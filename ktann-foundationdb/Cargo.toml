@@ -1,0 +1,13 @@
+[package]
+name = "ktann-foundationdb"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "FoundationDB storage adapter for KTANN"
+
+[dependencies]
+ktann = { path = ".." }
+
+[lints]
+workspace = true
