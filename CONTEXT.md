@@ -128,6 +128,10 @@ _Avoid_: Search-time validation, automatic repair
 A process-local scheduler that submits ordinary batch Foreground Mutations in bounded waves while applying Structure Maintenance backpressure.
 _Avoid_: Bulk-build generation, atomic whole-import transaction
 
+**Batch Token**:
+An Import Session receipt identifying one accepted mutation batch whose ordered outcomes are collected when the session finishes.
+_Avoid_: Transaction ID, durable job ID
+
 ## Relationships
 
 - A **Backend Hard Limit** is a stable storage-engine fact; a **Backend Admission Budget** is conservative adapter policy used to bound KTANN work early. Staying below a budget is not proof that FoundationDB's affected-data accounting will accept a transaction.
@@ -153,6 +157,7 @@ _Avoid_: Bulk-build generation, atomic whole-import transaction
 - **Demand-Driven Maintenance** may leave a cold partition in a searchable intermediate topology state indefinitely
 - **Index Verification** may run concurrently with Foreground Mutations and never changes persistent data
 - An **Import Session** changes neither Foreground Mutation atomicity nor persistent Logical Index lifecycle
+- An **Import Session** issues one **Batch Token** for each accepted mutation batch and reports those batch outcomes in submission order
 - A filtered search returns at most its requested number of **Vector Records** within its **Search Budget**
 
 ## Example dialogue
