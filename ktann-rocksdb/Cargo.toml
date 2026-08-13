@@ -1,0 +1,13 @@
+[package]
+name = "ktann-rocksdb"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "RocksDB storage adapter for KTANN"
+
+[dependencies]
+ktann = { path = ".." }
+
+[lints]
+workspace = true

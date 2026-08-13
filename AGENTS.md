@@ -3,8 +3,8 @@
 ## Project Sources of Truth
 
 Read `README.md` for the project status, goals, and architecture overview. The
-current Rust code is only a minimal scaffold; do not infer the intended
-architecture from `src/main.rs`.
+current Rust code is a workspace and module skeleton; do not infer unimplemented
+API or behavior from empty modules.
 
 - `CONTEXT.md`: canonical domain language and system-wide invariants.
 - `docs/design/overview.md`: product boundary, authoritative invariants, target
@@ -33,9 +33,7 @@ Run focused checks while iterating, then the relevant workspace-wide checks
 before completion. Do not run multiple Cargo commands concurrently because they
 contend on Cargo and target-directory locks. The target toolchain is Rust
 Edition 2024 with MSRV 1.85 and current stable CI; production code must not
-require nightly features. Until the scaffold is migrated, treat the current
-`Cargo.toml` as executable configuration and the design as the required end
-state—make the migration explicit rather than assuming it has already happened.
+require nightly features.
 
 ## Workflow Principles
 

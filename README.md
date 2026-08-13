@@ -70,7 +70,7 @@ selection, tree traversal, filtering, record loading, and exact reranking. It
 returns valid, exactly reranked hits from a bounded candidate set; it does not
 claim exact global top-k or guarantee that every request returns `k` hits.
 
-## Planned crate layout
+## Crate layout
 
 | Crate | Responsibility |
 | --- | --- |
@@ -97,7 +97,7 @@ KTANN's contract.
 
 ## Development
 
-The repository currently contains a minimal Rust scaffold. See
+The repository currently contains the Rust workspace and module skeleton. See
 [`AGENTS.md`](AGENTS.md) for development commands, engineering constraints, and
 verification guidelines.
 
