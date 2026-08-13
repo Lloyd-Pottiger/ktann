@@ -1,0 +1,3 @@
+# Maintain exact leaf membership with Record Location
+
+Every Vector Record has one authoritative Record Location and exactly one corresponding Leaf Entry in every committed state. Foreground upsert/delete and background split/merge atomically update the record, source/target entries, and location as applicable; a mismatch is corruption rather than a legal stale state. This adds one small KV per record and an extra write for every structural move, but removes approximate deletion, duplicate or dangling entries, membership cleanup, and per-record versioning while making point deletion deterministic.
