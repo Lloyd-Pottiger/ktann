@@ -1,10 +1,11 @@
-//! Canonical ordered codecs for logical key components and key families.
+//! Versioned namespace and ordered families for Logical Keys.
 //!
 //! This module owns the version-1 logical keyspace: the version framing, the
 //! namespace/index scope tags, the typed entry-kind discriminators, the raw
-//! identity and name components, and the memcomparable Tree Key tuple codec. It
-//! defines no persistent values and no backend physical prefixes; adapters
-//! prepend their own bounded prefix and value codecs live in a sibling module.
+//! identity and name components, and bounded ranges. It embeds canonical Tree
+//! Key bytes without interpreting or re-escaping them. It defines no persistent
+//! values and no backend physical prefixes; adapters prepend their own bounded
+//! prefix and value codecs live in a sibling module.
 //!
 //! # Layout
 //!
@@ -39,28 +40,6 @@
 //! only for `LeafEntry` and `ChildEntry` — a terminal Record ID or child
 //! Partition Key.
 //!
-//! # Tree Key memcomparable codec
-//!
-//! A Tree Key is the ordered tuple of the declared non-null Tree Key fields.
-//! Each scalar encodes to a self-delimiting memcomparable byte string whose
-//! order matches typed comparison:
-//!
-//! * `Bool` is one byte: `0x00` for `false`, `0x01` for `true`.
-//! * `I64` is eight big-endian bytes of `bits ^ 0x8000_0000_0000_0000`.
-//! * `F64` is eight bytes: `bits | 0x8000_0000_0000_0000` for the non-negative
-//!   half (including `+0.0`) and `!bits` for the negative half, matching the
-//!   total order of finite `f64`. `-0.0` is noncanonical and rejected.
-//! * `String` bytes escape `0x00` as `0x00 0xFF` and terminate with a single
-//!   `0x00`.
-//!
-//! The tuple is the concatenation of its field encodings in field order. That
-//! preserves typed order and makes the encoding of any leading fields a byte
-//! prefix of every tuple sharing those fields, so a field-prefix half-open range
-//! is an ordinary byte-prefix range. For a `String` field the byte-prefix range
-//! is a conservative superset — it can additionally include Tree Keys whose
-//! pinned `String` value is extended by a leading `0x00` byte — and exact
-//! predicate evaluation later rejects those.
-//!
 //! # Fail closed
 //!
 //! Decoders reject an unknown version or scope, an unknown kind or subkind,
@@ -77,6 +56,9 @@ use crate::api::{
     DataType, Error, ErrorKind, IndexName, LogicalIndexId, PartitionKey, Result, Value,
 };
 
+#[doc(inline)]
+pub use super::tree_key::{MAX_STRING_BYTES, MAX_TREE_KEY_BYTES, TreeKey};
+
 /// The single logical-key format version emitted and accepted by this build.
 pub const KEY_VERSION: u8 = 1;
 
@@ -87,11 +69,6 @@ pub const PARTITION_KEY_BYTES: usize = 8;
 
 /// The maximum encoded length of a Record ID in bytes.
 pub const MAX_RECORD_ID_BYTES: usize = 256;
-/// The maximum encoded length of a single String Tree Key field in bytes.
-pub const MAX_STRING_BYTES: usize = 1_024;
-/// The maximum encoded length of a complete Tree Key in bytes.
-pub const MAX_TREE_KEY_BYTES: usize = 8 * 1_024;
-
 const SCOPE_NAMESPACE: u8 = 0x00;
 const SCOPE_INDEX: u8 = 0x01;
 
@@ -114,75 +91,9 @@ const SUB_CENTROID: u8 = 0x03;
 const SUB_LEAF_ENTRY: u8 = 0x04;
 const SUB_CHILD_ENTRY: u8 = 0x05;
 
-/// The high bit used by the memcomparable `I64` and `F64` transforms.
-const SIGN: u64 = 0x8000_0000_0000_0000;
-
 /// A storage-corruption error for a malformed or noncanonical decoded key.
 fn corrupt() -> Error {
     Error::new(ErrorKind::Corruption)
-}
-
-/// The canonical memcomparable encoding of one Tree Key.
-///
-/// The bytes are opaque and always interpreted through the schema-derived field
-/// types; byte order matches typed comparison. `Debug` is redacted because a
-/// Tree Key carries caller field values.
-#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct TreeKey(Vec<u8>);
-
-impl TreeKey {
-    /// Encodes `values` as a memcomparable Tree Key under the ordered `types`.
-    ///
-    /// `types` and `values` must have the same length, and every value must be a
-    /// canonical non-`Null` value of its declared type. A `String` longer than
-    /// [`MAX_STRING_BYTES`], a non-finite `F64`, or a `-0.0` is rejected as
-    /// [`ErrorKind::InvalidArgument`], as is any result longer than
-    /// [`MAX_TREE_KEY_BYTES`].
-    pub fn encode(types: &[DataType], values: &[Value]) -> Result<Self> {
-        if types.len() != values.len() {
-            return Err(Error::invalid_argument());
-        }
-        let mut bytes = Vec::new();
-        for (ty, value) in types.iter().zip(values) {
-            encode_scalar(*ty, value, &mut bytes)?;
-        }
-        if bytes.len() > MAX_TREE_KEY_BYTES {
-            return Err(Error::invalid_argument());
-        }
-        Ok(Self(bytes))
-    }
-
-    /// The canonical encoded bytes.
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-
-    /// Decodes this Tree Key into its typed field values.
-    ///
-    /// Malformed, truncated, noncanonical, overlong, or trailing bytes fail as
-    /// [`ErrorKind::Corruption`].
-    pub fn values(&self, types: &[DataType]) -> Result<Vec<Value>> {
-        let (values, consumed) = decode_tree_key(types, &self.0)?;
-        if consumed != self.0.len() {
-            return Err(corrupt());
-        }
-        Ok(values)
-    }
-
-    /// Validates and owns an already encoded Tree Key.
-    ///
-    /// Malformed, truncated, noncanonical, overlong, or trailing bytes fail as
-    /// [`ErrorKind::Corruption`].
-    pub(super) fn from_encoded(types: &[DataType], bytes: &[u8]) -> Result<Self> {
-        decode_tree_key_only(types, bytes)
-    }
-}
-
-impl fmt::Debug for TreeKey {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("TreeKey([REDACTED])")
-    }
 }
 
 /// A fully decoded logical key.
@@ -433,106 +344,6 @@ fn take_array<const N: usize>(bytes: &[u8]) -> Result<[u8; N]> {
     slice.try_into().map_err(|_| corrupt())
 }
 
-/// Encodes one scalar Tree Key field into `out`.
-fn encode_scalar(ty: DataType, value: &Value, out: &mut Vec<u8>) -> Result<()> {
-    match (ty, value) {
-        (DataType::Bool, Value::Bool(value)) => out.push(u8::from(*value)),
-        (DataType::I64, Value::I64(value)) => {
-            out.extend_from_slice(&((*value as u64) ^ SIGN).to_be_bytes());
-        }
-        (DataType::F64, Value::F64(value)) => {
-            if !value.is_finite() || (*value == 0.0 && value.is_sign_negative()) {
-                return Err(Error::invalid_argument());
-            }
-            let bits = value.to_bits();
-            let encoded = if bits & SIGN != 0 { !bits } else { bits | SIGN };
-            out.extend_from_slice(&encoded.to_be_bytes());
-        }
-        (DataType::String, Value::String(value)) => {
-            if value.len() > MAX_STRING_BYTES {
-                return Err(Error::invalid_argument());
-            }
-            for &byte in value.as_bytes() {
-                if byte == 0x00 {
-                    out.extend_from_slice(&[0x00, 0xFF]);
-                } else {
-                    out.push(byte);
-                }
-            }
-            out.push(0x00);
-        }
-        _ => return Err(Error::invalid_argument()),
-    }
-    Ok(())
-}
-
-/// Decodes one scalar Tree Key field, returning its value and consumed bytes.
-fn decode_scalar(ty: DataType, bytes: &[u8]) -> Result<(Value, usize)> {
-    match ty {
-        DataType::Bool => match bytes.first() {
-            Some(0x00) => Ok((Value::Bool(false), 1)),
-            Some(0x01) => Ok((Value::Bool(true), 1)),
-            _ => Err(corrupt()),
-        },
-        DataType::I64 => {
-            let raw = take_array::<8>(bytes)?;
-            Ok((Value::I64((u64::from_be_bytes(raw) ^ SIGN) as i64), 8))
-        }
-        DataType::F64 => {
-            let encoded = u64::from_be_bytes(take_array::<8>(bytes)?);
-            let bits = if encoded & SIGN != 0 {
-                encoded ^ SIGN
-            } else {
-                !encoded
-            };
-            let value = f64::from_bits(bits);
-            if !value.is_finite() || (value == 0.0 && value.is_sign_negative()) {
-                return Err(corrupt());
-            }
-            Ok((Value::F64(value), 8))
-        }
-        DataType::String => {
-            let mut value = Vec::new();
-            let mut offset = 0;
-            loop {
-                let byte = *bytes.get(offset).ok_or_else(corrupt)?;
-                if byte == 0x00 {
-                    if bytes.get(offset + 1) == Some(&0xFF) {
-                        value.push(0x00);
-                        offset += 2;
-                    } else {
-                        offset += 1;
-                        break;
-                    }
-                } else {
-                    value.push(byte);
-                    offset += 1;
-                }
-                if value.len() > MAX_STRING_BYTES {
-                    return Err(corrupt());
-                }
-            }
-            let string = String::from_utf8(value).map_err(|_| corrupt())?;
-            Ok((Value::String(string), offset))
-        }
-    }
-}
-
-/// Decodes a Tree Key into its values and the number of bytes it consumed.
-fn decode_tree_key(types: &[DataType], bytes: &[u8]) -> Result<(Vec<Value>, usize)> {
-    if bytes.len() > MAX_TREE_KEY_BYTES {
-        return Err(corrupt());
-    }
-    let mut values = Vec::with_capacity(types.len());
-    let mut offset = 0;
-    for ty in types {
-        let (value, consumed) = decode_scalar(*ty, &bytes[offset..])?;
-        offset += consumed;
-        values.push(value);
-    }
-    Ok((values, offset))
-}
-
 /// Rejects an invalid Record ID on the encode path.
 fn check_record_id(id: &[u8]) -> Result<()> {
     if id.is_empty() || id.len() > MAX_RECORD_ID_BYTES {
@@ -754,7 +565,7 @@ fn decode_index_key(types: &[DataType], body: &[u8]) -> Result<LogicalKey> {
         KIND_RECORD_GROUP => decode_record_group(index, rest),
         KIND_TREE_MANIFEST => Ok(LogicalKey::TreeManifest {
             index,
-            tree_key: decode_tree_key_only(types, rest)?,
+            tree_key: TreeKey::from_encoded(types, rest)?,
         }),
         KIND_PARTITION => decode_partition_key(types, index, rest),
         _ => Err(corrupt()),
@@ -791,24 +602,14 @@ fn decode_record_group(index: LogicalIndexId, bytes: &[u8]) -> Result<LogicalKey
     }
 }
 
-/// Decodes a terminal Tree Key, rejecting trailing bytes.
-fn decode_tree_key_only(types: &[DataType], bytes: &[u8]) -> Result<TreeKey> {
-    let (_, consumed) = decode_tree_key(types, bytes)?;
-    if consumed != bytes.len() {
-        return Err(corrupt());
-    }
-    Ok(TreeKey(bytes.to_vec()))
-}
-
 /// Decodes the remainder of a partition-scoped key body.
 fn decode_partition_key(
     types: &[DataType],
     index: LogicalIndexId,
     rest: &[u8],
 ) -> Result<LogicalKey> {
-    let (_, tree_key_len) = decode_tree_key(types, rest)?;
-    let (tree_key_bytes, after) = rest.split_at(tree_key_len);
-    let tree_key = TreeKey(tree_key_bytes.to_vec());
+    let (tree_key, tree_key_len) = TreeKey::from_prefix(types, rest)?;
+    let after = &rest[tree_key_len..];
 
     let partition =
         PartitionKey::new(u64::from_be_bytes(take_array::<8>(after)?)).map_err(|_| corrupt())?;
@@ -903,9 +704,7 @@ pub fn tree_manifest_prefix_range(
     }
     let mut start = index_prefix(index);
     start.push(KIND_TREE_MANIFEST);
-    for (ty, value) in types.iter().zip(prefix) {
-        encode_scalar(*ty, value, &mut start)?;
-    }
+    TreeKey::append_fields(&types[..prefix.len()], prefix, &mut start)?;
     let end = successor(&start);
     Ok(KeyRange { start, end })
 }
