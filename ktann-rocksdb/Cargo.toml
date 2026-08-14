@@ -5,9 +5,17 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 description = "RocksDB storage adapter for KTANN"
+readme = "README.md"
 
 [dependencies]
+bytes = "1"
 ktann = { path = ".." }
+rocksdb = { version = "0.24", default-features = false, features = ["bindgen-runtime"] }
 
-[lints]
-workspace = true
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt"] }
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_code = "deny"
