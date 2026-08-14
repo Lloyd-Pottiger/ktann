@@ -8,10 +8,10 @@ use std::cmp::Ordering;
 use bytes::Bytes;
 use ktann::api::{DataType, ErrorKind, IndexName, LogicalIndexId, PartitionKey, Value};
 use ktann::storage::keys::{
-    LogicalKey, TreeKey, child_entry_key, decode_key, header_key, index_id_allocator_key,
-    index_range, leaf_entry_key, location_key, manifest_key, name_directory_key, partition_range,
-    record_key, state_key, synopsis_key, training_key, tree_manifest_key,
-    tree_manifest_prefix_range, tree_manifest_range,
+    LogicalKey, TreeKey, centroid_key, child_entry_key, decode_key, header_key,
+    index_id_allocator_key, index_range, leaf_entry_key, location_key, manifest_key,
+    name_directory_key, partition_range, payload_key, record_key, state_key, synopsis_key,
+    tree_manifest_key, tree_manifest_prefix_range, tree_manifest_range,
 };
 
 fn id(value: u64) -> LogicalIndexId {
@@ -54,11 +54,15 @@ fn index_level_family_golden_bytes() {
     );
     assert_eq!(
         record_key(id(1), &Bytes::from_static(b"r")).expect("valid id"),
-        b"\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x01r"
+        b"\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x01r\x00\x00"
     );
     assert_eq!(
         location_key(id(1), &Bytes::from_static(b"r")).expect("valid id"),
-        b"\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x02r"
+        b"\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x01r\x00\x01"
+    );
+    assert_eq!(
+        payload_key(id(1), &Bytes::from_static(b"r")).expect("valid id"),
+        b"\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x01r\x00\x02"
     );
 
     let empty = TreeKey::encode(&[], &[]).expect("empty tree key");
@@ -66,6 +70,61 @@ fn index_level_family_golden_bytes() {
         tree_manifest_key(id(1), &empty),
         b"\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x03"
     );
+}
+
+#[test]
+fn record_group_golden_bytes_escape_embedded_nul() {
+    let record_id = Bytes::from_static(b"a\0b");
+    assert_eq!(
+        record_key(id(1), &record_id).expect("valid id"),
+        b"\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x01a\x00\xffb\x00\x00"
+    );
+    assert_eq!(
+        decode_key(&[], &record_key(id(1), &record_id).expect("valid id")).expect("decode"),
+        LogicalKey::Record {
+            index: id(1),
+            id: record_id,
+        }
+    );
+}
+
+#[test]
+fn record_values_are_adjacent_and_ordered_by_record_id() {
+    let index = id(1);
+    let record_ids = [
+        Bytes::from_static(b"a"),
+        Bytes::from_static(b"a\0"),
+        Bytes::from_static(b"b"),
+    ];
+    let keys: Vec<Vec<u8>> = record_ids
+        .iter()
+        .flat_map(|record_id| {
+            [
+                record_key(index, record_id).expect("valid id"),
+                location_key(index, record_id).expect("valid id"),
+                payload_key(index, record_id).expect("valid id"),
+            ]
+        })
+        .collect();
+
+    let mut sorted = keys.clone();
+    sorted.sort();
+    assert_eq!(sorted, keys);
+
+    for (record_id, group) in record_ids.iter().zip(keys.chunks_exact(3)) {
+        assert!(matches!(
+            decode_key(&[], &group[0]).expect("decode Record"),
+            LogicalKey::Record { id, .. } if id == *record_id
+        ));
+        assert!(matches!(
+            decode_key(&[], &group[1]).expect("decode Location"),
+            LogicalKey::Location { id, .. } if id == *record_id
+        ));
+        assert!(matches!(
+            decode_key(&[], &group[2]).expect("decode Payload"),
+            LogicalKey::Payload { id, .. } if id == *record_id
+        ));
+    }
 }
 
 #[test]
@@ -95,7 +154,7 @@ fn partition_family_golden_bytes() {
     let mut expected = prefix.to_vec();
     expected.extend_from_slice(partition);
     expected.push(0x03);
-    assert_eq!(training_key(id(1), &tree_key, pk(1)), expected);
+    assert_eq!(centroid_key(id(1), &tree_key, pk(1)), expected);
 
     let mut expected = prefix.to_vec();
     expected.extend_from_slice(partition);
@@ -317,6 +376,7 @@ fn encode_key(key: &LogicalKey) -> Vec<u8> {
         LogicalKey::Manifest(index) => manifest_key(*index),
         LogicalKey::Record { index, id } => record_key(*index, id).expect("valid id"),
         LogicalKey::Location { index, id } => location_key(*index, id).expect("valid id"),
+        LogicalKey::Payload { index, id } => payload_key(*index, id).expect("valid id"),
         LogicalKey::TreeManifest { index, tree_key } => tree_manifest_key(*index, tree_key),
         LogicalKey::Header {
             index,
@@ -333,11 +393,11 @@ fn encode_key(key: &LogicalKey) -> Vec<u8> {
             tree_key,
             partition,
         } => state_key(*index, tree_key, *partition),
-        LogicalKey::Training {
+        LogicalKey::Centroid {
             index,
             tree_key,
             partition,
-        } => training_key(*index, tree_key, *partition),
+        } => centroid_key(*index, tree_key, *partition),
         LogicalKey::LeafEntry {
             index,
             tree_key,
@@ -377,6 +437,10 @@ fn every_key_family_round_trips() {
             index,
             id: Bytes::from_static(b"rec"),
         },
+        LogicalKey::Payload {
+            index,
+            id: Bytes::from_static(b"rec"),
+        },
         LogicalKey::TreeManifest {
             index,
             tree_key: tree_key.clone(),
@@ -396,7 +460,7 @@ fn every_key_family_round_trips() {
             tree_key: tree_key.clone(),
             partition,
         },
-        LogicalKey::Training {
+        LogicalKey::Centroid {
             index,
             tree_key: tree_key.clone(),
             partition,
@@ -505,11 +569,12 @@ fn decode_rejects_every_truncation_of_every_valid_key() {
         manifest_key(index),
         record_key(index, &Bytes::from_static(b"r")).expect("valid id"),
         location_key(index, &Bytes::from_static(b"r")).expect("valid id"),
+        payload_key(index, &Bytes::from_static(b"r")).expect("valid id"),
         tree_manifest_key(index, &tree_key),
         header_key(index, &tree_key, partition),
         synopsis_key(index, &tree_key, partition),
         state_key(index, &tree_key, partition),
-        training_key(index, &tree_key, partition),
+        centroid_key(index, &tree_key, partition),
         leaf_entry_key(index, &tree_key, partition, &Bytes::from_static(b"x")).expect("valid id"),
         child_entry_key(index, &tree_key, partition, pk(2)),
     ];
@@ -539,7 +604,7 @@ fn decode_rejects_trailing_bytes_on_fixed_terminal_keys() {
         header_key(index, &tree_key, partition),
         synopsis_key(index, &tree_key, partition),
         state_key(index, &tree_key, partition),
-        training_key(index, &tree_key, partition),
+        centroid_key(index, &tree_key, partition),
         child_entry_key(index, &tree_key, partition, pk(2)),
     ];
     for key in &fixed {
