@@ -18,6 +18,9 @@ foreground in-flight guard is registered before an operation can begin commit
 and is held by the owned completion path until the backend commit finishes,
 even if the caller drops its future. This is required because RocksDB commits
 cannot be interrupted and any backend may produce an unknown outcome.
+At most the configured foreground operation limit may run and the same number
+may wait for admission; further calls fail with `LimitExceeded` rather than
+creating an unbounded process-local queue.
 
 ## 2. Shutdown
 

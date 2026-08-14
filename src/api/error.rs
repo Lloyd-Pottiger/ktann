@@ -26,7 +26,7 @@ pub enum ErrorKind {
     Unsupported,
     /// The operation cannot fit the backend's declared transaction limits.
     TransactionTooLarge,
-    /// The operation exceeds a backend hard limit or admission budget.
+    /// The operation exceeds a hard limit or bounded admission capacity.
     LimitExceeded,
     /// Whole-operation retry attempts were exhausted.
     ContentionExhausted,
@@ -61,7 +61,7 @@ impl ErrorKind {
             Self::UnsupportedFormat => "unsupported format",
             Self::Unsupported => "backend does not support operation",
             Self::TransactionTooLarge => "transaction too large",
-            Self::LimitExceeded => "backend limit exceeded",
+            Self::LimitExceeded => "limit exceeded",
             Self::ContentionExhausted => "contention retries exhausted",
             Self::RetryableAbort => "transaction aborted, retry",
             Self::CommitOutcomeUnknown => "commit outcome unknown",

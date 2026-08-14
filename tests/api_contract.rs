@@ -160,6 +160,15 @@ fn search_rejects_invalid_k_dimension_and_budgets() -> ktann::api::Result<()> {
 
 #[test]
 fn runtime_and_verify_limits_fail_closed() {
+    assert_invalid(RuntimeConfig::default().with_foreground_operation_limit(0));
+    assert_invalid(RuntimeConfig::default().with_foreground_operation_limit(65_537));
+    assert_eq!(
+        RuntimeConfig::default()
+            .with_foreground_operation_limit(7)
+            .expect("positive foreground limit")
+            .foreground_operation_limit(),
+        7
+    );
     assert_invalid(RuntimeConfig::default().with_maintenance(0, 1_024));
     let unsafe_import_limits = RuntimeConfig::default()
         .with_import_limits(1, 1_025)

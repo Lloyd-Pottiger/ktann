@@ -157,16 +157,17 @@ non-null Tree Key FieldIds, and minimum/maximum partition entries. Limits are:
 RaBitQ7, binary fanout, Lloyd rounds, rotation algorithm, logical codecs, and
 hard safety caps are fixed by format version 1, not caller options.
 
-`RuntimeConfig` owns cache bytes, worker count, queue capacity, retry/backoff,
-maintenance transaction budgets, and default search budgets. Adapter config
-owns backend resources such as RocksDB blocking concurrency. Search options may
-only lower or override process defaults within hard caps; changing them cannot
-alter index correctness.
+`RuntimeConfig` owns the foreground operation limit, cache bytes, worker count,
+queue capacity, retry/backoff, maintenance transaction budgets, and default
+search budgets. Adapter config owns backend resources such as RocksDB blocking
+concurrency. Search options may only lower or override process defaults within
+hard caps; changing them cannot alter index correctness.
 
 The v1 defaults and caps are:
 
 | Setting | Default | Hard cap / validation |
 | --- | ---: | ---: |
+| Running / waiting foreground operations | 1,024 each | 1..=65,536 each |
 | Maintenance workers | `min(available_parallelism, 8)`, min 1 | at least 1 |
 | Pending/running fixups | 1,024 | at least worker count |
 | Fixup / foreground attempts | 8 each | at least 1 |
@@ -213,16 +214,16 @@ Errors are non-exhaustive and preserve a diagnostic source. Stable kinds are:
 
 - `InvalidArgument`, `IndexAlreadyExists`, `IndexNotFound`, `IndexDropping`,
   `RecordAlreadyExists`, and `UnsupportedFormat`;
-- `TransactionTooLarge`, `ContentionExhausted`, `CommitOutcomeUnknown`, and
-  `IdExhausted`;
+- `TransactionTooLarge`, `LimitExceeded`, `ContentionExhausted`,
+  `CommitOutcomeUnknown`, and `IdExhausted`;
 - `DeadlineExceeded`, `Cancelled`, and `RuntimeClosed`;
 - `Backend` and `Corruption`.
 
 Malformed input, schema mismatch, and non-finite caller-derived arithmetic are
 InvalidArgument. Adapter-declared transaction admission failure is
-TransactionTooLarge. Bounded whole-operation retry exhaustion is
-ContentionExhausted. Invalid persistent encoding or an invariant mismatch is
-Corruption.
+TransactionTooLarge. A full bounded process-local admission queue is
+LimitExceeded. Bounded whole-operation retry exhaustion is ContentionExhausted.
+Invalid persistent encoding or an invariant mismatch is Corruption.
 
 Display and Debug redact Index Name, raw Tree Key, Record ID, field values,
 vectors, and payload. Cancellation never rewrites a successful commit or a
