@@ -353,6 +353,16 @@ pub struct KeyRange {
 }
 
 impl KeyRange {
+    /// Constructs a half-open `[start, end)` range from explicit byte bounds.
+    ///
+    /// A range whose `start` is not less than `end` is empty and yields no
+    /// keys. This is the generic constructor used for scan pagination; the
+    /// codec range helpers below build their exact prefix ends themselves.
+    #[must_use]
+    pub fn new(start: Vec<u8>, end: Vec<u8>) -> Self {
+        Self { start, end }
+    }
+
     /// The inclusive start bound.
     #[must_use]
     pub fn start(&self) -> &[u8] {

@@ -55,6 +55,7 @@ name = "ktann"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "tokio",
  "tokio-util",
 ]
 
