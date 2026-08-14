@@ -46,6 +46,8 @@ require nightly features.
 - Implement in the dependency order in the overview unless the task establishes
   a smaller self-contained vertical slice. Do not add placeholder abstractions
   for later stages.
+- For substantial changes, define the private module layout before
+  implementation; do not accumulate multiple responsibilities in one file.
 - Keep each responsibility at its documented owner. In particular, logical
   codecs and atomic index operations belong in core storage; backend-specific
   limits and error classification belong in the adapters; lifecycle and
