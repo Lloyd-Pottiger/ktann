@@ -636,12 +636,12 @@ fn decode_rejects_overlong_record_id_and_name() {
     let mut key = vec![0x01, 0x01];
     key.extend_from_slice(&1_u64.to_be_bytes());
     key.push(0x01);
-    key.extend(std::iter::repeat(b'x').take(257));
+    key.extend(std::iter::repeat_n(b'x', 257));
     assert!(is_corrupt(&types, &key));
 
     // 256-byte Index Name after the directory kind.
     let mut key = vec![0x01, 0x00, 0x01];
-    key.extend(std::iter::repeat(b'y').take(256));
+    key.extend(std::iter::repeat_n(b'y', 256));
     assert!(is_corrupt(&types, &key));
 }
 
