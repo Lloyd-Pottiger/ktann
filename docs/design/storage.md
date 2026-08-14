@@ -75,9 +75,9 @@ The core defines a versioned logical namespace for:
 
 - allocator and Index Name mapping;
 - Index Manifest;
-- Vector Record and Record Location;
+- Vector Record, Opaque Payload, and Record Location;
 - Tree Manifest directory entries;
-- Partition Header, Synopsis, State, and optional training data;
+- Partition Header, immutable Centroid, Synopsis, and transition State;
 - Leaf Entry and Child Entry.
 
 Every data key begins with Logical Index ID, so drop owns one contiguous logical
@@ -101,8 +101,10 @@ Partition Key allocator high-water mark for one Tree Key. Reservation allocates
 fixed ranges (default 1,024) through an update-protected manifest; unused keys
 remain gaps.
 
-Partition Header stores kind, level, exact entry count, cache epoch, and the
-small state discriminator needed for traversal. State payloads store the
+Partition Header stores level (1 for a leaf), exact entry count, cache epoch,
+and the small Partition State discriminator needed for traversal; level alone
+determines whether the partition contains Leaf or Child Entries. Transition
+payloads store the
 source/target references and state-start time required to resume a transition;
 structural drain and paged deletion restart from the current prefix beginning
 and persist no cursor.

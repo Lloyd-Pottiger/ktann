@@ -32,10 +32,12 @@ result or correctness.
 ## 2. Tree shape
 
 Each Tree Key lazily installs one initial leaf root with its Tree Manifest.
-Internal fanout is exactly two. Partition identities are never reused. An
-ordinary non-root split allocates and exposes two new targets, then removes the
-source at completion. Root Partition Key 1 remains stable and is converted in
-place to an internal root only after its entries drain, so every committed state
+Leaf partitions are level 1; partitions above level 1 contain Child Entries.
+The level therefore determines the partition kind without a second persistent
+discriminator. Internal fanout is exactly two. Partition identities are never
+reused. An ordinary non-root split allocates and exposes two new targets, then
+removes the source at completion. Root Partition Key 1 remains stable and is
+converted in place to an internal root only after its entries drain, so every committed state
 has one searchable entry point.
 
 Split training reads the complete source through one consistent snapshot and

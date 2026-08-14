@@ -9,7 +9,7 @@ use super::schema::FieldSchema;
 use super::{Error, Result, Value};
 
 const MAX_RECORD_ID_BYTES: usize = 256;
-const MAX_PAYLOAD_BYTES: usize = 64 * 1_024;
+pub(crate) const MAX_PAYLOAD_BYTES: usize = 64 * 1_024;
 
 /// An engine-owned Vector Record accepted by insert and upsert.
 #[derive(Clone)]

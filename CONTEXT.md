@@ -152,6 +152,7 @@ _Avoid_: Transaction ID, durable job ID
 - A **Search Outcome** contains zero or more **Search Hits** governed by one **Search Budget**
 - A **Leaf Partition** has zero or more **Partition Synopses**
 - A **Leaf Partition** contains zero or more **Leaf Entries**
+- Every **Leaf Partition** is at tree level 1; partitions above level 1 contain **Child Entries**
 - Every non-root partition has exactly one corresponding **Child Entry** in one parent partition
 - A **Fixup Worker** may advance **Structure Maintenance** for any **Logical Index**
 - **Demand-Driven Maintenance** may leave a cold partition in a searchable intermediate topology state indefinitely

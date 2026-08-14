@@ -29,3 +29,6 @@ pub use search::{
     SearchOutcome, SearchRequest,
 };
 pub use verify::{VerifyIssue, VerifyIssueKind, VerifyObjectCounts, VerifyOptions, VerifyReport};
+
+pub(crate) use record::MAX_PAYLOAD_BYTES;
+pub(crate) use schema::{MAX_ENCODED_SYNOPSIS_BYTES, MAX_FIELDS, MAX_STRING_BYTES};

@@ -29,13 +29,14 @@
 //! [ 0x01 ][ 0x01 ][ index_id: u64 BE ][ kind ][ ... ]
 //! ```
 //!
-//! The index-scoped `kind` byte selects the family. `Manifest`, `Record`,
-//! `Location`, and `TreeManifest` address index-level objects; `Record` and
-//! `Location` end with the raw Record ID and `TreeManifest` ends with the
-//! canonical Tree Key. `Partition` addresses tree-local partition data and is
-//! followed by the canonical Tree Key, the big-endian Partition Key, a subkind
-//! byte (`Header`, `Synopsis`, `State`, `Training`, `LeafEntry`, `ChildEntry`),
-//! and — only for `LeafEntry` and `ChildEntry` — a terminal Record ID or child
+//! The index-scoped `kind` byte selects the family. `Manifest`, `RecordGroup`,
+//! `TreeManifest`, and `Partition` address index-level objects. A Record Group
+//! contains one self-terminating Record ID followed by the `Record`, `Location`,
+//! or `Payload` subkind, keeping all three values adjacent by Record ID.
+//! `TreeManifest` ends with the canonical Tree Key. `Partition` is followed by
+//! the canonical Tree Key, the big-endian Partition Key, a subkind byte
+//! (`Header`, `Synopsis`, `State`, `Centroid`, `LeafEntry`, `ChildEntry`), and —
+//! only for `LeafEntry` and `ChildEntry` — a terminal Record ID or child
 //! Partition Key.
 //!
 //! # Tree Key memcomparable codec
@@ -98,15 +99,18 @@ const NS_INDEX_ID_ALLOCATOR: u8 = 0x00;
 const NS_INDEX_NAME_DIRECTORY: u8 = 0x01;
 
 const KIND_MANIFEST: u8 = 0x00;
-const KIND_RECORD: u8 = 0x01;
-const KIND_LOCATION: u8 = 0x02;
+const KIND_RECORD_GROUP: u8 = 0x01;
 const KIND_TREE_MANIFEST: u8 = 0x03;
 const KIND_PARTITION: u8 = 0x04;
+
+const RECORD_VALUE: u8 = 0x00;
+const RECORD_LOCATION: u8 = 0x01;
+const RECORD_PAYLOAD: u8 = 0x02;
 
 const SUB_HEADER: u8 = 0x00;
 const SUB_SYNOPSIS: u8 = 0x01;
 const SUB_STATE: u8 = 0x02;
-const SUB_TRAINING: u8 = 0x03;
+const SUB_CENTROID: u8 = 0x03;
 const SUB_LEAF_ENTRY: u8 = 0x04;
 const SUB_CHILD_ENTRY: u8 = 0x05;
 
@@ -165,6 +169,14 @@ impl TreeKey {
         }
         Ok(values)
     }
+
+    /// Validates and owns an already encoded Tree Key.
+    ///
+    /// Malformed, truncated, noncanonical, overlong, or trailing bytes fail as
+    /// [`ErrorKind::Corruption`].
+    pub(super) fn from_encoded(types: &[DataType], bytes: &[u8]) -> Result<Self> {
+        decode_tree_key_only(types, bytes)
+    }
 }
 
 impl fmt::Debug for TreeKey {
@@ -195,6 +207,13 @@ pub enum LogicalKey {
     },
     /// A Record Location.
     Location {
+        /// The owning Logical Index ID.
+        index: LogicalIndexId,
+        /// The raw Record ID.
+        id: Bytes,
+    },
+    /// An Opaque Payload.
+    Payload {
         /// The owning Logical Index ID.
         index: LogicalIndexId,
         /// The raw Record ID.
@@ -234,8 +253,8 @@ pub enum LogicalKey {
         /// The Partition Key.
         partition: PartitionKey,
     },
-    /// A partition training-data record.
-    Training {
+    /// A partition's immutable centroid.
+    Centroid {
         /// The owning Logical Index ID.
         index: LogicalIndexId,
         /// The canonical Tree Key.
@@ -283,6 +302,11 @@ impl fmt::Debug for LogicalKey {
                 .field("index", index)
                 .field("id", &"[REDACTED]")
                 .finish(),
+            Self::Payload { index, .. } => formatter
+                .debug_struct("Payload")
+                .field("index", index)
+                .field("id", &"[REDACTED]")
+                .finish(),
             Self::TreeManifest { index, .. } => formatter
                 .debug_struct("TreeManifest")
                 .field("index", index)
@@ -312,10 +336,10 @@ impl fmt::Debug for LogicalKey {
                 .field("tree_key", &"[REDACTED]")
                 .field("partition", partition)
                 .finish(),
-            Self::Training {
+            Self::Centroid {
                 index, partition, ..
             } => formatter
-                .debug_struct("Training")
+                .debug_struct("Centroid")
                 .field("index", index)
                 .field("tree_key", &"[REDACTED]")
                 .field("partition", partition)
@@ -584,19 +608,37 @@ pub fn manifest_key(index: LogicalIndexId) -> Vec<u8> {
 
 /// The Vector Record key for `id` in `index`.
 pub fn record_key(index: LogicalIndexId, id: &Bytes) -> Result<Vec<u8>> {
-    check_record_id(id)?;
-    let mut bytes = index_prefix(index);
-    bytes.push(KIND_RECORD);
-    bytes.extend_from_slice(id);
+    let mut bytes = record_group_prefix(index, id)?;
+    bytes.push(RECORD_VALUE);
     Ok(bytes)
 }
 
 /// The Record Location key for `id` in `index`.
 pub fn location_key(index: LogicalIndexId, id: &Bytes) -> Result<Vec<u8>> {
+    let mut bytes = record_group_prefix(index, id)?;
+    bytes.push(RECORD_LOCATION);
+    Ok(bytes)
+}
+
+/// The Opaque Payload key for `id` in `index`.
+pub fn payload_key(index: LogicalIndexId, id: &Bytes) -> Result<Vec<u8>> {
+    let mut bytes = record_group_prefix(index, id)?;
+    bytes.push(RECORD_PAYLOAD);
+    Ok(bytes)
+}
+
+fn record_group_prefix(index: LogicalIndexId, id: &Bytes) -> Result<Vec<u8>> {
     check_record_id(id)?;
     let mut bytes = index_prefix(index);
-    bytes.push(KIND_LOCATION);
-    bytes.extend_from_slice(id);
+    bytes.push(KIND_RECORD_GROUP);
+    for &byte in id {
+        if byte == 0 {
+            bytes.extend_from_slice(&[0, 0xff]);
+        } else {
+            bytes.push(byte);
+        }
+    }
+    bytes.push(0);
     Ok(bytes)
 }
 
@@ -633,11 +675,11 @@ pub fn state_key(index: LogicalIndexId, tree_key: &TreeKey, partition: Partition
     bytes
 }
 
-/// The partition training-data key.
+/// The partition's immutable centroid key.
 #[must_use]
-pub fn training_key(index: LogicalIndexId, tree_key: &TreeKey, partition: PartitionKey) -> Vec<u8> {
+pub fn centroid_key(index: LogicalIndexId, tree_key: &TreeKey, partition: PartitionKey) -> Vec<u8> {
     let mut bytes = partition_prefix(index, tree_key, partition);
-    bytes.push(SUB_TRAINING);
+    bytes.push(SUB_CENTROID);
     bytes
 }
 
@@ -709,19 +751,42 @@ fn decode_index_key(types: &[DataType], body: &[u8]) -> Result<LogicalKey> {
     match kind {
         KIND_MANIFEST if rest.is_empty() => Ok(LogicalKey::Manifest(index)),
         KIND_MANIFEST => Err(corrupt()),
-        KIND_RECORD => Ok(LogicalKey::Record {
-            index,
-            id: decode_record_id(rest)?,
-        }),
-        KIND_LOCATION => Ok(LogicalKey::Location {
-            index,
-            id: decode_record_id(rest)?,
-        }),
+        KIND_RECORD_GROUP => decode_record_group(index, rest),
         KIND_TREE_MANIFEST => Ok(LogicalKey::TreeManifest {
             index,
             tree_key: decode_tree_key_only(types, rest)?,
         }),
         KIND_PARTITION => decode_partition_key(types, index, rest),
+        _ => Err(corrupt()),
+    }
+}
+
+fn decode_record_group(index: LogicalIndexId, bytes: &[u8]) -> Result<LogicalKey> {
+    let mut id = Vec::new();
+    let mut offset = 0;
+    loop {
+        let byte = *bytes.get(offset).ok_or_else(corrupt)?;
+        if byte == 0 {
+            if bytes.get(offset + 1) == Some(&0xff) {
+                id.push(0);
+                offset += 2;
+            } else {
+                offset += 1;
+                break;
+            }
+        } else {
+            id.push(byte);
+            offset += 1;
+        }
+        if id.len() > MAX_RECORD_ID_BYTES {
+            return Err(corrupt());
+        }
+    }
+    let id = decode_record_id(&id)?;
+    match bytes.get(offset..) {
+        Some([RECORD_VALUE]) => Ok(LogicalKey::Record { index, id }),
+        Some([RECORD_LOCATION]) => Ok(LogicalKey::Location { index, id }),
+        Some([RECORD_PAYLOAD]) => Ok(LogicalKey::Payload { index, id }),
         _ => Err(corrupt()),
     }
 }
@@ -766,7 +831,7 @@ fn decode_partition_key(
             tree_key,
             partition,
         }),
-        SUB_TRAINING if terminal.is_empty() => Ok(LogicalKey::Training {
+        SUB_CENTROID if terminal.is_empty() => Ok(LogicalKey::Centroid {
             index,
             tree_key,
             partition,
