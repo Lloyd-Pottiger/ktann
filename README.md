@@ -12,8 +12,10 @@ index can run on multiple KV backends.
 
 > [!IMPORTANT]
 > KTANN is currently in the design and early implementation stage. The system
-> design is implementation-ready, but the public library API and production KV
-> adapters described below are not yet available for use.
+> design is implementation-ready, and the workspace now includes the public
+> domain types, logical key codecs, backend transaction seam, and FoundationDB
+> adapter. The higher-level vector-index lifecycle and algorithms are not yet
+> available for use.
 
 ## Goals
 

@@ -24,10 +24,25 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust
         run: rustup toolchain install "${{ matrix.toolchain }}" --profile minimal
+      - name: Install FoundationDB client
+        run: .github/scripts/setup-foundationdb.sh client
       - name: Check workspace
         run: cargo +"${{ matrix.toolchain }}" check --workspace --all-targets
       - name: Test workspace
         run: cargo +"${{ matrix.toolchain }}" test --workspace --all-targets
+
+  foundationdb:
+    name: FoundationDB integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Set up FoundationDB
+        run: .github/scripts/setup-foundationdb.sh server
+      - name: Test FoundationDB adapter
+        run: cargo +stable test -p ktann-foundationdb --test foundationdb_adapter -- --ignored
 
   lint:
     name: Format and lint
