@@ -25,6 +25,8 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install "${{ matrix.toolchain }}" --profile minimal
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-${{ matrix.toolchain }}
       - name: Install FoundationDB client
         run: .github/scripts/setup-foundationdb.sh client
       - name: Test workspace
