@@ -22,10 +22,16 @@ pub enum ErrorKind {
     RecordAlreadyExists,
     /// The persistent format is known but unsupported by this build.
     UnsupportedFormat,
+    /// The backend does not support the requested operation.
+    Unsupported,
     /// The operation cannot fit the backend's declared transaction limits.
     TransactionTooLarge,
+    /// The operation exceeds a backend hard limit or admission budget.
+    LimitExceeded,
     /// Whole-operation retry attempts were exhausted.
     ContentionExhausted,
+    /// The backend aborted the transaction and the whole operation may be retried.
+    RetryableAbort,
     /// The backend cannot determine whether commit succeeded.
     CommitOutcomeUnknown,
     /// A persistent non-reusable identifier space is exhausted.
@@ -38,6 +44,8 @@ pub enum ErrorKind {
     RuntimeClosed,
     /// A backend operation failed.
     Backend,
+    /// An unclassified backend failure without a more specific category.
+    Other,
     /// Persistent encoding or a committed invariant is invalid.
     Corruption,
 }
@@ -51,14 +59,18 @@ impl ErrorKind {
             Self::IndexDropping => "index is being dropped",
             Self::RecordAlreadyExists => "record already exists",
             Self::UnsupportedFormat => "unsupported format",
+            Self::Unsupported => "backend does not support operation",
             Self::TransactionTooLarge => "transaction too large",
+            Self::LimitExceeded => "backend limit exceeded",
             Self::ContentionExhausted => "contention retries exhausted",
+            Self::RetryableAbort => "transaction aborted, retry",
             Self::CommitOutcomeUnknown => "commit outcome unknown",
             Self::IdExhausted => "identifier space exhausted",
             Self::DeadlineExceeded => "deadline exceeded",
             Self::Cancelled => "operation cancelled",
             Self::RuntimeClosed => "runtime closed",
             Self::Backend => "backend error",
+            Self::Other => "unclassified backend error",
             Self::Corruption => "corruption detected",
         }
     }
