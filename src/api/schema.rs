@@ -17,7 +17,7 @@ pub(crate) const MAX_ENCODED_SYNOPSIS_BYTES: usize = 64 * 1_024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum Metric {
-    /// Squared Euclidean distance.
+    /// Euclidean distance, ranked by its squared value.
     L2,
     /// Cosine distance.
     Cosine,

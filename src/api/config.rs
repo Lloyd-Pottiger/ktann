@@ -7,7 +7,7 @@ use std::time::Duration;
 use super::schema::{MAX_ENCODED_SYNOPSIS_BYTES, MAX_FIELDS, MAX_STRING_BYTES};
 use super::{Error, FieldId, FieldSchema, Metric, Result, SearchBudgets, SynopsisConfig};
 
-const MAX_DIMENSION: usize = 16_384;
+pub(crate) const MAX_DIMENSION: usize = 16_384;
 const MAX_BLOOM_FIELDS: usize = 4;
 const MAX_TREE_KEY_BYTES: usize = 8 * 1_024;
 const DEFAULT_MIN_PARTITION_ENTRIES: u32 = 16;

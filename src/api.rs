@@ -14,6 +14,7 @@ mod schema;
 mod search;
 mod verify;
 
+pub(crate) use config::MAX_DIMENSION;
 pub use config::{IndexConfig, RuntimeConfig};
 pub use error::{Error, ErrorKind, Result};
 pub use identifiers::{BatchToken, FieldId, IndexName, LogicalIndexId, PartitionKey};
