@@ -14,6 +14,8 @@ const DEFAULT_MIN_PARTITION_ENTRIES: u32 = 16;
 const DEFAULT_MAX_PARTITION_ENTRIES: u32 = 128;
 const MAX_PARTITION_ENTRIES: u32 = 65_536;
 const DEFAULT_FIXUP_QUEUE_CAPACITY: usize = 1_024;
+const DEFAULT_FOREGROUND_OPERATION_LIMIT: usize = 1_024;
+const MAX_FOREGROUND_OPERATION_LIMIT: usize = 65_536;
 const DEFAULT_ATTEMPTS: u32 = 8;
 const DEFAULT_PARTITION_CACHE_BYTES: u64 = 256 * 1_024 * 1_024;
 const DEFAULT_TREE_KEY_SCAN_RANGES: u32 = 1_024;
@@ -214,6 +216,7 @@ impl IndexConfig {
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct RuntimeConfig {
+    foreground_operation_limit: usize,
     maintenance_workers: usize,
     fixup_queue_capacity: usize,
     fixup_attempts: u32,
@@ -233,6 +236,7 @@ impl Default for RuntimeConfig {
         let available = thread::available_parallelism().map_or(1, usize::from);
         let workers = available.clamp(1, 8);
         Self {
+            foreground_operation_limit: DEFAULT_FOREGROUND_OPERATION_LIMIT,
             maintenance_workers: workers,
             fixup_queue_capacity: DEFAULT_FIXUP_QUEUE_CAPACITY,
             fixup_attempts: DEFAULT_ATTEMPTS,
@@ -250,6 +254,15 @@ impl Default for RuntimeConfig {
 }
 
 impl RuntimeConfig {
+    /// Sets equal bounds for running and waiting foreground operations.
+    pub fn with_foreground_operation_limit(mut self, limit: usize) -> Result<Self> {
+        if limit == 0 || limit > MAX_FOREGROUND_OPERATION_LIMIT {
+            return Err(Error::invalid_argument());
+        }
+        self.foreground_operation_limit = limit;
+        Ok(self)
+    }
+
     /// Sets maintenance worker and pending/running Fixup capacity.
     pub fn with_maintenance(mut self, workers: usize, queue_capacity: usize) -> Result<Self> {
         if workers == 0 || queue_capacity < workers {
@@ -330,7 +343,9 @@ impl RuntimeConfig {
 
     /// Validates all process-local resource bounds.
     pub fn validate(&self) -> Result<()> {
-        if self.maintenance_workers == 0
+        if self.foreground_operation_limit == 0
+            || self.foreground_operation_limit > MAX_FOREGROUND_OPERATION_LIMIT
+            || self.maintenance_workers == 0
             || self.fixup_queue_capacity < self.maintenance_workers
             || self.fixup_attempts == 0
             || self.foreground_attempts == 0
@@ -344,6 +359,12 @@ impl RuntimeConfig {
             return Err(Error::invalid_argument());
         }
         self.default_search_budgets.validate_hard_caps()
+    }
+
+    /// Returns each bound for running and waiting foreground operations.
+    #[must_use]
+    pub const fn foreground_operation_limit(&self) -> usize {
+        self.foreground_operation_limit
     }
 
     /// Returns the maintenance worker count.
