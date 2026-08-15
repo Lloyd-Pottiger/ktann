@@ -10,6 +10,9 @@ use ktann::storage::keys::KeyRange;
 use ktann_rocksdb::{BackendNamespace, RocksDbBackend};
 use rocksdb::{MemtableFactory, OptimisticTransactionDB, Options, SliceTransform};
 
+#[path = "../../tests/support/backend_contract.rs"]
+mod shared_backend_contract;
+
 fn key(value: &'static [u8]) -> Bytes {
     Bytes::from_static(value)
 }
@@ -41,6 +44,7 @@ async fn rocksdb_adapter_preserves_the_backend_contract() {
         assert_eq!(primary.admission_budget().max_mutation_bytes, 1 << 20);
         assert_eq!(primary.hard_limits().max_value_bytes, u32::MAX as usize);
         assert!(!primary.capabilities().transactional_clear_range);
+        shared_backend_contract::run(&primary).await;
 
         let mut write = primary.begin_write().await.expect("begin write");
         write

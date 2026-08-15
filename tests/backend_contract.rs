@@ -19,6 +19,8 @@ use ktann::storage::backend::{
 };
 use ktann::storage::keys::KeyRange;
 
+#[path = "support/backend_contract.rs"]
+mod shared_backend_contract;
 mod support;
 
 use support::{
@@ -97,6 +99,12 @@ fn transaction_types_are_send() {
     // requires only `Send`.
     assert_send::<DeterministicReadTxn<'static>>();
     assert_send::<DeterministicWriteTxn<'static>>();
+}
+
+#[test]
+fn deterministic_backend_runs_the_shared_public_contract() {
+    let backend = mock_with_clear();
+    block_on(shared_backend_contract::run(&backend));
 }
 
 #[test]
@@ -1221,4 +1229,291 @@ fn debug_and_history_redact_keys_and_values() {
         assert!(!debug.contains("another-value"));
         assert!(!debug.contains("secret-key"));
     }
+}
+
+#[test]
+fn scan_rejects_zero_limits_for_empty_ranges() {
+    let backend = mock();
+
+    block_on(async {
+        let empty_ranges = [range(b"a", b"a"), range(b"z", b"a")];
+        for empty_range in &empty_ranges {
+            let mut reader = backend.begin_read().await.expect("begin read");
+            let read_error = reader
+                .scan(
+                    empty_range,
+                    ScanLimits {
+                        item_limit: 0,
+                        byte_limit: 1,
+                    },
+                )
+                .await
+                .expect_err("read scan rejects zero limit");
+            assert_eq!(read_error.kind(), ErrorKind::InvalidArgument);
+
+            let mut writer = backend.begin_write().await.expect("begin write");
+            let write_error = writer
+                .scan(
+                    empty_range,
+                    ScanLimits {
+                        item_limit: 1,
+                        byte_limit: 0,
+                    },
+                )
+                .await
+                .expect_err("write scan rejects zero limit");
+            assert_eq!(write_error.kind(), ErrorKind::InvalidArgument);
+        }
+    });
+}
+
+#[test]
+fn hard_key_limit_applies_to_every_point_read() {
+    let config = DeterministicConfig {
+        hard_limits: HardLimits {
+            max_key_bytes: 1,
+            max_value_bytes: 4_096,
+        },
+        max_read_set: 1,
+        ..Default::default()
+    };
+    let backend = DeterministicBackend::new(config);
+    let oversized = Bytes::from_static(b"too long");
+
+    block_on(async {
+        let mut reader = backend.begin_read().await.expect("begin read");
+        assert_eq!(
+            reader
+                .get(oversized.clone())
+                .await
+                .expect_err("get rejects oversized key")
+                .kind(),
+            ErrorKind::LimitExceeded,
+        );
+        assert_eq!(
+            reader
+                .batch_get(vec![oversized.clone()])
+                .await
+                .expect_err("batch get rejects oversized key")
+                .kind(),
+            ErrorKind::LimitExceeded,
+        );
+
+        let mut writer = backend.begin_write().await.expect("begin write");
+        assert_eq!(
+            writer
+                .get(oversized.clone())
+                .await
+                .expect_err("write get rejects oversized key")
+                .kind(),
+            ErrorKind::LimitExceeded,
+        );
+        assert_eq!(
+            writer
+                .batch_get(vec![oversized.clone()])
+                .await
+                .expect_err("write batch get rejects oversized key")
+                .kind(),
+            ErrorKind::LimitExceeded,
+        );
+        assert_eq!(
+            writer
+                .get_for_update(oversized.clone())
+                .await
+                .expect_err("protected get rejects oversized key")
+                .kind(),
+            ErrorKind::LimitExceeded,
+        );
+        writer
+            .get_for_update(key(b"a"))
+            .await
+            .expect("failed protected get does not consume read-set capacity");
+
+        let mut batch_writer = backend.begin_write().await.expect("begin write");
+        assert_eq!(
+            batch_writer
+                .batch_get_for_update(vec![oversized])
+                .await
+                .expect_err("protected batch rejects oversized key")
+                .kind(),
+            ErrorKind::LimitExceeded,
+        );
+        batch_writer
+            .get_for_update(key(b"a"))
+            .await
+            .expect("failed protected batch does not consume read-set capacity");
+    });
+}
+
+#[test]
+fn unknown_applied_fault_does_not_bypass_point_conflicts() {
+    let backend = mock();
+
+    block_on(async {
+        let mut first = backend.begin_write().await.expect("begin first");
+        let mut second = backend.begin_write().await.expect("begin second");
+        assert_eq!(
+            first
+                .insert(key(b"unique"), key(b"first"))
+                .await
+                .expect("first insert"),
+            InsertOutcome::Inserted,
+        );
+        assert_eq!(
+            second
+                .insert(key(b"unique"), key(b"second"))
+                .await
+                .expect("second insert"),
+            InsertOutcome::Inserted,
+        );
+
+        first.commit().await.expect("first commit");
+        backend
+            .push_fault(CommitFault::UnknownApplied)
+            .expect("inject fault");
+        assert_eq!(
+            second
+                .commit()
+                .await
+                .expect_err("conflicting commit aborts")
+                .kind(),
+            ErrorKind::RetryableAbort,
+        );
+
+        let mut reader = backend.begin_read().await.expect("begin read");
+        assert_eq!(
+            reader.get(key(b"unique")).await.expect("read winner"),
+            Some(key(b"first")),
+        );
+    });
+}
+
+#[test]
+fn clear_range_charges_one_mutation_and_its_boundaries() {
+    let config = DeterministicConfig {
+        admission_budget: AdmissionBudget {
+            max_mutations: 1,
+            max_mutation_bytes: 2,
+        },
+        capabilities: Capabilities {
+            transactional_clear_range: true,
+        },
+        max_mutation_buffer: 1,
+        ..Default::default()
+    };
+    let backend = DeterministicBackend::new(config);
+    seed(&backend, &[(b"a", b"")]);
+    seed(&backend, &[(b"b", b"")]);
+
+    block_on(async {
+        let mut txn = backend.begin_write().await.expect("begin clear");
+        txn.clear_range(&range(b"a", b"c"))
+            .await
+            .expect("range contents do not count against the mutation budget");
+        txn.commit().await.expect("commit clear");
+
+        let mut reader = backend.begin_read().await.expect("begin read");
+        assert_eq!(reader.get(key(b"a")).await.expect("get a"), None);
+        assert_eq!(reader.get(key(b"b")).await.expect("get b"), None);
+    });
+}
+
+#[test]
+fn history_fingerprint_delimits_keys_and_values() {
+    let left = mock();
+    let right = mock();
+
+    block_on(async {
+        let mut left_txn = left.begin_write().await.expect("begin left");
+        left_txn.put(key(b"a"), key(b"bc")).await.expect("left put");
+        left_txn.commit().await.expect("left commit");
+
+        let mut right_txn = right.begin_write().await.expect("begin right");
+        right_txn
+            .put(key(b"ab"), key(b"c"))
+            .await
+            .expect("right put");
+        right_txn.commit().await.expect("right commit");
+    });
+
+    assert_ne!(left.history(), right.history());
+}
+
+#[test]
+fn committed_range_clear_conflicts_with_a_protected_point_read() {
+    let backend = mock_with_clear();
+
+    block_on(async {
+        let mut stale = backend.begin_write().await.expect("begin stale writer");
+        stale
+            .get_for_update(key(b"middle"))
+            .await
+            .expect("protected read");
+
+        let mut clear = backend.begin_write().await.expect("begin clear");
+        clear
+            .clear_range(&range(b"a", b"z"))
+            .await
+            .expect("stage clear");
+        clear.commit().await.expect("commit clear");
+
+        stale
+            .put(key(b"middle"), key(b"stale"))
+            .await
+            .expect("stage stale write");
+        assert_eq!(
+            stale
+                .commit()
+                .await
+                .expect_err("range clear conflicts")
+                .kind(),
+            ErrorKind::RetryableAbort,
+        );
+    });
+}
+
+#[test]
+fn range_clear_union_normalizes_overlap_adjacency_and_order() {
+    let config = DeterministicConfig {
+        capabilities: Capabilities {
+            transactional_clear_range: true,
+        },
+        max_mutation_buffer: 1,
+        ..Default::default()
+    };
+    let backend = DeterministicBackend::new(config);
+    for (entry_key, value) in [
+        (b"b".as_slice(), b"1".as_slice()),
+        (b"y".as_slice(), b"2".as_slice()),
+        (b"z".as_slice(), b"3".as_slice()),
+        (b"zz".as_slice(), b"4".as_slice()),
+    ] {
+        seed(&backend, &[(entry_key, value)]);
+    }
+
+    block_on(async {
+        let mut txn = backend.begin_write().await.expect("begin write");
+        txn.clear_range(&range(b"m", b"z"))
+            .await
+            .expect("first clear");
+        txn.clear_range(&range(b"a", b"n"))
+            .await
+            .expect("out-of-order overlapping clear shares the range");
+        txn.clear_range(&range(b"z", b"zz"))
+            .await
+            .expect("adjacent clear shares the range");
+        txn.clear_range(&range(b"b", b"c"))
+            .await
+            .expect("contained clear shares the range");
+        txn.commit().await.expect("commit normalized clears");
+
+        let mut reader = backend.begin_read().await.expect("begin read");
+        assert_eq!(
+            reader
+                .batch_get(vec![key(b"b"), key(b"y"), key(b"z"), key(b"zz")])
+                .await
+                .expect("read normalized clear result"),
+            vec![None, None, None, Some(key(b"4"))],
+        );
+    });
 }

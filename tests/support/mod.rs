@@ -59,8 +59,9 @@ pub enum CommitFault {
     /// A definite failure: nothing is applied and commit reports
     /// `ErrorKind::RetryableAbort`.
     Abort,
-    /// The mutation is applied but commit reports
-    /// `ErrorKind::CommitOutcomeUnknown`.
+    /// If conflict validation succeeds, the mutation is applied but commit
+    /// reports `ErrorKind::CommitOutcomeUnknown`. A conflicting transaction
+    /// still aborts without applying its mutations.
     UnknownApplied,
     /// Nothing is applied but commit reports `ErrorKind::CommitOutcomeUnknown`.
     UnknownNotApplied,
@@ -104,7 +105,7 @@ pub struct HistoryEntry {
     pub mutation_bytes: usize,
     /// The number of distinct keys in the transaction's mutation overlay.
     pub distinct_keys: usize,
-    /// A deterministic fingerprint of the final mutation overlay.
+    /// A deterministic fingerprint of the staged point and range mutations.
     pub fingerprint: u64,
 }
 
@@ -183,7 +184,8 @@ pub struct DeterministicConfig {
     pub max_batch_size: usize,
     /// Maximum number of distinct keys in one transaction's conflict set.
     pub max_read_set: usize,
-    /// Maximum number of distinct keys in one transaction's mutation overlay.
+    /// Maximum number of distinct point keys plus logical range clears in one
+    /// transaction's mutation overlay.
     pub max_mutation_buffer: usize,
     /// Maximum number of distinct committed keys.
     pub max_db_keys: usize,
@@ -276,6 +278,7 @@ struct State {
 struct VersionRecord {
     version: u64,
     written_keys: Vec<Vec<u8>>,
+    cleared_ranges: Vec<KeyRange>,
 }
 
 impl DeterministicBackend {
@@ -476,6 +479,9 @@ pub struct DeterministicWriteTxn<'backend> {
     snapshot: Arc<Keyspace>,
     /// Overlay of pending mutations; `None` marks a delete.
     pending: Overlay,
+    /// Logical range clears, applied before `pending` so later point mutations
+    /// win over earlier clears.
+    clear_ranges: Vec<KeyRange>,
     /// Keys read via `get_for_update`, establishing point conflicts.
     read_set: BTreeSet<Vec<u8>>,
     mutation_count: usize,
@@ -492,6 +498,7 @@ impl fmt::Debug for DeterministicWriteTxn<'_> {
             .field("mutation_bytes", &self.mutation_bytes)
             .field("read_set_len", &self.read_set.len())
             .field("pending_len", &self.pending.len())
+            .field("clear_ranges_len", &self.clear_ranges.len())
             .finish_non_exhaustive()
     }
 }
@@ -512,6 +519,13 @@ impl DeterministicWriteTxn<'_> {
         if let Some(entry) = self.pending.get(key) {
             return entry.as_ref().map(|value| Bytes::copy_from_slice(value));
         }
+        if self
+            .clear_ranges
+            .iter()
+            .any(|range| range_contains(range, key))
+        {
+            return None;
+        }
         self.snapshot
             .get(key)
             .map(|value| Bytes::copy_from_slice(value))
@@ -519,12 +533,9 @@ impl DeterministicWriteTxn<'_> {
 
     /// Rejects a key or value that exceeds the backend's hard limits.
     fn check_key_value(&self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
-        let hard = self.backend.config.hard_limits;
-        if key.len() > hard.max_key_bytes {
-            return Err(limit_exceeded());
-        }
+        check_key(&self.backend.config, key)?;
         if let Some(value) = value {
-            if value.len() > hard.max_value_bytes {
+            if value.len() > self.backend.config.hard_limits.max_value_bytes {
                 return Err(limit_exceeded());
             }
         }
@@ -565,15 +576,38 @@ impl DeterministicWriteTxn<'_> {
             .iter()
             .filter(|key| !self.pending.contains_key(*key))
             .count();
-        let next = self
+        let current = self
             .pending
             .len()
-            .checked_add(added)
+            .checked_add(self.clear_ranges.len())
             .ok_or_else(limit_exceeded)?;
+        let next = current.checked_add(added).ok_or_else(limit_exceeded)?;
         if next > self.backend.config.max_mutation_buffer {
             return Err(limit_exceeded());
         }
         Ok(())
+    }
+
+    /// Normalizes one additional clear and enforces the mutation-buffer bound.
+    fn prepare_clear_ranges(&self, range: &KeyRange) -> Result<Vec<KeyRange>> {
+        let clear_ranges = merge_clear_range(&self.clear_ranges, range);
+        let removed = self
+            .pending
+            .keys()
+            .filter(|key| range_contains(range, key))
+            .count();
+        let retained_points = self
+            .pending
+            .len()
+            .checked_sub(removed)
+            .ok_or_else(limit_exceeded)?;
+        let next = retained_points
+            .checked_add(clear_ranges.len())
+            .ok_or_else(limit_exceeded)?;
+        if next > self.backend.config.max_mutation_buffer {
+            return Err(limit_exceeded());
+        }
+        Ok(clear_ranges)
     }
 
     /// Performs the commit under the single state lock, returning the outcome.
@@ -583,17 +617,14 @@ impl DeterministicWriteTxn<'_> {
 
         let fault = state.fault_plan.pop_front().unwrap_or(CommitFault::Normal);
 
+        let too_old = !self.read_set.is_empty() && self.version < evicted_through(&state);
+        let can_apply = !too_old && !self.conflicts(&state);
         let (outcome, should_apply) = match fault {
-            CommitFault::Normal => {
-                let too_old = !self.read_set.is_empty() && self.version < evicted_through(&state);
-                if too_old || self.conflicts(&state) {
-                    (CommitOutcome::Aborted, false)
-                } else {
-                    (CommitOutcome::Committed, true)
-                }
-            }
+            CommitFault::Normal if can_apply => (CommitOutcome::Committed, true),
+            CommitFault::Normal => (CommitOutcome::Aborted, false),
             CommitFault::Abort => (CommitOutcome::Aborted, false),
-            CommitFault::UnknownApplied => (CommitOutcome::UnknownApplied, true),
+            CommitFault::UnknownApplied if can_apply => (CommitOutcome::UnknownApplied, true),
+            CommitFault::UnknownApplied => (CommitOutcome::Aborted, false),
             CommitFault::UnknownNotApplied => (CommitOutcome::UnknownNotApplied, false),
         };
 
@@ -603,11 +634,12 @@ impl DeterministicWriteTxn<'_> {
             mutations: self.mutation_count,
             mutation_bytes: self.mutation_bytes,
             distinct_keys: self.pending.len(),
-            fingerprint: fingerprint(&self.pending),
+            fingerprint: fingerprint(&self.clear_ranges, &self.pending),
         };
 
         let applied_version = if should_apply {
-            let (new_map, new_db_bytes) = apply_pending(&state.committed, &self.pending)?;
+            let new_map = apply_staged(&state.committed, &self.clear_ranges, &self.pending);
+            let new_db_bytes = try_sum_bytes(&new_map)?;
             if new_map.len() > config.max_db_keys || new_db_bytes > config.max_db_bytes {
                 entry.outcome = CommitOutcome::LimitExceeded;
                 state.history.push(entry);
@@ -624,6 +656,7 @@ impl DeterministicWriteTxn<'_> {
             state.versions.push_back(VersionRecord {
                 version: new_version,
                 written_keys,
+                cleared_ranges: self.clear_ranges.clone(),
             });
             gc_versions(&mut state, config.max_retained_versions);
             entry.version = new_version;
@@ -655,6 +688,13 @@ impl DeterministicWriteTxn<'_> {
                 .last_written
                 .get(key)
                 .is_some_and(|v| *v > self.version)
+                || state.versions.iter().any(|record| {
+                    record.version > self.version
+                        && record
+                            .cleared_ranges
+                            .iter()
+                            .any(|range| range_contains(range, key))
+                })
         })
     }
 }
@@ -691,6 +731,7 @@ impl Backend for DeterministicBackend {
             version,
             snapshot,
             pending: BTreeMap::new(),
+            clear_ranges: Vec::new(),
             read_set: BTreeSet::new(),
             mutation_count: 0,
             mutation_bytes: 0,
@@ -716,6 +757,7 @@ impl DeterministicBackend {
 
 impl ReadOps for DeterministicReadTxn<'_> {
     async fn get(&mut self, key: Bytes) -> Result<Option<Bytes>> {
+        check_key(&self.backend.config, &key)?;
         Ok(self.get_value(&key))
     }
 
@@ -723,14 +765,16 @@ impl ReadOps for DeterministicReadTxn<'_> {
         if keys.len() > self.backend.config.max_batch_size {
             return Err(limit_exceeded());
         }
+        check_keys(&self.backend.config, &keys)?;
         Ok(keys.into_iter().map(|key| self.get_value(&key)).collect())
     }
 
     async fn scan(&mut self, range: &KeyRange, limits: ScanLimits) -> Result<ScanPage> {
+        let (item_limit, byte_limit) = resolve_scan(limits, &self.backend.config)?;
         if range.start() >= range.end() {
             return Ok(ScanPage::new(Vec::new(), None));
         }
-        let (item_limit, byte_limit) = resolve_scan(limits, &self.backend.config)?;
+        check_range(&self.backend.config, range)?;
         scan_map(&self.snapshot, range, item_limit, byte_limit)
     }
 }
@@ -739,6 +783,7 @@ impl ReadTxn for DeterministicReadTxn<'_> {}
 
 impl ReadOps for DeterministicWriteTxn<'_> {
     async fn get(&mut self, key: Bytes) -> Result<Option<Bytes>> {
+        check_key(&self.backend.config, &key)?;
         Ok(self.lookup(&key))
     }
 
@@ -746,21 +791,24 @@ impl ReadOps for DeterministicWriteTxn<'_> {
         if keys.len() > self.backend.config.max_batch_size {
             return Err(limit_exceeded());
         }
+        check_keys(&self.backend.config, &keys)?;
         Ok(keys.into_iter().map(|key| self.lookup(&key)).collect())
     }
 
     async fn scan(&mut self, range: &KeyRange, limits: ScanLimits) -> Result<ScanPage> {
+        let (item_limit, byte_limit) = resolve_scan(limits, &self.backend.config)?;
         if range.start() >= range.end() {
             return Ok(ScanPage::new(Vec::new(), None));
         }
-        let (item_limit, byte_limit) = resolve_scan(limits, &self.backend.config)?;
-        let merged = merged(&self.snapshot, &self.pending);
+        check_range(&self.backend.config, range)?;
+        let merged = apply_staged(&self.snapshot, &self.clear_ranges, &self.pending);
         scan_map(&merged, range, item_limit, byte_limit)
     }
 }
 
 impl WriteTxn for DeterministicWriteTxn<'_> {
     async fn get_for_update(&mut self, key: Bytes) -> Result<Option<Bytes>> {
+        check_key(&self.backend.config, &key)?;
         self.add_read(&key)?;
         Ok(self.lookup(&key))
     }
@@ -769,6 +817,7 @@ impl WriteTxn for DeterministicWriteTxn<'_> {
         if keys.len() > self.backend.config.max_batch_size {
             return Err(limit_exceeded());
         }
+        check_keys(&self.backend.config, &keys)?;
         for key in &keys {
             self.add_read(key)?;
         }
@@ -866,26 +915,16 @@ impl WriteTxn for DeterministicWriteTxn<'_> {
         if range.start() >= range.end() {
             return Ok(());
         }
-        let start = range.start().to_vec();
-        let end = range.end().to_vec();
-        let mut keys = BTreeSet::new();
-        for (key, _) in self.snapshot.range(start.clone()..end.clone()) {
-            keys.insert(key.clone());
-        }
-        for (key, _) in self.pending.range(start..end) {
-            keys.insert(key.clone());
-        }
-        let mut bytes_delta = 0usize;
-        for key in &keys {
-            bytes_delta = bytes_delta
-                .checked_add(key.len())
-                .ok_or_else(limit_exceeded)?;
-        }
-        self.check_buffer_growth(&keys)?;
-        self.charge(keys.len(), bytes_delta)?;
-        for key in keys {
-            self.pending.insert(key, None);
-        }
+        check_range(&self.backend.config, range)?;
+        let clear_ranges = self.prepare_clear_ranges(range)?;
+        let bytes = range
+            .start()
+            .len()
+            .checked_add(range.end().len())
+            .ok_or_else(limit_exceeded)?;
+        self.charge(1, bytes)?;
+        self.pending.retain(|key, _| !range_contains(range, key));
+        self.clear_ranges = clear_ranges;
         Ok(())
     }
 
@@ -909,24 +948,6 @@ fn evicted_through(state: &State) -> u64 {
         .unwrap_or(0)
 }
 
-/// Applies a pending overlay to a committed map, returning the new map and its
-/// total byte count.
-fn apply_pending(committed: &Keyspace, pending: &Overlay) -> Result<(Keyspace, usize)> {
-    let mut map = committed.clone();
-    for (key, value) in pending {
-        match value {
-            Some(value) => {
-                map.insert(key.clone(), value.clone());
-            }
-            None => {
-                map.remove(key);
-            }
-        }
-    }
-    let bytes = try_sum_bytes(&map)?;
-    Ok((map, bytes))
-}
-
 /// Sums the encoded key-plus-value bytes of a keyspace with checked arithmetic.
 fn try_sum_bytes(map: &Keyspace) -> Result<usize> {
     map.iter().try_fold(0usize, |acc, (key, value)| {
@@ -938,9 +959,20 @@ fn try_sum_bytes(map: &Keyspace) -> Result<usize> {
     })
 }
 
-/// The merged view of a snapshot and an optional pending overlay.
-fn merged(snapshot: &Keyspace, pending: &Overlay) -> Keyspace {
+/// Materializes staged range clears and point mutations over a snapshot.
+fn apply_staged(snapshot: &Keyspace, clear_ranges: &[KeyRange], pending: &Overlay) -> Keyspace {
     let mut map = snapshot.clone();
+    // `clear_ranges` is a sorted, disjoint union and `BTreeMap::retain` visits
+    // keys in ascending order, so one monotonic range cursor clears the map.
+    let mut clear_index = 0usize;
+    map.retain(|key, _| {
+        while clear_index < clear_ranges.len() && clear_ranges[clear_index].end() <= key.as_slice()
+        {
+            clear_index += 1;
+        }
+        clear_index >= clear_ranges.len()
+            || !range_contains(&clear_ranges[clear_index], key.as_slice())
+    });
     for (key, value) in pending {
         match value {
             Some(value) => {
@@ -952,6 +984,42 @@ fn merged(snapshot: &Keyspace, pending: &Overlay) -> Keyspace {
         }
     }
     map
+}
+
+/// Inserts one range into a sorted, disjoint range union.
+fn merge_clear_range(clear_ranges: &[KeyRange], added: &KeyRange) -> Vec<KeyRange> {
+    let mut merged = Vec::with_capacity(clear_ranges.len().saturating_add(1));
+    let mut start = added.start().to_vec();
+    let mut end = added.end().to_vec();
+    let mut inserted = false;
+
+    for range in clear_ranges {
+        if range.end() < start.as_slice() {
+            merged.push(range.clone());
+        } else if end.as_slice() < range.start() {
+            if !inserted {
+                merged.push(KeyRange::new(start.clone(), end.clone()));
+                inserted = true;
+            }
+            merged.push(range.clone());
+        } else {
+            if range.start() < start.as_slice() {
+                start = range.start().to_vec();
+            }
+            if range.end() > end.as_slice() {
+                end = range.end().to_vec();
+            }
+        }
+    }
+
+    if !inserted {
+        merged.push(KeyRange::new(start, end));
+    }
+    merged
+}
+
+fn range_contains(range: &KeyRange, key: &[u8]) -> bool {
+    range.start() <= key && key < range.end()
 }
 
 /// Evicts retained versions beyond `max_retained_versions`, dropping the
@@ -977,6 +1045,28 @@ fn resolve_scan(limits: ScanLimits, config: &DeterministicConfig) -> Result<(usi
         limits.item_limit.min(config.max_scan_page_items),
         limits.byte_limit.min(config.max_scan_page_bytes),
     ))
+}
+
+/// Enforces the backend's hard logical-key ceiling.
+fn check_key(config: &DeterministicConfig, key: &[u8]) -> Result<()> {
+    if key.len() > config.hard_limits.max_key_bytes {
+        return Err(limit_exceeded());
+    }
+    Ok(())
+}
+
+/// Validates every key before a batch read performs any transaction work.
+fn check_keys(config: &DeterministicConfig, keys: &[Bytes]) -> Result<()> {
+    for key in keys {
+        check_key(config, key)?;
+    }
+    Ok(())
+}
+
+/// Enforces hard key limits on both bounds of a non-empty logical range.
+fn check_range(config: &DeterministicConfig, range: &KeyRange) -> Result<()> {
+    check_key(config, range.start())?;
+    check_key(config, range.end())
 }
 
 /// Scans an ordered map, returning one bounded page with a strict cursor.
@@ -1054,25 +1144,39 @@ impl Fnv1a {
         }
     }
 
+    /// Writes a length-delimited field so adjacent fields cannot collide.
+    fn write_field(&mut self, bytes: &[u8]) {
+        let length = u64::try_from(bytes.len())
+            .expect("supported Rust targets use no more than 64-bit usize");
+        self.write(&length.to_le_bytes());
+        self.write(bytes);
+    }
+
     fn finish(self) -> u64 {
         self.0
     }
 }
 
-/// A deterministic content fingerprint of a mutation overlay, without raw keys
+/// A deterministic content fingerprint of staged mutations, without raw keys
 /// or values.
-fn fingerprint(pending: &Overlay) -> u64 {
+fn fingerprint(clear_ranges: &[KeyRange], pending: &Overlay) -> u64 {
     let mut hasher = Fnv1a::new();
+    hasher.write(b"ktann-deterministic-history-v1");
+    for range in clear_ranges {
+        hasher.write(&[3]);
+        hasher.write_field(range.start());
+        hasher.write_field(range.end());
+    }
     for (key, value) in pending {
         match value {
             Some(value) => {
                 hasher.write(&[1]);
-                hasher.write(key);
-                hasher.write(value);
+                hasher.write_field(key);
+                hasher.write_field(value);
             }
             None => {
                 hasher.write(&[2]);
-                hasher.write(key);
+                hasher.write_field(key);
             }
         }
     }
