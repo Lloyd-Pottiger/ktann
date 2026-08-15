@@ -23,6 +23,7 @@ use ktann::storage::keys::KeyRange;
 mod shared_backend_contract;
 mod support;
 
+use shared_backend_contract::{BackendHarness, Fault, FaultInjection, RestartMode};
 use support::{
     CommitFault, CommitOutcome, DeterministicBackend, DeterministicConfig, DeterministicReadTxn,
     DeterministicWriteTxn, Durability, HistoryEntry,
@@ -86,6 +87,63 @@ fn outcomes(history: &[HistoryEntry]) -> Vec<CommitOutcome> {
     history.iter().map(|entry| entry.outcome).collect()
 }
 
+/// Adapts the deterministic test backend to the shared [`BackendHarness`] seam.
+///
+/// Controlled faults map one-to-one onto the backend's fault plan, and restart
+/// reuses [`DeterministicBackend::reopen`], so the shared durability case
+/// observes the configured [`Durability`].
+struct DeterministicHarness {
+    backend: DeterministicBackend,
+    restart: RestartMode,
+}
+
+impl DeterministicHarness {
+    fn new(config: DeterministicConfig) -> Self {
+        let restart = match config.durability {
+            Durability::Durable => RestartMode::Durable,
+            Durability::Ephemeral => RestartMode::Ephemeral,
+        };
+        Self {
+            backend: DeterministicBackend::new(config),
+            restart,
+        }
+    }
+}
+
+impl BackendHarness for DeterministicHarness {
+    type Backend = DeterministicBackend;
+
+    fn backend(&self) -> &DeterministicBackend {
+        &self.backend
+    }
+
+    fn fault_injection(&self) -> FaultInjection {
+        FaultInjection::Controlled
+    }
+
+    fn inject_fault(&self, fault: Fault) {
+        let commit_fault = match fault {
+            Fault::Abort => CommitFault::Abort,
+            Fault::UnknownApplied => CommitFault::UnknownApplied,
+            Fault::UnknownNotApplied => CommitFault::UnknownNotApplied,
+        };
+        self.backend
+            .set_fault_plan(vec![commit_fault])
+            .expect("single-step fault plan fits");
+    }
+
+    fn restart_mode(&self) -> RestartMode {
+        self.restart
+    }
+
+    fn restart(&self) -> Self {
+        Self {
+            backend: self.backend.reopen(),
+            restart: self.restart,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Compile-time interface shape.
 // ---------------------------------------------------------------------------
@@ -102,9 +160,39 @@ fn transaction_types_are_send() {
 }
 
 #[test]
-fn deterministic_backend_runs_the_shared_public_contract() {
-    let backend = mock_with_clear();
-    block_on(shared_backend_contract::run(&backend));
+fn deterministic_backend_runs_the_shared_contract_suite_durable() {
+    let harness = DeterministicHarness::new(DeterministicConfig {
+        durability: Durability::Durable,
+        capabilities: Capabilities {
+            transactional_clear_range: true,
+        },
+        ..Default::default()
+    });
+    block_on(shared_backend_contract::run_suite(&harness));
+}
+
+#[test]
+fn deterministic_backend_runs_the_shared_contract_suite_ephemeral() {
+    let harness = DeterministicHarness::new(DeterministicConfig {
+        durability: Durability::Ephemeral,
+        capabilities: Capabilities {
+            transactional_clear_range: true,
+        },
+        ..Default::default()
+    });
+    block_on(shared_backend_contract::run_suite(&harness));
+}
+
+#[test]
+fn deterministic_backend_declines_range_clear_in_the_shared_suite() {
+    let harness = DeterministicHarness::new(DeterministicConfig {
+        durability: Durability::Durable,
+        capabilities: Capabilities {
+            transactional_clear_range: false,
+        },
+        ..Default::default()
+    });
+    block_on(shared_backend_contract::run_suite(&harness));
 }
 
 #[test]
