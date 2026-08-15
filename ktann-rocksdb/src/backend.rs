@@ -520,7 +520,14 @@ fn limit_exceeded() -> Error {
 }
 
 fn map_operation_error(error: RocksError) -> Error {
-    let kind = match error.kind() {
+    let kind = map_operation_error_kind(error.kind());
+    Error::with_source(kind, error)
+}
+
+/// Maps a native RocksDB error kind to a stable backend category for a
+/// non-commit operation.
+fn map_operation_error_kind(kind: RocksErrorKind) -> ErrorKind {
+    match kind {
         RocksErrorKind::Corruption => ErrorKind::Corruption,
         RocksErrorKind::NotSupported => ErrorKind::Unsupported,
         RocksErrorKind::TimedOut
@@ -529,17 +536,22 @@ fn map_operation_error(error: RocksError) -> Error {
         | RocksErrorKind::Expired
         | RocksErrorKind::TryAgain => ErrorKind::RetryableAbort,
         _ => ErrorKind::Backend,
-    };
-    Error::with_source(kind, error)
+    }
 }
 
 fn map_commit_error(error: RocksError) -> Error {
-    match error.kind() {
+    let kind = map_commit_error_kind(error.kind());
+    Error::with_source(kind, error)
+}
+
+/// Maps a native RocksDB error kind to a stable backend category for a commit.
+fn map_commit_error_kind(kind: RocksErrorKind) -> ErrorKind {
+    match kind {
         RocksErrorKind::IOError
         | RocksErrorKind::Incomplete
         | RocksErrorKind::ShutdownInProgress
-        | RocksErrorKind::Unknown => Error::with_source(ErrorKind::CommitOutcomeUnknown, error),
-        _ => map_operation_error(error),
+        | RocksErrorKind::Unknown => ErrorKind::CommitOutcomeUnknown,
+        _ => map_operation_error_kind(kind),
     }
 }
 
@@ -577,6 +589,50 @@ mod tests {
                 .expect_err("oversized")
                 .kind(),
             ErrorKind::InvalidArgument,
+        );
+    }
+
+    #[test]
+    fn rocksdb_errors_map_to_stable_backend_categories() {
+        assert_eq!(
+            map_operation_error_kind(RocksErrorKind::Corruption),
+            ErrorKind::Corruption,
+        );
+        assert_eq!(
+            map_operation_error_kind(RocksErrorKind::NotSupported),
+            ErrorKind::Unsupported,
+        );
+        assert_eq!(
+            map_operation_error_kind(RocksErrorKind::Busy),
+            ErrorKind::RetryableAbort,
+        );
+        assert_eq!(
+            map_operation_error_kind(RocksErrorKind::TryAgain),
+            ErrorKind::RetryableAbort,
+        );
+        assert_eq!(
+            map_operation_error_kind(RocksErrorKind::NotFound),
+            ErrorKind::Backend,
+        );
+        assert_eq!(
+            map_commit_error_kind(RocksErrorKind::Busy),
+            ErrorKind::RetryableAbort,
+        );
+        assert_eq!(
+            map_commit_error_kind(RocksErrorKind::IOError),
+            ErrorKind::CommitOutcomeUnknown,
+        );
+        assert_eq!(
+            map_commit_error_kind(RocksErrorKind::Incomplete),
+            ErrorKind::CommitOutcomeUnknown,
+        );
+        assert_eq!(
+            map_commit_error_kind(RocksErrorKind::ShutdownInProgress),
+            ErrorKind::CommitOutcomeUnknown,
+        );
+        assert_eq!(
+            map_commit_error_kind(RocksErrorKind::Unknown),
+            ErrorKind::CommitOutcomeUnknown,
         );
     }
 }
