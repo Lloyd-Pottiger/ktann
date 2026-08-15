@@ -1,409 +1,40 @@
 //! Backend-neutral transaction contract tests.
 //!
 //! These tests drive a deterministic in-memory mock backend exclusively through
-//! the public [`ktann::storage::backend`] seam. The mock models the contract
-//! (snapshot isolation, read-your-writes, update-protected conflicts, ordered
-//! scans and batches, unique insertion, rollback, commit outcomes, hard limits
-//! and admission budgets, and the range-clear capability) without depending on
-//! any production adapter.
+//! the public [`ktann::storage::backend`] seam. The backend models the contract
+//! (snapshot isolation, read-your-writes, update-protected conflicts including
+//! ABA, ordered scans and batches, unique insertion, rollback, commit outcomes,
+//! hard limits and admission budgets, and the range-clear capability) without
+//! depending on any production adapter. Resource bounds, fault injection,
+//! replay history, and restart semantics use the test-backend-specific seams in
+//! [`support`].
 
-use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::marker::PhantomData;
-use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use ktann::api::{Error, ErrorKind, Result};
+use ktann::api::ErrorKind;
 use ktann::storage::backend::{
-    AdmissionBudget, Backend, Capabilities, HardLimits, InsertOutcome, Mutation, ReadOps, ReadTxn,
-    ScanItem, ScanLimits, ScanPage, WriteTxn,
+    AdmissionBudget, Backend, Capabilities, HardLimits, InsertOutcome, Mutation, ReadOps,
+    ScanLimits, ScanPage, WriteTxn,
 };
 use ktann::storage::keys::KeyRange;
 
+#[path = "support/backend_contract.rs"]
+mod shared_backend_contract;
+mod support;
+
+use support::{
+    CommitFault, CommitOutcome, DeterministicBackend, DeterministicConfig, DeterministicReadTxn,
+    DeterministicWriteTxn, Durability, HistoryEntry,
+};
+
 /// Drives an already-borrowing future to completion on a current-thread
-/// runtime. The mock's futures never park, so this never blocks.
+/// runtime. The backend's futures never park, so this never blocks.
 fn block_on<F: Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("current-thread runtime builds")
         .block_on(future)
-}
-
-/// A deterministic in-memory KV backend implementing [`Backend`].
-///
-/// Committed data is an immutable `Arc<BTreeMap>` snapshot; every read and
-/// write transaction captures its own clone at begin time. Writes apply to a
-/// per-transaction overlay and install a fresh snapshot on commit, giving
-/// snapshot isolation and read-your-writes without a versioned log.
-struct MockBackend {
-    hard_limits: HardLimits,
-    admission_budget: AdmissionBudget,
-    capabilities: Capabilities,
-    state: Mutex<MockState>,
-    fault: Mutex<CommitFault>,
-}
-
-#[derive(Default)]
-struct MockState {
-    committed: Arc<BTreeMap<Vec<u8>, Vec<u8>>>,
-}
-
-/// An injected commit outcome for fault-injection tests.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CommitFault {
-    /// Commit proceeds normally.
-    None,
-    /// The mutation is applied but the result is reported unknown.
-    Unknown,
-    /// The mutation is discarded and commit reports a retryable abort.
-    Fail,
-}
-
-impl MockBackend {
-    fn new(
-        hard_limits: HardLimits,
-        admission_budget: AdmissionBudget,
-        capabilities: Capabilities,
-    ) -> Self {
-        Self {
-            hard_limits,
-            admission_budget,
-            capabilities,
-            state: Mutex::new(MockState {
-                committed: Arc::new(BTreeMap::new()),
-            }),
-            fault: Mutex::new(CommitFault::None),
-        }
-    }
-
-    fn set_fault(&self, fault: CommitFault) {
-        *self.fault.lock().expect("fault lock poisoned") = fault;
-    }
-}
-
-/// A read transaction: one immutable snapshot.
-///
-/// The `PhantomData` reference ties the transaction's lifetime and auto-traits
-/// to its backend; the `Cell` marker makes the type `Send` but not `Sync`,
-/// proving the interface does not require `Sync`.
-struct MockReadTxn<'backend> {
-    _backend: PhantomData<&'backend MockBackend>,
-    snapshot: Arc<BTreeMap<Vec<u8>, Vec<u8>>>,
-    _not_sync: PhantomData<Cell<()>>,
-}
-
-/// A write transaction: a snapshot plus an uncommitted overlay.
-struct MockWriteTxn<'backend> {
-    backend: &'backend MockBackend,
-    snapshot: Arc<BTreeMap<Vec<u8>, Vec<u8>>>,
-    /// Overlay of pending mutations; `None` marks a delete.
-    pending: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
-    /// Keys read via `get_for_update`, establishing point conflicts.
-    read_set: BTreeSet<Vec<u8>>,
-    mutation_count: usize,
-    mutation_bytes: usize,
-    /// Makes the type `Send` but not `Sync` (same purpose as in the read txn).
-    _not_sync: PhantomData<Cell<()>>,
-}
-
-impl MockReadTxn<'_> {
-    fn lookup(&self, key: &[u8]) -> Option<Bytes> {
-        self.snapshot
-            .get(key)
-            .map(|value| Bytes::from(value.clone()))
-    }
-}
-
-impl MockWriteTxn<'_> {
-    /// Reads through the pending overlay for read-your-writes.
-    fn lookup(&self, key: &[u8]) -> Option<Bytes> {
-        if let Some(entry) = self.pending.get(key) {
-            return entry.as_ref().map(|value| Bytes::from(value.clone()));
-        }
-        self.snapshot
-            .get(key)
-            .map(|value| Bytes::from(value.clone()))
-    }
-
-    /// Charges one mutation against hard limits and the admission budget.
-    fn account(&mut self, key: &[u8], value_bytes: usize) -> Result<()> {
-        let hard = self.backend.hard_limits;
-        if key.len() > hard.max_key_bytes || value_bytes > hard.max_value_bytes {
-            return Err(Error::new(ErrorKind::LimitExceeded));
-        }
-        let budget = self.backend.admission_budget;
-        if self.mutation_count >= budget.max_mutations {
-            return Err(Error::new(ErrorKind::LimitExceeded));
-        }
-        let total = key
-            .len()
-            .checked_add(value_bytes)
-            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-        let next_bytes = self
-            .mutation_bytes
-            .checked_add(total)
-            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-        if next_bytes > budget.max_mutation_bytes {
-            return Err(Error::new(ErrorKind::LimitExceeded));
-        }
-        self.mutation_count += 1;
-        self.mutation_bytes = next_bytes;
-        Ok(())
-    }
-
-    /// Installs the pending overlay into the committed snapshot.
-    fn apply(&self, state: &mut MockState) {
-        let mut committed = (*state.committed).clone();
-        for (key, value) in &self.pending {
-            match value {
-                Some(value) => {
-                    committed.insert(key.clone(), value.clone());
-                }
-                None => {
-                    committed.remove(key);
-                }
-            }
-        }
-        state.committed = Arc::new(committed);
-    }
-}
-
-/// Scans the merged view of a snapshot and an optional pending overlay.
-fn scan_merged(
-    snapshot: &BTreeMap<Vec<u8>, Vec<u8>>,
-    pending: Option<&BTreeMap<Vec<u8>, Option<Vec<u8>>>>,
-    range: &KeyRange,
-    limits: ScanLimits,
-) -> Result<ScanPage> {
-    if limits.item_limit == 0 || limits.byte_limit == 0 {
-        return Err(Error::new(ErrorKind::InvalidArgument));
-    }
-
-    let merged: BTreeMap<Vec<u8>, Vec<u8>> = match pending {
-        None => snapshot.clone(),
-        Some(pending) => {
-            let mut merged = snapshot.clone();
-            for (key, value) in pending {
-                match value {
-                    Some(value) => {
-                        merged.insert(key.clone(), value.clone());
-                    }
-                    None => {
-                        merged.remove(key);
-                    }
-                }
-            }
-            merged
-        }
-    };
-
-    let start = range.start();
-    let end = range.end();
-    let mut items = Vec::new();
-    let mut byte_total = 0_usize;
-    let mut next = None;
-    for (key, value) in merged.range(start.to_vec()..end.to_vec()) {
-        let item_bytes = key.len() + value.len();
-        if items.is_empty() {
-            // A single oversized first item is returned alone so a legal value
-            // stays readable; every later item must fit within the byte limit.
-            items.push(ScanItem::new(
-                Bytes::copy_from_slice(key),
-                Bytes::copy_from_slice(value),
-            ));
-            byte_total += item_bytes;
-            continue;
-        }
-        if items.len() >= limits.item_limit || byte_total + item_bytes > limits.byte_limit {
-            next = Some(Bytes::copy_from_slice(key));
-            break;
-        }
-        items.push(ScanItem::new(
-            Bytes::copy_from_slice(key),
-            Bytes::copy_from_slice(value),
-        ));
-        byte_total += item_bytes;
-    }
-    Ok(ScanPage::new(items, next))
-}
-
-impl Backend for MockBackend {
-    type ReadTxn<'backend> = MockReadTxn<'backend>;
-    type WriteTxn<'backend> = MockWriteTxn<'backend>;
-
-    fn hard_limits(&self) -> HardLimits {
-        self.hard_limits
-    }
-
-    fn admission_budget(&self) -> AdmissionBudget {
-        self.admission_budget
-    }
-
-    fn capabilities(&self) -> Capabilities {
-        self.capabilities
-    }
-
-    async fn begin_read(&self) -> Result<MockReadTxn<'_>> {
-        let committed = self
-            .state
-            .lock()
-            .expect("state lock poisoned")
-            .committed
-            .clone();
-        Ok(MockReadTxn {
-            _backend: PhantomData,
-            snapshot: committed,
-            _not_sync: PhantomData,
-        })
-    }
-
-    async fn begin_write(&self) -> Result<MockWriteTxn<'_>> {
-        let committed = self
-            .state
-            .lock()
-            .expect("state lock poisoned")
-            .committed
-            .clone();
-        Ok(MockWriteTxn {
-            backend: self,
-            snapshot: committed,
-            pending: BTreeMap::new(),
-            read_set: BTreeSet::new(),
-            mutation_count: 0,
-            mutation_bytes: 0,
-            _not_sync: PhantomData,
-        })
-    }
-}
-
-impl ReadOps for MockReadTxn<'_> {
-    async fn get(&mut self, key: Bytes) -> Result<Option<Bytes>> {
-        Ok(self.lookup(&key))
-    }
-
-    async fn batch_get(&mut self, keys: Vec<Bytes>) -> Result<Vec<Option<Bytes>>> {
-        Ok(keys.into_iter().map(|key| self.lookup(&key)).collect())
-    }
-
-    async fn scan(&mut self, range: &KeyRange, limits: ScanLimits) -> Result<ScanPage> {
-        scan_merged(&self.snapshot, None, range, limits)
-    }
-}
-
-impl ReadOps for MockWriteTxn<'_> {
-    async fn get(&mut self, key: Bytes) -> Result<Option<Bytes>> {
-        Ok(self.lookup(&key))
-    }
-
-    async fn batch_get(&mut self, keys: Vec<Bytes>) -> Result<Vec<Option<Bytes>>> {
-        Ok(keys.into_iter().map(|key| self.lookup(&key)).collect())
-    }
-
-    async fn scan(&mut self, range: &KeyRange, limits: ScanLimits) -> Result<ScanPage> {
-        scan_merged(&self.snapshot, Some(&self.pending), range, limits)
-    }
-}
-
-impl ReadTxn for MockReadTxn<'_> {}
-
-impl WriteTxn for MockWriteTxn<'_> {
-    async fn get_for_update(&mut self, key: Bytes) -> Result<Option<Bytes>> {
-        self.read_set.insert(key.to_vec());
-        Ok(self.lookup(&key))
-    }
-
-    async fn batch_get_for_update(&mut self, keys: Vec<Bytes>) -> Result<Vec<Option<Bytes>>> {
-        for key in &keys {
-            self.read_set.insert(key.to_vec());
-        }
-        Ok(keys.into_iter().map(|key| self.lookup(&key)).collect())
-    }
-
-    async fn put(&mut self, key: Bytes, value: Bytes) -> Result<()> {
-        self.account(&key, value.len())?;
-        self.pending.insert(key.to_vec(), Some(value.to_vec()));
-        Ok(())
-    }
-
-    async fn insert(&mut self, key: Bytes, value: Bytes) -> Result<InsertOutcome> {
-        self.account(&key, value.len())?;
-        if self.lookup(&key).is_some() {
-            return Ok(InsertOutcome::AlreadyExists);
-        }
-        self.pending.insert(key.to_vec(), Some(value.to_vec()));
-        Ok(InsertOutcome::Inserted)
-    }
-
-    async fn delete(&mut self, key: Bytes) -> Result<()> {
-        self.account(&key, 0)?;
-        self.pending.insert(key.to_vec(), None);
-        Ok(())
-    }
-
-    async fn batch_mutate(&mut self, mutations: Vec<Mutation>) -> Result<()> {
-        for mutation in mutations {
-            match mutation {
-                Mutation::Put { key, value } => {
-                    self.account(&key, value.len())?;
-                    self.pending.insert(key.to_vec(), Some(value.to_vec()));
-                }
-                Mutation::Delete { key } => {
-                    self.account(&key, 0)?;
-                    self.pending.insert(key.to_vec(), None);
-                }
-                _ => return Err(Error::new(ErrorKind::Unsupported)),
-            }
-        }
-        Ok(())
-    }
-
-    async fn clear_range(&mut self, range: &KeyRange) -> Result<()> {
-        if !self.backend.capabilities.transactional_clear_range {
-            return Err(Error::new(ErrorKind::Unsupported));
-        }
-        let start = range.start();
-        let end = range.end();
-        let mut keys = BTreeSet::new();
-        for key in self.snapshot.keys() {
-            if key.as_slice() >= start && key.as_slice() < end {
-                keys.insert(key.clone());
-            }
-        }
-        for key in self.pending.keys() {
-            if key.as_slice() >= start && key.as_slice() < end {
-                keys.insert(key.clone());
-            }
-        }
-        for key in keys {
-            self.pending.insert(key, None);
-        }
-        Ok(())
-    }
-
-    async fn commit(self) -> Result<()> {
-        let fault = *self.backend.fault.lock().expect("fault lock poisoned");
-        let mut state = self.backend.state.lock().expect("state lock poisoned");
-
-        match fault {
-            CommitFault::Fail => Err(Error::new(ErrorKind::RetryableAbort)),
-            CommitFault::Unknown => {
-                self.apply(&mut state);
-                Err(Error::new(ErrorKind::CommitOutcomeUnknown))
-            }
-            CommitFault::None => {
-                for key in &self.read_set {
-                    if state.committed.get(key) != self.snapshot.get(key) {
-                        return Err(Error::new(ErrorKind::RetryableAbort));
-                    }
-                }
-                self.apply(&mut state);
-                Ok(())
-            }
-        }
-    }
-
-    async fn rollback(self) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -418,39 +49,21 @@ fn range(start: &[u8], end: &[u8]) -> KeyRange {
     KeyRange::new(start.to_vec(), end.to_vec())
 }
 
-fn mock() -> MockBackend {
-    MockBackend::new(
-        HardLimits {
-            max_key_bytes: 1_024,
-            max_value_bytes: 4_096,
-        },
-        AdmissionBudget {
-            max_mutations: 1_000,
-            max_mutation_bytes: 1 << 20,
-        },
-        Capabilities {
-            transactional_clear_range: false,
-        },
-    )
+fn mock() -> DeterministicBackend {
+    DeterministicBackend::new(DeterministicConfig::default())
 }
 
-fn mock_with_clear() -> MockBackend {
-    MockBackend::new(
-        HardLimits {
-            max_key_bytes: 1_024,
-            max_value_bytes: 4_096,
-        },
-        AdmissionBudget {
-            max_mutations: 1_000,
-            max_mutation_bytes: 1 << 20,
-        },
-        Capabilities {
+fn mock_with_clear() -> DeterministicBackend {
+    let config = DeterministicConfig {
+        capabilities: Capabilities {
             transactional_clear_range: true,
         },
-    )
+        ..Default::default()
+    };
+    DeterministicBackend::new(config)
 }
 
-fn seed(backend: &MockBackend, entries: &[(&'static [u8], &'static [u8])]) {
+fn seed(backend: &DeterministicBackend, entries: &[(&'static [u8], &'static [u8])]) {
     block_on(async {
         let mut txn = backend.begin_write().await.expect("begin write");
         for (entry_key, entry_value) in entries {
@@ -469,6 +82,10 @@ fn scanned_keys(page: &ScanPage) -> Vec<&[u8]> {
         .collect()
 }
 
+fn outcomes(history: &[HistoryEntry]) -> Vec<CommitOutcome> {
+    history.iter().map(|entry| entry.outcome).collect()
+}
+
 // ---------------------------------------------------------------------------
 // Compile-time interface shape.
 // ---------------------------------------------------------------------------
@@ -476,11 +93,18 @@ fn scanned_keys(page: &ScanPage) -> Vec<&[u8]> {
 #[test]
 fn transaction_types_are_send() {
     fn assert_send<T: Send>() {}
-    // `MockReadTxn` and `MockWriteTxn` are `Send` for any backend lifetime.
-    // Their `PhantomData<Cell<()>>` field makes them `!Sync`, and yet they still
-    // satisfy `ReadTxn`/`WriteTxn`, proving the interface requires only `Send`.
-    assert_send::<MockReadTxn<'static>>();
-    assert_send::<MockWriteTxn<'static>>();
+    // `DeterministicReadTxn` and `DeterministicWriteTxn` are `Send` for any
+    // backend lifetime. Their `PhantomData<Cell<()>>` field makes them `!Sync`,
+    // and yet they still satisfy `ReadTxn`/`WriteTxn`, proving the interface
+    // requires only `Send`.
+    assert_send::<DeterministicReadTxn<'static>>();
+    assert_send::<DeterministicWriteTxn<'static>>();
+}
+
+#[test]
+fn deterministic_backend_runs_the_shared_public_contract() {
+    let backend = mock_with_clear();
+    block_on(shared_backend_contract::run(&backend));
 }
 
 #[test]
@@ -513,6 +137,29 @@ fn snapshot_consistency_isolates_later_commits() {
 
         assert_eq!(reader.get(key(b"a")).await.expect("get"), Some(key(b"1")));
         assert_eq!(reader.get(key(b"b")).await.expect("get"), None);
+    });
+}
+
+#[test]
+fn long_lived_read_txn_observes_original_version() {
+    let backend = mock();
+    seed(&backend, &[(b"a", b"1")]);
+
+    block_on(async {
+        let mut reader = backend.begin_read().await.expect("begin read");
+        // Several subsequent commits must leave the open snapshot untouched.
+        for (entry_key, entry_value) in [(b"b", b"2"), (b"c", b"3"), (b"a", b"4")] {
+            let mut writer = backend.begin_write().await.expect("begin write");
+            writer
+                .put(key(entry_key), key(entry_value))
+                .await
+                .expect("put");
+            writer.commit().await.expect("commit");
+        }
+
+        assert_eq!(reader.get(key(b"a")).await.expect("get"), Some(key(b"1")));
+        assert_eq!(reader.get(key(b"b")).await.expect("get"), None);
+        assert_eq!(reader.get(key(b"c")).await.expect("get"), None);
     });
 }
 
@@ -678,6 +325,81 @@ fn scan_rejects_zero_limits_before_work() {
     });
 }
 
+#[test]
+fn scan_empty_range_returns_empty_page() {
+    let backend = mock();
+    seed(&backend, &[(b"a", b"1")]);
+
+    block_on(async {
+        let mut txn = backend.begin_read().await.expect("begin read");
+        let page = txn
+            .scan(
+                &range(b"b", b"a"),
+                ScanLimits {
+                    item_limit: 10,
+                    byte_limit: 10,
+                },
+            )
+            .await
+            .expect("scan");
+        assert!(page.items().is_empty());
+        assert!(page.next_start().is_none());
+    });
+}
+
+#[test]
+fn scan_page_item_cap_is_enforced() {
+    let config = DeterministicConfig {
+        max_scan_page_items: 1,
+        ..Default::default()
+    };
+    let backend = DeterministicBackend::new(config);
+    seed(&backend, &[(b"a", b"1"), (b"b", b"2")]);
+
+    block_on(async {
+        let mut txn = backend.begin_read().await.expect("begin read");
+        let page = txn
+            .scan(
+                &range(b"a", b"\xff"),
+                ScanLimits {
+                    item_limit: 100,
+                    byte_limit: 1_024,
+                },
+            )
+            .await
+            .expect("scan");
+        assert_eq!(page.items().len(), 1);
+        assert_eq!(page.items()[0].key().as_ref(), b"a");
+        assert!(page.next_start().is_some());
+    });
+}
+
+#[test]
+fn scan_page_byte_cap_is_enforced() {
+    let config = DeterministicConfig {
+        max_scan_page_bytes: 2,
+        ..Default::default()
+    };
+    let backend = DeterministicBackend::new(config);
+    seed(&backend, &[(b"a", b"1"), (b"b", b"2")]);
+
+    block_on(async {
+        let mut txn = backend.begin_read().await.expect("begin read");
+        let page = txn
+            .scan(
+                &range(b"a", b"\xff"),
+                ScanLimits {
+                    item_limit: 100,
+                    byte_limit: 1_024,
+                },
+            )
+            .await
+            .expect("scan");
+        assert_eq!(page.items().len(), 1);
+        assert_eq!(page.items()[0].key().as_ref(), b"a");
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Mutations.
 // ---------------------------------------------------------------------------
@@ -721,6 +443,80 @@ fn empty_batch_mutate_succeeds() {
         let mut txn = backend.begin_write().await.expect("begin write");
         txn.batch_mutate(Vec::new()).await.expect("empty batch");
         txn.commit().await.expect("commit");
+    });
+}
+
+#[test]
+fn batch_mutate_capacity_failure_leaves_no_partial_state() {
+    let backend = DeterministicBackend::new(DeterministicConfig::new(
+        HardLimits {
+            max_key_bytes: 1_024,
+            max_value_bytes: 1_024,
+        },
+        AdmissionBudget {
+            max_mutations: 2,
+            max_mutation_bytes: 1 << 20,
+        },
+        Capabilities {
+            transactional_clear_range: false,
+        },
+    ));
+
+    block_on(async {
+        let mut txn = backend.begin_write().await.expect("begin write");
+        let error = txn
+            .batch_mutate(vec![
+                Mutation::Put {
+                    key: key(b"a"),
+                    value: key(b"1"),
+                },
+                Mutation::Put {
+                    key: key(b"b"),
+                    value: key(b"2"),
+                },
+                Mutation::Put {
+                    key: key(b"c"),
+                    value: key(b"3"),
+                },
+            ])
+            .await
+            .expect_err("exceeds mutation budget");
+        assert_eq!(error.kind(), ErrorKind::LimitExceeded);
+
+        // Nothing was applied, and the transaction is still usable.
+        assert_eq!(txn.get(key(b"a")).await.expect("get"), None);
+        assert_eq!(txn.get(key(b"b")).await.expect("get"), None);
+        txn.batch_mutate(vec![Mutation::Put {
+            key: key(b"a"),
+            value: key(b"1"),
+        }])
+        .await
+        .expect("single mutation fits");
+        txn.commit().await.expect("commit");
+    });
+}
+
+#[test]
+fn write_txn_scan_sees_its_own_mutations() {
+    let backend = mock();
+    seed(&backend, &[(b"a", b"1"), (b"b", b"2"), (b"c", b"3")]);
+
+    block_on(async {
+        let mut txn = backend.begin_write().await.expect("begin write");
+        txn.put(key(b"x"), key(b"9")).await.expect("put");
+        txn.delete(key(b"b")).await.expect("delete");
+        let page = txn
+            .scan(
+                &range(b"a", b"\xff"),
+                ScanLimits {
+                    item_limit: 100,
+                    byte_limit: 1_024,
+                },
+            )
+            .await
+            .expect("scan");
+        assert_eq!(scanned_keys(&page), vec![&b"a"[..], &b"c"[..], &b"x"[..]]);
+        txn.rollback().await;
     });
 }
 
@@ -781,6 +577,57 @@ fn update_protected_read_conflict_aborts() {
     });
 }
 
+#[test]
+fn key_restored_to_original_value_still_conflicts() {
+    let backend = mock();
+    block_on(async {
+        // Reads the key absent at version 0.
+        let mut reader = backend.begin_write().await.expect("begin write");
+        reader.get_for_update(key(b"k")).await.expect("read");
+
+        // A write then a delete restore the original (absent) value.
+        let mut first = backend.begin_write().await.expect("begin write");
+        first.put(key(b"k"), key(b"1")).await.expect("put");
+        first.commit().await.expect("commit");
+
+        let mut second = backend.begin_write().await.expect("begin write");
+        second.delete(key(b"k")).await.expect("delete");
+        second.commit().await.expect("commit");
+
+        // The value matches the reader's snapshot, but the version changed.
+        reader.put(key(b"k"), key(b"2")).await.expect("put");
+        let error = reader.commit().await.expect_err("ABA conflict");
+        assert_eq!(error.kind(), ErrorKind::RetryableAbort);
+    });
+}
+
+#[test]
+fn concurrent_unique_insert_does_not_silently_overwrite() {
+    let backend = mock();
+    block_on(async {
+        let mut first = backend.begin_write().await.expect("begin write");
+        let mut second = backend.begin_write().await.expect("begin write");
+
+        assert_eq!(
+            first.insert(key(b"k"), key(b"1")).await.expect("insert"),
+            InsertOutcome::Inserted
+        );
+        assert_eq!(
+            second.insert(key(b"k"), key(b"2")).await.expect("insert"),
+            InsertOutcome::Inserted
+        );
+
+        first.commit().await.expect("first commit wins");
+        let error = second.commit().await.expect_err("second insert conflicts");
+        assert_eq!(error.kind(), ErrorKind::RetryableAbort);
+    });
+
+    block_on(async {
+        let mut txn = backend.begin_read().await.expect("begin read");
+        assert_eq!(txn.get(key(b"k")).await.expect("get"), Some(key(b"1")));
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Commit outcomes and rollback.
 // ---------------------------------------------------------------------------
@@ -792,6 +639,21 @@ fn rollback_persists_nothing() {
         let mut txn = backend.begin_write().await.expect("begin write");
         txn.put(key(b"a"), key(b"v")).await.expect("put");
         txn.rollback().await;
+    });
+
+    block_on(async {
+        let mut txn = backend.begin_read().await.expect("begin read");
+        assert_eq!(txn.get(key(b"a")).await.expect("get"), None);
+    });
+}
+
+#[test]
+fn dropping_a_transaction_persists_nothing() {
+    let backend = mock();
+    block_on(async {
+        let mut txn = backend.begin_write().await.expect("begin write");
+        txn.put(key(b"a"), key(b"v")).await.expect("put");
+        drop(txn);
     });
 
     block_on(async {
@@ -816,12 +678,35 @@ fn commit_success_is_visible_to_subsequent_snapshots() {
 }
 
 #[test]
+fn commit_installs_complete_new_version_never_partial() {
+    let backend = mock();
+    seed(&backend, &[(b"a", b"1"), (b"b", b"2")]);
+
+    block_on(async {
+        let mut reader = backend.begin_read().await.expect("begin read");
+        let mut writer = backend.begin_write().await.expect("begin write");
+        writer.put(key(b"a"), key(b"x")).await.expect("put");
+        writer.put(key(b"b"), key(b"y")).await.expect("put");
+        writer.commit().await.expect("commit");
+
+        // The pre-commit reader sees the complete old version, never a mix.
+        assert_eq!(reader.get(key(b"a")).await.expect("get"), Some(key(b"1")));
+        assert_eq!(reader.get(key(b"b")).await.expect("get"), Some(key(b"2")));
+
+        // A post-commit reader sees the complete new version.
+        let mut after = backend.begin_read().await.expect("begin read");
+        assert_eq!(after.get(key(b"a")).await.expect("get"), Some(key(b"x")));
+        assert_eq!(after.get(key(b"b")).await.expect("get"), Some(key(b"y")));
+    });
+}
+
+#[test]
 fn commit_failure_and_unknown_outcome_are_distinct() {
     let backend = mock();
 
     // Definite failure: an injected fault reports a retryable abort.
+    backend.push_fault(CommitFault::Abort).expect("fault");
     block_on(async {
-        backend.set_fault(CommitFault::Fail);
         let mut txn = backend.begin_write().await.expect("begin write");
         txn.put(key(b"a"), key(b"v")).await.expect("put");
         let error = txn.commit().await.expect_err("faulted commit fails");
@@ -829,15 +714,58 @@ fn commit_failure_and_unknown_outcome_are_distinct() {
     });
 
     // Unknown outcome: the mutation lands but the result is reported unknown.
+    backend
+        .push_fault(CommitFault::UnknownApplied)
+        .expect("fault");
     block_on(async {
-        backend.set_fault(CommitFault::Unknown);
         let mut txn = backend.begin_write().await.expect("begin write");
         txn.put(key(b"b"), key(b"v")).await.expect("put");
         let error = txn.commit().await.expect_err("faulted commit is unknown");
         assert_eq!(error.kind(), ErrorKind::CommitOutcomeUnknown);
     });
+}
 
-    backend.set_fault(CommitFault::None);
+#[test]
+fn unknown_applied_persists_all_mutations_atomically() {
+    let backend = mock();
+    backend
+        .push_fault(CommitFault::UnknownApplied)
+        .expect("fault");
+
+    block_on(async {
+        let mut txn = backend.begin_write().await.expect("begin write");
+        txn.put(key(b"a"), key(b"1")).await.expect("put");
+        txn.put(key(b"b"), key(b"2")).await.expect("put");
+        let error = txn.commit().await.expect_err("unknown outcome");
+        assert_eq!(error.kind(), ErrorKind::CommitOutcomeUnknown);
+    });
+
+    block_on(async {
+        let mut txn = backend.begin_read().await.expect("begin read");
+        assert_eq!(txn.get(key(b"a")).await.expect("get"), Some(key(b"1")));
+        assert_eq!(txn.get(key(b"b")).await.expect("get"), Some(key(b"2")));
+    });
+}
+
+#[test]
+fn unknown_not_applied_persists_nothing() {
+    let backend = mock();
+    backend
+        .push_fault(CommitFault::UnknownNotApplied)
+        .expect("fault");
+
+    block_on(async {
+        let mut txn = backend.begin_write().await.expect("begin write");
+        txn.put(key(b"a"), key(b"1")).await.expect("put");
+        let error = txn.commit().await.expect_err("unknown outcome");
+        assert_eq!(error.kind(), ErrorKind::CommitOutcomeUnknown);
+    });
+
+    assert_eq!(backend.db_key_count(), 0);
+    block_on(async {
+        let mut txn = backend.begin_read().await.expect("begin read");
+        assert_eq!(txn.get(key(b"a")).await.expect("get"), None);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -846,7 +774,7 @@ fn commit_failure_and_unknown_outcome_are_distinct() {
 
 #[test]
 fn hard_limit_rejects_oversized_key_and_value() {
-    let backend = MockBackend::new(
+    let backend = DeterministicBackend::new(DeterministicConfig::new(
         HardLimits {
             max_key_bytes: 2,
             max_value_bytes: 2,
@@ -858,7 +786,7 @@ fn hard_limit_rejects_oversized_key_and_value() {
         Capabilities {
             transactional_clear_range: false,
         },
-    );
+    ));
 
     block_on(async {
         let mut txn = backend.begin_write().await.expect("begin write");
@@ -878,7 +806,7 @@ fn hard_limit_rejects_oversized_key_and_value() {
 
 #[test]
 fn admission_budget_rejects_excess_mutations_and_bytes() {
-    let backend = MockBackend::new(
+    let backend = DeterministicBackend::new(DeterministicConfig::new(
         HardLimits {
             max_key_bytes: 1_024,
             max_value_bytes: 1_024,
@@ -890,7 +818,7 @@ fn admission_budget_rejects_excess_mutations_and_bytes() {
         Capabilities {
             transactional_clear_range: false,
         },
-    );
+    ));
 
     block_on(async {
         let mut txn = backend.begin_write().await.expect("begin write");
@@ -912,6 +840,173 @@ fn admission_budget_rejects_excess_mutations_and_bytes() {
             .expect_err("exceeds mutation bytes");
         assert_eq!(error.kind(), ErrorKind::LimitExceeded);
     });
+}
+
+#[test]
+fn active_transaction_limit_is_enforced() {
+    let config = DeterministicConfig {
+        max_active_transactions: 1,
+        ..Default::default()
+    };
+    let backend = DeterministicBackend::new(config);
+
+    block_on(async {
+        let open = backend.begin_read().await.expect("first admits");
+        assert_eq!(backend.active_transactions(), 1);
+        let error = backend
+            .begin_write()
+            .await
+            .expect_err("second exceeds active limit");
+        assert_eq!(error.kind(), ErrorKind::LimitExceeded);
+
+        drop(open);
+        assert_eq!(backend.active_transactions(), 0);
+        backend
+            .begin_write()
+            .await
+            .expect("third admits after release");
+    });
+}
+
+#[test]
+fn read_set_limit_is_enforced() {
+    let config = DeterministicConfig {
+        max_read_set: 1,
+        ..Default::default()
+    };
+    let backend = DeterministicBackend::new(config);
+
+    block_on(async {
+        let mut txn = backend.begin_write().await.expect("begin write");
+        txn.get_for_update(key(b"a")).await.expect("first read");
+        let error = txn
+            .get_for_update(key(b"b"))
+            .await
+            .expect_err("read set full");
+        assert_eq!(error.kind(), ErrorKind::LimitExceeded);
+    });
+}
+
+#[test]
+fn mutation_buffer_limit_is_enforced() {
+    let config = DeterministicConfig {
+        max_mutation_buffer: 1,
+        ..Default::default()
+    };
+    let backend = DeterministicBackend::new(config);
+
+    block_on(async {
+        let mut txn = backend.begin_write().await.expect("begin write");
+        txn.put(key(b"a"), key(b"1")).await.expect("first key");
+        let error = txn
+            .put(key(b"b"), key(b"2"))
+            .await
+            .expect_err("buffer full");
+        assert_eq!(error.kind(), ErrorKind::LimitExceeded);
+    });
+}
+
+#[test]
+fn batch_size_limit_is_enforced() {
+    let config = DeterministicConfig {
+        max_batch_size: 2,
+        ..Default::default()
+    };
+    let backend = DeterministicBackend::new(config);
+
+    block_on(async {
+        let mut txn = backend.begin_read().await.expect("begin read");
+        let error = txn
+            .batch_get(vec![key(b"a"), key(b"b"), key(b"c")])
+            .await
+            .expect_err("batch too large");
+        assert_eq!(error.kind(), ErrorKind::LimitExceeded);
+    });
+}
+
+#[test]
+fn db_key_limit_is_enforced() {
+    let config = DeterministicConfig {
+        max_db_keys: 1,
+        ..Default::default()
+    };
+    let backend = DeterministicBackend::new(config);
+    seed(&backend, &[(b"a", b"1")]);
+
+    block_on(async {
+        let mut txn = backend.begin_write().await.expect("begin write");
+        txn.put(key(b"b"), key(b"2")).await.expect("put accepted");
+        let error = txn.commit().await.expect_err("exceeds db key limit");
+        assert_eq!(error.kind(), ErrorKind::LimitExceeded);
+    });
+
+    assert_eq!(backend.db_key_count(), 1);
+}
+
+#[test]
+fn db_byte_limit_is_enforced() {
+    let config = DeterministicConfig {
+        max_db_bytes: 4,
+        ..Default::default()
+    };
+    let backend = DeterministicBackend::new(config);
+    seed(&backend, &[(b"a", b"1"), (b"b", b"2")]);
+
+    block_on(async {
+        let mut txn = backend.begin_write().await.expect("begin write");
+        txn.put(key(b"c"), key(b"3")).await.expect("put accepted");
+        let error = txn.commit().await.expect_err("exceeds db byte limit");
+        assert_eq!(error.kind(), ErrorKind::LimitExceeded);
+    });
+
+    assert_eq!(backend.db_byte_count(), 4);
+}
+
+#[test]
+fn retained_version_eviction_rejects_too_old_commit() {
+    let config = DeterministicConfig {
+        max_retained_versions: 1,
+        ..Default::default()
+    };
+    let backend = DeterministicBackend::new(config);
+
+    block_on(async {
+        let mut stale = backend.begin_write().await.expect("begin write");
+        stale
+            .get_for_update(key(b"k"))
+            .await
+            .expect("read at version 0");
+
+        // Two commits evict the version the stale transaction read from.
+        let mut first = backend.begin_write().await.expect("begin write");
+        first.put(key(b"x"), key(b"1")).await.expect("put");
+        first.commit().await.expect("commit");
+
+        let mut second = backend.begin_write().await.expect("begin write");
+        second.put(key(b"y"), key(b"2")).await.expect("put");
+        second.commit().await.expect("commit");
+
+        stale.put(key(b"k"), key(b"v")).await.expect("put");
+        let error = stale.commit().await.expect_err("read version evicted");
+        assert_eq!(error.kind(), ErrorKind::RetryableAbort);
+    });
+}
+
+#[test]
+fn fault_plan_limit_is_enforced() {
+    let config = DeterministicConfig {
+        max_fault_plan: 2,
+        ..Default::default()
+    };
+    let backend = DeterministicBackend::new(config);
+
+    backend
+        .set_fault_plan(vec![CommitFault::Normal, CommitFault::Abort])
+        .expect("plan fits");
+    let error = backend
+        .push_fault(CommitFault::Abort)
+        .expect_err("plan full");
+    assert_eq!(error.kind(), ErrorKind::LimitExceeded);
 }
 
 // ---------------------------------------------------------------------------
@@ -950,5 +1045,475 @@ fn clear_range_clears_transactionally_when_supported() {
         assert_eq!(txn.get(key(b"a")).await.expect("get"), None);
         assert_eq!(txn.get(key(b"b")).await.expect("get"), None);
         assert_eq!(txn.get(key(b"z")).await.expect("get"), Some(key(b"3")));
+    });
+}
+
+#[test]
+fn clear_range_composes_with_other_mutations_in_txn() {
+    let backend = mock_with_clear();
+    seed(&backend, &[(b"a", b"1"), (b"b", b"2")]);
+
+    block_on(async {
+        let mut txn = backend.begin_write().await.expect("begin write");
+        txn.clear_range(&range(b"a", b"c")).await.expect("clear");
+        txn.put(key(b"b"), key(b"reinserted")).await.expect("put");
+        // The put wins over the range clear for the same key.
+        assert_eq!(
+            txn.get(key(b"b")).await.expect("get"),
+            Some(key(b"reinserted"))
+        );
+        txn.commit().await.expect("commit");
+    });
+
+    block_on(async {
+        let mut txn = backend.begin_read().await.expect("begin read");
+        assert_eq!(txn.get(key(b"a")).await.expect("get"), None);
+        assert_eq!(
+            txn.get(key(b"b")).await.expect("get"),
+            Some(key(b"reinserted"))
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Durability and restart.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn durable_restart_preserves_committed_data() {
+    let config = DeterministicConfig {
+        durability: Durability::Durable,
+        ..Default::default()
+    };
+    let backend = DeterministicBackend::new(config);
+    seed(&backend, &[(b"a", b"1"), (b"b", b"2")]);
+
+    let restarted = backend.reopen();
+    assert_eq!(restarted.db_key_count(), 2);
+    block_on(async {
+        let mut txn = restarted.begin_read().await.expect("begin read");
+        assert_eq!(txn.get(key(b"a")).await.expect("get"), Some(key(b"1")));
+        assert_eq!(txn.get(key(b"b")).await.expect("get"), Some(key(b"2")));
+    });
+}
+
+#[test]
+fn ephemeral_restart_starts_empty() {
+    let backend = DeterministicBackend::new(DeterministicConfig::default());
+    seed(&backend, &[(b"a", b"1")]);
+
+    let restarted = backend.reopen();
+    assert_eq!(restarted.db_key_count(), 0);
+    block_on(async {
+        let mut txn = restarted.begin_read().await.expect("begin read");
+        assert_eq!(txn.get(key(b"a")).await.expect("get"), None);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic history and replay.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn history_records_outcomes_without_raw_bytes() {
+    let backend = mock();
+    backend
+        .set_fault_plan(vec![
+            CommitFault::Normal,
+            CommitFault::UnknownApplied,
+            CommitFault::Abort,
+            CommitFault::UnknownNotApplied,
+        ])
+        .expect("plan fits");
+
+    block_on(async {
+        for value in [b"1", b"2", b"3", b"4"] {
+            let mut txn = backend.begin_write().await.expect("begin write");
+            txn.put(key(b"secret-key"), key(value)).await.expect("put");
+            let _ = txn.commit().await;
+        }
+    });
+
+    let history = backend.history();
+    assert_eq!(
+        outcomes(&history),
+        vec![
+            CommitOutcome::Committed,
+            CommitOutcome::UnknownApplied,
+            CommitOutcome::Aborted,
+            CommitOutcome::UnknownNotApplied,
+        ]
+    );
+    for entry in &history {
+        let debug = format!("{entry:?}");
+        assert!(!debug.contains("secret-key"));
+    }
+}
+
+#[test]
+fn same_seed_and_plan_reproduce_identical_history() {
+    let plan = vec![
+        CommitFault::Normal,
+        CommitFault::UnknownApplied,
+        CommitFault::Abort,
+        CommitFault::UnknownNotApplied,
+        CommitFault::Normal,
+    ];
+
+    let backend_a = DeterministicBackend::new(DeterministicConfig::default());
+    backend_a.set_fault_plan(plan.clone()).expect("plan fits");
+    let backend_b = DeterministicBackend::new(DeterministicConfig::default());
+    backend_b.set_fault_plan(plan).expect("plan fits");
+
+    let replay = |backend: &DeterministicBackend| {
+        block_on(async {
+            for value in [b"1", b"2", b"3", b"4", b"5"] {
+                let mut txn = backend.begin_write().await.expect("begin write");
+                txn.put(key(b"k"), key(value)).await.expect("put");
+                let _ = txn.commit().await;
+            }
+        });
+        backend.history()
+    };
+
+    let history_a = replay(&backend_a);
+    let history_b = replay(&backend_b);
+    assert!(!history_a.is_empty());
+    assert_eq!(history_a, history_b);
+}
+
+#[test]
+fn history_ring_truncation_is_exposed() {
+    let config = DeterministicConfig {
+        max_history_entries: 2,
+        ..Default::default()
+    };
+    let backend = DeterministicBackend::new(config);
+    assert!(!backend.history_truncated());
+
+    seed(&backend, &[(b"a", b"1")]);
+    seed(&backend, &[(b"b", b"2")]);
+    seed(&backend, &[(b"c", b"3")]);
+
+    assert_eq!(backend.history().len(), 2);
+    assert!(backend.history_truncated());
+}
+
+// ---------------------------------------------------------------------------
+// Redaction.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn debug_and_history_redact_keys_and_values() {
+    let backend = mock();
+    seed(&backend, &[(b"secret-key", b"secret-value")]);
+
+    let backend_debug = format!("{backend:?}");
+    assert!(!backend_debug.contains("secret-key"));
+    assert!(!backend_debug.contains("secret-value"));
+
+    block_on(async {
+        let mut txn = backend.begin_write().await.expect("begin write");
+        txn.put(key(b"another-key"), key(b"another-value"))
+            .await
+            .expect("put");
+        let txn_debug = format!("{txn:?}");
+        assert!(!txn_debug.contains("another-key"));
+        assert!(!txn_debug.contains("another-value"));
+        txn.commit().await.expect("commit");
+    });
+
+    for entry in &backend.history() {
+        let debug = format!("{entry:?}");
+        assert!(!debug.contains("another-key"));
+        assert!(!debug.contains("another-value"));
+        assert!(!debug.contains("secret-key"));
+    }
+}
+
+#[test]
+fn scan_rejects_zero_limits_for_empty_ranges() {
+    let backend = mock();
+
+    block_on(async {
+        let empty_ranges = [range(b"a", b"a"), range(b"z", b"a")];
+        for empty_range in &empty_ranges {
+            let mut reader = backend.begin_read().await.expect("begin read");
+            let read_error = reader
+                .scan(
+                    empty_range,
+                    ScanLimits {
+                        item_limit: 0,
+                        byte_limit: 1,
+                    },
+                )
+                .await
+                .expect_err("read scan rejects zero limit");
+            assert_eq!(read_error.kind(), ErrorKind::InvalidArgument);
+
+            let mut writer = backend.begin_write().await.expect("begin write");
+            let write_error = writer
+                .scan(
+                    empty_range,
+                    ScanLimits {
+                        item_limit: 1,
+                        byte_limit: 0,
+                    },
+                )
+                .await
+                .expect_err("write scan rejects zero limit");
+            assert_eq!(write_error.kind(), ErrorKind::InvalidArgument);
+        }
+    });
+}
+
+#[test]
+fn hard_key_limit_applies_to_every_point_read() {
+    let config = DeterministicConfig {
+        hard_limits: HardLimits {
+            max_key_bytes: 1,
+            max_value_bytes: 4_096,
+        },
+        max_read_set: 1,
+        ..Default::default()
+    };
+    let backend = DeterministicBackend::new(config);
+    let oversized = Bytes::from_static(b"too long");
+
+    block_on(async {
+        let mut reader = backend.begin_read().await.expect("begin read");
+        assert_eq!(
+            reader
+                .get(oversized.clone())
+                .await
+                .expect_err("get rejects oversized key")
+                .kind(),
+            ErrorKind::LimitExceeded,
+        );
+        assert_eq!(
+            reader
+                .batch_get(vec![oversized.clone()])
+                .await
+                .expect_err("batch get rejects oversized key")
+                .kind(),
+            ErrorKind::LimitExceeded,
+        );
+
+        let mut writer = backend.begin_write().await.expect("begin write");
+        assert_eq!(
+            writer
+                .get(oversized.clone())
+                .await
+                .expect_err("write get rejects oversized key")
+                .kind(),
+            ErrorKind::LimitExceeded,
+        );
+        assert_eq!(
+            writer
+                .batch_get(vec![oversized.clone()])
+                .await
+                .expect_err("write batch get rejects oversized key")
+                .kind(),
+            ErrorKind::LimitExceeded,
+        );
+        assert_eq!(
+            writer
+                .get_for_update(oversized.clone())
+                .await
+                .expect_err("protected get rejects oversized key")
+                .kind(),
+            ErrorKind::LimitExceeded,
+        );
+        writer
+            .get_for_update(key(b"a"))
+            .await
+            .expect("failed protected get does not consume read-set capacity");
+
+        let mut batch_writer = backend.begin_write().await.expect("begin write");
+        assert_eq!(
+            batch_writer
+                .batch_get_for_update(vec![oversized])
+                .await
+                .expect_err("protected batch rejects oversized key")
+                .kind(),
+            ErrorKind::LimitExceeded,
+        );
+        batch_writer
+            .get_for_update(key(b"a"))
+            .await
+            .expect("failed protected batch does not consume read-set capacity");
+    });
+}
+
+#[test]
+fn unknown_applied_fault_does_not_bypass_point_conflicts() {
+    let backend = mock();
+
+    block_on(async {
+        let mut first = backend.begin_write().await.expect("begin first");
+        let mut second = backend.begin_write().await.expect("begin second");
+        assert_eq!(
+            first
+                .insert(key(b"unique"), key(b"first"))
+                .await
+                .expect("first insert"),
+            InsertOutcome::Inserted,
+        );
+        assert_eq!(
+            second
+                .insert(key(b"unique"), key(b"second"))
+                .await
+                .expect("second insert"),
+            InsertOutcome::Inserted,
+        );
+
+        first.commit().await.expect("first commit");
+        backend
+            .push_fault(CommitFault::UnknownApplied)
+            .expect("inject fault");
+        assert_eq!(
+            second
+                .commit()
+                .await
+                .expect_err("conflicting commit aborts")
+                .kind(),
+            ErrorKind::RetryableAbort,
+        );
+
+        let mut reader = backend.begin_read().await.expect("begin read");
+        assert_eq!(
+            reader.get(key(b"unique")).await.expect("read winner"),
+            Some(key(b"first")),
+        );
+    });
+}
+
+#[test]
+fn clear_range_charges_one_mutation_and_its_boundaries() {
+    let config = DeterministicConfig {
+        admission_budget: AdmissionBudget {
+            max_mutations: 1,
+            max_mutation_bytes: 2,
+        },
+        capabilities: Capabilities {
+            transactional_clear_range: true,
+        },
+        max_mutation_buffer: 1,
+        ..Default::default()
+    };
+    let backend = DeterministicBackend::new(config);
+    seed(&backend, &[(b"a", b"")]);
+    seed(&backend, &[(b"b", b"")]);
+
+    block_on(async {
+        let mut txn = backend.begin_write().await.expect("begin clear");
+        txn.clear_range(&range(b"a", b"c"))
+            .await
+            .expect("range contents do not count against the mutation budget");
+        txn.commit().await.expect("commit clear");
+
+        let mut reader = backend.begin_read().await.expect("begin read");
+        assert_eq!(reader.get(key(b"a")).await.expect("get a"), None);
+        assert_eq!(reader.get(key(b"b")).await.expect("get b"), None);
+    });
+}
+
+#[test]
+fn history_fingerprint_delimits_keys_and_values() {
+    let left = mock();
+    let right = mock();
+
+    block_on(async {
+        let mut left_txn = left.begin_write().await.expect("begin left");
+        left_txn.put(key(b"a"), key(b"bc")).await.expect("left put");
+        left_txn.commit().await.expect("left commit");
+
+        let mut right_txn = right.begin_write().await.expect("begin right");
+        right_txn
+            .put(key(b"ab"), key(b"c"))
+            .await
+            .expect("right put");
+        right_txn.commit().await.expect("right commit");
+    });
+
+    assert_ne!(left.history(), right.history());
+}
+
+#[test]
+fn committed_range_clear_conflicts_with_a_protected_point_read() {
+    let backend = mock_with_clear();
+
+    block_on(async {
+        let mut stale = backend.begin_write().await.expect("begin stale writer");
+        stale
+            .get_for_update(key(b"middle"))
+            .await
+            .expect("protected read");
+
+        let mut clear = backend.begin_write().await.expect("begin clear");
+        clear
+            .clear_range(&range(b"a", b"z"))
+            .await
+            .expect("stage clear");
+        clear.commit().await.expect("commit clear");
+
+        stale
+            .put(key(b"middle"), key(b"stale"))
+            .await
+            .expect("stage stale write");
+        assert_eq!(
+            stale
+                .commit()
+                .await
+                .expect_err("range clear conflicts")
+                .kind(),
+            ErrorKind::RetryableAbort,
+        );
+    });
+}
+
+#[test]
+fn range_clear_union_normalizes_overlap_adjacency_and_order() {
+    let config = DeterministicConfig {
+        capabilities: Capabilities {
+            transactional_clear_range: true,
+        },
+        max_mutation_buffer: 1,
+        ..Default::default()
+    };
+    let backend = DeterministicBackend::new(config);
+    for (entry_key, value) in [
+        (b"b".as_slice(), b"1".as_slice()),
+        (b"y".as_slice(), b"2".as_slice()),
+        (b"z".as_slice(), b"3".as_slice()),
+        (b"zz".as_slice(), b"4".as_slice()),
+    ] {
+        seed(&backend, &[(entry_key, value)]);
+    }
+
+    block_on(async {
+        let mut txn = backend.begin_write().await.expect("begin write");
+        txn.clear_range(&range(b"m", b"z"))
+            .await
+            .expect("first clear");
+        txn.clear_range(&range(b"a", b"n"))
+            .await
+            .expect("out-of-order overlapping clear shares the range");
+        txn.clear_range(&range(b"z", b"zz"))
+            .await
+            .expect("adjacent clear shares the range");
+        txn.clear_range(&range(b"b", b"c"))
+            .await
+            .expect("contained clear shares the range");
+        txn.commit().await.expect("commit normalized clears");
+
+        let mut reader = backend.begin_read().await.expect("begin read");
+        assert_eq!(
+            reader
+                .batch_get(vec![key(b"b"), key(b"y"), key(b"z"), key(b"zz")])
+                .await
+                .expect("read normalized clear result"),
+            vec![None, None, None, Some(key(b"4"))],
+        );
     });
 }
