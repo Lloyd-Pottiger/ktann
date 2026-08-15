@@ -5,6 +5,7 @@ use std::fmt;
 use bytes::Bytes;
 
 use crate::api::{Error, PartitionKey, Result, Value};
+use crate::search::RaBitQ7;
 use crate::storage::keys::MAX_RECORD_ID_BYTES;
 
 use super::corrupt;
@@ -128,10 +129,12 @@ pub(super) fn encode_leaf_entry(
     }
     encoder.sized_u16_bytes(&entry.record_id)?;
     encode_fields(encoder, manifest.config().fields(), &entry.fields)?;
-    let expected = rabitq7_encoded_len(manifest.config().dimension())?;
+    let expected = RaBitQ7::encoded_len(manifest.config().dimension())?;
     if entry.rabitq7.len() != expected {
         return Err(Error::invalid_argument());
     }
+    RaBitQ7::validate(&entry.rabitq7, manifest.config().dimension())
+        .map_err(|_| Error::invalid_argument())?;
     encoder.sized_bytes(&entry.rabitq7, expected)
 }
 
@@ -144,22 +147,11 @@ pub(super) fn decode_leaf_entry(
         return Err(corrupt());
     }
     let fields = decode_fields(decoder, manifest.config().fields())?;
-    let expected = rabitq7_encoded_len(manifest.config().dimension()).map_err(|_| corrupt())?;
+    let expected = RaBitQ7::encoded_len(manifest.config().dimension()).map_err(|_| corrupt())?;
     let rabitq7 = decoder.sized_bytes(expected)?;
     if rabitq7.len() != expected {
         return Err(corrupt());
     }
+    RaBitQ7::validate(&rabitq7, manifest.config().dimension())?;
     Ok(LeafEntry::new(record_id, fields, rabitq7))
-}
-
-fn rabitq7_encoded_len(dimension: usize) -> Result<usize> {
-    let sign_bytes = dimension.checked_add(7).map(|value| value / 8);
-    let magnitude_bytes = dimension
-        .checked_mul(6)
-        .and_then(|bits| bits.checked_add(7))
-        .map(|bits| bits / 8);
-    sign_bytes
-        .zip(magnitude_bytes)
-        .and_then(|(signs, magnitudes)| 12_usize.checked_add(signs)?.checked_add(magnitudes))
-        .ok_or_else(Error::invalid_argument)
 }

@@ -12,9 +12,18 @@ mod numeric;
     )
 )]
 mod predicate;
+mod rabitq;
 
 #[expect(
     unused_imports,
     reason = "this preserves the caller seam for the future search pipeline"
 )]
 pub(crate) use numeric::{ExactDistance, VectorKernel};
+#[expect(
+    unused_imports,
+    reason = "these preserve the RaBitQ7 seams for mutation and search pipelines"
+)]
+pub(crate) use rabitq::{
+    ApproximateCandidate, ApproximateDistance, OverlapSelection, RaBitQ7, RaBitQQuery,
+    select_global_overlap, select_leaf_overlap,
+};
