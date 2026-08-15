@@ -2,6 +2,8 @@
 
 use bytes::Bytes;
 use foundationdb::Database;
+use foundationdb::options::DatabaseOption;
+use ktann::api::ErrorKind;
 use ktann::storage::backend::{Backend, ReadOps, ScanLimits, WriteTxn};
 use ktann::storage::keys::KeyRange;
 use ktann_foundationdb::{BackendNamespace, FoundationDbBackend};
@@ -42,9 +44,7 @@ async fn clear_test_keys(backend: &FoundationDbBackend) {
 /// Adapts a [`FoundationDbBackend`] to the shared harness seam.
 ///
 /// FoundationDB reports unknown commit outcomes naturally but cannot stage a
-/// controlled one in a test, and its durability is exercised by reopening a
-/// database handle against the same cluster rather than by an in-process
-/// restart.
+/// specific outcome or restart the external cluster from the shared suite.
 struct FoundationDbHarness {
     backend: FoundationDbBackend,
 }
@@ -69,8 +69,33 @@ impl BackendHarness for FoundationDbHarness {
     }
 
     fn restart(&self) -> Self {
-        unreachable!("FoundationDB durability is exercised by the adapter reopen test");
+        unreachable!("FoundationDB process restart requires the external durability test");
     }
+}
+
+/// Proves that FoundationDB's native transaction-size rejection is preserved.
+async fn check_native_transaction_limit(cluster_file: Option<&str>) {
+    let database = Database::new(cluster_file).expect("open size-limited database");
+    database
+        .set_option(DatabaseOption::TransactionSizeLimit(128))
+        .expect("set transaction size limit");
+    let backend = FoundationDbBackend::new(
+        database,
+        BackendNamespace::new("ktann-issue-20-native-limit").expect("namespace"),
+    );
+
+    // This write is below the adapter's admission budget but above the lower
+    // native limit configured on this database handle.
+    let mut transaction = backend.begin_write().await.expect("begin limited write");
+    transaction
+        .put(key(b"native-limit"), Bytes::from(vec![0_u8; 256]))
+        .await
+        .expect("stage limited write");
+    let error = transaction
+        .commit()
+        .await
+        .expect_err("native size rejection");
+    assert_eq!(error.kind(), ErrorKind::TransactionTooLarge);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -81,11 +106,11 @@ async fn foundationdb_adapter_preserves_the_backend_contract() {
     let database = Database::new(cluster_file.as_deref()).expect("open FoundationDB");
     let primary = FoundationDbBackend::new(
         database,
-        BackendNamespace::new("ktann-issue-18-contract").expect("namespace"),
+        BackendNamespace::new("ktann-issue-20-contract").expect("namespace"),
     );
     let isolated = FoundationDbBackend::new(
         Database::new(cluster_file.as_deref()).expect("open isolated database handle"),
-        BackendNamespace::new("ktann-issue-18-contract-isolated").expect("namespace"),
+        BackendNamespace::new("ktann-issue-20-contract-isolated").expect("namespace"),
     );
     clear_test_keys(&primary).await;
     clear_test_keys(&isolated).await;
@@ -100,6 +125,8 @@ async fn foundationdb_adapter_preserves_the_backend_contract() {
     let harness = FoundationDbHarness { backend: primary };
     shared_backend_contract::run_suite(&harness).await;
     let primary = harness.backend;
+
+    check_native_transaction_limit(cluster_file.as_deref()).await;
 
     // Adapter-specific: two namespaces over one cluster are isolated.
     let mut write = primary.begin_write().await.expect("begin write");
@@ -144,7 +171,7 @@ async fn foundationdb_adapter_preserves_the_backend_contract() {
 
     let reopened = FoundationDbBackend::new(
         Database::new(cluster_file.as_deref()).expect("reopen database"),
-        BackendNamespace::new("ktann-issue-18-contract").expect("namespace"),
+        BackendNamespace::new("ktann-issue-20-contract").expect("namespace"),
     );
     let mut durable = reopened.begin_read().await.expect("begin durable read");
     assert_eq!(

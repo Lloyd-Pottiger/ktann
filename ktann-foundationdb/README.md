@@ -38,14 +38,46 @@ final authority and maps an oversized transaction to `TransactionTooLarge`.
 2. Start the server and verify it with `fdbcli --exec status`.
 3. If the cluster file is not in FoundationDB's platform-default location, set
    `FDB_CLUSTER_FILE` to its absolute path.
-4. Run the ignored adapter test:
+4. Run the ignored adapter and fault tests:
 
    ```sh
-   cargo test -p ktann-foundationdb --test foundationdb_adapter -- --ignored
+   cargo test -p ktann-foundationdb \
+     --test foundationdb_adapter --test foundationdb_faults -- --ignored
    ```
 
-The test uses two dedicated Backend Namespaces, clears its test keys before and
-after execution, and covers namespace isolation, snapshot consistency,
-read-your-writes, point conflicts, item/byte-bounded ordered scan pagination,
-unique insertion, rollback, atomic range clear, and visibility through a newly
-opened database handle.
+The tests use dedicated Backend Namespaces and clear their test keys after
+execution. The adapter test runs every in-process case from the unchanged shared
+backend suite, including snapshot consistency, read-your-writes, point conflict
+ranges, item/byte-bounded ordered scan pagination, unique insertion, rollback,
+and atomic range clear. It also lowers the native transaction-size limit on one
+database handle to prove the adapter's `TransactionTooLarge` mapping without
+generating a large cluster workload.
+
+The separate fault-test process enables FoundationDB's Client Buggify facility.
+It makes at most 256 small commits and requires one transaction that is applied
+by the real cluster while the client reports `CommitOutcomeUnknown`; the test
+then disables fault injection, verifies the committed key, and clears the
+namespace. FoundationDB cannot deterministically stage each exact commit result,
+so the shared suite declares controlled fault injection unavailable for this
+adapter. The deterministic backend remains the exhaustive evidence for both
+applied and unapplied unknown outcomes.
+
+Durability uses a separate two-phase test because restarting a client handle is
+not evidence that the server durably stored an acknowledged commit. Run the
+write phase, restart the same FoundationDB server without deleting its data
+directory, then run the verify phase:
+
+```sh
+KTANN_FDB_DURABILITY_PHASE=write \
+  cargo test -p ktann-foundationdb --test foundationdb_durability -- --ignored
+
+# Restart FoundationDB here, preserving its data directory.
+
+KTANN_FDB_DURABILITY_PHASE=verify \
+  cargo test -p ktann-foundationdb --test foundationdb_durability -- --ignored
+```
+
+CI performs this service restart explicitly. The in-process shared harness
+therefore declares controlled fault injection and backend restart unsupported;
+the fault and durability binaries provide the adapter-specific evidence instead
+of silently weakening those shared cases.
