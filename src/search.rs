@@ -16,6 +16,8 @@ use std::mem::size_of;
 
 use crate::api::{Error, ErrorKind, MAX_DIMENSION, Metric, Result};
 
+mod predicate;
+
 /// Format-v1 Givens rotations make exactly three independent pairing passes.
 const ROTATION_ROUNDS: usize = 3;
 /// The format-fixed nearest f32 representation of `1 / sqrt(2)`.
