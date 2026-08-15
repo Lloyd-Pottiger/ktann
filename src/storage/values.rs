@@ -51,7 +51,9 @@
 //! `sized8<u8>` name, type, nullable byte, synopsis tag, configured Bloom input,
 //! and exact Bloom parameters. A Field Synopsis stores canonical NULL/non-NULL
 //! flags, optional typed extrema, and the schema-governed fixed-size Bloom byte
-//! string.
+//! string. The nested RaBitQ7 payload is governed by the Manifest's whole-format
+//! version. Its 12-byte header and LSB-first bit streams use the format-v1
+//! little-endian layout even though the enclosing value codec is big-endian.
 
 use bytes::Bytes;
 

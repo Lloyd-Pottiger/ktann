@@ -161,6 +161,36 @@ fn assert_corrupt(result: ktann::api::Result<PersistentValue>) {
 }
 
 #[test]
+fn leaf_entry_codec_rejects_noncanonical_nested_rabitq7() {
+    let manifest = minimal_manifest();
+    let codec = index_codec(&manifest);
+    let mut negative_zero = [0_u8; 14];
+    negative_zero[12] = 1;
+    let malformed = PersistentValue::LeafEntry(LeafEntry::new(
+        Bytes::from_static(b"r"),
+        Vec::<Value>::new(),
+        Bytes::copy_from_slice(&negative_zero),
+    ));
+    assert_eq!(
+        codec
+            .encode(&malformed)
+            .expect_err("encode must reject")
+            .kind(),
+        ErrorKind::InvalidArgument
+    );
+
+    let valid = PersistentValue::LeafEntry(LeafEntry::new(
+        Bytes::from_static(b"r"),
+        Vec::<Value>::new(),
+        Bytes::from_static(&[0; 14]),
+    ));
+    let mut bytes = codec.encode(&valid).expect("encode valid Leaf Entry");
+    let payload_start = bytes.len() - 14;
+    bytes[payload_start + 12] = 1;
+    assert_corrupt(decode_value(codec, id(1), &valid, &bytes));
+}
+
+#[test]
 fn namespace_and_manifest_golden_bytes() {
     let codec = ValueCodec::bootstrap();
     assert_eq!(
