@@ -7,5 +7,8 @@
 #![forbid(unsafe_code)]
 
 mod backend;
+mod blocking;
+mod config;
 
 pub use backend::{BackendNamespace, RocksDbBackend, RocksDbReadTxn, RocksDbWriteTxn};
+pub use config::RocksDbConfig;

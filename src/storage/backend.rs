@@ -39,10 +39,12 @@
 
 use std::fmt;
 use std::future::Future;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 
-use crate::api::Result;
+use crate::api::{Error, ErrorKind, Result};
 use crate::storage::keys::KeyRange;
 
 /// Stable physical ceilings that a backend declares as storage-engine facts.
@@ -77,6 +79,64 @@ pub struct AdmissionBudget {
 pub struct Capabilities {
     /// Whether [`WriteTxn::clear_range`] is supported.
     pub transactional_clear_range: bool,
+}
+
+/// The adapter-side right to cross an irreversible commit point.
+///
+/// A backend adapter must consume this handle with [`CommitStart::begin`]
+/// after all cancellation-safe admission waits and immediately before starting
+/// its native commit. This lets Runtime cancellation race atomically with the
+/// real backend commit point instead of an earlier caller-side approximation.
+#[derive(Debug)]
+pub struct CommitStart {
+    claim: Option<Arc<AtomicBool>>,
+}
+
+impl CommitStart {
+    fn uncontrolled() -> Self {
+        Self { claim: None }
+    }
+
+    /// Claims commit ownership immediately before native commit begins.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::Cancelled`] when pre-commit cancellation won the
+    /// race. After this succeeds, the adapter must start native commit without
+    /// another cancellation-safe wait.
+    pub fn begin(self) -> Result<()> {
+        let Some(claim) = self.claim else {
+            return Ok(());
+        };
+        claim
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| Error::new(ErrorKind::Cancelled))
+    }
+}
+
+/// The Runtime-side right to cancel before native commit starts.
+#[derive(Debug)]
+pub(crate) struct CommitCancellation {
+    claim: Arc<AtomicBool>,
+}
+
+impl CommitCancellation {
+    pub(crate) fn pair() -> (Self, CommitStart) {
+        let claim = Arc::new(AtomicBool::new(false));
+        (
+            Self {
+                claim: Arc::clone(&claim),
+            },
+            CommitStart { claim: Some(claim) },
+        )
+    }
+
+    pub(crate) fn cancel(&self) -> bool {
+        self.claim
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
 }
 
 /// Explicit bounds on one forward scan page.
@@ -315,7 +375,18 @@ pub trait WriteTxn: ReadOps {
     /// `ErrorKind::CommitOutcomeUnknown` when the result cannot be
     /// determined. A successful commit makes every mutation visible to any
     /// transaction begun after it returns.
-    fn commit(self) -> impl Future<Output = Result<()>> + Send;
+    fn commit(self) -> impl Future<Output = Result<()>> + Send
+    where
+        Self: Sized,
+    {
+        self.commit_with(CommitStart::uncontrolled())
+    }
+
+    /// Commits after coordinating the adapter's actual native commit point.
+    ///
+    /// Adapters must call [`CommitStart::begin`] after any asynchronous
+    /// resource admission and immediately before starting native commit.
+    fn commit_with(self, start: CommitStart) -> impl Future<Output = Result<()>> + Send;
 
     /// Abandons this transaction without persisting any mutation, consuming it.
     ///

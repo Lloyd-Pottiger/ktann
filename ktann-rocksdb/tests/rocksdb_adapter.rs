@@ -7,7 +7,7 @@ use bytes::Bytes;
 use ktann::api::ErrorKind;
 use ktann::storage::backend::{Backend, Mutation, ReadOps, ScanLimits, WriteTxn};
 use ktann::storage::keys::KeyRange;
-use ktann_rocksdb::{BackendNamespace, RocksDbBackend};
+use ktann_rocksdb::{BackendNamespace, RocksDbBackend, RocksDbConfig};
 use rocksdb::{MemtableFactory, OptimisticTransactionDB, Options, SliceTransform};
 
 #[path = "../../tests/support/backend_contract.rs"]
@@ -62,7 +62,7 @@ impl BackendHarness for RocksDbHarness {
     }
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "multi_thread")]
 async fn rocksdb_adapter_preserves_the_backend_contract() {
     let directory = tempfile::tempdir().expect("temporary database directory");
     let database_path = directory.path().join("database");
@@ -72,11 +72,16 @@ async fn rocksdb_adapter_preserves_the_backend_contract() {
 
     {
         let database = Arc::new(open_database(&database_path));
-        let primary = RocksDbBackend::new(Arc::clone(&database), primary_namespace.clone());
+        let config = RocksDbConfig::default()
+            .with_blocking_resource_limit(64)
+            .expect("blocking limit");
+        let primary =
+            RocksDbBackend::with_config(Arc::clone(&database), primary_namespace.clone(), config);
         let isolated = RocksDbBackend::new(Arc::clone(&database), isolated_namespace.clone());
 
         // Adapter-declared facts are asserted here; the shared suite checks the
         // rest of the common contract.
+        assert_eq!(primary.config().blocking_resource_limit(), 64);
         assert_eq!(primary.admission_budget().max_mutations, 10_000);
         assert_eq!(primary.admission_budget().max_mutation_bytes, 1 << 20);
         assert_eq!(primary.hard_limits().max_value_bytes, u32::MAX as usize);
@@ -193,7 +198,7 @@ async fn rocksdb_adapter_preserves_the_backend_contract() {
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "multi_thread")]
 async fn scan_uses_total_order_with_a_hash_memtable() {
     let directory = tempfile::tempdir().expect("temporary database directory");
     let namespace = BackendNamespace::new([]).expect("namespace");

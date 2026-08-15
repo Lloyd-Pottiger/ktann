@@ -7,10 +7,11 @@ use std::time::Instant;
 
 use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::api::{Error, ErrorKind, OperationOptions, Result, RuntimeConfig};
-use crate::storage::backend::Backend;
+use crate::storage::backend::{Backend, CommitCancellation, CommitStart};
 
 /// Owns one backend and its process-local foreground operation lifecycle.
 ///
@@ -91,13 +92,15 @@ impl<B: Backend> Runtime<B> {
         Fut: Future<Output = Result<T>> + Send + 'static,
     {
         let (admission, backend) = self.handle.inner.admit(&options).await?;
-        let abandoned = CancellationToken::new();
+        let cancellation = options.cancellation().cloned();
+        let deadline = options.deadline();
+        let (commit_cancellation, commit_start) = CommitCancellation::pair();
         let context = OperationContext {
             backend,
             options,
-            abandoned: abandoned.clone(),
+            commit_start,
         };
-        let task = self.handle.inner.executor.spawn(async move {
+        let mut task = self.handle.inner.executor.spawn(async move {
             let result = match context.checkpoint() {
                 Ok(()) => operation(context).await,
                 Err(error) => {
@@ -109,12 +112,36 @@ impl<B: Backend> Runtime<B> {
             result
         });
 
-        let caller = abandoned.drop_guard();
-        let result = task
-            .await
-            .map_err(|source| Error::with_source(ErrorKind::Backend, source));
-        let _abandoned = caller.disarm();
-        result?
+        let mut caller = CancelBeforeCommit {
+            task: Some(task.abort_handle()),
+            commit_cancellation,
+        };
+        let result = if cancellation.is_none() && deadline.is_none() {
+            join_task(&mut task).await
+        } else {
+            let cancellation = wait_for_cancellation(cancellation.as_ref());
+            let deadline = wait_for_deadline(deadline);
+            tokio::select! {
+                biased;
+                () = cancellation => {
+                    cancel_task_before_commit(
+                        &mut task,
+                        &caller.commit_cancellation,
+                        ErrorKind::Cancelled,
+                    ).await
+                }
+                () = deadline => {
+                    cancel_task_before_commit(
+                        &mut task,
+                        &caller.commit_cancellation,
+                        ErrorKind::DeadlineExceeded,
+                    ).await
+                }
+                result = join_task(&mut task) => result,
+            }
+        };
+        caller.disarm();
+        result
     }
 }
 
@@ -154,7 +181,7 @@ impl<B: Backend> Drop for RuntimeHandle<B> {
 pub(crate) struct OperationContext<B: Backend> {
     backend: Arc<B>,
     options: OperationOptions,
-    abandoned: CancellationToken,
+    commit_start: CommitStart,
 }
 
 impl<B: Backend> OperationContext<B> {
@@ -167,7 +194,7 @@ impl<B: Backend> OperationContext<B> {
     }
 
     pub(crate) fn checkpoint(&self) -> Result<()> {
-        check_control(&self.options, Some(&self.abandoned))
+        check_control(&self.options)
     }
 
     #[cfg_attr(
@@ -176,11 +203,52 @@ impl<B: Backend> OperationContext<B> {
     )]
     pub(crate) async fn commit<T, F, Fut>(self, commit: F) -> Result<T>
     where
-        F: FnOnce() -> Fut,
+        F: FnOnce(CommitStart) -> Fut,
         Fut: Future<Output = Result<T>>,
     {
         self.checkpoint()?;
-        commit().await
+        commit(self.commit_start).await
+    }
+}
+
+/// Cancels owned work on caller drop only while commit has not started.
+struct CancelBeforeCommit {
+    task: Option<AbortHandle>,
+    commit_cancellation: CommitCancellation,
+}
+
+impl CancelBeforeCommit {
+    fn disarm(&mut self) {
+        self.task = None;
+    }
+}
+
+impl Drop for CancelBeforeCommit {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            if self.commit_cancellation.cancel() {
+                task.abort();
+            }
+        }
+    }
+}
+
+async fn join_task<T>(task: &mut JoinHandle<Result<T>>) -> Result<T> {
+    task.await
+        .map_err(|source| Error::with_source(ErrorKind::Backend, source))?
+}
+
+async fn cancel_task_before_commit<T>(
+    task: &mut JoinHandle<Result<T>>,
+    commit_cancellation: &CommitCancellation,
+    error_kind: ErrorKind,
+) -> Result<T> {
+    if commit_cancellation.cancel() {
+        task.abort();
+        let _cancelled = task.await;
+        Err(Error::new(error_kind))
+    } else {
+        join_task(task).await
     }
 }
 
@@ -195,7 +263,7 @@ struct RuntimeInner<B: Backend> {
 
 impl<B: Backend> RuntimeInner<B> {
     async fn admit(self: &Arc<Self>, options: &OperationOptions) -> Result<(Admission<B>, Arc<B>)> {
-        check_control(options, None)?;
+        check_control(options)?;
         let acquired = match self.foreground.clone().try_acquire_owned() {
             Ok(permit) => Ok(permit),
             Err(TryAcquireError::Closed) => Err(Error::new(ErrorKind::RuntimeClosed)),
@@ -203,11 +271,11 @@ impl<B: Backend> RuntimeInner<B> {
                 let waiting = match self.foreground_waiting.clone().try_acquire_owned() {
                     Ok(waiting) => waiting,
                     Err(TryAcquireError::NoPermits) => {
-                        check_control(options, None)?;
+                        check_control(options)?;
                         return Err(Error::new(ErrorKind::LimitExceeded));
                     }
                     Err(TryAcquireError::Closed) => {
-                        check_control(options, None)?;
+                        check_control(options)?;
                         return Err(Error::new(ErrorKind::RuntimeClosed));
                     }
                 };
@@ -228,7 +296,7 @@ impl<B: Backend> RuntimeInner<B> {
         let permit = match acquired {
             Ok(permit) => permit,
             Err(error) => {
-                check_control(options, None)?;
+                check_control(options)?;
                 if self.phase() != Phase::Accepting {
                     return Err(Error::new(ErrorKind::RuntimeClosed));
                 }
@@ -238,7 +306,7 @@ impl<B: Backend> RuntimeInner<B> {
 
         let backend = {
             let mut lifecycle = self.lock_lifecycle();
-            check_control(options, None)?;
+            check_control(options)?;
             if lifecycle.phase != Phase::Accepting {
                 return Err(Error::new(ErrorKind::RuntimeClosed));
             }
@@ -356,11 +424,10 @@ impl<B: Backend> Drop for Admission<B> {
     }
 }
 
-fn check_control(options: &OperationOptions, abandoned: Option<&CancellationToken>) -> Result<()> {
-    if abandoned.is_some_and(CancellationToken::is_cancelled)
-        || options
-            .cancellation()
-            .is_some_and(CancellationToken::is_cancelled)
+fn check_control(options: &OperationOptions) -> Result<()> {
+    if options
+        .cancellation()
+        .is_some_and(CancellationToken::is_cancelled)
     {
         return Err(Error::new(ErrorKind::Cancelled));
     }
@@ -450,6 +517,33 @@ mod tests {
         ready(Err(Error::new(ErrorKind::Backend)))
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_boundary_has_exactly_one_winner() {
+        for _ in 0..100 {
+            let (cancellation, start) = CommitCancellation::pair();
+            let ready = Arc::new(tokio::sync::Barrier::new(3));
+            let commit = tokio::spawn({
+                let ready = Arc::clone(&ready);
+                async move {
+                    ready.wait().await;
+                    start.begin().is_ok()
+                }
+            });
+            let cancel = tokio::spawn({
+                let ready = Arc::clone(&ready);
+                async move {
+                    ready.wait().await;
+                    cancellation.cancel()
+                }
+            });
+
+            ready.wait().await;
+            let commit_won = commit.await.expect("commit claimant did not panic");
+            let cancel_won = cancel.await.expect("cancel claimant did not panic");
+            assert_ne!(commit_won, cancel_won);
+        }
+    }
+
     impl ReadOps for TestTxn {
         fn get(&mut self, _key: Bytes) -> impl Future<Output = Result<Option<Bytes>>> + Send {
             backend_error()
@@ -515,8 +609,9 @@ mod tests {
             backend_error()
         }
 
-        fn commit(self) -> impl Future<Output = Result<()>> + Send {
-            backend_error()
+        async fn commit_with(self, start: CommitStart) -> Result<()> {
+            start.begin()?;
+            Err(Error::new(ErrorKind::Backend))
         }
 
         fn rollback(self) -> impl Future<Output = ()> + Send {
@@ -779,6 +874,45 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_caller_cancels_a_precommit_backend_wait() {
+        let (runtime, _drops) = test_runtime(1);
+        let waiting_for_backend = Arc::new(Notify::new());
+        let backend_capacity = Arc::new(Notify::new());
+        let backend_call_started = Arc::new(AtomicBool::new(false));
+
+        let caller = tokio::spawn({
+            let runtime = runtime.clone();
+            let waiting_for_backend = Arc::clone(&waiting_for_backend);
+            let backend_capacity = Arc::clone(&backend_capacity);
+            let backend_call_started = Arc::clone(&backend_call_started);
+            async move {
+                runtime
+                    .run_foreground(OperationOptions::default(), move |context| async move {
+                        context
+                            .commit(move |commit_start| async move {
+                                waiting_for_backend.notify_one();
+                                backend_capacity.notified().await;
+                                commit_start.begin()?;
+                                backend_call_started.store(true, Ordering::SeqCst);
+                                Ok(())
+                            })
+                            .await
+                    })
+                    .await
+            }
+        });
+        waiting_for_backend.notified().await;
+        caller.abort();
+        caller.await.expect_err("caller task was aborted");
+
+        tokio::time::timeout(Duration::from_secs(1), runtime.shutdown())
+            .await
+            .expect("shutdown does not wait for abandoned precommit work")
+            .expect("shutdown succeeds");
+        assert!(!backend_call_started.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancellation_before_commit_abandons_operation() {
         let (runtime, _drops) = test_runtime(1);
         let cancellation = CancellationToken::new();
@@ -814,6 +948,93 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_interrupts_a_precommit_backend_wait() {
+        let (runtime, _drops) = test_runtime(1);
+        let cancellation = CancellationToken::new();
+        let waiting_for_backend = Arc::new(Notify::new());
+        let backend_capacity = Arc::new(Notify::new());
+        let backend_call_started = Arc::new(AtomicBool::new(false));
+        let options = OperationOptions::default().with_cancellation(cancellation.clone());
+
+        let operation = tokio::spawn({
+            let runtime = runtime.clone();
+            let waiting_for_backend = Arc::clone(&waiting_for_backend);
+            let backend_capacity = Arc::clone(&backend_capacity);
+            let backend_call_started = Arc::clone(&backend_call_started);
+            async move {
+                runtime
+                    .run_foreground(options, move |context| async move {
+                        context
+                            .commit(move |commit_start| async move {
+                                waiting_for_backend.notify_one();
+                                backend_capacity.notified().await;
+                                commit_start.begin()?;
+                                backend_call_started.store(true, Ordering::SeqCst);
+                                Ok(())
+                            })
+                            .await
+                    })
+                    .await
+            }
+        });
+        waiting_for_backend.notified().await;
+        cancellation.cancel();
+
+        let error = tokio::time::timeout(Duration::from_secs(1), operation)
+            .await
+            .expect("cancelled precommit wait completes")
+            .expect("caller task did not panic")
+            .expect_err("operation is cancelled");
+        assert_eq!(error.kind(), ErrorKind::Cancelled);
+        assert!(!backend_call_started.load(Ordering::SeqCst));
+        runtime.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deadline_interrupts_a_precommit_backend_wait() {
+        let (runtime, _drops) = test_runtime(1);
+        let waiting_for_backend = Arc::new(Notify::new());
+        let backend_capacity = Arc::new(Notify::new());
+        let backend_call_started = Arc::new(AtomicBool::new(false));
+        let options =
+            OperationOptions::default().with_deadline(Instant::now() + Duration::from_millis(200));
+
+        let operation = tokio::spawn({
+            let runtime = runtime.clone();
+            let waiting_for_backend = Arc::clone(&waiting_for_backend);
+            let backend_capacity = Arc::clone(&backend_capacity);
+            let backend_call_started = Arc::clone(&backend_call_started);
+            async move {
+                runtime
+                    .run_foreground(options, move |context| async move {
+                        context
+                            .commit(move |commit_start| async move {
+                                waiting_for_backend.notify_one();
+                                backend_capacity.notified().await;
+                                commit_start.begin()?;
+                                backend_call_started.store(true, Ordering::SeqCst);
+                                Ok(())
+                            })
+                            .await
+                    })
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), waiting_for_backend.notified())
+            .await
+            .expect("operation reaches the backend wait before its deadline");
+
+        let error = tokio::time::timeout(Duration::from_secs(1), operation)
+            .await
+            .expect("expired precommit wait completes")
+            .expect("caller task did not panic")
+            .expect_err("operation deadline expires");
+        assert_eq!(error.kind(), ErrorKind::DeadlineExceeded);
+        assert!(!backend_call_started.load(Ordering::SeqCst));
+        runtime.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn commit_result_wins_over_later_cancellation() {
         let (runtime, _drops) = test_runtime(1);
         let cancellation = CancellationToken::new();
@@ -829,7 +1050,8 @@ mod tests {
                 runtime
                     .run_foreground(options, move |context| async move {
                         context
-                            .commit(move || async move {
+                            .commit(move |commit_start| async move {
+                                commit_start.begin()?;
                                 commit_started.notify_one();
                                 finish_commit.notified().await;
                                 Err::<(), _>(Error::new(ErrorKind::CommitOutcomeUnknown))
@@ -867,7 +1089,8 @@ mod tests {
                 runtime
                     .run_foreground(OperationOptions::default(), move |context| async move {
                         context
-                            .commit(move || async move {
+                            .commit(move |commit_start| async move {
+                                commit_start.begin()?;
                                 commit_started.notify_one();
                                 finish_commit.notified().await;
                                 commit_finished.store(true, Ordering::SeqCst);
@@ -917,7 +1140,8 @@ mod tests {
                 runtime
                     .run_foreground(OperationOptions::default(), move |context| async move {
                         context
-                            .commit(move || async move {
+                            .commit(move |commit_start| async move {
+                                commit_start.begin()?;
                                 commit_started.notify_one();
                                 finish_commit.notified().await;
                                 commit_finished.notify_one();

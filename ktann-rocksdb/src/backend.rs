@@ -4,14 +4,17 @@ use std::sync::Arc;
 use bytes::Bytes;
 use ktann::api::{Error, ErrorKind, Result};
 use ktann::storage::backend::{
-    AdmissionBudget, Backend, Capabilities, HardLimits, InsertOutcome, Mutation, ReadOps, ReadTxn,
-    ScanItem, ScanLimits, ScanPage, WriteTxn,
+    AdmissionBudget, Backend, Capabilities, CommitStart, HardLimits, InsertOutcome, Mutation,
+    ReadOps, ReadTxn, ScanItem, ScanLimits, ScanPage, WriteTxn,
 };
 use ktann::storage::keys::KeyRange;
 use rocksdb::{
     DBAccess, Error as RocksError, ErrorKind as RocksErrorKind, OptimisticTransactionDB,
     OptimisticTransactionOptions, ReadOptions, SnapshotWithThreadMode, Transaction, WriteOptions,
 };
+
+use crate::blocking::{AdmittedHandle, BlockingAdmission};
+use crate::config::RocksDbConfig;
 
 const ROCKSDB_MAX_PHYSICAL_KEY_BYTES: usize = u32::MAX as usize;
 const ROCKSDB_MAX_VALUE_BYTES: usize = u32::MAX as usize;
@@ -111,6 +114,8 @@ pub struct RocksDbBackend {
     database: Arc<OptimisticTransactionDB>,
     namespace: BackendNamespace,
     prefix: PhysicalPrefix,
+    config: RocksDbConfig,
+    blocking: BlockingAdmission,
 }
 
 impl RocksDbBackend {
@@ -132,11 +137,29 @@ impl RocksDbBackend {
         database: impl Into<Arc<OptimisticTransactionDB>>,
         namespace: BackendNamespace,
     ) -> Self {
+        Self::with_config(database, namespace, RocksDbConfig::default())
+    }
+
+    /// Constructs an adapter with explicit process-local resource limits.
+    ///
+    /// The configured blocking limit applies to this adapter instance. Opening
+    /// a transaction waits asynchronously for one resource slot, retains it
+    /// through native cleanup, and enters RocksDB only from a Tokio multi-thread
+    /// runtime's blocking section.
+    #[must_use]
+    pub fn with_config(
+        database: impl Into<Arc<OptimisticTransactionDB>>,
+        namespace: BackendNamespace,
+        config: RocksDbConfig,
+    ) -> Self {
         let prefix = PhysicalPrefix::new(&namespace);
+        let blocking = BlockingAdmission::new(config.blocking_resource_limit());
         Self {
             database: database.into(),
             namespace,
             prefix,
+            config,
+            blocking,
         }
     }
 
@@ -145,6 +168,12 @@ impl RocksDbBackend {
     pub fn namespace(&self) -> &BackendNamespace {
         &self.namespace
     }
+
+    /// Returns this adapter's process-local resource limits.
+    #[must_use]
+    pub fn config(&self) -> &RocksDbConfig {
+        &self.config
+    }
 }
 
 impl fmt::Debug for RocksDbBackend {
@@ -152,13 +181,14 @@ impl fmt::Debug for RocksDbBackend {
         formatter
             .debug_struct("RocksDbBackend")
             .field("namespace", &self.namespace)
+            .field("config", &self.config)
             .finish_non_exhaustive()
     }
 }
 
 /// A consistent RocksDB read transaction.
 pub struct RocksDbReadTxn<'backend> {
-    snapshot: SnapshotWithThreadMode<'backend, OptimisticTransactionDB>,
+    snapshot: AdmittedHandle<'backend, SnapshotWithThreadMode<'backend, OptimisticTransactionDB>>,
     prefix: &'backend PhysicalPrefix,
 }
 
@@ -172,7 +202,7 @@ impl fmt::Debug for RocksDbReadTxn<'_> {
 
 /// An atomic RocksDB write transaction with snapshot reads and read-your-writes.
 pub struct RocksDbWriteTxn<'backend> {
-    transaction: Transaction<'backend, OptimisticTransactionDB>,
+    transaction: AdmittedHandle<'backend, Transaction<'backend, OptimisticTransactionDB>>,
     prefix: &'backend PhysicalPrefix,
     mutation_count: usize,
     mutation_bytes: usize,
@@ -213,22 +243,29 @@ impl Backend for RocksDbBackend {
     }
 
     async fn begin_read(&self) -> Result<RocksDbReadTxn<'_>> {
+        let snapshot = self
+            .blocking
+            .admit()
+            .await?
+            .open(|| self.database.snapshot())?;
         Ok(RocksDbReadTxn {
-            snapshot: self.database.snapshot(),
+            snapshot,
             prefix: &self.prefix,
         })
     }
 
     async fn begin_write(&self) -> Result<RocksDbWriteTxn<'_>> {
-        let mut write_options = WriteOptions::default();
-        write_options.disable_wal(false);
-        write_options.set_sync(true);
-        let mut transaction_options = OptimisticTransactionOptions::default();
-        transaction_options.set_snapshot(true);
+        let transaction = self.blocking.admit().await?.open(|| {
+            let mut write_options = WriteOptions::default();
+            write_options.disable_wal(false);
+            write_options.set_sync(true);
+            let mut transaction_options = OptimisticTransactionOptions::default();
+            transaction_options.set_snapshot(true);
+            self.database
+                .transaction_opt(&write_options, &transaction_options)
+        })?;
         Ok(RocksDbWriteTxn {
-            transaction: self
-                .database
-                .transaction_opt(&write_options, &transaction_options),
+            transaction,
             prefix: &self.prefix,
             mutation_count: 0,
             mutation_bytes: 0,
@@ -238,15 +275,21 @@ impl Backend for RocksDbBackend {
 
 impl ReadOps for RocksDbReadTxn<'_> {
     async fn get(&mut self, key: Bytes) -> Result<Option<Bytes>> {
-        get(&self.snapshot, self.prefix, key)
+        let key = self.prefix.encode_key(&key)?;
+        self.snapshot.run(|snapshot| get(snapshot, &key))
     }
 
     async fn batch_get(&mut self, keys: Vec<Bytes>) -> Result<Vec<Option<Bytes>>> {
-        batch_get(&self.snapshot, self.prefix, keys)
+        for key in &keys {
+            self.prefix.validate_key(key)?;
+        }
+        self.snapshot
+            .run(|snapshot| batch_get(snapshot, self.prefix, keys))
     }
 
     async fn scan(&mut self, range: &KeyRange, limits: ScanLimits) -> Result<ScanPage> {
-        scan(&self.snapshot, self.prefix, range, limits)
+        self.snapshot
+            .run(|snapshot| scan(snapshot, self.prefix, range, limits))
     }
 }
 
@@ -254,23 +297,33 @@ impl ReadTxn for RocksDbReadTxn<'_> {}
 
 impl ReadOps for RocksDbWriteTxn<'_> {
     async fn get(&mut self, key: Bytes) -> Result<Option<Bytes>> {
-        let snapshot = self.transaction.snapshot();
-        get(&snapshot, self.prefix, key)
+        let key = self.prefix.encode_key(&key)?;
+        self.transaction.run(|transaction| {
+            let snapshot = transaction.snapshot();
+            get(&snapshot, &key)
+        })
     }
 
     async fn batch_get(&mut self, keys: Vec<Bytes>) -> Result<Vec<Option<Bytes>>> {
-        let snapshot = self.transaction.snapshot();
-        batch_get(&snapshot, self.prefix, keys)
+        for key in &keys {
+            self.prefix.validate_key(key)?;
+        }
+        self.transaction.run(|transaction| {
+            let snapshot = transaction.snapshot();
+            batch_get(&snapshot, self.prefix, keys)
+        })
     }
 
     async fn scan(&mut self, range: &KeyRange, limits: ScanLimits) -> Result<ScanPage> {
-        let snapshot = self.transaction.snapshot();
-        scan(&snapshot, self.prefix, range, limits)
+        self.transaction.run(|transaction| {
+            let snapshot = transaction.snapshot();
+            scan(&snapshot, self.prefix, range, limits)
+        })
     }
 }
 
 impl RocksDbWriteTxn<'_> {
-    fn charge(&mut self, mutation_count: usize, mutation_bytes: usize) -> Result<()> {
+    fn next_charge(&self, mutation_count: usize, mutation_bytes: usize) -> Result<(usize, usize)> {
         let next_count = self
             .mutation_count
             .checked_add(mutation_count)
@@ -282,9 +335,7 @@ impl RocksDbWriteTxn<'_> {
         if next_count > DEFAULT_MAX_MUTATIONS || next_bytes > DEFAULT_MAX_MUTATION_BYTES {
             return Err(limit_exceeded());
         }
-        self.mutation_count = next_count;
-        self.mutation_bytes = next_bytes;
-        Ok(())
+        Ok((next_count, next_bytes))
     }
 
     fn prepare_put(&self, key: Bytes, value: Bytes) -> Result<PreparedMutation> {
@@ -302,53 +353,68 @@ impl RocksDbWriteTxn<'_> {
 impl WriteTxn for RocksDbWriteTxn<'_> {
     async fn get_for_update(&mut self, key: Bytes) -> Result<Option<Bytes>> {
         let key = self.prefix.encode_key(&key)?;
-        let snapshot = self.transaction.snapshot();
-        let mut read_options = ReadOptions::default();
-        read_options.set_snapshot(&snapshot);
-        get_for_update(&self.transaction, &key, &read_options)
+        self.transaction.run(|transaction| {
+            let snapshot = transaction.snapshot();
+            let mut read_options = ReadOptions::default();
+            read_options.set_snapshot(&snapshot);
+            get_for_update(transaction, &key, &read_options)
+        })
     }
 
     async fn batch_get_for_update(&mut self, keys: Vec<Bytes>) -> Result<Vec<Option<Bytes>>> {
         for key in &keys {
             self.prefix.validate_key(key)?;
         }
-        let snapshot = self.transaction.snapshot();
-        let mut read_options = ReadOptions::default();
-        read_options.set_snapshot(&snapshot);
-        let mut values = Vec::with_capacity(keys.len());
-        for key in keys {
-            let key = self.prefix.encode_key(&key)?;
-            values.push(get_for_update(&self.transaction, &key, &read_options)?);
-        }
-        Ok(values)
+        self.transaction.run(|transaction| {
+            let snapshot = transaction.snapshot();
+            let mut read_options = ReadOptions::default();
+            read_options.set_snapshot(&snapshot);
+            let mut values = Vec::with_capacity(keys.len());
+            for key in keys {
+                let key = self.prefix.encode_key(&key)?;
+                values.push(get_for_update(transaction, &key, &read_options)?);
+            }
+            Ok(values)
+        })
     }
 
     async fn put(&mut self, key: Bytes, value: Bytes) -> Result<()> {
         let mutation = self.prepare_put(key, value)?;
-        self.charge(1, mutation.charged_bytes()?)?;
-        mutation.apply(&self.transaction)
+        let charge = self.next_charge(1, mutation.charged_bytes()?)?;
+        self.transaction
+            .run(|transaction| mutation.apply(transaction))?;
+        (self.mutation_count, self.mutation_bytes) = charge;
+        Ok(())
     }
 
     async fn insert(&mut self, key: Bytes, value: Bytes) -> Result<InsertOutcome> {
         let mutation = self.prepare_put(key, value)?;
-        let existing = {
-            let snapshot = self.transaction.snapshot();
+        let charged_bytes = mutation.charged_bytes()?;
+        let (outcome, charge) = self.transaction.run(|transaction| {
+            let snapshot = transaction.snapshot();
             let mut read_options = ReadOptions::default();
             read_options.set_snapshot(&snapshot);
-            get_for_update(&self.transaction, mutation.key(), &read_options)?
-        };
-        if existing.is_some() {
-            return Ok(InsertOutcome::AlreadyExists);
+            if get_for_update(transaction, mutation.key(), &read_options)?.is_some() {
+                return Ok((InsertOutcome::AlreadyExists, None));
+            }
+            let charge = self.next_charge(1, charged_bytes)?;
+            mutation.apply(transaction)?;
+            Ok((InsertOutcome::Inserted, Some(charge)))
+        })?;
+        if let Some((mutation_count, mutation_bytes)) = charge {
+            self.mutation_count = mutation_count;
+            self.mutation_bytes = mutation_bytes;
         }
-        self.charge(1, mutation.charged_bytes()?)?;
-        mutation.apply(&self.transaction)?;
-        Ok(InsertOutcome::Inserted)
+        Ok(outcome)
     }
 
     async fn delete(&mut self, key: Bytes) -> Result<()> {
         let mutation = self.prepare_delete(key)?;
-        self.charge(1, mutation.charged_bytes()?)?;
-        mutation.apply(&self.transaction)
+        let charge = self.next_charge(1, mutation.charged_bytes()?)?;
+        self.transaction
+            .run(|transaction| mutation.apply(transaction))?;
+        (self.mutation_count, self.mutation_bytes) = charge;
+        Ok(())
     }
 
     async fn batch_mutate(&mut self, mutations: Vec<Mutation>) -> Result<()> {
@@ -368,10 +434,14 @@ impl WriteTxn for RocksDbWriteTxn<'_> {
                 .ok_or_else(limit_exceeded)?;
             prepared.push(mutation);
         }
-        self.charge(prepared.len(), charged_bytes)?;
-        for mutation in prepared {
-            mutation.apply(&self.transaction)?;
-        }
+        let charge = self.next_charge(prepared.len(), charged_bytes)?;
+        self.transaction.run(|transaction| {
+            for mutation in prepared {
+                mutation.apply(transaction)?;
+            }
+            Ok(())
+        })?;
+        (self.mutation_count, self.mutation_bytes) = charge;
         Ok(())
     }
 
@@ -379,11 +449,16 @@ impl WriteTxn for RocksDbWriteTxn<'_> {
         Err(Error::new(ErrorKind::Unsupported))
     }
 
-    async fn commit(self) -> Result<()> {
-        self.transaction.commit().map_err(map_commit_error)
+    async fn commit_with(self, start: CommitStart) -> Result<()> {
+        self.transaction.ensure_supported()?;
+        start.begin()?;
+        let (transaction, section) = self.transaction.into_section();
+        section.run(|| transaction.commit().map_err(map_commit_error))
     }
 
-    async fn rollback(self) {}
+    async fn rollback(self) {
+        drop(self);
+    }
 }
 
 enum PreparedMutation {
@@ -417,14 +492,9 @@ impl PreparedMutation {
     }
 }
 
-fn get<D: DBAccess>(
-    snapshot: &SnapshotWithThreadMode<'_, D>,
-    prefix: &PhysicalPrefix,
-    key: Bytes,
-) -> Result<Option<Bytes>> {
-    let key = prefix.encode_key(&key)?;
+fn get<D: DBAccess>(snapshot: &SnapshotWithThreadMode<'_, D>, key: &[u8]) -> Result<Option<Bytes>> {
     snapshot
-        .get(&key)
+        .get(key)
         .map(|value| value.map(Bytes::from))
         .map_err(map_operation_error)
 }
@@ -434,9 +504,6 @@ fn batch_get<D: DBAccess>(
     prefix: &PhysicalPrefix,
     keys: Vec<Bytes>,
 ) -> Result<Vec<Option<Bytes>>> {
-    for key in &keys {
-        prefix.validate_key(key)?;
-    }
     let mut values = Vec::with_capacity(keys.len());
     for keys in keys.chunks(MAX_BATCH_POINT_READS) {
         let keys = keys

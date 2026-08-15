@@ -2,9 +2,9 @@
 
 This crate maps KTANN's backend-neutral transactional KV interface onto
 RocksDB's `OptimisticTransactionDB`. It uses explicit snapshots, point-key
-optimistic conflicts, WAL-backed writes, and synchronous commits. Tokio
-blocking-resource admission is owned by a later runtime integration layer and
-is not part of this crate yet.
+optimistic conflicts, WAL-backed writes, and synchronous commits. Every native
+call runs in a Tokio `block_in_place` section while its snapshot or transaction
+holds one bounded adapter resource slot.
 
 The caller opens an `OptimisticTransactionDB` and passes it, or a shared `Arc`
 containing it, to `RocksDbBackend`. Each adapter instance adds a versioned,
@@ -40,6 +40,21 @@ The adapter keeps WAL enabled and sets `sync=true` for every transaction. It
 uses conservative defaults of 10,000 mutations, 1 MiB of physical mutation
 bytes, and 80 KiB per scan page. RocksDB v1 reports transactional range clear
 as unsupported, so higher layers use bounded point deletes.
+
+The adapter requires a Tokio multi-thread runtime and rejects calls polled from
+a `LocalSet` because Tokio forbids `block_in_place` there. `RocksDbConfig` bounds
+live native snapshot/transaction resource slots and defaults to the host's
+available parallelism. Each transaction retains its slot through cleanup, so
+native call concurrency is bounded without making synchronous Drop wait for
+admission. Waiting transaction opens remain ordinary caller-owned futures, so
+cancelling one removes its semaphore waiter without scheduling blocking work.
+A call already inside `block_in_place`, including commit, runs to
+completion; KTANN Runtime ownership retains an admitted Foreground Mutation's
+outcome when its caller drops the future. Snapshot and transaction destruction
+retains the same resource slot and uses a blocking section, including
+cancellation and rollback cleanup. If a handle is moved into a `LocalSet`,
+operations are rejected and destruction uses a scoped native thread because
+Tokio forbids `block_in_place` in that context.
 
 ## Local tests
 

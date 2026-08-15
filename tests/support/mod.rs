@@ -22,8 +22,8 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use ktann::api::{Error, ErrorKind, Result};
 use ktann::storage::backend::{
-    AdmissionBudget, Backend, Capabilities, HardLimits, InsertOutcome, Mutation, ReadOps, ReadTxn,
-    ScanItem, ScanLimits, ScanPage, WriteTxn,
+    AdmissionBudget, Backend, Capabilities, CommitStart, HardLimits, InsertOutcome, Mutation,
+    ReadOps, ReadTxn, ScanItem, ScanLimits, ScanPage, WriteTxn,
 };
 use ktann::storage::keys::KeyRange;
 
@@ -928,7 +928,8 @@ impl WriteTxn for DeterministicWriteTxn<'_> {
         Ok(())
     }
 
-    async fn commit(self) -> Result<()> {
+    async fn commit_with(self, start: CommitStart) -> Result<()> {
+        start.begin()?;
         self.commit_impl()
     }
 
