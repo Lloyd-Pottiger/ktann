@@ -4,6 +4,14 @@
 //! re-exported here. Traversal, filtering, storage, and runtime concerns remain
 //! outside that deep module.
 mod numeric;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the search pipeline consumes the compiled predicate evaluator"
+    )
+)]
+mod predicate;
 
 #[expect(
     unused_imports,

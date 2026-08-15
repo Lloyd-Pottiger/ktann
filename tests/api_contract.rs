@@ -120,7 +120,11 @@ fn mutation_batches_reject_duplicate_ids_with_position() -> ktann::api::Result<(
 
 #[test]
 fn predicates_enforce_shape_and_types() -> ktann::api::Result<()> {
-    let fields = vec![FieldSchema::new("published", DataType::Bool)?];
+    let fields = vec![
+        FieldSchema::new("published", DataType::Bool)?,
+        FieldSchema::new("score", DataType::F64)?,
+        FieldSchema::new("name", DataType::String)?,
+    ];
     let mut compare_null = Predicate::Compare {
         field: FieldId(0),
         op: ktann::api::CompareOp::Eq,
@@ -134,11 +138,70 @@ fn predicates_enforce_shape_and_types() -> ktann::api::Result<()> {
     };
     assert_invalid(wrong_type.validate(&fields));
 
+    let mut null_in_list = Predicate::In {
+        field: FieldId(0),
+        values: vec![Value::Bool(true), Value::Null],
+    };
+    assert_invalid(null_in_list.validate(&fields));
+
+    let mut unknown_field = Predicate::IsNull(FieldId(3));
+    assert_invalid(unknown_field.validate(&fields));
+
+    let mut non_finite = Predicate::Compare {
+        field: FieldId(1),
+        op: ktann::api::CompareOp::Eq,
+        value: Value::F64(f64::INFINITY),
+    };
+    assert_invalid(non_finite.validate(&fields));
+
+    let mut oversized_string = Predicate::Compare {
+        field: FieldId(2),
+        op: ktann::api::CompareOp::Eq,
+        value: Value::String("x".repeat(1_025)),
+    };
+    assert_invalid(oversized_string.validate(&fields));
+
+    let mut maximum_in = Predicate::In {
+        field: FieldId(0),
+        values: vec![Value::Bool(false); 1_024],
+    };
+    maximum_in.validate(&fields)?;
+    let mut oversized_in = Predicate::In {
+        field: FieldId(0),
+        values: vec![Value::Bool(false); 1_025],
+    };
+    assert_invalid(oversized_in.validate(&fields));
+
+    let mut maximum_nodes = Predicate::And(vec![Predicate::IsNull(FieldId(0)); 1_023]);
+    maximum_nodes.validate(&fields)?;
+    let mut oversized_nodes = Predicate::And(vec![Predicate::IsNull(FieldId(0)); 1_024]);
+    assert_invalid(oversized_nodes.validate(&fields));
+
+    let mut maximum_depth = Predicate::And(vec![]);
+    for _ in 0..63 {
+        maximum_depth = Predicate::Not(Box::new(maximum_depth));
+    }
+    maximum_depth.validate(&fields)?;
     let mut too_deep = Predicate::And(vec![]);
     for _ in 0..64 {
         too_deep = Predicate::Not(Box::new(too_deep));
     }
     assert_invalid(too_deep.validate(&fields));
+
+    let mut negative_zero = Predicate::Compare {
+        field: FieldId(1),
+        op: ktann::api::CompareOp::Eq,
+        value: Value::F64(-0.0),
+    };
+    negative_zero.validate(&fields)?;
+    let Predicate::Compare {
+        value: Value::F64(canonical_zero),
+        ..
+    } = negative_zero
+    else {
+        panic!("comparison shape changed during validation");
+    };
+    assert_eq!(canonical_zero.to_bits(), 0.0_f64.to_bits());
     Ok(())
 }
 

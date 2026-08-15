@@ -31,5 +31,8 @@ bytes = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 
+[dev-dependencies]
+proptest = "1"
+
 [lints]
 workspace = true
