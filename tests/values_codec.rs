@@ -9,8 +9,8 @@ use ktann::api::{
 };
 use ktann::storage::keys::{LogicalKey, TreeKey};
 use ktann::storage::values::{
-    BloomParameters, ChildEntry, FieldSynopsis, IndexIdAllocator, IndexLifecycle, IndexManifest,
-    IndexNameEntry, LeafEntry, OpaquePayload, PartitionCentroid, PartitionHeader, PartitionState,
+    BloomParameters, ChildEntry, IndexIdAllocator, IndexLifecycle, IndexManifest, IndexNameEntry,
+    LeafEntry, OpaquePayload, PartitionCentroid, PartitionHeader, PartitionState,
     PartitionSynopsis, PartitionTransition, PersistentValue, RecordLocation, TreeManifest,
     ValueCodec, VectorRecord,
 };
@@ -41,7 +41,7 @@ fn rich_manifest() -> IndexManifest {
         .nullable()
         .with_synopsis(SynopsisConfig::MinMaxBloom {
             expected_distinct: NonZeroU32::new(10).expect("nonzero"),
-            false_positive_rate: 0.01,
+            false_positive_rate: 0.5,
         })
         .expect("valid synopsis");
     let config = IndexConfig::new(2, Metric::Cosine)
@@ -56,21 +56,38 @@ fn rich_manifest() -> IndexManifest {
     for (value, byte) in seed.iter_mut().zip(0_u8..) {
         *value = byte;
     }
+    let score_bloom =
+        BloomParameters::derive(config.fields()[1].synopsis()).expect("derive Bloom parameters");
     IndexManifest::new(
         IndexLifecycle::Dropping,
         id(7),
         config,
         seed,
-        vec![
-            None,
-            Some(BloomParameters::new(17, 3).expect("valid Bloom")),
-        ],
+        vec![None, score_bloom],
     )
     .expect("valid manifest")
 }
 
 fn index_codec(manifest: &IndexManifest) -> ValueCodec<'_> {
     ValueCodec::for_index(manifest)
+}
+
+fn rich_synopsis(manifest: &IndexManifest) -> PartitionSynopsis {
+    let mut synopsis = PartitionSynopsis::empty(manifest);
+    for fields in [
+        vec![Value::string("a").expect("valid String"), Value::Null],
+        vec![
+            Value::string("z").expect("valid String"),
+            Value::f64(1.0).expect("finite"),
+        ],
+        vec![
+            Value::string("m").expect("valid String"),
+            Value::f64(2.0).expect("finite"),
+        ],
+    ] {
+        synopsis.expand(manifest, &fields).expect("expand synopsis");
+    }
+    synopsis
 }
 
 fn decode(
@@ -305,9 +322,9 @@ fn index_value_family_golden_bytes() {
     );
     assert_eq!(
         codec
-            .encode(&PersistentValue::PartitionSynopsis(PartitionSynopsis::new(
-                Vec::<FieldSynopsis>::new()
-            )))
+            .encode(&PersistentValue::PartitionSynopsis(
+                PartitionSynopsis::empty(&manifest,)
+            ))
             .expect("encode"),
         b"\x0b\x01\x00\x00"
     );
@@ -328,6 +345,40 @@ fn index_value_family_golden_bytes() {
             .expect("encode"),
         state
     );
+}
+
+#[test]
+fn incrementally_constructed_synopsis_has_golden_bytes_and_round_trips() {
+    let manifest = rich_manifest();
+    let value = PersistentValue::PartitionSynopsis(rich_synopsis(&manifest));
+    let bytes = index_codec(&manifest).encode(&value).expect("encode");
+    assert_eq!(
+        bytes,
+        b"\x0b\x01\x00\x02\x02\x04\x00\x00\x00\x01a\x04\x00\x00\x00\x01z\x03\x03\x3f\xf0\x00\x00\x00\x00\x00\x00\x03\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03\x80\x01\x00"
+    );
+    assert_eq!(
+        decode_value(index_codec(&manifest), id(7), &value, &bytes).expect("decode"),
+        value
+    );
+}
+
+#[test]
+fn derived_bloom_shape_meets_the_configured_false_positive_bound() {
+    let manifest = rich_manifest();
+    let parameters = manifest.bloom_parameters()[1].expect("score Bloom");
+    assert_eq!((parameters.bit_count(), parameters.hash_count()), (20, 1));
+
+    let occupied_bit_bound = 10.0 / f64::from(parameters.bit_count());
+    assert!(occupied_bit_bound <= 0.5);
+
+    let strict = SynopsisConfig::MinMaxBloom {
+        expected_distinct: NonZeroU32::new(1).expect("nonzero"),
+        false_positive_rate: 0.01,
+    };
+    let strict = BloomParameters::derive(&strict)
+        .expect("derive strict Bloom")
+        .expect("Bloom parameters");
+    assert_eq!((strict.bit_count(), strict.hash_count()), (100, 1));
 }
 
 #[test]
@@ -356,6 +407,7 @@ fn every_value_family_round_trips() {
         &[Value::string("tenant-a").expect("valid String")],
     )
     .expect("valid Tree Key");
+    let synopsis = rich_synopsis(&manifest);
     let values = [
         PersistentValue::TreeManifest(
             TreeManifest::new(pk(1), pk(1_024)).expect("valid Tree Manifest"),
@@ -386,20 +438,7 @@ fn every_value_family_round_trips() {
             ],
             Bytes::from_static(&[0; 15]),
         )),
-        PersistentValue::PartitionSynopsis(PartitionSynopsis::new(vec![
-            FieldSynopsis::new(
-                false,
-                Some(Value::string("a").expect("valid String")),
-                Some(Value::string("z").expect("valid String")),
-                None,
-            ),
-            FieldSynopsis::new(
-                true,
-                Some(Value::f64(1.0).expect("finite")),
-                Some(Value::f64(2.0).expect("finite")),
-                Some(Bytes::from_static(&[0x01, 0x00, 0x01])),
-            ),
-        ])),
+        PersistentValue::PartitionSynopsis(synopsis),
         PersistentValue::PartitionState(PartitionTransition::ReceivingSplit {
             source: pk(2),
             started_at_unix_millis: 123,
@@ -463,7 +502,7 @@ fn every_value_family_rejects_truncation_and_trailing_bytes() {
             Vec::<Value>::new(),
             Bytes::from_static(&[0; 14]),
         )),
-        PersistentValue::PartitionSynopsis(PartitionSynopsis::new(Vec::<FieldSynopsis>::new())),
+        PersistentValue::PartitionSynopsis(PartitionSynopsis::empty(&manifest)),
         PersistentValue::PartitionState(PartitionTransition::Merging {
             started_at_unix_millis: 0,
         }),
@@ -628,6 +667,16 @@ fn manifest_rejects_malformed_identity_configuration_and_discriminants() {
     let mut bytes = codec.encode(&value).expect("encode");
     bytes[18] = 0xff;
     assert_corrupt(decode_value(codec, id(1), &value, &bytes));
+
+    let rich = PersistentValue::IndexManifest(rich_manifest());
+    let mut bytes = codec.encode(&rich).expect("encode rich Manifest");
+    let parameters = [0, 0, 0, 20, 1];
+    let offset = bytes
+        .windows(parameters.len())
+        .position(|window| window == parameters)
+        .expect("derived Bloom parameters");
+    bytes[offset + 3] -= 1;
+    assert_corrupt(decode_value(codec, id(7), &rich, &bytes));
 }
 
 #[test]
@@ -733,24 +782,7 @@ fn schema_and_synopsis_invariants_fail_closed() {
     bytes[17..19].copy_from_slice(&1_u16.to_be_bytes());
     assert_corrupt(decode_value(codec, id(7), &record, &bytes));
 
-    let synopsis = PersistentValue::PartitionSynopsis(PartitionSynopsis::new(vec![
-        FieldSynopsis::new(
-            false,
-            Some(Value::string("a").expect("valid String")),
-            Some(Value::string("z").expect("valid String")),
-            None,
-        ),
-        FieldSynopsis::new(
-            false,
-            Some(Value::f64(1.0).expect("finite")),
-            Some(Value::f64(2.0).expect("finite")),
-            Some(Bytes::from_static(&[0x01, 0x00, 0x01])),
-        ),
-    ]));
-    let mut bytes = codec.encode(&synopsis).expect("encode");
-    *bytes.last_mut().expect("Bloom byte") = 0x80;
-    assert_corrupt(decode_value(codec, id(7), &synopsis, &bytes));
-
+    let synopsis = PersistentValue::PartitionSynopsis(rich_synopsis(&manifest));
     let mut bytes = codec.encode(&synopsis).expect("encode");
     bytes[4] = 0x80;
     assert_corrupt(decode_value(codec, id(7), &synopsis, &bytes));
@@ -760,8 +792,27 @@ fn schema_and_synopsis_invariants_fail_closed() {
     assert_corrupt(decode_value(codec, id(7), &synopsis, &bytes));
 
     let mut bytes = codec.encode(&synopsis).expect("encode");
-    let bloom_start = bytes.len() - 3;
+    let bloom_bytes = usize::try_from(
+        manifest.bloom_parameters()[1]
+            .expect("score Bloom")
+            .bit_count(),
+    )
+    .expect("u32 fits usize")
+    .div_ceil(8);
+    let bloom_start = bytes.len() - bloom_bytes;
     bytes[bloom_start..].fill(0);
+    assert_corrupt(decode_value(codec, id(7), &synopsis, &bytes));
+
+    let mut bytes = codec.encode(&synopsis).expect("encode");
+    let bloom_start = bytes.len() - bloom_bytes;
+    let unrelated_bit = (0..manifest.bloom_parameters()[1]
+        .expect("score Bloom")
+        .bit_count())
+        .map(|bit| usize::try_from(bit).expect("u32 fits usize"))
+        .find(|bit| bytes[bloom_start + bit / 8] & (1 << (bit % 8)) == 0)
+        .expect("Bloom has an unset bit");
+    bytes[bloom_start..].fill(0);
+    bytes[bloom_start + unrelated_bit / 8] = 1 << (unrelated_bit % 8);
     assert_corrupt(decode_value(codec, id(7), &synopsis, &bytes));
 }
 

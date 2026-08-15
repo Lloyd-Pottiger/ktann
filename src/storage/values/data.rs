@@ -72,26 +72,44 @@ pub(super) fn encode_typed_value(
     nullable: bool,
     value: &Value,
 ) -> Result<()> {
+    visit_typed_value_bytes(data_type, nullable, value, |bytes| encoder.bytes(bytes))
+}
+
+/// Visits the canonical wire chunks for one schema-directed typed value.
+pub(super) fn visit_typed_value_bytes(
+    data_type: DataType,
+    nullable: bool,
+    value: &Value,
+    mut visit: impl FnMut(&[u8]),
+) -> Result<()> {
     match value {
-        Value::Null if nullable => encoder.u8(0),
+        Value::Null if nullable => visit(&[0]),
         Value::Bool(value) if data_type == DataType::Bool => {
-            encoder.u8(1);
-            encoder.bool(*value);
+            visit(&[1, u8::from(*value)]);
         }
         Value::I64(value) if data_type == DataType::I64 => {
-            encoder.u8(2);
-            encoder.i64(*value);
+            visit(&[2]);
+            visit(&value.to_be_bytes());
         }
         Value::F64(value) if data_type == DataType::F64 => {
-            encoder.u8(3);
-            encoder.f64(*value)?;
+            if !value.is_finite() {
+                return Err(Error::invalid_argument());
+            }
+            visit(&[3]);
+            let bits = if *value == 0.0 { 0 } else { value.to_bits() };
+            visit(&bits.to_be_bytes());
         }
         Value::String(value) if data_type == DataType::String => {
             if value.len() > MAX_STRING_BYTES {
                 return Err(Error::invalid_argument());
             }
-            encoder.u8(4);
-            encoder.sized_bytes(value.as_bytes(), MAX_STRING_BYTES)?;
+            visit(&[4]);
+            visit(
+                &u32::try_from(value.len())
+                    .map_err(|_| Error::invalid_argument())?
+                    .to_be_bytes(),
+            );
+            visit(value.as_bytes());
         }
         _ => return Err(Error::invalid_argument()),
     }
