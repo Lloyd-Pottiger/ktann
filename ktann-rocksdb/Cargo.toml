@@ -11,10 +11,11 @@ readme = "README.md"
 bytes = "1"
 ktann = { path = ".." }
 rocksdb = { version = "0.24", default-features = false, features = ["bindgen-runtime"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["macros", "time"] }
 
 [lints.rust]
 missing_docs = "deny"

@@ -7,8 +7,8 @@ use futures_util::TryStreamExt;
 use futures_util::future::try_join_all;
 use ktann::api::{Error, ErrorKind, Result};
 use ktann::storage::backend::{
-    AdmissionBudget, Backend, Capabilities, HardLimits, InsertOutcome, Mutation, ReadOps, ReadTxn,
-    ScanItem, ScanLimits, ScanPage, WriteTxn,
+    AdmissionBudget, Backend, Capabilities, CommitStart, HardLimits, InsertOutcome, Mutation,
+    ReadOps, ReadTxn, ScanItem, ScanLimits, ScanPage, WriteTxn,
 };
 use ktann::storage::keys::KeyRange;
 
@@ -374,7 +374,8 @@ impl WriteTxn for FoundationDbWriteTxn<'_> {
         Ok(())
     }
 
-    async fn commit(self) -> Result<()> {
+    async fn commit_with(self, start: CommitStart) -> Result<()> {
+        start.begin()?;
         self.transaction
             .commit()
             .await
