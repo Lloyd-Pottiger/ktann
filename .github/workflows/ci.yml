@@ -43,7 +43,23 @@ jobs:
       - name: Set up FoundationDB
         run: .github/scripts/setup-foundationdb.sh server
       - name: Test FoundationDB adapter
-        run: cargo +stable test -p ktann-foundationdb --test foundationdb_adapter -- --ignored
+        run: >-
+          cargo +stable test -p ktann-foundationdb
+          --test foundationdb_adapter --test foundationdb_faults -- --ignored
+      - name: Write FoundationDB durability probe
+        env:
+          KTANN_FDB_DURABILITY_PHASE: write
+        run: >-
+          cargo +stable test -p ktann-foundationdb
+          --test foundationdb_durability -- --ignored
+      - name: Restart FoundationDB
+        run: .github/scripts/setup-foundationdb.sh restart
+      - name: Verify FoundationDB durability probe
+        env:
+          KTANN_FDB_DURABILITY_PHASE: verify
+        run: >-
+          cargo +stable test -p ktann-foundationdb
+          --test foundationdb_durability -- --ignored
 
   lint:
     name: Format and lint

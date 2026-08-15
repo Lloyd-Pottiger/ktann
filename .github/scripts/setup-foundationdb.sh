@@ -6,9 +6,27 @@ readonly FDB_CLIENT_SHA256="ea59d1708519798c7bc4f514cd29af1ac8e41dccbec4371f22d8
 readonly FDB_SERVER_SHA256="1a4088133d088be93a868e26e058250040ddfa725580701170ad2fb9e3d38ede"
 readonly MODE="${1:-}"
 
-if [[ $# -ne 1 || ("$MODE" != "client" && "$MODE" != "server") ]]; then
-  echo "usage: $0 client|server" >&2
+if [[ $# -ne 1 || ("$MODE" != "client" && "$MODE" != "server" && "$MODE" != "restart") ]]; then
+  echo "usage: $0 client|server|restart" >&2
   exit 2
+fi
+
+wait_until_ready() {
+  for _ in {1..30}; do
+    if timeout 3s fdbcli --exec "status minimal"; then
+      return
+    fi
+    sleep 1
+  done
+
+  echo "FoundationDB did not become ready" >&2
+  exit 1
+}
+
+if [[ "$MODE" == "restart" ]]; then
+  sudo service foundationdb restart
+  wait_until_ready
+  exit 0
 fi
 
 PACKAGE_DIR="$(mktemp -d)"
@@ -38,12 +56,4 @@ if [[ "$MODE" == "client" ]]; then
 fi
 
 sudo service foundationdb restart
-for _ in {1..30}; do
-  if timeout 3s fdbcli --exec "status minimal"; then
-    exit 0
-  fi
-  sleep 1
-done
-
-echo "FoundationDB did not become ready" >&2
-exit 1
+wait_until_ready
