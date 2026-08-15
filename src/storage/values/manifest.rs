@@ -45,6 +45,14 @@ impl BloomParameters {
         })
     }
 
+    /// Derives the canonical v1 Bloom shape for a synopsis configuration.
+    pub fn derive(config: &SynopsisConfig) -> Result<Option<Self>> {
+        config
+            .bloom_shape()?
+            .map(|(bit_count, hash_count)| Self::new(bit_count, hash_count))
+            .transpose()
+    }
+
     /// Returns the exact number of persisted bits.
     #[must_use]
     pub const fn bit_count(self) -> u32 {
@@ -143,11 +151,8 @@ impl IndexManifest {
         }
         let mut maximum_synopsis_size = 2_usize + 2;
         for (field, parameters) in self.config.fields().iter().zip(&self.bloom_parameters) {
-            match (field.synopsis(), parameters) {
-                (SynopsisConfig::MinMax, None) => {}
-                (SynopsisConfig::MinMaxBloom { .. }, Some(parameters))
-                    if parameters.byte_count() <= MAX_SYNOPSIS_BYTES => {}
-                _ => return Err(Error::invalid_argument()),
+            if BloomParameters::derive(field.synopsis())?.as_ref() != parameters.as_ref() {
+                return Err(Error::invalid_argument());
             }
             let encoded_extrema = match field.data_type() {
                 DataType::Bool => 2 * 2,

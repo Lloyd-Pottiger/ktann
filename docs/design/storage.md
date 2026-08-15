@@ -123,9 +123,16 @@ All persistent algorithms that affect bytes are format protocol:
   `(x, y) -> ((x + y) * c, (x - y) * c)` with
   `c = f32::from_bits(0x3f3504f3)`; an odd final index is unchanged for that
   round. Each arithmetic step rounds as IEEE-754 f32 without fused contraction;
-- Bloom uses domain-separated XXH3-128 over canonical typed bytes; its two
-  halves drive wrapping double hashing `h1 + i*h2`, followed by unsigned modulo
-  the persisted bit count and LSB-first bit numbering;
+- Bloom uses XXH3-128 with the v1 domain seed `0x4b54414e4e01b100`
+  over the canonical non-NULL typed-value bytes. The low 64 digest bits are
+  `h1` and the high 64 bits are `h2`; they drive wrapping double hashing
+  `h1 + i*h2`, followed by unsigned modulo the persisted bit count and
+  LSB-first bit numbering. V1 uses one probe and, for expected distinct count
+  `n` and target false-positive rate `p`, derives `m = ceil(n / p)` bits. At
+  most `n` bits can be occupied at the configured cardinality, so the uniform
+  hash false-positive bound is directly `n / m <= p`, without relying on
+  independent double-hash probes. Creation rejects `m > 2^32 - 1` or the
+  existing 64-KiB complete-Synopsis limit;
 - RaBitQ7 uses the exact layout defined by the search design.
 
 These constants and steps must be written next to codec golden vectors before

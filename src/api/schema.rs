@@ -1,5 +1,6 @@
 //! Vector Record schema and Filter Predicate values.
 
+use std::cmp::Ordering;
 use std::fmt;
 use std::num::NonZeroU32;
 
@@ -72,23 +73,38 @@ impl SynopsisConfig {
     }
 
     pub(crate) fn bloom_bytes(&self) -> Result<usize> {
+        let Some((bit_count, _)) = self.bloom_shape()? else {
+            return Ok(0);
+        };
+        usize::try_from(bit_count)
+            .ok()
+            .and_then(|bits| bits.checked_add(7))
+            .map(|bits| bits / 8)
+            .ok_or_else(Error::invalid_argument)
+    }
+
+    /// Derives a one-probe shape whose occupied-bit bound is at most `p`.
+    pub(crate) fn bloom_shape(&self) -> Result<Option<(u32, u8)>> {
         let Self::MinMaxBloom {
             expected_distinct,
             false_positive_rate,
         } = self
         else {
-            return Ok(0);
+            return Ok(None);
         };
         self.validate()?;
-        let bits = -(f64::from(expected_distinct.get()) * false_positive_rate.ln())
-            / std::f64::consts::LN_2.powi(2);
-        if !bits.is_finite() || bits > (usize::MAX as f64) {
+        let distinct = f64::from(expected_distinct.get());
+        let bit_count = (distinct / false_positive_rate).ceil();
+        if !bit_count.is_finite() || bit_count <= 0.0 || bit_count > f64::from(u32::MAX) {
             return Err(Error::invalid_argument());
         }
-        let bits = bits.ceil() as usize;
-        bits.checked_add(7)
-            .map(|rounded| rounded / 8)
-            .ok_or_else(Error::invalid_argument)
+        let mut bit_count = bit_count as u32;
+        while distinct / f64::from(bit_count) > *false_positive_rate {
+            bit_count = bit_count
+                .checked_add(1)
+                .ok_or_else(Error::invalid_argument)?;
+        }
+        Ok(Some((bit_count, 1)))
     }
 }
 
@@ -161,6 +177,19 @@ impl Value {
 
     const fn is_null(&self) -> bool {
         matches!(self, Self::Null)
+    }
+}
+
+/// Orders canonical, non-NULL values from the same scalar domain.
+pub(crate) fn typed_order(left: &Value, right: &Value) -> Option<Ordering> {
+    match (left, right) {
+        (Value::Bool(left), Value::Bool(right)) => Some(left.cmp(right)),
+        (Value::I64(left), Value::I64(right)) => Some(left.cmp(right)),
+        (Value::F64(left), Value::F64(right)) if left.is_finite() && right.is_finite() => {
+            left.partial_cmp(right)
+        }
+        (Value::String(left), Value::String(right)) => Some(left.as_bytes().cmp(right.as_bytes())),
+        _ => None,
     }
 }
 

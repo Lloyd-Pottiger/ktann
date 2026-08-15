@@ -45,10 +45,6 @@ impl Encoder {
         self.bytes.extend_from_slice(&value.to_be_bytes());
     }
 
-    pub(super) fn i64(&mut self, value: i64) {
-        self.bytes.extend_from_slice(&value.to_be_bytes());
-    }
-
     pub(super) fn f32(&mut self, value: f32) -> Result<()> {
         if !value.is_finite() {
             return Err(Error::invalid_argument());
