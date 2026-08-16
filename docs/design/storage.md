@@ -20,6 +20,7 @@ Every adapter provides:
 - update-protected point reads for conflict establishment;
 - ordered, half-open forward scans with explicit item/byte bounds;
 - hard limits, conservative admission budgets, and declared capabilities;
+- an asynchronous native-resource shutdown hook invoked after Runtime drain;
 - error classes `RetryableAbort`, `CommitOutcomeUnknown`, `LimitExceeded`,
   `Unsupported`, `Corruption`, and `Other`.
 
@@ -52,9 +53,15 @@ RocksDB uses `OptimisticTransactionDB`. ReadTxn owns a Snapshot. WriteTxn enable
 a transaction snapshot and binds every read option to it while retaining
 read-your-writes. Point `get_for_update` establishes conflicts; state machines
 never depend on range conflicts. WAL remains enabled and commits use
-`sync=true`. Every synchronous call runs wholly inside one admitted
-`block_in_place` section. RocksDB v1 does not advertise transactional range
-clear.
+`sync=true`. One permit-bounded native thread actor owns each live snapshot or
+write transaction from admission through native cleanup. Its capacity-one
+channel serializes every synchronous call, commit, rollback, and destruction;
+async tasks never run native cleanup or wait synchronously for it. Existing
+transactions reuse their actor rather than reacquiring admission, so saturating
+the configured live-actor limit delays only new transaction creation. A
+backend shutdown hook waits for detached cleanup before Runtime releases the
+adapter; direct users get the same barrier from consuming asynchronous adapter
+shutdown. RocksDB v1 does not advertise transactional range clear.
 
 ## 4. Persistent identity and lifecycle
 

@@ -1,160 +1,135 @@
-use std::any::Any;
-use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ktann::api::{Error, ErrorKind, Result};
-use tokio::runtime::{Handle, RuntimeFlavor};
-use tokio::sync::{Semaphore, SemaphorePermit};
+use tokio::runtime::Handle;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
-/// Admits native RocksDB resources without exposing permits to the adapter interface.
+const COMMAND_CAPACITY: usize = 1;
+
+/// Admits native transaction actors without exposing permits to the adapter interface.
 #[derive(Debug)]
 pub(crate) struct BlockingAdmission {
-    permits: Semaphore,
+    state: Arc<AdmissionState>,
+}
+
+#[derive(Debug)]
+struct AdmissionState {
+    permits: Arc<Semaphore>,
+    active: AtomicUsize,
+    idle: Notify,
 }
 
 impl BlockingAdmission {
     pub(crate) fn new(limit: usize) -> Self {
         Self {
-            permits: Semaphore::new(limit),
+            state: Arc::new(AdmissionState {
+                permits: Arc::new(Semaphore::new(limit)),
+                active: AtomicUsize::new(0),
+                idle: Notify::new(),
+            }),
         }
     }
 
-    /// Waits asynchronously before opening a native RocksDB resource.
+    /// Waits asynchronously, then starts one bounded native transaction actor.
     ///
-    /// Admission and execution are deliberately separate so callers create a
-    /// closure borrowing a non-`Sync` transaction only after this await.
-    pub(crate) async fn admit(&self) -> Result<BlockingSection<'_>> {
-        let runtime = Handle::try_current()
+    /// The actor owns its permit until its native state has been destroyed. Its
+    /// one-command channel keeps cancelled callers from creating an unbounded
+    /// queue while preserving serialized access to the native transaction.
+    pub(crate) async fn start<C>(
+        &self,
+        actor: impl FnOnce(mpsc::Receiver<C>, oneshot::Sender<()>) + Send + 'static,
+    ) -> Result<NativeWorker<C>>
+    where
+        C: Send + 'static,
+    {
+        Handle::try_current()
             .map_err(|source| Error::with_source(ErrorKind::InvalidArgument, source))?;
-        if runtime.runtime_flavor() != RuntimeFlavor::MultiThread {
-            return Err(Error::new(ErrorKind::InvalidArgument));
-        }
-        let permit = self
-            .permits
-            .acquire()
+        let permit = Arc::clone(&self.state.permits)
+            .acquire_owned()
             .await
             .map_err(|source| Error::with_source(ErrorKind::Backend, source))?;
-        Ok(BlockingSection { permit })
-    }
-}
-
-/// One admitted synchronous call that has not entered its blocking section yet.
-pub(crate) struct BlockingSection<'admission> {
-    permit: SemaphorePermit<'admission>,
-}
-
-impl<'admission> BlockingSection<'admission> {
-    /// Runs one native call synchronously and releases admission on return.
-    pub(crate) fn run<T>(self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
-        run_supported(operation)
-    }
-
-    /// Opens a native handle whose eventual destructor reuses this admission.
-    pub(crate) fn open<T: Send>(
-        self,
-        operation: impl FnOnce() -> T,
-    ) -> Result<AdmittedHandle<'admission, T>> {
-        let value = run_supported(|| Ok(operation()))?;
-        Ok(AdmittedHandle {
-            admitted: Some((value, self.permit)),
-        })
-    }
-}
-
-/// Owns one native handle whose destructor must use blocking admission.
-pub(crate) struct AdmittedHandle<'admission, T: Send> {
-    admitted: Option<(T, SemaphorePermit<'admission>)>,
-}
-
-impl<'admission, T: Send> AdmittedHandle<'admission, T> {
-    /// Verifies that this task context permits `block_in_place`.
-    pub(crate) fn ensure_supported(&self) -> Result<()> {
-        run_supported(|| Ok(()))
-    }
-
-    /// Runs one native call while retaining this handle's reserved admission.
-    pub(crate) fn run<R>(&self, operation: impl FnOnce(&T) -> Result<R>) -> Result<R> {
-        let Some((value, _permit)) = self.admitted.as_ref() else {
-            unreachable!("an admitted handle cannot be accessed after transfer");
+        self.state.active.fetch_add(1, Ordering::AcqRel);
+        let permit = ActivePermit {
+            _permit: permit,
+            state: Arc::clone(&self.state),
         };
-        run_supported(|| operation(value))
+        let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
+        let (ready, opened) = oneshot::channel();
+
+        std::thread::Builder::new()
+            .name("ktann-rocksdb-actor".to_owned())
+            .spawn(move || {
+                let _permit = permit;
+                actor(receiver, ready);
+            })
+            .map_err(|source| Error::with_source(ErrorKind::Backend, source))?;
+
+        opened
+            .await
+            .map_err(|source| Error::with_source(ErrorKind::Backend, source))?;
+        Ok(NativeWorker { commands })
     }
 
-    /// Transfers the native handle and its reserved terminal section.
-    pub(crate) fn into_section(mut self) -> (T, BlockingSection<'admission>) {
-        let Some((value, permit)) = self.admitted.take() else {
-            unreachable!("an admitted handle can transfer ownership only once");
-        };
-        (value, BlockingSection { permit })
-    }
-}
-
-impl<T: Send> Drop for AdmittedHandle<'_, T> {
-    fn drop(&mut self) {
-        if let Some((value, _permit)) = self.admitted.take() {
-            let cleanup = || drop(value);
-            match try_block_in_place(cleanup) {
-                Ok(()) => {}
-                Err(BlockInPlaceError::Unsupported(cleanup)) => {
-                    std::thread::scope(|scope| {
-                        if let Err(panic) = scope.spawn(cleanup).join() {
-                            resume_unwind(panic);
-                        }
-                    });
-                }
-                Err(BlockInPlaceError::Panicked(panic)) => resume_unwind(panic),
-            }
+    /// Asynchronously waits until every admitted actor has finished cleanup.
+    pub(crate) async fn wait_for_idle(&self) {
+        while self.state.active.load(Ordering::Acquire) != 0 {
+            self.state.idle.notified().await;
         }
     }
 }
 
-fn run_supported<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
-    match try_block_in_place(operation) {
-        Ok(result) => result,
-        Err(BlockInPlaceError::Unsupported(_)) => Err(Error::new(ErrorKind::InvalidArgument)),
-        Err(BlockInPlaceError::Panicked(panic)) => resume_unwind(panic),
+struct ActivePermit {
+    _permit: OwnedSemaphorePermit,
+    state: Arc<AdmissionState>,
+}
+
+impl Drop for ActivePermit {
+    fn drop(&mut self) {
+        if self.state.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.state.idle.notify_one();
+        }
     }
 }
 
-enum BlockInPlaceError<F> {
-    Unsupported(F),
-    Panicked(Box<dyn Any + Send>),
+/// A nonblocking handle to one admitted native transaction actor.
+///
+/// Dropping the handle only closes its bounded command channel. The actor then
+/// destroys its native state on its existing native thread before
+/// releasing admission.
+pub(crate) struct NativeWorker<C> {
+    commands: mpsc::Sender<C>,
 }
 
-/// Preserves an unstarted operation when Tokio rejects the current task context.
-///
-/// Tokio exposes no public LocalSet predicate. `block_in_place` panics before
-/// invoking its closure there, so retaining the closure distinguishes that
-/// context rejection from a panic produced by the native operation itself.
-fn try_block_in_place<F, T>(operation: F) -> std::result::Result<T, BlockInPlaceError<F>>
-where
-    F: FnOnce() -> T,
-{
-    let mut operation = Some(operation);
-    match catch_unwind(AssertUnwindSafe(|| {
-        tokio::task::block_in_place(|| {
-            let Some(operation) = operation.take() else {
-                unreachable!("a blocking operation runs exactly once");
-            };
-            operation()
-        })
-    })) {
-        Ok(result) => Ok(result),
-        Err(panic) => match operation {
-            Some(operation) => Err(BlockInPlaceError::Unsupported(operation)),
-            None => Err(BlockInPlaceError::Panicked(panic)),
-        },
+impl<C> NativeWorker<C> {
+    /// Sends one serialized command to the native actor.
+    pub(crate) async fn send(&self, command: C) -> Result<()> {
+        self.commands
+            .send(command)
+            .await
+            .map_err(|_| Error::new(ErrorKind::Backend))
+    }
+
+    /// Sends one command and asynchronously awaits its response.
+    pub(crate) async fn request<T>(
+        &self,
+        command: impl FnOnce(oneshot::Sender<Result<T>>) -> C,
+    ) -> Result<T> {
+        let (response, result) = oneshot::channel();
+        self.send(command(response)).await?;
+        result
+            .await
+            .map_err(|source| Error::with_source(ErrorKind::Backend, source))?
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::future::{Future, poll_fn};
+    use std::future::{Future, pending, poll_fn};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+    use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc as std_mpsc};
     use std::task::Poll;
-    use std::time::Duration;
-
-    use tokio::sync::mpsc;
+    use std::time::{Duration, Instant};
 
     use super::*;
 
@@ -188,60 +163,99 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn saturation_never_executes_more_than_the_configured_limit() {
-        let admission = Arc::new(BlockingAdmission::new(2));
-        let gate = Arc::new(Gate::default());
-        let active = Arc::new(AtomicUsize::new(0));
-        let maximum = Arc::new(AtomicUsize::new(0));
-        let (started, mut starts) = mpsc::unbounded_channel();
-        let mut tasks = Vec::new();
+    struct SlowDrop {
+        started: Option<oneshot::Sender<()>>,
+        gate: Arc<Gate>,
+    }
 
-        for _ in 0..4 {
-            let admission = Arc::clone(&admission);
-            let gate = Arc::clone(&gate);
-            let active = Arc::clone(&active);
-            let maximum = Arc::clone(&maximum);
-            let started = started.clone();
-            tasks.push(tokio::spawn(async move {
-                admission.admit().await?.run(|| {
-                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
-                    maximum.fetch_max(now, Ordering::SeqCst);
-                    started
-                        .send(())
-                        .map_err(|source| Error::with_source(ErrorKind::Backend, source))?;
-                    gate.wait();
-                    active.fetch_sub(1, Ordering::SeqCst);
-                    Ok::<(), Error>(())
-                })
-            }));
+    impl Drop for SlowDrop {
+        fn drop(&mut self) {
+            if let Some(started) = self.started.take() {
+                let _ = started.send(());
+            }
+            self.gate.wait();
         }
-        drop(started);
+    }
 
-        starts.recv().await.expect("first call starts");
-        starts.recv().await.expect("second call starts");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), starts.recv())
-                .await
-                .is_err(),
-            "a third call entered while both permits were held",
-        );
-        assert_eq!(maximum.load(Ordering::SeqCst), 2);
+    async fn idle_worker(admission: &BlockingAdmission) -> Result<NativeWorker<()>> {
+        admission
+            .start(|mut commands, ready| {
+                if ready.send(()).is_err() {
+                    return;
+                }
+                while commands.blocking_recv().is_some() {}
+            })
+            .await
+    }
 
-        gate.open();
-        for task in tasks {
-            task.await
-                .expect("blocking task did not panic")
-                .expect("blocking call succeeds");
-        }
-        assert_eq!(maximum.load(Ordering::SeqCst), 2);
+    async fn value_worker(
+        admission: &BlockingAdmission,
+    ) -> Result<NativeWorker<oneshot::Sender<Result<usize>>>> {
+        admission
+            .start(
+                |mut commands: mpsc::Receiver<oneshot::Sender<Result<usize>>>, ready| {
+                    if ready.send(()).is_err() {
+                        return;
+                    }
+                    while let Some(response) = commands.blocking_recv() {
+                        let _ = response.send(Ok(7));
+                    }
+                },
+            )
+            .await
+    }
+
+    async fn slow_worker(
+        admission: &BlockingAdmission,
+        gate: Arc<Gate>,
+    ) -> Result<(NativeWorker<()>, oneshot::Receiver<()>)> {
+        let (cleanup_started, started) = oneshot::channel();
+        let worker = admission
+            .start(move |mut commands: mpsc::Receiver<()>, ready| {
+                let _slow = SlowDrop {
+                    started: Some(cleanup_started),
+                    gate,
+                };
+                if ready.send(()).is_err() {
+                    return;
+                }
+                while commands.blocking_recv().is_some() {}
+            })
+            .await?;
+        Ok((worker, started))
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancelling_while_waiting_removes_the_waiter_without_leaking_capacity() {
+    async fn live_actor_uses_native_calls_while_next_admission_waits() {
         let admission = BlockingAdmission::new(1);
-        let holder = admission.admit().await.expect("holder acquires permit");
-        let mut waiter = Box::pin(admission.admit());
+        let holder = value_worker(&admission).await.expect("holder starts");
+        let mut waiter = Box::pin(idle_worker(&admission));
+        poll_fn(|context| match waiter.as_mut().poll(context) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(_) => panic!("a live actor released its resource slot"),
+        })
+        .await;
+        assert_eq!(
+            holder
+                .request(|response| response)
+                .await
+                .expect("admitted actor remains operable"),
+            7,
+        );
+
+        drop(holder);
+        let successor = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("cleanup releases capacity")
+            .expect("successor starts");
+        drop(successor);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_before_admission_removes_the_waiter() {
+        let admission = BlockingAdmission::new(1);
+        let holder = idle_worker(&admission).await.expect("holder starts");
+        let mut waiter = Box::pin(idle_worker(&admission));
         poll_fn(|context| match waiter.as_mut().poll(context) {
             Poll::Pending => Poll::Ready(()),
             Poll::Ready(_) => panic!("waiter acquired a held permit"),
@@ -250,85 +264,138 @@ mod tests {
         drop(waiter);
         drop(holder);
 
-        let value = admission
-            .admit()
+        let successor = tokio::time::timeout(Duration::from_secs(1), idle_worker(&admission))
             .await
-            .expect("capacity is reusable")
-            .run(|| Ok::<_, Error>(7))
-            .expect("successor call starts");
-        assert_eq!(value, 7);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn native_handle_reserves_capacity_through_cleanup() {
-        struct DropProbe(Arc<AtomicUsize>);
-
-        impl Drop for DropProbe {
-            fn drop(&mut self) {
-                self.0.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
-        let admission = BlockingAdmission::new(1);
-        let dropped = Arc::new(AtomicUsize::new(0));
-        let handle = admission
-            .admit()
-            .await
-            .expect("handle creation acquires admission")
-            .open(|| DropProbe(Arc::clone(&dropped)))
-            .expect("native handle opens");
-        let mut waiter = Box::pin(admission.admit());
-        poll_fn(|context| match waiter.as_mut().poll(context) {
-            Poll::Pending => Poll::Ready(()),
-            Poll::Ready(_) => panic!("a live native handle released its resource slot"),
-        })
-        .await;
-
-        drop(handle);
-        assert_eq!(dropped.load(Ordering::SeqCst), 1);
-        waiter
-            .await
-            .expect("cleanup releases capacity")
-            .run(|| Ok::<(), Error>(()))
-            .expect("successor call starts");
+            .expect("cancelled admission does not leak capacity")
+            .expect("successor starts");
+        drop(successor);
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn current_thread_runtime_is_rejected_before_admission() {
-        let error = match BlockingAdmission::new(1).admit().await {
-            Ok(_) => panic!("current-thread runtime is unsupported"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), ErrorKind::InvalidArgument);
+    async fn current_thread_runtime_can_use_native_actor() {
+        let admission = BlockingAdmission::new(1);
+        let worker = idle_worker(&admission)
+            .await
+            .expect("current-thread runtime starts blocking actor");
+        drop(worker);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn local_set_calls_are_rejected_and_admitted_handles_still_drop() {
-        struct DropProbe(Arc<AtomicUsize>);
-
-        impl Drop for DropProbe {
-            fn drop(&mut self) {
-                self.0.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
+    async fn local_set_drop_does_not_block_unrelated_tasks_during_slow_cleanup() {
         let admission = BlockingAdmission::new(1);
-        let dropped = Arc::new(AtomicUsize::new(0));
-        let handle = admission
-            .admit()
+        let gate = Arc::new(Gate::default());
+        let (worker, started) = slow_worker(&admission, Arc::clone(&gate))
             .await
-            .expect("handle creation acquires admission")
-            .open(|| DropProbe(Arc::clone(&dropped)))
-            .expect("native handle opens");
+            .expect("worker starts");
 
-        let error = tokio::task::LocalSet::new()
-            .run_until(async {
-                let error = handle.run(|_| Ok::<(), Error>(()));
-                drop(handle);
-                error.expect_err("LocalSet cannot enter block_in_place")
+        let (scheduled, ran) = oneshot::channel();
+        tokio::task::LocalSet::new()
+            .run_until(async move {
+                tokio::task::spawn_local(async move {
+                    let _ = scheduled.send(());
+                });
+                drop(worker);
+                started.await.expect("cleanup starts");
+                tokio::time::timeout(Duration::from_secs(1), ran)
+                    .await
+                    .expect("unrelated LocalSet task remains schedulable")
+                    .expect("unrelated LocalSet task runs");
             })
             .await;
-        assert_eq!(error.kind(), ErrorKind::InvalidArgument);
-        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        gate.open();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn orderly_shutdown_waits_for_native_cleanup_completion() {
+        let admission = BlockingAdmission::new(1);
+        let gate = Arc::new(Gate::default());
+        let (worker, started) = slow_worker(&admission, Arc::clone(&gate))
+            .await
+            .expect("worker starts");
+        drop(worker);
+        started.await.expect("cleanup starts");
+
+        let mut shutdown = Box::pin(admission.wait_for_idle());
+        poll_fn(|context| match shutdown.as_mut().poll(context) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(()) => panic!("shutdown completed before native cleanup"),
+        })
+        .await;
+        gate.open();
+        tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .expect("shutdown completes after native cleanup");
+    }
+
+    #[test]
+    fn runtime_shutdown_does_not_wait_for_slow_native_cleanup() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime builds");
+        let admission = BlockingAdmission::new(1);
+        let gate = Arc::new(Gate::default());
+        let (worker, mut started) = runtime
+            .block_on(slow_worker(&admission, Arc::clone(&gate)))
+            .expect("worker starts");
+        runtime.spawn(async move {
+            let _worker = worker;
+            pending::<()>().await;
+        });
+
+        let (shutdown_finished, finished) = std_mpsc::channel();
+        std::thread::spawn(move || {
+            drop(runtime);
+            let _ = shutdown_finished.send(());
+        });
+        let cleanup_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match started.try_recv() {
+                Ok(()) => break,
+                Err(oneshot::error::TryRecvError::Empty) if Instant::now() < cleanup_deadline => {
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("runtime shutdown did not start native cleanup: {error}"),
+            }
+        }
+        finished
+            .recv_timeout(Duration::from_secs(1))
+            .expect("runtime shutdown does not wait for slow cleanup");
+        gate.open();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cleanup_panic_releases_admission() {
+        let admission = BlockingAdmission::new(1);
+        let panics = Arc::new(AtomicUsize::new(0));
+        let panic_count = Arc::clone(&panics);
+        let worker = admission
+            .start(move |mut commands: mpsc::Receiver<()>, ready| {
+                struct PanicOnDrop(Arc<AtomicUsize>);
+
+                impl Drop for PanicOnDrop {
+                    fn drop(&mut self) {
+                        self.0.fetch_add(1, Ordering::SeqCst);
+                        panic!("cleanup probe panic");
+                    }
+                }
+
+                let _panic = PanicOnDrop(panic_count);
+                if ready.send(()).is_err() {
+                    return;
+                }
+                while commands.blocking_recv().is_some() {}
+            })
+            .await
+            .expect("worker starts");
+        drop(worker);
+
+        let successor = tokio::time::timeout(Duration::from_secs(1), idle_worker(&admission))
+            .await
+            .expect("panic releases capacity")
+            .expect("successor starts");
+        assert_eq!(panics.load(Ordering::SeqCst), 1);
+        drop(successor);
     }
 }

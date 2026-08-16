@@ -1,5 +1,6 @@
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use ktann::api::{Error, ErrorKind, Result};
@@ -12,8 +13,9 @@ use rocksdb::{
     DBAccess, Error as RocksError, ErrorKind as RocksErrorKind, OptimisticTransactionDB,
     OptimisticTransactionOptions, ReadOptions, SnapshotWithThreadMode, Transaction, WriteOptions,
 };
+use tokio::sync::{mpsc, oneshot};
 
-use crate::blocking::{AdmittedHandle, BlockingAdmission};
+use crate::blocking::{BlockingAdmission, NativeWorker};
 use crate::config::RocksDbConfig;
 
 const ROCKSDB_MAX_PHYSICAL_KEY_BYTES: usize = u32::MAX as usize;
@@ -24,6 +26,8 @@ const MAX_SCAN_PAGE_BYTES: usize = 80 << 10;
 const MAX_BATCH_POINT_READS: usize = 1_024;
 const MAX_BACKEND_NAMESPACE_BYTES: usize = u8::MAX as usize;
 const PHYSICAL_PREFIX_HEADER: &[u8] = b"\0ktann-rocksdb\x01";
+
+type MutationCharge = (usize, usize);
 
 /// A caller-selected RocksDB storage scope for KTANN Logical Indexes.
 ///
@@ -62,9 +66,14 @@ impl fmt::Debug for BackendNamespace {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct PhysicalPrefix {
     bytes: Bytes,
+}
+
+struct PhysicalRange {
+    start: Bytes,
+    end: Bytes,
 }
 
 impl PhysicalPrefix {
@@ -102,6 +111,13 @@ impl PhysicalPrefix {
             return Err(Error::new(ErrorKind::Corruption));
         }
         Ok(Bytes::copy_from_slice(&physical_key[self.bytes.len()..]))
+    }
+
+    fn encode_range(&self, range: &KeyRange) -> Result<PhysicalRange> {
+        Ok(PhysicalRange {
+            start: self.encode_key(range.start())?,
+            end: self.encode_key(range.end())?,
+        })
     }
 }
 
@@ -143,9 +159,9 @@ impl RocksDbBackend {
     /// Constructs an adapter with explicit process-local resource limits.
     ///
     /// The configured blocking limit applies to this adapter instance. Opening
-    /// a transaction waits asynchronously for one resource slot, retains it
-    /// through native cleanup, and enters RocksDB only from a Tokio multi-thread
-    /// runtime's blocking section.
+    /// a transaction waits asynchronously for one actor slot and retains it
+    /// through native cleanup. Native calls and destruction run on that actor's
+    /// dedicated native thread.
     #[must_use]
     pub fn with_config(
         database: impl Into<Arc<OptimisticTransactionDB>>,
@@ -174,6 +190,15 @@ impl RocksDbBackend {
     pub fn config(&self) -> &RocksDbConfig {
         &self.config
     }
+
+    /// Waits asynchronously for this adapter's native actors to finish cleanup.
+    ///
+    /// Ordinary transaction drops remain nonblocking. Consume the adapter with
+    /// this method before immediately reopening or destroying its underlying
+    /// database when deterministic native cleanup completion is required.
+    pub async fn shutdown(self) {
+        self.blocking.wait_for_idle().await;
+    }
 }
 
 impl fmt::Debug for RocksDbBackend {
@@ -188,7 +213,7 @@ impl fmt::Debug for RocksDbBackend {
 
 /// A consistent RocksDB read transaction.
 pub struct RocksDbReadTxn<'backend> {
-    snapshot: AdmittedHandle<'backend, SnapshotWithThreadMode<'backend, OptimisticTransactionDB>>,
+    worker: NativeWorker<ReadCommand>,
     prefix: &'backend PhysicalPrefix,
 }
 
@@ -202,18 +227,109 @@ impl fmt::Debug for RocksDbReadTxn<'_> {
 
 /// An atomic RocksDB write transaction with snapshot reads and read-your-writes.
 pub struct RocksDbWriteTxn<'backend> {
-    transaction: AdmittedHandle<'backend, Transaction<'backend, OptimisticTransactionDB>>,
+    worker: NativeWorker<WriteCommand>,
     prefix: &'backend PhysicalPrefix,
-    mutation_count: usize,
-    mutation_bytes: usize,
+}
+
+enum ReadCommand {
+    Get {
+        key: Bytes,
+        response: oneshot::Sender<Result<Option<Bytes>>>,
+    },
+    BatchGet {
+        keys: Vec<Bytes>,
+        response: oneshot::Sender<Result<Vec<Option<Bytes>>>>,
+    },
+    Scan {
+        range: PhysicalRange,
+        limits: ScanLimits,
+        response: oneshot::Sender<Result<ScanPage>>,
+    },
+}
+
+enum WriteCommand {
+    Get {
+        key: Bytes,
+        response: oneshot::Sender<Result<Option<Bytes>>>,
+    },
+    BatchGet {
+        keys: Vec<Bytes>,
+        response: oneshot::Sender<Result<Vec<Option<Bytes>>>>,
+    },
+    Scan {
+        range: PhysicalRange,
+        limits: ScanLimits,
+        response: oneshot::Sender<Result<ScanPage>>,
+    },
+    GetForUpdate {
+        key: Bytes,
+        response: oneshot::Sender<Result<Option<Bytes>>>,
+    },
+    BatchGetForUpdate {
+        keys: Vec<Bytes>,
+        response: oneshot::Sender<Result<Vec<Option<Bytes>>>>,
+    },
+    ApplyOne {
+        mutation: PreparedMutation,
+        charged_bytes: usize,
+        response: oneshot::Sender<Result<()>>,
+    },
+    ApplyBatch {
+        mutations: Vec<PreparedMutation>,
+        charged_bytes: usize,
+        response: oneshot::Sender<Result<()>>,
+    },
+    Insert {
+        mutation: PreparedMutation,
+        charged_bytes: usize,
+        response: oneshot::Sender<Result<InsertOutcome>>,
+    },
+    Commit {
+        start: CommitStart,
+        ownership: CommitOwnership,
+        response: oneshot::Sender<Result<()>>,
+    },
+    Rollback {
+        response: oneshot::Sender<()>,
+    },
+}
+
+/// Linearizes a dropped commit future against actor ownership of native commit.
+#[derive(Clone)]
+struct CommitOwnership(Arc<AtomicBool>);
+
+impl CommitOwnership {
+    fn waiting() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+
+    fn try_start(&self) -> bool {
+        self.0
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn cancel(&self) {
+        let _ = self
+            .0
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+
+struct CancelCommitOnDrop {
+    ownership: CommitOwnership,
+}
+
+impl Drop for CancelCommitOnDrop {
+    fn drop(&mut self) {
+        self.ownership.cancel();
+    }
 }
 
 impl fmt::Debug for RocksDbWriteTxn<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RocksDbWriteTxn")
-            .field("mutation_count", &self.mutation_count)
-            .field("mutation_bytes", &self.mutation_bytes)
             .finish_non_exhaustive()
     }
 }
@@ -242,33 +358,33 @@ impl Backend for RocksDbBackend {
         }
     }
 
+    async fn shutdown(&self) {
+        self.blocking.wait_for_idle().await;
+    }
+
     async fn begin_read(&self) -> Result<RocksDbReadTxn<'_>> {
-        let snapshot = self
+        let database = Arc::clone(&self.database);
+        let prefix = self.prefix.clone();
+        let worker = self
             .blocking
-            .admit()
-            .await?
-            .open(|| self.database.snapshot())?;
+            .start(move |commands, ready| read_actor(database, prefix, commands, ready))
+            .await?;
         Ok(RocksDbReadTxn {
-            snapshot,
+            worker,
             prefix: &self.prefix,
         })
     }
 
     async fn begin_write(&self) -> Result<RocksDbWriteTxn<'_>> {
-        let transaction = self.blocking.admit().await?.open(|| {
-            let mut write_options = WriteOptions::default();
-            write_options.disable_wal(false);
-            write_options.set_sync(true);
-            let mut transaction_options = OptimisticTransactionOptions::default();
-            transaction_options.set_snapshot(true);
-            self.database
-                .transaction_opt(&write_options, &transaction_options)
-        })?;
+        let database = Arc::clone(&self.database);
+        let prefix = self.prefix.clone();
+        let worker = self
+            .blocking
+            .start(move |commands, ready| write_actor(database, prefix, commands, ready))
+            .await?;
         Ok(RocksDbWriteTxn {
-            transaction,
+            worker,
             prefix: &self.prefix,
-            mutation_count: 0,
-            mutation_bytes: 0,
         })
     }
 }
@@ -276,20 +392,29 @@ impl Backend for RocksDbBackend {
 impl ReadOps for RocksDbReadTxn<'_> {
     async fn get(&mut self, key: Bytes) -> Result<Option<Bytes>> {
         let key = self.prefix.encode_key(&key)?;
-        self.snapshot.run(|snapshot| get(snapshot, &key))
+        self.worker
+            .request(|response| ReadCommand::Get { key, response })
+            .await
     }
 
     async fn batch_get(&mut self, keys: Vec<Bytes>) -> Result<Vec<Option<Bytes>>> {
         for key in &keys {
             self.prefix.validate_key(key)?;
         }
-        self.snapshot
-            .run(|snapshot| batch_get(snapshot, self.prefix, keys))
+        self.worker
+            .request(|response| ReadCommand::BatchGet { keys, response })
+            .await
     }
 
     async fn scan(&mut self, range: &KeyRange, limits: ScanLimits) -> Result<ScanPage> {
-        self.snapshot
-            .run(|snapshot| scan(snapshot, self.prefix, range, limits))
+        let range = self.prefix.encode_range(range)?;
+        self.worker
+            .request(|response| ReadCommand::Scan {
+                range,
+                limits,
+                response,
+            })
+            .await
     }
 }
 
@@ -298,46 +423,33 @@ impl ReadTxn for RocksDbReadTxn<'_> {}
 impl ReadOps for RocksDbWriteTxn<'_> {
     async fn get(&mut self, key: Bytes) -> Result<Option<Bytes>> {
         let key = self.prefix.encode_key(&key)?;
-        self.transaction.run(|transaction| {
-            let snapshot = transaction.snapshot();
-            get(&snapshot, &key)
-        })
+        self.worker
+            .request(|response| WriteCommand::Get { key, response })
+            .await
     }
 
     async fn batch_get(&mut self, keys: Vec<Bytes>) -> Result<Vec<Option<Bytes>>> {
         for key in &keys {
             self.prefix.validate_key(key)?;
         }
-        self.transaction.run(|transaction| {
-            let snapshot = transaction.snapshot();
-            batch_get(&snapshot, self.prefix, keys)
-        })
+        self.worker
+            .request(|response| WriteCommand::BatchGet { keys, response })
+            .await
     }
 
     async fn scan(&mut self, range: &KeyRange, limits: ScanLimits) -> Result<ScanPage> {
-        self.transaction.run(|transaction| {
-            let snapshot = transaction.snapshot();
-            scan(&snapshot, self.prefix, range, limits)
-        })
+        let range = self.prefix.encode_range(range)?;
+        self.worker
+            .request(|response| WriteCommand::Scan {
+                range,
+                limits,
+                response,
+            })
+            .await
     }
 }
 
 impl RocksDbWriteTxn<'_> {
-    fn next_charge(&self, mutation_count: usize, mutation_bytes: usize) -> Result<(usize, usize)> {
-        let next_count = self
-            .mutation_count
-            .checked_add(mutation_count)
-            .ok_or_else(limit_exceeded)?;
-        let next_bytes = self
-            .mutation_bytes
-            .checked_add(mutation_bytes)
-            .ok_or_else(limit_exceeded)?;
-        if next_count > DEFAULT_MAX_MUTATIONS || next_bytes > DEFAULT_MAX_MUTATION_BYTES {
-            return Err(limit_exceeded());
-        }
-        Ok((next_count, next_bytes))
-    }
-
     fn prepare_put(&self, key: Bytes, value: Bytes) -> Result<PreparedMutation> {
         validate_value(&value)?;
         let key = self.prefix.encode_key(&key)?;
@@ -350,75 +462,79 @@ impl RocksDbWriteTxn<'_> {
     }
 }
 
+fn next_charge(
+    current_count: usize,
+    current_bytes: usize,
+    mutation_count: usize,
+    mutation_bytes: usize,
+) -> Result<MutationCharge> {
+    let next_count = current_count
+        .checked_add(mutation_count)
+        .ok_or_else(limit_exceeded)?;
+    let next_bytes = current_bytes
+        .checked_add(mutation_bytes)
+        .ok_or_else(limit_exceeded)?;
+    if next_count > DEFAULT_MAX_MUTATIONS || next_bytes > DEFAULT_MAX_MUTATION_BYTES {
+        return Err(limit_exceeded());
+    }
+    Ok((next_count, next_bytes))
+}
+
 impl WriteTxn for RocksDbWriteTxn<'_> {
     async fn get_for_update(&mut self, key: Bytes) -> Result<Option<Bytes>> {
         let key = self.prefix.encode_key(&key)?;
-        self.transaction.run(|transaction| {
-            let snapshot = transaction.snapshot();
-            let mut read_options = ReadOptions::default();
-            read_options.set_snapshot(&snapshot);
-            get_for_update(transaction, &key, &read_options)
-        })
+        self.worker
+            .request(|response| WriteCommand::GetForUpdate { key, response })
+            .await
     }
 
     async fn batch_get_for_update(&mut self, keys: Vec<Bytes>) -> Result<Vec<Option<Bytes>>> {
         for key in &keys {
             self.prefix.validate_key(key)?;
         }
-        self.transaction.run(|transaction| {
-            let snapshot = transaction.snapshot();
-            let mut read_options = ReadOptions::default();
-            read_options.set_snapshot(&snapshot);
-            let mut values = Vec::with_capacity(keys.len());
-            for key in keys {
-                let key = self.prefix.encode_key(&key)?;
-                values.push(get_for_update(transaction, &key, &read_options)?);
-            }
-            Ok(values)
-        })
+        self.worker
+            .request(|response| WriteCommand::BatchGetForUpdate { keys, response })
+            .await
     }
 
     async fn put(&mut self, key: Bytes, value: Bytes) -> Result<()> {
         let mutation = self.prepare_put(key, value)?;
-        let charge = self.next_charge(1, mutation.charged_bytes()?)?;
-        self.transaction
-            .run(|transaction| mutation.apply(transaction))?;
-        (self.mutation_count, self.mutation_bytes) = charge;
-        Ok(())
+        let charged_bytes = mutation.charged_bytes()?;
+        self.worker
+            .request(|response| WriteCommand::ApplyOne {
+                mutation,
+                charged_bytes,
+                response,
+            })
+            .await
     }
 
     async fn insert(&mut self, key: Bytes, value: Bytes) -> Result<InsertOutcome> {
         let mutation = self.prepare_put(key, value)?;
         let charged_bytes = mutation.charged_bytes()?;
-        let (outcome, charge) = self.transaction.run(|transaction| {
-            let snapshot = transaction.snapshot();
-            let mut read_options = ReadOptions::default();
-            read_options.set_snapshot(&snapshot);
-            if get_for_update(transaction, mutation.key(), &read_options)?.is_some() {
-                return Ok((InsertOutcome::AlreadyExists, None));
-            }
-            let charge = self.next_charge(1, charged_bytes)?;
-            mutation.apply(transaction)?;
-            Ok((InsertOutcome::Inserted, Some(charge)))
-        })?;
-        if let Some((mutation_count, mutation_bytes)) = charge {
-            self.mutation_count = mutation_count;
-            self.mutation_bytes = mutation_bytes;
-        }
-        Ok(outcome)
+        self.worker
+            .request(|response| WriteCommand::Insert {
+                mutation,
+                charged_bytes,
+                response,
+            })
+            .await
     }
 
     async fn delete(&mut self, key: Bytes) -> Result<()> {
         let mutation = self.prepare_delete(key)?;
-        let charge = self.next_charge(1, mutation.charged_bytes()?)?;
-        self.transaction
-            .run(|transaction| mutation.apply(transaction))?;
-        (self.mutation_count, self.mutation_bytes) = charge;
-        Ok(())
+        let charged_bytes = mutation.charged_bytes()?;
+        self.worker
+            .request(|response| WriteCommand::ApplyOne {
+                mutation,
+                charged_bytes,
+                response,
+            })
+            .await
     }
 
     async fn batch_mutate(&mut self, mutations: Vec<Mutation>) -> Result<()> {
-        if mutations.len() > DEFAULT_MAX_MUTATIONS.saturating_sub(self.mutation_count) {
+        if mutations.len() > DEFAULT_MAX_MUTATIONS {
             return Err(limit_exceeded());
         }
         let mut prepared = Vec::with_capacity(mutations.len());
@@ -434,15 +550,16 @@ impl WriteTxn for RocksDbWriteTxn<'_> {
                 .ok_or_else(limit_exceeded)?;
             prepared.push(mutation);
         }
-        let charge = self.next_charge(prepared.len(), charged_bytes)?;
-        self.transaction.run(|transaction| {
-            for mutation in prepared {
-                mutation.apply(transaction)?;
-            }
-            Ok(())
-        })?;
-        (self.mutation_count, self.mutation_bytes) = charge;
-        Ok(())
+        if charged_bytes > DEFAULT_MAX_MUTATION_BYTES {
+            return Err(limit_exceeded());
+        }
+        self.worker
+            .request(|response| WriteCommand::ApplyBatch {
+                mutations: prepared,
+                charged_bytes,
+                response,
+            })
+            .await
     }
 
     async fn clear_range(&mut self, _range: &KeyRange) -> Result<()> {
@@ -450,15 +567,200 @@ impl WriteTxn for RocksDbWriteTxn<'_> {
     }
 
     async fn commit_with(self, start: CommitStart) -> Result<()> {
-        self.transaction.ensure_supported()?;
-        start.begin()?;
-        let (transaction, section) = self.transaction.into_section();
-        section.run(|| transaction.commit().map_err(map_commit_error))
+        let ownership = CommitOwnership::waiting();
+        let cancellation = CancelCommitOnDrop {
+            ownership: ownership.clone(),
+        };
+        let (response, result) = oneshot::channel();
+        self.worker
+            .send(WriteCommand::Commit {
+                start,
+                ownership,
+                response,
+            })
+            .await?;
+        let result = result
+            .await
+            .map_err(|source| Error::with_source(ErrorKind::Backend, source))?;
+        drop(cancellation);
+        result
     }
 
     async fn rollback(self) {
-        drop(self);
+        let (response, cleaned) = oneshot::channel();
+        if self
+            .worker
+            .send(WriteCommand::Rollback { response })
+            .await
+            .is_ok()
+        {
+            let _ = cleaned.await;
+        }
     }
+}
+
+fn read_actor(
+    database: Arc<OptimisticTransactionDB>,
+    prefix: PhysicalPrefix,
+    mut commands: mpsc::Receiver<ReadCommand>,
+    ready: oneshot::Sender<()>,
+) {
+    let snapshot = database.snapshot();
+    if ready.send(()).is_err() {
+        return;
+    }
+    while let Some(command) = commands.blocking_recv() {
+        match command {
+            ReadCommand::Get { key, response } => {
+                let _ = respond(response, || get(&snapshot, &key));
+            }
+            ReadCommand::BatchGet { keys, response } => {
+                let _ = respond(response, || batch_get(&snapshot, &prefix, keys));
+            }
+            ReadCommand::Scan {
+                range,
+                limits,
+                response,
+            } => {
+                let _ = respond(response, || scan(&snapshot, &prefix, &range, limits));
+            }
+        }
+    }
+}
+
+fn write_actor(
+    database: Arc<OptimisticTransactionDB>,
+    prefix: PhysicalPrefix,
+    mut commands: mpsc::Receiver<WriteCommand>,
+    ready: oneshot::Sender<()>,
+) {
+    let mut write_options = WriteOptions::default();
+    write_options.disable_wal(false);
+    write_options.set_sync(true);
+    let mut transaction_options = OptimisticTransactionOptions::default();
+    transaction_options.set_snapshot(true);
+    let transaction = database.transaction_opt(&write_options, &transaction_options);
+    let mut mutation_count = 0_usize;
+    let mut mutation_bytes = 0_usize;
+    if ready.send(()).is_err() {
+        return;
+    }
+
+    while let Some(command) = commands.blocking_recv() {
+        let keep_running = match command {
+            WriteCommand::Get { key, response } => respond(response, || {
+                let snapshot = transaction.snapshot();
+                get(&snapshot, &key)
+            }),
+            WriteCommand::BatchGet { keys, response } => respond(response, || {
+                let snapshot = transaction.snapshot();
+                batch_get(&snapshot, &prefix, keys)
+            }),
+            WriteCommand::Scan {
+                range,
+                limits,
+                response,
+            } => respond(response, || {
+                let snapshot = transaction.snapshot();
+                scan(&snapshot, &prefix, &range, limits)
+            }),
+            WriteCommand::GetForUpdate { key, response } => respond(response, || {
+                let snapshot = transaction.snapshot();
+                let mut read_options = ReadOptions::default();
+                read_options.set_snapshot(&snapshot);
+                get_for_update(&transaction, &key, &read_options)
+            }),
+            WriteCommand::BatchGetForUpdate { keys, response } => respond(response, || {
+                let snapshot = transaction.snapshot();
+                let mut read_options = ReadOptions::default();
+                read_options.set_snapshot(&snapshot);
+                let mut values = Vec::with_capacity(keys.len());
+                for key in keys {
+                    let key = prefix.encode_key(&key)?;
+                    values.push(get_for_update(&transaction, &key, &read_options)?);
+                }
+                Ok(values)
+            }),
+            WriteCommand::ApplyOne {
+                mutation,
+                charged_bytes,
+                response,
+            } => respond(response, || {
+                let charge = next_charge(mutation_count, mutation_bytes, 1, charged_bytes)?;
+                mutation.apply(&transaction)?;
+                (mutation_count, mutation_bytes) = charge;
+                Ok(())
+            }),
+            WriteCommand::ApplyBatch {
+                mutations,
+                charged_bytes,
+                response,
+            } => respond(response, || {
+                let charge = next_charge(
+                    mutation_count,
+                    mutation_bytes,
+                    mutations.len(),
+                    charged_bytes,
+                )?;
+                for mutation in mutations {
+                    mutation.apply(&transaction)?;
+                }
+                (mutation_count, mutation_bytes) = charge;
+                Ok(())
+            }),
+            WriteCommand::Insert {
+                mutation,
+                charged_bytes,
+                response,
+            } => respond(response, || {
+                let snapshot = transaction.snapshot();
+                let mut read_options = ReadOptions::default();
+                read_options.set_snapshot(&snapshot);
+                if get_for_update(&transaction, mutation.key(), &read_options)?.is_some() {
+                    return Ok(InsertOutcome::AlreadyExists);
+                }
+                let charge = next_charge(mutation_count, mutation_bytes, 1, charged_bytes)?;
+                mutation.apply(&transaction)?;
+                (mutation_count, mutation_bytes) = charge;
+                Ok(InsertOutcome::Inserted)
+            }),
+            WriteCommand::Commit {
+                start,
+                ownership,
+                response,
+            } => {
+                if !ownership.try_start() {
+                    return;
+                }
+                let result = match start.begin() {
+                    Ok(()) => transaction.commit().map_err(map_commit_error),
+                    Err(error) => {
+                        drop(transaction);
+                        let _ = response.send(Err(error));
+                        return;
+                    }
+                };
+                let _ = response.send(result);
+                return;
+            }
+            WriteCommand::Rollback { response } => {
+                drop(transaction);
+                let _ = response.send(());
+                return;
+            }
+        };
+        if !keep_running {
+            break;
+        }
+    }
+}
+
+/// Runs a command only while its caller still owns the response future.
+fn respond<T>(response: oneshot::Sender<Result<T>>, operation: impl FnOnce() -> Result<T>) -> bool {
+    if response.is_closed() {
+        return false;
+    }
+    response.send(operation()).is_ok()
 }
 
 enum PreparedMutation {
@@ -535,24 +837,22 @@ fn get_for_update(
 fn scan<D: DBAccess>(
     snapshot: &SnapshotWithThreadMode<'_, D>,
     prefix: &PhysicalPrefix,
-    range: &KeyRange,
+    range: &PhysicalRange,
     limits: ScanLimits,
 ) -> Result<ScanPage> {
     if limits.item_limit == 0 || limits.byte_limit == 0 {
         return Err(Error::new(ErrorKind::InvalidArgument));
     }
-    if range.start() >= range.end() {
+    if range.start.as_ref() >= range.end.as_ref() {
         return Ok(ScanPage::new(Vec::new(), None));
     }
-    let start = prefix.encode_key(range.start())?;
-    let end = prefix.encode_key(range.end())?;
     let byte_limit = limits.byte_limit.min(MAX_SCAN_PAGE_BYTES);
     let mut read_options = ReadOptions::default();
-    read_options.set_iterate_lower_bound(start.to_vec());
-    read_options.set_iterate_upper_bound(end.to_vec());
+    read_options.set_iterate_lower_bound(range.start.to_vec());
+    read_options.set_iterate_upper_bound(range.end.to_vec());
     read_options.set_total_order_seek(true);
     let mut iterator = snapshot.raw_iterator_opt(read_options);
-    iterator.seek(&start);
+    iterator.seek(&range.start);
     let mut items = Vec::new();
     let mut item_bytes = 0_usize;
     while let Some((physical_key, value)) = iterator.item() {
@@ -701,5 +1001,22 @@ mod tests {
             map_commit_error_kind(RocksErrorKind::Unknown),
             ErrorKind::CommitOutcomeUnknown,
         );
+    }
+
+    #[test]
+    fn commit_future_cancellation_is_linearized_against_actor_ownership() {
+        let cancelled = CommitOwnership::waiting();
+        drop(CancelCommitOnDrop {
+            ownership: cancelled.clone(),
+        });
+        assert!(!cancelled.try_start());
+
+        let started = CommitOwnership::waiting();
+        let cancellation = CancelCommitOnDrop {
+            ownership: started.clone(),
+        };
+        assert!(started.try_start());
+        drop(cancellation);
+        assert!(started.0.load(Ordering::Acquire));
     }
 }

@@ -359,8 +359,10 @@ impl<B: Backend> RuntimeInner<B> {
 
     fn release_backend(self: &Arc<Self>, backend: Arc<B>) {
         let inner = Arc::clone(self);
-        drop(self.executor.spawn_blocking(move || {
-            drop(backend);
+        let executor = self.executor.clone();
+        drop(self.executor.spawn(async move {
+            backend.shutdown().await;
+            let _ = executor.spawn_blocking(move || drop(backend)).await;
             inner.finish_release();
         }));
     }
@@ -473,6 +475,7 @@ mod tests {
 
     struct TestBackend {
         drops: Arc<AtomicUsize>,
+        shutdowns: Arc<AtomicUsize>,
         drop_control: Option<Arc<DropControl>>,
         debug_sentinel: &'static str,
     }
@@ -643,6 +646,10 @@ mod tests {
             }
         }
 
+        async fn shutdown(&self) {
+            self.shutdowns.fetch_add(1, Ordering::SeqCst);
+        }
+
         fn begin_read(&self) -> impl Future<Output = Result<Self::ReadTxn<'_>>> + Send + '_ {
             ready(Ok(TestTxn))
         }
@@ -654,12 +661,14 @@ mod tests {
 
     fn test_runtime(limit: usize) -> (Runtime<TestBackend>, Arc<AtomicUsize>) {
         let drops = Arc::new(AtomicUsize::new(0));
+        let shutdowns = Arc::new(AtomicUsize::new(0));
         let config = RuntimeConfig::default()
             .with_foreground_operation_limit(limit)
             .expect("test limit is positive");
         let runtime = Runtime::new(
             TestBackend {
                 drops: Arc::clone(&drops),
+                shutdowns,
                 drop_control: None,
                 debug_sentinel: "sensitive-backend-sentinel",
             },
@@ -672,9 +681,11 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn construction_rejects_current_thread_runtime() {
         let drops = Arc::new(AtomicUsize::new(0));
+        let shutdowns = Arc::new(AtomicUsize::new(0));
         let error = Runtime::new(
             TestBackend {
                 drops: Arc::clone(&drops),
+                shutdowns,
                 drop_control: None,
                 debug_sentinel: "sensitive-backend-sentinel",
             },
@@ -1252,6 +1263,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_reaches_terminal_state_after_blocking_backend_drop() {
         let drops = Arc::new(AtomicUsize::new(0));
+        let shutdowns = Arc::new(AtomicUsize::new(0));
         let drop_control = Arc::new(DropControl {
             started: AtomicBool::new(false),
             release: Mutex::new(false),
@@ -1260,6 +1272,7 @@ mod tests {
         let runtime = Runtime::new(
             TestBackend {
                 drops: Arc::clone(&drops),
+                shutdowns: Arc::clone(&shutdowns),
                 drop_control: Some(Arc::clone(&drop_control)),
                 debug_sentinel: "sensitive-backend-sentinel",
             },
@@ -1304,6 +1317,7 @@ mod tests {
         })
         .await
         .expect("backend release starts");
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
         assert_eq!(runtime.handle.inner.phase(), Phase::Releasing);
         assert!(!shutdown.is_finished());
 

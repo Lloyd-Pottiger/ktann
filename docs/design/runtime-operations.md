@@ -140,6 +140,11 @@ benchmark-tunable implementation details.
 ## 8. Operational limitations
 
 - Demand-driven maintenance offers no time-bound cluster-wide convergence.
+- RocksDB handle Drop starts nonblocking actor cleanup. Runtime shutdown invokes
+  the backend cleanup hook after foreground drain and waits before releasing the
+  adapter, so successful shutdown permits native database reopen or teardown.
+  Direct adapter users call its consuming asynchronous shutdown. Dedicated
+  native actors may outlive an ungraceful Tokio runtime drop.
 - Verify has no repair mode and may require an offline copy for large
   FoundationDB indexes.
 - Search quality depends on explicit budgets and data distribution; v1 publishes
