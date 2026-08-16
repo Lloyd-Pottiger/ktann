@@ -475,7 +475,7 @@ async fn scan(
         return Err(Error::new(ErrorKind::InvalidArgument));
     }
     if range.start() >= range.end() {
-        return Ok(ScanPage::new(Vec::new(), None));
+        return Ok(ScanPage::terminal(Vec::new()));
     }
     let start = prefix.encode_key(range.start())?;
     let end = prefix.encode_key(range.end())?;
@@ -510,7 +510,7 @@ async fn scan(
                 && (items.len() >= limits.item_limit
                     || item_bytes.checked_add(bytes).ok_or_else(limit_exceeded)? > byte_limit)
             {
-                return Ok(ScanPage::new(items, Some(logical_key)));
+                return ScanPage::continued(items, prefix.max_logical_key_bytes());
             }
             item_bytes = item_bytes.checked_add(bytes).ok_or_else(limit_exceeded)?;
             items.push(ScanItem::new(
@@ -519,7 +519,7 @@ async fn scan(
             ));
         }
     }
-    Ok(ScanPage::new(items, None))
+    Ok(ScanPage::terminal(items))
 }
 
 fn validate_value(value: &[u8]) -> Result<()> {

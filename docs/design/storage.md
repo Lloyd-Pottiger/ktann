@@ -27,8 +27,12 @@ Every adapter provides:
 The common interface has no reverse scan, unbounded scan, implicit read renewal,
 or cross-transaction logical snapshot. A scan may return one oversized first
 item so callers can make progress; otherwise it never exceeds the requested
-adapter byte bound. Cursor advancement is the successor of the last returned
-key and an empty page terminates the range.
+adapter byte bound. A page is explicitly terminal (the range is exhausted) or
+non-terminal; a non-terminal page carries a `next_start` equal to the
+byte-lexicographic successor of its last key — the smallest key strictly
+greater than it within the backend's key-length limit — so resuming at that
+bound returns every remaining key exactly once, with no skipped eligible key
+and no duplicated returned key.
 
 ## 2. Transaction sizing and retry
 
@@ -180,8 +184,9 @@ that lacks transactional range clear.
 
 Backend contract tests run unchanged against a deterministic test backend,
 FoundationDB, and RocksDB. They cover snapshot consistency, read-your-writes,
-conflicts, unique insertion, scan pagination, limits, rollback, commit outcome,
-range-clear capability, and durability mappings.
+conflicts, unique insertion, gap-free scan pagination across item and byte
+boundaries, empty ranges, oversized values, exact-boundary exhaustion, limits,
+rollback, commit outcome, range-clear capability, and durability mappings.
 
 Codec tests use golden bytes, ordering properties, malformed/noncanonical input,
 and cross-process deterministic vectors for rotation, Bloom, Tree Key, values,
