@@ -32,6 +32,29 @@ jobs:
       - name: Test workspace
         run: cargo +"${{ matrix.toolchain }}" test --workspace --all-targets
 
+  rocksdb:
+    name: RocksDB durability
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Write RocksDB durability probe
+        env:
+          KTANN_ROCKSDB_DURABILITY_PHASE: write
+          KTANN_ROCKSDB_DURABILITY_PATH: ${{ runner.temp }}/ktann-rocksdb-durability
+        run: >-
+          cargo +stable test -p ktann-rocksdb
+          --test rocksdb_durability -- --ignored
+      - name: Verify RocksDB durability probe in a fresh process
+        env:
+          KTANN_ROCKSDB_DURABILITY_PHASE: verify
+          KTANN_ROCKSDB_DURABILITY_PATH: ${{ runner.temp }}/ktann-rocksdb-durability
+        run: >-
+          cargo +stable test -p ktann-rocksdb
+          --test rocksdb_durability -- --ignored
+
   foundationdb:
     name: FoundationDB integration
     runs-on: ubuntu-latest

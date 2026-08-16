@@ -1,11 +1,18 @@
 //! Focused contract checks against a temporary local RocksDB database.
+//!
+//! Every test here owns one `tempfile` directory that is removed when the test
+//! finishes, so databases are isolated from each other and from any caller-owned
+//! database, and cleanup never depends on a shared path. Each adapter binds a
+//! distinct Backend Namespace, and every test writes a bounded number of small
+//! keys and values.
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use ktann::api::ErrorKind;
-use ktann::storage::backend::{Backend, Mutation, ReadOps, ScanLimits, WriteTxn};
+use ktann::storage::backend::{Backend, InsertOutcome, Mutation, ReadOps, ScanLimits, WriteTxn};
 use ktann::storage::keys::KeyRange;
 use ktann_rocksdb::{BackendNamespace, RocksDbBackend, RocksDbConfig};
 use rocksdb::{MemtableFactory, OptimisticTransactionDB, Options, SliceTransform};
@@ -31,9 +38,14 @@ fn open_database(path: &Path) -> OptimisticTransactionDB {
 
 /// Adapts a [`RocksDbBackend`] to the shared harness seam.
 ///
-/// RocksDB cannot stage controlled commit faults, and its durability is
-/// exercised by reopening the database at the same path rather than by an
-/// in-process restart.
+/// RocksDB cannot stage a controlled commit outcome, so fault injection is
+/// declared unavailable. Backend restart is likewise declared unsupported
+/// rather than silently skipped: the only honest restart is dropping the one
+/// live database handle and reopening the path, but RocksDB locks the path for
+/// the handle's whole lifetime and the unchanged shared suite keeps using this
+/// harness after `restart()`. The two-phase `rocksdb_durability` binary proves
+/// committed data survives a fresh process, and this file's reopen check proves
+/// visibility through a new adapter after an orderly close.
 struct RocksDbHarness {
     backend: RocksDbBackend,
 }
@@ -58,7 +70,7 @@ impl BackendHarness for RocksDbHarness {
     }
 
     fn restart(&self) -> Self {
-        unreachable!("RocksDB durability is exercised by the adapter reopen test");
+        unreachable!("RocksDB durability requires the external two-phase durability test");
     }
 }
 
@@ -66,9 +78,9 @@ impl BackendHarness for RocksDbHarness {
 async fn rocksdb_adapter_preserves_the_backend_contract() {
     let directory = tempfile::tempdir().expect("temporary database directory");
     let database_path = directory.path().join("database");
-    let primary_namespace = BackendNamespace::new("ktann-issue-18-contract").expect("namespace");
+    let primary_namespace = BackendNamespace::new("ktann-issue-34-contract").expect("namespace");
     let isolated_namespace =
-        BackendNamespace::new("ktann-issue-18-contract-isolated").expect("namespace");
+        BackendNamespace::new("ktann-issue-34-contract-isolated").expect("namespace");
 
     {
         let database = Arc::new(open_database(&database_path));
@@ -202,6 +214,158 @@ async fn rocksdb_adapter_preserves_the_backend_contract() {
     );
     drop(isolated_durable);
     isolated.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_unique_insert_conflicts_instead_of_overwriting() {
+    let directory = tempfile::tempdir().expect("temporary database directory");
+    let namespace = BackendNamespace::new("ktann-issue-34-insert-conflict").expect("namespace");
+    let backend = RocksDbBackend::new(open_database(directory.path()), namespace);
+
+    let mut first = backend.begin_write().await.expect("begin first");
+    let mut second = backend.begin_write().await.expect("begin second");
+    assert_eq!(
+        first
+            .insert(key(b"unique"), key(b"1"))
+            .await
+            .expect("first insert"),
+        InsertOutcome::Inserted,
+    );
+    assert_eq!(
+        second
+            .insert(key(b"unique"), key(b"2"))
+            .await
+            .expect("second insert"),
+        InsertOutcome::Inserted,
+    );
+
+    first.commit().await.expect("first commit wins");
+    // The loser observes RocksDB's real optimistic-conflict error, classified
+    // as a retryable abort rather than a silent overwrite.
+    let error = second.commit().await.expect_err("second insert conflicts");
+    assert_eq!(error.kind(), ErrorKind::RetryableAbort);
+
+    let mut read = backend.begin_read().await.expect("begin read");
+    assert_eq!(
+        read.get(key(b"unique")).await.expect("get"),
+        Some(key(b"1"))
+    );
+    drop(read);
+    backend.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn open_snapshot_paginates_consistently_across_concurrent_commits() {
+    let directory = tempfile::tempdir().expect("temporary database directory");
+    let namespace = BackendNamespace::new("ktann-issue-34-snapshot-pages").expect("namespace");
+    let backend = RocksDbBackend::new(open_database(directory.path()), namespace);
+
+    {
+        let mut seed = backend.begin_write().await.expect("begin seed");
+        for (suffix, value) in ["a", "b", "c", "d", "e", "f"].iter().zip(1_u8..=6) {
+            seed.put(
+                Bytes::from(format!("snap/{suffix}").into_bytes()),
+                Bytes::from(vec![value]),
+            )
+            .await
+            .expect("seed put");
+        }
+        seed.commit().await.expect("commit seed");
+    }
+
+    // The snapshot opens before the concurrent commit, so every page below
+    // must observe the pre-commit state.
+    let mut reader = backend.begin_read().await.expect("begin snapshot");
+    {
+        let mut concurrent = backend.begin_write().await.expect("begin concurrent");
+        concurrent
+            .delete(key(b"snap/d"))
+            .await
+            .expect("concurrent delete");
+        concurrent
+            .put(key(b"snap/z"), key(b"7"))
+            .await
+            .expect("concurrent put");
+        concurrent.commit().await.expect("commit concurrent");
+    }
+
+    let limits = ScanLimits {
+        item_limit: 2,
+        byte_limit: 1_024,
+    };
+    let range = range(b"snap/", b"snap0");
+    let mut pages = 0_usize;
+    let mut start = range.start().to_vec();
+    let mut items = Vec::new();
+    loop {
+        let page = reader
+            .scan(&KeyRange::new(start.clone(), range.end().to_vec()), limits)
+            .await
+            .expect("snapshot page");
+        for item in page.items() {
+            items.push((item.key().to_vec(), item.value().to_vec()));
+        }
+        pages += 1;
+        match page.next_start() {
+            Some(next) => start = next.to_vec(),
+            None => break,
+        }
+    }
+
+    let expected: Vec<(Vec<u8>, Vec<u8>)> = ["a", "b", "c", "d", "e", "f"]
+        .iter()
+        .zip(1_u8..=6)
+        .map(|(suffix, value)| (format!("snap/{suffix}").into_bytes(), vec![value]))
+        .collect();
+    assert_eq!(
+        pages, 3,
+        "six keys paginate as three pages of two without gaps or duplicates",
+    );
+    assert_eq!(
+        items, expected,
+        "the open snapshot keeps the deleted key and hides the inserted key",
+    );
+    drop(reader);
+    backend.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocking_resource_limit_waits_for_a_live_transaction_slot() {
+    let directory = tempfile::tempdir().expect("temporary database directory");
+    let namespace = BackendNamespace::new("ktann-issue-34-blocking-limit").expect("namespace");
+    let config = RocksDbConfig::default()
+        .with_blocking_resource_limit(1)
+        .expect("blocking limit");
+    let backend = RocksDbBackend::with_config(open_database(directory.path()), namespace, config);
+
+    {
+        let mut seed = backend.begin_write().await.expect("begin seed");
+        seed.put(key(b"seed"), key(b"1")).await.expect("seed put");
+        seed.commit().await.expect("commit seed");
+    }
+
+    let mut holder = backend.begin_read().await.expect("first slot");
+    // The one native actor slot is held, so the next open must wait
+    // asynchronously instead of failing or overtaking the live transaction.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), backend.begin_read())
+            .await
+            .is_err(),
+        "second open must wait while the only slot is held",
+    );
+    assert_eq!(
+        holder.get(key(b"seed")).await.expect("holder get"),
+        Some(key(b"1")),
+        "the live transaction keeps making progress while another open waits",
+    );
+
+    drop(holder);
+    let successor = tokio::time::timeout(Duration::from_secs(1), backend.begin_read())
+        .await
+        .expect("native cleanup releases the slot")
+        .expect("successor admits after release");
+    drop(successor);
+    backend.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
