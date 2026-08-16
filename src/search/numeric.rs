@@ -8,7 +8,7 @@
     not(test),
     expect(
         dead_code,
-        reason = "the search pipeline consumes the format-v1 vector kernel"
+        reason = "the exact-reranking stage consumes the format-v1 vector kernel (#28)"
     )
 )]
 
