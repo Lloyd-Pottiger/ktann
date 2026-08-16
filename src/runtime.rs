@@ -10,8 +10,12 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
-use crate::api::{Error, ErrorKind, OperationOptions, Result, RuntimeConfig};
+use crate::api::{
+    Error, ErrorKind, Index, IndexConfig, IndexName, OperationOptions, Result, RuntimeConfig,
+};
 use crate::storage::backend::{Backend, CommitCancellation, CommitStart};
+
+mod lifecycle;
 
 /// Owns one backend and its process-local foreground operation lifecycle.
 ///
@@ -62,6 +66,89 @@ impl<B: Backend> Runtime<B> {
         &self.handle.inner.config
     }
 
+    /// Creates one Logical Index and returns a cloneable Active handle.
+    ///
+    /// Create is idempotent for the same Index Name and identical immutable
+    /// configuration: retrying after an unknown commit outcome recovers the
+    /// current index from a fresh snapshot. A different configuration returns
+    /// [`ErrorKind::IndexAlreadyExists`], and a Dropping same-name index
+    /// returns [`ErrorKind::IndexDropping`].
+    pub async fn create_index(&self, name: &str, config: IndexConfig) -> Result<Index<B>> {
+        self.create_index_with_control(name, config, OperationOptions::default())
+            .await
+    }
+
+    /// Creates one Logical Index with explicit operation control.
+    pub async fn create_index_with_control(
+        &self,
+        name: &str,
+        config: IndexConfig,
+        options: OperationOptions,
+    ) -> Result<Index<B>> {
+        let name = IndexName::new(name)?;
+        config.validate()?;
+        let retry = lifecycle::RetryPolicy::from_config(self.config());
+        let handle_name = name.clone();
+        let manifest = self
+            .run_foreground(options, move |mut context| async move {
+                lifecycle::create_index(&mut context, name, config, retry).await
+            })
+            .await?;
+        Index::new(Arc::clone(&self.handle.inner), handle_name, manifest)
+    }
+
+    /// Opens the current Active Logical Index for one Index Name.
+    ///
+    /// [`ErrorKind::IndexNotFound`] means no Index Name mapping exists.
+    /// [`ErrorKind::IndexDropping`] reports a persisted Dropping Manifest, and
+    /// an unsupported or malformed Manifest fails closed before a handle is
+    /// returned.
+    pub async fn open_index(&self, name: &str) -> Result<Index<B>> {
+        self.open_index_with_control(name, OperationOptions::default())
+            .await
+    }
+
+    /// Opens one Logical Index with explicit operation control.
+    pub async fn open_index_with_control(
+        &self,
+        name: &str,
+        options: OperationOptions,
+    ) -> Result<Index<B>> {
+        let name = IndexName::new(name)?;
+        let handle_name = name.clone();
+        let manifest = self
+            .run_foreground(options, move |mut context| async move {
+                lifecycle::open_index(&mut context, name).await
+            })
+            .await?;
+        Index::new(Arc::clone(&self.handle.inner), handle_name, manifest)
+    }
+
+    /// Drops one Logical Index idempotently.
+    ///
+    /// Drop first persists the Dropping Manifest state, deletes only the
+    /// index-owned range, and removes the Index Name mapping last. It is
+    /// bounded and resumable on backends without transactional range clear,
+    /// and safe to retry after a commit of unknown outcome.
+    pub async fn drop_index(&self, name: &str) -> Result<()> {
+        self.drop_index_with_control(name, OperationOptions::default())
+            .await
+    }
+
+    /// Drops one Logical Index with explicit operation control.
+    pub async fn drop_index_with_control(
+        &self,
+        name: &str,
+        options: OperationOptions,
+    ) -> Result<()> {
+        let name = IndexName::new(name)?;
+        let retry = lifecycle::RetryPolicy::from_config(self.config());
+        self.run_foreground(options, move |mut context| async move {
+            lifecycle::drop_index(&mut context, name, retry).await
+        })
+        .await
+    }
+
     /// Stops admission and waits for all admitted foreground work to finish.
     ///
     /// Shutdown is idempotent. Operations admitted before shutdown retain their
@@ -77,10 +164,6 @@ impl<B: Backend> Runtime<B> {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "foreground Index operations consume this seam")
-    )]
     pub(crate) async fn run_foreground<T, F, Fut>(
         &self,
         options: OperationOptions,
@@ -98,7 +181,7 @@ impl<B: Backend> Runtime<B> {
         let context = OperationContext {
             backend,
             options,
-            commit_start,
+            commit_start: Some(commit_start),
         };
         let mut task = self.handle.inner.executor.spawn(async move {
             let result = match context.checkpoint() {
@@ -181,14 +264,10 @@ impl<B: Backend> Drop for RuntimeHandle<B> {
 pub(crate) struct OperationContext<B: Backend> {
     backend: Arc<B>,
     options: OperationOptions,
-    commit_start: CommitStart,
+    commit_start: Option<CommitStart>,
 }
 
 impl<B: Backend> OperationContext<B> {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "foreground Index operations access the backend")
-    )]
     pub(crate) fn backend(&self) -> Arc<B> {
         Arc::clone(&self.backend)
     }
@@ -197,17 +276,25 @@ impl<B: Backend> OperationContext<B> {
         check_control(&self.options)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Foreground Mutations use the commit boundary")
-    )]
-    pub(crate) async fn commit<T, F, Fut>(self, commit: F) -> Result<T>
+    /// Starts one commit attempt at the Runtime's cancellation boundary.
+    ///
+    /// The first attempt consumes the guarded boundary. A resumable lifecycle
+    /// operation may perform several bounded transactions; after the first
+    /// native commit has started, the caller-side cancellation race is already
+    /// decided and later attempts commit without re-arming that one-shot
+    /// boundary. Callers still call [`OperationContext::checkpoint`] before
+    /// every attempt through [`OperationContext::commit`].
+    pub(crate) async fn commit<T, F, Fut>(&mut self, commit: F) -> Result<T>
     where
         F: FnOnce(CommitStart) -> Fut,
         Fut: Future<Output = Result<T>>,
     {
         self.checkpoint()?;
-        commit(self.commit_start).await
+        let start = self
+            .commit_start
+            .take()
+            .unwrap_or_else(CommitStart::uncontrolled);
+        commit(start).await
     }
 }
 
@@ -252,7 +339,7 @@ async fn cancel_task_before_commit<T>(
     }
 }
 
-struct RuntimeInner<B: Backend> {
+pub(crate) struct RuntimeInner<B: Backend> {
     executor: Handle,
     config: RuntimeConfig,
     foreground: Arc<Semaphore>,
@@ -898,7 +985,7 @@ mod tests {
             let backend_call_started = Arc::clone(&backend_call_started);
             async move {
                 runtime
-                    .run_foreground(OperationOptions::default(), move |context| async move {
+                    .run_foreground(OperationOptions::default(), move |mut context| async move {
                         context
                             .commit(move |commit_start| async move {
                                 waiting_for_backend.notify_one();
@@ -974,7 +1061,7 @@ mod tests {
             let backend_call_started = Arc::clone(&backend_call_started);
             async move {
                 runtime
-                    .run_foreground(options, move |context| async move {
+                    .run_foreground(options, move |mut context| async move {
                         context
                             .commit(move |commit_start| async move {
                                 waiting_for_backend.notify_one();
@@ -1017,7 +1104,7 @@ mod tests {
             let backend_call_started = Arc::clone(&backend_call_started);
             async move {
                 runtime
-                    .run_foreground(options, move |context| async move {
+                    .run_foreground(options, move |mut context| async move {
                         context
                             .commit(move |commit_start| async move {
                                 waiting_for_backend.notify_one();
@@ -1059,7 +1146,7 @@ mod tests {
             let finish_commit = Arc::clone(&finish_commit);
             async move {
                 runtime
-                    .run_foreground(options, move |context| async move {
+                    .run_foreground(options, move |mut context| async move {
                         context
                             .commit(move |commit_start| async move {
                                 commit_start.begin()?;
@@ -1098,7 +1185,7 @@ mod tests {
             let commit_finished = Arc::clone(&commit_finished);
             async move {
                 runtime
-                    .run_foreground(OperationOptions::default(), move |context| async move {
+                    .run_foreground(OperationOptions::default(), move |mut context| async move {
                         context
                             .commit(move |commit_start| async move {
                                 commit_start.begin()?;
@@ -1149,7 +1236,7 @@ mod tests {
             let commit_finished = Arc::clone(&commit_finished);
             async move {
                 runtime
-                    .run_foreground(OperationOptions::default(), move |context| async move {
+                    .run_foreground(OperationOptions::default(), move |mut context| async move {
                         context
                             .commit(move |commit_start| async move {
                                 commit_start.begin()?;

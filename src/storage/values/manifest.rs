@@ -120,6 +120,20 @@ impl IndexManifest {
         self.lifecycle
     }
 
+    /// Derives a Manifest with a different lifecycle state.
+    ///
+    /// All immutable identity, configuration, and derived codec fields are
+    /// retained exactly. Callers use this only for lifecycle transitions.
+    pub fn with_lifecycle(&self, lifecycle: IndexLifecycle) -> Result<Self> {
+        Self::new(
+            lifecycle,
+            self.logical_index_id,
+            self.config.clone(),
+            self.rotation_seed,
+            self.bloom_parameters.to_vec(),
+        )
+    }
+
     /// Returns the owned Logical Index ID.
     #[must_use]
     pub const fn logical_index_id(&self) -> LogicalIndexId {
