@@ -32,20 +32,18 @@ jobs:
       - name: Test workspace
         run: cargo +"${{ matrix.toolchain }}" test --workspace --all-targets
       - name: Write RocksDB durability probe
-        if: matrix.toolchain == 'stable'
         env:
           KTANN_ROCKSDB_DURABILITY_PHASE: write
           KTANN_ROCKSDB_DURABILITY_PATH: ${{ runner.temp }}/ktann-rocksdb-durability
         run: >-
-          cargo +stable test -p ktann-rocksdb
+          cargo +"${{ matrix.toolchain }}" test -p ktann-rocksdb
           --test rocksdb_durability -- --ignored
       - name: Verify RocksDB durability probe in a fresh process
-        if: matrix.toolchain == 'stable'
         env:
           KTANN_ROCKSDB_DURABILITY_PHASE: verify
           KTANN_ROCKSDB_DURABILITY_PATH: ${{ runner.temp }}/ktann-rocksdb-durability
         run: >-
-          cargo +stable test -p ktann-rocksdb
+          cargo +"${{ matrix.toolchain }}" test -p ktann-rocksdb
           --test rocksdb_durability -- --ignored
 
   foundationdb:
