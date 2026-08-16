@@ -4,7 +4,7 @@ use std::fmt;
 
 use bytes::Bytes;
 
-use crate::api::{DataType, Error, MAX_FIELDS, PartitionKey, Result, Value};
+use crate::api::{Error, PartitionKey, Result, Value};
 
 use crate::storage::keys::{MAX_RECORD_ID_BYTES, MAX_TREE_KEY_BYTES, TreeKey};
 
@@ -151,20 +151,10 @@ pub(super) fn decode_vector_record(
 }
 
 fn validate_tree_key(manifest: &IndexManifest, tree_key: &TreeKey) -> Result<()> {
-    let (types, type_count) = tree_key_types(manifest);
+    let (types, type_count) = manifest.tree_key_types();
     tree_key
-        .values(&types[..type_count])
-        .map(|_| ())
+        .validate(&types[..type_count])
         .map_err(|_| Error::invalid_argument())
-}
-
-fn tree_key_types(manifest: &IndexManifest) -> ([DataType; MAX_FIELDS], usize) {
-    let mut types = [DataType::Bool; MAX_FIELDS];
-    let field_ids = manifest.config().tree_key_fields();
-    for (target, field_id) in types.iter_mut().zip(field_ids) {
-        *target = manifest.config().fields()[usize::from(field_id.0)].data_type();
-    }
-    (types, field_ids.len())
 }
 
 pub(super) fn encode_opaque_payload(encoder: &mut Encoder, payload: &OpaquePayload) -> Result<()> {
@@ -192,7 +182,7 @@ pub(super) fn decode_record_location(
     manifest: &IndexManifest,
 ) -> Result<RecordLocation> {
     let bytes = decoder.sized_bytes(MAX_TREE_KEY_BYTES)?;
-    let (types, type_count) = tree_key_types(manifest);
+    let (types, type_count) = manifest.tree_key_types();
     let tree_key = TreeKey::from_encoded(&types[..type_count], &bytes)?;
     let leaf = decoder.partition_key()?;
     Ok(RecordLocation::new(tree_key, leaf))

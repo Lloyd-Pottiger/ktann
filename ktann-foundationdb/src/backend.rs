@@ -315,7 +315,6 @@ impl WriteTxn for FoundationDbWriteTxn<'_> {
             .len()
             .checked_add(value.len())
             .ok_or_else(limit_exceeded)?;
-        self.charge(1, charged_bytes)?;
         let existing = self
             .transaction
             .get(&physical_key, false)
@@ -324,6 +323,7 @@ impl WriteTxn for FoundationDbWriteTxn<'_> {
         if existing.is_some() {
             return Ok(InsertOutcome::AlreadyExists);
         }
+        self.charge(1, charged_bytes)?;
         self.transaction.set(&physical_key, &value);
         Ok(InsertOutcome::Inserted)
     }

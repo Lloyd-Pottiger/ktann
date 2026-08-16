@@ -5,10 +5,15 @@
 //! keys themselves. The [`keys`] submodule implements the version-1 Logical Key
 //! namespace and exposes the canonical Tree Key codec; the [`values`] submodule
 //! implements the version-1 persistent value codecs; and the [`backend`]
-//! submodule defines the backend-neutral transactional KV contract. Typed atomic
-//! operations are added by later stages.
+//! submodule defines the backend-neutral transactional KV contract.
 
 pub mod backend;
 pub mod keys;
+mod operations;
 mod tree_key;
 pub mod values;
+
+pub use operations::{
+    LogicalRange, LogicalScanCursor, LogicalScanItem, LogicalScanPage, MutationBuilder,
+    ReadLogicalTxn, TransactionSize, WriteLogicalTxn,
+};

@@ -57,7 +57,7 @@
 
 use bytes::Bytes;
 
-use crate::api::{Error, ErrorKind, LogicalIndexId, MAX_ENCODED_SYNOPSIS_BYTES, Result};
+use crate::api::{Error, ErrorKind, MAX_ENCODED_SYNOPSIS_BYTES, Result};
 
 use super::keys::LogicalKey;
 
@@ -302,6 +302,20 @@ impl<'a> ValueCodec<'a> {
         encoder.finish()
     }
 
+    /// Encodes a value after validating its typed key family and identity.
+    pub(crate) fn encode_for_key(
+        self,
+        key: &LogicalKey,
+        value: &PersistentValue,
+    ) -> Result<Vec<u8>> {
+        if value_kind_for_key(key) != value.kind()
+            || validate_key_identity(key, value, self.manifest).is_err()
+        {
+            return Err(Error::invalid_argument());
+        }
+        self.encode(value)
+    }
+
     /// Decodes owned backend bytes and rejects every noncanonical byte.
     ///
     /// Index-owned values other than the Index Manifest require a codec made
@@ -393,7 +407,7 @@ fn validate_key_identity(
     value: &PersistentValue,
     manifest: Option<&IndexManifest>,
 ) -> Result<()> {
-    if let (Some(expected), Some(actual)) = (manifest, logical_key_index(key)) {
+    if let (Some(expected), Some(actual)) = (manifest, key.index()) {
         if expected.logical_index_id() != actual {
             return Err(corrupt());
         }
@@ -401,6 +415,11 @@ fn validate_key_identity(
     match (key, value) {
         (LogicalKey::Manifest(expected), PersistentValue::IndexManifest(actual))
             if *expected != actual.logical_index_id() =>
+        {
+            Err(corrupt())
+        }
+        (LogicalKey::Manifest(_), PersistentValue::IndexManifest(actual))
+            if manifest.is_some_and(|expected| !expected.has_same_immutable_identity(actual)) =>
         {
             Err(corrupt())
         }
@@ -420,23 +439,6 @@ fn validate_key_identity(
             Err(corrupt())
         }
         _ => Ok(()),
-    }
-}
-
-const fn logical_key_index(key: &LogicalKey) -> Option<LogicalIndexId> {
-    match key {
-        LogicalKey::IndexIdAllocator | LogicalKey::IndexNameDirectory(_) => None,
-        LogicalKey::Manifest(index) => Some(*index),
-        LogicalKey::Record { index, .. }
-        | LogicalKey::Location { index, .. }
-        | LogicalKey::Payload { index, .. }
-        | LogicalKey::TreeManifest { index, .. }
-        | LogicalKey::Header { index, .. }
-        | LogicalKey::Synopsis { index, .. }
-        | LogicalKey::State { index, .. }
-        | LogicalKey::Centroid { index, .. }
-        | LogicalKey::LeafEntry { index, .. }
-        | LogicalKey::ChildEntry { index, .. } => Some(*index),
     }
 }
 

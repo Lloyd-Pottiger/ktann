@@ -76,6 +76,15 @@ impl TreeKey {
         Ok(values)
     }
 
+    /// Validates this complete encoding against ordered field types.
+    pub(super) fn validate(&self, types: &[DataType]) -> Result<()> {
+        let (_, consumed) = decode_fields(types, &self.0)?;
+        if consumed != self.0.len() {
+            return Err(corrupt());
+        }
+        Ok(())
+    }
+
     /// Appends an ordered field sequence without an intermediate key buffer.
     pub(super) fn append_fields(
         types: &[DataType],
