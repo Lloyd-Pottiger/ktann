@@ -330,7 +330,9 @@ fn scan_paginates_with_strictly_advancing_next_start() {
             .expect("first");
         assert_eq!(scanned_keys(&first), vec![&b"a"[..], &b"b"[..]]);
         let next = first.next_start().expect("non-terminal has cursor").clone();
-        assert_eq!(next.as_ref(), b"c");
+        // The continuation is the byte-successor of the last key, so the next
+        // page resumes without skipping or duplicating `b`.
+        assert_eq!(next.as_ref(), b"b\x00");
 
         let second = txn
             .scan(&KeyRange::new(next.to_vec(), b"\xff".to_vec()), limits)
@@ -362,7 +364,7 @@ fn scan_accounts_bytes_and_allows_oversized_first_item() {
             .expect("scan");
         assert_eq!(page.items().len(), 1);
         assert_eq!(page.items()[0].key().as_ref(), b"a");
-        assert_eq!(page.next_start().expect("more").as_ref(), b"b");
+        assert_eq!(page.next_start().expect("more").as_ref(), b"a\x00");
 
         // A first item larger than the byte limit is returned alone.
         let page = txn
@@ -377,7 +379,44 @@ fn scan_accounts_bytes_and_allows_oversized_first_item() {
             .expect("scan");
         assert_eq!(page.items().len(), 1);
         assert_eq!(page.items()[0].value().as_ref(), b"12345");
-        assert_eq!(page.next_start().expect("more").as_ref(), b"b");
+        assert_eq!(page.next_start().expect("more").as_ref(), b"a\x00");
+    });
+}
+
+#[test]
+fn scan_resumes_after_a_key_at_the_backend_length_ceiling() {
+    let config = DeterministicConfig {
+        hard_limits: HardLimits {
+            max_key_bytes: 2,
+            max_value_bytes: 4_096,
+        },
+        ..Default::default()
+    };
+    let backend = DeterministicBackend::new(config);
+    seed(&backend, &[(b"\x01\x01", b"1"), (b"\x01\x02", b"2")]);
+
+    block_on(async {
+        let mut txn = backend.begin_read().await.expect("begin read");
+        let limits = ScanLimits {
+            item_limit: 1,
+            byte_limit: 1_024,
+        };
+        let first = txn
+            .scan(&range(b"\x01\x01", b"\x02"), limits)
+            .await
+            .expect("first");
+        assert_eq!(scanned_keys(&first), vec![&b"\x01\x01"[..]]);
+        // The continuation stays within the 2-byte ceiling instead of appending
+        // a byte and overflowing the limit on resume.
+        let next = first.next_start().expect("non-terminal at ceiling").clone();
+        assert_eq!(next.as_ref(), b"\x01\x02");
+
+        let second = txn
+            .scan(&KeyRange::new(next.to_vec(), b"\x02".to_vec()), limits)
+            .await
+            .expect("second page at the ceiling");
+        assert_eq!(scanned_keys(&second), vec![&b"\x01\x02"[..]]);
+        assert!(second.next_start().is_none());
     });
 }
 

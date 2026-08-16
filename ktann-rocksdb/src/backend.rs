@@ -844,7 +844,7 @@ fn scan<D: DBAccess>(
         return Err(Error::new(ErrorKind::InvalidArgument));
     }
     if range.start.as_ref() >= range.end.as_ref() {
-        return Ok(ScanPage::new(Vec::new(), None));
+        return Ok(ScanPage::terminal(Vec::new()));
     }
     let byte_limit = limits.byte_limit.min(MAX_SCAN_PAGE_BYTES);
     let mut read_options = ReadOptions::default();
@@ -865,14 +865,14 @@ fn scan<D: DBAccess>(
             && (items.len() >= limits.item_limit
                 || item_bytes.checked_add(bytes).ok_or_else(limit_exceeded)? > byte_limit)
         {
-            return Ok(ScanPage::new(items, Some(logical_key)));
+            return ScanPage::continued(items, prefix.max_logical_key_bytes());
         }
         item_bytes = item_bytes.checked_add(bytes).ok_or_else(limit_exceeded)?;
         items.push(ScanItem::new(logical_key, Bytes::copy_from_slice(value)));
         iterator.next();
     }
     iterator.status().map_err(map_operation_error)?;
-    Ok(ScanPage::new(items, None))
+    Ok(ScanPage::terminal(items))
 }
 
 fn validate_value(value: &[u8]) -> Result<()> {

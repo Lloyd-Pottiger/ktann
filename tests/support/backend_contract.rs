@@ -135,6 +135,8 @@ const SEED_ABORT: u64 = 11;
 const SEED_UNKNOWN_APPLIED: u64 = 12;
 const SEED_UNKNOWN_NOT_APPLIED: u64 = 13;
 const SEED_DURABILITY: u64 = 14;
+const SEED_SCAN_NO_SKIP: u64 = 15;
+const SEED_SCAN_EMPTY: u64 = 16;
 
 /// Runs every applicable contract case against `harness`.
 ///
@@ -184,6 +186,12 @@ pub async fn run_suite<H: BackendHarness>(harness: &H) {
 
     let ctx = CaseContext::new("durability_mapping", SEED_DURABILITY);
     case_durability_mapping(harness, &ctx).await;
+
+    let ctx = CaseContext::new("scan_no_skip", SEED_SCAN_NO_SKIP);
+    case_scan_no_skip(harness, &ctx).await;
+
+    let ctx = CaseContext::new("scan_empty_range", SEED_SCAN_EMPTY);
+    case_scan_empty_range(harness, &ctx).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -531,10 +539,12 @@ async fn case_scan_pagination<H: BackendHarness>(harness: &H, ctx: &CaseContext)
     );
 
     let next = first.next_start().expect("non-terminal cursor").clone();
+    let mut expected_next = case_key(ctx, "scan/b").to_vec();
+    expected_next.push(0x00);
     check_true(
         ctx,
-        "cursor strictly follows the last key",
-        next.as_ref() > first.items()[1].key().as_ref(),
+        "cursor is the byte-successor of the last key",
+        next.as_ref() == expected_next.as_slice(),
     );
 
     let second = txn
@@ -576,6 +586,144 @@ async fn case_scan_pagination<H: BackendHarness>(harness: &H, ctx: &CaseContext)
         error.kind(),
         ErrorKind::InvalidArgument,
     );
+}
+
+/// Drains an entire range one page at a time, returning the ordered keys and
+/// the number of pages consumed.
+async fn drain_scan<H: BackendHarness>(
+    harness: &H,
+    range: &KeyRange,
+    limits: ScanLimits,
+) -> (Vec<Vec<u8>>, usize) {
+    let backend = harness.backend();
+    let mut keys = Vec::new();
+    let mut pages = 0usize;
+    let mut start = range.start().to_vec();
+    loop {
+        let mut txn = backend.begin_read().await.expect("begin read");
+        let page = txn
+            .scan(&KeyRange::new(start.clone(), range.end().to_vec()), limits)
+            .await
+            .expect("scan page");
+        for item in page.items() {
+            keys.push(item.key().to_vec());
+        }
+        pages += 1;
+        match page.next_start() {
+            Some(next) => start = next.to_vec(),
+            None => break,
+        }
+    }
+    (keys, pages)
+}
+
+/// A scan paginates gap-free and duplicate-free across item and byte bounds,
+/// an oversized first item, and exact-boundary exhaustion.
+async fn case_scan_no_skip<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
+    let backend = harness.backend();
+    let suffixes = ["a", "b", "c", "d", "e"];
+    let expected: Vec<Vec<u8>> = suffixes
+        .iter()
+        .map(|suffix| case_key(ctx, &format!("round/{suffix}")).to_vec())
+        .collect();
+    {
+        let mut txn = backend.begin_write().await.expect("begin seed");
+        for (index, suffix) in suffixes.iter().enumerate() {
+            let item_value = if index == 2 {
+                Bytes::from(vec![0x7f; 64])
+            } else {
+                value(b"v")
+            };
+            txn.put(case_key(ctx, &format!("round/{suffix}")), item_value)
+                .await
+                .expect("put");
+        }
+        txn.commit().await.expect("commit seed");
+    }
+
+    let range = case_subrange(ctx, "round/");
+
+    // Item boundary: a generous byte limit lets the item limit drive paging.
+    let (item_keys, item_pages) = drain_scan(
+        harness,
+        &range,
+        ScanLimits {
+            item_limit: 2,
+            byte_limit: 1_024,
+        },
+    )
+    .await;
+    check_true(
+        ctx,
+        "item-bounded paging has no gap or duplicate",
+        item_keys == expected,
+    );
+    check_count(ctx, "item-bounded page count", item_pages, 3);
+
+    // Byte boundary: a tight byte limit splits pages mid-value while the
+    // oversized middle value is still returned alone, and the final page
+    // exhausts the range exactly.
+    let (byte_keys, byte_pages) = drain_scan(
+        harness,
+        &range,
+        ScanLimits {
+            item_limit: 1_024,
+            byte_limit: 48,
+        },
+    )
+    .await;
+    check_true(
+        ctx,
+        "byte-bounded paging has no gap or duplicate",
+        byte_keys == expected,
+    );
+    check_count(ctx, "byte-bounded page count", byte_pages, suffixes.len());
+}
+
+/// A scan of an inverted or keyless range yields an empty terminal page, never
+/// a continuation.
+async fn case_scan_empty_range<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
+    let backend = harness.backend();
+    {
+        let mut txn = backend.begin_write().await.expect("begin seed");
+        txn.put(case_key(ctx, "empty/inside"), value(b"1"))
+            .await
+            .expect("put");
+        txn.commit().await.expect("commit seed");
+    }
+
+    let mut txn = backend.begin_read().await.expect("begin read");
+
+    // An inverted `[end, start)` range is empty even when keys exist elsewhere.
+    let inverted = txn
+        .scan(
+            &KeyRange::new(
+                case_key(ctx, "empty/b").to_vec(),
+                case_key(ctx, "empty/a").to_vec(),
+            ),
+            ScanLimits {
+                item_limit: 10,
+                byte_limit: 1_024,
+            },
+        )
+        .await
+        .expect("inverted scan");
+    check_count(ctx, "inverted range is empty", inverted.items().len(), 0);
+    check_true(ctx, "inverted range is terminal", inverted.is_terminal());
+
+    // A well-formed half-open range that happens to contain no keys is empty.
+    let gap = txn
+        .scan(
+            &case_subrange(ctx, "empty/gap/"),
+            ScanLimits {
+                item_limit: 10,
+                byte_limit: 1_024,
+            },
+        )
+        .await
+        .expect("empty gap scan");
+    check_count(ctx, "keyless range is empty", gap.items().len(), 0);
+    check_true(ctx, "keyless range is terminal", gap.is_terminal());
 }
 
 /// Unique insertion distinguishes inserted from existing and conflicts on

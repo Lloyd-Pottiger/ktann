@@ -192,9 +192,13 @@ impl fmt::Debug for ScanItem {
 
 /// One bounded, strictly ordered page of scan results.
 ///
-/// A page is terminal when [`next_start`](ScanPage::next_start) is `None`; a
-/// non-terminal page is always non-empty and its `next_start` strictly follows
-/// the page's last key. `Debug` is redacted because keys and values may carry
+/// A page is either terminal (the requested range is exhausted) or
+/// non-terminal (more keys follow). A non-terminal page is always non-empty,
+/// and its [`next_start`](ScanPage::next_start) is the byte-lexicographic
+/// successor of the page's last key — the smallest key strictly greater than
+/// it — so a caller that resumes the scan at `next_start` encounters every
+/// remaining key exactly once: no eligible key is skipped and no returned key
+/// is duplicated. `Debug` is redacted because keys and values may carry
 /// sensitive bytes.
 #[derive(Clone, Eq, PartialEq)]
 pub struct ScanPage {
@@ -203,10 +207,36 @@ pub struct ScanPage {
 }
 
 impl ScanPage {
-    /// Constructs a scan page from its items and optional cursor.
+    /// Constructs a terminal page that exhausts the requested range.
     #[must_use]
-    pub fn new(items: Vec<ScanItem>, next_start: Option<Bytes>) -> Self {
-        Self { items, next_start }
+    pub fn terminal(items: Vec<ScanItem>) -> Self {
+        Self {
+            items,
+            next_start: None,
+        }
+    }
+
+    /// Constructs a non-terminal page whose continuation is derived from the
+    /// last item's key.
+    ///
+    /// `max_key_bytes` is the backend's logical key-length limit; it bounds the
+    /// derived successor so the continuation is always a legal scan bound. The
+    /// continuation is the byte-lexicographic successor of the last key, so it
+    /// can never skip an eligible key or re-emit a returned key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::Backend`] when `items` is empty: a non-terminal
+    /// page must carry its last key to derive the continuation from, and the
+    /// single-oversized-first-item guarantee means any non-empty range yields a
+    /// non-empty page.
+    pub fn continued(items: Vec<ScanItem>, max_key_bytes: usize) -> Result<Self> {
+        let last_key = items
+            .last()
+            .map(ScanItem::key)
+            .ok_or_else(|| Error::new(ErrorKind::Backend))?;
+        let next_start = Some(Bytes::from(scan_successor(last_key, max_key_bytes)));
+        Ok(Self { items, next_start })
     }
 
     /// The ordered page items.
@@ -215,11 +245,23 @@ impl ScanPage {
         &self.items
     }
 
-    /// The strict lower bound for the next page, or `None` if the range is
+    /// The inclusive lower bound of the next page, or `None` when the range is
     /// exhausted.
+    ///
+    /// When present, this is the byte-lexicographic successor of the page's
+    /// last key: the smallest key strictly greater than it within the backend's
+    /// key-length limit. Resuming a scan of the same range at this bound
+    /// therefore skips no eligible key and re-emits no returned key, independent
+    /// of any backend.
     #[must_use]
     pub fn next_start(&self) -> Option<&Bytes> {
         self.next_start.as_ref()
+    }
+
+    /// Returns `true` when the page exhausts the requested range.
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        self.next_start.is_none()
     }
 }
 
@@ -233,6 +275,36 @@ impl fmt::Debug for ScanPage {
                 &self.next_start.as_ref().map(|_| "[REDACTED]"),
             )
             .finish()
+    }
+}
+
+/// The byte-lexicographic successor of `key` within a keyspace whose keys are
+/// at most `max_key_bytes` long: the smallest key strictly greater than `key`.
+///
+/// This is the no-skip scan continuation. While `key` is shorter than the
+/// ceiling it is `key` followed by a single `0x00` byte, so a key that extends
+/// `key` (for example `"aa"` after `"a"`) is never skipped. At the ceiling no
+/// key can extend `key`, so the prefix-end successor — increment the last
+/// non-`0xFF` byte and truncate — is used instead and never exceeds the limit.
+fn scan_successor(key: &[u8], max_key_bytes: usize) -> Vec<u8> {
+    if key.len() < max_key_bytes {
+        let mut successor = Vec::with_capacity(key.len() + 1);
+        successor.extend_from_slice(key);
+        successor.push(0x00);
+        successor
+    } else {
+        let mut successor = key.to_vec();
+        while let Some(last) = successor.last_mut() {
+            if *last == 0xff {
+                successor.pop();
+            } else {
+                *last += 1;
+                return successor;
+            }
+        }
+        // Unreachable for a non-terminal page: the all-`0xFF` maximum key has
+        // no successor, so the adapter reports the page terminal instead.
+        successor
     }
 }
 
@@ -302,9 +374,15 @@ pub trait ReadOps: Send {
     /// length. Both limits must be non-zero and are checked before any work.
     /// A single oversized first item may be returned alone even when it exceeds
     /// `byte_limit`, so any value within the backend's hard limits remains
-    /// readable; no other item may push the page past `byte_limit`. A
-    /// non-terminal page is non-empty and carries a `next_start` that strictly
-    /// follows its last key.
+    /// readable; no other item may push the page past `byte_limit`.
+    ///
+    /// A non-terminal page is non-empty and carries a `next_start` that is the
+    /// byte-lexicographic successor of its last key — the smallest key strictly
+    /// greater than it within the backend's key-length limit. A caller resumes
+    /// by passing `next_start` as the next page's start bound together with the
+    /// original end bound; because no key lies strictly between the last key and
+    /// its successor, this returns every remaining key exactly once, with no
+    /// skipped eligible key and no duplicated returned key.
     fn scan(
         &mut self,
         range: &KeyRange,
@@ -433,4 +511,68 @@ pub trait Backend: Send + Sync + 'static {
 
     /// Opens a write transaction over the current consistent snapshot.
     fn begin_write(&self) -> impl Future<Output = Result<Self::WriteTxn<'_>>> + Send + '_;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_successor_appends_zero_below_the_ceiling() {
+        assert_eq!(scan_successor(b"", 16), b"\x00");
+        assert_eq!(scan_successor(b"a", 16), b"a\x00");
+        assert_eq!(scan_successor(b"a\xff", 16), b"a\xff\x00");
+    }
+
+    #[test]
+    fn scan_successor_at_the_ceiling_uses_the_prefix_end_successor() {
+        // A key at the ceiling has no room for an extension, so the successor
+        // must increment the last non-0xFF byte and truncate instead.
+        assert_eq!(scan_successor(b"ab", 2), b"ac");
+        assert_eq!(scan_successor(b"a\xff", 2), b"b");
+        assert_eq!(scan_successor(b"\x01\xff\xff", 3), b"\x02");
+    }
+
+    #[test]
+    fn continued_page_derives_successor_and_is_not_terminal() {
+        let page = ScanPage::continued(
+            vec![ScanItem::new(
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"1"),
+            )],
+            1024,
+        )
+        .expect("non-empty page continues");
+        assert!(!page.is_terminal());
+        assert_eq!(page.next_start().expect("continuation").as_ref(), b"a\x00");
+    }
+
+    #[test]
+    fn continued_page_at_the_ceiling_stays_within_the_limit() {
+        let page = ScanPage::continued(
+            vec![ScanItem::new(
+                Bytes::from_static(b"ab"),
+                Bytes::from_static(b"1"),
+            )],
+            2,
+        )
+        .expect("non-empty page continues");
+        assert_eq!(page.next_start().expect("continuation").as_ref(), b"ac");
+    }
+
+    #[test]
+    fn terminal_page_has_no_continuation() {
+        let page = ScanPage::terminal(vec![ScanItem::new(
+            Bytes::from_static(b"a"),
+            Bytes::from_static(b"1"),
+        )]);
+        assert!(page.is_terminal());
+        assert!(page.next_start().is_none());
+    }
+
+    #[test]
+    fn empty_non_terminal_page_is_rejected() {
+        let error = ScanPage::continued(Vec::new(), 1024).expect_err("empty continued page");
+        assert_eq!(error.kind(), ErrorKind::Backend);
+    }
 }

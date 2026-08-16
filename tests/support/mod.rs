@@ -772,10 +772,16 @@ impl ReadOps for DeterministicReadTxn<'_> {
     async fn scan(&mut self, range: &KeyRange, limits: ScanLimits) -> Result<ScanPage> {
         let (item_limit, byte_limit) = resolve_scan(limits, &self.backend.config)?;
         if range.start() >= range.end() {
-            return Ok(ScanPage::new(Vec::new(), None));
+            return Ok(ScanPage::terminal(Vec::new()));
         }
         check_range(&self.backend.config, range)?;
-        scan_map(&self.snapshot, range, item_limit, byte_limit)
+        scan_map(
+            &self.snapshot,
+            range,
+            item_limit,
+            byte_limit,
+            self.backend.config.hard_limits.max_key_bytes,
+        )
     }
 }
 
@@ -798,11 +804,17 @@ impl ReadOps for DeterministicWriteTxn<'_> {
     async fn scan(&mut self, range: &KeyRange, limits: ScanLimits) -> Result<ScanPage> {
         let (item_limit, byte_limit) = resolve_scan(limits, &self.backend.config)?;
         if range.start() >= range.end() {
-            return Ok(ScanPage::new(Vec::new(), None));
+            return Ok(ScanPage::terminal(Vec::new()));
         }
         check_range(&self.backend.config, range)?;
         let merged = apply_staged(&self.snapshot, &self.clear_ranges, &self.pending);
-        scan_map(&merged, range, item_limit, byte_limit)
+        scan_map(
+            &merged,
+            range,
+            item_limit,
+            byte_limit,
+            self.backend.config.hard_limits.max_key_bytes,
+        )
     }
 }
 
@@ -1070,18 +1082,20 @@ fn check_range(config: &DeterministicConfig, range: &KeyRange) -> Result<()> {
     check_key(config, range.end())
 }
 
-/// Scans an ordered map, returning one bounded page with a strict cursor.
+/// Scans an ordered map, returning one bounded page whose continuation is the
+/// byte-lexicographic successor of its last key.
 fn scan_map(
     map: &Keyspace,
     range: &KeyRange,
     item_limit: usize,
     byte_limit: usize,
+    max_key_bytes: usize,
 ) -> Result<ScanPage> {
     let start = range.start().to_vec();
     let end = range.end().to_vec();
     let mut items = Vec::new();
     let mut byte_total = 0usize;
-    let mut next = None;
+    let mut more = false;
     for (key, value) in map.range(start..end) {
         let item_bytes = key
             .len()
@@ -1105,7 +1119,7 @@ fn scan_map(
                 .ok_or_else(limit_exceeded)?
                 > byte_limit
         {
-            next = Some(Bytes::copy_from_slice(key));
+            more = true;
             break;
         }
         items.push(ScanItem::new(
@@ -1116,7 +1130,11 @@ fn scan_map(
             .checked_add(item_bytes)
             .ok_or_else(limit_exceeded)?;
     }
-    Ok(ScanPage::new(items, next))
+    if more {
+        ScanPage::continued(items, max_key_bytes)
+    } else {
+        Ok(ScanPage::terminal(items))
+    }
 }
 
 /// A one-element key set used to check overlay growth for single-key writes.

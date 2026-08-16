@@ -139,7 +139,7 @@ async fn rocksdb_adapter_preserves_the_backend_contract() {
         assert_eq!(capped_page.items().len(), 1);
         assert_eq!(
             capped_page.next_start().expect("adapter cursor").as_ref(),
-            b"large/b",
+            b"large/a\x00",
         );
 
         // Adapter-specific: exceeding the declared admission budget is rejected.
