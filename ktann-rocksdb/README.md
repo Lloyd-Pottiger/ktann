@@ -52,7 +52,10 @@ transactions; only another transaction open waits asynchronously.
 
 Cancelling before admission removes the semaphore waiter and creates no actor.
 Dropping an ordinary operation may discard a native call that already started;
-if the actor observes a cancelled write call, it abandons that transaction.
+if the actor observes a cancelled call it abandons that transaction. This
+applies to reads issued through a write transaction as well as mutations: the
+write actor retires on any closed response, so a cancelled read-through-write
+does not leave the transaction in an ambiguous partially-mutated state.
 Dropping a commit future before its actor claims commit ownership abandons the
 transaction. After the claim, commit runs to completion and the usual
 unknown-outcome rule applies to the dropped caller. Handle `Drop` only closes
