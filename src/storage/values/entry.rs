@@ -5,7 +5,7 @@ use std::fmt;
 use bytes::Bytes;
 
 use crate::api::{Error, PartitionKey, Result, Value};
-use crate::search::RaBitQ7;
+use crate::search::rabitq::RaBitQ7;
 use crate::storage::keys::MAX_RECORD_ID_BYTES;
 
 use super::corrupt;

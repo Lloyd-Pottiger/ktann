@@ -8,7 +8,9 @@
     not(test),
     expect(
         dead_code,
-        reason = "mutation and search pipelines consume the RaBitQ7 module"
+        unused_imports,
+        reason = "the RaBitQ7 codec is consumed by storage; quantize and candidate \
+                  selection are consumed by the mutation and search pipelines (#9, #30)"
     )
 )]
 

@@ -1,4 +1,11 @@
 //! Schema-compiled exact Filter Predicate evaluation.
+#![cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the search pipeline consumes the compiled predicate evaluator (#28, #30)"
+    )
+)]
 
 use std::cmp::Ordering;
 
