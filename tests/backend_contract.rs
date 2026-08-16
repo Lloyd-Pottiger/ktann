@@ -21,6 +21,7 @@ use ktann::storage::keys::KeyRange;
 
 #[path = "support/backend_contract.rs"]
 mod shared_backend_contract;
+mod storage_operations;
 mod support;
 
 use shared_backend_contract::{BackendHarness, Fault, FaultInjection, RestartMode};

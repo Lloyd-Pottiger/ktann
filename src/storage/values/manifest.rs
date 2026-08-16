@@ -144,6 +144,24 @@ impl IndexManifest {
         &self.bloom_parameters
     }
 
+    /// Returns Tree Key field types in their declared order.
+    pub(crate) fn tree_key_types(&self) -> ([DataType; MAX_FIELDS], usize) {
+        let mut types = [DataType::Bool; MAX_FIELDS];
+        let field_ids = self.config.tree_key_fields();
+        for (target, field_id) in types.iter_mut().zip(field_ids) {
+            *target = self.config.fields()[usize::from(field_id.0)].data_type();
+        }
+        (types, field_ids.len())
+    }
+
+    /// Reports whether two Manifests describe the same immutable index.
+    pub(crate) fn has_same_immutable_identity(&self, other: &Self) -> bool {
+        self.logical_index_id == other.logical_index_id
+            && self.config == other.config
+            && self.rotation_seed == other.rotation_seed
+            && self.bloom_parameters == other.bloom_parameters
+    }
+
     fn validate(&self) -> Result<()> {
         self.config.validate()?;
         if self.bloom_parameters.len() != self.config.fields().len() {

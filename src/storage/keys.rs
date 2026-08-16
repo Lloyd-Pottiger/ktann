@@ -197,6 +197,45 @@ pub enum LogicalKey {
     },
 }
 
+impl LogicalKey {
+    /// Returns the owning Logical Index ID for an index-scoped key.
+    pub(crate) const fn index(&self) -> Option<LogicalIndexId> {
+        match self {
+            Self::IndexIdAllocator | Self::IndexNameDirectory(_) => None,
+            Self::Manifest(index) => Some(*index),
+            Self::Record { index, .. }
+            | Self::Location { index, .. }
+            | Self::Payload { index, .. }
+            | Self::TreeManifest { index, .. }
+            | Self::Header { index, .. }
+            | Self::Synopsis { index, .. }
+            | Self::State { index, .. }
+            | Self::Centroid { index, .. }
+            | Self::LeafEntry { index, .. }
+            | Self::ChildEntry { index, .. } => Some(*index),
+        }
+    }
+
+    /// Returns the embedded Tree Key for a tree-local key.
+    pub(crate) const fn tree_key(&self) -> Option<&TreeKey> {
+        match self {
+            Self::TreeManifest { tree_key, .. }
+            | Self::Header { tree_key, .. }
+            | Self::Synopsis { tree_key, .. }
+            | Self::State { tree_key, .. }
+            | Self::Centroid { tree_key, .. }
+            | Self::LeafEntry { tree_key, .. }
+            | Self::ChildEntry { tree_key, .. } => Some(tree_key),
+            Self::IndexIdAllocator
+            | Self::IndexNameDirectory(_)
+            | Self::Manifest(_)
+            | Self::Record { .. }
+            | Self::Location { .. }
+            | Self::Payload { .. } => None,
+        }
+    }
+}
+
 impl fmt::Debug for LogicalKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -522,6 +561,51 @@ pub fn child_entry_key(
     bytes
 }
 
+/// Encodes one typed Logical Key to canonical bytes.
+pub(crate) fn encode_key(key: &LogicalKey) -> Result<Vec<u8>> {
+    match key {
+        LogicalKey::IndexIdAllocator => Ok(index_id_allocator_key()),
+        LogicalKey::IndexNameDirectory(name) => Ok(name_directory_key(name)),
+        LogicalKey::Manifest(index) => Ok(manifest_key(*index)),
+        LogicalKey::Record { index, id } => record_key(*index, id),
+        LogicalKey::Location { index, id } => location_key(*index, id),
+        LogicalKey::Payload { index, id } => payload_key(*index, id),
+        LogicalKey::TreeManifest { index, tree_key } => Ok(tree_manifest_key(*index, tree_key)),
+        LogicalKey::Header {
+            index,
+            tree_key,
+            partition,
+        } => Ok(header_key(*index, tree_key, *partition)),
+        LogicalKey::Synopsis {
+            index,
+            tree_key,
+            partition,
+        } => Ok(synopsis_key(*index, tree_key, *partition)),
+        LogicalKey::State {
+            index,
+            tree_key,
+            partition,
+        } => Ok(state_key(*index, tree_key, *partition)),
+        LogicalKey::Centroid {
+            index,
+            tree_key,
+            partition,
+        } => Ok(centroid_key(*index, tree_key, *partition)),
+        LogicalKey::LeafEntry {
+            index,
+            tree_key,
+            partition,
+            id,
+        } => leaf_entry_key(*index, tree_key, *partition, id),
+        LogicalKey::ChildEntry {
+            index,
+            tree_key,
+            partition,
+            child,
+        } => Ok(child_entry_key(*index, tree_key, *partition, *child)),
+    }
+}
+
 /// Decodes a complete logical key.
 ///
 /// `types` is the ordered Tree Key field types and is required to split the
@@ -687,6 +771,37 @@ pub fn partition_range(
     let start = partition_prefix(index, tree_key, partition);
     let end = successor(&start);
     KeyRange { start, end }
+}
+
+/// Builds the range for one partition-local subkind.
+fn partition_subkind_range(
+    index: LogicalIndexId,
+    tree_key: &TreeKey,
+    partition: PartitionKey,
+    subkind: u8,
+) -> KeyRange {
+    let mut start = partition_prefix(index, tree_key, partition);
+    start.push(subkind);
+    let end = successor(&start);
+    KeyRange { start, end }
+}
+
+/// The contiguous range of every Leaf Entry in one partition.
+pub(crate) fn leaf_entry_range(
+    index: LogicalIndexId,
+    tree_key: &TreeKey,
+    partition: PartitionKey,
+) -> KeyRange {
+    partition_subkind_range(index, tree_key, partition, SUB_LEAF_ENTRY)
+}
+
+/// The contiguous range of every Child Entry in one partition.
+pub(crate) fn child_entry_range(
+    index: LogicalIndexId,
+    tree_key: &TreeKey,
+    partition: PartitionKey,
+) -> KeyRange {
+    partition_subkind_range(index, tree_key, partition, SUB_CHILD_ENTRY)
 }
 
 /// The Tree Manifest directory range matching a Tree Key field prefix.
