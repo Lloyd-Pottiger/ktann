@@ -31,6 +31,20 @@ jobs:
         run: .github/scripts/setup-foundationdb.sh client
       - name: Test workspace
         run: cargo +"${{ matrix.toolchain }}" test --workspace --all-targets
+      - name: Write RocksDB durability probe
+        env:
+          KTANN_ROCKSDB_DURABILITY_PHASE: write
+          KTANN_ROCKSDB_DURABILITY_PATH: ${{ runner.temp }}/ktann-rocksdb-durability
+        run: >-
+          cargo +"${{ matrix.toolchain }}" test -p ktann-rocksdb
+          --test rocksdb_durability -- --ignored
+      - name: Verify RocksDB durability probe in a fresh process
+        env:
+          KTANN_ROCKSDB_DURABILITY_PHASE: verify
+          KTANN_ROCKSDB_DURABILITY_PATH: ${{ runner.temp }}/ktann-rocksdb-durability
+        run: >-
+          cargo +"${{ matrix.toolchain }}" test -p ktann-rocksdb
+          --test rocksdb_durability -- --ignored
 
   foundationdb:
     name: FoundationDB integration
