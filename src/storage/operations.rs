@@ -8,10 +8,11 @@ use bytes::Bytes;
 use crate::api::{DataType, Error, ErrorKind, LogicalIndexId, MAX_FIELDS, Result, Value};
 
 use super::backend::{
-    AdmissionBudget, HardLimits, InsertOutcome, Mutation, ReadOps, ScanLimits, WriteTxn,
+    AdmissionBudget, CommitStart, HardLimits, InsertOutcome, Mutation, ReadOps, ScanLimits,
+    WriteTxn,
 };
 use super::keys::{self, KeyRange, LogicalKey, TreeKey};
-use super::values::{IndexManifest, PersistentValue, ValueCodec};
+use super::values::{IndexLifecycle, IndexManifest, PersistentValue, ValueCodec};
 
 /// The ordered Tree Key field types of one Logical Index.
 ///
@@ -255,6 +256,7 @@ impl fmt::Debug for LogicalScanPage {
 struct LogicalBinding<'manifest> {
     manifest: Option<&'manifest IndexManifest>,
     schema: TreeKeySchema,
+    allow_name_mapping: bool,
 }
 
 impl LogicalBinding<'static> {
@@ -262,6 +264,7 @@ impl LogicalBinding<'static> {
         Self {
             manifest: None,
             schema: TreeKeySchema::bootstrap(),
+            allow_name_mapping: true,
         }
     }
 }
@@ -271,6 +274,18 @@ impl<'manifest> LogicalBinding<'manifest> {
         Self {
             manifest: Some(manifest),
             schema: TreeKeySchema::for_index(manifest),
+            allow_name_mapping: false,
+        }
+    }
+
+    /// A drop transition may atomically update the Index Name mapping and the
+    /// complete index-owned range in one transaction, so it needs both the
+    /// namespace name key and the bound index keyspace.
+    fn for_drop(manifest: &'manifest IndexManifest) -> Self {
+        Self {
+            manifest: Some(manifest),
+            schema: TreeKeySchema::for_index(manifest),
+            allow_name_mapping: true,
         }
     }
 
@@ -290,7 +305,9 @@ impl<'manifest> LogicalBinding<'manifest> {
             (None, None) => true,
             (None, Some(_)) => matches!(key, LogicalKey::Manifest(_)),
             (Some(manifest), Some(index)) => index == manifest.logical_index_id(),
-            (Some(_), None) => false,
+            (Some(_), None) => {
+                self.allow_name_mapping && matches!(key, LogicalKey::IndexNameDirectory(_))
+            }
         };
         if !valid {
             return Err(Error::invalid_argument());
@@ -322,7 +339,7 @@ impl<'manifest> LogicalBinding<'manifest> {
     }
 
     fn compatible_with(&self, other: &LogicalBinding<'_>) -> bool {
-        self.manifest == other.manifest
+        self.manifest == other.manifest && self.allow_name_mapping == other.allow_name_mapping
     }
 }
 
@@ -704,10 +721,50 @@ impl<'manifest, T> WriteLogicalTxn<'manifest, T> {
         })
     }
 
+    /// Binds a write transaction to one Dropping Manifest transition.
+    ///
+    /// Drop completion must atomically remove the Index Name mapping and the
+    /// index-owned range. This binding accepts the exact bound index keyspace
+    /// plus the Index Name directory key, while rejecting the allocator and
+    /// every other namespace key.
+    pub fn for_drop(
+        raw: T,
+        manifest: &'manifest IndexManifest,
+        hard_limits: HardLimits,
+        budget: AdmissionBudget,
+    ) -> Result<Self> {
+        if manifest.lifecycle() != IndexLifecycle::Dropping {
+            return Err(Error::invalid_argument());
+        }
+        Ok(Self {
+            raw,
+            binding: LogicalBinding::for_drop(manifest),
+            hard_limits,
+            budget,
+            size: TransactionSize::default(),
+        })
+    }
+
     /// Returns the exact mutation work already applied to this transaction.
     #[must_use]
     pub const fn size(&self) -> TransactionSize {
         self.size
+    }
+
+    /// Returns the conservative admission budget bound to this transaction.
+    #[must_use]
+    pub(crate) const fn admission_budget(&self) -> AdmissionBudget {
+        self.budget
+    }
+
+    /// Unwraps the raw transaction so a lifecycle transition can rebind it.
+    ///
+    /// The raw transaction retains its snapshot, update-protected read set,
+    /// and any pending mutations. Lifecycle drop uses this only before any
+    /// mutation is queued, so the replacement typed binding starts with an
+    /// exact zero mutation charge.
+    pub(crate) fn into_raw(self) -> T {
+        self.raw
     }
 
     /// Creates a builder bounded by this transaction's remaining budget.
@@ -884,6 +941,15 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
     /// Commits every read and mutation atomically, consuming the transaction.
     pub async fn commit(self) -> Result<()> {
         self.raw.commit().await
+    }
+
+    /// Commits after coordinating the Runtime's native commit boundary.
+    ///
+    /// The first commit attempt of one foreground operation uses the
+    /// cancellation-guarded boundary; later attempts in a resumable lifecycle
+    /// operation commit without re-arming the already-consumed boundary.
+    pub async fn commit_with(self, start: CommitStart) -> Result<()> {
+        self.raw.commit_with(start).await
     }
 
     /// Abandons every mutation, consuming the transaction.

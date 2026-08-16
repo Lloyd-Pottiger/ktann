@@ -13,9 +13,10 @@ index can run on multiple KV backends.
 > [!IMPORTANT]
 > KTANN is currently in the design and early implementation stage. The system
 > design is implementation-ready, and the workspace now includes the public
-> domain types, canonical logical key and value codecs, backend transaction
-> seam, and FoundationDB and RocksDB adapters. The higher-level vector-index
-> lifecycle and algorithms are not yet available for use.
+> domain types, canonical logical key and value codecs, typed storage
+> operations, backend transaction seam, FoundationDB and RocksDB adapters, and
+> the create/open/drop Logical Index lifecycle. Vector Record mutation, search,
+> and structure-maintenance algorithms are not yet available for use.
 
 ## Goals
 
@@ -99,9 +100,11 @@ KTANN's contract.
 
 ## Development
 
-The repository currently contains the Rust workspace and module skeleton. See
-[`AGENTS.md`](AGENTS.md) for development commands, engineering constraints, and
-verification guidelines.
+The repository currently contains the Rust workspace, public domain types,
+canonical codecs, typed storage, backend adapters, Runtime admission/shutdown,
+and the Logical Index lifecycle. Mutation, search, and maintenance stages are
+implemented incrementally. See [`AGENTS.md`](AGENTS.md) for development
+commands, engineering constraints, and verification guidelines.
 
 ## Influences
 

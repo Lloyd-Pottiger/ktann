@@ -93,7 +93,7 @@ pub struct CommitStart {
 }
 
 impl CommitStart {
-    fn uncontrolled() -> Self {
+    pub(crate) fn uncontrolled() -> Self {
         Self { claim: None }
     }
 
