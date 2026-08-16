@@ -53,6 +53,12 @@ impl VectorRecord {
     pub fn fields(&self) -> &[Value] {
         &self.fields
     }
+
+    /// Consumes the record body and returns its owned parts.
+    #[must_use]
+    pub fn into_parts(self) -> (Bytes, Box<[f32]>, Box<[Value]>) {
+        (self.record_id, self.vector, self.fields)
+    }
 }
 
 impl fmt::Debug for VectorRecord {
@@ -78,6 +84,12 @@ impl OpaquePayload {
     #[must_use]
     pub const fn as_bytes(&self) -> &Bytes {
         &self.0
+    }
+
+    /// Consumes the payload and returns its opaque bytes.
+    #[must_use]
+    pub fn into_bytes(self) -> Bytes {
+        self.0
     }
 }
 

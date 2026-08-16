@@ -12,7 +12,10 @@ use super::backend::{
     WriteTxn,
 };
 use super::keys::{self, KeyRange, LogicalKey, TreeKey};
-use super::values::{IndexLifecycle, IndexManifest, PersistentValue, ValueCodec};
+use super::values::{
+    IndexLifecycle, IndexManifest, OpaquePayload, PersistentValue, RecordLocation, ValueCodec,
+    VectorRecord,
+};
 
 /// The ordered Tree Key field types of one Logical Index.
 ///
@@ -424,6 +427,47 @@ async fn scan_logical<T: ReadOps>(
     Ok(LogicalScanPage { items, next_cursor })
 }
 
+/// The closed read of one existing Vector Record group.
+///
+/// The group contains the Vector Record body and the authoritative Record
+/// Location read from one transaction snapshot. The Opaque Payload is `None`
+/// when the payload was not requested by the read operation; a requested but
+/// absent payload is also `None`, and callers distinguish the two cases from
+/// the request itself.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct RecordGroupRead {
+    record: VectorRecord,
+    location: RecordLocation,
+    payload: Option<OpaquePayload>,
+}
+
+impl RecordGroupRead {
+    /// Returns the canonical Vector Record body.
+    #[must_use]
+    pub const fn record(&self) -> &VectorRecord {
+        &self.record
+    }
+
+    /// Returns the authoritative Record Location.
+    #[must_use]
+    pub const fn location(&self) -> &RecordLocation {
+        &self.location
+    }
+
+    /// Returns the Opaque Payload when it was requested and present.
+    #[must_use]
+    pub const fn payload(&self) -> Option<&OpaquePayload> {
+        self.payload.as_ref()
+    }
+
+    /// Consumes the read and returns its owned parts.
+    #[must_use]
+    pub fn into_parts(self) -> (VectorRecord, RecordLocation, Option<OpaquePayload>) {
+        (self.record, self.location, self.payload)
+    }
+}
+
 /// A read transaction that exposes only typed logical operations.
 pub struct ReadLogicalTxn<'manifest, T> {
     raw: T,
@@ -448,6 +492,16 @@ impl<'manifest, T> ReadLogicalTxn<'manifest, T> {
             raw,
             binding: LogicalBinding::for_index(manifest),
         })
+    }
+
+    /// Unwraps the raw transaction so a manifest-validated read can rebind it.
+    ///
+    /// The raw transaction retains its snapshot. Manifest validation reads the
+    /// Manifest with a bootstrap binding and then rebinds the same raw
+    /// transaction to the validated Manifest, so the Record Group reads that
+    /// follow share one consistent snapshot.
+    pub(crate) fn into_raw(self) -> T {
+        self.raw
     }
 }
 
@@ -482,6 +536,114 @@ impl<T: ReadOps> ReadLogicalTxn<'_, T> {
             .collect::<Result<Vec<_>>>()?;
         let values = self.raw.batch_get(encoded).await?;
         decode_batch(&self.binding, &keys, values)
+    }
+
+    /// Reads one Vector Record group from this transaction's snapshot.
+    ///
+    /// Returns `None` when the Record ID is absent: neither the Vector Record
+    /// nor its Record Location exists. A Record ID with only one side of the
+    /// Record/Location pair present is [`ErrorKind::Corruption`], as is an
+    /// Opaque Payload without its Vector Record.
+    pub async fn read_record_group(
+        &mut self,
+        id: Bytes,
+        include_payload: bool,
+    ) -> Result<Option<RecordGroupRead>> {
+        let mut groups = self.read_record_groups(vec![id], include_payload).await?;
+        Ok(groups
+            .pop()
+            .expect("one input Record ID yields exactly one group read"))
+    }
+
+    /// Reads Vector Record groups in input order while preserving duplicates.
+    ///
+    /// The whole request reads from this transaction's one snapshot in a
+    /// single bounded batch. Every input Record ID yields one result: `None`
+    /// for a fully absent group, the validated group when the Vector Record
+    /// and Record Location exist (plus the Opaque Payload when requested), or
+    /// [`ErrorKind::Corruption`] for any partial group.
+    pub async fn read_record_groups(
+        &mut self,
+        ids: Vec<Bytes>,
+        include_payload: bool,
+    ) -> Result<Vec<Option<RecordGroupRead>>> {
+        let index = match self.binding.manifest {
+            Some(manifest) => manifest.logical_index_id(),
+            None => return Err(Error::invalid_argument()),
+        };
+        let keys_per_id = if include_payload { 3 } else { 2 };
+        let key_count = ids
+            .len()
+            .checked_mul(keys_per_id)
+            .ok_or_else(limit_exceeded)?;
+        let mut keys = Vec::with_capacity(key_count);
+        for id in &ids {
+            keys.push(LogicalKey::Record {
+                index,
+                id: id.clone(),
+            });
+            keys.push(LogicalKey::Location {
+                index,
+                id: id.clone(),
+            });
+            if include_payload {
+                keys.push(LogicalKey::Payload {
+                    index,
+                    id: id.clone(),
+                });
+            }
+        }
+
+        let encoded = keys
+            .iter()
+            .map(|key| encode_input_key(&self.binding, key))
+            .collect::<Result<Vec<_>>>()?;
+        // Guard the batch byte accounting with checked arithmetic; the backend
+        // enforces its own hard key limits and batch ceiling on the raw call.
+        encoded
+            .iter()
+            .try_fold(0_usize, |bytes, key| bytes.checked_add(key.len()))
+            .ok_or_else(limit_exceeded)?;
+        let values = self.raw.batch_get(encoded).await?;
+        let values = decode_batch(&self.binding, &keys, values)?;
+
+        let mut iter = values.into_iter();
+        let mut groups = Vec::with_capacity(ids.len());
+        for _ in &ids {
+            let record = iter
+                .next()
+                .expect("the decoded batch has one entry per input key");
+            let location = iter
+                .next()
+                .expect("the decoded batch has one entry per input key");
+            let payload = if include_payload {
+                iter.next()
+                    .expect("the decoded batch has one entry per input key")
+            } else {
+                None
+            };
+            groups.push(match (record, location, payload) {
+                (None, None, None) => None,
+                (
+                    Some(PersistentValue::VectorRecord(record)),
+                    Some(PersistentValue::RecordLocation(location)),
+                    payload,
+                ) => {
+                    let payload = match payload {
+                        Some(PersistentValue::OpaquePayload(payload)) => Some(payload),
+                        None => None,
+                        Some(_) => return Err(corruption()),
+                    };
+                    Some(RecordGroupRead {
+                        record,
+                        location,
+                        payload,
+                    })
+                }
+                _ => return Err(corruption()),
+            });
+        }
+        Ok(groups)
     }
 
     /// Scans one bounded typed page from an exact Logical Range.
@@ -679,6 +841,10 @@ fn check_budget(budget: AdmissionBudget, size: TransactionSize) -> Result<()> {
 
 fn limit_exceeded() -> Error {
     Error::new(ErrorKind::LimitExceeded)
+}
+
+fn corruption() -> Error {
+    Error::new(ErrorKind::Corruption)
 }
 
 /// A write transaction that exposes typed logical reads and mutations.

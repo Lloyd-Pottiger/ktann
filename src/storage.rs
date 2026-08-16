@@ -15,5 +15,5 @@ pub mod values;
 
 pub use operations::{
     LogicalRange, LogicalScanCursor, LogicalScanItem, LogicalScanPage, MutationBuilder,
-    ReadLogicalTxn, TransactionSize, WriteLogicalTxn,
+    ReadLogicalTxn, RecordGroupRead, TransactionSize, WriteLogicalTxn,
 };

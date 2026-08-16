@@ -24,6 +24,7 @@ pub use operation::{
     GetOptions, ImportBatchResult, ImportOptions, Mutation, MutationOutcome, OperationOptions,
     UpsertResult, validate_mutations,
 };
+pub(crate) use operation::{validate_id, validate_ids};
 pub use record::{PayloadProjection, Record, StoredRecord};
 pub use schema::{CompareOp, DataType, FieldSchema, Metric, Predicate, SynopsisConfig, Value};
 pub use search::{

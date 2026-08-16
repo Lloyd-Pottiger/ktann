@@ -98,6 +98,18 @@ projection: `NotLoaded`, `Absent`, or `Present(Bytes)`. Batch get is same-order
 and same-length; duplicate IDs return repeated values while storage may load
 once. Record Location is never public.
 
+Point reads open one consistent read snapshot and validate the persisted
+Manifest first: an Active Manifest with the handle's exact immutable identity
+proceeds, a Dropping Manifest returns `IndexDropping`, a missing Manifest
+returns `IndexNotFound`, and any other mismatch is `Corruption`. Each read then
+loads the requested Record Group — the Vector Record and Record Location pair,
+plus the Opaque Payload when requested — from the same snapshot. An absent
+Record ID means neither the Record nor the Location exists; a pair with only
+one side, or a payload without its record, is `Corruption`. Record IDs are
+validated before admission, an empty batch succeeds with an empty result, and
+backend key and batch limits surface `LimitExceeded`. Cancellation and deadline
+apply to the whole read through the shared operation-control contract.
+
 ## 3. Schema and predicates
 
 ```rust
