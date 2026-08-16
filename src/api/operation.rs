@@ -68,6 +68,25 @@ pub enum MutationOutcome {
     },
 }
 
+/// Validates one caller Record ID shape: `1..=256` opaque bytes.
+pub(crate) fn validate_id(id: &Bytes) -> Result<()> {
+    if id.is_empty() || id.len() > 256 {
+        return Err(Error::invalid_argument());
+    }
+    Ok(())
+}
+
+/// Validates a complete point-read ID batch before storage access.
+///
+/// Duplicate Record IDs are valid in a read batch. An empty batch is valid.
+/// Returns `InvalidArgument` with the first invalid ID's zero-based position.
+pub(crate) fn validate_ids(ids: &[Bytes]) -> Result<()> {
+    for (position, id) in ids.iter().enumerate() {
+        validate_id(id).map_err(|error| error.at_position(position))?;
+    }
+    Ok(())
+}
+
 /// Validates a complete atomic mutation batch before storage access.
 ///
 /// An empty batch is valid. A duplicate or invalid Record ID, invalid Vector
@@ -81,7 +100,7 @@ pub fn validate_mutations(
     let mut ids = HashSet::with_capacity(mutations.len());
     for (position, mutation) in mutations.iter_mut().enumerate() {
         let id = mutation.id();
-        if id.is_empty() || id.len() > 256 || !ids.insert(id.clone()) {
+        if validate_id(id).is_err() || !ids.insert(id.clone()) {
             return Err(Error::invalid_argument().at_position(position));
         }
         match mutation {
