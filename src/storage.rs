@@ -11,6 +11,7 @@ pub mod backend;
 pub mod keys;
 mod operations;
 mod tree_key;
+pub mod tree_manifest;
 pub mod values;
 
 pub use operations::{

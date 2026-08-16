@@ -95,6 +95,19 @@ impl LogicalRange {
         })
     }
 
+    /// Selects Tree Manifests within one planned raw directory range.
+    ///
+    /// The Tree Key planner owns the bytes of `raw`; this constructor only
+    /// binds them to the exact Logical Index ID and Tree Key schema needed to
+    /// decode the returned keys.
+    pub(crate) fn tree_manifest_plan(manifest: &IndexManifest, raw: KeyRange) -> Self {
+        Self {
+            index: manifest.logical_index_id(),
+            schema: TreeKeySchema::for_index(manifest),
+            raw,
+        }
+    }
+
     /// Selects every value owned by one partition.
     ///
     /// Returns `InvalidArgument` when `tree_key` does not match the Manifest's
@@ -463,6 +476,13 @@ impl<T> fmt::Debug for ReadLogicalTxn<'_, T> {
     }
 }
 
+impl<'manifest, T> ReadLogicalTxn<'manifest, T> {
+    /// Returns the Index Manifest this transaction is bound to, if any.
+    pub(crate) fn bound_manifest(&self) -> Option<&'manifest IndexManifest> {
+        self.binding.manifest
+    }
+}
+
 impl<T: ReadOps> ReadLogicalTxn<'_, T> {
     /// Reads one typed value, returning `None` when the key is absent.
     pub async fn get(&mut self, key: LogicalKey) -> Result<Option<PersistentValue>> {
@@ -749,6 +769,11 @@ impl<'manifest, T> WriteLogicalTxn<'manifest, T> {
     #[must_use]
     pub const fn size(&self) -> TransactionSize {
         self.size
+    }
+
+    /// Returns the Index Manifest this transaction is bound to, if any.
+    pub(crate) fn bound_manifest(&self) -> Option<&'manifest IndexManifest> {
+        self.binding.manifest
     }
 
     /// Returns the conservative admission budget bound to this transaction.
