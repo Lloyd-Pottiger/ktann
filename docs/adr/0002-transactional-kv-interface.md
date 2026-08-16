@@ -22,14 +22,32 @@ The Rust interface uses static backend polymorphism: `Runtime<B: Backend>` and `
 
 RocksDB uses OptimisticTransactionDB with explicit snapshots for every read,
 point-key conflict fencing, WAL enabled, and synchronous commits. Synchronous
-FFI calls run under bounded semaphore admission via `block_in_place`; no owned
-transaction actor or unsafe lifetime erasure is introduced. Transactional
-DeleteRange is unavailable, so RocksDB uses paged point deletes. FoundationDB
-uses one native transactional range clear for an entire dropped index because
-its affected-data accounting charges the range boundaries rather than the data
-inside the cleared range.
+FFI calls run on permit-bounded dedicated native transaction actors;
+no native object, iterator, or borrowed value crosses into an async task and no
+unsafe lifetime erasure is introduced. Transactional DeleteRange is
+unavailable, so RocksDB uses paged point deletes. FoundationDB uses one native
+transactional range clear for an entire dropped index because its affected-data
+accounting charges the range boundaries rather than the data inside the cleared
+range.
 
-KTANN explicitly targets Tokio, and its RocksDB adapter requires a multi-thread Tokio runtime. It uses `OptimisticTransactionDB`: update-protected reads establish conflicts and commit conflicts map to RetryableAbort, matching the distributed adapters' whole-operation retry model without retaining pessimistic locks across awaits. Before each synchronous RocksDB call, the adapter asynchronously acquires one permit from its bounded blocking semaphore and executes that single call with `tokio::task::block_in_place`; the closure may safely borrow the lifetime-bound transaction and releases its permit immediately afterward. A transaction may retain its snapshot across awaits but never reserves blocking capacity while doing CPU work or waiting elsewhere. This deliberately rejects an unsafe lifetime-erased transaction, an unbounded blocking queue, and one long-lived blocking actor per transaction.
+KTANN explicitly targets Tokio. The RocksDB adapter supports both current-thread
+and multi-thread runtimes because async tasks communicate with dedicated actors
+through capacity-one channels instead of calling `block_in_place`. One permit
+is acquired before a snapshot or write transaction actor starts and is released
+only after that actor destroys its native state. All ordinary calls, commit,
+rollback, cancellation cleanup, and destruction reuse the same actor and never
+reacquire admission. Consequently, retaining the configured maximum number of
+transactions delays only another transaction open; it cannot prevent an
+existing transaction from making progress or releasing its permit. The actor
+model creates one dedicated OS thread per live transaction, bounded by public
+configuration, in exchange for safe lifetime ownership and nonblocking Drop on
+LocalSet, cancellation, panic, and runtime-shutdown paths. Dedicated threads
+avoid a hidden dependency on Tokio's configurable blocking-pool capacity; the
+public limit is the only actor-count authority. Each actor's bounded queue
+rejects unbounded work accumulation. Runtime calls the backend shutdown hook
+after foreground drain and waits for actor cleanup before releasing the
+adapter. Direct adapter users consume it with the same asynchronous barrier
+before orderly database reopen or teardown.
 
 Adapters distinguish backend hard limits from adapter admission budgets. Stable
 native key, value, and optional affected-data ceilings are facts; positive
@@ -62,7 +80,7 @@ WriteTxn may optionally expose an atomic logical range clear. A supported clear 
 
 Trait async methods return `impl Future + Send` directly, since static dispatch removes any object-safety need for `async_trait` boxing or explicit future GATs. Transaction operations uniformly take `&mut self`, serializing requests within one transaction; deliberate parallelism is exposed only through batch primitives with interface-defined semantics. A small `ReadOps` trait owns snapshot get/batch-get/ordered-scan, while independent ReadTxn and `WriteTxn: ReadOps` traits ensure read-only index paths never receive mutation capabilities.
 
-Dropping a mutation future before commit begins abandons its transaction. Once commit begins, cancellation cannot establish whether it committed; the operation is not cancellation-safe and is observationally equivalent to CommitOutcomeUnknown. Replaying a complete idempotent upsert or delete can recover, while insert-if-absent requires the caller to read the authoritative record before deciding whether to retry. An in-progress synchronous RocksDB commit runs to completion under semaphore-bounded `block_in_place` admission even if its caller drops the future. Cancelling reads stops scheduling new work and drops the snapshot transaction; already-running RocksDB blocking calls may finish with discarded results. An explicitly cancelled or expired Search returns Cancelled and never partial hits.
+Dropping a mutation future before commit begins abandons its transaction. Once commit begins, cancellation cannot establish whether it committed; the operation is not cancellation-safe and is observationally equivalent to CommitOutcomeUnknown. Replaying a complete idempotent upsert or delete can recover, while insert-if-absent requires the caller to read the authoritative record before deciding whether to retry. A RocksDB actor claims commit ownership immediately before `CommitStart::begin`; cancellation before that claim abandons the actor, while an admitted synchronous commit runs to completion even if its caller then drops the future. Cancelling reads stops scheduling new work and drops the snapshot transaction; already-running RocksDB actor calls may finish with discarded results. An explicitly cancelled or expired Search returns Cancelled and never partial hits.
 
 Runtime admission therefore installs an owned foreground in-flight guard before commit can begin. The completion path holds that guard until the backend commit finishes even if the caller drops its future. Shutdown stops new admission and waits for these guards; it never replaces an admitted operation's real result with RuntimeClosed.
 

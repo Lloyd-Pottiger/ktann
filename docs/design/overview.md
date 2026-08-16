@@ -157,6 +157,12 @@ operations and commits. Those operations retain their real results, including
 `CommitOutcomeUnknown`; `RuntimeClosed` never overwrites an admitted result.
 Only calls admitted after shutdown begins fail with `RuntimeClosed`.
 
+After foreground drain, Runtime invokes the backend shutdown hook before
+releasing it. For RocksDB this is the completion barrier for native actor
+cleanup, so successful Runtime shutdown permits immediate database reopen or
+teardown. Direct adapter users consume `RocksDbBackend` with its asynchronous
+shutdown for the same guarantee; transaction-handle Drop remains nonblocking.
+
 An Import Session accepts ordinary atomic mutation batches under bounded
 concurrency and maintenance backpressure. `submit` returns a process-local
 Batch Token after admission. `finish` waits for accepted work and returns batch
@@ -182,9 +188,10 @@ common Backend API does not invent a long-lived snapshot facility.
 - Tree Key enumeration materializes only keys counted within the same bounded
   Tree Key budget before traversal, so tree count cannot create unbounded query
   memory.
-- RocksDB calls are admitted by a bounded semaphore and run in a Tokio
-  `block_in_place` section; no iterator, transaction, or borrowed value crosses
-  that section.
+- RocksDB transactions are admitted by a bounded semaphore and owned by
+  dedicated native thread actors through cleanup. Capacity-one channels serialize
+  calls without blocking async executor threads; existing transactions never
+  reacquire admission, and backend shutdown awaits detached cleanup.
 - Caches are process-local and byte bounded. Persistent epochs make cached
   decoded partition data safe; a particular eviction policy is an internal,
   benchmark-driven choice rather than a stable contract.

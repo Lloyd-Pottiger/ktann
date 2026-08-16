@@ -420,6 +420,14 @@ pub trait Backend: Send + Sync + 'static {
     /// The backend's declared capabilities.
     fn capabilities(&self) -> Capabilities;
 
+    /// Waits for backend-native resources detached from transaction handles.
+    ///
+    /// Runtime calls this after foreground work drains and before dropping the
+    /// backend. Adapters without detached cleanup use the no-op default.
+    fn shutdown(&self) -> impl Future<Output = ()> + Send + '_ {
+        async {}
+    }
+
     /// Opens a read transaction over the current consistent snapshot.
     fn begin_read(&self) -> impl Future<Output = Result<Self::ReadTxn<'_>>> + Send + '_;
 

@@ -42,7 +42,9 @@ Every operation has a companion `_with_control` form accepting
 `OperationOptions` in addition to its ordinary request/options argument; the
 simple form uses default operation control. Runtime construction requires an
 active Tokio multi-thread runtime, validates all process configuration, and
-immediately starts maintenance workers.
+immediately starts maintenance workers. Successful Runtime shutdown drains
+admitted work, awaits the backend's native-resource shutdown hook, and only then
+releases the backend.
 
 Index Names are `1..=255` UTF-8 bytes and are compared by their original bytes;
 they are not normalized. The fixed bound permits create admission to prove

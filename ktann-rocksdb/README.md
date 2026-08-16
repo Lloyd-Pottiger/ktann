@@ -2,9 +2,9 @@
 
 This crate maps KTANN's backend-neutral transactional KV interface onto
 RocksDB's `OptimisticTransactionDB`. It uses explicit snapshots, point-key
-optimistic conflicts, WAL-backed writes, and synchronous commits. Every native
-call runs in a Tokio `block_in_place` section while its snapshot or transaction
-holds one bounded adapter resource slot.
+optimistic conflicts, WAL-backed writes, and synchronous commits. Each live
+snapshot or transaction is owned by one permit-bounded native thread actor;
+all native calls and cleanup for that handle run serially on that actor.
 
 The caller opens an `OptimisticTransactionDB` and passes it, or a shared `Arc`
 containing it, to `RocksDbBackend`. Each adapter instance adds a versioned,
@@ -41,20 +41,31 @@ uses conservative defaults of 10,000 mutations, 1 MiB of physical mutation
 bytes, and 80 KiB per scan page. RocksDB v1 reports transactional range clear
 as unsupported, so higher layers use bounded point deletes.
 
-The adapter requires a Tokio multi-thread runtime and rejects calls polled from
-a `LocalSet` because Tokio forbids `block_in_place` there. `RocksDbConfig` bounds
-live native snapshot/transaction resource slots and defaults to the host's
-available parallelism. Each transaction retains its slot through cleanup, so
-native call concurrency is bounded without making synchronous Drop wait for
-admission. Waiting transaction opens remain ordinary caller-owned futures, so
-cancelling one removes its semaphore waiter without scheduling blocking work.
-A call already inside `block_in_place`, including commit, runs to
-completion; KTANN Runtime ownership retains an admitted Foreground Mutation's
-outcome when its caller drops the future. Snapshot and transaction destruction
-retains the same resource slot and uses a blocking section, including
-cancellation and rollback cleanup. If a handle is moved into a `LocalSet`,
-operations are rejected and destruction uses a scoped native thread because
-Tokio forbids `block_in_place` in that context.
+The adapter requires a Tokio runtime; current-thread runtimes and `LocalSet`
+callers are supported because async tasks never execute RocksDB directly.
+`RocksDbConfig::blocking_resource_limit` bounds live native transaction actors
+and defaults to the host's available parallelism. Each actor has a one-command
+queue and retains one permit from transaction admission through native cleanup.
+Existing transactions reuse their actor for ordinary calls, commit, rollback,
+and destruction, so retaining the configured maximum cannot deadlock those
+transactions; only another transaction open waits asynchronously.
+
+Cancelling before admission removes the semaphore waiter and creates no actor.
+Dropping an ordinary operation may discard a native call that already started;
+if the actor observes a cancelled write call, it abandons that transaction.
+Dropping a commit future before its actor claims commit ownership abandons the
+transaction. After the claim, commit runs to completion and the usual
+unknown-outcome rule applies to the dropped caller. Handle `Drop` only closes
+the bounded actor channel. Snapshot or transaction destruction therefore never
+waits synchronously on an async executor thread, including from a `LocalSet`,
+task cancellation, panic unwinding, or Tokio runtime shutdown.
+
+Call `RocksDbBackend::shutdown().await` before immediately reopening or
+destroying the underlying database when deterministic cleanup completion is
+required by a direct adapter user. KTANN Runtime invokes the backend cleanup
+hook automatically after foreground drain, so successful `Runtime::shutdown`
+already includes this barrier. Native actor threads are detached from Tokio and
+may outlive an ungraceful runtime drop.
 
 ## Local tests
 
@@ -72,4 +83,5 @@ cargo test -p ktann-rocksdb
 The tests use temporary databases and cover namespace isolation, snapshot
 consistency, read-your-writes, point conflicts, item/byte-bounded ordered scan
 pagination, unique insertion, rollback, unsupported range clear, admission
-limits, and visibility after reopening the database.
+limits, cancellation and slow-cleanup scheduling, runtime shutdown, panic
+cleanup, and visibility after orderly adapter shutdown and database reopening.

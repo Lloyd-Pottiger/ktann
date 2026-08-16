@@ -172,6 +172,10 @@ async fn rocksdb_adapter_preserves_the_backend_contract() {
             ErrorKind::LimitExceeded,
         );
         bytes_limited.rollback().await;
+        drop(scan);
+        drop(isolated_read);
+        primary.shutdown().await;
+        isolated.shutdown().await;
     }
 
     // Adapter-specific: committed data survives a real reopen at the same path.
@@ -182,7 +186,7 @@ async fn rocksdb_adapter_preserves_the_backend_contract() {
         Some(key(b"primary")),
     );
     drop(durable);
-    drop(reopened);
+    reopened.shutdown().await;
 
     let isolated = RocksDbBackend::new(open_database(&database_path), isolated_namespace);
     let mut isolated_durable = isolated
@@ -196,6 +200,8 @@ async fn rocksdb_adapter_preserves_the_backend_contract() {
             .expect("isolated durable get"),
         Some(key(b"isolated")),
     );
+    drop(isolated_durable);
+    isolated.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -241,4 +247,6 @@ async fn scan_uses_total_order_with_a_hash_memtable() {
         vec![&b"a/item"[..], &b"b/item"[..]],
     );
     assert!(page.next_start().is_none());
+    drop(read);
+    backend.shutdown().await;
 }
