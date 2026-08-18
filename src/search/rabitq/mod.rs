@@ -110,3 +110,10 @@ impl ApproximateDistance {
         self.upper
     }
 }
+
+/// Builds a degenerate conservative interval for tests outside this module.
+#[cfg(test)]
+pub(crate) fn test_approximate_distance(rough: f64) -> ApproximateDistance {
+    ApproximateDistance::from_conservative_bounds(rough, rough, rough)
+        .expect("a finite rough value forms a valid degenerate interval")
+}

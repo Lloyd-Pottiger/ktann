@@ -8,7 +8,8 @@
     not(test),
     expect(
         dead_code,
-        reason = "the exact-reranking stage consumes the format-v1 vector kernel (#28)"
+        reason = "initial tree routing (#25) consumes caller-vector preprocessing; the \
+                  exact-reranking stage (#28) consumes the exact-distance kernel"
     )
 )]
 
