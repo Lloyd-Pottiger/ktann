@@ -3,7 +3,8 @@
     not(test),
     expect(
         dead_code,
-        reason = "the search pipeline consumes the compiled predicate evaluator (#28, #30)"
+        reason = "synopsis classification is consumed by traversal (#9) and predicate \
+                  compilation by the public search operation (#30)"
     )
 )]
 
