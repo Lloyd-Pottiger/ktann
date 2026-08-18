@@ -88,3 +88,42 @@ consistency, read-your-writes, point conflicts, item/byte-bounded ordered scan
 pagination, unique insertion, rollback, unsupported range clear, admission
 limits, cancellation and slow-cleanup scheduling, runtime shutdown, panic
 cleanup, and visibility after orderly adapter shutdown and database reopening.
+
+Each test owns a `tempfile` directory that is removed when the test finishes
+and binds a dedicated Backend Namespace, so databases are isolated from each
+other and from any caller-owned database; keys and values are bounded and
+small. The adapter test runs every in-process case from the unchanged shared
+backend suite and adds adapter-specific checks: namespace isolation across one
+database, the 80 KiB scan-page ceiling, admission-budget rejection, a real
+optimistic unique-insert conflict mapping to `RetryableAbort`, one open
+snapshot paginating consistently across concurrent commits, and the blocking
+resource limit delaying a new transaction until a live one releases its slot.
+
+The fault test flushes one value into an on-disk SST, truncates the file, and
+requires both a point read and a range scan to surface `Corruption`, proving
+the adapter's error classification against a real RocksDB failure. RocksDB
+cannot deterministically stage a controlled commit outcome, so the shared suite
+declares controlled fault injection unavailable for this adapter. The
+deterministic backend remains the exhaustive evidence for both applied and
+unapplied unknown outcomes, and the commit-error mapping table is unit-tested.
+
+Durability uses a separate two-phase test because only a fresh process proves
+that an acknowledged WAL-synced commit is recovered on open. Run the write
+phase, then the verify phase from a new process against the same directory:
+
+```sh
+KTANN_ROCKSDB_DURABILITY_PHASE=write \
+  KTANN_ROCKSDB_DURABILITY_PATH=/tmp/ktann-rocksdb-durability \
+  cargo test -p ktann-rocksdb --test rocksdb_durability -- --ignored
+
+KTANN_ROCKSDB_DURABILITY_PHASE=verify \
+  KTANN_ROCKSDB_DURABILITY_PATH=/tmp/ktann-rocksdb-durability \
+  cargo test -p ktann-rocksdb --test rocksdb_durability -- --ignored
+```
+
+The write phase clears any previous database at the path before writing two
+bounded keys; the verify phase destroys the database directory when it
+finishes. CI runs both phases explicitly. The in-process shared harness
+therefore declares controlled fault injection and backend restart unsupported;
+the fault and durability binaries provide the adapter-specific evidence instead
+of silently weakening those shared cases.

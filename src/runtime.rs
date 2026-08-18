@@ -16,6 +16,7 @@ use crate::api::{
 use crate::storage::backend::{Backend, CommitCancellation, CommitStart};
 
 mod lifecycle;
+pub(crate) mod reads;
 
 /// Owns one backend and its process-local foreground operation lifecycle.
 ///
@@ -174,57 +175,7 @@ impl<B: Backend> Runtime<B> {
         F: FnOnce(OperationContext<B>) -> Fut + Send + 'static,
         Fut: Future<Output = Result<T>> + Send + 'static,
     {
-        let (admission, backend) = self.handle.inner.admit(&options).await?;
-        let cancellation = options.cancellation().cloned();
-        let deadline = options.deadline();
-        let (commit_cancellation, commit_start) = CommitCancellation::pair();
-        let context = OperationContext {
-            backend,
-            options,
-            commit_start: Some(commit_start),
-        };
-        let mut task = self.handle.inner.executor.spawn(async move {
-            let result = match context.checkpoint() {
-                Ok(()) => operation(context).await,
-                Err(error) => {
-                    drop(context);
-                    Err(error)
-                }
-            };
-            drop(admission);
-            result
-        });
-
-        let mut caller = CancelBeforeCommit {
-            task: Some(task.abort_handle()),
-            commit_cancellation,
-        };
-        let result = if cancellation.is_none() && deadline.is_none() {
-            join_task(&mut task).await
-        } else {
-            let cancellation = wait_for_cancellation(cancellation.as_ref());
-            let deadline = wait_for_deadline(deadline);
-            tokio::select! {
-                biased;
-                () = cancellation => {
-                    cancel_task_before_commit(
-                        &mut task,
-                        &caller.commit_cancellation,
-                        ErrorKind::Cancelled,
-                    ).await
-                }
-                () = deadline => {
-                    cancel_task_before_commit(
-                        &mut task,
-                        &caller.commit_cancellation,
-                        ErrorKind::DeadlineExceeded,
-                    ).await
-                }
-                result = join_task(&mut task) => result,
-            }
-        };
-        caller.disarm();
-        result
+        self.handle.inner.run_foreground(options, operation).await
     }
 }
 
@@ -349,6 +300,75 @@ pub(crate) struct RuntimeInner<B: Backend> {
 }
 
 impl<B: Backend> RuntimeInner<B> {
+    /// Admits one foreground operation and runs it under operation control.
+    ///
+    /// The Runtime handle and every [`Index`] handle share this path: it
+    /// enforces the foreground admission semaphores, the cancellation/deadline
+    /// checks, and the commit-boundary race before the operation's closure
+    /// starts.
+    pub(crate) async fn run_foreground<T, F, Fut>(
+        self: &Arc<Self>,
+        options: OperationOptions,
+        operation: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(OperationContext<B>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T>> + Send + 'static,
+    {
+        let (admission, backend) = self.admit(&options).await?;
+        let cancellation = options.cancellation().cloned();
+        let deadline = options.deadline();
+        let (commit_cancellation, commit_start) = CommitCancellation::pair();
+        let context = OperationContext {
+            backend,
+            options,
+            commit_start: Some(commit_start),
+        };
+        let mut task = self.executor.spawn(async move {
+            let result = match context.checkpoint() {
+                Ok(()) => operation(context).await,
+                Err(error) => {
+                    drop(context);
+                    Err(error)
+                }
+            };
+            drop(admission);
+            result
+        });
+
+        let mut caller = CancelBeforeCommit {
+            task: Some(task.abort_handle()),
+            commit_cancellation,
+        };
+        let result = if cancellation.is_none() && deadline.is_none() {
+            join_task(&mut task).await
+        } else {
+            let cancellation = wait_for_cancellation(cancellation.as_ref());
+            let deadline = wait_for_deadline(deadline);
+            tokio::select! {
+                biased;
+                () = cancellation => {
+                    cancel_task_before_commit(
+                        &mut task,
+                        &caller.commit_cancellation,
+                        ErrorKind::Cancelled,
+                    ).await
+                }
+                () = deadline => {
+                    cancel_task_before_commit(
+                        &mut task,
+                        &caller.commit_cancellation,
+                        ErrorKind::DeadlineExceeded,
+                    ).await
+                }
+                result = join_task(&mut task) => result,
+            }
+        };
+        caller.disarm();
+        result
+    }
+
     async fn admit(self: &Arc<Self>, options: &OperationOptions) -> Result<(Admission<B>, Arc<B>)> {
         check_control(options)?;
         let acquired = match self.foreground.clone().try_acquire_owned() {
