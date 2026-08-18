@@ -824,6 +824,40 @@ pub fn tree_manifest_prefix_range(
     Ok(KeyRange { start, end })
 }
 
+/// The Tree Manifest directory range for one planned field expansion.
+///
+/// `prefix` carries the already encoded leading exact field values and `lower`
+/// and `upper` carry the already encoded bounds of the next field; `None`
+/// bounds are unbounded within that field. The exclusive end is the byte
+/// successor of the prefix plus upper bound when present, and the byte
+/// successor of the prefix alone otherwise, so the range always covers every
+/// directory key under the prefix whose bounded field value starts at or after
+/// `lower` and — for a string upper bound — a conservative superset of keys
+/// strictly before `upper`. Typed planning rejects those byte-superset
+/// artifacts during enumeration.
+pub(crate) fn tree_manifest_plan_range(
+    index: LogicalIndexId,
+    prefix: &[u8],
+    lower: Option<&[u8]>,
+    upper: Option<&[u8]>,
+) -> KeyRange {
+    let start = {
+        let mut start = index_prefix(index);
+        start.push(KIND_TREE_MANIFEST);
+        start.extend_from_slice(prefix);
+        start.extend_from_slice(lower.unwrap_or_default());
+        start
+    };
+    let mut end = index_prefix(index);
+    end.push(KIND_TREE_MANIFEST);
+    end.extend_from_slice(prefix);
+    if let Some(upper) = upper {
+        end.extend_from_slice(upper);
+    }
+    let end = successor(&end);
+    KeyRange { start, end }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -840,5 +874,42 @@ mod tests {
         let one = index_range(LogicalIndexId::new(1).expect("one is nonzero"));
         let two = index_range(LogicalIndexId::new(2).expect("two is nonzero"));
         assert_eq!(one.end(), two.start());
+    }
+
+    #[test]
+    fn plan_range_without_bounds_is_the_directory_prefix() {
+        let index = LogicalIndexId::new(7).expect("nonzero");
+        let range = tree_manifest_plan_range(index, b"", None, None);
+        assert_eq!(range.start(), tree_manifest_range(index).start());
+        assert_eq!(range.end(), tree_manifest_range(index).end());
+    }
+
+    #[test]
+    fn plan_range_upper_bound_is_the_byte_successor() {
+        let index = LogicalIndexId::new(7).expect("nonzero");
+        let range = tree_manifest_plan_range(index, b"\x01", None, Some(b"\x05\x00"));
+        let mut expected_end = index_prefix(index);
+        expected_end.push(KIND_TREE_MANIFEST);
+        expected_end.extend_from_slice(b"\x01\x05\x00");
+        assert_eq!(range.end(), successor(&expected_end));
+        // The end is the successor of prefix + upper, so directory keys with a
+        // strictly greater encoded field value are still covered as artifacts.
+        assert!(range.end().len() >= expected_end.len());
+    }
+
+    #[test]
+    fn plan_range_with_only_a_lower_bound_ends_at_the_prefix_successor() {
+        let index = LogicalIndexId::new(7).expect("nonzero");
+        let range = tree_manifest_plan_range(index, b"\x01", Some(b"\x05"), None);
+        let mut expected_start = index_prefix(index);
+        expected_start.push(KIND_TREE_MANIFEST);
+        expected_start.extend_from_slice(b"\x01\x05");
+        assert_eq!(range.start(), expected_start);
+        // Without an upper bound the range reaches the end of the whole prefix,
+        // so every field value above the lower bound stays covered.
+        let mut prefix = index_prefix(index);
+        prefix.push(KIND_TREE_MANIFEST);
+        prefix.extend_from_slice(b"\x01");
+        assert_eq!(range.end(), successor(&prefix));
     }
 }

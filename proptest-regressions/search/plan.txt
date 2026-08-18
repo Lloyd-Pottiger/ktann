@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d01e11a55db111294b1f47dc569eb3b00607b0025d6851ba452e8dd25e24f617 # shrinks to predicate = Predicate([REDACTED]), key = [I64([REDACTED]), String([REDACTED])]
+cc 2911f0ac091b47848947d869cf50071e2b64fd9946bc2bbf4231dd29586d13e4 # shrinks to predicate = Predicate([REDACTED]), key = [I64([REDACTED]), String([REDACTED])]
+cc fa3d806cc5493555f7045ae30ee2e54947518147d988cb6d4f43a5ec776a8889 # shrinks to predicate = Predicate([REDACTED]), key = [I64([REDACTED]), String([REDACTED])]
+cc 2968de11504fcf76b7b7008a3e5e4f7bee2185be571ef383c83c1293f1f31653 # shrinks to predicate = Predicate([REDACTED]), key = [I64([REDACTED]), String([REDACTED])]
