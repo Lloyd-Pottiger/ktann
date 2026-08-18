@@ -72,11 +72,7 @@ pub async fn read_tree_manifest<T: ReadOps>(
         txn.bound_manifest().ok_or_else(Error::invalid_argument)?,
         tree_key,
     )?;
-    match txn.get(key).await? {
-        Some(PersistentValue::TreeManifest(manifest)) => Ok(Some(manifest)),
-        Some(_) => Err(corruption()),
-        None => Ok(None),
-    }
+    expect_manifest(txn.get(key).await?)
 }
 
 /// Reads one Tree Manifest and establishes a conflict on its key.
@@ -88,11 +84,7 @@ pub async fn read_tree_manifest_for_update<T: WriteTxn>(
         txn.bound_manifest().ok_or_else(Error::invalid_argument)?,
         tree_key,
     )?;
-    match txn.get_for_update(key).await? {
-        Some(PersistentValue::TreeManifest(manifest)) => Ok(Some(manifest)),
-        Some(_) => Err(corruption()),
-        None => Ok(None),
-    }
+    expect_manifest(txn.get_for_update(key).await?)
 }
 
 /// Lazily creates the tree for one Tree Key.
@@ -175,11 +167,8 @@ pub async fn reserve_partition_keys<T: WriteTxn>(
         txn.bound_manifest().ok_or_else(Error::invalid_argument)?,
         tree_key,
     )?;
-    let manifest = match txn.get_for_update(key.clone()).await? {
-        Some(PersistentValue::TreeManifest(manifest)) => manifest,
-        Some(_) => return Err(corruption()),
-        None => return Err(Error::invalid_argument()),
-    };
+    let manifest = expect_manifest(txn.get_for_update(key.clone()).await?)?
+        .ok_or_else(Error::invalid_argument)?;
     let high_water = manifest.partition_key_high_water().get();
     if high_water == u64::MAX {
         return Err(Error::new(ErrorKind::IdExhausted));
@@ -195,6 +184,16 @@ pub async fn reserve_partition_keys<T: WriteTxn>(
         next: partition_key(next)?,
         last: partition_key(last)?,
     })
+}
+
+/// Extracts the Tree Manifest from a typed read, failing closed on a
+/// wrong-kind value.
+fn expect_manifest(value: Option<PersistentValue>) -> Result<Option<TreeManifest>> {
+    match value {
+        Some(PersistentValue::TreeManifest(manifest)) => Ok(Some(manifest)),
+        Some(_) => Err(corruption()),
+        None => Ok(None),
+    }
 }
 
 /// Builds the typed Tree Manifest key for one transaction binding.

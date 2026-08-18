@@ -149,7 +149,7 @@ pub(crate) fn plan_tree_keys(
 
     let mut drafts = vec![Draft::prefix()];
     let mut ranges = Vec::new();
-    for ordinal in 0..schema.field_count {
+    for ordinal in 0..schema.types.len() {
         let Some(set) = &constraints.sets[ordinal] else {
             break;
         };
@@ -168,14 +168,16 @@ pub(crate) fn plan_tree_keys(
         if product > u64::from(range_limit) {
             break;
         }
-        if set.is_all_points()? {
+        let points = set
+            .intervals
+            .iter()
+            .map(|interval| set.point_value(interval))
+            .collect::<Result<Option<Vec<_>>>>()?;
+        if let Some(points) = points {
             let mut next = Vec::with_capacity(product as usize);
             for draft in &drafts {
-                for interval in &set.intervals {
-                    let Some(value) = set.point_value(interval)? else {
-                        return Err(corruption());
-                    };
-                    next.push(Draft::with_point(&draft.prefix, value));
+                for value in &points {
+                    next.push(Draft::with_point(&draft.prefix, value.clone()));
                 }
             }
             drafts = next;
@@ -271,7 +273,11 @@ pub(crate) async fn enumerate_tree_keys<T: ReadOps>(
                 let PersistentValue::TreeManifest(tree_manifest) = item.value() else {
                     return Err(corruption());
                 };
-                remaining -= 1;
+                // A conforming backend never exceeds the requested item bound,
+                // so this underflow means the scan contract was violated.
+                remaining = remaining
+                    .checked_sub(1)
+                    .ok_or_else(|| Error::new(ErrorKind::Backend))?;
                 if plan.accepts(tree_key)? {
                     trees.push(EnumeratedTree {
                         tree_key: tree_key.clone(),
@@ -279,13 +285,9 @@ pub(crate) async fn enumerate_tree_keys<T: ReadOps>(
                     });
                 }
             }
-            match page.next_cursor() {
-                Some(next) => cursor = Some(next.clone()),
+            match page.into_next_cursor() {
+                Some(next) => cursor = Some(next),
                 None => break,
-            }
-            if remaining == 0 {
-                exhausted = true;
-                break 'ranges;
             }
         }
     }
@@ -298,7 +300,6 @@ pub(crate) async fn enumerate_tree_keys<T: ReadOps>(
 
 /// The ordered Tree Key schema of one Logical Index.
 struct TreeSchema {
-    field_count: usize,
     types: Box<[DataType]>,
     ordinal_by_schema_pos: Vec<Option<usize>>,
 }
@@ -311,7 +312,6 @@ impl TreeSchema {
             ordinal_by_schema_pos[usize::from(field_id.0)] = Some(ordinal);
         }
         Self {
-            field_count,
             types: types[..field_count].into(),
             ordinal_by_schema_pos,
         }
@@ -356,22 +356,20 @@ impl Constraints {
     /// The full domain for a leaf that references a non-Tree-Key field.
     fn non_tree(types: &[DataType]) -> Self {
         Self {
-            types: types.into(),
-            sets: vec![None; types.len()],
-            exact: true,
             tree_pure: false,
+            ..Self::full(types)
         }
     }
 
     fn wide(types: &[DataType]) -> Self {
         Self {
-            types: types.into(),
-            sets: vec![None; types.len()],
             exact: false,
             tree_pure: false,
+            ..Self::full(types)
         }
     }
 
+    /// No Tree Key can match: every field's set is empty.
     fn impossible(types: &[DataType]) -> Self {
         Self {
             sets: types.iter().map(|ty| Some(FieldSet::empty(*ty))).collect(),
@@ -381,13 +379,9 @@ impl Constraints {
         }
     }
 
+    /// The union identity: no child has contributed a possible match yet.
     fn empty_union(types: &[DataType]) -> Self {
-        Self {
-            sets: types.iter().map(|ty| Some(FieldSet::empty(*ty))).collect(),
-            types: types.into(),
-            exact: true,
-            tree_pure: true,
-        }
+        Self::impossible(types)
     }
 
     fn intersect(&mut self, other: &Self) {
@@ -650,14 +644,6 @@ impl FieldSet {
         Self::normalize(self.ty, intervals)
     }
 
-    fn is_all_points(&self) -> Result<bool> {
-        self.intervals
-            .iter()
-            .map(|interval| self.point_value(interval))
-            .collect::<Result<Vec<_>>>()
-            .map(|points| points.iter().all(Option::is_some))
-    }
-
     fn point_value(&self, interval: &Interval) -> Result<Option<Value>> {
         let Some(lo) = interval.lo.as_ref() else {
             return Ok(None);
@@ -730,14 +716,8 @@ fn materialize_range(
 ) -> Result<KeyRange> {
     let prefix = TreeKey::encode(&types[..prefix_values.len()], prefix_values)?;
     let ty = types.get(prefix_values.len());
-    let lower = match lo {
-        Some(value) => Some(encode_scalar(ty, value)?),
-        None => None,
-    };
-    let upper = match hi {
-        Some(value) => Some(encode_scalar(ty, value)?),
-        None => None,
-    };
+    let lower = lo.map(|value| encode_scalar(ty, value)).transpose()?;
+    let upper = hi.map(|value| encode_scalar(ty, value)).transpose()?;
     Ok(keys::tree_manifest_plan_range(
         index,
         prefix.as_bytes(),
@@ -2345,6 +2325,10 @@ mod exhaustive {
         }
     }
 
+    fn format_key(key: &[Value]) -> String {
+        key.iter().map(format_value).collect::<Vec<_>>().join(", ")
+    }
+
     #[test]
     fn small_domain_plans_never_miss_a_match() {
         let manifest = property_manifest();
@@ -2425,12 +2409,6 @@ mod exhaustive {
                 predicates.push(Predicate::Or(vec![left.clone(), right.clone()]));
             }
         }
-        for left in &leaves {
-            predicates.push(Predicate::Not(Box::new(Predicate::And(vec![
-                left.clone(),
-                left.clone(),
-            ]))));
-        }
 
         let mut conjunctive = leaves.clone();
         for left in &leaves {
@@ -2438,56 +2416,55 @@ mod exhaustive {
                 conjunctive.push(Predicate::And(vec![left.clone(), right.clone()]));
             }
         }
+        let cases: Vec<(Vec<Value>, TreeKey)> = i64_domain
+            .into_iter()
+            .flat_map(|a| {
+                string_domain.iter().map(move |s| {
+                    let key = vec![i64_value(a), string_value(s)];
+                    let tree_key = TreeKey::encode(&types, &key).expect("canonical key");
+                    (key, tree_key)
+                })
+            })
+            .collect();
         for predicate in &conjunctive {
             let plan = plan_tree_keys(&manifest, Some(predicate), 8).expect("plan");
-            for a in i64_domain {
-                for s in &string_domain {
-                    let key = vec![i64_value(a), string_value(s)];
-                    let expected = oracle(predicate, &key);
-                    let tree_key = TreeKey::encode(&types, &key).expect("canonical key");
-                    let accepted = plan.accepts(&tree_key).expect("accepts");
-                    assert_eq!(
-                        accepted,
-                        expected,
-                        "inexact conjunctive plan: {} for key [{}, {:?}]",
-                        format_predicate(predicate),
-                        a,
-                        s
-                    );
-                }
+            for (key, tree_key) in &cases {
+                let expected = oracle(predicate, key);
+                let accepted = plan.accepts(tree_key).expect("accepts");
+                assert_eq!(
+                    accepted,
+                    expected,
+                    "inexact conjunctive plan: {} for key [{}]",
+                    format_predicate(predicate),
+                    format_key(key)
+                );
             }
         }
         for predicate in &predicates {
             let plan = plan_tree_keys(&manifest, Some(predicate), 8).expect("plan");
-            for a in i64_domain {
-                for s in &string_domain {
-                    let key = vec![i64_value(a), string_value(s)];
-                    let expected = oracle(predicate, &key);
-                    let tree_key = TreeKey::encode(&types, &key).expect("canonical key");
-                    let accepted = plan.accepts(&tree_key).expect("accepts");
+            for (key, tree_key) in &cases {
+                let expected = oracle(predicate, key);
+                let accepted = plan.accepts(tree_key).expect("accepts");
+                assert!(
+                    accepted || !expected,
+                    "missed a match: {} for key [{}]",
+                    format_predicate(predicate),
+                    format_key(key)
+                );
+                if expected {
+                    // Enumeration only scans the planned ranges, so every
+                    // matching Tree Key must byte-order inside one of them.
+                    let directory_key =
+                        keys::tree_manifest_key(manifest.logical_index_id(), tree_key);
                     assert!(
-                        accepted || !expected,
-                        "missed a match: {} for key [{}, {:?}]",
+                        plan.ranges().iter().any(|range| {
+                            range.start() <= directory_key.as_slice()
+                                && directory_key.as_slice() < range.end()
+                        }),
+                        "matching key outside every planned range: {} for key [{}]",
                         format_predicate(predicate),
-                        a,
-                        s
+                        format_key(key)
                     );
-                    if expected {
-                        // Enumeration only scans the planned ranges, so every
-                        // matching Tree Key must byte-order inside one of them.
-                        let directory_key =
-                            keys::tree_manifest_key(manifest.logical_index_id(), &tree_key);
-                        assert!(
-                            plan.ranges().iter().any(|range| {
-                                range.start() <= directory_key.as_slice()
-                                    && directory_key.as_slice() < range.end()
-                            }),
-                            "matching key outside every planned range: {} for key [{}, {:?}]",
-                            format_predicate(predicate),
-                            a,
-                            s
-                        );
-                    }
                 }
             }
         }

@@ -848,21 +848,13 @@ pub(crate) fn tree_manifest_plan_range(
         start.extend_from_slice(lower.unwrap_or_default());
         start
     };
-    let end = match upper {
-        Some(upper) => {
-            let mut end = index_prefix(index);
-            end.push(KIND_TREE_MANIFEST);
-            end.extend_from_slice(prefix);
-            end.extend_from_slice(upper);
-            successor(&end)
-        }
-        None => {
-            let mut end = index_prefix(index);
-            end.push(KIND_TREE_MANIFEST);
-            end.extend_from_slice(prefix);
-            successor(&end)
-        }
-    };
+    let mut end = index_prefix(index);
+    end.push(KIND_TREE_MANIFEST);
+    end.extend_from_slice(prefix);
+    if let Some(upper) = upper {
+        end.extend_from_slice(upper);
+    }
+    let end = successor(&end);
     KeyRange { start, end }
 }
 
