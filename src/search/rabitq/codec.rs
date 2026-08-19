@@ -145,12 +145,16 @@ fn parse(encoded: &[u8], dimension: usize, mut accept_code: impl FnMut(i8)) -> R
 }
 
 fn zero_code(encoded_len: usize) -> Result<Bytes> {
+    Ok(Bytes::from(zeroed_buffer(encoded_len)?))
+}
+
+fn zeroed_buffer(len: usize) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     bytes
-        .try_reserve_exact(encoded_len)
+        .try_reserve_exact(len)
         .map_err(|error| Error::with_source(ErrorKind::LimitExceeded, error))?;
-    bytes.resize(encoded_len, 0);
-    Ok(Bytes::from(bytes))
+    bytes.resize(len, 0);
+    Ok(bytes)
 }
 
 fn allocate_codes(dimension: usize) -> Result<Vec<i8>> {
@@ -241,11 +245,7 @@ fn encode_payload(
     reconstruction_error_upper: f32,
     signed_codes: &[i8],
 ) -> Result<Bytes> {
-    let mut encoded = Vec::new();
-    encoded
-        .try_reserve_exact(encoded_len)
-        .map_err(|error| Error::with_source(ErrorKind::LimitExceeded, error))?;
-    encoded.resize(encoded_len, 0);
+    let mut encoded = zeroed_buffer(encoded_len)?;
     encoded[0..4].copy_from_slice(&scale.to_bits().to_le_bytes());
     encoded[4..8].copy_from_slice(&code_norm_squared.to_le_bytes());
     encoded[8..12].copy_from_slice(&reconstruction_error_upper.to_bits().to_le_bytes());

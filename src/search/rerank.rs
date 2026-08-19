@@ -17,7 +17,6 @@
     )
 )]
 
-use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
 use bytes::Bytes;
@@ -27,7 +26,7 @@ use crate::storage::ReadLogicalTxn;
 use crate::storage::backend::ReadOps;
 use crate::storage::values::RecordLocation;
 
-use super::numeric::{ExactDistance, VectorKernel};
+use super::numeric::{ExactDistance, VectorKernel, compare_finite};
 use super::predicate::CompiledPredicate;
 use super::rabitq::ApproximateDistance;
 
@@ -248,16 +247,6 @@ pub(crate) async fn exact_rerank<T: ReadOps>(
             .map_err(|_| Error::new(ErrorKind::LimitExceeded))?,
         exact_rerank_budget_exhausted: exhausted,
     })
-}
-
-fn compare_finite(left: f64, right: f64) -> Ordering {
-    if left < right {
-        Ordering::Less
-    } else if left > right {
-        Ordering::Greater
-    } else {
-        Ordering::Equal
-    }
 }
 
 fn corruption() -> Error {
