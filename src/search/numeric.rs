@@ -4,14 +4,6 @@
 //! rotation. These steps are persistent protocol: changing their order,
 //! precision, constants, or random-word consumption would change stored
 //! RaBitQ codes even if the resulting vectors remained mathematically close.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "initial tree routing (#25) consumes caller-vector preprocessing; the \
-                  exact-reranking stage (#28) consumes the exact-distance kernel"
-    )
-)]
 
 use std::mem::size_of;
 
@@ -98,6 +90,38 @@ impl VectorKernel {
         self.rotation
             .apply_in_place(&mut processed, VectorSource::Caller)?;
         Ok(processed.into_boxed_slice())
+    }
+
+    /// Computes the deterministic routing distance from a preprocessed routing
+    /// vector to a persistent routing centroid; smaller is nearer.
+    ///
+    /// L2 accumulates squared distance in f64, which ranks identically to the
+    /// Euclidean exact distance. Inner product ranks by the negated f64 dot
+    /// product, exactly its distance definition. Cosine also ranks by the
+    /// negated dot product in the preprocessed space: routing-space records
+    /// are unit-norm, while a centroid is an unnormalized mean whose norm
+    /// reflects cluster coherence rather than distance, so dot-product
+    /// assignment is the spherical routing rule and stays total and
+    /// deterministic even for a zero centroid.
+    ///
+    /// Every input component is validated finite and the bounded dimension
+    /// caps the f64 accumulations far below overflow, so a finite result is
+    /// guaranteed. A malformed persistent centroid is `Corruption`.
+    pub(crate) fn routing_distance(&self, routing: &[f32], centroid: &[f32]) -> Result<f64> {
+        validate_vector(routing, self.dimension, VectorSource::Caller)?;
+        validate_vector(centroid, self.dimension, VectorSource::Persistent)?;
+
+        match self.metric {
+            Metric::L2 => {
+                let mut squared = 0.0;
+                for index in 0..self.dimension {
+                    let difference = f64::from(routing[index]) - f64::from(centroid[index]);
+                    squared += difference * difference;
+                }
+                Ok(squared)
+            }
+            Metric::Cosine | Metric::InnerProduct => Ok(-dot_product(routing, centroid)),
+        }
     }
 
     /// Computes the exact scalar-f64 distance to one committed Vector Record.
@@ -630,5 +654,53 @@ mod tests {
             }
         }
         assert_eq!(hash, 0x2398_08d9_e8ca_5477);
+    }
+
+    #[test]
+    fn routing_distance_uses_squared_l2_ranking() {
+        let kernel = VectorKernel::new(3, Metric::L2, SEED).unwrap();
+        let distance = kernel
+            .routing_distance(&[1.0, 2.0, 3.0], &[4.0, 6.0, 3.0])
+            .unwrap();
+        assert_eq!(distance, 25.0);
+    }
+
+    #[test]
+    fn routing_distance_negates_dot_product_for_inner_product_and_cosine() {
+        for metric in [Metric::InnerProduct, Metric::Cosine] {
+            let kernel = VectorKernel::new(3, metric, SEED).unwrap();
+            let distance = kernel
+                .routing_distance(&[1.0, -2.0, 3.0], &[4.0, 5.0, -6.0])
+                .unwrap();
+            assert_eq!(distance, 24.0);
+        }
+    }
+
+    #[test]
+    fn cosine_routing_accepts_a_zero_centroid() {
+        let kernel = VectorKernel::new(2, Metric::Cosine, SEED).unwrap();
+        let distance = kernel.routing_distance(&[0.6, 0.8], &[0.0, 0.0]).unwrap();
+        assert_eq!(distance, 0.0);
+    }
+
+    #[test]
+    fn routing_distance_distinguishes_caller_errors_from_corruption() {
+        let kernel = VectorKernel::new(2, Metric::L2, SEED).unwrap();
+        assert_kind(
+            kernel.routing_distance(&[1.0], &[1.0, 0.0]),
+            ErrorKind::InvalidArgument,
+        );
+        assert_kind(
+            kernel.routing_distance(&[1.0, f32::NAN], &[1.0, 0.0]),
+            ErrorKind::InvalidArgument,
+        );
+        assert_kind(
+            kernel.routing_distance(&[1.0, 0.0], &[1.0]),
+            ErrorKind::Corruption,
+        );
+        assert_kind(
+            kernel.routing_distance(&[1.0, 0.0], &[f32::INFINITY, 0.0]),
+            ErrorKind::Corruption,
+        );
     }
 }
