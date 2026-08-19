@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use super::{Error, FieldSchema, Predicate, Result};
+use super::{Error, FieldSchema, Predicate, Result, validate_id};
 
 const MAX_K: usize = 65_536;
 const MAX_SCANNED_TREE_KEYS: u32 = 65_536;
@@ -221,7 +221,9 @@ impl SearchRequest {
         fields: &[FieldSchema],
         defaults: SearchBudgets,
     ) -> Result<SearchBudgets> {
-        if self.vector.len() != dimension || self.vector.iter().any(|value| !value.is_finite()) {
+        // Vector finiteness is guaranteed by `SearchRequest::new` and the
+        // vector is immutable, so only the index-dependent shape is checked.
+        if self.vector.len() != dimension {
             return Err(Error::invalid_argument());
         }
         if let Some(predicate) = &mut self.predicate {
@@ -278,7 +280,8 @@ pub struct SearchHit {
 impl SearchHit {
     /// Creates a hit from a valid Record ID and finite exact distance.
     pub fn new(id: Bytes, distance: f64) -> Result<Self> {
-        if id.is_empty() || id.len() > 256 || !distance.is_finite() {
+        validate_id(&id)?;
+        if !distance.is_finite() {
             return Err(Error::invalid_argument());
         }
         Ok(Self { id, distance })

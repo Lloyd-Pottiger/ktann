@@ -7,7 +7,7 @@ use std::time::Instant;
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
-use super::{BatchToken, Error, Record, Result};
+use super::{BatchToken, Error, MAX_RECORD_ID_BYTES, Record, Result};
 
 /// One atomic Foreground Mutation item.
 #[derive(Clone)]
@@ -70,7 +70,7 @@ pub enum MutationOutcome {
 
 /// Validates one caller Record ID shape: `1..=256` opaque bytes.
 pub(crate) fn validate_id(id: &Bytes) -> Result<()> {
-    if id.is_empty() || id.len() > 256 {
+    if id.is_empty() || id.len() > MAX_RECORD_ID_BYTES {
         return Err(Error::invalid_argument());
     }
     Ok(())
