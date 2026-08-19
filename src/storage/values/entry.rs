@@ -111,10 +111,9 @@ pub(super) fn encode_child_entry(
 
 pub(super) fn decode_child_entry(
     decoder: &mut Decoder,
-    manifest: Option<&IndexManifest>,
+    manifest: &IndexManifest,
 ) -> Result<ChildEntry> {
     let child = decoder.partition_key()?;
-    let manifest = manifest.ok_or_else(Error::invalid_argument)?;
     let centroid = decode_vector(decoder, manifest.config().dimension())?;
     Ok(ChildEntry::new(child, centroid))
 }
