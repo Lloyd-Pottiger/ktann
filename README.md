@@ -15,9 +15,10 @@ index can run on multiple KV backends.
 > design is implementation-ready, and the workspace now includes the public
 > domain types, canonical logical key and value codecs, typed storage
 > operations, backend transaction seam, FoundationDB and RocksDB adapters, the
-> create/open/drop Logical Index lifecycle, and snapshot-validated point and
-> batch Vector Record reads. Vector Record mutation, search, and
-> structure-maintenance algorithms are not yet available for use.
+> create/open/drop Logical Index lifecycle, snapshot-validated point and batch
+> Vector Record reads, and routed foreground Vector Record mutations with
+> whole-operation retries. Search and structure-maintenance algorithms are not
+> yet available for use.
 
 ## Goals
 
@@ -103,10 +104,12 @@ KTANN's contract.
 
 The repository currently contains the Rust workspace, public domain types,
 canonical codecs, typed storage, backend adapters, Runtime admission/shutdown,
-the Logical Index lifecycle, and point/batch Vector Record reads over one
-consistent snapshot. Mutation, search, and maintenance stages are implemented
-incrementally. See [`AGENTS.md`](AGENTS.md) for development commands,
-engineering constraints, and verification guidelines.
+the Logical Index lifecycle, point/batch Vector Record reads over one
+consistent snapshot, and atomic foreground mutations (insert, replacement
+upsert, delete, and batches) with whole-operation routing and retries. Search
+and maintenance stages are implemented incrementally. See
+[`AGENTS.md`](AGENTS.md) for development commands, engineering constraints,
+and verification guidelines.
 
 ## Influences
 

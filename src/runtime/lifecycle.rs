@@ -47,11 +47,11 @@ impl RetryPolicy {
         }
     }
 
-    fn would_exhaust(self, failed_attempts: u32) -> bool {
+    pub(crate) fn would_exhaust(self, failed_attempts: u32) -> bool {
         failed_attempts.saturating_add(1) >= self.attempts
     }
 
-    async fn wait(self, failed_attempts: u32) {
+    pub(crate) async fn wait(self, failed_attempts: u32) {
         let shift = failed_attempts.min(31);
         let current = self
             .initial_backoff

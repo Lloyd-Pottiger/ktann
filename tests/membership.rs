@@ -18,7 +18,7 @@ use ktann::storage::{
     LogicalRange, ReadLogicalTxn, RecordGroupRead, WriteLogicalTxn, tree_manifest,
 };
 
-use support::{CommitFault, CommitOutcome, DeterministicBackend};
+use support::{CommitFault, CommitOutcome, DeterministicBackend, Rng};
 
 #[allow(dead_code)]
 mod support;
@@ -975,24 +975,6 @@ async fn a_target_that_no_longer_accepts_writes_is_corruption() {
     txn.rollback().await;
 
     assert_eq!(read_group(&backend, &manifest, rid(1), false).await, None);
-}
-
-/// A replayable xorshift64 generator; the printed seed reproduces a failure.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
-    }
-
-    fn below(&mut self, bound: u64) -> u64 {
-        self.next() % bound
-    }
 }
 
 /// Verifies the committed state against the model: every modeled record reads
