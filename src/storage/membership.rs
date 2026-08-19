@@ -147,15 +147,15 @@ pub async fn replace_record<T: WriteTxn>(
 
     let record_key = record_key(index, id);
     let location_key = location_key(index, id);
-    let existing =
-        expect_record(txn.get_for_update(record_key.clone()).await?)?.ok_or_else(corruption)?;
+    let existing = expect_record(txn.get_for_update(record_key.clone()).await?)?
+        .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
     if existing.record_id() != id {
-        return Err(corruption());
+        return Err(Error::new(ErrorKind::Corruption));
     }
-    let location =
-        expect_location(txn.get_for_update(location_key.clone()).await?)?.ok_or_else(corruption)?;
+    let location = expect_location(txn.get_for_update(location_key.clone()).await?)?
+        .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
     if &location != expected {
-        return Err(corruption());
+        return Err(Error::new(ErrorKind::Corruption));
     }
 
     txn.put(record_key, PersistentValue::VectorRecord(record.clone()))
@@ -183,13 +183,13 @@ pub async fn replace_record<T: WriteTxn>(
         // The replaced entry must exist; the update-protected read also
         // establishes the conflict on it.
         expect_entry(txn.get_for_update(target_entry_key.clone()).await?)?
-            .ok_or_else(corruption)?;
+            .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
         txn.put(target_entry_key, PersistentValue::LeafEntry(entry.clone()))
             .await?;
     } else {
         let source_entry_key = entry_key(index, expected, id);
         expect_entry(txn.get_for_update(source_entry_key.clone()).await?)?
-            .ok_or_else(corruption)?;
+            .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
         txn.delete(source_entry_key).await?;
         expect_inserted(
             txn.insert(target_entry_key, PersistentValue::LeafEntry(entry.clone()))
@@ -238,10 +238,11 @@ pub async fn delete_record<T: WriteTxn>(
         return Ok(DeleteOutcome::NotFound);
     }
     let location_key = location_key(index, id);
-    let location =
-        expect_location(txn.get_for_update(location_key.clone()).await?)?.ok_or_else(corruption)?;
+    let location = expect_location(txn.get_for_update(location_key.clone()).await?)?
+        .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
     let entry_key = entry_key(index, &location, id);
-    expect_entry(txn.get_for_update(entry_key.clone()).await?)?.ok_or_else(corruption)?;
+    expect_entry(txn.get_for_update(entry_key.clone()).await?)?
+        .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
 
     txn.delete(record_key).await?;
     txn.delete(location_key).await?;
@@ -270,7 +271,8 @@ async fn read_header<T: WriteTxn>(
     index: LogicalIndexId,
     location: &RecordLocation,
 ) -> Result<PartitionHeader> {
-    expect_header(txn.get_for_update(header_key(index, location)).await?)?.ok_or_else(corruption)
+    expect_header(txn.get_for_update(header_key(index, location)).await?)?
+        .ok_or_else(|| Error::new(ErrorKind::Corruption))
 }
 
 /// Writes one adjusted leaf Header back through the budgeted mutation path.
@@ -301,8 +303,8 @@ async fn expand_synopsis<T: WriteTxn>(
     projection: &[Value],
 ) -> Result<()> {
     let key = synopsis_key(manifest.logical_index_id(), target);
-    let mut synopsis =
-        expect_synopsis(txn.get_for_update(key.clone()).await?)?.ok_or_else(corruption)?;
+    let mut synopsis = expect_synopsis(txn.get_for_update(key.clone()).await?)?
+        .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
     let before = synopsis.clone();
     synopsis.expand(manifest, projection)?;
     if synopsis != before {
@@ -320,7 +322,7 @@ fn expect_write_target(header: PartitionHeader) -> Result<PartitionHeader> {
         {
             Ok(header)
         }
-        _ => Err(corruption()),
+        _ => Err(Error::new(ErrorKind::Corruption)),
     }
 }
 
@@ -328,7 +330,10 @@ fn expect_write_target(header: PartitionHeader) -> Result<PartitionHeader> {
 fn added_entry(header: PartitionHeader) -> Result<PartitionHeader> {
     adjust_header(
         header,
-        header.entry_count().checked_add(1).ok_or_else(corruption)?,
+        header
+            .entry_count()
+            .checked_add(1)
+            .ok_or_else(|| Error::new(ErrorKind::Corruption))?,
     )
 }
 
@@ -338,7 +343,10 @@ fn added_entry(header: PartitionHeader) -> Result<PartitionHeader> {
 fn removed_entry(header: PartitionHeader) -> Result<PartitionHeader> {
     adjust_header(
         header,
-        header.entry_count().checked_sub(1).ok_or_else(corruption)?,
+        header
+            .entry_count()
+            .checked_sub(1)
+            .ok_or_else(|| Error::new(ErrorKind::Corruption))?,
     )
 }
 
@@ -352,16 +360,19 @@ fn touched_entry(header: PartitionHeader) -> Result<PartitionHeader> {
 /// The input Header was structurally valid at decode, so a construction or
 /// epoch-overflow failure here is impossible arithmetic and fails closed.
 fn adjust_header(header: PartitionHeader, entry_count: u32) -> Result<PartitionHeader> {
-    let cache_epoch = header.cache_epoch().checked_add(1).ok_or_else(corruption)?;
+    let cache_epoch = header
+        .cache_epoch()
+        .checked_add(1)
+        .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
     PartitionHeader::new(header.level(), entry_count, cache_epoch, header.state())
-        .map_err(|_| corruption())
+        .map_err(|_| Error::new(ErrorKind::Corruption))
 }
 
 /// Maps a duplicate unique insert of authoritative state to Corruption.
 fn expect_inserted(outcome: InsertOutcome) -> Result<()> {
     match outcome {
         InsertOutcome::Inserted => Ok(()),
-        InsertOutcome::AlreadyExists => Err(corruption()),
+        InsertOutcome::AlreadyExists => Err(Error::new(ErrorKind::Corruption)),
     }
 }
 
@@ -370,7 +381,7 @@ fn expect_inserted(outcome: InsertOutcome) -> Result<()> {
 fn expect_record(value: Option<PersistentValue>) -> Result<Option<VectorRecord>> {
     match value {
         Some(PersistentValue::VectorRecord(record)) => Ok(Some(record)),
-        Some(_) => Err(corruption()),
+        Some(_) => Err(Error::new(ErrorKind::Corruption)),
         None => Ok(None),
     }
 }
@@ -380,7 +391,7 @@ fn expect_record(value: Option<PersistentValue>) -> Result<Option<VectorRecord>>
 fn expect_location(value: Option<PersistentValue>) -> Result<Option<RecordLocation>> {
     match value {
         Some(PersistentValue::RecordLocation(location)) => Ok(Some(location)),
-        Some(_) => Err(corruption()),
+        Some(_) => Err(Error::new(ErrorKind::Corruption)),
         None => Ok(None),
     }
 }
@@ -390,7 +401,7 @@ fn expect_location(value: Option<PersistentValue>) -> Result<Option<RecordLocati
 fn expect_header(value: Option<PersistentValue>) -> Result<Option<PartitionHeader>> {
     match value {
         Some(PersistentValue::PartitionHeader(header)) => Ok(Some(header)),
-        Some(_) => Err(corruption()),
+        Some(_) => Err(Error::new(ErrorKind::Corruption)),
         None => Ok(None),
     }
 }
@@ -400,7 +411,7 @@ fn expect_header(value: Option<PersistentValue>) -> Result<Option<PartitionHeade
 fn expect_synopsis(value: Option<PersistentValue>) -> Result<Option<PartitionSynopsis>> {
     match value {
         Some(PersistentValue::PartitionSynopsis(synopsis)) => Ok(Some(synopsis)),
-        Some(_) => Err(corruption()),
+        Some(_) => Err(Error::new(ErrorKind::Corruption)),
         None => Ok(None),
     }
 }
@@ -410,7 +421,7 @@ fn expect_synopsis(value: Option<PersistentValue>) -> Result<Option<PartitionSyn
 fn expect_entry(value: Option<PersistentValue>) -> Result<Option<LeafEntry>> {
     match value {
         Some(PersistentValue::LeafEntry(entry)) => Ok(Some(entry)),
-        Some(_) => Err(corruption()),
+        Some(_) => Err(Error::new(ErrorKind::Corruption)),
         None => Ok(None),
     }
 }
@@ -459,8 +470,4 @@ fn entry_key(index: LogicalIndexId, location: &RecordLocation, id: &Bytes) -> Lo
         partition: location.leaf(),
         id: id.clone(),
     }
-}
-
-fn corruption() -> Error {
-    Error::new(ErrorKind::Corruption)
 }

@@ -77,10 +77,10 @@ async fn validate_manifest<T: ReadOps>(
     {
         Some(PersistentValue::IndexManifest(current)) => match current.lifecycle() {
             IndexLifecycle::Active if current.has_same_immutable_identity(handle) => Ok(current),
-            IndexLifecycle::Active => Err(corruption()),
+            IndexLifecycle::Active => Err(Error::new(ErrorKind::Corruption)),
             IndexLifecycle::Dropping => Err(Error::new(ErrorKind::IndexDropping)),
         },
-        Some(_) => Err(corruption()),
+        Some(_) => Err(Error::new(ErrorKind::Corruption)),
         None => Err(Error::new(ErrorKind::IndexNotFound)),
     }
 }
@@ -100,8 +100,4 @@ fn stored_record(include_payload: bool, group: RecordGroupRead) -> StoredRecord 
         (false, _) => PayloadProjection::NotLoaded,
     };
     StoredRecord::new(id, Arc::from(vector), fields, payload)
-}
-
-fn corruption() -> Error {
-    Error::new(ErrorKind::Corruption)
 }
