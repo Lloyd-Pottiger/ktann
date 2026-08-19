@@ -125,8 +125,31 @@ pub async fn route_leaf_for_write<T: WriteTxn>(
     let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
     let kernel = kernel_for(manifest)?;
     let routing = kernel.preprocess(vector)?;
+    route_leaf_for_write_preprocessed(txn, tree_key, &kernel, &routing, started_at_unix_millis)
+        .await
+}
+
+/// Routes an already preprocessed routing vector through one tree for a
+/// foreground write.
+///
+/// `routing` must be the exact output of [`VectorKernel::preprocess`] under
+/// `kernel` for the bound Logical Index: the mutation pipeline preprocesses
+/// and quantizes each caller vector once and reuses the same routing vector
+/// here. The same empty-root growth and write validation contract as
+/// [`route_leaf_for_write`] applies.
+pub(crate) async fn route_leaf_for_write_preprocessed<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    tree_key: &TreeKey,
+    kernel: &VectorKernel,
+    routing: &[f32],
+    started_at_unix_millis: u64,
+) -> Result<Route> {
+    let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
+    if routing.len() != manifest.config().dimension() {
+        return Err(Error::invalid_argument());
+    }
     let root = ensure_tree(txn, tree_key, started_at_unix_millis).await?;
-    let route = descend(txn, manifest, &kernel, tree_key, root, &routing).await?;
+    let route = descend(txn, manifest, kernel, tree_key, root, routing).await?;
     validate_for_write(txn, manifest, tree_key, &route).await?;
     Ok(route)
 }
@@ -369,7 +392,7 @@ async fn validate_for_write<T: WriteTxn>(
 }
 
 /// Builds the format-v1 vector kernel for the bound Logical Index.
-fn kernel_for(manifest: &IndexManifest) -> Result<VectorKernel> {
+pub(crate) fn kernel_for(manifest: &IndexManifest) -> Result<VectorKernel> {
     VectorKernel::new(
         manifest.config().dimension(),
         manifest.config().metric(),

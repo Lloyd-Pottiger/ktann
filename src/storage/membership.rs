@@ -253,6 +253,36 @@ pub async fn delete_record<T: WriteTxn>(
     Ok(DeleteOutcome::Deleted)
 }
 
+/// Reads one Record ID's authoritative Record Location with update protection.
+///
+/// The upsert routing decision and the replacement's exact expected location
+/// come from this read. A fully absent Record ID returns `None`; a
+/// half-present Record/Location pair is [`ErrorKind::Corruption`].
+pub async fn read_location_for_update<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    id: &Bytes,
+) -> Result<Option<RecordLocation>> {
+    let index = txn
+        .bound_manifest()
+        .ok_or_else(Error::invalid_argument)?
+        .logical_index_id();
+    let mut values = txn
+        .batch_get_for_update(vec![record_key(index, id), location_key(index, id)])
+        .await?
+        .into_iter();
+    match (values.next(), values.next()) {
+        (Some(record), Some(location)) => {
+            match (expect_record(record)?, expect_location(location)?) {
+                (None, None) => Ok(None),
+                (Some(_), Some(location)) => Ok(Some(location)),
+                _ => Err(Error::new(ErrorKind::Corruption)),
+            }
+        }
+        // The typed batch read returns exactly one value per input key.
+        _ => Err(Error::new(ErrorKind::Backend)),
+    }
+}
+
 /// Validates caller identity agreement and returns the bound Manifest.
 fn validated_input<'manifest, T>(
     txn: &WriteLogicalTxn<'manifest, T>,

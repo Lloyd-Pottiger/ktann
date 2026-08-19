@@ -16,7 +16,7 @@ use crate::api::{
 use crate::search::cache::PartitionCache;
 use crate::storage::backend::{Backend, CommitCancellation, CommitStart};
 
-mod lifecycle;
+pub(crate) mod lifecycle;
 pub(crate) mod reads;
 
 /// Owns one backend and its process-local foreground operation lifecycle.
@@ -489,6 +489,11 @@ impl<B: Backend> RuntimeInner<B> {
 
     fn phase(&self) -> Phase {
         self.lock_lifecycle().phase
+    }
+
+    /// Returns the validated process-local configuration.
+    pub(crate) fn config(&self) -> &RuntimeConfig {
+        &self.config
     }
 
     /// Returns the process-shared snapshot-validated Partition Cache.
