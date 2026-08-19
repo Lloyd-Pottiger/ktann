@@ -6,6 +6,7 @@ use bytes::Bytes;
 
 use crate::api::{Error, ErrorKind, Result};
 
+use super::super::numeric::compare_finite;
 use super::ApproximateDistance;
 
 /// One approximately ranked candidate with an opaque caller-owned value.
@@ -110,12 +111,7 @@ pub(crate) fn select_leaf_overlap<T>(
         .min(remaining_rerank_budget);
     let truncated = candidates.len() > overlap_cap;
     if truncated {
-        if overlap_cap == 0 {
-            candidates.clear();
-        } else {
-            candidates.select_nth_unstable_by(overlap_cap - 1, compare_local_cap);
-            candidates.truncate(overlap_cap);
-        }
+        truncate_candidates(&mut candidates, overlap_cap, compare_local_cap);
     }
     candidates.sort_unstable_by(compare_rough);
 
@@ -146,12 +142,7 @@ pub(crate) fn select_global_overlap<T>(
     candidates.retain(|candidate| candidate.distance.lower() <= overlap_threshold);
     let truncated = candidates.len() > remaining_rerank_budget;
     if truncated {
-        if remaining_rerank_budget == 0 {
-            candidates.clear();
-        } else {
-            candidates.select_nth_unstable_by(remaining_rerank_budget - 1, compare_rough);
-            candidates.truncate(remaining_rerank_budget);
-        }
+        truncate_candidates(&mut candidates, remaining_rerank_budget, compare_rough);
     }
     candidates.sort_unstable_by(compare_rough);
     Ok(OverlapSelection {
@@ -180,12 +171,16 @@ fn compare_local_cap<T>(
         .then_with(|| compare_rough(left, right))
 }
 
-fn compare_finite(left: f64, right: f64) -> Ordering {
-    if left < right {
-        Ordering::Less
-    } else if left > right {
-        Ordering::Greater
+/// Truncates to `cap`, keeping the strongest candidates under `compare`.
+fn truncate_candidates<T>(
+    candidates: &mut Vec<ApproximateCandidate<T>>,
+    cap: usize,
+    compare: impl Fn(&ApproximateCandidate<T>, &ApproximateCandidate<T>) -> Ordering,
+) {
+    if cap == 0 {
+        candidates.clear();
     } else {
-        Ordering::Equal
+        candidates.select_nth_unstable_by(cap - 1, compare);
+        candidates.truncate(cap);
     }
 }

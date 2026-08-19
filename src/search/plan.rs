@@ -160,11 +160,13 @@ pub(crate) fn plan_tree_keys(
                 types: schema.types.clone(),
             });
         }
-        let draft_count = u64::try_from(drafts.len()).map_err(|_| limit_exceeded())?;
-        let interval_count = u64::try_from(set.intervals.len()).map_err(|_| limit_exceeded())?;
+        let draft_count =
+            u64::try_from(drafts.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
+        let interval_count =
+            u64::try_from(set.intervals.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
         let product = draft_count
             .checked_mul(interval_count)
-            .ok_or_else(limit_exceeded)?;
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
         if product > u64::from(range_limit) {
             break;
         }
@@ -379,11 +381,6 @@ impl Constraints {
         }
     }
 
-    /// The union identity: no child has contributed a possible match yet.
-    fn empty_union(types: &[DataType]) -> Self {
-        Self::impossible(types)
-    }
-
     fn intersect(&mut self, other: &Self) {
         for (left, right) in self.sets.iter_mut().zip(&other.sets) {
             match (left.as_ref(), right.as_ref()) {
@@ -442,7 +439,7 @@ fn derive(predicate: &Predicate, schema: &TreeSchema) -> Result<Constraints> {
             Ok(result)
         }
         Predicate::Or(children) => {
-            let mut result = Constraints::empty_union(&schema.types);
+            let mut result = Constraints::impossible(&schema.types);
             for child in children {
                 let child_constraints = derive(child, schema)?;
                 result.union(&child_constraints);
@@ -764,6 +761,7 @@ fn cmp_intervals(left: &Interval, right: &Interval) -> Ordering {
     cmp_lower(&left.lo, &right.lo).then_with(|| cmp_upper(&left.hi, &right.hi))
 }
 
+/// Orders lower bounds, where `None` is unbounded below every value.
 fn cmp_lower(left: &Option<Value>, right: &Option<Value>) -> Ordering {
     match (left, right) {
         (None, None) => Ordering::Equal,
@@ -773,6 +771,7 @@ fn cmp_lower(left: &Option<Value>, right: &Option<Value>) -> Ordering {
     }
 }
 
+/// Orders upper bounds, where `None` is unbounded above every value.
 fn cmp_upper(left: &Option<Value>, right: &Option<Value>) -> Ordering {
     match (left, right) {
         (None, None) => Ordering::Equal,
@@ -790,33 +789,30 @@ fn overlaps_or_adjacent(last: &Interval, next: &Interval) -> bool {
     }
 }
 
+/// Returns the greater lower bound, where `None` is unbounded below.
 fn max_lo(left: Option<Value>, right: Option<Value>) -> Option<Value> {
-    match (left, right) {
-        (None, other) | (other, None) => other,
-        (Some(left), Some(right)) => match bound_order(&left, &right) {
-            Ordering::Less => Some(right),
-            _ => Some(left),
-        },
+    if cmp_lower(&left, &right) == Ordering::Less {
+        right
+    } else {
+        left
     }
 }
 
+/// Returns the lesser upper bound, where `None` is unbounded above.
 fn min_hi(left: Option<Value>, right: Option<Value>) -> Option<Value> {
-    match (left, right) {
-        (None, other) | (other, None) => other,
-        (Some(left), Some(right)) => match bound_order(&left, &right) {
-            Ordering::Greater => Some(right),
-            _ => Some(left),
-        },
+    if cmp_upper(&left, &right) == Ordering::Greater {
+        right
+    } else {
+        left
     }
 }
 
+/// Returns the greater upper bound, where `None` is unbounded above.
 fn max_hi(left: Option<Value>, right: Option<Value>) -> Option<Value> {
-    match (left, right) {
-        (None, _) | (_, None) => None,
-        (Some(left), Some(right)) => match bound_order(&left, &right) {
-            Ordering::Less => Some(right),
-            _ => Some(left),
-        },
+    if cmp_upper(&left, &right) == Ordering::Less {
+        right
+    } else {
+        left
     }
 }
 
@@ -980,10 +976,6 @@ fn check_typed(ty: DataType, value: &Value) -> Result<()> {
 
 fn corruption() -> Error {
     Error::new(ErrorKind::Corruption)
-}
-
-fn limit_exceeded() -> Error {
-    Error::new(ErrorKind::LimitExceeded)
 }
 
 #[cfg(test)]
