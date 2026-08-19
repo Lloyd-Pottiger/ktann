@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use crate::api::{
     Error, ErrorKind, Index, IndexConfig, IndexName, OperationOptions, Result, RuntimeConfig,
 };
+use crate::search::cache::PartitionCache;
 use crate::storage::backend::{Backend, CommitCancellation, CommitStart};
 
 mod lifecycle;
@@ -43,11 +44,13 @@ impl<B: Backend> Runtime<B> {
         }
 
         let foreground_limit = config.foreground_operation_limit();
+        let partition_cache = PartitionCache::new(config.partition_cache_bytes());
         Ok(Self {
             handle: Arc::new(RuntimeHandle {
                 inner: Arc::new(RuntimeInner {
                     executor,
                     config,
+                    partition_cache,
                     foreground: Arc::new(Semaphore::new(foreground_limit)),
                     foreground_waiting: Arc::new(Semaphore::new(foreground_limit)),
                     lifecycle: Mutex::new(Lifecycle {
@@ -293,6 +296,7 @@ async fn cancel_task_before_commit<T>(
 pub(crate) struct RuntimeInner<B: Backend> {
     executor: Handle,
     config: RuntimeConfig,
+    partition_cache: PartitionCache,
     foreground: Arc<Semaphore>,
     foreground_waiting: Arc<Semaphore>,
     lifecycle: Mutex<Lifecycle<B>>,
@@ -485,6 +489,12 @@ impl<B: Backend> RuntimeInner<B> {
 
     fn phase(&self) -> Phase {
         self.lock_lifecycle().phase
+    }
+
+    /// Returns the process-shared snapshot-validated Partition Cache.
+    #[expect(dead_code, reason = "search traversal (#9) reads the shared cache")]
+    pub(crate) fn partition_cache(&self) -> &PartitionCache {
+        &self.partition_cache
     }
 
     fn lock_lifecycle(&self) -> MutexGuard<'_, Lifecycle<B>> {
