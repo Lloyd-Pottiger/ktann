@@ -237,9 +237,10 @@ impl PartitionCache {
             Some(slot) => slot.body.epoch < epoch,
             None => false,
         };
-        if stale {
-            inner.remove(key);
-        }
+        let evicted = if stale { inner.remove(key) } else { None };
+        drop(inner);
+        // Drop the evicted body outside the lock.
+        drop(evicted);
         None
     }
 
@@ -254,16 +255,21 @@ impl PartitionCache {
             return;
         }
         let small_capacity_bytes = self.capacity_bytes / SMALL_QUEUE_DIVISOR;
-        let mut inner = self.lock();
-        if let Some(existing) = inner.slots.get(&key) {
-            if existing.body.epoch > body.epoch {
-                return;
+        let mut evicted = Vec::new();
+        {
+            let mut inner = self.lock();
+            if let Some(existing) = inner.slots.get(&key) {
+                if existing.body.epoch > body.epoch {
+                    return;
+                }
+                evicted.extend(inner.remove(&key));
             }
-            inner.remove(&key);
+            inner.insert(key, body, small_capacity_bytes);
+            inner.evict_within_capacity(self.capacity_bytes, small_capacity_bytes, &mut evicted);
+            inner.compact_queues();
         }
-        inner.insert(key, body, small_capacity_bytes);
-        inner.evict_within_capacity(self.capacity_bytes, small_capacity_bytes);
-        inner.compact_queues();
+        // Drop evicted bodies outside the lock.
+        drop(evicted);
     }
 
     /// Returns the number of cached bodies.
@@ -350,13 +356,13 @@ impl CacheInner {
         );
     }
 
-    fn remove(&mut self, key: &CacheKey) {
-        if let Some(slot) = self.slots.remove(key) {
-            match slot.queue {
-                QueueKind::Small => self.small_bytes -= slot.body.bytes,
-                QueueKind::Main => self.main_bytes -= slot.body.bytes,
-            }
+    fn remove(&mut self, key: &CacheKey) -> Option<Arc<CachedBody>> {
+        let slot = self.slots.remove(key)?;
+        match slot.queue {
+            QueueKind::Small => self.small_bytes -= slot.body.bytes,
+            QueueKind::Main => self.main_bytes -= slot.body.bytes,
         }
+        Some(slot.body)
     }
 
     /// Pops the oldest live record of one queue, skipping stale records.
@@ -377,27 +383,34 @@ impl CacheInner {
         None
     }
 
-    fn evict_within_capacity(&mut self, capacity_bytes: u64, small_capacity_bytes: u64) {
+    /// Evicts until the cache is within capacity, collecting evicted bodies
+    /// for the caller to drop outside the lock.
+    fn evict_within_capacity(
+        &mut self,
+        capacity_bytes: u64,
+        small_capacity_bytes: u64,
+        evicted: &mut Vec<Arc<CachedBody>>,
+    ) {
         while self.small_bytes + self.main_bytes > capacity_bytes {
             if self.small_bytes > small_capacity_bytes {
                 if let Some(key) = self.pop_live(QueueKind::Small) {
-                    self.evict_small_front(key);
+                    self.evict_small_front(key, evicted);
                     continue;
                 }
             }
             if let Some(key) = self.pop_live(QueueKind::Main) {
-                self.evict_main_front(key);
+                self.evict_main_front(key, evicted);
                 continue;
             }
             if let Some(key) = self.pop_live(QueueKind::Small) {
-                self.evict_small_front(key);
+                self.evict_small_front(key, evicted);
                 continue;
             }
             // Every accounted byte belongs to a live slot with one matching
             // queue record, so an over-capacity cache never reaches this
             // guard.
             debug_assert!(self.slots.is_empty());
-            self.slots.clear();
+            evicted.extend(self.slots.drain().map(|(_, slot)| slot.body));
             self.ghost_set.clear();
             self.ghost_order.clear();
             self.small_bytes = 0;
@@ -408,7 +421,7 @@ impl CacheInner {
 
     /// Evicts the small queue's front: entries that earned a hit graduate to
     /// the main queue with a reset counter; the rest leave to the ghost queue.
-    fn evict_small_front(&mut self, key: CacheKey) {
+    fn evict_small_front(&mut self, key: CacheKey, evicted: &mut Vec<Arc<CachedBody>>) {
         let Some(slot) = self.slots.get(&key) else {
             return;
         };
@@ -424,14 +437,14 @@ impl CacheInner {
             self.main_bytes += bytes;
             self.main.push_back(QueueRecord { key, tick });
         } else {
-            self.remove(&key);
+            evicted.extend(self.remove(&key));
             self.ghost_insert(key);
         }
     }
 
     /// Gives the main queue's front a second chance per frequency mark, or
     /// evicts it once the marks are spent.
-    fn evict_main_front(&mut self, key: CacheKey) {
+    fn evict_main_front(&mut self, key: CacheKey, evicted: &mut Vec<Arc<CachedBody>>) {
         let Some(slot) = self.slots.get(&key) else {
             return;
         };
@@ -443,7 +456,7 @@ impl CacheInner {
             }
             self.main.push_back(QueueRecord { key, tick });
         } else {
-            self.remove(&key);
+            evicted.extend(self.remove(&key));
         }
     }
 
