@@ -5,7 +5,7 @@ use std::thread;
 use std::time::Duration;
 
 use super::schema::{MAX_ENCODED_SYNOPSIS_BYTES, MAX_FIELDS, MAX_STRING_BYTES};
-use super::{Error, FieldId, FieldSchema, Metric, Result, SearchBudgets, SynopsisConfig};
+use super::{DataType, Error, FieldId, FieldSchema, Metric, Result, SearchBudgets, SynopsisConfig};
 
 pub(crate) const MAX_DIMENSION: usize = 16_384;
 const MAX_BLOOM_FIELDS: usize = 4;
@@ -106,9 +106,9 @@ impl IndexConfig {
             // the exact length. Bloom bytes use the requested probability
             // without weakening it.
             let encoded_value_bytes = match field.data_type() {
-                super::DataType::String => MAX_STRING_BYTES + 5,
-                super::DataType::Bool => 2,
-                super::DataType::I64 | super::DataType::F64 => 9,
+                DataType::String => MAX_STRING_BYTES + 5,
+                DataType::Bool => 2,
+                DataType::I64 | DataType::F64 => 9,
             };
             let extrema_bytes = encoded_value_bytes
                 .checked_mul(2)
@@ -147,9 +147,9 @@ impl IndexConfig {
             // a type tag, and a terminator. This conservative schema-time bound
             // is independent of the later canonical codec implementation.
             let encoded_field_bytes = match field.data_type() {
-                super::DataType::String => 2 * 1_024 + 2,
-                super::DataType::Bool => 3,
-                super::DataType::I64 | super::DataType::F64 => 10,
+                DataType::String => 2 * MAX_STRING_BYTES + 2,
+                DataType::Bool => 3,
+                DataType::I64 | DataType::F64 => 10,
             };
             worst_case_tree_key_bytes = worst_case_tree_key_bytes
                 .checked_add(encoded_field_bytes)

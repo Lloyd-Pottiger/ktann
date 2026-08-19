@@ -11,7 +11,7 @@ use crate::storage::backend::Backend;
 use crate::storage::values::{IndexLifecycle, IndexManifest};
 
 use super::{
-    Error, GetOptions, IndexConfig, IndexName, LogicalIndexId, OperationOptions, Result,
+    Error, ErrorKind, GetOptions, IndexConfig, IndexName, LogicalIndexId, OperationOptions, Result,
     StoredRecord, validate_id, validate_ids,
 };
 
@@ -34,7 +34,7 @@ impl<B: Backend> Index<B> {
         manifest: IndexManifest,
     ) -> Result<Self> {
         if manifest.lifecycle() != IndexLifecycle::Active {
-            return Err(Error::new(super::ErrorKind::IndexDropping));
+            return Err(Error::new(ErrorKind::IndexDropping));
         }
         Ok(Self {
             runtime,
