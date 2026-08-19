@@ -304,15 +304,17 @@ async fn nearest_child<R: RoutingReader>(
 /// plus value framing per entry — so a legal page is never byte-truncated and
 /// the fanout check always sees every Child Entry.
 fn child_scan_limits(dimension: usize) -> Result<ScanLimits> {
-    let vector_bytes = dimension.checked_mul(4).ok_or_else(limit_exceeded)?;
+    let vector_bytes = dimension
+        .checked_mul(4)
+        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
     let per_item = 28_usize
         .checked_add(MAX_TREE_KEY_BYTES)
         .and_then(|bytes| bytes.checked_add(32))
         .and_then(|bytes| bytes.checked_add(vector_bytes))
-        .ok_or_else(limit_exceeded)?;
+        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
     let byte_limit = per_item
         .checked_mul(INTERNAL_FANOUT + 1)
-        .ok_or_else(limit_exceeded)?;
+        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
     Ok(ScanLimits {
         item_limit: INTERNAL_FANOUT + 1,
         byte_limit,
@@ -375,11 +377,6 @@ fn kernel_for(manifest: &IndexManifest) -> Result<VectorKernel> {
 /// A storage-corruption error for a broken persistent routing invariant.
 fn corruption() -> Error {
     Error::new(ErrorKind::Corruption)
-}
-
-/// A limit error for impossible scan-budget arithmetic.
-fn limit_exceeded() -> Error {
-    Error::new(ErrorKind::LimitExceeded)
 }
 
 /// The read surface a routing descent needs from either transaction kind.

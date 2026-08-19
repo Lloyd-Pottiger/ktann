@@ -267,13 +267,13 @@ impl FoundationDbWriteTxn<'_> {
         let next_count = self
             .mutation_count
             .checked_add(mutation_count)
-            .ok_or_else(limit_exceeded)?;
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
         let next_bytes = self
             .mutation_bytes
             .checked_add(mutation_bytes)
-            .ok_or_else(limit_exceeded)?;
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
         if next_count > DEFAULT_MAX_MUTATIONS || next_bytes > DEFAULT_MAX_MUTATION_BYTES {
-            return Err(limit_exceeded());
+            return Err(Error::new(ErrorKind::LimitExceeded));
         }
         self.mutation_count = next_count;
         self.mutation_bytes = next_bytes;
@@ -314,7 +314,7 @@ impl WriteTxn for FoundationDbWriteTxn<'_> {
         let charged_bytes = physical_key
             .len()
             .checked_add(value.len())
-            .ok_or_else(limit_exceeded)?;
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
         let existing = self
             .transaction
             .get(&physical_key, false)
@@ -337,7 +337,7 @@ impl WriteTxn for FoundationDbWriteTxn<'_> {
 
     async fn batch_mutate(&mut self, mutations: Vec<Mutation>) -> Result<()> {
         if mutations.len() > DEFAULT_MAX_MUTATIONS.saturating_sub(self.mutation_count) {
-            return Err(limit_exceeded());
+            return Err(Error::new(ErrorKind::LimitExceeded));
         }
         let mut prepared = Vec::with_capacity(mutations.len());
         let mut charged_bytes = 0_usize;
@@ -349,7 +349,7 @@ impl WriteTxn for FoundationDbWriteTxn<'_> {
             };
             charged_bytes = charged_bytes
                 .checked_add(mutation.charged_bytes()?)
-                .ok_or_else(limit_exceeded)?;
+                .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
             prepared.push(mutation);
         }
         self.charge(prepared.len(), charged_bytes)?;
@@ -368,7 +368,7 @@ impl WriteTxn for FoundationDbWriteTxn<'_> {
         let charged_bytes = start
             .len()
             .checked_add(end.len())
-            .ok_or_else(limit_exceeded)?;
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
         self.charge(1, charged_bytes)?;
         self.transaction.clear_range(&start, &end);
         Ok(())
@@ -409,7 +409,7 @@ impl PreparedMutation {
             Self::Put { key, value } => key
                 .len()
                 .checked_add(value.len())
-                .ok_or_else(limit_exceeded),
+                .ok_or_else(|| Error::new(ErrorKind::LimitExceeded)),
             Self::Delete { key } => Ok(key.len()),
         }
     }
@@ -505,14 +505,19 @@ async fn scan(
             let bytes = logical_key
                 .len()
                 .checked_add(value.value().len())
-                .ok_or_else(limit_exceeded)?;
+                .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
             if !items.is_empty()
                 && (items.len() >= limits.item_limit
-                    || item_bytes.checked_add(bytes).ok_or_else(limit_exceeded)? > byte_limit)
+                    || item_bytes
+                        .checked_add(bytes)
+                        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?
+                        > byte_limit)
             {
                 return ScanPage::continued(items, prefix.max_logical_key_bytes());
             }
-            item_bytes = item_bytes.checked_add(bytes).ok_or_else(limit_exceeded)?;
+            item_bytes = item_bytes
+                .checked_add(bytes)
+                .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
             items.push(ScanItem::new(
                 logical_key,
                 Bytes::copy_from_slice(value.value()),
@@ -524,13 +529,9 @@ async fn scan(
 
 fn validate_value(value: &[u8]) -> Result<()> {
     if value.len() > FDB_MAX_VALUE_BYTES {
-        return Err(limit_exceeded());
+        return Err(Error::new(ErrorKind::LimitExceeded));
     }
     Ok(())
-}
-
-fn limit_exceeded() -> Error {
-    Error::new(ErrorKind::LimitExceeded)
 }
 
 fn map_operation_error(error: FdbError) -> Error {
