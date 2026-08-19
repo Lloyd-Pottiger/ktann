@@ -400,6 +400,29 @@ fn decode_batch(
         .collect()
 }
 
+async fn get_logical<T: ReadOps>(
+    raw: &mut T,
+    binding: &LogicalBinding<'_>,
+    key: LogicalKey,
+) -> Result<Option<PersistentValue>> {
+    let encoded = encode_input_key(binding, &key)?;
+    let value = raw.get(encoded).await?;
+    decode_value(binding, &key, value)
+}
+
+async fn batch_get_logical<T: ReadOps>(
+    raw: &mut T,
+    binding: &LogicalBinding<'_>,
+    keys: Vec<LogicalKey>,
+) -> Result<Vec<Option<PersistentValue>>> {
+    let encoded = keys
+        .iter()
+        .map(|key| encode_input_key(binding, key))
+        .collect::<Result<Vec<_>>>()?;
+    let values = raw.batch_get(encoded).await?;
+    decode_batch(binding, &keys, values)
+}
+
 async fn scan_logical<T: ReadOps>(
     raw: &mut T,
     binding: &LogicalBinding<'_>,
@@ -552,9 +575,7 @@ impl<'manifest, T> ReadLogicalTxn<'manifest, T> {
 impl<T: ReadOps> ReadLogicalTxn<'_, T> {
     /// Reads one typed value, returning `None` when the key is absent.
     pub async fn get(&mut self, key: LogicalKey) -> Result<Option<PersistentValue>> {
-        let encoded = encode_input_key(&self.binding, &key)?;
-        let value = self.raw.get(encoded).await?;
-        decode_value(&self.binding, &key, value)
+        get_logical(&mut self.raw, &self.binding, key).await
     }
 
     /// Reads typed values in input order while preserving duplicates and gaps.
@@ -562,12 +583,7 @@ impl<T: ReadOps> ReadLogicalTxn<'_, T> {
         &mut self,
         keys: Vec<LogicalKey>,
     ) -> Result<Vec<Option<PersistentValue>>> {
-        let encoded = keys
-            .iter()
-            .map(|key| encode_input_key(&self.binding, key))
-            .collect::<Result<Vec<_>>>()?;
-        let values = self.raw.batch_get(encoded).await?;
-        decode_batch(&self.binding, &keys, values)
+        batch_get_logical(&mut self.raw, &self.binding, keys).await
     }
 
     /// Reads one Vector Record group from this transaction's snapshot.
@@ -1003,9 +1019,7 @@ impl<T> fmt::Debug for WriteLogicalTxn<'_, T> {
 impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
     /// Reads one typed value from the transaction snapshot and pending writes.
     pub async fn get(&mut self, key: LogicalKey) -> Result<Option<PersistentValue>> {
-        let encoded = encode_input_key(&self.binding, &key)?;
-        let value = self.raw.get(encoded).await?;
-        decode_value(&self.binding, &key, value)
+        get_logical(&mut self.raw, &self.binding, key).await
     }
 
     /// Reads typed values in input order from the transaction snapshot.
@@ -1013,12 +1027,7 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
         &mut self,
         keys: Vec<LogicalKey>,
     ) -> Result<Vec<Option<PersistentValue>>> {
-        let encoded = keys
-            .iter()
-            .map(|key| encode_input_key(&self.binding, key))
-            .collect::<Result<Vec<_>>>()?;
-        let values = self.raw.batch_get(encoded).await?;
-        decode_batch(&self.binding, &keys, values)
+        batch_get_logical(&mut self.raw, &self.binding, keys).await
     }
 
     /// Reads one typed value and establishes a point conflict on its key.

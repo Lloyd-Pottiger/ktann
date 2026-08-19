@@ -359,9 +359,10 @@ impl<'a> ValueCodec<'a> {
             ValueKind::PartitionCentroid => PersistentValue::PartitionCentroid(
                 authority::decode_partition_centroid(&mut decoder, self.require_manifest()?)?,
             ),
-            ValueKind::ChildEntry => {
-                PersistentValue::ChildEntry(entry::decode_child_entry(&mut decoder, self.manifest)?)
-            }
+            ValueKind::ChildEntry => PersistentValue::ChildEntry(entry::decode_child_entry(
+                &mut decoder,
+                self.require_manifest()?,
+            )?),
             ValueKind::LeafEntry => PersistentValue::LeafEntry(entry::decode_leaf_entry(
                 &mut decoder,
                 self.require_manifest()?,
