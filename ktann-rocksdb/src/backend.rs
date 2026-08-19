@@ -93,7 +93,7 @@ impl PhysicalPrefix {
 
     fn validate_key(&self, logical_key: &[u8]) -> Result<()> {
         if logical_key.len() > self.max_logical_key_bytes() {
-            return Err(limit_exceeded());
+            return Err(Error::new(ErrorKind::LimitExceeded));
         }
         Ok(())
     }
@@ -470,12 +470,12 @@ fn next_charge(
 ) -> Result<MutationCharge> {
     let next_count = current_count
         .checked_add(mutation_count)
-        .ok_or_else(limit_exceeded)?;
+        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
     let next_bytes = current_bytes
         .checked_add(mutation_bytes)
-        .ok_or_else(limit_exceeded)?;
+        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
     if next_count > DEFAULT_MAX_MUTATIONS || next_bytes > DEFAULT_MAX_MUTATION_BYTES {
-        return Err(limit_exceeded());
+        return Err(Error::new(ErrorKind::LimitExceeded));
     }
     Ok((next_count, next_bytes))
 }
@@ -535,7 +535,7 @@ impl WriteTxn for RocksDbWriteTxn<'_> {
 
     async fn batch_mutate(&mut self, mutations: Vec<Mutation>) -> Result<()> {
         if mutations.len() > DEFAULT_MAX_MUTATIONS {
-            return Err(limit_exceeded());
+            return Err(Error::new(ErrorKind::LimitExceeded));
         }
         let mut prepared = Vec::with_capacity(mutations.len());
         let mut charged_bytes = 0_usize;
@@ -547,11 +547,11 @@ impl WriteTxn for RocksDbWriteTxn<'_> {
             };
             charged_bytes = charged_bytes
                 .checked_add(mutation.charged_bytes()?)
-                .ok_or_else(limit_exceeded)?;
+                .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
             prepared.push(mutation);
         }
         if charged_bytes > DEFAULT_MAX_MUTATION_BYTES {
-            return Err(limit_exceeded());
+            return Err(Error::new(ErrorKind::LimitExceeded));
         }
         self.worker
             .request(|response| WriteCommand::ApplyBatch {
@@ -780,7 +780,7 @@ impl PreparedMutation {
             Self::Put { key, value } => key
                 .len()
                 .checked_add(value.len())
-                .ok_or_else(limit_exceeded),
+                .ok_or_else(|| Error::new(ErrorKind::LimitExceeded)),
             Self::Delete { key } => Ok(key.len()),
         }
     }
@@ -860,14 +860,19 @@ fn scan<D: DBAccess>(
         let bytes = logical_key
             .len()
             .checked_add(value.len())
-            .ok_or_else(limit_exceeded)?;
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
         if !items.is_empty()
             && (items.len() >= limits.item_limit
-                || item_bytes.checked_add(bytes).ok_or_else(limit_exceeded)? > byte_limit)
+                || item_bytes
+                    .checked_add(bytes)
+                    .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?
+                    > byte_limit)
         {
             return ScanPage::continued(items, prefix.max_logical_key_bytes());
         }
-        item_bytes = item_bytes.checked_add(bytes).ok_or_else(limit_exceeded)?;
+        item_bytes = item_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
         items.push(ScanItem::new(logical_key, Bytes::copy_from_slice(value)));
         iterator.next();
     }
@@ -877,13 +882,9 @@ fn scan<D: DBAccess>(
 
 fn validate_value(value: &[u8]) -> Result<()> {
     if value.len() > ROCKSDB_MAX_VALUE_BYTES {
-        return Err(limit_exceeded());
+        return Err(Error::new(ErrorKind::LimitExceeded));
     }
     Ok(())
-}
-
-fn limit_exceeded() -> Error {
-    Error::new(ErrorKind::LimitExceeded)
 }
 
 fn map_operation_error(error: RocksError) -> Error {
