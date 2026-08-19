@@ -57,7 +57,7 @@ const BODY_SCAN_LIMITS: ScanLimits = ScanLimits {
 };
 
 /// The search-body kind of a partition, derived from its Header level.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub(crate) enum PartitionKind {
     /// A level-one partition holding Leaf Entries.
     Leaf,
@@ -78,20 +78,38 @@ impl PartitionKind {
     }
 }
 
-/// The identity of one cached partition body.
+/// The identity of one cached partition body: one partition of one tree of one
+/// Logical Index, with the body kind derived from the snapshot Header.
 ///
 /// The kind is part of the key, so a partition whose level changed can never
 /// serve a body of the wrong kind.
 #[derive(Clone, Eq, Hash, PartialEq)]
-struct CacheKey {
+pub(crate) struct CacheKey {
     index: LogicalIndexId,
     tree_key: TreeKey,
     partition: PartitionKey,
     kind: PartitionKind,
 }
 
+impl CacheKey {
+    /// Creates the cache key for one partition body.
+    #[must_use]
+    pub(crate) const fn new(
+        index: LogicalIndexId,
+        tree_key: TreeKey,
+        partition: PartitionKey,
+        kind: PartitionKind,
+    ) -> Self {
+        Self {
+            index,
+            tree_key,
+            partition,
+            kind,
+        }
+    }
+}
+
 /// The decoded search body of one partition.
-#[derive(Clone, PartialEq)]
 pub(crate) enum BodyEntries {
     /// The decoded Leaf Entries of a leaf partition.
     Leaf(Box<[LeafEntry]>),
@@ -114,12 +132,6 @@ impl CachedBody {
     #[must_use]
     pub(crate) const fn epoch(&self) -> u64 {
         self.epoch
-    }
-
-    /// Returns the accounted decoded size in bytes.
-    #[must_use]
-    pub(crate) const fn bytes(&self) -> u64 {
-        self.bytes
     }
 
     /// Returns the decoded body entries.
@@ -162,7 +174,6 @@ struct CacheInner {
     queue_tick: u64,
     small_bytes: u64,
     main_bytes: u64,
-    total_bytes: u64,
 }
 
 struct CacheSlot {
@@ -200,14 +211,13 @@ impl PartitionCache {
                 queue_tick: 0,
                 small_bytes: 0,
                 main_bytes: 0,
-                total_bytes: 0,
             }),
         }
     }
 
     /// Returns the configured byte capacity.
-    #[must_use]
-    pub(crate) const fn capacity_bytes(&self) -> u64 {
+    #[cfg(test)]
+    fn capacity_bytes(&self) -> u64 {
         self.capacity_bytes
     }
 
@@ -217,21 +227,20 @@ impl PartitionCache {
     /// and reported as a miss. A cached newer epoch means the caller holds a
     /// historical snapshot: it misses without evicting the newer entry.
     #[must_use]
-    pub(crate) fn lookup(&self, key_parts: &CacheKeyParts, epoch: u64) -> Option<Arc<CachedBody>> {
-        let key = key_parts.key();
+    pub(crate) fn lookup(&self, key: &CacheKey, epoch: u64) -> Option<Arc<CachedBody>> {
         let mut inner = self.lock();
-        let cached_epoch = inner.slots.get(&key).map(|slot| slot.body.epoch);
-        match cached_epoch {
-            Some(cached) if cached == epoch => inner.slots.get_mut(&key).map(|slot| {
+        let stale = match inner.slots.get_mut(key) {
+            Some(slot) if slot.body.epoch == epoch => {
                 slot.frequency = (slot.frequency + 1).min(MAX_FREQUENCY);
-                Arc::clone(&slot.body)
-            }),
-            Some(cached) if cached < epoch => {
-                inner.remove(&key);
-                None
+                return Some(Arc::clone(&slot.body));
             }
-            Some(_) | None => None,
+            Some(slot) => slot.body.epoch < epoch,
+            None => false,
+        };
+        if stale {
+            inner.remove(key);
         }
+        None
     }
 
     /// Publishes a decoded body.
@@ -240,11 +249,10 @@ impl PartitionCache {
     /// strictly newer epoch is never downgraded by a racing fill; an equal or
     /// newer epoch replaces it. Installation evicts until the cache is within
     /// its byte capacity.
-    pub(crate) fn install(&self, key_parts: &CacheKeyParts, body: Arc<CachedBody>) {
+    pub(crate) fn install(&self, key: CacheKey, body: Arc<CachedBody>) {
         if body.bytes > self.capacity_bytes {
             return;
         }
-        let key = key_parts.key();
         let small_capacity_bytes = self.capacity_bytes / SMALL_QUEUE_DIVISOR;
         let mut inner = self.lock();
         if let Some(existing) = inner.slots.get(&key) {
@@ -267,7 +275,8 @@ impl PartitionCache {
     /// Returns the accounted bytes of all cached bodies.
     #[cfg(test)]
     fn total_bytes(&self) -> u64 {
-        self.lock().total_bytes
+        let inner = self.lock();
+        inner.small_bytes + inner.main_bytes
     }
 
     fn lock(&self) -> MutexGuard<'_, CacheInner> {
@@ -314,7 +323,6 @@ impl CacheInner {
         };
         let tick = self.next_queue_tick();
         let bytes = body.bytes;
-        self.total_bytes += bytes;
         match queue {
             QueueKind::Small => {
                 self.small_bytes += bytes;
@@ -344,7 +352,6 @@ impl CacheInner {
 
     fn remove(&mut self, key: &CacheKey) {
         if let Some(slot) = self.slots.remove(key) {
-            self.total_bytes -= slot.body.bytes;
             match slot.queue {
                 QueueKind::Small => self.small_bytes -= slot.body.bytes,
                 QueueKind::Main => self.main_bytes -= slot.body.bytes,
@@ -371,10 +378,10 @@ impl CacheInner {
     }
 
     fn evict_within_capacity(&mut self, capacity_bytes: u64, small_capacity_bytes: u64) {
-        while self.total_bytes > capacity_bytes {
+        while self.small_bytes + self.main_bytes > capacity_bytes {
             if self.small_bytes > small_capacity_bytes {
                 if let Some(key) = self.pop_live(QueueKind::Small) {
-                    self.evict_small_front(&key);
+                    self.evict_small_front(key);
                     continue;
                 }
             }
@@ -383,7 +390,7 @@ impl CacheInner {
                 continue;
             }
             if let Some(key) = self.pop_live(QueueKind::Small) {
-                self.evict_small_front(&key);
+                self.evict_small_front(key);
                 continue;
             }
             // Every accounted byte belongs to a live slot with one matching
@@ -395,34 +402,30 @@ impl CacheInner {
             self.ghost_order.clear();
             self.small_bytes = 0;
             self.main_bytes = 0;
-            self.total_bytes = 0;
             break;
         }
     }
 
     /// Evicts the small queue's front: entries that earned a hit graduate to
     /// the main queue with a reset counter; the rest leave to the ghost queue.
-    fn evict_small_front(&mut self, key: &CacheKey) {
-        let Some(slot) = self.slots.get(key) else {
+    fn evict_small_front(&mut self, key: CacheKey) {
+        let Some(slot) = self.slots.get(&key) else {
             return;
         };
         if slot.frequency > 0 {
             let bytes = slot.body.bytes;
             let tick = self.next_queue_tick();
-            if let Some(slot) = self.slots.get_mut(key) {
+            if let Some(slot) = self.slots.get_mut(&key) {
                 slot.frequency = 0;
                 slot.queue = QueueKind::Main;
                 slot.queue_tick = tick;
             }
             self.small_bytes -= bytes;
             self.main_bytes += bytes;
-            self.main.push_back(QueueRecord {
-                key: key.clone(),
-                tick,
-            });
+            self.main.push_back(QueueRecord { key, tick });
         } else {
-            self.remove(key);
-            self.ghost_insert(key.clone());
+            self.remove(&key);
+            self.ghost_insert(key);
         }
     }
 
@@ -447,8 +450,9 @@ impl CacheInner {
     /// Remembers a key evicted from the small queue, bounded relative to the
     /// live cache so the ghost queue cannot grow without limit.
     fn ghost_insert(&mut self, key: CacheKey) {
-        if self.ghost_set.insert(key.clone()) {
-            self.ghost_order.push_back(key);
+        if !self.ghost_set.contains(&key) {
+            self.ghost_order.push_back(key.clone());
+            self.ghost_set.insert(key);
         }
         let limit = self.slots.len().saturating_mul(2).saturating_add(1_024);
         while self.ghost_set.len() > limit {
@@ -466,8 +470,8 @@ impl CacheInner {
         {
             return;
         }
-        let mut small_records = Vec::new();
-        let mut main_records = Vec::new();
+        let mut small_records = Vec::with_capacity(self.slots.len());
+        let mut main_records = Vec::with_capacity(self.slots.len());
         for (key, slot) in &self.slots {
             let record = QueueRecord {
                 key: key.clone(),
@@ -482,43 +486,6 @@ impl CacheInner {
         main_records.sort_by_key(|record| record.tick);
         self.small = small_records.into_iter().collect();
         self.main = main_records.into_iter().collect();
-    }
-}
-
-/// The caller-visible parts of a cache key: one partition of one tree of one
-/// Logical Index, with the body kind derived from the snapshot Header.
-#[derive(Clone)]
-pub(crate) struct CacheKeyParts {
-    index: LogicalIndexId,
-    tree_key: TreeKey,
-    partition: PartitionKey,
-    kind: PartitionKind,
-}
-
-impl CacheKeyParts {
-    /// Creates the key parts for one partition body.
-    #[must_use]
-    pub(crate) const fn new(
-        index: LogicalIndexId,
-        tree_key: TreeKey,
-        partition: PartitionKey,
-        kind: PartitionKind,
-    ) -> Self {
-        Self {
-            index,
-            tree_key,
-            partition,
-            kind,
-        }
-    }
-
-    fn key(&self) -> CacheKey {
-        CacheKey {
-            index: self.index,
-            tree_key: self.tree_key.clone(),
-            partition: self.partition,
-            kind: self.kind,
-        }
     }
 }
 
@@ -541,8 +508,8 @@ pub(crate) async fn load_body<T: ReadOps>(
     let index = manifest.logical_index_id();
     let header = read_header(txn, index, tree_key, partition).await?;
     let kind = PartitionKind::from_level(header.level());
-    let key_parts = CacheKeyParts::new(index, tree_key.clone(), partition, kind);
-    if let Some(body) = cache.lookup(&key_parts, header.cache_epoch()) {
+    let key = CacheKey::new(index, tree_key.clone(), partition, kind);
+    if let Some(body) = cache.lookup(&key, header.cache_epoch()) {
         return Ok(body);
     }
 
@@ -557,20 +524,20 @@ pub(crate) async fn load_body<T: ReadOps>(
     let mut cursor: Option<LogicalScanCursor> = None;
     loop {
         let page = txn.scan(&range, cursor.as_ref(), BODY_SCAN_LIMITS).await?;
-        for item in page.items() {
-            match (kind, item.value()) {
+        cursor = page.next_cursor().cloned();
+        for item in page.into_items() {
+            match (kind, item.into_value()) {
                 (PartitionKind::Leaf, PersistentValue::LeafEntry(entry)) => {
-                    bytes = bytes.saturating_add(leaf_entry_bytes(entry));
-                    leaf_entries.push(entry.clone());
+                    bytes = bytes.saturating_add(leaf_entry_bytes(&entry));
+                    leaf_entries.push(entry);
                 }
                 (PartitionKind::Internal, PersistentValue::ChildEntry(entry)) => {
-                    bytes = bytes.saturating_add(child_entry_bytes(entry));
-                    child_entries.push(entry.clone());
+                    bytes = bytes.saturating_add(child_entry_bytes(&entry));
+                    child_entries.push(entry);
                 }
                 _ => return Err(corruption()),
             }
         }
-        cursor = page.into_next_cursor();
         if cursor.is_none() {
             break;
         }
@@ -596,7 +563,7 @@ pub(crate) async fn load_body<T: ReadOps>(
         bytes,
         entries,
     });
-    cache.install(&key_parts, Arc::clone(&body));
+    cache.install(key, Arc::clone(&body));
     Ok(body)
 }
 
@@ -640,7 +607,8 @@ fn field_bytes(field: &Value) -> u64 {
 /// The accounted decoded size of one Child Entry: the envelope, the Child
 /// Partition Key, and the full-f32 centroid.
 fn child_entry_bytes(entry: &ChildEntry) -> u64 {
-    (size_of::<ChildEntry>() as u64).saturating_add(4 * entry.centroid().len() as u64)
+    let centroid = entry.centroid().len() as u64 * size_of::<f32>() as u64;
+    (size_of::<ChildEntry>() as u64).saturating_add(centroid)
 }
 
 fn corruption() -> Error {
@@ -666,7 +634,7 @@ mod tests {
 
     use super::super::rabitq::RaBitQ7;
     use super::{
-        BodyEntries, CacheKeyParts, CachedBody, PartitionCache, PartitionKind, child_entry_bytes,
+        BodyEntries, CacheKey, CachedBody, PartitionCache, PartitionKind, child_entry_bytes,
         leaf_entry_bytes, load_body,
     };
 
@@ -695,8 +663,8 @@ mod tests {
         TreeKey::encode(&[], &[]).expect("empty Tree Key is canonical")
     }
 
-    fn parts(partition: u64, kind: PartitionKind) -> CacheKeyParts {
-        CacheKeyParts::new(index(), tree_key(), pk(partition), kind)
+    fn key(partition: u64, kind: PartitionKind) -> CacheKey {
+        CacheKey::new(index(), tree_key(), pk(partition), kind)
     }
 
     fn leaf_entry(id: &[u8]) -> LeafEntry {
@@ -750,8 +718,8 @@ mod tests {
     #[test]
     fn an_equal_epoch_is_a_hit() {
         let cache = PartitionCache::new(1 << 20);
-        let key = parts(1, PartitionKind::Leaf);
-        cache.install(&key, cached_leaf_body(5, &[b"a"]));
+        let key = key(1, PartitionKind::Leaf);
+        cache.install(key.clone(), cached_leaf_body(5, &[b"a"]));
 
         let hit = cache.lookup(&key, 5).expect("equal epoch hits");
         assert_eq!(hit.epoch(), 5);
@@ -762,8 +730,8 @@ mod tests {
     #[test]
     fn a_cached_older_epoch_misses_and_is_evicted() {
         let cache = PartitionCache::new(1 << 20);
-        let key = parts(1, PartitionKind::Leaf);
-        cache.install(&key, cached_leaf_body(5, &[b"a"]));
+        let key = key(1, PartitionKind::Leaf);
+        cache.install(key.clone(), cached_leaf_body(5, &[b"a"]));
 
         assert!(cache.lookup(&key, 6).is_none());
         // The stale entry was evicted, so its own epoch misses too.
@@ -775,8 +743,8 @@ mod tests {
     #[test]
     fn a_cached_newer_epoch_survives_a_historical_lookup() {
         let cache = PartitionCache::new(1 << 20);
-        let key = parts(1, PartitionKind::Leaf);
-        cache.install(&key, cached_leaf_body(6, &[b"a"]));
+        let key = key(1, PartitionKind::Leaf);
+        cache.install(key.clone(), cached_leaf_body(6, &[b"a"]));
 
         // A historical snapshot misses but must not evict the newer entry.
         assert!(cache.lookup(&key, 5).is_none());
@@ -787,9 +755,9 @@ mod tests {
     #[test]
     fn install_never_downgrades_a_newer_epoch() {
         let cache = PartitionCache::new(1 << 20);
-        let key = parts(1, PartitionKind::Leaf);
-        cache.install(&key, cached_leaf_body(6, &[b"new"]));
-        cache.install(&key, cached_leaf_body(5, &[b"old"]));
+        let key = key(1, PartitionKind::Leaf);
+        cache.install(key.clone(), cached_leaf_body(6, &[b"new"]));
+        cache.install(key.clone(), cached_leaf_body(5, &[b"old"]));
         assert_eq!(
             leaf_ids(&cache.lookup(&key, 6).expect("hit")),
             vec![Bytes::from_static(b"new")]
@@ -797,7 +765,7 @@ mod tests {
         assert!(cache.lookup(&key, 5).is_none());
 
         // A racing fill with an equal epoch may replace the entry.
-        cache.install(&key, cached_leaf_body(6, &[b"other"]));
+        cache.install(key.clone(), cached_leaf_body(6, &[b"other"]));
         assert_eq!(
             leaf_ids(&cache.lookup(&key, 6).expect("hit")),
             vec![Bytes::from_static(b"other")]
@@ -808,10 +776,10 @@ mod tests {
     #[test]
     fn kinds_do_not_share_entries() {
         let cache = PartitionCache::new(1 << 20);
-        let leaf = parts(1, PartitionKind::Leaf);
-        let internal = parts(1, PartitionKind::Internal);
-        cache.install(&leaf, cached_leaf_body(3, &[b"a"]));
-        cache.install(&internal, cached_internal_body(3, &[2, 3]));
+        let leaf = key(1, PartitionKind::Leaf);
+        let internal = key(1, PartitionKind::Internal);
+        cache.install(leaf.clone(), cached_leaf_body(3, &[b"a"]));
+        cache.install(internal.clone(), cached_internal_body(3, &[2, 3]));
 
         assert!(matches!(
             cache.lookup(&leaf, 3).expect("leaf hit").entries(),
@@ -825,19 +793,13 @@ mod tests {
     }
 
     #[test]
-    fn an_oversized_body_is_skipped() {
-        let body = cached_leaf_body(1, &[b"a"]);
-        let cache = PartitionCache::new(body.bytes() - 1);
-        let key = parts(1, PartitionKind::Leaf);
-        cache.install(&key, body);
+    fn zero_capacity_disables_caching() {
+        // Even an empty body is oversized for a zero-capacity cache.
+        let cache = PartitionCache::new(0);
+        let key = key(1, PartitionKind::Leaf);
+        cache.install(key.clone(), cached_leaf_body(1, &[]));
         assert_eq!(cache.len(), 0);
-        assert_eq!(cache.total_bytes(), 0);
         assert!(cache.lookup(&key, 1).is_none());
-
-        // A zero capacity disables caching entirely, even for empty bodies.
-        let disabled = PartitionCache::new(0);
-        disabled.install(&key, cached_leaf_body(1, &[]));
-        assert_eq!(disabled.len(), 0);
     }
 
     #[test]
@@ -853,8 +815,8 @@ mod tests {
             let partition = next() % 64 + 1;
             let epoch = round + 1;
             let id = [(next() % 26) as u8 + b'a'];
-            let key = parts(u64::from(partition), PartitionKind::Leaf);
-            cache.install(&key, cached_leaf_body(epoch, &[&id]));
+            let key = key(u64::from(partition), PartitionKind::Leaf);
+            cache.install(key.clone(), cached_leaf_body(epoch, &[&id]));
             assert!(cache.total_bytes() <= cache.capacity_bytes());
             // Every lookup that hits returns exactly the requested epoch.
             let query_epoch = u64::from(next()) % (epoch + 1);
@@ -881,13 +843,13 @@ mod tests {
                     state ^= state << 5;
                     let partition = u64::from(state % 4 + 1);
                     let epoch = u64::from(state % 8 + 1);
-                    let key = parts(partition, PartitionKind::Leaf);
+                    let key = key(partition, PartitionKind::Leaf);
                     if state % 2 == 0 {
                         if let Some(hit) = cache.lookup(&key, epoch) {
                             assert_eq!(hit.epoch(), epoch);
                         }
                     } else {
-                        cache.install(&key, cached_leaf_body(epoch, &[b"x"]));
+                        cache.install(key, cached_leaf_body(epoch, &[b"x"]));
                     }
                 }
             }));
@@ -898,7 +860,7 @@ mod tests {
         // Every remaining entry still validates against its own epoch.
         for partition in 1..=4_u64 {
             for epoch in 1..=8_u64 {
-                let key = parts(partition, PartitionKind::Leaf);
+                let key = key(partition, PartitionKind::Leaf);
                 if let Some(hit) = cache.lookup(&key, epoch) {
                     assert_eq!(hit.epoch(), epoch);
                 }
@@ -1066,8 +1028,8 @@ mod tests {
         assert_eq!(leaf_ids(&second), vec![Bytes::from_static(b"b")]);
 
         // The stale epoch-11 entry was evicted by the first lookup at epoch 12.
-        assert!(cache.lookup(&parts(1, PartitionKind::Leaf), 11).is_none());
-        assert!(cache.lookup(&parts(1, PartitionKind::Leaf), 12).is_some());
+        assert!(cache.lookup(&key(1, PartitionKind::Leaf), 11).is_none());
+        assert!(cache.lookup(&key(1, PartitionKind::Leaf), 12).is_some());
         assert_eq!(cache.len(), 1);
     }
 
