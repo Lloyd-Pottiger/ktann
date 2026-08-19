@@ -9,6 +9,7 @@
 
 pub mod backend;
 pub mod keys;
+pub mod membership;
 mod operations;
 mod tree_key;
 pub mod tree_manifest;
