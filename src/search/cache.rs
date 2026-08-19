@@ -548,7 +548,7 @@ pub(crate) async fn load_body<T: ReadOps>(
                     bytes = bytes.saturating_add(child_entry_bytes(&entry));
                     child_entries.push(entry);
                 }
-                _ => return Err(corruption()),
+                _ => return Err(Error::new(ErrorKind::Corruption)),
             }
         }
         if cursor.is_none() {
@@ -557,14 +557,14 @@ pub(crate) async fn load_body<T: ReadOps>(
     }
     let entry_count = leaf_entries.len() + child_entries.len();
     if entry_count != header.entry_count() as usize {
-        return Err(corruption());
+        return Err(Error::new(ErrorKind::Corruption));
     }
 
     // Recheck the same snapshot Header before publishing: the body is only
     // cacheable under the epoch it was decoded from.
     let rechecked = read_header(txn, index, tree_key, partition).await?;
     if rechecked != header {
-        return Err(corruption());
+        return Err(Error::new(ErrorKind::Corruption));
     }
 
     let entries = match kind {
@@ -593,7 +593,7 @@ async fn read_header<T: ReadOps>(
     };
     match txn.get(key).await? {
         Some(PersistentValue::PartitionHeader(header)) => Ok(header),
-        _ => Err(corruption()),
+        _ => Err(Error::new(ErrorKind::Corruption)),
     }
 }
 
@@ -622,10 +622,6 @@ fn field_bytes(field: &Value) -> u64 {
 fn child_entry_bytes(entry: &ChildEntry) -> u64 {
     let centroid = entry.centroid().len() as u64 * size_of::<f32>() as u64;
     (size_of::<ChildEntry>() as u64).saturating_add(centroid)
-}
-
-fn corruption() -> Error {
-    Error::new(ErrorKind::Corruption)
 }
 
 #[cfg(test)]

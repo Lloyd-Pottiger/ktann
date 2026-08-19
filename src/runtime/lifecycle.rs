@@ -98,13 +98,13 @@ pub(crate) async fn create_index<B: Backend>(
         let allocator = match txn.get_for_update(LogicalKey::IndexIdAllocator).await? {
             None => IndexIdAllocator::new(0),
             Some(PersistentValue::IndexIdAllocator(allocator)) => allocator,
-            Some(_) => return Err(corruption()),
+            Some(_) => return Err(Error::new(ErrorKind::Corruption)),
         };
         let name_key = LogicalKey::IndexNameDirectory(name.clone());
         let existing = txn.get_for_update(name_key.clone()).await?;
         if let Some(existing) = existing {
             let PersistentValue::IndexNameEntry(entry) = existing else {
-                return Err(corruption());
+                return Err(Error::new(ErrorKind::Corruption));
             };
             let manifest = read_manifest_for_update(&mut txn, entry.logical_index_id()).await?;
             txn.rollback().await;
@@ -173,7 +173,7 @@ async fn recover_create<B: Backend>(
         return Err(Error::new(ErrorKind::CommitOutcomeUnknown));
     };
     let PersistentValue::IndexNameEntry(entry) = existing else {
-        return Err(corruption());
+        return Err(Error::new(ErrorKind::Corruption));
     };
     let manifest = read_manifest(&mut txn, entry.logical_index_id()).await?;
     classify_existing(manifest, config)
@@ -201,7 +201,7 @@ pub(crate) async fn open_index<B: Backend>(
         return Err(Error::new(ErrorKind::IndexNotFound));
     };
     let PersistentValue::IndexNameEntry(entry) = existing else {
-        return Err(corruption());
+        return Err(Error::new(ErrorKind::Corruption));
     };
     let manifest = read_manifest(&mut txn, entry.logical_index_id()).await?;
     match manifest.lifecycle() {
@@ -244,7 +244,7 @@ pub(crate) async fn drop_index<B: Backend>(
             return Ok(());
         };
         let PersistentValue::IndexNameEntry(entry) = existing else {
-            return Err(corruption());
+            return Err(Error::new(ErrorKind::Corruption));
         };
         let manifest = read_manifest_for_update(&mut txn, entry.logical_index_id()).await?;
         match manifest.lifecycle() {
@@ -290,14 +290,14 @@ pub(crate) async fn drop_index<B: Backend>(
             return Ok(());
         };
         let PersistentValue::IndexNameEntry(entry) = existing else {
-            return Err(corruption());
+            return Err(Error::new(ErrorKind::Corruption));
         };
         let current = read_manifest_for_update(&mut txn, entry.logical_index_id()).await?;
         if current.lifecycle() != IndexLifecycle::Dropping {
-            return Err(corruption());
+            return Err(Error::new(ErrorKind::Corruption));
         }
         if current.logical_index_id() != manifest.logical_index_id() {
-            return Err(corruption());
+            return Err(Error::new(ErrorKind::Corruption));
         }
 
         let step =
@@ -432,7 +432,7 @@ async fn recover_drop_after_unknown<B: Backend>(backend: &B, name_key: &LogicalK
         return Ok(());
     };
     let PersistentValue::IndexNameEntry(entry) = existing else {
-        return Err(corruption());
+        return Err(Error::new(ErrorKind::Corruption));
     };
     let _ = read_manifest(&mut txn, entry.logical_index_id()).await?;
     Err(Error::new(ErrorKind::CommitOutcomeUnknown))
@@ -452,8 +452,8 @@ async fn read_manifest<T: crate::storage::backend::ReadOps>(
 ) -> Result<IndexManifest> {
     match txn.get(LogicalKey::Manifest(logical_index_id)).await? {
         Some(PersistentValue::IndexManifest(manifest)) => Ok(manifest),
-        Some(_) => Err(corruption()),
-        None => Err(corruption()),
+        Some(_) => Err(Error::new(ErrorKind::Corruption)),
+        None => Err(Error::new(ErrorKind::Corruption)),
     }
 }
 
@@ -466,8 +466,8 @@ async fn read_manifest_for_update<T: WriteTxn>(
         .await?
     {
         Some(PersistentValue::IndexManifest(manifest)) => Ok(manifest),
-        Some(_) => Err(corruption()),
-        None => Err(corruption()),
+        Some(_) => Err(Error::new(ErrorKind::Corruption)),
+        None => Err(Error::new(ErrorKind::Corruption)),
     }
 }
 
@@ -489,10 +489,6 @@ fn derive_rotation_seed(logical_index_id: LogicalIndexId) -> [u8; 32] {
     seed[..16].copy_from_slice(&first.to_le_bytes());
     seed[16..].copy_from_slice(&second.to_le_bytes());
     seed
-}
-
-fn corruption() -> Error {
-    Error::new(ErrorKind::Corruption)
 }
 
 fn id_exhausted() -> Error {

@@ -198,7 +198,7 @@ pub(crate) async fn exact_rerank<T: ReadOps>(
     let mut seen = BTreeSet::new();
     for candidate in &candidates {
         if !seen.insert(candidate.record_id.as_ref()) {
-            return Err(corruption());
+            return Err(Error::new(ErrorKind::Corruption));
         }
     }
 
@@ -215,13 +215,13 @@ pub(crate) async fn exact_rerank<T: ReadOps>(
             .collect();
         let groups = txn.read_record_groups(ids, false).await?;
         for (candidate, group) in batch.iter().zip(groups) {
-            let group = group.ok_or_else(corruption)?;
+            let group = group.ok_or_else(|| Error::new(ErrorKind::Corruption))?;
             let record = group.record();
             if record.record_id() != candidate.record_id()
                 || group.location() != candidate.location()
                 || record.fields() != candidate.fields()
             {
-                return Err(corruption());
+                return Err(Error::new(ErrorKind::Corruption));
             }
             let distance = kernel.exact_distance(query, record.vector())?;
             scored.push((candidate.record_id.clone(), distance));
@@ -238,7 +238,10 @@ pub(crate) async fn exact_rerank<T: ReadOps>(
         // The persistent codecs bound Record ID length and the kernel
         // guarantees a finite distance, so construction can only fail on
         // corrupted persistent state.
-        hits.push(SearchHit::new(id, distance.distance()).map_err(|_| corruption())?);
+        hits.push(
+            SearchHit::new(id, distance.distance())
+                .map_err(|_| Error::new(ErrorKind::Corruption))?,
+        );
     }
 
     Ok(ExactRerankOutcome {
@@ -247,10 +250,6 @@ pub(crate) async fn exact_rerank<T: ReadOps>(
             .map_err(|_| Error::new(ErrorKind::LimitExceeded))?,
         exact_rerank_budget_exhausted: exhausted,
     })
-}
-
-fn corruption() -> Error {
-    Error::new(ErrorKind::Corruption)
 }
 
 #[cfg(test)]

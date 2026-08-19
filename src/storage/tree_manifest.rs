@@ -191,7 +191,7 @@ pub async fn reserve_partition_keys<T: WriteTxn>(
 fn expect_manifest(value: Option<PersistentValue>) -> Result<Option<TreeManifest>> {
     match value {
         Some(PersistentValue::TreeManifest(manifest)) => Ok(Some(manifest)),
-        Some(_) => Err(corruption()),
+        Some(_) => Err(Error::new(ErrorKind::Corruption)),
         None => Ok(None),
     }
 }
@@ -209,9 +209,5 @@ fn tree_manifest_key_for(manifest: &IndexManifest, tree_key: &TreeKey) -> Result
 /// The reservation arithmetic above guarantees `1..=u64::MAX`; a violation is
 /// an internal error, reported fail-closed.
 fn partition_key(value: u64) -> Result<PartitionKey> {
-    PartitionKey::new(value).map_err(|_| corruption())
-}
-
-fn corruption() -> Error {
-    Error::new(ErrorKind::Corruption)
+    PartitionKey::new(value).map_err(|_| Error::new(ErrorKind::Corruption))
 }

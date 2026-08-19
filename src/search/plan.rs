@@ -117,7 +117,9 @@ impl TreeKeyPlan {
         }
         let values = tree_key.values(&self.types)?;
         for check in &self.checks {
-            let value = values.get(check.ordinal).ok_or_else(corruption)?;
+            let value = values
+                .get(check.ordinal)
+                .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
             if !check.contains(value)? {
                 return Ok(false);
             }
@@ -270,10 +272,10 @@ pub(crate) async fn enumerate_tree_keys<T: ReadOps>(
                 .await?;
             for item in page.items() {
                 let LogicalKey::TreeManifest { tree_key, .. } = item.key() else {
-                    return Err(corruption());
+                    return Err(Error::new(ErrorKind::Corruption));
                 };
                 let PersistentValue::TreeManifest(tree_manifest) = item.value() else {
-                    return Err(corruption());
+                    return Err(Error::new(ErrorKind::Corruption));
                 };
                 // A conforming backend never exceeds the requested item bound,
                 // so this underflow means the scan contract was violated.
@@ -881,7 +883,9 @@ fn next_string(value: &str, max_len: usize) -> Result<Option<String>> {
                 next.extend_from_slice(&bytes[..k]);
                 next.push(candidate);
                 next.extend_from_slice(tail);
-                return String::from_utf8(next).map(Some).map_err(|_| corruption());
+                return String::from_utf8(next)
+                    .map(Some)
+                    .map_err(|_| Error::new(ErrorKind::Corruption));
             }
         }
     }
@@ -972,10 +976,6 @@ fn check_typed(ty: DataType, value: &Value) -> Result<()> {
     } else {
         Err(Error::invalid_argument())
     }
-}
-
-fn corruption() -> Error {
-    Error::new(ErrorKind::Corruption)
 }
 
 #[cfg(test)]

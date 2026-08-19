@@ -680,7 +680,7 @@ impl<T: ReadOps> ReadLogicalTxn<'_, T> {
                     let payload = match payload {
                         Some(PersistentValue::OpaquePayload(payload)) => Some(payload),
                         None => None,
-                        Some(_) => return Err(corruption()),
+                        Some(_) => return Err(Error::new(ErrorKind::Corruption)),
                     };
                     Some(RecordGroupRead {
                         record,
@@ -688,7 +688,7 @@ impl<T: ReadOps> ReadLogicalTxn<'_, T> {
                         payload,
                     })
                 }
-                _ => return Err(corruption()),
+                _ => return Err(Error::new(ErrorKind::Corruption)),
             });
         }
         Ok(groups)
@@ -885,10 +885,6 @@ fn check_budget(budget: AdmissionBudget, size: TransactionSize) -> Result<()> {
     } else {
         Ok(())
     }
-}
-
-fn corruption() -> Error {
-    Error::new(ErrorKind::Corruption)
 }
 
 /// A write transaction that exposes typed logical reads and mutations.
