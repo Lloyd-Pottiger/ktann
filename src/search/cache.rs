@@ -35,7 +35,7 @@
     )
 )]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::api::{Error, ErrorKind, LogicalIndexId, PartitionKey, Result, Value};
@@ -130,26 +130,55 @@ impl CachedBody {
 }
 
 /// A byte-bounded process-shared cache of decoded partition search bodies.
+///
+/// The eviction policy is S3-FIFO: a probationary small FIFO queue holding one
+/// tenth of the byte capacity, a main FIFO queue giving second chances through
+/// 2-bit frequency counters, and a non-resident ghost queue of keys evicted
+/// from the small queue. A hit only increments a saturating frequency counter
+/// and never touches a queue, keeping the locked section short. The policy is
+/// an internal benchmark-tunable detail, not a persistent or public
+/// compatibility contract.
 pub(crate) struct PartitionCache {
     capacity_bytes: u64,
     inner: Mutex<CacheInner>,
 }
 
+/// The small queue's divisor of the byte capacity.
+const SMALL_QUEUE_DIVISOR: u64 = 10;
+
+/// The maximum value of a slot's frequency counter.
+const MAX_FREQUENCY: u8 = 3;
+
 struct CacheInner {
     slots: HashMap<CacheKey, CacheSlot>,
-    /// The lazy LRU access log: one record per lookup hit or install, matched
-    /// to its slot by tick. Stale records are skipped on eviction.
-    access: VecDeque<AccessRecord>,
-    tick: u64,
+    /// The probationary small FIFO queue: one record per enqueue, matched to
+    /// its slot by tick. Stale records are skipped on eviction.
+    small: VecDeque<QueueRecord>,
+    /// The main FIFO queue, reinserting entries that spent a second chance.
+    main: VecDeque<QueueRecord>,
+    /// The non-resident ghost queue of keys evicted from the small queue.
+    ghost_set: HashSet<CacheKey>,
+    ghost_order: VecDeque<CacheKey>,
+    queue_tick: u64,
+    small_bytes: u64,
+    main_bytes: u64,
     total_bytes: u64,
 }
 
 struct CacheSlot {
     body: Arc<CachedBody>,
-    tick: u64,
+    frequency: u8,
+    queue: QueueKind,
+    queue_tick: u64,
 }
 
-struct AccessRecord {
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum QueueKind {
+    Small,
+    Main,
+}
+
+struct QueueRecord {
     key: CacheKey,
     tick: u64,
 }
@@ -164,8 +193,13 @@ impl PartitionCache {
             capacity_bytes,
             inner: Mutex::new(CacheInner {
                 slots: HashMap::new(),
-                access: VecDeque::new(),
-                tick: 0,
+                small: VecDeque::new(),
+                main: VecDeque::new(),
+                ghost_set: HashSet::new(),
+                ghost_order: VecDeque::new(),
+                queue_tick: 0,
+                small_bytes: 0,
+                main_bytes: 0,
                 total_bytes: 0,
             }),
         }
@@ -188,10 +222,10 @@ impl PartitionCache {
         let mut inner = self.lock();
         let cached_epoch = inner.slots.get(&key).map(|slot| slot.body.epoch);
         match cached_epoch {
-            Some(cached) if cached == epoch => {
-                inner.touch(&key);
-                inner.slots.get(&key).map(|slot| Arc::clone(&slot.body))
-            }
+            Some(cached) if cached == epoch => inner.slots.get_mut(&key).map(|slot| {
+                slot.frequency = (slot.frequency + 1).min(MAX_FREQUENCY);
+                Arc::clone(&slot.body)
+            }),
             Some(cached) if cached < epoch => {
                 inner.remove(&key);
                 None
@@ -211,6 +245,7 @@ impl PartitionCache {
             return;
         }
         let key = key_parts.key();
+        let small_capacity_bytes = self.capacity_bytes / SMALL_QUEUE_DIVISOR;
         let mut inner = self.lock();
         if let Some(existing) = inner.slots.get(&key) {
             if existing.body.epoch > body.epoch {
@@ -218,12 +253,9 @@ impl PartitionCache {
             }
             inner.remove(&key);
         }
-        let tick = inner.next_tick();
-        inner.total_bytes += body.bytes;
-        inner.slots.insert(key.clone(), CacheSlot { body, tick });
-        inner.access.push_back(AccessRecord { key, tick });
-        inner.evict_within_capacity(self.capacity_bytes);
-        inner.compact_access_log();
+        inner.insert(key, body, small_capacity_bytes);
+        inner.evict_within_capacity(self.capacity_bytes, small_capacity_bytes);
+        inner.compact_queues();
     }
 
     /// Returns the number of cached bodies.
@@ -247,73 +279,209 @@ impl PartitionCache {
 }
 
 impl CacheInner {
-    fn next_tick(&mut self) -> u64 {
-        if self.tick == u64::MAX {
-            // Renumber from an empty access log; every live slot restarts at
-            // tick zero so ticks stay unique within the new numbering.
-            self.access.clear();
-            for slot in self.slots.values_mut() {
-                slot.tick = 0;
+    fn next_queue_tick(&mut self) -> u64 {
+        if self.queue_tick == u64::MAX {
+            // Renumber: rebuild both queues so every live slot keeps exactly
+            // one matching record and ticks stay unique within the new
+            // numbering.
+            self.small.clear();
+            self.main.clear();
+            self.queue_tick = 0;
+            let keys: Vec<CacheKey> = self.slots.keys().cloned().collect();
+            for key in keys {
+                self.queue_tick += 1;
+                let tick = self.queue_tick;
+                if let Some(slot) = self.slots.get_mut(&key) {
+                    slot.queue_tick = tick;
+                    match slot.queue {
+                        QueueKind::Small => self.small.push_back(QueueRecord { key, tick }),
+                        QueueKind::Main => self.main.push_back(QueueRecord { key, tick }),
+                    }
+                }
             }
-            self.tick = 0;
         }
-        self.tick += 1;
-        self.tick
+        self.queue_tick += 1;
+        self.queue_tick
     }
 
-    fn touch(&mut self, key: &CacheKey) {
-        let tick = self.next_tick();
-        if let Some(slot) = self.slots.get_mut(key) {
-            slot.tick = tick;
+    fn insert(&mut self, key: CacheKey, body: Arc<CachedBody>, small_capacity_bytes: u64) {
+        // Ghost hits and bodies too large for the small queue enter the main
+        // queue directly; everything else starts in the small queue.
+        let queue = if self.ghost_set.remove(&key) || body.bytes > small_capacity_bytes {
+            QueueKind::Main
+        } else {
+            QueueKind::Small
+        };
+        let tick = self.next_queue_tick();
+        let bytes = body.bytes;
+        self.total_bytes += bytes;
+        match queue {
+            QueueKind::Small => {
+                self.small_bytes += bytes;
+                self.small.push_back(QueueRecord {
+                    key: key.clone(),
+                    tick,
+                });
+            }
+            QueueKind::Main => {
+                self.main_bytes += bytes;
+                self.main.push_back(QueueRecord {
+                    key: key.clone(),
+                    tick,
+                });
+            }
         }
-        self.access.push_back(AccessRecord {
-            key: key.clone(),
-            tick,
-        });
-        self.compact_access_log();
+        self.slots.insert(
+            key,
+            CacheSlot {
+                body,
+                frequency: 0,
+                queue,
+                queue_tick: tick,
+            },
+        );
     }
 
     fn remove(&mut self, key: &CacheKey) {
         if let Some(slot) = self.slots.remove(key) {
             self.total_bytes -= slot.body.bytes;
-        }
-    }
-
-    fn evict_within_capacity(&mut self, capacity_bytes: u64) {
-        while self.total_bytes > capacity_bytes {
-            let Some(record) = self.access.pop_front() else {
-                // Every live slot has exactly one matching access record, so a
-                // live over-capacity cache never reaches this guard.
-                debug_assert!(self.slots.is_empty());
-                self.slots.clear();
-                self.total_bytes = 0;
-                break;
-            };
-            if self
-                .slots
-                .get(&record.key)
-                .is_some_and(|slot| slot.tick == record.tick)
-            {
-                self.remove(&record.key);
+            match slot.queue {
+                QueueKind::Small => self.small_bytes -= slot.body.bytes,
+                QueueKind::Main => self.main_bytes -= slot.body.bytes,
             }
         }
     }
 
-    /// Rebuilds the access log when stale records dominate it.
-    fn compact_access_log(&mut self) {
-        if self.access.len() <= self.slots.len().saturating_mul(2).saturating_add(64) {
+    /// Pops the oldest live record of one queue, skipping stale records.
+    fn pop_live(&mut self, queue: QueueKind) -> Option<CacheKey> {
+        let records = match queue {
+            QueueKind::Small => &mut self.small,
+            QueueKind::Main => &mut self.main,
+        };
+        while let Some(record) = records.pop_front() {
+            let live = self
+                .slots
+                .get(&record.key)
+                .is_some_and(|slot| slot.queue == queue && slot.queue_tick == record.tick);
+            if live {
+                return Some(record.key);
+            }
+        }
+        None
+    }
+
+    fn evict_within_capacity(&mut self, capacity_bytes: u64, small_capacity_bytes: u64) {
+        while self.total_bytes > capacity_bytes {
+            if self.small_bytes > small_capacity_bytes {
+                if let Some(key) = self.pop_live(QueueKind::Small) {
+                    self.evict_small_front(&key);
+                    continue;
+                }
+            }
+            if let Some(key) = self.pop_live(QueueKind::Main) {
+                self.evict_main_front(key);
+                continue;
+            }
+            if let Some(key) = self.pop_live(QueueKind::Small) {
+                self.evict_small_front(&key);
+                continue;
+            }
+            // Every accounted byte belongs to a live slot with one matching
+            // queue record, so an over-capacity cache never reaches this
+            // guard.
+            debug_assert!(self.slots.is_empty());
+            self.slots.clear();
+            self.ghost_set.clear();
+            self.ghost_order.clear();
+            self.small_bytes = 0;
+            self.main_bytes = 0;
+            self.total_bytes = 0;
+            break;
+        }
+    }
+
+    /// Evicts the small queue's front: entries that earned a hit graduate to
+    /// the main queue with a reset counter; the rest leave to the ghost queue.
+    fn evict_small_front(&mut self, key: &CacheKey) {
+        let Some(slot) = self.slots.get(key) else {
+            return;
+        };
+        if slot.frequency > 0 {
+            let bytes = slot.body.bytes;
+            let tick = self.next_queue_tick();
+            if let Some(slot) = self.slots.get_mut(key) {
+                slot.frequency = 0;
+                slot.queue = QueueKind::Main;
+                slot.queue_tick = tick;
+            }
+            self.small_bytes -= bytes;
+            self.main_bytes += bytes;
+            self.main.push_back(QueueRecord {
+                key: key.clone(),
+                tick,
+            });
+        } else {
+            self.remove(key);
+            self.ghost_insert(key.clone());
+        }
+    }
+
+    /// Gives the main queue's front a second chance per frequency mark, or
+    /// evicts it once the marks are spent.
+    fn evict_main_front(&mut self, key: CacheKey) {
+        let Some(slot) = self.slots.get(&key) else {
+            return;
+        };
+        if slot.frequency > 0 {
+            let tick = self.next_queue_tick();
+            if let Some(slot) = self.slots.get_mut(&key) {
+                slot.frequency -= 1;
+                slot.queue_tick = tick;
+            }
+            self.main.push_back(QueueRecord { key, tick });
+        } else {
+            self.remove(&key);
+        }
+    }
+
+    /// Remembers a key evicted from the small queue, bounded relative to the
+    /// live cache so the ghost queue cannot grow without limit.
+    fn ghost_insert(&mut self, key: CacheKey) {
+        if self.ghost_set.insert(key.clone()) {
+            self.ghost_order.push_back(key);
+        }
+        let limit = self.slots.len().saturating_mul(2).saturating_add(1_024);
+        while self.ghost_set.len() > limit {
+            let Some(front) = self.ghost_order.pop_front() else {
+                break;
+            };
+            self.ghost_set.remove(&front);
+        }
+    }
+
+    /// Rebuilds both queues when stale records dominate them.
+    fn compact_queues(&mut self) {
+        if self.small.len() + self.main.len()
+            <= self.slots.len().saturating_mul(2).saturating_add(64)
+        {
             return;
         }
-        let mut records: Vec<AccessRecord> = self
-            .slots
-            .iter()
-            .map(|(key, slot)| AccessRecord {
+        let mut small_records = Vec::new();
+        let mut main_records = Vec::new();
+        for (key, slot) in &self.slots {
+            let record = QueueRecord {
                 key: key.clone(),
-                tick: slot.tick,
-            })
-            .collect();
-        records.sort_by_key(|record| record.tick);
-        self.access = records.into_iter().collect();
+                tick: slot.queue_tick,
+            };
+            match slot.queue {
+                QueueKind::Small => small_records.push(record),
+                QueueKind::Main => main_records.push(record),
+            }
+        }
+        small_records.sort_by_key(|record| record.tick);
+        main_records.sort_by_key(|record| record.tick);
+        self.small = small_records.into_iter().collect();
+        self.main = main_records.into_iter().collect();
     }
 }
 
