@@ -16,6 +16,7 @@ use crate::api::{
 use crate::search::cache::PartitionCache;
 use crate::storage::backend::{Backend, CommitCancellation, CommitStart};
 
+pub(crate) mod import;
 pub(crate) mod lifecycle;
 pub(crate) mod reads;
 
@@ -489,6 +490,11 @@ impl<B: Backend> RuntimeInner<B> {
 
     fn phase(&self) -> Phase {
         self.lock_lifecycle().phase
+    }
+
+    /// Returns whether the Runtime still admits new foreground and import work.
+    pub(crate) fn is_accepting(&self) -> bool {
+        self.phase() == Phase::Accepting
     }
 
     /// Returns the validated process-local configuration.
