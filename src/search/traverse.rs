@@ -332,10 +332,7 @@ impl Traversal {
         txn: &mut ReadLogicalTxn<'_, T>,
         context: &VisitContext<'_>,
     ) -> Result<()> {
-        loop {
-            let Some(&Reverse(entry)) = self.frontier.peek() else {
-                break;
-            };
+        while let Some(&Reverse(entry)) = self.frontier.peek() {
             // Stop before unfunded work: the peeked entry is beam-admitted or
             // topology-mandated, so it is eligible work the depleted Partition
             // budget would prevent.
