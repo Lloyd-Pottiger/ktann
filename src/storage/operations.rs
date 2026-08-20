@@ -218,6 +218,12 @@ impl LogicalScanItem {
     pub const fn value(&self) -> &PersistentValue {
         &self.value
     }
+
+    /// Consumes the item and returns the owned decoded persistent value.
+    #[must_use]
+    pub fn into_value(self) -> PersistentValue {
+        self.value
+    }
 }
 
 impl fmt::Debug for LogicalScanItem {
@@ -254,6 +260,12 @@ impl LogicalScanPage {
     #[must_use]
     pub fn into_next_cursor(self) -> Option<LogicalScanCursor> {
         self.next_cursor
+    }
+
+    /// Consumes the page and returns its owned items and continuation.
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<LogicalScanItem>, Option<LogicalScanCursor>) {
+        (self.items, self.next_cursor)
     }
 }
 
