@@ -20,12 +20,14 @@ use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use ktann::api::{Error, ErrorKind, Result};
+use ktann::api::{Error, ErrorKind, LogicalIndexId, Result};
+use ktann::storage::ReadLogicalTxn;
 use ktann::storage::backend::{
     AdmissionBudget, Backend, Capabilities, CommitStart, HardLimits, InsertOutcome, Mutation,
     ReadOps, ReadTxn, ScanItem, ScanLimits, ScanPage, WriteTxn,
 };
-use ktann::storage::keys::KeyRange;
+use ktann::storage::keys::{KeyRange, LogicalKey};
+use ktann::storage::values::{IndexManifest, PersistentValue};
 
 /// A committed keyspace snapshot mapping encoded keys to values.
 type Keyspace = BTreeMap<Vec<u8>, Vec<u8>>;
@@ -1283,5 +1285,69 @@ impl Rng {
     /// Returns the next word modulo `bound`.
     pub fn below(&mut self, bound: u64) -> u64 {
         self.next() % bound
+    }
+}
+
+/// A shareable [`DeterministicBackend`] handle: the Runtime under test and the
+/// test's own inspection transactions drive the same backend.
+#[derive(Clone)]
+pub struct SharedBackend {
+    inner: Arc<DeterministicBackend>,
+}
+
+impl SharedBackend {
+    /// Wraps one deterministic backend.
+    pub fn new(inner: DeterministicBackend) -> Self {
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    /// The shared inner backend, for fault injection and inspection.
+    pub fn inner(&self) -> &Arc<DeterministicBackend> {
+        &self.inner
+    }
+}
+
+impl Backend for SharedBackend {
+    type ReadTxn<'backend> = DeterministicReadTxn<'backend>;
+    type WriteTxn<'backend> = DeterministicWriteTxn<'backend>;
+
+    fn hard_limits(&self) -> HardLimits {
+        self.inner.hard_limits()
+    }
+
+    fn admission_budget(&self) -> AdmissionBudget {
+        self.inner.admission_budget()
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+
+    async fn shutdown(&self) {
+        self.inner.shutdown().await;
+    }
+
+    async fn begin_read(&self) -> Result<Self::ReadTxn<'_>> {
+        self.inner.begin_read().await
+    }
+
+    async fn begin_write(&self) -> Result<Self::WriteTxn<'_>> {
+        self.inner.begin_write().await
+    }
+}
+
+/// Reads the persisted Index Manifest of one Logical Index.
+pub async fn read_manifest(backend: &SharedBackend, index: LogicalIndexId) -> IndexManifest {
+    let raw = backend.begin_read().await.expect("begin read");
+    let mut txn = ReadLogicalTxn::bootstrap(raw);
+    match txn
+        .get(LogicalKey::Manifest(index))
+        .await
+        .expect("read manifest")
+    {
+        Some(PersistentValue::IndexManifest(manifest)) => manifest,
+        _ => panic!("manifest must exist"),
     }
 }

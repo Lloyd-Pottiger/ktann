@@ -962,7 +962,7 @@ async fn seed_grown_tree(backend: &SharedBackend, manifest: &IndexManifest, buck
     tree_manifest::create_tree(&mut txn, &key, 0)
         .await
         .expect("create tree");
-    let header = |level, partition| {
+    let header = |level, count, partition| {
         (
             LogicalKey::Header {
                 index,
@@ -970,7 +970,7 @@ async fn seed_grown_tree(backend: &SharedBackend, manifest: &IndexManifest, buck
                 partition,
             },
             PersistentValue::PartitionHeader(
-                PartitionHeader::new(level, 0, 0, PartitionState::Ready).expect("header"),
+                PartitionHeader::new(level, count, 0, PartitionState::Ready).expect("header"),
             ),
         )
     };
@@ -996,9 +996,9 @@ async fn seed_grown_tree(backend: &SharedBackend, manifest: &IndexManifest, buck
         )
     };
     for (key, value) in [
-        header(2, pk(1)),
-        header(1, pk(2)),
-        header(1, pk(3)),
+        header(2, 2, pk(1)),
+        header(1, 0, pk(2)),
+        header(1, 0, pk(3)),
         edge(pk(2), 0.0),
         edge(pk(3), 10.0),
         synopsis(pk(2)),

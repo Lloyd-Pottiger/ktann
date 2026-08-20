@@ -13,10 +13,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use crate::api::{Error, ErrorKind, PayloadProjection, Result, StoredRecord};
-use crate::storage::backend::{Backend, ReadOps};
+use crate::storage::backend::{Backend, ReadOps, WriteTxn};
 use crate::storage::keys::LogicalKey;
 use crate::storage::values::{IndexLifecycle, IndexManifest, PersistentValue};
-use crate::storage::{ReadLogicalTxn, RecordGroupRead};
+use crate::storage::{ReadLogicalTxn, RecordGroupRead, WriteLogicalTxn};
 
 use super::OperationContext;
 
@@ -68,6 +68,23 @@ async fn validate_manifest<T: ReadOps>(
 ) -> Result<IndexManifest> {
     opened_manifest(
         txn.get(LogicalKey::Manifest(handle.logical_index_id()))
+            .await?,
+        handle,
+    )
+}
+
+/// Validates the persisted Manifest of the opened handle, with update
+/// protection on the Manifest key.
+///
+/// The conflict aborts the transaction if a concurrent drop transition
+/// commits, so neither a Foreground Mutation nor a Structure Maintenance step
+/// commits into a Logical Index whose deletion has begun.
+pub(crate) async fn validated_active_manifest<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    handle: &IndexManifest,
+) -> Result<IndexManifest> {
+    opened_manifest(
+        txn.get_for_update(LogicalKey::Manifest(handle.logical_index_id()))
             .await?,
         handle,
     )

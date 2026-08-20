@@ -21,6 +21,8 @@ pub(crate) mod lifecycle;
 pub(crate) mod reads;
 pub(crate) mod search;
 
+pub use lifecycle::RetryPolicy;
+
 /// Owns one backend and its process-local foreground operation lifecycle.
 ///
 /// Clone handles share admission capacity and shutdown state. Dropping the last

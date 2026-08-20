@@ -32,7 +32,7 @@
 //!   real result wins.
 //!
 //! Offering maintenance after a committed mutation arrives with the Fixup
-//! runtime (#10, #31); losing it never affects correctness because every
+//! runtime (#31); losing it never affects correctness because every
 //! committed topology state remains searchable.
 
 use std::collections::BTreeMap;
@@ -43,7 +43,7 @@ use crate::runtime::{OperationContext, reads};
 use crate::search::numeric::VectorKernel;
 use crate::search::rabitq::RaBitQ7;
 use crate::storage::backend::{Backend, WriteTxn};
-use crate::storage::keys::{LogicalKey, TreeKey};
+use crate::storage::keys::TreeKey;
 use crate::storage::values::{
     IndexManifest, LeafEntry, OpaquePayload, RecordLocation, VectorRecord,
 };
@@ -97,7 +97,7 @@ async fn run_attempt<B: Backend>(
     let budget = backend.admission_budget();
     let raw = backend.begin_write().await?;
     let mut txn = WriteLogicalTxn::bootstrap(raw, hard_limits, budget);
-    let current = match validate_manifest(&mut txn, handle_manifest).await {
+    let current = match reads::validated_active_manifest(&mut txn, handle_manifest).await {
         Ok(current) => current,
         Err(error) => {
             txn.rollback().await;
@@ -116,22 +116,6 @@ async fn run_attempt<B: Backend>(
             Err(error)
         }
     }
-}
-
-/// Validates the persisted Manifest of the opened handle in this transaction.
-///
-/// The update-protected read both validates Active state and conflicts with a
-/// concurrent drop transition, so a mutation never commits into a Logical
-/// Index whose deletion has begun.
-async fn validate_manifest<T: WriteTxn>(
-    txn: &mut WriteLogicalTxn<'_, T>,
-    handle: &IndexManifest,
-) -> Result<IndexManifest> {
-    reads::opened_manifest(
-        txn.get_for_update(LogicalKey::Manifest(handle.logical_index_id()))
-            .await?,
-        handle,
-    )
 }
 
 /// Applies every mutation in input order inside the attempt transaction.

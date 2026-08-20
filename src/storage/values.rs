@@ -221,6 +221,40 @@ impl PersistentValue {
     }
 }
 
+// The typed logical transactions decode the value family a key implies, so a
+// mismatched kind is unreachable in a correct backend but must stay
+// fail-closed. These extractors are the single home of that check.
+macro_rules! expect_variant {
+    ($name:ident, $variant:ident, $ty:ty) => {
+        /// Extracts the typed value from a typed read, failing closed on a
+        /// wrong-kind value.
+        pub(crate) fn $name(value: Option<PersistentValue>) -> Result<Option<$ty>> {
+            match value {
+                Some(PersistentValue::$variant(value)) => Ok(Some(value)),
+                Some(_) => Err(corrupt()),
+                None => Ok(None),
+            }
+        }
+    };
+}
+
+expect_variant!(expect_record, VectorRecord, VectorRecord);
+expect_variant!(expect_location, RecordLocation, RecordLocation);
+expect_variant!(expect_header, PartitionHeader, PartitionHeader);
+expect_variant!(expect_centroid, PartitionCentroid, PartitionCentroid);
+expect_variant!(expect_leaf_entry, LeafEntry, LeafEntry);
+expect_variant!(expect_child_entry, ChildEntry, ChildEntry);
+expect_variant!(expect_synopsis, PartitionSynopsis, PartitionSynopsis);
+expect_variant!(expect_state, PartitionState, PartitionTransition);
+
+/// Extracts a borrowed Child Entry from a scanned typed value.
+pub(crate) fn expect_child_entry_ref(value: &PersistentValue) -> Result<&ChildEntry> {
+    match value {
+        PersistentValue::ChildEntry(entry) => Ok(entry),
+        _ => Err(corrupt()),
+    }
+}
+
 /// A canonical value codec, optionally bound to one supported Index Manifest.
 #[derive(Clone, Copy, Debug)]
 pub struct ValueCodec<'a> {

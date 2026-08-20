@@ -1,13 +1,15 @@
-//! Initial tree routing through stable internal and leaf partitions.
+//! Tree routing through stable and split-intermediate topology states.
 //!
 //! Routing descends one tree of a Logical Index from its stable root
 //! Partition Key 1 to the Leaf Partition nearest to a preprocessed routing
-//! vector. Only the stable `Ready` topology exists before the split/merge
-//! state machines (#10, #31); every other persisted state is unreachable and
-//! therefore rejected as Corruption rather than routed through. The write path
-//! routes a whole batch at once: one grouped descent per Tree Key shares the
-//! Tree Manifest read and every visited internal partition's reads across all
-//! of the batch's records.
+//! vector. The expose-then-drain split protocol (ADR 0014) keeps every
+//! committed state routable: a `Splitting` source still holds its complete
+//! entry set, each `ReceivingSplit` target participates through its own
+//! incoming reference, and a `DrainingSplit` source is covered by the exact
+//! union of its body and its two persisted targets. The write path routes a
+//! whole batch at once: one grouped descent per Tree Key shares the Tree
+//! Manifest read and every visited internal partition's reads across all of
+//! the batch's records.
 //!
 //! # Contract
 //!
@@ -25,17 +27,32 @@
 //!   either key aborts the commit; the retried attempt reroutes from a fresh
 //!   snapshot, which is deterministic because descent is a pure function of
 //!   the snapshot and the canonical tie-breakers.
+//! - **Split states.** A write-accepting leaf is `Ready`, `Splitting`, or
+//!   `ReceivingSplit`. A `DrainingSplit` leaf accepts no writes: the route
+//!   redirects to the nearer of the two persisted target centroids with the
+//!   Partition Key tie-break, and the source's `DrainingSplit` state slot
+//!   naming the target is update-protected instead of any parent edge —
+//!   adjacent-level maintenance may hold the two edges in different parents,
+//!   and a root split's targets have no parent edge until completion.
+//!   A `DrainingSplit` internal partition is descended through the union of
+//!   its own remaining Child Entries and both targets', whose exact ownership
+//!   is disjoint and complete. An internal `ReceivingSplit` partition is
+//!   never descended alone: its source still owns the unmigrated children,
+//!   so routing resolves the split family through the target's persisted
+//!   source reference.
 //! - **Bounded depth and work.** The root Header's level bounds the descent:
 //!   every hop must descend exactly one level and a leaf is exactly level 1
 //!   (ADR 0006), so hop count is bounded by the persisted root level and a
 //!   level that fails to decrement — including any cycle — is Corruption.
-//!   Each hop reads one Header and scans at most one extra Child Entry beyond
-//!   the binary fanout to prove the fanout invariant.
-//! - **Fail closed.** A missing Header, a wrong-kind value, a fanout other
-//!   than two, a level mismatch, a non-Ready state, or a malformed centroid
-//!   is Corruption; malformed caller vectors are InvalidArgument.
+//!   Each internal body scanned contributes its exact Header count of Child
+//!   Entries in bounded pages; a count mismatch is Corruption.
+//! - **Fail closed.** A missing Header, State, or centroid, a wrong-kind
+//!   value, a level mismatch, a header/state disagreement, an incomplete
+//!   split family, or a malformed centroid is Corruption; a `Merging`
+//!   partition is unreachable before the merge state machine (#31) and is
+//!   likewise rejected; malformed caller vectors are InvalidArgument.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 
 use crate::api::{Error, ErrorKind, PartitionKey, Result};
@@ -43,16 +60,17 @@ use crate::search::numeric::VectorKernel;
 use crate::storage::backend::{ReadOps, ScanLimits, WriteTxn};
 use crate::storage::keys::{LogicalKey, MAX_TREE_KEY_BYTES, TreeKey};
 use crate::storage::values::{
-    ChildEntry, IndexManifest, PartitionHeader, PartitionState, PersistentValue, TreeManifest,
+    ChildEntry, IndexManifest, PartitionCentroid, PartitionHeader, PartitionState,
+    PartitionTransition, PersistentValue, TreeManifest, expect_centroid, expect_header,
+    expect_state,
 };
 use crate::storage::{
     LogicalRange, LogicalScanCursor, LogicalScanPage, ReadLogicalTxn, WriteLogicalTxn,
     tree_manifest,
 };
 
-/// The exact Child Entry count of a stable internal partition; binary fanout
-/// is a fixed format-v1 protocol choice.
-const INTERNAL_FANOUT: usize = 2;
+/// The number of Child Entry candidates scanned per page during descent.
+const CHILD_SCAN_PAGE: usize = 64;
 
 /// The stable-topology route of one routing vector through one tree.
 ///
@@ -65,6 +83,25 @@ pub struct Route {
     leaf: PartitionKey,
     leaf_header: PartitionHeader,
     parent: Option<PartitionKey>,
+    incoming: Incoming,
+}
+
+/// The incoming topology reference a write route update-protects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Incoming {
+    /// The leaf's Child Entry at the observed parent.
+    ParentEdge,
+    /// The draining source's persisted `DrainingSplit` state slot naming this
+    /// leaf as a target.
+    ///
+    /// A drain redirect must not pin the target's Child Entry at a specific
+    /// parent: adjacent-level maintenance may have moved the source edge and
+    /// the target edge to different parents (ADR 0014). While the source
+    /// drains, its state is the authoritative family reference, and
+    /// completion deletes or converts it — aborting the write and forcing a
+    /// fresh reroute. This also covers a root split, whose targets have no
+    /// parent edge at all until root completion.
+    SourceSlot(PartitionKey),
 }
 
 impl Route {
@@ -147,9 +184,9 @@ pub async fn route_leaf_for_write<T: WriteTxn>(
 /// The batch shares one Tree Manifest read and one read per visited internal
 /// partition instead of re-descending per record. The returned Routes
 /// correspond to the input vectors by index, and every *distinct* routed leaf
-/// is validated once: its Header and incoming edge are update-protected, so a
-/// concurrent topology change aborts the commit and the whole attempt reroutes
-/// from a fresh snapshot.
+/// is validated once: its Header and incoming reference are update-protected,
+/// so a concurrent topology change aborts the commit and the whole attempt
+/// reroutes from a fresh snapshot.
 ///
 /// Every routing vector must be the exact output of
 /// [`VectorKernel::preprocess`] under `kernel` for the bound Logical Index.
@@ -174,8 +211,8 @@ pub(crate) async fn route_leaves_for_write_preprocessed<T: WriteTxn>(
     let routes = descend_grouped(txn, manifest, kernel, tree_key, root, routings).await?;
     let mut validated = BTreeSet::new();
     for route in &routes {
-        // One snapshot gives each leaf exactly one incoming edge, so the leaf
-        // alone identifies the (leaf, parent) pair to validate.
+        // One snapshot gives each leaf exactly one incoming reference, so the
+        // leaf alone identifies the route to validate.
         if validated.insert(route.leaf()) {
             validate_for_write(txn, manifest, tree_key, route).await?;
         }
@@ -230,8 +267,25 @@ async fn read_tree_manifest_plain<T: WriteTxn>(
     }
 }
 
-/// Descends from `root` to the leaf nearest to `routing`, carrying the
-/// observed parent.
+/// Validates one visited partition's level progression.
+///
+/// Every hop must descend exactly one level, so a level that fails to
+/// decrement — including any cycle — is Corruption.
+fn check_level(header: &PartitionHeader, expected_level: Option<u32>) -> Result<()> {
+    if let Some(expected) = expected_level {
+        if header.level() != expected {
+            return Err(Error::new(ErrorKind::Corruption));
+        }
+    }
+    Ok(())
+}
+
+/// Descends from `root` to the write-accepting leaf nearest to `routing`,
+/// carrying the observed parent.
+///
+/// Split-family resolution stays within one level: a `ReceivingSplit`
+/// internal partition hops sideways to its source's family at most once,
+/// because targets cannot themselves split until their source drains.
 async fn descend<R: RoutingReader>(
     reader: &mut R,
     manifest: &IndexManifest,
@@ -245,36 +299,122 @@ async fn descend<R: RoutingReader>(
     let mut expected_level = None;
     loop {
         let header = read_header(reader, manifest, tree_key, partition).await?;
-        check_visited_header(&header, expected_level)?;
-        if header.level() == 1 {
+        check_level(&header, expected_level)?;
+        // A write-accepting leaf — Ready, Splitting, or ReceivingSplit — is
+        // the descent's end.
+        if header.level() == 1 && header.state().accepts_writes() {
             return Ok(Route {
                 leaf: partition,
                 leaf_header: header,
                 parent,
+                incoming: Incoming::ParentEdge,
             });
         }
-        expected_level = Some(header.level() - 1);
-        let child = nearest_child(reader, manifest, kernel, tree_key, partition, routing).await?;
-        parent = Some(partition);
-        partition = child;
-    }
-}
-
-/// Validates one visited partition's level progression and Ready state.
-///
-/// Every hop must descend exactly one level, so a level that fails to
-/// decrement — including any cycle — is Corruption, as is any non-Ready
-/// state.
-fn check_visited_header(header: &PartitionHeader, expected_level: Option<u32>) -> Result<()> {
-    if let Some(expected) = expected_level {
-        if header.level() != expected {
-            return Err(Error::new(ErrorKind::Corruption));
+        match header.state() {
+            PartitionState::Ready | PartitionState::Splitting => {
+                // A Splitting source still holds its complete child set; its
+                // empty targets are correctly skipped until draining starts.
+                expected_level = Some(header.level() - 1);
+                let child = nearest_child(
+                    reader, manifest, kernel, tree_key, partition, header, routing,
+                )
+                .await?;
+                parent = Some(partition);
+                partition = child;
+            }
+            PartitionState::ReceivingSplit => {
+                // An internal target is never descended alone: its source
+                // still owns the unmigrated children, so the split family is
+                // resolved through the persisted source reference.
+                let source = match read_state(reader, manifest, tree_key, partition).await? {
+                    PartitionTransition::ReceivingSplit { source, .. } => source,
+                    _ => return Err(Error::new(ErrorKind::Corruption)),
+                };
+                match read_state(reader, manifest, tree_key, source).await? {
+                    PartitionTransition::Splitting { .. } => {
+                        // The source still holds every entry; the target is
+                        // empty and contributes nothing. The carried parent is
+                        // informational here: the next descent hop below the
+                        // internal source replaces it.
+                        partition = source;
+                    }
+                    PartitionTransition::DrainingSplit { left, right, .. } => {
+                        let source_header = read_header(reader, manifest, tree_key, source).await?;
+                        expected_level = Some(header.level() - 1);
+                        let family = SplitFamily {
+                            source,
+                            source_header,
+                            targets: [left, right],
+                        };
+                        let (child, owner) = nearest_child_across(
+                            reader,
+                            manifest,
+                            kernel,
+                            tree_key,
+                            family,
+                            header.level(),
+                            routing,
+                        )
+                        .await?;
+                        parent = Some(owner);
+                        partition = child;
+                    }
+                    _ => return Err(Error::new(ErrorKind::Corruption)),
+                }
+            }
+            PartitionState::DrainingSplit => {
+                let (left, right) = match read_state(reader, manifest, tree_key, partition).await? {
+                    PartitionTransition::DrainingSplit { left, right, .. } => (left, right),
+                    _ => return Err(Error::new(ErrorKind::Corruption)),
+                };
+                if header.level() == 1 {
+                    // A draining leaf accepts no writes: redirect to the
+                    // nearer persisted target. The target shares the source's
+                    // observed parent — or, for a root split, the root target
+                    // slot — so the carried parent observation stays valid.
+                    let target = nearer_target_leaf(
+                        reader, manifest, kernel, tree_key, routing, left, right,
+                    )
+                    .await?;
+                    let target_header = read_header(reader, manifest, tree_key, target).await?;
+                    if target_header.level() != 1
+                        || target_header.state() != PartitionState::ReceivingSplit
+                    {
+                        return Err(Error::new(ErrorKind::Corruption));
+                    }
+                    return Ok(Route {
+                        leaf: target,
+                        leaf_header: target_header,
+                        parent,
+                        incoming: Incoming::SourceSlot(partition),
+                    });
+                }
+                // The exact union of the source body and both targets covers
+                // the source's original children.
+                expected_level = Some(header.level() - 1);
+                let family = SplitFamily {
+                    source: partition,
+                    source_header: header,
+                    targets: [left, right],
+                };
+                let (child, owner) = nearest_child_across(
+                    reader,
+                    manifest,
+                    kernel,
+                    tree_key,
+                    family,
+                    header.level(),
+                    routing,
+                )
+                .await?;
+                parent = Some(owner);
+                partition = child;
+            }
+            // Merging is unreachable before the merge state machine (#31) and
+            // stays fail-closed.
+            _ => return Err(Error::new(ErrorKind::Corruption)),
         }
     }
-    if header.state() != PartitionState::Ready {
-        return Err(Error::new(ErrorKind::Corruption));
-    }
-    Ok(())
 }
 
 /// Descends from `root` with the whole group, reading each visited partition
@@ -289,6 +429,7 @@ async fn descend_grouped<T: WriteTxn>(
     routings: &[&[f32]],
 ) -> Result<Vec<Route>> {
     let mut routes: Vec<Option<Route>> = vec![None; routings.len()];
+    // (partition, observed parent, expected level, member indexes).
     let mut pending = vec![(
         root,
         None,
@@ -297,37 +438,157 @@ async fn descend_grouped<T: WriteTxn>(
     )];
     while let Some((partition, parent, expected_level, members)) = pending.pop() {
         let header = read_header(txn, manifest, tree_key, partition).await?;
-        check_visited_header(&header, expected_level)?;
-        if header.level() == 1 {
+        check_level(&header, expected_level)?;
+        if header.level() == 1 && header.state().accepts_writes() {
             for member in members {
                 routes[member] = Some(Route {
                     leaf: partition,
                     leaf_header: header,
                     parent,
+                    incoming: Incoming::ParentEdge,
                 });
             }
             continue;
         }
-        let children = read_children(txn, manifest, tree_key, partition).await?;
-        let mut left = Vec::new();
-        let mut right = Vec::new();
-        for member in members {
-            if nearest_of(&children, kernel, routings[member])? == children[0].child() {
-                left.push(member);
-            } else {
-                right.push(member);
+        // The candidate child bodies for this hop: the partition itself for
+        // stable or splitting descent, or its whole draining split family.
+        let mut bodies: Vec<(PartitionKey, PartitionHeader)> = Vec::new();
+        match header.state() {
+            PartitionState::Ready | PartitionState::Splitting => {
+                bodies.push((partition, header));
+            }
+            PartitionState::ReceivingSplit => {
+                let source = match read_state(txn, manifest, tree_key, partition).await? {
+                    PartitionTransition::ReceivingSplit { source, .. } => source,
+                    _ => return Err(Error::new(ErrorKind::Corruption)),
+                };
+                match read_state(txn, manifest, tree_key, source).await? {
+                    PartitionTransition::Splitting { .. } => {
+                        // The source still holds every entry; requeue the
+                        // group at it. The source shares the target's level;
+                        // the carried parent is informational — the next hop
+                        // below the internal source replaces it.
+                        pending.push((source, parent, expected_level, members));
+                        continue;
+                    }
+                    PartitionTransition::DrainingSplit { left, right, .. } => {
+                        let source_header = read_header(txn, manifest, tree_key, source).await?;
+                        bodies = split_family_bodies(
+                            txn,
+                            manifest,
+                            tree_key,
+                            source,
+                            source_header,
+                            [left, right],
+                            header.level(),
+                        )
+                        .await?;
+                    }
+                    _ => return Err(Error::new(ErrorKind::Corruption)),
+                }
+            }
+            PartitionState::DrainingSplit => {
+                let (left, right) = match read_state(txn, manifest, tree_key, partition).await? {
+                    PartitionTransition::DrainingSplit { left, right, .. } => (left, right),
+                    _ => return Err(Error::new(ErrorKind::Corruption)),
+                };
+                if header.level() == 1 {
+                    // A draining leaf accepts no writes: each member redirects
+                    // to its nearer persisted target, sharing the source's
+                    // observed parent or root target slot.
+                    let left_centroid = read_centroid(txn, manifest, tree_key, left).await?;
+                    let right_centroid = read_centroid(txn, manifest, tree_key, right).await?;
+                    let left_header = read_header(txn, manifest, tree_key, left).await?;
+                    let right_header = read_header(txn, manifest, tree_key, right).await?;
+                    for target_header in [left_header, right_header] {
+                        if target_header.level() != 1
+                            || target_header.state() != PartitionState::ReceivingSplit
+                        {
+                            return Err(Error::new(ErrorKind::Corruption));
+                        }
+                    }
+                    for member in members {
+                        let left_distance = kernel
+                            .routing_distance(routings[member], left_centroid.components())?;
+                        let right_distance = kernel
+                            .routing_distance(routings[member], right_centroid.components())?;
+                        let target = nearer_of_two(left, left_distance, right, right_distance);
+                        let target_header = if target == left {
+                            left_header
+                        } else {
+                            right_header
+                        };
+                        routes[member] = Some(Route {
+                            leaf: target,
+                            leaf_header: target_header,
+                            parent,
+                            incoming: Incoming::SourceSlot(partition),
+                        });
+                    }
+                    continue;
+                }
+                bodies = split_family_bodies(
+                    txn,
+                    manifest,
+                    tree_key,
+                    partition,
+                    header,
+                    [left, right],
+                    header.level(),
+                )
+                .await?;
+            }
+            // Merging is unreachable before the merge state machine (#31) and
+            // stays fail-closed.
+            _ => return Err(Error::new(ErrorKind::Corruption)),
+        }
+
+        // Gather the exact Child Entry union of the candidate bodies; a
+        // draining family's union is never empty, and a stable or splitting
+        // internal partition never has zero children.
+        let mut children: Vec<(PartitionKey, PartitionKey, ChildEntry)> = Vec::new();
+        for (body, body_header) in &bodies {
+            for entry in scan_children(txn, manifest, tree_key, *body, *body_header).await? {
+                children.push((entry.child(), *body, entry));
             }
         }
-        let next_level = Some(header.level() - 1);
-        if !left.is_empty() {
-            pending.push((children[0].child(), Some(partition), next_level, left));
+        if children.is_empty() {
+            return Err(Error::new(ErrorKind::Corruption));
         }
-        if !right.is_empty() {
-            pending.push((children[1].child(), Some(partition), next_level, right));
+
+        // Partition the members by nearest child, then descend per group.
+        let next_level = Some(header.level() - 1);
+        let mut grouped: BTreeMap<PartitionKey, (PartitionKey, Vec<usize>)> = BTreeMap::new();
+        for member in members {
+            let mut best: Option<(f64, PartitionKey, PartitionKey)> = None;
+            for (child, owner, entry) in &children {
+                let distance = kernel.routing_distance(routings[member], entry.centroid())?;
+                let nearer = match best {
+                    None => true,
+                    Some((best_distance, best_child, _)) => {
+                        distance < best_distance
+                            || (distance == best_distance && *child < best_child)
+                    }
+                };
+                if nearer {
+                    best = Some((distance, *child, *owner));
+                }
+            }
+            let (_, child, owner) = best.ok_or_else(|| Error::new(ErrorKind::Corruption))?;
+            grouped
+                .entry(child)
+                .or_insert_with(|| (owner, Vec::new()))
+                .1
+                .push(member);
+        }
+        for (child, (owner, members)) in grouped {
+            pending.push((child, Some(owner), next_level, members));
         }
     }
     // Every member is resolved exactly once: each partition visit either
-    // assigns its members at a leaf or splits them across both children.
+    // assigns its members at a write-accepting leaf or redirects them to a
+    // target leaf, requeues them at a splitting source, or splits them across
+    // the children of the candidate bodies.
     routes
         .into_iter()
         .map(|route| route.ok_or_else(|| Error::new(ErrorKind::Backend)))
@@ -347,43 +608,101 @@ async fn read_header<R: RoutingReader>(
         tree_key: tree_key.clone(),
         partition,
     };
-    match reader.get(key).await? {
-        Some(PersistentValue::PartitionHeader(header)) => Ok(header),
-        // A Header key decodes only as a Partition Header, so another value
-        // kind is unreachable; a missing Header on a referenced partition is
-        // Corruption either way.
-        _ => Err(Error::new(ErrorKind::Corruption)),
+    // A Header key decodes only as a Partition Header, so another value kind
+    // is unreachable; a missing Header on a referenced partition is Corruption
+    // either way.
+    expect_header(reader.get(key).await?)?.ok_or_else(|| Error::new(ErrorKind::Corruption))
+}
+
+/// Reads one partition State, failing closed when a routed-to partition has
+/// no State or a wrong-kind value.
+async fn read_state<R: RoutingReader>(
+    reader: &mut R,
+    manifest: &IndexManifest,
+    tree_key: &TreeKey,
+    partition: PartitionKey,
+) -> Result<PartitionTransition> {
+    expect_state(
+        reader
+            .get(LogicalKey::State {
+                index: manifest.logical_index_id(),
+                tree_key: tree_key.clone(),
+                partition,
+            })
+            .await?,
+    )?
+    .ok_or_else(|| Error::new(ErrorKind::Corruption))
+}
+
+/// Reads one partition's persisted centroid, failing closed when absent.
+async fn read_centroid<R: RoutingReader>(
+    reader: &mut R,
+    manifest: &IndexManifest,
+    tree_key: &TreeKey,
+    partition: PartitionKey,
+) -> Result<PartitionCentroid> {
+    expect_centroid(
+        reader
+            .get(LogicalKey::Centroid {
+                index: manifest.logical_index_id(),
+                tree_key: tree_key.clone(),
+                partition,
+            })
+            .await?,
+    )?
+    .ok_or_else(|| Error::new(ErrorKind::Corruption))
+}
+
+/// One draining split family: the source with its already-read Header and
+/// the two persisted targets.
+struct SplitFamily {
+    source: PartitionKey,
+    source_header: PartitionHeader,
+    targets: [PartitionKey; 2],
+}
+
+/// Validates and lists one draining split family's bodies: the source first,
+/// then its two targets, each proven at the family's level with its expected
+/// state.
+async fn split_family_bodies<R: RoutingReader>(
+    reader: &mut R,
+    manifest: &IndexManifest,
+    tree_key: &TreeKey,
+    source: PartitionKey,
+    source_header: PartitionHeader,
+    targets: [PartitionKey; 2],
+    level: u32,
+) -> Result<Vec<(PartitionKey, PartitionHeader)>> {
+    if source_header.level() != level || source_header.state() != PartitionState::DrainingSplit {
+        return Err(Error::new(ErrorKind::Corruption));
     }
+    let mut bodies = vec![(source, source_header)];
+    for target in targets {
+        let header = read_header(reader, manifest, tree_key, target).await?;
+        if header.level() != level || header.state() != PartitionState::ReceivingSplit {
+            return Err(Error::new(ErrorKind::Corruption));
+        }
+        bodies.push((target, header));
+    }
+    Ok(bodies)
 }
 
-/// Selects the nearest child of one stable internal partition for `routing`.
-async fn nearest_child<R: RoutingReader>(
-    reader: &mut R,
-    manifest: &IndexManifest,
-    kernel: &VectorKernel,
-    tree_key: &TreeKey,
-    partition: PartitionKey,
-    routing: &[f32],
-) -> Result<PartitionKey> {
-    let children = read_children(reader, manifest, tree_key, partition).await?;
-    nearest_of(&children, kernel, routing)
-}
-
-/// Reads the exactly-two Child Entries of one stable internal partition.
+/// Scans one internal body's complete Child Entry set in bounded pages.
 ///
-/// A stable internal partition holds exactly [`INTERNAL_FANOUT`] Child
-/// Entries; the scan admits one extra entry solely to detect a fanout
-/// violation, and any other count is Corruption. The backend's ordered scan
-/// returns the entries in ascending child Partition Key order.
-async fn read_children<R: RoutingReader>(
+/// The Header count is exact in every committed state, so the scan must see
+/// precisely that many Child Entries; any mismatch is Corruption. An empty
+/// result is legal only for a not-yet-filled split target or a fully drained
+/// source.
+async fn scan_children<R: RoutingReader>(
     reader: &mut R,
     manifest: &IndexManifest,
     tree_key: &TreeKey,
     partition: PartitionKey,
-) -> Result<[ChildEntry; 2]> {
+    header: PartitionHeader,
+) -> Result<Vec<ChildEntry>> {
     let range = LogicalRange::child_entries(manifest, tree_key, partition)?;
     let limits = child_scan_limits(manifest.config().dimension())?;
-    let mut entries = Vec::with_capacity(INTERNAL_FANOUT);
+    let mut entries = Vec::with_capacity(header.entry_count().min(1_024) as usize);
     let mut cursor = None;
     loop {
         let page = reader.scan(&range, cursor.as_ref(), limits).await?;
@@ -392,45 +711,142 @@ async fn read_children<R: RoutingReader>(
                 return Err(Error::new(ErrorKind::Corruption));
             };
             entries.push(entry.clone());
-            if entries.len() > INTERNAL_FANOUT {
-                return Err(Error::new(ErrorKind::Corruption));
-            }
         }
         cursor = page.into_next_cursor();
         if cursor.is_none() {
             break;
         }
     }
-    <[ChildEntry; 2]>::try_from(entries).map_err(|_| Error::new(ErrorKind::Corruption))
+    if entries.len() != header.entry_count() as usize {
+        return Err(Error::new(ErrorKind::Corruption));
+    }
+    Ok(entries)
 }
 
-/// Selects the nearer of one internal partition's two children for `routing`.
+/// Selects the nearest child of one stable or splitting internal partition.
 ///
 /// Distance ties resolve to the smaller child Partition Key, the canonical
-/// routing tie-breaker: the ordered scan places the smaller key at index 0.
-/// IEEE equality makes -0.0 and +0.0 a distance tie, and the comparison is
-/// total because every distance is validated finite.
-fn nearest_of(
-    children: &[ChildEntry; 2],
+/// routing tie-breaker. A `Ready` or `Splitting` internal partition never has
+/// an empty child set.
+async fn nearest_child<R: RoutingReader>(
+    reader: &mut R,
+    manifest: &IndexManifest,
     kernel: &VectorKernel,
+    tree_key: &TreeKey,
+    partition: PartitionKey,
+    header: PartitionHeader,
     routing: &[f32],
 ) -> Result<PartitionKey> {
-    let left = kernel.routing_distance(routing, children[0].centroid())?;
-    let right = kernel.routing_distance(routing, children[1].centroid())?;
-    Ok(if left <= right {
-        children[0].child()
-    } else {
-        children[1].child()
-    })
+    let mut best: Option<(f64, PartitionKey)> = None;
+    for entry in scan_children(reader, manifest, tree_key, partition, header).await? {
+        let distance = kernel.routing_distance(routing, entry.centroid())?;
+        let nearer = match best {
+            None => true,
+            Some((best_distance, best_child)) => {
+                // IEEE equality makes -0.0 and +0.0 a distance tie, so the
+                // Partition Key decides. The comparison is total because
+                // every distance is validated finite.
+                distance < best_distance
+                    || (distance == best_distance && entry.child() < best_child)
+            }
+        };
+        if nearer {
+            best = Some((distance, entry.child()));
+        }
+    }
+    best.map(|(_, child)| child)
+        .ok_or_else(|| Error::new(ErrorKind::Corruption))
 }
 
-/// Builds the scan bounds that prove the internal fanout invariant.
+/// Selects the nearest child across one draining split family's exact Child
+/// Entry union, returning the child and the body that owns it.
+async fn nearest_child_across<R: RoutingReader>(
+    reader: &mut R,
+    manifest: &IndexManifest,
+    kernel: &VectorKernel,
+    tree_key: &TreeKey,
+    family: SplitFamily,
+    level: u32,
+    routing: &[f32],
+) -> Result<(PartitionKey, PartitionKey)> {
+    let SplitFamily {
+        source,
+        source_header,
+        targets,
+    } = family;
+    let bodies = split_family_bodies(
+        reader,
+        manifest,
+        tree_key,
+        source,
+        source_header,
+        targets,
+        level,
+    )
+    .await?;
+    let mut best: Option<(f64, PartitionKey, PartitionKey)> = None;
+    for (body, header) in bodies {
+        for entry in scan_children(reader, manifest, tree_key, body, header).await? {
+            let distance = kernel.routing_distance(routing, entry.centroid())?;
+            let nearer = match best {
+                None => true,
+                Some((best_distance, best_child, _)) => {
+                    distance < best_distance
+                        || (distance == best_distance && entry.child() < best_child)
+                }
+            };
+            if nearer {
+                best = Some((distance, entry.child(), body));
+            }
+        }
+    }
+    best.map(|(_, child, owner)| (child, owner))
+        .ok_or_else(|| Error::new(ErrorKind::Corruption))
+}
+
+/// Chooses the nearer of one draining leaf's two persisted targets.
 ///
-/// The item limit admits one extra Child Entry beyond the binary fanout. The
-/// byte limit covers that many worst-case entries at the index dimension —
-/// 28 fixed key bytes plus the canonical Tree Key, and 8 + 4 payload bytes
-/// plus value framing per entry — so a legal page is never byte-truncated and
-/// the fanout check always sees every Child Entry.
+/// The persisted target centroids are routing models learned at exposure;
+/// exact movement, not centroid freshness, preserves membership (ADR 0014).
+async fn nearer_target_leaf<R: RoutingReader>(
+    reader: &mut R,
+    manifest: &IndexManifest,
+    kernel: &VectorKernel,
+    tree_key: &TreeKey,
+    routing: &[f32],
+    left: PartitionKey,
+    right: PartitionKey,
+) -> Result<PartitionKey> {
+    let left_centroid = read_centroid(reader, manifest, tree_key, left).await?;
+    let right_centroid = read_centroid(reader, manifest, tree_key, right).await?;
+    let left_distance = kernel.routing_distance(routing, left_centroid.components())?;
+    let right_distance = kernel.routing_distance(routing, right_centroid.components())?;
+    Ok(nearer_of_two(left, left_distance, right, right_distance))
+}
+
+/// The canonical two-target split decision shared by drain placement and
+/// descent redirect: the nearer routing distance wins and ties resolve to the
+/// smaller Partition Key, which is stable across workers because
+/// `begin_split` reserves the left target first.
+pub(crate) fn nearer_of_two(
+    left: PartitionKey,
+    left_distance: f64,
+    right: PartitionKey,
+    right_distance: f64,
+) -> PartitionKey {
+    if right_distance < left_distance || (right_distance == left_distance && right < left) {
+        right
+    } else {
+        left
+    }
+}
+
+/// Builds the page bounds for a Child Entry scan during descent.
+///
+/// The byte limit covers one page of worst-case entries at the index
+/// dimension — 28 fixed key bytes plus the canonical Tree Key, and 8 + 4
+/// payload bytes plus value framing per entry — so a legal page is never
+/// byte-truncated before its item limit.
 fn child_scan_limits(dimension: usize) -> Result<ScanLimits> {
     let vector_bytes = dimension
         .checked_mul(4)
@@ -441,10 +857,10 @@ fn child_scan_limits(dimension: usize) -> Result<ScanLimits> {
         .and_then(|bytes| bytes.checked_add(vector_bytes))
         .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
     let byte_limit = per_item
-        .checked_mul(INTERNAL_FANOUT + 1)
+        .checked_mul(CHILD_SCAN_PAGE)
         .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
     Ok(ScanLimits {
-        item_limit: INTERNAL_FANOUT + 1,
+        item_limit: CHILD_SCAN_PAGE,
         byte_limit,
     })
 }
@@ -453,10 +869,17 @@ fn child_scan_limits(dimension: usize) -> Result<ScanLimits> {
 ///
 /// The update-protected reads establish exactly the conflicts that keep the
 /// observed membership legal: the leaf Header, whose count and epoch the
-/// mutation changes, and the leaf's incoming Child Entry, which adjacent-level
-/// maintenance must move or remove to change the leaf's parent (ADR 0007). The
-/// values still match the carried observation because both were read from this
-/// transaction's snapshot; the fail-closed checks guard that contract.
+/// mutation changes and whose state must still accept writes (`Ready`,
+/// `Splitting`, or `ReceivingSplit`), and the leaf's incoming reference. A
+/// directly routed leaf protects its Child Entry at the observed parent (ADR
+/// 0007). A drain-redirected leaf instead protects the source's
+/// `DrainingSplit` state slot naming it: adjacent-level maintenance may have
+/// moved the source edge and the target edge to different parents, so no
+/// single parent edge is authoritative for the redirect (ADR 0014). Either
+/// way, a concurrent topology change aborts the commit and the retried
+/// attempt reroutes from a fresh snapshot. The values still match the carried
+/// observation because both were read from this transaction's snapshot; the
+/// fail-closed checks guard that contract.
 async fn validate_for_write<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     manifest: &IndexManifest,
@@ -473,24 +896,45 @@ async fn validate_for_write<T: WriteTxn>(
         .await?;
     match header {
         Some(PersistentValue::PartitionHeader(header))
-            if header.level() == 1 && header.state() == PartitionState::Ready => {}
+            if header.level() == 1 && header.state().accepts_writes() => {}
         _ => return Err(Error::new(ErrorKind::Corruption)),
     }
-    if let Some(parent) = route.parent {
-        let edge = txn
-            .get_for_update(LogicalKey::ChildEntry {
+    match route.incoming {
+        Incoming::ParentEdge => {
+            let Some(parent) = route.parent else {
+                // The tree root has no incoming edge.
+                return Ok(());
+            };
+            let edge = txn
+                .get_for_update(LogicalKey::ChildEntry {
+                    index,
+                    tree_key: tree_key.clone(),
+                    partition: parent,
+                    child: route.leaf,
+                })
+                .await?;
+            match edge {
+                Some(PersistentValue::ChildEntry(entry)) if entry.child() == route.leaf => {}
+                _ => return Err(Error::new(ErrorKind::Corruption)),
+            }
+            Ok(())
+        }
+        Incoming::SourceSlot(source) => match txn
+            .get_for_update(LogicalKey::State {
                 index,
                 tree_key: tree_key.clone(),
-                partition: parent,
-                child: route.leaf,
+                partition: source,
             })
-            .await?;
-        match edge {
-            Some(PersistentValue::ChildEntry(entry)) if entry.child() == route.leaf => {}
-            _ => return Err(Error::new(ErrorKind::Corruption)),
-        }
+            .await?
+        {
+            Some(PersistentValue::PartitionState(PartitionTransition::DrainingSplit {
+                left,
+                right,
+                ..
+            })) if route.leaf == left || route.leaf == right => Ok(()),
+            _ => Err(Error::new(ErrorKind::Corruption)),
+        },
     }
-    Ok(())
 }
 
 /// Builds the format-v1 vector kernel for the bound Logical Index.
