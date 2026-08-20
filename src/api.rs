@@ -8,6 +8,7 @@
 mod config;
 mod error;
 mod identifiers;
+mod import;
 mod index;
 mod operation;
 mod record;
@@ -19,6 +20,7 @@ pub(crate) use config::MAX_DIMENSION;
 pub use config::{IndexConfig, RuntimeConfig};
 pub use error::{Error, ErrorKind, Result};
 pub use identifiers::{BatchToken, FieldId, IndexName, LogicalIndexId, PartitionKey};
+pub use import::ImportSession;
 pub use index::Index;
 pub use operation::{
     GetOptions, ImportBatchResult, ImportOptions, Mutation, MutationOutcome, OperationOptions,

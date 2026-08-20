@@ -12,9 +12,9 @@ use crate::storage::backend::Backend;
 use crate::storage::values::{IndexLifecycle, IndexManifest};
 
 use super::{
-    Error, ErrorKind, GetOptions, IndexConfig, IndexName, LogicalIndexId, Mutation,
-    MutationOutcome, OperationOptions, Record, Result, StoredRecord, UpsertResult, validate_id,
-    validate_ids, validate_mutations,
+    Error, ErrorKind, GetOptions, ImportOptions, ImportSession, IndexConfig, IndexName,
+    LogicalIndexId, Mutation, MutationOutcome, OperationOptions, Record, Result, StoredRecord,
+    UpsertResult, validate_id, validate_ids, validate_mutations,
 };
 
 /// A cheap cloneable handle to one Active Logical Index.
@@ -176,15 +176,41 @@ impl<B: Backend> Index<B> {
         self.run_mutations(mutations, operation_options).await
     }
 
+    /// Opens a bounded Import Session on this index.
+    ///
+    /// The session admits ordinary atomic mutation batches under bounded
+    /// concurrency; see [`ImportSession`] for the admission, ordering,
+    /// cancellation, and shutdown contract. `options.in_flight_batches()`
+    /// overrides the Runtime's configured in-flight batch limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::RuntimeClosed`] when the Runtime is shutting down
+    /// or has shut down.
+    pub fn import_session(&self, options: ImportOptions) -> Result<ImportSession<B>> {
+        if !self.runtime.is_accepting() {
+            return Err(Error::new(ErrorKind::RuntimeClosed));
+        }
+        let in_flight_batches = options
+            .in_flight_batches()
+            .unwrap_or_else(|| self.runtime.config().import_in_flight_batches());
+        Ok(ImportSession::new(self.clone(), in_flight_batches))
+    }
+
     /// Validates one mutation batch against this index's immutable
     /// configuration before any storage work.
-    fn validate(&self, mutations: &mut [Mutation]) -> Result<()> {
+    pub(crate) fn validate(&self, mutations: &mut [Mutation]) -> Result<()> {
         let config = self.manifest.config();
         validate_mutations(mutations, config.dimension(), config.fields())
     }
 
+    /// Returns the owning Runtime's shared state.
+    pub(crate) fn runtime(&self) -> &Arc<RuntimeInner<B>> {
+        &self.runtime
+    }
+
     /// Runs one validated mutation batch under foreground admission.
-    async fn run_mutations(
+    pub(crate) async fn run_mutations(
         &self,
         mutations: Vec<Mutation>,
         operation_options: OperationOptions,

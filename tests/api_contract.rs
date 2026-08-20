@@ -7,9 +7,10 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use ktann::api::{
-    DataType, Error, ErrorKind, FieldId, FieldSchema, IndexConfig, IndexName, Metric, Mutation,
-    PayloadProjection, Predicate, Record, RuntimeConfig, SearchBudgets, SearchHit, SearchOptions,
-    SearchRequest, SynopsisConfig, Value, VerifyOptions, validate_mutations,
+    DataType, Error, ErrorKind, FieldId, FieldSchema, ImportOptions, IndexConfig, IndexName,
+    Metric, Mutation, PayloadProjection, Predicate, Record, RuntimeConfig, SearchBudgets,
+    SearchHit, SearchOptions, SearchRequest, SynopsisConfig, Value, VerifyOptions,
+    validate_mutations,
 };
 
 fn assert_invalid<T>(result: ktann::api::Result<T>) {
@@ -237,6 +238,15 @@ fn runtime_and_verify_limits_fail_closed() {
         .with_import_limits(1, 1_025)
         .expect("builder defers cross-setting validation");
     assert_invalid(unsafe_import_limits.validate());
+    assert_invalid(ImportOptions::default().with_in_flight_batches(0));
+    assert_eq!(
+        ImportOptions::default()
+            .with_in_flight_batches(2)
+            .expect("positive in-flight override")
+            .in_flight_batches(),
+        Some(2)
+    );
+    assert_eq!(ImportOptions::default().in_flight_batches(), None);
     assert_invalid(RuntimeConfig::default().with_stalled_timeout(Default::default()));
     assert_invalid(VerifyOptions::default().with_issue_limit(10_001));
     assert_invalid(VerifyOptions::default().with_memory_limit_bytes(1_073_741_825));
