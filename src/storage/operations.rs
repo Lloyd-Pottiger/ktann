@@ -267,6 +267,12 @@ impl LogicalScanPage {
     pub fn into_next_cursor(self) -> Option<LogicalScanCursor> {
         self.next_cursor
     }
+
+    /// Consumes the page and returns its owned items and continuation.
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<LogicalScanItem>, Option<LogicalScanCursor>) {
+        (self.items, self.next_cursor)
+    }
 }
 
 impl fmt::Debug for LogicalScanPage {

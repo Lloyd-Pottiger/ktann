@@ -42,6 +42,11 @@ pub(crate) struct EnumeratedTree {
 }
 
 impl EnumeratedTree {
+    /// Creates one planned tree from its canonical Tree Key and Tree Manifest.
+    pub(crate) fn new(tree_key: TreeKey, manifest: TreeManifest) -> Self {
+        Self { tree_key, manifest }
+    }
+
     /// Returns the canonical Tree Key.
     #[must_use]
     pub(crate) fn tree_key(&self) -> &TreeKey {

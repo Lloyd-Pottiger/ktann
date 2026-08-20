@@ -92,6 +92,13 @@ impl LeafEntry {
     pub const fn rabitq7(&self) -> &Bytes {
         &self.rabitq7
     }
+
+    /// Consumes the entry and returns its Record ID, filter projection, and
+    /// RaBitQ7 bytes without copying.
+    #[must_use]
+    pub fn into_parts(self) -> (Bytes, Box<[Value]>, Bytes) {
+        (self.record_id, self.fields, self.rabitq7)
+    }
 }
 
 impl fmt::Debug for LeafEntry {
