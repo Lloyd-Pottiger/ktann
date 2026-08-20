@@ -59,6 +59,8 @@ use crate::api::{
 #[doc(inline)]
 pub use super::tree_key::{MAX_STRING_BYTES, MAX_TREE_KEY_BYTES, TreeKey};
 
+use super::tree_key::{decode_escaped_terminated, push_escaped_terminated, take_array};
+
 /// The single logical-key format version emitted and accepted by this build.
 pub const KEY_VERSION: u8 = 1;
 
@@ -68,7 +70,7 @@ pub const LOGICAL_INDEX_ID_BYTES: usize = 8;
 pub const PARTITION_KEY_BYTES: usize = 8;
 
 /// The maximum encoded length of a Record ID in bytes.
-pub const MAX_RECORD_ID_BYTES: usize = 256;
+pub const MAX_RECORD_ID_BYTES: usize = crate::api::MAX_RECORD_ID_BYTES;
 const SCOPE_NAMESPACE: u8 = 0x00;
 const SCOPE_INDEX: u8 = 0x01;
 
@@ -377,12 +379,6 @@ fn successor(prefix: &[u8]) -> Vec<u8> {
     Vec::new()
 }
 
-/// Reads exactly `N` bytes as an array, failing closed on truncation.
-fn take_array<const N: usize>(bytes: &[u8]) -> Result<[u8; N]> {
-    let slice = bytes.get(..N).ok_or_else(corrupt)?;
-    slice.try_into().map_err(|_| corrupt())
-}
-
 /// Rejects an invalid Record ID on the encode path.
 fn check_record_id(id: &[u8]) -> Result<()> {
     if id.is_empty() || id.len() > MAX_RECORD_ID_BYTES {
@@ -481,14 +477,7 @@ fn record_group_prefix(index: LogicalIndexId, id: &Bytes) -> Result<Vec<u8>> {
     check_record_id(id)?;
     let mut bytes = index_prefix(index);
     bytes.push(KIND_RECORD_GROUP);
-    for &byte in id {
-        if byte == 0 {
-            bytes.extend_from_slice(&[0, 0xff]);
-        } else {
-            bytes.push(byte);
-        }
-    }
-    bytes.push(0);
+    push_escaped_terminated(&mut bytes, id);
     Ok(bytes)
 }
 
@@ -657,26 +646,7 @@ fn decode_index_key(types: &[DataType], body: &[u8]) -> Result<LogicalKey> {
 }
 
 fn decode_record_group(index: LogicalIndexId, bytes: &[u8]) -> Result<LogicalKey> {
-    let mut id = Vec::new();
-    let mut offset = 0;
-    loop {
-        let byte = *bytes.get(offset).ok_or_else(corrupt)?;
-        if byte == 0 {
-            if bytes.get(offset + 1) == Some(&0xff) {
-                id.push(0);
-                offset += 2;
-            } else {
-                offset += 1;
-                break;
-            }
-        } else {
-            id.push(byte);
-            offset += 1;
-        }
-        if id.len() > MAX_RECORD_ID_BYTES {
-            return Err(corrupt());
-        }
-    }
+    let (id, offset) = decode_escaped_terminated(bytes, MAX_RECORD_ID_BYTES)?;
     let id = decode_record_id(&id)?;
     match bytes.get(offset..) {
         Some([RECORD_VALUE]) => Ok(LogicalKey::Record { index, id }),

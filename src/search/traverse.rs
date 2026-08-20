@@ -72,7 +72,7 @@ use crate::storage::values::{
 };
 use crate::storage::{LogicalRange, LogicalScanCursor, ReadLogicalTxn};
 
-use super::numeric::VectorKernel;
+use super::numeric::{VectorKernel, compare_finite};
 use super::plan::EnumeratedTree;
 use super::predicate::{CompiledPredicate, SynopsisClassification};
 use super::rabitq::{ApproximateCandidate, RaBitQ7, RaBitQQuery, select_leaf_overlap};
@@ -222,7 +222,7 @@ pub(crate) async fn traverse<T: ReadOps>(
         kernel,
         query: &query,
         rerank_cap: usize::try_from(request.budgets.exact_rerank_candidates())
-            .map_err(|_| limit_exceeded())?,
+            .map_err(|_| Error::new(ErrorKind::LimitExceeded))?,
         request,
     };
     let mut state = Traversal::seed(context.request.trees)?;
@@ -310,7 +310,8 @@ impl Traversal {
             rabitq_overlap_truncated: false,
         };
         for (ordinal, tree) in trees.iter().enumerate() {
-            let ordinal = u32::try_from(ordinal).map_err(|_| limit_exceeded())?;
+            let ordinal =
+                u32::try_from(ordinal).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
             let root = tree.manifest().root();
             // Tree ordinals are unique within one enumeration, so the root
             // reference is always new.
@@ -369,7 +370,7 @@ impl Traversal {
         self.visited_partitions = self
             .visited_partitions
             .checked_add(1)
-            .ok_or_else(limit_exceeded)?;
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
         let index = context.manifest.logical_index_id();
         let tree_key = context.request.trees[entry.tree as usize].tree_key();
 
@@ -404,7 +405,7 @@ impl Traversal {
         // the same check rejects cycles before they can repeat a partition.
         if let Some(expected) = entry.expected_level {
             if header.level() != expected {
-                return Err(corruption());
+                return Err(Error::new(ErrorKind::Corruption));
             }
         }
         let level = header.level();
@@ -482,13 +483,15 @@ impl Traversal {
                         Some(PersistentValue::PartitionState(
                             PartitionTransition::DrainingSplit { left, right, .. },
                         )) => (left, right),
-                        _ => return Err(corruption()),
+                        _ => return Err(Error::new(ErrorKind::Corruption)),
                     };
                 self.inject(tree, left, header.level())?;
                 self.inject(tree, right, header.level())?;
                 Ok(())
             }
-            PartitionState::ReceivingSplit | PartitionState::Merging => Err(corruption()),
+            PartitionState::ReceivingSplit | PartitionState::Merging => {
+                Err(Error::new(ErrorKind::Corruption))
+            }
         }
     }
 
@@ -515,7 +518,7 @@ impl Traversal {
             let page = txn.scan(&range, cursor.as_ref(), limits).await?;
             for item in page.items() {
                 let PersistentValue::ChildEntry(child) = item.value() else {
-                    return Err(corruption());
+                    return Err(Error::new(ErrorKind::Corruption));
                 };
                 let distance = context
                     .kernel
@@ -524,7 +527,7 @@ impl Traversal {
                 // Entry; a second reference is Corruption, not a duplicate to
                 // deduplicate.
                 if !self.referenced.insert((tree, child.child())) {
-                    return Err(corruption());
+                    return Err(Error::new(ErrorKind::Corruption));
                 }
                 children.push((distance, child.child()));
             }
@@ -577,7 +580,7 @@ impl Traversal {
                 .budgets
                 .visited_leaf_entries()
                 .checked_sub(self.visited_leaf_entries)
-                .ok_or_else(limit_exceeded)?;
+                .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
             if remaining == 0 {
                 // Entries provably remain: the leaf is non-empty on entry and
                 // every later iteration follows a non-terminal page. The
@@ -587,7 +590,7 @@ impl Traversal {
                 break;
             }
             let item_limit = usize::try_from(remaining)
-                .map_err(|_| limit_exceeded())?
+                .map_err(|_| Error::new(ErrorKind::LimitExceeded))?
                 .min(ENTRY_SCAN_PAGE_ITEMS);
             let page = txn
                 .scan(
@@ -600,7 +603,7 @@ impl Traversal {
             let mut batch = Vec::with_capacity(items.len());
             for item in items {
                 let PersistentValue::LeafEntry(entry) = item.into_value() else {
-                    return Err(corruption());
+                    return Err(Error::new(ErrorKind::Corruption));
                 };
                 let (record_id, fields, code) = entry.into_parts();
                 let code = RaBitQ7::decode(&code, dimension)?;
@@ -608,7 +611,7 @@ impl Traversal {
                 // non-conservative distance here means corrupted state.
                 let distance = code
                     .approximate_distance(context.query)
-                    .map_err(|_| corruption())?;
+                    .map_err(|_| Error::new(ErrorKind::Corruption))?;
                 batch.push(LeafCandidate::new(
                     record_id,
                     fields,
@@ -658,7 +661,7 @@ impl Traversal {
         // A split target is exclusively referenced by the root transition
         // state before exposure; any second reference is Corruption.
         if !self.referenced.insert((tree, partition)) {
-            return Err(corruption());
+            return Err(Error::new(ErrorKind::Corruption));
         }
         self.frontier.push(Reverse(FrontierEntry {
             distance: 0.0,
@@ -677,7 +680,7 @@ impl Traversal {
         let mut seen = HashSet::new();
         for candidate in &self.candidates {
             if !seen.insert(candidate.record_id().as_ref()) {
-                return Err(corruption());
+                return Err(Error::new(ErrorKind::Corruption));
             }
         }
         self.candidates.sort_unstable_by(|left, right| {
@@ -704,17 +707,6 @@ fn beam_width(leaf_beam: u32, level: u32) -> u32 {
         .max(1)
 }
 
-/// Compares two finite f64 routing values, treating -0.0 and +0.0 as equal.
-fn compare_finite(left: f64, right: f64) -> Ordering {
-    if left < right {
-        Ordering::Less
-    } else if left > right {
-        Ordering::Greater
-    } else {
-        Ordering::Equal
-    }
-}
-
 /// Builds the scan bounds for one internal partition's Child Entry pages.
 ///
 /// The per-item byte bound covers the 28 fixed key bytes plus the canonical
@@ -722,17 +714,19 @@ fn compare_finite(left: f64, right: f64) -> Ordering {
 /// legal page is never byte-truncated. Transient split fanout exceeds the
 /// stable fanout of two, so pages iterate rather than assert a fanout.
 fn child_scan_limits(dimension: usize) -> Result<ScanLimits> {
-    let vector_bytes = dimension.checked_mul(4).ok_or_else(limit_exceeded)?;
+    let vector_bytes = dimension
+        .checked_mul(4)
+        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
     let per_item = 28_usize
         .checked_add(MAX_TREE_KEY_BYTES)
         .and_then(|bytes| bytes.checked_add(32))
         .and_then(|bytes| bytes.checked_add(vector_bytes))
-        .ok_or_else(limit_exceeded)?;
+        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
     Ok(ScanLimits {
         item_limit: ENTRY_SCAN_PAGE_ITEMS,
         byte_limit: per_item
             .checked_mul(ENTRY_SCAN_PAGE_ITEMS)
-            .ok_or_else(limit_exceeded)?,
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?,
     })
 }
 
@@ -747,7 +741,7 @@ fn leaf_entry_item_bytes(dimension: usize) -> Result<usize> {
     // maximum String payload.
     let field_bytes = MAX_FIELDS
         .checked_mul(5 + MAX_STRING_BYTES)
-        .ok_or_else(limit_exceeded)?;
+        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
     20_usize
         .checked_add(MAX_TREE_KEY_BYTES)
         .and_then(|bytes| bytes.checked_add(MAX_RECORD_ID_BYTES))
@@ -756,7 +750,7 @@ fn leaf_entry_item_bytes(dimension: usize) -> Result<usize> {
         .and_then(|bytes| bytes.checked_add(2 + field_bytes))
         .and_then(|bytes| bytes.checked_add(4))
         .and_then(|bytes| bytes.checked_add(code_bytes))
-        .ok_or_else(limit_exceeded)
+        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))
 }
 
 /// Builds the scan bounds for one Leaf Entry page funded by the budget.
@@ -765,7 +759,7 @@ fn leaf_scan_limits(item_bytes: usize, item_limit: usize) -> Result<ScanLimits> 
         item_limit,
         byte_limit: item_bytes
             .checked_mul(item_limit)
-            .ok_or_else(limit_exceeded)?,
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?,
     })
 }
 
@@ -773,7 +767,7 @@ fn leaf_scan_limits(item_bytes: usize, item_limit: usize) -> Result<ScanLimits> 
 fn expect_header(value: Option<PersistentValue>) -> Result<PartitionHeader> {
     match value {
         Some(PersistentValue::PartitionHeader(header)) => Ok(header),
-        _ => Err(corruption()),
+        _ => Err(Error::new(ErrorKind::Corruption)),
     }
 }
 
@@ -781,18 +775,8 @@ fn expect_header(value: Option<PersistentValue>) -> Result<PartitionHeader> {
 fn expect_synopsis(value: Option<PersistentValue>) -> Result<PartitionSynopsis> {
     match value {
         Some(PersistentValue::PartitionSynopsis(synopsis)) => Ok(synopsis),
-        _ => Err(corruption()),
+        _ => Err(Error::new(ErrorKind::Corruption)),
     }
-}
-
-/// A storage-corruption error for a broken persistent traversal invariant.
-fn corruption() -> Error {
-    Error::new(ErrorKind::Corruption)
-}
-
-/// A limit error for impossible traversal arithmetic.
-fn limit_exceeded() -> Error {
-    Error::new(ErrorKind::LimitExceeded)
 }
 
 #[cfg(test)]

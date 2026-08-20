@@ -125,8 +125,31 @@ pub async fn route_leaf_for_write<T: WriteTxn>(
     let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
     let kernel = kernel_for(manifest)?;
     let routing = kernel.preprocess(vector)?;
+    route_leaf_for_write_preprocessed(txn, tree_key, &kernel, &routing, started_at_unix_millis)
+        .await
+}
+
+/// Routes an already preprocessed routing vector through one tree for a
+/// foreground write.
+///
+/// `routing` must be the exact output of [`VectorKernel::preprocess`] under
+/// `kernel` for the bound Logical Index: the mutation pipeline preprocesses
+/// and quantizes each caller vector once and reuses the same routing vector
+/// here. The same empty-root growth and write validation contract as
+/// [`route_leaf_for_write`] applies.
+pub(crate) async fn route_leaf_for_write_preprocessed<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    tree_key: &TreeKey,
+    kernel: &VectorKernel,
+    routing: &[f32],
+    started_at_unix_millis: u64,
+) -> Result<Route> {
+    let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
+    if routing.len() != manifest.config().dimension() {
+        return Err(Error::invalid_argument());
+    }
     let root = ensure_tree(txn, tree_key, started_at_unix_millis).await?;
-    let route = descend(txn, manifest, &kernel, tree_key, root, &routing).await?;
+    let route = descend(txn, manifest, kernel, tree_key, root, routing).await?;
     validate_for_write(txn, manifest, tree_key, &route).await?;
     Ok(route)
 }
@@ -149,7 +172,7 @@ async fn ensure_tree<T: WriteTxn>(
     read_tree_manifest_plain(txn, tree_key)
         .await?
         .map(|tree| tree.root())
-        .ok_or_else(corruption)
+        .ok_or_else(|| Error::new(ErrorKind::Corruption))
 }
 
 /// Reads one Tree Manifest from a write transaction without establishing a
@@ -173,7 +196,7 @@ async fn read_tree_manifest_plain<T: WriteTxn>(
         Some(PersistentValue::TreeManifest(tree)) => Ok(Some(tree)),
         // The codec decodes a directory key only as a Tree Manifest, so a
         // different value kind is unreachable but must stay fail-closed.
-        Some(_) => Err(corruption()),
+        Some(_) => Err(Error::new(ErrorKind::Corruption)),
         None => Ok(None),
     }
 }
@@ -199,11 +222,11 @@ async fn descend<R: RoutingReader>(
         let header = read_header(reader, manifest, tree_key, partition).await?;
         if let Some(expected) = expected_level {
             if header.level() != expected {
-                return Err(corruption());
+                return Err(Error::new(ErrorKind::Corruption));
             }
         }
         if header.state() != PartitionState::Ready {
-            return Err(corruption());
+            return Err(Error::new(ErrorKind::Corruption));
         }
         if header.level() == 1 {
             return Ok(Route {
@@ -237,7 +260,7 @@ async fn read_header<R: RoutingReader>(
         // A Header key decodes only as a Partition Header, so another value
         // kind is unreachable; a missing Header on a referenced partition is
         // Corruption either way.
-        _ => Err(corruption()),
+        _ => Err(Error::new(ErrorKind::Corruption)),
     }
 }
 
@@ -264,11 +287,13 @@ async fn nearest_child<R: RoutingReader>(
         let page = reader.scan(&range, cursor.as_ref(), limits).await?;
         for item in page.items() {
             let PersistentValue::ChildEntry(entry) = item.value() else {
-                return Err(corruption());
+                return Err(Error::new(ErrorKind::Corruption));
             };
-            count = count.checked_add(1).ok_or_else(corruption)?;
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
             if count > INTERNAL_FANOUT {
-                return Err(corruption());
+                return Err(Error::new(ErrorKind::Corruption));
             }
             let distance = kernel.routing_distance(routing, entry.centroid())?;
             let nearer = match best {
@@ -291,9 +316,10 @@ async fn nearest_child<R: RoutingReader>(
         }
     }
     if count != INTERNAL_FANOUT {
-        return Err(corruption());
+        return Err(Error::new(ErrorKind::Corruption));
     }
-    best.map(|(_, child)| child).ok_or_else(corruption)
+    best.map(|(_, child)| child)
+        .ok_or_else(|| Error::new(ErrorKind::Corruption))
 }
 
 /// Builds the scan bounds that prove the internal fanout invariant.
@@ -304,15 +330,17 @@ async fn nearest_child<R: RoutingReader>(
 /// plus value framing per entry — so a legal page is never byte-truncated and
 /// the fanout check always sees every Child Entry.
 fn child_scan_limits(dimension: usize) -> Result<ScanLimits> {
-    let vector_bytes = dimension.checked_mul(4).ok_or_else(limit_exceeded)?;
+    let vector_bytes = dimension
+        .checked_mul(4)
+        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
     let per_item = 28_usize
         .checked_add(MAX_TREE_KEY_BYTES)
         .and_then(|bytes| bytes.checked_add(32))
         .and_then(|bytes| bytes.checked_add(vector_bytes))
-        .ok_or_else(limit_exceeded)?;
+        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
     let byte_limit = per_item
         .checked_mul(INTERNAL_FANOUT + 1)
-        .ok_or_else(limit_exceeded)?;
+        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
     Ok(ScanLimits {
         item_limit: INTERNAL_FANOUT + 1,
         byte_limit,
@@ -344,7 +372,7 @@ async fn validate_for_write<T: WriteTxn>(
     match header {
         Some(PersistentValue::PartitionHeader(header))
             if header.level() == 1 && header.state() == PartitionState::Ready => {}
-        _ => return Err(corruption()),
+        _ => return Err(Error::new(ErrorKind::Corruption)),
     }
     if let Some(parent) = route.parent {
         let edge = txn
@@ -357,29 +385,19 @@ async fn validate_for_write<T: WriteTxn>(
             .await?;
         match edge {
             Some(PersistentValue::ChildEntry(entry)) if entry.child() == route.leaf => {}
-            _ => return Err(corruption()),
+            _ => return Err(Error::new(ErrorKind::Corruption)),
         }
     }
     Ok(())
 }
 
 /// Builds the format-v1 vector kernel for the bound Logical Index.
-fn kernel_for(manifest: &IndexManifest) -> Result<VectorKernel> {
+pub(crate) fn kernel_for(manifest: &IndexManifest) -> Result<VectorKernel> {
     VectorKernel::new(
         manifest.config().dimension(),
         manifest.config().metric(),
         *manifest.rotation_seed(),
     )
-}
-
-/// A storage-corruption error for a broken persistent routing invariant.
-fn corruption() -> Error {
-    Error::new(ErrorKind::Corruption)
-}
-
-/// A limit error for impossible scan-budget arithmetic.
-fn limit_exceeded() -> Error {
-    Error::new(ErrorKind::LimitExceeded)
 }
 
 /// The read surface a routing descent needs from either transaction kind.

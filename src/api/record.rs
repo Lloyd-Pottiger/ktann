@@ -8,7 +8,7 @@ use bytes::Bytes;
 use super::schema::FieldSchema;
 use super::{Error, Result, Value};
 
-const MAX_RECORD_ID_BYTES: usize = 256;
+pub(crate) const MAX_RECORD_ID_BYTES: usize = 256;
 pub(crate) const MAX_PAYLOAD_BYTES: usize = 64 * 1_024;
 
 /// An engine-owned Vector Record accepted by insert and upsert.
@@ -48,7 +48,8 @@ impl Record {
 
     /// Validates this record against one Logical Index configuration.
     pub fn validate(&mut self, dimension: usize, schema: &[FieldSchema]) -> Result<()> {
-        self.validate_shape()?;
+        // Record shape is guaranteed by `Record::new` and `with_payload` and
+        // no field is mutably exposed, so only schema-dependent checks run.
         if self.vector.len() != dimension || self.fields.len() != schema.len() {
             return Err(Error::invalid_argument());
         }

@@ -5,6 +5,7 @@
 //! precision, constants, or random-word consumption would change stored
 //! RaBitQ codes even if the resulting vectors remained mathematically close.
 
+use std::cmp::Ordering;
 use std::mem::size_of;
 
 use crate::api::{Error, ErrorKind, MAX_DIMENSION, Metric, Result};
@@ -60,6 +61,11 @@ impl VectorKernel {
         })
     }
 
+    /// Returns the configured vector dimension.
+    pub(crate) const fn dimension(&self) -> usize {
+        self.dimension
+    }
+
     /// Validates, metric-preprocesses, and rotates a caller vector.
     ///
     /// Cosine is normalized with scalar f64 accumulation before conversion
@@ -112,14 +118,7 @@ impl VectorKernel {
         validate_vector(centroid, self.dimension, VectorSource::Persistent)?;
 
         match self.metric {
-            Metric::L2 => {
-                let mut squared = 0.0;
-                for index in 0..self.dimension {
-                    let difference = f64::from(routing[index]) - f64::from(centroid[index]);
-                    squared += difference * difference;
-                }
-                Ok(squared)
-            }
+            Metric::L2 => Ok(squared_l2(routing, centroid)),
             Metric::Cosine | Metric::InnerProduct => Ok(-dot_product(routing, centroid)),
         }
     }
@@ -135,11 +134,7 @@ impl VectorKernel {
 
         match self.metric {
             Metric::L2 => {
-                let mut squared = 0.0;
-                for index in 0..self.dimension {
-                    let difference = f64::from(query[index]) - f64::from(record[index]);
-                    squared += difference * difference;
-                }
+                let squared = squared_l2(query, record);
                 finite_exact_distance(squared, squared.sqrt())
             }
             Metric::InnerProduct => {
@@ -215,6 +210,15 @@ fn dot_product(left: &[f32], right: &[f32]) -> f64 {
     dot
 }
 
+fn squared_l2(left: &[f32], right: &[f32]) -> f64 {
+    let mut squared = 0.0;
+    for index in 0..left.len() {
+        let difference = f64::from(left[index]) - f64::from(right[index]);
+        squared += difference * difference;
+    }
+    squared
+}
+
 fn vector_norm(vector: &[f32], source: VectorSource) -> Result<f64> {
     // The order is part of the scalar-f64 protocol. Do not replace this with a
     // parallel reduction or f32/SIMD kernel without accounting for rounding.
@@ -235,6 +239,18 @@ fn finite_exact_distance(ranking: f64, distance: f64) -> Result<ExactDistance> {
         return Err(Error::invalid_argument());
     }
     Ok(ExactDistance { ranking, distance })
+}
+
+/// Orders two finite ranking values so `-0.0` and `0.0` tie and fall through
+/// to the deterministic Record ID tie-breaker.
+pub(crate) fn compare_finite(left: f64, right: f64) -> Ordering {
+    if left < right {
+        Ordering::Less
+    } else if left > right {
+        Ordering::Greater
+    } else {
+        Ordering::Equal
+    }
 }
 
 /// A reusable schedule for the format-v1 seeded orthogonal transformation.

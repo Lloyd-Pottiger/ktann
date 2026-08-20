@@ -278,12 +278,18 @@ impl CompiledExpression {
                 in_truths(field_synopsis, values, data_type, parameters)
             }
             Self::IsNull(field) => {
-                let (field, _, _) = synopsis_field(manifest, synopsis, *field)?;
-                presence_truths(field.has_null(), field.minimum().is_some())
+                let (field_synopsis, _, _) = synopsis_field(manifest, synopsis, *field)?;
+                presence_truths(
+                    field_synopsis.has_null(),
+                    field_synopsis.minimum().is_some(),
+                )
             }
             Self::IsNotNull(field) => {
-                let (field, _, _) = synopsis_field(manifest, synopsis, *field)?;
-                presence_truths(field.minimum().is_some(), field.has_null())
+                let (field_synopsis, _, _) = synopsis_field(manifest, synopsis, *field)?;
+                presence_truths(
+                    field_synopsis.minimum().is_some(),
+                    field_synopsis.has_null(),
+                )
             }
         }
     }
@@ -372,6 +378,20 @@ fn synopsis_field<'a>(
     ))
 }
 
+/// Seeds the possible truths with UNKNOWN from NULL presence and returns the
+/// MinMax bounds, which a synopsis holds exactly when a non-NULL value exists.
+fn null_seeded_bounds(synopsis: &FieldSynopsis) -> (TruthSet, Option<(&Value, &Value)>) {
+    let mut truths = TruthSet::EMPTY;
+    if synopsis.has_null() {
+        truths.insert(TruthValue::Unknown);
+    }
+    let bounds = match (synopsis.minimum(), synopsis.maximum()) {
+        (Some(minimum), Some(maximum)) => Some((minimum, maximum)),
+        _ => None,
+    };
+    (truths, bounds)
+}
+
 fn compare_truths(
     synopsis: &FieldSynopsis,
     op: CompareOp,
@@ -379,11 +399,8 @@ fn compare_truths(
     data_type: DataType,
     parameters: Option<BloomParameters>,
 ) -> Result<TruthSet> {
-    let mut truths = TruthSet::EMPTY;
-    if synopsis.has_null() {
-        truths.insert(TruthValue::Unknown);
-    }
-    let (Some(minimum), Some(maximum)) = (synopsis.minimum(), synopsis.maximum()) else {
+    let (mut truths, bounds) = null_seeded_bounds(synopsis);
+    let Some((minimum, maximum)) = bounds else {
         return Ok(truths);
     };
     let minimum_order = typed_order(minimum, value).ok_or_else(corrupt)?;
@@ -438,11 +455,8 @@ fn in_truths(
         return Ok(TruthSet::FALSE);
     }
 
-    let mut truths = TruthSet::EMPTY;
-    if synopsis.has_null() {
-        truths.insert(TruthValue::Unknown);
-    }
-    let (Some(minimum), Some(maximum)) = (synopsis.minimum(), synopsis.maximum()) else {
+    let (mut truths, bounds) = null_seeded_bounds(synopsis);
+    let Some((minimum, maximum)) = bounds else {
         return Ok(truths);
     };
     let mut true_possible = false;

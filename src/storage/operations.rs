@@ -219,7 +219,7 @@ impl LogicalScanItem {
         &self.value
     }
 
-    /// Consumes the item and returns the owned decoded persistent value.
+    /// Consumes the item and returns the decoded persistent value.
     #[must_use]
     pub fn into_value(self) -> PersistentValue {
         self.value
@@ -254,6 +254,12 @@ impl LogicalScanPage {
     #[must_use]
     pub const fn next_cursor(&self) -> Option<&LogicalScanCursor> {
         self.next_cursor.as_ref()
+    }
+
+    /// Consumes the page and returns the ordered decoded items.
+    #[must_use]
+    pub fn into_items(self) -> Vec<LogicalScanItem> {
+        self.items
     }
 
     /// Consumes the page and returns its continuation, if any.
@@ -398,6 +404,29 @@ fn decode_batch(
         .zip(values)
         .map(|(key, value)| decode_value(binding, key, value))
         .collect()
+}
+
+async fn get_logical<T: ReadOps>(
+    raw: &mut T,
+    binding: &LogicalBinding<'_>,
+    key: LogicalKey,
+) -> Result<Option<PersistentValue>> {
+    let encoded = encode_input_key(binding, &key)?;
+    let value = raw.get(encoded).await?;
+    decode_value(binding, &key, value)
+}
+
+async fn batch_get_logical<T: ReadOps>(
+    raw: &mut T,
+    binding: &LogicalBinding<'_>,
+    keys: Vec<LogicalKey>,
+) -> Result<Vec<Option<PersistentValue>>> {
+    let encoded = keys
+        .iter()
+        .map(|key| encode_input_key(binding, key))
+        .collect::<Result<Vec<_>>>()?;
+    let values = raw.batch_get(encoded).await?;
+    decode_batch(binding, &keys, values)
 }
 
 async fn scan_logical<T: ReadOps>(
@@ -552,9 +581,7 @@ impl<'manifest, T> ReadLogicalTxn<'manifest, T> {
 impl<T: ReadOps> ReadLogicalTxn<'_, T> {
     /// Reads one typed value, returning `None` when the key is absent.
     pub async fn get(&mut self, key: LogicalKey) -> Result<Option<PersistentValue>> {
-        let encoded = encode_input_key(&self.binding, &key)?;
-        let value = self.raw.get(encoded).await?;
-        decode_value(&self.binding, &key, value)
+        get_logical(&mut self.raw, &self.binding, key).await
     }
 
     /// Reads typed values in input order while preserving duplicates and gaps.
@@ -562,12 +589,7 @@ impl<T: ReadOps> ReadLogicalTxn<'_, T> {
         &mut self,
         keys: Vec<LogicalKey>,
     ) -> Result<Vec<Option<PersistentValue>>> {
-        let encoded = keys
-            .iter()
-            .map(|key| encode_input_key(&self.binding, key))
-            .collect::<Result<Vec<_>>>()?;
-        let values = self.raw.batch_get(encoded).await?;
-        decode_batch(&self.binding, &keys, values)
+        batch_get_logical(&mut self.raw, &self.binding, keys).await
     }
 
     /// Reads one Vector Record group from this transaction's snapshot.
@@ -607,7 +629,7 @@ impl<T: ReadOps> ReadLogicalTxn<'_, T> {
         let key_count = ids
             .len()
             .checked_mul(keys_per_id)
-            .ok_or_else(limit_exceeded)?;
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
         let mut keys = Vec::with_capacity(key_count);
         for id in &ids {
             keys.push(LogicalKey::Record {
@@ -635,7 +657,7 @@ impl<T: ReadOps> ReadLogicalTxn<'_, T> {
         encoded
             .iter()
             .try_fold(0_usize, |bytes, key| bytes.checked_add(key.len()))
-            .ok_or_else(limit_exceeded)?;
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
         let values = self.raw.batch_get(encoded).await?;
         let values = decode_batch(&self.binding, &keys, values)?;
 
@@ -664,7 +686,7 @@ impl<T: ReadOps> ReadLogicalTxn<'_, T> {
                     let payload = match payload {
                         Some(PersistentValue::OpaquePayload(payload)) => Some(payload),
                         None => None,
-                        Some(_) => return Err(corruption()),
+                        Some(_) => return Err(Error::new(ErrorKind::Corruption)),
                     };
                     Some(RecordGroupRead {
                         record,
@@ -672,7 +694,7 @@ impl<T: ReadOps> ReadLogicalTxn<'_, T> {
                         payload,
                     })
                 }
-                _ => return Err(corruption()),
+                _ => return Err(Error::new(ErrorKind::Corruption)),
             });
         }
         Ok(groups)
@@ -792,7 +814,7 @@ impl<'manifest> MutationBuilder<'manifest> {
                     .bytes
                     .checked_sub(old_bytes)
                     .and_then(|bytes| bytes.checked_add(new_bytes))
-                    .ok_or_else(limit_exceeded)?;
+                    .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
                 let next = TransactionSize {
                     mutations: self.size.mutations,
                     bytes,
@@ -807,12 +829,12 @@ impl<'manifest> MutationBuilder<'manifest> {
                         .size
                         .mutations
                         .checked_add(1)
-                        .ok_or_else(limit_exceeded)?,
+                        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?,
                     bytes: self
                         .size
                         .bytes
                         .checked_add(new_bytes)
-                        .ok_or_else(limit_exceeded)?,
+                        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?,
                 };
                 check_budget(self.budget, next)?;
                 entry.insert(value);
@@ -850,14 +872,14 @@ impl fmt::Debug for MutationBuilder<'_> {
 fn mutation_bytes(key: &Bytes, value: Option<&Bytes>) -> Result<usize> {
     key.len()
         .checked_add(value.map_or(0, Bytes::len))
-        .ok_or_else(limit_exceeded)
+        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))
 }
 
 fn check_hard_limits(limits: HardLimits, key: &Bytes, value: Option<&Bytes>) -> Result<()> {
     if key.len() > limits.max_key_bytes
         || value.is_some_and(|value| value.len() > limits.max_value_bytes)
     {
-        Err(limit_exceeded())
+        Err(Error::new(ErrorKind::LimitExceeded))
     } else {
         Ok(())
     }
@@ -865,18 +887,10 @@ fn check_hard_limits(limits: HardLimits, key: &Bytes, value: Option<&Bytes>) -> 
 
 fn check_budget(budget: AdmissionBudget, size: TransactionSize) -> Result<()> {
     if size.mutations > budget.max_mutations || size.bytes > budget.max_mutation_bytes {
-        Err(limit_exceeded())
+        Err(Error::new(ErrorKind::LimitExceeded))
     } else {
         Ok(())
     }
-}
-
-fn limit_exceeded() -> Error {
-    Error::new(ErrorKind::LimitExceeded)
-}
-
-fn corruption() -> Error {
-    Error::new(ErrorKind::Corruption)
 }
 
 /// A write transaction that exposes typed logical reads and mutations.
@@ -1003,9 +1017,7 @@ impl<T> fmt::Debug for WriteLogicalTxn<'_, T> {
 impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
     /// Reads one typed value from the transaction snapshot and pending writes.
     pub async fn get(&mut self, key: LogicalKey) -> Result<Option<PersistentValue>> {
-        let encoded = encode_input_key(&self.binding, &key)?;
-        let value = self.raw.get(encoded).await?;
-        decode_value(&self.binding, &key, value)
+        get_logical(&mut self.raw, &self.binding, key).await
     }
 
     /// Reads typed values in input order from the transaction snapshot.
@@ -1013,12 +1025,7 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
         &mut self,
         keys: Vec<LogicalKey>,
     ) -> Result<Vec<Option<PersistentValue>>> {
-        let encoded = keys
-            .iter()
-            .map(|key| encode_input_key(&self.binding, key))
-            .collect::<Result<Vec<_>>>()?;
-        let values = self.raw.batch_get(encoded).await?;
-        decode_batch(&self.binding, &keys, values)
+        batch_get_logical(&mut self.raw, &self.binding, keys).await
     }
 
     /// Reads one typed value and establishes a point conflict on its key.
@@ -1090,7 +1097,7 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
         let next = self
             .size
             .checked_add(mutation_size)
-            .ok_or_else(limit_exceeded)?;
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
         check_budget(self.budget, next)?;
         let outcome = self.raw.insert(encoded_key, encoded_value).await?;
         if outcome == InsertOutcome::Inserted {
@@ -1110,7 +1117,7 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
         let next = self
             .size
             .checked_add(builder.size)
-            .ok_or_else(limit_exceeded)?;
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
         check_budget(self.budget, next)?;
         self.raw
             .batch_mutate(builder.into_backend_mutations())
@@ -1127,14 +1134,14 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
             .start()
             .len()
             .checked_add(range.raw.end().len())
-            .ok_or_else(limit_exceeded)?;
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
         let next = self
             .size
             .checked_add(TransactionSize {
                 mutations: 1,
                 bytes,
             })
-            .ok_or_else(limit_exceeded)?;
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
         check_budget(self.budget, next)?;
         self.raw.clear_range(&range.raw).await?;
         self.size = next;

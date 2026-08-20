@@ -62,25 +62,34 @@ pub(crate) async fn batch_get_records<B: Backend>(
 }
 
 /// Validates the persisted Manifest of the opened handle in one snapshot.
+async fn validate_manifest<T: ReadOps>(
+    txn: &mut ReadLogicalTxn<'_, T>,
+    handle: &IndexManifest,
+) -> Result<IndexManifest> {
+    opened_manifest(
+        txn.get(LogicalKey::Manifest(handle.logical_index_id()))
+            .await?,
+        handle,
+    )
+}
+
+/// Classifies the persisted Manifest of the opened handle in one snapshot.
 ///
 /// The handle never retargets to a newer Logical Index, so the persisted
 /// Manifest must be Active and carry the handle's exact immutable identity.
 /// A supported but Dropping Manifest fails with `IndexDropping`; an absent
 /// Manifest means the Logical Index no longer exists.
-async fn validate_manifest<T: ReadOps>(
-    txn: &mut ReadLogicalTxn<'_, T>,
+pub(crate) fn opened_manifest(
+    value: Option<PersistentValue>,
     handle: &IndexManifest,
 ) -> Result<IndexManifest> {
-    match txn
-        .get(LogicalKey::Manifest(handle.logical_index_id()))
-        .await?
-    {
+    match value {
         Some(PersistentValue::IndexManifest(current)) => match current.lifecycle() {
             IndexLifecycle::Active if current.has_same_immutable_identity(handle) => Ok(current),
-            IndexLifecycle::Active => Err(corruption()),
+            IndexLifecycle::Active => Err(Error::new(ErrorKind::Corruption)),
             IndexLifecycle::Dropping => Err(Error::new(ErrorKind::IndexDropping)),
         },
-        Some(_) => Err(corruption()),
+        Some(_) => Err(Error::new(ErrorKind::Corruption)),
         None => Err(Error::new(ErrorKind::IndexNotFound)),
     }
 }
@@ -100,8 +109,4 @@ fn stored_record(include_payload: bool, group: RecordGroupRead) -> StoredRecord 
         (false, _) => PayloadProjection::NotLoaded,
     };
     StoredRecord::new(id, Arc::from(vector), fields, payload)
-}
-
-fn corruption() -> Error {
-    Error::new(ErrorKind::Corruption)
 }

@@ -125,24 +125,24 @@ impl Decoder {
         self.bytes.len() - self.position
     }
 
-    fn take(&mut self, length: usize) -> Result<&[u8]> {
+    fn take_range(&mut self, length: usize) -> Result<(usize, usize)> {
         let end = self.position.checked_add(length).ok_or_else(corrupt)?;
         if end > self.bytes.len() {
             return Err(corrupt());
         }
         let start = self.position;
         self.position = end;
+        Ok((start, end))
+    }
+
+    fn take(&mut self, length: usize) -> Result<&[u8]> {
+        let (start, end) = self.take_range(length)?;
         Ok(&self.bytes[start..end])
     }
 
     fn take_bytes(&mut self, length: usize) -> Result<Bytes> {
-        let end = self.position.checked_add(length).ok_or_else(corrupt)?;
-        if end > self.bytes.len() {
-            return Err(corrupt());
-        }
-        let value = self.bytes.slice(self.position..end);
-        self.position = end;
-        Ok(value)
+        let (start, end) = self.take_range(length)?;
+        Ok(self.bytes.slice(start..end))
     }
 
     pub(super) fn array<const N: usize>(&mut self) -> Result<[u8; N]> {

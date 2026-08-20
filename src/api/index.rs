@@ -5,14 +5,16 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
+use crate::maintenance::mutation;
 use crate::runtime::RuntimeInner;
-use crate::runtime::reads;
+use crate::runtime::{lifecycle, reads};
 use crate::storage::backend::Backend;
 use crate::storage::values::{IndexLifecycle, IndexManifest};
 
 use super::{
-    Error, GetOptions, IndexConfig, IndexName, LogicalIndexId, OperationOptions, Result,
-    StoredRecord, validate_id, validate_ids,
+    Error, ErrorKind, GetOptions, IndexConfig, IndexName, LogicalIndexId, Mutation,
+    MutationOutcome, OperationOptions, Record, Result, StoredRecord, UpsertResult, validate_id,
+    validate_ids, validate_mutations,
 };
 
 /// A cheap cloneable handle to one Active Logical Index.
@@ -34,7 +36,7 @@ impl<B: Backend> Index<B> {
         manifest: IndexManifest,
     ) -> Result<Self> {
         if manifest.lifecycle() != IndexLifecycle::Active {
-            return Err(Error::new(super::ErrorKind::IndexDropping));
+            return Err(Error::new(ErrorKind::IndexDropping));
         }
         Ok(Self {
             runtime,
@@ -59,6 +61,141 @@ impl<B: Backend> Index<B> {
     #[must_use]
     pub fn config(&self) -> &IndexConfig {
         self.manifest.config()
+    }
+
+    /// Inserts one Vector Record only when its Record ID is absent.
+    ///
+    /// The record is validated against this index's immutable configuration
+    /// before any storage work. The atomic commit installs the Vector Record,
+    /// its Record Location, the routed Leaf Entry, and every affected exact
+    /// count and synopsis together; an existing Record ID fails with
+    /// [`ErrorKind::RecordAlreadyExists`]. A retryable topology or write
+    /// conflict restarts the whole operation from a fresh snapshot under the
+    /// Runtime's bounded contention policy, and a commit of unknown outcome is
+    /// returned as [`ErrorKind::CommitOutcomeUnknown`] without a retry.
+    pub async fn insert(&self, record: Record) -> Result<()> {
+        self.insert_with_control(record, OperationOptions::default())
+            .await
+    }
+
+    /// Inserts one Vector Record with explicit operation control.
+    pub async fn insert_with_control(
+        &self,
+        record: Record,
+        operation_options: OperationOptions,
+    ) -> Result<()> {
+        let mut mutations = vec![Mutation::Insert(record)];
+        self.validate(&mut mutations)?;
+        let outcomes = self.run_mutations(mutations, operation_options).await?;
+        match outcomes.first() {
+            Some(MutationOutcome::Inserted) => Ok(()),
+            _ => Err(Error::new(ErrorKind::Backend)),
+        }
+    }
+
+    /// Creates or fully replaces one Vector Record, last-write-wins.
+    ///
+    /// The returned [`UpsertResult`] reports whether an existing Vector Record
+    /// was replaced. Replacement is an atomic move: a changed Tree Key or a
+    /// newly routed leaf relocates the Leaf Entry in the same commit, `None`
+    /// payload deletes an old payload, and `Some(empty)` stores an empty
+    /// payload, which stays distinct from absence. Validation, retry, and
+    /// commit-outcome behavior match [`insert`](Self::insert).
+    pub async fn upsert(&self, record: Record) -> Result<UpsertResult> {
+        self.upsert_with_control(record, OperationOptions::default())
+            .await
+    }
+
+    /// Creates or fully replaces one Vector Record with explicit operation
+    /// control.
+    pub async fn upsert_with_control(
+        &self,
+        record: Record,
+        operation_options: OperationOptions,
+    ) -> Result<UpsertResult> {
+        let mut mutations = vec![Mutation::Upsert(record)];
+        self.validate(&mut mutations)?;
+        let outcomes = self.run_mutations(mutations, operation_options).await?;
+        match outcomes.first() {
+            Some(MutationOutcome::Upserted { replaced: true }) => Ok(UpsertResult::Replaced),
+            Some(MutationOutcome::Upserted { replaced: false }) => Ok(UpsertResult::Created),
+            _ => Err(Error::new(ErrorKind::Backend)),
+        }
+    }
+
+    /// Idempotently deletes one Vector Record by Record ID.
+    ///
+    /// Returns whether a Vector Record existed. Delete follows the exact
+    /// stored Record Location and atomically removes the record, location,
+    /// Leaf Entry, and any Opaque Payload. Validation, retry, and
+    /// commit-outcome behavior match [`insert`](Self::insert).
+    pub async fn delete(&self, id: Bytes) -> Result<bool> {
+        self.delete_with_control(id, OperationOptions::default())
+            .await
+    }
+
+    /// Deletes one Vector Record with explicit operation control.
+    pub async fn delete_with_control(
+        &self,
+        id: Bytes,
+        operation_options: OperationOptions,
+    ) -> Result<bool> {
+        let mut mutations = vec![Mutation::Delete(id)];
+        self.validate(&mut mutations)?;
+        let outcomes = self.run_mutations(mutations, operation_options).await?;
+        match outcomes.first() {
+            Some(MutationOutcome::Deleted { existed }) => Ok(*existed),
+            _ => Err(Error::new(ErrorKind::Backend)),
+        }
+    }
+
+    /// Applies one atomic mutation batch.
+    ///
+    /// A nonempty batch is one atomic transaction and is never split: every
+    /// mutation commits or none does. Outcomes correspond to inputs in order.
+    /// Validation of the whole batch completes before storage work; duplicate
+    /// Record IDs are invalid. An empty batch succeeds with an empty result.
+    /// Any item failure returns one operation error carrying the input
+    /// position and no partial outcomes. Retry and commit-outcome behavior
+    /// match [`insert`](Self::insert).
+    pub async fn batch_mutate(&self, mutations: Vec<Mutation>) -> Result<Vec<MutationOutcome>> {
+        self.batch_mutate_with_control(mutations, OperationOptions::default())
+            .await
+    }
+
+    /// Applies one atomic mutation batch with explicit operation control.
+    pub async fn batch_mutate_with_control(
+        &self,
+        mut mutations: Vec<Mutation>,
+        operation_options: OperationOptions,
+    ) -> Result<Vec<MutationOutcome>> {
+        self.validate(&mut mutations)?;
+        if mutations.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.run_mutations(mutations, operation_options).await
+    }
+
+    /// Validates one mutation batch against this index's immutable
+    /// configuration before any storage work.
+    fn validate(&self, mutations: &mut [Mutation]) -> Result<()> {
+        let config = self.manifest.config();
+        validate_mutations(mutations, config.dimension(), config.fields())
+    }
+
+    /// Runs one validated mutation batch under foreground admission.
+    async fn run_mutations(
+        &self,
+        mutations: Vec<Mutation>,
+        operation_options: OperationOptions,
+    ) -> Result<Vec<MutationOutcome>> {
+        let retry = lifecycle::RetryPolicy::from_config(self.runtime.config());
+        let manifest = Arc::clone(&self.manifest);
+        self.runtime
+            .run_foreground(operation_options, move |mut context| async move {
+                mutation::mutate(&mut context, &manifest, &mutations, retry).await
+            })
+            .await
     }
 
     /// Reads one Vector Record by Record ID.
