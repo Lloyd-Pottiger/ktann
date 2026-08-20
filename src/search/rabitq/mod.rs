@@ -4,15 +4,6 @@
 //! f64 approximate distances, conservative intervals, and deterministic
 //! overlap selection. Callers do not need to know the bit layout or the
 //! directed-rounding rules that keep its intervals conservative.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        unused_imports,
-        reason = "the RaBitQ7 codec is consumed by storage; quantize and candidate \
-                  selection are consumed by the mutation and search pipelines (#9, #30)"
-    )
-)]
 
 mod codec;
 mod interval;
@@ -29,9 +20,9 @@ use bytes::Bytes;
 use crate::api::Result;
 
 pub(crate) use interval::RaBitQQuery;
-pub(crate) use selection::{
-    ApproximateCandidate, OverlapSelection, select_global_overlap, select_leaf_overlap,
-};
+#[cfg(test)]
+pub(crate) use selection::OverlapSelection;
+pub(crate) use selection::{ApproximateCandidate, select_global_overlap, select_leaf_overlap};
 
 /// One decoded canonical absolute RaBitQ7 payload.
 pub(crate) struct RaBitQ7 {

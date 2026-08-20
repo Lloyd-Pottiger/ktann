@@ -15,14 +15,6 @@
 //! materializes only keys counted inside that budget, so an unlimited number
 //! of stored trees cannot cause unbounded query memory or read-ahead.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the bounded search operation consumes the planner and enumeration (#30)"
-    )
-)]
-
 use std::cmp::Ordering;
 
 use crate::api::{
@@ -104,7 +96,7 @@ impl TreeKeyPlan {
     }
 
     /// Returns whether the predicate can match no Tree Key at all.
-    #[must_use]
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.ranges.is_empty()
     }
@@ -288,10 +280,7 @@ pub(crate) async fn enumerate_tree_keys<T: ReadOps>(
                     .checked_sub(1)
                     .ok_or_else(|| Error::new(ErrorKind::Backend))?;
                 if plan.accepts(tree_key)? {
-                    trees.push(EnumeratedTree {
-                        tree_key: tree_key.clone(),
-                        manifest: *tree_manifest,
-                    });
+                    trees.push(EnumeratedTree::new(tree_key.clone(), *tree_manifest));
                 }
             }
             match page.into_next_cursor() {

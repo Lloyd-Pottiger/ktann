@@ -8,14 +8,6 @@
 //! from one consistent snapshot, computes exact f64 distances over the
 //! unrotated vectors, and builds Search Hits ordered by distance and then
 //! unsigned lexicographic Record ID bytes.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "tree traversal (#9) and the public search operation (#30) consume the \
-                  exact filtering and reranking stage"
-    )
-)]
 
 use std::collections::BTreeSet;
 
@@ -28,7 +20,7 @@ use crate::storage::values::RecordLocation;
 
 use super::numeric::{ExactDistance, VectorKernel, compare_finite};
 use super::predicate::CompiledPredicate;
-use super::rabitq::ApproximateDistance;
+use super::rabitq::{ApproximateCandidate, ApproximateDistance};
 
 /// The number of Vector Records loaded per backend batch.
 ///
@@ -92,6 +84,18 @@ impl std::fmt::Debug for LeafCandidate {
     }
 }
 
+impl From<LeafCandidate> for ApproximateCandidate<LeafCandidate> {
+    /// Wraps one candidate with its selection ranking key: the Record ID and
+    /// the rough distance with its conservative interval.
+    fn from(candidate: LeafCandidate) -> Self {
+        ApproximateCandidate::new(
+            candidate.record_id().clone(),
+            candidate.distance(),
+            candidate,
+        )
+    }
+}
+
 /// The exact-rerank stage's hits and its owned Search Budget accounting.
 ///
 /// The traversal/search integration (#9, #30) folds the usage counter into
@@ -105,6 +109,7 @@ pub(crate) struct ExactRerankOutcome {
 
 impl ExactRerankOutcome {
     /// Returns the hits ordered by exact distance and Record ID bytes.
+    #[cfg(test)]
     pub(crate) fn hits(&self) -> &[SearchHit] {
         &self.hits
     }
