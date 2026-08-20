@@ -61,6 +61,11 @@ impl VectorKernel {
         })
     }
 
+    /// Returns the configured vector dimension.
+    pub(crate) const fn dimension(&self) -> usize {
+        self.dimension
+    }
+
     /// Validates, metric-preprocesses, and rotates a caller vector.
     ///
     /// Cosine is normalized with scalar f64 accumulation before conversion
