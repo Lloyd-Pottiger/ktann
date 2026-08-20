@@ -1,12 +1,4 @@
 //! Schema-compiled exact Filter Predicate evaluation.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "synopsis classification is consumed by traversal (#9) and predicate \
-                  compilation by the public search operation (#30)"
-    )
-)]
 
 use std::cmp::Ordering;
 

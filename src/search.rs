@@ -8,9 +8,8 @@
 //! budget accounting. `rerank` owns exact Leaf Entry filtering, bounded
 //! Vector Record loading, and exact reranking. `cache` owns the
 //! snapshot-validated Partition Cache of decoded search bodies. The RaBitQ7
-//! codec is consumed by storage's Leaf Entry encoding; the cache, the
-//! traversal, and the remaining planner and candidate-selection items are
-//! consumed by the public search operation tracked in #30.
+//! codec is consumed by storage's Leaf Entry encoding; the runtime's search
+//! operation consumes the planner, cache, traversal, and rerank stages.
 
 pub(crate) mod cache;
 pub(crate) mod numeric;

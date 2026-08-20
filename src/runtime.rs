@@ -19,6 +19,7 @@ use crate::storage::backend::{Backend, CommitCancellation, CommitStart};
 pub(crate) mod import;
 pub(crate) mod lifecycle;
 pub(crate) mod reads;
+pub(crate) mod search;
 
 /// Owns one backend and its process-local foreground operation lifecycle.
 ///
@@ -45,7 +46,7 @@ impl<B: Backend> Runtime<B> {
         }
 
         let foreground_limit = config.foreground_operation_limit();
-        let partition_cache = PartitionCache::new(config.partition_cache_bytes());
+        let partition_cache = Arc::new(PartitionCache::new(config.partition_cache_bytes()));
         Ok(Self {
             handle: Arc::new(RuntimeHandle {
                 inner: Arc::new(RuntimeInner {
@@ -297,7 +298,7 @@ async fn cancel_task_before_commit<T>(
 pub(crate) struct RuntimeInner<B: Backend> {
     executor: Handle,
     config: RuntimeConfig,
-    partition_cache: PartitionCache,
+    partition_cache: Arc<PartitionCache>,
     foreground: Arc<Semaphore>,
     foreground_waiting: Arc<Semaphore>,
     lifecycle: Mutex<Lifecycle<B>>,
@@ -502,10 +503,10 @@ impl<B: Backend> RuntimeInner<B> {
         &self.config
     }
 
-    /// Returns the process-shared snapshot-validated Partition Cache.
-    #[expect(dead_code, reason = "search traversal (#9) reads the shared cache")]
-    pub(crate) fn partition_cache(&self) -> &PartitionCache {
-        &self.partition_cache
+    /// Returns a shared handle to the process-wide snapshot-validated
+    /// Partition Cache.
+    pub(crate) fn partition_cache(&self) -> Arc<PartitionCache> {
+        Arc::clone(&self.partition_cache)
     }
 
     fn lock_lifecycle(&self) -> MutexGuard<'_, Lifecycle<B>> {

@@ -7,14 +7,14 @@ use bytes::Bytes;
 
 use crate::maintenance::mutation;
 use crate::runtime::RuntimeInner;
-use crate::runtime::{lifecycle, reads};
+use crate::runtime::{lifecycle, reads, search};
 use crate::storage::backend::Backend;
 use crate::storage::values::{IndexLifecycle, IndexManifest};
 
 use super::{
     Error, ErrorKind, GetOptions, ImportOptions, ImportSession, IndexConfig, IndexName,
-    LogicalIndexId, Mutation, MutationOutcome, OperationOptions, Record, Result, StoredRecord,
-    UpsertResult, validate_id, validate_ids, validate_mutations,
+    LogicalIndexId, Mutation, MutationOutcome, OperationOptions, Record, Result, SearchOutcome,
+    SearchRequest, StoredRecord, UpsertResult, validate_id, validate_ids, validate_mutations,
 };
 
 /// A cheap cloneable handle to one Active Logical Index.
@@ -195,6 +195,52 @@ impl<B: Backend> Index<B> {
             .in_flight_batches()
             .unwrap_or_else(|| self.runtime.config().import_in_flight_batches());
         Ok(ImportSession::new(self.clone(), in_flight_batches))
+    }
+
+    /// Runs one bounded approximate search over one consistent snapshot.
+    ///
+    /// The request is validated against this index's immutable configuration
+    /// before admission: the vector dimension must match, the Filter Predicate
+    /// must be schema-correct, and the effective Search Budgets resolve from
+    /// the Runtime defaults and the request overrides within hard caps, with
+    /// the exact-rerank budget at least `k`. Manifest validation, Tree Key
+    /// enumeration, traversal, filtering, Vector Record loading, and exact
+    /// reranking then read from one consistent backend snapshot, and partition
+    /// bodies are served by the Runtime's snapshot-validated Partition Cache.
+    ///
+    /// The outcome reports ordered exact-distance hits, actual budget usage,
+    /// every budget dimension that prevented eligible work, and per-leaf
+    /// RaBitQ overlap truncation. Success may return fewer than `k` hits and
+    /// deliberately makes no exact-global-top-k, completeness, continuation,
+    /// or monotonic-across-budgets guarantee: resubmitting the same request
+    /// with larger budgets asks for more work without promising a superset of
+    /// earlier hits. Cancellation and deadline apply to the whole operation;
+    /// search never commits, so they surface as errors, never partial state.
+    pub async fn search(&self, request: SearchRequest) -> Result<SearchOutcome> {
+        self.search_with_control(request, OperationOptions::default())
+            .await
+    }
+
+    /// Runs one bounded approximate search with explicit operation control.
+    pub async fn search_with_control(
+        &self,
+        request: SearchRequest,
+        operation_options: OperationOptions,
+    ) -> Result<SearchOutcome> {
+        let config = self.runtime.config();
+        let prepared = search::PreparedSearch::new(
+            &self.manifest,
+            config.default_search_budgets(),
+            config.tree_key_scan_ranges(),
+            request,
+        )?;
+        let manifest = Arc::clone(&self.manifest);
+        let cache = self.runtime.partition_cache();
+        self.runtime
+            .run_foreground(operation_options, move |mut context| async move {
+                search::search(&mut context, &cache, &manifest, prepared).await
+            })
+            .await
     }
 
     /// Validates one mutation batch against this index's immutable

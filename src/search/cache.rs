@@ -26,14 +26,6 @@
 //! policy is an internal benchmark-tunable detail, not a persistent or public
 //! compatibility contract; cache warmth never changes logical search-budget
 //! accounting.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "tree traversal (#9) and the public search operation (#30) consume the \
-                  partition cache"
-    )
-)]
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -129,7 +121,7 @@ pub(crate) struct CachedBody {
 
 impl CachedBody {
     /// Returns the Header cache epoch this body was decoded from.
-    #[must_use]
+    #[cfg(test)]
     pub(crate) const fn epoch(&self) -> u64 {
         self.epoch
     }

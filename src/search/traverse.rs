@@ -6,10 +6,11 @@
 //! eligible tree fairly through one global best-first frontier, expands
 //! internal partitions through their Child Entries, prunes Leaf Partitions
 //! through their conservative synopses, and reduces each visited leaf to its
-//! bounded RaBitQ overlap candidates. Global overlap selection, exact Vector
+//! bounded RaBitQ overlap candidates. Partition bodies are loaded through the
+//! snapshot-validated Partition Cache (ADR 0010); cache warmth never changes
+//! the logical budget accounting below. Global overlap selection, exact Vector
 //! Record loading and reranking, and Search Outcome assembly stay with the
-//! rerank stage and the public search operation (#30); snapshot-validated
-//! caching is a separate concern (#29).
+//! rerank stage and the public search operation (#30).
 //!
 //! # Contract
 //!
@@ -29,11 +30,13 @@
 //!   as one.
 //! - **Bounded work, charged before it starts.** Each distinct
 //!   `{Tree Key, Partition Key}` body is visited and charged to the Partition
-//!   budget at most once. Every Leaf Entry page is limited to the remaining
-//!   Leaf Entry budget before it is scanned, so no entry is ever read
-//!   unfunded. A budget dimension is reported exhausted only when eligible
-//!   pending work was actually prevented by its depletion — never merely
-//!   because natural completion landed exactly on the limit (ADR 0011).
+//!   budget at most once. Decoded bodies arrive whole from the
+//!   snapshot-validated cache, but Leaf Entries are charged and considered
+//!   only while the Leaf Entry budget funds them, in canonical body order, so
+//!   cache warmth never changes the logical accounting. A budget dimension is
+//!   reported exhausted only when eligible pending work was actually prevented
+//!   by its depletion — never merely because natural completion landed
+//!   exactly on the limit (ADR 0011).
 //! - **Intermediate topology.** Non-root partitions in every committed state
 //!   are reached only through their current Child Entries and searched as
 //!   ordinary same-level bodies. A Splitting root exposes no targets, so only
@@ -43,35 +46,27 @@
 //!   Corruption.
 //! - **Fail closed.** A missing Header, Synopsis, or referenced State, a
 //!   wrong-kind value, a level that fails to descend exactly one level per
-//!   hop, a second incoming reference to one partition, or a duplicate Record
-//!   ID among the admitted candidates is Corruption.
+//!   hop, a body whose decoded entries disagree with the Header's exact
+//!   count, a second incoming reference to one partition, or a duplicate
+//!   Record ID among the admitted candidates is Corruption.
 //! - **Approximate bounds are never exact filters.** Synopses prune a leaf
 //!   only when they prove `NoMatch`; exact predicate evaluation admits
 //!   entries; RaBitQ intervals only order candidates and drive the bounded
 //!   conservative overlap selection.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the public search operation (#30) drives tree traversal"
-    )
-)]
-
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt;
 
-use crate::api::{
-    Error, ErrorKind, MAX_FIELDS, MAX_STRING_BYTES, PartitionKey, Result, SearchBudgets,
-};
-use crate::storage::backend::{ReadOps, ScanLimits};
-use crate::storage::keys::{LogicalKey, MAX_RECORD_ID_BYTES, MAX_TREE_KEY_BYTES, TreeKey};
+use crate::api::{Error, ErrorKind, PartitionKey, Result, SearchBudgets};
+use crate::storage::ReadLogicalTxn;
+use crate::storage::backend::ReadOps;
+use crate::storage::keys::{LogicalKey, TreeKey};
 use crate::storage::values::{
     IndexManifest, PartitionHeader, PartitionState, PartitionSynopsis, PartitionTransition,
     PersistentValue, RecordLocation,
 };
-use crate::storage::{LogicalRange, LogicalScanCursor, ReadLogicalTxn};
 
+use super::cache::{BodyEntries, PartitionCache, load_body};
 use super::numeric::{VectorKernel, compare_finite};
 use super::plan::EnumeratedTree;
 use super::predicate::{CompiledPredicate, SynopsisClassification};
@@ -80,9 +75,6 @@ use super::rerank::{LeafCandidate, filter_candidates};
 
 /// The default leaf-level base beam (design `search.md` section 6).
 pub(crate) const DEFAULT_LEAF_BEAM: u32 = 32;
-
-/// The item cap of one Child Entry or Leaf Entry scan page.
-const ENTRY_SCAN_PAGE_ITEMS: usize = 64;
 
 /// One bounded traversal request over the enumerated trees of one snapshot.
 ///
@@ -142,7 +134,7 @@ pub(crate) struct TraversalOutcome {
 
 impl TraversalOutcome {
     /// Returns the merged candidates in rough-distance/Record-ID order.
-    #[must_use]
+    #[cfg(test)]
     pub(crate) fn candidates(&self) -> &[LeafCandidate] {
         &self.candidates
     }
@@ -208,10 +200,14 @@ impl fmt::Debug for TraversalOutcome {
 /// Traverses every requested tree under one consistent snapshot.
 ///
 /// Returns the merged per-leaf candidate selections and the traversal-owned
-/// budget accounting. The result is a deterministic function of the snapshot,
-/// the request, and the budgets.
+/// budget accounting. Partition bodies come from the snapshot-validated
+/// `cache`: a hit serves the decoded body without backend reads, and a miss
+/// scans, validates, and publishes the body from `txn`'s snapshot. The result
+/// is a deterministic function of the snapshot, the request, and the budgets,
+/// independent of cache warmth.
 pub(crate) async fn traverse<T: ReadOps>(
     txn: &mut ReadLogicalTxn<'_, T>,
+    cache: &PartitionCache,
     kernel: &VectorKernel,
     request: TraversalRequest<'_>,
 ) -> Result<TraversalOutcome> {
@@ -219,6 +215,7 @@ pub(crate) async fn traverse<T: ReadOps>(
     let query = RaBitQQuery::new(request.routing, manifest.config().metric())?;
     let context = VisitContext {
         manifest,
+        cache,
         kernel,
         query: &query,
         rerank_cap: usize::try_from(request.budgets.exact_rerank_candidates())
@@ -233,6 +230,7 @@ pub(crate) async fn traverse<T: ReadOps>(
 /// The manifest-bound inputs shared by every partition visit.
 struct VisitContext<'a> {
     manifest: &'a IndexManifest,
+    cache: &'a PartitionCache,
     kernel: &'a VectorKernel,
     query: &'a RaBitQQuery<'a>,
     /// The exact-rerank budget converted for the per-leaf overlap caps.
@@ -494,10 +492,11 @@ impl Traversal {
 
     /// Expands one internal partition's Child Entries into the frontier.
     ///
-    /// Children enter the frontier best-first within the parent. Per tree and
-    /// level at most `beam(level)` children are admitted; surplus children —
-    /// reachable only through transient split fanout or the minimum-one
-    /// plateau — are pruned deterministically, never reported as exhaustion.
+    /// The decoded body comes from the snapshot-validated cache. Children
+    /// enter the frontier best-first within the parent. Per tree and level at
+    /// most `beam(level)` children are admitted; surplus children — reachable
+    /// only through transient split fanout or the minimum-one plateau — are
+    /// pruned deterministically, never reported as exhaustion.
     async fn visit_internal<T: ReadOps>(
         &mut self,
         txn: &mut ReadLogicalTxn<'_, T>,
@@ -507,31 +506,22 @@ impl Traversal {
         partition: PartitionKey,
         level: u32,
     ) -> Result<()> {
-        let range = LogicalRange::child_entries(context.manifest, tree_key, partition)?;
-        let limits = child_scan_limits(context.manifest.config().dimension())?;
-        let mut children: Vec<(f64, PartitionKey)> = Vec::new();
-        let mut cursor: Option<LogicalScanCursor> = None;
-        loop {
-            let page = txn.scan(&range, cursor.as_ref(), limits).await?;
-            for item in page.items() {
-                let PersistentValue::ChildEntry(child) = item.value() else {
-                    return Err(Error::new(ErrorKind::Corruption));
-                };
-                let distance = context
-                    .kernel
-                    .routing_distance(context.request.routing, child.centroid())?;
-                // Every non-root partition has exactly one incoming Child
-                // Entry; a second reference is Corruption, not a duplicate to
-                // deduplicate.
-                if !self.referenced.insert((tree, child.child())) {
-                    return Err(Error::new(ErrorKind::Corruption));
-                }
-                children.push((distance, child.child()));
+        let body = load_body(txn, context.cache, context.manifest, tree_key, partition).await?;
+        let BodyEntries::Internal(entries) = body.entries() else {
+            return Err(Error::new(ErrorKind::Corruption));
+        };
+        let mut children: Vec<(f64, PartitionKey)> = Vec::with_capacity(entries.len());
+        for child in entries {
+            let distance = context
+                .kernel
+                .routing_distance(context.request.routing, child.centroid())?;
+            // Every non-root partition has exactly one incoming Child
+            // Entry; a second reference is Corruption, not a duplicate to
+            // deduplicate.
+            if !self.referenced.insert((tree, child.child())) {
+                return Err(Error::new(ErrorKind::Corruption));
             }
-            cursor = page.into_next_cursor();
-            if cursor.is_none() {
-                break;
-            }
+            children.push((distance, child.child()));
         }
         children.sort_unstable_by(|left, right| {
             compare_finite(left.0, right.0).then_with(|| left.1.cmp(&right.1))
@@ -550,14 +540,17 @@ impl Traversal {
         Ok(())
     }
 
-    /// Scans one Leaf Partition's entries under the Leaf Entry budget,
+    /// Considers one Leaf Partition's entries under the Leaf Entry budget,
     /// filters them exactly, and merges the bounded overlap selection.
     ///
-    /// The caller guarantees the leaf is non-empty and not synopsis-pruned.
-    /// Every scanned entry is charged before the page that carries it is
-    /// read, since the page item limit never exceeds the remaining budget.
-    /// Running out of budget with known-pending entries is exhaustion and
-    /// stops the whole traversal.
+    /// The caller guarantees the leaf is non-empty and not synopsis-pruned, so
+    /// a budget that funds no entry is provably pending work: the leaf is
+    /// reported exhausted without spending a body load. Otherwise the decoded
+    /// body arrives whole from the snapshot-validated cache and entries are
+    /// charged and considered in canonical body order only while the remaining
+    /// Leaf Entry budget funds them — a depleted budget with unconsidered
+    /// entries is exhaustion and stops the whole traversal, regardless of
+    /// cache warmth.
     async fn scan_leaf<T: ReadOps>(
         &mut self,
         txn: &mut ReadLogicalTxn<'_, T>,
@@ -566,79 +559,56 @@ impl Traversal {
         partition: PartitionKey,
         predicate: Option<&CompiledPredicate>,
     ) -> Result<()> {
-        let range = LogicalRange::leaf_entries(context.manifest, tree_key, partition)?;
-        let dimension = context.manifest.config().dimension();
-        let item_bytes = leaf_entry_item_bytes(dimension)?;
-        let mut pool: Vec<ApproximateCandidate<LeafCandidate>> = Vec::new();
-        let mut cursor: Option<LogicalScanCursor> = None;
-        loop {
-            let remaining = context
+        let remaining = usize::try_from(
+            context
                 .request
                 .budgets
                 .visited_leaf_entries()
                 .checked_sub(self.visited_leaf_entries)
-                .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-            if remaining == 0 {
-                // Entries provably remain: the leaf is non-empty on entry and
-                // every later iteration follows a non-terminal page. The
-                // already-funded entries below stay materialized and still
-                // flow through selection.
-                self.leaf_entry_budget_exhausted = true;
-                break;
-            }
-            let item_limit = usize::try_from(remaining)
-                .map_err(|_| Error::new(ErrorKind::LimitExceeded))?
-                .min(ENTRY_SCAN_PAGE_ITEMS);
-            let page = txn
-                .scan(
-                    &range,
-                    cursor.as_ref(),
-                    leaf_scan_limits(item_bytes, item_limit)?,
-                )
-                .await?;
-            let (items, next_cursor) = page.into_parts();
-            let mut batch = Vec::with_capacity(items.len());
-            for item in items {
-                let PersistentValue::LeafEntry(entry) = item.into_value() else {
-                    return Err(Error::new(ErrorKind::Corruption));
-                };
-                let (record_id, fields, code) = entry.into_parts();
-                let code = RaBitQ7::decode(&code, dimension)?;
-                // The query and the decoded code are validated finite, so a
-                // non-conservative distance here means corrupted state.
-                let distance = code
-                    .approximate_distance(context.query)
-                    .map_err(|_| Error::new(ErrorKind::Corruption))?;
-                batch.push(LeafCandidate::new(
-                    record_id,
-                    fields,
-                    distance,
-                    RecordLocation::new(tree_key.clone(), partition),
-                ));
-            }
-            let filtered = filter_candidates(batch, predicate, &mut self.visited_leaf_entries)?;
-            pool.extend(filtered.into_iter().map(|candidate| {
-                ApproximateCandidate::new(
-                    candidate.record_id().clone(),
-                    candidate.distance(),
-                    candidate,
-                )
-            }));
-            cursor = next_cursor;
-            if cursor.is_none() {
-                break;
-            }
+                .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?,
+        )
+        .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
+        if remaining == 0 {
+            self.leaf_entry_budget_exhausted = true;
+            return Ok(());
         }
+        let body = load_body(txn, context.cache, context.manifest, tree_key, partition).await?;
+        let BodyEntries::Leaf(entries) = body.entries() else {
+            return Err(Error::new(ErrorKind::Corruption));
+        };
+        let dimension = context.manifest.config().dimension();
+        let funded = entries.len().min(remaining);
+        // Unconsidered entries are eligible work the depleted budget prevents.
+        // The already-funded entries below stay materialized and still flow
+        // through selection.
+        if funded < entries.len() {
+            self.leaf_entry_budget_exhausted = true;
+        }
+        let mut batch = Vec::with_capacity(funded);
+        for entry in &entries[..funded] {
+            let code = RaBitQ7::decode(entry.rabitq7(), dimension)?;
+            // The query and the decoded code are validated finite, so a
+            // non-conservative distance here means corrupted state.
+            let distance = code
+                .approximate_distance(context.query)
+                .map_err(|_| Error::new(ErrorKind::Corruption))?;
+            batch.push(LeafCandidate::new(
+                entry.record_id().clone(),
+                entry.fields().into(),
+                distance,
+                RecordLocation::new(tree_key.clone(), partition),
+            ));
+        }
+        let filtered = filter_candidates(batch, predicate, &mut self.visited_leaf_entries)?;
+        let pool: Vec<ApproximateCandidate<LeafCandidate>> = filtered
+            .into_iter()
+            .map(ApproximateCandidate::from)
+            .collect();
         let selection = select_leaf_overlap(pool, context.request.k, context.rerank_cap)?;
         if selection.truncated() {
             self.rabitq_overlap_truncated = true;
         }
-        self.candidates.extend(
-            selection
-                .into_candidates()
-                .into_iter()
-                .map(|candidate| candidate.into_parts().2),
-        );
+        self.candidates.extend(selection.into_values());
         Ok(())
     }
 
@@ -704,62 +674,6 @@ fn beam_width(leaf_beam: u32, level: u32) -> u32 {
         .max(1)
 }
 
-/// Builds the scan bounds for one internal partition's Child Entry pages.
-///
-/// The per-item byte bound covers the 28 fixed key bytes plus the canonical
-/// Tree Key and an 8 + 4 + `4 * dimension` payload with value framing, so a
-/// legal page is never byte-truncated. Transient split fanout exceeds the
-/// stable fanout of two, so pages iterate rather than assert a fanout.
-fn child_scan_limits(dimension: usize) -> Result<ScanLimits> {
-    let vector_bytes = dimension
-        .checked_mul(4)
-        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-    let per_item = 28_usize
-        .checked_add(MAX_TREE_KEY_BYTES)
-        .and_then(|bytes| bytes.checked_add(32))
-        .and_then(|bytes| bytes.checked_add(vector_bytes))
-        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-    Ok(ScanLimits {
-        item_limit: ENTRY_SCAN_PAGE_ITEMS,
-        byte_limit: per_item
-            .checked_mul(ENTRY_SCAN_PAGE_ITEMS)
-            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?,
-    })
-}
-
-/// The worst-case encoded byte size of one Leaf Entry for `dimension`.
-///
-/// The key carries the 20 fixed partition-key bytes plus the canonical Tree
-/// Key and a full Record ID; the value carries the frame, the Record ID, the
-/// full typed field projection, and the dimension-sized RaBitQ7 payload.
-fn leaf_entry_item_bytes(dimension: usize) -> Result<usize> {
-    let code_bytes = RaBitQ7::encoded_len(dimension)?;
-    // Per-field worst case: a 1-byte tag plus a 4-byte length plus the
-    // maximum String payload.
-    let field_bytes = MAX_FIELDS
-        .checked_mul(5 + MAX_STRING_BYTES)
-        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-    20_usize
-        .checked_add(MAX_TREE_KEY_BYTES)
-        .and_then(|bytes| bytes.checked_add(MAX_RECORD_ID_BYTES))
-        .and_then(|bytes| bytes.checked_add(2))
-        .and_then(|bytes| bytes.checked_add(2 + MAX_RECORD_ID_BYTES))
-        .and_then(|bytes| bytes.checked_add(2 + field_bytes))
-        .and_then(|bytes| bytes.checked_add(4))
-        .and_then(|bytes| bytes.checked_add(code_bytes))
-        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))
-}
-
-/// Builds the scan bounds for one Leaf Entry page funded by the budget.
-fn leaf_scan_limits(item_bytes: usize, item_limit: usize) -> Result<ScanLimits> {
-    Ok(ScanLimits {
-        item_limit,
-        byte_limit: item_bytes
-            .checked_mul(item_limit)
-            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?,
-    })
-}
-
 /// Extracts a partition Header from a typed read, failing closed.
 fn expect_header(value: Option<PersistentValue>) -> Result<PartitionHeader> {
     match value {
@@ -796,6 +710,7 @@ mod tests {
         ValueCodec,
     };
 
+    use super::super::cache::PartitionCache;
     use super::super::numeric::VectorKernel;
     use super::super::plan::EnumeratedTree;
     use super::super::predicate::CompiledPredicate;
@@ -1071,8 +986,10 @@ mod tests {
             .map(|predicate| CompiledPredicate::compile(predicate, manifest.config().fields()))
             .transpose()
             .expect("compile predicate");
+        let cache = PartitionCache::new(1 << 20);
         traverse(
             &mut txn,
+            &cache,
             &kernel,
             TraversalRequest::new(&QUERY, trees, compiled.as_ref(), k, budgets, beam)
                 .expect("valid request"),
