@@ -3,49 +3,42 @@
 **K-means Tree Approximate Nearest Neighbor**
 
 KTANN is a Rust library for building an approximate nearest-neighbor index on
-top of transactional key-value storage. It is designed to keep vectors and
-their index membership atomically consistent while maintaining a dynamic
-K-means tree asynchronously.
+top of transactional key-value storage. It keeps vectors and their index
+membership atomically consistent while maintaining a dynamic K-means tree
+asynchronously.
 
-KTANN separates its index algorithms from the storage engine so the same logical
-index can run on multiple KV backends.
+KTANN separates its index algorithms from the storage engine so the same
+logical index can run on multiple KV backends.
 
-> [!IMPORTANT]
-> KTANN is currently in the design and early implementation stage. The system
-> design is implementation-ready, and the workspace now includes the public
-> domain types, canonical logical key and value codecs, typed storage
-> operations, backend transaction seam, FoundationDB and RocksDB adapters, the
-> create/open/drop Logical Index lifecycle, snapshot-validated point and batch
-> Vector Record reads, routed foreground Vector Record mutations with
-> whole-operation retries, and the bounded deterministic approximate Search
-> operation over one consistent snapshot. Structure-maintenance algorithms are
-> not yet available for use.
+## Status
 
-## Goals
+KTANN is in active implementation; there is no stable release and the
+persistent format may still change. The Logical Index lifecycle, point and
+batch reads, atomic foreground mutations, bounded approximate search with
+exact filtering and reranking, and bounded import sessions are implemented
+over both the FoundationDB and RocksDB adapters. Asynchronous split and merge
+maintenance is in progress.
 
-- Provide an embeddable vector-index library rather than a standalone database
-  or service.
-- Store each vector, its location, and its leaf membership in one atomic
+## Features
+
+- Embeddable library, not a standalone database or service.
+- Each vector, its location, and its leaf membership commit in one atomic
   foreground transaction.
-- Support dynamic inserts, updates, and deletes without periodically rebuilding
-  the whole index.
-- Keep every committed split and merge state searchable while asynchronous
-  maintenance progresses.
-- Run the same logical index over multiple transactional KV stores. FoundationDB
-  and RocksDB are the initial planned backends.
-- Offer typed metadata filtering with conservative partition pruning.
-- Bound search work, transaction size, concurrency, queues, retries, caches, and
-  memory explicitly.
-- Use approximate candidate selection followed by exact reranking over the
-  original vectors.
+- Dynamic inserts, updates, and deletes without rebuilding the index; every
+  committed split and merge state remains searchable.
+- The same logical index runs over multiple transactional KV stores;
+  FoundationDB and RocksDB are the initial backends.
+- Typed metadata filtering with conservative partition pruning.
+- Bounded, deterministic approximate candidate selection followed by exact
+  reranking over the original vectors.
 
 ## Design overview
 
 Records are divided into a sharded forest by caller-declared **Tree Key**
 fields. Each Tree Key selects one incremental binary K-means tree. Internal
-partitions route searches by centroid distance; leaf partitions use RaBitQ7 for
-compact approximate ranking and retain access to the original vector for exact
-reranking.
+partitions route searches by centroid distance; leaf partitions use RaBitQ7
+for compact approximate ranking and retain access to the original vector for
+exact reranking.
 
 ```text
 Application
@@ -84,9 +77,8 @@ claim exact global top-k or guarantee that every request returns `k` hits.
 | `ktann-foundationdb` | FoundationDB transactions, physical keyspace, limits, and error mapping |
 | `ktann-rocksdb` | RocksDB `OptimisticTransactionDB` integration, admission, limits, and error mapping |
 
-Backend adapters share the same logical transaction contract, but their
-physical keyspaces are backend-specific and are not intended to be portable
-between storage engines.
+Backend adapters share one logical transaction contract, but their physical
+keyspaces are backend-specific and are not portable between storage engines.
 
 ## Documentation
 
@@ -97,22 +89,10 @@ between storage engines.
 - [`docs/design/`](docs/design/) contains the detailed API, storage, search,
   maintenance, and runtime contracts.
 - [`docs/adr/`](docs/adr/) records accepted architectural decisions.
+- [`AGENTS.md`](AGENTS.md) lists development commands and engineering rules.
 
 These documents, rather than external implementations or papers, define
 KTANN's contract.
-
-## Development
-
-The repository currently contains the Rust workspace, public domain types,
-canonical codecs, typed storage, backend adapters, Runtime admission/shutdown,
-the Logical Index lifecycle, point/batch Vector Record reads over one
-consistent snapshot, atomic foreground mutations (insert, replacement
-upsert, delete, and batches) with whole-operation routing and retries, and
-the public bounded approximate Search operation with exact filtering,
-snapshot-validated partition caching, exact reranking, and per-dimension
-budget reporting. Maintenance stages are implemented incrementally. See
-[`AGENTS.md`](AGENTS.md) for development commands, engineering constraints,
-and verification guidelines.
 
 ## Influences
 
