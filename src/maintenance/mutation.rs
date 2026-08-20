@@ -9,13 +9,17 @@
 //! every mutation or none; there is no record revision, no partial outcome,
 //! and no repair branch.
 //!
-//! - **Routing.** Insert and upsert targets come from
-//!   [`routing::route_leaf_for_write_preprocessed`]: the record's Tree Key
-//!   selects the tree, which is lazily created on the first write, and the
-//!   preprocessed routing vector descends to the nearest leaf. Upsert reads
-//!   the stored Record Location with update protection to choose between
-//!   insert and replacement; a replacement across Tree Keys or leaves is one
-//!   atomic move. Delete never routes and follows the exact stored location.
+//! - **Routing.** Insert and upsert targets come from one grouped descent per
+//!   distinct Tree Key
+//!   ([`routing::route_leaves_for_write_preprocessed`]): the Tree Manifest and
+//!   every visited internal partition are read once per attempt, not once per
+//!   record. Upsert reads every stored Record Location with one batched
+//!   update-protected read to choose between insert and replacement; a
+//!   replacement across Tree Keys or leaves is one atomic move. Delete never
+//!   routes and follows the exact stored location.
+//! - **Writes.** Every item queues its record-group writes into one shared
+//!   builder applied once in canonical key order; exact Header counts and
+//!   Synopsis expansions still apply per item so later items observe them.
 //! - **Retry.** A definite backend abort anywhere in an attempt discards
 //!   every route and replays the complete operation from a fresh snapshot
 //!   under the bounded contention policy; exhaustion returns
@@ -31,18 +35,19 @@
 //! runtime (#10, #31); losing it never affects correctness because every
 //! committed topology state remains searchable.
 
+use std::collections::BTreeMap;
+
 use crate::api::{Error, ErrorKind, Mutation, MutationOutcome, Record, Result};
 use crate::runtime::lifecycle::RetryPolicy;
 use crate::runtime::{OperationContext, reads};
 use crate::search::numeric::VectorKernel;
 use crate::search::rabitq::RaBitQ7;
-use crate::storage::WriteLogicalTxn;
 use crate::storage::backend::{Backend, WriteTxn};
 use crate::storage::keys::{LogicalKey, TreeKey};
-use crate::storage::membership;
 use crate::storage::values::{
     IndexManifest, LeafEntry, OpaquePayload, RecordLocation, VectorRecord,
 };
+use crate::storage::{MutationBuilder, WriteLogicalTxn, membership};
 
 use super::routing;
 
@@ -131,8 +136,12 @@ async fn validate_manifest<T: WriteTxn>(
 
 /// Applies every mutation in input order inside the attempt transaction.
 ///
-/// Items route and apply one at a time; batched routing and batched writes
-/// are #84.
+/// Routing and the upsert membership reads are batched across the whole
+/// operation first — one grouped descent per distinct Tree Key, one batched
+/// update-protected read of every upsert's authoritative Record Location. The
+/// membership operations then apply in input order and queue their
+/// record-group writes into one builder, which is applied once in canonical
+/// key order at the end.
 async fn apply_all<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     kernel: &VectorKernel,
@@ -141,48 +150,153 @@ async fn apply_all<T: WriteTxn>(
 ) -> Result<Vec<MutationOutcome>> {
     debug_assert_eq!(mutations.len(), prepared.len());
     let started_at = now_unix_millis();
+    let targets = route_all(txn, kernel, prepared, started_at).await?;
+    let expected = read_locations(txn, mutations).await?;
+    let mut deferred = txn.mutations();
     let mut outcomes = Vec::with_capacity(mutations.len());
-    for (position, (mutation, prepared)) in mutations.iter().zip(prepared).enumerate() {
-        let outcome = apply_one(txn, kernel, mutation, prepared.as_ref(), started_at)
-            .await
-            .map_err(|error| error.at_position(position))?;
+    for (position, mutation) in mutations.iter().enumerate() {
+        let routed = prepared[position].as_ref().zip(targets[position].as_ref());
+        let outcome = apply_one(
+            txn,
+            mutation,
+            routed,
+            expected[position].as_ref(),
+            &mut deferred,
+        )
+        .await
+        .map_err(|error| error.at_position(position))?;
         outcomes.push(outcome);
     }
+    txn.apply(deferred).await?;
     Ok(outcomes)
 }
 
-/// Routes and applies one mutation item inside the attempt transaction.
-async fn apply_one<T: WriteTxn>(
+/// One Tree Key's routing group: the items routed together in one descent.
+struct RouteGroup<'a> {
+    tree_key: &'a TreeKey,
+    /// The group's first input position, used for error attribution.
+    first_position: usize,
+    members: Vec<(usize, &'a PreparedRecord)>,
+}
+
+/// Routes every Insert/Upsert item to its target leaf with one batched
+/// descent per distinct Tree Key, aligned to the input positions.
+///
+/// Groups are processed in first-appearance order. A group-level routing
+/// failure is a property of the tree's topology rather than of one record, so
+/// it is reported at the group's first input position.
+async fn route_all<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     kernel: &VectorKernel,
-    mutation: &Mutation,
-    prepared: Option<&PreparedRecord>,
+    prepared: &[Option<PreparedRecord>],
     started_at: u64,
+) -> Result<Vec<Option<RecordLocation>>> {
+    let mut targets: Vec<Option<RecordLocation>> = vec![None; prepared.len()];
+    let mut group_index: BTreeMap<&[u8], usize> = BTreeMap::new();
+    let mut groups: Vec<RouteGroup<'_>> = Vec::new();
+    for (position, prepared) in prepared.iter().enumerate() {
+        let Some(prepared) = prepared else { continue };
+        match group_index.get(prepared.tree_key.as_bytes()) {
+            Some(&group) => groups[group].members.push((position, prepared)),
+            None => {
+                group_index.insert(prepared.tree_key.as_bytes(), groups.len());
+                groups.push(RouteGroup {
+                    tree_key: &prepared.tree_key,
+                    first_position: position,
+                    members: vec![(position, prepared)],
+                });
+            }
+        }
+    }
+    for group in groups {
+        let routings: Vec<&[f32]> = group
+            .members
+            .iter()
+            .map(|(_, prepared)| &*prepared.routing)
+            .collect();
+        let routes = routing::route_leaves_for_write_preprocessed(
+            txn,
+            group.tree_key,
+            kernel,
+            &routings,
+            started_at,
+        )
+        .await
+        .map_err(|error| error.at_position(group.first_position))?;
+        for ((position, prepared), route) in group.members.into_iter().zip(routes) {
+            targets[position] = Some(RecordLocation::new(prepared.tree_key.clone(), route.leaf()));
+        }
+    }
+    Ok(targets)
+}
+
+/// Reads the stored Record Locations of every upsert item with one batched
+/// update-protected read, aligned to the input positions.
+async fn read_locations<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    mutations: &[Mutation],
+) -> Result<Vec<Option<RecordLocation>>> {
+    let mut upsert_positions = Vec::new();
+    let mut ids = Vec::new();
+    for (position, mutation) in mutations.iter().enumerate() {
+        if let Mutation::Upsert(record) = mutation {
+            upsert_positions.push(position);
+            ids.push(record.id().clone());
+        }
+    }
+    let mut expected = vec![None; mutations.len()];
+    if ids.is_empty() {
+        return Ok(expected);
+    }
+    let locations = membership::read_locations_for_update(txn, &ids)
+        .await
+        .map_err(|error| match error.position() {
+            Some(subset) => error.at_position(upsert_positions[subset]),
+            None => error,
+        })?;
+    for (position, location) in upsert_positions.into_iter().zip(locations) {
+        expected[position] = location;
+    }
+    Ok(expected)
+}
+
+/// Applies one mutation item inside the attempt transaction, queueing
+/// record-group writes into `deferred`.
+///
+/// `routed` carries the prepared record and its target location; exactly the
+/// insert/upsert items are prepared and routed by `apply_all`, so a missing
+/// pair for those items is an internal contract violation, not caller input.
+async fn apply_one<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    mutation: &Mutation,
+    routed: Option<(&PreparedRecord, &RecordLocation)>,
+    expected: Option<&RecordLocation>,
+    deferred: &mut MutationBuilder<'_>,
 ) -> Result<MutationOutcome> {
     match mutation {
         Mutation::Insert(_) => {
-            let prepared = prepared.ok_or_else(|| Error::new(ErrorKind::Backend))?;
-            let target = route_target(txn, kernel, prepared, started_at).await?;
+            let (prepared, target) = routed.ok_or_else(|| Error::new(ErrorKind::Backend))?;
             membership::insert_record(
                 txn,
+                deferred,
                 &prepared.record,
                 prepared.payload.as_ref(),
-                &target,
+                target,
                 &prepared.entry,
             )
             .await?;
             Ok(MutationOutcome::Inserted)
         }
-        Mutation::Upsert(record) => {
-            let prepared = prepared.ok_or_else(|| Error::new(ErrorKind::Backend))?;
-            let target = route_target(txn, kernel, prepared, started_at).await?;
-            match membership::read_location_for_update(txn, record.id()).await? {
+        Mutation::Upsert(_) => {
+            let (prepared, target) = routed.ok_or_else(|| Error::new(ErrorKind::Backend))?;
+            match expected {
                 None => {
                     membership::insert_record(
                         txn,
+                        deferred,
                         &prepared.record,
                         prepared.payload.as_ref(),
-                        &target,
+                        target,
                         &prepared.entry,
                     )
                     .await?;
@@ -191,10 +305,11 @@ async fn apply_one<T: WriteTxn>(
                 Some(expected) => {
                     membership::replace_record(
                         txn,
+                        deferred,
                         &prepared.record,
                         prepared.payload.as_ref(),
-                        &expected,
-                        &target,
+                        expected,
+                        target,
                         &prepared.entry,
                     )
                     .await?;
@@ -203,30 +318,12 @@ async fn apply_one<T: WriteTxn>(
             }
         }
         Mutation::Delete(id) => {
-            let outcome = membership::delete_record(txn, id).await?;
+            let outcome = membership::delete_record(txn, deferred, id).await?;
             Ok(MutationOutcome::Deleted {
                 existed: matches!(outcome, membership::DeleteOutcome::Deleted),
             })
         }
     }
-}
-
-/// Routes one prepared record to its target Leaf Partition.
-async fn route_target<T: WriteTxn>(
-    txn: &mut WriteLogicalTxn<'_, T>,
-    kernel: &VectorKernel,
-    prepared: &PreparedRecord,
-    started_at: u64,
-) -> Result<RecordLocation> {
-    let route = routing::route_leaf_for_write_preprocessed(
-        txn,
-        &prepared.tree_key,
-        kernel,
-        &prepared.routing,
-        started_at,
-    )
-    .await?;
-    Ok(RecordLocation::new(prepared.tree_key.clone(), route.leaf()))
 }
 
 /// Derives every routed item's persistent projection once per operation.

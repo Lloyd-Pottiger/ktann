@@ -167,9 +167,11 @@ async fn insert_committed(
     entry: &LeafEntry,
 ) {
     let mut txn = write_txn(backend, manifest).await;
-    membership::insert_record(&mut txn, record, payload, target, entry)
+    let mut deferred = txn.mutations();
+    membership::insert_record(&mut txn, &mut deferred, record, payload, target, entry)
         .await
         .expect("insert");
+    txn.apply(deferred).await.expect("apply deferred");
     txn.commit().await.expect("commit insert");
 }
 
@@ -339,8 +341,10 @@ async fn duplicate_insert_is_record_already_exists_and_changes_nothing() {
     .await;
 
     let mut txn = write_txn(&backend, &manifest).await;
+    let mut deferred = txn.mutations();
     let error = membership::insert_record(
         &mut txn,
+        &mut deferred,
         &record(&rid(1), 9),
         None,
         &target,
@@ -349,7 +353,8 @@ async fn duplicate_insert_is_record_already_exists_and_changes_nothing() {
     .await
     .expect_err("duplicate Record ID");
     assert_eq!(error.kind(), ErrorKind::RecordAlreadyExists);
-    // The Record unique insert runs first, so nothing else was staged.
+    // The Record existence check runs first, so nothing else was staged.
+    assert_eq!(deferred.size().mutations(), 0);
     assert_eq!(txn.size().mutations(), 0);
     txn.rollback().await;
 
@@ -383,8 +388,10 @@ async fn same_leaf_replace_rewrites_entry_payload_and_epoch() {
     // A payload-carrying replacement updates the entry and swaps the payload.
     {
         let mut txn = write_txn(&backend, &manifest).await;
+        let mut deferred = txn.mutations();
         membership::replace_record(
             &mut txn,
+            &mut deferred,
             &record(&rid(1), 7),
             Some(&payload(b"p2")),
             &target,
@@ -393,6 +400,7 @@ async fn same_leaf_replace_rewrites_entry_payload_and_epoch() {
         )
         .await
         .expect("replace");
+        txn.apply(deferred).await.expect("apply deferred");
         txn.commit().await.expect("commit replace");
     }
 
@@ -414,8 +422,10 @@ async fn same_leaf_replace_rewrites_entry_payload_and_epoch() {
     // A payload-less replacement deletes the old payload.
     {
         let mut txn = write_txn(&backend, &manifest).await;
+        let mut deferred = txn.mutations();
         membership::replace_record(
             &mut txn,
+            &mut deferred,
             &record(&rid(1), 9),
             None,
             &target,
@@ -424,6 +434,7 @@ async fn same_leaf_replace_rewrites_entry_payload_and_epoch() {
         )
         .await
         .expect("replace");
+        txn.apply(deferred).await.expect("apply deferred");
         txn.commit().await.expect("commit replace");
     }
 
@@ -459,8 +470,10 @@ async fn cross_leaf_and_cross_tree_moves_retarget_membership_and_counts() {
 
     // A same-tree cross-leaf move from PK 2 to PK 3.
     let mut txn = write_txn(&backend, &manifest).await;
+    let mut deferred = txn.mutations();
     membership::replace_record(
         &mut txn,
+        &mut deferred,
         &record(&rid(1), 5),
         None,
         &source,
@@ -469,6 +482,7 @@ async fn cross_leaf_and_cross_tree_moves_retarget_membership_and_counts() {
     )
     .await
     .expect("move");
+    txn.apply(deferred).await.expect("apply deferred");
     txn.commit().await.expect("commit move");
 
     assert_eq!(
@@ -528,8 +542,10 @@ async fn cross_leaf_and_cross_tree_moves_retarget_membership_and_counts() {
     );
 
     let mut txn = write_txn(&backend, &manifest).await;
+    let mut deferred = txn.mutations();
     membership::replace_record(
         &mut txn,
+        &mut deferred,
         &record(&rid(2), 3),
         None,
         &source,
@@ -538,6 +554,7 @@ async fn cross_leaf_and_cross_tree_moves_retarget_membership_and_counts() {
     )
     .await
     .expect("cross-tree move");
+    txn.apply(deferred).await.expect("apply deferred");
     txn.commit().await.expect("commit move");
 
     assert_eq!(
@@ -597,12 +614,14 @@ async fn delete_removes_the_whole_group_and_is_idempotent() {
     .await;
 
     let mut txn = write_txn(&backend, &manifest).await;
+    let mut deferred = txn.mutations();
     assert_eq!(
-        membership::delete_record(&mut txn, &rid(1))
+        membership::delete_record(&mut txn, &mut deferred, &rid(1))
             .await
             .expect("delete"),
         DeleteOutcome::Deleted
     );
+    txn.apply(deferred).await.expect("apply deferred");
     txn.commit().await.expect("commit delete");
 
     assert_eq!(read_group(&backend, &manifest, rid(1), true).await, None);
@@ -626,12 +645,14 @@ async fn delete_removes_the_whole_group_and_is_idempotent() {
 
     // The second delete is a no-op that stages nothing.
     let mut txn = write_txn(&backend, &manifest).await;
+    let mut deferred = txn.mutations();
     assert_eq!(
-        membership::delete_record(&mut txn, &rid(1))
+        membership::delete_record(&mut txn, &mut deferred, &rid(1))
             .await
             .expect("idempotent delete"),
         DeleteOutcome::NotFound
     );
+    assert_eq!(deferred.size().mutations(), 0);
     assert_eq!(txn.size().mutations(), 0);
     txn.rollback().await;
 }
@@ -654,12 +675,14 @@ async fn delete_uses_the_stored_location_not_routing() {
     .await;
 
     let mut txn = write_txn(&backend, &manifest).await;
+    let mut deferred = txn.mutations();
     assert_eq!(
-        membership::delete_record(&mut txn, &rid(1))
+        membership::delete_record(&mut txn, &mut deferred, &rid(1))
             .await
             .expect("delete"),
         DeleteOutcome::Deleted
     );
+    txn.apply(deferred).await.expect("apply deferred");
     txn.commit().await.expect("commit delete");
 
     assert_eq!(
@@ -685,8 +708,10 @@ async fn rollback_discards_the_whole_mutation() {
     create_tree(&backend, &manifest, &key).await;
 
     let mut txn = write_txn(&backend, &manifest).await;
+    let mut deferred = txn.mutations();
     membership::insert_record(
         &mut txn,
+        &mut deferred,
         &record(&rid(1), 5),
         Some(&payload(b"p1")),
         &location(&key, 1),
@@ -713,8 +738,10 @@ async fn concurrent_leaf_mutations_conflict_and_retry_cleanly() {
 
     // Both transactions update-protect the same leaf Header.
     let mut first = write_txn(&backend, &manifest).await;
+    let mut first_deferred = first.mutations();
     membership::insert_record(
         &mut first,
+        &mut first_deferred,
         &record(&rid(1), 1),
         None,
         &target,
@@ -723,8 +750,10 @@ async fn concurrent_leaf_mutations_conflict_and_retry_cleanly() {
     .await
     .expect("first insert");
     let mut second = write_txn(&backend, &manifest).await;
+    let mut second_deferred = second.mutations();
     membership::insert_record(
         &mut second,
+        &mut second_deferred,
         &record(&rid(2), 2),
         None,
         &target,
@@ -733,7 +762,9 @@ async fn concurrent_leaf_mutations_conflict_and_retry_cleanly() {
     .await
     .expect("second insert");
 
+    first.apply(first_deferred).await.expect("apply deferred");
     first.commit().await.expect("first commit wins");
+    second.apply(second_deferred).await.expect("apply deferred");
     let error = second.commit().await.expect_err("header conflict");
     assert_eq!(error.kind(), ErrorKind::RetryableAbort);
 
@@ -751,8 +782,10 @@ async fn concurrent_leaf_mutations_conflict_and_retry_cleanly() {
 
     // The retried attempt observes the winner and commits cleanly.
     let mut retry = write_txn(&backend, &manifest).await;
+    let mut deferred = retry.mutations();
     membership::insert_record(
         &mut retry,
+        &mut deferred,
         &record(&rid(2), 2),
         None,
         &target,
@@ -760,6 +793,7 @@ async fn concurrent_leaf_mutations_conflict_and_retry_cleanly() {
     )
     .await
     .expect("retried insert");
+    retry.apply(deferred).await.expect("apply deferred");
     retry.commit().await.expect("retry commits");
     assert_eq!(
         read_header_at(&backend, &manifest, &key, pk(1)).await,
@@ -780,8 +814,10 @@ async fn unknown_commit_outcomes_surface_and_preserve_membership() {
         .set_fault_plan(vec![CommitFault::UnknownApplied])
         .expect("fault plan");
     let mut txn = write_txn(&backend, &manifest).await;
+    let mut deferred = txn.mutations();
     membership::insert_record(
         &mut txn,
+        &mut deferred,
         &record(&rid(1), 1),
         None,
         &target,
@@ -789,6 +825,7 @@ async fn unknown_commit_outcomes_surface_and_preserve_membership() {
     )
     .await
     .expect("insert");
+    txn.apply(deferred).await.expect("apply deferred");
     let error = txn.commit().await.expect_err("unknown outcome");
     assert_eq!(error.kind(), ErrorKind::CommitOutcomeUnknown);
     assert_eq!(
@@ -814,8 +851,10 @@ async fn unknown_commit_outcomes_surface_and_preserve_membership() {
         .set_fault_plan(vec![CommitFault::UnknownNotApplied])
         .expect("fault plan");
     let mut txn = write_txn(&backend, &manifest).await;
+    let mut deferred = txn.mutations();
     membership::insert_record(
         &mut txn,
+        &mut deferred,
         &record(&rid(2), 2),
         None,
         &target,
@@ -823,6 +862,7 @@ async fn unknown_commit_outcomes_surface_and_preserve_membership() {
     )
     .await
     .expect("insert");
+    txn.apply(deferred).await.expect("apply deferred");
     let error = txn.commit().await.expect_err("unknown outcome");
     assert_eq!(error.kind(), ErrorKind::CommitOutcomeUnknown);
     assert_eq!(
@@ -850,8 +890,10 @@ async fn invalid_caller_input_is_rejected_before_any_write() {
 
     // Record and Leaf Entry identities must agree.
     let mut txn = write_txn(&backend, &manifest).await;
+    let mut deferred = txn.mutations();
     let error = membership::insert_record(
         &mut txn,
+        &mut deferred,
         &record(&rid(1), 5),
         None,
         &target,
@@ -860,6 +902,7 @@ async fn invalid_caller_input_is_rejected_before_any_write() {
     .await
     .expect_err("mismatched identity");
     assert_eq!(error.kind(), ErrorKind::InvalidArgument);
+    assert_eq!(deferred.size().mutations(), 0);
     assert_eq!(txn.size().mutations(), 0);
     txn.rollback().await;
 
@@ -867,8 +910,10 @@ async fn invalid_caller_input_is_rejected_before_any_write() {
     let raw = backend.begin_write().await.expect("begin write");
     let mut txn =
         WriteLogicalTxn::bootstrap(raw, backend.hard_limits(), backend.admission_budget());
+    let mut deferred = txn.mutations();
     let error = membership::insert_record(
         &mut txn,
+        &mut deferred,
         &record(&rid(1), 5),
         None,
         &target,
@@ -877,7 +922,7 @@ async fn invalid_caller_input_is_rejected_before_any_write() {
     .await
     .expect_err("unbound transaction");
     assert_eq!(error.kind(), ErrorKind::InvalidArgument);
-    let error = membership::delete_record(&mut txn, &rid(1))
+    let error = membership::delete_record(&mut txn, &mut deferred, &rid(1))
         .await
         .expect_err("unbound transaction");
     assert_eq!(error.kind(), ErrorKind::InvalidArgument);
@@ -903,8 +948,10 @@ async fn replace_fails_closed_on_absent_or_stale_membership() {
 
     // Replacing a record that does not exist is corruption, not an insert.
     let mut txn = write_txn(&backend, &manifest).await;
+    let mut deferred = txn.mutations();
     let error = membership::replace_record(
         &mut txn,
+        &mut deferred,
         &record(&rid(9), 5),
         None,
         &source,
@@ -918,8 +965,10 @@ async fn replace_fails_closed_on_absent_or_stale_membership() {
 
     // A stale expected location mismatches the authoritative stored location.
     let mut txn = write_txn(&backend, &manifest).await;
+    let mut deferred = txn.mutations();
     let error = membership::replace_record(
         &mut txn,
+        &mut deferred,
         &record(&rid(1), 6),
         None,
         &location(&key, 3),
@@ -962,8 +1011,10 @@ async fn a_target_that_no_longer_accepts_writes_is_corruption() {
     txn.commit().await.expect("commit header");
 
     let mut txn = write_txn(&backend, &manifest).await;
+    let mut deferred = txn.mutations();
     let error = membership::insert_record(
         &mut txn,
+        &mut deferred,
         &record(&rid(1), 5),
         None,
         &location(&key, 1),
@@ -1054,8 +1105,10 @@ async fn membership_matches_a_seeded_model() {
             match rng.below(4) {
                 0 | 1 => {
                     let mut txn = write_txn(&backend, &manifest).await;
+                    let mut deferred = txn.mutations();
                     let result = membership::insert_record(
                         &mut txn,
+                        &mut deferred,
                         &record(&rid(record_id), field),
                         None,
                         &target,
@@ -1070,6 +1123,7 @@ async fn membership_matches_a_seeded_model() {
                         }
                         btree_map::Entry::Vacant(entry) => {
                             result.expect("insert");
+                            txn.apply(deferred).await.expect("apply deferred");
                             txn.commit().await.expect("commit insert");
                             entry.insert((field, target));
                         }
@@ -1077,9 +1131,11 @@ async fn membership_matches_a_seeded_model() {
                 }
                 2 => {
                     let mut txn = write_txn(&backend, &manifest).await;
+                    let mut deferred = txn.mutations();
                     let Some((_, expected)) = model.get(&record_id).cloned() else {
                         let error = membership::replace_record(
                             &mut txn,
+                            &mut deferred,
                             &record(&rid(record_id), field),
                             None,
                             &target,
@@ -1101,6 +1157,7 @@ async fn membership_matches_a_seeded_model() {
                     };
                     membership::replace_record(
                         &mut txn,
+                        &mut deferred,
                         &record(&rid(record_id), field),
                         None,
                         &expected,
@@ -1109,20 +1166,24 @@ async fn membership_matches_a_seeded_model() {
                     )
                     .await
                     .expect("replace");
+                    txn.apply(deferred).await.expect("apply deferred");
                     txn.commit().await.expect("commit replace");
                     model.insert(record_id, (field, target));
                 }
                 _ => {
                     let mut txn = write_txn(&backend, &manifest).await;
-                    let outcome = membership::delete_record(&mut txn, &rid(record_id))
-                        .await
-                        .expect("delete");
+                    let mut deferred = txn.mutations();
+                    let outcome =
+                        membership::delete_record(&mut txn, &mut deferred, &rid(record_id))
+                            .await
+                            .expect("delete");
                     let expected = if model.remove(&record_id).is_some() {
                         DeleteOutcome::Deleted
                     } else {
                         DeleteOutcome::NotFound
                     };
                     assert_eq!(outcome, expected, "seed {seed}");
+                    txn.apply(deferred).await.expect("apply deferred");
                     txn.commit().await.expect("commit delete");
                 }
             }

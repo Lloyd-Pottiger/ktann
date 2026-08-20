@@ -14,9 +14,10 @@ use ktann::runtime::Runtime;
 use ktann::storage::backend::{AdmissionBudget, Backend, Capabilities, HardLimits, ScanLimits};
 use ktann::storage::keys::{LogicalKey, TreeKey};
 use ktann::storage::values::{
-    IndexLifecycle, IndexManifest, PartitionHeader, PersistentValue, RecordLocation,
+    ChildEntry, IndexLifecycle, IndexManifest, PartitionHeader, PartitionState, PartitionSynopsis,
+    PersistentValue, RecordLocation,
 };
-use ktann::storage::{LogicalRange, ReadLogicalTxn, WriteLogicalTxn};
+use ktann::storage::{LogicalRange, ReadLogicalTxn, WriteLogicalTxn, tree_manifest};
 use tokio_util::sync::CancellationToken;
 
 use support::{
@@ -917,5 +918,207 @@ async fn seeded_model_history_with_abort_faults_preserves_membership() {
                 .entry_count() as usize,
             expected.len()
         );
+    }
+}
+
+/// A one-dimensional L2 index: rotation is the identity at dimension 1, so
+/// routing distances are plain squared differences and the seeded centroids
+/// below need no numeric setup.
+fn config_1d() -> IndexConfig {
+    IndexConfig::new(1, Metric::L2)
+        .expect("valid dimension")
+        .with_fields(vec![
+            FieldSchema::new("bucket", DataType::I64).expect("valid field"),
+        ])
+        .expect("valid fields")
+        .with_tree_key_fields(vec![FieldId(0)])
+        .expect("valid tree key fields")
+}
+
+fn record_1d(id: &[u8], x: f32, bucket: i64) -> Record {
+    Record::new(
+        Bytes::copy_from_slice(id),
+        Arc::from([x]),
+        vec![Value::I64(bucket)],
+    )
+    .expect("valid record")
+}
+
+/// Seeds the grown root shape for `bucket`: root PK 1 at level 2 with leaf
+/// children PK 2 (centroid 0.0) and PK 3 (centroid 10.0), each with its Header
+/// and empty Synopsis installed.
+async fn seed_grown_tree(backend: &SharedBackend, manifest: &IndexManifest, bucket: i64) {
+    let key = tree_key(bucket);
+    let index = manifest.logical_index_id();
+    let pk = |value: u64| PartitionKey::new(value).expect("valid partition key");
+    let raw = backend.begin_write().await.expect("begin write");
+    let mut txn = WriteLogicalTxn::for_index(
+        raw,
+        manifest,
+        backend.hard_limits(),
+        backend.admission_budget(),
+    )
+    .expect("bind index");
+    tree_manifest::create_tree(&mut txn, &key, 0)
+        .await
+        .expect("create tree");
+    let header = |level, partition| {
+        (
+            LogicalKey::Header {
+                index,
+                tree_key: key.clone(),
+                partition,
+            },
+            PersistentValue::PartitionHeader(
+                PartitionHeader::new(level, 0, 0, PartitionState::Ready).expect("header"),
+            ),
+        )
+    };
+    let synopsis = |partition| {
+        (
+            LogicalKey::Synopsis {
+                index,
+                tree_key: key.clone(),
+                partition,
+            },
+            PersistentValue::PartitionSynopsis(PartitionSynopsis::empty(manifest)),
+        )
+    };
+    let edge = |partition, centroid| {
+        (
+            LogicalKey::ChildEntry {
+                index,
+                tree_key: key.clone(),
+                partition: pk(1),
+                child: partition,
+            },
+            PersistentValue::ChildEntry(ChildEntry::new(partition, vec![centroid])),
+        )
+    };
+    for (key, value) in [
+        header(2, pk(1)),
+        header(1, pk(2)),
+        header(1, pk(3)),
+        edge(pk(2), 0.0),
+        edge(pk(3), 10.0),
+        synopsis(pk(2)),
+        synopsis(pk(3)),
+    ] {
+        txn.put(key, value).await.expect("seed topology");
+    }
+    txn.commit().await.expect("commit topology");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batched_inserts_share_routing_and_apply_writes_once() {
+    let backend = backend(DeterministicConfig::default());
+    let runtime = make_runtime(backend.clone());
+    let index = runtime
+        .create_index("batched", config_1d())
+        .await
+        .expect("create index");
+    let manifest = read_manifest(&backend, index.logical_index_id()).await;
+    seed_grown_tree(&backend, &manifest, 1).await;
+
+    const N: usize = 40;
+    backend.inner.reset_operation_counts();
+    let outcomes = index
+        .batch_mutate(
+            (0..N as u8)
+                .map(|i| {
+                    let x = if i % 2 == 0 { 0.5 } else { 10.5 };
+                    Mutation::Insert(record_1d(&rid(i), x, 1))
+                })
+                .collect(),
+        )
+        .await
+        .expect("batch insert");
+    assert_eq!(outcomes.len(), N);
+
+    let counts = backend.inner.operation_counts();
+    // One grouped descent for the whole batch: one Tree Manifest read, one
+    // read per visited partition (root plus both leaves), one Child Entry
+    // scan — independent of the batch size.
+    assert_eq!(counts.get, 4, "plain reads: {counts:?}");
+    assert_eq!(counts.scan, 1, "scans: {counts:?}");
+    // Every record-group write lands through the single deferred apply; the
+    // only remaining write calls are the per-item Header/Synopsis updates.
+    assert_eq!(counts.insert, 0, "unique inserts: {counts:?}");
+    assert!(
+        counts.batch_mutate <= 2 * N + 1,
+        "batch_mutate calls: {counts:?}"
+    );
+    // Update-protected reads: one Manifest validation, one Header+edge pair
+    // per distinct leaf, and bounded per-item authoritative reads; the
+    // transaction-local cache serves every repeat.
+    assert!(
+        counts.get_for_update <= 5 * N + 5,
+        "get_for_update calls: {counts:?}"
+    );
+
+    // Functional outcome: all 40 records split across the two leaves.
+    assert_eq!(leaf_member_ids(&backend, &manifest, 1, 2).await.len(), 20);
+    assert_eq!(leaf_member_ids(&backend, &manifest, 1, 3).await.len(), 20);
+    assert_eq!(
+        read_header(&backend, &manifest, 1, 2).await.entry_count(),
+        20
+    );
+    assert_eq!(
+        read_header(&backend, &manifest, 1, 3).await.entry_count(),
+        20
+    );
+    for i in 0..N as u8 {
+        assert!(
+            index
+                .get(rid(i), GetOptions::default())
+                .await
+                .expect("get")
+                .is_some()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batched_upserts_read_locations_in_one_call() {
+    let backend = backend(DeterministicConfig::default());
+    let runtime = make_runtime(backend.clone());
+    let index = runtime
+        .create_index("batched-upsert", config_1d())
+        .await
+        .expect("create index");
+
+    const N: usize = 20;
+    let upserts = (0..N as u8)
+        .map(|i| Mutation::Upsert(record_1d(&rid(i), 1.0, 1)))
+        .collect::<Vec<_>>();
+    index.batch_mutate(upserts).await.expect("seed upserts");
+
+    backend.inner.reset_operation_counts();
+    let outcomes = index
+        .batch_mutate(
+            (0..N as u8)
+                .map(|i| Mutation::Upsert(record_1d(&rid(i), 2.0, 1)))
+                .collect(),
+        )
+        .await
+        .expect("replace upserts");
+    assert_eq!(
+        outcomes,
+        vec![MutationOutcome::Upserted { replaced: true }; N]
+    );
+
+    // One batched update-protected read decides insert versus replace for the
+    // whole batch; the membership operations re-read from the
+    // transaction-local cache.
+    let counts = backend.inner.operation_counts();
+    assert_eq!(counts.batch_get_for_update, 1, "location reads: {counts:?}");
+
+    for i in 0..N as u8 {
+        let stored = index
+            .get(rid(i), GetOptions::default())
+            .await
+            .expect("get")
+            .expect("record exists");
+        assert_eq!(stored.vector(), &[2.0]);
     }
 }

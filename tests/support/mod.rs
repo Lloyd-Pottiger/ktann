@@ -244,6 +244,35 @@ impl Default for DeterministicConfig {
     }
 }
 
+/// Native operation call counts since the last reset.
+///
+/// Every counter increments once per backend-native call, regardless of how
+/// many keys the call carries; the counts make read/write amplification
+/// observable in deterministic tests.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OperationCounts {
+    /// Point `get` calls.
+    pub get: usize,
+    /// `batch_get` calls.
+    pub batch_get: usize,
+    /// Update-protected `get_for_update` calls.
+    pub get_for_update: usize,
+    /// `batch_get_for_update` calls.
+    pub batch_get_for_update: usize,
+    /// `put` calls.
+    pub put: usize,
+    /// Unique `insert` calls.
+    pub insert: usize,
+    /// `delete` calls.
+    pub delete: usize,
+    /// `batch_mutate` calls.
+    pub batch_mutate: usize,
+    /// `scan` calls.
+    pub scan: usize,
+    /// `clear_range` calls.
+    pub clear_range: usize,
+}
+
 /// A deterministic in-memory transactional KV backend.
 ///
 /// Committed state is an immutable `Arc<BTreeMap>` snapshot, replaced under one
@@ -254,6 +283,7 @@ impl Default for DeterministicConfig {
 pub struct DeterministicBackend {
     config: DeterministicConfig,
     state: Mutex<State>,
+    counts: Mutex<OperationCounts>,
 }
 
 struct State {
@@ -315,7 +345,25 @@ impl DeterministicBackend {
         Self {
             config,
             state: Mutex::new(state),
+            counts: Mutex::new(OperationCounts::default()),
         }
+    }
+
+    /// Counts one native operation call.
+    fn count(&self, update: impl FnOnce(&mut OperationCounts)) {
+        let mut counts = self.counts.lock().expect("counts lock poisoned");
+        update(&mut counts);
+    }
+
+    /// Returns the native operation call counts since the last reset.
+    #[must_use]
+    pub fn operation_counts(&self) -> OperationCounts {
+        *self.counts.lock().expect("counts lock poisoned")
+    }
+
+    /// Resets the native operation call counters.
+    pub fn reset_operation_counts(&self) {
+        *self.counts.lock().expect("counts lock poisoned") = OperationCounts::default();
     }
 
     /// Appends one fault step to the plan, bounded by `max_fault_plan`.
@@ -413,6 +461,7 @@ impl DeterministicBackend {
         DeterministicBackend {
             config: self.config,
             state: Mutex::new(state),
+            counts: Mutex::new(OperationCounts::default()),
         }
     }
 }
@@ -757,11 +806,13 @@ impl DeterministicBackend {
 
 impl ReadOps for DeterministicReadTxn<'_> {
     async fn get(&mut self, key: Bytes) -> Result<Option<Bytes>> {
+        self.backend.count(|counts| counts.get += 1);
         check_key(&self.backend.config, &key)?;
         Ok(self.get_value(&key))
     }
 
     async fn batch_get(&mut self, keys: Vec<Bytes>) -> Result<Vec<Option<Bytes>>> {
+        self.backend.count(|counts| counts.batch_get += 1);
         if keys.len() > self.backend.config.max_batch_size {
             return Err(limit_exceeded());
         }
@@ -770,6 +821,7 @@ impl ReadOps for DeterministicReadTxn<'_> {
     }
 
     async fn scan(&mut self, range: &KeyRange, limits: ScanLimits) -> Result<ScanPage> {
+        self.backend.count(|counts| counts.scan += 1);
         let (item_limit, byte_limit) = resolve_scan(limits, &self.backend.config)?;
         if range.start() >= range.end() {
             return Ok(ScanPage::terminal(Vec::new()));
@@ -789,11 +841,13 @@ impl ReadTxn for DeterministicReadTxn<'_> {}
 
 impl ReadOps for DeterministicWriteTxn<'_> {
     async fn get(&mut self, key: Bytes) -> Result<Option<Bytes>> {
+        self.backend.count(|counts| counts.get += 1);
         check_key(&self.backend.config, &key)?;
         Ok(self.lookup(&key))
     }
 
     async fn batch_get(&mut self, keys: Vec<Bytes>) -> Result<Vec<Option<Bytes>>> {
+        self.backend.count(|counts| counts.batch_get += 1);
         if keys.len() > self.backend.config.max_batch_size {
             return Err(limit_exceeded());
         }
@@ -802,6 +856,7 @@ impl ReadOps for DeterministicWriteTxn<'_> {
     }
 
     async fn scan(&mut self, range: &KeyRange, limits: ScanLimits) -> Result<ScanPage> {
+        self.backend.count(|counts| counts.scan += 1);
         let (item_limit, byte_limit) = resolve_scan(limits, &self.backend.config)?;
         if range.start() >= range.end() {
             return Ok(ScanPage::terminal(Vec::new()));
@@ -820,12 +875,15 @@ impl ReadOps for DeterministicWriteTxn<'_> {
 
 impl WriteTxn for DeterministicWriteTxn<'_> {
     async fn get_for_update(&mut self, key: Bytes) -> Result<Option<Bytes>> {
+        self.backend.count(|counts| counts.get_for_update += 1);
         check_key(&self.backend.config, &key)?;
         self.add_read(&key)?;
         Ok(self.lookup(&key))
     }
 
     async fn batch_get_for_update(&mut self, keys: Vec<Bytes>) -> Result<Vec<Option<Bytes>>> {
+        self.backend
+            .count(|counts| counts.batch_get_for_update += 1);
         if keys.len() > self.backend.config.max_batch_size {
             return Err(limit_exceeded());
         }
@@ -837,6 +895,7 @@ impl WriteTxn for DeterministicWriteTxn<'_> {
     }
 
     async fn put(&mut self, key: Bytes, value: Bytes) -> Result<()> {
+        self.backend.count(|counts| counts.put += 1);
         self.check_key_value(&key, Some(&value))?;
         let new_keys = once_set(key.to_vec());
         self.check_buffer_growth(&new_keys)?;
@@ -851,6 +910,7 @@ impl WriteTxn for DeterministicWriteTxn<'_> {
     }
 
     async fn insert(&mut self, key: Bytes, value: Bytes) -> Result<InsertOutcome> {
+        self.backend.count(|counts| counts.insert += 1);
         self.check_key_value(&key, Some(&value))?;
         self.add_read(&key)?;
         if self.lookup(&key).is_some() {
@@ -869,6 +929,7 @@ impl WriteTxn for DeterministicWriteTxn<'_> {
     }
 
     async fn delete(&mut self, key: Bytes) -> Result<()> {
+        self.backend.count(|counts| counts.delete += 1);
         self.check_key_value(&key, None)?;
         let new_keys = once_set(key.to_vec());
         self.check_buffer_growth(&new_keys)?;
@@ -878,6 +939,7 @@ impl WriteTxn for DeterministicWriteTxn<'_> {
     }
 
     async fn batch_mutate(&mut self, mutations: Vec<Mutation>) -> Result<()> {
+        self.backend.count(|counts| counts.batch_mutate += 1);
         if mutations.len() > self.backend.config.max_batch_size {
             return Err(limit_exceeded());
         }
@@ -921,6 +983,7 @@ impl WriteTxn for DeterministicWriteTxn<'_> {
     }
 
     async fn clear_range(&mut self, range: &KeyRange) -> Result<()> {
+        self.backend.count(|counts| counts.clear_range += 1);
         if !self.backend.config.capabilities.transactional_clear_range {
             return Err(Error::new(ErrorKind::Unsupported));
         }

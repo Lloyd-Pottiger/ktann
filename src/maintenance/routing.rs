@@ -4,7 +4,10 @@
 //! Partition Key 1 to the Leaf Partition nearest to a preprocessed routing
 //! vector. Only the stable `Ready` topology exists before the split/merge
 //! state machines (#10, #31); every other persisted state is unreachable and
-//! therefore rejected as Corruption rather than routed through.
+//! therefore rejected as Corruption rather than routed through. The write path
+//! routes a whole batch at once: one grouped descent per Tree Key shares the
+//! Tree Manifest read and every visited internal partition's reads across all
+//! of the batch's records.
 //!
 //! # Contract
 //!
@@ -32,6 +35,7 @@
 //!   than two, a level mismatch, a non-Ready state, or a malformed centroid
 //!   is Corruption; malformed caller vectors are InvalidArgument.
 
+use std::collections::BTreeSet;
 use std::future::Future;
 
 use crate::api::{Error, ErrorKind, PartitionKey, Result};
@@ -39,7 +43,7 @@ use crate::search::numeric::VectorKernel;
 use crate::storage::backend::{ReadOps, ScanLimits, WriteTxn};
 use crate::storage::keys::{LogicalKey, MAX_TREE_KEY_BYTES, TreeKey};
 use crate::storage::values::{
-    IndexManifest, PartitionHeader, PartitionState, PersistentValue, TreeManifest,
+    ChildEntry, IndexManifest, PartitionHeader, PartitionState, PersistentValue, TreeManifest,
 };
 use crate::storage::{
     LogicalRange, LogicalScanCursor, LogicalScanPage, ReadLogicalTxn, WriteLogicalTxn,
@@ -125,33 +129,58 @@ pub async fn route_leaf_for_write<T: WriteTxn>(
     let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
     let kernel = kernel_for(manifest)?;
     let routing = kernel.preprocess(vector)?;
-    route_leaf_for_write_preprocessed(txn, tree_key, &kernel, &routing, started_at_unix_millis)
-        .await
+    let mut routes = route_leaves_for_write_preprocessed(
+        txn,
+        tree_key,
+        &kernel,
+        &[&routing],
+        started_at_unix_millis,
+    )
+    .await?;
+    // The batched contract yields exactly one route per input vector.
+    routes.pop().ok_or_else(|| Error::new(ErrorKind::Backend))
 }
 
-/// Routes an already preprocessed routing vector through one tree for a
+/// Routes one batch of preprocessed routing vectors through one tree for a
 /// foreground write.
 ///
-/// `routing` must be the exact output of [`VectorKernel::preprocess`] under
-/// `kernel` for the bound Logical Index: the mutation pipeline preprocesses
-/// and quantizes each caller vector once and reuses the same routing vector
-/// here. The same empty-root growth and write validation contract as
-/// [`route_leaf_for_write`] applies.
-pub(crate) async fn route_leaf_for_write_preprocessed<T: WriteTxn>(
+/// The batch shares one Tree Manifest read and one read per visited internal
+/// partition instead of re-descending per record. The returned Routes
+/// correspond to the input vectors by index, and every *distinct* routed leaf
+/// is validated once: its Header and incoming edge are update-protected, so a
+/// concurrent topology change aborts the commit and the whole attempt reroutes
+/// from a fresh snapshot.
+///
+/// Every routing vector must be the exact output of
+/// [`VectorKernel::preprocess`] under `kernel` for the bound Logical Index.
+pub(crate) async fn route_leaves_for_write_preprocessed<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     tree_key: &TreeKey,
     kernel: &VectorKernel,
-    routing: &[f32],
+    routings: &[&[f32]],
     started_at_unix_millis: u64,
-) -> Result<Route> {
+) -> Result<Vec<Route>> {
     let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
-    if routing.len() != manifest.config().dimension() {
+    if routings
+        .iter()
+        .any(|routing| routing.len() != manifest.config().dimension())
+    {
         return Err(Error::invalid_argument());
     }
+    if routings.is_empty() {
+        return Ok(Vec::new());
+    }
     let root = ensure_tree(txn, tree_key, started_at_unix_millis).await?;
-    let route = descend(txn, manifest, kernel, tree_key, root, routing).await?;
-    validate_for_write(txn, manifest, tree_key, &route).await?;
-    Ok(route)
+    let routes = descend_grouped(txn, manifest, kernel, tree_key, root, routings).await?;
+    let mut validated = BTreeSet::new();
+    for route in &routes {
+        // One snapshot gives each leaf exactly one incoming edge, so the leaf
+        // alone identifies the (leaf, parent) pair to validate.
+        if validated.insert(route.leaf()) {
+            validate_for_write(txn, manifest, tree_key, route).await?;
+        }
+    }
+    Ok(routes)
 }
 
 /// Returns the root of `tree_key`'s tree, lazily installing the tree when the
@@ -203,10 +232,6 @@ async fn read_tree_manifest_plain<T: WriteTxn>(
 
 /// Descends from `root` to the leaf nearest to `routing`, carrying the
 /// observed parent.
-///
-/// The hop count is bounded by the persisted root level: every hop must
-/// descend exactly one level, so a level that fails to decrement — including
-/// any cycle — is Corruption before the descent can repeat a partition.
 async fn descend<R: RoutingReader>(
     reader: &mut R,
     manifest: &IndexManifest,
@@ -220,14 +245,7 @@ async fn descend<R: RoutingReader>(
     let mut expected_level = None;
     loop {
         let header = read_header(reader, manifest, tree_key, partition).await?;
-        if let Some(expected) = expected_level {
-            if header.level() != expected {
-                return Err(Error::new(ErrorKind::Corruption));
-            }
-        }
-        if header.state() != PartitionState::Ready {
-            return Err(Error::new(ErrorKind::Corruption));
-        }
+        check_visited_header(&header, expected_level)?;
         if header.level() == 1 {
             return Ok(Route {
                 leaf: partition,
@@ -240,6 +258,80 @@ async fn descend<R: RoutingReader>(
         parent = Some(partition);
         partition = child;
     }
+}
+
+/// Validates one visited partition's level progression and Ready state.
+///
+/// Every hop must descend exactly one level, so a level that fails to
+/// decrement — including any cycle — is Corruption, as is any non-Ready
+/// state.
+fn check_visited_header(header: &PartitionHeader, expected_level: Option<u32>) -> Result<()> {
+    if let Some(expected) = expected_level {
+        if header.level() != expected {
+            return Err(Error::new(ErrorKind::Corruption));
+        }
+    }
+    if header.state() != PartitionState::Ready {
+        return Err(Error::new(ErrorKind::Corruption));
+    }
+    Ok(())
+}
+
+/// Descends from `root` with the whole group, reading each visited partition
+/// once and returning one Route per input vector in input order. The same
+/// fail-closed level and state contract as [`descend`] applies.
+async fn descend_grouped<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    manifest: &IndexManifest,
+    kernel: &VectorKernel,
+    tree_key: &TreeKey,
+    root: PartitionKey,
+    routings: &[&[f32]],
+) -> Result<Vec<Route>> {
+    let mut routes: Vec<Option<Route>> = vec![None; routings.len()];
+    let mut pending = vec![(
+        root,
+        None,
+        None,
+        (0..routings.len()).collect::<Vec<usize>>(),
+    )];
+    while let Some((partition, parent, expected_level, members)) = pending.pop() {
+        let header = read_header(txn, manifest, tree_key, partition).await?;
+        check_visited_header(&header, expected_level)?;
+        if header.level() == 1 {
+            for member in members {
+                routes[member] = Some(Route {
+                    leaf: partition,
+                    leaf_header: header,
+                    parent,
+                });
+            }
+            continue;
+        }
+        let children = read_children(txn, manifest, tree_key, partition).await?;
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        for member in members {
+            if nearest_of(&children, kernel, routings[member])? == children[0].child() {
+                left.push(member);
+            } else {
+                right.push(member);
+            }
+        }
+        let next_level = Some(header.level() - 1);
+        if !left.is_empty() {
+            pending.push((children[0].child(), Some(partition), next_level, left));
+        }
+        if !right.is_empty() {
+            pending.push((children[1].child(), Some(partition), next_level, right));
+        }
+    }
+    // Every member is resolved exactly once: each partition visit either
+    // assigns its members at a leaf or splits them across both children.
+    routes
+        .into_iter()
+        .map(|route| route.ok_or_else(|| Error::new(ErrorKind::Backend)))
+        .collect()
 }
 
 /// Reads one partition Header, failing closed when a routed-to partition has
@@ -265,11 +357,6 @@ async fn read_header<R: RoutingReader>(
 }
 
 /// Selects the nearest child of one stable internal partition for `routing`.
-///
-/// A stable internal partition holds exactly [`INTERNAL_FANOUT`] Child
-/// Entries; the scan admits one extra entry solely to detect a fanout
-/// violation, and any other count is Corruption. Distance ties resolve to the
-/// smaller child Partition Key, the canonical routing tie-breaker.
 async fn nearest_child<R: RoutingReader>(
     reader: &mut R,
     manifest: &IndexManifest,
@@ -278,10 +365,25 @@ async fn nearest_child<R: RoutingReader>(
     partition: PartitionKey,
     routing: &[f32],
 ) -> Result<PartitionKey> {
+    let children = read_children(reader, manifest, tree_key, partition).await?;
+    nearest_of(&children, kernel, routing)
+}
+
+/// Reads the exactly-two Child Entries of one stable internal partition.
+///
+/// A stable internal partition holds exactly [`INTERNAL_FANOUT`] Child
+/// Entries; the scan admits one extra entry solely to detect a fanout
+/// violation, and any other count is Corruption. The backend's ordered scan
+/// returns the entries in ascending child Partition Key order.
+async fn read_children<R: RoutingReader>(
+    reader: &mut R,
+    manifest: &IndexManifest,
+    tree_key: &TreeKey,
+    partition: PartitionKey,
+) -> Result<[ChildEntry; 2]> {
     let range = LogicalRange::child_entries(manifest, tree_key, partition)?;
     let limits = child_scan_limits(manifest.config().dimension())?;
-    let mut count = 0_usize;
-    let mut best: Option<(f64, PartitionKey)> = None;
+    let mut entries = Vec::with_capacity(INTERNAL_FANOUT);
     let mut cursor = None;
     loop {
         let page = reader.scan(&range, cursor.as_ref(), limits).await?;
@@ -289,25 +391,9 @@ async fn nearest_child<R: RoutingReader>(
             let PersistentValue::ChildEntry(entry) = item.value() else {
                 return Err(Error::new(ErrorKind::Corruption));
             };
-            count = count
-                .checked_add(1)
-                .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
-            if count > INTERNAL_FANOUT {
+            entries.push(entry.clone());
+            if entries.len() > INTERNAL_FANOUT {
                 return Err(Error::new(ErrorKind::Corruption));
-            }
-            let distance = kernel.routing_distance(routing, entry.centroid())?;
-            let nearer = match best {
-                None => true,
-                Some((best_distance, best_child)) => {
-                    // IEEE equality makes -0.0 and +0.0 a distance tie, so the
-                    // Partition Key decides. The comparison is total because
-                    // every distance is validated finite.
-                    distance < best_distance
-                        || (distance == best_distance && entry.child() < best_child)
-                }
-            };
-            if nearer {
-                best = Some((distance, entry.child()));
             }
         }
         cursor = page.into_next_cursor();
@@ -315,11 +401,27 @@ async fn nearest_child<R: RoutingReader>(
             break;
         }
     }
-    if count != INTERNAL_FANOUT {
-        return Err(Error::new(ErrorKind::Corruption));
-    }
-    best.map(|(_, child)| child)
-        .ok_or_else(|| Error::new(ErrorKind::Corruption))
+    <[ChildEntry; 2]>::try_from(entries).map_err(|_| Error::new(ErrorKind::Corruption))
+}
+
+/// Selects the nearer of one internal partition's two children for `routing`.
+///
+/// Distance ties resolve to the smaller child Partition Key, the canonical
+/// routing tie-breaker: the ordered scan places the smaller key at index 0.
+/// IEEE equality makes -0.0 and +0.0 a distance tie, and the comparison is
+/// total because every distance is validated finite.
+fn nearest_of(
+    children: &[ChildEntry; 2],
+    kernel: &VectorKernel,
+    routing: &[f32],
+) -> Result<PartitionKey> {
+    let left = kernel.routing_distance(routing, children[0].centroid())?;
+    let right = kernel.routing_distance(routing, children[1].centroid())?;
+    Ok(if left <= right {
+        children[0].child()
+    } else {
+        children[1].child()
+    })
 }
 
 /// Builds the scan bounds that prove the internal fanout invariant.

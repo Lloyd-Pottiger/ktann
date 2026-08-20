@@ -894,12 +894,33 @@ fn check_budget(budget: AdmissionBudget, size: TransactionSize) -> Result<()> {
 }
 
 /// A write transaction that exposes typed logical reads and mutations.
+///
+/// Point reads are served through a transaction-local cache: the first read
+/// of a key goes to the backend, and later reads of the same key reuse the
+/// cached value, which is always consistent with this transaction's snapshot
+/// and pending writes. A cached value serves an update-protected read only
+/// when the native read that populated it already established the conflict;
+/// otherwise the read goes to the backend so the conflict is established.
+/// Every mutation of a key refreshes its cache entry with the written value,
+/// so reads after a write observe this transaction's own write without
+/// another backend call; a range clear drops the whole cache. The cache is
+/// bounded by the transaction's own read and write volume and is dropped when
+/// the transaction is.
 pub struct WriteLogicalTxn<'manifest, T> {
     raw: T,
     binding: LogicalBinding<'manifest>,
     hard_limits: HardLimits,
     budget: AdmissionBudget,
     size: TransactionSize,
+    read_cache: BTreeMap<Bytes, ReadCacheEntry>,
+}
+
+/// One cached point-read value.
+struct ReadCacheEntry {
+    value: Option<Bytes>,
+    /// Whether the native read that produced this entry established a
+    /// conflict on the key.
+    update_protected: bool,
 }
 
 impl<T> WriteLogicalTxn<'static, T> {
@@ -912,6 +933,7 @@ impl<T> WriteLogicalTxn<'static, T> {
             hard_limits,
             budget,
             size: TransactionSize::default(),
+            read_cache: BTreeMap::new(),
         }
     }
 }
@@ -930,6 +952,7 @@ impl<'manifest, T> WriteLogicalTxn<'manifest, T> {
             hard_limits,
             budget,
             size: TransactionSize::default(),
+            read_cache: BTreeMap::new(),
         })
     }
 
@@ -954,6 +977,7 @@ impl<'manifest, T> WriteLogicalTxn<'manifest, T> {
             hard_limits,
             budget,
             size: TransactionSize::default(),
+            read_cache: BTreeMap::new(),
         })
     }
 
@@ -1017,7 +1041,9 @@ impl<T> fmt::Debug for WriteLogicalTxn<'_, T> {
 impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
     /// Reads one typed value from the transaction snapshot and pending writes.
     pub async fn get(&mut self, key: LogicalKey) -> Result<Option<PersistentValue>> {
-        get_logical(&mut self.raw, &self.binding, key).await
+        let encoded = encode_input_key(&self.binding, &key)?;
+        let value = self.get_raw(encoded, false).await?;
+        decode_value(&self.binding, &key, value)
     }
 
     /// Reads typed values in input order from the transaction snapshot.
@@ -1025,13 +1051,22 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
         &mut self,
         keys: Vec<LogicalKey>,
     ) -> Result<Vec<Option<PersistentValue>>> {
-        batch_get_logical(&mut self.raw, &self.binding, keys).await
+        let encoded = keys
+            .iter()
+            .map(|key| encode_input_key(&self.binding, key))
+            .collect::<Result<Vec<_>>>()?;
+        let values = self.batch_get_raw(encoded, false).await?;
+        decode_batch(&self.binding, &keys, values)
     }
 
     /// Reads one typed value and establishes a point conflict on its key.
+    ///
+    /// A repeat read of an already conflict-established key is served from the
+    /// transaction-local cache without a second backend read; the conflict
+    /// from the first read still guards the commit.
     pub async fn get_for_update(&mut self, key: LogicalKey) -> Result<Option<PersistentValue>> {
         let encoded = encode_input_key(&self.binding, &key)?;
-        let value = self.raw.get_for_update(encoded).await?;
+        let value = self.get_raw(encoded, true).await?;
         decode_value(&self.binding, &key, value)
     }
 
@@ -1044,8 +1079,82 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
             .iter()
             .map(|key| encode_input_key(&self.binding, key))
             .collect::<Result<Vec<_>>>()?;
-        let values = self.raw.batch_get_for_update(encoded).await?;
+        let values = self.batch_get_raw(encoded, true).await?;
         decode_batch(&self.binding, &keys, values)
+    }
+
+    /// Reads one raw value, serving repeats from the transaction-local cache.
+    ///
+    /// A cached entry serves the read when it is conflict-established or the
+    /// caller only needs a plain read; otherwise the read goes to the backend
+    /// so the conflict is established natively.
+    async fn get_raw(&mut self, key: Bytes, for_update: bool) -> Result<Option<Bytes>> {
+        if let Some(entry) = self.read_cache.get(&key) {
+            if entry.update_protected || !for_update {
+                return Ok(entry.value.clone());
+            }
+        }
+        let value = if for_update {
+            self.raw.get_for_update(key.clone()).await?
+        } else {
+            self.raw.get(key.clone()).await?
+        };
+        self.read_cache.insert(
+            key,
+            ReadCacheEntry {
+                value: value.clone(),
+                update_protected: for_update,
+            },
+        );
+        Ok(value)
+    }
+
+    /// Reads raw values in input order, fetching only keys the cache cannot
+    /// serve and merging cached and native values at their input positions.
+    async fn batch_get_raw(
+        &mut self,
+        keys: Vec<Bytes>,
+        for_update: bool,
+    ) -> Result<Vec<Option<Bytes>>> {
+        let mut values: Vec<Option<Bytes>> = Vec::with_capacity(keys.len());
+        let mut missing = Vec::new();
+        for (index, key) in keys.iter().enumerate() {
+            match self.read_cache.get(key) {
+                Some(entry) if entry.update_protected || !for_update => {
+                    values.push(entry.value.clone());
+                }
+                _ => {
+                    missing.push((index, key.clone()));
+                    values.push(None);
+                }
+            }
+        }
+        if missing.is_empty() {
+            return Ok(values);
+        }
+        let fetched = if for_update {
+            self.raw
+                .batch_get_for_update(missing.iter().map(|(_, key)| key.clone()).collect())
+                .await?
+        } else {
+            self.raw
+                .batch_get(missing.iter().map(|(_, key)| key.clone()).collect())
+                .await?
+        };
+        if fetched.len() != missing.len() {
+            return Err(Error::new(ErrorKind::Backend));
+        }
+        for ((index, key), value) in missing.into_iter().zip(fetched) {
+            self.read_cache.insert(
+                key,
+                ReadCacheEntry {
+                    value: value.clone(),
+                    update_protected: for_update,
+                },
+            );
+            values[index] = value;
+        }
+        Ok(values)
     }
 
     /// Scans one bounded typed page from this transaction's snapshot.
@@ -1089,7 +1198,9 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
         // An update-protected read both establishes a conflict on the target key
         // and decodes the existing value fail-closed, so a duplicate insert is
         // always validated and conflict-safe regardless of the remaining budget.
-        if let Some(existing) = self.raw.get_for_update(encoded_key.clone()).await? {
+        // The read is served from the transaction-local cache when this
+        // transaction already conflict-established the key.
+        if let Some(existing) = self.get_raw(encoded_key.clone(), true).await? {
             self.binding.codec().decode(&key, existing)?;
             return Ok(InsertOutcome::AlreadyExists);
         }
@@ -1099,9 +1210,13 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
             .checked_add(mutation_size)
             .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
         check_budget(self.budget, next)?;
-        let outcome = self.raw.insert(encoded_key, encoded_value).await?;
+        let outcome = self
+            .raw
+            .insert(encoded_key.clone(), encoded_value.clone())
+            .await?;
         if outcome == InsertOutcome::Inserted {
             self.size = next;
+            self.cache_write(encoded_key, Some(encoded_value));
         }
         Ok(outcome)
     }
@@ -1111,6 +1226,10 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
         if !self.binding.compatible_with(&builder.binding) {
             return Err(Error::invalid_argument());
         }
+        // An empty builder carries no writes; skip the native call.
+        if builder.entries.is_empty() {
+            return Ok(());
+        }
         for (key, value) in &builder.entries {
             check_hard_limits(self.hard_limits, key, value.as_ref())?;
         }
@@ -1119,11 +1238,37 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
             .checked_add(builder.size)
             .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
         check_budget(self.budget, next)?;
+        let written: Vec<(Bytes, Option<Bytes>)> = builder
+            .entries
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
         self.raw
             .batch_mutate(builder.into_backend_mutations())
             .await?;
+        for (key, value) in written {
+            self.cache_write(key, value);
+        }
         self.size = next;
         Ok(())
+    }
+
+    /// Records this transaction's own write in the read cache.
+    ///
+    /// A later read must observe exactly these bytes through the backend
+    /// overlay (read-your-writes), so re-fetching them would be redundant. A
+    /// key that was never conflict-read keeps `update_protected` unset, so a
+    /// later update-protected read still establishes the conflict natively.
+    fn cache_write(&mut self, key: Bytes, value: Option<Bytes>) {
+        match self.read_cache.entry(key) {
+            Entry::Occupied(mut entry) => entry.get_mut().value = value,
+            Entry::Vacant(entry) => {
+                entry.insert(ReadCacheEntry {
+                    value,
+                    update_protected: false,
+                });
+            }
+        }
     }
 
     /// Clears one typed range when the backend supports transactional clear.
@@ -1144,6 +1289,9 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
             .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
         check_budget(self.budget, next)?;
         self.raw.clear_range(&range.raw).await?;
+        // A range clear invalidates every cached value in the range; the
+        // cache is small and drops are rare, so the whole cache is dropped.
+        self.read_cache.clear();
         self.size = next;
         Ok(())
     }

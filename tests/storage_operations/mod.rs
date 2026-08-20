@@ -18,7 +18,7 @@ use ktann::storage::{
     LogicalRange, MutationBuilder, ReadLogicalTxn, TransactionSize, WriteLogicalTxn,
 };
 
-use super::support::{DeterministicBackend, DeterministicConfig};
+use super::support::{DeterministicBackend, DeterministicConfig, DeterministicWriteTxn};
 
 fn id(value: u64) -> LogicalIndexId {
     LogicalIndexId::new(value).expect("test Logical Index ID is nonzero")
@@ -831,5 +831,132 @@ async fn insert_at_exhausted_budget_for_absent_key_returns_limit_exceeded() {
         .await
         .expect_err("absent key at exhausted budget");
     assert_eq!(error.kind(), ErrorKind::LimitExceeded);
+    txn.rollback().await;
+}
+
+/// Seeds one committed Record value and resets the backend call counters.
+async fn seed_record(backend: &DeterministicBackend, record_id: &'static [u8]) {
+    let manifest = manifest();
+    let limits = backend.hard_limits();
+    let budget = backend.admission_budget();
+    let raw = backend.begin_write().await.expect("begin seed");
+    let mut txn = WriteLogicalTxn::for_index(raw, &manifest, limits, budget).expect("bind index");
+    txn.put(record_key(record_id), record(record_id))
+        .await
+        .expect("seed record");
+    txn.commit().await.expect("commit seed");
+    backend.reset_operation_counts();
+}
+
+async fn index_write_txn<'b, 'm>(
+    backend: &'b DeterministicBackend,
+    manifest: &'m IndexManifest,
+) -> WriteLogicalTxn<'m, DeterministicWriteTxn<'b>> {
+    let raw = backend.begin_write().await.expect("begin write");
+    WriteLogicalTxn::for_index(
+        raw,
+        manifest,
+        backend.hard_limits(),
+        backend.admission_budget(),
+    )
+    .expect("bind index")
+}
+
+#[tokio::test]
+async fn repeat_reads_reuse_the_transaction_cache() {
+    let backend = DeterministicBackend::default();
+    let manifest = manifest();
+    seed_record(&backend, b"cached").await;
+    let mut txn = index_write_txn(&backend, &manifest).await;
+
+    // A plain read followed by another plain read hits the backend once.
+    let first = txn.get(record_key(b"cached")).await.expect("first get");
+    let second = txn.get(record_key(b"cached")).await.expect("second get");
+    assert_eq!(first, second);
+    assert_eq!(backend.operation_counts().get, 1);
+
+    // An update-protected read of a key cached by a plain read must go to the
+    // backend anyway: the conflict is established only by a native
+    // update-protected read. A later update-protected read reuses the cache.
+    txn.get_for_update(record_key(b"cached"))
+        .await
+        .expect("update read");
+    txn.get_for_update(record_key(b"cached"))
+        .await
+        .expect("cached update read");
+    assert_eq!(backend.operation_counts().get_for_update, 1);
+
+    // A batch read merges cached keys with one native call for the rest, in
+    // input order and with duplicates preserved.
+    let values = txn
+        .batch_get(vec![
+            record_key(b"cached"),
+            record_key(b"other"),
+            record_key(b"cached"),
+        ])
+        .await
+        .expect("batch get");
+    assert_eq!(values, vec![first.clone(), None, first]);
+    assert_eq!(backend.operation_counts().batch_get, 1);
+    // The update-protected batch reuses the conflict-established entry and
+    // fetches only the remaining key.
+    txn.batch_get_for_update(vec![record_key(b"cached"), record_key(b"other")])
+        .await
+        .expect("batch update read");
+    assert_eq!(backend.operation_counts().batch_get_for_update, 1);
+    txn.rollback().await;
+}
+
+#[tokio::test]
+async fn cached_update_protected_reads_still_conflict() {
+    let backend = DeterministicBackend::default();
+    let manifest = manifest();
+    seed_record(&backend, b"cached").await;
+
+    let mut txn = index_write_txn(&backend, &manifest).await;
+    // The second read is served from the cache, so the transaction establishes
+    // exactly one native conflict on the key.
+    txn.get_for_update(record_key(b"cached"))
+        .await
+        .expect("update read");
+    txn.get_for_update(record_key(b"cached"))
+        .await
+        .expect("cached update read");
+    assert_eq!(backend.operation_counts().get_for_update, 1);
+    txn.put(record_key(b"other"), record(b"other"))
+        .await
+        .expect("write something");
+
+    let mut concurrent = index_write_txn(&backend, &manifest).await;
+    concurrent
+        .put(record_key(b"cached"), record(b"cached"))
+        .await
+        .expect("concurrent put");
+    concurrent.commit().await.expect("concurrent commit");
+
+    let error = txn.commit().await.expect_err("cached read conflicts");
+    assert_eq!(error.kind(), ErrorKind::RetryableAbort);
+}
+
+#[tokio::test]
+async fn writes_refresh_cached_reads() {
+    let backend = DeterministicBackend::default();
+    let manifest = manifest();
+    seed_record(&backend, b"cached").await;
+    let mut txn = index_write_txn(&backend, &manifest).await;
+
+    assert!(txn.get(record_key(b"cached")).await.expect("get").is_some());
+    // A write refreshes the cache entry, so the next read observes this
+    // transaction's own write without another backend read.
+    txn.put(record_key(b"cached"), record(b"cached"))
+        .await
+        .expect("overwrite");
+    let after_write = txn.get(record_key(b"cached")).await.expect("re-read");
+    assert_eq!(after_write, Some(record(b"cached")));
+    assert_eq!(backend.operation_counts().get, 1);
+
+    txn.delete(record_key(b"cached")).await.expect("delete");
+    assert_eq!(txn.get(record_key(b"cached")).await.expect("re-read"), None);
+    assert_eq!(backend.operation_counts().get, 1);
     txn.rollback().await;
 }

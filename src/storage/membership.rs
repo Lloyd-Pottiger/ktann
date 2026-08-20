@@ -10,6 +10,16 @@
 //! maintenance module; these functions take the caller's exact expected and
 //! target locations and never route.
 //!
+//! Record-group writes (Vector Record, Record Location, Opaque Payload, Leaf
+//! Entry) are queued into the caller's [`MutationBuilder`] and become visible
+//! only when it is applied, so a whole mutation batch lands in canonical key
+//! order with one backend write call; the queue replaces backend unique
+//! inserts with update-protected existence checks. Exact Header counts and
+//! Synopsis expansions apply immediately through the transaction, so a later
+//! item of the same batch observes them via read-your-writes. Deferral is
+//! exact because a validated batch holds at most one item per Record ID;
+//! callers must enforce that before queueing.
+//!
 //! Every authoritative read a mutation depends on is update-protected, so a
 //! concurrent change to the same membership or leaf Header aborts the commit
 //! with [`ErrorKind::RetryableAbort`] instead of producing a partial write. A
@@ -21,13 +31,13 @@
 use bytes::Bytes;
 
 use crate::api::{Error, ErrorKind, LogicalIndexId, Result, Value};
-use crate::storage::WriteLogicalTxn;
-use crate::storage::backend::{InsertOutcome, WriteTxn};
+use crate::storage::backend::WriteTxn;
 use crate::storage::keys::LogicalKey;
 use crate::storage::values::{
     IndexManifest, LeafEntry, OpaquePayload, PartitionHeader, PartitionState, PartitionSynopsis,
     PersistentValue, RecordLocation, VectorRecord,
 };
+use crate::storage::{MutationBuilder, WriteLogicalTxn};
 
 /// The outcome of an idempotent delete.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,13 +51,14 @@ pub enum DeleteOutcome {
 
 /// Inserts one new Vector Record's complete membership at `target`.
 ///
-/// The Record unique insert runs first, so an existing Record ID fails with
+/// The Record existence check runs first, so an existing Record ID fails with
 /// [`ErrorKind::RecordAlreadyExists`] before any other write. The Record
-/// Location, the optional Opaque Payload, and the Leaf Entry are unique
-/// inserts; any of them already existing is [`ErrorKind::Corruption`]. The
-/// target leaf Header must exist at level 1 in a write-accepting state
-/// (`Ready`, `Splitting`, or `ReceivingSplit`) and the target Synopsis must
-/// exist; a missing or non-write-accepting Header and a missing Synopsis are
+/// Location, the optional Opaque Payload, and the Leaf Entry must not exist;
+/// any of them already existing is [`ErrorKind::Corruption`]. All four checks
+/// are update-protected and the writes are queued into `deferred`. The target
+/// leaf Header must exist at level 1 in a write-accepting state (`Ready`,
+/// `Splitting`, or `ReceivingSplit`) and the target Synopsis must exist; a
+/// missing or non-write-accepting Header and a missing Synopsis are
 /// [`ErrorKind::Corruption`]. The Header's exact count and cache epoch
 /// increase by one, and the Synopsis expands with the entry's exact
 /// projection.
@@ -56,6 +67,7 @@ pub enum DeleteOutcome {
 /// caller must not commit the transaction.
 pub async fn insert_record<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
+    deferred: &mut MutationBuilder<'_>,
     record: &VectorRecord,
     payload: Option<&OpaquePayload>,
     target: &RecordLocation,
@@ -65,30 +77,24 @@ pub async fn insert_record<T: WriteTxn>(
     let index = manifest.logical_index_id();
     let id = record.record_id();
 
-    let outcome = txn
-        .insert(
-            record_key(index, id),
-            PersistentValue::VectorRecord(record.clone()),
-        )
-        .await?;
-    if outcome != InsertOutcome::Inserted {
+    // The update-protected existence check aborts the commit when a concurrent
+    // transaction creates the same Record ID, keeping insert-if-absent exact.
+    if txn.get_for_update(record_key(index, id)).await?.is_some() {
         return Err(Error::new(ErrorKind::RecordAlreadyExists));
     }
-    expect_inserted(
-        txn.insert(
-            location_key(index, id),
-            PersistentValue::RecordLocation(target.clone()),
-        )
-        .await?,
+    deferred.put(
+        record_key(index, id),
+        PersistentValue::VectorRecord(record.clone()),
+    )?;
+    expect_absent(txn, location_key(index, id)).await?;
+    deferred.put(
+        location_key(index, id),
+        PersistentValue::RecordLocation(target.clone()),
     )?;
     if let Some(payload) = payload {
-        expect_inserted(
-            txn.insert(
-                payload_key(index, id),
-                PersistentValue::OpaquePayload(payload.clone()),
-            )
-            .await?,
-        )?;
+        let key = payload_key(index, id);
+        expect_absent(txn, key.clone()).await?;
+        deferred.put(key, PersistentValue::OpaquePayload(payload.clone()))?;
     }
     let header = read_header(txn, index, target).await?;
     put_header(
@@ -99,13 +105,9 @@ pub async fn insert_record<T: WriteTxn>(
     )
     .await?;
     expand_synopsis(txn, manifest, target, entry.fields()).await?;
-    expect_inserted(
-        txn.insert(
-            entry_key(index, target, id),
-            PersistentValue::LeafEntry(entry.clone()),
-        )
-        .await?,
-    )?;
+    let entry_key = entry_key(index, target, id);
+    expect_absent(txn, entry_key.clone()).await?;
+    deferred.put(entry_key, PersistentValue::LeafEntry(entry.clone()))?;
     Ok(())
 }
 
@@ -123,7 +125,7 @@ pub async fn insert_record<T: WriteTxn>(
 /// Entry to exist, rewrites it, and bumps the leaf cache epoch with its exact
 /// count unchanged. A cross-leaf replacement — including a cross-tree move,
 /// since keys embed the Tree Key — deletes the source Leaf Entry (which must
-/// exist), unique-inserts the target Leaf Entry, decrements the source Header
+/// exist), inserts the target Leaf Entry, decrements the source Header
 /// count (which must be positive), and increments the target Header count;
 /// only the cache epochs move by one on both sides. A source accepts the
 /// move-out in any state because it follows the exact stored location; a
@@ -131,10 +133,12 @@ pub async fn insert_record<T: WriteTxn>(
 /// ever expand: the target Synopsis expands with the entry's exact projection
 /// and the source Synopsis is left untouched.
 ///
-/// `record` and `entry` must carry the same Record ID. On any error the
-/// caller must not commit the transaction.
+/// `record` and `entry` must carry the same Record ID. Record-group writes are
+/// queued into `deferred`; Header and Synopsis writes apply immediately. On
+/// any error the caller must not commit the transaction.
 pub async fn replace_record<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
+    deferred: &mut MutationBuilder<'_>,
     record: &VectorRecord,
     payload: Option<&OpaquePayload>,
     expected: &RecordLocation,
@@ -158,24 +162,19 @@ pub async fn replace_record<T: WriteTxn>(
         return Err(Error::new(ErrorKind::Corruption));
     }
 
-    txn.put(record_key, PersistentValue::VectorRecord(record.clone()))
-        .await?;
+    deferred.put(record_key, PersistentValue::VectorRecord(record.clone()))?;
     if target != expected {
-        txn.put(
+        deferred.put(
             location_key,
             PersistentValue::RecordLocation(target.clone()),
-        )
-        .await?;
+        )?;
     }
+    let payload_key = payload_key(index, id);
     match payload {
         Some(payload) => {
-            txn.put(
-                payload_key(index, id),
-                PersistentValue::OpaquePayload(payload.clone()),
-            )
-            .await?;
+            deferred.put(payload_key, PersistentValue::OpaquePayload(payload.clone()))?
         }
-        None => txn.delete(payload_key(index, id)).await?,
+        None => deferred.delete(payload_key)?,
     }
 
     let target_entry_key = entry_key(index, target, id);
@@ -184,17 +183,14 @@ pub async fn replace_record<T: WriteTxn>(
         // establishes the conflict on it.
         expect_entry(txn.get_for_update(target_entry_key.clone()).await?)?
             .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
-        txn.put(target_entry_key, PersistentValue::LeafEntry(entry.clone()))
-            .await?;
+        deferred.put(target_entry_key, PersistentValue::LeafEntry(entry.clone()))?;
     } else {
         let source_entry_key = entry_key(index, expected, id);
         expect_entry(txn.get_for_update(source_entry_key.clone()).await?)?
             .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
-        txn.delete(source_entry_key).await?;
-        expect_inserted(
-            txn.insert(target_entry_key, PersistentValue::LeafEntry(entry.clone()))
-                .await?,
-        )?;
+        deferred.delete(source_entry_key)?;
+        expect_absent(txn, target_entry_key.clone()).await?;
+        deferred.put(target_entry_key, PersistentValue::LeafEntry(entry.clone()))?;
 
         // The source follows the exact stored location, so any state is legal
         // for it; only the target must be a write-accepting leaf.
@@ -220,12 +216,13 @@ pub async fn replace_record<T: WriteTxn>(
 /// touches nothing else; otherwise the Location and the Leaf Entry at the
 /// stored location must exist or the mutation fails closed with
 /// [`ErrorKind::Corruption`]. The Record, Location, Leaf Entry, and any
-/// Opaque Payload are deleted, the leaf Header count decrements (and must be
-/// positive) with its cache epoch bumped, and the Synopsis stays untouched
-/// because synopses never shrink. On any error the caller must not commit the
-/// transaction.
+/// Opaque Payload deletes are queued into `deferred`, the leaf Header count
+/// decrements (and must be positive) with its cache epoch bumped, and the
+/// Synopsis stays untouched because synopses never shrink. On any error the
+/// caller must not commit the transaction.
 pub async fn delete_record<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
+    deferred: &mut MutationBuilder<'_>,
     id: &Bytes,
 ) -> Result<DeleteOutcome> {
     let index = txn
@@ -244,42 +241,59 @@ pub async fn delete_record<T: WriteTxn>(
     expect_entry(txn.get_for_update(entry_key.clone()).await?)?
         .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
 
-    txn.delete(record_key).await?;
-    txn.delete(location_key).await?;
-    txn.delete(entry_key).await?;
-    txn.delete(payload_key(index, id)).await?;
+    deferred.delete(record_key)?;
+    deferred.delete(location_key)?;
+    deferred.delete(entry_key)?;
+    deferred.delete(payload_key(index, id))?;
     let header = read_header(txn, index, &location).await?;
     put_header(txn, index, &location, removed_entry(header)?).await?;
     Ok(DeleteOutcome::Deleted)
 }
 
-/// Reads one Record ID's authoritative Record Location with update protection.
+/// Reads the authoritative Record Locations of one batch of Record IDs with
+/// update protection, in input order.
 ///
-/// The upsert routing decision and the replacement's exact expected location
-/// come from this read. A fully absent Record ID returns `None`; a
-/// half-present Record/Location pair is [`ErrorKind::Corruption`].
-pub async fn read_location_for_update<T: WriteTxn>(
+/// One batched backend read establishes every conflict the upsert routing
+/// decision and the replacement's exact expected location depend on. A fully
+/// absent Record ID returns `None` at its position; a half-present
+/// Record/Location pair is [`ErrorKind::Corruption`] at that position.
+pub async fn read_locations_for_update<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
-    id: &Bytes,
-) -> Result<Option<RecordLocation>> {
+    ids: &[Bytes],
+) -> Result<Vec<Option<RecordLocation>>> {
     let index = txn
         .bound_manifest()
         .ok_or_else(Error::invalid_argument)?
         .logical_index_id();
-    let mut values = txn
-        .batch_get_for_update(vec![record_key(index, id), location_key(index, id)])
-        .await?
-        .into_iter();
-    match (values.next(), values.next()) {
-        (Some(record), Some(location)) => {
-            match (expect_record(record)?, expect_location(location)?) {
-                (None, None) => Ok(None),
-                (Some(_), Some(location)) => Ok(Some(location)),
-                _ => Err(Error::new(ErrorKind::Corruption)),
-            }
-        }
-        // The typed batch read returns exactly one value per input key.
-        _ => Err(Error::new(ErrorKind::Backend)),
+    let mut keys = Vec::with_capacity(ids.len().saturating_mul(2));
+    for id in ids {
+        keys.push(record_key(index, id));
+        keys.push(location_key(index, id));
+    }
+    let mut values = txn.batch_get_for_update(keys).await?.into_iter();
+    let mut locations = Vec::with_capacity(ids.len());
+    for (position, _) in ids.iter().enumerate() {
+        let pair = match (values.next(), values.next()) {
+            (Some(record), Some(location)) => classify_location_pair(record, location)
+                .map_err(|error| error.at_position(position))?,
+            // The typed batch read returns exactly one value per input key.
+            _ => return Err(Error::new(ErrorKind::Backend)),
+        };
+        locations.push(pair);
+    }
+    Ok(locations)
+}
+
+/// Validates one Record/Location pair, failing closed on a wrong value family
+/// or a half-present pair.
+fn classify_location_pair(
+    record: Option<PersistentValue>,
+    location: Option<PersistentValue>,
+) -> Result<Option<RecordLocation>> {
+    match (expect_record(record)?, expect_location(location)?) {
+        (None, None) => Ok(None),
+        (Some(_), Some(location)) => Ok(Some(location)),
+        _ => Err(Error::new(ErrorKind::Corruption)),
     }
 }
 
@@ -398,12 +412,18 @@ fn adjust_header(header: PartitionHeader, entry_count: u32) -> Result<PartitionH
         .map_err(|_| Error::new(ErrorKind::Corruption))
 }
 
-/// Maps a duplicate unique insert of authoritative state to Corruption.
-fn expect_inserted(outcome: InsertOutcome) -> Result<()> {
-    match outcome {
-        InsertOutcome::Inserted => Ok(()),
-        InsertOutcome::AlreadyExists => Err(Error::new(ErrorKind::Corruption)),
+/// Asserts a record-group key is absent, failing closed on corruption.
+///
+/// The update-protected read establishes the conflict that keeps the queued
+/// write exact: a concurrent commit creating the key aborts this transaction.
+async fn expect_absent<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    key: LogicalKey,
+) -> Result<()> {
+    if txn.get_for_update(key).await?.is_some() {
+        return Err(Error::new(ErrorKind::Corruption));
     }
+    Ok(())
 }
 
 /// Extracts the Vector Record from a typed read, failing closed on a
