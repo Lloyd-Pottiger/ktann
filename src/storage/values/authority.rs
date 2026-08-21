@@ -57,6 +57,18 @@ pub enum PartitionState {
     Merging,
 }
 
+impl PartitionState {
+    /// Whether a leaf in this state accepts foreground writes and structural
+    /// move-ins.
+    ///
+    /// A `DrainingSplit` or `Merging` source accepts move-outs only: its
+    /// entries are leaving, and its exact zero count is the completion proof
+    /// that no insert may race.
+    pub(crate) const fn accepts_writes(self) -> bool {
+        matches!(self, Self::Ready | Self::Splitting | Self::ReceivingSplit)
+    }
+}
+
 /// Small mutable operational metadata for one partition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PartitionHeader {

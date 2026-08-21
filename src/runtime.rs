@@ -21,6 +21,8 @@ pub(crate) mod lifecycle;
 pub(crate) mod reads;
 pub(crate) mod search;
 
+pub use lifecycle::RetryPolicy;
+
 /// Owns one backend and its process-local foreground operation lifecycle.
 ///
 /// Clone handles share admission capacity and shutdown state. Dropping the last
@@ -1004,6 +1006,16 @@ mod tests {
         operation_started.notified().await;
         caller.abort();
         caller.await.expect_err("caller task was aborted");
+        // Wait until the aborted operation has fully released its foreground
+        // admission before opening its gate: an aborted task can still be
+        // queued for finalization, and only a returned permit proves the
+        // inner task was dropped and can never poll past the gate.
+        let mut spins = 0_u32;
+        while runtime.handle.inner.foreground.available_permits() != 1 {
+            spins += 1;
+            assert!(spins < 10_000, "aborted operation was not finalized");
+            tokio::task::yield_now().await;
+        }
         check_control.notify_one();
 
         runtime

@@ -32,7 +32,7 @@ static RETRY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Whole-operation retry policy copied from one validated RuntimeConfig.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct RetryPolicy {
+pub struct RetryPolicy {
     attempts: u32,
     initial_backoff: Duration,
     max_backoff: Duration,
@@ -47,11 +47,23 @@ impl RetryPolicy {
         }
     }
 
-    pub(crate) fn would_exhaust(self, failed_attempts: u32) -> bool {
+    /// Builds the whole-step retry policy for Structure Maintenance from one
+    /// validated RuntimeConfig.
+    pub fn for_fixup(config: &RuntimeConfig) -> Self {
+        Self {
+            attempts: config.fixup_attempts(),
+            initial_backoff: config.retry_initial_backoff(),
+            max_backoff: config.retry_max_backoff(),
+        }
+    }
+
+    /// Whether one more failed attempt would exhaust the policy.
+    pub fn would_exhaust(self, failed_attempts: u32) -> bool {
         failed_attempts.saturating_add(1) >= self.attempts
     }
 
-    pub(crate) async fn wait(self, failed_attempts: u32) {
+    /// Waits the jittered backoff interval for one failed attempt.
+    pub async fn wait(self, failed_attempts: u32) {
         let shift = failed_attempts.min(31);
         let current = self
             .initial_backoff

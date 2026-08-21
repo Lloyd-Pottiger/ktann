@@ -608,7 +608,23 @@ async fn shutdown_waits_for_admitted_batches_and_cancels_queued_ones() {
             shutdown_done.store(true, Ordering::SeqCst);
         }
     });
-    for _ in 0..64 {
+    // Wait until shutdown has actually stopped foreground admission before
+    // releasing the gate: batch 1 holds the only foreground permit until its
+    // commit completes, so batch 2 is guaranteed to still be queued exactly
+    // when admission closes. Session construction is the side-effect-free
+    // probe — it fails with RuntimeClosed once admission has stopped.
+    let mut probes = 0_u32;
+    loop {
+        match index.import_session(ImportOptions::default()) {
+            Ok(probe) => drop(probe),
+            Err(error) if error.kind() == ErrorKind::RuntimeClosed => break,
+            Err(error) => panic!("unexpected probe error: {error:?}"),
+        }
+        probes += 1;
+        assert!(
+            probes < 10_000,
+            "shutdown did not stop foreground admission"
+        );
         tokio::task::yield_now().await;
     }
     assert!(

@@ -31,11 +31,12 @@
 use bytes::Bytes;
 
 use crate::api::{Error, ErrorKind, LogicalIndexId, Result, Value};
-use crate::storage::backend::WriteTxn;
+use crate::storage::backend::{InsertOutcome, WriteTxn};
 use crate::storage::keys::LogicalKey;
 use crate::storage::values::{
-    IndexManifest, LeafEntry, OpaquePayload, PartitionHeader, PartitionState, PartitionSynopsis,
-    PersistentValue, RecordLocation, VectorRecord,
+    IndexManifest, LeafEntry, OpaquePayload, PartitionHeader, PersistentValue, RecordLocation,
+    VectorRecord, expect_header, expect_leaf_entry, expect_location, expect_record,
+    expect_synopsis,
 };
 use crate::storage::{MutationBuilder, WriteLogicalTxn};
 
@@ -181,12 +182,12 @@ pub async fn replace_record<T: WriteTxn>(
     if expected == target {
         // The replaced entry must exist; the update-protected read also
         // establishes the conflict on it.
-        expect_entry(txn.get_for_update(target_entry_key.clone()).await?)?
+        expect_leaf_entry(txn.get_for_update(target_entry_key.clone()).await?)?
             .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
         deferred.put(target_entry_key, PersistentValue::LeafEntry(entry.clone()))?;
     } else {
         let source_entry_key = entry_key(index, expected, id);
-        expect_entry(txn.get_for_update(source_entry_key.clone()).await?)?
+        expect_leaf_entry(txn.get_for_update(source_entry_key.clone()).await?)?
             .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
         deferred.delete(source_entry_key)?;
         expect_absent(txn, target_entry_key.clone()).await?;
@@ -238,7 +239,7 @@ pub async fn delete_record<T: WriteTxn>(
     let location = expect_location(txn.get_for_update(location_key.clone()).await?)?
         .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
     let entry_key = entry_key(index, &location, id);
-    expect_entry(txn.get_for_update(entry_key.clone()).await?)?
+    expect_leaf_entry(txn.get_for_update(entry_key.clone()).await?)?
         .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
 
     deferred.delete(record_key)?;
@@ -360,18 +361,15 @@ async fn expand_synopsis<T: WriteTxn>(
 
 /// Validates that a decoded Header names a write-accepting leaf.
 fn expect_write_target(header: PartitionHeader) -> Result<PartitionHeader> {
-    match header.state() {
-        PartitionState::Ready | PartitionState::Splitting | PartitionState::ReceivingSplit
-            if header.level() == 1 =>
-        {
-            Ok(header)
-        }
-        _ => Err(Error::new(ErrorKind::Corruption)),
+    if header.level() == 1 && header.state().accepts_writes() {
+        Ok(header)
+    } else {
+        Err(Error::new(ErrorKind::Corruption))
     }
 }
 
 /// Returns `header` with its exact count increased by one and epoch bumped.
-fn added_entry(header: PartitionHeader) -> Result<PartitionHeader> {
+pub(crate) fn added_entry(header: PartitionHeader) -> Result<PartitionHeader> {
     adjust_header(
         header,
         header
@@ -384,7 +382,7 @@ fn added_entry(header: PartitionHeader) -> Result<PartitionHeader> {
 /// Returns `header` with its exact count decreased by one and epoch bumped.
 ///
 /// A zero count on decrement is an impossible count and fails closed.
-fn removed_entry(header: PartitionHeader) -> Result<PartitionHeader> {
+pub(crate) fn removed_entry(header: PartitionHeader) -> Result<PartitionHeader> {
     adjust_header(
         header,
         header
@@ -426,53 +424,11 @@ async fn expect_absent<T: WriteTxn>(
     Ok(())
 }
 
-/// Extracts the Vector Record from a typed read, failing closed on a
-/// wrong-kind value.
-fn expect_record(value: Option<PersistentValue>) -> Result<Option<VectorRecord>> {
-    match value {
-        Some(PersistentValue::VectorRecord(record)) => Ok(Some(record)),
-        Some(_) => Err(Error::new(ErrorKind::Corruption)),
-        None => Ok(None),
-    }
-}
-
-/// Extracts the Record Location from a typed read, failing closed on a
-/// wrong-kind value.
-fn expect_location(value: Option<PersistentValue>) -> Result<Option<RecordLocation>> {
-    match value {
-        Some(PersistentValue::RecordLocation(location)) => Ok(Some(location)),
-        Some(_) => Err(Error::new(ErrorKind::Corruption)),
-        None => Ok(None),
-    }
-}
-
-/// Extracts the Partition Header from a typed read, failing closed on a
-/// wrong-kind value.
-fn expect_header(value: Option<PersistentValue>) -> Result<Option<PartitionHeader>> {
-    match value {
-        Some(PersistentValue::PartitionHeader(header)) => Ok(Some(header)),
-        Some(_) => Err(Error::new(ErrorKind::Corruption)),
-        None => Ok(None),
-    }
-}
-
-/// Extracts the Partition Synopsis from a typed read, failing closed on a
-/// wrong-kind value.
-fn expect_synopsis(value: Option<PersistentValue>) -> Result<Option<PartitionSynopsis>> {
-    match value {
-        Some(PersistentValue::PartitionSynopsis(synopsis)) => Ok(Some(synopsis)),
-        Some(_) => Err(Error::new(ErrorKind::Corruption)),
-        None => Ok(None),
-    }
-}
-
-/// Extracts the Leaf Entry from a typed read, failing closed on a wrong-kind
-/// value.
-fn expect_entry(value: Option<PersistentValue>) -> Result<Option<LeafEntry>> {
-    match value {
-        Some(PersistentValue::LeafEntry(entry)) => Ok(Some(entry)),
-        Some(_) => Err(Error::new(ErrorKind::Corruption)),
-        None => Ok(None),
+/// Maps a duplicate unique insert of authoritative state to Corruption.
+pub(crate) fn expect_inserted(outcome: InsertOutcome) -> Result<()> {
+    match outcome {
+        InsertOutcome::Inserted => Ok(()),
+        InsertOutcome::AlreadyExists => Err(Error::new(ErrorKind::Corruption)),
     }
 }
 

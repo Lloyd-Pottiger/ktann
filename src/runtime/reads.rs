@@ -13,10 +13,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use crate::api::{Error, ErrorKind, PayloadProjection, Result, StoredRecord};
-use crate::storage::backend::{Backend, ReadOps};
+use crate::storage::backend::{Backend, ReadOps, WriteTxn};
 use crate::storage::keys::LogicalKey;
 use crate::storage::values::{IndexLifecycle, IndexManifest, PersistentValue};
-use crate::storage::{ReadLogicalTxn, RecordGroupRead};
+use crate::storage::{ReadLogicalTxn, RecordGroupRead, WriteLogicalTxn};
 
 use super::OperationContext;
 
@@ -29,11 +29,7 @@ pub(crate) async fn get_record<B: Backend>(
 ) -> Result<Option<StoredRecord>> {
     context.checkpoint()?;
     let backend = context.backend();
-    let raw = backend.begin_read().await?;
-    let mut txn = ReadLogicalTxn::bootstrap(raw);
-    let current = validate_manifest(&mut txn, handle_manifest).await?;
-    let raw = txn.into_raw();
-    let mut txn = ReadLogicalTxn::for_index(raw, &current)?;
+    let mut txn = open_validated_read(backend.as_ref(), handle_manifest).await?;
     let group = txn.read_record_group(id, include_payload).await?;
     context.checkpoint()?;
     Ok(group.map(|group| stored_record(include_payload, group)))
@@ -48,11 +44,7 @@ pub(crate) async fn batch_get_records<B: Backend>(
 ) -> Result<Vec<Option<StoredRecord>>> {
     context.checkpoint()?;
     let backend = context.backend();
-    let raw = backend.begin_read().await?;
-    let mut txn = ReadLogicalTxn::bootstrap(raw);
-    let current = validate_manifest(&mut txn, handle_manifest).await?;
-    let raw = txn.into_raw();
-    let mut txn = ReadLogicalTxn::for_index(raw, &current)?;
+    let mut txn = open_validated_read(backend.as_ref(), handle_manifest).await?;
     let groups = txn.read_record_groups(ids, include_payload).await?;
     context.checkpoint()?;
     Ok(groups
@@ -62,12 +54,46 @@ pub(crate) async fn batch_get_records<B: Backend>(
 }
 
 /// Validates the persisted Manifest of the opened handle in one snapshot.
-async fn validate_manifest<T: ReadOps>(
+pub(crate) async fn validate_manifest<T: ReadOps>(
     txn: &mut ReadLogicalTxn<'_, T>,
     handle: &IndexManifest,
 ) -> Result<IndexManifest> {
     opened_manifest(
         txn.get(LogicalKey::Manifest(handle.logical_index_id()))
+            .await?,
+        handle,
+    )
+}
+
+/// Opens one read transaction bound to the Logical Index, validating the
+/// persisted Active Manifest of the opened handle first.
+///
+/// A dropped Logical Index reports `IndexNotFound`/`IndexDropping` instead of
+/// a misleading Corruption from missing data keys. Validation proves the
+/// persisted Manifest carries the handle's exact immutable identity, so
+/// binding the handle manifest is equivalent to binding the persisted one.
+pub(crate) async fn open_validated_read<'b, 'm, B: Backend>(
+    backend: &'b B,
+    handle_manifest: &'m IndexManifest,
+) -> Result<ReadLogicalTxn<'m, B::ReadTxn<'b>>> {
+    let raw = backend.begin_read().await?;
+    let mut txn = ReadLogicalTxn::bootstrap(raw);
+    validate_manifest(&mut txn, handle_manifest).await?;
+    ReadLogicalTxn::for_index(txn.into_raw(), handle_manifest)
+}
+
+/// Validates the persisted Manifest of the opened handle, with update
+/// protection on the Manifest key.
+///
+/// The conflict aborts the transaction if a concurrent drop transition
+/// commits, so neither a Foreground Mutation nor a Structure Maintenance step
+/// commits into a Logical Index whose deletion has begun.
+pub(crate) async fn validated_active_manifest<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    handle: &IndexManifest,
+) -> Result<IndexManifest> {
+    opened_manifest(
+        txn.get_for_update(LogicalKey::Manifest(handle.logical_index_id()))
             .await?,
         handle,
     )
