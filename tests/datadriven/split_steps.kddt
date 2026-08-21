@@ -1,0 +1,341 @@
+# ----------------------------------------------------------------------
+# Split state machine, one bounded transition at a time (issue #97, state
+# machine from #10). Every committed intermediate state must stay searchable
+# and pass the exact-membership audit; format-tree renders each phase.
+#
+# DRAIN_BATCH_LEAF is 8, so a 12-entry leaf drains in two batches.
+# ----------------------------------------------------------------------
+# --- Scenario A: root split, step by step ---
+new-index dimension=2 metric=L2 fields=bucket:i64 tree-key-fields=0 min-entries=2 max-entries=4
+----
+created index "index"
+
+load dataset=clustered:12:2 tree=1 via=single seed=5
+----
+loaded 12 records (dataset=clustered:12:2, seed=5)
+
+validate
+----
+ok: records=12 trees=1 partitions=1 max_level=1
+
+format-tree
+----
+tree 0: root pk=1
+  pk=1 level=1 state=Ready count=12
+
+# The root leaf holds 12 entries, well over the maximum of 4.
+split-step tree=1
+----
+pk=1: began left=2 right=3
+
+format-tree
+----
+tree 0: root pk=1
+  pk=1 level=1 state=Splitting count=12 left=2 right=3
+
+validate
+----
+ok: records=12 trees=1 partitions=1 max_level=1
+
+# A Splitting source still serves every record.
+search k=3 vector=[0,0]
+----
+r000002: 1.6886
+r000003: 1.7065
+r000009: 1.7424
+usage: scanned_tree_keys=1 visited_partitions=1 visited_leaf_entries=12 exact_rerank_candidates=3
+
+split-step tree=1
+----
+pk=1: exposed left=2 right=3
+
+format-tree
+----
+tree 0: root pk=1
+  pk=1 level=1 state=DrainingSplit count=12 left=2 right=3
+    pk=2 level=1 state=ReceivingSplit count=0
+    pk=3 level=1 state=ReceivingSplit count=0
+
+validate
+----
+ok: records=12 trees=1 partitions=3 max_level=1
+
+# Mid-drain: entries live in the source and both targets at once.
+split-step tree=1
+----
+pk=1: drained moved=8 remaining=4
+
+format-tree
+----
+tree 0: root pk=1
+  pk=1 level=1 state=DrainingSplit count=4 left=2 right=3
+    pk=2 level=1 state=ReceivingSplit count=4
+    pk=3 level=1 state=ReceivingSplit count=4
+
+search k=3 vector=[0,0]
+----
+r000002: 1.6886
+r000003: 1.7065
+r000009: 1.7424
+usage: scanned_tree_keys=1 visited_partitions=3 visited_leaf_entries=12 exact_rerank_candidates=3
+
+validate
+----
+ok: records=12 trees=1 partitions=3 max_level=1
+
+split-step tree=1
+----
+pk=1: completed
+
+format-tree
+----
+tree 0: root pk=1
+  pk=1 level=2 state=Ready count=2
+    pk=2 level=1 state=Ready count=4
+    pk=3 level=1 state=Ready count=8
+
+validate
+----
+ok: records=12 trees=1 partitions=3 max_level=2
+
+recall k=3 samples=6
+----
+recall@3: 100.00% (samples=6, truncated=0)
+mean usage: visited_partitions=3 visited_leaf_entries=12 exact_rerank_candidates=3
+
+# --- Scenario B: foreground mutations interleaved with a drain ---
+new-index dimension=2 metric=L2 fields=bucket:i64 tree-key-fields=0 min-entries=2 max-entries=4
+----
+created index "index"
+
+load dataset=clustered:12:2 tree=1 via=single seed=5
+----
+loaded 12 records (dataset=clustered:12:2, seed=5)
+
+split-step tree=1
+----
+pk=1: began left=2 right=3
+
+split-step tree=1
+----
+pk=1: exposed left=2 right=3
+
+# Inserts and deletes land while the source is DrainingSplit.
+insert tree=1
+r100: [10,10]
+r101: [-10,-10]
+----
+r100: ok
+r101: ok
+
+split-step tree=1
+----
+pk=1: drained moved=8 remaining=4
+
+delete
+r000000
+----
+r000000: true
+
+validate
+----
+ok: records=13 trees=1 partitions=3 max_level=1
+
+split-step tree=1
+----
+pk=1: completed
+
+format-tree entries
+----
+tree 0: root pk=1
+  pk=1 level=2 state=Ready count=2
+    pk=2 level=1 state=Ready count=4
+      r000002
+      r000004
+      r000005
+      r101
+    pk=3 level=1 state=Ready count=9
+      r000001
+      r000003
+      r000006
+      r000007
+      r000008
+      r000009
+      r000010
+      r000011
+      r100
+
+validate
+----
+ok: records=13 trees=1 partitions=3 max_level=2
+
+# --- Scenario C: non-root split, step by step ---
+# Both leaves of the scenario-B tree are still over the maximum; split the
+# worst one (auto-selected) and watch the parent edge handoff.
+split-step tree=1
+----
+pk=3: began left=4 right=5
+
+format-tree
+----
+tree 0: root pk=1
+  pk=1 level=2 state=Ready count=2
+    pk=2 level=1 state=Ready count=4
+    pk=3 level=1 state=Splitting count=9 left=4 right=5
+
+validate
+----
+ok: records=13 trees=1 partitions=3 max_level=2
+
+split-step tree=1
+----
+pk=3: exposed left=4 right=5
+
+format-tree
+----
+tree 0: root pk=1
+  pk=1 level=2 state=Ready count=4
+    pk=2 level=1 state=Ready count=4
+    pk=3 level=1 state=DrainingSplit count=9 left=4 right=5
+      pk=4 level=1 state=ReceivingSplit count=0
+      pk=5 level=1 state=ReceivingSplit count=0
+
+split-step tree=1
+----
+pk=3: drained moved=8 remaining=1
+
+format-tree
+----
+tree 0: root pk=1
+  pk=1 level=2 state=Ready count=4
+    pk=2 level=1 state=Ready count=4
+    pk=3 level=1 state=DrainingSplit count=1 left=4 right=5
+      pk=4 level=1 state=ReceivingSplit count=0
+      pk=5 level=1 state=ReceivingSplit count=8
+
+validate
+----
+ok: records=13 trees=1 partitions=5 max_level=2
+
+# The last source entry drains and the split completes: the parent's Child
+# Entries flip from the source to the two targets.
+split-step tree=1
+----
+pk=3: completed
+
+format-tree
+----
+tree 0: root pk=1
+  pk=1 level=2 state=Ready count=3
+    pk=2 level=1 state=Ready count=4
+    pk=4 level=1 state=Ready count=1
+    pk=5 level=1 state=Ready count=8
+
+validate
+----
+ok: records=13 trees=1 partitions=4 max_level=2
+
+# --- Scenario D: a restart mid-split resumes from the durable state ---
+# Structure Maintenance may be lost from process-local queues at any point;
+# every committed intermediate state must resume exactly where it stopped.
+new-index dimension=2 metric=L2 fields=bucket:i64 tree-key-fields=0 min-entries=2 max-entries=4
+----
+created index "index"
+
+load dataset=clustered:12:2 tree=1 via=single seed=5
+----
+loaded 12 records (dataset=clustered:12:2, seed=5)
+
+split-step tree=1
+----
+pk=1: began left=2 right=3
+
+restart
+----
+restarted
+
+split-step tree=1
+----
+pk=1: exposed left=2 right=3
+
+restart
+----
+restarted
+
+split-step tree=1
+----
+pk=1: drained moved=8 remaining=4
+
+format-tree
+----
+tree 0: root pk=1
+  pk=1 level=1 state=DrainingSplit count=4 left=2 right=3
+    pk=2 level=1 state=ReceivingSplit count=4
+    pk=3 level=1 state=ReceivingSplit count=4
+
+split-step tree=1
+----
+pk=1: completed
+
+format-tree
+----
+tree 0: root pk=1
+  pk=1 level=2 state=Ready count=2
+    pk=2 level=1 state=Ready count=4
+    pk=3 level=1 state=Ready count=8
+
+validate
+----
+ok: records=12 trees=1 partitions=3 max_level=2
+
+# --- Scenario E: split-all settles a small tree ---
+new-index dimension=2 metric=L2 fields=bucket:i64 tree-key-fields=0 min-entries=4 max-entries=8
+----
+created index "index"
+
+load dataset=clustered:64:4 tree=1 via=batch seed=9
+----
+loaded 64 records (dataset=clustered:64:4, seed=9)
+
+split-all tree=1
+----
+pk=1: split into left=2 right=3
+pk=2: split into left=4 right=5
+pk=3: split into left=6 right=7
+pk=5: split into left=8 right=9
+pk=6: split into left=10 right=11
+pk=7: split into left=12 right=13
+pk=4: split into left=14 right=15
+pk=8: split into left=16 right=17
+pk=9: split into left=18 right=19
+pk=1: split into left=20 right=21
+pk=11: split into left=22 right=23
+settled
+
+validate
+----
+ok: records=64 trees=1 partitions=14 max_level=3
+
+format-tree
+----
+tree 0: root pk=1
+  pk=1 level=3 state=Ready count=2
+    pk=20 level=2 state=Ready count=6
+      pk=14 level=1 state=Ready count=8
+      pk=15 level=1 state=Ready count=6
+      pk=16 level=1 state=Ready count=5
+      pk=17 level=1 state=Ready count=5
+      pk=18 level=1 state=Ready count=5
+      pk=19 level=1 state=Ready count=5
+    pk=21 level=2 state=Ready count=5
+      pk=10 level=1 state=Ready count=5
+      pk=12 level=1 state=Ready count=8
+      pk=13 level=1 state=Ready count=7
+      pk=22 level=1 state=Ready count=4
+      pk=23 level=1 state=Ready count=6
+
+recall k=5 samples=8
+----
+recall@5: 100.00% (samples=8, truncated=0)
+mean usage: visited_partitions=14 visited_leaf_entries=64 exact_rerank_candidates=6
+

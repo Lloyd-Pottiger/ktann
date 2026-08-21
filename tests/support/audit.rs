@@ -22,7 +22,9 @@ use bytes::Bytes;
 use ktann::api::{LogicalIndexId, PartitionKey};
 use ktann::storage::backend::{Backend, ReadOps, ScanLimits};
 use ktann::storage::keys::{LogicalKey, TreeKey};
-use ktann::storage::values::{IndexManifest, PartitionHeader, PersistentValue};
+use ktann::storage::values::{
+    IndexManifest, PartitionHeader, PartitionTransition, PersistentValue,
+};
 use ktann::storage::{LogicalRange, LogicalScanItem, ReadLogicalTxn};
 
 use super::oracle::Model;
@@ -137,13 +139,14 @@ async fn enumerate_trees<T: ReadOps>(
     Ok(trees)
 }
 
-/// Reads one partition Header, requiring agreement with its State.
+/// Reads one partition Header and State, requiring agreement, and returns
+/// both (the transition carries split targets during a split).
 async fn read_partition_header<T: ReadOps>(
     txn: &mut ReadLogicalTxn<'_, T>,
     manifest: &IndexManifest,
     tree_key: &TreeKey,
     partition: PartitionKey,
-) -> Result<PartitionHeader, String> {
+) -> Result<(PartitionHeader, PartitionTransition), String> {
     let header = match txn
         .get(LogicalKey::Header {
             index: manifest.logical_index_id(),
@@ -179,15 +182,40 @@ async fn read_partition_header<T: ReadOps>(
                     transition.state()
                 ));
             }
+            Ok((header, transition))
         }
-        other => {
-            return Err(format!(
-                "partition {} state must exist, got {other:?}",
-                partition.get()
-            ));
-        }
+        other => Err(format!(
+            "partition {} state must exist, got {other:?}",
+            partition.get()
+        )),
     }
-    Ok(header)
+}
+
+/// Probes whether one partition has a persisted Header (used before
+/// following a split target link: an unexposed target has none).
+async fn partition_exists<T: ReadOps>(
+    txn: &mut ReadLogicalTxn<'_, T>,
+    manifest: &IndexManifest,
+    tree_key: &TreeKey,
+    partition: PartitionKey,
+) -> Result<bool, String> {
+    txn.get(LogicalKey::Header {
+        index: manifest.logical_index_id(),
+        tree_key: tree_key.clone(),
+        partition,
+    })
+    .await
+    .map(|value| value.is_some())
+    .map_err(|error| format!("probe header: {error:?}"))
+}
+
+/// The split targets named by one transition, when it is a split in flight.
+fn split_targets(transition: &PartitionTransition) -> Option<(PartitionKey, PartitionKey)> {
+    match transition {
+        PartitionTransition::Splitting { left, right, .. }
+        | PartitionTransition::DrainingSplit { left, right, .. } => Some((*left, *right)),
+        _ => None,
+    }
 }
 
 /// Scans one leaf partition's complete entry set, in key order.
@@ -250,6 +278,13 @@ struct TreeWalk {
 
 /// Walks one tree from its root, validating structure, and records every
 /// reachable partition.
+///
+/// Reachability follows Child Entries plus the drain links of an in-flight
+/// split: while a source drains, its targets hold live entries but a root
+/// source has no parent to link them, so the walk must follow the source
+/// State's target pair. A non-root target is discovered twice (its parent's
+/// Child Entry and its source's drain link); the second discovery is a
+/// no-op, while two Child Entry edges remain a topology error.
 async fn walk_tree<T: ReadOps>(
     txn: &mut ReadLogicalTxn<'_, T>,
     manifest: &IndexManifest,
@@ -261,14 +296,28 @@ async fn walk_tree<T: ReadOps>(
         max_level: 0,
     };
     let mut incoming: BTreeMap<PartitionRef, PartitionRef> = BTreeMap::new();
+    let mut enqueued: BTreeSet<PartitionRef> = BTreeSet::new();
     let mut stack = vec![root];
+    enqueued.insert((tree_key.clone(), root));
     while let Some(partition) = stack.pop() {
         let reference = (tree_key.clone(), partition);
-        if walk.visits.contains_key(&reference) {
-            return Err(format!("partition {} reached twice", partition.get()));
-        }
-        let header = read_partition_header(txn, manifest, tree_key, partition).await?;
+        let (header, transition) =
+            read_partition_header(txn, manifest, tree_key, partition).await?;
         walk.max_level = walk.max_level.max(header.level());
+
+        // Follow split targets once they are exposed (an unexposed target
+        // has no persisted Header yet).
+        if let Some((left, right)) = split_targets(&transition) {
+            for target in [left, right] {
+                let target_ref = (tree_key.clone(), target);
+                if !enqueued.contains(&target_ref)
+                    && partition_exists(txn, manifest, tree_key, target).await?
+                {
+                    enqueued.insert(target_ref);
+                    stack.push(target);
+                }
+            }
+        }
 
         let leaf_entries = if header.level() == 1 {
             let ids = scan_leaf_ids(txn, manifest, tree_key, partition).await?;
@@ -299,7 +348,9 @@ async fn walk_tree<T: ReadOps>(
                 {
                     return Err(format!("partition {} has two incoming edges", child.get()));
                 }
-                stack.push(child);
+                if enqueued.insert(child_ref) {
+                    stack.push(child);
+                }
             }
             Vec::new()
         };
@@ -444,11 +495,33 @@ pub async fn run<B: Backend>(
     })
 }
 
+/// Lists every reachable partition with its Header, in walk order; corpus
+/// directives use this to select split candidates deterministically.
+pub async fn list_partitions<B: Backend>(
+    backend: &B,
+    index: LogicalIndexId,
+) -> Result<Vec<(TreeKey, PartitionKey, PartitionHeader)>, String> {
+    let manifest = read_manifest(backend, index).await?;
+    let mut txn = open_walk_txn(backend, &manifest).await?;
+    let mut partitions = Vec::new();
+    for (tree_key, root) in enumerate_trees(&mut txn, &manifest).await? {
+        let walk = walk_tree(&mut txn, &manifest, &tree_key, root).await?;
+        for ((tree_key, partition), visit) in walk.visits {
+            partitions.push((tree_key, partition, visit.header));
+        }
+    }
+    Ok(partitions)
+}
+
 /// Renders the reachable topology of every tree, deterministically.
 ///
 /// One line per tree, then one line per partition indented by depth:
-/// `pk=N level=L state=State count=C`. With `entries`, each leaf's Record IDs
-/// follow, one per line; corpus authors use that flag only on small fixtures.
+/// `pk=N level=L state=State count=C`, extended with `left=L right=R` for a
+/// split in flight. Split targets render under their source until the split
+/// completes (a root source has no parent to link them); each partition
+/// renders once even when a non-root target is also reachable through its
+/// parent's Child Entry. With `entries`, each leaf's Record IDs follow, one
+/// per line; corpus authors use that flag only on small fixtures.
 pub async fn render_tree<B: Backend>(
     backend: &B,
     index: LogicalIndexId,
@@ -458,14 +531,27 @@ pub async fn render_tree<B: Backend>(
     let mut txn = open_walk_txn(backend, &manifest).await?;
     let mut out = String::new();
     let trees = enumerate_trees(&mut txn, &manifest).await?;
+    let mut rendered = BTreeSet::new();
     for (ordinal, (tree_key, root)) in trees.iter().enumerate() {
         out.push_str(&format!("tree {ordinal}: root pk={}\n", root.get()));
-        render_partition(&mut txn, &manifest, tree_key, *root, 1, entries, &mut out).await?;
+        render_partition(
+            &mut txn,
+            &manifest,
+            tree_key,
+            *root,
+            1,
+            entries,
+            &mut rendered,
+            &mut out,
+        )
+        .await?;
     }
     Ok(out)
 }
 
-/// Renders one partition subtree, recursively.
+/// Renders one partition subtree, recursively, following drain links and
+/// skipping partitions already rendered.
+#[allow(clippy::too_many_arguments)]
 async fn render_partition<T: ReadOps>(
     txn: &mut ReadLogicalTxn<'_, T>,
     manifest: &IndexManifest,
@@ -473,17 +559,32 @@ async fn render_partition<T: ReadOps>(
     partition: PartitionKey,
     depth: usize,
     entries: bool,
+    rendered: &mut BTreeSet<PartitionRef>,
     out: &mut String,
 ) -> Result<(), String> {
-    let header = read_partition_header(txn, manifest, tree_key, partition).await?;
+    let reference = (tree_key.clone(), partition);
+    if !rendered.insert(reference) {
+        return Ok(());
+    }
+    let (header, transition) = read_partition_header(txn, manifest, tree_key, partition).await?;
     let indent = "  ".repeat(depth);
     out.push_str(&format!(
-        "{indent}pk={} level={} state={:?} count={}\n",
+        "{indent}pk={} level={} state={:?} count={}",
         partition.get(),
         header.level(),
         header.state(),
         header.entry_count()
     ));
+    let mut drain_linked = Vec::new();
+    if let Some((left, right)) = split_targets(&transition) {
+        out.push_str(&format!(" left={} right={}", left.get(), right.get()));
+        for target in [left, right] {
+            if partition_exists(txn, manifest, tree_key, target).await? {
+                drain_linked.push(target);
+            }
+        }
+    }
+    out.push('\n');
     if header.level() == 1 {
         if entries {
             for id in scan_leaf_ids(txn, manifest, tree_key, partition).await? {
@@ -499,10 +600,26 @@ async fn render_partition<T: ReadOps>(
                 child,
                 depth + 1,
                 entries,
+                rendered,
                 out,
             ))
             .await?;
         }
+    }
+    // Split targets render after the source's own subtree so the split group
+    // stays visually together until completion.
+    for target in drain_linked {
+        Box::pin(render_partition(
+            txn,
+            manifest,
+            tree_key,
+            target,
+            depth + 1,
+            entries,
+            rendered,
+            out,
+        ))
+        .await?;
     }
     Ok(())
 }

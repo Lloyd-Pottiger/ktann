@@ -32,18 +32,26 @@
 //! - `inject-fault kind=abort|unknown-applied|unknown-not-applied` — queues one
 //!   commit fault; unknown outcomes are recovered by read-back, and the model
 //!   is synchronized per ADR 0012.
+//! - `split-step tree=V [partition=N]` — one bounded split state-machine
+//!   transition (`maintenance::split::advance`) on `partition=N`, or on the
+//!   most over-full Ready partition of the tree when omitted; prints the
+//!   transition (`began`/`exposed`/`drained`/`completed`/`idle`).
+//! - `split tree=V [partition=N]` — drives one source to a completed split.
+//! - `split-all tree=V` — settles every over-full partition of the tree,
+//!   worst offender first.
 //! - `restart` — shuts the Runtime down and reopens the index on a reopened
 //!   durable backend, simulating a process restart.
 //! - `validate` — runs the exact-membership/topology audit against the model.
-//! - `format-tree [entries]` — renders the reachable topology.
+//! - `format-tree [entries]` — renders the reachable topology, including
+//!   in-flight split states with their targets.
 //! - `stats` — prints committed keyspace size.
 //! - `drop-index` — drops the index.
 //!
-//! Foreground mutations never trigger a split on their own in the current
-//! build, so every corpus tree stays a single level-1 root until split-step
-//! directives (tracked in #94) drive the #10 state machine explicitly;
-//! `validate` and `format-tree` then cover internal levels and intermediate
-//! topology states without changing the corpus format.
+//! The split directives drive the #10 state machine explicitly (foreground
+//! mutations never trigger a split on their own in the current build), so
+//! corpus files decide the exact interleaving of topology transitions,
+//! foreground mutations, and searches: every committed intermediate state
+//! stays searchable and auditable.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -51,9 +59,13 @@ use std::sync::Arc;
 use bytes::Bytes;
 use ktann::api::{
     CompareOp, DataType, ErrorKind, FieldId, FieldSchema, ImportOptions, Index, IndexConfig,
-    Metric, Mutation, Predicate, Record, RuntimeConfig, SearchOptions, SearchRequest, Value,
+    Metric, Mutation, PartitionKey, Predicate, Record, RuntimeConfig, SearchOptions, SearchRequest,
+    Value,
 };
-use ktann::runtime::Runtime;
+use ktann::maintenance::split::{self, Advance};
+use ktann::runtime::{RetryPolicy, Runtime};
+use ktann::storage::keys::TreeKey;
+use ktann::storage::values::PartitionState;
 
 #[allow(dead_code)]
 mod support;
@@ -130,6 +142,8 @@ struct Harness {
     name: String,
     model: Model,
     dataset: Option<Dataset>,
+    /// Deterministic clock for split-step `started_at` timestamps.
+    maintenance_clock: u64,
 }
 
 impl Harness {
@@ -141,6 +155,7 @@ impl Harness {
             name: "index".to_string(),
             model: Model::new(),
             dataset: None,
+            maintenance_clock: 1_000,
         }
     }
 
@@ -166,6 +181,9 @@ impl Harness {
             "get" => self.get_lines(directive).await,
             "search" => self.search(directive).await,
             "recall" => self.recall(directive).await,
+            "split-step" => self.split_step(directive).await,
+            "split" => self.split_full(directive).await,
+            "split-all" => self.split_all(directive).await,
             "inject-fault" => self.inject_fault(directive),
             "restart" => self.restart().await,
             "validate" => self.validate().await,
@@ -573,6 +591,199 @@ impl Harness {
         )
     }
 
+    /// `split-step` performs one bounded state-machine transition
+    /// (`split::advance`) on the `partition=` source, or on the most
+    /// over-full Ready partition of the tree when the argument is omitted.
+    async fn split_step(&mut self, directive: &Directive) -> String {
+        let Some((tree_key, source)) = self.split_source(directive).await else {
+            return "idle: nothing to split\n".to_string();
+        };
+        match self.advance_once(&tree_key, source).await {
+            Ok(outcome) => format!("pk={}: {}\n", source.get(), describe_advance(&outcome)),
+            Err(error) => format!("pk={}: error {:?}\n", source.get(), error.kind()),
+        }
+    }
+
+    /// `split` drives one source partition's state machine to completion.
+    async fn split_full(&mut self, directive: &Directive) -> String {
+        let Some((tree_key, source)) = self.split_source(directive).await else {
+            return "idle: nothing to split\n".to_string();
+        };
+        match self.run_split(&tree_key, source).await {
+            Ok(summary) => summary,
+            Err(error) => format!("pk={}: error {:?}\n", source.get(), error.kind()),
+        }
+    }
+
+    /// `split-all` settles every over-full partition of the tree, one full
+    /// split at a time, worst offender first.
+    async fn split_all(&mut self, directive: &Directive) -> String {
+        let tree_key = self.tree_key_arg(directive);
+        let mut out = String::new();
+        let mut splits = 0_usize;
+        while let Some(source) = self.split_candidate(&tree_key).await {
+            assert!(
+                splits < 1_024,
+                "split-all did not settle within 1024 splits"
+            );
+            match self.run_split(&tree_key, source).await {
+                Ok(summary) => out.push_str(&summary),
+                Err(error) => {
+                    out.push_str(&format!("pk={}: error {:?}\n", source.get(), error.kind()));
+                    return out;
+                }
+            }
+            splits += 1;
+        }
+        out.push_str("settled\n");
+        out
+    }
+
+    /// Resolves the split source for one directive: explicit `partition=N`,
+    /// or the most over-full Ready partition of the tree when omitted.
+    async fn split_source(&self, directive: &Directive) -> Option<(TreeKey, PartitionKey)> {
+        let tree_key = self.tree_key_arg(directive);
+        if let Some(raw) = directive.arg("partition") {
+            let key = PartitionKey::new(raw.parse().expect("partition key"))
+                .expect("split source Partition Key is nonzero");
+            return Some((tree_key, key));
+        }
+        self.split_candidate(&tree_key)
+            .await
+            .map(|source| (tree_key, source))
+    }
+
+    /// The partition an argument-free split directive should drive: an
+    /// in-flight split source first (smallest Partition Key, so a corpus
+    /// resumes the machine it started), otherwise the most over-full Ready
+    /// partition (ties: smallest key).
+    async fn split_candidate(&self, tree_key: &TreeKey) -> Option<PartitionKey> {
+        let backend = self
+            .backend
+            .as_ref()
+            .expect("split directives require new-index first");
+        let index = self.index().logical_index_id();
+        let manifest = support::read_manifest(backend, index).await;
+        let listing = support::audit::list_partitions(backend, index)
+            .await
+            .expect("partition listing");
+        let in_flight = listing
+            .iter()
+            .filter(|(key, _, header)| {
+                key == tree_key
+                    && matches!(
+                        header.state(),
+                        PartitionState::Splitting | PartitionState::DrainingSplit
+                    )
+            })
+            .map(|(_, partition, _)| *partition)
+            .min();
+        if in_flight.is_some() {
+            return in_flight;
+        }
+        let maximum = manifest.config().max_partition_entries();
+        listing
+            .into_iter()
+            .filter(|(key, _, header)| {
+                key == tree_key
+                    && header.state() == PartitionState::Ready
+                    && header.entry_count() > maximum
+            })
+            .max_by(|left, right| {
+                left.2
+                    .entry_count()
+                    .cmp(&right.2.entry_count())
+                    .then_with(|| right.1.cmp(&left.1))
+            })
+            .map(|(_, partition, _)| partition)
+    }
+
+    /// Drives one source partition to a completed split; an immediately-idle
+    /// source reports `idle`. The per-batch `moved` accounting is only
+    /// visible through `split-step`: `advance` folds the final drain batch
+    /// into `Completed`, so a full-split summary cannot sum moves honestly.
+    async fn run_split(
+        &mut self,
+        tree_key: &TreeKey,
+        source: PartitionKey,
+    ) -> ktann::api::Result<String> {
+        let mut targets = None;
+        for _ in 0..4_096 {
+            match self.advance_once(tree_key, source).await? {
+                Advance::Idle => {
+                    assert!(targets.is_none(), "split idled mid-machine");
+                    return Ok(format!("pk={}: idle\n", source.get()));
+                }
+                Advance::Began { left, right } | Advance::Exposed { left, right } => {
+                    targets = Some((left, right));
+                }
+                Advance::Drained { .. } => {}
+                Advance::Completed => {
+                    return Ok(match targets {
+                        Some((left, right)) => format!(
+                            "pk={}: split into left={} right={}\n",
+                            source.get(),
+                            left.get(),
+                            right.get()
+                        ),
+                        None => format!("pk={}: split resumed\n", source.get()),
+                    });
+                }
+                other => panic!("unexpected split outcome {other:?}"),
+            }
+        }
+        panic!(
+            "split of pk={} did not complete within 4096 steps",
+            source.get()
+        );
+    }
+
+    /// One bounded split transition with the harness's deterministic clock.
+    async fn advance_once(
+        &mut self,
+        tree_key: &TreeKey,
+        source: PartitionKey,
+    ) -> ktann::api::Result<Advance> {
+        let backend = self
+            .backend
+            .as_ref()
+            .expect("split directives require new-index first");
+        let manifest = support::read_manifest(backend, self.index().logical_index_id()).await;
+        let started_at = self.maintenance_clock;
+        self.maintenance_clock += 100;
+        split::advance(
+            backend,
+            &manifest,
+            tree_key,
+            source,
+            started_at,
+            &retry_policy(),
+        )
+        .await
+    }
+
+    /// Encodes the `tree=V` argument as the Tree Key. Split directives
+    /// support the corpus's single i64 tree-key field shape only.
+    fn tree_key_arg(&self, directive: &Directive) -> TreeKey {
+        let value = directive.require("tree");
+        let config = self.index().config();
+        let tree_fields = config.tree_key_fields();
+        assert!(
+            tree_fields.len() == 1,
+            "split directives need a single tree-key field"
+        );
+        let schema = &config.fields()[usize::from(tree_fields[0].0)];
+        assert!(
+            schema.data_type() == DataType::I64,
+            "split directives need an i64 tree-key field"
+        );
+        TreeKey::encode(
+            &[DataType::I64],
+            &[Value::I64(value.parse().expect("tree value"))],
+        )
+        .expect("canonical tree key")
+    }
+
     fn search_request_with(
         &self,
         directive: &Directive,
@@ -971,4 +1182,27 @@ fn format_distance(distance: f64) -> String {
     let rounded = (distance * 10_000.0).round() / 10_000.0;
     let rounded = if rounded == 0.0 { 0.0 } else { rounded };
     format!("{rounded:.4}")
+}
+
+/// Renders one split-step outcome for the corpus.
+fn describe_advance(outcome: &Advance) -> String {
+    match outcome {
+        Advance::Idle => "idle".to_string(),
+        Advance::Began { left, right } => {
+            format!("began left={} right={}", left.get(), right.get())
+        }
+        Advance::Exposed { left, right } => {
+            format!("exposed left={} right={}", left.get(), right.get())
+        }
+        Advance::Drained { moved, remaining } => {
+            format!("drained moved={moved} remaining={remaining}")
+        }
+        Advance::Completed => "completed".to_string(),
+        other => panic!("unexpected split outcome {other:?}"),
+    }
+}
+
+/// The bounded fixup retry policy used by split steps.
+fn retry_policy() -> RetryPolicy {
+    RetryPolicy::for_fixup(&RuntimeConfig::default())
 }
