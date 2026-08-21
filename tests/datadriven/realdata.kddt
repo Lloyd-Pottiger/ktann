@@ -1,0 +1,119 @@
+# ----------------------------------------------------------------------
+# Real-dataset suites: published ANN benchmarks at 10k scale over the load
+# paths, exact audits, recall against the brute-force oracle, restarts, and
+# deletes. Fixtures live in tests/datadriven/data/ (see its README for
+# provenance); Record IDs are dataset ordinals (r000000 .. r009999).
+#
+# Until the split state machine (#10) lands every tree is a single leaf, so
+# with sufficient budgets search is an exact flat scan and recall must be
+# 100%. Overlap truncation (the bounded exact-rerank overlap cap) is
+# expected on a 10k-entry flat leaf with concentrated real distances; the
+# counts move once splits ship and this corpus exercises approximate
+# traversal. Query samples are capped to bound brute-force oracle cost.
+# ----------------------------------------------------------------------
+# --- SIFTsmall base: 10k x 128 dense descriptors, L2 ---
+new-index name=sift dimension=128 metric=L2 fields=bucket:i64,label:i64 tree-key-fields=0 min-entries=8 max-entries=32
+----
+created index "sift"
+
+load dataset=file:siftsmall_base.fvecs tree=1 via=batch batch=100
+----
+loaded 10000 records (dataset=file:siftsmall_base.fvecs, seed=42)
+
+validate
+----
+ok: records=10000 trees=1 partitions=1 max_level=1
+
+stats
+----
+keys=30007 bytes=8030318
+
+# Stride-sampled self-queries from the loaded base set.
+recall k=10 samples=20
+----
+recall@10: 100.00% (samples=20, truncated=18)
+mean usage: visited_partitions=1 visited_leaf_entries=10000 exact_rerank_candidates=21
+
+# The official siftsmall query set (100 held-out descriptors), first 20.
+recall k=10 samples=20 query=file:siftsmall_query.fvecs
+----
+recall@10: 100.00% (samples=20, truncated=19)
+mean usage: visited_partitions=1 visited_leaf_entries=10000 exact_rerank_candidates=24
+
+recall k=100 samples=10 query=file:siftsmall_query.fvecs
+----
+recall@100: 100.00% (samples=10, truncated=0)
+mean usage: visited_partitions=1 visited_leaf_entries=10000 exact_rerank_candidates=184
+
+# Exact filter: label is the record ordinal, so this keeps the first 1000.
+recall k=10 samples=10 query=file:siftsmall_query.fvecs where=1:le:999
+----
+recall@10: 100.00% (samples=10, truncated=4)
+mean usage: visited_partitions=1 visited_leaf_entries=10000 exact_rerank_candidates=19
+
+restart
+----
+restarted
+
+validate
+----
+ok: records=10000 trees=1 partitions=1 max_level=1
+
+recall k=10 samples=5 query=file:siftsmall_query.fvecs
+----
+recall@10: 100.00% (samples=5, truncated=5)
+mean usage: visited_partitions=1 visited_leaf_entries=10000 exact_rerank_candidates=25
+
+delete
+r000000
+r004999
+r009999
+----
+r000000: true
+r004999: true
+r009999: true
+
+validate
+----
+ok: records=9997 trees=1 partitions=1 max_level=1
+
+recall k=10 samples=10 query=file:siftsmall_query.fvecs
+----
+recall@10: 100.00% (samples=10, truncated=9)
+mean usage: visited_partitions=1 visited_leaf_entries=9997 exact_rerank_candidates=22
+
+# --- fashion-mnist: 10k x 784 sparse grayscale images, L2 ---
+new-index name=fashion dimension=784 metric=L2 fields=bucket:i64,label:i64 tree-key-fields=0 min-entries=8 max-entries=32
+----
+created index "fashion"
+
+load dataset=file:fashion_mnist_base.idx3-ubyte tree=1 via=import batch=100
+----
+loaded 10000 records (dataset=file:fashion_mnist_base.idx3-ubyte, seed=42)
+
+validate
+----
+ok: records=10000 trees=1 partitions=1 max_level=1
+
+stats
+----
+keys=30007 bytes=40010321
+
+recall k=10 samples=5 query=file:fashion_mnist_query.idx3-ubyte
+----
+recall@10: 100.00% (samples=5, truncated=5)
+mean usage: visited_partitions=1 visited_leaf_entries=10000 exact_rerank_candidates=23
+
+restart
+----
+restarted
+
+validate
+----
+ok: records=10000 trees=1 partitions=1 max_level=1
+
+recall k=10 samples=5 query=file:fashion_mnist_query.idx3-ubyte
+----
+recall@10: 100.00% (samples=5, truncated=5)
+mean usage: visited_partitions=1 visited_leaf_entries=10000 exact_rerank_candidates=23
+

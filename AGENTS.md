@@ -144,4 +144,8 @@ must not require nightly features.
   brute-force oracle (`tests/support/oracle.rs`), and the persistent-state
   audit (`tests/support/audit.rs`). Regenerate expectations with
   `KTANN_REWRITE=1 cargo test --test e2e` and review the diff like any other
-  change.
+  change. Real-dataset fixtures (siftsmall, fashion-mnist; see
+  `tests/datadriven/data/README.md` for provenance) are checked in under
+  `tests/datadriven/data/` and loaded via `file:` dataset specs; the oracle is
+  cross-checked against published siftsmall ground truth in
+  `tests/oracle_groundtruth.rs`.

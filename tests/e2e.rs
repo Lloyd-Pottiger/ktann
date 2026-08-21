@@ -13,9 +13,11 @@
 //!    the harness model resets. Field types: `i64`, `f64`, `bool`, `string`;
 //!    a `?` suffix makes the field nullable.
 //! - `load dataset=SPEC tree=V|A..B [via=batch|single|import] [seed=N]
-//!    [batch=N]` — inserts a generated dataset through the public mutation
-//!    API. Non-tree fields are filled deterministically (ordinal values; every
-//!    seventh nullable field is NULL).
+//!    [batch=N]` — inserts a dataset through the public mutation API. SPECs
+//!    are generated synthetically except `file:NAME`, which loads a checked-in
+//!    fixture from `tests/datadriven/data/` and ignores `seed`. Non-tree
+//!    fields are filled deterministically (ordinal values; every seventh
+//!    nullable field is NULL).
 //! - `insert [tree=V]` / `upsert [tree=V]` — input lines `id: [v,v,...]
 //!    [fI=value ...]`; prints `id: ok|created|replaced` or `id: error Kind`.
 //! - `delete` — input lines of Record IDs; prints `id: true|false`.
@@ -25,7 +27,9 @@
 //!    any exhaustion flags.
 //! - `recall k=K samples=N [query=SPEC] [query-seed=N] [where=...] [budgets]` —
 //!    prints recall against the brute-force oracle plus the count of
-//!    budget-truncated queries.
+//!    budget-truncated queries. A `query=` spec is capped at `samples`
+//!    queries; without it, `samples` stride queries come from the loaded
+//!    dataset.
 //! - `inject-fault kind=abort|unknown-applied|unknown-not-applied` — queues one
 //!    commit fault; unknown outcomes are recovered by read-back, and the model
 //!    is synchronized per ADR 0012.
@@ -505,11 +509,16 @@ impl Harness {
         let dimension = self.index().config().dimension();
 
         // The query set: a separately generated spec, or a deterministic
-        // stride sample of the loaded dataset.
+        // stride sample of the loaded dataset. A `query=` spec is capped at
+        // `samples` queries to bound brute-force oracle cost.
         let queries: Vec<Arc<[f32]>> = match directive.arg("query") {
             Some(spec) => {
                 let seed = directive.arg_u64("query-seed", 43);
-                dataset::generate(spec, dimension, seed).vectors
+                dataset::generate(spec, dimension, seed)
+                    .vectors
+                    .into_iter()
+                    .take(samples)
+                    .collect()
             }
             None => {
                 let data = self
