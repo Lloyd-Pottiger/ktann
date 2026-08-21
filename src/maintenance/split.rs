@@ -40,13 +40,12 @@ use bytes::Bytes;
 
 use crate::api::{Error, ErrorKind, PartitionKey, Result};
 use crate::runtime::RetryPolicy;
-use crate::runtime::reads;
-use crate::storage::backend::Backend;
-use crate::storage::backend::ScanLimits;
+use crate::runtime::{reads, writes};
+use crate::storage::backend::{Backend, ScanLimits, WriteTxn};
 use crate::storage::keys::{LogicalKey, TreeKey};
 use crate::storage::values::{
-    IndexManifest, PartitionCentroid, PartitionHeader, PartitionState, PartitionTransition,
-    PersistentValue, expect_centroid, expect_header, expect_state,
+    IndexManifest, PartitionCentroid, PartitionState, PartitionTransition, PersistentValue,
+    expect_centroid,
 };
 use crate::storage::{LogicalRange, ReadLogicalTxn, WriteLogicalTxn, topology};
 
@@ -151,8 +150,13 @@ pub async fn begin_split<B: Backend>(
     started_at_unix_millis: u64,
     retry: &RetryPolicy,
 ) -> Result<topology::SplitStart> {
-    run_step(backend, manifest, retry, async |txn| {
-        topology::begin_split(txn, tree_key, source, started_at_unix_millis).await
+    writes::run_write_attempts(backend, None, manifest, retry, |txn| {
+        writes::boxed_step(topology::begin_split(
+            txn,
+            tree_key,
+            source,
+            started_at_unix_millis,
+        ))
     })
     .await
 }
@@ -174,9 +178,10 @@ pub async fn begin_split<B: Backend>(
 /// A target installation whose discovered parent cannot accept a new child is
 /// abandoned and retried from a fresh snapshot under the retry policy, so a
 /// later attempt rediscovers the source's current parent. That outer retry
-/// deliberately shares the same bounded policy as `run_step`'s inner one: the
-/// total work is bounded by the product of the two (still a small constant),
-/// and exhaustion retires the worker for a later access to rediscover.
+/// deliberately shares the same bounded policy as the whole-step runner's
+/// inner one: the total work is bounded by the product of the two (still a
+/// small constant), and exhaustion retires the worker for a later access to
+/// rediscover.
 pub async fn expose_targets<B: Backend>(
     backend: &B,
     manifest: &IndexManifest,
@@ -205,16 +210,15 @@ pub async fn expose_targets<B: Backend>(
     for (target, centroid) in [(left, centroids.left()), (right, centroids.right())] {
         let mut failed_attempts = 0_u32;
         let install = loop {
-            let outcome = run_step(backend, manifest, retry, async |txn| {
-                topology::create_split_target(
+            let outcome = writes::run_write_attempts(backend, None, manifest, retry, |txn| {
+                writes::boxed_step(topology::create_split_target(
                     txn,
                     tree_key,
                     source,
                     target,
                     centroid,
                     started_at_unix_millis,
-                )
-                .await
+                ))
             })
             .await?;
             match outcome {
@@ -251,8 +255,13 @@ pub async fn advance_to_draining<B: Backend>(
     started_at_unix_millis: u64,
     retry: &RetryPolicy,
 ) -> Result<topology::DrainStart> {
-    run_step(backend, manifest, retry, async |txn| {
-        topology::advance_to_draining(txn, tree_key, source, started_at_unix_millis).await
+    writes::run_write_attempts(backend, None, manifest, retry, |txn| {
+        writes::boxed_step(topology::advance_to_draining(
+            txn,
+            tree_key,
+            source,
+            started_at_unix_millis,
+        ))
     })
     .await
 }
@@ -276,17 +285,27 @@ pub async fn drain_batch<B: Backend>(
     source: PartitionKey,
     retry: &RetryPolicy,
 ) -> Result<DrainStep> {
-    // The read phase fixes the batch from one consistent snapshot.
+    // The read phase fixes the batch from one consistent snapshot; one
+    // batched read covers both source authority values.
     let mut read = reads::open_validated_read(backend, manifest).await?;
-    let Some(state) = read_source_state(&mut read, tree_key, source).await? else {
-        return Ok(DrainStep::SourceAdvanced);
+    let (source_header, state) =
+        topology::read_authority_opt(&mut read, manifest.logical_index_id(), tree_key, source)
+            .await?;
+    let Some(state) = state else {
+        // A completed split removed both authority values; a lone surviving
+        // Header is a torn committed state.
+        return if source_header.is_some() {
+            Err(Error::new(ErrorKind::Corruption))
+        } else {
+            Ok(DrainStep::SourceAdvanced)
+        };
     };
     let (left, right) = match state {
         PartitionTransition::DrainingSplit { left, right, .. } => (left, right),
         PartitionTransition::Splitting { .. } => return Ok(DrainStep::NotDraining),
         _ => return Ok(DrainStep::SourceAdvanced),
     };
-    let header = read_header(&mut read, tree_key, source).await?;
+    let header = source_header.ok_or_else(|| Error::new(ErrorKind::Corruption))?;
     if header.entry_count() == 0 {
         return Ok(DrainStep::Drained {
             moved: 0,
@@ -300,121 +319,145 @@ pub async fn drain_batch<B: Backend>(
     }
     drop(read);
 
-    let kernel = routing::kernel_for(manifest)?;
-    run_step(backend, manifest, retry, async |txn| {
-        // Revalidate the durable state before moving anything.
-        let state = match txn
-            .get_for_update(LogicalKey::State {
-                index: manifest.logical_index_id(),
-                tree_key: tree_key.clone(),
-                partition: source,
-            })
-            .await?
-        {
-            Some(PersistentValue::PartitionState(state)) => state,
-            Some(_) => return Err(Error::new(ErrorKind::Corruption)),
-            // A completed split removed the source State.
-            None => return Ok(DrainStep::SourceAdvanced),
-        };
-        match state {
-            // The DrainingSplit target pair is fixed at the transition, so a
-            // different pair contradicts the persisted protocol.
-            PartitionTransition::DrainingSplit {
-                left: l, right: r, ..
-            } if l == left && r == right => {}
-            PartitionTransition::DrainingSplit { .. } => {
-                return Err(Error::new(ErrorKind::Corruption));
-            }
-            _ => return Ok(DrainStep::SourceAdvanced),
-        }
-
-        let source_header_key = LogicalKey::Header {
-            index: manifest.logical_index_id(),
-            tree_key: tree_key.clone(),
-            partition: source,
-        };
-        let source_header = match txn.get_for_update(source_header_key).await? {
-            Some(PersistentValue::PartitionHeader(header)) => header,
-            Some(_) => return Err(Error::new(ErrorKind::Corruption)),
-            None => return Ok(DrainStep::SourceAdvanced),
-        };
-        if source_header.state() != PartitionState::DrainingSplit {
-            return Err(Error::new(ErrorKind::Corruption));
-        }
-
-        // The persisted target centroids are immutable, so plain reads
-        // suffice; a missing centroid contradicts the DrainingSplit state.
-        let mut centroid_values = txn
-            .batch_get(
-                [left, right]
-                    .map(|target| LogicalKey::Centroid {
-                        index: manifest.logical_index_id(),
-                        tree_key: tree_key.clone(),
-                        partition: target,
-                    })
-                    .into(),
-            )
-            .await?
-            .into_iter();
-        let (Some(left_value), Some(right_value)) =
-            (centroid_values.next(), centroid_values.next())
-        else {
-            // The typed batch read returns exactly one value per input key.
-            return Err(Error::new(ErrorKind::Backend));
-        };
-        let (Some(left_centroid), Some(right_centroid)) =
-            (expect_centroid(left_value)?, expect_centroid(right_value)?)
-        else {
-            return Err(Error::new(ErrorKind::Corruption));
-        };
-
-        let moved = match &batch {
-            DrainBatch::Leaf(record_ids) => {
-                let candidates =
-                    topology::read_leaf_drain_candidates(txn, tree_key, source, record_ids).await?;
-                let mut moves = Vec::new();
-                for candidate in candidates.into_iter().flatten() {
-                    // A `None` slot is a concurrently removed entry: skipped.
-                    let routing = kernel
-                        .preprocess(candidate.record().vector())
-                        .map_err(|_| Error::new(ErrorKind::Corruption))?;
-                    let target = nearer_target(
-                        &kernel,
-                        &routing,
-                        left,
-                        &left_centroid,
-                        right,
-                        &right_centroid,
-                    )?;
-                    moves.push((candidate, target));
-                }
-                topology::relocate_leaf_entries(txn, tree_key, source, moves).await?
-            }
-            DrainBatch::Child(children) => {
-                let candidates =
-                    topology::read_child_drain_candidates(txn, tree_key, source, children).await?;
-                let mut moves = Vec::new();
-                for entry in candidates.into_iter().flatten() {
-                    let target = nearer_target(
-                        &kernel,
-                        entry.centroid(),
-                        left,
-                        &left_centroid,
-                        right,
-                        &right_centroid,
-                    )?;
-                    moves.push((entry, target));
-                }
-                topology::relocate_child_entries(txn, tree_key, source, moves).await?
-            }
-        };
-        let remaining = source_header
-            .entry_count()
-            .checked_sub(u32::try_from(moved).map_err(|_| Error::new(ErrorKind::Corruption))?)
-            .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
-        Ok(DrainStep::Drained { moved, remaining })
+    let plan = DrainPlan {
+        batch,
+        kernel: routing::kernel_for(manifest)?,
+        left,
+        right,
+    };
+    writes::run_write_attempts(backend, None, manifest, retry, |txn| {
+        writes::boxed_step(drain_attempt(txn, manifest, tree_key, source, &plan))
     })
     .await
+}
+
+/// One fixed drain batch: the candidates fixed by the read snapshot and the
+/// routing data the write phase revalidates and moves against.
+struct DrainPlan {
+    batch: DrainBatch,
+    kernel: crate::search::numeric::VectorKernel,
+    left: PartitionKey,
+    right: PartitionKey,
+}
+
+/// Runs one drain attempt inside the attempt transaction.
+async fn drain_attempt<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    manifest: &IndexManifest,
+    tree_key: &TreeKey,
+    source: PartitionKey,
+    plan: &DrainPlan,
+) -> Result<DrainStep> {
+    // Revalidate the durable state before moving anything; one batched
+    // update-protected read covers both source authority values.
+    let index = manifest.logical_index_id();
+    let (source_header, state) = topology::authority_for_update(
+        txn,
+        LogicalKey::Header {
+            index,
+            tree_key: tree_key.clone(),
+            partition: source,
+        },
+        LogicalKey::State {
+            index,
+            tree_key: tree_key.clone(),
+            partition: source,
+        },
+    )
+    .await?;
+    let Some(state) = state else {
+        // A completed split removed the source State.
+        return Ok(DrainStep::SourceAdvanced);
+    };
+    match state {
+        // The DrainingSplit target pair is fixed at the transition, so a
+        // different pair contradicts the persisted protocol.
+        PartitionTransition::DrainingSplit {
+            left: l, right: r, ..
+        } if l == plan.left && r == plan.right => {}
+        PartitionTransition::DrainingSplit { .. } => {
+            return Err(Error::new(ErrorKind::Corruption));
+        }
+        _ => return Ok(DrainStep::SourceAdvanced),
+    }
+    let Some(source_header) = source_header else {
+        return Ok(DrainStep::SourceAdvanced);
+    };
+    if source_header.state() != PartitionState::DrainingSplit {
+        return Err(Error::new(ErrorKind::Corruption));
+    }
+
+    // The persisted target centroids are immutable, so plain reads
+    // suffice; a missing centroid contradicts the DrainingSplit state.
+    let mut centroid_values = txn
+        .batch_get(
+            [plan.left, plan.right]
+                .map(|target| LogicalKey::Centroid {
+                    index,
+                    tree_key: tree_key.clone(),
+                    partition: target,
+                })
+                .into(),
+        )
+        .await?
+        .into_iter();
+    let (Some(left_value), Some(right_value)) = (centroid_values.next(), centroid_values.next())
+    else {
+        // The typed batch read returns exactly one value per input key.
+        return Err(Error::new(ErrorKind::Backend));
+    };
+    let (Some(left_centroid), Some(right_centroid)) =
+        (expect_centroid(left_value)?, expect_centroid(right_value)?)
+    else {
+        return Err(Error::new(ErrorKind::Corruption));
+    };
+
+    let moved = match &plan.batch {
+        DrainBatch::Leaf(record_ids) => {
+            let candidates =
+                topology::read_leaf_drain_candidates(txn, tree_key, source, record_ids).await?;
+            let mut moves = Vec::new();
+            for candidate in candidates.into_iter().flatten() {
+                // A `None` slot is a concurrently removed entry: skipped.
+                let routing = plan
+                    .kernel
+                    .preprocess(candidate.record().vector())
+                    .map_err(|_| Error::new(ErrorKind::Corruption))?;
+                let target = nearer_target(
+                    &plan.kernel,
+                    &routing,
+                    plan.left,
+                    &left_centroid,
+                    plan.right,
+                    &right_centroid,
+                )?;
+                moves.push((candidate, target));
+            }
+            topology::relocate_leaf_entries(txn, tree_key, source, moves).await?
+        }
+        DrainBatch::Child(children) => {
+            let candidates =
+                topology::read_child_drain_candidates(txn, tree_key, source, children).await?;
+            let mut moves = Vec::new();
+            for entry in candidates.into_iter().flatten() {
+                let target = nearer_target(
+                    &plan.kernel,
+                    entry.centroid(),
+                    plan.left,
+                    &left_centroid,
+                    plan.right,
+                    &right_centroid,
+                )?;
+                moves.push((entry, target));
+            }
+            topology::relocate_child_entries(txn, tree_key, source, moves).await?
+        }
+    };
+    let remaining = source_header
+        .entry_count()
+        .checked_sub(u32::try_from(moved).map_err(|_| Error::new(ErrorKind::Corruption))?)
+        .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
+    Ok(DrainStep::Drained { moved, remaining })
 }
 
 /// Runs [`topology::finalize_split`] as one bounded whole-retrying step,
@@ -433,8 +476,14 @@ pub async fn complete_split<B: Backend>(
     } else {
         topology::SourceRemoval::PointDeletes
     };
-    run_step(backend, manifest, retry, async |txn| {
-        topology::finalize_split(txn, tree_key, source, started_at_unix_millis, removal).await
+    writes::run_write_attempts(backend, None, manifest, retry, |txn| {
+        writes::boxed_step(topology::finalize_split(
+            txn,
+            tree_key,
+            source,
+            started_at_unix_millis,
+            removal,
+        ))
     })
     .await
 }
@@ -458,8 +507,9 @@ pub async fn advance<B: Backend>(
     retry: &RetryPolicy,
 ) -> Result<Advance> {
     let mut read = reads::open_validated_read(backend, manifest).await?;
-    let header = read_header_opt(&mut read, tree_key, partition).await?;
-    let state = read_state_opt(&mut read, tree_key, partition).await?;
+    let (header, state) =
+        topology::read_authority_opt(&mut read, manifest.logical_index_id(), tree_key, partition)
+            .await?;
     drop(read);
     let (header, state) = match (header, state) {
         // Nothing was ever persisted here, or a completed split already
@@ -643,121 +693,23 @@ fn nearer_target(
     ))
 }
 
-/// Reads one partition State that may be absent.
-async fn read_state_opt<T: crate::storage::backend::ReadOps>(
-    txn: &mut ReadLogicalTxn<'_, T>,
-    tree_key: &TreeKey,
-    partition: PartitionKey,
-) -> Result<Option<PartitionTransition>> {
-    let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
-    expect_state(
-        txn.get(LogicalKey::State {
-            index: manifest.logical_index_id(),
-            tree_key: tree_key.clone(),
-            partition,
-        })
-        .await?,
-    )
-}
-
 /// Reads one split source's State from a snapshot, returning `None` when a
 /// completed non-root split removed both authority values.
 ///
 /// Re-driving any step of a finished split observes the absence and is
 /// harmless (maintenance.md §3); a lone surviving Header is a torn committed
-/// state.
+/// state. One batched read covers both authority values.
 async fn read_source_state<T: crate::storage::backend::ReadOps>(
     txn: &mut ReadLogicalTxn<'_, T>,
     tree_key: &TreeKey,
     source: PartitionKey,
 ) -> Result<Option<PartitionTransition>> {
-    match read_state_opt(txn, tree_key, source).await? {
-        Some(state) => Ok(Some(state)),
-        None if read_header_opt(txn, tree_key, source).await?.is_some() => {
-            Err(Error::new(ErrorKind::Corruption))
-        }
-        None => Ok(None),
-    }
-}
-
-/// Reads one partition Header from a snapshot, failing closed when absent.
-async fn read_header<T: crate::storage::backend::ReadOps>(
-    txn: &mut ReadLogicalTxn<'_, T>,
-    tree_key: &TreeKey,
-    partition: PartitionKey,
-) -> Result<PartitionHeader> {
-    read_header_opt(txn, tree_key, partition)
-        .await?
-        .ok_or_else(|| Error::new(ErrorKind::Corruption))
-}
-
-/// Reads one partition Header that may be absent.
-async fn read_header_opt<T: crate::storage::backend::ReadOps>(
-    txn: &mut ReadLogicalTxn<'_, T>,
-    tree_key: &TreeKey,
-    partition: PartitionKey,
-) -> Result<Option<PartitionHeader>> {
     let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
-    expect_header(
-        txn.get(LogicalKey::Header {
-            index: manifest.logical_index_id(),
-            tree_key: tree_key.clone(),
-            partition,
-        })
-        .await?,
-    )
-}
-
-/// Runs one bounded split step as a sequence of whole attempts.
-///
-/// Each attempt opens a fresh write transaction, update-protects and
-/// validates the Active Index Manifest so a step never commits into a
-/// dropping Logical Index, runs the step closure, and commits. A definite
-/// abort replays the whole step under the bounded policy; a commit of
-/// unknown outcome is returned, never retried (ADR 0012).
-async fn run_step<B: Backend, O>(
-    backend: &B,
-    handle_manifest: &IndexManifest,
-    retry: &RetryPolicy,
-    mut step: impl AsyncFnMut(&mut WriteLogicalTxn<'_, B::WriteTxn<'_>>) -> Result<O>,
-) -> Result<O> {
-    let mut failed_attempts = 0_u32;
-    loop {
-        let raw = backend.begin_write().await?;
-        let hard_limits = backend.hard_limits();
-        let budget = backend.admission_budget();
-        let mut txn = WriteLogicalTxn::bootstrap(raw, hard_limits, budget);
-        let current = match reads::validated_active_manifest(&mut txn, handle_manifest).await {
-            Ok(current) => current,
-            Err(error) => {
-                txn.rollback().await;
-                return Err(error);
-            }
-        };
-        let raw = txn.into_raw();
-        let mut txn = match WriteLogicalTxn::for_index(raw, &current, hard_limits, budget) {
-            Ok(txn) => txn,
-            Err(error) => return Err(error),
-        };
-        let error = match step(&mut txn).await {
-            Ok(outcome) => match txn.commit().await {
-                // The commit boundary is included in the whole-attempt retry;
-                // an unknown outcome is returned, never retried (ADR 0012).
-                Ok(()) => return Ok(outcome),
-                Err(error) => error,
-            },
-            Err(error) => {
-                txn.rollback().await;
-                error
-            }
-        };
-        if error.kind() != ErrorKind::RetryableAbort {
-            return Err(error);
-        }
-        if retry.would_exhaust(failed_attempts) {
-            return Err(Error::new(ErrorKind::ContentionExhausted));
-        }
-        retry.wait(failed_attempts).await;
-        failed_attempts += 1;
+    let (header, state) =
+        topology::read_authority_opt(txn, manifest.logical_index_id(), tree_key, source).await?;
+    match (header, state) {
+        (_, Some(state)) => Ok(Some(state)),
+        (Some(_), None) => Err(Error::new(ErrorKind::Corruption)),
+        (None, None) => Ok(None),
     }
 }

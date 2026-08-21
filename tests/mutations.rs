@@ -1123,10 +1123,10 @@ async fn batched_upserts_read_locations_in_one_call() {
     );
 
     // One batched update-protected read decides insert versus replace for the
-    // whole batch; the membership operations re-read from the
-    // transaction-local cache.
+    // whole batch, and a second one validates every distinct routed leaf; the
+    // membership operations re-read from the transaction-local cache.
     let counts = backend.inner.operation_counts();
-    assert_eq!(counts.batch_get_for_update, 1, "location reads: {counts:?}");
+    assert_eq!(counts.batch_get_for_update, 2, "batched reads: {counts:?}");
 
     for i in 0..N as u8 {
         let stored = index

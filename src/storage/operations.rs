@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, btree_map::Entry};
 use std::fmt;
+use std::future::Future;
 
 use bytes::Bytes;
 
@@ -1313,6 +1314,86 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
     /// Abandons every mutation, consuming the transaction.
     pub async fn rollback(self) {
         self.raw.rollback().await;
+    }
+}
+
+/// The typed read surface both logical transaction kinds expose.
+///
+/// Read-only and write logical transactions decode the same typed `get`,
+/// `batch_get`, and `scan` operations; this trait lets algorithm modules write
+/// one read helper or traversal that serves both transaction kinds without
+/// duplicating the logic. It grants no update protection: write transactions
+/// establish conflicts only through the `for_update` operations, which stay
+/// `WriteLogicalTxn`-only.
+pub(crate) trait LogicalReader {
+    /// Reads one typed value, returning `None` when the key is absent.
+    fn get(
+        &mut self,
+        key: LogicalKey,
+    ) -> impl Future<Output = Result<Option<PersistentValue>>> + Send;
+
+    /// Reads typed values in input order while preserving duplicates and gaps.
+    fn batch_get(
+        &mut self,
+        keys: Vec<LogicalKey>,
+    ) -> impl Future<Output = Result<Vec<Option<PersistentValue>>>> + Send;
+
+    /// Scans one bounded typed page from an exact Logical Range.
+    fn scan(
+        &mut self,
+        range: &LogicalRange,
+        cursor: Option<&LogicalScanCursor>,
+        limits: ScanLimits,
+    ) -> impl Future<Output = Result<LogicalScanPage>> + Send;
+}
+
+impl<T: ReadOps> LogicalReader for ReadLogicalTxn<'_, T> {
+    fn get(
+        &mut self,
+        key: LogicalKey,
+    ) -> impl Future<Output = Result<Option<PersistentValue>>> + Send {
+        ReadLogicalTxn::get(self, key)
+    }
+
+    fn batch_get(
+        &mut self,
+        keys: Vec<LogicalKey>,
+    ) -> impl Future<Output = Result<Vec<Option<PersistentValue>>>> + Send {
+        ReadLogicalTxn::batch_get(self, keys)
+    }
+
+    fn scan(
+        &mut self,
+        range: &LogicalRange,
+        cursor: Option<&LogicalScanCursor>,
+        limits: ScanLimits,
+    ) -> impl Future<Output = Result<LogicalScanPage>> + Send {
+        ReadLogicalTxn::scan(self, range, cursor, limits)
+    }
+}
+
+impl<T: WriteTxn> LogicalReader for WriteLogicalTxn<'_, T> {
+    fn get(
+        &mut self,
+        key: LogicalKey,
+    ) -> impl Future<Output = Result<Option<PersistentValue>>> + Send {
+        WriteLogicalTxn::get(self, key)
+    }
+
+    fn batch_get(
+        &mut self,
+        keys: Vec<LogicalKey>,
+    ) -> impl Future<Output = Result<Vec<Option<PersistentValue>>>> + Send {
+        WriteLogicalTxn::batch_get(self, keys)
+    }
+
+    fn scan(
+        &mut self,
+        range: &LogicalRange,
+        cursor: Option<&LogicalScanCursor>,
+        limits: ScanLimits,
+    ) -> impl Future<Output = Result<LogicalScanPage>> + Send {
+        WriteLogicalTxn::scan(self, range, cursor, limits)
     }
 }
 
