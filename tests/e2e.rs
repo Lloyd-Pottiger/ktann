@@ -39,10 +39,11 @@
 //! - `stats` — prints committed keyspace size.
 //! - `drop-index` — drops the index.
 //!
-//! Until the split state machine (#10) lands, every corpus tree is a single
-//! level-1 root; `validate` and `format-tree` then start covering internal
-//! levels and intermediate topology states without changing the corpus
-//! format.
+//! Foreground mutations never trigger a split on their own in the current
+//! build, so every corpus tree stays a single level-1 root until split-step
+//! directives (tracked in #94) drive the #10 state machine explicitly;
+//! `validate` and `format-tree` then cover internal levels and intermediate
+//! topology states without changing the corpus format.
 
 use std::path::Path;
 use std::sync::Arc;
