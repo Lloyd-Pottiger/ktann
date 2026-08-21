@@ -79,7 +79,21 @@ async fn data_driven_corpus() {
         let mut harness = Harness::new();
         let mut outputs = Vec::with_capacity(directives.len());
         for directive in &directives {
-            outputs.push(harness.execute(directive).await);
+            let actual = harness.execute(directive).await;
+            // Compare immediately: a later directive may panic (e.g. a recall
+            // after a failed load), which must not hide the real mismatch.
+            if !rewrite && directive.expected != actual {
+                let mismatch = Mismatch {
+                    path: path.clone(),
+                    line: directive.line,
+                    raw_header: directive.raw_header.clone(),
+                    expected: directive.expected.clone(),
+                    actual: actual.clone(),
+                };
+                eprintln!("{mismatch}");
+                mismatches.push(mismatch);
+            }
+            outputs.push(actual);
         }
         harness.shutdown().await;
         if rewrite {
@@ -87,23 +101,6 @@ async fn data_driven_corpus() {
             if rendered != text {
                 std::fs::write(&path, rendered)
                     .unwrap_or_else(|error| panic!("rewrite {}: {error}", path.display()));
-            }
-        } else {
-            for (directive, actual) in directives.iter().zip(&outputs) {
-                if directive.expected != *actual {
-                    let mismatch = Mismatch {
-                        path: path.clone(),
-                        line: directive.line,
-                        raw_header: directive.raw_header.clone(),
-                        expected: directive.expected.clone(),
-                        actual: actual.clone(),
-                    };
-                    // Surface the diff immediately: a later directive may
-                    // panic (e.g. a recall after a failed load), which would
-                    // otherwise hide the root cause from the test log.
-                    eprintln!("{mismatch}");
-                    mismatches.push(mismatch);
-                }
             }
         }
     }
@@ -271,9 +268,16 @@ impl Harness {
 
         match via {
             Via::Import => {
+                // Serialized import keeps the corpus deterministic: pipelined
+                // batches inserting into the same leaf legitimately race, and
+                // a bounded-retry exhaustion under that contention is engine
+                // behavior for engine tests, not for this corpus.
+                let options = ImportOptions::default()
+                    .with_in_flight_batches(1)
+                    .expect("import options");
                 let mut session = self
                     .index()
-                    .import_session(ImportOptions::default())
+                    .import_session(options)
                     .expect("import session");
                 for chunk in records.chunks(batch_size) {
                     let mutations = chunk.iter().cloned().map(Mutation::Insert).collect();
