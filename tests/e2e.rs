@@ -72,6 +72,7 @@ async fn data_driven_corpus() {
     let rewrite = datadriven::rewrite_enabled();
     let mut mismatches = Vec::new();
     for path in datadriven::corpus_files(&dir) {
+        eprintln!("running {}", path.display());
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
         let directives = datadriven::parse(&path, &text);
@@ -90,13 +91,18 @@ async fn data_driven_corpus() {
         } else {
             for (directive, actual) in directives.iter().zip(&outputs) {
                 if directive.expected != *actual {
-                    mismatches.push(Mismatch {
+                    let mismatch = Mismatch {
                         path: path.clone(),
                         line: directive.line,
                         raw_header: directive.raw_header.clone(),
                         expected: directive.expected.clone(),
                         actual: actual.clone(),
-                    });
+                    };
+                    // Surface the diff immediately: a later directive may
+                    // panic (e.g. a recall after a failed load), which would
+                    // otherwise hide the root cause from the test log.
+                    eprintln!("{mismatch}");
+                    mismatches.push(mismatch);
                 }
             }
         }
@@ -521,10 +527,13 @@ impl Harness {
                     .collect()
             }
             None => {
-                let data = self
-                    .dataset
-                    .as_ref()
-                    .expect("recall needs a loaded dataset or query=");
+                let data = self.dataset.as_ref().unwrap_or_else(|| {
+                    panic!(
+                        "recall at line {} needs a loaded dataset or query= \
+                         (a previous load may have failed)",
+                        directive.line
+                    )
+                });
                 (0..samples)
                     .map(|sample| data.vectors[sample * data.len() / samples].clone())
                     .collect()
