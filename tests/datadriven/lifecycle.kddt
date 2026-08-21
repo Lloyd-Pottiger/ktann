@@ -1,0 +1,53 @@
+# ----------------------------------------------------------------------
+# Lifecycle: a durable index survives a simulated process restart and drops
+# cleanly.
+# ----------------------------------------------------------------------
+new-index dimension=8 metric=L2 fields=bucket:i64 tree-key-fields=0
+----
+created index "index"
+
+load dataset=uniform:3000 tree=1 via=batch batch=100 seed=31
+----
+loaded 3000 records (dataset=uniform:3000, seed=31)
+
+validate
+----
+ok: records=3000 trees=1 partitions=1 max_level=1
+
+restart
+----
+restarted
+
+# The reopened index is intact and searchable.
+validate
+----
+ok: records=3000 trees=1 partitions=1 max_level=1
+
+search k=3 vector=[0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5]
+----
+r001846: 0.6114
+r000449: 0.6861
+r001137: 0.7559
+usage: scanned_tree_keys=1 visited_partitions=1 visited_leaf_entries=3000 exact_rerank_candidates=4
+
+stats
+----
+keys=9007 bytes=600291
+
+drop-index
+----
+dropped
+
+stats
+----
+keys=1 bytes=13
+
+# A fresh index under the same name starts empty.
+new-index dimension=8 metric=L2 fields=bucket:i64 tree-key-fields=0
+----
+created index "index"
+
+stats
+----
+keys=3 bytes=117
+

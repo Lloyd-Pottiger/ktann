@@ -1,0 +1,58 @@
+# ----------------------------------------------------------------------
+# Tree Fan-out: records spread over four Tree Keys, enumerated or
+# predicate-selected, with the scanned Tree Key budget accounted.
+# ----------------------------------------------------------------------
+new-index dimension=4 metric=L2 fields=bucket:i64 tree-key-fields=0
+----
+created index "index"
+
+load dataset=clustered:2000:4 tree=1..4 seed=21
+----
+loaded 2000 records (dataset=clustered:2000:4, seed=21)
+
+validate
+----
+ok: records=2000 trees=4 partitions=4 max_level=1
+
+format-tree
+----
+tree 0: root pk=1
+  pk=1 level=1 state=Ready count=500
+tree 1: root pk=1
+  pk=1 level=1 state=Ready count=500
+tree 2: root pk=1
+  pk=1 level=1 state=Ready count=500
+tree 3: root pk=1
+  pk=1 level=1 state=Ready count=500
+
+# Without a predicate every tree is enumerated.
+search k=5 vector=[0,0,0,0]
+----
+r000895: 0.9240
+r001641: 0.9636
+r000662: 1.0141
+r001923: 1.0538
+r000284: 1.0555
+usage: scanned_tree_keys=4 visited_partitions=4 visited_leaf_entries=2000 exact_rerank_candidates=5
+
+# A predicate on the Tree Key field selects exactly one tree.
+search k=5 vector=[0,0,0,0] where=0:eq:2
+----
+r001641: 0.9636
+r000537: 1.0815
+r000149: 1.0835
+r001973: 1.1712
+r000233: 1.1783
+usage: scanned_tree_keys=1 visited_partitions=1 visited_leaf_entries=500 exact_rerank_candidates=7
+
+# A scanned Tree Key budget below the fan-out truncates enumeration.
+search k=5 vector=[0,0,0,0] scanned-tree-keys=2
+----
+r001641: 0.9636
+r000284: 1.0555
+r000537: 1.0815
+r000149: 1.0835
+r000892: 1.1363
+usage: scanned_tree_keys=2 visited_partitions=2 visited_leaf_entries=1000 exact_rerank_candidates=5
+exhausted: scanned_tree_keys
+

@@ -29,6 +29,11 @@ use ktann::storage::backend::{
 use ktann::storage::keys::{KeyRange, LogicalKey};
 use ktann::storage::values::{IndexManifest, PersistentValue};
 
+pub mod audit;
+pub mod datadriven;
+pub mod dataset;
+pub mod oracle;
+
 /// A committed keyspace snapshot mapping encoded keys to values.
 type Keyspace = BTreeMap<Vec<u8>, Vec<u8>>;
 /// A transaction's mutation overlay mapping keys to `Some(value)` or `None`
