@@ -39,7 +39,7 @@ use std::collections::BTreeMap;
 
 use crate::api::{Error, ErrorKind, Mutation, MutationOutcome, Record, Result};
 use crate::runtime::lifecycle::RetryPolicy;
-use crate::runtime::{OperationContext, reads};
+use crate::runtime::{OperationContext, writes};
 use crate::search::numeric::VectorKernel;
 use crate::search::rabitq::RaBitQ7;
 use crate::storage::backend::{Backend, WriteTxn};
@@ -67,55 +67,15 @@ pub(crate) async fn mutate<B: Backend>(
 ) -> Result<Vec<MutationOutcome>> {
     let kernel = routing::kernel_for(handle_manifest)?;
     let prepared = prepare_all(handle_manifest, &kernel, mutations)?;
-    let mut failed_attempts = 0_u32;
-    loop {
-        context.checkpoint()?;
-        match run_attempt(context, handle_manifest, &kernel, mutations, &prepared).await {
-            Ok(outcomes) => return Ok(outcomes),
-            Err(error) if error.kind() == ErrorKind::RetryableAbort => {
-                if retry.would_exhaust(failed_attempts) {
-                    return Err(Error::new(ErrorKind::ContentionExhausted));
-                }
-                retry.wait(failed_attempts).await;
-                failed_attempts += 1;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-/// Runs one complete attempt in a single fresh write transaction.
-async fn run_attempt<B: Backend>(
-    context: &mut OperationContext<B>,
-    handle_manifest: &IndexManifest,
-    kernel: &VectorKernel,
-    mutations: &[Mutation],
-    prepared: &[Option<PreparedRecord>],
-) -> Result<Vec<MutationOutcome>> {
     let backend = context.backend();
-    let hard_limits = backend.hard_limits();
-    let budget = backend.admission_budget();
-    let raw = backend.begin_write().await?;
-    let mut txn = WriteLogicalTxn::bootstrap(raw, hard_limits, budget);
-    let current = match reads::validated_active_manifest(&mut txn, handle_manifest).await {
-        Ok(current) => current,
-        Err(error) => {
-            txn.rollback().await;
-            return Err(error);
-        }
-    };
-    let raw = txn.into_raw();
-    let mut txn = WriteLogicalTxn::for_index(raw, &current, hard_limits, budget)?;
-    match apply_all(&mut txn, kernel, mutations, prepared).await {
-        Ok(outcomes) => context
-            .commit(move |start| txn.commit_with(start))
-            .await
-            .map(|()| outcomes),
-        Err(error) => {
-            txn.rollback().await;
-            Err(error)
-        }
-    }
+    writes::run_write_attempts(
+        backend.as_ref(),
+        Some(context),
+        handle_manifest,
+        &retry,
+        |txn| writes::boxed_step(apply_all(txn, &kernel, mutations, &prepared)),
+    )
+    .await
 }
 
 /// Applies every mutation in input order inside the attempt transaction.

@@ -58,7 +58,7 @@ use crate::storage::values::{
     expect_child_entry, expect_child_entry_ref, expect_header, expect_leaf_entry, expect_location,
     expect_record, expect_state, expect_synopsis,
 };
-use crate::storage::{LogicalRange, WriteLogicalTxn};
+use crate::storage::{LogicalRange, LogicalReader, WriteLogicalTxn};
 
 /// The number of split targets one split reserves and exposes; binary fanout
 /// is a fixed format-v1 protocol choice.
@@ -273,7 +273,10 @@ pub async fn create_split_target<T: WriteTxn>(
     // A previous committed attempt is recognized before any discovery work;
     // its persisted centroid stands.
     let (target_header_key, target_state_key) = authority_keys(index, tree_key, target);
-    if expect_header(txn.get(target_header_key.clone()).await?)?.is_some() {
+    if read_header_opt(txn, index, tree_key, target)
+        .await?
+        .is_some()
+    {
         return match read_target_state(txn, index, tree_key, source, target).await? {
             Some(()) => Ok(TargetInstall::AlreadyExists),
             None => Err(corrupt()),
@@ -664,7 +667,9 @@ pub async fn relocate_leaf_entries<T: WriteTxn>(
     let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
     let index = manifest.logical_index_id();
 
-    // One update-protected read of each touched partition Header.
+    // One update-protected read of each touched partition Header, and one of
+    // each receiving target's Synopsis: a batch never pays per-partition
+    // authority round trips.
     let mut targets: Vec<PartitionKey> = moves.iter().map(|(_, target)| *target).collect();
     targets.sort_unstable();
     targets.dedup();
@@ -701,6 +706,23 @@ pub async fn relocate_leaf_entries<T: WriteTxn>(
     // draining into exactly these `ReceivingSplit` targets.
     if source_header.level() != 1 || source_header.state() != PartitionState::DrainingSplit {
         return Err(corrupt());
+    }
+
+    let synopsis_keys: Vec<LogicalKey> = targets
+        .iter()
+        .map(|target| LogicalKey::Synopsis {
+            index,
+            tree_key: tree_key.clone(),
+            partition: *target,
+        })
+        .collect();
+    let mut synopsis_values = txn.batch_get_for_update(synopsis_keys).await?.into_iter();
+    let mut target_synopses: Vec<PartitionSynopsis> = Vec::with_capacity(targets.len());
+    for _ in &targets {
+        let Some(value) = synopsis_values.next() else {
+            return Err(Error::new(ErrorKind::Backend));
+        };
+        target_synopses.push(expect_synopsis(value)?.ok_or_else(corrupt)?);
     }
 
     let moved = moves.len();
@@ -746,16 +768,8 @@ pub async fn relocate_leaf_entries<T: WriteTxn>(
         PersistentValue::PartitionHeader(source_header),
     )
     .await?;
-    for (target, header) in target_headers {
+    for ((target, header), mut synopsis) in target_headers.into_iter().zip(target_synopses) {
         let mut header = header;
-        let mut synopsis = {
-            let key = LogicalKey::Synopsis {
-                index,
-                tree_key: tree_key.clone(),
-                partition: target,
-            };
-            expect_synopsis(txn.get_for_update(key).await?)?.ok_or_else(corrupt)?
-        };
         let original = synopsis.clone();
         for (drain, move_target) in &moves {
             if move_target == &target {
@@ -1046,18 +1060,27 @@ pub async fn finalize_split<T: WriteTxn>(
 
     if source == root_partition() {
         // The root converts in place: it gains one level and the two target
-        // Child Entries carrying the persisted target centroids.
+        // Child Entries carrying the persisted target centroids, read in one
+        // batch.
+        let mut centroids = txn
+            .batch_get(
+                [left, right]
+                    .map(|target| LogicalKey::Centroid {
+                        index,
+                        tree_key: tree_key.clone(),
+                        partition: target,
+                    })
+                    .into(),
+            )
+            .await?
+            .into_iter();
         let mut promoted = header;
         for target in [left, right] {
-            let centroid = expect_centroid(
-                txn.get(LogicalKey::Centroid {
-                    index,
-                    tree_key: tree_key.clone(),
-                    partition: target,
-                })
-                .await?,
-            )?
-            .ok_or_else(corrupt)?;
+            let Some(centroid_value) = centroids.next() else {
+                // The typed batch read returns exactly one value per input key.
+                return Err(Error::new(ErrorKind::Backend));
+            };
+            let centroid = expect_centroid(centroid_value)?.ok_or_else(corrupt)?;
             // The drained root holds no entries, so both Child Entries are
             // unique inserts.
             expect_inserted(
@@ -1217,15 +1240,9 @@ async fn find_incoming_edge<T: WriteTxn>(
                     if target == root || bodies.contains(&target) {
                         continue;
                     }
-                    let exists = expect_header(
-                        txn.get(LogicalKey::Header {
-                            index,
-                            tree_key: tree_key.clone(),
-                            partition: target,
-                        })
-                        .await?,
-                    )?
-                    .is_some();
+                    let exists = read_header_opt(txn, index, tree_key, target)
+                        .await?
+                        .is_some();
                     if !exists && !draining {
                         continue;
                     }
@@ -1295,43 +1312,105 @@ async fn find_incoming_edge<T: WriteTxn>(
 }
 
 /// Reads one partition Header that must exist.
-async fn read_header<T: WriteTxn>(
-    txn: &mut WriteLogicalTxn<'_, T>,
+///
+/// This is the single home of the typed authority read; read-only and write
+/// transactions share it through [`LogicalReader`]. A missing Header on a
+/// referenced partition is Corruption.
+pub(crate) async fn read_header<R: LogicalReader>(
+    reader: &mut R,
     index: LogicalIndexId,
     tree_key: &TreeKey,
     partition: PartitionKey,
 ) -> Result<PartitionHeader> {
+    read_header_opt(reader, index, tree_key, partition)
+        .await?
+        .ok_or_else(corrupt)
+}
+
+/// Reads one partition Header, which may be absent after a completed split.
+pub(crate) async fn read_header_opt<R: LogicalReader>(
+    reader: &mut R,
+    index: LogicalIndexId,
+    tree_key: &TreeKey,
+    partition: PartitionKey,
+) -> Result<Option<PartitionHeader>> {
     expect_header(
-        txn.get(LogicalKey::Header {
-            index,
-            tree_key: tree_key.clone(),
-            partition,
-        })
-        .await?,
-    )?
-    .ok_or_else(corrupt)
+        reader
+            .get(LogicalKey::Header {
+                index,
+                tree_key: tree_key.clone(),
+                partition,
+            })
+            .await?,
+    )
 }
 
 /// Reads one partition State, which may be absent after a completed split.
-async fn read_state<T: WriteTxn>(
-    txn: &mut WriteLogicalTxn<'_, T>,
+pub(crate) async fn read_state<R: LogicalReader>(
+    reader: &mut R,
     index: LogicalIndexId,
     tree_key: &TreeKey,
     partition: PartitionKey,
 ) -> Result<Option<PartitionTransition>> {
     expect_state(
-        txn.get(LogicalKey::State {
-            index,
-            tree_key: tree_key.clone(),
-            partition,
-        })
-        .await?,
+        reader
+            .get(LogicalKey::State {
+                index,
+                tree_key: tree_key.clone(),
+                partition,
+            })
+            .await?,
     )
+}
+
+/// Reads one partition's authority pair in one batched plain read, without
+/// classifying presence or agreement.
+///
+/// One batched call covers what would otherwise be two sequential point
+/// reads; the caller classifies the pair because the meaning of a half-present
+/// pair depends on the state machine step.
+pub(crate) async fn read_authority_opt<R: LogicalReader>(
+    reader: &mut R,
+    index: LogicalIndexId,
+    tree_key: &TreeKey,
+    partition: PartitionKey,
+) -> Result<(Option<PartitionHeader>, Option<PartitionTransition>)> {
+    let (header_key, state_key) = authority_keys(index, tree_key, partition);
+    let mut values = reader
+        .batch_get(vec![header_key, state_key])
+        .await?
+        .into_iter();
+    let (Some(header), Some(state)) = (values.next(), values.next()) else {
+        // The typed batch read returns exactly one value per input key.
+        return Err(Error::new(ErrorKind::Backend));
+    };
+    Ok((expect_header(header)?, expect_state(state)?))
+}
+
+/// Reads one visited partition's Header and State in one batch, failing
+/// closed when either is missing, of the wrong kind, or in disagreement.
+///
+/// Every reachable partition carries both authority values in every committed
+/// state: creation installs them together, and completion removes them
+/// together with the partition's last incoming reference.
+pub(crate) async fn read_authority<R: LogicalReader>(
+    reader: &mut R,
+    index: LogicalIndexId,
+    tree_key: &TreeKey,
+    partition: PartitionKey,
+) -> Result<(PartitionHeader, PartitionTransition)> {
+    match read_authority_opt(reader, index, tree_key, partition).await? {
+        (Some(header), Some(state)) => {
+            expect_agreement(header, state)?;
+            Ok((header, state))
+        }
+        _ => Err(corrupt()),
+    }
 }
 
 /// Reads one partition's Header and State with update protection in one
 /// batch.
-async fn authority_for_update<T: WriteTxn>(
+pub(crate) async fn authority_for_update<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     header_key: LogicalKey,
     state_key: LogicalKey,

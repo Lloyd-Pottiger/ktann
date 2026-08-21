@@ -20,6 +20,7 @@ pub(crate) mod import;
 pub(crate) mod lifecycle;
 pub(crate) mod reads;
 pub(crate) mod search;
+pub(crate) mod writes;
 
 pub use lifecycle::RetryPolicy;
 
