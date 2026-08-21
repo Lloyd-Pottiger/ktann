@@ -153,6 +153,9 @@ pub enum SplitCompletion {
 ///
 /// Observing `Splitting { left, right }` returns the persisted targets, so
 /// re-driving after an unknown commit outcome never reserves a second pair.
+/// A source with no authority values — a completed split removed them, or it
+/// never existed — reports [`SplitStart::NotEligible`]; a half-present pair
+/// is Corruption.
 pub async fn begin_split<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     tree_key: &TreeKey,
@@ -163,8 +166,13 @@ pub async fn begin_split<T: WriteTxn>(
     let index = manifest.logical_index_id();
     let (header_key, state_key) = authority_keys(index, tree_key, source);
     let (header, state) = authority_for_update(txn, header_key.clone(), state_key.clone()).await?;
-    let header = header.ok_or_else(corrupt)?;
-    let state = state.ok_or_else(corrupt)?;
+    let (header, state) = match (header, state) {
+        (Some(header), Some(state)) => (header, state),
+        // Both authority values are gone: a completed split already removed
+        // the source (or it never existed), so there is nothing to start.
+        (None, None) => return Ok(SplitStart::NotEligible),
+        _ => return Err(corrupt()),
+    };
     expect_agreement(header, state)?;
 
     match state {
@@ -406,9 +414,16 @@ pub async fn create_split_target<T: WriteTxn>(
 /// `DrainingSplit`.
 ///
 /// The transition update-protects the source and verifies that both persisted
-/// targets identify it as their source; it deliberately ignores the source's
-/// entries, count, and cache epoch so concurrent foreground writes during
-/// training and publication never abort the structural step (ADR 0014).
+/// targets identify it as their source and are complete — State, Header, and
+/// Centroid present and in agreement at the source's level — so the source
+/// never commits into a `DrainingSplit` that the fail-closed drain and
+/// completion steps would wedge behind. It deliberately ignores the source's
+/// entries, count, and cache epoch: training and publication never restart or
+/// revalidate because of concurrent foreground writes (ADR 0014). The Header
+/// write that keeps the state discriminator in agreement can still conflict
+/// with a concurrent foreground write to the source; the caller's whole-step
+/// retry absorbs that, and exhaustion leaves a searchable `Splitting` state
+/// for a later access to rediscover.
 pub async fn advance_to_draining<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     tree_key: &TreeKey,
@@ -426,6 +441,10 @@ pub async fn advance_to_draining<T: WriteTxn>(
         PartitionTransition::DrainingSplit { .. } => return Ok(DrainStart::AlreadyDraining),
         _ => return Ok(DrainStart::NotSplitting),
     };
+
+    let header =
+        expect_header(txn.get_for_update(header_key.clone()).await?)?.ok_or_else(corrupt)?;
+    expect_agreement(header, state)?;
 
     // Both targets must identify this source; one update-protected batch
     // establishes the commit-time conflicts on both target States.
@@ -445,16 +464,53 @@ pub async fn advance_to_draining<T: WriteTxn>(
         // The typed batch read returns exactly one value per input key.
         return Err(Error::new(ErrorKind::Backend));
     };
-    for value in [left_state, right_state] {
-        match expect_state(value)? {
+
+    // Each target must also carry its Header and Centroid; committing the
+    // transition with a torn target would wedge the source behind the
+    // fail-closed drain and completion checks. These are plain reads: the
+    // update-protected States above already conflict with any concurrent
+    // target transition, and target counts and epochs may change freely.
+    let mut target_parts = txn
+        .batch_get(
+            [left, right]
+                .into_iter()
+                .flat_map(|target| {
+                    [
+                        LogicalKey::Header {
+                            index,
+                            tree_key: tree_key.clone(),
+                            partition: target,
+                        },
+                        LogicalKey::Centroid {
+                            index,
+                            tree_key: tree_key.clone(),
+                            partition: target,
+                        },
+                    ]
+                })
+                .collect(),
+        )
+        .await?
+        .into_iter();
+    for state_value in [left_state, right_state] {
+        match expect_state(state_value)? {
             Some(PartitionTransition::ReceivingSplit { source: s, .. }) if s == source => {}
             _ => return Err(corrupt()),
         }
+        let (Some(header_value), Some(centroid_value)) = (target_parts.next(), target_parts.next())
+        else {
+            // The typed batch read returns exactly one value per input key.
+            return Err(Error::new(ErrorKind::Backend));
+        };
+        let target_header = expect_header(header_value)?.ok_or_else(corrupt)?;
+        if target_header.state() != PartitionState::ReceivingSplit
+            || target_header.level() != header.level()
+        {
+            return Err(corrupt());
+        }
+        expect_centroid(centroid_value)?.ok_or_else(corrupt)?;
     }
 
-    let header =
-        expect_header(txn.get_for_update(header_key.clone()).await?)?.ok_or_else(corrupt)?;
-    expect_agreement(header, state)?;
     txn.put(
         state_key,
         PersistentValue::PartitionState(PartitionTransition::DrainingSplit {
@@ -596,8 +652,10 @@ pub async fn read_leaf_drain_candidates<T: WriteTxn>(
 /// receiving target's Header and Synopsis once, accumulates the exact counts,
 /// cache epochs, and synopsis expansions in memory, and writes each authority
 /// value back once, so a batch never pays per-entry authority round trips.
-/// The source accepts the move-out in any state; every target must be a
-/// `ReceivingSplit` leaf. Returns the number of moved entries.
+/// The source must be `DrainingSplit` and every target must be a
+/// `ReceivingSplit` leaf: the exact-membership invariant holds only while
+/// movement runs inside the split protocol. Returns the number of moved
+/// entries.
 pub async fn relocate_leaf_entries<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     tree_key: &TreeKey,
@@ -643,6 +701,11 @@ pub async fn relocate_leaf_entries<T: WriteTxn>(
         return Err(Error::new(ErrorKind::Backend));
     };
     let source_header = expect_header(source_value)?.ok_or_else(corrupt)?;
+    // Movement is legal only inside the split protocol: the source must be
+    // draining into exactly these `ReceivingSplit` targets.
+    if source_header.level() != 1 || source_header.state() != PartitionState::DrainingSplit {
+        return Err(corrupt());
+    }
 
     let moved = moves.len();
     for (drain, target) in &moves {
@@ -697,15 +760,14 @@ pub async fn relocate_leaf_entries<T: WriteTxn>(
             };
             expect_synopsis(txn.get_for_update(key).await?)?.ok_or_else(corrupt)?
         };
-        let mut synopsis_changed = false;
+        let original = synopsis.clone();
         for (drain, move_target) in &moves {
             if move_target == &target {
                 header = added_entry(header)?;
-                let before = synopsis.clone();
                 synopsis.expand(manifest, drain.entry.fields())?;
-                synopsis_changed |= synopsis != before;
             }
         }
+        let synopsis_changed = synopsis != original;
         txn.put(
             LogicalKey::Header {
                 index,
@@ -776,7 +838,9 @@ pub async fn read_child_drain_candidates<T: WriteTxn>(
 /// read and written once per partition per batch — but touches neither Record
 /// Location, Vector Record, nor Synopsis (ADR 0014): exact Child Entry
 /// ownership is the coordination point between adjacent-level maintenance.
-/// Every target must be `ReceivingSplit` at the source's level. Returns the
+/// The source must be `DrainingSplit` and every target must be
+/// `ReceivingSplit` at the source's level: the exact-membership invariant
+/// holds only while movement runs inside the split protocol. Returns the
 /// number of moved entries.
 pub async fn relocate_child_entries<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
@@ -822,6 +886,11 @@ pub async fn relocate_child_entries<T: WriteTxn>(
         return Err(Error::new(ErrorKind::Backend));
     };
     let source_header = expect_header(source_value)?.ok_or_else(corrupt)?;
+    // Movement is legal only inside the split protocol: the source must be
+    // draining into exactly these `ReceivingSplit` targets.
+    if source_header.state() != PartitionState::DrainingSplit {
+        return Err(corrupt());
+    }
     for (_, target_header) in &target_headers {
         if target_header.level() != source_header.level() {
             return Err(corrupt());

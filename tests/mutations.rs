@@ -15,7 +15,7 @@ use ktann::storage::backend::{AdmissionBudget, Backend, Capabilities, HardLimits
 use ktann::storage::keys::{LogicalKey, TreeKey};
 use ktann::storage::values::{
     ChildEntry, IndexLifecycle, IndexManifest, PartitionHeader, PartitionState, PartitionSynopsis,
-    PersistentValue, RecordLocation,
+    PartitionTransition, PersistentValue, RecordLocation,
 };
 use ktann::storage::{LogicalRange, ReadLogicalTxn, WriteLogicalTxn, tree_manifest};
 use tokio_util::sync::CancellationToken;
@@ -984,6 +984,18 @@ async fn seed_grown_tree(backend: &SharedBackend, manifest: &IndexManifest, buck
             PersistentValue::PartitionSynopsis(PartitionSynopsis::empty(manifest)),
         )
     };
+    let state = |partition| {
+        (
+            LogicalKey::State {
+                index,
+                tree_key: key.clone(),
+                partition,
+            },
+            PersistentValue::PartitionState(PartitionTransition::Ready {
+                started_at_unix_millis: 0,
+            }),
+        )
+    };
     let edge = |partition, centroid| {
         (
             LogicalKey::ChildEntry {
@@ -999,6 +1011,8 @@ async fn seed_grown_tree(backend: &SharedBackend, manifest: &IndexManifest, buck
         header(2, 2, pk(1)),
         header(1, 0, pk(2)),
         header(1, 0, pk(3)),
+        state(pk(2)),
+        state(pk(3)),
         edge(pk(2), 0.0),
         edge(pk(3), 10.0),
         synopsis(pk(2)),
@@ -1037,9 +1051,10 @@ async fn batched_inserts_share_routing_and_apply_writes_once() {
 
     let counts = backend.inner.operation_counts();
     // One grouped descent for the whole batch: one Tree Manifest read, one
-    // read per visited partition (root plus both leaves), one Child Entry
-    // scan — independent of the batch size.
-    assert_eq!(counts.get, 4, "plain reads: {counts:?}");
+    // batched authority (Header+State) read per visited partition — root plus
+    // both leaves — and one Child Entry scan, independent of the batch size.
+    assert_eq!(counts.get, 1, "plain reads: {counts:?}");
+    assert_eq!(counts.batch_get, 3, "batched authority reads: {counts:?}");
     assert_eq!(counts.scan, 1, "scans: {counts:?}");
     // Every record-group write lands through the single deferred apply; the
     // only remaining write calls are the per-item Header/Synopsis updates.

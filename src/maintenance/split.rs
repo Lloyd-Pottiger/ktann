@@ -188,7 +188,19 @@ pub async fn expose_targets<B: Backend>(
     // One consistent snapshot classifies the source and trains both target
     // centroids without holding KV locks.
     let mut read = begin_read(backend, manifest).await?;
-    let state = read_state(&mut read, tree_key, source).await?;
+    let Some(state) = read_state_opt(&mut read, tree_key, source).await? else {
+        // A completed non-root split removed the source's authority values;
+        // re-driving this step observes the absence and is harmless
+        // (maintenance.md §3). A lone surviving Header is a torn committed
+        // state.
+        if read_header_opt(&mut read, tree_key, source)
+            .await?
+            .is_some()
+        {
+            return Err(Error::new(ErrorKind::Corruption));
+        }
+        return Ok(TargetExposure::SourceAdvanced);
+    };
     let (left, right) = match state {
         PartitionTransition::Splitting { left, right, .. } => (left, right),
         // Advancing proves both targets were exposed.
@@ -276,7 +288,19 @@ pub async fn drain_batch<B: Backend>(
 ) -> Result<DrainStep> {
     // The read phase fixes the batch from one consistent snapshot.
     let mut read = begin_read(backend, manifest).await?;
-    let state = read_state(&mut read, tree_key, source).await?;
+    let Some(state) = read_state_opt(&mut read, tree_key, source).await? else {
+        // A completed non-root split removed the source's authority values;
+        // re-driving this step observes the absence and is harmless
+        // (maintenance.md §3). A lone surviving Header is a torn committed
+        // state.
+        if read_header_opt(&mut read, tree_key, source)
+            .await?
+            .is_some()
+        {
+            return Err(Error::new(ErrorKind::Corruption));
+        }
+        return Ok(DrainStep::SourceAdvanced);
+    };
     let (left, right) = match state {
         PartitionTransition::DrainingSplit { left, right, .. } => (left, right),
         PartitionTransition::Splitting { .. } => return Ok(DrainStep::NotDraining),
@@ -640,24 +664,19 @@ fn nearer_target(
 }
 
 /// Opens one read transaction bound to the Logical Index.
+///
+/// The persisted Active Manifest is validated first so a dropped Logical
+/// Index reports `IndexNotFound`/`IndexDropping` — the same contract as the
+/// write steps — instead of a misleading Corruption from the missing
+/// topology keys.
 async fn begin_read<'b, 'm, B: Backend>(
     backend: &'b B,
     manifest: &'m IndexManifest,
 ) -> Result<ReadLogicalTxn<'m, B::ReadTxn<'b>>> {
     let raw = backend.begin_read().await?;
-    ReadLogicalTxn::for_index(raw, manifest)
-}
-
-/// Reads one partition State from a snapshot, failing closed on a wrong-kind
-/// value.
-async fn read_state<T: crate::storage::backend::ReadOps>(
-    txn: &mut ReadLogicalTxn<'_, T>,
-    tree_key: &TreeKey,
-    partition: PartitionKey,
-) -> Result<PartitionTransition> {
-    read_state_opt(txn, tree_key, partition)
-        .await?
-        .ok_or_else(|| Error::new(ErrorKind::Corruption))
+    let mut txn = ReadLogicalTxn::bootstrap(raw);
+    reads::validate_manifest(&mut txn, manifest).await?;
+    ReadLogicalTxn::for_index(txn.into_raw(), manifest)
 }
 
 /// Reads one partition State that may be absent.

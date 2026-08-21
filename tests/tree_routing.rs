@@ -84,6 +84,23 @@ fn edge_key_at(tree_key: &TreeKey, parent: PartitionKey, child: PartitionKey) ->
     }
 }
 
+fn state_key_at(tree_key: &TreeKey, partition: PartitionKey) -> LogicalKey {
+    LogicalKey::State {
+        index: id(7),
+        tree_key: tree_key.clone(),
+        partition,
+    }
+}
+
+/// The State value of a stable partition. Every fixture `header` is paired
+/// with one because routing validates both authority values of every visited
+/// partition against each other.
+fn ready_state() -> PersistentValue {
+    PersistentValue::PartitionState(PartitionTransition::Ready {
+        started_at_unix_millis: 0,
+    })
+}
+
 fn header(level: u32, count: u32) -> PersistentValue {
     PersistentValue::PartitionHeader(
         PartitionHeader::new(level, count, 0, PartitionState::Ready).expect("header"),
@@ -134,6 +151,8 @@ async fn seed_grown_root(backend: &DeterministicBackend, manifest: &IndexManifes
             (header_key_at(key, pk(1)), header(2, 2)),
             (header_key_at(key, pk(2)), header(1, 0)),
             (header_key_at(key, pk(3)), header(1, 0)),
+            (state_key_at(key, pk(2)), ready_state()),
+            (state_key_at(key, pk(3)), ready_state()),
             (edge_key_at(key, pk(1), pk(2)), edge(pk(2), 0.0)),
             (edge_key_at(key, pk(1), pk(3)), edge(pk(3), 10.0)),
         ],
@@ -163,6 +182,10 @@ async fn move_edge_under_new_parent(
         (header_key_at(key, pk(6)), header(2, 2)),
         (header_key_at(key, pk(5)), header(1, 0)),
         (header_key_at(key, pk(7)), header(1, 0)),
+        (state_key_at(key, pk(4)), ready_state()),
+        (state_key_at(key, pk(5)), ready_state()),
+        (state_key_at(key, pk(6)), ready_state()),
+        (state_key_at(key, pk(7)), ready_state()),
         (edge_key_at(key, pk(1), pk(4)), edge(pk(4), 1.0)),
         (edge_key_at(key, pk(1), pk(6)), edge(pk(6), 10.0)),
         (edge_key_at(key, pk(4), pk(2)), edge(pk(2), 0.0)),
@@ -326,6 +349,12 @@ async fn descent_decrements_levels_through_ordinary_internal_partitions() {
             (header_key_at(&key, pk(5)), header(1, 0)),
             (header_key_at(&key, pk(6)), header(1, 0)),
             (header_key_at(&key, pk(7)), header(1, 0)),
+            (state_key_at(&key, pk(2)), ready_state()),
+            (state_key_at(&key, pk(3)), ready_state()),
+            (state_key_at(&key, pk(4)), ready_state()),
+            (state_key_at(&key, pk(5)), ready_state()),
+            (state_key_at(&key, pk(6)), ready_state()),
+            (state_key_at(&key, pk(7)), ready_state()),
             (edge_key_at(&key, pk(1), pk(2)), edge(pk(2), 0.0)),
             (edge_key_at(&key, pk(1), pk(3)), edge(pk(3), 10.0)),
             (edge_key_at(&key, pk(2), pk(4)), edge(pk(4), 0.0)),
@@ -482,6 +511,8 @@ async fn a_child_at_the_wrong_level_is_corruption() {
             // descended into; the exact one-level step is violated.
             (header_key_at(&key, pk(2)), header(2, 0)),
             (header_key_at(&key, pk(3)), header(1, 0)),
+            (state_key_at(&key, pk(2)), ready_state()),
+            (state_key_at(&key, pk(3)), ready_state()),
             (edge_key_at(&key, pk(1), pk(2)), edge(pk(2), 0.0)),
             (edge_key_at(&key, pk(1), pk(3)), edge(pk(3), 10.0)),
         ],
@@ -506,6 +537,7 @@ async fn a_self_loop_is_corruption_instead_of_a_cycle() {
         vec![
             (header_key_at(&key, pk(1)), header(2, 2)),
             (header_key_at(&key, pk(2)), header(1, 0)),
+            (state_key_at(&key, pk(2)), ready_state()),
             // The root references itself; descending would revisit PK 1.
             (edge_key_at(&key, pk(1), pk(1)), edge(pk(1), 0.0)),
             (edge_key_at(&key, pk(1), pk(2)), edge(pk(2), 10.0)),
@@ -534,6 +566,7 @@ async fn an_internal_partition_must_match_its_exact_header_count() {
         vec![
             (header_key_at(&one_child, pk(1)), header(2, 1)),
             (header_key_at(&one_child, pk(2)), header(1, 0)),
+            (state_key_at(&one_child, pk(2)), ready_state()),
             (edge_key_at(&one_child, pk(1), pk(2)), edge(pk(2), 0.0)),
         ],
     )
@@ -605,12 +638,22 @@ async fn a_splitting_leaf_root_still_accepts_writes() {
     write_topology(
         &backend,
         &manifest,
-        vec![(
-            header_key_at(&key, pk(1)),
-            PersistentValue::PartitionHeader(
-                PartitionHeader::new(1, 0, 0, PartitionState::Splitting).expect("header"),
+        vec![
+            (
+                header_key_at(&key, pk(1)),
+                PersistentValue::PartitionHeader(
+                    PartitionHeader::new(1, 0, 0, PartitionState::Splitting).expect("header"),
+                ),
             ),
-        )],
+            (
+                state_key_at(&key, pk(1)),
+                PersistentValue::PartitionState(PartitionTransition::Splitting {
+                    left: pk(2),
+                    right: pk(3),
+                    started_at_unix_millis: 0,
+                }),
+            ),
+        ],
     )
     .await;
 
@@ -647,12 +690,20 @@ async fn a_merging_partition_is_corruption_until_merge_exists() {
     write_topology(
         &backend,
         &manifest,
-        vec![(
-            header_key_at(&key, pk(1)),
-            PersistentValue::PartitionHeader(
-                PartitionHeader::new(1, 0, 0, PartitionState::Merging).expect("header"),
+        vec![
+            (
+                header_key_at(&key, pk(1)),
+                PersistentValue::PartitionHeader(
+                    PartitionHeader::new(1, 0, 0, PartitionState::Merging).expect("header"),
+                ),
             ),
-        )],
+            (
+                state_key_at(&key, pk(1)),
+                PersistentValue::PartitionState(PartitionTransition::Merging {
+                    started_at_unix_millis: 0,
+                }),
+            ),
+        ],
     )
     .await;
 
@@ -692,6 +743,78 @@ async fn a_draining_header_without_matching_state_is_corruption() {
         .await
         .expect_err("header/state disagreement");
     assert_eq!(error.kind(), ErrorKind::Corruption);
+}
+
+#[tokio::test]
+async fn a_ready_header_with_a_draining_state_is_corruption() {
+    let backend = DeterministicBackend::default();
+    let manifest = manifest();
+    let key = tree_key(1);
+    create_committed_tree(&backend, &manifest, &key).await;
+
+    // The Header claims Ready but the State value is mid-split: every
+    // descent hop validates the pair against each other, whatever the
+    // Header's discriminator would imply on its own.
+    write_topology(
+        &backend,
+        &manifest,
+        vec![(
+            state_key_at(&key, pk(1)),
+            PersistentValue::PartitionState(PartitionTransition::DrainingSplit {
+                left: pk(2),
+                right: pk(3),
+                started_at_unix_millis: 0,
+            }),
+        )],
+    )
+    .await;
+
+    let error = route_leaf(&mut read_txn(&backend, &manifest).await, &key, &[1.0])
+        .await
+        .expect_err("header/state disagreement");
+    assert_eq!(error.kind(), ErrorKind::Corruption);
+}
+
+#[tokio::test]
+async fn a_receiving_split_root_is_corruption() {
+    let backend = DeterministicBackend::default();
+    let manifest = manifest();
+    let key = tree_key(1);
+    create_committed_tree(&backend, &manifest, &key).await;
+
+    // The root is the one searchable entry point: it is never a split target.
+    write_topology(
+        &backend,
+        &manifest,
+        vec![
+            (
+                header_key_at(&key, pk(1)),
+                PersistentValue::PartitionHeader(
+                    PartitionHeader::new(1, 0, 0, PartitionState::ReceivingSplit).expect("header"),
+                ),
+            ),
+            (
+                state_key_at(&key, pk(1)),
+                PersistentValue::PartitionState(PartitionTransition::ReceivingSplit {
+                    source: pk(9),
+                    started_at_unix_millis: 0,
+                }),
+            ),
+        ],
+    )
+    .await;
+
+    let error = route_leaf(&mut read_txn(&backend, &manifest).await, &key, &[1.0])
+        .await
+        .expect_err("receiving root on the read path");
+    assert_eq!(error.kind(), ErrorKind::Corruption);
+
+    let mut txn = write_txn(&backend, &manifest).await;
+    let error = route_leaf_for_write(&mut txn, &key, &[1.0], 600)
+        .await
+        .expect_err("receiving root on the write path");
+    assert_eq!(error.kind(), ErrorKind::Corruption);
+    txn.rollback().await;
 }
 
 #[tokio::test]

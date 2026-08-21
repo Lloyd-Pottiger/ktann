@@ -21,7 +21,7 @@ use ktann::storage::backend::{Backend, Capabilities, ScanLimits, WriteTxn};
 use ktann::storage::keys::{self, LogicalKey, TreeKey};
 use ktann::storage::values::{
     ChildEntry, IndexManifest, LeafEntry, PartitionCentroid, PartitionHeader, PartitionState,
-    PartitionTransition, PersistentValue, RecordLocation,
+    PartitionSynopsis, PartitionTransition, PersistentValue, RecordLocation,
 };
 use ktann::storage::{LogicalRange, ReadLogicalTxn, WriteLogicalTxn, topology, tree_manifest};
 
@@ -175,6 +175,28 @@ async fn centroid_of(
         Some(PersistentValue::PartitionCentroid(centroid)) => Some(centroid),
         None => None,
         other => panic!("wrong centroid kind: {other:?}"),
+    }
+}
+
+async fn synopsis_of(
+    backend: &SharedBackend,
+    manifest: &IndexManifest,
+    key: &TreeKey,
+    partition: PartitionKey,
+) -> Option<PartitionSynopsis> {
+    match read_txn(backend, manifest)
+        .await
+        .get(LogicalKey::Synopsis {
+            index: manifest.logical_index_id(),
+            tree_key: key.clone(),
+            partition,
+        })
+        .await
+        .expect("read synopsis")
+    {
+        Some(PersistentValue::PartitionSynopsis(synopsis)) => Some(synopsis),
+        None => None,
+        other => panic!("wrong synopsis kind: {other:?}"),
     }
 }
 
@@ -2411,4 +2433,450 @@ async fn all_partitions(
         }
     }
     seen.into_iter().collect()
+}
+
+// ---------------------------------------------------------------------------
+// Recovery and fail-closed regressions.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn steps_on_a_completed_non_root_split_are_harmless_noops() {
+    let backend = backend();
+    let runtime = make_runtime(backend.clone());
+    let index = runtime
+        .create_index("index", config())
+        .await
+        .expect("create");
+    let manifest = read_manifest(&backend, index.logical_index_id()).await;
+    let key = tree_key(1);
+    seed_completable_non_root_split(&backend, &manifest, &key).await;
+
+    // Complete the split: both targets promote and the source is removed.
+    let mut txn = write_txn(&backend, &manifest).await;
+    let completed = topology::finalize_split(
+        &mut txn,
+        &key,
+        pk(2),
+        300,
+        topology::SourceRemoval::PointDeletes,
+    )
+    .await
+    .expect("finalize op");
+    assert_eq!(completed, topology::SplitCompletion::Completed);
+    txn.commit().await.expect("commit finalize");
+    assert!(state_of(&backend, &manifest, &key, pk(2)).await.is_none());
+    assert!(header_of(&backend, &manifest, &key, pk(2)).await.is_none());
+
+    // A competing or recovering worker that re-drives any step of the
+    // finished split observes the removal and gets a graceful outcome, never
+    // a spurious Corruption (maintenance.md §3).
+    let start = split::begin_split(&backend, &manifest, &key, pk(2), 400, &retry())
+        .await
+        .expect("begin");
+    assert_eq!(start, topology::SplitStart::NotEligible);
+    let exposure = split::expose_targets(&backend, &manifest, &key, pk(2), 400, &retry())
+        .await
+        .expect("expose");
+    assert_eq!(exposure, split::TargetExposure::SourceAdvanced);
+    let drained = split::drain_batch(&backend, &manifest, &key, pk(2), &retry())
+        .await
+        .expect("drain");
+    assert_eq!(drained, split::DrainStep::SourceAdvanced);
+    let completion = split::complete_split(&backend, &manifest, &key, pk(2), 400, &retry())
+        .await
+        .expect("complete");
+    assert_eq!(completion, topology::SplitCompletion::Completed);
+    let advance = split::advance(&backend, &manifest, &key, pk(2), 400, &retry())
+        .await
+        .expect("advance");
+    assert_eq!(advance, Advance::Idle);
+
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn steps_on_a_dropped_index_report_the_lifecycle_error() {
+    let backend = backend();
+    let runtime = make_runtime(backend.clone());
+    let index = runtime
+        .create_index("index", config())
+        .await
+        .expect("create");
+    let manifest = read_manifest(&backend, index.logical_index_id()).await;
+    let key = tree_key(1);
+    runtime.drop_index("index").await.expect("drop");
+
+    // The read phase validates the persisted Manifest like every other
+    // entry point, instead of reporting the missing topology keys as
+    // Corruption.
+    let error = split::advance(&backend, &manifest, &key, pk(1), 1_000, &retry())
+        .await
+        .expect_err("a dropped index rejects maintenance");
+    assert_eq!(error.kind(), ErrorKind::IndexNotFound);
+    let error = split::drain_batch(&backend, &manifest, &key, pk(1), &retry())
+        .await
+        .expect_err("a dropped index rejects draining");
+    assert_eq!(error.kind(), ErrorKind::IndexNotFound);
+
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drain_moves_bounded_batches_and_refreshes_target_authority() {
+    let backend = backend();
+    let runtime = make_runtime(backend.clone());
+    let index = runtime
+        .create_index("index", config())
+        .await
+        .expect("create");
+    let manifest = read_manifest(&backend, index.logical_index_id()).await;
+    let key = tree_key(1);
+    let records = seed_records(&index, 1, 10).await;
+
+    split::begin_split(&backend, &manifest, &key, pk(1), 1_000, &retry())
+        .await
+        .expect("begin");
+    split::expose_targets(&backend, &manifest, &key, pk(1), 1_100, &retry())
+        .await
+        .expect("expose");
+    split::advance_to_draining(&backend, &manifest, &key, pk(1), 1_200, &retry())
+        .await
+        .expect("advance");
+
+    // Newly exposed targets start empty with a zero epoch.
+    for target in [pk(2), pk(3)] {
+        let header = header_of(&backend, &manifest, &key, target)
+            .await
+            .expect("target header");
+        assert_eq!(header.entry_count(), 0);
+        assert_eq!(header.cache_epoch(), 0);
+    }
+
+    // Ten entries drain in two bounded batches: eight, then the remaining
+    // two, with the exact count driving completion.
+    let first = split::drain_batch(&backend, &manifest, &key, pk(1), &retry())
+        .await
+        .expect("first batch");
+    assert_eq!(
+        first,
+        split::DrainStep::Drained {
+            moved: 8,
+            remaining: 2
+        }
+    );
+    let second = split::drain_batch(&backend, &manifest, &key, pk(1), &retry())
+        .await
+        .expect("second batch");
+    assert_eq!(
+        second,
+        split::DrainStep::Drained {
+            moved: 2,
+            remaining: 0
+        }
+    );
+
+    // Each target's exact count, cache epoch, and synopsis reflect exactly
+    // the entries it received: the epoch bumped once per moved entry and the
+    // synopsis expanded monotonically from the canonical empty value.
+    for target in [pk(2), pk(3)] {
+        let entries = scan_leaf_entries(&backend, &manifest, &key, target).await;
+        let header = header_of(&backend, &manifest, &key, target)
+            .await
+            .expect("target header");
+        assert_eq!(header.entry_count() as usize, entries.len());
+        assert_eq!(
+            header.cache_epoch(),
+            u64::from(header.entry_count()),
+            "one epoch bump per moved entry"
+        );
+        let mut expected = PartitionSynopsis::empty(&manifest);
+        for entry in &entries {
+            expected.expand(&manifest, entry.fields()).expect("expand");
+        }
+        assert_eq!(
+            synopsis_of(&backend, &manifest, &key, target).await,
+            Some(expected),
+            "target synopsis is exactly the moved entries' expansion"
+        );
+    }
+
+    let completion = split::complete_split(&backend, &manifest, &key, pk(1), 1_300, &retry())
+        .await
+        .expect("complete");
+    assert_eq!(completion, topology::SplitCompletion::Completed);
+    assert_searchable(&backend, &manifest, &key, &records).await;
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drain_fails_closed_when_the_count_disagrees_with_the_entries() {
+    let backend = backend();
+    let runtime = make_runtime(backend.clone());
+    let index = runtime
+        .create_index("index", config())
+        .await
+        .expect("create");
+    let manifest = read_manifest(&backend, index.logical_index_id()).await;
+    let key = tree_key(1);
+
+    // A DrainingSplit leaf root whose exact count claims one entry while the
+    // entry range is empty: within one snapshot the two must agree.
+    let mut txn = write_txn(&backend, &manifest).await;
+    tree_manifest::create_tree(&mut txn, &key, 100)
+        .await
+        .expect("create tree");
+    txn.commit().await.expect("commit tree");
+    let mut txn = write_txn(&backend, &manifest).await;
+    let index_id = manifest.logical_index_id();
+    txn.put(
+        LogicalKey::Header {
+            index: index_id,
+            tree_key: key.clone(),
+            partition: pk(1),
+        },
+        PersistentValue::PartitionHeader(
+            PartitionHeader::new(1, 1, 0, PartitionState::DrainingSplit).expect("header"),
+        ),
+    )
+    .await
+    .expect("put source header");
+    txn.put(
+        LogicalKey::State {
+            index: index_id,
+            tree_key: key.clone(),
+            partition: pk(1),
+        },
+        PersistentValue::PartitionState(PartitionTransition::DrainingSplit {
+            left: pk(2),
+            right: pk(3),
+            started_at_unix_millis: 200,
+        }),
+    )
+    .await
+    .expect("put source state");
+    for target in [pk(2), pk(3)] {
+        txn.put(
+            LogicalKey::Header {
+                index: index_id,
+                tree_key: key.clone(),
+                partition: target,
+            },
+            PersistentValue::PartitionHeader(
+                PartitionHeader::new(1, 0, 0, PartitionState::ReceivingSplit).expect("header"),
+            ),
+        )
+        .await
+        .expect("put target header");
+        txn.put(
+            LogicalKey::State {
+                index: index_id,
+                tree_key: key.clone(),
+                partition: target,
+            },
+            PersistentValue::PartitionState(PartitionTransition::ReceivingSplit {
+                source: pk(1),
+                started_at_unix_millis: 200,
+            }),
+        )
+        .await
+        .expect("put target state");
+        txn.put(
+            LogicalKey::Centroid {
+                index: index_id,
+                tree_key: key.clone(),
+                partition: target,
+            },
+            PersistentValue::PartitionCentroid(PartitionCentroid::new(vec![1.0])),
+        )
+        .await
+        .expect("put target centroid");
+        txn.put(
+            LogicalKey::Synopsis {
+                index: index_id,
+                tree_key: key.clone(),
+                partition: target,
+            },
+            PersistentValue::PartitionSynopsis(PartitionSynopsis::empty(&manifest)),
+        )
+        .await
+        .expect("put target synopsis");
+    }
+    txn.commit().await.expect("commit fixture");
+
+    let error = split::drain_batch(&backend, &manifest, &key, pk(1), &retry())
+        .await
+        .expect_err("a positive count with an empty entry range is corruption");
+    assert_eq!(error.kind(), ErrorKind::Corruption);
+
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_root_finalize_recovers_from_an_unknown_commit_outcome() {
+    for (backend, removal) in [
+        (backend(), topology::SourceRemoval::PointDeletes),
+        (
+            backend_with_clear(),
+            topology::SourceRemoval::TransactionalClear,
+        ),
+    ] {
+        let runtime = make_runtime(backend.clone());
+        let index = runtime
+            .create_index("index", config())
+            .await
+            .expect("create");
+        let manifest = read_manifest(&backend, index.logical_index_id()).await;
+        let key = tree_key(1);
+        seed_completable_non_root_split(&backend, &manifest, &key).await;
+
+        // Finalize under an injected applied-but-unknown commit outcome.
+        backend
+            .inner()
+            .push_fault(CommitFault::UnknownApplied)
+            .expect("push fault");
+        let mut txn = write_txn(&backend, &manifest).await;
+        let completed = topology::finalize_split(&mut txn, &key, pk(2), 300, removal)
+            .await
+            .expect("finalize op");
+        assert_eq!(completed, topology::SplitCompletion::Completed);
+        let error = txn.commit().await.expect_err("injected fault");
+        assert_eq!(error.kind(), ErrorKind::CommitOutcomeUnknown);
+
+        // Re-driving observes the removed source and reports completion
+        // instead of failing or repeating the topology switch.
+        let mut retry_txn = write_txn(&backend, &manifest).await;
+        let redriven = topology::finalize_split(&mut retry_txn, &key, pk(2), 301, removal)
+            .await
+            .expect("redriven finalize");
+        assert_eq!(redriven, topology::SplitCompletion::Completed);
+        retry_txn.commit().await.expect("retry commits");
+
+        // The switched topology stands: both targets are Ready and the
+        // source is gone. (Their incoming edges are installed at target
+        // creation, which this synthetic fixture omits.)
+        for target in [pk(4), pk(5)] {
+            let header = header_of(&backend, &manifest, &key, target)
+                .await
+                .expect("target header");
+            assert_eq!(header.state(), PartitionState::Ready);
+        }
+        assert!(header_of(&backend, &manifest, &key, pk(2)).await.is_none());
+        runtime.shutdown().await.expect("shutdown");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn advance_fails_closed_on_a_torn_target_without_committing() {
+    let backend = backend();
+    let runtime = make_runtime(backend.clone());
+    let index = runtime
+        .create_index("index", config())
+        .await
+        .expect("create");
+    let manifest = read_manifest(&backend, index.logical_index_id()).await;
+    let key = tree_key(1);
+
+    // A Splitting leaf root whose left target carries only its State: Header
+    // and Centroid are missing — a torn committed state.
+    let mut txn = write_txn(&backend, &manifest).await;
+    tree_manifest::create_tree(&mut txn, &key, 100)
+        .await
+        .expect("create tree");
+    txn.commit().await.expect("commit tree");
+    let mut txn = write_txn(&backend, &manifest).await;
+    let index_id = manifest.logical_index_id();
+    txn.put(
+        LogicalKey::Header {
+            index: index_id,
+            tree_key: key.clone(),
+            partition: pk(1),
+        },
+        PersistentValue::PartitionHeader(
+            PartitionHeader::new(1, 6, 0, PartitionState::Splitting).expect("header"),
+        ),
+    )
+    .await
+    .expect("put source header");
+    txn.put(
+        LogicalKey::State {
+            index: index_id,
+            tree_key: key.clone(),
+            partition: pk(1),
+        },
+        PersistentValue::PartitionState(PartitionTransition::Splitting {
+            left: pk(2),
+            right: pk(3),
+            started_at_unix_millis: 200,
+        }),
+    )
+    .await
+    .expect("put source state");
+    txn.put(
+        LogicalKey::State {
+            index: index_id,
+            tree_key: key.clone(),
+            partition: pk(2),
+        },
+        PersistentValue::PartitionState(PartitionTransition::ReceivingSplit {
+            source: pk(1),
+            started_at_unix_millis: 200,
+        }),
+    )
+    .await
+    .expect("put torn target state");
+    for (key_part, value) in [
+        (
+            LogicalKey::Header {
+                index: index_id,
+                tree_key: key.clone(),
+                partition: pk(3),
+            },
+            PersistentValue::PartitionHeader(
+                PartitionHeader::new(1, 0, 0, PartitionState::ReceivingSplit).expect("header"),
+            ),
+        ),
+        (
+            LogicalKey::State {
+                index: index_id,
+                tree_key: key.clone(),
+                partition: pk(3),
+            },
+            PersistentValue::PartitionState(PartitionTransition::ReceivingSplit {
+                source: pk(1),
+                started_at_unix_millis: 200,
+            }),
+        ),
+        (
+            LogicalKey::Centroid {
+                index: index_id,
+                tree_key: key.clone(),
+                partition: pk(3),
+            },
+            PersistentValue::PartitionCentroid(PartitionCentroid::new(vec![1.0])),
+        ),
+    ] {
+        txn.put(key_part, value).await.expect("put target");
+    }
+    txn.commit().await.expect("commit fixture");
+
+    // The transition refuses to commit the source into a DrainingSplit that
+    // drain and completion could only wedge behind...
+    let mut txn = write_txn(&backend, &manifest).await;
+    let error = topology::advance_to_draining(&mut txn, &key, pk(1), 300)
+        .await
+        .expect_err("a torn target fails closed");
+    assert_eq!(error.kind(), ErrorKind::Corruption);
+    txn.rollback().await;
+
+    // ...and the source stays Splitting and therefore fully writable.
+    assert_eq!(
+        state_of(&backend, &manifest, &key, pk(1)).await,
+        Some(PartitionTransition::Splitting {
+            left: pk(2),
+            right: pk(3),
+            started_at_unix_millis: 200,
+        })
+    );
+
+    runtime.shutdown().await.expect("shutdown");
 }

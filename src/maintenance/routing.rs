@@ -87,7 +87,7 @@ pub struct Route {
 }
 
 /// The incoming topology reference a write route update-protects.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum Incoming {
     /// The leaf's Child Entry at the observed parent.
     ParentEdge,
@@ -211,9 +211,11 @@ pub(crate) async fn route_leaves_for_write_preprocessed<T: WriteTxn>(
     let routes = descend_grouped(txn, manifest, kernel, tree_key, root, routings).await?;
     let mut validated = BTreeSet::new();
     for route in &routes {
-        // One snapshot gives each leaf exactly one incoming reference, so the
-        // leaf alone identifies the route to validate.
-        if validated.insert(route.leaf()) {
+        // One snapshot gives each leaf exactly one incoming reference, but a
+        // split target is reachable both through its own parent edge and
+        // through a draining source's redirect; each distinct reference is
+        // validated once.
+        if validated.insert((route.leaf(), route.incoming)) {
             validate_for_write(txn, manifest, tree_key, route).await?;
         }
     }
@@ -298,8 +300,18 @@ async fn descend<R: RoutingReader>(
     let mut parent = None;
     let mut expected_level = None;
     loop {
-        let header = read_header(reader, manifest, tree_key, partition).await?;
+        let (header, state) = read_authority(reader, manifest, tree_key, partition).await?;
         check_level(&header, expected_level)?;
+        // The root is the one searchable entry point: it is never a split
+        // target and never merges, matching the search traversal contract.
+        if partition == root
+            && matches!(
+                state,
+                PartitionTransition::ReceivingSplit { .. } | PartitionTransition::Merging { .. }
+            )
+        {
+            return Err(Error::new(ErrorKind::Corruption));
+        }
         // A write-accepting leaf — Ready, Splitting, or ReceivingSplit — is
         // the descent's end.
         if header.level() == 1 && header.state().accepts_writes() {
@@ -310,8 +322,8 @@ async fn descend<R: RoutingReader>(
                 incoming: Incoming::ParentEdge,
             });
         }
-        match header.state() {
-            PartitionState::Ready | PartitionState::Splitting => {
+        match state {
+            PartitionTransition::Ready { .. } | PartitionTransition::Splitting { .. } => {
                 // A Splitting source still holds its complete child set; its
                 // empty targets are correctly skipped until draining starts.
                 expected_level = Some(header.level() - 1);
@@ -322,14 +334,10 @@ async fn descend<R: RoutingReader>(
                 parent = Some(partition);
                 partition = child;
             }
-            PartitionState::ReceivingSplit => {
+            PartitionTransition::ReceivingSplit { source, .. } => {
                 // An internal target is never descended alone: its source
                 // still owns the unmigrated children, so the split family is
                 // resolved through the persisted source reference.
-                let source = match read_state(reader, manifest, tree_key, partition).await? {
-                    PartitionTransition::ReceivingSplit { source, .. } => source,
-                    _ => return Err(Error::new(ErrorKind::Corruption)),
-                };
                 match read_state(reader, manifest, tree_key, source).await? {
                     PartitionTransition::Splitting { .. } => {
                         // The source still holds every entry; the target is
@@ -362,11 +370,7 @@ async fn descend<R: RoutingReader>(
                     _ => return Err(Error::new(ErrorKind::Corruption)),
                 }
             }
-            PartitionState::DrainingSplit => {
-                let (left, right) = match read_state(reader, manifest, tree_key, partition).await? {
-                    PartitionTransition::DrainingSplit { left, right, .. } => (left, right),
-                    _ => return Err(Error::new(ErrorKind::Corruption)),
-                };
+            PartitionTransition::DrainingSplit { left, right, .. } => {
                 if header.level() == 1 {
                     // A draining leaf accepts no writes: redirect to the
                     // nearer persisted target. The target shares the source's
@@ -437,8 +441,18 @@ async fn descend_grouped<T: WriteTxn>(
         (0..routings.len()).collect::<Vec<usize>>(),
     )];
     while let Some((partition, parent, expected_level, members)) = pending.pop() {
-        let header = read_header(txn, manifest, tree_key, partition).await?;
+        let (header, state) = read_authority(txn, manifest, tree_key, partition).await?;
         check_level(&header, expected_level)?;
+        // The root is the one searchable entry point: it is never a split
+        // target and never merges, matching the search traversal contract.
+        if partition == root
+            && matches!(
+                state,
+                PartitionTransition::ReceivingSplit { .. } | PartitionTransition::Merging { .. }
+            )
+        {
+            return Err(Error::new(ErrorKind::Corruption));
+        }
         if header.level() == 1 && header.state().accepts_writes() {
             for member in members {
                 routes[member] = Some(Route {
@@ -453,15 +467,11 @@ async fn descend_grouped<T: WriteTxn>(
         // The candidate child bodies for this hop: the partition itself for
         // stable or splitting descent, or its whole draining split family.
         let mut bodies: Vec<(PartitionKey, PartitionHeader)> = Vec::new();
-        match header.state() {
-            PartitionState::Ready | PartitionState::Splitting => {
+        match state {
+            PartitionTransition::Ready { .. } | PartitionTransition::Splitting { .. } => {
                 bodies.push((partition, header));
             }
-            PartitionState::ReceivingSplit => {
-                let source = match read_state(txn, manifest, tree_key, partition).await? {
-                    PartitionTransition::ReceivingSplit { source, .. } => source,
-                    _ => return Err(Error::new(ErrorKind::Corruption)),
-                };
+            PartitionTransition::ReceivingSplit { source, .. } => {
                 match read_state(txn, manifest, tree_key, source).await? {
                     PartitionTransition::Splitting { .. } => {
                         // The source still holds every entry; requeue the
@@ -487,11 +497,7 @@ async fn descend_grouped<T: WriteTxn>(
                     _ => return Err(Error::new(ErrorKind::Corruption)),
                 }
             }
-            PartitionState::DrainingSplit => {
-                let (left, right) = match read_state(txn, manifest, tree_key, partition).await? {
-                    PartitionTransition::DrainingSplit { left, right, .. } => (left, right),
-                    _ => return Err(Error::new(ErrorKind::Corruption)),
-                };
+            PartitionTransition::DrainingSplit { left, right, .. } => {
                 if header.level() == 1 {
                     // A draining leaf accepts no writes: each member redirects
                     // to its nearer persisted target, sharing the source's
@@ -612,6 +618,46 @@ async fn read_header<R: RoutingReader>(
     // is unreachable; a missing Header on a referenced partition is Corruption
     // either way.
     expect_header(reader.get(key).await?)?.ok_or_else(|| Error::new(ErrorKind::Corruption))
+}
+
+/// Reads one visited partition's Header and State in one batch, failing
+/// closed when either is missing, of the wrong kind, or in disagreement.
+///
+/// Every reachable partition carries both authority values in every committed
+/// state: creation installs them together, and completion removes them
+/// together with the partition's last incoming reference.
+async fn read_authority<R: RoutingReader>(
+    reader: &mut R,
+    manifest: &IndexManifest,
+    tree_key: &TreeKey,
+    partition: PartitionKey,
+) -> Result<(PartitionHeader, PartitionTransition)> {
+    let index = manifest.logical_index_id();
+    let mut values = reader
+        .batch_get(vec![
+            LogicalKey::Header {
+                index,
+                tree_key: tree_key.clone(),
+                partition,
+            },
+            LogicalKey::State {
+                index,
+                tree_key: tree_key.clone(),
+                partition,
+            },
+        ])
+        .await?
+        .into_iter();
+    let (Some(header_value), Some(state_value)) = (values.next(), values.next()) else {
+        // The typed batch read returns exactly one value per input key.
+        return Err(Error::new(ErrorKind::Backend));
+    };
+    let header = expect_header(header_value)?.ok_or_else(|| Error::new(ErrorKind::Corruption))?;
+    let state = expect_state(state_value)?.ok_or_else(|| Error::new(ErrorKind::Corruption))?;
+    if header.state() != state.state() {
+        return Err(Error::new(ErrorKind::Corruption));
+    }
+    Ok((header, state))
 }
 
 /// Reads one partition State, failing closed when a routed-to partition has
@@ -956,6 +1002,10 @@ trait RoutingReader {
         &mut self,
         key: LogicalKey,
     ) -> impl Future<Output = Result<Option<PersistentValue>>> + Send;
+    fn batch_get(
+        &mut self,
+        keys: Vec<LogicalKey>,
+    ) -> impl Future<Output = Result<Vec<Option<PersistentValue>>>> + Send;
     fn scan(
         &mut self,
         range: &LogicalRange,
@@ -970,6 +1020,13 @@ impl<T: ReadOps> RoutingReader for ReadLogicalTxn<'_, T> {
         key: LogicalKey,
     ) -> impl Future<Output = Result<Option<PersistentValue>>> + Send {
         ReadLogicalTxn::get(self, key)
+    }
+
+    fn batch_get(
+        &mut self,
+        keys: Vec<LogicalKey>,
+    ) -> impl Future<Output = Result<Vec<Option<PersistentValue>>>> + Send {
+        ReadLogicalTxn::batch_get(self, keys)
     }
 
     fn scan(
@@ -988,6 +1045,13 @@ impl<T: WriteTxn> RoutingReader for WriteLogicalTxn<'_, T> {
         key: LogicalKey,
     ) -> impl Future<Output = Result<Option<PersistentValue>>> + Send {
         WriteLogicalTxn::get(self, key)
+    }
+
+    fn batch_get(
+        &mut self,
+        keys: Vec<LogicalKey>,
+    ) -> impl Future<Output = Result<Vec<Option<PersistentValue>>>> + Send {
+        WriteLogicalTxn::batch_get(self, keys)
     }
 
     fn scan(

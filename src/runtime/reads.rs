@@ -62,7 +62,7 @@ pub(crate) async fn batch_get_records<B: Backend>(
 }
 
 /// Validates the persisted Manifest of the opened handle in one snapshot.
-async fn validate_manifest<T: ReadOps>(
+pub(crate) async fn validate_manifest<T: ReadOps>(
     txn: &mut ReadLogicalTxn<'_, T>,
     handle: &IndexManifest,
 ) -> Result<IndexManifest> {
