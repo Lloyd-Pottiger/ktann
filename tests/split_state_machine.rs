@@ -112,6 +112,16 @@ async fn write_txn<'b, 'm>(
     .expect("bind manifest")
 }
 
+/// Installs the Tree Manifest and initial leaf root so fixtures can grow the
+/// root shape from a committed empty root.
+async fn create_committed_tree(backend: &SharedBackend, manifest: &IndexManifest, key: &TreeKey) {
+    let mut txn = write_txn(backend, manifest).await;
+    tree_manifest::create_tree(&mut txn, key, 100)
+        .await
+        .expect("create tree");
+    txn.commit().await.expect("commit tree");
+}
+
 async fn header_of(
     backend: &SharedBackend,
     manifest: &IndexManifest,
@@ -2620,12 +2630,10 @@ async fn drain_fails_closed_when_the_count_disagrees_with_the_entries() {
     let key = tree_key(1);
 
     // A DrainingSplit leaf root whose exact count claims one entry while the
-    // entry range is empty: within one snapshot the two must agree.
-    let mut txn = write_txn(&backend, &manifest).await;
-    tree_manifest::create_tree(&mut txn, &key, 100)
-        .await
-        .expect("create tree");
-    txn.commit().await.expect("commit tree");
+    // entry range is empty: within one snapshot the two must agree. The
+    // drain read phase fails before any target key is read, so the fixture
+    // needs only the source's authority pair.
+    create_committed_tree(&backend, &manifest, &key).await;
     let mut txn = write_txn(&backend, &manifest).await;
     let index_id = manifest.logical_index_id();
     txn.put(
@@ -2654,53 +2662,6 @@ async fn drain_fails_closed_when_the_count_disagrees_with_the_entries() {
     )
     .await
     .expect("put source state");
-    for target in [pk(2), pk(3)] {
-        txn.put(
-            LogicalKey::Header {
-                index: index_id,
-                tree_key: key.clone(),
-                partition: target,
-            },
-            PersistentValue::PartitionHeader(
-                PartitionHeader::new(1, 0, 0, PartitionState::ReceivingSplit).expect("header"),
-            ),
-        )
-        .await
-        .expect("put target header");
-        txn.put(
-            LogicalKey::State {
-                index: index_id,
-                tree_key: key.clone(),
-                partition: target,
-            },
-            PersistentValue::PartitionState(PartitionTransition::ReceivingSplit {
-                source: pk(1),
-                started_at_unix_millis: 200,
-            }),
-        )
-        .await
-        .expect("put target state");
-        txn.put(
-            LogicalKey::Centroid {
-                index: index_id,
-                tree_key: key.clone(),
-                partition: target,
-            },
-            PersistentValue::PartitionCentroid(PartitionCentroid::new(vec![1.0])),
-        )
-        .await
-        .expect("put target centroid");
-        txn.put(
-            LogicalKey::Synopsis {
-                index: index_id,
-                tree_key: key.clone(),
-                partition: target,
-            },
-            PersistentValue::PartitionSynopsis(PartitionSynopsis::empty(&manifest)),
-        )
-        .await
-        .expect("put target synopsis");
-    }
     txn.commit().await.expect("commit fixture");
 
     let error = split::drain_batch(&backend, &manifest, &key, pk(1), &retry())
@@ -2778,11 +2739,7 @@ async fn advance_fails_closed_on_a_torn_target_without_committing() {
 
     // A Splitting leaf root whose left target carries only its State: Header
     // and Centroid are missing — a torn committed state.
-    let mut txn = write_txn(&backend, &manifest).await;
-    tree_manifest::create_tree(&mut txn, &key, 100)
-        .await
-        .expect("create tree");
-    txn.commit().await.expect("commit tree");
+    create_committed_tree(&backend, &manifest, &key).await;
     let mut txn = write_txn(&backend, &manifest).await;
     let index_id = manifest.logical_index_id();
     txn.put(

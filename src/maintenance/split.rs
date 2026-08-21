@@ -187,18 +187,8 @@ pub async fn expose_targets<B: Backend>(
 ) -> Result<TargetExposure> {
     // One consistent snapshot classifies the source and trains both target
     // centroids without holding KV locks.
-    let mut read = begin_read(backend, manifest).await?;
-    let Some(state) = read_state_opt(&mut read, tree_key, source).await? else {
-        // A completed non-root split removed the source's authority values;
-        // re-driving this step observes the absence and is harmless
-        // (maintenance.md §3). A lone surviving Header is a torn committed
-        // state.
-        if read_header_opt(&mut read, tree_key, source)
-            .await?
-            .is_some()
-        {
-            return Err(Error::new(ErrorKind::Corruption));
-        }
+    let mut read = reads::open_validated_read(backend, manifest).await?;
+    let Some(state) = read_source_state(&mut read, tree_key, source).await? else {
         return Ok(TargetExposure::SourceAdvanced);
     };
     let (left, right) = match state {
@@ -287,18 +277,8 @@ pub async fn drain_batch<B: Backend>(
     retry: &RetryPolicy,
 ) -> Result<DrainStep> {
     // The read phase fixes the batch from one consistent snapshot.
-    let mut read = begin_read(backend, manifest).await?;
-    let Some(state) = read_state_opt(&mut read, tree_key, source).await? else {
-        // A completed non-root split removed the source's authority values;
-        // re-driving this step observes the absence and is harmless
-        // (maintenance.md §3). A lone surviving Header is a torn committed
-        // state.
-        if read_header_opt(&mut read, tree_key, source)
-            .await?
-            .is_some()
-        {
-            return Err(Error::new(ErrorKind::Corruption));
-        }
+    let mut read = reads::open_validated_read(backend, manifest).await?;
+    let Some(state) = read_source_state(&mut read, tree_key, source).await? else {
         return Ok(DrainStep::SourceAdvanced);
     };
     let (left, right) = match state {
@@ -477,7 +457,7 @@ pub async fn advance<B: Backend>(
     started_at_unix_millis: u64,
     retry: &RetryPolicy,
 ) -> Result<Advance> {
-    let mut read = begin_read(backend, manifest).await?;
+    let mut read = reads::open_validated_read(backend, manifest).await?;
     let header = read_header_opt(&mut read, tree_key, partition).await?;
     let state = read_state_opt(&mut read, tree_key, partition).await?;
     drop(read);
@@ -663,22 +643,6 @@ fn nearer_target(
     ))
 }
 
-/// Opens one read transaction bound to the Logical Index.
-///
-/// The persisted Active Manifest is validated first so a dropped Logical
-/// Index reports `IndexNotFound`/`IndexDropping` — the same contract as the
-/// write steps — instead of a misleading Corruption from the missing
-/// topology keys.
-async fn begin_read<'b, 'm, B: Backend>(
-    backend: &'b B,
-    manifest: &'m IndexManifest,
-) -> Result<ReadLogicalTxn<'m, B::ReadTxn<'b>>> {
-    let raw = backend.begin_read().await?;
-    let mut txn = ReadLogicalTxn::bootstrap(raw);
-    reads::validate_manifest(&mut txn, manifest).await?;
-    ReadLogicalTxn::for_index(txn.into_raw(), manifest)
-}
-
 /// Reads one partition State that may be absent.
 async fn read_state_opt<T: crate::storage::backend::ReadOps>(
     txn: &mut ReadLogicalTxn<'_, T>,
@@ -694,6 +658,26 @@ async fn read_state_opt<T: crate::storage::backend::ReadOps>(
         })
         .await?,
     )
+}
+
+/// Reads one split source's State from a snapshot, returning `None` when a
+/// completed non-root split removed both authority values.
+///
+/// Re-driving any step of a finished split observes the absence and is
+/// harmless (maintenance.md §3); a lone surviving Header is a torn committed
+/// state.
+async fn read_source_state<T: crate::storage::backend::ReadOps>(
+    txn: &mut ReadLogicalTxn<'_, T>,
+    tree_key: &TreeKey,
+    source: PartitionKey,
+) -> Result<Option<PartitionTransition>> {
+    match read_state_opt(txn, tree_key, source).await? {
+        Some(state) => Ok(Some(state)),
+        None if read_header_opt(txn, tree_key, source).await?.is_some() => {
+            Err(Error::new(ErrorKind::Corruption))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Reads one partition Header from a snapshot, failing closed when absent.

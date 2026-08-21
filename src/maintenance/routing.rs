@@ -60,9 +60,8 @@ use crate::search::numeric::VectorKernel;
 use crate::storage::backend::{ReadOps, ScanLimits, WriteTxn};
 use crate::storage::keys::{LogicalKey, MAX_TREE_KEY_BYTES, TreeKey};
 use crate::storage::values::{
-    ChildEntry, IndexManifest, PartitionCentroid, PartitionHeader, PartitionState,
-    PartitionTransition, PersistentValue, TreeManifest, expect_centroid, expect_header,
-    expect_state,
+    ChildEntry, IndexManifest, PartitionHeader, PartitionState, PartitionTransition,
+    PersistentValue, TreeManifest, expect_centroid, expect_header, expect_state,
 };
 use crate::storage::{
     LogicalRange, LogicalScanCursor, LogicalScanPage, ReadLogicalTxn, WriteLogicalTxn,
@@ -282,6 +281,26 @@ fn check_level(header: &PartitionHeader, expected_level: Option<u32>) -> Result<
     Ok(())
 }
 
+/// Validates that the root partition carries a legal root state.
+///
+/// The root is the one searchable entry point: it is never a split target
+/// and never merges, matching the search traversal contract.
+fn check_root_state(
+    root: PartitionKey,
+    partition: PartitionKey,
+    state: PartitionTransition,
+) -> Result<()> {
+    if partition == root
+        && matches!(
+            state,
+            PartitionTransition::ReceivingSplit { .. } | PartitionTransition::Merging { .. }
+        )
+    {
+        return Err(Error::new(ErrorKind::Corruption));
+    }
+    Ok(())
+}
+
 /// Descends from `root` to the write-accepting leaf nearest to `routing`,
 /// carrying the observed parent.
 ///
@@ -302,16 +321,7 @@ async fn descend<R: RoutingReader>(
     loop {
         let (header, state) = read_authority(reader, manifest, tree_key, partition).await?;
         check_level(&header, expected_level)?;
-        // The root is the one searchable entry point: it is never a split
-        // target and never merges, matching the search traversal contract.
-        if partition == root
-            && matches!(
-                state,
-                PartitionTransition::ReceivingSplit { .. } | PartitionTransition::Merging { .. }
-            )
-        {
-            return Err(Error::new(ErrorKind::Corruption));
-        }
+        check_root_state(root, partition, state)?;
         // A write-accepting leaf — Ready, Splitting, or ReceivingSplit — is
         // the descent's end.
         if header.level() == 1 && header.state().accepts_writes() {
@@ -338,7 +348,9 @@ async fn descend<R: RoutingReader>(
                 // An internal target is never descended alone: its source
                 // still owns the unmigrated children, so the split family is
                 // resolved through the persisted source reference.
-                match read_state(reader, manifest, tree_key, source).await? {
+                let (source_header, source_state) =
+                    read_authority(reader, manifest, tree_key, source).await?;
+                match source_state {
                     PartitionTransition::Splitting { .. } => {
                         // The source still holds every entry; the target is
                         // empty and contributes nothing. The carried parent is
@@ -347,7 +359,6 @@ async fn descend<R: RoutingReader>(
                         partition = source;
                     }
                     PartitionTransition::DrainingSplit { left, right, .. } => {
-                        let source_header = read_header(reader, manifest, tree_key, source).await?;
                         expected_level = Some(header.level() - 1);
                         let family = SplitFamily {
                             source,
@@ -443,16 +454,7 @@ async fn descend_grouped<T: WriteTxn>(
     while let Some((partition, parent, expected_level, members)) = pending.pop() {
         let (header, state) = read_authority(txn, manifest, tree_key, partition).await?;
         check_level(&header, expected_level)?;
-        // The root is the one searchable entry point: it is never a split
-        // target and never merges, matching the search traversal contract.
-        if partition == root
-            && matches!(
-                state,
-                PartitionTransition::ReceivingSplit { .. } | PartitionTransition::Merging { .. }
-            )
-        {
-            return Err(Error::new(ErrorKind::Corruption));
-        }
+        check_root_state(root, partition, state)?;
         if header.level() == 1 && header.state().accepts_writes() {
             for member in members {
                 routes[member] = Some(Route {
@@ -472,7 +474,9 @@ async fn descend_grouped<T: WriteTxn>(
                 bodies.push((partition, header));
             }
             PartitionTransition::ReceivingSplit { source, .. } => {
-                match read_state(txn, manifest, tree_key, source).await? {
+                let (source_header, source_state) =
+                    read_authority(txn, manifest, tree_key, source).await?;
+                match source_state {
                     PartitionTransition::Splitting { .. } => {
                         // The source still holds every entry; requeue the
                         // group at it. The source shares the target's level;
@@ -482,7 +486,6 @@ async fn descend_grouped<T: WriteTxn>(
                         continue;
                     }
                     PartitionTransition::DrainingSplit { left, right, .. } => {
-                        let source_header = read_header(txn, manifest, tree_key, source).await?;
                         bodies = split_family_bodies(
                             txn,
                             manifest,
@@ -501,11 +504,57 @@ async fn descend_grouped<T: WriteTxn>(
                 if header.level() == 1 {
                     // A draining leaf accepts no writes: each member redirects
                     // to its nearer persisted target, sharing the source's
-                    // observed parent or root target slot.
-                    let left_centroid = read_centroid(txn, manifest, tree_key, left).await?;
-                    let right_centroid = read_centroid(txn, manifest, tree_key, right).await?;
-                    let left_header = read_header(txn, manifest, tree_key, left).await?;
-                    let right_header = read_header(txn, manifest, tree_key, right).await?;
+                    // observed parent or root target slot. One batched read
+                    // fetches both targets' Centroids and Headers.
+                    let index = manifest.logical_index_id();
+                    let mut target_values = txn
+                        .batch_get(vec![
+                            LogicalKey::Centroid {
+                                index,
+                                tree_key: tree_key.clone(),
+                                partition: left,
+                            },
+                            LogicalKey::Centroid {
+                                index,
+                                tree_key: tree_key.clone(),
+                                partition: right,
+                            },
+                            LogicalKey::Header {
+                                index,
+                                tree_key: tree_key.clone(),
+                                partition: left,
+                            },
+                            LogicalKey::Header {
+                                index,
+                                tree_key: tree_key.clone(),
+                                partition: right,
+                            },
+                        ])
+                        .await?
+                        .into_iter();
+                    let (
+                        Some(left_centroid),
+                        Some(right_centroid),
+                        Some(left_header),
+                        Some(right_header),
+                    ) = (
+                        target_values.next(),
+                        target_values.next(),
+                        target_values.next(),
+                        target_values.next(),
+                    )
+                    else {
+                        // The typed batch read returns exactly one value per input key.
+                        return Err(Error::new(ErrorKind::Backend));
+                    };
+                    let left_centroid = expect_centroid(left_centroid)?
+                        .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
+                    let right_centroid = expect_centroid(right_centroid)?
+                        .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
+                    let left_header = expect_header(left_header)?
+                        .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
+                    let right_header = expect_header(right_header)?
+                        .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
                     for target_header in [left_header, right_header] {
                         if target_header.level() != 1
                             || target_header.state() != PartitionState::ReceivingSplit
@@ -658,45 +707,6 @@ async fn read_authority<R: RoutingReader>(
         return Err(Error::new(ErrorKind::Corruption));
     }
     Ok((header, state))
-}
-
-/// Reads one partition State, failing closed when a routed-to partition has
-/// no State or a wrong-kind value.
-async fn read_state<R: RoutingReader>(
-    reader: &mut R,
-    manifest: &IndexManifest,
-    tree_key: &TreeKey,
-    partition: PartitionKey,
-) -> Result<PartitionTransition> {
-    expect_state(
-        reader
-            .get(LogicalKey::State {
-                index: manifest.logical_index_id(),
-                tree_key: tree_key.clone(),
-                partition,
-            })
-            .await?,
-    )?
-    .ok_or_else(|| Error::new(ErrorKind::Corruption))
-}
-
-/// Reads one partition's persisted centroid, failing closed when absent.
-async fn read_centroid<R: RoutingReader>(
-    reader: &mut R,
-    manifest: &IndexManifest,
-    tree_key: &TreeKey,
-    partition: PartitionKey,
-) -> Result<PartitionCentroid> {
-    expect_centroid(
-        reader
-            .get(LogicalKey::Centroid {
-                index: manifest.logical_index_id(),
-                tree_key: tree_key.clone(),
-                partition,
-            })
-            .await?,
-    )?
-    .ok_or_else(|| Error::new(ErrorKind::Corruption))
 }
 
 /// One draining split family: the source with its already-read Header and
@@ -863,8 +873,30 @@ async fn nearer_target_leaf<R: RoutingReader>(
     left: PartitionKey,
     right: PartitionKey,
 ) -> Result<PartitionKey> {
-    let left_centroid = read_centroid(reader, manifest, tree_key, left).await?;
-    let right_centroid = read_centroid(reader, manifest, tree_key, right).await?;
+    let index = manifest.logical_index_id();
+    let mut centroids = reader
+        .batch_get(vec![
+            LogicalKey::Centroid {
+                index,
+                tree_key: tree_key.clone(),
+                partition: left,
+            },
+            LogicalKey::Centroid {
+                index,
+                tree_key: tree_key.clone(),
+                partition: right,
+            },
+        ])
+        .await?
+        .into_iter();
+    let (Some(left_value), Some(right_value)) = (centroids.next(), centroids.next()) else {
+        // The typed batch read returns exactly one value per input key.
+        return Err(Error::new(ErrorKind::Backend));
+    };
+    let left_centroid =
+        expect_centroid(left_value)?.ok_or_else(|| Error::new(ErrorKind::Corruption))?;
+    let right_centroid =
+        expect_centroid(right_value)?.ok_or_else(|| Error::new(ErrorKind::Corruption))?;
     let left_distance = kernel.routing_distance(routing, left_centroid.components())?;
     let right_distance = kernel.routing_distance(routing, right_centroid.components())?;
     Ok(nearer_of_two(left, left_distance, right, right_distance))

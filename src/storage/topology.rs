@@ -165,15 +165,12 @@ pub async fn begin_split<T: WriteTxn>(
     let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
     let index = manifest.logical_index_id();
     let (header_key, state_key) = authority_keys(index, tree_key, source);
-    let (header, state) = authority_for_update(txn, header_key.clone(), state_key.clone()).await?;
-    let (header, state) = match (header, state) {
-        (Some(header), Some(state)) => (header, state),
+    let Some((header, state)) = authority_pair(txn, header_key.clone(), state_key.clone()).await?
+    else {
         // Both authority values are gone: a completed split already removed
         // the source (or it never existed), so there is nothing to start.
-        (None, None) => return Ok(SplitStart::NotEligible),
-        _ => return Err(corrupt()),
+        return Ok(SplitStart::NotEligible);
     };
-    expect_agreement(header, state)?;
 
     match state {
         PartitionTransition::Splitting { left, right, .. } => {
@@ -433,7 +430,10 @@ pub async fn advance_to_draining<T: WriteTxn>(
     let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
     let index = manifest.logical_index_id();
     let (header_key, state_key) = authority_keys(index, tree_key, source);
-    let Some(state) = expect_state(txn.get_for_update(state_key.clone()).await?)? else {
+    let Some((header, state)) = authority_pair(txn, header_key.clone(), state_key.clone()).await?
+    else {
+        // Both authority values are gone: a completed split already removed
+        // the source, so there is nothing to advance.
         return Ok(DrainStart::NotSplitting);
     };
     let (left, right) = match state {
@@ -441,10 +441,6 @@ pub async fn advance_to_draining<T: WriteTxn>(
         PartitionTransition::DrainingSplit { .. } => return Ok(DrainStart::AlreadyDraining),
         _ => return Ok(DrainStart::NotSplitting),
     };
-
-    let header =
-        expect_header(txn.get_for_update(header_key.clone()).await?)?.ok_or_else(corrupt)?;
-    expect_agreement(header, state)?;
 
     // Both targets must identify this source; one update-protected batch
     // establishes the commit-time conflicts on both target States.
@@ -991,15 +987,12 @@ pub async fn finalize_split<T: WriteTxn>(
     let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
     let index = manifest.logical_index_id();
     let (header_key, state_key) = authority_keys(index, tree_key, source);
-    let (header, state) = authority_for_update(txn, header_key.clone(), state_key.clone()).await?;
-    let (header, state) = match (header, state) {
-        (Some(header), Some(state)) => (header, state),
+    let Some((header, state)) = authority_pair(txn, header_key.clone(), state_key.clone()).await?
+    else {
         // Both authority values are gone: a previous committed finalize
         // completed this split.
-        (None, None) => return Ok(SplitCompletion::Completed),
-        _ => return Err(corrupt()),
+        return Ok(SplitCompletion::Completed);
     };
-    expect_agreement(header, state)?;
     let PartitionTransition::DrainingSplit { left, right, .. } = state else {
         return Ok(SplitCompletion::NotDraining);
     };
@@ -1352,6 +1345,27 @@ async fn authority_for_update<T: WriteTxn>(
         return Err(Error::new(ErrorKind::Backend));
     };
     Ok((expect_header(header)?, expect_state(state)?))
+}
+
+/// Reads one partition's authority pair with update protection, classifying
+/// presence and agreement.
+///
+/// Both values present and in agreement is `Some`; both gone — a completed
+/// split removed them, or the partition never existed — is `None`; a
+/// half-present or disagreeing pair is Corruption.
+async fn authority_pair<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    header_key: LogicalKey,
+    state_key: LogicalKey,
+) -> Result<Option<(PartitionHeader, PartitionTransition)>> {
+    match authority_for_update(txn, header_key, state_key).await? {
+        (Some(header), Some(state)) => {
+            expect_agreement(header, state)?;
+            Ok(Some((header, state)))
+        }
+        (None, None) => Ok(None),
+        _ => Err(corrupt()),
+    }
 }
 
 /// Verifies that one target's persisted State names `source`, without a
