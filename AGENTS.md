@@ -138,3 +138,14 @@ must not require nightly features.
 - Test every resource boundary and truncation reason. Benchmarks report
   recall, latency, contention, memory, and write amplification without
   freezing benchmark-tunable internals such as cache eviction or task layout.
+- The data-driven integration corpus lives in `tests/datadriven/*.kddt`,
+  executed by `tests/e2e.rs` against the public API on the deterministic
+  backend with seeded synthetic datasets (`tests/support/dataset.rs`), a
+  brute-force oracle (`tests/support/oracle.rs`), and the persistent-state
+  audit (`tests/support/audit.rs`). Regenerate expectations with
+  `KTANN_REWRITE=1 cargo test --test e2e` and review the diff like any other
+  change. Real-dataset fixtures (siftsmall, fashion-mnist; see
+  `tests/datadriven/data/README.md` for provenance) are checked in under
+  `tests/datadriven/data/` and loaded via `file:` dataset specs; the oracle is
+  cross-checked against published siftsmall ground truth in
+  `tests/oracle_groundtruth.rs`.

@@ -1,0 +1,106 @@
+# ----------------------------------------------------------------------
+# Basic insert/upsert/delete/get semantics on a tiny two-field index.
+# ----------------------------------------------------------------------
+new-index dimension=2 metric=L2 fields=bucket:i64,note:string?,flag:bool tree-key-fields=0
+----
+created index "index"
+
+insert tree=1
+r1: [1,2]
+r2: [7,4]
+r3: [4,3]
+----
+r1: ok
+r2: ok
+r3: ok
+
+# A duplicate Record ID insert fails; upsert replaces.
+insert tree=1
+r1: [9,9]
+----
+r1: error RecordAlreadyExists
+
+upsert tree=1
+r1: [5,6]
+r4: [0,0]
+----
+r1: replaced
+r4: created
+
+get
+r1
+r9
+----
+r1: present
+r9: absent
+
+delete
+r3
+r9
+----
+r3: true
+r9: false
+
+# Duplicate-heavy data loaded one record at a time.
+load dataset=dups:24:5 tree=1 via=single
+----
+loaded 24 records (dataset=dups:24:5, seed=42)
+
+# The auto-filled bool field filters exactly (even ordinals are true).
+search k=30 vector=[0,0] where=2:eq:true
+----
+r000008: 0.4386
+r000004: 0.4406
+r000006: 0.4406
+r000020: 0.5928
+r000010: 0.5941
+r000014: 0.6455
+r000002: 0.6458
+r000022: 0.6458
+r000000: 0.7130
+r000018: 0.7130
+r000016: 0.7147
+r000012: 0.7149
+r1: 7.8102
+usage: scanned_tree_keys=1 visited_partitions=1 visited_leaf_entries=27 exact_rerank_candidates=13
+
+validate
+----
+ok: records=27 trees=1 partitions=1 max_level=1
+
+format-tree entries
+----
+tree 0: root pk=1
+  pk=1 level=1 state=Ready count=27
+    r000000
+    r000001
+    r000002
+    r000003
+    r000004
+    r000005
+    r000006
+    r000007
+    r000008
+    r000009
+    r000010
+    r000011
+    r000012
+    r000013
+    r000014
+    r000015
+    r000016
+    r000017
+    r000018
+    r000019
+    r000020
+    r000021
+    r000022
+    r000023
+    r1
+    r2
+    r4
+
+stats
+----
+keys=88 bytes=5596
+

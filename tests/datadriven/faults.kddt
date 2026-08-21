@@ -1,0 +1,92 @@
+# ----------------------------------------------------------------------
+# Commit-fault injection: definite aborts are retried inside the Runtime;
+# unknown outcomes surface and are recovered by read-back (ADR 0012).
+# ----------------------------------------------------------------------
+new-index dimension=2 metric=L2 fields=bucket:i64 tree-key-fields=0
+----
+created index "index"
+
+insert tree=1
+r1: [1,2]
+r2: [7,4]
+r3: [4,3]
+----
+r1: ok
+r2: ok
+r3: ok
+
+# A definite abort is retried by the whole-operation policy and commits.
+inject-fault kind=abort
+----
+ok
+
+insert tree=1
+r4: [0,0]
+----
+r4: ok
+
+validate
+----
+ok: records=4 trees=1 partitions=1 max_level=1
+
+# Unknown outcomes: the model is synchronized by the documented read-back.
+inject-fault kind=unknown-applied
+----
+ok
+
+insert tree=1
+r5: [2,2]
+----
+r5: error CommitOutcomeUnknown (recovered: present)
+
+inject-fault kind=unknown-not-applied
+----
+ok
+
+insert tree=1
+r6: [3,3]
+----
+r6: error CommitOutcomeUnknown (recovered: absent)
+
+inject-fault kind=unknown-applied
+----
+ok
+
+delete
+r2
+----
+r2: error CommitOutcomeUnknown (recovered: absent)
+
+inject-fault kind=unknown-not-applied
+----
+ok
+
+delete
+r3
+----
+r3: error CommitOutcomeUnknown (recovered: present)
+
+validate
+----
+ok: records=4 trees=1 partitions=1 max_level=1
+
+# Faults are process-local; the durable outcome survives a restart.
+restart
+----
+restarted
+
+validate
+----
+ok: records=4 trees=1 partitions=1 max_level=1
+
+get
+r2
+r3
+r5
+r6
+----
+r2: absent
+r3: present
+r5: present
+r6: absent
+

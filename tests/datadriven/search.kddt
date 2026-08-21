@@ -1,0 +1,110 @@
+# ----------------------------------------------------------------------
+# Bounded search over a clustered dataset: exact hits, budget accounting,
+# predicate filtering, and truncation reporting.
+# ----------------------------------------------------------------------
+new-index dimension=8 metric=L2 fields=bucket:i64,score:f64? tree-key-fields=0 min-entries=8 max-entries=32
+----
+created index "index"
+
+load dataset=clustered:2000:8 tree=1 via=batch seed=7
+----
+loaded 2000 records (dataset=clustered:2000:8, seed=7)
+
+validate
+----
+ok: records=2000 trees=1 partitions=1 max_level=1
+
+# An unfiltered search with sufficient budgets is exact.
+search k=5 vector=[0,0,0,0,0,0,0,0]
+----
+r000103: 1.3630
+r000504: 1.3691
+r001343: 1.3692
+r001393: 1.3858
+r001522: 1.3923
+usage: scanned_tree_keys=1 visited_partitions=1 visited_leaf_entries=2000 exact_rerank_candidates=7
+
+# The nullable f64 field filters exactly: score <= 10.5 keeps ordinals 0..=9
+# and 3 (NULL) never qualifies under SQL three-valued logic.
+search k=20 vector=[0,0,0,0,0,0,0,0] where=1:le:10.5
+----
+r000009: 1.4586
+r000008: 2.1333
+r000006: 2.7269
+r000005: 2.9405
+r000002: 3.2921
+r000004: 3.4862
+r000000: 3.8138
+r000007: 3.8434
+r000001: 3.9469
+usage: scanned_tree_keys=1 visited_partitions=1 visited_leaf_entries=2000 exact_rerank_candidates=9
+
+# SQL UNKNOWN never qualifies; only IS NULL returns the NULL-score rows.
+search k=20 vector=[0,0,0,0,0,0,0,0] where=1:isnull
+----
+r001522: 1.3923
+r001564: 1.4358
+r000262: 1.4883
+r001893: 1.5312
+r000710: 1.5348
+r000969: 1.5485
+r001207: 1.5892
+r001851: 1.5930
+r001795: 1.6036
+r001270: 1.6153
+r001172: 1.6186
+r000073: 1.6289
+r000605: 1.6369
+r000192: 1.6462
+r000682: 1.6558
+r001081: 1.6870
+r000479: 1.7040
+r000395: 1.7145
+r001340: 1.7207
+r000787: 1.7227
+usage: scanned_tree_keys=1 visited_partitions=1 visited_leaf_entries=2000 exact_rerank_candidates=22
+
+# IN on the Tree Key field plus NOT NULL on the nullable score.
+search k=10 vector=[0,0,0,0,0,0,0,0] where=0:in:1 where=1:notnull
+----
+r000103: 1.3630
+r000504: 1.3691
+r001343: 1.3692
+r001393: 1.3858
+r001085: 1.4060
+r000523: 1.4072
+r000904: 1.4172
+r000356: 1.4176
+r001254: 1.4284
+r001364: 1.4314
+usage: scanned_tree_keys=1 visited_partitions=1 visited_leaf_entries=2000 exact_rerank_candidates=16
+
+# Not-equal excludes exactly the matching score.
+search k=5 vector=[0,0,0,0,0,0,0,0] where=1:ne:5.5 where=1:le:10.5
+----
+r000009: 1.4586
+r000008: 2.1333
+r000006: 2.7269
+r000002: 3.2921
+r000004: 3.4862
+usage: scanned_tree_keys=1 visited_partitions=1 visited_leaf_entries=2000 exact_rerank_candidates=5
+
+# A depleted Leaf Entry budget truncates and says so.
+search k=5 vector=[0,0,0,0,0,0,0,0] visited-leaf-entries=50
+----
+r000009: 1.4586
+r000016: 1.7387
+r000018: 1.8086
+r000028: 1.8168
+r000008: 2.1333
+usage: scanned_tree_keys=1 visited_partitions=1 visited_leaf_entries=50 exact_rerank_candidates=5
+exhausted: visited_leaf_entries
+
+# A tight exact-rerank budget truncates candidacy.
+search k=2 vector=[0,0,0,0,0,0,0,0] exact-rerank=2
+----
+r000103: 1.3630
+r001343: 1.3692
+usage: scanned_tree_keys=1 visited_partitions=1 visited_leaf_entries=2000 exact_rerank_candidates=2
+exhausted: rabitq_overlap_truncated
+
