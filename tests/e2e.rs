@@ -8,33 +8,32 @@
 //!
 //! Directives:
 //!
-//! - `new-index name=N dimension=D metric=M fields=f:t[?],... tree-key-fields=I,...
-//!    [min-entries=N] [max-entries=N]` — fresh backend, Runtime, and index;
-//!    the harness model resets. Field types: `i64`, `f64`, `bool`, `string`;
-//!    a `?` suffix makes the field nullable.
-//! - `load dataset=SPEC tree=V|A..B [via=batch|single|import] [seed=N]
-//!    [batch=N]` — inserts a dataset through the public mutation API. SPECs
-//!    are generated synthetically except `file:NAME`, which loads a checked-in
-//!    fixture from `tests/datadriven/data/` and ignores `seed`. Non-tree
-//!    fields are filled deterministically (ordinal values; every seventh
-//!    nullable field is NULL).
-//! - `insert [tree=V]` / `upsert [tree=V]` — input lines `id: [v,v,...]
-//!    [fI=value ...]`; prints `id: ok|created|replaced` or `id: error Kind`.
+//! - `new-index name=N dimension=D metric=M fields=f:t[?],... tree-key-fields=I,... [min-entries=N] [max-entries=N]`
+//!   starts a fresh backend, Runtime, and index; the harness model resets.
+//!   Field types: `i64`, `f64`, `bool`, `string`; a `?` suffix makes the
+//!   field nullable.
+//! - `load dataset=SPEC tree=V|A..B [via=batch|single|import] [seed=N] [batch=N]`
+//!   inserts a dataset through the public mutation API. SPECs are generated
+//!   synthetically except `file:NAME`, which loads a checked-in fixture from
+//!   `tests/datadriven/data/` and ignores `seed`. Non-tree fields are filled
+//!   deterministically (ordinal values; every seventh nullable field is NULL).
+//! - `insert [tree=V]` / `upsert [tree=V]` — input lines `id: [v,v,...] [fI=value ...]`;
+//!   prints `id: ok|created|replaced` or `id: error Kind`.
 //! - `delete` — input lines of Record IDs; prints `id: true|false`.
 //! - `get` — input lines of Record IDs; prints `id: present|absent`.
 //! - `search k=K vector=[v,v,...] [where=F:op:value ...] [budget overrides]` —
-//!    prints one `id: distance` line per hit, then exact budget usage, then
-//!    any exhaustion flags.
+//!   prints one `id: distance` line per hit, then exact budget usage, then
+//!   any exhaustion flags.
 //! - `recall k=K samples=N [query=SPEC] [query-seed=N] [where=...] [budgets]` —
-//!    prints recall against the brute-force oracle plus the count of
-//!    budget-truncated queries. A `query=` spec is capped at `samples`
-//!    queries; without it, `samples` stride queries come from the loaded
-//!    dataset.
+//!   prints recall against the brute-force oracle plus the count of
+//!   budget-truncated queries. A `query=` spec is capped at `samples`
+//!   queries; without it, `samples` stride queries come from the loaded
+//!   dataset.
 //! - `inject-fault kind=abort|unknown-applied|unknown-not-applied` — queues one
-//!    commit fault; unknown outcomes are recovered by read-back, and the model
-//!    is synchronized per ADR 0012.
+//!   commit fault; unknown outcomes are recovered by read-back, and the model
+//!   is synchronized per ADR 0012.
 //! - `restart` — shuts the Runtime down and reopens the index on a reopened
-//!    durable backend, simulating a process restart.
+//!   durable backend, simulating a process restart.
 //! - `validate` — runs the exact-membership/topology audit against the model.
 //! - `format-tree [entries]` — renders the reachable topology.
 //! - `stats` — prints committed keyspace size.
