@@ -236,11 +236,18 @@ impl<B: Backend> Index<B> {
         )?;
         let manifest = Arc::clone(&self.manifest);
         let cache = self.runtime.partition_cache();
-        self.runtime
+        let (outcome, maintenance) = self
+            .runtime
             .run_foreground(operation_options, move |mut context| async move {
                 search::search(&mut context, &cache, &manifest, prepared).await
             })
-            .await
+            .await?;
+        // The search is the relevant access that rediscovers cold split and
+        // merge states; offering them is best-effort and loss-safe.
+        if !maintenance.is_empty() {
+            self.runtime.offer_fixups(&self.manifest, maintenance);
+        }
+        Ok(outcome)
     }
 
     /// Validates one mutation batch against this index's immutable
@@ -256,6 +263,11 @@ impl<B: Backend> Index<B> {
     }
 
     /// Runs one validated mutation batch under foreground admission.
+    ///
+    /// A committed batch's maintenance discoveries — split candidates,
+    /// shrunken leaves, and draining sources rerouted around — are offered to
+    /// the Runtime's bounded Fixup queue after success; losing them never
+    /// affects correctness.
     pub(crate) async fn run_mutations(
         &self,
         mutations: Vec<Mutation>,
@@ -263,11 +275,17 @@ impl<B: Backend> Index<B> {
     ) -> Result<Vec<MutationOutcome>> {
         let retry = lifecycle::RetryPolicy::from_config(self.runtime.config());
         let manifest = Arc::clone(&self.manifest);
-        self.runtime
+        let report = self
+            .runtime
             .run_foreground(operation_options, move |mut context| async move {
                 mutation::mutate(&mut context, &manifest, &mutations, retry).await
             })
-            .await
+            .await?;
+        if !report.maintenance.is_empty() {
+            self.runtime
+                .offer_fixups(&self.manifest, report.maintenance);
+        }
+        Ok(report.outcomes)
     }
 
     /// Reads one Vector Record by Record ID.

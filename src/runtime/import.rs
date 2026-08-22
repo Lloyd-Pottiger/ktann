@@ -22,9 +22,8 @@
 //! and finishes without an Import Session observer.
 //!
 //! `submit_batch` will also wait for the Runtime's Structure Maintenance
-//! backlog watermark once bounded maintenance scheduling lands with the Fixup
-//! runtime (#32); the gate wiring is tracked by #89, and the admission bounds
-//! here are independent of it.
+//! backlog watermark against the Fixup queue; the gate wiring is tracked by
+//! #89, and the admission bounds here are independent of it.
 
 use std::sync::Arc;
 

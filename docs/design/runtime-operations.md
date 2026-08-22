@@ -49,6 +49,11 @@ jittered backoff, then retires. Later relevant access may enqueue it again.
 There is no durable scan, queue, leader, lease, or claim that one Runtime knows
 cluster-wide backlog.
 
+Runtime construction starts the configured maintenance workers immediately.
+Zero workers disables background scheduling: that Runtime's offers are
+dropped, and topology changes advance only when driven outside it, which
+stays correct because every committed intermediate state remains searchable.
+
 Wall clock writes Unix-epoch nanosecond diagnostic timestamps; Tokio monotonic
 time controls deadlines and backoff. Invalid wall time prevents a state
 transition. Future persistent timestamps are not stalled.

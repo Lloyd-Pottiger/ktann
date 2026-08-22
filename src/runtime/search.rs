@@ -16,8 +16,8 @@
 //! continuation, or monotonic-across-budgets guarantee.
 
 use crate::api::{
-    Error, ErrorKind, Result, SearchBudgetExhaustion, SearchBudgetUsage, SearchBudgets,
-    SearchOutcome, SearchRequest,
+    Error, ErrorKind, PartitionKey, Result, SearchBudgetExhaustion, SearchBudgetUsage,
+    SearchBudgets, SearchOutcome, SearchRequest,
 };
 use crate::search::cache::PartitionCache;
 use crate::search::numeric::VectorKernel;
@@ -28,7 +28,7 @@ use crate::search::rerank::{LeafCandidate, exact_rerank};
 use crate::search::traverse::{DEFAULT_LEAF_BEAM, TraversalRequest, traverse};
 use crate::storage::ReadLogicalTxn;
 use crate::storage::backend::{Backend, ScanLimits};
-use crate::storage::keys::LogicalKey;
+use crate::storage::keys::{LogicalKey, TreeKey};
 use crate::storage::values::IndexManifest;
 
 use super::OperationContext;
@@ -100,12 +100,17 @@ impl PreparedSearch {
 /// and reranking — reads from the same snapshot. Cancellation and deadline
 /// are checked between stages; a search never commits, so a cancelled or
 /// expired operation is simply an error.
+///
+/// The second return value is the traversal's demand-driven maintenance
+/// discovery: visited partitions in a split or merge state and
+/// threshold-crossing `Ready` partitions, which the caller offers to the
+/// Runtime's Fixup queue after success.
 pub(crate) async fn search<B: Backend>(
     context: &mut OperationContext<B>,
     cache: &PartitionCache,
     handle_manifest: &IndexManifest,
     prepared: PreparedSearch,
-) -> Result<SearchOutcome> {
+) -> Result<(SearchOutcome, Vec<(TreeKey, PartitionKey)>)> {
     context.checkpoint()?;
     let backend = context.backend();
     let raw = backend.begin_read().await?;
@@ -131,7 +136,7 @@ pub(crate) async fn search<B: Backend>(
     .await?;
     context.checkpoint()?;
 
-    let traversal = traverse(
+    let mut traversal = traverse(
         &mut txn,
         cache,
         &prepared.kernel,
@@ -147,6 +152,7 @@ pub(crate) async fn search<B: Backend>(
     .await?;
     context.checkpoint()?;
 
+    let maintenance = traversal.take_maintenance();
     let visited_partitions = traversal.visited_partitions();
     let visited_leaf_entries = traversal.visited_leaf_entries();
     let partition_budget_exhausted = traversal.partition_budget_exhausted();
@@ -181,7 +187,7 @@ pub(crate) async fn search<B: Backend>(
 
     let exact_rerank_candidates = rerank.exact_rerank_candidates();
     let rerank_exhausted = rerank_budget_exhausted || rerank.exact_rerank_budget_exhausted();
-    Ok(SearchOutcome {
+    let outcome = SearchOutcome {
         hits: rerank.into_hits(),
         usage: SearchBudgetUsage {
             scanned_tree_keys: enumeration.scanned_tree_keys(),
@@ -196,5 +202,6 @@ pub(crate) async fn search<B: Backend>(
             exact_rerank_candidates: rerank_exhausted,
         },
         rabitq_overlap_truncated,
-    })
+    };
+    Ok((outcome, maintenance))
 }

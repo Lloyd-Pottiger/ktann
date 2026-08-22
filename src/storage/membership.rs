@@ -41,11 +41,16 @@ use crate::storage::values::{
 use crate::storage::{MutationBuilder, WriteLogicalTxn};
 
 /// The outcome of an idempotent delete.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum DeleteOutcome {
-    /// The record existed and its whole membership group was deleted.
-    Deleted,
+    /// The record existed and its whole membership group was deleted; carries
+    /// the exact location it was deleted from, so the caller may offer the
+    /// shrunken leaf to demand-driven maintenance.
+    Deleted {
+        /// The deleted record's authoritative Record Location.
+        location: RecordLocation,
+    },
     /// No Vector Record with the Record ID exists; nothing was touched.
     NotFound,
 }
@@ -248,7 +253,7 @@ pub async fn delete_record<T: WriteTxn>(
     deferred.delete(payload_key(index, id))?;
     let header = read_header(txn, index, &location).await?;
     put_header(txn, index, &location, removed_entry(header)?).await?;
-    Ok(DeleteOutcome::Deleted)
+    Ok(DeleteOutcome::Deleted { location })
 }
 
 /// Reads the authoritative Record Locations of one batch of Record IDs with

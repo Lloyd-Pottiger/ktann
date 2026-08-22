@@ -82,7 +82,9 @@ fn wide_config() -> IndexConfig {
 }
 
 fn make_runtime(backend: SharedBackend) -> Runtime<SharedBackend> {
-    Runtime::new(backend, RuntimeConfig::default()).expect("runtime is valid")
+    // These suites drive the state machines by hand; background maintenance
+    // workers would race the manual drives.
+    Runtime::new(backend, support::manual_maintenance_config()).expect("runtime is valid")
 }
 
 fn retry() -> RetryPolicy {

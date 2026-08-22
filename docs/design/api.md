@@ -182,8 +182,8 @@ The v1 defaults and caps are:
 | Setting | Default | Hard cap / validation |
 | --- | ---: | ---: |
 | Running / waiting foreground operations | 1,024 each | 1..=65,536 each |
-| Maintenance workers | `min(available_parallelism, 8)`, min 1 | at least 1 |
-| Pending/running fixups | 1,024 | at least worker count |
+| Maintenance workers | `min(available_parallelism, 8)`, min 1 | zero disables background maintenance |
+| Pending/running fixups | 1,024 | positive, at least worker count |
 | Fixup / foreground attempts | 8 each | at least 1 |
 | Partition cache | 256 MiB | zero disables; must fit `usize` |
 | Scanned Tree Keys | 4,096 | 65,536 |

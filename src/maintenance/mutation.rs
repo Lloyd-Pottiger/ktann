@@ -36,14 +36,16 @@
 //!   checked before every attempt and before commit; once commit starts, the
 //!   real result wins.
 //!
-//! Offering maintenance after a committed mutation arrives with the Fixup
-//! runtime; losing it never affects correctness because every committed
-//! topology state remains searchable.
+//! Offering maintenance after a committed mutation is demand-driven and
+//! best-effort: the committed attempt's routed targets, replacement and delete
+//! sources, and any draining split sources rerouted around during descent are
+//! returned for the Runtime's Fixup queue. Losing them never affects
+//! correctness because every committed topology state remains searchable.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::api::{Error, ErrorKind, Mutation, MutationOutcome, Record, Result};
-use crate::runtime::lifecycle::RetryPolicy;
+use crate::api::{Error, ErrorKind, Mutation, MutationOutcome, PartitionKey, Record, Result};
+use crate::runtime::lifecycle::{RetryPolicy, now_unix_millis};
 use crate::runtime::{OperationContext, writes};
 use crate::search::numeric::VectorKernel;
 use crate::search::rabitq::RaBitQ7;
@@ -55,6 +57,20 @@ use crate::storage::values::{
 use crate::storage::{MutationBuilder, WriteLogicalTxn, membership};
 
 use super::routing;
+
+/// The result of one committed mutation batch: per-item outcomes and the
+/// partitions worth offering to demand-driven maintenance.
+///
+/// The maintenance list holds the insert/upsert target leaves (possible split
+/// candidates), the leaves a replacement or delete shrank (possible merge
+/// candidates), and the draining split sources the descent rerouted around
+/// (resumable drain work). It is best-effort discovery, not correctness state.
+pub(crate) struct MutationReport {
+    /// Per-item outcomes aligned to the validated input batch.
+    pub(crate) outcomes: Vec<MutationOutcome>,
+    /// Discovered `(Tree Key, Partition Key)` maintenance candidates.
+    pub(crate) maintenance: Vec<(TreeKey, PartitionKey)>,
+}
 
 /// Runs one validated, non-empty mutation batch as a bounded sequence of
 /// whole attempts.
@@ -69,7 +85,7 @@ pub(crate) async fn mutate<B: Backend>(
     handle_manifest: &IndexManifest,
     mutations: &[Mutation],
     retry: RetryPolicy,
-) -> Result<Vec<MutationOutcome>> {
+) -> Result<MutationReport> {
     let kernel = routing::kernel_for(handle_manifest)?;
     let prepared = prepare_all(handle_manifest, &kernel, mutations)?;
     let backend = context.backend();
@@ -84,7 +100,7 @@ pub(crate) async fn mutate<B: Backend>(
         )
         .await?;
         match outcome {
-            ApplyOutcome::Applied(outcomes) => return Ok(outcomes),
+            ApplyOutcome::Applied(report) => return Ok(report),
             // A Merging leaf blocked routing and no Ready same-level target
             // exists: the attempt staged no writes, so the whole operation
             // retries from a fresh snapshot under the bounded policy, and
@@ -99,7 +115,7 @@ pub(crate) async fn mutate<B: Backend>(
 /// The outcome of one whole mutation attempt.
 enum ApplyOutcome {
     /// Every mutation applied; the attempt commits.
-    Applied(Vec<MutationOutcome>),
+    Applied(MutationReport),
     /// Routing found no `Ready` same-level merge target; the attempt staged
     /// no writes and the operation retries.
     NoReadyMergeTarget,
@@ -121,8 +137,11 @@ async fn apply_all<T: WriteTxn>(
 ) -> Result<ApplyOutcome> {
     debug_assert_eq!(mutations.len(), prepared.len());
     let started_at = now_unix_millis();
-    let targets = match route_all(txn, kernel, prepared, started_at).await? {
-        RouteAll::Routed(targets) => targets,
+    let (targets, mut maintenance) = match route_all(txn, kernel, prepared, started_at).await? {
+        RouteAll::Routed {
+            targets,
+            draining_sources,
+        } => (targets, draining_sources),
         // Routing queues no writes, so an attempt abandoned here commits
         // nothing and retries whole.
         RouteAll::NoReadyMergeTarget => return Ok(ApplyOutcome::NoReadyMergeTarget),
@@ -132,19 +151,26 @@ async fn apply_all<T: WriteTxn>(
     let mut outcomes = Vec::with_capacity(mutations.len());
     for (position, mutation) in mutations.iter().enumerate() {
         let routed = prepared[position].as_ref().zip(targets[position].as_ref());
+        // Only a committed attempt's discoveries reach the caller, so
+        // collecting them inside the item application is safe even though
+        // aborted attempts repeat it.
         let outcome = apply_one(
             txn,
             mutation,
             routed,
             expected[position].as_ref(),
             &mut deferred,
+            &mut maintenance,
         )
         .await
         .map_err(|error| error.at_position(position))?;
         outcomes.push(outcome);
     }
     txn.apply(deferred).await?;
-    Ok(ApplyOutcome::Applied(outcomes))
+    Ok(ApplyOutcome::Applied(MutationReport {
+        outcomes,
+        maintenance,
+    }))
 }
 
 /// One Tree Key's routing group: the items routed together in one descent.
@@ -157,8 +183,14 @@ struct RouteGroup<'a> {
 
 /// The outcome of routing every Insert/Upsert item to its target leaf.
 enum RouteAll {
-    /// Every item routed, aligned to the input positions.
-    Routed(Vec<Option<RecordLocation>>),
+    /// Every item routed, aligned to the input positions, with the draining
+    /// split sources the descents rerouted around.
+    Routed {
+        /// The routed target locations, aligned to the input positions.
+        targets: Vec<Option<RecordLocation>>,
+        /// The `DrainingSplit` sources discovered during the descents.
+        draining_sources: Vec<(TreeKey, PartitionKey)>,
+    },
     /// A `Merging` leaf blocked routing and no `Ready` same-level target
     /// exists.
     NoReadyMergeTarget,
@@ -177,6 +209,7 @@ async fn route_all<T: WriteTxn>(
     started_at: u64,
 ) -> Result<RouteAll> {
     let mut targets: Vec<Option<RecordLocation>> = vec![None; prepared.len()];
+    let mut draining_sources = Vec::new();
     let mut group_index: BTreeMap<&[u8], usize> = BTreeMap::new();
     let mut groups: Vec<RouteGroup<'_>> = Vec::new();
     for (position, prepared) in prepared.iter().enumerate() {
@@ -214,11 +247,26 @@ async fn route_all<T: WriteTxn>(
                 return Ok(RouteAll::NoReadyMergeTarget);
             }
         };
+        // A descent rerouted by a draining split source is the relevant
+        // access that resumes its drain; group members often share one
+        // source, so offer each distinct source once per group.
+        let sources: BTreeSet<PartitionKey> = routes
+            .iter()
+            .filter_map(|route| route.draining_source())
+            .collect();
+        draining_sources.extend(
+            sources
+                .into_iter()
+                .map(|source| (group.tree_key.clone(), source)),
+        );
         for ((position, prepared), route) in group.members.into_iter().zip(routes) {
             targets[position] = Some(RecordLocation::new(prepared.tree_key.clone(), route.leaf()));
         }
     }
-    Ok(RouteAll::Routed(targets))
+    Ok(RouteAll::Routed {
+        targets,
+        draining_sources,
+    })
 }
 
 /// Reads the stored Record Locations of every upsert item with one batched
@@ -257,12 +305,17 @@ async fn read_locations<T: WriteTxn>(
 /// `routed` carries the prepared record and its target location; exactly the
 /// insert/upsert items are prepared and routed by `apply_all`, so a missing
 /// pair for those items is an internal contract violation, not caller input.
+/// Successful items push their maintenance candidates onto `maintenance`: the
+/// insert/upsert target leaf (a possible split candidate), a replaced
+/// record's previous leaf when it moved (a possible merge candidate), and a
+/// deleted record's leaf.
 async fn apply_one<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     mutation: &Mutation,
     routed: Option<(&PreparedRecord, &RecordLocation)>,
     expected: Option<&RecordLocation>,
     deferred: &mut MutationBuilder<'_>,
+    maintenance: &mut Vec<(TreeKey, PartitionKey)>,
 ) -> Result<MutationOutcome> {
     match mutation {
         Mutation::Insert(_) => {
@@ -276,11 +329,13 @@ async fn apply_one<T: WriteTxn>(
                 &prepared.entry,
             )
             .await?;
+            // The target may have crossed the split threshold.
+            maintenance.push((target.tree_key().clone(), target.leaf()));
             Ok(MutationOutcome::Inserted)
         }
         Mutation::Upsert(_) => {
             let (prepared, target) = routed.ok_or_else(|| Error::new(ErrorKind::Backend))?;
-            match expected {
+            let outcome = match expected {
                 None => {
                     membership::insert_record(
                         txn,
@@ -291,7 +346,7 @@ async fn apply_one<T: WriteTxn>(
                         &prepared.entry,
                     )
                     .await?;
-                    Ok(MutationOutcome::Upserted { replaced: false })
+                    MutationOutcome::Upserted { replaced: false }
                 }
                 Some(expected) => {
                     membership::replace_record(
@@ -304,15 +359,30 @@ async fn apply_one<T: WriteTxn>(
                         &prepared.entry,
                     )
                     .await?;
-                    Ok(MutationOutcome::Upserted { replaced: true })
+                    // A replacement that moved the record shrank its old
+                    // leaf, possibly below the merge threshold.
+                    if expected != target {
+                        maintenance.push((expected.tree_key().clone(), expected.leaf()));
+                    }
+                    MutationOutcome::Upserted { replaced: true }
                 }
-            }
+            };
+            // The target may have crossed the split threshold.
+            maintenance.push((target.tree_key().clone(), target.leaf()));
+            Ok(outcome)
         }
         Mutation::Delete(id) => {
             let outcome = membership::delete_record(txn, deferred, id).await?;
-            Ok(MutationOutcome::Deleted {
-                existed: matches!(outcome, membership::DeleteOutcome::Deleted),
-            })
+            let existed = match outcome {
+                membership::DeleteOutcome::Deleted { location } => {
+                    // The deleted-from leaf may have fallen below the merge
+                    // threshold.
+                    maintenance.push((location.tree_key().clone(), location.leaf()));
+                    true
+                }
+                membership::DeleteOutcome::NotFound => false,
+            };
+            Ok(MutationOutcome::Deleted { existed })
         }
     }
 }
@@ -382,15 +452,4 @@ impl PreparedRecord {
             entry: LeafEntry::new(record.id().clone(), Box::from(record.fields()), rabitq7),
         })
     }
-}
-
-/// Returns the current Unix time in milliseconds, or zero for a clock before
-/// the epoch. State-start times only diagnose stalls and never grant
-/// ownership, so a degraded clock cannot affect correctness.
-fn now_unix_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
-        .unwrap_or(0)
 }
