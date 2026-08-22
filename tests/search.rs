@@ -797,6 +797,202 @@ async fn inconsistent_persistent_state_fails_closed() {
     runtime.shutdown().await.expect("shutdown");
 }
 
+/// One Record ID reachable from two partitions at once — the leftover state
+/// of a failed update in the reference corpus (issue #100, item A4). Where
+/// CockroachDB dedupes and reranks the true distance, KTANN fails closed: a
+/// duplicate Record ID in one snapshot is Corruption, never silently
+/// deduplicated (design search.md section 6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_duplicate_record_id_across_partitions_fails_closed() {
+    let (backend, runtime, index) = setup().await;
+    let rows: Vec<Row> = vec![
+        (b"a".to_vec(), 1.0, 7, Some(1)),
+        (b"b".to_vec(), 2.0, 7, Some(2)),
+        (b"c".to_vec(), 3.0, 7, Some(3)),
+    ];
+    insert_all(&index, &rows).await;
+
+    let iid = index.logical_index_id();
+    let manifest = read_manifest(&backend, iid).await;
+    let key = tree_key(7);
+
+    // Read the committed root Leaf Entries back: the RaBitQ7 encoding is
+    // internal, so the crafted state copies the decoded envelopes rather
+    // than re-encoding vectors.
+    let mut entries = {
+        let raw = backend.begin_read().await.expect("begin read");
+        let mut txn = ReadLogicalTxn::for_index(raw, &manifest).expect("bind index");
+        let range = LogicalRange::leaf_entries(&manifest, &key, pk(1)).expect("leaf range");
+        let page = txn
+            .scan(
+                &range,
+                None,
+                ScanLimits {
+                    item_limit: 16,
+                    byte_limit: 1 << 20,
+                },
+            )
+            .await
+            .expect("scan root leaf");
+        assert!(page.next_cursor().is_none(), "one page covers the root");
+        let mut entries = std::collections::BTreeMap::new();
+        for item in page.into_items() {
+            let LogicalKey::LeafEntry { id, .. } = item.key() else {
+                panic!("a Leaf Entry range holds only Leaf Entries");
+            };
+            let id = id.clone();
+            let PersistentValue::LeafEntry(entry) = item.into_value() else {
+                panic!("a Leaf Entry range holds only Leaf Entries");
+            };
+            entries.insert(id, entry);
+        }
+        entries
+    };
+
+    // Hand-install a committed DrainingSplit shape where the failed-update
+    // leftover is visible: "a" stays in the root body AND a stray copy lives
+    // in the pk=2 target, while "c" drains cleanly to pk=3. Every Header,
+    // State, and Synopsis is consistent; only the duplicated Record ID is
+    // wrong.
+    let raw = backend.begin_write().await.expect("begin write");
+    let mut txn = WriteLogicalTxn::for_index(
+        raw,
+        &manifest,
+        backend.hard_limits(),
+        backend.admission_budget(),
+    )
+    .expect("bind index");
+    let header = |partition, count, state| {
+        (
+            LogicalKey::Header {
+                index: iid,
+                tree_key: key.clone(),
+                partition,
+            },
+            PersistentValue::PartitionHeader(
+                PartitionHeader::new(1, count, 7, state).expect("header"),
+            ),
+        )
+    };
+    let state = |partition, transition: PartitionTransition| {
+        (
+            LogicalKey::State {
+                index: iid,
+                tree_key: key.clone(),
+                partition,
+            },
+            PersistentValue::PartitionState(transition),
+        )
+    };
+    let synopsis = |partition, row: &Row| {
+        let mut synopsis = PartitionSynopsis::empty(&manifest);
+        synopsis
+            .expand(
+                &manifest,
+                &[
+                    Value::I64(row.2),
+                    row.3.map(Value::I64).unwrap_or(Value::Null),
+                ],
+            )
+            .expect("expand synopsis");
+        (
+            LogicalKey::Synopsis {
+                index: iid,
+                tree_key: key.clone(),
+                partition,
+            },
+            PersistentValue::PartitionSynopsis(synopsis),
+        )
+    };
+    let writes = [
+        header(pk(1), 2, PartitionState::DrainingSplit),
+        state(
+            pk(1),
+            PartitionTransition::DrainingSplit {
+                left: pk(2),
+                right: pk(3),
+                started_at_unix_millis: 0,
+            },
+        ),
+        header(pk(2), 1, PartitionState::ReceivingSplit),
+        state(
+            pk(2),
+            PartitionTransition::ReceivingSplit {
+                source: pk(1),
+                started_at_unix_millis: 0,
+            },
+        ),
+        synopsis(pk(2), &rows[0]),
+        header(pk(3), 1, PartitionState::ReceivingSplit),
+        state(
+            pk(3),
+            PartitionTransition::ReceivingSplit {
+                source: pk(1),
+                started_at_unix_millis: 0,
+            },
+        ),
+        synopsis(pk(3), &rows[2]),
+    ];
+    for (key, value) in writes {
+        txn.put(key, value).await.expect("write topology");
+    }
+    // The stray copy of "a" in pk=2: no delete at the root, no Location
+    // update — the Record Location still names the root, as a torn
+    // relocation would leave it.
+    let id_a = Bytes::from_static(b"a");
+    let entry_a = entries.remove(&id_a).expect("committed entry exists");
+    txn.put(
+        LogicalKey::LeafEntry {
+            index: iid,
+            tree_key: key.clone(),
+            partition: pk(2),
+            id: id_a.clone(),
+        },
+        PersistentValue::LeafEntry(entry_a),
+    )
+    .await
+    .expect("copy leaf entry");
+    // "c" drains cleanly: moved out of the root with its Location.
+    let id_c = Bytes::from_static(b"c");
+    let entry_c = entries.remove(&id_c).expect("committed entry exists");
+    txn.put(
+        LogicalKey::LeafEntry {
+            index: iid,
+            tree_key: key.clone(),
+            partition: pk(3),
+            id: id_c.clone(),
+        },
+        PersistentValue::LeafEntry(entry_c),
+    )
+    .await
+    .expect("move leaf entry");
+    txn.delete(LogicalKey::LeafEntry {
+        index: iid,
+        tree_key: key.clone(),
+        partition: pk(1),
+        id: id_c.clone(),
+    })
+    .await
+    .expect("remove source entry");
+    txn.put(
+        LogicalKey::Location {
+            index: iid,
+            id: id_c.clone(),
+        },
+        PersistentValue::RecordLocation(RecordLocation::new(key.clone(), pk(3))),
+    )
+    .await
+    .expect("move record location");
+    txn.commit().await.expect("commit crafted state");
+
+    let error = index
+        .search(search_request(10))
+        .await
+        .expect_err("a duplicate Record ID across partitions is corruption");
+    assert_eq!(error.kind(), ErrorKind::Corruption);
+    runtime.shutdown().await.expect("shutdown");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn backend_limits_paginate_scans_and_bound_batches() {
     // One item per backend scan page: directory enumeration and body loads

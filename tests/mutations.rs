@@ -1026,7 +1026,12 @@ async fn seed_grown_tree(backend: &SharedBackend, manifest: &IndexManifest, buck
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn batched_inserts_share_routing_and_apply_writes_once() {
     let backend = backend(DeterministicConfig::default());
-    let runtime = make_runtime(backend.clone());
+    // Exact backend operation counts are incompatible with background fixup
+    // workers: the 40 inserts over-fill both seeded leaves, and a worker that
+    // wakes inside the counted window adds its own reads (flaky on stable CI
+    // since #102). This test drives no maintenance, so it runs workerless.
+    let runtime = Runtime::new(backend.clone(), support::manual_maintenance_config())
+        .expect("runtime is valid");
     let index = runtime
         .create_index("batched", config_1d())
         .await

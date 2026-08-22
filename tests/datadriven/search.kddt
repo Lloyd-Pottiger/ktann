@@ -1,6 +1,8 @@
 # ----------------------------------------------------------------------
 # Bounded search over a clustered dataset: exact hits, budget accounting,
-# predicate filtering, and truncation reporting.
+# predicate filtering, and truncation reporting. Later sections cover ties
+# and duplicates at the k boundary, empty trees and partitions, and the
+# same scenario under every metric (issue #100, items A3/A5).
 # ----------------------------------------------------------------------
 new-index dimension=8 metric=L2 fields=bucket:i64,score:f64? tree-key-fields=0 min-entries=8 max-entries=32
 ----
@@ -107,4 +109,222 @@ r000103: 1.3630
 r001343: 1.3692
 usage: scanned_tree_keys=1 visited_partitions=1 visited_leaf_entries=2000 exact_rerank_candidates=2
 exhausted: rabitq_overlap_truncated
+
+# ----------------------------------------------------------------------
+# A5: an empty tree reports zero hits with budget usage still accounted.
+# ----------------------------------------------------------------------
+new-index dimension=2 metric=L2 fields=bucket:i64 tree-key-fields=0 min-entries=2 max-entries=4
+----
+created index "index"
+
+search k=3 vector=[0,0]
+----
+usage: scanned_tree_keys=0 visited_partitions=0 visited_leaf_entries=0 exact_rerank_candidates=0
+
+# ----------------------------------------------------------------------
+# A3: ties and duplicates at the k boundary. Duplicate vectors tie on exact
+# distance and resolve by unsigned lexicographic Record ID bytes; the result
+# is truncated to exactly k — there is no MaxExtraResults-style spillover.
+# ----------------------------------------------------------------------
+insert tree=1
+a: [0,0]
+b: [1,0]
+c: [1,0]
+d: [1,0]
+e: [2,0]
+f: [3,0]
+----
+a: ok
+b: ok
+c: ok
+d: ok
+e: ok
+f: ok
+
+# A three-way tie at the boundary: k=2 takes the smallest tied Record ID,
+# k=3 and k=4 walk the tie in Record ID order, never more than k hits.
+search k=2 vector=[0,0]
+----
+a: 0.0000
+b: 1.0000
+usage: scanned_tree_keys=1 visited_partitions=1 visited_leaf_entries=6 exact_rerank_candidates=4
+
+search k=3 vector=[0,0]
+----
+a: 0.0000
+b: 1.0000
+c: 1.0000
+usage: scanned_tree_keys=1 visited_partitions=1 visited_leaf_entries=6 exact_rerank_candidates=4
+
+search k=4 vector=[0,0]
+----
+a: 0.0000
+b: 1.0000
+c: 1.0000
+d: 1.0000
+usage: scanned_tree_keys=1 visited_partitions=1 visited_leaf_entries=6 exact_rerank_candidates=4
+
+# The tie order is global: it is identical after the root split scatters
+# the duplicates across two leaves.
+split tree=1 partition=1
+----
+pk=1: split into left=2 right=3
+
+search k=4 vector=[0,0]
+----
+a: 0.0000
+b: 1.0000
+c: 1.0000
+d: 1.0000
+usage: scanned_tree_keys=1 visited_partitions=3 visited_leaf_entries=6 exact_rerank_candidates=4
+
+validate
+----
+ok: records=6 trees=1 partitions=3 max_level=2
+
+# A5: deleting everything leaves an empty internal root with empty leaf
+# partitions; search still reports its (zero) budget usage.
+delete
+a
+b
+c
+d
+e
+f
+----
+a: true
+b: true
+c: true
+d: true
+e: true
+f: true
+
+format-tree
+----
+tree 0: root pk=1
+  pk=1 level=2 state=Ready count=2
+    pk=2 level=1 state=Ready count=0
+    pk=3 level=1 state=Ready count=0
+
+search k=3 vector=[0,0]
+----
+usage: scanned_tree_keys=1 visited_partitions=3 visited_leaf_entries=0 exact_rerank_candidates=0
+
+validate
+----
+ok: records=0 trees=1 partitions=3 max_level=2
+
+# ----------------------------------------------------------------------
+# A5: the same scenario under Cosine and InnerProduct — one insert set, one
+# split, and identical queries across both metrics, recording each metric's
+# exact distance semantics over the same topology shape. The zero vector has
+# no direction and is rejected under Cosine; InnerProduct accepts it, so the
+# shared set below is non-zero (and still carries a three-way duplicate).
+# ----------------------------------------------------------------------
+new-index dimension=2 metric=Cosine fields=bucket:i64 tree-key-fields=0 min-entries=2 max-entries=4
+----
+created index "index"
+
+insert tree=1
+zero: [0,0]
+----
+zero: error InvalidArgument
+
+insert tree=1
+a: [1,1]
+b: [1,0]
+c: [1,0]
+d: [1,0]
+e: [2,1]
+f: [3,1]
+----
+a: ok
+b: ok
+c: ok
+d: ok
+e: ok
+f: ok
+
+search k=4 vector=[1,0]
+----
+b: 0.0000
+c: 0.0000
+d: 0.0000
+f: 0.0513
+usage: scanned_tree_keys=1 visited_partitions=1 visited_leaf_entries=6 exact_rerank_candidates=4
+
+split tree=1 partition=1
+----
+pk=1: split into left=2 right=3
+
+search k=4 vector=[1,0]
+----
+b: 0.0000
+c: 0.0000
+d: 0.0000
+f: 0.0513
+usage: scanned_tree_keys=1 visited_partitions=3 visited_leaf_entries=6 exact_rerank_candidates=4
+
+search k=4 vector=[1,0] where=0:eq:1
+----
+b: 0.0000
+c: 0.0000
+d: 0.0000
+f: 0.0513
+usage: scanned_tree_keys=1 visited_partitions=3 visited_leaf_entries=6 exact_rerank_candidates=4
+
+validate
+----
+ok: records=6 trees=1 partitions=3 max_level=2
+
+new-index dimension=2 metric=InnerProduct fields=bucket:i64 tree-key-fields=0 min-entries=2 max-entries=4
+----
+created index "index"
+
+insert tree=1
+a: [1,1]
+b: [1,0]
+c: [1,0]
+d: [1,0]
+e: [2,1]
+f: [3,1]
+----
+a: ok
+b: ok
+c: ok
+d: ok
+e: ok
+f: ok
+
+search k=4 vector=[1,0]
+----
+f: -3.0000
+e: -2.0000
+a: -1.0000
+b: -1.0000
+usage: scanned_tree_keys=1 visited_partitions=1 visited_leaf_entries=6 exact_rerank_candidates=6
+
+split tree=1 partition=1
+----
+pk=1: split into left=2 right=3
+
+search k=4 vector=[1,0]
+----
+f: -3.0000
+e: -2.0000
+a: -1.0000
+b: -1.0000
+usage: scanned_tree_keys=1 visited_partitions=3 visited_leaf_entries=6 exact_rerank_candidates=6
+
+search k=4 vector=[1,0] where=0:eq:1
+----
+f: -3.0000
+e: -2.0000
+a: -1.0000
+b: -1.0000
+usage: scanned_tree_keys=1 visited_partitions=3 visited_leaf_entries=6 exact_rerank_candidates=6
+
+validate
+----
+ok: records=6 trees=1 partitions=3 max_level=2
 

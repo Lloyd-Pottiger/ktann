@@ -5,13 +5,13 @@
 # provenance); Record IDs are dataset ordinals (r000000 .. r009999).
 #
 # Foreground mutations never trigger a split on their own in the current
-# build, so every tree here is a single leaf: with sufficient budgets search
-# is an exact flat scan and recall must be 100%. Overlap truncation (the
-# bounded exact-rerank overlap cap) is expected on a 10k-entry flat leaf with
-# concentrated real distances; the counts move once split-step directives
-# (tracked in #94) drive the #10 state machine and this corpus exercises
-# approximate traversal. Query samples are capped to bound brute-force oracle
-# cost.
+# build, so the first suites are single flat leaves: with sufficient budgets
+# search is an exact flat scan and recall must be 100%. Overlap truncation
+# (the bounded exact-rerank overlap cap) is expected on a 10k-entry flat
+# leaf with concentrated real distances. The final suite drives two splits
+# and sweeps the leaf beam width (issue #100, item B1); settling a full
+# 10k-entry tree stays out of the debug corpus (#98, issue #100 item B3).
+# Query samples are capped to bound brute-force oracle cost.
 # ----------------------------------------------------------------------
 # --- SIFTsmall base: 10k x 128 dense descriptors, L2 ---
 new-index name=sift dimension=128 metric=L2 fields=bucket:i64,label:i64 tree-key-fields=0 min-entries=8 max-entries=32
@@ -118,4 +118,47 @@ recall k=10 samples=5 query=file:fashion_mnist_query.idx3-ubyte
 ----
 recall@10: 100.00% (samples=5, truncated=5)
 mean usage: visited_partitions=1 visited_leaf_entries=10000 exact_rerank_candidates=23
+
+# --- Beam x recall on a split siftsmall tree (issue #100, item B1) ---
+# Two splits give a three-leaf tree; the beam sweep trades recall against
+# visited partitions. Settling all 10k entries stays out of scope (#98).
+new-index name=siftbeam dimension=128 metric=L2 fields=bucket:i64,label:i64 tree-key-fields=0 min-entries=8 max-entries=32
+----
+created index "siftbeam"
+
+load dataset=file:siftsmall_base.fvecs tree=1 via=batch batch=100
+----
+loaded 10000 records (dataset=file:siftsmall_base.fvecs, seed=42)
+
+split tree=1 partition=1
+----
+pk=1: split into left=2 right=3
+
+split tree=1 partition=2
+----
+pk=2: split into left=4 right=5
+
+validate
+----
+ok: records=10000 trees=1 partitions=4 max_level=2
+
+recall k=10 samples=10 query=file:siftsmall_query.fvecs beam-size=1
+----
+recall@10: 85.00% (samples=10, truncated=8)
+mean usage: visited_partitions=2 visited_leaf_entries=3506 exact_rerank_candidates=20
+
+recall k=10 samples=10 query=file:siftsmall_query.fvecs beam-size=2
+----
+recall@10: 100.00% (samples=10, truncated=9)
+mean usage: visited_partitions=3 visited_leaf_entries=5966 exact_rerank_candidates=22
+
+recall k=10 samples=10 query=file:siftsmall_query.fvecs beam-size=4
+----
+recall@10: 100.00% (samples=10, truncated=10)
+mean usage: visited_partitions=4 visited_leaf_entries=10000 exact_rerank_candidates=22
+
+recall k=10 samples=10 query=file:siftsmall_query.fvecs beam-size=32
+----
+recall@10: 100.00% (samples=10, truncated=10)
+mean usage: visited_partitions=4 visited_leaf_entries=10000 exact_rerank_candidates=22
 

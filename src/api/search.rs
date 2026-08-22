@@ -12,6 +12,9 @@ const MAX_SCANNED_TREE_KEYS: u32 = 65_536;
 const MAX_VISITED_PARTITIONS: u32 = 16_384;
 const MAX_VISITED_LEAF_ENTRIES: u32 = 1_048_576;
 const MAX_EXACT_RERANK_CANDIDATES: u32 = 65_536;
+/// Beam width is counted in partitions, so anything wider than the visited
+/// partition hard cap is guaranteed to exhaust that budget instead.
+const MAX_LEAF_BEAM_SIZE: u32 = MAX_VISITED_PARTITIONS;
 
 /// Concrete limits applied to one Search.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -92,7 +95,8 @@ impl SearchBudgets {
     }
 }
 
-/// Optional per-request overrides of Runtime Search Budgets.
+/// Optional per-request overrides of Runtime Search Budgets and traversal
+/// width.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct SearchOptions {
@@ -100,6 +104,7 @@ pub struct SearchOptions {
     visited_partitions: Option<u32>,
     visited_leaf_entries: Option<u32>,
     exact_rerank_candidates: Option<u32>,
+    leaf_beam_size: Option<u32>,
 }
 
 impl SearchOptions {
@@ -129,6 +134,24 @@ impl SearchOptions {
         validate_override(value, MAX_EXACT_RERANK_CANDIDATES)?;
         self.exact_rerank_candidates = Some(value);
         Ok(self)
+    }
+
+    /// Overrides the positive leaf-level base beam width.
+    ///
+    /// The beam is a traversal-quality knob, not an accounted budget
+    /// dimension: wider beams visit more partitions, all still charged to the
+    /// visited-partition budget. When unset, the leaf-level base beam defaults
+    /// to 32 (design `search.md` section 6).
+    pub fn with_leaf_beam_size(mut self, value: u32) -> Result<Self> {
+        validate_override(value, MAX_LEAF_BEAM_SIZE)?;
+        self.leaf_beam_size = Some(value);
+        Ok(self)
+    }
+
+    /// Returns the leaf-level base beam width override.
+    #[must_use]
+    pub const fn leaf_beam_size(self) -> Option<u32> {
+        self.leaf_beam_size
     }
 
     /// Resolves overrides against Runtime defaults and validates them for `k`.
