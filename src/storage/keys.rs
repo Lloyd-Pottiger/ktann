@@ -47,6 +47,11 @@
 //! invalid UTF-8, and trailing bytes after a terminal component. Every decode
 //! failure returns [`ErrorKind::Corruption`]; encode-time rejection of invalid
 //! caller input returns [`ErrorKind::InvalidArgument`].
+//!
+//! Decoding is zero-copy: decoded Tree Key and Record ID components borrow the
+//! input key's allocation, and validation walks the canonical encoding without
+//! materializing field values. Only a Record ID containing `0x00` bytes, whose
+//! escaped form is not contiguous in the key, decodes into one owned buffer.
 
 use std::fmt;
 
@@ -59,7 +64,9 @@ use crate::api::{
 #[doc(inline)]
 pub use super::tree_key::{MAX_STRING_BYTES, MAX_TREE_KEY_BYTES, TreeKey};
 
-use super::tree_key::{decode_escaped_terminated, push_escaped_terminated, take_array};
+use super::tree_key::{
+    decode_escaped_terminated, push_escaped_terminated, scan_escaped_terminated, take_array,
+};
 
 /// The single logical-key format version emitted and accepted by this build.
 pub const KEY_VERSION: u8 = 1;
@@ -387,12 +394,13 @@ fn check_record_id(id: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Decodes a terminal Record ID.
-fn decode_record_id(bytes: &[u8]) -> Result<Bytes> {
-    if bytes.is_empty() || bytes.len() > MAX_RECORD_ID_BYTES {
+/// Validates and shares the terminal Record ID starting at `offset` in `key`.
+fn slice_terminal_record_id(key: &Bytes, offset: usize) -> Result<Bytes> {
+    let id = key.get(offset..).ok_or_else(corrupt)?;
+    if id.is_empty() || id.len() > MAX_RECORD_ID_BYTES {
         return Err(corrupt());
     }
-    Ok(Bytes::copy_from_slice(bytes))
+    Ok(key.slice(offset..))
 }
 
 /// Decodes a terminal Index Name.
@@ -599,16 +607,16 @@ pub(crate) fn encode_key(key: &LogicalKey) -> Result<Vec<u8>> {
 ///
 /// `types` is the ordered Tree Key field types and is required to split the
 /// Tree Key from its trailing components; it must match the Logical Index's
-/// immutable schema.
-pub fn decode_key(types: &[DataType], key: &[u8]) -> Result<LogicalKey> {
+/// immutable schema. Decoding is zero-copy: the decoded Tree Key and Record ID
+/// components share `key`'s allocation.
+pub fn decode_key(types: &[DataType], key: &Bytes) -> Result<LogicalKey> {
     if key.first() != Some(&KEY_VERSION) {
         return Err(corrupt());
     }
     let scope = *key.get(1).ok_or_else(corrupt)?;
-    let body = &key[2..];
     match scope {
-        SCOPE_NAMESPACE => decode_namespace_key(body),
-        SCOPE_INDEX => decode_index_key(types, body),
+        SCOPE_NAMESPACE => decode_namespace_key(&key[2..]),
+        SCOPE_INDEX => decode_index_key(types, key, 2),
         _ => Err(corrupt()),
     }
 }
@@ -625,30 +633,43 @@ fn decode_namespace_key(body: &[u8]) -> Result<LogicalKey> {
     }
 }
 
-/// Decodes an index-scope key body.
-fn decode_index_key(types: &[DataType], body: &[u8]) -> Result<LogicalKey> {
+/// Decodes an index-scope key body starting at `offset` in `key`.
+fn decode_index_key(types: &[DataType], key: &Bytes, offset: usize) -> Result<LogicalKey> {
+    let body = &key[offset..];
     let index =
         LogicalIndexId::new(u64::from_be_bytes(take_array::<8>(body)?)).map_err(|_| corrupt())?;
     let kind = *body.get(LOGICAL_INDEX_ID_BYTES).ok_or_else(corrupt)?;
-    let rest = &body[LOGICAL_INDEX_ID_BYTES + 1..];
+    let rest = offset + LOGICAL_INDEX_ID_BYTES + 1;
 
     match kind {
-        KIND_MANIFEST if rest.is_empty() => Ok(LogicalKey::Manifest(index)),
+        KIND_MANIFEST if body.len() == LOGICAL_INDEX_ID_BYTES + 1 => {
+            Ok(LogicalKey::Manifest(index))
+        }
         KIND_MANIFEST => Err(corrupt()),
-        KIND_RECORD_GROUP => decode_record_group(index, rest),
+        KIND_RECORD_GROUP => decode_record_group(index, key, rest),
         KIND_TREE_MANIFEST => Ok(LogicalKey::TreeManifest {
             index,
-            tree_key: TreeKey::from_encoded(types, rest)?,
+            tree_key: TreeKey::from_encoded(types, key.slice(rest..))?,
         }),
-        KIND_PARTITION => decode_partition_key(types, index, rest),
+        KIND_PARTITION => decode_partition_key(types, index, key, rest),
         _ => Err(corrupt()),
     }
 }
 
-fn decode_record_group(index: LogicalIndexId, bytes: &[u8]) -> Result<LogicalKey> {
-    let (id, offset) = decode_escaped_terminated(bytes, MAX_RECORD_ID_BYTES)?;
-    let id = decode_record_id(&id)?;
-    match bytes.get(offset..) {
+fn decode_record_group(index: LogicalIndexId, key: &Bytes, offset: usize) -> Result<LogicalKey> {
+    let body = key.get(offset..).ok_or_else(corrupt)?;
+    let scan = scan_escaped_terminated(body, MAX_RECORD_ID_BYTES)?;
+    let id = if scan.escaped {
+        // An escaped Record ID is not contiguous in the key, so decode it into
+        // one owned buffer. IDs without a `0x00` byte take the borrowed path.
+        Bytes::from(decode_escaped_terminated(body, &scan))
+    } else {
+        key.slice(offset..offset + scan.decoded_len)
+    };
+    if id.is_empty() {
+        return Err(corrupt());
+    }
+    match key.get(offset + scan.consumed..) {
         Some([RECORD_VALUE]) => Ok(LogicalKey::Record { index, id }),
         Some([RECORD_LOCATION]) => Ok(LogicalKey::Location { index, id }),
         Some([RECORD_PAYLOAD]) => Ok(LogicalKey::Payload { index, id }),
@@ -656,19 +677,23 @@ fn decode_record_group(index: LogicalIndexId, bytes: &[u8]) -> Result<LogicalKey
     }
 }
 
-/// Decodes the remainder of a partition-scoped key body.
+/// Decodes the remainder of a partition-scoped key body starting at `offset`
+/// in `key`.
 fn decode_partition_key(
     types: &[DataType],
     index: LogicalIndexId,
-    rest: &[u8],
+    key: &Bytes,
+    offset: usize,
 ) -> Result<LogicalKey> {
-    let (tree_key, tree_key_len) = TreeKey::from_prefix(types, rest)?;
+    let rest = key.slice(offset..);
+    let (tree_key, tree_key_len) = TreeKey::from_prefix(types, &rest)?;
     let after = &rest[tree_key_len..];
 
     let partition =
         PartitionKey::new(u64::from_be_bytes(take_array::<8>(after)?)).map_err(|_| corrupt())?;
     let subkind = *after.get(PARTITION_KEY_BYTES).ok_or_else(corrupt)?;
-    let terminal = &after[PARTITION_KEY_BYTES + 1..];
+    let terminal_offset = offset + tree_key_len + PARTITION_KEY_BYTES + 1;
+    let terminal = key.get(terminal_offset..).ok_or_else(corrupt)?;
 
     match subkind {
         SUB_HEADER if terminal.is_empty() => Ok(LogicalKey::Header {
@@ -695,7 +720,7 @@ fn decode_partition_key(
             index,
             tree_key,
             partition,
-            id: decode_record_id(terminal)?,
+            id: slice_terminal_record_id(key, terminal_offset)?,
         }),
         SUB_CHILD_ENTRY => {
             let child = PartitionKey::new(u64::from_be_bytes(take_array::<8>(terminal)?))

@@ -201,7 +201,7 @@ pub(super) fn decode_record_location(
 ) -> Result<RecordLocation> {
     let bytes = decoder.sized_bytes(MAX_TREE_KEY_BYTES)?;
     let (types, type_count) = manifest.tree_key_types();
-    let tree_key = TreeKey::from_encoded(&types[..type_count], &bytes)?;
+    let tree_key = TreeKey::from_encoded(&types[..type_count], bytes)?;
     let leaf = decoder.partition_key()?;
     Ok(RecordLocation::new(tree_key, leaf))
 }

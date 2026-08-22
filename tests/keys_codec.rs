@@ -30,7 +30,7 @@ fn tk(types: &[DataType], values: &[Value]) -> Vec<u8> {
 }
 
 fn is_corrupt(types: &[DataType], bytes: &[u8]) -> bool {
-    matches!(decode_key(types, bytes), Err(error) if error.kind() == ErrorKind::Corruption)
+    matches!(decode_key(types, &Bytes::copy_from_slice(bytes)), Err(error) if error.kind() == ErrorKind::Corruption)
 }
 
 // ---------------------------------------------------------------------------
@@ -80,7 +80,11 @@ fn record_group_golden_bytes_escape_embedded_nul() {
         b"\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x01a\x00\xffb\x00\x00"
     );
     assert_eq!(
-        decode_key(&[], &record_key(id(1), &record_id).expect("valid id")).expect("decode"),
+        decode_key(
+            &[],
+            &Bytes::from(record_key(id(1), &record_id).expect("valid id"))
+        )
+        .expect("decode"),
         LogicalKey::Record {
             index: id(1),
             id: record_id,
@@ -113,15 +117,15 @@ fn record_values_are_adjacent_and_ordered_by_record_id() {
 
     for (record_id, group) in record_ids.iter().zip(keys.chunks_exact(3)) {
         assert!(matches!(
-            decode_key(&[], &group[0]).expect("decode Record"),
+            decode_key(&[], &Bytes::copy_from_slice(&group[0])).expect("decode Record"),
             LogicalKey::Record { id, .. } if id == *record_id
         ));
         assert!(matches!(
-            decode_key(&[], &group[1]).expect("decode Location"),
+            decode_key(&[], &Bytes::copy_from_slice(&group[1])).expect("decode Location"),
             LogicalKey::Location { id, .. } if id == *record_id
         ));
         assert!(matches!(
-            decode_key(&[], &group[2]).expect("decode Payload"),
+            decode_key(&[], &Bytes::copy_from_slice(&group[2])).expect("decode Payload"),
             LogicalKey::Payload { id, .. } if id == *record_id
         ));
     }
@@ -481,7 +485,7 @@ fn every_key_family_round_trips() {
 
     for key in &keys {
         let encoded = encode_key(key);
-        let decoded = decode_key(&types, &encoded).expect("key decodes");
+        let decoded = decode_key(&types, &Bytes::from(encoded)).expect("key decodes");
         assert_eq!(&decoded, key, "round trip of {key:?}");
     }
 }
