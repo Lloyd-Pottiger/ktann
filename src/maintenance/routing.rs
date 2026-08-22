@@ -134,6 +134,20 @@ impl Route {
     pub const fn parent(self) -> Option<PartitionKey> {
         self.parent
     }
+
+    /// Returns the draining split source whose state slot is this route's
+    /// incoming reference, when the descent redirected around one.
+    ///
+    /// The mutation path offers the source to demand-driven maintenance: a
+    /// write stream rerouted around a `DrainingSplit` leaf is exactly the
+    /// relevant access that resumes its drain.
+    #[must_use]
+    pub(crate) const fn draining_source(self) -> Option<PartitionKey> {
+        match self.incoming {
+            Incoming::SourceSlot(source) => Some(source),
+            Incoming::ParentEdge => None,
+        }
+    }
 }
 
 /// Routes one caller vector through one tree on a read snapshot.

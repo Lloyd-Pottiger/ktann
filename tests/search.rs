@@ -12,8 +12,8 @@ use std::time::Instant;
 use bytes::Bytes;
 use ktann::api::{
     CompareOp, DataType, ErrorKind, FieldId, FieldSchema, Index, IndexConfig, LogicalIndexId,
-    Metric, OperationOptions, Predicate, Record, RuntimeConfig, SearchOptions, SearchOutcome,
-    SearchRequest, Value,
+    Metric, OperationOptions, Predicate, Record, SearchOptions, SearchOutcome, SearchRequest,
+    Value,
 };
 use ktann::runtime::Runtime;
 use ktann::storage::backend::{
@@ -97,7 +97,9 @@ fn config() -> IndexConfig {
 }
 
 fn make_runtime(backend: SharedBackend) -> Runtime<SharedBackend> {
-    Runtime::new(backend, RuntimeConfig::default()).expect("runtime is valid")
+    // Search fixtures pin exact intermediate topology states; background
+    // maintenance workers would advance them concurrently.
+    Runtime::new(backend, support::manual_maintenance_config()).expect("runtime is valid")
 }
 
 fn pk(value: u64) -> ktann::api::PartitionKey {

@@ -20,7 +20,7 @@ use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use ktann::api::{Error, ErrorKind, LogicalIndexId, Result};
+use ktann::api::{Error, ErrorKind, LogicalIndexId, Result, RuntimeConfig};
 use ktann::storage::ReadLogicalTxn;
 use ktann::storage::backend::{
     AdmissionBudget, Backend, Capabilities, CommitStart, HardLimits, InsertOutcome, Mutation,
@@ -33,6 +33,19 @@ pub mod audit;
 pub mod datadriven;
 pub mod dataset;
 pub mod oracle;
+
+/// A Runtime configuration without background maintenance workers.
+///
+/// Tests that drive the split/merge state machines one bounded transition at
+/// a time — or assert exact intermediate topology under fixtures — use this
+/// configuration so demand-driven Fixup scheduling cannot race their manual
+/// drives. Scheduling itself is covered by `maintenance_scheduling.rs`.
+pub fn manual_maintenance_config() -> RuntimeConfig {
+    RuntimeConfig::default()
+        .with_maintenance(0, 1)
+        .and_then(|config| config.with_import_limits(1, 1))
+        .expect("valid manual-maintenance config")
+}
 
 /// A committed keyspace snapshot mapping encoded keys to values.
 type Keyspace = BTreeMap<Vec<u8>, Vec<u8>>;

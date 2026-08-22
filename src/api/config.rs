@@ -264,8 +264,14 @@ impl RuntimeConfig {
     }
 
     /// Sets maintenance worker and pending/running Fixup capacity.
+    ///
+    /// Zero workers disables background Structure Maintenance: this Runtime's
+    /// Fixup offers are dropped, and topology changes advance only through
+    /// drives outside this Runtime. This stays correct — every committed
+    /// intermediate state remains searchable — and exists for callers and
+    /// tests that drive the state machines deterministically.
     pub fn with_maintenance(mut self, workers: usize, queue_capacity: usize) -> Result<Self> {
-        if workers == 0 || queue_capacity < workers {
+        if queue_capacity == 0 || queue_capacity < workers {
             return Err(Error::invalid_argument());
         }
         self.maintenance_workers = workers;
@@ -345,7 +351,7 @@ impl RuntimeConfig {
     pub fn validate(&self) -> Result<()> {
         if self.foreground_operation_limit == 0
             || self.foreground_operation_limit > MAX_FOREGROUND_OPERATION_LIMIT
-            || self.maintenance_workers == 0
+            || self.fixup_queue_capacity == 0
             || self.fixup_queue_capacity < self.maintenance_workers
             || self.fixup_attempts == 0
             || self.foreground_attempts == 0
@@ -367,7 +373,8 @@ impl RuntimeConfig {
         self.foreground_operation_limit
     }
 
-    /// Returns the maintenance worker count.
+    /// Returns the maintenance worker count; zero disables background
+    /// Structure Maintenance.
     #[must_use]
     pub const fn maintenance_workers(&self) -> usize {
         self.maintenance_workers

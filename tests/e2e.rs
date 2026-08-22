@@ -246,7 +246,12 @@ impl Harness {
             ..DeterministicConfig::default()
         };
         let backend = SharedBackend::new(DeterministicBackend::new(backend_config));
-        let runtime = Runtime::new(backend.clone(), RuntimeConfig::default()).expect("runtime");
+        // The corpus drives the split/merge state machines through its own
+        // split-step/merge-step directives and asserts every intermediate
+        // state, so its Runtime runs without background maintenance workers;
+        // demand-driven scheduling is covered by tests/maintenance_scheduling.rs.
+        let runtime =
+            Runtime::new(backend.clone(), support::manual_maintenance_config()).expect("runtime");
         match runtime.create_index(&name, config).await {
             Ok(index) => {
                 self.backend = Some(backend);
@@ -1063,7 +1068,8 @@ impl Harness {
             .take()
             .expect("restart requires new-index first");
         let backend = SharedBackend::new(backend.inner().reopen());
-        let runtime = Runtime::new(backend.clone(), RuntimeConfig::default()).expect("runtime");
+        let runtime =
+            Runtime::new(backend.clone(), support::manual_maintenance_config()).expect("runtime");
         match runtime.open_index(&self.name).await {
             Ok(index) => {
                 self.backend = Some(backend);

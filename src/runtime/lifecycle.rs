@@ -62,24 +62,38 @@ impl RetryPolicy {
         failed_attempts.saturating_add(1) >= self.attempts
     }
 
+    /// Returns the capped pre-jitter backoff interval for one failed attempt.
+    fn interval(self, failed_attempts: u32) -> Duration {
+        let shift = failed_attempts.min(31);
+        self.initial_backoff
+            .checked_mul(1_u32.checked_shl(shift).unwrap_or(u32::MAX))
+            .map_or(self.max_backoff, |backoff| backoff.min(self.max_backoff))
+    }
+
+    /// Applies full jitter within `interval` for one sample word.
+    ///
+    /// The scaled product never exceeds the interval; saturating conversion
+    /// keeps even `u64::MAX`-scale intervals inside a `Duration`.
+    fn jittered(interval: Duration, sample: u64) -> Duration {
+        let jittered_nanos = u128::from(sample)
+            .checked_mul(interval.as_nanos())
+            .map_or(u128::MAX, |product| product / u128::from(u64::MAX));
+        Duration::from_nanos(u64::try_from(jittered_nanos).unwrap_or(u64::MAX))
+    }
+
     /// Waits the jittered backoff interval for one failed attempt.
     pub async fn wait(self, failed_attempts: u32) {
-        let shift = failed_attempts.min(31);
-        let current = self
-            .initial_backoff
-            .checked_mul(1_u32.checked_shl(shift).unwrap_or(u32::MAX))
-            .map_or(self.max_backoff, |backoff| backoff.min(self.max_backoff));
-        if !current.is_zero() {
+        let interval = self.interval(failed_attempts);
+        if !interval.is_zero() {
             // Full jitter in the current interval. The process-local sequence is
             // mixed through the deterministic XXH3 word stream; no persistent
             // algorithm depends on the chosen value.
             let sequence = RETRY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let sample = xxh3_64(&sequence.to_le_bytes());
-            let jittered_nanos = u128::from(sample)
-                .checked_mul(current.as_nanos())
-                .map_or(u128::MAX, |product| product / u128::from(u64::MAX));
-            let jittered_nanos = u64::try_from(jittered_nanos).unwrap_or(u64::MAX);
-            tokio::time::sleep(Duration::from_nanos(jittered_nanos)).await;
+            let jittered = Self::jittered(interval, sample);
+            if !jittered.is_zero() {
+                tokio::time::sleep(jittered).await;
+            }
         }
     }
 
@@ -94,6 +108,17 @@ impl RetryPolicy {
         *failed_attempts += 1;
         Ok(())
     }
+}
+
+/// Returns the current Unix time in milliseconds, or zero for a clock before
+/// the epoch. State-start times only diagnose stalls and never grant
+/// ownership, so a degraded clock cannot affect correctness.
+pub(crate) fn now_unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
+        .unwrap_or(0)
 }
 
 /// Creates one Active Logical Index idempotently for `name`.
@@ -505,4 +530,96 @@ fn derive_rotation_seed(logical_index_id: LogicalIndexId) -> [u8; 32] {
 
 fn id_exhausted() -> Error {
     Error::new(ErrorKind::IdExhausted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn policy(attempts: u32, initial: Duration, maximum: Duration) -> RetryPolicy {
+        RetryPolicy {
+            attempts,
+            initial_backoff: initial,
+            max_backoff: maximum,
+        }
+    }
+
+    #[test]
+    fn backoff_interval_doubles_and_caps() {
+        let retry = policy(8, Duration::from_millis(1), Duration::from_millis(100));
+        let expected_ms = [1, 2, 4, 8, 16, 32, 64, 100, 100, 100];
+        for (failed, expected) in expected_ms.into_iter().enumerate() {
+            assert_eq!(
+                retry.interval(failed as u32),
+                Duration::from_millis(expected),
+                "failed_attempts {failed}"
+            );
+        }
+        // Saturating shifts and multiplications stay at the cap.
+        assert_eq!(retry.interval(u32::MAX), Duration::from_millis(100));
+    }
+
+    #[test]
+    fn backoff_interval_stays_exact_when_uncapped() {
+        let retry = policy(8, Duration::from_millis(10), Duration::from_secs(3600));
+        assert_eq!(retry.interval(0), Duration::from_millis(10));
+        assert_eq!(retry.interval(5), Duration::from_millis(320));
+    }
+
+    #[test]
+    fn jitter_stays_within_the_interval() {
+        let interval = Duration::from_millis(100);
+        // Boundary and patterned samples keep the result inside [0, interval].
+        let samples = [
+            0_u64,
+            1,
+            u64::MAX / 2,
+            u64::MAX - 1,
+            u64::MAX,
+            0x5555_5555_5555_5555,
+            0xAAAA_AAAA_AAAA_AAAA,
+            0x0123_4567_89AB_CDEF,
+        ];
+        for sample in samples {
+            let jittered = RetryPolicy::jittered(interval, sample);
+            assert!(jittered <= interval, "sample {sample}: {jittered:?}");
+        }
+        assert_eq!(RetryPolicy::jittered(interval, 0), Duration::ZERO);
+        // A full-range sample scales to exactly the interval.
+        assert_eq!(RetryPolicy::jittered(interval, u64::MAX), interval);
+        // A zero interval never sleeps.
+        assert_eq!(
+            RetryPolicy::jittered(Duration::ZERO, u64::MAX),
+            Duration::ZERO
+        );
+        // Huge intervals saturate conversion instead of panicking.
+        let huge = Duration::from_secs(u64::MAX);
+        assert!(RetryPolicy::jittered(huge, u64::MAX) <= huge);
+    }
+
+    #[test]
+    fn exhaustion_is_exactly_at_the_attempt_limit() {
+        let retry = policy(3, Duration::from_millis(1), Duration::from_millis(1));
+        assert!(!retry.would_exhaust(0));
+        assert!(!retry.would_exhaust(1));
+        assert!(retry.would_exhaust(2));
+        assert!(retry.would_exhaust(u32::MAX));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_or_exhaust_waits_then_fails() {
+        let retry = policy(2, Duration::from_millis(1), Duration::from_millis(1));
+        let mut failed_attempts = 0_u32;
+        retry
+            .wait_or_exhaust(&mut failed_attempts)
+            .await
+            .expect("first failure waits");
+        assert_eq!(failed_attempts, 1);
+        let error = retry
+            .wait_or_exhaust(&mut failed_attempts)
+            .await
+            .expect_err("the attempt limit is reached");
+        assert_eq!(error.kind(), ErrorKind::ContentionExhausted);
+        assert_eq!(failed_attempts, 1);
+    }
 }

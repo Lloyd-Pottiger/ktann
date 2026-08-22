@@ -125,6 +125,9 @@ impl<'a> TraversalRequest<'a> {
 /// `visited_leaf_entries` dimensions.
 pub(crate) struct TraversalOutcome {
     candidates: Vec<LeafCandidate>,
+    /// Visited partitions worth offering to the Runtime's demand-driven Fixup
+    /// queue: split or merge states and threshold-crossing `Ready` partitions.
+    maintenance: Vec<(TreeKey, PartitionKey)>,
     visited_partitions: u32,
     visited_leaf_entries: u32,
     partition_budget_exhausted: bool,
@@ -143,6 +146,13 @@ impl TraversalOutcome {
     #[must_use]
     pub(crate) fn into_candidates(self) -> Vec<LeafCandidate> {
         self.candidates
+    }
+
+    /// Takes the visited partitions worth offering to maintenance — split or
+    /// merge states and threshold-crossing `Ready` partitions — leaving an
+    /// empty list behind.
+    pub(crate) fn take_maintenance(&mut self) -> Vec<(TreeKey, PartitionKey)> {
+        std::mem::take(&mut self.maintenance)
     }
 
     /// Returns the distinct partition bodies logically visited.
@@ -286,6 +296,9 @@ struct Traversal {
     /// Beam admissions per `{tree, level}`.
     admitted: HashMap<(u32, u32), u32>,
     candidates: Vec<LeafCandidate>,
+    /// Visited partitions worth offering to the Runtime's demand-driven Fixup
+    /// queue: split or merge states and threshold-crossing `Ready` partitions.
+    maintenance: Vec<(TreeKey, PartitionKey)>,
     visited_partitions: u32,
     visited_leaf_entries: u32,
     partition_budget_exhausted: bool,
@@ -301,6 +314,7 @@ impl Traversal {
             referenced: HashSet::new(),
             admitted: HashMap::new(),
             candidates: Vec::new(),
+            maintenance: Vec::new(),
             visited_partitions: 0,
             visited_leaf_entries: 0,
             partition_budget_exhausted: false,
@@ -404,6 +418,23 @@ impl Traversal {
             }
         }
         let level = header.level();
+
+        // A visit is the relevant access that rediscovers maintenance work:
+        // offer split and merge states, over-threshold `Ready` partitions
+        // (split candidates whose offer was lost), and under-threshold
+        // non-root `Ready` partitions (merge candidates). A `ReceivingSplit`
+        // target is driven by its source, so it is not offered itself.
+        let config = context.manifest.config();
+        let split_candidate = header.entry_count() > config.max_partition_entries();
+        let merge_candidate =
+            entry.expected_level.is_some() && header.entry_count() < config.min_partition_entries();
+        if matches!(
+            header.state(),
+            PartitionState::Splitting | PartitionState::DrainingSplit | PartitionState::Merging
+        ) || (header.state() == PartitionState::Ready && (split_candidate || merge_candidate))
+        {
+            self.maintenance.push((tree_key.clone(), entry.partition));
+        }
 
         if entry.expected_level.is_none() {
             self.apply_root_state(txn, index, tree_key, entry.tree, entry.partition, &header)
@@ -656,6 +687,7 @@ impl Traversal {
         });
         Ok(TraversalOutcome {
             candidates: self.candidates,
+            maintenance: self.maintenance,
             visited_partitions: self.visited_partitions,
             visited_leaf_entries: self.visited_leaf_entries,
             partition_budget_exhausted: self.partition_budget_exhausted,

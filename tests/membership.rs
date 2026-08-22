@@ -619,7 +619,9 @@ async fn delete_removes_the_whole_group_and_is_idempotent() {
         membership::delete_record(&mut txn, &mut deferred, &rid(1))
             .await
             .expect("delete"),
-        DeleteOutcome::Deleted
+        DeleteOutcome::Deleted {
+            location: target.clone()
+        }
     );
     txn.apply(deferred).await.expect("apply deferred");
     txn.commit().await.expect("commit delete");
@@ -680,7 +682,9 @@ async fn delete_uses_the_stored_location_not_routing() {
         membership::delete_record(&mut txn, &mut deferred, &rid(1))
             .await
             .expect("delete"),
-        DeleteOutcome::Deleted
+        DeleteOutcome::Deleted {
+            location: stored.clone()
+        }
     );
     txn.apply(deferred).await.expect("apply deferred");
     txn.commit().await.expect("commit delete");
@@ -1177,10 +1181,9 @@ async fn membership_matches_a_seeded_model() {
                         membership::delete_record(&mut txn, &mut deferred, &rid(record_id))
                             .await
                             .expect("delete");
-                    let expected = if model.remove(&record_id).is_some() {
-                        DeleteOutcome::Deleted
-                    } else {
-                        DeleteOutcome::NotFound
+                    let expected = match model.remove(&record_id) {
+                        Some((_, location)) => DeleteOutcome::Deleted { location },
+                        None => DeleteOutcome::NotFound,
                     };
                     assert_eq!(outcome, expected, "seed {seed}");
                     txn.apply(deferred).await.expect("apply deferred");

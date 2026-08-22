@@ -17,7 +17,8 @@ persistent format may still change. The Logical Index lifecycle, point and
 batch reads, atomic foreground mutations, bounded approximate search with
 exact filtering and reranking, and bounded import sessions are implemented
 over both the FoundationDB and RocksDB adapters. The split and merge state
-machines are implemented; asynchronous maintenance wiring is in progress.
+machines are implemented, with bounded demand-driven maintenance scheduling
+in the Runtime.
 
 ## Features
 

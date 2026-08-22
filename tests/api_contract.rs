@@ -233,7 +233,17 @@ fn runtime_and_verify_limits_fail_closed() {
             .foreground_operation_limit(),
         7
     );
-    assert_invalid(RuntimeConfig::default().with_maintenance(0, 1_024));
+    assert_invalid(RuntimeConfig::default().with_maintenance(2, 1));
+    assert_invalid(RuntimeConfig::default().with_maintenance(0, 0));
+    // Zero workers disables background maintenance scheduling; the queue
+    // capacity bound still applies and must cover the import watermark.
+    assert_eq!(
+        RuntimeConfig::default()
+            .with_maintenance(0, 1_024)
+            .expect("zero workers disables background maintenance")
+            .maintenance_workers(),
+        0
+    );
     let unsafe_import_limits = RuntimeConfig::default()
         .with_import_limits(1, 1_025)
         .expect("builder defers cross-setting validation");

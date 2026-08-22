@@ -1,4 +1,4 @@
-//! Process-local foreground admission and orderly shutdown.
+//! Process-local foreground admission, maintenance scheduling, and orderly shutdown.
 
 use std::fmt;
 use std::future::{Future, pending};
@@ -16,6 +16,9 @@ use crate::api::{
 use crate::search::cache::PartitionCache;
 use crate::storage::backend::{Backend, CommitCancellation, CommitStart};
 
+use self::fixup::FixupQueue;
+
+pub(crate) mod fixup;
 pub(crate) mod import;
 pub(crate) mod lifecycle;
 pub(crate) mod reads;
@@ -36,6 +39,10 @@ pub struct Runtime<B: Backend> {
 impl<B: Backend> Runtime<B> {
     /// Creates a Runtime on the current Tokio multi-thread runtime.
     ///
+    /// Construction starts the configured maintenance workers immediately;
+    /// [`RuntimeConfig::with_maintenance`] with zero workers disables
+    /// background Structure Maintenance.
+    ///
     /// # Errors
     ///
     /// Returns [`ErrorKind::InvalidArgument`] when `config` is invalid or the
@@ -50,23 +57,28 @@ impl<B: Backend> Runtime<B> {
 
         let foreground_limit = config.foreground_operation_limit();
         let partition_cache = Arc::new(PartitionCache::new(config.partition_cache_bytes()));
-        Ok(Self {
+        let runtime = Self {
             handle: Arc::new(RuntimeHandle {
                 inner: Arc::new(RuntimeInner {
                     executor,
-                    config,
                     partition_cache,
                     foreground: Arc::new(Semaphore::new(foreground_limit)),
                     foreground_waiting: Arc::new(Semaphore::new(foreground_limit)),
+                    fixups: Mutex::new(FixupQueue::new(config.fixup_queue_capacity())),
+                    fixup_available: Notify::new(),
+                    maintenance_cancel: CancellationToken::new(),
                     lifecycle: Mutex::new(Lifecycle {
                         phase: Phase::Accepting,
                         active: 0,
                         backend: Some(Arc::new(backend)),
                     }),
                     terminal: Notify::new(),
+                    config,
                 }),
             }),
-        })
+        };
+        runtime.handle.inner.start_maintenance();
+        Ok(runtime)
     }
 
     /// Returns the validated process-local configuration.
@@ -158,10 +170,16 @@ impl<B: Backend> Runtime<B> {
         .await
     }
 
-    /// Stops admission and waits for all admitted foreground work to finish.
+    /// Stops admission and waits for all admitted work to finish.
     ///
-    /// Shutdown is idempotent. Operations admitted before shutdown retain their
-    /// real results; only later admission returns [`ErrorKind::RuntimeClosed`].
+    /// Shutdown is idempotent. It atomically stops new foreground, import, and
+    /// maintenance admission, cancels queued Fixups that have not begun, waits
+    /// for admitted foreground operations and detached commit completions,
+    /// then stops the maintenance workers and releases the backend. Operations
+    /// admitted before shutdown retain their real results; only later
+    /// admission returns [`ErrorKind::RuntimeClosed`]. A cancelled queued Fixup
+    /// loses no durable state: every committed topology state remains
+    /// searchable and a later relevant access rediscovers it.
     pub async fn shutdown(&self) -> Result<()> {
         self.handle.inner.begin_shutdown();
         loop {
@@ -197,15 +215,17 @@ impl<B: Backend> Clone for Runtime<B> {
 
 impl<B: Backend> fmt::Debug for Runtime<B> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let fixups = self.handle.inner.fixup_stats();
         let lifecycle = self.handle.inner.lock_lifecycle();
         formatter
             .debug_struct("Runtime")
             .field("phase", &lifecycle.phase)
-            .field("active_foreground", &lifecycle.active)
+            .field("active", &lifecycle.active)
             .field(
                 "foreground_limit",
                 &self.handle.inner.config.foreground_operation_limit(),
             )
+            .field("fixups", &fixups)
             .finish()
     }
 }
@@ -304,6 +324,9 @@ pub(crate) struct RuntimeInner<B: Backend> {
     partition_cache: Arc<PartitionCache>,
     foreground: Arc<Semaphore>,
     foreground_waiting: Arc<Semaphore>,
+    fixups: Mutex<FixupQueue>,
+    fixup_available: Notify,
+    maintenance_cancel: CancellationToken,
     lifecycle: Mutex<Lifecycle<B>>,
     terminal: Notify,
 }
@@ -426,10 +449,10 @@ impl<B: Backend> RuntimeInner<B> {
             if lifecycle.phase != Phase::Accepting {
                 return Err(Error::new(ErrorKind::RuntimeClosed));
             }
-            let Some(backend) = lifecycle.backend.as_ref().map(Arc::clone) else {
+            let Some(backend) = lifecycle.backend() else {
                 return Err(Error::new(ErrorKind::RuntimeClosed));
             };
-            lifecycle.active += 1;
+            lifecycle.begin_activity();
             backend
         };
 
@@ -452,6 +475,10 @@ impl<B: Backend> RuntimeInner<B> {
             (lifecycle.start_release_if_drained(), started_closing)
         };
         if started_closing {
+            // Stop maintenance admission with the same transition that stops
+            // foreground admission; queued Fixups that have not begun are
+            // cancelled and their durable states stay searchable.
+            self.stop_maintenance();
             self.foreground.close();
         }
         if let Some(backend) = released_backend {
@@ -459,7 +486,9 @@ impl<B: Backend> RuntimeInner<B> {
         }
     }
 
-    fn finish_operation(self: &Arc<Self>) {
+    /// Accounts one finished activity — a foreground operation or a stopping
+    /// maintenance worker — releasing the backend once shutdown drained all.
+    fn finish_activity(self: &Arc<Self>) {
         let released_backend = {
             let mut lifecycle = self.lock_lifecycle();
             debug_assert!(lifecycle.active > 0);
@@ -527,6 +556,23 @@ struct Lifecycle<B: Backend> {
 }
 
 impl<B: Backend> Lifecycle<B> {
+    /// Whether the Runtime still admits new foreground, import, and
+    /// maintenance work.
+    fn is_accepting(&self) -> bool {
+        self.phase == Phase::Accepting
+    }
+
+    /// Registers one admitted activity: a foreground operation's start or a
+    /// maintenance worker's lifetime.
+    fn begin_activity(&mut self) {
+        self.active = self.active.saturating_add(1);
+    }
+
+    /// Returns the shared backend while it is still owned by the Runtime.
+    fn backend(&self) -> Option<Arc<B>> {
+        self.backend.as_ref().map(Arc::clone)
+    }
+
     fn start_release_if_drained(&mut self) -> Option<Arc<B>> {
         if self.phase == Phase::Closing && self.active == 0 {
             self.phase = Phase::Releasing;
@@ -554,7 +600,7 @@ struct Admission<B: Backend> {
 
 impl<B: Backend> Drop for Admission<B> {
     fn drop(&mut self) {
-        self.inner.finish_operation();
+        self.inner.finish_activity();
     }
 }
 
