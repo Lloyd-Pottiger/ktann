@@ -211,6 +211,15 @@ fn search_rejects_invalid_k_dimension_and_budgets() -> ktann::api::Result<()> {
     assert_invalid(SearchRequest::new(Arc::from([1.0_f32]), 0));
     assert_invalid(SearchRequest::new(Arc::from([f32::INFINITY]), 1));
     assert_invalid(SearchOptions::default().with_visited_partitions(16_385));
+    assert_invalid(SearchOptions::default().with_leaf_beam_size(0));
+    assert_invalid(SearchOptions::default().with_leaf_beam_size(16_385));
+    assert_eq!(
+        SearchOptions::default()
+            .with_leaf_beam_size(8)?
+            .leaf_beam_size(),
+        Some(8)
+    );
+    assert_eq!(SearchOptions::default().leaf_beam_size(), None);
 
     let options = SearchOptions::default().with_exact_rerank_candidates(9)?;
     let mut request = SearchRequest::new(Arc::from([1.0_f32, 2.0]), 10)?.with_options(options);

@@ -461,3 +461,281 @@ validate
 ----
 ok: records=9 trees=1 partitions=3 max_level=2
 
+# --- Scenario G: a merge drains a multi-entry source in bounded batches ---
+# Earlier scenarios shrink every source to one entry, folding drain and
+# completion into one advance. Here a 12-entry source drains for real:
+# DRAIN_BATCH_LEAF is 8, so the drain takes two batches, the final batch
+# folded into `completed`; a further step after completion is `idle`. The
+# exact shape is installed declaratively via load-index (load_index.kddt).
+new-index dimension=2 metric=L2 fields=bucket:i64 tree-key-fields=0 min-entries=16 max-entries=32
+----
+created index "index"
+
+load-index tree=1
+pk=1 level=2 state=Ready
+  pk=2 level=1 state=Ready centroid=[0,0]
+    r01: [0,0] f1=0
+    r02: [0,1] f1=1
+    r03: [1,0] f1=2
+    r04: [1,1] f1=3
+    r05: [0,2] f1=4
+    r06: [2,0] f1=5
+    r07: [1,2] f1=6
+    r08: [2,1] f1=7
+    r09: [2,2] f1=8
+    r10: [0,3] f1=9
+    r11: [3,0] f1=10
+    r12: [1,3] f1=11
+  pk=3 level=1 state=Ready centroid=[10,10]
+    r13: [10,10] f1=12
+    r14: [10,11] f1=13
+    r15: [11,10] f1=14
+    r16: [11,11] f1=15
+    r17: [10,12] f1=16
+    r18: [12,10] f1=17
+----
+loaded 18 records, 3 partitions, max level 2
+
+# pk=2 holds 12 entries, below the minimum of 16, with a Ready sibling.
+merge-step tree=1 partition=2
+----
+pk=2: began
+
+merge-step tree=1 partition=2
+----
+pk=2: drained moved=8 remaining=4
+
+# Mid-drain the source stays searchable and both partitions are charged.
+search k=2 vector=[0,0]
+----
+r01: 0.0000
+r02: 1.0000
+usage: scanned_tree_keys=1 visited_partitions=3 visited_leaf_entries=18 exact_rerank_candidates=3
+
+merge-step tree=1 partition=2
+----
+pk=2: completed
+
+merge-step tree=1 partition=2
+----
+pk=2: idle
+
+format-tree
+----
+tree 0: root pk=1
+  pk=1 level=2 state=Ready count=1
+    pk=3 level=1 state=Ready count=18
+
+validate
+----
+ok: records=18 trees=1 partitions=2 max_level=2
+
+# --- Scenario H: an internal (level-2) merge moves Child Entries ---
+# DRAIN_BATCH_INTERNAL is 128, so the source's two children move in one
+# batch; the root keeps its level with a single child — roots never merge
+# or collapse.
+new-index dimension=2 metric=L2 fields=bucket:i64 tree-key-fields=0 min-entries=4 max-entries=8
+----
+created index "index"
+
+load-index tree=1
+pk=1 level=3 state=Ready
+  pk=2 level=2 state=Ready centroid=[0,0]
+    pk=4 level=1 state=Ready centroid=[0,0]
+      r01: [0,0] f1=0
+      r02: [0,1] f1=1
+      r03: [1,0] f1=2
+    pk=5 level=1 state=Ready centroid=[2,2]
+      r04: [2,2] f1=3
+      r05: [2,3] f1=4
+      r06: [3,2] f1=5
+  pk=3 level=2 state=Ready centroid=[10,10]
+    pk=6 level=1 state=Ready centroid=[10,10]
+      r07: [10,10] f1=6
+      r08: [10,11] f1=7
+      r09: [11,10] f1=8
+    pk=7 level=1 state=Ready centroid=[12,12]
+      r10: [12,12] f1=9
+      r11: [12,13] f1=10
+      r12: [13,12] f1=11
+----
+loaded 12 records, 7 partitions, max level 3
+
+# pk=2 holds two Child Entries, below the minimum of 4; pk=3 is the only
+# same-level Ready target.
+merge-step tree=1 partition=2
+----
+pk=2: began
+
+merge-step tree=1 partition=2
+----
+pk=2: completed
+
+merge-step tree=1 partition=2
+----
+pk=2: idle
+
+format-tree
+----
+tree 0: root pk=1
+  pk=1 level=3 state=Ready count=1
+    pk=3 level=2 state=Ready count=4
+      pk=4 level=1 state=Ready count=3
+      pk=5 level=1 state=Ready count=3
+      pk=6 level=1 state=Ready count=3
+      pk=7 level=1 state=Ready count=3
+
+search k=2 vector=[0,0]
+----
+r01: 0.0000
+r02: 1.0000
+usage: scanned_tree_keys=1 visited_partitions=6 visited_leaf_entries=12 exact_rerank_candidates=3
+
+validate
+----
+ok: records=12 trees=1 partitions=6 max_level=3
+
+# --- Scenario I: delete-everything collapse behavior ---
+# Deleting every record leaves an empty internal root over empty leaves.
+# The root never merges and never collapses; an empty leaf still merges
+# away, leaving the root with one child at its original level.
+new-index dimension=2 metric=L2 fields=bucket:i64 tree-key-fields=0 min-entries=2 max-entries=4
+----
+created index "index"
+
+load dataset=clustered:12:2 tree=1 via=single seed=5
+----
+loaded 12 records (dataset=clustered:12:2, seed=5)
+
+split tree=1 partition=1
+----
+pk=1: split into left=2 right=3
+
+delete
+r000000
+r000001
+r000002
+r000003
+r000004
+r000005
+r000006
+r000007
+r000008
+r000009
+r000010
+r000011
+----
+r000000: true
+r000001: true
+r000002: true
+r000003: true
+r000004: true
+r000005: true
+r000006: true
+r000007: true
+r000008: true
+r000009: true
+r000010: true
+r000011: true
+
+format-tree
+----
+tree 0: root pk=1
+  pk=1 level=2 state=Ready count=2
+    pk=2 level=1 state=Ready count=0
+    pk=3 level=1 state=Ready count=0
+
+search k=3 vector=[0,0]
+----
+usage: scanned_tree_keys=1 visited_partitions=3 visited_leaf_entries=0 exact_rerank_candidates=0
+
+# The root is not merge-eligible even empty.
+merge-step tree=1 partition=1
+----
+pk=1: idle
+
+# An empty leaf is under the minimum and merges with no drain moves.
+merge-step tree=1 partition=2
+----
+pk=2: began
+
+merge-step tree=1 partition=2
+----
+pk=2: completed
+
+# The root keeps level 2 over its single remaining child.
+format-tree
+----
+tree 0: root pk=1
+  pk=1 level=2 state=Ready count=1
+    pk=3 level=1 state=Ready count=0
+
+# The last child has no same-level Ready target left.
+merge-step tree=1 partition=3
+----
+pk=3: idle
+
+validate
+----
+ok: records=0 trees=1 partitions=2 max_level=2
+
+# --- Scenario J: merge no-op validation ---
+# merge-step on an ineligible or nonexistent partition is a deterministic
+# no-op (`idle`), the force-merge validation cases of the reference corpus.
+new-index dimension=2 metric=L2 fields=bucket:i64 tree-key-fields=0 min-entries=2 max-entries=4
+----
+created index "index"
+
+load dataset=clustered:12:2 tree=1 via=single seed=5
+----
+loaded 12 records (dataset=clustered:12:2, seed=5)
+
+split tree=1 partition=1
+----
+pk=1: split into left=2 right=3
+
+# A nonexistent partition key.
+merge-step tree=1 partition=99
+----
+pk=99: idle
+
+# The root.
+merge-step tree=1 partition=1
+----
+pk=1: idle
+
+# A Ready leaf at or above the minimum.
+merge-step tree=1 partition=3
+----
+pk=3: idle
+
+# A partition the split machine owns: Splitting first, then DrainingSplit.
+split-step tree=1 partition=3
+----
+pk=3: began left=4 right=5
+
+merge-step tree=1 partition=3
+----
+pk=3: idle
+
+split-step tree=1 partition=3
+----
+pk=3: exposed left=4 right=5
+
+merge-step tree=1 partition=3
+----
+pk=3: idle
+
+# A full merge drive on an ineligible source reports idle as well.
+merge tree=1 partition=1
+----
+pk=1: idle
+
+split tree=1 partition=3
+----
+pk=3: split resumed
+
+validate
+----
+ok: records=12 trees=1 partitions=4 max_level=2
+

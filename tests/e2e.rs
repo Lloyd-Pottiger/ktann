@@ -21,10 +21,10 @@
 //!   prints `id: ok|created|replaced` or `id: error Kind`.
 //! - `delete` — input lines of Record IDs; prints `id: true|false`.
 //! - `get` — input lines of Record IDs; prints `id: present|absent`.
-//! - `search k=K vector=[v,v,...] [where=F:op:value ...] [budget overrides]` —
+//! - `search k=K vector=[v,v,...] [where=F:op:value ...] [budget overrides] [beam-size=N]` —
 //!   prints one `id: distance` line per hit, then exact budget usage, then
 //!   any exhaustion flags.
-//! - `recall k=K samples=N [query=SPEC] [query-seed=N] [where=...] [budgets]` —
+//! - `recall k=K samples=N [query=SPEC] [query-seed=N] [where=...] [budgets] [beam-size=N]` —
 //!   prints recall against the brute-force oracle plus the count of
 //!   budget-truncated queries. A `query=` spec is capped at `samples`
 //!   queries; without it, `samples` stride queries come from the loaded
@@ -45,11 +45,21 @@
 //!   tree when omitted; prints the transition
 //!   (`began`/`drained`/`stalled`/`completed`/`idle`).
 //! - `merge tree=V [partition=N]` — drives one source to a completed merge.
+//! - `load-index tree=V` — installs one exact persistent topology for the
+//!   (empty) tree from annotated `format-tree`-shaped text: partition lines
+//!   `pk=N level=L [state=S] [left=L right=R | source=N] [centroid=[...]]`
+//!   nested by two-space indentation (first line `pk=1`, the stable root),
+//!   with leaf record lines in `insert` syntax. In-flight split/merge
+//!   intermediate states install directly, so corpus files can construct
+//!   states that are tedious to reach by driving the state machines; later
+//!   directives drive them exactly like state-machine output. Prints a
+//!   one-line summary.
 //! - `restart` — shuts the Runtime down and reopens the index on a reopened
 //!   durable backend, simulating a process restart.
 //! - `validate` — runs the exact-membership/topology audit against the model.
-//! - `format-tree [entries]` — renders the reachable topology, including
-//!   in-flight split states with their targets.
+//! - `format-tree [entries] [tree=V]` — renders the reachable topology,
+//!   including in-flight split states with their targets; `tree=V` restricts
+//!   the output to one tree, keeping its ordinal in directory order.
 //! - `stats` — prints committed keyspace size.
 //! - `drop-index` — drops the index.
 //!
@@ -79,6 +89,7 @@ mod support;
 
 use support::datadriven::{self, Directive, Mismatch};
 use support::dataset::{self, Dataset};
+use support::load_index::{FixturePartition, FixtureState, LoadFixture};
 use support::oracle::{self, Model, ModelRecord};
 use support::{CommitFault, DeterministicBackend, DeterministicConfig, Durability, SharedBackend};
 
@@ -149,7 +160,8 @@ struct Harness {
     name: String,
     model: Model,
     dataset: Option<Dataset>,
-    /// Deterministic clock for split-step and merge-step `started_at` timestamps.
+    /// Deterministic clock for split-step, merge-step, and load-index
+    /// `started_at` timestamps (and the load-index cache-epoch stamp).
     maintenance_clock: u64,
 }
 
@@ -193,6 +205,7 @@ impl Harness {
             "split-all" => self.split_all(directive).await,
             "merge-step" => self.merge_step(directive).await,
             "merge" => self.merge_full(directive).await,
+            "load-index" => self.load_index(directive).await,
             "inject-fault" => self.inject_fault(directive),
             "restart" => self.restart().await,
             "validate" => self.validate().await,
@@ -914,8 +927,122 @@ impl Harness {
         .await
     }
 
-    /// Encodes the `tree=V` argument as the Tree Key. Split and merge
-    /// directives support the corpus's single i64 tree-key field shape only.
+    /// `load-index` installs one exact persistent topology state for the
+    /// (empty) `tree=V` tree — including in-flight split/merge intermediate
+    /// states — directly from the annotated text, so corpus files can
+    /// construct states that are tedious to reach by driving the state
+    /// machines (issue #100, item C2). Installed states are byte-equivalent
+    /// to what the state machines persist; later directives drive them
+    /// exactly like state-machine output.
+    async fn load_index(&mut self, directive: &Directive) -> String {
+        let tree_key = self.tree_key_arg(directive);
+        let fixture = self.parse_load_fixture(directive);
+        // The deterministic maintenance clock supplies both the persisted
+        // started-at timestamps and a fresh cache epoch stamped on every
+        // Header the installer writes: an earlier search may have warmed the
+        // runtime partition cache under the tree's pre-install epochs.
+        let started_at = self.maintenance_clock;
+        self.maintenance_clock += 100;
+        let cache_epoch = self.maintenance_clock;
+        self.maintenance_clock += 100;
+        let summary = support::load_index::install(
+            self.backend
+                .as_ref()
+                .expect("load-index requires new-index first"),
+            self.index(),
+            &fixture,
+            &tree_key,
+            started_at,
+            cache_epoch,
+            directive.line,
+        )
+        .await;
+        self.accept_model_chunk(&fixture.records);
+        format!(
+            "loaded {} records, {} partitions, max level {}\n",
+            summary.records, summary.partitions, summary.max_level
+        )
+    }
+
+    /// Parses the `load-index` input lines into a fixture: partition lines
+    /// nested by two-space indentation (exactly like `format-tree` renders,
+    /// minus the `tree N:` line), and leaf record lines in `insert` syntax
+    /// with the Tree Key field filled from `tree=V`.
+    fn parse_load_fixture(&self, directive: &Directive) -> LoadFixture {
+        let line = directive.line;
+        let config = self.index().config();
+        let dimension = config.dimension();
+        let tree_value = directive.require("tree");
+        let mut fixture = LoadFixture::default();
+        // The current nesting path: (depth, fixture position) pairs.
+        let mut stack: Vec<(usize, usize)> = Vec::new();
+        for input in &directive.input {
+            let indent = input.len() - input.trim_start_matches(' ').len();
+            let content = &input[indent..];
+            assert!(
+                indent % 2 == 0 && !content.is_empty() && !content.starts_with(char::is_whitespace),
+                "load-index at line {line}: bad indentation in `{input}`"
+            );
+            let depth = indent / 2;
+            while stack.last().is_some_and(|&(top, _)| top >= depth) {
+                stack.pop();
+            }
+            if content.starts_with("pk=") {
+                let mut partition = parse_partition_line(content, line, dimension);
+                partition.parent_line = match stack.last() {
+                    Some(&(parent_depth, parent)) => {
+                        assert!(
+                            parent_depth == depth - 1,
+                            "load-index at line {line}: `{input}` skips a nesting level"
+                        );
+                        Some(fixture.partitions[parent].key)
+                    }
+                    None => {
+                        assert!(
+                            depth == 0,
+                            "load-index at line {line}: `{input}` skips a nesting level"
+                        );
+                        assert!(
+                            fixture.partitions.is_empty(),
+                            "load-index at line {line}: only the first (root) line sits at \
+                             depth 0"
+                        );
+                        None
+                    }
+                };
+                stack.push((depth, fixture.partitions.len()));
+                fixture.partitions.push(partition);
+            } else {
+                let Some(&(parent_depth, parent)) = stack.last() else {
+                    panic!(
+                        "load-index at line {line}: record line `{input}` nests under no \
+                         partition line"
+                    )
+                };
+                assert!(
+                    parent_depth == depth - 1,
+                    "load-index at line {line}: `{input}` skips a nesting level"
+                );
+                let (id, vector, explicit) = parse_record_line(content);
+                assert!(
+                    vector.len() == dimension,
+                    "load-index at line {line}: record vector has {} components, dimension is \
+                     {dimension}",
+                    vector.len()
+                );
+                let fields =
+                    fill_fields(config, Some(tree_value), fixture.records.len(), &explicit);
+                let record = Record::new(id.clone(), vector, fields).expect("record");
+                fixture.partitions[parent].records.push(id);
+                fixture.records.push(record);
+            }
+        }
+        fixture
+    }
+
+    /// Encodes the `tree=V` argument as the Tree Key. The split, merge, and
+    /// load-index directives support the corpus's single i64 tree-key field
+    /// shape only.
     fn tree_key_arg(&self, directive: &Directive) -> TreeKey {
         let value = directive.require("tree");
         let config = self.index().config();
@@ -1102,7 +1229,15 @@ impl Harness {
             .as_ref()
             .expect("format-tree requires new-index first");
         let index = self.index().logical_index_id();
-        match support::audit::render_tree(backend, index, directive.flag("entries")).await {
+        let filter = directive.arg("tree").map(|_| self.tree_key_arg(directive));
+        match support::audit::render_tree(
+            backend,
+            index,
+            directive.flag("entries"),
+            filter.as_ref(),
+        )
+        .await
+        {
             Ok(rendered) => rendered,
             Err(mismatch) => format!("audit mismatch: {mismatch}\n"),
         }
@@ -1187,6 +1322,129 @@ fn parse_record_line(line: &str) -> (Bytes, Arc<[f32]>, Vec<(usize, String)>) {
         fields.push((index, value.to_string()));
     }
     (Bytes::from(id.to_string()), vector, fields)
+}
+
+/// Parses one `load-index` partition line: `pk=N level=L [state=S]` plus the
+/// state's parameters (`left=L right=R` for Splitting/DrainingSplit,
+/// `source=N` for ReceivingSplit) and an optional `centroid=[...]`. The
+/// nesting parent and record lines are filled in by the caller.
+fn parse_partition_line(content: &str, line: usize, dimension: usize) -> FixturePartition {
+    let mut tokens = content.split_whitespace();
+    let first = tokens
+        .next()
+        .unwrap_or_else(|| panic!("load-index at line {line}: empty partition line"));
+    let key = parse_partition_key(
+        first
+            .strip_prefix("pk=")
+            .expect("partition line starts with `pk=`"),
+        line,
+    );
+    let mut level: Option<u32> = None;
+    let mut state: Option<&str> = None;
+    let mut left = None;
+    let mut right = None;
+    let mut source = None;
+    let mut centroid = None;
+    for token in tokens {
+        let (name, value) = token
+            .split_once('=')
+            .unwrap_or_else(|| panic!("load-index at line {line}: bad partition token `{token}`"));
+        match name {
+            "level" => set_once(
+                &mut level,
+                value
+                    .parse()
+                    .unwrap_or_else(|_| panic!("load-index at line {line}: bad level `{value}`")),
+                name,
+                line,
+            ),
+            "state" => set_once(&mut state, value, name, line),
+            "left" => set_once(&mut left, parse_partition_key(value, line), name, line),
+            "right" => set_once(&mut right, parse_partition_key(value, line), name, line),
+            "source" => set_once(&mut source, parse_partition_key(value, line), name, line),
+            "centroid" => {
+                let components = parse_vector(value);
+                assert!(
+                    components.len() == dimension,
+                    "load-index at line {line}: centroid has {} components, dimension is \
+                     {dimension}",
+                    components.len()
+                );
+                set_once(&mut centroid, components, name, line);
+            }
+            other => panic!("load-index at line {line}: unknown partition token `{other}=`"),
+        }
+    }
+    let level = level.unwrap_or_else(|| {
+        panic!(
+            "load-index at line {line}: partition pk={} needs `level=`",
+            key.get()
+        )
+    });
+    let state = match state.unwrap_or("Ready") {
+        name @ ("Ready" | "Merging") => {
+            assert!(
+                left.is_none() && right.is_none() && source.is_none(),
+                "load-index at line {line}: {name} takes no `left=`/`right=`/`source=` parameters"
+            );
+            match name {
+                "Ready" => FixtureState::Ready,
+                _ => FixtureState::Merging,
+            }
+        }
+        name @ ("Splitting" | "DrainingSplit") => {
+            assert!(
+                source.is_none(),
+                "load-index at line {line}: {name} takes no `source=` parameter"
+            );
+            let left =
+                left.unwrap_or_else(|| panic!("load-index at line {line}: {name} needs `left=`"));
+            let right =
+                right.unwrap_or_else(|| panic!("load-index at line {line}: {name} needs `right=`"));
+            match name {
+                "Splitting" => FixtureState::Splitting { left, right },
+                _ => FixtureState::DrainingSplit { left, right },
+            }
+        }
+        "ReceivingSplit" => {
+            assert!(
+                left.is_none() && right.is_none(),
+                "load-index at line {line}: ReceivingSplit takes no `left=`/`right=` parameters"
+            );
+            FixtureState::ReceivingSplit {
+                source: source.unwrap_or_else(|| {
+                    panic!("load-index at line {line}: ReceivingSplit needs `source=`")
+                }),
+            }
+        }
+        other => panic!("load-index at line {line}: unknown partition state `{other}`"),
+    };
+    FixturePartition {
+        key,
+        level,
+        state,
+        centroid,
+        parent_line: None,
+        records: Vec::new(),
+    }
+}
+
+/// Parses one partition-key value (of `pk=N`, `left=N`, `right=N`, or
+/// `source=N`) into a Partition Key.
+fn parse_partition_key(value: &str, line: usize) -> PartitionKey {
+    let raw = value
+        .parse()
+        .unwrap_or_else(|_| panic!("load-index at line {line}: bad partition key `{value}`"));
+    PartitionKey::new(raw)
+        .unwrap_or_else(|_| panic!("load-index at line {line}: partition key `{value}` is zero"))
+}
+
+/// Sets one not-yet-seen partition-line token value.
+fn set_once<T>(slot: &mut Option<T>, value: T, name: &str, line: usize) {
+    assert!(
+        slot.replace(value).is_none(),
+        "load-index at line {line}: duplicate `{name}=` token"
+    );
 }
 
 /// Parses one override value against the field's declared type.
@@ -1325,6 +1583,11 @@ fn search_options(directive: &Directive) -> SearchOptions {
     if let Some(value) = directive.arg("exact-rerank") {
         options = options
             .with_exact_rerank_candidates(value.parse().expect("exact-rerank"))
+            .expect("valid");
+    }
+    if let Some(value) = directive.arg("beam-size") {
+        options = options
+            .with_leaf_beam_size(value.parse().expect("beam-size"))
             .expect("valid");
     }
     options

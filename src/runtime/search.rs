@@ -54,6 +54,7 @@ const DIRECTORY_SCAN_LIMITS: ScanLimits = ScanLimits {
 pub(crate) struct PreparedSearch {
     request: SearchRequest,
     budgets: SearchBudgets,
+    leaf_beam: u32,
     kernel: VectorKernel,
     routing: Box<[f32]>,
     predicate: Option<CompiledPredicate>,
@@ -70,6 +71,10 @@ impl PreparedSearch {
     ) -> Result<Self> {
         let config = manifest.config();
         let budgets = request.validate(config.dimension(), config.fields(), defaults)?;
+        let leaf_beam = request
+            .options()
+            .leaf_beam_size()
+            .unwrap_or(DEFAULT_LEAF_BEAM);
         let kernel = VectorKernel::new(
             config.dimension(),
             config.metric(),
@@ -85,6 +90,7 @@ impl PreparedSearch {
         Ok(Self {
             request,
             budgets,
+            leaf_beam,
             kernel,
             routing,
             predicate,
@@ -146,7 +152,7 @@ pub(crate) async fn search<B: Backend>(
             prepared.predicate.as_ref(),
             prepared.request.k(),
             prepared.budgets,
-            DEFAULT_LEAF_BEAM,
+            prepared.leaf_beam,
         )?,
     )
     .await?;

@@ -56,3 +56,101 @@ r000892: 1.1363
 usage: scanned_tree_keys=2 visited_partitions=2 visited_leaf_entries=1000 exact_rerank_candidates=5
 exhausted: scanned_tree_keys
 
+# --- Cross-tree isolation (issue #100, item D2) ---
+# Churn on trees 2..4 — splits, merges, inserts, upserts, deletes — must
+# leave tree 1 byte-identical, in structure and in content. The two
+# format-tree snapshots and the two filtered searches below are the
+# before/after pair.
+new-index dimension=4 metric=L2 fields=bucket:i64 tree-key-fields=0 min-entries=4 max-entries=8
+----
+created index "index"
+
+load dataset=clustered:40:4 tree=1..4 seed=3
+----
+loaded 40 records (dataset=clustered:40:4, seed=3)
+
+format-tree tree=1 entries
+----
+tree 0: root pk=1
+  pk=1 level=1 state=Ready count=10
+    r000000
+    r000004
+    r000008
+    r000012
+    r000016
+    r000020
+    r000024
+    r000028
+    r000032
+    r000036
+
+search k=3 vector=[0,0,0,0] where=0:eq:1
+----
+r000028: 1.5494
+r000016: 1.9021
+r000020: 1.9425
+usage: scanned_tree_keys=1 visited_partitions=1 visited_leaf_entries=10 exact_rerank_candidates=4
+
+split-all tree=2
+----
+pk=1: split into left=2 right=3
+settled
+
+split-all tree=4
+----
+pk=1: split into left=2 right=3
+settled
+
+insert tree=3
+x1: [9,9,9,9]
+x2: [8,9,8,9]
+----
+x1: ok
+x2: ok
+
+upsert tree=4
+r000003: [7,7,7,7]
+x3: [6,6,6,6]
+----
+r000003: replaced
+x3: created
+
+# Deletes by Record ID target tree 2 members only (ordinal % 4 == 1).
+delete
+r000001
+r000005
+----
+r000001: true
+r000005: true
+
+# Shrink tree 2's leaves below the minimum and merge one away.
+merge-step tree=2
+----
+pk=2: began
+
+format-tree tree=1 entries
+----
+tree 0: root pk=1
+  pk=1 level=1 state=Ready count=10
+    r000000
+    r000004
+    r000008
+    r000012
+    r000016
+    r000020
+    r000024
+    r000028
+    r000032
+    r000036
+
+search k=3 vector=[0,0,0,0] where=0:eq:1
+----
+r000028: 1.5494
+r000016: 1.9021
+r000020: 1.9425
+usage: scanned_tree_keys=1 visited_partitions=1 visited_leaf_entries=10 exact_rerank_candidates=4
+
+validate
+----
+ok: records=41 trees=4 partitions=8 max_level=2
+

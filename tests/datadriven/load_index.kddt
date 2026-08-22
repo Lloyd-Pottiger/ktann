@@ -1,0 +1,354 @@
+# ----------------------------------------------------------------------
+# load-index: exact persistent topologies installed from annotated
+# format-tree-shaped text (issue #100, item C2), including in-flight
+# split/merge intermediate states that are tedious to reach by driving the
+# state machines. Installed states are byte-equivalent to state-machine
+# output, so split-step/merge-step/search/validate/format-tree all drive them
+# afterwards; validate audits every milestone. Header entry counts are
+# computed by the installer, never taken from the text.
+# ----------------------------------------------------------------------
+# --- Scenario A: a Ready two-level tree, installed directly ---
+new-index dimension=2 metric=L2 fields=bucket:i64 tree-key-fields=0 min-entries=2 max-entries=4
+----
+created index "index"
+
+# `state=` defaults to Ready; the round-trip renders the loaded shape.
+load-index tree=1
+pk=1 level=2
+  pk=2 level=1 centroid=[1,1]
+    r1: [1,1]
+    r2: [2,1]
+  pk=3 level=1 centroid=[9,9]
+    r3: [9,9]
+    r4: [10,9]
+----
+loaded 4 records, 3 partitions, max level 2
+
+format-tree entries
+----
+tree 0: root pk=1
+  pk=1 level=2 state=Ready count=2
+    pk=2 level=1 state=Ready count=2
+      r1
+      r2
+    pk=3 level=1 state=Ready count=2
+      r3
+      r4
+
+search k=2 vector=[1,1]
+----
+r1: 0.0000
+r2: 1.0000
+usage: scanned_tree_keys=1 visited_partitions=3 visited_leaf_entries=4 exact_rerank_candidates=2
+
+validate
+----
+ok: records=4 trees=1 partitions=3 max_level=2
+
+# --- Scenario B: a single-level root leaf ---
+new-index dimension=2 metric=L2 fields=bucket:i64 tree-key-fields=0 min-entries=2 max-entries=4
+----
+created index "index"
+
+load-index tree=1
+pk=1 level=1
+  r1: [0,0]
+  r2: [3,4]
+  r3: [6,0]
+----
+loaded 3 records, 1 partitions, max level 1
+
+search k=2 vector=[0,0]
+----
+r1: 0.0000
+r2: 5.0000
+usage: scanned_tree_keys=1 visited_partitions=1 visited_leaf_entries=3 exact_rerank_candidates=2
+
+validate
+----
+ok: records=3 trees=1 partitions=1 max_level=1
+
+# --- Scenario C: a root DrainingSplit mid-state ---
+# The root holds one remaining entry; both published targets hold moved
+# entries and are reachable only through the root's drain link.
+new-index dimension=2 metric=L2 fields=bucket:i64 tree-key-fields=0 min-entries=2 max-entries=4
+----
+created index "index"
+
+load-index tree=1
+pk=1 level=1 state=DrainingSplit left=2 right=3
+  r1: [14,1]
+  pk=2 level=1 state=ReceivingSplit source=1 centroid=[10.5,2.5]
+    r2: [11,2]
+    r3: [10,3]
+  pk=3 level=1 state=ReceivingSplit source=1 centroid=[2.5,2.5]
+    r4: [2,2]
+    r5: [3,3]
+----
+loaded 5 records, 3 partitions, max level 1
+
+format-tree entries
+----
+tree 0: root pk=1
+  pk=1 level=1 state=DrainingSplit count=1 left=2 right=3
+    r1
+    pk=2 level=1 state=ReceivingSplit count=2
+      r2
+      r3
+    pk=3 level=1 state=ReceivingSplit count=2
+      r4
+      r5
+
+search k=2 vector=[10,2]
+----
+r2: 1.0000
+r3: 1.0000
+usage: scanned_tree_keys=1 visited_partitions=3 visited_leaf_entries=5 exact_rerank_candidates=2
+
+validate
+----
+ok: records=5 trees=1 partitions=3 max_level=1
+
+# One bounded step drains the last entry and completes the split in place:
+# the root converts to a level-2 internal root over the two promoted targets.
+split-step tree=1
+----
+pk=1: completed
+
+format-tree entries
+----
+tree 0: root pk=1
+  pk=1 level=2 state=Ready count=2
+    pk=2 level=1 state=Ready count=3
+      r1
+      r2
+      r3
+    pk=3 level=1 state=Ready count=2
+      r4
+      r5
+
+validate
+----
+ok: records=5 trees=1 partitions=3 max_level=2
+
+# --- Scenario D: a non-root DrainingSplit mid-state ---
+# Mid-drain targets of a non-root source are dual-linked: the parent's Child
+# Entries plus the source's drain link.
+new-index dimension=2 metric=L2 fields=bucket:i64 tree-key-fields=0 min-entries=2 max-entries=4
+----
+created index "index"
+
+load-index tree=1
+pk=1 level=2
+  pk=2 level=1 state=DrainingSplit left=3 right=4 centroid=[8,1]
+    r1: [8,1]
+    pk=3 level=1 state=ReceivingSplit source=2 centroid=[9,1]
+      r2: [9,1]
+      r3: [10,2]
+    pk=4 level=1 state=ReceivingSplit source=2 centroid=[1,2]
+      r4: [1,2]
+  pk=5 level=1 centroid=[20,20]
+    r5: [20,20]
+----
+loaded 5 records, 5 partitions, max level 2
+
+format-tree entries
+----
+tree 0: root pk=1
+  pk=1 level=2 state=Ready count=4
+    pk=2 level=1 state=DrainingSplit count=1 left=3 right=4
+      r1
+      pk=3 level=1 state=ReceivingSplit count=2
+        r2
+        r3
+      pk=4 level=1 state=ReceivingSplit count=1
+        r4
+    pk=5 level=1 state=Ready count=1
+      r5
+
+search k=2 vector=[9,1]
+----
+r2: 0.0000
+r1: 1.0000
+usage: scanned_tree_keys=1 visited_partitions=5 visited_leaf_entries=5 exact_rerank_candidates=2
+
+validate
+----
+ok: records=5 trees=1 partitions=5 max_level=2
+
+# Draining the source's last entry completes the split: the parent's Child
+# Entries flip from the source to the two promoted targets.
+split-step tree=1 partition=2
+----
+pk=2: completed
+
+format-tree entries
+----
+tree 0: root pk=1
+  pk=1 level=2 state=Ready count=3
+    pk=3 level=1 state=Ready count=3
+      r1
+      r2
+      r3
+    pk=4 level=1 state=Ready count=1
+      r4
+    pk=5 level=1 state=Ready count=1
+      r5
+
+validate
+----
+ok: records=5 trees=1 partitions=4 max_level=2
+
+# --- Scenario E: a Splitting root with reserved, not yet exposed targets ---
+# The targets have no partition lines; only the root body is searched.
+new-index dimension=2 metric=L2 fields=bucket:i64 tree-key-fields=0 min-entries=2 max-entries=4
+----
+created index "index"
+
+load-index tree=1
+pk=1 level=1 state=Splitting left=2 right=3
+  r1: [1,1]
+  r2: [2,1]
+  r3: [8,9]
+  r4: [9,9]
+  r5: [9,8]
+----
+loaded 5 records, 1 partitions, max level 1
+
+search k=2 vector=[1,1]
+----
+r1: 0.0000
+r2: 1.0000
+usage: scanned_tree_keys=1 visited_partitions=1 visited_leaf_entries=5 exact_rerank_candidates=2
+
+validate
+----
+ok: records=5 trees=1 partitions=1 max_level=1
+
+# The next step trains target centroids from the installed source entries,
+# publishes both targets, and advances the source to DrainingSplit.
+split-step tree=1
+----
+pk=1: exposed left=2 right=3
+
+format-tree
+----
+tree 0: root pk=1
+  pk=1 level=1 state=DrainingSplit count=5 left=2 right=3
+    pk=2 level=1 state=ReceivingSplit count=0
+    pk=3 level=1 state=ReceivingSplit count=0
+
+validate
+----
+ok: records=5 trees=1 partitions=3 max_level=1
+
+split-step tree=1
+----
+pk=1: completed
+
+format-tree entries
+----
+tree 0: root pk=1
+  pk=1 level=2 state=Ready count=2
+    pk=2 level=1 state=Ready count=2
+      r1
+      r2
+    pk=3 level=1 state=Ready count=3
+      r3
+      r4
+      r5
+
+validate
+----
+ok: records=5 trees=1 partitions=3 max_level=2
+
+# --- Scenario F: a Merging leaf mid-state ---
+# The source still serves its remaining entry; the merge machine reselects
+# the sibling Ready leaf as the drain target.
+new-index dimension=2 metric=L2 fields=bucket:i64 tree-key-fields=0 min-entries=2 max-entries=4
+----
+created index "index"
+
+load-index tree=1
+pk=1 level=2
+  pk=2 level=1 state=Merging centroid=[1,1]
+    r1: [1,1]
+  pk=3 level=1 centroid=[9,9]
+    r2: [9,9]
+    r3: [10,9]
+    r4: [9,10]
+----
+loaded 4 records, 3 partitions, max level 2
+
+format-tree entries
+----
+tree 0: root pk=1
+  pk=1 level=2 state=Ready count=2
+    pk=2 level=1 state=Merging count=1
+      r1
+    pk=3 level=1 state=Ready count=3
+      r2
+      r3
+      r4
+
+search k=2 vector=[9,9]
+----
+r2: 0.0000
+r3: 1.0000
+usage: scanned_tree_keys=1 visited_partitions=3 visited_leaf_entries=4 exact_rerank_candidates=3
+
+validate
+----
+ok: records=4 trees=1 partitions=3 max_level=2
+
+merge-step tree=1 partition=2
+----
+pk=2: completed
+
+format-tree entries
+----
+tree 0: root pk=1
+  pk=1 level=2 state=Ready count=1
+    pk=3 level=1 state=Ready count=4
+      r1
+      r2
+      r3
+      r4
+
+validate
+----
+ok: records=4 trees=1 partitions=2 max_level=2
+
+# --- Scenario G: an empty Ready leaf ---
+# pk=2 holds no record lines; its canonical empty synopsis proves the
+# predicate impossible, so it is pruned uncharged.
+new-index dimension=2 metric=L2 fields=bucket:i64,score:i64 tree-key-fields=0 min-entries=2 max-entries=4
+----
+created index "index"
+
+load-index tree=1
+pk=1 level=2
+  pk=2 level=1 centroid=[1,1]
+  pk=3 level=1 centroid=[9,9]
+    r1: [9,9] f1=5
+    r2: [10,9] f1=3
+----
+loaded 2 records, 3 partitions, max level 2
+
+format-tree
+----
+tree 0: root pk=1
+  pk=1 level=2 state=Ready count=2
+    pk=2 level=1 state=Ready count=0
+    pk=3 level=1 state=Ready count=2
+
+search k=2 vector=[9,9] where=1:ge:1
+----
+r1: 0.0000
+r2: 1.0000
+usage: scanned_tree_keys=1 visited_partitions=3 visited_leaf_entries=2 exact_rerank_candidates=2
+
+validate
+----
+ok: records=2 trees=1 partitions=3 max_level=2
+

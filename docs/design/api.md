@@ -190,6 +190,7 @@ The v1 defaults and caps are:
 | Visited partitions | 1,024 | 16,384 |
 | Visited Leaf Entries | 65,536 | 1,048,576 |
 | Exact rerank candidates | `min(max(4*k,100),65,536)` | 65,536 and at least `k` |
+| Leaf beam size | 32 | 16,384 |
 | Tree Key scan ranges | 1,024 | wider conservative fallback |
 | Import in-flight batches | `min(available_parallelism,4)`, min 1 | positive |
 | Import backlog watermark | half fixup queue | within queue capacity |
@@ -202,7 +203,10 @@ doubles to 100 ms, and applies full jitter in the current interval.
 
 `SearchRequest` contains a finite vector of exact dimension, `k`, an optional
 Predicate, and SearchOptions. `k` is `1..=65,536`; the effective exact-rerank
-budget must be at least `k`.
+budget must be at least `k`. SearchOptions may also override the leaf-level
+base beam width per request; the beam is a traversal-quality knob, not an
+accounted budget dimension, and the visited-partition budget still bounds the
+work it schedules.
 
 `SearchOutcome` contains ordered Search Hits, Search Budget usage, an exhaustive
 set of exhausted dimensions, and `rabitq_overlap_truncated`. A hit contains only

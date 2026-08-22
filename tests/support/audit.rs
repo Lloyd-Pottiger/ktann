@@ -521,11 +521,14 @@ pub async fn list_partitions<B: Backend>(
 /// completes (a root source has no parent to link them); each partition
 /// renders once even when a non-root target is also reachable through its
 /// parent's Child Entry. With `entries`, each leaf's Record IDs follow, one
-/// per line; corpus authors use that flag only on small fixtures.
+/// per line; corpus authors use that flag only on small fixtures. With
+/// `filter`, only the named tree renders, keeping its ordinal in the
+/// canonical directory order so the output stays comparable across calls.
 pub async fn render_tree<B: Backend>(
     backend: &B,
     index: LogicalIndexId,
     entries: bool,
+    filter: Option<&TreeKey>,
 ) -> Result<String, String> {
     let manifest = read_manifest(backend, index).await?;
     let mut txn = open_walk_txn(backend, &manifest).await?;
@@ -533,6 +536,9 @@ pub async fn render_tree<B: Backend>(
     let trees = enumerate_trees(&mut txn, &manifest).await?;
     let mut rendered = BTreeSet::new();
     for (ordinal, (tree_key, root)) in trees.iter().enumerate() {
+        if filter.is_some_and(|filter| filter != tree_key) {
+            continue;
+        }
         out.push_str(&format!("tree {ordinal}: root pk={}\n", root.get()));
         render_partition(
             &mut txn,

@@ -32,6 +32,7 @@ use ktann::storage::values::{IndexManifest, PersistentValue};
 pub mod audit;
 pub mod datadriven;
 pub mod dataset;
+pub mod load_index;
 pub mod oracle;
 
 /// A Runtime configuration without background maintenance workers.

@@ -138,8 +138,9 @@ One consistent snapshot performs:
 6. original Vector Record batch loading and exact reranking;
 7. deterministic top-k ordering and budget report construction.
 
-Traversal is a level-scaled beam. The leaf-level base beam defaults to 32;
-moving one level toward the root divides it by two with minimum one. Eligible
+Traversal is a level-scaled beam. The leaf-level base beam defaults to 32 and
+SearchOptions may override it per request within the hard cap; moving one
+level toward the root divides it by two with minimum one. Eligible
 trees advance fairly. Ties use Tree Key, Partition Key, then Record ID.
 Partition, Leaf Entry, rerank, and optional RaBitQ-overlap bounds are charged
 before corresponding work. No speculative read-ahead occurs beyond a budget.
@@ -172,14 +173,19 @@ Corruption rather than silently deduplicated.
 
 ## 7. Search budgets and response
 
-SearchOptions overrides nonzero bounds for Tree Keys, partitions, leaf entries,
-rerank candidates, and RaBitQ overlap candidates within hard caps. Defaults are
-process-local and benchmark-tunable. One successful response reports usage and
+SearchOptions overrides nonzero bounds for Tree Keys, partitions, leaf
+entries, rerank candidates, and RaBitQ overlap candidates within hard caps,
+plus the leaf-level base beam width. Defaults are process-local and
+benchmark-tunable. One successful response reports usage and
 each dimension that prevented pending work.
 
 The API deliberately has no `complete` boolean: ANN search is approximate even
 when no logical budget is exhausted. It also has no quality score or
 continuation token. Callers needing more work resubmit with higher budgets.
+RaBitQ estimate distances likewise stay internal: there is deliberately no
+estimate-only response mode or skip-rerank switch, so the exact-rerank stage's
+value is evidenced by rerank-budget sweeps in the e2e corpus (issue #100)
+rather than by exposing estimate-versus-exact divergence.
 
 ## 8. Partition cache
 
