@@ -39,6 +39,12 @@
 //! - `split tree=V [partition=N]` — drives one source to a completed split.
 //! - `split-all tree=V` — settles every over-full partition of the tree,
 //!   worst offender first.
+//! - `merge-step tree=V [partition=N]` — one bounded merge state-machine
+//!   transition (`maintenance::merge::advance`) on `partition=N`, or on an
+//!   in-flight merge or the most under-full eligible Ready partition of the
+//!   tree when omitted; prints the transition
+//!   (`began`/`drained`/`stalled`/`completed`/`idle`).
+//! - `merge tree=V [partition=N]` — drives one source to a completed merge.
 //! - `restart` — shuts the Runtime down and reopens the index on a reopened
 //!   durable backend, simulating a process restart.
 //! - `validate` — runs the exact-membership/topology audit against the model.
@@ -47,11 +53,11 @@
 //! - `stats` — prints committed keyspace size.
 //! - `drop-index` — drops the index.
 //!
-//! The split directives drive the #10 state machine explicitly (foreground
-//! mutations never trigger a split on their own in the current build), so
-//! corpus files decide the exact interleaving of topology transitions,
-//! foreground mutations, and searches: every committed intermediate state
-//! stays searchable and auditable.
+//! The split and merge directives drive the #10/#31 state machines explicitly
+//! (foreground mutations never trigger structural maintenance on their own in
+//! the current build), so corpus files decide the exact interleaving of
+//! topology transitions, foreground mutations, and searches: every committed
+//! intermediate state stays searchable and auditable.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -62,6 +68,7 @@ use ktann::api::{
     Metric, Mutation, PartitionKey, Predicate, Record, RuntimeConfig, SearchOptions, SearchRequest,
     Value,
 };
+use ktann::maintenance::merge::{self, Advance as MergeAdvance};
 use ktann::maintenance::split::{self, Advance};
 use ktann::runtime::{RetryPolicy, Runtime};
 use ktann::storage::keys::TreeKey;
@@ -142,7 +149,7 @@ struct Harness {
     name: String,
     model: Model,
     dataset: Option<Dataset>,
-    /// Deterministic clock for split-step `started_at` timestamps.
+    /// Deterministic clock for split-step and merge-step `started_at` timestamps.
     maintenance_clock: u64,
 }
 
@@ -184,6 +191,8 @@ impl Harness {
             "split-step" => self.split_step(directive).await,
             "split" => self.split_full(directive).await,
             "split-all" => self.split_all(directive).await,
+            "merge-step" => self.merge_step(directive).await,
+            "merge" => self.merge_full(directive).await,
             "inject-fault" => self.inject_fault(directive),
             "restart" => self.restart().await,
             "validate" => self.validate().await,
@@ -762,20 +771,158 @@ impl Harness {
         .await
     }
 
-    /// Encodes the `tree=V` argument as the Tree Key. Split directives
-    /// support the corpus's single i64 tree-key field shape only.
+    /// `merge-step` performs one bounded state-machine transition
+    /// (`merge::advance`) on the `partition=` source, or on an in-flight
+    /// merge or the most under-full eligible Ready partition of the tree when
+    /// the argument is omitted.
+    async fn merge_step(&mut self, directive: &Directive) -> String {
+        let Some((tree_key, source)) = self.merge_source(directive).await else {
+            return "idle: nothing to merge\n".to_string();
+        };
+        match self.merge_advance_once(&tree_key, source).await {
+            Ok(outcome) => format!(
+                "pk={}: {}\n",
+                source.get(),
+                describe_merge_advance(&outcome)
+            ),
+            Err(error) => format!("pk={}: error {:?}\n", source.get(), error.kind()),
+        }
+    }
+
+    /// `merge` drives one source partition's merge state machine to
+    /// completion; a source that never begins reports `idle`, and a merge
+    /// with no legal target reports `stalled`.
+    async fn merge_full(&mut self, directive: &Directive) -> String {
+        let Some((tree_key, source)) = self.merge_source(directive).await else {
+            return "idle: nothing to merge\n".to_string();
+        };
+        match self.run_merge(&tree_key, source).await {
+            Ok(summary) => summary,
+            Err(error) => format!("pk={}: error {:?}\n", source.get(), error.kind()),
+        }
+    }
+
+    /// Resolves the merge source for one directive: explicit `partition=N`,
+    /// or an in-flight merge / the most under-full eligible Ready partition
+    /// of the tree when omitted.
+    async fn merge_source(&self, directive: &Directive) -> Option<(TreeKey, PartitionKey)> {
+        let tree_key = self.tree_key_arg(directive);
+        if let Some(raw) = directive.arg("partition") {
+            let key = PartitionKey::new(raw.parse().expect("partition key"))
+                .expect("merge source Partition Key is nonzero");
+            return Some((tree_key, key));
+        }
+        self.merge_candidate(&tree_key)
+            .await
+            .map(|source| (tree_key, source))
+    }
+
+    /// The partition an argument-free merge directive should drive: an
+    /// in-flight merge source first (smallest Partition Key, so a corpus
+    /// resumes the machine it started), otherwise the most under-full
+    /// eligible Ready non-root partition (fewest entries; ties: smallest
+    /// key).
+    async fn merge_candidate(&self, tree_key: &TreeKey) -> Option<PartitionKey> {
+        let backend = self
+            .backend
+            .as_ref()
+            .expect("merge directives require new-index first");
+        let index = self.index().logical_index_id();
+        let manifest = support::read_manifest(backend, index).await;
+        let listing = support::audit::list_partitions(backend, index)
+            .await
+            .expect("partition listing");
+        let in_flight = listing
+            .iter()
+            .filter(|(key, _, header)| key == tree_key && header.state() == PartitionState::Merging)
+            .map(|(_, partition, _)| *partition)
+            .min();
+        if in_flight.is_some() {
+            return in_flight;
+        }
+        let minimum = manifest.config().min_partition_entries();
+        listing
+            .into_iter()
+            .filter(|(key, partition, header)| {
+                key == tree_key
+                    && partition.get() != 1
+                    && header.state() == PartitionState::Ready
+                    && header.entry_count() < minimum
+            })
+            .min_by(|left, right| {
+                left.2
+                    .entry_count()
+                    .cmp(&right.2.entry_count())
+                    .then_with(|| left.1.cmp(&right.1))
+            })
+            .map(|(_, partition, _)| partition)
+    }
+
+    /// Drives one source partition to a completed merge; an immediately-idle
+    /// source reports `idle` and a target-less merge reports `stalled`.
+    async fn run_merge(
+        &mut self,
+        tree_key: &TreeKey,
+        source: PartitionKey,
+    ) -> ktann::api::Result<String> {
+        let mut began = false;
+        for _ in 0..4_096 {
+            match self.merge_advance_once(tree_key, source).await? {
+                MergeAdvance::Idle => {
+                    assert!(!began, "merge idled mid-machine");
+                    return Ok(format!("pk={}: idle\n", source.get()));
+                }
+                MergeAdvance::Stalled => return Ok(format!("pk={}: stalled\n", source.get())),
+                MergeAdvance::Began => began = true,
+                MergeAdvance::Drained { .. } => {}
+                MergeAdvance::Completed => return Ok(format!("pk={}: merged\n", source.get())),
+                other => panic!("unexpected merge outcome {other:?}"),
+            }
+        }
+        panic!(
+            "merge of pk={} did not complete within 4096 steps",
+            source.get()
+        );
+    }
+
+    /// One bounded merge transition with the harness's deterministic clock.
+    async fn merge_advance_once(
+        &mut self,
+        tree_key: &TreeKey,
+        source: PartitionKey,
+    ) -> ktann::api::Result<MergeAdvance> {
+        let backend = self
+            .backend
+            .as_ref()
+            .expect("merge directives require new-index first");
+        let manifest = support::read_manifest(backend, self.index().logical_index_id()).await;
+        let started_at = self.maintenance_clock;
+        self.maintenance_clock += 100;
+        merge::advance(
+            backend,
+            &manifest,
+            tree_key,
+            source,
+            started_at,
+            &retry_policy(),
+        )
+        .await
+    }
+
+    /// Encodes the `tree=V` argument as the Tree Key. Split and merge
+    /// directives support the corpus's single i64 tree-key field shape only.
     fn tree_key_arg(&self, directive: &Directive) -> TreeKey {
         let value = directive.require("tree");
         let config = self.index().config();
         let tree_fields = config.tree_key_fields();
         assert!(
             tree_fields.len() == 1,
-            "split directives need a single tree-key field"
+            "split/merge directives need a single tree-key field"
         );
         let schema = &config.fields()[usize::from(tree_fields[0].0)];
         assert!(
             schema.data_type() == DataType::I64,
-            "split directives need an i64 tree-key field"
+            "split/merge directives need an i64 tree-key field"
         );
         TreeKey::encode(
             &[DataType::I64],
@@ -1202,7 +1349,21 @@ fn describe_advance(outcome: &Advance) -> String {
     }
 }
 
-/// The bounded fixup retry policy used by split steps.
+/// Renders one merge-step outcome for the corpus.
+fn describe_merge_advance(outcome: &MergeAdvance) -> String {
+    match outcome {
+        MergeAdvance::Idle => "idle".to_string(),
+        MergeAdvance::Began => "began".to_string(),
+        MergeAdvance::Drained { moved, remaining } => {
+            format!("drained moved={moved} remaining={remaining}")
+        }
+        MergeAdvance::Stalled => "stalled".to_string(),
+        MergeAdvance::Completed => "completed".to_string(),
+        other => panic!("unexpected merge outcome {other:?}"),
+    }
+}
+
+/// The bounded fixup retry policy used by split and merge steps.
 fn retry_policy() -> RetryPolicy {
     RetryPolicy::for_fixup(&RuntimeConfig::default())
 }

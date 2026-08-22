@@ -16,7 +16,12 @@
 //!   record. Upsert reads every stored Record Location with one batched
 //!   update-protected read to choose between insert and replacement; a
 //!   replacement across Tree Keys or leaves is one atomic move. Delete never
-//!   routes and follows the exact stored location.
+//!   routes and follows the exact stored location. A descent that meets a
+//!   `Merging` partition reselects the nearest `Ready` same-level candidate,
+//!   so no insert enters a merge source and an upsert whose Record Location
+//!   still names the source relocates atomically; when no `Ready` target
+//!   exists the whole operation retries under the bounded policy and surfaces
+//!   `ContentionExhausted` on exhaustion (ADR 0008).
 //! - **Writes.** Every item queues its record-group writes into one shared
 //!   builder applied once in canonical key order; exact Header counts and
 //!   Synopsis expansions still apply per item so later items observe them.
@@ -32,8 +37,8 @@
 //!   real result wins.
 //!
 //! Offering maintenance after a committed mutation arrives with the Fixup
-//! runtime (#31); losing it never affects correctness because every
-//! committed topology state remains searchable.
+//! runtime; losing it never affects correctness because every committed
+//! topology state remains searchable.
 
 use std::collections::BTreeMap;
 
@@ -68,14 +73,36 @@ pub(crate) async fn mutate<B: Backend>(
     let kernel = routing::kernel_for(handle_manifest)?;
     let prepared = prepare_all(handle_manifest, &kernel, mutations)?;
     let backend = context.backend();
-    writes::run_write_attempts(
-        backend.as_ref(),
-        Some(context),
-        handle_manifest,
-        &retry,
-        |txn| writes::boxed_step(apply_all(txn, &kernel, mutations, &prepared)),
-    )
-    .await
+    let mut failed_attempts = 0_u32;
+    loop {
+        let outcome = writes::run_write_attempts(
+            backend.as_ref(),
+            Some(&mut *context),
+            handle_manifest,
+            &retry,
+            |txn| writes::boxed_step(apply_all(txn, &kernel, mutations, &prepared)),
+        )
+        .await?;
+        match outcome {
+            ApplyOutcome::Applied(outcomes) => return Ok(outcomes),
+            // A Merging leaf blocked routing and no Ready same-level target
+            // exists: the attempt staged no writes, so the whole operation
+            // retries from a fresh snapshot under the bounded policy, and
+            // exhaustion returns ContentionExhausted (ADR 0008).
+            ApplyOutcome::NoReadyMergeTarget => {
+                retry.wait_or_exhaust(&mut failed_attempts).await?;
+            }
+        }
+    }
+}
+
+/// The outcome of one whole mutation attempt.
+enum ApplyOutcome {
+    /// Every mutation applied; the attempt commits.
+    Applied(Vec<MutationOutcome>),
+    /// Routing found no `Ready` same-level merge target; the attempt staged
+    /// no writes and the operation retries.
+    NoReadyMergeTarget,
 }
 
 /// Applies every mutation in input order inside the attempt transaction.
@@ -91,10 +118,15 @@ async fn apply_all<T: WriteTxn>(
     kernel: &VectorKernel,
     mutations: &[Mutation],
     prepared: &[Option<PreparedRecord>],
-) -> Result<Vec<MutationOutcome>> {
+) -> Result<ApplyOutcome> {
     debug_assert_eq!(mutations.len(), prepared.len());
     let started_at = now_unix_millis();
-    let targets = route_all(txn, kernel, prepared, started_at).await?;
+    let targets = match route_all(txn, kernel, prepared, started_at).await? {
+        RouteAll::Routed(targets) => targets,
+        // Routing queues no writes, so an attempt abandoned here commits
+        // nothing and retries whole.
+        RouteAll::NoReadyMergeTarget => return Ok(ApplyOutcome::NoReadyMergeTarget),
+    };
     let expected = read_locations(txn, mutations).await?;
     let mut deferred = txn.mutations();
     let mut outcomes = Vec::with_capacity(mutations.len());
@@ -112,7 +144,7 @@ async fn apply_all<T: WriteTxn>(
         outcomes.push(outcome);
     }
     txn.apply(deferred).await?;
-    Ok(outcomes)
+    Ok(ApplyOutcome::Applied(outcomes))
 }
 
 /// One Tree Key's routing group: the items routed together in one descent.
@@ -121,6 +153,15 @@ struct RouteGroup<'a> {
     /// The group's first input position, used for error attribution.
     first_position: usize,
     members: Vec<(usize, &'a PreparedRecord)>,
+}
+
+/// The outcome of routing every Insert/Upsert item to its target leaf.
+enum RouteAll {
+    /// Every item routed, aligned to the input positions.
+    Routed(Vec<Option<RecordLocation>>),
+    /// A `Merging` leaf blocked routing and no `Ready` same-level target
+    /// exists.
+    NoReadyMergeTarget,
 }
 
 /// Routes every Insert/Upsert item to its target leaf with one batched
@@ -134,7 +175,7 @@ async fn route_all<T: WriteTxn>(
     kernel: &VectorKernel,
     prepared: &[Option<PreparedRecord>],
     started_at: u64,
-) -> Result<Vec<Option<RecordLocation>>> {
+) -> Result<RouteAll> {
     let mut targets: Vec<Option<RecordLocation>> = vec![None; prepared.len()];
     let mut group_index: BTreeMap<&[u8], usize> = BTreeMap::new();
     let mut groups: Vec<RouteGroup<'_>> = Vec::new();
@@ -158,7 +199,7 @@ async fn route_all<T: WriteTxn>(
             .iter()
             .map(|(_, prepared)| &*prepared.routing)
             .collect();
-        let routes = routing::route_leaves_for_write_preprocessed(
+        let routes = match routing::route_leaves_for_write_preprocessed(
             txn,
             group.tree_key,
             kernel,
@@ -166,12 +207,18 @@ async fn route_all<T: WriteTxn>(
             started_at,
         )
         .await
-        .map_err(|error| error.at_position(group.first_position))?;
+        .map_err(|error| error.at_position(group.first_position))?
+        {
+            routing::GroupedDescent::Routed(routes) => routes,
+            routing::GroupedDescent::NoReadyMergeTarget => {
+                return Ok(RouteAll::NoReadyMergeTarget);
+            }
+        };
         for ((position, prepared), route) in group.members.into_iter().zip(routes) {
             targets[position] = Some(RecordLocation::new(prepared.tree_key.clone(), route.leaf()));
         }
     }
-    Ok(targets)
+    Ok(RouteAll::Routed(targets))
 }
 
 /// Reads the stored Record Locations of every upsert item with one batched

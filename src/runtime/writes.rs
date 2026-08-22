@@ -19,7 +19,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::api::{Error, ErrorKind, Result};
+use crate::api::{ErrorKind, Result};
 use crate::storage::WriteLogicalTxn;
 use crate::storage::backend::Backend;
 use crate::storage::values::IndexManifest;
@@ -101,11 +101,7 @@ pub(crate) async fn run_write_attempts<'b, 'm, B: Backend, O>(
         if error.kind() != ErrorKind::RetryableAbort {
             return Err(error);
         }
-        if retry.would_exhaust(failed_attempts) {
-            return Err(Error::new(ErrorKind::ContentionExhausted));
-        }
-        retry.wait(failed_attempts).await;
-        failed_attempts += 1;
+        retry.wait_or_exhaust(&mut failed_attempts).await?;
     }
 }
 

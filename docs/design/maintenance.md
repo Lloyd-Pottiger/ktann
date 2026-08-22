@@ -106,10 +106,11 @@ Exact source Header count zero is the sole proof that structural draining is
 complete; no entry rescan is performed. For a non-root source, completion finds
 and validates its unique incoming Child Entry. With transactional range clear,
 one final transaction switches topology, promotes both targets to Ready, and
-removes the source prefix. Without that capability, bounded point cleanup keeps
-the DrainingSplit State and Header until the obsolete prefix is empty; the final
-transaction revalidates zero count, removes the incoming source edge and source
-metadata, and promotes the already exposed targets. Root completion
+removes the source prefix. Without that capability, the exact zero count proves
+the entry ranges empty without a rescan — the source prefix holds only its
+fixed metadata keys — so the same final transaction revalidates zero count,
+removes the incoming source edge and those fixed metadata keys with bounded
+point deletes, and promotes the already exposed targets. Root completion
 converts Partition Key 1 in place to a Ready internal root containing the two
 target Child Entries.
 
@@ -131,8 +132,10 @@ if none exists after bounded retry it returns ContentionExhausted.
 
 After exact source count reaches zero, cleanup follows the same capability
 branch as non-root split: transactional full-prefix clear when available;
-otherwise paged point cleanup retains the Merging State/Header until the final
-incoming-reference removal. No target state changes and no tombstone remains.
+otherwise the exact zero count proves the entry ranges empty, so the final
+transaction removes the incoming reference and the source's fixed metadata
+keys with bounded point deletes. No target state changes and no tombstone
+remains.
 
 If no legal target exists before merge begins, no state starts. If targets later
 disappear, the searchable Merging source remains and later access retries; it

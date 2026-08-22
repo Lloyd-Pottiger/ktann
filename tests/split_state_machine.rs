@@ -1835,9 +1835,15 @@ async fn a_concurrent_drain_move_conflicts_with_a_foreground_delete() {
         .expect("candidate exists");
     assert!(index.delete(rid(3)).await.expect("delete"));
     records.retain(|(id, _)| *id != rid(3));
-    topology::relocate_leaf_entries(&mut attempt, &key, pk(1), vec![(candidate, pk(3))])
-        .await
-        .expect("relocate op");
+    topology::relocate_leaf_entries(
+        &mut attempt,
+        &key,
+        pk(1),
+        vec![(candidate, pk(3))],
+        topology::Movement::Split,
+    )
+    .await
+    .expect("relocate op");
     let error = attempt.commit().await.expect_err("delete conflicts");
     assert_eq!(error.kind(), ErrorKind::RetryableAbort);
 

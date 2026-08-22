@@ -40,17 +40,30 @@
 //!   never descended alone: its source still owns the unmigrated children,
 //!   so routing resolves the split family through the target's persisted
 //!   source reference.
+//! - **Merge state.** A `Merging` partition never accepts a write descent:
+//!   the route reselects the nearest `Ready` same-level candidate with the
+//!   Partition Key tie-break — the merge drain's own target rule (ADR 0008) —
+//!   and redirects a leaf descent or re-descends an internal hop there, so no
+//!   insert enters the source and an upsert whose Record Location names the
+//!   source relocates atomically. The reselected partition's own incoming
+//!   edge at its observed parent is the validated reference. When no `Ready`
+//!   candidate exists the grouped write descent reports it, and the
+//!   operation retries under its bounded policy before surfacing
+//!   `ContentionExhausted`. Search traversal instead visits the `Merging`
+//!   source as an ordinary body (ADR 0006).
 //! - **Bounded depth and work.** The root Header's level bounds the descent:
 //!   every hop must descend exactly one level and a leaf is exactly level 1
 //!   (ADR 0006), so hop count is bounded by the persisted root level and a
 //!   level that fails to decrement — including any cycle — is Corruption.
 //!   Each internal body scanned contributes its exact Header count of Child
-//!   Entries in bounded pages; a count mismatch is Corruption.
+//!   Entries in bounded pages; a count mismatch is Corruption. A merge
+//!   reroute hop adds one bounded same-level candidate enumeration,
+//!   proportional to that level's partition count and paged like the
+//!   incoming-edge rediscovery (ADR 0007).
 //! - **Fail closed.** A missing Header, State, or centroid, a wrong-kind
 //!   value, a level mismatch, a header/state disagreement, an incomplete
-//!   split family, or a malformed centroid is Corruption; a `Merging`
-//!   partition is unreachable before the merge state machine (#31) and is
-//!   likewise rejected; malformed caller vectors are InvalidArgument.
+//!   split family, or a malformed centroid is Corruption; malformed caller
+//!   vectors are InvalidArgument.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -128,7 +141,10 @@ impl Route {
 /// Returns `None` when the Tree Key has no tree yet; reads never create one.
 /// The vector is validated and preprocessed (metric normalization and the
 /// persisted rotation) exactly as the write path preprocesses it, so both
-/// paths descend identically on the same snapshot.
+/// paths descend identically on the same snapshot. A descent rerouted by a
+/// `Merging` partition fails with `ContentionExhausted` when no `Ready`
+/// same-level target exists — the single-vector shape has no retry layer,
+/// unlike the grouped write path.
 pub async fn route_leaf<T: ReadOps>(
     txn: &mut ReadLogicalTxn<'_, T>,
     tree_key: &TreeKey,
@@ -151,7 +167,10 @@ pub async fn route_leaf<T: ReadOps>(
 /// Route is validated for the mutation: the leaf Header and, for a non-root
 /// leaf, the carried parent edge are update-protected, so a concurrent
 /// topology change makes the commit fail with a retryable conflict and the
-/// whole attempt reroutes from a fresh snapshot.
+/// whole attempt reroutes from a fresh snapshot. A descent rerouted by a
+/// `Merging` partition fails with `ContentionExhausted` when no `Ready`
+/// same-level target exists — the single-vector shape has no retry layer,
+/// unlike the grouped write path.
 ///
 /// `started_at_unix_millis` seeds the persisted state-start time when this
 /// route creates the tree; it is unused when the tree already exists.
@@ -170,15 +189,27 @@ pub async fn route_leaf_for_write<T: WriteTxn>(
     Ok(route)
 }
 
+/// The outcome of a grouped write descent.
+pub(crate) enum GroupedDescent {
+    /// Every vector routed to a write-accepting leaf, in input order.
+    Routed(Vec<Route>),
+    /// A `Merging` partition blocked the descent and no `Ready` same-level
+    /// target exists; the operation retries under its bounded policy and
+    /// surfaces `ContentionExhausted` on exhaustion (ADR 0008).
+    NoReadyMergeTarget,
+}
+
 /// Routes one batch of preprocessed routing vectors through one tree for a
 /// foreground write.
 ///
 /// The batch shares one Tree Manifest read and one read per visited internal
-/// partition instead of re-descending per record. The returned Routes
-/// correspond to the input vectors by index, and every *distinct* routed leaf
-/// is validated once in one batched update-protected read: its Header and
-/// incoming reference are update-protected, so a concurrent topology change
-/// aborts the commit and the whole attempt reroutes from a fresh snapshot.
+/// partition instead of re-descending per record. On [`GroupedDescent::Routed`]
+/// the returned Routes correspond to the input vectors by index, and every
+/// *distinct* routed leaf is validated once in one batched update-protected
+/// read: its Header and incoming reference are update-protected, so a
+/// concurrent topology change aborts the commit and the whole attempt
+/// reroutes from a fresh snapshot. [`GroupedDescent::NoReadyMergeTarget`]
+/// carries no routes and validates nothing.
 ///
 /// Every routing vector must be the exact output of
 /// [`VectorKernel::preprocess`] under `kernel` for the bound Logical Index.
@@ -188,7 +219,7 @@ pub(crate) async fn route_leaves_for_write_preprocessed<T: WriteTxn>(
     kernel: &VectorKernel,
     routings: &[&[f32]],
     started_at_unix_millis: u64,
-) -> Result<Vec<Route>> {
+) -> Result<GroupedDescent> {
     let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
     if routings
         .iter()
@@ -197,12 +228,14 @@ pub(crate) async fn route_leaves_for_write_preprocessed<T: WriteTxn>(
         return Err(Error::invalid_argument());
     }
     if routings.is_empty() {
-        return Ok(Vec::new());
+        return Ok(GroupedDescent::Routed(Vec::new()));
     }
     let root = ensure_tree(txn, tree_key, started_at_unix_millis).await?;
-    let routes = descend_grouped(txn, manifest, kernel, tree_key, root, routings).await?;
-    validate_for_write(txn, manifest, tree_key, &routes).await?;
-    Ok(routes)
+    let descent = descend_grouped(txn, manifest, kernel, tree_key, root, routings).await?;
+    if let GroupedDescent::Routed(routes) = &descent {
+        validate_for_write(txn, manifest, tree_key, routes).await?;
+    }
+    Ok(descent)
 }
 
 /// Returns the root of `tree_key`'s tree, lazily installing the tree when the
@@ -343,6 +376,31 @@ async fn descend<R: LogicalReader>(
                 // hop below the internal source replaces it.
                 partition = source;
             }
+            Hop::MergeReroute { level, candidates } => {
+                let Some(candidate) =
+                    nearest_ready_candidate(kernel, routing, partition, &candidates)?
+                else {
+                    // No Ready same-level target exists while the source is
+                    // Merging; the stall is transient and the caller may
+                    // retry (ADR 0008).
+                    return Err(Error::new(ErrorKind::ContentionExhausted));
+                };
+                if level == 1 {
+                    // The reselected Ready leaf ends the descent; its own
+                    // incoming edge at its observed parent is the reference
+                    // write validation protects.
+                    return Ok(Route {
+                        leaf: candidate.partition(),
+                        leaf_header: *candidate.header(),
+                        parent: Some(candidate.parent()),
+                        incoming: Incoming::ParentEdge,
+                    });
+                }
+                // Re-descend from the reselected same-level body at the same
+                // level; the next hop replaces the carried parent.
+                partition = candidate.partition();
+                parent = Some(candidate.parent());
+            }
         }
     }
 }
@@ -350,7 +408,9 @@ async fn descend<R: LogicalReader>(
 /// Descends from `root` with the whole group, reading each visited partition
 /// once and returning one Route per input vector in input order. The same
 /// shared state-machine body ([`resolve_hop`]) and fail-closed level and
-/// state contract as [`descend`] apply.
+/// state contract as [`descend`] apply. A descent blocked by a `Merging`
+/// partition with no `Ready` same-level target reports
+/// [`GroupedDescent::NoReadyMergeTarget`] instead of routes.
 async fn descend_grouped<R: LogicalReader>(
     reader: &mut R,
     manifest: &IndexManifest,
@@ -358,7 +418,7 @@ async fn descend_grouped<R: LogicalReader>(
     tree_key: &TreeKey,
     root: PartitionKey,
     routings: &[&[f32]],
-) -> Result<Vec<Route>> {
+) -> Result<GroupedDescent> {
     let mut routes: Vec<Option<Route>> = vec![None; routings.len()];
     // (partition, observed parent, expected level, member indexes).
     let mut pending = vec![(
@@ -430,16 +490,54 @@ async fn descend_grouped<R: LogicalReader>(
                 // replaces it.
                 pending.push((source, parent, expected_level, members));
             }
+            Hop::MergeReroute { level, candidates } => {
+                // The Ready-candidate set is vector-independent: either every
+                // member reselects a target or none does.
+                let mut grouped: BTreeMap<
+                    PartitionKey,
+                    (PartitionKey, PartitionHeader, Vec<usize>),
+                > = BTreeMap::new();
+                for member in members {
+                    let Some(candidate) =
+                        nearest_ready_candidate(kernel, routings[member], partition, &candidates)?
+                    else {
+                        return Ok(GroupedDescent::NoReadyMergeTarget);
+                    };
+                    grouped
+                        .entry(candidate.partition())
+                        .or_insert_with(|| (candidate.parent(), *candidate.header(), Vec::new()))
+                        .2
+                        .push(member);
+                }
+                for (target, (target_parent, target_header, members)) in grouped {
+                    if level == 1 {
+                        // The reselected Ready leaf ends the descent; its own
+                        // incoming edge at its observed parent is validated.
+                        for member in members {
+                            routes[member] = Some(Route {
+                                leaf: target,
+                                leaf_header: target_header,
+                                parent: Some(target_parent),
+                                incoming: Incoming::ParentEdge,
+                            });
+                        }
+                    } else {
+                        pending.push((target, Some(target_parent), Some(level), members));
+                    }
+                }
+            }
         }
     }
     // Every member is resolved exactly once: each partition visit either
     // assigns its members at a write-accepting leaf or redirects them to a
-    // target leaf, requeues them at a splitting source, or splits them across
-    // the children of the candidate bodies.
-    routes
+    // target leaf, requeues them at a splitting source or a reselected
+    // merge-level body, or splits them across the children of the candidate
+    // bodies.
+    let routes = routes
         .into_iter()
         .map(|route| route.ok_or_else(|| Error::new(ErrorKind::Backend)))
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    Ok(GroupedDescent::Routed(routes))
 }
 
 /// One resolved descent hop: the split-aware state machine's whole per-hop
@@ -473,6 +571,17 @@ enum Hop {
     /// source still holds every entry: re-descend from the source at the same
     /// level.
     Sideways(PartitionKey),
+    /// A `Merging` partition is never descended into for writes: each vector
+    /// reselects the nearest `Ready` same-level candidate — the merge drain's
+    /// own target rule (ADR 0008) — and redirects (leaf) or re-descends
+    /// (internal) there. Carries every same-level candidate, including the
+    /// source itself and non-Ready partitions, both excluded at selection.
+    MergeReroute {
+        /// The level the merging partition and its candidates sit at.
+        level: u32,
+        /// Every same-level candidate under the descent's snapshot.
+        candidates: Vec<topology::LevelCandidate>,
+    },
 }
 
 /// One draining leaf's redirect target with its validated authority values.
@@ -484,7 +593,7 @@ struct DrainTarget {
 
 /// Resolves one visited partition's descent hop: the single split-aware
 /// state-machine body serving both the single-vector read descent and the
-/// grouped write descent. The merge state machine (#31) extends exactly this
+/// grouped write descent. The merge state machine extends exactly this
 /// match.
 ///
 /// Split-family resolution stays within one level: a `ReceivingSplit`
@@ -564,9 +673,17 @@ async fn resolve_hop<R: LogicalReader>(
                 next_level: header.level() - 1,
             })
         }
-        // Merging is unreachable before the merge state machine (#31) and
-        // stays fail-closed.
-        _ => Err(Error::new(ErrorKind::Corruption)),
+        PartitionTransition::Merging { .. } => {
+            // A Merging partition accepts no write descent: its entries are
+            // leaving for reselected Ready targets, so the route reselects
+            // under current topology — the merge drain's own rule (ADR 0008).
+            let candidates =
+                topology::same_level_candidates(reader, manifest, tree_key, header.level()).await?;
+            Ok(Hop::MergeReroute {
+                level: header.level(),
+                candidates,
+            })
+        }
     }
 }
 
@@ -797,6 +914,43 @@ pub(crate) fn nearer_of_two(
     } else {
         left
     }
+}
+
+/// Selects the nearest legal merge target for one routing-space vector: a
+/// `Ready` candidate other than the source, nearer routing distance first
+/// with the Partition Key tie-break — ADR 0008's canonical reselection rule,
+/// shared by the merge drain and the write descent's merge redirect.
+///
+/// Persisted candidate centroids are routing models, so kernel errors here
+/// are fail-closed Corruption rather than caller error.
+pub(crate) fn nearest_ready_candidate<'c>(
+    kernel: &VectorKernel,
+    routing: &[f32],
+    source: PartitionKey,
+    candidates: &'c [topology::LevelCandidate],
+) -> Result<Option<&'c topology::LevelCandidate>> {
+    let mut best: Option<(f64, PartitionKey, &topology::LevelCandidate)> = None;
+    for candidate in candidates {
+        if !candidate.is_legal_merge_target(source) {
+            continue;
+        }
+        let distance = kernel
+            .routing_distance(routing, candidate.centroid())
+            .map_err(|_| Error::new(ErrorKind::Corruption))?;
+        if best
+            .as_ref()
+            .is_none_or(|&(best_distance, best_partition, _)| {
+                beats(
+                    distance,
+                    candidate.partition(),
+                    (best_distance, best_partition),
+                )
+            })
+        {
+            best = Some((distance, candidate.partition(), candidate));
+        }
+    }
+    Ok(best.map(|(_, _, candidate)| candidate))
 }
 
 /// Builds the page bounds for a Child Entry scan during descent.

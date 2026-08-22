@@ -36,41 +36,20 @@
 //!   `advance` converges a split; abandoning it at any point leaves a
 //!   searchable state.
 
-use bytes::Bytes;
-
 use crate::api::{Error, ErrorKind, PartitionKey, Result};
 use crate::runtime::RetryPolicy;
 use crate::runtime::{reads, writes};
-use crate::storage::backend::{Backend, ScanLimits, WriteTxn};
+use crate::storage::backend::{Backend, WriteTxn};
 use crate::storage::keys::{LogicalKey, TreeKey};
 use crate::storage::values::{
-    IndexManifest, PartitionCentroid, PartitionState, PartitionTransition, PersistentValue,
-    expect_centroid,
+    IndexManifest, PartitionCentroid, PartitionState, PartitionTransition, expect_centroid,
 };
-use crate::storage::{LogicalRange, ReadLogicalTxn, WriteLogicalTxn, topology};
+use crate::storage::{ReadLogicalTxn, WriteLogicalTxn, topology};
 
+use super::drain::{self, DrainBatch};
+pub use super::drain::{DRAIN_BATCH_INTERNAL, DRAIN_BATCH_LEAF};
 use super::routing;
 use super::training;
-
-/// The number of Leaf Entries one drain batch moves.
-///
-/// Each leaf move writes the target entry, both Headers, and the Record
-/// Location, and may rewrite the target Synopsis (at most 64 KiB), so eight
-/// moves stay within the most conservative adapter admission budget
-/// (1,000 mutations / 1 MiB) even when every Synopsis rewrite is maximal.
-pub const DRAIN_BATCH_LEAF: usize = 8;
-
-/// The number of Child Entries one drain batch moves.
-///
-/// An internal move writes only the entry and both Headers, so 128 moves stay
-/// far below every adapter admission budget.
-pub const DRAIN_BATCH_INTERNAL: usize = 128;
-
-/// The bound on one drain candidate scan page.
-const DRAIN_SCAN_LIMITS: ScanLimits = ScanLimits {
-    item_limit: DRAIN_BATCH_INTERNAL,
-    byte_limit: 1_048_576,
-};
 
 /// The outcome of [`expose_targets`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,7 +93,7 @@ pub enum DrainStep {
 pub enum Advance {
     /// Nothing to do: the partition is `Ready` at or below the split
     /// threshold, a `ReceivingSplit` target waiting for its source, or
-    /// `Merging` (whose state machine is #31).
+    /// `Merging` (advanced by [`super::merge`]).
     Idle,
     /// The partition began a split.
     Began {
@@ -225,11 +204,7 @@ pub async fn expose_targets<B: Backend>(
                 // The parent rejected a new child: abandon and rediscover
                 // from a fresh snapshot under the same bounded policy.
                 topology::TargetInstall::ParentNotAccepting => {
-                    if retry.would_exhaust(failed_attempts) {
-                        return Err(Error::new(ErrorKind::ContentionExhausted));
-                    }
-                    retry.wait(failed_attempts).await;
-                    failed_attempts += 1;
+                    retry.wait_or_exhaust(&mut failed_attempts).await?;
                 }
                 other => break other,
             }
@@ -288,35 +263,26 @@ pub async fn drain_batch<B: Backend>(
     // The read phase fixes the batch from one consistent snapshot; one
     // batched read covers both source authority values.
     let mut read = reads::open_validated_read(backend, manifest).await?;
-    let (source_header, state) =
-        topology::read_authority_opt(&mut read, manifest.logical_index_id(), tree_key, source)
+    let pair =
+        topology::read_authority_pair(&mut read, manifest.logical_index_id(), tree_key, source)
             .await?;
-    let Some(state) = state else {
-        // A completed split removed both authority values; a lone surviving
-        // Header is a torn committed state.
-        return if source_header.is_some() {
-            Err(Error::new(ErrorKind::Corruption))
-        } else {
-            Ok(DrainStep::SourceAdvanced)
-        };
+    let Some((source_header, state)) = pair else {
+        // A completed split removed both authority values.
+        return Ok(DrainStep::SourceAdvanced);
     };
     let (left, right) = match state {
         PartitionTransition::DrainingSplit { left, right, .. } => (left, right),
         PartitionTransition::Splitting { .. } => return Ok(DrainStep::NotDraining),
         _ => return Ok(DrainStep::SourceAdvanced),
     };
-    let header = source_header.ok_or_else(|| Error::new(ErrorKind::Corruption))?;
-    if header.entry_count() == 0 {
+    let Some(batch) =
+        drain::next_drain_batch(&mut read, manifest, tree_key, source, Some(source_header)).await?
+    else {
         return Ok(DrainStep::Drained {
             moved: 0,
             remaining: 0,
         });
-    }
-    let batch = read_drain_batch(&mut read, manifest, tree_key, source, header.level()).await?;
-    if batch.is_empty() {
-        // The exact count and the entry set disagree within one snapshot.
-        return Err(Error::new(ErrorKind::Corruption));
-    }
+    };
     drop(read);
 
     let plan = DrainPlan {
@@ -365,9 +331,13 @@ async fn drain_attempt<T: WriteTxn>(
         },
     )
     .await?;
-    let Some(state) = state else {
-        // A completed split removed the source State.
-        return Ok(DrainStep::SourceAdvanced);
+    let (source_header, state) = match (source_header, state) {
+        // A completed split removed both authority values.
+        (None, None) => return Ok(DrainStep::SourceAdvanced),
+        (Some(header), Some(state)) => (header, state),
+        // Completion removes or converts the pair atomically, so a
+        // half-present pair is a torn committed state.
+        _ => return Err(Error::new(ErrorKind::Corruption)),
     };
     match state {
         // The DrainingSplit target pair is fixed at the transition, so a
@@ -380,9 +350,6 @@ async fn drain_attempt<T: WriteTxn>(
         }
         _ => return Ok(DrainStep::SourceAdvanced),
     }
-    let Some(source_header) = source_header else {
-        return Ok(DrainStep::SourceAdvanced);
-    };
     if source_header.state() != PartitionState::DrainingSplit {
         return Err(Error::new(ErrorKind::Corruption));
     }
@@ -433,7 +400,8 @@ async fn drain_attempt<T: WriteTxn>(
                 )?;
                 moves.push((candidate, target));
             }
-            topology::relocate_leaf_entries(txn, tree_key, source, moves).await?
+            topology::relocate_leaf_entries(txn, tree_key, source, moves, topology::Movement::Split)
+                .await?
         }
         DrainBatch::Child(children) => {
             let candidates =
@@ -450,7 +418,14 @@ async fn drain_attempt<T: WriteTxn>(
                 )?;
                 moves.push((entry, target));
             }
-            topology::relocate_child_entries(txn, tree_key, source, moves).await?
+            topology::relocate_child_entries(
+                txn,
+                tree_key,
+                source,
+                moves,
+                topology::Movement::Split,
+            )
+            .await?
         }
     };
     let remaining = source_header
@@ -471,11 +446,7 @@ pub async fn complete_split<B: Backend>(
     started_at_unix_millis: u64,
     retry: &RetryPolicy,
 ) -> Result<topology::SplitCompletion> {
-    let removal = if backend.capabilities().transactional_clear_range {
-        topology::SourceRemoval::TransactionalClear
-    } else {
-        topology::SourceRemoval::PointDeletes
-    };
+    let removal = topology::SourceRemoval::for_capabilities(backend.capabilities());
     writes::run_write_attempts(backend, None, manifest, retry, |txn| {
         writes::boxed_step(topology::finalize_split(
             txn,
@@ -507,22 +478,14 @@ pub async fn advance<B: Backend>(
     retry: &RetryPolicy,
 ) -> Result<Advance> {
     let mut read = reads::open_validated_read(backend, manifest).await?;
-    let (header, state) =
-        topology::read_authority_opt(&mut read, manifest.logical_index_id(), tree_key, partition)
+    let pair =
+        topology::read_authority_pair(&mut read, manifest.logical_index_id(), tree_key, partition)
             .await?;
     drop(read);
-    let (header, state) = match (header, state) {
-        // Nothing was ever persisted here, or a completed split already
-        // removed every value: nothing to advance.
-        (None, None) => return Ok(Advance::Idle),
-        // A half-present pair is Corruption.
-        (Some(header), Some(state)) => {
-            if header.state() != state.state() {
-                return Err(Error::new(ErrorKind::Corruption));
-            }
-            (header, state)
-        }
-        _ => return Err(Error::new(ErrorKind::Corruption)),
+    // Nothing was ever persisted here, or a completed split already removed
+    // every value: nothing to advance.
+    let Some((header, state)) = pair else {
+        return Ok(Advance::Idle);
     };
 
     match state {
@@ -609,61 +572,6 @@ pub async fn advance<B: Backend>(
         PartitionTransition::ReceivingSplit { .. } | PartitionTransition::Merging { .. } => {
             Ok(Advance::Idle)
         }
-    }
-}
-
-/// One drain batch fixed by the read snapshot: leaf Record IDs or internal
-/// child Partition Keys.
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum DrainBatch {
-    Leaf(Vec<Bytes>),
-    Child(Vec<PartitionKey>),
-}
-
-impl DrainBatch {
-    /// Whether the batch holds no candidates.
-    fn is_empty(&self) -> bool {
-        match self {
-            Self::Leaf(ids) => ids.is_empty(),
-            Self::Child(children) => children.is_empty(),
-        }
-    }
-}
-
-/// Scans the source's current smallest drain candidates from the snapshot.
-async fn read_drain_batch<T: crate::storage::backend::ReadOps>(
-    txn: &mut ReadLogicalTxn<'_, T>,
-    manifest: &IndexManifest,
-    tree_key: &TreeKey,
-    source: PartitionKey,
-    level: u32,
-) -> Result<DrainBatch> {
-    if level == 1 {
-        let range = LogicalRange::leaf_entries(manifest, tree_key, source)?;
-        let limits = ScanLimits {
-            item_limit: DRAIN_BATCH_LEAF,
-            ..DRAIN_SCAN_LIMITS
-        };
-        let page = txn.scan(&range, None, limits).await?;
-        let mut ids = Vec::new();
-        for item in page.items() {
-            let PersistentValue::LeafEntry(entry) = item.value() else {
-                return Err(Error::new(ErrorKind::Corruption));
-            };
-            ids.push(entry.record_id().clone());
-        }
-        Ok(DrainBatch::Leaf(ids))
-    } else {
-        let range = LogicalRange::child_entries(manifest, tree_key, source)?;
-        let page = txn.scan(&range, None, DRAIN_SCAN_LIMITS).await?;
-        let mut children = Vec::new();
-        for item in page.items() {
-            let PersistentValue::ChildEntry(entry) = item.value() else {
-                return Err(Error::new(ErrorKind::Corruption));
-            };
-            children.push(entry.child());
-        }
-        Ok(DrainBatch::Child(children))
     }
 }
 
