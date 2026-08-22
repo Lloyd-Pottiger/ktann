@@ -10,9 +10,13 @@ use super::{BatchToken, ImportBatchResult, Index, Mutation, Result};
 /// A non-cloneable process-local coordinator that submits bounded waves of
 /// ordinary atomic mutation batches into one Index.
 ///
-/// `submit` applies ordinary batch validation, waits for an in-flight slot,
-/// admits exactly one ordinary atomic mutation operation, and returns a
-/// process-local [`BatchToken`]. Tokens are monotonically increasing within
+/// `submit` applies ordinary batch validation, waits for an in-flight slot
+/// and the Runtime's Structure Maintenance backlog gate, admits exactly one
+/// ordinary atomic mutation operation, and returns a process-local
+/// [`BatchToken`]. The
+/// gate pauses admission while the process-local Fixup backlog is at or above
+/// the configured watermark; it is process-local backpressure, never a durable
+/// or cluster-wide barrier. Tokens are monotonically increasing within
 /// the session and have no persistent or transaction identity. Accepted
 /// batches may execute concurrently within the session's in-flight bound and
 /// behave exactly like [`Index::batch_mutate`]: the same atomicity, retry,
@@ -49,9 +53,10 @@ impl<B: Backend> ImportSession<B> {
     /// Validation matches [`Index::batch_mutate`]: an invalid batch fails with
     /// [`crate::api::ErrorKind::InvalidArgument`] at the offending input
     /// position and no token is issued. An empty batch is accepted with an
-    /// empty result and never occupies an in-flight slot. Waiting for a slot
-    /// is bounded by the caller: dropping this future before it returns
-    /// cancels the wait and admits nothing.
+    /// empty result and never occupies an in-flight slot or waits for the
+    /// backlog gate. Waiting for a slot or the gate is bounded by the caller:
+    /// dropping this future before it returns cancels the wait and admits
+    /// nothing.
     ///
     /// # Errors
     ///

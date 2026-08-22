@@ -10,10 +10,11 @@
 //!
 //! Admission is bounded in both directions: at most the session's in-flight
 //! limit of batches execute concurrently, and no session-internal queue
-//! exists — a caller waiting for a slot holds its own unsubmitted batch, while
-//! admitted batches additionally pass the Runtime's bounded foreground
-//! admission. Session memory is bounded by the in-flight batch payloads plus
-//! one outcome entry per accepted token, collected on `drain`.
+//! exists — a caller waiting for a slot or the backlog gate holds its own
+//! unsubmitted batch, while admitted batches additionally pass the Runtime's
+//! bounded foreground admission. Session memory is bounded by the in-flight
+//! batch payloads plus one outcome entry per accepted token, collected on
+//! `drain`.
 //!
 //! Dropping the coordinator aborts every incomplete batch task. Tokio drops an
 //! aborted task's future, which runs the caller-drop guard inside
@@ -21,9 +22,13 @@
 //! a started commit keeps running detached under the Runtime's in-flight guard
 //! and finishes without an Import Session observer.
 //!
-//! `submit_batch` will also wait for the Runtime's Structure Maintenance
-//! backlog watermark against the Fixup queue; the gate wiring is tracked by
-//! #89, and the admission bounds here are independent of it.
+//! `submit_batch` also waits for the Runtime's Structure Maintenance backlog
+//! gate (design `runtime-operations.md` §4): a non-empty batch admits only
+//! once the process-local Fixup backlog — pending plus running — is below the
+//! configured watermark. The gate is process-local backpressure, never a
+//! durable or cluster-wide barrier; losing it cannot affect persistent
+//! correctness, and an empty batch does no storage work so it bypasses the
+//! gate exactly like it bypasses the in-flight slot.
 
 use std::sync::Arc;
 
@@ -70,11 +75,15 @@ impl<B: Backend> ImportCoordinator<B> {
     ///
     /// `mutations` must already be validated against the index's immutable
     /// configuration. An empty batch does no storage work — matching ordinary
-    /// `batch_mutate` — so it is admitted without occupying an in-flight slot.
+    /// `batch_mutate` — so it is admitted without occupying an in-flight slot
+    /// or waiting for the backlog gate.
     ///
-    /// Admission fails with [`ErrorKind::RuntimeClosed`] once the Runtime stops
-    /// accepting work; the residual race with shutdown is decided by the
-    /// batch's own foreground admission and reported as its outcome.
+    /// A non-empty batch waits for an in-flight slot and then for the Fixup
+    /// backlog gate before admitting; dropping this future mid-wait admits
+    /// nothing. Admission fails with [`ErrorKind::RuntimeClosed`] once the
+    /// Runtime stops accepting work; the residual race with shutdown is
+    /// decided by the batch's own foreground admission and reported as its
+    /// outcome.
     pub(crate) async fn submit_batch(&mut self, mutations: Vec<Mutation>) -> Result<BatchToken> {
         let runtime = Arc::clone(self.index.runtime());
         if !runtime.is_accepting() {
@@ -95,6 +104,7 @@ impl<B: Backend> ImportCoordinator<B> {
         if !runtime.is_accepting() {
             return Err(Error::new(ErrorKind::RuntimeClosed));
         }
+        runtime.wait_for_backlog_below().await?;
         let token = self.issue_token()?;
         let index = self.index.clone();
         let task = runtime.executor.spawn(async move {

@@ -66,6 +66,7 @@ impl<B: Backend> Runtime<B> {
                     foreground_waiting: Arc::new(Semaphore::new(foreground_limit)),
                     fixups: Mutex::new(FixupQueue::new(config.fixup_queue_capacity())),
                     fixup_available: Notify::new(),
+                    fixup_released: Notify::new(),
                     maintenance_cancel: CancellationToken::new(),
                     lifecycle: Mutex::new(Lifecycle {
                         phase: Phase::Accepting,
@@ -326,6 +327,9 @@ pub(crate) struct RuntimeInner<B: Backend> {
     foreground_waiting: Arc<Semaphore>,
     fixups: Mutex<FixupQueue>,
     fixup_available: Notify,
+    /// Signalled when a released Fixup queue slot opens the Import Session
+    /// backlog gate, so gated submissions re-check the watermark.
+    fixup_released: Notify,
     maintenance_cancel: CancellationToken,
     lifecycle: Mutex<Lifecycle<B>>,
     terminal: Notify,
