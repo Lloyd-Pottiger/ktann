@@ -20,6 +20,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::api::{ErrorKind, Result};
+use crate::observe::labels::Operation;
 use crate::storage::WriteLogicalTxn;
 use crate::storage::backend::Backend;
 use crate::storage::values::IndexManifest;
@@ -72,6 +73,7 @@ pub(crate) async fn run_write_attempts<'b, 'm, B: Backend, O>(
     mut context: Option<&mut OperationContext<B>>,
     handle_manifest: &'m IndexManifest,
     retry: &RetryPolicy,
+    operation: Operation,
     mut step: impl for<'a> FnMut(&'a mut WriteLogicalTxn<'m, B::WriteTxn<'b>>) -> StepFuture<'a, O>,
 ) -> Result<O> {
     let mut failed_attempts = 0_u32;
@@ -101,7 +103,9 @@ pub(crate) async fn run_write_attempts<'b, 'm, B: Backend, O>(
         if error.kind() != ErrorKind::RetryableAbort {
             return Err(error);
         }
-        retry.wait_or_exhaust(&mut failed_attempts).await?;
+        retry
+            .wait_or_exhaust(operation, &mut failed_attempts)
+            .await?;
     }
 }
 

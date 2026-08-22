@@ -19,6 +19,7 @@
 use std::fmt;
 
 use bytes::Bytes;
+use xxhash_rust::xxh3::xxh3_128_with_seed;
 
 use crate::api::{DataType, Error, ErrorKind, Result, Value};
 
@@ -29,6 +30,11 @@ pub const MAX_TREE_KEY_BYTES: usize = 8 * 1_024;
 
 /// The high bit used by the memcomparable `I64` and `F64` transforms.
 const SIGN: u64 = 0x8000_0000_0000_0000;
+
+/// Domain-separates the redacted Tree Key hash from every other hash.
+const TREE_KEY_HASH_DOMAIN: u64 = 0x4b54_414e_4e01_b1a0;
+/// The second pass domain deriving the upper 16 hash bytes.
+const TREE_KEY_HASH_SECOND_DOMAIN: u64 = 0x4b54_414e_4e01_b1a1;
 
 /// A storage-corruption error for malformed or noncanonical encoded fields.
 fn corrupt() -> Error {
@@ -119,6 +125,21 @@ impl fmt::Debug for TreeKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("TreeKey([REDACTED])")
     }
+}
+
+/// The stable redacted Tree Key hash attached to verification issues and
+/// trace spans (ADR 0019, design `runtime-operations.md` section 5).
+#[must_use]
+pub(crate) fn tree_key_hash(tree_key: &TreeKey) -> [u8; 32] {
+    let first = xxh3_128_with_seed(tree_key.as_bytes(), TREE_KEY_HASH_DOMAIN);
+    let second = xxh3_128_with_seed(
+        &first.to_le_bytes(),
+        TREE_KEY_HASH_SECOND_DOMAIN ^ (first as u64),
+    );
+    let mut hash = [0; 32];
+    hash[..16].copy_from_slice(&first.to_le_bytes());
+    hash[16..].copy_from_slice(&second.to_le_bytes());
+    hash
 }
 
 /// Reads exactly `N` bytes as an array, failing closed on truncation.

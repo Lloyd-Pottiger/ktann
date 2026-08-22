@@ -17,6 +17,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::blocking::{BlockingAdmission, NativeWorker};
 use crate::config::RocksDbConfig;
+use crate::observe;
 
 const ROCKSDB_MAX_PHYSICAL_KEY_BYTES: usize = u32::MAX as usize;
 const ROCKSDB_MAX_VALUE_BYTES: usize = u32::MAX as usize;
@@ -583,6 +584,7 @@ impl WriteTxn for RocksDbWriteTxn<'_> {
             .await
             .map_err(|source| Error::with_source(ErrorKind::Backend, source))?;
         drop(cancellation);
+        observe::commit(observe::CommitOutcome::from_result(&result));
         result
     }
 

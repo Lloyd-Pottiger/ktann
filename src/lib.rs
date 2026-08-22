@@ -34,6 +34,7 @@
 
 pub mod api;
 pub mod maintenance;
+mod observe;
 pub mod runtime;
 pub mod search;
 pub mod storage;

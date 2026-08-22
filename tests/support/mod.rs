@@ -33,6 +33,7 @@ pub mod audit;
 pub mod datadriven;
 pub mod dataset;
 pub mod load_index;
+pub mod observe;
 pub mod oracle;
 
 /// A Runtime configuration without background maintenance workers.

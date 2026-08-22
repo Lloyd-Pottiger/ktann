@@ -44,6 +44,8 @@
 //!   never reverts to `Ready`.
 
 use crate::api::{Error, ErrorKind, PartitionKey, Result};
+use crate::observe::labels::{FixupKind, Operation};
+use crate::observe::metrics;
 use crate::runtime::RetryPolicy;
 use crate::runtime::{reads, writes};
 use crate::storage::backend::{Backend, WriteTxn};
@@ -109,14 +111,21 @@ pub async fn begin_merge<B: Backend>(
     started_at_unix_millis: u64,
     retry: &RetryPolicy,
 ) -> Result<topology::MergeStart> {
-    writes::run_write_attempts(backend, None, manifest, retry, |txn| {
-        writes::boxed_step(topology::begin_merge(
-            txn,
-            tree_key,
-            source,
-            started_at_unix_millis,
-        ))
-    })
+    writes::run_write_attempts(
+        backend,
+        None,
+        manifest,
+        retry,
+        Operation::MergeFixup,
+        |txn| {
+            writes::boxed_step(topology::begin_merge(
+                txn,
+                tree_key,
+                source,
+                started_at_unix_millis,
+            ))
+        },
+    )
     .await
 }
 
@@ -182,16 +191,25 @@ pub async fn drain_batch<B: Backend>(
             kernel: routing::kernel_for(manifest)?,
             candidates,
         };
-        match writes::run_write_attempts(backend, None, manifest, retry, |txn| {
-            writes::boxed_step(drain_attempt(txn, manifest, tree_key, source, &plan))
-        })
+        match writes::run_write_attempts(
+            backend,
+            None,
+            manifest,
+            retry,
+            Operation::MergeFixup,
+            |txn| writes::boxed_step(drain_attempt(txn, manifest, tree_key, source, &plan)),
+        )
         .await?
         {
             Attempt::Step(step) => return Ok(step),
             // A chosen target left `Ready` between the read snapshot and the
             // attempt: discard the route and start target selection again,
             // bounded by the same policy as the whole-step runner.
-            Attempt::Reselect => retry.wait_or_exhaust(&mut failed_attempts).await?,
+            Attempt::Reselect => {
+                retry
+                    .wait_or_exhaust(Operation::MergeFixup, &mut failed_attempts)
+                    .await?
+            }
         }
     }
 }
@@ -207,9 +225,14 @@ pub async fn complete_merge<B: Backend>(
     retry: &RetryPolicy,
 ) -> Result<topology::MergeCompletion> {
     let removal = topology::SourceRemoval::for_capabilities(backend.capabilities());
-    writes::run_write_attempts(backend, None, manifest, retry, |txn| {
-        writes::boxed_step(topology::finalize_merge(txn, tree_key, source, removal))
-    })
+    writes::run_write_attempts(
+        backend,
+        None,
+        manifest,
+        retry,
+        Operation::MergeFixup,
+        |txn| writes::boxed_step(topology::finalize_merge(txn, tree_key, source, removal)),
+    )
     .await
 }
 
@@ -242,6 +265,13 @@ pub async fn advance<B: Backend>(
     let Some((header, state)) = pair else {
         return Ok(Advance::Idle);
     };
+    if matches!(state, PartitionTransition::Merging { .. }) {
+        metrics::fixup_state_age(
+            FixupKind::Merge,
+            started_at_unix_millis,
+            state.started_at_unix_millis(),
+        );
+    }
 
     match state {
         PartitionTransition::Ready { .. } => {

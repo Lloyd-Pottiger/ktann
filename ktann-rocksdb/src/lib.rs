@@ -9,6 +9,7 @@
 mod backend;
 mod blocking;
 mod config;
+mod observe;
 
 pub use backend::{BackendNamespace, RocksDbBackend, RocksDbReadTxn, RocksDbWriteTxn};
 pub use config::RocksDbConfig;
