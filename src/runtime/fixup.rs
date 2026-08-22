@@ -36,7 +36,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, MutexGuard};
 
-use crate::api::{LogicalIndexId, PartitionKey};
+use crate::api::{Error, ErrorKind, LogicalIndexId, PartitionKey, Result};
 use crate::maintenance::{merge, split};
 use crate::storage::backend::Backend;
 use crate::storage::keys::TreeKey;
@@ -152,6 +152,11 @@ impl FixupQueue {
         }
     }
 
+    /// The process-local maintenance backlog: pending plus running Fixups.
+    fn backlog(&self) -> usize {
+        self.pending.len().saturating_add(self.running)
+    }
+
     /// Admits one offered Fixup under the deduplication and capacity policy.
     ///
     /// The Manifest Arc is cloned only on the enqueue path; duplicate and
@@ -161,7 +166,7 @@ impl FixupQueue {
             self.stats.duplicate = self.stats.duplicate.saturating_add(1);
             return Admission::Duplicate;
         }
-        if self.pending.len().saturating_add(self.running) >= self.capacity {
+        if self.backlog() >= self.capacity {
             self.stats.saturated = self.stats.saturated.saturating_add(1);
             return Admission::Saturated;
         }
@@ -240,6 +245,37 @@ impl<B: Backend> RuntimeInner<B> {
     /// Returns the cumulative Fixup queue statistics.
     pub(crate) fn fixup_stats(&self) -> FixupStats {
         self.lock_fixups().stats
+    }
+
+    /// Waits for the Import Session backlog gate (design
+    /// `runtime-operations.md` §4): admission pauses until the process-local
+    /// Fixup backlog drops below the configured watermark.
+    ///
+    /// The wait is cancellation-safe and wakes on every queue slot release
+    /// that opens the gate; once the Runtime stops accepting work it fails
+    /// with [`ErrorKind::RuntimeClosed`] instead of waiting for the backlog.
+    pub(crate) async fn wait_for_backlog_below(&self) -> Result<()> {
+        let watermark = self.config().import_backlog_watermark();
+        loop {
+            // Register the waiter before checking the backlog so a slot
+            // release landing between the check and the wait still wakes us.
+            let notified = self.fixup_released.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.lock_fixups().backlog() < watermark {
+                return Ok(());
+            }
+            if self.maintenance_cancel.is_cancelled() {
+                return Err(Error::new(ErrorKind::RuntimeClosed));
+            }
+            tokio::select! {
+                biased;
+                () = self.maintenance_cancel.cancelled() => {
+                    return Err(Error::new(ErrorKind::RuntimeClosed));
+                }
+                () = notified => {}
+            }
+        }
     }
 
     /// Starts the configured maintenance workers.
@@ -342,7 +378,16 @@ struct RunningFixup<'a, B: Backend> {
 
 impl<B: Backend> Drop for RunningFixup<'_, B> {
     fn drop(&mut self) {
-        self.inner.lock_fixups().finish(self.key);
+        // Wake gated Import Session submissions only when this release opens
+        // the backlog gate; while it stays closed no waiter could proceed.
+        let gate_open = {
+            let mut queue = self.inner.lock_fixups();
+            queue.finish(self.key);
+            queue.backlog() < self.inner.config().import_backlog_watermark()
+        };
+        if gate_open {
+            self.inner.fixup_released.notify_waiters();
+        }
     }
 }
 

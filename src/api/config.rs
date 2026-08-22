@@ -315,6 +315,11 @@ impl RuntimeConfig {
     }
 
     /// Sets Import Session in-flight and backlog admission bounds.
+    ///
+    /// A non-empty batch admits only once the process-local Fixup backlog
+    /// (pending plus running) is below `backlog_watermark`; a zero watermark
+    /// holds every non-empty batch. The gate is process-local backpressure and
+    /// never a durable or cluster-wide barrier.
     pub fn with_import_limits(
         mut self,
         in_flight: usize,
@@ -422,7 +427,8 @@ impl RuntimeConfig {
         self.import_in_flight_batches
     }
 
-    /// Returns the Import Session backlog watermark.
+    /// Returns the Import Session backlog watermark set by
+    /// [`Self::with_import_limits`].
     #[must_use]
     pub const fn import_backlog_watermark(&self) -> usize {
         self.import_backlog_watermark

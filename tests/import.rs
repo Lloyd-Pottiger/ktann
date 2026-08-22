@@ -2,11 +2,12 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use ktann::api::{
     DataType, ErrorKind, FieldId, FieldSchema, GetOptions, ImportOptions, Index, IndexConfig,
-    Metric, Mutation, MutationOutcome, Record, RuntimeConfig, Value,
+    Metric, Mutation, MutationOutcome, Record, RuntimeConfig, SearchRequest, Value,
 };
 use ktann::runtime::Runtime;
 use ktann::storage::backend::{
@@ -14,10 +15,11 @@ use ktann::storage::backend::{
     Mutation as StorageMutation, ReadOps, ReadTxn, ScanLimits, ScanPage, WriteTxn,
 };
 use ktann::storage::keys::KeyRange;
+use ktann::storage::values::PartitionState;
 
 use support::{
     CommitFault, DeterministicBackend, DeterministicConfig, DeterministicReadTxn,
-    DeterministicWriteTxn,
+    DeterministicWriteTxn, audit,
 };
 
 #[allow(dead_code)]
@@ -26,16 +28,18 @@ mod support;
 /// Holds chosen commits before their commit boundary until released.
 ///
 /// The wait runs before [`CommitStart::begin`], so a held commit has not
-/// crossed the Runtime's cancellation boundary and remains cancellable.
+/// crossed the Runtime's cancellation boundary and remains cancellable. Held
+/// commits are released in entry order: [`CommitGate::release_one`] frees
+/// exactly the earliest entered commit, [`CommitGate::release`] frees all.
 #[derive(Default)]
 struct CommitGate {
     block_next: AtomicUsize,
     entered: AtomicUsize,
-    released: AtomicBool,
+    released: AtomicUsize,
 }
 
 impl CommitGate {
-    /// Holds the next `commits` commit attempts until [`CommitGate::release`].
+    /// Holds the next `commits` commit attempts until released.
     fn hold_next(&self, commits: usize) {
         self.block_next.fetch_add(commits, Ordering::SeqCst);
     }
@@ -50,8 +54,8 @@ impl CommitGate {
         if !held {
             return;
         }
-        self.entered.fetch_add(1, Ordering::SeqCst);
-        while !self.released.load(Ordering::SeqCst) {
+        let position = self.entered.fetch_add(1, Ordering::SeqCst);
+        while self.released.load(Ordering::SeqCst) <= position {
             tokio::task::yield_now().await;
         }
     }
@@ -62,8 +66,14 @@ impl CommitGate {
         }
     }
 
+    /// Releases every held commit.
     fn release(&self) {
-        self.released.store(true, Ordering::SeqCst);
+        self.released.store(usize::MAX, Ordering::SeqCst);
+    }
+
+    /// Releases exactly the earliest entered held commit.
+    fn release_one(&self) {
+        self.released.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -223,6 +233,18 @@ async fn setup_with(
     Runtime<GatedBackend>,
     Index<GatedBackend>,
 ) {
+    setup_with_index(runtime_config, config()).await
+}
+
+async fn setup_with_index(
+    runtime_config: RuntimeConfig,
+    index_config: IndexConfig,
+) -> (
+    GatedBackend,
+    Arc<CommitGate>,
+    Runtime<GatedBackend>,
+    Index<GatedBackend>,
+) {
     let gate = Arc::new(CommitGate::default());
     let backend = GatedBackend::new(
         DeterministicBackend::new(DeterministicConfig::default()),
@@ -230,7 +252,7 @@ async fn setup_with(
     );
     let runtime = Runtime::new(backend.clone(), runtime_config).expect("runtime is valid");
     let index = runtime
-        .create_index("index", config())
+        .create_index("index", index_config)
         .await
         .expect("create index");
     (backend, gate, runtime, index)
@@ -419,16 +441,11 @@ async fn in_flight_limit_bounds_concurrent_commits() {
 
     let token2 = {
         let mut submit2 = std::pin::pin!(session.submit(insert(&rid(2), 2.0, 2)));
-        tokio::select! {
-            result = &mut submit2 => {
-                panic!("submit must wait for a slot while batch 1 is held: {result:?}")
-            }
-            () = async {
-                for _ in 0..64 {
-                    tokio::task::yield_now().await;
-                }
-            } => {}
-        }
+        assert_submit_pending(
+            &mut submit2,
+            "submit must wait for a slot while batch 1 is held",
+        )
+        .await;
         assert_eq!(
             gate.entered.load(Ordering::SeqCst),
             1,
@@ -696,4 +713,271 @@ async fn session_debug_redacts_the_index_name() {
     assert!(debug.contains("ImportSession"));
     assert!(!debug.contains("import-redaction-secret"));
     runtime.shutdown().await.expect("shutdown");
+}
+
+/// A Runtime configuration for backlog-gate tests: one worker, a two-slot
+/// Fixup queue, one state-machine step per Fixup execution, and an import
+/// backlog watermark of one, so a single running Fixup closes the gate.
+fn gate_runtime_config() -> RuntimeConfig {
+    RuntimeConfig::default()
+        .with_maintenance(1, 2)
+        .and_then(|config| config.with_attempts(1, 8))
+        .and_then(|config| config.with_import_limits(1, 1))
+        .expect("valid gate config")
+}
+
+/// Tiny partitions: at most four entries per leaf, so a handful of records
+/// offers a split Fixup.
+fn gate_index_config() -> IndexConfig {
+    config()
+        .with_partition_entries(1, 4)
+        .expect("valid partition entries")
+}
+
+/// Seeds a cold `Splitting` partition: five records under one Tree Key exceed
+/// the leaf maximum, and the single-step worker begins the split and retires,
+/// leaving the searchable intermediate state for a later relevant access to
+/// rediscover. Returns with the queue empty and the gate open.
+async fn seed_cold_splitting(backend: &GatedBackend, index: &Index<GatedBackend>) {
+    for value in 1..=5_u8 {
+        index
+            .insert(record(&rid(value), f32::from(value), 1))
+            .await
+            .expect("seed insert");
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let splitting = audit::list_partitions(backend, index.logical_index_id())
+            .await
+            .expect("list partitions")
+            .iter()
+            .any(|(_, _, header)| header.state() == PartitionState::Splitting);
+        if splitting {
+            return;
+        }
+        assert!(Instant::now() < deadline, "the split did not begin");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Closes the backlog gate deterministically: a search rediscovers the cold
+/// `Splitting` partition and re-offers it, and the worker's next step commit
+/// is held by `gate`, keeping one Fixup running — a backlog of one, exactly at
+/// the watermark. `entered` is the expected held-commit count, including any
+/// commits already held. The gate stays closed until `gate` releases the
+/// commit.
+async fn hold_gate_closed(gate: &CommitGate, index: &Index<GatedBackend>, entered: usize) {
+    gate.hold_next(1);
+    let request = SearchRequest::new(Arc::from([0.0_f32, 0.0]), 1).expect("valid request");
+    let _ = index.search(request).await;
+    gate.wait_until_entered(entered).await;
+}
+
+/// Asserts the pinned submit stays pending across many executor turns.
+async fn assert_submit_pending<F>(submit: &mut std::pin::Pin<&mut F>, context: &str)
+where
+    F: std::future::Future,
+    F::Output: std::fmt::Debug,
+{
+    tokio::select! {
+        result = submit.as_mut() => panic!("{context}: {result:?}"),
+        () = async {
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+        } => {}
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backlog_gate_blocks_and_releases_submit() {
+    let (backend, gate, runtime, index) =
+        setup_with_index(gate_runtime_config(), gate_index_config()).await;
+    seed_cold_splitting(&backend, &index).await;
+    let mut session = index.import_session(import_options(2)).expect("session");
+    hold_gate_closed(&gate, &index, 1).await;
+
+    // An empty batch does no storage work: it bypasses both the in-flight
+    // slot and the backlog gate.
+    let empty_token = session.submit(Vec::new()).await.expect("empty submit");
+    assert_eq!(empty_token.get(), 1);
+
+    // The backlog sits at the watermark, so a non-empty submit waits even
+    // with every in-flight slot free.
+    let token = {
+        let mut submit = std::pin::pin!(session.submit(insert(&rid(9), 9.0, 1)));
+        assert_submit_pending(
+            &mut submit,
+            "submit must wait while the backlog is at the watermark",
+        )
+        .await;
+
+        // Draining the backlog below the watermark admits the waiting batch.
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(30), submit.as_mut())
+            .await
+            .expect("the gate opens once the backlog drains")
+            .expect("submit succeeds")
+    };
+    assert_eq!(token.get(), 2, "the gated submit issues the next token");
+
+    let results = session.finish().await;
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].token, empty_token);
+    assert!(
+        results[0]
+            .result
+            .as_ref()
+            .expect("empty batch succeeds")
+            .is_empty()
+    );
+    assert_eq!(results[1].token, token);
+    assert_eq!(
+        results[1]
+            .result
+            .as_ref()
+            .expect("batch commits")
+            .as_slice(),
+        &[MutationOutcome::Inserted]
+    );
+    assert_record_present(&index, &rid(9)).await;
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backlog_gate_composes_with_in_flight_bound() {
+    let (backend, gate, runtime, index) =
+        setup_with_index(gate_runtime_config(), gate_index_config()).await;
+    seed_cold_splitting(&backend, &index).await;
+    let mut session = index.import_session(import_options(1)).expect("session");
+
+    // Batch 1 admits while the gate is open and holds the session's only
+    // in-flight slot; its commit is held before the boundary.
+    gate.hold_next(1);
+    let token1 = session
+        .submit(insert(&rid(8), 8.0, 1))
+        .await
+        .expect("submit 1");
+    gate.wait_until_entered(1).await;
+
+    // The worker's step commit is held too: the slot is occupied and the
+    // backlog sits at the watermark.
+    hold_gate_closed(&gate, &index, 2).await;
+
+    let token2 = {
+        let mut submit2 = std::pin::pin!(session.submit(insert(&rid(9), 9.0, 1)));
+        assert_submit_pending(&mut submit2, "submit must wait for the in-flight slot").await;
+
+        // Releasing batch 1 frees the slot, but the closed gate alone still
+        // blocks admission.
+        gate.release_one();
+        wait_until_present(&index, &rid(8)).await;
+        assert_submit_pending(&mut submit2, "submit must wait for the backlog gate").await;
+
+        // Releasing the worker's held step drains the backlog below the
+        // watermark; with both bounds open the waiting batch admits and commits.
+        gate.release_one();
+        tokio::time::timeout(Duration::from_secs(30), submit2.as_mut())
+            .await
+            .expect("the gate opens once the backlog drains")
+            .expect("submit 2 succeeds")
+    };
+    assert_eq!((token1.get(), token2.get()), (1, 2));
+
+    let results = session.finish().await;
+    assert_eq!(results.len(), 2);
+    for entry in &results {
+        assert_eq!(
+            entry.result.as_ref().expect("batch commits").as_slice(),
+            &[MutationOutcome::Inserted]
+        );
+    }
+    assert_record_present(&index, &rid(9)).await;
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropped_gated_submit_admits_nothing() {
+    let (backend, gate, runtime, index) =
+        setup_with_index(gate_runtime_config(), gate_index_config()).await;
+    seed_cold_splitting(&backend, &index).await;
+    let mut session = index.import_session(import_options(2)).expect("session");
+    hold_gate_closed(&gate, &index, 1).await;
+
+    {
+        let mut gated = std::pin::pin!(session.submit(insert(&rid(9), 9.0, 1)));
+        assert_submit_pending(&mut gated, "submit must wait for the backlog gate").await;
+        // Dropping the waiting future cancels the wait: nothing admits and no
+        // token or in-flight slot is consumed.
+    }
+
+    gate.release();
+    let token = session
+        .submit(insert(&rid(10), 10.0, 1))
+        .await
+        .expect("submit after the gate opens");
+    assert_eq!(token.get(), 1, "the dropped gated submit consumed no token");
+    let results = session.finish().await;
+    assert_eq!(results.len(), 1);
+    assert_record_absent(&index, &rid(9)).await;
+    assert_record_present(&index, &rid(10)).await;
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_releases_gated_submit() {
+    let (backend, gate, runtime, index) =
+        setup_with_index(gate_runtime_config(), gate_index_config()).await;
+    seed_cold_splitting(&backend, &index).await;
+    let mut session = index.import_session(import_options(2)).expect("session");
+
+    // A batch admitted before the gate closes keeps its real result.
+    let token1 = session
+        .submit(insert(&rid(8), 8.0, 1))
+        .await
+        .expect("submit 1");
+    wait_until_present(&index, &rid(8)).await;
+
+    hold_gate_closed(&gate, &index, 1).await;
+    let error = {
+        let mut gated = std::pin::pin!(session.submit(insert(&rid(9), 9.0, 1)));
+        assert_submit_pending(&mut gated, "submit must wait for the backlog gate").await;
+
+        // Shutdown while gated: the waiting submit fails with RuntimeClosed and
+        // admits nothing, even though shutdown cannot complete until the held
+        // worker commit is released.
+        let shutdown = tokio::spawn({
+            let runtime = runtime.clone();
+            async move { runtime.shutdown().await }
+        });
+        let error = tokio::select! {
+            result = gated.as_mut() => {
+                result.expect_err("a gated submit fails once the Runtime closes")
+            }
+            () = async {
+                for _ in 0..10_000 {
+                    tokio::task::yield_now().await;
+                }
+            } => panic!("shutdown must release a gated submit"),
+        };
+        gate.release();
+        shutdown
+            .await
+            .expect("shutdown task")
+            .expect("shutdown succeeds");
+        error
+    };
+    assert_eq!(error.kind(), ErrorKind::RuntimeClosed);
+
+    let results = session.finish().await;
+    assert_eq!(results.len(), 1, "the gated submit admitted nothing");
+    assert_eq!(results[0].token, token1);
+    assert_eq!(
+        results[0]
+            .result
+            .as_ref()
+            .expect("an admitted batch keeps its real result")
+            .as_slice(),
+        &[MutationOutcome::Inserted]
+    );
 }
