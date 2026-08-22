@@ -59,7 +59,8 @@ jobs:
       - name: Test FoundationDB adapter
         run: >-
           cargo +stable test -p ktann-foundationdb
-          --test foundationdb_adapter --test foundationdb_faults -- --ignored
+          --test foundationdb_adapter --test foundationdb_faults
+          --test foundationdb_verify --test foundationdb_observability -- --ignored
       - name: Write FoundationDB durability probe
         env:
           KTANN_FDB_DURABILITY_PHASE: write
