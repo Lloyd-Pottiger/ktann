@@ -124,6 +124,12 @@ impl RecordLocation {
     pub const fn leaf(&self) -> PartitionKey {
         self.leaf
     }
+
+    /// Consumes the location and returns its Tree Key and leaf Partition Key.
+    #[must_use]
+    pub fn into_parts(self) -> (TreeKey, PartitionKey) {
+        (self.tree_key, self.leaf)
+    }
 }
 
 impl fmt::Debug for RecordLocation {

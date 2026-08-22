@@ -7,14 +7,15 @@ use bytes::Bytes;
 
 use crate::maintenance::mutation;
 use crate::runtime::RuntimeInner;
-use crate::runtime::{lifecycle, reads, search};
+use crate::runtime::{lifecycle, reads, search, verify};
 use crate::storage::backend::Backend;
 use crate::storage::values::{IndexLifecycle, IndexManifest};
 
 use super::{
     Error, ErrorKind, GetOptions, ImportOptions, ImportSession, IndexConfig, IndexName,
     LogicalIndexId, Mutation, MutationOutcome, OperationOptions, Record, Result, SearchOutcome,
-    SearchRequest, StoredRecord, UpsertResult, validate_id, validate_ids, validate_mutations,
+    SearchRequest, StoredRecord, UpsertResult, VerifyOptions, VerifyReport, validate_id,
+    validate_ids, validate_mutations,
 };
 
 /// A cheap cloneable handle to one Active Logical Index.
@@ -248,6 +249,42 @@ impl<B: Backend> Index<B> {
             self.runtime.offer_fixups(&self.manifest, maintenance);
         }
         Ok(outcome)
+    }
+
+    /// Runs one bounded, read-only verification of this index.
+    ///
+    /// The audit validates the persisted Active Manifest and then checks one
+    /// consistent backend snapshot: canonical encodings, tree reachability
+    /// and unique incoming references, exact Header counts and legal State
+    /// references, Record–Location–Leaf membership, Leaf Entry projection
+    /// agreement, conservative Synopses, and allocator high-water marks. It
+    /// never mutates or repairs persistent data, and there is no
+    /// continuation, spill, sampling, or repair mode.
+    ///
+    /// [`VerifyOptions`] bounds the reported issues, the visited logical
+    /// objects, and the resident memory independently, and carries the
+    /// deadline and cancellation control other operations take through their
+    /// `_with_control` companion. Reaching any limit stops the audit and
+    /// returns the collected issues with [`VerifyReport::complete`] set to
+    /// `false`; only a complete report is conclusive. Cancellation,
+    /// deadline, and snapshot failure return errors rather than a partial
+    /// cross-snapshot conclusion, so on a backend with a short snapshot
+    /// lifetime — FoundationDB — a large audit must run against an offline
+    /// copy or another instance able to hold the snapshot.
+    ///
+    /// Issues are deliberately coarse and redacted: they carry only the
+    /// Logical Index ID, a stable hash of the Tree Key, the Partition Key,
+    /// and an optional Record ID — never raw Tree Keys, vectors, payloads,
+    /// or filter values.
+    pub async fn verify(&self, options: VerifyOptions) -> Result<VerifyReport> {
+        options.validate()?;
+        let manifest = Arc::clone(&self.manifest);
+        let operation_options = options.operation_options().clone();
+        self.runtime
+            .run_foreground(operation_options, move |mut context| async move {
+                verify::verify(&mut context, &manifest, options).await
+            })
+            .await
     }
 
     /// Validates one mutation batch against this index's immutable

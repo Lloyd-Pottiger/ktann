@@ -40,7 +40,9 @@ impl<B: Backend> Index<B> {
 
 Every operation has a companion `_with_control` form accepting
 `OperationOptions` in addition to its ordinary request/options argument; the
-simple form uses default operation control. Runtime construction requires an
+simple form uses default operation control. `verify` is the one exception:
+its deadline and cancellation control ride inside `VerifyOptions`, which the
+single form takes in full. Runtime construction requires an
 active Tokio multi-thread runtime, validates all process configuration, and
 immediately starts maintenance workers. Successful Runtime shutdown drains
 admitted work, awaits the backend's native-resource shutdown hook, and only then
