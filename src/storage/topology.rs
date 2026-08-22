@@ -1,13 +1,15 @@
 //! Typed atomic topology operations for the expose-then-drain split protocol
-//! (ADR 0014).
+//! (ADR 0014) and the target-reselecting merge protocol (ADR 0008).
 //!
 //! These operations are the only writers of partition topology: partition
-//! creation, split state transitions, Child Entry installation and removal,
-//! and the structural entry moves that drain a split source into its two
-//! targets. Each operation performs one bounded, atomically committable step
-//! inside the caller's transaction; the multi-transaction driver lives in
-//! [`crate::maintenance::split`]. Every authoritative read a step depends on is
-//! update-protected, so a concurrent transition, foreground mutation, or
+//! creation, split and merge state transitions, Child Entry installation and
+//! removal, and the structural entry moves that drain a source into its
+//! targets — a split's two persisted `ReceivingSplit` targets, or a merge's
+//! per-batch reselected `Ready` targets. Each operation performs one bounded,
+//! atomically committable step inside the caller's transaction; the
+//! multi-transaction drivers live in [`crate::maintenance::split`] and
+//! [`crate::maintenance::merge`]. Every authoritative read a step depends on
+//! is update-protected, so a concurrent transition, foreground mutation, or
 //! adjacent-level move aborts the commit with [`ErrorKind::RetryableAbort`]
 //! and the whole step retries from a fresh snapshot.
 //!
@@ -48,15 +50,15 @@
 use bytes::Bytes;
 
 use crate::api::{Error, ErrorKind, LogicalIndexId, PartitionKey, Result};
-use crate::storage::backend::{InsertOutcome, ScanLimits, WriteTxn};
+use crate::storage::backend::{Capabilities, InsertOutcome, ScanLimits, WriteTxn};
 use crate::storage::keys::{LogicalKey, TreeKey};
 use crate::storage::membership::{added_entry, expect_inserted, removed_entry};
 use crate::storage::tree_manifest::reserve_partition_keys;
 use crate::storage::values::{
-    ChildEntry, LeafEntry, PartitionCentroid, PartitionHeader, PartitionState, PartitionSynopsis,
-    PartitionTransition, PersistentValue, RecordLocation, VectorRecord, expect_centroid,
-    expect_child_entry, expect_child_entry_ref, expect_header, expect_leaf_entry, expect_location,
-    expect_record, expect_state, expect_synopsis,
+    ChildEntry, IndexManifest, LeafEntry, PartitionCentroid, PartitionHeader, PartitionState,
+    PartitionSynopsis, PartitionTransition, PersistentValue, RecordLocation, VectorRecord,
+    expect_centroid, expect_child_entry, expect_child_entry_ref, expect_header, expect_leaf_entry,
+    expect_location, expect_record, expect_state, expect_synopsis,
 };
 use crate::storage::{LogicalRange, LogicalReader, WriteLogicalTxn};
 
@@ -293,11 +295,7 @@ pub async fn create_split_target<T: WriteTxn>(
     let parent = if source == root_partition() {
         None
     } else {
-        let Some((parent, _)) = find_incoming_edge(txn, tree_key, source, level).await? else {
-            // A non-root partition has exactly one incoming Child Entry in
-            // every committed state (ADR 0007).
-            return Err(corrupt());
-        };
+        let parent = lock_incoming_edge(txn, tree_key, source, level).await?;
         let parent_header = expect_header(
             txn.get_for_update(LogicalKey::Header {
                 index,
@@ -316,19 +314,6 @@ pub async fn create_split_target<T: WriteTxn>(
             // abandoning lets a later attempt rediscover the moved edge.
             _ => return Ok(TargetInstall::ParentNotAccepting),
         }
-        // The discovery scan ran on this transaction's snapshot, so the source
-        // edge must still decode; the update-protected re-read establishes the
-        // commit-time conflict that reroutes a concurrent edge move.
-        expect_child_entry(
-            txn.get_for_update(LogicalKey::ChildEntry {
-                index,
-                tree_key: tree_key.clone(),
-                partition: parent,
-                child: source,
-            })
-            .await?,
-        )?
-        .ok_or_else(corrupt)?;
         Some((parent, parent_header))
     };
 
@@ -642,8 +627,41 @@ pub async fn read_leaf_drain_candidates<T: WriteTxn>(
     Ok(slots)
 }
 
-/// Atomically moves one batch of verified leaf entries from the split source
-/// to their chosen targets.
+/// The structural movement protocol one entry-relocation batch runs under.
+///
+/// Both state machines move entries with the same atomic insert/delete,
+/// exact-count, cache-epoch, and Record Location rules; they differ only in
+/// the source and target states a move is legal between.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Movement {
+    /// A `DrainingSplit` source draining into its two persisted
+    /// `ReceivingSplit` targets (ADR 0014).
+    Split,
+    /// A `Merging` source draining into per-batch reselected `Ready` targets
+    /// (ADR 0008).
+    Merge,
+}
+
+impl Movement {
+    /// The only source state a move under this protocol is legal from.
+    fn source_state(self) -> PartitionState {
+        match self {
+            Self::Split => PartitionState::DrainingSplit,
+            Self::Merge => PartitionState::Merging,
+        }
+    }
+
+    /// The only target state a move under this protocol is legal into.
+    fn target_state(self) -> PartitionState {
+        match self {
+            Self::Split => PartitionState::ReceivingSplit,
+            Self::Merge => PartitionState::Ready,
+        }
+    }
+}
+
+/// Atomically moves one batch of verified leaf entries from the draining
+/// source to their chosen targets.
 ///
 /// Each move copies the Leaf Entry — including its absolute RaBitQ7 payload —
 /// unchanged to the target, unique-inserts it, deletes the source entry, and
@@ -651,15 +669,15 @@ pub async fn read_leaf_drain_candidates<T: WriteTxn>(
 /// receiving target's Header and Synopsis once, accumulates the exact counts,
 /// cache epochs, and synopsis expansions in memory, and writes each authority
 /// value back once, so a batch never pays per-entry authority round trips.
-/// The source must be `DrainingSplit` and every target must be a
-/// `ReceivingSplit` leaf: the exact-membership invariant holds only while
-/// movement runs inside the split protocol. Returns the number of moved
-/// entries.
+/// The source and every target must be a leaf in the states `movement` names:
+/// the exact-membership invariant holds only while movement runs inside one
+/// structural protocol. Returns the number of moved entries.
 pub async fn relocate_leaf_entries<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     tree_key: &TreeKey,
     source: PartitionKey,
     moves: Vec<(LeafDrainEntry, PartitionKey)>,
+    movement: Movement,
 ) -> Result<usize> {
     if moves.is_empty() {
         return Ok(0);
@@ -693,7 +711,7 @@ pub async fn relocate_leaf_entries<T: WriteTxn>(
             return Err(Error::new(ErrorKind::Backend));
         };
         let header = expect_header(value)?.ok_or_else(corrupt)?;
-        if header.level() != 1 || header.state() != PartitionState::ReceivingSplit {
+        if header.level() != 1 || header.state() != movement.target_state() {
             return Err(corrupt());
         }
         target_headers.push((*target, header));
@@ -702,9 +720,9 @@ pub async fn relocate_leaf_entries<T: WriteTxn>(
         return Err(Error::new(ErrorKind::Backend));
     };
     let source_header = expect_header(source_value)?.ok_or_else(corrupt)?;
-    // Movement is legal only inside the split protocol: the source must be
-    // draining into exactly these `ReceivingSplit` targets.
-    if source_header.level() != 1 || source_header.state() != PartitionState::DrainingSplit {
+    // Movement is legal only inside the named protocol: the source must be
+    // draining into exactly these targets.
+    if source_header.level() != 1 || source_header.state() != movement.source_state() {
         return Err(corrupt());
     }
 
@@ -840,23 +858,24 @@ pub async fn read_child_drain_candidates<T: WriteTxn>(
     Ok(slots)
 }
 
-/// Atomically moves one batch of verified Child Entries from the split source
-/// to their chosen targets.
+/// Atomically moves one batch of verified Child Entries from the draining
+/// source to their chosen targets.
 ///
 /// Internal movement applies the same exact source-delete/target-insert rule
 /// as leaf movement and updates both exact Header counts and cache epochs —
 /// read and written once per partition per batch — but touches neither Record
 /// Location, Vector Record, nor Synopsis (ADR 0014): exact Child Entry
 /// ownership is the coordination point between adjacent-level maintenance.
-/// The source must be `DrainingSplit` and every target must be
-/// `ReceivingSplit` at the source's level: the exact-membership invariant
-/// holds only while movement runs inside the split protocol. Returns the
+/// The source and every target must be in the states `movement` names, and
+/// every target must sit at the source's level: exact Child Entry ownership
+/// holds only while movement runs inside one structural protocol. Returns the
 /// number of moved entries.
 pub async fn relocate_child_entries<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     tree_key: &TreeKey,
     source: PartitionKey,
     moves: Vec<(ChildEntry, PartitionKey)>,
+    movement: Movement,
 ) -> Result<usize> {
     if moves.is_empty() {
         return Ok(0);
@@ -887,7 +906,7 @@ pub async fn relocate_child_entries<T: WriteTxn>(
             return Err(Error::new(ErrorKind::Backend));
         };
         let header = expect_header(value)?.ok_or_else(corrupt)?;
-        if header.state() != PartitionState::ReceivingSplit {
+        if header.state() != movement.target_state() {
             return Err(corrupt());
         }
         target_headers.push((*target, header));
@@ -896,9 +915,9 @@ pub async fn relocate_child_entries<T: WriteTxn>(
         return Err(Error::new(ErrorKind::Backend));
     };
     let source_header = expect_header(source_value)?.ok_or_else(corrupt)?;
-    // Movement is legal only inside the split protocol: the source must be
-    // draining into exactly these `ReceivingSplit` targets.
-    if source_header.state() != PartitionState::DrainingSplit {
+    // Movement is legal only inside the named protocol: the source must be
+    // draining into exactly these targets.
+    if source_header.state() != movement.source_state() {
         return Err(corrupt());
     }
     for (_, target_header) in &target_headers {
@@ -974,6 +993,17 @@ pub enum SourceRemoval {
     TransactionalClear,
     /// Bounded point deletes of the four fixed metadata keys.
     PointDeletes,
+}
+
+impl SourceRemoval {
+    /// Selects the removal form one backend's declared capabilities support.
+    pub fn for_capabilities(capabilities: Capabilities) -> Self {
+        if capabilities.transactional_clear_range {
+            Self::TransactionalClear
+        } else {
+            Self::PointDeletes
+        }
+    }
 }
 
 /// Completes one fully drained split in a single final transaction.
@@ -1128,19 +1158,221 @@ pub async fn finalize_split<T: WriteTxn>(
 
     // Remove the source's unique incoming reference, rediscovered on this
     // transaction's snapshot and update-protected (ADR 0007).
-    let Some((parent, _)) = find_incoming_edge(txn, tree_key, source, level).await? else {
+    remove_incoming_edge(txn, tree_key, source, level).await?;
+    remove_source_prefix(
+        txn,
+        manifest,
+        tree_key,
+        source,
+        header_key,
+        state_key,
+        source_removal,
+    )
+    .await?;
+    Ok(SplitCompletion::Completed)
+}
+
+/// The outcome of [`begin_merge`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum MergeStart {
+    /// This transaction transitioned the source to `Merging`.
+    Started,
+    /// The source was already `Merging`; nothing was written. This is the
+    /// recovery path after an unknown commit outcome.
+    AlreadyMerging,
+    /// The source is not an eligible non-root `Ready` partition below the
+    /// merge threshold, or its authority values are already gone.
+    NotEligible,
+    /// The source is eligible but no legal same-level `Ready` target exists,
+    /// so no state starts (ADR 0008).
+    NoReadyTarget,
+}
+
+/// Starts the merge of one eligible `Ready` partition by marking it
+/// `Merging`.
+///
+/// The update-protected source Header and State reads revalidate eligibility:
+/// the source must be `Ready`, non-root, and below the configured minimum
+/// entry count; an intermediate-state partition cannot start another
+/// structural change, and roots never merge or collapse. The same transaction
+/// locks the source's unique incoming Child Entry — rediscovered by the exact
+/// bounded root-down scan and update-protected (ADR 0007) — so a concurrent
+/// edge move aborts the commit instead of starting a merge against a stale
+/// parent observation. Before the transition it validates that at least one
+/// legal same-level `Ready` target exists; when none exists no state starts.
+/// The target validation reads the current snapshot without update protection
+/// on purpose: merging persists no target, and a target that disappears later
+/// stalls the drain, never corrupts it.
+///
+/// Observing `Merging` reports [`MergeStart::AlreadyMerging`], so re-driving
+/// after an unknown commit outcome never restarts anything. A source with no
+/// authority values — a completed merge removed them, or it never existed —
+/// reports [`MergeStart::NotEligible`]; a half-present pair is Corruption.
+pub async fn begin_merge<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    tree_key: &TreeKey,
+    source: PartitionKey,
+    started_at_unix_millis: u64,
+) -> Result<MergeStart> {
+    let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
+    let index = manifest.logical_index_id();
+    let (header_key, state_key) = authority_keys(index, tree_key, source);
+    let Some((header, state)) = authority_pair(txn, header_key.clone(), state_key.clone()).await?
+    else {
+        // Both authority values are gone: a completed merge already removed
+        // the source (or it never existed), so there is nothing to start.
+        return Ok(MergeStart::NotEligible);
+    };
+
+    match state {
+        PartitionTransition::Merging { .. } => return Ok(MergeStart::AlreadyMerging),
+        PartitionTransition::Ready { .. } => {}
+        // An intermediate-state partition cannot start a merge.
+        _ => return Ok(MergeStart::NotEligible),
+    }
+    if source == root_partition() {
+        return Ok(MergeStart::NotEligible);
+    }
+    if header.entry_count() >= manifest.config().min_partition_entries() {
+        return Ok(MergeStart::NotEligible);
+    }
+
+    // One same-level enumeration answers both begin questions: the source's
+    // own incoming edge (its candidate occurrence) and whether a legal
+    // target exists.
+    let candidates = same_level_candidates(txn, manifest, tree_key, header.level()).await?;
+
+    // Lock the source's unique incoming reference before the transition: a
+    // concurrent edge move aborts the commit, so the merge never starts
+    // against a stale parent observation. Zero or duplicate occurrences of
+    // the source contradict the one-incoming-edge invariant (ADR 0007).
+    let mut occurrences = candidates
+        .iter()
+        .filter(|candidate| candidate.partition() == source);
+    let Some(own) = occurrences.next() else {
         return Err(corrupt());
     };
+    if occurrences.next().is_some() {
+        return Err(corrupt());
+    }
     expect_child_entry(
         txn.get_for_update(LogicalKey::ChildEntry {
             index,
             tree_key: tree_key.clone(),
-            partition: parent,
+            partition: own.parent(),
             child: source,
         })
         .await?,
     )?
     .ok_or_else(corrupt)?;
+
+    if !candidates
+        .iter()
+        .any(|candidate| candidate.is_legal_merge_target(source))
+    {
+        return Ok(MergeStart::NoReadyTarget);
+    }
+
+    txn.put(
+        state_key,
+        PersistentValue::PartitionState(PartitionTransition::Merging {
+            started_at_unix_millis,
+        }),
+    )
+    .await?;
+    txn.put(
+        header_key,
+        PersistentValue::PartitionHeader(with_state(header, PartitionState::Merging)?),
+    )
+    .await?;
+    Ok(MergeStart::Started)
+}
+
+/// The outcome of [`finalize_merge`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum MergeCompletion {
+    /// The merge completed: the source's incoming reference is removed and
+    /// its prefix is gone.
+    Completed,
+    /// The source is `Merging` but its exact entry count is not zero.
+    NotDrained,
+    /// The source is not `Merging` (anymore). A merging source left the state
+    /// only through a completed finalize, so re-driving a finalize after an
+    /// unknown commit outcome observes this outcome.
+    NotMerging,
+}
+
+/// Completes one fully drained merge in a single final transaction.
+///
+/// The exact update-protected source Header count is the sole proof of
+/// emptiness; no entry rescan is performed. The transaction revalidates the
+/// `Merging` state, removes the source's unique incoming Child Entry with the
+/// parent's exact count, and removes the source prefix per `source_removal` —
+/// one transactional range clear, or bounded point deletes of the four fixed
+/// metadata keys. Merging persists no targets, so no target state changes and
+/// no tombstone remains (ADR 0008). Roots never merge, so a `Merging` root is
+/// Corruption.
+pub async fn finalize_merge<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    tree_key: &TreeKey,
+    source: PartitionKey,
+    source_removal: SourceRemoval,
+) -> Result<MergeCompletion> {
+    let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
+    let (header_key, state_key) = authority_keys(manifest.logical_index_id(), tree_key, source);
+    let Some((header, state)) = authority_pair(txn, header_key.clone(), state_key.clone()).await?
+    else {
+        // Both authority values are gone: a previous committed finalize
+        // completed this merge.
+        return Ok(MergeCompletion::Completed);
+    };
+    if !matches!(state, PartitionTransition::Merging { .. }) {
+        return Ok(MergeCompletion::NotMerging);
+    }
+    if source == root_partition() {
+        // Roots never merge, so a Merging root contradicts the protocol
+        // regardless of its count.
+        return Err(corrupt());
+    }
+    if header.entry_count() != 0 {
+        return Ok(MergeCompletion::NotDrained);
+    }
+    let level = header.level();
+    remove_incoming_edge(txn, tree_key, source, level).await?;
+    remove_source_prefix(
+        txn,
+        manifest,
+        tree_key,
+        source,
+        header_key,
+        state_key,
+        source_removal,
+    )
+    .await?;
+    Ok(MergeCompletion::Completed)
+}
+
+/// Removes one drained non-root source's unique incoming Child Entry and
+/// decrements the parent's exact count, atomically.
+///
+/// The edge is rediscovered on this transaction's snapshot by the exact
+/// bounded root-down scan and update-protected (ADR 0007): a concurrent edge
+/// move aborts the commit with a retryable conflict, and a missing or
+/// duplicated edge fails closed. A parent whose own maintenance moved the
+/// edge is rediscovered afresh on the next attempt.
+async fn remove_incoming_edge<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    tree_key: &TreeKey,
+    source: PartitionKey,
+    level: u32,
+) -> Result<()> {
+    let index = txn
+        .bound_manifest()
+        .ok_or_else(Error::invalid_argument)?
+        .logical_index_id();
+    let parent = lock_incoming_edge(txn, tree_key, source, level).await?;
     let parent_header_key = LogicalKey::Header {
         index,
         tree_key: tree_key.clone(),
@@ -1163,16 +1395,32 @@ pub async fn finalize_split<T: WriteTxn>(
         PersistentValue::PartitionHeader(removed_entry(parent_header)?),
     )
     .await?;
+    Ok(())
+}
 
+/// Removes one fully drained source's whole partition prefix per the
+/// backend's capability branch.
+///
+/// After exact count zero the prefix holds only the four fixed metadata keys,
+/// so both forms are bounded; only the exact-count-zero invariant makes the
+/// point form complete without a rescan. A leaf-only Synopsis key is simply
+/// absent for an internal source, so its point delete is a no-op.
+async fn remove_source_prefix<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    manifest: &IndexManifest,
+    tree_key: &TreeKey,
+    source: PartitionKey,
+    header_key: LogicalKey,
+    state_key: LogicalKey,
+    source_removal: SourceRemoval,
+) -> Result<()> {
+    let index = manifest.logical_index_id();
     match source_removal {
         SourceRemoval::TransactionalClear => {
             txn.clear_range(&LogicalRange::partition(manifest, tree_key, source)?)
                 .await?;
         }
         SourceRemoval::PointDeletes => {
-            // After exact count zero the prefix holds only the four fixed
-            // metadata keys; the entry ranges are provably empty without a
-            // rescan (ADR 0014).
             for key in [
                 LogicalKey::Synopsis {
                     index,
@@ -1191,19 +1439,14 @@ pub async fn finalize_split<T: WriteTxn>(
             }
         }
     }
-    Ok(SplitCompletion::Completed)
+    Ok(())
 }
 
 /// Rediscovers one partition's unique incoming Child Entry by an exact
 /// bounded root-down scan of every Child Entry at the required parent level
 /// (ADR 0007).
 ///
-/// Partitions persist no reverse parent pointers, so the scan walks from the
-/// root down to `level + 1`, reading every partition Header at each level to
-/// prove the level invariant, and matches the child Partition Key. While the
-/// root is `Splitting` or `DrainingSplit` its targets have no incoming edge
-/// of their own, so the exclusive target slots named by the root State are
-/// added to the root's level. A duplicate or missing match is Corruption.
+/// A duplicate or missing match is Corruption.
 async fn find_incoming_edge<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     tree_key: &TreeKey,
@@ -1211,11 +1454,106 @@ async fn find_incoming_edge<T: WriteTxn>(
     level: u32,
 ) -> Result<Option<(PartitionKey, ChildEntry)>> {
     let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
-    let index = manifest.logical_index_id();
     let parent_level = level.checked_add(1).ok_or_else(corrupt)?;
+    let bodies = level_bodies(txn, manifest, tree_key, parent_level).await?;
+    // Only the parent level's matches are collected.
+    let mut found: Option<(PartitionKey, ChildEntry)> = None;
+    for body in &bodies {
+        scan_child_edges(txn, manifest, tree_key, *body, &mut |entry| {
+            if entry.child() == partition {
+                if found.is_some() {
+                    return Err(corrupt());
+                }
+                found = Some((*body, entry.clone()));
+            }
+            Ok(())
+        })
+        .await?;
+    }
+    Ok(found)
+}
+
+/// Rediscovers one non-root partition's unique incoming Child Entry by the
+/// exact root-down scan and update-protects it, returning the parent's
+/// Partition Key.
+///
+/// A missing or duplicate edge is Corruption; a concurrent edge move aborts
+/// the commit through the update-protected read (ADR 0007).
+async fn lock_incoming_edge<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    tree_key: &TreeKey,
+    partition: PartitionKey,
+    level: u32,
+) -> Result<PartitionKey> {
+    let index = txn
+        .bound_manifest()
+        .ok_or_else(Error::invalid_argument)?
+        .logical_index_id();
+    let Some((parent, _)) = find_incoming_edge(txn, tree_key, partition, level).await? else {
+        // A non-root partition has exactly one incoming Child Entry in every
+        // committed state (ADR 0007).
+        return Err(corrupt());
+    };
+    expect_child_entry(
+        txn.get_for_update(LogicalKey::ChildEntry {
+            index,
+            tree_key: tree_key.clone(),
+            partition: parent,
+            child: partition,
+        })
+        .await?,
+    )?
+    .ok_or_else(corrupt)?;
+    Ok(parent)
+}
+
+/// Scans one internal body's complete Child Entry set in bounded discovery
+/// pages, visiting each entry by reference without materializing the page.
+async fn scan_child_edges<R: LogicalReader>(
+    reader: &mut R,
+    manifest: &IndexManifest,
+    tree_key: &TreeKey,
+    body: PartitionKey,
+    visit: &mut impl FnMut(&ChildEntry) -> Result<()>,
+) -> Result<()> {
+    let range = LogicalRange::child_entries(manifest, tree_key, body)?;
+    let mut cursor = None;
+    loop {
+        let page = reader
+            .scan(&range, cursor.as_ref(), DISCOVERY_SCAN_LIMITS)
+            .await?;
+        for item in page.items() {
+            visit(expect_child_entry_ref(item.value())?)?;
+        }
+        cursor = page.into_next_cursor();
+        if cursor.is_none() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Walks from the root down to `level`, returning every partition body at
+/// that level, by the exact bounded root-down walk of ADR 0007.
+///
+/// Partitions persist no reverse parent pointers, so the walk reads every
+/// partition Header at each level to prove the level invariant and collects
+/// the next level from scanned Child Entries. While the root is `Splitting`
+/// or `DrainingSplit` its targets have no incoming edge of their own, so the
+/// exclusive target slots named by the root State are added to the root's
+/// level. A level that fails to decrement and an unreachable level are
+/// Corruption. Paging only shapes I/O: every page is bounded, so work stays
+/// proportional to the scanned levels' actual size.
+async fn level_bodies<R: LogicalReader>(
+    reader: &mut R,
+    manifest: &IndexManifest,
+    tree_key: &TreeKey,
+    level: u32,
+) -> Result<Vec<PartitionKey>> {
+    let index = manifest.logical_index_id();
     let root = root_partition();
-    let root_header = read_header(txn, index, tree_key, root).await?;
-    if root_header.level() < parent_level {
+    let root_header = read_header(reader, index, tree_key, root).await?;
+    if root_header.level() < level {
         return Err(corrupt());
     }
 
@@ -1229,7 +1567,7 @@ async fn find_incoming_edge<T: WriteTxn>(
         // Entries and is skipped. While DrainingSplit both targets exist
         // because advancing verified them.
         if current_level == root_header.level() {
-            if let Some(root_state) = read_state(txn, index, tree_key, root).await? {
+            if let Some(root_state) = read_state(reader, index, tree_key, root).await? {
                 let draining = matches!(root_state, PartitionTransition::DrainingSplit { .. });
                 let targets = match root_state {
                     PartitionTransition::Splitting { left, right, .. }
@@ -1240,7 +1578,7 @@ async fn find_incoming_edge<T: WriteTxn>(
                     if target == root || bodies.contains(&target) {
                         continue;
                     }
-                    let exists = read_header_opt(txn, index, tree_key, target)
+                    let exists = read_header_opt(reader, index, tree_key, target)
                         .await?
                         .is_some();
                     if !exists && !draining {
@@ -1251,55 +1589,22 @@ async fn find_incoming_edge<T: WriteTxn>(
             }
         }
 
-        if current_level == parent_level {
-            // Only the parent level's matches are collected.
-            let mut found: Option<(PartitionKey, ChildEntry)> = None;
-            for body in &bodies {
-                let range = LogicalRange::child_entries(manifest, tree_key, *body)?;
-                let mut cursor = None;
-                loop {
-                    let page = txn
-                        .scan(&range, cursor.as_ref(), DISCOVERY_SCAN_LIMITS)
-                        .await?;
-                    for item in page.items() {
-                        let entry = expect_child_entry_ref(item.value())?;
-                        if entry.child() == partition {
-                            if found.is_some() {
-                                return Err(corrupt());
-                            }
-                            found = Some((*body, entry.clone()));
-                        }
-                    }
-                    cursor = page.into_next_cursor();
-                    if cursor.is_none() {
-                        break;
-                    }
-                }
-            }
-            return Ok(found);
+        if current_level == level {
+            return Ok(bodies);
         }
 
         // Descend: intermediate levels contribute only child Partition Keys.
         let mut next = Vec::new();
         for body in &bodies {
-            let header = read_header(txn, index, tree_key, *body).await?;
+            let header = read_header(reader, index, tree_key, *body).await?;
             if header.level() != current_level {
                 return Err(corrupt());
             }
-            let range = LogicalRange::child_entries(manifest, tree_key, *body)?;
-            let mut cursor = None;
-            loop {
-                let page = txn
-                    .scan(&range, cursor.as_ref(), DISCOVERY_SCAN_LIMITS)
-                    .await?;
-                for item in page.items() {
-                    next.push(expect_child_entry_ref(item.value())?.child());
-                }
-                cursor = page.into_next_cursor();
-                if cursor.is_none() {
-                    break;
-                }
-            }
+            scan_child_edges(reader, manifest, tree_key, *body, &mut |entry| {
+                next.push(entry.child());
+                Ok(())
+            })
+            .await?;
         }
         if next.is_empty() {
             // A level above one that cannot be reached contradicts the
@@ -1309,6 +1614,101 @@ async fn find_incoming_edge<T: WriteTxn>(
         bodies = next;
         current_level -= 1;
     }
+}
+
+/// One partition at a merge source's level, reached by its unique incoming
+/// Child Entry during the exact root-down level walk: one candidate that
+/// merge target reselection orders by routing distance (ADR 0008).
+pub(crate) struct LevelCandidate {
+    parent: PartitionKey,
+    entry: ChildEntry,
+    header: PartitionHeader,
+}
+
+impl LevelCandidate {
+    /// Returns the candidate's Partition Key.
+    pub(crate) const fn partition(&self) -> PartitionKey {
+        self.entry.child()
+    }
+
+    /// Returns the partition holding the candidate's incoming Child Entry.
+    pub(crate) const fn parent(&self) -> PartitionKey {
+        self.parent
+    }
+
+    /// Returns the candidate's immutable full-f32 centroid projection.
+    pub(crate) fn centroid(&self) -> &[f32] {
+        self.entry.centroid()
+    }
+
+    /// Returns the candidate's decoded Header.
+    pub(crate) const fn header(&self) -> &PartitionHeader {
+        &self.header
+    }
+
+    /// Whether the candidate is a legal merge target for `source`: another
+    /// partition currently `Ready` (ADR 0008).
+    pub(crate) fn is_legal_merge_target(&self, source: PartitionKey) -> bool {
+        self.partition() != source && self.header.state() == PartitionState::Ready
+    }
+}
+
+/// Enumerates every partition at `level` with its incoming Child Entry and
+/// decoded Header, in deterministic walk order.
+///
+/// This is the candidate set ADR 0008's same-level merge routing orders:
+/// every non-root partition owns exactly one incoming Child Entry in one
+/// level-`level + 1` body in every committed state, so the exact root-down
+/// walk plus one bounded Child Entry scan per body is complete. Each
+/// candidate's Header is batch-read in bounded chunks; a missing Header or a
+/// level disagreement is Corruption. The caller filters states — the merge
+/// protocol selects among `Ready` candidates only.
+pub(crate) async fn same_level_candidates<R: LogicalReader>(
+    reader: &mut R,
+    manifest: &IndexManifest,
+    tree_key: &TreeKey,
+    level: u32,
+) -> Result<Vec<LevelCandidate>> {
+    let index = manifest.logical_index_id();
+    let parent_level = level.checked_add(1).ok_or_else(corrupt)?;
+    let bodies = level_bodies(reader, manifest, tree_key, parent_level).await?;
+
+    let mut edges: Vec<(PartitionKey, ChildEntry)> = Vec::new();
+    for body in &bodies {
+        scan_child_edges(reader, manifest, tree_key, *body, &mut |entry| {
+            edges.push((*body, entry.clone()));
+            Ok(())
+        })
+        .await?;
+    }
+
+    // Candidate Headers are batch-read in bounded chunks.
+    let mut headers = Vec::with_capacity(edges.len());
+    for chunk in edges.chunks(DISCOVERY_SCAN_LIMITS.item_limit) {
+        let keys: Vec<LogicalKey> = chunk
+            .iter()
+            .map(|(_, entry)| LogicalKey::Header {
+                index,
+                tree_key: tree_key.clone(),
+                partition: entry.child(),
+            })
+            .collect();
+        headers.extend(reader.batch_get(keys).await?);
+    }
+
+    let mut candidates = Vec::with_capacity(edges.len());
+    for ((parent, entry), value) in edges.into_iter().zip(headers) {
+        let header = expect_header(value)?.ok_or_else(corrupt)?;
+        if header.level() != level {
+            return Err(corrupt());
+        }
+        candidates.push(LevelCandidate {
+            parent,
+            entry,
+            header,
+        });
+    }
+    Ok(candidates)
 }
 
 /// Reads one partition Header that must exist.
@@ -1385,6 +1785,28 @@ pub(crate) async fn read_authority_opt<R: LogicalReader>(
         return Err(Error::new(ErrorKind::Backend));
     };
     Ok((expect_header(header)?, expect_state(state)?))
+}
+
+/// Reads one partition's authority pair in one batched plain read,
+/// classifying presence and agreement.
+///
+/// Both values present and in agreement is `Some`; both gone — a completed
+/// split or merge removed them, or the partition never existed — is `None`; a
+/// half-present or disagreeing pair is Corruption.
+pub(crate) async fn read_authority_pair<R: LogicalReader>(
+    reader: &mut R,
+    index: LogicalIndexId,
+    tree_key: &TreeKey,
+    partition: PartitionKey,
+) -> Result<Option<(PartitionHeader, PartitionTransition)>> {
+    match read_authority_opt(reader, index, tree_key, partition).await? {
+        (Some(header), Some(state)) => {
+            expect_agreement(header, state)?;
+            Ok(Some((header, state)))
+        }
+        (None, None) => Ok(None),
+        _ => Err(corrupt()),
+    }
 }
 
 /// Reads one visited partition's Header and State in one batch, failing
@@ -1487,7 +1909,7 @@ fn authority_keys(
 ///
 /// The Tree Manifest constructor rejects any root other than Partition Key 1,
 /// so construction cannot fail.
-fn root_partition() -> PartitionKey {
+pub(crate) fn root_partition() -> PartitionKey {
     match PartitionKey::new(1) {
         Ok(root) => root,
         Err(_) => unreachable!("Partition Key 1 is nonzero"),

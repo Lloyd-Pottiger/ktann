@@ -82,6 +82,18 @@ impl RetryPolicy {
             tokio::time::sleep(Duration::from_nanos(jittered_nanos)).await;
         }
     }
+
+    /// The shared tail of every whole-retry loop: waits out one failed
+    /// attempt under the bounded policy, or returns `ContentionExhausted`
+    /// when one more failure would exhaust it.
+    pub async fn wait_or_exhaust(self, failed_attempts: &mut u32) -> Result<()> {
+        if self.would_exhaust(*failed_attempts) {
+            return Err(Error::new(ErrorKind::ContentionExhausted));
+        }
+        self.wait(*failed_attempts).await;
+        *failed_attempts += 1;
+        Ok(())
+    }
 }
 
 /// Creates one Active Logical Index idempotently for `name`.
@@ -159,11 +171,7 @@ pub(crate) async fn create_index<B: Backend>(
         match context.commit(move |start| txn.commit_with(start)).await {
             Ok(()) => return Ok(manifest),
             Err(error) if error.kind() == ErrorKind::RetryableAbort => {
-                if retry.would_exhaust(failed_attempts) {
-                    return Err(Error::new(ErrorKind::ContentionExhausted));
-                }
-                retry.wait(failed_attempts).await;
-                failed_attempts += 1;
+                retry.wait_or_exhaust(&mut failed_attempts).await?;
             }
             Err(error) if error.kind() == ErrorKind::CommitOutcomeUnknown => {
                 return recover_create(backend.as_ref(), &name, &config).await;
@@ -273,11 +281,7 @@ pub(crate) async fn drop_index<B: Backend>(
                         continue;
                     }
                     CommitStep::RetryableAbort => {
-                        if retry.would_exhaust(failed_attempts) {
-                            return Err(Error::new(ErrorKind::ContentionExhausted));
-                        }
-                        retry.wait(failed_attempts).await;
-                        failed_attempts += 1;
+                        retry.wait_or_exhaust(&mut failed_attempts).await?;
                         continue;
                     }
                     CommitStep::Unknown => {
@@ -329,11 +333,7 @@ pub(crate) async fn drop_index<B: Backend>(
                     cursor = next;
                 }
                 CommitStep::RetryableAbort => {
-                    if retry.would_exhaust(failed_attempts) {
-                        return Err(Error::new(ErrorKind::ContentionExhausted));
-                    }
-                    retry.wait(failed_attempts).await;
-                    failed_attempts += 1;
+                    retry.wait_or_exhaust(&mut failed_attempts).await?;
                 }
                 CommitStep::Unknown => {
                     cursor = None;

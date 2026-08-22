@@ -1,0 +1,463 @@
+# ----------------------------------------------------------------------
+# Merge state machine, one bounded transition at a time (issue #31; the split
+# side is covered in split_steps.kddt). Every committed intermediate state
+# must stay searchable and pass the exact-membership audit; format-tree
+# renders each phase.
+#
+# min-entries=2, so a non-root leaf below 2 entries is merge-eligible.
+# ----------------------------------------------------------------------
+# --- Scenario A: leaf merge, step by step ---
+new-index dimension=2 metric=L2 fields=bucket:i64 tree-key-fields=0 min-entries=2 max-entries=4
+----
+created index "index"
+
+load dataset=clustered:12:2 tree=1 via=single seed=5
+----
+loaded 12 records (dataset=clustered:12:2, seed=5)
+
+# Split the root, then shrink leaf pk=2 below the minimum.
+split tree=1 partition=1
+----
+pk=1: split into left=2 right=3
+
+format-tree entries
+----
+tree 0: root pk=1
+  pk=1 level=2 state=Ready count=2
+    pk=2 level=1 state=Ready count=4
+      r000000
+      r000002
+      r000004
+      r000005
+    pk=3 level=1 state=Ready count=8
+      r000001
+      r000003
+      r000006
+      r000007
+      r000008
+      r000009
+      r000010
+      r000011
+
+delete
+r000002
+r000004
+r000005
+----
+r000002: true
+r000004: true
+r000005: true
+
+# pk=2 holds one entry: below the minimum with a legal Ready target.
+merge-step tree=1 partition=2
+----
+pk=2: began
+
+format-tree
+----
+tree 0: root pk=1
+  pk=1 level=2 state=Ready count=2
+    pk=2 level=1 state=Merging count=1
+    pk=3 level=1 state=Ready count=8
+
+# A Merging source still serves its record; search visits it like any leaf.
+search k=3 vector=[0,0]
+----
+r000003: 1.7065
+r000009: 1.7424
+r000000: 1.7913
+usage: scanned_tree_keys=1 visited_partitions=3 visited_leaf_entries=9 exact_rerank_candidates=3
+
+validate
+----
+ok: records=9 trees=1 partitions=3 max_level=2
+
+# The single entry drains to a reselected Ready target and the merge
+# completes in the same advance: no target state changes, no tombstone.
+merge-step tree=1 partition=2
+----
+pk=2: completed
+
+format-tree entries
+----
+tree 0: root pk=1
+  pk=1 level=2 state=Ready count=1
+    pk=3 level=1 state=Ready count=9
+      r000000
+      r000001
+      r000003
+      r000006
+      r000007
+      r000008
+      r000009
+      r000010
+      r000011
+
+validate
+----
+ok: records=9 trees=1 partitions=2 max_level=2
+
+recall k=3 samples=6
+----
+recall@3: 100.00% (samples=6, truncated=0)
+mean usage: visited_partitions=2 visited_leaf_entries=9 exact_rerank_candidates=3
+
+# --- Scenario B: foreground mutations interleaved with a merge ---
+new-index dimension=2 metric=L2 fields=bucket:i64 tree-key-fields=0 min-entries=2 max-entries=4
+----
+created index "index"
+
+load dataset=clustered:12:2 tree=1 via=single seed=5
+----
+loaded 12 records (dataset=clustered:12:2, seed=5)
+
+split tree=1 partition=1
+----
+pk=1: split into left=2 right=3
+
+# Shrink pk=2 to one entry and begin its merge.
+delete
+r000002
+r000004
+r000005
+----
+r000002: true
+r000004: true
+r000005: true
+
+merge-step tree=1 partition=2
+----
+pk=2: began
+
+# An insert whose nearest leaf is the Merging source redirects to the
+# nearest Ready leaf instead; no new insert enters the source.
+insert tree=1
+r100: [10,10]
+----
+r100: ok
+
+# An upsert whose Record Location still names the Merging source relocates
+# atomically to a Ready leaf instead of growing the source again.
+upsert tree=1
+r000000: [9.5,9.5]
+----
+r000000: replaced
+
+format-tree entries
+----
+tree 0: root pk=1
+  pk=1 level=2 state=Ready count=2
+    pk=2 level=1 state=Merging count=0
+    pk=3 level=1 state=Ready count=10
+      r000000
+      r000001
+      r000003
+      r000006
+      r000007
+      r000008
+      r000009
+      r000010
+      r000011
+      r100
+
+validate
+----
+ok: records=10 trees=1 partitions=3 max_level=2
+
+# The source is already empty, so the merge completes without a drain move.
+merge-step tree=1 partition=2
+----
+pk=2: completed
+
+format-tree entries
+----
+tree 0: root pk=1
+  pk=1 level=2 state=Ready count=1
+    pk=3 level=1 state=Ready count=10
+      r000000
+      r000001
+      r000003
+      r000006
+      r000007
+      r000008
+      r000009
+      r000010
+      r000011
+      r100
+
+validate
+----
+ok: records=10 trees=1 partitions=2 max_level=2
+
+# --- Scenario C: a restart mid-merge resumes from the durable state ---
+new-index dimension=2 metric=L2 fields=bucket:i64 tree-key-fields=0 min-entries=2 max-entries=4
+----
+created index "index"
+
+load dataset=clustered:12:2 tree=1 via=single seed=5
+----
+loaded 12 records (dataset=clustered:12:2, seed=5)
+
+split tree=1 partition=1
+----
+pk=1: split into left=2 right=3
+
+delete
+r000002
+r000004
+r000005
+----
+r000002: true
+r000004: true
+r000005: true
+
+merge-step tree=1 partition=2
+----
+pk=2: began
+
+restart
+----
+restarted
+
+# A delete follows the exact Record Location into the Merging source even
+# after a process restart rediscovers only the durable state.
+delete
+r000000
+----
+r000000: true
+
+merge-step tree=1 partition=2
+----
+pk=2: completed
+
+format-tree
+----
+tree 0: root pk=1
+  pk=1 level=2 state=Ready count=1
+    pk=3 level=1 state=Ready count=8
+
+validate
+----
+ok: records=8 trees=1 partitions=2 max_level=2
+
+# --- Scenario D: no legal target before the merge begins, so no state starts ---
+new-index dimension=2 metric=L2 fields=bucket:i64 tree-key-fields=0 min-entries=2 max-entries=4
+----
+created index "index"
+
+load dataset=clustered:12:2 tree=1 via=single seed=5
+----
+loaded 12 records (dataset=clustered:12:2, seed=5)
+
+split tree=1 partition=1
+----
+pk=1: split into left=2 right=3
+
+# Begin a split of pk=3 so no Ready same-level target exists for pk=2.
+split-step tree=1 partition=3
+----
+pk=3: began left=4 right=5
+
+delete
+r000002
+r000004
+r000005
+----
+r000002: true
+r000004: true
+r000005: true
+
+# The only candidate is Splitting: the merge does not begin and pk=2 stays
+# Ready.
+merge-step tree=1 partition=2
+----
+pk=2: idle
+
+format-tree
+----
+tree 0: root pk=1
+  pk=1 level=2 state=Ready count=2
+    pk=2 level=1 state=Ready count=1
+    pk=3 level=1 state=Splitting count=8 left=4 right=5
+
+split-step tree=1 partition=3
+----
+pk=3: exposed left=4 right=5
+
+# DrainingSplit and ReceivingSplit are not Ready either: still no target.
+merge-step tree=1 partition=2
+----
+pk=2: idle
+
+split-step tree=1 partition=3
+----
+pk=3: completed
+
+# With the split complete, its promoted targets are Ready and the merge can
+# begin — and complete.
+merge-step tree=1 partition=2
+----
+pk=2: began
+
+merge-step tree=1 partition=2
+----
+pk=2: completed
+
+format-tree
+----
+tree 0: root pk=1
+  pk=1 level=2 state=Ready count=2
+    pk=4 level=1 state=Ready count=5
+    pk=5 level=1 state=Ready count=4
+
+validate
+----
+ok: records=9 trees=1 partitions=3 max_level=2
+
+# --- Scenario E: a stalled merge stays searchable and never reverts ---
+new-index dimension=2 metric=L2 fields=bucket:i64 tree-key-fields=0 min-entries=2 max-entries=4
+----
+created index "index"
+
+load dataset=clustered:12:2 tree=1 via=single seed=5
+----
+loaded 12 records (dataset=clustered:12:2, seed=5)
+
+split tree=1 partition=1
+----
+pk=1: split into left=2 right=3
+
+delete
+r000002
+r000004
+r000005
+----
+r000002: true
+r000004: true
+r000005: true
+
+# The merge begins with pk=3 Ready...
+merge-step tree=1 partition=2
+----
+pk=2: began
+
+# ...and pk=3 starting its own split leaves no Ready same-level target.
+split-step tree=1 partition=3
+----
+pk=3: began left=4 right=5
+
+merge-step tree=1 partition=2
+----
+pk=2: stalled
+
+# A stalled Merging source remains searchable and never reverts to Ready.
+search k=3 vector=[0,0]
+----
+r000003: 1.7065
+r000009: 1.7424
+r000000: 1.7913
+usage: scanned_tree_keys=1 visited_partitions=3 visited_leaf_entries=9 exact_rerank_candidates=3
+
+merge-step tree=1 partition=2
+----
+pk=2: stalled
+
+format-tree
+----
+tree 0: root pk=1
+  pk=1 level=2 state=Ready count=2
+    pk=2 level=1 state=Merging count=1
+    pk=3 level=1 state=Splitting count=8 left=4 right=5
+
+# Once the split completes, a legal target returns and the merge finishes.
+split-step tree=1 partition=3
+----
+pk=3: exposed left=4 right=5
+
+split-step tree=1 partition=3
+----
+pk=3: completed
+
+merge-step tree=1 partition=2
+----
+pk=2: completed
+
+format-tree
+----
+tree 0: root pk=1
+  pk=1 level=2 state=Ready count=2
+    pk=4 level=1 state=Ready count=5
+    pk=5 level=1 state=Ready count=4
+
+validate
+----
+ok: records=9 trees=1 partitions=3 max_level=2
+
+# --- Scenario F: a merge target may cross the split threshold ---
+new-index dimension=2 metric=L2 fields=bucket:i64 tree-key-fields=0 min-entries=2 max-entries=4
+----
+created index "index"
+
+load dataset=clustered:12:2 tree=1 via=single seed=5
+----
+loaded 12 records (dataset=clustered:12:2, seed=5)
+
+split tree=1 partition=1
+----
+pk=1: split into left=2 right=3
+
+split tree=1 partition=3
+----
+pk=3: split into left=4 right=5
+
+format-tree entries
+----
+tree 0: root pk=1
+  pk=1 level=2 state=Ready count=3
+    pk=2 level=1 state=Ready count=4
+      r000000
+      r000002
+      r000004
+      r000005
+    pk=4 level=1 state=Ready count=5
+      r000003
+      r000006
+      r000009
+      r000010
+      r000011
+    pk=5 level=1 state=Ready count=3
+      r000001
+      r000007
+      r000008
+
+# Shrink pk=5 to one entry and pk=4 to exactly the maximum; merging pk=5
+# away then pushes its reselected target over the maximum, which is legal
+# and settles through the ordinary split machine.
+delete
+r000007
+r000008
+r000011
+----
+r000007: true
+r000008: true
+r000011: true
+
+merge tree=1 partition=5
+----
+pk=5: merged
+
+format-tree
+----
+tree 0: root pk=1
+  pk=1 level=2 state=Ready count=2
+    pk=2 level=1 state=Ready count=4
+    pk=4 level=1 state=Ready count=5
+
+split-step tree=1
+----
+pk=4: began left=6 right=7
+
+validate
+----
+ok: records=9 trees=1 partitions=3 max_level=2
+

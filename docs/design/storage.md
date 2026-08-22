@@ -180,6 +180,13 @@ Partition removal has one common correctness order:
 Split and merge may not describe an atomic “delete full prefix” on an adapter
 that lacks transactional range clear.
 
+For a split or merge source, the exact zero Header count is itself the
+emptiness proof: the drained prefix holds only its fixed metadata keys, so
+steps 3 and 4 collapse into the final transaction — bounded point deletes of
+those keys commit atomically with the topology switch, and the terminal state
+never outlives it. The paged form remains for removals without an exact-count
+proof, such as index drop.
+
 ## 9. Verification
 
 Backend contract tests run unchanged against a deterministic test backend,

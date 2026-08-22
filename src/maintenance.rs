@@ -9,10 +9,14 @@
 //! over the storage module's typed membership operations with whole-operation
 //! retries. `training` implements the deterministic binary K-means split
 //! training (ADR 0015) whose target centroids the split state machine
-//! publishes. `split` drives the bounded expose-then-drain split state machine
-//! (ADR 0014) that `routing` routes through; the merge state machine (#31)
-//! extends the same rules to `Merging`.
+//! publishes. `drain` holds the two-phase bounded drain batch machinery both
+//! state machines share. `split` drives the bounded expose-then-drain split
+//! state machine (ADR 0014) that `routing` routes through; `merge` drives the
+//! bounded reselect-then-drain merge state machine (ADR 0008), extending the
+//! same rules to `Merging`.
 
+pub(crate) mod drain;
+pub mod merge;
 pub(crate) mod mutation;
 pub mod routing;
 pub mod split;
