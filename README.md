@@ -65,6 +65,12 @@ durable maintenance queue, leader, or lease is required for correctness: a
 lost maintenance task leaves a searchable intermediate state that a later
 relevant access can resume.
 
+Structure Maintenance is demand-driven: a cold partition can remain in a
+searchable intermediate topology state indefinitely, and there is no
+time-bound on index-wide convergence. An index that is bulk-loaded and then
+rarely accessed does not become compact on its own; the next relevant access
+resumes maintenance from the durable intermediate state.
+
 A search uses one consistent backend snapshot for index validation, Tree Key
 selection, tree traversal, filtering, record loading, and exact reranking. It
 returns valid, exactly reranked hits from a bounded candidate set; it does not
