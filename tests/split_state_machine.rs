@@ -1358,6 +1358,79 @@ async fn advance_rediscovers_and_converges_a_cold_split() {
     runtime.shutdown().await.expect("shutdown");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn advance_converges_a_split_whose_source_shrank_to_one_entry() {
+    let backend = backend();
+    let runtime = make_runtime(backend.clone());
+    let index = runtime
+        .create_index("index", config())
+        .await
+        .expect("create");
+    let manifest = read_manifest(&backend, index.logical_index_id()).await;
+    let key = tree_key(1);
+    let records = seed_records(&index, 1, 6).await;
+
+    // Begin the split while the root is over the maximum, then let foreground
+    // deletes legally shrink the Splitting source to one entry (ADR 0014).
+    assert_eq!(
+        split::advance(&backend, &manifest, &key, pk(1), 10_000, &retry())
+            .await
+            .expect("begin"),
+        Advance::Began {
+            left: pk(2),
+            right: pk(3)
+        }
+    );
+    for n in 0..5_u8 {
+        assert!(index.delete(rid(n)).await.expect("delete"));
+    }
+    let remaining = &records[5..];
+    assert_searchable(&backend, &manifest, &key, remaining).await;
+
+    // Exposure trains on the shrunken snapshot; the machine must advance on
+    // this valid persistent state instead of reporting Corruption (#113).
+    let outcomes = drive_to_completion(&backend, &manifest, &key, pk(1)).await;
+    assert_eq!(outcomes.last(), Some(&Advance::Completed));
+    assert_searchable(&backend, &manifest, &key, remaining).await;
+
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn advance_converges_a_split_whose_source_emptied_out() {
+    let backend = backend();
+    let runtime = make_runtime(backend.clone());
+    let index = runtime
+        .create_index("index", config())
+        .await
+        .expect("create");
+    let manifest = read_manifest(&backend, index.logical_index_id()).await;
+    let key = tree_key(1);
+    let records = seed_records(&index, 1, 6).await;
+
+    assert_eq!(
+        split::advance(&backend, &manifest, &key, pk(1), 10_000, &retry())
+            .await
+            .expect("begin"),
+        Advance::Began {
+            left: pk(2),
+            right: pk(3)
+        }
+    );
+    for (id, _) in &records {
+        assert!(index.delete(id.clone()).await.expect("delete"));
+    }
+    assert_searchable(&backend, &manifest, &key, &[]).await;
+
+    // An empty Splitting source trains two zero centroids, drains nothing,
+    // and completes through the ordinary zero-count completion (#113).
+    let outcomes = drive_to_completion(&backend, &manifest, &key, pk(1)).await;
+    assert_eq!(outcomes.last(), Some(&Advance::Completed));
+    assert_searchable(&backend, &manifest, &key, &[]).await;
+
+    runtime.shutdown().await.expect("shutdown");
+}
+
 // ---------------------------------------------------------------------------
 // Crash and unknown-outcome recovery at every transition.
 // ---------------------------------------------------------------------------

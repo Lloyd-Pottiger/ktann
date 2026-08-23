@@ -27,12 +27,19 @@
 //!   with no sampling, memory, or CPU bound (ADR 0014); only each scan page
 //!   and record-load batch is bounded, so resource use stays proportional to
 //!   the source's actual size.
+//! - **Undersized sources still train.** A Splitting source accepts
+//!   foreground writes (ADR 0014), so deletes or child merges can legally
+//!   shrink it below the two entries balanced seeding needs before exposure.
+//!   Training then emits degenerate centroids — a single entry replicated, or
+//!   two zero vectors when empty — so the split can always advance. Target
+//!   centroids are routing models, not authority, so degenerate centroids
+//!   weaken only routing quality while exact movement preserves membership.
 //! - **Fail closed.** A missing source Header, a Leaf Entry whose Vector
-//!   Record is absent or no longer preprocesses cleanly, and a malformed or
-//!   undersized training set are Corruption. Training changes no persistent
-//!   state, so the searchable source stays intact for later diagnosis or
-//!   retry. State validation — that the source is actually Splitting — is the
-//!   caller's contract, not training's.
+//!   Record is absent or no longer preprocesses cleanly, and a malformed
+//!   training entry are Corruption. Training changes no persistent state, so
+//!   the searchable source stays intact for later diagnosis or retry. State
+//!   validation — that the source is actually Splitting — is the caller's
+//!   contract, not training's.
 
 use std::fmt;
 
@@ -240,18 +247,38 @@ struct TrainedSplit {
 /// Runs the deterministic balanced K-means protocol over one loaded source.
 ///
 /// The entries are reordered by canonical ID before seeding, so the result is
-/// a pure function of the entry set. Fewer than two entries cannot seed two
-/// non-empty balanced clusters; a legal split source holds more than the
-/// configured maximum (at least two) entries, so an undersized or malformed
-/// training set is Corruption.
+/// a pure function of the entry set. A malformed entry — wrong dimension or
+/// non-finite component — is Corruption.
+///
+/// A Splitting source accepts foreground writes (ADR 0014), so it can legally
+/// shrink below the two entries balanced seeding needs between begin and
+/// exposure. The split must still be able to advance on a valid persistent
+/// state, so an undersized set trains degenerate centroids: a single entry
+/// replicates as both centroids, and an empty source yields two zero vectors.
 fn train<I: Ord>(kernel: &VectorKernel, mut entries: Vec<(I, Box<[f32]>)>) -> Result<TrainedSplit> {
-    if entries.len() < 2 {
-        return Err(Error::new(ErrorKind::Corruption));
-    }
     for (_, vector) in &entries {
         if vector.len() != kernel.dimension() || vector.iter().any(|c| !c.is_finite()) {
             return Err(Error::new(ErrorKind::Corruption));
         }
+    }
+    match entries.len() {
+        0 => {
+            let zero: Box<[f32]> = vec![0.0; kernel.dimension()].into();
+            return Ok(TrainedSplit {
+                left: zero.clone(),
+                right: zero,
+                rounds: 0,
+            });
+        }
+        1 => {
+            let vector = &entries[0].1;
+            return Ok(TrainedSplit {
+                left: vector.clone(),
+                right: vector.clone(),
+                rounds: 0,
+            });
+        }
+        _ => {}
     }
     entries.sort_by(|left, right| left.0.cmp(&right.0));
 
@@ -499,13 +526,29 @@ mod tests {
     }
 
     #[test]
-    fn fewer_than_two_entries_are_corruption() {
+    fn an_undersized_source_trains_degenerate_centroids() {
         let kernel = kernel(1, Metric::L2);
+        // Foreground writes can legally shrink a Splitting source below two
+        // entries before exposure (ADR 0014); the split must still advance.
+        let trained = train(&kernel, Vec::<(Bytes, Box<[f32]>)>::new()).expect("trained");
+        assert_eq!(&*trained.left, &[0.0]);
+        assert_eq!(&*trained.right, &[0.0]);
+        assert_eq!(trained.rounds, 0);
+
+        let trained = train(&kernel, entries(&[&[3.0]])).expect("trained");
+        assert_eq!(&*trained.left, &[3.0]);
+        assert_eq!(&*trained.right, &[3.0]);
+        assert_eq!(trained.rounds, 0);
+    }
+
+    #[test]
+    fn a_malformed_undersized_entry_is_still_corruption() {
+        let kernel = kernel(2, Metric::L2);
+        assert_kind(train(&kernel, entries(&[&[1.0]])), ErrorKind::Corruption);
         assert_kind(
-            train(&kernel, Vec::<(Bytes, Box<[f32]>)>::new()),
+            train(&kernel, entries(&[&[1.0, f32::NAN]])),
             ErrorKind::Corruption,
         );
-        assert_kind(train(&kernel, entries(&[&[1.0]])), ErrorKind::Corruption);
     }
 
     #[test]
