@@ -47,7 +47,10 @@ tie-breakers. Each round orders entries by distance difference and assigns
 exactly `floor(n/2)` to the left cluster, with identity tie-breaking. Assignment
 stability stops early. Training output is not persistent authority; published
 target centroids are routing models and concurrent source writes need not
-restart training.
+restart training. Because Splitting accepts foreground writes, the source can
+legally shrink below two entries before exposure; training then emits
+degenerate centroids — the single entry replicated, or zero vectors when the
+source is empty — so every committed split state can always advance.
 
 Merge is eligible for a Ready non-root partition below the configured minimum.
 The worker reselects a legal target for each bounded batch under current

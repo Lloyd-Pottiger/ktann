@@ -317,16 +317,74 @@ async fn a_missing_source_header_is_corruption() {
 }
 
 #[tokio::test]
-async fn an_empty_leaf_source_is_corruption() {
+async fn an_empty_leaf_source_trains_zero_centroids() {
+    // Foreground deletes may legally empty a Splitting source before exposure
+    // (ADR 0014); training must still emit a deterministic pair so the split
+    // can advance (#113).
     let backend = DeterministicBackend::default();
     let manifest = manifest();
     let key = tree_key(1);
     create_committed_tree(&backend, &manifest, &key).await;
 
-    let error = train(&backend, &manifest, &key, pk(1))
+    let trained = train(&backend, &manifest, &key, pk(1))
         .await
-        .expect_err("empty leaf source");
-    assert_eq!(error.kind(), ErrorKind::Corruption);
+        .expect("empty leaf source trains");
+    assert_eq!(trained.left().components(), &[0.0]);
+    assert_eq!(trained.right().components(), &[0.0]);
+}
+
+#[tokio::test]
+async fn a_lone_leaf_entry_replicates_as_both_centroids() {
+    let backend = DeterministicBackend::default();
+    let manifest = manifest();
+    let key = tree_key(1);
+    seed_leaf_source(&backend, &manifest, &key, &[(rid(0), 3.0)]).await;
+
+    let trained = train(&backend, &manifest, &key, pk(1))
+        .await
+        .expect("single-entry source trains");
+    assert_eq!(trained.left().components(), &[3.0]);
+    assert_eq!(trained.right().components(), &[3.0]);
+}
+
+#[tokio::test]
+async fn a_lone_child_centroid_replicates_for_internal_training() {
+    let backend = DeterministicBackend::default();
+    let manifest = manifest();
+    let key = tree_key(1);
+    create_committed_tree(&backend, &manifest, &key).await;
+    write_values(
+        &backend,
+        &manifest,
+        vec![
+            (
+                LogicalKey::Header {
+                    index: id(7),
+                    tree_key: key.clone(),
+                    partition: pk(1),
+                },
+                PersistentValue::PartitionHeader(
+                    PartitionHeader::new(2, 1, 0, PartitionState::Splitting).expect("header"),
+                ),
+            ),
+            (
+                LogicalKey::ChildEntry {
+                    index: id(7),
+                    tree_key: key.clone(),
+                    partition: pk(1),
+                    child: pk(2),
+                },
+                PersistentValue::ChildEntry(ChildEntry::new(pk(2), vec![7.0])),
+            ),
+        ],
+    )
+    .await;
+
+    let trained = train(&backend, &manifest, &key, pk(1))
+        .await
+        .expect("single-child source trains");
+    assert_eq!(trained.left().components(), &[7.0]);
+    assert_eq!(trained.right().components(), &[7.0]);
 }
 
 #[tokio::test]
