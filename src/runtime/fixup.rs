@@ -36,8 +36,12 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, MutexGuard};
 
+use tracing::{Instrument as _, Span};
+
 use crate::api::{Error, ErrorKind, LogicalIndexId, PartitionKey, Result};
 use crate::maintenance::{merge, split};
+use crate::observe::labels::{FixupAdmission, FixupExecution, FixupKind};
+use crate::observe::{metrics, trace};
 use crate::storage::backend::Backend;
 use crate::storage::keys::TreeKey;
 use crate::storage::values::IndexManifest;
@@ -69,23 +73,11 @@ struct FixupOffer {
     manifest: Arc<IndexManifest>,
 }
 
-/// The outcome of offering one Fixup key.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Admission {
-    /// The key took a queue slot.
-    Enqueued,
-    /// The key is already pending or running; the offer coalesced into it.
-    Duplicate,
-    /// Pending plus running Fixups reached the configured capacity; the offer
-    /// was dropped.
-    Saturated,
-}
-
 /// Cumulative, privacy-safe observations of the process-local Fixup queue.
 ///
-/// Counts only; the permanent metrics and tracing labels arrive with the
-/// observability work. Saturating arithmetic keeps the counters themselves
-/// bounded and panic-free.
+/// Counts only; the `ktann.fixup.*` facade series are emitted alongside
+/// (design `runtime-operations.md` §5). Saturating arithmetic keeps the
+/// counters themselves bounded and panic-free.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct FixupStats {
     /// Keys that took a queue slot.
@@ -104,26 +96,14 @@ pub(crate) struct FixupStats {
 
 impl FixupStats {
     /// Counts one finished execution's outcome.
-    fn record(&mut self, execution: Execution) {
+    fn record(&mut self, execution: FixupExecution) {
         let counter = match execution {
-            Execution::Settled => &mut self.settled,
-            Execution::Stalled => &mut self.stalled,
-            Execution::Retired => &mut self.retired,
+            FixupExecution::Settled => &mut self.settled,
+            FixupExecution::Stalled => &mut self.stalled,
+            FixupExecution::Retired => &mut self.retired,
         };
         *counter = counter.saturating_add(1);
     }
-}
-
-/// The outcome of one Fixup execution.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Execution {
-    /// The partition reached a state with no work for either state machine.
-    Settled,
-    /// The partition is `Merging` with no legal target; rediscovery may retry.
-    Stalled,
-    /// Execution stopped early: an error (including an unknown commit
-    /// outcome), the bounded step count, cancellation, or backend release.
-    Retired,
 }
 
 /// The bounded, deduplicating process-local Fixup queue.
@@ -161,14 +141,14 @@ impl FixupQueue {
     ///
     /// The Manifest Arc is cloned only on the enqueue path; duplicate and
     /// saturated offers drop without touching its refcount.
-    fn offer(&mut self, key: FixupKey, manifest: &Arc<IndexManifest>) -> Admission {
+    fn offer(&mut self, key: FixupKey, manifest: &Arc<IndexManifest>) -> FixupAdmission {
         if self.admitted.contains(&key) {
             self.stats.duplicate = self.stats.duplicate.saturating_add(1);
-            return Admission::Duplicate;
+            return FixupAdmission::Duplicate;
         }
         if self.backlog() >= self.capacity {
             self.stats.saturated = self.stats.saturated.saturating_add(1);
-            return Admission::Saturated;
+            return FixupAdmission::Saturated;
         }
         self.admitted.insert(key.clone());
         self.pending.push_back(FixupOffer {
@@ -176,7 +156,7 @@ impl FixupQueue {
             manifest: Arc::clone(manifest),
         });
         self.stats.enqueued = self.stats.enqueued.saturating_add(1);
-        Admission::Enqueued
+        FixupAdmission::Enqueued
     }
 
     /// Takes the oldest pending Fixup into running state.
@@ -189,24 +169,28 @@ impl FixupQueue {
         Some(offer)
     }
 
-    /// Releases one running Fixup's slot after its execution ended.
+    /// Releases one running Fixup's slot after its execution ended, returning
+    /// the remaining backlog.
     ///
     /// Called from the worker's running guard, so it also runs when the
     /// worker task is aborted mid-execution: an interrupted Fixup never leaks
     /// its admission slot.
-    fn finish(&mut self, key: &FixupKey) {
+    fn finish(&mut self, key: &FixupKey) -> usize {
         self.running = self.running.saturating_sub(1);
         self.admitted.remove(key);
+        self.backlog()
     }
 
-    /// Drops every pending Fixup, keeping only running admissions.
+    /// Drops every pending Fixup, keeping only running admissions, and returns
+    /// the remaining backlog.
     ///
     /// Shutdown cancels work that has not begun; running executions release
     /// their own slots through [`FixupQueue::finish`].
-    fn drain_pending(&mut self) {
+    fn drain_pending(&mut self) -> usize {
         while let Some(offer) = self.pending.pop_front() {
             self.admitted.remove(&offer.key);
         }
+        self.backlog()
     }
 }
 
@@ -229,17 +213,39 @@ impl<B: Backend> RuntimeInner<B> {
             return;
         }
         let index = manifest.logical_index_id();
-        let mut queue = self.lock_fixups();
-        for (tree_key, partition) in partitions {
-            let key = FixupKey {
-                index,
-                tree_key,
-                partition,
-            };
-            if queue.offer(key, manifest) == Admission::Enqueued {
-                self.fixup_available.notify_one();
+        let mut enqueued = 0_u64;
+        let mut duplicate = 0_u64;
+        let mut saturated = 0_u64;
+        let backlog = {
+            let mut queue = self.lock_fixups();
+            for (tree_key, partition) in partitions {
+                let key = FixupKey {
+                    index,
+                    tree_key,
+                    partition,
+                };
+                match queue.offer(key, manifest) {
+                    FixupAdmission::Enqueued => {
+                        self.fixup_available.notify_one();
+                        enqueued += 1;
+                    }
+                    FixupAdmission::Duplicate => duplicate += 1,
+                    FixupAdmission::Saturated => saturated += 1,
+                }
+            }
+            queue.backlog()
+        };
+        // Facade calls stay outside the queue lock.
+        for (admission, count) in [
+            (FixupAdmission::Enqueued, enqueued),
+            (FixupAdmission::Duplicate, duplicate),
+            (FixupAdmission::Saturated, saturated),
+        ] {
+            if count > 0 {
+                metrics::fixup_admission(admission, count);
             }
         }
+        metrics::fixup_backlog(backlog);
     }
 
     /// Returns the cumulative Fixup queue statistics.
@@ -303,7 +309,8 @@ impl<B: Backend> RuntimeInner<B> {
     /// finish their bounded step and stop at the next cancellation point.
     pub(crate) fn stop_maintenance(&self) {
         self.maintenance_cancel.cancel();
-        self.lock_fixups().drain_pending();
+        let backlog = self.lock_fixups().drain_pending();
+        metrics::fixup_backlog(backlog);
     }
 
     /// Returns the backend for maintenance work, or `None` once it is gone.
@@ -325,7 +332,8 @@ impl<B: Backend> RuntimeInner<B> {
             tokio::pin!(notified);
             notified.as_mut().enable();
             if self.maintenance_cancel.is_cancelled() {
-                self.lock_fixups().drain_pending();
+                let backlog = self.lock_fixups().drain_pending();
+                metrics::fixup_backlog(backlog);
                 return None;
             }
             if let Some(offer) = self.lock_fixups().pop() {
@@ -334,7 +342,8 @@ impl<B: Backend> RuntimeInner<B> {
             tokio::select! {
                 biased;
                 () = self.maintenance_cancel.cancelled() => {
-                    self.lock_fixups().drain_pending();
+                    let backlog = self.lock_fixups().drain_pending();
+                    metrics::fixup_backlog(backlog);
                     return None;
                 }
                 () = notified => {}
@@ -365,7 +374,9 @@ async fn run_worker<B: Backend>(guard: WorkerGuard<B>) {
             inner,
             key: &offer.key,
         };
-        let execution = drive(inner, &offer).await;
+        let span = trace::fixup_span(offer.key.index, offer.key.partition, &offer.key.tree_key);
+        let execution = drive(inner, &offer).instrument(span).await;
+        metrics::fixup_execution(execution);
         inner.lock_fixups().stats.record(execution);
     }
 }
@@ -380,11 +391,15 @@ impl<B: Backend> Drop for RunningFixup<'_, B> {
     fn drop(&mut self) {
         // Wake gated Import Session submissions only when this release opens
         // the backlog gate; while it stays closed no waiter could proceed.
-        let gate_open = {
+        let (gate_open, backlog) = {
             let mut queue = self.inner.lock_fixups();
-            queue.finish(self.key);
-            queue.backlog() < self.inner.config().import_backlog_watermark()
+            let backlog = queue.finish(self.key);
+            (
+                backlog < self.inner.config().import_backlog_watermark(),
+                backlog,
+            )
         };
+        metrics::fixup_backlog(backlog);
         if gate_open {
             self.inner.fixup_released.notify_waiters();
         }
@@ -413,15 +428,15 @@ impl<B: Backend> Drop for WorkerGuard<B> {
 /// rediscovers the durable state exactly where it stopped. Corruption is not
 /// repaired here; it surfaces to the foreground path that reads the same
 /// state.
-async fn drive<B: Backend>(inner: &Arc<RuntimeInner<B>>, offer: &FixupOffer) -> Execution {
+async fn drive<B: Backend>(inner: &Arc<RuntimeInner<B>>, offer: &FixupOffer) -> FixupExecution {
     let Some(backend) = inner.maintenance_backend() else {
-        return Execution::Retired;
+        return FixupExecution::Retired;
     };
     let retry = RetryPolicy::for_fixup(inner.config());
     let attempts = inner.config().fixup_attempts();
     for _ in 0..attempts {
         if inner.maintenance_cancel.is_cancelled() {
-            return Execution::Retired;
+            return FixupExecution::Retired;
         }
         let started_at = now_unix_millis();
         let key = &offer.key;
@@ -436,7 +451,7 @@ async fn drive<B: Backend>(inner: &Arc<RuntimeInner<B>>, offer: &FixupOffer) -> 
         .await;
         match split_step {
             Ok(split::Advance::Idle) => {
-                match merge::advance(
+                let merge_step = merge::advance(
                     &*backend,
                     &offer.manifest,
                     &key.tree_key,
@@ -444,28 +459,39 @@ async fn drive<B: Backend>(inner: &Arc<RuntimeInner<B>>, offer: &FixupOffer) -> 
                     started_at,
                     &retry,
                 )
-                .await
-                {
+                .await;
+                if !matches!(merge_step, Ok(merge::Advance::Idle)) {
+                    trace::fixup_kind(&Span::current(), FixupKind::Merge);
+                }
+                match merge_step {
                     Ok(merge::Advance::Idle | merge::Advance::Completed) => {
-                        return Execution::Settled;
+                        return FixupExecution::Settled;
                     }
-                    Ok(merge::Advance::Stalled) => return Execution::Stalled,
+                    Ok(merge::Advance::Stalled) => return FixupExecution::Stalled,
                     Ok(merge::Advance::Began | merge::Advance::Drained { .. }) => {}
-                    Err(_) => return Execution::Retired,
+                    Err(_) => return FixupExecution::Retired,
                 }
             }
-            Ok(split::Advance::Completed) => return Execution::Settled,
+            Ok(split::Advance::Completed) => {
+                trace::fixup_kind(&Span::current(), FixupKind::Split);
+                return FixupExecution::Settled;
+            }
             Ok(
                 split::Advance::Began { .. }
                 | split::Advance::Exposed { .. }
                 | split::Advance::Drained { .. },
-            ) => {}
-            Err(_) => return Execution::Retired,
+            ) => {
+                trace::fixup_kind(&Span::current(), FixupKind::Split);
+            }
+            Err(_) => {
+                trace::fixup_kind(&Span::current(), FixupKind::Split);
+                return FixupExecution::Retired;
+            }
         }
     }
     // The step budget ran out with work possibly remaining: the Fixup
     // retires and a later relevant access re-offers the partition.
-    Execution::Retired
+    FixupExecution::Retired
 }
 
 #[cfg(test)]
@@ -518,11 +544,11 @@ mod tests {
         let mut queue = FixupQueue::new(4);
         assert_eq!(
             queue.offer(key(&manifest, 1, 1), &manifest),
-            Admission::Enqueued
+            FixupAdmission::Enqueued
         );
         assert_eq!(
             queue.offer(key(&manifest, 1, 1), &manifest),
-            Admission::Duplicate
+            FixupAdmission::Duplicate
         );
         assert_eq!(queue.pending.len(), 1);
         assert_eq!(queue.stats.enqueued, 1);
@@ -531,11 +557,11 @@ mod tests {
         // distinct tree are both new keys.
         assert_eq!(
             queue.offer(key(&manifest, 1, 2), &manifest),
-            Admission::Enqueued
+            FixupAdmission::Enqueued
         );
         assert_eq!(
             queue.offer(key(&manifest, 2, 1), &manifest),
-            Admission::Enqueued
+            FixupAdmission::Enqueued
         );
         assert_eq!(queue.pending.len(), 3);
     }
@@ -546,16 +572,16 @@ mod tests {
         let mut queue = FixupQueue::new(2);
         assert_eq!(
             queue.offer(key(&manifest, 1, 1), &manifest),
-            Admission::Enqueued
+            FixupAdmission::Enqueued
         );
         assert_eq!(
             queue.offer(key(&manifest, 1, 2), &manifest),
-            Admission::Enqueued
+            FixupAdmission::Enqueued
         );
         // Pending plus running reached the capacity.
         assert_eq!(
             queue.offer(key(&manifest, 1, 3), &manifest),
-            Admission::Saturated
+            FixupAdmission::Saturated
         );
         assert_eq!(queue.stats.saturated, 1);
 
@@ -564,12 +590,12 @@ mod tests {
         assert_eq!(queue.running, 1);
         assert_eq!(
             queue.offer(key(&manifest, 1, 3), &manifest),
-            Admission::Saturated
+            FixupAdmission::Saturated
         );
         // A duplicate of the running key still coalesces rather than failing.
         assert_eq!(
             queue.offer(key(&manifest, 1, 1), &manifest),
-            Admission::Duplicate
+            FixupAdmission::Duplicate
         );
 
         queue.finish(&first.key);
@@ -579,7 +605,7 @@ mod tests {
         assert_eq!(queue.admitted.len(), 1);
         assert_eq!(
             queue.offer(key(&manifest, 1, 3), &manifest),
-            Admission::Enqueued
+            FixupAdmission::Enqueued
         );
         let second = queue.pop().expect("pending offer");
         assert_eq!(second.key.partition.get(), 2);
@@ -597,7 +623,7 @@ mod tests {
         for partition in 1..=3_u64 {
             assert_eq!(
                 queue.offer(key(&manifest, 1, partition), &manifest),
-                Admission::Enqueued
+                FixupAdmission::Enqueued
             );
         }
         let first = queue.pop().expect("first pending");

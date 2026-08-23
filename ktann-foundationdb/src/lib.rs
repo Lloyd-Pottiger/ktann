@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod backend;
+mod observe;
 
 pub use backend::{
     BackendNamespace, FoundationDbBackend, FoundationDbReadTxn, FoundationDbWriteTxn,

@@ -7,6 +7,7 @@ use bytes::Bytes;
 use xxhash_rust::xxh3::Xxh3;
 
 use crate::api::{DataType, Error, FieldSchema, MAX_STRING_BYTES, Result, Value, typed_order};
+use crate::observe::metrics;
 
 use super::MAX_SYNOPSIS_BYTES;
 use super::corrupt;
@@ -328,7 +329,12 @@ fn expand_field(
             let byte = bit / 8;
             bloom[byte] |= 1_u8 << (bit % 8);
         }
+        // Saturation only weakens pruning; it never breaks the conservative
+        // contract (ADR 0021), so a rising fill ratio is purely diagnostic.
+        let set_bits: u64 = bloom.iter().map(|byte| u64::from(byte.count_ones())).sum();
         synopsis.bloom = Some(bloom.freeze());
+        #[allow(clippy::cast_precision_loss)]
+        metrics::bloom_fill_ratio(set_bits as f64 / f64::from(parameters.bit_count()));
     }
 }
 

@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::future::{Future, pending};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -9,10 +10,14 @@ use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument as _;
 
 use crate::api::{
-    Error, ErrorKind, Index, IndexConfig, IndexName, OperationOptions, Result, RuntimeConfig,
+    Error, ErrorKind, Index, IndexConfig, IndexName, LogicalIndexId, OperationOptions, Result,
+    RuntimeConfig,
 };
+use crate::observe::labels::{Operation, OperationOutcome};
+use crate::observe::{metrics, trace};
 use crate::search::cache::PartitionCache;
 use crate::storage::backend::{Backend, CommitCancellation, CommitStart};
 
@@ -113,9 +118,14 @@ impl<B: Backend> Runtime<B> {
         let retry = lifecycle::RetryPolicy::from_config(self.config());
         let handle_name = name.clone();
         let manifest = self
-            .run_foreground(options, move |mut context| async move {
-                lifecycle::create_index(&mut context, name, config, retry).await
-            })
+            .run_foreground(
+                Operation::CreateIndex,
+                None,
+                options,
+                move |mut context| async move {
+                    lifecycle::create_index(&mut context, name, config, retry).await
+                },
+            )
             .await?;
         Index::new(Arc::clone(&self.handle.inner), handle_name, manifest)
     }
@@ -140,9 +150,12 @@ impl<B: Backend> Runtime<B> {
         let name = IndexName::new(name)?;
         let handle_name = name.clone();
         let manifest = self
-            .run_foreground(options, move |mut context| async move {
-                lifecycle::open_index(&mut context, name).await
-            })
+            .run_foreground(
+                Operation::OpenIndex,
+                None,
+                options,
+                move |mut context| async move { lifecycle::open_index(&mut context, name).await },
+            )
             .await?;
         Index::new(Arc::clone(&self.handle.inner), handle_name, manifest)
     }
@@ -166,9 +179,12 @@ impl<B: Backend> Runtime<B> {
     ) -> Result<()> {
         let name = IndexName::new(name)?;
         let retry = lifecycle::RetryPolicy::from_config(self.config());
-        self.run_foreground(options, move |mut context| async move {
-            lifecycle::drop_index(&mut context, name, retry).await
-        })
+        self.run_foreground(
+            Operation::DropIndex,
+            None,
+            options,
+            move |mut context| async move { lifecycle::drop_index(&mut context, name, retry).await },
+        )
         .await
     }
 
@@ -195,15 +211,20 @@ impl<B: Backend> Runtime<B> {
 
     pub(crate) async fn run_foreground<T, F, Fut>(
         &self,
+        operation: Operation,
+        index: Option<LogicalIndexId>,
         options: OperationOptions,
-        operation: F,
+        work: F,
     ) -> Result<T>
     where
         T: Send + 'static,
         F: FnOnce(OperationContext<B>) -> Fut + Send + 'static,
         Fut: Future<Output = Result<T>> + Send + 'static,
     {
-        self.handle.inner.run_foreground(options, operation).await
+        self.handle
+            .inner
+            .run_foreground(operation, index, options, work)
+            .await
     }
 }
 
@@ -306,6 +327,20 @@ async fn join_task<T>(task: &mut JoinHandle<Result<T>>) -> Result<T> {
         .map_err(|source| Error::with_source(ErrorKind::Backend, source))?
 }
 
+/// Reports one foreground operation's outcome and, for failures, the
+/// levelled completion event (design `runtime-operations.md` §5).
+fn observe_operation(
+    operation: Operation,
+    outcome: OperationOutcome,
+    error: Option<&Error>,
+    started: Instant,
+) {
+    metrics::operation_finished(operation, outcome, started.elapsed());
+    if let Some(error) = error {
+        trace::operation_failed(operation, error);
+    }
+}
+
 async fn cancel_task_before_commit<T>(
     task: &mut JoinHandle<Result<T>>,
     commit_cancellation: &CommitCancellation,
@@ -342,18 +377,34 @@ impl<B: Backend> RuntimeInner<B> {
     /// The Runtime handle and every [`Index`] handle share this path: it
     /// enforces the foreground admission semaphores, the cancellation/deadline
     /// checks, and the commit-boundary race before the operation's closure
-    /// starts.
+    /// starts. Every outcome — admission rejection, closure result, or
+    /// caller-side cancellation of an aborted task — is observed under the
+    /// bounded operation label, and the closure runs inside the operation span.
     pub(crate) async fn run_foreground<T, F, Fut>(
         self: &Arc<Self>,
+        operation: Operation,
+        index: Option<LogicalIndexId>,
         options: OperationOptions,
-        operation: F,
+        work: F,
     ) -> Result<T>
     where
         T: Send + 'static,
         F: FnOnce(OperationContext<B>) -> Fut + Send + 'static,
         Fut: Future<Output = Result<T>> + Send + 'static,
     {
-        let (admission, backend) = self.admit(&options).await?;
+        let started = Instant::now();
+        let (admission, backend) = match self.admit(&options).await {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                observe_operation(
+                    operation,
+                    OperationOutcome::Error(error.kind()),
+                    Some(&error),
+                    started,
+                );
+                return Err(error);
+            }
+        };
         let cancellation = options.cancellation().cloned();
         let deadline = options.deadline();
         let (commit_cancellation, commit_start) = CommitCancellation::pair();
@@ -362,17 +413,33 @@ impl<B: Backend> RuntimeInner<B> {
             options,
             commit_start: Some(commit_start),
         };
-        let mut task = self.executor.spawn(async move {
-            let result = match context.checkpoint() {
-                Ok(()) => operation(context).await,
-                Err(error) => {
-                    drop(context);
-                    Err(error)
-                }
-            };
-            drop(admission);
-            result
-        });
+        // `observed` tracks whether the spawned task reported the operation's
+        // true outcome; the caller side reports only when it won the
+        // cancellation race and the aborted task never reported.
+        let observed = Arc::new(AtomicBool::new(false));
+        let task_observed = Arc::clone(&observed);
+        let span = trace::operation_span(operation, index);
+        let mut task = self.executor.spawn(
+            async move {
+                let result = match context.checkpoint() {
+                    Ok(()) => work(context).await,
+                    Err(error) => {
+                        drop(context);
+                        Err(error)
+                    }
+                };
+                drop(admission);
+                observe_operation(
+                    operation,
+                    OperationOutcome::from_result(&result),
+                    result.as_ref().err(),
+                    started,
+                );
+                task_observed.store(true, Ordering::Release);
+                result
+            }
+            .instrument(span),
+        );
 
         let mut caller = CancelBeforeCommit {
             task: Some(task.abort_handle()),
@@ -403,6 +470,14 @@ impl<B: Backend> RuntimeInner<B> {
             }
         };
         caller.disarm();
+        if !observed.load(Ordering::Acquire) && result.is_err() {
+            observe_operation(
+                operation,
+                OperationOutcome::from_result(&result),
+                result.as_ref().err(),
+                started,
+            );
+        }
         result
     }
 
@@ -892,13 +967,18 @@ mod tests {
             let release_first = Arc::clone(&release_first);
             async move {
                 runtime
-                    .run_foreground(OperationOptions::default(), move |context| async move {
-                        let _backend = context.backend();
-                        first_started.notify_one();
-                        release_first.notified().await;
-                        context.checkpoint()?;
-                        Ok(1_u8)
-                    })
+                    .run_foreground(
+                        Operation::Get,
+                        None,
+                        OperationOptions::default(),
+                        move |context| async move {
+                            let _backend = context.backend();
+                            first_started.notify_one();
+                            release_first.notified().await;
+                            context.checkpoint()?;
+                            Ok(1_u8)
+                        },
+                    )
                     .await
             }
         });
@@ -909,10 +989,15 @@ mod tests {
             let second_started = Arc::clone(&second_started);
             async move {
                 runtime
-                    .run_foreground(OperationOptions::default(), move |_context| async move {
-                        second_started.store(true, Ordering::SeqCst);
-                        Ok(2_u8)
-                    })
+                    .run_foreground(
+                        Operation::Get,
+                        None,
+                        OperationOptions::default(),
+                        move |_context| async move {
+                            second_started.store(true, Ordering::SeqCst);
+                            Ok(2_u8)
+                        },
+                    )
                     .await
             }
         });
@@ -922,7 +1007,12 @@ mod tests {
         assert!(!second_started.load(Ordering::SeqCst));
 
         let saturation_error = runtime
-            .run_foreground(OperationOptions::default(), |_context| async { Ok(()) })
+            .run_foreground(
+                Operation::Get,
+                None,
+                OperationOptions::default(),
+                |_context| async { Ok(()) },
+            )
             .await
             .unwrap_err();
         assert_eq!(saturation_error.kind(), ErrorKind::LimitExceeded);
@@ -958,11 +1048,16 @@ mod tests {
             let release_first = Arc::clone(&release_first);
             async move {
                 runtime
-                    .run_foreground(OperationOptions::default(), move |_context| async move {
-                        first_started.notify_one();
-                        release_first.notified().await;
-                        Ok(())
-                    })
+                    .run_foreground(
+                        Operation::Get,
+                        None,
+                        OperationOptions::default(),
+                        move |_context| async move {
+                            first_started.notify_one();
+                            release_first.notified().await;
+                            Ok(())
+                        },
+                    )
                     .await
             }
         });
@@ -975,7 +1070,7 @@ mod tests {
             let options = OperationOptions::default().with_cancellation(cancellation.clone());
             async move {
                 runtime
-                    .run_foreground(options, move |_context| async move {
+                    .run_foreground(Operation::Get, None, options, move |_context| async move {
                         second_started.store(true, Ordering::SeqCst);
                         Ok(())
                     })
@@ -1010,6 +1105,8 @@ mod tests {
         let (runtime, _drops) = test_runtime(1);
         let deadline_error = runtime
             .run_foreground(
+                Operation::Get,
+                None,
                 OperationOptions::default().with_deadline(Instant::now()),
                 |_context| async { Ok(()) },
             )
@@ -1024,7 +1121,7 @@ mod tests {
             .with_cancellation(cancellation);
 
         let error = runtime
-            .run_foreground(options, |_context| async { Ok(()) })
+            .run_foreground(Operation::Get, None, options, |_context| async { Ok(()) })
             .await
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Cancelled);
@@ -1045,13 +1142,18 @@ mod tests {
             let commit_started = Arc::clone(&commit_started);
             async move {
                 runtime
-                    .run_foreground(OperationOptions::default(), move |context| async move {
-                        operation_started.notify_one();
-                        check_control.notified().await;
-                        context.checkpoint()?;
-                        commit_started.store(true, Ordering::SeqCst);
-                        Ok(())
-                    })
+                    .run_foreground(
+                        Operation::Get,
+                        None,
+                        OperationOptions::default(),
+                        move |context| async move {
+                            operation_started.notify_one();
+                            check_control.notified().await;
+                            context.checkpoint()?;
+                            commit_started.store(true, Ordering::SeqCst);
+                            Ok(())
+                        },
+                    )
                     .await
             }
         });
@@ -1091,17 +1193,22 @@ mod tests {
             let backend_call_started = Arc::clone(&backend_call_started);
             async move {
                 runtime
-                    .run_foreground(OperationOptions::default(), move |mut context| async move {
-                        context
-                            .commit(move |commit_start| async move {
-                                waiting_for_backend.notify_one();
-                                backend_capacity.notified().await;
-                                commit_start.begin()?;
-                                backend_call_started.store(true, Ordering::SeqCst);
-                                Ok(())
-                            })
-                            .await
-                    })
+                    .run_foreground(
+                        Operation::Get,
+                        None,
+                        OperationOptions::default(),
+                        move |mut context| async move {
+                            context
+                                .commit(move |commit_start| async move {
+                                    waiting_for_backend.notify_one();
+                                    backend_capacity.notified().await;
+                                    commit_start.begin()?;
+                                    backend_call_started.store(true, Ordering::SeqCst);
+                                    Ok(())
+                                })
+                                .await
+                        },
+                    )
                     .await
             }
         });
@@ -1130,7 +1237,7 @@ mod tests {
             let check_control = Arc::clone(&check_control);
             async move {
                 runtime
-                    .run_foreground(options, move |context| async move {
+                    .run_foreground(Operation::Get, None, options, move |context| async move {
                         started.notify_one();
                         check_control.notified().await;
                         context.checkpoint()?;
@@ -1167,17 +1274,22 @@ mod tests {
             let backend_call_started = Arc::clone(&backend_call_started);
             async move {
                 runtime
-                    .run_foreground(options, move |mut context| async move {
-                        context
-                            .commit(move |commit_start| async move {
-                                waiting_for_backend.notify_one();
-                                backend_capacity.notified().await;
-                                commit_start.begin()?;
-                                backend_call_started.store(true, Ordering::SeqCst);
-                                Ok(())
-                            })
-                            .await
-                    })
+                    .run_foreground(
+                        Operation::Get,
+                        None,
+                        options,
+                        move |mut context| async move {
+                            context
+                                .commit(move |commit_start| async move {
+                                    waiting_for_backend.notify_one();
+                                    backend_capacity.notified().await;
+                                    commit_start.begin()?;
+                                    backend_call_started.store(true, Ordering::SeqCst);
+                                    Ok(())
+                                })
+                                .await
+                        },
+                    )
                     .await
             }
         });
@@ -1210,17 +1322,22 @@ mod tests {
             let backend_call_started = Arc::clone(&backend_call_started);
             async move {
                 runtime
-                    .run_foreground(options, move |mut context| async move {
-                        context
-                            .commit(move |commit_start| async move {
-                                waiting_for_backend.notify_one();
-                                backend_capacity.notified().await;
-                                commit_start.begin()?;
-                                backend_call_started.store(true, Ordering::SeqCst);
-                                Ok(())
-                            })
-                            .await
-                    })
+                    .run_foreground(
+                        Operation::Get,
+                        None,
+                        options,
+                        move |mut context| async move {
+                            context
+                                .commit(move |commit_start| async move {
+                                    waiting_for_backend.notify_one();
+                                    backend_capacity.notified().await;
+                                    commit_start.begin()?;
+                                    backend_call_started.store(true, Ordering::SeqCst);
+                                    Ok(())
+                                })
+                                .await
+                        },
+                    )
                     .await
             }
         });
@@ -1252,16 +1369,21 @@ mod tests {
             let finish_commit = Arc::clone(&finish_commit);
             async move {
                 runtime
-                    .run_foreground(options, move |mut context| async move {
-                        context
-                            .commit(move |commit_start| async move {
-                                commit_start.begin()?;
-                                commit_started.notify_one();
-                                finish_commit.notified().await;
-                                Err::<(), _>(Error::new(ErrorKind::CommitOutcomeUnknown))
-                            })
-                            .await
-                    })
+                    .run_foreground(
+                        Operation::Get,
+                        None,
+                        options,
+                        move |mut context| async move {
+                            context
+                                .commit(move |commit_start| async move {
+                                    commit_start.begin()?;
+                                    commit_started.notify_one();
+                                    finish_commit.notified().await;
+                                    Err::<(), _>(Error::new(ErrorKind::CommitOutcomeUnknown))
+                                })
+                                .await
+                        },
+                    )
                     .await
             }
         });
@@ -1291,17 +1413,22 @@ mod tests {
             let commit_finished = Arc::clone(&commit_finished);
             async move {
                 runtime
-                    .run_foreground(OperationOptions::default(), move |mut context| async move {
-                        context
-                            .commit(move |commit_start| async move {
-                                commit_start.begin()?;
-                                commit_started.notify_one();
-                                finish_commit.notified().await;
-                                commit_finished.store(true, Ordering::SeqCst);
-                                Ok(())
-                            })
-                            .await
-                    })
+                    .run_foreground(
+                        Operation::Get,
+                        None,
+                        OperationOptions::default(),
+                        move |mut context| async move {
+                            context
+                                .commit(move |commit_start| async move {
+                                    commit_start.begin()?;
+                                    commit_started.notify_one();
+                                    finish_commit.notified().await;
+                                    commit_finished.store(true, Ordering::SeqCst);
+                                    Ok(())
+                                })
+                                .await
+                        },
+                    )
                     .await
             }
         });
@@ -1342,17 +1469,22 @@ mod tests {
             let commit_finished = Arc::clone(&commit_finished);
             async move {
                 runtime
-                    .run_foreground(OperationOptions::default(), move |mut context| async move {
-                        context
-                            .commit(move |commit_start| async move {
-                                commit_start.begin()?;
-                                commit_started.notify_one();
-                                finish_commit.notified().await;
-                                commit_finished.notify_one();
-                                Ok(())
-                            })
-                            .await
-                    })
+                    .run_foreground(
+                        Operation::Get,
+                        None,
+                        OperationOptions::default(),
+                        move |mut context| async move {
+                            context
+                                .commit(move |commit_start| async move {
+                                    commit_start.begin()?;
+                                    commit_started.notify_one();
+                                    finish_commit.notified().await;
+                                    commit_finished.notify_one();
+                                    Ok(())
+                                })
+                                .await
+                        },
+                    )
                     .await
             }
         });
@@ -1388,11 +1520,16 @@ mod tests {
             let finish_operation = Arc::clone(&finish_operation);
             async move {
                 runtime
-                    .run_foreground(OperationOptions::default(), move |_context| async move {
-                        operation_started.notify_one();
-                        finish_operation.notified().await;
-                        Ok(7_u8)
-                    })
+                    .run_foreground(
+                        Operation::Get,
+                        None,
+                        OperationOptions::default(),
+                        move |_context| async move {
+                            operation_started.notify_one();
+                            finish_operation.notified().await;
+                            Ok(7_u8)
+                        },
+                    )
                     .await
             }
         });
@@ -1403,10 +1540,15 @@ mod tests {
             let queued_started = Arc::clone(&queued_started);
             async move {
                 runtime
-                    .run_foreground(OperationOptions::default(), move |_context| async move {
-                        queued_started.store(true, Ordering::SeqCst);
-                        Ok(())
-                    })
+                    .run_foreground(
+                        Operation::Get,
+                        None,
+                        OperationOptions::default(),
+                        move |_context| async move {
+                            queued_started.store(true, Ordering::SeqCst);
+                            Ok(())
+                        },
+                    )
                     .await
             }
         });
@@ -1430,7 +1572,12 @@ mod tests {
         assert!(!queued_started.load(Ordering::SeqCst));
 
         let error = runtime
-            .run_foreground(OperationOptions::default(), |_context| async { Ok(()) })
+            .run_foreground(
+                Operation::Get,
+                None,
+                OperationOptions::default(),
+                |_context| async { Ok(()) },
+            )
             .await
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::RuntimeClosed);
@@ -1481,11 +1628,16 @@ mod tests {
             let finish_operation = Arc::clone(&finish_operation);
             async move {
                 runtime
-                    .run_foreground(OperationOptions::default(), move |_context| async move {
-                        operation_started.notify_one();
-                        finish_operation.notified().await;
-                        Ok(())
-                    })
+                    .run_foreground(
+                        Operation::Get,
+                        None,
+                        OperationOptions::default(),
+                        move |_context| async move {
+                            operation_started.notify_one();
+                            finish_operation.notified().await;
+                            Ok(())
+                        },
+                    )
                     .await
             }
         });

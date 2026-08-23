@@ -1,9 +1,12 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use ktann::api::{Error, ErrorKind, Result};
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+
+use crate::observe;
 
 const COMMAND_CAPACITY: usize = 1;
 
@@ -45,14 +48,17 @@ impl BlockingAdmission {
     {
         Handle::try_current()
             .map_err(|source| Error::with_source(ErrorKind::InvalidArgument, source))?;
+        let wait_started = Instant::now();
         let permit = Arc::clone(&self.state.permits)
             .acquire_owned()
             .await
             .map_err(|source| Error::with_source(ErrorKind::Backend, source))?;
+        observe::blocking_wait(wait_started.elapsed());
         self.state.active.fetch_add(1, Ordering::AcqRel);
         let permit = ActivePermit {
             _permit: permit,
             state: Arc::clone(&self.state),
+            admitted_at: Instant::now(),
         };
         let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
         let (ready, opened) = oneshot::channel();
@@ -82,10 +88,12 @@ impl BlockingAdmission {
 struct ActivePermit {
     _permit: OwnedSemaphorePermit,
     state: Arc<AdmissionState>,
+    admitted_at: Instant,
 }
 
 impl Drop for ActivePermit {
     fn drop(&mut self) {
+        observe::blocking_held(self.admitted_at.elapsed());
         if self.state.active.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.state.idle.notify_one();
         }

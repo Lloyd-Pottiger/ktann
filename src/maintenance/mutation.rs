@@ -45,6 +45,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::api::{Error, ErrorKind, Mutation, MutationOutcome, PartitionKey, Record, Result};
+use crate::observe::labels::Operation;
 use crate::runtime::lifecycle::{RetryPolicy, now_unix_millis};
 use crate::runtime::{OperationContext, writes};
 use crate::search::numeric::VectorKernel;
@@ -85,6 +86,7 @@ pub(crate) async fn mutate<B: Backend>(
     handle_manifest: &IndexManifest,
     mutations: &[Mutation],
     retry: RetryPolicy,
+    operation: Operation,
 ) -> Result<MutationReport> {
     let kernel = routing::kernel_for(handle_manifest)?;
     let prepared = prepare_all(handle_manifest, &kernel, mutations)?;
@@ -96,6 +98,7 @@ pub(crate) async fn mutate<B: Backend>(
             Some(&mut *context),
             handle_manifest,
             &retry,
+            operation,
             |txn| writes::boxed_step(apply_all(txn, &kernel, mutations, &prepared)),
         )
         .await?;
@@ -106,7 +109,9 @@ pub(crate) async fn mutate<B: Backend>(
             // retries from a fresh snapshot under the bounded policy, and
             // exhaustion returns ContentionExhausted (ADR 0008).
             ApplyOutcome::NoReadyMergeTarget => {
-                retry.wait_or_exhaust(&mut failed_attempts).await?;
+                retry
+                    .wait_or_exhaust(operation, &mut failed_attempts)
+                    .await?;
             }
         }
     }

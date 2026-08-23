@@ -31,6 +31,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::api::{Error, ErrorKind, LogicalIndexId, PartitionKey, Result, Value};
+use crate::observe::labels::{CacheInstallResult, CacheLookupResult};
+use crate::observe::metrics;
 use crate::storage::backend::{ReadOps, ScanLimits};
 use crate::storage::keys::{LogicalKey, TreeKey};
 use crate::storage::values::{
@@ -224,15 +226,28 @@ impl PartitionCache {
         let stale = match inner.slots.get_mut(key) {
             Some(slot) if slot.body.epoch == epoch => {
                 slot.frequency = (slot.frequency + 1).min(MAX_FREQUENCY);
-                return Some(Arc::clone(&slot.body));
+                let body = Arc::clone(&slot.body);
+                drop(inner);
+                metrics::cache_lookup(key.kind, CacheLookupResult::Hit);
+                return Some(body);
             }
             Some(slot) => slot.body.epoch < epoch,
             None => false,
         };
         let evicted = if stale { inner.remove(key) } else { None };
+        let remaining_bytes = inner.small_bytes + inner.main_bytes;
         drop(inner);
         // Drop the evicted body outside the lock.
         drop(evicted);
+        let result = if stale {
+            CacheLookupResult::StaleMiss
+        } else {
+            CacheLookupResult::Miss
+        };
+        metrics::cache_lookup(key.kind, result);
+        if stale {
+            metrics::cache_bytes(remaining_bytes);
+        }
         None
     }
 
@@ -243,15 +258,20 @@ impl PartitionCache {
     /// newer epoch replaces it. Installation evicts until the cache is within
     /// its byte capacity.
     pub(crate) fn install(&self, key: CacheKey, body: Arc<CachedBody>) {
+        let kind = key.kind;
         if body.bytes > self.capacity_bytes {
+            metrics::cache_install(kind, CacheInstallResult::SkippedOversized);
             return;
         }
         let small_capacity_bytes = self.capacity_bytes / SMALL_QUEUE_DIVISOR;
         let mut evicted = Vec::new();
+        let total_bytes;
         {
             let mut inner = self.lock();
             if let Some(existing) = inner.slots.get(&key) {
                 if existing.body.epoch > body.epoch {
+                    drop(inner);
+                    metrics::cache_install(kind, CacheInstallResult::SkippedStale);
                     return;
                 }
                 evicted.extend(inner.remove(&key));
@@ -259,9 +279,12 @@ impl PartitionCache {
             inner.insert(key, body, small_capacity_bytes);
             inner.evict_within_capacity(self.capacity_bytes, small_capacity_bytes, &mut evicted);
             inner.compact_queues();
+            total_bytes = inner.small_bytes + inner.main_bytes;
         }
         // Drop evicted bodies outside the lock.
         drop(evicted);
+        metrics::cache_install(kind, CacheInstallResult::Installed);
+        metrics::cache_bytes(total_bytes);
     }
 
     /// Returns the number of cached bodies.

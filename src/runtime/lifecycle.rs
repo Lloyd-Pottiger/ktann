@@ -14,6 +14,8 @@ use std::time::Duration;
 use xxhash_rust::xxh3::{xxh3_64, xxh3_128_with_seed};
 
 use crate::api::{Error, ErrorKind, IndexConfig, IndexName, LogicalIndexId, Result, RuntimeConfig};
+use crate::observe::labels::Operation;
+use crate::observe::{metrics, trace};
 use crate::storage::backend::{Backend, Capabilities, ScanLimits, WriteTxn};
 use crate::storage::keys::LogicalKey;
 use crate::storage::values::{
@@ -82,7 +84,7 @@ impl RetryPolicy {
     }
 
     /// Waits the jittered backoff interval for one failed attempt.
-    pub async fn wait(self, failed_attempts: u32) {
+    pub(crate) async fn wait(self, failed_attempts: u32) {
         let interval = self.interval(failed_attempts);
         if !interval.is_zero() {
             // Full jitter in the current interval. The process-local sequence is
@@ -97,13 +99,20 @@ impl RetryPolicy {
         }
     }
 
-    /// The shared tail of every whole-retry loop: waits out one failed
-    /// attempt under the bounded policy, or returns `ContentionExhausted`
-    /// when one more failure would exhaust it.
-    pub async fn wait_or_exhaust(self, failed_attempts: &mut u32) -> Result<()> {
+    /// The shared tail of every whole-retry loop: observes the retry, waits
+    /// out one failed attempt under the bounded policy, or returns
+    /// `ContentionExhausted` when one more failure would exhaust it. The retry
+    /// is observed only when it actually proceeds.
+    pub(crate) async fn wait_or_exhaust(
+        self,
+        operation: Operation,
+        failed_attempts: &mut u32,
+    ) -> Result<()> {
         if self.would_exhaust(*failed_attempts) {
             return Err(Error::new(ErrorKind::ContentionExhausted));
         }
+        metrics::write_retried(operation);
+        trace::write_retrying(operation, failed_attempts.saturating_add(1));
         self.wait(*failed_attempts).await;
         *failed_attempts += 1;
         Ok(())
@@ -196,7 +205,9 @@ pub(crate) async fn create_index<B: Backend>(
         match context.commit(move |start| txn.commit_with(start)).await {
             Ok(()) => return Ok(manifest),
             Err(error) if error.kind() == ErrorKind::RetryableAbort => {
-                retry.wait_or_exhaust(&mut failed_attempts).await?;
+                retry
+                    .wait_or_exhaust(Operation::CreateIndex, &mut failed_attempts)
+                    .await?;
             }
             Err(error) if error.kind() == ErrorKind::CommitOutcomeUnknown => {
                 return recover_create(backend.as_ref(), &name, &config).await;
@@ -306,7 +317,9 @@ pub(crate) async fn drop_index<B: Backend>(
                         continue;
                     }
                     CommitStep::RetryableAbort => {
-                        retry.wait_or_exhaust(&mut failed_attempts).await?;
+                        retry
+                            .wait_or_exhaust(Operation::DropIndex, &mut failed_attempts)
+                            .await?;
                         continue;
                     }
                     CommitStep::Unknown => {
@@ -358,7 +371,9 @@ pub(crate) async fn drop_index<B: Backend>(
                     cursor = next;
                 }
                 CommitStep::RetryableAbort => {
-                    retry.wait_or_exhaust(&mut failed_attempts).await?;
+                    retry
+                        .wait_or_exhaust(Operation::DropIndex, &mut failed_attempts)
+                        .await?;
                 }
                 CommitStep::Unknown => {
                     cursor = None;
@@ -611,12 +626,12 @@ mod tests {
         let retry = policy(2, Duration::from_millis(1), Duration::from_millis(1));
         let mut failed_attempts = 0_u32;
         retry
-            .wait_or_exhaust(&mut failed_attempts)
+            .wait_or_exhaust(Operation::Insert, &mut failed_attempts)
             .await
             .expect("first failure waits");
         assert_eq!(failed_attempts, 1);
         let error = retry
-            .wait_or_exhaust(&mut failed_attempts)
+            .wait_or_exhaust(Operation::Insert, &mut failed_attempts)
             .await
             .expect_err("the attempt limit is reached");
         assert_eq!(error.kind(), ErrorKind::ContentionExhausted);

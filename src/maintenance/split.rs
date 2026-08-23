@@ -37,6 +37,8 @@
 //!   searchable state.
 
 use crate::api::{Error, ErrorKind, PartitionKey, Result};
+use crate::observe::labels::{FixupKind, Operation};
+use crate::observe::metrics;
 use crate::runtime::RetryPolicy;
 use crate::runtime::{reads, writes};
 use crate::storage::backend::{Backend, WriteTxn};
@@ -129,14 +131,21 @@ pub async fn begin_split<B: Backend>(
     started_at_unix_millis: u64,
     retry: &RetryPolicy,
 ) -> Result<topology::SplitStart> {
-    writes::run_write_attempts(backend, None, manifest, retry, |txn| {
-        writes::boxed_step(topology::begin_split(
-            txn,
-            tree_key,
-            source,
-            started_at_unix_millis,
-        ))
-    })
+    writes::run_write_attempts(
+        backend,
+        None,
+        manifest,
+        retry,
+        Operation::SplitFixup,
+        |txn| {
+            writes::boxed_step(topology::begin_split(
+                txn,
+                tree_key,
+                source,
+                started_at_unix_millis,
+            ))
+        },
+    )
     .await
 }
 
@@ -189,22 +198,31 @@ pub async fn expose_targets<B: Backend>(
     for (target, centroid) in [(left, centroids.left()), (right, centroids.right())] {
         let mut failed_attempts = 0_u32;
         let install = loop {
-            let outcome = writes::run_write_attempts(backend, None, manifest, retry, |txn| {
-                writes::boxed_step(topology::create_split_target(
-                    txn,
-                    tree_key,
-                    source,
-                    target,
-                    centroid,
-                    started_at_unix_millis,
-                ))
-            })
+            let outcome = writes::run_write_attempts(
+                backend,
+                None,
+                manifest,
+                retry,
+                Operation::SplitFixup,
+                |txn| {
+                    writes::boxed_step(topology::create_split_target(
+                        txn,
+                        tree_key,
+                        source,
+                        target,
+                        centroid,
+                        started_at_unix_millis,
+                    ))
+                },
+            )
             .await?;
             match outcome {
                 // The parent rejected a new child: abandon and rediscover
                 // from a fresh snapshot under the same bounded policy.
                 topology::TargetInstall::ParentNotAccepting => {
-                    retry.wait_or_exhaust(&mut failed_attempts).await?;
+                    retry
+                        .wait_or_exhaust(Operation::SplitFixup, &mut failed_attempts)
+                        .await?;
                 }
                 other => break other,
             }
@@ -230,14 +248,21 @@ pub async fn advance_to_draining<B: Backend>(
     started_at_unix_millis: u64,
     retry: &RetryPolicy,
 ) -> Result<topology::DrainStart> {
-    writes::run_write_attempts(backend, None, manifest, retry, |txn| {
-        writes::boxed_step(topology::advance_to_draining(
-            txn,
-            tree_key,
-            source,
-            started_at_unix_millis,
-        ))
-    })
+    writes::run_write_attempts(
+        backend,
+        None,
+        manifest,
+        retry,
+        Operation::SplitFixup,
+        |txn| {
+            writes::boxed_step(topology::advance_to_draining(
+                txn,
+                tree_key,
+                source,
+                started_at_unix_millis,
+            ))
+        },
+    )
     .await
 }
 
@@ -291,9 +316,14 @@ pub async fn drain_batch<B: Backend>(
         left,
         right,
     };
-    writes::run_write_attempts(backend, None, manifest, retry, |txn| {
-        writes::boxed_step(drain_attempt(txn, manifest, tree_key, source, &plan))
-    })
+    writes::run_write_attempts(
+        backend,
+        None,
+        manifest,
+        retry,
+        Operation::SplitFixup,
+        |txn| writes::boxed_step(drain_attempt(txn, manifest, tree_key, source, &plan)),
+    )
     .await
 }
 
@@ -447,15 +477,22 @@ pub async fn complete_split<B: Backend>(
     retry: &RetryPolicy,
 ) -> Result<topology::SplitCompletion> {
     let removal = topology::SourceRemoval::for_capabilities(backend.capabilities());
-    writes::run_write_attempts(backend, None, manifest, retry, |txn| {
-        writes::boxed_step(topology::finalize_split(
-            txn,
-            tree_key,
-            source,
-            started_at_unix_millis,
-            removal,
-        ))
-    })
+    writes::run_write_attempts(
+        backend,
+        None,
+        manifest,
+        retry,
+        Operation::SplitFixup,
+        |txn| {
+            writes::boxed_step(topology::finalize_split(
+                txn,
+                tree_key,
+                source,
+                started_at_unix_millis,
+                removal,
+            ))
+        },
+    )
     .await
 }
 
@@ -487,6 +524,16 @@ pub async fn advance<B: Backend>(
     let Some((header, state)) = pair else {
         return Ok(Advance::Idle);
     };
+    if matches!(
+        state,
+        PartitionTransition::Splitting { .. } | PartitionTransition::DrainingSplit { .. }
+    ) {
+        metrics::fixup_state_age(
+            FixupKind::Split,
+            started_at_unix_millis,
+            state.started_at_unix_millis(),
+        );
+    }
 
     match state {
         PartitionTransition::Ready { .. } => {

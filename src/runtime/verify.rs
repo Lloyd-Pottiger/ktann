@@ -53,8 +53,9 @@ use crate::api::{
     DataType, LogicalIndexId, PartitionKey, Result, VerifyIssue, VerifyIssueKind,
     VerifyObjectCounts, VerifyOptions, VerifyReport,
 };
+use crate::observe::metrics;
 use crate::storage::backend::{Backend, ReadOps, ScanItem, ScanLimits};
-use crate::storage::keys::{self, KeyRange, LogicalKey, TreeKey};
+use crate::storage::keys::{self, KeyRange, LogicalKey, TreeKey, tree_key_hash};
 use crate::storage::topology::root_partition;
 use crate::storage::values::{IndexManifest, PersistentValue, ValueCodec};
 
@@ -69,10 +70,6 @@ use limits::Limits;
 use records::RecordLedger;
 use topology::{LeafEntryItem, TopologyLedger};
 
-/// Domain-separates the redacted Tree Key issue hash from every other hash.
-const TREE_KEY_HASH_DOMAIN: u64 = 0x4b54_414e_4e01_b1a0;
-/// The second pass domain deriving the upper 16 hash bytes.
-const TREE_KEY_HASH_SECOND_DOMAIN: u64 = 0x4b54_414e_4e01_b1a1;
 /// Domain-separates the Leaf Entry projection fingerprint.
 const ENTRY_FINGERPRINT_DOMAIN: u64 = 0x4b54_414e_4e01_b1a2;
 
@@ -97,7 +94,9 @@ pub(crate) async fn verify<B: Backend>(
     let mut cx = Context::new(manifest, &options);
     check_allocator(&mut cx, &mut raw).await?;
     scan_index(&mut cx, context, &mut raw).await?;
-    Ok(cx.finish())
+    let report = cx.finish();
+    metrics::verify_report(&report);
+    Ok(report)
 }
 
 /// The shared per-audit state: resource limits, the issue sink, and the
@@ -221,19 +220,6 @@ impl<'m> Context<'m> {
             objects: self.counts,
         }
     }
-}
-
-/// The stable redacted Tree Key hash attached to issues (ADR 0019).
-pub(super) fn tree_key_hash(tree_key: &TreeKey) -> [u8; 32] {
-    let first = xxh3_128_with_seed(tree_key.as_bytes(), TREE_KEY_HASH_DOMAIN);
-    let second = xxh3_128_with_seed(
-        &first.to_le_bytes(),
-        TREE_KEY_HASH_SECOND_DOMAIN ^ (first as u64),
-    );
-    let mut hash = [0; 32];
-    hash[..16].copy_from_slice(&first.to_le_bytes());
-    hash[16..].copy_from_slice(&second.to_le_bytes());
-    hash
 }
 
 /// The canonical Leaf Entry projection fingerprint compared across the

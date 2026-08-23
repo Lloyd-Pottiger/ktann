@@ -12,6 +12,8 @@ use ktann::storage::backend::{
 };
 use ktann::storage::keys::KeyRange;
 
+use crate::observe;
+
 const FDB_MAX_KEY_BYTES: usize = 10_000;
 const FDB_MAX_VALUE_BYTES: usize = 100_000;
 const DEFAULT_MAX_MUTATIONS: usize = 10_000;
@@ -376,11 +378,14 @@ impl WriteTxn for FoundationDbWriteTxn<'_> {
 
     async fn commit_with(self, start: CommitStart) -> Result<()> {
         start.begin()?;
-        self.transaction
+        let result = self
+            .transaction
             .commit()
             .await
             .map(|_| ())
-            .map_err(|error| map_commit_error(error.into()))
+            .map_err(|error| map_commit_error(error.into()));
+        observe::commit(observe::CommitOutcome::from_result(&result));
+        result
     }
 
     async fn rollback(self) {}

@@ -6,7 +6,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use crate::maintenance::mutation;
-use crate::runtime::RuntimeInner;
+use crate::observe::labels::Operation;
+use crate::runtime::{OperationContext, RuntimeInner};
 use crate::runtime::{lifecycle, reads, search, verify};
 use crate::storage::backend::Backend;
 use crate::storage::values::{IndexLifecycle, IndexManifest};
@@ -87,7 +88,9 @@ impl<B: Backend> Index<B> {
     ) -> Result<()> {
         let mut mutations = vec![Mutation::Insert(record)];
         self.validate(&mut mutations)?;
-        let outcomes = self.run_mutations(mutations, operation_options).await?;
+        let outcomes = self
+            .run_mutations(Operation::Insert, mutations, operation_options)
+            .await?;
         match outcomes.first() {
             Some(MutationOutcome::Inserted) => Ok(()),
             _ => Err(Error::new(ErrorKind::Backend)),
@@ -116,7 +119,9 @@ impl<B: Backend> Index<B> {
     ) -> Result<UpsertResult> {
         let mut mutations = vec![Mutation::Upsert(record)];
         self.validate(&mut mutations)?;
-        let outcomes = self.run_mutations(mutations, operation_options).await?;
+        let outcomes = self
+            .run_mutations(Operation::Upsert, mutations, operation_options)
+            .await?;
         match outcomes.first() {
             Some(MutationOutcome::Upserted { replaced: true }) => Ok(UpsertResult::Replaced),
             Some(MutationOutcome::Upserted { replaced: false }) => Ok(UpsertResult::Created),
@@ -143,7 +148,9 @@ impl<B: Backend> Index<B> {
     ) -> Result<bool> {
         let mut mutations = vec![Mutation::Delete(id)];
         self.validate(&mut mutations)?;
-        let outcomes = self.run_mutations(mutations, operation_options).await?;
+        let outcomes = self
+            .run_mutations(Operation::Delete, mutations, operation_options)
+            .await?;
         match outcomes.first() {
             Some(MutationOutcome::Deleted { existed }) => Ok(*existed),
             _ => Err(Error::new(ErrorKind::Backend)),
@@ -174,7 +181,8 @@ impl<B: Backend> Index<B> {
         if mutations.is_empty() {
             return Ok(Vec::new());
         }
-        self.run_mutations(mutations, operation_options).await
+        self.run_mutations(Operation::BatchMutate, mutations, operation_options)
+            .await
     }
 
     /// Opens a bounded Import Session on this index.
@@ -238,10 +246,13 @@ impl<B: Backend> Index<B> {
         let manifest = Arc::clone(&self.manifest);
         let cache = self.runtime.partition_cache();
         let (outcome, maintenance) = self
-            .runtime
-            .run_foreground(operation_options, move |mut context| async move {
-                search::search(&mut context, &cache, &manifest, prepared).await
-            })
+            .run_foreground(
+                Operation::Search,
+                operation_options,
+                move |mut context| async move {
+                    search::search(&mut context, &cache, &manifest, prepared).await
+                },
+            )
             .await?;
         // The search is the relevant access that rediscovers cold split and
         // merge states; offering them is best-effort and loss-safe.
@@ -280,11 +291,12 @@ impl<B: Backend> Index<B> {
         options.validate()?;
         let manifest = Arc::clone(&self.manifest);
         let operation_options = options.operation_options().clone();
-        self.runtime
-            .run_foreground(operation_options, move |mut context| async move {
-                verify::verify(&mut context, &manifest, options).await
-            })
-            .await
+        self.run_foreground(
+            Operation::Verify,
+            operation_options,
+            move |mut context| async move { verify::verify(&mut context, &manifest, options).await },
+        )
+        .await
     }
 
     /// Validates one mutation batch against this index's immutable
@@ -299,6 +311,24 @@ impl<B: Backend> Index<B> {
         &self.runtime
     }
 
+    /// Runs one foreground operation observed under this index's identity.
+    pub(crate) async fn run_foreground<T, F, Fut>(
+        &self,
+        operation: Operation,
+        options: OperationOptions,
+        work: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(OperationContext<B>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T>> + Send + 'static,
+    {
+        let index = Some(self.manifest.logical_index_id());
+        self.runtime
+            .run_foreground(operation, index, options, work)
+            .await
+    }
+
     /// Runs one validated mutation batch under foreground admission.
     ///
     /// A committed batch's maintenance discoveries — split candidates,
@@ -307,16 +337,20 @@ impl<B: Backend> Index<B> {
     /// affects correctness.
     pub(crate) async fn run_mutations(
         &self,
+        operation: Operation,
         mutations: Vec<Mutation>,
         operation_options: OperationOptions,
     ) -> Result<Vec<MutationOutcome>> {
         let retry = lifecycle::RetryPolicy::from_config(self.runtime.config());
         let manifest = Arc::clone(&self.manifest);
         let report = self
-            .runtime
-            .run_foreground(operation_options, move |mut context| async move {
-                mutation::mutate(&mut context, &manifest, &mutations, retry).await
-            })
+            .run_foreground(
+                operation,
+                operation_options,
+                move |mut context| async move {
+                    mutation::mutate(&mut context, &manifest, &mutations, retry, operation).await
+                },
+            )
             .await?;
         if !report.maintenance.is_empty() {
             self.runtime
@@ -349,11 +383,14 @@ impl<B: Backend> Index<B> {
     ) -> Result<Option<StoredRecord>> {
         validate_id(&id)?;
         let manifest = Arc::clone(&self.manifest);
-        self.runtime
-            .run_foreground(operation_options, move |mut context| async move {
+        self.run_foreground(
+            Operation::Get,
+            operation_options,
+            move |mut context| async move {
                 reads::get_record(&mut context, &manifest, id, options.includes_payload()).await
-            })
-            .await
+            },
+        )
+        .await
     }
 
     /// Reads Vector Records by Record ID in one bounded batch.
@@ -385,12 +422,15 @@ impl<B: Backend> Index<B> {
             return Ok(Vec::new());
         }
         let manifest = Arc::clone(&self.manifest);
-        self.runtime
-            .run_foreground(operation_options, move |mut context| async move {
+        self.run_foreground(
+            Operation::BatchGet,
+            operation_options,
+            move |mut context| async move {
                 reads::batch_get_records(&mut context, &manifest, ids, options.includes_payload())
                     .await
-            })
-            .await
+            },
+        )
+        .await
     }
 }
 

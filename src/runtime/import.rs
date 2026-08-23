@@ -31,6 +31,7 @@
 //! gate exactly like it bypasses the in-flight slot.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
@@ -39,6 +40,8 @@ use crate::api::{
     BatchToken, Error, ErrorKind, ImportBatchResult, Index, Mutation, MutationOutcome,
     OperationOptions, Result,
 };
+use crate::observe::labels::{ImportGate, Operation};
+use crate::observe::metrics;
 use crate::storage::backend::Backend;
 
 /// Coordinates bounded batch admission for one Import Session.
@@ -95,21 +98,29 @@ impl<B: Backend> ImportCoordinator<B> {
             self.batches.push((token, task));
             return Ok(token);
         }
+        let slot_wait = Instant::now();
         let slot = self
             .slots
             .clone()
             .acquire_owned()
             .await
             .expect("the session slot semaphore is never closed");
+        metrics::import_wait(ImportGate::InFlightSlot, slot_wait.elapsed());
         if !runtime.is_accepting() {
             return Err(Error::new(ErrorKind::RuntimeClosed));
         }
+        let backlog_wait = Instant::now();
         runtime.wait_for_backlog_below().await?;
+        metrics::import_wait(ImportGate::Backlog, backlog_wait.elapsed());
         let token = self.issue_token()?;
         let index = self.index.clone();
         let task = runtime.executor.spawn(async move {
             let result = index
-                .run_mutations(mutations, OperationOptions::default())
+                .run_mutations(
+                    Operation::BatchMutate,
+                    mutations,
+                    OperationOptions::default(),
+                )
                 .await;
             drop(slot);
             result

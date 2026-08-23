@@ -73,6 +73,7 @@ async fn foundationdb_verify_completes_within_one_snapshot() {
         backend,
         RuntimeConfig::default()
             .with_maintenance(0, 1)
+            .and_then(|config| config.with_import_limits(1, 1))
             .expect("valid maintenance config"),
     )
     .expect("runtime");

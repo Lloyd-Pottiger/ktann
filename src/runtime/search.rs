@@ -19,6 +19,7 @@ use crate::api::{
     Error, ErrorKind, PartitionKey, Result, SearchBudgetExhaustion, SearchBudgetUsage,
     SearchBudgets, SearchOutcome, SearchRequest,
 };
+use crate::observe::metrics;
 use crate::search::cache::PartitionCache;
 use crate::search::numeric::VectorKernel;
 use crate::search::plan::{TreeKeyPlan, enumerate_tree_keys, plan_tree_keys};
@@ -209,5 +210,6 @@ pub(crate) async fn search<B: Backend>(
         },
         rabitq_overlap_truncated,
     };
+    metrics::search_budget(&outcome.usage, &outcome.exhausted);
     Ok((outcome, maintenance))
 }
