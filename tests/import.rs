@@ -25,12 +25,22 @@ use support::{
 #[allow(dead_code)]
 mod support;
 
+/// A generous bound on every wait in these tests: a missed wakeup or a lost
+/// Fixup offer must fail the test in seconds, never hang a CI job for hours
+/// (issue #109).
+const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Holds chosen commits before their commit boundary until released.
 ///
 /// The wait runs before [`CommitStart::begin`], so a held commit has not
 /// crossed the Runtime's cancellation boundary and remains cancellable. Held
 /// commits are released in entry order: [`CommitGate::release_one`] frees
 /// exactly the earliest entered commit, [`CommitGate::release`] frees all.
+///
+/// Both waits are bounded by [`WAIT_TIMEOUT`]: a commit that is never
+/// released, or an entry that never happens — for example because the Fixup
+/// offer that should have triggered it was lost — panics instead of spinning
+/// forever.
 #[derive(Default)]
 struct CommitGate {
     block_next: AtomicUsize,
@@ -55,15 +65,25 @@ impl CommitGate {
             return;
         }
         let position = self.entered.fetch_add(1, Ordering::SeqCst);
-        while self.released.load(Ordering::SeqCst) <= position {
-            tokio::task::yield_now().await;
-        }
+        let released = async {
+            while self.released.load(Ordering::SeqCst) <= position {
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::time::timeout(WAIT_TIMEOUT, released)
+            .await
+            .expect("a held commit was not released in time");
     }
 
     async fn wait_until_entered(&self, commits: usize) {
-        while self.entered.load(Ordering::SeqCst) < commits {
-            tokio::task::yield_now().await;
-        }
+        let entered = async {
+            while self.entered.load(Ordering::SeqCst) < commits {
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::time::timeout(WAIT_TIMEOUT, entered)
+            .await
+            .expect("the expected commits never entered the gate");
     }
 
     /// Releases every held commit.
@@ -265,6 +285,7 @@ fn import_options(in_flight: usize) -> ImportOptions {
 }
 
 async fn wait_until_present(index: &Index<GatedBackend>, id: &[u8]) {
+    let deadline = Instant::now() + WAIT_TIMEOUT;
     loop {
         let visible = index
             .get(Bytes::copy_from_slice(id), GetOptions::default())
@@ -274,6 +295,7 @@ async fn wait_until_present(index: &Index<GatedBackend>, id: &[u8]) {
         if visible {
             break;
         }
+        assert!(Instant::now() < deadline, "the record never became visible");
         tokio::task::yield_now().await;
     }
 }
@@ -734,10 +756,53 @@ fn gate_index_config() -> IndexConfig {
         .expect("valid partition entries")
 }
 
+/// Runs one search purely as the relevant access that rediscovers
+/// maintenance: visiting an over-threshold `Ready` partition or an in-flight
+/// split re-offers it to the bounded Fixup queue (Demand-Driven Maintenance,
+/// ADR 0006). The search outcome itself is irrelevant here.
+async fn reoffer_maintenance(index: &Index<GatedBackend>) {
+    let request = SearchRequest::new(Arc::from([0.0_f32, 0.0]), 1).expect("valid request");
+    let _ = index.search(request).await;
+}
+
+/// Returns once no Fixup execution is pending or running: an import batch
+/// admits only after the backlog drops below the watermark, and this batch
+/// upserts into an otherwise empty tree, so its own commit offers nothing.
+/// Once it commits, the queue is empty and the single worker is idle, so
+/// every execution afterwards is triggered by the test's own later accesses,
+/// in an order the test controls.
+async fn await_worker_quiescence(index: &Index<GatedBackend>) {
+    let probe = async {
+        let mut session = index
+            .import_session(import_options(1))
+            .expect("probe session");
+        session
+            .submit(vec![Mutation::Upsert(record(&rid(200), 0.0, 2))])
+            .await
+            .expect("probe submit");
+        let results = session.finish().await;
+        assert_eq!(results.len(), 1, "the probe batch commits");
+    };
+    tokio::time::timeout(WAIT_TIMEOUT, probe)
+        .await
+        .expect("the maintenance backlog drains in time");
+}
+
 /// Seeds a cold `Splitting` partition: five records under one Tree Key exceed
-/// the leaf maximum, and the single-step worker begins the split and retires,
+/// the leaf maximum, so the single-step worker begins the split and retires,
 /// leaving the searchable intermediate state for a later relevant access to
-/// rediscover. Returns with the queue empty and the gate open.
+/// rediscover. Returns with the split begun and no Fixup execution running.
+///
+/// The fifth insert's own offer can be lost: it coalesces while the previous
+/// insert's execution is still running, and that execution rediscovers a
+/// leaf that is not over threshold yet, settling without beginning the split
+/// (issue #109). Each poll iteration therefore re-offers through a real
+/// search — the relevant access the demand-driven contract expects to
+/// rediscover lost offers. The quiescence probe runs *before* the scan, so a
+/// re-offer is only ever made against a quiet queue whose durable state the
+/// scan just observed: it begins the split from the over-threshold `Ready`
+/// leaf and can never race a begin commit into driving the step past
+/// `Splitting`.
 async fn seed_cold_splitting(backend: &GatedBackend, index: &Index<GatedBackend>) {
     for value in 1..=5_u8 {
         index
@@ -745,8 +810,9 @@ async fn seed_cold_splitting(backend: &GatedBackend, index: &Index<GatedBackend>
             .await
             .expect("seed insert");
     }
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + WAIT_TIMEOUT;
     loop {
+        await_worker_quiescence(index).await;
         let splitting = audit::list_partitions(backend, index.logical_index_id())
             .await
             .expect("list partitions")
@@ -756,21 +822,34 @@ async fn seed_cold_splitting(backend: &GatedBackend, index: &Index<GatedBackend>
             return;
         }
         assert!(Instant::now() < deadline, "the split did not begin");
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        reoffer_maintenance(index).await;
     }
 }
 
-/// Closes the backlog gate deterministically: a search rediscovers the cold
-/// `Splitting` partition and re-offers it, and the worker's next step commit
-/// is held by `gate`, keeping one Fixup running — a backlog of one, exactly at
-/// the watermark. `entered` is the expected held-commit count, including any
+/// Closes the backlog gate deterministically: searches rediscover the cold
+/// in-flight split and re-offer it, and the worker's next step commit is held
+/// by `gate`, keeping one Fixup running — a backlog of one, exactly at the
+/// watermark. `entered` is the expected held-commit count, including any
 /// commits already held. The gate stays closed until `gate` releases the
 /// commit.
+///
+/// A single search's offer can be lost — coalesced into a running execution
+/// whose step budget is already spent, leaving nothing queued (issue #109) —
+/// so the loop re-offers until the worker's commit is actually held.
 async fn hold_gate_closed(gate: &CommitGate, index: &Index<GatedBackend>, entered: usize) {
     gate.hold_next(1);
-    let request = SearchRequest::new(Arc::from([0.0_f32, 0.0]), 1).expect("valid request");
-    let _ = index.search(request).await;
-    gate.wait_until_entered(entered).await;
+    let deadline = Instant::now() + WAIT_TIMEOUT;
+    loop {
+        reoffer_maintenance(index).await;
+        if gate.entered.load(Ordering::SeqCst) >= entered {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the worker's step commit never reached the gate"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 /// Asserts the pinned submit stays pending across many executor turns.
@@ -814,7 +893,7 @@ async fn backlog_gate_blocks_and_releases_submit() {
 
         // Draining the backlog below the watermark admits the waiting batch.
         gate.release();
-        tokio::time::timeout(Duration::from_secs(30), submit.as_mut())
+        tokio::time::timeout(WAIT_TIMEOUT, submit.as_mut())
             .await
             .expect("the gate opens once the backlog drains")
             .expect("submit succeeds")
@@ -877,7 +956,7 @@ async fn backlog_gate_composes_with_in_flight_bound() {
         // Releasing the worker's held step drains the backlog below the
         // watermark; with both bounds open the waiting batch admits and commits.
         gate.release_one();
-        tokio::time::timeout(Duration::from_secs(30), submit2.as_mut())
+        tokio::time::timeout(WAIT_TIMEOUT, submit2.as_mut())
             .await
             .expect("the gate opens once the backlog drains")
             .expect("submit 2 succeeds")
