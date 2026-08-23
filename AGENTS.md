@@ -166,7 +166,9 @@ must not require nightly features.
   the step trace and a replay command; reproduce a seed with
   `KTANN_MODEL_SEED=<seed> cargo test --test model_history model_history_replay`
   (optionally `KTANN_MODEL_STEPS=<n>`), and run the expanded deterministic
-  profile (24 seeds × 400 steps) with `KTANN_MODEL_PROFILE=expanded`.
+  profile (24 seeds × 400 steps) with `KTANN_MODEL_PROFILE=expanded`. The
+  nightly workflow (`.github/workflows/nightly.yml`) runs the expanded profile
+  daily and on manual dispatch.
 - API-level recall parity on the production adapters lives in
   `ktann-rocksdb/tests/rocksdb_recall.rs` (embedded, runs in CI) and
   `ktann-foundationdb/tests/foundationdb_recall.rs` (requires a local

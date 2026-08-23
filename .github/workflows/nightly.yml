@@ -1,0 +1,28 @@
+name: Nightly
+
+on:
+  schedule:
+    # Daily at 03:47 UTC (off the :00/:30 herd marks).
+    - cron: "47 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  expanded-model-history:
+    name: Expanded model-history profile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the expanded deterministic profile
+        # 24 seeds x 400 steps of crash/fault/model histories; see
+        # tests/model_history.rs and the AGENTS.md Testing section.
+        run: KTANN_MODEL_PROFILE=expanded cargo test --test model_history -- --nocapture
