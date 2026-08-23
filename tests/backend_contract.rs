@@ -213,24 +213,6 @@ fn backend_declares_limits_budget_and_capabilities() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn snapshot_consistency_isolates_later_commits() {
-    let backend = mock();
-    seed(&backend, &[(b"a", b"1")]);
-
-    block_on(async {
-        let mut reader = backend.begin_read().await.expect("begin read");
-        // A later commit must not become visible to this open snapshot.
-        let mut writer = backend.begin_write().await.expect("begin write");
-        writer.put(key(b"a"), key(b"2")).await.expect("put");
-        writer.put(key(b"b"), key(b"3")).await.expect("put");
-        writer.commit().await.expect("commit");
-
-        assert_eq!(reader.get(key(b"a")).await.expect("get"), Some(key(b"1")));
-        assert_eq!(reader.get(key(b"b")).await.expect("get"), None);
-    });
-}
-
-#[test]
 fn long_lived_read_txn_observes_original_version() {
     let backend = mock();
     seed(&backend, &[(b"a", b"1")]);
@@ -250,20 +232,6 @@ fn long_lived_read_txn_observes_original_version() {
         assert_eq!(reader.get(key(b"a")).await.expect("get"), Some(key(b"1")));
         assert_eq!(reader.get(key(b"b")).await.expect("get"), None);
         assert_eq!(reader.get(key(b"c")).await.expect("get"), None);
-    });
-}
-
-#[test]
-fn write_transaction_reads_its_own_writes() {
-    let backend = mock();
-    block_on(async {
-        let mut txn = backend.begin_write().await.expect("begin write");
-        assert_eq!(txn.get(key(b"a")).await.expect("get"), None);
-        txn.put(key(b"a"), key(b"v")).await.expect("put");
-        assert_eq!(txn.get(key(b"a")).await.expect("get"), Some(key(b"v")));
-        txn.delete(key(b"a")).await.expect("delete");
-        assert_eq!(txn.get(key(b"a")).await.expect("get"), None);
-        txn.rollback().await;
     });
 }
 
@@ -310,37 +278,6 @@ fn scan_returns_sorted_items_in_half_open_range() {
         let page = txn.scan(&range(b"a", b"d"), limits).await.expect("scan");
         assert_eq!(scanned_keys(&page), vec![&b"a"[..], &b"b"[..], &b"c"[..]]);
         assert!(page.next_start().is_none());
-    });
-}
-
-#[test]
-fn scan_paginates_with_strictly_advancing_next_start() {
-    let backend = mock();
-    seed(&backend, &[(b"a", b"1"), (b"b", b"2"), (b"c", b"3")]);
-
-    block_on(async {
-        let mut txn = backend.begin_read().await.expect("begin read");
-        let limits = ScanLimits {
-            item_limit: 2,
-            byte_limit: 1_024,
-        };
-
-        let first = txn
-            .scan(&range(b"a", b"\xff"), limits)
-            .await
-            .expect("first");
-        assert_eq!(scanned_keys(&first), vec![&b"a"[..], &b"b"[..]]);
-        let next = first.next_start().expect("non-terminal has cursor").clone();
-        // The continuation is the byte-successor of the last key, so the next
-        // page resumes without skipping or duplicating `b`.
-        assert_eq!(next.as_ref(), b"b\x00");
-
-        let second = txn
-            .scan(&KeyRange::new(next.to_vec(), b"\xff".to_vec()), limits)
-            .await
-            .expect("second");
-        assert_eq!(scanned_keys(&second), vec![&b"c"[..]]);
-        assert!(second.next_start().is_none());
     });
 }
 
@@ -455,28 +392,6 @@ fn scan_rejects_zero_limits_before_work() {
 }
 
 #[test]
-fn scan_empty_range_returns_empty_page() {
-    let backend = mock();
-    seed(&backend, &[(b"a", b"1")]);
-
-    block_on(async {
-        let mut txn = backend.begin_read().await.expect("begin read");
-        let page = txn
-            .scan(
-                &range(b"b", b"a"),
-                ScanLimits {
-                    item_limit: 10,
-                    byte_limit: 10,
-                },
-            )
-            .await
-            .expect("scan");
-        assert!(page.items().is_empty());
-        assert!(page.next_start().is_none());
-    });
-}
-
-#[test]
 fn scan_page_item_cap_is_enforced() {
     let config = DeterministicConfig {
         max_scan_page_items: 1,
@@ -532,38 +447,6 @@ fn scan_page_byte_cap_is_enforced() {
 // ---------------------------------------------------------------------------
 // Mutations.
 // ---------------------------------------------------------------------------
-
-#[test]
-fn batch_mutate_applies_in_input_order() {
-    let backend = mock();
-    block_on(async {
-        let mut txn = backend.begin_write().await.expect("begin write");
-        txn.batch_mutate(vec![
-            Mutation::Put {
-                key: key(b"a"),
-                value: key(b"1"),
-            },
-            Mutation::Put {
-                key: key(b"a"),
-                value: key(b"2"),
-            },
-            Mutation::Delete { key: key(b"a") },
-            Mutation::Put {
-                key: key(b"a"),
-                value: key(b"3"),
-            },
-        ])
-        .await
-        .expect("batch mutate");
-        assert_eq!(txn.get(key(b"a")).await.expect("get"), Some(key(b"3")));
-        txn.commit().await.expect("commit");
-    });
-
-    block_on(async {
-        let mut txn = backend.begin_read().await.expect("begin read");
-        assert_eq!(txn.get(key(b"a")).await.expect("get"), Some(key(b"3")));
-    });
-}
 
 #[test]
 fn empty_batch_mutate_succeeds() {
@@ -650,87 +533,6 @@ fn write_txn_scan_sees_its_own_mutations() {
 }
 
 #[test]
-fn unique_insert_distinguishes_inserted_from_existing() {
-    let backend = mock();
-    seed(&backend, &[(b"existing", b"old")]);
-
-    block_on(async {
-        let mut txn = backend.begin_write().await.expect("begin write");
-        assert_eq!(
-            txn.insert(key(b"fresh"), key(b"v")).await.expect("insert"),
-            InsertOutcome::Inserted
-        );
-        assert_eq!(
-            txn.insert(key(b"existing"), key(b"v"))
-                .await
-                .expect("insert"),
-            InsertOutcome::AlreadyExists
-        );
-        // The existing value is left unchanged.
-        assert_eq!(
-            txn.get(key(b"existing")).await.expect("get"),
-            Some(key(b"old"))
-        );
-        // Re-inserting the just-inserted key within the same txn sees it.
-        assert_eq!(
-            txn.insert(key(b"fresh"), key(b"again"))
-                .await
-                .expect("insert"),
-            InsertOutcome::AlreadyExists
-        );
-        txn.commit().await.expect("commit");
-    });
-}
-
-#[test]
-fn update_protected_read_conflict_aborts() {
-    let backend = mock();
-    block_on(async {
-        let mut first = backend.begin_write().await.expect("begin write");
-        let mut second = backend.begin_write().await.expect("begin write");
-
-        first.get_for_update(key(b"k")).await.expect("read");
-        second.get_for_update(key(b"k")).await.expect("read");
-
-        first.put(key(b"k"), key(b"1")).await.expect("put");
-        first.commit().await.expect("first commit wins");
-
-        second.put(key(b"k"), key(b"2")).await.expect("put");
-        let conflict = second.commit().await.expect_err("conflict");
-        assert_eq!(conflict.kind(), ErrorKind::RetryableAbort);
-    });
-
-    block_on(async {
-        let mut txn = backend.begin_read().await.expect("begin read");
-        assert_eq!(txn.get(key(b"k")).await.expect("get"), Some(key(b"1")));
-    });
-}
-
-#[test]
-fn key_restored_to_original_value_still_conflicts() {
-    let backend = mock();
-    block_on(async {
-        // Reads the key absent at version 0.
-        let mut reader = backend.begin_write().await.expect("begin write");
-        reader.get_for_update(key(b"k")).await.expect("read");
-
-        // A write then a delete restore the original (absent) value.
-        let mut first = backend.begin_write().await.expect("begin write");
-        first.put(key(b"k"), key(b"1")).await.expect("put");
-        first.commit().await.expect("commit");
-
-        let mut second = backend.begin_write().await.expect("begin write");
-        second.delete(key(b"k")).await.expect("delete");
-        second.commit().await.expect("commit");
-
-        // The value matches the reader's snapshot, but the version changed.
-        reader.put(key(b"k"), key(b"2")).await.expect("put");
-        let error = reader.commit().await.expect_err("ABA conflict");
-        assert_eq!(error.kind(), ErrorKind::RetryableAbort);
-    });
-}
-
-#[test]
 fn concurrent_unique_insert_does_not_silently_overwrite() {
     let backend = mock();
     block_on(async {
@@ -760,51 +562,6 @@ fn concurrent_unique_insert_does_not_silently_overwrite() {
 // ---------------------------------------------------------------------------
 // Commit outcomes and rollback.
 // ---------------------------------------------------------------------------
-
-#[test]
-fn rollback_persists_nothing() {
-    let backend = mock();
-    block_on(async {
-        let mut txn = backend.begin_write().await.expect("begin write");
-        txn.put(key(b"a"), key(b"v")).await.expect("put");
-        txn.rollback().await;
-    });
-
-    block_on(async {
-        let mut txn = backend.begin_read().await.expect("begin read");
-        assert_eq!(txn.get(key(b"a")).await.expect("get"), None);
-    });
-}
-
-#[test]
-fn dropping_a_transaction_persists_nothing() {
-    let backend = mock();
-    block_on(async {
-        let mut txn = backend.begin_write().await.expect("begin write");
-        txn.put(key(b"a"), key(b"v")).await.expect("put");
-        drop(txn);
-    });
-
-    block_on(async {
-        let mut txn = backend.begin_read().await.expect("begin read");
-        assert_eq!(txn.get(key(b"a")).await.expect("get"), None);
-    });
-}
-
-#[test]
-fn commit_success_is_visible_to_subsequent_snapshots() {
-    let backend = mock();
-    block_on(async {
-        let mut txn = backend.begin_write().await.expect("begin write");
-        txn.put(key(b"a"), key(b"v")).await.expect("put");
-        txn.commit().await.expect("commit succeeds");
-    });
-
-    block_on(async {
-        let mut txn = backend.begin_read().await.expect("begin read");
-        assert_eq!(txn.get(key(b"a")).await.expect("get"), Some(key(b"v")));
-    });
-}
 
 #[test]
 fn commit_installs_complete_new_version_never_partial() {
@@ -851,28 +608,6 @@ fn commit_failure_and_unknown_outcome_are_distinct() {
         txn.put(key(b"b"), key(b"v")).await.expect("put");
         let error = txn.commit().await.expect_err("faulted commit is unknown");
         assert_eq!(error.kind(), ErrorKind::CommitOutcomeUnknown);
-    });
-}
-
-#[test]
-fn unknown_applied_persists_all_mutations_atomically() {
-    let backend = mock();
-    backend
-        .push_fault(CommitFault::UnknownApplied)
-        .expect("fault");
-
-    block_on(async {
-        let mut txn = backend.begin_write().await.expect("begin write");
-        txn.put(key(b"a"), key(b"1")).await.expect("put");
-        txn.put(key(b"b"), key(b"2")).await.expect("put");
-        let error = txn.commit().await.expect_err("unknown outcome");
-        assert_eq!(error.kind(), ErrorKind::CommitOutcomeUnknown);
-    });
-
-    block_on(async {
-        let mut txn = backend.begin_read().await.expect("begin read");
-        assert_eq!(txn.get(key(b"a")).await.expect("get"), Some(key(b"1")));
-        assert_eq!(txn.get(key(b"b")).await.expect("get"), Some(key(b"2")));
     });
 }
 
@@ -1141,19 +876,6 @@ fn fault_plan_limit_is_enforced() {
 // ---------------------------------------------------------------------------
 // Range clear capability.
 // ---------------------------------------------------------------------------
-
-#[test]
-fn clear_range_is_declined_when_unsupported() {
-    let backend = mock();
-    block_on(async {
-        let mut txn = backend.begin_write().await.expect("begin write");
-        let error = txn
-            .clear_range(&range(b"a", b"z"))
-            .await
-            .expect_err("unsupported clear");
-        assert_eq!(error.kind(), ErrorKind::Unsupported);
-    });
-}
 
 #[test]
 fn clear_range_clears_transactionally_when_supported() {

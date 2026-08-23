@@ -146,45 +146,8 @@ async fn assert_records(index: &Index<SharedBackend>, model: &Model) {
 /// Drives demand-driven rediscovery until the topology settles: every search
 /// visits and offers cold partitions, so repeated searches converge the
 /// forest without any manual state-machine drive.
-///
-/// Settled means the quiet observation — every partition `Ready`, none over
-/// the split threshold, and exact leaf membership — persists across several
-/// consecutive polls, so a queued or in-flight transition cannot slip through
-/// a single snapshot's race window.
 async fn settle(index: &Index<SharedBackend>, backend: &SharedBackend, model: &Model) {
-    let maximum = index.config().max_partition_entries();
-    let expected = model.len() as u32;
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut stable = 0_u32;
-    loop {
-        // The search is the relevant access that offers cold work.
-        let request = SearchRequest::new(Arc::from([0.0_f32]), 1).expect("valid request");
-        let _ = index.search(request).await;
-        let partitions = audit::list_partitions(backend, index.logical_index_id())
-            .await
-            .expect("list partitions");
-        let quiet = partitions
-            .iter()
-            .all(|(_, _, header)| header.state() == PartitionState::Ready)
-            && partitions
-                .iter()
-                .all(|(_, _, header)| header.entry_count() <= maximum)
-            && partitions
-                .iter()
-                .filter(|(_, _, header)| header.level() == 1)
-                .map(|(_, _, header)| header.entry_count())
-                .sum::<u32>()
-                == expected;
-        stable = if quiet { stable + 1 } else { 0 };
-        if stable >= 3 {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for the topology to settle"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    audit::settle(index, backend, model.len() as u32).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

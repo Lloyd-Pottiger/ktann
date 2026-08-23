@@ -146,6 +146,17 @@ must not require nightly features.
   `KTANN_REWRITE=1 cargo test --test e2e` and review the diff like any other
   change. Real-dataset fixtures (siftsmall, fashion-mnist; see
   `tests/datadriven/data/README.md` for provenance) are checked in under
-  `tests/datadriven/data/` and loaded via `file:` dataset specs; the oracle is
+  `tests/datadriven/data/` and loaded via `file:NAME[:N]` dataset specs (the
+  optional `:N` takes the fixture's first N vectors); the oracle is
   cross-checked against published siftsmall ground truth in
   `tests/oracle_groundtruth.rs`.
+- Metric recording is asserted in `tests/metrics.rs`: the documented `ktann.*`
+  series fire with the expected labels and counts as the public API drives
+  work. Telemetry privacy (no caller data in metrics or traces) is audited in
+  `tests/observability.rs`.
+- API-level recall parity on the production adapters lives in
+  `ktann-rocksdb/tests/rocksdb_recall.rs` (embedded, runs in CI) and
+  `ktann-foundationdb/tests/foundationdb_recall.rs` (requires a local
+  cluster; the FoundationDB CI job runs it). Both share the scenario in
+  `tests/support/adapter_recall.rs` and the fixture loaders in
+  `tests/support/fixtures.rs`.

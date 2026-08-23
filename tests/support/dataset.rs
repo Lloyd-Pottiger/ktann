@@ -22,15 +22,20 @@
 //!   weight, producing heavily unbalanced partitions under splits.
 //! - `dups:N:M` — `M` base vectors; each record is an exact copy of a base or
 //!   carries tiny jitter, exercising ties and duplicate-heavy regions.
-//! - `file:NAME` — a fixture from `tests/datadriven/data/`; `.fvecs` and
-//!   `.idx3-ubyte` (MNIST IDX) formats are supported. The fixture dimension
-//!   must equal the index dimension.
+//! - `file:NAME[:N]` — a fixture from `tests/datadriven/data/`; `.fvecs` and
+//!   `.idx3-ubyte` (MNIST IDX) formats are supported. With `:N`, only the
+//!   first N vectors are taken. The fixture dimension must equal the index
+//!   dimension.
+//!
+//! Specifications with missing, extra, or non-numeric fields panic.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bytes::Bytes;
 
 use super::Rng;
+use super::fixtures;
 
 /// One generated dataset: stable Record IDs and their vectors in index order.
 pub struct Dataset {
@@ -56,7 +61,18 @@ pub fn generate(spec: &str, dimension: usize, seed: u64) -> Dataset {
     let mut parts = spec.split(':');
     let kind = parts.next().unwrap_or("");
     if kind == "file" {
-        let vectors = read_fixture(parts.next().unwrap_or(""), dimension, spec);
+        let mut vectors = read_fixture(parts.next().unwrap_or(""), dimension, spec);
+        if let Some(part) = parts.next() {
+            let take: usize = part
+                .parse()
+                .unwrap_or_else(|_| panic!("bad dataset spec `{spec}`"));
+            assert!(
+                take > 0 && take <= vectors.len(),
+                "bad take count in dataset spec `{spec}`"
+            );
+            vectors.truncate(take);
+        }
+        assert!(parts.next().is_none(), "bad dataset spec `{spec}`");
         let ids = (0..vectors.len())
             .map(|ordinal| Bytes::from(format!("r{ordinal:06}")))
             .collect();
@@ -144,6 +160,7 @@ pub fn generate(spec: &str, dimension: usize, seed: u64) -> Dataset {
         }
         other => panic!("unknown dataset kind in spec `{spec}`: `{other}`"),
     };
+    assert!(parts.next().is_none(), "bad dataset spec `{spec}`");
 
     Dataset {
         ids: (0..count)
@@ -176,37 +193,18 @@ fn parse<T: std::str::FromStr>(part: Option<&str>, spec: &str) -> T {
         .unwrap_or_else(|| panic!("bad dataset spec `{spec}`"))
 }
 
-/// The directory holding the checked-in real-dataset fixtures.
+/// The directory holding the checked-in real-dataset fixtures, relative to
+/// the crate manifest.
 const FIXTURE_DIR: &str = "tests/datadriven/data";
 
-/// Reads one fixture file by plain file name (no path separators).
-fn fixture_bytes(name: &str, spec: &str) -> (std::path::PathBuf, Vec<u8>) {
-    assert!(
-        !name.is_empty() && !name.contains(['/', '\\']) && !name.contains(".."),
-        "bad fixture name in spec `{spec}`"
-    );
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(FIXTURE_DIR)
-        .join(name);
-    let bytes = std::fs::read(&path)
-        .unwrap_or_else(|error| panic!("read fixture {}: {error}", path.display()));
-    (path, bytes)
+fn fixture_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_DIR)
 }
 
 /// Loads the vector fixture named by a `file:` spec and checks that its
 /// dimension equals the index dimension.
 fn read_fixture(name: &str, dimension: usize, spec: &str) -> Vec<Arc<[f32]>> {
-    let (path, bytes) = fixture_bytes(name, spec);
-    let vectors = if name.ends_with(".fvecs") {
-        parse_fvecs(&bytes, spec)
-    } else if name.ends_with(".idx3-ubyte") {
-        parse_idx3_ubyte(&bytes, spec)
-    } else {
-        panic!(
-            "unknown fixture format in spec `{spec}`: {}",
-            path.display()
-        )
-    };
+    let vectors = fixtures::read_vectors(&fixture_dir(), name);
     let found = vectors.first().map_or(0, |vector| vector.len());
     assert!(
         found == dimension,
@@ -215,78 +213,9 @@ fn read_fixture(name: &str, dimension: usize, spec: &str) -> Vec<Arc<[f32]>> {
     vectors
 }
 
-/// Parses the `.fvecs` layout: per vector one little-endian i32 dimension
-/// prefix followed by that many little-endian f32 components.
-fn parse_fvecs(bytes: &[u8], spec: &str) -> Vec<Arc<[f32]>> {
-    assert!(bytes.len() >= 4, "bad fvecs fixture in spec `{spec}`");
-    let dimension = i32::from_le_bytes(bytes[..4].try_into().expect("prefix")) as usize;
-    let record = 4 + dimension * 4;
-    assert!(
-        dimension > 0 && bytes.len() % record == 0,
-        "truncated fvecs fixture in spec `{spec}`"
-    );
-    (0..bytes.len() / record)
-        .map(|index| {
-            let payload = &bytes[index * record..(index + 1) * record];
-            assert!(
-                i32::from_le_bytes(payload[..4].try_into().expect("prefix")) as usize == dimension,
-                "inconsistent fvecs dimension in spec `{spec}`"
-            );
-            payload[4..]
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("component")))
-                .collect()
-        })
-        .collect()
-}
-
-/// Parses the MNIST IDX ubyte layout: a big-endian header (magic 0x803,
-/// count, rows, columns) followed by `count` row-major images, converted to
-/// raw f32 intensities in `[0, 255]`.
-fn parse_idx3_ubyte(bytes: &[u8], spec: &str) -> Vec<Arc<[f32]>> {
-    let header = |index: usize| -> i32 {
-        bytes
-            .get(index * 4..index * 4 + 4)
-            .and_then(|chunk| chunk.try_into().ok())
-            .map(i32::from_be_bytes)
-            .unwrap_or_else(|| panic!("bad idx3-ubyte fixture in spec `{spec}`"))
-    };
-    assert!(header(0) == 0x803, "bad idx3-ubyte magic in spec `{spec}`");
-    let count = header(1) as usize;
-    let dimension = (header(2) * header(3)) as usize;
-    assert!(
-        bytes.len() == 16 + count * dimension,
-        "truncated idx3-ubyte fixture in spec `{spec}`"
-    );
-    (0..count)
-        .map(|index| {
-            bytes[16 + index * dimension..16 + (index + 1) * dimension]
-                .iter()
-                .map(|byte| f32::from(*byte))
-                .collect()
-        })
-        .collect()
-}
-
 /// Reads an `.ivecs` fixture (the `.fvecs` layout with i32 components); used
 /// to check the brute-force oracle against published ground truth.
 #[must_use]
 pub fn read_ivecs_fixture(name: &str) -> Vec<Vec<i32>> {
-    let (_, bytes) = fixture_bytes(name, "ivecs fixture");
-    assert!(bytes.len() >= 4, "bad ivecs fixture `{name}`");
-    let width = i32::from_le_bytes(bytes[..4].try_into().expect("prefix")) as usize;
-    let record = 4 + width * 4;
-    assert!(
-        width > 0 && bytes.len() % record == 0,
-        "truncated ivecs fixture `{name}`"
-    );
-    (0..bytes.len() / record)
-        .map(|index| {
-            let payload = &bytes[index * record + 4..(index + 1) * record];
-            payload
-                .chunks_exact(4)
-                .map(|chunk| i32::from_le_bytes(chunk.try_into().expect("component")))
-                .collect()
-        })
-        .collect()
+    fixtures::read_ivecs(&fixture_dir(), name)
 }
