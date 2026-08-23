@@ -154,6 +154,21 @@ must not require nightly features.
   series fire with the expected labels and counts as the public API drives
   work. Telemetry privacy (no caller data in metrics or traces) is audited in
   `tests/observability.rs`.
+- The replayable crash-history and model-validation harness lives in
+  `tests/model_history.rs` (issue #37): one seeded, fully pre-generated script
+  drives the public API through lifecycle transitions, atomic Foreground
+  Mutations (some armed with commit faults), manually advanced split/merge
+  transitions, queue loss via crash/reopen, unknown commit outcomes,
+  cancellation, and shutdown, asserting exact membership, Partition Key
+  non-reuse, and Logical Index ID non-reuse after every step. Determinism
+  comes from zero maintenance workers with manually driven bounded advances
+  plus a script drawn from one seed before any async work. A failure prints
+  the step trace and a replay command; reproduce a seed with
+  `KTANN_MODEL_SEED=<seed> cargo test --test model_history model_history_replay`
+  (optionally `KTANN_MODEL_STEPS=<n>`), and run the expanded deterministic
+  profile (24 seeds × 400 steps) with `KTANN_MODEL_PROFILE=expanded`. The
+  nightly workflow (`.github/workflows/nightly.yml`) runs the expanded profile
+  daily and on manual dispatch.
 - API-level recall parity on the production adapters lives in
   `ktann-rocksdb/tests/rocksdb_recall.rs` (embedded, runs in CI) and
   `ktann-foundationdb/tests/foundationdb_recall.rs` (requires a local
