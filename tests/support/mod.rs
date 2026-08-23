@@ -32,6 +32,7 @@ use ktann::storage::values::{IndexManifest, PersistentValue};
 pub mod audit;
 pub mod datadriven;
 pub mod dataset;
+pub mod fixtures;
 pub mod load_index;
 pub mod observe;
 pub mod oracle;

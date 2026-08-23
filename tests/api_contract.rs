@@ -21,6 +21,11 @@ fn assert_invalid<T>(result: ktann::api::Result<T>) {
 }
 
 #[test]
+fn core_crate_is_linkable() {
+    use ktann as _;
+}
+
+#[test]
 fn immutable_configuration_enforces_schema_contract() -> ktann::api::Result<()> {
     assert_invalid(IndexConfig::new(0, Metric::L2));
     assert_invalid(IndexConfig::new(16_385, Metric::L2));

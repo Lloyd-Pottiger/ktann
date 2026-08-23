@@ -17,13 +17,15 @@
 //! quiescent, so the gap is unreachable in practice.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use ktann::api::{LogicalIndexId, PartitionKey};
+use ktann::api::{Index, LogicalIndexId, PartitionKey, SearchRequest};
 use ktann::storage::backend::{Backend, ReadOps, ScanLimits};
 use ktann::storage::keys::{LogicalKey, TreeKey};
 use ktann::storage::values::{
-    IndexManifest, PartitionHeader, PartitionTransition, PersistentValue,
+    IndexManifest, PartitionHeader, PartitionState, PartitionTransition, PersistentValue,
 };
 use ktann::storage::{LogicalRange, LogicalScanItem, ReadLogicalTxn};
 
@@ -628,4 +630,45 @@ async fn render_partition<T: ReadOps>(
         .await?;
     }
     Ok(())
+}
+
+/// Polls demand-driven maintenance until the topology is quiet: every
+/// partition `Ready`, none over the split threshold, and the exact expected
+/// leaf membership — sustained across several consecutive polls, so a queued
+/// or in-flight transition cannot slip through one snapshot's race window.
+/// Each poll searches, offering cold partitions to the Fixup queue. The
+/// real-time bound only guards against a broken implementation hanging.
+pub async fn settle<B: Backend>(index: &Index<B>, backend: &B, expected: u32) {
+    let maximum = index.config().max_partition_entries();
+    let zeros: Arc<[f32]> = vec![0.0_f32; index.config().dimension()].into();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut stable = 0_u32;
+    loop {
+        let request = SearchRequest::new(zeros.clone(), 1).expect("valid request");
+        let _ = index.search(request).await;
+        let partitions = list_partitions(backend, index.logical_index_id())
+            .await
+            .expect("list partitions");
+        let quiet = partitions
+            .iter()
+            .all(|(_, _, header)| header.state() == PartitionState::Ready)
+            && partitions
+                .iter()
+                .all(|(_, _, header)| header.entry_count() <= maximum)
+            && partitions
+                .iter()
+                .filter(|(_, _, header)| header.level() == 1)
+                .map(|(_, _, header)| header.entry_count())
+                .sum::<u32>()
+                == expected;
+        stable = if quiet { stable + 1 } else { 0 };
+        if stable >= 3 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the topology to settle"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }

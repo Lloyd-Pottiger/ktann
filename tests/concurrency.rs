@@ -178,6 +178,60 @@ async fn seeded_interleaving_converges_with_exact_membership() {
     runtime.shutdown().await.expect("runtime shutdown");
 }
 
+/// The same seeded interleaving, but with the Runtime's real background Fixup
+/// workers performing all Structure Maintenance: foreground mutations and
+/// searches offer discovered partitions to the demand-driven queue and the
+/// workers settle the tree with no manual drive. The scripts are unchanged,
+/// so the final model stays interleaving-independent and the same
+/// exact-membership audit must pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seeded_interleaving_with_background_fixups_converges() {
+    let backend = SharedBackend::new(DeterministicBackend::new(DeterministicConfig::default()));
+    let config = RuntimeConfig::default()
+        .with_maintenance(2, 64)
+        .and_then(|config| config.with_attempts(ATTEMPTS, ATTEMPTS))
+        .and_then(|config| config.with_import_limits(1, 1))
+        .expect("valid runtime config");
+    let runtime = Runtime::new(backend.clone(), config).expect("runtime is valid");
+    let index = runtime
+        .create_index("concurrency-fixups", index_config())
+        .await
+        .expect("create index");
+    let logical_index_id = index.logical_index_id();
+
+    let scripts: Vec<Vec<Op>> = (0..TASKS).map(generate_script).collect();
+    let mut tasks = Vec::with_capacity(TASKS);
+    for (task, script) in scripts.into_iter().enumerate() {
+        tasks.push(tokio::spawn(run_script(task, script, index.clone())));
+    }
+    let mut model = Model::new();
+    for task in tasks {
+        let local = task.await.expect("mutation task did not panic");
+        let (before, added) = (model.len(), local.len());
+        model.extend(local);
+        assert_eq!(
+            model.len(),
+            before + added,
+            "task Record ID ranges must be disjoint"
+        );
+    }
+
+    // Background workers settle the topology; each settle poll offers cold
+    // work through an ordinary search.
+    audit::settle(&index, &backend, model.len() as u32).await;
+
+    let report = audit::run(&backend, logical_index_id, &model)
+        .await
+        .unwrap_or_else(|failure| panic!("exact-membership audit failed: {failure}"));
+    assert_eq!(report.records, model.len());
+    assert_eq!(report.trees, 1, "every record carries bucket={TREE_BUCKET}");
+    assert!(
+        report.partitions > 1,
+        "background fixups must have split under the load"
+    );
+    runtime.shutdown().await.expect("runtime shutdown");
+}
+
 /// A 4-dimensional L2 index with one i64 Tree Key field and small partition
 /// entry bounds so splits (and, after deletes, merges) fire regularly.
 fn index_config() -> IndexConfig {

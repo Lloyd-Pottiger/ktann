@@ -14,9 +14,10 @@
 //!   field nullable.
 //! - `load dataset=SPEC tree=V|A..B [via=batch|single|import] [seed=N] [batch=N]`
 //!   inserts a dataset through the public mutation API. SPECs are generated
-//!   synthetically except `file:NAME`, which loads a checked-in fixture from
-//!   `tests/datadriven/data/` and ignores `seed`. Non-tree fields are filled
-//!   deterministically (ordinal values; every seventh nullable field is NULL).
+//!   synthetically except `file:NAME[:N]`, which loads (the first N vectors
+//!   of) a checked-in fixture from `tests/datadriven/data/` and ignores
+//!   `seed`. Non-tree fields are filled deterministically (ordinal values;
+//!   every seventh nullable field is NULL).
 //! - `insert [tree=V]` / `upsert [tree=V]` — input lines `id: [v,v,...] [fI=value ...]`;
 //!   prints `id: ok|created|replaced` or `id: error Kind`.
 //! - `delete` — input lines of Record IDs; prints `id: true|false`.

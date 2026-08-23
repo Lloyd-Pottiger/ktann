@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
-use metrics_util::debugging::{DebuggingRecorder, Snapshotter};
+use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use tracing::field::Visit;
 use tracing::{Event, Id, Subscriber};
 use tracing_subscriber::Layer;
@@ -18,6 +18,10 @@ use tracing_subscriber::layer::{Context, SubscriberExt};
 
 /// One captured span or event: its rendered `(field, value)` pairs.
 type CapturedFields = Vec<(String, String)>;
+
+/// One captured counter series: `(name, sorted (label, value) pairs,
+/// cumulative value)`.
+pub(crate) type CounterSeries = (String, Vec<(String, String)>, u64);
 
 /// The installed capture stack: metric snapshots plus captured span and event
 /// fields.
@@ -144,6 +148,29 @@ impl Capture {
                     .collect();
                 labels.sort();
                 (key.key().name().to_owned(), labels)
+            })
+            .collect()
+    }
+
+    /// Every counter series as `(name, sorted (label, value) pairs,
+    /// cumulative value)`. Gauges and histograms are excluded; callers diff
+    /// two snapshots because metric state is cumulative.
+    pub(crate) fn metric_counters(&self) -> Vec<CounterSeries> {
+        self.snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(key, _unit, _description, value)| {
+                let DebugValue::Counter(value) = value else {
+                    return None;
+                };
+                let mut labels: Vec<(String, String)> = key
+                    .key()
+                    .labels()
+                    .map(|label| (label.key().to_owned(), label.value().to_owned()))
+                    .collect();
+                labels.sort();
+                Some((key.key().name().to_owned(), labels, value))
             })
             .collect()
     }

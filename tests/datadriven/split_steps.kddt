@@ -339,3 +339,53 @@ recall k=5 samples=8
 recall@5: 100.00% (samples=8, truncated=0)
 mean usage: visited_partitions=14 visited_leaf_entries=64 exact_rerank_candidates=6
 
+# --- Scenario F: post-split insert routing (the search-for-insert path) ---
+# Insert routing descends by nearest Child Entry centroid — a different path
+# from query search (beam traversal + exact rerank). After a topology change,
+# new inserts must still land in the leaf their vector routes to. This
+# declarative tree has known centroids, so the golden placement is checkable
+# by construction; [5,5] is equidistant to both leaves and pins the
+# deterministic tie-break. The merge-side redirect (inserts/upserts never
+# enter a Merging source) is covered in merge_steps.kddt scenario B.
+new-index dimension=2 metric=L2 fields=bucket:i64 tree-key-fields=0 min-entries=2 max-entries=8
+----
+created index "index"
+
+load-index tree=1
+pk=1 level=2 state=Ready
+  pk=2 level=1 state=Ready centroid=[0,0]
+    r01: [0,0]
+    r02: [0,1]
+  pk=3 level=1 state=Ready centroid=[10,10]
+    r03: [10,10]
+    r04: [10,11]
+----
+loaded 4 records, 3 partitions, max level 2
+
+insert tree=1
+r05: [0.2,0.1]
+r06: [9.9,10.2]
+r07: [5,5]
+----
+r05: ok
+r06: ok
+r07: ok
+
+format-tree entries
+----
+tree 0: root pk=1
+  pk=1 level=2 state=Ready count=2
+    pk=2 level=1 state=Ready count=4
+      r01
+      r02
+      r05
+      r07
+    pk=3 level=1 state=Ready count=3
+      r03
+      r04
+      r06
+
+validate
+----
+ok: records=7 trees=1 partitions=3 max_level=2
+
