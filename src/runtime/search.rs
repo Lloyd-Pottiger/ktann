@@ -15,10 +15,13 @@
 //! truncation. Success deliberately makes no exact-global-top-k, completeness,
 //! continuation, or monotonic-across-budgets guarantee.
 
+use std::time::Instant;
+
 use crate::api::{
     Error, ErrorKind, PartitionKey, Result, SearchBudgetExhaustion, SearchBudgetUsage,
     SearchBudgets, SearchOutcome, SearchRequest,
 };
+use crate::observe::labels::SearchStage;
 use crate::observe::metrics;
 use crate::search::cache::PartitionCache;
 use crate::search::numeric::VectorKernel;
@@ -131,6 +134,8 @@ pub(crate) async fn search<B: Backend>(
     let mut txn = ReadLogicalTxn::for_index(raw, &current)?;
     context.checkpoint()?;
 
+    let approximate_started = Instant::now();
+
     // Bounded Tree Key enumeration finishes before traversal so budget use is
     // deterministic.
     let enumeration = enumerate_tree_keys(
@@ -180,7 +185,12 @@ pub(crate) async fn search<B: Backend>(
     let selection = select_global_overlap(pool, prepared.request.k(), rerank_budget)?;
     let rerank_budget_exhausted = selection.truncated();
     let selected: Vec<LeafCandidate> = selection.into_values();
+    metrics::search_stage_finished(
+        SearchStage::ApproximateSelection,
+        approximate_started.elapsed(),
+    );
 
+    let reranking_started = Instant::now();
     let rerank = exact_rerank(
         &mut txn,
         &prepared.kernel,
@@ -190,6 +200,7 @@ pub(crate) async fn search<B: Backend>(
         prepared.budgets.exact_rerank_candidates(),
     )
     .await?;
+    metrics::search_stage_finished(SearchStage::ExactReranking, reranking_started.elapsed());
     context.checkpoint()?;
 
     let exact_rerank_candidates = rerank.exact_rerank_candidates();

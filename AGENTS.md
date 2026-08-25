@@ -154,6 +154,13 @@ must not require nightly features.
   series fire with the expected labels and counts as the public API drives
   work. Telemetry privacy (no caller data in metrics or traces) is audited in
   `tests/observability.rs`.
+- Reproducible ANN and whole-system baselines live in the non-published
+  `ktann-benchmarks` workspace crate. Run the fast production-adapter matrix
+  with `cargo run -p ktann-benchmarks --bin ktann-bench -- run --backend rocksdb
+  --profile smoke`; run optimized `full` profiles only on an otherwise idle
+  host. `benchmarks/README.md` defines timing boundaries, logical write
+  amplification, FoundationDB setup, report comparability, and why these
+  empirical results are not a v1 SLA.
 - The replayable crash-history and model-validation harness lives in
   `tests/model_history.rs` (issue #37): one seeded, fully pre-generated script
   drives the public API through lifecycle transitions, atomic Foreground

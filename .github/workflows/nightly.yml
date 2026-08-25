@@ -26,3 +26,52 @@ jobs:
         # 24 seeds x 400 steps of crash/fault/model histories; see
         # tests/model_history.rs and the AGENTS.md Testing section.
         run: KTANN_MODEL_PROFILE=expanded cargo test --test model_history -- --nocapture
+
+  rocksdb-performance-baseline:
+    name: RocksDB full performance baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: performance-rocksdb
+      - name: Run optimized full profile
+        run: >-
+          cargo +stable run --release -p ktann-benchmarks --bin ktann-bench --
+          run --backend rocksdb --profile full --worker-threads 2
+          --output "${{ runner.temp }}/rocksdb-full.json"
+      - name: Upload versioned report
+        uses: actions/upload-artifact@v4
+        with:
+          name: rocksdb-full-${{ github.run_id }}
+          path: ${{ runner.temp }}/rocksdb-full.json
+          retention-days: 30
+
+  foundationdb-performance-baseline:
+    name: FoundationDB full performance baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: performance-foundationdb
+      - name: Set up FoundationDB
+        run: .github/scripts/setup-foundationdb.sh server
+      - name: Run optimized full profile
+        run: >-
+          cargo +stable run --release -p ktann-benchmarks
+          --no-default-features --features foundationdb --bin ktann-bench --
+          run --backend foundationdb --profile full --worker-threads 2
+          --output "${{ runner.temp }}/foundationdb-full.json"
+      - name: Upload versioned report
+        uses: actions/upload-artifact@v4
+        with:
+          name: foundationdb-full-${{ github.run_id }}
+          path: ${{ runner.temp }}/foundationdb-full.json
+          retention-days: 30

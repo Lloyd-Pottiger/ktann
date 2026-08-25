@@ -32,10 +32,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use bytes::Bytes;
-
 use super::Rng;
 use super::fixtures;
+use bytes::Bytes;
 
 /// One generated dataset: stable Record IDs and their vectors in index order.
 pub struct Dataset {

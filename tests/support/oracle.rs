@@ -71,7 +71,7 @@ pub fn truth(
     filter: &dyn Fn(&ModelRecord) -> bool,
 ) -> Vec<(Bytes, f64)> {
     let query_norm = norm(query);
-    let mut scored: Vec<(f64, &Bytes)> = model
+    let scored: Vec<(f64, &Bytes)> = model
         .iter()
         .filter(|(_, record)| filter(record))
         .map(|(id, record)| {
@@ -81,17 +81,57 @@ pub fn truth(
             )
         })
         .collect();
-    scored.sort_by(|(left_distance, left_id), (right_distance, right_id)| {
-        left_distance
-            .partial_cmp(right_distance)
-            .expect("oracle distances are finite")
-            .then_with(|| left_id.cmp(right_id))
-    });
+    top_k(scored, k)
+}
+
+/// The brute-force top-`k` for aligned IDs and vectors without record fields.
+#[must_use]
+pub fn truth_vectors(
+    ids: &[Bytes],
+    vectors: &[Arc<[f32]>],
+    metric: Metric,
+    query: &[f32],
+    k: usize,
+) -> Vec<(Bytes, f64)> {
+    assert_eq!(
+        ids.len(),
+        vectors.len(),
+        "oracle IDs and vectors must align"
+    );
+    let query_norm = norm(query);
+    let scored = ids
+        .iter()
+        .zip(vectors)
+        .map(|(id, vector)| (distance_with_norm(metric, query, query_norm, vector), id))
+        .collect();
+    top_k(scored, k)
+}
+
+/// Selects the exact prefix under the engine's total distance/ID order.
+fn top_k(mut scored: Vec<(f64, &Bytes)>, k: usize) -> Vec<(Bytes, f64)> {
+    if k == 0 {
+        return Vec::new();
+    }
+    if k < scored.len() {
+        scored.select_nth_unstable_by(k, score_order);
+        scored.truncate(k);
+    }
+    scored.sort_by(score_order);
     scored
         .into_iter()
-        .take(k)
         .map(|(distance, id)| (id.clone(), distance))
         .collect()
+}
+
+/// Orders finite oracle distances and then canonical Record ID bytes.
+fn score_order(
+    (left_distance, left_id): &(f64, &Bytes),
+    (right_distance, right_id): &(f64, &Bytes),
+) -> std::cmp::Ordering {
+    left_distance
+        .partial_cmp(right_distance)
+        .expect("oracle distances are finite")
+        .then_with(|| left_id.cmp(right_id))
 }
 
 /// The overlap of the predicted hit set with the truth set, in `[0, 1]`.
@@ -100,10 +140,19 @@ pub fn truth(
 /// recall definition; budget truncation is reported separately by the caller.
 #[must_use]
 pub fn recall(predicted: &[Bytes], truth: &[(Bytes, f64)]) -> f64 {
+    recall_ids(predicted, truth)
+}
+
+/// The recall overlap for an iterator of borrowed predicted Record IDs.
+#[must_use]
+pub fn recall_ids<'a>(
+    predicted: impl IntoIterator<Item = &'a Bytes>,
+    truth: &[(Bytes, f64)],
+) -> f64 {
     if truth.is_empty() {
         return 1.0;
     }
-    let predicted: std::collections::BTreeSet<&Bytes> = predicted.iter().collect();
+    let predicted: std::collections::BTreeSet<&Bytes> = predicted.into_iter().collect();
     let hits = truth
         .iter()
         .filter(|(id, _)| predicted.contains(id))

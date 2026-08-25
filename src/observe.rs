@@ -28,6 +28,7 @@
 //! | `ktann.write.retries` | counter | operation |
 //! | `ktann.search.budget.usage` | histogram | dimension |
 //! | `ktann.search.budget.exhausted` | counter | dimension |
+//! | `ktann.search.stage.duration` | histogram | stage |
 //! | `ktann.cache.lookup` | counter | level, result |
 //! | `ktann.cache.install` | counter | level, result |
 //! | `ktann.cache.bytes` | gauge | — |

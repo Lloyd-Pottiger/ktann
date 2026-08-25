@@ -493,6 +493,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "ktann-benchmarks"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "foundationdb",
+ "foundationdb-sys",
+ "ktann",
+ "ktann-foundationdb",
+ "ktann-rocksdb",
+ "libc",
+ "metrics",
+ "metrics-util",
+ "rocksdb",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "ktann-foundationdb"
 version = "0.1.0"
 dependencies = [

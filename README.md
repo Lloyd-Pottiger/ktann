@@ -83,6 +83,7 @@ claim exact global top-k or guarantee that every request returns `k` hits.
 | `ktann` | Public API, K-means tree algorithms, search, maintenance, logical storage, and persistent codecs |
 | `ktann-foundationdb` | FoundationDB transactions, physical keyspace, limits, and error mapping |
 | `ktann-rocksdb` | RocksDB `OptimisticTransactionDB` integration, admission, limits, and error mapping |
+| `ktann-benchmarks` | Reproducible ANN quality and whole-system performance baselines |
 
 Backend adapters share one logical transaction contract, but their physical
 keyspaces are backend-specific and are not portable between storage engines.
@@ -97,6 +98,8 @@ keyspaces are backend-specific and are not portable between storage engines.
   maintenance, and runtime contracts.
 - [`docs/adr/`](docs/adr/) records accepted architectural decisions.
 - [`AGENTS.md`](AGENTS.md) lists development commands and engineering rules.
+- [`benchmarks/README.md`](benchmarks/README.md) defines benchmark scenarios,
+  measurement boundaries, report semantics, and comparison commands.
 
 These documents, rather than external implementations or papers, define
 KTANN's contract.
