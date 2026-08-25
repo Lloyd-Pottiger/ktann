@@ -186,11 +186,11 @@ format-tree entries
 ----
 tree 0: root pk=1
   pk=1 level=2 state=Ready count=3
-    pk=3 level=1 state=Ready count=3
-      r1
+    pk=3 level=1 state=Ready count=2
       r2
       r3
-    pk=4 level=1 state=Ready count=1
+    pk=4 level=1 state=Ready count=2
+      r1
       r4
     pk=5 level=1 state=Ready count=1
       r5

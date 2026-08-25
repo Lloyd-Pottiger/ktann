@@ -29,6 +29,9 @@
 //!   centroids are routing models; concurrent source writes never restart
 //!   training, and an already-created target always keeps its persisted
 //!   centroid.
+//! - **Viable target counts.** Draining normally routes by the persisted
+//!   target centroids, but exact remaining and target counts reserve enough
+//!   entries for each target to reach the configured minimum when possible.
 //! - **Rediscovery.** [`advance`] inspects one partition's durable state and
 //!   performs the next bounded step: beginning an over-maximum `Ready`
 //!   partition, exposing and advancing a `Splitting` one, draining one batch
@@ -45,6 +48,7 @@ use crate::storage::backend::{Backend, WriteTxn};
 use crate::storage::keys::{LogicalKey, TreeKey};
 use crate::storage::values::{
     IndexManifest, PartitionCentroid, PartitionState, PartitionTransition, expect_centroid,
+    expect_header,
 };
 use crate::storage::{ReadLogicalTxn, WriteLogicalTxn, topology};
 
@@ -275,9 +279,11 @@ pub async fn advance_to_draining<B: Backend>(
 /// candidate with update protection: an entry removed by a concurrent
 /// completed mutation is skipped and a remaining membership mismatch is
 /// Corruption. Every remaining entry routes against the two persisted target
-/// centroids with the Partition Key tie-break and moves atomically — Leaf
-/// Entries with their Record Location and target Synopsis, Child Entries
-/// with exact counts alone (ADR 0014).
+/// centroids and moves atomically — Leaf Entries with their Record Location and
+/// target Synopsis, Child Entries with exact counts alone (ADR 0014). Exact
+/// remaining and target counts reserve the last necessary entries for each
+/// target to reach the configured minimum before nearest routing could make
+/// that impossible.
 pub async fn drain_batch<B: Backend>(
     backend: &B,
     manifest: &IndexManifest,
@@ -384,31 +390,64 @@ async fn drain_attempt<T: WriteTxn>(
         return Err(Error::new(ErrorKind::Corruption));
     }
 
-    // The persisted target centroids are immutable, so plain reads
-    // suffice; a missing centroid contradicts the DrainingSplit state.
-    let mut centroid_values = txn
-        .batch_get(
+    // Protect the exact target counts that shape this batch; relocation reuses
+    // these cached Headers through commit. The immutable centroid reads stay
+    // plain so unrelated target lifecycle work does not add conflicts.
+    let mut header_values = txn
+        .batch_get_for_update(
             [plan.left, plan.right]
-                .map(|target| LogicalKey::Centroid {
+                .map(|partition| LogicalKey::Header {
                     index,
                     tree_key: tree_key.clone(),
-                    partition: target,
+                    partition,
                 })
                 .into(),
         )
         .await?
         .into_iter();
-    let (Some(left_value), Some(right_value)) = (centroid_values.next(), centroid_values.next())
+    let (Some(left_header_value), Some(right_header_value)) =
+        (header_values.next(), header_values.next())
     else {
         // The typed batch read returns exactly one value per input key.
         return Err(Error::new(ErrorKind::Backend));
     };
-    let (Some(left_centroid), Some(right_centroid)) =
-        (expect_centroid(left_value)?, expect_centroid(right_value)?)
-    else {
+    let (Some(left_header), Some(right_header)) = (
+        expect_header(left_header_value)?,
+        expect_header(right_header_value)?,
+    ) else {
         return Err(Error::new(ErrorKind::Corruption));
     };
 
+    let mut centroid_values = txn
+        .batch_get(
+            [plan.left, plan.right]
+                .map(|partition| LogicalKey::Centroid {
+                    index,
+                    tree_key: tree_key.clone(),
+                    partition,
+                })
+                .into(),
+        )
+        .await?
+        .into_iter();
+    let (Some(left_centroid_value), Some(right_centroid_value)) =
+        (centroid_values.next(), centroid_values.next())
+    else {
+        return Err(Error::new(ErrorKind::Backend));
+    };
+    let (Some(left_centroid), Some(right_centroid)) = (
+        expect_centroid(left_centroid_value)?,
+        expect_centroid(right_centroid_value)?,
+    ) else {
+        return Err(Error::new(ErrorKind::Corruption));
+    };
+
+    let mut balance = SplitBalance::new(
+        source_header.entry_count(),
+        left_header.entry_count(),
+        right_header.entry_count(),
+        manifest.config().min_partition_entries(),
+    );
     let moved = match &plan.batch {
         DrainBatch::Leaf(record_ids) => {
             let candidates =
@@ -427,6 +466,7 @@ async fn drain_attempt<T: WriteTxn>(
                     &left_centroid,
                     plan.right,
                     &right_centroid,
+                    &mut balance,
                 )?;
                 moves.push((candidate, target));
             }
@@ -445,6 +485,7 @@ async fn drain_attempt<T: WriteTxn>(
                     &left_centroid,
                     plan.right,
                     &right_centroid,
+                    &mut balance,
                 )?;
                 moves.push((entry, target));
             }
@@ -625,7 +666,8 @@ pub async fn advance<B: Backend>(
 /// Chooses the nearer of two split targets for one routing-space vector.
 ///
 /// Both centroids are persisted routing models, so kernel errors here are
-/// fail-closed Corruption rather than caller error.
+/// fail-closed Corruption rather than caller error. `balance` reserves entries
+/// needed to reach the deterministic half-total target quotas.
 fn nearer_target(
     kernel: &crate::search::numeric::VectorKernel,
     routing: &[f32],
@@ -633,6 +675,7 @@ fn nearer_target(
     left_centroid: &PartitionCentroid,
     right: PartitionKey,
     right_centroid: &PartitionCentroid,
+    balance: &mut SplitBalance,
 ) -> Result<PartitionKey> {
     let left_distance = kernel
         .routing_distance(routing, left_centroid.components())
@@ -640,12 +683,56 @@ fn nearer_target(
     let right_distance = kernel
         .routing_distance(routing, right_centroid.components())
         .map_err(|_| Error::new(ErrorKind::Corruption))?;
-    Ok(routing::nearer_of_two(
-        left,
-        left_distance,
-        right,
-        right_distance,
-    ))
+    balance.choose(left, left_distance, right, right_distance)
+}
+
+/// Exact remaining counts that keep both split targets viable while preserving
+/// nearest-centroid routing whenever possible.
+struct SplitBalance {
+    source_remaining: u64,
+    left_needed: u64,
+    right_needed: u64,
+}
+
+impl SplitBalance {
+    fn new(source: u32, left: u32, right: u32, minimum: u32) -> Self {
+        Self {
+            source_remaining: u64::from(source),
+            left_needed: u64::from(minimum.saturating_sub(left)),
+            right_needed: u64::from(minimum.saturating_sub(right)),
+        }
+    }
+
+    fn choose(
+        &mut self,
+        left: PartitionKey,
+        left_distance: f64,
+        right: PartitionKey,
+        right_distance: f64,
+    ) -> Result<PartitionKey> {
+        self.source_remaining = self
+            .source_remaining
+            .checked_sub(1)
+            .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
+        let attainable = self
+            .left_needed
+            .checked_add(self.right_needed)
+            .ok_or_else(|| Error::new(ErrorKind::Corruption))?
+            <= self.source_remaining.saturating_add(1);
+        let target = if attainable && self.left_needed > self.source_remaining {
+            left
+        } else if attainable && self.right_needed > self.source_remaining {
+            right
+        } else {
+            routing::nearer_of_two(left, left_distance, right, right_distance)
+        };
+        if target == left {
+            self.left_needed = self.left_needed.saturating_sub(1);
+        } else {
+            self.right_needed = self.right_needed.saturating_sub(1);
+        }
+        Ok(target)
+    }
 }
 
 /// Reads one split source's State from a snapshot, returning `None` when a
@@ -666,5 +753,35 @@ async fn read_source_state<T: crate::storage::backend::ReadOps>(
         (_, Some(state)) => Ok(Some(state)),
         (Some(_), None) => Err(Error::new(ErrorKind::Corruption)),
         (None, None) => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn partition(value: u64) -> PartitionKey {
+        PartitionKey::new(value).expect("nonzero Partition Key")
+    }
+
+    #[test]
+    fn split_balance_reserves_the_minimum_after_nearest_routing_fills_one_side() {
+        let left = partition(2);
+        let right = partition(3);
+        let mut balance = SplitBalance::new(9, 0, 0, 3);
+        let mut counts = (0_u32, 0_u32);
+
+        for _ in 0..9 {
+            match balance
+                .choose(left, 0.0, right, 1.0)
+                .expect("one source entry remains")
+            {
+                target if target == left => counts.0 += 1,
+                target if target == right => counts.1 += 1,
+                _ => unreachable!("the policy returns one of its two targets"),
+            }
+        }
+
+        assert_eq!(counts, (6, 3));
     }
 }

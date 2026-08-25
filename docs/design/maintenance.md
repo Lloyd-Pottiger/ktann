@@ -99,6 +99,15 @@ counts and cache epochs. Leaf movement also updates Record Location and target
 Synopsis. A concurrently removed entry is skipped; any remaining membership
 mismatch is Corruption.
 
+Drain placement normally chooses the nearer persisted target centroid. Exact
+remaining and target counts reserve the last entries needed for each target to
+reach the configured minimum when the source has enough entries, crediting
+entries already redirected into the targets. Thus duplicate-heavy routing
+cannot immediately merge a small target back into its oversized source, while
+ordinary inputs retain the distance-based placement learned by balanced
+training. If concurrent deletes make both minima unattainable, nearest routing
+continues and the normal merge protocol converges the undersized result.
+
 New inserts route to the nearer target. Upsert relocates a source membership;
 delete follows exact Record Location. Traversal visits the source plus both
 targets while draining, so the state remains searchable if no worker runs again.

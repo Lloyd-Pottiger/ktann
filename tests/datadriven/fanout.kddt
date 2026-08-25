@@ -119,14 +119,16 @@ x3: created
 delete
 r000001
 r000005
+r000009
 ----
 r000001: true
 r000005: true
+r000009: true
 
-# Shrink tree 2's leaves below the minimum and merge one away.
+# Three deletes force at least one balanced target below the minimum.
 merge-step tree=2
 ----
-pk=2: began
+pk=3: began
 
 format-tree tree=1 entries
 ----
@@ -152,5 +154,5 @@ usage: scanned_tree_keys=1 visited_partitions=1 visited_leaf_entries=10 exact_re
 
 validate
 ----
-ok: records=41 trees=4 partitions=8 max_level=2
+ok: records=40 trees=4 partitions=8 max_level=2
 
