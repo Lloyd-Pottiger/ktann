@@ -95,14 +95,10 @@ pub struct Configuration {
     pub maintenance_workers: usize,
     /// Pending-plus-running Fixup capacity.
     pub fixup_queue_capacity: usize,
-    /// Per-search Tree Key scan limit.
-    pub scanned_tree_keys_budget: u32,
-    /// Per-search partition visit limit.
-    pub visited_partitions_budget: u32,
-    /// Per-search Leaf Entry visit limit.
-    pub visited_leaf_entries_budget: u32,
-    /// Per-search exact-rerank candidate limit.
-    pub exact_rerank_candidates_budget: u32,
+    /// Runtime defaults, request overrides, and effective per-search limits.
+    pub search_budgets: SearchBudgetConfiguration,
+    /// Per-request leaf-level base beam override, when present.
+    pub leaf_beam_size_override: Option<u32>,
     /// RocksDB native blocking-resource limit, when applicable.
     pub blocking_resource_limit: Option<usize>,
     /// Backend Admission Budget mutation-count ceiling.
@@ -117,6 +113,30 @@ pub struct Configuration {
     pub measured_operations: usize,
     /// Requested result count.
     pub k: usize,
+}
+
+/// Configuration and effective limit for one public Search Budget dimension.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BudgetConfiguration {
+    /// Runtime default from which requests resolve this dimension.
+    pub runtime_default: u32,
+    /// Explicit per-request override used by the scenario, when present.
+    pub request_override: Option<u32>,
+    /// Concrete limit applied to every measured search in the scenario.
+    pub effective_limit: u32,
+}
+
+/// Configuration for every public Search Budget dimension.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SearchBudgetConfiguration {
+    /// Scanned Tree Key limit configuration.
+    pub scanned_tree_keys: BudgetConfiguration,
+    /// Visited partition limit configuration.
+    pub visited_partitions: BudgetConfiguration,
+    /// Visited Leaf Entry limit configuration.
+    pub visited_leaf_entries: BudgetConfiguration,
+    /// Exact-rerank candidate limit configuration.
+    pub exact_rerank_candidates: BudgetConfiguration,
 }
 
 /// Identity and size of one fixed public or synthetic dataset.

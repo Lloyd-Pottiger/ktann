@@ -580,12 +580,20 @@ fn relative_decrease(
 #[cfg(test)]
 mod tests {
     use crate::report::{
-        BenchmarkReport, BenchmarkSuite, BudgetSummary, Configuration, DatasetMetadata,
-        Distribution, Environment, Measurements, REPORT_SCHEMA_VERSION, RecallSummary,
-        WriteAmplification,
+        BenchmarkReport, BenchmarkSuite, BudgetConfiguration, BudgetSummary, Configuration,
+        DatasetMetadata, Distribution, Environment, Measurements, REPORT_SCHEMA_VERSION,
+        RecallSummary, SearchBudgetConfiguration, WriteAmplification,
     };
 
     use super::{ComparisonPolicy, compare};
+
+    fn budget_configuration(runtime_default: u32, effective_limit: u32) -> BudgetConfiguration {
+        BudgetConfiguration {
+            runtime_default,
+            request_override: None,
+            effective_limit,
+        }
+    }
 
     /// Produces the smallest complete report whose fields remain easy to vary.
     fn report() -> BenchmarkReport {
@@ -620,10 +628,13 @@ mod tests {
                 foreground_limit: 8,
                 maintenance_workers: 2,
                 fixup_queue_capacity: 1_024,
-                scanned_tree_keys_budget: 4_096,
-                visited_partitions_budget: 1_024,
-                visited_leaf_entries_budget: 65_536,
-                exact_rerank_candidates_budget: 65_536,
+                search_budgets: SearchBudgetConfiguration {
+                    scanned_tree_keys: budget_configuration(4_096, 4_096),
+                    visited_partitions: budget_configuration(1_024, 1_024),
+                    visited_leaf_entries: budget_configuration(65_536, 65_536),
+                    exact_rerank_candidates: budget_configuration(65_536, 100),
+                },
+                leaf_beam_size_override: None,
                 blocking_resource_limit: Some(2),
                 backend_max_mutations: 100,
                 backend_max_mutation_bytes: 1_000,
@@ -681,6 +692,17 @@ mod tests {
             compare(
                 &baseline,
                 &suite(changed_budget),
+                ComparisonPolicy::default()
+            )
+            .is_err()
+        );
+
+        let mut changed_traversal = report();
+        changed_traversal.configuration.leaf_beam_size_override = Some(16);
+        assert!(
+            compare(
+                &baseline,
+                &suite(changed_traversal),
                 ComparisonPolicy::default()
             )
             .is_err()
