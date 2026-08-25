@@ -334,6 +334,9 @@ async fn operations_record_the_documented_series() {
             &[("dimension", dimension)]
         ));
     }
+    for stage in ["approximate_selection", "exact_reranking"] {
+        assert!(seen("ktann.search.stage.duration", &[("stage", stage)]));
+    }
     assert!(seen("ktann.import.wait", &[("gate", "in_flight_slot")]));
     assert!(seen("ktann.import.wait", &[("gate", "backlog")]));
     assert!(seen("ktann.fixup.state_age", &[("kind", "split")]));

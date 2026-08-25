@@ -1,0 +1,351 @@
+//! Versioned benchmark report schema and distribution summaries.
+
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+
+/// Current on-disk report schema.
+pub const REPORT_SCHEMA_VERSION: u32 = 1;
+
+/// Reports produced by one suite command on one comparable host.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct BenchmarkSuite {
+    /// Report schema version.
+    pub schema_version: u32,
+    /// Exact command that reproduces the suite.
+    pub reproduction_command: String,
+    /// Scenario reports, each measured in an isolated worker process.
+    pub reports: Vec<BenchmarkReport>,
+}
+
+/// One complete, reproducible benchmark result.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct BenchmarkReport {
+    /// Unix timestamp at report creation.
+    pub generated_unix_seconds: u64,
+    /// Exact shell command that reproduces the run.
+    pub reproduction_command: String,
+    /// Git revision measured by the worker.
+    pub git_revision: String,
+    /// Hardware and runtime facts.
+    pub environment: Environment,
+    /// Benchmark inputs and process-local limits.
+    pub configuration: Configuration,
+    /// Fixed input data identity.
+    pub dataset: DatasetMetadata,
+    /// Stable topology facts after setup.
+    pub topology: Topology,
+    /// Measurements collected outside setup and warmup.
+    pub measurements: Measurements,
+}
+
+/// Hardware and software metadata needed to judge comparability.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct Environment {
+    /// Operating-system and kernel description.
+    pub operating_system: String,
+    /// CPU model reported by the host.
+    pub cpu_model: String,
+    /// Logical CPU count visible to the process.
+    pub logical_cpus: usize,
+    /// Installed memory in bytes when available.
+    pub memory_bytes: Option<u64>,
+    /// Build-time `rustc --version --verbose` output.
+    pub rustc: String,
+    /// Cargo profile used to compile the benchmark executable.
+    pub build_profile: String,
+    /// Additive Cargo features compiled into the benchmark executable.
+    pub build_features: String,
+    /// Rust code-generation flags applied at build time.
+    pub rustflags: String,
+    /// Storage-engine client and server identity.
+    pub backend_runtime: String,
+    /// Tokio worker-thread count used by the benchmark.
+    pub tokio_worker_threads: usize,
+}
+
+/// Reproducible benchmark configuration.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct Configuration {
+    /// Production Backend under measurement.
+    pub backend: String,
+    /// Workload scenario.
+    pub scenario: String,
+    /// Dataset/operation scale.
+    pub profile: String,
+    /// Replayable random seed.
+    pub seed: u64,
+    /// Exact vector dimension accepted by the Logical Index.
+    pub dimension: usize,
+    /// Stable distance metric name.
+    pub metric: String,
+    /// Percentage of workload operations that are searches.
+    pub search_percent: u8,
+    /// Whether writes target a small conflict set.
+    pub hot_updates: bool,
+    /// Logical Index merge threshold.
+    pub min_partition_entries: u32,
+    /// Logical Index split threshold.
+    pub max_partition_entries: u32,
+    /// Runtime Partition Cache capacity.
+    pub partition_cache_bytes: u64,
+    /// Foreground operation concurrency limit.
+    pub foreground_limit: usize,
+    /// Background Structure Maintenance worker count.
+    pub maintenance_workers: usize,
+    /// Pending-plus-running Fixup capacity.
+    pub fixup_queue_capacity: usize,
+    /// Per-search Tree Key scan limit.
+    pub scanned_tree_keys_budget: u32,
+    /// Per-search partition visit limit.
+    pub visited_partitions_budget: u32,
+    /// Per-search Leaf Entry visit limit.
+    pub visited_leaf_entries_budget: u32,
+    /// Per-search exact-rerank candidate limit.
+    pub exact_rerank_candidates_budget: u32,
+    /// RocksDB native blocking-resource limit, when applicable.
+    pub blocking_resource_limit: Option<usize>,
+    /// Backend Admission Budget mutation-count ceiling.
+    pub backend_max_mutations: usize,
+    /// Backend Admission Budget mutation-byte ceiling.
+    pub backend_max_mutation_bytes: usize,
+    /// Concurrent workload clients.
+    pub concurrency: usize,
+    /// Operations executed before measurement.
+    pub warmup_operations: usize,
+    /// Operations included in the report.
+    pub measured_operations: usize,
+    /// Requested result count.
+    pub k: usize,
+}
+
+/// Identity and size of one fixed public or synthetic dataset.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DatasetMetadata {
+    /// Canonical dataset/distribution name.
+    pub name: String,
+    /// Number of indexed vectors.
+    pub base_vectors: usize,
+    /// Number of held-out query vectors.
+    pub query_vectors: usize,
+    /// Vector dimension.
+    pub dimension: usize,
+    /// Stable xxh3-128 checksum over vector bits and IDs.
+    pub checksum_xxh3_128: String,
+}
+
+/// Persistent topology facts after setup convergence.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct Topology {
+    /// Verified Vector Record count.
+    pub vector_records: u64,
+    /// Verified partition count.
+    pub partitions: u64,
+    /// Verified internal and Leaf Entry count.
+    pub entries: u64,
+}
+
+/// Measurements attributed to one isolated scenario worker.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct Measurements {
+    /// Timed-region wall-clock duration.
+    pub wall_seconds: f64,
+    /// Time after foreground completion until its maintenance backlog drained.
+    pub maintenance_drain_seconds: f64,
+    /// User/system CPU through foreground work and maintenance drain.
+    pub cpu_seconds: Option<f64>,
+    /// Whole-worker peak RSS, including setup, warmup, and measurement.
+    pub peak_rss_bytes: Option<u64>,
+    /// Successful operations per wall-clock second.
+    pub throughput_per_second: f64,
+    /// Successful operation count.
+    pub successful_operations: u64,
+    /// Failed operation count.
+    pub failed_operations: u64,
+    /// Failures by stable KTANN error category.
+    pub errors: BTreeMap<String, u64>,
+    /// End-to-end successful operation latency in milliseconds.
+    pub latency_ms: Distribution,
+    /// Recall@k for successful searches.
+    pub recall_at_k: Option<RecallSummary>,
+    /// Search budget use for every public dimension.
+    pub search_budgets: BTreeMap<String, BudgetSummary>,
+    /// Approximate-selection and exact-reranking stage latency.
+    pub search_stages_ms: BTreeMap<String, Distribution>,
+    /// Partition Cache observations.
+    pub cache: CacheSummary,
+    /// Backend blocking/admission observations.
+    pub backend_admission: AdmissionSummary,
+    /// Backend-neutral logical KV work attempted in the timed region.
+    pub backend_io: BackendIo,
+    /// Logical KV work per successful write operation.
+    pub write_amplification: Option<WriteAmplification>,
+}
+
+/// A finite sample distribution.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct Distribution {
+    /// Number of observations.
+    pub count: u64,
+    /// Arithmetic mean.
+    pub mean: f64,
+    /// Minimum.
+    pub min: f64,
+    /// Median.
+    pub p50: f64,
+    /// 95th percentile, nearest-rank.
+    pub p95: f64,
+    /// 99th percentile, nearest-rank.
+    pub p99: f64,
+    /// Maximum.
+    pub max: f64,
+}
+
+impl Distribution {
+    /// Summarizes finite samples in their current unit.
+    #[must_use]
+    pub fn from_samples(mut samples: Vec<f64>) -> Self {
+        samples.retain(|sample| sample.is_finite());
+        if samples.is_empty() {
+            return Self::default();
+        }
+        samples.sort_by(f64::total_cmp);
+        let count = samples.len();
+        let sum: f64 = samples.iter().sum();
+        Self {
+            count: count as u64,
+            mean: sum / count as f64,
+            min: samples[0],
+            p50: percentile(&samples, 50),
+            p95: percentile(&samples, 95),
+            p99: percentile(&samples, 99),
+            max: samples[count - 1],
+        }
+    }
+
+    /// Converts a seconds distribution into milliseconds.
+    #[must_use]
+    pub fn seconds_to_milliseconds(mut self) -> Self {
+        for value in [
+            &mut self.mean,
+            &mut self.min,
+            &mut self.p50,
+            &mut self.p95,
+            &mut self.p99,
+            &mut self.max,
+        ] {
+            *value *= 1_000.0;
+        }
+        self
+    }
+}
+
+/// Returns the nearest-rank percentile from finite samples sorted ascending.
+fn percentile(samples: &[f64], percentile: usize) -> f64 {
+    let rank = percentile
+        .saturating_mul(samples.len())
+        .div_ceil(100)
+        .saturating_sub(1)
+        .min(samples.len() - 1);
+    samples[rank]
+}
+
+/// Recall distribution across successful queries.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct RecallSummary {
+    /// Number of queries evaluated.
+    pub queries: u64,
+    /// Mean recall@k.
+    pub mean: f64,
+    /// Minimum per-query recall@k.
+    pub min: f64,
+}
+
+/// One public Search Budget's use and exhaustion.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct BudgetSummary {
+    /// Work charged per successful search.
+    pub usage: Distribution,
+    /// Searches where this budget prevented eligible work.
+    pub exhausted_searches: u64,
+}
+
+/// Partition Cache lookup and capacity observations.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct CacheSummary {
+    /// Lookups by `level/result`.
+    pub lookups: BTreeMap<String, u64>,
+    /// Installs by `level/result`.
+    pub installs: BTreeMap<String, u64>,
+    /// Last reported accounted cache bytes.
+    pub accounted_bytes: Option<u64>,
+}
+
+/// Backend resource admission distributions.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct AdmissionSummary {
+    /// RocksDB wait for a native actor slot, milliseconds.
+    pub blocking_wait_ms: Distribution,
+    /// RocksDB native actor hold time, milliseconds.
+    pub blocking_held_ms: Distribution,
+    /// Import gate waits, milliseconds, by gate.
+    pub import_wait_ms: BTreeMap<String, Distribution>,
+}
+
+/// Backend-neutral attempted logical KV work.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct BackendIo {
+    /// Read transactions opened.
+    pub read_transactions: u64,
+    /// Write transactions opened, including retries.
+    pub write_transactions: u64,
+    /// Point and batch point-read keys requested.
+    pub point_read_keys: u64,
+    /// Range scan calls.
+    pub scans: u64,
+    /// Logical KV items returned by reads.
+    pub items_read: u64,
+    /// Logical key/value bytes returned by reads.
+    pub bytes_read: u64,
+    /// Attempted point mutations, including retry attempts.
+    pub mutation_operations: u64,
+    /// Attempted logical mutation key/value bytes.
+    pub mutation_bytes: u64,
+    /// Attempted transactional range clears.
+    pub range_clears: u64,
+    /// Definitely committed write transactions.
+    pub commits: u64,
+    /// Definitely retryable commit outcomes.
+    pub retryable_commits: u64,
+    /// Unknown commit outcomes.
+    pub unknown_commits: u64,
+    /// Other failed commit outcomes.
+    pub failed_commits: u64,
+}
+
+/// Logical write amplification derived from Backend calls.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct WriteAmplification {
+    /// Successful user-visible writes.
+    pub successful_writes: u64,
+    /// Attempted logical KV mutation operations per successful write.
+    pub logical_mutations_per_write: f64,
+    /// Attempted logical mutation bytes per successful write.
+    pub logical_bytes_per_write: f64,
+    /// Whole-operation retries observed by KTANN.
+    pub write_retries: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Distribution;
+
+    #[test]
+    fn distribution_uses_nearest_rank_percentiles() {
+        let distribution = Distribution::from_samples((1..=100).map(|n| n as f64).collect());
+        assert_eq!(distribution.count, 100);
+        assert_eq!(distribution.p50, 50.0);
+        assert_eq!(distribution.p95, 95.0);
+        assert_eq!(distribution.p99, 99.0);
+    }
+}

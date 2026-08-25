@@ -326,6 +326,7 @@ const ALLOWED_LABEL_VALUES: &[(&str, &[&str])] = &[
             "exact_rerank_candidates",
         ],
     ),
+    ("stage", &["approximate_selection", "exact_reranking"]),
     ("level", &["leaf", "internal"]),
     (
         "result",

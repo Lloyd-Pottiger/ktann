@@ -16,6 +16,8 @@ pub(crate) mod key {
     pub(crate) const OUTCOME: &str = "outcome";
     /// One Search Budget dimension.
     pub(crate) const DIMENSION: &str = "dimension";
+    /// One measured search stage.
+    pub(crate) const STAGE: &str = "stage";
     /// The Partition Cache level.
     pub(crate) const LEVEL: &str = "level";
     /// The bounded result of one cache access.
@@ -24,6 +26,25 @@ pub(crate) mod key {
     pub(crate) const KIND: &str = "kind";
     /// One Import Session admission gate.
     pub(crate) const GATE: &str = "gate";
+}
+
+/// One measured search stage (key `stage`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SearchStage {
+    /// Tree Key enumeration, tree traversal, and RaBitQ candidate selection.
+    ApproximateSelection,
+    /// Original Vector Record loading and exact-distance reranking.
+    ExactReranking,
+}
+
+impl SearchStage {
+    /// Returns the bounded metric label value.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ApproximateSelection => "approximate_selection",
+            Self::ExactReranking => "exact_reranking",
+        }
+    }
 }
 
 /// One observed foreground operation or maintenance write step (key

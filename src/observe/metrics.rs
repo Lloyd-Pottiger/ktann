@@ -11,8 +11,8 @@ use crate::search::cache::PartitionKind;
 
 use super::labels::{
     BudgetDimension, CacheInstallResult, CacheLookupResult, FixupAdmission, FixupExecution,
-    FixupKind, ImportGate, Operation, OperationOutcome, VerifyCompletion, cache_level, key,
-    verify_issue,
+    FixupKind, ImportGate, Operation, OperationOutcome, SearchStage, VerifyCompletion, cache_level,
+    key, verify_issue,
 };
 
 /// The metric names of the `ktann.*` namespace; the inventory table in
@@ -23,6 +23,7 @@ pub(crate) mod names {
     pub(crate) const WRITE_RETRIES: &str = "ktann.write.retries";
     pub(crate) const SEARCH_BUDGET_USAGE: &str = "ktann.search.budget.usage";
     pub(crate) const SEARCH_BUDGET_EXHAUSTED: &str = "ktann.search.budget.exhausted";
+    pub(crate) const SEARCH_STAGE_DURATION: &str = "ktann.search.stage.duration";
     pub(crate) const CACHE_LOOKUP: &str = "ktann.cache.lookup";
     pub(crate) const CACHE_INSTALL: &str = "ktann.cache.install";
     pub(crate) const CACHE_BYTES: &str = "ktann.cache.bytes";
@@ -34,6 +35,15 @@ pub(crate) mod names {
     pub(crate) const IMPORT_WAIT: &str = "ktann.import.wait";
     pub(crate) const VERIFY_REPORTS: &str = "ktann.verify.reports";
     pub(crate) const VERIFY_ISSUES: &str = "ktann.verify.issues";
+}
+
+/// Records one successful search stage's elapsed time.
+pub(crate) fn search_stage_finished(stage: SearchStage, duration: Duration) {
+    metrics::histogram!(
+        names::SEARCH_STAGE_DURATION,
+        key::STAGE => stage.as_str(),
+    )
+    .record(duration.as_secs_f64());
 }
 
 /// Records one finished foreground operation's outcome and latency.
@@ -224,6 +234,7 @@ mod tests {
                     ..Default::default()
                 },
             );
+            search_stage_finished(SearchStage::ApproximateSelection, Duration::from_millis(1));
             cache_lookup(PartitionKind::Leaf, CacheLookupResult::Hit);
             cache_install(PartitionKind::Internal, CacheInstallResult::SkippedStale);
             cache_bytes(512);
@@ -270,6 +281,7 @@ mod tests {
             names::WRITE_RETRIES,
             names::SEARCH_BUDGET_USAGE,
             names::SEARCH_BUDGET_EXHAUSTED,
+            names::SEARCH_STAGE_DURATION,
             names::CACHE_LOOKUP,
             names::CACHE_INSTALL,
             names::CACHE_BYTES,

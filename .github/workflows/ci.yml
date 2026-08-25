@@ -31,6 +31,18 @@ jobs:
         run: .github/scripts/setup-foundationdb.sh client
       - name: Test workspace
         run: cargo +"${{ matrix.toolchain }}" test --workspace --all-targets
+      - name: Run RocksDB benchmark smoke profile
+        if: matrix.toolchain == 'stable'
+        run: >-
+          cargo +stable run -p ktann-benchmarks --bin ktann-bench --
+          run --backend rocksdb --profile smoke --worker-threads 2
+          --output "${{ runner.temp }}/rocksdb-smoke.json"
+      - name: Upload RocksDB benchmark smoke report
+        if: matrix.toolchain == 'stable'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rocksdb-smoke
+          path: ${{ runner.temp }}/rocksdb-smoke.json
       - name: Write RocksDB durability probe
         env:
           KTANN_ROCKSDB_DURABILITY_PHASE: write
@@ -49,7 +61,7 @@ jobs:
   foundationdb:
     name: FoundationDB integration
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - name: Install stable Rust
@@ -62,6 +74,17 @@ jobs:
           --test foundationdb_adapter --test foundationdb_faults
           --test foundationdb_verify --test foundationdb_observability
           --test foundationdb_recall -- --ignored
+      - name: Run FoundationDB benchmark smoke profile
+        run: >-
+          cargo +stable run -p ktann-benchmarks
+          --no-default-features --features foundationdb --bin ktann-bench --
+          run --backend foundationdb --profile smoke --worker-threads 2
+          --output "${{ runner.temp }}/foundationdb-smoke.json"
+      - name: Upload FoundationDB benchmark smoke report
+        uses: actions/upload-artifact@v4
+        with:
+          name: foundationdb-smoke
+          path: ${{ runner.temp }}/foundationdb-smoke.json
       - name: Write FoundationDB durability probe
         env:
           KTANN_FDB_DURABILITY_PHASE: write
