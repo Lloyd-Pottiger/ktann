@@ -8,7 +8,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use ktann::api::{
     DataType, ErrorKind, FieldId, FieldSchema, Index, IndexConfig, Metric, Mutation, Record,
-    RuntimeConfig, SearchOutcome, SearchRequest, Value, VerifyOptions,
+    RuntimeConfig, SearchBudgets, SearchOptions, SearchOutcome, SearchRequest, Value,
+    VerifyOptions,
 };
 use ktann::runtime::Runtime;
 use ktann::storage::backend::Backend;
@@ -17,8 +18,8 @@ use crate::backend::{BackendCounters, MeasuredBackend};
 use crate::dataset::{self, BenchmarkDataset};
 use crate::metrics::{CapturedMetrics, MetricCapture};
 use crate::report::{
-    BenchmarkReport, BudgetSummary, Configuration, Distribution, Environment, Measurements,
-    RecallSummary, Topology, WriteAmplification,
+    BenchmarkReport, BudgetConfiguration, BudgetSummary, Configuration, Distribution, Environment,
+    Measurements, RecallSummary, SearchBudgetConfiguration, Topology, WriteAmplification,
 };
 use crate::resource::ResourceSnapshot;
 
@@ -81,6 +82,8 @@ pub struct ScenarioSpec {
     pub measured_operations: usize,
     /// Search result count.
     pub k: usize,
+    /// Per-request Search Budget and traversal overrides.
+    pub search_options: SearchOptions,
     /// Logical Index maximum partition size.
     pub max_partition_entries: u32,
 }
@@ -119,6 +122,7 @@ fn smoke_scenarios() -> Vec<ScenarioSpec> {
         warmup_operations: 16,
         measured_operations: 64,
         k: 10,
+        search_options: SearchOptions::default(),
         max_partition_entries: 32,
     };
     vec![
@@ -175,6 +179,7 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
         warmup_operations: query_vectors,
         measured_operations: query_vectors.saturating_mul(10),
         k: 10,
+        search_options: SearchOptions::default(),
         max_partition_entries: 128,
     };
     let clustered = ann("ann-clustered", "clustered", 5_000, 100, 128, 0x38_1001);
@@ -250,7 +255,9 @@ pub async fn run_scenario<B: Backend>(
     let admission = backend.admission_budget();
     let metric_capture = MetricCapture::install()?;
     let runtime_config = runtime_config(spec)?;
-    let search_budgets = runtime_config.default_search_budgets();
+    let default_search_budgets = runtime_config.default_search_budgets();
+    let search_budgets =
+        search_budget_configuration(default_search_budgets, spec.search_options, spec.k)?;
     let runtime =
         Runtime::new(backend, runtime_config).map_err(|error| error_at("create runtime", error))?;
     let measured =
@@ -285,10 +292,8 @@ pub async fn run_scenario<B: Backend>(
             foreground_limit: spec.foreground_limit,
             maintenance_workers: MAINTENANCE_WORKERS,
             fixup_queue_capacity: FIXUP_QUEUE_CAPACITY,
-            scanned_tree_keys_budget: search_budgets.scanned_tree_keys(),
-            visited_partitions_budget: search_budgets.visited_partitions(),
-            visited_leaf_entries_budget: search_budgets.visited_leaf_entries(),
-            exact_rerank_candidates_budget: search_budgets.exact_rerank_candidates(),
+            search_budgets,
+            leaf_beam_size_override: spec.search_options.leaf_beam_size(),
             blocking_resource_limit: spec.blocking_resource_limit,
             backend_max_mutations: admission.max_mutations,
             backend_max_mutation_bytes: admission.max_mutation_bytes,
@@ -315,6 +320,39 @@ fn runtime_config(spec: &ScenarioSpec) -> Result<RuntimeConfig, String> {
         .and_then(|config| config.with_partition_cache_bytes(spec.partition_cache_bytes))
         .and_then(|config| config.validate().map(|()| config))
         .map_err(|error| error_at("configure runtime", error))
+}
+
+/// Resolves the exact limits used by scenario requests through the public API.
+fn search_budget_configuration(
+    defaults: SearchBudgets,
+    options: SearchOptions,
+    k: usize,
+) -> Result<SearchBudgetConfiguration, String> {
+    let effective = options
+        .resolve(defaults, k)
+        .map_err(|error| error_at("resolve search budgets", error))?;
+    Ok(SearchBudgetConfiguration {
+        scanned_tree_keys: BudgetConfiguration {
+            runtime_default: defaults.scanned_tree_keys(),
+            request_override: options.scanned_tree_keys(),
+            effective_limit: effective.scanned_tree_keys(),
+        },
+        visited_partitions: BudgetConfiguration {
+            runtime_default: defaults.visited_partitions(),
+            request_override: options.visited_partitions(),
+            effective_limit: effective.visited_partitions(),
+        },
+        visited_leaf_entries: BudgetConfiguration {
+            runtime_default: defaults.visited_leaf_entries(),
+            request_override: options.visited_leaf_entries(),
+            effective_limit: effective.visited_leaf_entries(),
+        },
+        exact_rerank_candidates: BudgetConfiguration {
+            runtime_default: defaults.exact_rerank_candidates(),
+            request_override: options.exact_rerank_candidates(),
+            effective_limit: effective.exact_rerank_candidates(),
+        },
+    })
 }
 
 /// Owns setup, warmup, measurement, and the post-run invariant audit.
@@ -517,6 +555,7 @@ async fn settle_topology<B: Backend>(
         // without introducing a private maintenance control surface.
         for query in dataset.queries.iter().take(4) {
             let request = SearchRequest::new(Arc::clone(query), spec.k)
+                .map(|request| request.with_options(spec.search_options))
                 .map_err(|error| error_at("construct topology-settling search", error))?;
             index
                 .search(request)
@@ -632,6 +671,7 @@ fn work_items(
             // latency, but never compare against stale pre-update truth.
             let truth = truth.map(|truth| Arc::clone(&truth[query_index]));
             let request = SearchRequest::new(Arc::clone(&dataset.queries[query_index]), spec.k)
+                .map(|request| request.with_options(spec.search_options))
                 .map_err(|error| error_at("construct search request", error))?;
             items.push(WorkItem::Search { request, truth });
         } else {
@@ -898,7 +938,9 @@ fn error_at(phase: &str, error: ktann::api::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_search_operation, runtime_config, scenarios};
+    use ktann::api::{SearchBudgets, SearchOptions};
+
+    use super::{is_search_operation, runtime_config, scenarios, search_budget_configuration};
 
     #[test]
     fn every_scenario_has_a_jointly_valid_runtime_configuration() {
@@ -927,5 +969,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn report_exposes_the_k_derived_effective_rerank_limit() {
+        let budgets =
+            search_budget_configuration(SearchBudgets::default(), SearchOptions::default(), 10)
+                .expect("default search budgets resolve");
+
+        let rerank = budgets.exact_rerank_candidates;
+        assert_eq!(rerank.runtime_default, 65_536);
+        assert_eq!(rerank.request_override, None);
+        assert_eq!(rerank.effective_limit, 100);
+    }
+
+    #[test]
+    fn report_distinguishes_a_request_budget_override() {
+        let options = SearchOptions::default()
+            .with_visited_partitions(64)
+            .and_then(|options| options.with_exact_rerank_candidates(256))
+            .expect("valid request overrides");
+        let budgets = search_budget_configuration(SearchBudgets::default(), options, 10)
+            .expect("overridden search budgets resolve");
+
+        let partitions = budgets.visited_partitions;
+        assert_eq!(partitions.runtime_default, 1_024);
+        assert_eq!(partitions.request_override, Some(64));
+        assert_eq!(partitions.effective_limit, 64);
+
+        let rerank = budgets.exact_rerank_candidates;
+        assert_eq!(rerank.runtime_default, 65_536);
+        assert_eq!(rerank.request_override, Some(256));
+        assert_eq!(rerank.effective_limit, 256);
     }
 }

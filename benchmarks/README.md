@@ -67,6 +67,21 @@ The timed workload reports:
 - logical write amplification as attempted mutation operations and bytes per
   successful public write, including retry attempts.
 
+`configuration.search_budgets` exposes the same four dimension names used by
+`measurements.search_budgets`:
+`scanned_tree_keys`, `visited_partitions`, `visited_leaf_entries`, and
+`exact_rerank_candidates`. Each configuration entry distinguishes the Runtime
+`runtime_default`, an optional per-request `request_override`, and the concrete
+`effective_limit`. The measurement entry can therefore compare its usage and
+exhausted-search count directly with the governing limit. `visited_leaf_entries`
+counts derived Leaf Entries considered during filtering and approximate
+selection; `exact_rerank_candidates` counts original Vector Records loaded and
+exactly reranked.
+
+The configuration also records `leaf_beam_size_override` because this
+per-request traversal input affects recall and partition work even though it is
+not a Search Budget dimension.
+
 Foreground `wall_seconds`, throughput, and operation latency stop when the last
 public operation completes. `maintenance_drain_seconds`, CPU, and Backend IO
 continue until the pending-plus-running Fixup backlog returns to zero, so

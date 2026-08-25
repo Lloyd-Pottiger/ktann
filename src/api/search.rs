@@ -136,6 +136,30 @@ impl SearchOptions {
         Ok(self)
     }
 
+    /// Returns the scanned Tree Key budget override.
+    #[must_use]
+    pub const fn scanned_tree_keys(self) -> Option<u32> {
+        self.scanned_tree_keys
+    }
+
+    /// Returns the visited partition budget override.
+    #[must_use]
+    pub const fn visited_partitions(self) -> Option<u32> {
+        self.visited_partitions
+    }
+
+    /// Returns the visited Leaf Entry budget override.
+    #[must_use]
+    pub const fn visited_leaf_entries(self) -> Option<u32> {
+        self.visited_leaf_entries
+    }
+
+    /// Returns the exact-rerank candidate budget override.
+    #[must_use]
+    pub const fn exact_rerank_candidates(self) -> Option<u32> {
+        self.exact_rerank_candidates
+    }
+
     /// Overrides the positive leaf-level base beam width.
     ///
     /// The beam is a traversal-quality knob, not an accounted budget
