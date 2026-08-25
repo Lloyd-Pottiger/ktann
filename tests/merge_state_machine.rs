@@ -3293,26 +3293,56 @@ async fn seeded_model_history_interleaving_mutations_splits_and_merges() {
 
     // Drive every remaining intermediate state to completion, then verify the
     // final tree against the model.
+    let mut settled = false;
     for _ in 0..500 {
         let partitions = all_partitions(&backend, &manifest, &key).await;
         let mut progressed = false;
+        let mut blocked = false;
         for partition in &partitions {
-            let outcome = split::advance(&backend, &manifest, &key, *partition, 60_000, &retry())
-                .await
-                .expect("split advance");
+            let outcome =
+                match split::advance(&backend, &manifest, &key, *partition, 60_000, &retry()).await
+                {
+                    Ok(outcome) => outcome,
+                    // A child split waits while its parent drains; advancing the
+                    // parent in this bounded loop makes a later attempt succeed.
+                    Err(error) if error.kind() == ErrorKind::ContentionExhausted => {
+                        blocked = true;
+                        continue;
+                    }
+                    Err(error) => panic!("split advance: {error:?}"),
+                };
             if outcome != split::Advance::Idle {
                 progressed = true;
             }
             let outcome = merge::advance(&backend, &manifest, &key, *partition, 60_000, &retry())
                 .await
                 .expect("merge advance");
+            if outcome == merge::Advance::Stalled {
+                blocked = true;
+            }
             if !matches!(outcome, merge::Advance::Idle | merge::Advance::Stalled) {
                 progressed = true;
             }
         }
         if !progressed {
+            assert!(
+                !blocked,
+                "topology convergence stalled on parent maintenance"
+            );
+            settled = true;
             break;
         }
+    }
+    assert!(settled, "topology convergence exceeded the bounded drive");
+    for partition in all_partitions(&backend, &manifest, &key).await {
+        assert_eq!(
+            header_of(&backend, &manifest, &key, partition)
+                .await
+                .expect("reachable partition header")
+                .state(),
+            PartitionState::Ready,
+            "partition {partition:?} did not settle"
+        );
     }
     let model_records: Vec<(Bytes, f32)> = model.iter().map(|(id, x)| (id.clone(), *x)).collect();
     assert_searchable(&backend, &manifest, &key, &model_records).await;

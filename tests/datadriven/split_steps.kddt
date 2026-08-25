@@ -210,8 +210,8 @@ tree 0: root pk=1
   pk=1 level=2 state=Ready count=4
     pk=2 level=1 state=Ready count=4
     pk=3 level=1 state=DrainingSplit count=1 left=4 right=5
-      pk=4 level=1 state=ReceivingSplit count=0
-      pk=5 level=1 state=ReceivingSplit count=8
+      pk=4 level=1 state=ReceivingSplit count=1
+      pk=5 level=1 state=ReceivingSplit count=7
 
 validate
 ----
@@ -228,8 +228,8 @@ format-tree
 tree 0: root pk=1
   pk=1 level=2 state=Ready count=3
     pk=2 level=1 state=Ready count=4
-    pk=4 level=1 state=Ready count=1
-    pk=5 level=1 state=Ready count=8
+    pk=4 level=1 state=Ready count=2
+    pk=5 level=1 state=Ready count=7
 
 validate
 ----

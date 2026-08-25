@@ -187,6 +187,41 @@ async fn inserts_drive_splits_to_completion() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicate_heavy_split_converges_without_immediate_merge() {
+    let backend = backend();
+    let runtime = Runtime::new(backend.clone(), runtime_config(2, 16, 8)).expect("runtime");
+    let index = runtime
+        .create_index("duplicate-heavy", index_config(2, 4))
+        .await
+        .expect("create index");
+    let mut model = Model::new();
+    for (id, x) in [0.0_f32, 0.0, 0.0, 0.0, 100.0].into_iter().enumerate() {
+        insert(
+            &index,
+            &mut model,
+            u8::try_from(id).expect("five fixtures fit in u8"),
+            x,
+        )
+        .await;
+    }
+
+    settle(&index, &backend, &model).await;
+    assert_converged(&backend, &index, &model).await;
+    let partitions = audit::list_partitions(&backend, index.logical_index_id())
+        .await
+        .expect("list partitions");
+    let mut leaf_counts = partitions
+        .iter()
+        .filter(|(_, _, header)| header.level() == 1)
+        .map(|(_, _, header)| header.entry_count())
+        .collect::<Vec<_>>();
+    leaf_counts.sort_unstable();
+    assert_eq!(leaf_counts, [2, 3]);
+    assert_records(&index, &model).await;
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deletes_drive_merges_to_completion() {
     let backend = backend();
     let runtime = Runtime::new(backend.clone(), runtime_config(2, 16, 8)).expect("runtime");
