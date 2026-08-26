@@ -141,8 +141,8 @@ impl CommitCancellation {
 
 /// Explicit bounds on one forward scan page.
 ///
-/// Both limits must be non-zero; [`WriteTxn::scan`] and [`ReadTxn::scan`]
-/// reject a zero limit before doing any work.
+/// Both limits must be non-zero; [`ReadOps::scan`] rejects a zero limit before
+/// doing any work.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ScanLimits {
     /// The maximum number of items returned by one page.

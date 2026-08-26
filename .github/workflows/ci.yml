@@ -31,6 +31,12 @@ jobs:
         run: .github/scripts/setup-foundationdb.sh client
       - name: Test workspace
         run: cargo +"${{ matrix.toolchain }}" test --workspace --all-targets
+      - name: Check public documentation
+        env:
+          RUSTDOCFLAGS: -Dwarnings
+        run: >-
+          cargo +"${{ matrix.toolchain }}" doc --workspace --all-features
+          --no-deps
       - name: Run RocksDB benchmark smoke profile
         if: matrix.toolchain == 'stable'
         run: >-
