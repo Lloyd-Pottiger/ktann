@@ -20,8 +20,8 @@
 //! - **No persisted target.** Merging stores no fixed target and no drain
 //!   cursor. Each bounded batch performs ordinary same-level routing, skips
 //!   the source and every non-Ready candidate, and selects the nearest
-//!   current `Ready` target with canonical tie-breakers
-//!   ([`routing::nearest_ready_candidate`]). A target that leaves `Ready`
+//!   current `Ready` target by routing distance with the canonical Partition
+//!   Key tie-break. A target that leaves `Ready`
 //!   between the read snapshot and the write attempt discards the route and
 //!   starts target selection again from a fresh snapshot, with no durable or
 //!   process-local target affinity. Different entries may move to different
