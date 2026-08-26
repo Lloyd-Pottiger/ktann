@@ -89,6 +89,8 @@ struct CompareOptions {
     maximum_relative_regression: f64,
     /// Absolute ceiling for recall@k loss.
     maximum_recall_drop: f64,
+    /// Absolute ceiling for an admission-rejection rate increase.
+    maximum_rejection_rate_increase: f64,
 }
 
 /// Validates public suite options at the process boundary.
@@ -146,6 +148,7 @@ fn parse_worker_options(arguments: &[OsString]) -> Result<WorkerOptions, String>
 
 /// Validates report paths and material-regression thresholds.
 fn parse_compare_options(arguments: &[OsString]) -> Result<CompareOptions, String> {
+    let defaults = ComparisonPolicy::default();
     let values = option_map(
         arguments,
         &[
@@ -154,22 +157,31 @@ fn parse_compare_options(arguments: &[OsString]) -> Result<CompareOptions, Strin
             "output",
             "maximum-relative-regression",
             "maximum-recall-drop",
+            "maximum-rejection-rate-increase",
         ],
     )?;
     let maximum_relative_regression = values
         .get("maximum-relative-regression")
-        .map_or(Ok(0.20), |value| {
+        .map_or(Ok(defaults.maximum_relative_regression), |value| {
             parse_number(value, "maximum-relative-regression")
         })?;
     let maximum_recall_drop = values
         .get("maximum-recall-drop")
-        .map_or(Ok(0.02), |value| parse_number(value, "maximum-recall-drop"))?;
+        .map_or(Ok(defaults.maximum_recall_drop), |value| {
+            parse_number(value, "maximum-recall-drop")
+        })?;
+    let maximum_rejection_rate_increase = values
+        .get("maximum-rejection-rate-increase")
+        .map_or(Ok(defaults.maximum_rejection_rate_increase), |value| {
+            parse_number(value, "maximum-rejection-rate-increase")
+        })?;
     Ok(CompareOptions {
         baseline: PathBuf::from(required(&values, "baseline")?),
         candidate: PathBuf::from(required(&values, "candidate")?),
         output: values.get("output").map(PathBuf::from),
         maximum_relative_regression,
         maximum_recall_drop,
+        maximum_rejection_rate_increase,
     })
 }
 
@@ -526,6 +538,7 @@ fn compare_reports(options: CompareOptions) -> Result<(), String> {
         ComparisonPolicy {
             maximum_relative_regression: options.maximum_relative_regression,
             maximum_recall_drop: options.maximum_recall_drop,
+            maximum_rejection_rate_increase: options.maximum_rejection_rate_increase,
         },
     )?;
     write_json(options.output.as_deref(), &comparison)?;
@@ -593,7 +606,7 @@ fn shell_quote(value: &OsStr) -> String {
 
 /// Returns the stable help shown for missing or unknown public commands.
 fn usage() -> String {
-    "usage:\n  ktann-bench run --backend rocksdb|foundationdb [--profile smoke|full] [--scenario NAME] [--worker-threads N] [--output PATH]\n  ktann-bench compare --baseline PATH --candidate PATH [--maximum-relative-regression N] [--maximum-recall-drop N] [--output PATH]".to_owned()
+    "usage:\n  ktann-bench run --backend rocksdb|foundationdb [--profile smoke|full] [--scenario NAME] [--worker-threads N] [--output PATH]\n  ktann-bench compare --baseline PATH --candidate PATH [--maximum-relative-regression N] [--maximum-recall-drop N] [--maximum-rejection-rate-increase N] [--output PATH]".to_owned()
 }
 
 #[cfg(test)]
@@ -629,11 +642,14 @@ mod tests {
             "0.10",
             "--maximum-recall-drop",
             "0.01",
+            "--maximum-rejection-rate-increase",
+            "0.03",
         ]
         .map(std::ffi::OsString::from);
         let options = parse_compare_options(&arguments).expect("documented options");
         assert_eq!(options.maximum_relative_regression, 0.10);
         assert_eq!(options.maximum_recall_drop, 0.01);
+        assert_eq!(options.maximum_rejection_rate_increase, 0.03);
     }
 
     #[test]

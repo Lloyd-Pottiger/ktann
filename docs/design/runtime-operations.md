@@ -93,7 +93,8 @@ Tracing may include Logical Index ID, Partition Key, and a stable Tree Key hash.
 It never includes raw Index Name, Tree Key, Record ID, fields, vector, or
 payload. Errors use the same redaction policy.
 
-Required observations cover operation latency/outcome; conflicts/retries and
+Required observations cover operation latency/outcome and foreground admission
+rejection; conflicts/retries and
 commit unknown; logical budget use; cache bytes/results; maintenance admission,
 backlog, retries, state age, and completion; Bloom saturation; RocksDB semaphore
 wait/blocking duration; and import backpressure. Names use one `ktann.*`

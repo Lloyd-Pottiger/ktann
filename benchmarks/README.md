@@ -55,7 +55,10 @@ the entire isolated worker, including setup and warmup.
 
 The timed workload reports:
 
-- successful-operation throughput and end-to-end latency distributions;
+- accepted-operation throughput plus attempted, accepted, admission-rejected,
+  and stable error-category counts by search/write class;
+- accepted end-to-end latency distributions by search/write class; rejection
+  rates are derived from the reported outcome counts;
 - exact recall@k against a precomputed brute-force L2 oracle for immutable ANN
   scenarios;
 - every Search Budget dimension and separate `approximate_selection` and
@@ -96,6 +99,16 @@ they still contribute any Backend work attempted before failure. The logical
 write-amplification definition is backend-neutral and deliberately distinct
 from RocksDB engine-level physical write amplification.
 
+The `backend-admission-saturated` scenario submits fixed concurrent waves. A
+wave drains before the next begins, preventing fast `LimitExceeded` results
+from recursively generating nearly all remaining attempts while accepted work
+is still in flight. Runtime admission limits are unchanged. Both profiles
+require at least 100 accepted searches and 100 accepted writes, with an overall
+rejection rate from 25% through 75%. A run outside
+that declared operating region fails instead of emitting a statistically weak
+baseline. The smoke scenario measures 640 operations; the full scenario
+measures 2,000 operations.
+
 ## Comparing results
 
 Capture baseline and candidate suites on the same otherwise idle host, with
@@ -112,12 +125,19 @@ cargo run --release -p ktann-benchmarks --bin ktann-bench -- \
 The comparator refuses different report schemas, scenario sets, inputs, or
 hardware/runtime fingerprints. By default it flags more than 20% regression in
 p95 latency, throughput, CPU, peak RSS, or logical write amplification, and an
-absolute mean recall drop greater than 0.02. Override these materiality bounds
-with `--maximum-relative-regression` and `--maximum-recall-drop`. Both accept
-fractions: for example, `--maximum-relative-regression 0.10` means 10%, while
-`--maximum-recall-drop 0.01` means one percentage point of absolute recall.
-Thresholds absorb ordinary measurement noise; changing them is benchmark
-policy, not a public KTANN guarantee.
+absolute mean recall drop greater than 0.02. Admission rejection is compared
+across the fixed operation mix with a five-percentage-point absolute increase
+threshold. Per-class outcomes remain in the report, while the aggregate avoids
+mistaking scheduler-dependent permit allocation between searches and writes
+for an admission regression. Override
+these materiality bounds with `--maximum-relative-regression`,
+`--maximum-recall-drop`, and `--maximum-rejection-rate-increase`. All accept
+fractions: for example, `0.10` means ten percentage points for the absolute
+thresholds and 10% for the relative threshold. Thresholds absorb ordinary
+measurement noise; changing them is benchmark policy, not a public KTANN
+guarantee. Latency distributions additionally require at least a 1 ms absolute
+p95 increase before a relative increase is material, avoiding large ratios on
+sub-millisecond samples.
 
 `git_revision` receives a `-dirty` suffix when tracked or untracked workspace
 changes are present. Commit or otherwise preserve the exact patch before using
