@@ -8,7 +8,7 @@ use metrics::atomics::AtomicU64;
 use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
 use metrics_util::registry::{AtomicStorage, Registry};
 
-use crate::report::{AdmissionSummary, CacheSummary, Distribution};
+use crate::report::{AdmissionSummary, CacheSummary, Distribution, OperationClass};
 
 /// One process-global recorder used by a single benchmark worker.
 #[derive(Debug)]
@@ -144,6 +144,19 @@ impl CapturedMetrics {
             .get(&SeriesKey::new(name, labels))
             .copied()
             .unwrap_or_default()
+    }
+
+    /// Returns Runtime foreground-admission rejections for one public class.
+    #[must_use]
+    pub fn foreground_admission_rejections(&self, class: OperationClass) -> u64 {
+        let operation = match class {
+            OperationClass::Search => "search",
+            OperationClass::Write => "upsert",
+        };
+        self.counter(
+            "ktann.foreground.admission",
+            &[("operation", operation), ("outcome", "rejected")],
+        )
     }
 
     /// Returns one histogram with the exact label set.

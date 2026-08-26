@@ -18,8 +18,9 @@ use crate::backend::{BackendCounters, MeasuredBackend};
 use crate::dataset::{self, BenchmarkDataset};
 use crate::metrics::{CapturedMetrics, MetricCapture};
 use crate::report::{
-    BenchmarkReport, BudgetConfiguration, BudgetSummary, Configuration, Distribution, Environment,
-    Measurements, RecallSummary, SearchBudgetConfiguration, Topology, WriteAmplification,
+    AdmissionTarget, BenchmarkReport, BudgetConfiguration, BudgetSummary, Configuration,
+    Distribution, Environment, Measurements, OperationClass, OperationSummary, RecallSummary,
+    SearchBudgetConfiguration, Topology, WorkloadDispatch, WriteAmplification,
 };
 use crate::resource::ResourceSnapshot;
 
@@ -76,6 +77,8 @@ pub struct ScenarioSpec {
     pub blocking_resource_limit: Option<usize>,
     /// Concurrent clients in the timed workload.
     pub concurrency: usize,
+    /// Dispatch policy for the bounded concurrent clients.
+    pub dispatch: WorkloadDispatch,
     /// Operations outside the timed region that establish steady state.
     pub warmup_operations: usize,
     /// Operations in the timed region.
@@ -119,6 +122,7 @@ fn smoke_scenarios() -> Vec<ScenarioSpec> {
         foreground_limit: 8,
         blocking_resource_limit: None,
         concurrency: 2,
+        dispatch: WorkloadDispatch::Continuous,
         warmup_operations: 16,
         measured_operations: 64,
         k: 10,
@@ -152,9 +156,10 @@ fn smoke_scenarios() -> Vec<ScenarioSpec> {
             search_percent: 50,
             hot_updates: true,
             blocking_resource_limit: Some(1),
-            concurrency: 8,
+            concurrency: 16,
             foreground_limit: 4,
-            measured_operations: 96,
+            dispatch: WorkloadDispatch::FixedWaves(admission_target()),
+            measured_operations: 640,
             ..common
         },
     ]
@@ -176,6 +181,7 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
         foreground_limit: 32,
         blocking_resource_limit: None,
         concurrency: 4,
+        dispatch: WorkloadDispatch::Continuous,
         warmup_operations: query_vectors,
         measured_operations: query_vectors.saturating_mul(10),
         k: 10,
@@ -224,9 +230,19 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
             foreground_limit: 8,
             concurrency: 32,
             measured_operations: 2_000,
+            dispatch: WorkloadDispatch::FixedWaves(admission_target()),
             ..clustered
         },
     ]
+}
+
+/// Defines a sample-rich mixed region while preserving visible overload.
+const fn admission_target() -> AdmissionTarget {
+    AdmissionTarget {
+        minimum_accepted_per_class: 100,
+        minimum_rejection_rate: 0.25,
+        maximum_rejection_rate: 0.75,
+    }
 }
 
 /// Runs one scenario through KTANN's public Runtime and Index APIs.
@@ -298,6 +314,7 @@ pub async fn run_scenario<B: Backend>(
             backend_max_mutations: admission.max_mutations,
             backend_max_mutation_bytes: admission.max_mutation_bytes,
             concurrency: spec.concurrency,
+            dispatch: spec.dispatch,
             warmup_operations: spec.warmup_operations,
             measured_operations: spec.measured_operations,
             k: spec.k,
@@ -388,7 +405,8 @@ async fn run_with_runtime<B: Backend>(
     let topology = settle_topology(&index, dataset, spec).await?;
     let truth = (spec.search_percent == 100).then(|| exact_truth(dataset, spec.k));
     let warmup = work_items(dataset, None, spec, spec.warmup_operations, 0)?;
-    let _warmup_result = execute_items(index.clone(), warmup, spec.concurrency).await?;
+    let _warmup_result =
+        execute_items(index.clone(), warmup, spec.concurrency, spec.dispatch).await?;
 
     // Reset setup counters and histograms before the measured interval. Gauges
     // retain current process state and need no compatibility fallback.
@@ -405,7 +423,13 @@ async fn run_with_runtime<B: Backend>(
 
     let resources_before = ResourceSnapshot::capture()?;
     let wall_started = Instant::now();
-    let workload = execute_items(index.clone(), measured_items, spec.concurrency).await?;
+    let workload = execute_items(
+        index.clone(),
+        measured_items,
+        spec.concurrency,
+        spec.dispatch,
+    )
+    .await?;
     let wall_seconds = wall_started.elapsed().as_secs_f64();
     let metrics = metric_capture.snapshot();
     let maintenance_started = Instant::now();
@@ -429,7 +453,7 @@ async fn run_with_runtime<B: Backend>(
         ));
     }
 
-    let successful_writes = workload.successful_writes;
+    let successful_writes = workload.accepted_operations(OperationClass::Write);
     let write_amplification = (successful_writes > 0).then(|| WriteAmplification {
         successful_writes,
         logical_mutations_per_write: backend_io.mutation_operations as f64
@@ -437,7 +461,9 @@ async fn run_with_runtime<B: Backend>(
         logical_bytes_per_write: backend_io.mutation_bytes as f64 / successful_writes as f64,
         write_retries: metrics.write_retries(),
     });
-    let successful_operations = workload.successful_operations;
+    let successful_operations = workload.successful_operations();
+    let operations = workload.into_operation_summaries(&metrics);
+    validate_admission_target(&operations, spec)?;
     let measurements = Measurements {
         wall_seconds,
         maintenance_drain_seconds,
@@ -448,10 +474,7 @@ async fn run_with_runtime<B: Backend>(
         } else {
             0.0
         },
-        successful_operations,
-        failed_operations: workload.failed_operations,
-        errors: workload.errors,
-        latency_ms: Distribution::from_samples(workload.latency_ms),
+        operations,
         recall_at_k: recall_summary(&recalls),
         search_budgets: budget_summaries(&metrics),
         search_stages_ms: metrics
@@ -470,6 +493,43 @@ async fn run_with_runtime<B: Backend>(
         write_amplification,
     };
     Ok((topology, measurements))
+}
+
+/// Rejects pressure samples that do not occupy their declared operating region.
+fn validate_admission_target(
+    operations: &BTreeMap<OperationClass, OperationSummary>,
+    spec: &ScenarioSpec,
+) -> Result<(), String> {
+    let WorkloadDispatch::FixedWaves(target) = spec.dispatch else {
+        return Ok(());
+    };
+    for class in OperationClass::for_mix(spec.search_percent) {
+        let accepted = operations.get(&class).map_or(0, |summary| summary.accepted);
+        if accepted < target.minimum_accepted_per_class {
+            return Err(format!(
+                "admission sample has {} accepted {} operations; target requires at least {}",
+                accepted,
+                class.as_str(),
+                target.minimum_accepted_per_class
+            ));
+        }
+    }
+    let attempted: u64 = operations.values().map(|summary| summary.attempted).sum();
+    let rejected: u64 = operations.values().map(|summary| summary.rejected).sum();
+    let rejection_rate = if attempted == 0 {
+        0.0
+    } else {
+        rejected as f64 / attempted as f64
+    };
+    if rejection_rate < target.minimum_rejection_rate
+        || rejection_rate > target.maximum_rejection_rate
+    {
+        return Err(format!(
+            "admission sample has {rejected}/{attempted} rejected operations ({rejection_rate:.4}); target rate is [{:.4}, {:.4}]",
+            target.minimum_rejection_rate, target.maximum_rejection_rate
+        ));
+    }
+    Ok(())
 }
 
 /// Loads ordinary atomic mutation batches, retrying only definite exhaustion.
@@ -621,35 +681,33 @@ enum WorkItem {
 /// Measurements returned by one operation task.
 #[derive(Debug)]
 struct OperationObservation {
+    /// Public operation class used for per-class admission reporting.
+    class: OperationClass,
     /// End-to-end API latency; aggregation retains it only after success.
     latency_ms: f64,
-    /// Mutually exclusive success kind or stable public failure category.
-    result: Result<SuccessfulOperation, ErrorKind>,
-}
-
-/// Successful operation state needed by workload aggregation.
-#[derive(Debug)]
-enum SuccessfulOperation {
-    /// Search with optional immutable truth for post-timing recall.
-    Search(Option<RecallInput>),
-    /// Upsert contributing to the write-amplification divisor.
-    Write,
+    /// Optional search-recall input on success, or a stable failure category.
+    result: Result<Option<RecallInput>, ErrorKind>,
 }
 
 /// Aggregation built only after all bounded operation tasks have joined.
 #[derive(Debug, Default)]
 struct WorkloadObservation {
-    /// Successful API calls used for throughput.
-    successful_operations: u64,
-    /// Failed API calls reported separately from the latency distribution.
-    failed_operations: u64,
-    /// Successful upserts used as the logical write-amplification divisor.
-    successful_writes: u64,
-    /// End-to-end latency samples for successful API calls.
-    latency_ms: Vec<f64>,
+    /// Attempt and outcome observations grouped by public operation class.
+    operations: BTreeMap<OperationClass, OperationClassObservation>,
     /// Search results whose exact recall is computed after resource timing.
     recall_inputs: Vec<RecallInput>,
-    /// Failed calls grouped by stable public error category.
+}
+
+/// Raw samples for one public operation class.
+#[derive(Debug, Default)]
+struct OperationClassObservation {
+    /// Public calls issued in the measured region.
+    attempted: u64,
+    /// Calls that returned success.
+    accepted: u64,
+    /// Accepted-call latency samples.
+    latency_ms: Vec<f64>,
+    /// All failures grouped by stable public error category.
     errors: BTreeMap<String, u64>,
 }
 
@@ -712,6 +770,19 @@ async fn execute_items<B: Backend>(
     index: Index<MeasuredBackend<B>>,
     items: Vec<WorkItem>,
     concurrency: usize,
+    dispatch: WorkloadDispatch,
+) -> Result<WorkloadObservation, String> {
+    match dispatch {
+        WorkloadDispatch::Continuous => execute_continuous(index, items, concurrency).await,
+        WorkloadDispatch::FixedWaves(_) => execute_fixed_waves(index, items, concurrency).await,
+    }
+}
+
+/// Sustains pressure by replacing each client as soon as its operation ends.
+async fn execute_continuous<B: Backend>(
+    index: Index<MeasuredBackend<B>>,
+    items: Vec<WorkItem>,
+    concurrency: usize,
 ) -> Result<WorkloadObservation, String> {
     let mut aggregate = WorkloadObservation::default();
     let mut items = items.into_iter();
@@ -733,26 +804,92 @@ async fn execute_items<B: Backend>(
     Ok(aggregate)
 }
 
+/// Applies repeatable overload bursts without letting fast rejections self-amplify.
+async fn execute_fixed_waves<B: Backend>(
+    index: Index<MeasuredBackend<B>>,
+    items: Vec<WorkItem>,
+    concurrency: usize,
+) -> Result<WorkloadObservation, String> {
+    let mut aggregate = WorkloadObservation::default();
+    let mut items = items.into_iter();
+    let mut tasks = tokio::task::JoinSet::new();
+    loop {
+        let wave_size = items.len().min(concurrency);
+        if wave_size == 0 {
+            break;
+        }
+        let start = Arc::new(tokio::sync::Barrier::new(wave_size + 1));
+        for item in items.by_ref().take(wave_size) {
+            let index = index.clone();
+            let start = Arc::clone(&start);
+            tasks.spawn(async move {
+                start.wait().await;
+                execute_item(&index, item).await
+            });
+        }
+        start.wait().await;
+        while let Some(result) = tasks.join_next().await {
+            aggregate.push(result.map_err(|error| format!("workload task failed: {error}"))?);
+        }
+    }
+    Ok(aggregate)
+}
+
 impl WorkloadObservation {
     /// Merges one completed task without treating failures as useful latency.
     fn push(&mut self, observation: OperationObservation) {
+        let operation = self.operations.entry(observation.class).or_default();
+        operation.attempted = operation.attempted.saturating_add(1);
         match observation.result {
             Err(error) => {
-                self.failed_operations = self.failed_operations.saturating_add(1);
-                *self.errors.entry(format!("{error:?}")).or_default() += 1;
+                *operation.errors.entry(format!("{error:?}")).or_default() += 1;
             }
-            Ok(success) => {
-                self.successful_operations = self.successful_operations.saturating_add(1);
-                self.latency_ms.push(observation.latency_ms);
-                match success {
-                    SuccessfulOperation::Search(Some(input)) => self.recall_inputs.push(input),
-                    SuccessfulOperation::Search(None) => {}
-                    SuccessfulOperation::Write => {
-                        self.successful_writes = self.successful_writes.saturating_add(1);
-                    }
+            Ok(recall_input) => {
+                operation.accepted = operation.accepted.saturating_add(1);
+                operation.latency_ms.push(observation.latency_ms);
+                if let Some(input) = recall_input {
+                    self.recall_inputs.push(input);
                 }
             }
         }
+    }
+
+    /// Counts all accepted public operations for foreground throughput.
+    fn successful_operations(&self) -> u64 {
+        self.operations
+            .values()
+            .map(|operation| operation.accepted)
+            .sum()
+    }
+
+    /// Counts accepted calls for one public operation class.
+    fn accepted_operations(&self, class: OperationClass) -> u64 {
+        self.operations
+            .get(&class)
+            .map_or(0, |operation| operation.accepted)
+    }
+
+    /// Builds the stable per-class report schema from retained raw samples.
+    fn into_operation_summaries(
+        self,
+        metrics: &CapturedMetrics,
+    ) -> BTreeMap<OperationClass, OperationSummary> {
+        self.operations
+            .into_iter()
+            .map(|(class, operation)| {
+                let rejected = metrics.foreground_admission_rejections(class);
+                (
+                    class,
+                    OperationSummary {
+                        attempted: operation.attempted,
+                        accepted: operation.accepted,
+                        rejected,
+                        errors: operation.errors,
+                        latency_ms: Distribution::from_samples(operation.latency_ms),
+                    },
+                )
+            })
+            .collect()
     }
 
     /// Computes oracle overlap only after latency, wall, and CPU observations.
@@ -772,21 +909,26 @@ async fn execute_item<B: Backend>(
     item: WorkItem,
 ) -> OperationObservation {
     let started = Instant::now();
-    let result = match item {
-        WorkItem::Search { request, truth } => index
-            .search(request)
-            .await
-            .map(|outcome| {
-                SuccessfulOperation::Search(truth.map(|truth| RecallInput { outcome, truth }))
-            })
-            .map_err(|error| error.kind()),
-        WorkItem::Upsert { record } => index
-            .upsert(record)
-            .await
-            .map(|_| SuccessfulOperation::Write)
-            .map_err(|error| error.kind()),
+    let (class, result) = match item {
+        WorkItem::Search { request, truth } => (
+            OperationClass::Search,
+            index
+                .search(request)
+                .await
+                .map(|outcome| truth.map(|truth| RecallInput { outcome, truth }))
+                .map_err(|error| error.kind()),
+        ),
+        WorkItem::Upsert { record } => (
+            OperationClass::Write,
+            index
+                .upsert(record)
+                .await
+                .map(|_| None)
+                .map_err(|error| error.kind()),
+        ),
     };
     OperationObservation {
+        class,
         latency_ms: started.elapsed().as_secs_f64() * 1_000.0,
         result,
     }
@@ -938,9 +1080,39 @@ fn error_at(phase: &str, error: ktann::api::Error) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use ktann::api::{SearchBudgets, SearchOptions};
 
-    use super::{is_search_operation, runtime_config, scenarios, search_budget_configuration};
+    use crate::report::{Distribution, OperationClass, OperationSummary};
+
+    use super::{
+        is_search_operation, runtime_config, scenarios, search_budget_configuration,
+        validate_admission_target,
+    };
+
+    fn operation_summary(attempted: u64, accepted: u64, rejected: u64) -> OperationSummary {
+        let other_failures = attempted
+            .checked_sub(accepted + rejected)
+            .expect("outcomes fit attempts");
+        let mut errors = BTreeMap::new();
+        if rejected > 0 {
+            errors.insert("LimitExceeded".to_owned(), rejected);
+        }
+        if other_failures > 0 {
+            errors.insert("Backend".to_owned(), other_failures);
+        }
+        OperationSummary {
+            attempted,
+            accepted,
+            rejected,
+            errors,
+            latency_ms: Distribution {
+                count: accepted,
+                ..Default::default()
+            },
+        }
+    }
 
     #[test]
     fn every_scenario_has_a_jointly_valid_runtime_configuration() {
@@ -969,6 +1141,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn admission_target_rejects_weak_samples() {
+        let scenario = scenarios("full")
+            .expect("known profile")
+            .into_iter()
+            .find(|scenario| scenario.name == "backend-admission-saturated")
+            .expect("admission scenario");
+        let mut operations = BTreeMap::from([
+            (OperationClass::Search, operation_summary(200, 100, 100)),
+            (OperationClass::Write, operation_summary(200, 100, 100)),
+        ]);
+        assert!(validate_admission_target(&operations, &scenario).is_ok());
+
+        operations.insert(OperationClass::Search, operation_summary(200, 99, 100));
+        assert!(validate_admission_target(&operations, &scenario).is_err());
+
+        for summary in operations.values_mut() {
+            *summary = operation_summary(500, 100, 400);
+        }
+        assert!(validate_admission_target(&operations, &scenario).is_err());
     }
 
     #[test]

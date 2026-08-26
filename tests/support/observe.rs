@@ -300,6 +300,8 @@ const ALLOWED_LABEL_VALUES: &[(&str, &[&str])] = &[
             "backend",
             "other",
             "corruption",
+            // Foreground Runtime admission.
+            "rejected",
             // Native commit outcomes.
             "committed",
             "retryable",

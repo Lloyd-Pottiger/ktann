@@ -25,6 +25,7 @@
 //! | --- | --- | --- |
 //! | `ktann.operation.total` | counter | operation, outcome |
 //! | `ktann.operation.duration` | histogram | operation, outcome |
+//! | `ktann.foreground.admission` | counter | operation, outcome |
 //! | `ktann.write.retries` | counter | operation |
 //! | `ktann.search.budget.usage` | histogram | dimension |
 //! | `ktann.search.budget.exhausted` | counter | dimension |

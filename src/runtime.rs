@@ -393,7 +393,7 @@ impl<B: Backend> RuntimeInner<B> {
         Fut: Future<Output = Result<T>> + Send + 'static,
     {
         let started = Instant::now();
-        let (admission, backend) = match self.admit(&options).await {
+        let (admission, backend) = match self.admit(operation, &options).await {
             Ok(admitted) => admitted,
             Err(error) => {
                 observe_operation(
@@ -481,7 +481,11 @@ impl<B: Backend> RuntimeInner<B> {
         result
     }
 
-    async fn admit(self: &Arc<Self>, options: &OperationOptions) -> Result<(Admission<B>, Arc<B>)> {
+    async fn admit(
+        self: &Arc<Self>,
+        operation: Operation,
+        options: &OperationOptions,
+    ) -> Result<(Admission<B>, Arc<B>)> {
         check_control(options)?;
         let acquired = match self.foreground.clone().try_acquire_owned() {
             Ok(permit) => Ok(permit),
@@ -491,6 +495,7 @@ impl<B: Backend> RuntimeInner<B> {
                     Ok(waiting) => waiting,
                     Err(TryAcquireError::NoPermits) => {
                         check_control(options)?;
+                        metrics::foreground_admission_rejected(operation);
                         return Err(Error::new(ErrorKind::LimitExceeded));
                     }
                     Err(TryAcquireError::Closed) => {
@@ -535,7 +540,6 @@ impl<B: Backend> RuntimeInner<B> {
             lifecycle.begin_activity();
             backend
         };
-
         Ok((
             Admission {
                 inner: Arc::clone(self),

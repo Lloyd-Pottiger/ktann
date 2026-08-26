@@ -107,6 +107,8 @@ pub struct Configuration {
     pub backend_max_mutation_bytes: usize,
     /// Concurrent workload clients.
     pub concurrency: usize,
+    /// How clients are dispatched during the measured workload.
+    pub dispatch: WorkloadDispatch,
     /// Operations executed before measurement.
     pub warmup_operations: usize,
     /// Operations included in the report.
@@ -178,14 +180,8 @@ pub struct Measurements {
     pub peak_rss_bytes: Option<u64>,
     /// Successful operations per wall-clock second.
     pub throughput_per_second: f64,
-    /// Successful operation count.
-    pub successful_operations: u64,
-    /// Failed operation count.
-    pub failed_operations: u64,
-    /// Failures by stable KTANN error category.
-    pub errors: BTreeMap<String, u64>,
-    /// End-to-end successful operation latency in milliseconds.
-    pub latency_ms: Distribution,
+    /// Attempt, outcome, and successful-latency results by public operation class.
+    pub operations: BTreeMap<OperationClass, OperationSummary>,
     /// Recall@k for successful searches.
     pub recall_at_k: Option<RecallSummary>,
     /// Search budget use for every public dimension.
@@ -200,6 +196,112 @@ pub struct Measurements {
     pub backend_io: BackendIo,
     /// Logical KV work per successful write operation.
     pub write_amplification: Option<WriteAmplification>,
+}
+
+/// Scheduling shape used to apply bounded client pressure.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkloadDispatch {
+    /// Replenish one client whenever any operation completes.
+    Continuous,
+    /// Submit fixed concurrent waves and let each wave drain before the next.
+    FixedWaves(AdmissionTarget),
+}
+
+/// Public operation classes reported independently by mixed workloads.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationClass {
+    /// Approximate search followed by exact reranking.
+    Search,
+    /// One replacement upsert.
+    Write,
+}
+
+impl OperationClass {
+    /// Returns the stable report key for this operation class.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Search => "search",
+            Self::Write => "write",
+        }
+    }
+
+    /// Returns the operation classes present in a search/write mix.
+    pub(crate) fn for_mix(search_percent: u8) -> impl Iterator<Item = Self> {
+        [
+            (search_percent > 0).then_some(Self::Search),
+            (search_percent < 100).then_some(Self::Write),
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+
+/// Observable operating region required from an admission-pressure scenario.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+pub struct AdmissionTarget {
+    /// Successful samples required for every attempted operation class.
+    pub minimum_accepted_per_class: u64,
+    /// Inclusive lower bound for the overall admission-rejection rate.
+    pub minimum_rejection_rate: f64,
+    /// Inclusive upper bound for the overall admission-rejection rate.
+    pub maximum_rejection_rate: f64,
+}
+
+/// Outcomes and successful latency for one public operation class.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct OperationSummary {
+    /// Public calls issued in the measured region.
+    pub attempted: u64,
+    /// Calls that returned success.
+    pub accepted: u64,
+    /// Calls rejected by the Runtime foreground admission bound.
+    pub rejected: u64,
+    /// All failures grouped by stable KTANN error category.
+    pub errors: BTreeMap<String, u64>,
+    /// End-to-end latency of accepted calls in milliseconds.
+    pub latency_ms: Distribution,
+}
+
+impl OperationSummary {
+    /// Returns failures not attributed to Runtime foreground admission.
+    pub(crate) fn non_admission_failures(&self) -> u64 {
+        self.attempted
+            .checked_sub(self.accepted)
+            .and_then(|failures| failures.checked_sub(self.rejected))
+            .expect("validated operation outcomes fit within attempts")
+    }
+
+    /// Checks that serialized outcome counts agree with each other.
+    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        let failures = self
+            .attempted
+            .checked_sub(self.accepted)
+            .ok_or("accepted operations exceed attempts")?;
+        let error_count = self
+            .errors
+            .values()
+            .try_fold(0_u64, |sum, count| sum.checked_add(*count))
+            .ok_or("operation error count overflow")?;
+        if failures != error_count {
+            return Err("operation errors do not account for failed attempts");
+        }
+        if self.rejected
+            > self
+                .errors
+                .get("LimitExceeded")
+                .copied()
+                .unwrap_or_default()
+        {
+            return Err("admission rejections exceed limit-exceeded failures");
+        }
+        if self.latency_ms.count != self.accepted {
+            return Err("accepted operation count differs from latency samples");
+        }
+        Ok(())
+    }
 }
 
 /// A finite sample distribution.

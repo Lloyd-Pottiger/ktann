@@ -20,6 +20,7 @@ use super::labels::{
 pub(crate) mod names {
     pub(crate) const OPERATION_TOTAL: &str = "ktann.operation.total";
     pub(crate) const OPERATION_DURATION: &str = "ktann.operation.duration";
+    pub(crate) const FOREGROUND_ADMISSION: &str = "ktann.foreground.admission";
     pub(crate) const WRITE_RETRIES: &str = "ktann.write.retries";
     pub(crate) const SEARCH_BUDGET_USAGE: &str = "ktann.search.budget.usage";
     pub(crate) const SEARCH_BUDGET_EXHAUSTED: &str = "ktann.search.budget.exhausted";
@@ -35,6 +36,16 @@ pub(crate) mod names {
     pub(crate) const IMPORT_WAIT: &str = "ktann.import.wait";
     pub(crate) const VERIFY_REPORTS: &str = "ktann.verify.reports";
     pub(crate) const VERIFY_ISSUES: &str = "ktann.verify.issues";
+}
+
+/// Counts one Runtime foreground admission rejection.
+pub(crate) fn foreground_admission_rejected(operation: Operation) {
+    metrics::counter!(
+        names::FOREGROUND_ADMISSION,
+        key::OPERATION => operation.as_str(),
+        key::OUTCOME => "rejected",
+    )
+    .increment(1);
 }
 
 /// Records one successful search stage's elapsed time.
@@ -221,6 +232,7 @@ mod tests {
                 OperationOutcome::Ok,
                 Duration::from_millis(3),
             );
+            foreground_admission_rejected(Operation::Search);
             write_retried(Operation::SplitFixup);
             search_budget(
                 &SearchBudgetUsage {
@@ -278,6 +290,7 @@ mod tests {
         for expected in [
             names::OPERATION_TOTAL,
             names::OPERATION_DURATION,
+            names::FOREGROUND_ADMISSION,
             names::WRITE_RETRIES,
             names::SEARCH_BUDGET_USAGE,
             names::SEARCH_BUDGET_EXHAUSTED,
