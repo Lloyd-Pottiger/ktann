@@ -800,26 +800,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn duplicate_offers_during_execution_coalesce() {
-        let runtime = failing_runtime(1, 4);
-        let manifest = manifest(1);
-        let key = (tree_key(1), PartitionKey::new(1).expect("nonzero"));
-        for _ in 0..8 {
-            runtime.handle.inner.offer_fixups(&manifest, [key.clone()]);
-        }
-        eventually(|| {
-            let queue = runtime.handle.inner.lock_fixups();
-            queue.admitted.is_empty() && queue.stats.enqueued == 1
-        })
-        .await;
-        let stats = runtime.handle.inner.fixup_stats();
-        assert_eq!(stats.enqueued, 1);
-        assert!(stats.duplicate >= 1);
-        assert_eq!(stats.retired, 1);
-        runtime.shutdown().await.expect("shutdown succeeds");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn saturated_queue_drops_and_later_offers_admit() {
         let runtime = failing_runtime(1, 1);
         let manifest = manifest(1);

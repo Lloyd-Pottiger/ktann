@@ -178,9 +178,9 @@ pub struct Topology {
 #[serde(tag = "kind", content = "values", rename_all = "snake_case")]
 pub enum ReportMeasurements {
     /// Existing steady-state or mixed-workload measurements.
-    SteadyState(SteadyStateMeasurements),
+    SteadyState(Box<SteadyStateMeasurements>),
     /// Import-to-search lifecycle phase measurements.
-    Lifecycle(LifecycleMeasurements),
+    Lifecycle(Box<LifecycleMeasurements>),
 }
 
 /// Measurements attributed to one steady-state scenario worker.

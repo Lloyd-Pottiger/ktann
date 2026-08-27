@@ -331,7 +331,7 @@ pub async fn run_scenario<B: Backend>(
             &dataset,
         )
         .await?;
-        (topology, ReportMeasurements::Lifecycle(lifecycle))
+        (topology, ReportMeasurements::Lifecycle(Box::new(lifecycle)))
     } else {
         let runtime = Runtime::new(backend, runtime_config)
             .map_err(|error| error_at("create runtime", error))?;
@@ -343,7 +343,10 @@ pub async fn run_scenario<B: Backend>(
             .map_err(|error| error_at("shut down runtime", error));
         let (topology, measurements) = measured?;
         shutdown?;
-        (topology, ReportMeasurements::SteadyState(measurements))
+        (
+            topology,
+            ReportMeasurements::SteadyState(Box::new(measurements)),
+        )
     };
 
     Ok(BenchmarkReport {

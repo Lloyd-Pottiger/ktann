@@ -1249,7 +1249,7 @@ mod tests {
                 checksum_xxh3_128: "checksum".to_owned(),
             },
             topology: Default::default(),
-            measurements: ReportMeasurements::SteadyState(SteadyStateMeasurements {
+            measurements: ReportMeasurements::SteadyState(Box::new(SteadyStateMeasurements {
                 cpu_seconds: Some(1.0),
                 peak_rss_bytes: Some(1_000),
                 throughput_per_second: 100.0,
@@ -1278,7 +1278,7 @@ mod tests {
                     write_retries: 0,
                 }),
                 ..Default::default()
-            }),
+            })),
         }
     }
 
@@ -1424,7 +1424,7 @@ mod tests {
             .import
             .batch_failures
             .insert("Backend".to_owned(), 1);
-        baseline_report.measurements = ReportMeasurements::Lifecycle(baseline_lifecycle);
+        baseline_report.measurements = ReportMeasurements::Lifecycle(Box::new(baseline_lifecycle));
 
         let baseline = suite(baseline_report.clone());
         let mut candidate = baseline_report;
