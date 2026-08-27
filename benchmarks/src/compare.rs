@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::report::{
     AdmissionSummary, BackendIo, BenchmarkReport, BenchmarkSuite, BudgetSummary, CacheSummary,
-    Distribution, OperationClass, OperationSummary, REPORT_SCHEMA_VERSION,
+    Distribution, LifecycleMeasurements, OperationClass, OperationSummary, REPORT_SCHEMA_VERSION,
+    ReportMeasurements, SearchPhase, SteadyStateMeasurements,
 };
 
 /// Sub-millisecond p95 movement is not stable enough to classify by ratio.
@@ -114,6 +115,8 @@ fn ensure_comparable(
 ) -> Result<(), String> {
     validate_operation_summaries(baseline)?;
     validate_operation_summaries(candidate)?;
+    validate_lifecycle_measurements(baseline)?;
+    validate_lifecycle_measurements(candidate)?;
     // Compare the schema type as a whole so adding a workload or admission
     // input cannot silently leave the comparability contract incomplete.
     if baseline.configuration != candidate.configuration
@@ -130,24 +133,89 @@ fn ensure_comparable(
             baseline.configuration.backend, baseline.configuration.scenario
         ));
     }
+    if std::mem::discriminant(&baseline.measurements)
+        != std::mem::discriminant(&candidate.measurements)
+    {
+        return Err(format!(
+            "scenario {}/{} has different measurement kinds",
+            baseline.configuration.backend, baseline.configuration.scenario
+        ));
+    }
+    Ok(())
+}
+
+/// Rejects internally inconsistent lifecycle measurements at the JSON boundary.
+fn validate_lifecycle_measurements(report: &BenchmarkReport) -> Result<(), String> {
+    let ReportMeasurements::Lifecycle(lifecycle) = &report.measurements else {
+        return Ok(());
+    };
+    if lifecycle.unattributed_wall_seconds().is_none() {
+        return Err(format!(
+            "scenario {}/{} has inconsistent lifecycle phase accounting",
+            report.configuration.backend, report.configuration.scenario
+        ));
+    }
+    match (
+        lifecycle.case_cpu_seconds,
+        lifecycle.unattributed_cpu_seconds(),
+    ) {
+        (Some(_), Some(_)) => {}
+        (None, None) => {}
+        _ => {
+            return Err(format!(
+                "scenario {}/{} has inconsistent lifecycle CPU accounting",
+                report.configuration.backend, report.configuration.scenario
+            ));
+        }
+    }
+    if lifecycle.unattributed_backend_io().is_none() {
+        return Err(format!(
+            "scenario {}/{} has inconsistent lifecycle Backend IO accounting",
+            report.configuration.backend, report.configuration.scenario
+        ));
+    }
+    let configured_attempts =
+        u64::try_from(report.configuration.measured_operations).map_err(|_| {
+            format!(
+                "scenario {}/{} measured operation count exceeds report range",
+                report.configuration.backend, report.configuration.scenario
+            )
+        })?;
+    for phase in [
+        &lifecycle.immediate_search,
+        &lifecycle.stable_cold_search,
+        &lifecycle.stable_warm_search,
+    ] {
+        phase.search.validate().map_err(|error| {
+            format!(
+                "scenario {}/{} has invalid lifecycle search results: {error}",
+                report.configuration.backend, report.configuration.scenario
+            )
+        })?;
+        if phase.search.attempted != configured_attempts {
+            return Err(format!(
+                "scenario {}/{} lifecycle query attempts differ from its configuration",
+                report.configuration.backend, report.configuration.scenario
+            ));
+        }
+    }
     Ok(())
 }
 
 /// Rejects internally inconsistent operation summaries at the JSON boundary.
 fn validate_operation_summaries(report: &BenchmarkReport) -> Result<(), String> {
-    if !OperationClass::for_mix(report.configuration.search_percent).eq(report
-        .measurements
-        .operations
-        .keys()
-        .copied())
+    let ReportMeasurements::SteadyState(measurements) = &report.measurements else {
+        return Ok(());
+    };
+    if !OperationClass::for_mix(report.configuration.search_percent)
+        .eq(measurements.operations.keys().copied())
     {
         return Err(format!(
             "scenario {}/{} has operation classes inconsistent with its mix",
             report.configuration.backend, report.configuration.scenario
         ));
     }
-    let attempted = report
-        .measurements
+    let attempted = measurements
         .operations
         .values()
         .try_fold(0_u64, |sum, summary| {
@@ -185,107 +253,113 @@ fn compare_report(
     policy: ComparisonPolicy,
     result: &mut ComparisonReport,
 ) {
+    match (&baseline.measurements, &candidate.measurements) {
+        (ReportMeasurements::SteadyState(baseline), ReportMeasurements::SteadyState(candidate)) => {
+            compare_steady_state(result, key, baseline, candidate, policy);
+        }
+        (ReportMeasurements::Lifecycle(baseline), ReportMeasurements::Lifecycle(candidate)) => {
+            compare_lifecycle(result, key, baseline, candidate, policy);
+        }
+        _ => result
+            .regressions
+            .push(format!("{key}: measurement kind changed")),
+    }
+}
+
+/// Compares one pair of steady-state scenario measurements.
+fn compare_steady_state(
+    result: &mut ComparisonReport,
+    key: &str,
+    baseline: &SteadyStateMeasurements,
+    candidate: &SteadyStateMeasurements,
+    policy: ComparisonPolicy,
+) {
     compare_operations(
         result,
         key,
-        &baseline.measurements.operations,
-        &candidate.measurements.operations,
+        &baseline.operations,
+        &candidate.operations,
         policy,
     );
     relative_decrease(
         result,
         key,
         "throughput",
-        baseline.measurements.throughput_per_second,
-        candidate.measurements.throughput_per_second,
+        baseline.throughput_per_second,
+        candidate.throughput_per_second,
         policy.maximum_relative_regression,
     );
     compare_optional_resource(
         result,
         key,
         "CPU seconds",
-        baseline.measurements.cpu_seconds,
-        candidate.measurements.cpu_seconds,
+        baseline.cpu_seconds,
+        candidate.cpu_seconds,
         policy.maximum_relative_regression,
     );
     relative_regression(
         result,
         key,
         "maintenance drain seconds",
-        baseline.measurements.maintenance_drain_seconds,
-        candidate.measurements.maintenance_drain_seconds,
+        baseline.maintenance_drain_seconds,
+        candidate.maintenance_drain_seconds,
         policy.maximum_relative_regression,
     );
     compare_distributions(
         result,
         key,
         "search stage",
-        &baseline.measurements.search_stages_ms,
-        &candidate.measurements.search_stages_ms,
+        &baseline.search_stages_ms,
+        &candidate.search_stages_ms,
         policy.maximum_relative_regression,
     );
     compare_budgets(
         result,
         key,
-        &baseline.measurements.search_budgets,
-        &candidate.measurements.search_budgets,
+        &baseline.search_budgets,
+        &candidate.search_budgets,
         policy.maximum_relative_regression,
     );
     compare_cache(
         result,
         key,
-        &baseline.measurements.cache,
-        &candidate.measurements.cache,
+        &baseline.cache,
+        &candidate.cache,
         policy.maximum_relative_regression,
     );
     compare_admission(
         result,
         key,
-        &baseline.measurements.backend_admission,
-        &candidate.measurements.backend_admission,
+        &baseline.backend_admission,
+        &candidate.backend_admission,
         policy.maximum_relative_regression,
     );
     compare_backend_io(
         result,
         key,
-        &baseline.measurements.backend_io,
-        &candidate.measurements.backend_io,
+        &baseline.backend_io,
+        &candidate.backend_io,
         policy.maximum_relative_regression,
     );
     compare_optional_resource(
         result,
         key,
         "peak RSS bytes",
-        baseline
-            .measurements
-            .peak_rss_bytes
-            .map(|value| value as f64),
-        candidate
-            .measurements
-            .peak_rss_bytes
-            .map(|value| value as f64),
+        baseline.peak_rss_bytes.map(|value| value as f64),
+        candidate.peak_rss_bytes.map(|value| value as f64),
         policy.maximum_relative_regression,
     );
+    compare_recall(
+        result,
+        key,
+        "",
+        baseline.recall_at_k.as_ref(),
+        candidate.recall_at_k.as_ref(),
+        policy.maximum_recall_drop,
+    );
     match (
-        baseline.measurements.recall_at_k.as_ref(),
-        candidate.measurements.recall_at_k.as_ref(),
-    ) {
-        (Some(baseline), Some(candidate)) => {
-            if baseline.mean - candidate.mean > policy.maximum_recall_drop {
-                result.regressions.push(format!(
-                    "{key}: mean recall dropped from {:.4} to {:.4}",
-                    baseline.mean, candidate.mean
-                ));
-            }
-        }
-        (None, None) => {}
-        _ => result
-            .regressions
-            .push(format!("{key}: recall availability changed")),
-    }
-    match (
-        baseline.measurements.write_amplification.as_ref(),
-        candidate.measurements.write_amplification.as_ref(),
+        baseline.write_amplification.as_ref(),
+        candidate.write_amplification.as_ref(),
     ) {
         (Some(baseline), Some(candidate)) => {
             relative_regression(
@@ -320,6 +394,407 @@ fn compare_report(
     }
 }
 
+/// Compares the phase boundaries unique to import-to-search lifecycle cases.
+fn compare_lifecycle(
+    result: &mut ComparisonReport,
+    key: &str,
+    baseline: &LifecycleMeasurements,
+    candidate: &LifecycleMeasurements,
+    policy: ComparisonPolicy,
+) {
+    relative_regression(
+        result,
+        key,
+        "lifecycle case wall seconds",
+        baseline.case_wall_seconds,
+        candidate.case_wall_seconds,
+        policy.maximum_relative_regression,
+    );
+    compare_optional_resource(
+        result,
+        key,
+        "lifecycle case CPU seconds",
+        baseline.case_cpu_seconds,
+        candidate.case_cpu_seconds,
+        policy.maximum_relative_regression,
+    );
+    compare_optional_resource(
+        result,
+        key,
+        "lifecycle case peak RSS bytes",
+        baseline.case_peak_rss_bytes.map(|value| value as f64),
+        candidate.case_peak_rss_bytes.map(|value| value as f64),
+        policy.maximum_relative_regression,
+    );
+    relative_decrease(
+        result,
+        key,
+        "import records/second",
+        baseline.import.records_per_second,
+        candidate.import.records_per_second,
+        policy.maximum_relative_regression,
+    );
+    compare_distribution(
+        result,
+        key,
+        "import submit latency",
+        &baseline.import.submit_latency_ms,
+        &candidate.import.submit_latency_ms,
+        policy.maximum_relative_regression,
+    );
+    compare_count_maps(
+        result,
+        key,
+        "import batch failure",
+        &baseline.import.batch_failures,
+        &candidate.import.batch_failures,
+        policy.maximum_relative_regression,
+    );
+    relative_decrease(
+        result,
+        key,
+        "import accepted records",
+        baseline.import.accepted_records as f64,
+        candidate.import.accepted_records as f64,
+        0.0,
+    );
+    compare_admission(
+        result,
+        key,
+        &baseline.import.admission,
+        &candidate.import.admission,
+        policy.maximum_relative_regression,
+    );
+    compare_phase_resources(
+        result,
+        key,
+        "import",
+        &baseline.import.resources,
+        &candidate.import.resources,
+        policy,
+    );
+    relative_regression(
+        result,
+        key,
+        "finish-to-stable seconds",
+        baseline.convergence.from_import_finish_seconds,
+        candidate.convergence.from_import_finish_seconds,
+        policy.maximum_relative_regression,
+    );
+    compare_phase_resources(
+        result,
+        key,
+        "convergence",
+        &baseline.convergence.resources,
+        &candidate.convergence.resources,
+        policy,
+    );
+    compare_phase_resources(
+        result,
+        key,
+        "cache reset",
+        &baseline.cache_reset,
+        &candidate.cache_reset,
+        policy,
+    );
+    relative_regression(
+        result,
+        key,
+        "convergence maintenance drain seconds",
+        baseline.convergence.maintenance_drain_seconds,
+        candidate.convergence.maintenance_drain_seconds,
+        policy.maximum_relative_regression,
+    );
+    compare_lifecycle_search(
+        result,
+        key,
+        "immediate search",
+        &baseline.immediate_search,
+        &candidate.immediate_search,
+        policy,
+    );
+    compare_lifecycle_search(
+        result,
+        key,
+        "stable cold search",
+        &baseline.stable_cold_search,
+        &candidate.stable_cold_search,
+        policy,
+    );
+    compare_lifecycle_search(
+        result,
+        key,
+        "stable warm search",
+        &baseline.stable_warm_search,
+        &candidate.stable_warm_search,
+        policy,
+    );
+}
+
+/// Compares one fixed lifecycle query pass without mixing cache states.
+fn compare_lifecycle_search(
+    result: &mut ComparisonReport,
+    key: &str,
+    phase_name: &str,
+    baseline: &SearchPhase,
+    candidate: &SearchPhase,
+    policy: ComparisonPolicy,
+) {
+    compare_distribution(
+        result,
+        key,
+        &format!("{phase_name} latency"),
+        &baseline.search.latency_ms,
+        &candidate.search.latency_ms,
+        policy.maximum_relative_regression,
+    );
+    relative_regression(
+        result,
+        key,
+        &format!("{phase_name} admission rejections"),
+        baseline.search.rejected as f64,
+        candidate.search.rejected as f64,
+        policy.maximum_relative_regression,
+    );
+    compare_non_admission_errors(
+        result,
+        key,
+        &format!("{phase_name} error"),
+        &baseline.search.errors,
+        &candidate.search.errors,
+        policy.maximum_relative_regression,
+    );
+    compare_optional_resource(
+        result,
+        key,
+        &format!("{phase_name} first-query latency"),
+        baseline.first_query_latency_ms,
+        candidate.first_query_latency_ms,
+        policy.maximum_relative_regression,
+    );
+    relative_decrease(
+        result,
+        key,
+        &format!("{phase_name} throughput"),
+        baseline.throughput_per_second,
+        candidate.throughput_per_second,
+        policy.maximum_relative_regression,
+    );
+    compare_recall(
+        result,
+        key,
+        &format!("{phase_name} "),
+        baseline.recall_at_k.as_ref(),
+        candidate.recall_at_k.as_ref(),
+        policy.maximum_recall_drop,
+    );
+    compare_budgets(
+        result,
+        key,
+        &baseline.search_budgets,
+        &candidate.search_budgets,
+        policy.maximum_relative_regression,
+    );
+    compare_distributions(
+        result,
+        key,
+        &format!("{phase_name} search stage"),
+        &baseline.search_stages_ms,
+        &candidate.search_stages_ms,
+        policy.maximum_relative_regression,
+    );
+    compare_cache(
+        result,
+        key,
+        &baseline.cache,
+        &candidate.cache,
+        policy.maximum_relative_regression,
+    );
+    compare_admission(
+        result,
+        key,
+        &baseline.backend_admission,
+        &candidate.backend_admission,
+        policy.maximum_relative_regression,
+    );
+    for (name, baseline, candidate) in [
+        (
+            "scanned Tree Keys",
+            baseline.truncation.scanned_tree_keys,
+            candidate.truncation.scanned_tree_keys,
+        ),
+        (
+            "visited partitions",
+            baseline.truncation.visited_partitions,
+            candidate.truncation.visited_partitions,
+        ),
+        (
+            "visited Leaf Entries",
+            baseline.truncation.visited_leaf_entries,
+            candidate.truncation.visited_leaf_entries,
+        ),
+        (
+            "exact rerank candidates",
+            baseline.truncation.exact_rerank_candidates,
+            candidate.truncation.exact_rerank_candidates,
+        ),
+        (
+            "RaBitQ overlap",
+            baseline.truncation.rabitq_overlap,
+            candidate.truncation.rabitq_overlap,
+        ),
+    ] {
+        relative_regression(
+            result,
+            key,
+            &format!("{phase_name} {name} truncation"),
+            baseline as f64,
+            candidate as f64,
+            policy.maximum_relative_regression,
+        );
+    }
+    compare_phase_resources(
+        result,
+        key,
+        phase_name,
+        &baseline.resources,
+        &candidate.resources,
+        policy,
+    );
+}
+
+/// Compares recall availability and its absolute mean drop.
+fn compare_recall(
+    result: &mut ComparisonReport,
+    key: &str,
+    prefix: &str,
+    baseline: Option<&crate::report::RecallSummary>,
+    candidate: Option<&crate::report::RecallSummary>,
+    maximum_drop: f64,
+) {
+    match (baseline, candidate) {
+        (Some(baseline), Some(candidate)) => {
+            if baseline.mean - candidate.mean > maximum_drop {
+                result.regressions.push(format!(
+                    "{key}: {prefix}mean recall dropped from {:.4} to {:.4}",
+                    baseline.mean, candidate.mean
+                ));
+            }
+            if baseline.min - candidate.min > maximum_drop {
+                result.regressions.push(format!(
+                    "{key}: {prefix}minimum recall dropped from {:.4} to {:.4}",
+                    baseline.min, candidate.min
+                ));
+            }
+        }
+        (None, None) => {}
+        _ => result
+            .regressions
+            .push(format!("{key}: {prefix}recall availability changed")),
+    }
+}
+
+/// Compares phase-local CPU, Backend IO, and maintenance work.
+fn compare_phase_resources(
+    result: &mut ComparisonReport,
+    key: &str,
+    phase_name: &str,
+    baseline: &crate::report::PhaseResources,
+    candidate: &crate::report::PhaseResources,
+    policy: ComparisonPolicy,
+) {
+    relative_regression(
+        result,
+        key,
+        &format!("{phase_name} wall seconds"),
+        baseline.wall_seconds,
+        candidate.wall_seconds,
+        policy.maximum_relative_regression,
+    );
+    compare_optional_resource(
+        result,
+        key,
+        &format!("{phase_name} CPU seconds"),
+        baseline.cpu_seconds,
+        candidate.cpu_seconds,
+        policy.maximum_relative_regression,
+    );
+    compare_backend_io(
+        result,
+        key,
+        &baseline.backend_io,
+        &candidate.backend_io,
+        policy.maximum_relative_regression,
+    );
+    compare_count_maps(
+        result,
+        key,
+        &format!("{phase_name} Fixup admission"),
+        &baseline.maintenance.admission,
+        &candidate.maintenance.admission,
+        policy.maximum_relative_regression,
+    );
+    compare_count_maps(
+        result,
+        key,
+        &format!("{phase_name} Fixup execution"),
+        &baseline.maintenance.execution,
+        &candidate.maintenance.execution,
+        policy.maximum_relative_regression,
+    );
+}
+
+/// Compares each stable outcome category without hiding shifts in equal totals.
+fn compare_count_maps(
+    result: &mut ComparisonReport,
+    key: &str,
+    metric: &str,
+    baseline: &BTreeMap<String, u64>,
+    candidate: &BTreeMap<String, u64>,
+    threshold: f64,
+) {
+    for category in baseline
+        .keys()
+        .chain(candidate.keys())
+        .collect::<BTreeSet<_>>()
+    {
+        relative_regression(
+            result,
+            key,
+            &format!("{metric} {category}"),
+            baseline.get(category).copied().unwrap_or_default() as f64,
+            candidate.get(category).copied().unwrap_or_default() as f64,
+            threshold,
+        );
+    }
+}
+
+/// Compares stable operation errors while admission uses its aggregate policy.
+fn compare_non_admission_errors(
+    result: &mut ComparisonReport,
+    key: &str,
+    metric: &str,
+    baseline: &BTreeMap<String, u64>,
+    candidate: &BTreeMap<String, u64>,
+    threshold: f64,
+) {
+    for category in baseline
+        .keys()
+        .chain(candidate.keys())
+        .filter(|category| category.as_str() != "LimitExceeded")
+        .collect::<BTreeSet<_>>()
+    {
+        relative_regression(
+            result,
+            key,
+            &format!("{metric} {category}"),
+            baseline.get(category).copied().unwrap_or_default() as f64,
+            candidate.get(category).copied().unwrap_or_default() as f64,
+            threshold,
+        );
+    }
+}
+
 /// Compares accepted latency and admission outcomes without amplifying count noise.
 fn compare_operations(
     result: &mut ComparisonReport,
@@ -341,12 +816,12 @@ fn compare_operations(
             &candidate.latency_ms,
             policy.maximum_relative_regression,
         );
-        relative_regression(
+        compare_non_admission_errors(
             result,
             scenario,
-            &format!("{class_name} non-admission failures"),
-            baseline.non_admission_failures() as f64,
-            candidate.non_admission_failures() as f64,
+            &format!("{class_name} error"),
+            &baseline.errors,
+            &candidate.errors,
             policy.maximum_relative_regression,
         );
     }
@@ -699,9 +1174,9 @@ mod tests {
 
     use crate::report::{
         BenchmarkReport, BenchmarkSuite, BudgetConfiguration, BudgetSummary, Configuration,
-        DatasetMetadata, Distribution, Environment, Measurements, OperationClass, OperationSummary,
-        REPORT_SCHEMA_VERSION, RecallSummary, SearchBudgetConfiguration, WorkloadDispatch,
-        WriteAmplification,
+        DatasetMetadata, Distribution, Environment, LifecycleMeasurements, OperationClass,
+        OperationSummary, REPORT_SCHEMA_VERSION, RecallSummary, ReportMeasurements,
+        SearchBudgetConfiguration, SteadyStateMeasurements, WorkloadDispatch, WriteAmplification,
     };
 
     use super::{ComparisonPolicy, compare};
@@ -762,6 +1237,9 @@ mod tests {
                 warmup_operations: 10,
                 measured_operations: 100,
                 k: 10,
+                import_batch_size: None,
+                import_in_flight_batches: None,
+                import_backlog_watermark: None,
             },
             dataset: DatasetMetadata {
                 name: "clustered".to_owned(),
@@ -771,7 +1249,7 @@ mod tests {
                 checksum_xxh3_128: "checksum".to_owned(),
             },
             topology: Default::default(),
-            measurements: Measurements {
+            measurements: ReportMeasurements::SteadyState(SteadyStateMeasurements {
                 cpu_seconds: Some(1.0),
                 peak_rss_bytes: Some(1_000),
                 throughput_per_second: 100.0,
@@ -800,8 +1278,15 @@ mod tests {
                     write_retries: 0,
                 }),
                 ..Default::default()
-            },
+            }),
         }
+    }
+
+    fn steady_mut(report: &mut BenchmarkReport) -> &mut SteadyStateMeasurements {
+        let ReportMeasurements::SteadyState(measurements) = &mut report.measurements else {
+            panic!("fixture is not steady-state")
+        };
+        measurements
     }
 
     fn suite(report: BenchmarkReport) -> BenchmarkSuite {
@@ -873,8 +1358,7 @@ mod tests {
     fn rejects_internally_inconsistent_operation_results() {
         let baseline = suite(report());
         let mut inconsistent = report();
-        inconsistent
-            .measurements
+        steady_mut(&mut inconsistent)
             .operations
             .get_mut(&OperationClass::Search)
             .expect("operation fixture")
@@ -887,11 +1371,11 @@ mod tests {
     fn reports_material_resource_and_throughput_regressions() {
         let baseline = suite(report());
         let mut candidate = report();
-        candidate.measurements.throughput_per_second = 70.0;
-        candidate.measurements.cpu_seconds = Some(1.3);
-        candidate.measurements.peak_rss_bytes = Some(1_300);
-        candidate
-            .measurements
+        let measurements = steady_mut(&mut candidate);
+        measurements.throughput_per_second = 70.0;
+        measurements.cpu_seconds = Some(1.3);
+        measurements.peak_rss_bytes = Some(1_300);
+        measurements
             .write_amplification
             .as_mut()
             .expect("fixture has write amplification")
@@ -906,8 +1390,7 @@ mod tests {
     fn recall_uses_an_absolute_drop_threshold() {
         let baseline = suite(report());
         let mut candidate = report();
-        candidate
-            .measurements
+        steady_mut(&mut candidate)
             .recall_at_k
             .as_mut()
             .expect("fixture has recall")
@@ -920,11 +1403,67 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_comparison_catches_minimum_recall_and_failure_category_shifts() {
+        let mut baseline_report = report();
+        let mut baseline_lifecycle = LifecycleMeasurements::default();
+        for phase in [
+            &mut baseline_lifecycle.immediate_search,
+            &mut baseline_lifecycle.stable_cold_search,
+            &mut baseline_lifecycle.stable_warm_search,
+        ] {
+            phase.search.attempted = 100;
+            phase.search.accepted = 100;
+            phase.search.latency_ms.count = 100;
+        }
+        baseline_lifecycle.stable_warm_search.recall_at_k = Some(RecallSummary {
+            queries: 10,
+            mean: 0.9,
+            min: 0.8,
+        });
+        baseline_lifecycle
+            .import
+            .batch_failures
+            .insert("Backend".to_owned(), 1);
+        baseline_report.measurements = ReportMeasurements::Lifecycle(baseline_lifecycle);
+
+        let baseline = suite(baseline_report.clone());
+        let mut candidate = baseline_report;
+        let ReportMeasurements::Lifecycle(lifecycle) = &mut candidate.measurements else {
+            panic!("fixture is not lifecycle")
+        };
+        lifecycle
+            .stable_warm_search
+            .recall_at_k
+            .as_mut()
+            .expect("recall fixture")
+            .min = 0.7;
+        lifecycle.import.batch_failures.clear();
+        lifecycle
+            .import
+            .batch_failures
+            .insert("CommitOutcomeUnknown".to_owned(), 1);
+
+        let comparison = compare(&baseline, &suite(candidate), ComparisonPolicy::default())
+            .expect("reports are comparable");
+        assert!(
+            comparison
+                .regressions
+                .iter()
+                .any(|regression| regression.contains("minimum recall dropped"))
+        );
+        assert!(
+            comparison
+                .regressions
+                .iter()
+                .any(|regression| regression.contains("CommitOutcomeUnknown"))
+        );
+    }
+
+    #[test]
     fn aggregate_rejection_rate_uses_an_absolute_noise_threshold() {
         let baseline = suite(report());
         let mut noisy = report();
-        let noisy_search = noisy
-            .measurements
+        let noisy_search = steady_mut(&mut noisy)
             .operations
             .get_mut(&OperationClass::Search)
             .expect("operation fixture");
@@ -937,8 +1476,7 @@ mod tests {
         );
 
         let mut material = report();
-        let material_search = material
-            .measurements
+        let material_search = steady_mut(&mut material)
             .operations
             .get_mut(&OperationClass::Search)
             .expect("operation fixture");
@@ -957,8 +1495,7 @@ mod tests {
     fn opposing_per_class_admission_noise_does_not_change_the_aggregate() {
         let mut baseline_report = report();
         baseline_report.configuration.search_percent = 50;
-        let search = baseline_report
-            .measurements
+        let search = steady_mut(&mut baseline_report)
             .operations
             .get_mut(&OperationClass::Search)
             .expect("search fixture");
@@ -969,16 +1506,14 @@ mod tests {
             ..Default::default()
         };
         set_operation_outcomes(&mut write, 25, 25, 0);
-        baseline_report
-            .measurements
+        steady_mut(&mut baseline_report)
             .operations
             .insert(OperationClass::Write, write);
 
         let baseline = suite(baseline_report.clone());
         let mut candidate = baseline_report;
         set_operation_outcomes(
-            candidate
-                .measurements
+            steady_mut(&mut candidate)
                 .operations
                 .get_mut(&OperationClass::Search)
                 .expect("search fixture"),
@@ -987,8 +1522,7 @@ mod tests {
             0,
         );
         set_operation_outcomes(
-            candidate
-                .measurements
+            steady_mut(&mut candidate)
                 .operations
                 .get_mut(&OperationClass::Write)
                 .expect("write fixture"),
@@ -1009,8 +1543,7 @@ mod tests {
     fn latency_requires_material_relative_and_absolute_movement() {
         let baseline = suite(report());
         let mut noisy = report();
-        noisy
-            .measurements
+        steady_mut(&mut noisy)
             .operations
             .get_mut(&OperationClass::Search)
             .expect("operation fixture")
@@ -1024,8 +1557,7 @@ mod tests {
         );
 
         let mut material = report();
-        material
-            .measurements
+        steady_mut(&mut material)
             .operations
             .get_mut(&OperationClass::Search)
             .expect("operation fixture")
@@ -1043,8 +1575,7 @@ mod tests {
     #[test]
     fn reports_disappearing_scenario_measurements() {
         let mut baseline_report = report();
-        baseline_report
-            .measurements
+        steady_mut(&mut baseline_report)
             .backend_admission
             .blocking_wait_ms = Distribution {
             count: 1,
@@ -1053,9 +1584,10 @@ mod tests {
         };
         let baseline = suite(baseline_report);
         let mut candidate = report();
-        candidate.measurements.cpu_seconds = None;
-        candidate.measurements.recall_at_k = None;
-        candidate.measurements.write_amplification = None;
+        let measurements = steady_mut(&mut candidate);
+        measurements.cpu_seconds = None;
+        measurements.recall_at_k = None;
+        measurements.write_amplification = None;
 
         let comparison = compare(&baseline, &suite(candidate), ComparisonPolicy::default())
             .expect("reports are comparable");
@@ -1089,8 +1621,9 @@ mod tests {
     #[test]
     fn compares_each_issue_38_measurement_family() {
         let mut baseline_report = report();
-        baseline_report.measurements.maintenance_drain_seconds = 1.0;
-        baseline_report.measurements.search_stages_ms.insert(
+        let measurements = steady_mut(&mut baseline_report);
+        measurements.maintenance_drain_seconds = 1.0;
+        measurements.search_stages_ms.insert(
             "exact_reranking".to_owned(),
             Distribution {
                 count: 1,
@@ -1098,7 +1631,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        baseline_report.measurements.search_budgets.insert(
+        measurements.search_budgets.insert(
             "visited_partitions".to_owned(),
             BudgetSummary {
                 usage: Distribution {
@@ -1108,59 +1641,48 @@ mod tests {
                 exhausted_searches: 0,
             },
         );
-        baseline_report
-            .measurements
+        measurements
             .cache
             .lookups
             .insert("level=leaf,result=hit".to_owned(), 100);
-        baseline_report
-            .measurements
-            .backend_admission
-            .blocking_wait_ms = Distribution {
+        measurements.backend_admission.blocking_wait_ms = Distribution {
             count: 1,
             p95: 1.0,
             ..Default::default()
         };
-        baseline_report.measurements.backend_io.bytes_read = 100;
+        measurements.backend_io.bytes_read = 100;
 
         let baseline = suite(baseline_report.clone());
         let mut candidate = baseline_report;
-        candidate.measurements.maintenance_drain_seconds = 2.0;
-        let operation = candidate
-            .measurements
+        let measurements = steady_mut(&mut candidate);
+        measurements.maintenance_drain_seconds = 2.0;
+        let operation = measurements
             .operations
             .get_mut(&OperationClass::Search)
             .expect("operation fixture");
         set_operation_outcomes(operation, 99, 0, 1);
-        candidate
-            .measurements
+        measurements
             .search_stages_ms
             .get_mut("exact_reranking")
             .expect("stage fixture")
             .p95 = 2.0;
-        candidate
-            .measurements
+        measurements
             .search_budgets
             .get_mut("visited_partitions")
             .expect("budget fixture")
             .exhausted_searches = 1;
-        candidate
-            .measurements
+        measurements
             .cache
             .lookups
             .insert("level=leaf,result=miss".to_owned(), 1);
-        candidate
-            .measurements
-            .backend_admission
-            .blocking_wait_ms
-            .p95 = 2.0;
-        candidate.measurements.backend_io.bytes_read = 200;
+        measurements.backend_admission.blocking_wait_ms.p95 = 2.0;
+        measurements.backend_io.bytes_read = 200;
 
         let comparison = compare(&baseline, &suite(candidate), ComparisonPolicy::default())
             .expect("reports are comparable");
         for expected in [
             "maintenance drain",
-            "non-admission failures",
+            "search error Backend",
             "search stage exact_reranking",
             "exhausted searches",
             "cache miss ratio",

@@ -24,7 +24,7 @@ use crate::report::BackendIo;
 #[derive(Debug)]
 pub struct MeasuredBackend<B> {
     /// Production adapter receiving every operation unchanged.
-    inner: B,
+    inner: Arc<B>,
     /// Monotonic logical-IO observations shared with all child transactions.
     counters: Arc<Counters>,
 }
@@ -36,11 +36,20 @@ impl<B> MeasuredBackend<B> {
         let counters = Arc::new(Counters::default());
         (
             Self {
-                inner,
+                inner: Arc::new(inner),
                 counters: Arc::clone(&counters),
             },
             BackendCounters { counters },
         )
+    }
+}
+
+impl<B> Clone for MeasuredBackend<B> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            counters: Arc::clone(&self.counters),
+        }
     }
 }
 
@@ -182,29 +191,9 @@ fn add(counter: &AtomicU64, value: usize) {
 
 /// Computes the timed-region delta from two monotonic snapshots.
 fn subtract(after: BackendIo, before: &BackendIo) -> BackendIo {
-    BackendIo {
-        read_transactions: after
-            .read_transactions
-            .saturating_sub(before.read_transactions),
-        write_transactions: after
-            .write_transactions
-            .saturating_sub(before.write_transactions),
-        point_read_keys: after.point_read_keys.saturating_sub(before.point_read_keys),
-        scans: after.scans.saturating_sub(before.scans),
-        items_read: after.items_read.saturating_sub(before.items_read),
-        bytes_read: after.bytes_read.saturating_sub(before.bytes_read),
-        mutation_operations: after
-            .mutation_operations
-            .saturating_sub(before.mutation_operations),
-        mutation_bytes: after.mutation_bytes.saturating_sub(before.mutation_bytes),
-        range_clears: after.range_clears.saturating_sub(before.range_clears),
-        commits: after.commits.saturating_sub(before.commits),
-        retryable_commits: after
-            .retryable_commits
-            .saturating_sub(before.retryable_commits),
-        unknown_commits: after.unknown_commits.saturating_sub(before.unknown_commits),
-        failed_commits: after.failed_commits.saturating_sub(before.failed_commits),
-    }
+    after
+        .checked_sub(before)
+        .expect("monotonic Backend counters never decrease")
 }
 
 /// Read transaction forwarding calls while accounting returned logical data.

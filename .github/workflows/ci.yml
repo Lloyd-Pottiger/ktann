@@ -37,7 +37,7 @@ jobs:
         run: >-
           cargo +"${{ matrix.toolchain }}" doc --workspace --all-features
           --no-deps
-      - name: Run RocksDB benchmark smoke profile
+      - name: Run RocksDB benchmark smoke profile including lifecycle
         if: matrix.toolchain == 'stable'
         run: >-
           cargo +stable run -p ktann-benchmarks --bin ktann-bench --
@@ -80,7 +80,7 @@ jobs:
           --test foundationdb_adapter --test foundationdb_faults
           --test foundationdb_verify --test foundationdb_observability
           --test foundationdb_recall -- --ignored
-      - name: Run FoundationDB benchmark smoke profile
+      - name: Run FoundationDB benchmark smoke profile including lifecycle
         run: >-
           cargo +stable run -p ktann-benchmarks
           --no-default-features --features foundationdb --bin ktann-bench --

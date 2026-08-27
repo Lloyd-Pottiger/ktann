@@ -21,8 +21,9 @@ state.
 
 The `smoke` profile uses a small deterministic synthetic dataset and exercises
 warm-cache ANN, cache-disabled ANN, 95/5 search/update, hot 50/50
-search/update, and saturated Backend admission. It is a functional CI signal,
-not a stable performance sample. The `full` profile adds checked-in SIFTsmall
+search/update, saturated Backend admission, and one bounded import-to-search
+lifecycle. It is a functional CI signal, not a stable performance sample. The
+`full` profile adds checked-in SIFTsmall
 and Fashion-MNIST inputs plus clustered, skewed, and duplicate-heavy synthetic
 distributions at representative sizes. Full runs are intended for optimized,
 otherwise idle hosts.
@@ -44,6 +45,11 @@ has no FoundationDB equivalent; it is recorded as configuration and only
 changes RocksDB's native blocking actor bound.
 
 ## Measurement contract
+
+Report schema v1 stores exactly one tagged `measurements` payload per scenario:
+`steady_state` for the existing workload cases or `lifecycle` for the
+`import-to-search-lifecycle` case. The lifecycle case does not change the setup
+exclusions or workload semantics of the steady-state scenarios described below.
 
 Setup is excluded from the wall-clock, CPU, latency, throughput, metric, and
 Backend-IO deltas. Setup includes dataset loading, index creation and batch
@@ -71,7 +77,7 @@ The timed workload reports:
   successful public write, including retry attempts.
 
 `configuration.search_budgets` exposes the same four dimension names used by
-`measurements.search_budgets`:
+the steady-state measurement payload's `search_budgets`:
 `scanned_tree_keys`, `visited_partitions`, `visited_leaf_entries`, and
 `exact_rerank_candidates`. Each configuration entry distinguishes the Runtime
 `runtime_default`, an optional per-request `request_override`, and the concrete
@@ -142,3 +148,47 @@ sub-millisecond samples.
 `git_revision` receives a `-dirty` suffix when tracked or untracked workspace
 changes are present. Commit or otherwise preserve the exact patch before using
 such a local report as a durable baseline.
+
+## Import-to-search lifecycle
+
+Every lifecycle worker opens a fresh isolated Backend Namespace and creates a
+fresh Logical Index through `Runtime::create_index` before timing. Dataset
+loading, record/request materialization, and exact-oracle construction are also
+complete before the continuous case timer. The timer begins immediately before
+the first `ImportSession::submit` and ends when the final warmed search returns.
+
+The report keeps these boundaries distinct:
+
+1. `import` begins before the first submit and ends after
+   `ImportSession::finish`. It reports accepted batches and records, throughput,
+   submit percentiles, gate waits, batch failures, CPU, Backend IO, peak RSS,
+   and concurrent Structure Maintenance. `finish` remains only an accepted
+   batch-outcome barrier.
+2. `immediate_search` is the first fixed query pass after finish, before the
+   runner drives convergence. It reports first-query and p50/p95/p99 latency,
+   throughput, mean/minimum recall@k, truncation, Search Budget use, cache
+   behavior, CPU, and Backend IO.
+3. `convergence` uses bounded public `verify` and `search` calls until a
+   structured topology is verified unchanged across three observations, drains
+   the observed Fixup backlog, and verifies that the counts remain unchanged.
+   Its active phase costs are separate, while `from_import_finish_seconds` includes
+   the preceding immediate-search pass so time to verified readiness is not
+   understated.
+4. `cache_reset` shuts down the first Runtime, creates a new Runtime over the
+   same Backend Namespace, and reopens the Index. This gives the stable cold
+   pass a deterministic empty process-local Partition Cache without changing
+   persistent topology.
+5. `stable_cold_search` runs the fixed query set once; `stable_warm_search`
+   repeats it immediately to expose warmed steady-state behavior.
+
+`case_wall_seconds`, `case_cpu_seconds`, and `case_backend_io` cover the
+continuous case. Unattributed harness overhead is derived by subtracting the
+named phases from those totals, so the report does not store a second accounting
+authority. Peak RSS is the operating-system process high-water mark at each
+boundary and is not additive; the import value can therefore include the
+pre-timed dataset and oracle resident in the isolated worker.
+
+The comparator requires identical lifecycle bounds and inputs. In addition to
+the warmed steady-state rules, it compares import throughput and submit
+latency, batch failures and gate waits, finish-to-stable time, each query
+stage's latency/throughput/recall/cache/budget results, and phase Backend IO.

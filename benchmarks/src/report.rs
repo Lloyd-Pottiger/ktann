@@ -35,8 +35,8 @@ pub struct BenchmarkReport {
     pub dataset: DatasetMetadata,
     /// Stable topology facts after setup.
     pub topology: Topology,
-    /// Measurements collected outside setup and warmup.
-    pub measurements: Measurements,
+    /// Measurements for exactly one steady-state or lifecycle scenario.
+    pub measurements: ReportMeasurements,
 }
 
 /// Hardware and software metadata needed to judge comparability.
@@ -115,6 +115,12 @@ pub struct Configuration {
     pub measured_operations: usize,
     /// Requested result count.
     pub k: usize,
+    /// Records submitted in each Import Session batch, when applicable.
+    pub import_batch_size: Option<usize>,
+    /// Maximum concurrently executing Import Session batches, when applicable.
+    pub import_in_flight_batches: Option<usize>,
+    /// Fixup backlog watermark gating Import Session submission, when applicable.
+    pub import_backlog_watermark: Option<usize>,
 }
 
 /// Configuration and effective limit for one public Search Budget dimension.
@@ -167,9 +173,19 @@ pub struct Topology {
     pub entries: u64,
 }
 
-/// Measurements attributed to one isolated scenario worker.
+/// Mutually exclusive measurements for one benchmark scenario.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", content = "values", rename_all = "snake_case")]
+pub enum ReportMeasurements {
+    /// Existing steady-state or mixed-workload measurements.
+    SteadyState(SteadyStateMeasurements),
+    /// Import-to-search lifecycle phase measurements.
+    Lifecycle(LifecycleMeasurements),
+}
+
+/// Measurements attributed to one steady-state scenario worker.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub struct Measurements {
+pub struct SteadyStateMeasurements {
     /// Timed-region wall-clock duration.
     pub wall_seconds: f64,
     /// Time after foreground completion until its maintenance backlog drained.
@@ -196,6 +212,182 @@ pub struct Measurements {
     pub backend_io: BackendIo,
     /// Logical KV work per successful write operation.
     pub write_amplification: Option<WriteAmplification>,
+}
+
+/// Complete measurements for one import-to-search lifecycle case.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct LifecycleMeasurements {
+    /// Continuous wall time from the first submission boundary through warm search.
+    pub case_wall_seconds: f64,
+    /// Process CPU consumed across the same continuous case interval.
+    pub case_cpu_seconds: Option<f64>,
+    /// Whole-worker peak RSS observed when the case completed.
+    pub case_peak_rss_bytes: Option<u64>,
+    /// Backend work across the same continuous case interval.
+    pub case_backend_io: BackendIo,
+    /// Import submission and accepted-batch completion.
+    pub import: ImportPhase,
+    /// First fixed query pass immediately after Import Session finish.
+    pub immediate_search: SearchPhase,
+    /// Public-API-driven, verified topology stabilization.
+    pub convergence: ConvergencePhase,
+    /// Runtime shutdown, cache reset, restart, and public Index reopen.
+    pub cache_reset: PhaseResources,
+    /// First fixed query pass after verified topology stabilization.
+    pub stable_cold_search: SearchPhase,
+    /// Repeated fixed query pass after the stable topology cache is populated.
+    pub stable_warm_search: SearchPhase,
+}
+
+impl LifecycleMeasurements {
+    /// Returns wall time not attributed to a named phase.
+    #[must_use]
+    pub(crate) fn unattributed_wall_seconds(&self) -> Option<f64> {
+        checked_remainder(
+            self.case_wall_seconds,
+            self.import.resources.wall_seconds
+                + self.immediate_search.resources.wall_seconds
+                + self.convergence.resources.wall_seconds
+                + self.cache_reset.wall_seconds
+                + self.stable_cold_search.resources.wall_seconds
+                + self.stable_warm_search.resources.wall_seconds,
+        )
+    }
+
+    /// Returns CPU time not attributed to a named phase.
+    #[must_use]
+    pub(crate) fn unattributed_cpu_seconds(&self) -> Option<f64> {
+        checked_remainder(
+            self.case_cpu_seconds?,
+            self.import.resources.cpu_seconds?
+                + self.immediate_search.resources.cpu_seconds?
+                + self.convergence.resources.cpu_seconds?
+                + self.cache_reset.cpu_seconds?
+                + self.stable_cold_search.resources.cpu_seconds?
+                + self.stable_warm_search.resources.cpu_seconds?,
+        )
+    }
+
+    /// Returns Backend IO not attributed to a named phase.
+    #[must_use]
+    pub(crate) fn unattributed_backend_io(&self) -> Option<BackendIo> {
+        let mut total = BackendIo::default();
+        for phase in [
+            &self.import.resources.backend_io,
+            &self.immediate_search.resources.backend_io,
+            &self.convergence.resources.backend_io,
+            &self.cache_reset.backend_io,
+            &self.stable_cold_search.resources.backend_io,
+            &self.stable_warm_search.resources.backend_io,
+        ] {
+            total.saturating_add_assign(phase);
+        }
+        self.case_backend_io.checked_sub(&total)
+    }
+}
+
+/// Returns a nonnegative accounting remainder within floating-point tolerance.
+fn checked_remainder(total: f64, parts: f64) -> Option<f64> {
+    let tolerance = total.abs().max(1.0) * 1e-9;
+    (parts <= total + tolerance).then(|| (total - parts).max(0.0))
+}
+
+/// Resources and Structure Maintenance activity attributed to one phase.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct PhaseResources {
+    /// Contiguous phase wall-clock duration.
+    pub wall_seconds: f64,
+    /// Process CPU consumed during the phase.
+    pub cpu_seconds: Option<f64>,
+    /// Whole-worker peak RSS observed at the end of the phase.
+    pub peak_rss_bytes: Option<u64>,
+    /// Backend work performed during the phase.
+    pub backend_io: BackendIo,
+    /// Structure Maintenance observations during the phase.
+    pub maintenance: MaintenanceSummary,
+}
+
+/// Structure Maintenance work observed in one accounting phase.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct MaintenanceSummary {
+    /// Fixup admission outcomes grouped by their stable labels.
+    pub admission: BTreeMap<String, u64>,
+    /// Completed Fixup outcomes grouped by their stable labels.
+    pub execution: BTreeMap<String, u64>,
+    /// Pending-plus-running Fixups at the phase boundary.
+    pub backlog_at_end: usize,
+}
+
+/// Import Session results from first submission through `finish`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ImportPhase {
+    /// Resources charged through completion of `ImportSession::finish`.
+    pub resources: PhaseResources,
+    /// Batches for which `submit` returned a Batch Token.
+    pub submitted_batches: u64,
+    /// Submitted batches whose ordinary atomic mutation completed successfully.
+    pub accepted_batches: u64,
+    /// Records committed by successful accepted batches.
+    pub accepted_records: u64,
+    /// Successful accepted records per import wall second.
+    pub records_per_second: f64,
+    /// End-to-end `submit` latency, including in-flight and backlog gates.
+    pub submit_latency_ms: Distribution,
+    /// Failed submissions and accepted batch outcomes by stable error category.
+    pub batch_failures: BTreeMap<String, u64>,
+    /// Backend and Import Session gate wait distributions.
+    pub admission: AdmissionSummary,
+}
+
+/// One fixed query-set pass at a lifecycle boundary.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct SearchPhase {
+    /// Resources charged to this query pass.
+    pub resources: PhaseResources,
+    /// Latency of the first query in milliseconds.
+    pub first_query_latency_ms: Option<f64>,
+    /// Attempt, outcome, and latency summary for the fixed query set.
+    pub search: OperationSummary,
+    /// Successful searches per phase wall second.
+    pub throughput_per_second: f64,
+    /// Recall@k across successful fixed queries.
+    pub recall_at_k: Option<RecallSummary>,
+    /// Search truncation observed directly from successful outcomes.
+    pub truncation: SearchTruncation,
+    /// Search Budget use for every public dimension.
+    pub search_budgets: BTreeMap<String, BudgetSummary>,
+    /// Approximate-selection and exact-reranking latency.
+    pub search_stages_ms: BTreeMap<String, Distribution>,
+    /// Partition Cache behavior during the pass.
+    pub cache: CacheSummary,
+    /// Backend resource-admission behavior during the pass.
+    pub backend_admission: AdmissionSummary,
+}
+
+/// Counts searches truncated by each public bounded-search mechanism.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct SearchTruncation {
+    /// Searches exhausting the Tree Key scan budget.
+    pub scanned_tree_keys: u64,
+    /// Searches exhausting the visited-partition budget.
+    pub visited_partitions: u64,
+    /// Searches exhausting the visited-Leaf-Entry budget.
+    pub visited_leaf_entries: u64,
+    /// Searches exhausting the exact-rerank-candidate budget.
+    pub exact_rerank_candidates: u64,
+    /// Searches truncated by a per-leaf RaBitQ overlap cap.
+    pub rabitq_overlap: u64,
+}
+
+/// Time and resources required to verify a stable topology.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ConvergencePhase {
+    /// Resources charged after immediate search while actively converging.
+    pub resources: PhaseResources,
+    /// Elapsed wall time from Import Session finish through stable verification.
+    pub from_import_finish_seconds: f64,
+    /// Time spent waiting for the pending-plus-running Fixup backlog to drain.
+    pub maintenance_drain_seconds: f64,
 }
 
 /// Scheduling shape used to apply bounded client pressure.
@@ -266,14 +458,6 @@ pub struct OperationSummary {
 }
 
 impl OperationSummary {
-    /// Returns failures not attributed to Runtime foreground admission.
-    pub(crate) fn non_admission_failures(&self) -> u64 {
-        self.attempted
-            .checked_sub(self.accepted)
-            .and_then(|failures| failures.checked_sub(self.rejected))
-            .expect("validated operation outcomes fit within attempts")
-    }
-
     /// Checks that serialized outcome counts agree with each other.
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
         let failures = self
@@ -415,7 +599,7 @@ pub struct AdmissionSummary {
 }
 
 /// Backend-neutral attempted logical KV work.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BackendIo {
     /// Read transactions opened.
     pub read_transactions: u64,
@@ -445,6 +629,60 @@ pub struct BackendIo {
     pub failed_commits: u64,
 }
 
+impl BackendIo {
+    /// Adds another disjoint accounting interval without wrapping counters.
+    pub(crate) fn saturating_add_assign(&mut self, other: &Self) {
+        self.read_transactions = self
+            .read_transactions
+            .saturating_add(other.read_transactions);
+        self.write_transactions = self
+            .write_transactions
+            .saturating_add(other.write_transactions);
+        self.point_read_keys = self.point_read_keys.saturating_add(other.point_read_keys);
+        self.scans = self.scans.saturating_add(other.scans);
+        self.items_read = self.items_read.saturating_add(other.items_read);
+        self.bytes_read = self.bytes_read.saturating_add(other.bytes_read);
+        self.mutation_operations = self
+            .mutation_operations
+            .saturating_add(other.mutation_operations);
+        self.mutation_bytes = self.mutation_bytes.saturating_add(other.mutation_bytes);
+        self.range_clears = self.range_clears.saturating_add(other.range_clears);
+        self.commits = self.commits.saturating_add(other.commits);
+        self.retryable_commits = self
+            .retryable_commits
+            .saturating_add(other.retryable_commits);
+        self.unknown_commits = self.unknown_commits.saturating_add(other.unknown_commits);
+        self.failed_commits = self.failed_commits.saturating_add(other.failed_commits);
+    }
+
+    /// Subtracts a contained accounting interval, rejecting overlap mistakes.
+    pub(crate) fn checked_sub(&self, other: &Self) -> Option<Self> {
+        Some(Self {
+            read_transactions: self
+                .read_transactions
+                .checked_sub(other.read_transactions)?,
+            write_transactions: self
+                .write_transactions
+                .checked_sub(other.write_transactions)?,
+            point_read_keys: self.point_read_keys.checked_sub(other.point_read_keys)?,
+            scans: self.scans.checked_sub(other.scans)?,
+            items_read: self.items_read.checked_sub(other.items_read)?,
+            bytes_read: self.bytes_read.checked_sub(other.bytes_read)?,
+            mutation_operations: self
+                .mutation_operations
+                .checked_sub(other.mutation_operations)?,
+            mutation_bytes: self.mutation_bytes.checked_sub(other.mutation_bytes)?,
+            range_clears: self.range_clears.checked_sub(other.range_clears)?,
+            commits: self.commits.checked_sub(other.commits)?,
+            retryable_commits: self
+                .retryable_commits
+                .checked_sub(other.retryable_commits)?,
+            unknown_commits: self.unknown_commits.checked_sub(other.unknown_commits)?,
+            failed_commits: self.failed_commits.checked_sub(other.failed_commits)?,
+        })
+    }
+}
+
 /// Logical write amplification derived from Backend calls.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct WriteAmplification {
@@ -460,7 +698,7 @@ pub struct WriteAmplification {
 
 #[cfg(test)]
 mod tests {
-    use super::Distribution;
+    use super::{BackendIo, Distribution, LifecycleMeasurements};
 
     #[test]
     fn distribution_uses_nearest_rank_percentiles() {
@@ -469,5 +707,58 @@ mod tests {
         assert_eq!(distribution.p50, 50.0);
         assert_eq!(distribution.p95, 95.0);
         assert_eq!(distribution.p99, 99.0);
+    }
+
+    #[test]
+    fn lifecycle_derives_unattributed_resources_from_named_phases() {
+        let mut lifecycle = LifecycleMeasurements {
+            case_wall_seconds: 21.0,
+            ..Default::default()
+        };
+        lifecycle.import.resources.wall_seconds = 2.0;
+        lifecycle.immediate_search.resources.wall_seconds = 3.0;
+        lifecycle.convergence.resources.wall_seconds = 4.0;
+        lifecycle.cache_reset.wall_seconds = 2.0;
+        lifecycle.stable_cold_search.resources.wall_seconds = 4.0;
+        lifecycle.stable_warm_search.resources.wall_seconds = 5.0;
+        lifecycle.case_cpu_seconds = Some(14.0);
+        lifecycle.import.resources.cpu_seconds = Some(1.0);
+        lifecycle.immediate_search.resources.cpu_seconds = Some(2.0);
+        lifecycle.convergence.resources.cpu_seconds = Some(3.0);
+        lifecycle.cache_reset.cpu_seconds = Some(1.0);
+        lifecycle.stable_cold_search.resources.cpu_seconds = Some(3.0);
+        lifecycle.stable_warm_search.resources.cpu_seconds = Some(3.0);
+        lifecycle.import.resources.backend_io.read_transactions = 2;
+        lifecycle
+            .immediate_search
+            .resources
+            .backend_io
+            .read_transactions = 3;
+        lifecycle.convergence.resources.backend_io.read_transactions = 4;
+        lifecycle.cache_reset.backend_io.read_transactions = 2;
+        lifecycle
+            .stable_cold_search
+            .resources
+            .backend_io
+            .read_transactions = 4;
+        lifecycle
+            .stable_warm_search
+            .resources
+            .backend_io
+            .read_transactions = 5;
+        lifecycle.case_backend_io = BackendIo {
+            read_transactions: 21,
+            ..Default::default()
+        };
+
+        assert_eq!(lifecycle.unattributed_wall_seconds(), Some(1.0));
+        assert_eq!(lifecycle.unattributed_cpu_seconds(), Some(1.0));
+        assert_eq!(
+            lifecycle.unattributed_backend_io(),
+            Some(BackendIo {
+                read_transactions: 1,
+                ..Default::default()
+            })
+        );
     }
 }
