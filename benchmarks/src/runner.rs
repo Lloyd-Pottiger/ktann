@@ -7,9 +7,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use ktann::api::{
-    DataType, ErrorKind, FieldId, FieldSchema, Index, IndexConfig, Metric, Mutation, Record,
-    RuntimeConfig, SearchBudgets, SearchOptions, SearchOutcome, SearchRequest, Value,
-    VerifyOptions,
+    DataType, ErrorKind, FieldId, FieldSchema, ImportOptions, ImportSession, Index, IndexConfig,
+    Metric, Mutation, OperationOptions, Record, RuntimeConfig, SearchBudgets, SearchOptions,
+    SearchOutcome, SearchRequest, Value, VerifyOptions,
 };
 use ktann::runtime::Runtime;
 use ktann::storage::backend::Backend;
@@ -19,8 +19,10 @@ use crate::dataset::{self, BenchmarkDataset};
 use crate::metrics::{CapturedMetrics, MetricCapture};
 use crate::report::{
     AdmissionTarget, BenchmarkReport, BudgetConfiguration, BudgetSummary, Configuration,
-    Distribution, Environment, Measurements, OperationClass, OperationSummary, RecallSummary,
-    SearchBudgetConfiguration, Topology, WorkloadDispatch, WriteAmplification,
+    ConvergencePhase, Distribution, Environment, ImportPhase, LifecycleMeasurements,
+    MaintenanceSummary, OperationClass, OperationSummary, PhaseResources, RecallSummary,
+    ReportMeasurements, SearchBudgetConfiguration, SearchPhase, SearchTruncation,
+    SteadyStateMeasurements, Topology, WorkloadDispatch, WriteAmplification,
 };
 use crate::resource::ResourceSnapshot;
 
@@ -89,6 +91,14 @@ pub struct ScenarioSpec {
     pub search_options: SearchOptions,
     /// Logical Index maximum partition size.
     pub max_partition_entries: u32,
+    /// Whether this scenario measures the import-to-search lifecycle.
+    pub lifecycle: bool,
+    /// Records per Import Session batch in a lifecycle scenario.
+    pub import_batch_size: usize,
+    /// Explicit Import Session in-flight batch limit.
+    pub import_in_flight_batches: usize,
+    /// Explicit Runtime Fixup backlog watermark for Import Session admission.
+    pub import_backlog_watermark: usize,
 }
 
 /// Returns the complete deterministic scenario matrix for one scale profile.
@@ -128,6 +138,10 @@ fn smoke_scenarios() -> Vec<ScenarioSpec> {
         k: 10,
         search_options: SearchOptions::default(),
         max_partition_entries: 32,
+        lifecycle: false,
+        import_batch_size: 32,
+        import_in_flight_batches: 2,
+        import_backlog_watermark: 512,
     };
     vec![
         common.clone(),
@@ -160,7 +174,19 @@ fn smoke_scenarios() -> Vec<ScenarioSpec> {
             foreground_limit: 4,
             dispatch: WorkloadDispatch::FixedWaves(admission_target()),
             measured_operations: 640,
-            ..common
+            ..common.clone()
+        },
+        ScenarioSpec {
+            name: "import-to-search-lifecycle",
+            lifecycle: true,
+            search_percent: 100,
+            concurrency: 1,
+            warmup_operations: 0,
+            measured_operations: 8,
+            hot_updates: false,
+            blocking_resource_limit: None,
+            dispatch: WorkloadDispatch::Continuous,
+            ..common.clone()
         },
     ]
 }
@@ -187,6 +213,10 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
         k: 10,
         search_options: SearchOptions::default(),
         max_partition_entries: 128,
+        lifecycle: false,
+        import_batch_size: 50,
+        import_in_flight_batches: 4,
+        import_backlog_watermark: 512,
     };
     let clustered = ann("ann-clustered", "clustered", 5_000, 100, 128, 0x38_1001);
     vec![
@@ -231,7 +261,27 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
             concurrency: 32,
             measured_operations: 2_000,
             dispatch: WorkloadDispatch::FixedWaves(admission_target()),
-            ..clustered
+            ..clustered.clone()
+        },
+        ScenarioSpec {
+            name: "import-to-search-lifecycle",
+            dataset: "siftsmall",
+            base_vectors: 10_000,
+            query_vectors: 100,
+            dimension: 128,
+            seed: 0x38_1006,
+            lifecycle: true,
+            search_percent: 100,
+            concurrency: 1,
+            warmup_operations: 0,
+            measured_operations: 100,
+            hot_updates: false,
+            blocking_resource_limit: None,
+            dispatch: WorkloadDispatch::Continuous,
+            // Keep one batch active so the fixed corpus is fully imported
+            // while Structure Maintenance competes for the same partitions.
+            import_in_flight_batches: 1,
+            ..clustered.clone()
         },
     ]
 }
@@ -274,16 +324,33 @@ pub async fn run_scenario<B: Backend>(
     let default_search_budgets = runtime_config.default_search_budgets();
     let search_budgets =
         search_budget_configuration(default_search_budgets, spec.search_options, spec.k)?;
-    let runtime =
-        Runtime::new(backend, runtime_config).map_err(|error| error_at("create runtime", error))?;
-    let measured =
-        run_with_runtime(&runtime, &backend_counters, &metric_capture, spec, &dataset).await;
-    let shutdown = runtime
-        .shutdown()
-        .await
-        .map_err(|error| error_at("shut down runtime", error));
-    let (topology, measurements) = measured?;
-    shutdown?;
+    let (topology, measurements) = if spec.lifecycle {
+        let (topology, lifecycle) = run_lifecycle_case(
+            backend,
+            runtime_config,
+            &backend_counters,
+            &metric_capture,
+            spec,
+            &dataset,
+        )
+        .await?;
+        (topology, ReportMeasurements::Lifecycle(Box::new(lifecycle)))
+    } else {
+        let runtime = Runtime::new(backend, runtime_config)
+            .map_err(|error| error_at("create runtime", error))?;
+        let measured =
+            run_with_runtime(&runtime, &backend_counters, &metric_capture, spec, &dataset).await;
+        let shutdown = runtime
+            .shutdown()
+            .await
+            .map_err(|error| error_at("shut down runtime", error));
+        let (topology, measurements) = measured?;
+        shutdown?;
+        (
+            topology,
+            ReportMeasurements::SteadyState(Box::new(measurements)),
+        )
+    };
 
     Ok(BenchmarkReport {
         generated_unix_seconds: SystemTime::now()
@@ -318,6 +385,9 @@ pub async fn run_scenario<B: Backend>(
             warmup_operations: spec.warmup_operations,
             measured_operations: spec.measured_operations,
             k: spec.k,
+            import_batch_size: spec.lifecycle.then_some(spec.import_batch_size),
+            import_in_flight_batches: spec.lifecycle.then_some(spec.import_in_flight_batches),
+            import_backlog_watermark: spec.lifecycle.then_some(spec.import_backlog_watermark),
         },
         dataset: dataset.metadata,
         topology,
@@ -330,11 +400,19 @@ fn runtime_config(spec: &ScenarioSpec) -> Result<RuntimeConfig, String> {
     // The Fixup queue retains the default capacity so the default Import
     // Session backlog watermark remains within it. RuntimeConfig validates
     // those two process-local resource bounds together at Runtime creation.
-    RuntimeConfig::default()
+    let config = RuntimeConfig::default()
         .with_foreground_operation_limit(spec.foreground_limit)
         .and_then(|config| config.with_maintenance(MAINTENANCE_WORKERS, FIXUP_QUEUE_CAPACITY))
         .and_then(|config| config.with_attempts(32, 32))
-        .and_then(|config| config.with_partition_cache_bytes(spec.partition_cache_bytes))
+        .and_then(|config| config.with_partition_cache_bytes(spec.partition_cache_bytes));
+    let config = if spec.lifecycle {
+        config.and_then(|config| {
+            config.with_import_limits(spec.import_in_flight_batches, spec.import_backlog_watermark)
+        })
+    } else {
+        config
+    };
+    config
         .and_then(|config| config.validate().map(|()| config))
         .map_err(|error| error_at("configure runtime", error))
 }
@@ -372,15 +450,177 @@ fn search_budget_configuration(
     })
 }
 
-/// Owns setup, warmup, measurement, and the post-run invariant audit.
-async fn run_with_runtime<B: Backend>(
-    runtime: &Runtime<MeasuredBackend<B>>,
+/// Measures one fresh Index from Import Session submission through warm search.
+async fn run_lifecycle_case<B: Backend>(
+    backend: MeasuredBackend<B>,
+    runtime_config: RuntimeConfig,
     backend_counters: &BackendCounters,
     metric_capture: &MetricCapture,
     spec: &ScenarioSpec,
     dataset: &BenchmarkDataset,
-) -> Result<(Topology, Measurements), String> {
-    let index_config = IndexConfig::new(spec.dimension, Metric::L2)
+) -> Result<(Topology, LifecycleMeasurements), String> {
+    let runtime = Runtime::new(backend.clone(), runtime_config.clone())
+        .map_err(|error| error_at("create import runtime", error))?;
+    let index = runtime
+        .create_index("benchmark", index_config(spec)?)
+        .await
+        .map_err(|error| error_at("create lifecycle index", error))?;
+    let batches = mutation_batches(dataset, spec.import_batch_size, "construct import record")?;
+    let truths = exact_truth(dataset, spec.k);
+    let requests = lifecycle_requests(dataset, spec)?;
+    let import_options = ImportOptions::default()
+        .with_in_flight_batches(spec.import_in_flight_batches)
+        .map_err(|error| error_at("configure Import Session", error))?;
+    let import_session = index
+        .import_session(import_options)
+        .map_err(|error| error_at("open Import Session", error))?;
+
+    let _ = metric_capture.snapshot();
+    let (import, case_baseline) =
+        run_import_phase(import_session, batches, backend_counters, metric_capture).await?;
+    let import_finished = Instant::now();
+    let immediate_search =
+        run_search_phase(&index, &requests, &truths, backend_counters, metric_capture)
+            .await?
+            .phase;
+
+    let convergence_started = Instant::now();
+    let convergence_deadline = convergence_started + settle_timeout(spec);
+    let convergence_resources_before = ResourceSnapshot::capture()?;
+    let convergence_backend_before = backend_counters.snapshot();
+    let topology = settle_topology_until(&index, dataset, spec, convergence_deadline).await?;
+    let drain_started = Instant::now();
+    wait_for_maintenance_until(metric_capture, convergence_deadline).await?;
+    let maintenance_drain_seconds = drain_started.elapsed().as_secs_f64();
+    let drained_topology =
+        verified_topology(&index, "verify drained topology", convergence_deadline).await?;
+    if topology_key(&drained_topology) != topology_key(&topology) {
+        return Err("topology changed after its stable observation".to_owned());
+    }
+    let convergence_completed = Instant::now();
+    let convergence_wall_seconds = convergence_completed
+        .duration_since(convergence_started)
+        .as_secs_f64();
+    let convergence_resources_after = ResourceSnapshot::capture()?;
+    let convergence_backend_io = backend_counters.since(&convergence_backend_before);
+    let convergence_metrics = metric_capture.snapshot();
+    let convergence = ConvergencePhase {
+        resources: phase_resources(
+            convergence_wall_seconds,
+            convergence_resources_before,
+            convergence_resources_after,
+            convergence_backend_io,
+            &convergence_metrics,
+            metric_capture,
+        ),
+        from_import_finish_seconds: convergence_completed
+            .duration_since(import_finished)
+            .as_secs_f64(),
+        maintenance_drain_seconds,
+    };
+
+    // A new Runtime is the public, deterministic cache-reset boundary. It
+    // preserves the stable persistent topology while ensuring the following
+    // query pass starts with an empty process-local Partition Cache.
+    let reset_started = Instant::now();
+    let reset_resources_before = ResourceSnapshot::capture()?;
+    let reset_backend_before = backend_counters.snapshot();
+    runtime
+        .shutdown()
+        .await
+        .map_err(|error| error_at("shut down import runtime", error))?;
+    drop(index);
+    drop(runtime);
+    let search_runtime = Runtime::new(backend, runtime_config)
+        .map_err(|error| error_at("create search runtime", error))?;
+    let stable_index = search_runtime
+        .open_index("benchmark")
+        .await
+        .map_err(|error| error_at("reopen lifecycle index", error))?;
+    let reset_wall_seconds = reset_started.elapsed().as_secs_f64();
+    let reset_resources_after = ResourceSnapshot::capture()?;
+    let reset_backend_io = backend_counters.since(&reset_backend_before);
+    let reset_metrics = metric_capture.snapshot();
+    let cache_reset = phase_resources(
+        reset_wall_seconds,
+        reset_resources_before,
+        reset_resources_after,
+        reset_backend_io,
+        &reset_metrics,
+        metric_capture,
+    );
+
+    let stable_cold_search = run_search_phase(
+        &stable_index,
+        &requests,
+        &truths,
+        backend_counters,
+        metric_capture,
+    )
+    .await?
+    .phase;
+    let stable_warm = run_search_phase(
+        &stable_index,
+        &requests,
+        &truths,
+        backend_counters,
+        metric_capture,
+    )
+    .await?;
+    let case_wall_seconds = stable_warm
+        .completed_at
+        .duration_since(case_baseline.started)
+        .as_secs_f64();
+    let case_resources_after = stable_warm.resources_after;
+    let case_backend_io = stable_warm
+        .backend_after
+        .checked_sub(&case_baseline.backend_io)
+        .ok_or_else(|| "continuous Backend counters decreased".to_owned())?;
+    let stable_warm_search = stable_warm.phase;
+    search_runtime
+        .shutdown()
+        .await
+        .map_err(|error| error_at("shut down search runtime", error))?;
+
+    let case_cpu_seconds = case_resources_after.cpu_seconds_since(case_baseline.resources);
+    let lifecycle = LifecycleMeasurements {
+        case_wall_seconds,
+        case_cpu_seconds: Some(case_cpu_seconds),
+        case_peak_rss_bytes: Some(case_resources_after.peak_rss_bytes()),
+        case_backend_io,
+        import,
+        immediate_search,
+        convergence,
+        cache_reset,
+        stable_cold_search,
+        stable_warm_search,
+    };
+    lifecycle
+        .unattributed_wall_seconds()
+        .ok_or_else(|| "lifecycle phases exceed the continuous wall time".to_owned())?;
+    lifecycle
+        .unattributed_cpu_seconds()
+        .ok_or_else(|| "lifecycle phases exceed the continuous CPU time".to_owned())?;
+    lifecycle
+        .unattributed_backend_io()
+        .ok_or_else(|| "lifecycle phases exceed the continuous Backend IO".to_owned())?;
+
+    Ok((topology, lifecycle))
+}
+
+/// Exact continuous-case baselines captured immediately before the first submit.
+struct CaseBaseline {
+    /// Monotonic first-submit timer boundary.
+    started: Instant,
+    /// Cumulative process resources at the same boundary.
+    resources: ResourceSnapshot,
+    /// Cumulative Backend IO at the same boundary.
+    backend_io: crate::report::BackendIo,
+}
+
+/// Builds the public Index configuration shared by steady and lifecycle cases.
+fn index_config(spec: &ScenarioSpec) -> Result<IndexConfig, String> {
+    IndexConfig::new(spec.dimension, Metric::L2)
         .and_then(|config| {
             config.with_fields(vec![
                 FieldSchema::new("bucket", DataType::I64)?,
@@ -392,7 +632,315 @@ async fn run_with_runtime<B: Backend>(
             config
                 .with_partition_entries(spec.max_partition_entries / 4, spec.max_partition_entries)
         })
-        .map_err(|error| error_at("configure index", error))?;
+        .map_err(|error| error_at("configure index", error))
+}
+
+/// Materializes bounded mutation batches before the first submission timer.
+fn mutation_batches(
+    dataset: &BenchmarkDataset,
+    batch_size: usize,
+    phase: &str,
+) -> Result<Vec<Vec<Mutation>>, String> {
+    dataset
+        .base
+        .chunks(batch_size)
+        .enumerate()
+        .map(|(batch, vectors)| {
+            vectors
+                .iter()
+                .enumerate()
+                .map(|(offset, vector)| {
+                    let ordinal = batch
+                        .checked_mul(batch_size)
+                        .and_then(|ordinal| ordinal.checked_add(offset))
+                        .ok_or_else(|| "import record ordinal overflow".to_owned())?;
+                    Record::new(
+                        dataset.ids[ordinal].clone(),
+                        Arc::clone(vector),
+                        vec![Value::I64(0), Value::I64(0)],
+                    )
+                    .map(Mutation::Insert)
+                    .map_err(|error| error_at(phase, error))
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Constructs the fixed query set used at every lifecycle search boundary.
+fn lifecycle_requests(
+    dataset: &BenchmarkDataset,
+    spec: &ScenarioSpec,
+) -> Result<Vec<SearchRequest>, String> {
+    (0..spec.measured_operations)
+        .map(|ordinal| search_request(dataset, spec, ordinal % dataset.queries.len()))
+        .collect()
+}
+
+/// Constructs one deterministic public search request.
+fn search_request(
+    dataset: &BenchmarkDataset,
+    spec: &ScenarioSpec,
+    query_index: usize,
+) -> Result<SearchRequest, String> {
+    SearchRequest::new(Arc::clone(&dataset.queries[query_index]), spec.k)
+        .map(|request| request.with_options(spec.search_options))
+        .map_err(|error| error_at("construct search request", error))
+}
+
+/// Executes one real bounded Import Session and summarizes accepted outcomes.
+async fn run_import_phase<B: Backend>(
+    mut session: ImportSession<MeasuredBackend<B>>,
+    batches: Vec<Vec<Mutation>>,
+    backend_counters: &BackendCounters,
+    metric_capture: &MetricCapture,
+) -> Result<(ImportPhase, CaseBaseline), String> {
+    let mut submitted_batch_sizes = Vec::with_capacity(batches.len());
+    let mut submit_latency_ms = Vec::with_capacity(batches.len());
+    let mut failures = BTreeMap::new();
+    let mut resources_before = None;
+    let mut backend_before = None;
+    let mut started = None;
+    for batch in batches {
+        if started.is_none() {
+            resources_before = Some(ResourceSnapshot::capture()?);
+            backend_before = Some(backend_counters.snapshot());
+        }
+        let records = batch.len();
+        let submit_started = Instant::now();
+        started.get_or_insert(submit_started);
+        match session.submit(batch).await {
+            Ok(_) => submitted_batch_sizes.push(records),
+            Err(error) => {
+                *failures.entry(format!("{:?}", error.kind())).or_default() += 1;
+            }
+        }
+        submit_latency_ms.push(submit_started.elapsed().as_secs_f64() * 1_000.0);
+    }
+    let started = started.ok_or_else(|| "lifecycle import has no batches".to_owned())?;
+    let resources_before =
+        resources_before.ok_or_else(|| "lifecycle import has no resource baseline".to_owned())?;
+    let backend_before =
+        backend_before.ok_or_else(|| "lifecycle import has no Backend IO baseline".to_owned())?;
+    let results = session.finish().await;
+    let wall_seconds = started.elapsed().as_secs_f64();
+    let resources_after = ResourceSnapshot::capture()?;
+    let backend_io = backend_counters.since(&backend_before);
+    let metrics = metric_capture.snapshot();
+    if results.len() != submitted_batch_sizes.len() {
+        return Err("Import Session result count differs from submitted batches".to_owned());
+    }
+    let mut accepted_batches = 0_u64;
+    let mut accepted_records = 0_u64;
+    let submitted_records = submitted_batch_sizes.iter().try_fold(0_u64, |total, size| {
+        total.checked_add(u64::try_from(*size).ok()?)
+    });
+    let submitted_records =
+        submitted_records.ok_or_else(|| "import record count overflow".to_owned())?;
+    for (batch_size, result) in submitted_batch_sizes.iter().zip(results) {
+        match result.result {
+            Ok(outcomes) => {
+                accepted_batches = accepted_batches.saturating_add(1);
+                accepted_records = accepted_records.saturating_add(
+                    u64::try_from(outcomes.len()).map_err(|_| "import record count overflow")?,
+                );
+                if outcomes.len() != *batch_size {
+                    return Err("Import Session outcome count differs from batch size".to_owned());
+                }
+            }
+            Err(error) => {
+                *failures.entry(format!("{:?}", error.kind())).or_default() += 1;
+            }
+        }
+    }
+    if accepted_records != submitted_records {
+        return Err(format!(
+            "Import Session accepted {accepted_records} of {submitted_records} records; batch failures: {failures:?}"
+        ));
+    }
+    let submitted_batches = u64::try_from(submitted_batch_sizes.len())
+        .map_err(|_| "import batch count overflow".to_owned())?;
+    let phase = ImportPhase {
+        resources: phase_resources(
+            wall_seconds,
+            resources_before,
+            resources_after,
+            backend_io,
+            &metrics,
+            metric_capture,
+        ),
+        submitted_batches,
+        accepted_batches,
+        accepted_records,
+        records_per_second: if wall_seconds > 0.0 {
+            accepted_records as f64 / wall_seconds
+        } else {
+            0.0
+        },
+        submit_latency_ms: Distribution::from_samples(submit_latency_ms),
+        batch_failures: failures,
+        admission: metrics.admission_summary(),
+    };
+    Ok((
+        phase,
+        CaseBaseline {
+            started,
+            resources: resources_before,
+            backend_io: backend_before,
+        },
+    ))
+}
+
+/// Executes the same fixed query set sequentially at one lifecycle boundary.
+async fn run_search_phase<B: Backend>(
+    index: &Index<MeasuredBackend<B>>,
+    requests: &[SearchRequest],
+    truths: &[ExactTruth],
+    backend_counters: &BackendCounters,
+    metric_capture: &MetricCapture,
+) -> Result<CompletedSearchPhase, String> {
+    let resources_before = ResourceSnapshot::capture()?;
+    let backend_before = backend_counters.snapshot();
+    let started = Instant::now();
+    let mut latency_ms = Vec::with_capacity(requests.len());
+    let mut first_query_latency_ms = None;
+    let mut errors = BTreeMap::new();
+    let mut outcomes = Vec::with_capacity(requests.len());
+    for (ordinal, request) in requests.iter().enumerate() {
+        let query_started = Instant::now();
+        let result = index.search(request.clone()).await;
+        let query_latency_ms = query_started.elapsed().as_secs_f64() * 1_000.0;
+        match result {
+            Ok(outcome) => {
+                if ordinal == 0 {
+                    first_query_latency_ms = Some(query_latency_ms);
+                }
+                latency_ms.push(query_latency_ms);
+                outcomes.push((outcome, &truths[ordinal % truths.len()]))
+            }
+            Err(error) => *errors.entry(format!("{:?}", error.kind())).or_default() += 1,
+        }
+    }
+    let completed_at = Instant::now();
+    let wall_seconds = completed_at.duration_since(started).as_secs_f64();
+    let resources_after = ResourceSnapshot::capture()?;
+    let backend_after = backend_counters.snapshot();
+    let backend_io = backend_after
+        .checked_sub(&backend_before)
+        .ok_or_else(|| "phase Backend counters decreased".to_owned())?;
+    let metrics = metric_capture.snapshot();
+    let attempted = u64::try_from(requests.len()).map_err(|_| "query count overflow")?;
+    let accepted = u64::try_from(outcomes.len()).map_err(|_| "query count overflow")?;
+    let recalls: Vec<_> = outcomes
+        .iter()
+        .map(|(outcome, truth)| oracle::recall_ids(outcome.hits.iter().map(|hit| hit.id()), truth))
+        .collect();
+    let truncation =
+        outcomes
+            .iter()
+            .fold(SearchTruncation::default(), |mut summary, (outcome, _)| {
+                summary.scanned_tree_keys += u64::from(outcome.exhausted.scanned_tree_keys);
+                summary.visited_partitions += u64::from(outcome.exhausted.visited_partitions);
+                summary.visited_leaf_entries += u64::from(outcome.exhausted.visited_leaf_entries);
+                summary.exact_rerank_candidates +=
+                    u64::from(outcome.exhausted.exact_rerank_candidates);
+                summary.rabitq_overlap += u64::from(outcome.rabitq_overlap_truncated);
+                summary
+            });
+    let phase = SearchPhase {
+        resources: phase_resources(
+            wall_seconds,
+            resources_before,
+            resources_after,
+            backend_io,
+            &metrics,
+            metric_capture,
+        ),
+        first_query_latency_ms,
+        search: OperationSummary {
+            attempted,
+            accepted,
+            rejected: metrics.foreground_admission_rejections(OperationClass::Search),
+            errors,
+            latency_ms: Distribution::from_samples(latency_ms),
+        },
+        throughput_per_second: if wall_seconds > 0.0 {
+            accepted as f64 / wall_seconds
+        } else {
+            0.0
+        },
+        recall_at_k: recall_summary(&recalls),
+        truncation,
+        search_budgets: budget_summaries(&metrics),
+        search_stages_ms: search_stage_summaries(&metrics),
+        cache: metrics.cache_summary(),
+        backend_admission: metrics.admission_summary(),
+    };
+    Ok(CompletedSearchPhase {
+        phase,
+        completed_at,
+        resources_after,
+        backend_after,
+    })
+}
+
+/// Search report plus the exact final-operation continuous-case boundary.
+struct CompletedSearchPhase {
+    /// Serialized phase measurements.
+    phase: SearchPhase,
+    /// Instant captured immediately after the final public search returned.
+    completed_at: Instant,
+    /// Cumulative process resources at the same boundary.
+    resources_after: ResourceSnapshot,
+    /// Cumulative Backend IO at the same boundary.
+    backend_after: crate::report::BackendIo,
+}
+
+/// Builds common resource and maintenance accounting at a phase boundary.
+fn phase_resources(
+    wall_seconds: f64,
+    before: ResourceSnapshot,
+    after: ResourceSnapshot,
+    backend_io: crate::report::BackendIo,
+    metrics: &CapturedMetrics,
+    metric_capture: &MetricCapture,
+) -> PhaseResources {
+    PhaseResources {
+        wall_seconds,
+        cpu_seconds: Some(after.cpu_seconds_since(before)),
+        peak_rss_bytes: Some(after.peak_rss_bytes()),
+        backend_io,
+        maintenance: MaintenanceSummary {
+            admission: metrics.counters_rendered("ktann.fixup.admission"),
+            execution: metrics.counters_rendered("ktann.fixup.execution"),
+            backlog_at_end: metric_capture.fixup_backlog(),
+        },
+    }
+}
+
+/// Converts measured search-stage histograms into milliseconds.
+fn search_stage_summaries(metrics: &CapturedMetrics) -> BTreeMap<String, Distribution> {
+    metrics
+        .histograms_by_label("ktann.search.stage.duration", "stage")
+        .into_iter()
+        .map(|(stage, samples)| {
+            (
+                stage,
+                Distribution::from_samples(samples).seconds_to_milliseconds(),
+            )
+        })
+        .collect()
+}
+
+/// Owns setup, warmup, measurement, and the post-run invariant audit.
+async fn run_with_runtime<B: Backend>(
+    runtime: &Runtime<MeasuredBackend<B>>,
+    backend_counters: &BackendCounters,
+    metric_capture: &MetricCapture,
+    spec: &ScenarioSpec,
+    dataset: &BenchmarkDataset,
+) -> Result<(Topology, SteadyStateMeasurements), String> {
+    let index_config = index_config(spec)?;
     let index = runtime
         .create_index("benchmark", index_config)
         .await
@@ -464,7 +1012,7 @@ async fn run_with_runtime<B: Backend>(
     let successful_operations = workload.successful_operations();
     let operations = workload.into_operation_summaries(&metrics);
     validate_admission_target(&operations, spec)?;
-    let measurements = Measurements {
+    let measurements = SteadyStateMeasurements {
         wall_seconds,
         maintenance_drain_seconds,
         cpu_seconds: Some(resources_after.cpu_seconds_since(resources_before)),
@@ -477,16 +1025,7 @@ async fn run_with_runtime<B: Backend>(
         operations,
         recall_at_k: recall_summary(&recalls),
         search_budgets: budget_summaries(&metrics),
-        search_stages_ms: metrics
-            .histograms_by_label("ktann.search.stage.duration", "stage")
-            .into_iter()
-            .map(|(stage, samples)| {
-                (
-                    stage,
-                    Distribution::from_samples(samples).seconds_to_milliseconds(),
-                )
-            })
-            .collect(),
+        search_stages_ms: search_stage_summaries(&metrics),
         cache: metrics.cache_summary(),
         backend_admission: metrics.admission_summary(),
         backend_io,
@@ -537,21 +1076,7 @@ async fn load_index<B: Backend>(
     index: &Index<MeasuredBackend<B>>,
     dataset: &BenchmarkDataset,
 ) -> Result<(), String> {
-    for (batch, vectors) in dataset.base.chunks(50).enumerate() {
-        let mutations: Result<Vec<_>, _> = vectors
-            .iter()
-            .enumerate()
-            .map(|(offset, vector)| {
-                let ordinal = batch * 50 + offset;
-                Record::new(
-                    dataset.ids[ordinal].clone(),
-                    Arc::clone(vector),
-                    vec![Value::I64(0), Value::I64(0)],
-                )
-                .map(Mutation::Insert)
-            })
-            .collect();
-        let mutations = mutations.map_err(|error| error_at("construct load record", error))?;
+    for mutations in mutation_batches(dataset, 50, "construct load record")? {
         let mut attempts = 0_u32;
         loop {
             match index.batch_mutate(mutations.clone()).await {
@@ -574,28 +1099,27 @@ async fn settle_topology<B: Backend>(
     spec: &ScenarioSpec,
 ) -> Result<Topology, String> {
     let deadline = Instant::now() + settle_timeout(spec);
+    settle_topology_until(index, dataset, spec, deadline).await
+}
+
+/// Drives topology convergence without extending the caller's absolute deadline.
+async fn settle_topology_until<B: Backend>(
+    index: &Index<MeasuredBackend<B>>,
+    dataset: &BenchmarkDataset,
+    spec: &ScenarioSpec,
+    deadline: Instant,
+) -> Result<Topology, String> {
     let mut previous = None;
     let mut stable_rounds = 0_u8;
     loop {
-        let report = index
-            .verify(VerifyOptions::default())
-            .await
-            .map_err(|error| error_at("verify topology", error))?;
-        if !report.complete || !report.issues.is_empty() {
-            return Err(format!(
-                "setup verification failed: complete={}, issues={}",
-                report.complete,
-                report.issues.len()
-            ));
-        }
-        let topology = Topology {
-            vector_records: report.objects.vector_records,
-            partitions: report.objects.partitions,
-            entries: report.objects.entries,
-        };
+        let topology = verified_topology(index, "verify topology", deadline).await?;
         let structured = topology.partitions > 1 && topology.entries > topology.vector_records;
-        stable_rounds = if structured && previous.as_ref() == Some(&topology_key(&topology)) {
-            stable_rounds.saturating_add(1)
+        stable_rounds = if structured {
+            if previous.as_ref() == Some(&topology_key(&topology)) {
+                stable_rounds.saturating_add(1)
+            } else {
+                1
+            }
         } else {
             0
         };
@@ -618,12 +1142,39 @@ async fn settle_topology<B: Backend>(
                 .map(|request| request.with_options(spec.search_options))
                 .map_err(|error| error_at("construct topology-settling search", error))?;
             index
-                .search(request)
+                .search_with_control(request, OperationOptions::default().with_deadline(deadline))
                 .await
                 .map_err(|error| error_at("settle topology", error))?;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// Verifies persistent state and returns its observable topology counts.
+async fn verified_topology<B: Backend>(
+    index: &Index<MeasuredBackend<B>>,
+    phase: &str,
+    deadline: Instant,
+) -> Result<Topology, String> {
+    let report = index
+        .verify(
+            VerifyOptions::default()
+                .with_operation_options(OperationOptions::default().with_deadline(deadline)),
+        )
+        .await
+        .map_err(|error| error_at(phase, error))?;
+    if !report.complete || !report.issues.is_empty() {
+        return Err(format!(
+            "{phase} failed: complete={}, issues={}",
+            report.complete,
+            report.issues.len()
+        ));
+    }
+    Ok(Topology {
+        vector_records: report.objects.vector_records,
+        partitions: report.objects.partitions,
+        entries: report.objects.entries,
+    })
 }
 
 /// Returns the bounded setup and maintenance-drain allowance for a profile.
@@ -640,7 +1191,14 @@ async fn wait_for_maintenance(
     metric_capture: &MetricCapture,
     timeout: Duration,
 ) -> Result<(), String> {
-    let deadline = Instant::now() + timeout;
+    wait_for_maintenance_until(metric_capture, Instant::now() + timeout).await
+}
+
+/// Waits for maintenance without extending an existing absolute deadline.
+async fn wait_for_maintenance_until(
+    metric_capture: &MetricCapture,
+    deadline: Instant,
+) -> Result<(), String> {
     let mut backlog = metric_capture.fixup_backlog();
     while backlog > 0 {
         if Instant::now() >= deadline {
@@ -728,9 +1286,7 @@ fn work_items(
             // immutable oracle model. Mixed workloads still report budgets and
             // latency, but never compare against stale pre-update truth.
             let truth = truth.map(|truth| Arc::clone(&truth[query_index]));
-            let request = SearchRequest::new(Arc::clone(&dataset.queries[query_index]), spec.k)
-                .map(|request| request.with_options(spec.search_options))
-                .map_err(|error| error_at("construct search request", error))?;
+            let request = search_request(dataset, spec, query_index)?;
             items.push(WorkItem::Search { request, truth });
         } else {
             let ordinal = if spec.hot_updates {

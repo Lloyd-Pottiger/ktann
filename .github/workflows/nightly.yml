@@ -38,7 +38,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: performance-rocksdb
-      - name: Run optimized full profile
+      - name: Run optimized full profile including lifecycle
         run: >-
           cargo +stable run --release -p ktann-benchmarks --bin ktann-bench --
           run --backend rocksdb --profile full --worker-threads 2
@@ -63,7 +63,7 @@ jobs:
           shared-key: performance-foundationdb
       - name: Set up FoundationDB
         run: .github/scripts/setup-foundationdb.sh server
-      - name: Run optimized full profile
+      - name: Run optimized full profile including lifecycle
         run: >-
           cargo +stable run --release -p ktann-benchmarks
           --no-default-features --features foundationdb --bin ktann-bench --
