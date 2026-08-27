@@ -163,7 +163,8 @@ The report keeps these boundaries distinct:
    `ImportSession::finish`. It reports accepted batches and records, throughput,
    submit percentiles, gate waits, batch failures, CPU, Backend IO, peak RSS,
    and concurrent Structure Maintenance. `finish` remains only an accepted
-   batch-outcome barrier.
+   batch-outcome barrier. The case fails if any submitted record is not
+   accepted, so subsequent recall always measures the complete fixed corpus.
 2. `immediate_search` is the first fixed query pass after finish, before the
    runner drives convergence. It reports first-query and p50/p95/p99 latency,
    throughput, mean/minimum recall@k, truncation, Search Budget use, cache

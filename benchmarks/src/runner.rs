@@ -278,6 +278,9 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
             hot_updates: false,
             blocking_resource_limit: None,
             dispatch: WorkloadDispatch::Continuous,
+            // Keep one batch active so the fixed corpus is fully imported
+            // while Structure Maintenance competes for the same partitions.
+            import_in_flight_batches: 1,
             ..clustered.clone()
         },
     ]
@@ -729,6 +732,11 @@ async fn run_import_phase<B: Backend>(
     }
     let mut accepted_batches = 0_u64;
     let mut accepted_records = 0_u64;
+    let submitted_records = submitted_batch_sizes.iter().try_fold(0_u64, |total, size| {
+        total.checked_add(u64::try_from(*size).ok()?)
+    });
+    let submitted_records =
+        submitted_records.ok_or_else(|| "import record count overflow".to_owned())?;
     for (batch_size, result) in submitted_batch_sizes.iter().zip(results) {
         match result.result {
             Ok(outcomes) => {
@@ -744,6 +752,11 @@ async fn run_import_phase<B: Backend>(
                 *failures.entry(format!("{:?}", error.kind())).or_default() += 1;
             }
         }
+    }
+    if accepted_records != submitted_records {
+        return Err(format!(
+            "Import Session accepted {accepted_records} of {submitted_records} records; batch failures: {failures:?}"
+        ));
     }
     let submitted_batches = u64::try_from(submitted_batch_sizes.len())
         .map_err(|_| "import batch count overflow".to_owned())?;
