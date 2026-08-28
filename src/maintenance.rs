@@ -16,6 +16,7 @@
 //! same rules to `Merging`.
 
 pub(crate) mod drain;
+pub(crate) mod fixup;
 pub mod merge;
 pub(crate) mod mutation;
 pub mod routing;

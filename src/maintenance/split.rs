@@ -47,8 +47,8 @@ use crate::runtime::{reads, writes};
 use crate::storage::backend::{Backend, WriteTxn};
 use crate::storage::keys::{LogicalKey, TreeKey};
 use crate::storage::values::{
-    IndexManifest, PartitionCentroid, PartitionState, PartitionTransition, expect_centroid,
-    expect_header,
+    IndexManifest, PartitionCentroid, PartitionHeader, PartitionState, PartitionTransition,
+    expect_centroid, expect_header,
 };
 use crate::storage::{ReadLogicalTxn, WriteLogicalTxn, topology};
 
@@ -566,9 +566,36 @@ pub async fn advance<B: Backend>(
     drop(read);
     // Nothing was ever persisted here, or a completed split already removed
     // every value: nothing to advance.
-    let Some((header, state)) = pair else {
+    let Some(authority) = pair else {
         return Ok(Advance::Idle);
     };
+    advance_observed(
+        backend,
+        manifest,
+        tree_key,
+        partition,
+        started_at_unix_millis,
+        retry,
+        authority,
+    )
+    .await
+}
+
+/// Runs one split step from an already validated Header and State pair.
+///
+/// The shared Fixup dispatcher uses this entry point after its single
+/// preflight read. Public direct drivers retain [`advance`] as the complete
+/// read-and-dispatch operation.
+pub(crate) async fn advance_observed<B: Backend>(
+    backend: &B,
+    manifest: &IndexManifest,
+    tree_key: &TreeKey,
+    partition: PartitionKey,
+    started_at_unix_millis: u64,
+    retry: &RetryPolicy,
+    authority: (PartitionHeader, PartitionTransition),
+) -> Result<Advance> {
+    let (header, state) = authority;
     if matches!(
         state,
         PartitionTransition::Splitting { .. } | PartitionTransition::DrainingSplit { .. }

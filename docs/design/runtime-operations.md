@@ -39,13 +39,19 @@ known outcome call shutdown explicitly.
 
 ## 3. Maintenance scheduling
 
-Relevant mutation and search paths may offer a Fixup key to a bounded,
-deduplicating process-local queue. Admission bounds per-index and global
+Relevant mutation and search paths may offer an actionable Fixup key to a
+bounded, deduplicating process-local queue. Eligibility is derived from the
+committed Header: threshold-crossing Ready partitions and durable split/merge
+source states are actionable, while healthy Ready partitions and
+ReceivingSplit targets are not. One committed mutation batch coalesces each
+partition before offering it. Admission bounds per-index and global
 concurrency. Queue full, duplicate admission, or worker loss is observable but
 does not affect correctness.
 
-A fixup retries a bounded number of whole state-machine steps with capped
-jittered backoff, then retires. Later relevant access may enqueue it again.
+A fixup reads one Header/State pair and dispatches directly to the owning split
+or merge state machine, then retries a bounded number of whole state-machine
+steps with capped jittered backoff before retiring. Later relevant access may
+enqueue it again.
 There is no durable scan, queue, leader, lease, or claim that one Runtime knows
 cluster-wide backlog.
 

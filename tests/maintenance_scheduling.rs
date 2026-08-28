@@ -297,6 +297,39 @@ async fn queue_loss_leaves_searchable_state_and_search_resumes_it() {
     runtime_b.shutdown().await.expect("shutdown");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lost_oversized_ready_offer_is_rediscovered_after_reopen() {
+    let backend = backend();
+
+    // With no workers, every foreground offer is deliberately dropped. The
+    // committed oversized Ready root remains the complete source of truth.
+    let runtime_a = Runtime::new(backend.clone(), runtime_config(0, 4, 8)).expect("runtime");
+    let index_a = runtime_a
+        .create_index("lost-ready", index_config(1, 4))
+        .await
+        .expect("create index");
+    let mut model = Model::new();
+    for id in 0..5_u8 {
+        insert(&index_a, &mut model, id, f32::from(id)).await;
+    }
+    let (states, entries) = topology(&backend, &index_a).await;
+    assert_eq!(states, [PartitionState::Ready]);
+    assert_eq!(entries, 5);
+    runtime_a.shutdown().await.expect("shutdown");
+
+    // A new Runtime begins with an empty queue. Search observes the committed
+    // threshold crossing, re-offers it, and the split converges normally.
+    let runtime_b = Runtime::new(backend.clone(), runtime_config(2, 16, 8)).expect("runtime");
+    let index_b = runtime_b
+        .open_index("lost-ready")
+        .await
+        .expect("open index");
+    settle(&index_b, &backend, &model).await;
+    assert_converged(&backend, &index_b, &model).await;
+    assert_records(&index_b, &model).await;
+    runtime_b.shutdown().await.expect("shutdown");
+}
+
 /// Polls until some reachable partition is in `expected`. The poll's
 /// re-offers keep advancing the machine, so `expected` must persist through
 /// every step the wait can still drive: with `fixup_attempts == 1`, at most

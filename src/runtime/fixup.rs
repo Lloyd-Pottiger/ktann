@@ -39,7 +39,7 @@ use std::sync::{Arc, MutexGuard};
 use tracing::{Instrument as _, Span};
 
 use crate::api::{Error, ErrorKind, LogicalIndexId, PartitionKey, Result};
-use crate::maintenance::{merge, split};
+use crate::maintenance::{fixup as maintenance_fixup, merge, split};
 use crate::observe::labels::{FixupAdmission, FixupExecution, FixupKind, FixupStepResult};
 use crate::observe::{metrics, trace};
 use crate::storage::backend::Backend;
@@ -419,10 +419,9 @@ impl<B: Backend> Drop for WorkerGuard<B> {
 
 /// Drives one offered partition through its next bounded state-machine steps.
 ///
-/// One step is one [`split::advance`] pass, falling back to one
-/// [`merge::advance`] pass when the split state machine has nothing to do
-/// (`Ready` at or below the split threshold, `ReceivingSplit`, or `Merging`).
-/// Progress continues within the configured step budget; any error — a
+/// One step reads the durable authority once and dispatches directly to the
+/// actionable split or merge state machine. Progress continues within the
+/// configured step budget; any error — a
 /// contended step that exhausted its bounded retries, an unknown commit
 /// outcome, or Corruption — retires the Fixup, and a later relevant access
 /// rediscovers the durable state exactly where it stopped. Corruption is not
@@ -440,7 +439,7 @@ async fn drive<B: Backend>(inner: &Arc<RuntimeInner<B>>, offer: &FixupOffer) -> 
         }
         let started_at = now_unix_millis();
         let key = &offer.key;
-        let split_step = split::advance(
+        let step = maintenance_fixup::advance(
             &*backend,
             &offer.manifest,
             &key.tree_key,
@@ -449,22 +448,26 @@ async fn drive<B: Backend>(inner: &Arc<RuntimeInner<B>>, offer: &FixupOffer) -> 
             &retry,
         )
         .await;
-        observe_split_step(&split_step);
-        match split_step {
-            Ok(split::Advance::Idle) => {
-                let merge_step = merge::advance(
-                    &*backend,
-                    &offer.manifest,
-                    &key.tree_key,
-                    key.partition,
-                    started_at,
-                    &retry,
-                )
-                .await;
-                observe_merge_step(&merge_step);
-                if !matches!(merge_step, Ok(merge::Advance::Idle)) {
-                    trace::fixup_kind(&Span::current(), FixupKind::Merge);
+        match step {
+            Ok(maintenance_fixup::Advance::Idle) => return FixupExecution::Settled,
+            Ok(maintenance_fixup::Advance::Split(split_step)) => {
+                observe_split_step(&split_step);
+                trace::fixup_kind(&Span::current(), FixupKind::Split);
+                match split_step {
+                    Ok(split::Advance::Idle | split::Advance::Completed) => {
+                        return FixupExecution::Settled;
+                    }
+                    Ok(
+                        split::Advance::Began { .. }
+                        | split::Advance::Exposed { .. }
+                        | split::Advance::Drained { .. },
+                    ) => {}
+                    Err(_) => return FixupExecution::Retired,
                 }
+            }
+            Ok(maintenance_fixup::Advance::Merge(merge_step)) => {
+                observe_merge_step(&merge_step);
+                trace::fixup_kind(&Span::current(), FixupKind::Merge);
                 match merge_step {
                     Ok(merge::Advance::Idle | merge::Advance::Completed) => {
                         return FixupExecution::Settled;
@@ -474,21 +477,10 @@ async fn drive<B: Backend>(inner: &Arc<RuntimeInner<B>>, offer: &FixupOffer) -> 
                     Err(_) => return FixupExecution::Retired,
                 }
             }
-            Ok(split::Advance::Completed) => {
-                trace::fixup_kind(&Span::current(), FixupKind::Split);
-                return FixupExecution::Settled;
-            }
-            Ok(
-                split::Advance::Began { .. }
-                | split::Advance::Exposed { .. }
-                | split::Advance::Drained { .. },
-            ) => {
-                trace::fixup_kind(&Span::current(), FixupKind::Split);
-            }
-            Err(_) => {
-                trace::fixup_kind(&Span::current(), FixupKind::Split);
-                return FixupExecution::Retired;
-            }
+            // The shared authority preflight failed before it could identify
+            // a split or merge owner. The execution outcome records the
+            // retirement without fabricating a state-machine step.
+            Err(_) => return FixupExecution::Retired,
         }
     }
     // The step budget ran out with work possibly remaining: the Fixup

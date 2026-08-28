@@ -58,6 +58,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt;
 
 use crate::api::{Error, ErrorKind, PartitionKey, Result, SearchBudgets};
+use crate::maintenance::fixup;
 use crate::storage::ReadLogicalTxn;
 use crate::storage::backend::ReadOps;
 use crate::storage::keys::{LogicalKey, TreeKey};
@@ -419,20 +420,8 @@ impl Traversal {
         }
         let level = header.level();
 
-        // A visit is the relevant access that rediscovers maintenance work:
-        // offer split and merge states, over-threshold `Ready` partitions
-        // (split candidates whose offer was lost), and under-threshold
-        // non-root `Ready` partitions (merge candidates). A `ReceivingSplit`
-        // target is driven by its source, so it is not offered itself.
-        let config = context.manifest.config();
-        let split_candidate = header.entry_count() > config.max_partition_entries();
-        let merge_candidate =
-            entry.expected_level.is_some() && header.entry_count() < config.min_partition_entries();
-        if matches!(
-            header.state(),
-            PartitionState::Splitting | PartitionState::DrainingSplit | PartitionState::Merging
-        ) || (header.state() == PartitionState::Ready && (split_candidate || merge_candidate))
-        {
+        // A visit rediscovers only work the committed Header can advance.
+        if fixup::is_actionable(context.manifest.config(), entry.partition, header) {
             self.maintenance.push((tree_key.clone(), entry.partition));
         }
 

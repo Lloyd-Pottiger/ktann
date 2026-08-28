@@ -27,8 +27,7 @@ use support::{DeterministicBackend, DeterministicConfig, SharedBackend, audit, o
 #[allow(dead_code)]
 mod support;
 
-/// The cumulative value of one counter series in one snapshot (0 when the
-/// series does not exist yet).
+/// Returns one cumulative counter series value, or zero when absent.
 fn counter(snapshot: &[CounterSeries], name: &str, labels: &[(&str, &str)]) -> u64 {
     snapshot
         .iter()
@@ -37,14 +36,14 @@ fn counter(snapshot: &[CounterSeries], name: &str, labels: &[(&str, &str)]) -> u
                 && labels.iter().all(|(key, value)| {
                     series_labels
                         .iter()
-                        .any(|l| l == &(key.to_string(), value.to_string()))
+                        .any(|label| label == &(key.to_string(), value.to_string()))
                 })
         })
         .map(|(_, _, value)| *value)
         .sum()
 }
 
-/// The increase of one counter series between two snapshots.
+/// Returns one counter series increase between cumulative snapshots.
 fn delta(
     before: &[CounterSeries],
     after: &[CounterSeries],
@@ -70,12 +69,92 @@ fn index_config() -> IndexConfig {
 }
 
 fn record(id: &str, x: f32) -> Record {
+    record_in_bucket(id, x, 7)
+}
+
+fn record_in_bucket(id: &str, x: f32, bucket: i64) -> Record {
     Record::new(
         Bytes::copy_from_slice(id.as_bytes()),
         Arc::from([x]),
-        vec![Value::I64(7)],
+        vec![Value::I64(bucket)],
     )
     .expect("valid record")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreground_batches_offer_only_coalesced_actionable_partitions() {
+    let _serial = observe::audit_lock().await;
+    let capture = observe::capture();
+
+    let backend = SharedBackend::new(DeterministicBackend::new(DeterministicConfig::default()));
+    let config = RuntimeConfig::default()
+        .with_maintenance(1, 16)
+        .and_then(|config| config.with_import_limits(1, 1))
+        .expect("valid runtime config");
+    let runtime = Runtime::new(backend, config).expect("runtime");
+    let index = runtime
+        .create_index("actionable-fixups", index_config())
+        .await
+        .expect("create index");
+
+    let before_healthy = capture.metric_counters();
+    let healthy = (0..8_u8)
+        .map(|id| Mutation::Insert(record_in_bucket(&format!("healthy-{id}"), f32::from(id), 8)))
+        .collect();
+    index.batch_mutate(healthy).await.expect("healthy batch");
+    let after_healthy = capture.metric_counters();
+    for outcome in ["enqueued", "duplicate", "saturated"] {
+        assert_eq!(
+            delta(
+                &before_healthy,
+                &after_healthy,
+                "ktann.fixup.admission",
+                &[("outcome", outcome)],
+            ),
+            0,
+            "a healthy final Header must not be offered",
+        );
+    }
+
+    let before_actionable = capture.metric_counters();
+    let oversized = (0..9_u8)
+        .map(|id| {
+            Mutation::Insert(record_in_bucket(
+                &format!("oversized-{id}"),
+                f32::from(id),
+                9,
+            ))
+        })
+        .collect();
+    index
+        .batch_mutate(oversized)
+        .await
+        .expect("oversized batch");
+    let after_actionable = capture.metric_counters();
+    assert_eq!(
+        delta(
+            &before_actionable,
+            &after_actionable,
+            "ktann.fixup.admission",
+            &[("outcome", "enqueued")],
+        ),
+        1,
+        "one committed batch offers one partition once",
+    );
+    for outcome in ["duplicate", "saturated"] {
+        assert_eq!(
+            delta(
+                &before_actionable,
+                &after_actionable,
+                "ktann.fixup.admission",
+                &[("outcome", outcome)],
+            ),
+            0,
+            "batch-local coalescing happens before queue admission",
+        );
+    }
+
+    runtime.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
