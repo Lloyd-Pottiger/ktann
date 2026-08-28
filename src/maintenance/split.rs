@@ -322,7 +322,7 @@ pub async fn drain_batch<B: Backend>(
         left,
         right,
     };
-    writes::run_write_attempts(
+    let step = writes::run_write_attempts(
         backend,
         None,
         manifest,
@@ -330,7 +330,11 @@ pub async fn drain_batch<B: Backend>(
         Operation::SplitFixup,
         |txn| writes::boxed_step(drain_attempt(txn, manifest, tree_key, source, &plan)),
     )
-    .await
+    .await?;
+    if let DrainStep::Drained { moved, .. } = step {
+        metrics::fixup_drain_step(FixupKind::Split, moved);
+    }
+    Ok(step)
 }
 
 /// One fixed drain batch: the candidates fixed by the read snapshot and the

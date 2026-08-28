@@ -8,7 +8,9 @@ use metrics::atomics::AtomicU64;
 use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
 use metrics_util::registry::{AtomicStorage, Registry};
 
-use crate::report::{AdmissionSummary, CacheSummary, Distribution, OperationClass};
+use crate::report::{
+    AdmissionSummary, CacheSummary, Distribution, OperationClass, WriteAttribution,
+};
 
 /// One process-global recorder used by a single benchmark worker.
 #[derive(Debug)]
@@ -50,10 +52,12 @@ impl MetricCapture {
     pub fn snapshot(&self) -> CapturedMetrics {
         let mut captured = CapturedMetrics::default();
         self.registry.visit_counters(|key, counter| {
-            captured.counters.insert(
-                SeriesKey::from_metric_key(key),
-                counter.swap(0, Ordering::SeqCst),
-            );
+            let value = counter.swap(0, Ordering::SeqCst);
+            if value > 0 {
+                captured
+                    .counters
+                    .insert(SeriesKey::from_metric_key(key), value);
+            }
         });
         self.registry.visit_gauges(|key, gauge| {
             captured.gauges.insert(
@@ -64,9 +68,11 @@ impl MetricCapture {
         self.registry.visit_histograms(|key, histogram| {
             let mut values = Vec::new();
             histogram.clear_with(|block| values.extend_from_slice(block));
-            captured
-                .histograms
-                .insert(SeriesKey::from_metric_key(key), values);
+            if !values.is_empty() {
+                captured
+                    .histograms
+                    .insert(SeriesKey::from_metric_key(key), values);
+            }
         });
         captured
     }
@@ -189,6 +195,37 @@ impl CapturedMetrics {
             .filter(|(key, _)| key.name == name)
             .map(|(key, value)| (key.render_labels(), *value))
             .collect()
+    }
+
+    /// Returns all histograms grouped by their complete rendered label sets.
+    #[must_use]
+    pub fn distributions_rendered(&self, name: &str) -> BTreeMap<String, Distribution> {
+        self.histograms
+            .iter()
+            .filter(|(key, _)| key.name == name)
+            .map(|(key, values)| {
+                (
+                    key.render_labels(),
+                    Distribution::from_samples(values.clone()),
+                )
+            })
+            .collect()
+    }
+
+    /// Converts operation-attributed write series into the report schema.
+    #[must_use]
+    pub fn write_attribution(&self) -> WriteAttribution {
+        WriteAttribution {
+            attempts: self.counters_rendered("ktann.write.attempts"),
+            retries: self.counters_rendered("ktann.write.retries"),
+            mutation_operations: self.counters_rendered("ktann.write.mutations"),
+            mutation_bytes: self.counters_rendered("ktann.write.mutation_bytes"),
+            commit_wait_ms: self
+                .distributions_rendered("ktann.write.commit.duration")
+                .into_iter()
+                .map(|(labels, distribution)| (labels, distribution.seconds_to_milliseconds()))
+                .collect(),
+        }
     }
 
     /// Converts captured cache series into the report schema.
@@ -318,7 +355,65 @@ fn finite_usize(value: f64) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::MetricCapture;
+    use super::{CapturedMetrics, MetricCapture, SeriesKey};
+
+    #[test]
+    fn write_series_preserve_complete_attribution_labels() {
+        let mut captured = CapturedMetrics::default();
+        let retryable = [
+            ("operation", "batch_mutate"),
+            ("outcome", "retryable_abort"),
+        ];
+        captured
+            .counters
+            .insert(SeriesKey::new("ktann.write.attempts", &retryable), 3);
+        captured.counters.insert(
+            SeriesKey::new("ktann.write.retries", &[("operation", "batch_mutate")]),
+            2,
+        );
+        captured
+            .counters
+            .insert(SeriesKey::new("ktann.write.mutations", &retryable), 12);
+        captured.counters.insert(
+            SeriesKey::new("ktann.write.mutation_bytes", &retryable),
+            480,
+        );
+        captured.histograms.insert(
+            SeriesKey::new(
+                "ktann.write.commit.duration",
+                &[("operation", "split_fixup"), ("outcome", "committed")],
+            ),
+            vec![0.001, 0.003],
+        );
+
+        let writes = captured.write_attribution();
+        assert_eq!(
+            writes
+                .attempts
+                .get("operation=batch_mutate,outcome=retryable_abort"),
+            Some(&3)
+        );
+        assert_eq!(writes.retries.get("operation=batch_mutate"), Some(&2));
+        assert_eq!(
+            writes
+                .mutation_operations
+                .get("operation=batch_mutate,outcome=retryable_abort"),
+            Some(&12)
+        );
+        assert_eq!(
+            writes
+                .mutation_bytes
+                .get("operation=batch_mutate,outcome=retryable_abort"),
+            Some(&480)
+        );
+        let commit_wait = writes
+            .commit_wait_ms
+            .get("operation=split_fixup,outcome=committed")
+            .expect("commit wait series");
+        assert_eq!(commit_wait.count, 2);
+        assert_eq!(commit_wait.mean, 2.0);
+        assert_eq!(commit_wait.p95, 3.0);
+    }
 
     #[test]
     fn gauges_remain_sticky_until_an_explicit_update() {

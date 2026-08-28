@@ -33,10 +33,10 @@ use crate::resource::ResourceSnapshot;
 )]
 mod oracle;
 
-/// Background workers used by every measured process.
-const MAINTENANCE_WORKERS: usize = 2;
 /// Queue capacity keeps the default Import backlog watermark valid.
 const FIXUP_QUEUE_CAPACITY: usize = 1_024;
+/// Workers used after import diagnostics to converge persistent topology.
+const CONVERGENCE_MAINTENANCE_WORKERS: usize = 2;
 
 /// One immutable exact top-k result shared by repeated query operations.
 type ExactTruth = Arc<[(Bytes, f64)]>;
@@ -99,6 +99,8 @@ pub struct ScenarioSpec {
     pub import_in_flight_batches: usize,
     /// Explicit Runtime Fixup backlog watermark for Import Session admission.
     pub import_backlog_watermark: usize,
+    /// Background Structure Maintenance workers.
+    pub maintenance_workers: usize,
 }
 
 /// Returns the complete deterministic scenario matrix for one scale profile.
@@ -142,6 +144,7 @@ fn smoke_scenarios() -> Vec<ScenarioSpec> {
         import_batch_size: 32,
         import_in_flight_batches: 2,
         import_backlog_watermark: 512,
+        maintenance_workers: 2,
     };
     vec![
         common.clone(),
@@ -217,6 +220,7 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
         import_batch_size: 50,
         import_in_flight_batches: 4,
         import_backlog_watermark: 512,
+        maintenance_workers: 2,
     };
     let clustered = ann("ann-clustered", "clustered", 5_000, 100, 128, 0x38_1001);
     vec![
@@ -320,14 +324,15 @@ pub async fn run_scenario<B: Backend>(
     let (backend, backend_counters) = MeasuredBackend::new(backend);
     let admission = backend.admission_budget();
     let metric_capture = MetricCapture::install()?;
-    let runtime_config = runtime_config(spec)?;
-    let default_search_budgets = runtime_config.default_search_budgets();
+    let primary_runtime_config = runtime_config(spec, spec.maintenance_workers)?;
+    let default_search_budgets = primary_runtime_config.default_search_budgets();
     let search_budgets =
         search_budget_configuration(default_search_budgets, spec.search_options, spec.k)?;
     let (topology, measurements) = if spec.lifecycle {
         let (topology, lifecycle) = run_lifecycle_case(
             backend,
-            runtime_config,
+            primary_runtime_config,
+            runtime_config(spec, CONVERGENCE_MAINTENANCE_WORKERS)?,
             &backend_counters,
             &metric_capture,
             spec,
@@ -336,7 +341,7 @@ pub async fn run_scenario<B: Backend>(
         .await?;
         (topology, ReportMeasurements::Lifecycle(Box::new(lifecycle)))
     } else {
-        let runtime = Runtime::new(backend, runtime_config)
+        let runtime = Runtime::new(backend, primary_runtime_config)
             .map_err(|error| error_at("create runtime", error))?;
         let measured =
             run_with_runtime(&runtime, &backend_counters, &metric_capture, spec, &dataset).await;
@@ -373,7 +378,10 @@ pub async fn run_scenario<B: Backend>(
             max_partition_entries: spec.max_partition_entries,
             partition_cache_bytes: spec.partition_cache_bytes,
             foreground_limit: spec.foreground_limit,
-            maintenance_workers: MAINTENANCE_WORKERS,
+            maintenance_workers: spec.maintenance_workers,
+            convergence_maintenance_workers: spec
+                .lifecycle
+                .then_some(CONVERGENCE_MAINTENANCE_WORKERS),
             fixup_queue_capacity: FIXUP_QUEUE_CAPACITY,
             search_budgets,
             leaf_beam_size_override: spec.search_options.leaf_beam_size(),
@@ -396,13 +404,16 @@ pub async fn run_scenario<B: Backend>(
 }
 
 /// Builds the complete process-local configuration used by benchmark workers.
-fn runtime_config(spec: &ScenarioSpec) -> Result<RuntimeConfig, String> {
+fn runtime_config(
+    spec: &ScenarioSpec,
+    maintenance_workers: usize,
+) -> Result<RuntimeConfig, String> {
     // The Fixup queue retains the default capacity so the default Import
     // Session backlog watermark remains within it. RuntimeConfig validates
     // those two process-local resource bounds together at Runtime creation.
     let config = RuntimeConfig::default()
         .with_foreground_operation_limit(spec.foreground_limit)
-        .and_then(|config| config.with_maintenance(MAINTENANCE_WORKERS, FIXUP_QUEUE_CAPACITY))
+        .and_then(|config| config.with_maintenance(maintenance_workers, FIXUP_QUEUE_CAPACITY))
         .and_then(|config| config.with_attempts(32, 32))
         .and_then(|config| config.with_partition_cache_bytes(spec.partition_cache_bytes));
     let config = if spec.lifecycle {
@@ -453,13 +464,14 @@ fn search_budget_configuration(
 /// Measures one fresh Index from Import Session submission through warm search.
 async fn run_lifecycle_case<B: Backend>(
     backend: MeasuredBackend<B>,
-    runtime_config: RuntimeConfig,
+    import_runtime_config: RuntimeConfig,
+    convergence_runtime_config: RuntimeConfig,
     backend_counters: &BackendCounters,
     metric_capture: &MetricCapture,
     spec: &ScenarioSpec,
     dataset: &BenchmarkDataset,
 ) -> Result<(Topology, LifecycleMeasurements), String> {
-    let runtime = Runtime::new(backend.clone(), runtime_config.clone())
+    let runtime = Runtime::new(backend.clone(), import_runtime_config)
         .map_err(|error| error_at("create import runtime", error))?;
     let index = runtime
         .create_index("benchmark", index_config(spec)?)
@@ -488,15 +500,26 @@ async fn run_lifecycle_case<B: Backend>(
     let convergence_deadline = convergence_started + settle_timeout(spec);
     let convergence_resources_before = ResourceSnapshot::capture()?;
     let convergence_backend_before = backend_counters.snapshot();
-    let topology = settle_topology_until(&index, dataset, spec, convergence_deadline).await?;
-    let drain_started = Instant::now();
-    wait_for_maintenance_until(metric_capture, convergence_deadline).await?;
-    let maintenance_drain_seconds = drain_started.elapsed().as_secs_f64();
-    let drained_topology =
-        verified_topology(&index, "verify drained topology", convergence_deadline).await?;
-    if topology_key(&drained_topology) != topology_key(&topology) {
-        return Err("topology changed after its stable observation".to_owned());
-    }
+    let (runtime, index) = if spec.maintenance_workers == CONVERGENCE_MAINTENANCE_WORKERS {
+        (runtime, index)
+    } else {
+        runtime
+            .shutdown()
+            .await
+            .map_err(|error| error_at("shut down import-only runtime", error))?;
+        drop(index);
+        drop(runtime);
+        let runtime = Runtime::new(backend.clone(), convergence_runtime_config.clone())
+            .map_err(|error| error_at("create convergence runtime", error))?;
+        let index = runtime
+            .open_index("benchmark")
+            .await
+            .map_err(|error| error_at("reopen lifecycle index for convergence", error))?;
+        (runtime, index)
+    };
+    let (topology, maintenance_drain_seconds) =
+        settle_and_drain_topology(&index, dataset, spec, metric_capture, convergence_deadline)
+            .await?;
     let convergence_completed = Instant::now();
     let convergence_wall_seconds = convergence_completed
         .duration_since(convergence_started)
@@ -528,10 +551,10 @@ async fn run_lifecycle_case<B: Backend>(
     runtime
         .shutdown()
         .await
-        .map_err(|error| error_at("shut down import runtime", error))?;
+        .map_err(|error| error_at("shut down convergence runtime", error))?;
     drop(index);
     drop(runtime);
-    let search_runtime = Runtime::new(backend, runtime_config)
+    let search_runtime = Runtime::new(backend, convergence_runtime_config)
         .map_err(|error| error_at("create search runtime", error))?;
     let stable_index = search_runtime
         .open_index("benchmark")
@@ -910,9 +933,12 @@ fn phase_resources(
         cpu_seconds: Some(after.cpu_seconds_since(before)),
         peak_rss_bytes: Some(after.peak_rss_bytes()),
         backend_io,
+        writes: metrics.write_attribution(),
         maintenance: MaintenanceSummary {
             admission: metrics.counters_rendered("ktann.fixup.admission"),
             execution: metrics.counters_rendered("ktann.fixup.execution"),
+            steps: metrics.counters_rendered("ktann.fixup.steps"),
+            drain_entries: metrics.distributions_rendered("ktann.fixup.drain.entries"),
             backlog_at_end: metric_capture.fixup_backlog(),
         },
     }
@@ -1115,7 +1141,7 @@ async fn settle_topology_until<B: Backend>(
         let topology = verified_topology(index, "verify topology", deadline).await?;
         let structured = topology.partitions > 1 && topology.entries > topology.vector_records;
         stable_rounds = if structured {
-            if previous.as_ref() == Some(&topology_key(&topology)) {
+            if previous.as_ref() == Some(&topology) {
                 stable_rounds.saturating_add(1)
             } else {
                 1
@@ -1132,7 +1158,7 @@ async fn settle_topology_until<B: Backend>(
                 topology.vector_records, topology.partitions, topology.entries
             ));
         }
-        previous = Some(topology_key(&topology));
+        previous = Some(topology.clone());
 
         // Search is the public access path that rediscovers cold intermediate
         // states. Cycling a few held-out queries makes progress demand-driven
@@ -1147,6 +1173,27 @@ async fn settle_topology_until<B: Backend>(
                 .map_err(|error| error_at("settle topology", error))?;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Repeats stable observation and maintenance drain until both agree.
+async fn settle_and_drain_topology<B: Backend>(
+    index: &Index<MeasuredBackend<B>>,
+    dataset: &BenchmarkDataset,
+    spec: &ScenarioSpec,
+    metric_capture: &MetricCapture,
+    deadline: Instant,
+) -> Result<(Topology, f64), String> {
+    let mut maintenance_drain_seconds = 0.0;
+    loop {
+        let topology = settle_topology_until(index, dataset, spec, deadline).await?;
+        let drain_started = Instant::now();
+        wait_for_maintenance_until(metric_capture, deadline).await?;
+        maintenance_drain_seconds += drain_started.elapsed().as_secs_f64();
+        let drained = verified_topology(index, "verify drained topology", deadline).await?;
+        if drained == topology {
+            return Ok((drained, maintenance_drain_seconds));
+        }
     }
 }
 
@@ -1210,14 +1257,6 @@ async fn wait_for_maintenance_until(
         backlog = metric_capture.fixup_backlog();
     }
     Ok(())
-}
-
-fn topology_key(topology: &Topology) -> (u64, u64, u64) {
-    (
-        topology.vector_records,
-        topology.partitions,
-        topology.entries,
-    )
 }
 
 /// One fully materialized operation; construction stays outside measurement.
@@ -1643,8 +1682,8 @@ mod tests {
     use crate::report::{Distribution, OperationClass, OperationSummary};
 
     use super::{
-        is_search_operation, runtime_config, scenarios, search_budget_configuration,
-        validate_admission_target,
+        CONVERGENCE_MAINTENANCE_WORKERS, is_search_operation, runtime_config, scenarios,
+        search_budget_configuration, validate_admission_target,
     };
 
     fn operation_summary(attempted: u64, accepted: u64, rejected: u64) -> OperationSummary {
@@ -1674,9 +1713,14 @@ mod tests {
     fn every_scenario_has_a_jointly_valid_runtime_configuration() {
         for profile in ["smoke", "full"] {
             for scenario in scenarios(profile).expect("known profile") {
-                runtime_config(&scenario).unwrap_or_else(|error| {
-                    panic!("{} runtime configuration: {error}", scenario.name)
-                });
+                for workers in [
+                    scenario.maintenance_workers,
+                    CONVERGENCE_MAINTENANCE_WORKERS,
+                ] {
+                    runtime_config(&scenario, workers).unwrap_or_else(|error| {
+                        panic!("{} runtime configuration: {error}", scenario.name)
+                    });
+                }
             }
         }
     }

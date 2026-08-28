@@ -93,6 +93,8 @@ pub struct Configuration {
     pub foreground_limit: usize,
     /// Background Structure Maintenance worker count.
     pub maintenance_workers: usize,
+    /// Lifecycle convergence worker count after an import-only diagnostic.
+    pub convergence_maintenance_workers: Option<usize>,
     /// Pending-plus-running Fixup capacity.
     pub fixup_queue_capacity: usize,
     /// Runtime defaults, request overrides, and effective per-search limits.
@@ -163,7 +165,7 @@ pub struct DatasetMetadata {
 }
 
 /// Persistent topology facts after setup convergence.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Topology {
     /// Verified Vector Record count.
     pub vector_records: u64,
@@ -303,8 +305,25 @@ pub struct PhaseResources {
     pub peak_rss_bytes: Option<u64>,
     /// Backend work performed during the phase.
     pub backend_io: BackendIo,
+    /// Whole write-attempt work attributed by operation and outcome.
+    pub writes: WriteAttribution,
     /// Structure Maintenance observations during the phase.
     pub maintenance: MaintenanceSummary,
+}
+
+/// Whole write-attempt work attributed by stable operation and outcome labels.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct WriteAttribution {
+    /// Completed whole attempts grouped by operation and terminal outcome.
+    pub attempts: BTreeMap<String, u64>,
+    /// Whole-operation retries grouped by operation.
+    pub retries: BTreeMap<String, u64>,
+    /// Attempted logical point mutations grouped by operation and outcome.
+    pub mutation_operations: BTreeMap<String, u64>,
+    /// Attempted logical mutation bytes grouped by operation and outcome.
+    pub mutation_bytes: BTreeMap<String, u64>,
+    /// Native commit wait grouped by operation and commit outcome.
+    pub commit_wait_ms: BTreeMap<String, Distribution>,
 }
 
 /// Structure Maintenance work observed in one accounting phase.
@@ -314,6 +333,10 @@ pub struct MaintenanceSummary {
     pub admission: BTreeMap<String, u64>,
     /// Completed Fixup outcomes grouped by their stable labels.
     pub execution: BTreeMap<String, u64>,
+    /// State-machine advance results grouped by Fixup kind and result.
+    pub steps: BTreeMap<String, u64>,
+    /// Entries moved per committed drain step, grouped by Fixup kind.
+    pub drain_entries: BTreeMap<String, Distribution>,
     /// Pending-plus-running Fixups at the phase boundary.
     pub backlog_at_end: usize,
 }

@@ -339,6 +339,14 @@ const ALLOWED_LABEL_VALUES: &[(&str, &[&str])] = &[
             "installed",
             "skipped_oversized",
             "skipped_stale",
+            // Fixup state-machine step results.
+            "idle",
+            "began",
+            "exposed",
+            "drained",
+            "completed",
+            "stalled",
+            "failed",
         ],
     ),
     (

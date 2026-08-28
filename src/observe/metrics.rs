@@ -11,8 +11,8 @@ use crate::search::cache::PartitionKind;
 
 use super::labels::{
     BudgetDimension, CacheInstallResult, CacheLookupResult, FixupAdmission, FixupExecution,
-    FixupKind, ImportGate, Operation, OperationOutcome, SearchStage, VerifyCompletion, cache_level,
-    key, verify_issue,
+    FixupKind, FixupStepResult, ImportGate, Operation, OperationOutcome, SearchStage,
+    VerifyCompletion, WriteAttemptOutcome, cache_level, key, verify_issue,
 };
 
 /// The metric names of the `ktann.*` namespace; the inventory table in
@@ -22,6 +22,10 @@ pub(crate) mod names {
     pub(crate) const OPERATION_DURATION: &str = "ktann.operation.duration";
     pub(crate) const FOREGROUND_ADMISSION: &str = "ktann.foreground.admission";
     pub(crate) const WRITE_RETRIES: &str = "ktann.write.retries";
+    pub(crate) const WRITE_ATTEMPTS: &str = "ktann.write.attempts";
+    pub(crate) const WRITE_MUTATIONS: &str = "ktann.write.mutations";
+    pub(crate) const WRITE_MUTATION_BYTES: &str = "ktann.write.mutation_bytes";
+    pub(crate) const WRITE_COMMIT_DURATION: &str = "ktann.write.commit.duration";
     pub(crate) const SEARCH_BUDGET_USAGE: &str = "ktann.search.budget.usage";
     pub(crate) const SEARCH_BUDGET_EXHAUSTED: &str = "ktann.search.budget.exhausted";
     pub(crate) const SEARCH_STAGE_DURATION: &str = "ktann.search.stage.duration";
@@ -31,6 +35,8 @@ pub(crate) mod names {
     pub(crate) const FIXUP_ADMISSION: &str = "ktann.fixup.admission";
     pub(crate) const FIXUP_BACKLOG: &str = "ktann.fixup.backlog";
     pub(crate) const FIXUP_EXECUTION: &str = "ktann.fixup.execution";
+    pub(crate) const FIXUP_STEPS: &str = "ktann.fixup.steps";
+    pub(crate) const FIXUP_DRAIN_ENTRIES: &str = "ktann.fixup.drain.entries";
     pub(crate) const FIXUP_STATE_AGE: &str = "ktann.fixup.state_age";
     pub(crate) const BLOOM_FILL_RATIO: &str = "ktann.bloom.fill_ratio";
     pub(crate) const IMPORT_WAIT: &str = "ktann.import.wait";
@@ -80,6 +86,40 @@ pub(crate) fn operation_finished(
 /// Counts one whole-attempt write retry.
 pub(crate) fn write_retried(operation: Operation) {
     metrics::counter!(names::WRITE_RETRIES, key::OPERATION => operation.as_str()).increment(1);
+}
+
+/// Records one completed whole write attempt and its exact logical mutations.
+pub(crate) fn write_attempt_finished(
+    operation: Operation,
+    outcome: WriteAttemptOutcome,
+    mutations: usize,
+    mutation_bytes: usize,
+) {
+    let labels = [
+        (key::OPERATION, operation.as_str()),
+        (key::OUTCOME, outcome.as_str()),
+    ];
+    metrics::counter!(names::WRITE_ATTEMPTS, &labels).increment(1);
+    if mutations > 0 {
+        metrics::counter!(names::WRITE_MUTATIONS, &labels)
+            .increment(u64::try_from(mutations).unwrap_or(u64::MAX));
+        metrics::counter!(names::WRITE_MUTATION_BYTES, &labels)
+            .increment(u64::try_from(mutation_bytes).unwrap_or(u64::MAX));
+    }
+}
+
+/// Records the native commit wait of one whole write attempt.
+pub(crate) fn write_commit_finished(
+    operation: Operation,
+    outcome: WriteAttemptOutcome,
+    duration: Duration,
+) {
+    metrics::histogram!(
+        names::WRITE_COMMIT_DURATION,
+        key::OPERATION => operation.as_str(),
+        key::OUTCOME => outcome.as_str(),
+    )
+    .record(duration.as_secs_f64());
 }
 
 /// Records the logical budget usage and exhaustion of one search.
@@ -159,6 +199,24 @@ pub(crate) fn fixup_backlog(backlog: usize) {
 /// Counts one finished Fixup execution's outcome.
 pub(crate) fn fixup_execution(result: FixupExecution) {
     metrics::counter!(names::FIXUP_EXECUTION, key::OUTCOME => result.as_str()).increment(1);
+}
+
+/// Counts one Fixup state-machine advance result.
+pub(crate) fn fixup_step(kind: FixupKind, result: FixupStepResult) {
+    metrics::counter!(
+        names::FIXUP_STEPS,
+        key::KIND => kind.as_str(),
+        key::RESULT => result.as_str(),
+    )
+    .increment(1);
+}
+
+/// Records one committed structural drain step and how many entries it moved.
+pub(crate) fn fixup_drain_step(kind: FixupKind, entries: usize) {
+    fixup_step(kind, FixupStepResult::Drained);
+    let entries = u32::try_from(entries).unwrap_or(u32::MAX);
+    metrics::histogram!(names::FIXUP_DRAIN_ENTRIES, key::KIND => kind.as_str())
+        .record(f64::from(entries));
 }
 
 /// Records the wall-clock age of the durable partition state one Fixup step

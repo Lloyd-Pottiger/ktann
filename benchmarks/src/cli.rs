@@ -59,6 +59,10 @@ struct RunOptions {
     output: Option<PathBuf>,
     /// Tokio execution threads created independently in every worker.
     worker_threads: usize,
+    /// Optional lifecycle-only Structure Maintenance worker override.
+    maintenance_workers: Option<usize>,
+    /// Optional lifecycle-only Import Session in-flight override.
+    import_in_flight_batches: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -74,6 +78,10 @@ struct WorkerOptions {
     reproduction_command: String,
     /// Tokio execution threads for the isolated worker runtime.
     worker_threads: usize,
+    /// Lifecycle-only Structure Maintenance worker override.
+    maintenance_workers: Option<usize>,
+    /// Lifecycle-only Import Session in-flight override.
+    import_in_flight_batches: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -97,7 +105,15 @@ struct CompareOptions {
 fn parse_run_options(arguments: &[OsString]) -> Result<RunOptions, String> {
     let values = option_map(
         arguments,
-        &["backend", "profile", "scenario", "output", "worker-threads"],
+        &[
+            "backend",
+            "profile",
+            "scenario",
+            "output",
+            "worker-threads",
+            "maintenance-workers",
+            "import-in-flight-batches",
+        ],
     )?;
     let backend = required(&values, "backend")?;
     if backend != "rocksdb" && backend != "foundationdb" {
@@ -112,12 +128,28 @@ fn parse_run_options(arguments: &[OsString]) -> Result<RunOptions, String> {
         .map_or_else(default_worker_threads, |value| {
             parse_positive(value, "worker-threads")
         })?;
+    let scenario = values.get("scenario").cloned();
+    let maintenance_workers = values
+        .get("maintenance-workers")
+        .map(|value| parse_nonnegative(value, "maintenance-workers"))
+        .transpose()?;
+    let import_in_flight_batches = values
+        .get("import-in-flight-batches")
+        .map(|value| parse_positive(value, "import-in-flight-batches"))
+        .transpose()?;
+    if (maintenance_workers.is_some() || import_in_flight_batches.is_some())
+        && scenario.as_deref() != Some("import-to-search-lifecycle")
+    {
+        return Err("lifecycle overrides require --scenario import-to-search-lifecycle".to_owned());
+    }
     Ok(RunOptions {
         backend,
         profile,
-        scenario: values.get("scenario").cloned(),
+        scenario,
         output: values.get("output").map(PathBuf::from),
         worker_threads,
+        maintenance_workers,
+        import_in_flight_batches,
     })
 }
 
@@ -131,6 +163,8 @@ fn parse_worker_options(arguments: &[OsString]) -> Result<WorkerOptions, String>
             "scenario",
             "reproduction-command",
             "worker-threads",
+            "maintenance-workers",
+            "import-in-flight-batches",
         ],
     )?;
     Ok(WorkerOptions {
@@ -143,6 +177,14 @@ fn parse_worker_options(arguments: &[OsString]) -> Result<WorkerOptions, String>
             .map_or_else(default_worker_threads, |value| {
                 parse_positive(value, "worker-threads")
             })?,
+        maintenance_workers: values
+            .get("maintenance-workers")
+            .map(|value| parse_nonnegative(value, "maintenance-workers"))
+            .transpose()?,
+        import_in_flight_batches: values
+            .get("import-in-flight-batches")
+            .map(|value| parse_positive(value, "import-in-flight-batches"))
+            .transpose()?,
     })
 }
 
@@ -232,6 +274,13 @@ fn parse_positive(value: &str, name: &str) -> Result<usize, String> {
         .ok_or_else(|| format!("--{name} must be a positive integer"))
 }
 
+/// Parses a nonnegative host-sized bound.
+fn parse_nonnegative(value: &str, name: &str) -> Result<usize, String> {
+    value
+        .parse()
+        .map_err(|_| format!("--{name} must be a nonnegative integer"))
+}
+
 /// Parses a finite nonnegative comparison threshold.
 fn parse_number(value: &str, name: &str) -> Result<f64, String> {
     value
@@ -272,13 +321,21 @@ fn run_suite(options: RunOptions) -> Result<(), String> {
         .map_err(|error| format!("resolve benchmark executable: {error}"))?;
     let mut reports = Vec::with_capacity(selected.len());
     for scenario in selected {
-        let output = Command::new(&executable)
+        let mut command = Command::new(&executable);
+        command
             .arg("__worker")
             .args(["--backend", &options.backend])
             .args(["--profile", &options.profile])
             .args(["--scenario", scenario.name])
             .args(["--reproduction-command", &reproduction_command])
-            .args(["--worker-threads", &options.worker_threads.to_string()])
+            .args(["--worker-threads", &options.worker_threads.to_string()]);
+        if let Some(workers) = options.maintenance_workers {
+            command.args(["--maintenance-workers", &workers.to_string()]);
+        }
+        if let Some(in_flight) = options.import_in_flight_batches {
+            command.args(["--import-in-flight-batches", &in_flight.to_string()]);
+        }
+        let output = command
             .output()
             .map_err(|error| format!("start scenario {}: {error}", scenario.name))?;
         if !output.status.success() {
@@ -302,10 +359,16 @@ fn run_suite(options: RunOptions) -> Result<(), String> {
 
 /// Builds one Tokio runtime and executes exactly one isolated scenario.
 fn run_worker(options: WorkerOptions) -> Result<(), String> {
-    let scenario = runner::scenarios(&options.profile)?
+    let mut scenario = runner::scenarios(&options.profile)?
         .into_iter()
         .find(|scenario| scenario.name == options.scenario)
         .ok_or_else(|| format!("unknown scenario `{}`", options.scenario))?;
+    if let Some(workers) = options.maintenance_workers {
+        scenario.maintenance_workers = workers;
+    }
+    if let Some(in_flight) = options.import_in_flight_batches {
+        scenario.import_in_flight_batches = in_flight;
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(options.worker_threads)
         .enable_all()
@@ -606,12 +669,40 @@ fn shell_quote(value: &OsStr) -> String {
 
 /// Returns the stable help shown for missing or unknown public commands.
 fn usage() -> String {
-    "usage:\n  ktann-bench run --backend rocksdb|foundationdb [--profile smoke|full] [--scenario NAME] [--worker-threads N] [--output PATH]\n  ktann-bench compare --baseline PATH --candidate PATH [--maximum-relative-regression N] [--maximum-recall-drop N] [--maximum-rejection-rate-increase N] [--output PATH]".to_owned()
+    "usage:\n  ktann-bench run --backend rocksdb|foundationdb [--profile smoke|full] [--scenario NAME] [--worker-threads N] [--maintenance-workers N] [--import-in-flight-batches N] [--output PATH]\n  ktann-bench compare --baseline PATH --candidate PATH [--maximum-relative-regression N] [--maximum-recall-drop N] [--maximum-rejection-rate-increase N] [--output PATH]".to_owned()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{option_map, parse_compare_options, shell_quote};
+    use super::{option_map, parse_compare_options, parse_run_options, shell_quote};
+
+    #[test]
+    fn lifecycle_parser_accepts_diagnostic_overrides() {
+        let arguments = [
+            "--backend",
+            "rocksdb",
+            "--scenario",
+            "import-to-search-lifecycle",
+            "--maintenance-workers",
+            "0",
+            "--import-in-flight-batches",
+            "4",
+        ]
+        .map(std::ffi::OsString::from);
+        let options = parse_run_options(&arguments).expect("valid lifecycle overrides");
+        assert_eq!(options.maintenance_workers, Some(0));
+        assert_eq!(options.import_in_flight_batches, Some(4));
+    }
+
+    #[test]
+    fn lifecycle_overrides_require_the_lifecycle_scenario() {
+        let arguments =
+            ["--backend", "rocksdb", "--maintenance-workers", "0"].map(std::ffi::OsString::from);
+        assert_eq!(
+            parse_run_options(&arguments).map(|_| ()),
+            Err("lifecycle overrides require --scenario import-to-search-lifecycle".to_owned())
+        );
+    }
 
     #[test]
     fn option_parser_rejects_duplicates() {

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::report::{
     AdmissionSummary, BackendIo, BenchmarkReport, BenchmarkSuite, BudgetSummary, CacheSummary,
     Distribution, LifecycleMeasurements, OperationClass, OperationSummary, REPORT_SCHEMA_VERSION,
-    ReportMeasurements, SearchPhase, SteadyStateMeasurements,
+    ReportMeasurements, SearchPhase, SteadyStateMeasurements, WriteAttribution,
 };
 
 /// Sub-millisecond p95 movement is not stable enough to classify by ratio.
@@ -726,6 +726,14 @@ fn compare_phase_resources(
         &candidate.backend_io,
         policy.maximum_relative_regression,
     );
+    compare_write_attribution(
+        result,
+        key,
+        phase_name,
+        &baseline.writes,
+        &candidate.writes,
+        policy.maximum_relative_regression,
+    );
     compare_count_maps(
         result,
         key,
@@ -741,6 +749,56 @@ fn compare_phase_resources(
         &baseline.maintenance.execution,
         &candidate.maintenance.execution,
         policy.maximum_relative_regression,
+    );
+    compare_count_maps(
+        result,
+        key,
+        &format!("{phase_name} Fixup step"),
+        &baseline.maintenance.steps,
+        &candidate.maintenance.steps,
+        policy.maximum_relative_regression,
+    );
+}
+
+/// Compares operation-attributed write attempts, work, retries, and commit wait.
+fn compare_write_attribution(
+    result: &mut ComparisonReport,
+    key: &str,
+    phase_name: &str,
+    baseline: &WriteAttribution,
+    candidate: &WriteAttribution,
+    threshold: f64,
+) {
+    for (name, baseline, candidate) in [
+        ("attempt", &baseline.attempts, &candidate.attempts),
+        ("retry", &baseline.retries, &candidate.retries),
+        (
+            "mutation operation",
+            &baseline.mutation_operations,
+            &candidate.mutation_operations,
+        ),
+        (
+            "mutation byte",
+            &baseline.mutation_bytes,
+            &candidate.mutation_bytes,
+        ),
+    ] {
+        compare_count_maps(
+            result,
+            key,
+            &format!("{phase_name} write {name}"),
+            baseline,
+            candidate,
+            threshold,
+        );
+    }
+    compare_distributions(
+        result,
+        key,
+        &format!("{phase_name} write commit wait"),
+        &baseline.commit_wait_ms,
+        &candidate.commit_wait_ms,
+        threshold,
     );
 }
 
@@ -1221,6 +1279,7 @@ mod tests {
                 partition_cache_bytes: 1024,
                 foreground_limit: 8,
                 maintenance_workers: 2,
+                convergence_maintenance_workers: None,
                 fixup_queue_capacity: 1_024,
                 search_budgets: SearchBudgetConfiguration {
                     scanned_tree_keys: budget_configuration(4_096, 4_096),
@@ -1457,6 +1516,113 @@ mod tests {
                 .iter()
                 .any(|regression| regression.contains("CommitOutcomeUnknown"))
         );
+    }
+
+    #[test]
+    fn lifecycle_comparison_catches_write_and_fixup_attribution_growth() {
+        let mut baseline_report = report();
+        let mut baseline_lifecycle = LifecycleMeasurements::default();
+        for phase in [
+            &mut baseline_lifecycle.immediate_search,
+            &mut baseline_lifecycle.stable_cold_search,
+            &mut baseline_lifecycle.stable_warm_search,
+        ] {
+            phase.search.attempted = 100;
+            phase.search.accepted = 100;
+            phase.search.latency_ms.count = 100;
+        }
+        let resources = &mut baseline_lifecycle.import.resources;
+        resources
+            .writes
+            .attempts
+            .insert("operation=batch_mutate,outcome=committed".to_owned(), 10);
+        resources
+            .writes
+            .retries
+            .insert("operation=batch_mutate".to_owned(), 2);
+        resources
+            .writes
+            .mutation_operations
+            .insert("operation=batch_mutate,outcome=committed".to_owned(), 100);
+        resources
+            .writes
+            .mutation_bytes
+            .insert("operation=batch_mutate,outcome=committed".to_owned(), 1_000);
+        resources.writes.commit_wait_ms.insert(
+            "operation=batch_mutate,outcome=committed".to_owned(),
+            Distribution {
+                count: 10,
+                mean: 1.0,
+                min: 1.0,
+                p50: 1.0,
+                p95: 1.0,
+                p99: 1.0,
+                max: 1.0,
+            },
+        );
+        resources
+            .maintenance
+            .steps
+            .insert("kind=split,result=drained".to_owned(), 10);
+        baseline_report.measurements = ReportMeasurements::Lifecycle(Box::new(baseline_lifecycle));
+
+        let baseline = suite(baseline_report.clone());
+        let mut candidate = baseline_report;
+        let ReportMeasurements::Lifecycle(lifecycle) = &mut candidate.measurements else {
+            panic!("fixture is not lifecycle")
+        };
+        let resources = &mut lifecycle.import.resources;
+        *resources
+            .writes
+            .attempts
+            .get_mut("operation=batch_mutate,outcome=committed")
+            .expect("attempt fixture") = 20;
+        *resources
+            .writes
+            .retries
+            .get_mut("operation=batch_mutate")
+            .expect("retry fixture") = 4;
+        *resources
+            .writes
+            .mutation_operations
+            .get_mut("operation=batch_mutate,outcome=committed")
+            .expect("mutation fixture") = 200;
+        *resources
+            .writes
+            .mutation_bytes
+            .get_mut("operation=batch_mutate,outcome=committed")
+            .expect("byte fixture") = 2_000;
+        resources
+            .writes
+            .commit_wait_ms
+            .get_mut("operation=batch_mutate,outcome=committed")
+            .expect("commit wait fixture")
+            .p95 = 2.0;
+        *resources
+            .maintenance
+            .steps
+            .get_mut("kind=split,result=drained")
+            .expect("Fixup step fixture") = 20;
+
+        let comparison = compare(&baseline, &suite(candidate), ComparisonPolicy::default())
+            .expect("reports are comparable");
+        for expected in [
+            "import write attempt",
+            "import write retry",
+            "import write mutation operation",
+            "import write mutation byte",
+            "import write commit wait",
+            "import Fixup step",
+        ] {
+            assert!(
+                comparison
+                    .regressions
+                    .iter()
+                    .any(|regression| regression.contains(expected)),
+                "missing regression for {expected}: {:?}",
+                comparison.regressions
+            );
+        }
     }
 
     #[test]
