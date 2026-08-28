@@ -53,19 +53,19 @@ use crate::search::rabitq::RaBitQ7;
 use crate::storage::backend::{Backend, WriteTxn};
 use crate::storage::keys::TreeKey;
 use crate::storage::values::{
-    IndexManifest, LeafEntry, OpaquePayload, RecordLocation, VectorRecord,
+    IndexManifest, LeafEntry, OpaquePayload, PartitionHeader, RecordLocation, VectorRecord,
 };
 use crate::storage::{MutationBuilder, WriteLogicalTxn, membership};
 
-use super::routing;
+use super::{fixup, routing};
 
 /// The result of one committed mutation batch: per-item outcomes and the
 /// partitions worth offering to demand-driven maintenance.
 ///
-/// The maintenance list holds the insert/upsert target leaves (possible split
-/// candidates), the leaves a replacement or delete shrank (possible merge
-/// candidates), and the draining split sources the descent rerouted around
-/// (resumable drain work). It is best-effort discovery, not correctness state.
+/// The maintenance list holds only partitions whose final committed Header is
+/// actionable, plus draining split sources the descent rerouted around. It is
+/// coalesced per partition and remains best-effort discovery, not correctness
+/// state.
 pub(crate) struct MutationReport {
     /// Per-item outcomes aligned to the validated input batch.
     pub(crate) outcomes: Vec<MutationOutcome>,
@@ -142,7 +142,7 @@ async fn apply_all<T: WriteTxn>(
 ) -> Result<ApplyOutcome> {
     debug_assert_eq!(mutations.len(), prepared.len());
     let started_at = now_unix_millis();
-    let (targets, mut maintenance) = match route_all(txn, kernel, prepared, started_at).await? {
+    let (targets, draining_sources) = match route_all(txn, kernel, prepared, started_at).await? {
         RouteAll::Routed {
             targets,
             draining_sources,
@@ -154,6 +154,7 @@ async fn apply_all<T: WriteTxn>(
     let expected = read_locations(txn, mutations).await?;
     let mut deferred = txn.mutations();
     let mut outcomes = Vec::with_capacity(mutations.len());
+    let mut changed_headers = BTreeMap::new();
     for (position, mutation) in mutations.iter().enumerate() {
         let routed = prepared[position].as_ref().zip(targets[position].as_ref());
         // Only a committed attempt's discoveries reach the caller, so
@@ -165,16 +166,26 @@ async fn apply_all<T: WriteTxn>(
             routed,
             expected[position].as_ref(),
             &mut deferred,
-            &mut maintenance,
+            &mut changed_headers,
         )
         .await
         .map_err(|error| error.at_position(position))?;
         outcomes.push(outcome);
     }
     txn.apply(deferred).await?;
+    let mut maintenance: BTreeSet<(TreeKey, PartitionKey)> = draining_sources.into_iter().collect();
+    let config = txn
+        .bound_manifest()
+        .ok_or_else(Error::invalid_argument)?
+        .config();
+    for ((tree_key, partition), header) in changed_headers {
+        if fixup::is_actionable(config, partition, header) {
+            maintenance.insert((tree_key, partition));
+        }
+    }
     Ok(ApplyOutcome::Applied(MutationReport {
         outcomes,
-        maintenance,
+        maintenance: maintenance.into_iter().collect(),
     }))
 }
 
@@ -310,22 +321,21 @@ async fn read_locations<T: WriteTxn>(
 /// `routed` carries the prepared record and its target location; exactly the
 /// insert/upsert items are prepared and routed by `apply_all`, so a missing
 /// pair for those items is an internal contract violation, not caller input.
-/// Successful items push their maintenance candidates onto `maintenance`: the
-/// insert/upsert target leaf (a possible split candidate), a replaced
-/// record's previous leaf when it moved (a possible merge candidate), and a
-/// deleted record's leaf.
+/// Successful items retain each changed partition's final Header in
+/// `changed_headers`; the batch filters and coalesces those observations only
+/// after every item has applied.
 async fn apply_one<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     mutation: &Mutation,
     routed: Option<(&PreparedRecord, &RecordLocation)>,
     expected: Option<&RecordLocation>,
     deferred: &mut MutationBuilder<'_>,
-    maintenance: &mut Vec<(TreeKey, PartitionKey)>,
+    changed_headers: &mut BTreeMap<(TreeKey, PartitionKey), PartitionHeader>,
 ) -> Result<MutationOutcome> {
     match mutation {
         Mutation::Insert(_) => {
             let (prepared, target) = routed.ok_or_else(|| Error::new(ErrorKind::Backend))?;
-            membership::insert_record(
+            let header = membership::insert_record_with_header(
                 txn,
                 deferred,
                 &prepared.record,
@@ -334,15 +344,14 @@ async fn apply_one<T: WriteTxn>(
                 &prepared.entry,
             )
             .await?;
-            // The target may have crossed the split threshold.
-            maintenance.push((target.tree_key().clone(), target.leaf()));
+            record_header(changed_headers, target, header);
             Ok(MutationOutcome::Inserted)
         }
         Mutation::Upsert(_) => {
             let (prepared, target) = routed.ok_or_else(|| Error::new(ErrorKind::Backend))?;
-            let outcome = match expected {
+            let (outcome, target_header) = match expected {
                 None => {
-                    membership::insert_record(
+                    let header = membership::insert_record_with_header(
                         txn,
                         deferred,
                         &prepared.record,
@@ -351,10 +360,10 @@ async fn apply_one<T: WriteTxn>(
                         &prepared.entry,
                     )
                     .await?;
-                    MutationOutcome::Upserted { replaced: false }
+                    (MutationOutcome::Upserted { replaced: false }, header)
                 }
                 Some(expected) => {
-                    membership::replace_record(
+                    let headers = membership::replace_record_with_headers(
                         txn,
                         deferred,
                         &prepared.record,
@@ -364,32 +373,39 @@ async fn apply_one<T: WriteTxn>(
                         &prepared.entry,
                     )
                     .await?;
-                    // A replacement that moved the record shrank its old
-                    // leaf, possibly below the merge threshold.
-                    if expected != target {
-                        maintenance.push((expected.tree_key().clone(), expected.leaf()));
+                    if let Some(source) = headers.source() {
+                        record_header(changed_headers, expected, source);
                     }
-                    MutationOutcome::Upserted { replaced: true }
+                    (
+                        MutationOutcome::Upserted { replaced: true },
+                        headers.target(),
+                    )
                 }
             };
-            // The target may have crossed the split threshold.
-            maintenance.push((target.tree_key().clone(), target.leaf()));
+            record_header(changed_headers, target, target_header);
             Ok(outcome)
         }
         Mutation::Delete(id) => {
-            let outcome = membership::delete_record(txn, deferred, id).await?;
-            let existed = match outcome {
-                membership::DeleteOutcome::Deleted { location } => {
-                    // The deleted-from leaf may have fallen below the merge
-                    // threshold.
-                    maintenance.push((location.tree_key().clone(), location.leaf()));
+            let report = membership::delete_record_with_header(txn, deferred, id).await?;
+            let existed = match report {
+                membership::DeleteReport::Deleted { location, header } => {
+                    record_header(changed_headers, &location, header);
                     true
                 }
-                membership::DeleteOutcome::NotFound => false,
+                membership::DeleteReport::NotFound => false,
             };
             Ok(MutationOutcome::Deleted { existed })
         }
     }
+}
+
+/// Retains the final Header observed for one changed partition in this batch.
+fn record_header(
+    changed_headers: &mut BTreeMap<(TreeKey, PartitionKey), PartitionHeader>,
+    location: &RecordLocation,
+    header: PartitionHeader,
+) {
+    changed_headers.insert((location.tree_key().clone(), location.leaf()), header);
 }
 
 /// Derives every routed item's persistent projection once per operation.

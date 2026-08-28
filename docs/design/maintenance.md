@@ -25,9 +25,12 @@ re-encodes RaBitQ7; structural movement copies the absolute code unchanged.
 Whole-attempt retries re-read topology and membership. There is no record
 revision, stale membership cleanup, or repair branch.
 
-After commit, oversized/small partitions and intermediate states may be offered
-to process-local maintenance. Failure to enqueue never changes the mutation
-result or correctness.
+After commit, one mutation batch coalesces its changed partitions and offers
+only actionable final Headers: oversized Ready partitions, undersized
+non-root Ready partitions, and durable split/merge source states. Healthy
+Ready partitions and ReceivingSplit targets are not offered because their
+current state cannot advance independently. Failure to enqueue never changes
+the mutation result or correctness.
 
 ## 2. Tree shape
 

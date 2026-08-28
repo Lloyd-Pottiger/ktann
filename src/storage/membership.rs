@@ -55,6 +55,38 @@ pub enum DeleteOutcome {
     NotFound,
 }
 
+/// Internal delete result carrying the changed Header for scheduling.
+pub(crate) enum DeleteReport {
+    /// The record existed and its leaf Header changed.
+    Deleted {
+        location: RecordLocation,
+        header: PartitionHeader,
+    },
+    /// No record existed and no Header changed.
+    NotFound,
+}
+
+/// Partition Headers produced by one replacement upsert.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReplacementHeaders {
+    source: Option<PartitionHeader>,
+    target: PartitionHeader,
+}
+
+impl ReplacementHeaders {
+    /// Returns the shrunken source Header for a cross-leaf replacement.
+    #[must_use]
+    pub(crate) const fn source(self) -> Option<PartitionHeader> {
+        self.source
+    }
+
+    /// Returns the target Header after the replacement.
+    #[must_use]
+    pub(crate) const fn target(self) -> PartitionHeader {
+        self.target
+    }
+}
+
 /// Inserts one new Vector Record's complete membership at `target`.
 ///
 /// The Record existence check runs first, so an existing Record ID fails with
@@ -79,6 +111,20 @@ pub async fn insert_record<T: WriteTxn>(
     target: &RecordLocation,
     entry: &LeafEntry,
 ) -> Result<()> {
+    insert_record_with_header(txn, deferred, record, payload, target, entry)
+        .await
+        .map(|_| ())
+}
+
+/// Inserts one record and returns the target's final Header for scheduling.
+pub(crate) async fn insert_record_with_header<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    deferred: &mut MutationBuilder<'_>,
+    record: &VectorRecord,
+    payload: Option<&OpaquePayload>,
+    target: &RecordLocation,
+    entry: &LeafEntry,
+) -> Result<PartitionHeader> {
     let manifest = validated_input(txn, record, entry)?;
     let index = manifest.logical_index_id();
     let id = record.record_id();
@@ -103,18 +149,13 @@ pub async fn insert_record<T: WriteTxn>(
         deferred.put(key, PersistentValue::OpaquePayload(payload.clone()))?;
     }
     let header = read_header(txn, index, target).await?;
-    put_header(
-        txn,
-        index,
-        target,
-        added_entry(expect_write_target(header)?)?,
-    )
-    .await?;
+    let adjusted = added_entry(expect_write_target(header)?)?;
+    put_header(txn, index, target, adjusted).await?;
     expand_synopsis(txn, manifest, target, entry.fields()).await?;
     let entry_key = entry_key(index, target, id);
     expect_absent(txn, entry_key.clone()).await?;
     deferred.put(entry_key, PersistentValue::LeafEntry(entry.clone()))?;
-    Ok(())
+    Ok(adjusted)
 }
 
 /// Replaces one existing Vector Record's complete membership, last-write-wins.
@@ -151,6 +192,21 @@ pub async fn replace_record<T: WriteTxn>(
     target: &RecordLocation,
     entry: &LeafEntry,
 ) -> Result<()> {
+    replace_record_with_headers(txn, deferred, record, payload, expected, target, entry)
+        .await
+        .map(|_| ())
+}
+
+/// Replaces one record and returns final changed Headers for scheduling.
+pub(crate) async fn replace_record_with_headers<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    deferred: &mut MutationBuilder<'_>,
+    record: &VectorRecord,
+    payload: Option<&OpaquePayload>,
+    expected: &RecordLocation,
+    target: &RecordLocation,
+    entry: &LeafEntry,
+) -> Result<ReplacementHeaders> {
     let manifest = validated_input(txn, record, entry)?;
     let index = manifest.logical_index_id();
     let id = record.record_id();
@@ -184,12 +240,13 @@ pub async fn replace_record<T: WriteTxn>(
     }
 
     let target_entry_key = entry_key(index, target, id);
-    if expected == target {
+    let source = if expected == target {
         // The replaced entry must exist; the update-protected read also
         // establishes the conflict on it.
         expect_leaf_entry(txn.get_for_update(target_entry_key.clone()).await?)?
             .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
         deferred.put(target_entry_key, PersistentValue::LeafEntry(entry.clone()))?;
+        None
     } else {
         let source_entry_key = entry_key(index, expected, id);
         expect_leaf_entry(txn.get_for_update(source_entry_key.clone()).await?)?
@@ -201,8 +258,10 @@ pub async fn replace_record<T: WriteTxn>(
         // The source follows the exact stored location, so any state is legal
         // for it; only the target must be a write-accepting leaf.
         let source = read_header(txn, index, expected).await?;
-        put_header(txn, index, expected, removed_entry(source)?).await?;
-    }
+        let adjusted = removed_entry(source)?;
+        put_header(txn, index, expected, adjusted).await?;
+        Some(adjusted)
+    };
 
     let target_header = expect_write_target(read_header(txn, index, target).await?)?;
     let adjusted = if expected == target {
@@ -212,7 +271,10 @@ pub async fn replace_record<T: WriteTxn>(
     };
     put_header(txn, index, target, adjusted).await?;
     expand_synopsis(txn, manifest, target, entry.fields()).await?;
-    Ok(())
+    Ok(ReplacementHeaders {
+        source,
+        target: adjusted,
+    })
 }
 
 /// Deletes one Vector Record's complete membership, idempotently.
@@ -231,6 +293,18 @@ pub async fn delete_record<T: WriteTxn>(
     deferred: &mut MutationBuilder<'_>,
     id: &Bytes,
 ) -> Result<DeleteOutcome> {
+    Ok(match delete_record_with_header(txn, deferred, id).await? {
+        DeleteReport::Deleted { location, .. } => DeleteOutcome::Deleted { location },
+        DeleteReport::NotFound => DeleteOutcome::NotFound,
+    })
+}
+
+/// Deletes one record and returns the changed Header for maintenance discovery.
+pub(crate) async fn delete_record_with_header<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    deferred: &mut MutationBuilder<'_>,
+    id: &Bytes,
+) -> Result<DeleteReport> {
     let index = txn
         .bound_manifest()
         .ok_or_else(Error::invalid_argument)?
@@ -238,7 +312,7 @@ pub async fn delete_record<T: WriteTxn>(
 
     let record_key = record_key(index, id);
     if expect_record(txn.get_for_update(record_key.clone()).await?)?.is_none() {
-        return Ok(DeleteOutcome::NotFound);
+        return Ok(DeleteReport::NotFound);
     }
     let location_key = location_key(index, id);
     let location = expect_location(txn.get_for_update(location_key.clone()).await?)?
@@ -251,9 +325,9 @@ pub async fn delete_record<T: WriteTxn>(
     deferred.delete(location_key)?;
     deferred.delete(entry_key)?;
     deferred.delete(payload_key(index, id))?;
-    let header = read_header(txn, index, &location).await?;
-    put_header(txn, index, &location, removed_entry(header)?).await?;
-    Ok(DeleteOutcome::Deleted { location })
+    let header = removed_entry(read_header(txn, index, &location).await?)?;
+    put_header(txn, index, &location, header).await?;
+    Ok(DeleteReport::Deleted { location, header })
 }
 
 /// Reads the authoritative Record Locations of one batch of Record IDs with

@@ -207,3 +207,43 @@ The comparator requires identical lifecycle bounds and inputs. In addition to
 the warmed steady-state rules, it compares import throughput and submit
 latency, batch failures and gate waits, finish-to-stable time, each query
 stage's latency/throughput/recall/cache/budget results, and phase Backend IO.
+
+### Actionable maintenance validation
+
+An otherwise-idle Apple M1 Pro run on 2026-08-28 compared revision `da57d81`
+with actionable, batch-coalesced maintenance discovery. Both runs used the
+`full` `import-to-search-lifecycle` scenario: SIFTsmall, 10,000 records,
+200 batches, one in-flight batch, and two maintenance workers.
+
+| Backend | Implementation | Fixup admissions | Fixup executions | Import read transactions | Import wall seconds |
+| --- | --- | ---: | ---: | ---: | ---: |
+| RocksDB | `da57d81` | 10,000 | 5,145 | 14,115 | 3.147 |
+| RocksDB | actionable discovery | 109 | 109 | 4,041 | 3.515 |
+| FoundationDB | `da57d81` | 10,000 | 5,145 | 14,113 | 27.205 |
+| FoundationDB | actionable discovery | 109 | 109 | 4,041 | 27.721 |
+
+The current implementation removed all 5,036 merge-idle and 5,038/5,036
+split-idle steps reported during RocksDB/FoundationDB import. Both sides still
+reported 2,602 successful commits, 109 split begin/completion steps, 1,857
+split drain steps, complete convergence, recall@10 of 1.0 in the immediate,
+stable-cold, and stable-warm passes, and no Search Budget truncation. This
+single paired run proves the work reduction, not a latency improvement; wall
+time and retry variation require repeated sampling before drawing a latency or
+contention conclusion.
+
+The RocksDB reports were produced with:
+
+```sh
+cargo run --release -p ktann-benchmarks --bin ktann-bench -- \
+  run --backend rocksdb --profile full \
+  --scenario import-to-search-lifecycle --output REPORT.json
+```
+
+The FoundationDB reports used the documented local environment and:
+
+```sh
+cargo run --release -p ktann-benchmarks \
+  --no-default-features --features foundationdb --bin ktann-bench -- \
+  run --backend foundationdb --profile full \
+  --scenario import-to-search-lifecycle --output REPORT.json
+```
