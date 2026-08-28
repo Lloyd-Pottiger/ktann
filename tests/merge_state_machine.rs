@@ -66,8 +66,7 @@ fn config() -> IndexConfig {
 }
 
 /// A one-dimensional L2 index with a minimum of thirteen entries per
-/// partition, so a merge source can hold more than one drain batch of
-/// entries (the leaf drain batch is eight).
+/// partition, so budget-focused fixtures can exercise multiple drain batches.
 fn wide_config() -> IndexConfig {
     IndexConfig::new(1, Metric::L2)
         .expect("valid dimension")

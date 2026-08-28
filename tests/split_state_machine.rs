@@ -2667,8 +2667,8 @@ async fn drain_moves_bounded_batches_and_refreshes_target_authority() {
         assert_eq!(header.cache_epoch(), 0);
     }
 
-    // Ten entries drain in two bounded batches: eight, then the remaining
-    // two, with the exact count driving completion.
+    // The configured threshold caps this small fixture at eight entries, so
+    // the exact count drives two bounded batches.
     let first = split::drain_batch(&backend, &manifest, &key, pk(1), &retry())
         .await
         .expect("first batch");

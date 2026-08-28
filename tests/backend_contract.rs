@@ -468,6 +468,7 @@ fn batch_mutate_capacity_failure_leaves_no_partial_state() {
         AdmissionBudget {
             max_mutations: 2,
             max_mutation_bytes: 1 << 20,
+            mutation_key_overhead_bytes: 0,
         },
         Capabilities {
             transactional_clear_range: false,
@@ -646,6 +647,7 @@ fn hard_limit_rejects_oversized_key_and_value() {
         AdmissionBudget {
             max_mutations: 100,
             max_mutation_bytes: 1 << 20,
+            mutation_key_overhead_bytes: 0,
         },
         Capabilities {
             transactional_clear_range: false,
@@ -678,6 +680,7 @@ fn admission_budget_rejects_excess_mutations_and_bytes() {
         AdmissionBudget {
             max_mutations: 2,
             max_mutation_bytes: 4,
+            mutation_key_overhead_bytes: 0,
         },
         Capabilities {
             transactional_clear_range: false,
@@ -1245,6 +1248,7 @@ fn clear_range_charges_one_mutation_and_its_boundaries() {
         admission_budget: AdmissionBudget {
             max_mutations: 1,
             max_mutation_bytes: 2,
+            mutation_key_overhead_bytes: 0,
         },
         capabilities: Capabilities {
             transactional_clear_range: true,

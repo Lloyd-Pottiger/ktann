@@ -37,8 +37,10 @@ and no duplicated returned key.
 ## 2. Transaction sizing and retry
 
 Core plans logical work before starting a transaction and checks adapter
-budgets while building mutations. Adapters re-check exact encoded keys, values,
-and affected-data accounting. Exceeding a declared limit returns `BackendLimit`,
+budgets while building mutations. The Admission Budget exposes the adapter's
+physical key-prefix charge to operations that need an exact worst-case plan,
+such as leaf relocation. Adapters re-check exact encoded keys, values, and
+affected-data accounting. Exceeding a declared limit returns `LimitExceeded`,
 not an unbounded internal retry.
 
 RetryableAbort restarts the complete logical attempt against a fresh snapshot.

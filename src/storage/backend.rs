@@ -69,9 +69,11 @@ pub struct HardLimits {
 pub struct AdmissionBudget {
     /// The maximum number of mutations in one transaction.
     pub max_mutations: usize,
-    /// The maximum total encoded key plus value bytes mutated in one
+    /// The maximum total physical key plus value bytes mutated in one
     /// transaction.
     pub max_mutation_bytes: usize,
+    /// Adapter-specific physical bytes added to every logical mutation key.
+    pub mutation_key_overhead_bytes: usize,
 }
 
 /// Backend capabilities that adapters declare explicitly.

@@ -9,7 +9,9 @@ use crate::search::rabitq::RaBitQ7;
 use crate::storage::keys::MAX_RECORD_ID_BYTES;
 
 use super::corrupt;
-use super::data::{decode_fields, decode_vector, encode_fields, encode_vector};
+use super::data::{
+    decode_fields, decode_vector, encode_fields, encode_vector, maximum_typed_value_len,
+};
 use super::manifest::IndexManifest;
 use super::wire::{Decoder, Encoder};
 
@@ -142,6 +144,26 @@ pub(super) fn encode_leaf_entry(
     RaBitQ7::validate(&entry.rabitq7, manifest.config().dimension())
         .map_err(|_| Error::invalid_argument())?;
     encoder.sized_bytes(&entry.rabitq7, expected)
+}
+
+/// Returns the exact maximum encoded Leaf Entry length for one Manifest.
+pub(super) fn maximum_leaf_entry_encoded_len(manifest: &IndexManifest) -> Result<usize> {
+    let field_bytes = manifest
+        .config()
+        .fields()
+        .iter()
+        .try_fold(0_usize, |size, field| {
+            size.checked_add(maximum_typed_value_len(field.data_type()))
+                .ok_or_else(Error::invalid_argument)
+        })?;
+    let rabitq7_bytes = RaBitQ7::encoded_len(manifest.config().dimension())?;
+
+    // Frame, sized Record ID, field count, typed fields, and sized RaBitQ7.
+    2_usize
+        .checked_add(2 + MAX_RECORD_ID_BYTES)
+        .and_then(|size| size.checked_add(2 + field_bytes))
+        .and_then(|size| size.checked_add(4 + rabitq7_bytes))
+        .ok_or_else(Error::invalid_argument)
 }
 
 pub(super) fn decode_leaf_entry(

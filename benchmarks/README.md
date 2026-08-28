@@ -55,7 +55,9 @@ changes RocksDB's native blocking actor bound.
 
 ## Measurement contract
 
-Report schema v1 stores exactly one tagged `measurements` payload per scenario:
+Each report stores exactly one tagged `measurements` payload per scenario and
+records the adapter's physical key-prefix charge alongside its mutation-count
+and mutation-byte ceilings:
 `steady_state` for the existing workload cases or `lifecycle` for the
 `import-to-search-lifecycle` case. The lifecycle case does not change the setup
 exclusions or workload semantics of the steady-state scenarios described below.
@@ -247,3 +249,33 @@ cargo run --release -p ktann-benchmarks \
   run --backend foundationdb --profile full \
   --scenario import-to-search-lifecycle --output REPORT.json
 ```
+
+### Adaptive leaf-drain validation
+
+Three independent same-host runs on 2026-08-28 compared revision `ccb4090`
+with the adaptive leaf relocation batch. Both sides used the `full`
+`import-to-search-lifecycle` scenario, SIFTsmall, 10,000 records, 200 batches,
+one in-flight batch, and two maintenance workers. Each timing is the arithmetic
+mean with the sample coefficient of variation in parentheses.
+
+| Backend | Measurement | `ccb4090` | Adaptive drain | Change |
+| --- | --- | ---: | ---: | ---: |
+| RocksDB | Case wall seconds | 6.311 (3.12%) | 4.880 (0.27%) | -22.7% |
+| RocksDB | Import wall seconds | 3.997 (4.78%) | 2.781 (1.00%) | -30.4% |
+| RocksDB | Case CPU seconds | 8.454 (1.44%) | 6.439 (0.84%) | -23.8% |
+| RocksDB | Import retryable commits | 310.7 (0.74%) | 250.0 (1.74%) | -19.5% |
+| RocksDB | Import mutation operations | 147,496 (0.21%) | 131,759 (0.60%) | -10.7% |
+| FoundationDB | Case wall seconds | 34.522 (0.54%) | 23.405 (0.44%) | -32.2% |
+| FoundationDB | Import wall seconds | 29.035 (0.68%) | 18.467 (0.50%) | -36.4% |
+| FoundationDB | Case CPU seconds | 12.956 (0.44%) | 8.887 (0.75%) | -31.4% |
+| FoundationDB | Import retryable commits | 464.3 (1.11%) | 293.3 (1.57%) | -36.8% |
+| FoundationDB | Import mutation operations | 173,590 (0.53%) | 134,572 (0.30%) | -22.5% |
+
+The workload's 128-entry partition limit selects a 32-entry contention cap.
+On both adapters, successful import commits fell from 2,602 to 1,290, read
+transactions from 4,041 to 1,417, and split drain steps from 1,857 to 545.
+Every run accepted all 10,000 records, converged completely, reported
+recall@10 of 1.0 in immediate, stable-cold, and stable-warm search, and had no
+Search Budget truncation. The three-run result therefore validates lower
+whole-system work and latency without trading away the scenario's correctness
+or recall contract.

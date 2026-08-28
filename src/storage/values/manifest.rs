@@ -1,10 +1,11 @@
 //! Persistent namespace and Index Manifest values.
 
 use crate::api::{
-    DataType, Error, FieldId, FieldSchema, IndexConfig, LogicalIndexId, MAX_FIELDS,
-    MAX_STRING_BYTES, Metric, Result, SynopsisConfig,
+    DataType, Error, FieldId, FieldSchema, IndexConfig, LogicalIndexId, MAX_FIELDS, Metric, Result,
+    SynopsisConfig,
 };
 
+use super::data::maximum_typed_value_len;
 use super::wire::{Decoder, Encoder};
 use super::{
     FORMAT_VERSION, MAX_SYNOPSIS_BYTES, ROTATION_SEED_BYTES, VALUE_CODEC_VERSION, corrupt,
@@ -158,6 +159,18 @@ impl IndexManifest {
         &self.bloom_parameters
     }
 
+    /// Returns the exact maximum encoded Synopsis length for this Manifest.
+    pub(crate) fn maximum_synopsis_encoded_len(&self) -> usize {
+        let mut size = 2_usize + 2;
+        for (field, parameters) in self.config.fields().iter().zip(&self.bloom_parameters) {
+            size += 1 + 2 * maximum_typed_value_len(field.data_type());
+            if let Some(parameters) = parameters {
+                size += 4 + parameters.byte_count();
+            }
+        }
+        size
+    }
+
     /// Returns Tree Key field types in their declared order.
     pub(crate) fn tree_key_types(&self) -> ([DataType; MAX_FIELDS], usize) {
         let mut types = [DataType::Bool; MAX_FIELDS];
@@ -181,26 +194,12 @@ impl IndexManifest {
         if self.bloom_parameters.len() != self.config.fields().len() {
             return Err(Error::invalid_argument());
         }
-        let mut maximum_synopsis_size = 2_usize + 2;
         for (field, parameters) in self.config.fields().iter().zip(&self.bloom_parameters) {
             if BloomParameters::derive(field.synopsis())?.as_ref() != parameters.as_ref() {
                 return Err(Error::invalid_argument());
             }
-            let encoded_extrema = match field.data_type() {
-                DataType::Bool => 2 * 2,
-                DataType::I64 | DataType::F64 => 2 * 9,
-                DataType::String => 2 * (1 + 4 + MAX_STRING_BYTES),
-            };
-            maximum_synopsis_size = maximum_synopsis_size
-                .checked_add(1 + encoded_extrema)
-                .and_then(|size| {
-                    parameters.map_or(Some(size), |parameters| {
-                        size.checked_add(4 + parameters.byte_count())
-                    })
-                })
-                .ok_or_else(Error::invalid_argument)?;
         }
-        if maximum_synopsis_size > MAX_SYNOPSIS_BYTES {
+        if self.maximum_synopsis_encoded_len() > MAX_SYNOPSIS_BYTES {
             return Err(Error::invalid_argument());
         }
         Ok(())

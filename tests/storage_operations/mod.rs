@@ -153,6 +153,7 @@ async fn duplicate_insert_does_not_require_remaining_mutation_budget() {
         admission_budget: AdmissionBudget {
             max_mutations: 1,
             max_mutation_bytes: 1_024,
+            mutation_key_overhead_bytes: 0,
         },
         ..DeterministicConfig::default()
     });
@@ -381,6 +382,7 @@ fn mutation_builder_enforces_count_and_byte_limits_without_partial_change() {
     let count_budget = AdmissionBudget {
         max_mutations: 2,
         max_mutation_bytes: usize::MAX,
+        mutation_key_overhead_bytes: 0,
     };
     let mut builder =
         MutationBuilder::for_index(&manifest, hard_limits, count_budget).expect("valid builder");
@@ -396,6 +398,7 @@ fn mutation_builder_enforces_count_and_byte_limits_without_partial_change() {
     let generous_budget = AdmissionBudget {
         max_mutations: 1,
         max_mutation_bytes: usize::MAX,
+        mutation_key_overhead_bytes: 0,
     };
     let mut sizing =
         MutationBuilder::for_index(&manifest, hard_limits, generous_budget).expect("valid builder");
@@ -407,6 +410,7 @@ fn mutation_builder_enforces_count_and_byte_limits_without_partial_change() {
     let byte_budget = AdmissionBudget {
         max_mutations: 1,
         max_mutation_bytes: exact_bytes - 1,
+        mutation_key_overhead_bytes: 0,
     };
     let mut limited =
         MutationBuilder::for_index(&manifest, hard_limits, byte_budget).expect("valid builder");
@@ -427,6 +431,7 @@ fn mutation_builder_rejects_wrong_value_family_and_hard_limits() {
     let budget = AdmissionBudget {
         max_mutations: 10,
         max_mutation_bytes: usize::MAX,
+        mutation_key_overhead_bytes: 0,
     };
     let mut builder =
         MutationBuilder::for_index(&manifest, hard_limits, budget).expect("valid builder");
@@ -486,6 +491,7 @@ fn tree_local_inputs_must_match_the_bound_tree_key_schema() {
         AdmissionBudget {
             max_mutations: 1,
             max_mutation_bytes: 1_024,
+            mutation_key_overhead_bytes: 0,
         },
     )
     .expect("valid builder");
@@ -509,6 +515,7 @@ async fn range_clear_is_included_in_transaction_admission() {
         admission_budget: AdmissionBudget {
             max_mutations: 1,
             max_mutation_bytes: 1_024,
+            mutation_key_overhead_bytes: 0,
         },
         ..DeterministicConfig::default()
     };
@@ -596,6 +603,7 @@ fn manifest_write_with_different_immutable_config_is_rejected_when_bound() {
     let budget = AdmissionBudget {
         max_mutations: 1,
         max_mutation_bytes: 1_024,
+        mutation_key_overhead_bytes: 0,
     };
 
     let mut builder =
@@ -654,6 +662,7 @@ async fn duplicate_insert_establishes_an_update_protected_conflict() {
         admission_budget: AdmissionBudget {
             max_mutations: 1,
             max_mutation_bytes: 1_024,
+            mutation_key_overhead_bytes: 0,
         },
         ..DeterministicConfig::default()
     };
@@ -806,6 +815,7 @@ async fn insert_at_exhausted_budget_for_absent_key_returns_limit_exceeded() {
         admission_budget: AdmissionBudget {
             max_mutations: 1,
             max_mutation_bytes: 1_024,
+            mutation_key_overhead_bytes: 0,
         },
         ..DeterministicConfig::default()
     };
