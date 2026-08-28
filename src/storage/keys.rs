@@ -475,6 +475,13 @@ pub fn location_key(index: LogicalIndexId, id: &Bytes) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Returns the maximum encoded Record Location key length.
+pub(crate) const fn maximum_location_key_len() -> usize {
+    // Index prefix, record-group kind, maximally escaped terminated Record ID,
+    // and Record Location subkind.
+    2 + LOGICAL_INDEX_ID_BYTES + 1 + (2 * MAX_RECORD_ID_BYTES + 1) + 1
+}
+
 /// The Opaque Payload key for `id` in `index`.
 pub fn payload_key(index: LogicalIndexId, id: &Bytes) -> Result<Vec<u8>> {
     let mut bytes = record_group_prefix(index, id)?;
@@ -515,6 +522,12 @@ pub fn synopsis_key(index: LogicalIndexId, tree_key: &TreeKey, partition: Partit
     bytes
 }
 
+/// Returns one partition metadata key's exact encoded length.
+pub(crate) fn partition_metadata_key_len(tree_key: &TreeKey) -> usize {
+    // Index prefix, partition kind, Tree Key, Partition Key, and metadata subkind.
+    2 + LOGICAL_INDEX_ID_BYTES + 1 + tree_key.as_bytes().len() + PARTITION_KEY_BYTES + 1
+}
+
 /// The partition State key.
 #[must_use]
 pub fn state_key(index: LogicalIndexId, tree_key: &TreeKey, partition: PartitionKey) -> Vec<u8> {
@@ -543,6 +556,11 @@ pub fn leaf_entry_key(
     bytes.push(SUB_LEAF_ENTRY);
     bytes.extend_from_slice(id);
     Ok(bytes)
+}
+
+/// Returns the maximum encoded Leaf Entry key length for `tree_key`.
+pub(crate) fn maximum_leaf_entry_key_len(tree_key: &TreeKey) -> usize {
+    partition_metadata_key_len(tree_key) + MAX_RECORD_ID_BYTES
 }
 
 /// The Child Entry key for child partition `child` in `partition`.

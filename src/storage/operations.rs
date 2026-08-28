@@ -1021,6 +1021,7 @@ impl<'manifest, T> WriteLogicalTxn<'manifest, T> {
                 .budget
                 .max_mutation_bytes
                 .saturating_sub(self.size.bytes),
+            mutation_key_overhead_bytes: self.budget.mutation_key_overhead_bytes,
         };
         MutationBuilder::new(self.binding, self.hard_limits, remaining)
     }
@@ -1413,6 +1414,7 @@ mod tests {
             AdmissionBudget {
                 max_mutations: 2,
                 max_mutation_bytes: 2_048,
+                mutation_key_overhead_bytes: 0,
             },
         );
         builder

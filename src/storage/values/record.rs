@@ -195,6 +195,12 @@ pub(super) fn encode_record_location(
     Ok(())
 }
 
+/// Returns the exact encoded Record Location length for `tree_key`.
+pub(super) fn record_location_encoded_len(tree_key: &TreeKey) -> usize {
+    // Frame, sized Tree Key, and leaf Partition Key.
+    2 + 4 + tree_key.as_bytes().len() + 8
+}
+
 pub(super) fn decode_record_location(
     decoder: &mut Decoder,
     manifest: &IndexManifest,

@@ -18,10 +18,9 @@
 //!   never retried (ADR 0012): the caller recovers by re-driving the same
 //!   step, which observes the persisted state and proceeds idempotently.
 //! - **Bounded work.** Each step commits at most one transition, one target
-//!   installation, or one fixed-size drain batch
-//!   ([`DRAIN_BATCH_LEAF`] / [`DRAIN_BATCH_INTERNAL`]) — small enough to stay
-//!   within every adapter's conservative admission budget. Draining stores no
-//!   durable cursor: every batch starts at the source's current smallest
+//!   installation, or one schema- and Backend-budget-bounded drain batch —
+//!   small enough to stay within the adapter's conservative admission budget.
+//!   Draining stores no durable cursor: every batch starts at the source's current smallest
 //!   entry because successful moves delete that prefix.
 //! - **Training without locks.** Target centroids are trained from one
 //!   consistent read snapshot while the source is `Splitting`, outside any
@@ -52,8 +51,8 @@ use crate::storage::values::{
 };
 use crate::storage::{ReadLogicalTxn, WriteLogicalTxn, topology};
 
+pub use super::drain::DRAIN_BATCH_INTERNAL;
 use super::drain::{self, DrainBatch};
-pub use super::drain::{DRAIN_BATCH_INTERNAL, DRAIN_BATCH_LEAF};
 use super::routing;
 use super::training;
 
@@ -273,8 +272,8 @@ pub async fn advance_to_draining<B: Backend>(
 /// Moves one bounded batch of source entries to their nearer split target.
 ///
 /// A short read snapshot first fixes the batch: the source's current smallest
-/// entries, at most [`DRAIN_BATCH_LEAF`] Leaf Entries or
-/// [`DRAIN_BATCH_INTERNAL`] Child Entries by source level. The write
+/// entries, using the largest safe Leaf Entry batch for the current schema and
+/// Backend budget or at most [`DRAIN_BATCH_INTERNAL`] Child Entries. The write
 /// transaction revalidates the `DrainingSplit` state, then re-reads each
 /// candidate with update protection: an entry removed by a concurrent
 /// completed mutation is skipped and a remaining membership mismatch is
@@ -306,8 +305,16 @@ pub async fn drain_batch<B: Backend>(
         PartitionTransition::Splitting { .. } => return Ok(DrainStep::NotDraining),
         _ => return Ok(DrainStep::SourceAdvanced),
     };
-    let Some(batch) =
-        drain::next_drain_batch(&mut read, manifest, tree_key, source, Some(source_header)).await?
+    let Some(batch) = drain::next_drain_batch(
+        &mut read,
+        manifest,
+        tree_key,
+        source,
+        Some(source_header),
+        topology::Movement::Split,
+        backend.admission_budget(),
+    )
+    .await?
     else {
         return Ok(DrainStep::Drained {
             moved: 0,

@@ -14,7 +14,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::compare::{self, ComparisonPolicy};
-use crate::report::{BenchmarkReport, BenchmarkSuite, REPORT_SCHEMA_VERSION};
+use crate::report::{BenchmarkReport, BenchmarkSuite};
 use crate::runner::{self, ScenarioSpec};
 
 /// Parses and executes one `ktann-bench` command.
@@ -350,7 +350,6 @@ fn run_suite(options: RunOptions) -> Result<(), String> {
         reports.push(report);
     }
     let suite = BenchmarkSuite {
-        schema_version: REPORT_SCHEMA_VERSION,
         reproduction_command,
         reports,
     };

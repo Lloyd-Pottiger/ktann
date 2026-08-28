@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::report::{
     AdmissionSummary, BackendIo, BenchmarkReport, BenchmarkSuite, BudgetSummary, CacheSummary,
-    Distribution, LifecycleMeasurements, OperationClass, OperationSummary, REPORT_SCHEMA_VERSION,
-    ReportMeasurements, SearchPhase, SteadyStateMeasurements, WriteAttribution,
+    Distribution, LifecycleMeasurements, OperationClass, OperationSummary, ReportMeasurements,
+    SearchPhase, SteadyStateMeasurements, WriteAttribution,
 };
 
 /// Sub-millisecond p95 movement is not stable enough to classify by ratio.
@@ -56,17 +56,12 @@ impl ComparisonReport {
 /// # Errors
 ///
 /// Returns an error when policy values are invalid or the suites differ in
-/// schema, scenario set, inputs, Backend limits, or runtime fingerprint.
+/// scenario set, inputs, Backend limits, or runtime fingerprint.
 pub fn compare(
     baseline: &BenchmarkSuite,
     candidate: &BenchmarkSuite,
     policy: ComparisonPolicy,
 ) -> Result<ComparisonReport, String> {
-    if baseline.schema_version != REPORT_SCHEMA_VERSION
-        || candidate.schema_version != REPORT_SCHEMA_VERSION
-    {
-        return Err("benchmark report schema mismatch".to_owned());
-    }
     if !policy.maximum_relative_regression.is_finite()
         || policy.maximum_relative_regression < 0.0
         || !policy.maximum_recall_drop.is_finite()
@@ -1233,8 +1228,8 @@ mod tests {
     use crate::report::{
         BenchmarkReport, BenchmarkSuite, BudgetConfiguration, BudgetSummary, Configuration,
         DatasetMetadata, Distribution, Environment, LifecycleMeasurements, OperationClass,
-        OperationSummary, REPORT_SCHEMA_VERSION, RecallSummary, ReportMeasurements,
-        SearchBudgetConfiguration, SteadyStateMeasurements, WorkloadDispatch, WriteAmplification,
+        OperationSummary, RecallSummary, ReportMeasurements, SearchBudgetConfiguration,
+        SteadyStateMeasurements, WorkloadDispatch, WriteAmplification,
     };
 
     use super::{ComparisonPolicy, compare};
@@ -1291,6 +1286,7 @@ mod tests {
                 blocking_resource_limit: Some(2),
                 backend_max_mutations: 100,
                 backend_max_mutation_bytes: 1_000,
+                backend_mutation_key_overhead_bytes: 16,
                 concurrency: 4,
                 dispatch: WorkloadDispatch::Continuous,
                 warmup_operations: 10,
@@ -1350,7 +1346,6 @@ mod tests {
 
     fn suite(report: BenchmarkReport) -> BenchmarkSuite {
         BenchmarkSuite {
-            schema_version: REPORT_SCHEMA_VERSION,
             reproduction_command: "ktann-bench run".to_owned(),
             reports: vec![report],
         }

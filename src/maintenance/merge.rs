@@ -26,9 +26,8 @@
 //!   starts target selection again from a fresh snapshot, with no durable or
 //!   process-local target affinity. Different entries may move to different
 //!   targets, and a target may cross the split threshold.
-//! - **Bounded work.** Each step commits at most one transition or one
-//!   fixed-size drain batch ([`crate::maintenance::split::DRAIN_BATCH_LEAF`] /
-//!   [`crate::maintenance::split::DRAIN_BATCH_INTERNAL`]) — small enough to stay within every
+//! - **Bounded work.** Each step commits at most one transition or one schema-
+//!   and Backend-budget-bounded drain batch — small enough to stay within the
 //!   adapter's conservative admission budget. Every batch starts at the
 //!   source's current smallest entry because successful moves delete that
 //!   prefix.
@@ -134,8 +133,8 @@ pub async fn begin_merge<B: Backend>(
 /// Moves one bounded batch of source entries to reselected `Ready` targets.
 ///
 /// A short read snapshot first fixes the batch — the source's current
-/// smallest entries, at most [`crate::maintenance::split::DRAIN_BATCH_LEAF`] Leaf Entries or
-/// [`crate::maintenance::split::DRAIN_BATCH_INTERNAL`] Child Entries by source level — and the
+/// smallest entries, using the largest safe Leaf Entry batch for the current
+/// schema and Backend budget or the fixed internal-entry bound — and the
 /// same-level candidate set. The write transaction revalidates the `Merging`
 /// state, then re-reads each candidate with update protection: an entry
 /// removed by a concurrent completed mutation is skipped and a remaining
@@ -169,9 +168,16 @@ pub async fn drain_batch<B: Backend>(
             return Ok(DrainStep::NotMerging);
         }
         let level = source_header.level();
-        let Some(batch) =
-            drain::next_drain_batch(&mut read, manifest, tree_key, source, Some(source_header))
-                .await?
+        let Some(batch) = drain::next_drain_batch(
+            &mut read,
+            manifest,
+            tree_key,
+            source,
+            Some(source_header),
+            topology::Movement::Merge,
+            backend.admission_budget(),
+        )
+        .await?
         else {
             return Ok(DrainStep::Drained {
                 moved: 0,

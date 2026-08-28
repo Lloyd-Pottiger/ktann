@@ -259,6 +259,7 @@ impl Default for DeterministicConfig {
             AdmissionBudget {
                 max_mutations: 1_000,
                 max_mutation_bytes: 1 << 20,
+                mutation_key_overhead_bytes: 0,
             },
             Capabilities {
                 transactional_clear_range: false,

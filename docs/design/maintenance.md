@@ -102,6 +102,17 @@ counts and cache epochs. Leaf movement also updates Record Location and target
 Synopsis. A concurrently removed entry is skipped; any remaining membership
 mismatch is Corruption.
 
+The leaf page first derives the largest batch whose exact worst-case relocation
+charge fits the current Backend Admission Budget. The charge uses the
+Manifest's dimension, fields and Bloom parameters, the current Tree Key, codec
+key/value sizes, adapter key-prefix overhead, and the operation's worst target
+distribution: two targets for split, or one distinct Ready target per entry for
+merge. It then caps that safe bound at one quarter of the configured split
+threshold, with a floor of eight, limiting conflict rollback and failure blast
+radius relative to the index's ordinary partition size. Internal movement
+retains its fixed entry bound because it does not write Record Locations or
+Synopses.
+
 Drain placement normally chooses the nearer persisted target centroid. Exact
 remaining and target counts reserve the last entries needed for each target to
 reach the configured minimum when the source has enough entries, crediting

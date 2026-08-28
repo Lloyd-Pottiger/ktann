@@ -96,6 +96,7 @@ fn paged_config(page_mutations: usize) -> DeterministicConfig {
         admission_budget: AdmissionBudget {
             max_mutations: page_mutations,
             max_mutation_bytes: 1 << 20,
+            mutation_key_overhead_bytes: 0,
         },
         ..no_clear_config()
     }

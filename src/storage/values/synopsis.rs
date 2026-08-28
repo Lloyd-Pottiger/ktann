@@ -128,10 +128,13 @@ impl PartitionSynopsis {
     ///
     /// Returns `InvalidArgument` if the projection or existing synopsis does
     /// not match the Index Manifest.
-    pub fn expand(&mut self, manifest: &IndexManifest, projection: &[Value]) -> Result<()> {
+    ///
+    /// On success, returns whether the persisted Synopsis changed.
+    pub fn expand(&mut self, manifest: &IndexManifest, projection: &[Value]) -> Result<bool> {
         validate_synopsis_shape(self, manifest)?;
         validate_projection(projection, manifest.config().fields())?;
 
+        let mut changed = false;
         for (((synopsis, value), field), parameters) in self
             .0
             .iter_mut()
@@ -139,9 +142,9 @@ impl PartitionSynopsis {
             .zip(manifest.config().fields())
             .zip(manifest.bloom_parameters())
         {
-            expand_field(synopsis, value, field.data_type(), *parameters);
+            changed |= expand_field(synopsis, value, field.data_type(), *parameters);
         }
-        Ok(())
+        Ok(changed)
     }
 
     /// Returns field synopses in schema order.
@@ -295,10 +298,11 @@ fn expand_field(
     value: &Value,
     data_type: DataType,
     bloom_parameters: Option<BloomParameters>,
-) {
+) -> bool {
     if matches!(value, Value::Null) {
+        let changed = !synopsis.has_null;
         synopsis.has_null = true;
-        return;
+        return changed;
     }
 
     let replace_minimum = synopsis
@@ -320,6 +324,7 @@ fn expand_field(
         (false, false) => {}
     }
 
+    let mut changed = replace_minimum || replace_maximum;
     if let (Some(parameters), Some(bloom)) = (bloom_parameters, synopsis.bloom.take()) {
         let mut bloom = bloom
             .try_into_mut()
@@ -327,7 +332,9 @@ fn expand_field(
         let (first, step) = bloom_hash(value, data_type);
         for bit in bloom_probes(first, step, parameters) {
             let byte = bit / 8;
-            bloom[byte] |= 1_u8 << (bit % 8);
+            let mask = 1_u8 << (bit % 8);
+            changed |= bloom[byte] & mask == 0;
+            bloom[byte] |= mask;
         }
         // Saturation only weakens pruning; it never breaks the conservative
         // contract (ADR 0021), so a rising fill ratio is purely diagnostic.
@@ -336,6 +343,7 @@ fn expand_field(
         #[allow(clippy::cast_precision_loss)]
         metrics::bloom_fill_ratio(set_bits as f64 / f64::from(parameters.bit_count()));
     }
+    changed
 }
 
 fn canonical_value(value: &Value) -> Value {
@@ -444,20 +452,32 @@ mod tests {
         let fields = vec![
             FieldSchema::new("number", DataType::I64)
                 .unwrap()
-                .nullable(),
+                .nullable()
+                .with_synopsis(SynopsisConfig::MinMaxBloom {
+                    expected_distinct: NonZeroU32::new(8).unwrap(),
+                    false_positive_rate: 0.01,
+                })
+                .unwrap(),
             FieldSchema::new("float", DataType::F64).unwrap(),
         ];
         let manifest = manifest(fields);
         let mut synopsis = PartitionSynopsis::empty(&manifest);
-        synopsis
-            .expand(&manifest, &[Value::Null, Value::F64(-0.0)])
-            .unwrap();
+        assert!(
+            synopsis
+                .expand(&manifest, &[Value::Null, Value::F64(-0.0)])
+                .unwrap()
+        );
         synopsis
             .expand(&manifest, &[Value::I64(5), Value::F64(2.0)])
             .unwrap();
         synopsis
             .expand(&manifest, &[Value::I64(-2), Value::F64(-1.0)])
             .unwrap();
+        assert!(
+            !synopsis
+                .expand(&manifest, &[Value::I64(5), Value::F64(-1.0)])
+                .unwrap()
+        );
 
         assert!(synopsis.fields()[0].has_null());
         assert_eq!(synopsis.fields()[0].minimum(), Some(&Value::I64(-2)));

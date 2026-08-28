@@ -5,6 +5,15 @@ use crate::api::{DataType, Error, FieldSchema, MAX_STRING_BYTES, Result, Value};
 use super::corrupt;
 use super::wire::{Decoder, Encoder};
 
+/// Returns the exact maximum encoded length of one non-NULL typed value.
+pub(super) const fn maximum_typed_value_len(data_type: DataType) -> usize {
+    match data_type {
+        DataType::Bool => 2,
+        DataType::I64 | DataType::F64 => 9,
+        DataType::String => 1 + 4 + MAX_STRING_BYTES,
+    }
+}
+
 pub(super) fn encode_vector(encoder: &mut Encoder, dimension: usize, vector: &[f32]) -> Result<()> {
     if vector.len() != dimension {
         return Err(Error::invalid_argument());

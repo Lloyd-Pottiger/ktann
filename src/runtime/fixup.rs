@@ -762,6 +762,7 @@ mod tests {
             AdmissionBudget {
                 max_mutations: usize::MAX,
                 max_mutation_bytes: usize::MAX,
+                mutation_key_overhead_bytes: 0,
             }
         }
 

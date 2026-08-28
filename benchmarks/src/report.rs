@@ -1,17 +1,12 @@
-//! Versioned benchmark report schema and distribution summaries.
+//! Benchmark report structures and distribution summaries.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-/// Current on-disk report schema.
-pub const REPORT_SCHEMA_VERSION: u32 = 1;
-
 /// Reports produced by one suite command on one comparable host.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BenchmarkSuite {
-    /// Report schema version.
-    pub schema_version: u32,
     /// Exact command that reproduces the suite.
     pub reproduction_command: String,
     /// Scenario reports, each measured in an isolated worker process.
@@ -107,6 +102,8 @@ pub struct Configuration {
     pub backend_max_mutations: usize,
     /// Backend Admission Budget mutation-byte ceiling.
     pub backend_max_mutation_bytes: usize,
+    /// Physical key-prefix bytes charged per Backend mutation.
+    pub backend_mutation_key_overhead_bytes: usize,
     /// Concurrent workload clients.
     pub concurrency: usize,
     /// How clients are dispatched during the measured workload.

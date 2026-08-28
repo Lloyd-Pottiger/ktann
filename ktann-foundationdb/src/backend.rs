@@ -206,6 +206,7 @@ impl Backend for FoundationDbBackend {
         AdmissionBudget {
             max_mutations: DEFAULT_MAX_MUTATIONS,
             max_mutation_bytes: DEFAULT_MAX_MUTATION_BYTES,
+            mutation_key_overhead_bytes: self.prefix.bytes.len(),
         }
     }
 

@@ -725,6 +725,7 @@ async fn backend_admission_limits_are_enforced() {
         admission_budget: AdmissionBudget {
             max_mutations: 3,
             max_mutation_bytes: 1 << 20,
+            mutation_key_overhead_bytes: 0,
         },
         ..DeterministicConfig::default()
     });

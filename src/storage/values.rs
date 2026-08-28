@@ -98,6 +98,27 @@ pub const MAX_PAYLOAD_BYTES: usize = crate::api::MAX_PAYLOAD_BYTES;
 /// The maximum encoded Partition Synopsis size.
 pub const MAX_SYNOPSIS_BYTES: usize = MAX_ENCODED_SYNOPSIS_BYTES;
 
+/// Maximum encoded value lengths involved in one leaf relocation batch.
+pub(crate) struct LeafRelocationValueSizes {
+    pub(crate) leaf_entry: usize,
+    pub(crate) record_location: usize,
+    pub(crate) partition_header: usize,
+    pub(crate) partition_synopsis: usize,
+}
+
+/// Returns exact worst-case value lengths for the current Manifest and Tree Key.
+pub(crate) fn leaf_relocation_value_sizes(
+    manifest: &IndexManifest,
+    tree_key: &super::keys::TreeKey,
+) -> Result<LeafRelocationValueSizes> {
+    Ok(LeafRelocationValueSizes {
+        leaf_entry: entry::maximum_leaf_entry_encoded_len(manifest)?,
+        record_location: record::record_location_encoded_len(tree_key),
+        partition_header: authority::PARTITION_HEADER_ENCODED_LEN,
+        partition_synopsis: manifest.maximum_synopsis_encoded_len(),
+    })
+}
+
 const MAX_VALUE_BYTES: usize = 1024 * 1024;
 const ROTATION_SEED_BYTES: usize = 32;
 

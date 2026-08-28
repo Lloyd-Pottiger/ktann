@@ -388,6 +388,7 @@ pub async fn run_scenario<B: Backend>(
             blocking_resource_limit: spec.blocking_resource_limit,
             backend_max_mutations: admission.max_mutations,
             backend_max_mutation_bytes: admission.max_mutation_bytes,
+            backend_mutation_key_overhead_bytes: admission.mutation_key_overhead_bytes,
             concurrency: spec.concurrency,
             dispatch: spec.dispatch,
             warmup_operations: spec.warmup_operations,

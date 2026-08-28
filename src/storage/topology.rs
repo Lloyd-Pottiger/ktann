@@ -50,15 +50,15 @@
 use bytes::Bytes;
 
 use crate::api::{Error, ErrorKind, LogicalIndexId, PartitionKey, Result};
-use crate::storage::backend::{Capabilities, InsertOutcome, ScanLimits, WriteTxn};
-use crate::storage::keys::{LogicalKey, TreeKey};
+use crate::storage::backend::{AdmissionBudget, Capabilities, InsertOutcome, ScanLimits, WriteTxn};
+use crate::storage::keys::{self, LogicalKey, TreeKey};
 use crate::storage::membership::{added_entry, expect_inserted, removed_entry};
 use crate::storage::tree_manifest::reserve_partition_keys;
 use crate::storage::values::{
     ChildEntry, IndexManifest, LeafEntry, PartitionCentroid, PartitionHeader, PartitionState,
     PartitionSynopsis, PartitionTransition, PersistentValue, RecordLocation, VectorRecord,
     expect_centroid, expect_child_entry, expect_child_entry_ref, expect_header, expect_leaf_entry,
-    expect_location, expect_record, expect_state, expect_synopsis,
+    expect_location, expect_record, expect_state, expect_synopsis, leaf_relocation_value_sizes,
 };
 use crate::storage::{LogicalRange, LogicalReader, WriteLogicalTxn};
 
@@ -660,6 +660,103 @@ impl Movement {
     }
 }
 
+/// Returns the largest safe leaf relocation batch for one Backend budget.
+///
+/// The bound charges exact codec sizes for the current Manifest and Tree Key,
+/// the Backend adapter's per-key physical overhead, and the worst target
+/// distribution for the movement protocol. A split may touch both persisted
+/// targets; a merge may route every entry to a different Ready target.
+pub(crate) fn leaf_relocation_batch_limit(
+    manifest: &IndexManifest,
+    tree_key: &TreeKey,
+    movement: Movement,
+    budget: AdmissionBudget,
+) -> Result<usize> {
+    let charge = LeafRelocationCharge::new(manifest, tree_key, budget.mutation_key_overhead_bytes)?;
+    let high = budget.max_mutations.saturating_sub(1) / 3;
+    if high == 0 || !charge.fits(1, movement, budget) {
+        return Err(Error::new(ErrorKind::LimitExceeded));
+    }
+
+    // The charge is monotonic in entry count, including the split's second
+    // target at entry two, so binary search finds the exact joint count/byte
+    // bound without iterating once per admissible entry.
+    let mut low = 1_usize;
+    let mut high = high;
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        if charge.fits(middle, movement, budget) {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    Ok(low)
+}
+
+/// Worst-case physical mutation-byte charges for one leaf relocation.
+struct LeafRelocationCharge {
+    source_header: usize,
+    entry: usize,
+    target: usize,
+}
+
+impl LeafRelocationCharge {
+    fn new(
+        manifest: &IndexManifest,
+        tree_key: &TreeKey,
+        mutation_key_overhead_bytes: usize,
+    ) -> Result<Self> {
+        let values = leaf_relocation_value_sizes(manifest, tree_key)?;
+        let leaf_key = keys::maximum_leaf_entry_key_len(tree_key);
+        let metadata_key = keys::partition_metadata_key_len(tree_key);
+        let location_key = keys::maximum_location_key_len();
+        let mutation = |key: usize, value: usize| {
+            key.checked_add(value)
+                .and_then(|bytes| bytes.checked_add(mutation_key_overhead_bytes))
+                .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))
+        };
+        let source_header = mutation(metadata_key, values.partition_header)?;
+        let location = mutation(location_key, values.record_location)?;
+        let entry = mutation(leaf_key, values.leaf_entry)?
+            .checked_add(mutation(leaf_key, 0)?)
+            .and_then(|bytes| bytes.checked_add(location))
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+        let target = mutation(metadata_key, values.partition_header)?
+            .checked_add(mutation(metadata_key, values.partition_synopsis)?)
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+        Ok(Self {
+            source_header,
+            entry,
+            target,
+        })
+    }
+
+    fn size(&self, entries: usize, movement: Movement) -> Option<(usize, usize)> {
+        let targets = match movement {
+            Movement::Split => entries.min(2),
+            Movement::Merge => entries,
+        };
+        let mutations = entries
+            .checked_mul(3)
+            .and_then(|count| targets.checked_mul(2)?.checked_add(count))
+            .and_then(|count| count.checked_add(1))?;
+        let bytes = entries
+            .checked_mul(self.entry)
+            .and_then(|bytes| targets.checked_mul(self.target)?.checked_add(bytes))
+            .and_then(|bytes| bytes.checked_add(self.source_header))?;
+        Some((mutations, bytes))
+    }
+
+    fn fits(&self, entries: usize, movement: Movement, budget: AdmissionBudget) -> bool {
+        matches!(
+            self.size(entries, movement),
+            Some((mutations, bytes))
+                if mutations <= budget.max_mutations && bytes <= budget.max_mutation_bytes
+        )
+    }
+}
+
 /// Atomically moves one batch of verified leaf entries from the draining
 /// source to their chosen targets.
 ///
@@ -676,7 +773,7 @@ pub async fn relocate_leaf_entries<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     tree_key: &TreeKey,
     source: PartitionKey,
-    moves: Vec<(LeafDrainEntry, PartitionKey)>,
+    mut moves: Vec<(LeafDrainEntry, PartitionKey)>,
     movement: Movement,
 ) -> Result<usize> {
     if moves.is_empty() {
@@ -688,8 +785,8 @@ pub async fn relocate_leaf_entries<T: WriteTxn>(
     // One update-protected read of each touched partition Header, and one of
     // each receiving target's Synopsis: a batch never pays per-partition
     // authority round trips.
+    moves.sort_unstable_by_key(|(_, target)| *target);
     let mut targets: Vec<PartitionKey> = moves.iter().map(|(_, target)| *target).collect();
-    targets.sort_unstable();
     targets.dedup();
     let mut header_keys = Vec::with_capacity(targets.len() + 1);
     for target in &targets {
@@ -786,16 +883,18 @@ pub async fn relocate_leaf_entries<T: WriteTxn>(
         PersistentValue::PartitionHeader(source_header),
     )
     .await?;
+    let mut grouped_moves = moves.iter().peekable();
     for ((target, header), mut synopsis) in target_headers.into_iter().zip(target_synopses) {
         let mut header = header;
-        let original = synopsis.clone();
-        for (drain, move_target) in &moves {
-            if move_target == &target {
-                header = added_entry(header)?;
-                synopsis.expand(manifest, drain.entry.fields())?;
+        let mut synopsis_changed = false;
+        while let Some((drain, move_target)) = grouped_moves.peek() {
+            if *move_target != target {
+                break;
             }
+            header = added_entry(header)?;
+            synopsis_changed |= synopsis.expand(manifest, drain.entry.fields())?;
+            grouped_moves.next();
         }
-        let synopsis_changed = synopsis != original;
         txn.put(
             LogicalKey::Header {
                 index,
@@ -817,6 +916,7 @@ pub async fn relocate_leaf_entries<T: WriteTxn>(
             .await?;
         }
     }
+    debug_assert!(grouped_moves.next().is_none());
     Ok(moved)
 }
 
@@ -1937,4 +2037,164 @@ fn expect_agreement(header: PartitionHeader, state: PartitionTransition) -> Resu
 
 fn corrupt() -> Error {
     Error::new(ErrorKind::Corruption)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::api::{DataType, FieldSchema, IndexConfig, LogicalIndexId, Metric, SynopsisConfig};
+    use crate::storage::backend::AdmissionBudget;
+    use crate::storage::keys::TreeKey;
+    use crate::storage::values::{BloomParameters, IndexLifecycle, IndexManifest};
+
+    use super::{LeafRelocationCharge, Movement, leaf_relocation_batch_limit};
+
+    fn manifest() -> IndexManifest {
+        let config = IndexConfig::new(128, Metric::L2)
+            .expect("valid dimension")
+            .with_fields(vec![
+                FieldSchema::new("first", DataType::I64).expect("field"),
+                FieldSchema::new("second", DataType::String)
+                    .expect("field")
+                    .with_synopsis(SynopsisConfig::MinMaxBloom {
+                        expected_distinct: std::num::NonZeroU32::new(128).expect("nonzero"),
+                        false_positive_rate: 0.01,
+                    })
+                    .expect("bloom"),
+            ])
+            .expect("valid fields");
+        let bloom_parameters = config
+            .fields()
+            .iter()
+            .map(|field| BloomParameters::derive(field.synopsis()).expect("bloom parameters"))
+            .collect();
+        IndexManifest::new(
+            IndexLifecycle::Active,
+            LogicalIndexId::new(1).expect("nonzero"),
+            config,
+            [0; 32],
+            bloom_parameters,
+        )
+        .expect("valid manifest")
+    }
+
+    fn tree_key() -> TreeKey {
+        TreeKey::encode(&[], &[]).expect("empty Tree Key")
+    }
+
+    fn budget(mutations: usize, bytes: usize, overhead: usize) -> AdmissionBudget {
+        AdmissionBudget {
+            max_mutations: mutations,
+            max_mutation_bytes: bytes,
+            mutation_key_overhead_bytes: overhead,
+        }
+    }
+
+    #[test]
+    fn leaf_relocation_requires_room_for_one_complete_move() {
+        let manifest = manifest();
+        let tree_key = tree_key();
+        let overhead = 17;
+        for movement in [Movement::Split, Movement::Merge] {
+            let charge = LeafRelocationCharge::new(&manifest, &tree_key, overhead).expect("charge");
+            let (mutations, bytes) = charge.size(1, movement).expect("one move fits usize");
+            assert_eq!(
+                leaf_relocation_batch_limit(
+                    &manifest,
+                    &tree_key,
+                    movement,
+                    budget(mutations, bytes, overhead),
+                )
+                .expect("one move is admissible"),
+                1
+            );
+            assert!(
+                leaf_relocation_batch_limit(
+                    &manifest,
+                    &tree_key,
+                    movement,
+                    budget(mutations - 1, bytes, overhead),
+                )
+                .is_err()
+            );
+            assert!(
+                leaf_relocation_batch_limit(
+                    &manifest,
+                    &tree_key,
+                    movement,
+                    budget(mutations, bytes - 1, overhead),
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn leaf_relocation_uses_exact_count_and_byte_boundaries() {
+        let manifest = manifest();
+        let tree_key = tree_key();
+        let overhead = 23;
+        let entries = 37;
+        for movement in [Movement::Split, Movement::Merge] {
+            let charge = LeafRelocationCharge::new(&manifest, &tree_key, overhead).expect("charge");
+            let (mutations, bytes) = charge
+                .size(entries, movement)
+                .expect("test batch fits usize");
+            assert_eq!(
+                leaf_relocation_batch_limit(
+                    &manifest,
+                    &tree_key,
+                    movement,
+                    budget(mutations, usize::MAX, overhead),
+                )
+                .expect("exact count budget"),
+                entries
+            );
+            assert_eq!(
+                leaf_relocation_batch_limit(
+                    &manifest,
+                    &tree_key,
+                    movement,
+                    budget(usize::MAX, bytes, overhead),
+                )
+                .expect("exact byte budget"),
+                entries
+            );
+            assert_eq!(
+                leaf_relocation_batch_limit(
+                    &manifest,
+                    &tree_key,
+                    movement,
+                    budget(mutations - 1, usize::MAX, overhead),
+                )
+                .expect("one fewer mutation"),
+                entries - 1
+            );
+            assert_eq!(
+                leaf_relocation_batch_limit(
+                    &manifest,
+                    &tree_key,
+                    movement,
+                    budget(usize::MAX, bytes - 1, overhead),
+                )
+                .expect("one fewer byte"),
+                entries - 1
+            );
+        }
+    }
+
+    #[test]
+    fn leaf_relocation_selects_the_largest_jointly_admissible_batch() {
+        let manifest = manifest();
+        let tree_key = tree_key();
+        let budget = budget(10_000, 1 << 20, 263);
+        for movement in [Movement::Split, Movement::Merge] {
+            let limit = leaf_relocation_batch_limit(&manifest, &tree_key, movement, budget)
+                .expect("production-sized budget admits a move");
+            let charge =
+                LeafRelocationCharge::new(&manifest, &tree_key, budget.mutation_key_overhead_bytes)
+                    .expect("charge");
+            assert!(charge.fits(limit, movement, budget));
+            assert!(!charge.fits(limit + 1, movement, budget));
+        }
+    }
 }
