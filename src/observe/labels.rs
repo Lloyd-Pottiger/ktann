@@ -73,9 +73,9 @@ pub(crate) enum Operation {
     Search,
     /// `Index::verify`.
     Verify,
-    /// One split Fixup write step; labels `ktann.write.retries` only.
+    /// One split Fixup write step.
     SplitFixup,
-    /// One merge Fixup write step; labels `ktann.write.retries` only.
+    /// One merge Fixup write step.
     MergeFixup,
 }
 
@@ -96,6 +96,48 @@ impl Operation {
             Self::Verify => "verify",
             Self::SplitFixup => "split_fixup",
             Self::MergeFixup => "merge_fixup",
+        }
+    }
+}
+
+/// The terminal result of one whole write attempt (key `outcome`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WriteAttemptOutcome {
+    /// The native commit completed successfully.
+    Committed,
+    /// The attempt definitely aborted and may be retried whole.
+    RetryableAbort,
+    /// The native commit outcome is unknown and must not be retried blindly.
+    CommitOutcomeUnknown,
+    /// The attempt ended with another terminal error.
+    Failed,
+}
+
+impl WriteAttemptOutcome {
+    /// Classifies one completed whole attempt.
+    pub(crate) fn from_result<T>(result: &crate::api::Result<T>) -> Self {
+        match result {
+            Ok(_) => Self::Committed,
+            Err(error) => Self::from_error(error.kind()),
+        }
+    }
+
+    /// Classifies one failed step or commit result.
+    pub(crate) const fn from_error(kind: ErrorKind) -> Self {
+        match kind {
+            ErrorKind::RetryableAbort => Self::RetryableAbort,
+            ErrorKind::CommitOutcomeUnknown => Self::CommitOutcomeUnknown,
+            _ => Self::Failed,
+        }
+    }
+
+    /// Returns the bounded metric label value.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Committed => "committed",
+            Self::RetryableAbort => "retryable_abort",
+            Self::CommitOutcomeUnknown => "commit_outcome_unknown",
+            Self::Failed => "failed",
         }
     }
 }
@@ -251,6 +293,40 @@ impl FixupKind {
     }
 }
 
+/// The result of one Fixup state-machine advance call (key `result`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FixupStepResult {
+    /// The state machine found no work for the partition.
+    Idle,
+    /// A durable split or merge transition began.
+    Began,
+    /// Both split targets became exposed and draining began.
+    Exposed,
+    /// One structural drain transaction committed.
+    Drained,
+    /// The durable split or merge transition completed.
+    Completed,
+    /// A merging source currently has no legal target.
+    Stalled,
+    /// The advance call returned an error.
+    Failed,
+}
+
+impl FixupStepResult {
+    /// Returns the bounded metric label value.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Began => "began",
+            Self::Exposed => "exposed",
+            Self::Drained => "drained",
+            Self::Completed => "completed",
+            Self::Stalled => "stalled",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 /// The outcome of offering one Fixup key (key `outcome`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FixupAdmission {
@@ -385,6 +461,21 @@ mod tests {
             Operation::Verify.as_str(),
             Operation::SplitFixup.as_str(),
             Operation::MergeFixup.as_str(),
+        ]);
+        assert_bounded(&[
+            WriteAttemptOutcome::Committed.as_str(),
+            WriteAttemptOutcome::RetryableAbort.as_str(),
+            WriteAttemptOutcome::CommitOutcomeUnknown.as_str(),
+            WriteAttemptOutcome::Failed.as_str(),
+        ]);
+        assert_bounded(&[
+            FixupStepResult::Idle.as_str(),
+            FixupStepResult::Began.as_str(),
+            FixupStepResult::Exposed.as_str(),
+            FixupStepResult::Drained.as_str(),
+            FixupStepResult::Completed.as_str(),
+            FixupStepResult::Stalled.as_str(),
+            FixupStepResult::Failed.as_str(),
         ]);
         assert_bounded(&[
             OperationOutcome::Ok.as_str(),

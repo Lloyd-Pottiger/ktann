@@ -108,14 +108,21 @@ fn search_request(k: usize) -> SearchRequest {
 /// have executed to completion.
 async fn wait_for_maintenance(backend: &SharedBackend, index: &Index<SharedBackend>) {
     let deadline = Instant::now() + Duration::from_secs(30);
+    let mut ready_rounds = 0_u8;
     loop {
         let partitions = audit::list_partitions(backend, index.logical_index_id())
             .await
             .expect("list partitions");
-        if partitions
-            .iter()
-            .all(|(_, _, header)| header.state() == ktann::storage::values::PartitionState::Ready)
-        {
+        let ready = partitions.len() > 1
+            && partitions.iter().all(|(_, _, header)| {
+                header.state() == ktann::storage::values::PartitionState::Ready
+            });
+        ready_rounds = if ready {
+            ready_rounds.saturating_add(1)
+        } else {
+            0
+        };
+        if ready_rounds >= 3 {
             return;
         }
         assert!(
@@ -410,6 +417,24 @@ async fn redaction_audit_covers_all_paths() {
         &[("operation", "search"), ("outcome", "ok")],
     );
     has_series(&series, "ktann.write.retries", &[("operation", "insert")]);
+    has_series(
+        &series,
+        "ktann.write.attempts",
+        &[("operation", "insert"), ("outcome", "retryable_abort")],
+    );
+    has_series(
+        &series,
+        "ktann.write.attempts",
+        &[
+            ("operation", "insert"),
+            ("outcome", "commit_outcome_unknown"),
+        ],
+    );
+    has_series(
+        &series,
+        "ktann.write.commit.duration",
+        &[("operation", "insert"), ("outcome", "committed")],
+    );
     for dimension in [
         "scanned_tree_keys",
         "visited_partitions",
@@ -444,6 +469,12 @@ async fn redaction_audit_covers_all_paths() {
     );
     has_series(&series, "ktann.fixup.admission", &[("outcome", "enqueued")]);
     has_series(&series, "ktann.fixup.execution", &[("outcome", "settled")]);
+    has_series(
+        &series,
+        "ktann.fixup.steps",
+        &[("kind", "split"), ("result", "drained")],
+    );
+    has_series(&series, "ktann.fixup.drain.entries", &[("kind", "split")]);
     has_series(&series, "ktann.fixup.state_age", &[("kind", "split")]);
     has_series(&series, "ktann.import.wait", &[("gate", "in_flight_slot")]);
     has_series(&series, "ktann.import.wait", &[("gate", "backlog")]);

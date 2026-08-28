@@ -18,9 +18,11 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Instant;
 
 use crate::api::{ErrorKind, Result};
-use crate::observe::labels::Operation;
+use crate::observe::labels::{Operation, WriteAttemptOutcome};
+use crate::observe::metrics;
 use crate::storage::WriteLogicalTxn;
 use crate::storage::backend::Backend;
 use crate::storage::values::IndexManifest;
@@ -84,10 +86,40 @@ pub(crate) async fn run_write_attempts<'b, 'm, B: Backend, O>(
         let mut txn = open_validated_write(backend, handle_manifest).await?;
         let error = match step(&mut txn).await {
             Ok(outcome) => {
+                let size = txn.size();
                 let committed = match context.as_deref_mut() {
-                    Some(context) => context.commit(move |start| txn.commit_with(start)).await,
-                    None => txn.commit().await,
+                    Some(context) => {
+                        context
+                            .commit(move |start| async move {
+                                let commit_started = Instant::now();
+                                let committed = txn.commit_with(start).await;
+                                metrics::write_commit_finished(
+                                    operation,
+                                    WriteAttemptOutcome::from_result(&committed),
+                                    commit_started.elapsed(),
+                                );
+                                committed
+                            })
+                            .await
+                    }
+                    None => {
+                        let commit_started = Instant::now();
+                        let committed = txn.commit().await;
+                        metrics::write_commit_finished(
+                            operation,
+                            WriteAttemptOutcome::from_result(&committed),
+                            commit_started.elapsed(),
+                        );
+                        committed
+                    }
                 };
+                let attempt_outcome = WriteAttemptOutcome::from_result(&committed);
+                metrics::write_attempt_finished(
+                    operation,
+                    attempt_outcome,
+                    size.mutations(),
+                    size.bytes(),
+                );
                 match committed {
                     Ok(()) => return Ok(outcome),
                     // The commit boundary is included in the whole-attempt
@@ -96,7 +128,14 @@ pub(crate) async fn run_write_attempts<'b, 'm, B: Backend, O>(
                 }
             }
             Err(error) => {
+                let size = txn.size();
                 txn.rollback().await;
+                metrics::write_attempt_finished(
+                    operation,
+                    WriteAttemptOutcome::from_error(error.kind()),
+                    size.mutations(),
+                    size.bytes(),
+                );
                 error
             }
         };

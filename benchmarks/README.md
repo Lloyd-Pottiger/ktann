@@ -19,6 +19,15 @@ parent invocation. Each scenario runs in a fresh subprocess so its metrics
 recorder, Partition Cache, and peak RSS do not contain another scenario's
 state.
 
+For controlled `import-to-search-lifecycle` diagnostics,
+`--maintenance-workers N` overrides the import Runtime's Structure Maintenance
+worker count (including zero), and `--import-in-flight-batches N` overrides the
+positive Import Session in-flight limit. After immediate search, the runner
+reopens the same index with the profile's
+`convergence_maintenance_workers` count so an import-only run can still reach
+the stable search phases. These options require explicitly selecting that
+lifecycle scenario so ordinary suites retain their fixed configuration.
+
 The `smoke` profile uses a small deterministic synthetic dataset and exercises
 warm-cache ANN, cache-disabled ANN, 95/5 search/update, hot 50/50
 search/update, saturated Backend admission, and one bounded import-to-search
@@ -73,6 +82,10 @@ The timed workload reports:
 - blocking-resource wait/held time and Import admission wait where emitted;
 - Backend-boundary logical reads, scans, returned items/bytes, transaction
   attempts, commit outcomes, and attempted mutations/bytes;
+- phase-local whole write attempts, retries, logical mutations/bytes, and native
+  commit wait attributed by `batch_mutate`, `split_fixup`, and `merge_fixup`;
+- Fixup state-machine advance results and entries moved per committed split or
+  merge drain step;
 - logical write amplification as attempted mutation operations and bytes per
   successful public write, including retry attempts.
 
@@ -162,7 +175,8 @@ The report keeps these boundaries distinct:
 1. `import` begins before the first submit and ends after
    `ImportSession::finish`. It reports accepted batches and records, throughput,
    submit percentiles, gate waits, batch failures, CPU, Backend IO, peak RSS,
-   and concurrent Structure Maintenance. `finish` remains only an accepted
+   operation-attributed write work, Fixup steps, drain batch sizes, and
+   concurrent Structure Maintenance. `finish` remains only an accepted
    batch-outcome barrier. The case fails if any submitted record is not
    accepted, so subsequent recall always measures the complete fixed corpus.
 2. `immediate_search` is the first fixed query pass after finish, before the

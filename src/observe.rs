@@ -27,6 +27,10 @@
 //! | `ktann.operation.duration` | histogram | operation, outcome |
 //! | `ktann.foreground.admission` | counter | operation, outcome |
 //! | `ktann.write.retries` | counter | operation |
+//! | `ktann.write.attempts` | counter | operation, outcome |
+//! | `ktann.write.mutations` | counter | operation, outcome |
+//! | `ktann.write.mutation_bytes` | counter | operation, outcome |
+//! | `ktann.write.commit.duration` | histogram | operation, outcome |
 //! | `ktann.search.budget.usage` | histogram | dimension |
 //! | `ktann.search.budget.exhausted` | counter | dimension |
 //! | `ktann.search.stage.duration` | histogram | stage |
@@ -36,6 +40,8 @@
 //! | `ktann.fixup.admission` | counter | outcome |
 //! | `ktann.fixup.backlog` | gauge | — |
 //! | `ktann.fixup.execution` | counter | outcome |
+//! | `ktann.fixup.steps` | counter | kind, result |
+//! | `ktann.fixup.drain.entries` | histogram | kind |
 //! | `ktann.fixup.state_age` | histogram | kind |
 //! | `ktann.bloom.fill_ratio` | histogram | — |
 //! | `ktann.import.wait` | histogram | gate |

@@ -201,7 +201,12 @@ pub async fn drain_batch<B: Backend>(
         )
         .await?
         {
-            Attempt::Step(step) => return Ok(step),
+            Attempt::Step(step) => {
+                if let DrainStep::Drained { moved, .. } = step {
+                    metrics::fixup_drain_step(FixupKind::Merge, moved);
+                }
+                return Ok(step);
+            }
             // A chosen target left `Ready` between the read snapshot and the
             // attempt: discard the route and start target selection again,
             // bounded by the same policy as the whole-step runner.

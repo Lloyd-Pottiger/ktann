@@ -40,7 +40,7 @@ use tracing::{Instrument as _, Span};
 
 use crate::api::{Error, ErrorKind, LogicalIndexId, PartitionKey, Result};
 use crate::maintenance::{merge, split};
-use crate::observe::labels::{FixupAdmission, FixupExecution, FixupKind};
+use crate::observe::labels::{FixupAdmission, FixupExecution, FixupKind, FixupStepResult};
 use crate::observe::{metrics, trace};
 use crate::storage::backend::Backend;
 use crate::storage::keys::TreeKey;
@@ -449,6 +449,7 @@ async fn drive<B: Backend>(inner: &Arc<RuntimeInner<B>>, offer: &FixupOffer) -> 
             &retry,
         )
         .await;
+        observe_split_step(&split_step);
         match split_step {
             Ok(split::Advance::Idle) => {
                 let merge_step = merge::advance(
@@ -460,6 +461,7 @@ async fn drive<B: Backend>(inner: &Arc<RuntimeInner<B>>, offer: &FixupOffer) -> 
                     &retry,
                 )
                 .await;
+                observe_merge_step(&merge_step);
                 if !matches!(merge_step, Ok(merge::Advance::Idle)) {
                     trace::fixup_kind(&Span::current(), FixupKind::Merge);
                 }
@@ -492,6 +494,36 @@ async fn drive<B: Backend>(inner: &Arc<RuntimeInner<B>>, offer: &FixupOffer) -> 
     // The step budget ran out with work possibly remaining: the Fixup
     // retires and a later relevant access re-offers the partition.
     FixupExecution::Retired
+}
+
+/// Records one split advance result without exposing partition identity.
+fn observe_split_step(step: &Result<split::Advance>) {
+    let result = match step {
+        Ok(split::Advance::Idle) => FixupStepResult::Idle,
+        Ok(split::Advance::Began { .. }) => FixupStepResult::Began,
+        Ok(split::Advance::Exposed { .. }) => FixupStepResult::Exposed,
+        // The committed drain boundary records both the step and moved count,
+        // including a final drain followed by completion in this advance.
+        Ok(split::Advance::Drained { .. }) => return,
+        Ok(split::Advance::Completed) => FixupStepResult::Completed,
+        Err(_) => FixupStepResult::Failed,
+    };
+    metrics::fixup_step(FixupKind::Split, result);
+}
+
+/// Records one merge advance result without exposing partition identity.
+fn observe_merge_step(step: &Result<merge::Advance>) {
+    let result = match step {
+        Ok(merge::Advance::Idle) => FixupStepResult::Idle,
+        Ok(merge::Advance::Began) => FixupStepResult::Began,
+        // The committed drain boundary records both the step and moved count,
+        // including a final drain followed by completion in this advance.
+        Ok(merge::Advance::Drained { .. }) => return,
+        Ok(merge::Advance::Stalled) => FixupStepResult::Stalled,
+        Ok(merge::Advance::Completed) => FixupStepResult::Completed,
+        Err(_) => FixupStepResult::Failed,
+    };
+    metrics::fixup_step(FixupKind::Merge, result);
 }
 
 #[cfg(test)]

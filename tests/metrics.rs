@@ -287,6 +287,49 @@ async fn operations_record_the_documented_series() {
     // The demand-driven queue admitted and finished split work.
     assert!(bumped("ktann.fixup.admission", &[("outcome", "enqueued")]) >= 1);
     assert!(bumped("ktann.fixup.execution", &[("outcome", "settled")]) >= 1);
+    assert!(
+        bumped(
+            "ktann.write.attempts",
+            &[("operation", "batch_mutate"), ("outcome", "committed")]
+        ) >= 2
+    );
+    assert_eq!(
+        bumped(
+            "ktann.write.attempts",
+            &[("operation", "insert"), ("outcome", "failed")]
+        ),
+        1
+    );
+    assert!(
+        bumped(
+            "ktann.write.mutations",
+            &[("operation", "batch_mutate"), ("outcome", "committed")]
+        ) > 0
+    );
+    assert!(
+        bumped(
+            "ktann.write.mutation_bytes",
+            &[("operation", "batch_mutate"), ("outcome", "committed")]
+        ) > 0
+    );
+    assert!(
+        bumped(
+            "ktann.fixup.steps",
+            &[("kind", "split"), ("result", "began")]
+        ) >= 1
+    );
+    assert!(
+        bumped(
+            "ktann.fixup.steps",
+            &[("kind", "split"), ("result", "drained")]
+        ) >= 1
+    );
+    assert!(
+        bumped(
+            "ktann.fixup.steps",
+            &[("kind", "split"), ("result", "completed")]
+        ) >= 1
+    );
 
     // The completed verification report is counted.
     assert_eq!(
@@ -339,6 +382,11 @@ async fn operations_record_the_documented_series() {
     }
     assert!(seen("ktann.import.wait", &[("gate", "in_flight_slot")]));
     assert!(seen("ktann.import.wait", &[("gate", "backlog")]));
+    assert!(seen(
+        "ktann.write.commit.duration",
+        &[("operation", "batch_mutate"), ("outcome", "committed")]
+    ));
+    assert!(seen("ktann.fixup.drain.entries", &[("kind", "split")]));
     assert!(seen("ktann.fixup.state_age", &[("kind", "split")]));
     assert!(series.iter().any(|(name, _)| name == "ktann.fixup.backlog"));
 }
