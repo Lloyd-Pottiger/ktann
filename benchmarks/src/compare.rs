@@ -1293,7 +1293,7 @@ mod tests {
                 measured_operations: 100,
                 k: 10,
                 import_batch_size: None,
-                import_in_flight_batches: None,
+                import_max_in_flight_batches: None,
                 import_backlog_watermark: None,
             },
             dataset: DatasetMetadata {

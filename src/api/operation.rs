@@ -175,23 +175,23 @@ impl GetOptions {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct ImportOptions {
-    in_flight_batches: Option<usize>,
+    max_in_flight_batches: Option<usize>,
 }
 
 impl ImportOptions {
-    /// Overrides the Runtime's positive in-flight batch limit.
-    pub fn with_in_flight_batches(mut self, batches: usize) -> Result<Self> {
+    /// Overrides the Runtime's positive adaptive-concurrency ceiling.
+    pub fn with_max_in_flight_batches(mut self, batches: usize) -> Result<Self> {
         if batches == 0 {
             return Err(Error::invalid_argument());
         }
-        self.in_flight_batches = Some(batches);
+        self.max_in_flight_batches = Some(batches);
         Ok(self)
     }
 
-    /// Returns the optional in-flight batch override.
+    /// Returns the optional adaptive-concurrency ceiling override.
     #[must_use]
-    pub const fn in_flight_batches(self) -> Option<usize> {
-        self.in_flight_batches
+    pub const fn max_in_flight_batches(self) -> Option<usize> {
+        self.max_in_flight_batches
     }
 }
 

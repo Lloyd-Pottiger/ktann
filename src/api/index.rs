@@ -7,6 +7,7 @@ use bytes::Bytes;
 
 use crate::maintenance::mutation;
 use crate::observe::labels::Operation;
+use crate::runtime::import::ImportPermit;
 use crate::runtime::{OperationContext, RuntimeInner};
 use crate::runtime::{lifecycle, reads, search, verify};
 use crate::storage::backend::Backend;
@@ -189,8 +190,8 @@ impl<B: Backend> Index<B> {
     ///
     /// The session admits ordinary atomic mutation batches under bounded
     /// concurrency; see [`ImportSession`] for the admission, ordering,
-    /// cancellation, and shutdown contract. `options.in_flight_batches()`
-    /// overrides the Runtime's configured in-flight batch limit.
+    /// cancellation, and shutdown contract. `options.max_in_flight_batches()`
+    /// overrides the Runtime's configured adaptive-concurrency ceiling.
     ///
     /// # Errors
     ///
@@ -200,10 +201,10 @@ impl<B: Backend> Index<B> {
         if !self.runtime.is_accepting() {
             return Err(Error::new(ErrorKind::RuntimeClosed));
         }
-        let in_flight_batches = options
-            .in_flight_batches()
-            .unwrap_or_else(|| self.runtime.config().import_in_flight_batches());
-        Ok(ImportSession::new(self.clone(), in_flight_batches))
+        let max_in_flight_batches = options
+            .max_in_flight_batches()
+            .unwrap_or_else(|| self.runtime.config().import_max_in_flight_batches());
+        Ok(ImportSession::new(self.clone(), max_in_flight_batches))
     }
 
     /// Runs one bounded approximate search over one consistent snapshot.
@@ -341,20 +342,57 @@ impl<B: Backend> Index<B> {
         mutations: Vec<Mutation>,
         operation_options: OperationOptions,
     ) -> Result<Vec<MutationOutcome>> {
+        self.run_mutations_with_import_permit(operation, mutations, operation_options, None)
+            .await
+    }
+
+    /// Runs one Import Session batch with its adaptive concurrency permit.
+    pub(crate) async fn run_import_mutations(
+        &self,
+        operation: Operation,
+        mutations: Vec<Mutation>,
+        operation_options: OperationOptions,
+        permit: ImportPermit<B>,
+    ) -> Result<Vec<MutationOutcome>> {
+        self.run_mutations_with_import_permit(operation, mutations, operation_options, Some(permit))
+            .await
+    }
+
+    /// Executes a mutation batch and offers only its committed maintenance.
+    async fn run_mutations_with_import_permit(
+        &self,
+        operation: Operation,
+        mutations: Vec<Mutation>,
+        operation_options: OperationOptions,
+        permit: Option<ImportPermit<B>>,
+    ) -> Result<Vec<MutationOutcome>> {
         let retry = lifecycle::RetryPolicy::from_config(self.runtime.config());
         let manifest = Arc::clone(&self.manifest);
-        let report = self
+        let (report, permit) = self
             .run_foreground(
                 operation,
                 operation_options,
                 move |mut context| async move {
-                    mutation::mutate(&mut context, &manifest, &mutations, retry, operation).await
+                    let mut permit = permit;
+                    let report = mutation::mutate(
+                        &mut context,
+                        &manifest,
+                        &mutations,
+                        retry,
+                        operation,
+                        permit.as_mut(),
+                    )
+                    .await?;
+                    Ok((report, permit))
                 },
             )
             .await?;
         if !report.maintenance.is_empty() {
             self.runtime
                 .offer_fixups(&self.manifest, report.maintenance);
+        }
+        if let Some(permit) = permit {
+            permit.complete();
         }
         Ok(report.outcomes)
     }

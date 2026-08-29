@@ -194,8 +194,8 @@ The v1 defaults and caps are:
 | Exact rerank candidates | `min(max(4*k,100),65,536)` | 65,536 and at least `k` |
 | Leaf beam size | 32 | 16,384 |
 | Tree Key scan ranges | 1,024 | wider conservative fallback |
-| Import in-flight batches | `min(available_parallelism,4)`, min 1 | positive |
-| Import backlog watermark | half fixup queue | within queue capacity |
+| Import maximum in-flight batches | `min(available_parallelism,4)`, min 1 | positive |
+| Import backlog watermark | 2 | within queue capacity |
 
 Stalled timeout defaults to checked
 `max(1ms, 1s * max_partition_entries / 128)`. Retry backoff starts at 1 ms,
@@ -253,7 +253,9 @@ commit of unknown outcome.
 
 `ImportSession::submit(&mut self, Vec<Mutation>)` waits for local capacity,
 admits exactly one ordinary atomic batch, and returns a unique process-local
-`BatchToken`. Multiple accepted batches may execute concurrently within bounds.
+`BatchToken`. Each session starts with one active batch and learns concurrency
+from saturated clean completions and retryable conflicts up to its configured ceiling;
+multiple accepted batches may execute concurrently within that learned bound.
 `finish(self)` waits for all accepted work and returns ordered
 `ImportBatchResult { token, result }` values in submission order. Dropping the
 session cancels work not yet admitted to commit; committing work continues under

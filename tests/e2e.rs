@@ -319,7 +319,7 @@ impl Harness {
                 // a bounded-retry exhaustion under that contention is engine
                 // behavior for engine tests, not for this corpus.
                 let options = ImportOptions::default()
-                    .with_in_flight_batches(1)
+                    .with_max_in_flight_batches(1)
                     .expect("import options");
                 let mut session = self
                     .index()

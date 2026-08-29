@@ -67,13 +67,29 @@ transition. Future persistent timestamps are not stalled.
 ## 4. Import Session
 
 An Import Session is a non-cloneable process-local coordinator bound to one
-Index. `submit` applies ordinary batch validation, waits for an in-flight slot
-and backlog gate, admits exactly one ordinary atomic mutation operation,
-and returns a Batch Token. Tokens are monotonically increasing within the
-session and have no persistent or transaction identity.
+Index. `submit` applies ordinary batch validation, waits for an adaptive
+concurrency slot and backlog gate, admits exactly one ordinary atomic mutation
+operation, and returns a Batch Token. Tokens are monotonically increasing
+within the session and have no persistent or transaction identity.
 
-Accepted batches may execute concurrently. Their atomicity, retry, error, and
-maintenance behavior is identical to normal mutate. `finish` closes admission,
+Each session starts with one active batch and treats the configured maximum
+in-flight value as a hard ceiling on accepted, nonterminal batches. Clean
+completions raise the learned active limit additively only while that limit is
+saturated and another submission is waiting. A retryable write conflict
+contracts it multiplicatively and releases the contended batch's active slot,
+but the paused batch retains its accepted-batch capacity and has priority when
+reacquiring under the smaller limit before the next ordinary whole-operation
+attempt. This feedback measures demonstrated write overlap, including data
+skew, Tree Key distribution, and concurrent Structure Maintenance. It does not
+scan, persist, or infer a partition count. The default backlog watermark is
+two, allowing one pending or running Fixup to coexist with import while
+pausing new admission before maintenance backlog grows further. Explicit
+overrides remain process-local tuning bounds.
+
+Accepted batches may execute concurrently within the learned limit. Their
+atomicity, retry, error, and maintenance behavior is identical to normal
+mutate. Import never splits or combines caller-submitted batches; batch size is
+part of the caller's atomicity and transaction-budget choice. `finish` closes admission,
 waits for all accepted tokens, and returns every batch result in submission
 order; a failed batch does not discard other known results. The caller can
 select the first failure if desired without losing outcome information.

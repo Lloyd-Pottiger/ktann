@@ -224,7 +224,7 @@ pub struct RuntimeConfig {
     partition_cache_bytes: u64,
     default_search_budgets: SearchBudgets,
     tree_key_scan_ranges: u32,
-    import_in_flight_batches: usize,
+    import_max_in_flight_batches: usize,
     import_backlog_watermark: usize,
     stalled_timeout: Option<Duration>,
     retry_initial_backoff: Duration,
@@ -244,8 +244,8 @@ impl Default for RuntimeConfig {
             partition_cache_bytes: DEFAULT_PARTITION_CACHE_BYTES,
             default_search_budgets: SearchBudgets::default(),
             tree_key_scan_ranges: DEFAULT_TREE_KEY_SCAN_RANGES,
-            import_in_flight_batches: available.clamp(1, 4),
-            import_backlog_watermark: DEFAULT_FIXUP_QUEUE_CAPACITY / 2,
+            import_max_in_flight_batches: available.clamp(1, 4),
+            import_backlog_watermark: 2,
             stalled_timeout: None,
             retry_initial_backoff: Duration::from_millis(1),
             retry_max_backoff: Duration::from_millis(100),
@@ -314,9 +314,11 @@ impl RuntimeConfig {
         Ok(self)
     }
 
-    /// Sets Import Session in-flight and backlog admission bounds.
+    /// Sets the Import Session concurrency ceiling and backlog admission bound.
     ///
-    /// A non-empty batch admits only once the process-local Fixup backlog
+    /// A session starts with one active batch and learns useful concurrency up
+    /// to `in_flight` from clean completions and retryable contention. A
+    /// non-empty batch admits only once the process-local Fixup backlog
     /// (pending plus running) is below `backlog_watermark`; a zero watermark
     /// holds every non-empty batch. The gate is process-local backpressure and
     /// never a durable or cluster-wide barrier.
@@ -328,7 +330,7 @@ impl RuntimeConfig {
         if in_flight == 0 {
             return Err(Error::invalid_argument());
         }
-        self.import_in_flight_batches = in_flight;
+        self.import_max_in_flight_batches = in_flight;
         self.import_backlog_watermark = backlog_watermark;
         Ok(self)
     }
@@ -362,7 +364,7 @@ impl RuntimeConfig {
             || self.foreground_attempts == 0
             || usize::try_from(self.partition_cache_bytes).is_err()
             || self.tree_key_scan_ranges == 0
-            || self.import_in_flight_batches == 0
+            || self.import_max_in_flight_batches == 0
             || self.import_backlog_watermark > self.fixup_queue_capacity
             || self.retry_initial_backoff.is_zero()
             || self.retry_initial_backoff > self.retry_max_backoff
@@ -421,10 +423,10 @@ impl RuntimeConfig {
         self.tree_key_scan_ranges
     }
 
-    /// Returns the Import Session in-flight batch limit.
+    /// Returns the Import Session adaptive-concurrency ceiling.
     #[must_use]
-    pub const fn import_in_flight_batches(&self) -> usize {
-        self.import_in_flight_batches
+    pub const fn import_max_in_flight_batches(&self) -> usize {
+        self.import_max_in_flight_batches
     }
 
     /// Returns the Import Session backlog watermark set by

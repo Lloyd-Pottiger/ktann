@@ -117,7 +117,7 @@ pub struct Configuration {
     /// Records submitted in each Import Session batch, when applicable.
     pub import_batch_size: Option<usize>,
     /// Maximum concurrently executing Import Session batches, when applicable.
-    pub import_in_flight_batches: Option<usize>,
+    pub import_max_in_flight_batches: Option<usize>,
     /// Fixup backlog watermark gating Import Session submission, when applicable.
     pub import_backlog_watermark: Option<usize>,
 }
@@ -616,6 +616,8 @@ pub struct AdmissionSummary {
     pub blocking_held_ms: Distribution,
     /// Import gate waits, milliseconds, by gate.
     pub import_wait_ms: BTreeMap<String, Distribution>,
+    /// Learned concurrency limit after each adjustment, by direction.
+    pub import_concurrency_limit: BTreeMap<String, Distribution>,
 }
 
 /// Backend-neutral attempted logical KV work.

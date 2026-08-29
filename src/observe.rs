@@ -45,6 +45,7 @@
 //! | `ktann.fixup.state_age` | histogram | kind |
 //! | `ktann.bloom.fill_ratio` | histogram | — |
 //! | `ktann.import.wait` | histogram | gate |
+//! | `ktann.import.concurrency.limit` | histogram | direction |
 //! | `ktann.verify.reports` | counter | outcome |
 //! | `ktann.verify.issues` | counter | kind |
 //!

@@ -73,6 +73,12 @@ struct FixupOffer {
     manifest: Arc<IndexManifest>,
 }
 
+/// Terminal states of one wait on the process-local import backlog gate.
+enum BacklogGate {
+    Open,
+    MaintenanceCancelled,
+}
+
 /// Cumulative, privacy-safe observations of the process-local Fixup queue.
 ///
 /// Counts only; the `ktann.fixup.*` facade series are emitted alongside
@@ -261,23 +267,41 @@ impl<B: Backend> RuntimeInner<B> {
     /// that opens the gate; once the Runtime stops accepting work it fails
     /// with [`ErrorKind::RuntimeClosed`] instead of waiting for the backlog.
     pub(crate) async fn wait_for_backlog_below(&self) -> Result<()> {
+        match self.wait_for_backlog_gate().await {
+            BacklogGate::Open => Ok(()),
+            BacklogGate::MaintenanceCancelled => Err(Error::new(ErrorKind::RuntimeClosed)),
+        }
+    }
+
+    /// Waits for maintenance backpressure before retrying admitted import work.
+    ///
+    /// Shutdown cancels maintenance but must not replace an already-admitted
+    /// foreground operation's real result with `RuntimeClosed`. Once
+    /// maintenance cancellation is visible, the retry proceeds under its
+    /// ordinary bounded policy while Runtime shutdown continues to wait for it.
+    pub(crate) async fn wait_for_backlog_before_retry(&self) {
+        let _ = self.wait_for_backlog_gate().await;
+    }
+
+    /// Waits until the process-local backlog gate opens or maintenance stops.
+    async fn wait_for_backlog_gate(&self) -> BacklogGate {
         let watermark = self.config().import_backlog_watermark();
         loop {
-            // Register the waiter before checking the backlog so a slot
-            // release landing between the check and the wait still wakes us.
+            // Register before checking so a slot release between the check and
+            // await cannot be lost.
             let notified = self.fixup_released.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             if self.lock_fixups().backlog() < watermark {
-                return Ok(());
+                return BacklogGate::Open;
             }
             if self.maintenance_cancel.is_cancelled() {
-                return Err(Error::new(ErrorKind::RuntimeClosed));
+                return BacklogGate::MaintenanceCancelled;
             }
             tokio::select! {
                 biased;
                 () = self.maintenance_cancel.cancelled() => {
-                    return Err(Error::new(ErrorKind::RuntimeClosed));
+                    return BacklogGate::MaintenanceCancelled;
                 }
                 () = notified => {}
             }
