@@ -46,6 +46,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::api::{Error, ErrorKind, Mutation, MutationOutcome, PartitionKey, Record, Result};
 use crate::observe::labels::Operation;
+use crate::runtime::import::ImportPermit;
 use crate::runtime::lifecycle::{RetryPolicy, now_unix_millis};
 use crate::runtime::{OperationContext, writes};
 use crate::search::numeric::VectorKernel;
@@ -87,18 +88,20 @@ pub(crate) async fn mutate<B: Backend>(
     mutations: &[Mutation],
     retry: RetryPolicy,
     operation: Operation,
+    mut import_permit: Option<&mut ImportPermit<B>>,
 ) -> Result<MutationReport> {
     let kernel = routing::kernel_for(handle_manifest)?;
     let prepared = prepare_all(handle_manifest, &kernel, mutations)?;
     let backend = context.backend();
     let mut failed_attempts = 0_u32;
     loop {
-        let outcome = writes::run_write_attempts(
+        let outcome = writes::run_write_attempts_with_optional_import_permit(
             backend.as_ref(),
             Some(&mut *context),
             handle_manifest,
             &retry,
             operation,
+            &mut import_permit,
             |txn| writes::boxed_step(apply_all(txn, &kernel, mutations, &prepared)),
         )
         .await?;
@@ -109,9 +112,13 @@ pub(crate) async fn mutate<B: Backend>(
             // retries from a fresh snapshot under the bounded policy, and
             // exhaustion returns ContentionExhausted (ADR 0008).
             ApplyOutcome::NoReadyMergeTarget => {
-                retry
-                    .wait_or_exhaust(operation, &mut failed_attempts)
-                    .await?;
+                writes::wait_before_retry(
+                    &retry,
+                    operation,
+                    &mut failed_attempts,
+                    &mut import_permit,
+                )
+                .await?;
             }
         }
     }

@@ -33,7 +33,7 @@ use crate::resource::ResourceSnapshot;
 )]
 mod oracle;
 
-/// Queue capacity keeps the default Import backlog watermark valid.
+/// Queue capacity for demand-driven Structure Maintenance.
 const FIXUP_QUEUE_CAPACITY: usize = 1_024;
 /// Workers used after import diagnostics to converge persistent topology.
 const CONVERGENCE_MAINTENANCE_WORKERS: usize = 2;
@@ -95,8 +95,8 @@ pub struct ScenarioSpec {
     pub lifecycle: bool,
     /// Records per Import Session batch in a lifecycle scenario.
     pub import_batch_size: usize,
-    /// Explicit Import Session in-flight batch limit.
-    pub import_in_flight_batches: usize,
+    /// Explicit Import Session maximum accepted-batch ceiling.
+    pub import_max_in_flight_batches: usize,
     /// Explicit Runtime Fixup backlog watermark for Import Session admission.
     pub import_backlog_watermark: usize,
     /// Background Structure Maintenance workers.
@@ -142,8 +142,8 @@ fn smoke_scenarios() -> Vec<ScenarioSpec> {
         max_partition_entries: 32,
         lifecycle: false,
         import_batch_size: 32,
-        import_in_flight_batches: 2,
-        import_backlog_watermark: 512,
+        import_max_in_flight_batches: 2,
+        import_backlog_watermark: 2,
         maintenance_workers: 2,
     };
     vec![
@@ -218,8 +218,8 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
         max_partition_entries: 128,
         lifecycle: false,
         import_batch_size: 50,
-        import_in_flight_batches: 4,
-        import_backlog_watermark: 512,
+        import_max_in_flight_batches: 4,
+        import_backlog_watermark: 2,
         maintenance_workers: 2,
     };
     let clustered = ann("ann-clustered", "clustered", 5_000, 100, 128, 0x38_1001);
@@ -282,9 +282,9 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
             hot_updates: false,
             blocking_resource_limit: None,
             dispatch: WorkloadDispatch::Continuous,
-            // Keep one batch active so the fixed corpus is fully imported
-            // while Structure Maintenance competes for the same partitions.
-            import_in_flight_batches: 1,
+            // Adaptive admission starts at one and may probe up to four
+            // concurrent batches after sustained conflict-free completions.
+            import_max_in_flight_batches: 4,
             ..clustered.clone()
         },
     ]
@@ -395,7 +395,9 @@ pub async fn run_scenario<B: Backend>(
             measured_operations: spec.measured_operations,
             k: spec.k,
             import_batch_size: spec.lifecycle.then_some(spec.import_batch_size),
-            import_in_flight_batches: spec.lifecycle.then_some(spec.import_in_flight_batches),
+            import_max_in_flight_batches: spec
+                .lifecycle
+                .then_some(spec.import_max_in_flight_batches),
             import_backlog_watermark: spec.lifecycle.then_some(spec.import_backlog_watermark),
         },
         dataset: dataset.metadata,
@@ -419,7 +421,10 @@ fn runtime_config(
         .and_then(|config| config.with_partition_cache_bytes(spec.partition_cache_bytes));
     let config = if spec.lifecycle {
         config.and_then(|config| {
-            config.with_import_limits(spec.import_in_flight_batches, spec.import_backlog_watermark)
+            config.with_import_limits(
+                spec.import_max_in_flight_batches,
+                spec.import_backlog_watermark,
+            )
         })
     } else {
         config
@@ -482,7 +487,7 @@ async fn run_lifecycle_case<B: Backend>(
     let truths = exact_truth(dataset, spec.k);
     let requests = lifecycle_requests(dataset, spec)?;
     let import_options = ImportOptions::default()
-        .with_in_flight_batches(spec.import_in_flight_batches)
+        .with_max_in_flight_batches(spec.import_max_in_flight_batches)
         .map_err(|error| error_at("configure Import Session", error))?;
     let import_session = index
         .import_session(import_options)

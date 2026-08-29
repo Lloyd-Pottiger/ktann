@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use ktann::api::{
-    DataType, ErrorKind, FieldId, FieldSchema, GetOptions, ImportOptions, Index, IndexConfig,
-    Metric, Mutation, MutationOutcome, Record, RuntimeConfig, SearchRequest, Value,
+    DataType, ErrorKind, FieldId, FieldSchema, GetOptions, ImportOptions, ImportSession, Index,
+    IndexConfig, Metric, Mutation, MutationOutcome, Record, RuntimeConfig, SearchRequest, Value,
 };
 use ktann::runtime::Runtime;
 use ktann::storage::backend::{
@@ -18,7 +18,7 @@ use ktann::storage::keys::KeyRange;
 use ktann::storage::values::PartitionState;
 
 use support::{
-    CommitFault, DeterministicBackend, DeterministicConfig, DeterministicReadTxn,
+    CommitFault, CommitOutcome, DeterministicBackend, DeterministicConfig, DeterministicReadTxn,
     DeterministicWriteTxn, audit,
 };
 
@@ -89,6 +89,12 @@ impl CommitGate {
     /// Releases every held commit.
     fn release(&self) {
         self.released.store(usize::MAX, Ordering::SeqCst);
+    }
+
+    /// Releases commits that have already entered while keeping later holds usable.
+    fn release_entered(&self) {
+        self.released
+            .store(self.entered.load(Ordering::SeqCst), Ordering::SeqCst);
     }
 
     /// Releases exactly the earliest entered held commit.
@@ -280,8 +286,47 @@ async fn setup_with_index(
 
 fn import_options(in_flight: usize) -> ImportOptions {
     ImportOptions::default()
-        .with_in_flight_batches(in_flight)
-        .expect("positive in-flight limit")
+        .with_max_in_flight_batches(in_flight)
+        .expect("positive maximum in-flight limit")
+}
+
+/// Keeps a limit-one session saturated for the controller's initial clean
+/// window, then waits for the final warmup batch to finish at limit two.
+async fn warm_import_concurrency(
+    session: &mut ImportSession<GatedBackend>,
+    gate: &CommitGate,
+    index: &Index<GatedBackend>,
+    first_value: u8,
+) {
+    const INITIAL_CLEAN_WINDOW: u8 = 8;
+
+    let first_entry = gate.entered.load(Ordering::SeqCst) + 1;
+    gate.hold_next(1);
+    session
+        .submit(insert(
+            &rid(first_value),
+            f32::from(first_value),
+            i64::from(first_value),
+        ))
+        .await
+        .expect("first warmup submit");
+    gate.wait_until_entered(first_entry).await;
+
+    for offset in 1..=INITIAL_CLEAN_WINDOW {
+        let value = first_value + offset;
+        gate.hold_next(1);
+        let mut next =
+            std::pin::pin!(
+                session.submit(insert(&rid(value), f32::from(value), i64::from(value),))
+            );
+        assert_submit_pending(&mut next, "warmup must maintain admission demand").await;
+        gate.release_one();
+        next.await.expect("demanded warmup submit");
+        gate.wait_until_entered(first_entry + usize::from(offset))
+            .await;
+    }
+    gate.release_one();
+    wait_until_present(index, &rid(first_value + INITIAL_CLEAN_WINDOW)).await;
 }
 
 async fn wait_until_present(index: &Index<GatedBackend>, id: &[u8]) {
@@ -296,6 +341,26 @@ async fn wait_until_present(index: &Index<GatedBackend>, id: &[u8]) {
             break;
         }
         assert!(Instant::now() < deadline, "the record never became visible");
+        tokio::task::yield_now().await;
+    }
+}
+
+fn aborted_commit_count(backend: &GatedBackend) -> usize {
+    backend
+        .inner
+        .history()
+        .iter()
+        .filter(|entry| entry.outcome == CommitOutcome::Aborted)
+        .count()
+}
+
+async fn wait_for_aborted_commits(backend: &GatedBackend, expected: usize) {
+    let deadline = Instant::now() + WAIT_TIMEOUT;
+    loop {
+        if aborted_commit_count(backend) >= expected {
+            return;
+        }
+        assert!(Instant::now() < deadline, "commit aborts were not observed");
         tokio::task::yield_now().await;
     }
 }
@@ -362,12 +427,15 @@ async fn out_of_order_completion_preserves_submission_order() {
     let (_backend, gate, runtime, index) = setup().await;
     let mut session = index.import_session(import_options(2)).expect("session");
 
+    warm_import_concurrency(&mut session, &gate, &index, 20).await;
+
+    let held_entry = gate.entered.load(Ordering::SeqCst) + 1;
     gate.hold_next(1);
     let token1 = session
         .submit(insert(&rid(1), 1.0, 1))
         .await
         .expect("submit 1");
-    gate.wait_until_entered(1).await;
+    gate.wait_until_entered(held_entry).await;
 
     let token2 = session
         .submit(insert(&rid(2), 2.0, 2))
@@ -379,9 +447,16 @@ async fn out_of_order_completion_preserves_submission_order() {
 
     gate.release();
     let results = session.finish().await;
-    assert_eq!(results.len(), 2);
-    assert_eq!(results[0].token, token1);
-    assert_eq!(results[1].token, token2);
+    assert_eq!(results.len(), 11);
+    let token1_position = results
+        .iter()
+        .position(|entry| entry.token == token1)
+        .expect("batch 1 has an outcome");
+    let token2_position = results
+        .iter()
+        .position(|entry| entry.token == token2)
+        .expect("batch 2 has an outcome");
+    assert!(token1_position < token2_position);
     for entry in &results {
         assert_eq!(
             entry.result.as_ref().expect("batch commits").as_slice(),
@@ -486,6 +561,208 @@ async fn in_flight_limit_bounds_concurrent_commits() {
             &[MutationOutcome::Inserted]
         );
     }
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_concurrency_grows_after_clean_work_and_contracts_on_contention() {
+    let (_backend, gate, runtime, index) = setup().await;
+    let mut session = index.import_session(import_options(2)).expect("session");
+
+    // Sustained demand across clean, disjoint Tree Keys earns a probe at two.
+    warm_import_concurrency(&mut session, &gate, &index, 0).await;
+
+    // Both same-leaf batches reach commit concurrently, proving the learned
+    // limit grew to two. Their conflict then contracts the session to one.
+    let first_contender = gate.entered.load(Ordering::SeqCst) + 1;
+    gate.hold_next(2);
+    session
+        .submit(insert(&rid(9), 9.0, 0))
+        .await
+        .expect("first contending submit");
+    gate.wait_until_entered(first_contender).await;
+    session
+        .submit(insert(&rid(10), 10.0, 0))
+        .await
+        .expect("second contending submit");
+    gate.wait_until_entered(first_contender + 1).await;
+    gate.release_entered();
+    wait_until_present(&index, &rid(9)).await;
+    wait_until_present(&index, &rid(10)).await;
+
+    // After the retryable conflict, only one new batch may run. The next
+    // clean window must be earned before the controller probes two again.
+    gate.hold_next(1);
+    session
+        .submit(insert(&rid(11), 11.0, 11))
+        .await
+        .expect("serial submit");
+    gate.wait_until_entered(first_contender + 2).await;
+    let token = {
+        let mut next = std::pin::pin!(session.submit(insert(&rid(12), 12.0, 12)));
+        assert_submit_pending(
+            &mut next,
+            "contention must contract the learned concurrency to one",
+        )
+        .await;
+        assert_eq!(gate.entered.load(Ordering::SeqCst), first_contender + 2);
+        gate.release();
+        next.await.expect("submit after contracted slot opens")
+    };
+    assert_eq!(token.get(), 13);
+
+    let results = session.finish().await;
+    assert_eq!(results.len(), 13);
+    assert!(results.iter().all(|entry| entry.result.is_ok()));
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serial_clean_work_does_not_raise_import_concurrency() {
+    let (_backend, gate, runtime, index) = setup().await;
+    let mut session = index.import_session(import_options(2)).expect("session");
+
+    // Clean completions without a waiting submission do not demonstrate that
+    // overlapping writes are useful, regardless of how long they continue.
+    for value in 0..16_u8 {
+        session
+            .submit(insert(&rid(value), f32::from(value), i64::from(value)))
+            .await
+            .expect("serial submit");
+        wait_until_present(&index, &rid(value)).await;
+    }
+
+    let held_entry = gate.entered.load(Ordering::SeqCst) + 1;
+    gate.hold_next(1);
+    session
+        .submit(insert(&rid(16), 16.0, 16))
+        .await
+        .expect("held serial submit");
+    gate.wait_until_entered(held_entry).await;
+
+    {
+        let mut next = std::pin::pin!(session.submit(insert(&rid(17), 17.0, 17)));
+        assert_submit_pending(
+            &mut next,
+            "unsaturated clean work must leave the learned limit at one",
+        )
+        .await;
+        gate.release();
+        next.await.expect("submit after the serial slot opens");
+    }
+
+    let results = session.finish().await;
+    assert_eq!(results.len(), 18);
+    assert!(results.iter().all(|entry| entry.result.is_ok()));
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_contention_still_contracts_import_concurrency() {
+    let runtime_config = RuntimeConfig::default()
+        .with_attempts(2, 1)
+        .expect("one foreground attempt");
+    let (backend, gate, runtime, index) = setup_with(runtime_config).await;
+    let mut session = index.import_session(import_options(2)).expect("session");
+    warm_import_concurrency(&mut session, &gate, &index, 0).await;
+
+    let aborted_before = aborted_commit_count(&backend);
+    let first_contender = gate.entered.load(Ordering::SeqCst) + 1;
+    gate.hold_next(2);
+    session
+        .submit(insert(&rid(9), 9.0, 0))
+        .await
+        .expect("first contending submit");
+    gate.wait_until_entered(first_contender).await;
+    session
+        .submit(insert(&rid(10), 10.0, 0))
+        .await
+        .expect("second contending submit");
+    gate.wait_until_entered(first_contender + 1).await;
+    gate.release_entered();
+    wait_for_aborted_commits(&backend, aborted_before + 1).await;
+
+    let held_entry = gate.entered.load(Ordering::SeqCst) + 1;
+    gate.hold_next(1);
+    session
+        .submit(insert(&rid(11), 11.0, 11))
+        .await
+        .expect("submit after terminal contention");
+    gate.wait_until_entered(held_entry).await;
+    {
+        let mut next = std::pin::pin!(session.submit(insert(&rid(12), 12.0, 12)));
+        assert_submit_pending(
+            &mut next,
+            "terminal contention must contract the next admission window",
+        )
+        .await;
+        gate.release();
+        next.await.expect("submit after contracted slot opens");
+    }
+
+    let results = session.finish().await;
+    assert_eq!(results.len(), 13);
+    let failures = results
+        .iter()
+        .filter_map(|entry| entry.result.as_ref().err())
+        .collect::<Vec<_>>();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].kind(), ErrorKind::ContentionExhausted);
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retry_waiters_retain_the_ceiling_and_precede_new_submissions() {
+    let runtime_config = RuntimeConfig::default()
+        .with_retry_backoff(Duration::from_millis(100), Duration::from_millis(100))
+        .expect("fixed retry backoff");
+    let (backend, gate, runtime, index) = setup_with(runtime_config).await;
+    let mut session = index.import_session(import_options(2)).expect("session");
+    warm_import_concurrency(&mut session, &gate, &index, 0).await;
+
+    let aborted_before = aborted_commit_count(&backend);
+    backend
+        .inner
+        .push_fault(CommitFault::Abort)
+        .and_then(|()| backend.inner.push_fault(CommitFault::Abort))
+        .expect("two retryable commit faults");
+
+    let first_attempt = gate.entered.load(Ordering::SeqCst) + 1;
+    gate.hold_next(4);
+    session
+        .submit(insert(&rid(30), 30.0, 30))
+        .await
+        .expect("first faulted submit");
+    gate.wait_until_entered(first_attempt).await;
+    session
+        .submit(insert(&rid(31), 31.0, 31))
+        .await
+        .expect("second faulted submit");
+    gate.wait_until_entered(first_attempt + 1).await;
+    gate.release_entered();
+    wait_for_aborted_commits(&backend, aborted_before + 2).await;
+
+    {
+        let mut next = std::pin::pin!(session.submit(insert(&rid(32), 32.0, 32)));
+        assert_submit_pending(
+            &mut next,
+            "paused accepted batches retain the configured ceiling",
+        )
+        .await;
+
+        gate.wait_until_entered(first_attempt + 2).await;
+        assert_submit_pending(&mut next, "the first retry must precede a new submission").await;
+        gate.release_one();
+
+        gate.wait_until_entered(first_attempt + 3).await;
+        assert_submit_pending(&mut next, "every retry waiter precedes a new submission").await;
+        gate.release();
+        next.await.expect("submit after both retry waiters finish");
+    }
+
+    let results = session.finish().await;
+    assert_eq!(results.len(), 12);
+    assert!(results.iter().all(|entry| entry.result.is_ok()));
     runtime.shutdown().await.expect("shutdown");
 }
 
@@ -624,16 +901,19 @@ async fn shutdown_waits_for_admitted_batches_and_cancels_queued_ones() {
     let (_backend, gate, runtime, index) = setup_with(runtime_config).await;
     let mut session = index.import_session(import_options(2)).expect("session");
 
+    warm_import_concurrency(&mut session, &gate, &index, 20).await;
+
     // Batch 1 holds the only foreground permit inside the commit gate; batch 2
     // is admitted by the session but queues behind foreground admission.
     // Hold every commit attempt in this test until released.
+    let held_entry = gate.entered.load(Ordering::SeqCst) + 1;
     gate.hold_next(64);
-    session
+    let token1 = session
         .submit(insert(&rid(1), 1.0, 1))
         .await
         .expect("submit 1");
-    gate.wait_until_entered(1).await;
-    session
+    gate.wait_until_entered(held_entry).await;
+    let token2 = session
         .submit(insert(&rid(2), 2.0, 2))
         .await
         .expect("submit 2");
@@ -673,16 +953,24 @@ async fn shutdown_waits_for_admitted_batches_and_cancels_queued_ones() {
     gate.release();
 
     let results = session.finish().await;
-    assert_eq!(results.len(), 2);
+    assert_eq!(results.len(), 11);
+    let admitted = results
+        .iter()
+        .find(|entry| entry.token == token1)
+        .expect("the admitted token has an outcome");
     assert_eq!(
-        results[0]
+        admitted
             .result
             .as_ref()
             .expect("an admitted batch keeps its real result")
             .as_slice(),
         &[MutationOutcome::Inserted]
     );
-    let error = results[1]
+    let queued = results
+        .iter()
+        .find(|entry| entry.token == token2)
+        .expect("the queued token has an outcome");
+    let error = queued
         .result
         .as_ref()
         .expect_err("the queued batch never began");

@@ -21,8 +21,10 @@ state.
 
 For controlled `import-to-search-lifecycle` diagnostics,
 `--maintenance-workers N` overrides the import Runtime's Structure Maintenance
-worker count (including zero), and `--import-in-flight-batches N` overrides the
-positive Import Session in-flight limit. After immediate search, the runner
+worker count (including zero), `--import-max-in-flight-batches N` overrides the
+positive Import Session concurrency ceiling, `--import-batch-size N` overrides the
+positive records per atomic batch, and `--import-backlog-watermark N` overrides
+the positive process-local Fixup backlog gate. After immediate search, the runner
 reopens the same index with the profile's
 `convergence_maintenance_workers` count so an import-only run can still reach
 the stable search phases. These options require explicitly selecting that
@@ -279,3 +281,57 @@ recall@10 of 1.0 in immediate, stable-cold, and stable-warm search, and had no
 Search Budget truncation. The three-run result therefore validates lower
 whole-system work and latency without trading away the scenario's correctness
 or recall contract.
+
+### Adaptive import admission validation
+
+Adaptive import admission uses observed write contention rather than raw
+partition count: an atomic batch may update many leaves, skew can keep one leaf
+hot in a large tree, and concurrent Structure Maintenance can conflict while
+the process-local queue is nearly empty. `ImportSession` treats its configured
+maximum in-flight value as a ceiling. It starts at one, cautiously probes higher
+concurrency after saturated clean completion windows, and contracts before
+retrying a contended batch. The default backlog watermark is two, allowing one
+pending or running Fixup to coexist with import before new admission pauses.
+Submitted batches remain indivisible atomic operations.
+
+The complete batch-size, concurrency-ceiling, maintenance-worker, and backlog
+watermark matrix, including three-run variance, logical Backend IO, Fixup work,
+convergence, and rejected configurations, is recorded in
+[`issue-134-calibration.md`](issue-134-calibration.md).
+
+Three interleaved same-host full SIFTsmall runs on 2026-08-29 compared revision
+`ca5b00b` with fixed concurrency one and backlog watermark 512 against adaptive
+admission with a ceiling of four and backlog watermark two. Both sides used
+50-record batches and two maintenance workers. Every run accepted 10,000 of
+10,000 records, converged to 442 partitions, shut down cleanly, and reported
+mean and minimum recall@10 of 1.0 in immediate, stable-cold, and stable-warm
+search without Search Budget exhaustion. Reproduce the adaptive side with the
+RocksDB and FoundationDB commands above plus these arguments, using a distinct
+output path for each run:
+
+```text
+--import-max-in-flight-batches 4 --import-batch-size 50 \
+  --import-backlog-watermark 2 --output REPORT.json
+```
+
+| Backend | Measurement | Fixed mean | Adaptive mean | Change |
+| --- | --- | ---: | ---: | ---: |
+| RocksDB | Case wall seconds | 4.900 | 4.470 | -8.8% |
+| RocksDB | Import wall seconds | 2.773 | 2.418 | -12.8% |
+| RocksDB | Import CPU seconds | 4.677 | 3.798 | -18.8% |
+| RocksDB | Retryable commits | 217.3 | 165.7 | -23.8% |
+| RocksDB | Mutation operations | 126,443 | 117,060 | -7.4% |
+| RocksDB | p95 submit latency ms | 34.8 | 28.2 | -18.8% |
+| FoundationDB | Case wall seconds | 24.780 | 24.333 | -1.8% |
+| FoundationDB | Import wall seconds | 19.584 | 19.317 | -1.4% |
+| FoundationDB | Import CPU seconds | 7.078 | 6.510 | -8.0% |
+| FoundationDB | Retryable commits | 289.3 | 231.0 | -20.2% |
+| FoundationDB | Mutation operations | 134,606 | 125,245 | -7.0% |
+| FoundationDB | p95 submit latency ms | 210.1 | 205.8 | -2.0% |
+
+The single-Tree-Key corpus supported one probe of concurrency two, observed
+contention, and returned to one. Adaptive admission therefore reduced CPU,
+retryable commits, and mutation work without changing recall or forcing unsafe
+concurrency. Wall time and p95 submit latency remained close to the fixed
+baseline rather than improving uniformly. Callers choose batch size from their
+transaction, latency, and atomicity requirements rather than from tree size.

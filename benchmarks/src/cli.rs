@@ -17,6 +17,8 @@ use crate::compare::{self, ComparisonPolicy};
 use crate::report::{BenchmarkReport, BenchmarkSuite};
 use crate::runner::{self, ScenarioSpec};
 
+const IMPORT_LIFECYCLE_SCENARIO: &str = "import-to-search-lifecycle";
+
 /// Parses and executes one `ktann-bench` command.
 ///
 /// # Errors
@@ -59,10 +61,8 @@ struct RunOptions {
     output: Option<PathBuf>,
     /// Tokio execution threads created independently in every worker.
     worker_threads: usize,
-    /// Optional lifecycle-only Structure Maintenance worker override.
-    maintenance_workers: Option<usize>,
-    /// Optional lifecycle-only Import Session in-flight override.
-    import_in_flight_batches: Option<usize>,
+    /// Diagnostic overrides for the import lifecycle scenario.
+    lifecycle: LifecycleOverrides,
 }
 
 #[derive(Clone, Debug)]
@@ -78,10 +78,75 @@ struct WorkerOptions {
     reproduction_command: String,
     /// Tokio execution threads for the isolated worker runtime.
     worker_threads: usize,
-    /// Lifecycle-only Structure Maintenance worker override.
+    /// Diagnostic overrides for the import lifecycle scenario.
+    lifecycle: LifecycleOverrides,
+}
+
+/// Optional diagnostic bounds for the import lifecycle scenario.
+#[derive(Clone, Debug, Default)]
+struct LifecycleOverrides {
     maintenance_workers: Option<usize>,
-    /// Lifecycle-only Import Session in-flight override.
-    import_in_flight_batches: Option<usize>,
+    max_in_flight_batches: Option<usize>,
+    batch_size: Option<usize>,
+    backlog_watermark: Option<usize>,
+}
+
+impl LifecycleOverrides {
+    fn parse(values: &std::collections::BTreeMap<String, String>) -> Result<Self, String> {
+        Ok(Self {
+            maintenance_workers: values
+                .get("maintenance-workers")
+                .map(|value| parse_nonnegative(value, "maintenance-workers"))
+                .transpose()?,
+            max_in_flight_batches: values
+                .get("import-max-in-flight-batches")
+                .map(|value| parse_positive(value, "import-max-in-flight-batches"))
+                .transpose()?,
+            batch_size: values
+                .get("import-batch-size")
+                .map(|value| parse_positive(value, "import-batch-size"))
+                .transpose()?,
+            backlog_watermark: values
+                .get("import-backlog-watermark")
+                .map(|value| parse_positive(value, "import-backlog-watermark"))
+                .transpose()?,
+        })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.maintenance_workers.is_none()
+            && self.max_in_flight_batches.is_none()
+            && self.batch_size.is_none()
+            && self.backlog_watermark.is_none()
+    }
+
+    fn append_args(&self, command: &mut Command) {
+        for (name, value) in [
+            ("maintenance-workers", self.maintenance_workers),
+            ("import-max-in-flight-batches", self.max_in_flight_batches),
+            ("import-batch-size", self.batch_size),
+            ("import-backlog-watermark", self.backlog_watermark),
+        ] {
+            if let Some(value) = value {
+                command.args([format!("--{name}"), value.to_string()]);
+            }
+        }
+    }
+
+    fn apply(&self, scenario: &mut ScenarioSpec) {
+        if let Some(workers) = self.maintenance_workers {
+            scenario.maintenance_workers = workers;
+        }
+        if let Some(maximum) = self.max_in_flight_batches {
+            scenario.import_max_in_flight_batches = maximum;
+        }
+        if let Some(batch_size) = self.batch_size {
+            scenario.import_batch_size = batch_size;
+        }
+        if let Some(watermark) = self.backlog_watermark {
+            scenario.import_backlog_watermark = watermark;
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -112,7 +177,9 @@ fn parse_run_options(arguments: &[OsString]) -> Result<RunOptions, String> {
             "output",
             "worker-threads",
             "maintenance-workers",
-            "import-in-flight-batches",
+            "import-max-in-flight-batches",
+            "import-batch-size",
+            "import-backlog-watermark",
         ],
     )?;
     let backend = required(&values, "backend")?;
@@ -129,17 +196,8 @@ fn parse_run_options(arguments: &[OsString]) -> Result<RunOptions, String> {
             parse_positive(value, "worker-threads")
         })?;
     let scenario = values.get("scenario").cloned();
-    let maintenance_workers = values
-        .get("maintenance-workers")
-        .map(|value| parse_nonnegative(value, "maintenance-workers"))
-        .transpose()?;
-    let import_in_flight_batches = values
-        .get("import-in-flight-batches")
-        .map(|value| parse_positive(value, "import-in-flight-batches"))
-        .transpose()?;
-    if (maintenance_workers.is_some() || import_in_flight_batches.is_some())
-        && scenario.as_deref() != Some("import-to-search-lifecycle")
-    {
+    let lifecycle = LifecycleOverrides::parse(&values)?;
+    if !lifecycle.is_empty() && scenario.as_deref() != Some(IMPORT_LIFECYCLE_SCENARIO) {
         return Err("lifecycle overrides require --scenario import-to-search-lifecycle".to_owned());
     }
     Ok(RunOptions {
@@ -148,8 +206,7 @@ fn parse_run_options(arguments: &[OsString]) -> Result<RunOptions, String> {
         scenario,
         output: values.get("output").map(PathBuf::from),
         worker_threads,
-        maintenance_workers,
-        import_in_flight_batches,
+        lifecycle,
     })
 }
 
@@ -164,7 +221,9 @@ fn parse_worker_options(arguments: &[OsString]) -> Result<WorkerOptions, String>
             "reproduction-command",
             "worker-threads",
             "maintenance-workers",
-            "import-in-flight-batches",
+            "import-max-in-flight-batches",
+            "import-batch-size",
+            "import-backlog-watermark",
         ],
     )?;
     Ok(WorkerOptions {
@@ -177,14 +236,7 @@ fn parse_worker_options(arguments: &[OsString]) -> Result<WorkerOptions, String>
             .map_or_else(default_worker_threads, |value| {
                 parse_positive(value, "worker-threads")
             })?,
-        maintenance_workers: values
-            .get("maintenance-workers")
-            .map(|value| parse_nonnegative(value, "maintenance-workers"))
-            .transpose()?,
-        import_in_flight_batches: values
-            .get("import-in-flight-batches")
-            .map(|value| parse_positive(value, "import-in-flight-batches"))
-            .transpose()?,
+        lifecycle: LifecycleOverrides::parse(&values)?,
     })
 }
 
@@ -329,12 +381,7 @@ fn run_suite(options: RunOptions) -> Result<(), String> {
             .args(["--scenario", scenario.name])
             .args(["--reproduction-command", &reproduction_command])
             .args(["--worker-threads", &options.worker_threads.to_string()]);
-        if let Some(workers) = options.maintenance_workers {
-            command.args(["--maintenance-workers", &workers.to_string()]);
-        }
-        if let Some(in_flight) = options.import_in_flight_batches {
-            command.args(["--import-in-flight-batches", &in_flight.to_string()]);
-        }
+        options.lifecycle.append_args(&mut command);
         let output = command
             .output()
             .map_err(|error| format!("start scenario {}: {error}", scenario.name))?;
@@ -362,12 +409,7 @@ fn run_worker(options: WorkerOptions) -> Result<(), String> {
         .into_iter()
         .find(|scenario| scenario.name == options.scenario)
         .ok_or_else(|| format!("unknown scenario `{}`", options.scenario))?;
-    if let Some(workers) = options.maintenance_workers {
-        scenario.maintenance_workers = workers;
-    }
-    if let Some(in_flight) = options.import_in_flight_batches {
-        scenario.import_in_flight_batches = in_flight;
-    }
+    options.lifecycle.apply(&mut scenario);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(options.worker_threads)
         .enable_all()
@@ -668,7 +710,7 @@ fn shell_quote(value: &OsStr) -> String {
 
 /// Returns the stable help shown for missing or unknown public commands.
 fn usage() -> String {
-    "usage:\n  ktann-bench run --backend rocksdb|foundationdb [--profile smoke|full] [--scenario NAME] [--worker-threads N] [--maintenance-workers N] [--import-in-flight-batches N] [--output PATH]\n  ktann-bench compare --baseline PATH --candidate PATH [--maximum-relative-regression N] [--maximum-recall-drop N] [--maximum-rejection-rate-increase N] [--output PATH]".to_owned()
+    "usage:\n  ktann-bench run --backend rocksdb|foundationdb [--profile smoke|full] [--scenario NAME] [--worker-threads N] [--maintenance-workers N] [--import-max-in-flight-batches N] [--import-batch-size N] [--import-backlog-watermark N] [--output PATH]\n  ktann-bench compare --baseline PATH --candidate PATH [--maximum-relative-regression N] [--maximum-recall-drop N] [--maximum-rejection-rate-increase N] [--output PATH]".to_owned()
 }
 
 #[cfg(test)]
@@ -684,13 +726,19 @@ mod tests {
             "import-to-search-lifecycle",
             "--maintenance-workers",
             "0",
-            "--import-in-flight-batches",
+            "--import-max-in-flight-batches",
             "4",
+            "--import-batch-size",
+            "25",
+            "--import-backlog-watermark",
+            "1",
         ]
         .map(std::ffi::OsString::from);
         let options = parse_run_options(&arguments).expect("valid lifecycle overrides");
-        assert_eq!(options.maintenance_workers, Some(0));
-        assert_eq!(options.import_in_flight_batches, Some(4));
+        assert_eq!(options.lifecycle.maintenance_workers, Some(0));
+        assert_eq!(options.lifecycle.max_in_flight_batches, Some(4));
+        assert_eq!(options.lifecycle.batch_size, Some(25));
+        assert_eq!(options.lifecycle.backlog_watermark, Some(1));
     }
 
     #[test]

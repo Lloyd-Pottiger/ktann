@@ -26,6 +26,8 @@ pub(crate) mod key {
     pub(crate) const KIND: &str = "kind";
     /// One Import Session admission gate.
     pub(crate) const GATE: &str = "gate";
+    /// One adaptive-control direction.
+    pub(crate) const DIRECTION: &str = "direction";
 }
 
 /// One measured search stage (key `stage`).
@@ -387,6 +389,25 @@ impl ImportGate {
         match self {
             Self::InFlightSlot => "in_flight_slot",
             Self::Backlog => "backlog",
+        }
+    }
+}
+
+/// One adaptive Import Session concurrency change (key `direction`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ImportConcurrencyAdjustment {
+    /// A clean completion window admitted one more concurrent batch.
+    Increased,
+    /// Retryable contention contracted the active batch window.
+    Decreased,
+}
+
+impl ImportConcurrencyAdjustment {
+    /// The bounded label value.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Increased => "increased",
+            Self::Decreased => "decreased",
         }
     }
 }

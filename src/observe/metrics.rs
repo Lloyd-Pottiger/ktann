@@ -11,8 +11,9 @@ use crate::search::cache::PartitionKind;
 
 use super::labels::{
     BudgetDimension, CacheInstallResult, CacheLookupResult, FixupAdmission, FixupExecution,
-    FixupKind, FixupStepResult, ImportGate, Operation, OperationOutcome, SearchStage,
-    VerifyCompletion, WriteAttemptOutcome, cache_level, key, verify_issue,
+    FixupKind, FixupStepResult, ImportConcurrencyAdjustment, ImportGate, Operation,
+    OperationOutcome, SearchStage, VerifyCompletion, WriteAttemptOutcome, cache_level, key,
+    verify_issue,
 };
 
 /// The metric names of the `ktann.*` namespace; the inventory table in
@@ -40,6 +41,7 @@ pub(crate) mod names {
     pub(crate) const FIXUP_STATE_AGE: &str = "ktann.fixup.state_age";
     pub(crate) const BLOOM_FILL_RATIO: &str = "ktann.bloom.fill_ratio";
     pub(crate) const IMPORT_WAIT: &str = "ktann.import.wait";
+    pub(crate) const IMPORT_CONCURRENCY_LIMIT: &str = "ktann.import.concurrency.limit";
     pub(crate) const VERIFY_REPORTS: &str = "ktann.verify.reports";
     pub(crate) const VERIFY_ISSUES: &str = "ktann.verify.issues";
 }
@@ -240,6 +242,15 @@ pub(crate) fn import_wait(gate: ImportGate, duration: Duration) {
         .record(duration.as_secs_f64());
 }
 
+/// Records one learned Import Session concurrency change and its new limit.
+pub(crate) fn import_concurrency_adjusted(adjustment: ImportConcurrencyAdjustment, limit: usize) {
+    metrics::histogram!(
+        names::IMPORT_CONCURRENCY_LIMIT,
+        key::DIRECTION => adjustment.as_str(),
+    )
+    .record(limit as f64);
+}
+
 /// Records one verification report's completeness and per-kind issue counts.
 pub(crate) fn verify_report(report: &VerifyReport) {
     let completion = if report.complete {
@@ -314,6 +325,7 @@ mod tests {
             fixup_state_age(FixupKind::Split, 7_000, 1_000);
             bloom_fill_ratio(0.25);
             import_wait(ImportGate::Backlog, Duration::from_millis(2));
+            import_concurrency_adjusted(ImportConcurrencyAdjustment::Increased, 2);
             verify_report(&VerifyReport {
                 complete: false,
                 issues: vec![VerifyIssue {
@@ -362,6 +374,7 @@ mod tests {
             names::FIXUP_STATE_AGE,
             names::BLOOM_FILL_RATIO,
             names::IMPORT_WAIT,
+            names::IMPORT_CONCURRENCY_LIMIT,
             names::VERIFY_REPORTS,
             names::VERIFY_ISSUES,
         ] {

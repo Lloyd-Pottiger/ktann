@@ -7,20 +7,26 @@ use crate::storage::backend::Backend;
 
 use super::{BatchToken, ImportBatchResult, Index, Mutation, Result};
 
-/// A non-cloneable process-local coordinator that submits bounded waves of
-/// ordinary atomic mutation batches into one Index.
+/// A non-cloneable process-local coordinator that submits adaptive bounded
+/// waves of ordinary atomic mutation batches into one Index.
 ///
-/// `submit` applies ordinary batch validation, waits for an in-flight slot
-/// and the Runtime's Structure Maintenance backlog gate, admits exactly one
+/// `submit` applies ordinary batch validation, waits for an adaptive
+/// concurrency slot and the Runtime's Structure Maintenance backlog gate, admits exactly one
 /// ordinary atomic mutation operation, and returns a process-local
 /// [`BatchToken`]. The
 /// gate pauses admission while the process-local Fixup backlog is at or above
 /// the configured watermark; it is process-local backpressure, never a durable
 /// or cluster-wide barrier. Tokens are monotonically increasing within
-/// the session and have no persistent or transaction identity. Accepted
-/// batches may execute concurrently within the session's in-flight bound and
+/// the session and have no persistent or transaction identity. Each session
+/// starts with one active batch. Sustained clean completions cautiously raise
+/// concurrency to its configured ceiling; a retryable conflict contracts it
+/// before the affected whole operation retries. This observes actual write
+/// overlap without scanning or persisting a partition count. Accepted batches
+/// may execute concurrently within the learned bound and
 /// behave exactly like [`Index::batch_mutate`]: the same atomicity, retry,
 /// error, and maintenance behavior.
+/// The session never splits or combines submitted batches: the caller-chosen
+/// `Vec<Mutation>` remains one atomic operation, while only concurrency adapts.
 ///
 /// `finish` closes admission, waits for every accepted batch, and returns one
 /// [`ImportBatchResult`] per token in submission order; a failed batch is
@@ -29,7 +35,7 @@ use super::{BatchToken, ImportBatchResult, Index, Mutation, Result};
 /// commits finish under the Runtime's in-flight guard without an observer.
 ///
 /// Admission, concurrency, queued bytes, and memory are bounded: at most the
-/// configured in-flight limit of batches execute concurrently, there is no
+/// configured in-flight ceiling of batches execute concurrently, there is no
 /// session-internal queue (a caller waiting in `submit` holds its own
 /// unsubmitted batch), and every admitted batch still passes the Runtime's
 /// bounded foreground admission. No import state is persistent, and import
@@ -43,8 +49,8 @@ pub struct ImportSession<B: Backend> {
 }
 
 impl<B: Backend> ImportSession<B> {
-    pub(crate) fn new(index: Index<B>, in_flight_batches: usize) -> Self {
-        let coordinator = ImportCoordinator::new(index.clone(), in_flight_batches);
+    pub(crate) fn new(index: Index<B>, max_in_flight_batches: usize) -> Self {
+        let coordinator = ImportCoordinator::new(index.clone(), max_in_flight_batches);
         Self { index, coordinator }
     }
 

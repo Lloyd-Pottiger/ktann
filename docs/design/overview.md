@@ -163,8 +163,9 @@ cleanup, so successful Runtime shutdown permits immediate database reopen or
 teardown. Direct adapter users consume `RocksDbBackend` with its asynchronous
 shutdown for the same guarantee; transaction-handle Drop remains nonblocking.
 
-An Import Session accepts ordinary atomic mutation batches under bounded
-concurrency and maintenance backpressure. `submit` returns a process-local
+An Import Session accepts ordinary atomic mutation batches under adaptive,
+bounded concurrency and maintenance backpressure. It learns useful concurrency
+from actual retryable contention rather than scanning tree topology. `submit` returns a process-local
 Batch Token after admission. `finish` waits for accepted work and returns batch
 results in submission order. No import state is persistent and no whole import
 is atomic.

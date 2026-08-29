@@ -238,6 +238,7 @@ fn search_rejects_invalid_k_dimension_and_budgets() -> ktann::api::Result<()> {
 
 #[test]
 fn runtime_and_verify_limits_fail_closed() {
+    assert_eq!(RuntimeConfig::default().import_backlog_watermark(), 2);
     assert_invalid(RuntimeConfig::default().with_foreground_operation_limit(0));
     assert_invalid(RuntimeConfig::default().with_foreground_operation_limit(65_537));
     assert_eq!(
@@ -262,15 +263,15 @@ fn runtime_and_verify_limits_fail_closed() {
         .with_import_limits(1, 1_025)
         .expect("builder defers cross-setting validation");
     assert_invalid(unsafe_import_limits.validate());
-    assert_invalid(ImportOptions::default().with_in_flight_batches(0));
+    assert_invalid(ImportOptions::default().with_max_in_flight_batches(0));
     assert_eq!(
         ImportOptions::default()
-            .with_in_flight_batches(2)
+            .with_max_in_flight_batches(2)
             .expect("positive in-flight override")
-            .in_flight_batches(),
+            .max_in_flight_batches(),
         Some(2)
     );
-    assert_eq!(ImportOptions::default().in_flight_batches(), None);
+    assert_eq!(ImportOptions::default().max_in_flight_batches(), None);
     assert_invalid(RuntimeConfig::default().with_stalled_timeout(Default::default()));
     assert_invalid(VerifyOptions::default().with_issue_limit(10_001));
     assert_invalid(VerifyOptions::default().with_memory_limit_bytes(1_073_741_825));
