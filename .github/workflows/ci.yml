@@ -29,7 +29,7 @@ jobs:
           shared-key: test-${{ matrix.toolchain }}
           # GitHub caches are immutable, so build-mode changes need a fresh key
           # before later steps can contribute their artifacts.
-          key: ${{ hashFiles('.github/workflows/ci.yml') }}
+          key: complete-build-modes-v1
       - name: Install FoundationDB client
         run: .github/scripts/setup-foundationdb.sh client
       - name: Test workspace
