@@ -297,7 +297,7 @@ Submitted batches remain indivisible atomic operations.
 The complete batch-size, concurrency-ceiling, maintenance-worker, and backlog
 watermark matrix, including three-run variance, logical Backend IO, Fixup work,
 convergence, and rejected configurations, is recorded in
-[`issue-134-calibration.md`](issue-134-calibration.md).
+[`import-admission-calibration.md`](import-admission-calibration.md).
 
 Three interleaved same-host full SIFTsmall runs on 2026-08-29 compared revision
 `ca5b00b` with fixed concurrency one and backlog watermark 512 against adaptive
