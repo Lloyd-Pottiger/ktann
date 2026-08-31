@@ -77,3 +77,46 @@ Validation completed:
 The benchmark runner keeps beam 8 in the large-profile sweep. The rerank=1000
 ceiling was a temporary diagnostic-only API change and has been restored to
 the normal k-derived ceiling of 64.
+
+## Follow-up experiments
+
+### Traversal allocation is not the whole remaining loss
+
+With the normalized centroids, the default global level beam reached about
+63.75% recall at beam 8 and 83.70% at beam 32. Removing the level scaling and
+using the same beam at every level changed those results only to about 64.80%
+and 83.66%.
+
+A per-parent beam experiment did more work: beam 8 visited about 11,932 leaf
+entries and reached 73.95%, while beam 32 visited about 95,852 leaf entries
+and reached 92.50%. The extra work improved quality, but beam 8 still missed
+the target and the result was worse than the global beam 32 run at a similar
+leaf-entry count. The global competition is therefore a quality trade-off,
+not the root cause of the remaining failure.
+
+### Weighted internal centroids were not a demonstrated fix
+
+One candidate loaded each Child Entry's child Header and weighted its
+centroid by `entry_count` during internal split training. This is only an
+approximation: an internal Header counts direct Child Entries, not descendant
+Vector Records. A fresh 1M Cohere import with this candidate produced 63.59%
+at beam 8 and 83.77% at beam 32, indistinguishable from the normalized
+baseline, while adding Header reads to training. The candidate was removed.
+
+### InnerProduct does not have the same cosine normalization bug
+
+InnerProduct intentionally preserves vector scale during preprocessing,
+trains from unnormalized centroids, and ranks by `-dot`; exact reranking uses
+the same definition. The numeric routing tests cover this contract. A
+clustered 5K InnerProduct experiment reached 100% recall at beam 32. A
+skewed InnerProduct experiment reached only 34.10%, while the same skewed
+L2 experiment reached 93.70%. This is evidence of a broader centroid/tree
+model limitation for skewed MIPS data, not evidence that InnerProduct
+centroids should be normalized. Normalizing them would change the metric.
+
+The committed cosine normalization fix is useful, but these experiments do
+not justify closing #126: the beam-8 Cohere target remains unmet. The next
+high-value investigation is the quality of immutable internal routing
+centroids over the online split history, ideally with per-level routing
+diagnostics or a descendant-aggregate experiment before changing the public
+beam semantics.
