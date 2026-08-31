@@ -14,20 +14,17 @@
 //!
 //! # Contract
 //!
-//! - **Deterministic best-first order.** The frontier is one priority queue
+//! - **Deterministic level beam.** The active frontier is one priority queue
 //!   ordered by `(routing distance, Tree Key enumeration order, Partition
-//!   Key)`. Every tree's root is queued up front, so identical snapshots,
-//!   requests, and budgets pop identical visit sequences and no tree is
-//!   starved by enumeration order alone.
+//!   Key)`. Every tree's root is queued up front; each tree and level selects
+//!   its nearest next-level beam before those entries enter the frontier, so a
+//!   wide first parent cannot monopolize its tree's next level.
 //! - **Level-scaled beam.** Per tree and level, at most `beam(level)`
 //!   Child Entry-referenced partitions enter the frontier: the leaf-level
 //!   base beam defaults to [`DEFAULT_LEAF_BEAM`] and halves toward the root
-//!   with a minimum of one. Since internal fanout is exactly two, the halving
-//!   funds full best-first descent down to the leaf beam and prunes only
-//!   transient-fanout or plateau-level surplus. Root-split target injection
-//!   is topology-mandated membership coverage, not beam admission, and is
-//!   never pruned. Beam pruning is not budget exhaustion and is not reported
-//!   as one.
+//!   with a minimum of one. Root-split target injection is topology-mandated
+//!   membership coverage, not beam admission, and is never pruned. Beam
+//!   pruning is not budget exhaustion and is not reported as one.
 //! - **Bounded work, charged before it starts.** Each distinct
 //!   `{Tree Key, Partition Key}` body is visited and charged to the Partition
 //!   budget at most once. Decoded bodies arrive whole from the
@@ -251,10 +248,12 @@ struct VisitContext<'a> {
 
 /// One queued frontier partition.
 ///
-/// The best-first order key is `(routing distance, Tree Key enumeration
-/// order, Partition Key)`; roots and injected root-split targets carry
-/// distance zero. `expected_level` is the level the referencing edge
-/// established — `None` for a tree root — and the visited Header must agree.
+/// The active frontier order key is `(routing distance, tree, partition)`.
+///
+/// `expected_level` is the level the referencing edge established — `None`
+/// for a tree root — and the visited Header must agree. The active frontier
+/// contains only the selected beam for one depth. Roots and injected
+/// root-split targets bypass the beam.
 #[derive(Clone, Copy, Debug)]
 struct FrontierEntry {
     distance: f64,
@@ -289,13 +288,15 @@ impl Eq for FrontierEntry {}
 
 /// The mutable state of one forest traversal.
 struct Traversal {
+    /// The already-selected beam at the current tree depth.
     frontier: BinaryHeap<Reverse<FrontierEntry>>,
+    /// Children exposed by the current depth, grouped for next-level beam
+    /// selection by tree and persistent level.
+    next_frontier: HashMap<(u32, u32), Vec<FrontierEntry>>,
     /// Every referenced `{tree, partition}`: roots, injected root-split
-    /// targets, and admitted Child Entries. A second reference to one body is
+    /// targets, and discovered Child Entries. A second reference to one body is
     /// Corruption.
     referenced: HashSet<(u32, PartitionKey)>,
-    /// Beam admissions per `{tree, level}`.
-    admitted: HashMap<(u32, u32), u32>,
     candidates: Vec<LeafCandidate>,
     /// Visited partitions worth offering to the Runtime's demand-driven Fixup
     /// queue: split or merge states and threshold-crossing `Ready` partitions.
@@ -312,8 +313,8 @@ impl Traversal {
     fn seed(trees: &[EnumeratedTree]) -> Result<Self> {
         let mut state = Self {
             frontier: BinaryHeap::new(),
+            next_frontier: HashMap::new(),
             referenced: HashSet::new(),
-            admitted: HashMap::new(),
             candidates: Vec::new(),
             maintenance: Vec::new(),
             visited_partitions: 0,
@@ -345,14 +346,19 @@ impl Traversal {
         txn: &mut ReadLogicalTxn<'_, T>,
         context: &VisitContext<'_>,
     ) -> Result<()> {
-        while let Some(&Reverse(entry)) = self.frontier.peek() {
-            // Stop before unfunded work: the peeked entry is beam-admitted or
-            // topology-mandated, so it is eligible work the depleted Partition
-            // budget would prevent.
+        loop {
+            if self.frontier.is_empty() {
+                self.select_next_frontier(context.request.leaf_beam);
+                if self.frontier.is_empty() {
+                    break;
+                }
+            }
+            // Stop before eligible unfunded work. Beam-pruned entries never
+            // enter the active frontier.
             if self.visited_partitions == context.request.budgets.visited_partitions() {
                 break;
             }
-            self.frontier.pop();
+            let Reverse(entry) = self.frontier.pop().expect("frontier checked non-empty");
             self.visit_partition(txn, context, entry).await?;
             // A depleted Leaf Entry budget stops the whole traversal: every
             // remaining leaf visit consumes it, and expanding internal nodes
@@ -365,8 +371,9 @@ impl Traversal {
         // the Partition budget is fully spent; several dimensions may be
         // exhausted together, while natural completion on the limit (an empty
         // frontier) is not exhaustion.
-        self.partition_budget_exhausted = !self.frontier.is_empty()
-            && self.visited_partitions == context.request.budgets.visited_partitions();
+        self.partition_budget_exhausted = self.visited_partitions
+            == context.request.budgets.visited_partitions()
+            && (!self.frontier.is_empty() || !self.next_frontier.is_empty());
         Ok(())
     }
 
@@ -510,13 +517,11 @@ impl Traversal {
         }
     }
 
-    /// Expands one internal partition's Child Entries into the frontier.
+    /// Exposes one internal partition's children to the next depth's beam.
     ///
-    /// The decoded body comes from the snapshot-validated cache. Children
-    /// enter the frontier best-first within the parent. Per tree and level at
-    /// most `beam(level)` children are admitted; surplus children — reachable
-    /// only through transient split fanout or the minimum-one plateau — are
-    /// pruned deterministically, never reported as exhaustion.
+    /// The decoded body comes from the snapshot-validated cache. Every Child
+    /// Entry enters the frontier so children from all admitted same-depth
+    /// parents compete by routing distance when the next depth is popped.
     async fn visit_internal<T: ReadOps>(
         &mut self,
         txn: &mut ReadLogicalTxn<'_, T>,
@@ -530,7 +535,6 @@ impl Traversal {
         let BodyEntries::Internal(entries) = body.entries() else {
             return Err(Error::new(ErrorKind::Corruption));
         };
-        let mut children: Vec<(f64, PartitionKey)> = Vec::with_capacity(entries.len());
         for child in entries {
             let distance = context
                 .kernel
@@ -541,21 +545,15 @@ impl Traversal {
             if !self.referenced.insert((tree, child.child())) {
                 return Err(Error::new(ErrorKind::Corruption));
             }
-            children.push((distance, child.child()));
-        }
-        children.sort_unstable_by(|left, right| {
-            compare_finite(left.0, right.0).then_with(|| left.1.cmp(&right.1))
-        });
-        let child_level = level - 1;
-        for (distance, child) in children {
-            if self.admit(tree, child_level, context.request.leaf_beam) {
-                self.frontier.push(Reverse(FrontierEntry {
+            self.next_frontier
+                .entry((tree, level - 1))
+                .or_default()
+                .push(FrontierEntry {
                     distance,
                     tree,
-                    partition: child,
-                    expected_level: Some(child_level),
-                }));
-            }
+                    partition: child.child(),
+                    expected_level: Some(level - 1),
+                });
         }
         Ok(())
     }
@@ -632,15 +630,17 @@ impl Traversal {
         Ok(())
     }
 
-    /// Admits one Child Entry-referenced partition to the level-scaled beam.
-    fn admit(&mut self, tree: u32, level: u32, leaf_beam: u32) -> bool {
-        let width = beam_width(leaf_beam, level);
-        let admitted = self.admitted.entry((tree, level)).or_insert(0);
-        if *admitted >= width {
-            return false;
+    /// Selects each tree-level's globally nearest next-depth beam.
+    fn select_next_frontier(&mut self, leaf_beam: u32) {
+        let groups = std::mem::take(&mut self.next_frontier);
+        for ((_tree, level), mut entries) in groups {
+            let width = usize::try_from(beam_width(leaf_beam, level)).unwrap_or(usize::MAX);
+            if entries.len() > width {
+                entries.select_nth_unstable_by(width - 1, FrontierEntry::cmp);
+                entries.truncate(width);
+            }
+            self.frontier.extend(entries.into_iter().map(Reverse));
         }
-        *admitted += 1;
-        true
     }
 
     /// Injects a root-split target into the frontier, bypassing the beam.
@@ -1420,6 +1420,62 @@ mod tests {
         .expect("traverse");
         assert_eq!(candidate_ids(&outcome), vec![b"e4".as_slice()]);
         assert_eq!(outcome.visited_partitions(), 3);
+        assert!(!outcome.partition_budget_exhausted());
+    }
+
+    #[tokio::test]
+    async fn beam_selects_children_globally_across_same_level_parents() {
+        let manifest = manifest();
+        let mut fixture = Fixture::new(&manifest);
+        let tree = fixture.tree(1);
+        fixture.header(&tree, 1, 3, 2, PartitionState::Ready);
+        fixture.header(&tree, 2, 2, 4, PartitionState::Ready);
+        fixture.header(&tree, 3, 2, 4, PartitionState::Ready);
+        fixture.child(&tree, 1, 2, [0.0, 0.0]);
+        fixture.child(&tree, 1, 3, [1.0, 0.0]);
+
+        for (leaf, distance, record_id) in [
+            (4, 2.0, "a2"),
+            (5, 3.0, "a3"),
+            (6, 4.0, "a4"),
+            (7, 5.0, "a5"),
+        ] {
+            fixture.header(&tree, leaf, 1, 1, PartitionState::Ready);
+            fixture.child(&tree, 2, leaf, [distance, 0.0]);
+            fixture.entry(&tree, 1, leaf, record_id, 0, [distance, 0.0]);
+        }
+        for (leaf, distance, record_id) in [
+            (8, 0.1, "b01"),
+            (9, 0.2, "b02"),
+            (10, 6.0, "b6"),
+            (11, 7.0, "b7"),
+        ] {
+            fixture.header(&tree, leaf, 1, 1, PartitionState::Ready);
+            fixture.child(&tree, 3, leaf, [distance, 0.0]);
+            fixture.entry(&tree, 1, leaf, record_id, 0, [distance, 0.0]);
+        }
+
+        let outcome = run(
+            fixture.items,
+            &manifest,
+            &[tree_ref(&tree)],
+            None,
+            8,
+            budgets(16, 16, 64),
+            4,
+        )
+        .await
+        .expect("traverse");
+        assert_eq!(
+            candidate_ids(&outcome),
+            vec![
+                b"b01".as_slice(),
+                b"b02".as_slice(),
+                b"a2".as_slice(),
+                b"a3".as_slice(),
+            ]
+        );
+        assert_eq!(outcome.visited_partitions(), 7);
         assert!(!outcome.partition_budget_exhausted());
     }
 

@@ -500,7 +500,7 @@ async fn drive_to_completion(
         .await
         .expect("advance");
         match outcome {
-            Advance::Idle | Advance::Completed => {
+            Advance::Idle | Advance::Completed { .. } => {
                 outcomes.push(outcome);
                 return outcomes;
             }
@@ -729,7 +729,10 @@ async fn root_leaf_split_runs_end_to_end_and_stays_searchable() {
     let completed = split::complete_split(&backend, &manifest, &key, pk(1), 1_300, &retry())
         .await
         .expect("complete");
-    assert_eq!(completed, topology::SplitCompletion::Completed);
+    assert!(matches!(
+        completed,
+        topology::SplitCompletion::Completed { .. }
+    ));
 
     let root_header = header_of(&backend, &manifest, &key, pk(1))
         .await
@@ -844,7 +847,10 @@ async fn split_root_into_two_leaves(
     let completed = split::complete_split(backend, manifest, key, pk(1), 1_300, &retry())
         .await
         .expect("complete");
-    assert_eq!(completed, topology::SplitCompletion::Completed);
+    assert!(matches!(
+        completed,
+        topology::SplitCompletion::Completed { .. }
+    ));
     (pk(2), pk(3))
 }
 
@@ -916,7 +922,10 @@ async fn non_root_leaf_split_installs_edges_and_removes_the_source() {
     let completed = split::complete_split(&backend, &manifest, &key, left_leaf, 2_300, &retry())
         .await
         .expect("complete");
-    assert_eq!(completed, topology::SplitCompletion::Completed);
+    assert!(matches!(
+        completed,
+        topology::SplitCompletion::Completed { .. }
+    ));
     assert_eq!(
         edge_of(&backend, &manifest, &key, pk(1), left_leaf).await,
         None,
@@ -979,7 +988,7 @@ async fn completion_uses_range_clear_when_the_backend_supports_it() {
         records.push((rid(n), x));
     }
     let outcomes = drive_to_completion(&backend, &manifest, &key, left_leaf).await;
-    assert_eq!(outcomes.last(), Some(&Advance::Completed));
+    assert!(matches!(outcomes.last(), Some(Advance::Completed { .. })));
 
     assert_eq!(header_of(&backend, &manifest, &key, left_leaf).await, None);
     assert_eq!(state_of(&backend, &manifest, &key, left_leaf).await, None);
@@ -1012,14 +1021,14 @@ async fn root_internal_split_moves_child_entries_and_rises_one_level() {
         records.push((rid(n), x));
     }
     let outcomes = drive_to_completion(&backend, &manifest, &key, left_leaf).await;
-    assert_eq!(outcomes.last(), Some(&Advance::Completed));
+    assert!(matches!(outcomes.last(), Some(Advance::Completed { .. })));
     // Root children: {3, 4, 5}.
     for (n, x) in [(13, 3.25), (14, 3.75), (15, 4.25)] {
         index.insert(record(&rid(n), x, 1)).await.expect("insert");
         records.push((rid(n), x));
     }
     let outcomes = drive_to_completion(&backend, &manifest, &key, right_leaf).await;
-    assert_eq!(outcomes.last(), Some(&Advance::Completed));
+    assert!(matches!(outcomes.last(), Some(Advance::Completed { .. })));
     // Root children: {4, 5, 6, 7} — at the maximum, not above it.
     let root_header = header_of(&backend, &manifest, &key, pk(1))
         .await
@@ -1042,7 +1051,7 @@ async fn root_internal_split_moves_child_entries_and_rises_one_level() {
             .expect("a leaf above the maximum")
     };
     let outcomes = drive_to_completion(&backend, &manifest, &key, over).await;
-    assert_eq!(outcomes.last(), Some(&Advance::Completed));
+    assert!(matches!(outcomes.last(), Some(Advance::Completed { .. })));
     let root_header = header_of(&backend, &manifest, &key, pk(1))
         .await
         .expect("root header");
@@ -1053,7 +1062,7 @@ async fn root_internal_split_moves_child_entries_and_rises_one_level() {
     // Child Entries — no Record Location or Synopsis work — and converts
     // Partition Key 1 in place to level 3.
     let outcomes = drive_to_completion(&backend, &manifest, &key, pk(1)).await;
-    assert_eq!(outcomes.last(), Some(&Advance::Completed));
+    assert!(matches!(outcomes.last(), Some(Advance::Completed { .. })));
     let root_header = header_of(&backend, &manifest, &key, pk(1))
         .await
         .expect("root header");
@@ -1243,7 +1252,10 @@ async fn non_root_internal_split_moves_child_entries() {
     let completed = split::complete_split(&backend, &manifest, &key, pk(2), 2_300, &retry())
         .await
         .expect("complete");
-    assert_eq!(completed, topology::SplitCompletion::Completed);
+    assert!(matches!(
+        completed,
+        topology::SplitCompletion::Completed { .. }
+    ));
     assert_eq!(header_of(&backend, &manifest, &key, pk(2)).await, None);
     assert_eq!(edge_of(&backend, &manifest, &key, pk(1), pk(2)).await, None);
     assert_eq!(
@@ -1303,7 +1315,7 @@ async fn advance_rediscovers_and_converges_a_cold_split() {
     for expected in expected {
         assert_eq!(kinds.next(), Some(expected));
     }
-    assert_eq!(outcomes.last(), Some(&Advance::Completed));
+    assert!(matches!(outcomes.last(), Some(Advance::Completed { .. })));
 
     // A settled partition is Idle, and a never-created or removed partition
     // has nothing to maintain.
@@ -1352,7 +1364,7 @@ async fn advance_rediscovers_and_converges_a_cold_split() {
         Advance::Idle
     );
     let outcomes = drive_to_completion(&backend, &manifest, &key, over).await;
-    assert_eq!(outcomes.last(), Some(&Advance::Completed));
+    assert!(matches!(outcomes.last(), Some(Advance::Completed { .. })));
     assert_searchable(&backend, &manifest, &key, &records).await;
 
     runtime.shutdown().await.expect("shutdown");
@@ -1390,7 +1402,7 @@ async fn advance_converges_a_split_whose_source_shrank_to_one_entry() {
     // Exposure trains on the shrunken snapshot; the machine must advance on
     // this valid persistent state instead of reporting Corruption (#113).
     let outcomes = drive_to_completion(&backend, &manifest, &key, pk(1)).await;
-    assert_eq!(outcomes.last(), Some(&Advance::Completed));
+    assert!(matches!(outcomes.last(), Some(Advance::Completed { .. })));
     assert_searchable(&backend, &manifest, &key, remaining).await;
 
     runtime.shutdown().await.expect("shutdown");
@@ -1425,7 +1437,7 @@ async fn advance_converges_a_split_whose_source_emptied_out() {
     // An empty Splitting source trains two zero centroids, drains nothing,
     // and completes through the ordinary zero-count completion (#113).
     let outcomes = drive_to_completion(&backend, &manifest, &key, pk(1)).await;
-    assert_eq!(outcomes.last(), Some(&Advance::Completed));
+    assert!(matches!(outcomes.last(), Some(Advance::Completed { .. })));
     assert_searchable(&backend, &manifest, &key, &[]).await;
 
     runtime.shutdown().await.expect("shutdown");
@@ -1615,7 +1627,10 @@ async fn advance_and_finalize_recover_from_every_commit_outcome() {
             CommitFault::UnknownApplied => {
                 assert_eq!(redriven, topology::SplitCompletion::NotDraining)
             }
-            _ => assert_eq!(redriven, topology::SplitCompletion::Completed),
+            _ => assert!(matches!(
+                redriven,
+                topology::SplitCompletion::Completed { .. }
+            )),
         }
         retry_txn.commit().await.expect("retry commits");
 
@@ -1674,7 +1689,10 @@ async fn drain_recovers_from_unknown_outcomes_without_losing_membership() {
     let completed = split::complete_split(&backend, &manifest, &key, pk(1), 1_300, &retry())
         .await
         .expect("complete");
-    assert_eq!(completed, topology::SplitCompletion::Completed);
+    assert!(matches!(
+        completed,
+        topology::SplitCompletion::Completed { .. }
+    ));
     assert_searchable(&backend, &manifest, &key, &records).await;
 
     runtime.shutdown().await.expect("shutdown");
@@ -1713,7 +1731,7 @@ async fn a_restarted_process_rediscovers_the_durable_split_state() {
     // DrainingSplit state and converges it.
     let reopened = SharedBackend::new(backend.inner().reopen());
     let outcomes = drive_to_completion(&reopened, &manifest, &key, pk(1)).await;
-    assert_eq!(outcomes.last(), Some(&Advance::Completed));
+    assert!(matches!(outcomes.last(), Some(Advance::Completed { .. })));
     assert_searchable(&reopened, &manifest, &key, &records).await;
 }
 
@@ -1850,7 +1868,7 @@ async fn a_stale_worker_cannot_recreate_a_target_after_completion() {
         .await
         .expect("train");
     let outcomes = drive_to_completion(&backend, &manifest, &key, pk(1)).await;
-    assert_eq!(outcomes.last(), Some(&Advance::Completed));
+    assert!(matches!(outcomes.last(), Some(Advance::Completed { .. })));
     let key_count = backend.inner().db_key_count();
 
     // The split is complete: the source State now says Ready (the root was
@@ -2577,7 +2595,10 @@ async fn steps_on_a_completed_non_root_split_are_harmless_noops() {
     )
     .await
     .expect("finalize op");
-    assert_eq!(completed, topology::SplitCompletion::Completed);
+    assert!(matches!(
+        completed,
+        topology::SplitCompletion::Completed { .. }
+    ));
     txn.commit().await.expect("commit finalize");
     assert!(state_of(&backend, &manifest, &key, pk(2)).await.is_none());
     assert!(header_of(&backend, &manifest, &key, pk(2)).await.is_none());
@@ -2600,7 +2621,10 @@ async fn steps_on_a_completed_non_root_split_are_harmless_noops() {
     let completion = split::complete_split(&backend, &manifest, &key, pk(2), 400, &retry())
         .await
         .expect("complete");
-    assert_eq!(completion, topology::SplitCompletion::Completed);
+    assert!(matches!(
+        completion,
+        topology::SplitCompletion::Completed { .. }
+    ));
     let advance = split::advance(&backend, &manifest, &key, pk(2), 400, &retry())
         .await
         .expect("advance");
@@ -2718,7 +2742,10 @@ async fn drain_moves_bounded_batches_and_refreshes_target_authority() {
     let completion = split::complete_split(&backend, &manifest, &key, pk(1), 1_300, &retry())
         .await
         .expect("complete");
-    assert_eq!(completion, topology::SplitCompletion::Completed);
+    assert!(matches!(
+        completion,
+        topology::SplitCompletion::Completed { .. }
+    ));
     assert_searchable(&backend, &manifest, &key, &records).await;
     runtime.shutdown().await.expect("shutdown");
 }
@@ -2804,7 +2831,10 @@ async fn non_root_finalize_recovers_from_an_unknown_commit_outcome() {
         let completed = topology::finalize_split(&mut txn, &key, pk(2), 300, removal)
             .await
             .expect("finalize op");
-        assert_eq!(completed, topology::SplitCompletion::Completed);
+        assert!(matches!(
+            completed,
+            topology::SplitCompletion::Completed { .. }
+        ));
         let error = txn.commit().await.expect_err("injected fault");
         assert_eq!(error.kind(), ErrorKind::CommitOutcomeUnknown);
 
@@ -2814,7 +2844,10 @@ async fn non_root_finalize_recovers_from_an_unknown_commit_outcome() {
         let redriven = topology::finalize_split(&mut retry_txn, &key, pk(2), 301, removal)
             .await
             .expect("redriven finalize");
-        assert_eq!(redriven, topology::SplitCompletion::Completed);
+        assert!(matches!(
+            redriven,
+            topology::SplitCompletion::Completed { .. }
+        ));
         retry_txn.commit().await.expect("retry commits");
 
         // The switched topology stands: both targets are Ready and the

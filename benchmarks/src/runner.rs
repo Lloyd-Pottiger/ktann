@@ -9,7 +9,7 @@ use bytes::Bytes;
 use ktann::api::{
     DataType, ErrorKind, FieldId, FieldSchema, ImportOptions, ImportSession, Index, IndexConfig,
     Metric, Mutation, OperationOptions, Record, RuntimeConfig, SearchBudgets, SearchOptions,
-    SearchOutcome, SearchRequest, Value, VerifyOptions,
+    SearchRequest, Value, VerifyOptions,
 };
 use ktann::runtime::Runtime;
 use ktann::storage::backend::Backend;
@@ -20,9 +20,10 @@ use crate::metrics::{CapturedMetrics, MetricCapture};
 use crate::report::{
     AdmissionTarget, BenchmarkReport, BudgetConfiguration, BudgetSummary, Configuration,
     ConvergencePhase, Distribution, Environment, ImportPhase, LifecycleMeasurements,
-    MaintenanceSummary, OperationClass, OperationSummary, PhaseResources, RecallSummary,
-    ReportMeasurements, SearchBudgetConfiguration, SearchPhase, SearchTruncation,
-    SteadyStateMeasurements, Topology, WorkloadDispatch, WriteAmplification,
+    MaintenanceSummary, OperationClass, OperationSummary, PartitionStateCounts, PhaseResources,
+    QualityPoint, QualitySweepMeasurements, RecallSummary, ReportMeasurements,
+    SearchBudgetConfiguration, SearchPhase, SearchTruncation, SteadyStateMeasurements, Topology,
+    WorkloadDispatch, WriteAmplification,
 };
 use crate::resource::ResourceSnapshot;
 
@@ -44,8 +45,8 @@ type ExactTruth = Arc<[(Bytes, f64)]>;
 /// A successful search retained until recall can run outside resource timing.
 #[derive(Debug)]
 struct RecallInput {
-    /// Approximate hits returned inside the measured API call.
-    outcome: SearchOutcome,
+    /// Record IDs returned inside the measured API call.
+    hit_ids: Vec<Bytes>,
     /// Immutable exact result computed before any benchmark timing.
     truth: ExactTruth,
 }
@@ -65,6 +66,8 @@ pub struct ScenarioSpec {
     pub query_vectors: usize,
     /// Vector dimension.
     pub dimension: usize,
+    /// Distance metric used by the Logical Index and supplied ground truth.
+    pub metric: Metric,
     /// Replayable dataset and workload seed.
     pub seed: u64,
     /// Percentage of operations that are searches.
@@ -89,6 +92,8 @@ pub struct ScenarioSpec {
     pub k: usize,
     /// Per-request Search Budget and traversal overrides.
     pub search_options: SearchOptions,
+    /// Ordered single-variable beam values; empty for ordinary scenarios.
+    pub leaf_beam_sweep: Vec<u32>,
     /// Logical Index maximum partition size.
     pub max_partition_entries: u32,
     /// Whether this scenario measures the import-to-search lifecycle.
@@ -107,13 +112,14 @@ pub struct ScenarioSpec {
 ///
 /// # Errors
 ///
-/// Returns an error when `profile` is neither `smoke` nor `full`.
+/// Returns an error when `profile` is unknown.
 pub fn scenarios(profile: &str) -> Result<Vec<ScenarioSpec>, String> {
     match profile {
         "smoke" => Ok(smoke_scenarios()),
         "full" => Ok(full_scenarios()),
+        "large" => large_scenarios(),
         _ => Err(format!(
-            "unknown profile `{profile}`; expected smoke or full"
+            "unknown profile `{profile}`; expected smoke, full, or large"
         )),
     }
 }
@@ -127,6 +133,7 @@ fn smoke_scenarios() -> Vec<ScenarioSpec> {
         base_vectors: 256,
         query_vectors: 8,
         dimension: 16,
+        metric: Metric::L2,
         seed: 0x38_0001,
         search_percent: 100,
         hot_updates: false,
@@ -139,6 +146,7 @@ fn smoke_scenarios() -> Vec<ScenarioSpec> {
         measured_operations: 64,
         k: 10,
         search_options: SearchOptions::default(),
+        leaf_beam_sweep: Vec::new(),
         max_partition_entries: 32,
         lifecycle: false,
         import_batch_size: 32,
@@ -203,6 +211,7 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
         base_vectors,
         query_vectors,
         dimension,
+        metric: Metric::L2,
         seed,
         search_percent: 100,
         hot_updates: false,
@@ -215,6 +224,7 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
         measured_operations: query_vectors.saturating_mul(10),
         k: 10,
         search_options: SearchOptions::default(),
+        leaf_beam_sweep: Vec::new(),
         max_partition_entries: 128,
         lifecycle: false,
         import_batch_size: 50,
@@ -290,6 +300,49 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
     ]
 }
 
+/// Fixed public million-vector quality curves reserved for optimized workers.
+fn large_scenarios() -> Result<Vec<ScenarioSpec>, String> {
+    let search_options = SearchOptions::default()
+        .with_scanned_tree_keys(1)
+        .and_then(|options| options.with_visited_partitions(16_384))
+        .and_then(|options| options.with_visited_leaf_entries(1_048_576))
+        .map_err(|error| error_at("configure large search", error))?;
+    let scenario = |name, dataset, dimension, metric| ScenarioSpec {
+        name,
+        dataset,
+        profile: "large",
+        base_vectors: 1_000_000,
+        query_vectors: 1_000,
+        dimension,
+        metric,
+        seed: 0x38_2001,
+        search_percent: 100,
+        hot_updates: false,
+        partition_cache_bytes: 512 << 20,
+        foreground_limit: 64,
+        blocking_resource_limit: Some(64),
+        concurrency: 16,
+        dispatch: WorkloadDispatch::Continuous,
+        warmup_operations: 1_000,
+        measured_operations: 1_000,
+        k: 10,
+        search_options,
+        leaf_beam_sweep: vec![1, 4, 16, 32],
+        // Keep the shared leaf/internal fanout below sqrt(1M) so the
+        // million-vector corpus must form at least three searchable levels.
+        max_partition_entries: 512,
+        lifecycle: false,
+        import_batch_size: 50,
+        import_max_in_flight_batches: 4,
+        import_backlog_watermark: 2,
+        maintenance_workers: 2,
+    };
+    Ok(vec![
+        scenario("quality-cohere-1m", "cohere-1m", 768, Metric::Cosine),
+        scenario("quality-sift-1m", "sift-1m", 128, Metric::L2),
+    ])
+}
+
 /// Defines a sample-rich mixed region while preserving visible overload.
 const fn admission_target() -> AdmissionTarget {
     AdmissionTarget {
@@ -314,21 +367,46 @@ pub async fn run_scenario<B: Backend>(
     reproduction_command: String,
     tokio_worker_threads: usize,
 ) -> Result<BenchmarkReport, String> {
-    let dataset = dataset::load(
-        spec.dataset,
-        spec.base_vectors,
-        spec.query_vectors,
-        spec.dimension,
-        spec.seed,
-    )?;
+    let dataset_started = phase_started(spec, "dataset load");
+    let mut dataset = if spec.profile == "large" {
+        dataset::load_large(spec.dataset)?
+    } else {
+        dataset::load(
+            spec.dataset,
+            spec.base_vectors,
+            spec.query_vectors,
+            spec.dimension,
+            spec.seed,
+        )?
+    };
+    phase_completed(spec, "dataset load", dataset_started);
     let (backend, backend_counters) = MeasuredBackend::new(backend);
     let admission = backend.admission_budget();
     let metric_capture = MetricCapture::install()?;
     let primary_runtime_config = runtime_config(spec, spec.maintenance_workers)?;
+    let index_config = index_config(spec)?;
     let default_search_budgets = primary_runtime_config.default_search_budgets();
     let search_budgets =
         search_budget_configuration(default_search_budgets, spec.search_options, spec.k)?;
-    let (topology, measurements) = if spec.lifecycle {
+    let (topology, measurements) = if !spec.leaf_beam_sweep.is_empty() {
+        let runtime = Runtime::new(backend, primary_runtime_config)
+            .map_err(|error| error_at("create runtime", error))?;
+        let measured = run_quality_sweep(
+            &runtime,
+            &backend_counters,
+            &metric_capture,
+            spec,
+            &mut dataset,
+        )
+        .await;
+        let shutdown = runtime
+            .shutdown()
+            .await
+            .map_err(|error| error_at("shut down runtime", error));
+        let (topology, measurements) = measured?;
+        shutdown?;
+        (topology, ReportMeasurements::QualitySweep(measurements))
+    } else if spec.lifecycle {
         let (topology, lifecycle) = run_lifecycle_case(
             backend,
             primary_runtime_config,
@@ -370,12 +448,14 @@ pub async fn run_scenario<B: Backend>(
             scenario: spec.name.to_owned(),
             profile: spec.profile.to_owned(),
             seed: spec.seed,
-            dimension: spec.dimension,
-            metric: "l2".to_owned(),
+            dimension: index_config.dimension(),
+            metric: metric_name(index_config.metric()).to_owned(),
+            index_field_count: index_config.fields().len(),
+            tree_key_field_count: index_config.tree_key_fields().len(),
             search_percent: spec.search_percent,
             hot_updates: spec.hot_updates,
-            min_partition_entries: spec.max_partition_entries / 4,
-            max_partition_entries: spec.max_partition_entries,
+            min_partition_entries: index_config.min_partition_entries(),
+            max_partition_entries: index_config.max_partition_entries(),
             partition_cache_bytes: spec.partition_cache_bytes,
             foreground_limit: spec.foreground_limit,
             maintenance_workers: spec.maintenance_workers,
@@ -383,8 +463,11 @@ pub async fn run_scenario<B: Backend>(
                 .lifecycle
                 .then_some(CONVERGENCE_MAINTENANCE_WORKERS),
             fixup_queue_capacity: FIXUP_QUEUE_CAPACITY,
+            mutation_attempt_limit: 32,
+            maintenance_attempt_limit: 32,
             search_budgets,
             leaf_beam_size_override: spec.search_options.leaf_beam_size(),
+            leaf_beam_sweep: spec.leaf_beam_sweep.clone(),
             blocking_resource_limit: spec.blocking_resource_limit,
             backend_max_mutations: admission.max_mutations,
             backend_max_mutation_bytes: admission.max_mutation_bytes,
@@ -394,11 +477,14 @@ pub async fn run_scenario<B: Backend>(
             warmup_operations: spec.warmup_operations,
             measured_operations: spec.measured_operations,
             k: spec.k,
-            import_batch_size: spec.lifecycle.then_some(spec.import_batch_size),
+            import_batch_size: (spec.lifecycle || spec.profile == "large")
+                .then_some(spec.import_batch_size),
             import_max_in_flight_batches: spec
                 .lifecycle
-                .then_some(spec.import_max_in_flight_batches),
-            import_backlog_watermark: spec.lifecycle.then_some(spec.import_backlog_watermark),
+                .then_some(spec.import_max_in_flight_batches)
+                .or_else(|| (spec.profile == "large").then_some(spec.import_max_in_flight_batches)),
+            import_backlog_watermark: (spec.lifecycle || spec.profile == "large")
+                .then_some(spec.import_backlog_watermark),
         },
         dataset: dataset.metadata,
         topology,
@@ -419,7 +505,7 @@ fn runtime_config(
         .and_then(|config| config.with_maintenance(maintenance_workers, FIXUP_QUEUE_CAPACITY))
         .and_then(|config| config.with_attempts(32, 32))
         .and_then(|config| config.with_partition_cache_bytes(spec.partition_cache_bytes));
-    let config = if spec.lifecycle {
+    let config = if spec.lifecycle || spec.profile == "large" {
         config.and_then(|config| {
             config.with_import_limits(
                 spec.import_max_in_flight_batches,
@@ -461,7 +547,7 @@ fn search_budget_configuration(
         },
         exact_rerank_candidates: BudgetConfiguration {
             runtime_default: defaults.exact_rerank_candidates(),
-            request_override: options.exact_rerank_candidates(),
+            request_override: None,
             effective_limit: effective.exact_rerank_candidates(),
         },
     })
@@ -484,7 +570,7 @@ async fn run_lifecycle_case<B: Backend>(
         .await
         .map_err(|error| error_at("create lifecycle index", error))?;
     let batches = mutation_batches(dataset, spec.import_batch_size, "construct import record")?;
-    let truths = exact_truth(dataset, spec.k);
+    let truths = exact_truth(dataset, spec.metric, spec.k);
     let requests = lifecycle_requests(dataset, spec)?;
     let import_options = ImportOptions::default()
         .with_max_in_flight_batches(spec.import_max_in_flight_batches)
@@ -647,21 +733,34 @@ struct CaseBaseline {
     backend_io: crate::report::BackendIo,
 }
 
+/// Returns the stable public name of a configured distance metric.
+const fn metric_name(metric: Metric) -> &'static str {
+    match metric {
+        Metric::L2 => "l2",
+        Metric::Cosine => "cosine",
+        Metric::InnerProduct => "inner_product",
+        _ => "unknown",
+    }
+}
+
 /// Builds the public Index configuration shared by steady and lifecycle cases.
 fn index_config(spec: &ScenarioSpec) -> Result<IndexConfig, String> {
-    IndexConfig::new(spec.dimension, Metric::L2)
-        .and_then(|config| {
-            config.with_fields(vec![
-                FieldSchema::new("bucket", DataType::I64)?,
-                FieldSchema::new("generation", DataType::I64)?,
-            ])
-        })
-        .and_then(|config| config.with_tree_key_fields(vec![FieldId(0)]))
-        .and_then(|config| {
-            config
-                .with_partition_entries(spec.max_partition_entries / 4, spec.max_partition_entries)
-        })
-        .map_err(|error| error_at("configure index", error))
+    let config = IndexConfig::new(spec.dimension, spec.metric).and_then(|config| {
+        config.with_partition_entries(spec.max_partition_entries / 4, spec.max_partition_entries)
+    });
+    let config = if spec.profile == "large" {
+        config
+    } else {
+        config
+            .and_then(|config| {
+                config.with_fields(vec![
+                    FieldSchema::new("bucket", DataType::I64)?,
+                    FieldSchema::new("generation", DataType::I64)?,
+                ])
+            })
+            .and_then(|config| config.with_tree_key_fields(vec![FieldId(0)]))
+    };
+    config.map_err(|error| error_at("configure index", error))
 }
 
 /// Materializes bounded mutation batches before the first submission timer.
@@ -675,23 +774,42 @@ fn mutation_batches(
         .chunks(batch_size)
         .enumerate()
         .map(|(batch, vectors)| {
-            vectors
-                .iter()
-                .enumerate()
-                .map(|(offset, vector)| {
-                    let ordinal = batch
-                        .checked_mul(batch_size)
-                        .and_then(|ordinal| ordinal.checked_add(offset))
-                        .ok_or_else(|| "import record ordinal overflow".to_owned())?;
-                    Record::new(
-                        dataset.ids[ordinal].clone(),
-                        Arc::clone(vector),
-                        vec![Value::I64(0), Value::I64(0)],
-                    )
-                    .map(Mutation::Insert)
-                    .map_err(|error| error_at(phase, error))
-                })
-                .collect()
+            let start = batch
+                .checked_mul(batch_size)
+                .ok_or_else(|| "import record ordinal overflow".to_owned())?;
+            mutation_batch(
+                dataset,
+                vectors,
+                start,
+                &[Value::I64(0), Value::I64(0)],
+                phase,
+            )
+        })
+        .collect()
+}
+
+/// Builds one bounded batch of insert mutations from aligned dataset rows.
+fn mutation_batch(
+    dataset: &BenchmarkDataset,
+    vectors: &[Arc<[f32]>],
+    start: usize,
+    fields: &[Value],
+    phase: &str,
+) -> Result<Vec<Mutation>, String> {
+    vectors
+        .iter()
+        .enumerate()
+        .map(|(offset, vector)| {
+            let ordinal = start
+                .checked_add(offset)
+                .ok_or_else(|| "load record ordinal overflow".to_owned())?;
+            Record::new(
+                dataset.ids[ordinal].clone(),
+                Arc::clone(vector),
+                fields.to_vec(),
+            )
+            .map(Mutation::Insert)
+            .map_err(|error| error_at(phase, error))
         })
         .collect()
 }
@@ -964,7 +1082,7 @@ fn search_stage_summaries(metrics: &CapturedMetrics) -> BTreeMap<String, Distrib
         .collect()
 }
 
-/// Owns setup, warmup, measurement, and the post-run invariant audit.
+/// Owns setup, one steady measurement, and the post-run invariant audit.
 async fn run_with_runtime<B: Backend>(
     runtime: &Runtime<MeasuredBackend<B>>,
     backend_counters: &BackendCounters,
@@ -972,6 +1090,62 @@ async fn run_with_runtime<B: Backend>(
     spec: &ScenarioSpec,
     dataset: &BenchmarkDataset,
 ) -> Result<(Topology, SteadyStateMeasurements), String> {
+    let (index, topology) = prepare_index(runtime, metric_capture, spec, dataset).await?;
+    let measurements =
+        measure_steady_workload(&index, backend_counters, metric_capture, spec, dataset).await?;
+    verify_measured_state(&index, spec).await?;
+    Ok((topology, measurements))
+}
+
+/// Measures an ordered beam curve over one loaded and converged Logical Index.
+async fn run_quality_sweep<B: Backend>(
+    runtime: &Runtime<MeasuredBackend<B>>,
+    backend_counters: &BackendCounters,
+    metric_capture: &MetricCapture,
+    spec: &ScenarioSpec,
+    dataset: &mut BenchmarkDataset,
+) -> Result<(Topology, QualitySweepMeasurements), String> {
+    let (index, topology) = prepare_index(runtime, metric_capture, spec, dataset).await?;
+    if topology.max_level.is_none_or(|level| level < 3) {
+        return Err(format!(
+            "large quality topology has max level {:?} with {} partitions by level {:?}; expected at least three searchable levels",
+            topology.max_level, topology.partitions, topology.partitions_by_level
+        ));
+    }
+    // Quality points use only held-out queries and supplied ground truth.
+    // Release the imported million-vector corpus before measuring search.
+    dataset.ids = Vec::new();
+    dataset.base = Vec::new();
+    let mut points = Vec::with_capacity(spec.leaf_beam_sweep.len());
+    for beam in &spec.leaf_beam_sweep {
+        let mut point = spec.clone();
+        point.search_options = point
+            .search_options
+            .with_leaf_beam_size(*beam)
+            .map_err(|error| error_at("configure quality point", error))?;
+        let mut measurements =
+            measure_steady_workload(&index, backend_counters, metric_capture, &point, dataset)
+                .await?;
+        // getrusage exposes only the process-lifetime high-water mark, which
+        // setup already established and cannot attribute to one beam point.
+        measurements.peak_rss_bytes = None;
+        points.push(QualityPoint {
+            leaf_beam_size: *beam,
+            measurements,
+        });
+    }
+    verify_measured_state(&index, spec).await?;
+    validate_quality_frontier(&points, spec.measured_operations)?;
+    Ok((topology, QualitySweepMeasurements { points }))
+}
+
+/// Creates, loads, and converges one fresh Logical Index outside measurement.
+async fn prepare_index<B: Backend>(
+    runtime: &Runtime<MeasuredBackend<B>>,
+    metric_capture: &MetricCapture,
+    spec: &ScenarioSpec,
+    dataset: &BenchmarkDataset,
+) -> Result<(Index<MeasuredBackend<B>>, Topology), String> {
     let index_config = index_config(spec)?;
     let index = runtime
         .create_index("benchmark", index_config)
@@ -981,12 +1155,34 @@ async fn run_with_runtime<B: Backend>(
     // Setup is deliberately complete before any timer or counter baseline:
     // load transactions, split training, verification, oracle construction,
     // and cache warmup therefore cannot make measured operations look slower.
-    load_index(&index, dataset).await?;
-    let topology = settle_topology(&index, dataset, spec).await?;
-    let truth = (spec.search_percent == 100).then(|| exact_truth(dataset, spec.k));
+    let import_started = phase_started(spec, "import");
+    load_index(&index, dataset, spec).await?;
+    phase_completed(spec, "import", import_started);
+    let deadline = Instant::now() + settle_timeout(spec);
+    let (topology, _) =
+        settle_and_drain_topology(&index, dataset, spec, metric_capture, deadline).await?;
+    Ok((index, topology))
+}
+
+/// Measures one fixed workload after setup and before the invariant audit.
+async fn measure_steady_workload<B: Backend>(
+    index: &Index<MeasuredBackend<B>>,
+    backend_counters: &BackendCounters,
+    metric_capture: &MetricCapture,
+    spec: &ScenarioSpec,
+    dataset: &BenchmarkDataset,
+) -> Result<SteadyStateMeasurements, String> {
+    let truth = (spec.search_percent == 100).then(|| exact_truth(dataset, spec.metric, spec.k));
     let warmup = work_items(dataset, None, spec, spec.warmup_operations, 0)?;
+    let point = spec
+        .search_options
+        .leaf_beam_size()
+        .map_or_else(|| "workload".to_owned(), |beam| format!("beam {beam}"));
+    let warmup_phase = format!("{point} warmup");
+    let warmup_started = phase_started(spec, &warmup_phase);
     let _warmup_result =
         execute_items(index.clone(), warmup, spec.concurrency, spec.dispatch).await?;
+    phase_completed(spec, &warmup_phase, warmup_started);
 
     // Reset setup counters and histograms before the measured interval. Gauges
     // retain current process state and need no compatibility fallback.
@@ -1002,6 +1198,8 @@ async fn run_with_runtime<B: Backend>(
     )?;
 
     let resources_before = ResourceSnapshot::capture()?;
+    let measured_phase = format!("{point} measurement");
+    let measured_started = phase_started(spec, &measured_phase);
     let wall_started = Instant::now();
     let workload = execute_items(
         index.clone(),
@@ -1011,6 +1209,7 @@ async fn run_with_runtime<B: Backend>(
     )
     .await?;
     let wall_seconds = wall_started.elapsed().as_secs_f64();
+    phase_completed(spec, &measured_phase, measured_started);
     let metrics = metric_capture.snapshot();
     let maintenance_started = Instant::now();
     wait_for_maintenance(metric_capture, settle_timeout(spec)).await?;
@@ -1018,20 +1217,6 @@ async fn run_with_runtime<B: Backend>(
     let resources_after = ResourceSnapshot::capture()?;
     let backend_io = backend_counters.since(&backend_before);
     let recalls = workload.recall_values();
-
-    // Verification is outside the timed region and protects the benchmark
-    // itself from reporting fast results produced by corrupt persistent state.
-    let final_report = index
-        .verify(VerifyOptions::default())
-        .await
-        .map_err(|error| error_at("verify measured state", error))?;
-    if !final_report.complete || !final_report.issues.is_empty() {
-        return Err(format!(
-            "post-run verification failed: complete={}, issues={}",
-            final_report.complete,
-            final_report.issues.len()
-        ));
-    }
 
     let successful_writes = workload.accepted_operations(OperationClass::Write);
     let write_amplification = (successful_writes > 0).then(|| WriteAmplification {
@@ -1063,7 +1248,89 @@ async fn run_with_runtime<B: Backend>(
         backend_io,
         write_amplification,
     };
-    Ok((topology, measurements))
+    Ok(measurements)
+}
+
+/// Protects reports from measurements produced by corrupt persistent state.
+async fn verify_measured_state<B: Backend>(
+    index: &Index<MeasuredBackend<B>>,
+    spec: &ScenarioSpec,
+) -> Result<(), String> {
+    let started = phase_started(spec, "final verification");
+    let report = index
+        .verify(verify_options(spec, None)?)
+        .await
+        .map_err(|error| error_at("verify measured state", error))?;
+    if !report.complete || !report.issues.is_empty() {
+        return Err(format!(
+            "post-run verification failed: complete={}, issues={}",
+            report.complete,
+            report.issues.len()
+        ));
+    }
+    phase_completed(spec, "final verification", started);
+    Ok(())
+}
+
+/// Requires both quality and work to move across the declared beam curve.
+fn validate_quality_frontier(
+    points: &[QualityPoint],
+    expected_searches: usize,
+) -> Result<(), String> {
+    let expected_searches = u64::try_from(expected_searches)
+        .map_err(|_| "large quality search count exceeds u64".to_owned())?;
+    let mut recalls = Vec::with_capacity(points.len());
+    let mut leaf_work = Vec::with_capacity(points.len());
+    for point in points {
+        let search = point
+            .measurements
+            .operations
+            .get(&OperationClass::Search)
+            .ok_or_else(|| format!("leaf beam {} has no search results", point.leaf_beam_size))?;
+        let recall =
+            point.measurements.recall_at_k.as_ref().ok_or_else(|| {
+                format!("leaf beam {} has no recall results", point.leaf_beam_size)
+            })?;
+        let leaf_budget = point
+            .measurements
+            .search_budgets
+            .get("visited_leaf_entries")
+            .ok_or_else(|| {
+                format!(
+                    "leaf beam {} has no Leaf Entry budget results",
+                    point.leaf_beam_size
+                )
+            })?;
+        if search.attempted != expected_searches
+            || search.accepted != expected_searches
+            || recall.queries != expected_searches
+            || leaf_budget.usage.count != expected_searches
+        {
+            return Err(format!(
+                "leaf beam {} completed {}/{} searches with {} recall and {} Leaf Entry samples; expected {expected_searches}",
+                point.leaf_beam_size,
+                search.accepted,
+                search.attempted,
+                recall.queries,
+                leaf_budget.usage.count,
+            ));
+        }
+        recalls.push(recall.mean);
+        leaf_work.push(leaf_budget.usage.mean);
+    }
+    let recall_moves = recalls
+        .iter()
+        .copied()
+        .reduce(f64::min)
+        .zip(recalls.iter().copied().reduce(f64::max))
+        .is_some_and(|(minimum, maximum)| maximum > minimum);
+    let work_moves = leaf_work.windows(2).any(|window| window[1] > window[0]);
+    if !recall_moves || !work_moves {
+        return Err(
+            "large quality sweep did not produce a nontrivial quality/work frontier".to_owned(),
+        );
+    }
+    Ok(())
 }
 
 /// Rejects pressure samples that do not occupy their declared operating region.
@@ -1107,8 +1374,43 @@ fn validate_admission_target(
 async fn load_index<B: Backend>(
     index: &Index<MeasuredBackend<B>>,
     dataset: &BenchmarkDataset,
+    spec: &ScenarioSpec,
 ) -> Result<(), String> {
-    for mutations in mutation_batches(dataset, 50, "construct load record")? {
+    let mut import = if spec.profile == "large" {
+        Some(
+            index
+                .import_session(
+                    ImportOptions::default()
+                        .with_max_in_flight_batches(spec.import_max_in_flight_batches)
+                        .map_err(|error| error_at("configure load import", error))?,
+                )
+                .map_err(|error| error_at("open load import", error))?,
+        )
+    } else {
+        None
+    };
+    let batch_size = if spec.profile == "large" {
+        spec.import_batch_size
+    } else {
+        50
+    };
+    let fields = if spec.profile == "large" {
+        Vec::new()
+    } else {
+        vec![Value::I64(0), Value::I64(0)]
+    };
+    for (batch, vectors) in dataset.base.chunks(batch_size).enumerate() {
+        let start = batch
+            .checked_mul(batch_size)
+            .ok_or_else(|| "load record ordinal overflow".to_owned())?;
+        let mutations = mutation_batch(dataset, vectors, start, &fields, "construct load record")?;
+        if let Some(import) = import.as_mut() {
+            import
+                .submit(mutations)
+                .await
+                .map_err(|error| error_at("submit load records", error))?;
+            continue;
+        }
         let mut attempts = 0_u32;
         loop {
             match index.batch_mutate(mutations.clone()).await {
@@ -1121,68 +1423,70 @@ async fn load_index<B: Backend>(
             }
         }
     }
+    if let Some(import) = import {
+        for result in import.finish().await {
+            result
+                .result
+                .map_err(|error| error_at("load records", error))?;
+        }
+    }
     Ok(())
 }
 
-/// Drives relevant accesses until the structured topology is observably stable.
-async fn settle_topology<B: Backend>(
-    index: &Index<MeasuredBackend<B>>,
-    dataset: &BenchmarkDataset,
-    spec: &ScenarioSpec,
-) -> Result<Topology, String> {
-    let deadline = Instant::now() + settle_timeout(spec);
-    settle_topology_until(index, dataset, spec, deadline).await
-}
-
-/// Drives topology convergence without extending the caller's absolute deadline.
-async fn settle_topology_until<B: Backend>(
+/// Uses public searches to rediscover maintenance work after an unsettled audit.
+async fn rediscover_topology_work<B: Backend>(
     index: &Index<MeasuredBackend<B>>,
     dataset: &BenchmarkDataset,
     spec: &ScenarioSpec,
     deadline: Instant,
-) -> Result<Topology, String> {
-    let mut previous = None;
-    let mut stable_rounds = 0_u8;
-    loop {
-        let topology = verified_topology(index, "verify topology", deadline).await?;
-        let structured = topology.partitions > 1 && topology.entries > topology.vector_records;
-        stable_rounds = if structured {
-            if previous.as_ref() == Some(&topology) {
-                stable_rounds.saturating_add(1)
-            } else {
-                1
-            }
-        } else {
-            0
-        };
-        if stable_rounds >= 3 {
-            return Ok(topology);
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "topology did not stabilize: records={}, partitions={}, entries={}",
-                topology.vector_records, topology.partitions, topology.entries
-            ));
-        }
-        previous = Some(topology.clone());
-
-        // Search is the public access path that rediscovers cold intermediate
-        // states. Cycling a few held-out queries makes progress demand-driven
-        // without introducing a private maintenance control surface.
-        for query in dataset.queries.iter().take(4) {
-            let request = SearchRequest::new(Arc::clone(query), spec.k)
-                .map(|request| request.with_options(spec.search_options))
-                .map_err(|error| error_at("construct topology-settling search", error))?;
-            index
-                .search_with_control(request, OperationOptions::default().with_deadline(deadline))
-                .await
-                .map_err(|error| error_at("settle topology", error))?;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+) -> Result<(), String> {
+    // A complete large query set gives demand-driven maintenance representative
+    // tree coverage. Ordinary profiles retain a bounded four-query probe.
+    let query_limit = if spec.profile == "large" {
+        dataset.queries.len()
+    } else {
+        4
+    };
+    for query in dataset.queries.iter().take(query_limit) {
+        let request = SearchRequest::new(Arc::clone(query), spec.k)
+            .map(|request| request.with_options(spec.search_options))
+            .map_err(|error| error_at("construct topology-settling search", error))?;
+        index
+            .search_with_control(request, OperationOptions::default().with_deadline(deadline))
+            .await
+            .map_err(|error| error_at("settle topology", error))?;
     }
+    Ok(())
 }
 
-/// Repeats stable observation and maintenance drain until both agree.
+/// Returns whether aggregate topology could be a fully settled search tree.
+fn topology_is_settled(topology: &Topology, max_partition_entries: u32) -> bool {
+    let leaf_entries = topology.entries_by_level.get(&1).copied().unwrap_or(0);
+    let largest_leaf = topology.max_entries_by_level.get(&1).copied().unwrap_or(0);
+    topology.partitions > 1
+        && topology.entries > topology.vector_records
+        && leaf_entries == topology.vector_records
+        && largest_leaf <= max_partition_entries
+        && topology.actionable_partitions == 0
+        && topology.partition_states.transitional() == 0
+}
+
+/// Records a topology audit and returns consecutive unchanged rediscovery rounds.
+fn observe_topology_progress(
+    topology: &Topology,
+    previous_topology: &mut Option<Topology>,
+    unchanged_rounds: &mut u32,
+) -> u32 {
+    if previous_topology.as_ref() == Some(topology) {
+        *unchanged_rounds = unchanged_rounds.saturating_add(1);
+    } else {
+        *unchanged_rounds = 0;
+    }
+    *previous_topology = Some(topology.clone());
+    *unchanged_rounds
+}
+
+/// Drains scheduled work and accepts the first complete settled topology audit.
 async fn settle_and_drain_topology<B: Backend>(
     index: &Index<MeasuredBackend<B>>,
     dataset: &BenchmarkDataset,
@@ -1190,30 +1494,101 @@ async fn settle_and_drain_topology<B: Backend>(
     metric_capture: &MetricCapture,
     deadline: Instant,
 ) -> Result<(Topology, f64), String> {
+    const MAX_UNCHANGED_ROUNDS: u32 = 2;
+
     let mut maintenance_drain_seconds = 0.0;
+    let mut round = 1_u32;
+    let mut previous_topology = None;
+    let mut unchanged_rounds = 0_u32;
     loop {
-        let topology = settle_topology_until(index, dataset, spec, deadline).await?;
+        let drain_phase = format!("maintenance drain {round}");
         let drain_started = Instant::now();
+        phase_announced(spec, &drain_phase);
         wait_for_maintenance_until(metric_capture, deadline).await?;
-        maintenance_drain_seconds += drain_started.elapsed().as_secs_f64();
-        let drained = verified_topology(index, "verify drained topology", deadline).await?;
-        if drained == topology {
-            return Ok((drained, maintenance_drain_seconds));
+        let drain_elapsed = drain_started.elapsed();
+        maintenance_drain_seconds += drain_elapsed.as_secs_f64();
+        phase_completed(spec, &drain_phase, drain_started);
+
+        let verify_phase = format!("topology verification {round}");
+        let verify_started = phase_started(spec, &verify_phase);
+        let topology = verified_topology(index, spec, "verify topology", deadline).await?;
+        phase_completed(spec, &verify_phase, verify_started);
+        eprintln!(
+            "[{}] topology: records={}, partitions={}, actionable={}, transitional={}, max_entries_by_level={:?}",
+            spec.name,
+            topology.vector_records,
+            topology.partitions,
+            topology.actionable_partitions,
+            topology.partition_states.transitional(),
+            topology.max_entries_by_level,
+        );
+        if topology_is_settled(&topology, spec.max_partition_entries) {
+            return Ok((topology, maintenance_drain_seconds));
         }
+        if observe_topology_progress(&topology, &mut previous_topology, &mut unchanged_rounds)
+            >= MAX_UNCHANGED_ROUNDS
+        {
+            return Err(format!(
+                "topology made no observable progress across {unchanged_rounds} rediscovery rounds: \
+                 records={}, partitions={}, entries={}, actionable={}, transitional={}, \
+                 max_entries_by_level={:?}",
+                topology.vector_records,
+                topology.partitions,
+                topology.entries,
+                topology.actionable_partitions,
+                topology.partition_states.transitional(),
+                topology.max_entries_by_level,
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "topology did not settle: records={}, partitions={}, entries={}, \
+                 actionable={}, transitional={}, max_entries_by_level={:?}",
+                topology.vector_records,
+                topology.partitions,
+                topology.entries,
+                topology.actionable_partitions,
+                topology.partition_states.transitional(),
+                topology.max_entries_by_level,
+            ));
+        }
+        let rediscovery_phase = format!("maintenance rediscovery {round}");
+        let rediscovery_started = phase_started(spec, &rediscovery_phase);
+        rediscover_topology_work(index, dataset, spec, deadline).await?;
+        phase_completed(spec, &rediscovery_phase, rediscovery_started);
+        round = round.saturating_add(1);
     }
+}
+
+/// Reports a benchmark phase boundary without changing its measured interval.
+fn phase_started(spec: &ScenarioSpec, phase: &str) -> Instant {
+    phase_announced(spec, phase);
+    Instant::now()
+}
+
+/// Reports a benchmark phase start to the worker's inherited stderr.
+fn phase_announced(spec: &ScenarioSpec, phase: &str) {
+    eprintln!("[{}] {phase} started", spec.name);
+}
+
+/// Reports elapsed wall time for one completed benchmark phase.
+fn phase_completed(spec: &ScenarioSpec, phase: &str, started: Instant) {
+    eprintln!(
+        "[{}] {phase} completed in {:.3}s",
+        spec.name,
+        started.elapsed().as_secs_f64()
+    );
 }
 
 /// Verifies persistent state and returns its observable topology counts.
 async fn verified_topology<B: Backend>(
     index: &Index<MeasuredBackend<B>>,
+    spec: &ScenarioSpec,
     phase: &str,
     deadline: Instant,
 ) -> Result<Topology, String> {
     let report = index
-        .verify(
-            VerifyOptions::default()
-                .with_operation_options(OperationOptions::default().with_deadline(deadline)),
-        )
+        .verify(verify_options(spec, Some(deadline))?)
         .await
         .map_err(|error| error_at(phase, error))?;
     if !report.complete || !report.issues.is_empty() {
@@ -1225,17 +1600,48 @@ async fn verified_topology<B: Backend>(
     }
     Ok(Topology {
         vector_records: report.objects.vector_records,
-        partitions: report.objects.partitions,
+        partitions: report.topology.partitions,
         entries: report.objects.entries,
+        trees: report.topology.trees,
+        max_level: report.topology.max_level,
+        partitions_by_level: report.topology.partitions_by_level,
+        entries_by_level: report.topology.entries_by_level,
+        max_entries_by_level: report.topology.max_entries_by_level,
+        partition_states: PartitionStateCounts {
+            ready: report.topology.partition_states.ready,
+            splitting: report.topology.partition_states.splitting,
+            receiving_split: report.topology.partition_states.receiving_split,
+            draining_split: report.topology.partition_states.draining_split,
+            merging: report.topology.partition_states.merging,
+        },
+        actionable_partitions: report.topology.actionable_partitions,
+    })
+}
+
+/// Applies larger verification bounds only to the declared million-vector profile.
+fn verify_options(spec: &ScenarioSpec, deadline: Option<Instant>) -> Result<VerifyOptions, String> {
+    let options = if spec.profile == "large" {
+        VerifyOptions::default()
+            .with_object_limit(10_000_000)
+            .and_then(|options| options.with_memory_limit_bytes(1 << 30))
+            .map_err(|error| error_at("configure verification", error))?
+    } else {
+        VerifyOptions::default()
+    };
+    Ok(match deadline {
+        Some(deadline) => {
+            options.with_operation_options(OperationOptions::default().with_deadline(deadline))
+        }
+        None => options,
     })
 }
 
 /// Returns the bounded setup and maintenance-drain allowance for a profile.
 fn settle_timeout(spec: &ScenarioSpec) -> Duration {
-    if spec.profile == "smoke" {
-        Duration::from_secs(30)
-    } else {
-        Duration::from_secs(120)
+    match spec.profile {
+        "smoke" => Duration::from_secs(30),
+        "large" => Duration::from_secs(6 * 60 * 60),
+        _ => Duration::from_secs(120),
     }
 }
 
@@ -1497,9 +1903,7 @@ impl WorkloadObservation {
     fn recall_values(&self) -> Vec<f64> {
         self.recall_inputs
             .iter()
-            .map(|input| {
-                oracle::recall_ids(input.outcome.hits.iter().map(|hit| hit.id()), &input.truth)
-            })
+            .map(|input| oracle::recall_ids(input.hit_ids.iter(), &input.truth))
             .collect()
     }
 }
@@ -1516,7 +1920,12 @@ async fn execute_item<B: Backend>(
             index
                 .search(request)
                 .await
-                .map(|outcome| truth.map(|truth| RecallInput { outcome, truth }))
+                .map(|outcome| {
+                    truth.map(|truth| RecallInput {
+                        hit_ids: outcome.hits.iter().map(|hit| hit.id().clone()).collect(),
+                        truth,
+                    })
+                })
                 .map_err(|error| error.kind()),
         ),
         WorkItem::Upsert { record } => (
@@ -1535,8 +1944,23 @@ async fn execute_item<B: Backend>(
     }
 }
 
-/// Computes canonical exact L2 top-k truth before warmup and measurement.
-fn exact_truth(dataset: &BenchmarkDataset, k: usize) -> Vec<ExactTruth> {
+/// Computes canonical exact top-k truth before warmup and measurement.
+fn exact_truth(dataset: &BenchmarkDataset, metric: Metric, k: usize) -> Vec<ExactTruth> {
+    if let Some(truth) = &dataset.ground_truth {
+        return truth
+            .iter()
+            .map(|neighbors| {
+                Arc::from(
+                    neighbors
+                        .iter()
+                        .take(k)
+                        .cloned()
+                        .map(|id| (id, 0.0))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+    }
     dataset
         .queries
         .iter()
@@ -1544,7 +1968,7 @@ fn exact_truth(dataset: &BenchmarkDataset, k: usize) -> Vec<ExactTruth> {
             Arc::from(oracle::truth_vectors(
                 &dataset.ids,
                 &dataset.base,
-                Metric::L2,
+                metric,
                 query,
                 k,
             ))
@@ -1685,11 +2109,15 @@ mod tests {
 
     use ktann::api::{SearchBudgets, SearchOptions};
 
-    use crate::report::{Distribution, OperationClass, OperationSummary};
+    use crate::report::{
+        BudgetSummary, Distribution, OperationClass, OperationSummary, QualityPoint, RecallSummary,
+        SteadyStateMeasurements, Topology,
+    };
 
     use super::{
-        CONVERGENCE_MAINTENANCE_WORKERS, is_search_operation, runtime_config, scenarios,
-        search_budget_configuration, validate_admission_target,
+        CONVERGENCE_MAINTENANCE_WORKERS, is_search_operation, observe_topology_progress,
+        runtime_config, scenarios, search_budget_configuration, topology_is_settled,
+        validate_admission_target, validate_quality_frontier,
     };
 
     fn operation_summary(attempted: u64, accepted: u64, rejected: u64) -> OperationSummary {
@@ -1715,9 +2143,39 @@ mod tests {
         }
     }
 
+    fn quality_point(beam: u32, searches: u64, recall: f64, leaf_work: f64) -> QualityPoint {
+        let mut measurements = SteadyStateMeasurements {
+            recall_at_k: Some(RecallSummary {
+                queries: searches,
+                mean: recall,
+                min: recall,
+            }),
+            ..Default::default()
+        };
+        measurements.operations.insert(
+            OperationClass::Search,
+            operation_summary(searches, searches, 0),
+        );
+        measurements.search_budgets.insert(
+            "visited_leaf_entries".to_owned(),
+            BudgetSummary {
+                usage: Distribution {
+                    count: searches,
+                    mean: leaf_work,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        QualityPoint {
+            leaf_beam_size: beam,
+            measurements,
+        }
+    }
+
     #[test]
     fn every_scenario_has_a_jointly_valid_runtime_configuration() {
-        for profile in ["smoke", "full"] {
+        for profile in ["smoke", "full", "large"] {
             for scenario in scenarios(profile).expect("known profile") {
                 for workers in [
                     scenario.maintenance_workers,
@@ -1733,7 +2191,7 @@ mod tests {
 
     #[test]
     fn measured_windows_preserve_each_declared_operation_mix() {
-        for profile in ["smoke", "full"] {
+        for profile in ["smoke", "full", "large"] {
             for scenario in scenarios(profile).expect("known profile") {
                 let searches = (scenario.warmup_operations
                     ..scenario.warmup_operations + scenario.measured_operations)
@@ -1780,15 +2238,14 @@ mod tests {
         let rerank = budgets.exact_rerank_candidates;
         assert_eq!(rerank.runtime_default, 65_536);
         assert_eq!(rerank.request_override, None);
-        assert_eq!(rerank.effective_limit, 100);
+        assert_eq!(rerank.effective_limit, 64);
     }
 
     #[test]
     fn report_distinguishes_a_request_budget_override() {
         let options = SearchOptions::default()
             .with_visited_partitions(64)
-            .and_then(|options| options.with_exact_rerank_candidates(256))
-            .expect("valid request overrides");
+            .expect("valid request override");
         let budgets = search_budget_configuration(SearchBudgets::default(), options, 10)
             .expect("overridden search budgets resolve");
 
@@ -1796,10 +2253,98 @@ mod tests {
         assert_eq!(partitions.runtime_default, 1_024);
         assert_eq!(partitions.request_override, Some(64));
         assert_eq!(partitions.effective_limit, 64);
+    }
 
-        let rerank = budgets.exact_rerank_candidates;
-        assert_eq!(rerank.runtime_default, 65_536);
-        assert_eq!(rerank.request_override, Some(256));
-        assert_eq!(rerank.effective_limit, 256);
+    #[test]
+    fn large_profile_is_an_explicit_single_variable_beam_sweep() {
+        for scenario in scenarios("large").expect("large profile") {
+            assert_eq!(scenario.leaf_beam_sweep, [1, 4, 16, 32]);
+            assert_eq!(scenario.search_options.scanned_tree_keys(), Some(1));
+            assert_eq!(scenario.search_options.visited_partitions(), Some(16_384));
+            assert_eq!(
+                scenario.search_options.visited_leaf_entries(),
+                Some(1_048_576)
+            );
+            assert_eq!(scenario.search_options.leaf_beam_size(), None);
+            let budgets = scenario
+                .search_options
+                .resolve(SearchBudgets::default(), scenario.k)
+                .expect("large search budgets resolve");
+            assert_eq!(budgets.exact_rerank_candidates(), 64);
+            let max_partition_entries = usize::try_from(scenario.max_partition_entries)
+                .expect("partition fanout fits usize");
+            assert!(
+                max_partition_entries * max_partition_entries < scenario.base_vectors,
+                "the shared partition fanout must force a third topology level"
+            );
+        }
+    }
+
+    #[test]
+    fn quality_frontier_requires_complete_results_for_every_beam() {
+        let mut points = vec![
+            quality_point(1, 2, 0.5, 10.0),
+            quality_point(2, 2, 1.0, 20.0),
+        ];
+        assert!(validate_quality_frontier(&points, 2).is_ok());
+
+        points[0].measurements.recall_at_k = None;
+        assert!(validate_quality_frontier(&points, 2).is_err());
+    }
+
+    #[test]
+    fn topology_settlement_rejects_insufficient_leaf_capacity() {
+        let topology = crate::report::Topology {
+            vector_records: 1_000_000,
+            partitions: 1_089,
+            entries: 1_001_088,
+            trees: 1,
+            max_level: Some(3),
+            partitions_by_level: BTreeMap::from([(1, 1_085), (2, 3), (3, 1)]),
+            entries_by_level: BTreeMap::from([(1, 1_000_000), (2, 1_085), (3, 3)]),
+            max_entries_by_level: BTreeMap::from([(1, 1_842), (2, 512), (3, 3)]),
+            partition_states: Default::default(),
+            actionable_partitions: 0,
+        };
+
+        assert!(topology_is_settled(&topology, 1_842));
+        assert!(!topology_is_settled(&topology, 512));
+    }
+
+    #[test]
+    fn topology_progress_counts_completed_unchanged_rediscoveries() {
+        let first = Topology {
+            vector_records: 1_000_000,
+            partitions: 1_000,
+            ..Default::default()
+        };
+        let mut previous = None;
+        let mut unchanged_rounds = 0;
+
+        assert_eq!(
+            observe_topology_progress(&first, &mut previous, &mut unchanged_rounds),
+            0
+        );
+        assert_eq!(
+            observe_topology_progress(&first, &mut previous, &mut unchanged_rounds),
+            1
+        );
+
+        let progressed = Topology {
+            partitions: 1_001,
+            ..first
+        };
+        assert_eq!(
+            observe_topology_progress(&progressed, &mut previous, &mut unchanged_rounds),
+            0
+        );
+        assert_eq!(
+            observe_topology_progress(&progressed, &mut previous, &mut unchanged_rounds),
+            1
+        );
+        assert_eq!(
+            observe_topology_progress(&progressed, &mut previous, &mut unchanged_rounds),
+            2
+        );
     }
 }

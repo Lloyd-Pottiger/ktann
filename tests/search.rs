@@ -12,8 +12,8 @@ use std::time::Instant;
 use bytes::Bytes;
 use ktann::api::{
     CompareOp, DataType, ErrorKind, FieldId, FieldSchema, Index, IndexConfig, LogicalIndexId,
-    Metric, OperationOptions, Predicate, Record, SearchOptions, SearchOutcome, SearchRequest,
-    Value,
+    Metric, OperationOptions, Predicate, Record, SearchBudgets, SearchOptions, SearchOutcome,
+    SearchRequest, Value,
 };
 use ktann::runtime::Runtime;
 use ktann::storage::backend::{
@@ -180,7 +180,7 @@ fn hit_parts(outcome: &SearchOutcome) -> Vec<(Bytes, f64)> {
         .collect()
 }
 
-fn assert_no_exhaustion(outcome: &SearchOutcome) {
+fn assert_no_budget_exhaustion(outcome: &SearchOutcome) {
     assert!(
         !outcome.exhausted.scanned_tree_keys
             && !outcome.exhausted.visited_partitions
@@ -189,7 +189,6 @@ fn assert_no_exhaustion(outcome: &SearchOutcome) {
         "no budget dimension is exhausted: {:?}",
         outcome.exhausted
     );
-    assert!(!outcome.rabitq_overlap_truncated);
 }
 
 fn search_request(k: usize) -> SearchRequest {
@@ -234,7 +233,7 @@ async fn an_empty_index_returns_an_empty_outcome() {
     assert_eq!(outcome.usage.visited_partitions, 0);
     assert_eq!(outcome.usage.visited_leaf_entries, 0);
     assert_eq!(outcome.usage.exact_rerank_candidates, 0);
-    assert_no_exhaustion(&outcome);
+    assert_no_budget_exhaustion(&outcome);
     runtime.shutdown().await.expect("shutdown");
 }
 
@@ -259,7 +258,7 @@ async fn search_matches_brute_force_and_reports_exact_usage() {
     assert_eq!(outcome.usage.visited_partitions, 1);
     assert_eq!(outcome.usage.visited_leaf_entries, 20);
     assert!(outcome.usage.exact_rerank_candidates >= 5);
-    assert_no_exhaustion(&outcome);
+    assert_no_budget_exhaustion(&outcome);
 
     // A warm-cache rerun over an unchanged snapshot is bit-identical.
     let rerun = index.search(search_request(5)).await.expect("search");
@@ -284,7 +283,7 @@ async fn multi_tree_fanout_merges_one_deterministic_order() {
     assert_eq!(outcome.usage.scanned_tree_keys, 4);
     assert_eq!(outcome.usage.visited_partitions, 4);
     assert_eq!(outcome.usage.visited_leaf_entries, 8);
-    assert_no_exhaustion(&outcome);
+    assert_no_budget_exhaustion(&outcome);
     runtime.shutdown().await.expect("shutdown");
 }
 
@@ -309,7 +308,7 @@ async fn tree_key_predicate_scans_only_the_planned_range() {
     assert_eq!(outcome.usage.scanned_tree_keys, 1);
     assert_eq!(outcome.usage.visited_partitions, 1);
     assert_eq!(outcome.usage.visited_leaf_entries, 2);
-    assert_no_exhaustion(&outcome);
+    assert_no_budget_exhaustion(&outcome);
     runtime.shutdown().await.expect("shutdown");
 }
 
@@ -329,7 +328,7 @@ async fn non_key_predicates_filter_exactly_and_null_never_matches() {
         hit_parts(&outcome),
         brute_force(&rows, 0.0, 4, |row| row.3 == Some(5))
     );
-    assert_no_exhaustion(&outcome);
+    assert_no_budget_exhaustion(&outcome);
 
     // SQL UNKNOWN never qualifies: only IsNull returns the NULL-score rows.
     let request = search_request(4).with_predicate(Predicate::IsNull(FieldId(1)));
@@ -338,7 +337,7 @@ async fn non_key_predicates_filter_exactly_and_null_never_matches() {
         hit_parts(&outcome),
         brute_force(&rows, 0.0, 4, |row| row.3.is_none())
     );
-    assert_no_exhaustion(&outcome);
+    assert_no_budget_exhaustion(&outcome);
     runtime.shutdown().await.expect("shutdown");
 }
 
@@ -357,7 +356,7 @@ async fn a_predicate_matching_no_tree_key_yields_an_empty_outcome() {
     assert!(outcome.hits.is_empty());
     assert_eq!(outcome.usage.scanned_tree_keys, 0);
     assert_eq!(outcome.usage.visited_partitions, 0);
-    assert_no_exhaustion(&outcome);
+    assert_no_budget_exhaustion(&outcome);
 
     // A point predicate with no stored tree scans its range without a hit.
     let request = search_request(4).with_predicate(Predicate::Compare {
@@ -368,7 +367,7 @@ async fn a_predicate_matching_no_tree_key_yields_an_empty_outcome() {
     let outcome = index.search(request).await.expect("search");
     assert!(outcome.hits.is_empty());
     assert_eq!(outcome.usage.scanned_tree_keys, 0);
-    assert_no_exhaustion(&outcome);
+    assert_no_budget_exhaustion(&outcome);
     runtime.shutdown().await.expect("shutdown");
 }
 
@@ -451,22 +450,26 @@ async fn every_budget_dimension_reports_exactly_its_own_exhaustion() {
 
     // Exact rerank candidates: two trees of ten identical vectors each. Every
     // interval coincides, so the per-leaf caps and the merged selection both
-    // truncate to the rerank budget and report it.
-    let (_backend, runtime, index) = setup().await;
+    // truncate to the Runtime ceiling and report it.
+    let backend = shared_backend(DeterministicConfig::default());
+    let search_budgets =
+        SearchBudgets::new(4_096, 1_024, 65_536, 3).expect("valid exact-rerank ceiling");
+    let runtime_config = support::manual_maintenance_config()
+        .with_default_search_budgets(search_budgets)
+        .expect("valid runtime search budgets");
+    let runtime = Runtime::new(backend, runtime_config).expect("runtime is valid");
+    let index = runtime
+        .create_index("index", config())
+        .await
+        .expect("create index");
     let mut rows: Vec<Row> = Vec::new();
     for i in 0..10_u8 {
         rows.push((format!("a{i}").into_bytes(), 1.0, 1, None));
         rows.push((format!("b{i}").into_bytes(), 1.0, 2, None));
     }
     insert_all(&index, &rows).await;
-    let options = SearchOptions::default()
-        .with_exact_rerank_candidates(2)
-        .expect("valid override");
-    let outcome = index
-        .search(search_request(2).with_options(options))
-        .await
-        .expect("search");
-    assert_eq!(outcome.usage.exact_rerank_candidates, 2);
+    let outcome = index.search(search_request(2)).await.expect("search");
+    assert_eq!(outcome.usage.exact_rerank_candidates, 3);
     assert!(outcome.exhausted.exact_rerank_candidates);
     assert!(outcome.rabitq_overlap_truncated);
     assert!(!outcome.exhausted.scanned_tree_keys);
@@ -476,10 +479,7 @@ async fn every_budget_dimension_reports_exactly_its_own_exhaustion() {
     assert!(outcome.hits.iter().all(|hit| hit.distance() == 1.0));
 
     // The depleted outcome is deterministic across identical resubmissions.
-    let rerun = index
-        .search(search_request(2).with_options(options))
-        .await
-        .expect("search");
+    let rerun = index.search(search_request(2)).await.expect("search");
     assert_eq!(hit_parts(&rerun), hit_parts(&outcome));
     assert_eq!(rerun.usage, outcome.usage);
     assert_eq!(rerun.exhausted, outcome.exhausted);
@@ -659,7 +659,7 @@ async fn a_draining_root_split_stays_searchable_with_exact_membership() {
     assert_eq!(outcome.usage.scanned_tree_keys, 1);
     assert_eq!(outcome.usage.visited_partitions, 3);
     assert_eq!(outcome.usage.visited_leaf_entries, 3);
-    assert_no_exhaustion(&outcome);
+    assert_no_budget_exhaustion(&outcome);
 
     // Synopsis pruning applies to the crafted targets: only the root body
     // holds a score of 2, so the targets are provably skipped uncharged.
@@ -675,7 +675,7 @@ async fn a_draining_root_split_stays_searchable_with_exact_membership() {
     );
     assert_eq!(outcome.usage.visited_partitions, 3);
     assert_eq!(outcome.usage.visited_leaf_entries, 1);
-    assert_no_exhaustion(&outcome);
+    assert_no_budget_exhaustion(&outcome);
     runtime.shutdown().await.expect("shutdown");
 }
 
@@ -1011,7 +1011,7 @@ async fn backend_limits_paginate_scans_and_bound_batches() {
     let outcome = index.search(search_request(4)).await.expect("search");
     assert_eq!(hit_parts(&outcome), brute_force(&rows, 0.0, 4, |_| true));
     assert_eq!(outcome.usage.scanned_tree_keys, 4);
-    assert_no_exhaustion(&outcome);
+    assert_no_budget_exhaustion(&outcome);
     runtime.shutdown().await.expect("shutdown");
 
     // A backend batch ceiling that admits every mutation batch (at most 9
@@ -1095,16 +1095,6 @@ async fn invalid_requests_fail_before_admission() {
     // The query dimension must match the Manifest.
     let request = SearchRequest::new(Arc::from([0.0_f32, 1.0]), 4).expect("valid request");
     let error = index.search(request).await.expect_err("wrong dimension");
-    assert_eq!(error.kind(), ErrorKind::InvalidArgument);
-
-    // The effective exact-rerank budget must be at least k.
-    let options = SearchOptions::default()
-        .with_exact_rerank_candidates(2)
-        .expect("valid override");
-    let error = index
-        .search(search_request(4).with_options(options))
-        .await
-        .expect_err("rerank budget below k");
     assert_eq!(error.kind(), ErrorKind::InvalidArgument);
 
     // A zero-k request is rejected at construction.

@@ -336,6 +336,7 @@ mod tests {
                     record_id: None,
                 }],
                 objects: VerifyObjectCounts::default(),
+                topology: Default::default(),
             });
         });
 

@@ -33,24 +33,24 @@ keys=30007 bytes=8030318
 # Stride-sampled self-queries from the loaded base set.
 recall k=10 samples=20
 ----
-recall@10: 100.00% (samples=20, truncated=18)
+recall@10: 100.00% (samples=20, truncated=20)
 mean usage: visited_partitions=1 visited_leaf_entries=10000 exact_rerank_candidates=21
 
 # The official siftsmall query set (100 held-out descriptors), first 20.
 recall k=10 samples=20 query=file:siftsmall_query.fvecs
 ----
-recall@10: 100.00% (samples=20, truncated=19)
+recall@10: 100.00% (samples=20, truncated=20)
 mean usage: visited_partitions=1 visited_leaf_entries=10000 exact_rerank_candidates=24
 
 recall k=100 samples=10 query=file:siftsmall_query.fvecs
 ----
-recall@100: 100.00% (samples=10, truncated=0)
-mean usage: visited_partitions=1 visited_leaf_entries=10000 exact_rerank_candidates=184
+recall@100: 100.00% (samples=10, truncated=10)
+mean usage: visited_partitions=1 visited_leaf_entries=10000 exact_rerank_candidates=149
 
 # Exact filter: label is the record ordinal, so this keeps the first 1000.
 recall k=10 samples=10 query=file:siftsmall_query.fvecs where=1:le:999
 ----
-recall@10: 100.00% (samples=10, truncated=4)
+recall@10: 100.00% (samples=10, truncated=10)
 mean usage: visited_partitions=1 visited_leaf_entries=10000 exact_rerank_candidates=19
 
 restart
@@ -81,7 +81,7 @@ ok: records=9997 trees=1 partitions=1 max_level=1
 
 recall k=10 samples=10 query=file:siftsmall_query.fvecs
 ----
-recall@10: 100.00% (samples=10, truncated=9)
+recall@10: 100.00% (samples=10, truncated=10)
 mean usage: visited_partitions=1 visited_leaf_entries=9997 exact_rerank_candidates=22
 
 # --- fashion-mnist: 10k x 784 sparse grayscale images, L2 ---
@@ -144,12 +144,12 @@ ok: records=10000 trees=1 partitions=4 max_level=2
 
 recall k=10 samples=10 query=file:siftsmall_query.fvecs beam-size=1
 ----
-recall@10: 85.00% (samples=10, truncated=8)
+recall@10: 85.00% (samples=10, truncated=10)
 mean usage: visited_partitions=2 visited_leaf_entries=3506 exact_rerank_candidates=20
 
 recall k=10 samples=10 query=file:siftsmall_query.fvecs beam-size=2
 ----
-recall@10: 100.00% (samples=10, truncated=9)
+recall@10: 100.00% (samples=10, truncated=10)
 mean usage: visited_partitions=3 visited_leaf_entries=5966 exact_rerank_candidates=22
 
 recall k=10 samples=10 query=file:siftsmall_query.fvecs beam-size=4

@@ -313,6 +313,7 @@ const ALLOWED_LABEL_VALUES: &[(&str, &[&str])] = &[
             "saturated",
             "settled",
             "stalled",
+            "yielded",
             "retired",
             // Verification completeness.
             "complete",

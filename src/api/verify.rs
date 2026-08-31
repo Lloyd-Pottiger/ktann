@@ -1,5 +1,6 @@
 //! Bounded read-only verification request and report values.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use bytes::Bytes;
@@ -166,6 +167,44 @@ pub struct VerifyObjectCounts {
     pub entries: u64,
 }
 
+/// Verified Partition Header counts grouped by persistent state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct VerifyPartitionStateCounts {
+    /// Ready partitions.
+    pub ready: u64,
+    /// Splitting source partitions.
+    pub splitting: u64,
+    /// Receiving split targets.
+    pub receiving_split: u64,
+    /// Draining split source partitions.
+    pub draining_split: u64,
+    /// Merging source partitions.
+    pub merging: u64,
+}
+
+/// Verified tree-shape facts observed from persistent directory and Headers.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct VerifyTopology {
+    /// Tree Manifests decoded by the audit.
+    pub trees: u64,
+    /// Partition Headers decoded by the audit.
+    pub partitions: u64,
+    /// Highest observed partition level, or `None` for an empty Sharded Forest.
+    pub max_level: Option<u32>,
+    /// Partition Header counts keyed by their positive tree level.
+    pub partitions_by_level: BTreeMap<u32, u64>,
+    /// Exact Header entry-count sums keyed by tree level.
+    pub entries_by_level: BTreeMap<u32, u64>,
+    /// Largest exact Header entry count observed at each tree level.
+    pub max_entries_by_level: BTreeMap<u32, u32>,
+    /// Partition Header counts grouped by persistent state.
+    pub partition_states: VerifyPartitionStateCounts,
+    /// Partitions whose committed Header can advance Structure Maintenance.
+    pub actionable_partitions: u64,
+}
+
 /// The bounded result of one read-only verification snapshot.
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
@@ -176,4 +215,6 @@ pub struct VerifyReport {
     pub issues: Vec<VerifyIssue>,
     /// Decoded logical-object counts.
     pub objects: VerifyObjectCounts,
+    /// Verified tree-shape facts derived from authoritative persistent state.
+    pub topology: VerifyTopology,
 }

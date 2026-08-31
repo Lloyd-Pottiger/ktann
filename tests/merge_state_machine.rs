@@ -539,7 +539,7 @@ async fn drive_split_to_completion(
         .await
         .expect("advance");
         match outcome {
-            split::Advance::Idle | split::Advance::Completed => {
+            split::Advance::Idle | split::Advance::Completed { .. } => {
                 outcomes.push(outcome);
                 return outcomes;
             }
@@ -739,7 +739,10 @@ async fn two_leaf_tree(
     let key = tree_key(1);
     let records = seed_records(&index, 1, 6).await;
     let outcomes = drive_split_to_completion(backend, &manifest, &key, pk(1)).await;
-    assert_eq!(outcomes.last(), Some(&split::Advance::Completed));
+    assert!(matches!(
+        outcomes.last(),
+        Some(split::Advance::Completed { .. })
+    ));
     for leaf in [pk(2), pk(3)] {
         let header = header_of(backend, &manifest, &key, leaf)
             .await
@@ -768,7 +771,10 @@ async fn three_leaf_tree(
         records.push((rid(n), x));
     }
     let outcomes = drive_split_to_completion(backend, &manifest, &key, pk(2)).await;
-    assert_eq!(outcomes.last(), Some(&split::Advance::Completed));
+    assert!(matches!(
+        outcomes.last(),
+        Some(split::Advance::Completed { .. })
+    ));
     let leaves = reachable_leaves(backend, &manifest, &key).await;
     assert_eq!(
         leaves.keys().copied().collect::<Vec<_>>(),
@@ -796,7 +802,10 @@ async fn wide_two_leaf_tree(
     let key = tree_key(1);
     let records = seed_records(&index, 1, 33).await;
     let outcomes = drive_split_to_completion(backend, &manifest, &key, pk(1)).await;
-    assert_eq!(outcomes.last(), Some(&split::Advance::Completed));
+    assert!(matches!(
+        outcomes.last(),
+        Some(split::Advance::Completed { .. })
+    ));
     (runtime, index, manifest, key, records)
 }
 
@@ -818,7 +827,10 @@ async fn wide_three_leaf_tree(
         records.push((rid(n), x));
     }
     let outcomes = drive_split_to_completion(backend, &manifest, &key, pk(3)).await;
-    assert_eq!(outcomes.last(), Some(&split::Advance::Completed));
+    assert!(matches!(
+        outcomes.last(),
+        Some(split::Advance::Completed { .. })
+    ));
     let leaves = reachable_leaves(backend, &manifest, &key).await;
     assert_eq!(leaves.len(), 3);
     (runtime, index, manifest, key, records)
@@ -1291,7 +1303,10 @@ async fn an_internal_merge_moves_child_entries_and_removes_the_source() {
     };
     drive_split_to_completion(&backend, &manifest, &key, over).await;
     let outcomes = drive_split_to_completion(&backend, &manifest, &key, pk(1)).await;
-    assert_eq!(outcomes.last(), Some(&split::Advance::Completed));
+    assert!(matches!(
+        outcomes.last(),
+        Some(split::Advance::Completed { .. })
+    ));
     let root_header = header_of(&backend, &manifest, &key, pk(1))
         .await
         .expect("root header");
@@ -1448,7 +1463,10 @@ async fn completion_removes_exactly_the_source_prefix_with_and_without_range_cle
         let key = tree_key(1);
         let mut records = seed_records(&index, 1, 6).await;
         let outcomes = drive_split_to_completion(&backend, &manifest, &key, pk(1)).await;
-        assert_eq!(outcomes.last(), Some(&split::Advance::Completed));
+        assert!(matches!(
+            outcomes.last(),
+            Some(split::Advance::Completed { .. })
+        ));
         trim_leaf(&index, &backend, &manifest, &key, pk(2), 1, &mut records).await;
 
         let start = merge::begin_merge(&backend, &manifest, &key, pk(2), 1_000, &retry())
@@ -1987,7 +2005,10 @@ async fn a_concurrent_target_transition_aborts_the_relocate_and_the_next_batch_r
 
     // The interrupted split still converges on its own state machine.
     let outcomes = drive_split_to_completion(&backend, &manifest, &key, split_target).await;
-    assert_eq!(outcomes.last(), Some(&split::Advance::Completed));
+    assert!(matches!(
+        outcomes.last(),
+        Some(split::Advance::Completed { .. })
+    ));
     assert_searchable(&backend, &manifest, &key, &records).await;
     run_audit(&backend, &manifest, &records).await;
 
@@ -2202,7 +2223,10 @@ async fn a_target_may_cross_the_split_threshold_while_receiving() {
 
     // A later split of the over-maximum target converges normally.
     let outcomes = drive_split_to_completion(&backend, &manifest, &key, pk(3)).await;
-    assert_eq!(outcomes.last(), Some(&split::Advance::Completed));
+    assert!(matches!(
+        outcomes.last(),
+        Some(split::Advance::Completed { .. })
+    ));
     assert_searchable(&backend, &manifest, &key, &records).await;
     run_audit(&backend, &manifest, &records).await;
 
@@ -2319,7 +2343,10 @@ async fn a_merging_source_stalls_searchable_until_a_ready_target_returns() {
     // Once a Ready target exists again — the target's split completed,
     // publishing two Ready leaves — a later drain succeeds.
     let outcomes = drive_split_to_completion(&backend, &manifest, &key, pk(3)).await;
-    assert_eq!(outcomes.last(), Some(&split::Advance::Completed));
+    assert!(matches!(
+        outcomes.last(),
+        Some(split::Advance::Completed { .. })
+    ));
     let step = merge::drain_batch(&backend, &manifest, &key, pk(2), &retry())
         .await
         .expect("recovered drain");
@@ -2483,7 +2510,10 @@ async fn foreground_writes_fail_with_contention_exhausted_when_no_ready_target_r
     // Once the split publishes Ready targets, foreground writes succeed and
     // the stalled merge completes.
     let outcomes = drive_split_to_completion(&backend, &manifest, &key, pk(3)).await;
-    assert_eq!(outcomes.last(), Some(&split::Advance::Completed));
+    assert!(matches!(
+        outcomes.last(),
+        Some(split::Advance::Completed { .. })
+    ));
     index
         .insert(record(&rid(20), 1.9, 1))
         .await

@@ -51,8 +51,9 @@ use xxhash_rust::xxh3::xxh3_128_with_seed;
 
 use crate::api::{
     DataType, LogicalIndexId, PartitionKey, Result, VerifyIssue, VerifyIssueKind,
-    VerifyObjectCounts, VerifyOptions, VerifyReport,
+    VerifyObjectCounts, VerifyOptions, VerifyReport, VerifyTopology,
 };
+use crate::maintenance::fixup;
 use crate::observe::metrics;
 use crate::storage::backend::{Backend, ReadOps, ScanItem, ScanLimits};
 use crate::storage::keys::{self, KeyRange, LogicalKey, TreeKey, tree_key_hash};
@@ -111,6 +112,7 @@ pub(super) struct Context<'m> {
     limits: Limits,
     issues: Vec<VerifyIssue>,
     counts: VerifyObjectCounts,
+    topology: VerifyTopology,
     truncated: bool,
 }
 
@@ -124,6 +126,7 @@ impl<'m> Context<'m> {
             limits: Limits::new(options),
             issues: Vec::new(),
             counts: VerifyObjectCounts::default(),
+            topology: VerifyTopology::default(),
             truncated: false,
         }
     }
@@ -200,8 +203,50 @@ impl<'m> Context<'m> {
             PersistentValue::RecordLocation(_) => {
                 self.counts.record_locations = self.counts.record_locations.saturating_add(1);
             }
-            PersistentValue::PartitionHeader(_)
-            | PersistentValue::PartitionSynopsis(_)
+            PersistentValue::TreeManifest(_) => {
+                self.topology.trees = self.topology.trees.saturating_add(1);
+            }
+            PersistentValue::PartitionHeader(header) => {
+                self.counts.partitions = self.counts.partitions.saturating_add(1);
+                self.topology.partitions = self.topology.partitions.saturating_add(1);
+                self.topology.max_level = Some(
+                    self.topology
+                        .max_level
+                        .map_or(header.level(), |level| level.max(header.level())),
+                );
+                let count = self
+                    .topology
+                    .partitions_by_level
+                    .entry(header.level())
+                    .or_default();
+                *count = count.saturating_add(1);
+                let entries = self
+                    .topology
+                    .entries_by_level
+                    .entry(header.level())
+                    .or_default();
+                *entries = entries.saturating_add(u64::from(header.entry_count()));
+                let maximum = self
+                    .topology
+                    .max_entries_by_level
+                    .entry(header.level())
+                    .or_default();
+                *maximum = (*maximum).max(header.entry_count());
+                let states = &mut self.topology.partition_states;
+                let count = match header.state() {
+                    crate::storage::values::PartitionState::Ready => &mut states.ready,
+                    crate::storage::values::PartitionState::Splitting => &mut states.splitting,
+                    crate::storage::values::PartitionState::ReceivingSplit => {
+                        &mut states.receiving_split
+                    }
+                    crate::storage::values::PartitionState::DrainingSplit => {
+                        &mut states.draining_split
+                    }
+                    crate::storage::values::PartitionState::Merging => &mut states.merging,
+                };
+                *count = count.saturating_add(1);
+            }
+            PersistentValue::PartitionSynopsis(_)
             | PersistentValue::PartitionState(_)
             | PersistentValue::PartitionCentroid(_) => {
                 self.counts.partitions = self.counts.partitions.saturating_add(1);
@@ -213,11 +258,24 @@ impl<'m> Context<'m> {
         }
     }
 
+    /// Counts a Header whose durable state can advance Structure Maintenance.
+    pub(super) fn note_actionable_partition(
+        &mut self,
+        partition: PartitionKey,
+        header: crate::storage::values::PartitionHeader,
+    ) {
+        if fixup::is_actionable(self.manifest.config(), partition, header) {
+            self.topology.actionable_partitions =
+                self.topology.actionable_partitions.saturating_add(1);
+        }
+    }
+
     fn finish(self) -> VerifyReport {
         VerifyReport {
             complete: !self.truncated,
             issues: self.issues,
             objects: self.counts,
+            topology: self.topology,
         }
     }
 }

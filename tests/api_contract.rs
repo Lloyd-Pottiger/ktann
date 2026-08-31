@@ -226,9 +226,23 @@ fn search_rejects_invalid_k_dimension_and_budgets() -> ktann::api::Result<()> {
     );
     assert_eq!(SearchOptions::default().leaf_beam_size(), None);
 
-    let options = SearchOptions::default().with_exact_rerank_candidates(9)?;
-    let mut request = SearchRequest::new(Arc::from([1.0_f32, 2.0]), 10)?.with_options(options);
-    assert_invalid(request.validate(2, &[], SearchBudgets::default()));
+    let tight_runtime_budgets = SearchBudgets::new(4_096, 1_024, 65_536, 9)?;
+    let mut request = SearchRequest::new(Arc::from([1.0_f32, 2.0]), 10)?;
+    assert_invalid(request.validate(2, &[], tight_runtime_budgets));
+
+    for (k, expected) in [(1, 64), (10, 64), (43, 65), (65_536, 65_536)] {
+        let mut request = SearchRequest::new(Arc::from([1.0_f32, 2.0]), k)?;
+        let budgets = request.validate(2, &[], SearchBudgets::default())?;
+        assert_eq!(budgets.exact_rerank_candidates(), expected);
+    }
+    let runtime_cap = SearchBudgets::new(4_096, 1_024, 65_536, 12)?;
+    let mut request = SearchRequest::new(Arc::from([1.0_f32, 2.0]), 10)?;
+    assert_eq!(
+        request
+            .validate(2, &[], runtime_cap)?
+            .exact_rerank_candidates(),
+        12
+    );
 
     let mut wrong_dimension = SearchRequest::new(Arc::from([1.0_f32]), 1)?;
     assert_invalid(wrong_dimension.validate(2, &[], SearchBudgets::default()));

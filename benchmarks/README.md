@@ -39,6 +39,30 @@ and Fashion-MNIST inputs plus clustered, skewed, and duplicate-heavy synthetic
 distributions at representative sizes. Full runs are intended for optimized,
 otherwise idle hosts.
 
+The separate `large` profile is an optimized scheduled/manual quality run and
+never runs in smoke CI. It loads the fixed external inputs described in
+[`datasets/README.md`](datasets/README.md), creates one converged index per
+dataset, and sweeps leaf beam `1, 4, 16, 32` while holding the four Search
+Budgets, k-derived exact-rerank policy, `k`, Runtime limits, Index configuration,
+concurrency, dataset, and Backend fixed. The curves use Cohere 1M with cosine
+and SIFT1M with L2, each with 1,000 held-out queries and supplied ground truth.
+
+```sh
+cargo run --release -p ktann-benchmarks --bin ktann-bench -- \
+  run --backend rocksdb --profile large --worker-threads 8 \
+  --output rocksdb-large.json
+```
+
+Each large worker verifies at least three searchable topology levels and
+requires both recall and visited-Leaf-Entry work to move across its curve. A
+saturated or structurally shallow run fails instead of publishing a
+non-discriminating artifact.
+
+`.github/workflows/large-ann-quality.yml` runs weekly and on manual dispatch
+on a dedicated self-hosted runner labeled `ktann-benchmark`. Its concurrency
+group serializes runs so the host is otherwise idle; it retains the validated
+dataset cache and uploads the schema-versioned JSON artifact for 90 days.
+
 FoundationDB requires a reachable local cluster, the client library, and
 `fdbcli`. The runner queries `fdbcli --exec status json` so the connected
 server version becomes part of the comparable runtime identity:
@@ -60,15 +84,18 @@ changes RocksDB's native blocking actor bound.
 Each report stores exactly one tagged `measurements` payload per scenario and
 records the adapter's physical key-prefix charge alongside its mutation-count
 and mutation-byte ceilings:
-`steady_state` for the existing workload cases or `lifecycle` for the
-`import-to-search-lifecycle` case. The lifecycle case does not change the setup
+`steady_state` for the existing workload cases, `lifecycle` for the
+`import-to-search-lifecycle` case, or `quality_sweep` for an ordered large ANN
+curve. The lifecycle case does not change the setup
 exclusions or workload semantics of the steady-state scenarios described below.
 
 Setup is excluded from the wall-clock, CPU, latency, throughput, metric, and
 Backend-IO deltas. Setup includes dataset loading, index creation and batch
 load, demand-driven topology convergence, verification, brute-force oracle
-construction, operation materialization, cache warmup, and draining warmup's
-Structure Maintenance backlog. A second invariant audit runs after measurement.
+construction for ordinary scenarios, supplied ground-truth validation for
+large scenarios, operation materialization, cache warmup, and draining
+warmup's Structure Maintenance backlog. A second invariant audit runs after
+measurement.
 Peak RSS is different: the operating-system high-water mark necessarily covers
 the entire isolated worker, including setup and warmup.
 
@@ -78,8 +105,9 @@ The timed workload reports:
   and stable error-category counts by search/write class;
 - accepted end-to-end latency distributions by search/write class; rejection
   rates are derived from the reported outcome counts;
-- exact recall@k against a precomputed brute-force L2 oracle for immutable ANN
-  scenarios;
+- exact recall@k against metric-specific brute-force truth for ordinary
+  immutable ANN scenarios; large quality scenarios use the dataset's supplied
+  exact-neighbor truth (`cosine` for Cohere and `L2` for SIFT);
 - every Search Budget dimension and separate `approximate_selection` and
   `exact_reranking` stage latency;
 - Partition Cache hits, misses, stale misses, installs, and accounted bytes;
@@ -98,8 +126,9 @@ the steady-state measurement payload's `search_budgets`:
 `scanned_tree_keys`, `visited_partitions`, `visited_leaf_entries`, and
 `exact_rerank_candidates`. Each configuration entry distinguishes the Runtime
 `runtime_default`, an optional per-request `request_override`, and the concrete
-`effective_limit`. The measurement entry can therefore compare its usage and
-exhausted-search count directly with the governing limit. `visited_leaf_entries`
+`effective_limit`; exact reranking is engine-sized, so that dimension's request
+override is always absent. The measurement entry can therefore compare its
+usage and exhausted-search count directly with the governing limit. `visited_leaf_entries`
 counts derived Leaf Entries considered during filtering and approximate
 selection; `exact_rerank_candidates` counts original Vector Records loaded and
 exactly reranked.
@@ -107,6 +136,13 @@ exactly reranked.
 The configuration also records `leaf_beam_size_override` because this
 per-request traversal input affects recall and partition work even though it is
 not a Search Budget dimension.
+
+Large reports record the ordered `leaf_beam_sweep` once and emit one point per
+beam. Every point contains mean/min recall@k, search-latency p50/p95/p99,
+throughput, CPU, process peak RSS, all Search Budget usage and exhaustion,
+approximate/rerank stage latency, Partition Cache behavior, and Backend IO. The
+topology records Tree count, true Partition Header count, maximum level, and
+Partition counts by level from the same successful invariant audit.
 
 Foreground `wall_seconds`, throughput, and operation latency stop when the last
 public operation completes. `maintenance_drain_seconds`, CPU, and Backend IO
@@ -161,6 +197,14 @@ measurement noise; changing them is benchmark policy, not a public KTANN
 guarantee. Latency distributions additionally require at least a 1 ms absolute
 p95 increase before a relative increase is material, avoiding large ratios on
 sub-millisecond samples.
+
+For `quality_sweep` reports, comparison pairs identical beam points and applies
+the existing recall, latency, throughput, CPU, cache, Search Budget, and
+Backend-IO policies to every point. Per-point RSS is unavailable because the
+operating-system high-water mark cannot distinguish multiple beam points in one
+worker. Compare only artifacts from the same otherwise idle host and fixed
+dataset cache; beam values and other tuning inputs are experiment coordinates,
+not a production SLA.
 
 `git_revision` receives a `-dirty` suffix when tracked or untracked workspace
 changes are present. Commit or otherwise preserve the exact patch before using

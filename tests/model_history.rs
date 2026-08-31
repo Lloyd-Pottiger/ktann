@@ -1089,7 +1089,7 @@ impl Driver {
                 .await
                 {
                     Ok(advance) => {
-                        if advance == SplitAdvance::Completed {
+                        if matches!(advance, SplitAdvance::Completed { .. }) {
                             self.stats.splits += 1;
                         }
                         self.trace.push(format!(

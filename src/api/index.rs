@@ -212,8 +212,9 @@ impl<B: Backend> Index<B> {
     /// The request is validated against this index's immutable configuration
     /// before admission: the vector dimension must match, the Filter Predicate
     /// must be schema-correct, and the effective Search Budgets resolve from
-    /// the Runtime defaults and the request overrides within hard caps, with
-    /// the exact-rerank budget at least `k`. Manifest validation, Tree Key
+    /// the Runtime defaults and the request overrides within hard caps. Search
+    /// derives the exact-rerank budget from `k` under the Runtime ceiling and
+    /// keeps it at least `k`. Manifest validation, Tree Key
     /// enumeration, traversal, filtering, Vector Record loading, and exact
     /// reranking then read from one consistent backend snapshot, and partition
     /// bodies are served by the Runtime's snapshot-validated Partition Cache.
@@ -223,9 +224,11 @@ impl<B: Backend> Index<B> {
     /// RaBitQ overlap truncation. Success may return fewer than `k` hits and
     /// deliberately makes no exact-global-top-k, completeness, continuation,
     /// or monotonic-across-budgets guarantee: resubmitting the same request
-    /// with larger budgets asks for more work without promising a superset of
-    /// earlier hits. Cancellation and deadline apply to the whole operation;
-    /// search never commits, so they surface as errors, never partial state.
+    /// with larger caller-controlled traversal budgets asks for more work
+    /// without promising a superset of earlier hits. Exact-rerank sizing
+    /// remains engine-owned for `k`. Cancellation and deadline apply to the
+    /// whole operation; search never commits, so they surface as errors, never
+    /// partial state.
     pub async fn search(&self, request: SearchRequest) -> Result<SearchOutcome> {
         self.search_with_control(request, OperationOptions::default())
             .await

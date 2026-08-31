@@ -303,7 +303,7 @@ impl<B: Backend> ImportPermit<B> {
         self.concurrency.pause_for_contention(&mut self.state);
     }
 
-    /// Waits for maintenance and reacquires capacity before the next attempt.
+    /// Waits for maintenance to quiesce and reacquires capacity before retry.
     pub(crate) async fn resume_after_backoff(&mut self) {
         self.runtime.wait_for_backlog_before_retry().await;
         self.concurrency.resume(&mut self.state).await;

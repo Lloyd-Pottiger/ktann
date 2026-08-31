@@ -358,8 +358,11 @@ pub(crate) enum FixupExecution {
     Settled,
     /// The partition is `Merging` with no legal target.
     Stalled,
-    /// Execution stopped early: error, step exhaustion, cancellation, or
-    /// backend release.
+    /// The step budget was consumed by successful progress and work was
+    /// returned to the queue.
+    Yielded,
+    /// Execution stopped early because of an error, cancellation, or backend
+    /// release.
     Retired,
 }
 
@@ -369,6 +372,7 @@ impl FixupExecution {
         match self {
             Self::Settled => "settled",
             Self::Stalled => "stalled",
+            Self::Yielded => "yielded",
             Self::Retired => "retired",
         }
     }
@@ -540,6 +544,7 @@ mod tests {
             FixupAdmission::Saturated.as_str(),
             FixupExecution::Settled.as_str(),
             FixupExecution::Stalled.as_str(),
+            FixupExecution::Yielded.as_str(),
             FixupExecution::Retired.as_str(),
             ImportGate::InFlightSlot.as_str(),
             ImportGate::Backlog.as_str(),

@@ -134,6 +134,7 @@ r001846: 0.6114
 r000449: 0.6861
 r001137: 0.7559
 usage: scanned_tree_keys=1 visited_partitions=1 visited_leaf_entries=3000 exact_rerank_candidates=4
+truncated: rabitq_overlap
 
 stats
 ----
@@ -155,4 +156,3 @@ created index "index"
 stats
 ----
 keys=3 bytes=117
-
