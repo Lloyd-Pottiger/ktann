@@ -14,12 +14,12 @@ and converts it to finite f32, leaves L2/inner-product unnormalized, then applie
 the persisted rotation. Internal centroids are full-f32 routing vectors. Routing
 ranks a partition's Child Entries by the f64 routing distance between the
 preprocessed vector and each persisted centroid: squared Euclidean distance for
-L2, and negated dot product for inner product and cosine — cosine routing-space
-records are unit-norm, while a centroid is an unnormalized mean whose norm
-reflects cluster coherence rather than distance, so dot-product assignment is
-the spherical routing rule and stays total even for a zero centroid. Distance
-ties resolve to the smaller Partition Key. Exact reranking reads the unrotated
-original vector, accumulates in f64, and defines:
+L2, negated dot product for inner product, and negated dot product for cosine.
+Cosine records are normalized during preprocessing and cosine split centroids
+are normalized after their arithmetic mean is trained; a zero centroid remains
+zero and uses a neutral distance of zero. Distance ties resolve to the smaller
+Partition Key. Exact reranking reads the unrotated original vector, accumulates
+in f64, and defines:
 
 - L2 ranking: squared distance `sum((q_i - x_i)^2)`, with public SearchHit
   returning its Euclidean square root;

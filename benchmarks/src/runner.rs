@@ -327,7 +327,7 @@ fn large_scenarios() -> Result<Vec<ScenarioSpec>, String> {
         measured_operations: 1_000,
         k: 10,
         search_options,
-        leaf_beam_sweep: vec![1, 4, 16, 32],
+        leaf_beam_sweep: vec![1, 4, 8, 16, 32],
         // Keep the shared leaf/internal fanout below sqrt(1M) so the
         // million-vector corpus must form at least three searchable levels.
         max_partition_entries: 512,
@@ -2258,7 +2258,7 @@ mod tests {
     #[test]
     fn large_profile_is_an_explicit_single_variable_beam_sweep() {
         for scenario in scenarios("large").expect("large profile") {
-            assert_eq!(scenario.leaf_beam_sweep, [1, 4, 16, 32]);
+            assert_eq!(scenario.leaf_beam_sweep, [1, 4, 8, 16, 32]);
             assert_eq!(scenario.search_options.scanned_tree_keys(), Some(1));
             assert_eq!(scenario.search_options.visited_partitions(), Some(16_384));
             assert_eq!(

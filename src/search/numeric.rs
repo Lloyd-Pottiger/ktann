@@ -66,6 +66,37 @@ impl VectorKernel {
         self.dimension
     }
 
+    /// Returns whether this kernel uses cosine routing semantics.
+    pub(crate) const fn is_cosine(&self) -> bool {
+        matches!(self.metric, Metric::Cosine)
+    }
+
+    /// Normalizes a finite routing-space centroid for cosine routing.
+    ///
+    /// Leaf records are normalized by [`Self::preprocess`], but a split
+    /// centroid is their arithmetic mean and therefore needs this second
+    /// normalization step. Zero centroids remain zero so degenerate internal
+    /// partitions retain a deterministic neutral route.
+    pub(crate) fn normalize_centroid(&self, centroid: &[f32]) -> Result<Box<[f32]>> {
+        validate_vector(centroid, self.dimension, VectorSource::Persistent)?;
+        if !self.is_cosine() {
+            return Ok(centroid.to_vec().into_boxed_slice());
+        }
+        let norm = vector_norm(centroid, VectorSource::Persistent)?;
+        if norm == 0.0 {
+            return Ok(centroid.to_vec().into_boxed_slice());
+        }
+        let mut normalized = allocate_vector(self.dimension)?;
+        for &component in centroid {
+            let component = (f64::from(component) / norm) as f32;
+            if !component.is_finite() {
+                return Err(vector_error(VectorSource::Persistent));
+            }
+            normalized.push(component);
+        }
+        Ok(normalized.into_boxed_slice())
+    }
+
     /// Validates, metric-preprocesses, and rotates a caller vector.
     ///
     /// Cosine is normalized with scalar f64 accumulation before conversion
@@ -103,12 +134,11 @@ impl VectorKernel {
     ///
     /// L2 accumulates squared distance in f64, which ranks identically to the
     /// Euclidean exact distance. Inner product ranks by the negated f64 dot
-    /// product, exactly its distance definition. Cosine also ranks by the
-    /// negated dot product in the preprocessed space: routing-space records
-    /// are unit-norm, while a centroid is an unnormalized mean whose norm
-    /// reflects cluster coherence rather than distance, so dot-product
-    /// assignment is the spherical routing rule and stays total and
-    /// deterministic even for a zero centroid.
+    /// product, exactly its distance definition. Cosine ranks by the negated
+    /// dot product for cosine: both the preprocessed records and the
+    /// persisted split centroids are unit-norm. A zero centroid has no
+    /// direction and contributes a neutral distance of zero, preserving a
+    /// total deterministic ordering for degenerate split states.
     ///
     /// Every input component is validated finite and the bounded dimension
     /// caps the f64 accumulations far below overflow, so a finite result is
@@ -682,14 +712,22 @@ mod tests {
     }
 
     #[test]
-    fn routing_distance_negates_dot_product_for_inner_product_and_cosine() {
-        for metric in [Metric::InnerProduct, Metric::Cosine] {
-            let kernel = VectorKernel::new(3, metric, SEED).unwrap();
-            let distance = kernel
-                .routing_distance(&[1.0, -2.0, 3.0], &[4.0, 5.0, -6.0])
-                .unwrap();
-            assert_eq!(distance, 24.0);
-        }
+    fn routing_distance_negates_dot_product_for_inner_product() {
+        let kernel = VectorKernel::new(3, Metric::InnerProduct, SEED).unwrap();
+        let distance = kernel
+            .routing_distance(&[1.0, -2.0, 3.0], &[4.0, 5.0, -6.0])
+            .unwrap();
+        assert_eq!(distance, 24.0);
+    }
+
+    #[test]
+    fn cosine_centroid_normalization_is_scale_invariant() {
+        let kernel = VectorKernel::new(2, Metric::Cosine, SEED).unwrap();
+        let normalized = kernel.normalize_centroid(&[6.0, 8.0]).unwrap();
+        assert_eq!(&*normalized, &[0.6, 0.8]);
+
+        let opposite = kernel.normalize_centroid(&[-6.0, -8.0]).unwrap();
+        assert_eq!(&*opposite, &[-0.6, -0.8]);
     }
 
     #[test]
