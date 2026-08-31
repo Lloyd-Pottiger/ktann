@@ -1,5 +1,6 @@
 //! Fixed public and replayable synthetic benchmark datasets.
 
+use std::mem::{size_of, size_of_val};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -7,6 +8,10 @@ use bytes::Bytes;
 use xxhash_rust::xxh3::Xxh3;
 
 use crate::report::DatasetMetadata;
+
+mod large;
+
+pub use large::load_large;
 
 #[path = "../../tests/support/dataset.rs"]
 #[expect(
@@ -29,6 +34,8 @@ pub struct BenchmarkDataset {
     pub base: Vec<Arc<[f32]>>,
     /// Held-out query vectors.
     pub queries: Vec<Arc<[f32]>>,
+    /// Supplied ordered exact-neighbor IDs for each query, when available.
+    pub ground_truth: Option<Vec<Vec<Bytes>>>,
     /// Reproducible identity and dimensions.
     pub metadata: DatasetMetadata,
 }
@@ -76,11 +83,13 @@ pub fn load(
         query_vectors: queries.len(),
         dimension,
         checksum_xxh3_128,
+        source: None,
     };
     Ok(BenchmarkDataset {
         ids,
         base,
         queries,
+        ground_truth: None,
         metadata,
     })
 }
@@ -181,8 +190,12 @@ fn checksum(ids: &[Bytes], base: &[Arc<[f32]>], queries: &[Arc<[f32]>]) -> Strin
 /// Adds a length-delimited vector using canonical IEEE-754 component bits.
 fn update_vector(hasher: &mut Xxh3, vector: &[f32]) {
     hasher.update(&(vector.len() as u64).to_le_bytes());
-    for component in vector {
-        hasher.update(&component.to_bits().to_le_bytes());
+    let mut encoded = [0_u8; 4_096];
+    for components in vector.chunks(encoded.len() / size_of::<f32>()) {
+        for (bytes, component) in encoded.chunks_exact_mut(4).zip(components) {
+            bytes.copy_from_slice(&component.to_bits().to_le_bytes());
+        }
+        hasher.update(&encoded[..size_of_val(components)]);
     }
 }
 
@@ -214,6 +227,10 @@ mod tests {
     fn synthetic_dataset_is_replayable() {
         let first = load("clustered", 32, 4, 8, 7).expect("dataset");
         let second = load("clustered", 32, 4, 8, 7).expect("dataset");
+        assert_eq!(
+            first.metadata.checksum_xxh3_128,
+            "bb104b3c58a4651bfd498235ee286902"
+        );
         assert_eq!(
             first.metadata.checksum_xxh3_128,
             second.metadata.checksum_xxh3_128

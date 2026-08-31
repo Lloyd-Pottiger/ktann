@@ -6,8 +6,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::report::{
     AdmissionSummary, BackendIo, BenchmarkReport, BenchmarkSuite, BudgetSummary, CacheSummary,
-    Distribution, LifecycleMeasurements, OperationClass, OperationSummary, ReportMeasurements,
-    SearchPhase, SteadyStateMeasurements, WriteAttribution,
+    Distribution, LifecycleMeasurements, OperationClass, OperationSummary,
+    QualitySweepMeasurements, ReportMeasurements, SearchPhase, SteadyStateMeasurements,
+    WriteAttribution,
 };
 
 /// Sub-millisecond p95 movement is not stable enough to classify by ratio.
@@ -62,6 +63,9 @@ pub fn compare(
     candidate: &BenchmarkSuite,
     policy: ComparisonPolicy,
 ) -> Result<ComparisonReport, String> {
+    if baseline.schema_version != candidate.schema_version {
+        return Err("baseline and candidate report schema versions differ".to_owned());
+    }
     if !policy.maximum_relative_regression.is_finite()
         || policy.maximum_relative_regression < 0.0
         || !policy.maximum_recall_drop.is_finite()
@@ -114,9 +118,7 @@ fn ensure_comparable(
     validate_lifecycle_measurements(candidate)?;
     // Compare the schema type as a whole so adding a workload or admission
     // input cannot silently leave the comparability contract incomplete.
-    if baseline.configuration != candidate.configuration
-        || baseline.dataset.checksum_xxh3_128 != candidate.dataset.checksum_xxh3_128
-    {
+    if baseline.configuration != candidate.configuration || baseline.dataset != candidate.dataset {
         return Err(format!(
             "scenario {}/{} has incomparable inputs",
             baseline.configuration.backend, baseline.configuration.scenario
@@ -199,9 +201,25 @@ fn validate_lifecycle_measurements(report: &BenchmarkReport) -> Result<(), Strin
 
 /// Rejects internally inconsistent operation summaries at the JSON boundary.
 fn validate_operation_summaries(report: &BenchmarkReport) -> Result<(), String> {
-    let ReportMeasurements::SteadyState(measurements) = &report.measurements else {
-        return Ok(());
-    };
+    match &report.measurements {
+        ReportMeasurements::SteadyState(measurements) => {
+            validate_steady_operation_summaries(report, measurements)
+        }
+        ReportMeasurements::QualitySweep(sweep) => {
+            for point in &sweep.points {
+                validate_steady_operation_summaries(report, &point.measurements)?;
+            }
+            Ok(())
+        }
+        ReportMeasurements::Lifecycle(_) => Ok(()),
+    }
+}
+
+/// Rejects one steady measurement whose operation totals do not match config.
+fn validate_steady_operation_summaries(
+    report: &BenchmarkReport,
+    measurements: &SteadyStateMeasurements,
+) -> Result<(), String> {
     if !OperationClass::for_mix(report.configuration.search_percent)
         .eq(measurements.operations.keys().copied())
     {
@@ -255,9 +273,45 @@ fn compare_report(
         (ReportMeasurements::Lifecycle(baseline), ReportMeasurements::Lifecycle(candidate)) => {
             compare_lifecycle(result, key, baseline, candidate, policy);
         }
+        (
+            ReportMeasurements::QualitySweep(baseline),
+            ReportMeasurements::QualitySweep(candidate),
+        ) => compare_quality_sweep(result, key, baseline, candidate, policy),
         _ => result
             .regressions
             .push(format!("{key}: measurement kind changed")),
+    }
+}
+
+/// Compares like-for-like points on one explicitly ordered quality curve.
+fn compare_quality_sweep(
+    result: &mut ComparisonReport,
+    key: &str,
+    baseline: &QualitySweepMeasurements,
+    candidate: &QualitySweepMeasurements,
+    policy: ComparisonPolicy,
+) {
+    if baseline.points.len() != candidate.points.len()
+        || baseline
+            .points
+            .iter()
+            .map(|point| point.leaf_beam_size)
+            .ne(candidate.points.iter().map(|point| point.leaf_beam_size))
+    {
+        result
+            .regressions
+            .push(format!("{key}: quality sweep points changed"));
+        return;
+    }
+    for (baseline, candidate) in baseline.points.iter().zip(&candidate.points) {
+        let point_key = format!("{key}/leaf_beam={}", baseline.leaf_beam_size);
+        compare_steady_state(
+            result,
+            &point_key,
+            &baseline.measurements,
+            &candidate.measurements,
+            policy,
+        );
     }
 }
 
@@ -1228,8 +1282,9 @@ mod tests {
     use crate::report::{
         BenchmarkReport, BenchmarkSuite, BudgetConfiguration, BudgetSummary, Configuration,
         DatasetMetadata, Distribution, Environment, LifecycleMeasurements, OperationClass,
-        OperationSummary, RecallSummary, ReportMeasurements, SearchBudgetConfiguration,
-        SteadyStateMeasurements, WorkloadDispatch, WriteAmplification,
+        OperationSummary, QualityPoint, QualitySweepMeasurements, REPORT_SCHEMA_VERSION,
+        RecallSummary, ReportMeasurements, SearchBudgetConfiguration, SteadyStateMeasurements,
+        WorkloadDispatch, WriteAmplification,
     };
 
     use super::{ComparisonPolicy, compare};
@@ -1267,6 +1322,8 @@ mod tests {
                 seed: 38,
                 dimension: 16,
                 metric: "l2".to_owned(),
+                index_field_count: 2,
+                tree_key_field_count: 1,
                 search_percent: 100,
                 hot_updates: false,
                 min_partition_entries: 8,
@@ -1276,6 +1333,8 @@ mod tests {
                 maintenance_workers: 2,
                 convergence_maintenance_workers: None,
                 fixup_queue_capacity: 1_024,
+                mutation_attempt_limit: 32,
+                maintenance_attempt_limit: 32,
                 search_budgets: SearchBudgetConfiguration {
                     scanned_tree_keys: budget_configuration(4_096, 4_096),
                     visited_partitions: budget_configuration(1_024, 1_024),
@@ -1283,6 +1342,7 @@ mod tests {
                     exact_rerank_candidates: budget_configuration(65_536, 100),
                 },
                 leaf_beam_size_override: None,
+                leaf_beam_sweep: Vec::new(),
                 blocking_resource_limit: Some(2),
                 backend_max_mutations: 100,
                 backend_max_mutation_bytes: 1_000,
@@ -1302,6 +1362,7 @@ mod tests {
                 query_vectors: 10,
                 dimension: 16,
                 checksum_xxh3_128: "checksum".to_owned(),
+                source: None,
             },
             topology: Default::default(),
             measurements: ReportMeasurements::SteadyState(Box::new(SteadyStateMeasurements {
@@ -1346,9 +1407,50 @@ mod tests {
 
     fn suite(report: BenchmarkReport) -> BenchmarkSuite {
         BenchmarkSuite {
+            schema_version: REPORT_SCHEMA_VERSION,
             reproduction_command: "ktann-bench run".to_owned(),
             reports: vec![report],
         }
+    }
+
+    #[test]
+    fn quality_curves_compare_identical_beam_points_independently() {
+        let mut baseline = report();
+        baseline.configuration.leaf_beam_sweep = vec![1, 32];
+        let ReportMeasurements::SteadyState(measurements) = baseline.measurements else {
+            panic!("steady fixture")
+        };
+        baseline.measurements = ReportMeasurements::QualitySweep(QualitySweepMeasurements {
+            points: vec![
+                QualityPoint {
+                    leaf_beam_size: 1,
+                    measurements: (*measurements).clone(),
+                },
+                QualityPoint {
+                    leaf_beam_size: 32,
+                    measurements: (*measurements).clone(),
+                },
+            ],
+        });
+        let mut candidate = baseline.clone();
+        let ReportMeasurements::QualitySweep(sweep) = &mut candidate.measurements else {
+            panic!("quality fixture")
+        };
+        sweep.points[1].measurements.throughput_per_second = 50.0;
+
+        let comparison = compare(
+            &suite(baseline),
+            &suite(candidate),
+            ComparisonPolicy::default(),
+        )
+        .expect("comparable curves");
+        assert!(
+            comparison
+                .regressions
+                .iter()
+                .any(|regression| regression.contains("leaf_beam=32")
+                    && regression.contains("throughput"))
+        );
     }
 
     /// Updates the mutually exclusive operation outcomes as one valid summary.

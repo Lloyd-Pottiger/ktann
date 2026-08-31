@@ -746,7 +746,7 @@ impl Harness {
                     targets = Some((left, right));
                 }
                 Advance::Drained { .. } => {}
-                Advance::Completed => {
+                Advance::Completed { .. } => {
                     return Ok(match targets {
                         Some((left, right)) => format!(
                             "pk={}: split into left={} right={}\n",
@@ -1581,11 +1581,6 @@ fn search_options(directive: &Directive) -> SearchOptions {
             .with_visited_leaf_entries(value.parse().expect("visited-leaf-entries"))
             .expect("valid");
     }
-    if let Some(value) = directive.arg("exact-rerank") {
-        options = options
-            .with_exact_rerank_candidates(value.parse().expect("exact-rerank"))
-            .expect("valid");
-    }
     if let Some(value) = directive.arg("beam-size") {
         options = options
             .with_leaf_beam_size(value.parse().expect("beam-size"))
@@ -1614,7 +1609,7 @@ fn describe_advance(outcome: &Advance) -> String {
         Advance::Drained { moved, remaining } => {
             format!("drained moved={moved} remaining={remaining}")
         }
-        Advance::Completed => "completed".to_string(),
+        Advance::Completed { .. } => "completed".to_string(),
         other => panic!("unexpected split outcome {other:?}"),
     }
 }

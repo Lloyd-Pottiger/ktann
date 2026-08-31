@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use ktann::api::{
-    DataType, FieldId, FieldSchema, Index, IndexConfig, Metric, Record, RuntimeConfig,
+    DataType, FieldId, FieldSchema, Index, IndexConfig, Metric, Mutation, Record, RuntimeConfig,
     SearchRequest, Value,
 };
 use ktann::runtime::Runtime;
@@ -101,29 +101,11 @@ async fn topology(
     (states, entries)
 }
 
-/// Polls until `condition` holds, re-offering rediscovery on every poll,
-/// with a generous real-time bound. The deterministic backend makes
-/// maintenance fast; the bound only guards against a broken implementation
-/// hanging the test.
-///
-/// Every poll whose condition fails drives one rediscovery pass: a single
-/// offer coalesces into the partition's still-pending-or-running queue slot
-/// and is silently dropped, so assuming one offer lands races the worker's
-/// slot release. Re-offering until the condition holds is the demand-driven
-/// rediscovery contract (ADR 0006). The condition is checked before each
-/// re-offer, so a condition that already holds never drives another step.
-async fn wait_until(
-    index: &Index<SharedBackend>,
-    description: &str,
-    mut condition: impl FnMut() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>,
-) {
+/// Waits for one deterministic backend commit without offering more work.
+async fn wait_for_commit(backend: &SharedBackend, previous: usize) {
     let deadline = Instant::now() + Duration::from_secs(30);
-    while !condition().await {
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for: {description}"
-        );
-        drive_one_step(index).await;
+    while backend.inner().history().len() == previous {
+        assert!(Instant::now() < deadline, "timed out waiting for commit");
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
@@ -183,6 +165,74 @@ async fn inserts_drive_splits_to_completion() {
         .expect("search");
     let first = outcome.hits.first().expect("a hit");
     assert_eq!(first.id(), &rid(5));
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn split_completion_cascades_overfull_targets_without_rediscovery() {
+    let backend = backend();
+    let runtime = Runtime::new(backend.clone(), runtime_config(1, 16, 32)).expect("runtime");
+    let index = runtime
+        .create_index("split-cascade", index_config(1, 4))
+        .await
+        .expect("create index");
+    let mutations = (0..17_u8)
+        .map(|id| Mutation::Insert(record(id, f32::from(id))))
+        .collect();
+    index.batch_mutate(mutations).await.expect("burst insert");
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let partitions = audit::list_partitions(&backend, index.logical_index_id())
+            .await
+            .expect("list partitions");
+        let settled = partitions.iter().all(|(_, _, header)| {
+            header.state() == PartitionState::Ready && header.entry_count() <= 4
+        });
+        if settled {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "split targets did not cascade without another foreground access: {partitions:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn successful_step_exhaustion_yields_without_rediscovery() {
+    let backend = backend();
+    let runtime = Runtime::new(backend.clone(), runtime_config(1, 16, 1)).expect("runtime");
+    let index = runtime
+        .create_index("split-yield", index_config(1, 4))
+        .await
+        .expect("create index");
+    let mutations = (0..8_u8)
+        .map(|id| Mutation::Insert(record(id, f32::from(id))))
+        .collect();
+    index.batch_mutate(mutations).await.expect("burst insert");
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let partitions = audit::list_partitions(&backend, index.logical_index_id())
+            .await
+            .expect("list partitions");
+        let settled = partitions.iter().all(|(_, _, header)| {
+            header.state() == PartitionState::Ready && header.entry_count() <= 4
+        });
+        if settled {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "split did not yield across one-step executions: {partitions:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
     runtime.shutdown().await.expect("shutdown");
 }
 
@@ -269,19 +319,30 @@ async fn deletes_drive_merges_to_completion() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn queue_loss_leaves_searchable_state_and_search_resumes_it() {
     let backend = backend();
-    // One Fixup attempt per execution: the worker performs exactly one
-    // state-machine step per offer, leaving a cold split in progress.
-    let runtime_a = Runtime::new(backend.clone(), runtime_config(1, 4, 1)).expect("runtime");
-    let index_a = runtime_a
+    let seed_runtime = Runtime::new(backend.clone(), runtime_config(0, 4, 1)).expect("runtime");
+    let seed_index = seed_runtime
         .create_index("cold", index_config(1, 4))
         .await
         .expect("create index");
     let mut model = Model::new();
     for id in 0..5_u8 {
-        insert(&index_a, &mut model, id, f32::from(id)).await;
+        insert(&seed_index, &mut model, id, f32::from(id)).await;
     }
-    // The single-step worker begins the split and retires.
-    wait_for_split_to_begin(&backend, &index_a).await;
+    seed_runtime.shutdown().await.expect("shutdown");
+
+    // An applied unknown begin leaves a durable Splitting source after the
+    // worker retires, providing a deterministic queue-loss boundary.
+    let runtime_a = Runtime::new(backend.clone(), runtime_config(1, 4, 1)).expect("runtime");
+    let index_a = runtime_a.open_index("cold").await.expect("open index");
+    backend
+        .inner()
+        .push_fault(CommitFault::UnknownApplied)
+        .expect("fault");
+    let commits = backend.inner().history().len();
+    drive_one_step(&index_a).await;
+    wait_for_commit(&backend, commits).await;
+    let (states, _) = topology(&backend, &index_a).await;
+    assert!(states.contains(&PartitionState::Splitting));
     // The intermediate state stays searchable while the queue is live.
     assert_records(&index_a, &model).await;
     // Dropping the Runtime loses the queue; the durable state is untouched.
@@ -330,107 +391,47 @@ async fn lost_oversized_ready_offer_is_rediscovered_after_reopen() {
     runtime_b.shutdown().await.expect("shutdown");
 }
 
-/// Polls until some reachable partition is in `expected`. The poll's
-/// re-offers keep advancing the machine, so `expected` must persist through
-/// every step the wait can still drive: with `fixup_attempts == 1`, at most
-/// one in-flight and one newly offered execution can commit within one poll
-/// window. `DrainingSplit` survives that window — leaving it takes a drain
-/// pass plus a completion pass — while `Splitting` can be advanced past in
-/// one window and is waited on with `wait_for_split_to_begin` instead.
-async fn wait_for_state(
-    backend: &SharedBackend,
-    index: &Index<SharedBackend>,
-    description: &str,
-    expected: PartitionState,
-) {
-    wait_until(index, description, || {
-        let backend = backend.clone();
-        let index = index.clone();
-        Box::pin(async move {
-            let (states, _) = topology(&backend, &index).await;
-            states.contains(&expected)
-        })
-    })
-    .await;
-}
-
-/// Polls until some reachable partition has begun to split: `Splitting`, or
-/// already `DrainingSplit`. The wait is entered straight after the mutations
-/// whose own offer may still be executing, so a mutation-driven begin and a
-/// re-offered expose can commit within the same poll window; accepting the
-/// one-step-past state keeps that double advance from looking like a lost
-/// begin. Two commits in one window cannot advance further, so the wait
-/// still proves a split is durably in progress.
-async fn wait_for_split_to_begin(backend: &SharedBackend, index: &Index<SharedBackend>) {
-    wait_until(index, "split begins", || {
-        let backend = backend.clone();
-        let index = index.clone();
-        Box::pin(async move {
-            let (states, _) = topology(&backend, &index).await;
-            states.contains(&PartitionState::Splitting)
-                || states.contains(&PartitionState::DrainingSplit)
-        })
-    })
-    .await;
-}
-
-/// Offers one rediscovery pass through a search: with `fixup_attempts == 1`
-/// a landed offer drives exactly one bounded state-machine step. An offer is
-/// dropped when the partition's queue slot is still held by a pending or
-/// running execution, which is why the polling waits re-offer instead of
-/// assuming one offer lands.
+/// Offers one rediscovery pass through a search.
 async fn drive_one_step(index: &Index<SharedBackend>) {
     let request = SearchRequest::new(Arc::from([0.0_f32]), 1).expect("valid request");
     let _ = index.search(request).await;
 }
 
-/// Drives a root split to `DrainingSplit` one deterministic step at a time,
-/// injects `fault` into the worker's drain commit, and proves the worker
-/// retires without losing the searchable state and that later rediscovery
-/// completes the split idempotently.
-///
-/// With `fixup_attempts == 1` each landed offer runs exactly one
-/// state-machine step: rediscovery offers begin the split, expose the
-/// targets, and start the drain, and the first offer landed after the fault
-/// is injected runs the faulted drain batch. The commit history length is
-/// the deterministic witness that the faulted step actually executed.
+/// Injects an unknown outcome into the first split step and proves the worker
+/// retires without losing searchable state. Later rediscovery completes from
+/// either the unapplied Ready state or applied Splitting state.
 async fn unknown_outcome_retires_and_rediscovery_resumes(fault: CommitFault, name: &str) {
     let backend = backend();
-    let runtime = Runtime::new(backend.clone(), runtime_config(1, 4, 1)).expect("runtime");
-    let index = runtime
+    let seed_runtime = Runtime::new(backend.clone(), runtime_config(0, 4, 1)).expect("runtime");
+    let seed_index = seed_runtime
         .create_index(name, index_config(1, 4))
         .await
         .expect("create index");
     let mut model = Model::new();
     for id in 0..5_u8 {
-        insert(&index, &mut model, id, f32::from(id)).await;
+        insert(&seed_index, &mut model, id, f32::from(id)).await;
     }
-    wait_for_split_to_begin(&backend, &index).await;
-    wait_for_state(
-        &backend,
-        &index,
-        "drain starts",
-        PartitionState::DrainingSplit,
-    )
-    .await;
+    seed_runtime.shutdown().await.expect("shutdown");
 
-    // The next commit attempt anywhere is the worker's drain batch; the
-    // injected fault decides whether it applies, but the worker retires
-    // either way because the outcome is unknown.
+    let runtime = Runtime::new(backend.clone(), runtime_config(1, 4, 1)).expect("runtime");
+    let index = runtime.open_index(name).await.expect("open index");
+
     backend.inner().push_fault(fault).expect("fault");
     let commits = backend.inner().history().len();
-    wait_until(&index, "the faulted step ran and retired", || {
-        let backend = backend.clone();
-        Box::pin(async move { backend.inner().history().len() > commits })
-    })
-    .await;
-    // The retired worker leaves the draining state intact and searchable.
+    drive_one_step(&index).await;
+    wait_for_commit(&backend, commits).await;
+
     let (states, entries) = topology(&backend, &index).await;
-    assert!(states.contains(&PartitionState::DrainingSplit));
+    let expected = if fault == CommitFault::UnknownApplied {
+        PartitionState::Splitting
+    } else {
+        PartitionState::Ready
+    };
+    assert!(states.contains(&expected));
     assert_eq!(entries, 5);
     assert_records(&index, &model).await;
 
-    // A later relevant access rediscovers the drain and completes the split.
+    // A later relevant access rediscovers and completes the split.
     settle(&index, &backend, &model).await;
     assert_converged(&backend, &index, &model).await;
     runtime.shutdown().await.expect("shutdown");

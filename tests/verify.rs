@@ -226,6 +226,14 @@ async fn healthy_index_verifies_complete_and_writes_nothing() {
     // The allocator, the Manifest, six Record/Location pairs, three Tree
     // Manifests, nine partition bodies, and six Leaf Entries.
     assert_eq!(report.objects.total, 32);
+    assert_eq!(report.topology.trees, 3);
+    assert_eq!(report.topology.partitions, 3);
+    assert_eq!(report.topology.max_level, Some(1));
+    assert_eq!(report.topology.partitions_by_level.get(&1), Some(&3));
+    assert_eq!(report.topology.entries_by_level.get(&1), Some(&6));
+    assert_eq!(report.topology.max_entries_by_level.get(&1), Some(&2));
+    assert_eq!(report.topology.partition_states.ready, 3);
+    assert_eq!(report.topology.actionable_partitions, 0);
 
     // The audit is read-only: no mutation or clear calls reached the backend.
     let counts = backend.inner().operation_counts();
@@ -243,6 +251,7 @@ async fn healthy_index_verifies_complete_and_writes_nothing() {
         .expect("verify");
     assert!(again.complete && again.issues.is_empty());
     assert_eq!(again.objects, report.objects);
+    assert_eq!(again.topology, report.topology);
     runtime.shutdown().await.expect("shutdown");
 }
 
@@ -262,6 +271,8 @@ async fn inflight_split_states_verify_clean() {
     // draining — and the converged post-split tree. Every legal state is
     // complete and issue-free.
     let mut clock = 1_000_u64;
+    let mut observed_actionable = false;
+    let mut observed_transition = false;
     for step in 0..16_u32 {
         let report = index
             .verify(VerifyOptions::default())
@@ -272,11 +283,15 @@ async fn inflight_split_states_verify_clean() {
             "step {step} issues: {:?}",
             report.issues
         );
+        observed_actionable |= report.topology.actionable_partitions > 0;
+        observed_transition |= report.topology.partition_states.splitting > 0
+            || report.topology.partition_states.receiving_split > 0
+            || report.topology.partition_states.draining_split > 0;
         let outcome = split::advance(&backend, &manifest, &tree_key(1), pk(1), clock, &retry)
             .await
             .expect("advance");
         clock += 100;
-        if matches!(outcome, Advance::Idle | Advance::Completed) {
+        if matches!(outcome, Advance::Idle | Advance::Completed { .. }) {
             break;
         }
     }
@@ -285,6 +300,8 @@ async fn inflight_split_states_verify_clean() {
         .await
         .expect("list partitions");
     assert!(partitions.len() > 1, "the root split never began");
+    assert!(observed_actionable);
+    assert!(observed_transition);
     assert!(
         partitions
             .iter()
@@ -295,6 +312,10 @@ async fn inflight_split_states_verify_clean() {
         .await
         .expect("verify");
     assert!(report.complete && report.issues.is_empty());
+    assert_eq!(report.topology.actionable_partitions, 0);
+    assert_eq!(report.topology.partition_states.splitting, 0);
+    assert_eq!(report.topology.partition_states.receiving_split, 0);
+    assert_eq!(report.topology.partition_states.draining_split, 0);
 
     // Phase two: over-fill one leaf below the internal root and drive its
     // non-root split. Unlike a root split's targets, these carry ordinary
@@ -321,7 +342,7 @@ async fn inflight_split_states_verify_clean() {
             .await
             .expect("advance");
         clock += 100;
-        if matches!(outcome, Advance::Idle | Advance::Completed) {
+        if matches!(outcome, Advance::Idle | Advance::Completed { .. }) {
             break;
         }
     }
@@ -338,6 +359,15 @@ async fn inflight_split_states_verify_clean() {
         .await
         .expect("verify");
     assert!(report.complete && report.issues.is_empty());
+    assert_eq!(report.topology.trees, 1);
+    assert_eq!(report.topology.partitions, partitions.len() as u64);
+    assert_eq!(report.topology.max_level, Some(2));
+    assert_eq!(
+        report.topology.partitions,
+        report.topology.partitions_by_level.values().sum()
+    );
+    assert!(report.topology.partitions_by_level.contains_key(&1));
+    assert!(report.topology.partitions_by_level.contains_key(&2));
     runtime.shutdown().await.expect("shutdown");
 }
 

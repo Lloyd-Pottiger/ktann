@@ -9,12 +9,12 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 #[cfg(feature = "foundationdb")]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::compare::{self, ComparisonPolicy};
-use crate::report::{BenchmarkReport, BenchmarkSuite};
+use crate::report::{BenchmarkReport, BenchmarkSuite, REPORT_SCHEMA_VERSION};
 use crate::runner::{self, ScenarioSpec};
 
 const IMPORT_LIFECYCLE_SCENARIO: &str = "import-to-search-lifecycle";
@@ -380,16 +380,16 @@ fn run_suite(options: RunOptions) -> Result<(), String> {
             .args(["--profile", &options.profile])
             .args(["--scenario", scenario.name])
             .args(["--reproduction-command", &reproduction_command])
-            .args(["--worker-threads", &options.worker_threads.to_string()]);
+            .args(["--worker-threads", &options.worker_threads.to_string()])
+            .stderr(Stdio::inherit());
         options.lifecycle.append_args(&mut command);
         let output = command
             .output()
             .map_err(|error| format!("start scenario {}: {error}", scenario.name))?;
         if !output.status.success() {
             return Err(format!(
-                "scenario {} failed: {}",
-                scenario.name,
-                String::from_utf8_lossy(&output.stderr).trim()
+                "scenario {} failed with status {}",
+                scenario.name, output.status
             ));
         }
         let report: BenchmarkReport = serde_json::from_slice(&output.stdout)
@@ -397,6 +397,7 @@ fn run_suite(options: RunOptions) -> Result<(), String> {
         reports.push(report);
     }
     let suite = BenchmarkSuite {
+        schema_version: REPORT_SCHEMA_VERSION,
         reproduction_command,
         reports,
     };
@@ -710,7 +711,7 @@ fn shell_quote(value: &OsStr) -> String {
 
 /// Returns the stable help shown for missing or unknown public commands.
 fn usage() -> String {
-    "usage:\n  ktann-bench run --backend rocksdb|foundationdb [--profile smoke|full] [--scenario NAME] [--worker-threads N] [--maintenance-workers N] [--import-max-in-flight-batches N] [--import-batch-size N] [--import-backlog-watermark N] [--output PATH]\n  ktann-bench compare --baseline PATH --candidate PATH [--maximum-relative-regression N] [--maximum-recall-drop N] [--maximum-rejection-rate-increase N] [--output PATH]".to_owned()
+    "usage:\n  ktann-bench run --backend rocksdb|foundationdb [--profile smoke|full|large] [--scenario NAME] [--worker-threads N] [--maintenance-workers N] [--import-max-in-flight-batches N] [--import-batch-size N] [--import-backlog-watermark N] [--output PATH]\n  ktann-bench compare --baseline PATH --candidate PATH [--maximum-relative-regression N] [--maximum-recall-drop N] [--maximum-rejection-rate-increase N] [--output PATH]".to_owned()
 }
 
 #[cfg(test)]

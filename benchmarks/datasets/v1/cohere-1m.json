@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "id": "vectordbbench-cohere-medium-1m",
+  "source_revision": "VectorDBBench@08fabb2df7436bbaffb549f6d1144d66f14b9fb2; S3 object versions pinned per file",
+  "format": "vectordbbench_parquet",
+  "metric": "cosine",
+  "dimension": 768,
+  "base_vectors": 1000000,
+  "source_query_vectors": 1000,
+  "benchmark_query_vectors": 1000,
+  "ground_truth_neighbors": 100,
+  "files": [
+    {
+      "role": "base",
+      "path": "cohere/cohere_medium_1m/shuffle_train.parquet",
+      "url": "https://assets.zilliz.com/benchmark/cohere_medium_1m/shuffle_train.parquet?versionId=9XIbR3Rr33QqVLWG97mWh73NjH01VZQ8",
+      "bytes": 3134418448,
+      "checksum": { "algorithm": "s3_etag_md5", "value": "aa5dee664dc87b3e416c9863723a0ba4-374", "part_bytes": 8388608 }
+    },
+    {
+      "role": "queries",
+      "path": "cohere/cohere_medium_1m/test.parquet",
+      "url": "https://assets.zilliz.com/benchmark/cohere_medium_1m/test.parquet?versionId=a8Wf7zPE9YCKhiPw0nTF4jEhrGs7h.CC",
+      "bytes": 3133165,
+      "checksum": { "algorithm": "s3_etag_md5", "value": "c63a0efd0e611d9f35345af1fc6f7966", "part_bytes": 8388608 }
+    },
+    {
+      "role": "ground_truth",
+      "path": "cohere/cohere_medium_1m/neighbors.parquet",
+      "url": "https://assets.zilliz.com/benchmark/cohere_medium_1m/neighbors.parquet?versionId=UCL_GDV5HL078p3o48ek7CZLMvCxHT1x",
+      "bytes": 3704127,
+      "checksum": { "algorithm": "s3_etag_md5", "value": "d1aca052763a292b10e80bbda964f55d", "part_bytes": 8388608 }
+    }
+  ]
+}

@@ -386,6 +386,7 @@ impl TreeWalk {
             );
         }
         if let Some(header) = facts.header {
+            cx.note_actionable_partition(partition, header);
             let expected = u64::from(header.entry_count());
             if header.level() == 1 {
                 if facts.leaf_entries != expected {

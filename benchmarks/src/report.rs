@@ -4,9 +4,14 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+/// Current complete benchmark suite/report JSON contract.
+pub const REPORT_SCHEMA_VERSION: u32 = 2;
+
 /// Reports produced by one suite command on one comparable host.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BenchmarkSuite {
+    /// Version of the complete suite/report JSON contract.
+    pub schema_version: u32,
     /// Exact command that reproduces the suite.
     pub reproduction_command: String,
     /// Scenario reports, each measured in an isolated worker process.
@@ -74,6 +79,10 @@ pub struct Configuration {
     pub dimension: usize,
     /// Stable distance metric name.
     pub metric: String,
+    /// Number of declared typed Vector Record fields.
+    pub index_field_count: usize,
+    /// Number of leading fields used to construct the Tree Key.
+    pub tree_key_field_count: usize,
     /// Percentage of workload operations that are searches.
     pub search_percent: u8,
     /// Whether writes target a small conflict set.
@@ -92,10 +101,16 @@ pub struct Configuration {
     pub convergence_maintenance_workers: Option<usize>,
     /// Pending-plus-running Fixup capacity.
     pub fixup_queue_capacity: usize,
+    /// Whole Foreground Mutation attempt ceiling.
+    pub mutation_attempt_limit: usize,
+    /// Whole Structure Maintenance attempt ceiling.
+    pub maintenance_attempt_limit: usize,
     /// Runtime defaults, request overrides, and effective per-search limits.
     pub search_budgets: SearchBudgetConfiguration,
     /// Per-request leaf-level base beam override, when present.
     pub leaf_beam_size_override: Option<u32>,
+    /// Ordered leaf-beam values for a single-variable quality sweep.
+    pub leaf_beam_sweep: Vec<u32>,
     /// RocksDB native blocking-resource limit, when applicable.
     pub blocking_resource_limit: Option<usize>,
     /// Backend Admission Budget mutation-count ceiling.
@@ -147,7 +162,7 @@ pub struct SearchBudgetConfiguration {
 }
 
 /// Identity and size of one fixed public or synthetic dataset.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DatasetMetadata {
     /// Canonical dataset/distribution name.
     pub name: String,
@@ -159,6 +174,36 @@ pub struct DatasetMetadata {
     pub dimension: usize,
     /// Stable xxh3-128 checksum over vector bits and IDs.
     pub checksum_xxh3_128: String,
+    /// Versioned external-data identity, absent for generated and checked-in inputs.
+    pub source: Option<DatasetSourceMetadata>,
+}
+
+/// Versioned source identity for a cached external benchmark dataset.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DatasetSourceMetadata {
+    /// Stable manifest identifier.
+    pub manifest_id: String,
+    /// Dataset manifest schema version.
+    pub manifest_version: u32,
+    /// Immutable upstream revision or object-version description.
+    pub source_revision: String,
+    /// Validated source files in manifest order.
+    pub files: Vec<DatasetFileMetadata>,
+}
+
+/// One validated external dataset file recorded in the report.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DatasetFileMetadata {
+    /// Logical role such as base, queries, or ground truth.
+    pub role: String,
+    /// Cache-relative path without exposing a host-specific absolute path.
+    pub path: String,
+    /// Exact expected byte length.
+    pub bytes: u64,
+    /// Manifest checksum algorithm.
+    pub checksum_algorithm: String,
+    /// Manifest checksum value.
+    pub checksum: String,
 }
 
 /// Persistent topology facts after setup convergence.
@@ -170,6 +215,45 @@ pub struct Topology {
     pub partitions: u64,
     /// Verified internal and Leaf Entry count.
     pub entries: u64,
+    /// Verified Tree Manifest count.
+    pub trees: u64,
+    /// Highest verified searchable level.
+    pub max_level: Option<u32>,
+    /// Verified Partition Header counts keyed by level.
+    pub partitions_by_level: BTreeMap<u32, u64>,
+    /// Verified exact Header entry-count sums keyed by level.
+    pub entries_by_level: BTreeMap<u32, u64>,
+    /// Largest verified exact Header entry count at each level.
+    pub max_entries_by_level: BTreeMap<u32, u32>,
+    /// Verified Partition Header counts grouped by persistent state.
+    pub partition_states: PartitionStateCounts,
+    /// Verified partitions whose committed Header can advance maintenance.
+    pub actionable_partitions: u64,
+}
+
+/// Persistent partition-state counts captured after setup convergence.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PartitionStateCounts {
+    /// Ready partitions.
+    pub ready: u64,
+    /// Splitting source partitions.
+    pub splitting: u64,
+    /// Receiving split targets.
+    pub receiving_split: u64,
+    /// Draining split source partitions.
+    pub draining_split: u64,
+    /// Merging source partitions.
+    pub merging: u64,
+}
+
+impl PartitionStateCounts {
+    /// Returns the number of partitions outside the Ready state.
+    pub const fn transitional(self) -> u64 {
+        self.splitting
+            .saturating_add(self.receiving_split)
+            .saturating_add(self.draining_split)
+            .saturating_add(self.merging)
+    }
 }
 
 /// Mutually exclusive measurements for one benchmark scenario.
@@ -180,6 +264,24 @@ pub enum ReportMeasurements {
     SteadyState(Box<SteadyStateMeasurements>),
     /// Import-to-search lifecycle phase measurements.
     Lifecycle(Box<LifecycleMeasurements>),
+    /// Ordered single-variable ANN quality points over one converged index.
+    QualitySweep(QualitySweepMeasurements),
+}
+
+/// Measurements for one ordered leaf-beam quality curve.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct QualitySweepMeasurements {
+    /// Points ordered from the narrowest beam through the production default.
+    pub points: Vec<QualityPoint>,
+}
+
+/// One fully measured leaf-beam point.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct QualityPoint {
+    /// Explicit leaf-level base beam applied to every query in the point.
+    pub leaf_beam_size: u32,
+    /// Complete steady-state measurements for this one search configuration.
+    pub measurements: SteadyStateMeasurements,
 }
 
 /// Measurements attributed to one steady-state scenario worker.

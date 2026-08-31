@@ -26,6 +26,7 @@ rustc-ice-*.txt
 .vscode/
 refwiki/
 /AGENTS.override.md
+/.benchmark-data/
 
 
 # Added by cargo

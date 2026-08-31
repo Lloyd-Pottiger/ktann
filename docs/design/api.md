@@ -191,7 +191,7 @@ The v1 defaults and caps are:
 | Scanned Tree Keys | 4,096 | 65,536 |
 | Visited partitions | 1,024 | 16,384 |
 | Visited Leaf Entries | 65,536 | 1,048,576 |
-| Exact rerank candidates | `min(max(4*k,100),65,536)` | 65,536 and at least `k` |
+| Exact rerank candidates | `min(max(64,k+ceil(k/2)),65,536)` | Runtime ceiling 65,536; effective value at least `k` |
 | Leaf beam size | 32 | 16,384 |
 | Tree Key scan ranges | 1,024 | wider conservative fallback |
 | Import maximum in-flight batches | `min(available_parallelism,4)`, min 1 | positive |
@@ -205,10 +205,11 @@ doubles to 100 ms, and applies full jitter in the current interval.
 
 `SearchRequest` contains a finite vector of exact dimension, `k`, an optional
 Predicate, and SearchOptions. `k` is `1..=65,536`; the effective exact-rerank
-budget must be at least `k`. SearchOptions may also override the leaf-level
-base beam width per request; the beam is a traversal-quality knob, not an
-accounted budget dimension, and the visited-partition budget still bounds the
-work it schedules.
+budget is `max(64,k+ceil(k/2))` under the Runtime ceiling and must remain at
+least `k`. SearchOptions may override Tree Key, partition, and Leaf Entry bounds and
+the leaf-level base beam width per request; the beam is a traversal-quality
+knob, not an accounted budget dimension, and the visited-partition budget still
+bounds the work it schedules.
 
 `SearchOutcome` contains ordered Search Hits, Search Budget usage, an exhaustive
 set of exhausted dimensions, and `rabitq_overlap_truncated`. A hit contains only

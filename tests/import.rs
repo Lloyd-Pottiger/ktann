@@ -15,11 +15,10 @@ use ktann::storage::backend::{
     Mutation as StorageMutation, ReadOps, ReadTxn, ScanLimits, ScanPage, WriteTxn,
 };
 use ktann::storage::keys::KeyRange;
-use ktann::storage::values::PartitionState;
 
 use support::{
     CommitFault, CommitOutcome, DeterministicBackend, DeterministicConfig, DeterministicReadTxn,
-    DeterministicWriteTxn, audit,
+    DeterministicWriteTxn,
 };
 
 #[allow(dead_code)]
@@ -1053,77 +1052,39 @@ async fn reoffer_maintenance(index: &Index<GatedBackend>) {
     let _ = index.search(request).await;
 }
 
-/// Returns once no Fixup execution is pending or running: an import batch
-/// admits only after the backlog drops below the watermark, and this batch
-/// upserts into an otherwise empty tree, so its own commit offers nothing.
-/// Once it commits, the queue is empty and the single worker is idle, so
-/// every execution afterwards is triggered by the test's own later accesses,
-/// in an order the test controls.
-async fn await_worker_quiescence(index: &Index<GatedBackend>) {
-    let probe = async {
-        let mut session = index
-            .import_session(import_options(1))
-            .expect("probe session");
-        session
-            .submit(vec![Mutation::Upsert(record(&rid(200), 0.0, 2))])
-            .await
-            .expect("probe submit");
-        let results = session.finish().await;
-        assert_eq!(results.len(), 1, "the probe batch commits");
-    };
-    tokio::time::timeout(WAIT_TIMEOUT, probe)
-        .await
-        .expect("the maintenance backlog drains in time");
-}
-
-/// Seeds a cold `Splitting` partition: five records under one Tree Key exceed
-/// the leaf maximum, so the single-step worker begins the split and retires,
-/// leaving the searchable intermediate state for a later relevant access to
-/// rediscover. Returns with the split begun and no Fixup execution running.
+/// Seeds one overfull `Ready` leaf without offering its Fixup.
 ///
-/// The fifth insert's own offer can be lost: it coalesces while the previous
-/// insert's execution is still running, and that execution rediscovers a
-/// leaf that is not over threshold yet, settling without beginning the split
-/// (issue #109). Each poll iteration therefore re-offers through a real
-/// search — the relevant access the demand-driven contract expects to
-/// rediscover lost offers. The quiescence probe runs *before* the scan, so a
-/// re-offer is only ever made against a quiet queue whose durable state the
-/// scan just observed: it begins the split from the over-threshold `Ready`
-/// leaf and can never race a begin commit into driving the step past
-/// `Splitting`.
-async fn seed_cold_splitting(backend: &GatedBackend, index: &Index<GatedBackend>) {
-    for value in 1..=5_u8 {
+/// The fifth insert commits with an unknown outcome. Its durable mutation is
+/// visible, but the failed foreground operation cannot offer maintenance, so
+/// a later search deterministically owns rediscovery.
+async fn seed_cold_overfull(backend: &GatedBackend, index: &Index<GatedBackend>) {
+    for value in 1..=4_u8 {
         index
             .insert(record(&rid(value), f32::from(value), 1))
             .await
             .expect("seed insert");
     }
-    let deadline = Instant::now() + WAIT_TIMEOUT;
-    loop {
-        await_worker_quiescence(index).await;
-        let splitting = audit::list_partitions(backend, index.logical_index_id())
-            .await
-            .expect("list partitions")
-            .iter()
-            .any(|(_, _, header)| header.state() == PartitionState::Splitting);
-        if splitting {
-            return;
-        }
-        assert!(Instant::now() < deadline, "the split did not begin");
-        reoffer_maintenance(index).await;
-    }
+    backend
+        .inner
+        .set_fault_plan(vec![CommitFault::UnknownApplied])
+        .expect("unknown-outcome fault");
+    let error = index
+        .insert(record(&rid(5), 5.0, 1))
+        .await
+        .expect_err("the applied insert reports an unknown outcome");
+    assert_eq!(error.kind(), ErrorKind::CommitOutcomeUnknown);
+    assert_record_present(index, &rid(5)).await;
 }
 
 /// Closes the backlog gate deterministically: searches rediscover the cold
-/// in-flight split and re-offer it, and the worker's next step commit is held
+/// overfull leaf and offer it, and the worker's next step commit is held
 /// by `gate`, keeping one Fixup running — a backlog of one, exactly at the
 /// watermark. `entered` is the expected held-commit count, including any
 /// commits already held. The gate stays closed until `gate` releases the
 /// commit.
 ///
-/// A single search's offer can be lost — coalesced into a running execution
-/// whose step budget is already spent, leaving nothing queued (issue #109) —
-/// so the loop re-offers until the worker's commit is actually held.
+/// The loop re-offers until the worker's commit is actually held because an
+/// offer may still coalesce with a worker execution already in progress.
 async fn hold_gate_closed(gate: &CommitGate, index: &Index<GatedBackend>, entered: usize) {
     gate.hold_next(1);
     let deadline = Instant::now() + WAIT_TIMEOUT;
@@ -1160,7 +1121,7 @@ where
 async fn backlog_gate_blocks_and_releases_submit() {
     let (backend, gate, runtime, index) =
         setup_with_index(gate_runtime_config(), gate_index_config()).await;
-    seed_cold_splitting(&backend, &index).await;
+    seed_cold_overfull(&backend, &index).await;
     let mut session = index.import_session(import_options(2)).expect("session");
     hold_gate_closed(&gate, &index, 1).await;
 
@@ -1215,7 +1176,7 @@ async fn backlog_gate_blocks_and_releases_submit() {
 async fn backlog_gate_composes_with_in_flight_bound() {
     let (backend, gate, runtime, index) =
         setup_with_index(gate_runtime_config(), gate_index_config()).await;
-    seed_cold_splitting(&backend, &index).await;
+    seed_cold_overfull(&backend, &index).await;
     let mut session = index.import_session(import_options(1)).expect("session");
 
     // Batch 1 admits while the gate is open and holds the session's only
@@ -1267,7 +1228,7 @@ async fn backlog_gate_composes_with_in_flight_bound() {
 async fn dropped_gated_submit_admits_nothing() {
     let (backend, gate, runtime, index) =
         setup_with_index(gate_runtime_config(), gate_index_config()).await;
-    seed_cold_splitting(&backend, &index).await;
+    seed_cold_overfull(&backend, &index).await;
     let mut session = index.import_session(import_options(2)).expect("session");
     hold_gate_closed(&gate, &index, 1).await;
 
@@ -1295,7 +1256,7 @@ async fn dropped_gated_submit_admits_nothing() {
 async fn shutdown_releases_gated_submit() {
     let (backend, gate, runtime, index) =
         setup_with_index(gate_runtime_config(), gate_index_config()).await;
-    seed_cold_splitting(&backend, &index).await;
+    seed_cold_overfull(&backend, &index).await;
     let mut session = index.import_session(import_options(2)).expect("session");
 
     // A batch admitted before the gate closes keeps its real result.

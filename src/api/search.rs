@@ -16,7 +16,7 @@ const MAX_EXACT_RERANK_CANDIDATES: u32 = 65_536;
 /// partition hard cap is guaranteed to exhaust that budget instead.
 const MAX_LEAF_BEAM_SIZE: u32 = MAX_VISITED_PARTITIONS;
 
-/// Concrete limits applied to one Search.
+/// Search bounds used as Runtime defaults and resolved per-Search limits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct SearchBudgets {
@@ -38,7 +38,7 @@ impl Default for SearchBudgets {
 }
 
 impl SearchBudgets {
-    /// Constructs positive concrete Search Budgets.
+    /// Constructs positive Search Budgets.
     pub fn new(
         scanned_tree_keys: u32,
         visited_partitions: u32,
@@ -103,7 +103,6 @@ pub struct SearchOptions {
     scanned_tree_keys: Option<u32>,
     visited_partitions: Option<u32>,
     visited_leaf_entries: Option<u32>,
-    exact_rerank_candidates: Option<u32>,
     leaf_beam_size: Option<u32>,
 }
 
@@ -129,13 +128,6 @@ impl SearchOptions {
         Ok(self)
     }
 
-    /// Overrides the positive exact-rerank candidate budget.
-    pub fn with_exact_rerank_candidates(mut self, value: u32) -> Result<Self> {
-        validate_override(value, MAX_EXACT_RERANK_CANDIDATES)?;
-        self.exact_rerank_candidates = Some(value);
-        Ok(self)
-    }
-
     /// Returns the scanned Tree Key budget override.
     #[must_use]
     pub const fn scanned_tree_keys(self) -> Option<u32> {
@@ -152,12 +144,6 @@ impl SearchOptions {
     #[must_use]
     pub const fn visited_leaf_entries(self) -> Option<u32> {
         self.visited_leaf_entries
-    }
-
-    /// Returns the exact-rerank candidate budget override.
-    #[must_use]
-    pub const fn exact_rerank_candidates(self) -> Option<u32> {
-        self.exact_rerank_candidates
     }
 
     /// Overrides the positive leaf-level base beam width.
@@ -190,9 +176,7 @@ impl SearchOptions {
             visited_leaf_entries: self
                 .visited_leaf_entries
                 .unwrap_or(defaults.visited_leaf_entries),
-            exact_rerank_candidates: self
-                .exact_rerank_candidates
-                .unwrap_or(defaults.exact_rerank_candidates.min(exact_default)),
+            exact_rerank_candidates: defaults.exact_rerank_candidates.min(exact_default),
         };
         budgets.validate_hard_caps()?;
         let k = u32::try_from(k).map_err(|_| Error::invalid_argument())?;
@@ -216,9 +200,9 @@ fn default_exact_rerank(k: usize) -> Result<u32> {
         return Err(Error::invalid_argument());
     }
     let value = k
-        .checked_mul(4)
+        .checked_add(k.div_ceil(2))
         .ok_or_else(Error::invalid_argument)?
-        .clamp(100, MAX_K);
+        .clamp(64, MAX_K);
     u32::try_from(value).map_err(|_| Error::invalid_argument())
 }
 

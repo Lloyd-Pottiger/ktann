@@ -25,9 +25,15 @@
 //!   0006). There is no durable scan, queue, leader, lease, or claim.
 //! - **Bounded execution.** One execution drives one partition through the
 //!   split or merge state machine for at most the configured steps. It settles
-//!   when no work remains, stalls when a merge has no legal target, and
-//!   retires on error or step exhaustion; retirement never removes durable
-//!   state, so rediscovery resumes where the state machine stopped.
+//!   when no work remains, stalls when a merge has no legal target, yields
+//!   successful unfinished work to the back of the queue, and retires on an
+//!   error or shutdown; retirement never removes durable state.
+//! - **Bounded split follow-up.** A completed split replaces its source slot
+//!   with offers for both newly `Ready` targets and the updated parent in one
+//!   queue transition, then publishes the final backlog. This discovers an
+//!   immediately overfull target or parent without turning one worker execution
+//!   into an unbounded cascade; saturation and process loss retain their
+//!   ordinary rediscovery semantics.
 //! - **Shutdown.** Stopping admission cancels pending work immediately and
 //!   lets an admitted step finish its bounded transaction; workers are
 //!   accounted in the Runtime's lifecycle so the backend is released only
@@ -96,7 +102,9 @@ pub(crate) struct FixupStats {
     settled: u64,
     /// Executions that stopped on a stalled merge with no legal target.
     stalled: u64,
-    /// Executions that stopped early: error, step exhaustion, or shutdown.
+    /// Executions that yielded after making a full step budget of progress.
+    yielded: u64,
+    /// Executions that stopped early because of an error or shutdown.
     retired: u64,
 }
 
@@ -106,6 +114,7 @@ impl FixupStats {
         let counter = match execution {
             FixupExecution::Settled => &mut self.settled,
             FixupExecution::Stalled => &mut self.stalled,
+            FixupExecution::Yielded => &mut self.yielded,
             FixupExecution::Retired => &mut self.retired,
         };
         *counter = counter.saturating_add(1);
@@ -117,7 +126,7 @@ impl FixupStats {
 /// `admitted` holds every key with a slot, pending or running, which is what
 /// makes an offer during execution coalesce instead of queueing behind the
 /// running execution: the executor keeps advancing the partition within its
-/// bounded step budget, and a later access re-offers after it retires.
+/// bounded step budget, then yields unfinished successful work to the queue.
 pub(crate) struct FixupQueue {
     pending: VecDeque<FixupOffer>,
     admitted: HashSet<FixupKey>,
@@ -184,6 +193,18 @@ impl FixupQueue {
     fn finish(&mut self, key: &FixupKey) -> usize {
         self.running = self.running.saturating_sub(1);
         self.admitted.remove(key);
+        self.backlog()
+    }
+
+    /// Returns one successfully progressing Fixup to the queue tail without
+    /// releasing its bounded admission slot.
+    fn yield_back(&mut self, offer: &FixupOffer) -> usize {
+        self.running = self.running.saturating_sub(1);
+        debug_assert!(self.admitted.contains(&offer.key));
+        self.pending.push_back(FixupOffer {
+            key: offer.key.clone(),
+            manifest: Arc::clone(&offer.manifest),
+        });
         self.backlog()
     }
 
@@ -267,25 +288,28 @@ impl<B: Backend> RuntimeInner<B> {
     /// that opens the gate; once the Runtime stops accepting work it fails
     /// with [`ErrorKind::RuntimeClosed`] instead of waiting for the backlog.
     pub(crate) async fn wait_for_backlog_below(&self) -> Result<()> {
-        match self.wait_for_backlog_gate().await {
+        match self
+            .wait_for_backlog_gate(self.config().import_backlog_watermark())
+            .await
+        {
             BacklogGate::Open => Ok(()),
             BacklogGate::MaintenanceCancelled => Err(Error::new(ErrorKind::RuntimeClosed)),
         }
     }
 
-    /// Waits for maintenance backpressure before retrying admitted import work.
+    /// Waits for maintenance to quiesce before retrying admitted import work.
     ///
     /// Shutdown cancels maintenance but must not replace an already-admitted
     /// foreground operation's real result with `RuntimeClosed`. Once
     /// maintenance cancellation is visible, the retry proceeds under its
     /// ordinary bounded policy while Runtime shutdown continues to wait for it.
     pub(crate) async fn wait_for_backlog_before_retry(&self) {
-        let _ = self.wait_for_backlog_gate().await;
+        let _ = self.wait_for_backlog_gate(1).await;
     }
 
-    /// Waits until the process-local backlog gate opens or maintenance stops.
-    async fn wait_for_backlog_gate(&self) -> BacklogGate {
-        let watermark = self.config().import_backlog_watermark();
+    /// Waits until backlog falls below `watermark` or maintenance stops.
+    async fn wait_for_backlog_gate(&self, watermark: usize) -> BacklogGate {
+        debug_assert!(watermark > 0);
         loop {
             // Register before checking so a slot release between the check and
             // await cannot be lost.
@@ -394,37 +418,104 @@ impl<B: Backend> RuntimeInner<B> {
 async fn run_worker<B: Backend>(guard: WorkerGuard<B>) {
     let inner = &guard.inner;
     while let Some(offer) = inner.next_fixup().await {
-        let _running = RunningFixup {
-            inner,
-            key: &offer.key,
+        let driven = {
+            let mut running = RunningFixup {
+                inner,
+                offer: &offer,
+                yield_back: false,
+                split_followups: None,
+            };
+            let span = trace::fixup_span(offer.key.index, offer.key.partition, &offer.key.tree_key);
+            let mut driven = drive(inner, &offer).instrument(span).await;
+            running.yield_back = driven.execution == FixupExecution::Yielded;
+            running.split_followups = driven.split_followups.take();
+            driven
         };
-        let span = trace::fixup_span(offer.key.index, offer.key.partition, &offer.key.tree_key);
-        let execution = drive(inner, &offer).instrument(span).await;
-        metrics::fixup_execution(execution);
-        inner.lock_fixups().stats.record(execution);
+        metrics::fixup_execution(driven.execution);
+        inner.lock_fixups().stats.record(driven.execution);
     }
 }
 
 /// Releases a running Fixup's queue slot even when the worker is aborted.
 struct RunningFixup<'a, B: Backend> {
     inner: &'a RuntimeInner<B>,
-    key: &'a FixupKey,
+    offer: &'a FixupOffer,
+    yield_back: bool,
+    split_followups: Option<([PartitionKey; 2], Option<PartitionKey>)>,
 }
 
 impl<B: Backend> Drop for RunningFixup<'_, B> {
     fn drop(&mut self) {
-        // Wake gated Import Session submissions only when this release opens
-        // the backlog gate; while it stays closed no waiter could proceed.
-        let (gate_open, backlog) = {
-            let mut queue = self.inner.lock_fixups();
-            let backlog = queue.finish(self.key);
-            (
-                backlog < self.inner.config().import_backlog_watermark(),
-                backlog,
-            )
+        let split_followups = if self.inner.is_accepting() {
+            self.split_followups.take()
+        } else {
+            None
         };
+        let (can_yield, gate_open, backlog, enqueued, duplicate, saturated) = {
+            let mut queue = self.inner.lock_fixups();
+            let can_yield = self.yield_back && !self.inner.maintenance_cancel.is_cancelled();
+            if can_yield {
+                let backlog = queue.yield_back(self.offer);
+                (
+                    can_yield,
+                    backlog < self.inner.config().import_backlog_watermark(),
+                    backlog,
+                    0,
+                    0,
+                    0,
+                )
+            } else {
+                queue.finish(&self.offer.key);
+                let mut enqueued = 0_u64;
+                let mut duplicate = 0_u64;
+                let mut saturated = 0_u64;
+                if !self.inner.maintenance_cancel.is_cancelled() {
+                    if let Some((targets, parent)) = split_followups {
+                        for partition in targets.into_iter().chain(parent) {
+                            let key = FixupKey {
+                                index: self.offer.key.index,
+                                tree_key: self.offer.key.tree_key.clone(),
+                                partition,
+                            };
+                            match queue.offer(key, &self.offer.manifest) {
+                                FixupAdmission::Enqueued => enqueued += 1,
+                                FixupAdmission::Duplicate => duplicate += 1,
+                                FixupAdmission::Saturated => saturated += 1,
+                            }
+                        }
+                    }
+                }
+                let backlog = queue.backlog();
+                (
+                    can_yield,
+                    backlog < self.inner.config().import_backlog_watermark(),
+                    backlog,
+                    enqueued,
+                    duplicate,
+                    saturated,
+                )
+            }
+        };
+        for (admission, count) in [
+            (FixupAdmission::Enqueued, enqueued),
+            (FixupAdmission::Duplicate, duplicate),
+            (FixupAdmission::Saturated, saturated),
+        ] {
+            if count > 0 {
+                metrics::fixup_admission(admission, count);
+            }
+        }
         metrics::fixup_backlog(backlog);
-        if gate_open {
+        if can_yield {
+            self.inner.fixup_available.notify_one();
+        } else {
+            for _ in 0..enqueued {
+                self.inner.fixup_available.notify_one();
+            }
+        }
+        // Wake gated Import Session submissions only after the source release
+        // and any split follow-ups form one observable queue transition.
+        if !can_yield && gate_open {
             self.inner.fixup_released.notify_waiters();
         }
     }
@@ -445,21 +536,22 @@ impl<B: Backend> Drop for WorkerGuard<B> {
 ///
 /// One step reads the durable authority once and dispatches directly to the
 /// actionable split or merge state machine. Progress continues within the
-/// configured step budget; any error — a
+/// configured step budget; successful step exhaustion yields the same key to
+/// the queue tail. Any error — a
 /// contended step that exhausted its bounded retries, an unknown commit
 /// outcome, or Corruption — retires the Fixup, and a later relevant access
 /// rediscovers the durable state exactly where it stopped. Corruption is not
 /// repaired here; it surfaces to the foreground path that reads the same
 /// state.
-async fn drive<B: Backend>(inner: &Arc<RuntimeInner<B>>, offer: &FixupOffer) -> FixupExecution {
+async fn drive<B: Backend>(inner: &Arc<RuntimeInner<B>>, offer: &FixupOffer) -> DrivenFixup {
     let Some(backend) = inner.maintenance_backend() else {
-        return FixupExecution::Retired;
+        return DrivenFixup::new(FixupExecution::Retired);
     };
     let retry = RetryPolicy::for_fixup(inner.config());
     let attempts = inner.config().fixup_attempts();
     for _ in 0..attempts {
         if inner.maintenance_cancel.is_cancelled() {
-            return FixupExecution::Retired;
+            return DrivenFixup::new(FixupExecution::Retired);
         }
         let started_at = now_unix_millis();
         let key = &offer.key;
@@ -473,20 +565,32 @@ async fn drive<B: Backend>(inner: &Arc<RuntimeInner<B>>, offer: &FixupOffer) -> 
         )
         .await;
         match step {
-            Ok(maintenance_fixup::Advance::Idle) => return FixupExecution::Settled,
+            Ok(maintenance_fixup::Advance::Idle) => {
+                return DrivenFixup::new(FixupExecution::Settled);
+            }
             Ok(maintenance_fixup::Advance::Split(split_step)) => {
                 observe_split_step(&split_step);
                 trace::fixup_kind(&Span::current(), FixupKind::Split);
                 match split_step {
-                    Ok(split::Advance::Idle | split::Advance::Completed) => {
-                        return FixupExecution::Settled;
+                    Ok(split::Advance::Idle) => {
+                        return DrivenFixup::new(FixupExecution::Settled);
+                    }
+                    Ok(split::Advance::Completed {
+                        left,
+                        right,
+                        parent,
+                    }) => {
+                        return DrivenFixup {
+                            execution: FixupExecution::Settled,
+                            split_followups: Some(([left, right], parent)),
+                        };
                     }
                     Ok(
                         split::Advance::Began { .. }
                         | split::Advance::Exposed { .. }
                         | split::Advance::Drained { .. },
                     ) => {}
-                    Err(_) => return FixupExecution::Retired,
+                    Err(_) => return DrivenFixup::new(FixupExecution::Retired),
                 }
             }
             Ok(maintenance_fixup::Advance::Merge(merge_step)) => {
@@ -494,22 +598,40 @@ async fn drive<B: Backend>(inner: &Arc<RuntimeInner<B>>, offer: &FixupOffer) -> 
                 trace::fixup_kind(&Span::current(), FixupKind::Merge);
                 match merge_step {
                     Ok(merge::Advance::Idle | merge::Advance::Completed) => {
-                        return FixupExecution::Settled;
+                        return DrivenFixup::new(FixupExecution::Settled);
                     }
-                    Ok(merge::Advance::Stalled) => return FixupExecution::Stalled,
+                    Ok(merge::Advance::Stalled) => {
+                        return DrivenFixup::new(FixupExecution::Stalled);
+                    }
                     Ok(merge::Advance::Began | merge::Advance::Drained { .. }) => {}
-                    Err(_) => return FixupExecution::Retired,
+                    Err(_) => return DrivenFixup::new(FixupExecution::Retired),
                 }
             }
             // The shared authority preflight failed before it could identify
             // a split or merge owner. The execution outcome records the
             // retirement without fabricating a state-machine step.
-            Err(_) => return FixupExecution::Retired,
+            Err(_) => return DrivenFixup::new(FixupExecution::Retired),
         }
     }
-    // The step budget ran out with work possibly remaining: the Fixup
-    // retires and a later relevant access re-offers the partition.
-    FixupExecution::Retired
+    // Every budgeted step made progress and left work remaining. Preserve the
+    // admission slot while returning the key to the queue tail so other work
+    // remains fair without requiring another foreground access.
+    DrivenFixup::new(FixupExecution::Yielded)
+}
+
+/// One bounded Fixup execution and any newly Ready split targets it discovered.
+struct DrivenFixup {
+    execution: FixupExecution,
+    split_followups: Option<([PartitionKey; 2], Option<PartitionKey>)>,
+}
+
+impl DrivenFixup {
+    const fn new(execution: FixupExecution) -> Self {
+        Self {
+            execution,
+            split_followups: None,
+        }
+    }
 }
 
 /// Records one split advance result without exposing partition identity.
@@ -521,7 +643,7 @@ fn observe_split_step(step: &Result<split::Advance>) {
         // The committed drain boundary records both the step and moved count,
         // including a final drain followed by completion in this advance.
         Ok(split::Advance::Drained { .. }) => return,
-        Ok(split::Advance::Completed) => FixupStepResult::Completed,
+        Ok(split::Advance::Completed { .. }) => FixupStepResult::Completed,
         Err(_) => FixupStepResult::Failed,
     };
     metrics::fixup_step(FixupKind::Split, result);
@@ -825,6 +947,106 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn import_retry_waits_for_maintenance_to_quiesce() {
+        let config = RuntimeConfig::default()
+            .with_maintenance(0, 2)
+            .and_then(|config| config.with_import_limits(1, 2))
+            .expect("valid maintenance config");
+        let runtime = Runtime::new(FailingBackend, config).expect("multi-thread runtime");
+        let manifest = manifest(1);
+        let offer = {
+            let mut queue = runtime.handle.inner.lock_fixups();
+            assert_eq!(
+                queue.offer(key(&manifest, 1, 1), &manifest),
+                FixupAdmission::Enqueued
+            );
+            queue.pop().expect("running maintenance")
+        };
+
+        let mut retry = std::pin::pin!(runtime.handle.inner.wait_for_backlog_before_retry());
+        tokio::select! {
+            () = retry.as_mut() => {
+                panic!("a contended import retry must not overlap running maintenance")
+            }
+            () = async {
+                for _ in 0..64 {
+                    tokio::task::yield_now().await;
+                }
+            } => {}
+        }
+
+        {
+            let mut queue = runtime.handle.inner.lock_fixups();
+            assert_eq!(queue.finish(&offer.key), 0);
+        }
+        runtime.handle.inner.fixup_released.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(1), retry)
+            .await
+            .expect("the retry resumes after maintenance quiesces");
+        runtime.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn split_followups_keep_the_import_retry_gate_closed() {
+        let config = RuntimeConfig::default()
+            .with_maintenance(0, 8)
+            .and_then(|config| config.with_import_limits(1, 2))
+            .expect("valid maintenance config");
+        let runtime = Runtime::new(FailingBackend, config).expect("multi-thread runtime");
+        let manifest = manifest(1);
+        let offer = {
+            let mut queue = runtime.handle.inner.lock_fixups();
+            assert_eq!(
+                queue.offer(key(&manifest, 1, 1), &manifest),
+                FixupAdmission::Enqueued
+            );
+            queue.pop().expect("running split")
+        };
+
+        let mut retry = std::pin::pin!(runtime.handle.inner.wait_for_backlog_before_retry());
+        tokio::select! {
+            () = retry.as_mut() => panic!("the retry must wait for the running split"),
+            () = tokio::task::yield_now() => {}
+        }
+
+        drop(RunningFixup {
+            inner: &runtime.handle.inner,
+            offer: &offer,
+            yield_back: false,
+            split_followups: Some((
+                [
+                    PartitionKey::new(2).expect("nonzero"),
+                    PartitionKey::new(3).expect("nonzero"),
+                ],
+                Some(PartitionKey::new(4).expect("nonzero")),
+            )),
+        });
+
+        {
+            let queue = runtime.handle.inner.lock_fixups();
+            assert_eq!(queue.backlog(), 3);
+            assert!(!queue.admitted.contains(&offer.key));
+        }
+        tokio::select! {
+            () = retry.as_mut() => {
+                panic!("the retry must not observe a gap before split follow-ups")
+            }
+            () = async {
+                for _ in 0..64 {
+                    tokio::task::yield_now().await;
+                }
+            } => {}
+        }
+
+        assert_eq!(runtime.handle.inner.lock_fixups().drain_pending(), 0);
+        runtime.handle.inner.fixup_released.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(1), retry)
+            .await
+            .expect("the retry resumes after every follow-up retires");
+        runtime.shutdown().await.expect("shutdown succeeds");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

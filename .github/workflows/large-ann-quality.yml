@@ -1,0 +1,110 @@
+name: Large ANN quality
+
+on:
+  schedule:
+    # Weekly, away from common hourly cron boundaries.
+    - cron: "17 2 * * 6"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# The labeled runner is dedicated to benchmarks; serializing runs keeps the
+# host otherwise idle and preserves same-host curve comparability.
+concurrency:
+  group: ktann-large-ann-quality
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rocksdb-large-quality:
+    name: RocksDB million-vector quality curves
+    runs-on: [self-hosted, ktann-benchmark]
+    timeout-minutes: 1440
+    env:
+      KTANN_BENCH_DATASET_CACHE: ${{ runner.tool_cache }}/ktann-datasets
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: large-quality-rocksdb
+      - name: Prepare versioned public datasets
+        shell: bash
+        run: |
+          set -euo pipefail
+          checksum_matches() {
+            local target="$1"
+            local algorithm="$2"
+            local expected="$3"
+            local part_bytes="$4"
+            local actual
+            case "$algorithm" in
+              sha256)
+                actual=$(sha256sum -- "$target")
+                actual=${actual%% *}
+                ;;
+              s3_etag_md5)
+                if [[ -z "$part_bytes" ]]; then
+                  return 1
+                fi
+                local bytes
+                bytes=$(wc -c < "$target")
+                if (( bytes <= part_bytes )); then
+                  actual=$(md5sum -- "$target")
+                  actual=${actual%% *}
+                else
+                  local digests parts
+                  digests=$(mktemp)
+                  split -b "$part_bytes" --filter='openssl dgst -md5 -binary' "$target" > "$digests"
+                  actual=$(openssl dgst -md5 "$digests")
+                  actual="${actual##* }-$(( (bytes + part_bytes - 1) / part_bytes ))"
+                  rm -f -- "$digests"
+                fi
+                ;;
+              *) return 1 ;;
+            esac
+            [[ "$actual" == "$expected" ]]
+          }
+          download() {
+            local expected_bytes="$1"
+            local target="$2"
+            local url="$3"
+            local algorithm="$4"
+            local expected_checksum="$5"
+            local part_bytes="$6"
+            if [[ -f "$target" ]]; then
+              local actual_bytes
+              actual_bytes=$(wc -c < "$target")
+              if (( actual_bytes == expected_bytes )) &&
+                 checksum_matches "$target" "$algorithm" "$expected_checksum" "$part_bytes"; then
+                return
+              fi
+              rm -f -- "$target"
+            fi
+            curl --fail --location --retry 5 --continue-at - --output "$target" "$url"
+            [[ $(wc -c < "$target") -eq expected_bytes ]]
+            checksum_matches "$target" "$algorithm" "$expected_checksum" "$part_bytes"
+          }
+          for manifest in benchmarks/datasets/v1/*.json; do
+            jq -r '.files[] | [.bytes, .path, .url, .checksum.algorithm, .checksum.value, (.checksum.part_bytes // "")] | @tsv' "$manifest" |
+            while IFS=$'\t' read -r expected_bytes path url algorithm expected_checksum part_bytes; do
+              target="$KTANN_BENCH_DATASET_CACHE/$path"
+              mkdir -p "$(dirname "$target")"
+              download "$expected_bytes" "$target" "$url" "$algorithm" "$expected_checksum" "$part_bytes"
+            done
+          done
+      - name: Run optimized large quality profile
+        run: >-
+          cargo +stable run --release -p ktann-benchmarks --bin ktann-bench --
+          run --backend rocksdb --profile large --worker-threads 8
+          --output "${{ runner.temp }}/rocksdb-large.json"
+      - name: Upload versioned quality report
+        uses: actions/upload-artifact@v4
+        with:
+          name: rocksdb-large-quality-${{ github.run_id }}
+          path: ${{ runner.temp }}/rocksdb-large.json
+          retention-days: 90

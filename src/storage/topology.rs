@@ -135,7 +135,11 @@ pub enum DrainStart {
 pub enum SplitCompletion {
     /// The split completed: both targets are `Ready` and the source topology
     /// is switched.
-    Completed,
+    Completed {
+        /// The updated parent when this call completed a non-root split.
+        /// `None` denotes a root split or an idempotent re-drive.
+        parent: Option<PartitionKey>,
+    },
     /// The source is `DrainingSplit` but its exact entry count is not zero.
     NotDrained,
     /// The source is not `DrainingSplit` (anymore). A split that was draining
@@ -1135,7 +1139,7 @@ pub async fn finalize_split<T: WriteTxn>(
     else {
         // Both authority values are gone: a previous committed finalize
         // completed this split.
-        return Ok(SplitCompletion::Completed);
+        return Ok(SplitCompletion::Completed { parent: None });
     };
     let PartitionTransition::DrainingSplit { left, right, .. } = state else {
         return Ok(SplitCompletion::NotDraining);
@@ -1253,12 +1257,12 @@ pub async fn finalize_split<T: WriteTxn>(
             }),
         )
         .await?;
-        return Ok(SplitCompletion::Completed);
+        return Ok(SplitCompletion::Completed { parent: None });
     }
 
     // Remove the source's unique incoming reference, rediscovered on this
     // transaction's snapshot and update-protected (ADR 0007).
-    remove_incoming_edge(txn, tree_key, source, level).await?;
+    let parent = remove_incoming_edge(txn, tree_key, source, level).await?;
     remove_source_prefix(
         txn,
         manifest,
@@ -1269,7 +1273,9 @@ pub async fn finalize_split<T: WriteTxn>(
         source_removal,
     )
     .await?;
-    Ok(SplitCompletion::Completed)
+    Ok(SplitCompletion::Completed {
+        parent: Some(parent),
+    })
 }
 
 /// The outcome of [`begin_merge`].
@@ -1467,7 +1473,7 @@ async fn remove_incoming_edge<T: WriteTxn>(
     tree_key: &TreeKey,
     source: PartitionKey,
     level: u32,
-) -> Result<()> {
+) -> Result<PartitionKey> {
     let index = txn
         .bound_manifest()
         .ok_or_else(Error::invalid_argument)?
@@ -1495,7 +1501,7 @@ async fn remove_incoming_edge<T: WriteTxn>(
         PersistentValue::PartitionHeader(removed_entry(parent_header)?),
     )
     .await?;
-    Ok(())
+    Ok(parent)
 }
 
 /// Removes one fully drained source's whole partition prefix per the

@@ -121,8 +121,15 @@ pub enum Advance {
         /// The source's exact entry count after the batch.
         remaining: u32,
     },
-    /// The split completed.
-    Completed,
+    /// The split completed and promoted both targets to `Ready`.
+    Completed {
+        /// The promoted left target.
+        left: PartitionKey,
+        /// The promoted right target.
+        right: PartitionKey,
+        /// The updated parent, or `None` when the root split in place.
+        parent: Option<PartitionKey>,
+    },
 }
 
 /// Runs [`topology::begin_split`] as one bounded whole-retrying step.
@@ -667,7 +674,7 @@ pub(crate) async fn advance_observed<B: Backend>(
                 TargetExposure::SourceAdvanced => Ok(Advance::Idle),
             }
         }
-        PartitionTransition::DrainingSplit { .. } => {
+        PartitionTransition::DrainingSplit { left, right, .. } => {
             match drain_batch(backend, manifest, tree_key, partition, retry).await? {
                 DrainStep::Drained { moved, remaining } => {
                     if remaining == 0 {
@@ -681,8 +688,18 @@ pub(crate) async fn advance_observed<B: Backend>(
                         )
                         .await?
                         {
-                            topology::SplitCompletion::Completed
-                            | topology::SplitCompletion::NotDraining => Ok(Advance::Completed),
+                            topology::SplitCompletion::Completed { parent } => {
+                                Ok(Advance::Completed {
+                                    left,
+                                    right,
+                                    parent,
+                                })
+                            }
+                            topology::SplitCompletion::NotDraining => Ok(Advance::Completed {
+                                left,
+                                right,
+                                parent: None,
+                            }),
                             topology::SplitCompletion::NotDrained => {
                                 Ok(Advance::Drained { moved, remaining })
                             }
@@ -691,7 +708,11 @@ pub(crate) async fn advance_observed<B: Backend>(
                         Ok(Advance::Drained { moved, remaining })
                     }
                 }
-                DrainStep::SourceAdvanced => Ok(Advance::Completed),
+                DrainStep::SourceAdvanced => Ok(Advance::Completed {
+                    left,
+                    right,
+                    parent: None,
+                }),
                 DrainStep::NotDraining => Ok(Advance::Idle),
             }
         }

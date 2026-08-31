@@ -399,7 +399,7 @@ async fn drive_maintenance(
                 )
                 .await
                 {
-                    Ok(SplitAdvance::Completed) => {
+                    Ok(SplitAdvance::Completed { .. }) => {
                         stats.splits += 1;
                         true
                     }

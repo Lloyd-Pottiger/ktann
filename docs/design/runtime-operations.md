@@ -49,9 +49,17 @@ concurrency. Queue full, duplicate admission, or worker loss is observable but
 does not affect correctness.
 
 A fixup reads one Header/State pair and dispatches directly to the owning split
-or merge state machine, then retries a bounded number of whole state-machine
-steps with capped jittered backoff before retiring. Later relevant access may
-enqueue it again.
+or merge state machine, then runs a bounded number of whole state-machine steps
+with capped jittered backoff. An execution that consumes its step budget through
+successful progress returns the same admission to the queue tail; this keeps
+each execution bounded and fair without requiring another foreground access.
+Errors and cancellation retire the admission. Completing a split replaces the
+source's queue slot with best-effort offers for both newly Ready targets and the
+updated parent in one process-local queue transition, then publishes the final
+backlog; this catches immediately actionable follow-on work without exposing a
+false quiescent interval or making the split transaction or one worker
+execution unbounded. Normal queue capacity, deduplication, and loss rules still
+apply. Later relevant access may enqueue dropped or retired work again.
 There is no durable scan, queue, leader, lease, or claim that one Runtime knows
 cluster-wide backlog.
 
@@ -77,14 +85,17 @@ in-flight value as a hard ceiling on accepted, nonterminal batches. Clean
 completions raise the learned active limit additively only while that limit is
 saturated and another submission is waiting. A retryable write conflict
 contracts it multiplicatively and releases the contended batch's active slot,
-but the paused batch retains its accepted-batch capacity and has priority when
-reacquiring under the smaller limit before the next ordinary whole-operation
-attempt. This feedback measures demonstrated write overlap, including data
-skew, Tree Key distribution, and concurrent Structure Maintenance. It does not
-scan, persist, or infer a partition count. The default backlog watermark is
-two, allowing one pending or running Fixup to coexist with import while
-pausing new admission before maintenance backlog grows further. Explicit
-overrides remain process-local tuning bounds.
+waits for the process-local Fixup backlog to drain completely, and then gives
+the paused batch priority when reacquiring under the smaller limit before the
+next ordinary whole-operation attempt. Waiting for quiescence only after
+observed contention prevents one remaining hot Fixup from repeatedly
+conflicting with the same bounded retry. This feedback measures demonstrated
+write overlap, including data skew, Tree Key distribution, and concurrent
+Structure Maintenance. It does not scan, persist, or infer a partition count.
+The default backlog watermark is two, allowing one pending or running Fixup to
+coexist with ordinary import admission while pausing new admission before
+maintenance backlog grows further. Explicit overrides remain process-local
+tuning bounds.
 
 Accepted batches may execute concurrently within the learned limit. Their
 atomicity, retry, error, and maintenance behavior is identical to normal
@@ -136,6 +147,14 @@ deadline, and cancellation bounds:
 - Leaf Entry field/code agreement with the Vector Record;
 - conservative synopsis contents recomputed from leaf entries;
 - allocator high-water marks and ownership ranges.
+
+The complete report also exposes audited Tree Manifest count, Partition Header
+count, maximum tree level, Partition Header and exact entry counts by level,
+maximum entries by level, persistent partition-state counts, and the number of
+partitions whose committed Header can advance Structure Maintenance. These
+facts come from the same snapshot as the invariant audit and make topology
+quiescence independently auditable without treating a temporarily unchanged
+partition count as convergence or exposing raw Tree Keys or Partition Keys.
 
 The report is conclusive only when `complete` is true. A reached limit returns a
 successful incomplete report with collected issues; cancellation, deadline, or

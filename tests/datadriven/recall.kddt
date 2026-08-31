@@ -1,14 +1,11 @@
 # ----------------------------------------------------------------------
-# Recall against the brute-force oracle and search-quality budget sweeps.
+# Recall against the brute-force oracle and search-quality beam sweeps.
 #
 # Flat leaves with sufficient budgets are exact scans: recall must be 100%
 # for every metric and distribution; tight budgets truncate and report it.
-# The settled-tree suites sweep the leaf beam width and the exact-rerank
-# candidate budget over the same queries, recording hit quality and
-# visited-partition cost as two-line regression goldens (issue #100, items
-# A1/A2/B1; merged from the former beam.kddt). Estimate distances
-# deliberately never leave the engine (design search.md section 7), so the
-# rerank stage is ablated through its candidate budget, not a skip switch.
+# The settled-tree suites sweep leaf beam width over the same queries,
+# recording hit quality and visited-partition cost as two-line regression
+# goldens (issue #100, items A1/B1; merged from the former beam.kddt).
 # ----------------------------------------------------------------------
 new-index dimension=8 metric=L2 fields=bucket:i64 tree-key-fields=0
 ----
@@ -20,7 +17,7 @@ loaded 5000 records (dataset=uniform:5000, seed=11)
 
 recall k=10 samples=20
 ----
-recall@10: 100.00% (samples=20, truncated=0)
+recall@10: 100.00% (samples=20, truncated=20)
 mean usage: visited_partitions=1 visited_leaf_entries=5000 exact_rerank_candidates=11
 
 recall k=10 samples=20 visited-leaf-entries=64
@@ -31,11 +28,11 @@ mean usage: visited_partitions=1 visited_leaf_entries=64 exact_rerank_candidates
 # Cross-distribution queries: clustered queries against uniform data.
 recall k=10 samples=20 query=clustered:20:6 query-seed=99
 ----
-recall@10: 100.00% (samples=20, truncated=0)
+recall@10: 100.00% (samples=20, truncated=20)
 mean usage: visited_partitions=1 visited_leaf_entries=5000 exact_rerank_candidates=12
 
-# Cosine over clustered data. The default exact-rerank cap (100) is smaller
-# than the 3000-entry leaf, so `truncated` reports the RaBitQ candidate
+# Cosine over clustered data. The k-derived exact-rerank cap is smaller than
+# the 3000-entry leaf, so `truncated` reports the RaBitQ candidate
 # window, not a recall failure: recall stays exact when the truth survives
 # the window.
 new-index dimension=16 metric=Cosine fields=bucket:i64 tree-key-fields=0
@@ -49,7 +46,7 @@ loaded 3000 records (dataset=clustered:3000:6, seed=12)
 recall k=10 samples=20
 ----
 recall@10: 100.00% (samples=20, truncated=20)
-mean usage: visited_partitions=1 visited_leaf_entries=3000 exact_rerank_candidates=100
+mean usage: visited_partitions=1 visited_leaf_entries=3000 exact_rerank_candidates=64
 
 # Inner product over skewed data; same truncation semantics as above.
 new-index dimension=16 metric=InnerProduct fields=bucket:i64 tree-key-fields=0
@@ -62,10 +59,10 @@ loaded 3000 records (dataset=skewed:3000, seed=13)
 
 recall k=10 samples=20
 ----
-recall@10: 100.00% (samples=20, truncated=18)
-mean usage: visited_partitions=1 visited_leaf_entries=3000 exact_rerank_candidates=91
+recall@10: 100.00% (samples=20, truncated=20)
+mean usage: visited_partitions=1 visited_leaf_entries=3000 exact_rerank_candidates=59
 
-# --- Beam-width and rerank-budget sweeps on a settled synthetic tree ---
+# --- Beam-width sweep on a settled synthetic tree ---
 new-index dimension=8 metric=L2 fields=bucket:i64 tree-key-fields=0 min-entries=8 max-entries=32
 ----
 created index "index"
@@ -192,39 +189,39 @@ usage: scanned_tree_keys=1 visited_partitions=4 visited_leaf_entries=58 exact_re
 
 search k=8 vector=[0,0,0,0,0,0,0,0] beam-size=4
 ----
-r000973: 2.2837
-r001421: 2.3076
-r001777: 2.3199
-r000118: 2.3369
-r000740: 2.3621
-r000372: 2.3659
-r000704: 2.3663
-r001327: 2.3679
-usage: scanned_tree_keys=1 visited_partitions=7 visited_leaf_entries=113 exact_rerank_candidates=14
+r000103: 1.3630
+r000504: 1.3691
+r001343: 1.3692
+r001522: 1.3923
+r001085: 1.4060
+r000523: 1.4072
+r000356: 1.4176
+r001254: 1.4284
+usage: scanned_tree_keys=1 visited_partitions=7 visited_leaf_entries=76 exact_rerank_candidates=13
 
 search k=8 vector=[0,0,0,0,0,0,0,0] beam-size=8
 ----
-r000973: 2.2837
-r001421: 2.3076
-r001777: 2.3199
-r001604: 2.3323
-r000118: 2.3369
-r001197: 2.3541
-r000740: 2.3621
-r000372: 2.3659
-usage: scanned_tree_keys=1 visited_partitions=12 visited_leaf_entries=207 exact_rerank_candidates=15
+r000103: 1.3630
+r000504: 1.3691
+r001343: 1.3692
+r001393: 1.3858
+r001522: 1.3923
+r001085: 1.4060
+r000523: 1.4072
+r000904: 1.4172
+usage: scanned_tree_keys=1 visited_partitions=12 visited_leaf_entries=155 exact_rerank_candidates=11
 
 search k=8 vector=[0,0,0,0,0,0,0,0] beam-size=16
 ----
-r000973: 2.2837
-r001421: 2.3076
-r001777: 2.3199
-r001604: 2.3323
-r000118: 2.3369
-r001197: 2.3541
-r000740: 2.3621
-r000372: 2.3659
-usage: scanned_tree_keys=1 visited_partitions=20 visited_leaf_entries=389 exact_rerank_candidates=17
+r000103: 1.3630
+r000504: 1.3691
+r001343: 1.3692
+r001393: 1.3858
+r001522: 1.3923
+r001085: 1.4060
+r000523: 1.4072
+r000904: 1.4172
+usage: scanned_tree_keys=1 visited_partitions=20 visited_leaf_entries=350 exact_rerank_candidates=11
 
 search k=8 vector=[0,0,0,0,0,0,0,0] beam-size=32
 ----
@@ -236,7 +233,7 @@ r001522: 1.3923
 r001085: 1.4060
 r000523: 1.4072
 r000904: 1.4172
-usage: scanned_tree_keys=1 visited_partitions=36 visited_leaf_entries=755 exact_rerank_candidates=11
+usage: scanned_tree_keys=1 visited_partitions=36 visited_leaf_entries=734 exact_rerank_candidates=11
 
 search k=8 vector=[0,0,0,0,0,0,0,0]
 ----
@@ -248,7 +245,7 @@ r001522: 1.3923
 r001085: 1.4060
 r000523: 1.4072
 r000904: 1.4172
-usage: scanned_tree_keys=1 visited_partitions=36 visited_leaf_entries=755 exact_rerank_candidates=11
+usage: scanned_tree_keys=1 visited_partitions=36 visited_leaf_entries=734 exact_rerank_candidates=11
 
 # Recall x beam matrix against the brute-force oracle.
 recall k=10 samples=10 beam-size=1
@@ -274,48 +271,24 @@ mean usage: visited_partitions=12 visited_leaf_entries=200 exact_rerank_candidat
 recall k=10 samples=10 beam-size=16
 ----
 recall@10: 100.00% (samples=10, truncated=0)
-mean usage: visited_partitions=20 visited_leaf_entries=391 exact_rerank_candidates=21
+mean usage: visited_partitions=20 visited_leaf_entries=376 exact_rerank_candidates=21
 
 recall k=10 samples=10 beam-size=32
 ----
 recall@10: 100.00% (samples=10, truncated=0)
-mean usage: visited_partitions=36 visited_leaf_entries=775 exact_rerank_candidates=21
+mean usage: visited_partitions=36 visited_leaf_entries=774 exact_rerank_candidates=21
 
 recall k=10 samples=10
 ----
 recall@10: 100.00% (samples=10, truncated=0)
-mean usage: visited_partitions=36 visited_leaf_entries=775 exact_rerank_candidates=21
-
-# Rerank ablation (A2): the exact-rerank candidate budget swept over
-# k/2k/4k and the default (min(max(4*k,100),65536) = 100 here). Tighter
-# windows truncate candidacy and report it; recall recovers as the window
-# widens — the estimate-only order alone is not the answer.
-recall k=10 samples=10 exact-rerank=10
-----
-recall@10: 92.00% (samples=10, truncated=10)
-mean usage: visited_partitions=36 visited_leaf_entries=775 exact_rerank_candidates=10
-
-recall k=10 samples=10 exact-rerank=20
-----
-recall@10: 100.00% (samples=10, truncated=10)
-mean usage: visited_partitions=36 visited_leaf_entries=775 exact_rerank_candidates=18
-
-recall k=10 samples=10 exact-rerank=40
-----
-recall@10: 100.00% (samples=10, truncated=0)
-mean usage: visited_partitions=36 visited_leaf_entries=775 exact_rerank_candidates=21
-
-recall k=10 samples=10 exact-rerank=100
-----
-recall@10: 100.00% (samples=10, truncated=0)
-mean usage: visited_partitions=36 visited_leaf_entries=775 exact_rerank_candidates=21
+mean usage: visited_partitions=36 visited_leaf_entries=774 exact_rerank_candidates=21
 
 # --- Real datasets at 1k: flat exactness, then a fully settled tree ---
 # The 1k prefix of the checked-in fixtures keeps a full settle (split-all)
 # cheap enough for the debug corpus; settling the full 10k fixtures stays
 # out of scope (#98, issue #100 item B3). The flat leaf is an exact scan;
-# the settled tree sweeps beam width and the rerank window on real
-# distances, and an exact filter prunes on the settled tree.
+# the settled tree sweeps beam width on real distances, and an exact filter
+# prunes on the settled tree.
 new-index name=sift1k dimension=128 metric=L2 fields=bucket:i64,label:i64 tree-key-fields=0 min-entries=8 max-entries=32
 ----
 created index "sift1k"
@@ -331,7 +304,7 @@ ok: records=1000 trees=1 partitions=1 max_level=1
 # The flat 1k leaf is an exact scan: 100% recall against the oracle.
 recall k=10 samples=10 query=file:siftsmall_query.fvecs
 ----
-recall@10: 100.00% (samples=10, truncated=4)
+recall@10: 100.00% (samples=10, truncated=10)
 mean usage: visited_partitions=1 visited_leaf_entries=1000 exact_rerank_candidates=19
 
 split-all tree=1
@@ -405,17 +378,6 @@ recall k=10 samples=10 query=file:siftsmall_query.fvecs beam-size=32
 recall@10: 100.00% (samples=10, truncated=0)
 mean usage: visited_partitions=35 visited_leaf_entries=785 exact_rerank_candidates=19
 
-# Rerank-window ablation on the settled real-data tree.
-recall k=10 samples=10 query=file:siftsmall_query.fvecs exact-rerank=10
-----
-recall@10: 100.00% (samples=10, truncated=10)
-mean usage: visited_partitions=35 visited_leaf_entries=785 exact_rerank_candidates=10
-
-recall k=10 samples=10 query=file:siftsmall_query.fvecs exact-rerank=40
-----
-recall@10: 100.00% (samples=10, truncated=0)
-mean usage: visited_partitions=35 visited_leaf_entries=785 exact_rerank_candidates=19
-
 # An exact filter (label is the record ordinal) on the settled tree.
 recall k=10 samples=10 query=file:siftsmall_query.fvecs where=1:le:499
 ----
@@ -433,6 +395,6 @@ loaded 1000 records (dataset=file:fashion_mnist_base.idx3-ubyte:1000, seed=42)
 
 recall k=10 samples=5 query=file:fashion_mnist_query.idx3-ubyte
 ----
-recall@10: 100.00% (samples=5, truncated=0)
+recall@10: 100.00% (samples=5, truncated=5)
 mean usage: visited_partitions=1 visited_leaf_entries=1000 exact_rerank_candidates=16
 

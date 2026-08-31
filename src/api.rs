@@ -33,7 +33,10 @@ pub use search::{
     SearchBudgetExhaustion, SearchBudgetUsage, SearchBudgets, SearchHit, SearchOptions,
     SearchOutcome, SearchRequest,
 };
-pub use verify::{VerifyIssue, VerifyIssueKind, VerifyObjectCounts, VerifyOptions, VerifyReport};
+pub use verify::{
+    VerifyIssue, VerifyIssueKind, VerifyObjectCounts, VerifyOptions, VerifyPartitionStateCounts,
+    VerifyReport, VerifyTopology,
+};
 
 pub(crate) use record::{MAX_PAYLOAD_BYTES, MAX_RECORD_ID_BYTES};
 pub(crate) use schema::{MAX_ENCODED_SYNOPSIS_BYTES, MAX_FIELDS, MAX_STRING_BYTES, typed_order};

@@ -140,8 +140,12 @@ One consistent snapshot performs:
 
 Traversal is a level-scaled beam. The leaf-level base beam defaults to 32 and
 SearchOptions may override it per request within the hard cap; moving one
-level toward the root divides it by two with minimum one. Eligible
-trees advance fairly. Ties use Tree Key, Partition Key, then Record ID.
+level toward the root divides it by two with minimum one. All admitted parents
+at one depth expose their Child Entries before the next depth selects the
+globally nearest beam for each tree. This prevents one wide parent from
+consuming the next level's beam before other admitted parents contribute their
+children. Eligible trees advance fairly. Ties use Tree Key, Partition Key,
+then Record ID.
 Partition, Leaf Entry, rerank, and optional RaBitQ-overlap bounds are charged
 before corresponding work. No speculative read-ahead occurs beyond a budget.
 
@@ -173,19 +177,22 @@ Corruption rather than silently deduplicated.
 
 ## 7. Search budgets and response
 
-SearchOptions overrides nonzero bounds for Tree Keys, partitions, leaf
-entries, rerank candidates, and RaBitQ overlap candidates within hard caps,
-plus the leaf-level base beam width. Defaults are process-local and
-benchmark-tunable. One successful response reports usage and
-each dimension that prevented pending work.
+SearchOptions overrides nonzero bounds for Tree Keys, partitions, and Leaf
+Entries within hard caps, plus the leaf-level base beam width. Exact-rerank
+sizing is owned by search: checked arithmetic computes
+`max(64,k+ceil(k/2))`, matching the leaf rough-set floor, and bounds it by the
+Runtime's exact-rerank ceiling. Defaults are process-local and benchmark-tunable.
+One successful response reports usage and each dimension that prevented
+pending work.
 
 The API deliberately has no `complete` boolean: ANN search is approximate even
 when no logical budget is exhausted. It also has no quality score or
-continuation token. Callers needing more work resubmit with higher budgets.
-RaBitQ estimate distances likewise stay internal: there is deliberately no
-estimate-only response mode or skip-rerank switch, so the exact-rerank stage's
-value is evidenced by rerank-budget sweeps in the e2e corpus (issue #100)
-rather than by exposing estimate-versus-exact divergence.
+continuation token. Callers needing more traversal work may resubmit with
+higher Tree Key, partition, or Leaf Entry budgets, or a wider beam. Exact-rerank
+sizing changes only with `k` or the engine policy. RaBitQ estimate distances
+likewise stay internal: there is deliberately no estimate-only response mode or
+skip-rerank switch. Focused selection tests protect the candidate policy, while
+search reports exact-rerank usage, exhaustion, and stage latency.
 
 ## 8. Partition cache
 

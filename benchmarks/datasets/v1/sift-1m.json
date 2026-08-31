@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "id": "texmex-sift1m",
+  "source_revision": "qbo-odp/sift1m@bd8ccad6c2a0a0a3a7519f6d37c0e5a2d59fe55b",
+  "format": "texmex_fvecs",
+  "metric": "l2",
+  "dimension": 128,
+  "base_vectors": 1000000,
+  "source_query_vectors": 10000,
+  "benchmark_query_vectors": 1000,
+  "ground_truth_neighbors": 100,
+  "files": [
+    {
+      "role": "base",
+      "path": "sift1m/sift_base.fvecs",
+      "url": "https://huggingface.co/datasets/qbo-odp/sift1m/resolve/bd8ccad6c2a0a0a3a7519f6d37c0e5a2d59fe55b/sift_base.fvecs",
+      "bytes": 516000000,
+      "checksum": { "algorithm": "sha256", "value": "21f66e2975057b5728ba56de1c825bac4f4d89d596609ae985741c6242631816" }
+    },
+    {
+      "role": "queries",
+      "path": "sift1m/sift_query.fvecs",
+      "url": "https://huggingface.co/datasets/qbo-odp/sift1m/resolve/bd8ccad6c2a0a0a3a7519f6d37c0e5a2d59fe55b/sift_query.fvecs",
+      "bytes": 5160000,
+      "checksum": { "algorithm": "sha256", "value": "f7fc9be140accdfd64116c2fa2365ecdb69b8f084970c6b0532db5ff79ac8fdc" }
+    },
+    {
+      "role": "ground_truth",
+      "path": "sift1m/sift_groundtruth.ivecs",
+      "url": "https://huggingface.co/datasets/qbo-odp/sift1m/resolve/bd8ccad6c2a0a0a3a7519f6d37c0e5a2d59fe55b/sift_groundtruth.ivecs",
+      "bytes": 4040000,
+      "checksum": { "algorithm": "sha256", "value": "2b71de0a8d5a83e6a84eec3e23fb8b611d8801dd9b3a6cd62f070ab65ea65f4f" }
+    }
+  ]
+}
