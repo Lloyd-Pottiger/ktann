@@ -1,9 +1,9 @@
 # Large ANN dataset cache
 
 The optimized `large` profile consumes fixed public datasets without checking
-their multi-gigabyte files into KTANN. The versioned manifests under `v1/`
-pin the source revision or S3 object version, exact byte length, checksum,
-metric, shape, query count, and supplied exact-neighbor ground truth.
+their multi-gigabyte files into KTANN. The manifests pin the source revision or
+S3 object version, exact byte length, checksum, metric, shape, query count, and
+supplied exact-neighbor ground truth.
 
 By default the runner reads `/tmp/vectordb_bench/dataset`, matching
 VectorDBBench. Set `KTANN_BENCH_DATASET_CACHE` to use a persistent cache. The

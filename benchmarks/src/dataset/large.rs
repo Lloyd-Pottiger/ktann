@@ -1,4 +1,4 @@
-//! Versioned external datasets for the optimized large ANN quality profile.
+//! External datasets for the optimized large ANN quality profile.
 
 use std::collections::HashSet;
 use std::env;
@@ -65,7 +65,7 @@ struct FileChecksum {
     part_bytes: Option<usize>,
 }
 
-/// Loads and validates one versioned large-profile dataset from the shared cache.
+/// Loads and validates one manifest-defined large-profile dataset from the shared cache.
 ///
 /// # Errors
 ///
@@ -117,8 +117,8 @@ pub fn load_large(name: &str) -> Result<BenchmarkDataset, String> {
 
 fn parse_manifest(name: &str) -> Result<Manifest, String> {
     let bytes = match name {
-        "cohere-1m" => include_str!("../../datasets/v1/cohere-1m.json"),
-        "sift-1m" => include_str!("../../datasets/v1/sift-1m.json"),
+        "cohere-1m" => include_str!("../../datasets/cohere-1m.json"),
+        "sift-1m" => include_str!("../../datasets/sift-1m.json"),
         _ => return Err(format!("unknown large dataset `{name}`")),
     };
     serde_json::from_str(bytes).map_err(|error| format!("decode {name} dataset manifest: {error}"))

@@ -89,7 +89,7 @@ jobs:
             [[ $(wc -c < "$target") -eq expected_bytes ]]
             checksum_matches "$target" "$algorithm" "$expected_checksum" "$part_bytes"
           }
-          for manifest in benchmarks/datasets/v1/*.json; do
+          for manifest in benchmarks/datasets/*.json; do
             jq -r '.files[] | [.bytes, .path, .url, .checksum.algorithm, .checksum.value, (.checksum.part_bytes // "")] | @tsv' "$manifest" |
             while IFS=$'\t' read -r expected_bytes path url algorithm expected_checksum part_bytes; do
               target="$KTANN_BENCH_DATASET_CACHE/$path"
