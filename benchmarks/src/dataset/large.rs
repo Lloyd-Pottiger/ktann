@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, FixedSizeListArray, Float32Array, Int32Array, Int64Array, LargeListArray, ListArray,
-    UInt32Array, UInt64Array,
+    Array, ArrayRef, FixedSizeListArray, Float32Array, Int32Array, Int64Array, LargeListArray,
+    ListArray, UInt32Array, UInt64Array,
 };
 use bytes::Bytes;
 use md5::{Digest as _, Md5};
@@ -399,16 +399,30 @@ fn vector_at(
     dimension: usize,
     path: &Path,
 ) -> Result<Arc<[f32]>, String> {
+    float_values(
+        list_value(array, row, path, "emb")?.as_ref(),
+        dimension,
+        path,
+    )
+}
+
+/// Reads a row from any Arrow list representation used by the source files.
+fn list_value(
+    array: &dyn Array,
+    row: usize,
+    path: &Path,
+    column: &str,
+) -> Result<ArrayRef, String> {
     if let Some(list) = array.as_any().downcast_ref::<ListArray>() {
-        return float_values(list.value(row).as_ref(), dimension, path);
+        return Ok(list.value(row));
     }
     if let Some(list) = array.as_any().downcast_ref::<FixedSizeListArray>() {
-        return float_values(list.value(row).as_ref(), dimension, path);
+        return Ok(list.value(row));
     }
     if let Some(list) = array.as_any().downcast_ref::<LargeListArray>() {
-        return float_values(list.value(row).as_ref(), dimension, path);
+        return Ok(list.value(row));
     }
-    Err(format!("{} has a non-list emb column", path.display()))
+    Err(format!("{} has a non-list {column} column", path.display()))
 }
 
 fn float_values(array: &dyn Array, dimension: usize, path: &Path) -> Result<Arc<[f32]>, String> {
@@ -428,15 +442,7 @@ fn integer_list_at(
     neighbors: usize,
     path: &Path,
 ) -> Result<Vec<Bytes>, String> {
-    let values = if let Some(list) = array.as_any().downcast_ref::<ListArray>() {
-        list.value(row)
-    } else if let Some(list) = array.as_any().downcast_ref::<FixedSizeListArray>() {
-        list.value(row)
-    } else if let Some(list) = array.as_any().downcast_ref::<LargeListArray>() {
-        list.value(row)
-    } else {
-        return Err(format!("{} has non-list ground truth", path.display()));
-    };
+    let values = list_value(array, row, path, "ground truth")?;
     if values.len() < neighbors {
         return Err(format!("{} has too few exact neighbors", path.display()));
     }

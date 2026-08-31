@@ -554,30 +554,25 @@ fn compare_lifecycle(
         candidate.convergence.maintenance_drain_seconds,
         policy.maximum_relative_regression,
     );
-    compare_lifecycle_search(
-        result,
-        key,
-        "immediate search",
-        &baseline.immediate_search,
-        &candidate.immediate_search,
-        policy,
-    );
-    compare_lifecycle_search(
-        result,
-        key,
-        "stable cold search",
-        &baseline.stable_cold_search,
-        &candidate.stable_cold_search,
-        policy,
-    );
-    compare_lifecycle_search(
-        result,
-        key,
-        "stable warm search",
-        &baseline.stable_warm_search,
-        &candidate.stable_warm_search,
-        policy,
-    );
+    for (name, baseline, candidate) in [
+        (
+            "immediate search",
+            &baseline.immediate_search,
+            &candidate.immediate_search,
+        ),
+        (
+            "stable cold search",
+            &baseline.stable_cold_search,
+            &candidate.stable_cold_search,
+        ),
+        (
+            "stable warm search",
+            &baseline.stable_warm_search,
+            &candidate.stable_warm_search,
+        ),
+    ] {
+        compare_lifecycle_search(result, key, name, baseline, candidate, policy);
+    }
 }
 
 /// Compares one fixed lifecycle query pass without mixing cache states.

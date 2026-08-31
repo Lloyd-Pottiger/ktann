@@ -9,7 +9,7 @@ use bytes::Bytes;
 use ktann::api::{
     DataType, ErrorKind, FieldId, FieldSchema, ImportOptions, ImportSession, Index, IndexConfig,
     Metric, Mutation, OperationOptions, Record, RuntimeConfig, SearchBudgets, SearchOptions,
-    SearchOutcome, SearchRequest, Value, VerifyOptions,
+    SearchRequest, Value, VerifyOptions,
 };
 use ktann::runtime::Runtime;
 use ktann::storage::backend::Backend;
@@ -45,8 +45,8 @@ type ExactTruth = Arc<[(Bytes, f64)]>;
 /// A successful search retained until recall can run outside resource timing.
 #[derive(Debug)]
 struct RecallInput {
-    /// Approximate hits returned inside the measured API call.
-    outcome: SearchOutcome,
+    /// Record IDs returned inside the measured API call.
+    hit_ids: Vec<Bytes>,
     /// Immutable exact result computed before any benchmark timing.
     truth: ExactTruth,
 }
@@ -774,23 +774,42 @@ fn mutation_batches(
         .chunks(batch_size)
         .enumerate()
         .map(|(batch, vectors)| {
-            vectors
-                .iter()
-                .enumerate()
-                .map(|(offset, vector)| {
-                    let ordinal = batch
-                        .checked_mul(batch_size)
-                        .and_then(|ordinal| ordinal.checked_add(offset))
-                        .ok_or_else(|| "import record ordinal overflow".to_owned())?;
-                    Record::new(
-                        dataset.ids[ordinal].clone(),
-                        Arc::clone(vector),
-                        vec![Value::I64(0), Value::I64(0)],
-                    )
-                    .map(Mutation::Insert)
-                    .map_err(|error| error_at(phase, error))
-                })
-                .collect()
+            let start = batch
+                .checked_mul(batch_size)
+                .ok_or_else(|| "import record ordinal overflow".to_owned())?;
+            mutation_batch(
+                dataset,
+                vectors,
+                start,
+                &[Value::I64(0), Value::I64(0)],
+                phase,
+            )
+        })
+        .collect()
+}
+
+/// Builds one bounded batch of insert mutations from aligned dataset rows.
+fn mutation_batch(
+    dataset: &BenchmarkDataset,
+    vectors: &[Arc<[f32]>],
+    start: usize,
+    fields: &[Value],
+    phase: &str,
+) -> Result<Vec<Mutation>, String> {
+    vectors
+        .iter()
+        .enumerate()
+        .map(|(offset, vector)| {
+            let ordinal = start
+                .checked_add(offset)
+                .ok_or_else(|| "load record ordinal overflow".to_owned())?;
+            Record::new(
+                dataset.ids[ordinal].clone(),
+                Arc::clone(vector),
+                fields.to_vec(),
+            )
+            .map(Mutation::Insert)
+            .map_err(|error| error_at(phase, error))
         })
         .collect()
 }
@@ -1375,30 +1394,16 @@ async fn load_index<B: Backend>(
     } else {
         50
     };
+    let fields = if spec.profile == "large" {
+        Vec::new()
+    } else {
+        vec![Value::I64(0), Value::I64(0)]
+    };
     for (batch, vectors) in dataset.base.chunks(batch_size).enumerate() {
         let start = batch
             .checked_mul(batch_size)
             .ok_or_else(|| "load record ordinal overflow".to_owned())?;
-        let mutations = vectors
-            .iter()
-            .enumerate()
-            .map(|(offset, vector)| {
-                let ordinal = start
-                    .checked_add(offset)
-                    .ok_or_else(|| "load record ordinal overflow".to_owned())?;
-                Record::new(
-                    dataset.ids[ordinal].clone(),
-                    Arc::clone(vector),
-                    if spec.profile == "large" {
-                        Vec::new()
-                    } else {
-                        vec![Value::I64(0), Value::I64(0)]
-                    },
-                )
-                .map(Mutation::Insert)
-                .map_err(|error| error_at("construct load record", error))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let mutations = mutation_batch(dataset, vectors, start, &fields, "construct load record")?;
         if let Some(import) = import.as_mut() {
             import
                 .submit(mutations)
@@ -1898,9 +1903,7 @@ impl WorkloadObservation {
     fn recall_values(&self) -> Vec<f64> {
         self.recall_inputs
             .iter()
-            .map(|input| {
-                oracle::recall_ids(input.outcome.hits.iter().map(|hit| hit.id()), &input.truth)
-            })
+            .map(|input| oracle::recall_ids(input.hit_ids.iter(), &input.truth))
             .collect()
     }
 }
@@ -1917,7 +1920,12 @@ async fn execute_item<B: Backend>(
             index
                 .search(request)
                 .await
-                .map(|outcome| truth.map(|truth| RecallInput { outcome, truth }))
+                .map(|outcome| {
+                    truth.map(|truth| RecallInput {
+                        hit_ids: outcome.hits.iter().map(|hit| hit.id().clone()).collect(),
+                        truth,
+                    })
+                })
                 .map_err(|error| error.kind()),
         ),
         WorkItem::Upsert { record } => (
@@ -1936,7 +1944,7 @@ async fn execute_item<B: Backend>(
     }
 }
 
-/// Computes canonical exact L2 top-k truth before warmup and measurement.
+/// Computes canonical exact top-k truth before warmup and measurement.
 fn exact_truth(dataset: &BenchmarkDataset, metric: Metric, k: usize) -> Vec<ExactTruth> {
     if let Some(truth) = &dataset.ground_truth {
         return truth
