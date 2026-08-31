@@ -32,7 +32,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: large-quality-rocksdb
-      - name: Prepare versioned public datasets
+      - name: Prepare public datasets
         shell: bash
         run: |
           set -euo pipefail

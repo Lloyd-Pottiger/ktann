@@ -25,7 +25,7 @@ r001343: 1.3692
 r001393: 1.3858
 r001522: 1.3923
 usage: scanned_tree_keys=1 visited_partitions=1 visited_leaf_entries=2000 exact_rerank_candidates=7
-exhausted: rabitq_overlap_truncated
+truncated: rabitq_overlap
 
 # The nullable f64 field filters exactly: score <= 10.5 keeps ordinals 0..=9
 # and 3 (NULL) never qualifies under SQL three-valued logic.
@@ -66,7 +66,7 @@ r000395: 1.7145
 r001340: 1.7207
 r000787: 1.7227
 usage: scanned_tree_keys=1 visited_partitions=1 visited_leaf_entries=2000 exact_rerank_candidates=22
-exhausted: rabitq_overlap_truncated
+truncated: rabitq_overlap
 
 # IN on the Tree Key field plus NOT NULL on the nullable score.
 search k=10 vector=[0,0,0,0,0,0,0,0] where=0:in:1 where=1:notnull
@@ -82,7 +82,7 @@ r000356: 1.4176
 r001254: 1.4284
 r001364: 1.4314
 usage: scanned_tree_keys=1 visited_partitions=1 visited_leaf_entries=2000 exact_rerank_candidates=16
-exhausted: rabitq_overlap_truncated
+truncated: rabitq_overlap
 
 # Not-equal excludes exactly the matching score.
 search k=5 vector=[0,0,0,0,0,0,0,0] where=1:ne:5.5 where=1:le:10.5
@@ -322,4 +322,3 @@ usage: scanned_tree_keys=1 visited_partitions=3 visited_leaf_entries=6 exact_rer
 validate
 ----
 ok: records=6 trees=1 partitions=3 max_level=2
-

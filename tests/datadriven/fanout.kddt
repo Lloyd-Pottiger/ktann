@@ -34,7 +34,7 @@ r000662: 1.0141
 r001923: 1.0538
 r000284: 1.0555
 usage: scanned_tree_keys=4 visited_partitions=4 visited_leaf_entries=2000 exact_rerank_candidates=5
-exhausted: rabitq_overlap_truncated
+truncated: rabitq_overlap
 
 # A predicate on the Tree Key field selects exactly one tree.
 search k=5 vector=[0,0,0,0] where=0:eq:2
@@ -45,7 +45,7 @@ r000149: 1.0835
 r001973: 1.1712
 r000233: 1.1783
 usage: scanned_tree_keys=1 visited_partitions=1 visited_leaf_entries=500 exact_rerank_candidates=7
-exhausted: rabitq_overlap_truncated
+truncated: rabitq_overlap
 
 # A scanned Tree Key budget below the fan-out truncates enumeration.
 search k=5 vector=[0,0,0,0] scanned-tree-keys=2
@@ -56,7 +56,8 @@ r000537: 1.0815
 r000149: 1.0835
 r000892: 1.1363
 usage: scanned_tree_keys=2 visited_partitions=2 visited_leaf_entries=1000 exact_rerank_candidates=5
-exhausted: scanned_tree_keys rabitq_overlap_truncated
+exhausted: scanned_tree_keys
+truncated: rabitq_overlap
 
 # --- Cross-tree isolation (issue #100, item D2) ---
 # Churn on trees 2..4 — splits, merges, inserts, upserts, deletes — must
@@ -157,4 +158,3 @@ usage: scanned_tree_keys=1 visited_partitions=1 visited_leaf_entries=10 exact_re
 validate
 ----
 ok: records=40 trees=4 partitions=8 max_level=2
-

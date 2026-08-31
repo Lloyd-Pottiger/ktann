@@ -21,7 +21,6 @@ use sha2::Sha256;
 use super::{BenchmarkDataset, checksum, validate_dimension};
 use crate::report::{DatasetFileMetadata, DatasetMetadata, DatasetSourceMetadata};
 
-const MANIFEST_VERSION: u32 = 1;
 const DEFAULT_CACHE_DIR: &str = "/tmp/vectordb_bench/dataset";
 
 type IdVectors = (Vec<Bytes>, Vec<Arc<[f32]>>);
@@ -36,7 +35,6 @@ enum DatasetFormat {
 
 #[derive(Clone, Debug, Deserialize)]
 struct Manifest {
-    schema_version: u32,
     id: String,
     source_revision: String,
     format: DatasetFormat,
@@ -85,7 +83,6 @@ pub fn load_large(name: &str) -> Result<BenchmarkDataset, String> {
     let checksum_xxh3_128 = checksum(&ids, &base, &queries);
     let source = DatasetSourceMetadata {
         manifest_id: manifest.id.clone(),
-        manifest_version: manifest.schema_version,
         source_revision: manifest.source_revision.clone(),
         files: manifest
             .files
@@ -125,12 +122,6 @@ fn parse_manifest(name: &str) -> Result<Manifest, String> {
 }
 
 fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
-    if manifest.schema_version != MANIFEST_VERSION {
-        return Err(format!(
-            "dataset manifest {} has unsupported schema version {}",
-            manifest.id, manifest.schema_version
-        ));
-    }
     if manifest.dimension == 0
         || manifest.base_vectors < 500_000
         || manifest.benchmark_query_vectors == 0

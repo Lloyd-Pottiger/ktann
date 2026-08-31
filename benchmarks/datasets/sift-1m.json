@@ -1,5 +1,4 @@
 {
-  "schema_version": 1,
   "id": "texmex-sift1m",
   "source_revision": "qbo-odp/sift1m@bd8ccad6c2a0a0a3a7519f6d37c0e5a2d59fe55b",
   "format": "texmex_fvecs",

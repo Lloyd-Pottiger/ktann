@@ -546,11 +546,11 @@ impl Harness {
                 if outcome.exhausted.exact_rerank_candidates {
                     exhausted.push("exact_rerank_candidates");
                 }
-                if outcome.rabitq_overlap_truncated {
-                    exhausted.push("rabitq_overlap_truncated");
-                }
                 if !exhausted.is_empty() {
                     out.push_str(&format!("exhausted: {}\n", exhausted.join(" ")));
+                }
+                if outcome.rabitq_overlap_truncated {
+                    out.push_str("truncated: rabitq_overlap\n");
                 }
                 out
             }

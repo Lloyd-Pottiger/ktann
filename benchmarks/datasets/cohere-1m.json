@@ -1,5 +1,4 @@
 {
-  "schema_version": 1,
   "id": "vectordbbench-cohere-medium-1m",
   "source_revision": "VectorDBBench@08fabb2df7436bbaffb549f6d1144d66f14b9fb2; S3 object versions pinned per file",
   "format": "vectordbbench_parquet",

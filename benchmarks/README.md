@@ -40,7 +40,7 @@ distributions at representative sizes. Full runs are intended for optimized,
 otherwise idle hosts.
 
 The separate `large` profile is an optimized scheduled/manual quality run and
-never runs in smoke CI. It loads the versioned external inputs described in
+never runs in smoke CI. It loads the fixed external inputs described in
 [`datasets/README.md`](datasets/README.md), creates one converged index per
 dataset, and sweeps leaf beam `1, 4, 16, 32` while holding the four Search
 Budgets, k-derived exact-rerank policy, `k`, Runtime limits, Index configuration,
@@ -106,8 +106,8 @@ The timed workload reports:
 - accepted end-to-end latency distributions by search/write class; rejection
   rates are derived from the reported outcome counts;
 - exact recall@k against metric-specific brute-force truth for ordinary
-  immutable ANN scenarios; large quality scenarios use the versioned dataset's
-  supplied exact-neighbor truth (`cosine` for Cohere and `L2` for SIFT);
+  immutable ANN scenarios; large quality scenarios use the dataset's supplied
+  exact-neighbor truth (`cosine` for Cohere and `L2` for SIFT);
 - every Search Budget dimension and separate `approximate_selection` and
   `exact_reranking` stage latency;
 - Partition Cache hits, misses, stale misses, installs, and accounted bytes;
@@ -202,7 +202,7 @@ For `quality_sweep` reports, comparison pairs identical beam points and applies
 the existing recall, latency, throughput, CPU, cache, Search Budget, and
 Backend-IO policies to every point. Per-point RSS is unavailable because the
 operating-system high-water mark cannot distinguish multiple beam points in one
-worker. Compare only artifacts from the same otherwise idle host and versioned
+worker. Compare only artifacts from the same otherwise idle host and fixed
 dataset cache; beam values and other tuning inputs are experiment coordinates,
 not a production SLA.
 

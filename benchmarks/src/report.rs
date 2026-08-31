@@ -174,17 +174,15 @@ pub struct DatasetMetadata {
     pub dimension: usize,
     /// Stable xxh3-128 checksum over vector bits and IDs.
     pub checksum_xxh3_128: String,
-    /// Versioned external-data identity, absent for generated and checked-in inputs.
+    /// External-data identity, absent for generated and checked-in inputs.
     pub source: Option<DatasetSourceMetadata>,
 }
 
-/// Versioned source identity for a cached external benchmark dataset.
+/// Source identity for a cached external benchmark dataset.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DatasetSourceMetadata {
     /// Stable manifest identifier.
     pub manifest_id: String,
-    /// Dataset manifest schema version.
-    pub manifest_version: u32,
     /// Immutable upstream revision or object-version description.
     pub source_revision: String,
     /// Validated source files in manifest order.
