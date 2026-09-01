@@ -11,7 +11,7 @@ quality regression. The working target is recall@10 above 95% with
 The large RocksDB benchmark uses one tree, three searchable levels, and the
 same 1M-vector Cohere and SIFT datasets. The default exact-rerank limit is 64.
 
-| dataset / metric | beam 1 | beam 4 | beam 8 | beam 16 | beam 32 |
+| dataset / metric (before centroid fix) | beam 1 | beam 4 | beam 8 | beam 16 | beam 32 |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | SIFT1M / L2 recall@10 | 21.39% | 50.10% | 66.07% | 80.16% | 90.61% |
 | Cohere1M / cosine recall@10 | 6.76% | 19.41% | 30.12% | 42.55% | 56.21% |
@@ -121,7 +121,7 @@ centroids over the online split history, ideally with per-level routing
 diagnostics or a descendant-aggregate experiment before changing the public
 beam semantics.
 
-## Follow-up experiments
+### Leaf capacity and equal-work comparison
 
 The post-normalization 1M baseline remains far below the target. On a fresh
 `max_partition_entries=512` tree with 2,753 leaves, eight level-2 partitions,
@@ -134,6 +134,11 @@ and one root, the Cohere curve was:
 | 64 | 90.56% | 23,740 |
 | 128 | 95.16% | 47,528 |
 
+The fair `max=128` run produced 11,025 leaves, 122 level-2 partitions, and one
+root. Its beam=8 point reached 50.95% at 738 entries; beam=32 reached 71.74%
+at 2,953 entries. The measured report is
+`.benchmark-data/results/diagnose-cohere-1m-max128-beam8-32-2026-09-01.json`.
+
 Several structural/training candidates did not solve the problem:
 
 - Five deterministic balanced-K-means seed pairs, selecting the lowest
@@ -141,9 +146,14 @@ Several structural/training candidates did not solve the problem:
   versus about 798 seconds for the single-seed run. The small gain does not
   justify the extra training complexity or meet the target, so the candidate
   was removed.
-- Reducing the leaf capacity to 128 produced 11,075 leaves and reached only
-  51.79% at beam 8 while visiting 737 leaf entries. Its import took about 848
-  seconds, so smaller leaves are not a quality fix for this tree model.
+- Reducing the leaf capacity to 128 produced about 11,000 leaves. The earlier
+  `max=128, beam=8` point reached 51.79% while visiting only 737 leaf entries;
+  that is a lower-work point and is not a fair comparison with `max=512,
+  beam=8`. A fresh equal-work sweep measured `max=128, beam=32` at 71.74%
+  recall and 2,953 visited leaf entries, versus 64.28% and 2,956 entries for
+  `max=512, beam=8`. Smaller leaves therefore improve recall at matched leaf
+  work, but they do not approach the 95% target and their import took about
+  964 seconds.
 - On a valid difficult 100k slice (`max_partition_entries=64`, query rows
   900--999), balanced training reached 0.1% at beam 8. Five seed pairs reached
   0.0%, and unbalanced nearest-cluster assignment reached 0.1%. These results
@@ -157,6 +167,8 @@ numbers are discarded and are not evidence about KTANN quality.
 
 The remaining high-value direction is a better persistent routing model for
 the online tree—likely a bulk-build or explicitly maintained descendant
-aggregate—not a larger rerank candidate set, smaller leaves, or more local
-K-means seeds. No additional production implementation change is justified by
-the follow-up measurements yet.
+aggregate—not a larger rerank candidate set or a beam-allocation tweak. The
+equal-work result makes smaller leaves a useful quality/work trade-off, but it
+does not justify changing the production default by itself. No additional
+production implementation change is justified by the follow-up measurements
+yet.
