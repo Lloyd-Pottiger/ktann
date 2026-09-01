@@ -120,3 +120,43 @@ high-value investigation is the quality of immutable internal routing
 centroids over the online split history, ideally with per-level routing
 diagnostics or a descendant-aggregate experiment before changing the public
 beam semantics.
+
+## Follow-up experiments
+
+The post-normalization 1M baseline remains far below the target. On a fresh
+`max_partition_entries=512` tree with 2,753 leaves, eight level-2 partitions,
+and one root, the Cohere curve was:
+
+| beam | recall@10 | mean visited leaf entries |
+| ---: | ---: | ---: |
+| 8 | 64.28% | 2,956 |
+| 32 | 84.01% | 11,846 |
+| 64 | 90.56% | 23,740 |
+| 128 | 95.16% | 47,528 |
+
+Several structural/training candidates did not solve the problem:
+
+- Five deterministic balanced-K-means seed pairs, selecting the lowest
+  balanced objective, reached 65.15% at beam 8. Import took about 833 seconds,
+  versus about 798 seconds for the single-seed run. The small gain does not
+  justify the extra training complexity or meet the target, so the candidate
+  was removed.
+- Reducing the leaf capacity to 128 produced 11,075 leaves and reached only
+  51.79% at beam 8 while visiting 737 leaf entries. Its import took about 848
+  seconds, so smaller leaves are not a quality fix for this tree model.
+- On a valid difficult 100k slice (`max_partition_entries=64`, query rows
+  900--999), balanced training reached 0.1% at beam 8. Five seed pairs reached
+  0.0%, and unbalanced nearest-cluster assignment reached 0.1%. These results
+  reinforce that neither seed restarts nor removing the 50/50 constraint is the
+  missing invariant.
+
+Some early reduced-dataset runs incorrectly reported 100% because the temporary
+runner cleared the base vectors before recomputing local brute-force truth. The
+runner was corrected before the results above were accepted; those earlier
+numbers are discarded and are not evidence about KTANN quality.
+
+The remaining high-value direction is a better persistent routing model for
+the online tree—likely a bulk-build or explicitly maintained descendant
+aggregate—not a larger rerank candidate set, smaller leaves, or more local
+K-means seeds. No additional production implementation change is justified by
+the follow-up measurements yet.
