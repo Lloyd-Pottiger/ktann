@@ -56,7 +56,7 @@ The small change confirms that reranking is not the remaining dominant loss;
 the beam=8 target is still unmet and traversal/tree coverage needs a separate
 investigation.
 
-## Planned correction and validation
+## Committed correction and validation
 
 Cosine split centroids are now normalized in f64 after every trained cluster
 mean and before persistence. The query and leaf records are already normalized
@@ -77,6 +77,43 @@ Validation completed:
 The benchmark runner keeps beam 8 in the large-profile sweep. The rerank=1000
 ceiling was a temporary diagnostic-only API change and has been restored to
 the normal k-derived ceiling of 64.
+
+## Write-time beam
+
+Foreground inserts and upserts now accept a RuntimeConfig write beam through
+the same routing path used by Import Session. The default remains one, while
+`with_write_beam_size` exposes a bounded diagnostic/quality knob. A wider beam
+does not duplicate membership: every mutation still validates and commits one
+Record Location and one Leaf Entry.
+
+The write beam is global within each tree level, matching the search
+traversal's semantics. For example, if four candidate parents expose eight
+children, write beam four retains the four nearest children for that vector
+across all four parents; it does not retain four under every parent. A focused
+three-level topology test catches this distinction. This also prevents the
+effective work from growing as beam squared at the next level.
+
+A full Cohere 1M run with `max_partition_entries=512` and write beam four
+completed successfully on 2026-09-02. It produced 2,774 partitions and the
+following search curve:
+
+| search beam | recall@10 | mean visited leaf entries |
+| ---: | ---: | ---: |
+| 1 | 27.10% | 370 |
+| 4 | 52.32% | 1,478 |
+| 8 | 65.81% | 2,954 |
+| 16 | 76.51% | 5,906 |
+| 32 | 84.74% | 11,809 |
+
+The comparable earlier write-beam-one run reached 64.28% at search beam 8
+and 84.01% at search beam 32. This is a directional improvement, not a
+controlled same-process comparison: the imported topology had 2,774 versus
+about 2,762 partitions, and the write-beam-four import took 1,236 seconds.
+The target of greater than 95% recall at search beam 8 is therefore still not
+met. Write beam four is useful as an explicit experiment, but the evidence
+does not justify making it the Runtime default; write beam eight was not run
+on the full 1M corpus. The full-run report is
+`.benchmark-data/results/diagnose-cohere-1m-write-beam4-2026-09-02.json`.
 
 ## Follow-up experiments
 
@@ -114,12 +151,11 @@ L2 experiment reached 93.70%. This is evidence of a broader centroid/tree
 model limitation for skewed MIPS data, not evidence that InnerProduct
 centroids should be normalized. Normalizing them would change the metric.
 
-The committed cosine normalization fix is useful, but these experiments do
-not justify closing #126: the beam-8 Cohere target remains unmet. The next
-high-value investigation is the quality of immutable internal routing
-centroids over the online split history, ideally with per-level routing
-diagnostics or a descendant-aggregate experiment before changing the public
-beam semantics.
+The committed cosine normalization fix and the write-time beam are useful, but
+these experiments do not justify closing #126: the beam-8 Cohere target
+remains unmet. The next high-value investigation is the quality of immutable
+internal routing centroids over the online split history, ideally with
+per-level routing diagnostics or a descendant-aggregate experiment.
 
 ### Leaf capacity and equal-work comparison
 
@@ -154,21 +190,27 @@ Several structural/training candidates did not solve the problem:
   `max=512, beam=8`. Smaller leaves therefore improve recall at matched leaf
   work, but they do not approach the 95% target and their import took about
   964 seconds.
-- On a valid difficult 100k slice (`max_partition_entries=64`, query rows
-  900--999), balanced training reached 0.1% at beam 8. Five seed pairs reached
-  0.0%, and unbalanced nearest-cluster assignment reached 0.1%. These results
-  reinforce that neither seed restarts nor removing the 50/50 constraint is the
-  missing invariant.
+The earlier bounded query-window reports that showed 100% recall were invalid:
+the runner discarded the base vectors before computing the local exact truth,
+so an empty truth set was treated as perfect recall. The runner now computes
+truth before releasing the imported vectors. Those old reports must not be
+used as quality evidence.
 
-Some early reduced-dataset runs incorrectly reported 100% because the temporary
-runner cleared the base vectors before recomputing local brute-force truth. The
-runner was corrected before the results above were accepted; those earlier
-numbers are discarded and are not evidence about KTANN quality.
+A corrected paired 100k Cohere run (`max_partition_entries=64`, query rows
+900--999) measured write beam one versus four:
+
+| write beam | search beam 8 recall@10 | mean visited leaf entries | import seconds |
+| ---: | ---: | ---: | ---: |
+| 1 | 47.60% | 364 | 49.1 |
+| 4 | 52.20% | 371 | 55.5 |
+
+The write beam four run improved this slice by 4.6 percentage points at search
+beam 8, with about 13% more import time and nearly the same search work. This
+supports keeping the option available, but the slice is not a replacement for
+the full 1M quality result.
 
 The remaining high-value direction is a better persistent routing model for
 the online tree—likely a bulk-build or explicitly maintained descendant
-aggregate—not a larger rerank candidate set or a beam-allocation tweak. The
-equal-work result makes smaller leaves a useful quality/work trade-off, but it
-does not justify changing the production default by itself. No additional
-production implementation change is justified by the follow-up measurements
-yet.
+aggregate—not a larger rerank candidate set. Smaller leaves remain a useful
+quality/work trade-off, but neither leaf-capacity changes nor write beam four
+close the beam-8 quality gap.

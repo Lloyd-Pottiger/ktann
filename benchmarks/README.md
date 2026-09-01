@@ -19,6 +19,12 @@ parent invocation. Each scenario runs in a fresh subprocess so its metrics
 recorder, Partition Cache, and peak RSS do not contain another scenario's
 state.
 
+The large profile accepts `--write-beam-size N` for import diagnostics. The
+write beam is applied globally at each tree level, like the search beam; the
+final foreground mutation still assigns each record to exactly one leaf. The
+default is one, so the option is explicit when measuring its import cost and
+quality effect.
+
 For controlled `import-to-search-lifecycle` diagnostics,
 `--maintenance-workers N` overrides the import Runtime's Structure Maintenance
 worker count (including zero), `--import-max-in-flight-batches N` overrides the

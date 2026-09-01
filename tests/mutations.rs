@@ -1057,10 +1057,10 @@ async fn batched_inserts_share_routing_and_apply_writes_once() {
 
     let counts = backend.inner.operation_counts();
     // One grouped descent for the whole batch: one Tree Manifest read, one
-    // batched authority (Header+State) read per visited partition — root plus
-    // both leaves — and one Child Entry scan, independent of the batch size.
+    // root authority read, one batched authority (Header+State) read for both
+    // leaves, and one Child Entry scan, independent of the batch size.
     assert_eq!(counts.get, 1, "plain reads: {counts:?}");
-    assert_eq!(counts.batch_get, 3, "batched authority reads: {counts:?}");
+    assert_eq!(counts.batch_get, 2, "batched authority reads: {counts:?}");
     assert_eq!(counts.scan, 1, "scans: {counts:?}");
     // Every record-group write lands through the single deferred apply; the
     // only remaining write calls are the per-item Header/Synopsis updates.

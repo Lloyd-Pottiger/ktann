@@ -5,7 +5,9 @@ use ktann::api::{
     DataType, ErrorKind, FieldId, FieldSchema, IndexConfig, LogicalIndexId, Metric, PartitionKey,
     Value,
 };
-use ktann::maintenance::routing::{Route, route_leaf, route_leaf_for_write};
+use ktann::maintenance::routing::{
+    Route, route_leaf, route_leaf_for_write, route_leaf_for_write_with_beam,
+};
 use ktann::storage::backend::{Backend, WriteTxn};
 use ktann::storage::keys::{self, LogicalKey, TreeKey};
 use ktann::storage::values::{
@@ -329,6 +331,153 @@ async fn grown_root_routes_to_the_nearest_child_and_breaks_ties() {
         .expect("write route");
     assert_eq!(route.leaf(), pk(3));
     assert_eq!(route.parent(), Some(pk(1)));
+    txn.rollback().await;
+}
+
+#[tokio::test]
+async fn write_beam_keeps_a_second_internal_path_in_play() {
+    let backend = DeterministicBackend::default();
+    let manifest = manifest();
+    let key = tree_key(1);
+    create_committed_tree(&backend, &manifest, &key).await;
+    write_topology(
+        &backend,
+        &manifest,
+        vec![
+            (header_key_at(&key, pk(1)), header(3, 2)),
+            (header_key_at(&key, pk(4)), header(2, 2)),
+            (header_key_at(&key, pk(6)), header(2, 2)),
+            (header_key_at(&key, pk(2)), header(1, 0)),
+            (header_key_at(&key, pk(3)), header(1, 0)),
+            (header_key_at(&key, pk(7)), header(1, 0)),
+            (header_key_at(&key, pk(8)), header(1, 0)),
+            (state_key_at(&key, pk(4)), ready_state()),
+            (state_key_at(&key, pk(6)), ready_state()),
+            (state_key_at(&key, pk(2)), ready_state()),
+            (state_key_at(&key, pk(3)), ready_state()),
+            (state_key_at(&key, pk(7)), ready_state()),
+            (state_key_at(&key, pk(8)), ready_state()),
+            (edge_key_at(&key, pk(1), pk(4)), edge(pk(4), 0.0)),
+            (edge_key_at(&key, pk(1), pk(6)), edge(pk(6), 100.0)),
+            (edge_key_at(&key, pk(4), pk(2)), edge(pk(2), 0.0)),
+            (edge_key_at(&key, pk(4), pk(3)), edge(pk(3), 100.0)),
+            (edge_key_at(&key, pk(6), pk(7)), edge(pk(7), 10.0)),
+            (edge_key_at(&key, pk(6), pk(8)), edge(pk(8), 11.0)),
+        ],
+    )
+    .await;
+
+    // Top-1 greedily follows the centroid-0 branch and cannot see the leaf at
+    // centroid 10 under the other root child.
+    let mut greedy = write_txn(&backend, &manifest).await;
+    let greedy_route = route_leaf_for_write(&mut greedy, &key, &[9.0], 200)
+        .await
+        .expect("greedy write route");
+    assert_eq!(greedy_route.leaf(), pk(2));
+    greedy.rollback().await;
+
+    // A wider write beam retains both root branches and chooses the genuinely
+    // nearer terminal leaf.
+    let mut beam = write_txn(&backend, &manifest).await;
+    let beam_route = route_leaf_for_write_with_beam(&mut beam, &key, &[9.0], 200, 4)
+        .await
+        .expect("beam write route");
+    assert_eq!(beam_route.leaf(), pk(7));
+    assert_eq!(beam_route.parent(), Some(pk(6)));
+    beam.rollback().await;
+}
+
+#[tokio::test]
+async fn write_beam_is_global_across_parents_at_each_level() {
+    let backend = DeterministicBackend::default();
+    let manifest = manifest();
+    let key = tree_key(1);
+    create_committed_tree(&backend, &manifest, &key).await;
+
+    let mut values = vec![
+        (header_key_at(&key, pk(1)), header(4, 2)),
+        (header_key_at(&key, pk(2)), header(3, 4)),
+        (header_key_at(&key, pk(3)), header(3, 4)),
+        (state_key_at(&key, pk(2)), ready_state()),
+        (state_key_at(&key, pk(3)), ready_state()),
+        (edge_key_at(&key, pk(1), pk(2)), edge(pk(2), 0.0)),
+        (edge_key_at(&key, pk(1), pk(3)), edge(pk(3), 100.0)),
+    ];
+    for (parent, children, leaf_start, centroid) in [
+        (pk(2), [pk(10), pk(11), pk(12), pk(13)], 30_u64, 9.0_f32),
+        (pk(3), [pk(20), pk(21), pk(22), pk(23)], 34_u64, 20.0_f32),
+    ] {
+        for (offset, child) in children.into_iter().enumerate() {
+            values.push((header_key_at(&key, child), header(2, 1)));
+            values.push((state_key_at(&key, child), ready_state()));
+            values.push((
+                edge_key_at(&key, parent, child),
+                edge(
+                    child,
+                    if parent == pk(2) {
+                        100.0 + offset as f32
+                    } else {
+                        offset as f32
+                    },
+                ),
+            ));
+            let leaf = pk(leaf_start + offset as u64);
+            values.push((header_key_at(&key, leaf), header(1, 0)));
+            values.push((state_key_at(&key, leaf), ready_state()));
+            values.push((edge_key_at(&key, child, leaf), edge(leaf, centroid)));
+        }
+    }
+    write_topology(&backend, &manifest, values).await;
+
+    // Top-1 follows the root's nearest branch and reaches the leaf at 9.
+    let mut greedy = write_txn(&backend, &manifest).await;
+    let greedy_route = route_leaf_for_write(&mut greedy, &key, &[9.0], 200)
+        .await
+        .expect("greedy write route");
+    assert_eq!(greedy_route.leaf(), pk(30));
+    greedy.rollback().await;
+
+    // At write beam 8, the root retains both branches, but the next level
+    // keeps only the four nearest children globally. All four therefore come
+    // from the second root branch, matching search's per-level beam policy.
+    let mut beam = write_txn(&backend, &manifest).await;
+    let beam_route = route_leaf_for_write_with_beam(&mut beam, &key, &[9.0], 200, 8)
+        .await
+        .expect("beam write route");
+    assert_eq!(beam_route.leaf(), pk(34));
+    beam.rollback().await;
+}
+
+#[tokio::test]
+async fn write_beam_rejects_duplicate_incoming_child_references() {
+    let backend = DeterministicBackend::default();
+    let manifest = manifest();
+    let key = tree_key(1);
+    create_committed_tree(&backend, &manifest, &key).await;
+    write_topology(
+        &backend,
+        &manifest,
+        vec![
+            (header_key_at(&key, pk(1)), header(3, 2)),
+            (header_key_at(&key, pk(2)), header(2, 1)),
+            (header_key_at(&key, pk(3)), header(2, 1)),
+            (header_key_at(&key, pk(4)), header(1, 0)),
+            (state_key_at(&key, pk(2)), ready_state()),
+            (state_key_at(&key, pk(3)), ready_state()),
+            (state_key_at(&key, pk(4)), ready_state()),
+            (edge_key_at(&key, pk(1), pk(2)), edge(pk(2), 0.0)),
+            (edge_key_at(&key, pk(1), pk(3)), edge(pk(3), 10.0)),
+            (edge_key_at(&key, pk(2), pk(4)), edge(pk(4), 0.0)),
+            (edge_key_at(&key, pk(3), pk(4)), edge(pk(4), 10.0)),
+        ],
+    )
+    .await;
+
+    let mut txn = write_txn(&backend, &manifest).await;
+    let error = route_leaf_for_write_with_beam(&mut txn, &key, &[5.0], 200, 8)
+        .await
+        .expect_err("duplicate child reference must fail closed");
+    assert_eq!(error.kind(), ErrorKind::Corruption);
     txn.rollback().await;
 }
 
