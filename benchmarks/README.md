@@ -22,8 +22,8 @@ state.
 The large profile accepts `--write-beam-size N` for import diagnostics. The
 write beam is applied globally at each tree level, like the search beam; the
 final foreground mutation still assigns each record to exactly one leaf. The
-default is one, so the option is explicit when measuring its import cost and
-quality effect.
+default is eight, so the option is explicit when measuring another import beam
+and its quality effect.
 
 For controlled `import-to-search-lifecycle` diagnostics,
 `--maintenance-workers N` overrides the import Runtime's Structure Maintenance

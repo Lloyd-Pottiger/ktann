@@ -253,7 +253,7 @@ fn search_rejects_invalid_k_dimension_and_budgets() -> ktann::api::Result<()> {
 #[test]
 fn runtime_and_verify_limits_fail_closed() {
     assert_eq!(RuntimeConfig::default().import_backlog_watermark(), 2);
-    assert_eq!(RuntimeConfig::default().write_beam_size(), 1);
+    assert_eq!(RuntimeConfig::default().write_beam_size(), 8);
     assert_invalid(RuntimeConfig::default().with_write_beam_size(0));
     assert_invalid(RuntimeConfig::default().with_write_beam_size(16_385));
     assert_eq!(

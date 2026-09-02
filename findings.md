@@ -81,10 +81,10 @@ the normal k-derived ceiling of 64.
 ## Write-time beam
 
 Foreground inserts and upserts now accept a RuntimeConfig write beam through
-the same routing path used by Import Session. The default remains one, while
-`with_write_beam_size` exposes a bounded diagnostic/quality knob. A wider beam
-does not duplicate membership: every mutation still validates and commits one
-Record Location and one Leaf Entry.
+the same routing path used by Import Session. The production default is eight;
+`with_write_beam_size` remains available for controlled quality/cost tuning. A
+wider beam does not duplicate membership: every mutation still validates and
+commits one Record Location and one Leaf Entry.
 
 The write beam is global within each tree level, matching the search
 traversal's semantics. For example, if four candidate parents expose eight
@@ -110,8 +110,8 @@ and 84.01% at search beam 32. This is a directional improvement, not a
 controlled same-process comparison: the imported topology had 2,774 versus
 about 2,762 partitions, and the write-beam-four import took 1,236 seconds.
 The target of greater than 95% recall at search beam 8 is therefore still not
-met. Write beam four is useful as an explicit experiment, but the evidence
-does not justify making it the Runtime default. The full-run report is
+met. Write beam four remains a useful lower-cost comparison, while the Runtime
+default is now write beam eight. The full-run report is
 `.benchmark-data/results/diagnose-cohere-1m-write-beam4-2026-09-02.json`.
 
 A follow-up full Cohere 1M run with `max_partition_entries=128` and write beam
@@ -128,6 +128,12 @@ took 1,566 seconds and the search curve was:
 Even search beam 128 remains below 95%, so increasing write beam alone does
 not explain or resolve the remaining quality loss. The run report is
 `.benchmark-data/results/cohere-1m-max128-write-beam8-search-16-32-54-128-2026-09-02.json`.
+
+Given the quality-first goal, the production defaults are now write beam 8,
+leaf search beam 128, and maximum partition size 128. This deliberately trades
+import and query cost for a stronger routing baseline; it is not a claim that
+the current index reaches the 95% target. Import throughput is tracked
+separately because the write beam makes the import path materially more costly.
 
 ## Follow-up experiments
 

@@ -19,7 +19,7 @@ const MAX_FOREGROUND_OPERATION_LIMIT: usize = 65_536;
 const DEFAULT_ATTEMPTS: u32 = 8;
 const DEFAULT_PARTITION_CACHE_BYTES: u64 = 256 * 1_024 * 1_024;
 const DEFAULT_TREE_KEY_SCAN_RANGES: u32 = 1_024;
-const DEFAULT_WRITE_BEAM_SIZE: u32 = 1;
+const DEFAULT_WRITE_BEAM_SIZE: u32 = 8;
 const MAX_WRITE_BEAM_SIZE: u32 = 16_384;
 
 /// Immutable configuration persisted in an Index Manifest.

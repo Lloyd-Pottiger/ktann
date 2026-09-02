@@ -72,7 +72,7 @@ use super::rabitq::{ApproximateCandidate, RaBitQ7, RaBitQQuery, select_leaf_over
 use super::rerank::{LeafCandidate, filter_candidates};
 
 /// The default leaf-level base beam (design `search.md` section 6).
-pub(crate) const DEFAULT_LEAF_BEAM: u32 = 32;
+pub(crate) const DEFAULT_LEAF_BEAM: u32 = 128;
 
 /// One bounded traversal request over the enumerated trees of one snapshot.
 ///
@@ -1056,6 +1056,7 @@ mod tests {
 
     #[test]
     fn beam_width_halves_toward_the_root_with_minimum_one() {
+        assert_eq!(DEFAULT_LEAF_BEAM, 128);
         assert_eq!(beam_width(32, 1), 32);
         assert_eq!(beam_width(32, 2), 16);
         assert_eq!(beam_width(32, 3), 8);

@@ -1336,7 +1336,7 @@ mod tests {
                     visited_leaf_entries: budget_configuration(65_536, 65_536),
                     exact_rerank_candidates: budget_configuration(65_536, 100),
                 },
-                write_beam_size: 1,
+                write_beam_size: 8,
                 leaf_beam_size_override: None,
                 leaf_beam_sweep: Vec::new(),
                 blocking_resource_limit: Some(2),

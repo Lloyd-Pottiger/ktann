@@ -138,7 +138,7 @@ One consistent snapshot performs:
 6. original Vector Record batch loading and exact reranking;
 7. deterministic top-k ordering and budget report construction.
 
-Traversal is a level-scaled beam. The leaf-level base beam defaults to 32 and
+Traversal is a level-scaled beam. The leaf-level base beam defaults to 128 and
 SearchOptions may override it per request within the hard cap; moving one
 level toward the root divides it by two with minimum one. All admitted parents
 at one depth expose their Child Entries before the next depth selects the

@@ -194,8 +194,8 @@ The v1 defaults and caps are:
 | Visited partitions | 1,024 | 16,384 |
 | Visited Leaf Entries | 65,536 | 1,048,576 |
 | Exact rerank candidates | `min(max(64,k+ceil(k/2)),65,536)` | Runtime ceiling 65,536; effective value at least `k` |
-| Leaf beam size | 32 | 16,384 |
-| Write beam size | 1 | 16,384 |
+| Leaf beam size | 128 | 16,384 |
+| Write beam size | 8 | 16,384 |
 | Tree Key scan ranges | 1,024 | wider conservative fallback |
 | Import maximum in-flight batches | `min(available_parallelism,4)`, min 1 | positive |
 | Import backlog watermark | 2 | within queue capacity |
