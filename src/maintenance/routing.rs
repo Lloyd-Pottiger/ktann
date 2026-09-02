@@ -75,7 +75,7 @@ use crate::storage::keys::{LogicalKey, MAX_TREE_KEY_BYTES, TreeKey};
 use crate::storage::values::{
     ChildEntry, IndexManifest, PartitionCentroid, PartitionHeader, PartitionState,
     PartitionTransition, PersistentValue, TreeManifest, expect_centroid, expect_child_entry_ref,
-    expect_header, expect_state,
+    expect_header,
 };
 use crate::storage::{
     LogicalRange, LogicalReader, ReadLogicalTxn, WriteLogicalTxn, topology, tree_manifest,
@@ -262,8 +262,8 @@ pub(crate) enum GroupedDescent {
 /// Routes one batch of preprocessed routing vectors through one tree for a
 /// foreground write.
 ///
-/// The batch shares one Tree Manifest read and one read per visited internal
-/// partition instead of re-descending per record. On [`GroupedDescent::Routed`]
+/// The batch shares one Tree Manifest read and one authority batch per visited
+/// tree level instead of re-descending per record. On [`GroupedDescent::Routed`]
 /// the returned Routes correspond to the input vectors by index, and every
 /// *distinct* routed leaf is validated once in one batched update-protected
 /// read: its Header and incoming reference are update-protected, so a
@@ -413,7 +413,20 @@ async fn descend<R: LogicalReader>(
     let mut parent = None;
     let mut expected_level = None;
     loop {
-        match resolve_hop(reader, manifest, tree_key, root, partition, expected_level).await? {
+        let authority =
+            topology::read_authority(reader, manifest.logical_index_id(), tree_key, partition)
+                .await?;
+        match resolve_hop(
+            reader,
+            manifest,
+            tree_key,
+            root,
+            partition,
+            expected_level,
+            authority,
+        )
+        .await?
+        {
             Hop::Leaf(header) => {
                 return Ok(Route {
                     leaf: partition,
@@ -546,50 +559,31 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
     let mut leaf_batch_fallback = false;
 
     while !pending.is_empty() {
-        // Beam expansion commonly leaves a whole frontier of level-one
-        // candidates. Read their authority pairs in one batch when every
-        // candidate is a normal write-accepting leaf. Transitional leaves
-        // fall back to the full state-aware resolver below.
+        // A normal leaf wave can finish directly after its one batch read. A
+        // transitional leaf must re-enter the state-aware resolver because it
+        // can redirect or expose a different body before accepting the write.
         if !leaf_batch_fallback
             && pending
                 .keys()
                 .all(|(_, expected_level)| *expected_level == Some(1))
         {
             let leaf_pending = std::mem::take(&mut pending);
-            let mut keys = Vec::with_capacity(2 * leaf_pending.len());
-            for (partition, _) in leaf_pending.keys() {
-                keys.push(LogicalKey::Header {
-                    index: manifest.logical_index_id(),
-                    tree_key: tree_key.clone(),
-                    partition: *partition,
-                });
-                keys.push(LogicalKey::State {
-                    index: manifest.logical_index_id(),
-                    tree_key: tree_key.clone(),
-                    partition: *partition,
-                });
-            }
-            let mut values = reader.batch_get(keys).await?.into_iter();
-            let mut headers = Vec::with_capacity(leaf_pending.len());
+            let partitions: Vec<PartitionKey> = leaf_pending
+                .keys()
+                .map(|(partition, _)| *partition)
+                .collect();
+            let authorities = topology::read_authority_batch(
+                reader,
+                manifest.logical_index_id(),
+                tree_key,
+                &partitions,
+            )
+            .await?;
             let mut fast_path = true;
-            for (partition, _) in leaf_pending.keys() {
-                let header = expect_header(
-                    values
-                        .next()
-                        .ok_or_else(|| Error::new(ErrorKind::Backend))?,
-                )?
-                .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
-                let state = expect_state(
-                    values
-                        .next()
-                        .ok_or_else(|| Error::new(ErrorKind::Backend))?,
-                )?
-                .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
+            let mut headers = Vec::with_capacity(leaf_pending.len());
+            for ((partition, _), (header, state)) in leaf_pending.keys().zip(authorities) {
                 check_level(&header, Some(1))?;
                 check_root_state(root, *partition, state)?;
-                if header.state() != state.state() {
-                    return Err(Error::new(ErrorKind::Corruption));
-                }
                 if !header.state().accepts_writes() {
                     fast_path = false;
                 }
@@ -639,8 +633,46 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
 
         let mut nearest = None;
         let mut child_level = None;
+        // Read the complete current wave before doing any routing work. This
+        // keeps authority reads proportional to tree depth, while the
+        // transaction-local cache handles a partition revisited by a
+        // split-family sideways hop.
+        let partitions: Vec<PartitionKey> = wave.keys().map(|(partition, _)| *partition).collect();
+        let mut authorities = topology::read_authority_batch(
+            reader,
+            manifest.logical_index_id(),
+            tree_key,
+            &partitions,
+        )
+        .await?
+        .into_iter()
+        .zip(partitions)
+        .map(|(authority, partition)| (partition, authority))
+        .collect::<HashMap<_, _>>();
         while let Some(((partition, current_level), members)) = wave.pop_first() {
-            match resolve_hop(reader, manifest, tree_key, root, partition, current_level).await? {
+            let (header, state) = match authorities.remove(&partition) {
+                Some(authority) => authority,
+                None => {
+                    topology::read_authority(
+                        reader,
+                        manifest.logical_index_id(),
+                        tree_key,
+                        partition,
+                    )
+                    .await?
+                }
+            };
+            match resolve_hop(
+                reader,
+                manifest,
+                tree_key,
+                root,
+                partition,
+                current_level,
+                (header, state),
+            )
+            .await?
+            {
                 Hop::Leaf(header) => {
                     for member in members {
                         consider_write_route(
@@ -951,11 +983,10 @@ struct DrainTarget {
     centroid: PartitionCentroid,
 }
 
-/// Resolves one visited partition's descent hop: the single split-aware
-/// state-machine body serving both the single-vector read descent and the
-/// grouped write descent. The merge state machine extends exactly this
-/// match.
-///
+/// Resolves one split-aware hop from an authority pair already read by the
+/// caller. This state-machine body serves both the single-vector read descent
+/// and the grouped write descent; batching changes only how the snapshot pair
+/// arrives.
 /// Split-family resolution stays within one level: a `ReceivingSplit`
 /// internal partition hops sideways to its source's family at most once,
 /// because targets cannot themselves split until their source drains.
@@ -966,9 +997,10 @@ async fn resolve_hop<R: LogicalReader>(
     root: PartitionKey,
     partition: PartitionKey,
     expected_level: Option<u32>,
+    authority: (PartitionHeader, PartitionTransition),
 ) -> Result<Hop> {
+    let (header, state) = authority;
     let index = manifest.logical_index_id();
-    let (header, state) = topology::read_authority(reader, index, tree_key, partition).await?;
     check_level(&header, expected_level)?;
     check_root_state(root, partition, state)?;
     // A write-accepting leaf — Ready, Splitting, or ReceivingSplit — is the

@@ -1024,6 +1024,91 @@ async fn seed_grown_tree(backend: &SharedBackend, manifest: &IndexManifest, buck
     txn.commit().await.expect("commit topology");
 }
 
+/// Extends the seeded two-level tree to three levels by turning its two leaf
+/// children into internal partitions and adding four empty leaf children.
+async fn deepen_tree(backend: &SharedBackend, manifest: &IndexManifest, bucket: i64) {
+    let key = tree_key(bucket);
+    let index = manifest.logical_index_id();
+    let pk = |value: u64| PartitionKey::new(value).expect("valid partition key");
+    let raw = backend.begin_write().await.expect("begin write");
+    let mut txn = WriteLogicalTxn::for_index(
+        raw,
+        manifest,
+        backend.hard_limits(),
+        backend.admission_budget(),
+    )
+    .expect("bind index");
+    let header = |partition, level, count| {
+        (
+            LogicalKey::Header {
+                index,
+                tree_key: key.clone(),
+                partition,
+            },
+            PersistentValue::PartitionHeader(
+                PartitionHeader::new(level, count, 0, PartitionState::Ready).expect("header"),
+            ),
+        )
+    };
+    let state = |partition| {
+        (
+            LogicalKey::State {
+                index,
+                tree_key: key.clone(),
+                partition,
+            },
+            PersistentValue::PartitionState(PartitionTransition::Ready {
+                started_at_unix_millis: 0,
+            }),
+        )
+    };
+    let synopsis = |partition| {
+        (
+            LogicalKey::Synopsis {
+                index,
+                tree_key: key.clone(),
+                partition,
+            },
+            PersistentValue::PartitionSynopsis(PartitionSynopsis::empty(manifest)),
+        )
+    };
+    let edge = |parent, child, centroid| {
+        (
+            LogicalKey::ChildEntry {
+                index,
+                tree_key: key.clone(),
+                partition: parent,
+                child,
+            },
+            PersistentValue::ChildEntry(ChildEntry::new(child, vec![centroid])),
+        )
+    };
+    for (key, value) in [
+        header(pk(1), 3, 2),
+        header(pk(2), 2, 2),
+        header(pk(3), 2, 2),
+        header(pk(4), 1, 0),
+        header(pk(5), 1, 0),
+        header(pk(6), 1, 0),
+        header(pk(7), 1, 0),
+        state(pk(4)),
+        state(pk(5)),
+        state(pk(6)),
+        state(pk(7)),
+        synopsis(pk(4)),
+        synopsis(pk(5)),
+        synopsis(pk(6)),
+        synopsis(pk(7)),
+        edge(pk(2), pk(4), 0.0),
+        edge(pk(2), pk(5), 1.0),
+        edge(pk(3), pk(6), 10.0),
+        edge(pk(3), pk(7), 11.0),
+    ] {
+        txn.put(key, value).await.expect("deepen topology");
+    }
+    txn.commit().await.expect("commit deep topology");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn batched_inserts_share_routing_and_apply_writes_once() {
     let backend = backend(DeterministicConfig::default());
@@ -1089,6 +1174,53 @@ async fn batched_inserts_share_routing_and_apply_writes_once() {
         20
     );
     for i in 0..N as u8 {
+        assert!(
+            index
+                .get(rid(i), GetOptions::default())
+                .await
+                .expect("get")
+                .is_some()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batched_routing_reads_authority_once_per_tree_level() {
+    let backend = backend(DeterministicConfig::default());
+    let runtime = Runtime::new(backend.clone(), support::manual_maintenance_config())
+        .expect("runtime is valid");
+    let index = runtime
+        .create_index("deep-batched", config_1d())
+        .await
+        .expect("create index");
+    let manifest = read_manifest(&backend, index.logical_index_id()).await;
+    seed_grown_tree(&backend, &manifest, 1).await;
+    deepen_tree(&backend, &manifest, 1).await;
+
+    backend.inner.reset_operation_counts();
+    index
+        .batch_mutate(
+            (0..16_u8)
+                .map(|i| {
+                    let x = match i % 4 {
+                        0 => 0.1,
+                        1 => 0.9,
+                        2 => 10.1,
+                        _ => 10.9,
+                    };
+                    Mutation::Insert(record_1d(&rid(i), x, 1))
+                })
+                .collect(),
+        )
+        .await
+        .expect("batch insert");
+
+    let counts = backend.inner.operation_counts();
+    // The route reads the root, both level-two candidates, and all level-one
+    // candidates as three authority waves. Before batching, the middle wave
+    // issued one authority batch per internal partition.
+    assert_eq!(counts.batch_get, 3, "authority waves: {counts:?}");
+    for i in 0..16_u8 {
         assert!(
             index
                 .get(rid(i), GetOptions::default())
