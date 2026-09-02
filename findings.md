@@ -111,9 +111,23 @@ controlled same-process comparison: the imported topology had 2,774 versus
 about 2,762 partitions, and the write-beam-four import took 1,236 seconds.
 The target of greater than 95% recall at search beam 8 is therefore still not
 met. Write beam four is useful as an explicit experiment, but the evidence
-does not justify making it the Runtime default; write beam eight was not run
-on the full 1M corpus. The full-run report is
+does not justify making it the Runtime default. The full-run report is
 `.benchmark-data/results/diagnose-cohere-1m-write-beam4-2026-09-02.json`.
+
+A follow-up full Cohere 1M run with `max_partition_entries=128` and write beam
+eight completed on the same host. It produced 11,147 partitions; the import
+took 1,566 seconds and the search curve was:
+
+| search beam | recall@10 | mean visited leaf entries |
+| ---: | ---: | ---: |
+| 16 | 66.53% | 1,482 |
+| 32 | 76.22% | 2,960 |
+| 54 | 82.39% | 4,996 |
+| 128 | 90.50% | 11,835 |
+
+Even search beam 128 remains below 95%, so increasing write beam alone does
+not explain or resolve the remaining quality loss. The run report is
+`.benchmark-data/results/cohere-1m-max128-write-beam8-search-16-32-54-128-2026-09-02.json`.
 
 ## Follow-up experiments
 
