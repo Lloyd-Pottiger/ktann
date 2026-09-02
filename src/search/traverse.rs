@@ -64,6 +64,7 @@ use crate::storage::values::{
     PersistentValue, RecordLocation,
 };
 
+use super::beam_width;
 use super::cache::{BodyEntries, PartitionCache, load_body};
 use super::numeric::{VectorKernel, compare_finite};
 use super::plan::EnumeratedTree;
@@ -684,15 +685,6 @@ impl Traversal {
             rabitq_overlap_truncated: self.rabitq_overlap_truncated,
         })
     }
-}
-
-/// The level-scaled beam width: `leaf_beam` at the leaf level, halved per
-/// level toward the root, with a minimum of one.
-fn beam_width(leaf_beam: u32, level: u32) -> u32 {
-    leaf_beam
-        .checked_shr(level.saturating_sub(1))
-        .unwrap_or(0)
-        .max(1)
 }
 
 /// Extracts a partition Header from a typed read, failing closed.

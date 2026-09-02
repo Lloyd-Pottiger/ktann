@@ -145,11 +145,9 @@ pub async fn train_split_centroids<T: ReadOps>(
         let entries = load_internal_source(txn, manifest, tree_key, source).await?;
         train(&kernel, entries)?
     };
-    let left = kernel.normalize_centroid(&trained.left)?;
-    let right = kernel.normalize_centroid(&trained.right)?;
     Ok(SplitCentroids {
-        left: PartitionCentroid::new(left),
-        right: PartitionCentroid::new(right),
+        left: PartitionCentroid::new(trained.left),
+        right: PartitionCentroid::new(trained.right),
     })
 }
 

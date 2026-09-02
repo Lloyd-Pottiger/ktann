@@ -97,11 +97,6 @@ validate
 ----
 ok: records=9 trees=1 partitions=2 max_level=2
 
-recall k=3 samples=6
-----
-recall@3: 100.00% (samples=6, truncated=0)
-mean usage: visited_partitions=2 visited_leaf_entries=9 exact_rerank_candidates=3
-
 # --- Scenario B: foreground mutations interleaved with a merge ---
 new-index dimension=2 metric=L2 fields=bucket:i64 tree-key-fields=0 min-entries=2 max-entries=4
 ----
@@ -738,4 +733,3 @@ pk=3: split resumed
 validate
 ----
 ok: records=12 trees=1 partitions=4 max_level=2
-

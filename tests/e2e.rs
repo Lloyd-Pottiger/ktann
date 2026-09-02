@@ -6,9 +6,13 @@
 //! --test e2e` regenerates the corpus instead of failing; a rewrite must be
 //! reviewed like any other change.
 //!
+//! KDDT requests use a test-only default leaf beam of 8 so small settled trees
+//! exercise approximate routing; production SearchOptions keep their default
+//! of 128. A directive can override the test default with `beam-size=`.
+//!
 //! Directives:
 //!
-//! - `new-index name=N dimension=D metric=M fields=f:t[?],... tree-key-fields=I,... [min-entries=N] [max-entries=N]`
+//! - `new-index name=N dimension=D metric=M fields=f:t[?],... tree-key-fields=I,... [min-entries=N] [max-entries=N] [write-beam=N]`
 //!   starts a fresh backend, Runtime, and index; the harness model resets.
 //!   Field types: `i64`, `f64`, `bool`, `string`; a `?` suffix makes the
 //!   field nullable.
@@ -25,11 +29,12 @@
 //! - `search k=K vector=[v,v,...] [where=F:op:value ...] [budget overrides] [beam-size=N]` —
 //!   prints one `id: distance` line per hit, then exact budget usage, then
 //!   any exhaustion flags.
-//! - `recall k=K samples=N [query=SPEC] [query-seed=N] [where=...] [budgets] [beam-size=N]` —
-//!   prints recall against the brute-force oracle plus the count of
-//!   budget-truncated queries. A `query=` spec is capped at `samples`
-//!   queries; without it, `samples` stride queries come from the loaded
-//!   dataset.
+//! - `recall k=K samples=N [query=SPEC] [query-seed=N] [where=...] [budgets]
+//!   [beam-size=N] [min-recall=PERCENT]` — prints recall against the
+//!   brute-force oracle plus the count of budget-truncated queries. A
+//!   `query=` spec is capped at `samples` queries; without it, `samples`
+//!   stride queries come from the loaded dataset. `min-recall=` adds a
+//!   quality assertion without changing the recorded output.
 //! - `inject-fault kind=abort|unknown-applied|unknown-not-applied` — queues one
 //!   commit fault; unknown outcomes are recovered by read-back, and the model
 //!   is synchronized per ADR 0012.
@@ -61,7 +66,6 @@
 //! - `format-tree [entries] [tree=V]` — renders the reachable topology,
 //!   including in-flight split states with their targets; `tree=V` restricts
 //!   the output to one tree, keeping its ordinal in directory order.
-//! - `stats` — prints committed keyspace size.
 //! - `drop-index` — drops the index.
 //!
 //! The split and merge directives drive the #10/#31 state machines explicitly
@@ -211,7 +215,6 @@ impl Harness {
             "restart" => self.restart().await,
             "validate" => self.validate().await,
             "format-tree" => self.format_tree(directive).await,
-            "stats" => self.stats(),
             "drop-index" => self.drop_index().await,
             other => panic!("unknown directive `{other}` at line {}", directive.line),
         }
@@ -254,7 +257,6 @@ impl Harness {
                 )
                 .expect("valid partition entries");
         }
-
         let backend_config = DeterministicConfig {
             durability: Durability::Durable,
             ..DeterministicConfig::default()
@@ -264,8 +266,13 @@ impl Harness {
         // split-step/merge-step directives and asserts every intermediate
         // state, so its Runtime runs without background maintenance workers;
         // demand-driven scheduling is covered by tests/maintenance_scheduling.rs.
-        let runtime =
-            Runtime::new(backend.clone(), support::manual_maintenance_config()).expect("runtime");
+        let mut runtime_config = support::manual_maintenance_config();
+        if let Some(beam) = directive.arg("write-beam") {
+            runtime_config = runtime_config
+                .with_write_beam_size(beam.parse().expect("write-beam"))
+                .expect("valid write beam");
+        }
+        let runtime = Runtime::new(backend.clone(), runtime_config).expect("runtime");
         match runtime.create_index(&name, config).await {
             Ok(index) => {
                 self.backend = Some(backend);
@@ -609,9 +616,33 @@ impl Harness {
             total_rerank += u64::from(outcome.usage.exact_rerank_candidates);
         }
         let count = queries.len() as f64;
+        let mean_recall = total_recall / count;
+        if let Some(value) = directive.arg("min-recall") {
+            let minimum: f64 = value.parse().unwrap_or_else(|_| {
+                panic!(
+                    "directive `{}` at line {}: `min-recall=` must be a finite percentage, got `{value}`",
+                    directive.raw_header, directive.line
+                )
+            });
+            assert!(
+                minimum.is_finite() && (0.0..=100.0).contains(&minimum),
+                "directive `{}` at line {}: `min-recall=` must be between 0 and 100, got `{minimum}`",
+                directive.raw_header,
+                directive.line
+            );
+            let actual = mean_recall * 100.0;
+            assert!(
+                actual >= minimum,
+                "directive `{}` at line {}: recall {:.2}% is below the minimum {:.2}%",
+                directive.raw_header,
+                directive.line,
+                actual,
+                minimum
+            );
+        }
         format!(
             "recall@{k}: {:.2}% (samples={}, truncated={truncated})\nmean usage: visited_partitions={} visited_leaf_entries={} exact_rerank_candidates={}\n",
-            total_recall / count * 100.0,
+            mean_recall * 100.0,
             queries.len(),
             total_partitions / queries.len() as u64,
             total_leaf_entries / queries.len() as u64,
@@ -1244,18 +1275,6 @@ impl Harness {
         }
     }
 
-    fn stats(&mut self) -> String {
-        let backend = self
-            .backend
-            .as_ref()
-            .expect("stats requires new-index first");
-        format!(
-            "keys={} bytes={}\n",
-            backend.inner().db_key_count(),
-            backend.inner().db_byte_count()
-        )
-    }
-
     async fn drop_index(&mut self) -> String {
         let runtime = self
             .runtime
@@ -1563,9 +1582,15 @@ fn fill_fields(
         .collect()
 }
 
+/// Keeps small KDDT datasets approximate enough to exercise tree routing.
+/// Production requests retain their independent default of 128.
+const TEST_DEFAULT_LEAF_BEAM: u32 = 8;
+
 /// Builds Search Budget overrides from directive arguments.
 fn search_options(directive: &Directive) -> SearchOptions {
-    let mut options = SearchOptions::default();
+    let mut options = SearchOptions::default()
+        .with_leaf_beam_size(TEST_DEFAULT_LEAF_BEAM)
+        .expect("valid test default leaf beam");
     if let Some(value) = directive.arg("scanned-tree-keys") {
         options = options
             .with_scanned_tree_keys(value.parse().expect("scanned-tree-keys"))

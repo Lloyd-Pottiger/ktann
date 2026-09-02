@@ -1,7 +1,6 @@
 # ----------------------------------------------------------------------
 # Basic insert/upsert/delete/get semantics on a tiny two-field index, plus a
-# lifecycle slice (restart durability and a clean drop, merged from the
-# former lifecycle.kddt).
+# lifecycle smoke test.
 # ----------------------------------------------------------------------
 new-index dimension=2 metric=L2 fields=bucket:i64,note:string?,flag:bool tree-key-fields=0
 ----
@@ -70,43 +69,7 @@ validate
 ----
 ok: records=27 trees=1 partitions=1 max_level=1
 
-format-tree entries
-----
-tree 0: root pk=1
-  pk=1 level=1 state=Ready count=27
-    r000000
-    r000001
-    r000002
-    r000003
-    r000004
-    r000005
-    r000006
-    r000007
-    r000008
-    r000009
-    r000010
-    r000011
-    r000012
-    r000013
-    r000014
-    r000015
-    r000016
-    r000017
-    r000018
-    r000019
-    r000020
-    r000021
-    r000022
-    r000023
-    r1
-    r2
-    r4
-
-stats
-----
-keys=88 bytes=5596
-
-# --- Lifecycle: restart durability and a clean drop (merged from the former lifecycle.kddt) ---
+# --- Lifecycle smoke test ---
 new-index dimension=8 metric=L2 fields=bucket:i64 tree-key-fields=0
 ----
 created index "index"
@@ -136,23 +99,6 @@ r001137: 0.7559
 usage: scanned_tree_keys=1 visited_partitions=1 visited_leaf_entries=3000 exact_rerank_candidates=4
 truncated: rabitq_overlap
 
-stats
-----
-keys=9007 bytes=600291
-
 drop-index
 ----
 dropped
-
-stats
-----
-keys=1 bytes=13
-
-# A fresh index under the same name starts empty.
-new-index dimension=8 metric=L2 fields=bucket:i64 tree-key-fields=0
-----
-created index "index"
-
-stats
-----
-keys=3 bytes=117

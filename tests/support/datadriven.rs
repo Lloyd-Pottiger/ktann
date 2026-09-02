@@ -220,7 +220,7 @@ pub fn parse(path: &Path, text: &str) -> Vec<Directive> {
 pub fn render(directives: &[Directive], outputs: &[String]) -> String {
     assert_eq!(directives.len(), outputs.len(), "one output per directive");
     let mut text = String::new();
-    for (directive, output) in directives.iter().zip(outputs) {
+    for (index, (directive, output)) in directives.iter().zip(outputs).enumerate() {
         text.push_str(&directive.comments);
         text.push_str(&directive.raw_header);
         text.push('\n');
@@ -230,7 +230,12 @@ pub fn render(directives: &[Directive], outputs: &[String]) -> String {
         }
         text.push_str("----\n");
         text.push_str(output);
-        text.push('\n');
+        if !output.ends_with('\n') {
+            text.push('\n');
+        }
+        if index + 1 < directives.len() {
+            text.push('\n');
+        }
     }
     text
 }

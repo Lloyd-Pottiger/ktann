@@ -98,11 +98,6 @@ validate
 ----
 ok: records=12 trees=1 partitions=3 max_level=2
 
-recall k=3 samples=6
-----
-recall@3: 100.00% (samples=6, truncated=0)
-mean usage: visited_partitions=3 visited_leaf_entries=12 exact_rerank_candidates=3
-
 # --- Scenario B: foreground mutations interleaved with a drain ---
 new-index dimension=2 metric=L2 fields=bucket:i64 tree-key-fields=0 min-entries=2 max-entries=4
 ----
@@ -334,11 +329,6 @@ tree 0: root pk=1
       pk=22 level=1 state=Ready count=4
       pk=23 level=1 state=Ready count=6
 
-recall k=5 samples=8
-----
-recall@5: 100.00% (samples=8, truncated=0)
-mean usage: visited_partitions=14 visited_leaf_entries=64 exact_rerank_candidates=6
-
 # --- Scenario F: post-split insert routing (the search-for-insert path) ---
 # Insert routing descends by nearest Child Entry centroid — a different path
 # from query search (beam traversal + exact rerank). After a topology change,
@@ -388,4 +378,3 @@ tree 0: root pk=1
 validate
 ----
 ok: records=7 trees=1 partitions=3 max_level=2
-

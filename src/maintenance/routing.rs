@@ -65,9 +65,10 @@
 //!   split family, or a malformed centroid is Corruption; malformed caller
 //!   vectors are InvalidArgument.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::api::{Error, ErrorKind, PartitionKey, Result};
+use crate::search::beam_width;
 use crate::search::numeric::{VectorKernel, compare_finite};
 use crate::storage::backend::{ReadOps, ScanLimits, WriteTxn};
 use crate::storage::keys::{LogicalKey, MAX_TREE_KEY_BYTES, TreeKey};
@@ -541,7 +542,7 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
     // Track the owner of every child reference observed during the descent.
     // The same edge may be revisited through a split-family sideways hop, but
     // a child referenced by two different bodies violates the tree invariant.
-    let mut incoming_owners = BTreeMap::from([(root, root)]);
+    let mut incoming_owners = HashMap::from([(root, root)]);
     let mut leaf_batch_fallback = false;
 
     while !pending.is_empty() {
@@ -687,7 +688,10 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                     child_level = Some(next_level);
                     let nearest = nearest.get_or_insert_with(|| {
                         vec![
-                            NearestChildren::new(write_beam_width(write_beam_size, next_level));
+                            NearestChildren::new(
+                                usize::try_from(beam_width(write_beam_size, next_level))
+                                    .unwrap_or(usize::MAX),
+                            );
                             routings.len()
                         ]
                     });
@@ -804,16 +808,6 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
 /// Returns the write beam at one child level, halving toward the root like the
 /// read traversal. `write_beam_size` is the leaf-level width; this keeps a
 /// configured beam comparable between write routing and search routing.
-fn write_beam_width(write_beam_size: u32, child_level: u32) -> usize {
-    usize::try_from(
-        write_beam_size
-            .checked_shr(child_level.saturating_sub(1))
-            .unwrap_or(0)
-            .max(1),
-    )
-    .unwrap_or(usize::MAX)
-}
-
 /// Keeps the best terminal leaf for one member of a write beam.
 fn consider_write_route(
     routes: &mut [Option<(f64, Route)>],

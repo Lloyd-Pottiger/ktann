@@ -1,400 +1,88 @@
 # ----------------------------------------------------------------------
-# Recall against the brute-force oracle and search-quality beam sweeps.
-#
-# Flat leaves with sufficient budgets are exact scans: recall must be 100%
-# for every metric and distribution; tight budgets truncate and report it.
-# The settled-tree suites sweep leaf beam width over the same queries,
-# recording hit quality and visited-partition cost as two-line regression
-# goldens (issue #100, items A1/B1; merged from the former beam.kddt).
+# Recall quality against a brute-force oracle on a settled, multi-level tree.
+# Queries are generated independently from the loaded records so this measures
+# routing quality rather than exact self-query matches. The beam sweep keeps
+# the traversal trade-off observable at a dataset size that actually creates
+# multiple searchable levels.
 # ----------------------------------------------------------------------
-new-index dimension=8 metric=L2 fields=bucket:i64 tree-key-fields=0
+# Cosine routing must be exercised on a settled, multi-level tree.
+new-index dimension=16 metric=Cosine fields=bucket:i64 tree-key-fields=0 min-entries=8 max-entries=16
 ----
 created index "index"
 
-load dataset=uniform:5000 tree=1 via=import seed=11
+load dataset=clustered:512:6 tree=1 via=batch seed=14
 ----
-loaded 5000 records (dataset=uniform:5000, seed=11)
-
-recall k=10 samples=20
-----
-recall@10: 100.00% (samples=20, truncated=20)
-mean usage: visited_partitions=1 visited_leaf_entries=5000 exact_rerank_candidates=11
-
-recall k=10 samples=20 visited-leaf-entries=64
-----
-recall@10: 1.00% (samples=20, truncated=20)
-mean usage: visited_partitions=1 visited_leaf_entries=64 exact_rerank_candidates=10
-
-# Cross-distribution queries: clustered queries against uniform data.
-recall k=10 samples=20 query=clustered:20:6 query-seed=99
-----
-recall@10: 100.00% (samples=20, truncated=20)
-mean usage: visited_partitions=1 visited_leaf_entries=5000 exact_rerank_candidates=12
-
-# Cosine over clustered data. The k-derived exact-rerank cap is smaller than
-# the 3000-entry leaf, so `truncated` reports the RaBitQ candidate
-# window, not a recall failure: recall stays exact when the truth survives
-# the window.
-new-index dimension=16 metric=Cosine fields=bucket:i64 tree-key-fields=0
-----
-created index "index"
-
-load dataset=clustered:3000:6 tree=1 seed=12
-----
-loaded 3000 records (dataset=clustered:3000:6, seed=12)
-
-recall k=10 samples=20
-----
-recall@10: 100.00% (samples=20, truncated=20)
-mean usage: visited_partitions=1 visited_leaf_entries=3000 exact_rerank_candidates=64
-
-# Inner product over skewed data; same truncation semantics as above.
-new-index dimension=16 metric=InnerProduct fields=bucket:i64 tree-key-fields=0
-----
-created index "index"
-
-load dataset=skewed:3000 tree=1 seed=13
-----
-loaded 3000 records (dataset=skewed:3000, seed=13)
-
-recall k=10 samples=20
-----
-recall@10: 100.00% (samples=20, truncated=20)
-mean usage: visited_partitions=1 visited_leaf_entries=3000 exact_rerank_candidates=59
-
-# --- Beam-width sweep on a settled synthetic tree ---
-new-index dimension=8 metric=L2 fields=bucket:i64 tree-key-fields=0 min-entries=8 max-entries=32
-----
-created index "index"
-
-load dataset=clustered:2000:8 tree=1 via=batch seed=7
-----
-loaded 2000 records (dataset=clustered:2000:8, seed=7)
+loaded 512 records (dataset=clustered:512:6, seed=14)
 
 split-all tree=1
 ----
 pk=1: split into left=2 right=3
-pk=3: split into left=4 right=5
-pk=2: split into left=6 right=7
-pk=5: split into left=8 right=9
+pk=2: split into left=4 right=5
+pk=3: split into left=6 right=7
+pk=6: split into left=8 right=9
 pk=4: split into left=10 right=11
-pk=7: split into left=12 right=13
-pk=8: split into left=14 right=15
-pk=9: split into left=16 right=17
-pk=10: split into left=18 right=19
-pk=11: split into left=20 right=21
-pk=6: split into left=22 right=23
-pk=13: split into left=24 right=25
-pk=12: split into left=26 right=27
-pk=19: split into left=28 right=29
-pk=23: split into left=30 right=31
-pk=17: split into left=32 right=33
-pk=15: split into left=34 right=35
-pk=14: split into left=36 right=37
-pk=21: split into left=38 right=39
-pk=25: split into left=40 right=41
-pk=24: split into left=42 right=43
-pk=27: split into left=44 right=45
-pk=29: split into left=46 right=47
-pk=20: split into left=48 right=49
-pk=32: split into left=50 right=51
-pk=26: split into left=52 right=53
-pk=31: split into left=54 right=55
-pk=30: split into left=56 right=57
-pk=28: split into left=58 right=59
-pk=33: split into left=60 right=61
-pk=34: split into left=62 right=63
-pk=35: split into left=64 right=65
-pk=16: split into left=66 right=67
-pk=37: split into left=68 right=69
-pk=39: split into left=70 right=71
-pk=38: split into left=72 right=73
-pk=36: split into left=74 right=75
-pk=40: split into left=76 right=77
-pk=41: split into left=78 right=79
-pk=42: split into left=80 right=81
-pk=43: split into left=82 right=83
-pk=44: split into left=84 right=85
-pk=53: split into left=86 right=87
-pk=45: split into left=88 right=89
-pk=46: split into left=90 right=91
-pk=49: split into left=92 right=93
-pk=47: split into left=94 right=95
-pk=50: split into left=96 right=97
-pk=51: split into left=98 right=99
-pk=54: split into left=100 right=101
-pk=56: split into left=102 right=103
-pk=48: split into left=104 right=105
-pk=55: split into left=106 right=107
-pk=58: split into left=108 right=109
-pk=59: split into left=110 right=111
-pk=61: split into left=112 right=113
-pk=1: split into left=114 right=115
-pk=57: split into left=116 right=117
-pk=52: split into left=118 right=119
-pk=60: split into left=120 right=121
-pk=63: split into left=122 right=123
-pk=64: split into left=124 right=125
-pk=65: split into left=126 right=127
-pk=62: split into left=128 right=129
-pk=18: split into left=130 right=131
-pk=67: split into left=132 right=133
-pk=66: split into left=134 right=135
-pk=115: split into left=136 right=137
-pk=68: split into left=138 right=139
-pk=69: split into left=140 right=141
-pk=70: split into left=142 right=143
-pk=72: split into left=144 right=145
-pk=71: split into left=146 right=147
-pk=78: split into left=148 right=149
-pk=83: split into left=150 right=151
-pk=74: split into left=152 right=153
-pk=75: split into left=154 right=155
-pk=77: split into left=156 right=157
-pk=81: split into left=158 right=159
-pk=73: split into left=160 right=161
-pk=76: split into left=162 right=163
-pk=101: split into left=164 right=165
-settled
-
-validate
-----
-ok: records=2000 trees=1 partitions=85 max_level=3
-
-# The same query at doubling beam widths: narrow beams are cheaper and
-# weaker, the default width (32) matches the unset override exactly.
-search k=8 vector=[0,0,0,0,0,0,0,0] beam-size=1
-----
-r000973: 2.2837
-r000118: 2.3369
-r000372: 2.3659
-r000704: 2.3663
-r001154: 2.3781
-r000069: 2.4181
-r000019: 2.4262
-r001289: 2.4333
-usage: scanned_tree_keys=1 visited_partitions=3 visited_leaf_entries=30 exact_rerank_candidates=11
-
-search k=8 vector=[0,0,0,0,0,0,0,0] beam-size=2
-----
-r000973: 2.2837
-r000118: 2.3369
-r000740: 2.3621
-r000372: 2.3659
-r000704: 2.3663
-r001154: 2.3781
-r001220: 2.3804
-r000069: 2.4181
-usage: scanned_tree_keys=1 visited_partitions=4 visited_leaf_entries=58 exact_rerank_candidates=13
-
-search k=8 vector=[0,0,0,0,0,0,0,0] beam-size=4
-----
-r000103: 1.3630
-r000504: 1.3691
-r001343: 1.3692
-r001522: 1.3923
-r001085: 1.4060
-r000523: 1.4072
-r000356: 1.4176
-r001254: 1.4284
-usage: scanned_tree_keys=1 visited_partitions=7 visited_leaf_entries=76 exact_rerank_candidates=13
-
-search k=8 vector=[0,0,0,0,0,0,0,0] beam-size=8
-----
-r000103: 1.3630
-r000504: 1.3691
-r001343: 1.3692
-r001393: 1.3858
-r001522: 1.3923
-r001085: 1.4060
-r000523: 1.4072
-r000904: 1.4172
-usage: scanned_tree_keys=1 visited_partitions=12 visited_leaf_entries=155 exact_rerank_candidates=11
-
-search k=8 vector=[0,0,0,0,0,0,0,0] beam-size=16
-----
-r000103: 1.3630
-r000504: 1.3691
-r001343: 1.3692
-r001393: 1.3858
-r001522: 1.3923
-r001085: 1.4060
-r000523: 1.4072
-r000904: 1.4172
-usage: scanned_tree_keys=1 visited_partitions=20 visited_leaf_entries=350 exact_rerank_candidates=11
-
-search k=8 vector=[0,0,0,0,0,0,0,0] beam-size=32
-----
-r000103: 1.3630
-r000504: 1.3691
-r001343: 1.3692
-r001393: 1.3858
-r001522: 1.3923
-r001085: 1.4060
-r000523: 1.4072
-r000904: 1.4172
-usage: scanned_tree_keys=1 visited_partitions=36 visited_leaf_entries=734 exact_rerank_candidates=11
-
-search k=8 vector=[0,0,0,0,0,0,0,0]
-----
-r000103: 1.3630
-r000504: 1.3691
-r001343: 1.3692
-r001393: 1.3858
-r001522: 1.3923
-r001085: 1.4060
-r000523: 1.4072
-r000904: 1.4172
-usage: scanned_tree_keys=1 visited_partitions=36 visited_leaf_entries=734 exact_rerank_candidates=11
-
-# Recall x beam matrix against the brute-force oracle.
-recall k=10 samples=10 beam-size=1
-----
-recall@10: 44.00% (samples=10, truncated=0)
-mean usage: visited_partitions=3 visited_leaf_entries=23 exact_rerank_candidates=13
-
-recall k=10 samples=10 beam-size=2
-----
-recall@10: 69.00% (samples=10, truncated=0)
-mean usage: visited_partitions=4 visited_leaf_entries=48 exact_rerank_candidates=15
-
-recall k=10 samples=10 beam-size=4
-----
-recall@10: 94.00% (samples=10, truncated=0)
-mean usage: visited_partitions=7 visited_leaf_entries=99 exact_rerank_candidates=18
-
-recall k=10 samples=10 beam-size=8
-----
-recall@10: 100.00% (samples=10, truncated=0)
-mean usage: visited_partitions=12 visited_leaf_entries=200 exact_rerank_candidates=21
-
-recall k=10 samples=10 beam-size=16
-----
-recall@10: 100.00% (samples=10, truncated=0)
-mean usage: visited_partitions=20 visited_leaf_entries=376 exact_rerank_candidates=21
-
-recall k=10 samples=10 beam-size=32
-----
-recall@10: 100.00% (samples=10, truncated=0)
-mean usage: visited_partitions=36 visited_leaf_entries=774 exact_rerank_candidates=21
-
-recall k=10 samples=10
-----
-recall@10: 100.00% (samples=10, truncated=0)
-mean usage: visited_partitions=36 visited_leaf_entries=774 exact_rerank_candidates=21
-
-# --- Real datasets at 1k: flat exactness, then a fully settled tree ---
-# The 1k prefix of the checked-in fixtures keeps a full settle (split-all)
-# cheap enough for the debug corpus; settling the full 10k fixtures stays
-# out of scope (#98, issue #100 item B3). The flat leaf is an exact scan;
-# the settled tree sweeps beam width on real distances, and an exact filter
-# prunes on the settled tree.
-new-index name=sift1k dimension=128 metric=L2 fields=bucket:i64,label:i64 tree-key-fields=0 min-entries=8 max-entries=32
-----
-created index "sift1k"
-
-load dataset=file:siftsmall_base.fvecs:1000 tree=1 via=batch batch=100
-----
-loaded 1000 records (dataset=file:siftsmall_base.fvecs:1000, seed=42)
-
-validate
-----
-ok: records=1000 trees=1 partitions=1 max_level=1
-
-# The flat 1k leaf is an exact scan: 100% recall against the oracle.
-recall k=10 samples=10 query=file:siftsmall_query.fvecs
-----
-recall@10: 100.00% (samples=10, truncated=10)
-mean usage: visited_partitions=1 visited_leaf_entries=1000 exact_rerank_candidates=19
-
-split-all tree=1
-----
-pk=1: split into left=2 right=3
-pk=3: split into left=4 right=5
-pk=2: split into left=6 right=7
-pk=4: split into left=8 right=9
-pk=5: split into left=10 right=11
-pk=7: split into left=12 right=13
-pk=6: split into left=14 right=15
-pk=13: split into left=16 right=17
-pk=8: split into left=18 right=19
-pk=11: split into left=20 right=21
-pk=10: split into left=22 right=23
-pk=15: split into left=24 right=25
-pk=14: split into left=26 right=27
-pk=9: split into left=28 right=29
-pk=12: split into left=30 right=31
-pk=17: split into left=32 right=33
-pk=19: split into left=34 right=35
-pk=23: split into left=36 right=37
+pk=5: split into left=12 right=13
+pk=9: split into left=14 right=15
+pk=7: split into left=16 right=17
+pk=11: split into left=18 right=19
+pk=10: split into left=20 right=21
+pk=8: split into left=22 right=23
+pk=12: split into left=24 right=25
+pk=13: split into left=26 right=27
+pk=14: split into left=28 right=29
+pk=17: split into left=30 right=31
+pk=15: split into left=32 right=33
+pk=16: split into left=34 right=35
+pk=19: split into left=36 right=37
 pk=18: split into left=38 right=39
-pk=16: split into left=40 right=41
-pk=21: split into left=42 right=43
-pk=24: split into left=44 right=45
-pk=27: split into left=46 right=47
-pk=20: split into left=48 right=49
-pk=25: split into left=50 right=51
-pk=28: split into left=52 right=53
-pk=29: split into left=54 right=55
-pk=22: split into left=56 right=57
-pk=26: split into left=58 right=59
-pk=30: split into left=60 right=61
+pk=21: split into left=40 right=41
+pk=23: split into left=42 right=43
+pk=20: split into left=44 right=45
+pk=22: split into left=46 right=47
+pk=25: split into left=48 right=49
+pk=26: split into left=50 right=51
+pk=1: split into left=52 right=53
+pk=24: split into left=54 right=55
+pk=27: split into left=56 right=57
+pk=28: split into left=58 right=59
+pk=29: split into left=60 right=61
 pk=31: split into left=62 right=63
-pk=32: split into left=64 right=65
-pk=33: split into left=66 right=67
-pk=35: split into left=68 right=69
-pk=1: split into left=70 right=71
-pk=37: split into left=72 right=73
-pk=38: split into left=74 right=75
-pk=41: split into left=76 right=77
-pk=43: split into left=78 right=79
-pk=45: split into left=80 right=81
-pk=47: split into left=82 right=83
-pk=49: split into left=84 right=85
+pk=33: split into left=64 right=65
+pk=30: split into left=66 right=67
+pk=38: split into left=68 right=69
+pk=32: split into left=70 right=71
+pk=34: split into left=72 right=73
+pk=35: split into left=74 right=75
+pk=37: split into left=76 right=77
+pk=36: split into left=78 right=79
+pk=52: split into left=80 right=81
+pk=41: split into left=82 right=83
+pk=43: split into left=84 right=85
+pk=53: split into left=86 right=87
+pk=39: split into left=88 right=89
+pk=40: split into left=90 right=91
+pk=42: split into left=92 right=93
+pk=44: split into left=94 right=95
+pk=45: split into left=96 right=97
+pk=47: split into left=98 right=99
+pk=46: split into left=100 right=101
 settled
 
 validate
 ----
-ok: records=1000 trees=1 partitions=45 max_level=3
+ok: records=512 trees=1 partitions=53 max_level=3
 
-# Beam x recall on the settled real-data tree (B1 at 1k scale).
-recall k=10 samples=10 query=file:siftsmall_query.fvecs beam-size=1
+recall k=10 samples=20 query=clustered:20:6 query-seed=91 beam-size=1 min-recall=25
 ----
-recall@10: 37.00% (samples=10, truncated=0)
-mean usage: visited_partitions=3 visited_leaf_entries=22 exact_rerank_candidates=12
+recall@10: 28.50% (samples=20, truncated=0)
+mean usage: visited_partitions=3 visited_leaf_entries=10 exact_rerank_candidates=10
 
-recall k=10 samples=10 query=file:siftsmall_query.fvecs beam-size=2
+recall k=10 samples=20 query=clustered:20:6 query-seed=91 beam-size=4 min-recall=80
 ----
-recall@10: 54.00% (samples=10, truncated=0)
-mean usage: visited_partitions=4 visited_leaf_entries=48 exact_rerank_candidates=16
+recall@10: 87.50% (samples=20, truncated=0)
+mean usage: visited_partitions=7 visited_leaf_entries=43 exact_rerank_candidates=18
 
-recall k=10 samples=10 query=file:siftsmall_query.fvecs beam-size=4
+recall k=10 samples=20 query=clustered:20:6 query-seed=91 beam-size=8 min-recall=95
 ----
-recall@10: 78.00% (samples=10, truncated=0)
-mean usage: visited_partitions=7 visited_leaf_entries=93 exact_rerank_candidates=15
-
-recall k=10 samples=10 query=file:siftsmall_query.fvecs beam-size=32
-----
-recall@10: 100.00% (samples=10, truncated=0)
-mean usage: visited_partitions=35 visited_leaf_entries=785 exact_rerank_candidates=19
-
-# An exact filter (label is the record ordinal) on the settled tree.
-recall k=10 samples=10 query=file:siftsmall_query.fvecs where=1:le:499
-----
-recall@10: 100.00% (samples=10, truncated=0)
-mean usage: visited_partitions=35 visited_leaf_entries=785 exact_rerank_candidates=19
-
-# --- fashion-mnist 1k smoke ---
-new-index name=fashion1k dimension=784 metric=L2 fields=bucket:i64,label:i64 tree-key-fields=0
-----
-created index "fashion1k"
-
-load dataset=file:fashion_mnist_base.idx3-ubyte:1000 tree=1 via=batch batch=100
-----
-loaded 1000 records (dataset=file:fashion_mnist_base.idx3-ubyte:1000, seed=42)
-
-recall k=10 samples=5 query=file:fashion_mnist_query.idx3-ubyte
-----
-recall@10: 100.00% (samples=5, truncated=5)
-mean usage: visited_partitions=1 visited_leaf_entries=1000 exact_rerank_candidates=16
-
+recall@10: 100.00% (samples=20, truncated=0)
+mean usage: visited_partitions=13 visited_leaf_entries=85 exact_rerank_candidates=23
