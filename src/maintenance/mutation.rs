@@ -92,6 +92,7 @@ pub(crate) async fn mutate<B: Backend>(
 ) -> Result<MutationReport> {
     let kernel = routing::kernel_for(handle_manifest)?;
     let prepared = prepare_all(handle_manifest, &kernel, mutations)?;
+    let write_beam_size = context.write_beam_size();
     let backend = context.backend();
     let mut failed_attempts = 0_u32;
     loop {
@@ -102,7 +103,15 @@ pub(crate) async fn mutate<B: Backend>(
             &retry,
             operation,
             &mut import_permit,
-            |txn| writes::boxed_step(apply_all(txn, &kernel, mutations, &prepared)),
+            |txn| {
+                writes::boxed_step(apply_all(
+                    txn,
+                    &kernel,
+                    mutations,
+                    &prepared,
+                    write_beam_size,
+                ))
+            },
         )
         .await?;
         match outcome {
@@ -146,18 +155,20 @@ async fn apply_all<T: WriteTxn>(
     kernel: &VectorKernel,
     mutations: &[Mutation],
     prepared: &[Option<PreparedRecord>],
+    write_beam_size: u32,
 ) -> Result<ApplyOutcome> {
     debug_assert_eq!(mutations.len(), prepared.len());
     let started_at = now_unix_millis();
-    let (targets, draining_sources) = match route_all(txn, kernel, prepared, started_at).await? {
-        RouteAll::Routed {
-            targets,
-            draining_sources,
-        } => (targets, draining_sources),
-        // Routing queues no writes, so an attempt abandoned here commits
-        // nothing and retries whole.
-        RouteAll::NoReadyMergeTarget => return Ok(ApplyOutcome::NoReadyMergeTarget),
-    };
+    let (targets, draining_sources) =
+        match route_all(txn, kernel, prepared, started_at, write_beam_size).await? {
+            RouteAll::Routed {
+                targets,
+                draining_sources,
+            } => (targets, draining_sources),
+            // Routing queues no writes, so an attempt abandoned here commits
+            // nothing and retries whole.
+            RouteAll::NoReadyMergeTarget => return Ok(ApplyOutcome::NoReadyMergeTarget),
+        };
     let expected = read_locations(txn, mutations).await?;
     let mut deferred = txn.mutations();
     let mut outcomes = Vec::with_capacity(mutations.len());
@@ -230,6 +241,7 @@ async fn route_all<T: WriteTxn>(
     kernel: &VectorKernel,
     prepared: &[Option<PreparedRecord>],
     started_at: u64,
+    write_beam_size: u32,
 ) -> Result<RouteAll> {
     let mut targets: Vec<Option<RecordLocation>> = vec![None; prepared.len()];
     let mut draining_sources = Vec::new();
@@ -261,6 +273,7 @@ async fn route_all<T: WriteTxn>(
             kernel,
             &routings,
             started_at,
+            write_beam_size,
         )
         .await
         .map_err(|error| error.at_position(group.first_position))?

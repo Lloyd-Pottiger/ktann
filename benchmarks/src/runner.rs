@@ -64,6 +64,8 @@ pub struct ScenarioSpec {
     pub base_vectors: usize,
     /// Held-out query count.
     pub query_vectors: usize,
+    /// Query-window start used by bounded large diagnostic runs.
+    pub query_offset: usize,
     /// Vector dimension.
     pub dimension: usize,
     /// Distance metric used by the Logical Index and supplied ground truth.
@@ -92,6 +94,8 @@ pub struct ScenarioSpec {
     pub k: usize,
     /// Per-request Search Budget and traversal overrides.
     pub search_options: SearchOptions,
+    /// Per-level beam used while importing records into the tree.
+    pub write_beam_size: u32,
     /// Ordered single-variable beam values; empty for ordinary scenarios.
     pub leaf_beam_sweep: Vec<u32>,
     /// Logical Index maximum partition size.
@@ -132,6 +136,7 @@ fn smoke_scenarios() -> Vec<ScenarioSpec> {
         profile: "smoke",
         base_vectors: 256,
         query_vectors: 8,
+        query_offset: 0,
         dimension: 16,
         metric: Metric::L2,
         seed: 0x38_0001,
@@ -146,6 +151,7 @@ fn smoke_scenarios() -> Vec<ScenarioSpec> {
         measured_operations: 64,
         k: 10,
         search_options: SearchOptions::default(),
+        write_beam_size: 8,
         leaf_beam_sweep: Vec::new(),
         max_partition_entries: 32,
         lifecycle: false,
@@ -210,6 +216,7 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
         profile: "full",
         base_vectors,
         query_vectors,
+        query_offset: 0,
         dimension,
         metric: Metric::L2,
         seed,
@@ -224,6 +231,7 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
         measured_operations: query_vectors.saturating_mul(10),
         k: 10,
         search_options: SearchOptions::default(),
+        write_beam_size: 8,
         leaf_beam_sweep: Vec::new(),
         max_partition_entries: 128,
         lifecycle: false,
@@ -313,6 +321,7 @@ fn large_scenarios() -> Result<Vec<ScenarioSpec>, String> {
         profile: "large",
         base_vectors: 1_000_000,
         query_vectors: 1_000,
+        query_offset: 0,
         dimension,
         metric,
         seed: 0x38_2001,
@@ -327,10 +336,11 @@ fn large_scenarios() -> Result<Vec<ScenarioSpec>, String> {
         measured_operations: 1_000,
         k: 10,
         search_options,
-        leaf_beam_sweep: vec![1, 4, 16, 32],
+        write_beam_size: 8,
+        leaf_beam_sweep: vec![1, 4, 8, 16, 32],
         // Keep the shared leaf/internal fanout below sqrt(1M) so the
         // million-vector corpus must form at least three searchable levels.
-        max_partition_entries: 512,
+        max_partition_entries: 128,
         lifecycle: false,
         import_batch_size: 50,
         import_max_in_flight_batches: 4,
@@ -379,6 +389,18 @@ pub async fn run_scenario<B: Backend>(
             spec.seed,
         )?
     };
+    if spec.profile == "large"
+        && (spec.base_vectors != dataset.base.len()
+            || spec.query_offset != 0
+            || spec.query_vectors != dataset.queries.len())
+    {
+        dataset = dataset::limit_with_query_offset(
+            dataset,
+            spec.base_vectors,
+            spec.query_offset,
+            spec.query_vectors,
+        )?;
+    }
     phase_completed(spec, "dataset load", dataset_started);
     let (backend, backend_counters) = MeasuredBackend::new(backend);
     let admission = backend.admission_budget();
@@ -466,6 +488,7 @@ pub async fn run_scenario<B: Backend>(
             mutation_attempt_limit: 32,
             maintenance_attempt_limit: 32,
             search_budgets,
+            write_beam_size: spec.write_beam_size,
             leaf_beam_size_override: spec.search_options.leaf_beam_size(),
             leaf_beam_sweep: spec.leaf_beam_sweep.clone(),
             blocking_resource_limit: spec.blocking_resource_limit,
@@ -504,7 +527,8 @@ fn runtime_config(
         .with_foreground_operation_limit(spec.foreground_limit)
         .and_then(|config| config.with_maintenance(maintenance_workers, FIXUP_QUEUE_CAPACITY))
         .and_then(|config| config.with_attempts(32, 32))
-        .and_then(|config| config.with_partition_cache_bytes(spec.partition_cache_bytes));
+        .and_then(|config| config.with_partition_cache_bytes(spec.partition_cache_bytes))
+        .and_then(|config| config.with_write_beam_size(spec.write_beam_size));
     let config = if spec.lifecycle || spec.profile == "large" {
         config.and_then(|config| {
             config.with_import_limits(
@@ -1091,8 +1115,15 @@ async fn run_with_runtime<B: Backend>(
     dataset: &BenchmarkDataset,
 ) -> Result<(Topology, SteadyStateMeasurements), String> {
     let (index, topology) = prepare_index(runtime, metric_capture, spec, dataset).await?;
-    let measurements =
-        measure_steady_workload(&index, backend_counters, metric_capture, spec, dataset).await?;
+    let measurements = measure_steady_workload(
+        &index,
+        backend_counters,
+        metric_capture,
+        spec,
+        dataset,
+        None,
+    )
+    .await?;
     verify_measured_state(&index, spec).await?;
     Ok((topology, measurements))
 }
@@ -1112,7 +1143,10 @@ async fn run_quality_sweep<B: Backend>(
             topology.max_level, topology.partitions, topology.partitions_by_level
         ));
     }
-    // Quality points use only held-out queries and supplied ground truth.
+    // Compute truth while the imported vectors are still available. Bounded
+    // diagnostic datasets deliberately discard supplied full-corpus truth, so
+    // this also preserves exact truth for the selected base/query subset.
+    let truth = exact_truth(dataset, spec.metric, spec.k);
     // Release the imported million-vector corpus before measuring search.
     dataset.ids = Vec::new();
     dataset.base = Vec::new();
@@ -1123,9 +1157,15 @@ async fn run_quality_sweep<B: Backend>(
             .search_options
             .with_leaf_beam_size(*beam)
             .map_err(|error| error_at("configure quality point", error))?;
-        let mut measurements =
-            measure_steady_workload(&index, backend_counters, metric_capture, &point, dataset)
-                .await?;
+        let mut measurements = measure_steady_workload(
+            &index,
+            backend_counters,
+            metric_capture,
+            &point,
+            dataset,
+            Some(&truth),
+        )
+        .await?;
         // getrusage exposes only the process-lifetime high-water mark, which
         // setup already established and cannot attribute to one beam point.
         measurements.peak_rss_bytes = None;
@@ -1171,8 +1211,11 @@ async fn measure_steady_workload<B: Backend>(
     metric_capture: &MetricCapture,
     spec: &ScenarioSpec,
     dataset: &BenchmarkDataset,
+    supplied_truth: Option<&[ExactTruth]>,
 ) -> Result<SteadyStateMeasurements, String> {
-    let truth = (spec.search_percent == 100).then(|| exact_truth(dataset, spec.metric, spec.k));
+    let computed_truth = (supplied_truth.is_none() && spec.search_percent == 100)
+        .then(|| exact_truth(dataset, spec.metric, spec.k));
+    let truth = supplied_truth.or(computed_truth.as_deref());
     let warmup = work_items(dataset, None, spec, spec.warmup_operations, 0)?;
     let point = spec
         .search_options
@@ -1191,7 +1234,7 @@ async fn measure_steady_workload<B: Backend>(
     let backend_before = backend_counters.snapshot();
     let measured_items = work_items(
         dataset,
-        truth.as_deref(),
+        truth,
         spec,
         spec.measured_operations,
         spec.warmup_operations,
@@ -2258,7 +2301,7 @@ mod tests {
     #[test]
     fn large_profile_is_an_explicit_single_variable_beam_sweep() {
         for scenario in scenarios("large").expect("large profile") {
-            assert_eq!(scenario.leaf_beam_sweep, [1, 4, 16, 32]);
+            assert_eq!(scenario.leaf_beam_sweep, [1, 4, 8, 16, 32]);
             assert_eq!(scenario.search_options.scanned_tree_keys(), Some(1));
             assert_eq!(scenario.search_options.visited_partitions(), Some(16_384));
             assert_eq!(

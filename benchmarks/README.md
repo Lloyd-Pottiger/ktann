@@ -19,6 +19,12 @@ parent invocation. Each scenario runs in a fresh subprocess so its metrics
 recorder, Partition Cache, and peak RSS do not contain another scenario's
 state.
 
+The large profile accepts `--write-beam-size N` for import diagnostics. The
+write beam is applied globally at each tree level, like the search beam; the
+final foreground mutation still assigns each record to exactly one leaf. The
+default is eight, so the option is explicit when measuring another import beam
+and its quality effect.
+
 For controlled `import-to-search-lifecycle` diagnostics,
 `--maintenance-workers N` overrides the import Runtime's Structure Maintenance
 worker count (including zero), `--import-max-in-flight-batches N` overrides the
@@ -42,7 +48,7 @@ otherwise idle hosts.
 The separate `large` profile is an optimized scheduled/manual quality run and
 never runs in smoke CI. It loads the fixed external inputs described in
 [`datasets/README.md`](datasets/README.md), creates one converged index per
-dataset, and sweeps leaf beam `1, 4, 16, 32` while holding the four Search
+dataset, and sweeps leaf beam `1, 4, 8, 16, 32` while holding the four Search
 Budgets, k-derived exact-rerank policy, `k`, Runtime limits, Index configuration,
 concurrency, dataset, and Backend fixed. The curves use Cohere 1M with cosine
 and SIFT1M with L2, each with 1,000 held-out queries and supplied ground truth.

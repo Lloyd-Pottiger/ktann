@@ -351,4 +351,3 @@ usage: scanned_tree_keys=1 visited_partitions=3 visited_leaf_entries=2 exact_rer
 validate
 ----
 ok: records=2 trees=1 partitions=3 max_level=2
-

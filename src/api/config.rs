@@ -19,6 +19,8 @@ const MAX_FOREGROUND_OPERATION_LIMIT: usize = 65_536;
 const DEFAULT_ATTEMPTS: u32 = 8;
 const DEFAULT_PARTITION_CACHE_BYTES: u64 = 256 * 1_024 * 1_024;
 const DEFAULT_TREE_KEY_SCAN_RANGES: u32 = 1_024;
+const DEFAULT_WRITE_BEAM_SIZE: u32 = 8;
+const MAX_WRITE_BEAM_SIZE: u32 = 16_384;
 
 /// Immutable configuration persisted in an Index Manifest.
 #[derive(Clone, Debug, PartialEq)]
@@ -224,6 +226,7 @@ pub struct RuntimeConfig {
     partition_cache_bytes: u64,
     default_search_budgets: SearchBudgets,
     tree_key_scan_ranges: u32,
+    write_beam_size: u32,
     import_max_in_flight_batches: usize,
     import_backlog_watermark: usize,
     stalled_timeout: Option<Duration>,
@@ -244,6 +247,7 @@ impl Default for RuntimeConfig {
             partition_cache_bytes: DEFAULT_PARTITION_CACHE_BYTES,
             default_search_budgets: SearchBudgets::default(),
             tree_key_scan_ranges: DEFAULT_TREE_KEY_SCAN_RANGES,
+            write_beam_size: DEFAULT_WRITE_BEAM_SIZE,
             import_max_in_flight_batches: available.clamp(1, 4),
             import_backlog_watermark: 2,
             stalled_timeout: None,
@@ -314,6 +318,17 @@ impl RuntimeConfig {
         Ok(self)
     }
 
+    /// Sets the per-level beam used when routing inserted and upserted
+    /// records. A record is still committed to exactly one leaf; a wider beam
+    /// only keeps more candidate paths alive before that final choice.
+    pub fn with_write_beam_size(mut self, beam: u32) -> Result<Self> {
+        if beam == 0 || beam > MAX_WRITE_BEAM_SIZE {
+            return Err(Error::invalid_argument());
+        }
+        self.write_beam_size = beam;
+        Ok(self)
+    }
+
     /// Sets the Import Session concurrency ceiling and backlog admission bound.
     ///
     /// A session starts with one active batch and learns useful concurrency up
@@ -364,6 +379,8 @@ impl RuntimeConfig {
             || self.foreground_attempts == 0
             || usize::try_from(self.partition_cache_bytes).is_err()
             || self.tree_key_scan_ranges == 0
+            || self.write_beam_size == 0
+            || self.write_beam_size > MAX_WRITE_BEAM_SIZE
             || self.import_max_in_flight_batches == 0
             || self.import_backlog_watermark > self.fixup_queue_capacity
             || self.retry_initial_backoff.is_zero()
@@ -421,6 +438,13 @@ impl RuntimeConfig {
     #[must_use]
     pub const fn tree_key_scan_ranges(&self) -> u32 {
         self.tree_key_scan_ranges
+    }
+
+    /// Returns the per-level beam used by foreground insert and upsert
+    /// routing.
+    #[must_use]
+    pub const fn write_beam_size(&self) -> u32 {
+        self.write_beam_size
     }
 
     /// Returns the Import Session adaptive-concurrency ceiling.

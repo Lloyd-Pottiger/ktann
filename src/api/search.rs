@@ -151,7 +151,7 @@ impl SearchOptions {
     /// The beam is a traversal-quality knob, not an accounted budget
     /// dimension: wider beams visit more partitions, all still charged to the
     /// visited-partition budget. When unset, the leaf-level base beam defaults
-    /// to 32 (design `search.md` section 6).
+    /// to 128 (design `search.md` section 6).
     pub fn with_leaf_beam_size(mut self, value: u32) -> Result<Self> {
         validate_override(value, MAX_LEAF_BEAM_SIZE)?;
         self.leaf_beam_size = Some(value);

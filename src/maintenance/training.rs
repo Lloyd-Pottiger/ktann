@@ -77,8 +77,10 @@ const RECORD_LOAD_BATCH: usize = 128;
 /// The two target centroids trained from one consistent source snapshot.
 ///
 /// The left centroid leads the balanced cluster of exactly `floor(n/2)`
-/// entries; the right centroid leads the remainder. The split state machine
-/// persists them on the exposed targets in creation order.
+/// entries; the right centroid leads the remainder. Cosine centroids are
+/// normalized after training because the arithmetic mean of unit vectors is
+/// not generally unit-norm. The split state machine persists them on the
+/// exposed targets in creation order.
 #[derive(Clone, PartialEq)]
 pub struct SplitCentroids {
     left: PartitionCentroid,
@@ -261,6 +263,11 @@ fn train<I: Ord>(kernel: &VectorKernel, mut entries: Vec<(I, Box<[f32]>)>) -> Re
             return Err(Error::new(ErrorKind::Corruption));
         }
     }
+    if kernel.is_cosine() {
+        for (_, vector) in &mut entries {
+            *vector = kernel.normalize_centroid(vector)?;
+        }
+    }
     match entries.len() {
         0 => {
             let zero: Box<[f32]> = vec![0.0; kernel.dimension()].into();
@@ -307,8 +314,8 @@ fn train<I: Ord>(kernel: &VectorKernel, mut entries: Vec<(I, Box<[f32]>)>) -> Re
     loop {
         let assignment = assign(&entries, &left, &right, half, &distance)?;
         let stable = previous.as_ref() == Some(&assignment);
-        left = cluster_mean(kernel.dimension(), &entries, &assignment, true)?;
-        right = cluster_mean(kernel.dimension(), &entries, &assignment, false)?;
+        left = cluster_mean(kernel, &entries, &assignment, true)?;
+        right = cluster_mean(kernel, &entries, &assignment, false)?;
         previous = Some(assignment);
         rounds += 1;
         if stable || rounds == MAX_TRAINING_ROUNDS {
@@ -373,21 +380,26 @@ fn farthest<I, D: Fn(&[f32], &[f32]) -> Result<f64>>(
 /// A balanced assignment never produces an empty cluster: `half >= 1` and
 /// `entries.len() - half >= 1` whenever training admits the entry set.
 fn cluster_mean<I>(
-    dimension: usize,
+    kernel: &VectorKernel,
     entries: &[(I, Box<[f32]>)],
     assignment: &[bool],
     left: bool,
 ) -> Result<Box<[f32]>> {
     let count = assignment.iter().filter(|&&member| member == left).count();
-    mean(
-        dimension,
+    let centroid = mean(
+        kernel.dimension(),
         count,
         entries
             .iter()
             .zip(assignment)
             .filter(move |(_, member)| **member == left)
             .map(|(entry, _)| &*entry.1),
-    )
+    )?;
+    if kernel.is_cosine() {
+        kernel.normalize_centroid(&centroid)
+    } else {
+        Ok(centroid)
+    }
 }
 
 /// Computes the component-wise mean of `count` members with f64 accumulation,
@@ -511,17 +523,19 @@ mod tests {
     }
 
     #[test]
-    fn cosine_training_ranks_by_negated_dot_product() {
-        // In routing space cosine distance is the negated dot product, so the
-        // antipodal entry pairs against the seed and the remaining entries
-        // average into the right centroid.
+    fn cosine_training_normalizes_cluster_centroids() {
+        // In routing space cosine distance is the negated dot product between
+        // unit vectors. The arithmetic mean of the right cluster is
+        // `[-0.5, 0.5]`, so spherical training must persist its direction.
         let trained = train(
             &kernel(2, Metric::Cosine),
             entries(&[&[1.0, 0.0], &[0.0, 1.0], &[-1.0, 0.0]]),
         )
         .expect("trained");
         assert_eq!(&*trained.left, &[1.0, 0.0]);
-        assert_eq!(&*trained.right, &[-0.5, 0.5]);
+        let expected = std::f32::consts::FRAC_1_SQRT_2;
+        assert!((trained.right[0] + expected).abs() < 1e-6);
+        assert!((trained.right[1] - expected).abs() < 1e-6);
         assert_eq!(trained.rounds, 2);
     }
 

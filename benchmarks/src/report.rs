@@ -5,7 +5,14 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 /// Current complete benchmark suite/report JSON contract.
-pub const REPORT_SCHEMA_VERSION: u32 = 2;
+pub const REPORT_SCHEMA_VERSION: u32 = 3;
+
+/// Supplies the v2 default when decoding a report created before write-beam
+/// configuration became part of the report contract. The schema-version check
+/// still prevents comparing that report with a v3 report.
+const fn default_write_beam_size() -> u32 {
+    1
+}
 
 /// Reports produced by one suite command on one comparable host.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -107,6 +114,9 @@ pub struct Configuration {
     pub maintenance_attempt_limit: usize,
     /// Runtime defaults, request overrides, and effective per-search limits.
     pub search_budgets: SearchBudgetConfiguration,
+    /// Per-level beam used while importing records into the tree.
+    #[serde(default = "default_write_beam_size")]
+    pub write_beam_size: u32,
     /// Per-request leaf-level base beam override, when present.
     pub leaf_beam_size_override: Option<u32>,
     /// Ordered leaf-beam values for a single-variable quality sweep.

@@ -65,16 +65,17 @@
 //!   split family, or a malformed centroid is Corruption; malformed caller
 //!   vectors are InvalidArgument.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::api::{Error, ErrorKind, PartitionKey, Result};
-use crate::search::numeric::VectorKernel;
+use crate::search::beam_width;
+use crate::search::numeric::{VectorKernel, compare_finite};
 use crate::storage::backend::{ReadOps, ScanLimits, WriteTxn};
 use crate::storage::keys::{LogicalKey, MAX_TREE_KEY_BYTES, TreeKey};
 use crate::storage::values::{
     ChildEntry, IndexManifest, PartitionCentroid, PartitionHeader, PartitionState,
     PartitionTransition, PersistentValue, TreeManifest, expect_centroid, expect_child_entry_ref,
-    expect_header,
+    expect_header, expect_state,
 };
 use crate::storage::{
     LogicalRange, LogicalReader, ReadLogicalTxn, WriteLogicalTxn, topology, tree_manifest,
@@ -203,6 +204,51 @@ pub async fn route_leaf_for_write<T: WriteTxn>(
     Ok(route)
 }
 
+/// Routes one caller vector with an explicit write beam.
+///
+/// A beam wider than one explores several child paths at every internal level
+/// and chooses the nearest terminal leaf among those paths. The vector is
+/// still assigned to one leaf, and the same observed Header and incoming-edge
+/// validation as [`route_leaf_for_write`] applies.
+pub async fn route_leaf_for_write_with_beam<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    tree_key: &TreeKey,
+    vector: &[f32],
+    started_at_unix_millis: u64,
+    write_beam_size: u32,
+) -> Result<Route> {
+    if write_beam_size == 0 {
+        return Err(Error::invalid_argument());
+    }
+    if write_beam_size == 1 {
+        return route_leaf_for_write(txn, tree_key, vector, started_at_unix_millis).await;
+    }
+    let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
+    let kernel = kernel_for(manifest)?;
+    let routing = kernel.preprocess(vector)?;
+    let root = ensure_tree(txn, tree_key, started_at_unix_millis).await?;
+    let descent = descend_grouped_with_beam(
+        txn,
+        manifest,
+        &kernel,
+        tree_key,
+        root,
+        &[&routing],
+        write_beam_size,
+    )
+    .await?;
+    match descent {
+        GroupedDescent::Routed(routes) => {
+            validate_for_write(txn, manifest, tree_key, &routes).await?;
+            routes
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::new(ErrorKind::Backend))
+        }
+        GroupedDescent::NoReadyMergeTarget => Err(Error::new(ErrorKind::ContentionExhausted)),
+    }
+}
+
 /// The outcome of a grouped write descent.
 pub(crate) enum GroupedDescent {
     /// Every vector routed to a write-accepting leaf, in input order.
@@ -233,8 +279,12 @@ pub(crate) async fn route_leaves_for_write_preprocessed<T: WriteTxn>(
     kernel: &VectorKernel,
     routings: &[&[f32]],
     started_at_unix_millis: u64,
+    write_beam_size: u32,
 ) -> Result<GroupedDescent> {
     let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
+    if write_beam_size == 0 {
+        return Err(Error::invalid_argument());
+    }
     if routings
         .iter()
         .any(|routing| routing.len() != manifest.config().dimension())
@@ -245,7 +295,20 @@ pub(crate) async fn route_leaves_for_write_preprocessed<T: WriteTxn>(
         return Ok(GroupedDescent::Routed(Vec::new()));
     }
     let root = ensure_tree(txn, tree_key, started_at_unix_millis).await?;
-    let descent = descend_grouped(txn, manifest, kernel, tree_key, root, routings).await?;
+    let descent = if write_beam_size == 1 {
+        descend_grouped(txn, manifest, kernel, tree_key, root, routings).await?
+    } else {
+        descend_grouped_with_beam(
+            txn,
+            manifest,
+            kernel,
+            tree_key,
+            root,
+            routings,
+            write_beam_size,
+        )
+        .await?
+    };
     if let GroupedDescent::Routed(routes) = &descent {
         validate_for_write(txn, manifest, tree_key, routes).await?;
     }
@@ -433,126 +496,409 @@ async fn descend_grouped<R: LogicalReader>(
     root: PartitionKey,
     routings: &[&[f32]],
 ) -> Result<GroupedDescent> {
-    let mut routes: Vec<Option<Route>> = vec![None; routings.len()];
-    // (partition, observed parent, expected level, member indexes).
-    let mut pending = vec![(
-        root,
-        None,
-        None,
-        (0..routings.len()).collect::<Vec<usize>>(),
-    )];
-    while let Some((partition, parent, expected_level, members)) = pending.pop() {
-        match resolve_hop(reader, manifest, tree_key, root, partition, expected_level).await? {
-            Hop::Leaf(header) => {
-                for member in members {
-                    routes[member] = Some(Route {
-                        leaf: partition,
-                        leaf_header: header,
-                        parent,
-                        incoming: Incoming::ParentEdge,
-                    });
-                }
+    descend_grouped_with_beam(reader, manifest, kernel, tree_key, root, routings, 1).await
+}
+
+/// One member of a write beam currently waiting at one partition.
+///
+/// `distance` is the distance of the edge that reached this partition. It is
+/// used only to choose between the final candidate leaves; every intermediate
+/// level replaces it with the distance of the newly selected Child Entry.
+#[derive(Clone, Copy)]
+struct PendingBeamMember {
+    member: usize,
+    parent: Option<PartitionKey>,
+    distance: f64,
+}
+
+/// Descends a batch while retaining several candidate paths per vector.
+///
+/// The grouped shape is important for imports: all vectors that currently
+/// share a partition scan its Child Entry bodies once, while each vector keeps
+/// its own top-N candidates. A vector still receives exactly one final Route;
+/// the beam changes which leaves are eligible for that choice, not the
+/// foreground membership invariant.
+async fn descend_grouped_with_beam<R: LogicalReader>(
+    reader: &mut R,
+    manifest: &IndexManifest,
+    kernel: &VectorKernel,
+    tree_key: &TreeKey,
+    root: PartitionKey,
+    routings: &[&[f32]],
+    write_beam_size: u32,
+) -> Result<GroupedDescent> {
+    let mut routes: Vec<Option<(f64, Route)>> = vec![None; routings.len()];
+    let mut pending: BTreeMap<(PartitionKey, Option<u32>), Vec<PendingBeamMember>> =
+        BTreeMap::from([(
+            (root, None),
+            (0..routings.len())
+                .map(|member| PendingBeamMember {
+                    member,
+                    parent: None,
+                    distance: 0.0,
+                })
+                .collect(),
+        )]);
+    // Track the owner of every child reference observed during the descent.
+    // The same edge may be revisited through a split-family sideways hop, but
+    // a child referenced by two different bodies violates the tree invariant.
+    let mut incoming_owners = HashMap::from([(root, root)]);
+    let mut leaf_batch_fallback = false;
+
+    while !pending.is_empty() {
+        // Beam expansion commonly leaves a whole frontier of level-one
+        // candidates. Read their authority pairs in one batch when every
+        // candidate is a normal write-accepting leaf. Transitional leaves
+        // fall back to the full state-aware resolver below.
+        if !leaf_batch_fallback
+            && pending
+                .keys()
+                .all(|(_, expected_level)| *expected_level == Some(1))
+        {
+            let leaf_pending = std::mem::take(&mut pending);
+            let mut keys = Vec::with_capacity(2 * leaf_pending.len());
+            for (partition, _) in leaf_pending.keys() {
+                keys.push(LogicalKey::Header {
+                    index: manifest.logical_index_id(),
+                    tree_key: tree_key.clone(),
+                    partition: *partition,
+                });
+                keys.push(LogicalKey::State {
+                    index: manifest.logical_index_id(),
+                    tree_key: tree_key.clone(),
+                    partition: *partition,
+                });
             }
-            Hop::DrainRedirect {
-                source,
-                left,
-                right,
-            } => {
-                for member in members {
-                    let target = nearer_redirect_target(kernel, routings[member], &left, &right)?;
-                    routes[member] = Some(Route {
-                        leaf: target.partition,
-                        leaf_header: target.header,
-                        parent,
-                        incoming: Incoming::SourceSlot(source),
-                    });
+            let mut values = reader.batch_get(keys).await?.into_iter();
+            let mut headers = Vec::with_capacity(leaf_pending.len());
+            let mut fast_path = true;
+            for (partition, _) in leaf_pending.keys() {
+                let header = expect_header(
+                    values
+                        .next()
+                        .ok_or_else(|| Error::new(ErrorKind::Backend))?,
+                )?
+                .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
+                let state = expect_state(
+                    values
+                        .next()
+                        .ok_or_else(|| Error::new(ErrorKind::Backend))?,
+                )?
+                .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
+                check_level(&header, Some(1))?;
+                check_root_state(root, *partition, state)?;
+                if header.state() != state.state() {
+                    return Err(Error::new(ErrorKind::Corruption));
                 }
+                if !header.state().accepts_writes() {
+                    fast_path = false;
+                }
+                headers.push(header);
             }
-            Hop::Children { bodies, next_level } => {
-                // Partition the members by nearest child across the bodies'
-                // exact Child Entry union — streamed per body, never
-                // materialized — then descend per group. A draining family's
-                // union is never empty, and a stable or splitting internal
-                // partition never has zero children, so every member resolves.
-                let mut nearest = vec![NearestChild::default(); members.len()];
-                for &(body, header) in &bodies {
-                    scan_children_with(reader, manifest, tree_key, body, header, &mut |entry| {
-                        for (slot, &member) in nearest.iter_mut().zip(&members) {
-                            slot.consider(kernel, routings[member], entry, body)?;
-                        }
-                        Ok(())
-                    })
-                    .await?;
-                }
-                let mut grouped: BTreeMap<PartitionKey, (PartitionKey, Vec<usize>)> =
-                    BTreeMap::new();
-                for (slot, member) in nearest.into_iter().zip(members) {
-                    let (child, owner) = slot.finish()?;
-                    grouped
-                        .entry(child)
-                        .or_insert_with(|| (owner, Vec::new()))
-                        .1
-                        .push(member);
-                }
-                for (child, (owner, members)) in grouped {
-                    pending.push((child, Some(owner), Some(next_level), members));
-                }
-            }
-            Hop::Sideways(source) => {
-                // The source shares the target's level; the carried parent is
-                // informational — the next hop below the internal source
-                // replaces it.
-                pending.push((source, parent, expected_level, members));
-            }
-            Hop::MergeReroute { level, candidates } => {
-                // The Ready-candidate set is vector-independent: either every
-                // member reselects a target or none does.
-                let mut grouped: BTreeMap<
-                    PartitionKey,
-                    (PartitionKey, PartitionHeader, Vec<usize>),
-                > = BTreeMap::new();
-                for member in members {
-                    let Some(candidate) =
-                        nearest_ready_candidate(kernel, routings[member], partition, &candidates)?
-                    else {
-                        return Ok(GroupedDescent::NoReadyMergeTarget);
-                    };
-                    grouped
-                        .entry(candidate.partition())
-                        .or_insert_with(|| (candidate.parent(), *candidate.header(), Vec::new()))
-                        .2
-                        .push(member);
-                }
-                for (target, (target_parent, target_header, members)) in grouped {
-                    if level == 1 {
-                        // The reselected Ready leaf ends the descent; its own
-                        // incoming edge at its observed parent is validated.
-                        for member in members {
-                            routes[member] = Some(Route {
-                                leaf: target,
-                                leaf_header: target_header,
-                                parent: Some(target_parent),
+            if fast_path {
+                for (((partition, _), members), header) in leaf_pending.into_iter().zip(headers) {
+                    for member in members {
+                        consider_write_route(
+                            &mut routes,
+                            member.member,
+                            member.distance,
+                            Route {
+                                leaf: partition,
+                                leaf_header: header,
+                                parent: member.parent,
                                 incoming: Incoming::ParentEdge,
-                            });
+                            },
+                        );
+                    }
+                }
+                continue;
+            }
+            leaf_batch_fallback = true;
+            pending = leaf_pending;
+        }
+
+        // Process one level as a wave. The read traversal applies the beam
+        // globally to all parents at a level; doing the same here keeps a
+        // configured write beam equal to the number of live paths, rather
+        // than multiplying it once per parent.
+        let expected_level = pending
+            .keys()
+            .next()
+            .map(|(_, level)| *level)
+            .ok_or_else(|| Error::new(ErrorKind::Backend))?;
+        let mut wave = BTreeMap::new();
+        let mut rest = BTreeMap::new();
+        for (key, members) in std::mem::take(&mut pending) {
+            if key.1 == expected_level {
+                wave.insert(key, members);
+            } else {
+                rest.insert(key, members);
+            }
+        }
+        pending = rest;
+
+        let mut nearest = None;
+        let mut child_level = None;
+        while let Some(((partition, current_level), members)) = wave.pop_first() {
+            match resolve_hop(reader, manifest, tree_key, root, partition, current_level).await? {
+                Hop::Leaf(header) => {
+                    for member in members {
+                        consider_write_route(
+                            &mut routes,
+                            member.member,
+                            member.distance,
+                            Route {
+                                leaf: partition,
+                                leaf_header: header,
+                                parent: member.parent,
+                                incoming: Incoming::ParentEdge,
+                            },
+                        );
+                    }
+                }
+                Hop::DrainRedirect {
+                    source,
+                    left,
+                    right,
+                } => {
+                    for member in members {
+                        let target =
+                            nearer_redirect_target(kernel, routings[member.member], &left, &right)?;
+                        let distance = kernel.routing_distance(
+                            routings[member.member],
+                            target.centroid.components(),
+                        )?;
+                        consider_write_route(
+                            &mut routes,
+                            member.member,
+                            distance,
+                            Route {
+                                leaf: target.partition,
+                                leaf_header: target.header,
+                                parent: member.parent,
+                                incoming: Incoming::SourceSlot(source),
+                            },
+                        );
+                    }
+                }
+                Hop::Children { bodies, next_level } => {
+                    if child_level.is_some_and(|level| level != next_level) {
+                        return Err(Error::new(ErrorKind::Corruption));
+                    }
+                    child_level = Some(next_level);
+                    let nearest = nearest.get_or_insert_with(|| {
+                        vec![
+                            NearestChildren::new(
+                                usize::try_from(beam_width(write_beam_size, next_level))
+                                    .unwrap_or(usize::MAX),
+                            );
+                            routings.len()
+                        ]
+                    });
+                    // The nearest candidates are accumulated across every
+                    // current-level body. They are reduced to one global
+                    // beam per vector only after the whole wave is scanned.
+                    for &(body, header) in &bodies {
+                        scan_children_with(
+                            reader,
+                            manifest,
+                            tree_key,
+                            body,
+                            header,
+                            &mut |entry| {
+                                if incoming_owners
+                                    .insert(entry.child(), body)
+                                    .is_some_and(|owner| owner != body)
+                                {
+                                    return Err(Error::new(ErrorKind::Corruption));
+                                }
+                                for member in &members {
+                                    nearest[member.member].consider(
+                                        kernel,
+                                        routings[member.member],
+                                        entry,
+                                        body,
+                                    )?;
+                                }
+                                Ok(())
+                            },
+                        )
+                        .await?;
+                    }
+                    debug_assert!(
+                        expected_level.is_none_or(|level| level > next_level),
+                        "child level must descend"
+                    );
+                }
+                Hop::Sideways(source) => {
+                    wave.entry((source, current_level))
+                        .or_default()
+                        .extend(members);
+                }
+                Hop::MergeReroute { level, candidates } => {
+                    for member in members {
+                        let Some(candidate) = nearest_ready_candidate(
+                            kernel,
+                            routings[member.member],
+                            partition,
+                            &candidates,
+                        )?
+                        else {
+                            return Ok(GroupedDescent::NoReadyMergeTarget);
+                        };
+                        let distance = kernel
+                            .routing_distance(routings[member.member], candidate.centroid())?;
+                        if level == 1 {
+                            consider_write_route(
+                                &mut routes,
+                                member.member,
+                                distance,
+                                Route {
+                                    leaf: candidate.partition(),
+                                    leaf_header: *candidate.header(),
+                                    parent: Some(candidate.parent()),
+                                    incoming: Incoming::ParentEdge,
+                                },
+                            );
+                        } else {
+                            wave.entry((candidate.partition(), Some(level)))
+                                .or_default()
+                                .push(PendingBeamMember {
+                                    member: member.member,
+                                    parent: Some(candidate.parent()),
+                                    distance,
+                                });
                         }
-                    } else {
-                        pending.push((target, Some(target_parent), Some(level), members));
                     }
                 }
             }
         }
+
+        // Child candidates from this wave become the next wave only after the
+        // global per-vector beam has been selected.
+        if let Some(next_level) = child_level {
+            let nearest = nearest.ok_or_else(|| Error::new(ErrorKind::Backend))?;
+            for (member, slot) in nearest.into_iter().enumerate() {
+                for (distance, child, owner) in slot.into_best() {
+                    pending
+                        .entry((child, Some(next_level)))
+                        .or_default()
+                        .push(PendingBeamMember {
+                            member,
+                            parent: Some(owner),
+                            distance,
+                        });
+                }
+            }
+        }
     }
-    // Every member is resolved exactly once: each partition visit either
-    // assigns its members at a write-accepting leaf or redirects them to a
-    // target leaf, requeues them at a splitting source or a reselected
-    // merge-level body, or splits them across the children of the candidate
-    // bodies.
-    let routes = routes
-        .into_iter()
-        .map(|route| route.ok_or_else(|| Error::new(ErrorKind::Backend)))
-        .collect::<Result<Vec<_>>>()?;
-    Ok(GroupedDescent::Routed(routes))
+
+    Ok(GroupedDescent::Routed(
+        routes
+            .into_iter()
+            .map(|route| {
+                route
+                    .map(|(_, route)| route)
+                    .ok_or_else(|| Error::new(ErrorKind::Backend))
+            })
+            .collect::<Result<Vec<_>>>()?,
+    ))
 }
+
+/// Returns the write beam at one child level, halving toward the root like the
+/// read traversal. `write_beam_size` is the leaf-level width; this keeps a
+/// configured beam comparable between write routing and search routing.
+/// Keeps the best terminal leaf for one member of a write beam.
+fn consider_write_route(
+    routes: &mut [Option<(f64, Route)>],
+    member: usize,
+    distance: f64,
+    route: Route,
+) {
+    let replace = routes[member].is_none_or(|(best_distance, best_route)| {
+        beats(distance, route.leaf(), (best_distance, best_route.leaf()))
+    });
+    if replace {
+        routes[member] = Some((distance, route));
+    }
+}
+
+/// The nearest `beam` Child Entries for one vector during grouped descent.
+#[derive(Clone)]
+struct NearestChildren {
+    beam: usize,
+    best: std::collections::BinaryHeap<WriteChildCandidate>,
+}
+
+impl NearestChildren {
+    fn new(beam: usize) -> Self {
+        Self {
+            beam,
+            best: std::collections::BinaryHeap::with_capacity(beam.min(8)),
+        }
+    }
+
+    fn consider(
+        &mut self,
+        kernel: &VectorKernel,
+        routing: &[f32],
+        entry: &ChildEntry,
+        owner: PartitionKey,
+    ) -> Result<()> {
+        let distance = kernel.routing_distance(routing, entry.centroid())?;
+        let candidate = WriteChildCandidate {
+            distance,
+            child: entry.child(),
+            owner,
+        };
+        if self.best.len() < self.beam {
+            self.best.push(candidate);
+        } else if self.best.peek().is_some_and(|worst| candidate < *worst) {
+            self.best.pop();
+            self.best.push(candidate);
+        }
+        Ok(())
+    }
+
+    fn into_best(self) -> impl Iterator<Item = (f64, PartitionKey, PartitionKey)> {
+        self.best
+            .into_sorted_vec()
+            .into_iter()
+            .map(|candidate| (candidate.distance, candidate.child, candidate.owner))
+    }
+}
+
+/// One candidate retained by the bounded write beam. The heap's greatest
+/// element is the worst candidate, so a better candidate can replace it in
+/// logarithmic time without shifting a sorted vector on every scan.
+#[derive(Clone, Copy, Debug)]
+struct WriteChildCandidate {
+    distance: f64,
+    child: PartitionKey,
+    owner: PartitionKey,
+}
+
+impl Ord for WriteChildCandidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        compare_finite(self.distance, other.distance)
+            .then_with(|| self.child.cmp(&other.child))
+            .then_with(|| self.owner.cmp(&other.owner))
+    }
+}
+
+impl PartialOrd for WriteChildCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for WriteChildCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for WriteChildCandidate {}
 
 /// One resolved descent hop: the split-aware state machine's whole per-hop
 /// decision for one visited partition, shared by both descent shapes.

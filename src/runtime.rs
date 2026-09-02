@@ -266,12 +266,18 @@ impl<B: Backend> Drop for RuntimeHandle<B> {
 pub(crate) struct OperationContext<B: Backend> {
     backend: Arc<B>,
     options: OperationOptions,
+    write_beam_size: u32,
     commit_start: Option<CommitStart>,
 }
 
 impl<B: Backend> OperationContext<B> {
     pub(crate) fn backend(&self) -> Arc<B> {
         Arc::clone(&self.backend)
+    }
+
+    /// Returns the configured per-level beam for foreground write routing.
+    pub(crate) const fn write_beam_size(&self) -> u32 {
+        self.write_beam_size
     }
 
     pub(crate) fn checkpoint(&self) -> Result<()> {
@@ -411,6 +417,7 @@ impl<B: Backend> RuntimeInner<B> {
         let context = OperationContext {
             backend,
             options,
+            write_beam_size: self.config.write_beam_size(),
             commit_start: Some(commit_start),
         };
         // `observed` tracks whether the spawned task reported the operation's

@@ -175,7 +175,9 @@ hard safety caps are fixed by format version 1, not caller options.
 
 `RuntimeConfig` owns the foreground operation limit, cache bytes, worker count,
 queue capacity, retry/backoff, maintenance transaction budgets, and default
-search budgets. Adapter config owns backend resources such as RocksDB blocking
+search budgets. It also owns the per-level write beam used by foreground
+inserts and upserts; a wider write beam still commits each record to exactly
+one leaf. Adapter config owns backend resources such as RocksDB blocking
 concurrency. Search options may only lower or override process defaults within
 hard caps; changing them cannot alter index correctness.
 
@@ -192,7 +194,8 @@ The v1 defaults and caps are:
 | Visited partitions | 1,024 | 16,384 |
 | Visited Leaf Entries | 65,536 | 1,048,576 |
 | Exact rerank candidates | `min(max(64,k+ceil(k/2)),65,536)` | Runtime ceiling 65,536; effective value at least `k` |
-| Leaf beam size | 32 | 16,384 |
+| Leaf beam size | 128 | 16,384 |
+| Write beam size | 8 | 16,384 |
 | Tree Key scan ranges | 1,024 | wider conservative fallback |
 | Import maximum in-flight batches | `min(available_parallelism,4)`, min 1 | positive |
 | Import backlog watermark | 2 | within queue capacity |

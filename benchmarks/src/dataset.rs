@@ -40,6 +40,44 @@ pub struct BenchmarkDataset {
     pub metadata: DatasetMetadata,
 }
 
+/// Restricts a loaded dataset while selecting a query window.
+/// Supplied ground truth belongs to the original corpus. Once the base set is
+/// truncated, it is discarded so the runner computes exact truth against the
+/// actual indexed vectors instead of reporting neighbors that were never
+/// loaded.
+pub fn limit_with_query_offset(
+    mut dataset: BenchmarkDataset,
+    base_count: usize,
+    query_offset: usize,
+    query_count: usize,
+) -> Result<BenchmarkDataset, String> {
+    if base_count == 0
+        || base_count > dataset.base.len()
+        || query_count == 0
+        || query_offset > dataset.queries.len()
+        || query_count > dataset.queries.len() - query_offset
+    {
+        return Err(format!(
+            "dataset limits must be within loaded data (base <= {}, queries <= {})",
+            dataset.base.len(),
+            dataset.queries.len()
+        ));
+    }
+    dataset.ids.truncate(base_count);
+    dataset.base.truncate(base_count);
+    dataset.queries = dataset
+        .queries
+        .into_iter()
+        .skip(query_offset)
+        .take(query_count)
+        .collect();
+    dataset.ground_truth = None;
+    dataset.metadata.base_vectors = base_count;
+    dataset.metadata.query_vectors = query_count;
+    dataset.metadata.checksum_xxh3_128 = checksum(&dataset.ids, &dataset.base, &dataset.queries);
+    Ok(dataset)
+}
+
 /// Loads a checked-in public dataset or generates a synthetic distribution.
 ///
 /// # Errors

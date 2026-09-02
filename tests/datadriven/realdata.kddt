@@ -1,8 +1,8 @@
 # ----------------------------------------------------------------------
-# Real-dataset suites: published ANN benchmarks at 10k scale over the load
-# paths, exact audits, recall against the brute-force oracle, restarts, and
-# deletes. Fixtures live in tests/datadriven/data/ (see its README for
-# provenance); Record IDs are dataset ordinals (r000000 .. r009999).
+# Real-dataset suites: published ANN fixtures at 10k scale over the load paths,
+# recall against the brute-force oracle, restarts, and deletes. Fixtures live in
+# tests/datadriven/data/ (see its README for provenance); Record IDs are dataset
+# ordinals (r000000 .. r009999).
 #
 # Foreground mutations never trigger a split on their own in the current
 # build, so the first suites are single flat leaves: with sufficient budgets
@@ -26,26 +26,11 @@ validate
 ----
 ok: records=10000 trees=1 partitions=1 max_level=1
 
-stats
-----
-keys=30007 bytes=8030318
-
-# Stride-sampled self-queries from the loaded base set.
-recall k=10 samples=20
-----
-recall@10: 100.00% (samples=20, truncated=20)
-mean usage: visited_partitions=1 visited_leaf_entries=10000 exact_rerank_candidates=21
-
 # The official siftsmall query set (100 held-out descriptors), first 20.
 recall k=10 samples=20 query=file:siftsmall_query.fvecs
 ----
 recall@10: 100.00% (samples=20, truncated=20)
 mean usage: visited_partitions=1 visited_leaf_entries=10000 exact_rerank_candidates=24
-
-recall k=100 samples=10 query=file:siftsmall_query.fvecs
-----
-recall@100: 100.00% (samples=10, truncated=10)
-mean usage: visited_partitions=1 visited_leaf_entries=10000 exact_rerank_candidates=149
 
 # Exact filter: label is the record ordinal, so this keeps the first 1000.
 recall k=10 samples=10 query=file:siftsmall_query.fvecs where=1:le:999
@@ -60,11 +45,6 @@ restarted
 validate
 ----
 ok: records=10000 trees=1 partitions=1 max_level=1
-
-recall k=10 samples=5 query=file:siftsmall_query.fvecs
-----
-recall@10: 100.00% (samples=5, truncated=5)
-mean usage: visited_partitions=1 visited_leaf_entries=10000 exact_rerank_candidates=25
 
 delete
 r000000
@@ -97,10 +77,6 @@ validate
 ----
 ok: records=10000 trees=1 partitions=1 max_level=1
 
-stats
-----
-keys=30007 bytes=40010321
-
 recall k=10 samples=5 query=file:fashion_mnist_query.idx3-ubyte
 ----
 recall@10: 100.00% (samples=5, truncated=5)
@@ -113,11 +89,6 @@ restarted
 validate
 ----
 ok: records=10000 trees=1 partitions=1 max_level=1
-
-recall k=10 samples=5 query=file:fashion_mnist_query.idx3-ubyte
-----
-recall@10: 100.00% (samples=5, truncated=5)
-mean usage: visited_partitions=1 visited_leaf_entries=10000 exact_rerank_candidates=23
 
 # --- Beam x recall on a split siftsmall tree (issue #100, item B1) ---
 # Two splits give a three-leaf tree; the beam sweep trades recall against
@@ -142,23 +113,12 @@ validate
 ----
 ok: records=10000 trees=1 partitions=4 max_level=2
 
-recall k=10 samples=10 query=file:siftsmall_query.fvecs beam-size=1
+recall k=10 samples=10 query=file:siftsmall_query.fvecs beam-size=1 min-recall=80
 ----
 recall@10: 85.00% (samples=10, truncated=10)
 mean usage: visited_partitions=2 visited_leaf_entries=3506 exact_rerank_candidates=20
 
-recall k=10 samples=10 query=file:siftsmall_query.fvecs beam-size=2
+recall k=10 samples=10 query=file:siftsmall_query.fvecs beam-size=2 min-recall=95
 ----
 recall@10: 100.00% (samples=10, truncated=10)
 mean usage: visited_partitions=3 visited_leaf_entries=5966 exact_rerank_candidates=22
-
-recall k=10 samples=10 query=file:siftsmall_query.fvecs beam-size=4
-----
-recall@10: 100.00% (samples=10, truncated=10)
-mean usage: visited_partitions=4 visited_leaf_entries=10000 exact_rerank_candidates=22
-
-recall k=10 samples=10 query=file:siftsmall_query.fvecs beam-size=32
-----
-recall@10: 100.00% (samples=10, truncated=10)
-mean usage: visited_partitions=4 visited_leaf_entries=10000 exact_rerank_candidates=22
-

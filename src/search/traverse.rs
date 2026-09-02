@@ -64,6 +64,7 @@ use crate::storage::values::{
     PersistentValue, RecordLocation,
 };
 
+use super::beam_width;
 use super::cache::{BodyEntries, PartitionCache, load_body};
 use super::numeric::{VectorKernel, compare_finite};
 use super::plan::EnumeratedTree;
@@ -72,7 +73,7 @@ use super::rabitq::{ApproximateCandidate, RaBitQ7, RaBitQQuery, select_leaf_over
 use super::rerank::{LeafCandidate, filter_candidates};
 
 /// The default leaf-level base beam (design `search.md` section 6).
-pub(crate) const DEFAULT_LEAF_BEAM: u32 = 32;
+pub(crate) const DEFAULT_LEAF_BEAM: u32 = 128;
 
 /// One bounded traversal request over the enumerated trees of one snapshot.
 ///
@@ -686,15 +687,6 @@ impl Traversal {
     }
 }
 
-/// The level-scaled beam width: `leaf_beam` at the leaf level, halved per
-/// level toward the root, with a minimum of one.
-fn beam_width(leaf_beam: u32, level: u32) -> u32 {
-    leaf_beam
-        .checked_shr(level.saturating_sub(1))
-        .unwrap_or(0)
-        .max(1)
-}
-
 /// Extracts a partition Header from a typed read, failing closed.
 fn expect_header(value: Option<PersistentValue>) -> Result<PartitionHeader> {
     match value {
@@ -1056,6 +1048,7 @@ mod tests {
 
     #[test]
     fn beam_width_halves_toward_the_root_with_minimum_one() {
+        assert_eq!(DEFAULT_LEAF_BEAM, 128);
         assert_eq!(beam_width(32, 1), 32);
         assert_eq!(beam_width(32, 2), 16);
         assert_eq!(beam_width(32, 3), 8);
