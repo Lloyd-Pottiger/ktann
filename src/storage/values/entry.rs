@@ -118,6 +118,17 @@ pub(super) fn encode_child_entry(
     encode_vector(encoder, manifest.config().dimension(), entry.centroid())
 }
 
+/// Returns the exact encoded Child Entry length for one Manifest.
+pub(super) fn child_entry_encoded_len(manifest: &IndexManifest) -> Result<usize> {
+    // Frame, Child Partition Key, vector length, and full-f32 components.
+    manifest
+        .config()
+        .dimension()
+        .checked_mul(4)
+        .and_then(|bytes| bytes.checked_add(2 + 8 + 4))
+        .ok_or_else(Error::invalid_argument)
+}
+
 pub(super) fn decode_child_entry(
     decoder: &mut Decoder,
     manifest: &IndexManifest,

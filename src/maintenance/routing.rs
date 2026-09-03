@@ -1052,19 +1052,21 @@ async fn resolve_hop<R: LogicalReader>(
             let (source_header, source_state) =
                 topology::read_authority(reader, index, tree_key, source).await?;
             match source_state {
-                PartitionTransition::Splitting { .. } => {
+                PartitionTransition::Splitting { left, right, .. }
+                    if partition == left || partition == right =>
+                {
                     // The source still holds every entry; the target is empty
                     // and contributes nothing.
                     Ok(Hop::Sideways(source))
                 }
-                PartitionTransition::DrainingSplit { left, right, .. } => Ok(Hop::Children {
-                    bodies: split_family_bodies(
+                source_state @ PartitionTransition::DrainingSplit { .. } => Ok(Hop::Children {
+                    bodies: topology::split_family_bodies(
                         reader,
-                        manifest,
+                        index,
                         tree_key,
                         source,
                         source_header,
-                        [left, right],
+                        source_state,
                         header.level(),
                     )
                     .await?,
@@ -1073,20 +1075,20 @@ async fn resolve_hop<R: LogicalReader>(
                 _ => Err(Error::new(ErrorKind::Corruption)),
             }
         }
-        PartitionTransition::DrainingSplit { left, right, .. } => {
+        state @ PartitionTransition::DrainingSplit { left, right, .. } => {
             if header.level() == 1 {
                 return drain_redirect(reader, manifest, tree_key, partition, left, right).await;
             }
             // The exact union of the source body and both targets covers the
             // source's original children.
             Ok(Hop::Children {
-                bodies: split_family_bodies(
+                bodies: topology::split_family_bodies(
                     reader,
-                    manifest,
+                    index,
                     tree_key,
                     partition,
                     header,
-                    [left, right],
+                    state,
                     header.level(),
                 )
                 .await?,
@@ -1194,50 +1196,6 @@ fn nearer_redirect_target<'a>(
             right
         },
     )
-}
-
-/// Validates and lists one draining split family's bodies: the source first,
-/// then its two targets, each proven at the family's level with its expected
-/// state. Both target Headers are read in one batch.
-async fn split_family_bodies<R: LogicalReader>(
-    reader: &mut R,
-    manifest: &IndexManifest,
-    tree_key: &TreeKey,
-    source: PartitionKey,
-    source_header: PartitionHeader,
-    targets: [PartitionKey; 2],
-    level: u32,
-) -> Result<Vec<(PartitionKey, PartitionHeader)>> {
-    if source_header.level() != level || source_header.state() != PartitionState::DrainingSplit {
-        return Err(Error::new(ErrorKind::Corruption));
-    }
-    let index = manifest.logical_index_id();
-    let mut values = reader
-        .batch_get(
-            targets
-                .map(|target| LogicalKey::Header {
-                    index,
-                    tree_key: tree_key.clone(),
-                    partition: target,
-                })
-                .into(),
-        )
-        .await?
-        .into_iter();
-    let mut bodies = Vec::with_capacity(3);
-    bodies.push((source, source_header));
-    for target in targets {
-        let Some(value) = values.next() else {
-            // The typed batch read returns exactly one value per input key.
-            return Err(Error::new(ErrorKind::Backend));
-        };
-        let header = expect_header(value)?.ok_or_else(|| Error::new(ErrorKind::Corruption))?;
-        if header.level() != level || header.state() != PartitionState::ReceivingSplit {
-            return Err(Error::new(ErrorKind::Corruption));
-        }
-        bodies.push((target, header));
-    }
-    Ok(bodies)
 }
 
 /// Scans every listed body's complete Child Entry set in batched lockstep

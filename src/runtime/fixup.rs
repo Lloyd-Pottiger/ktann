@@ -588,6 +588,7 @@ async fn drive<B: Backend>(inner: &Arc<RuntimeInner<B>>, offer: &FixupOffer) -> 
                     Ok(
                         split::Advance::Began { .. }
                         | split::Advance::Exposed { .. }
+                        | split::Advance::Corrected { .. }
                         | split::Advance::Drained { .. },
                     ) => {}
                     Err(_) => return DrivenFixup::new(FixupExecution::Retired),
@@ -642,7 +643,7 @@ fn observe_split_step(step: &Result<split::Advance>) {
         Ok(split::Advance::Exposed { .. }) => FixupStepResult::Exposed,
         // The committed drain boundary records both the step and moved count,
         // including a final drain followed by completion in this advance.
-        Ok(split::Advance::Drained { .. }) => return,
+        Ok(split::Advance::Corrected { .. } | split::Advance::Drained { .. }) => return,
         Ok(split::Advance::Completed { .. }) => FixupStepResult::Completed,
         Err(_) => FixupStepResult::Failed,
     };

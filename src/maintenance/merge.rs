@@ -205,7 +205,7 @@ pub async fn drain_batch<B: Backend>(
             manifest,
             retry,
             Operation::MergeFixup,
-            |txn| writes::boxed_step(drain_attempt(txn, manifest, tree_key, source, &plan)),
+            |txn| writes::boxed_step(drain_attempt(txn, tree_key, source, &plan)),
         )
         .await?
         {
@@ -388,43 +388,21 @@ enum Attempt {
 /// Runs one drain attempt inside the attempt transaction.
 async fn drain_attempt<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
-    manifest: &IndexManifest,
     tree_key: &TreeKey,
     source: PartitionKey,
     plan: &DrainPlan,
 ) -> Result<Attempt> {
     // Revalidate the durable state before moving anything; one batched
     // update-protected read covers both source authority values.
-    let index = manifest.logical_index_id();
-    let (source_header, state) = topology::authority_for_update(
-        txn,
-        LogicalKey::Header {
-            index,
-            tree_key: tree_key.clone(),
-            partition: source,
-        },
-        LogicalKey::State {
-            index,
-            tree_key: tree_key.clone(),
-            partition: source,
-        },
-    )
-    .await?;
-    let (source_header, state) = match (source_header, state) {
-        // A completed merge removed both authority values.
-        (None, None) => return Ok(Attempt::Step(DrainStep::SourceAdvanced)),
-        (Some(header), Some(state)) => (header, state),
-        // Completion removes the pair atomically, so a half-present pair is
-        // a torn committed state.
-        _ => return Err(Error::new(ErrorKind::Corruption)),
+    let Some((source_header, state)) =
+        topology::partition_authority_for_update(txn, tree_key, source).await?
+    else {
+        return Ok(Attempt::Step(DrainStep::SourceAdvanced));
     };
     if !matches!(state, PartitionTransition::Merging { .. }) {
         // Merging never reverts to another persisted state and completion
         // removes both authority values, so a present non-Merging State
         // contradicts the persisted protocol.
-        return Err(Error::new(ErrorKind::Corruption));
-    }
-    if source_header.state() != PartitionState::Merging {
         return Err(Error::new(ErrorKind::Corruption));
     }
     let level = source_header.level();

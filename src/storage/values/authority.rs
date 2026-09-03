@@ -227,6 +227,30 @@ impl PartitionTransition {
             } => started_at_unix_millis,
         }
     }
+
+    /// Returns whether this state receives entries from `source`'s split.
+    #[must_use]
+    pub fn is_receiving_split_of(self, source: PartitionKey) -> bool {
+        matches!(
+            self,
+            Self::ReceivingSplit {
+                source: persisted, ..
+            } if persisted == source
+        )
+    }
+
+    /// Returns whether this state drains the split family `left`/`right`.
+    #[must_use]
+    pub fn is_draining_split_of(self, left: PartitionKey, right: PartitionKey) -> bool {
+        matches!(
+            self,
+            Self::DrainingSplit {
+                left: persisted_left,
+                right: persisted_right,
+                ..
+            } if persisted_left == left && persisted_right == right
+        )
+    }
 }
 
 pub(super) fn encode_tree_manifest(encoder: &mut Encoder, manifest: TreeManifest) {

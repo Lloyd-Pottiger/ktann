@@ -776,7 +776,7 @@ impl Harness {
                 Advance::Began { left, right } | Advance::Exposed { left, right } => {
                     targets = Some((left, right));
                 }
-                Advance::Drained { .. } => {}
+                Advance::Corrected { .. } | Advance::Drained { .. } => {}
                 Advance::Completed { .. } => {
                     return Ok(match targets {
                         Some((left, right)) => format!(
@@ -1631,6 +1631,7 @@ fn describe_advance(outcome: &Advance) -> String {
         Advance::Exposed { left, right } => {
             format!("exposed left={} right={}", left.get(), right.get())
         }
+        Advance::Corrected { moved } => format!("corrected moved={moved}"),
         Advance::Drained { moved, remaining } => {
             format!("drained moved={moved} remaining={remaining}")
         }

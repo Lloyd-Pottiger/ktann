@@ -164,10 +164,33 @@ Only this module may compose raw logical keys. It exposes typed operations for:
 - reading records, locations, headers, states, synopses, and entries;
 - atomically changing record membership and exact metadata;
 - installing and advancing split/merge states;
+- atomically relocating Leaf Entries and Child Entries under a typed structural
+  movement protocol;
 - bounded deletion of one partition prefix or full index range.
 
 Algorithm modules do not hand-build keys or partially update counts/synopses.
 Natural decode or cross-value invariant failures return Corruption.
+
+Relocation update-protects the source, every actual target, and any split family
+whose state authorizes the move. The allowed combinations are exact:
+
+- `DrainingSplit` source to its own `ReceivingSplit` targets;
+- `DrainingSplit` source to a same-level `Ready` corrective target;
+- same-level `Ready` source to the named split family's `ReceivingSplit`
+  targets;
+- `Merging` source to same-level `Ready` targets.
+
+The transaction validates Header/State agreement, levels, split-family
+identity, and entry identity before mutation. Leaf relocation uniquely inserts
+the target entry, deletes the source entry, repoints Record Location, and
+updates source/target counts and epochs plus the target Synopsis. Child Entry
+relocation uniquely inserts under the new parent, deletes under the old parent,
+and updates both parent counts and epochs, preserving one incoming edge in
+every committed state. A corrective internal move also rejects a batch that
+would remove the Ready source's final Child Entry. Corrective target capacity
+and encoded Backend mutation budgets are rechecked at this topology boundary;
+a concurrent transition conflicts and the caller replans from a fresh
+snapshot.
 
 ## 8. Partition deletion
 

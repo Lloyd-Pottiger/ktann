@@ -4,7 +4,7 @@
 //! Draining stores no durable cursor: a short read snapshot fixes the
 //! source's current smallest entries — as many Leaf Entries as the current
 //! schema and Backend budget safely admit, or at most
-//! [`DRAIN_BATCH_INTERNAL`] Child Entries by source level — and a
+//! [`DRAIN_BATCH_INTERNAL`] budget-safe Child Entries by source level — and a
 //! following write transaction revalidates and moves exactly those
 //! candidates. Successful movement deletes that prefix, so every batch starts
 //! at the current smallest entry, and entries a competing worker already
@@ -21,15 +21,16 @@ use crate::storage::{LogicalRange, ReadLogicalTxn};
 
 /// The number of Child Entries one drain batch moves.
 ///
-/// An internal move writes only the entry and both Headers, so 128 moves stay
-/// far below every adapter admission budget.
+/// The contention cap on one internal drain batch; encoded mutation bytes may
+/// reduce it further for high-dimensional Child Entry centroids.
 pub const DRAIN_BATCH_INTERNAL: usize = 128;
 
 /// The minimum leaf batch allowed by the adaptive contention cap.
 const MIN_LEAF_DRAIN_BATCH: usize = 8;
 
-/// The bound on one drain candidate scan page.
-const DRAIN_SCAN_LIMITS: ScanLimits = ScanLimits {
+/// The bound on one maintenance entry-scan page (drain candidates and
+/// corrective scans).
+pub(crate) const DRAIN_SCAN_LIMITS: ScanLimits = ScanLimits {
     item_limit: DRAIN_BATCH_INTERNAL,
     byte_limit: 1_048_576,
 };
@@ -74,14 +75,14 @@ pub(crate) async fn read_drain_batch<T: ReadOps>(
     tree_key: &TreeKey,
     source: PartitionKey,
     level: u32,
-    leaf_limit: usize,
+    entry_limit: usize,
 ) -> Result<DrainBatch> {
+    let limits = ScanLimits {
+        item_limit: entry_limit,
+        ..DRAIN_SCAN_LIMITS
+    };
     if level == 1 {
         let range = LogicalRange::leaf_entries(manifest, tree_key, source)?;
-        let limits = ScanLimits {
-            item_limit: leaf_limit,
-            ..DRAIN_SCAN_LIMITS
-        };
         let page = txn.scan(&range, None, limits).await?;
         let mut ids = Vec::new();
         for item in page.items() {
@@ -93,7 +94,7 @@ pub(crate) async fn read_drain_batch<T: ReadOps>(
         Ok(DrainBatch::Leaf(ids))
     } else {
         let range = LogicalRange::child_entries(manifest, tree_key, source)?;
-        let page = txn.scan(&range, None, DRAIN_SCAN_LIMITS).await?;
+        let page = txn.scan(&range, None, limits).await?;
         let mut children = Vec::new();
         for item in page.items() {
             let PersistentValue::ChildEntry(entry) = item.value() else {
@@ -102,6 +103,32 @@ pub(crate) async fn read_drain_batch<T: ReadOps>(
             children.push(entry.child());
         }
         Ok(DrainBatch::Child(children))
+    }
+}
+
+/// Returns the maximum entries one relocation transaction may move.
+pub(crate) fn relocation_batch_limit(
+    manifest: &IndexManifest,
+    tree_key: &TreeKey,
+    header: PartitionHeader,
+    movement: Movement,
+    budget: AdmissionBudget,
+) -> Result<usize> {
+    let source_entries = header.entry_count() as usize;
+    if header.level() == 1 {
+        let budget_limit =
+            topology::leaf_relocation_batch_limit(manifest, tree_key, movement, budget)?;
+        Ok(leaf_drain_batch_limit(
+            manifest.config().max_partition_entries(),
+            header.entry_count(),
+            budget_limit,
+        ))
+    } else {
+        Ok(
+            topology::child_relocation_batch_limit(manifest, tree_key, movement, budget)?
+                .min(DRAIN_BATCH_INTERNAL)
+                .min(source_entries),
+        )
     }
 }
 
@@ -123,19 +150,9 @@ pub(crate) async fn next_drain_batch<T: ReadOps>(
     if header.entry_count() == 0 {
         return Ok(None);
     }
-    let leaf_limit = if header.level() == 1 {
-        let budget_limit =
-            topology::leaf_relocation_batch_limit(manifest, tree_key, movement, budget)?;
-        leaf_drain_batch_limit(
-            manifest.config().max_partition_entries(),
-            header.entry_count(),
-            budget_limit,
-        )
-    } else {
-        DRAIN_BATCH_INTERNAL
-    };
+    let batch_limit = relocation_batch_limit(manifest, tree_key, header, movement, budget)?;
     let batch =
-        read_drain_batch(txn, manifest, tree_key, source, header.level(), leaf_limit).await?;
+        read_drain_batch(txn, manifest, tree_key, source, header.level(), batch_limit).await?;
     if batch.is_empty() {
         // The exact count and the entry set disagree within one snapshot.
         return Err(Error::new(ErrorKind::Corruption));

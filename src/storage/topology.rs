@@ -47,6 +47,8 @@
 //!   impossible count are Corruption. On any returned error the caller must
 //!   not commit the transaction; rolling back leaves no partial change.
 
+use std::collections::BTreeMap;
+
 use bytes::Bytes;
 
 use crate::api::{Error, ErrorKind, LogicalIndexId, PartitionKey, Result};
@@ -57,8 +59,9 @@ use crate::storage::tree_manifest::reserve_partition_keys;
 use crate::storage::values::{
     ChildEntry, IndexManifest, LeafEntry, PartitionCentroid, PartitionHeader, PartitionState,
     PartitionSynopsis, PartitionTransition, PersistentValue, RecordLocation, VectorRecord,
-    expect_centroid, expect_child_entry, expect_child_entry_ref, expect_header, expect_leaf_entry,
-    expect_location, expect_record, expect_state, expect_synopsis, leaf_relocation_value_sizes,
+    child_relocation_value_sizes, expect_centroid, expect_child_entry, expect_child_entry_ref,
+    expect_header, expect_leaf_entry, expect_location, expect_record, expect_state,
+    expect_synopsis, leaf_relocation_value_sizes,
 };
 use crate::storage::{LogicalRange, LogicalReader, WriteLogicalTxn};
 
@@ -482,7 +485,7 @@ pub async fn advance_to_draining<T: WriteTxn>(
         .into_iter();
     for state_value in [left_state, right_state] {
         match expect_state(state_value)? {
-            Some(PartitionTransition::ReceivingSplit { source: s, .. }) if s == source => {}
+            Some(state) if state.is_receiving_split_of(source) => {}
             _ => return Err(corrupt()),
         }
         let (Some(header_value), Some(centroid_value)) = (target_parts.next(), target_parts.next())
@@ -639,27 +642,42 @@ pub async fn read_leaf_drain_candidates<T: WriteTxn>(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Movement {
     /// A `DrainingSplit` source draining into its two persisted
-    /// `ReceivingSplit` targets (ADR 0014).
-    Split,
+    /// `ReceivingSplit` targets or a strictly better same-level `Ready`
+    /// partition.
+    Split {
+        /// The persisted left split target.
+        left: PartitionKey,
+        /// The persisted right split target.
+        right: PartitionKey,
+    },
+    /// A same-level `Ready` source moving entries into one of a split's two
+    /// `ReceivingSplit` targets when that target is strictly better.
+    CorrectivePull {
+        /// The `DrainingSplit` partition whose targets receive the entries.
+        split_source: PartitionKey,
+        /// The persisted left split target.
+        left: PartitionKey,
+        /// The persisted right split target.
+        right: PartitionKey,
+    },
     /// A `Merging` source draining into per-batch reselected `Ready` targets
     /// (ADR 0008).
     Merge,
 }
 
-impl Movement {
-    /// The only source state a move under this protocol is legal from.
-    fn source_state(self) -> PartitionState {
-        match self {
-            Self::Split => PartitionState::DrainingSplit,
-            Self::Merge => PartitionState::Merging,
-        }
-    }
+/// Maximum same-level `Ready` candidates one corrective discovery retains.
+///
+/// The split driver's maintenance beam uses this bound, which also caps the
+/// distinct `Ready` targets one split drain batch may touch.
+pub(crate) const CORRECTIVE_PARTITION_BEAM: usize = 16;
 
-    /// The only target state a move under this protocol is legal into.
-    fn target_state(self) -> PartitionState {
+impl Movement {
+    /// Maximum distinct targets charged for `entries` relocations.
+    fn maximum_targets(self, entries: usize) -> usize {
         match self {
-            Self::Split => PartitionState::ReceivingSplit,
-            Self::Merge => PartitionState::Ready,
+            Self::CorrectivePull { .. } => entries.min(2),
+            Self::Split { .. } => entries.min(2 + CORRECTIVE_PARTITION_BEAM),
+            Self::Merge => entries,
         }
     }
 }
@@ -669,27 +687,44 @@ impl Movement {
 /// The bound charges exact codec sizes for the current Manifest and Tree Key,
 /// the Backend adapter's per-key physical overhead, and the worst target
 /// distribution for the movement protocol. A split may touch both persisted
-/// targets; a merge may route every entry to a different Ready target.
+/// targets plus the bounded corrective candidate set; a merge may route every
+/// entry to a different Ready target.
 pub(crate) fn leaf_relocation_batch_limit(
     manifest: &IndexManifest,
     tree_key: &TreeKey,
     movement: Movement,
     budget: AdmissionBudget,
 ) -> Result<usize> {
-    let charge = LeafRelocationCharge::new(manifest, tree_key, budget.mutation_key_overhead_bytes)?;
+    let charge = RelocationCharge::leaf(manifest, tree_key, budget.mutation_key_overhead_bytes)?;
     let high = budget.max_mutations.saturating_sub(1) / 3;
-    if high == 0 || !charge.fits(1, movement, budget) {
+    largest_fitting_batch(high, |entries| charge.fits(entries, movement, budget))
+}
+
+/// Returns the largest safe Child Entry relocation batch for one Backend budget.
+pub(crate) fn child_relocation_batch_limit(
+    manifest: &IndexManifest,
+    tree_key: &TreeKey,
+    movement: Movement,
+    budget: AdmissionBudget,
+) -> Result<usize> {
+    let charge = RelocationCharge::child(manifest, tree_key, budget.mutation_key_overhead_bytes)?;
+    let high = budget.max_mutations.saturating_sub(1) / 2;
+    largest_fitting_batch(high, |entries| charge.fits(entries, movement, budget))
+}
+
+/// Finds the largest positive batch admitted by a monotonic charge function.
+fn largest_fitting_batch(high: usize, fits: impl Fn(usize) -> bool) -> Result<usize> {
+    if high == 0 || !fits(1) {
         return Err(Error::new(ErrorKind::LimitExceeded));
     }
 
-    // The charge is monotonic in entry count, including the split's second
-    // target at entry two, so binary search finds the exact joint count/byte
-    // bound without iterating once per admissible entry.
+    // Every relocation charge is monotonic in entry count, including any
+    // additional target authority first charged by a larger batch.
     let mut low = 1_usize;
     let mut high = high;
     while low < high {
         let middle = low + (high - low).div_ceil(2);
-        if charge.fits(middle, movement, budget) {
+        if fits(middle) {
             low = middle;
         } else {
             high = middle - 1;
@@ -698,15 +733,43 @@ pub(crate) fn leaf_relocation_batch_limit(
     Ok(low)
 }
 
-/// Worst-case physical mutation-byte charges for one leaf relocation.
-struct LeafRelocationCharge {
-    source_header: usize,
-    entry: usize,
-    target: usize,
+/// Worst-case physical mutation charges for one relocation batch.
+struct RelocationCharge {
+    source_bytes: usize,
+    entry_mutations: usize,
+    entry_bytes: usize,
+    target_mutations: usize,
+    target_bytes: usize,
 }
 
-impl LeafRelocationCharge {
-    fn new(
+impl RelocationCharge {
+    fn child(
+        manifest: &IndexManifest,
+        tree_key: &TreeKey,
+        mutation_key_overhead_bytes: usize,
+    ) -> Result<Self> {
+        let values = child_relocation_value_sizes(manifest)?;
+        let entry_key = keys::child_entry_key_len(tree_key);
+        let metadata_key = keys::partition_metadata_key_len(tree_key);
+        let mutation = |key: usize, value: usize| {
+            key.checked_add(value)
+                .and_then(|bytes| bytes.checked_add(mutation_key_overhead_bytes))
+                .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))
+        };
+        let entry = mutation(entry_key, values.child_entry)?
+            .checked_add(mutation(entry_key, 0)?)
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+        let header = mutation(metadata_key, values.partition_header)?;
+        Ok(Self {
+            source_bytes: header,
+            entry_mutations: 2,
+            entry_bytes: entry,
+            target_mutations: 1,
+            target_bytes: header,
+        })
+    }
+
+    fn leaf(
         manifest: &IndexManifest,
         tree_key: &TreeKey,
         mutation_key_overhead_bytes: usize,
@@ -730,25 +793,28 @@ impl LeafRelocationCharge {
             .checked_add(mutation(metadata_key, values.partition_synopsis)?)
             .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
         Ok(Self {
-            source_header,
-            entry,
-            target,
+            source_bytes: source_header,
+            entry_mutations: 3,
+            entry_bytes: entry,
+            target_mutations: 2,
+            target_bytes: target,
         })
     }
 
     fn size(&self, entries: usize, movement: Movement) -> Option<(usize, usize)> {
-        let targets = match movement {
-            Movement::Split => entries.min(2),
-            Movement::Merge => entries,
-        };
+        let targets = movement.maximum_targets(entries);
         let mutations = entries
-            .checked_mul(3)
-            .and_then(|count| targets.checked_mul(2)?.checked_add(count))
+            .checked_mul(self.entry_mutations)
+            .and_then(|count| {
+                targets
+                    .checked_mul(self.target_mutations)?
+                    .checked_add(count)
+            })
             .and_then(|count| count.checked_add(1))?;
         let bytes = entries
-            .checked_mul(self.entry)
-            .and_then(|bytes| targets.checked_mul(self.target)?.checked_add(bytes))
-            .and_then(|bytes| bytes.checked_add(self.source_header))?;
+            .checked_mul(self.entry_bytes)
+            .and_then(|bytes| targets.checked_mul(self.target_bytes)?.checked_add(bytes))
+            .and_then(|bytes| bytes.checked_add(self.source_bytes))?;
         Some((mutations, bytes))
     }
 
@@ -759,6 +825,206 @@ impl LeafRelocationCharge {
                 if mutations <= budget.max_mutations && bytes <= budget.max_mutation_bytes
         )
     }
+}
+
+/// Update-protected authority for one relocation batch.
+struct RelocationAuthority {
+    source: PartitionHeader,
+    targets: Vec<(PartitionKey, PartitionHeader, PartitionTransition)>,
+}
+
+/// Validates both members of one update-protected split family.
+fn validate_split_family(
+    authorities: &BTreeMap<PartitionKey, (PartitionHeader, PartitionTransition)>,
+    source: PartitionKey,
+    level: u32,
+    left: PartitionKey,
+    right: PartitionKey,
+) -> Result<()> {
+    if left == right || left == source || right == source {
+        return Err(corrupt());
+    }
+    for target in [left, right] {
+        let (header, state) = authorities.get(&target).copied().ok_or_else(corrupt)?;
+        if header.level() != level || !state.is_receiving_split_of(source) {
+            return Err(corrupt());
+        }
+    }
+    Ok(())
+}
+
+/// Locks and validates every partition whose topology makes a move legal.
+async fn relocation_authority<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    tree_key: &TreeKey,
+    source: PartitionKey,
+    targets: &[PartitionKey],
+    movement: Movement,
+) -> Result<RelocationAuthority> {
+    if targets.contains(&source) {
+        return Err(corrupt());
+    }
+    let index = txn
+        .bound_manifest()
+        .ok_or_else(Error::invalid_argument)?
+        .logical_index_id();
+    let split_family = match movement {
+        Movement::Split { left, right } => Some((source, left, right)),
+        Movement::CorrectivePull {
+            split_source,
+            left,
+            right,
+        } => Some((split_source, left, right)),
+        Movement::Merge => None,
+    };
+    let mut partitions = Vec::with_capacity(targets.len() + 4);
+    partitions.extend_from_slice(targets);
+    partitions.push(source);
+    if let Some((split_source, left, right)) = split_family {
+        if (split_source == source || targets.contains(&split_source))
+            && !matches!(movement, Movement::Split { .. })
+        {
+            return Err(corrupt());
+        }
+        partitions.extend([split_source, left, right]);
+    }
+    partitions.sort_unstable();
+    partitions.dedup();
+    let keys = partitions
+        .iter()
+        .flat_map(|partition| {
+            let (header, state) = authority_keys(index, tree_key, *partition);
+            [header, state]
+        })
+        .collect();
+    let values = txn.batch_get_for_update(keys).await?;
+    let mut authorities = BTreeMap::new();
+    let mut values = values.into_iter();
+    for partition in partitions {
+        let (Some(header_value), Some(state_value)) = (values.next(), values.next()) else {
+            return Err(Error::new(ErrorKind::Backend));
+        };
+        let header = expect_header(header_value)?.ok_or_else(corrupt)?;
+        let state = expect_state(state_value)?.ok_or_else(corrupt)?;
+        expect_agreement(header, state)?;
+        authorities.insert(partition, (header, state));
+    }
+
+    let targets_authority: Vec<_> = targets
+        .iter()
+        .copied()
+        .map(|partition| {
+            authorities
+                .get(&partition)
+                .copied()
+                .map(|(header, state)| (partition, header, state))
+                .ok_or_else(corrupt)
+        })
+        .collect::<Result<_>>()?;
+    let (source_header, source_state) = authorities.get(&source).copied().ok_or_else(corrupt)?;
+    match movement {
+        Movement::Split { left, right } => {
+            if !source_state.is_draining_split_of(left, right) {
+                return Err(corrupt());
+            }
+            validate_split_family(&authorities, source, source_header.level(), left, right)?;
+            for (target, _, state) in &targets_authority {
+                let legal = if *target == left || *target == right {
+                    state.is_receiving_split_of(source)
+                } else {
+                    matches!(state, PartitionTransition::Ready { .. })
+                };
+                if !legal {
+                    return Err(corrupt());
+                }
+            }
+        }
+        Movement::CorrectivePull {
+            split_source,
+            left,
+            right,
+        } => {
+            if !matches!(source_state, PartitionTransition::Ready { .. }) {
+                return Err(corrupt());
+            }
+            let (split_header, split_state) = authorities
+                .get(&split_source)
+                .copied()
+                .ok_or_else(corrupt)?;
+            if !split_state.is_draining_split_of(left, right) {
+                return Err(corrupt());
+            }
+            if split_header.level() != source_header.level() {
+                return Err(corrupt());
+            }
+            validate_split_family(
+                &authorities,
+                split_source,
+                source_header.level(),
+                left,
+                right,
+            )?;
+            for (target, _, state) in &targets_authority {
+                if (*target != left && *target != right)
+                    || !state.is_receiving_split_of(split_source)
+                {
+                    return Err(corrupt());
+                }
+            }
+        }
+        Movement::Merge => {
+            if !matches!(source_state, PartitionTransition::Merging { .. })
+                || targets_authority
+                    .iter()
+                    .any(|(_, _, state)| !matches!(state, PartitionTransition::Ready { .. }))
+            {
+                return Err(corrupt());
+            }
+        }
+    }
+    if targets_authority
+        .iter()
+        .any(|(_, header, _)| header.level() != source_header.level())
+    {
+        return Err(corrupt());
+    }
+    Ok(RelocationAuthority {
+        source: source_header,
+        targets: targets_authority,
+    })
+}
+
+/// Enforces the configured capacity for targets introduced by correction.
+fn validate_corrective_capacity<E>(
+    manifest: &IndexManifest,
+    movement: Movement,
+    targets: &[(PartitionKey, PartitionHeader, PartitionTransition)],
+    moves: &[(E, PartitionKey)],
+) -> Result<()> {
+    let maximum = manifest.config().max_partition_entries();
+    for (target, header, state) in targets {
+        let capped = matches!(movement, Movement::CorrectivePull { .. })
+            || matches!(movement, Movement::Split { .. })
+                && matches!(state, PartitionTransition::Ready { .. });
+        if !capped {
+            continue;
+        }
+        let additions = u32::try_from(
+            moves
+                .iter()
+                .filter(|(_, move_target)| move_target == target)
+                .count(),
+        )
+        .map_err(|_| corrupt())?;
+        let final_count = header
+            .entry_count()
+            .checked_add(additions)
+            .ok_or_else(corrupt)?;
+        if final_count > maximum {
+            return Err(corrupt());
+        }
+    }
+    Ok(())
 }
 
 /// Atomically moves one batch of verified leaf entries from the draining
@@ -792,40 +1058,22 @@ pub async fn relocate_leaf_entries<T: WriteTxn>(
     moves.sort_unstable_by_key(|(_, target)| *target);
     let mut targets: Vec<PartitionKey> = moves.iter().map(|(_, target)| *target).collect();
     targets.dedup();
-    let mut header_keys = Vec::with_capacity(targets.len() + 1);
-    for target in &targets {
-        header_keys.push(LogicalKey::Header {
-            index,
-            tree_key: tree_key.clone(),
-            partition: *target,
-        });
-    }
-    header_keys.push(LogicalKey::Header {
-        index,
-        tree_key: tree_key.clone(),
-        partition: source,
-    });
-    let mut headers = txn.batch_get_for_update(header_keys).await?.into_iter();
-    let mut target_headers: Vec<(PartitionKey, PartitionHeader)> = Vec::new();
-    for target in &targets {
-        let Some(value) = headers.next() else {
-            return Err(Error::new(ErrorKind::Backend));
-        };
-        let header = expect_header(value)?.ok_or_else(corrupt)?;
-        if header.level() != 1 || header.state() != movement.target_state() {
-            return Err(corrupt());
-        }
-        target_headers.push((*target, header));
-    }
-    let Some(source_value) = headers.next() else {
-        return Err(Error::new(ErrorKind::Backend));
-    };
-    let source_header = expect_header(source_value)?.ok_or_else(corrupt)?;
-    // Movement is legal only inside the named protocol: the source must be
-    // draining into exactly these targets.
-    if source_header.level() != 1 || source_header.state() != movement.source_state() {
+    let authority = relocation_authority(txn, tree_key, source, &targets, movement).await?;
+    validate_corrective_capacity(manifest, movement, &authority.targets, &moves)?;
+    let source_header = authority.source;
+    if source_header.level() != 1
+        || authority
+            .targets
+            .iter()
+            .any(|(_, header, _)| header.level() != 1)
+    {
         return Err(corrupt());
     }
+    let target_headers: Vec<_> = authority
+        .targets
+        .into_iter()
+        .map(|(partition, header, _)| (partition, header))
+        .collect();
 
     let synopsis_keys: Vec<LogicalKey> = targets
         .iter()
@@ -978,7 +1226,7 @@ pub async fn relocate_child_entries<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     tree_key: &TreeKey,
     source: PartitionKey,
-    moves: Vec<(ChildEntry, PartitionKey)>,
+    mut moves: Vec<(ChildEntry, PartitionKey)>,
     movement: Movement,
 ) -> Result<usize> {
     if moves.is_empty() {
@@ -987,48 +1235,22 @@ pub async fn relocate_child_entries<T: WriteTxn>(
     let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
     let index = manifest.logical_index_id();
 
+    moves.sort_unstable_by_key(|(_, target)| *target);
     let mut targets: Vec<PartitionKey> = moves.iter().map(|(_, target)| *target).collect();
-    targets.sort_unstable();
     targets.dedup();
-    let mut header_keys = Vec::with_capacity(targets.len() + 1);
-    for target in &targets {
-        header_keys.push(LogicalKey::Header {
-            index,
-            tree_key: tree_key.clone(),
-            partition: *target,
-        });
-    }
-    header_keys.push(LogicalKey::Header {
-        index,
-        tree_key: tree_key.clone(),
-        partition: source,
-    });
-    let mut headers = txn.batch_get_for_update(header_keys).await?.into_iter();
-    let mut target_headers: Vec<(PartitionKey, PartitionHeader)> = Vec::new();
-    for target in &targets {
-        let Some(value) = headers.next() else {
-            return Err(Error::new(ErrorKind::Backend));
-        };
-        let header = expect_header(value)?.ok_or_else(corrupt)?;
-        if header.state() != movement.target_state() {
-            return Err(corrupt());
-        }
-        target_headers.push((*target, header));
-    }
-    let Some(source_value) = headers.next() else {
-        return Err(Error::new(ErrorKind::Backend));
-    };
-    let source_header = expect_header(source_value)?.ok_or_else(corrupt)?;
-    // Movement is legal only inside the named protocol: the source must be
-    // draining into exactly these targets.
-    if source_header.state() != movement.source_state() {
+    let authority = relocation_authority(txn, tree_key, source, &targets, movement).await?;
+    validate_corrective_capacity(manifest, movement, &authority.targets, &moves)?;
+    let source_header = authority.source;
+    if matches!(movement, Movement::CorrectivePull { .. })
+        && u32::try_from(moves.len()).map_err(|_| corrupt())? >= source_header.entry_count()
+    {
         return Err(corrupt());
     }
-    for (_, target_header) in &target_headers {
-        if target_header.level() != source_header.level() {
-            return Err(corrupt());
-        }
-    }
+    let target_headers: Vec<_> = authority
+        .targets
+        .into_iter()
+        .map(|(partition, header, _)| (partition, header))
+        .collect();
 
     let moved = moves.len();
     for (entry, target) in &moves {
@@ -1066,11 +1288,14 @@ pub async fn relocate_child_entries<T: WriteTxn>(
         PersistentValue::PartitionHeader(source_header),
     )
     .await?;
+    let mut grouped_moves = moves.iter().peekable();
     for (target, mut header) in target_headers {
-        for (_, move_target) in &moves {
-            if move_target == &target {
-                header = added_entry(header)?;
-            }
+        while grouped_moves
+            .peek()
+            .is_some_and(|(_, move_target)| *move_target == target)
+        {
+            header = added_entry(header)?;
+            grouped_moves.next();
         }
         txn.put(
             LogicalKey::Header {
@@ -1082,6 +1307,7 @@ pub async fn relocate_child_entries<T: WriteTxn>(
         )
         .await?;
     }
+    debug_assert!(grouped_moves.next().is_none());
     Ok(moved)
 }
 
@@ -1170,7 +1396,7 @@ pub async fn finalize_split<T: WriteTxn>(
         };
         let target_state = expect_state(state_value)?.ok_or_else(corrupt)?;
         match target_state {
-            PartitionTransition::ReceivingSplit { source: s, .. } if s == source => {}
+            state if state.is_receiving_split_of(source) => {}
             _ => return Err(corrupt()),
         }
         let target_header = expect_header(header_value)?.ok_or_else(corrupt)?;
@@ -1722,9 +1948,10 @@ async fn level_bodies<R: LogicalReader>(
     }
 }
 
-/// One partition at a merge source's level, reached by its unique incoming
-/// Child Entry during the exact root-down level walk: one candidate that
-/// merge target reselection orders by routing distance (ADR 0008).
+/// One same-level partition reached through its unique incoming Child Entry.
+///
+/// Merge target reselection obtains these from an exact level walk; split
+/// correction obtains a bounded subset from its independent maintenance beam.
 pub(crate) struct LevelCandidate {
     parent: PartitionKey,
     entry: ChildEntry,
@@ -1732,6 +1959,15 @@ pub(crate) struct LevelCandidate {
 }
 
 impl LevelCandidate {
+    /// Builds one candidate from a snapshot-consistent incoming edge and Header.
+    pub(crate) fn new(parent: PartitionKey, entry: ChildEntry, header: PartitionHeader) -> Self {
+        Self {
+            parent,
+            entry,
+            header,
+        }
+    }
+
     /// Returns the candidate's Partition Key.
     pub(crate) const fn partition(&self) -> PartitionKey {
         self.entry.child()
@@ -1983,9 +2219,55 @@ fn decode_authority_pair(
     Ok((expect_header(header)?, expect_state(state)?))
 }
 
+/// Returns one validated, fully exposed split family's searchable bodies.
+pub(crate) async fn split_family_bodies<R: LogicalReader>(
+    reader: &mut R,
+    index: LogicalIndexId,
+    tree_key: &TreeKey,
+    source: PartitionKey,
+    source_header: PartitionHeader,
+    source_state: PartitionTransition,
+    level: u32,
+) -> Result<Vec<(PartitionKey, PartitionHeader)>> {
+    let PartitionTransition::DrainingSplit { left, right, .. } = source_state else {
+        return Err(corrupt());
+    };
+    if source_header.level() != level
+        || source_header.state() != PartitionState::DrainingSplit
+        || left == right
+        || left == source
+        || right == source
+    {
+        return Err(corrupt());
+    }
+
+    let mut keys = Vec::with_capacity(4);
+    for target in [left, right] {
+        let (header, state) = authority_keys(index, tree_key, target);
+        keys.push(header);
+        keys.push(state);
+    }
+    let mut values = reader.batch_get(keys).await?.into_iter();
+    let mut bodies = Vec::with_capacity(3);
+    bodies.push((source, source_header));
+    for target in [left, right] {
+        let (Some(header), Some(state)) = (values.next(), values.next()) else {
+            return Err(Error::new(ErrorKind::Backend));
+        };
+        let header = expect_header(header)?.ok_or_else(corrupt)?;
+        let state = expect_state(state)?.ok_or_else(corrupt)?;
+        expect_agreement(header, state)?;
+        if header.level() != level || !state.is_receiving_split_of(source) {
+            return Err(corrupt());
+        }
+        bodies.push((target, header));
+    }
+    Ok(bodies)
+}
+
 /// Reads one partition's Header and State with update protection in one
 /// batch.
-pub(crate) async fn authority_for_update<T: WriteTxn>(
+async fn authority_for_update<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     header_key: LogicalKey,
     state_key: LogicalKey,
@@ -2018,6 +2300,20 @@ async fn authority_pair<T: WriteTxn>(
     }
 }
 
+/// Reads one partition's authority with update protection and agreement checks.
+pub(crate) async fn partition_authority_for_update<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    tree_key: &TreeKey,
+    partition: PartitionKey,
+) -> Result<Option<(PartitionHeader, PartitionTransition)>> {
+    let index = txn
+        .bound_manifest()
+        .ok_or_else(Error::invalid_argument)?
+        .logical_index_id();
+    let (header, state) = authority_keys(index, tree_key, partition);
+    authority_pair(txn, header, state).await
+}
+
 /// Verifies that one target's persisted State names `source`, without a
 /// conflict.
 async fn read_target_state<T: WriteTxn>(
@@ -2028,7 +2324,7 @@ async fn read_target_state<T: WriteTxn>(
     target: PartitionKey,
 ) -> Result<Option<()>> {
     match read_state(txn, index, tree_key, target).await? {
-        Some(PartitionTransition::ReceivingSplit { source: s, .. }) if s == source => Ok(Some(())),
+        Some(state) if state.is_receiving_split_of(source) => Ok(Some(())),
         Some(_) => Err(corrupt()),
         None => Ok(None),
     }
@@ -2090,12 +2386,20 @@ fn corrupt() -> Error {
 
 #[cfg(test)]
 mod tests {
-    use crate::api::{DataType, FieldSchema, IndexConfig, LogicalIndexId, Metric, SynopsisConfig};
+    use crate::api::{
+        DataType, FieldSchema, IndexConfig, LogicalIndexId, Metric, PartitionKey, SynopsisConfig,
+    };
     use crate::storage::backend::AdmissionBudget;
     use crate::storage::keys::TreeKey;
-    use crate::storage::values::{BloomParameters, IndexLifecycle, IndexManifest};
+    use crate::storage::values::{
+        BloomParameters, IndexLifecycle, IndexManifest, PartitionHeader, PartitionState,
+        PartitionTransition,
+    };
 
-    use super::{LeafRelocationCharge, Movement, leaf_relocation_batch_limit};
+    use super::{
+        Movement, RelocationCharge, child_relocation_batch_limit, leaf_relocation_batch_limit,
+        validate_corrective_capacity,
+    };
 
     fn manifest() -> IndexManifest {
         let config = IndexConfig::new(128, Metric::L2)
@@ -2130,6 +2434,10 @@ mod tests {
         TreeKey::encode(&[], &[]).expect("empty Tree Key")
     }
 
+    fn pk(value: u64) -> PartitionKey {
+        PartitionKey::new(value).expect("nonzero Partition Key")
+    }
+
     fn budget(mutations: usize, bytes: usize, overhead: usize) -> AdmissionBudget {
         AdmissionBudget {
             max_mutations: mutations,
@@ -2139,12 +2447,99 @@ mod tests {
     }
 
     #[test]
+    fn corrective_capacity_is_enforced_at_the_atomic_boundary() {
+        let manifest = manifest();
+        let maximum = manifest.config().max_partition_entries();
+        let target = pk(4);
+        let full_ready = [(
+            target,
+            PartitionHeader::new(1, maximum, 0, PartitionState::Ready).expect("header"),
+            PartitionTransition::Ready {
+                started_at_unix_millis: 1,
+            },
+        )];
+        assert!(
+            validate_corrective_capacity(
+                &manifest,
+                Movement::Split {
+                    left: pk(2),
+                    right: pk(3),
+                },
+                &full_ready,
+                &[((), target)],
+            )
+            .is_err()
+        );
+
+        let full_receiving = [(
+            target,
+            PartitionHeader::new(1, maximum, 0, PartitionState::ReceivingSplit).expect("header"),
+            PartitionTransition::ReceivingSplit {
+                source: pk(1),
+                started_at_unix_millis: 1,
+            },
+        )];
+        assert!(
+            validate_corrective_capacity(
+                &manifest,
+                Movement::CorrectivePull {
+                    split_source: pk(1),
+                    left: target,
+                    right: pk(5),
+                },
+                &full_receiving,
+                &[((), target)],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn child_relocation_respects_encoded_byte_boundaries() {
+        let manifest = manifest();
+        let tree_key = tree_key();
+        let overhead = 19;
+        let movement = Movement::CorrectivePull {
+            split_source: pk(1),
+            left: pk(2),
+            right: pk(3),
+        };
+        let charge = RelocationCharge::child(&manifest, &tree_key, overhead).expect("charge");
+        let (mutations, bytes) = charge.size(1, movement).expect("one move fits usize");
+        assert_eq!(
+            child_relocation_batch_limit(
+                &manifest,
+                &tree_key,
+                movement,
+                budget(mutations, bytes, overhead),
+            )
+            .expect("one move is admissible"),
+            1
+        );
+        assert!(
+            child_relocation_batch_limit(
+                &manifest,
+                &tree_key,
+                movement,
+                budget(mutations, bytes - 1, overhead),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn leaf_relocation_requires_room_for_one_complete_move() {
         let manifest = manifest();
         let tree_key = tree_key();
         let overhead = 17;
-        for movement in [Movement::Split, Movement::Merge] {
-            let charge = LeafRelocationCharge::new(&manifest, &tree_key, overhead).expect("charge");
+        for movement in [
+            Movement::Split {
+                left: pk(2),
+                right: pk(3),
+            },
+            Movement::Merge,
+        ] {
+            let charge = RelocationCharge::leaf(&manifest, &tree_key, overhead).expect("charge");
             let (mutations, bytes) = charge.size(1, movement).expect("one move fits usize");
             assert_eq!(
                 leaf_relocation_batch_limit(
@@ -2183,8 +2578,14 @@ mod tests {
         let tree_key = tree_key();
         let overhead = 23;
         let entries = 37;
-        for movement in [Movement::Split, Movement::Merge] {
-            let charge = LeafRelocationCharge::new(&manifest, &tree_key, overhead).expect("charge");
+        for movement in [
+            Movement::Split {
+                left: pk(2),
+                right: pk(3),
+            },
+            Movement::Merge,
+        ] {
+            let charge = RelocationCharge::leaf(&manifest, &tree_key, overhead).expect("charge");
             let (mutations, bytes) = charge
                 .size(entries, movement)
                 .expect("test batch fits usize");
@@ -2236,11 +2637,17 @@ mod tests {
         let manifest = manifest();
         let tree_key = tree_key();
         let budget = budget(10_000, 1 << 20, 263);
-        for movement in [Movement::Split, Movement::Merge] {
+        for movement in [
+            Movement::Split {
+                left: pk(2),
+                right: pk(3),
+            },
+            Movement::Merge,
+        ] {
             let limit = leaf_relocation_batch_limit(&manifest, &tree_key, movement, budget)
                 .expect("production-sized budget admits a move");
             let charge =
-                LeafRelocationCharge::new(&manifest, &tree_key, budget.mutation_key_overhead_bytes)
+                RelocationCharge::leaf(&manifest, &tree_key, budget.mutation_key_overhead_bytes)
                     .expect("charge");
             assert!(charge.fits(limit, movement, budget));
             assert!(!charge.fits(limit + 1, movement, budget));

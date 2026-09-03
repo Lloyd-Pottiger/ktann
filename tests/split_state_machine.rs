@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use ktann::api::{
-    DataType, ErrorKind, FieldId, FieldSchema, Index, IndexConfig, Metric, PartitionKey, Record,
-    RuntimeConfig, Value,
+    DataType, ErrorKind, FieldId, FieldSchema, Index, IndexConfig, LogicalIndexId, Metric,
+    PartitionKey, Record, RuntimeConfig, Value,
 };
 use ktann::maintenance::routing::route_leaf;
 use ktann::maintenance::split::{self, Advance};
@@ -21,7 +21,7 @@ use ktann::storage::backend::{Backend, Capabilities, ScanLimits, WriteTxn};
 use ktann::storage::keys::{self, LogicalKey, TreeKey};
 use ktann::storage::values::{
     ChildEntry, IndexManifest, LeafEntry, PartitionCentroid, PartitionHeader, PartitionState,
-    PartitionSynopsis, PartitionTransition, PersistentValue, RecordLocation,
+    PartitionSynopsis, PartitionTransition, PersistentValue, RecordLocation, VectorRecord,
 };
 use ktann::storage::{LogicalRange, ReadLogicalTxn, WriteLogicalTxn, topology, tree_manifest};
 
@@ -53,6 +53,21 @@ fn config() -> IndexConfig {
         .expect("valid dimension")
         .with_fields(vec![
             FieldSchema::new("bucket", DataType::I64).expect("field"),
+        ])
+        .expect("valid fields")
+        .with_tree_key_fields(vec![FieldId(0)])
+        .expect("valid tree key fields")
+        .with_partition_entries(1, 4)
+        .expect("valid partition entries")
+}
+
+/// Adds a non-key field so corrective leaf moves have observable Synopsis work.
+fn corrective_config() -> IndexConfig {
+    IndexConfig::new(1, Metric::L2)
+        .expect("valid dimension")
+        .with_fields(vec![
+            FieldSchema::new("bucket", DataType::I64).expect("field"),
+            FieldSchema::new("tag", DataType::I64).expect("field"),
         ])
         .expect("valid fields")
         .with_tree_key_fields(vec![FieldId(0)])
@@ -112,6 +127,110 @@ async fn write_txn<'b, 'm>(
         backend.admission_budget(),
     )
     .expect("bind manifest")
+}
+
+/// Installs one partition's authority pair; the Header state mirrors the
+/// persisted transition.
+async fn put_authority(
+    txn: &mut WriteLogicalTxn<'_, <SharedBackend as Backend>::WriteTxn<'_>>,
+    index: LogicalIndexId,
+    key: &TreeKey,
+    partition: PartitionKey,
+    level: u32,
+    count: u32,
+    transition: PartitionTransition,
+) {
+    txn.put(
+        LogicalKey::Header {
+            index,
+            tree_key: key.clone(),
+            partition,
+        },
+        PersistentValue::PartitionHeader(
+            PartitionHeader::new(level, count, 0, transition.state()).expect("fixture header"),
+        ),
+    )
+    .await
+    .expect("put header");
+    txn.put(
+        LogicalKey::State {
+            index,
+            tree_key: key.clone(),
+            partition,
+        },
+        PersistentValue::PartitionState(transition),
+    )
+    .await
+    .expect("put state");
+}
+
+/// Installs leaf records with their locations, leaf entries, and per-partition
+/// synopses; the second filter field mirrors the vector value.
+async fn put_leaf_records(
+    txn: &mut WriteLogicalTxn<'_, <SharedBackend as Backend>::WriteTxn<'_>>,
+    manifest: &IndexManifest,
+    key: &TreeKey,
+    records: &[(PartitionKey, Bytes, f32)],
+) {
+    let index = manifest.logical_index_id();
+    let mut synopses: BTreeMap<PartitionKey, PartitionSynopsis> = BTreeMap::new();
+    for (partition, id, vector) in records {
+        let fields = vec![Value::I64(1), Value::I64(*vector as i64)];
+        txn.put(
+            LogicalKey::Record {
+                index,
+                id: id.clone(),
+            },
+            PersistentValue::VectorRecord(VectorRecord::new(
+                id.clone(),
+                vec![*vector],
+                fields.clone(),
+            )),
+        )
+        .await
+        .expect("put record");
+        txn.put(
+            LogicalKey::Location {
+                index,
+                id: id.clone(),
+            },
+            PersistentValue::RecordLocation(RecordLocation::new(key.clone(), *partition)),
+        )
+        .await
+        .expect("put location");
+        txn.put(
+            LogicalKey::LeafEntry {
+                index,
+                tree_key: key.clone(),
+                partition: *partition,
+                id: id.clone(),
+            },
+            PersistentValue::LeafEntry(LeafEntry::new(
+                id.clone(),
+                fields.clone(),
+                Bytes::from_static(&[0; 14]),
+            )),
+        )
+        .await
+        .expect("put leaf entry");
+        synopses
+            .entry(*partition)
+            .or_insert_with(|| PartitionSynopsis::empty(manifest))
+            .expand(manifest, &fields)
+            .expect("expand synopsis");
+    }
+    for (partition, synopsis) in synopses {
+        txn.put(
+            LogicalKey::Synopsis {
+                index,
+                tree_key: key.clone(),
+                partition,
+            },
+            PersistentValue::PartitionSynopsis(synopsis),
+        )
+        .await
+        .expect("put synopsis");
+    }
 }
 
 /// Installs the Tree Manifest and initial leaf root so fixtures can grow the
@@ -1933,7 +2052,10 @@ async fn a_concurrent_drain_move_conflicts_with_a_foreground_delete() {
         &key,
         pk(1),
         vec![(candidate, pk(3))],
-        topology::Movement::Split,
+        topology::Movement::Split {
+            left: pk(2),
+            right: pk(3),
+        },
     )
     .await
     .expect("relocate op");
@@ -1942,6 +2064,771 @@ async fn a_concurrent_drain_move_conflicts_with_a_foreground_delete() {
 
     // The retried batch skips the vanished entry; membership stays exact.
     drain_to_zero(&backend, &manifest, &key, pk(1)).await;
+    assert_searchable(&backend, &manifest, &key, &records).await;
+    runtime.shutdown().await.expect("shutdown");
+}
+
+// ---------------------------------------------------------------------------
+// All-level split-time corrective migration.
+// ---------------------------------------------------------------------------
+
+/// Installs a searchable non-root leaf split with work in both P0 directions.
+async fn seed_leaf_corrective_split(
+    backend: &SharedBackend,
+    manifest: &IndexManifest,
+    key: &TreeKey,
+) -> Vec<(Bytes, f32)> {
+    let index = manifest.logical_index_id();
+    let mut txn = write_txn(backend, manifest).await;
+    tree_manifest::create_tree(&mut txn, key, 100)
+        .await
+        .expect("create tree");
+    tree_manifest::reserve_partition_keys(&mut txn, key, 5)
+        .await
+        .expect("reserve fixture keys");
+
+    txn.delete(LogicalKey::Synopsis {
+        index,
+        tree_key: key.clone(),
+        partition: pk(1),
+    })
+    .await
+    .expect("remove obsolete root synopsis");
+    for (partition, level, count, transition) in [
+        (
+            pk(1),
+            2,
+            5,
+            PartitionTransition::Ready {
+                started_at_unix_millis: 100,
+            },
+        ),
+        (
+            pk(2),
+            1,
+            2,
+            PartitionTransition::DrainingSplit {
+                left: pk(4),
+                right: pk(5),
+                started_at_unix_millis: 200,
+            },
+        ),
+        (
+            pk(3),
+            1,
+            10,
+            PartitionTransition::Ready {
+                started_at_unix_millis: 100,
+            },
+        ),
+        (
+            pk(4),
+            1,
+            1,
+            PartitionTransition::ReceivingSplit {
+                source: pk(2),
+                started_at_unix_millis: 150,
+            },
+        ),
+        (
+            pk(5),
+            1,
+            1,
+            PartitionTransition::ReceivingSplit {
+                source: pk(2),
+                started_at_unix_millis: 150,
+            },
+        ),
+        (
+            pk(6),
+            1,
+            1,
+            PartitionTransition::Ready {
+                started_at_unix_millis: 100,
+            },
+        ),
+    ] {
+        put_authority(&mut txn, index, key, partition, level, count, transition).await;
+    }
+
+    for (partition, centroid) in [
+        (pk(2), 50.0),
+        (pk(3), 100.0),
+        (pk(4), 0.0),
+        (pk(5), 10.0),
+        (pk(6), 20.0),
+    ] {
+        txn.put(
+            LogicalKey::Centroid {
+                index,
+                tree_key: key.clone(),
+                partition,
+            },
+            PersistentValue::PartitionCentroid(PartitionCentroid::new(vec![centroid])),
+        )
+        .await
+        .expect("put centroid");
+        txn.put(
+            LogicalKey::ChildEntry {
+                index,
+                tree_key: key.clone(),
+                partition: pk(1),
+                child: partition,
+            },
+            PersistentValue::ChildEntry(ChildEntry::new(partition, vec![centroid])),
+        )
+        .await
+        .expect("put root edge");
+    }
+
+    let mut records = vec![
+        (pk(4), rid(20), 0.0),
+        (pk(5), rid(21), 10.0),
+        (pk(2), rid(18), 100.0),
+        (pk(2), rid(22), 100.0),
+        (pk(6), rid(33), 20.0),
+    ];
+    for id in 23_u8..=32 {
+        let vector = if id == 32 { 9.0 } else { 100.0 };
+        records.push((pk(3), rid(id), vector));
+    }
+    put_leaf_records(&mut txn, manifest, key, &records).await;
+    txn.commit().await.expect("commit corrective fixture");
+    records
+        .into_iter()
+        .map(|(_, id, vector)| (id, vector))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn leaf_correction_moves_both_directions_atomically_and_recovers() {
+    let durable = DeterministicConfig {
+        durability: support::Durability::Durable,
+        ..DeterministicConfig::default()
+    };
+    let backend = SharedBackend::new(DeterministicBackend::new(durable));
+    let runtime = make_runtime(backend.clone());
+    let config = corrective_config()
+        .with_partition_entries(1, 32)
+        .expect("valid scan fixture limits");
+    let index = runtime.create_index("index", config).await.expect("create");
+    let manifest = read_manifest(&backend, index.logical_index_id()).await;
+    let key = tree_key(1);
+    let records = seed_leaf_corrective_split(&backend, &manifest, &key).await;
+    runtime.shutdown().await.expect("shutdown");
+    assert_searchable(&backend, &manifest, &key, &records).await;
+
+    // The nearer candidate pk=6 has no qualifying entry, while pk=3's only
+    // qualifying entry sorts behind the eight-entry relocation batch limit.
+    // Discovery must inspect both bounded pages before fixing the
+    // mutation-sized batch.
+    // UnknownApplied commits the Ready sibling -> ReceivingSplit target pull.
+    backend
+        .inner()
+        .push_fault(CommitFault::UnknownApplied)
+        .expect("push fault");
+    let error = split::advance(&backend, &manifest, &key, pk(2), 300, &retry())
+        .await
+        .expect_err("unknown corrective pull outcome");
+    assert_eq!(error.kind(), ErrorKind::CommitOutcomeUnknown);
+    assert_eq!(
+        location_of(&backend, &manifest, &rid(32))
+            .await
+            .unwrap()
+            .leaf(),
+        pk(5)
+    );
+    assert_eq!(
+        header_of(&backend, &manifest, &key, pk(3))
+            .await
+            .unwrap()
+            .entry_count(),
+        9
+    );
+    assert_eq!(
+        header_of(&backend, &manifest, &key, pk(5))
+            .await
+            .unwrap()
+            .entry_count(),
+        2
+    );
+    assert_eq!(
+        header_of(&backend, &manifest, &key, pk(6))
+            .await
+            .unwrap()
+            .entry_count(),
+        1
+    );
+    assert_searchable(&backend, &manifest, &key, &records).await;
+
+    let mut expected = PartitionSynopsis::empty(&manifest);
+    for tag in [10_i64, 9_i64] {
+        expected
+            .expand(&manifest, &[Value::I64(1), Value::I64(tag)])
+            .expect("expand expected synopsis");
+    }
+    assert_eq!(
+        synopsis_of(&backend, &manifest, &key, pk(5)).await,
+        Some(expected)
+    );
+
+    // A cold process rediscovers the split. The remaining source entry is
+    // strictly closer to the Ready sibling than either split target.
+    let reopened = SharedBackend::new(backend.inner().reopen());
+    let outcome = split::advance(&reopened, &manifest, &key, pk(2), 301, &retry())
+        .await
+        .expect("redrive correction and drain");
+    assert!(matches!(outcome, Advance::Completed { .. }));
+    assert_eq!(
+        location_of(&reopened, &manifest, &rid(22))
+            .await
+            .unwrap()
+            .leaf(),
+        pk(3)
+    );
+    let sibling = header_of(&reopened, &manifest, &key, pk(3)).await.unwrap();
+    assert_eq!((sibling.entry_count(), sibling.cache_epoch()), (11, 3));
+    assert_searchable(&reopened, &manifest, &key, &records).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn corrective_beam_crosses_a_partially_exposed_internal_split() {
+    let backend = backend();
+    let runtime = make_runtime(backend.clone());
+    let config = corrective_config()
+        .with_partition_entries(1, 32)
+        .expect("valid height fixture limits");
+    let index = runtime.create_index("index", config).await.expect("create");
+    let manifest = read_manifest(&backend, index.logical_index_id()).await;
+    let key = tree_key(1);
+    let logical_index = manifest.logical_index_id();
+    let mut txn = write_txn(&backend, &manifest).await;
+    tree_manifest::create_tree(&mut txn, &key, 100)
+        .await
+        .expect("create tree");
+    tree_manifest::reserve_partition_keys(&mut txn, &key, 11)
+        .await
+        .expect("reserve fixture keys");
+    txn.delete(LogicalKey::Synopsis {
+        index: logical_index,
+        tree_key: key.clone(),
+        partition: pk(1),
+    })
+    .await
+    .expect("remove obsolete root synopsis");
+
+    for (partition, level, count, transition) in [
+        (
+            pk(1),
+            3,
+            3,
+            PartitionTransition::Ready {
+                started_at_unix_millis: 100,
+            },
+        ),
+        (
+            pk(2),
+            1,
+            1,
+            PartitionTransition::DrainingSplit {
+                left: pk(4),
+                right: pk(5),
+                started_at_unix_millis: 200,
+            },
+        ),
+        (
+            pk(3),
+            1,
+            1,
+            PartitionTransition::Ready {
+                started_at_unix_millis: 100,
+            },
+        ),
+        (
+            pk(4),
+            1,
+            1,
+            PartitionTransition::ReceivingSplit {
+                source: pk(2),
+                started_at_unix_millis: 150,
+            },
+        ),
+        (
+            pk(5),
+            1,
+            1,
+            PartitionTransition::ReceivingSplit {
+                source: pk(2),
+                started_at_unix_millis: 150,
+            },
+        ),
+        (
+            pk(6),
+            2,
+            3,
+            PartitionTransition::Ready {
+                started_at_unix_millis: 100,
+            },
+        ),
+        (
+            pk(10),
+            2,
+            1,
+            PartitionTransition::Splitting {
+                left: pk(11),
+                right: pk(12),
+                started_at_unix_millis: 180,
+            },
+        ),
+        (
+            pk(11),
+            2,
+            0,
+            PartitionTransition::ReceivingSplit {
+                source: pk(10),
+                started_at_unix_millis: 190,
+            },
+        ),
+    ] {
+        put_authority(
+            &mut txn,
+            logical_index,
+            &key,
+            partition,
+            level,
+            count,
+            transition,
+        )
+        .await;
+    }
+
+    for (partition, centroid) in [
+        (pk(2), 50.0),
+        (pk(3), 100.0),
+        (pk(4), 0.0),
+        (pk(5), 10.0),
+        (pk(6), 50.0),
+        (pk(10), 100.0),
+        (pk(11), 0.0),
+    ] {
+        txn.put(
+            LogicalKey::Centroid {
+                index: logical_index,
+                tree_key: key.clone(),
+                partition,
+            },
+            PersistentValue::PartitionCentroid(PartitionCentroid::new(vec![centroid])),
+        )
+        .await
+        .expect("put centroid");
+    }
+    for (parent, child, centroid) in [
+        (pk(1), pk(10), 100.0),
+        (pk(1), pk(11), 0.0),
+        (pk(1), pk(6), 50.0),
+        (pk(10), pk(3), 100.0),
+        (pk(6), pk(2), 50.0),
+        (pk(6), pk(4), 0.0),
+        (pk(6), pk(5), 10.0),
+    ] {
+        txn.put(
+            LogicalKey::ChildEntry {
+                index: logical_index,
+                tree_key: key.clone(),
+                partition: parent,
+                child,
+            },
+            PersistentValue::ChildEntry(ChildEntry::new(child, vec![centroid])),
+        )
+        .await
+        .expect("put edge");
+    }
+
+    let records = [
+        (pk(2), rid(40), 100.0),
+        (pk(3), rid(41), 9.0),
+        (pk(4), rid(42), 0.0),
+        (pk(5), rid(43), 10.0),
+    ];
+    put_leaf_records(&mut txn, &manifest, &key, &records).await;
+    txn.commit().await.expect("commit fixture");
+
+    let outcome = split::advance(&backend, &manifest, &key, pk(2), 300, &retry())
+        .await
+        .expect("cross partially exposed family");
+    assert_eq!(outcome, Advance::Corrected { moved: 1 });
+    assert_eq!(
+        location_of(&backend, &manifest, &rid(41))
+            .await
+            .expect("location")
+            .leaf(),
+        pk(5)
+    );
+    let searchable: Vec<_> = records
+        .into_iter()
+        .map(|(_, id, vector)| (id, vector))
+        .collect();
+    assert_searchable(&backend, &manifest, &key, &searchable).await;
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn internal_correction_moves_both_directions_without_emptying_a_ready_source() {
+    let backend = backend();
+    let runtime = make_runtime(backend.clone());
+    let index = runtime
+        .create_index("index", config())
+        .await
+        .expect("create");
+    let manifest = read_manifest(&backend, index.logical_index_id()).await;
+    let key = tree_key(1);
+    let index_id = manifest.logical_index_id();
+
+    let mut txn = write_txn(&backend, &manifest).await;
+    tree_manifest::create_tree(&mut txn, &key, 100)
+        .await
+        .expect("create tree");
+    tree_manifest::reserve_partition_keys(&mut txn, &key, 14)
+        .await
+        .expect("reserve fixture keys");
+    txn.delete(LogicalKey::Synopsis {
+        index: index_id,
+        tree_key: key.clone(),
+        partition: pk(1),
+    })
+    .await
+    .expect("remove obsolete root synopsis");
+
+    for (partition, level, count, transition) in [
+        (
+            pk(1),
+            3,
+            5,
+            PartitionTransition::Ready {
+                started_at_unix_millis: 100,
+            },
+        ),
+        (
+            pk(2),
+            2,
+            1,
+            PartitionTransition::DrainingSplit {
+                left: pk(4),
+                right: pk(5),
+                started_at_unix_millis: 200,
+            },
+        ),
+        (
+            pk(3),
+            2,
+            2,
+            PartitionTransition::Ready {
+                started_at_unix_millis: 100,
+            },
+        ),
+        (
+            pk(4),
+            2,
+            1,
+            PartitionTransition::ReceivingSplit {
+                source: pk(2),
+                started_at_unix_millis: 150,
+            },
+        ),
+        (
+            pk(5),
+            2,
+            1,
+            PartitionTransition::ReceivingSplit {
+                source: pk(2),
+                started_at_unix_millis: 150,
+            },
+        ),
+        (
+            pk(6),
+            2,
+            1,
+            PartitionTransition::Ready {
+                started_at_unix_millis: 100,
+            },
+        ),
+        (
+            pk(10),
+            1,
+            0,
+            PartitionTransition::Ready {
+                started_at_unix_millis: 100,
+            },
+        ),
+        (
+            pk(11),
+            1,
+            0,
+            PartitionTransition::Ready {
+                started_at_unix_millis: 100,
+            },
+        ),
+        (
+            pk(12),
+            1,
+            0,
+            PartitionTransition::Ready {
+                started_at_unix_millis: 100,
+            },
+        ),
+        (
+            pk(13),
+            1,
+            0,
+            PartitionTransition::Ready {
+                started_at_unix_millis: 100,
+            },
+        ),
+        (
+            pk(14),
+            1,
+            0,
+            PartitionTransition::Ready {
+                started_at_unix_millis: 100,
+            },
+        ),
+        (
+            pk(15),
+            1,
+            0,
+            PartitionTransition::Ready {
+                started_at_unix_millis: 100,
+            },
+        ),
+    ] {
+        put_authority(
+            &mut txn, index_id, &key, partition, level, count, transition,
+        )
+        .await;
+        let centroid = match partition.get() {
+            2 => 50.0,
+            3 | 10 | 12 => 100.0,
+            6 => -100.0,
+            5 | 14 => 10.0,
+            11 | 15 => 9.0,
+            1 | 4 | 13 => 0.0,
+            _ => unreachable!("fixture partition"),
+        };
+        txn.put(
+            LogicalKey::Centroid {
+                index: index_id,
+                tree_key: key.clone(),
+                partition,
+            },
+            PersistentValue::PartitionCentroid(PartitionCentroid::new(vec![centroid])),
+        )
+        .await
+        .expect("put centroid");
+        if level == 1 {
+            txn.put(
+                LogicalKey::Synopsis {
+                    index: index_id,
+                    tree_key: key.clone(),
+                    partition,
+                },
+                PersistentValue::PartitionSynopsis(PartitionSynopsis::empty(&manifest)),
+            )
+            .await
+            .expect("put leaf synopsis");
+        }
+    }
+    for (partition, centroid) in [
+        (pk(2), 50.0),
+        (pk(3), 100.0),
+        (pk(4), 0.0),
+        (pk(5), 10.0),
+        (pk(6), -100.0),
+    ] {
+        txn.put(
+            LogicalKey::ChildEntry {
+                index: index_id,
+                tree_key: key.clone(),
+                partition: pk(1),
+                child: partition,
+            },
+            PersistentValue::ChildEntry(ChildEntry::new(partition, vec![centroid])),
+        )
+        .await
+        .expect("put root edge");
+    }
+    for (parent, child, centroid) in [
+        (pk(2), pk(10), 100.0),
+        (pk(3), pk(11), 9.0),
+        (pk(3), pk(12), 100.0),
+        (pk(4), pk(13), 0.0),
+        (pk(5), pk(14), 10.0),
+        (pk(6), pk(15), 9.0),
+    ] {
+        txn.put(
+            LogicalKey::ChildEntry {
+                index: index_id,
+                tree_key: key.clone(),
+                partition: parent,
+                child,
+            },
+            PersistentValue::ChildEntry(ChildEntry::new(child, vec![centroid])),
+        )
+        .await
+        .expect("put child edge");
+    }
+    txn.commit().await.expect("commit corrective fixture");
+
+    let assert_unique = |entries: &BTreeMap<PartitionKey, Vec<PartitionKey>>| {
+        let mut occurrences = BTreeMap::new();
+        for children in entries.values() {
+            for child in children {
+                *occurrences.entry(*child).or_insert(0_u32) += 1;
+            }
+        }
+        for child in [pk(10), pk(11), pk(12), pk(13), pk(14), pk(15)] {
+            assert_eq!(occurrences.get(&child), Some(&1), "child {child:?}");
+        }
+    };
+    let bodies = async |backend: &SharedBackend| {
+        let mut entries = BTreeMap::new();
+        for parent in [pk(2), pk(3), pk(4), pk(5), pk(6)] {
+            entries.insert(
+                parent,
+                scan_child_entries(backend, &manifest, &key, parent)
+                    .await
+                    .into_iter()
+                    .map(|entry| entry.child())
+                    .collect(),
+            );
+        }
+        entries
+    };
+
+    let first = split::advance(&backend, &manifest, &key, pk(2), 300, &retry())
+        .await
+        .expect("pull sibling child");
+    assert_eq!(first, Advance::Corrected { moved: 1 });
+    let entries = bodies(&backend).await;
+    assert_unique(&entries);
+    assert_eq!(entries[&pk(3)], vec![pk(12)]);
+    assert_eq!(entries[&pk(5)], vec![pk(11), pk(14)]);
+    assert_eq!(entries[&pk(6)], vec![pk(15)]);
+    assert_eq!(
+        scan_child_entries(&backend, &manifest, &key, pk(1))
+            .await
+            .into_iter()
+            .filter(|entry| entry.child() == pk(6))
+            .count(),
+        1
+    );
+    for vector in [[-100.0], [9.0], [100.0]] {
+        route_leaf(&mut read_txn(&backend, &manifest).await, &key, &vector)
+            .await
+            .expect("route intermediate")
+            .expect("tree exists");
+    }
+
+    let second = split::advance(&backend, &manifest, &key, pk(2), 301, &retry())
+        .await
+        .expect("move source child and complete");
+    assert!(matches!(second, Advance::Completed { .. }));
+    let entries = bodies(&backend).await;
+    assert_unique(&entries);
+    assert_eq!(entries[&pk(3)], vec![pk(10), pk(12)]);
+    assert_eq!(entries[&pk(6)], vec![pk(15)]);
+    assert_eq!(
+        scan_child_entries(&backend, &manifest, &key, pk(1))
+            .await
+            .into_iter()
+            .filter(|entry| entry.child() == pk(6))
+            .count(),
+        1
+    );
+    assert_eq!(header_of(&backend, &manifest, &key, pk(2)).await, None);
+    assert_eq!(edge_of(&backend, &manifest, &key, pk(1), pk(2)).await, None);
+    for vector in [[-100.0], [9.0], [100.0]] {
+        route_leaf(&mut read_txn(&backend, &manifest).await, &key, &vector)
+            .await
+            .expect("route completed")
+            .expect("tree exists");
+    }
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn corrective_move_conflicts_with_a_concurrent_merge_transition() {
+    let backend = backend();
+    let runtime = make_runtime(backend.clone());
+    let config = corrective_config()
+        .with_partition_entries(1, 32)
+        .expect("valid conflict fixture limits");
+    let index = runtime.create_index("index", config).await.expect("create");
+    let manifest = read_manifest(&backend, index.logical_index_id()).await;
+    let key = tree_key(1);
+    let records = seed_leaf_corrective_split(&backend, &manifest, &key).await;
+
+    // Fix a source -> Ready sibling move in one attempt, then transition that
+    // sibling to Merging in a concurrent transaction. The protected Header
+    // and State force the stale relocation commit to abort.
+    let mut attempt = write_txn(&backend, &manifest).await;
+    let candidate = topology::read_leaf_drain_candidates(&mut attempt, &key, pk(2), &[rid(22)])
+        .await
+        .expect("read source candidate")
+        .into_iter()
+        .next()
+        .expect("one slot")
+        .expect("candidate exists");
+    topology::relocate_leaf_entries(
+        &mut attempt,
+        &key,
+        pk(2),
+        vec![(candidate, pk(3))],
+        topology::Movement::Split {
+            left: pk(4),
+            right: pk(5),
+        },
+    )
+    .await
+    .expect("stage corrective move");
+
+    let mut concurrent = write_txn(&backend, &manifest).await;
+    concurrent
+        .put(
+            LogicalKey::Header {
+                index: manifest.logical_index_id(),
+                tree_key: key.clone(),
+                partition: pk(3),
+            },
+            PersistentValue::PartitionHeader(
+                PartitionHeader::new(1, 10, 0, PartitionState::Merging).expect("header"),
+            ),
+        )
+        .await
+        .expect("put merging header");
+    concurrent
+        .put(
+            LogicalKey::State {
+                index: manifest.logical_index_id(),
+                tree_key: key.clone(),
+                partition: pk(3),
+            },
+            PersistentValue::PartitionState(PartitionTransition::Merging {
+                started_at_unix_millis: 400,
+            }),
+        )
+        .await
+        .expect("put merging state");
+    concurrent.commit().await.expect("commit merge transition");
+
+    let error = attempt.commit().await.expect_err("stale move conflicts");
+    assert_eq!(error.kind(), ErrorKind::RetryableAbort);
+    assert_eq!(
+        location_of(&backend, &manifest, &rid(22))
+            .await
+            .unwrap()
+            .leaf(),
+        pk(2)
+    );
     assert_searchable(&backend, &manifest, &key, &records).await;
     runtime.shutdown().await.expect("shutdown");
 }
@@ -2081,6 +2968,33 @@ async fn seed_completable_non_root_split(
         .expect("put target centroid");
     }
     txn.commit().await.expect("commit fixture");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn advance_completes_an_already_drained_non_root_split() {
+    let backend = backend();
+    let runtime = make_runtime(backend.clone());
+    let index = runtime
+        .create_index("index", config())
+        .await
+        .expect("create");
+    let manifest = read_manifest(&backend, index.logical_index_id()).await;
+    let key = tree_key(1);
+    seed_completable_non_root_split(&backend, &manifest, &key).await;
+
+    assert_eq!(
+        split::advance(&backend, &manifest, &key, pk(2), 300, &retry())
+            .await
+            .expect("complete split"),
+        Advance::Completed {
+            left: pk(4),
+            right: pk(5),
+            parent: Some(pk(1)),
+        }
+    );
+    assert!(header_of(&backend, &manifest, &key, pk(2)).await.is_none());
+
+    runtime.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2460,7 +3374,7 @@ async fn seeded_model_history_interleaving_mutations_and_splits() {
                 let partitions = all_partitions(&backend, &manifest, &key).await;
                 if !partitions.is_empty() {
                     let partition = partitions[rng.below(partitions.len() as u64) as usize];
-                    if let Err(error) = split::advance(
+                    let result = split::advance(
                         &backend,
                         &manifest,
                         &key,
@@ -2468,13 +3382,21 @@ async fn seeded_model_history_interleaving_mutations_and_splits() {
                         50_000 + step,
                         &retry(),
                     )
-                    .await
-                    {
-                        let header = header_of(&backend, &manifest, &key, partition).await;
-                        let state = state_of(&backend, &manifest, &key, partition).await;
-                        panic!(
-                            "advance {partition:?} failed at step {step}: {error:?}; header {header:?}; state {state:?}"
-                        );
+                    .await;
+                    match result {
+                        Ok(_) => {}
+                        // A split whose parent cannot yet accept a new child
+                        // exhausts its bounded attempts; a later random advance
+                        // of the parent unblocks it, exactly as in the settle
+                        // loop below.
+                        Err(error) if error.kind() == ErrorKind::ContentionExhausted => {}
+                        Err(error) => {
+                            let header = header_of(&backend, &manifest, &key, partition).await;
+                            let state = state_of(&backend, &manifest, &key, partition).await;
+                            panic!(
+                                "advance {partition:?} failed at step {step}: {error:?}; header {header:?}; state {state:?}"
+                            );
+                        }
                     }
                 }
             }

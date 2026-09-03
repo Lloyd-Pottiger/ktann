@@ -46,9 +46,9 @@ pk=24: split into left=54 right=55
 pk=27: split into left=56 right=57
 pk=28: split into left=58 right=59
 pk=29: split into left=60 right=61
-pk=31: split into left=62 right=63
-pk=33: split into left=64 right=65
-pk=30: split into left=66 right=67
+pk=33: split into left=62 right=63
+pk=30: split into left=64 right=65
+pk=31: split into left=66 right=67
 pk=38: split into left=68 right=69
 pk=32: split into left=70 right=71
 pk=34: split into left=72 right=73
@@ -74,13 +74,13 @@ ok: records=512 trees=1 partitions=53 max_level=3
 
 recall k=10 samples=20 query=clustered:20:6 query-seed=91 beam-size=1 min-recall=25
 ----
-recall@10: 28.50% (samples=20, truncated=0)
+recall@10: 29.00% (samples=20, truncated=0)
 mean usage: visited_partitions=3 visited_leaf_entries=10 exact_rerank_candidates=10
 
 recall k=10 samples=20 query=clustered:20:6 query-seed=91 beam-size=4 min-recall=80
 ----
-recall@10: 87.50% (samples=20, truncated=0)
-mean usage: visited_partitions=7 visited_leaf_entries=43 exact_rerank_candidates=18
+recall@10: 86.50% (samples=20, truncated=0)
+mean usage: visited_partitions=7 visited_leaf_entries=44 exact_rerank_candidates=19
 
 recall k=10 samples=20 query=clustered:20:6 query-seed=91 beam-size=8 min-recall=95
 ----

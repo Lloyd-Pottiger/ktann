@@ -577,6 +577,11 @@ pub fn child_entry_key(
     bytes
 }
 
+/// Returns one Child Entry key's exact encoded length for `tree_key`.
+pub(crate) fn child_entry_key_len(tree_key: &TreeKey) -> usize {
+    partition_metadata_key_len(tree_key) + PARTITION_KEY_BYTES
+}
+
 /// Encodes one typed Logical Key to canonical bytes.
 pub(crate) fn encode_key(key: &LogicalKey) -> Result<Vec<u8>> {
     match key {

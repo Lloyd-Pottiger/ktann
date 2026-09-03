@@ -106,6 +106,22 @@ pub(crate) struct LeafRelocationValueSizes {
     pub(crate) partition_synopsis: usize,
 }
 
+/// Exact encoded value lengths involved in one Child Entry relocation batch.
+pub(crate) struct ChildRelocationValueSizes {
+    pub(crate) child_entry: usize,
+    pub(crate) partition_header: usize,
+}
+
+/// Returns exact Child Entry relocation value lengths for one Manifest.
+pub(crate) fn child_relocation_value_sizes(
+    manifest: &IndexManifest,
+) -> Result<ChildRelocationValueSizes> {
+    Ok(ChildRelocationValueSizes {
+        child_entry: entry::child_entry_encoded_len(manifest)?,
+        partition_header: authority::PARTITION_HEADER_ENCODED_LEN,
+    })
+}
+
 /// Returns exact worst-case value lengths for the current Manifest and Tree Key.
 pub(crate) fn leaf_relocation_value_sizes(
     manifest: &IndexManifest,

@@ -176,28 +176,29 @@ validate
 ----
 ok: records=5 trees=1 partitions=5 max_level=2
 
-# Draining the source's last entry completes the split: the parent's Child
-# Entries flip from the source to the two promoted targets.
+# The corrective pass first pulls a Ready sibling entry into a nearer target.
+# The source remains searchable in DrainingSplit until a later step drains it.
 split-step tree=1 partition=2
 ----
-pk=2: completed
+pk=2: corrected moved=1
 
 format-tree entries
 ----
 tree 0: root pk=1
-  pk=1 level=2 state=Ready count=3
-    pk=3 level=1 state=Ready count=2
-      r2
-      r3
-    pk=4 level=1 state=Ready count=2
+  pk=1 level=2 state=Ready count=4
+    pk=2 level=1 state=DrainingSplit count=1 left=3 right=4
       r1
-      r4
-    pk=5 level=1 state=Ready count=1
-      r5
+      pk=3 level=1 state=ReceivingSplit count=3
+        r2
+        r3
+        r5
+      pk=4 level=1 state=ReceivingSplit count=1
+        r4
+    pk=5 level=1 state=Ready count=0
 
 validate
 ----
-ok: records=5 trees=1 partitions=4 max_level=2
+ok: records=5 trees=1 partitions=5 max_level=2
 
 # --- Scenario E: a Splitting root with reserved, not yet exposed targets ---
 # The targets have no partition lines; only the root body is searched.

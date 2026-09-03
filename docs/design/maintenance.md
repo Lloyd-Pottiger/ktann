@@ -106,12 +106,14 @@ The leaf page first derives the largest batch whose exact worst-case relocation
 charge fits the current Backend Admission Budget. The charge uses the
 Manifest's dimension, fields and Bloom parameters, the current Tree Key, codec
 key/value sizes, adapter key-prefix overhead, and the operation's worst target
-distribution: two targets for split, or one distinct Ready target per entry for
+distribution: two persisted targets plus the bounded corrective candidate set
+for split, or one distinct Ready target per entry for
 merge. It then caps that safe bound at one quarter of the configured split
 threshold, with a floor of eight, limiting conflict rollback and failure blast
 radius relative to the index's ordinary partition size. Internal movement
-retains its fixed entry bound because it does not write Record Locations or
-Synopses.
+retains a 128-entry contention cap, reduced when necessary by an exact encoded
+Child Entry and Header mutation-byte calculation for the current dimension and
+Backend Admission Budget.
 
 Drain placement normally chooses the nearer persisted target centroid. Exact
 remaining and target counts reserve the last entries needed for each target to
@@ -121,6 +123,37 @@ cannot immediately merge a small target back into its oversized source, while
 ordinary inputs retain the distance-based placement learned by balanced
 training. If concurrent deletes make both minima unattainable, nearest routing
 continues and the normal merge protocol converges the undersized result.
+
+Before each ordinary drain batch, a non-root split performs one bounded
+same-level corrective pass. Leaf routing vectors are current Vector Records;
+internal routing vectors are the immutable full-f32 centroids already stored in
+Child Entries. The same strict-improvement rule and Partition Key tie-break
+serve both kinds. A source entry may move to an existing Ready sibling only
+when that sibling is strictly closer than both split targets and doing so still
+leaves enough source entries to attain both target minima. Conversely, each
+Ready sibling or cousin in the bounded candidate beam contributes at most one
+128-entry, 1-MiB entry page. Each pass rotates through at most four candidates,
+scans at most 512 entry envelopes, and screens a deterministic aggregate
+sample of at most eight routing vectors; successive drain rounds cover
+different candidates and page positions. The first page with qualifying entries supplies a
+mutation-budget-sized batch to a ReceivingSplit target only when that target
+is strictly closer than the current owner's immutable centroid. Configured
+target capacity is enforced both by planning and at the atomic topology
+boundary. An internal Ready source always retains at least one Child Entry, so
+its incoming edge can never route to an empty body.
+
+Corrective discovery has its own fixed maintenance beam of 16 and does not
+change foreground routing. Starting at the root, each level expands at most 16
+searchable partition bodies; each body contributes at most one 128-entry,
+1-MiB Child Entry page, and only the nearest 16 child paths survive. The final
+level admits at most 16 nonempty Ready candidates, excluding the split source
+and targets. Corrective pulls rotate through up to four candidates that can
+donate an entry; an internal donor must contain at least two Child Entries. A
+fully exposed transitional split family is expanded as its
+source and both targets after validating the family relationship. A partially
+exposed ReceivingSplit target redirects to its still-complete Splitting source
+body. A root split has no sibling and skips correction. Existing Child Entry
+centroids are never refreshed.
 
 New inserts route to the nearer target. Upsert relocates a source membership;
 delete follows exact Record Location. Traversal visits the source plus both
