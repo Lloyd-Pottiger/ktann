@@ -75,7 +75,7 @@ use crate::storage::keys::{LogicalKey, MAX_TREE_KEY_BYTES, TreeKey};
 use crate::storage::values::{
     ChildEntry, IndexManifest, PartitionCentroid, PartitionHeader, PartitionState,
     PartitionTransition, PersistentValue, TreeManifest, expect_centroid, expect_child_entry_ref,
-    expect_header, expect_state,
+    expect_header,
 };
 use crate::storage::{
     LogicalRange, LogicalReader, ReadLogicalTxn, WriteLogicalTxn, topology, tree_manifest,
@@ -568,40 +568,22 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                 .all(|(_, expected_level)| *expected_level == Some(1))
         {
             let leaf_pending = std::mem::take(&mut pending);
-            let mut keys = Vec::with_capacity(2 * leaf_pending.len());
-            for (partition, _) in leaf_pending.keys() {
-                keys.push(LogicalKey::Header {
-                    index: manifest.logical_index_id(),
-                    tree_key: tree_key.clone(),
-                    partition: *partition,
-                });
-                keys.push(LogicalKey::State {
-                    index: manifest.logical_index_id(),
-                    tree_key: tree_key.clone(),
-                    partition: *partition,
-                });
-            }
-            let mut values = reader.batch_get(keys).await?.into_iter();
+            let partitions: Vec<PartitionKey> = leaf_pending
+                .keys()
+                .map(|(partition, _)| *partition)
+                .collect();
+            let authorities = topology::read_authority_batch(
+                reader,
+                manifest.logical_index_id(),
+                tree_key,
+                &partitions,
+            )
+            .await?;
             let mut fast_path = true;
-            let mut headers = Vec::with_capacity(leaf_pending.len());
-            for (partition, _) in leaf_pending.keys() {
-                let header = expect_header(
-                    values
-                        .next()
-                        .ok_or_else(|| Error::new(ErrorKind::Backend))?,
-                )?
-                .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
-                let state = expect_state(
-                    values
-                        .next()
-                        .ok_or_else(|| Error::new(ErrorKind::Backend))?,
-                )?
-                .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
+            let mut headers = Vec::with_capacity(authorities.len());
+            for (&partition, (header, state)) in partitions.iter().zip(authorities) {
                 check_level(&header, Some(1))?;
-                check_root_state(root, *partition, state)?;
-                if header.state() != state.state() {
-                    return Err(Error::new(ErrorKind::Corruption));
-                }
+                check_root_state(root, partition, state)?;
                 if !header.state().accepts_writes() {
                     fast_path = false;
                 }
