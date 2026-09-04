@@ -788,6 +788,18 @@ fn batch_size_limit_is_enforced() {
             .await
             .expect_err("batch too large");
         assert_eq!(error.kind(), ErrorKind::LimitExceeded);
+
+        let error = txn
+            .batch_scan(
+                vec![range(b"a", b"b"), range(b"b", b"c"), range(b"c", b"d")],
+                ScanLimits {
+                    item_limit: 1,
+                    byte_limit: 1,
+                },
+            )
+            .await
+            .expect_err("batch scan too large");
+        assert_eq!(error.kind(), ErrorKind::LimitExceeded);
     });
 }
 

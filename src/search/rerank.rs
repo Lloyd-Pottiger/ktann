@@ -458,6 +458,15 @@ mod tests {
             // The rerank stage only point-reads record groups; it never scans.
             Err(Error::new(ErrorKind::Backend))
         }
+
+        async fn batch_scan(
+            &mut self,
+            _ranges: Vec<KeyRange>,
+            _limits: ScanLimits,
+        ) -> Result<Vec<ScanPage>> {
+            // The rerank stage only point-reads record groups; it never scans.
+            Err(Error::new(ErrorKind::Backend))
+        }
     }
 
     async fn rerank(

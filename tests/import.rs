@@ -167,6 +167,14 @@ impl ReadOps for GatedWriteTxn<'_> {
     async fn scan(&mut self, range: &KeyRange, limits: ScanLimits) -> ktann::api::Result<ScanPage> {
         self.inner.scan(range, limits).await
     }
+
+    async fn batch_scan(
+        &mut self,
+        ranges: Vec<KeyRange>,
+        limits: ScanLimits,
+    ) -> ktann::api::Result<Vec<ScanPage>> {
+        self.inner.batch_scan(ranges, limits).await
+    }
 }
 
 impl ReadTxn for GatedWriteTxn<'_> {}

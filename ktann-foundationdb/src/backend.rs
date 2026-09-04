@@ -20,6 +20,7 @@ const DEFAULT_MAX_MUTATIONS: usize = 10_000;
 const DEFAULT_MAX_MUTATION_BYTES: usize = 1 << 20;
 const MAX_SCAN_PAGE_BYTES: usize = 80 << 10;
 const MAX_CONCURRENT_POINT_READS: usize = 1_024;
+const MAX_CONCURRENT_RANGE_READS: usize = 1_024;
 const MAX_BACKEND_NAMESPACE_BYTES: usize = u8::MAX as usize;
 const PHYSICAL_PREFIX_HEADER: &[u8] = b"\0ktann\x01";
 
@@ -247,6 +248,14 @@ impl ReadOps for FoundationDbReadTxn<'_> {
     async fn scan(&mut self, range: &KeyRange, limits: ScanLimits) -> Result<ScanPage> {
         scan(&self.transaction, self.prefix, range, limits).await
     }
+
+    async fn batch_scan(
+        &mut self,
+        ranges: Vec<KeyRange>,
+        limits: ScanLimits,
+    ) -> Result<Vec<ScanPage>> {
+        batch_scan(&self.transaction, self.prefix, ranges, limits).await
+    }
 }
 
 impl ReadTxn for FoundationDbReadTxn<'_> {}
@@ -262,6 +271,14 @@ impl ReadOps for FoundationDbWriteTxn<'_> {
 
     async fn scan(&mut self, range: &KeyRange, limits: ScanLimits) -> Result<ScanPage> {
         scan(&self.transaction, self.prefix, range, limits).await
+    }
+
+    async fn batch_scan(
+        &mut self,
+        ranges: Vec<KeyRange>,
+        limits: ScanLimits,
+    ) -> Result<Vec<ScanPage>> {
+        batch_scan(&self.transaction, self.prefix, ranges, limits).await
     }
 }
 
@@ -531,6 +548,31 @@ async fn scan(
         }
     }
     Ok(ScanPage::terminal(items))
+}
+
+/// Serves every range as one snapshot range read, bounding the fan-out per
+/// chunk, keeping the per-range paging rules of `scan` and the input order.
+async fn batch_scan(
+    transaction: &Transaction,
+    prefix: &PhysicalPrefix,
+    ranges: Vec<KeyRange>,
+    limits: ScanLimits,
+) -> Result<Vec<ScanPage>> {
+    if limits.item_limit == 0 || limits.byte_limit == 0 {
+        return Err(Error::new(ErrorKind::InvalidArgument));
+    }
+    for range in &ranges {
+        prefix.validate_key(range.start())?;
+        prefix.validate_key(range.end())?;
+    }
+    let mut pages = Vec::with_capacity(ranges.len());
+    for ranges in ranges.chunks(MAX_CONCURRENT_RANGE_READS) {
+        let scans = ranges
+            .iter()
+            .map(|range| scan(transaction, prefix, range, limits));
+        pages.extend(try_join_all(scans).await?);
+    }
+    Ok(pages)
 }
 
 fn validate_value(value: &[u8]) -> Result<()> {

@@ -838,6 +838,14 @@ mod tests {
         ) -> impl Future<Output = Result<ScanPage>> + Send {
             failing()
         }
+
+        fn batch_scan(
+            &mut self,
+            _ranges: Vec<KeyRange>,
+            _limits: ScanLimits,
+        ) -> impl Future<Output = Result<Vec<ScanPage>>> + Send {
+            failing()
+        }
     }
 
     impl ReadTxn for FailingTxn {}

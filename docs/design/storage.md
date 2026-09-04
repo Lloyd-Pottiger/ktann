@@ -8,7 +8,9 @@ logical key/value codecs, and typed atomic storage operations.
 ## 1. Backend contract
 
 `Backend` uses GAT transaction types and stable RPITIT futures. A ReadTxn offers
-snapshot `get`, same-order `batch_get`, and bounded forward `scan`. A WriteTxn
+snapshot `get`, same-order `batch_get`, bounded forward `scan`, and same-order
+multi-range `batch_scan` — one independently paginated page per range from one
+backend interaction. A WriteTxn
 adds `get_for_update`, `batch_get_for_update`, `put`, unique `insert`, `delete`,
 bounded `batch_mutate`, optional transactional `clear_range`, and consuming
 commit/rollback.
@@ -194,7 +196,8 @@ proof, such as index drop.
 Backend contract tests run unchanged against a deterministic test backend,
 FoundationDB, and RocksDB. They cover snapshot consistency, read-your-writes,
 conflicts, unique insertion, gap-free scan pagination across item and byte
-boundaries, empty ranges, oversized values, exact-boundary exhaustion, limits,
+boundaries, empty ranges, oversized values, exact-boundary exhaustion, batched
+multi-range scans with independent per-range pagination, limits,
 rollback, commit outcome, range-clear capability, and durability mappings.
 
 Codec tests use golden bytes, ordering properties, malformed/noncanonical input,

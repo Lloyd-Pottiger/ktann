@@ -9,7 +9,8 @@
 //! union of its body and its two persisted targets. The write path routes a
 //! whole batch at once: one grouped descent per Tree Key shares the Tree
 //! Manifest read and every visited internal partition's reads across all of
-//! the batch's records.
+//! the batch's records, and one level's Child Entry bodies are scanned in
+//! batched lockstep rounds rather than one serialized page stream per body.
 //!
 //! # Contract
 //!
@@ -78,7 +79,8 @@ use crate::storage::values::{
     expect_header,
 };
 use crate::storage::{
-    LogicalRange, LogicalReader, ReadLogicalTxn, WriteLogicalTxn, topology, tree_manifest,
+    LogicalRange, LogicalReader, LogicalScanCursor, ReadLogicalTxn, WriteLogicalTxn, topology,
+    tree_manifest,
 };
 
 /// The number of Child Entry candidates scanned per page during descent.
@@ -450,12 +452,10 @@ async fn descend<R: LogicalReader>(
             }
             Hop::Children { bodies, next_level } => {
                 let mut nearest = NearestChild::default();
-                for &(body, header) in &bodies {
-                    scan_children_with(reader, manifest, tree_key, body, header, &mut |entry| {
-                        nearest.consider(kernel, routing, entry, body)
-                    })
-                    .await?;
-                }
+                scan_bodies(reader, manifest, tree_key, &bodies, &mut |index, entry| {
+                    nearest.consider(kernel, routing, entry, bodies[index].0)
+                })
+                .await?;
                 let (child, owner) = nearest.finish()?;
                 parent = Some(owner);
                 partition = child;
@@ -633,6 +633,12 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
 
         let mut nearest = None;
         let mut child_level = None;
+        // Every Child Entry body the wave's resolved hops ask for, collected
+        // during resolution and then scanned in batched lockstep rounds, so
+        // one level's bodies share each backend round trip. `scan_members`
+        // holds the waiting beam members of one resolved hop per slot.
+        let mut scan_work: Vec<(usize, PartitionKey, PartitionHeader)> = Vec::new();
+        let mut scan_members: Vec<Vec<PendingBeamMember>> = Vec::new();
         // Read the complete current wave before doing any routing work. This
         // keeps authority reads proportional to tree depth, while the
         // transaction-local cache handles a partition revisited by a
@@ -735,7 +741,7 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                         return Err(Error::new(ErrorKind::Corruption));
                     }
                     child_level = Some(next_level);
-                    let nearest = nearest.get_or_insert_with(|| {
+                    nearest.get_or_insert_with(|| {
                         vec![
                             NearestChildren::new(
                                 usize::try_from(beam_width(write_beam_size, next_level))
@@ -744,36 +750,16 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                             routings.len()
                         ]
                     });
-                    // The nearest candidates are accumulated across every
-                    // current-level body. They are reduced to one global
-                    // beam per vector only after the whole wave is scanned.
-                    for &(body, header) in &bodies {
-                        scan_children_with(
-                            reader,
-                            manifest,
-                            tree_key,
-                            body,
-                            header,
-                            &mut |entry| {
-                                if incoming_owners
-                                    .insert(entry.child(), body)
-                                    .is_some_and(|owner| owner != body)
-                                {
-                                    return Err(Error::new(ErrorKind::Corruption));
-                                }
-                                for member in &members {
-                                    nearest[member.member].consider(
-                                        kernel,
-                                        routings[member.member],
-                                        entry,
-                                        body,
-                                    )?;
-                                }
-                                Ok(())
-                            },
-                        )
-                        .await?;
-                    }
+                    // Scanning is deferred until the wave is fully resolved;
+                    // the nearest candidates are then accumulated across every
+                    // collected body of the level in batched lockstep rounds.
+                    let slot = scan_members.len();
+                    scan_members.push(members);
+                    scan_work.extend(
+                        bodies
+                            .into_iter()
+                            .map(|(body, header)| (slot, body, header)),
+                    );
                     debug_assert!(
                         expected_level.is_none_or(|level| level > next_level),
                         "child level must descend"
@@ -821,6 +807,38 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                     }
                 }
             }
+        }
+
+        // The wave's hops are resolved; now every collected Child Entry body
+        // is scanned in batched lockstep rounds, feeding the shared per-vector
+        // beams and the dual-ownership check exactly as a sequential scan did.
+        if !scan_work.is_empty() {
+            let nearest = nearest
+                .as_mut()
+                .ok_or_else(|| Error::new(ErrorKind::Backend))?;
+            let bodies: Vec<(PartitionKey, PartitionHeader)> = scan_work
+                .iter()
+                .map(|(_, body, header)| (*body, *header))
+                .collect();
+            scan_bodies(reader, manifest, tree_key, &bodies, &mut |index, entry| {
+                let (slot, body, _) = scan_work[index];
+                if incoming_owners
+                    .insert(entry.child(), body)
+                    .is_some_and(|owner| owner != body)
+                {
+                    return Err(Error::new(ErrorKind::Corruption));
+                }
+                for member in &scan_members[slot] {
+                    nearest[member.member].consider(
+                        kernel,
+                        routings[member.member],
+                        entry,
+                        body,
+                    )?;
+                }
+                Ok(())
+            })
+            .await?;
         }
 
         // Child candidates from this wave become the next wave only after the
@@ -1229,38 +1247,71 @@ async fn split_family_bodies<R: LogicalReader>(
     Ok(bodies)
 }
 
-/// Scans one internal body's complete Child Entry set in bounded pages,
-/// visiting each entry by reference without materializing it.
+/// Scans every listed body's complete Child Entry set in batched lockstep
+/// rounds, visiting each entry by reference with its body's index in `bodies`.
 ///
-/// The Header count is exact in every committed state, so the scan must see
+/// One round reads the current page of every unfinished body in a single
+/// `batch_scan`, so a group of bodies costs the largest body's page count in
+/// backend round trips instead of the sum of every body's pages. The Header
+/// count is exact in every committed state, so each body's scan must see
 /// precisely that many Child Entries; any mismatch is Corruption. An empty
 /// result is legal only for a not-yet-filled split target or a fully drained
 /// source.
-async fn scan_children_with<R: LogicalReader>(
+async fn scan_bodies<R: LogicalReader>(
     reader: &mut R,
     manifest: &IndexManifest,
     tree_key: &TreeKey,
-    partition: PartitionKey,
-    header: PartitionHeader,
-    visit: &mut impl FnMut(&ChildEntry) -> Result<()>,
+    bodies: &[(PartitionKey, PartitionHeader)],
+    visit: &mut impl FnMut(usize, &ChildEntry) -> Result<()>,
 ) -> Result<()> {
-    let range = LogicalRange::child_entries(manifest, tree_key, partition)?;
+    /// One body's in-progress scan: its exact range, continuation, and the
+    /// number of Child Entries seen so far.
+    struct BodyScan {
+        range: LogicalRange,
+        cursor: Option<LogicalScanCursor>,
+        seen: usize,
+        done: bool,
+    }
+
     let limits = child_scan_limits(manifest.config().dimension())?;
-    let mut seen = 0_usize;
-    let mut cursor = None;
+    let mut scans = bodies
+        .iter()
+        .map(|(partition, _)| {
+            Ok(BodyScan {
+                range: LogicalRange::child_entries(manifest, tree_key, *partition)?,
+                cursor: None,
+                seen: 0,
+                done: false,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     loop {
-        let page = reader.scan(&range, cursor.as_ref(), limits).await?;
-        for item in page.items() {
-            visit(expect_child_entry_ref(item.value())?)?;
-            seen += 1;
+        let mut active = Vec::new();
+        let mut legs = Vec::new();
+        for (index, scan) in scans.iter().enumerate() {
+            if !scan.done {
+                active.push(index);
+                legs.push((&scan.range, scan.cursor.as_ref()));
+            }
         }
-        cursor = page.into_next_cursor();
-        if cursor.is_none() {
+        if active.is_empty() {
             break;
         }
+        let pages = reader.batch_scan(&legs, limits).await?;
+        for (index, page) in active.into_iter().zip(pages) {
+            let scan = &mut scans[index];
+            for item in page.items() {
+                visit(index, expect_child_entry_ref(item.value())?)?;
+                scan.seen += 1;
+            }
+            scan.cursor = page.into_next_cursor();
+            scan.done = scan.cursor.is_none();
+        }
     }
-    if seen != header.entry_count() as usize {
-        return Err(Error::new(ErrorKind::Corruption));
+    for (scan, (_, header)) in scans.iter().zip(bodies) {
+        if scan.seen != header.entry_count() as usize {
+            return Err(Error::new(ErrorKind::Corruption));
+        }
     }
     Ok(())
 }

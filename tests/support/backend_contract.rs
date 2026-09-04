@@ -137,6 +137,7 @@ const SEED_UNKNOWN_NOT_APPLIED: u64 = 13;
 const SEED_DURABILITY: u64 = 14;
 const SEED_SCAN_NO_SKIP: u64 = 15;
 const SEED_SCAN_EMPTY: u64 = 16;
+const SEED_BATCH_SCAN: u64 = 17;
 
 /// Runs every applicable contract case against `harness`.
 ///
@@ -192,6 +193,9 @@ pub async fn run_suite<H: BackendHarness>(harness: &H) {
 
     let ctx = CaseContext::new("scan_empty_range", SEED_SCAN_EMPTY);
     case_scan_empty_range(harness, &ctx).await;
+
+    let ctx = CaseContext::new("batch_scan", SEED_BATCH_SCAN);
+    case_batch_scan(harness, &ctx).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -724,6 +728,161 @@ async fn case_scan_empty_range<H: BackendHarness>(harness: &H, ctx: &CaseContext
         .expect("empty gap scan");
     check_count(ctx, "keyless range is empty", gap.items().len(), 0);
     check_true(ctx, "keyless range is terminal", gap.is_terminal());
+}
+
+/// A batched scan returns one independently paginated page per input range,
+/// preserving input order, duplicates, and empty or inverted ranges.
+async fn case_batch_scan<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
+    let backend = harness.backend();
+    {
+        let mut txn = backend.begin_write().await.expect("begin seed");
+        txn.put(case_key(ctx, "a/1"), value(b"1"))
+            .await
+            .expect("put a1");
+        txn.put(case_key(ctx, "a/2"), value(b"22"))
+            .await
+            .expect("put a2");
+        txn.put(case_key(ctx, "a/3"), value(b"333"))
+            .await
+            .expect("put a3");
+        txn.put(case_key(ctx, "b/1"), value(b"x"))
+            .await
+            .expect("put b1");
+        txn.put(case_key(ctx, "b/2"), value(b"yy"))
+            .await
+            .expect("put b2");
+        txn.put(case_key(ctx, "big/k"), Bytes::from(vec![0x7f; 64]))
+            .await
+            .expect("put big");
+        txn.commit().await.expect("commit seed");
+    }
+
+    let range_a = case_subrange(ctx, "a/");
+    let range_b = case_subrange(ctx, "b/");
+    let limits = ScanLimits {
+        item_limit: 2,
+        byte_limit: 1_024,
+    };
+
+    let mut txn = backend.begin_read().await.expect("begin read");
+
+    // An empty input succeeds with an empty result.
+    let none = txn
+        .batch_scan(Vec::new(), limits)
+        .await
+        .expect("empty batch scan");
+    check_count(ctx, "empty batch page count", none.len(), 0);
+
+    let inverted = KeyRange::new(case_key(ctx, "b/2").to_vec(), case_key(ctx, "b/1").to_vec());
+    let pages = txn
+        .batch_scan(
+            vec![range_a.clone(), range_b.clone(), inverted, range_a.clone()],
+            limits,
+        )
+        .await
+        .expect("batch scan");
+    check_count(ctx, "one page per input range", pages.len(), 4);
+
+    // Range A paginates independently at the item limit.
+    check_count(ctx, "range a first page count", pages[0].items().len(), 2);
+    check_true(
+        ctx,
+        "range a page order",
+        pages[0].items()[0].key().as_ref() == case_key(ctx, "a/1").as_ref()
+            && pages[0].items()[1].key().as_ref() == case_key(ctx, "a/2").as_ref(),
+    );
+    let mut expected_next = case_key(ctx, "a/2").to_vec();
+    expected_next.push(0x00);
+    check_true(
+        ctx,
+        "range a cursor is the byte-successor of its last key",
+        pages[0]
+            .next_start()
+            .is_some_and(|next| next.as_ref() == expected_next.as_slice()),
+    );
+
+    // Range B exhausts in one terminal page.
+    check_count(ctx, "range b page count", pages[1].items().len(), 2);
+    check_true(ctx, "range b page is terminal", pages[1].is_terminal());
+
+    // The inverted range is a terminal empty page at its own position.
+    check_count(ctx, "inverted range page count", pages[2].items().len(), 0);
+    check_true(
+        ctx,
+        "inverted range page is terminal",
+        pages[2].is_terminal(),
+    );
+
+    // A repeated range is read independently and returns the same page.
+    check_true(ctx, "duplicate range repeats", pages[3] == pages[0]);
+
+    // Resuming range A in a later batch skips no key and repeats none.
+    let resume = KeyRange::new(expected_next, range_a.end().to_vec());
+    let pages = txn
+        .batch_scan(vec![resume], limits)
+        .await
+        .expect("resumed batch scan");
+    check_count(ctx, "resumed page count", pages[0].items().len(), 1);
+    check_present(
+        ctx,
+        "resumed value",
+        Some(pages[0].items()[0].value().as_ref()),
+        b"333",
+    );
+    check_true(ctx, "resumed page is terminal", pages[0].is_terminal());
+
+    // A single oversized first item is returned alone even past the byte
+    // limit.
+    let pages = txn
+        .batch_scan(
+            vec![case_subrange(ctx, "big/")],
+            ScanLimits {
+                item_limit: 8,
+                byte_limit: 48,
+            },
+        )
+        .await
+        .expect("oversized batch scan");
+    check_count(ctx, "oversized first item alone", pages[0].items().len(), 1);
+    check_true(ctx, "oversized page is terminal", pages[0].is_terminal());
+
+    // A zero limit is invalid before any work.
+    let error = txn
+        .batch_scan(
+            vec![range_a.clone()],
+            ScanLimits {
+                item_limit: 0,
+                byte_limit: 1,
+            },
+        )
+        .await
+        .expect_err("zero item limit");
+    check_kind(
+        ctx,
+        "zero batch scan limit is invalid",
+        error.kind(),
+        ErrorKind::InvalidArgument,
+    );
+    drop(txn);
+
+    // A write transaction's batched scan reads its own staged writes.
+    let mut txn = backend.begin_write().await.expect("begin write");
+    txn.put(case_key(ctx, "c/1"), value(b"staged"))
+        .await
+        .expect("put staged");
+    let pages = txn
+        .batch_scan(vec![case_subrange(ctx, "c/"), range_b], limits)
+        .await
+        .expect("write batch scan");
+    check_count(ctx, "staged range count", pages[0].items().len(), 1);
+    check_present(
+        ctx,
+        "staged value is visible",
+        Some(pages[0].items()[0].value().as_ref()),
+        b"staged",
+    );
+    check_count(ctx, "committed range count", pages[1].items().len(), 2);
+    txn.rollback().await;
 }
 
 /// Unique insertion distinguishes inserted from existing and conflicts on

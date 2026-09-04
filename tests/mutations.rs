@@ -1109,6 +1109,96 @@ async fn deepen_tree(backend: &SharedBackend, manifest: &IndexManifest, bucket: 
     txn.commit().await.expect("commit deep topology");
 }
 
+/// Widens the seeded three-level tree so each level-two body holds 130 Child
+/// Entries: at dimension 1 the 64-item scan page splits each body into three
+/// backend pages, so a two-body wave distinguishes batched lockstep rounds
+/// from serialized per-body page reads. Only the leaves the write beam can
+/// select are seeded as write-accepting; the remaining children exist as
+/// edges only.
+async fn widen_tree(backend: &SharedBackend, manifest: &IndexManifest, bucket: i64) {
+    const BODY_CHILDREN: u64 = 130;
+    let key = tree_key(bucket);
+    let index = manifest.logical_index_id();
+    let pk = |value: u64| PartitionKey::new(value).expect("valid partition key");
+    let raw = backend.begin_write().await.expect("begin write");
+    let mut txn = WriteLogicalTxn::for_index(
+        raw,
+        manifest,
+        backend.hard_limits(),
+        backend.admission_budget(),
+    )
+    .expect("bind index");
+    let header = |partition, level, count| {
+        (
+            LogicalKey::Header {
+                index,
+                tree_key: key.clone(),
+                partition,
+            },
+            PersistentValue::PartitionHeader(
+                PartitionHeader::new(level, count, 0, PartitionState::Ready).expect("header"),
+            ),
+        )
+    };
+    let state = |partition| {
+        (
+            LogicalKey::State {
+                index,
+                tree_key: key.clone(),
+                partition,
+            },
+            PersistentValue::PartitionState(PartitionTransition::Ready {
+                started_at_unix_millis: 0,
+            }),
+        )
+    };
+    let synopsis = |partition| {
+        (
+            LogicalKey::Synopsis {
+                index,
+                tree_key: key.clone(),
+                partition,
+            },
+            PersistentValue::PartitionSynopsis(PartitionSynopsis::empty(manifest)),
+        )
+    };
+    let edge = |parent, child, centroid| {
+        (
+            LogicalKey::ChildEntry {
+                index,
+                tree_key: key.clone(),
+                partition: parent,
+                child,
+            },
+            PersistentValue::ChildEntry(ChildEntry::new(child, vec![centroid])),
+        )
+    };
+    let mut entries = vec![
+        header(pk(1), 3, 2),
+        header(pk(2), 2, BODY_CHILDREN as u32),
+        header(pk(3), 2, BODY_CHILDREN as u32),
+        edge(pk(1), pk(2), 0.0),
+        edge(pk(1), pk(3), 1_000.0),
+    ];
+    for i in 0..BODY_CHILDREN {
+        entries.push(edge(pk(2), pk(100 + i), i as f32));
+        entries.push(edge(pk(3), pk(300 + i), 1_000.0 + i as f32));
+    }
+    // The inserted records can only select the nearest leaves at either end;
+    // those need the full write-accepting seed.
+    for i in 0..=8_u64 {
+        for leaf in [pk(100 + i), pk(300 + i)] {
+            entries.push(header(leaf, 1, 0));
+            entries.push(state(leaf));
+            entries.push(synopsis(leaf));
+        }
+    }
+    for (key, value) in entries {
+        txn.put(key, value).await.expect("widen topology");
+    }
+    txn.commit().await.expect("commit widened topology");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn batched_inserts_share_routing_and_apply_writes_once() {
     let backend = backend(DeterministicConfig::default());
@@ -1143,10 +1233,12 @@ async fn batched_inserts_share_routing_and_apply_writes_once() {
     let counts = backend.inner.operation_counts();
     // One grouped descent for the whole batch: one Tree Manifest read, one
     // root authority read, one batched authority (Header+State) read for both
-    // leaves, and one Child Entry scan, independent of the batch size.
+    // leaves, and one batched Child Entry scan round, independent of the
+    // batch size.
     assert_eq!(counts.get, 1, "plain reads: {counts:?}");
     assert_eq!(counts.batch_get, 2, "batched authority reads: {counts:?}");
-    assert_eq!(counts.scan, 1, "scans: {counts:?}");
+    assert_eq!(counts.scan, 0, "standalone scans: {counts:?}");
+    assert_eq!(counts.batch_scan, 1, "batched scan rounds: {counts:?}");
     // Every record-group write lands through the single deferred apply; the
     // only remaining write calls are the per-item Header/Synopsis updates.
     assert_eq!(counts.insert, 0, "unique inserts: {counts:?}");
@@ -1230,7 +1322,58 @@ async fn batched_routing_reads_authority_once_per_tree_level() {
     // candidates as three authority waves. Before batching, the middle wave
     // issued one authority batch per internal partition.
     assert_eq!(counts.batch_get, 3, "authority waves: {counts:?}");
+    // Each internal level's Child Entry bodies are scanned in batched
+    // lockstep rounds: the root wave and the two-body level-two wave each
+    // cost one batched scan instead of one serialized scan per body.
+    assert_eq!(counts.scan, 0, "standalone scans: {counts:?}");
+    assert_eq!(counts.batch_scan, 2, "lockstep scan rounds: {counts:?}");
     for i in 0..16_u8 {
+        assert!(
+            index
+                .get(rid(i), GetOptions::default())
+                .await
+                .expect("get")
+                .is_some()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batched_routing_scans_wide_bodies_in_lockstep() {
+    let backend = backend(DeterministicConfig::default());
+    // Exact backend operation counts are incompatible with background fixup
+    // workers; this test drives no maintenance, so it runs workerless.
+    let runtime = Runtime::new(backend.clone(), support::manual_maintenance_config())
+        .expect("runtime is valid");
+    let index = runtime
+        .create_index("wide-batched", config_1d())
+        .await
+        .expect("create index");
+    let manifest = read_manifest(&backend, index.logical_index_id()).await;
+    seed_grown_tree(&backend, &manifest, 1).await;
+    widen_tree(&backend, &manifest, 1).await;
+
+    backend.inner.reset_operation_counts();
+    index
+        .batch_mutate(
+            [0.0_f32, 1.0, 2.0, 3.0, 1_000.0, 1_001.0, 1_002.0, 1_003.0]
+                .iter()
+                .enumerate()
+                .map(|(i, &x)| Mutation::Insert(record_1d(&rid(i as u8), x, 1)))
+                .collect(),
+        )
+        .await
+        .expect("batch insert");
+
+    let counts = backend.inner.operation_counts();
+    // The root wave scans its one two-child body in a single round. Both
+    // level-two bodies hold 130 Child Entries — three 64-item pages each —
+    // and their wave completes in three lockstep rounds, one batched scan
+    // each, instead of six serialized page reads.
+    assert_eq!(counts.scan, 0, "standalone scans: {counts:?}");
+    assert_eq!(counts.batch_scan, 4, "lockstep scan rounds: {counts:?}");
+
+    for i in 0..8_u8 {
         assert!(
             index
                 .get(rid(i), GetOptions::default())
