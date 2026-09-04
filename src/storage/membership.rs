@@ -377,6 +377,132 @@ fn classify_location_pair(
     }
 }
 
+/// One batch item's membership read set to warm before the apply loop.
+///
+/// Each set mirrors exactly what the corresponding membership operation —
+/// [`insert_record_with_header`], [`replace_record_with_headers`], or
+/// [`delete_record_with_header`] — reads with update protection.
+pub(crate) enum MembershipPrefetch<'a> {
+    /// An insert's existence checks: the Record, the Location, the Opaque
+    /// Payload when the record carries one, and the Leaf Entry at the routed
+    /// target.
+    Insert {
+        id: &'a Bytes,
+        payload: bool,
+        target: &'a RecordLocation,
+    },
+    /// A replacement's reads: the stored Record and Location, the target Leaf
+    /// Entry, and the source Leaf Entry when the move crosses leaves.
+    Replace {
+        id: &'a Bytes,
+        expected: &'a RecordLocation,
+        target: &'a RecordLocation,
+    },
+    /// A delete's Record and Location. The Leaf Entry key follows from the
+    /// stored Location, so it warms in a second wave.
+    Delete { id: &'a Bytes },
+}
+
+/// The chunk bound for batched membership warming reads. One chunk matches
+/// the production adapters' internal point-read batch, so a logical batch
+/// never re-chunks below the adapter, and stays well under every backend's
+/// batch limit regardless of the caller's batch size.
+const MEMBERSHIP_READ_CHUNK: usize = 1_024;
+
+/// Warms the transaction-local read cache with every item's membership read
+/// set in bounded update-protected batches.
+///
+/// The per-item membership operations re-read exactly these keys through the
+/// checked typed path when they apply; served from the warmed cache, they
+/// cost no backend round trip per record. The batched reads establish the
+/// per-key conflicts the per-item reads rely on; a delete of an absent record
+/// additionally protects its (necessarily absent) Location, which exact
+/// membership only ever writes together with the already-protected Record.
+///
+/// This is an optimization only: it validates nothing and never fails. A key
+/// left unwarmed by a failed batch — raw values fetched before the failure
+/// stay cached — is re-read by the item's own checked path, which reproduces
+/// the error with the item's input position attached.
+pub(crate) async fn prefetch_membership_for_update<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    items: &[MembershipPrefetch<'_>],
+) {
+    let Some(index) = txn.bound_manifest().map(IndexManifest::logical_index_id) else {
+        return;
+    };
+    let mut keys = Vec::new();
+    for item in items {
+        match *item {
+            MembershipPrefetch::Insert {
+                id,
+                payload,
+                target,
+            } => {
+                keys.push(record_key(index, id));
+                keys.push(location_key(index, id));
+                if payload {
+                    keys.push(payload_key(index, id));
+                }
+                keys.push(entry_key(index, target, id));
+            }
+            MembershipPrefetch::Replace {
+                id,
+                expected,
+                target,
+            } => {
+                keys.push(record_key(index, id));
+                keys.push(location_key(index, id));
+                keys.push(entry_key(index, target, id));
+                if expected != target {
+                    keys.push(entry_key(index, expected, id));
+                }
+            }
+            MembershipPrefetch::Delete { id } => {
+                keys.push(record_key(index, id));
+                keys.push(location_key(index, id));
+            }
+        }
+    }
+    if !read_chunks_for_update(txn, keys).await {
+        return;
+    }
+    // A delete's Leaf Entry key follows from its stored Location, so it warms
+    // in a second wave; the Record and Location re-reads here are cache hits
+    // from the first wave. An absent record or a half-present pair defers to
+    // the checked delete path, which reports it with the item's position.
+    let mut entry_keys = Vec::new();
+    for item in items {
+        let &MembershipPrefetch::Delete { id } = item else {
+            continue;
+        };
+        let record = txn.get_for_update(record_key(index, id)).await;
+        let location = txn.get_for_update(location_key(index, id)).await;
+        let (Ok(record), Ok(location)) = (record, location) else {
+            continue;
+        };
+        let (Ok(Some(_)), Ok(Some(location))) = (expect_record(record), expect_location(location))
+        else {
+            continue;
+        };
+        entry_keys.push(entry_key(index, &location, id));
+    }
+    read_chunks_for_update(txn, entry_keys).await;
+}
+
+/// Reads `keys` in bounded update-protected batches, returning false when a
+/// batch fails and the remaining keys are left unwarmed.
+async fn read_chunks_for_update<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    keys: Vec<LogicalKey>,
+) -> bool {
+    for chunk in keys.chunks(MEMBERSHIP_READ_CHUNK) {
+        if txn.batch_get_for_update(chunk.to_vec()).await.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
 /// Validates caller identity agreement and returns the bound Manifest.
 fn validated_input<'manifest, T>(
     txn: &WriteLogicalTxn<'manifest, T>,

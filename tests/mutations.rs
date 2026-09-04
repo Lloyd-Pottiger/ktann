@@ -1154,12 +1154,22 @@ async fn batched_inserts_share_routing_and_apply_writes_once() {
         counts.batch_mutate <= 2 * N + 1,
         "batch_mutate calls: {counts:?}"
     );
-    // Update-protected reads: one Manifest validation, one Header+edge pair
-    // per distinct leaf, and bounded per-item authoritative reads; the
-    // transaction-local cache serves every repeat.
-    assert!(
-        counts.get_for_update <= 5 * N + 5,
-        "get_for_update calls: {counts:?}"
+    // Update-protected point reads no longer scale with the batch: one
+    // Manifest validation plus the first Synopsis read of each distinct
+    // leaf. The leaf Headers were already warmed by the route validation's
+    // batched read, and the per-record membership checks by the prefetch;
+    // both re-read from the transaction-local cache.
+    assert_eq!(
+        counts.get_for_update, 3,
+        "point reads independent of N: {counts:?}"
+    );
+    // One batched update-protected read validates the routed leaves' Headers
+    // and incoming edges, and one prefetches every record's Record, Location,
+    // and Leaf Entry keys; before prefetching, each record issued its three
+    // existence checks as separate point reads.
+    assert_eq!(
+        counts.batch_get_for_update, 2,
+        "batched update reads: {counts:?}"
     );
 
     // Functional outcome: all 40 records split across the two leaves.
@@ -1261,10 +1271,11 @@ async fn batched_upserts_read_locations_in_one_call() {
     );
 
     // One batched update-protected read decides insert versus replace for the
-    // whole batch, and a second one validates every distinct routed leaf; the
-    // membership operations re-read from the transaction-local cache.
+    // whole batch, a second warms every item's Leaf Entry read, and a third
+    // validates every distinct routed leaf; the membership operations re-read
+    // from the transaction-local cache.
     let counts = backend.inner.operation_counts();
-    assert_eq!(counts.batch_get_for_update, 2, "batched reads: {counts:?}");
+    assert_eq!(counts.batch_get_for_update, 3, "batched reads: {counts:?}");
 
     for i in 0..N as u8 {
         let stored = index
@@ -1273,5 +1284,60 @@ async fn batched_upserts_read_locations_in_one_call() {
             .expect("get")
             .expect("record exists");
         assert_eq!(stored.vector(), &[2.0]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batched_deletes_read_membership_in_bounded_calls() {
+    let backend = backend(DeterministicConfig::default());
+    // Exact backend operation counts are incompatible with background fixup
+    // workers; this test drives no maintenance, so it runs workerless.
+    let runtime = Runtime::new(backend.clone(), support::manual_maintenance_config())
+        .expect("runtime is valid");
+    let index = runtime
+        .create_index("batched-delete", config_1d())
+        .await
+        .expect("create index");
+
+    const N: usize = 20;
+    index
+        .batch_mutate(
+            (0..N as u8)
+                .map(|i| Mutation::Insert(record_1d(&rid(i), 1.0, 1)))
+                .collect(),
+        )
+        .await
+        .expect("seed inserts");
+
+    backend.inner.reset_operation_counts();
+    let outcomes = index
+        .batch_mutate(
+            (0..N as u8)
+                .map(|i| Mutation::Delete(rid(i)))
+                .chain(std::iter::once(Mutation::Delete(rid(250))))
+                .collect(),
+        )
+        .await
+        .expect("batch delete");
+    assert_eq!(
+        outcomes,
+        vec![MutationOutcome::Deleted { existed: true }; N]
+            .into_iter()
+            .chain(std::iter::once(MutationOutcome::Deleted { existed: false }))
+            .collect::<Vec<_>>()
+    );
+
+    let counts = backend.inner.operation_counts();
+    // One prefetch batch warms every Record/Location pair and a second warms
+    // the Leaf Entries of the records that exist (the absent Record ID
+    // contributes no entry key); the per-item delete checks are then cache
+    // hits. Before prefetching, each delete issued its three reads as
+    // separate point reads.
+    assert_eq!(counts.batch_get_for_update, 2, "batched reads: {counts:?}");
+    // The only remaining point reads are the Manifest validation and the
+    // first Header read of the single leaf.
+    assert_eq!(counts.get_for_update, 2, "point reads: {counts:?}");
+    for i in 0..N as u8 {
+        assert_record_absent(&index, &rid(i)).await;
     }
 }

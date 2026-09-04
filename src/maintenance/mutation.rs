@@ -25,6 +25,10 @@
 //! - **Writes.** Every item queues its record-group writes into one shared
 //!   builder applied once in canonical key order; exact Header counts and
 //!   Synopsis expansions still apply per item so later items observe them.
+//!   One bounded update-protected prefetch warms every item's membership
+//!   read set before the loop, so the per-item checked re-reads are served
+//!   by the transaction-local cache instead of one backend round trip per
+//!   record.
 //! - **Retry.** A definite backend abort anywhere in an attempt discards
 //!   every route and replays the complete operation from a fresh snapshot
 //!   under the bounded contention policy; exhaustion returns
@@ -144,12 +148,13 @@ enum ApplyOutcome {
 
 /// Applies every mutation in input order inside the attempt transaction.
 ///
-/// Routing and the upsert membership reads are batched across the whole
-/// operation first — one grouped descent per distinct Tree Key, one batched
-/// update-protected read of every upsert's authoritative Record Location. The
-/// membership operations then apply in input order and queue their
-/// record-group writes into one builder, which is applied once in canonical
-/// key order at the end.
+/// Routing and the membership reads are batched across the whole operation
+/// first — one grouped descent per distinct Tree Key, one batched
+/// update-protected read of every upsert's authoritative Record Location, and
+/// one bounded prefetch of every item's remaining membership read set. The
+/// membership operations then apply in input order, re-reading the warmed
+/// keys from the transaction-local cache, and queue their record-group writes
+/// into one builder, which is applied once in canonical key order at the end.
 async fn apply_all<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     kernel: &VectorKernel,
@@ -170,6 +175,7 @@ async fn apply_all<T: WriteTxn>(
             RouteAll::NoReadyMergeTarget => return Ok(ApplyOutcome::NoReadyMergeTarget),
         };
     let expected = read_locations(txn, mutations).await?;
+    prefetch_membership(txn, mutations, prepared, &targets, &expected).await;
     let mut deferred = txn.mutations();
     let mut outcomes = Vec::with_capacity(mutations.len());
     let mut changed_headers = BTreeMap::new();
@@ -333,6 +339,63 @@ async fn read_locations<T: WriteTxn>(
         expected[position] = location;
     }
     Ok(expected)
+}
+
+/// Warms the transaction-local read cache with every item's membership read
+/// set, so the per-item membership operations re-read from the cache instead
+/// of issuing one backend round trip per record.
+///
+/// The read sets derive from the routed targets and the upsert location
+/// reads, so the prefetch runs between them and the apply loop. Warming is
+/// advisory and validates nothing: a key left unwarmed is re-read by the
+/// item's own checked path, which reports any failure with the item's input
+/// position.
+async fn prefetch_membership<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    mutations: &[Mutation],
+    prepared: &[Option<PreparedRecord>],
+    targets: &[Option<RecordLocation>],
+    expected: &[Option<RecordLocation>],
+) {
+    let mut items = Vec::with_capacity(mutations.len());
+    for (position, mutation) in mutations.iter().enumerate() {
+        let item = match mutation {
+            Mutation::Insert(record) => {
+                let Some(target) = targets[position].as_ref() else {
+                    continue;
+                };
+                membership::MembershipPrefetch::Insert {
+                    id: record.id(),
+                    payload: prepared[position]
+                        .as_ref()
+                        .is_some_and(|prepared| prepared.payload.is_some()),
+                    target,
+                }
+            }
+            Mutation::Upsert(record) => {
+                let Some(target) = targets[position].as_ref() else {
+                    continue;
+                };
+                match expected[position].as_ref() {
+                    Some(expected) => membership::MembershipPrefetch::Replace {
+                        id: record.id(),
+                        expected,
+                        target,
+                    },
+                    None => membership::MembershipPrefetch::Insert {
+                        id: record.id(),
+                        payload: prepared[position]
+                            .as_ref()
+                            .is_some_and(|prepared| prepared.payload.is_some()),
+                        target,
+                    },
+                }
+            }
+            Mutation::Delete(id) => membership::MembershipPrefetch::Delete { id },
+        };
+        items.push(item);
+    }
+    membership::prefetch_membership_for_update(txn, &items).await;
 }
 
 /// Applies one mutation item inside the attempt transaction, queueing
