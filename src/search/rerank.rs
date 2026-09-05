@@ -260,17 +260,16 @@ pub(crate) async fn exact_rerank<T: ReadOps>(
 #[cfg(test)]
 mod tests {
     use std::cmp::Ordering;
-    use std::collections::BTreeMap;
 
     use bytes::Bytes;
 
     use crate::api::{
-        CompareOp, DataType, Error, ErrorKind, FieldId, FieldSchema, IndexConfig, LogicalIndexId,
-        Metric, PartitionKey, Predicate, Result, Value,
+        CompareOp, DataType, ErrorKind, FieldId, FieldSchema, IndexConfig, LogicalIndexId, Metric,
+        PartitionKey, Predicate, Result, Value,
     };
     use crate::storage::ReadLogicalTxn;
-    use crate::storage::backend::{ReadOps, ScanLimits, ScanPage};
-    use crate::storage::keys::{self, KeyRange, TreeKey};
+    use crate::storage::keys::{self, TreeKey};
+    use crate::storage::test_support::MockReadTxn;
     use crate::storage::values::{
         BloomParameters, IndexLifecycle, IndexManifest, PersistentValue, RecordLocation,
         ValueCodec, VectorRecord,
@@ -424,49 +423,10 @@ mod tests {
             .collect()
     }
 
-    /// A snapshot read mock with a configurable backend batch ceiling.
-    struct MockReadTxn {
-        data: BTreeMap<Vec<u8>, Vec<u8>>,
-        max_batch_size: usize,
-    }
-
-    impl MockReadTxn {
-        fn new(items: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
-            Self {
-                data: items.into_iter().collect(),
-                max_batch_size: 10_000,
-            }
-        }
-    }
-
-    impl ReadOps for MockReadTxn {
-        async fn get(&mut self, key: Bytes) -> Result<Option<Bytes>> {
-            Ok(self.data.get(key.as_ref()).cloned().map(Bytes::from))
-        }
-
-        async fn batch_get(&mut self, keys: Vec<Bytes>) -> Result<Vec<Option<Bytes>>> {
-            if keys.len() > self.max_batch_size {
-                return Err(Error::new(ErrorKind::LimitExceeded));
-            }
-            Ok(keys
-                .iter()
-                .map(|key| self.data.get(key.as_ref()).cloned().map(Bytes::from))
-                .collect())
-        }
-
-        async fn scan(&mut self, _range: &KeyRange, _limits: ScanLimits) -> Result<ScanPage> {
-            // The rerank stage only point-reads record groups; it never scans.
-            Err(Error::new(ErrorKind::Backend))
-        }
-
-        async fn batch_scan(
-            &mut self,
-            _ranges: &[KeyRange],
-            _limits: ScanLimits,
-        ) -> Result<Vec<ScanPage>> {
-            // The rerank stage only point-reads record groups; it never scans.
-            Err(Error::new(ErrorKind::Backend))
-        }
+    /// A rerank fixture mock: the rerank stage only point-reads record groups;
+    /// it never scans.
+    fn mock_txn(items: Vec<(Vec<u8>, Vec<u8>)>) -> MockReadTxn {
+        MockReadTxn::new(items).with_failing_scans()
     }
 
     async fn rerank(
@@ -605,15 +565,9 @@ mod tests {
             let manifest = manifest(metric);
             let data = record_group_data(&manifest, &records);
             let budget = records.len() as u32;
-            let outcome = rerank(
-                &manifest,
-                MockReadTxn::new(data),
-                candidates(&records),
-                5,
-                budget,
-            )
-            .await
-            .expect("rerank succeeds");
+            let outcome = rerank(&manifest, mock_txn(data), candidates(&records), 5, budget)
+                .await
+                .expect("rerank succeeds");
             let expected = oracle_topk(metric, &records.iter().collect::<Vec<_>>(), 5);
             assert_hits(&outcome, &expected);
             assert_eq!(outcome.exact_rerank_candidates(), budget);
@@ -672,7 +626,7 @@ mod tests {
                 assert_eq!(visited, records.len() as u32);
                 let budget = filtered.len() as u32;
                 let data = record_group_data(&manifest, &records);
-                let outcome = rerank(&manifest, MockReadTxn::new(data), filtered, 4, budget)
+                let outcome = rerank(&manifest, mock_txn(data), filtered, 4, budget)
                     .await
                     .expect("rerank succeeds");
                 let qualifying: Vec<&TestRecord> = records.iter().filter(|r| oracle(r)).collect();
@@ -794,7 +748,7 @@ mod tests {
         let records = fixture_records(24);
         let outcome = rerank(
             &manifest,
-            MockReadTxn::new(vec![]),
+            mock_txn(vec![]),
             vec![candidate(&records[0], 0.0)],
             1,
             1,
@@ -818,7 +772,7 @@ mod tests {
         ];
         let outcome = rerank(
             &manifest,
-            MockReadTxn::new(data),
+            mock_txn(data),
             vec![candidate(&records[0], 0.0)],
             1,
             1,
@@ -838,7 +792,7 @@ mod tests {
         ];
         let outcome = rerank(
             &manifest,
-            MockReadTxn::new(data),
+            mock_txn(data),
             vec![candidate(&records[1], 0.0)],
             1,
             1,
@@ -857,7 +811,7 @@ mod tests {
         let data = record_group_data(&manifest, &records[..1]);
         let outcome = rerank(
             &manifest,
-            MockReadTxn::new(data),
+            mock_txn(data),
             vec![candidate(&records[0], 0.0), candidate(&records[0], 1.0)],
             2,
             2,
@@ -883,7 +837,7 @@ mod tests {
             test_approximate_distance(0.0),
             RecordLocation::new(tree_key(divergent.bucket), leaf(1)),
         );
-        let outcome = rerank(&manifest, MockReadTxn::new(data), vec![candidate], 1, 1).await;
+        let outcome = rerank(&manifest, mock_txn(data), vec![candidate], 1, 1).await;
         assert_eq!(
             outcome.err().map(|error| error.kind()),
             Some(ErrorKind::Corruption)
@@ -908,7 +862,7 @@ mod tests {
         let data = vec![(key, value), location_item(&manifest, &records[0], 1)];
         let outcome = rerank(
             &manifest,
-            MockReadTxn::new(data),
+            mock_txn(data),
             vec![candidate(&records[0], 0.0)],
             1,
             1,
@@ -925,15 +879,9 @@ mod tests {
         let manifest = manifest(Metric::L2);
         let records = fixture_records(24);
         let data = record_group_data(&manifest, &records);
-        let outcome = rerank(
-            &manifest,
-            MockReadTxn::new(data),
-            candidates(&records),
-            5,
-            3,
-        )
-        .await
-        .expect("rerank succeeds");
+        let outcome = rerank(&manifest, mock_txn(data), candidates(&records), 5, 3)
+            .await
+            .expect("rerank succeeds");
         assert_eq!(outcome.exact_rerank_candidates(), 3);
         assert!(outcome.exact_rerank_budget_exhausted());
         // Only the first three candidates in rough order were loaded, and the
@@ -948,15 +896,9 @@ mod tests {
         let records = fixture_records(24);
         let data = record_group_data(&manifest, &records);
         let budget = records.len() as u32;
-        let outcome = rerank(
-            &manifest,
-            MockReadTxn::new(data),
-            candidates(&records),
-            2,
-            budget,
-        )
-        .await
-        .expect("rerank succeeds");
+        let outcome = rerank(&manifest, mock_txn(data), candidates(&records), 2, budget)
+            .await
+            .expect("rerank succeeds");
         assert_eq!(outcome.exact_rerank_candidates(), budget);
         assert!(!outcome.exact_rerank_budget_exhausted());
     }
@@ -966,21 +908,15 @@ mod tests {
         let manifest = manifest(Metric::L2);
         let records = fixture_records(24);
         let data = record_group_data(&manifest, &records);
-        let outcome = rerank(
-            &manifest,
-            MockReadTxn::new(data),
-            candidates(&records),
-            1,
-            0,
-        )
-        .await
-        .expect("rerank succeeds");
+        let outcome = rerank(&manifest, mock_txn(data), candidates(&records), 1, 0)
+            .await
+            .expect("rerank succeeds");
         assert!(outcome.hits().is_empty());
         assert_eq!(outcome.exact_rerank_candidates(), 0);
         assert!(outcome.exact_rerank_budget_exhausted());
 
         // No eligible work exists, so an empty candidate set is not exhaustion.
-        let outcome = rerank(&manifest, MockReadTxn::new(vec![]), vec![], 1, 0)
+        let outcome = rerank(&manifest, mock_txn(vec![]), vec![], 1, 0)
             .await
             .expect("rerank succeeds");
         assert!(!outcome.exact_rerank_budget_exhausted());
@@ -995,7 +931,7 @@ mod tests {
         // read of all 140 keys would fail with LimitExceeded.
         let records = fixture_records(70);
         let data = record_group_data(&manifest, &records);
-        let mut txn = MockReadTxn::new(data);
+        let mut txn = mock_txn(data);
         txn.max_batch_size = 2 * 64;
         let outcome = rerank(
             &manifest,
@@ -1032,7 +968,7 @@ mod tests {
         for _ in 0..2 {
             let outcome = rerank(
                 &manifest,
-                MockReadTxn::new(data.clone()),
+                mock_txn(data.clone()),
                 candidates(&records),
                 4,
                 4,
@@ -1053,7 +989,7 @@ mod tests {
     #[tokio::test]
     async fn rerank_rejects_a_zero_result_limit() {
         let manifest = manifest(Metric::L2);
-        let outcome = rerank(&manifest, MockReadTxn::new(vec![]), vec![], 0, 0).await;
+        let outcome = rerank(&manifest, mock_txn(vec![]), vec![], 0, 0).await;
         assert_eq!(
             outcome.err().map(|error| error.kind()),
             Some(ErrorKind::InvalidArgument)

@@ -634,16 +634,15 @@ fn child_entry_bytes(entry: &ChildEntry) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, VecDeque};
-    use std::ops::Bound;
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use bytes::Bytes;
 
-    use crate::api::{Error, ErrorKind, IndexConfig, LogicalIndexId, Metric, PartitionKey, Result};
+    use crate::api::{ErrorKind, IndexConfig, LogicalIndexId, Metric, Result};
     use crate::storage::ReadLogicalTxn;
-    use crate::storage::backend::{ReadOps, ScanItem, ScanLimits, ScanPage};
-    use crate::storage::keys::{self, KeyRange, TreeKey};
+    use crate::storage::keys::{self, TreeKey};
+    use crate::storage::test_support::{MockReadTxn, pk};
     use crate::storage::values::{
         ChildEntry, IndexLifecycle, IndexManifest, LeafEntry, PartitionHeader, PartitionState,
         PersistentValue, ValueCodec,
@@ -655,14 +654,8 @@ mod tests {
         leaf_entry_bytes, load_body,
     };
 
-    const MAX_KEY_BYTES: usize = 1_024;
-
     fn index() -> LogicalIndexId {
         LogicalIndexId::new(7).expect("test Logical Index ID is nonzero")
-    }
-
-    fn pk(value: u64) -> PartitionKey {
-        PartitionKey::new(value).expect("test Partition Key is nonzero")
     }
 
     fn manifest() -> IndexManifest {
@@ -885,71 +878,9 @@ mod tests {
         }
     }
 
-    /// A snapshot read mock over a raw key/value map, counting body scans.
-    #[derive(Clone, Default)]
-    struct MockReadTxn {
-        data: BTreeMap<Vec<u8>, Vec<u8>>,
-        scans: usize,
-        /// Scripted point-read results; a non-empty queue overrides the map.
-        scripted_gets: VecDeque<Option<Vec<u8>>>,
-    }
-
-    impl MockReadTxn {
-        fn new(data: BTreeMap<Vec<u8>, Vec<u8>>) -> Self {
-            Self {
-                data,
-                scans: 0,
-                scripted_gets: VecDeque::new(),
-            }
-        }
-    }
-
-    impl ReadOps for MockReadTxn {
-        async fn get(&mut self, key: Bytes) -> Result<Option<Bytes>> {
-            if let Some(scripted) = self.scripted_gets.pop_front() {
-                return Ok(scripted.map(Bytes::from));
-            }
-            Ok(self.data.get(key.as_ref()).cloned().map(Bytes::from))
-        }
-
-        async fn batch_get(&mut self, _keys: Vec<Bytes>) -> Result<Vec<Option<Bytes>>> {
-            Err(Error::new(ErrorKind::Backend))
-        }
-
-        async fn scan(&mut self, range: &KeyRange, limits: ScanLimits) -> Result<ScanPage> {
-            self.scans += 1;
-            let mut items = Vec::new();
-            let mut bytes = 0_usize;
-            let start = Bound::Included(range.start().to_vec());
-            let end = Bound::Excluded(range.end().to_vec());
-            for (key, value) in self.data.range((start, end)) {
-                let item_bytes = key.len() + value.len();
-                let full = items.len() >= limits.item_limit
-                    || bytes.saturating_add(item_bytes) > limits.byte_limit;
-                // A page always carries its first item, even when oversized.
-                if full && !items.is_empty() {
-                    return ScanPage::continued(items, MAX_KEY_BYTES);
-                }
-                bytes += item_bytes;
-                items.push(ScanItem::new(
-                    Bytes::copy_from_slice(key),
-                    Bytes::copy_from_slice(value),
-                ));
-            }
-            Ok(ScanPage::terminal(items))
-        }
-
-        async fn batch_scan(
-            &mut self,
-            ranges: &[KeyRange],
-            limits: ScanLimits,
-        ) -> Result<Vec<ScanPage>> {
-            let mut pages = Vec::with_capacity(ranges.len());
-            for range in ranges {
-                pages.push(self.scan(range, limits).await?);
-            }
-            Ok(pages)
-        }
+    /// A cache fixture mock: body loads point-read and scan but never batch.
+    fn mock_txn(data: BTreeMap<Vec<u8>, Vec<u8>>) -> MockReadTxn {
+        MockReadTxn::new(data).with_failing_batch_gets()
     }
 
     fn encode(manifest: &IndexManifest, value: &PersistentValue) -> Vec<u8> {
@@ -1026,7 +957,7 @@ mod tests {
     async fn a_miss_scans_decodes_and_publishes_the_body() {
         let manifest = manifest();
         let cache = PartitionCache::new(1 << 20);
-        let mock = MockReadTxn::new(leaf_data(&manifest, &[b"a", b"b"], 11));
+        let mock = mock_txn(leaf_data(&manifest, &[b"a", b"b"], 11));
 
         let (first, mock) = load(&cache, &manifest, mock, 1).await.expect("load");
         assert_eq!(mock.scans, 1);
@@ -1045,7 +976,7 @@ mod tests {
     async fn an_epoch_bump_forces_a_reload_and_evicts_the_stale_body() {
         let manifest = manifest();
         let cache = PartitionCache::new(1 << 20);
-        let mock = MockReadTxn::new(leaf_data(&manifest, &[b"a"], 11));
+        let mock = mock_txn(leaf_data(&manifest, &[b"a"], 11));
 
         let (first, mut mock) = load(&cache, &manifest, mock, 1).await.expect("load");
         // A body mutation commits with exactly one epoch increment.
@@ -1074,7 +1005,7 @@ mod tests {
             data.insert(key, value);
         }
 
-        let (body, _) = load(&cache, &manifest, MockReadTxn::new(data), 1)
+        let (body, _) = load(&cache, &manifest, mock_txn(data), 1)
             .await
             .expect("load");
         match body.entries() {
@@ -1090,7 +1021,7 @@ mod tests {
     async fn an_empty_body_is_cached() {
         let manifest = manifest();
         let cache = PartitionCache::new(1 << 20);
-        let mock = MockReadTxn::new(leaf_data(&manifest, &[], 3));
+        let mock = mock_txn(leaf_data(&manifest, &[], 3));
 
         let (first, mock) = load(&cache, &manifest, mock, 1).await.expect("load");
         assert!(leaf_ids(&first).is_empty());
@@ -1103,7 +1034,7 @@ mod tests {
     async fn a_missing_header_is_corruption() {
         let manifest = manifest();
         let cache = PartitionCache::new(1 << 20);
-        let error = load(&cache, &manifest, MockReadTxn::default(), 1)
+        let error = load(&cache, &manifest, mock_txn(BTreeMap::new()), 1)
             .await
             .map(|_| ())
             .expect_err("a partition without a Header fails closed");
@@ -1119,7 +1050,7 @@ mod tests {
         let (entry_key, _) = leaf_item(&manifest, 1, b"a");
         data.insert(entry_key.clone(), vec![0xFF; 3]);
 
-        let error = load(&cache, &manifest, MockReadTxn::new(data.clone()), 1)
+        let error = load(&cache, &manifest, mock_txn(data.clone()), 1)
             .await
             .map(|_| ())
             .expect_err("malformed entry bytes fail closed");
@@ -1130,7 +1061,7 @@ mod tests {
         let mut repaired = data;
         let (_, value) = leaf_item(&manifest, 1, b"a");
         repaired.insert(entry_key, value);
-        let (_, mock) = load(&cache, &manifest, MockReadTxn::new(repaired), 1)
+        let (_, mock) = load(&cache, &manifest, mock_txn(repaired), 1)
             .await
             .expect("repaired load");
         assert_eq!(mock.scans, 1);
@@ -1148,7 +1079,7 @@ mod tests {
         let (key, value) = leaf_item(&manifest, 1, b"a");
         data.insert(key, value);
 
-        let error = load(&cache, &manifest, MockReadTxn::new(data), 1)
+        let error = load(&cache, &manifest, mock_txn(data), 1)
             .await
             .map(|_| ())
             .expect_err("a divergent exact entry count fails closed");
@@ -1160,7 +1091,7 @@ mod tests {
     async fn a_header_recheck_mismatch_is_corruption_and_not_cached() {
         let manifest = manifest();
         let cache = PartitionCache::new(1 << 20);
-        let mut mock = MockReadTxn::new(leaf_data(&manifest, &[b"a"], 11));
+        let mut mock = mock_txn(leaf_data(&manifest, &[b"a"], 11));
         // A misbehaving read path returns a changed Header on the recheck.
         let (_, epoch_11) = header_item(&manifest, 1, 1, 1, 11);
         let (_, epoch_12) = header_item(&manifest, 1, 1, 1, 12);
@@ -1178,7 +1109,7 @@ mod tests {
     async fn an_oversized_body_is_served_but_never_cached() {
         let manifest = manifest();
         let cache = PartitionCache::new(1);
-        let mock = MockReadTxn::new(leaf_data(&manifest, &[b"a"], 11));
+        let mock = mock_txn(leaf_data(&manifest, &[b"a"], 11));
 
         let (body, mock) = load(&cache, &manifest, mock, 1).await.expect("load");
         assert_eq!(leaf_ids(&body), vec![Bytes::from_static(b"a")]);

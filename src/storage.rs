@@ -13,6 +13,8 @@ pub mod backend;
 pub mod keys;
 pub mod membership;
 mod operations;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod topology;
 mod tree_key;
 pub mod tree_manifest;
