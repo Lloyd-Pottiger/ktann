@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use ktann::api::{
-    DataType, Error, ErrorKind, FieldId, FieldSchema, ImportOptions, IndexConfig, IndexName,
-    Metric, Mutation, PayloadProjection, Predicate, Record, RuntimeConfig, SearchBudgets,
-    SearchHit, SearchOptions, SearchRequest, SynopsisConfig, Value, VerifyOptions,
+    CompareOp, DataType, Error, ErrorKind, FieldId, FieldSchema, ImportOptions, IndexConfig,
+    IndexName, Metric, Mutation, PayloadProjection, Predicate, Record, RuntimeConfig,
+    SearchBudgets, SearchHit, SearchOptions, SearchRequest, SynopsisConfig, Value, VerifyOptions,
     validate_mutations,
 };
 
@@ -18,11 +18,6 @@ fn assert_invalid<T>(result: ktann::api::Result<T>) {
         Ok(_) => panic!("expected InvalidArgument"),
         Err(error) => assert_eq!(error.kind(), ErrorKind::InvalidArgument),
     }
-}
-
-#[test]
-fn core_crate_is_linkable() {
-    use ktann as _;
 }
 
 #[test]
@@ -133,7 +128,7 @@ fn predicates_enforce_shape_and_types() -> ktann::api::Result<()> {
     ];
     let mut compare_null = Predicate::Compare {
         field: FieldId(0),
-        op: ktann::api::CompareOp::Eq,
+        op: CompareOp::Eq,
         value: Value::Null,
     };
     assert_invalid(compare_null.validate(&fields));
@@ -155,14 +150,14 @@ fn predicates_enforce_shape_and_types() -> ktann::api::Result<()> {
 
     let mut non_finite = Predicate::Compare {
         field: FieldId(1),
-        op: ktann::api::CompareOp::Eq,
+        op: CompareOp::Eq,
         value: Value::F64(f64::INFINITY),
     };
     assert_invalid(non_finite.validate(&fields));
 
     let mut oversized_string = Predicate::Compare {
         field: FieldId(2),
-        op: ktann::api::CompareOp::Eq,
+        op: CompareOp::Eq,
         value: Value::String("x".repeat(1_025)),
     };
     assert_invalid(oversized_string.validate(&fields));
@@ -196,7 +191,7 @@ fn predicates_enforce_shape_and_types() -> ktann::api::Result<()> {
 
     let mut negative_zero = Predicate::Compare {
         field: FieldId(1),
-        op: ktann::api::CompareOp::Eq,
+        op: CompareOp::Eq,
         value: Value::F64(-0.0),
     };
     negative_zero.validate(&fields)?;

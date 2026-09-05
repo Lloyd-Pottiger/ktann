@@ -10,8 +10,10 @@ use ktann_foundationdb::{BackendNamespace, FoundationDbBackend};
 
 #[path = "../../tests/support/backend_contract.rs"]
 mod shared_backend_contract;
+mod support;
 
 use shared_backend_contract::{BackendHarness, Fault, FaultInjection, RestartMode};
+use support::{boot_foundationdb, clear_test_keys};
 
 fn key(value: &'static [u8]) -> Bytes {
     Bytes::from_static(value)
@@ -19,26 +21,6 @@ fn key(value: &'static [u8]) -> Bytes {
 
 fn range(start: &[u8], end: &[u8]) -> KeyRange {
     KeyRange::new(start.to_vec(), end.to_vec())
-}
-
-#[expect(
-    unsafe_code,
-    reason = "the FoundationDB binding requires one process-global network boot"
-)]
-fn boot_foundationdb() -> foundationdb::api::NetworkAutoStop {
-    // SAFETY: this integration-test binary contains one test, so it starts the
-    // process-global FoundationDB network exactly once. The returned guard is
-    // kept alive until every database, backend, and transaction has dropped.
-    unsafe { foundationdb::boot() }
-}
-
-async fn clear_test_keys(backend: &FoundationDbBackend) {
-    let mut transaction = backend.begin_write().await.expect("begin cleanup");
-    transaction
-        .clear_range(&range(b"", b"\xff"))
-        .await
-        .expect("clear test range");
-    transaction.commit().await.expect("commit cleanup");
 }
 
 /// Adapts a [`FoundationDbBackend`] to the shared harness seam.

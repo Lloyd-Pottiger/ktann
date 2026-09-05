@@ -30,13 +30,12 @@ use crate::search::predicate::CompiledPredicate;
 use crate::search::rabitq::{ApproximateCandidate, select_global_overlap};
 use crate::search::rerank::{LeafCandidate, exact_rerank};
 use crate::search::traverse::{DEFAULT_LEAF_BEAM, TraversalRequest, traverse};
-use crate::storage::ReadLogicalTxn;
 use crate::storage::backend::{Backend, ScanLimits};
-use crate::storage::keys::{LogicalKey, TreeKey};
+use crate::storage::keys::TreeKey;
 use crate::storage::values::IndexManifest;
 
 use super::OperationContext;
-use super::reads::opened_manifest;
+use super::reads::open_validated_read;
 
 /// The page bounds for Tree Manifest directory enumeration.
 ///
@@ -123,15 +122,7 @@ pub(crate) async fn search<B: Backend>(
 ) -> Result<(SearchOutcome, Vec<(TreeKey, PartitionKey)>)> {
     context.checkpoint()?;
     let backend = context.backend();
-    let raw = backend.begin_read().await?;
-    let mut txn = ReadLogicalTxn::bootstrap(raw);
-    let current = opened_manifest(
-        txn.get(LogicalKey::Manifest(handle_manifest.logical_index_id()))
-            .await?,
-        handle_manifest,
-    )?;
-    let raw = txn.into_raw();
-    let mut txn = ReadLogicalTxn::for_index(raw, &current)?;
+    let mut txn = open_validated_read(backend.as_ref(), handle_manifest).await?;
     context.checkpoint()?;
 
     let approximate_started = Instant::now();
@@ -140,7 +131,7 @@ pub(crate) async fn search<B: Backend>(
     // deterministic.
     let enumeration = enumerate_tree_keys(
         &mut txn,
-        &current,
+        handle_manifest,
         &prepared.plan,
         prepared.budgets.scanned_tree_keys(),
         DIRECTORY_SCAN_LIMITS,

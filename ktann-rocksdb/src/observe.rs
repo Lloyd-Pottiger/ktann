@@ -11,7 +11,7 @@ use std::time::Duration;
 use ktann::api::ErrorKind;
 
 /// The fixed `backend` label of this adapter.
-pub(crate) const BACKEND: &str = "rocksdb";
+const BACKEND: &str = "rocksdb";
 
 /// Native commit outcomes by backend and bounded outcome.
 const COMMIT: &str = "ktann.backend.commit";

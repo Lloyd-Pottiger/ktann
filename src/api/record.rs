@@ -6,7 +6,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use super::schema::FieldSchema;
-use super::{Error, Result, Value};
+use super::{Error, Result, Value, validate_id};
 
 pub(crate) const MAX_RECORD_ID_BYTES: usize = 256;
 pub(crate) const MAX_PAYLOAD_BYTES: usize = 64 * 1_024;
@@ -33,7 +33,10 @@ impl Record {
             fields: fields.into(),
             payload: None,
         };
-        record.validate_shape()?;
+        validate_id(&record.id)?;
+        if record.vector.iter().any(|component| !component.is_finite()) {
+            return Err(Error::invalid_argument());
+        }
         Ok(record)
     }
 
@@ -81,20 +84,6 @@ impl Record {
     #[must_use]
     pub const fn payload(&self) -> Option<&Bytes> {
         self.payload.as_ref()
-    }
-
-    fn validate_shape(&self) -> Result<()> {
-        if self.id.is_empty()
-            || self.id.len() > MAX_RECORD_ID_BYTES
-            || self.vector.iter().any(|component| !component.is_finite())
-            || self
-                .payload
-                .as_ref()
-                .is_some_and(|payload| payload.len() > MAX_PAYLOAD_BYTES)
-        {
-            return Err(Error::invalid_argument());
-        }
-        Ok(())
     }
 }
 

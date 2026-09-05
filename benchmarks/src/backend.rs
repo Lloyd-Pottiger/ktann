@@ -196,25 +196,19 @@ fn subtract(after: BackendIo, before: &BackendIo) -> BackendIo {
         .expect("monotonic Backend counters never decrease")
 }
 
-/// Read transaction forwarding calls while accounting returned logical data.
+/// A production transaction forwarding calls while accounting logical data.
+///
+/// Reads charge returned data only after success; mutations are charged when
+/// attempted so retried work remains visible.
 #[derive(Debug)]
-pub struct MeasuredReadTxn<T> {
-    /// Production read transaction receiving forwarded calls.
+pub struct MeasuredTxn<T> {
+    /// Production transaction receiving every forwarded call unchanged.
     inner: T,
-    /// Shared observations updated only after successful read results.
+    /// Shared observations updated at the documented charge points.
     counters: Arc<Counters>,
 }
 
-/// Write transaction forwarding calls while accounting attempted logical work.
-#[derive(Debug)]
-pub struct MeasuredWriteTxn<T> {
-    /// Production write transaction receiving forwarded calls.
-    inner: T,
-    /// Shared observations charged when logical mutations are attempted.
-    counters: Arc<Counters>,
-}
-
-impl<T: ReadOps> ReadOps for MeasuredReadTxn<T> {
+impl<T: ReadOps> ReadOps for MeasuredTxn<T> {
     fn get(&mut self, key: Bytes) -> impl Future<Output = Result<Option<Bytes>>> + Send {
         let key_bytes = key.len();
         add(&self.counters.point_read_keys, 1);
@@ -269,64 +263,9 @@ impl<T: ReadOps> ReadOps for MeasuredReadTxn<T> {
     }
 }
 
-impl<T: ReadTxn> ReadTxn for MeasuredReadTxn<T> {}
+impl<T: ReadTxn> ReadTxn for MeasuredTxn<T> {}
 
-impl<T: WriteTxn> ReadOps for MeasuredWriteTxn<T> {
-    fn get(&mut self, key: Bytes) -> impl Future<Output = Result<Option<Bytes>>> + Send {
-        let key_bytes = key.len();
-        add(&self.counters.point_read_keys, 1);
-        async move {
-            let result = self.inner.get(key).await?;
-            self.counters.read_result(key_bytes, result.as_ref());
-            Ok(result)
-        }
-    }
-
-    fn batch_get(
-        &mut self,
-        keys: Vec<Bytes>,
-    ) -> impl Future<Output = Result<Vec<Option<Bytes>>>> + Send {
-        let key_bytes: Vec<usize> = keys.iter().map(Bytes::len).collect();
-        add(&self.counters.point_read_keys, keys.len());
-        async move {
-            let result = self.inner.batch_get(keys).await?;
-            self.counters.batch_read_result(&key_bytes, &result);
-            Ok(result)
-        }
-    }
-
-    fn scan(
-        &mut self,
-        range: &KeyRange,
-        limits: ScanLimits,
-    ) -> impl Future<Output = Result<ScanPage>> + Send {
-        add(&self.counters.scans, 1);
-        async move {
-            let result = self.inner.scan(range, limits).await?;
-            self.counters.scan_result(&result);
-            Ok(result)
-        }
-    }
-
-    fn batch_scan(
-        &mut self,
-        ranges: &[KeyRange],
-        limits: ScanLimits,
-    ) -> impl Future<Output = Result<Vec<ScanPage>>> + Send {
-        // One batched call is one backend interaction regardless of range
-        // count, so it charges one scan; returned items still charge fully.
-        add(&self.counters.scans, 1);
-        async move {
-            let pages = self.inner.batch_scan(ranges, limits).await?;
-            for page in &pages {
-                self.counters.scan_result(page);
-            }
-            Ok(pages)
-        }
-    }
-}
-
-impl<T: WriteTxn> WriteTxn for MeasuredWriteTxn<T> {
+impl<T: WriteTxn> WriteTxn for MeasuredTxn<T> {
     fn get_for_update(&mut self, key: Bytes) -> impl Future<Output = Result<Option<Bytes>>> + Send {
         let key_bytes = key.len();
         add(&self.counters.point_read_keys, 1);
@@ -419,11 +358,11 @@ impl<T: WriteTxn> WriteTxn for MeasuredWriteTxn<T> {
 
 impl<B: Backend> Backend for MeasuredBackend<B> {
     type ReadTxn<'backend>
-        = MeasuredReadTxn<B::ReadTxn<'backend>>
+        = MeasuredTxn<B::ReadTxn<'backend>>
     where
         Self: 'backend;
     type WriteTxn<'backend>
-        = MeasuredWriteTxn<B::WriteTxn<'backend>>
+        = MeasuredTxn<B::WriteTxn<'backend>>
     where
         Self: 'backend;
 
@@ -446,7 +385,7 @@ impl<B: Backend> Backend for MeasuredBackend<B> {
     async fn begin_read(&self) -> Result<Self::ReadTxn<'_>> {
         let inner = self.inner.begin_read().await?;
         add(&self.counters.read_transactions, 1);
-        Ok(MeasuredReadTxn {
+        Ok(MeasuredTxn {
             inner,
             counters: Arc::clone(&self.counters),
         })
@@ -455,7 +394,7 @@ impl<B: Backend> Backend for MeasuredBackend<B> {
     async fn begin_write(&self) -> Result<Self::WriteTxn<'_>> {
         let inner = self.inner.begin_write().await?;
         add(&self.counters.write_transactions, 1);
-        Ok(MeasuredWriteTxn {
+        Ok(MeasuredTxn {
             inner,
             counters: Arc::clone(&self.counters),
         })

@@ -6,8 +6,11 @@ use foundationdb::api::{FdbApiBuilder, NetworkAutoStop};
 use foundationdb::options::NetworkOption;
 use ktann::api::ErrorKind;
 use ktann::storage::backend::{Backend, ReadOps, WriteTxn};
-use ktann::storage::keys::KeyRange;
 use ktann_foundationdb::{BackendNamespace, FoundationDbBackend};
+
+mod support;
+
+use support::clear_test_keys;
 
 const MAX_BUGGIFIED_COMMITS: usize = 256;
 
@@ -44,15 +47,6 @@ fn set_client_buggify(enabled: bool) {
     // switch. This process owns the one initialized network and calls no other
     // process-global FoundationDB configuration concurrently.
     unsafe { option.apply() }.expect("set client buggify state");
-}
-
-async fn clear_test_keys(backend: &FoundationDbBackend) {
-    let mut transaction = backend.begin_write().await.expect("begin cleanup");
-    transaction
-        .clear_range(&KeyRange::new(Vec::new(), vec![0xff]))
-        .await
-        .expect("clear fault-test range");
-    transaction.commit().await.expect("commit cleanup");
 }
 
 #[tokio::test(flavor = "current_thread")]

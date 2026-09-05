@@ -57,10 +57,9 @@ struct CaptureLayer {
 
 impl CaptureLayer {
     fn lock<V>(mutex: &Mutex<V>) -> MutexGuard<'_, V> {
-        match mutex.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        }
+        mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -126,6 +125,16 @@ pub(crate) async fn audit_lock() -> tokio::sync::MutexGuard<'static, ()> {
         .await
 }
 
+/// The sorted (label, value) pairs of one snapshot key.
+fn sorted_labels(key: &metrics::Key) -> Vec<(String, String)> {
+    let mut labels: Vec<(String, String)> = key
+        .labels()
+        .map(|label| (label.key().to_owned(), label.value().to_owned()))
+        .collect();
+    labels.sort();
+    labels
+}
+
 impl Capture {
     /// Clears the captured spans and events. Metric state is cumulative;
     /// callers diff [`Capture::metric_labels`] snapshots instead.
@@ -141,13 +150,7 @@ impl Capture {
             .into_vec()
             .into_iter()
             .map(|(key, _unit, _description, _value)| {
-                let mut labels: Vec<(String, String)> = key
-                    .key()
-                    .labels()
-                    .map(|label| (label.key().to_owned(), label.value().to_owned()))
-                    .collect();
-                labels.sort();
-                (key.key().name().to_owned(), labels)
+                (key.key().name().to_owned(), sorted_labels(key.key()))
             })
             .collect()
     }
@@ -164,13 +167,7 @@ impl Capture {
                 let DebugValue::Counter(value) = value else {
                     return None;
                 };
-                let mut labels: Vec<(String, String)> = key
-                    .key()
-                    .labels()
-                    .map(|label| (label.key().to_owned(), label.value().to_owned()))
-                    .collect();
-                labels.sort();
-                Some((key.key().name().to_owned(), labels, value))
+                Some((key.key().name().to_owned(), sorted_labels(key.key()), value))
             })
             .collect()
     }

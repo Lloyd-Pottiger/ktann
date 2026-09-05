@@ -85,15 +85,10 @@ impl PhysicalPrefix {
         FDB_MAX_KEY_BYTES - self.bytes.len()
     }
 
-    fn validate_key(&self, logical_key: &[u8]) -> Result<()> {
+    fn encode_key(&self, logical_key: &[u8]) -> Result<Bytes> {
         if logical_key.len() > self.max_logical_key_bytes() {
             return Err(Error::new(ErrorKind::LimitExceeded));
         }
-        Ok(())
-    }
-
-    fn encode_key(&self, logical_key: &[u8]) -> Result<Bytes> {
-        self.validate_key(logical_key)?;
         let mut physical_key = Vec::with_capacity(self.bytes.len() + logical_key.len());
         physical_key.extend_from_slice(&self.bytes);
         physical_key.extend_from_slice(logical_key);
@@ -328,22 +323,18 @@ impl WriteTxn for FoundationDbWriteTxn<'_> {
     }
 
     async fn insert(&mut self, key: Bytes, value: Bytes) -> Result<InsertOutcome> {
-        validate_value(&value)?;
-        let physical_key = self.prefix.encode_key(&key)?;
-        let charged_bytes = physical_key
-            .len()
-            .checked_add(value.len())
-            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+        let mutation = self.prepare_put(key, value)?;
+        let charged_bytes = mutation.charged_bytes()?;
         let existing = self
             .transaction
-            .get(&physical_key, false)
+            .get(mutation.key(), false)
             .await
             .map_err(map_operation_error)?;
         if existing.is_some() {
             return Ok(InsertOutcome::AlreadyExists);
         }
         self.charge(1, charged_bytes)?;
-        self.transaction.set(&physical_key, &value);
+        mutation.apply(&self.transaction);
         Ok(InsertOutcome::Inserted)
     }
 
@@ -426,6 +417,12 @@ impl ReadMode {
 }
 
 impl PreparedMutation {
+    fn key(&self) -> &Bytes {
+        match self {
+            Self::Put { key, .. } | Self::Delete { key } => key,
+        }
+    }
+
     fn charged_bytes(&self) -> Result<usize> {
         match self {
             Self::Put { key, value } => key

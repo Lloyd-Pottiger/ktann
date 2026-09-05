@@ -14,29 +14,11 @@ use ktann::api::{
     RuntimeConfig, Value, VerifyOptions,
 };
 use ktann::runtime::Runtime;
-use ktann::storage::backend::{Backend, WriteTxn};
-use ktann::storage::keys::KeyRange;
 use ktann_foundationdb::{BackendNamespace, FoundationDbBackend};
 
-#[expect(
-    unsafe_code,
-    reason = "the FoundationDB binding requires one process-global network boot"
-)]
-fn boot_foundationdb() -> foundationdb::api::NetworkAutoStop {
-    // SAFETY: this integration-test binary contains one test, so it starts the
-    // process-global FoundationDB network exactly once. The returned guard is
-    // kept alive until every database, backend, and transaction has dropped.
-    unsafe { foundationdb::boot() }
-}
+mod support;
 
-async fn clear_test_keys(backend: &FoundationDbBackend) {
-    let mut transaction = backend.begin_write().await.expect("begin cleanup");
-    transaction
-        .clear_range(&KeyRange::new(b"".to_vec(), b"\xff".to_vec()))
-        .await
-        .expect("clear test range");
-    transaction.commit().await.expect("commit cleanup");
-}
+use support::{boot_foundationdb, clear_test_keys};
 
 fn config() -> IndexConfig {
     IndexConfig::new(2, Metric::L2)

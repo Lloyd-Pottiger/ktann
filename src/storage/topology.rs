@@ -168,7 +168,7 @@ pub async fn begin_split<T: WriteTxn>(
     source: PartitionKey,
     started_at_unix_millis: u64,
 ) -> Result<SplitStart> {
-    let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
+    let manifest = txn.require_manifest()?;
     let index = manifest.logical_index_id();
     let (header_key, state_key) = authority_keys(index, tree_key, source);
     let Some((header, state)) = authority_pair(txn, header_key.clone(), state_key.clone()).await?
@@ -246,7 +246,7 @@ pub async fn create_split_target<T: WriteTxn>(
     centroid: &PartitionCentroid,
     started_at_unix_millis: u64,
 ) -> Result<TargetInstall> {
-    let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
+    let manifest = txn.require_manifest()?;
     let index = manifest.logical_index_id();
     let (source_header_key, source_state_key) = authority_keys(index, tree_key, source);
 
@@ -419,7 +419,7 @@ pub async fn advance_to_draining<T: WriteTxn>(
     source: PartitionKey,
     started_at_unix_millis: u64,
 ) -> Result<DrainStart> {
-    let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
+    let manifest = txn.require_manifest()?;
     let index = manifest.logical_index_id();
     let (header_key, state_key) = authority_keys(index, tree_key, source);
     let Some((header, state)) = authority_pair(txn, header_key.clone(), state_key.clone()).await?
@@ -564,10 +564,7 @@ pub async fn read_leaf_drain_candidates<T: WriteTxn>(
     source: PartitionKey,
     record_ids: &[Bytes],
 ) -> Result<Vec<Option<LeafDrainEntry>>> {
-    let index = txn
-        .bound_manifest()
-        .ok_or_else(Error::invalid_argument)?
-        .logical_index_id();
+    let index = txn.require_manifest()?.logical_index_id();
     let entry_keys: Vec<LogicalKey> = record_ids
         .iter()
         .map(|id| LogicalKey::LeafEntry {
@@ -677,7 +674,7 @@ pub(crate) fn leaf_relocation_batch_limit(
     budget: AdmissionBudget,
 ) -> Result<usize> {
     let charge = LeafRelocationCharge::new(manifest, tree_key, budget.mutation_key_overhead_bytes)?;
-    let high = budget.max_mutations.saturating_sub(1) / 3;
+    let mut high = budget.max_mutations.saturating_sub(1) / 3;
     if high == 0 || !charge.fits(1, movement, budget) {
         return Err(Error::new(ErrorKind::LimitExceeded));
     }
@@ -686,7 +683,6 @@ pub(crate) fn leaf_relocation_batch_limit(
     // target at entry two, so binary search finds the exact joint count/byte
     // bound without iterating once per admissible entry.
     let mut low = 1_usize;
-    let mut high = high;
     while low < high {
         let middle = low + (high - low).div_ceil(2);
         if charge.fits(middle, movement, budget) {
@@ -783,7 +779,7 @@ pub async fn relocate_leaf_entries<T: WriteTxn>(
     if moves.is_empty() {
         return Ok(0);
     }
-    let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
+    let manifest = txn.require_manifest()?;
     let index = manifest.logical_index_id();
 
     // One update-protected read of each touched partition Header, and one of
@@ -937,10 +933,7 @@ pub async fn read_child_drain_candidates<T: WriteTxn>(
     source: PartitionKey,
     children: &[PartitionKey],
 ) -> Result<Vec<Option<ChildEntry>>> {
-    let index = txn
-        .bound_manifest()
-        .ok_or_else(Error::invalid_argument)?
-        .logical_index_id();
+    let index = txn.require_manifest()?.logical_index_id();
     let keys: Vec<LogicalKey> = children
         .iter()
         .map(|child| LogicalKey::ChildEntry {
@@ -984,7 +977,7 @@ pub async fn relocate_child_entries<T: WriteTxn>(
     if moves.is_empty() {
         return Ok(0);
     }
-    let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
+    let manifest = txn.require_manifest()?;
     let index = manifest.logical_index_id();
 
     let mut targets: Vec<PartitionKey> = moves.iter().map(|(_, target)| *target).collect();
@@ -1132,7 +1125,7 @@ pub async fn finalize_split<T: WriteTxn>(
     started_at_unix_millis: u64,
     source_removal: SourceRemoval,
 ) -> Result<SplitCompletion> {
-    let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
+    let manifest = txn.require_manifest()?;
     let index = manifest.logical_index_id();
     let (header_key, state_key) = authority_keys(index, tree_key, source);
     let Some((header, state)) = authority_pair(txn, header_key.clone(), state_key.clone()).await?
@@ -1321,7 +1314,7 @@ pub async fn begin_merge<T: WriteTxn>(
     source: PartitionKey,
     started_at_unix_millis: u64,
 ) -> Result<MergeStart> {
-    let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
+    let manifest = txn.require_manifest()?;
     let index = manifest.logical_index_id();
     let (header_key, state_key) = authority_keys(index, tree_key, source);
     let Some((header, state)) = authority_pair(txn, header_key.clone(), state_key.clone()).await?
@@ -1426,7 +1419,7 @@ pub async fn finalize_merge<T: WriteTxn>(
     source: PartitionKey,
     source_removal: SourceRemoval,
 ) -> Result<MergeCompletion> {
-    let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
+    let manifest = txn.require_manifest()?;
     let (header_key, state_key) = authority_keys(manifest.logical_index_id(), tree_key, source);
     let Some((header, state)) = authority_pair(txn, header_key.clone(), state_key.clone()).await?
     else {
@@ -1474,10 +1467,7 @@ async fn remove_incoming_edge<T: WriteTxn>(
     source: PartitionKey,
     level: u32,
 ) -> Result<PartitionKey> {
-    let index = txn
-        .bound_manifest()
-        .ok_or_else(Error::invalid_argument)?
-        .logical_index_id();
+    let index = txn.require_manifest()?.logical_index_id();
     let parent = lock_incoming_edge(txn, tree_key, source, level).await?;
     let parent_header_key = LogicalKey::Header {
         index,
@@ -1559,7 +1549,7 @@ async fn find_incoming_edge<T: WriteTxn>(
     partition: PartitionKey,
     level: u32,
 ) -> Result<Option<(PartitionKey, ChildEntry)>> {
-    let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
+    let manifest = txn.require_manifest()?;
     let parent_level = level.checked_add(1).ok_or_else(corrupt)?;
     let bodies = level_bodies(txn, manifest, tree_key, parent_level).await?;
     // Only the parent level's matches are collected.
@@ -1591,10 +1581,7 @@ async fn lock_incoming_edge<T: WriteTxn>(
     partition: PartitionKey,
     level: u32,
 ) -> Result<PartitionKey> {
-    let index = txn
-        .bound_manifest()
-        .ok_or_else(Error::invalid_argument)?
-        .logical_index_id();
+    let index = txn.require_manifest()?.logical_index_id();
     let Some((parent, _)) = find_incoming_edge(txn, tree_key, partition, level).await? else {
         // A non-root partition has exactly one incoming Child Entry in every
         // committed state (ADR 0007).
@@ -1901,14 +1888,7 @@ pub(crate) async fn read_authority_pair<R: LogicalReader>(
     tree_key: &TreeKey,
     partition: PartitionKey,
 ) -> Result<Option<(PartitionHeader, PartitionTransition)>> {
-    match read_authority_opt(reader, index, tree_key, partition).await? {
-        (Some(header), Some(state)) => {
-            expect_agreement(header, state)?;
-            Ok(Some((header, state)))
-        }
-        (None, None) => Ok(None),
-        _ => Err(corrupt()),
-    }
+    classify_authority(read_authority_opt(reader, index, tree_key, partition).await?)
 }
 
 /// Reads one visited partition's Header and State in one batch, failing
@@ -1923,13 +1903,9 @@ pub(crate) async fn read_authority<R: LogicalReader>(
     tree_key: &TreeKey,
     partition: PartitionKey,
 ) -> Result<(PartitionHeader, PartitionTransition)> {
-    match read_authority_opt(reader, index, tree_key, partition).await? {
-        (Some(header), Some(state)) => {
-            expect_agreement(header, state)?;
-            Ok((header, state))
-        }
-        _ => Err(corrupt()),
-    }
+    read_authority_pair(reader, index, tree_key, partition)
+        .await?
+        .ok_or_else(corrupt)
 }
 
 /// Reads the authority pairs for a distinct partition wave in one batched
@@ -1983,6 +1959,22 @@ fn decode_authority_pair(
     Ok((expect_header(header)?, expect_state(state)?))
 }
 
+/// Classifies one decoded authority pair: both present and in agreement is
+/// `Some`, both gone is `None`, and a half-present or disagreeing pair is
+/// Corruption.
+fn classify_authority(
+    pair: (Option<PartitionHeader>, Option<PartitionTransition>),
+) -> Result<Option<(PartitionHeader, PartitionTransition)>> {
+    match pair {
+        (Some(header), Some(state)) => {
+            expect_agreement(header, state)?;
+            Ok(Some((header, state)))
+        }
+        (None, None) => Ok(None),
+        _ => Err(corrupt()),
+    }
+}
+
 /// Reads one partition's Header and State with update protection in one
 /// batch.
 pub(crate) async fn authority_for_update<T: WriteTxn>(
@@ -2008,14 +2000,7 @@ async fn authority_pair<T: WriteTxn>(
     header_key: LogicalKey,
     state_key: LogicalKey,
 ) -> Result<Option<(PartitionHeader, PartitionTransition)>> {
-    match authority_for_update(txn, header_key, state_key).await? {
-        (Some(header), Some(state)) => {
-            expect_agreement(header, state)?;
-            Ok(Some((header, state)))
-        }
-        (None, None) => Ok(None),
-        _ => Err(corrupt()),
-    }
+    classify_authority(authority_for_update(txn, header_key, state_key).await?)
 }
 
 /// Verifies that one target's persisted State names `source`, without a

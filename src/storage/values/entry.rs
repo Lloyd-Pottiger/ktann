@@ -13,6 +13,7 @@ use super::data::{
     decode_fields, decode_vector, encode_fields, encode_vector, maximum_typed_value_len,
 };
 use super::manifest::IndexManifest;
+use super::record::{decode_record_id, encode_record_id};
 use super::wire::{Decoder, Encoder};
 
 /// An internal-partition entry and its immutable routing projection.
@@ -132,10 +133,7 @@ pub(super) fn encode_leaf_entry(
     manifest: &IndexManifest,
     entry: &LeafEntry,
 ) -> Result<()> {
-    if entry.record_id.is_empty() || entry.record_id.len() > MAX_RECORD_ID_BYTES {
-        return Err(Error::invalid_argument());
-    }
-    encoder.sized_u16_bytes(&entry.record_id)?;
+    encode_record_id(encoder, &entry.record_id)?;
     encode_fields(encoder, manifest.config().fields(), &entry.fields)?;
     let expected = RaBitQ7::encoded_len(manifest.config().dimension())?;
     if entry.rabitq7.len() != expected {
@@ -170,10 +168,7 @@ pub(super) fn decode_leaf_entry(
     decoder: &mut Decoder,
     manifest: &IndexManifest,
 ) -> Result<LeafEntry> {
-    let record_id = decoder.sized_u16_bytes(MAX_RECORD_ID_BYTES)?;
-    if record_id.is_empty() {
-        return Err(corrupt());
-    }
+    let record_id = decode_record_id(decoder)?;
     let fields = decode_fields(decoder, manifest.config().fields())?;
     let expected = RaBitQ7::encoded_len(manifest.config().dimension()).map_err(|_| corrupt())?;
     let rabitq7 = decoder.sized_bytes(expected)?;

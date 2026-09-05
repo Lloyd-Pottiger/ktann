@@ -108,6 +108,15 @@ pub(crate) async fn wait_before_retry<B: Backend>(
     Ok(())
 }
 
+/// Records the native commit wait and outcome of one finished commit call.
+fn observe_commit(operation: Operation, committed: &Result<()>, started: Instant) {
+    metrics::write_commit_finished(
+        operation,
+        WriteAttemptOutcome::from_result(committed),
+        started.elapsed(),
+    );
+}
+
 /// Shared whole-attempt loop behind the ordinary and observed entry points.
 pub(crate) async fn run_write_attempts_with_optional_import_permit<'b, 'm, B: Backend, O>(
     backend: &'b B,
@@ -133,11 +142,7 @@ pub(crate) async fn run_write_attempts_with_optional_import_permit<'b, 'm, B: Ba
                             .commit(move |start| async move {
                                 let commit_started = Instant::now();
                                 let committed = txn.commit_with(start).await;
-                                metrics::write_commit_finished(
-                                    operation,
-                                    WriteAttemptOutcome::from_result(&committed),
-                                    commit_started.elapsed(),
-                                );
+                                observe_commit(operation, &committed, commit_started);
                                 committed
                             })
                             .await
@@ -145,11 +150,7 @@ pub(crate) async fn run_write_attempts_with_optional_import_permit<'b, 'm, B: Ba
                     None => {
                         let commit_started = Instant::now();
                         let committed = txn.commit().await;
-                        metrics::write_commit_finished(
-                            operation,
-                            WriteAttemptOutcome::from_result(&committed),
-                            commit_started.elapsed(),
-                        );
+                        observe_commit(operation, &committed, commit_started);
                         committed
                     }
                 };

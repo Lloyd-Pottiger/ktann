@@ -31,14 +31,6 @@ struct TreeKeySchema {
 }
 
 impl TreeKeySchema {
-    /// The empty schema used by namespace-level bootstrap bindings.
-    fn bootstrap() -> Self {
-        Self {
-            types: [DataType::Bool; MAX_FIELDS],
-            count: 0,
-        }
-    }
-
     /// The Tree Key schema declared by one Index Manifest.
     fn for_index(manifest: &IndexManifest) -> Self {
         let (types, count) = manifest.tree_key_types();
@@ -68,35 +60,26 @@ impl LogicalRange {
     /// Selects every key owned by one Logical Index.
     #[must_use]
     pub fn index(manifest: &IndexManifest) -> Self {
-        Self {
-            index: manifest.logical_index_id(),
-            schema: TreeKeySchema::for_index(manifest),
-            raw: keys::index_range(manifest.logical_index_id()),
-        }
+        Self::bind(manifest, keys::index_range(manifest.logical_index_id()))
     }
 
     /// Selects every Tree Manifest in one Logical Index.
     #[must_use]
     pub fn tree_manifests(manifest: &IndexManifest) -> Self {
-        Self {
-            index: manifest.logical_index_id(),
-            schema: TreeKeySchema::for_index(manifest),
-            raw: keys::tree_manifest_range(manifest.logical_index_id()),
-        }
+        Self::bind(
+            manifest,
+            keys::tree_manifest_range(manifest.logical_index_id()),
+        )
     }
 
     /// Selects Tree Manifests matching leading Tree Key field values.
     pub fn tree_manifests_with_prefix(manifest: &IndexManifest, prefix: &[Value]) -> Result<Self> {
-        let schema = TreeKeySchema::for_index(manifest);
-        Ok(Self {
-            index: manifest.logical_index_id(),
-            schema,
-            raw: keys::tree_manifest_prefix_range(
-                manifest.logical_index_id(),
-                schema.types(),
-                prefix,
-            )?,
-        })
+        let raw = keys::tree_manifest_prefix_range(
+            manifest.logical_index_id(),
+            TreeKeySchema::for_index(manifest).types(),
+            prefix,
+        )?;
+        Ok(Self::bind(manifest, raw))
     }
 
     /// Selects Tree Manifests within one planned raw directory range.
@@ -105,11 +88,7 @@ impl LogicalRange {
     /// binds them to the exact Logical Index ID and Tree Key schema needed to
     /// decode the returned keys.
     pub(crate) fn tree_manifest_plan(manifest: &IndexManifest, raw: KeyRange) -> Self {
-        Self {
-            index: manifest.logical_index_id(),
-            schema: TreeKeySchema::for_index(manifest),
-            raw,
-        }
+        Self::bind(manifest, raw)
     }
 
     /// Selects every value owned by one partition.
@@ -121,15 +100,11 @@ impl LogicalRange {
         tree_key: &TreeKey,
         partition: crate::api::PartitionKey,
     ) -> Result<Self> {
-        let schema = TreeKeySchema::for_index(manifest);
-        tree_key
-            .validate(schema.types())
-            .map_err(|_| Error::invalid_argument())?;
-        Ok(Self {
-            index: manifest.logical_index_id(),
-            schema,
-            raw: keys::partition_range(manifest.logical_index_id(), tree_key, partition),
-        })
+        Self::bind_partition(
+            manifest,
+            tree_key,
+            keys::partition_range(manifest.logical_index_id(), tree_key, partition),
+        )
     }
 
     /// Selects every Leaf Entry owned by one partition.
@@ -141,15 +116,11 @@ impl LogicalRange {
         tree_key: &TreeKey,
         partition: crate::api::PartitionKey,
     ) -> Result<Self> {
-        let schema = TreeKeySchema::for_index(manifest);
-        tree_key
-            .validate(schema.types())
-            .map_err(|_| Error::invalid_argument())?;
-        Ok(Self {
-            index: manifest.logical_index_id(),
-            schema,
-            raw: keys::leaf_entry_range(manifest.logical_index_id(), tree_key, partition),
-        })
+        Self::bind_partition(
+            manifest,
+            tree_key,
+            keys::leaf_entry_range(manifest.logical_index_id(), tree_key, partition),
+        )
     }
 
     /// Selects every Child Entry owned by one partition.
@@ -161,15 +132,30 @@ impl LogicalRange {
         tree_key: &TreeKey,
         partition: crate::api::PartitionKey,
     ) -> Result<Self> {
-        let schema = TreeKeySchema::for_index(manifest);
-        tree_key
-            .validate(schema.types())
-            .map_err(|_| Error::invalid_argument())?;
-        Ok(Self {
+        Self::bind_partition(
+            manifest,
+            tree_key,
+            keys::child_entry_range(manifest.logical_index_id(), tree_key, partition),
+        )
+    }
+
+    /// Binds one raw range to the Manifest's Logical Index ID and Tree Key
+    /// schema.
+    fn bind(manifest: &IndexManifest, raw: KeyRange) -> Self {
+        Self {
             index: manifest.logical_index_id(),
-            schema,
-            raw: keys::child_entry_range(manifest.logical_index_id(), tree_key, partition),
-        })
+            schema: TreeKeySchema::for_index(manifest),
+            raw,
+        }
+    }
+
+    /// Binds one partition-scoped raw range, rejecting a Tree Key that does
+    /// not match the Manifest's declared Tree Key schema.
+    fn bind_partition(manifest: &IndexManifest, tree_key: &TreeKey, raw: KeyRange) -> Result<Self> {
+        tree_key
+            .validate(TreeKeySchema::for_index(manifest).types())
+            .map_err(|_| Error::invalid_argument())?;
+        Ok(Self::bind(manifest, raw))
     }
 }
 
@@ -298,7 +284,11 @@ impl LogicalBinding<'static> {
     fn bootstrap() -> Self {
         Self {
             manifest: None,
-            schema: TreeKeySchema::bootstrap(),
+            // The empty namespace schema; bootstrap keys carry no Tree Key.
+            schema: TreeKeySchema {
+                types: [DataType::Bool; MAX_FIELDS],
+                count: 0,
+            },
             allow_name_mapping: true,
         }
     }
@@ -623,6 +613,11 @@ impl<'manifest, T> ReadLogicalTxn<'manifest, T> {
     pub(crate) fn bound_manifest(&self) -> Option<&'manifest IndexManifest> {
         self.binding.manifest
     }
+
+    /// Returns the bound Index Manifest, rejecting a bootstrap binding.
+    pub(crate) fn require_manifest(&self) -> Result<&'manifest IndexManifest> {
+        self.bound_manifest().ok_or_else(Error::invalid_argument)
+    }
 }
 
 impl<T: ReadOps> ReadLogicalTxn<'_, T> {
@@ -885,18 +880,13 @@ impl<'manifest> MutationBuilder<'manifest> {
                 next
             }
             Entry::Vacant(entry) => {
-                let next = TransactionSize {
-                    mutations: self
-                        .size
-                        .mutations
-                        .checked_add(1)
-                        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?,
-                    bytes: self
-                        .size
-                        .bytes
-                        .checked_add(new_bytes)
-                        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?,
-                };
+                let next = self
+                    .size
+                    .checked_add(TransactionSize {
+                        mutations: 1,
+                        bytes: new_bytes,
+                    })
+                    .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
                 check_budget(self.budget, next)?;
                 entry.insert(value);
                 next
@@ -1051,6 +1041,11 @@ impl<'manifest, T> WriteLogicalTxn<'manifest, T> {
     /// Returns the Index Manifest this transaction is bound to, if any.
     pub(crate) fn bound_manifest(&self) -> Option<&'manifest IndexManifest> {
         self.binding.manifest
+    }
+
+    /// Returns the bound Index Manifest, rejecting a bootstrap binding.
+    pub(crate) fn require_manifest(&self) -> Result<&'manifest IndexManifest> {
+        self.bound_manifest().ok_or_else(Error::invalid_argument)
     }
 
     /// Returns the conservative admission budget bound to this transaction.

@@ -111,9 +111,7 @@ fn record_values_are_adjacent_and_ordered_by_record_id() {
         })
         .collect();
 
-    let mut sorted = keys.clone();
-    sorted.sort();
-    assert_eq!(sorted, keys);
+    assert!(keys.is_sorted());
 
     for (record_id, group) in record_ids.iter().zip(keys.chunks_exact(3)) {
         assert!(matches!(
@@ -137,41 +135,26 @@ fn partition_family_golden_bytes() {
     let types = [DataType::String];
     let tree_key = TreeKey::encode(&types, &[Value::string("a").expect("short string")])
         .expect("canonical tree key");
-    let prefix = b"\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x04\x61\x00";
     let partition = b"\x00\x00\x00\x00\x00\x00\x00\x01";
+    let expected = |suffix: &[u8]| {
+        let mut key = b"\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x04\x61\x00".to_vec();
+        key.extend_from_slice(partition);
+        key.extend_from_slice(suffix);
+        key
+    };
 
-    let mut expected = prefix.to_vec();
-    expected.extend_from_slice(partition);
-    expected.push(0x00);
-    assert_eq!(header_key(id(1), &tree_key, pk(1)), expected);
-
-    let mut expected = prefix.to_vec();
-    expected.extend_from_slice(partition);
-    expected.push(0x01);
-    assert_eq!(synopsis_key(id(1), &tree_key, pk(1)), expected);
-
-    let mut expected = prefix.to_vec();
-    expected.extend_from_slice(partition);
-    expected.push(0x02);
-    assert_eq!(state_key(id(1), &tree_key, pk(1)), expected);
-
-    let mut expected = prefix.to_vec();
-    expected.extend_from_slice(partition);
-    expected.push(0x03);
-    assert_eq!(centroid_key(id(1), &tree_key, pk(1)), expected);
-
-    let mut expected = prefix.to_vec();
-    expected.extend_from_slice(partition);
-    expected.extend_from_slice(&[0x04, b'x']);
+    assert_eq!(header_key(id(1), &tree_key, pk(1)), expected(&[0x00]));
+    assert_eq!(synopsis_key(id(1), &tree_key, pk(1)), expected(&[0x01]));
+    assert_eq!(state_key(id(1), &tree_key, pk(1)), expected(&[0x02]));
+    assert_eq!(centroid_key(id(1), &tree_key, pk(1)), expected(&[0x03]));
     assert_eq!(
         leaf_entry_key(id(1), &tree_key, pk(1), &Bytes::from_static(b"x")).expect("valid id"),
-        expected
+        expected(&[0x04, b'x'])
     );
-
-    let mut expected = prefix.to_vec();
-    expected.extend_from_slice(partition);
-    expected.extend_from_slice(&[0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02]);
-    assert_eq!(child_entry_key(id(1), &tree_key, pk(1), pk(2)), expected);
+    assert_eq!(
+        child_entry_key(id(1), &tree_key, pk(1), pk(2)),
+        expected(&[0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02])
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -254,12 +237,7 @@ fn tree_key_string_golden_bytes() {
             &[DataType::String],
             &[Value::string("\u{4f60}\u{597d}").expect("multibyte")]
         ),
-        "\u{4f60}\u{597d}"
-            .as_bytes()
-            .iter()
-            .copied()
-            .chain([0x00])
-            .collect::<Vec<u8>>()
+        ["\u{4f60}\u{597d}".as_bytes(), &[0x00]].concat()
     );
 }
 
@@ -278,24 +256,12 @@ fn tree_key_tuple_golden_bytes() {
 // ---------------------------------------------------------------------------
 
 fn cmp_value(ty: DataType, a: &Value, b: &Value) -> Ordering {
-    match ty {
-        DataType::Bool => match (a, b) {
-            (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
-            _ => panic!("bool type mismatch"),
-        },
-        DataType::I64 => match (a, b) {
-            (Value::I64(a), Value::I64(b)) => a.cmp(b),
-            _ => panic!("i64 type mismatch"),
-        },
-        DataType::F64 => match (a, b) {
-            (Value::F64(a), Value::F64(b)) => a.total_cmp(b),
-            _ => panic!("f64 type mismatch"),
-        },
-        DataType::String => match (a, b) {
-            (Value::String(a), Value::String(b)) => a.as_bytes().cmp(b.as_bytes()),
-            _ => panic!("string type mismatch"),
-        },
-        _ => panic!("unknown data type"),
+    match (ty, a, b) {
+        (DataType::Bool, Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+        (DataType::I64, Value::I64(a), Value::I64(b)) => a.cmp(b),
+        (DataType::F64, Value::F64(a), Value::F64(b)) => a.total_cmp(b),
+        (DataType::String, Value::String(a), Value::String(b)) => a.as_bytes().cmp(b.as_bytes()),
+        _ => panic!("typed value mismatch"),
     }
 }
 
@@ -522,11 +488,12 @@ fn index_and_partition_ranges_are_contiguous() {
     let tree_key = TreeKey::encode(&types, &[Value::I64(0)]).expect("canonical");
     let range = partition_range(id(1), &tree_key, pk(1));
     assert!(range.start() < range.end());
+    let contains = |key: &[u8]| key >= range.start() && key < range.end();
     let header = header_key(id(1), &tree_key, pk(1));
     let leaf =
         leaf_entry_key(id(1), &tree_key, pk(1), &Bytes::from_static(b"z")).expect("valid id");
-    assert!(header.as_slice() >= range.start() && header.as_slice() < range.end());
-    assert!(leaf.as_slice() >= range.start() && leaf.as_slice() < range.end());
+    assert!(contains(&header));
+    assert!(contains(&leaf));
 }
 
 #[test]
@@ -539,10 +506,9 @@ fn tree_manifest_prefix_range_contains_matching_keys() {
 
     let range = tree_manifest_prefix_range(index, &types, &[Value::string("a").expect("short")])
         .expect("valid prefix");
-    let ka = tree_manifest_key(index, &a);
-    let kb = tree_manifest_key(index, &b);
-    assert!(ka.as_slice() >= range.start() && ka.as_slice() < range.end());
-    assert!(!(kb.as_slice() >= range.start() && kb.as_slice() < range.end()));
+    let contains = |key: &[u8]| key >= range.start() && key < range.end();
+    assert!(contains(&tree_manifest_key(index, &a)));
+    assert!(!contains(&tree_manifest_key(index, &b)));
 }
 
 #[test]

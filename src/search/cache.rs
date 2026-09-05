@@ -36,7 +36,7 @@ use crate::observe::metrics;
 use crate::storage::backend::{ReadOps, ScanLimits};
 use crate::storage::keys::{LogicalKey, TreeKey};
 use crate::storage::values::{
-    ChildEntry, IndexManifest, LeafEntry, PartitionHeader, PersistentValue,
+    ChildEntry, IndexManifest, LeafEntry, PartitionHeader, PersistentValue, expect_header,
 };
 use crate::storage::{LogicalRange, LogicalScanCursor, ReadLogicalTxn};
 
@@ -301,10 +301,9 @@ impl PartitionCache {
     }
 
     fn lock(&self) -> MutexGuard<'_, CacheInner> {
-        match self.inner.lock() {
-            Ok(inner) => inner,
-            Err(poisoned) => poisoned.into_inner(),
-        }
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -344,20 +343,18 @@ impl CacheInner {
         };
         let tick = self.next_queue_tick();
         let bytes = body.bytes;
+        let record = QueueRecord {
+            key: key.clone(),
+            tick,
+        };
         match queue {
             QueueKind::Small => {
                 self.small_bytes += bytes;
-                self.small.push_back(QueueRecord {
-                    key: key.clone(),
-                    tick,
-                });
+                self.small.push_back(record);
             }
             QueueKind::Main => {
                 self.main_bytes += bytes;
-                self.main.push_back(QueueRecord {
-                    key: key.clone(),
-                    tick,
-                });
+                self.main.push_back(record);
             }
         }
         self.slots.insert(
@@ -478,9 +475,8 @@ impl CacheInner {
     /// Remembers a key evicted from the small queue, bounded relative to the
     /// live cache so the ghost queue cannot grow without limit.
     fn ghost_insert(&mut self, key: CacheKey) {
-        if !self.ghost_set.contains(&key) {
-            self.ghost_order.push_back(key.clone());
-            self.ghost_set.insert(key);
+        if self.ghost_set.insert(key.clone()) {
+            self.ghost_order.push_back(key);
         }
         let limit = self.slots.len().saturating_mul(2).saturating_add(1_024);
         while self.ghost_set.len() > limit {
@@ -606,10 +602,7 @@ async fn read_header<T: ReadOps>(
         tree_key: tree_key.clone(),
         partition,
     };
-    match txn.get(key).await? {
-        Some(PersistentValue::PartitionHeader(header)) => Ok(header),
-        _ => Err(Error::new(ErrorKind::Corruption)),
-    }
+    expect_header(txn.get(key).await?)?.ok_or_else(|| Error::new(ErrorKind::Corruption))
 }
 
 /// The accounted decoded size of one Leaf Entry: the envelope, the Record ID

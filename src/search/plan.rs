@@ -146,7 +146,9 @@ pub(crate) fn plan_tree_keys(
     };
     let index = manifest.logical_index_id();
 
-    let mut drafts = vec![Draft::prefix()];
+    // Leading exact-point prefixes expanded so far; the current field's typed
+    // interval bounds ride on the expansion loop, not the prefix list.
+    let mut prefixes: Vec<Vec<Value>> = vec![Vec::new()];
     let mut ranges = Vec::new();
     for ordinal in 0..schema.types.len() {
         let Some(set) = &constraints.sets[ordinal] else {
@@ -159,11 +161,11 @@ pub(crate) fn plan_tree_keys(
                 types: schema.types.clone(),
             });
         }
-        let draft_count =
-            u64::try_from(drafts.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
+        let prefix_count =
+            u64::try_from(prefixes.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
         let interval_count =
             u64::try_from(set.intervals.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
-        let product = draft_count
+        let product = prefix_count
             .checked_mul(interval_count)
             .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
         if product > u64::from(range_limit) {
@@ -176,36 +178,32 @@ pub(crate) fn plan_tree_keys(
             .collect::<Result<Option<Vec<_>>>>()?;
         if let Some(points) = points {
             let mut next = Vec::with_capacity(product as usize);
-            for draft in &drafts {
+            for prefix in &prefixes {
                 for value in &points {
-                    next.push(Draft::with_point(&draft.prefix, value.clone()));
+                    let mut extended = prefix.clone();
+                    extended.push(value.clone());
+                    next.push(extended);
                 }
             }
-            drafts = next;
+            prefixes = next;
         } else {
-            for draft in &drafts {
+            for prefix in &prefixes {
                 for interval in &set.intervals {
                     ranges.push(materialize_range(
                         index,
                         &schema.types,
-                        &draft.prefix,
+                        prefix,
                         interval.lo.as_ref(),
                         interval.hi.as_ref(),
                     )?);
                 }
             }
-            drafts.clear();
+            prefixes.clear();
             break;
         }
     }
-    for draft in &drafts {
-        ranges.push(materialize_range(
-            index,
-            &schema.types,
-            &draft.prefix,
-            None,
-            None,
-        )?);
+    for prefix in &prefixes {
+        ranges.push(materialize_range(index, &schema.types, prefix, None, None)?);
     }
     // String upper bounds widen to the byte successor of the bound encoding,
     // so a following range that extends that encoding can overlap. Merging
@@ -677,25 +675,7 @@ impl FieldCheck {
     }
 }
 
-/// One range draft: the leading exact field values expanded so far. The next
-/// field's typed interval bounds ride on the expansion loop, not the draft.
-struct Draft {
-    prefix: Vec<Value>,
-}
-
-impl Draft {
-    fn prefix() -> Self {
-        Self { prefix: Vec::new() }
-    }
-
-    fn with_point(prefix: &[Value], value: Value) -> Self {
-        let mut extended = prefix.to_vec();
-        extended.push(value);
-        Self { prefix: extended }
-    }
-}
-
-/// Materializes one draft as a directory byte range.
+/// Materializes one expanded prefix as a directory byte range.
 ///
 /// The end is the byte successor of the prefix plus upper bound when present,
 /// so a String upper bound conservatively includes extended values that the
@@ -709,8 +689,16 @@ fn materialize_range(
 ) -> Result<KeyRange> {
     let prefix = TreeKey::encode(&types[..prefix_values.len()], prefix_values)?;
     let ty = types.get(prefix_values.len());
-    let lower = lo.map(|value| encode_scalar(ty, value)).transpose()?;
-    let upper = hi.map(|value| encode_scalar(ty, value)).transpose()?;
+    let encode_bound = |value: &Value| -> Result<Vec<u8>> {
+        let ty = ty.ok_or_else(Error::invalid_argument)?;
+        Ok(
+            TreeKey::encode(std::slice::from_ref(ty), std::slice::from_ref(value))?
+                .as_bytes()
+                .to_vec(),
+        )
+    };
+    let lower = lo.map(encode_bound).transpose()?;
+    let upper = hi.map(encode_bound).transpose()?;
     Ok(keys::tree_manifest_plan_range(
         index,
         prefix.as_bytes(),
@@ -720,9 +708,9 @@ fn materialize_range(
 }
 
 /// Merges overlapping or adjacent byte ranges, preserving order.
-fn merge_ranges(mut ranges: Vec<KeyRange>) -> Vec<KeyRange> {
+fn merge_ranges(ranges: Vec<KeyRange>) -> Vec<KeyRange> {
     let mut merged: Vec<KeyRange> = Vec::with_capacity(ranges.len());
-    for range in ranges.drain(..) {
+    for range in ranges {
         match merged.last_mut() {
             Some(last) if last.end() >= range.start() => {
                 if range.end() > last.end() {
@@ -733,16 +721,6 @@ fn merge_ranges(mut ranges: Vec<KeyRange>) -> Vec<KeyRange> {
         }
     }
     merged
-}
-
-/// Encodes one scalar field bound using the Tree Key codec.
-fn encode_scalar(ty: Option<&DataType>, value: &Value) -> Result<Vec<u8>> {
-    let ty = ty.ok_or_else(Error::invalid_argument)?;
-    Ok(
-        TreeKey::encode(std::slice::from_ref(ty), std::slice::from_ref(value))?
-            .as_bytes()
-            .to_vec(),
-    )
 }
 
 fn interval_is_empty(ty: DataType, interval: &Interval) -> bool {

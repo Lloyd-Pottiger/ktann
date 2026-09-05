@@ -11,7 +11,7 @@ use ktann::api::{
     RuntimeConfig, UpsertResult, Value,
 };
 use ktann::runtime::Runtime;
-use ktann::storage::backend::{AdmissionBudget, Backend, Capabilities, HardLimits, ScanLimits};
+use ktann::storage::backend::{AdmissionBudget, Backend, ScanLimits};
 use ktann::storage::keys::{LogicalKey, TreeKey};
 use ktann::storage::values::{
     ChildEntry, IndexLifecycle, IndexManifest, PartitionHeader, PartitionState, PartitionSynopsis,
@@ -21,55 +21,12 @@ use ktann::storage::{LogicalRange, ReadLogicalTxn, WriteLogicalTxn, tree_manifes
 use tokio_util::sync::CancellationToken;
 
 use support::{
-    CommitFault, CommitOutcome, DeterministicBackend, DeterministicConfig, DeterministicReadTxn,
-    DeterministicWriteTxn, Rng,
+    CommitFault, CommitOutcome, DeterministicBackend, DeterministicConfig, Rng, SharedBackend,
+    read_manifest,
 };
 
 #[allow(dead_code)]
 mod support;
-
-#[derive(Clone)]
-struct SharedBackend {
-    inner: Arc<DeterministicBackend>,
-}
-
-impl SharedBackend {
-    fn new(inner: DeterministicBackend) -> Self {
-        Self {
-            inner: Arc::new(inner),
-        }
-    }
-}
-
-impl Backend for SharedBackend {
-    type ReadTxn<'backend> = DeterministicReadTxn<'backend>;
-
-    type WriteTxn<'backend> = DeterministicWriteTxn<'backend>;
-
-    fn hard_limits(&self) -> HardLimits {
-        self.inner.hard_limits()
-    }
-
-    fn admission_budget(&self) -> AdmissionBudget {
-        self.inner.admission_budget()
-    }
-
-    fn capabilities(&self) -> Capabilities {
-        self.inner.capabilities()
-    }
-
-    async fn shutdown(&self) {
-        self.inner.shutdown().await;
-    }
-
-    async fn begin_read(&self) -> ktann::api::Result<Self::ReadTxn<'_>> {
-        self.inner.begin_read().await
-    }
-
-    async fn begin_write(&self) -> ktann::api::Result<Self::WriteTxn<'_>> {
-        self.inner.begin_write().await
-    }
-}
 
 fn backend(config: DeterministicConfig) -> SharedBackend {
     SharedBackend::new(DeterministicBackend::new(config))
@@ -118,19 +75,6 @@ async fn make_index(runtime: &Runtime<SharedBackend>) -> Index<SharedBackend> {
         .create_index("index", config())
         .await
         .expect("create index")
-}
-
-async fn read_manifest(backend: &SharedBackend, index: LogicalIndexId) -> IndexManifest {
-    let raw = backend.begin_read().await.expect("begin read");
-    let mut txn = ReadLogicalTxn::bootstrap(raw);
-    match txn
-        .get(LogicalKey::Manifest(index))
-        .await
-        .expect("read manifest")
-    {
-        Some(PersistentValue::IndexManifest(manifest)) => manifest,
-        _ => panic!("committed manifest must exist"),
-    }
 }
 
 async fn read_location(
@@ -214,7 +158,7 @@ async fn leaf_member_ids(
 async fn tree_exists(backend: &SharedBackend, manifest: &IndexManifest, bucket: i64) -> bool {
     let raw = backend.begin_read().await.expect("begin read");
     let mut txn = ReadLogicalTxn::for_index(raw, manifest).expect("bind index");
-    ktann::storage::tree_manifest::read_tree_manifest(&mut txn, &tree_key(bucket))
+    tree_manifest::read_tree_manifest(&mut txn, &tree_key(bucket))
         .await
         .expect("read tree manifest")
         .is_some()
@@ -222,7 +166,7 @@ async fn tree_exists(backend: &SharedBackend, manifest: &IndexManifest, bucket: 
 
 fn commit_outcomes(backend: &SharedBackend) -> Vec<CommitOutcome> {
     backend
-        .inner
+        .inner()
         .history()
         .iter()
         .map(|entry| entry.outcome)
@@ -456,7 +400,7 @@ async fn batch_mutate_is_all_or_nothing_on_item_failure() {
     let index = make_index(&runtime).await;
 
     index.insert(record(&rid(1), 1.0, 1)).await.expect("insert");
-    let keys_before = backend.inner.db_key_count();
+    let keys_before = backend.inner().db_key_count();
 
     let error = index
         .batch_mutate(vec![
@@ -478,7 +422,7 @@ async fn batch_mutate_is_all_or_nothing_on_item_failure() {
         .expect("record 1 exists");
     assert_eq!(stored.vector(), &[1.0, 0.0]);
     assert_eq!(stored.fields(), &[Value::I64(1)]);
-    assert_eq!(backend.inner.db_key_count(), keys_before);
+    assert_eq!(backend.inner().db_key_count(), keys_before);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -486,11 +430,11 @@ async fn empty_batch_succeeds_without_storage_work() {
     let backend = backend(DeterministicConfig::default());
     let runtime = make_runtime(backend.clone());
     let index = make_index(&runtime).await;
-    let keys_before = backend.inner.db_key_count();
+    let keys_before = backend.inner().db_key_count();
 
     let outcomes = index.batch_mutate(Vec::new()).await.expect("empty batch");
     assert_eq!(outcomes, Vec::new());
-    assert_eq!(backend.inner.db_key_count(), keys_before);
+    assert_eq!(backend.inner().db_key_count(), keys_before);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -498,7 +442,7 @@ async fn invalid_records_fail_validation_before_storage_work() {
     let backend = backend(DeterministicConfig::default());
     let runtime = make_runtime(backend.clone());
     let index = make_index(&runtime).await;
-    let keys_before = backend.inner.db_key_count();
+    let keys_before = backend.inner().db_key_count();
 
     // A wrong vector dimension is rejected before any transaction begins.
     let wrong_dimension = Record::new(rid(1), Arc::from([1.0_f32, 0.0, 0.0]), vec![Value::I64(1)])
@@ -524,7 +468,7 @@ async fn invalid_records_fail_validation_before_storage_work() {
     assert_eq!(error.position(), Some(1));
 
     assert_record_absent(&index, &rid(2)).await;
-    assert_eq!(backend.inner.db_key_count(), keys_before);
+    assert_eq!(backend.inner().db_key_count(), keys_before);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -534,18 +478,16 @@ async fn a_retryable_abort_replays_the_whole_mutation() {
     let index = make_index(&runtime).await;
 
     backend
-        .inner
+        .inner()
         .push_fault(CommitFault::Abort)
         .expect("fault fits the plan");
     index.insert(record(&rid(1), 1.0, 1)).await.expect("insert");
 
     // The first attempt aborted and the whole mutation replayed and committed.
     let outcomes = commit_outcomes(&backend);
-    let mut insert_outcomes = outcomes.iter().rev().take(2).copied().collect::<Vec<_>>();
-    insert_outcomes.reverse();
     assert_eq!(
-        insert_outcomes,
-        vec![CommitOutcome::Aborted, CommitOutcome::Committed]
+        outcomes[outcomes.len() - 2..],
+        [CommitOutcome::Aborted, CommitOutcome::Committed]
     );
 
     let stored = index
@@ -569,7 +511,7 @@ async fn contention_exhaustion_is_reported_and_nothing_commits() {
     let index = make_index(&runtime).await;
 
     backend
-        .inner
+        .inner()
         .set_fault_plan(vec![CommitFault::Abort; 8])
         .expect("fault plan");
     let error = index
@@ -595,7 +537,7 @@ async fn an_unknown_commit_outcome_is_returned_without_retry() {
 
     // Unknown-applied: the mutation lands but the caller learns nothing.
     backend
-        .inner
+        .inner()
         .set_fault_plan(vec![CommitFault::UnknownApplied])
         .expect("fault plan");
     let error = index
@@ -614,10 +556,10 @@ async fn an_unknown_commit_outcome_is_returned_without_retry() {
 
     // Unknown-not-applied: nothing lands, and the operation is not retried.
     backend
-        .inner
+        .inner()
         .set_fault_plan(vec![CommitFault::UnknownNotApplied])
         .expect("fault plan");
-    let history_before = backend.inner.history().len();
+    let history_before = backend.inner().history().len();
     let error = index
         .insert(record(&rid(2), 2.0, 1))
         .await
@@ -625,7 +567,7 @@ async fn an_unknown_commit_outcome_is_returned_without_retry() {
     assert_eq!(error.kind(), ErrorKind::CommitOutcomeUnknown);
     assert_record_absent(&index, &rid(2)).await;
     assert_eq!(
-        backend.inner.history().len(),
+        backend.inner().history().len(),
         history_before + 1,
         "an unknown outcome never enters the retry loop"
     );
@@ -636,7 +578,7 @@ async fn cancellation_and_deadline_fail_before_storage_work() {
     let backend = backend(DeterministicConfig::default());
     let runtime = make_runtime(backend.clone());
     let index = make_index(&runtime).await;
-    let keys_before = backend.inner.db_key_count();
+    let keys_before = backend.inner().db_key_count();
 
     let cancellation = CancellationToken::new();
     cancellation.cancel();
@@ -658,7 +600,7 @@ async fn cancellation_and_deadline_fail_before_storage_work() {
         .expect_err("expired deadline");
     assert_eq!(error.kind(), ErrorKind::DeadlineExceeded);
 
-    assert_eq!(backend.inner.db_key_count(), keys_before);
+    assert_eq!(backend.inner().db_key_count(), keys_before);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -832,7 +774,7 @@ async fn seeded_model_history_with_abort_faults_preserves_membership() {
             consecutive = 0;
         }
     }
-    backend.inner.set_fault_plan(plan).expect("fault plan");
+    backend.inner().set_fault_plan(plan).expect("fault plan");
 
     let mut rng = Rng(0x243f_6a88_85a3_08d3);
     let mut model: HashMap<Bytes, (f32, i64)> = HashMap::new();
@@ -1163,7 +1105,7 @@ async fn batched_inserts_share_routing_and_apply_writes_once() {
     seed_grown_tree(&backend, &manifest, 1).await;
 
     const N: usize = 40;
-    backend.inner.reset_operation_counts();
+    backend.inner().reset_operation_counts();
     let outcomes = index
         .batch_mutate(
             (0..N as u8)
@@ -1177,7 +1119,7 @@ async fn batched_inserts_share_routing_and_apply_writes_once() {
         .expect("batch insert");
     assert_eq!(outcomes.len(), N);
 
-    let counts = backend.inner.operation_counts();
+    let counts = backend.inner().operation_counts();
     // One grouped descent for the whole batch: one Tree Manifest read, one
     // root authority read, one batched authority (Header+State) read for both
     // leaves, and one batched Child Entry scan round, independent of the
@@ -1244,7 +1186,7 @@ async fn batched_routing_reads_authority_once_per_tree_level() {
     seed_grown_tree(&backend, &manifest, 1).await;
     deepen_tree(&backend, &manifest, 1).await;
 
-    backend.inner.reset_operation_counts();
+    backend.inner().reset_operation_counts();
     index
         .batch_mutate(
             (0..16_u8)
@@ -1262,7 +1204,7 @@ async fn batched_routing_reads_authority_once_per_tree_level() {
         .await
         .expect("batch insert");
 
-    let counts = backend.inner.operation_counts();
+    let counts = backend.inner().operation_counts();
     // The route reads the root, both level-two candidates, and all level-one
     // candidates as three authority waves.
     assert_eq!(counts.batch_get, 3, "authority waves: {counts:?}");
@@ -1297,7 +1239,7 @@ async fn batched_routing_scans_wide_bodies_in_lockstep() {
     seed_grown_tree(&backend, &manifest, 1).await;
     widen_tree(&backend, &manifest, 1).await;
 
-    backend.inner.reset_operation_counts();
+    backend.inner().reset_operation_counts();
     index
         .batch_mutate(
             [0.0_f32, 1.0, 2.0, 3.0, 1_000.0, 1_001.0, 1_002.0, 1_003.0]
@@ -1309,7 +1251,7 @@ async fn batched_routing_scans_wide_bodies_in_lockstep() {
         .await
         .expect("batch insert");
 
-    let counts = backend.inner.operation_counts();
+    let counts = backend.inner().operation_counts();
     // The root wave scans its one two-child body in a single round. Both
     // level-two bodies hold 130 Child Entries — three 64-item pages each —
     // and their wave completes in three lockstep rounds, one batched scan
@@ -1343,7 +1285,7 @@ async fn batched_upserts_read_locations_in_one_call() {
         .collect::<Vec<_>>();
     index.batch_mutate(upserts).await.expect("seed upserts");
 
-    backend.inner.reset_operation_counts();
+    backend.inner().reset_operation_counts();
     let outcomes = index
         .batch_mutate(
             (0..N as u8)
@@ -1361,7 +1303,7 @@ async fn batched_upserts_read_locations_in_one_call() {
     // whole batch, a second warms every item's membership read set, and a
     // third validates every distinct routed leaf; the membership operations
     // re-read from the transaction-local cache.
-    let counts = backend.inner.operation_counts();
+    let counts = backend.inner().operation_counts();
     assert_eq!(counts.batch_get_for_update, 3, "batched reads: {counts:?}");
 
     for i in 0..N as u8 {
@@ -1396,7 +1338,7 @@ async fn batched_deletes_read_membership_in_bounded_calls() {
         .await
         .expect("seed inserts");
 
-    backend.inner.reset_operation_counts();
+    backend.inner().reset_operation_counts();
     let outcomes = index
         .batch_mutate(
             (0..N as u8)
@@ -1414,7 +1356,7 @@ async fn batched_deletes_read_membership_in_bounded_calls() {
             .collect::<Vec<_>>()
     );
 
-    let counts = backend.inner.operation_counts();
+    let counts = backend.inner().operation_counts();
     // One prefetch batch warms every Record/Location pair and a second warms
     // the Leaf Entries and leaf Headers of the records that exist (the absent
     // Record ID contributes no leaf key); the per-item delete checks are then

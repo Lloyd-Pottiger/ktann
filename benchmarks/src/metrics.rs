@@ -352,11 +352,7 @@ fn finite_u64(value: f64) -> Option<u64> {
 
 /// Converts a nonnegative integral gauge to a process-local resource count.
 fn finite_usize(value: f64) -> Option<usize> {
-    if value.is_finite() && value >= 0.0 && value <= usize::MAX as f64 {
-        Some(value as usize)
-    } else {
-        None
-    }
+    finite_u64(value).and_then(|value| usize::try_from(value).ok())
 }
 
 #[cfg(test)]

@@ -87,13 +87,15 @@ impl<B: Backend> Index<B> {
         record: Record,
         operation_options: OperationOptions,
     ) -> Result<()> {
-        let mut mutations = vec![Mutation::Insert(record)];
-        self.validate(&mut mutations)?;
-        let outcomes = self
-            .run_mutations(Operation::Insert, mutations, operation_options)
-            .await?;
-        match outcomes.first() {
-            Some(MutationOutcome::Inserted) => Ok(()),
+        match self
+            .run_single_mutation(
+                Operation::Insert,
+                Mutation::Insert(record),
+                operation_options,
+            )
+            .await?
+        {
+            MutationOutcome::Inserted => Ok(()),
             _ => Err(Error::new(ErrorKind::Backend)),
         }
     }
@@ -118,14 +120,16 @@ impl<B: Backend> Index<B> {
         record: Record,
         operation_options: OperationOptions,
     ) -> Result<UpsertResult> {
-        let mut mutations = vec![Mutation::Upsert(record)];
-        self.validate(&mut mutations)?;
-        let outcomes = self
-            .run_mutations(Operation::Upsert, mutations, operation_options)
-            .await?;
-        match outcomes.first() {
-            Some(MutationOutcome::Upserted { replaced: true }) => Ok(UpsertResult::Replaced),
-            Some(MutationOutcome::Upserted { replaced: false }) => Ok(UpsertResult::Created),
+        match self
+            .run_single_mutation(
+                Operation::Upsert,
+                Mutation::Upsert(record),
+                operation_options,
+            )
+            .await?
+        {
+            MutationOutcome::Upserted { replaced: true } => Ok(UpsertResult::Replaced),
+            MutationOutcome::Upserted { replaced: false } => Ok(UpsertResult::Created),
             _ => Err(Error::new(ErrorKind::Backend)),
         }
     }
@@ -147,13 +151,11 @@ impl<B: Backend> Index<B> {
         id: Bytes,
         operation_options: OperationOptions,
     ) -> Result<bool> {
-        let mut mutations = vec![Mutation::Delete(id)];
-        self.validate(&mut mutations)?;
-        let outcomes = self
-            .run_mutations(Operation::Delete, mutations, operation_options)
-            .await?;
-        match outcomes.first() {
-            Some(MutationOutcome::Deleted { existed }) => Ok(*existed),
+        match self
+            .run_single_mutation(Operation::Delete, Mutation::Delete(id), operation_options)
+            .await?
+        {
+            MutationOutcome::Deleted { existed } => Ok(existed),
             _ => Err(Error::new(ErrorKind::Backend)),
         }
     }
@@ -347,6 +349,24 @@ impl<B: Backend> Index<B> {
     ) -> Result<Vec<MutationOutcome>> {
         self.run_mutations_with_import_permit(operation, mutations, operation_options, None)
             .await
+    }
+
+    /// Runs one validated single-mutation batch and returns its one outcome.
+    async fn run_single_mutation(
+        &self,
+        operation: Operation,
+        mutation: Mutation,
+        operation_options: OperationOptions,
+    ) -> Result<MutationOutcome> {
+        let mut mutations = vec![mutation];
+        self.validate(&mut mutations)?;
+        let outcomes = self
+            .run_mutations(operation, mutations, operation_options)
+            .await?;
+        match outcomes.into_iter().next() {
+            Some(outcome) => Ok(outcome),
+            None => Err(Error::new(ErrorKind::Backend)),
+        }
     }
 
     /// Runs one Import Session batch with its adaptive concurrency permit.

@@ -122,7 +122,7 @@ pub async fn train_split_centroids<T: ReadOps>(
     tree_key: &TreeKey,
     source: PartitionKey,
 ) -> Result<SplitCentroids> {
-    let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
+    let manifest = txn.require_manifest()?;
     let header = match txn
         .get(LogicalKey::Header {
             index: manifest.logical_index_id(),
@@ -556,26 +556,18 @@ mod tests {
     }
 
     #[test]
-    fn a_malformed_undersized_entry_is_still_corruption() {
-        let kernel = kernel(2, Metric::L2);
-        assert_kind(train(&kernel, entries(&[&[1.0]])), ErrorKind::Corruption);
-        assert_kind(
-            train(&kernel, entries(&[&[1.0, f32::NAN]])),
-            ErrorKind::Corruption,
-        );
-    }
-
-    #[test]
     fn malformed_entry_vectors_are_corruption() {
         let kernel = kernel(2, Metric::L2);
-        assert_kind(
-            train(&kernel, entries(&[&[1.0], &[2.0]])),
-            ErrorKind::Corruption,
-        );
-        assert_kind(
-            train(&kernel, entries(&[&[1.0, f32::NAN], &[2.0, 3.0]])),
-            ErrorKind::Corruption,
-        );
+        // Entry validation precedes the degenerate undersized-source handling,
+        // so even a one-entry source fails closed on a malformed vector.
+        for malformed in [
+            entries(&[&[1.0]]),
+            entries(&[&[1.0, f32::NAN]]),
+            entries(&[&[1.0], &[2.0]]),
+            entries(&[&[1.0, f32::NAN], &[2.0, 3.0]]),
+        ] {
+            assert_kind(train(&kernel, malformed), ErrorKind::Corruption);
+        }
     }
 
     #[test]

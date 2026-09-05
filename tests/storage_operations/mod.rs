@@ -85,10 +85,9 @@ async fn namespace_manifest_and_name_directory_operations_are_typed() {
     let backend = DeterministicBackend::default();
     let manifest = manifest();
     let name = IndexName::new("documents").expect("valid name");
-    let limits = backend.hard_limits();
-    let budget = backend.admission_budget();
     let raw = backend.begin_write().await.expect("begin write");
-    let mut txn = WriteLogicalTxn::bootstrap(raw, limits, budget);
+    let mut txn =
+        WriteLogicalTxn::bootstrap(raw, backend.hard_limits(), backend.admission_budget());
 
     let inserted = txn
         .insert(
@@ -189,11 +188,7 @@ async fn partition_scans_decode_mixed_families_and_page_without_read_ahead() {
     let manifest = manifest();
     let tree_key = tree_key();
     let partition = pk(1);
-    let limits = backend.hard_limits();
-    let budget = backend.admission_budget();
-    let raw = backend.begin_write().await.expect("begin write");
-    let mut txn =
-        WriteLogicalTxn::for_index(raw, &manifest, limits, budget).expect("bind manifest");
+    let mut txn = index_write_txn(&backend, &manifest).await;
     let mut mutations = txn.mutations();
 
     for (record_id, value) in [(b"b".as_slice(), record(b"b")), (b"a", record(b"a"))] {
@@ -338,11 +333,7 @@ async fn batched_typed_scans_paginate_each_leg_independently() {
     let backend = DeterministicBackend::default();
     let manifest = manifest();
     let tree_key = tree_key();
-    let limits = backend.hard_limits();
-    let budget = backend.admission_budget();
-    let raw = backend.begin_write().await.expect("begin write");
-    let mut txn =
-        WriteLogicalTxn::for_index(raw, &manifest, limits, budget).expect("bind manifest");
+    let mut txn = index_write_txn(&backend, &manifest).await;
     let mut mutations = txn.mutations();
     for (partition, record_ids) in [(pk(1), ["a", "b", "c"]), (pk(2), ["x", "y", "z"])] {
         for record_id in record_ids {
@@ -436,12 +427,10 @@ async fn batched_typed_scans_paginate_each_leg_independently() {
     assert_eq!(error.kind(), ErrorKind::InvalidArgument);
 }
 
-#[tokio::test]
-async fn reads_and_scans_fail_closed_on_key_value_identity_mismatch() {
-    let backend = DeterministicBackend::default();
-    let manifest = manifest();
-    let codec = ValueCodec::for_index(&manifest);
-    let mismatched = codec
+/// Seeds a committed Vector Record whose encoded Record ID ("actual") disagrees
+/// with the Record ID in its key ("requested"), for fail-closed decode tests.
+async fn seed_mismatched_record(backend: &DeterministicBackend, manifest: &IndexManifest) {
+    let mismatched = ValueCodec::for_index(manifest)
         .encode(&record(b"actual"))
         .expect("encode mismatched record");
     let raw_key =
@@ -451,6 +440,13 @@ async fn reads_and_scans_fail_closed_on_key_value_identity_mismatch() {
         .await
         .expect("seed corruption");
     raw.commit().await.expect("commit corruption");
+}
+
+#[tokio::test]
+async fn reads_and_scans_fail_closed_on_key_value_identity_mismatch() {
+    let backend = DeterministicBackend::default();
+    let manifest = manifest();
+    seed_mismatched_record(&backend, &manifest).await;
 
     let raw = backend.begin_read().await.expect("begin read");
     let mut txn = ReadLogicalTxn::for_index(raw, &manifest).expect("bind manifest");
@@ -654,8 +650,7 @@ async fn range_clear_is_included_in_transaction_admission() {
 
 #[tokio::test]
 async fn applying_a_builder_charges_its_exact_final_size() {
-    let config = DeterministicConfig::default();
-    let backend = DeterministicBackend::new(config);
+    let backend = DeterministicBackend::default();
     let manifest = manifest();
     let raw = backend.begin_write().await.expect("begin write");
     let mut txn = WriteLogicalTxn::for_index(
@@ -725,21 +720,7 @@ fn manifest_write_with_different_immutable_config_is_rejected_when_bound() {
 async fn duplicate_insert_fails_closed_on_corrupt_existing_value() {
     let backend = DeterministicBackend::default();
     let manifest = manifest();
-    // Seed a VectorRecord whose embedded record_id ("actual") disagrees with the
-    // logical key's record_id ("requested").
-    let codec = ValueCodec::for_index(&manifest);
-    let mismatched = codec
-        .encode(&record(b"actual"))
-        .expect("encode mismatched record");
-    let raw_key =
-        keys::record_key(id(7), &Bytes::from_static(b"requested")).expect("encode record key");
-    {
-        let mut raw = backend.begin_write().await.expect("begin write");
-        raw.put(Bytes::from(raw_key), Bytes::from(mismatched))
-            .await
-            .expect("seed corruption");
-        raw.commit().await.expect("commit corruption");
-    }
+    seed_mismatched_record(&backend, &manifest).await;
 
     let raw = backend.begin_write().await.expect("begin write");
     let mut txn = WriteLogicalTxn::for_index(
@@ -923,10 +904,9 @@ async fn insert_at_exhausted_budget_for_absent_key_returns_limit_exceeded() {
         ..DeterministicConfig::default()
     };
     let backend = DeterministicBackend::new(config);
-    let limits = backend.hard_limits();
-    let budget = backend.admission_budget();
     let raw = backend.begin_write().await.expect("begin write");
-    let mut txn = WriteLogicalTxn::bootstrap(raw, limits, budget);
+    let mut txn =
+        WriteLogicalTxn::bootstrap(raw, backend.hard_limits(), backend.admission_budget());
     txn.put(
         LogicalKey::IndexIdAllocator,
         PersistentValue::IndexIdAllocator(IndexIdAllocator::new(1)),

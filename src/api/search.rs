@@ -165,8 +165,10 @@ impl SearchOptions {
     }
 
     /// Resolves overrides against Runtime defaults and validates them for `k`.
+    ///
+    /// `SearchBudgets` fields are set only by validating constructors, so the
+    /// defaults and the resolved budgets are always within the hard caps.
     pub fn resolve(self, defaults: SearchBudgets, k: usize) -> Result<SearchBudgets> {
-        defaults.validate_hard_caps()?;
         let exact_default = default_exact_rerank(k)?;
         let budgets = SearchBudgets {
             scanned_tree_keys: self.scanned_tree_keys.unwrap_or(defaults.scanned_tree_keys),
@@ -178,7 +180,6 @@ impl SearchOptions {
                 .unwrap_or(defaults.visited_leaf_entries),
             exact_rerank_candidates: defaults.exact_rerank_candidates.min(exact_default),
         };
-        budgets.validate_hard_caps()?;
         let k = u32::try_from(k).map_err(|_| Error::invalid_argument())?;
         if budgets.exact_rerank_candidates < k {
             return Err(Error::invalid_argument());

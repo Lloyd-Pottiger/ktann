@@ -164,10 +164,9 @@ mod tests {
         }
 
         fn lock(&self) -> MutexGuard<'_, bool> {
-            match self.open.lock() {
-                Ok(open) => open,
-                Err(poisoned) => poisoned.into_inner(),
-            }
+            self.open
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
         }
     }
 

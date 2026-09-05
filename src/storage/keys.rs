@@ -374,7 +374,7 @@ impl fmt::Debug for KeyRange {
 ///
 /// Returns an empty slice only when `prefix` is all `0xFF`; no logical key
 /// prefix is, because every key begins with the `0x01` version byte.
-fn successor(prefix: &[u8]) -> Vec<u8> {
+pub(super) fn successor(prefix: &[u8]) -> Vec<u8> {
     let mut bytes = prefix.to_vec();
     while let Some(last) = bytes.last_mut() {
         if *last == 0xFF {
@@ -644,7 +644,6 @@ pub fn decode_key(types: &[DataType], key: &Bytes) -> Result<LogicalKey> {
 fn decode_namespace_key(body: &[u8]) -> Result<LogicalKey> {
     match body.first() {
         Some(&NS_INDEX_ID_ALLOCATOR) if body.len() == 1 => Ok(LogicalKey::IndexIdAllocator),
-        Some(&NS_INDEX_ID_ALLOCATOR) => Err(corrupt()),
         Some(&NS_INDEX_NAME_DIRECTORY) => {
             Ok(LogicalKey::IndexNameDirectory(decode_name(&body[1..])?))
         }
@@ -664,7 +663,6 @@ fn decode_index_key(types: &[DataType], key: &Bytes, offset: usize) -> Result<Lo
         KIND_MANIFEST if body.len() == LOGICAL_INDEX_ID_BYTES + 1 => {
             Ok(LogicalKey::Manifest(index))
         }
-        KIND_MANIFEST => Err(corrupt()),
         KIND_RECORD_GROUP => decode_record_group(index, key, rest),
         KIND_TREE_MANIFEST => Ok(LogicalKey::TreeManifest {
             index,

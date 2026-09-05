@@ -509,10 +509,7 @@ async fn revalidate_targets<T: WriteTxn, E>(
     level: u32,
     moves: &[(E, PartitionKey)],
 ) -> Result<bool> {
-    let index = txn
-        .bound_manifest()
-        .ok_or_else(Error::invalid_argument)?
-        .logical_index_id();
+    let index = txn.require_manifest()?.logical_index_id();
     let mut targets: Vec<PartitionKey> = moves.iter().map(|(_, target)| *target).collect();
     targets.sort_unstable();
     targets.dedup();

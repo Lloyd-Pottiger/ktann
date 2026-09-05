@@ -5,6 +5,7 @@
 //! Partition Cache, and peak RSS each have an unambiguous owner. The public
 //! `compare` command accepts only complete, comparable versioned suites.
 
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Write as _};
@@ -112,7 +113,7 @@ struct LifecycleOverrides {
 }
 
 impl LifecycleOverrides {
-    fn parse(values: &std::collections::BTreeMap<String, String>) -> Result<Self, String> {
+    fn parse(values: &BTreeMap<String, String>) -> Result<Self, String> {
         Ok(Self {
             maintenance_workers: values
                 .get("maintenance-workers")
@@ -138,19 +139,6 @@ impl LifecycleOverrides {
             && self.max_in_flight_batches.is_none()
             && self.batch_size.is_none()
             && self.backlog_watermark.is_none()
-    }
-
-    fn append_args(&self, command: &mut Command) {
-        for (name, value) in [
-            ("maintenance-workers", self.maintenance_workers),
-            ("import-max-in-flight-batches", self.max_in_flight_batches),
-            ("import-batch-size", self.batch_size),
-            ("import-backlog-watermark", self.backlog_watermark),
-        ] {
-            if let Some(value) = value {
-                command.args([format!("--{name}"), value.to_string()]);
-            }
-        }
     }
 
     fn apply(&self, scenario: &mut ScenarioSpec) {
@@ -215,11 +203,10 @@ fn parse_run_options(arguments: &[OsString]) -> Result<RunOptions, String> {
         .get("profile")
         .cloned()
         .unwrap_or_else(|| "smoke".to_owned());
-    let worker_threads = values
-        .get("worker-threads")
-        .map_or_else(default_worker_threads, |value| {
-            parse_positive(value, "worker-threads")
-        })?;
+    let worker_threads = match values.get("worker-threads") {
+        Some(value) => parse_positive(value, "worker-threads")?,
+        None => default_worker_threads(),
+    };
     let scenario = values.get("scenario").cloned();
     let write_beam_size = values
         .get("write-beam-size")
@@ -291,11 +278,10 @@ fn parse_worker_options(arguments: &[OsString]) -> Result<WorkerOptions, String>
         profile: required(&values, "profile")?,
         scenario: required(&values, "scenario")?,
         reproduction_command: required(&values, "reproduction-command")?,
-        worker_threads: values
-            .get("worker-threads")
-            .map_or_else(default_worker_threads, |value| {
-                parse_positive(value, "worker-threads")
-            })?,
+        worker_threads: match values.get("worker-threads") {
+            Some(value) => parse_positive(value, "worker-threads")?,
+            None => default_worker_threads(),
+        },
         write_beam_size: values
             .get("write-beam-size")
             .map(|value| parse_positive_u32(value, "write-beam-size"))
@@ -363,11 +349,11 @@ fn parse_compare_options(arguments: &[OsString]) -> Result<CompareOptions, Strin
 fn option_map(
     arguments: &[OsString],
     allowed: &[&str],
-) -> Result<std::collections::BTreeMap<String, String>, String> {
+) -> Result<BTreeMap<String, String>, String> {
     if arguments.len() % 2 != 0 {
         return Err("every option must have a value".to_owned());
     }
-    let mut values = std::collections::BTreeMap::new();
+    let mut values = BTreeMap::new();
     for pair in arguments.chunks_exact(2) {
         let key = pair[0]
             .to_str()
@@ -387,14 +373,16 @@ fn option_map(
 }
 
 /// Returns one required option after the shared parser has validated its key.
-fn required(
-    values: &std::collections::BTreeMap<String, String>,
-    key: &str,
-) -> Result<String, String> {
+fn required(values: &BTreeMap<String, String>, key: &str) -> Result<String, String> {
     values
         .get(key)
         .cloned()
         .ok_or_else(|| format!("missing --{key}"))
+}
+
+/// Renders one optional value as a forwarded worker argument.
+fn option_string<T: ToString>(value: Option<T>) -> Option<String> {
+    value.map(|value| value.to_string())
 }
 
 /// Parses a strictly positive host-sized bound.
@@ -432,10 +420,10 @@ fn parse_number(value: &str, name: &str) -> Result<f64, String> {
 }
 
 /// Bounds the default executor size to keep runs comparable on large hosts.
-fn default_worker_threads() -> Result<usize, String> {
-    Ok(std::thread::available_parallelism()
+fn default_worker_threads() -> usize {
+    std::thread::available_parallelism()
         .map_or(2, usize::from)
-        .clamp(2, 8))
+        .clamp(2, 8)
 }
 
 /// Runs every selected scenario in a fresh subprocess and assembles one suite.
@@ -471,32 +459,34 @@ fn run_suite(options: RunOptions) -> Result<(), String> {
             .args(["--reproduction-command", &reproduction_command])
             .args(["--worker-threads", &options.worker_threads.to_string()])
             .stderr(Stdio::inherit());
-        if let Some(write_beam_size) = options.write_beam_size {
-            command.args(["--write-beam-size", &write_beam_size.to_string()]);
-        }
+        let lifecycle = &options.lifecycle;
         for (name, value) in [
-            (
-                "base-vectors",
-                options.base_vectors.map(|value| value.to_string()),
-            ),
-            (
-                "query-vectors",
-                options.query_vectors.map(|value| value.to_string()),
-            ),
-            (
-                "query-offset",
-                options.query_offset.map(|value| value.to_string()),
-            ),
+            ("write-beam-size", option_string(options.write_beam_size)),
+            ("base-vectors", option_string(options.base_vectors)),
+            ("query-vectors", option_string(options.query_vectors)),
+            ("query-offset", option_string(options.query_offset)),
             (
                 "max-partition-entries",
-                options.max_partition_entries.map(|value| value.to_string()),
+                option_string(options.max_partition_entries),
+            ),
+            (
+                "maintenance-workers",
+                option_string(lifecycle.maintenance_workers),
+            ),
+            (
+                "import-max-in-flight-batches",
+                option_string(lifecycle.max_in_flight_batches),
+            ),
+            ("import-batch-size", option_string(lifecycle.batch_size)),
+            (
+                "import-backlog-watermark",
+                option_string(lifecycle.backlog_watermark),
             ),
         ] {
             if let Some(value) = value {
                 command.args([format!("--{name}"), value]);
             }
         }
-        options.lifecycle.append_args(&mut command);
         let output = command
             .output()
             .map_err(|error| format!("start scenario {}: {error}", scenario.name))?;
@@ -604,8 +594,6 @@ async fn run_rocksdb(
         options.worker_threads,
     )
     .await?;
-    drop(database);
-    drop(directory);
     Ok(report)
 }
 

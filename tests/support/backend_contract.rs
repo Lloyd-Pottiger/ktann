@@ -121,24 +121,6 @@ impl CaseContext {
     }
 }
 
-const SEED_DECLARED: u64 = 1;
-const SEED_SNAPSHOT: u64 = 2;
-const SEED_READ_YOUR_WRITES: u64 = 3;
-const SEED_ORDERED_WRITES: u64 = 4;
-const SEED_PAGINATION: u64 = 5;
-const SEED_UNIQUE_INSERT: u64 = 6;
-const SEED_CONFLICT: u64 = 7;
-const SEED_ABA: u64 = 8;
-const SEED_ROLLBACK: u64 = 9;
-const SEED_RANGE_CLEAR: u64 = 10;
-const SEED_ABORT: u64 = 11;
-const SEED_UNKNOWN_APPLIED: u64 = 12;
-const SEED_UNKNOWN_NOT_APPLIED: u64 = 13;
-const SEED_DURABILITY: u64 = 14;
-const SEED_SCAN_NO_SKIP: u64 = 15;
-const SEED_SCAN_EMPTY: u64 = 16;
-const SEED_BATCH_SCAN: u64 = 17;
-
 /// Runs every applicable contract case against `harness`.
 ///
 /// Cases whose capability is unavailable ([`FaultInjection::Unavailable`] or
@@ -146,56 +128,25 @@ const SEED_BATCH_SCAN: u64 = 17;
 /// adapter. Case order is stable so a replay against a fresh harness observes
 /// the same sequence of operations.
 pub async fn run_suite<H: BackendHarness>(harness: &H) {
-    let ctx = CaseContext::new("declared_limits", SEED_DECLARED);
-    case_declared_limits_and_capabilities(harness, &ctx).await;
-
-    let ctx = CaseContext::new("snapshot_consistency", SEED_SNAPSHOT);
-    case_snapshot_consistency(harness, &ctx).await;
-
-    let ctx = CaseContext::new("read_your_writes", SEED_READ_YOUR_WRITES);
-    case_read_your_writes(harness, &ctx).await;
-
-    let ctx = CaseContext::new("ordered_writes", SEED_ORDERED_WRITES);
-    case_ordered_writes(harness, &ctx).await;
-
-    let ctx = CaseContext::new("scan_pagination", SEED_PAGINATION);
-    case_scan_pagination(harness, &ctx).await;
-
-    let ctx = CaseContext::new("unique_insert", SEED_UNIQUE_INSERT);
-    case_unique_insert(harness, &ctx).await;
-
-    let ctx = CaseContext::new("update_protected_conflict", SEED_CONFLICT);
-    case_update_protected_conflict(harness, &ctx).await;
-
-    let ctx = CaseContext::new("aba_conflict", SEED_ABA);
-    case_aba_conflict(harness, &ctx).await;
-
-    let ctx = CaseContext::new("rollback_and_drop", SEED_ROLLBACK);
-    case_rollback_and_drop(harness, &ctx).await;
-
-    let ctx = CaseContext::new("range_clear_capability", SEED_RANGE_CLEAR);
-    case_range_clear_capability(harness, &ctx).await;
-
-    let ctx = CaseContext::new("commit_definite_abort", SEED_ABORT);
-    case_commit_definite_abort(harness, &ctx).await;
-
-    let ctx = CaseContext::new("commit_unknown_applied", SEED_UNKNOWN_APPLIED);
-    case_commit_unknown_applied(harness, &ctx).await;
-
-    let ctx = CaseContext::new("commit_unknown_not_applied", SEED_UNKNOWN_NOT_APPLIED);
-    case_commit_unknown_not_applied(harness, &ctx).await;
-
-    let ctx = CaseContext::new("durability_mapping", SEED_DURABILITY);
-    case_durability_mapping(harness, &ctx).await;
-
-    let ctx = CaseContext::new("scan_no_skip", SEED_SCAN_NO_SKIP);
-    case_scan_no_skip(harness, &ctx).await;
-
-    let ctx = CaseContext::new("scan_empty_range", SEED_SCAN_EMPTY);
-    case_scan_empty_range(harness, &ctx).await;
-
-    let ctx = CaseContext::new("batch_scan", SEED_BATCH_SCAN);
-    case_batch_scan(harness, &ctx).await;
+    case_declared_limits_and_capabilities(harness, &CaseContext::new("declared_limits", 1)).await;
+    case_snapshot_consistency(harness, &CaseContext::new("snapshot_consistency", 2)).await;
+    case_read_your_writes(harness, &CaseContext::new("read_your_writes", 3)).await;
+    case_ordered_writes(harness, &CaseContext::new("ordered_writes", 4)).await;
+    case_scan_pagination(harness, &CaseContext::new("scan_pagination", 5)).await;
+    case_unique_insert(harness, &CaseContext::new("unique_insert", 6)).await;
+    case_update_protected_conflict(harness, &CaseContext::new("update_protected_conflict", 7))
+        .await;
+    case_aba_conflict(harness, &CaseContext::new("aba_conflict", 8)).await;
+    case_rollback_and_drop(harness, &CaseContext::new("rollback_and_drop", 9)).await;
+    case_range_clear_capability(harness, &CaseContext::new("range_clear_capability", 10)).await;
+    case_commit_definite_abort(harness, &CaseContext::new("commit_definite_abort", 11)).await;
+    case_commit_unknown_applied(harness, &CaseContext::new("commit_unknown_applied", 12)).await;
+    case_commit_unknown_not_applied(harness, &CaseContext::new("commit_unknown_not_applied", 13))
+        .await;
+    case_durability_mapping(harness, &CaseContext::new("durability_mapping", 14)).await;
+    case_scan_no_skip(harness, &CaseContext::new("scan_no_skip", 15)).await;
+    case_scan_empty_range(harness, &CaseContext::new("scan_empty_range", 16)).await;
+    case_batch_scan(harness, &CaseContext::new("batch_scan", 17)).await;
 }
 
 // ---------------------------------------------------------------------------

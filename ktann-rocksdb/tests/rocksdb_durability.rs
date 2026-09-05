@@ -21,21 +21,26 @@
 //! finishes, so repeated runs stay isolated and cleaned up.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use bytes::Bytes;
 use ktann::storage::backend::{Backend, ReadOps, WriteTxn};
 use ktann_rocksdb::{BackendNamespace, RocksDbBackend};
-use rocksdb::{OptimisticTransactionDB, Options};
+use rocksdb::Options;
+
+mod support;
+
+use support::open_database;
 
 const PHASE_ENV: &str = "KTANN_ROCKSDB_DURABILITY_PHASE";
 const PATH_ENV: &str = "KTANN_ROCKSDB_DURABILITY_PATH";
 
-fn open_database(path: &Path) -> OptimisticTransactionDB {
-    let mut options = Options::default();
-    options.create_if_missing(true);
-    OptimisticTransactionDB::open(&options, path).expect("open RocksDB")
-}
+/// The committed key/value probes the write phase stores and the verify phase
+/// reads back.
+const PROBE_ENTRIES: [(&[u8], &[u8]); 2] = [
+    (b"committed-a", b"durable-a"),
+    (b"committed-b", b"durable-b"),
+];
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires write and verify phases in separate processes sharing one database path"]
@@ -54,10 +59,7 @@ async fn rocksdb_data_survives_process_restart() {
             }
             let backend = RocksDbBackend::new(open_database(&path), namespace);
             let mut transaction = backend.begin_write().await.expect("begin durable write");
-            for (key, value) in [
-                (b"committed-a", b"durable-a"),
-                (b"committed-b", b"durable-b"),
-            ] {
+            for (key, value) in PROBE_ENTRIES {
                 transaction
                     .put(Bytes::from_static(key), Bytes::from_static(value))
                     .await
@@ -72,10 +74,7 @@ async fn rocksdb_data_survives_process_restart() {
         Ok("verify") => {
             let backend = RocksDbBackend::new(open_database(&path), namespace);
             let mut transaction = backend.begin_read().await.expect("begin durable read");
-            for (key, value) in [
-                (b"committed-a", b"durable-a"),
-                (b"committed-b", b"durable-b"),
-            ] {
+            for (key, value) in PROBE_ENTRIES {
                 assert_eq!(
                     transaction
                         .get(Bytes::from_static(key))

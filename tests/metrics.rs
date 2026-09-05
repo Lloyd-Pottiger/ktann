@@ -27,18 +27,20 @@ use support::{DeterministicBackend, DeterministicConfig, SharedBackend, audit, o
 #[allow(dead_code)]
 mod support;
 
+/// Returns `true` when one series carries every expected label.
+fn has_labels(series_labels: &[(String, String)], labels: &[(&str, &str)]) -> bool {
+    labels.iter().all(|(key, value)| {
+        series_labels
+            .iter()
+            .any(|label| label.0 == *key && label.1 == *value)
+    })
+}
+
 /// Returns one cumulative counter series value, or zero when absent.
 fn counter(snapshot: &[CounterSeries], name: &str, labels: &[(&str, &str)]) -> u64 {
     snapshot
         .iter()
-        .filter(|(series, series_labels, _)| {
-            series == name
-                && labels.iter().all(|(key, value)| {
-                    series_labels
-                        .iter()
-                        .any(|label| label == &(key.to_string(), value.to_string()))
-                })
-        })
+        .filter(|(series, series_labels, _)| series == name && has_labels(series_labels, labels))
         .map(|(_, _, value)| *value)
         .sum()
 }
@@ -433,12 +435,7 @@ async fn operations_record_the_documented_series() {
     let series: Vec<(String, Vec<(String, String)>)> = capture.metric_labels();
     let seen = |name: &str, labels: &[(&str, &str)]| {
         series.iter().any(|(series_name, series_labels)| {
-            series_name == name
-                && labels.iter().all(|(key, value)| {
-                    series_labels
-                        .iter()
-                        .any(|l| l == &(key.to_string(), value.to_string()))
-                })
+            series_name == name && has_labels(series_labels, labels)
         })
     };
     assert!(seen(

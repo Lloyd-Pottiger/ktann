@@ -45,7 +45,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use bytes::Bytes;
 
 use crate::api::{Error, ErrorKind, Result};
-use crate::storage::keys::KeyRange;
+use crate::storage::keys::{self, KeyRange};
 
 /// Stable physical ceilings that a backend declares as storage-engine facts.
 ///
@@ -295,18 +295,10 @@ fn scan_successor(key: &[u8], max_key_bytes: usize) -> Vec<u8> {
         successor.push(0x00);
         successor
     } else {
-        let mut successor = key.to_vec();
-        while let Some(last) = successor.last_mut() {
-            if *last == 0xff {
-                successor.pop();
-            } else {
-                *last += 1;
-                return successor;
-            }
-        }
-        // Unreachable for a non-terminal page: the all-`0xFF` maximum key has
-        // no successor, so the adapter reports the page terminal instead.
-        successor
+        // The all-`0xFF` maximum key has no successor, but that is unreachable
+        // for a non-terminal page: the adapter reports the page terminal
+        // instead.
+        keys::successor(key)
     }
 }
 

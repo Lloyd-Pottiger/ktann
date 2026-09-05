@@ -3,30 +3,13 @@
 use bytes::Bytes;
 use foundationdb::Database;
 use ktann::storage::backend::{Backend, ReadOps, WriteTxn};
-use ktann::storage::keys::KeyRange;
 use ktann_foundationdb::{BackendNamespace, FoundationDbBackend};
 
+mod support;
+
+use support::{boot_foundationdb, clear_test_keys};
+
 const PHASE_ENV: &str = "KTANN_FDB_DURABILITY_PHASE";
-
-#[expect(
-    unsafe_code,
-    reason = "the FoundationDB binding requires one process-global network boot"
-)]
-fn boot_foundationdb() -> foundationdb::api::NetworkAutoStop {
-    // SAFETY: this integration-test binary contains one test, so it starts the
-    // process-global FoundationDB network exactly once. The returned guard is
-    // retained until every database, backend, and transaction has dropped.
-    unsafe { foundationdb::boot() }
-}
-
-async fn clear_test_keys(backend: &FoundationDbBackend) {
-    let mut transaction = backend.begin_write().await.expect("begin cleanup");
-    transaction
-        .clear_range(&KeyRange::new(Vec::new(), vec![0xff]))
-        .await
-        .expect("clear durability range");
-    transaction.commit().await.expect("commit cleanup");
-}
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires write and verify phases separated by a FoundationDB server restart"]

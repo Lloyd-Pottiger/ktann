@@ -58,7 +58,7 @@ use crate::observe::metrics;
 use crate::storage::backend::{Backend, ReadOps, ScanItem, ScanLimits};
 use crate::storage::keys::{self, KeyRange, LogicalKey, TreeKey, tree_key_hash};
 use crate::storage::topology::root_partition;
-use crate::storage::values::{IndexManifest, PersistentValue, ValueCodec};
+use crate::storage::values::{IndexManifest, PartitionState, PersistentValue, ValueCodec};
 
 use super::OperationContext;
 use super::reads::open_validated_read;
@@ -234,15 +234,11 @@ impl<'m> Context<'m> {
                 *maximum = (*maximum).max(header.entry_count());
                 let states = &mut self.topology.partition_states;
                 let count = match header.state() {
-                    crate::storage::values::PartitionState::Ready => &mut states.ready,
-                    crate::storage::values::PartitionState::Splitting => &mut states.splitting,
-                    crate::storage::values::PartitionState::ReceivingSplit => {
-                        &mut states.receiving_split
-                    }
-                    crate::storage::values::PartitionState::DrainingSplit => {
-                        &mut states.draining_split
-                    }
-                    crate::storage::values::PartitionState::Merging => &mut states.merging,
+                    PartitionState::Ready => &mut states.ready,
+                    PartitionState::Splitting => &mut states.splitting,
+                    PartitionState::ReceivingSplit => &mut states.receiving_split,
+                    PartitionState::DrainingSplit => &mut states.draining_split,
+                    PartitionState::Merging => &mut states.merging,
                 };
                 *count = count.saturating_add(1);
             }

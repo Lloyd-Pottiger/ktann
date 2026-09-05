@@ -32,18 +32,14 @@ pub struct BloomParameters {
 impl BloomParameters {
     /// Creates bounded, nonzero Bloom parameters.
     pub fn new(bit_count: u32, hash_count: u8) -> Result<Self> {
-        let byte_count = usize::try_from(bit_count)
-            .ok()
-            .and_then(|bits| bits.checked_add(7))
-            .map(|bits| bits / 8)
-            .ok_or_else(Error::invalid_argument)?;
-        if bit_count == 0 || hash_count == 0 || byte_count > MAX_SYNOPSIS_BYTES {
-            return Err(Error::invalid_argument());
-        }
-        Ok(Self {
+        let parameters = Self {
             bit_count,
             hash_count,
-        })
+        };
+        if bit_count == 0 || hash_count == 0 || parameters.byte_count() > MAX_SYNOPSIS_BYTES {
+            return Err(Error::invalid_argument());
+        }
+        Ok(parameters)
     }
 
     /// Derives the canonical v1 Bloom shape for a synopsis configuration.
@@ -372,10 +368,6 @@ pub(super) fn decode_index_manifest(decoder: &mut Decoder) -> Result<IndexManife
         .and_then(|config| config.with_fields(fields))
         .and_then(|config| config.with_tree_key_fields(tree_key_fields))
         .and_then(|config| config.with_partition_entries(minimum, maximum))
-        .and_then(|config| {
-            config.validate()?;
-            Ok(config)
-        })
         .map_err(|_| corrupt())?;
     IndexManifest::new(
         lifecycle,

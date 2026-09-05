@@ -54,10 +54,7 @@ impl Encoder {
     }
 
     pub(super) fn f64(&mut self, value: f64) -> Result<()> {
-        if !value.is_finite() {
-            return Err(Error::invalid_argument());
-        }
-        self.u64(if value == 0.0 { 0 } else { value.to_bits() });
+        self.u64(canonical_f64_bits(value)?);
         Ok(())
     }
 
@@ -92,6 +89,15 @@ impl Encoder {
         }
         Ok(self.bytes)
     }
+}
+
+/// Returns the canonical persisted bits of a finite value; positive zero is
+/// the only canonical zero.
+pub(super) fn canonical_f64_bits(value: f64) -> Result<u64> {
+    if !value.is_finite() {
+        return Err(Error::invalid_argument());
+    }
+    Ok(if value == 0.0 { 0 } else { value.to_bits() })
 }
 
 pub(super) struct Decoder {
@@ -150,7 +156,7 @@ impl Decoder {
     }
 
     pub(super) fn u8(&mut self) -> Result<u8> {
-        self.take(1)?.first().copied().ok_or_else(corrupt)
+        Ok(self.take(1)?[0])
     }
 
     pub(super) fn bool(&mut self) -> Result<bool> {

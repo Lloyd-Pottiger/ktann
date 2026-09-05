@@ -618,6 +618,18 @@ impl OperationSummary {
     }
 }
 
+/// Returns the admission-rejection rate across a fixed operation mix.
+#[must_use]
+pub fn aggregate_rejection_rate(operations: &BTreeMap<OperationClass, OperationSummary>) -> f64 {
+    let attempted: u64 = operations.values().map(|summary| summary.attempted).sum();
+    let rejected: u64 = operations.values().map(|summary| summary.rejected).sum();
+    if attempted == 0 {
+        0.0
+    } else {
+        rejected as f64 / attempted as f64
+    }
+}
+
 /// A finite sample distribution.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Distribution {
@@ -761,58 +773,39 @@ pub struct BackendIo {
     pub failed_commits: u64,
 }
 
-impl BackendIo {
-    /// Adds another disjoint accounting interval without wrapping counters.
-    pub(crate) fn saturating_add_assign(&mut self, other: &Self) {
-        self.read_transactions = self
-            .read_transactions
-            .saturating_add(other.read_transactions);
-        self.write_transactions = self
-            .write_transactions
-            .saturating_add(other.write_transactions);
-        self.point_read_keys = self.point_read_keys.saturating_add(other.point_read_keys);
-        self.scans = self.scans.saturating_add(other.scans);
-        self.items_read = self.items_read.saturating_add(other.items_read);
-        self.bytes_read = self.bytes_read.saturating_add(other.bytes_read);
-        self.mutation_operations = self
-            .mutation_operations
-            .saturating_add(other.mutation_operations);
-        self.mutation_bytes = self.mutation_bytes.saturating_add(other.mutation_bytes);
-        self.range_clears = self.range_clears.saturating_add(other.range_clears);
-        self.commits = self.commits.saturating_add(other.commits);
-        self.retryable_commits = self
-            .retryable_commits
-            .saturating_add(other.retryable_commits);
-        self.unknown_commits = self.unknown_commits.saturating_add(other.unknown_commits);
-        self.failed_commits = self.failed_commits.saturating_add(other.failed_commits);
-    }
+/// Applies one saturating or checked combination to every counter field.
+macro_rules! combine_backend_io {
+    ($($field:ident),+ $(,)?) => {
+        /// Adds another disjoint accounting interval without wrapping counters.
+        pub(crate) fn saturating_add_assign(&mut self, other: &Self) {
+            $(self.$field = self.$field.saturating_add(other.$field);)+
+        }
 
-    /// Subtracts a contained accounting interval, rejecting overlap mistakes.
-    pub(crate) fn checked_sub(&self, other: &Self) -> Option<Self> {
-        Some(Self {
-            read_transactions: self
-                .read_transactions
-                .checked_sub(other.read_transactions)?,
-            write_transactions: self
-                .write_transactions
-                .checked_sub(other.write_transactions)?,
-            point_read_keys: self.point_read_keys.checked_sub(other.point_read_keys)?,
-            scans: self.scans.checked_sub(other.scans)?,
-            items_read: self.items_read.checked_sub(other.items_read)?,
-            bytes_read: self.bytes_read.checked_sub(other.bytes_read)?,
-            mutation_operations: self
-                .mutation_operations
-                .checked_sub(other.mutation_operations)?,
-            mutation_bytes: self.mutation_bytes.checked_sub(other.mutation_bytes)?,
-            range_clears: self.range_clears.checked_sub(other.range_clears)?,
-            commits: self.commits.checked_sub(other.commits)?,
-            retryable_commits: self
-                .retryable_commits
-                .checked_sub(other.retryable_commits)?,
-            unknown_commits: self.unknown_commits.checked_sub(other.unknown_commits)?,
-            failed_commits: self.failed_commits.checked_sub(other.failed_commits)?,
-        })
-    }
+        /// Subtracts a contained accounting interval, rejecting overlap mistakes.
+        pub(crate) fn checked_sub(&self, other: &Self) -> Option<Self> {
+            Some(Self {
+                $($field: self.$field.checked_sub(other.$field)?,)+
+            })
+        }
+    };
+}
+
+impl BackendIo {
+    combine_backend_io!(
+        read_transactions,
+        write_transactions,
+        point_read_keys,
+        scans,
+        items_read,
+        bytes_read,
+        mutation_operations,
+        mutation_bytes,
+        range_clears,
+        commits,
+        retryable_commits,
+        unknown_commits,
+        failed_commits,
+    );
 }
 
 /// Logical write amplification derived from Backend calls.

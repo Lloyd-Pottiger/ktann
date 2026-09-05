@@ -206,7 +206,7 @@ async fn apply_all<T: WriteTxn>(
         .map_err(|error| error.at_position(position))?;
         outcomes.push(outcome);
     }
-    let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
+    let manifest = txn.require_manifest()?;
     leaves.flush(txn, &mut deferred)?;
     txn.apply(deferred).await?;
     let mut maintenance: BTreeSet<(TreeKey, PartitionKey)> = draining_sources.into_iter().collect();

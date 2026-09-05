@@ -38,7 +38,7 @@ impl CompiledPredicate {
     pub(crate) fn compile(mut predicate: Predicate, fields: &[FieldSchema]) -> Result<Self> {
         predicate.validate(fields)?;
         let mut referenced = vec![false; fields.len()];
-        mark_referenced_fields(&predicate, &mut referenced)?;
+        mark_referenced_fields(&predicate, &mut referenced);
         let referenced_fields = fields
             .iter()
             .enumerate()
@@ -119,7 +119,9 @@ impl CompiledPredicate {
             return Err(corrupt());
         }
         for field in &self.referenced_fields {
-            let value = fields.get(field.index).ok_or_else(corrupt)?;
+            // Referenced indexes are schema-bounded and the projection length
+            // was checked above, so indexing cannot fail.
+            let value = &fields[field.index];
             let valid = match value {
                 Value::Null => field.nullable,
                 Value::Bool(_) => field.data_type == DataType::Bool,
@@ -171,20 +173,8 @@ impl CompiledExpression {
     /// Converts an already validated public AST without changing its shape.
     fn compile(predicate: Predicate) -> Result<Self> {
         Ok(match predicate {
-            Predicate::And(children) => Self::And(
-                children
-                    .into_iter()
-                    .map(Self::compile)
-                    .collect::<Result<Vec<_>>>()?
-                    .into_boxed_slice(),
-            ),
-            Predicate::Or(children) => Self::Or(
-                children
-                    .into_iter()
-                    .map(Self::compile)
-                    .collect::<Result<Vec<_>>>()?
-                    .into_boxed_slice(),
-            ),
+            Predicate::And(children) => Self::And(Self::compile_children(children)?),
+            Predicate::Or(children) => Self::Or(Self::compile_children(children)?),
             Predicate::Not(child) => Self::Not(Box::new(Self::compile(*child)?)),
             Predicate::Compare { field, op, value } => Self::Compare {
                 field: usize::from(field.0),
@@ -200,7 +190,18 @@ impl CompiledExpression {
         })
     }
 
+    fn compile_children(children: Vec<Predicate>) -> Result<Box<[Self]>> {
+        Ok(children
+            .into_iter()
+            .map(Self::compile)
+            .collect::<Result<Vec<_>>>()?
+            .into_boxed_slice())
+    }
+
     /// Evaluates one node with the SQL three-valued truth tables.
+    ///
+    /// Field indexes were bounded against the schema at compile time and the
+    /// caller validated the projection length, so field indexing cannot fail.
     fn evaluate(&self, fields: &[Value]) -> Result<TruthValue> {
         match self {
             Self::And(children) => {
@@ -227,21 +228,18 @@ impl CompiledExpression {
             }
             Self::Not(child) => Ok(child.evaluate(fields)?.not()),
             Self::Compare { field, op, value } => {
-                let stored = fields.get(*field).ok_or_else(corrupt)?;
+                let stored = &fields[*field];
                 if matches!(stored, Value::Null) {
                     return Ok(TruthValue::Unknown);
                 }
                 Ok(TruthValue::from_bool(compare(stored, value, *op)?))
             }
-            Self::In { field, values } => values.evaluate(fields.get(*field).ok_or_else(corrupt)?),
-            Self::IsNull(field) => fields
-                .get(*field)
-                .map(|value| TruthValue::from_bool(matches!(value, Value::Null)))
-                .ok_or_else(corrupt),
-            Self::IsNotNull(field) => fields
-                .get(*field)
-                .map(|value| TruthValue::from_bool(!matches!(value, Value::Null)))
-                .ok_or_else(corrupt),
+            Self::In { field, values } => values.evaluate(&fields[*field]),
+            Self::IsNull(field) => Ok(TruthValue::from_bool(matches!(fields[*field], Value::Null))),
+            Self::IsNotNull(field) => Ok(TruthValue::from_bool(!matches!(
+                fields[*field],
+                Value::Null
+            ))),
         }
     }
 
@@ -334,22 +332,21 @@ impl CompiledIn {
 }
 
 /// Marks the schema fields whose persistent values exact evaluation observes.
-fn mark_referenced_fields(predicate: &Predicate, referenced: &mut [bool]) -> Result<()> {
+///
+/// The predicate was already validated against this schema, so every field
+/// index is in bounds.
+fn mark_referenced_fields(predicate: &Predicate, referenced: &mut [bool]) {
     match predicate {
         Predicate::And(children) | Predicate::Or(children) => {
             for child in children {
-                mark_referenced_fields(child, referenced)?;
+                mark_referenced_fields(child, referenced);
             }
-            Ok(())
         }
         Predicate::Not(child) => mark_referenced_fields(child, referenced),
         Predicate::Compare { field, .. }
         | Predicate::In { field, .. }
         | Predicate::IsNull(field)
-        | Predicate::IsNotNull(field) => referenced
-            .get_mut(usize::from(field.0))
-            .map(|is_referenced| *is_referenced = true)
-            .ok_or_else(Error::invalid_argument),
+        | Predicate::IsNotNull(field) => referenced[usize::from(field.0)] = true,
     }
 }
 

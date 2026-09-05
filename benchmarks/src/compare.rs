@@ -6,9 +6,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::report::{
     AdmissionSummary, BackendIo, BenchmarkReport, BenchmarkSuite, BudgetSummary, CacheSummary,
-    Distribution, LifecycleMeasurements, OperationClass, OperationSummary,
-    QualitySweepMeasurements, ReportMeasurements, SearchPhase, SteadyStateMeasurements,
-    WriteAttribution,
+    Distribution, LifecycleMeasurements, OperationClass, OperationSummary, PhaseResources,
+    QualitySweepMeasurements, RecallSummary, ReportMeasurements, SearchPhase,
+    SteadyStateMeasurements, WriteAttribution, aggregate_rejection_rate,
 };
 
 /// Sub-millisecond p95 movement is not stable enough to classify by ratio.
@@ -712,8 +712,8 @@ fn compare_recall(
     result: &mut ComparisonReport,
     key: &str,
     prefix: &str,
-    baseline: Option<&crate::report::RecallSummary>,
-    candidate: Option<&crate::report::RecallSummary>,
+    baseline: Option<&RecallSummary>,
+    candidate: Option<&RecallSummary>,
     maximum_drop: f64,
 ) {
     match (baseline, candidate) {
@@ -743,8 +743,8 @@ fn compare_phase_resources(
     result: &mut ComparisonReport,
     key: &str,
     phase_name: &str,
-    baseline: &crate::report::PhaseResources,
-    candidate: &crate::report::PhaseResources,
+    baseline: &PhaseResources,
+    candidate: &PhaseResources,
     policy: ComparisonPolicy,
 ) {
     relative_regression(
@@ -880,21 +880,21 @@ fn compare_non_admission_errors(
     candidate: &BTreeMap<String, u64>,
     threshold: f64,
 ) {
-    for category in baseline
-        .keys()
-        .chain(candidate.keys())
-        .filter(|category| category.as_str() != "LimitExceeded")
-        .collect::<BTreeSet<_>>()
-    {
-        relative_regression(
-            result,
-            key,
-            &format!("{metric} {category}"),
-            baseline.get(category).copied().unwrap_or_default() as f64,
-            candidate.get(category).copied().unwrap_or_default() as f64,
-            threshold,
-        );
-    }
+    let without_admission = |errors: &BTreeMap<String, u64>| {
+        errors
+            .iter()
+            .filter(|(category, _)| category.as_str() != "LimitExceeded")
+            .map(|(category, count)| (category.clone(), *count))
+            .collect::<BTreeMap<_, _>>()
+    };
+    compare_count_maps(
+        result,
+        key,
+        metric,
+        &without_admission(baseline),
+        &without_admission(candidate),
+        threshold,
+    );
 }
 
 /// Compares accepted latency and admission outcomes without amplifying count noise.
@@ -933,17 +933,6 @@ fn compare_operations(
         result.regressions.push(format!(
             "{scenario}: aggregate rejection rate increased from {baseline_rate:.4} to {candidate_rate:.4}"
         ));
-    }
-}
-
-/// Returns the admission-rejection rate across the fixed operation mix.
-fn aggregate_rejection_rate(operations: &BTreeMap<OperationClass, OperationSummary>) -> f64 {
-    let attempted: u64 = operations.values().map(|summary| summary.attempted).sum();
-    let rejected: u64 = operations.values().map(|summary| summary.rejected).sum();
-    if attempted == 0 {
-        0.0
-    } else {
-        rejected as f64 / attempted as f64
     }
 }
 
