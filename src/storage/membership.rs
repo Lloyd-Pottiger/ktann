@@ -15,7 +15,7 @@
 //! only when it is applied, so a whole mutation batch lands in canonical key
 //! order with one backend write call; the queue replaces backend unique
 //! inserts with update-protected existence checks. Exact Header counts and
-//! Synopsis expansions accumulate per leaf in a [`LeafAccumulator`] and join
+//! Synopsis expansions accumulate per leaf in a `LeafAccumulator` and join
 //! the queued writes when it is flushed, so a batch touching one leaf N times
 //! reads and writes the leaf's Header and Synopsis once; later items observe
 //! earlier items' adjustments through the accumulator. Deferral is exact
