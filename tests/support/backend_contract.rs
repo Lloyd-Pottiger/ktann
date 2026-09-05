@@ -846,7 +846,7 @@ async fn case_batch_scan<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
     // A zero limit is invalid before any work.
     let error = txn
         .batch_scan(
-            &[range_a.clone()],
+            std::slice::from_ref(&range_a),
             ScanLimits {
                 item_limit: 0,
                 byte_limit: 1,
