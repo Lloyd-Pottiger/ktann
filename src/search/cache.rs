@@ -948,11 +948,11 @@ mod tests {
 
         async fn batch_scan(
             &mut self,
-            ranges: Vec<KeyRange>,
+            ranges: &[KeyRange],
             limits: ScanLimits,
         ) -> Result<Vec<ScanPage>> {
             let mut pages = Vec::with_capacity(ranges.len());
-            for range in &ranges {
+            for range in ranges {
                 pages.push(self.scan(range, limits).await?);
             }
             Ok(pages)

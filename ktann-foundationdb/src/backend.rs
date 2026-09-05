@@ -19,8 +19,7 @@ const FDB_MAX_VALUE_BYTES: usize = 100_000;
 const DEFAULT_MAX_MUTATIONS: usize = 10_000;
 const DEFAULT_MAX_MUTATION_BYTES: usize = 1 << 20;
 const MAX_SCAN_PAGE_BYTES: usize = 80 << 10;
-const MAX_CONCURRENT_POINT_READS: usize = 1_024;
-const MAX_CONCURRENT_RANGE_READS: usize = 1_024;
+const MAX_CONCURRENT_READS: usize = 1_024;
 const MAX_BACKEND_NAMESPACE_BYTES: usize = u8::MAX as usize;
 const PHYSICAL_PREFIX_HEADER: &[u8] = b"\0ktann\x01";
 
@@ -251,7 +250,7 @@ impl ReadOps for FoundationDbReadTxn<'_> {
 
     async fn batch_scan(
         &mut self,
-        ranges: Vec<KeyRange>,
+        ranges: &[KeyRange],
         limits: ScanLimits,
     ) -> Result<Vec<ScanPage>> {
         batch_scan(&self.transaction, self.prefix, ranges, limits).await
@@ -275,7 +274,7 @@ impl ReadOps for FoundationDbWriteTxn<'_> {
 
     async fn batch_scan(
         &mut self,
-        ranges: Vec<KeyRange>,
+        ranges: &[KeyRange],
         limits: ScanLimits,
     ) -> Result<Vec<ScanPage>> {
         batch_scan(&self.transaction, self.prefix, ranges, limits).await
@@ -465,11 +464,8 @@ async fn batch_get(
     keys: Vec<Bytes>,
     mode: ReadMode,
 ) -> Result<Vec<Option<Bytes>>> {
-    for key in &keys {
-        prefix.validate_key(key)?;
-    }
     let mut values = Vec::with_capacity(keys.len());
-    for keys in keys.chunks(MAX_CONCURRENT_POINT_READS) {
+    for keys in keys.chunks(MAX_CONCURRENT_READS) {
         let keys = keys
             .iter()
             .map(|key| prefix.encode_key(key))
@@ -555,18 +551,14 @@ async fn scan(
 async fn batch_scan(
     transaction: &Transaction,
     prefix: &PhysicalPrefix,
-    ranges: Vec<KeyRange>,
+    ranges: &[KeyRange],
     limits: ScanLimits,
 ) -> Result<Vec<ScanPage>> {
     if limits.item_limit == 0 || limits.byte_limit == 0 {
         return Err(Error::new(ErrorKind::InvalidArgument));
     }
-    for range in &ranges {
-        prefix.validate_key(range.start())?;
-        prefix.validate_key(range.end())?;
-    }
     let mut pages = Vec::with_capacity(ranges.len());
-    for ranges in ranges.chunks(MAX_CONCURRENT_RANGE_READS) {
+    for ranges in ranges.chunks(MAX_CONCURRENT_READS) {
         let scans = ranges
             .iter()
             .map(|range| scan(transaction, prefix, range, limits));

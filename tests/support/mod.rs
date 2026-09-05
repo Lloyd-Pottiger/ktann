@@ -864,7 +864,7 @@ impl ReadOps for DeterministicReadTxn<'_> {
 
     async fn batch_scan(
         &mut self,
-        ranges: Vec<KeyRange>,
+        ranges: &[KeyRange],
         limits: ScanLimits,
     ) -> Result<Vec<ScanPage>> {
         self.backend.count(|counts| counts.batch_scan += 1);
@@ -874,7 +874,7 @@ impl ReadOps for DeterministicReadTxn<'_> {
         let (item_limit, byte_limit) = resolve_scan(limits, &self.backend.config)?;
         let max_key_bytes = self.backend.config.hard_limits.max_key_bytes;
         let mut pages = Vec::with_capacity(ranges.len());
-        for range in &ranges {
+        for range in ranges {
             if range.start() >= range.end() {
                 pages.push(ScanPage::terminal(Vec::new()));
                 continue;
@@ -929,7 +929,7 @@ impl ReadOps for DeterministicWriteTxn<'_> {
 
     async fn batch_scan(
         &mut self,
-        ranges: Vec<KeyRange>,
+        ranges: &[KeyRange],
         limits: ScanLimits,
     ) -> Result<Vec<ScanPage>> {
         self.backend.count(|counts| counts.batch_scan += 1);
@@ -940,7 +940,7 @@ impl ReadOps for DeterministicWriteTxn<'_> {
         let max_key_bytes = self.backend.config.hard_limits.max_key_bytes;
         let mut merged = None;
         let mut pages = Vec::with_capacity(ranges.len());
-        for range in &ranges {
+        for range in ranges {
             if range.start() >= range.end() {
                 pages.push(ScanPage::terminal(Vec::new()));
                 continue;

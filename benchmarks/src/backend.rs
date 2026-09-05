@@ -253,7 +253,7 @@ impl<T: ReadOps> ReadOps for MeasuredReadTxn<T> {
 
     fn batch_scan(
         &mut self,
-        ranges: Vec<KeyRange>,
+        ranges: &[KeyRange],
         limits: ScanLimits,
     ) -> impl Future<Output = Result<Vec<ScanPage>>> + Send {
         // One batched call is one backend interaction regardless of range
@@ -310,7 +310,7 @@ impl<T: WriteTxn> ReadOps for MeasuredWriteTxn<T> {
 
     fn batch_scan(
         &mut self,
-        ranges: Vec<KeyRange>,
+        ranges: &[KeyRange],
         limits: ScanLimits,
     ) -> impl Future<Output = Result<Vec<ScanPage>>> + Send {
         // One batched call is one backend interaction regardless of range

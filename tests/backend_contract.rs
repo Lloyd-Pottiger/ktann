@@ -791,7 +791,7 @@ fn batch_size_limit_is_enforced() {
 
         let error = txn
             .batch_scan(
-                vec![range(b"a", b"b"), range(b"b", b"c"), range(b"c", b"d")],
+                &[range(b"a", b"b"), range(b"b", b"c"), range(b"c", b"d")],
                 ScanLimits {
                     item_limit: 1,
                     byte_limit: 1,

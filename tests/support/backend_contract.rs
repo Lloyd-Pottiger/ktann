@@ -767,16 +767,13 @@ async fn case_batch_scan<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
     let mut txn = backend.begin_read().await.expect("begin read");
 
     // An empty input succeeds with an empty result.
-    let none = txn
-        .batch_scan(Vec::new(), limits)
-        .await
-        .expect("empty batch scan");
+    let none = txn.batch_scan(&[], limits).await.expect("empty batch scan");
     check_count(ctx, "empty batch page count", none.len(), 0);
 
     let inverted = KeyRange::new(case_key(ctx, "b/2").to_vec(), case_key(ctx, "b/1").to_vec());
     let pages = txn
         .batch_scan(
-            vec![range_a.clone(), range_b.clone(), inverted, range_a.clone()],
+            &[range_a.clone(), range_b.clone(), inverted, range_a.clone()],
             limits,
         )
         .await
@@ -819,7 +816,7 @@ async fn case_batch_scan<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
     // Resuming range A in a later batch skips no key and repeats none.
     let resume = KeyRange::new(expected_next, range_a.end().to_vec());
     let pages = txn
-        .batch_scan(vec![resume], limits)
+        .batch_scan(&[resume], limits)
         .await
         .expect("resumed batch scan");
     check_count(ctx, "resumed page count", pages[0].items().len(), 1);
@@ -835,7 +832,7 @@ async fn case_batch_scan<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
     // limit.
     let pages = txn
         .batch_scan(
-            vec![case_subrange(ctx, "big/")],
+            &[case_subrange(ctx, "big/")],
             ScanLimits {
                 item_limit: 8,
                 byte_limit: 48,
@@ -849,7 +846,7 @@ async fn case_batch_scan<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
     // A zero limit is invalid before any work.
     let error = txn
         .batch_scan(
-            vec![range_a.clone()],
+            &[range_a.clone()],
             ScanLimits {
                 item_limit: 0,
                 byte_limit: 1,
@@ -871,7 +868,7 @@ async fn case_batch_scan<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
         .await
         .expect("put staged");
     let pages = txn
-        .batch_scan(vec![case_subrange(ctx, "c/"), range_b], limits)
+        .batch_scan(&[case_subrange(ctx, "c/"), range_b], limits)
         .await
         .expect("write batch scan");
     check_count(ctx, "staged range count", pages[0].items().len(), 1);

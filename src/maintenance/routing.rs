@@ -562,6 +562,9 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
         // A normal leaf wave can finish directly after its one batch read. A
         // transitional leaf must re-enter the state-aware resolver because it
         // can redirect or expose a different body before accepting the write.
+        let mut seeded_authorities: Option<
+            HashMap<PartitionKey, (PartitionHeader, PartitionTransition)>,
+        > = None;
         if !leaf_batch_fallback
             && pending
                 .keys()
@@ -581,7 +584,7 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
             .await?;
             let mut fast_path = true;
             let mut headers = Vec::with_capacity(authorities.len());
-            for (&partition, (header, state)) in partitions.iter().zip(authorities) {
+            for (&partition, &(header, state)) in partitions.iter().zip(&authorities) {
                 check_level(&header, Some(1))?;
                 check_root_state(root, partition, state)?;
                 if !header.state().accepts_writes() {
@@ -609,6 +612,9 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
             }
             leaf_batch_fallback = true;
             pending = leaf_pending;
+            // The fallback wave re-enters the same partitions through the
+            // state-aware resolver; seed its batch from this read.
+            seeded_authorities = Some(partitions.into_iter().zip(authorities).collect());
         }
 
         // Process one level as a wave. The read traversal applies the beam
@@ -636,19 +642,20 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
         // Every Child Entry body the wave's resolved hops ask for, collected
         // during resolution and then scanned in batched lockstep rounds, so
         // one level's bodies share each backend round trip. `scan_members`
-        // holds the waiting beam members of one resolved hop per slot.
-        let mut scan_work: Vec<(usize, PartitionKey, PartitionHeader)> = Vec::new();
+        // holds the waiting beam members of one resolved hop per slot, and
+        // `body_slots` maps each collected body back to its hop's slot.
+        let mut bodies: Vec<(PartitionKey, PartitionHeader)> = Vec::new();
+        let mut body_slots: Vec<usize> = Vec::new();
         let mut scan_members: Vec<Vec<PendingBeamMember>> = Vec::new();
         // Read the complete current wave before doing any routing work. This
         // keeps authority reads proportional to tree depth, while the
         // transaction-local cache handles a partition revisited by a
         // split-family sideways hop.
         let partitions: Vec<PartitionKey> = wave.keys().map(|(partition, _)| *partition).collect();
-        let mut authorities = if partitions.len() == 1 {
-            None
-        } else {
-            Some(
-                topology::read_authority_batch(
+        let mut authorities: HashMap<PartitionKey, (PartitionHeader, PartitionTransition)> =
+            match seeded_authorities {
+                Some(seeded) => seeded,
+                None => topology::read_authority_batch(
                     reader,
                     manifest.logical_index_id(),
                     tree_key,
@@ -658,23 +665,13 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                 .into_iter()
                 .zip(&partitions)
                 .map(|(authority, partition)| (*partition, authority))
-                .collect::<HashMap<_, _>>(),
-            )
-        };
+                .collect(),
+            };
         while let Some(((partition, current_level), members)) = wave.pop_first() {
-            let (header, state) = match authorities.as_mut() {
-                Some(authorities) => match authorities.remove(&partition) {
-                    Some(authority) => authority,
-                    None => {
-                        topology::read_authority(
-                            reader,
-                            manifest.logical_index_id(),
-                            tree_key,
-                            partition,
-                        )
-                        .await?
-                    }
-                },
+            // A partition re-added by a sideways or merge hop during this wave
+            // was not in its batch and is read on demand.
+            let (header, state) = match authorities.remove(&partition) {
+                Some(authority) => authority,
                 None => {
                     topology::read_authority(
                         reader,
@@ -736,7 +733,10 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                         );
                     }
                 }
-                Hop::Children { bodies, next_level } => {
+                Hop::Children {
+                    bodies: hop_bodies,
+                    next_level,
+                } => {
                     if child_level.is_some_and(|level| level != next_level) {
                         return Err(Error::new(ErrorKind::Corruption));
                     }
@@ -755,11 +755,8 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                     // collected body of the level in batched lockstep rounds.
                     let slot = scan_members.len();
                     scan_members.push(members);
-                    scan_work.extend(
-                        bodies
-                            .into_iter()
-                            .map(|(body, header)| (slot, body, header)),
-                    );
+                    body_slots.extend(std::iter::repeat_n(slot, hop_bodies.len()));
+                    bodies.extend(hop_bodies);
                     debug_assert!(
                         expected_level.is_none_or(|level| level > next_level),
                         "child level must descend"
@@ -812,23 +809,19 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
         // The wave's hops are resolved; now every collected Child Entry body
         // is scanned in batched lockstep rounds, feeding the shared per-vector
         // beams and the dual-ownership check exactly as a sequential scan did.
-        if !scan_work.is_empty() {
+        if !bodies.is_empty() {
             let nearest = nearest
                 .as_mut()
                 .ok_or_else(|| Error::new(ErrorKind::Backend))?;
-            let bodies: Vec<(PartitionKey, PartitionHeader)> = scan_work
-                .iter()
-                .map(|(_, body, header)| (*body, *header))
-                .collect();
             scan_bodies(reader, manifest, tree_key, &bodies, &mut |index, entry| {
-                let (slot, body, _) = scan_work[index];
+                let (body, _) = bodies[index];
                 if incoming_owners
                     .insert(entry.child(), body)
                     .is_some_and(|owner| owner != body)
                 {
                     return Err(Error::new(ErrorKind::Corruption));
                 }
-                for member in &scan_members[slot] {
+                for member in &scan_members[body_slots[index]] {
                     nearest[member.member].consider(
                         kernel,
                         routings[member.member],
@@ -1286,20 +1279,24 @@ async fn scan_bodies<R: LogicalReader>(
         })
         .collect::<Result<Vec<_>>>()?;
     loop {
-        let mut active = Vec::new();
         let mut legs = Vec::new();
-        for (index, scan) in scans.iter().enumerate() {
+        for scan in &scans {
             if !scan.done {
-                active.push(index);
                 legs.push((&scan.range, scan.cursor.as_ref()));
             }
         }
-        if active.is_empty() {
+        if legs.is_empty() {
             break;
         }
-        let pages = reader.batch_scan(&legs, limits).await?;
-        for (index, page) in active.into_iter().zip(pages) {
-            let scan = &mut scans[index];
+        let mut pages = reader.batch_scan(&legs, limits).await?.into_iter();
+        for (index, scan) in scans.iter_mut().enumerate() {
+            if scan.done {
+                continue;
+            }
+            let Some(page) = pages.next() else {
+                // The typed batch scan returns exactly one page per leg.
+                return Err(Error::new(ErrorKind::Backend));
+            };
             for item in page.items() {
                 visit(index, expect_child_entry_ref(item.value())?)?;
                 scan.seen += 1;

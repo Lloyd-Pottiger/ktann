@@ -410,9 +410,6 @@ impl ReadOps for RocksDbReadTxn<'_> {
     }
 
     async fn batch_get(&mut self, keys: Vec<Bytes>) -> Result<Vec<Option<Bytes>>> {
-        for key in &keys {
-            self.prefix.validate_key(key)?;
-        }
         self.worker
             .request(|response| ReadCommand::BatchGet { keys, response })
             .await
@@ -431,14 +428,14 @@ impl ReadOps for RocksDbReadTxn<'_> {
 
     async fn batch_scan(
         &mut self,
-        ranges: Vec<KeyRange>,
+        ranges: &[KeyRange],
         limits: ScanLimits,
     ) -> Result<Vec<ScanPage>> {
         if limits.item_limit == 0 || limits.byte_limit == 0 {
             return Err(Error::new(ErrorKind::InvalidArgument));
         }
         let mut physical_ranges = Vec::with_capacity(ranges.len());
-        for range in &ranges {
+        for range in ranges {
             physical_ranges.push(self.prefix.encode_range(range)?);
         }
         self.worker
@@ -462,9 +459,6 @@ impl ReadOps for RocksDbWriteTxn<'_> {
     }
 
     async fn batch_get(&mut self, keys: Vec<Bytes>) -> Result<Vec<Option<Bytes>>> {
-        for key in &keys {
-            self.prefix.validate_key(key)?;
-        }
         self.worker
             .request(|response| WriteCommand::BatchGet { keys, response })
             .await
@@ -483,14 +477,14 @@ impl ReadOps for RocksDbWriteTxn<'_> {
 
     async fn batch_scan(
         &mut self,
-        ranges: Vec<KeyRange>,
+        ranges: &[KeyRange],
         limits: ScanLimits,
     ) -> Result<Vec<ScanPage>> {
         if limits.item_limit == 0 || limits.byte_limit == 0 {
             return Err(Error::new(ErrorKind::InvalidArgument));
         }
         let mut physical_ranges = Vec::with_capacity(ranges.len());
-        for range in &ranges {
+        for range in ranges {
             physical_ranges.push(self.prefix.encode_range(range)?);
         }
         self.worker
@@ -543,9 +537,6 @@ impl WriteTxn for RocksDbWriteTxn<'_> {
     }
 
     async fn batch_get_for_update(&mut self, keys: Vec<Bytes>) -> Result<Vec<Option<Bytes>>> {
-        for key in &keys {
-            self.prefix.validate_key(key)?;
-        }
         self.worker
             .request(|response| WriteCommand::BatchGetForUpdate { keys, response })
             .await

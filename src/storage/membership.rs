@@ -30,7 +30,7 @@
 //! error the caller must not commit the transaction; rolling back leaves no
 //! partial change.
 
-use std::collections::{BTreeMap, btree_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
 use bytes::Bytes;
 
@@ -137,7 +137,8 @@ impl LeafAccumulator {
         if let Some(header) = self.headers.get(&key) {
             return Ok(*header);
         }
-        let header = read_header(txn, index, location).await?;
+        let header = expect_header(txn.get_for_update(header_key(index, location)).await?)?
+            .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
         self.headers.insert(key, header);
         Ok(header)
     }
@@ -182,11 +183,15 @@ impl LeafAccumulator {
 
     /// Queues every accumulated Header and each changed Synopsis into the
     /// caller's builder, so a whole batch lands in one backend write call.
-    pub(crate) fn flush(
+    pub(crate) fn flush<T>(
         self,
-        index: LogicalIndexId,
+        txn: &WriteLogicalTxn<'_, T>,
         deferred: &mut MutationBuilder<'_>,
     ) -> Result<()> {
+        let index = txn
+            .bound_manifest()
+            .ok_or_else(Error::invalid_argument)?
+            .logical_index_id();
         for ((tree_key, partition), header) in self.headers {
             deferred.put(
                 LogicalKey::Header {
@@ -262,11 +267,7 @@ pub async fn insert_record<T: WriteTxn>(
         entry,
     )
     .await?;
-    let index = txn
-        .bound_manifest()
-        .ok_or_else(Error::invalid_argument)?
-        .logical_index_id();
-    leaves.flush(index, deferred)
+    leaves.flush(txn, deferred)
 }
 
 /// Inserts one record and returns the target's final Header for scheduling.
@@ -370,11 +371,7 @@ pub async fn replace_record<T: WriteTxn>(
         entry,
     )
     .await?;
-    let index = txn
-        .bound_manifest()
-        .ok_or_else(Error::invalid_argument)?
-        .logical_index_id();
-    leaves.flush(index, deferred)
+    leaves.flush(txn, deferred)
 }
 
 /// Replaces one record and returns final changed Headers for scheduling.
@@ -495,11 +492,7 @@ pub async fn delete_record<T: WriteTxn>(
         id,
     )
     .await?;
-    let index = txn
-        .bound_manifest()
-        .ok_or_else(Error::invalid_argument)?
-        .logical_index_id();
-    leaves.flush(index, deferred)?;
+    leaves.flush(txn, deferred)?;
     Ok(match report {
         DeleteReport::Deleted { location, .. } => DeleteOutcome::Deleted { location },
         DeleteReport::NotFound => DeleteOutcome::NotFound,
@@ -589,27 +582,29 @@ fn classify_location_pair(
 
 /// One batch item's membership read set to warm before the apply loop.
 ///
-/// Each set mirrors exactly what the corresponding membership operation —
+/// Each set covers what the corresponding membership operation —
 /// [`insert_record_with_header`], [`replace_record_with_headers`], or
-/// [`delete_record_with_header`] — reads with update protection.
+/// [`delete_record_with_header`] — reads with update protection, except the
+/// routed target Header, which arrives warm from the route validation.
 pub(crate) enum MembershipPrefetch<'a> {
-    /// An insert's existence checks: the Record, the Location, the Opaque
-    /// Payload when the record carries one, and the Leaf Entry at the routed
-    /// target.
+    /// An insert's reads: the Record, the Location, the Opaque Payload when
+    /// the record carries one, the target Leaf Entry, and the target leaf
+    /// Synopsis.
     Insert {
         id: &'a Bytes,
         payload: bool,
         target: &'a RecordLocation,
     },
     /// A replacement's reads: the stored Record and Location, the target Leaf
-    /// Entry, and the source Leaf Entry when the move crosses leaves.
+    /// Entry and leaf Synopsis, and the source Leaf Entry and leaf Header when
+    /// the move crosses leaves.
     Replace {
         id: &'a Bytes,
         expected: &'a RecordLocation,
         target: &'a RecordLocation,
     },
-    /// A delete's Record and Location. The Leaf Entry key follows from the
-    /// stored Location, so it warms in a second wave.
+    /// A delete's Record and Location. Its leaf Header and Leaf Entry keys
+    /// follow from the stored Location, so they warm in a second wave.
     Delete { id: &'a Bytes },
 }
 
@@ -641,6 +636,10 @@ pub(crate) async fn prefetch_membership_for_update<T: WriteTxn>(
         return;
     };
     let mut keys = Vec::new();
+    // Leaf-level keys repeat per item routed to the same leaf; warm each
+    // distinct leaf's Synopsis or source Header once.
+    let mut warmed_synopses: BTreeSet<(TreeKey, PartitionKey)> = BTreeSet::new();
+    let mut warmed_headers: BTreeSet<(TreeKey, PartitionKey)> = BTreeSet::new();
     for item in items {
         match *item {
             MembershipPrefetch::Insert {
@@ -654,6 +653,9 @@ pub(crate) async fn prefetch_membership_for_update<T: WriteTxn>(
                     keys.push(payload_key(index, id));
                 }
                 keys.push(entry_key(index, target, id));
+                if warmed_synopses.insert((target.tree_key().clone(), target.leaf())) {
+                    keys.push(synopsis_key(index, target));
+                }
             }
             MembershipPrefetch::Replace {
                 id,
@@ -663,8 +665,14 @@ pub(crate) async fn prefetch_membership_for_update<T: WriteTxn>(
                 keys.push(record_key(index, id));
                 keys.push(location_key(index, id));
                 keys.push(entry_key(index, target, id));
+                if warmed_synopses.insert((target.tree_key().clone(), target.leaf())) {
+                    keys.push(synopsis_key(index, target));
+                }
                 if expected != target {
                     keys.push(entry_key(index, expected, id));
+                    if warmed_headers.insert((expected.tree_key().clone(), expected.leaf())) {
+                        keys.push(header_key(index, expected));
+                    }
                 }
             }
             MembershipPrefetch::Delete { id } => {
@@ -673,40 +681,53 @@ pub(crate) async fn prefetch_membership_for_update<T: WriteTxn>(
             }
         }
     }
-    if !read_chunks_for_update(txn, keys).await {
+    if !warm_chunks_for_update(txn, keys).await {
         return;
     }
-    // A delete's Leaf Entry key follows from its stored Location, so it warms
-    // in a second wave; the Record and Location re-reads here are cache hits
-    // from the first wave. An absent record or a half-present pair defers to
-    // the checked delete path, which reports it with the item's position.
-    let mut entry_keys = Vec::new();
+    // A delete's leaf Header and Leaf Entry keys follow from its stored
+    // Location, so they warm in a second wave served from the first wave's
+    // cache. An absent Location warms nothing; a corrupt pair defers to the
+    // checked delete path, which reports it with the item's position.
+    let mut location_keys = Vec::new();
     for item in items {
         let &MembershipPrefetch::Delete { id } = item else {
             continue;
         };
-        let record = txn.get_for_update(record_key(index, id)).await;
-        let location = txn.get_for_update(location_key(index, id)).await;
-        let (Ok(record), Ok(location)) = (record, location) else {
-            continue;
-        };
-        let (Ok(Some(_)), Ok(Some(location))) = (expect_record(record), expect_location(location))
-        else {
-            continue;
-        };
-        entry_keys.push(entry_key(index, &location, id));
+        location_keys.push(location_key(index, id));
     }
-    read_chunks_for_update(txn, entry_keys).await;
+    let Ok(locations) = txn.batch_get_for_update(location_keys).await else {
+        return;
+    };
+    let mut locations = locations.into_iter();
+    let mut leaf_keys = Vec::new();
+    for item in items {
+        let &MembershipPrefetch::Delete { id } = item else {
+            continue;
+        };
+        match locations.next() {
+            Some(Some(PersistentValue::RecordLocation(location))) => {
+                leaf_keys.push(entry_key(index, &location, id));
+                if warmed_headers.insert((location.tree_key().clone(), location.leaf())) {
+                    leaf_keys.push(header_key(index, &location));
+                }
+            }
+            // A fully absent Record ID warms nothing.
+            Some(None) => {}
+            // A short batch defers every remaining key to the checked path.
+            _ => return,
+        }
+    }
+    let _ = warm_chunks_for_update(txn, leaf_keys).await;
 }
 
-/// Reads `keys` in bounded update-protected batches, returning false when a
+/// Warms `keys` in bounded update-protected batches, returning false when a
 /// batch fails and the remaining keys are left unwarmed.
-async fn read_chunks_for_update<T: WriteTxn>(
+async fn warm_chunks_for_update<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     keys: Vec<LogicalKey>,
 ) -> bool {
     for chunk in keys.chunks(MEMBERSHIP_READ_CHUNK) {
-        if txn.batch_get_for_update(chunk.to_vec()).await.is_err() {
+        if txn.warm_for_update(chunk.to_vec()).await.is_err() {
             return false;
         }
     }
@@ -723,16 +744,6 @@ fn validated_input<'manifest, T>(
         return Err(Error::invalid_argument());
     }
     txn.bound_manifest().ok_or_else(Error::invalid_argument)
-}
-
-/// Reads one update-protected leaf Header that must exist.
-async fn read_header<T: WriteTxn>(
-    txn: &mut WriteLogicalTxn<'_, T>,
-    index: LogicalIndexId,
-    location: &RecordLocation,
-) -> Result<PartitionHeader> {
-    expect_header(txn.get_for_update(header_key(index, location)).await?)?
-        .ok_or_else(|| Error::new(ErrorKind::Corruption))
 }
 
 /// Validates that a decoded Header names a write-accepting leaf.

@@ -407,7 +407,7 @@ pub trait ReadOps: Send {
     /// batch ceiling.
     fn batch_scan(
         &mut self,
-        ranges: Vec<KeyRange>,
+        ranges: &[KeyRange],
         limits: ScanLimits,
     ) -> impl Future<Output = Result<Vec<ScanPage>>> + Send;
 }

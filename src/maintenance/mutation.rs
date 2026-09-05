@@ -49,6 +49,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use bytes::Bytes;
+
 use crate::api::{Error, ErrorKind, Mutation, MutationOutcome, PartitionKey, Record, Result};
 use crate::observe::labels::Operation;
 use crate::runtime::import::ImportPermit;
@@ -205,7 +207,7 @@ async fn apply_all<T: WriteTxn>(
         outcomes.push(outcome);
     }
     let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
-    leaves.flush(manifest.logical_index_id(), &mut deferred)?;
+    leaves.flush(txn, &mut deferred)?;
     txn.apply(deferred).await?;
     let mut maintenance: BTreeSet<(TreeKey, PartitionKey)> = draining_sources.into_iter().collect();
     let config = manifest.config();
@@ -371,13 +373,7 @@ async fn prefetch_membership<T: WriteTxn>(
                 let Some(target) = targets[position].as_ref() else {
                     continue;
                 };
-                membership::MembershipPrefetch::Insert {
-                    id: record.id(),
-                    payload: prepared[position]
-                        .as_ref()
-                        .is_some_and(|prepared| prepared.payload.is_some()),
-                    target,
-                }
+                insert_prefetch(prepared[position].as_ref(), record.id(), target)
             }
             Mutation::Upsert(record) => {
                 let Some(target) = targets[position].as_ref() else {
@@ -389,13 +385,7 @@ async fn prefetch_membership<T: WriteTxn>(
                         expected,
                         target,
                     },
-                    None => membership::MembershipPrefetch::Insert {
-                        id: record.id(),
-                        payload: prepared[position]
-                            .as_ref()
-                            .is_some_and(|prepared| prepared.payload.is_some()),
-                        target,
-                    },
+                    None => insert_prefetch(prepared[position].as_ref(), record.id(), target),
                 }
             }
             Mutation::Delete(id) => membership::MembershipPrefetch::Delete { id },
@@ -403,6 +393,20 @@ async fn prefetch_membership<T: WriteTxn>(
         items.push(item);
     }
     membership::prefetch_membership_for_update(txn, &items).await;
+}
+
+/// One insert-shaped prefetch item: the Record and Location existence checks,
+/// the Opaque Payload when the record carries one, and the target Leaf Entry.
+fn insert_prefetch<'a>(
+    prepared: Option<&PreparedRecord>,
+    id: &'a Bytes,
+    target: &'a RecordLocation,
+) -> membership::MembershipPrefetch<'a> {
+    membership::MembershipPrefetch::Insert {
+        id,
+        payload: prepared.is_some_and(|prepared| prepared.payload.is_some()),
+        target,
+    }
 }
 
 /// Applies one mutation item inside the attempt transaction, queueing every

@@ -461,7 +461,7 @@ mod tests {
 
         async fn batch_scan(
             &mut self,
-            _ranges: Vec<KeyRange>,
+            _ranges: &[KeyRange],
             _limits: ScanLimits,
         ) -> Result<Vec<ScanPage>> {
             // The rerank stage only point-reads record groups; it never scans.

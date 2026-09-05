@@ -515,7 +515,7 @@ async fn batch_scan_logical<T: ReadOps>(
     for (range, cursor) in legs {
         raw_ranges.push(scan_raw_range(binding, range, *cursor)?);
     }
-    let raw_pages = raw.batch_scan(raw_ranges.clone(), limits).await?;
+    let raw_pages = raw.batch_scan(&raw_ranges, limits).await?;
     if raw_pages.len() != legs.len() {
         return Err(Error::new(ErrorKind::Backend));
     }
@@ -1143,6 +1143,27 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
             .collect::<Result<Vec<_>>>()?;
         let values = self.batch_get_raw(encoded, true).await?;
         decode_batch(&self.binding, &keys, values)
+    }
+
+    /// Warms the read cache for `keys` with batched update-protected reads,
+    /// caching the raw bytes without decoding them.
+    ///
+    /// Each key's conflict is established exactly as the typed
+    /// [`batch_get_for_update`](Self::batch_get_for_update) establishes it; a
+    /// later typed read of a warmed key decodes the cached bytes. This serves
+    /// advisory prefetching, where the caller's checked path performs the
+    /// decode and validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's error; keys read before the failure stay cached.
+    pub(crate) async fn warm_for_update(&mut self, keys: Vec<LogicalKey>) -> Result<()> {
+        let encoded = keys
+            .iter()
+            .map(|key| encode_input_key(&self.binding, key))
+            .collect::<Result<Vec<_>>>()?;
+        self.batch_get_raw(encoded, true).await?;
+        Ok(())
     }
 
     /// Reads one raw value, serving repeats from the transaction-local cache.
