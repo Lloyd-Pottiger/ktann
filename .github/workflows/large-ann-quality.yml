@@ -23,8 +23,6 @@ jobs:
     name: RocksDB million-vector quality curves
     runs-on: [self-hosted, ktann-benchmark]
     timeout-minutes: 1440
-    env:
-      KTANN_BENCH_DATASET_CACHE: ${{ runner.tool_cache }}/ktann-datasets
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
@@ -34,6 +32,8 @@ jobs:
           shared-key: large-quality-rocksdb
       - name: Prepare public datasets
         shell: bash
+        env:
+          KTANN_BENCH_DATASET_CACHE: ${{ runner.tool_cache }}/ktann-datasets
         run: |
           set -euo pipefail
           checksum_matches() {
@@ -98,6 +98,8 @@ jobs:
             done
           done
       - name: Run optimized large quality profile
+        env:
+          KTANN_BENCH_DATASET_CACHE: ${{ runner.tool_cache }}/ktann-datasets
         run: >-
           cargo +stable run --release -p ktann-benchmarks --bin ktann-bench --
           run --backend rocksdb --profile large --worker-threads 8
