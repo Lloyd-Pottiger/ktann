@@ -138,7 +138,7 @@ pub struct HistoryEntry {
 /// permanently exposed via [`History::truncated`]; a truncated history is never
 /// presented as a complete replay.
 #[derive(Debug)]
-pub struct History {
+struct History {
     entries: VecDeque<HistoryEntry>,
     capacity: usize,
     truncated: bool,
@@ -146,7 +146,7 @@ pub struct History {
 
 impl History {
     /// Creates an empty history retaining at most `capacity` entries.
-    pub fn with_capacity(capacity: usize) -> Self {
+    fn with_capacity(capacity: usize) -> Self {
         Self {
             entries: VecDeque::with_capacity(capacity),
             capacity,
@@ -164,12 +164,12 @@ impl History {
     }
 
     /// Iterates over retained entries in commit order.
-    pub fn entries(&self) -> impl Iterator<Item = &HistoryEntry> {
+    fn entries(&self) -> impl Iterator<Item = &HistoryEntry> {
         self.entries.iter()
     }
 
     /// Returns `true` once any entry has been evicted from the ring.
-    pub fn truncated(&self) -> bool {
+    fn truncated(&self) -> bool {
         self.truncated
     }
 }
@@ -337,6 +337,23 @@ struct VersionRecord {
     cleared_ranges: Vec<KeyRange>,
 }
 
+impl State {
+    /// The initial state at version 0 over `committed`: no conflict metadata,
+    /// no open transactions, a fresh history ring, and an empty fault plan.
+    fn new(committed: Arc<Keyspace>, db_bytes: usize, max_history_entries: usize) -> Self {
+        Self {
+            version: 0,
+            committed,
+            db_bytes,
+            last_written: BTreeMap::new(),
+            versions: VecDeque::new(),
+            history: History::with_capacity(max_history_entries),
+            active_txns: 0,
+            fault_plan: VecDeque::new(),
+        }
+    }
+}
+
 impl DeterministicBackend {
     /// Constructs a backend from `config`, validating the bounds that must be
     /// at least one for the model to remain coherent.
@@ -358,16 +375,7 @@ impl DeterministicBackend {
             config.max_history_entries >= 1,
             "max_history_entries must be >= 1"
         );
-        let state = State {
-            version: 0,
-            committed: Arc::new(BTreeMap::new()),
-            db_bytes: 0,
-            last_written: BTreeMap::new(),
-            versions: VecDeque::new(),
-            history: History::with_capacity(config.max_history_entries),
-            active_txns: 0,
-            fault_plan: VecDeque::new(),
-        };
+        let state = State::new(Arc::new(BTreeMap::new()), 0, config.max_history_entries);
         Self {
             config,
             state: Mutex::new(state),
@@ -474,16 +482,7 @@ impl DeterministicBackend {
         };
         let db_bytes =
             try_sum_bytes(&committed).expect("reopened committed byte accounting overflows usize");
-        let state = State {
-            version: 0,
-            committed,
-            db_bytes,
-            last_written: BTreeMap::new(),
-            versions: VecDeque::new(),
-            history: History::with_capacity(self.config.max_history_entries),
-            active_txns: 0,
-            fault_plan: VecDeque::new(),
-        };
+        let state = State::new(committed, db_bytes, self.config.max_history_entries);
         DeterministicBackend {
             config: self.config,
             state: Mutex::new(state),
@@ -645,12 +644,9 @@ impl DeterministicWriteTxn<'_> {
         Ok(())
     }
 
-    /// Rejects pending-overlay growth past `max_mutation_buffer`.
-    fn check_buffer_growth(&self, new_keys: &BTreeSet<Vec<u8>>) -> Result<()> {
-        let added = new_keys
-            .iter()
-            .filter(|key| !self.pending.contains_key(*key))
-            .count();
+    /// Rejects pending-overlay growth of `added` new keys past
+    /// `max_mutation_buffer`.
+    fn check_buffer_growth(&self, added: usize) -> Result<()> {
         let current = self
             .pending
             .len()
@@ -848,18 +844,7 @@ impl ReadOps for DeterministicReadTxn<'_> {
 
     async fn scan(&mut self, range: &KeyRange, limits: ScanLimits) -> Result<ScanPage> {
         self.backend.count(|counts| counts.scan += 1);
-        let (item_limit, byte_limit) = resolve_scan(limits, &self.backend.config)?;
-        if range.start() >= range.end() {
-            return Ok(ScanPage::terminal(Vec::new()));
-        }
-        check_range(&self.backend.config, range)?;
-        scan_map(
-            &self.snapshot,
-            range,
-            item_limit,
-            byte_limit,
-            self.backend.config.hard_limits.max_key_bytes,
-        )
+        scan_one(&self.backend.config, &self.snapshot, range, limits)
     }
 
     async fn batch_scan(
@@ -868,27 +853,7 @@ impl ReadOps for DeterministicReadTxn<'_> {
         limits: ScanLimits,
     ) -> Result<Vec<ScanPage>> {
         self.backend.count(|counts| counts.batch_scan += 1);
-        if ranges.len() > self.backend.config.max_batch_size {
-            return Err(limit_exceeded());
-        }
-        let (item_limit, byte_limit) = resolve_scan(limits, &self.backend.config)?;
-        let max_key_bytes = self.backend.config.hard_limits.max_key_bytes;
-        let mut pages = Vec::with_capacity(ranges.len());
-        for range in ranges {
-            if range.start() >= range.end() {
-                pages.push(ScanPage::terminal(Vec::new()));
-                continue;
-            }
-            check_range(&self.backend.config, range)?;
-            pages.push(scan_map(
-                &self.snapshot,
-                range,
-                item_limit,
-                byte_limit,
-                max_key_bytes,
-            )?);
-        }
-        Ok(pages)
+        scan_batch(&self.backend.config, &self.snapshot, ranges, limits)
     }
 }
 
@@ -912,18 +877,22 @@ impl ReadOps for DeterministicWriteTxn<'_> {
 
     async fn scan(&mut self, range: &KeyRange, limits: ScanLimits) -> Result<ScanPage> {
         self.backend.count(|counts| counts.scan += 1);
-        let (item_limit, byte_limit) = resolve_scan(limits, &self.backend.config)?;
-        if range.start() >= range.end() {
-            return Ok(ScanPage::terminal(Vec::new()));
-        }
-        check_range(&self.backend.config, range)?;
-        let merged = apply_staged(&self.snapshot, &self.clear_ranges, &self.pending);
-        scan_map(
-            &merged,
+        // Read-your-writes: a non-empty range scans the snapshot with the
+        // staged overlay merged in.
+        let merged = if range.start() < range.end() {
+            Some(apply_staged(
+                &self.snapshot,
+                &self.clear_ranges,
+                &self.pending,
+            ))
+        } else {
+            None
+        };
+        scan_one(
+            &self.backend.config,
+            merged.as_ref().unwrap_or(self.snapshot.as_ref()),
             range,
-            item_limit,
-            byte_limit,
-            self.backend.config.hard_limits.max_key_bytes,
+            limits,
         )
     }
 
@@ -933,27 +902,23 @@ impl ReadOps for DeterministicWriteTxn<'_> {
         limits: ScanLimits,
     ) -> Result<Vec<ScanPage>> {
         self.backend.count(|counts| counts.batch_scan += 1);
-        if ranges.len() > self.backend.config.max_batch_size {
-            return Err(limit_exceeded());
-        }
-        let (item_limit, byte_limit) = resolve_scan(limits, &self.backend.config)?;
-        let max_key_bytes = self.backend.config.hard_limits.max_key_bytes;
-        let mut merged = None;
-        let mut pages = Vec::with_capacity(ranges.len());
-        for range in ranges {
-            if range.start() >= range.end() {
-                pages.push(ScanPage::terminal(Vec::new()));
-                continue;
-            }
-            check_range(&self.backend.config, range)?;
-            // Read-your-writes: the staged overlay is merged once and shared
-            // by every range in the batch.
-            let map = merged.get_or_insert_with(|| {
-                apply_staged(&self.snapshot, &self.clear_ranges, &self.pending)
-            });
-            pages.push(scan_map(map, range, item_limit, byte_limit, max_key_bytes)?);
-        }
-        Ok(pages)
+        // Read-your-writes: the staged overlay is merged once and shared by
+        // every range in the batch.
+        let merged = if ranges.iter().any(|range| range.start() < range.end()) {
+            Some(apply_staged(
+                &self.snapshot,
+                &self.clear_ranges,
+                &self.pending,
+            ))
+        } else {
+            None
+        };
+        scan_batch(
+            &self.backend.config,
+            merged.as_ref().unwrap_or(self.snapshot.as_ref()),
+            ranges,
+            limits,
+        )
     }
 }
 
@@ -981,8 +946,7 @@ impl WriteTxn for DeterministicWriteTxn<'_> {
     async fn put(&mut self, key: Bytes, value: Bytes) -> Result<()> {
         self.backend.count(|counts| counts.put += 1);
         self.check_key_value(&key, Some(&value))?;
-        let new_keys = once_set(key.to_vec());
-        self.check_buffer_growth(&new_keys)?;
+        self.check_buffer_growth(usize::from(!self.pending.contains_key(&key[..])))?;
         self.charge(
             1,
             key.len()
@@ -1000,8 +964,7 @@ impl WriteTxn for DeterministicWriteTxn<'_> {
         if self.lookup(&key).is_some() {
             return Ok(InsertOutcome::AlreadyExists);
         }
-        let new_keys = once_set(key.to_vec());
-        self.check_buffer_growth(&new_keys)?;
+        self.check_buffer_growth(usize::from(!self.pending.contains_key(&key[..])))?;
         self.charge(
             1,
             key.len()
@@ -1015,8 +978,7 @@ impl WriteTxn for DeterministicWriteTxn<'_> {
     async fn delete(&mut self, key: Bytes) -> Result<()> {
         self.backend.count(|counts| counts.delete += 1);
         self.check_key_value(&key, None)?;
-        let new_keys = once_set(key.to_vec());
-        self.check_buffer_growth(&new_keys)?;
+        self.check_buffer_growth(usize::from(!self.pending.contains_key(&key[..])))?;
         self.charge(1, key.len())?;
         self.pending.insert(key.to_vec(), None);
         Ok(())
@@ -1028,11 +990,12 @@ impl WriteTxn for DeterministicWriteTxn<'_> {
             return Err(limit_exceeded());
         }
         // Validate the whole batch before mutating any transaction state so a
-        // capacity failure leaves no partial overlay.
+        // capacity failure leaves no partial overlay. Staging in one overlay
+        // map deduplicates repeated keys with last-write-wins, matching the
+        // in-order application contract.
         let mut count_delta = 0usize;
         let mut bytes_delta = 0usize;
-        let mut new_keys = BTreeSet::new();
-        let mut ops: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::with_capacity(mutations.len());
+        let mut staged: Overlay = Overlay::new();
         for mutation in mutations {
             match mutation {
                 Mutation::Put { key, value } => {
@@ -1043,8 +1006,7 @@ impl WriteTxn for DeterministicWriteTxn<'_> {
                         .ok_or_else(limit_exceeded)?;
                     count_delta = count_delta.checked_add(1).ok_or_else(limit_exceeded)?;
                     bytes_delta = bytes_delta.checked_add(bytes).ok_or_else(limit_exceeded)?;
-                    new_keys.insert(key.to_vec());
-                    ops.push((key.to_vec(), Some(value.to_vec())));
+                    staged.insert(key.to_vec(), Some(value.to_vec()));
                 }
                 Mutation::Delete { key } => {
                     self.check_key_value(&key, None)?;
@@ -1052,15 +1014,18 @@ impl WriteTxn for DeterministicWriteTxn<'_> {
                     bytes_delta = bytes_delta
                         .checked_add(key.len())
                         .ok_or_else(limit_exceeded)?;
-                    new_keys.insert(key.to_vec());
-                    ops.push((key.to_vec(), None));
+                    staged.insert(key.to_vec(), None);
                 }
                 _ => return Err(Error::new(ErrorKind::Unsupported)),
             }
         }
-        self.check_buffer_growth(&new_keys)?;
+        let added = staged
+            .keys()
+            .filter(|key| !self.pending.contains_key(*key))
+            .count();
+        self.check_buffer_growth(added)?;
         self.charge(count_delta, bytes_delta)?;
-        for (key, value) in ops {
+        for (key, value) in staged {
             self.pending.insert(key, value);
         }
         Ok(())
@@ -1238,33 +1203,22 @@ fn scan_map(
     byte_limit: usize,
     max_key_bytes: usize,
 ) -> Result<ScanPage> {
-    let start = range.start().to_vec();
-    let end = range.end().to_vec();
     let mut items = Vec::new();
     let mut byte_total = 0usize;
     let mut more = false;
-    for (key, value) in map.range(start..end) {
+    for (key, value) in map.range(range.start().to_vec()..range.end().to_vec()) {
         let item_bytes = key
             .len()
             .checked_add(value.len())
             .ok_or_else(limit_exceeded)?;
-        if items.is_empty() {
-            // A single oversized first item is returned alone so any legal
-            // value stays readable.
-            items.push(ScanItem::new(
-                Bytes::copy_from_slice(key),
-                Bytes::copy_from_slice(value),
-            ));
-            byte_total = byte_total
-                .checked_add(item_bytes)
-                .ok_or_else(limit_exceeded)?;
-            continue;
-        }
-        if items.len() >= item_limit
-            || byte_total
-                .checked_add(item_bytes)
-                .ok_or_else(limit_exceeded)?
-                > byte_limit
+        // A single oversized first item is returned alone so any legal
+        // value stays readable.
+        if !items.is_empty()
+            && (items.len() >= item_limit
+                || byte_total
+                    .checked_add(item_bytes)
+                    .ok_or_else(limit_exceeded)?
+                    > byte_limit)
         {
             more = true;
             break;
@@ -1284,11 +1238,55 @@ fn scan_map(
     }
 }
 
-/// A one-element key set used to check overlay growth for single-key writes.
-fn once_set(key: Vec<u8>) -> BTreeSet<Vec<u8>> {
-    let mut set = BTreeSet::new();
-    set.insert(key);
-    set
+/// Scans one range of `map` under already-resolved page limits, returning a
+/// terminal empty page for an inverted range.
+fn scan_page(
+    config: &DeterministicConfig,
+    map: &Keyspace,
+    range: &KeyRange,
+    item_limit: usize,
+    byte_limit: usize,
+) -> Result<ScanPage> {
+    if range.start() >= range.end() {
+        return Ok(ScanPage::terminal(Vec::new()));
+    }
+    check_range(config, range)?;
+    scan_map(
+        map,
+        range,
+        item_limit,
+        byte_limit,
+        config.hard_limits.max_key_bytes,
+    )
+}
+
+/// Scans one range of `map` under the backend's resolved page ceilings.
+fn scan_one(
+    config: &DeterministicConfig,
+    map: &Keyspace,
+    range: &KeyRange,
+    limits: ScanLimits,
+) -> Result<ScanPage> {
+    let (item_limit, byte_limit) = resolve_scan(limits, config)?;
+    scan_page(config, map, range, item_limit, byte_limit)
+}
+
+/// Scans every range of `map` in input order, returning one page per range.
+fn scan_batch(
+    config: &DeterministicConfig,
+    map: &Keyspace,
+    ranges: &[KeyRange],
+    limits: ScanLimits,
+) -> Result<Vec<ScanPage>> {
+    if ranges.len() > config.max_batch_size {
+        return Err(limit_exceeded());
+    }
+    let (item_limit, byte_limit) = resolve_scan(limits, config)?;
+    let mut pages = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        pages.push(scan_page(config, map, range, item_limit, byte_limit)?);
+    }
+    Ok(pages)
 }
 
 fn limit_exceeded() -> Error {

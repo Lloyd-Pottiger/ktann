@@ -263,15 +263,7 @@ impl<B: Backend> RuntimeInner<B> {
             queue.backlog()
         };
         // Facade calls stay outside the queue lock.
-        for (admission, count) in [
-            (FixupAdmission::Enqueued, enqueued),
-            (FixupAdmission::Duplicate, duplicate),
-            (FixupAdmission::Saturated, saturated),
-        ] {
-            if count > 0 {
-                metrics::fixup_admission(admission, count);
-            }
-        }
+        report_admissions(enqueued, duplicate, saturated);
         metrics::fixup_backlog(backlog);
     }
 
@@ -400,9 +392,21 @@ impl<B: Backend> RuntimeInner<B> {
     }
 
     fn lock_fixups(&self) -> MutexGuard<'_, FixupQueue> {
-        match self.fixups.lock() {
-            Ok(fixups) => fixups,
-            Err(poisoned) => poisoned.into_inner(),
+        self.fixups
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// Reports one batch of queue-offer outcomes, skipping zero counts.
+fn report_admissions(enqueued: u64, duplicate: u64, saturated: u64) {
+    for (admission, count) in [
+        (FixupAdmission::Enqueued, enqueued),
+        (FixupAdmission::Duplicate, duplicate),
+        (FixupAdmission::Saturated, saturated),
+    ] {
+        if count > 0 {
+            metrics::fixup_admission(admission, count);
         }
     }
 }
@@ -496,15 +500,7 @@ impl<B: Backend> Drop for RunningFixup<'_, B> {
                 )
             }
         };
-        for (admission, count) in [
-            (FixupAdmission::Enqueued, enqueued),
-            (FixupAdmission::Duplicate, duplicate),
-            (FixupAdmission::Saturated, saturated),
-        ] {
-            if count > 0 {
-                metrics::fixup_admission(admission, count);
-            }
-        }
+        report_admissions(enqueued, duplicate, saturated);
         metrics::fixup_backlog(backlog);
         if can_yield {
             self.inner.fixup_available.notify_one();

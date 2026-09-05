@@ -122,16 +122,7 @@ pub(crate) fn select_leaf_overlap<T>(
         .checked_mul(4)
         .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?
         .min(remaining_rerank_budget);
-    let truncated = candidates.len() > overlap_cap;
-    if truncated {
-        truncate_candidates(&mut candidates, overlap_cap, compare_local_cap);
-    }
-    candidates.sort_unstable_by(compare_rough);
-
-    Ok(OverlapSelection {
-        candidates,
-        truncated,
-    })
+    Ok(cap_survivors(candidates, overlap_cap, compare_local_cap))
 }
 
 /// Selects globally overlapping candidates before exact reranking.
@@ -153,15 +144,11 @@ pub(crate) fn select_global_overlap<T>(
         nth_upper_endpoint(&mut candidates, k - 1)
     };
     candidates.retain(|candidate| candidate.distance.lower() <= overlap_threshold);
-    let truncated = candidates.len() > remaining_rerank_budget;
-    if truncated {
-        truncate_candidates(&mut candidates, remaining_rerank_budget, compare_rough);
-    }
-    candidates.sort_unstable_by(compare_rough);
-    Ok(OverlapSelection {
+    Ok(cap_survivors(
         candidates,
-        truncated,
-    })
+        remaining_rerank_budget,
+        compare_rough,
+    ))
 }
 
 fn nth_upper_endpoint<T>(candidates: &mut [ApproximateCandidate<T>], index: usize) -> f64 {
@@ -182,6 +169,24 @@ fn compare_local_cap<T>(
 ) -> Ordering {
     compare_finite(left.distance.lower(), right.distance.lower())
         .then_with(|| compare_rough(left, right))
+}
+
+/// Caps the surviving candidates at `cap` under `compare`, then restores the
+/// deterministic rough ranking order.
+fn cap_survivors<T>(
+    mut candidates: Vec<ApproximateCandidate<T>>,
+    cap: usize,
+    compare: impl Fn(&ApproximateCandidate<T>, &ApproximateCandidate<T>) -> Ordering,
+) -> OverlapSelection<T> {
+    let truncated = candidates.len() > cap;
+    if truncated {
+        truncate_candidates(&mut candidates, cap, compare);
+    }
+    candidates.sort_unstable_by(compare_rough);
+    OverlapSelection {
+        candidates,
+        truncated,
+    }
 }
 
 /// Truncates to `cap`, keeping the strongest candidates under `compare`.

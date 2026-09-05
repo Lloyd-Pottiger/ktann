@@ -435,13 +435,14 @@ async fn prepare_delete_step<T: WriteTxn>(
         });
     }
 
+    let budget = txn.admission_budget();
     let page = txn
         .scan(
             &range,
             cursor,
             ScanLimits {
-                item_limit: scan_item_limit(txn),
-                byte_limit: scan_byte_limit(txn),
+                item_limit: budget.max_mutations.max(1),
+                byte_limit: budget.max_mutation_bytes.max(1),
             },
         )
         .await?;
@@ -488,14 +489,6 @@ async fn recover_drop_after_unknown<B: Backend>(backend: &B, name_key: &LogicalK
     };
     let _ = read_manifest(&mut txn, entry.logical_index_id()).await?;
     Err(Error::new(ErrorKind::CommitOutcomeUnknown))
-}
-
-fn scan_item_limit<T: WriteTxn>(_txn: &WriteLogicalTxn<'_, T>) -> usize {
-    _txn.admission_budget().max_mutations.max(1)
-}
-
-fn scan_byte_limit<T: WriteTxn>(_txn: &WriteLogicalTxn<'_, T>) -> usize {
-    _txn.admission_budget().max_mutation_bytes.max(1)
 }
 
 async fn read_manifest<T: crate::storage::backend::ReadOps>(

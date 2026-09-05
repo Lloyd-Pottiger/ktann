@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use ktann::api::{Index, Mutation, PartitionKey, Record};
-use ktann::storage::backend::{Backend, ScanLimits};
+use ktann::storage::backend::Backend;
 use ktann::storage::keys::{LogicalKey, TreeKey};
 use ktann::storage::values::{
     ChildEntry, IndexManifest, LeafEntry, PartitionCentroid, PartitionHeader, PartitionState,
@@ -33,12 +33,6 @@ use ktann::storage::values::{
 use ktann::storage::{LogicalRange, ReadLogicalTxn, WriteLogicalTxn, tree_manifest};
 
 use super::{SharedBackend, read_manifest};
-
-/// The page bound for the root Leaf Entry read-back scan.
-const ROOT_ENTRY_SCAN: ScanLimits = ScanLimits {
-    item_limit: 256,
-    byte_limit: 1 << 20,
-};
 
 /// The state annotation of one fixture partition line.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -705,27 +699,18 @@ async fn read_root_entries(
     let mut txn = ReadLogicalTxn::for_index(raw, manifest).expect("bind index");
     let range = LogicalRange::leaf_entries(manifest, tree_key, root_key()).expect("leaf range");
     let mut entries = BTreeMap::new();
-    let mut cursor = None;
-    loop {
-        let page = txn
-            .scan(&range, cursor.as_ref(), ROOT_ENTRY_SCAN)
-            .await
-            .expect("scan root leaf");
-        let (items, next) = page.into_parts();
-        for item in items {
-            let LogicalKey::LeafEntry { id, .. } = item.key() else {
-                panic!("a Leaf Entry range holds only Leaf Entries");
-            };
-            let id = id.clone();
-            let PersistentValue::LeafEntry(entry) = item.into_value() else {
-                panic!("a Leaf Entry range holds only Leaf Entries");
-            };
-            entries.insert(id, entry);
-        }
-        cursor = next;
-        if cursor.is_none() {
-            break;
-        }
+    for item in super::audit::scan_all(&mut txn, &range)
+        .await
+        .expect("scan root leaf")
+    {
+        let LogicalKey::LeafEntry { id, .. } = item.key() else {
+            panic!("a Leaf Entry range holds only Leaf Entries");
+        };
+        let id = id.clone();
+        let PersistentValue::LeafEntry(entry) = item.into_value() else {
+            panic!("a Leaf Entry range holds only Leaf Entries");
+        };
+        entries.insert(id, entry);
     }
     entries
 }

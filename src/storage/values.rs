@@ -59,7 +59,7 @@ use bytes::Bytes;
 
 use crate::api::{Error, ErrorKind, MAX_ENCODED_SYNOPSIS_BYTES, Result};
 
-use super::keys::LogicalKey;
+use super::keys::{LogicalKey, TreeKey};
 
 mod authority;
 mod data;
@@ -109,7 +109,7 @@ pub(crate) struct LeafRelocationValueSizes {
 /// Returns exact worst-case value lengths for the current Manifest and Tree Key.
 pub(crate) fn leaf_relocation_value_sizes(
     manifest: &IndexManifest,
-    tree_key: &super::keys::TreeKey,
+    tree_key: &TreeKey,
 ) -> Result<LeafRelocationValueSizes> {
     Ok(LeafRelocationValueSizes {
         leaf_entry: entry::maximum_leaf_entry_encoded_len(manifest)?,

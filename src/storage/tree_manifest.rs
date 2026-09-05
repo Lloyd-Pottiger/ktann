@@ -68,10 +68,7 @@ pub async fn read_tree_manifest<T: ReadOps>(
     txn: &mut ReadLogicalTxn<'_, T>,
     tree_key: &TreeKey,
 ) -> Result<Option<TreeManifest>> {
-    let key = tree_manifest_key_for(
-        txn.bound_manifest().ok_or_else(Error::invalid_argument)?,
-        tree_key,
-    )?;
+    let key = tree_manifest_key_for(txn.require_manifest()?, tree_key)?;
     expect_manifest(txn.get(key).await?)
 }
 
@@ -80,10 +77,7 @@ pub async fn read_tree_manifest_for_update<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     tree_key: &TreeKey,
 ) -> Result<Option<TreeManifest>> {
-    let key = tree_manifest_key_for(
-        txn.bound_manifest().ok_or_else(Error::invalid_argument)?,
-        tree_key,
-    )?;
+    let key = tree_manifest_key_for(txn.require_manifest()?, tree_key)?;
     expect_manifest(txn.get_for_update(key).await?)
 }
 
@@ -100,7 +94,7 @@ pub async fn create_tree<T: WriteTxn>(
     tree_key: &TreeKey,
     started_at_unix_millis: u64,
 ) -> Result<TreeCreation> {
-    let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
+    let manifest = txn.require_manifest()?;
     let index = manifest.logical_index_id();
     let root = partition_key(1)?;
     let outcome = txn
@@ -163,10 +157,7 @@ pub async fn reserve_partition_keys<T: WriteTxn>(
     if count == 0 {
         return Err(Error::invalid_argument());
     }
-    let key = tree_manifest_key_for(
-        txn.bound_manifest().ok_or_else(Error::invalid_argument)?,
-        tree_key,
-    )?;
+    let key = tree_manifest_key_for(txn.require_manifest()?, tree_key)?;
     let manifest = expect_manifest(txn.get_for_update(key.clone()).await?)?
         .ok_or_else(Error::invalid_argument)?;
     let high_water = manifest.partition_key_high_water().get();

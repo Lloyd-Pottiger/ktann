@@ -476,11 +476,12 @@ fn read_fvecs(path: &Path, dimension: usize, limit: usize) -> Result<Vec<Arc<[f3
         reader
             .read_exact(&mut bytes)
             .map_err(|error| format!("read {}: {error}", path.display()))?;
-        let vector: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte chunk")))
-            .collect();
-        vectors.push(Arc::from(vector));
+        vectors.push(
+            bytes
+                .chunks_exact(4)
+                .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte chunk")))
+                .collect(),
+        );
     }
     Ok(vectors)
 }

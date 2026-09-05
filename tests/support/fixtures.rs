@@ -14,8 +14,7 @@ use std::sync::Arc;
 /// Reads one fixture file by plain file name (no path separators) from `dir`.
 ///
 /// Bad names and unreadable files are corpus-authoring errors and panic.
-#[must_use]
-pub fn read_bytes(dir: &Path, name: &str) -> Vec<u8> {
+fn read_bytes(dir: &Path, name: &str) -> Vec<u8> {
     assert!(
         !name.is_empty() && !name.contains(['/', '\\']) && !name.contains(".."),
         "bad fixture name `{name}`"

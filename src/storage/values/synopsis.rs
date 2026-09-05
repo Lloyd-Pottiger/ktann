@@ -105,17 +105,19 @@ impl PartitionSynopsis {
     /// Creates the canonical empty synopsis for an Index Manifest.
     #[must_use]
     pub fn empty(manifest: &IndexManifest) -> Self {
-        let fields = manifest
-            .bloom_parameters()
-            .iter()
-            .map(|parameters| FieldSynopsis {
-                has_null: false,
-                minimum: None,
-                maximum: None,
-                bloom: parameters.map(|parameters| Bytes::from(vec![0; parameters.byte_count()])),
-            })
-            .collect::<Vec<_>>();
-        Self::new(fields)
+        Self(
+            manifest
+                .bloom_parameters()
+                .iter()
+                .map(|parameters| FieldSynopsis {
+                    has_null: false,
+                    minimum: None,
+                    maximum: None,
+                    bloom: parameters
+                        .map(|parameters| Bytes::from(vec![0; parameters.byte_count()])),
+                })
+                .collect(),
+        )
     }
 
     /// Monotonically expands this synopsis with one exact Leaf projection.
@@ -222,12 +224,9 @@ pub(super) fn decode_partition_synopsis(
         } else {
             (None, None)
         };
-        let bloom = if let Some(parameters) = bloom_parameters {
-            let bloom = decoder.sized_bytes(parameters.byte_count())?;
-            Some(bloom)
-        } else {
-            None
-        };
+        let bloom = bloom_parameters
+            .map(|parameters| decoder.sized_bytes(parameters.byte_count()))
+            .transpose()?;
         fields.push(FieldSynopsis::new(has_null, minimum, maximum, bloom));
     }
     let synopsis = PartitionSynopsis::new(fields);
@@ -313,15 +312,11 @@ fn expand_field(
         .maximum
         .as_ref()
         .is_none_or(|maximum| value_order(value, maximum) == Ordering::Greater);
-    match (replace_minimum, replace_maximum) {
-        (true, true) => {
-            let canonical = canonical_value(value);
-            synopsis.minimum = Some(canonical.clone());
-            synopsis.maximum = Some(canonical);
-        }
-        (true, false) => synopsis.minimum = Some(canonical_value(value)),
-        (false, true) => synopsis.maximum = Some(canonical_value(value)),
-        (false, false) => {}
+    if replace_minimum {
+        synopsis.minimum = Some(canonical_value(value));
+    }
+    if replace_maximum {
+        synopsis.maximum = Some(canonical_value(value));
     }
 
     let mut changed = replace_minimum || replace_maximum;

@@ -60,8 +60,8 @@ use crate::storage::ReadLogicalTxn;
 use crate::storage::backend::ReadOps;
 use crate::storage::keys::{LogicalKey, TreeKey};
 use crate::storage::values::{
-    IndexManifest, PartitionHeader, PartitionState, PartitionSynopsis, PartitionTransition,
-    PersistentValue, RecordLocation,
+    IndexManifest, PartitionHeader, PartitionState, PartitionTransition, PersistentValue,
+    RecordLocation, expect_header, expect_synopsis,
 };
 
 use super::beam_width;
@@ -220,7 +220,7 @@ pub(crate) async fn traverse<T: ReadOps>(
     kernel: &VectorKernel,
     request: TraversalRequest<'_>,
 ) -> Result<TraversalOutcome> {
-    let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
+    let manifest = txn.require_manifest()?;
     let query = RaBitQQuery::new(request.routing, manifest.config().metric())?;
     let context = VisitContext {
         manifest,
@@ -411,11 +411,15 @@ impl Traversal {
                         },
                     ])
                     .await?;
-                let synopsis = expect_synopsis(values.pop().flatten())?;
-                let header = expect_header(values.pop().flatten())?;
+                let synopsis = expect_synopsis(values.pop().flatten())?
+                    .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
+                let header = expect_header(values.pop().flatten())?
+                    .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
                 (header, Some(synopsis))
             } else {
-                (expect_header(txn.get(header_key).await?)?, None)
+                let header = expect_header(txn.get(header_key).await?)?
+                    .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
+                (header, None)
             };
 
         // Every Child Entry descends exactly one level, so a referenced
@@ -446,14 +450,17 @@ impl Traversal {
                 Some(predicate) => {
                     let synopsis = match synopsis {
                         Some(synopsis) => synopsis,
-                        None => expect_synopsis(
-                            txn.get(LogicalKey::Synopsis {
-                                index,
-                                tree_key: tree_key.clone(),
-                                partition: entry.partition,
-                            })
-                            .await?,
-                        )?,
+                        None => {
+                            let value = txn
+                                .get(LogicalKey::Synopsis {
+                                    index,
+                                    tree_key: tree_key.clone(),
+                                    partition: entry.partition,
+                                })
+                                .await?;
+                            expect_synopsis(value)?
+                                .ok_or_else(|| Error::new(ErrorKind::Corruption))?
+                        }
                     };
                     match predicate.classify(context.manifest, &synopsis, header.entry_count())? {
                         // The synopsis proves no entry can satisfy the
@@ -684,22 +691,6 @@ impl Traversal {
             leaf_entry_budget_exhausted: self.leaf_entry_budget_exhausted,
             rabitq_overlap_truncated: self.rabitq_overlap_truncated,
         })
-    }
-}
-
-/// Extracts a partition Header from a typed read, failing closed.
-fn expect_header(value: Option<PersistentValue>) -> Result<PartitionHeader> {
-    match value {
-        Some(PersistentValue::PartitionHeader(header)) => Ok(header),
-        _ => Err(Error::new(ErrorKind::Corruption)),
-    }
-}
-
-/// Extracts a partition Synopsis from a typed read, failing closed.
-fn expect_synopsis(value: Option<PersistentValue>) -> Result<PartitionSynopsis> {
-    match value {
-        Some(PersistentValue::PartitionSynopsis(synopsis)) => Ok(synopsis),
-        _ => Err(Error::new(ErrorKind::Corruption)),
     }
 }
 

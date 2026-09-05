@@ -167,7 +167,7 @@ pub async fn route_leaf<T: ReadOps>(
     tree_key: &TreeKey,
     vector: &[f32],
 ) -> Result<Option<Route>> {
-    let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
+    let manifest = txn.require_manifest()?;
     let kernel = kernel_for(manifest)?;
     let routing = kernel.preprocess(vector)?;
     let Some(tree) = tree_manifest::read_tree_manifest(txn, tree_key).await? else {
@@ -197,7 +197,7 @@ pub async fn route_leaf_for_write<T: WriteTxn>(
     vector: &[f32],
     started_at_unix_millis: u64,
 ) -> Result<Route> {
-    let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
+    let manifest = txn.require_manifest()?;
     let kernel = kernel_for(manifest)?;
     let routing = kernel.preprocess(vector)?;
     let root = ensure_tree(txn, tree_key, started_at_unix_millis).await?;
@@ -225,7 +225,7 @@ pub async fn route_leaf_for_write_with_beam<T: WriteTxn>(
     if write_beam_size == 1 {
         return route_leaf_for_write(txn, tree_key, vector, started_at_unix_millis).await;
     }
-    let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
+    let manifest = txn.require_manifest()?;
     let kernel = kernel_for(manifest)?;
     let routing = kernel.preprocess(vector)?;
     let root = ensure_tree(txn, tree_key, started_at_unix_millis).await?;
@@ -283,7 +283,7 @@ pub(crate) async fn route_leaves_for_write_preprocessed<T: WriteTxn>(
     started_at_unix_millis: u64,
     write_beam_size: u32,
 ) -> Result<GroupedDescent> {
-    let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
+    let manifest = txn.require_manifest()?;
     if write_beam_size == 0 {
         return Err(Error::invalid_argument());
     }
@@ -297,20 +297,16 @@ pub(crate) async fn route_leaves_for_write_preprocessed<T: WriteTxn>(
         return Ok(GroupedDescent::Routed(Vec::new()));
     }
     let root = ensure_tree(txn, tree_key, started_at_unix_millis).await?;
-    let descent = if write_beam_size == 1 {
-        descend_grouped(txn, manifest, kernel, tree_key, root, routings).await?
-    } else {
-        descend_grouped_with_beam(
-            txn,
-            manifest,
-            kernel,
-            tree_key,
-            root,
-            routings,
-            write_beam_size,
-        )
-        .await?
-    };
+    let descent = descend_grouped_with_beam(
+        txn,
+        manifest,
+        kernel,
+        tree_key,
+        root,
+        routings,
+        write_beam_size,
+    )
+    .await?;
     if let GroupedDescent::Routed(routes) = &descent {
         validate_for_write(txn, manifest, tree_key, routes).await?;
     }
@@ -350,7 +346,7 @@ async fn read_tree_manifest_plain<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     tree_key: &TreeKey,
 ) -> Result<Option<TreeManifest>> {
-    let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
+    let manifest = txn.require_manifest()?;
     let key = LogicalKey::TreeManifest {
         index: manifest.logical_index_id(),
         tree_key: tree_key.clone(),
@@ -495,23 +491,6 @@ async fn descend<R: LogicalReader>(
     }
 }
 
-/// Descends from `root` with the whole group, reading each visited partition
-/// once and returning one Route per input vector in input order. The same
-/// shared state-machine body ([`resolve_hop`]) and fail-closed level and
-/// state contract as [`descend`] apply. A descent blocked by a `Merging`
-/// partition with no `Ready` same-level target reports
-/// [`GroupedDescent::NoReadyMergeTarget`] instead of routes.
-async fn descend_grouped<R: LogicalReader>(
-    reader: &mut R,
-    manifest: &IndexManifest,
-    kernel: &VectorKernel,
-    tree_key: &TreeKey,
-    root: PartitionKey,
-    routings: &[&[f32]],
-) -> Result<GroupedDescent> {
-    descend_grouped_with_beam(reader, manifest, kernel, tree_key, root, routings, 1).await
-}
-
 /// One member of a write beam currently waiting at one partition.
 ///
 /// `distance` is the distance of the edge that reached this partition. It is
@@ -524,7 +503,13 @@ struct PendingBeamMember {
     distance: f64,
 }
 
-/// Descends a batch while retaining several candidate paths per vector.
+/// Descends from `root` with the whole group, reading each visited partition
+/// once, retaining several candidate paths per vector, and returning one Route
+/// per input vector in input order. The same shared state-machine body
+/// ([`resolve_hop`]) and fail-closed level and state contract as [`descend`]
+/// apply. A descent blocked by a `Merging` partition with no `Ready`
+/// same-level target reports [`GroupedDescent::NoReadyMergeTarget`] instead of
+/// routes.
 ///
 /// The grouped shape is important for imports: all vectors that currently
 /// share a partition scan its Child Entry bodies once, while each vector keeps
@@ -865,9 +850,6 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
     ))
 }
 
-/// Returns the write beam at one child level, halving toward the root like the
-/// read traversal. `write_beam_size` is the leaf-level width; this keeps a
-/// configured beam comparable between write routing and search routing.
 /// Keeps the best terminal leaf for one member of a write beam.
 fn consider_write_route(
     routes: &mut [Option<(f64, Route)>],

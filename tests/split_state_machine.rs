@@ -1301,20 +1301,8 @@ async fn advance_rediscovers_and_converges_a_cold_split() {
 
     // No worker has run: advance performs each bounded step in turn.
     let outcomes = drive_to_completion(&backend, &manifest, &key, pk(1)).await;
-    let mut kinds = outcomes.iter().map(std::mem::discriminant);
-    let expected = [
-        std::mem::discriminant(&Advance::Began {
-            left: pk(2),
-            right: pk(3),
-        }),
-        std::mem::discriminant(&Advance::Exposed {
-            left: pk(2),
-            right: pk(3),
-        }),
-    ];
-    for expected in expected {
-        assert_eq!(kinds.next(), Some(expected));
-    }
+    assert!(matches!(outcomes[0], Advance::Began { .. }));
+    assert!(matches!(outcomes[1], Advance::Exposed { .. }));
     assert!(matches!(outcomes.last(), Some(Advance::Completed { .. })));
 
     // A settled partition is Idle, and a never-created or removed partition

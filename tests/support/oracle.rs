@@ -139,12 +139,6 @@ fn score_order(
 /// A short prediction counts as missing items, matching the CockroachDB
 /// recall definition; budget truncation is reported separately by the caller.
 #[must_use]
-pub fn recall(predicted: &[Bytes], truth: &[(Bytes, f64)]) -> f64 {
-    recall_ids(predicted, truth)
-}
-
-/// The recall overlap for an iterator of borrowed predicted Record IDs.
-#[must_use]
 pub fn recall_ids<'a>(
     predicted: impl IntoIterator<Item = &'a Bytes>,
     truth: &[(Bytes, f64)],

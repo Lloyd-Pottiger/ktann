@@ -123,17 +123,10 @@ async fn seeded_interleaving_converges_with_exact_membership() {
         .expect("create index");
     let logical_index_id = index.logical_index_id();
 
-    // Scripts are fully drawn before any task spawns: the interleaving never
-    // influences which operations exist, only when they commit.
-    let scripts: Vec<Vec<Op>> = (0..TASKS).map(generate_script).collect();
+    let tasks = spawn_scripts(&index);
 
     let mutations_done = Arc::new(AtomicBool::new(false));
     let maintenance_clock = Arc::new(AtomicU64::new(1_000));
-
-    let mut tasks = Vec::with_capacity(TASKS);
-    for (task, script) in scripts.into_iter().enumerate() {
-        tasks.push(tokio::spawn(run_script(task, script, index.clone())));
-    }
     let driver = tokio::spawn(drive_maintenance(
         backend.clone(),
         logical_index_id,
@@ -142,17 +135,7 @@ async fn seeded_interleaving_converges_with_exact_membership() {
         Arc::clone(&maintenance_clock),
     ));
 
-    let mut model = Model::new();
-    for task in tasks {
-        let local = task.await.expect("mutation task did not panic");
-        let (before, added) = (model.len(), local.len());
-        model.extend(local);
-        assert_eq!(
-            model.len(),
-            before + added,
-            "task Record ID ranges must be disjoint"
-        );
-    }
+    let model = join_models(tasks).await;
     mutations_done.store(true, Ordering::SeqCst);
     let stats = driver.await.expect("maintenance driver did not panic");
 
@@ -199,22 +182,8 @@ async fn seeded_interleaving_with_background_fixups_converges() {
         .expect("create index");
     let logical_index_id = index.logical_index_id();
 
-    let scripts: Vec<Vec<Op>> = (0..TASKS).map(generate_script).collect();
-    let mut tasks = Vec::with_capacity(TASKS);
-    for (task, script) in scripts.into_iter().enumerate() {
-        tasks.push(tokio::spawn(run_script(task, script, index.clone())));
-    }
-    let mut model = Model::new();
-    for task in tasks {
-        let local = task.await.expect("mutation task did not panic");
-        let (before, added) = (model.len(), local.len());
-        model.extend(local);
-        assert_eq!(
-            model.len(),
-            before + added,
-            "task Record ID ranges must be disjoint"
-        );
-    }
+    let tasks = spawn_scripts(&index);
+    let model = join_models(tasks).await;
 
     // Background workers settle the topology; each settle poll offers cold
     // work through an ordinary search.
@@ -437,6 +406,19 @@ async fn drive_maintenance(
     stats
 }
 
+/// Appends one ordered group of partitions as candidates for `work`.
+fn push_candidates(
+    candidates: &mut Vec<(TreeKey, PartitionKey, Work)>,
+    group: Vec<&(TreeKey, PartitionKey, PartitionHeader)>,
+    work: Work,
+) {
+    candidates.extend(
+        group
+            .into_iter()
+            .map(|(tree_key, partition, _)| (tree_key.clone(), *partition, work)),
+    );
+}
+
 /// Orders one partition listing into drivable candidates: in-flight machines
 /// first (smallest Tree Key and Partition Key), then over-full Ready
 /// partitions (most entries, largest key on ties), then under-full Ready
@@ -458,22 +440,14 @@ fn collect_candidates(
         })
         .collect();
     in_flight_splits.sort_by_key(|(tree_key, partition, _)| (tree_key.clone(), *partition));
-    candidates.extend(
-        in_flight_splits
-            .into_iter()
-            .map(|(tree_key, partition, _)| (tree_key.clone(), *partition, Work::Split)),
-    );
+    push_candidates(&mut candidates, in_flight_splits, Work::Split);
 
     let mut in_flight_merges: Vec<_> = listing
         .iter()
         .filter(|(_, _, header)| header.state() == PartitionState::Merging)
         .collect();
     in_flight_merges.sort_by_key(|(tree_key, partition, _)| (tree_key.clone(), *partition));
-    candidates.extend(
-        in_flight_merges
-            .into_iter()
-            .map(|(tree_key, partition, _)| (tree_key.clone(), *partition, Work::Merge)),
-    );
+    push_candidates(&mut candidates, in_flight_merges, Work::Merge);
 
     let maximum = config.max_partition_entries();
     let mut over_full: Vec<_> = listing
@@ -489,11 +463,7 @@ fn collect_candidates(
             .cmp(&left.2.entry_count())
             .then_with(|| right.1.cmp(&left.1))
     });
-    candidates.extend(
-        over_full
-            .into_iter()
-            .map(|(tree_key, partition, _)| (tree_key.clone(), *partition, Work::Split)),
-    );
+    push_candidates(&mut candidates, over_full, Work::Split);
 
     let minimum = config.min_partition_entries();
     let mut under_full: Vec<_> = listing
@@ -510,13 +480,38 @@ fn collect_candidates(
             .cmp(&right.2.entry_count())
             .then_with(|| left.1.cmp(&right.1))
     });
-    candidates.extend(
-        under_full
-            .into_iter()
-            .map(|(tree_key, partition, _)| (tree_key.clone(), *partition, Work::Merge)),
-    );
+    push_candidates(&mut candidates, under_full, Work::Merge);
 
     candidates
+}
+
+/// Draws every task's script and spawns one task per script. Scripts are
+/// fully drawn before any task spawns: the interleaving never influences
+/// which operations exist, only when they commit.
+fn spawn_scripts(index: &Index<SharedBackend>) -> Vec<tokio::task::JoinHandle<Model>> {
+    let scripts: Vec<Vec<Op>> = (0..TASKS).map(generate_script).collect();
+    scripts
+        .into_iter()
+        .enumerate()
+        .map(|(task, script)| tokio::spawn(run_script(task, script, index.clone())))
+        .collect()
+}
+
+/// Joins every mutation task and merges the task-local models, asserting the
+/// disjoint Record ID ranges keep the merge exact.
+async fn join_models(tasks: Vec<tokio::task::JoinHandle<Model>>) -> Model {
+    let mut model = Model::new();
+    for task in tasks {
+        let local = task.await.expect("mutation task did not panic");
+        let (before, added) = (model.len(), local.len());
+        model.extend(local);
+        assert_eq!(
+            model.len(),
+            before + added,
+            "task Record ID ranges must be disjoint"
+        );
+    }
+    model
 }
 
 /// The task-owned Record ID `t{TASK}-r{ORDINAL}`.

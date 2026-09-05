@@ -40,8 +40,7 @@ fn leaf_drain_batch_limit(
     source_entries: u32,
     budget_limit: usize,
 ) -> usize {
-    let contention_limit = usize::try_from(max_partition_entries)
-        .expect("u32 fits usize on supported targets")
+    let contention_limit = (max_partition_entries as usize)
         .div_ceil(4)
         .max(MIN_LEAF_DRAIN_BATCH);
     budget_limit

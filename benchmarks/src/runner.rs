@@ -18,12 +18,12 @@ use crate::backend::{BackendCounters, MeasuredBackend};
 use crate::dataset::{self, BenchmarkDataset};
 use crate::metrics::{CapturedMetrics, MetricCapture};
 use crate::report::{
-    AdmissionTarget, BenchmarkReport, BudgetConfiguration, BudgetSummary, Configuration,
+    AdmissionTarget, BackendIo, BenchmarkReport, BudgetConfiguration, BudgetSummary, Configuration,
     ConvergencePhase, Distribution, Environment, ImportPhase, LifecycleMeasurements,
     MaintenanceSummary, OperationClass, OperationSummary, PartitionStateCounts, PhaseResources,
     QualityPoint, QualitySweepMeasurements, RecallSummary, ReportMeasurements,
     SearchBudgetConfiguration, SearchPhase, SearchTruncation, SteadyStateMeasurements, Topology,
-    WorkloadDispatch, WriteAmplification,
+    WorkloadDispatch, WriteAmplification, aggregate_rejection_rate,
 };
 use crate::resource::ResourceSnapshot;
 
@@ -502,10 +502,8 @@ pub async fn run_scenario<B: Backend>(
             k: spec.k,
             import_batch_size: (spec.lifecycle || spec.profile == "large")
                 .then_some(spec.import_batch_size),
-            import_max_in_flight_batches: spec
-                .lifecycle
-                .then_some(spec.import_max_in_flight_batches)
-                .or_else(|| (spec.profile == "large").then_some(spec.import_max_in_flight_batches)),
+            import_max_in_flight_batches: (spec.lifecycle || spec.profile == "large")
+                .then_some(spec.import_max_in_flight_batches),
             import_backlog_watermark: (spec.lifecycle || spec.profile == "large")
                 .then_some(spec.import_backlog_watermark),
         },
@@ -754,7 +752,7 @@ struct CaseBaseline {
     /// Cumulative process resources at the same boundary.
     resources: ResourceSnapshot,
     /// Cumulative Backend IO at the same boundary.
-    backend_io: crate::report::BackendIo,
+    backend_io: BackendIo,
 }
 
 /// Returns the stable public name of a configured distance metric.
@@ -866,20 +864,18 @@ async fn run_import_phase<B: Backend>(
     backend_counters: &BackendCounters,
     metric_capture: &MetricCapture,
 ) -> Result<(ImportPhase, CaseBaseline), String> {
+    if batches.is_empty() {
+        return Err("lifecycle import has no batches".to_owned());
+    }
+    let resources_before = ResourceSnapshot::capture()?;
+    let backend_before = backend_counters.snapshot();
+    let started = Instant::now();
     let mut submitted_batch_sizes = Vec::with_capacity(batches.len());
     let mut submit_latency_ms = Vec::with_capacity(batches.len());
     let mut failures = BTreeMap::new();
-    let mut resources_before = None;
-    let mut backend_before = None;
-    let mut started = None;
     for batch in batches {
-        if started.is_none() {
-            resources_before = Some(ResourceSnapshot::capture()?);
-            backend_before = Some(backend_counters.snapshot());
-        }
         let records = batch.len();
         let submit_started = Instant::now();
-        started.get_or_insert(submit_started);
         match session.submit(batch).await {
             Ok(_) => submitted_batch_sizes.push(records),
             Err(error) => {
@@ -888,11 +884,6 @@ async fn run_import_phase<B: Backend>(
         }
         submit_latency_ms.push(submit_started.elapsed().as_secs_f64() * 1_000.0);
     }
-    let started = started.ok_or_else(|| "lifecycle import has no batches".to_owned())?;
-    let resources_before =
-        resources_before.ok_or_else(|| "lifecycle import has no resource baseline".to_owned())?;
-    let backend_before =
-        backend_before.ok_or_else(|| "lifecycle import has no Backend IO baseline".to_owned())?;
     let results = session.finish().await;
     let wall_seconds = started.elapsed().as_secs_f64();
     let resources_after = ResourceSnapshot::capture()?;
@@ -1064,7 +1055,7 @@ struct CompletedSearchPhase {
     /// Cumulative process resources at the same boundary.
     resources_after: ResourceSnapshot,
     /// Cumulative Backend IO at the same boundary.
-    backend_after: crate::report::BackendIo,
+    backend_after: BackendIo,
 }
 
 /// Builds common resource and maintenance accounting at a phase boundary.
@@ -1072,7 +1063,7 @@ fn phase_resources(
     wall_seconds: f64,
     before: ResourceSnapshot,
     after: ResourceSnapshot,
-    backend_io: crate::report::BackendIo,
+    backend_io: BackendIo,
     metrics: &CapturedMetrics,
     metric_capture: &MetricCapture,
 ) -> PhaseResources {
@@ -1395,16 +1386,12 @@ fn validate_admission_target(
             ));
         }
     }
-    let attempted: u64 = operations.values().map(|summary| summary.attempted).sum();
-    let rejected: u64 = operations.values().map(|summary| summary.rejected).sum();
-    let rejection_rate = if attempted == 0 {
-        0.0
-    } else {
-        rejected as f64 / attempted as f64
-    };
+    let rejection_rate = aggregate_rejection_rate(operations);
     if rejection_rate < target.minimum_rejection_rate
         || rejection_rate > target.maximum_rejection_rate
     {
+        let attempted: u64 = operations.values().map(|summary| summary.attempted).sum();
+        let rejected: u64 = operations.values().map(|summary| summary.rejected).sum();
         return Err(format!(
             "admission sample has {rejected}/{attempted} rejected operations ({rejection_rate:.4}); target rate is [{:.4}, {:.4}]",
             target.minimum_rejection_rate, target.maximum_rejection_rate
@@ -1993,14 +1980,12 @@ fn exact_truth(dataset: &BenchmarkDataset, metric: Metric, k: usize) -> Vec<Exac
         return truth
             .iter()
             .map(|neighbors| {
-                Arc::from(
-                    neighbors
-                        .iter()
-                        .take(k)
-                        .cloned()
-                        .map(|id| (id, 0.0))
-                        .collect::<Vec<_>>(),
-                )
+                neighbors
+                    .iter()
+                    .take(k)
+                    .cloned()
+                    .map(|id| (id, 0.0))
+                    .collect()
             })
             .collect();
     }
@@ -2337,7 +2322,7 @@ mod tests {
 
     #[test]
     fn topology_settlement_rejects_insufficient_leaf_capacity() {
-        let topology = crate::report::Topology {
+        let topology = Topology {
             vector_records: 1_000_000,
             partitions: 1_089,
             entries: 1_001_088,

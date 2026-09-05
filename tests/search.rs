@@ -11,69 +11,24 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use ktann::api::{
-    CompareOp, DataType, ErrorKind, FieldId, FieldSchema, Index, IndexConfig, LogicalIndexId,
-    Metric, OperationOptions, Predicate, Record, SearchBudgets, SearchOptions, SearchOutcome,
+    CompareOp, DataType, ErrorKind, FieldId, FieldSchema, Index, IndexConfig, Metric,
+    OperationOptions, Predicate, Record, SearchBudgets, SearchOptions, SearchOutcome,
     SearchRequest, Value,
 };
 use ktann::runtime::Runtime;
-use ktann::storage::backend::{
-    AdmissionBudget, Backend, Capabilities, HardLimits, ScanLimits, WriteTxn,
-};
+use ktann::storage::backend::{Backend, ScanLimits, WriteTxn};
 use ktann::storage::keys::{self, LogicalKey, TreeKey};
 use ktann::storage::values::{
-    IndexLifecycle, IndexManifest, PartitionHeader, PartitionState, PartitionSynopsis,
-    PartitionTransition, PersistentValue, RecordLocation,
+    IndexLifecycle, PartitionHeader, PartitionState, PartitionSynopsis, PartitionTransition,
+    PersistentValue, RecordLocation,
 };
 use ktann::storage::{LogicalRange, ReadLogicalTxn, WriteLogicalTxn};
 use tokio_util::sync::CancellationToken;
 
-use support::{DeterministicBackend, DeterministicConfig};
+use support::{DeterministicBackend, DeterministicConfig, SharedBackend};
 
 #[allow(dead_code)]
 mod support;
-
-#[derive(Clone)]
-struct SharedBackend {
-    inner: Arc<DeterministicBackend>,
-}
-
-impl SharedBackend {
-    fn new(inner: DeterministicBackend) -> Self {
-        Self {
-            inner: Arc::new(inner),
-        }
-    }
-}
-
-impl Backend for SharedBackend {
-    type ReadTxn<'backend> = support::DeterministicReadTxn<'backend>;
-
-    type WriteTxn<'backend> = support::DeterministicWriteTxn<'backend>;
-
-    fn hard_limits(&self) -> HardLimits {
-        self.inner.hard_limits()
-    }
-
-    fn admission_budget(&self) -> AdmissionBudget {
-        self.inner.admission_budget()
-    }
-
-    fn capabilities(&self) -> Capabilities {
-        self.inner.capabilities()
-    }
-
-    async fn shutdown(&self) {
-        self.inner.shutdown().await;
-    }
-
-    async fn begin_read(&self) -> ktann::api::Result<Self::ReadTxn<'_>> {
-        self.inner.begin_read().await
-    }
-
-    async fn begin_write(&self) -> ktann::api::Result<Self::WriteTxn<'_>> {
-        self.inner.begin_write().await
-    }
-}
 
 fn shared_backend(config: DeterministicConfig) -> SharedBackend {
     SharedBackend::new(DeterministicBackend::new(config))
@@ -193,19 +148,6 @@ fn assert_no_budget_exhaustion(outcome: &SearchOutcome) {
 
 fn search_request(k: usize) -> SearchRequest {
     SearchRequest::new(Arc::from([0.0_f32]), k).expect("valid request")
-}
-
-async fn read_manifest(backend: &SharedBackend, index: LogicalIndexId) -> IndexManifest {
-    let raw = backend.begin_read().await.expect("begin read");
-    let mut txn = ReadLogicalTxn::bootstrap(raw);
-    match txn
-        .get(LogicalKey::Manifest(index))
-        .await
-        .expect("read manifest")
-    {
-        Some(PersistentValue::IndexManifest(manifest)) => manifest,
-        _ => panic!("committed manifest must exist"),
-    }
 }
 
 /// Four trees with two records each, ordered so the global top four are the
@@ -497,7 +439,7 @@ async fn a_draining_root_split_stays_searchable_with_exact_membership() {
     insert_all(&index, &rows).await;
 
     let iid = index.logical_index_id();
-    let manifest = read_manifest(&backend, iid).await;
+    let manifest = support::read_manifest(&backend, iid).await;
     let key = tree_key(7);
 
     // Read the committed root Leaf Entries back: the RaBitQ7 encoding is
@@ -708,7 +650,7 @@ async fn inconsistent_persistent_state_fails_closed() {
     let (backend, runtime, index) = setup().await;
     let rows: Vec<Row> = vec![(b"a".to_vec(), 1.0, 1, None), (b"b".to_vec(), 2.0, 1, None)];
     insert_all(&index, &rows).await;
-    let manifest = read_manifest(&backend, index.logical_index_id()).await;
+    let manifest = support::read_manifest(&backend, index.logical_index_id()).await;
     let iid = index.logical_index_id();
     let key = tree_key(1);
     {
@@ -745,7 +687,7 @@ async fn inconsistent_persistent_state_fails_closed() {
     // Corruption, never a silent deduplication or skip.
     let (backend, runtime, index) = setup().await;
     insert_all(&index, &rows).await;
-    let manifest = read_manifest(&backend, index.logical_index_id()).await;
+    let manifest = support::read_manifest(&backend, index.logical_index_id()).await;
     let iid = index.logical_index_id();
     {
         let raw = backend.begin_write().await.expect("begin write");
@@ -813,7 +755,7 @@ async fn a_duplicate_record_id_across_partitions_fails_closed() {
     insert_all(&index, &rows).await;
 
     let iid = index.logical_index_id();
-    let manifest = read_manifest(&backend, iid).await;
+    let manifest = support::read_manifest(&backend, iid).await;
     let key = tree_key(7);
 
     // Read the committed root Leaf Entries back: the RaBitQ7 encoding is
@@ -1049,7 +991,7 @@ async fn a_dropping_or_dropped_index_fails_closed_for_search() {
         .expect("create index");
 
     // Flip the persisted Manifest to Dropping underneath the open handle.
-    let manifest = read_manifest(&backend, dropping.logical_index_id()).await;
+    let manifest = support::read_manifest(&backend, dropping.logical_index_id()).await;
     {
         let raw = backend.begin_write().await.expect("begin write");
         let limits = backend.hard_limits();

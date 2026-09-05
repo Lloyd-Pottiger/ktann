@@ -86,14 +86,8 @@ impl VectorKernel {
         if norm == 0.0 {
             return Ok(centroid.to_vec().into_boxed_slice());
         }
-        let mut normalized = allocate_vector(self.dimension)?;
-        for &component in centroid {
-            let component = (f64::from(component) / norm) as f32;
-            if !component.is_finite() {
-                return Err(vector_error(VectorSource::Persistent));
-            }
-            normalized.push(component);
-        }
+        let mut normalized = allocate_vec(self.dimension)?;
+        push_normalized(&mut normalized, centroid, norm, VectorSource::Persistent)?;
         Ok(normalized.into_boxed_slice())
     }
 
@@ -106,20 +100,14 @@ impl VectorKernel {
     pub(crate) fn preprocess(&self, vector: &[f32]) -> Result<Box<[f32]>> {
         validate_vector(vector, self.dimension, VectorSource::Caller)?;
 
-        let mut processed = allocate_vector(self.dimension)?;
+        let mut processed = allocate_vec(self.dimension)?;
         match self.metric {
             Metric::Cosine => {
                 let norm = vector_norm(vector, VectorSource::Caller)?;
                 if norm == 0.0 {
                     return Err(vector_error(VectorSource::Caller));
                 }
-                for &component in vector {
-                    let normalized = (f64::from(component) / norm) as f32;
-                    if !normalized.is_finite() {
-                        return Err(vector_error(VectorSource::Caller));
-                    }
-                    processed.push(normalized);
-                }
+                push_normalized(&mut processed, vector, norm, VectorSource::Caller)?;
             }
             Metric::L2 | Metric::InnerProduct => processed.extend_from_slice(vector),
         }
@@ -224,12 +212,33 @@ fn vector_error(source: VectorSource) -> Error {
     }
 }
 
-fn allocate_vector(dimension: usize) -> Result<Vec<f32>> {
+/// Allocates exact capacity for one bounded workspace, classifying allocation
+/// failure as LimitExceeded.
+fn allocate_vec<T>(capacity: usize) -> Result<Vec<T>> {
     let mut vector = Vec::new();
     vector
-        .try_reserve_exact(dimension)
+        .try_reserve_exact(capacity)
         .map_err(|error| Error::with_source(ErrorKind::LimitExceeded, error))?;
     Ok(vector)
+}
+
+/// Pushes each component divided by `norm`, converting back to f32 per
+/// component. The scalar f64 division order is persistent format; a
+/// non-finite result fails closed by `source`.
+fn push_normalized(
+    output: &mut Vec<f32>,
+    vector: &[f32],
+    norm: f64,
+    source: VectorSource,
+) -> Result<()> {
+    for &component in vector {
+        let normalized = (f64::from(component) / norm) as f32;
+        if !normalized.is_finite() {
+            return Err(vector_error(source));
+        }
+        output.push(normalized);
+    }
+    Ok(())
 }
 
 fn dot_product(left: &[f32], right: &[f32]) -> f64 {
@@ -339,10 +348,7 @@ impl Rotation {
 }
 
 fn generate_pairs(dimension: usize, random: &mut ChaCha8) -> Result<Box<[[usize; 2]]>> {
-    let mut permutation = Vec::new();
-    permutation
-        .try_reserve_exact(dimension)
-        .map_err(|error| Error::with_source(ErrorKind::LimitExceeded, error))?;
+    let mut permutation = allocate_vec(dimension)?;
     permutation.extend(0..dimension);
 
     // Descending Fisher-Yates consumes one unbiased bounded draw per suffix.
@@ -354,10 +360,7 @@ fn generate_pairs(dimension: usize, random: &mut ChaCha8) -> Result<Box<[[usize;
     }
 
     let pair_count = dimension / 2;
-    let mut pairs = Vec::new();
-    pairs
-        .try_reserve_exact(pair_count)
-        .map_err(|error| Error::with_source(ErrorKind::LimitExceeded, error))?;
+    let mut pairs = allocate_vec(pair_count)?;
     for pair in permutation.chunks_exact(2) {
         pairs.push([pair[0], pair[1]]);
     }
@@ -425,8 +428,6 @@ impl ChaCha8 {
         state[4..12].copy_from_slice(&self.key);
         state[12] = self.block_counter as u32;
         state[13] = (self.block_counter >> u32::BITS) as u32;
-        state[14] = 0;
-        state[15] = 0;
 
         let mut working = state;
         // Four double rounds are eight ChaCha rounds. Each double round applies

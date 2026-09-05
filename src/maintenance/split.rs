@@ -43,7 +43,7 @@ use crate::observe::labels::{FixupKind, Operation};
 use crate::observe::metrics;
 use crate::runtime::RetryPolicy;
 use crate::runtime::{reads, writes};
-use crate::storage::backend::{Backend, WriteTxn};
+use crate::storage::backend::{Backend, ReadOps, WriteTxn};
 use crate::storage::keys::{LogicalKey, TreeKey};
 use crate::storage::values::{
     IndexManifest, PartitionCentroid, PartitionHeader, PartitionState, PartitionTransition,
@@ -800,12 +800,12 @@ impl SplitBalance {
 /// Re-driving any step of a finished split observes the absence and is
 /// harmless (maintenance.md §3); a lone surviving Header is a torn committed
 /// state. One batched read covers both authority values.
-async fn read_source_state<T: crate::storage::backend::ReadOps>(
+async fn read_source_state<T: ReadOps>(
     txn: &mut ReadLogicalTxn<'_, T>,
     tree_key: &TreeKey,
     source: PartitionKey,
 ) -> Result<Option<PartitionTransition>> {
-    let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
+    let manifest = txn.require_manifest()?;
     let (header, state) =
         topology::read_authority_opt(txn, manifest.logical_index_id(), tree_key, source).await?;
     match (header, state) {

@@ -98,7 +98,7 @@ async fn open_walk_txn<'b, 'm, B: Backend>(
 }
 
 /// Scans one logical range to exhaustion in bounded pages.
-async fn scan_all<T: ReadOps>(
+pub async fn scan_all<T: ReadOps>(
     txn: &mut ReadLogicalTxn<'_, T>,
     range: &LogicalRange,
 ) -> Result<Vec<LogicalScanItem>, String> {

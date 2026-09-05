@@ -188,10 +188,7 @@ impl LeafAccumulator {
         txn: &WriteLogicalTxn<'_, T>,
         deferred: &mut MutationBuilder<'_>,
     ) -> Result<()> {
-        let index = txn
-            .bound_manifest()
-            .ok_or_else(Error::invalid_argument)?
-            .logical_index_id();
+        let index = txn.require_manifest()?.logical_index_id();
         for ((tree_key, partition), header) in self.headers {
             deferred.put(
                 LogicalKey::Header {
@@ -508,10 +505,7 @@ pub(crate) async fn delete_record_with_header<T: WriteTxn>(
     writes: &mut WriteSinks<'_, '_>,
     id: &Bytes,
 ) -> Result<DeleteReport> {
-    let index = txn
-        .bound_manifest()
-        .ok_or_else(Error::invalid_argument)?
-        .logical_index_id();
+    let index = txn.require_manifest()?.logical_index_id();
 
     let record_key = record_key(index, id);
     if expect_record(txn.get_for_update(record_key.clone()).await?)?.is_none() {
@@ -544,10 +538,7 @@ pub async fn read_locations_for_update<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     ids: &[Bytes],
 ) -> Result<Vec<Option<RecordLocation>>> {
-    let index = txn
-        .bound_manifest()
-        .ok_or_else(Error::invalid_argument)?
-        .logical_index_id();
+    let index = txn.require_manifest()?.logical_index_id();
     let mut keys = Vec::with_capacity(ids.len().saturating_mul(2));
     for id in ids {
         keys.push(record_key(index, id));
@@ -555,7 +546,7 @@ pub async fn read_locations_for_update<T: WriteTxn>(
     }
     let mut values = txn.batch_get_for_update(keys).await?.into_iter();
     let mut locations = Vec::with_capacity(ids.len());
-    for (position, _) in ids.iter().enumerate() {
+    for position in 0..ids.len() {
         let pair = match (values.next(), values.next()) {
             (Some(record), Some(location)) => classify_location_pair(record, location)
                 .map_err(|error| error.at_position(position))?,
@@ -743,7 +734,7 @@ fn validated_input<'manifest, T>(
     if record.record_id() != entry.record_id() {
         return Err(Error::invalid_argument());
     }
-    txn.bound_manifest().ok_or_else(Error::invalid_argument)
+    txn.require_manifest()
 }
 
 /// Validates that a decoded Header names a write-accepting leaf.

@@ -10,18 +10,14 @@ use bytes::Bytes;
 use ktann::api::RuntimeConfig;
 use ktann::runtime::Runtime;
 use ktann_rocksdb::{BackendNamespace, RocksDbBackend};
-use rocksdb::{OptimisticTransactionDB, Options};
 
 #[path = "../../tests/support/adapter_recall.rs"]
 mod adapter_recall;
 #[path = "../../tests/support/fixtures.rs"]
 mod fixtures;
+mod support;
 
-fn open_database(path: &Path) -> OptimisticTransactionDB {
-    let mut options = Options::default();
-    options.create_if_missing(true);
-    OptimisticTransactionDB::open(&options, path).expect("open RocksDB")
-}
+use support::open_database;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rocksdb_recall_matches_the_corpus_contract() {

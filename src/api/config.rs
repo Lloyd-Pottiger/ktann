@@ -302,9 +302,9 @@ impl RuntimeConfig {
         Ok(self)
     }
 
-    /// Sets default Search Budgets within v1 hard caps.
+    /// Sets default Search Budgets; [`SearchBudgets`] constructors already
+    /// enforce the v1 hard caps.
     pub fn with_default_search_budgets(mut self, budgets: SearchBudgets) -> Result<Self> {
-        budgets.validate_hard_caps()?;
         self.default_search_budgets = budgets;
         Ok(self)
     }
@@ -388,7 +388,7 @@ impl RuntimeConfig {
         {
             return Err(Error::invalid_argument());
         }
-        self.default_search_budgets.validate_hard_caps()
+        Ok(())
     }
 
     /// Returns each bound for running and waiting foreground operations.

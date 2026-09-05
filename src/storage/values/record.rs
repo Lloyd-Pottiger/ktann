@@ -142,15 +142,27 @@ impl fmt::Debug for RecordLocation {
     }
 }
 
+pub(super) fn encode_record_id(encoder: &mut Encoder, record_id: &[u8]) -> Result<()> {
+    if record_id.is_empty() || record_id.len() > MAX_RECORD_ID_BYTES {
+        return Err(Error::invalid_argument());
+    }
+    encoder.sized_u16_bytes(record_id)
+}
+
+pub(super) fn decode_record_id(decoder: &mut Decoder) -> Result<Bytes> {
+    let record_id = decoder.sized_u16_bytes(MAX_RECORD_ID_BYTES)?;
+    if record_id.is_empty() {
+        return Err(corrupt());
+    }
+    Ok(record_id)
+}
+
 pub(super) fn encode_vector_record(
     encoder: &mut Encoder,
     manifest: &IndexManifest,
     record: &VectorRecord,
 ) -> Result<()> {
-    if record.record_id.is_empty() || record.record_id.len() > MAX_RECORD_ID_BYTES {
-        return Err(Error::invalid_argument());
-    }
-    encoder.sized_u16_bytes(&record.record_id)?;
+    encode_record_id(encoder, &record.record_id)?;
     encode_vector(encoder, manifest.config().dimension(), record.vector())?;
     encode_fields(encoder, manifest.config().fields(), record.fields())
 }
@@ -159,20 +171,10 @@ pub(super) fn decode_vector_record(
     decoder: &mut Decoder,
     manifest: &IndexManifest,
 ) -> Result<VectorRecord> {
-    let record_id = decoder.sized_u16_bytes(MAX_RECORD_ID_BYTES)?;
-    if record_id.is_empty() {
-        return Err(corrupt());
-    }
+    let record_id = decode_record_id(decoder)?;
     let vector = decode_vector(decoder, manifest.config().dimension())?;
     let fields = decode_fields(decoder, manifest.config().fields())?;
     Ok(VectorRecord::new(record_id, vector, fields))
-}
-
-fn validate_tree_key(manifest: &IndexManifest, tree_key: &TreeKey) -> Result<()> {
-    let (types, type_count) = manifest.tree_key_types();
-    tree_key
-        .validate(&types[..type_count])
-        .map_err(|_| Error::invalid_argument())
 }
 
 pub(super) fn encode_opaque_payload(encoder: &mut Encoder, payload: &OpaquePayload) -> Result<()> {
@@ -180,8 +182,8 @@ pub(super) fn encode_opaque_payload(encoder: &mut Encoder, payload: &OpaquePaylo
 }
 
 pub(super) fn decode_opaque_payload(decoder: &mut Decoder) -> Result<OpaquePayload> {
-    let payload = decoder.sized_bytes(MAX_PAYLOAD_BYTES)?;
-    OpaquePayload::new(payload).map_err(|_| corrupt())
+    // The sized decode already enforces the bound, so construction cannot fail.
+    Ok(OpaquePayload(decoder.sized_bytes(MAX_PAYLOAD_BYTES)?))
 }
 
 pub(super) fn encode_record_location(
@@ -189,7 +191,11 @@ pub(super) fn encode_record_location(
     manifest: &IndexManifest,
     location: &RecordLocation,
 ) -> Result<()> {
-    validate_tree_key(manifest, location.tree_key())?;
+    let (types, type_count) = manifest.tree_key_types();
+    location
+        .tree_key()
+        .validate(&types[..type_count])
+        .map_err(|_| Error::invalid_argument())?;
     encoder.sized_bytes(location.tree_key().as_bytes(), MAX_TREE_KEY_BYTES)?;
     encoder.u64(location.leaf.get());
     Ok(())

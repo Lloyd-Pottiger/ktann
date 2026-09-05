@@ -227,10 +227,9 @@ impl ImportConcurrency {
     }
 
     fn lock_state(&self) -> MutexGuard<'_, ImportConcurrencyState> {
-        match self.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => poisoned.into_inner(),
-        }
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 

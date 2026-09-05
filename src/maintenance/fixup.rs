@@ -11,7 +11,7 @@
 //! avoiding separate split and merge preflight transactions.
 
 use crate::api::{IndexConfig, PartitionKey, Result};
-use crate::runtime::lifecycle::RetryPolicy;
+use crate::runtime::RetryPolicy;
 use crate::runtime::reads;
 use crate::storage::backend::Backend;
 use crate::storage::keys::TreeKey;

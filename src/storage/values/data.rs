@@ -3,7 +3,7 @@
 use crate::api::{DataType, Error, FieldSchema, MAX_STRING_BYTES, Result, Value};
 
 use super::corrupt;
-use super::wire::{Decoder, Encoder};
+use super::wire::{Decoder, Encoder, canonical_f64_bits};
 
 /// Returns the exact maximum encoded length of one non-NULL typed value.
 pub(super) const fn maximum_typed_value_len(data_type: DataType) -> usize {
@@ -101,11 +101,8 @@ pub(super) fn visit_typed_value_bytes(
             visit(&value.to_be_bytes());
         }
         Value::F64(value) if data_type == DataType::F64 => {
-            if !value.is_finite() {
-                return Err(Error::invalid_argument());
-            }
+            let bits = canonical_f64_bits(*value)?;
             visit(&[3]);
-            let bits = if *value == 0.0 { 0 } else { value.to_bits() };
             visit(&bits.to_be_bytes());
         }
         Value::String(value) if data_type == DataType::String => {

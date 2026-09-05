@@ -1,6 +1,5 @@
 //! Point and batch Vector Record read contract tests.
 
-use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -9,7 +8,7 @@ use ktann::api::{
     Metric, OperationOptions, PartitionKey, PayloadProjection, RuntimeConfig, Value,
 };
 use ktann::storage::WriteLogicalTxn;
-use ktann::storage::backend::{AdmissionBudget, Backend, Capabilities, HardLimits, WriteTxn};
+use ktann::storage::backend::{Backend, HardLimits, WriteTxn};
 use ktann::storage::keys::{self, TreeKey};
 use ktann::storage::values::{
     IndexIdAllocator, IndexLifecycle, IndexManifest, IndexNameEntry, OpaquePayload,
@@ -17,55 +16,10 @@ use ktann::storage::values::{
 };
 use tokio_util::sync::CancellationToken;
 
-use support::{
-    DeterministicBackend, DeterministicConfig, DeterministicReadTxn, DeterministicWriteTxn,
-};
+use support::{DeterministicBackend, DeterministicConfig, SharedBackend};
 
 #[allow(dead_code)]
 mod support;
-
-#[derive(Clone)]
-struct SharedBackend {
-    inner: Arc<DeterministicBackend>,
-}
-
-impl SharedBackend {
-    fn new(inner: DeterministicBackend) -> Self {
-        Self {
-            inner: Arc::new(inner),
-        }
-    }
-}
-
-impl Backend for SharedBackend {
-    type ReadTxn<'backend> = DeterministicReadTxn<'backend>;
-
-    type WriteTxn<'backend> = DeterministicWriteTxn<'backend>;
-
-    fn hard_limits(&self) -> HardLimits {
-        self.inner.hard_limits()
-    }
-
-    fn admission_budget(&self) -> AdmissionBudget {
-        self.inner.admission_budget()
-    }
-
-    fn capabilities(&self) -> Capabilities {
-        self.inner.capabilities()
-    }
-
-    async fn shutdown(&self) {
-        self.inner.shutdown().await;
-    }
-
-    async fn begin_read(&self) -> ktann::api::Result<Self::ReadTxn<'_>> {
-        self.inner.begin_read().await
-    }
-
-    async fn begin_write(&self) -> ktann::api::Result<Self::WriteTxn<'_>> {
-        self.inner.begin_write().await
-    }
-}
 
 fn backend(config: DeterministicConfig) -> SharedBackend {
     SharedBackend::new(DeterministicBackend::new(config))

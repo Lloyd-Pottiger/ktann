@@ -7,16 +7,9 @@ use ktann::storage::backend::{Backend, WriteTxn};
 use ktann_foundationdb::{BackendNamespace, FoundationDbBackend};
 use metrics_util::debugging::DebuggingRecorder;
 
-#[expect(
-    unsafe_code,
-    reason = "the FoundationDB binding requires one process-global network boot"
-)]
-fn boot_foundationdb() -> foundationdb::api::NetworkAutoStop {
-    // SAFETY: this integration-test binary contains one test, so it starts the
-    // process-global FoundationDB network exactly once. The returned guard is
-    // kept alive until every database, backend, and transaction has dropped.
-    unsafe { foundationdb::boot() }
-}
+mod support;
+
+use support::{boot_foundationdb, clear_test_keys};
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires a local FoundationDB 7.3 client and cluster"]
@@ -32,15 +25,7 @@ async fn foundationdb_adapter_emits_bounded_commit_metrics() {
         database,
         BackendNamespace::new("ktann-observability").expect("namespace"),
     );
-    let mut cleanup = backend.begin_write().await.expect("begin cleanup");
-    cleanup
-        .clear_range(&ktann::storage::keys::KeyRange::new(
-            b"".to_vec(),
-            b"\xff".to_vec(),
-        ))
-        .await
-        .expect("clear test range");
-    cleanup.commit().await.expect("commit cleanup");
+    clear_test_keys(&backend).await;
 
     let mut write = backend.begin_write().await.expect("begin write");
     write

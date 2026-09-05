@@ -21,23 +21,11 @@ use std::sync::Arc;
 use bytes::Bytes;
 use ktann::api::ErrorKind;
 use ktann::storage::backend::{Backend, ReadOps, ScanLimits, WriteTxn};
-use ktann::storage::keys::KeyRange;
 use ktann_rocksdb::{BackendNamespace, RocksDbBackend};
-use rocksdb::{OptimisticTransactionDB, Options};
 
-fn key(value: &'static [u8]) -> Bytes {
-    Bytes::from_static(value)
-}
+mod support;
 
-fn range(start: &[u8], end: &[u8]) -> KeyRange {
-    KeyRange::new(start.to_vec(), end.to_vec())
-}
-
-fn open_database(path: &Path) -> OptimisticTransactionDB {
-    let mut options = Options::default();
-    options.create_if_missing(true);
-    OptimisticTransactionDB::open(&options, path).expect("open RocksDB")
-}
+use support::{key, open_database, range};
 
 /// Truncates every SST in `directory` to 20 bytes, destroying each footer so
 /// any read of the table must fail a structure or checksum check.

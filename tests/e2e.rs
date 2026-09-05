@@ -432,18 +432,7 @@ impl Harness {
                     );
                     out.push_str(&format!("{}: {label}\n", datadriven::show_id(&id)));
                 }
-                Err(error) if error.kind() == ErrorKind::CommitOutcomeUnknown => {
-                    let recovered = self.recover_one(&id).await;
-                    out.push_str(&format!(
-                        "{}: error CommitOutcomeUnknown (recovered: {recovered})\n",
-                        datadriven::show_id(&id)
-                    ));
-                }
-                Err(error) => out.push_str(&format!(
-                    "{}: error {:?}\n",
-                    datadriven::show_id(&id),
-                    error.kind()
-                )),
+                Err(error) => out.push_str(&self.mutation_error_line(&id, &error).await),
             }
         }
         out
@@ -460,18 +449,7 @@ impl Harness {
                     }
                     out.push_str(&format!("{}: {existed}\n", datadriven::show_id(&id)));
                 }
-                Err(error) if error.kind() == ErrorKind::CommitOutcomeUnknown => {
-                    let recovered = self.recover_one(&id).await;
-                    out.push_str(&format!(
-                        "{}: error CommitOutcomeUnknown (recovered: {recovered})\n",
-                        datadriven::show_id(&id)
-                    ));
-                }
-                Err(error) => out.push_str(&format!(
-                    "{}: error {:?}\n",
-                    datadriven::show_id(&id),
-                    error.kind()
-                )),
+                Err(error) => out.push_str(&self.mutation_error_line(&id, &error).await),
             }
         }
         out
@@ -516,6 +494,20 @@ impl Harness {
                 self.model.remove(id);
                 "absent"
             }
+        }
+    }
+
+    /// Renders one mutation line's failure, re-synchronizing the model after
+    /// an unknown commit outcome per the documented recovery protocol.
+    async fn mutation_error_line(&mut self, id: &Bytes, error: &ktann::api::Error) -> String {
+        if error.kind() == ErrorKind::CommitOutcomeUnknown {
+            let recovered = self.recover_one(id).await;
+            format!(
+                "{}: error CommitOutcomeUnknown (recovered: {recovered})\n",
+                datadriven::show_id(id)
+            )
+        } else {
+            format!("{}: error {:?}\n", datadriven::show_id(id), error.kind())
         }
     }
 
@@ -607,7 +599,7 @@ impl Harness {
             let outcome = self.index().search(request).await.expect("recall search");
             let predicted: Vec<Bytes> = outcome.hits.iter().map(|hit| hit.id().clone()).collect();
             let truth = oracle::truth(&self.model, metric, query, k, &filter);
-            total_recall += oracle::recall(&predicted, &truth);
+            total_recall += oracle::recall_ids(&predicted, &truth);
             if outcome.exhausted != Default::default() || outcome.rabitq_overlap_truncated {
                 truncated += 1;
             }
@@ -1163,13 +1155,13 @@ impl Harness {
                     }));
                 }
                 other => {
-                    let (api_op, oracle_op) = match other {
-                        "eq" => (CompareOp::Eq, CompareOp::Eq),
-                        "ne" => (CompareOp::NotEq, CompareOp::NotEq),
-                        "lt" => (CompareOp::Lt, CompareOp::Lt),
-                        "le" => (CompareOp::LessOrEqual, CompareOp::LessOrEqual),
-                        "gt" => (CompareOp::Gt, CompareOp::Gt),
-                        "ge" => (CompareOp::GreaterOrEqual, CompareOp::GreaterOrEqual),
+                    let op = match other {
+                        "eq" => CompareOp::Eq,
+                        "ne" => CompareOp::NotEq,
+                        "lt" => CompareOp::Lt,
+                        "le" => CompareOp::LessOrEqual,
+                        "gt" => CompareOp::Gt,
+                        "ge" => CompareOp::GreaterOrEqual,
                         unknown => panic!("unknown where op `{unknown}`"),
                     };
                     let value = parse_typed(
@@ -1180,15 +1172,11 @@ impl Harness {
                     );
                     predicates.push(Predicate::Compare {
                         field,
-                        op: api_op,
+                        op,
                         value: value.clone(),
                     });
                     filters.push(Box::new(move |record| {
-                        oracle::compare_3vl(
-                            oracle_op,
-                            &record.fields[usize::from(field_index)],
-                            &value,
-                        )
+                        oracle::compare_3vl(op, &record.fields[usize::from(field_index)], &value)
                     }));
                 }
             }

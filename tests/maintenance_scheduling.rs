@@ -110,6 +110,29 @@ async fn wait_for_commit(backend: &SharedBackend, previous: usize) {
     }
 }
 
+/// Polls until every partition is `Ready` with at most `max_entries` entries,
+/// failing with `context` when one second passes without settling.
+async fn wait_for_ready_partitions(
+    backend: &SharedBackend,
+    index: &Index<SharedBackend>,
+    max_entries: u32,
+    context: &str,
+) {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let partitions = audit::list_partitions(backend, index.logical_index_id())
+            .await
+            .expect("list partitions");
+        if partitions.iter().all(|(_, _, header)| {
+            header.state() == PartitionState::Ready && header.entry_count() <= max_entries
+        }) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{context}: {partitions:?}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 /// Asserts the quiescent end state: every partition Ready, and the full
 /// persistent-state audit passes against the model.
 async fn assert_converged(backend: &SharedBackend, index: &Index<SharedBackend>, model: &Model) {
@@ -181,23 +204,13 @@ async fn split_completion_cascades_overfull_targets_without_rediscovery() {
         .collect();
     index.batch_mutate(mutations).await.expect("burst insert");
 
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        let partitions = audit::list_partitions(&backend, index.logical_index_id())
-            .await
-            .expect("list partitions");
-        let settled = partitions.iter().all(|(_, _, header)| {
-            header.state() == PartitionState::Ready && header.entry_count() <= 4
-        });
-        if settled {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "split targets did not cascade without another foreground access: {partitions:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    wait_for_ready_partitions(
+        &backend,
+        &index,
+        4,
+        "split targets did not cascade without another foreground access",
+    )
+    .await;
 
     runtime.shutdown().await.expect("shutdown");
 }
@@ -215,23 +228,13 @@ async fn successful_step_exhaustion_yields_without_rediscovery() {
         .collect();
     index.batch_mutate(mutations).await.expect("burst insert");
 
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        let partitions = audit::list_partitions(&backend, index.logical_index_id())
-            .await
-            .expect("list partitions");
-        let settled = partitions.iter().all(|(_, _, header)| {
-            header.state() == PartitionState::Ready && header.entry_count() <= 4
-        });
-        if settled {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "split did not yield across one-step executions: {partitions:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    wait_for_ready_partitions(
+        &backend,
+        &index,
+        4,
+        "split did not yield across one-step executions",
+    )
+    .await;
 
     runtime.shutdown().await.expect("shutdown");
 }

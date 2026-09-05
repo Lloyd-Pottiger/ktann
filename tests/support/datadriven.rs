@@ -92,20 +92,17 @@ impl Directive {
     /// Parses a non-negative integer argument with a default.
     #[must_use]
     pub fn arg_usize(&self, key: &str, default: usize) -> usize {
-        match self.arg(key) {
-            Some(value) => value.parse().unwrap_or_else(|_| {
-                panic!(
-                    "directive `{}` at line {}: `{key}=` must be a non-negative integer, got `{value}`",
-                    self.raw_header, self.line
-                )
-            }),
-            None => default,
-        }
+        self.arg_num(key, default)
     }
 
     /// Parses a non-negative 64-bit integer argument with a default.
     #[must_use]
     pub fn arg_u64(&self, key: &str, default: u64) -> u64 {
+        self.arg_num(key, default)
+    }
+
+    /// Parses a non-negative integer argument of any width with a default.
+    fn arg_num<T: std::str::FromStr>(&self, key: &str, default: T) -> T {
         match self.arg(key) {
             Some(value) => value.parse().unwrap_or_else(|_| {
                 panic!(

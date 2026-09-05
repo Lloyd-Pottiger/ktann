@@ -28,8 +28,6 @@ const MAX_BATCH_POINT_READS: usize = 1_024;
 const MAX_BACKEND_NAMESPACE_BYTES: usize = u8::MAX as usize;
 const PHYSICAL_PREFIX_HEADER: &[u8] = b"\0ktann-rocksdb\x01";
 
-type MutationCharge = (usize, usize);
-
 /// A caller-selected RocksDB storage scope for KTANN Logical Indexes.
 ///
 /// Namespace bytes are opaque and may be empty. They are length-delimited in
@@ -92,15 +90,10 @@ impl PhysicalPrefix {
         ROCKSDB_MAX_PHYSICAL_KEY_BYTES - self.bytes.len()
     }
 
-    fn validate_key(&self, logical_key: &[u8]) -> Result<()> {
+    fn encode_key(&self, logical_key: &[u8]) -> Result<Bytes> {
         if logical_key.len() > self.max_logical_key_bytes() {
             return Err(Error::new(ErrorKind::LimitExceeded));
         }
-        Ok(())
-    }
-
-    fn encode_key(&self, logical_key: &[u8]) -> Result<Bytes> {
-        self.validate_key(logical_key)?;
         let mut physical_key = Vec::with_capacity(self.bytes.len() + logical_key.len());
         physical_key.extend_from_slice(&self.bytes);
         physical_key.extend_from_slice(logical_key);
@@ -401,101 +394,64 @@ impl Backend for RocksDbBackend {
     }
 }
 
-impl ReadOps for RocksDbReadTxn<'_> {
-    async fn get(&mut self, key: Bytes) -> Result<Option<Bytes>> {
-        let key = self.prefix.encode_key(&key)?;
-        self.worker
-            .request(|response| ReadCommand::Get { key, response })
-            .await
-    }
+/// Stamps the shared snapshot read operations of both transaction types; the
+/// read and write actors differ only in the command enum carrying each request.
+macro_rules! impl_read_ops {
+    ($txn:ident, $command:ident) => {
+        impl ReadOps for $txn<'_> {
+            async fn get(&mut self, key: Bytes) -> Result<Option<Bytes>> {
+                let key = self.prefix.encode_key(&key)?;
+                self.worker
+                    .request(|response| $command::Get { key, response })
+                    .await
+            }
 
-    async fn batch_get(&mut self, keys: Vec<Bytes>) -> Result<Vec<Option<Bytes>>> {
-        self.worker
-            .request(|response| ReadCommand::BatchGet { keys, response })
-            .await
-    }
+            async fn batch_get(&mut self, keys: Vec<Bytes>) -> Result<Vec<Option<Bytes>>> {
+                self.worker
+                    .request(|response| $command::BatchGet { keys, response })
+                    .await
+            }
 
-    async fn scan(&mut self, range: &KeyRange, limits: ScanLimits) -> Result<ScanPage> {
-        let range = self.prefix.encode_range(range)?;
-        self.worker
-            .request(|response| ReadCommand::Scan {
-                range,
-                limits,
-                response,
-            })
-            .await
-    }
+            async fn scan(&mut self, range: &KeyRange, limits: ScanLimits) -> Result<ScanPage> {
+                let range = self.prefix.encode_range(range)?;
+                self.worker
+                    .request(|response| $command::Scan {
+                        range,
+                        limits,
+                        response,
+                    })
+                    .await
+            }
 
-    async fn batch_scan(
-        &mut self,
-        ranges: &[KeyRange],
-        limits: ScanLimits,
-    ) -> Result<Vec<ScanPage>> {
-        if limits.item_limit == 0 || limits.byte_limit == 0 {
-            return Err(Error::new(ErrorKind::InvalidArgument));
+            async fn batch_scan(
+                &mut self,
+                ranges: &[KeyRange],
+                limits: ScanLimits,
+            ) -> Result<Vec<ScanPage>> {
+                if limits.item_limit == 0 || limits.byte_limit == 0 {
+                    return Err(Error::new(ErrorKind::InvalidArgument));
+                }
+                let mut physical_ranges = Vec::with_capacity(ranges.len());
+                for range in ranges {
+                    physical_ranges.push(self.prefix.encode_range(range)?);
+                }
+                self.worker
+                    .request(|response| $command::BatchScan {
+                        ranges: physical_ranges,
+                        limits,
+                        response,
+                    })
+                    .await
+            }
         }
-        let mut physical_ranges = Vec::with_capacity(ranges.len());
-        for range in ranges {
-            physical_ranges.push(self.prefix.encode_range(range)?);
-        }
-        self.worker
-            .request(|response| ReadCommand::BatchScan {
-                ranges: physical_ranges,
-                limits,
-                response,
-            })
-            .await
-    }
+    };
 }
+
+impl_read_ops!(RocksDbReadTxn, ReadCommand);
 
 impl ReadTxn for RocksDbReadTxn<'_> {}
 
-impl ReadOps for RocksDbWriteTxn<'_> {
-    async fn get(&mut self, key: Bytes) -> Result<Option<Bytes>> {
-        let key = self.prefix.encode_key(&key)?;
-        self.worker
-            .request(|response| WriteCommand::Get { key, response })
-            .await
-    }
-
-    async fn batch_get(&mut self, keys: Vec<Bytes>) -> Result<Vec<Option<Bytes>>> {
-        self.worker
-            .request(|response| WriteCommand::BatchGet { keys, response })
-            .await
-    }
-
-    async fn scan(&mut self, range: &KeyRange, limits: ScanLimits) -> Result<ScanPage> {
-        let range = self.prefix.encode_range(range)?;
-        self.worker
-            .request(|response| WriteCommand::Scan {
-                range,
-                limits,
-                response,
-            })
-            .await
-    }
-
-    async fn batch_scan(
-        &mut self,
-        ranges: &[KeyRange],
-        limits: ScanLimits,
-    ) -> Result<Vec<ScanPage>> {
-        if limits.item_limit == 0 || limits.byte_limit == 0 {
-            return Err(Error::new(ErrorKind::InvalidArgument));
-        }
-        let mut physical_ranges = Vec::with_capacity(ranges.len());
-        for range in ranges {
-            physical_ranges.push(self.prefix.encode_range(range)?);
-        }
-        self.worker
-            .request(|response| WriteCommand::BatchScan {
-                ranges: physical_ranges,
-                limits,
-                response,
-            })
-            .await
-    }
-}
+impl_read_ops!(RocksDbWriteTxn, WriteCommand);
 
 impl RocksDbWriteTxn<'_> {
     fn prepare_put(&self, key: Bytes, value: Bytes) -> Result<PreparedMutation> {
@@ -515,7 +471,7 @@ fn next_charge(
     current_bytes: usize,
     mutation_count: usize,
     mutation_bytes: usize,
-) -> Result<MutationCharge> {
+) -> Result<(usize, usize)> {
     let next_count = current_count
         .checked_add(mutation_count)
         .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;

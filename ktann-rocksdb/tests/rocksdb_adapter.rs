@@ -6,7 +6,6 @@
 //! distinct Backend Namespace, and every test writes a bounded number of small
 //! keys and values.
 
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,22 +18,10 @@ use rocksdb::{MemtableFactory, OptimisticTransactionDB, Options, SliceTransform}
 
 #[path = "../../tests/support/backend_contract.rs"]
 mod shared_backend_contract;
+mod support;
 
 use shared_backend_contract::{BackendHarness, Fault, FaultInjection, RestartMode};
-
-fn key(value: &'static [u8]) -> Bytes {
-    Bytes::from_static(value)
-}
-
-fn range(start: &[u8], end: &[u8]) -> KeyRange {
-    KeyRange::new(start.to_vec(), end.to_vec())
-}
-
-fn open_database(path: &Path) -> OptimisticTransactionDB {
-    let mut options = Options::default();
-    options.create_if_missing(true);
-    OptimisticTransactionDB::open(&options, path).expect("open RocksDB")
-}
+use support::{key, open_database, range};
 
 /// Adapts a [`RocksDbBackend`] to the shared harness seam.
 ///

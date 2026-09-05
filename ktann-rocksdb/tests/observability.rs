@@ -4,14 +4,16 @@
 //! the `metrics` facade under the `ktann.*` namespace with only the bounded
 //! `backend` and `outcome` labels (design `runtime-operations.md` section 5).
 
-use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
 use ktann::storage::backend::{Backend, ReadOps, WriteTxn};
 use ktann_rocksdb::{BackendNamespace, RocksDbBackend};
 use metrics_util::debugging::{DebuggingRecorder, Snapshotter};
-use rocksdb::{OptimisticTransactionDB, Options};
+
+mod support;
+
+use support::open_database;
 
 fn snapshotter() -> &'static Snapshotter {
     static SNAPSHOTTER: OnceLock<Snapshotter> = OnceLock::new();
@@ -21,12 +23,6 @@ fn snapshotter() -> &'static Snapshotter {
         recorder.install().expect("global recorder installs once");
         snapshotter
     })
-}
-
-fn open_database(path: &Path) -> OptimisticTransactionDB {
-    let mut options = Options::default();
-    options.create_if_missing(true);
-    OptimisticTransactionDB::open(&options, path).expect("open RocksDB")
 }
 
 /// Captured series as `(name, sorted (label, value) pairs)`.

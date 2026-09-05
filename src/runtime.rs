@@ -633,10 +633,9 @@ impl<B: Backend> RuntimeInner<B> {
     }
 
     fn lock_lifecycle(&self) -> MutexGuard<'_, Lifecycle<B>> {
-        match self.lifecycle.lock() {
-            Ok(lifecycle) => lifecycle,
-            Err(poisoned) => poisoned.into_inner(),
-        }
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
