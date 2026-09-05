@@ -1349,26 +1349,10 @@ fn fingerprint(clear_ranges: &[KeyRange], pending: &Overlay) -> u64 {
     hasher.finish()
 }
 
-/// A replayable xorshift64 generator for model and fault histories; the
-/// printed seed reproduces a failure.
-pub struct Rng(pub u64);
-
-impl Rng {
-    /// Returns the next pseudo-random word.
-    pub fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
-    }
-
-    /// Returns the next word modulo `bound`.
-    pub fn below(&mut self, bound: u64) -> u64 {
-        self.next() % bound
-    }
-}
+// Re-exported so the model/fault-history suites can draw replayable
+// randomness as `support::Rng`; unused in suites that never draw.
+#[allow(unused_imports)]
+pub use dataset::Rng;
 
 /// A shareable [`DeterministicBackend`] handle: the Runtime under test and the
 /// test's own inspection transactions drive the same backend.

@@ -5,510 +5,34 @@
 //! Location; work per transaction is bounded; completion uses exact zero
 //! counts; crashes and conflicts at every transition are covered.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::collections::BTreeMap;
 
 use bytes::Bytes;
-use ktann::api::{
-    DataType, ErrorKind, FieldId, FieldSchema, Index, IndexConfig, Metric, PartitionKey, Record,
-    RuntimeConfig, Value,
-};
+use ktann::api::{ErrorKind, PartitionKey};
 use ktann::maintenance::routing::route_leaf;
 use ktann::maintenance::split::{self, Advance};
 use ktann::maintenance::training::train_split_centroids;
-use ktann::runtime::{RetryPolicy, Runtime};
-use ktann::storage::backend::{Backend, Capabilities, ScanLimits, WriteTxn};
+use ktann::storage::backend::{Backend, WriteTxn};
 use ktann::storage::keys::{self, LogicalKey, TreeKey};
 use ktann::storage::values::{
     ChildEntry, IndexManifest, LeafEntry, PartitionCentroid, PartitionHeader, PartitionState,
-    PartitionSynopsis, PartitionTransition, PersistentValue, RecordLocation,
+    PartitionSynopsis, PartitionTransition, PersistentValue,
 };
-use ktann::storage::{LogicalRange, ReadLogicalTxn, WriteLogicalTxn, topology, tree_manifest};
+use ktann::storage::{topology, tree_manifest};
 
+use support::topology_probe::{
+    all_partitions, assert_exact_membership, assert_fault_kind, assert_searchable, backend,
+    backend_with_clear, centroid_of, config, create_committed_tree, drive_split_to_completion,
+    edge_of, header_of, leaf_entry_of, location_of, make_runtime, pk, reachable_leaves, read_txn,
+    record, retry, rid, scan_child_entries, scan_leaf_entries, seed_records, state_of, synopsis_of,
+    tree_key, write_txn,
+};
 use support::{
     CommitFault, DeterministicBackend, DeterministicConfig, Rng, SharedBackend, read_manifest,
 };
 
 #[allow(dead_code)]
 mod support;
-
-fn backend() -> SharedBackend {
-    SharedBackend::new(DeterministicBackend::new(DeterministicConfig::default()))
-}
-
-fn backend_with_clear() -> SharedBackend {
-    let config = DeterministicConfig {
-        capabilities: Capabilities {
-            transactional_clear_range: true,
-        },
-        ..DeterministicConfig::default()
-    };
-    SharedBackend::new(DeterministicBackend::new(config))
-}
-
-/// A one-dimensional L2 index over one i64 tree-key field with a maximum of
-/// four entries per partition, so small fixtures trigger splits.
-fn config() -> IndexConfig {
-    IndexConfig::new(1, Metric::L2)
-        .expect("valid dimension")
-        .with_fields(vec![
-            FieldSchema::new("bucket", DataType::I64).expect("field"),
-        ])
-        .expect("valid fields")
-        .with_tree_key_fields(vec![FieldId(0)])
-        .expect("valid tree key fields")
-        .with_partition_entries(1, 4)
-        .expect("valid partition entries")
-}
-
-fn make_runtime(backend: SharedBackend) -> Runtime<SharedBackend> {
-    // These suites drive the state machines by hand; background maintenance
-    // workers would race the manual drives.
-    Runtime::new(backend, support::manual_maintenance_config()).expect("runtime is valid")
-}
-
-fn retry() -> RetryPolicy {
-    RetryPolicy::for_fixup(&RuntimeConfig::default())
-}
-
-fn tree_key(bucket: i64) -> TreeKey {
-    TreeKey::encode(&[DataType::I64], &[Value::I64(bucket)]).expect("canonical key")
-}
-
-fn rid(value: u8) -> Bytes {
-    Bytes::copy_from_slice(&[b'r', value])
-}
-
-fn record(id: &[u8], x: f32, bucket: i64) -> Record {
-    Record::new(
-        Bytes::copy_from_slice(id),
-        Arc::from([x]),
-        vec![Value::I64(bucket)],
-    )
-    .expect("valid record")
-}
-
-fn pk(value: u64) -> PartitionKey {
-    PartitionKey::new(value).expect("test Partition Key is nonzero")
-}
-
-async fn read_txn<'b, 'm>(
-    backend: &'b SharedBackend,
-    manifest: &'m IndexManifest,
-) -> ReadLogicalTxn<'m, <SharedBackend as Backend>::ReadTxn<'b>> {
-    let raw = backend.begin_read().await.expect("begin read");
-    ReadLogicalTxn::for_index(raw, manifest).expect("bind manifest")
-}
-
-async fn write_txn<'b, 'm>(
-    backend: &'b SharedBackend,
-    manifest: &'m IndexManifest,
-) -> WriteLogicalTxn<'m, <SharedBackend as Backend>::WriteTxn<'b>> {
-    let raw = backend.begin_write().await.expect("begin write");
-    WriteLogicalTxn::for_index(
-        raw,
-        manifest,
-        backend.hard_limits(),
-        backend.admission_budget(),
-    )
-    .expect("bind manifest")
-}
-
-/// Installs the Tree Manifest and initial leaf root so fixtures can grow the
-/// root shape from a committed empty root.
-async fn create_committed_tree(backend: &SharedBackend, manifest: &IndexManifest, key: &TreeKey) {
-    let mut txn = write_txn(backend, manifest).await;
-    tree_manifest::create_tree(&mut txn, key, 100)
-        .await
-        .expect("create tree");
-    txn.commit().await.expect("commit tree");
-}
-
-async fn header_of(
-    backend: &SharedBackend,
-    manifest: &IndexManifest,
-    key: &TreeKey,
-    partition: PartitionKey,
-) -> Option<PartitionHeader> {
-    match read_txn(backend, manifest)
-        .await
-        .get(LogicalKey::Header {
-            index: manifest.logical_index_id(),
-            tree_key: key.clone(),
-            partition,
-        })
-        .await
-        .expect("read header")
-    {
-        Some(PersistentValue::PartitionHeader(header)) => Some(header),
-        None => None,
-        other => panic!("wrong header kind: {other:?}"),
-    }
-}
-
-async fn state_of(
-    backend: &SharedBackend,
-    manifest: &IndexManifest,
-    key: &TreeKey,
-    partition: PartitionKey,
-) -> Option<PartitionTransition> {
-    match read_txn(backend, manifest)
-        .await
-        .get(LogicalKey::State {
-            index: manifest.logical_index_id(),
-            tree_key: key.clone(),
-            partition,
-        })
-        .await
-        .expect("read state")
-    {
-        Some(PersistentValue::PartitionState(state)) => Some(state),
-        None => None,
-        other => panic!("wrong state kind: {other:?}"),
-    }
-}
-
-async fn centroid_of(
-    backend: &SharedBackend,
-    manifest: &IndexManifest,
-    key: &TreeKey,
-    partition: PartitionKey,
-) -> Option<PartitionCentroid> {
-    match read_txn(backend, manifest)
-        .await
-        .get(LogicalKey::Centroid {
-            index: manifest.logical_index_id(),
-            tree_key: key.clone(),
-            partition,
-        })
-        .await
-        .expect("read centroid")
-    {
-        Some(PersistentValue::PartitionCentroid(centroid)) => Some(centroid),
-        None => None,
-        other => panic!("wrong centroid kind: {other:?}"),
-    }
-}
-
-async fn synopsis_of(
-    backend: &SharedBackend,
-    manifest: &IndexManifest,
-    key: &TreeKey,
-    partition: PartitionKey,
-) -> Option<PartitionSynopsis> {
-    match read_txn(backend, manifest)
-        .await
-        .get(LogicalKey::Synopsis {
-            index: manifest.logical_index_id(),
-            tree_key: key.clone(),
-            partition,
-        })
-        .await
-        .expect("read synopsis")
-    {
-        Some(PersistentValue::PartitionSynopsis(synopsis)) => Some(synopsis),
-        None => None,
-        other => panic!("wrong synopsis kind: {other:?}"),
-    }
-}
-
-async fn location_of(
-    backend: &SharedBackend,
-    manifest: &IndexManifest,
-    id: &Bytes,
-) -> Option<RecordLocation> {
-    match read_txn(backend, manifest)
-        .await
-        .get(LogicalKey::Location {
-            index: manifest.logical_index_id(),
-            id: id.clone(),
-        })
-        .await
-        .expect("read location")
-    {
-        Some(PersistentValue::RecordLocation(location)) => Some(location),
-        None => None,
-        other => panic!("wrong location kind: {other:?}"),
-    }
-}
-
-async fn leaf_entry_of(
-    backend: &SharedBackend,
-    manifest: &IndexManifest,
-    key: &TreeKey,
-    partition: PartitionKey,
-    id: &Bytes,
-) -> Option<LeafEntry> {
-    match read_txn(backend, manifest)
-        .await
-        .get(LogicalKey::LeafEntry {
-            index: manifest.logical_index_id(),
-            tree_key: key.clone(),
-            partition,
-            id: id.clone(),
-        })
-        .await
-        .expect("read entry")
-    {
-        Some(PersistentValue::LeafEntry(entry)) => Some(entry),
-        None => None,
-        other => panic!("wrong entry kind: {other:?}"),
-    }
-}
-
-async fn edge_of(
-    backend: &SharedBackend,
-    manifest: &IndexManifest,
-    key: &TreeKey,
-    parent: PartitionKey,
-    child: PartitionKey,
-) -> Option<ChildEntry> {
-    match read_txn(backend, manifest)
-        .await
-        .get(LogicalKey::ChildEntry {
-            index: manifest.logical_index_id(),
-            tree_key: key.clone(),
-            partition: parent,
-            child,
-        })
-        .await
-        .expect("read edge")
-    {
-        Some(PersistentValue::ChildEntry(entry)) => Some(entry),
-        None => None,
-        other => panic!("wrong edge kind: {other:?}"),
-    }
-}
-
-async fn scan_child_entries(
-    backend: &SharedBackend,
-    manifest: &IndexManifest,
-    key: &TreeKey,
-    partition: PartitionKey,
-) -> Vec<ChildEntry> {
-    let range = LogicalRange::child_entries(manifest, key, partition).expect("range");
-    let mut txn = read_txn(backend, manifest).await;
-    let mut entries = Vec::new();
-    let mut cursor = None;
-    loop {
-        let page = txn
-            .scan(
-                &range,
-                cursor.as_ref(),
-                ScanLimits {
-                    item_limit: 64,
-                    byte_limit: 1 << 20,
-                },
-            )
-            .await
-            .expect("scan children");
-        for item in page.items() {
-            match item.value() {
-                PersistentValue::ChildEntry(entry) => entries.push(entry.clone()),
-                other => panic!("wrong child kind: {other:?}"),
-            }
-        }
-        cursor = page.into_next_cursor();
-        if cursor.is_none() {
-            return entries;
-        }
-    }
-}
-
-async fn scan_leaf_entries(
-    backend: &SharedBackend,
-    manifest: &IndexManifest,
-    key: &TreeKey,
-    partition: PartitionKey,
-) -> Vec<LeafEntry> {
-    let range = LogicalRange::leaf_entries(manifest, key, partition).expect("range");
-    let mut txn = read_txn(backend, manifest).await;
-    let mut entries = Vec::new();
-    let mut cursor = None;
-    loop {
-        let page = txn
-            .scan(
-                &range,
-                cursor.as_ref(),
-                ScanLimits {
-                    item_limit: 64,
-                    byte_limit: 1 << 20,
-                },
-            )
-            .await
-            .expect("scan leaves");
-        for item in page.items() {
-            match item.value() {
-                PersistentValue::LeafEntry(entry) => entries.push(entry.clone()),
-                other => panic!("wrong leaf kind: {other:?}"),
-            }
-        }
-        cursor = page.into_next_cursor();
-        if cursor.is_none() {
-            return entries;
-        }
-    }
-}
-
-/// The set of leaves a traversal can reach, with exact-count validation.
-///
-/// Descent follows Child Entries from the root; while the root is `Splitting`
-/// or `DrainingSplit` its targets are reachable only through the root's
-/// persisted state, so they join the frontier there (ADR 0006). Every
-/// internal body's scanned Child Entry count must equal its exact Header
-/// count, and no partition may be discovered twice.
-async fn reachable_leaves(
-    backend: &SharedBackend,
-    manifest: &IndexManifest,
-    key: &TreeKey,
-) -> BTreeMap<PartitionKey, PartitionHeader> {
-    let mut leaves = BTreeMap::new();
-    let mut visited = BTreeSet::new();
-    let mut frontier = vec![pk(1)];
-    while let Some(partition) = frontier.pop() {
-        assert!(
-            visited.insert(partition),
-            "partition {partition:?} discovered twice"
-        );
-        let header = header_of(backend, manifest, key, partition)
-            .await
-            .unwrap_or_else(|| panic!("partition {partition:?} must have a Header"));
-        // A partition's Header and State discriminators always agree.
-        let state = state_of(backend, manifest, key, partition)
-            .await
-            .unwrap_or_else(|| panic!("partition {partition:?} must have a State"));
-        assert_eq!(header.state(), state.state(), "header/state agreement");
-        if partition == pk(1) {
-            match state {
-                // While Splitting, root targets may not be exposed yet;
-                // while Draining, they must exist.
-                PartitionTransition::Splitting { left, right, .. } => {
-                    for target in [left, right] {
-                        if header_of(backend, manifest, key, target).await.is_some() {
-                            frontier.push(target);
-                        }
-                    }
-                }
-                PartitionTransition::DrainingSplit { left, right, .. } => {
-                    frontier.push(left);
-                    frontier.push(right);
-                }
-                _ => {}
-            }
-        }
-        if header.level() == 1 {
-            let entries = scan_leaf_entries(backend, manifest, key, partition).await;
-            assert_eq!(
-                header.entry_count() as usize,
-                entries.len(),
-                "exact leaf entry count"
-            );
-            leaves.insert(partition, header);
-        } else {
-            let children = scan_child_entries(backend, manifest, key, partition).await;
-            assert_eq!(
-                header.entry_count() as usize,
-                children.len(),
-                "exact child entry count"
-            );
-            for entry in children {
-                frontier.push(entry.child());
-            }
-        }
-    }
-    leaves
-}
-
-/// Asserts the exact-membership invariant for one tree: every record has
-/// exactly one Record Location naming a reachable leaf, one corresponding
-/// Leaf Entry, and the reachable leaves' exact counts sum to the record
-/// count.
-async fn assert_exact_membership(
-    backend: &SharedBackend,
-    manifest: &IndexManifest,
-    key: &TreeKey,
-    records: &[(Bytes, f32)],
-) {
-    let leaves = reachable_leaves(backend, manifest, key).await;
-    for (id, _) in records {
-        let location = location_of(backend, manifest, id)
-            .await
-            .unwrap_or_else(|| panic!("record must have a location"));
-        assert_eq!(location.tree_key(), key, "location names the tree");
-        assert!(
-            leaves.contains_key(&location.leaf()),
-            "location leaf must be reachable"
-        );
-        let entry = leaf_entry_of(backend, manifest, key, location.leaf(), id)
-            .await
-            .unwrap_or_else(|| panic!("leaf entry must exist"));
-        assert_eq!(entry.record_id(), id);
-    }
-    let total: u32 = leaves.values().map(|header| header.entry_count()).sum();
-    assert_eq!(total as usize, records.len(), "total membership");
-}
-
-/// Asserts that routing reaches a live leaf for every record's vector.
-async fn assert_searchable(
-    backend: &SharedBackend,
-    manifest: &IndexManifest,
-    key: &TreeKey,
-    records: &[(Bytes, f32)],
-) {
-    assert_exact_membership(backend, manifest, key, records).await;
-    for (_, x) in records {
-        route_leaf(&mut read_txn(backend, manifest).await, key, &[*x])
-            .await
-            .expect("route")
-            .expect("tree exists");
-    }
-}
-
-/// Seeds records 0..count at x = 0.0, 1.0, ... into one tree through the
-/// public mutation API.
-async fn seed_records(index: &Index<SharedBackend>, bucket: i64, count: u8) -> Vec<(Bytes, f32)> {
-    let mut records = Vec::new();
-    for n in 0..count {
-        let x = f32::from(n);
-        index
-            .insert(record(&rid(n), x, bucket))
-            .await
-            .expect("insert");
-        records.push((rid(n), x));
-    }
-    records
-}
-
-/// Drives `advance` until the partition is no longer making progress,
-/// returning the observed outcome sequence.
-async fn drive_to_completion(
-    backend: &SharedBackend,
-    manifest: &IndexManifest,
-    key: &TreeKey,
-    partition: PartitionKey,
-) -> Vec<Advance> {
-    let mut outcomes = Vec::new();
-    for step in 0..1_000_u32 {
-        let outcome = split::advance(
-            backend,
-            manifest,
-            key,
-            partition,
-            10_000 + u64::from(step),
-            &retry(),
-        )
-        .await
-        .expect("advance");
-        match outcome {
-            Advance::Idle | Advance::Completed { .. } => {
-                outcomes.push(outcome);
-                return outcomes;
-            }
-            _ => outcomes.push(outcome),
-        }
-    }
-    panic!("split did not converge in 1000 steps");
-}
 
 /// Drains one split source to exact zero, one bounded batch at a time,
 /// returning the total moved entries.
@@ -535,15 +59,6 @@ async fn drain_to_zero(
     }
 }
 
-/// Asserts the error kind one injected commit fault produces.
-fn assert_fault_kind(fault: CommitFault, error: &ktann::api::Error) {
-    let expected = match fault {
-        CommitFault::Abort => ErrorKind::RetryableAbort,
-        _ => ErrorKind::CommitOutcomeUnknown,
-    };
-    assert_eq!(error.kind(), expected, "fault {fault:?}");
-}
-
 // ---------------------------------------------------------------------------
 // Lifecycle: root leaf split, end to end, with foreground interleaving.
 // ---------------------------------------------------------------------------
@@ -553,7 +68,7 @@ async fn root_leaf_split_runs_end_to_end_and_stays_searchable() {
     let backend = backend();
     let runtime = make_runtime(backend.clone());
     let index = runtime
-        .create_index("index", config())
+        .create_index("index", config(1, 4))
         .await
         .expect("create");
     let manifest = read_manifest(&backend, index.logical_index_id()).await;
@@ -859,7 +374,7 @@ async fn non_root_leaf_split_installs_edges_and_removes_the_source() {
     let backend = backend();
     let runtime = make_runtime(backend.clone());
     let index = runtime
-        .create_index("index", config())
+        .create_index("index", config(1, 4))
         .await
         .expect("create");
     let manifest = read_manifest(&backend, index.logical_index_id()).await;
@@ -974,7 +489,7 @@ async fn completion_uses_range_clear_when_the_backend_supports_it() {
     let backend = backend_with_clear();
     let runtime = make_runtime(backend.clone());
     let index = runtime
-        .create_index("index", config())
+        .create_index("index", config(1, 4))
         .await
         .expect("create");
     let manifest = read_manifest(&backend, index.logical_index_id()).await;
@@ -987,7 +502,7 @@ async fn completion_uses_range_clear_when_the_backend_supports_it() {
         index.insert(record(&rid(n), x, 1)).await.expect("insert");
         records.push((rid(n), x));
     }
-    let outcomes = drive_to_completion(&backend, &manifest, &key, left_leaf).await;
+    let outcomes = drive_split_to_completion(&backend, &manifest, &key, left_leaf).await;
     assert!(matches!(outcomes.last(), Some(Advance::Completed { .. })));
 
     assert_eq!(header_of(&backend, &manifest, &key, left_leaf).await, None);
@@ -1006,7 +521,7 @@ async fn root_internal_split_moves_child_entries_and_rises_one_level() {
     let backend = backend();
     let runtime = make_runtime(backend.clone());
     let index = runtime
-        .create_index("index", config())
+        .create_index("index", config(1, 4))
         .await
         .expect("create");
     let manifest = read_manifest(&backend, index.logical_index_id()).await;
@@ -1020,14 +535,14 @@ async fn root_internal_split_moves_child_entries_and_rises_one_level() {
         index.insert(record(&rid(n), x, 1)).await.expect("insert");
         records.push((rid(n), x));
     }
-    let outcomes = drive_to_completion(&backend, &manifest, &key, left_leaf).await;
+    let outcomes = drive_split_to_completion(&backend, &manifest, &key, left_leaf).await;
     assert!(matches!(outcomes.last(), Some(Advance::Completed { .. })));
     // Root children: {3, 4, 5}.
     for (n, x) in [(13, 3.25), (14, 3.75), (15, 4.25)] {
         index.insert(record(&rid(n), x, 1)).await.expect("insert");
         records.push((rid(n), x));
     }
-    let outcomes = drive_to_completion(&backend, &manifest, &key, right_leaf).await;
+    let outcomes = drive_split_to_completion(&backend, &manifest, &key, right_leaf).await;
     assert!(matches!(outcomes.last(), Some(Advance::Completed { .. })));
     // Root children: {4, 5, 6, 7} — at the maximum, not above it.
     let root_header = header_of(&backend, &manifest, &key, pk(1))
@@ -1050,7 +565,7 @@ async fn root_internal_split_moves_child_entries_and_rises_one_level() {
             .map(|(partition, _)| *partition)
             .expect("a leaf above the maximum")
     };
-    let outcomes = drive_to_completion(&backend, &manifest, &key, over).await;
+    let outcomes = drive_split_to_completion(&backend, &manifest, &key, over).await;
     assert!(matches!(outcomes.last(), Some(Advance::Completed { .. })));
     let root_header = header_of(&backend, &manifest, &key, pk(1))
         .await
@@ -1061,7 +576,7 @@ async fn root_internal_split_moves_child_entries_and_rises_one_level() {
     // The root is an internal partition above the maximum: its split moves
     // Child Entries — no Record Location or Synopsis work — and converts
     // Partition Key 1 in place to level 3.
-    let outcomes = drive_to_completion(&backend, &manifest, &key, pk(1)).await;
+    let outcomes = drive_split_to_completion(&backend, &manifest, &key, pk(1)).await;
     assert!(matches!(outcomes.last(), Some(Advance::Completed { .. })));
     let root_header = header_of(&backend, &manifest, &key, pk(1))
         .await
@@ -1096,7 +611,7 @@ async fn non_root_internal_split_moves_child_entries() {
     let backend = backend();
     let runtime = make_runtime(backend.clone());
     let index = runtime
-        .create_index("index", config())
+        .create_index("index", config(1, 4))
         .await
         .expect("create");
     let manifest = read_manifest(&backend, index.logical_index_id()).await;
@@ -1292,7 +807,7 @@ async fn advance_rediscovers_and_converges_a_cold_split() {
     let backend = backend();
     let runtime = make_runtime(backend.clone());
     let index = runtime
-        .create_index("index", config())
+        .create_index("index", config(1, 4))
         .await
         .expect("create");
     let manifest = read_manifest(&backend, index.logical_index_id()).await;
@@ -1300,7 +815,7 @@ async fn advance_rediscovers_and_converges_a_cold_split() {
     let records = seed_records(&index, 1, 6).await;
 
     // No worker has run: advance performs each bounded step in turn.
-    let outcomes = drive_to_completion(&backend, &manifest, &key, pk(1)).await;
+    let outcomes = drive_split_to_completion(&backend, &manifest, &key, pk(1)).await;
     assert!(matches!(outcomes[0], Advance::Began { .. }));
     assert!(matches!(outcomes[1], Advance::Exposed { .. }));
     assert!(matches!(outcomes.last(), Some(Advance::Completed { .. })));
@@ -1351,7 +866,7 @@ async fn advance_rediscovers_and_converges_a_cold_split() {
             .expect("target advance"),
         Advance::Idle
     );
-    let outcomes = drive_to_completion(&backend, &manifest, &key, over).await;
+    let outcomes = drive_split_to_completion(&backend, &manifest, &key, over).await;
     assert!(matches!(outcomes.last(), Some(Advance::Completed { .. })));
     assert_searchable(&backend, &manifest, &key, &records).await;
 
@@ -1363,7 +878,7 @@ async fn advance_converges_a_split_whose_source_shrank_to_one_entry() {
     let backend = backend();
     let runtime = make_runtime(backend.clone());
     let index = runtime
-        .create_index("index", config())
+        .create_index("index", config(1, 4))
         .await
         .expect("create");
     let manifest = read_manifest(&backend, index.logical_index_id()).await;
@@ -1389,7 +904,7 @@ async fn advance_converges_a_split_whose_source_shrank_to_one_entry() {
 
     // Exposure trains on the shrunken snapshot; the machine must advance on
     // this valid persistent state instead of reporting Corruption (#113).
-    let outcomes = drive_to_completion(&backend, &manifest, &key, pk(1)).await;
+    let outcomes = drive_split_to_completion(&backend, &manifest, &key, pk(1)).await;
     assert!(matches!(outcomes.last(), Some(Advance::Completed { .. })));
     assert_searchable(&backend, &manifest, &key, remaining).await;
 
@@ -1401,7 +916,7 @@ async fn advance_converges_a_split_whose_source_emptied_out() {
     let backend = backend();
     let runtime = make_runtime(backend.clone());
     let index = runtime
-        .create_index("index", config())
+        .create_index("index", config(1, 4))
         .await
         .expect("create");
     let manifest = read_manifest(&backend, index.logical_index_id()).await;
@@ -1424,7 +939,7 @@ async fn advance_converges_a_split_whose_source_emptied_out() {
 
     // An empty Splitting source trains two zero centroids, drains nothing,
     // and completes through the ordinary zero-count completion (#113).
-    let outcomes = drive_to_completion(&backend, &manifest, &key, pk(1)).await;
+    let outcomes = drive_split_to_completion(&backend, &manifest, &key, pk(1)).await;
     assert!(matches!(outcomes.last(), Some(Advance::Completed { .. })));
     assert_searchable(&backend, &manifest, &key, &[]).await;
 
@@ -1440,7 +955,7 @@ async fn advance_converges_a_split_whose_source_emptied_out() {
 async fn seed_over_max_root(backend: &SharedBackend) -> (IndexManifest, TreeKey) {
     let runtime = make_runtime(backend.clone());
     let index = runtime
-        .create_index("index", config())
+        .create_index("index", config(1, 4))
         .await
         .expect("create");
     seed_records(&index, 1, 6).await;
@@ -1635,7 +1150,7 @@ async fn drain_recovers_from_unknown_outcomes_without_losing_membership() {
     let backend = backend();
     let runtime = make_runtime(backend.clone());
     let index = runtime
-        .create_index("index", config())
+        .create_index("index", config(1, 4))
         .await
         .expect("create");
     let manifest = read_manifest(&backend, index.logical_index_id()).await;
@@ -1695,7 +1210,7 @@ async fn a_restarted_process_rediscovers_the_durable_split_state() {
     let backend = SharedBackend::new(DeterministicBackend::new(durable));
     let runtime = make_runtime(backend.clone());
     let index = runtime
-        .create_index("index", config())
+        .create_index("index", config(1, 4))
         .await
         .expect("create");
     let manifest = read_manifest(&backend, index.logical_index_id()).await;
@@ -1718,7 +1233,7 @@ async fn a_restarted_process_rediscovers_the_durable_split_state() {
     // The process is gone; a reopened backend rediscovers the durable
     // DrainingSplit state and converges it.
     let reopened = SharedBackend::new(backend.inner().reopen());
-    let outcomes = drive_to_completion(&reopened, &manifest, &key, pk(1)).await;
+    let outcomes = drive_split_to_completion(&reopened, &manifest, &key, pk(1)).await;
     assert!(matches!(outcomes.last(), Some(Advance::Completed { .. })));
     assert_searchable(&reopened, &manifest, &key, &records).await;
 }
@@ -1855,7 +1370,7 @@ async fn a_stale_worker_cannot_recreate_a_target_after_completion() {
     let trained = train_split_centroids(&mut read_txn(&backend, &manifest).await, &key, pk(1))
         .await
         .expect("train");
-    let outcomes = drive_to_completion(&backend, &manifest, &key, pk(1)).await;
+    let outcomes = drive_split_to_completion(&backend, &manifest, &key, pk(1)).await;
     assert!(matches!(outcomes.last(), Some(Advance::Completed { .. })));
     let key_count = backend.inner().db_key_count();
 
@@ -1888,7 +1403,7 @@ async fn a_concurrent_drain_move_conflicts_with_a_foreground_delete() {
     let backend = backend();
     let runtime = make_runtime(backend.clone());
     let index = runtime
-        .create_index("index", config())
+        .create_index("index", config(1, 4))
         .await
         .expect("create");
     let manifest = read_manifest(&backend, index.logical_index_id()).await;
@@ -2076,7 +1591,7 @@ async fn finalize_fails_closed_on_a_missing_or_duplicate_incoming_edge() {
     let backend = backend();
     let runtime = make_runtime(backend.clone());
     let index = runtime
-        .create_index("index", config())
+        .create_index("index", config(1, 4))
         .await
         .expect("create");
     let manifest = read_manifest(&backend, index.logical_index_id()).await;
@@ -2255,7 +1770,7 @@ async fn finalize_requires_exact_zero_count_and_draining_state() {
     let backend = backend();
     let runtime = make_runtime(backend.clone());
     let index = runtime
-        .create_index("index", config())
+        .create_index("index", config(1, 4))
         .await
         .expect("create");
     let manifest = read_manifest(&backend, index.logical_index_id()).await;
@@ -2312,7 +1827,7 @@ async fn drain_fails_closed_on_an_inconsistent_entry() {
     let backend = backend();
     let runtime = make_runtime(backend.clone());
     let index = runtime
-        .create_index("index", config())
+        .create_index("index", config(1, 4))
         .await
         .expect("create");
     let manifest = read_manifest(&backend, index.logical_index_id()).await;
@@ -2381,7 +1896,7 @@ async fn seeded_model_history_interleaving_mutations_and_splits() {
     let backend = backend();
     let runtime = make_runtime(backend.clone());
     let index = runtime
-        .create_index("index", config())
+        .create_index("index", config(1, 4))
         .await
         .expect("create");
     let manifest = read_manifest(&backend, index.logical_index_id()).await;
@@ -2521,41 +2036,6 @@ async fn seeded_model_history_interleaving_mutations_and_splits() {
     runtime.shutdown().await.expect("shutdown");
 }
 
-/// Enumerates every partition of one tree, following Child Entries and the
-/// root's persisted split target slots.
-async fn all_partitions(
-    backend: &SharedBackend,
-    manifest: &IndexManifest,
-    key: &TreeKey,
-) -> Vec<PartitionKey> {
-    let mut seen = BTreeSet::new();
-    let mut frontier = vec![pk(1)];
-    while let Some(partition) = frontier.pop() {
-        if !seen.insert(partition) {
-            continue;
-        }
-        let Some(header) = header_of(backend, manifest, key, partition).await else {
-            continue;
-        };
-        if let Some(state) = state_of(backend, manifest, key, partition).await {
-            if partition == pk(1) {
-                if let PartitionTransition::Splitting { left, right, .. }
-                | PartitionTransition::DrainingSplit { left, right, .. } = state
-                {
-                    frontier.push(left);
-                    frontier.push(right);
-                }
-            }
-        }
-        if header.level() > 1 {
-            for entry in scan_child_entries(backend, manifest, key, partition).await {
-                frontier.push(entry.child());
-            }
-        }
-    }
-    seen.into_iter().collect()
-}
-
 // ---------------------------------------------------------------------------
 // Recovery and fail-closed regressions.
 // ---------------------------------------------------------------------------
@@ -2565,7 +2045,7 @@ async fn steps_on_a_completed_non_root_split_are_harmless_noops() {
     let backend = backend();
     let runtime = make_runtime(backend.clone());
     let index = runtime
-        .create_index("index", config())
+        .create_index("index", config(1, 4))
         .await
         .expect("create");
     let manifest = read_manifest(&backend, index.logical_index_id()).await;
@@ -2626,7 +2106,7 @@ async fn steps_on_a_dropped_index_report_the_lifecycle_error() {
     let backend = backend();
     let runtime = make_runtime(backend.clone());
     let index = runtime
-        .create_index("index", config())
+        .create_index("index", config(1, 4))
         .await
         .expect("create");
     let manifest = read_manifest(&backend, index.logical_index_id()).await;
@@ -2653,7 +2133,7 @@ async fn drain_moves_bounded_batches_and_refreshes_target_authority() {
     let backend = backend();
     let runtime = make_runtime(backend.clone());
     let index = runtime
-        .create_index("index", config())
+        .create_index("index", config(1, 4))
         .await
         .expect("create");
     let manifest = read_manifest(&backend, index.logical_index_id()).await;
@@ -2743,7 +2223,7 @@ async fn drain_fails_closed_when_the_count_disagrees_with_the_entries() {
     let backend = backend();
     let runtime = make_runtime(backend.clone());
     let index = runtime
-        .create_index("index", config())
+        .create_index("index", config(1, 4))
         .await
         .expect("create");
     let manifest = read_manifest(&backend, index.logical_index_id()).await;
@@ -2803,7 +2283,7 @@ async fn non_root_finalize_recovers_from_an_unknown_commit_outcome() {
     ] {
         let runtime = make_runtime(backend.clone());
         let index = runtime
-            .create_index("index", config())
+            .create_index("index", config(1, 4))
             .await
             .expect("create");
         let manifest = read_manifest(&backend, index.logical_index_id()).await;
@@ -2857,7 +2337,7 @@ async fn advance_fails_closed_on_a_torn_target_without_committing() {
     let backend = backend();
     let runtime = make_runtime(backend.clone());
     let index = runtime
-        .create_index("index", config())
+        .create_index("index", config(1, 4))
         .await
         .expect("create");
     let manifest = read_manifest(&backend, index.logical_index_id()).await;
