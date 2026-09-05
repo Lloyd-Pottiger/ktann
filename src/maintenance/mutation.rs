@@ -23,8 +23,13 @@
 //!   exists the whole operation retries under the bounded policy and surfaces
 //!   `ContentionExhausted` on exhaustion (ADR 0008).
 //! - **Writes.** Every item queues its record-group writes into one shared
-//!   builder applied once in canonical key order; exact Header counts and
-//!   Synopsis expansions still apply per item so later items observe them.
+//!   builder, and exact Header counts and Synopsis expansions accumulate per
+//!   leaf and join the same builder when it is flushed, so the whole attempt
+//!   lands in canonical key order with one backend write call while later
+//!   items still observe earlier items' adjustments. One bounded
+//!   update-protected prefetch warms every item's membership read set before
+//!   the loop, so the per-item checked re-reads are served by the
+//!   transaction-local cache instead of one backend round trip per record.
 //! - **Retry.** A definite backend abort anywhere in an attempt discards
 //!   every route and replays the complete operation from a fresh snapshot
 //!   under the bounded contention policy; exhaustion returns
@@ -44,6 +49,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use bytes::Bytes;
+
 use crate::api::{Error, ErrorKind, Mutation, MutationOutcome, PartitionKey, Record, Result};
 use crate::observe::labels::Operation;
 use crate::runtime::import::ImportPermit;
@@ -56,7 +63,7 @@ use crate::storage::keys::TreeKey;
 use crate::storage::values::{
     IndexManifest, LeafEntry, OpaquePayload, PartitionHeader, RecordLocation, VectorRecord,
 };
-use crate::storage::{MutationBuilder, WriteLogicalTxn, membership};
+use crate::storage::{WriteLogicalTxn, membership};
 
 use super::{fixup, routing};
 
@@ -144,12 +151,15 @@ enum ApplyOutcome {
 
 /// Applies every mutation in input order inside the attempt transaction.
 ///
-/// Routing and the upsert membership reads are batched across the whole
-/// operation first — one grouped descent per distinct Tree Key, one batched
-/// update-protected read of every upsert's authoritative Record Location. The
-/// membership operations then apply in input order and queue their
-/// record-group writes into one builder, which is applied once in canonical
-/// key order at the end.
+/// Routing and the membership reads are batched across the whole operation
+/// first — one grouped descent per distinct Tree Key, one batched
+/// update-protected read of every upsert's authoritative Record Location, and
+/// one bounded prefetch of every item's remaining membership read set. The
+/// membership operations then apply in input order, re-reading the warmed
+/// keys from the transaction-local cache and accumulating per-leaf Header and
+/// Synopsis writes, and queue their record-group writes into one builder; the
+/// accumulated leaf writes flush into the same builder, which is applied once
+/// in canonical key order at the end.
 async fn apply_all<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     kernel: &VectorKernel,
@@ -170,7 +180,13 @@ async fn apply_all<T: WriteTxn>(
             RouteAll::NoReadyMergeTarget => return Ok(ApplyOutcome::NoReadyMergeTarget),
         };
     let expected = read_locations(txn, mutations).await?;
+    prefetch_membership(txn, mutations, prepared, &targets, &expected).await;
     let mut deferred = txn.mutations();
+    let mut leaves = membership::LeafAccumulator::new();
+    let mut writes = membership::WriteSinks {
+        deferred: &mut deferred,
+        leaves: &mut leaves,
+    };
     let mut outcomes = Vec::with_capacity(mutations.len());
     let mut changed_headers = BTreeMap::new();
     for (position, mutation) in mutations.iter().enumerate() {
@@ -183,19 +199,18 @@ async fn apply_all<T: WriteTxn>(
             mutation,
             routed,
             expected[position].as_ref(),
-            &mut deferred,
+            &mut writes,
             &mut changed_headers,
         )
         .await
         .map_err(|error| error.at_position(position))?;
         outcomes.push(outcome);
     }
+    let manifest = txn.bound_manifest().ok_or_else(Error::invalid_argument)?;
+    leaves.flush(txn, &mut deferred)?;
     txn.apply(deferred).await?;
     let mut maintenance: BTreeSet<(TreeKey, PartitionKey)> = draining_sources.into_iter().collect();
-    let config = txn
-        .bound_manifest()
-        .ok_or_else(Error::invalid_argument)?
-        .config();
+    let config = manifest.config();
     for ((tree_key, partition), header) in changed_headers {
         if fixup::is_actionable(config, partition, header) {
             maintenance.insert((tree_key, partition));
@@ -335,8 +350,67 @@ async fn read_locations<T: WriteTxn>(
     Ok(expected)
 }
 
-/// Applies one mutation item inside the attempt transaction, queueing
-/// record-group writes into `deferred`.
+/// Warms the transaction-local read cache with every item's membership read
+/// set, so the per-item membership operations re-read from the cache instead
+/// of issuing one backend round trip per record.
+///
+/// The read sets derive from the routed targets and the upsert location
+/// reads, so the prefetch runs between them and the apply loop. Warming is
+/// advisory and validates nothing: a key left unwarmed is re-read by the
+/// item's own checked path, which reports any failure with the item's input
+/// position.
+async fn prefetch_membership<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    mutations: &[Mutation],
+    prepared: &[Option<PreparedRecord>],
+    targets: &[Option<RecordLocation>],
+    expected: &[Option<RecordLocation>],
+) {
+    let mut items = Vec::with_capacity(mutations.len());
+    for (position, mutation) in mutations.iter().enumerate() {
+        let item = match mutation {
+            Mutation::Insert(record) => {
+                let Some(target) = targets[position].as_ref() else {
+                    continue;
+                };
+                insert_prefetch(prepared[position].as_ref(), record.id(), target)
+            }
+            Mutation::Upsert(record) => {
+                let Some(target) = targets[position].as_ref() else {
+                    continue;
+                };
+                match expected[position].as_ref() {
+                    Some(expected) => membership::MembershipPrefetch::Replace {
+                        id: record.id(),
+                        expected,
+                        target,
+                    },
+                    None => insert_prefetch(prepared[position].as_ref(), record.id(), target),
+                }
+            }
+            Mutation::Delete(id) => membership::MembershipPrefetch::Delete { id },
+        };
+        items.push(item);
+    }
+    membership::prefetch_membership_for_update(txn, &items).await;
+}
+
+/// One insert-shaped prefetch item: the Record and Location existence checks,
+/// the Opaque Payload when the record carries one, and the target Leaf Entry.
+fn insert_prefetch<'a>(
+    prepared: Option<&PreparedRecord>,
+    id: &'a Bytes,
+    target: &'a RecordLocation,
+) -> membership::MembershipPrefetch<'a> {
+    membership::MembershipPrefetch::Insert {
+        id,
+        payload: prepared.is_some_and(|prepared| prepared.payload.is_some()),
+        target,
+    }
+}
+
+/// Applies one mutation item inside the attempt transaction, queueing every
+/// write into the shared `writes` sinks.
 ///
 /// `routed` carries the prepared record and its target location; exactly the
 /// insert/upsert items are prepared and routed by `apply_all`, so a missing
@@ -349,7 +423,7 @@ async fn apply_one<T: WriteTxn>(
     mutation: &Mutation,
     routed: Option<(&PreparedRecord, &RecordLocation)>,
     expected: Option<&RecordLocation>,
-    deferred: &mut MutationBuilder<'_>,
+    writes: &mut membership::WriteSinks<'_, '_>,
     changed_headers: &mut BTreeMap<(TreeKey, PartitionKey), PartitionHeader>,
 ) -> Result<MutationOutcome> {
     match mutation {
@@ -357,7 +431,7 @@ async fn apply_one<T: WriteTxn>(
             let (prepared, target) = routed.ok_or_else(|| Error::new(ErrorKind::Backend))?;
             let header = membership::insert_record_with_header(
                 txn,
-                deferred,
+                writes,
                 &prepared.record,
                 prepared.payload.as_ref(),
                 target,
@@ -373,7 +447,7 @@ async fn apply_one<T: WriteTxn>(
                 None => {
                     let header = membership::insert_record_with_header(
                         txn,
-                        deferred,
+                        writes,
                         &prepared.record,
                         prepared.payload.as_ref(),
                         target,
@@ -385,7 +459,7 @@ async fn apply_one<T: WriteTxn>(
                 Some(expected) => {
                     let headers = membership::replace_record_with_headers(
                         txn,
-                        deferred,
+                        writes,
                         &prepared.record,
                         prepared.payload.as_ref(),
                         expected,
@@ -406,7 +480,7 @@ async fn apply_one<T: WriteTxn>(
             Ok(outcome)
         }
         Mutation::Delete(id) => {
-            let report = membership::delete_record_with_header(txn, deferred, id).await?;
+            let report = membership::delete_record_with_header(txn, writes, id).await?;
             let existed = match report {
                 membership::DeleteReport::Deleted { location, header } => {
                     record_header(changed_headers, &location, header);

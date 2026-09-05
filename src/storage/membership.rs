@@ -15,10 +15,12 @@
 //! only when it is applied, so a whole mutation batch lands in canonical key
 //! order with one backend write call; the queue replaces backend unique
 //! inserts with update-protected existence checks. Exact Header counts and
-//! Synopsis expansions apply immediately through the transaction, so a later
-//! item of the same batch observes them via read-your-writes. Deferral is
-//! exact because a validated batch holds at most one item per Record ID;
-//! callers must enforce that before queueing.
+//! Synopsis expansions accumulate per leaf in a `LeafAccumulator` and join
+//! the queued writes when it is flushed, so a batch touching one leaf N times
+//! reads and writes the leaf's Header and Synopsis once; later items observe
+//! earlier items' adjustments through the accumulator. Deferral is exact
+//! because a validated batch holds at most one item per Record ID; callers
+//! must enforce that before queueing.
 //!
 //! Every authoritative read a mutation depends on is update-protected, so a
 //! concurrent change to the same membership or leaf Header aborts the commit
@@ -28,14 +30,16 @@
 //! error the caller must not commit the transaction; rolling back leaves no
 //! partial change.
 
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
+
 use bytes::Bytes;
 
-use crate::api::{Error, ErrorKind, LogicalIndexId, Result, Value};
+use crate::api::{Error, ErrorKind, LogicalIndexId, PartitionKey, Result, Value};
 use crate::storage::backend::{InsertOutcome, WriteTxn};
-use crate::storage::keys::LogicalKey;
+use crate::storage::keys::{LogicalKey, TreeKey};
 use crate::storage::values::{
-    IndexManifest, LeafEntry, OpaquePayload, PartitionHeader, PersistentValue, RecordLocation,
-    VectorRecord, expect_header, expect_leaf_entry, expect_location, expect_record,
+    IndexManifest, LeafEntry, OpaquePayload, PartitionHeader, PartitionSynopsis, PersistentValue,
+    RecordLocation, VectorRecord, expect_header, expect_leaf_entry, expect_location, expect_record,
     expect_synopsis,
 };
 use crate::storage::{MutationBuilder, WriteLogicalTxn};
@@ -87,6 +91,145 @@ impl ReplacementHeaders {
     }
 }
 
+/// Per-leaf Header and Synopsis write state for one mutation batch.
+///
+/// The membership operations adjust exact Header counts and expand Synopses
+/// against this accumulator instead of writing each adjustment straight to
+/// the transaction: a leaf touched by N items is read once, adjusted once per
+/// item in input order with the same checked arithmetic, and written back
+/// once at [`flush`](Self::flush), so a batch's Header and Synopsis writes
+/// collapse from two puts per item to one per touched leaf. The first access
+/// to one leaf reads its Header or Synopsis update-protected through the
+/// transaction, establishing the same commit-time conflict the unbatched
+/// sequence establishes; later items observe their batch-mates' adjustments
+/// through the accumulator rather than through read-your-writes. The
+/// committed values and every per-item error are identical to the unbatched
+/// sequence.
+#[derive(Default)]
+pub(crate) struct LeafAccumulator {
+    headers: BTreeMap<(TreeKey, PartitionKey), PartitionHeader>,
+    synopses: BTreeMap<(TreeKey, PartitionKey), SynopsisExpansion>,
+}
+
+/// One leaf's accumulated Synopsis state: the current expansion and whether
+/// it differs from the stored Synopsis.
+struct SynopsisExpansion {
+    synopsis: PartitionSynopsis,
+    changed: bool,
+}
+
+impl LeafAccumulator {
+    /// Creates an empty accumulator.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns one leaf's current Header: the accumulated adjustments when
+    /// the batch already touched the leaf, otherwise its stored Header read
+    /// update-protected. A missing Header is [`ErrorKind::Corruption`].
+    async fn header<T: WriteTxn>(
+        &mut self,
+        txn: &mut WriteLogicalTxn<'_, T>,
+        index: LogicalIndexId,
+        location: &RecordLocation,
+    ) -> Result<PartitionHeader> {
+        let key = (location.tree_key().clone(), location.leaf());
+        if let Some(header) = self.headers.get(&key) {
+            return Ok(*header);
+        }
+        let header = expect_header(txn.get_for_update(header_key(index, location)).await?)?
+            .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
+        self.headers.insert(key, header);
+        Ok(header)
+    }
+
+    /// Stores one item's adjusted Header as the leaf's current state.
+    fn adjust_header(&mut self, location: &RecordLocation, header: PartitionHeader) {
+        self.headers
+            .insert((location.tree_key().clone(), location.leaf()), header);
+    }
+
+    /// Expands one leaf's Synopsis with one exact Leaf projection.
+    ///
+    /// The stored Synopsis was fully validated at decode, so a projection
+    /// mismatch here is caller input; a missing Synopsis is corruption. The
+    /// update-protected read on the first access already establishes the
+    /// commit-time conflict, so an unchanged expansion is never written.
+    async fn expand_synopsis<T: WriteTxn>(
+        &mut self,
+        txn: &mut WriteLogicalTxn<'_, T>,
+        manifest: &IndexManifest,
+        target: &RecordLocation,
+        projection: &[Value],
+    ) -> Result<()> {
+        let key = (target.tree_key().clone(), target.leaf());
+        let expansion = match self.synopses.entry(key) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let stored = expect_synopsis(
+                    txn.get_for_update(synopsis_key(manifest.logical_index_id(), target))
+                        .await?,
+                )?
+                .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
+                entry.insert(SynopsisExpansion {
+                    synopsis: stored,
+                    changed: false,
+                })
+            }
+        };
+        expansion.changed |= expansion.synopsis.expand(manifest, projection)?;
+        Ok(())
+    }
+
+    /// Queues every accumulated Header and each changed Synopsis into the
+    /// caller's builder, so a whole batch lands in one backend write call.
+    pub(crate) fn flush<T>(
+        self,
+        txn: &WriteLogicalTxn<'_, T>,
+        deferred: &mut MutationBuilder<'_>,
+    ) -> Result<()> {
+        let index = txn
+            .bound_manifest()
+            .ok_or_else(Error::invalid_argument)?
+            .logical_index_id();
+        for ((tree_key, partition), header) in self.headers {
+            deferred.put(
+                LogicalKey::Header {
+                    index,
+                    tree_key,
+                    partition,
+                },
+                PersistentValue::PartitionHeader(header),
+            )?;
+        }
+        for ((tree_key, partition), expansion) in self.synopses {
+            if expansion.changed {
+                deferred.put(
+                    LogicalKey::Synopsis {
+                        index,
+                        tree_key,
+                        partition,
+                    },
+                    PersistentValue::PartitionSynopsis(expansion.synopsis),
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The two sinks one membership operation writes into: the caller's deferred
+/// record-group builder and the per-leaf Header/Synopsis accumulator. They
+/// travel together because every membership write joins the batch's single
+/// backend write call — the record groups queued directly, the accumulated
+/// leaf writes at the accumulator's flush.
+pub(crate) struct WriteSinks<'a, 'manifest> {
+    /// The shared builder record-group writes queue into.
+    pub(crate) deferred: &'a mut MutationBuilder<'manifest>,
+    /// The per-leaf Header and Synopsis write state.
+    pub(crate) leaves: &'a mut LeafAccumulator,
+}
+
 /// Inserts one new Vector Record's complete membership at `target`.
 ///
 /// The Record existence check runs first, so an existing Record ID fails with
@@ -111,15 +254,29 @@ pub async fn insert_record<T: WriteTxn>(
     target: &RecordLocation,
     entry: &LeafEntry,
 ) -> Result<()> {
-    insert_record_with_header(txn, deferred, record, payload, target, entry)
-        .await
-        .map(|_| ())
+    let mut leaves = LeafAccumulator::new();
+    insert_record_with_header(
+        txn,
+        &mut WriteSinks {
+            deferred: &mut *deferred,
+            leaves: &mut leaves,
+        },
+        record,
+        payload,
+        target,
+        entry,
+    )
+    .await?;
+    leaves.flush(txn, deferred)
 }
 
 /// Inserts one record and returns the target's final Header for scheduling.
+///
+/// Follows [`insert_record`], with every write queued into the shared
+/// `writes`: Header and Synopsis adjustments accumulate until its flush.
 pub(crate) async fn insert_record_with_header<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
-    deferred: &mut MutationBuilder<'_>,
+    writes: &mut WriteSinks<'_, '_>,
     record: &VectorRecord,
     payload: Option<&OpaquePayload>,
     target: &RecordLocation,
@@ -134,27 +291,34 @@ pub(crate) async fn insert_record_with_header<T: WriteTxn>(
     if txn.get_for_update(record_key(index, id)).await?.is_some() {
         return Err(Error::new(ErrorKind::RecordAlreadyExists));
     }
-    deferred.put(
+    writes.deferred.put(
         record_key(index, id),
         PersistentValue::VectorRecord(record.clone()),
     )?;
     expect_absent(txn, location_key(index, id)).await?;
-    deferred.put(
+    writes.deferred.put(
         location_key(index, id),
         PersistentValue::RecordLocation(target.clone()),
     )?;
     if let Some(payload) = payload {
         let key = payload_key(index, id);
         expect_absent(txn, key.clone()).await?;
-        deferred.put(key, PersistentValue::OpaquePayload(payload.clone()))?;
+        writes
+            .deferred
+            .put(key, PersistentValue::OpaquePayload(payload.clone()))?;
     }
-    let header = read_header(txn, index, target).await?;
+    let header = writes.leaves.header(txn, index, target).await?;
     let adjusted = added_entry(expect_write_target(header)?)?;
-    put_header(txn, index, target, adjusted).await?;
-    expand_synopsis(txn, manifest, target, entry.fields()).await?;
+    writes.leaves.adjust_header(target, adjusted);
+    writes
+        .leaves
+        .expand_synopsis(txn, manifest, target, entry.fields())
+        .await?;
     let entry_key = entry_key(index, target, id);
     expect_absent(txn, entry_key.clone()).await?;
-    deferred.put(entry_key, PersistentValue::LeafEntry(entry.clone()))?;
+    writes
+        .deferred
+        .put(entry_key, PersistentValue::LeafEntry(entry.clone()))?;
     Ok(adjusted)
 }
 
@@ -181,8 +345,9 @@ pub(crate) async fn insert_record_with_header<T: WriteTxn>(
 /// and the source Synopsis is left untouched.
 ///
 /// `record` and `entry` must carry the same Record ID. Record-group writes are
-/// queued into `deferred`; Header and Synopsis writes apply immediately. On
-/// any error the caller must not commit the transaction.
+/// queued into `deferred`; Header and Synopsis adjustments accumulate and join
+/// the queued writes. On any error the caller must not commit the
+/// transaction.
 pub async fn replace_record<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     deferred: &mut MutationBuilder<'_>,
@@ -192,15 +357,30 @@ pub async fn replace_record<T: WriteTxn>(
     target: &RecordLocation,
     entry: &LeafEntry,
 ) -> Result<()> {
-    replace_record_with_headers(txn, deferred, record, payload, expected, target, entry)
-        .await
-        .map(|_| ())
+    let mut leaves = LeafAccumulator::new();
+    replace_record_with_headers(
+        txn,
+        &mut WriteSinks {
+            deferred: &mut *deferred,
+            leaves: &mut leaves,
+        },
+        record,
+        payload,
+        expected,
+        target,
+        entry,
+    )
+    .await?;
+    leaves.flush(txn, deferred)
 }
 
 /// Replaces one record and returns final changed Headers for scheduling.
+///
+/// Follows [`replace_record`], with every write queued into the shared
+/// `writes`: Header and Synopsis adjustments accumulate until its flush.
 pub(crate) async fn replace_record_with_headers<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
-    deferred: &mut MutationBuilder<'_>,
+    writes: &mut WriteSinks<'_, '_>,
     record: &VectorRecord,
     payload: Option<&OpaquePayload>,
     expected: &RecordLocation,
@@ -224,19 +404,21 @@ pub(crate) async fn replace_record_with_headers<T: WriteTxn>(
         return Err(Error::new(ErrorKind::Corruption));
     }
 
-    deferred.put(record_key, PersistentValue::VectorRecord(record.clone()))?;
+    writes
+        .deferred
+        .put(record_key, PersistentValue::VectorRecord(record.clone()))?;
     if target != expected {
-        deferred.put(
+        writes.deferred.put(
             location_key,
             PersistentValue::RecordLocation(target.clone()),
         )?;
     }
     let payload_key = payload_key(index, id);
     match payload {
-        Some(payload) => {
-            deferred.put(payload_key, PersistentValue::OpaquePayload(payload.clone()))?
-        }
-        None => deferred.delete(payload_key)?,
+        Some(payload) => writes
+            .deferred
+            .put(payload_key, PersistentValue::OpaquePayload(payload.clone()))?,
+        None => writes.deferred.delete(payload_key)?,
     }
 
     let target_entry_key = entry_key(index, target, id);
@@ -245,32 +427,39 @@ pub(crate) async fn replace_record_with_headers<T: WriteTxn>(
         // establishes the conflict on it.
         expect_leaf_entry(txn.get_for_update(target_entry_key.clone()).await?)?
             .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
-        deferred.put(target_entry_key, PersistentValue::LeafEntry(entry.clone()))?;
+        writes
+            .deferred
+            .put(target_entry_key, PersistentValue::LeafEntry(entry.clone()))?;
         None
     } else {
         let source_entry_key = entry_key(index, expected, id);
         expect_leaf_entry(txn.get_for_update(source_entry_key.clone()).await?)?
             .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
-        deferred.delete(source_entry_key)?;
+        writes.deferred.delete(source_entry_key)?;
         expect_absent(txn, target_entry_key.clone()).await?;
-        deferred.put(target_entry_key, PersistentValue::LeafEntry(entry.clone()))?;
+        writes
+            .deferred
+            .put(target_entry_key, PersistentValue::LeafEntry(entry.clone()))?;
 
         // The source follows the exact stored location, so any state is legal
         // for it; only the target must be a write-accepting leaf.
-        let source = read_header(txn, index, expected).await?;
+        let source = writes.leaves.header(txn, index, expected).await?;
         let adjusted = removed_entry(source)?;
-        put_header(txn, index, expected, adjusted).await?;
+        writes.leaves.adjust_header(expected, adjusted);
         Some(adjusted)
     };
 
-    let target_header = expect_write_target(read_header(txn, index, target).await?)?;
+    let target_header = expect_write_target(writes.leaves.header(txn, index, target).await?)?;
     let adjusted = if expected == target {
         touched_entry(target_header)?
     } else {
         added_entry(target_header)?
     };
-    put_header(txn, index, target, adjusted).await?;
-    expand_synopsis(txn, manifest, target, entry.fields()).await?;
+    writes.leaves.adjust_header(target, adjusted);
+    writes
+        .leaves
+        .expand_synopsis(txn, manifest, target, entry.fields())
+        .await?;
     Ok(ReplacementHeaders {
         source,
         target: adjusted,
@@ -293,16 +482,30 @@ pub async fn delete_record<T: WriteTxn>(
     deferred: &mut MutationBuilder<'_>,
     id: &Bytes,
 ) -> Result<DeleteOutcome> {
-    Ok(match delete_record_with_header(txn, deferred, id).await? {
+    let mut leaves = LeafAccumulator::new();
+    let report = delete_record_with_header(
+        txn,
+        &mut WriteSinks {
+            deferred: &mut *deferred,
+            leaves: &mut leaves,
+        },
+        id,
+    )
+    .await?;
+    leaves.flush(txn, deferred)?;
+    Ok(match report {
         DeleteReport::Deleted { location, .. } => DeleteOutcome::Deleted { location },
         DeleteReport::NotFound => DeleteOutcome::NotFound,
     })
 }
 
 /// Deletes one record and returns the changed Header for maintenance discovery.
+///
+/// Follows [`delete_record`], with every write queued into the shared
+/// `writes`: the Header adjustment accumulates until its flush.
 pub(crate) async fn delete_record_with_header<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
-    deferred: &mut MutationBuilder<'_>,
+    writes: &mut WriteSinks<'_, '_>,
     id: &Bytes,
 ) -> Result<DeleteReport> {
     let index = txn
@@ -321,12 +524,12 @@ pub(crate) async fn delete_record_with_header<T: WriteTxn>(
     expect_leaf_entry(txn.get_for_update(entry_key.clone()).await?)?
         .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
 
-    deferred.delete(record_key)?;
-    deferred.delete(location_key)?;
-    deferred.delete(entry_key)?;
-    deferred.delete(payload_key(index, id))?;
-    let header = removed_entry(read_header(txn, index, &location).await?)?;
-    put_header(txn, index, &location, header).await?;
+    writes.deferred.delete(record_key)?;
+    writes.deferred.delete(location_key)?;
+    writes.deferred.delete(entry_key)?;
+    writes.deferred.delete(payload_key(index, id))?;
+    let header = removed_entry(writes.leaves.header(txn, index, &location).await?)?;
+    writes.leaves.adjust_header(&location, header);
     Ok(DeleteReport::Deleted { location, header })
 }
 
@@ -377,6 +580,160 @@ fn classify_location_pair(
     }
 }
 
+/// One batch item's membership read set to warm before the apply loop.
+///
+/// Each set covers what the corresponding membership operation —
+/// [`insert_record_with_header`], [`replace_record_with_headers`], or
+/// [`delete_record_with_header`] — reads with update protection, except the
+/// routed target Header, which arrives warm from the route validation.
+pub(crate) enum MembershipPrefetch<'a> {
+    /// An insert's reads: the Record, the Location, the Opaque Payload when
+    /// the record carries one, the target Leaf Entry, and the target leaf
+    /// Synopsis.
+    Insert {
+        id: &'a Bytes,
+        payload: bool,
+        target: &'a RecordLocation,
+    },
+    /// A replacement's reads: the stored Record and Location, the target Leaf
+    /// Entry and leaf Synopsis, and the source Leaf Entry and leaf Header when
+    /// the move crosses leaves.
+    Replace {
+        id: &'a Bytes,
+        expected: &'a RecordLocation,
+        target: &'a RecordLocation,
+    },
+    /// A delete's Record and Location. Its leaf Header and Leaf Entry keys
+    /// follow from the stored Location, so they warm in a second wave.
+    Delete { id: &'a Bytes },
+}
+
+/// The chunk bound for batched membership warming reads. One chunk matches
+/// the production adapters' internal point-read batch, so a logical batch
+/// never re-chunks below the adapter, and stays well under every backend's
+/// batch limit regardless of the caller's batch size.
+const MEMBERSHIP_READ_CHUNK: usize = 1_024;
+
+/// Warms the transaction-local read cache with every item's membership read
+/// set in bounded update-protected batches.
+///
+/// The per-item membership operations re-read exactly these keys through the
+/// checked typed path when they apply; served from the warmed cache, they
+/// cost no backend round trip per record. The batched reads establish the
+/// per-key conflicts the per-item reads rely on; a delete of an absent record
+/// additionally protects its (necessarily absent) Location, which exact
+/// membership only ever writes together with the already-protected Record.
+///
+/// This is an optimization only: it validates nothing and never fails. A key
+/// left unwarmed by a failed batch — raw values fetched before the failure
+/// stay cached — is re-read by the item's own checked path, which reproduces
+/// the error with the item's input position attached.
+pub(crate) async fn prefetch_membership_for_update<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    items: &[MembershipPrefetch<'_>],
+) {
+    let Some(index) = txn.bound_manifest().map(IndexManifest::logical_index_id) else {
+        return;
+    };
+    let mut keys = Vec::new();
+    // Leaf-level keys repeat per item routed to the same leaf; warm each
+    // distinct leaf's Synopsis or source Header once.
+    let mut warmed_synopses: BTreeSet<(TreeKey, PartitionKey)> = BTreeSet::new();
+    let mut warmed_headers: BTreeSet<(TreeKey, PartitionKey)> = BTreeSet::new();
+    for item in items {
+        match *item {
+            MembershipPrefetch::Insert {
+                id,
+                payload,
+                target,
+            } => {
+                keys.push(record_key(index, id));
+                keys.push(location_key(index, id));
+                if payload {
+                    keys.push(payload_key(index, id));
+                }
+                keys.push(entry_key(index, target, id));
+                if warmed_synopses.insert((target.tree_key().clone(), target.leaf())) {
+                    keys.push(synopsis_key(index, target));
+                }
+            }
+            MembershipPrefetch::Replace {
+                id,
+                expected,
+                target,
+            } => {
+                keys.push(record_key(index, id));
+                keys.push(location_key(index, id));
+                keys.push(entry_key(index, target, id));
+                if warmed_synopses.insert((target.tree_key().clone(), target.leaf())) {
+                    keys.push(synopsis_key(index, target));
+                }
+                if expected != target {
+                    keys.push(entry_key(index, expected, id));
+                    if warmed_headers.insert((expected.tree_key().clone(), expected.leaf())) {
+                        keys.push(header_key(index, expected));
+                    }
+                }
+            }
+            MembershipPrefetch::Delete { id } => {
+                keys.push(record_key(index, id));
+                keys.push(location_key(index, id));
+            }
+        }
+    }
+    if !warm_chunks_for_update(txn, keys).await {
+        return;
+    }
+    // A delete's leaf Header and Leaf Entry keys follow from its stored
+    // Location, so they warm in a second wave served from the first wave's
+    // cache. An absent Location warms nothing; a corrupt pair defers to the
+    // checked delete path, which reports it with the item's position.
+    let mut location_keys = Vec::new();
+    for item in items {
+        let &MembershipPrefetch::Delete { id } = item else {
+            continue;
+        };
+        location_keys.push(location_key(index, id));
+    }
+    let Ok(locations) = txn.batch_get_for_update(location_keys).await else {
+        return;
+    };
+    let mut locations = locations.into_iter();
+    let mut leaf_keys = Vec::new();
+    for item in items {
+        let &MembershipPrefetch::Delete { id } = item else {
+            continue;
+        };
+        match locations.next() {
+            Some(Some(PersistentValue::RecordLocation(location))) => {
+                leaf_keys.push(entry_key(index, &location, id));
+                if warmed_headers.insert((location.tree_key().clone(), location.leaf())) {
+                    leaf_keys.push(header_key(index, &location));
+                }
+            }
+            // A fully absent Record ID warms nothing.
+            Some(None) => {}
+            // A short batch defers every remaining key to the checked path.
+            _ => return,
+        }
+    }
+    let _ = warm_chunks_for_update(txn, leaf_keys).await;
+}
+
+/// Warms `keys` in bounded update-protected batches, returning false when a
+/// batch fails and the remaining keys are left unwarmed.
+async fn warm_chunks_for_update<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    keys: Vec<LogicalKey>,
+) -> bool {
+    for chunk in keys.chunks(MEMBERSHIP_READ_CHUNK) {
+        if txn.warm_for_update(chunk.to_vec()).await.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
 /// Validates caller identity agreement and returns the bound Manifest.
 fn validated_input<'manifest, T>(
     txn: &WriteLogicalTxn<'manifest, T>,
@@ -387,55 +744,6 @@ fn validated_input<'manifest, T>(
         return Err(Error::invalid_argument());
     }
     txn.bound_manifest().ok_or_else(Error::invalid_argument)
-}
-
-/// Reads one update-protected leaf Header that must exist.
-async fn read_header<T: WriteTxn>(
-    txn: &mut WriteLogicalTxn<'_, T>,
-    index: LogicalIndexId,
-    location: &RecordLocation,
-) -> Result<PartitionHeader> {
-    expect_header(txn.get_for_update(header_key(index, location)).await?)?
-        .ok_or_else(|| Error::new(ErrorKind::Corruption))
-}
-
-/// Writes one adjusted leaf Header back through the budgeted mutation path.
-async fn put_header<T: WriteTxn>(
-    txn: &mut WriteLogicalTxn<'_, T>,
-    index: LogicalIndexId,
-    location: &RecordLocation,
-    header: PartitionHeader,
-) -> Result<()> {
-    txn.put(
-        header_key(index, location),
-        PersistentValue::PartitionHeader(header),
-    )
-    .await
-}
-
-/// Expands the target Synopsis with one exact Leaf projection and puts it back
-/// only when the expansion changed it.
-///
-/// The stored Synopsis was fully validated at decode, so a projection mismatch
-/// here is caller input; a missing Synopsis is corruption. The update-protected
-/// read already establishes the commit-time conflict, so a byte-identical
-/// expansion is left unwritten.
-async fn expand_synopsis<T: WriteTxn>(
-    txn: &mut WriteLogicalTxn<'_, T>,
-    manifest: &IndexManifest,
-    target: &RecordLocation,
-    projection: &[Value],
-) -> Result<()> {
-    let key = synopsis_key(manifest.logical_index_id(), target);
-    let mut synopsis = expect_synopsis(txn.get_for_update(key.clone()).await?)?
-        .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
-    let before = synopsis.clone();
-    synopsis.expand(manifest, projection)?;
-    if synopsis != before {
-        txn.put(key, PersistentValue::PartitionSynopsis(synopsis))
-            .await?;
-    }
-    Ok(())
 }
 
 /// Validates that a decoded Header names a write-accepting leaf.

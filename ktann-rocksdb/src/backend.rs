@@ -246,6 +246,11 @@ enum ReadCommand {
         limits: ScanLimits,
         response: oneshot::Sender<Result<ScanPage>>,
     },
+    BatchScan {
+        ranges: Vec<PhysicalRange>,
+        limits: ScanLimits,
+        response: oneshot::Sender<Result<Vec<ScanPage>>>,
+    },
 }
 
 enum WriteCommand {
@@ -261,6 +266,11 @@ enum WriteCommand {
         range: PhysicalRange,
         limits: ScanLimits,
         response: oneshot::Sender<Result<ScanPage>>,
+    },
+    BatchScan {
+        ranges: Vec<PhysicalRange>,
+        limits: ScanLimits,
+        response: oneshot::Sender<Result<Vec<ScanPage>>>,
     },
     GetForUpdate {
         key: Bytes,
@@ -400,9 +410,6 @@ impl ReadOps for RocksDbReadTxn<'_> {
     }
 
     async fn batch_get(&mut self, keys: Vec<Bytes>) -> Result<Vec<Option<Bytes>>> {
-        for key in &keys {
-            self.prefix.validate_key(key)?;
-        }
         self.worker
             .request(|response| ReadCommand::BatchGet { keys, response })
             .await
@@ -413,6 +420,27 @@ impl ReadOps for RocksDbReadTxn<'_> {
         self.worker
             .request(|response| ReadCommand::Scan {
                 range,
+                limits,
+                response,
+            })
+            .await
+    }
+
+    async fn batch_scan(
+        &mut self,
+        ranges: &[KeyRange],
+        limits: ScanLimits,
+    ) -> Result<Vec<ScanPage>> {
+        if limits.item_limit == 0 || limits.byte_limit == 0 {
+            return Err(Error::new(ErrorKind::InvalidArgument));
+        }
+        let mut physical_ranges = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            physical_ranges.push(self.prefix.encode_range(range)?);
+        }
+        self.worker
+            .request(|response| ReadCommand::BatchScan {
+                ranges: physical_ranges,
                 limits,
                 response,
             })
@@ -431,9 +459,6 @@ impl ReadOps for RocksDbWriteTxn<'_> {
     }
 
     async fn batch_get(&mut self, keys: Vec<Bytes>) -> Result<Vec<Option<Bytes>>> {
-        for key in &keys {
-            self.prefix.validate_key(key)?;
-        }
         self.worker
             .request(|response| WriteCommand::BatchGet { keys, response })
             .await
@@ -444,6 +469,27 @@ impl ReadOps for RocksDbWriteTxn<'_> {
         self.worker
             .request(|response| WriteCommand::Scan {
                 range,
+                limits,
+                response,
+            })
+            .await
+    }
+
+    async fn batch_scan(
+        &mut self,
+        ranges: &[KeyRange],
+        limits: ScanLimits,
+    ) -> Result<Vec<ScanPage>> {
+        if limits.item_limit == 0 || limits.byte_limit == 0 {
+            return Err(Error::new(ErrorKind::InvalidArgument));
+        }
+        let mut physical_ranges = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            physical_ranges.push(self.prefix.encode_range(range)?);
+        }
+        self.worker
+            .request(|response| WriteCommand::BatchScan {
+                ranges: physical_ranges,
                 limits,
                 response,
             })
@@ -491,9 +537,6 @@ impl WriteTxn for RocksDbWriteTxn<'_> {
     }
 
     async fn batch_get_for_update(&mut self, keys: Vec<Bytes>) -> Result<Vec<Option<Bytes>>> {
-        for key in &keys {
-            self.prefix.validate_key(key)?;
-        }
         self.worker
             .request(|response| WriteCommand::BatchGetForUpdate { keys, response })
             .await
@@ -627,6 +670,13 @@ fn read_actor(
             } => {
                 let _ = respond(response, || scan(&snapshot, &prefix, &range, limits));
             }
+            ReadCommand::BatchScan {
+                ranges,
+                limits,
+                response,
+            } => {
+                let _ = respond(response, || batch_scan(&snapshot, &prefix, &ranges, limits));
+            }
         }
     }
 }
@@ -666,6 +716,14 @@ fn write_actor(
             } => respond(response, || {
                 let snapshot = transaction.snapshot();
                 scan(&snapshot, &prefix, &range, limits)
+            }),
+            WriteCommand::BatchScan {
+                ranges,
+                limits,
+                response,
+            } => respond(response, || {
+                let snapshot = transaction.snapshot();
+                batch_scan(&snapshot, &prefix, &ranges, limits)
             }),
             WriteCommand::GetForUpdate { key, response } => respond(response, || {
                 let snapshot = transaction.snapshot();
@@ -881,6 +939,21 @@ fn scan<D: DBAccess>(
     }
     iterator.status().map_err(map_operation_error)?;
     Ok(ScanPage::terminal(items))
+}
+
+/// Serves every range of one batched scan in the single actor round trip,
+/// keeping the per-range paging rules of `scan` and the input order.
+fn batch_scan<D: DBAccess>(
+    snapshot: &SnapshotWithThreadMode<'_, D>,
+    prefix: &PhysicalPrefix,
+    ranges: &[PhysicalRange],
+    limits: ScanLimits,
+) -> Result<Vec<ScanPage>> {
+    let mut pages = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        pages.push(scan(snapshot, prefix, range, limits)?);
+    }
+    Ok(pages)
 }
 
 fn validate_value(value: &[u8]) -> Result<()> {

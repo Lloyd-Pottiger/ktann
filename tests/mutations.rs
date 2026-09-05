@@ -945,6 +945,99 @@ fn record_1d(id: &[u8], x: f32, bucket: i64) -> Record {
     .expect("valid record")
 }
 
+/// One partition's ready-state Header seed entry.
+fn header_entry(
+    index: LogicalIndexId,
+    tree_key: &TreeKey,
+    partition: PartitionKey,
+    level: u32,
+    count: u32,
+) -> (LogicalKey, PersistentValue) {
+    (
+        LogicalKey::Header {
+            index,
+            tree_key: tree_key.clone(),
+            partition,
+        },
+        PersistentValue::PartitionHeader(
+            PartitionHeader::new(level, count, 0, PartitionState::Ready).expect("header"),
+        ),
+    )
+}
+
+/// One partition's ready State seed entry.
+fn state_entry(
+    index: LogicalIndexId,
+    tree_key: &TreeKey,
+    partition: PartitionKey,
+) -> (LogicalKey, PersistentValue) {
+    (
+        LogicalKey::State {
+            index,
+            tree_key: tree_key.clone(),
+            partition,
+        },
+        PersistentValue::PartitionState(PartitionTransition::Ready {
+            started_at_unix_millis: 0,
+        }),
+    )
+}
+
+/// One partition's empty Synopsis seed entry.
+fn synopsis_entry(
+    manifest: &IndexManifest,
+    tree_key: &TreeKey,
+    partition: PartitionKey,
+) -> (LogicalKey, PersistentValue) {
+    (
+        LogicalKey::Synopsis {
+            index: manifest.logical_index_id(),
+            tree_key: tree_key.clone(),
+            partition,
+        },
+        PersistentValue::PartitionSynopsis(PartitionSynopsis::empty(manifest)),
+    )
+}
+
+/// One Child Entry seed edge from `parent` to `child`.
+fn edge_entry(
+    index: LogicalIndexId,
+    tree_key: &TreeKey,
+    parent: PartitionKey,
+    child: PartitionKey,
+    centroid: f32,
+) -> (LogicalKey, PersistentValue) {
+    (
+        LogicalKey::ChildEntry {
+            index,
+            tree_key: tree_key.clone(),
+            partition: parent,
+            child,
+        },
+        PersistentValue::ChildEntry(ChildEntry::new(child, vec![centroid])),
+    )
+}
+
+/// Puts every seed entry and commits them in one transaction.
+async fn seed_topology(
+    backend: &SharedBackend,
+    manifest: &IndexManifest,
+    entries: impl IntoIterator<Item = (LogicalKey, PersistentValue)>,
+) {
+    let raw = backend.begin_write().await.expect("begin write");
+    let mut txn = WriteLogicalTxn::for_index(
+        raw,
+        manifest,
+        backend.hard_limits(),
+        backend.admission_budget(),
+    )
+    .expect("bind index");
+    for (key, value) in entries {
+        txn.put(key, value).await.expect("seed topology");
+    }
+    txn.commit().await.expect("commit topology");
+}
+
 /// Seeds the grown root shape for `bucket`: root PK 1 at level 2 with leaf
 /// children PK 2 (centroid 0.0) and PK 3 (centroid 10.0), each with its Header
 /// and empty Synopsis installed.
@@ -963,65 +1056,94 @@ async fn seed_grown_tree(backend: &SharedBackend, manifest: &IndexManifest, buck
     tree_manifest::create_tree(&mut txn, &key, 0)
         .await
         .expect("create tree");
-    let header = |level, count, partition| {
-        (
-            LogicalKey::Header {
-                index,
-                tree_key: key.clone(),
-                partition,
-            },
-            PersistentValue::PartitionHeader(
-                PartitionHeader::new(level, count, 0, PartitionState::Ready).expect("header"),
-            ),
-        )
-    };
-    let synopsis = |partition| {
-        (
-            LogicalKey::Synopsis {
-                index,
-                tree_key: key.clone(),
-                partition,
-            },
-            PersistentValue::PartitionSynopsis(PartitionSynopsis::empty(manifest)),
-        )
-    };
-    let state = |partition| {
-        (
-            LogicalKey::State {
-                index,
-                tree_key: key.clone(),
-                partition,
-            },
-            PersistentValue::PartitionState(PartitionTransition::Ready {
-                started_at_unix_millis: 0,
-            }),
-        )
-    };
-    let edge = |partition, centroid| {
-        (
-            LogicalKey::ChildEntry {
-                index,
-                tree_key: key.clone(),
-                partition: pk(1),
-                child: partition,
-            },
-            PersistentValue::ChildEntry(ChildEntry::new(partition, vec![centroid])),
-        )
-    };
     for (key, value) in [
-        header(2, 2, pk(1)),
-        header(1, 0, pk(2)),
-        header(1, 0, pk(3)),
-        state(pk(2)),
-        state(pk(3)),
-        edge(pk(2), 0.0),
-        edge(pk(3), 10.0),
-        synopsis(pk(2)),
-        synopsis(pk(3)),
+        header_entry(index, &key, pk(1), 2, 2),
+        header_entry(index, &key, pk(2), 1, 0),
+        header_entry(index, &key, pk(3), 1, 0),
+        state_entry(index, &key, pk(2)),
+        state_entry(index, &key, pk(3)),
+        edge_entry(index, &key, pk(1), pk(2), 0.0),
+        edge_entry(index, &key, pk(1), pk(3), 10.0),
+        synopsis_entry(manifest, &key, pk(2)),
+        synopsis_entry(manifest, &key, pk(3)),
     ] {
         txn.put(key, value).await.expect("seed topology");
     }
     txn.commit().await.expect("commit topology");
+}
+
+/// Extends the seeded two-level tree to three levels by turning its two leaf
+/// children into internal partitions and adding four empty leaf children.
+async fn deepen_tree(backend: &SharedBackend, manifest: &IndexManifest, bucket: i64) {
+    let key = tree_key(bucket);
+    let index = manifest.logical_index_id();
+    let pk = |value: u64| PartitionKey::new(value).expect("valid partition key");
+    seed_topology(
+        backend,
+        manifest,
+        [
+            header_entry(index, &key, pk(1), 3, 2),
+            header_entry(index, &key, pk(2), 2, 2),
+            header_entry(index, &key, pk(3), 2, 2),
+            header_entry(index, &key, pk(4), 1, 0),
+            header_entry(index, &key, pk(5), 1, 0),
+            header_entry(index, &key, pk(6), 1, 0),
+            header_entry(index, &key, pk(7), 1, 0),
+            state_entry(index, &key, pk(4)),
+            state_entry(index, &key, pk(5)),
+            state_entry(index, &key, pk(6)),
+            state_entry(index, &key, pk(7)),
+            synopsis_entry(manifest, &key, pk(4)),
+            synopsis_entry(manifest, &key, pk(5)),
+            synopsis_entry(manifest, &key, pk(6)),
+            synopsis_entry(manifest, &key, pk(7)),
+            edge_entry(index, &key, pk(2), pk(4), 0.0),
+            edge_entry(index, &key, pk(2), pk(5), 1.0),
+            edge_entry(index, &key, pk(3), pk(6), 10.0),
+            edge_entry(index, &key, pk(3), pk(7), 11.0),
+        ],
+    )
+    .await;
+}
+
+/// Widens the seeded three-level tree so each level-two body holds 130 Child
+/// Entries: at dimension 1 the 64-item scan page splits each body into three
+/// backend pages, so a two-body wave distinguishes batched lockstep rounds
+/// from serialized per-body page reads. Only the leaves the write beam can
+/// select are seeded as write-accepting; the remaining children exist as
+/// edges only.
+async fn widen_tree(backend: &SharedBackend, manifest: &IndexManifest, bucket: i64) {
+    const BODY_CHILDREN: u64 = 130;
+    let key = tree_key(bucket);
+    let index = manifest.logical_index_id();
+    let pk = |value: u64| PartitionKey::new(value).expect("valid partition key");
+    let mut entries = vec![
+        header_entry(index, &key, pk(1), 3, 2),
+        header_entry(index, &key, pk(2), 2, BODY_CHILDREN as u32),
+        header_entry(index, &key, pk(3), 2, BODY_CHILDREN as u32),
+        edge_entry(index, &key, pk(1), pk(2), 0.0),
+        edge_entry(index, &key, pk(1), pk(3), 1_000.0),
+    ];
+    for i in 0..BODY_CHILDREN {
+        entries.push(edge_entry(index, &key, pk(2), pk(100 + i), i as f32));
+        entries.push(edge_entry(
+            index,
+            &key,
+            pk(3),
+            pk(300 + i),
+            1_000.0 + i as f32,
+        ));
+    }
+    // The inserted records can only select the nearest leaves at either end;
+    // those need the full write-accepting seed.
+    for i in 0..=8_u64 {
+        for leaf in [pk(100 + i), pk(300 + i)] {
+            entries.push(header_entry(index, &key, leaf, 1, 0));
+            entries.push(state_entry(index, &key, leaf));
+            entries.push(synopsis_entry(manifest, &key, leaf));
+        }
+    }
+    seed_topology(backend, manifest, entries).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1058,37 +1180,144 @@ async fn batched_inserts_share_routing_and_apply_writes_once() {
     let counts = backend.inner.operation_counts();
     // One grouped descent for the whole batch: one Tree Manifest read, one
     // root authority read, one batched authority (Header+State) read for both
-    // leaves, and one Child Entry scan, independent of the batch size.
+    // leaves, and one batched Child Entry scan round, independent of the
+    // batch size.
     assert_eq!(counts.get, 1, "plain reads: {counts:?}");
     assert_eq!(counts.batch_get, 2, "batched authority reads: {counts:?}");
-    assert_eq!(counts.scan, 1, "scans: {counts:?}");
-    // Every record-group write lands through the single deferred apply; the
-    // only remaining write calls are the per-item Header/Synopsis updates.
+    assert_eq!(counts.scan, 0, "standalone scans: {counts:?}");
+    assert_eq!(counts.batch_scan, 1, "batched scan rounds: {counts:?}");
+    // The whole attempt lands in one backend write call: every record-group
+    // write plus one Header and one changed Synopsis per touched leaf join
+    // the single deferred apply.
     assert_eq!(counts.insert, 0, "unique inserts: {counts:?}");
-    assert!(
-        counts.batch_mutate <= 2 * N + 1,
-        "batch_mutate calls: {counts:?}"
+    assert_eq!(counts.batch_mutate, 1, "one write call: {counts:?}");
+    // The Manifest validation is the only update-protected point read: every
+    // membership read rides a batch — the leaf Headers and incoming edges
+    // through the route validation, the record-group checks and leaf
+    // Synopses through the prefetch — and is re-read from the
+    // transaction-local cache.
+    assert_eq!(
+        counts.get_for_update, 1,
+        "point reads independent of N: {counts:?}"
     );
-    // Update-protected reads: one Manifest validation, one Header+edge pair
-    // per distinct leaf, and bounded per-item authoritative reads; the
-    // transaction-local cache serves every repeat.
-    assert!(
-        counts.get_for_update <= 5 * N + 5,
-        "get_for_update calls: {counts:?}"
+    // One batched update-protected read validates the routed leaves' Headers
+    // and incoming edges, and one prefetches every record's Record, Location,
+    // Leaf Entry, and target Synopsis keys.
+    assert_eq!(
+        counts.batch_get_for_update, 2,
+        "batched update reads: {counts:?}"
     );
 
     // Functional outcome: all 40 records split across the two leaves.
     assert_eq!(leaf_member_ids(&backend, &manifest, 1, 2).await.len(), 20);
     assert_eq!(leaf_member_ids(&backend, &manifest, 1, 3).await.len(), 20);
-    assert_eq!(
-        read_header(&backend, &manifest, 1, 2).await.entry_count(),
-        20
-    );
-    assert_eq!(
-        read_header(&backend, &manifest, 1, 3).await.entry_count(),
-        20
-    );
+    // The committed Headers carry the exact per-item arithmetic the unbatched
+    // sequence produced: one count increment and one cache-epoch bump per
+    // record over the seeded epoch 0.
+    let header_2 = read_header(&backend, &manifest, 1, 2).await;
+    assert_eq!(header_2.entry_count(), 20);
+    assert_eq!(header_2.cache_epoch(), 20);
+    let header_3 = read_header(&backend, &manifest, 1, 3).await;
+    assert_eq!(header_3.entry_count(), 20);
+    assert_eq!(header_3.cache_epoch(), 20);
     for i in 0..N as u8 {
+        assert!(
+            index
+                .get(rid(i), GetOptions::default())
+                .await
+                .expect("get")
+                .is_some()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batched_routing_reads_authority_once_per_tree_level() {
+    let backend = backend(DeterministicConfig::default());
+    let runtime = Runtime::new(backend.clone(), support::manual_maintenance_config())
+        .expect("runtime is valid");
+    let index = runtime
+        .create_index("deep-batched", config_1d())
+        .await
+        .expect("create index");
+    let manifest = read_manifest(&backend, index.logical_index_id()).await;
+    seed_grown_tree(&backend, &manifest, 1).await;
+    deepen_tree(&backend, &manifest, 1).await;
+
+    backend.inner.reset_operation_counts();
+    index
+        .batch_mutate(
+            (0..16_u8)
+                .map(|i| {
+                    let x = match i % 4 {
+                        0 => 0.1,
+                        1 => 0.9,
+                        2 => 10.1,
+                        _ => 10.9,
+                    };
+                    Mutation::Insert(record_1d(&rid(i), x, 1))
+                })
+                .collect(),
+        )
+        .await
+        .expect("batch insert");
+
+    let counts = backend.inner.operation_counts();
+    // The route reads the root, both level-two candidates, and all level-one
+    // candidates as three authority waves.
+    assert_eq!(counts.batch_get, 3, "authority waves: {counts:?}");
+    // Each internal level's Child Entry bodies are scanned in batched
+    // lockstep rounds: the root wave and the two-body level-two wave each
+    // cost one batched scan instead of one serialized scan per body.
+    assert_eq!(counts.scan, 0, "standalone scans: {counts:?}");
+    assert_eq!(counts.batch_scan, 2, "lockstep scan rounds: {counts:?}");
+    for i in 0..16_u8 {
+        assert!(
+            index
+                .get(rid(i), GetOptions::default())
+                .await
+                .expect("get")
+                .is_some()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batched_routing_scans_wide_bodies_in_lockstep() {
+    let backend = backend(DeterministicConfig::default());
+    // Exact backend operation counts are incompatible with background fixup
+    // workers; this test drives no maintenance, so it runs workerless.
+    let runtime = Runtime::new(backend.clone(), support::manual_maintenance_config())
+        .expect("runtime is valid");
+    let index = runtime
+        .create_index("wide-batched", config_1d())
+        .await
+        .expect("create index");
+    let manifest = read_manifest(&backend, index.logical_index_id()).await;
+    seed_grown_tree(&backend, &manifest, 1).await;
+    widen_tree(&backend, &manifest, 1).await;
+
+    backend.inner.reset_operation_counts();
+    index
+        .batch_mutate(
+            [0.0_f32, 1.0, 2.0, 3.0, 1_000.0, 1_001.0, 1_002.0, 1_003.0]
+                .iter()
+                .enumerate()
+                .map(|(i, &x)| Mutation::Insert(record_1d(&rid(i as u8), x, 1)))
+                .collect(),
+        )
+        .await
+        .expect("batch insert");
+
+    let counts = backend.inner.operation_counts();
+    // The root wave scans its one two-child body in a single round. Both
+    // level-two bodies hold 130 Child Entries — three 64-item pages each —
+    // and their wave completes in three lockstep rounds, one batched scan
+    // each, instead of six serialized page reads.
+    assert_eq!(counts.scan, 0, "standalone scans: {counts:?}");
+    assert_eq!(counts.batch_scan, 4, "lockstep scan rounds: {counts:?}");
+
+    for i in 0..8_u8 {
         assert!(
             index
                 .get(rid(i), GetOptions::default())
@@ -1129,10 +1358,11 @@ async fn batched_upserts_read_locations_in_one_call() {
     );
 
     // One batched update-protected read decides insert versus replace for the
-    // whole batch, and a second one validates every distinct routed leaf; the
-    // membership operations re-read from the transaction-local cache.
+    // whole batch, a second warms every item's membership read set, and a
+    // third validates every distinct routed leaf; the membership operations
+    // re-read from the transaction-local cache.
     let counts = backend.inner.operation_counts();
-    assert_eq!(counts.batch_get_for_update, 2, "batched reads: {counts:?}");
+    assert_eq!(counts.batch_get_for_update, 3, "batched reads: {counts:?}");
 
     for i in 0..N as u8 {
         let stored = index
@@ -1141,5 +1371,58 @@ async fn batched_upserts_read_locations_in_one_call() {
             .expect("get")
             .expect("record exists");
         assert_eq!(stored.vector(), &[2.0]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batched_deletes_read_membership_in_bounded_calls() {
+    let backend = backend(DeterministicConfig::default());
+    // Exact backend operation counts are incompatible with background fixup
+    // workers; this test drives no maintenance, so it runs workerless.
+    let runtime = Runtime::new(backend.clone(), support::manual_maintenance_config())
+        .expect("runtime is valid");
+    let index = runtime
+        .create_index("batched-delete", config_1d())
+        .await
+        .expect("create index");
+
+    const N: usize = 20;
+    index
+        .batch_mutate(
+            (0..N as u8)
+                .map(|i| Mutation::Insert(record_1d(&rid(i), 1.0, 1)))
+                .collect(),
+        )
+        .await
+        .expect("seed inserts");
+
+    backend.inner.reset_operation_counts();
+    let outcomes = index
+        .batch_mutate(
+            (0..N as u8)
+                .map(|i| Mutation::Delete(rid(i)))
+                .chain(std::iter::once(Mutation::Delete(rid(250))))
+                .collect(),
+        )
+        .await
+        .expect("batch delete");
+    assert_eq!(
+        outcomes,
+        vec![MutationOutcome::Deleted { existed: true }; N]
+            .into_iter()
+            .chain(std::iter::once(MutationOutcome::Deleted { existed: false }))
+            .collect::<Vec<_>>()
+    );
+
+    let counts = backend.inner.operation_counts();
+    // One prefetch batch warms every Record/Location pair and a second warms
+    // the Leaf Entries and leaf Headers of the records that exist (the absent
+    // Record ID contributes no leaf key); the per-item delete checks are then
+    // cache hits.
+    assert_eq!(counts.batch_get_for_update, 2, "batched reads: {counts:?}");
+    // The Manifest validation is the only remaining point read.
+    assert_eq!(counts.get_for_update, 1, "point reads: {counts:?}");
+    for i in 0..N as u8 {
+        assert_record_absent(&index, &rid(i)).await;
     }
 }

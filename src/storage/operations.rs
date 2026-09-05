@@ -10,7 +10,7 @@ use crate::api::{DataType, Error, ErrorKind, LogicalIndexId, MAX_FIELDS, Result,
 
 use super::backend::{
     AdmissionBudget, CommitStart, HardLimits, InsertOutcome, Mutation, ReadOps, ScanLimits,
-    WriteTxn,
+    ScanPage, WriteTxn,
 };
 use super::keys::{self, KeyRange, LogicalKey, TreeKey};
 use super::values::{
@@ -430,22 +430,33 @@ async fn batch_get_logical<T: ReadOps>(
     decode_batch(binding, &keys, values)
 }
 
-async fn scan_logical<T: ReadOps>(
-    raw: &mut T,
+/// Builds the effective raw range for one typed scan leg: the range is
+/// validated against the binding and the cursor must be bound to this exact
+/// range, resuming at its `next_start`.
+fn scan_raw_range(
     binding: &LogicalBinding<'_>,
     range: &LogicalRange,
     cursor: Option<&LogicalScanCursor>,
-    limits: ScanLimits,
-) -> Result<LogicalScanPage> {
+) -> Result<KeyRange> {
     binding.validate_range(range)?;
-    let raw_range = match cursor {
-        Some(cursor) if cursor.range == *range => {
-            KeyRange::new(cursor.next_start.to_vec(), range.raw.end().to_vec())
-        }
-        Some(_) => return Err(Error::invalid_argument()),
-        None => range.raw.clone(),
-    };
-    let raw_page = raw.scan(&raw_range, limits).await?;
+    match cursor {
+        Some(cursor) if cursor.range == *range => Ok(KeyRange::new(
+            cursor.next_start.to_vec(),
+            range.raw.end().to_vec(),
+        )),
+        Some(_) => Err(Error::invalid_argument()),
+        None => Ok(range.raw.clone()),
+    }
+}
+
+/// Decodes one raw page against its effective raw range and exact logical
+/// range, deriving the continuation fail-closed.
+fn decode_scan_page(
+    binding: &LogicalBinding<'_>,
+    range: &LogicalRange,
+    raw_range: &KeyRange,
+    raw_page: ScanPage,
+) -> Result<LogicalScanPage> {
     let mut items = Vec::with_capacity(raw_page.items().len());
     let mut previous: Option<&Bytes> = None;
     for item in raw_page.items() {
@@ -480,6 +491,41 @@ async fn scan_logical<T: ReadOps>(
     };
 
     Ok(LogicalScanPage { items, next_cursor })
+}
+
+async fn scan_logical<T: ReadOps>(
+    raw: &mut T,
+    binding: &LogicalBinding<'_>,
+    range: &LogicalRange,
+    cursor: Option<&LogicalScanCursor>,
+    limits: ScanLimits,
+) -> Result<LogicalScanPage> {
+    let raw_range = scan_raw_range(binding, range, cursor)?;
+    let raw_page = raw.scan(&raw_range, limits).await?;
+    decode_scan_page(binding, range, &raw_range, raw_page)
+}
+
+async fn batch_scan_logical<T: ReadOps>(
+    raw: &mut T,
+    binding: &LogicalBinding<'_>,
+    legs: &[(&LogicalRange, Option<&LogicalScanCursor>)],
+    limits: ScanLimits,
+) -> Result<Vec<LogicalScanPage>> {
+    let mut raw_ranges = Vec::with_capacity(legs.len());
+    for (range, cursor) in legs {
+        raw_ranges.push(scan_raw_range(binding, range, *cursor)?);
+    }
+    let raw_pages = raw.batch_scan(&raw_ranges, limits).await?;
+    if raw_pages.len() != legs.len() {
+        return Err(Error::new(ErrorKind::Backend));
+    }
+    legs.iter()
+        .zip(&raw_ranges)
+        .zip(raw_pages)
+        .map(|((&(range, _), raw_range), raw_page)| {
+            decode_scan_page(binding, range, raw_range, raw_page)
+        })
+        .collect()
 }
 
 /// The closed read of one existing Vector Record group.
@@ -709,6 +755,20 @@ impl<T: ReadOps> ReadLogicalTxn<'_, T> {
         limits: ScanLimits,
     ) -> Result<LogicalScanPage> {
         scan_logical(&mut self.raw, &self.binding, range, cursor, limits).await
+    }
+
+    /// Scans one bounded typed page from each leg, preserving input order.
+    ///
+    /// Every `(range, cursor)` leg is read exactly like [`Self::scan`]: the
+    /// cursor must be bound to its range, and each page is validated and
+    /// decoded fail-closed. The result has one page per leg; an empty input
+    /// succeeds with an empty result.
+    pub async fn batch_scan(
+        &mut self,
+        legs: &[(&LogicalRange, Option<&LogicalScanCursor>)],
+        limits: ScanLimits,
+    ) -> Result<Vec<LogicalScanPage>> {
+        batch_scan_logical(&mut self.raw, &self.binding, legs, limits).await
     }
 }
 
@@ -1085,6 +1145,27 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
         decode_batch(&self.binding, &keys, values)
     }
 
+    /// Warms the read cache for `keys` with batched update-protected reads,
+    /// caching the raw bytes without decoding them.
+    ///
+    /// Each key's conflict is established exactly as the typed
+    /// [`batch_get_for_update`](Self::batch_get_for_update) establishes it; a
+    /// later typed read of a warmed key decodes the cached bytes. This serves
+    /// advisory prefetching, where the caller's checked path performs the
+    /// decode and validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's error; keys read before the failure stay cached.
+    pub(crate) async fn warm_for_update(&mut self, keys: Vec<LogicalKey>) -> Result<()> {
+        let encoded = keys
+            .iter()
+            .map(|key| encode_input_key(&self.binding, key))
+            .collect::<Result<Vec<_>>>()?;
+        self.batch_get_raw(encoded, true).await?;
+        Ok(())
+    }
+
     /// Reads one raw value, serving repeats from the transaction-local cache.
     ///
     /// A cached entry serves the read when it is conflict-established or the
@@ -1167,6 +1248,20 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
         limits: ScanLimits,
     ) -> Result<LogicalScanPage> {
         scan_logical(&mut self.raw, &self.binding, range, cursor, limits).await
+    }
+
+    /// Scans one bounded typed page from each leg, preserving input order.
+    ///
+    /// Every `(range, cursor)` leg is read exactly like [`Self::scan`]: the
+    /// cursor must be bound to its range, and each page is validated and
+    /// decoded fail-closed. The result has one page per leg; an empty input
+    /// succeeds with an empty result.
+    pub async fn batch_scan(
+        &mut self,
+        legs: &[(&LogicalRange, Option<&LogicalScanCursor>)],
+        limits: ScanLimits,
+    ) -> Result<Vec<LogicalScanPage>> {
+        batch_scan_logical(&mut self.raw, &self.binding, legs, limits).await
     }
 
     /// Applies one typed put and charges its exact encoded size.
@@ -1321,11 +1416,11 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
 /// The typed read surface both logical transaction kinds expose.
 ///
 /// Read-only and write logical transactions decode the same typed `get`,
-/// `batch_get`, and `scan` operations; this trait lets algorithm modules write
-/// one read helper or traversal that serves both transaction kinds without
-/// duplicating the logic. It grants no update protection: write transactions
-/// establish conflicts only through the `for_update` operations, which stay
-/// `WriteLogicalTxn`-only.
+/// `batch_get`, `scan`, and `batch_scan` operations; this trait lets algorithm
+/// modules write one read helper or traversal that serves both transaction
+/// kinds without duplicating the logic. It grants no update protection: write
+/// transactions establish conflicts only through the `for_update` operations,
+/// which stay `WriteLogicalTxn`-only.
 pub(crate) trait LogicalReader {
     /// Reads one typed value, returning `None` when the key is absent.
     fn get(
@@ -1346,6 +1441,14 @@ pub(crate) trait LogicalReader {
         cursor: Option<&LogicalScanCursor>,
         limits: ScanLimits,
     ) -> impl Future<Output = Result<LogicalScanPage>> + Send;
+
+    /// Scans one bounded typed page from each `(range, cursor)` leg,
+    /// preserving input order.
+    fn batch_scan(
+        &mut self,
+        legs: &[(&LogicalRange, Option<&LogicalScanCursor>)],
+        limits: ScanLimits,
+    ) -> impl Future<Output = Result<Vec<LogicalScanPage>>> + Send;
 }
 
 impl<T: ReadOps> LogicalReader for ReadLogicalTxn<'_, T> {
@@ -1371,6 +1474,14 @@ impl<T: ReadOps> LogicalReader for ReadLogicalTxn<'_, T> {
     ) -> impl Future<Output = Result<LogicalScanPage>> + Send {
         ReadLogicalTxn::scan(self, range, cursor, limits)
     }
+
+    fn batch_scan(
+        &mut self,
+        legs: &[(&LogicalRange, Option<&LogicalScanCursor>)],
+        limits: ScanLimits,
+    ) -> impl Future<Output = Result<Vec<LogicalScanPage>>> + Send {
+        ReadLogicalTxn::batch_scan(self, legs, limits)
+    }
 }
 
 impl<T: WriteTxn> LogicalReader for WriteLogicalTxn<'_, T> {
@@ -1395,6 +1506,14 @@ impl<T: WriteTxn> LogicalReader for WriteLogicalTxn<'_, T> {
         limits: ScanLimits,
     ) -> impl Future<Output = Result<LogicalScanPage>> + Send {
         WriteLogicalTxn::scan(self, range, cursor, limits)
+    }
+
+    fn batch_scan(
+        &mut self,
+        legs: &[(&LogicalRange, Option<&LogicalScanCursor>)],
+        limits: ScanLimits,
+    ) -> impl Future<Output = Result<Vec<LogicalScanPage>>> + Send {
+        WriteLogicalTxn::batch_scan(self, legs, limits)
     }
 }
 

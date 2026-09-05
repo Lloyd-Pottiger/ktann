@@ -945,6 +945,18 @@ mod tests {
             }
             Ok(ScanPage::terminal(items))
         }
+
+        async fn batch_scan(
+            &mut self,
+            ranges: &[KeyRange],
+            limits: ScanLimits,
+        ) -> Result<Vec<ScanPage>> {
+            let mut pages = Vec::with_capacity(ranges.len());
+            for range in ranges {
+                pages.push(self.scan(range, limits).await?);
+            }
+            Ok(pages)
+        }
     }
 
     fn encode(manifest: &IndexManifest, value: &PersistentValue) -> Vec<u8> {

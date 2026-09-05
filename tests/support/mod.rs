@@ -202,8 +202,8 @@ pub struct DeterministicConfig {
     pub max_scan_page_items: usize,
     /// Backend ceiling on the byte total of one scan page.
     pub max_scan_page_bytes: usize,
-    /// Maximum input length of `batch_get`, `batch_get_for_update`, and
-    /// `batch_mutate`.
+    /// Maximum input length of `batch_get`, `batch_get_for_update`,
+    /// `batch_scan`, and `batch_mutate`.
     pub max_batch_size: usize,
     /// Maximum number of distinct keys in one transaction's conflict set.
     pub max_read_set: usize,
@@ -293,6 +293,8 @@ pub struct OperationCounts {
     pub batch_mutate: usize,
     /// `scan` calls.
     pub scan: usize,
+    /// `batch_scan` calls.
+    pub batch_scan: usize,
     /// `clear_range` calls.
     pub clear_range: usize,
 }
@@ -859,6 +861,35 @@ impl ReadOps for DeterministicReadTxn<'_> {
             self.backend.config.hard_limits.max_key_bytes,
         )
     }
+
+    async fn batch_scan(
+        &mut self,
+        ranges: &[KeyRange],
+        limits: ScanLimits,
+    ) -> Result<Vec<ScanPage>> {
+        self.backend.count(|counts| counts.batch_scan += 1);
+        if ranges.len() > self.backend.config.max_batch_size {
+            return Err(limit_exceeded());
+        }
+        let (item_limit, byte_limit) = resolve_scan(limits, &self.backend.config)?;
+        let max_key_bytes = self.backend.config.hard_limits.max_key_bytes;
+        let mut pages = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            if range.start() >= range.end() {
+                pages.push(ScanPage::terminal(Vec::new()));
+                continue;
+            }
+            check_range(&self.backend.config, range)?;
+            pages.push(scan_map(
+                &self.snapshot,
+                range,
+                item_limit,
+                byte_limit,
+                max_key_bytes,
+            )?);
+        }
+        Ok(pages)
+    }
 }
 
 impl ReadTxn for DeterministicReadTxn<'_> {}
@@ -894,6 +925,35 @@ impl ReadOps for DeterministicWriteTxn<'_> {
             byte_limit,
             self.backend.config.hard_limits.max_key_bytes,
         )
+    }
+
+    async fn batch_scan(
+        &mut self,
+        ranges: &[KeyRange],
+        limits: ScanLimits,
+    ) -> Result<Vec<ScanPage>> {
+        self.backend.count(|counts| counts.batch_scan += 1);
+        if ranges.len() > self.backend.config.max_batch_size {
+            return Err(limit_exceeded());
+        }
+        let (item_limit, byte_limit) = resolve_scan(limits, &self.backend.config)?;
+        let max_key_bytes = self.backend.config.hard_limits.max_key_bytes;
+        let mut merged = None;
+        let mut pages = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            if range.start() >= range.end() {
+                pages.push(ScanPage::terminal(Vec::new()));
+                continue;
+            }
+            check_range(&self.backend.config, range)?;
+            // Read-your-writes: the staged overlay is merged once and shared
+            // by every range in the batch.
+            let map = merged.get_or_insert_with(|| {
+                apply_staged(&self.snapshot, &self.clear_ranges, &self.pending)
+            });
+            pages.push(scan_map(map, range, item_limit, byte_limit, max_key_bytes)?);
+        }
+        Ok(pages)
     }
 }
 

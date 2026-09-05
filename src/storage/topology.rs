@@ -1886,11 +1886,7 @@ pub(crate) async fn read_authority_opt<R: LogicalReader>(
         .batch_get(vec![header_key, state_key])
         .await?
         .into_iter();
-    let (Some(header), Some(state)) = (values.next(), values.next()) else {
-        // The typed batch read returns exactly one value per input key.
-        return Err(Error::new(ErrorKind::Backend));
-    };
-    Ok((expect_header(header)?, expect_state(state)?))
+    decode_authority_pair(&mut values)
 }
 
 /// Reads one partition's authority pair in one batched plain read,
@@ -1936,6 +1932,57 @@ pub(crate) async fn read_authority<R: LogicalReader>(
     }
 }
 
+/// Reads the authority pairs for a distinct partition wave in one batched
+/// plain read.
+///
+/// The caller owns the wave and must pass each Partition Key at most once.
+/// Keeping the pairs aligned with that input lets a grouped foreground route
+/// inspect every partition at one level without issuing one backend call per
+/// partition. The read remains in the current transaction snapshot; it is a
+/// routing optimization, not a shared cache.
+pub(crate) async fn read_authority_batch<R: LogicalReader>(
+    reader: &mut R,
+    index: LogicalIndexId,
+    tree_key: &TreeKey,
+    partitions: &[PartitionKey],
+) -> Result<Vec<(PartitionHeader, PartitionTransition)>> {
+    if partitions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut keys = Vec::with_capacity(partitions.len().saturating_mul(2));
+    for &partition in partitions {
+        let (header_key, state_key) = authority_keys(index, tree_key, partition);
+        keys.push(header_key);
+        keys.push(state_key);
+    }
+    let mut values = reader.batch_get(keys).await?.into_iter();
+    let mut authorities = Vec::with_capacity(partitions.len());
+    for _ in partitions {
+        let (header, state) = decode_authority_pair(&mut values)?;
+        let (Some(header), Some(state)) = (header, state) else {
+            return Err(corrupt());
+        };
+        expect_agreement(header, state)?;
+        authorities.push((header, state));
+    }
+    if values.next().is_some() {
+        return Err(Error::new(ErrorKind::Backend));
+    }
+    Ok(authorities)
+}
+
+/// Decodes one Header/State pair while preserving missing values for callers
+/// whose state-machine rules distinguish an absent partition from corruption.
+fn decode_authority_pair(
+    values: &mut impl Iterator<Item = Option<PersistentValue>>,
+) -> Result<(Option<PartitionHeader>, Option<PartitionTransition>)> {
+    let (Some(header), Some(state)) = (values.next(), values.next()) else {
+        // The typed batch read returns exactly one value per input key.
+        return Err(Error::new(ErrorKind::Backend));
+    };
+    Ok((expect_header(header)?, expect_state(state)?))
+}
+
 /// Reads one partition's Header and State with update protection in one
 /// batch.
 pub(crate) async fn authority_for_update<T: WriteTxn>(
@@ -1947,11 +1994,7 @@ pub(crate) async fn authority_for_update<T: WriteTxn>(
         .batch_get_for_update(vec![header_key, state_key])
         .await?
         .into_iter();
-    let (Some(header), Some(state)) = (values.next(), values.next()) else {
-        // The typed batch read returns exactly one value per input key.
-        return Err(Error::new(ErrorKind::Backend));
-    };
-    Ok((expect_header(header)?, expect_state(state)?))
+    decode_authority_pair(&mut values)
 }
 
 /// Reads one partition's authority pair with update protection, classifying

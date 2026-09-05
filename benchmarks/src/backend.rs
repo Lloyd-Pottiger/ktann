@@ -250,6 +250,23 @@ impl<T: ReadOps> ReadOps for MeasuredReadTxn<T> {
             Ok(result)
         }
     }
+
+    fn batch_scan(
+        &mut self,
+        ranges: &[KeyRange],
+        limits: ScanLimits,
+    ) -> impl Future<Output = Result<Vec<ScanPage>>> + Send {
+        // One batched call is one backend interaction regardless of range
+        // count, so it charges one scan; returned items still charge fully.
+        add(&self.counters.scans, 1);
+        async move {
+            let pages = self.inner.batch_scan(ranges, limits).await?;
+            for page in &pages {
+                self.counters.scan_result(page);
+            }
+            Ok(pages)
+        }
+    }
 }
 
 impl<T: ReadTxn> ReadTxn for MeasuredReadTxn<T> {}
@@ -288,6 +305,23 @@ impl<T: WriteTxn> ReadOps for MeasuredWriteTxn<T> {
             let result = self.inner.scan(range, limits).await?;
             self.counters.scan_result(&result);
             Ok(result)
+        }
+    }
+
+    fn batch_scan(
+        &mut self,
+        ranges: &[KeyRange],
+        limits: ScanLimits,
+    ) -> impl Future<Output = Result<Vec<ScanPage>>> + Send {
+        // One batched call is one backend interaction regardless of range
+        // count, so it charges one scan; returned items still charge fully.
+        add(&self.counters.scans, 1);
+        async move {
+            let pages = self.inner.batch_scan(ranges, limits).await?;
+            for page in &pages {
+                self.counters.scan_result(page);
+            }
+            Ok(pages)
         }
     }
 }

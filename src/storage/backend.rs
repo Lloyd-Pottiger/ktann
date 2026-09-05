@@ -34,8 +34,8 @@
 //!
 //! Every operation takes `&mut self`, serializing access within one
 //! transaction; deliberate parallelism is expressed only through the batch
-//! primitives ([`ReadOps::batch_get`], [`WriteTxn::batch_get_for_update`], and
-//! [`WriteTxn::batch_mutate`]).
+//! primitives ([`ReadOps::batch_get`], [`ReadOps::batch_scan`],
+//! [`WriteTxn::batch_get_for_update`], and [`WriteTxn::batch_mutate`]).
 
 use std::fmt;
 use std::future::Future;
@@ -390,6 +390,26 @@ pub trait ReadOps: Send {
         range: &KeyRange,
         limits: ScanLimits,
     ) -> impl Future<Output = Result<ScanPage>> + Send;
+
+    /// Scans one bounded page from each range, preserving input order.
+    ///
+    /// The result has exactly one page per input range. Every range is read
+    /// independently under the identical per-range contract as
+    /// [`ReadOps::scan`]: the same non-zero `limits` bound each page, an empty
+    /// or inverted range yields a terminal empty page at its position, and a
+    /// non-terminal page resumes with its `next_start` and original end bound.
+    /// An empty input succeeds with an empty result. Ranges need not be
+    /// disjoint; each is read from the same snapshot regardless of the others.
+    ///
+    /// This is the deliberate-parallelism primitive for scanning many ranges
+    /// of one snapshot: a backend serves the whole batch in one interaction
+    /// rather than one serialized round trip per range, subject to its own
+    /// batch ceiling.
+    fn batch_scan(
+        &mut self,
+        ranges: &[KeyRange],
+        limits: ScanLimits,
+    ) -> impl Future<Output = Result<Vec<ScanPage>>> + Send;
 }
 
 /// A read transaction opened by [`Backend::begin_read`].

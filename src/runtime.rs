@@ -835,6 +835,14 @@ mod tests {
         ) -> impl Future<Output = Result<ScanPage>> + Send {
             backend_error()
         }
+
+        fn batch_scan(
+            &mut self,
+            _ranges: &[KeyRange],
+            _limits: ScanLimits,
+        ) -> impl Future<Output = Result<Vec<ScanPage>>> + Send {
+            backend_error()
+        }
     }
 
     impl ReadTxn for TestTxn {}

@@ -334,6 +334,109 @@ async fn partition_scans_decode_mixed_families_and_page_without_read_ahead() {
 }
 
 #[tokio::test]
+async fn batched_typed_scans_paginate_each_leg_independently() {
+    let backend = DeterministicBackend::default();
+    let manifest = manifest();
+    let tree_key = tree_key();
+    let limits = backend.hard_limits();
+    let budget = backend.admission_budget();
+    let raw = backend.begin_write().await.expect("begin write");
+    let mut txn =
+        WriteLogicalTxn::for_index(raw, &manifest, limits, budget).expect("bind manifest");
+    let mut mutations = txn.mutations();
+    for (partition, record_ids) in [(pk(1), ["a", "b", "c"]), (pk(2), ["x", "y", "z"])] {
+        for record_id in record_ids {
+            mutations
+                .put(
+                    LogicalKey::LeafEntry {
+                        index: id(7),
+                        tree_key: tree_key.clone(),
+                        partition,
+                        id: Bytes::copy_from_slice(record_id.as_bytes()),
+                    },
+                    PersistentValue::LeafEntry(LeafEntry::new(
+                        Bytes::copy_from_slice(record_id.as_bytes()),
+                        Vec::<Value>::new(),
+                        Bytes::from_static(&[0; 14]),
+                    )),
+                )
+                .expect("queue Leaf Entry");
+        }
+    }
+    txn.apply(mutations).await.expect("apply mutations");
+    txn.commit().await.expect("commit");
+
+    let range_a = LogicalRange::leaf_entries(&manifest, &tree_key, pk(1)).expect("range a");
+    let range_b = LogicalRange::leaf_entries(&manifest, &tree_key, pk(2)).expect("range b");
+    let raw = backend.begin_read().await.expect("begin read");
+    let mut txn = ReadLogicalTxn::for_index(raw, &manifest).expect("bind manifest");
+    let limits = ScanLimits {
+        item_limit: 2,
+        byte_limit: usize::MAX,
+    };
+
+    // An empty batch succeeds with an empty result.
+    assert!(
+        txn.batch_scan(&[], limits)
+            .await
+            .expect("empty batch scan")
+            .is_empty()
+    );
+
+    // Each leg paginates independently at the shared item limit.
+    let pages = txn
+        .batch_scan(&[(&range_a, None), (&range_b, None)], limits)
+        .await
+        .expect("first batched scan");
+    assert_eq!(pages.len(), 2);
+    let mut cursors = Vec::new();
+    for page in &pages {
+        assert_eq!(page.items().len(), 2);
+        assert!(
+            page.items()
+                .iter()
+                .all(|item| item.value().kind() == ValueKind::LeafEntry)
+        );
+        cursors.push(Some(page.next_cursor().expect("page continues").clone()));
+    }
+
+    // Resuming both legs in one later call exhausts them without gaps or
+    // repeats.
+    let pages = txn
+        .batch_scan(
+            &[
+                (&range_a, cursors[0].as_ref()),
+                (&range_b, cursors[1].as_ref()),
+            ],
+            limits,
+        )
+        .await
+        .expect("resumed batched scan");
+    assert_eq!(pages.len(), 2);
+    let ids: Vec<Bytes> = pages
+        .iter()
+        .flat_map(|page| {
+            page.items().iter().map(|item| match item.key() {
+                LogicalKey::LeafEntry { id, .. } => id.clone(),
+                _ => panic!("unexpected key kind in Leaf Entry range"),
+            })
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        vec![Bytes::from_static(b"c"), Bytes::from_static(b"z")]
+    );
+    assert!(pages.iter().all(|page| page.next_cursor().is_none()));
+
+    // A cursor is bound to its exact range; mixing legs is rejected.
+    let error = txn
+        .batch_scan(&[(&range_b, cursors[0].as_ref())], limits)
+        .await
+        .expect_err("cursor bound to another range");
+    assert_eq!(error.kind(), ErrorKind::InvalidArgument);
+}
+
+#[tokio::test]
 async fn reads_and_scans_fail_closed_on_key_value_identity_mismatch() {
     let backend = DeterministicBackend::default();
     let manifest = manifest();
