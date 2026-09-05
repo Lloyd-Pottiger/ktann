@@ -3,49 +3,21 @@
 use std::collections::{BTreeMap, BTreeSet, btree_map};
 
 use bytes::Bytes;
-use ktann::api::{
-    DataType, ErrorKind, FieldId, FieldSchema, IndexConfig, LogicalIndexId, Metric, PartitionKey,
-    Value,
-};
+use ktann::api::{ErrorKind, PartitionKey, Value};
 use ktann::storage::backend::{Backend, ScanLimits};
 use ktann::storage::keys::{LogicalKey, TreeKey};
 use ktann::storage::membership::{self, DeleteOutcome};
 use ktann::storage::values::{
-    ChildEntry, IndexLifecycle, IndexManifest, LeafEntry, OpaquePayload, PartitionHeader,
-    PartitionState, PartitionSynopsis, PersistentValue, RecordLocation, VectorRecord,
+    ChildEntry, IndexManifest, LeafEntry, OpaquePayload, PartitionHeader, PartitionState,
+    PartitionSynopsis, PersistentValue, RecordLocation, VectorRecord,
 };
-use ktann::storage::{
-    LogicalRange, ReadLogicalTxn, RecordGroupRead, WriteLogicalTxn, tree_manifest,
-};
+use ktann::storage::{LogicalRange, RecordGroupRead, WriteLogicalTxn};
 
+use support::builders::{create_committed_tree, id, manifest, pk, read_txn, tree_key, write_txn};
 use support::{CommitFault, CommitOutcome, DeterministicBackend, Rng};
 
 #[allow(dead_code)]
 mod support;
-
-fn id(value: u64) -> LogicalIndexId {
-    LogicalIndexId::new(value).expect("test Logical Index ID is nonzero")
-}
-
-fn pk(value: u64) -> PartitionKey {
-    PartitionKey::new(value).expect("test Partition Key is nonzero")
-}
-
-/// A one-dimensional L2 index with one I64 field that is also the Tree Key.
-fn manifest() -> IndexManifest {
-    let config = IndexConfig::new(1, Metric::L2)
-        .expect("valid config")
-        .with_fields(vec![FieldSchema::new("a", DataType::I64).expect("field")])
-        .expect("valid fields")
-        .with_tree_key_fields(vec![FieldId(0)])
-        .expect("valid tree key fields");
-    IndexManifest::new(IndexLifecycle::Active, id(7), config, [7; 32], vec![None])
-        .expect("valid manifest")
-}
-
-fn tree_key(value: i64) -> TreeKey {
-    TreeKey::encode(&[DataType::I64], &[Value::I64(value)]).expect("canonical key")
-}
 
 fn rid(value: u8) -> Bytes {
     Bytes::copy_from_slice(&[b'r', value])
@@ -77,41 +49,11 @@ fn payload(tag: &'static [u8]) -> OpaquePayload {
     OpaquePayload::new(Bytes::from_static(tag)).expect("bounded payload")
 }
 
-async fn write_txn<'b, 'm>(
-    backend: &'b DeterministicBackend,
-    manifest: &'m IndexManifest,
-) -> WriteLogicalTxn<'m, <DeterministicBackend as Backend>::WriteTxn<'b>> {
-    let raw = backend.begin_write().await.expect("begin write");
-    WriteLogicalTxn::for_index(
-        raw,
-        manifest,
-        backend.hard_limits(),
-        backend.admission_budget(),
-    )
-    .expect("bind manifest")
-}
-
-async fn read_txn<'b, 'm>(
-    backend: &'b DeterministicBackend,
-    manifest: &'m IndexManifest,
-) -> ReadLogicalTxn<'m, <DeterministicBackend as Backend>::ReadTxn<'b>> {
-    let raw = backend.begin_read().await.expect("begin read");
-    ReadLogicalTxn::for_index(raw, manifest).expect("bind manifest")
-}
-
-async fn create_tree(backend: &DeterministicBackend, manifest: &IndexManifest, key: &TreeKey) {
-    let mut txn = write_txn(backend, manifest).await;
-    tree_manifest::create_tree(&mut txn, key, 0)
-        .await
-        .expect("create tree");
-    txn.commit().await.expect("commit tree");
-}
-
 /// Seeds the grown root shape: internal root PK 1 at level 2 with leaf
 /// children PK 2 (centroid 0.0) and PK 3 (centroid 10.0), each with its Header
 /// and empty Synopsis installed.
 async fn seed_grown_root(backend: &DeterministicBackend, manifest: &IndexManifest, key: &TreeKey) {
-    create_tree(backend, manifest, key).await;
+    create_committed_tree(backend, manifest, key).await;
     let mut txn = write_txn(backend, manifest).await;
     let header_key = |partition| LogicalKey::Header {
         index: id(7),
@@ -287,7 +229,7 @@ async fn insert_commits_the_complete_record_group() {
     let backend = DeterministicBackend::default();
     let manifest = manifest();
     let key = tree_key(1);
-    create_tree(&backend, &manifest, &key).await;
+    create_committed_tree(&backend, &manifest, &key).await;
 
     let target = location(&key, 1);
     insert_committed(
@@ -328,7 +270,7 @@ async fn duplicate_insert_is_record_already_exists_and_changes_nothing() {
     let backend = DeterministicBackend::default();
     let manifest = manifest();
     let key = tree_key(1);
-    create_tree(&backend, &manifest, &key).await;
+    create_committed_tree(&backend, &manifest, &key).await;
     let target = location(&key, 1);
     insert_committed(
         &backend,
@@ -373,7 +315,7 @@ async fn same_leaf_replace_rewrites_entry_payload_and_epoch() {
     let backend = DeterministicBackend::default();
     let manifest = manifest();
     let key = tree_key(1);
-    create_tree(&backend, &manifest, &key).await;
+    create_committed_tree(&backend, &manifest, &key).await;
     let target = location(&key, 1);
     insert_committed(
         &backend,
@@ -525,7 +467,7 @@ async fn cross_leaf_and_cross_tree_moves_retarget_membership_and_counts() {
     // A cross-tree move carries a second record from the first tree's PK 2
     // leaf (now empty) into the second tree's root.
     let other = tree_key(2);
-    create_tree(&backend, &manifest, &other).await;
+    create_committed_tree(&backend, &manifest, &other).await;
     let other_target = location(&other, 1);
     insert_committed(
         &backend,
@@ -601,7 +543,7 @@ async fn delete_removes_the_whole_group_and_is_idempotent() {
     let backend = DeterministicBackend::default();
     let manifest = manifest();
     let key = tree_key(1);
-    create_tree(&backend, &manifest, &key).await;
+    create_committed_tree(&backend, &manifest, &key).await;
     let target = location(&key, 1);
     insert_committed(
         &backend,
@@ -709,7 +651,7 @@ async fn rollback_discards_the_whole_mutation() {
     let backend = DeterministicBackend::default();
     let manifest = manifest();
     let key = tree_key(1);
-    create_tree(&backend, &manifest, &key).await;
+    create_committed_tree(&backend, &manifest, &key).await;
 
     let mut txn = write_txn(&backend, &manifest).await;
     let mut deferred = txn.mutations();
@@ -737,7 +679,7 @@ async fn concurrent_leaf_mutations_conflict_and_retry_cleanly() {
     let backend = DeterministicBackend::default();
     let manifest = manifest();
     let key = tree_key(1);
-    create_tree(&backend, &manifest, &key).await;
+    create_committed_tree(&backend, &manifest, &key).await;
     let target = location(&key, 1);
 
     // Both transactions update-protect the same leaf Header.
@@ -810,7 +752,7 @@ async fn unknown_commit_outcomes_surface_and_preserve_membership() {
     let backend = DeterministicBackend::default();
     let manifest = manifest();
     let key = tree_key(1);
-    create_tree(&backend, &manifest, &key).await;
+    create_committed_tree(&backend, &manifest, &key).await;
     let target = location(&key, 1);
 
     // Unknown-applied: the mutation lands but the outcome is unknown.
@@ -889,7 +831,7 @@ async fn invalid_caller_input_is_rejected_before_any_write() {
     let backend = DeterministicBackend::default();
     let manifest = manifest();
     let key = tree_key(1);
-    create_tree(&backend, &manifest, &key).await;
+    create_committed_tree(&backend, &manifest, &key).await;
     let target = location(&key, 1);
 
     // Record and Leaf Entry identities must agree.
@@ -996,7 +938,7 @@ async fn a_target_that_no_longer_accepts_writes_is_corruption() {
     let backend = DeterministicBackend::default();
     let manifest = manifest();
     let key = tree_key(1);
-    create_tree(&backend, &manifest, &key).await;
+    create_committed_tree(&backend, &manifest, &key).await;
 
     // A Merging leaf is stale topology for a foreground write target.
     let mut txn = write_txn(&backend, &manifest).await;
@@ -1094,7 +1036,7 @@ async fn membership_matches_a_seeded_model() {
         let first = tree_key(1);
         let second = tree_key(2);
         seed_grown_root(&backend, &manifest, &first).await;
-        create_tree(&backend, &manifest, &second).await;
+        create_committed_tree(&backend, &manifest, &second).await;
         let leaves = [(first.clone(), 2), (first, 3), (second, 1)];
         let mut model: BTreeMap<u8, (i64, RecordLocation)> = BTreeMap::new();
         let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
