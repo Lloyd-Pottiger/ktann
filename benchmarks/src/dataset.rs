@@ -237,26 +237,6 @@ fn update_vector(hasher: &mut Xxh3, vector: &[f32]) {
     }
 }
 
-/// Replayable xorshift64 generator required by the shared corpus generator.
-struct Rng(u64);
-
-impl Rng {
-    /// Returns the next pseudo-random word.
-    fn next(&mut self) -> u64 {
-        let mut value = self.0;
-        value ^= value << 13;
-        value ^= value >> 7;
-        value ^= value << 17;
-        self.0 = value;
-        value
-    }
-
-    /// Returns a deterministic word modulo the generator's positive bound.
-    fn below(&mut self, bound: u64) -> u64 {
-        self.next() % bound
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::load;

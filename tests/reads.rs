@@ -11,11 +11,12 @@ use ktann::storage::WriteLogicalTxn;
 use ktann::storage::backend::{Backend, HardLimits, WriteTxn};
 use ktann::storage::keys::{self, TreeKey};
 use ktann::storage::values::{
-    IndexIdAllocator, IndexLifecycle, IndexManifest, IndexNameEntry, OpaquePayload,
-    PersistentValue, RecordLocation, ValueCodec, VectorRecord,
+    IndexLifecycle, IndexManifest, OpaquePayload, PersistentValue, RecordLocation, ValueCodec,
+    VectorRecord,
 };
 use tokio_util::sync::CancellationToken;
 
+use support::builders::seed_named_index;
 use support::{DeterministicBackend, DeterministicConfig, SharedBackend};
 
 #[allow(dead_code)]
@@ -67,38 +68,6 @@ fn name(value: &str) -> IndexName {
 
 fn tree_key(bucket: i64) -> TreeKey {
     TreeKey::encode(&[DataType::I64], &[Value::I64(bucket)]).expect("valid tree key")
-}
-
-async fn seed_named_index(
-    backend: &SharedBackend,
-    index_name: &IndexName,
-    logical_index_id: LogicalIndexId,
-    lifecycle: IndexLifecycle,
-) -> IndexManifest {
-    let manifest = IndexManifest::new(lifecycle, logical_index_id, config(), [3; 32], vec![None])
-        .expect("valid manifest");
-    for (key, value) in [
-        (
-            keys::LogicalKey::IndexIdAllocator,
-            PersistentValue::IndexIdAllocator(IndexIdAllocator::new(logical_index_id.get())),
-        ),
-        (
-            keys::LogicalKey::IndexNameDirectory(index_name.clone()),
-            PersistentValue::IndexNameEntry(IndexNameEntry::new(logical_index_id)),
-        ),
-        (
-            keys::LogicalKey::Manifest(logical_index_id),
-            PersistentValue::IndexManifest(manifest.clone()),
-        ),
-    ] {
-        let raw = backend.begin_write().await.expect("begin write");
-        let limits = backend.hard_limits();
-        let budget = backend.admission_budget();
-        let mut txn = WriteLogicalTxn::bootstrap(raw, limits, budget);
-        txn.put(key, value).await.expect("put lifecycle value");
-        txn.commit().await.expect("commit lifecycle value");
-    }
-    manifest
 }
 
 async fn seed_record(
@@ -184,7 +153,14 @@ struct Fixture {
 }
 
 async fn fixture(shared: SharedBackend) -> Fixture {
-    let manifest = seed_named_index(&shared, &name("docs"), id(1), IndexLifecycle::Active).await;
+    let manifest = seed_named_index(
+        &shared,
+        &name("docs"),
+        id(1),
+        IndexLifecycle::Active,
+        config(),
+    )
+    .await;
     seed_record(
         &shared,
         &manifest,
@@ -352,7 +328,14 @@ async fn batch_get_decodes_mixed_tree_keys() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reads_use_one_consistent_backend_snapshot() {
     let shared = backend(DeterministicConfig::default());
-    let manifest = seed_named_index(&shared, &name("docs"), id(1), IndexLifecycle::Active).await;
+    let manifest = seed_named_index(
+        &shared,
+        &name("docs"),
+        id(1),
+        IndexLifecycle::Active,
+        config(),
+    )
+    .await;
     seed_record(&shared, &manifest, b"alpha", vec![1.0_f32, 2.0], 1, None).await;
     let runtime = make_runtime(shared.clone());
     let index = runtime.open_index("docs").await.expect("open index");
@@ -416,7 +399,14 @@ async fn reads_use_one_consistent_backend_snapshot() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropping_manifest_fails_reads_closed() {
     let shared = backend(DeterministicConfig::default());
-    let manifest = seed_named_index(&shared, &name("docs"), id(1), IndexLifecycle::Active).await;
+    let manifest = seed_named_index(
+        &shared,
+        &name("docs"),
+        id(1),
+        IndexLifecycle::Active,
+        config(),
+    )
+    .await;
     seed_record(&shared, &manifest, b"alpha", vec![1.0_f32, 2.0], 1, None).await;
     let runtime = make_runtime(shared.clone());
     let index = runtime.open_index("docs").await.expect("open index");
@@ -446,7 +436,14 @@ async fn dropping_manifest_fails_reads_closed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropped_index_fails_reads_closed() {
     let shared = backend(DeterministicConfig::default());
-    let manifest = seed_named_index(&shared, &name("docs"), id(1), IndexLifecycle::Active).await;
+    let manifest = seed_named_index(
+        &shared,
+        &name("docs"),
+        id(1),
+        IndexLifecycle::Active,
+        config(),
+    )
+    .await;
     seed_record(&shared, &manifest, b"alpha", vec![1.0_f32, 2.0], 1, None).await;
     let runtime = make_runtime(shared.clone());
     let index = runtime.open_index("docs").await.expect("open index");
@@ -470,7 +467,14 @@ async fn dropped_index_fails_reads_closed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unsupported_manifest_format_fails_reads_closed() {
     let shared = backend(DeterministicConfig::default());
-    let manifest = seed_named_index(&shared, &name("docs"), id(1), IndexLifecycle::Active).await;
+    let manifest = seed_named_index(
+        &shared,
+        &name("docs"),
+        id(1),
+        IndexLifecycle::Active,
+        config(),
+    )
+    .await;
     seed_record(&shared, &manifest, b"alpha", vec![1.0_f32, 2.0], 1, None).await;
     let runtime = make_runtime(shared.clone());
     let index = runtime.open_index("docs").await.expect("open index");
@@ -499,7 +503,14 @@ async fn unsupported_manifest_format_fails_reads_closed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manifest_identity_mismatch_is_corruption() {
     let shared = backend(DeterministicConfig::default());
-    let manifest = seed_named_index(&shared, &name("docs"), id(1), IndexLifecycle::Active).await;
+    let manifest = seed_named_index(
+        &shared,
+        &name("docs"),
+        id(1),
+        IndexLifecycle::Active,
+        config(),
+    )
+    .await;
     seed_record(&shared, &manifest, b"alpha", vec![1.0_f32, 2.0], 1, None).await;
     let runtime = make_runtime(shared.clone());
     let index = runtime.open_index("docs").await.expect("open index");
@@ -534,7 +545,14 @@ async fn manifest_identity_mismatch_is_corruption() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn partial_record_groups_are_corruption() {
     let shared = backend(DeterministicConfig::default());
-    let manifest = seed_named_index(&shared, &name("docs"), id(1), IndexLifecycle::Active).await;
+    let manifest = seed_named_index(
+        &shared,
+        &name("docs"),
+        id(1),
+        IndexLifecycle::Active,
+        config(),
+    )
+    .await;
     let runtime = make_runtime(shared.clone());
     let index = runtime.open_index("docs").await.expect("open index");
 
@@ -627,7 +645,14 @@ async fn partial_record_groups_are_corruption() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn record_key_value_identity_mismatch_is_corruption() {
     let shared = backend(DeterministicConfig::default());
-    let manifest = seed_named_index(&shared, &name("docs"), id(1), IndexLifecycle::Active).await;
+    let manifest = seed_named_index(
+        &shared,
+        &name("docs"),
+        id(1),
+        IndexLifecycle::Active,
+        config(),
+    )
+    .await;
     let runtime = make_runtime(shared.clone());
     let index = runtime.open_index("docs").await.expect("open index");
 
@@ -694,7 +719,14 @@ async fn batch_reads_enforce_backend_batch_and_key_limits() {
     // The backend caps one batch_get at six keys: two IDs with payloads fit
     // exactly, three IDs with payloads exceed the cap.
     let shared = backend(batch_config(6));
-    let manifest = seed_named_index(&shared, &name("docs"), id(1), IndexLifecycle::Active).await;
+    let manifest = seed_named_index(
+        &shared,
+        &name("docs"),
+        id(1),
+        IndexLifecycle::Active,
+        config(),
+    )
+    .await;
     for (record_id, bucket) in [("a", 1), ("b", 2), ("c", 3)] {
         seed_record(
             &shared,
@@ -737,7 +769,14 @@ async fn batch_reads_enforce_backend_batch_and_key_limits() {
     // Encoded keys that exceed the backend key ceiling fail with
     // LimitExceeded before any value is read.
     let shared = backend(key_limit_config(16));
-    let manifest = seed_named_index(&shared, &name("docs"), id(1), IndexLifecycle::Active).await;
+    let manifest = seed_named_index(
+        &shared,
+        &name("docs"),
+        id(1),
+        IndexLifecycle::Active,
+        config(),
+    )
+    .await;
     seed_record(&shared, &manifest, b"abc", vec![1.0_f32, 2.0], 1, None).await;
     let runtime = make_runtime(shared);
     let index = runtime.open_index("docs").await.expect("open index");

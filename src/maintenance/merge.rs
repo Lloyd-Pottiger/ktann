@@ -156,10 +156,8 @@ pub async fn drain_batch<B: Backend>(
         // The read phase fixes the batch and the candidate set from one
         // consistent snapshot; one batched read covers both source authority
         // values.
-        let mut read = reads::open_validated_read(backend, manifest).await?;
-        let pair =
-            topology::read_authority_pair(&mut read, manifest.logical_index_id(), tree_key, source)
-                .await?;
+        let (mut read, pair) =
+            reads::open_authority_read(backend, manifest, tree_key, source).await?;
         let Some((source_header, state)) = pair else {
             // A completed merge removed both authority values.
             return Ok(DrainStep::SourceAdvanced);
@@ -268,10 +266,7 @@ pub async fn advance<B: Backend>(
     started_at_unix_millis: u64,
     retry: &RetryPolicy,
 ) -> Result<Advance> {
-    let mut read = reads::open_validated_read(backend, manifest).await?;
-    let pair =
-        topology::read_authority_pair(&mut read, manifest.logical_index_id(), tree_key, partition)
-            .await?;
+    let (read, pair) = reads::open_authority_read(backend, manifest, tree_key, partition).await?;
     drop(read);
     // Nothing was ever persisted here, or a completed merge already removed
     // every value: nothing to advance.

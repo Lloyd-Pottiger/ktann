@@ -59,10 +59,7 @@ pub(crate) async fn advance<B: Backend>(
     started_at_unix_millis: u64,
     retry: &RetryPolicy,
 ) -> Result<Advance> {
-    let mut read = reads::open_validated_read(backend, manifest).await?;
-    let pair =
-        topology::read_authority_pair(&mut read, manifest.logical_index_id(), tree_key, partition)
-            .await?;
+    let (read, pair) = reads::open_authority_read(backend, manifest, tree_key, partition).await?;
     drop(read);
     let Some(authority) = pair else {
         return Ok(Advance::Idle);

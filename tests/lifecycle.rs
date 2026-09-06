@@ -10,11 +10,11 @@ use ktann::api::{
 use ktann::storage::backend::{AdmissionBudget, Backend, Capabilities, WriteTxn};
 use ktann::storage::keys;
 use ktann::storage::values::{
-    IndexIdAllocator, IndexLifecycle, IndexManifest, IndexNameEntry, PersistentValue, ValueCodec,
-    VectorRecord,
+    IndexIdAllocator, IndexLifecycle, IndexManifest, PersistentValue, ValueCodec, VectorRecord,
 };
 use ktann::storage::{ReadLogicalTxn, WriteLogicalTxn};
 
+use support::builders::seed_named_index;
 use support::{
     CommitFault, CommitOutcome, DeterministicBackend, DeterministicConfig, Durability,
     SharedBackend,
@@ -135,38 +135,6 @@ async fn seed_allocator(backend: &SharedBackend, high_water: u64) {
     .await
     .expect("put allocator");
     txn.commit().await.expect("commit allocator");
-}
-
-async fn seed_named_index(
-    backend: &SharedBackend,
-    name: &IndexName,
-    logical_index_id: LogicalIndexId,
-    lifecycle: IndexLifecycle,
-) -> IndexManifest {
-    let manifest = IndexManifest::new(lifecycle, logical_index_id, config(), [3; 32], vec![None])
-        .expect("valid manifest");
-    for (key, value) in [
-        (
-            keys::LogicalKey::IndexIdAllocator,
-            PersistentValue::IndexIdAllocator(IndexIdAllocator::new(logical_index_id.get())),
-        ),
-        (
-            keys::LogicalKey::IndexNameDirectory(name.clone()),
-            PersistentValue::IndexNameEntry(IndexNameEntry::new(logical_index_id)),
-        ),
-        (
-            keys::LogicalKey::Manifest(logical_index_id),
-            PersistentValue::IndexManifest(manifest.clone()),
-        ),
-    ] {
-        let raw = backend.begin_write().await.expect("begin write");
-        let limits = backend.hard_limits();
-        let budget = backend.admission_budget();
-        let mut txn = WriteLogicalTxn::bootstrap(raw, limits, budget);
-        txn.put(key, value).await.expect("put lifecycle value");
-        txn.commit().await.expect("commit lifecycle value");
-    }
-    manifest
 }
 
 async fn seed_index_owned_keys(backend: &SharedBackend, manifest: &IndexManifest, count: usize) {
@@ -390,7 +358,14 @@ async fn unknown_applied_create_reports_a_later_conflicting_config() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropping_manifest_fails_open_and_create_closed_until_drop_completes() {
     let shared = backend(no_clear_config());
-    let seeded = seed_named_index(&shared, &name("docs"), id(7), IndexLifecycle::Dropping).await;
+    let seeded = seed_named_index(
+        &shared,
+        &name("docs"),
+        id(7),
+        IndexLifecycle::Dropping,
+        config(),
+    )
+    .await;
     let runtime = make_runtime(shared.clone());
 
     assert_eq!(
@@ -423,7 +398,14 @@ async fn dropping_manifest_fails_open_and_create_closed_until_drop_completes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn clear_range_drop_is_atomic_and_recovers_unknown_outcomes() {
     let shared = backend(clear_config());
-    let seeded = seed_named_index(&shared, &name("docs"), id(5), IndexLifecycle::Dropping).await;
+    let seeded = seed_named_index(
+        &shared,
+        &name("docs"),
+        id(5),
+        IndexLifecycle::Dropping,
+        config(),
+    )
+    .await;
     seed_index_owned_keys(&shared, &seeded, 20).await;
     shared
         .inner()
@@ -449,7 +431,14 @@ async fn clear_range_drop_is_atomic_and_recovers_unknown_outcomes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn point_delete_drop_is_bounded_resumable_and_restarts_after_unknown() {
     let shared = backend(paged_config(3));
-    let seeded = seed_named_index(&shared, &name("docs"), id(9), IndexLifecycle::Dropping).await;
+    let seeded = seed_named_index(
+        &shared,
+        &name("docs"),
+        id(9),
+        IndexLifecycle::Dropping,
+        config(),
+    )
+    .await;
     seed_index_owned_keys(&shared, &seeded, 11).await;
     let seeded_entries = shared.inner().history().len();
     shared
@@ -479,7 +468,14 @@ async fn point_delete_drop_is_bounded_resumable_and_restarts_after_unknown() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drop_recovers_when_the_initial_dropping_mark_was_not_applied() {
     let shared = backend(no_clear_config());
-    seed_named_index(&shared, &name("docs"), id(4), IndexLifecycle::Active).await;
+    seed_named_index(
+        &shared,
+        &name("docs"),
+        id(4),
+        IndexLifecycle::Active,
+        config(),
+    )
+    .await;
     shared
         .inner()
         .set_fault_plan(vec![CommitFault::UnknownNotApplied])
@@ -558,7 +554,14 @@ async fn durable_restart_reopens_created_and_dropped_lifecycle_states() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exhausted_unknown_budget_still_recovers_a_provable_completion() {
     let shared = backend(clear_config());
-    let seeded = seed_named_index(&shared, &name("docs"), id(6), IndexLifecycle::Dropping).await;
+    let seeded = seed_named_index(
+        &shared,
+        &name("docs"),
+        id(6),
+        IndexLifecycle::Dropping,
+        config(),
+    )
+    .await;
     seed_index_owned_keys(&shared, &seeded, 5).await;
     shared
         .inner()
@@ -583,7 +586,14 @@ async fn exhausted_unknown_budget_still_recovers_a_provable_completion() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exhausted_unknown_budget_returns_unknown_when_drop_is_incomplete() {
     let shared = backend(no_clear_config());
-    seed_named_index(&shared, &name("docs"), id(4), IndexLifecycle::Active).await;
+    seed_named_index(
+        &shared,
+        &name("docs"),
+        id(4),
+        IndexLifecycle::Active,
+        config(),
+    )
+    .await;
     shared
         .inner()
         .set_fault_plan(vec![CommitFault::UnknownNotApplied])
@@ -657,7 +667,14 @@ async fn create_open_and_drop_accept_tree_keys_and_bloom_synopses() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn point_delete_drop_resumes_from_prefix_after_restart() {
     let shared = backend(paged_config(3));
-    let seeded = seed_named_index(&shared, &name("docs"), id(11), IndexLifecycle::Dropping).await;
+    let seeded = seed_named_index(
+        &shared,
+        &name("docs"),
+        id(11),
+        IndexLifecycle::Dropping,
+        config(),
+    )
+    .await;
     seed_index_owned_keys(&shared, &seeded, 9).await;
     shared
         .inner()
@@ -701,7 +718,14 @@ async fn point_delete_drop_resumes_from_prefix_after_restart() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drop_recovers_when_the_initial_dropping_mark_was_applied() {
     let shared = backend(no_clear_config());
-    seed_named_index(&shared, &name("docs"), id(8), IndexLifecycle::Active).await;
+    seed_named_index(
+        &shared,
+        &name("docs"),
+        id(8),
+        IndexLifecycle::Active,
+        config(),
+    )
+    .await;
     shared
         .inner()
         .set_fault_plan(vec![CommitFault::UnknownApplied])

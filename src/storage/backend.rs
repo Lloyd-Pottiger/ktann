@@ -47,6 +47,47 @@ use bytes::Bytes;
 use crate::api::{Error, ErrorKind, Result};
 use crate::storage::keys::{self, KeyRange};
 
+/// The maximum length of a [`BackendNamespace`] in bytes.
+const MAX_BACKEND_NAMESPACE_BYTES: usize = u8::MAX as usize;
+
+/// A caller-selected storage scope for KTANN Logical Indexes.
+///
+/// Within a Backend Namespace, Index Names are unique and Logical Index IDs
+/// are allocated. Namespace bytes are opaque and may be empty. Every adapter
+/// length-delimits them in its physical key prefix, so distinct values always
+/// select disjoint key ranges. `Debug` redacts the bytes because callers may
+/// treat them as sensitive deployment metadata.
+#[derive(Clone, Eq, PartialEq)]
+pub struct BackendNamespace(Bytes);
+
+impl BackendNamespace {
+    /// Constructs a Backend Namespace from at most 255 opaque bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidArgument`] when the namespace is longer
+    /// than 255 bytes.
+    pub fn new(bytes: impl AsRef<[u8]>) -> Result<Self> {
+        let bytes = bytes.as_ref();
+        if bytes.len() > MAX_BACKEND_NAMESPACE_BYTES {
+            return Err(Error::new(ErrorKind::InvalidArgument));
+        }
+        Ok(Self(Bytes::copy_from_slice(bytes)))
+    }
+
+    /// Returns the opaque namespace bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for BackendNamespace {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("BackendNamespace([REDACTED])")
+    }
+}
+
 /// Stable physical ceilings that a backend declares as storage-engine facts.
 ///
 /// These are the backend's hard limits on encoded keys and values. They are
@@ -588,5 +629,17 @@ mod tests {
     fn empty_non_terminal_page_is_rejected() {
         let error = ScanPage::continued(Vec::new(), 1024).expect_err("empty continued page");
         assert_eq!(error.kind(), ErrorKind::Backend);
+    }
+
+    #[test]
+    fn namespace_is_bounded_and_debug_is_redacted() {
+        let namespace = BackendNamespace::new(Bytes::from_static(b"secret")).expect("namespace");
+        assert_eq!(format!("{namespace:?}"), "BackendNamespace([REDACTED])");
+        assert_eq!(
+            BackendNamespace::new(vec![0; MAX_BACKEND_NAMESPACE_BYTES + 1])
+                .expect_err("oversized")
+                .kind(),
+            ErrorKind::InvalidArgument,
+        );
     }
 }

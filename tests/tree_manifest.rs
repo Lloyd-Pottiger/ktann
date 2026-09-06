@@ -3,70 +3,23 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use ktann::api::{
-    DataType, ErrorKind, FieldId, FieldSchema, IndexConfig, LogicalIndexId, Metric, PartitionKey,
-    Value,
-};
+use ktann::api::ErrorKind;
+use ktann::storage::LogicalRange;
 use ktann::storage::backend::{Backend, ScanLimits, WriteTxn};
 use ktann::storage::keys::{self, LogicalKey, TreeKey};
 use ktann::storage::tree_manifest::{
     self, DEFAULT_PARTITION_KEY_RESERVATION, PartitionKeyReservation, TreeCreation,
 };
 use ktann::storage::values::{
-    IndexLifecycle, IndexManifest, PartitionHeader, PartitionState, PartitionSynopsis,
-    PartitionTransition, PersistentValue, TreeManifest,
+    IndexManifest, PartitionHeader, PartitionState, PartitionSynopsis, PartitionTransition,
+    PersistentValue, TreeManifest,
 };
-use ktann::storage::{LogicalRange, ReadLogicalTxn, WriteLogicalTxn};
 
 use support::DeterministicBackend;
+use support::builders::{id, manifest, pk, read_txn, tree_key, write_txn};
 
 #[allow(dead_code)]
 mod support;
-
-fn id(value: u64) -> LogicalIndexId {
-    LogicalIndexId::new(value).expect("test Logical Index ID is nonzero")
-}
-
-fn pk(value: u64) -> PartitionKey {
-    PartitionKey::new(value).expect("test Partition Key is nonzero")
-}
-
-fn manifest() -> IndexManifest {
-    let config = IndexConfig::new(1, Metric::L2)
-        .expect("valid config")
-        .with_fields(vec![FieldSchema::new("a", DataType::I64).expect("field")])
-        .expect("valid fields")
-        .with_tree_key_fields(vec![FieldId(0)])
-        .expect("valid tree key fields");
-    IndexManifest::new(IndexLifecycle::Active, id(7), config, [7; 32], vec![None])
-        .expect("valid manifest")
-}
-
-fn tree_key(value: i64) -> TreeKey {
-    TreeKey::encode(&[DataType::I64], &[Value::I64(value)]).expect("canonical key")
-}
-
-async fn write_txn<'b, 'm>(
-    backend: &'b DeterministicBackend,
-    manifest: &'m IndexManifest,
-) -> WriteLogicalTxn<'m, <DeterministicBackend as Backend>::WriteTxn<'b>> {
-    let raw = backend.begin_write().await.expect("begin write");
-    WriteLogicalTxn::for_index(
-        raw,
-        manifest,
-        backend.hard_limits(),
-        backend.admission_budget(),
-    )
-    .expect("bind manifest")
-}
-
-async fn read_txn<'b, 'm>(
-    backend: &'b DeterministicBackend,
-    manifest: &'m IndexManifest,
-) -> ReadLogicalTxn<'m, <DeterministicBackend as Backend>::ReadTxn<'b>> {
-    let raw = backend.begin_read().await.expect("begin read");
-    ReadLogicalTxn::for_index(raw, manifest).expect("bind manifest")
-}
 
 async fn create_tree_on(
     backend: &DeterministicBackend,

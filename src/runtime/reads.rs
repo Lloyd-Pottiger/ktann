@@ -1,4 +1,5 @@
-//! Runtime-owned point and batch Vector Record reads.
+//! Runtime-owned validated reads: point and batch Vector Record reads, plus
+//! the shared Structure Maintenance authority preflight.
 //!
 //! `get` and `batch_get` validate the persisted Index Manifest and read every
 //! requested Record Group from one consistent backend snapshot. Manifest
@@ -12,11 +13,13 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use crate::api::{Error, ErrorKind, PayloadProjection, Result, StoredRecord};
+use crate::api::{Error, ErrorKind, PartitionKey, PayloadProjection, Result, StoredRecord};
 use crate::storage::backend::{Backend, ReadOps, WriteTxn};
-use crate::storage::keys::LogicalKey;
-use crate::storage::values::{IndexLifecycle, IndexManifest, PersistentValue};
-use crate::storage::{ReadLogicalTxn, RecordGroupRead, WriteLogicalTxn};
+use crate::storage::keys::{LogicalKey, TreeKey};
+use crate::storage::values::{
+    IndexLifecycle, IndexManifest, PartitionHeader, PartitionTransition, PersistentValue,
+};
+use crate::storage::{ReadLogicalTxn, RecordGroupRead, WriteLogicalTxn, topology};
 
 use super::OperationContext;
 
@@ -80,6 +83,34 @@ pub(crate) async fn open_validated_read<'b, 'm, B: Backend>(
     let mut txn = ReadLogicalTxn::bootstrap(raw);
     validate_manifest(&mut txn, handle_manifest).await?;
     ReadLogicalTxn::for_index(txn.into_raw(), handle_manifest)
+}
+
+/// Opens one validated read snapshot and reads one partition's authority
+/// pair from it: the shared Structure Maintenance preflight.
+///
+/// The Manifest validation of [`open_validated_read`] runs first, then one
+/// batched plain read covers both authority values, all in the same
+/// consistent snapshot. The transaction stays open so the caller can fix more
+/// of its step — a drain batch, the same-level candidates — from that
+/// snapshot; a caller that needs only the pair drops it immediately.
+pub(crate) async fn open_authority_read<'b, 'm, B: Backend>(
+    backend: &'b B,
+    handle_manifest: &'m IndexManifest,
+    tree_key: &TreeKey,
+    partition: PartitionKey,
+) -> Result<(
+    ReadLogicalTxn<'m, B::ReadTxn<'b>>,
+    Option<(PartitionHeader, PartitionTransition)>,
+)> {
+    let mut txn = open_validated_read(backend, handle_manifest).await?;
+    let pair = topology::read_authority_pair(
+        &mut txn,
+        handle_manifest.logical_index_id(),
+        tree_key,
+        partition,
+    )
+    .await?;
+    Ok((txn, pair))
 }
 
 /// Validates the persisted Manifest of the opened handle, with update

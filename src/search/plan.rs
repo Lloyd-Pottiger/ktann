@@ -952,32 +952,20 @@ fn check_typed(ty: DataType, value: &Value) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-    use std::ops::Bound;
-
-    use bytes::Bytes;
     use proptest::prelude::*;
 
     use crate::api::{
-        CompareOp, DataType, FieldId, FieldSchema, IndexConfig, LogicalIndexId, Metric,
-        PartitionKey, Value,
+        CompareOp, DataType, FieldId, FieldSchema, IndexConfig, LogicalIndexId, Metric, Value,
     };
     use crate::storage::ReadLogicalTxn;
-    use crate::storage::backend::{ReadOps, ScanItem, ScanLimits, ScanPage};
+    use crate::storage::backend::ScanLimits;
     use crate::storage::keys::{self, KeyRange, TreeKey};
+    use crate::storage::test_support::{MockReadTxn, id, pk};
     use crate::storage::values::{
         BloomParameters, IndexLifecycle, IndexManifest, PersistentValue, TreeManifest, ValueCodec,
     };
 
     use super::*;
-
-    fn id(value: u64) -> LogicalIndexId {
-        LogicalIndexId::new(value).expect("test Logical Index ID is nonzero")
-    }
-
-    fn pk(value: u64) -> PartitionKey {
-        PartitionKey::new(value).expect("test Partition Key is nonzero")
-    }
 
     fn test_manifest(fields: Vec<FieldSchema>, tree_fields: Vec<FieldId>) -> IndexManifest {
         let bloom = fields
@@ -1649,80 +1637,6 @@ mod tests {
     }
 
     // --- Enumeration ---
-
-    struct MockReadTxn {
-        data: BTreeMap<Vec<u8>, Vec<u8>>,
-    }
-
-    impl MockReadTxn {
-        fn new(items: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>) -> Self {
-            Self {
-                data: items.into_iter().collect(),
-            }
-        }
-    }
-
-    impl ReadOps for MockReadTxn {
-        async fn get(&mut self, key: Bytes) -> Result<Option<Bytes>> {
-            Ok(self.data.get(key.as_ref()).cloned().map(Bytes::from))
-        }
-
-        async fn batch_get(&mut self, keys: Vec<Bytes>) -> Result<Vec<Option<Bytes>>> {
-            Ok(keys
-                .iter()
-                .map(|key| self.data.get(key.as_ref()).cloned().map(Bytes::from))
-                .collect())
-        }
-
-        async fn scan(&mut self, range: &KeyRange, limits: ScanLimits) -> Result<ScanPage> {
-            if limits.item_limit == 0 || limits.byte_limit == 0 {
-                return Err(Error::invalid_argument());
-            }
-            let mut iter = self
-                .data
-                .range::<[u8], _>((Bound::Included(range.start()), Bound::Excluded(range.end())))
-                .peekable();
-            let mut items = Vec::new();
-            let mut bytes = 0_usize;
-            while let Some((key, value)) = iter.peek() {
-                let size = key.len() + value.len();
-                if items.is_empty() && size > limits.byte_limit {
-                    let (key, value) = iter.next().expect("peeked item exists");
-                    items.push(ScanItem::new(
-                        Bytes::copy_from_slice(key),
-                        Bytes::copy_from_slice(value),
-                    ));
-                    break;
-                }
-                if items.len() >= limits.item_limit || bytes + size > limits.byte_limit {
-                    break;
-                }
-                let (key, value) = iter.next().expect("peeked item exists");
-                items.push(ScanItem::new(
-                    Bytes::copy_from_slice(key),
-                    Bytes::copy_from_slice(value),
-                ));
-                bytes += size;
-            }
-            if iter.peek().is_some() {
-                ScanPage::continued(items, keys::MAX_TREE_KEY_BYTES + 64)
-            } else {
-                Ok(ScanPage::terminal(items))
-            }
-        }
-
-        async fn batch_scan(
-            &mut self,
-            ranges: &[KeyRange],
-            limits: ScanLimits,
-        ) -> Result<Vec<ScanPage>> {
-            let mut pages = Vec::with_capacity(ranges.len());
-            for range in ranges {
-                pages.push(self.scan(range, limits).await?);
-            }
-            Ok(pages)
-        }
-    }
 
     fn directory_item(
         manifest: &IndexManifest,

@@ -2,30 +2,22 @@
 
 use bytes::Bytes;
 use ktann::api::{
-    DataType, ErrorKind, FieldId, FieldSchema, IndexConfig, LogicalIndexId, Metric, PartitionKey,
-    Value,
+    DataType, ErrorKind, FieldId, FieldSchema, IndexConfig, Metric, PartitionKey, Value,
 };
 use ktann::maintenance::training::{SplitCentroids, train_split_centroids};
+use ktann::storage::ReadLogicalTxn;
 use ktann::storage::backend::{Backend, WriteTxn};
 use ktann::storage::keys::{self, LogicalKey, TreeKey};
 use ktann::storage::values::{
     ChildEntry, IndexLifecycle, IndexManifest, LeafEntry, PartitionHeader, PartitionState,
     PersistentValue, VectorRecord,
 };
-use ktann::storage::{ReadLogicalTxn, WriteLogicalTxn, tree_manifest};
 
 use support::DeterministicBackend;
+use support::builders::{create_committed_tree, id, manifest, pk, read_txn, tree_key, write_txn};
 
 #[allow(dead_code)]
 mod support;
-
-fn id(value: u64) -> LogicalIndexId {
-    LogicalIndexId::new(value).expect("test Logical Index ID is nonzero")
-}
-
-fn pk(value: u64) -> PartitionKey {
-    PartitionKey::new(value).expect("test Partition Key is nonzero")
-}
 
 fn config(metric: Metric) -> IndexConfig {
     IndexConfig::new(1, metric)
@@ -34,20 +26,6 @@ fn config(metric: Metric) -> IndexConfig {
         .expect("valid fields")
         .with_tree_key_fields(vec![FieldId(0)])
         .expect("valid tree key fields")
-}
-
-/// A one-dimensional L2 index: rotation is the identity at dimension 1, so
-/// routing-space vectors equal the original vectors and expected centroids are
-/// plain arithmetic means.
-fn manifest() -> IndexManifest {
-    IndexManifest::new(
-        IndexLifecycle::Active,
-        id(7),
-        config(Metric::L2),
-        [7; 32],
-        vec![None],
-    )
-    .expect("valid manifest")
 }
 
 /// A one-dimensional Cosine index: preprocessing normalizes each record to
@@ -64,34 +42,8 @@ fn cosine_manifest() -> IndexManifest {
     .expect("valid manifest")
 }
 
-fn tree_key(value: i64) -> TreeKey {
-    TreeKey::encode(&[DataType::I64], &[Value::I64(value)]).expect("canonical key")
-}
-
 fn rid(value: u8) -> Bytes {
     Bytes::copy_from_slice(&[b'r', value])
-}
-
-async fn write_txn<'b, 'm>(
-    backend: &'b DeterministicBackend,
-    manifest: &'m IndexManifest,
-) -> WriteLogicalTxn<'m, <DeterministicBackend as Backend>::WriteTxn<'b>> {
-    let raw = backend.begin_write().await.expect("begin write");
-    WriteLogicalTxn::for_index(
-        raw,
-        manifest,
-        backend.hard_limits(),
-        backend.admission_budget(),
-    )
-    .expect("bind manifest")
-}
-
-async fn read_txn<'b, 'm>(
-    backend: &'b DeterministicBackend,
-    manifest: &'m IndexManifest,
-) -> ReadLogicalTxn<'m, <DeterministicBackend as Backend>::ReadTxn<'b>> {
-    let raw = backend.begin_read().await.expect("begin read");
-    ReadLogicalTxn::for_index(raw, manifest).expect("bind manifest")
 }
 
 async fn train(
@@ -153,19 +105,6 @@ async fn write_values(
         }
         txn.commit().await.expect("commit");
     }
-}
-
-/// Installs the tree's Tree Manifest and initial leaf root (Partition Key 1).
-async fn create_committed_tree(
-    backend: &DeterministicBackend,
-    manifest: &IndexManifest,
-    key: &TreeKey,
-) {
-    let mut txn = write_txn(backend, manifest).await;
-    tree_manifest::create_tree(&mut txn, key, 0)
-        .await
-        .expect("create tree");
-    txn.commit().await.expect("commit tree");
 }
 
 /// Seeds a leaf source on Partition Key 1: one Vector Record and one Leaf

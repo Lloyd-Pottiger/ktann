@@ -19,51 +19,15 @@ use crate::blocking::{BlockingAdmission, NativeWorker};
 use crate::config::RocksDbConfig;
 use crate::observe;
 
+pub use ktann::storage::backend::BackendNamespace;
+
 const ROCKSDB_MAX_PHYSICAL_KEY_BYTES: usize = u32::MAX as usize;
 const ROCKSDB_MAX_VALUE_BYTES: usize = u32::MAX as usize;
 const DEFAULT_MAX_MUTATIONS: usize = 10_000;
 const DEFAULT_MAX_MUTATION_BYTES: usize = 1 << 20;
 const MAX_SCAN_PAGE_BYTES: usize = 80 << 10;
 const MAX_BATCH_POINT_READS: usize = 1_024;
-const MAX_BACKEND_NAMESPACE_BYTES: usize = u8::MAX as usize;
 const PHYSICAL_PREFIX_HEADER: &[u8] = b"\0ktann-rocksdb\x01";
-
-/// A caller-selected RocksDB storage scope for KTANN Logical Indexes.
-///
-/// Namespace bytes are opaque and may be empty. They are length-delimited in
-/// the physical key prefix, so distinct values always select disjoint key
-/// ranges. `Debug` redacts the bytes because callers may treat them as
-/// sensitive deployment metadata.
-#[derive(Clone, Eq, PartialEq)]
-pub struct BackendNamespace(Bytes);
-
-impl BackendNamespace {
-    /// Constructs a Backend Namespace from at most 255 opaque bytes.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ErrorKind::InvalidArgument`] when the namespace is longer
-    /// than 255 bytes.
-    pub fn new(bytes: impl AsRef<[u8]>) -> Result<Self> {
-        let bytes = bytes.as_ref();
-        if bytes.len() > MAX_BACKEND_NAMESPACE_BYTES {
-            return Err(Error::new(ErrorKind::InvalidArgument));
-        }
-        Ok(Self(Bytes::copy_from_slice(bytes)))
-    }
-
-    /// Returns the opaque namespace bytes.
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl fmt::Debug for BackendNamespace {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("BackendNamespace([REDACTED])")
-    }
-}
 
 #[derive(Clone, Debug)]
 struct PhysicalPrefix {
@@ -77,10 +41,11 @@ struct PhysicalRange {
 
 impl PhysicalPrefix {
     fn new(namespace: &BackendNamespace) -> Self {
-        let mut bytes = Vec::with_capacity(PHYSICAL_PREFIX_HEADER.len() + 1 + namespace.0.len());
+        let namespace = namespace.as_bytes();
+        let mut bytes = Vec::with_capacity(PHYSICAL_PREFIX_HEADER.len() + 1 + namespace.len());
         bytes.extend_from_slice(PHYSICAL_PREFIX_HEADER);
-        bytes.push(namespace.0.len() as u8);
-        bytes.extend_from_slice(&namespace.0);
+        bytes.push(namespace.len() as u8);
+        bytes.extend_from_slice(namespace);
         Self {
             bytes: Bytes::from(bytes),
         }
@@ -977,18 +942,6 @@ mod tests {
         assert_eq!(
             prefix.max_logical_key_bytes() + prefix.bytes.len(),
             ROCKSDB_MAX_PHYSICAL_KEY_BYTES,
-        );
-    }
-
-    #[test]
-    fn namespace_is_bounded_and_debug_is_redacted() {
-        let namespace = BackendNamespace::new(Bytes::from_static(b"secret")).expect("namespace");
-        assert_eq!(format!("{namespace:?}"), "BackendNamespace([REDACTED])");
-        assert_eq!(
-            BackendNamespace::new(vec![0; MAX_BACKEND_NAMESPACE_BYTES + 1])
-                .expect_err("oversized")
-                .kind(),
-            ErrorKind::InvalidArgument,
         );
     }
 
