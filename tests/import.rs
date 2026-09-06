@@ -1267,14 +1267,26 @@ async fn shutdown_releases_gated_submit() {
     seed_cold_overfull(&backend, &index).await;
     let mut session = index.import_session(import_options(2)).expect("session");
 
-    // A batch admitted before the gate closes keeps its real result.
+    // A batch admitted before the gate closes keeps its real result. Its
+    // commit is held at the gate: a committed batch offers the overfull
+    // leaf's Fixup, and the worker could otherwise finish the whole split
+    // before the backlog gate closes.
+    gate.hold_next(1);
     let token1 = session
         .submit(insert(&rid(8), 8.0, 1))
         .await
         .expect("submit 1");
-    wait_until_present(&index, &rid(8)).await;
+    gate.wait_until_entered(1).await;
 
-    hold_gate_closed(&gate, &index, 1).await;
+    // Re-arm the gate before releasing the apply commit, so the worker's
+    // first step commit is held deterministically instead of racing the
+    // gate. The search re-offers in case the batch's offer was lost.
+    gate.hold_next(1);
+    gate.release_one();
+    wait_until_present(&index, &rid(8)).await;
+    reoffer_maintenance(&index).await;
+    gate.wait_until_entered(2).await;
+
     let error = {
         let mut gated = std::pin::pin!(session.submit(insert(&rid(9), 9.0, 1)));
         assert_submit_pending(&mut gated, "submit must wait for the backlog gate").await;
