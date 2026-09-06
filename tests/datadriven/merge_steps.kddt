@@ -286,6 +286,10 @@ pk=2: idle
 
 split-step tree=1 partition=3
 ----
+pk=3: drained moved=4 remaining=4
+
+split-step tree=1 partition=3
+----
 pk=3: completed
 
 # With the split complete, its promoted targets are Ready and the merge can
@@ -368,6 +372,10 @@ tree 0: root pk=1
 split-step tree=1 partition=3
 ----
 pk=3: exposed left=4 right=5
+
+split-step tree=1 partition=3
+----
+pk=3: drained moved=4 remaining=4
 
 split-step tree=1 partition=3
 ----
@@ -456,12 +464,15 @@ validate
 ----
 ok: records=9 trees=1 partitions=3 max_level=2
 
-# --- Scenario G: a merge drains a multi-entry source in bounded batches ---
+# --- Scenario G: a merge drains a multi-entry source in one bounded batch ---
 # Earlier scenarios shrink every source to one entry, folding drain and
-# completion into one advance. Here a 12-entry source drains for real:
-# DRAIN_BATCH_LEAF is 8, so the drain takes two batches, the final batch
-# folded into `completed`; a further step after completion is `idle`. The
-# exact shape is installed declaratively via load-index (load_index.kddt).
+# completion into one advance. Here a 12-entry source drains for real: a
+# Merging source is always below the minimum, hence never above the
+# maximum-capped drain batch, so the single batch folds into `completed` and
+# a further step is `idle`. Multi-batch draining with per-batch target
+# reselection is covered by the merge state-machine suite
+# (tests/merge_state_machine.rs). The exact shape is installed declaratively
+# via load-index (load_index.kddt).
 new-index dimension=2 metric=L2 fields=bucket:i64 tree-key-fields=0 min-entries=16 max-entries=32
 ----
 created index "index"
@@ -495,17 +506,6 @@ loaded 18 records, 3 partitions, max level 2
 merge-step tree=1 partition=2
 ----
 pk=2: began
-
-merge-step tree=1 partition=2
-----
-pk=2: drained moved=8 remaining=4
-
-# Mid-drain the source stays searchable and both partitions are charged.
-search k=2 vector=[0,0]
-----
-r01: 0.0000
-r02: 1.0000
-usage: scanned_tree_keys=1 visited_partitions=3 visited_leaf_entries=18 exact_rerank_candidates=3
 
 merge-step tree=1 partition=2
 ----

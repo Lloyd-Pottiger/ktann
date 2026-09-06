@@ -3,8 +3,8 @@
 //!
 //! Draining stores no durable cursor: a short read snapshot fixes the
 //! source's current smallest entries — as many Leaf Entries as the current
-//! schema and Backend budget safely admit, or at most
-//! [`DRAIN_BATCH_INTERNAL`] Child Entries by source level — and a
+//! schema, Backend budget, and configured split threshold safely admit, or at
+//! most [`DRAIN_BATCH_INTERNAL`] Child Entries by source level — and a
 //! following write transaction revalidates and moves exactly those
 //! candidates. Successful movement deletes that prefix, so every batch starts
 //! at the current smallest entry, and entries a competing worker already
@@ -25,26 +25,25 @@ use crate::storage::{LogicalRange, ReadLogicalTxn};
 /// far below every adapter admission budget.
 pub const DRAIN_BATCH_INTERNAL: usize = 128;
 
-/// The minimum leaf batch allowed by the adaptive contention cap.
-const MIN_LEAF_DRAIN_BATCH: usize = 8;
-
 /// The bound on one drain candidate scan page.
 const DRAIN_SCAN_LIMITS: ScanLimits = ScanLimits {
     item_limit: DRAIN_BATCH_INTERNAL,
     byte_limit: 1_048_576,
 };
 
-/// Applies the contention and source-size bounds to a budget-safe leaf batch.
+/// Applies the threshold and source-size bounds to a budget-safe leaf batch.
+///
+/// The configured split threshold caps the batch at one ordinary partition's
+/// worth of entries, limiting conflict rollback and failure blast radius
+/// relative to the index's ordinary partition size; the Backend budget remains
+/// the hard upper bound.
 fn leaf_drain_batch_limit(
     max_partition_entries: u32,
     source_entries: u32,
     budget_limit: usize,
 ) -> usize {
-    let contention_limit = (max_partition_entries as usize)
-        .div_ceil(4)
-        .max(MIN_LEAF_DRAIN_BATCH);
-    budget_limit
-        .min(contention_limit)
+    (max_partition_entries as usize)
+        .min(budget_limit)
         .min(source_entries as usize)
 }
 
@@ -147,10 +146,10 @@ mod tests {
     use super::leaf_drain_batch_limit;
 
     #[test]
-    fn leaf_batch_combines_budget_contention_and_source_bounds() {
-        assert_eq!(leaf_drain_batch_limit(32, 100, 1_000), 8);
-        assert_eq!(leaf_drain_batch_limit(128, 100, 1_000), 32);
-        assert_eq!(leaf_drain_batch_limit(129, 100, 1_000), 33);
+    fn leaf_batch_combines_budget_threshold_and_source_bounds() {
+        // The smallest of the three bounds wins: threshold, budget, source.
+        assert_eq!(leaf_drain_batch_limit(32, 100, 1_000), 32);
+        assert_eq!(leaf_drain_batch_limit(128, 100, 1_000), 100);
         assert_eq!(leaf_drain_batch_limit(128, 100, 17), 17);
         assert_eq!(leaf_drain_batch_limit(128, 9, 1_000), 9);
     }

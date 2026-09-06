@@ -16,19 +16,20 @@
 //! # Contract
 //!
 //! - **Expose-then-drain.** A split begins by reserving two never-reused
-//!   target Partition Keys and marking the source `Splitting`; each target is
-//!   then unique-created as `ReceivingSplit { source }` with its persisted
-//!   centroid before the source advances to `DrainingSplit`. Repeating a
-//!   committed step is harmless: every operation recognizes the state a
-//!   previous committed attempt left and reports it instead of failing, so the
-//!   documented recovery from an unknown commit outcome is to re-drive the
-//!   same step.
+//!   target Partition Keys and marking the source `Splitting`; one exposure
+//!   transaction then unique-creates both targets as `ReceivingSplit {
+//!   source }` with their persisted centroids and advances the source to
+//!   `DrainingSplit` atomically, so no committed state holds a partially
+//!   exposed split. Repeating a committed step is harmless: every operation
+//!   recognizes the state a previous committed attempt left and reports it
+//!   instead of failing, so the documented recovery from an unknown commit
+//!   outcome is to re-drive the same step.
 //! - **One incoming reference.** A non-root target's creation and its Child
 //!   Entry insertion into the source's current parent are one atomic step; a
 //!   root target is instead owned by the exclusive target slot named by
 //!   Partition Key 1's persisted `Splitting` state until root completion
-//!   converts the root in place (ADR 0007). Target creation abandons without
-//!   writing when the source no longer names the target or the discovered
+//!   converts the root in place (ADR 0007). Exposure abandons without
+//!   writing when the source no longer names the targets or the discovered
 //!   parent cannot accept a new child.
 //! - **Exact movement.** Draining moves one bounded batch per transaction:
 //!   each moved entry's target insert, source delete, and — for leaves —
@@ -50,7 +51,7 @@
 use bytes::Bytes;
 
 use crate::api::{Error, ErrorKind, LogicalIndexId, PartitionKey, Result};
-use crate::storage::backend::{AdmissionBudget, Capabilities, InsertOutcome, ScanLimits, WriteTxn};
+use crate::storage::backend::{AdmissionBudget, Capabilities, ScanLimits, WriteTxn};
 use crate::storage::keys::{self, LogicalKey, TreeKey};
 use crate::storage::membership::{added_entry, expect_inserted, removed_entry};
 use crate::storage::tree_manifest::reserve_partition_keys;
@@ -98,35 +99,24 @@ pub enum SplitStart {
     NotEligible,
 }
 
-/// The outcome of [`create_split_target`].
+/// The outcome of [`expose_split_targets`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
-pub enum TargetInstall {
-    /// This transaction unique-created the target and, for a non-root source,
-    /// inserted its Child Entry into the source's current parent.
-    Created,
-    /// A previous committed attempt already created the target; its persisted
-    /// centroid stands and nothing was written.
-    AlreadyExists,
-    /// The source no longer `Splitting`-names the target (the split advanced
-    /// or completed); the step wrote nothing and must be abandoned.
+pub enum SplitExposure {
+    /// This transaction unique-created both targets and advanced the source
+    /// to `DrainingSplit`.
+    Exposed,
+    /// The source was already `DrainingSplit` naming these targets; nothing
+    /// was written. This is the recovery path after an unknown commit
+    /// outcome.
+    AlreadyExposed,
+    /// The source no longer `Splitting`-names the targets (the split
+    /// completed); the step wrote nothing and must be abandoned.
     SourceAdvanced,
-    /// The source's current parent cannot accept a new Child Entry (it is
-    /// itself draining or merging); the step wrote nothing and must be
+    /// The source's current parent cannot accept the new Child Entries (it
+    /// is itself draining or merging); the step wrote nothing and must be
     /// abandoned so a later attempt can rediscover the source's parent.
     ParentNotAccepting,
-}
-
-/// The outcome of [`advance_to_draining`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum DrainStart {
-    /// This transaction transitioned the source to `DrainingSplit`.
-    Advanced,
-    /// The source was already `DrainingSplit`; nothing was written.
-    AlreadyDraining,
-    /// The source is not `Splitting` (anymore); nothing was written.
-    NotSplitting,
 }
 
 /// The outcome of [`finalize_split`].
@@ -217,81 +207,85 @@ pub async fn begin_split<T: WriteTxn>(
     Ok(SplitStart::Started { left, right })
 }
 
-/// Unique-creates one split target and, for a non-root source, installs its
-/// incoming Child Entry in the source's current parent, atomically.
+/// Unique-creates both split targets, installs their incoming Child Entries,
+/// and advances the source from `Splitting` to `DrainingSplit`, atomically.
 ///
-/// The step update-protects the source State and verifies that it is still
-/// `Splitting` and names `target`, so a stale worker cannot recreate or
-/// relink a target after the source advances. The first successful creation
-/// fixes the target's persisted centroid forever; a later attempt observes
-/// [`TargetInstall::AlreadyExists`] and the persisted centroid stands. The
-/// target is created at the source's level with an exact zero count and, for
-/// a leaf split, the canonical empty Synopsis that leaf membership requires.
+/// Exposure is one transaction (ADR 0014): both targets are created as
+/// `ReceivingSplit { source }` with their persisted centroids, a non-root
+/// source's current parent gains both Child Entries, and the source flips to
+/// `DrainingSplit`, so no committed state holds a partially exposed split. The
+/// update-protected source authority pair aborts the commit against a
+/// concurrent transition or foreground write to the source; the caller's
+/// whole-step retry absorbs that, and exhaustion leaves the searchable
+/// `Splitting` state for a later access to rediscover. The first successful
+/// exposure fixes both target centroids forever: a competing attempt conflicts
+/// on the source State before commit and retries onto the persisted
+/// `DrainingSplit` state, so no worker ever overwrites a published centroid.
 ///
 /// For a non-root source the same transaction rediscovers the source's unique
 /// incoming Child Entry by an exact bounded root-down scan (ADR 0007),
 /// update-protects the traversed parent Header and the source edge, verifies
-/// that the parent still contains the source and accepts a new child, and
-/// inserts the target edge. A root target has no parent: it occupies the
-/// exclusive target slot named by Partition Key 1's persisted `Splitting`
-/// state until root completion exposes it.
+/// that the parent still contains the source and accepts new children, and
+/// inserts both target edges. Root targets have no parent: they occupy the
+/// exclusive target slots named by Partition Key 1's persisted state until
+/// root completion exposes them.
 ///
-/// Only [`TargetInstall::Created`] carries writes; every other outcome leaves
+/// The transition deliberately ignores the source's entries, count, and cache
+/// epoch: training and publication never restart or revalidate because of
+/// concurrent foreground writes (ADR 0014). Under the atomic protocol a
+/// `DrainingSplit` source always has both targets complete, so the
+/// [`SplitExposure::AlreadyExposed`] re-drive only checks that the persisted
+/// state names the caller's targets and writes nothing; a `Splitting` source
+/// whose targets already exist is a torn committed state the unique inserts
+/// below fail closed on.
+///
+/// Only [`SplitExposure::Exposed`] carries writes; every other outcome leaves
 /// the transaction without mutations.
-pub async fn create_split_target<T: WriteTxn>(
+pub async fn expose_split_targets<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     tree_key: &TreeKey,
     source: PartitionKey,
-    target: PartitionKey,
-    centroid: &PartitionCentroid,
+    targets: [(PartitionKey, &PartitionCentroid); 2],
     started_at_unix_millis: u64,
-) -> Result<TargetInstall> {
+) -> Result<SplitExposure> {
     let manifest = txn.require_manifest()?;
     let index = manifest.logical_index_id();
     let (source_header_key, source_state_key) = authority_keys(index, tree_key, source);
+    // The two targets in the order the persisted `Splitting` state names them.
+    let [(left, left_centroid), (right, right_centroid)] = targets;
 
-    // The source State is update-protected so a concurrent transition aborts
-    // the commit; its absence means a completed split already removed it.
-    let Some(state) = expect_state(txn.get_for_update(source_state_key).await?)? else {
-        return Ok(TargetInstall::SourceAdvanced);
+    // The source authority pair is update-protected so a concurrent
+    // transition or foreground write to the source aborts the commit; its
+    // absence means a completed split already removed it.
+    let Some((source_header, state)) =
+        authority_pair(txn, source_header_key.clone(), source_state_key.clone()).await?
+    else {
+        return Ok(SplitExposure::SourceAdvanced);
     };
-    let (left, right) = match state {
-        PartitionTransition::Splitting { left, right, .. } => (left, right),
-        PartitionTransition::DrainingSplit { left, right, .. } => {
-            // Advancing verified both targets exist, so a named target absent
-            // in the same snapshot is a torn committed state.
-            if target != left && target != right {
+    let level = source_header.level();
+    let draining = matches!(state, PartitionTransition::DrainingSplit { .. });
+    match state {
+        PartitionTransition::Splitting {
+            left: persisted_left,
+            right: persisted_right,
+            ..
+        }
+        | PartitionTransition::DrainingSplit {
+            left: persisted_left,
+            right: persisted_right,
+            ..
+        } => {
+            if left != persisted_left || right != persisted_right {
                 return Err(Error::invalid_argument());
             }
-            return match read_target_state(txn, index, tree_key, source, target).await? {
-                Some(()) => Ok(TargetInstall::AlreadyExists),
-                None => Err(corrupt()),
-            };
         }
         // Ready, ReceivingSplit, or Merging: the split completed or never
         // began; a stale worker must abandon, not recreate.
-        _ => return Ok(TargetInstall::SourceAdvanced),
-    };
-    if target != left && target != right {
-        return Err(Error::invalid_argument());
+        _ => return Ok(SplitExposure::SourceAdvanced),
     }
-
-    // A previous committed attempt is recognized before any discovery work;
-    // its persisted centroid stands.
-    let (target_header_key, target_state_key) = authority_keys(index, tree_key, target);
-    if read_header_opt(txn, index, tree_key, target)
-        .await?
-        .is_some()
-    {
-        return match read_target_state(txn, index, tree_key, source, target).await? {
-            Some(()) => Ok(TargetInstall::AlreadyExists),
-            None => Err(corrupt()),
-        };
+    if draining {
+        return Ok(SplitExposure::AlreadyExposed);
     }
-
-    let source_header = expect_header(txn.get(source_header_key).await?)?.ok_or_else(corrupt)?;
-    expect_agreement(source_header, state)?;
-    let level = source_header.level();
 
     // For a non-root source, discover and validate the incoming topology
     // before writing anything. The parent Header's update-protected read both
@@ -316,191 +310,92 @@ pub async fn create_split_target<T: WriteTxn>(
             PartitionState::Ready | PartitionState::Splitting | PartitionState::ReceivingSplit => {}
             // A draining or merging parent is completing its own maintenance;
             // abandoning lets a later attempt rediscover the moved edge.
-            _ => return Ok(TargetInstall::ParentNotAccepting),
+            _ => return Ok(SplitExposure::ParentNotAccepting),
         }
         Some((parent, parent_header))
     };
 
-    // Every key of the target partition is a unique insert: the partition did
-    // not exist in this snapshot and Partition Keys are never reused, so an
-    // existing key is a torn committed state.
-    let created = txn
-        .insert(
-            target_header_key,
-            PersistentValue::PartitionHeader(
-                PartitionHeader::new(level, 0, 0, PartitionState::ReceivingSplit)
-                    .map_err(|_| corrupt())?,
-            ),
-        )
-        .await?;
-    if created != InsertOutcome::Inserted {
-        return Err(corrupt());
-    }
-    expect_inserted(
-        txn.insert(
-            target_state_key,
-            PersistentValue::PartitionState(PartitionTransition::ReceivingSplit {
-                source,
-                started_at_unix_millis,
-            }),
-        )
-        .await?,
-    )?;
-    expect_inserted(
-        txn.insert(
-            LogicalKey::Centroid {
-                index,
-                tree_key: tree_key.clone(),
-                partition: target,
-            },
-            PersistentValue::PartitionCentroid(centroid.clone()),
-        )
-        .await?,
-    )?;
-    if level == 1 {
+    // Every key of each target partition is a unique insert: under atomic
+    // exposure the partition cannot exist yet and Partition Keys are never
+    // reused, so an existing key is a torn committed state.
+    for (target, centroid) in [(left, left_centroid), (right, right_centroid)] {
+        let (target_header_key, target_state_key) = authority_keys(index, tree_key, target);
         expect_inserted(
             txn.insert(
-                LogicalKey::Synopsis {
+                target_header_key,
+                PersistentValue::PartitionHeader(
+                    PartitionHeader::new(level, 0, 0, PartitionState::ReceivingSplit)
+                        .map_err(|_| corrupt())?,
+                ),
+            )
+            .await?,
+        )?;
+        expect_inserted(
+            txn.insert(
+                target_state_key,
+                PersistentValue::PartitionState(PartitionTransition::ReceivingSplit {
+                    source,
+                    started_at_unix_millis,
+                }),
+            )
+            .await?,
+        )?;
+        expect_inserted(
+            txn.insert(
+                LogicalKey::Centroid {
                     index,
                     tree_key: tree_key.clone(),
                     partition: target,
                 },
-                PersistentValue::PartitionSynopsis(PartitionSynopsis::empty(manifest)),
+                PersistentValue::PartitionCentroid(centroid.clone()),
             )
             .await?,
         )?;
+        if level == 1 {
+            expect_inserted(
+                txn.insert(
+                    LogicalKey::Synopsis {
+                        index,
+                        tree_key: tree_key.clone(),
+                        partition: target,
+                    },
+                    PersistentValue::PartitionSynopsis(PartitionSynopsis::empty(manifest)),
+                )
+                .await?,
+            )?;
+        }
+        if let Some((parent, _)) = &parent {
+            expect_inserted(
+                txn.insert(
+                    LogicalKey::ChildEntry {
+                        index,
+                        tree_key: tree_key.clone(),
+                        partition: *parent,
+                        child: target,
+                    },
+                    PersistentValue::ChildEntry(ChildEntry::new(
+                        target,
+                        centroid.components().to_vec(),
+                    )),
+                )
+                .await?,
+            )?;
+        }
     }
     if let Some((parent, parent_header)) = parent {
-        expect_inserted(
-            txn.insert(
-                LogicalKey::ChildEntry {
-                    index,
-                    tree_key: tree_key.clone(),
-                    partition: parent,
-                    child: target,
-                },
-                PersistentValue::ChildEntry(ChildEntry::new(
-                    target,
-                    centroid.components().to_vec(),
-                )),
-            )
-            .await?,
-        )?;
         txn.put(
             LogicalKey::Header {
                 index,
                 tree_key: tree_key.clone(),
                 partition: parent,
             },
-            PersistentValue::PartitionHeader(added_entry(parent_header)?),
+            PersistentValue::PartitionHeader(added_entry(added_entry(parent_header)?)?),
         )
         .await?;
     }
-    Ok(TargetInstall::Created)
-}
-
-/// Advances one fully exposed split source from `Splitting` to
-/// `DrainingSplit`.
-///
-/// The transition update-protects the source and verifies that both persisted
-/// targets identify it as their source and are complete — State, Header, and
-/// Centroid present and in agreement at the source's level — so the source
-/// never commits into a `DrainingSplit` that the fail-closed drain and
-/// completion steps would wedge behind. It deliberately ignores the source's
-/// entries, count, and cache epoch: training and publication never restart or
-/// revalidate because of concurrent foreground writes (ADR 0014). The Header
-/// write that keeps the state discriminator in agreement can still conflict
-/// with a concurrent foreground write to the source; the caller's whole-step
-/// retry absorbs that, and exhaustion leaves a searchable `Splitting` state
-/// for a later access to rediscover.
-pub async fn advance_to_draining<T: WriteTxn>(
-    txn: &mut WriteLogicalTxn<'_, T>,
-    tree_key: &TreeKey,
-    source: PartitionKey,
-    started_at_unix_millis: u64,
-) -> Result<DrainStart> {
-    let manifest = txn.require_manifest()?;
-    let index = manifest.logical_index_id();
-    let (header_key, state_key) = authority_keys(index, tree_key, source);
-    let Some((header, state)) = authority_pair(txn, header_key.clone(), state_key.clone()).await?
-    else {
-        // Both authority values are gone: a completed split already removed
-        // the source, so there is nothing to advance.
-        return Ok(DrainStart::NotSplitting);
-    };
-    let (left, right) = match state {
-        PartitionTransition::Splitting { left, right, .. } => (left, right),
-        PartitionTransition::DrainingSplit { .. } => return Ok(DrainStart::AlreadyDraining),
-        _ => return Ok(DrainStart::NotSplitting),
-    };
-
-    // Both targets must identify this source; one update-protected batch
-    // establishes the commit-time conflicts on both target States.
-    let mut target_states = txn
-        .batch_get_for_update(
-            [left, right]
-                .map(|target| LogicalKey::State {
-                    index,
-                    tree_key: tree_key.clone(),
-                    partition: target,
-                })
-                .into(),
-        )
-        .await?
-        .into_iter();
-    let (Some(left_state), Some(right_state)) = (target_states.next(), target_states.next()) else {
-        // The typed batch read returns exactly one value per input key.
-        return Err(Error::new(ErrorKind::Backend));
-    };
-
-    // Each target must also carry its Header and Centroid; committing the
-    // transition with a torn target would wedge the source behind the
-    // fail-closed drain and completion checks. These are plain reads: the
-    // update-protected States above already conflict with any concurrent
-    // target transition, and target counts and epochs may change freely.
-    let mut target_parts = txn
-        .batch_get(
-            [left, right]
-                .into_iter()
-                .flat_map(|target| {
-                    [
-                        LogicalKey::Header {
-                            index,
-                            tree_key: tree_key.clone(),
-                            partition: target,
-                        },
-                        LogicalKey::Centroid {
-                            index,
-                            tree_key: tree_key.clone(),
-                            partition: target,
-                        },
-                    ]
-                })
-                .collect(),
-        )
-        .await?
-        .into_iter();
-    for state_value in [left_state, right_state] {
-        match expect_state(state_value)? {
-            Some(PartitionTransition::ReceivingSplit { source: s, .. }) if s == source => {}
-            _ => return Err(corrupt()),
-        }
-        let (Some(header_value), Some(centroid_value)) = (target_parts.next(), target_parts.next())
-        else {
-            // The typed batch read returns exactly one value per input key.
-            return Err(Error::new(ErrorKind::Backend));
-        };
-        let target_header = expect_header(header_value)?.ok_or_else(corrupt)?;
-        if target_header.state() != PartitionState::ReceivingSplit
-            || target_header.level() != header.level()
-        {
-            return Err(corrupt());
-        }
-        expect_centroid(centroid_value)?.ok_or_else(corrupt)?;
-    }
 
     txn.put(
-        state_key,
+        source_state_key,
         PersistentValue::PartitionState(PartitionTransition::DrainingSplit {
             left,
             right,
@@ -509,11 +404,11 @@ pub async fn advance_to_draining<T: WriteTxn>(
     )
     .await?;
     txn.put(
-        header_key,
-        PersistentValue::PartitionHeader(with_state(header, PartitionState::DrainingSplit)?),
+        source_header_key,
+        PersistentValue::PartitionHeader(with_state(source_header, PartitionState::DrainingSplit)?),
     )
     .await?;
-    Ok(DrainStart::Advanced)
+    Ok(SplitExposure::Exposed)
 }
 
 /// One verified leaf drain candidate: the source Leaf Entry and its current
@@ -1655,10 +1550,10 @@ async fn level_bodies<R: LogicalReader>(
     loop {
         // While the root exposes its split targets only through its own
         // State, those targets sit at the root's level without an incoming
-        // edge; add them exactly once. While the root is merely Splitting a
-        // target may not be exposed yet: an absent target holds no Child
-        // Entries and is skipped. While DrainingSplit both targets exist
-        // because advancing verified them.
+        // edge; add them exactly once. Exposure and the DrainingSplit
+        // transition commit atomically (ADR 0014): a Splitting root's targets
+        // cannot exist yet, so an absent target is skipped, while a
+        // DrainingSplit root's targets exist by construction.
         if current_level == root_header.level() {
             if let Some(root_state) = read_state(reader, index, tree_key, root).await? {
                 let draining = matches!(root_state, PartitionTransition::DrainingSplit { .. });
@@ -2001,22 +1896,6 @@ async fn authority_pair<T: WriteTxn>(
     state_key: LogicalKey,
 ) -> Result<Option<(PartitionHeader, PartitionTransition)>> {
     classify_authority(authority_for_update(txn, header_key, state_key).await?)
-}
-
-/// Verifies that one target's persisted State names `source`, without a
-/// conflict.
-async fn read_target_state<T: WriteTxn>(
-    txn: &mut WriteLogicalTxn<'_, T>,
-    index: LogicalIndexId,
-    tree_key: &TreeKey,
-    source: PartitionKey,
-    target: PartitionKey,
-) -> Result<Option<()>> {
-    match read_state(txn, index, tree_key, target).await? {
-        Some(PartitionTransition::ReceivingSplit { source: s, .. }) if s == source => Ok(Some(())),
-        Some(_) => Err(corrupt()),
-        None => Ok(None),
-    }
 }
 
 /// Builds the Header and State keys of one partition.

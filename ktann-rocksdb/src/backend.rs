@@ -15,7 +15,7 @@ use rocksdb::{
 };
 use tokio::sync::{mpsc, oneshot};
 
-use crate::blocking::{BlockingAdmission, NativeWorker};
+use crate::blocking::{BlockingPool, NativeWorker};
 use crate::config::RocksDbConfig;
 use crate::observe;
 
@@ -90,7 +90,7 @@ pub struct RocksDbBackend {
     namespace: BackendNamespace,
     prefix: PhysicalPrefix,
     config: RocksDbConfig,
-    blocking: BlockingAdmission,
+    blocking: BlockingPool,
 }
 
 impl RocksDbBackend {
@@ -118,9 +118,9 @@ impl RocksDbBackend {
     /// Constructs an adapter with explicit process-local resource limits.
     ///
     /// The configured blocking limit applies to this adapter instance. Opening
-    /// a transaction waits asynchronously for one actor slot and retains it
-    /// through native cleanup. Native calls and destruction run on that actor's
-    /// dedicated native thread.
+    /// a transaction waits asynchronously for one pool slot and retains it
+    /// through native cleanup. Native calls and destruction run on one pooled
+    /// native thread for the transaction's lifetime.
     #[must_use]
     pub fn with_config(
         database: impl Into<Arc<OptimisticTransactionDB>>,
@@ -128,7 +128,7 @@ impl RocksDbBackend {
         config: RocksDbConfig,
     ) -> Self {
         let prefix = PhysicalPrefix::new(&namespace);
-        let blocking = BlockingAdmission::new(config.blocking_resource_limit());
+        let blocking = BlockingPool::new(config.blocking_resource_limit());
         Self {
             database: database.into(),
             namespace,

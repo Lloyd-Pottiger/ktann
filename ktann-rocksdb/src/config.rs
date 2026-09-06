@@ -5,9 +5,9 @@ use tokio::sync::Semaphore;
 
 /// Process-local resource limits for one RocksDB adapter.
 ///
-/// The blocking resource limit bounds live RocksDB transaction actors. Each
-/// actor owns one dedicated native thread, one snapshot or write transaction,
-/// and one slot until native cleanup finishes.
+/// The blocking resource limit bounds live RocksDB transactions. Each
+/// transaction occupies one pool slot, and its native calls and cleanup run
+/// serially on one of that many reusable pooled native threads.
 ///
 /// # Examples
 ///
@@ -33,14 +33,14 @@ impl Default for RocksDbConfig {
 }
 
 impl RocksDbConfig {
-    /// Sets the maximum number of live RocksDB transaction actors.
+    /// Sets the maximum number of live RocksDB transactions.
     ///
-    /// Each read snapshot or write transaction reserves one dedicated thread
-    /// actor through native cleanup. Existing transactions never reacquire
-    /// admission for their calls, so retaining `limit` transactions cannot
-    /// prevent them from making progress; only another transaction open waits.
-    /// Dropping a handle closes its bounded actor channel without waiting
-    /// synchronously.
+    /// Each read snapshot or write transaction reserves one slot of the
+    /// adapter's native worker pool through native cleanup. Existing
+    /// transactions never reacquire admission for their calls, so retaining
+    /// `limit` transactions cannot prevent them from making progress; only
+    /// another transaction open waits. Dropping a handle closes its bounded
+    /// command channel without waiting synchronously.
     ///
     /// # Errors
     ///
@@ -54,7 +54,7 @@ impl RocksDbConfig {
         Ok(self)
     }
 
-    /// Returns the maximum number of live RocksDB transaction actors.
+    /// Returns the maximum number of live RocksDB transactions.
     #[must_use]
     pub const fn blocking_resource_limit(&self) -> usize {
         self.blocking_resource_limit

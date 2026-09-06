@@ -244,19 +244,34 @@ ok: records=5 trees=1 partitions=3 max_level=1
 
 split-step tree=1
 ----
-pk=1: completed
+pk=1: drained moved=4 remaining=1
 
 format-tree entries
 ----
 tree 0: root pk=1
-  pk=1 level=2 state=Ready count=2
-    pk=2 level=1 state=Ready count=2
+  pk=1 level=1 state=DrainingSplit count=1 left=2 right=3
+    r5
+    pk=2 level=1 state=ReceivingSplit count=2
       r1
       r2
-    pk=3 level=1 state=Ready count=3
+    pk=3 level=1 state=ReceivingSplit count=2
       r3
       r4
-      r5
+
+validate
+----
+ok: records=5 trees=1 partitions=3 max_level=1
+
+split-step tree=1
+----
+pk=1: completed
+
+format-tree
+----
+tree 0: root pk=1
+  pk=1 level=2 state=Ready count=2
+    pk=2 level=1 state=Ready count=2
+    pk=3 level=1 state=Ready count=3
 
 validate
 ----
