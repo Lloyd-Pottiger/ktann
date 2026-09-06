@@ -25,6 +25,14 @@ final foreground mutation still assigns each record to exactly one leaf. The
 default is eight, so the option is explicit when measuring another import beam
 and its quality effect.
 
+Setup stays excluded from every reported measurement, but the setup import is
+where large-scale write behavior is decided. After each quality scenario's
+batch load, the runner therefore logs the import interval's diagnostics to
+stderr: admission waits by gate, learned Import Session concurrency
+adjustments, write attempts by operation and outcome, native commit waits, and
+Fixup steps. The import metric interval is consumed at that point, so later
+phase accounting remains disjoint.
+
 For controlled `import-to-search-lifecycle` diagnostics,
 `--maintenance-workers N` overrides the import Runtime's Structure Maintenance
 worker count (including zero), `--import-max-in-flight-batches N` overrides the
