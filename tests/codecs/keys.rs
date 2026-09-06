@@ -8,10 +8,10 @@ use std::cmp::Ordering;
 use bytes::Bytes;
 use ktann::api::{DataType, ErrorKind, IndexName, LogicalIndexId, PartitionKey, Value};
 use ktann::storage::keys::{
-    LogicalKey, TreeKey, centroid_key, child_entry_key, decode_key, header_key,
-    index_id_allocator_key, index_range, leaf_entry_key, location_key, manifest_key,
-    name_directory_key, partition_range, payload_key, record_key, state_key, synopsis_key,
-    tree_manifest_key, tree_manifest_prefix_range, tree_manifest_range,
+    LogicalKey, MAX_RECORD_ID_BYTES, MAX_STRING_BYTES, MAX_TREE_KEY_BYTES, TreeKey, centroid_key,
+    child_entry_key, decode_key, header_key, index_id_allocator_key, index_range, leaf_entry_key,
+    location_key, manifest_key, name_directory_key, partition_range, payload_key, record_key,
+    state_key, synopsis_key, tree_manifest_key, tree_manifest_prefix_range, tree_manifest_range,
 };
 
 fn id(value: u64) -> LogicalIndexId {
@@ -474,6 +474,90 @@ fn tree_key_values_round_trip() {
     assert_eq!(tree_key.values(&types).expect("decodes"), values);
 }
 
+/// Builds a Tree Key of exactly `len` encoded bytes from eight String fields
+/// (each contributing its raw length plus one terminator byte).
+fn tree_key_of_len(len: usize) -> ([DataType; 8], TreeKey) {
+    let types = [DataType::String; 8];
+    let mut values = Vec::with_capacity(types.len());
+    let mut remaining = len;
+    for field in 0..types.len() {
+        let raw = (remaining - 1 - (types.len() - 1 - field)).min(MAX_STRING_BYTES);
+        values.push(Value::string("x".repeat(raw)).expect("within limit"));
+        remaining -= raw + 1;
+    }
+    assert_eq!(remaining, 0, "len {len} is representable");
+    let tree_key = TreeKey::encode(&types, &values).expect("canonical");
+    assert_eq!(tree_key.as_bytes().len(), len);
+    (types, tree_key)
+}
+
+#[test]
+fn partition_keys_round_trip_at_tree_key_ceiling() {
+    // The partition-key suffix (Partition Key, subkind, terminal Record ID or
+    // child Partition Key) follows the Tree Key and must not count against its
+    // length cap: every Tree Key legal per `TreeKey::encode` round-trips
+    // through every partition-scoped family. The boundary lengths are
+    // MAX_TREE_KEY_BYTES - 9 - {1, MAX_RECORD_ID_BYTES} (Leaf Entry),
+    // MAX_TREE_KEY_BYTES - 17 (Child Entry), MAX_TREE_KEY_BYTES - 9 (metadata),
+    // and the ceiling itself.
+    let index = id(1);
+    let partition = pk(1);
+    let short_id = Bytes::from_static(b"x");
+    let long_id = Bytes::from(vec![b'y'; MAX_RECORD_ID_BYTES]);
+    for len in [7927, 7928, 8175, 8176, 8183, 8184, MAX_TREE_KEY_BYTES] {
+        let (types, tree_key) = tree_key_of_len(len);
+        let keys = [
+            LogicalKey::TreeManifest {
+                index,
+                tree_key: tree_key.clone(),
+            },
+            LogicalKey::Header {
+                index,
+                tree_key: tree_key.clone(),
+                partition,
+            },
+            LogicalKey::Synopsis {
+                index,
+                tree_key: tree_key.clone(),
+                partition,
+            },
+            LogicalKey::State {
+                index,
+                tree_key: tree_key.clone(),
+                partition,
+            },
+            LogicalKey::Centroid {
+                index,
+                tree_key: tree_key.clone(),
+                partition,
+            },
+            LogicalKey::LeafEntry {
+                index,
+                tree_key: tree_key.clone(),
+                partition,
+                id: short_id.clone(),
+            },
+            LogicalKey::LeafEntry {
+                index,
+                tree_key: tree_key.clone(),
+                partition,
+                id: long_id.clone(),
+            },
+            LogicalKey::ChildEntry {
+                index,
+                tree_key: tree_key.clone(),
+                partition,
+                child: pk(2),
+            },
+        ];
+        for key in &keys {
+            let decoded = decode_key(&types, &Bytes::from(encode_key(key)))
+                .unwrap_or_else(|error| panic!("tree key length {len} decodes: {error:?}"));
+            assert_eq!(&decoded, key, "round trip at tree key length {len}");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Prefix and range construction.
 // ---------------------------------------------------------------------------
@@ -677,6 +761,32 @@ fn decode_rejects_overlong_record_id_and_name() {
     // 256-byte Index Name after the directory kind.
     let mut key = vec![0x01, 0x00, 0x01];
     key.extend(std::iter::repeat_n(b'y', 256));
+    assert!(is_corrupt(&types, &key));
+}
+
+#[test]
+fn decode_rejects_overlong_tree_key_prefix_in_partition_key() {
+    // The Tree Key length cap applies to the consumed Tree Key prefix, not to
+    // the whole partition-scoped key: eight maximum-length String fields
+    // encode to 8 * (MAX_STRING_BYTES + 1) = 8200 bytes, one past the
+    // 8 KiB ceiling, so the prefix is Corruption wherever it appears.
+    let types = [DataType::String; 8];
+    let mut tree_key = Vec::new();
+    for _ in 0..types.len() {
+        tree_key.extend(std::iter::repeat_n(b'x', MAX_STRING_BYTES));
+        tree_key.push(0x00);
+    }
+    assert_eq!(tree_key.len(), MAX_TREE_KEY_BYTES + 8);
+
+    let mut key = b"\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x04".to_vec();
+    key.extend_from_slice(&tree_key);
+    key.extend_from_slice(&1_u64.to_be_bytes());
+    key.push(0x00);
+    assert!(is_corrupt(&types, &key));
+
+    // The same encoding is rejected as a complete Tree Key (Tree Manifest).
+    let mut key = b"\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x03".to_vec();
+    key.extend_from_slice(&tree_key);
     assert!(is_corrupt(&types, &key));
 }
 

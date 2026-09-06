@@ -283,13 +283,17 @@ fn check_scalar(ty: DataType, bytes: &[u8]) -> Result<usize> {
 }
 
 /// Validates a Tree Key field sequence and reports the consumed prefix length.
+///
+/// The buffer may be a larger key whose leading bytes are the Tree Key (a
+/// partition-scoped logical key carries a suffix after it), so the length cap
+/// applies to the consumed Tree Key prefix rather than to the whole buffer.
 fn check_fields(types: &[DataType], bytes: &[u8]) -> Result<usize> {
-    if bytes.len() > MAX_TREE_KEY_BYTES {
-        return Err(corrupt());
-    }
     let mut offset = 0;
     for ty in types {
         offset += check_scalar(*ty, &bytes[offset..])?;
+    }
+    if offset > MAX_TREE_KEY_BYTES {
+        return Err(corrupt());
     }
     Ok(offset)
 }
