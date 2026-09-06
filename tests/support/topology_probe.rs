@@ -11,7 +11,7 @@ use ktann::api::{
 use ktann::maintenance::routing::route_leaf;
 use ktann::maintenance::{merge, split};
 use ktann::runtime::{RetryPolicy, Runtime};
-use ktann::storage::backend::{Backend, Capabilities, ScanLimits};
+use ktann::storage::backend::{AdmissionBudget, Backend, Capabilities, ScanLimits};
 use ktann::storage::keys::{LogicalKey, TreeKey};
 use ktann::storage::values::{
     ChildEntry, IndexManifest, LeafEntry, PartitionCentroid, PartitionHeader, PartitionSynopsis,
@@ -23,6 +23,24 @@ use super::{CommitFault, DeterministicBackend, DeterministicConfig, SharedBacken
 
 pub fn backend() -> SharedBackend {
     SharedBackend::new(DeterministicBackend::new(DeterministicConfig::default()))
+}
+
+/// A deterministic backend whose admission budget bounds a leaf merge drain
+/// batch to eight entries, so merge reselection is exercised across batches.
+///
+/// A leaf relocation charges three mutations per entry plus two per touched
+/// target and one for the source Header; a merge may touch one target per
+/// entry, so a batch of eight charges 41 mutations and a ninth entry would
+/// exceed the 41-mutation budget.
+pub fn backend_with_merge_drain_budget() -> SharedBackend {
+    let config = DeterministicConfig {
+        admission_budget: AdmissionBudget {
+            max_mutations: 41,
+            ..DeterministicConfig::default().admission_budget
+        },
+        ..DeterministicConfig::default()
+    };
+    SharedBackend::new(DeterministicBackend::new(config))
 }
 
 pub fn backend_with_clear() -> SharedBackend {

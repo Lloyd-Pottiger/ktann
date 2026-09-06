@@ -3,8 +3,9 @@
 This crate maps KTANN's backend-neutral transactional KV interface onto
 RocksDB's `OptimisticTransactionDB`. It uses explicit snapshots, point-key
 optimistic conflicts, WAL-backed writes, and synchronous commits. Each live
-snapshot or transaction is owned by one permit-bounded native thread actor;
-all native calls and cleanup for that handle run serially on that actor.
+snapshot or transaction holds one permit of a bounded native worker pool; all
+native calls and cleanup for that handle run serially on one pooled thread,
+reused across transactions instead of spawned per transaction.
 
 The caller opens an `OptimisticTransactionDB` and passes it, or a shared `Arc`
 containing it, to `RocksDbBackend`. Each adapter instance adds a versioned,
@@ -43,23 +44,24 @@ as unsupported, so higher layers use bounded point deletes.
 
 The adapter requires a Tokio runtime; current-thread runtimes and `LocalSet`
 callers are supported because async tasks never execute RocksDB directly.
-`RocksDbConfig::blocking_resource_limit` bounds live native transaction actors
-and defaults to the host's available parallelism. Each actor has a one-command
-queue and retains one permit from transaction admission through native cleanup.
-Existing transactions reuse their actor for ordinary calls, commit, rollback,
-and destruction, so retaining the configured maximum cannot deadlock those
-transactions; only another transaction open waits asynchronously.
+`RocksDbConfig::blocking_resource_limit` bounds live native transactions and
+defaults to the host's available parallelism. The adapter spawns worker
+threads on demand up to that limit and reuses them: each transaction's actor
+lifecycle is one job on one pooled thread, keeping one permit from admission
+through native cleanup. Existing transactions hold their permit for ordinary calls, commit,
+rollback, and destruction, so retaining the configured maximum cannot deadlock
+those transactions; only another transaction open waits asynchronously.
 
-Cancelling before admission removes the semaphore waiter and creates no actor.
+Cancelling before admission removes the semaphore waiter and queues no job.
 Dropping an ordinary operation may discard a native call that already started;
-if the actor observes a cancelled call it abandons that transaction. This
+if the worker observes a cancelled call it abandons that transaction. This
 applies to reads issued through a write transaction as well as mutations: the
-write actor retires on any closed response, so a cancelled read-through-write
+job retires on any closed response, so a cancelled read-through-write
 does not leave the transaction in an ambiguous partially-mutated state.
-Dropping a commit future before its actor claims commit ownership abandons the
+Dropping a commit future before its job claims commit ownership abandons the
 transaction. After the claim, commit runs to completion and the usual
 unknown-outcome rule applies to the dropped caller. Handle `Drop` only closes
-the bounded actor channel. Snapshot or transaction destruction therefore never
+the bounded command channel. Snapshot or transaction destruction therefore never
 waits synchronously on an async executor thread, including from a `LocalSet`,
 task cancellation, panic unwinding, or Tokio runtime shutdown.
 
@@ -67,8 +69,9 @@ Call `RocksDbBackend::shutdown().await` before immediately reopening or
 destroying the underlying database when deterministic cleanup completion is
 required by a direct adapter user. KTANN Runtime invokes the backend cleanup
 hook automatically after foreground drain, so successful `Runtime::shutdown`
-already includes this barrier. Native actor threads are detached from Tokio and
-may outlive an ungraceful runtime drop.
+already includes this barrier. Native worker threads are detached from Tokio
+and may outlive an ungraceful runtime drop; they exit when the pool closes
+with the adapter.
 
 ## Local tests
 

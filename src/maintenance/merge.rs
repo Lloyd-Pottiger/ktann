@@ -134,8 +134,9 @@ pub async fn begin_merge<B: Backend>(
 ///
 /// A short read snapshot first fixes the batch — the source's current
 /// smallest entries, using the largest safe Leaf Entry batch for the current
-/// schema and Backend budget or the fixed internal-entry bound — and the
-/// same-level candidate set. The write transaction revalidates the `Merging`
+/// schema, Backend budget, and configured split threshold, or the fixed
+/// internal-entry bound — and the same-level candidate set. The write
+/// transaction revalidates the `Merging`
 /// state, then re-reads each candidate with update protection: an entry
 /// removed by a concurrent completed mutation is skipped and a remaining
 /// membership mismatch is Corruption. Every remaining entry routes against

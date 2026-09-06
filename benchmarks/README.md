@@ -323,7 +323,9 @@ mean with the sample coefficient of variation in parentheses.
 | FoundationDB | Import retryable commits | 464.3 (1.11%) | 293.3 (1.57%) | -36.8% |
 | FoundationDB | Import mutation operations | 173,590 (0.53%) | 134,572 (0.30%) | -22.5% |
 
-The workload's 128-entry partition limit selects a 32-entry contention cap.
+The workload's 128-entry partition limit selected a 32-entry contention cap
+(since raised to the full configured threshold; see
+`docs/design/maintenance.md` §4.2).
 On both adapters, successful import commits fell from 2,602 to 1,290, read
 transactions from 4,041 to 1,417, and split drain steps from 1,857 to 545.
 Every run accepted all 10,000 records, converged completely, reported

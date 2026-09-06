@@ -25,10 +25,11 @@ use ktann::storage::{topology, tree_manifest};
 use support::oracle::{Model, ModelRecord};
 use support::topology_probe::{
     all_partitions, assert_exact_membership, assert_fault_kind, assert_searchable, backend,
-    backend_with_clear, centroid_of, config, create_committed_tree, drive_merge_to_completion,
-    drive_split_to_completion, edge_of, header_of, leaf_entry_of, location_of, make_runtime, pk,
-    reachable_leaves, record, retry, rid, scan_child_entries, scan_leaf_entries, seed_records,
-    state_of, synopsis_of, tree_key, write_txn,
+    backend_with_clear, backend_with_merge_drain_budget, centroid_of, config,
+    create_committed_tree, drive_merge_to_completion, drive_split_to_completion, edge_of,
+    header_of, leaf_entry_of, location_of, make_runtime, pk, reachable_leaves, record, retry, rid,
+    scan_child_entries, scan_leaf_entries, seed_records, state_of, synopsis_of, tree_key,
+    write_txn,
 };
 use support::{
     CommitFault, DeterministicBackend, DeterministicConfig, Durability, Rng, SharedBackend, audit,
@@ -305,8 +306,10 @@ async fn wide_three_leaf_tree(
 }
 
 /// A wide-config fixture with the middle leaf (by entry x-order) begun as a
-/// merge source: exactly twelve source entries (two drain batches) and two
-/// Ready targets with their persisted routing centroids.
+/// merge source: exactly twelve source entries and two Ready targets with
+/// their persisted routing centroids. The default budget drains the
+/// below-minimum source in one batch; `backend_with_merge_drain_budget`
+/// bounds the batch to eight entries for two-batch reselection coverage.
 struct MiddleLeafMerge {
     runtime: Runtime<SharedBackend>,
     index: Index<SharedBackend>,
@@ -380,7 +383,7 @@ async fn non_root_leaf_merge_runs_end_to_end_and_stays_searchable() {
     let target = pk(3);
 
     // Trim the source below the minimum of thirteen: exactly twelve entries
-    // remain, two bounded drain batches.
+    // remain; the interleaved mutations below leave ten for the drain.
     let kept = trim_leaf(&index, &backend, &manifest, &key, source, 12, &mut records).await;
     let target_before = header_of(&backend, &manifest, &key, target)
         .await
@@ -488,26 +491,14 @@ async fn non_root_leaf_merge_runs_end_to_end_and_stays_searchable() {
     assert_searchable(&backend, &manifest, &key, &records).await;
     run_audit(&backend, &manifest, &records).await;
 
-    // Drain: two bounded batches of eight and two, driven by the exact count.
-    let first = merge::drain_batch(&backend, &manifest, &key, source, &retry())
+    // Drain: one bounded batch, driven by the exact count.
+    let drained = merge::drain_batch(&backend, &manifest, &key, source, &retry())
         .await
-        .expect("first batch");
+        .expect("drain batch");
     assert_eq!(
-        first,
+        drained,
         merge::DrainStep::Drained {
-            moved: 8,
-            remaining: 2
-        }
-    );
-    assert_searchable(&backend, &manifest, &key, &records).await;
-    run_audit(&backend, &manifest, &records).await;
-    let second = merge::drain_batch(&backend, &manifest, &key, source, &retry())
-        .await
-        .expect("second batch");
-    assert_eq!(
-        second,
-        merge::DrainStep::Drained {
-            moved: 2,
+            moved: 10,
             remaining: 0
         }
     );
@@ -593,7 +584,10 @@ async fn non_root_leaf_merge_runs_end_to_end_and_stays_searchable() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drain_moves_bounded_batches_to_per_entry_reselected_targets() {
-    let backend = backend();
+    // The small admission budget bounds each merge batch to eight entries, so
+    // the twelve-entry source drains in two batches (the default budget would
+    // drain the below-minimum source in one).
+    let backend = backend_with_merge_drain_budget();
     let fixture = begin_middle_leaf_merge(&backend).await;
     let MiddleLeafMerge {
         runtime,
@@ -1350,20 +1344,18 @@ async fn a_concurrent_delete_conflicts_with_a_drain_batch_and_the_retry_skips_it
     let error = attempt.commit().await.expect_err("delete conflicts");
     assert_eq!(error.kind(), ErrorKind::RetryableAbort);
 
-    // The retried batch skips the vanished entry: eleven remain, eight move.
-    let first = merge::drain_batch(&backend, &manifest, &key, source, &retry())
+    // The retried batch skips the vanished entry: eleven remain, all move.
+    let drained = merge::drain_batch(&backend, &manifest, &key, source, &retry())
         .await
         .expect("retried batch");
     assert_eq!(
-        first,
+        drained,
         merge::DrainStep::Drained {
-            moved: 8,
-            remaining: 3
+            moved: 11,
+            remaining: 0
         }
     );
     assert_searchable(&backend, &manifest, &key, &records).await;
-    let moved = merge_drain_to_zero(&backend, &manifest, &key, source).await;
-    assert_eq!(moved, 3);
     let completed = merge::complete_merge(&backend, &manifest, &key, source, &retry())
         .await
         .expect("complete");
@@ -1489,7 +1481,9 @@ async fn a_concurrent_target_transition_aborts_the_relocate_and_the_next_batch_r
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_target_leaving_ready_between_batches_is_skipped_by_reselection() {
-    let backend = backend();
+    // The small admission budget splits the drain into two batches so the
+    // target transition lands between them.
+    let backend = backend_with_merge_drain_budget();
     let fixture = begin_middle_leaf_merge(&backend).await;
     let MiddleLeafMerge {
         runtime,
@@ -2749,6 +2743,12 @@ async fn seeded_model_history_interleaving_mutations_splits_and_merges() {
                     )
                     .await
                     {
+                        // A child split waits while its parent drains; the
+                        // exhausted step applied nothing and is rediscovered
+                        // later, exactly like the settling loop tolerates.
+                        if error.kind() == ErrorKind::ContentionExhausted {
+                            continue;
+                        }
                         let header = header_of(&backend, &manifest, &key, partition).await;
                         let state = state_of(&backend, &manifest, &key, partition).await;
                         panic!(
@@ -2772,6 +2772,11 @@ async fn seeded_model_history_interleaving_mutations_splits_and_merges() {
                     )
                     .await
                     {
+                        // A stalled step applied nothing and is rediscovered
+                        // later; the settling loop tolerates the same outcome.
+                        if error.kind() == ErrorKind::ContentionExhausted {
+                            continue;
+                        }
                         let header = header_of(&backend, &manifest, &key, partition).await;
                         let state = state_of(&backend, &manifest, &key, partition).await;
                         panic!(

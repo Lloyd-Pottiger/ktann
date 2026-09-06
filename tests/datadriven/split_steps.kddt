@@ -3,7 +3,8 @@
 # machine from #10). Every committed intermediate state must stay searchable
 # and pass the exact-membership audit; format-tree renders each phase.
 #
-# DRAIN_BATCH_LEAF is 8, so a 12-entry leaf drains in two batches.
+# The leaf drain batch is capped at the configured maximum of 4, so a
+# 12-entry leaf drains in three batches.
 # ----------------------------------------------------------------------
 # --- Scenario A: root split, step by step ---
 new-index dimension=2 metric=L2 fields=bucket:i64 tree-key-fields=0 min-entries=2 max-entries=4
@@ -63,14 +64,14 @@ ok: records=12 trees=1 partitions=3 max_level=1
 # Mid-drain: entries live in the source and both targets at once.
 split-step tree=1
 ----
-pk=1: drained moved=8 remaining=4
+pk=1: drained moved=4 remaining=8
 
 format-tree
 ----
 tree 0: root pk=1
-  pk=1 level=1 state=DrainingSplit count=4 left=2 right=3
-    pk=2 level=1 state=ReceivingSplit count=4
-    pk=3 level=1 state=ReceivingSplit count=4
+  pk=1 level=1 state=DrainingSplit count=8 left=2 right=3
+    pk=2 level=1 state=ReceivingSplit count=2
+    pk=3 level=1 state=ReceivingSplit count=2
 
 search k=3 vector=[0,0]
 ----
@@ -83,6 +84,22 @@ validate
 ----
 ok: records=12 trees=1 partitions=3 max_level=1
 
+split-step tree=1
+----
+pk=1: drained moved=4 remaining=4
+
+format-tree
+----
+tree 0: root pk=1
+  pk=1 level=1 state=DrainingSplit count=4 left=2 right=3
+    pk=2 level=1 state=ReceivingSplit count=4
+    pk=3 level=1 state=ReceivingSplit count=4
+
+validate
+----
+ok: records=12 trees=1 partitions=3 max_level=1
+
+# The last batch folds into completion: the root converts in place to level 2.
 split-step tree=1
 ----
 pk=1: completed
@@ -125,7 +142,7 @@ r101: ok
 
 split-step tree=1
 ----
-pk=1: drained moved=8 remaining=4
+pk=1: drained moved=4 remaining=8
 
 delete
 r000000
@@ -138,35 +155,51 @@ ok: records=13 trees=1 partitions=3 max_level=1
 
 split-step tree=1
 ----
-pk=1: completed
+pk=1: drained moved=4 remaining=4
 
 format-tree entries
 ----
 tree 0: root pk=1
-  pk=1 level=2 state=Ready count=2
-    pk=2 level=1 state=Ready count=4
+  pk=1 level=1 state=DrainingSplit count=4 left=2 right=3
+    r000008
+    r000009
+    r000010
+    r000011
+    pk=2 level=1 state=ReceivingSplit count=4
       r000002
       r000004
       r000005
       r101
-    pk=3 level=1 state=Ready count=9
+    pk=3 level=1 state=ReceivingSplit count=5
       r000001
       r000003
       r000006
       r000007
-      r000008
-      r000009
-      r000010
-      r000011
       r100
+
+validate
+----
+ok: records=13 trees=1 partitions=3 max_level=1
+
+# --- Scenario C: non-root split, step by step ---
+# The auto-selected step first finishes scenario B's in-flight root drain;
+# both resulting leaves are still over the maximum, so the next steps split
+# the worst one and watch the parent edge handoff.
+split-step tree=1
+----
+pk=1: completed
+
+format-tree
+----
+tree 0: root pk=1
+  pk=1 level=2 state=Ready count=2
+    pk=2 level=1 state=Ready count=4
+    pk=3 level=1 state=Ready count=9
 
 validate
 ----
 ok: records=13 trees=1 partitions=3 max_level=2
 
-# --- Scenario C: non-root split, step by step ---
-# Both leaves of the scenario-B tree are still over the maximum; split the
-# worst one (auto-selected) and watch the parent edge handoff.
 split-step tree=1
 ----
 pk=3: began left=4 right=5
@@ -177,10 +210,6 @@ tree 0: root pk=1
   pk=1 level=2 state=Ready count=2
     pk=2 level=1 state=Ready count=4
     pk=3 level=1 state=Splitting count=9 left=4 right=5
-
-validate
-----
-ok: records=13 trees=1 partitions=3 max_level=2
 
 split-step tree=1
 ----
@@ -195,22 +224,31 @@ tree 0: root pk=1
       pk=4 level=1 state=ReceivingSplit count=0
       pk=5 level=1 state=ReceivingSplit count=0
 
+validate
+----
+ok: records=13 trees=1 partitions=5 max_level=2
+
+# Entries flip from the source to the two targets.
 split-step tree=1
 ----
-pk=3: drained moved=8 remaining=1
+pk=3: drained moved=4 remaining=5
 
 format-tree
 ----
 tree 0: root pk=1
   pk=1 level=2 state=Ready count=4
     pk=2 level=1 state=Ready count=4
-    pk=3 level=1 state=DrainingSplit count=1 left=4 right=5
-      pk=4 level=1 state=ReceivingSplit count=1
-      pk=5 level=1 state=ReceivingSplit count=7
+    pk=3 level=1 state=DrainingSplit count=5 left=4 right=5
+      pk=4 level=1 state=ReceivingSplit count=0
+      pk=5 level=1 state=ReceivingSplit count=4
 
 validate
 ----
 ok: records=13 trees=1 partitions=5 max_level=2
+
+split-step tree=1
+----
+pk=3: drained moved=4 remaining=1
 
 # The last source entry drains and the split completes: the parent's Child
 # Entries flip from the source to the two targets.
@@ -259,7 +297,18 @@ restarted
 
 split-step tree=1
 ----
-pk=1: drained moved=8 remaining=4
+pk=1: drained moved=4 remaining=8
+
+format-tree
+----
+tree 0: root pk=1
+  pk=1 level=1 state=DrainingSplit count=8 left=2 right=3
+    pk=2 level=1 state=ReceivingSplit count=2
+    pk=3 level=1 state=ReceivingSplit count=2
+
+split-step tree=1
+----
+pk=1: drained moved=4 remaining=4
 
 format-tree
 ----

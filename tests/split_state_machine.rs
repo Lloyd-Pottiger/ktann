@@ -110,7 +110,21 @@ async fn root_leaf_split_runs_end_to_end_and_stays_searchable() {
         topology::SplitStart::AlreadySplitting { left, right }
     );
 
-    // Expose publishes both targets parentless, owned by the root's slot.
+    // While Splitting, inserts still land in the source.
+    index.insert(record(&rid(6), 6.0, 1)).await.expect("insert");
+    records.push((rid(6), 6.0));
+    assert_eq!(
+        location_of(&backend, &manifest, &rid(6))
+            .await
+            .expect("location")
+            .leaf(),
+        pk(1)
+    );
+    assert_searchable(&backend, &manifest, &key, &records).await;
+
+    // Exposure publishes both targets parentless — owned by the root's slot —
+    // and advances the source to DrainingSplit in the same transaction; the
+    // transition deliberately ignores the source's count.
     let trained = train_split_centroids(&mut read_txn(&backend, &manifest).await, &key, pk(1))
         .await
         .expect("train");
@@ -147,30 +161,12 @@ async fn root_leaf_split_runs_end_to_end_and_stays_searchable() {
         centroid_of(&backend, &manifest, &key, right).await.as_ref(),
         Some(trained.right())
     );
-    assert_searchable(&backend, &manifest, &key, &records).await;
-
-    // While Splitting, inserts still land in the source.
-    index.insert(record(&rid(6), 6.0, 1)).await.expect("insert");
-    records.push((rid(6), 6.0));
-    assert_eq!(
-        location_of(&backend, &manifest, &rid(6))
-            .await
-            .expect("location")
-            .leaf(),
-        pk(1)
-    );
-
-    // Advance to DrainingSplit; the source count is deliberately ignored.
-    let advanced = split::advance_to_draining(&backend, &manifest, &key, pk(1), 1_200, &retry())
-        .await
-        .expect("advance");
-    assert_eq!(advanced, topology::DrainStart::Advanced);
     assert_eq!(
         state_of(&backend, &manifest, &key, pk(1)).await,
         Some(PartitionTransition::DrainingSplit {
             left,
             right,
-            started_at_unix_millis: 1_200,
+            started_at_unix_millis: 1_100,
         })
     );
     assert_searchable(&backend, &manifest, &key, &records).await;
@@ -355,9 +351,6 @@ async fn split_root_into_two_leaves(
     split::expose_targets(backend, manifest, key, pk(1), 1_100, &retry())
         .await
         .expect("expose");
-    split::advance_to_draining(backend, manifest, key, pk(1), 1_200, &retry())
-        .await
-        .expect("advance");
     drain_to_zero(backend, manifest, key, pk(1)).await;
     let completed = split::complete_split(backend, manifest, key, pk(1), 1_300, &retry())
         .await
@@ -406,7 +399,8 @@ async fn non_root_leaf_split_installs_edges_and_removes_the_source() {
     assert_eq!((left, right), (pk(4), pk(5)));
     assert_searchable(&backend, &manifest, &key, &records).await;
 
-    // Expose installs each target's Child Entry in the source's parent.
+    // Expose installs both targets' Child Entries in the source's parent and
+    // advances the source to DrainingSplit in the same transaction.
     let exposed = split::expose_targets(&backend, &manifest, &key, left_leaf, 2_100, &retry())
         .await
         .expect("expose");
@@ -427,9 +421,6 @@ async fn non_root_leaf_split_installs_edges_and_removes_the_source() {
     );
     assert_searchable(&backend, &manifest, &key, &records).await;
 
-    split::advance_to_draining(&backend, &manifest, &key, left_leaf, 2_200, &retry())
-        .await
-        .expect("advance");
     drain_to_zero(&backend, &manifest, &key, left_leaf).await;
     assert_searchable(&backend, &manifest, &key, &records).await;
 
@@ -744,10 +735,6 @@ async fn non_root_internal_split_moves_child_entries() {
         4
     );
 
-    split::advance_to_draining(&backend, &manifest, &key, pk(2), 2_200, &retry())
-        .await
-        .expect("advance");
-
     // Drain: Child Entries move to the nearer persisted centroid with no
     // Record Location, Vector Record, or Synopsis work.
     drain_to_zero(&backend, &manifest, &key, pk(2)).await;
@@ -856,8 +843,8 @@ async fn advance_rediscovers_and_converges_a_cold_split() {
     let state = state_of(&backend, &manifest, &key, over)
         .await
         .expect("source state");
-    let PartitionTransition::Splitting { left, .. } = state else {
-        panic!("source must be Splitting");
+    let PartitionTransition::DrainingSplit { left, .. } = state else {
+        panic!("exposure leaves the source DrainingSplit");
     };
     // The target is over-threshold-empty but ReceivingSplit: not eligible.
     assert_eq!(
@@ -1008,7 +995,7 @@ async fn begin_split_recovers_from_every_commit_outcome() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn target_creation_recovers_from_every_commit_outcome() {
+async fn exposure_recovers_from_every_commit_outcome() {
     for fault in [
         CommitFault::Abort,
         CommitFault::UnknownNotApplied,
@@ -1025,46 +1012,71 @@ async fn target_creation_recovers_from_every_commit_outcome() {
 
         backend.inner().push_fault(fault).expect("push fault");
         let mut txn = write_txn(&backend, &manifest).await;
-        let created =
-            topology::create_split_target(&mut txn, &key, pk(1), pk(2), trained.left(), 1_100)
-                .await
-                .expect("create op");
-        assert_eq!(created, topology::TargetInstall::Created);
+        let exposed = topology::expose_split_targets(
+            &mut txn,
+            &key,
+            pk(1),
+            [(pk(2), trained.left()), (pk(3), trained.right())],
+            1_100,
+        )
+        .await
+        .expect("expose op");
+        assert_eq!(exposed, topology::SplitExposure::Exposed);
         let error = txn.commit().await.expect_err("injected fault");
         assert_fault_kind(fault, &error);
 
         let mut retry_txn = write_txn(&backend, &manifest).await;
-        let redriven = topology::create_split_target(
+        let redriven = topology::expose_split_targets(
             &mut retry_txn,
             &key,
             pk(1),
-            pk(2),
-            trained.left(),
+            [(pk(2), trained.left()), (pk(3), trained.right())],
             1_101,
         )
         .await
-        .expect("redriven create");
+        .expect("redriven expose");
         match fault {
             CommitFault::UnknownApplied => {
-                // The persisted centroid stands; the re-driven centroid (same
-                // value here) is discarded and the original start time kept.
-                assert_eq!(redriven, topology::TargetInstall::AlreadyExists);
+                // The committed exposure is adopted: the persisted centroids
+                // and the original start time stand, never overwritten.
+                assert_eq!(redriven, topology::SplitExposure::AlreadyExposed);
+                for target in [pk(2), pk(3)] {
+                    assert_eq!(
+                        state_of(&backend, &manifest, &key, target).await,
+                        Some(PartitionTransition::ReceivingSplit {
+                            source: pk(1),
+                            started_at_unix_millis: 1_100,
+                        })
+                    );
+                }
                 assert_eq!(
-                    state_of(&backend, &manifest, &key, pk(2)).await,
-                    Some(PartitionTransition::ReceivingSplit {
-                        source: pk(1),
+                    state_of(&backend, &manifest, &key, pk(1)).await,
+                    Some(PartitionTransition::DrainingSplit {
+                        left: pk(2),
+                        right: pk(3),
                         started_at_unix_millis: 1_100,
                     })
                 );
             }
-            _ => assert_eq!(redriven, topology::TargetInstall::Created),
+            _ => assert_eq!(redriven, topology::SplitExposure::Exposed),
         }
         retry_txn.commit().await.expect("retry commits");
+
+        // The published centroids are the trained routing model, however many
+        // attempts it took.
+        assert_eq!(
+            centroid_of(&backend, &manifest, &key, pk(2)).await.as_ref(),
+            Some(trained.left())
+        );
+        assert_eq!(
+            centroid_of(&backend, &manifest, &key, pk(3)).await.as_ref(),
+            Some(trained.right())
+        );
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn advance_and_finalize_recover_from_every_commit_outcome() {
+async fn finalize_recovers_from_every_commit_outcome() {
     for fault in [
         CommitFault::Abort,
         CommitFault::UnknownNotApplied,
@@ -1078,26 +1090,6 @@ async fn advance_and_finalize_recover_from_every_commit_outcome() {
         split::expose_targets(&backend, &manifest, &key, pk(1), 1_100, &retry())
             .await
             .expect("expose");
-
-        // Advance under the injected fault.
-        backend.inner().push_fault(fault).expect("push fault");
-        let mut txn = write_txn(&backend, &manifest).await;
-        topology::advance_to_draining(&mut txn, &key, pk(1), 1_200)
-            .await
-            .expect("advance op");
-        let error = txn.commit().await.expect_err("injected fault");
-        assert_fault_kind(fault, &error);
-        let mut retry_txn = write_txn(&backend, &manifest).await;
-        let redriven = topology::advance_to_draining(&mut retry_txn, &key, pk(1), 1_201)
-            .await
-            .expect("redriven advance");
-        match fault {
-            CommitFault::UnknownApplied => {
-                assert_eq!(redriven, topology::DrainStart::AlreadyDraining)
-            }
-            _ => assert_eq!(redriven, topology::DrainStart::Advanced),
-        }
-        retry_txn.commit().await.expect("retry commits");
 
         // Drain everything, then finalize under the injected fault.
         drain_to_zero(&backend, &manifest, &key, pk(1)).await;
@@ -1162,9 +1154,6 @@ async fn drain_recovers_from_unknown_outcomes_without_losing_membership() {
     split::expose_targets(&backend, &manifest, &key, pk(1), 1_100, &retry())
         .await
         .expect("expose");
-    split::advance_to_draining(&backend, &manifest, &key, pk(1), 1_200, &retry())
-        .await
-        .expect("advance");
 
     // The first batch's commit reports an unknown outcome after applying.
     backend
@@ -1222,9 +1211,6 @@ async fn a_restarted_process_rediscovers_the_durable_split_state() {
     split::expose_targets(&backend, &manifest, &key, pk(1), 1_100, &retry())
         .await
         .expect("expose");
-    split::advance_to_draining(&backend, &manifest, &key, pk(1), 1_200, &retry())
-        .await
-        .expect("advance");
     split::drain_batch(&backend, &manifest, &key, pk(1), &retry())
         .await
         .expect("one batch");
@@ -1243,7 +1229,7 @@ async fn a_restarted_process_rediscovers_the_durable_split_state() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_concurrent_source_write_aborts_begin_but_not_exposure() {
+async fn a_concurrent_source_write_aborts_begin_and_exposure() {
     let backend = backend();
     let (manifest, key) = seed_over_max_root(&backend).await;
 
@@ -1283,30 +1269,60 @@ async fn a_concurrent_source_write_aborts_begin_but_not_exposure() {
     assert!(matches!(started, topology::SplitStart::Started { .. }));
     retried.commit().await.expect("retry commits");
 
-    // Exposure deliberately ignores concurrent source data changes: an insert
-    // into the Splitting source does not conflict with target creation.
+    // Exposure update-protects and rewrites the source authority pair, so an
+    // insert into the Splitting source conflicts with it; the whole-step
+    // retry absorbs the abort (ADR 0014).
     let trained = train_split_centroids(&mut read_txn(&backend, &manifest).await, &key, pk(1))
         .await
         .expect("train");
     let runtime = make_runtime(backend.clone());
     let index = runtime.open_index("index").await.expect("open");
     let mut attempt = write_txn(&backend, &manifest).await;
-    topology::create_split_target(&mut attempt, &key, pk(1), pk(2), trained.left(), 1_100)
-        .await
-        .expect("create op");
+    let exposed = topology::expose_split_targets(
+        &mut attempt,
+        &key,
+        pk(1),
+        [(pk(2), trained.left()), (pk(3), trained.right())],
+        1_100,
+    )
+    .await
+    .expect("expose op");
+    assert_eq!(exposed, topology::SplitExposure::Exposed);
     index
         .insert(record(&rid(20), 2.5, 1))
         .await
         .expect("insert");
-    attempt
+    let error = attempt
         .commit()
         .await
-        .expect("creation does not conflict with source writes");
+        .expect_err("exposure conflicts with a concurrent source write");
+    assert_eq!(error.kind(), ErrorKind::RetryableAbort);
+
+    // The retried exposure commits from a fresh snapshot; the concurrent
+    // insert stayed in the source. (The doctored conflict write above skews
+    // the source's exact count, so this test asserts no membership.)
+    let redriven = split::expose_targets(&backend, &manifest, &key, pk(1), 1_101, &retry())
+        .await
+        .expect("redriven expose");
+    assert_eq!(
+        redriven,
+        split::TargetExposure::Exposed {
+            left: pk(2),
+            right: pk(3)
+        }
+    );
+    assert_eq!(
+        location_of(&backend, &manifest, &rid(20))
+            .await
+            .expect("location")
+            .leaf(),
+        pk(1)
+    );
     runtime.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_concurrent_transition_aborts_target_creation_and_advance() {
+async fn a_concurrent_exposure_aborts_the_losing_attempt() {
     let backend = backend();
     let (manifest, key) = seed_over_max_root(&backend).await;
     split::begin_split(&backend, &manifest, &key, pk(1), 1_000, &retry())
@@ -1316,48 +1332,44 @@ async fn a_concurrent_transition_aborts_target_creation_and_advance() {
         .await
         .expect("train");
 
-    // A concurrent worker exposing the same target conflicts on the target
-    // keys through the unique insert's protected existence check.
+    // A concurrent worker exposing the same split conflicts on the
+    // update-protected source authority pair.
     let mut attempt = write_txn(&backend, &manifest).await;
-    topology::create_split_target(&mut attempt, &key, pk(1), pk(2), trained.left(), 1_100)
-        .await
-        .expect("create op");
+    let exposed = topology::expose_split_targets(
+        &mut attempt,
+        &key,
+        pk(1),
+        [(pk(2), trained.left()), (pk(3), trained.right())],
+        1_100,
+    )
+    .await
+    .expect("expose op");
+    assert_eq!(exposed, topology::SplitExposure::Exposed);
     split::expose_targets(&backend, &manifest, &key, pk(1), 1_101, &retry())
         .await
         .expect("concurrent expose");
     let error = attempt
         .commit()
         .await
-        .expect_err("duplicate creation conflicts");
+        .expect_err("the losing exposure conflicts");
     assert_eq!(error.kind(), ErrorKind::RetryableAbort);
 
-    // A concurrent advance conflicts with a stale create attempt: the source
-    // State is update-protected by creation even when the target turns out to
-    // already exist, so the stale attempt's commit aborts and must retry.
-    let mut stale = write_txn(&backend, &manifest).await;
-    let outcome =
-        topology::create_split_target(&mut stale, &key, pk(1), pk(2), trained.left(), 1_102)
-            .await
-            .expect("stale create op");
-    assert_eq!(outcome, topology::TargetInstall::AlreadyExists);
-    split::advance_to_draining(&backend, &manifest, &key, pk(1), 1_200, &retry())
-        .await
-        .expect("concurrent advance");
-    let error = stale
-        .commit()
-        .await
-        .expect_err("the source-state protection conflicts with the advance");
-    assert_eq!(error.kind(), ErrorKind::RetryableAbort);
-
-    // Once the source is DrainingSplit, a create attempt for a named target
-    // verifies the exposed target instead of recreating it, and commits.
+    // A re-driven exposure observes the committed DrainingSplit state and
+    // adopts it without writing anything.
+    let key_count = backend.inner().db_key_count();
     let mut txn = write_txn(&backend, &manifest).await;
-    let outcome =
-        topology::create_split_target(&mut txn, &key, pk(1), pk(2), trained.left(), 1_300)
-            .await
-            .expect("verify existing");
-    assert_eq!(outcome, topology::TargetInstall::AlreadyExists);
-    txn.commit().await.expect("verification writes nothing");
+    let redriven = topology::expose_split_targets(
+        &mut txn,
+        &key,
+        pk(1),
+        [(pk(2), trained.left()), (pk(3), trained.right())],
+        1_102,
+    )
+    .await
+    .expect("redriven expose");
+    assert_eq!(redriven, topology::SplitExposure::AlreadyExposed);
+    txn.commit().await.expect("redrive writes nothing");
+    assert_eq!(backend.inner().db_key_count(), key_count, "no writes");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1375,27 +1387,24 @@ async fn a_stale_worker_cannot_recreate_a_target_after_completion() {
     let key_count = backend.inner().db_key_count();
 
     // The split is complete: the source State now says Ready (the root was
-    // converted), so the stale creation attempt abandons without writing.
+    // converted), so the stale exposure attempt abandons without writing.
     let mut txn = write_txn(&backend, &manifest).await;
-    let outcome =
-        topology::create_split_target(&mut txn, &key, pk(1), pk(2), trained.left(), 9_999)
-            .await
-            .expect("stale create");
-    assert_eq!(outcome, topology::TargetInstall::SourceAdvanced);
+    let outcome = topology::expose_split_targets(
+        &mut txn,
+        &key,
+        pk(1),
+        [(pk(2), trained.left()), (pk(3), trained.right())],
+        9_999,
+    )
+    .await
+    .expect("stale expose");
+    assert_eq!(outcome, topology::SplitExposure::SourceAdvanced);
     txn.commit().await.expect("nothing written");
     assert_eq!(
         backend.inner().db_key_count(),
         key_count,
         "no orphan writes"
     );
-
-    // A stale advance or drain likewise has nothing to do.
-    let mut txn = write_txn(&backend, &manifest).await;
-    let outcome = topology::advance_to_draining(&mut txn, &key, pk(1), 9_999)
-        .await
-        .expect("stale advance");
-    assert_eq!(outcome, topology::DrainStart::NotSplitting);
-    txn.rollback().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1415,9 +1424,6 @@ async fn a_concurrent_drain_move_conflicts_with_a_foreground_delete() {
     split::expose_targets(&backend, &manifest, &key, pk(1), 1_100, &retry())
         .await
         .expect("expose");
-    split::advance_to_draining(&backend, &manifest, &key, pk(1), 1_200, &retry())
-        .await
-        .expect("advance");
 
     // The drain's update-protected entry read conflicts with a concurrent
     // delete of the same record; the batch retries and skips the moved entry.
@@ -1839,9 +1845,6 @@ async fn drain_fails_closed_on_an_inconsistent_entry() {
     split::expose_targets(&backend, &manifest, &key, pk(1), 1_100, &retry())
         .await
         .expect("expose");
-    split::advance_to_draining(&backend, &manifest, &key, pk(1), 1_200, &retry())
-        .await
-        .expect("advance");
 
     // Corrupt one Record Location through the raw seam: it names a leaf that
     // is not the source.
@@ -1973,6 +1976,12 @@ async fn seeded_model_history_interleaving_mutations_and_splits() {
                     )
                     .await
                     {
+                        // A child split waits while its parent drains; the
+                        // exhausted step applied nothing and is rediscovered
+                        // later, exactly like the settling loop tolerates.
+                        if error.kind() == ErrorKind::ContentionExhausted {
+                            continue;
+                        }
                         let header = header_of(&backend, &manifest, &key, partition).await;
                         let state = state_of(&backend, &manifest, &key, partition).await;
                         panic!(
@@ -2146,9 +2155,6 @@ async fn drain_moves_bounded_batches_and_refreshes_target_authority() {
     split::expose_targets(&backend, &manifest, &key, pk(1), 1_100, &retry())
         .await
         .expect("expose");
-    split::advance_to_draining(&backend, &manifest, &key, pk(1), 1_200, &retry())
-        .await
-        .expect("advance");
 
     // Newly exposed targets start empty with a zero epoch.
     for target in [pk(2), pk(3)] {
@@ -2159,16 +2165,16 @@ async fn drain_moves_bounded_batches_and_refreshes_target_authority() {
         assert_eq!(header.cache_epoch(), 0);
     }
 
-    // The configured threshold caps this small fixture at eight entries, so
-    // the exact count drives two bounded batches.
+    // The configured threshold caps the batch at one partition's worth of
+    // entries, so the exact count drives three bounded batches.
     let first = split::drain_batch(&backend, &manifest, &key, pk(1), &retry())
         .await
         .expect("first batch");
     assert_eq!(
         first,
         split::DrainStep::Drained {
-            moved: 8,
-            remaining: 2
+            moved: 4,
+            remaining: 6
         }
     );
     let second = split::drain_batch(&backend, &manifest, &key, pk(1), &retry())
@@ -2176,6 +2182,16 @@ async fn drain_moves_bounded_batches_and_refreshes_target_authority() {
         .expect("second batch");
     assert_eq!(
         second,
+        split::DrainStep::Drained {
+            moved: 4,
+            remaining: 2
+        }
+    );
+    let third = split::drain_batch(&backend, &manifest, &key, pk(1), &retry())
+        .await
+        .expect("third batch");
+    assert_eq!(
+        third,
         split::DrainStep::Drained {
             moved: 2,
             remaining: 0
@@ -2333,7 +2349,7 @@ async fn non_root_finalize_recovers_from_an_unknown_commit_outcome() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn advance_fails_closed_on_a_torn_target_without_committing() {
+async fn exposure_fails_closed_on_a_torn_target_without_committing() {
     let backend = backend();
     let runtime = make_runtime(backend.clone());
     let index = runtime
@@ -2422,12 +2438,22 @@ async fn advance_fails_closed_on_a_torn_target_without_committing() {
     }
     txn.commit().await.expect("commit fixture");
 
-    // The transition refuses to commit the source into a DrainingSplit that
-    // drain and completion could only wedge behind...
+    // Exposure refuses to commit against a pre-existing target: under the
+    // atomic protocol a Splitting source has no installed targets, so the
+    // committed right target is a torn state.
     let mut txn = write_txn(&backend, &manifest).await;
-    let error = topology::advance_to_draining(&mut txn, &key, pk(1), 300)
-        .await
-        .expect_err("a torn target fails closed");
+    let error = topology::expose_split_targets(
+        &mut txn,
+        &key,
+        pk(1),
+        [
+            (pk(2), &PartitionCentroid::new(vec![0.0])),
+            (pk(3), &PartitionCentroid::new(vec![1.0])),
+        ],
+        300,
+    )
+    .await
+    .expect_err("a torn target fails closed");
     assert_eq!(error.kind(), ErrorKind::Corruption);
     txn.rollback().await;
 

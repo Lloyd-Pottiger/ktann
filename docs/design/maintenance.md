@@ -83,14 +83,16 @@ committed state.
 
 A short start transaction update-protects a Ready partition above maximum,
 revalidates its threshold, reserves never-reused target Partition Keys, and writes
-`Splitting { left, right }` on the source. Each target is then independently
-unique-created as `ReceivingSplit { source }` with its persisted centroid and,
-for a non-root split, its Child Entry. Target creation update-protects the source
-State and current incoming topology so a stale worker cannot recreate a target
-after completion. Once both targets exist, one transaction changes the source
-to `DrainingSplit { left, right }`. Splitting continues to accept foreground
-writes; ReceivingSplit accepts writes and movement but cannot start its own
-split or merge.
+`Splitting { left, right }` on the source. One exposure transaction then
+unique-creates both targets as `ReceivingSplit { source }` with their persisted
+centroids, installs both Child Entries into the source's current parent (for a
+non-root split), and advances the source to `DrainingSplit { left, right }`
+atomically, so no committed state holds a partially exposed split. Exposure
+update-protects the source authority pair and the current incoming topology so
+a stale worker cannot recreate a target after completion, and a Splitting
+source with an already-installed target fails closed as a torn committed state.
+Splitting continues to accept foreground writes; ReceivingSplit accepts writes
+and movement but cannot start its own split or merge.
 
 ### 4.2 Drain
 
@@ -107,11 +109,10 @@ charge fits the current Backend Admission Budget. The charge uses the
 Manifest's dimension, fields and Bloom parameters, the current Tree Key, codec
 key/value sizes, adapter key-prefix overhead, and the operation's worst target
 distribution: two targets for split, or one distinct Ready target per entry for
-merge. It then caps that safe bound at one quarter of the configured split
-threshold, with a floor of eight, limiting conflict rollback and failure blast
-radius relative to the index's ordinary partition size. Internal movement
-retains its fixed entry bound because it does not write Record Locations or
-Synopses.
+merge. It then caps that safe bound at the configured split threshold, limiting
+conflict rollback and failure blast radius to one ordinary partition's worth of
+entries. Internal movement retains its fixed entry bound because it does not
+write Record Locations or Synopses.
 
 Drain placement normally chooses the nearer persisted target centroid. Exact
 remaining and target counts reserve the last entries needed for each target to

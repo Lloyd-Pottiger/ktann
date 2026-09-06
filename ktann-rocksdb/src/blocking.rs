@@ -1,5 +1,6 @@
-use std::sync::Arc;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use ktann::api::{Error, ErrorKind, Result};
@@ -10,10 +11,91 @@ use crate::observe;
 
 const COMMAND_CAPACITY: usize = 1;
 
-/// Admits native transaction actors without exposing permits to the adapter interface.
+/// One transaction's whole native actor lifecycle, run by a pooled worker.
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+/// The bounded MPMC job queue shared by the pool's native worker threads.
+///
+/// Queued jobs hold one semaphore permit each, so the queue length stays
+/// within the configured limit. Dropping the pool closes the queue; workers
+/// finish their current job, then exit.
+#[derive(Default)]
+struct JobQueue {
+    state: Mutex<QueueState>,
+    ready: Condvar,
+}
+
+impl std::fmt::Debug for JobQueue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        formatter
+            .debug_struct("JobQueue")
+            .field("queued", &state.jobs.len())
+            .field("closed", &state.closed)
+            .finish()
+    }
+}
+
+#[derive(Default)]
+struct QueueState {
+    jobs: VecDeque<Job>,
+    closed: bool,
+}
+
+impl JobQueue {
+    /// Queues one job and wakes one worker.
+    ///
+    /// Called only from [`BlockingPool::start`], which borrows the pool, so
+    /// the queue cannot be closed concurrently.
+    fn push(&self, job: Job) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.jobs.push_back(job);
+        drop(state);
+        self.ready.notify_one();
+    }
+
+    /// Takes the next queued job, parking the worker until one arrives or the
+    /// queue closes.
+    fn pop_blocking(&self) -> Option<Job> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        loop {
+            if let Some(job) = state.jobs.pop_front() {
+                return Some(job);
+            }
+            if state.closed {
+                return None;
+            }
+            state = self
+                .ready
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+
+    /// Closes the queue and wakes every worker.
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.closed = true;
+        drop(state);
+        self.ready.notify_all();
+    }
+}
+
+/// A bounded pool of reusable native worker threads running transaction actors.
+///
+/// One admitted transaction occupies one permit from `start` through native
+/// cleanup, and its whole actor lifecycle runs as one job on one pooled
+/// thread, preserving serialized native access without a thread spawn per
+/// transaction. Workers spawn lazily as transactions arrive, up to the
+/// configured limit, so an idle adapter holds no native threads; they exit
+/// when the pool is dropped.
 #[derive(Debug)]
-pub(crate) struct BlockingAdmission {
+pub(crate) struct BlockingPool {
     state: Arc<AdmissionState>,
+    queue: Arc<JobQueue>,
+    spawned: AtomicUsize,
+    spawn_lock: Mutex<()>,
+    limit: usize,
 }
 
 #[derive(Debug)]
@@ -23,7 +105,7 @@ struct AdmissionState {
     idle: Notify,
 }
 
-impl BlockingAdmission {
+impl BlockingPool {
     pub(crate) fn new(limit: usize) -> Self {
         Self {
             state: Arc::new(AdmissionState {
@@ -31,12 +113,50 @@ impl BlockingAdmission {
                 active: AtomicUsize::new(0),
                 idle: Notify::new(),
             }),
+            queue: Arc::new(JobQueue::default()),
+            spawned: AtomicUsize::new(0),
+            spawn_lock: Mutex::new(()),
+            limit,
         }
     }
 
-    /// Waits asynchronously, then starts one bounded native transaction actor.
+    /// Grows the pool toward the configured limit as transactions arrive.
     ///
-    /// The actor owns its permit until its native state has been destroyed. Its
+    /// Spawning is serialized and lazy: an idle adapter holds no native
+    /// threads, and a failed spawn defers growth to the next transaction.
+    /// Fails closed with the spawn error only when no worker has ever come
+    /// up to serve queued jobs.
+    fn ensure_worker(&self) -> Result<()> {
+        if self.spawned.load(Ordering::Acquire) >= self.limit {
+            return Ok(());
+        }
+        let _guard = self
+            .spawn_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let worker = self.spawned.load(Ordering::Acquire);
+        if worker >= self.limit {
+            return Ok(());
+        }
+        let queue = Arc::clone(&self.queue);
+        match std::thread::Builder::new()
+            .name(format!("ktann-rocksdb-worker-{worker}"))
+            .spawn(move || worker_loop(&queue))
+        {
+            Ok(_) => {
+                self.spawned.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            }
+            // Live workers serve queued jobs; the next transaction retries
+            // the deferred growth.
+            Err(_) if worker > 0 => Ok(()),
+            Err(source) => Err(Error::with_source(ErrorKind::Backend, source)),
+        }
+    }
+
+    /// Waits asynchronously, then queues one native transaction actor.
+    ///
+    /// The job owns its permit until its native state has been destroyed. Its
     /// one-command channel keeps cancelled callers from creating an unbounded
     /// queue while preserving serialized access to the native transaction.
     pub(crate) async fn start<C>(
@@ -54,6 +174,7 @@ impl BlockingAdmission {
             .await
             .map_err(|source| Error::with_source(ErrorKind::Backend, source))?;
         observe::blocking_wait(wait_started.elapsed());
+        self.ensure_worker()?;
         self.state.active.fetch_add(1, Ordering::AcqRel);
         let permit = ActivePermit {
             _permit: permit,
@@ -63,13 +184,10 @@ impl BlockingAdmission {
         let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
         let (ready, opened) = oneshot::channel();
 
-        std::thread::Builder::new()
-            .name("ktann-rocksdb-actor".to_owned())
-            .spawn(move || {
-                let _permit = permit;
-                actor(receiver, ready);
-            })
-            .map_err(|source| Error::with_source(ErrorKind::Backend, source))?;
+        self.queue.push(Box::new(move || {
+            let _permit = permit;
+            actor(receiver, ready);
+        }));
 
         opened
             .await
@@ -82,6 +200,22 @@ impl BlockingAdmission {
         while self.state.active.load(Ordering::Acquire) != 0 {
             self.state.idle.notified().await;
         }
+    }
+}
+
+impl Drop for BlockingPool {
+    fn drop(&mut self) {
+        self.queue.close();
+    }
+}
+
+/// Runs queued jobs until the pool closes, surviving a panicking job.
+///
+/// The job's permit releases as the panic unwinds; the worker stays alive for
+/// the next transaction instead of dying with the job.
+fn worker_loop(queue: &JobQueue) {
+    while let Some(job) = queue.pop_blocking() {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
     }
 }
 
@@ -104,7 +238,7 @@ impl Drop for ActivePermit {
 ///
 /// Dropping the handle only closes its bounded command channel. The actor then
 /// destroys its native state on its existing native thread before
-/// releasing admission.
+/// releasing its permit.
 pub(crate) struct NativeWorker<C> {
     commands: mpsc::Sender<C>,
 }
@@ -184,40 +318,38 @@ mod tests {
         }
     }
 
-    async fn idle_worker(admission: &BlockingAdmission) -> Result<NativeWorker<()>> {
-        admission
-            .start(|mut commands, ready| {
-                if ready.send(()).is_err() {
-                    return;
-                }
-                while commands.blocking_recv().is_some() {}
-            })
-            .await
+    async fn idle_worker(pool: &BlockingPool) -> Result<NativeWorker<()>> {
+        pool.start(|mut commands, ready| {
+            if ready.send(()).is_err() {
+                return;
+            }
+            while commands.blocking_recv().is_some() {}
+        })
+        .await
     }
 
     async fn value_worker(
-        admission: &BlockingAdmission,
+        pool: &BlockingPool,
     ) -> Result<NativeWorker<oneshot::Sender<Result<usize>>>> {
-        admission
-            .start(
-                |mut commands: mpsc::Receiver<oneshot::Sender<Result<usize>>>, ready| {
-                    if ready.send(()).is_err() {
-                        return;
-                    }
-                    while let Some(response) = commands.blocking_recv() {
-                        let _ = response.send(Ok(7));
-                    }
-                },
-            )
-            .await
+        pool.start(
+            |mut commands: mpsc::Receiver<oneshot::Sender<Result<usize>>>, ready| {
+                if ready.send(()).is_err() {
+                    return;
+                }
+                while let Some(response) = commands.blocking_recv() {
+                    let _ = response.send(Ok(7));
+                }
+            },
+        )
+        .await
     }
 
     async fn slow_worker(
-        admission: &BlockingAdmission,
+        pool: &BlockingPool,
         gate: Arc<Gate>,
     ) -> Result<(NativeWorker<()>, oneshot::Receiver<()>)> {
         let (cleanup_started, started) = oneshot::channel();
-        let worker = admission
+        let worker = pool
             .start(move |mut commands: mpsc::Receiver<()>, ready| {
                 let _slow = SlowDrop {
                     started: Some(cleanup_started),
@@ -233,10 +365,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn live_actor_uses_native_calls_while_next_admission_waits() {
-        let admission = BlockingAdmission::new(1);
-        let holder = value_worker(&admission).await.expect("holder starts");
-        let mut waiter = Box::pin(idle_worker(&admission));
+    async fn live_actor_uses_native_calls_while_next_pool_waits() {
+        let pool = BlockingPool::new(1);
+        let holder = value_worker(&pool).await.expect("holder starts");
+        let mut waiter = Box::pin(idle_worker(&pool));
         poll_fn(|context| match waiter.as_mut().poll(context) {
             Poll::Pending => Poll::Ready(()),
             Poll::Ready(_) => panic!("a live actor released its resource slot"),
@@ -259,10 +391,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancelling_before_admission_removes_the_waiter() {
-        let admission = BlockingAdmission::new(1);
-        let holder = idle_worker(&admission).await.expect("holder starts");
-        let mut waiter = Box::pin(idle_worker(&admission));
+    async fn cancelling_before_pool_removes_the_waiter() {
+        let pool = BlockingPool::new(1);
+        let holder = idle_worker(&pool).await.expect("holder starts");
+        let mut waiter = Box::pin(idle_worker(&pool));
         poll_fn(|context| match waiter.as_mut().poll(context) {
             Poll::Pending => Poll::Ready(()),
             Poll::Ready(_) => panic!("waiter acquired a held permit"),
@@ -271,17 +403,17 @@ mod tests {
         drop(waiter);
         drop(holder);
 
-        let successor = tokio::time::timeout(Duration::from_secs(1), idle_worker(&admission))
+        let successor = tokio::time::timeout(Duration::from_secs(1), idle_worker(&pool))
             .await
-            .expect("cancelled admission does not leak capacity")
+            .expect("cancelled pool does not leak capacity")
             .expect("successor starts");
         drop(successor);
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn current_thread_runtime_can_use_native_actor() {
-        let admission = BlockingAdmission::new(1);
-        let worker = idle_worker(&admission)
+        let pool = BlockingPool::new(1);
+        let worker = idle_worker(&pool)
             .await
             .expect("current-thread runtime starts blocking actor");
         drop(worker);
@@ -289,9 +421,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn local_set_drop_does_not_block_unrelated_tasks_during_slow_cleanup() {
-        let admission = BlockingAdmission::new(1);
+        let pool = BlockingPool::new(1);
         let gate = Arc::new(Gate::default());
-        let (worker, started) = slow_worker(&admission, Arc::clone(&gate))
+        let (worker, started) = slow_worker(&pool, Arc::clone(&gate))
             .await
             .expect("worker starts");
 
@@ -314,15 +446,15 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn orderly_shutdown_waits_for_native_cleanup_completion() {
-        let admission = BlockingAdmission::new(1);
+        let pool = BlockingPool::new(1);
         let gate = Arc::new(Gate::default());
-        let (worker, started) = slow_worker(&admission, Arc::clone(&gate))
+        let (worker, started) = slow_worker(&pool, Arc::clone(&gate))
             .await
             .expect("worker starts");
         drop(worker);
         started.await.expect("cleanup starts");
 
-        let mut shutdown = Box::pin(admission.wait_for_idle());
+        let mut shutdown = Box::pin(pool.wait_for_idle());
         poll_fn(|context| match shutdown.as_mut().poll(context) {
             Poll::Pending => Poll::Ready(()),
             Poll::Ready(()) => panic!("shutdown completed before native cleanup"),
@@ -341,10 +473,10 @@ mod tests {
             .enable_all()
             .build()
             .expect("runtime builds");
-        let admission = BlockingAdmission::new(1);
+        let pool = BlockingPool::new(1);
         let gate = Arc::new(Gate::default());
         let (worker, mut started) = runtime
-            .block_on(slow_worker(&admission, Arc::clone(&gate)))
+            .block_on(slow_worker(&pool, Arc::clone(&gate)))
             .expect("worker starts");
         runtime.spawn(async move {
             let _worker = worker;
@@ -373,11 +505,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cleanup_panic_releases_admission() {
-        let admission = BlockingAdmission::new(1);
+    async fn cleanup_panic_releases_pool() {
+        let pool = BlockingPool::new(1);
         let panics = Arc::new(AtomicUsize::new(0));
         let panic_count = Arc::clone(&panics);
-        let worker = admission
+        let worker = pool
             .start(move |mut commands: mpsc::Receiver<()>, ready| {
                 struct PanicOnDrop(Arc<AtomicUsize>);
 
@@ -398,11 +530,43 @@ mod tests {
             .expect("worker starts");
         drop(worker);
 
-        let successor = tokio::time::timeout(Duration::from_secs(1), idle_worker(&admission))
+        let successor = tokio::time::timeout(Duration::from_secs(1), idle_worker(&pool))
             .await
             .expect("panic releases capacity")
             .expect("successor starts");
         assert_eq!(panics.load(Ordering::SeqCst), 1);
         drop(successor);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worker_threads_are_reused_across_transactions() {
+        let pool = BlockingPool::new(1);
+        let mut thread_ids = Vec::new();
+        for _ in 0..2 {
+            let worker = pool
+                .start(
+                    |mut commands: mpsc::Receiver<
+                        oneshot::Sender<Result<std::thread::ThreadId>>,
+                    >,
+                     ready| {
+                        if ready.send(()).is_err() {
+                            return;
+                        }
+                        while let Some(response) = commands.blocking_recv() {
+                            let _ = response.send(Ok(std::thread::current().id()));
+                        }
+                    },
+                )
+                .await
+                .expect("worker starts");
+            thread_ids.push(
+                worker
+                    .request(|response| response)
+                    .await
+                    .expect("thread id"),
+            );
+            drop(worker);
+        }
+        assert_eq!(thread_ids[0], thread_ids[1], "the pool reuses its worker");
     }
 }
