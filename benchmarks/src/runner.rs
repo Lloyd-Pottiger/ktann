@@ -1189,10 +1189,52 @@ async fn prepare_index<B: Backend>(
     let import_started = phase_started(spec, "import");
     load_index(&index, dataset, spec).await?;
     phase_completed(spec, "import", import_started);
+    log_import_diagnostics(spec, metric_capture);
     let deadline = Instant::now() + settle_timeout(spec);
     let (topology, _) =
         settle_and_drain_topology(&index, dataset, spec, metric_capture, deadline).await?;
     Ok((index, topology))
+}
+
+/// Logs the import phase's admission, contention, and commit diagnostics.
+///
+/// Quality profiles measure only the post-setup sweep, so the import phase's
+/// own metrics would otherwise be invisible at exactly the scales where import
+/// throughput matters. The snapshot consumes the import interval's counters
+/// and histograms, keeping later phase intervals disjoint.
+fn log_import_diagnostics(spec: &ScenarioSpec, metric_capture: &MetricCapture) {
+    let metrics = metric_capture.snapshot();
+    for (gate, samples) in metrics.histograms_by_label("ktann.import.wait", "gate") {
+        let wait = Distribution::from_samples(samples).seconds_to_milliseconds();
+        eprintln!(
+            "[{}] import wait gate={gate}: count={} mean={:.3}ms p95={:.3}ms max={:.3}ms",
+            spec.name, wait.count, wait.mean, wait.p95, wait.max,
+        );
+    }
+    for (direction, samples) in
+        metrics.histograms_by_label("ktann.import.concurrency.limit", "direction")
+    {
+        let limits = Distribution::from_samples(samples);
+        eprintln!(
+            "[{}] import concurrency {direction}: count={} max-limit={:.0}",
+            spec.name, limits.count, limits.max,
+        );
+    }
+    let attempts = metrics.counters_rendered("ktann.write.attempts");
+    if !attempts.is_empty() {
+        eprintln!("[{}] import write attempts: {attempts:?}", spec.name);
+    }
+    for (labels, distribution) in metrics.distributions_rendered("ktann.write.commit.duration") {
+        let wait = distribution.seconds_to_milliseconds();
+        eprintln!(
+            "[{}] import commit wait {labels}: count={} mean={:.3}ms p95={:.3}ms",
+            spec.name, wait.count, wait.mean, wait.p95,
+        );
+    }
+    let steps = metrics.counters_rendered("ktann.fixup.steps");
+    if !steps.is_empty() {
+        eprintln!("[{}] import-phase fixup steps: {steps:?}", spec.name);
+    }
 }
 
 /// Measures one fixed workload after setup and before the invariant audit.
