@@ -1028,7 +1028,7 @@ mod tests {
         keys::tree_manifest_plan_range(index, prefix.as_bytes(), lower.as_deref(), upper.as_deref())
     }
 
-    fn assert_ordered_and_disjoint(plan: &TreeKeyPlan) {
+    pub(super) fn assert_ordered_and_disjoint(plan: &TreeKeyPlan) {
         for pair in plan.ranges().windows(2) {
             assert!(
                 pair[0].end() <= pair[1].start(),
@@ -2159,7 +2159,9 @@ mod tests {
 
 #[cfg(test)]
 mod exhaustive {
-    use super::tests::{compare, i64_value, oracle, property_manifest, string_value};
+    use super::tests::{
+        assert_ordered_and_disjoint, compare, i64_value, oracle, property_manifest, string_value,
+    };
     use crate::api::{CompareOp, DataType, FieldId, Predicate, Value};
     use crate::storage::keys::{self, TreeKey};
 
@@ -2357,6 +2359,123 @@ mod exhaustive {
                     );
                 }
             }
+        }
+    }
+
+    /// The shrunk proptest failures persisted in
+    /// `proptest-regressions/search/plan.txt`, written out explicitly so the
+    /// scenarios stay readable and do not depend on the opaque seed stream:
+    /// connectives nested three levels deep, an empty conjunction, and `In`
+    /// points over extreme or ceiling-length values, all beyond the
+    /// two-level sweep above.
+    #[test]
+    fn shrunk_proptest_regressions_hold() {
+        let manifest = property_manifest();
+        let types = [DataType::I64, DataType::String];
+        let ceiling = "x".repeat(1024);
+
+        // Conjunctive cases must agree with the oracle exactly.
+        let exact_cases: Vec<(Predicate, Vec<Value>)> = vec![
+            // An empty conjunction is a tautology and matches every key.
+            (
+                Predicate::And(vec![]),
+                vec![i64_value(2), string_value("aa")],
+            ),
+            // Non-adjacent `In` points reaching i64::MAX, whose point
+            // interval has no successor and extends to the domain end.
+            (
+                Predicate::In {
+                    field: FieldId(0),
+                    values: vec![i64_value(1), i64_value(i64::MAX)],
+                },
+                vec![i64_value(i64::MIN), string_value("a\u{0}")],
+            ),
+            // An `In` point at the string length ceiling has no successor
+            // and stays an exact point.
+            (
+                Predicate::In {
+                    field: FieldId(1),
+                    values: vec![string_value(&ceiling)],
+                },
+                vec![i64_value(7), string_value("a")],
+            ),
+            // The complement of a NUL-extended string point.
+            (
+                Predicate::Not(Box::new(Predicate::In {
+                    field: FieldId(1),
+                    values: vec![string_value("a\u{0}")],
+                })),
+                vec![i64_value(i64::MIN), string_value(&ceiling)],
+            ),
+        ];
+
+        // Non-conjunctive cases may over-accept but must never miss a match.
+        let widened_cases: Vec<(Predicate, Vec<Value>)> = vec![
+            // The complement of a disjunction over a conjunctive interval.
+            (
+                Predicate::Not(Box::new(Predicate::Or(vec![Predicate::And(vec![
+                    compare(1, CompareOp::Lt, string_value("z")),
+                    compare(1, CompareOp::Gt, string_value("aa")),
+                ])]))),
+                vec![i64_value(-1), string_value("a")],
+            ),
+            // An intersection whose second conjunct is a nested union of an
+            // intersection.
+            (
+                Predicate::And(vec![
+                    Predicate::And(vec![
+                        Predicate::Not(Box::new(compare(0, CompareOp::LessOrEqual, i64_value(0)))),
+                        Predicate::Not(Box::new(Predicate::In {
+                            field: FieldId(1),
+                            values: vec![string_value("a"), string_value("a"), string_value("b")],
+                        })),
+                        compare(0, CompareOp::Gt, i64_value(2)),
+                    ]),
+                    Predicate::Or(vec![Predicate::And(vec![Predicate::In {
+                        field: FieldId(0),
+                        values: vec![i64_value(7), i64_value(i64::MAX)],
+                    }])]),
+                ]),
+                vec![i64_value(i64::MAX), string_value("")],
+            ),
+        ];
+
+        // Every case plans ordered disjoint ranges; a matching key is
+        // accepted and lies inside one of them.
+        let check = |predicate: &Predicate, key: &[Value]| {
+            let plan = plan_tree_keys(&manifest, Some(predicate), 8).expect("plan");
+            assert_ordered_and_disjoint(&plan);
+            let tree_key = TreeKey::encode(&types, key).expect("canonical key");
+            let expected = oracle(predicate, key);
+            let scenario = format!(
+                "{} for key [{}]",
+                format_predicate(predicate),
+                format_key(key)
+            );
+            if expected {
+                let directory_key = keys::tree_manifest_key(manifest.logical_index_id(), &tree_key);
+                assert!(
+                    plan.ranges().iter().any(|range| {
+                        range.start() <= directory_key.as_slice()
+                            && directory_key.as_slice() < range.end()
+                    }),
+                    "matching key outside every planned range: {scenario}"
+                );
+            }
+            (
+                plan.accepts(&tree_key).expect("accepts"),
+                expected,
+                scenario,
+            )
+        };
+
+        for (predicate, key) in &exact_cases {
+            let (accepted, expected, scenario) = check(predicate, key);
+            assert_eq!(accepted, expected, "inexact conjunctive plan: {scenario}");
+        }
+        for (predicate, key) in &widened_cases {
+            let (accepted, expected, scenario) = check(predicate, key);
+            assert!(accepted || !expected, "missed a match: {scenario}");
         }
     }
 }
