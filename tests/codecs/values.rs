@@ -214,16 +214,16 @@ fn namespace_and_manifest_golden_bytes() {
         codec
             .encode(&PersistentValue::IndexIdAllocator(IndexIdAllocator::new(0)))
             .expect("encode"),
-        b"\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00"
+        b"\x00\x00\x00\x00\x00\x00\x00\x00\x00"
     );
     assert_eq!(
         codec
             .encode(&PersistentValue::IndexNameEntry(IndexNameEntry::new(id(1))))
             .expect("encode"),
-        b"\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01"
+        b"\x01\x00\x00\x00\x00\x00\x00\x00\x01"
     );
 
-    let mut expected = vec![0x02, 0x01, 0x00, 0x01, 0x01, 0x00];
+    let mut expected = vec![0x02, 0x00, 0x02, 0x00];
     expected.extend_from_slice(&1_u64.to_be_bytes());
     expected.extend_from_slice(&1_u32.to_be_bytes());
     expected.push(0x00);
@@ -252,7 +252,7 @@ fn index_value_family_golden_bytes() {
                 TreeManifest::new(pk(1), pk(1_024)).expect("valid Tree Manifest")
             ))
             .expect("encode"),
-        b"\x03\x01\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x04\x00"
+        b"\x03\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x04\x00"
     );
     assert_eq!(
         codec
@@ -262,7 +262,7 @@ fn index_value_family_golden_bytes() {
                 Vec::<Value>::new()
             )))
             .expect("encode"),
-        b"\x04\x01\x00\x01r\x00\x00\x00\x01\x3f\xc0\x00\x00\x00\x00"
+        b"\x04\x00\x01r\x00\x00\x00\x01\x3f\xc0\x00\x00\x00\x00"
     );
     assert_eq!(
         codec
@@ -270,7 +270,7 @@ fn index_value_family_golden_bytes() {
                 OpaquePayload::new(Bytes::from_static(b"abc")).expect("valid payload")
             ))
             .expect("encode"),
-        b"\x05\x01\x00\x00\x00\x03abc"
+        b"\x05\x00\x00\x00\x03abc"
     );
     assert_eq!(
         codec
@@ -279,7 +279,7 @@ fn index_value_family_golden_bytes() {
                 pk(2)
             )))
             .expect("encode"),
-        b"\x06\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02"
+        b"\x06\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02"
     );
     assert_eq!(
         codec
@@ -287,7 +287,7 @@ fn index_value_family_golden_bytes() {
                 PartitionHeader::new(1, 3, 4, PartitionState::Ready,).expect("valid Header")
             ))
             .expect("encode"),
-        b"\x07\x01\x00\x00\x00\x01\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00\x04\x00"
+        b"\x07\x00\x00\x00\x01\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00\x04\x00"
     );
     assert_eq!(
         codec
@@ -295,7 +295,7 @@ fn index_value_family_golden_bytes() {
                 vec![2.0_f32]
             )))
             .expect("encode"),
-        b"\x08\x01\x00\x00\x00\x01\x40\x00\x00\x00"
+        b"\x08\x00\x00\x00\x01\x40\x00\x00\x00"
     );
     assert_eq!(
         codec
@@ -304,10 +304,10 @@ fn index_value_family_golden_bytes() {
                 vec![2.0_f32]
             )))
             .expect("encode"),
-        b"\x09\x01\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x01\x40\x00\x00\x00"
+        b"\x09\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x01\x40\x00\x00\x00"
     );
 
-    let mut leaf = vec![0x0a, 0x01, 0x00, 0x01, b'r', 0x00, 0x00];
+    let mut leaf = vec![0x0a, 0x00, 0x01, b'r', 0x00, 0x00];
     leaf.extend_from_slice(&14_u32.to_be_bytes());
     leaf.extend_from_slice(&[0; 14]);
     assert_eq!(
@@ -326,10 +326,10 @@ fn index_value_family_golden_bytes() {
                 PartitionSynopsis::empty(&manifest,)
             ))
             .expect("encode"),
-        b"\x0b\x01\x00\x00"
+        b"\x0b\x00\x00"
     );
 
-    let mut state = vec![0x0c, 0x01, 0x01];
+    let mut state = vec![0x0c, 0x01];
     state.extend_from_slice(&5_u64.to_be_bytes());
     state.extend_from_slice(&2_u64.to_be_bytes());
     state.extend_from_slice(&3_u64.to_be_bytes());
@@ -354,7 +354,7 @@ fn incrementally_constructed_synopsis_has_golden_bytes_and_round_trips() {
     let bytes = index_codec(&manifest).encode(&value).expect("encode");
     assert_eq!(
         bytes,
-        b"\x0b\x01\x00\x02\x02\x04\x00\x00\x00\x01a\x04\x00\x00\x00\x01z\x03\x03\x3f\xf0\x00\x00\x00\x00\x00\x00\x03\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03\x80\x01\x00"
+        b"\x0b\x00\x02\x02\x04\x00\x00\x00\x01a\x04\x00\x00\x00\x01z\x03\x03\x3f\xf0\x00\x00\x00\x00\x00\x00\x03\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03\x80\x01\x00"
     );
     assert_eq!(
         decode_value(index_codec(&manifest), id(7), &value, &bytes).expect("decode"),
@@ -379,6 +379,50 @@ fn derived_bloom_shape_meets_the_configured_false_positive_bound() {
         .expect("derive strict Bloom")
         .expect("Bloom parameters");
     assert_eq!((strict.bit_count(), strict.hash_count()), (100, 1));
+}
+
+#[test]
+fn synopsis_size_limit_includes_the_type_tag() {
+    // Tag, field count, flags, two Bool extrema, and Bloom length use 12 bytes.
+    for bloom_bytes in [65_524_u32, 65_525] {
+        let field = FieldSchema::new("flag", DataType::Bool)
+            .expect("valid field")
+            .with_synopsis(SynopsisConfig::MinMaxBloom {
+                expected_distinct: NonZeroU32::new(bloom_bytes * 4).expect("nonzero"),
+                false_positive_rate: 0.5,
+            })
+            .expect("valid synopsis");
+        let bloom = BloomParameters::derive(field.synopsis()).expect("derive Bloom");
+        let config = IndexConfig::new(1, Metric::L2)
+            .expect("valid config")
+            .with_fields(vec![field])
+            .expect("valid schema");
+        let manifest =
+            IndexManifest::new(IndexLifecycle::Active, id(1), config, [0; 32], vec![bloom]);
+        if bloom_bytes == 65_525 {
+            assert_eq!(
+                manifest.expect_err("one byte over limit").kind(),
+                ErrorKind::InvalidArgument
+            );
+            continue;
+        }
+        let manifest = manifest.expect("exactly at limit");
+        let mut synopsis = PartitionSynopsis::empty(&manifest);
+        synopsis
+            .expand(&manifest, &[Value::Bool(false)])
+            .expect("expand synopsis");
+        synopsis
+            .expand(&manifest, &[Value::Bool(true)])
+            .expect("expand synopsis");
+        let value = PersistentValue::PartitionSynopsis(synopsis);
+        let codec = index_codec(&manifest);
+        let bytes = codec.encode(&value).expect("encode maximum Synopsis");
+        assert_eq!(bytes.len(), 65_536);
+        assert_eq!(
+            decode_value(codec, id(1), &value, &bytes).expect("decode"),
+            value
+        );
+    }
 }
 
 #[test]
@@ -449,14 +493,17 @@ fn every_value_family_round_trips() {
     }
 }
 
-fn assert_truncated_and_trailing(
-    codec: ValueCodec<'_>,
-    index: LogicalIndexId,
-    value: &PersistentValue,
-) {
+fn assert_malformed_framing(codec: ValueCodec<'_>, index: LogicalIndexId, value: &PersistentValue) {
     let bytes = codec.encode(value).expect("encode corpus value");
     for cut in 0..bytes.len() {
         assert_corrupt(decode_value(codec, index, value, &bytes[..cut]));
+    }
+    for tag in 0..=u8::MAX {
+        if tag != bytes[0] {
+            let mut wrong_tag = bytes.clone();
+            wrong_tag[0] = tag;
+            assert_corrupt(decode_value(codec, index, value, &wrong_tag));
+        }
     }
     let mut trailing = bytes;
     trailing.push(0);
@@ -464,7 +511,7 @@ fn assert_truncated_and_trailing(
 }
 
 #[test]
-fn every_value_family_rejects_truncation_and_trailing_bytes() {
+fn every_value_family_rejects_malformed_framing() {
     let bootstrap = ValueCodec::bootstrap();
     let manifest = minimal_manifest();
     for value in [
@@ -472,7 +519,7 @@ fn every_value_family_rejects_truncation_and_trailing_bytes() {
         PersistentValue::IndexNameEntry(IndexNameEntry::new(id(1))),
         PersistentValue::IndexManifest(manifest.clone()),
     ] {
-        assert_truncated_and_trailing(bootstrap, id(1), &value);
+        assert_malformed_framing(bootstrap, id(1), &value);
     }
 
     let codec = index_codec(&manifest);
@@ -508,68 +555,25 @@ fn every_value_family_rejects_truncation_and_trailing_bytes() {
         }),
     ];
     for value in &values {
-        assert_truncated_and_trailing(codec, id(1), value);
+        assert_malformed_framing(codec, id(1), value);
     }
 }
 
 #[test]
-fn version_and_type_fail_closed() {
+fn unsupported_manifest_formats_fail_closed() {
     let bootstrap = ValueCodec::bootstrap();
-    let manifest = minimal_manifest();
-    let manifest_value = PersistentValue::IndexManifest(manifest.clone());
-    let manifest_key = key_for_value(id(1), &manifest_value);
-    let mut bytes = bootstrap.encode(&manifest_value).expect("encode Manifest");
-
-    bytes[1] = 2;
-    assert_eq!(
-        decode(bootstrap, &manifest_key, &bytes)
-            .expect_err("unknown Manifest codec")
-            .kind(),
-        ErrorKind::UnsupportedFormat
-    );
-
-    let name_value = PersistentValue::IndexNameEntry(IndexNameEntry::new(id(1)));
-    let name_key = key_for_value(id(1), &name_value);
-    let mut bytes = bootstrap.encode(&name_value).expect("encode mapping");
-    bytes[1] = 2;
-    assert_eq!(
-        decode(bootstrap, &name_key, &bytes)
-            .expect_err("unknown bootstrap codec")
-            .kind(),
-        ErrorKind::UnsupportedFormat
-    );
-
-    bytes = bootstrap.encode(&manifest_value).expect("encode Manifest");
-    bytes[2..4].copy_from_slice(&2_u16.to_be_bytes());
-    assert_eq!(
-        decode(bootstrap, &manifest_key, &bytes)
-            .expect_err("unknown whole format")
-            .kind(),
-        ErrorKind::UnsupportedFormat
-    );
-
-    bytes = bootstrap.encode(&manifest_value).expect("encode Manifest");
-    bytes[4] = 2;
-    assert_eq!(
-        decode(bootstrap, &manifest_key, &bytes)
-            .expect_err("unknown declared codec")
-            .kind(),
-        ErrorKind::UnsupportedFormat
-    );
-
-    let codec = index_codec(&manifest);
-    let header = PersistentValue::PartitionHeader(
-        PartitionHeader::new(1, 0, 0, PartitionState::Ready).expect("valid Header"),
-    );
-    let mut bytes = codec.encode(&header).expect("encode Header");
-    bytes[1] = 2;
-    assert_corrupt(decode_value(codec, id(1), &header, &bytes));
-
-    let bytes = codec.encode(&header).expect("encode Header");
-    let state = PersistentValue::PartitionState(PartitionTransition::Merging {
-        started_at_unix_millis: 0,
-    });
-    assert_corrupt(decode_value(codec, id(1), &state, &bytes));
+    let value = PersistentValue::IndexManifest(minimal_manifest());
+    let key = key_for_value(id(1), &value);
+    for format in [0_u16, 1, 3, u16::MAX] {
+        let mut bytes = bootstrap.encode(&value).expect("encode Manifest");
+        bytes[1..3].copy_from_slice(&format.to_be_bytes());
+        assert_eq!(
+            decode(bootstrap, &key, &bytes)
+                .expect_err("unsupported whole format")
+                .kind(),
+            ErrorKind::UnsupportedFormat
+        );
+    }
 }
 
 #[test]
@@ -653,19 +657,19 @@ fn manifest_rejects_malformed_identity_configuration_and_discriminants() {
     let value = PersistentValue::IndexManifest(minimal_manifest());
 
     let mut bytes = codec.encode(&value).expect("encode");
-    bytes[5] = 0xff;
+    bytes[3] = 0xff;
     assert_corrupt(decode_value(codec, id(1), &value, &bytes));
 
     let mut bytes = codec.encode(&value).expect("encode");
-    bytes[6..14].fill(0);
+    bytes[4..12].fill(0);
     assert_corrupt(decode_value(codec, id(1), &value, &bytes));
 
     let mut bytes = codec.encode(&value).expect("encode");
-    bytes[14..18].fill(0);
+    bytes[12..16].fill(0);
     assert_corrupt(decode_value(codec, id(1), &value, &bytes));
 
     let mut bytes = codec.encode(&value).expect("encode");
-    bytes[18] = 0xff;
+    bytes[16] = 0xff;
     assert_corrupt(decode_value(codec, id(1), &value, &bytes));
 
     let rich = PersistentValue::IndexManifest(rich_manifest());
@@ -686,14 +690,14 @@ fn dimensional_count_identity_and_size_invariants_fail_closed() {
 
     let name = PersistentValue::IndexNameEntry(IndexNameEntry::new(id(1)));
     let mut bytes = ValueCodec::bootstrap().encode(&name).expect("encode");
-    bytes[2..10].fill(0);
+    bytes[1..9].fill(0);
     assert_corrupt(decode_value(ValueCodec::bootstrap(), id(1), &name, &bytes));
 
     let tree = PersistentValue::TreeManifest(
         TreeManifest::new(pk(1), pk(2)).expect("valid Tree Manifest"),
     );
     let mut bytes = codec.encode(&tree).expect("encode");
-    bytes[2..10].copy_from_slice(&2_u64.to_be_bytes());
+    bytes[1..9].copy_from_slice(&2_u64.to_be_bytes());
     assert_corrupt(decode_value(codec, id(1), &tree, &bytes));
 
     let vector = PersistentValue::VectorRecord(VectorRecord::new(
@@ -702,16 +706,16 @@ fn dimensional_count_identity_and_size_invariants_fail_closed() {
         Vec::<Value>::new(),
     ));
     let mut bytes = codec.encode(&vector).expect("encode");
-    bytes[5..9].copy_from_slice(&2_u32.to_be_bytes());
+    bytes[4..8].copy_from_slice(&2_u32.to_be_bytes());
     assert_corrupt(decode_value(codec, id(1), &vector, &bytes));
     let mut bytes = codec.encode(&vector).expect("encode");
-    bytes[9..13].copy_from_slice(&(-0.0_f32).to_bits().to_be_bytes());
+    bytes[8..12].copy_from_slice(&(-0.0_f32).to_bits().to_be_bytes());
     assert_corrupt(decode_value(codec, id(1), &vector, &bytes));
 
     let payload =
         PersistentValue::OpaquePayload(OpaquePayload::new(Bytes::new()).expect("valid payload"));
     let mut bytes = codec.encode(&payload).expect("encode");
-    bytes[2..6].copy_from_slice(&((64 * 1_024 + 1) as u32).to_be_bytes());
+    bytes[1..5].copy_from_slice(&((64 * 1_024 + 1) as u32).to_be_bytes());
     assert_corrupt(decode_value(codec, id(1), &payload, &bytes));
 
     let location = PersistentValue::RecordLocation(RecordLocation::new(
@@ -727,17 +731,17 @@ fn dimensional_count_identity_and_size_invariants_fail_closed() {
         PartitionHeader::new(1, 0, 0, PartitionState::Ready).expect("valid Header"),
     );
     let mut bytes = codec.encode(&header).expect("encode");
-    bytes[2..6].fill(0);
+    bytes[1..5].fill(0);
     assert_corrupt(decode_value(codec, id(1), &header, &bytes));
 
     let centroid = PersistentValue::PartitionCentroid(PartitionCentroid::new(vec![0.0_f32]));
     let mut bytes = codec.encode(&centroid).expect("encode");
-    bytes[6..10].copy_from_slice(&f32::INFINITY.to_bits().to_be_bytes());
+    bytes[5..9].copy_from_slice(&f32::INFINITY.to_bits().to_be_bytes());
     assert_corrupt(decode_value(codec, id(1), &centroid, &bytes));
 
     let child = PersistentValue::ChildEntry(ChildEntry::new(pk(2), vec![0.0_f32]));
     let mut bytes = codec.encode(&child).expect("encode");
-    bytes[2..10].fill(0);
+    bytes[1..9].fill(0);
     assert_corrupt(decode_value(codec, id(1), &child, &bytes));
 
     let leaf = PersistentValue::LeafEntry(LeafEntry::new(
@@ -746,10 +750,10 @@ fn dimensional_count_identity_and_size_invariants_fail_closed() {
         Bytes::from_static(&[0; 14]),
     ));
     let mut bytes = codec.encode(&leaf).expect("encode");
-    bytes[2..4].fill(0);
+    bytes[1..3].fill(0);
     assert_corrupt(decode_value(codec, id(1), &leaf, &bytes));
     let mut bytes = codec.encode(&leaf).expect("encode");
-    bytes[7..11].copy_from_slice(&13_u32.to_be_bytes());
+    bytes[6..10].copy_from_slice(&13_u32.to_be_bytes());
     bytes.pop();
     assert_corrupt(decode_value(codec, id(1), &leaf, &bytes));
 
@@ -759,8 +763,8 @@ fn dimensional_count_identity_and_size_invariants_fail_closed() {
         started_at_unix_millis: 0,
     });
     let mut bytes = codec.encode(&state).expect("encode");
-    let left = bytes[11..19].to_vec();
-    bytes[19..27].copy_from_slice(&left);
+    let left = bytes[10..18].to_vec();
+    bytes[18..26].copy_from_slice(&left);
     assert_corrupt(decode_value(codec, id(1), &state, &bytes));
 }
 
@@ -778,17 +782,17 @@ fn schema_and_synopsis_invariants_fail_closed() {
         ],
     ));
     let mut bytes = codec.encode(&record).expect("encode");
-    // Record ID framing, dimension, and two f32 components occupy bytes 2..17.
-    bytes[17..19].copy_from_slice(&1_u16.to_be_bytes());
+    // Record ID framing, dimension, and two f32 components occupy bytes 1..16.
+    bytes[16..18].copy_from_slice(&1_u16.to_be_bytes());
     assert_corrupt(decode_value(codec, id(7), &record, &bytes));
 
     let synopsis = PersistentValue::PartitionSynopsis(rich_synopsis(&manifest));
     let mut bytes = codec.encode(&synopsis).expect("encode");
-    bytes[4] = 0x80;
+    bytes[3] = 0x80;
     assert_corrupt(decode_value(codec, id(7), &synopsis, &bytes));
 
     let mut bytes = codec.encode(&synopsis).expect("encode");
-    bytes[4] |= 0b01;
+    bytes[3] |= 0b01;
     assert_corrupt(decode_value(codec, id(7), &synopsis, &bytes));
 
     let mut bytes = codec.encode(&synopsis).expect("encode");

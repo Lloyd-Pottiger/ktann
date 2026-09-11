@@ -100,7 +100,7 @@ range. Tree-local keys embed the canonical encoded Tree Key and Partition Key;
 there is no Tree ID. Physical adapters add their own bounded prefix without a
 second unbounded escaping pass.
 
-Logical key codecs are versioned independently from value codecs. Version 1
+Logical keys retain their own version marker. Logical-key version 1
 specifies exact type tags, integer endianness, tuple escaping, terminators, and
 field ordering in codec source plus checked-in golden vectors. The Tree Key
 codec is memcomparable: byte ordering exactly matches typed comparison and
@@ -109,8 +109,15 @@ fields, noncanonical values, nonzero padding, and trailing bytes.
 
 ## 6. Persistent values
 
-The Index Manifest stores lifecycle state, format and codec versions, immutable
-configuration, Logical Index ID, RaBitQ rotation seed, and exact Bloom
+Each value is a one-byte type tag followed by its payload. The Manifest's
+whole-format marker is `FORMAT_VERSION = 2`; it governs all value layouts and
+persistent algorithms. An unsupported Manifest format returns `UnsupportedFormat`.
+Wrong key/value pairings and malformed or noncanonical values return `Corruption`,
+including namespace allocator and Index Name values. Only the current layout is
+supported; development data with an unsupported layout must be recreated.
+
+The Index Manifest stores lifecycle state, one whole persistent-format version,
+immutable configuration, Logical Index ID, RaBitQ rotation seed, and exact Bloom
 parameters. A Tree Manifest is the directory entry, root reference, and
 Partition Key allocator high-water mark for one Tree Key. Reservation allocates
 fixed ranges (default 1,024) through an update-protected manifest; unused keys

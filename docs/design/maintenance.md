@@ -64,7 +64,7 @@ collapse.
 
 Durable states are only `Ready`, `Splitting { left, right }`,
 `ReceivingSplit { source }`, `DrainingSplit { left, right }`, and `Merging`.
-State stores associated Partition Keys, codec version, and state-start time; it
+State stores associated Partition Keys and state-start time; it
 stores no drain cursor, owner, lease, or fixed merge target. A fixup transaction
 update-protects the relevant State, Headers, incoming references, and entry keys
 it changes. Each step is bounded by adapter budgets. Structural drain starts

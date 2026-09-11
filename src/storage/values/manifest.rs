@@ -7,10 +7,7 @@ use crate::api::{
 
 use super::data::maximum_typed_value_len;
 use super::wire::{Decoder, Encoder};
-use super::{
-    FORMAT_VERSION, MAX_SYNOPSIS_BYTES, ROTATION_SEED_BYTES, VALUE_CODEC_VERSION, corrupt,
-    unsupported,
-};
+use super::{FORMAT_VERSION, MAX_SYNOPSIS_BYTES, ROTATION_SEED_BYTES, corrupt, unsupported};
 
 /// The lifecycle state persisted in an Index Manifest.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,7 +77,7 @@ pub struct IndexManifest {
 }
 
 impl IndexManifest {
-    /// Creates a supported version-1 Index Manifest.
+    /// Creates an Index Manifest in the supported persistent format.
     pub fn new(
         lifecycle: IndexLifecycle,
         logical_index_id: LogicalIndexId,
@@ -103,12 +100,6 @@ impl IndexManifest {
     #[must_use]
     pub const fn format_version(&self) -> u16 {
         FORMAT_VERSION
-    }
-
-    /// Returns the logical value codec version.
-    #[must_use]
-    pub const fn value_codec_version(&self) -> u8 {
-        VALUE_CODEC_VERSION
     }
 
     /// Returns the persistent lifecycle state.
@@ -157,7 +148,7 @@ impl IndexManifest {
 
     /// Returns the exact maximum encoded Synopsis length for this Manifest.
     pub(crate) fn maximum_synopsis_encoded_len(&self) -> usize {
-        let mut size = 2_usize + 2;
+        let mut size = 1_usize + 2;
         for (field, parameters) in self.config.fields().iter().zip(&self.bloom_parameters) {
             size += 1 + 2 * maximum_typed_value_len(field.data_type());
             if let Some(parameters) = parameters {
@@ -260,7 +251,6 @@ pub(super) fn decode_index_name_entry(decoder: &mut Decoder) -> Result<IndexName
 
 pub(super) fn encode_index_manifest(encoder: &mut Encoder, manifest: &IndexManifest) -> Result<()> {
     encoder.u16(FORMAT_VERSION);
-    encoder.u8(VALUE_CODEC_VERSION);
     encoder.u8(match manifest.lifecycle {
         IndexLifecycle::Active => 0,
         IndexLifecycle::Dropping => 1,
@@ -302,8 +292,7 @@ pub(super) fn encode_index_manifest(encoder: &mut Encoder, manifest: &IndexManif
 
 pub(super) fn decode_index_manifest(decoder: &mut Decoder) -> Result<IndexManifest> {
     let format_version = decoder.u16()?;
-    let declared_codec_version = decoder.u8()?;
-    if format_version != FORMAT_VERSION || declared_codec_version != VALUE_CODEC_VERSION {
+    if format_version != FORMAT_VERSION {
         return Err(unsupported());
     }
     let lifecycle = match decoder.u8()? {
