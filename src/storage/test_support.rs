@@ -1,6 +1,6 @@
 //! Test doubles and fixtures shared by core-crate unit tests.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::ops::Bound;
 
 use bytes::Bytes;
@@ -22,16 +22,16 @@ pub(crate) fn pk(value: u64) -> PartitionKey {
 
 /// A snapshot read mock over committed key-value bytes.
 ///
-/// Point reads serve queued scripted results before falling back to the map,
-/// and batched gets enforce the configured backend batch ceiling. Scans count
-/// themselves and page the map forward under the backend scan contract:
+/// Point reads count themselves and read the map; batched gets enforce the
+/// configured backend batch ceiling. Scans count themselves and page the map
+/// forward under the backend scan contract:
 /// non-zero limits, one oversized first item carried alone, and a peek-ahead
 /// continuation. The `with_failing_*` builders turn one operation family into
 /// a tripwire for stages that must never use it.
 pub(crate) struct MockReadTxn {
     pub(crate) data: BTreeMap<Vec<u8>, Vec<u8>>,
-    /// Scripted point-read results; a non-empty queue overrides the map.
-    pub(crate) scripted_gets: VecDeque<Option<Vec<u8>>>,
+    /// The number of point reads performed.
+    pub(crate) gets: usize,
     /// The number of scans performed.
     pub(crate) scans: usize,
     /// The maximum number of keys one batched get accepts.
@@ -45,7 +45,7 @@ impl MockReadTxn {
     pub(crate) fn new(items: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>) -> Self {
         Self {
             data: items.into_iter().collect(),
-            scripted_gets: VecDeque::new(),
+            gets: 0,
             scans: 0,
             max_batch_size: 10_000,
             scans_fail: false,
@@ -68,9 +68,7 @@ impl MockReadTxn {
 
 impl ReadOps for MockReadTxn {
     async fn get(&mut self, key: Bytes) -> Result<Option<Bytes>> {
-        if let Some(scripted) = self.scripted_gets.pop_front() {
-            return Ok(scripted.map(Bytes::from));
-        }
+        self.gets += 1;
         Ok(self.data.get(key.as_ref()).cloned().map(Bytes::from))
     }
 
