@@ -14,10 +14,10 @@
 //! Header's cache epoch. A cached older epoch is a miss and is evicted; a
 //! cached newer epoch means the search holds a historical snapshot, so it
 //! misses without evicting the useful newer entry. On a miss the same search
-//! transaction scans and decodes the complete body and rechecks the same
-//! snapshot Header before publishing; it never fills from a separate latest
-//! snapshot. Corruption is never cached: a body that fails to decode or fails
-//! the Header recheck is a `Corruption` error and nothing is installed.
+//! transaction scans and decodes the complete body, then verifies its exact entry
+//! count against the initial Header before publishing. Corruption is never
+//! cached: a body that fails to decode or has a mismatched entry count is a
+//! `Corruption` error and nothing is installed.
 //!
 //! Entries are immutable and never pinned. Concurrent misses may duplicate work
 //! and race to publish equal or newer epochs; there is deliberately no
@@ -519,9 +519,9 @@ impl CacheInner {
 /// The Header is read first from `txn`'s one consistent snapshot. An equal
 /// cached epoch is served from `cache` without touching the body. On a miss
 /// the same transaction scans and decodes the complete body, the decoded entry
-/// count must equal the Header's exact entry count, and the same snapshot
-/// Header is rechecked before publishing; any disagreement is Corruption and
-/// nothing is cached. The body is returned even when it is too large to cache.
+/// count must equal the initial Header's exact entry count before publishing;
+/// any disagreement is Corruption and nothing is cached. The body is returned
+/// even when it is too large to cache.
 pub(crate) async fn load_body<T: ReadOps>(
     txn: &mut ReadLogicalTxn<'_, T>,
     cache: &PartitionCache,
@@ -568,13 +568,6 @@ pub(crate) async fn load_body<T: ReadOps>(
     }
     let entry_count = leaf_entries.len() + child_entries.len();
     if entry_count != header.entry_count() as usize {
-        return Err(Error::new(ErrorKind::Corruption));
-    }
-
-    // Recheck the same snapshot Header before publishing: the body is only
-    // cacheable under the epoch it was decoded from.
-    let rechecked = read_header(txn, index, tree_key, partition).await?;
-    if rechecked != header {
         return Err(Error::new(ErrorKind::Corruption));
     }
 
@@ -960,6 +953,7 @@ mod tests {
         let mock = mock_txn(leaf_data(&manifest, &[b"a", b"b"], 11));
 
         let (first, mock) = load(&cache, &manifest, mock, 1).await.expect("load");
+        assert_eq!(mock.gets, 1, "a miss reads the snapshot Header once");
         assert_eq!(mock.scans, 1);
         assert_eq!(first.epoch(), 11);
         assert_eq!(
@@ -968,6 +962,7 @@ mod tests {
         );
 
         let (second, mock) = load(&cache, &manifest, mock, 1).await.expect("load");
+        assert_eq!(mock.gets, 2, "a hit validates the snapshot Header once");
         assert_eq!(mock.scans, 1, "the equal-epoch hit performs no body scan");
         assert!(Arc::ptr_eq(&first, &second));
     }
@@ -1085,24 +1080,6 @@ mod tests {
             .expect_err("a divergent exact entry count fails closed");
         assert_eq!(error.kind(), ErrorKind::Corruption);
         assert_eq!(cache.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn a_header_recheck_mismatch_is_corruption_and_not_cached() {
-        let manifest = manifest();
-        let cache = PartitionCache::new(1 << 20);
-        let mut mock = mock_txn(leaf_data(&manifest, &[b"a"], 11));
-        // A misbehaving read path returns a changed Header on the recheck.
-        let (_, epoch_11) = header_item(&manifest, 1, 1, 1, 11);
-        let (_, epoch_12) = header_item(&manifest, 1, 1, 1, 12);
-        mock.scripted_gets = [Some(epoch_11), Some(epoch_12)].into_iter().collect();
-
-        let error = load(&cache, &manifest, mock, 1)
-            .await
-            .map(|_| ())
-            .expect_err("a changed snapshot Header fails closed");
-        assert_eq!(error.kind(), ErrorKind::Corruption);
-        assert_eq!(cache.len(), 0, "a failed recheck publishes nothing");
     }
 
     #[tokio::test]
