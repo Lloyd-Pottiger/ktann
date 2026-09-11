@@ -104,7 +104,7 @@ impl IndexConfig {
                 bloom_fields += 1;
             }
             // One type tag, NULL flags, and two maximum encoded extrema are a
-            // conservative bound until the canonical v1 value codec writes
+            // conservative bound until the canonical value codec writes
             // the exact length. Bloom bytes use the requested probability
             // without weakening it.
             let encoded_value_bytes = match field.data_type() {

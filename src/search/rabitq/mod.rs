@@ -1,4 +1,4 @@
-//! Canonical format-v1 RaBitQ7 encoding and bounded candidate selection.
+//! Canonical RaBitQ7 encoding and bounded candidate selection.
 //!
 //! This module is the single seam for the persistent seven-bit code, scalar
 //! f64 approximate distances, conservative intervals, and deterministic
@@ -33,7 +33,7 @@ pub(crate) struct RaBitQ7 {
 }
 
 impl RaBitQ7 {
-    /// Returns the exact format-v1 payload length for a dimension.
+    /// Returns the exact payload length for a dimension.
     pub(crate) fn encoded_len(dimension: usize) -> Result<usize> {
         codec::encoded_len(dimension)
     }
@@ -43,7 +43,7 @@ impl RaBitQ7 {
         codec::quantize(vector)
     }
 
-    /// Decodes and validates one persistent format-v1 payload.
+    /// Decodes and validates one persistent payload.
     pub(crate) fn decode(encoded: &[u8], dimension: usize) -> Result<Self> {
         codec::decode(encoded, dimension)
     }

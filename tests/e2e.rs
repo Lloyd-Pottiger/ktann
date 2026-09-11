@@ -416,7 +416,7 @@ impl Harness {
                     .map(|outcome| match outcome {
                         ktann::api::UpsertResult::Created => "created",
                         ktann::api::UpsertResult::Replaced => "replaced",
-                        _ => unreachable!("format v1 upsert outcomes"),
+                        _ => unreachable!("supported upsert outcomes"),
                     })
             } else {
                 self.index().insert(record.clone()).await.map(|_| "ok")
@@ -1462,7 +1462,7 @@ fn parse_typed(raw: &str, data_type: DataType) -> Value {
         DataType::F64 => Value::f64(raw.parse().expect("f64 value")).expect("finite f64"),
         DataType::Bool => Value::Bool(raw.parse().expect("bool value")),
         DataType::String => Value::string(raw).expect("string value"),
-        _ => unreachable!("format v1 field types"),
+        _ => unreachable!("supported field types"),
     }
 }
 
@@ -1564,7 +1564,7 @@ fn fill_fields(
                 DataType::F64 => Value::f64(ordinal as f64 + 0.5).expect("finite"),
                 DataType::Bool => Value::Bool(ordinal % 2 == 0),
                 DataType::String => Value::string(format!("s{ordinal:06}")).expect("string"),
-                _ => unreachable!("format v1 field types"),
+                _ => unreachable!("supported field types"),
             }
         })
         .collect()

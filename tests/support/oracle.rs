@@ -56,7 +56,7 @@ fn distance_with_norm(metric: Metric, query: &[f32], query_norm: f64, record: &[
                 1.0 - dot(query, record) / (query_norm * record_norm)
             }
         }
-        _ => unreachable!("format v1 has exactly three metrics"),
+        _ => unreachable!("the API has exactly three metrics"),
     }
 }
 
@@ -168,7 +168,7 @@ pub fn compare_3vl(op: CompareOp, field: &Value, target: &Value) -> bool {
         CompareOp::LessOrEqual => ordering != std::cmp::Ordering::Greater,
         CompareOp::Gt => ordering == std::cmp::Ordering::Greater,
         CompareOp::GreaterOrEqual => ordering != std::cmp::Ordering::Less,
-        _ => unreachable!("format v1 has exactly six comparison operators"),
+        _ => unreachable!("the API has exactly six comparison operators"),
     }
 }
 

@@ -183,7 +183,7 @@ impl ValueKind {
     }
 }
 
-/// Any versioned logical value owned by the storage module.
+/// Any logical value governed by the Manifest's whole-format version.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum PersistentValue {

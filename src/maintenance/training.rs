@@ -53,7 +53,7 @@ use crate::storage::keys::{LogicalKey, TreeKey};
 use crate::storage::values::{IndexManifest, PartitionCentroid, PersistentValue};
 use crate::storage::{LogicalRange, ReadLogicalTxn};
 
-/// The maximum number of Lloyd rounds; a fixed format-v1 protocol choice
+/// The maximum number of Lloyd rounds; a fixed persistent format protocol choice
 /// (ADR 0015).
 const MAX_TRAINING_ROUNDS: usize = 10;
 

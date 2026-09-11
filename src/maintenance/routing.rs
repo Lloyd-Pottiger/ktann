@@ -1522,7 +1522,7 @@ async fn validate_for_write<T: WriteTxn>(
     Ok(())
 }
 
-/// Builds the format-v1 vector kernel for the bound Logical Index.
+/// Builds the vector kernel for the bound Logical Index.
 pub(crate) fn kernel_for(manifest: &IndexManifest) -> Result<VectorKernel> {
     VectorKernel::new(
         manifest.config().dimension(),
