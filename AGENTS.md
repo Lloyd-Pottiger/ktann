@@ -2,9 +2,10 @@
 
 ## Project Sources of Truth
 
-Read `README.md` for the project status, goals, and architecture overview.
-Parts of the design are not yet implemented; do not infer available API or
-behavior from design documents alone.
+KTANN is in active implementation with no stable release. Do not add backward
+compatibility machinery unless the task explicitly requires it. Read `README.md`
+for project status; verify available APIs and behavior in code because parts of
+the design are not yet implemented.
 
 - `CONTEXT.md`: canonical domain language and system-wide invariants.
 - `docs/design/overview.md`: product boundary, authoritative invariants, target
@@ -27,11 +28,14 @@ contract. Do not edit or depend on it unless the task explicitly requires it.
 - Lint: `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - Format: check with `cargo fmt --all -- --check`, apply with `cargo fmt --all`
 
-Run focused checks while iterating; before completing work, run formatting,
-clippy, and the relevant workspace tests. Never run Cargo commands
-concurrently: they contend on Cargo and target-directory locks. The toolchain
-is Rust Edition 2024 with MSRV 1.85 and current stable CI; production code
-must not require nightly features.
+Select checks by the changed contract. For Rust changes, run formatting, Clippy,
+and relevant tests; use workspace-wide checks for shared contracts or changes
+across crates. For documentation-only changes, check accuracy, links, and the
+diff; Cargo checks are unnecessary. After relevant checks pass, broaden testing
+only for unresolved risks or failures. Report what ran and any verification gaps.
+Never run Cargo commands concurrently: they contend on Cargo and target-directory
+locks. Use Rust Edition 2024, MSRV 1.85, and stable CI; no nightly-only production
+features.
 
 ## Workflow Principles
 
@@ -44,17 +48,21 @@ must not require nightly features.
 - Implement in the dependency order in the overview unless the task establishes
   a smaller self-contained vertical slice. Do not add placeholder abstractions
   for later stages.
-- For substantial changes, define the private module layout before
-  implementation; do not accumulate multiple responsibilities in one file.
 - Keep each responsibility at its documented owner: logical codecs and atomic
   index operations in core storage; backend limits and error classification in
   the adapters; lifecycle and admission behavior in runtime/operations.
 - Treat a discrepancy among code, design, and ADRs as a decision to resolve,
-  not permission to choose whichever is easiest. Preserve shipped behavior,
-  and when intentionally changing a contract or domain language, update the
-  relevant design, ADR, and `CONTEXT.md` in the same change.
+  not permission to choose whichever is easiest. Preserve behavior outside the
+  requested change. Update affected designs and `CONTEXT.md` when changing a
+  contract or domain language; record hard-to-reverse decisions in ADRs.
 - Keep commits and diffs scoped to one coherent outcome. Do not mix formatting,
   dependency churn, or unrelated cleanup into a behavioral change.
+- Continue authorized work through verification. Resolve routine choices from
+  context; ask only when missing information materially affects the outcome or
+  an action needs authorization not already given. If an instruction blocks
+  completion, cite its file and exact requirement and explain why it applies.
+- Keep updates and final reports concise: outcome, meaningful verification,
+  and unresolved decisions.
 
 ## Correctness and Storage Rules
 
@@ -67,7 +75,8 @@ must not require nightly features.
   Maintenance may be delayed or lost from process-local queues; correctness
   cannot depend on a durable worker, lease, or coordinator.
 - Persistent Logical Index IDs and Partition Keys are never reused. Gaps are
-  valid. Persistent format changes must be explicit and versioned as one whole.
+  valid. Follow `docs/design/storage.md` for explicit format changes and
+  independent key/value codec versioning.
 - Use canonical, deterministic codecs. Reject malformed and noncanonical
   bytes; do not silently normalize persistent data.
 - Fail closed: invalid persistent encoding or invariant mismatches are
@@ -112,73 +121,41 @@ must not require nightly features.
 - Return structured errors with useful context while keeping vectors,
   payloads, filter values, and raw Tree Keys out of logs and error messages.
 - Avoid `unwrap`, `expect`, and `panic!` in production paths unless an
-  invariant is statically guaranteed and documented. Do not use `unsafe`
-  without a narrow, reviewed justification and dedicated tests.
+  invariant is statically guaranteed and documented. Production libraries
+  forbid `unsafe`; keep any test-only FFI exceptions narrowly scoped.
 - Document public APIs in backend-neutral terms. Use `rustfmt` defaults and
   keep Clippy clean under the repository command above.
 
 ## Testing
 
-- Test externally observable contracts, not implementation shape. Prefer
-  deterministic tests with replayable seeds.
-- Add focused regression coverage for each changed guarantee, at the layer the
-  module designs' evidence matrixes prescribe; do not duplicate tests at every
-  layer.
-- Run the shared backend contract suite unchanged against the deterministic
-  test backend and each production adapter, covering conflicts, snapshot
-  consistency, read-your-writes, pagination and limits, rollback, commit
-  outcomes, durability, and declared capabilities.
-- Protect persistent formats with golden bytes, ordering properties,
-  malformed/noncanonical corpora, and cross-process deterministic vectors.
-- Use model/history tests and fault injection for exact membership, retries,
-  unknown outcomes, crashes, and every committed topology transition.
-- Check predicate evaluation and synopsis pruning against a SQL
-  three-valued-logic oracle, and exact reranking against a brute-force numeric
-  oracle.
-- Test every resource boundary and truncation reason. Benchmarks report
-  recall, latency, contention, memory, and write amplification without
-  freezing benchmark-tunable internals such as cache eviction or task layout.
-- The data-driven integration corpus lives in `tests/datadriven/*.kddt`,
-  executed by `tests/e2e.rs` against the public API on the deterministic
-  backend with seeded synthetic datasets (`tests/support/dataset.rs`), a
-  brute-force oracle (`tests/support/oracle.rs`), and the persistent-state
-  audit (`tests/support/audit.rs`). Regenerate expectations with
-  `KTANN_REWRITE=1 cargo test --test e2e` and review the diff like any other
-  change. Real-dataset fixtures (siftsmall, fashion-mnist; see
-  `tests/datadriven/data/README.md` for provenance) are checked in under
-  `tests/datadriven/data/` and loaded via `file:NAME[:N]` dataset specs (the
-  optional `:N` takes the fixture's first N vectors); the oracle is
-  cross-checked against published siftsmall ground truth in
-  `tests/oracle_groundtruth.rs`.
-- Metric recording is asserted in `tests/metrics.rs`: the documented `ktann.*`
-  series fire with the expected labels and counts as the public API drives
-  work. Telemetry privacy (no caller data in metrics or traces) is audited in
-  `tests/observability.rs`.
-- Reproducible ANN and whole-system baselines live in the non-published
-  `ktann-benchmarks` workspace crate. Run the fast production-adapter matrix
-  with `cargo run -p ktann-benchmarks --bin ktann-bench -- run --backend rocksdb
-  --profile smoke`; run optimized `full` profiles only on an otherwise idle
-  host. `benchmarks/README.md` defines timing boundaries, logical write
-  amplification, FoundationDB setup, report comparability, and why these
-  empirical results are not a v1 SLA.
-- The replayable crash-history and model-validation harness lives in
-  `tests/model_history.rs` (issue #37): one seeded, fully pre-generated script
-  drives the public API through lifecycle transitions, atomic Foreground
-  Mutations (some armed with commit faults), manually advanced split/merge
-  transitions, queue loss via crash/reopen, unknown commit outcomes,
-  cancellation, and shutdown, asserting exact membership, Partition Key
-  non-reuse, and Logical Index ID non-reuse after every step. Determinism
-  comes from zero maintenance workers with manually driven bounded advances
-  plus a script drawn from one seed before any async work. A failure prints
-  the step trace and a replay command; reproduce a seed with
-  `KTANN_MODEL_SEED=<seed> cargo test --test model_history model_history_replay`
-  (optionally `KTANN_MODEL_STEPS=<n>`), and run the expanded deterministic
-  profile (24 seeds × 400 steps) with `KTANN_MODEL_PROFILE=expanded`. The
-  nightly workflow (`.github/workflows/nightly.yml`) runs the expanded profile
-  daily and on manual dispatch.
-- API-level recall parity on the production adapters lives in
-  `ktann-rocksdb/tests/rocksdb_recall.rs` (embedded, runs in CI) and
-  `ktann-foundationdb/tests/foundationdb_recall.rs` (requires a local
-  cluster; the FoundationDB CI job runs it). Both share the scenario in
-  `tests/support/adapter_recall.rs` and the fixture loaders in
-  `tests/support/fixtures.rs`.
+Choose the relevant coverage below; this is not a checklist for every change.
+Test observable contracts with deterministic, replayable inputs, using the
+owning design's evidence matrix to select the layer without duplicating coverage.
+
+- Backend semantics: run the shared contract suite unchanged on affected
+  backends; shared-contract changes cover the deterministic backend, FoundationDB,
+  and RocksDB. Cover conflicts, snapshots, read-your-writes, pagination, limits,
+  rollback, commit outcomes, durability, and declared capabilities.
+- Persistent formats: golden bytes, ordering properties, malformed/noncanonical
+  inputs, and cross-process determinism.
+- Mutation and maintenance: model/history tests and fault injection for exact
+  membership, retries, unknown outcomes, crashes, and committed topology states.
+- Search: SQL three-valued-logic and brute-force numeric oracles for predicates,
+  synopsis pruning, and reranking; cover changed resource limits and truncation.
+- Performance: reproducible recall, latency, contention, memory, and write
+  amplification measurements, without freezing tunable implementation details.
+
+Use these entry points for harness details and commands:
+
+| Concern | Reference |
+| --- | --- |
+| Public API corpus and expectation regeneration | `tests/e2e.rs`, `tests/datadriven/*.kddt`; run `KTANN_REWRITE=1 cargo test --test e2e` only for intended expectation changes and review the diff |
+| Real-dataset provenance and ground truth | `tests/datadriven/data/README.md`, `tests/oracle_groundtruth.rs` |
+| Metric labels/counts and telemetry privacy | `tests/metrics.rs`, `tests/observability.rs` |
+| Seeded crash/recovery replay and expanded profile | `tests/model_history.rs`, `.github/workflows/nightly.yml` |
+| Production-adapter recall parity | `ktann-rocksdb/tests/rocksdb_recall.rs`, `ktann-foundationdb/tests/foundationdb_recall.rs`, shared `tests/support/adapter_recall.rs` |
+| Benchmark profiles, FoundationDB setup, and report comparability | `benchmarks/README.md`; run optimized `full` profiles on an otherwise idle host |
+
+FoundationDB integration tests need a local cluster; follow the test's documented
+invocation, including `--ignored` where required. Benchmark results are empirical,
+not an SLA.
