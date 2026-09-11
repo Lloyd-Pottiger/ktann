@@ -128,10 +128,11 @@ remain gaps.
 Partition Header stores level (1 for a leaf), exact entry count, cache epoch,
 and the small Partition State discriminator needed for traversal; level alone
 determines whether the partition contains Leaf or Child Entries. Transition
-payloads store the
-source/target references and state-start time required to resume a transition;
-structural drain and paged deletion restart from the current prefix beginning
-and persist no cursor.
+payloads store the source/target references required to resume a transition and
+`started_at_unix_millis`, an unsigned 64-bit Unix-epoch millisecond timestamp
+used for diagnostics. Zero denotes an unavailable timestamp. Structural drain
+and paged deletion restart from the
+current prefix beginning.
 Leaf Entries contain Record ID, typed filter fields, and absolute RaBitQ7 bytes;
 Child Entries contain child Partition Key and immutable centroid projection.
 

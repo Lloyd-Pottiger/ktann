@@ -64,8 +64,9 @@ collapse.
 
 Durable states are only `Ready`, `Splitting { left, right }`,
 `ReceivingSplit { source }`, `DrainingSplit { left, right }`, and `Merging`.
-State stores associated Partition Keys and state-start time; it
-stores no drain cursor, owner, lease, or fixed merge target. A fixup transaction
+State stores associated Partition Keys and `started_at_unix_millis`, an
+unsigned 64-bit count of milliseconds since the Unix epoch; zero denotes an
+unavailable timestamp. A fixup transaction
 update-protects the relevant State, Headers, incoming references, and entry keys
 it changes. Each step is bounded by adapter budgets. Structural drain starts
 every batch from the current smallest source entry, and successful movement
@@ -174,9 +175,10 @@ Foreground mutations never wait for a whole split/merge. They may conflict with
 one bounded fixup and retry from a fresh snapshot. Fixups do not hold locks
 across transactions or reserve a durable owner.
 
-State timestamps diagnose stalls but do not grant ownership. A future timestamp
-is not considered stalled. Any process may advance an encountered state after
-bounded admission. Conditional convergence requires rediscovery, repeated
+State timestamps provide diagnostic ages. A sample is recorded when both
+Unix-epoch millisecond timestamps are nonzero and the current time is at least
+the state-start time. The nonnegative difference is reported in seconds. Any
+process may advance an encountered state after bounded admission. Conditional convergence requires rediscovery, repeated
 admission, eventual backend success, and a legal merge target; correctness does
 not require convergence.
 

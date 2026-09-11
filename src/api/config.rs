@@ -229,7 +229,6 @@ pub struct RuntimeConfig {
     write_beam_size: u32,
     import_max_in_flight_batches: usize,
     import_backlog_watermark: usize,
-    stalled_timeout: Option<Duration>,
     retry_initial_backoff: Duration,
     retry_max_backoff: Duration,
 }
@@ -250,7 +249,6 @@ impl Default for RuntimeConfig {
             write_beam_size: DEFAULT_WRITE_BEAM_SIZE,
             import_max_in_flight_batches: available.clamp(1, 4),
             import_backlog_watermark: 2,
-            stalled_timeout: None,
             retry_initial_backoff: Duration::from_millis(1),
             retry_max_backoff: Duration::from_millis(100),
         }
@@ -347,15 +345,6 @@ impl RuntimeConfig {
         }
         self.import_max_in_flight_batches = in_flight;
         self.import_backlog_watermark = backlog_watermark;
-        Ok(self)
-    }
-
-    /// Overrides the positive Structure Maintenance stalled timeout.
-    pub fn with_stalled_timeout(mut self, timeout: Duration) -> Result<Self> {
-        if timeout.is_zero() {
-            return Err(Error::invalid_argument());
-        }
-        self.stalled_timeout = Some(timeout);
         Ok(self)
     }
 
@@ -458,20 +447,6 @@ impl RuntimeConfig {
     #[must_use]
     pub const fn import_backlog_watermark(&self) -> usize {
         self.import_backlog_watermark
-    }
-
-    /// Resolves the stalled timeout for one Logical Index.
-    ///
-    /// Without an override, v1 uses checked
-    /// `max(1 ms, 1 s * max_partition_entries / 128)`.
-    pub fn stalled_timeout(&self, index: &IndexConfig) -> Result<Duration> {
-        if let Some(timeout) = self.stalled_timeout {
-            return Ok(timeout);
-        }
-        Duration::from_secs(1)
-            .checked_mul(index.max_partition_entries())
-            .map(|timeout| (timeout / 128).max(Duration::from_millis(1)))
-            .ok_or_else(Error::invalid_argument)
     }
 
     /// Returns the first retry backoff interval.

@@ -291,7 +291,6 @@ fn runtime_and_verify_limits_fail_closed() {
         Some(2)
     );
     assert_eq!(ImportOptions::default().max_in_flight_batches(), None);
-    assert_invalid(RuntimeConfig::default().with_stalled_timeout(Default::default()));
     assert_invalid(VerifyOptions::default().with_issue_limit(10_001));
     assert_invalid(VerifyOptions::default().with_memory_limit_bytes(1_073_741_825));
 }

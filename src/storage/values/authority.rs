@@ -150,6 +150,9 @@ impl fmt::Debug for PartitionCentroid {
 }
 
 /// The durable topology state and references for one partition.
+///
+/// State-start timestamps use Unix-epoch milliseconds. Zero denotes unavailable
+/// wall time; these timestamps support diagnostic age measurements.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum PartitionTransition {
@@ -203,7 +206,8 @@ impl PartitionTransition {
         }
     }
 
-    /// Returns milliseconds since the Unix epoch when this state began.
+    /// Returns milliseconds since the Unix epoch when this state began, or zero
+    /// when the wall-clock timestamp is unavailable.
     #[must_use]
     pub const fn started_at_unix_millis(self) -> u64 {
         match self {

@@ -40,9 +40,11 @@
 //! 0a LeafEntry          sized16<u8 record_id>, sized16<TypedValue>,
 //!                       sized<u8 RaBitQ7>
 //! 0b PartitionSynopsis  sized16<FieldSynopsis>
-//! 0c PartitionState     u8 state, u64 started_at, state-specific u64 keys
+//! 0c PartitionState     u8 state, u64 started_at_unix_millis,
+//!                       state-specific u64 keys
 //! ```
 //!
+//! A zero `started_at_unix_millis` denotes unavailable wall time.
 //! A vector is prefixed by its redundant `u32` dimension. A typed value uses
 //! tag `0=NULL`, `1=Bool`, `2=I64`, `3=F64`, or `4=String`; Bool has one
 //! canonical byte and String is `sized<u8>`. A Field Schema stores its

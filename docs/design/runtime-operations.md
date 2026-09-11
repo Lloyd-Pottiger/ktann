@@ -68,9 +68,13 @@ Zero workers disables background scheduling: that Runtime's offers are
 dropped, and topology changes advance only when driven outside it, which
 stays correct because every committed intermediate state remains searchable.
 
-Wall clock writes Unix-epoch nanosecond diagnostic timestamps; Tokio monotonic
-time controls deadlines and backoff. Invalid wall time prevents a state
-transition. Future persistent timestamps are not stalled.
+The Runtime supplies unsigned 64-bit Unix-epoch millisecond timestamps for
+partition state transitions. A wall-clock sample before the epoch or outside
+the `u64` millisecond range is represented by zero, denoting an unavailable
+timestamp. `ktann.fixup.state_age` records a sample when both timestamps are
+nonzero and the state started at or before the current time. The nonnegative
+millisecond difference is reported in seconds. Maintenance admission and
+topology govern state advances. Tokio monotonic time controls deadlines and retry backoff.
 
 ## 4. Import Session
 

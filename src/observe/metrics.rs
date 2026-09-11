@@ -221,13 +221,16 @@ pub(crate) fn fixup_drain_step(kind: FixupKind, entries: usize) {
         .record(f64::from(entries));
 }
 
-/// Records the wall-clock age of the durable partition state one Fixup step
-/// advanced; a future persisted timestamp saturates to zero (design
-/// `runtime-operations.md` §3).
+/// Records a partition state's diagnostic age in seconds when both Unix-epoch
+/// millisecond timestamps are known and the state started at or before `now`.
 pub(crate) fn fixup_state_age(kind: FixupKind, now_unix_millis: u64, started_at_unix_millis: u64) {
-    let age = Duration::from_millis(now_unix_millis.saturating_sub(started_at_unix_millis));
-    metrics::histogram!(names::FIXUP_STATE_AGE, key::KIND => kind.as_str())
-        .record(age.as_secs_f64());
+    if now_unix_millis == 0 || started_at_unix_millis == 0 {
+        return;
+    }
+    if let Some(age) = now_unix_millis.checked_sub(started_at_unix_millis) {
+        metrics::histogram!(names::FIXUP_STATE_AGE, key::KIND => kind.as_str())
+            .record(Duration::from_millis(age).as_secs_f64());
+    }
 }
 
 /// Records the set-bit ratio of one Bloom filter after a membership
@@ -281,7 +284,7 @@ pub(crate) fn verify_report(report: &VerifyReport) {
 
 #[cfg(test)]
 mod tests {
-    use metrics_util::debugging::{DebuggingRecorder, Snapshotter};
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 
     use super::*;
     use crate::api::{VerifyIssue, VerifyIssueKind, VerifyObjectCounts};
@@ -290,6 +293,36 @@ mod tests {
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         (recorder, snapshotter)
+    }
+
+    #[test]
+    fn fixup_state_age_records_known_nonnegative_ages() {
+        for (now, started, seconds) in [
+            (7_000, 1_000, Some(6.0)),
+            (1_000, 1_000, Some(0.0)),
+            (1_001, 1_000, Some(0.001)),
+            (0, 1_000, None),
+            (1_000, 0, None),
+            (0, 0, None),
+            (999, 1_000, None),
+        ] {
+            let (recorder, snapshotter) = recorder();
+            metrics::with_local_recorder(&recorder, || {
+                fixup_state_age(FixupKind::Split, now, started);
+            });
+            let values = snapshotter.snapshot().into_vec();
+            if let Some(seconds) = seconds {
+                assert_eq!(values.len(), 1);
+                let (key, _, _, value) = &values[0];
+                assert_eq!(key.key().name(), names::FIXUP_STATE_AGE);
+                assert_eq!(*value, DebugValue::Histogram(vec![seconds.into()]));
+            } else {
+                assert!(
+                    values.is_empty(),
+                    "invalid age sample: now={now}, started={started}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -200,9 +200,8 @@ The v1 defaults and caps are:
 | Import maximum in-flight batches | `min(available_parallelism,4)`, min 1 | positive |
 | Import backlog watermark | 2 | within queue capacity |
 
-Stalled timeout defaults to checked
-`max(1ms, 1s * max_partition_entries / 128)`. Retry backoff starts at 1 ms,
-doubles to 100 ms, and applies full jitter in the current interval.
+Retry backoff starts at 1 ms, doubles to 100 ms, and applies full jitter in the
+current interval.
 
 ## 5. Search contract
 
