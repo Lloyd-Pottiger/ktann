@@ -130,7 +130,7 @@ and the small Partition State discriminator needed for traversal; level alone
 determines whether the partition contains Leaf or Child Entries. Transition
 payloads store the source/target references required to resume a transition and
 `started_at_unix_millis`, an unsigned 64-bit Unix-epoch millisecond timestamp
-used for diagnostics. Zero denotes an unavailable timestamp. Structural drain
+used for recovery age checks and diagnostic metrics. Zero denotes an unavailable timestamp. Structural drain
 and paged deletion restart from the
 current prefix beginning.
 Leaf Entries contain Record ID, typed filter fields, and absolute RaBitQ7 bytes;

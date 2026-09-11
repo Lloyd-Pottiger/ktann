@@ -121,8 +121,7 @@ impl RetryPolicy {
 
 /// Returns the current Unix time in milliseconds, or zero when wall time is
 /// before the epoch or exceeds the `u64` millisecond range. Zero denotes an
-/// unavailable diagnostic timestamp. Maintenance admission and topology govern
-/// state advances.
+/// unavailable timestamp for recovery age checks and diagnostic metrics.
 pub(crate) fn now_unix_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

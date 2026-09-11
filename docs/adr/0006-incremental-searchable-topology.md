@@ -14,6 +14,19 @@ The durable state machine has five variants: Ready, `Splitting { left, right }`,
 
 The Runtime samples system wall time and supplies Unix-epoch milliseconds to maintenance advances. A wall-clock sample before the epoch or outside the `u64` millisecond range is represented by zero, which denotes an unavailable timestamp. Tests pass explicit timestamp values to maintenance advances. Tokio monotonic time controls deadlines and retry backoff.
 
-State timestamps provide diagnostic ages for `ktann.fixup.state_age`. An age sample is recorded when both timestamps are nonzero and the state started at or before the current time. The nonnegative millisecond difference is reported in seconds. Maintenance admission and durable topology determine whether a process may advance a state.
+`stalled_timeout` is the minimum age of a persisted `Splitting`,
+`DrainingSplit`, or `Merging` state before an independently rediscovered Fixup
+may assist it. Its default is
+`max(1 ms, 1 s * max_partition_entries / 128)`; overrides must be positive.
+The worker checks `now - started >= timeout` in its existing authority read,
+after process-local queue deduplication. Ready threshold crossings start
+immediately. A progressing worker, including one yielded to the queue tail,
+continues without an age delay. An unavailable timestamp permits recovery;
+a known future timestamp defers recovery until the age threshold is met.
+The timestamp measures time in the state, rather than time since the last
+progress: this is an assistance threshold, not task expiry or a lease.
+Later relevant access rediscovers deferred work; no timer schedules it.
+
+State timestamps also provide diagnostic ages for `ktann.fixup.state_age`. An age sample is recorded when both timestamps are nonzero and the state started at or before the current time. The nonnegative millisecond difference is reported in seconds. The recovery age check and durable topology determine whether a newly admitted worker may advance a state.
 
 Header separately stores one-based u32 level, exact count, and cache epoch. Leaves are level one, every internal Child Entry descends exactly one checked level, only root promotion increases root level, and a non-root partition's level is immutable. Search batch-reads State, Header, and Synopsis in one snapshot when needed. Mutation and maintenance update-protect only the State/Header values that decide whether their writes are legal; ordinary reads do not lock metadata merely to restate invariants. Missing required values or an incompatible level, body kind, or state combination is Corruption.

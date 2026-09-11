@@ -77,6 +77,8 @@ struct FixupKey {
 struct FixupOffer {
     key: FixupKey,
     manifest: Arc<IndexManifest>,
+    /// A yielded worker keeps advancing without waiting for recovery age.
+    continuing: bool,
 }
 
 /// Terminal states of one wait on the process-local import backlog gate.
@@ -169,6 +171,7 @@ impl FixupQueue {
         self.pending.push_back(FixupOffer {
             key,
             manifest: Arc::clone(manifest),
+            continuing: false,
         });
         self.stats.enqueued = self.stats.enqueued.saturating_add(1);
         FixupAdmission::Enqueued
@@ -204,6 +207,7 @@ impl FixupQueue {
         self.pending.push_back(FixupOffer {
             key: offer.key.clone(),
             manifest: Arc::clone(&offer.manifest),
+            continuing: true,
         });
         self.backlog()
     }
@@ -530,6 +534,8 @@ impl<B: Backend> Drop for WorkerGuard<B> {
 
 /// Drives one offered partition through its next bounded state-machine steps.
 ///
+/// Rediscovered intermediate states wait for the configured recovery age.
+/// A progressing worker retains permission across queue yields.
 /// One step reads the durable authority once and dispatches directly to the
 /// actionable split or merge state machine. Progress continues within the
 /// configured step budget; successful step exhaustion yields the same key to
@@ -545,6 +551,11 @@ async fn drive<B: Backend>(inner: &Arc<RuntimeInner<B>>, offer: &FixupOffer) -> 
     };
     let retry = RetryPolicy::for_fixup(inner.config());
     let attempts = inner.config().fixup_attempts();
+    let mut recovery_timeout = if offer.continuing {
+        None
+    } else {
+        Some(inner.config().stalled_timeout(offer.manifest.config()))
+    };
     for _ in 0..attempts {
         if inner.maintenance_cancel.is_cancelled() {
             return DrivenFixup::new(FixupExecution::Retired);
@@ -556,8 +567,11 @@ async fn drive<B: Backend>(inner: &Arc<RuntimeInner<B>>, offer: &FixupOffer) -> 
             &offer.manifest,
             &key.tree_key,
             key.partition,
-            started_at,
-            &retry,
+            maintenance_fixup::StepPolicy {
+                now_unix_millis: started_at,
+                recovery_timeout: recovery_timeout.take(),
+                retry: &retry,
+            },
         )
         .await;
         match step {

@@ -229,6 +229,7 @@ pub struct RuntimeConfig {
     write_beam_size: u32,
     import_max_in_flight_batches: usize,
     import_backlog_watermark: usize,
+    stalled_timeout: Option<Duration>,
     retry_initial_backoff: Duration,
     retry_max_backoff: Duration,
 }
@@ -249,6 +250,7 @@ impl Default for RuntimeConfig {
             write_beam_size: DEFAULT_WRITE_BEAM_SIZE,
             import_max_in_flight_batches: available.clamp(1, 4),
             import_backlog_watermark: 2,
+            stalled_timeout: None,
             retry_initial_backoff: Duration::from_millis(1),
             retry_max_backoff: Duration::from_millis(100),
         }
@@ -256,6 +258,15 @@ impl Default for RuntimeConfig {
 }
 
 impl RuntimeConfig {
+    /// Sets the positive minimum state age for rediscovered maintenance to resume.
+    pub fn with_stalled_timeout(mut self, timeout: Duration) -> Result<Self> {
+        if timeout.is_zero() {
+            return Err(Error::invalid_argument());
+        }
+        self.stalled_timeout = Some(timeout);
+        Ok(self)
+    }
+
     /// Sets equal bounds for running and waiting foreground operations.
     pub fn with_foreground_operation_limit(mut self, limit: usize) -> Result<Self> {
         if limit == 0 || limit > MAX_FOREGROUND_OPERATION_LIMIT {
@@ -447,6 +458,17 @@ impl RuntimeConfig {
     #[must_use]
     pub const fn import_backlog_watermark(&self) -> usize {
         self.import_backlog_watermark
+    }
+
+    /// Returns the minimum state age before a worker assists rediscovered work.
+    ///
+    /// The default is `max(1 ms, 1 s * max_partition_entries / 128)`.
+    #[must_use]
+    pub fn stalled_timeout(&self, index: &IndexConfig) -> Duration {
+        self.stalled_timeout.unwrap_or_else(|| {
+            (Duration::from_secs(u64::from(index.max_partition_entries())) / 128)
+                .max(Duration::from_millis(1))
+        })
     }
 
     /// Returns the first retry backoff interval.

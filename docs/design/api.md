@@ -174,8 +174,8 @@ RaBitQ7, binary fanout, Lloyd rounds, rotation algorithm, logical codecs, and
 hard safety caps are defined by the Persistent Format.
 
 `RuntimeConfig` owns the foreground operation limit, cache bytes, worker count,
-queue capacity, retry/backoff, maintenance transaction budgets, and default
-search budgets. It also owns the per-level write beam used by foreground
+queue capacity, the `stalled_timeout` recovery age threshold, retry/backoff,
+maintenance transaction budgets, and default search budgets. It also owns the per-level write beam used by foreground
 inserts and upserts; a wider write beam still commits each record to exactly
 one leaf. Adapter config owns backend resources such as RocksDB blocking
 concurrency. Search options may only lower or override process defaults within

@@ -152,7 +152,7 @@ impl fmt::Debug for PartitionCentroid {
 /// The durable topology state and references for one partition.
 ///
 /// State-start timestamps use Unix-epoch milliseconds. Zero denotes unavailable
-/// wall time; these timestamps support diagnostic age measurements.
+/// wall time; these timestamps support recovery age checks and diagnostic metrics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum PartitionTransition {

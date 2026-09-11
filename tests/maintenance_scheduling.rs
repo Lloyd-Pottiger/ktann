@@ -351,9 +351,36 @@ async fn queue_loss_leaves_searchable_state_and_search_resumes_it() {
     // Dropping the Runtime loses the queue; the durable state is untouched.
     runtime_a.shutdown().await.expect("shutdown");
 
-    // A fresh Runtime has an empty queue; the first relevant search
-    // rediscovers the cold split state and drives the split to completion.
-    let runtime_b = Runtime::new(backend.clone(), runtime_config(2, 16, 8)).expect("runtime");
+    // A rediscovering worker observes a young intermediate state but leaves
+    // it to existing work until the configured recovery age is reached.
+    let waiting_runtime = Runtime::new(
+        backend.clone(),
+        runtime_config(1, 16, 1)
+            .with_stalled_timeout(Duration::from_secs(86_400))
+            .expect("timeout"),
+    )
+    .expect("runtime");
+    let waiting_index = waiting_runtime.open_index("cold").await.expect("open");
+    let before = topology(&backend, &waiting_index).await;
+    drive_one_step(&waiting_index).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !format!("{waiting_runtime:?}").contains("settled: 1") {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("rediscovered worker finishes its age check");
+    waiting_runtime.shutdown().await.expect("shutdown");
+    assert_eq!(topology(&backend, &waiting_index).await, before);
+
+    // A new worker may recover the same state once its minimum age is met.
+    let runtime_b = Runtime::new(
+        backend.clone(),
+        runtime_config(2, 16, 8)
+            .with_stalled_timeout(Duration::from_nanos(1))
+            .expect("timeout"),
+    )
+    .expect("runtime");
     let index_b = runtime_b.open_index("cold").await.expect("open index");
     settle(&index_b, &backend, &model).await;
     assert_converged(&backend, &index_b, &model).await;
@@ -383,7 +410,13 @@ async fn lost_oversized_ready_offer_is_rediscovered_after_reopen() {
 
     // A new Runtime begins with an empty queue. Search observes the committed
     // threshold crossing, re-offers it, and the split converges normally.
-    let runtime_b = Runtime::new(backend.clone(), runtime_config(2, 16, 8)).expect("runtime");
+    let runtime_b = Runtime::new(
+        backend.clone(),
+        runtime_config(1, 16, 1)
+            .with_stalled_timeout(Duration::from_secs(86_400))
+            .expect("timeout"),
+    )
+    .expect("runtime");
     let index_b = runtime_b
         .open_index("lost-ready")
         .await
