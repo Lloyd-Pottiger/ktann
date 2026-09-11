@@ -5,15 +5,15 @@
 //! fixed-width unsigned integers. Strings are unnormalized UTF-8. Finite
 //! floating-point zero has exactly one representation: positive zero.
 //!
-//! The Index Manifest declares the whole persistent format version. An unsupported
+//! The Index Manifest declares the persistent format version. An unsupported
 //! Manifest format is [`ErrorKind::UnsupportedFormat`]. An unknown type tag,
 //! discriminant, malformed length, noncanonical scalar, inconsistent identity,
 //! or trailing byte is [`ErrorKind::Corruption`].
 //!
 //! [`ValueCodec::bootstrap`] handles namespace values and Index Manifests.
 //! [`ValueCodec::for_index`] binds all remaining codecs to the Manifest's exact
-//! dimension, schema, Tree Key definition, and Bloom parameters. The module
-//! never adds or interprets a backend physical prefix.
+//! dimension, schema, Tree Key definition, and Bloom parameters. Adapters own
+//! backend physical prefixes.
 //!
 //! # Value layout
 //!
@@ -49,9 +49,8 @@
 //! `sized8<u8>` name, type, nullable byte, synopsis tag, configured Bloom input,
 //! and exact Bloom parameters. A Field Synopsis stores canonical NULL/non-NULL
 //! flags, optional typed extrema, and the schema-governed fixed-size Bloom byte
-//! string. The nested RaBitQ7 payload is governed by the Manifest's whole-format
-//! version. Its 12-byte header and LSB-first bit streams use the
-//! little-endian layout even though the enclosing value codec is big-endian.
+//! string. The Persistent Format defines the nested RaBitQ7 payload: a 12-byte
+//! little-endian header followed by LSB-first bit streams.
 
 use bytes::Bytes;
 
@@ -84,7 +83,7 @@ pub use synopsis::{FieldSynopsis, PartitionSynopsis};
 
 use wire::{Decoder, Encoder};
 
-/// The whole persistent format version emitted and accepted by this build.
+/// The persistent format version emitted and accepted by this build.
 pub const FORMAT_VERSION: u16 = 1;
 
 /// The maximum encoded Opaque Payload size.
@@ -183,7 +182,7 @@ impl ValueKind {
     }
 }
 
-/// Any logical value governed by the Manifest's whole-format version.
+/// A typed value in the Persistent Format.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum PersistentValue {

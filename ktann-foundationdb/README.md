@@ -19,12 +19,11 @@ logical key:
 00 6b 74 61 6e 6e <namespace-length:u8> <namespace-bytes> <logical-key>
 ```
 
-`00 6b 74 61 6e 6e` is the KTANN marker. The prefix carries no version byte;
-the Index Manifest owns the whole-format marker. Backend Namespaces are limited
-to 255 bytes. Length delimiting
-keeps adjacent namespace values disjoint without escaping the logical key, and
-the adapter subtracts the complete prefix length from FoundationDB's 10,000
-byte physical-key limit.
+`00 6b 74 61 6e 6e` is the KTANN marker. The Index Manifest stores the
+persistent format version governing this encoding. Backend Namespaces are
+limited to 255 bytes. Length delimiting keeps adjacent namespace values
+disjoint, and the adapter subtracts the complete prefix length from
+FoundationDB's 10,000-byte physical-key limit.
 
 The adapter exposes FoundationDB's 100,000-byte value limit and applies the
 accepted conservative defaults of 10,000 mutations, 1 MiB of physical mutation

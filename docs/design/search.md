@@ -33,7 +33,7 @@ by distance and then unsigned lexicographic Record ID bytes.
 ## 2. Absolute RaBitQ7 format
 
 Each Leaf Entry stores an absolute, centroid-independent code. A fixed seeded
-orthogonal Givens rotation is governed by the Manifest's whole-format version.
+orthogonal Givens rotation is defined by the Persistent Format.
 The storage design fixes its exact ChaCha8 permutation and three-round pair
 protocol.
 

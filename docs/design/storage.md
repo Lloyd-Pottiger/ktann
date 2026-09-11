@@ -109,19 +109,18 @@ fields, noncanonical values, nonzero padding, and trailing bytes.
 
 ## 6. Persistent values
 
-Each value is a one-byte type tag followed by its payload. The Manifest's
-whole-format marker is `FORMAT_VERSION = 1`; it governs logical keys, values,
-adapter physical encodings, and persistent algorithms. Keys and adapter prefixes
-carry no independent versions. During the unreleased phase this marker remains 1
-while the sole encoding implementation is updated directly. An unsupported Manifest format returns `UnsupportedFormat`.
-Wrong key/value pairings and malformed or noncanonical values return `Corruption`,
-including namespace allocator and Index Name values. Only the current layout is
-supported; incompatible development data must be recreated even when its
-Manifest marker is 1.
+The Index Manifest stores the persistent format version (`FORMAT_VERSION = 1`),
+lifecycle state, immutable configuration, Logical Index ID, RaBitQ rotation
+seed, and exact Bloom parameters. The Persistent Format covers Logical Keys,
+stored values, adapter physical keys, and algorithms that determine persisted
+bytes. Loading a Manifest validates its format version; an unsupported version
+returns `UnsupportedFormat`.
 
-The Index Manifest stores lifecycle state, one whole persistent-format version,
-immutable configuration, Logical Index ID, RaBitQ rotation seed, and exact Bloom
-parameters. A Tree Manifest is the directory entry, root reference, and
+Each stored value consists of a one-byte type tag followed by its payload.
+Wrong key/value pairings and malformed or noncanonical encodings return
+`Corruption`, including in allocator and Index Name values.
+
+A Tree Manifest is the directory entry, root reference, and
 Partition Key allocator high-water mark for one Tree Key. Reservation allocates
 fixed ranges (default 1,024) through an update-protected manifest; unused keys
 remain gaps.

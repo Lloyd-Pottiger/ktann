@@ -171,7 +171,7 @@ non-null Tree Key FieldIds, and minimum/maximum partition entries. Limits are:
 | Partition entries | `1 <= min`, `2 * min <= max <= 65,536`; defaults 16/128 |
 
 RaBitQ7, binary fanout, Lloyd rounds, rotation algorithm, logical codecs, and
-hard safety caps are fixed by the Manifest's whole-format version.
+hard safety caps are defined by the Persistent Format.
 
 `RuntimeConfig` owns the foreground operation limit, cache bytes, worker count,
 queue capacity, retry/backoff, maintenance transaction budgets, and default

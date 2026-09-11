@@ -569,7 +569,7 @@ fn unsupported_manifest_formats_fail_closed() {
         bytes[1..3].copy_from_slice(&format.to_be_bytes());
         assert_eq!(
             decode(bootstrap, &key, &bytes)
-                .expect_err("unsupported whole format")
+                .expect_err("unsupported persistent format")
                 .kind(),
             ErrorKind::UnsupportedFormat
         );

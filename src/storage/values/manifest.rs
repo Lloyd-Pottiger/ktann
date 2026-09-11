@@ -96,7 +96,7 @@ impl IndexManifest {
         Ok(manifest)
     }
 
-    /// Returns the whole persistent format version.
+    /// Returns the persistent format version.
     #[must_use]
     pub const fn format_version(&self) -> u16 {
         FORMAT_VERSION

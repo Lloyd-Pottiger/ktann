@@ -479,7 +479,7 @@ async fn unsupported_manifest_format_fails_reads_closed() {
     let runtime = make_runtime(shared.clone());
     let index = runtime.open_index("docs").await.expect("open index");
 
-    // Rewrite the Manifest bytes with an unsupported whole-format version.
+    // Rewrite the Manifest bytes with an unsupported persistent format version.
     let mut bytes = ValueCodec::bootstrap()
         .encode(&PersistentValue::IndexManifest(manifest.clone()))
         .expect("encode manifest");

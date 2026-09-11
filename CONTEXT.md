@@ -20,6 +20,9 @@ _Avoid_: Logical Index, Tree Key
 The authoritative format, configuration, and lifecycle state of one existing Logical Index.
 _Avoid_: Tree root, process configuration
 
+**Persistent Format**:
+The canonical encoding contract for Logical Keys, stored values, adapter physical keys, and algorithms that determine persisted bytes. An Index Manifest identifies its format version.
+
 **Sharded Forest**:
 A set of disjoint K-means trees in one Logical Index where each Vector Record belongs to exactly one tree.
 _Avoid_: Randomized-tree ensemble, replicated forest

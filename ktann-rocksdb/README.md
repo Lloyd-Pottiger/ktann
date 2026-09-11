@@ -22,11 +22,10 @@ logical key:
 <namespace-length:u8> <namespace-bytes> <logical-key>
 ```
 
-The marker is deliberately RocksDB-specific. The prefix carries no version
-byte; the Index Manifest owns the whole-format marker. Persisted indexes are
-not portable to FoundationDB. Backend Namespaces are limited to 255 bytes. Length delimiting
-keeps adjacent namespace values disjoint without escaping or rewriting the
-logical key.
+The marker identifies the RocksDB adapter. The Index Manifest stores the
+persistent format version governing this encoding. Backend Namespaces are
+limited to 255 bytes. Length delimiting keeps adjacent namespace values
+disjoint. The logical key bytes follow the namespace unchanged.
 
 ## Database configuration
 
