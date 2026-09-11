@@ -479,11 +479,11 @@ async fn unsupported_manifest_format_fails_reads_closed() {
     let runtime = make_runtime(shared.clone());
     let index = runtime.open_index("docs").await.expect("open index");
 
-    // Rewrite the Manifest bytes with an unsupported whole-format version.
+    // Rewrite the Manifest bytes with an unsupported persistent format version.
     let mut bytes = ValueCodec::bootstrap()
         .encode(&PersistentValue::IndexManifest(manifest.clone()))
         .expect("encode manifest");
-    bytes[2..4].copy_from_slice(&2_u16.to_be_bytes());
+    bytes[1..3].copy_from_slice(&2_u16.to_be_bytes());
     put_raw(
         &shared,
         keys::manifest_key(manifest.logical_index_id()),
@@ -768,7 +768,7 @@ async fn batch_reads_enforce_backend_batch_and_key_limits() {
 
     // Encoded keys that exceed the backend key ceiling fail with
     // LimitExceeded before any value is read.
-    let shared = backend(key_limit_config(16));
+    let shared = backend(key_limit_config(15));
     let manifest = seed_named_index(
         &shared,
         &name("docs"),

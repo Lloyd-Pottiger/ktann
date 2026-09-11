@@ -68,9 +68,26 @@ Zero workers disables background scheduling: that Runtime's offers are
 dropped, and topology changes advance only when driven outside it, which
 stays correct because every committed intermediate state remains searchable.
 
-Wall clock writes Unix-epoch nanosecond diagnostic timestamps; Tokio monotonic
-time controls deadlines and backoff. Invalid wall time prevents a state
-transition. Future persistent timestamps are not stalled.
+The Runtime supplies unsigned 64-bit Unix-epoch millisecond timestamps for
+partition state transitions. A wall-clock sample before the epoch or outside
+the `u64` millisecond range is represented by zero, denoting an unavailable
+timestamp. `ktann.fixup.state_age` records a sample when both timestamps are
+nonzero and the state started at or before the current time. The nonnegative
+millisecond difference is reported in seconds. Tokio monotonic time controls deadlines and retry backoff.
+
+`stalled_timeout` is the minimum age of a persisted `Splitting`,
+`DrainingSplit`, or `Merging` state before an independently rediscovered Fixup
+may assist it. Its default is
+`max(1 ms, 1 s * max_partition_entries / 128)`; overrides must be positive.
+The worker checks `now - started >= timeout` in its existing authority read,
+after process-local queue deduplication. Ready threshold crossings start
+immediately. A progressing worker, including one yielded to the queue tail,
+continues without an age delay. An unavailable timestamp permits recovery;
+a known future timestamp defers recovery until the age threshold is met.
+The timestamp measures time in the state, rather than time since the last
+progress: this is an assistance threshold, not task expiry or a lease.
+Later relevant access rediscovers deferred work; no timer schedules it.
+
 
 ## 4. Import Session
 

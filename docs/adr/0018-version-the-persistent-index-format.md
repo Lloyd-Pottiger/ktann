@@ -1,13 +1,19 @@
-# Version the persistent index format as one whole
+# Store the persistent format version in the Index Manifest
 
-The Index Manifest stores one core value-format version, and every typed value
-carries a type tag and codec version so wrong key/value pairings and unsupported
-encodings fail closed. Each adapter separately versions its physical key
-encoding. All versions are scoped to opening an index through the same adapter;
-they do not define cross-backend interchange. KTANN v1 performs no in-place
-migration and never guesses compatibility. An unsupported Manifest format or
-its declared codec combination returns UnsupportedFormat. Once a Manifest
-declares a supported format, an unknown value tag, codec variant, Partition
-State discriminant, or illegal value combination is local Corruption rather
-than speculative evidence of a newer format; decoders never treat unknown data
-as Ready, Missing, or another permissive fallback.
+The Persistent Format defines the encoding of Logical Keys, stored values,
+adapter physical keys, and algorithms that determine persisted bytes, including
+RaBitQ7 payloads. Its version is stored in the Index Manifest. The supported
+version is 1 (`FORMAT_VERSION`). An index is opened through the adapter that
+owns its Backend Namespace.
+
+Logical Keys begin with a namespace or index scope tag. Stored values begin
+with a type tag followed by their payload. Adapter physical keys consist of a
+backend marker, a length-delimited Backend Namespace, and the Logical Key.
+These tags and lengths identify ownership and structure. Canonical encodings
+preserve deterministic bytes, ordered scans, and namespace isolation.
+
+Loading an Index Manifest validates the stored format version; an unsupported
+version returns UnsupportedFormat. Decoders validate scope and type tags,
+lengths, canonical scalars, identities, and structural invariants. Invalid
+encodings and wrong key/value pairings return Corruption, including in
+allocator and Index Name values.

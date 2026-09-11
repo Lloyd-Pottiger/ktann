@@ -7,7 +7,7 @@ FoundationDB 7.3 client library at build and runtime.
 The embedding process must start the FoundationDB network exactly once, keep
 its network guard alive longer than every `FoundationDbBackend`, and pass an
 already-open `foundationdb::Database` to the adapter. Each adapter instance
-adds a versioned physical prefix containing its caller-selected Backend
+adds a physical prefix containing its caller-selected Backend
 Namespace; logical codecs and index algorithms remain in `ktann`.
 
 ## Physical key format
@@ -16,14 +16,14 @@ Every FoundationDB key has this exact physical prefix before its opaque KTANN
 logical key:
 
 ```text
-00 6b 74 61 6e 6e 01 <namespace-length:u8> <namespace-bytes> <logical-key>
+00 6b 74 61 6e 6e <namespace-length:u8> <namespace-bytes> <logical-key>
 ```
 
-`00 6b 74 61 6e 6e` is the KTANN marker and `01` is the FoundationDB physical
-format version. Backend Namespaces are limited to 255 bytes. Length delimiting
-keeps adjacent namespace values disjoint without escaping the logical key, and
-the adapter subtracts the complete prefix length from FoundationDB's 10,000
-byte physical-key limit.
+`00 6b 74 61 6e 6e` is the KTANN marker. The Index Manifest stores the
+persistent format version governing this encoding. Backend Namespaces are
+limited to 255 bytes. Length delimiting keeps adjacent namespace values
+disjoint, and the adapter subtracts the complete prefix length from
+FoundationDB's 10,000-byte physical-key limit.
 
 The adapter exposes FoundationDB's 100,000-byte value limit and applies the
 accepted conservative defaults of 10,000 mutations, 1 MiB of physical mutation

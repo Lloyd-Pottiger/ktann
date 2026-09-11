@@ -6,7 +6,7 @@ reads, unique insertion, transaction limits, and explicit commit-outcome
 classification. This is a Rust behavioral interface, not a cross-backend
 storage protocol. Each adapter owns its physical keyspace and transaction
 mapping. Adapters do not implement index algorithms; the typed index-storage
-module owns logical key/value types, versioned value codecs, algorithmic
+module owns logical key/value types, canonical value codecs, algorithmic
 validation, and atomic record/partition operations. Reusing those codecs is an
 implementation choice and does not make persisted indexes transferable.
 

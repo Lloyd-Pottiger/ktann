@@ -33,8 +33,9 @@ by distance and then unsigned lexicographic Record ID bytes.
 ## 2. Absolute RaBitQ7 format
 
 Each Leaf Entry stores an absolute, centroid-independent code. A fixed seeded
-orthogonal Givens rotation is part of persistent format v1. The storage design
-fixes its exact ChaCha8 permutation and three-round pair protocol.
+orthogonal Givens rotation is defined by the Persistent Format.
+The storage design fixes its exact ChaCha8 permutation and three-round pair
+protocol.
 
 For each rotated component `x_i`, encoding stores one sign bit and a six-bit
 magnitude `m_i` in `0..=63`. Define the signed integer code:

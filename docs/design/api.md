@@ -171,11 +171,11 @@ non-null Tree Key FieldIds, and minimum/maximum partition entries. Limits are:
 | Partition entries | `1 <= min`, `2 * min <= max <= 65,536`; defaults 16/128 |
 
 RaBitQ7, binary fanout, Lloyd rounds, rotation algorithm, logical codecs, and
-hard safety caps are fixed by format version 1, not caller options.
+hard safety caps are defined by the Persistent Format.
 
 `RuntimeConfig` owns the foreground operation limit, cache bytes, worker count,
-queue capacity, retry/backoff, maintenance transaction budgets, and default
-search budgets. It also owns the per-level write beam used by foreground
+queue capacity, the `stalled_timeout` recovery age threshold, retry/backoff,
+maintenance transaction budgets, and default search budgets. It also owns the per-level write beam used by foreground
 inserts and upserts; a wider write beam still commits each record to exactly
 one leaf. Adapter config owns backend resources such as RocksDB blocking
 concurrency. Search options may only lower or override process defaults within
@@ -200,9 +200,8 @@ The v1 defaults and caps are:
 | Import maximum in-flight batches | `min(available_parallelism,4)`, min 1 | positive |
 | Import backlog watermark | 2 | within queue capacity |
 
-Stalled timeout defaults to checked
-`max(1ms, 1s * max_partition_entries / 128)`. Retry backoff starts at 1 ms,
-doubles to 100 ms, and applies full jitter in the current interval.
+Retry backoff starts at 1 ms, doubles to 100 ms, and applies full jitter in the
+current interval.
 
 ## 5. Search contract
 

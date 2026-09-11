@@ -64,7 +64,7 @@ use crate::storage::values::{
 use crate::storage::{LogicalRange, LogicalReader, WriteLogicalTxn};
 
 /// The number of split targets one split reserves and exposes; binary fanout
-/// is a fixed format-v1 protocol choice.
+/// is a fixed persistent format protocol choice.
 const SPLIT_TARGETS: u32 = 2;
 
 /// The bound on one incoming-edge discovery or entry scan page.

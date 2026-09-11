@@ -86,7 +86,7 @@ the lifecycle records.
 
 ## 5. Logical keyspace
 
-The core defines a versioned logical namespace for:
+The core defines one logical namespace for:
 
 - allocator and Index Name mapping;
 - Index Manifest;
@@ -100,7 +100,7 @@ range. Tree-local keys embed the canonical encoded Tree Key and Partition Key;
 there is no Tree ID. Physical adapters add their own bounded prefix without a
 second unbounded escaping pass.
 
-Logical key codecs are versioned independently from value codecs. Version 1
+Logical keys begin with their namespace or index scope tag. The canonical layout
 specifies exact type tags, integer endianness, tuple escaping, terminators, and
 field ordering in codec source plus checked-in golden vectors. The Tree Key
 codec is memcomparable: byte ordering exactly matches typed comparison and
@@ -109,9 +109,18 @@ fields, noncanonical values, nonzero padding, and trailing bytes.
 
 ## 6. Persistent values
 
-The Index Manifest stores lifecycle state, format and codec versions, immutable
-configuration, Logical Index ID, RaBitQ rotation seed, and exact Bloom
-parameters. A Tree Manifest is the directory entry, root reference, and
+The Index Manifest stores the persistent format version (`FORMAT_VERSION = 1`),
+lifecycle state, immutable configuration, Logical Index ID, RaBitQ rotation
+seed, and exact Bloom parameters. The Persistent Format covers Logical Keys,
+stored values, adapter physical keys, and algorithms that determine persisted
+bytes. Loading a Manifest validates its format version; an unsupported version
+returns `UnsupportedFormat`.
+
+Each stored value consists of a one-byte type tag followed by its payload.
+Wrong key/value pairings and malformed or noncanonical encodings return
+`Corruption`, including in allocator and Index Name values.
+
+A Tree Manifest is the directory entry, root reference, and
 Partition Key allocator high-water mark for one Tree Key. Reservation allocates
 fixed ranges (default 1,024) through an update-protected manifest; unused keys
 remain gaps.
@@ -119,10 +128,11 @@ remain gaps.
 Partition Header stores level (1 for a leaf), exact entry count, cache epoch,
 and the small Partition State discriminator needed for traversal; level alone
 determines whether the partition contains Leaf or Child Entries. Transition
-payloads store the
-source/target references and state-start time required to resume a transition;
-structural drain and paged deletion restart from the current prefix beginning
-and persist no cursor.
+payloads store the source/target references required to resume a transition and
+`started_at_unix_millis`, an unsigned 64-bit Unix-epoch millisecond timestamp
+used for recovery age checks and diagnostic metrics. Zero denotes an unavailable timestamp. Structural drain
+and paged deletion restart from the
+current prefix beginning.
 Leaf Entries contain Record ID, typed filter fields, and absolute RaBitQ7 bytes;
 Child Entries contain child Partition Key and immutable centroid projection.
 

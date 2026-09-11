@@ -1,33 +1,31 @@
 //! Canonical codecs for persistent logical values.
 //!
-//! Every value starts with a one-byte type tag and a one-byte codec version.
+//! Every value starts with a one-byte type tag followed by its payload.
 //! Integer and floating-point payloads use big-endian bytes; lengths use
 //! fixed-width unsigned integers. Strings are unnormalized UTF-8. Finite
 //! floating-point zero has exactly one representation: positive zero.
 //!
-//! The Index Manifest additionally declares the whole-format and value-codec
-//! versions. Unsupported versions in bootstrap values or a Manifest are
-//! [`ErrorKind::UnsupportedFormat`]. Once a supported Manifest has been opened,
-//! an unknown tag, codec version, discriminant, malformed length, noncanonical
-//! scalar, inconsistent identity, or trailing byte in an index-owned value is
-//! [`ErrorKind::Corruption`].
+//! The Index Manifest declares the persistent format version. An unsupported
+//! Manifest format is [`ErrorKind::UnsupportedFormat`]. An unknown type tag,
+//! discriminant, malformed length, noncanonical scalar, inconsistent identity,
+//! or trailing byte is [`ErrorKind::Corruption`].
 //!
 //! [`ValueCodec::bootstrap`] handles namespace values and Index Manifests.
 //! [`ValueCodec::for_index`] binds all remaining codecs to the Manifest's exact
-//! dimension, schema, Tree Key definition, and Bloom parameters. The module
-//! never adds or interprets a backend physical prefix.
+//! dimension, schema, Tree Key definition, and Bloom parameters. Adapters own
+//! backend physical prefixes.
 //!
-//! # Version 1 layout
+//! # Value layout
 //!
 //! `u16`, `u32`, `u64`, `i64`, `f32`, and `f64` below are fixed-width
 //! big-endian values. `bytes32` is exactly 32 bytes. `sizedN<T>` is an unsigned
 //! `N`-bit element count followed by that many `T` values; bare `sized<T>` uses
-//! a `u32` count. Every row starts with `[tag: u8][codec: u8 = 1]`:
+//! a `u32` count. Every row starts with `[tag: u8]`:
 //!
 //! ```text
 //! 00 IndexIdAllocator   u64 high_water
 //! 01 IndexNameEntry     u64 logical_index_id
-//! 02 IndexManifest      u16 format, u8 declared_codec, u8 lifecycle,
+//! 02 IndexManifest      u16 format, u8 lifecycle,
 //!                       u64 id, u32 dimension, u8 metric,
 //!                       sized16<FieldSchema>, sized16<u16 tree_field>,
 //!                       u32 min_entries, u32 max_entries, bytes32 seed
@@ -42,18 +40,19 @@
 //! 0a LeafEntry          sized16<u8 record_id>, sized16<TypedValue>,
 //!                       sized<u8 RaBitQ7>
 //! 0b PartitionSynopsis  sized16<FieldSynopsis>
-//! 0c PartitionState     u8 state, u64 started_at, state-specific u64 keys
+//! 0c PartitionState     u8 state, u64 started_at_unix_millis,
+//!                       state-specific u64 keys
 //! ```
 //!
+//! A zero `started_at_unix_millis` denotes unavailable wall time.
 //! A vector is prefixed by its redundant `u32` dimension. A typed value uses
 //! tag `0=NULL`, `1=Bool`, `2=I64`, `3=F64`, or `4=String`; Bool has one
 //! canonical byte and String is `sized<u8>`. A Field Schema stores its
 //! `sized8<u8>` name, type, nullable byte, synopsis tag, configured Bloom input,
 //! and exact Bloom parameters. A Field Synopsis stores canonical NULL/non-NULL
 //! flags, optional typed extrema, and the schema-governed fixed-size Bloom byte
-//! string. The nested RaBitQ7 payload is governed by the Manifest's whole-format
-//! version. Its 12-byte header and LSB-first bit streams use the format-v1
-//! little-endian layout even though the enclosing value codec is big-endian.
+//! string. The Persistent Format defines the nested RaBitQ7 payload: a 12-byte
+//! little-endian header followed by LSB-first bit streams.
 
 use bytes::Bytes;
 
@@ -86,11 +85,8 @@ pub use synopsis::{FieldSynopsis, PartitionSynopsis};
 
 use wire::{Decoder, Encoder};
 
-/// The whole persistent format version emitted and accepted by this build.
+/// The persistent format version emitted and accepted by this build.
 pub const FORMAT_VERSION: u16 = 1;
-
-/// The logical value codec version emitted and accepted by this build.
-pub const VALUE_CODEC_VERSION: u8 = 1;
 
 /// The maximum encoded Opaque Payload size.
 pub const MAX_PAYLOAD_BYTES: usize = crate::api::MAX_PAYLOAD_BYTES;
@@ -188,7 +184,7 @@ impl ValueKind {
     }
 }
 
-/// Any versioned logical value owned by the storage module.
+/// A typed value in the Persistent Format.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum PersistentValue {
@@ -500,8 +496,4 @@ fn validate_key_identity(
 
 fn corrupt() -> Error {
     Error::new(ErrorKind::Corruption)
-}
-
-fn unsupported() -> Error {
-    Error::new(ErrorKind::UnsupportedFormat)
 }

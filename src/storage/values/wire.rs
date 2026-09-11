@@ -4,7 +4,7 @@ use bytes::Bytes;
 
 use crate::api::{Error, LogicalIndexId, PartitionKey, Result};
 
-use super::{MAX_VALUE_BYTES, VALUE_CODEC_VERSION, ValueKind, corrupt, unsupported};
+use super::{MAX_VALUE_BYTES, ValueKind, corrupt};
 
 pub(super) struct Encoder {
     bytes: Vec<u8>,
@@ -13,7 +13,7 @@ pub(super) struct Encoder {
 impl Encoder {
     pub(super) fn new(kind: ValueKind) -> Self {
         Self {
-            bytes: vec![kind.tag(), VALUE_CODEC_VERSION],
+            bytes: vec![kind.tag()],
         }
     }
 
@@ -107,24 +107,10 @@ pub(super) struct Decoder {
 
 impl Decoder {
     pub(super) fn framed(expected: ValueKind, bytes: Bytes) -> Result<Self> {
-        if bytes.len() < 2 || bytes.len() > MAX_VALUE_BYTES || bytes[0] != expected.tag() {
+        if bytes.is_empty() || bytes.len() > MAX_VALUE_BYTES || bytes[0] != expected.tag() {
             return Err(corrupt());
         }
-        if bytes[1] != VALUE_CODEC_VERSION {
-            return Err(
-                if matches!(
-                    expected,
-                    ValueKind::IndexIdAllocator
-                        | ValueKind::IndexNameEntry
-                        | ValueKind::IndexManifest
-                ) {
-                    unsupported()
-                } else {
-                    corrupt()
-                },
-            );
-        }
-        Ok(Self { bytes, position: 2 })
+        Ok(Self { bytes, position: 1 })
     }
 
     pub(super) fn remaining(&self) -> usize {

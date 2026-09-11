@@ -22,7 +22,7 @@ const DEFAULT_MAX_MUTATIONS: usize = 10_000;
 const DEFAULT_MAX_MUTATION_BYTES: usize = 1 << 20;
 const MAX_SCAN_PAGE_BYTES: usize = 80 << 10;
 const MAX_CONCURRENT_READS: usize = 1_024;
-const PHYSICAL_PREFIX_HEADER: &[u8] = b"\0ktann\x01";
+const PHYSICAL_PREFIX_HEADER: &[u8] = b"\0ktann";
 
 const FDB_TRANSACTION_TOO_OLD: i32 = 1007;
 const FDB_TRANSACTION_TOO_LARGE: i32 = 2101;
@@ -569,12 +569,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn physical_prefix_is_versioned_length_delimited_and_order_preserving() {
+    fn physical_prefix_is_length_delimited_and_order_preserving() {
         let a = PhysicalPrefix::new(&BackendNamespace::new("a").expect("namespace"));
         let aa = PhysicalPrefix::new(&BackendNamespace::new("aa").expect("namespace"));
 
         assert_ne!(a.bytes, aa.bytes);
-        assert_eq!(a.bytes.as_ref(), b"\0ktann\x01\x01a");
+        assert_eq!(a.bytes.as_ref(), b"\0ktann\x01a");
         assert!(a.encode_key(b"left").expect("key") < a.encode_key(b"right").expect("key"));
         assert!(!aa.encode_key(b"key").expect("key").starts_with(&a.bytes));
     }

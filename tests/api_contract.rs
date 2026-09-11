@@ -249,6 +249,23 @@ fn search_rejects_invalid_k_dimension_and_budgets() -> ktann::api::Result<()> {
 fn runtime_and_verify_limits_fail_closed() {
     assert_eq!(RuntimeConfig::default().import_backlog_watermark(), 2);
     assert_eq!(RuntimeConfig::default().write_beam_size(), 8);
+    assert_invalid(RuntimeConfig::default().with_stalled_timeout(std::time::Duration::ZERO));
+    let recovery_index = IndexConfig::new(1, Metric::L2)
+        .expect("index")
+        .with_partition_entries(1, 128)
+        .expect("partition bounds");
+    assert_eq!(
+        RuntimeConfig::default().stalled_timeout(&recovery_index),
+        std::time::Duration::from_secs(1),
+    );
+    let override_timeout = std::time::Duration::from_millis(17);
+    assert_eq!(
+        RuntimeConfig::default()
+            .with_stalled_timeout(override_timeout)
+            .expect("positive timeout")
+            .stalled_timeout(&recovery_index),
+        override_timeout,
+    );
     assert_invalid(RuntimeConfig::default().with_write_beam_size(0));
     assert_invalid(RuntimeConfig::default().with_write_beam_size(16_385));
     assert_eq!(
@@ -291,7 +308,6 @@ fn runtime_and_verify_limits_fail_closed() {
         Some(2)
     );
     assert_eq!(ImportOptions::default().max_in_flight_batches(), None);
-    assert_invalid(RuntimeConfig::default().with_stalled_timeout(Default::default()));
     assert_invalid(VerifyOptions::default().with_issue_limit(10_001));
     assert_invalid(VerifyOptions::default().with_memory_limit_bytes(1_073_741_825));
 }

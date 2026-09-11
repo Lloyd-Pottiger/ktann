@@ -1,6 +1,6 @@
-//! Format-v1 Search vector validation, distance, and rotation semantics.
+//! Search vector validation, distance, and rotation semantics.
 //!
-//! Format v1 deliberately uses scalar IEEE-754 operations and a fixed seeded
+//! The persistent format uses scalar IEEE-754 operations and a fixed seeded
 //! rotation. These steps are persistent protocol: changing their order,
 //! precision, constants, or random-word consumption would change stored
 //! RaBitQ codes even if the resulting vectors remained mathematically close.
@@ -10,7 +10,7 @@ use std::mem::size_of;
 
 use crate::api::{Error, ErrorKind, MAX_DIMENSION, Metric, Result};
 
-/// Format-v1 Givens rotations make exactly three independent pairing passes.
+/// Givens rotations make exactly three independent pairing passes.
 const ROTATION_ROUNDS: usize = 3;
 /// The format-fixed nearest f32 representation of `1 / sqrt(2)`.
 const ROTATION_COEFFICIENT: f32 = f32::from_bits(0x3f35_04f3);
@@ -42,7 +42,7 @@ impl ExactDistance {
     }
 }
 
-/// The format-v1 scalar vector kernel for one Logical Index.
+/// The scalar vector kernel for one Logical Index.
 #[derive(Clone, Debug)]
 pub(crate) struct VectorKernel {
     dimension: usize,
@@ -292,7 +292,7 @@ pub(crate) fn compare_finite(left: f64, right: f64) -> Ordering {
     }
 }
 
-/// A reusable schedule for the format-v1 seeded orthogonal transformation.
+/// A reusable schedule for the seeded orthogonal transformation.
 ///
 /// Each round stores disjoint pairs from one Fisher-Yates permutation. An odd
 /// final index is absent from the pair list and therefore unchanged in that
@@ -367,7 +367,7 @@ fn generate_pairs(dimension: usize, random: &mut ChaCha8) -> Result<Box<[[usize;
     Ok(pairs.into_boxed_slice())
 }
 
-/// Minimal format-v1 ChaCha8 word stream.
+/// Minimal ChaCha8 word stream.
 ///
 /// ChaCha8 is the eight-round variant of the ChaCha stream cipher. KTANN uses
 /// it only as a deterministic pseudorandom generator: the persisted 32-byte

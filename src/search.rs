@@ -1,6 +1,6 @@
 //! Numeric semantics, predicates, tree traversal, reranking, and caching.
 //!
-//! `numeric`, `predicate`, and `rabitq` own the format-v1 numeric, predicate,
+//! `numeric`, `predicate`, and `rabitq` own the numeric, predicate,
 //! and RaBitQ7 contracts. `plan` owns Tree Key range planning and bounded
 //! directory enumeration. `traverse` owns deterministic bounded best-first
 //! traversal across the enumerated trees, including intermediate topology

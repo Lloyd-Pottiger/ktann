@@ -64,8 +64,9 @@ collapse.
 
 Durable states are only `Ready`, `Splitting { left, right }`,
 `ReceivingSplit { source }`, `DrainingSplit { left, right }`, and `Merging`.
-State stores associated Partition Keys, codec version, and state-start time; it
-stores no drain cursor, owner, lease, or fixed merge target. A fixup transaction
+State stores associated Partition Keys and `started_at_unix_millis`, an
+unsigned 64-bit count of milliseconds since the Unix epoch; zero denotes an
+unavailable timestamp. A fixup transaction
 update-protects the relevant State, Headers, incoming references, and entry keys
 it changes. Each step is bounded by adapter budgets. Structural drain starts
 every batch from the current smallest source entry, and successful movement
@@ -174,9 +175,25 @@ Foreground mutations never wait for a whole split/merge. They may conflict with
 one bounded fixup and retry from a fresh snapshot. Fixups do not hold locks
 across transactions or reserve a durable owner.
 
-State timestamps diagnose stalls but do not grant ownership. A future timestamp
-is not considered stalled. Any process may advance an encountered state after
-bounded admission. Conditional convergence requires rediscovery, repeated
+`stalled_timeout` is the minimum age of a persisted `Splitting`,
+`DrainingSplit`, or `Merging` state before an independently rediscovered Fixup
+may assist it. Its default is
+`max(1 ms, 1 s * max_partition_entries / 128)`; overrides must be positive.
+The worker checks `now - started >= timeout` in its existing authority read,
+after process-local queue deduplication. Ready threshold crossings start
+immediately. A progressing worker, including one yielded to the queue tail,
+continues without an age delay. An unavailable timestamp permits recovery;
+a known future timestamp defers recovery until the age threshold is met.
+The timestamp measures time in the state, rather than time since the last
+progress: this is an assistance threshold, not task expiry or a lease.
+Later relevant access rediscovers deferred work; no timer schedules it.
+`FixupExecution::Stalled` reports a merge execution with no available target;
+the recovery age threshold applies to both split and merge source states.
+
+State timestamps also provide diagnostic ages. A sample is recorded when both
+Unix-epoch millisecond timestamps are nonzero and the current time is at least
+the state-start time. The nonnegative difference is reported in seconds. Any
+process may assist an encountered state after bounded admission and the recovery age check. Conditional convergence requires rediscovery, repeated
 admission, eventual backend success, and a legal merge target; correctness does
 not require convergence.
 

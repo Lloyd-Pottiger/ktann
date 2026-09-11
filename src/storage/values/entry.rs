@@ -157,7 +157,7 @@ pub(super) fn maximum_leaf_entry_encoded_len(manifest: &IndexManifest) -> Result
     let rabitq7_bytes = RaBitQ7::encoded_len(manifest.config().dimension())?;
 
     // Frame, sized Record ID, field count, typed fields, and sized RaBitQ7.
-    2_usize
+    1_usize
         .checked_add(2 + MAX_RECORD_ID_BYTES)
         .and_then(|size| size.checked_add(2 + field_bytes))
         .and_then(|size| size.checked_add(4 + rabitq7_bytes))

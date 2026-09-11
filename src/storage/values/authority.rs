@@ -10,7 +10,7 @@ use super::manifest::IndexManifest;
 use super::wire::{Decoder, Encoder};
 
 /// The exact encoded length of every Partition Header.
-pub(super) const PARTITION_HEADER_ENCODED_LEN: usize = 2 + 4 + 4 + 8 + 1;
+pub(super) const PARTITION_HEADER_ENCODED_LEN: usize = 1 + 4 + 4 + 8 + 1;
 
 /// The directory and Partition Key allocator state for one Tree Key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -150,6 +150,9 @@ impl fmt::Debug for PartitionCentroid {
 }
 
 /// The durable topology state and references for one partition.
+///
+/// State-start timestamps use Unix-epoch milliseconds. Zero denotes unavailable
+/// wall time; these timestamps support recovery age checks and diagnostic metrics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum PartitionTransition {
@@ -203,7 +206,8 @@ impl PartitionTransition {
         }
     }
 
-    /// Returns milliseconds since the Unix epoch when this state began.
+    /// Returns milliseconds since the Unix epoch when this state began, or zero
+    /// when the wall-clock timestamp is unavailable.
     #[must_use]
     pub const fn started_at_unix_millis(self) -> u64 {
         match self {

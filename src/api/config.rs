@@ -104,7 +104,7 @@ impl IndexConfig {
                 bloom_fields += 1;
             }
             // One type tag, NULL flags, and two maximum encoded extrema are a
-            // conservative bound until the canonical v1 value codec writes
+            // conservative bound until the canonical value codec writes
             // the exact length. Bloom bytes use the requested probability
             // without weakening it.
             let encoded_value_bytes = match field.data_type() {
@@ -258,6 +258,15 @@ impl Default for RuntimeConfig {
 }
 
 impl RuntimeConfig {
+    /// Sets the positive minimum state age for rediscovered maintenance to resume.
+    pub fn with_stalled_timeout(mut self, timeout: Duration) -> Result<Self> {
+        if timeout.is_zero() {
+            return Err(Error::invalid_argument());
+        }
+        self.stalled_timeout = Some(timeout);
+        Ok(self)
+    }
+
     /// Sets equal bounds for running and waiting foreground operations.
     pub fn with_foreground_operation_limit(mut self, limit: usize) -> Result<Self> {
         if limit == 0 || limit > MAX_FOREGROUND_OPERATION_LIMIT {
@@ -347,15 +356,6 @@ impl RuntimeConfig {
         }
         self.import_max_in_flight_batches = in_flight;
         self.import_backlog_watermark = backlog_watermark;
-        Ok(self)
-    }
-
-    /// Overrides the positive Structure Maintenance stalled timeout.
-    pub fn with_stalled_timeout(mut self, timeout: Duration) -> Result<Self> {
-        if timeout.is_zero() {
-            return Err(Error::invalid_argument());
-        }
-        self.stalled_timeout = Some(timeout);
         Ok(self)
     }
 
@@ -460,18 +460,15 @@ impl RuntimeConfig {
         self.import_backlog_watermark
     }
 
-    /// Resolves the stalled timeout for one Logical Index.
+    /// Returns the minimum state age before a worker assists rediscovered work.
     ///
-    /// Without an override, v1 uses checked
-    /// `max(1 ms, 1 s * max_partition_entries / 128)`.
-    pub fn stalled_timeout(&self, index: &IndexConfig) -> Result<Duration> {
-        if let Some(timeout) = self.stalled_timeout {
-            return Ok(timeout);
-        }
-        Duration::from_secs(1)
-            .checked_mul(index.max_partition_entries())
-            .map(|timeout| (timeout / 128).max(Duration::from_millis(1)))
-            .ok_or_else(Error::invalid_argument)
+    /// The default is `max(1 ms, 1 s * max_partition_entries / 128)`.
+    #[must_use]
+    pub fn stalled_timeout(&self, index: &IndexConfig) -> Duration {
+        self.stalled_timeout.unwrap_or_else(|| {
+            (Duration::from_secs(u64::from(index.max_partition_entries())) / 128)
+                .max(Duration::from_millis(1))
+        })
     }
 
     /// Returns the first retry backoff interval.

@@ -27,7 +27,7 @@ const DEFAULT_MAX_MUTATIONS: usize = 10_000;
 const DEFAULT_MAX_MUTATION_BYTES: usize = 1 << 20;
 const MAX_SCAN_PAGE_BYTES: usize = 80 << 10;
 const MAX_BATCH_POINT_READS: usize = 1_024;
-const PHYSICAL_PREFIX_HEADER: &[u8] = b"\0ktann-rocksdb\x01";
+const PHYSICAL_PREFIX_HEADER: &[u8] = b"\0ktann-rocksdb";
 
 #[derive(Clone, Debug)]
 struct PhysicalPrefix {
@@ -932,8 +932,7 @@ mod tests {
         assert_ne!(a.bytes, aa.bytes);
         assert!(!aa.bytes.starts_with(&a.bytes));
         assert!(a.encode_key(b"a").expect("key") < a.encode_key(b"b").expect("key"));
-        assert!(a.bytes.starts_with(PHYSICAL_PREFIX_HEADER));
-        assert!(!a.bytes.starts_with(b"\0ktann\x01"));
+        assert_eq!(a.bytes.as_ref(), b"\0ktann-rocksdb\x01a");
     }
 
     #[test]
