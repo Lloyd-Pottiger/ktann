@@ -359,7 +359,7 @@ async fn blocking_resource_limit_waits_for_a_live_transaction_slot() {
 async fn scan_uses_total_order_with_a_hash_memtable() {
     let directory = tempfile::tempdir().expect("temporary database directory");
     let namespace = BackendNamespace::new([]).expect("namespace");
-    let physical_prefix_bytes = b"\0ktann-rocksdb\x01".len() + 1;
+    let physical_prefix_bytes = b"\0ktann-rocksdb".len() + 1;
     let mut options = Options::default();
     options.create_if_missing(true);
     options.set_prefix_extractor(SliceTransform::create_fixed_prefix(

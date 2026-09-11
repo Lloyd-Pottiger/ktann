@@ -1,6 +1,6 @@
 //! Canonical logical-key codec contract tests.
 //!
-//! Golden vectors pin the version-1 byte layout for every key family and edge
+//! Golden vectors pin the canonical byte layout for every key family and edge
 //! value; property tests cover ordering, round trips, and fail-closed decoding.
 
 use std::cmp::Ordering;
@@ -39,36 +39,36 @@ fn is_corrupt(types: &[DataType], bytes: &[u8]) -> bool {
 
 #[test]
 fn allocator_and_name_directory_golden_bytes() {
-    assert_eq!(index_id_allocator_key(), b"\x01\x00\x00");
+    assert_eq!(index_id_allocator_key(), b"\x00\x00");
     let name = IndexName::new("a").expect("valid name");
-    assert_eq!(name_directory_key(&name), b"\x01\x00\x01a");
+    assert_eq!(name_directory_key(&name), b"\x00\x01a");
     let nested = IndexName::new("x\x00y").expect("embedded NUL is valid UTF-8");
-    assert_eq!(name_directory_key(&nested), b"\x01\x00\x01x\x00y");
+    assert_eq!(name_directory_key(&nested), b"\x00\x01x\x00y");
 }
 
 #[test]
 fn index_level_family_golden_bytes() {
     assert_eq!(
         manifest_key(id(1)),
-        b"\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x00"
+        b"\x01\x00\x00\x00\x00\x00\x00\x00\x01\x00"
     );
     assert_eq!(
         record_key(id(1), &Bytes::from_static(b"r")).expect("valid id"),
-        b"\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x01r\x00\x00"
+        b"\x01\x00\x00\x00\x00\x00\x00\x00\x01\x01r\x00\x00"
     );
     assert_eq!(
         location_key(id(1), &Bytes::from_static(b"r")).expect("valid id"),
-        b"\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x01r\x00\x01"
+        b"\x01\x00\x00\x00\x00\x00\x00\x00\x01\x01r\x00\x01"
     );
     assert_eq!(
         payload_key(id(1), &Bytes::from_static(b"r")).expect("valid id"),
-        b"\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x01r\x00\x02"
+        b"\x01\x00\x00\x00\x00\x00\x00\x00\x01\x01r\x00\x02"
     );
 
     let empty = TreeKey::encode(&[], &[]).expect("empty tree key");
     assert_eq!(
         tree_manifest_key(id(1), &empty),
-        b"\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x03"
+        b"\x01\x00\x00\x00\x00\x00\x00\x00\x01\x03"
     );
 }
 
@@ -77,7 +77,7 @@ fn record_group_golden_bytes_escape_embedded_nul() {
     let record_id = Bytes::from_static(b"a\0b");
     assert_eq!(
         record_key(id(1), &record_id).expect("valid id"),
-        b"\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x01a\x00\xffb\x00\x00"
+        b"\x01\x00\x00\x00\x00\x00\x00\x00\x01\x01a\x00\xffb\x00\x00"
     );
     assert_eq!(
         decode_key(
@@ -137,7 +137,7 @@ fn partition_family_golden_bytes() {
         .expect("canonical tree key");
     let partition = b"\x00\x00\x00\x00\x00\x00\x00\x01";
     let expected = |suffix: &[u8]| {
-        let mut key = b"\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x04\x61\x00".to_vec();
+        let mut key = b"\x01\x00\x00\x00\x00\x00\x00\x00\x01\x04\x61\x00".to_vec();
         key.extend_from_slice(partition);
         key.extend_from_slice(suffix);
         key
@@ -674,21 +674,19 @@ fn decode_rejects_trailing_bytes_on_fixed_terminal_keys() {
 #[test]
 fn decode_rejects_unknown_discriminators() {
     let types: [DataType; 0] = [];
-    // Unknown version.
-    assert!(is_corrupt(&types, b"\x02\x00\x00"));
     // Unknown scope.
-    assert!(is_corrupt(&types, b"\x01\xff\x00"));
+    assert!(is_corrupt(&types, b"\xff\x00"));
     // Unknown namespace kind.
-    assert!(is_corrupt(&types, b"\x01\x00\xff"));
+    assert!(is_corrupt(&types, b"\x00\xff"));
     // Unknown index kind (id 1, kind 0x0a).
     assert!(is_corrupt(
         &types,
-        b"\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x0a"
+        b"\x01\x00\x00\x00\x00\x00\x00\x00\x01\x0a"
     ));
     // Unknown partition subkind.
     assert!(is_corrupt(
         &types,
-        b"\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x04\x00\x00\x00\x00\x00\x00\x00\x01\xff"
+        b"\x01\x00\x00\x00\x00\x00\x00\x00\x01\x04\x00\x00\x00\x00\x00\x00\x00\x01\xff"
     ));
 }
 
@@ -698,12 +696,12 @@ fn decode_rejects_zero_identities() {
     // Zero Logical Index ID in a manifest key.
     assert!(is_corrupt(
         &types,
-        b"\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+        b"\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00"
     ));
     // Zero Partition Key in a header key (empty tree key, id 1).
     assert!(is_corrupt(
         &types,
-        b"\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+        b"\x01\x00\x00\x00\x00\x00\x00\x00\x01\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00"
     ));
 }
 
@@ -712,39 +710,39 @@ fn decode_rejects_noncanonical_tree_key_scalars() {
     let types_f64 = [DataType::F64];
     // -0.0 encodes to 0x7f ff ff ff ff ff ff ff ff and is noncanonical.
     let neg_zero =
-        b"\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x03\x7f\xff\xff\xff\xff\xff\xff\xff".to_vec();
+        b"\x01\x00\x00\x00\x00\x00\x00\x00\x01\x03\x7f\xff\xff\xff\xff\xff\xff\xff".to_vec();
     assert!(is_corrupt(&types_f64, &neg_zero));
 
     // Non-finite F64 (infinity sign bit 0 -> encoded 0xff f0 00 ...).
     let infinity =
-        b"\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x03\xff\xf0\x00\x00\x00\x00\x00\x00".to_vec();
+        b"\x01\x00\x00\x00\x00\x00\x00\x00\x01\x03\xff\xf0\x00\x00\x00\x00\x00\x00".to_vec();
     assert!(is_corrupt(&types_f64, &infinity));
 
     // Noncanonical Bool (0x02).
     let types_bool = [DataType::Bool];
     assert!(is_corrupt(
         &types_bool,
-        b"\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x03\x02"
+        b"\x01\x00\x00\x00\x00\x00\x00\x00\x01\x03\x02"
     ));
 
     // Unterminated String field.
     let types_string = [DataType::String];
     assert!(is_corrupt(
         &types_string,
-        b"\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x03\x61"
+        b"\x01\x00\x00\x00\x00\x00\x00\x00\x01\x03\x61"
     ));
 
     // Invalid UTF-8 String field (0xff followed by terminator).
     assert!(is_corrupt(
         &types_string,
-        b"\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x03\xff\x00"
+        b"\x01\x00\x00\x00\x00\x00\x00\x00\x01\x03\xff\x00"
     ));
 }
 
 #[test]
 fn decode_rejects_invalid_utf8_name() {
     let types: [DataType; 0] = [];
-    assert!(is_corrupt(&types, b"\x01\x00\x01\xff"));
+    assert!(is_corrupt(&types, b"\x00\x01\xff"));
 }
 
 #[test]
@@ -778,14 +776,14 @@ fn decode_rejects_overlong_tree_key_prefix_in_partition_key() {
     }
     assert_eq!(tree_key.len(), MAX_TREE_KEY_BYTES + 8);
 
-    let mut key = b"\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x04".to_vec();
+    let mut key = b"\x01\x00\x00\x00\x00\x00\x00\x00\x01\x04".to_vec();
     key.extend_from_slice(&tree_key);
     key.extend_from_slice(&1_u64.to_be_bytes());
     key.push(0x00);
     assert!(is_corrupt(&types, &key));
 
     // The same encoding is rejected as a complete Tree Key (Tree Manifest).
-    let mut key = b"\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x03".to_vec();
+    let mut key = b"\x01\x00\x00\x00\x00\x00\x00\x00\x01\x03".to_vec();
     key.extend_from_slice(&tree_key);
     assert!(is_corrupt(&types, &key));
 }

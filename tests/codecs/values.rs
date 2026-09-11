@@ -223,7 +223,7 @@ fn namespace_and_manifest_golden_bytes() {
         b"\x01\x00\x00\x00\x00\x00\x00\x00\x01"
     );
 
-    let mut expected = vec![0x02, 0x00, 0x02, 0x00];
+    let mut expected = vec![0x02, 0x00, 0x01, 0x00];
     expected.extend_from_slice(&1_u64.to_be_bytes());
     expected.extend_from_slice(&1_u32.to_be_bytes());
     expected.push(0x00);
@@ -564,7 +564,7 @@ fn unsupported_manifest_formats_fail_closed() {
     let bootstrap = ValueCodec::bootstrap();
     let value = PersistentValue::IndexManifest(minimal_manifest());
     let key = key_for_value(id(1), &value);
-    for format in [0_u16, 1, 3, u16::MAX] {
+    for format in [0_u16, 2, u16::MAX] {
         let mut bytes = bootstrap.encode(&value).expect("encode Manifest");
         bytes[1..3].copy_from_slice(&format.to_be_bytes());
         assert_eq!(

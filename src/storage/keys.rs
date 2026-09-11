@@ -1,33 +1,31 @@
-//! Versioned namespace and ordered families for Logical Keys.
+//! Namespace and ordered families for Logical Keys.
 //!
-//! This module owns the version-1 logical keyspace: the version framing, the
-//! namespace/index scope tags, the typed entry-kind discriminators, the raw
-//! identity and name components, and bounded ranges. It embeds canonical Tree
+//! This module owns the logical keyspace: the namespace/index scope tags, typed
+//! entry-kind discriminators, raw identity and name components, and bounded ranges. It embeds canonical Tree
 //! Key bytes without interpreting or re-escaping them. It defines no persistent
 //! values and no backend physical prefixes; adapters prepend their own bounded
 //! prefix and value codecs live in a sibling module.
 //!
 //! # Layout
 //!
-//! Every logical key begins with a one-byte [`KEY_VERSION`] and a one-byte
-//! scope tag:
+//! Every logical key begins with a one-byte scope tag:
 //!
 //! ```text
-//! [ version: u8 = KEY_VERSION ][ scope: u8 ]
+//! [ scope: u8 ]
 //! ```
 //!
 //! `Namespace` scope (`0x00`) keys address the whole Backend Namespace:
 //!
 //! ```text
-//! [ 0x01 ][ 0x00 ][ 0x00 ]            IndexIdAllocator
-//! [ 0x01 ][ 0x00 ][ 0x01 ][ name ]    IndexNameDirectory(name)
+//! [ 0x00 ][ 0x00 ]            IndexIdAllocator
+//! [ 0x00 ][ 0x01 ][ name ]    IndexNameDirectory(name)
 //! ```
 //!
 //! `Index` scope (`0x01`) keys begin with a big-endian Logical Index ID, so one
 //! Logical Index owns one contiguous logical range for drop:
 //!
 //! ```text
-//! [ 0x01 ][ 0x01 ][ index_id: u64 BE ][ kind ][ ... ]
+//! [ 0x01 ][ index_id: u64 BE ][ kind ][ ... ]
 //! ```
 //!
 //! The index-scoped `kind` byte selects the family. `Manifest`, `RecordGroup`,
@@ -42,7 +40,7 @@
 //!
 //! # Fail closed
 //!
-//! Decoders reject an unknown version or scope, an unknown kind or subkind,
+//! Decoders reject an unknown scope, an unknown kind or subkind,
 //! truncated or overlong components, noncanonical scalars (including `-0.0`),
 //! invalid UTF-8, and trailing bytes after a terminal component. Every decode
 //! failure returns [`ErrorKind::Corruption`]; encode-time rejection of invalid
@@ -68,9 +66,6 @@ pub(crate) use super::tree_key::tree_key_hash;
 use super::tree_key::{
     decode_escaped_terminated, push_escaped_terminated, scan_escaped_terminated, take_array,
 };
-
-/// The single logical-key format version emitted and accepted by this build.
-pub const KEY_VERSION: u8 = 1;
 
 /// The fixed encoded width of a [`LogicalIndexId`] in bytes.
 pub const LOGICAL_INDEX_ID_BYTES: usize = 8;
@@ -373,7 +368,7 @@ impl fmt::Debug for KeyRange {
 /// The smallest byte string strictly greater than every string with `prefix`.
 ///
 /// Returns an empty slice only when `prefix` is all `0xFF`; no logical key
-/// prefix is, because every key begins with the `0x01` version byte.
+/// prefix is, because every key begins with a `0x00` or `0x01` scope tag.
 pub(super) fn successor(prefix: &[u8]) -> Vec<u8> {
     let mut bytes = prefix.to_vec();
     while let Some(last) = bytes.last_mut() {
@@ -410,16 +405,10 @@ fn decode_name(bytes: &[u8]) -> Result<IndexName> {
     IndexName::new(name).map_err(|_| corrupt())
 }
 
-/// Pushes the version and scope bytes onto a key under construction.
-fn push_version_scope(out: &mut Vec<u8>, scope: u8) {
-    out.push(KEY_VERSION);
-    out.push(scope);
-}
-
-/// Builds the common `[ version ][ index scope ][ index id ]` key prefix.
+/// Builds the common `[ index scope ][ index id ]` key prefix.
 fn index_prefix(index: LogicalIndexId) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(2 + LOGICAL_INDEX_ID_BYTES);
-    push_version_scope(&mut bytes, SCOPE_INDEX);
+    let mut bytes = Vec::with_capacity(1 + LOGICAL_INDEX_ID_BYTES);
+    bytes.push(SCOPE_INDEX);
     bytes.extend_from_slice(&index.get().to_be_bytes());
     bytes
 }
@@ -437,17 +426,14 @@ fn partition_prefix(index: LogicalIndexId, tree_key: &TreeKey, partition: Partit
 /// The single Logical Index ID allocator key.
 #[must_use]
 pub fn index_id_allocator_key() -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(3);
-    push_version_scope(&mut bytes, SCOPE_NAMESPACE);
-    bytes.push(NS_INDEX_ID_ALLOCATOR);
-    bytes
+    vec![SCOPE_NAMESPACE, NS_INDEX_ID_ALLOCATOR]
 }
 
 /// The Index Name directory key for `name`.
 #[must_use]
 pub fn name_directory_key(name: &IndexName) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(3 + name.as_str().len());
-    push_version_scope(&mut bytes, SCOPE_NAMESPACE);
+    let mut bytes = Vec::with_capacity(2 + name.as_str().len());
+    bytes.push(SCOPE_NAMESPACE);
     bytes.push(NS_INDEX_NAME_DIRECTORY);
     bytes.extend_from_slice(name.as_str().as_bytes());
     bytes
@@ -479,7 +465,7 @@ pub fn location_key(index: LogicalIndexId, id: &Bytes) -> Result<Vec<u8>> {
 pub(crate) const fn maximum_location_key_len() -> usize {
     // Index prefix, record-group kind, maximally escaped terminated Record ID,
     // and Record Location subkind.
-    2 + LOGICAL_INDEX_ID_BYTES + 1 + (2 * MAX_RECORD_ID_BYTES + 1) + 1
+    1 + LOGICAL_INDEX_ID_BYTES + 1 + (2 * MAX_RECORD_ID_BYTES + 1) + 1
 }
 
 /// The Opaque Payload key for `id` in `index`.
@@ -525,7 +511,7 @@ pub fn synopsis_key(index: LogicalIndexId, tree_key: &TreeKey, partition: Partit
 /// Returns one partition metadata key's exact encoded length.
 pub(crate) fn partition_metadata_key_len(tree_key: &TreeKey) -> usize {
     // Index prefix, partition kind, Tree Key, Partition Key, and metadata subkind.
-    2 + LOGICAL_INDEX_ID_BYTES + 1 + tree_key.as_bytes().len() + PARTITION_KEY_BYTES + 1
+    1 + LOGICAL_INDEX_ID_BYTES + 1 + tree_key.as_bytes().len() + PARTITION_KEY_BYTES + 1
 }
 
 /// The partition State key.
@@ -629,13 +615,10 @@ pub(crate) fn encode_key(key: &LogicalKey) -> Result<Vec<u8>> {
 /// immutable schema. Decoding is zero-copy: the decoded Tree Key and Record ID
 /// components share `key`'s allocation.
 pub fn decode_key(types: &[DataType], key: &Bytes) -> Result<LogicalKey> {
-    if key.first() != Some(&KEY_VERSION) {
-        return Err(corrupt());
-    }
-    let scope = *key.get(1).ok_or_else(corrupt)?;
+    let scope = *key.first().ok_or_else(corrupt)?;
     match scope {
-        SCOPE_NAMESPACE => decode_namespace_key(&key[2..]),
-        SCOPE_INDEX => decode_index_key(types, key, 2),
+        SCOPE_NAMESPACE => decode_namespace_key(&key[1..]),
+        SCOPE_INDEX => decode_index_key(types, key, 1),
         _ => Err(corrupt()),
     }
 }

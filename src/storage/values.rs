@@ -15,7 +15,7 @@
 //! dimension, schema, Tree Key definition, and Bloom parameters. The module
 //! never adds or interprets a backend physical prefix.
 //!
-//! # Format 2 value layout
+//! # Value layout
 //!
 //! `u16`, `u32`, `u64`, `i64`, `f32`, and `f64` below are fixed-width
 //! big-endian values. `bytes32` is exactly 32 bytes. `sizedN<T>` is an unsigned
@@ -85,7 +85,7 @@ pub use synopsis::{FieldSynopsis, PartitionSynopsis};
 use wire::{Decoder, Encoder};
 
 /// The whole persistent format version emitted and accepted by this build.
-pub const FORMAT_VERSION: u16 = 2;
+pub const FORMAT_VERSION: u16 = 1;
 
 /// The maximum encoded Opaque Payload size.
 pub const MAX_PAYLOAD_BYTES: usize = crate::api::MAX_PAYLOAD_BYTES;

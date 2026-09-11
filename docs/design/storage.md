@@ -86,7 +86,7 @@ the lifecycle records.
 
 ## 5. Logical keyspace
 
-The core defines a versioned logical namespace for:
+The core defines one logical namespace for:
 
 - allocator and Index Name mapping;
 - Index Manifest;
@@ -100,7 +100,7 @@ range. Tree-local keys embed the canonical encoded Tree Key and Partition Key;
 there is no Tree ID. Physical adapters add their own bounded prefix without a
 second unbounded escaping pass.
 
-Logical keys retain their own version marker. Logical-key version 1
+Logical keys begin with their namespace or index scope tag. The canonical layout
 specifies exact type tags, integer endianness, tuple escaping, terminators, and
 field ordering in codec source plus checked-in golden vectors. The Tree Key
 codec is memcomparable: byte ordering exactly matches typed comparison and
@@ -110,11 +110,14 @@ fields, noncanonical values, nonzero padding, and trailing bytes.
 ## 6. Persistent values
 
 Each value is a one-byte type tag followed by its payload. The Manifest's
-whole-format marker is `FORMAT_VERSION = 2`; it governs all value layouts and
-persistent algorithms. An unsupported Manifest format returns `UnsupportedFormat`.
+whole-format marker is `FORMAT_VERSION = 1`; it governs logical keys, values,
+adapter physical encodings, and persistent algorithms. Keys and adapter prefixes
+carry no independent versions. During the unreleased phase this marker remains 1
+while the sole encoding implementation is updated directly. An unsupported Manifest format returns `UnsupportedFormat`.
 Wrong key/value pairings and malformed or noncanonical values return `Corruption`,
 including namespace allocator and Index Name values. Only the current layout is
-supported; development data with an unsupported layout must be recreated.
+supported; incompatible development data must be recreated even when its
+Manifest marker is 1.
 
 The Index Manifest stores lifecycle state, one whole persistent-format version,
 immutable configuration, Logical Index ID, RaBitQ rotation seed, and exact Bloom

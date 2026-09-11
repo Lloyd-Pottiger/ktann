@@ -8,7 +8,7 @@ native calls and cleanup for that handle run serially on one pooled thread,
 reused across transactions instead of spawned per transaction.
 
 The caller opens an `OptimisticTransactionDB` and passes it, or a shared `Arc`
-containing it, to `RocksDbBackend`. Each adapter instance adds a versioned,
+containing it, to `RocksDbBackend`. Each adapter instance adds a
 RocksDB-specific physical prefix containing its caller-selected Backend
 Namespace; logical codecs and index algorithms remain in `ktann`.
 
@@ -18,13 +18,13 @@ Every RocksDB key has this exact physical prefix before its opaque KTANN
 logical key:
 
 ```text
-00 6b 74 61 6e 6e 2d 72 6f 63 6b 73 64 62 01
+00 6b 74 61 6e 6e 2d 72 6f 63 6b 73 64 62
 <namespace-length:u8> <namespace-bytes> <logical-key>
 ```
 
-The marker is deliberately RocksDB-specific. It versions this adapter's
-physical format without claiming that persisted indexes are portable to
-FoundationDB. Backend Namespaces are limited to 255 bytes. Length delimiting
+The marker is deliberately RocksDB-specific. The prefix carries no version
+byte; the Index Manifest owns the whole-format marker. Persisted indexes are
+not portable to FoundationDB. Backend Namespaces are limited to 255 bytes. Length delimiting
 keeps adjacent namespace values disjoint without escaping or rewriting the
 logical key.
 
