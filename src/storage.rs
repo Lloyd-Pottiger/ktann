@@ -1,13 +1,11 @@
 //! Backend transaction contract, logical codecs, and typed storage operations.
 //!
-//! This module is the sole owner of raw logical keys and persistent values.
-//! Algorithm modules hand the storage layer typed operations and never build
-//! keys themselves. The [`keys`] submodule implements the version-1 Logical Key
-//! namespace and exposes the canonical Tree Key codec; the [`values`] submodule
-//! implements the version-1 persistent value codecs; the [`backend`]
-//! submodule defines the backend-neutral transactional KV contract; and the
-//! [`topology`] submodule implements the typed atomic split-state transitions
-//! and structural entry moves (ADR 0014).
+//! This module owns raw Logical Keys and persistent values. Algorithms access
+//! index storage through typed operations. The [`keys`] submodule defines the
+//! Logical Key namespace and canonical Tree Key codec; [`values`] encodes and
+//! decodes persistent values; [`backend`] defines the backend-neutral
+//! transactional KV contract; and [`topology`] implements atomic partition
+//! transitions and entry moves (ADR 0014).
 
 pub mod backend;
 pub mod keys;

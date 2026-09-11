@@ -495,7 +495,3 @@ fn validate_key_identity(
 fn corrupt() -> Error {
     Error::new(ErrorKind::Corruption)
 }
-
-fn unsupported() -> Error {
-    Error::new(ErrorKind::UnsupportedFormat)
-}

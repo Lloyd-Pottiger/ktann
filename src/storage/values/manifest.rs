@@ -1,13 +1,13 @@
 //! Persistent namespace and Index Manifest values.
 
 use crate::api::{
-    DataType, Error, FieldId, FieldSchema, IndexConfig, LogicalIndexId, MAX_FIELDS, Metric, Result,
-    SynopsisConfig,
+    DataType, Error, ErrorKind, FieldId, FieldSchema, IndexConfig, LogicalIndexId, MAX_FIELDS,
+    Metric, Result, SynopsisConfig,
 };
 
 use super::data::maximum_typed_value_len;
 use super::wire::{Decoder, Encoder};
-use super::{FORMAT_VERSION, MAX_SYNOPSIS_BYTES, ROTATION_SEED_BYTES, corrupt, unsupported};
+use super::{FORMAT_VERSION, MAX_SYNOPSIS_BYTES, ROTATION_SEED_BYTES, corrupt};
 
 /// The lifecycle state persisted in an Index Manifest.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -293,7 +293,7 @@ pub(super) fn encode_index_manifest(encoder: &mut Encoder, manifest: &IndexManif
 pub(super) fn decode_index_manifest(decoder: &mut Decoder) -> Result<IndexManifest> {
     let format_version = decoder.u16()?;
     if format_version != FORMAT_VERSION {
-        return Err(unsupported());
+        return Err(Error::new(ErrorKind::UnsupportedFormat));
     }
     let lifecycle = match decoder.u8()? {
         0 => IndexLifecycle::Active,
