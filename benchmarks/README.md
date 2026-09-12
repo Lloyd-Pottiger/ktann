@@ -4,9 +4,6 @@
 `Runtime` and `Index` APIs. It produces versioned JSON intended for same-host,
 same-input comparisons. These results are empirical baselines, not a v1 SLA.
 
-See [balanced training validation](training-performance.md) for the deterministic
-training optimization, differential checks, and release microbenchmark.
-
 ## Running a suite
 
 Build and run benchmarks with optimizations enabled:
