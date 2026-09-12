@@ -53,6 +53,9 @@ use crate::storage::keys::{LogicalKey, TreeKey};
 use crate::storage::values::{IndexManifest, PartitionCentroid, PersistentValue};
 use crate::storage::{LogicalRange, ReadLogicalTxn};
 
+use crate::observe::labels::{FixupKind, FixupStage};
+use crate::observe::metrics::FixupTimer;
+
 /// The maximum number of Lloyd rounds; a fixed persistent format protocol choice
 /// (ADR 0015).
 const MAX_TRAINING_ROUNDS: usize = 10;
@@ -138,11 +141,16 @@ pub async fn train_split_centroids<T: ReadOps>(
         _ => return Err(Error::new(ErrorKind::Corruption)),
     };
     let kernel = kernel_for(manifest)?;
+    let load_timer = FixupTimer::start(FixupKind::Split, FixupStage::TrainingLoad);
     let trained = if header.level() == 1 {
         let entries = load_leaf_source(txn, manifest, tree_key, source, &kernel).await?;
+        drop(load_timer);
+        let _timer = FixupTimer::start(FixupKind::Split, FixupStage::Training);
         train(&kernel, entries)?
     } else {
         let entries = load_internal_source(txn, manifest, tree_key, source).await?;
+        drop(load_timer);
+        let _timer = FixupTimer::start(FixupKind::Split, FixupStage::Training);
         train(&kernel, entries)?
     };
     Ok(SplitCentroids {
@@ -193,6 +201,7 @@ async fn load_leaf_source<T: ReadOps>(
             })
             .collect();
         let values = txn.batch_get(keys).await?;
+        let _timer = FixupTimer::start(FixupKind::Split, FixupStage::TrainingPreprocess);
         for (id, value) in batch.iter().zip(values) {
             let Some(PersistentValue::VectorRecord(record)) = value else {
                 return Err(Error::new(ErrorKind::Corruption));
@@ -314,8 +323,12 @@ fn train<I: Ord>(kernel: &VectorKernel, mut entries: Vec<(I, Box<[f32]>)>) -> Re
     loop {
         let assignment = assign(&entries, &left, &right, half, &distance)?;
         let stable = previous.as_ref() == Some(&assignment);
-        left = cluster_mean(kernel, &entries, &assignment, true)?;
-        right = cluster_mean(kernel, &entries, &assignment, false)?;
+        // The same canonical membership produces byte-identical means. The
+        // confirming round still counts, but has no centroid work to repeat.
+        if !stable {
+            left = cluster_mean(kernel, &entries, &assignment, true)?;
+            right = cluster_mean(kernel, &entries, &assignment, false)?;
+        }
         previous = Some(assignment);
         rounds += 1;
         if stable || rounds == MAX_TRAINING_ROUNDS {
@@ -346,7 +359,11 @@ fn assign<I, D: Fn(&[f32], &[f32]) -> Result<f64>>(
         differences.push(distance(vector, left)? - distance(vector, right)?);
     }
     let mut order: Vec<usize> = (0..entries.len()).collect();
-    order.sort_by(|&a, &b| compare_finite(differences[a], differences[b]).then_with(|| a.cmp(&b)));
+    // Only the left membership matters. The canonical position makes this
+    // a total order even on ties; mean accumulation still follows ID order.
+    order.select_nth_unstable_by(half, |&a, &b| {
+        compare_finite(differences[a], differences[b]).then_with(|| a.cmp(&b))
+    });
     let mut assignment = vec![false; entries.len()];
     for &member in &order[..half] {
         assignment[member] = true;
@@ -606,6 +623,212 @@ mod tests {
             let trained = train(&kernel, entries.clone()).expect("trained");
             assert!(trained.rounds <= MAX_TRAINING_ROUNDS);
             assert_eq!(train(&kernel, entries).expect("trained"), trained);
+        }
+    }
+    // Independent full-sort/recompute protocol oracle for persisted centroid
+    // bytes and round counts. It intentionally retains the specified numeric
+    // reduction order while the implementation chooses only a membership set.
+    fn reference_train<I: Ord>(
+        kernel: &VectorKernel,
+        mut entries: Vec<(I, Box<[f32]>)>,
+    ) -> Result<TrainedSplit> {
+        for (_, vector) in &entries {
+            if vector.len() != kernel.dimension() || vector.iter().any(|c| !c.is_finite()) {
+                return Err(Error::new(ErrorKind::Corruption));
+            }
+        }
+        if kernel.is_cosine() {
+            for (_, vector) in &mut entries {
+                *vector = kernel.normalize_centroid(vector)?;
+            }
+        }
+        match entries.len() {
+            0 => {
+                let zero: Box<[f32]> = vec![0.0; kernel.dimension()].into();
+                return Ok(TrainedSplit {
+                    left: zero.clone(),
+                    right: zero,
+                    rounds: 0,
+                });
+            }
+            1 => {
+                let vector = &entries[0].1;
+                return Ok(TrainedSplit {
+                    left: vector.clone(),
+                    right: vector.clone(),
+                    rounds: 0,
+                });
+            }
+            _ => {}
+        }
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+
+        // Every input is persistent training data validated above, so the
+        // kernel's caller-versus-persistent error distinction collapses to
+        // Corruption here.
+        let distance = |vector: &[f32], centroid: &[f32]| -> Result<f64> {
+            kernel
+                .routing_distance(vector, centroid)
+                .map_err(|_| Error::new(ErrorKind::Corruption))
+        };
+
+        let source = mean(
+            kernel.dimension(),
+            entries.len(),
+            entries.iter().map(|entry| &*entry.1),
+        )?;
+        let left_seed = farthest(&entries, &source, &distance)?;
+        let right_seed = farthest(&entries, &entries[left_seed].1, &distance)?;
+
+        let mut left = entries[left_seed].1.clone();
+        let mut right = entries[right_seed].1.clone();
+        let half = entries.len() / 2;
+        let mut previous: Option<Vec<bool>> = None;
+        let mut rounds = 0_usize;
+        loop {
+            let assignment = reference_assign(&entries, &left, &right, half, &distance)?;
+            let stable = previous.as_ref() == Some(&assignment);
+            left = cluster_mean(kernel, &entries, &assignment, true)?;
+            right = cluster_mean(kernel, &entries, &assignment, false)?;
+            previous = Some(assignment);
+            rounds += 1;
+            if stable || rounds == MAX_TRAINING_ROUNDS {
+                return Ok(TrainedSplit {
+                    left,
+                    right,
+                    rounds,
+                });
+            }
+        }
+    }
+
+    fn reference_assign<I, D: Fn(&[f32], &[f32]) -> Result<f64>>(
+        entries: &[(I, Box<[f32]>)],
+        left: &[f32],
+        right: &[f32],
+        half: usize,
+        distance: &D,
+    ) -> Result<Vec<bool>> {
+        let mut differences = Vec::with_capacity(entries.len());
+        for (_, vector) in entries {
+            differences.push(distance(vector, left)? - distance(vector, right)?);
+        }
+        let mut order: Vec<usize> = (0..entries.len()).collect();
+        order.sort_by(|&a, &b| {
+            compare_finite(differences[a], differences[b]).then_with(|| a.cmp(&b))
+        });
+        let mut assignment = vec![false; entries.len()];
+        for &member in &order[..half] {
+            assignment[member] = true;
+        }
+        Ok(assignment)
+    }
+
+    #[test]
+    fn optimized_training_matches_full_sort_protocol_bytes_and_rounds() {
+        for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
+            for dimension in [1, 3, 16] {
+                let kernel = kernel(dimension, metric);
+                for count in [0, 1, 2, 3, 5, 32, 127, 128, 129] {
+                    for pattern in 0..4 {
+                        let entries: Vec<(usize, Box<[f32]>)> = (0..count)
+                            .rev()
+                            .map(|id| {
+                                let vector = (0..dimension)
+                                    .map(|axis| match pattern {
+                                        0 => 0.0,
+                                        1 => (id % 3) as f32 - 1.0,
+                                        2 => ((id * 17 + axis * 11) % 29) as f32 - 14.0,
+                                        _ => {
+                                            if (id + axis) % 2 == 0 {
+                                                f32::MAX
+                                            } else {
+                                                -f32::MAX
+                                            }
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .into_boxed_slice();
+                                (id, vector)
+                            })
+                            .collect();
+                        let expected = reference_train(&kernel, entries.clone());
+                        let actual = train(&kernel, entries);
+                        match (actual, expected) {
+                            (Ok(actual), Ok(expected)) => {
+                                assert_eq!(actual.rounds, expected.rounds);
+                                assert_eq!(
+                                    actual.left.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                                    expected
+                                        .left
+                                        .iter()
+                                        .map(|x| x.to_bits())
+                                        .collect::<Vec<_>>()
+                                );
+                                assert_eq!(
+                                    actual.right.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                                    expected
+                                        .right
+                                        .iter()
+                                        .map(|x| x.to_bits())
+                                        .collect::<Vec<_>>()
+                                );
+                            }
+                            (Err(actual), Err(expected)) => {
+                                assert_eq!(actual.kind(), expected.kind())
+                            }
+                            outcomes => panic!("protocol mismatch: {outcomes:?}"),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Release-only local comparison; cloning the common input is charged to
+    /// both paths, and alternating order limits warm-cache/order bias.
+    #[test]
+    #[ignore = "release training benchmark; run on an otherwise idle host"]
+    fn training_release_comparison() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        for dimension in [16, 128, 768] {
+            let kernel = kernel(dimension, Metric::L2);
+            for count in [128, 1024] {
+                let entries: Vec<(Bytes, Box<[f32]>)> = (0_usize..count)
+                    .map(|id| {
+                        (
+                            Bytes::copy_from_slice(&id.to_be_bytes()),
+                            (0..dimension)
+                                .map(|axis| ((id * 17 + axis * 11) % 257) as f32 - 128.0)
+                                .collect::<Vec<_>>()
+                                .into_boxed_slice(),
+                        )
+                    })
+                    .collect();
+                for repeat in 0..6 {
+                    for reference in if repeat % 2 == 0 {
+                        [true, false]
+                    } else {
+                        [false, true]
+                    } {
+                        let started = Instant::now();
+                        for _ in 0..20 {
+                            let input = black_box(entries.clone());
+                            black_box(if reference {
+                                reference_train(&kernel, input)
+                            } else {
+                                train(&kernel, input)
+                            })
+                            .expect("train");
+                        }
+                        println!(
+                            "training dimension={dimension} entries={count} repeat={repeat} reference={reference} seconds={:.6}",
+                            started.elapsed().as_secs_f64()
+                        );
+                    }
+                }
+            }
         }
     }
 }

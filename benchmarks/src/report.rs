@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 /// Current complete benchmark suite/report JSON contract.
-pub const REPORT_SCHEMA_VERSION: u32 = 3;
+pub const REPORT_SCHEMA_VERSION: u32 = 4;
 
 /// Supplies the v2 default when decoding a report created before write-beam
 /// configuration became part of the report contract. The schema-version check
@@ -94,6 +94,8 @@ pub struct Configuration {
     pub search_percent: u8,
     /// Whether writes target a small conflict set.
     pub hot_updates: bool,
+    /// Whether write operations delete distinct imported records.
+    pub delete_driven: bool,
     /// Logical Index merge threshold.
     pub min_partition_entries: u32,
     /// Logical Index split threshold.
@@ -299,6 +301,12 @@ pub struct SteadyStateMeasurements {
     pub wall_seconds: f64,
     /// Time after foreground completion until its maintenance backlog drained.
     pub maintenance_drain_seconds: f64,
+    /// Search quality against the surviving corpus after a delete workload.
+    pub post_delete_search: Option<SearchPhase>,
+    /// Maintenance work through foreground completion and backlog drain.
+    pub maintenance: MaintenanceSummary,
+    /// Write attempts, commit wait, and retries through maintenance drain.
+    pub writes: WriteAttribution,
     /// User/system CPU through foreground work and maintenance drain.
     pub cpu_seconds: Option<f64>,
     /// Whole-worker peak RSS, including setup, warmup, and measurement.
@@ -436,6 +444,12 @@ pub struct WriteAttribution {
 /// Structure Maintenance work observed in one accounting phase.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct MaintenanceSummary {
+    /// Attempted stage times; training load includes preprocessing.
+    pub stages_ms: BTreeMap<String, Distribution>,
+    /// Source level per relocation attempt.
+    pub source_levels: BTreeMap<String, Distribution>,
+    /// Complete same-level candidates per discovery.
+    pub candidates: BTreeMap<String, Distribution>,
     /// Fixup admission outcomes grouped by their stable labels.
     pub admission: BTreeMap<String, u64>,
     /// Completed Fixup outcomes grouped by their stable labels.
@@ -751,6 +765,8 @@ pub struct BackendIo {
     pub write_transactions: u64,
     /// Point and batch point-read keys requested.
     pub point_read_keys: u64,
+    /// Adapter point/batch read calls; these are not network RPC counts.
+    pub point_read_calls: u64,
     /// Range scan calls.
     pub scans: u64,
     /// Logical KV items returned by reads.
@@ -759,6 +775,8 @@ pub struct BackendIo {
     pub bytes_read: u64,
     /// Attempted point mutations, including retry attempts.
     pub mutation_operations: u64,
+    /// Adapter mutation calls, with one call for each batch.
+    pub mutation_calls: u64,
     /// Attempted logical mutation key/value bytes.
     pub mutation_bytes: u64,
     /// Attempted transactional range clears.
@@ -795,10 +813,12 @@ impl BackendIo {
         read_transactions,
         write_transactions,
         point_read_keys,
+        point_read_calls,
         scans,
         items_read,
         bytes_read,
         mutation_operations,
+        mutation_calls,
         mutation_bytes,
         range_clears,
         commits,

@@ -40,6 +40,9 @@
 //! | `ktann.fixup.admission` | counter | outcome |
 //! | `ktann.fixup.backlog` | gauge | — |
 //! | `ktann.fixup.execution` | counter | outcome |
+//! | `ktann.fixup.stage.duration` | histogram | kind, stage |
+//! | `ktann.fixup.source.level` | histogram | kind |
+//! | `ktann.fixup.candidates` | histogram | — |
 //! | `ktann.fixup.steps` | counter | kind, result |
 //! | `ktann.fixup.drain.entries` | histogram | kind |
 //! | `ktann.fixup.state_age` | histogram | kind |

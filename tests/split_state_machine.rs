@@ -564,6 +564,52 @@ async fn root_internal_split_moves_child_entries_and_rises_one_level() {
     assert_eq!(root_header.entry_count(), 5);
     assert_eq!(root_header.level(), 2);
 
+    split::begin_split(&backend, &manifest, &key, pk(1), 1_000, &retry())
+        .await
+        .expect("begin internal split");
+    split::expose_targets(&backend, &manifest, &key, pk(1), 1_100, &retry())
+        .await
+        .expect("expose internal targets");
+    let target = match state_of(&backend, &manifest, &key, pk(1)).await {
+        Some(PartitionTransition::DrainingSplit { left, .. }) => left,
+        state => panic!("expected draining split, got {state:?}"),
+    };
+    let child = scan_child_entries(&backend, &manifest, &key, pk(1)).await[0].clone();
+    for existing in [false, true] {
+        let mut attempt = write_txn(&backend, &manifest).await;
+        let moves = if existing {
+            attempt
+                .put(
+                    LogicalKey::ChildEntry {
+                        index: manifest.logical_index_id(),
+                        tree_key: key.clone(),
+                        partition: target,
+                        child: child.child(),
+                    },
+                    PersistentValue::ChildEntry(child.clone()),
+                )
+                .await
+                .expect("stage existing child");
+            vec![(child.clone(), target)]
+        } else {
+            vec![(child.clone(), target), (child.clone(), target)]
+        };
+        assert_eq!(
+            topology::relocate_child_entries(
+                &mut attempt,
+                &key,
+                pk(1),
+                moves,
+                topology::Movement::Split
+            )
+            .await
+            .expect_err("duplicate child destination")
+            .kind(),
+            ErrorKind::Corruption
+        );
+        drop(attempt);
+    }
+
     // The root is an internal partition above the maximum: its split moves
     // Child Entries — no Record Location or Synopsis work — and converts
     // Partition Key 1 in place to level 3.
@@ -2468,4 +2514,120 @@ async fn exposure_fails_closed_on_a_torn_target_without_committing() {
     );
 
     runtime.shutdown().await.expect("shutdown");
+}
+
+/// Relocation rejects repeated destinations and observes uncommitted entries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn leaf_relocation_rejects_duplicate_and_existing_destinations() {
+    for existing in [false, true] {
+        let backend = backend();
+        let runtime = make_runtime(backend.clone());
+        let index = runtime
+            .create_index("index", config(1, 4))
+            .await
+            .expect("create");
+        let manifest = read_manifest(&backend, index.logical_index_id()).await;
+        let key = tree_key(1);
+        let records = seed_records(&index, 1, 6).await;
+        split::begin_split(&backend, &manifest, &key, pk(1), 1_000, &retry())
+            .await
+            .expect("begin");
+        split::expose_targets(&backend, &manifest, &key, pk(1), 1_100, &retry())
+            .await
+            .expect("expose");
+        let mut txn = write_txn(&backend, &manifest).await;
+        let ids = if existing {
+            vec![rid(3)]
+        } else {
+            vec![rid(3), rid(3)]
+        };
+        let candidates = topology::read_leaf_drain_candidates(&mut txn, &key, pk(1), &ids)
+            .await
+            .expect("read candidates");
+        if existing {
+            // Uncommitted writes must be visible to the uniqueness check.
+            txn.put(
+                LogicalKey::LeafEntry {
+                    index: manifest.logical_index_id(),
+                    tree_key: key.clone(),
+                    partition: pk(3),
+                    id: rid(3),
+                },
+                PersistentValue::LeafEntry(
+                    candidates[0].as_ref().expect("candidate").entry().clone(),
+                ),
+            )
+            .await
+            .expect("stage duplicate destination");
+        }
+        let moves = candidates
+            .into_iter()
+            .map(|entry| (entry.expect("candidate"), pk(3)))
+            .collect();
+        let error = topology::relocate_leaf_entries(
+            &mut txn,
+            &key,
+            pk(1),
+            moves,
+            topology::Movement::Split,
+        )
+        .await
+        .expect_err("duplicate destination");
+        assert_eq!(error.kind(), ErrorKind::Corruption);
+        drop(txn);
+        assert_searchable(&backend, &manifest, &key, &records).await;
+        runtime.shutdown().await.expect("shutdown");
+    }
+}
+
+/// Destination absence remains protected until the drain transaction commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn leaf_relocation_conflicts_with_a_concurrent_destination_insert() {
+    let backend = backend();
+    let (manifest, key) = seed_over_max_root(&backend).await;
+    split::begin_split(&backend, &manifest, &key, pk(1), 1_000, &retry())
+        .await
+        .expect("begin");
+    split::expose_targets(&backend, &manifest, &key, pk(1), 1_100, &retry())
+        .await
+        .expect("expose");
+    let mut attempt = write_txn(&backend, &manifest).await;
+    let candidate = topology::read_leaf_drain_candidates(&mut attempt, &key, pk(1), &[rid(3)])
+        .await
+        .expect("read candidate")
+        .pop()
+        .expect("slot")
+        .expect("candidate");
+    let entry = candidate.entry().clone();
+    topology::relocate_leaf_entries(
+        &mut attempt,
+        &key,
+        pk(1),
+        vec![(candidate, pk(3))],
+        topology::Movement::Split,
+    )
+    .await
+    .expect("relocate");
+    let mut concurrent = write_txn(&backend, &manifest).await;
+    concurrent
+        .put(
+            LogicalKey::LeafEntry {
+                index: manifest.logical_index_id(),
+                tree_key: key,
+                partition: pk(3),
+                id: rid(3),
+            },
+            PersistentValue::LeafEntry(entry),
+        )
+        .await
+        .expect("insert destination");
+    concurrent.commit().await.expect("commit concurrent insert");
+    assert_eq!(
+        attempt
+            .commit()
+            .await
+            .expect_err("destination conflict")
+            .kind(),
+        ErrorKind::RetryableAbort
+    );
 }

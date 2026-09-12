@@ -4,6 +4,9 @@
 `Runtime` and `Index` APIs. It produces versioned JSON intended for same-host,
 same-input comparisons. These results are empirical baselines, not a v1 SLA.
 
+See [maintenance training validation](maintenance-performance.md) for issue #162
+measurements, the rejected relocation candidate, and remaining acceptance limits.
+
 ## Running a suite
 
 Build and run benchmarks with optimizations enabled:
@@ -18,6 +21,23 @@ Tokio executor size. The emitted `reproduction_command` records the complete
 parent invocation. Each scenario runs in a fresh subprocess so its metrics
 recorder, Partition Cache, and peak RSS do not contain another scenario's
 state.
+
+The `delete-driven-merge` scenario imports and converges a fresh index, then
+alternates held-out searches with distinct deletes until three quarters of the
+records have been deleted. Setup and final verification are outside measurement.
+The report includes foreground search/write p95/p99, maintenance drain time,
+maintenance stages and committed merge steps, CPU, peak RSS, and adapter IO.
+The scenario fails if it performs no merge drains. A separate post-delete query
+pass measures recall against the surviving corpus, never stale pre-delete truth.
+
+Maintenance stage durations cover attempts, including retries and early errors.
+`training_load` includes the separately reported `training_preprocess` subphase;
+do not sum those two as disjoint time. `relocation_apply` includes destination uniqueness checks, encoding, and
+adapter application; commit time remains in write attribution.
+Source-level and candidate-count histograms describe the measured workload.
+Adapter read/mutation call counts count API calls, not network RPCs; native
+caches can satisfy calls locally. Persistent mutation bytes are reported
+separately from call counts and peak RSS includes setup.
 
 The large profile accepts `--write-beam-size N` for import diagnostics. The
 write beam is applied globally at each tree level, like the search beam; the

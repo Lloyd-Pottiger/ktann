@@ -4,14 +4,14 @@
 //! bounded enums in [`super::labels`]. All helpers are no-ops until a metrics
 //! recorder is installed.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::api::{SearchBudgetExhaustion, SearchBudgetUsage, VerifyIssueKind, VerifyReport};
 use crate::search::cache::PartitionKind;
 
 use super::labels::{
     BudgetDimension, CacheInstallResult, CacheLookupResult, FixupAdmission, FixupExecution,
-    FixupKind, FixupStepResult, ImportConcurrencyAdjustment, ImportGate, Operation,
+    FixupKind, FixupStage, FixupStepResult, ImportConcurrencyAdjustment, ImportGate, Operation,
     OperationOutcome, SearchStage, VerifyCompletion, WriteAttemptOutcome, cache_level, key,
     verify_issue,
 };
@@ -36,6 +36,9 @@ pub(crate) mod names {
     pub(crate) const FIXUP_ADMISSION: &str = "ktann.fixup.admission";
     pub(crate) const FIXUP_BACKLOG: &str = "ktann.fixup.backlog";
     pub(crate) const FIXUP_EXECUTION: &str = "ktann.fixup.execution";
+    pub(crate) const FIXUP_STAGE_DURATION: &str = "ktann.fixup.stage.duration";
+    pub(crate) const FIXUP_SOURCE_LEVEL: &str = "ktann.fixup.source.level";
+    pub(crate) const FIXUP_CANDIDATES: &str = "ktann.fixup.candidates";
     pub(crate) const FIXUP_STEPS: &str = "ktann.fixup.steps";
     pub(crate) const FIXUP_DRAIN_ENTRIES: &str = "ktann.fixup.drain.entries";
     pub(crate) const FIXUP_STATE_AGE: &str = "ktann.fixup.state_age";
@@ -44,6 +47,45 @@ pub(crate) mod names {
     pub(crate) const IMPORT_CONCURRENCY_LIMIT: &str = "ktann.import.concurrency.limit";
     pub(crate) const VERIFY_REPORTS: &str = "ktann.verify.reports";
     pub(crate) const VERIFY_ISSUES: &str = "ktann.verify.issues";
+}
+
+/// Measures one attempted phase, including early error exits. Training load
+/// includes its separately reported preprocessing subphase; other stages are
+/// disjoint. No per-entry timer is installed on numeric loops.
+pub(crate) struct FixupTimer {
+    started: Instant,
+    kind: FixupKind,
+    stage: FixupStage,
+}
+
+impl FixupTimer {
+    pub(crate) fn start(kind: FixupKind, stage: FixupStage) -> Self {
+        Self {
+            started: Instant::now(),
+            kind,
+            stage,
+        }
+    }
+}
+
+impl Drop for FixupTimer {
+    fn drop(&mut self) {
+        metrics::histogram!(names::FIXUP_STAGE_DURATION,
+            key::KIND => self.kind.as_str(), key::STAGE => self.stage.as_str())
+        .record(self.started.elapsed().as_secs_f64());
+    }
+}
+
+/// Records the source level for one relocation attempt.
+pub(crate) fn fixup_source_level(kind: FixupKind, level: u32) {
+    metrics::histogram!(names::FIXUP_SOURCE_LEVEL, key::KIND => kind.as_str())
+        .record(f64::from(level));
+}
+
+/// Records complete same-level candidate counts, including non-Ready entries.
+pub(crate) fn fixup_candidates(count: usize) {
+    let count = u32::try_from(count).unwrap_or(u32::MAX);
+    metrics::histogram!(names::FIXUP_CANDIDATES).record(f64::from(count));
 }
 
 /// Counts one Runtime foreground admission rejection.
@@ -355,6 +397,12 @@ mod tests {
             fixup_admission(FixupAdmission::Duplicate, 2);
             fixup_backlog(3);
             fixup_execution(FixupExecution::Settled);
+            drop(FixupTimer::start(
+                FixupKind::Merge,
+                FixupStage::CandidateDiscovery,
+            ));
+            fixup_source_level(FixupKind::Merge, 2);
+            fixup_candidates(17);
             fixup_state_age(FixupKind::Split, 7_000, 1_000);
             bloom_fill_ratio(0.25);
             import_wait(ImportGate::Backlog, Duration::from_millis(2));
@@ -406,6 +454,9 @@ mod tests {
             names::FIXUP_BACKLOG,
             names::FIXUP_EXECUTION,
             names::FIXUP_STATE_AGE,
+            names::FIXUP_STAGE_DURATION,
+            names::FIXUP_SOURCE_LEVEL,
+            names::FIXUP_CANDIDATES,
             names::BLOOM_FILL_RATIO,
             names::IMPORT_WAIT,
             names::IMPORT_CONCURRENCY_LIMIT,

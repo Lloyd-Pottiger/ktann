@@ -43,7 +43,7 @@
 //!   never reverts to `Ready`.
 
 use crate::api::{Error, ErrorKind, PartitionKey, Result};
-use crate::observe::labels::{FixupKind, Operation};
+use crate::observe::labels::{FixupKind, FixupStage, Operation};
 use crate::observe::metrics;
 use crate::runtime::RetryPolicy;
 use crate::runtime::{reads, writes};
@@ -429,6 +429,7 @@ async fn drain_attempt<T: WriteTxn>(
         DrainBatch::Leaf(record_ids) => {
             let candidates =
                 topology::read_leaf_drain_candidates(txn, tree_key, source, record_ids).await?;
+            let routing_timer = metrics::FixupTimer::start(FixupKind::Merge, FixupStage::Routing);
             let mut moves = Vec::new();
             for candidate in candidates.into_iter().flatten() {
                 // A `None` slot is a concurrently removed entry: skipped.
@@ -448,6 +449,7 @@ async fn drain_attempt<T: WriteTxn>(
                 .partition();
                 moves.push((candidate, target));
             }
+            drop(routing_timer);
             if !revalidate_targets(txn, tree_key, level, &moves).await? {
                 return Ok(Attempt::Reselect);
             }
@@ -457,6 +459,7 @@ async fn drain_attempt<T: WriteTxn>(
         DrainBatch::Child(children) => {
             let candidates =
                 topology::read_child_drain_candidates(txn, tree_key, source, children).await?;
+            let routing_timer = metrics::FixupTimer::start(FixupKind::Merge, FixupStage::Routing);
             let mut moves = Vec::new();
             for entry in candidates.into_iter().flatten() {
                 let target = routing::nearest_ready_candidate(
@@ -469,6 +472,7 @@ async fn drain_attempt<T: WriteTxn>(
                 .partition();
                 moves.push((entry, target));
             }
+            drop(routing_timer);
             if !revalidate_targets(txn, tree_key, level, &moves).await? {
                 return Ok(Attempt::Reselect);
             }

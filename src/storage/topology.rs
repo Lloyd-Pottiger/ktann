@@ -48,6 +48,9 @@
 //!   impossible count are Corruption. On any returned error the caller must
 //!   not commit the transaction; rolling back leaves no partial change.
 
+use crate::observe::labels::{FixupKind, FixupStage};
+use crate::observe::metrics::{self, FixupTimer};
+
 use bytes::Bytes;
 
 use crate::api::{Error, ErrorKind, LogicalIndexId, PartitionKey, Result};
@@ -539,6 +542,14 @@ pub enum Movement {
 }
 
 impl Movement {
+    /// Associates storage relocation work with its maintenance protocol.
+    fn fixup_kind(self) -> FixupKind {
+        match self {
+            Self::Split => FixupKind::Split,
+            Self::Merge => FixupKind::Merge,
+        }
+    }
+
     /// The only source state a move under this protocol is legal from.
     fn source_state(self) -> PartitionState {
         match self {
@@ -735,6 +746,8 @@ pub async fn relocate_leaf_entries<T: WriteTxn>(
         target_synopses.push(expect_synopsis(value)?.ok_or_else(corrupt)?);
     }
 
+    metrics::fixup_source_level(movement.fixup_kind(), source_header.level());
+    let _apply_timer = FixupTimer::start(movement.fixup_kind(), FixupStage::RelocationApply);
     let moved = moves.len();
     for (drain, target) in &moves {
         let id = drain.entry.record_id().clone();
@@ -750,18 +763,22 @@ pub async fn relocate_leaf_entries<T: WriteTxn>(
             )
             .await?,
         )?;
-        txn.delete(LogicalKey::LeafEntry {
+    }
+    // Unique inserts retain update protection and read-your-writes. Stage the
+    // remaining writes against the budget left after those inserts.
+    let mut mutations = txn.mutations();
+    for (drain, target) in &moves {
+        let id = drain.entry.record_id().clone();
+        mutations.delete(LogicalKey::LeafEntry {
             index,
             tree_key: tree_key.clone(),
             partition: source,
             id: id.clone(),
-        })
-        .await?;
-        txn.put(
+        })?;
+        mutations.put(
             LogicalKey::Location { index, id },
             PersistentValue::RecordLocation(RecordLocation::new(tree_key.clone(), *target)),
-        )
-        .await?;
+        )?;
     }
 
     // Write each touched authority value back once.
@@ -769,15 +786,14 @@ pub async fn relocate_leaf_entries<T: WriteTxn>(
     for _ in &moves {
         source_header = removed_entry(source_header)?;
     }
-    txn.put(
+    mutations.put(
         LogicalKey::Header {
             index,
             tree_key: tree_key.clone(),
             partition: source,
         },
         PersistentValue::PartitionHeader(source_header),
-    )
-    .await?;
+    )?;
     let mut grouped_moves = moves.iter().peekable();
     for ((target, header), mut synopsis) in target_headers.into_iter().zip(target_synopses) {
         let mut header = header;
@@ -790,28 +806,27 @@ pub async fn relocate_leaf_entries<T: WriteTxn>(
             synopsis_changed |= synopsis.expand(manifest, drain.entry.fields())?;
             grouped_moves.next();
         }
-        txn.put(
+        mutations.put(
             LogicalKey::Header {
                 index,
                 tree_key: tree_key.clone(),
                 partition: target,
             },
             PersistentValue::PartitionHeader(header),
-        )
-        .await?;
+        )?;
         if synopsis_changed {
-            txn.put(
+            mutations.put(
                 LogicalKey::Synopsis {
                     index,
                     tree_key: tree_key.clone(),
                     partition: target,
                 },
                 PersistentValue::PartitionSynopsis(synopsis),
-            )
-            .await?;
+            )?;
         }
     }
     debug_assert!(grouped_moves.next().is_none());
+    txn.apply(mutations).await?;
     Ok(moved)
 }
 
@@ -918,6 +933,8 @@ pub async fn relocate_child_entries<T: WriteTxn>(
         }
     }
 
+    metrics::fixup_source_level(movement.fixup_kind(), source_header.level());
+    let _apply_timer = FixupTimer::start(movement.fixup_kind(), FixupStage::RelocationApply);
     let moved = moves.len();
     for (entry, target) in &moves {
         expect_inserted(
@@ -932,44 +949,46 @@ pub async fn relocate_child_entries<T: WriteTxn>(
             )
             .await?,
         )?;
-        txn.delete(LogicalKey::ChildEntry {
+    }
+    // Destination uniqueness is established before batching the remaining writes.
+    let mut mutations = txn.mutations();
+    for (entry, _) in &moves {
+        mutations.delete(LogicalKey::ChildEntry {
             index,
             tree_key: tree_key.clone(),
             partition: source,
             child: entry.child(),
-        })
-        .await?;
+        })?;
     }
 
     let mut source_header = source_header;
     for _ in &moves {
         source_header = removed_entry(source_header)?;
     }
-    txn.put(
+    mutations.put(
         LogicalKey::Header {
             index,
             tree_key: tree_key.clone(),
             partition: source,
         },
         PersistentValue::PartitionHeader(source_header),
-    )
-    .await?;
+    )?;
     for (target, mut header) in target_headers {
         for (_, move_target) in &moves {
             if move_target == &target {
                 header = added_entry(header)?;
             }
         }
-        txn.put(
+        mutations.put(
             LogicalKey::Header {
                 index,
                 tree_key: tree_key.clone(),
                 partition: target,
             },
             PersistentValue::PartitionHeader(header),
-        )
-        .await?;
+        )?;
     }
+    txn.apply(mutations).await?;
     Ok(moved)
 }
 
@@ -1657,6 +1676,7 @@ pub(crate) async fn same_level_candidates<R: LogicalReader>(
     tree_key: &TreeKey,
     level: u32,
 ) -> Result<Vec<LevelCandidate>> {
+    let _timer = FixupTimer::start(FixupKind::Merge, FixupStage::CandidateDiscovery);
     let index = manifest.logical_index_id();
     let parent_level = level.checked_add(1).ok_or_else(corrupt)?;
     let bodies = level_bodies(reader, manifest, tree_key, parent_level).await?;
@@ -1696,6 +1716,7 @@ pub(crate) async fn same_level_candidates<R: LogicalReader>(
             header,
         });
     }
+    metrics::fixup_candidates(candidates.len());
     Ok(candidates)
 }
 
