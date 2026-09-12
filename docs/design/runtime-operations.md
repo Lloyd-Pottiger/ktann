@@ -135,7 +135,7 @@ remains demand-driven and separately observable.
 
 KTANN emits through the `metrics` and `tracing` facades. Metric labels are
 bounded enums only: backend, operation, outcome, partition level/state, fixup
-kind, cache level/result, budget dimension, search stage, import gate, and
+kind, cache level/result, budget dimension, search/mutation stage, import gate, and
 verification issue kind. Raw Index Name, IDs, Tree Key, Record ID, field
 values, vector, and payload are forbidden labels.
 

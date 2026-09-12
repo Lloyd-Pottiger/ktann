@@ -199,7 +199,13 @@ fn validate_dimension(dimension: usize) -> Result<()> {
 }
 
 fn validate_vector(vector: &[f32], dimension: usize, source: VectorSource) -> Result<()> {
-    if vector.len() != dimension || vector.iter().any(|component| !component.is_finite()) {
+    // A bitwise reduction lets the compiler check multiple components at
+    // once, without a short-circuit branch for every finite component.
+    if vector.len() != dimension
+        || !vector
+            .iter()
+            .fold(true, |finite, component| finite & component.is_finite())
+    {
         return Err(vector_error(source));
     }
     Ok(())
@@ -739,8 +745,39 @@ mod tests {
     }
 
     #[test]
+    fn vector_validation_covers_finite_extremes_and_nonfinite_chunk_tails() {
+        let finite = [
+            0.0,
+            -0.0,
+            f32::from_bits(1),
+            -f32::from_bits(1),
+            f32::MAX,
+            f32::MIN,
+        ];
+        for dimension in [1, 7, 8, 9, 767, 768, 769, MAX_DIMENSION] {
+            let mut vector: Vec<_> = finite.into_iter().cycle().take(dimension).collect();
+            for source in [VectorSource::Caller, VectorSource::Persistent] {
+                validate_vector(&vector, dimension, source).unwrap();
+                let expected = vector_error(source).kind();
+                for position in [0, dimension / 2, dimension - 1] {
+                    let original = vector[position];
+                    for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                        vector[position] = invalid;
+                        assert_kind(validate_vector(&vector, dimension, source), expected);
+                    }
+                    vector[position] = original;
+                }
+            }
+        }
+    }
+
+    #[test]
     fn routing_distance_distinguishes_caller_errors_from_corruption() {
         let kernel = VectorKernel::new(2, Metric::L2, SEED).unwrap();
+        assert_kind(
+            kernel.routing_distance(&[f32::NAN, 0.0], &[f32::INFINITY, 0.0]),
+            ErrorKind::InvalidArgument,
+        );
         assert_kind(
             kernel.routing_distance(&[1.0], &[1.0, 0.0]),
             ErrorKind::InvalidArgument,
