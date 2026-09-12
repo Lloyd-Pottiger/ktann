@@ -443,7 +443,7 @@ impl Traversal {
         }
 
         if level > 1 {
-            self.visit_internal(txn, context, tree_key, entry.tree, entry.partition, level)
+            self.visit_internal(txn, context, tree_key, entry.tree, entry.partition, &header)
                 .await
         } else {
             let effective_predicate = match context.request.predicate {
@@ -476,8 +476,15 @@ impl Traversal {
             };
             // The exact Header count authoritatively proves emptiness.
             if header.entry_count() > 0 {
-                self.scan_leaf(txn, context, tree_key, entry.partition, effective_predicate)
-                    .await?;
+                self.scan_leaf(
+                    txn,
+                    context,
+                    tree_key,
+                    entry.partition,
+                    &header,
+                    effective_predicate,
+                )
+                .await?;
             }
             Ok(())
         }
@@ -537,9 +544,18 @@ impl Traversal {
         tree_key: &TreeKey,
         tree: u32,
         partition: PartitionKey,
-        level: u32,
+        header: &PartitionHeader,
     ) -> Result<()> {
-        let body = load_body(txn, context.cache, context.manifest, tree_key, partition).await?;
+        let body = load_body(
+            txn,
+            context.cache,
+            context.manifest,
+            tree_key,
+            partition,
+            header,
+        )
+        .await?;
+        let level = header.level();
         let BodyEntries::Internal(entries) = body.entries() else {
             return Err(Error::new(ErrorKind::Corruption));
         };
@@ -583,6 +599,7 @@ impl Traversal {
         context: &VisitContext<'_>,
         tree_key: &TreeKey,
         partition: PartitionKey,
+        header: &PartitionHeader,
         predicate: Option<&CompiledPredicate>,
     ) -> Result<()> {
         let remaining = usize::try_from(
@@ -598,7 +615,15 @@ impl Traversal {
             self.leaf_entry_budget_exhausted = true;
             return Ok(());
         }
-        let body = load_body(txn, context.cache, context.manifest, tree_key, partition).await?;
+        let body = load_body(
+            txn,
+            context.cache,
+            context.manifest,
+            tree_key,
+            partition,
+            header,
+        )
+        .await?;
         let BodyEntries::Leaf(entries) = body.entries() else {
             return Err(Error::new(ErrorKind::Corruption));
         };
@@ -986,6 +1011,65 @@ mod tests {
         let budget = budgets(8, 8, 8);
         assert!(TraversalRequest::new(&QUERY, &trees, None, 0, budget, 1).is_err());
         assert!(TraversalRequest::new(&QUERY, &trees, None, 1, budget, 0).is_err());
+    }
+
+    #[tokio::test]
+    async fn traversal_reads_each_header_once_across_cache_modes() {
+        let manifest = manifest();
+        let mut fixture = Fixture::new(&manifest);
+        let tree = fixture.tree(1);
+        fixture.header(&tree, 1, 2, 2, PartitionState::Ready);
+        fixture.child(&tree, 1, 2, [1.0, 0.0]);
+        fixture.child(&tree, 1, 3, [2.0, 0.0]);
+        for (partition, record_id, vector) in [(2, "a", [1.0, 0.0]), (3, "b", [2.0, 0.0])] {
+            fixture.header(&tree, partition, 1, 1, PartitionState::Ready);
+            fixture.entry(&tree, 1, partition, record_id, 1, vector);
+        }
+        let trees = [tree_ref(&tree)];
+        let kernel = VectorKernel::new(DIMENSION, Metric::L2, SEED).expect("valid kernel");
+        for capacity in [0, 1, 1 << 20] {
+            let cache = PartitionCache::new(capacity);
+            for pass in 0..2 {
+                let mut txn =
+                    ReadLogicalTxn::for_index(MockReadTxn::new(fixture.items.clone()), &manifest)
+                        .expect("bind manifest");
+                let outcome = traverse(
+                    &mut txn,
+                    &cache,
+                    &kernel,
+                    TraversalRequest::new(
+                        &QUERY,
+                        &trees,
+                        None,
+                        4,
+                        budgets(8, 8, 8),
+                        DEFAULT_LEAF_BEAM,
+                    )
+                    .expect("valid request"),
+                )
+                .await
+                .expect("traverse");
+                let raw = txn.into_raw();
+                assert_eq!(
+                    raw.gets, 3,
+                    "one Header read per visited partition: capacity={capacity}, pass={pass}"
+                );
+                let expected_scans = if capacity > 1 && pass == 1 { 0 } else { 3 };
+                assert_eq!(
+                    raw.scans, expected_scans,
+                    "body scans: capacity={capacity}, pass={pass}"
+                );
+                assert_eq!(
+                    candidate_ids(&outcome),
+                    vec![b"a".as_slice(), b"b".as_slice()]
+                );
+                assert_eq!(outcome.visited_partitions(), 3);
+                assert_eq!(outcome.visited_leaf_entries(), 2);
+                assert!(!outcome.partition_budget_exhausted());
+                assert!(!outcome.leaf_entry_budget_exhausted());
+                assert!(!outcome.rabitq_overlap_truncated());
+            }
+        }
     }
 
     #[tokio::test]

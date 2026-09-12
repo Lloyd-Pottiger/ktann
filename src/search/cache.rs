@@ -34,9 +34,9 @@ use crate::api::{Error, ErrorKind, LogicalIndexId, PartitionKey, Result, Value};
 use crate::observe::labels::{CacheInstallResult, CacheLookupResult};
 use crate::observe::metrics;
 use crate::storage::backend::{ReadOps, ScanLimits};
-use crate::storage::keys::{LogicalKey, TreeKey};
+use crate::storage::keys::TreeKey;
 use crate::storage::values::{
-    ChildEntry, IndexManifest, LeafEntry, PartitionHeader, PersistentValue, expect_header,
+    ChildEntry, IndexManifest, LeafEntry, PartitionHeader, PersistentValue,
 };
 use crate::storage::{LogicalRange, LogicalScanCursor, ReadLogicalTxn};
 
@@ -516,21 +516,21 @@ impl CacheInner {
 /// Loads one partition's decoded search body, validated against the snapshot
 /// Header and cached under its cache epoch.
 ///
-/// The Header is read first from `txn`'s one consistent snapshot. An equal
-/// cached epoch is served from `cache` without touching the body. On a miss
-/// the same transaction scans and decodes the complete body, the decoded entry
-/// count must equal the initial Header's exact entry count before publishing;
-/// any disagreement is Corruption and nothing is cached. The body is returned
-/// even when it is too large to cache.
-pub(crate) async fn load_body<T: ReadOps>(
+/// The caller must supply the Header already decoded for this exact Logical
+/// Index, Tree Key, and partition from `txn`'s snapshot. An equal cached epoch
+/// is served without touching the body. On a miss the same transaction scans
+/// and decodes the complete body, whose entry count must equal that Header's
+/// exact count before publishing. Any disagreement is Corruption and nothing
+/// is cached. The body is returned even when it is too large to cache.
+pub(super) async fn load_body<T: ReadOps>(
     txn: &mut ReadLogicalTxn<'_, T>,
     cache: &PartitionCache,
     manifest: &IndexManifest,
     tree_key: &TreeKey,
     partition: PartitionKey,
+    header: &PartitionHeader,
 ) -> Result<Arc<CachedBody>> {
     let index = manifest.logical_index_id();
-    let header = read_header(txn, index, tree_key, partition).await?;
     let kind = PartitionKind::from_level(header.level());
     let key = CacheKey::new(index, tree_key.clone(), partition, kind);
     if let Some(body) = cache.lookup(&key, header.cache_epoch()) {
@@ -584,20 +584,6 @@ pub(crate) async fn load_body<T: ReadOps>(
     Ok(body)
 }
 
-async fn read_header<T: ReadOps>(
-    txn: &mut ReadLogicalTxn<'_, T>,
-    index: LogicalIndexId,
-    tree_key: &TreeKey,
-    partition: PartitionKey,
-) -> Result<PartitionHeader> {
-    let key = LogicalKey::Header {
-        index,
-        tree_key: tree_key.clone(),
-        partition,
-    };
-    expect_header(txn.get(key).await?)?.ok_or_else(|| Error::new(ErrorKind::Corruption))
-}
-
 /// The accounted decoded size of one Leaf Entry: the envelope, the Record ID
 /// and RaBitQ7 byte strings, and every filter field including string payloads.
 fn leaf_entry_bytes(entry: &LeafEntry) -> u64 {
@@ -632,13 +618,13 @@ mod tests {
 
     use bytes::Bytes;
 
-    use crate::api::{ErrorKind, IndexConfig, LogicalIndexId, Metric, Result};
+    use crate::api::{Error, ErrorKind, IndexConfig, LogicalIndexId, Metric, Result};
     use crate::storage::ReadLogicalTxn;
-    use crate::storage::keys::{self, TreeKey};
+    use crate::storage::keys::{self, LogicalKey, TreeKey};
     use crate::storage::test_support::{MockReadTxn, pk};
     use crate::storage::values::{
         ChildEntry, IndexLifecycle, IndexManifest, LeafEntry, PartitionHeader, PartitionState,
-        PersistentValue, ValueCodec,
+        PersistentValue, ValueCodec, expect_header,
     };
 
     use super::super::rabitq::RaBitQ7;
@@ -942,7 +928,24 @@ mod tests {
         partition: u64,
     ) -> Result<(Arc<CachedBody>, MockReadTxn)> {
         let mut txn = ReadLogicalTxn::for_index(mock, manifest).expect("bind manifest");
-        let body = load_body(&mut txn, cache, manifest, &tree_key(), pk(partition)).await?;
+        let header = expect_header(
+            txn.get(LogicalKey::Header {
+                index: manifest.logical_index_id(),
+                tree_key: tree_key(),
+                partition: pk(partition),
+            })
+            .await?,
+        )?
+        .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
+        let body = load_body(
+            &mut txn,
+            cache,
+            manifest,
+            &tree_key(),
+            pk(partition),
+            &header,
+        )
+        .await?;
         Ok((body, txn.into_raw()))
     }
 
