@@ -52,10 +52,10 @@ impl fmt::Debug for RaBitQQuery<'_> {
 }
 
 pub(super) fn approximate_distance(
-    code: &RaBitQ7,
+    code: &RaBitQ7<'_>,
     query: &RaBitQQuery<'_>,
 ) -> Result<ApproximateDistance> {
-    if query.components.len() != code.signed_codes.len() {
+    if query.components.len() != code.dimension {
         return Err(Error::invalid_argument());
     }
 
@@ -63,7 +63,7 @@ pub(super) fn approximate_distance(
     let mut dot = 0.0_f64;
     let mut dot_lower = 0.0_f64;
     let mut dot_upper = 0.0_f64;
-    for (&query_component, &signed_code) in query.components.iter().zip(&code.signed_codes) {
+    for (&query_component, signed_code) in query.components.iter().zip(code.signed_codes()) {
         let query_component = f64::from(query_component);
         let reconstruction = scale * f64::from(signed_code);
         let product = query_component * reconstruction;

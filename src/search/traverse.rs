@@ -612,7 +612,10 @@ impl Traversal {
         }
         let mut batch = Vec::with_capacity(funded);
         for entry in &entries[..funded] {
-            let code = RaBitQ7::decode(entry.rabitq7(), dimension)?;
+            // `load_body` decoded and validated every payload against this
+            // Manifest before returning the immutable body. Reuse that
+            // validation while scoring its packed codes without allocation.
+            let code = RaBitQ7::from_validated_leaf_bytes(entry.rabitq7(), dimension);
             // The query and the decoded code are validated finite, so a
             // non-conservative distance here means corrupted state.
             let distance = code
