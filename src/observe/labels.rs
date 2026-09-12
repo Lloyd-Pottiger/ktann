@@ -447,31 +447,6 @@ pub(crate) const fn verify_issue(kind: VerifyIssueKind) -> &'static str {
     }
 }
 
-/// Bounded phases of attempted structure maintenance; timings include retries.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum FixupStage {
-    TrainingLoad,
-    TrainingPreprocess,
-    Training,
-    CandidateDiscovery,
-    Routing,
-    RelocationApply,
-}
-
-impl FixupStage {
-    /// Returns the stable stage label, without caller or persistent identities.
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::TrainingLoad => "training_load",
-            Self::TrainingPreprocess => "training_preprocess",
-            Self::Training => "training",
-            Self::CandidateDiscovery => "candidate_discovery",
-            Self::Routing => "routing",
-            Self::RelocationApply => "relocation_apply",
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

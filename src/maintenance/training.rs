@@ -53,9 +53,6 @@ use crate::storage::keys::{LogicalKey, TreeKey};
 use crate::storage::values::{IndexManifest, PartitionCentroid, PersistentValue};
 use crate::storage::{LogicalRange, ReadLogicalTxn};
 
-use crate::observe::labels::{FixupKind, FixupStage};
-use crate::observe::metrics::FixupTimer;
-
 /// The maximum number of Lloyd rounds; a fixed persistent format protocol choice
 /// (ADR 0015).
 const MAX_TRAINING_ROUNDS: usize = 10;
@@ -141,16 +138,11 @@ pub async fn train_split_centroids<T: ReadOps>(
         _ => return Err(Error::new(ErrorKind::Corruption)),
     };
     let kernel = kernel_for(manifest)?;
-    let load_timer = FixupTimer::start(FixupKind::Split, FixupStage::TrainingLoad);
     let trained = if header.level() == 1 {
         let entries = load_leaf_source(txn, manifest, tree_key, source, &kernel).await?;
-        drop(load_timer);
-        let _timer = FixupTimer::start(FixupKind::Split, FixupStage::Training);
         train(&kernel, entries)?
     } else {
         let entries = load_internal_source(txn, manifest, tree_key, source).await?;
-        drop(load_timer);
-        let _timer = FixupTimer::start(FixupKind::Split, FixupStage::Training);
         train(&kernel, entries)?
     };
     Ok(SplitCentroids {
@@ -201,7 +193,6 @@ async fn load_leaf_source<T: ReadOps>(
             })
             .collect();
         let values = txn.batch_get(keys).await?;
-        let _timer = FixupTimer::start(FixupKind::Split, FixupStage::TrainingPreprocess);
         for (id, value) in batch.iter().zip(values) {
             let Some(PersistentValue::VectorRecord(record)) = value else {
                 return Err(Error::new(ErrorKind::Corruption));

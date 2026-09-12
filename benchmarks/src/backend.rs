@@ -87,8 +87,6 @@ struct Counters {
     write_transactions: AtomicU64,
     /// Keys requested through point and batch point reads.
     point_read_keys: AtomicU64,
-    /// Adapter point/batch read method calls, not network RPCs.
-    point_read_calls: AtomicU64,
     /// Bounded range-scan calls issued to the Backend.
     scans: AtomicU64,
     /// Present logical key/value pairs returned by reads.
@@ -97,8 +95,6 @@ struct Counters {
     bytes_read: AtomicU64,
     /// Attempted point mutations, including attempts later retried.
     mutation_operations: AtomicU64,
-    /// Adapter mutation method calls, including batches and retries.
-    mutation_calls: AtomicU64,
     /// Attempted logical mutation key/value bytes.
     mutation_bytes: AtomicU64,
     /// Attempted transactional range clears.
@@ -120,12 +116,10 @@ impl Counters {
             read_transactions: load(&self.read_transactions),
             write_transactions: load(&self.write_transactions),
             point_read_keys: load(&self.point_read_keys),
-            point_read_calls: load(&self.point_read_calls),
             scans: load(&self.scans),
             items_read: load(&self.items_read),
             bytes_read: load(&self.bytes_read),
             mutation_operations: load(&self.mutation_operations),
-            mutation_calls: load(&self.mutation_calls),
             mutation_bytes: load(&self.mutation_bytes),
             range_clears: load(&self.range_clears),
             commits: load(&self.commits),
@@ -217,7 +211,6 @@ pub struct MeasuredTxn<T> {
 impl<T: ReadOps> ReadOps for MeasuredTxn<T> {
     fn get(&mut self, key: Bytes) -> impl Future<Output = Result<Option<Bytes>>> + Send {
         let key_bytes = key.len();
-        add(&self.counters.point_read_calls, 1);
         add(&self.counters.point_read_keys, 1);
         async move {
             let result = self.inner.get(key).await?;
@@ -231,7 +224,6 @@ impl<T: ReadOps> ReadOps for MeasuredTxn<T> {
         keys: Vec<Bytes>,
     ) -> impl Future<Output = Result<Vec<Option<Bytes>>>> + Send {
         let key_bytes: Vec<usize> = keys.iter().map(Bytes::len).collect();
-        add(&self.counters.point_read_calls, 1);
         add(&self.counters.point_read_keys, keys.len());
         async move {
             let result = self.inner.batch_get(keys).await?;
@@ -276,7 +268,6 @@ impl<T: ReadTxn> ReadTxn for MeasuredTxn<T> {}
 impl<T: WriteTxn> WriteTxn for MeasuredTxn<T> {
     fn get_for_update(&mut self, key: Bytes) -> impl Future<Output = Result<Option<Bytes>>> + Send {
         let key_bytes = key.len();
-        add(&self.counters.point_read_calls, 1);
         add(&self.counters.point_read_keys, 1);
         async move {
             let result = self.inner.get_for_update(key).await?;
@@ -290,7 +281,6 @@ impl<T: WriteTxn> WriteTxn for MeasuredTxn<T> {
         keys: Vec<Bytes>,
     ) -> impl Future<Output = Result<Vec<Option<Bytes>>>> + Send {
         let key_bytes: Vec<usize> = keys.iter().map(Bytes::len).collect();
-        add(&self.counters.point_read_calls, 1);
         add(&self.counters.point_read_keys, keys.len());
         async move {
             let result = self.inner.batch_get_for_update(keys).await?;
@@ -300,7 +290,6 @@ impl<T: WriteTxn> WriteTxn for MeasuredTxn<T> {
     }
 
     fn put(&mut self, key: Bytes, value: Bytes) -> impl Future<Output = Result<()>> + Send {
-        add(&self.counters.mutation_calls, 1);
         add(&self.counters.mutation_operations, 1);
         add(
             &self.counters.mutation_bytes,
@@ -314,7 +303,6 @@ impl<T: WriteTxn> WriteTxn for MeasuredTxn<T> {
         key: Bytes,
         value: Bytes,
     ) -> impl Future<Output = Result<InsertOutcome>> + Send {
-        add(&self.counters.mutation_calls, 1);
         add(&self.counters.mutation_operations, 1);
         add(
             &self.counters.mutation_bytes,
@@ -324,7 +312,6 @@ impl<T: WriteTxn> WriteTxn for MeasuredTxn<T> {
     }
 
     fn delete(&mut self, key: Bytes) -> impl Future<Output = Result<()>> + Send {
-        add(&self.counters.mutation_calls, 1);
         add(&self.counters.mutation_operations, 1);
         add(&self.counters.mutation_bytes, key.len());
         self.inner.delete(key)
@@ -334,7 +321,6 @@ impl<T: WriteTxn> WriteTxn for MeasuredTxn<T> {
         &mut self,
         mutations: Vec<Mutation>,
     ) -> impl Future<Output = Result<()>> + Send {
-        add(&self.counters.mutation_calls, 1);
         add(&self.counters.mutation_operations, mutations.len());
         // Mutation fields remain available at this boundary, so logical bytes
         // include exactly the encoded keys and values handed to the Backend.

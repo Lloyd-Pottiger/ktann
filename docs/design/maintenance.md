@@ -105,11 +105,6 @@ counts and cache epochs. Leaf movement also updates Record Location and target
 Synopsis. A concurrently removed entry is skipped; any remaining membership
 mismatch is Corruption.
 
-After destination Entries have been uniquely inserted, relocation stages source
-deletes, Locations, and aggregated Header/Synopsis updates in one MutationBuilder.
-The builder uses the transaction budget remaining after those inserts, and all
-writes commit or roll back together in the existing drain transaction.
-
 The leaf page first derives the largest batch whose exact worst-case relocation
 charge fits the current Backend Admission Budget. The charge uses the
 Manifest's dimension, fields and Bloom parameters, the current Tree Key, codec

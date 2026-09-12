@@ -76,8 +76,6 @@ pub struct ScenarioSpec {
     pub search_percent: u8,
     /// Whether updates concentrate on a small conflict set.
     pub hot_updates: bool,
-    /// Whether writes delete distinct records to drive merge maintenance.
-    pub delete_driven: bool,
     /// Runtime Partition Cache capacity.
     pub partition_cache_bytes: u64,
     /// Runtime foreground concurrency and wait bound.
@@ -144,7 +142,6 @@ fn smoke_scenarios() -> Vec<ScenarioSpec> {
         seed: 0x38_0001,
         search_percent: 100,
         hot_updates: false,
-        delete_driven: false,
         partition_cache_bytes: 4 << 20,
         foreground_limit: 8,
         blocking_resource_limit: None,
@@ -197,14 +194,6 @@ fn smoke_scenarios() -> Vec<ScenarioSpec> {
             ..common.clone()
         },
         ScenarioSpec {
-            name: "delete-driven-merge",
-            delete_driven: true,
-            search_percent: 50,
-            warmup_operations: 0,
-            measured_operations: common.base_vectors * 3 / 2,
-            ..common.clone()
-        },
-        ScenarioSpec {
             name: "import-to-search-lifecycle",
             lifecycle: true,
             search_percent: 100,
@@ -233,7 +222,6 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
         seed,
         search_percent: 100,
         hot_updates: false,
-        delete_driven: false,
         partition_cache_bytes: 64 << 20,
         foreground_limit: 32,
         blocking_resource_limit: None,
@@ -298,14 +286,6 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
             ..clustered.clone()
         },
         ScenarioSpec {
-            name: "delete-driven-merge",
-            delete_driven: true,
-            search_percent: 50,
-            warmup_operations: 0,
-            measured_operations: clustered.base_vectors * 3 / 2,
-            ..clustered.clone()
-        },
-        ScenarioSpec {
             name: "import-to-search-lifecycle",
             dataset: "siftsmall",
             base_vectors: 10_000,
@@ -347,7 +327,6 @@ fn large_scenarios() -> Result<Vec<ScenarioSpec>, String> {
         seed: 0x38_2001,
         search_percent: 100,
         hot_updates: false,
-        delete_driven: false,
         partition_cache_bytes: 512 << 20,
         foreground_limit: 64,
         blocking_resource_limit: Some(64),
@@ -497,7 +476,6 @@ pub async fn run_scenario<B: Backend>(
             tree_key_field_count: index_config.tree_key_fields().len(),
             search_percent: spec.search_percent,
             hot_updates: spec.hot_updates,
-            delete_driven: spec.delete_driven,
             min_partition_entries: index_config.min_partition_entries(),
             max_partition_entries: index_config.max_partition_entries(),
             partition_cache_bytes: spec.partition_cache_bytes,
@@ -1095,25 +1073,13 @@ fn phase_resources(
         peak_rss_bytes: Some(after.peak_rss_bytes()),
         backend_io,
         writes: metrics.write_attribution(),
-        maintenance: maintenance_summary(metrics, metric_capture),
-    }
-}
-
-/// Captures maintenance work through the end of the measured drain.
-fn maintenance_summary(metrics: &CapturedMetrics, capture: &MetricCapture) -> MaintenanceSummary {
-    MaintenanceSummary {
-        stages_ms: metrics
-            .distributions_rendered("ktann.fixup.stage.duration")
-            .into_iter()
-            .map(|(labels, distribution)| (labels, distribution.seconds_to_milliseconds()))
-            .collect(),
-        source_levels: metrics.distributions_rendered("ktann.fixup.source.level"),
-        candidates: metrics.distributions_rendered("ktann.fixup.candidates"),
-        admission: metrics.counters_rendered("ktann.fixup.admission"),
-        execution: metrics.counters_rendered("ktann.fixup.execution"),
-        steps: metrics.counters_rendered("ktann.fixup.steps"),
-        drain_entries: metrics.distributions_rendered("ktann.fixup.drain.entries"),
-        backlog_at_end: capture.fixup_backlog(),
+        maintenance: MaintenanceSummary {
+            admission: metrics.counters_rendered("ktann.fixup.admission"),
+            execution: metrics.counters_rendered("ktann.fixup.execution"),
+            steps: metrics.counters_rendered("ktann.fixup.steps"),
+            drain_entries: metrics.distributions_rendered("ktann.fixup.drain.entries"),
+            backlog_at_end: metric_capture.fixup_backlog(),
+        },
     }
 }
 
@@ -1140,7 +1106,7 @@ async fn run_with_runtime<B: Backend>(
     dataset: &BenchmarkDataset,
 ) -> Result<(Topology, SteadyStateMeasurements), String> {
     let (index, topology) = prepare_index(runtime, metric_capture, spec, dataset).await?;
-    let mut measurements = measure_steady_workload(
+    let measurements = measure_steady_workload(
         &index,
         backend_counters,
         metric_capture,
@@ -1150,30 +1116,6 @@ async fn run_with_runtime<B: Backend>(
     )
     .await?;
     verify_measured_state(&index, spec).await?;
-    if spec.delete_driven {
-        let deleted = spec.measured_operations / 2;
-        let truth: Vec<ExactTruth> = dataset
-            .queries
-            .iter()
-            .map(|query| {
-                Arc::from(oracle::truth_vectors(
-                    &dataset.ids[deleted..],
-                    &dataset.base[deleted..],
-                    spec.metric,
-                    query,
-                    spec.k,
-                ))
-            })
-            .collect();
-        let requests = (0..dataset.queries.len())
-            .map(|query| search_request(dataset, spec, query))
-            .collect::<Result<Vec<_>, _>>()?;
-        measurements.post_delete_search = Some(
-            run_search_phase(&index, &requests, &truth, backend_counters, metric_capture)
-                .await?
-                .phase,
-        );
-    }
     Ok((topology, measurements))
 }
 
@@ -1344,31 +1286,15 @@ async fn measure_steady_workload<B: Backend>(
     .await?;
     let wall_seconds = wall_started.elapsed().as_secs_f64();
     phase_completed(spec, &measured_phase, measured_started);
+    let metrics = metric_capture.snapshot();
     let maintenance_started = Instant::now();
     wait_for_maintenance(metric_capture, settle_timeout(spec)).await?;
     let maintenance_drain_seconds = maintenance_started.elapsed().as_secs_f64();
-    let metrics = metric_capture.snapshot();
     let resources_after = ResourceSnapshot::capture()?;
     let backend_io = backend_counters.since(&backend_before);
     let recalls = workload.recall_values();
 
-    if spec.delete_driven
-        && metrics.counter(
-            "ktann.fixup.steps",
-            &[("kind", "merge"), ("result", "drained")],
-        ) == 0
-    {
-        return Err("delete workload performed no merge drains".to_owned());
-    }
     let successful_writes = workload.accepted_operations(OperationClass::Write);
-    if spec.delete_driven
-        && successful_writes
-            != u64::try_from(spec.measured_operations / 2)
-                .map_err(|_| "delete count exceeds u64".to_owned())?
-    {
-        return Err("delete workload did not complete every distinct deletion".to_owned());
-    }
-
     let write_amplification = (successful_writes > 0).then(|| WriteAmplification {
         successful_writes,
         logical_mutations_per_write: backend_io.mutation_operations as f64
@@ -1382,9 +1308,6 @@ async fn measure_steady_workload<B: Backend>(
     let measurements = SteadyStateMeasurements {
         wall_seconds,
         maintenance_drain_seconds,
-        post_delete_search: None,
-        maintenance: maintenance_summary(&metrics, metric_capture),
-        writes: metrics.write_attribution(),
         cpu_seconds: Some(resources_after.cpu_seconds_since(resources_before)),
         peak_rss_bytes: Some(resources_after.peak_rss_bytes()),
         throughput_per_second: if wall_seconds > 0.0 {
@@ -1829,8 +1752,6 @@ enum WorkItem {
         /// Exact truth only for read-only workloads whose model stays valid.
         truth: Option<ExactTruth>,
     },
-    /// One deletion of a distinct imported record.
-    Delete { id: Bytes },
     /// One replacement upsert derived from a stable base vector.
     Upsert {
         /// Fully validated Record constructed before operation timing starts.
@@ -1890,14 +1811,6 @@ fn work_items(
             let truth = truth.map(|truth| Arc::clone(&truth[query_index]));
             let request = search_request(dataset, spec, query_index)?;
             items.push(WorkItem::Search { request, truth });
-        } else if spec.delete_driven {
-            // This scenario alternates searches and distinct deletes. Deleting
-            // three quarters of the corpus makes initially full leaves merge.
-            let id = dataset
-                .ids
-                .get(operation / 2)
-                .ok_or_else(|| "delete workload exceeds the imported corpus".to_owned())?;
-            items.push(WorkItem::Delete { id: id.clone() });
         } else {
             let ordinal = if spec.hot_updates {
                 operation % dataset.base.len().min(8)
@@ -2084,20 +1997,6 @@ async fn execute_item<B: Backend>(
                         hit_ids: outcome.hits.iter().map(|hit| hit.id().clone()).collect(),
                         truth,
                     })
-                })
-                .map_err(|error| error.kind()),
-        ),
-        WorkItem::Delete { id } => (
-            OperationClass::Write,
-            index
-                .delete(id)
-                .await
-                .and_then(|deleted| {
-                    if deleted {
-                        Ok(None)
-                    } else {
-                        Err(ktann::api::Error::new(ErrorKind::Corruption))
-                    }
                 })
                 .map_err(|error| error.kind()),
         ),

@@ -406,23 +406,6 @@ fn compare_steady_state(
         candidate.recall_at_k.as_ref(),
         policy.maximum_recall_drop,
     );
-    match (&baseline.post_delete_search, &candidate.post_delete_search) {
-        (Some(baseline), Some(candidate)) => {
-            compare_lifecycle_search(result, key, "post-delete", baseline, candidate, policy)
-        }
-        (None, None) => {}
-        _ => result
-            .regressions
-            .push(format!("{key}: post-delete search availability changed")),
-    }
-    compare_write_attribution(
-        result,
-        key,
-        "workload",
-        &baseline.writes,
-        &candidate.writes,
-        policy.maximum_relative_regression,
-    );
     match (
         baseline.write_amplification.as_ref(),
         candidate.write_amplification.as_ref(),
@@ -1174,16 +1157,6 @@ fn compare_backend_io(
             baseline.point_read_keys,
             candidate.point_read_keys,
         ),
-        (
-            "point-read calls",
-            baseline.point_read_calls,
-            candidate.point_read_calls,
-        ),
-        (
-            "mutation calls",
-            baseline.mutation_calls,
-            candidate.mutation_calls,
-        ),
         ("scans", baseline.scans, candidate.scans),
         ("items read", baseline.items_read, candidate.items_read),
         ("bytes read", baseline.bytes_read, candidate.bytes_read),
@@ -1337,7 +1310,6 @@ mod tests {
                 tree_key_field_count: 1,
                 search_percent: 100,
                 hot_updates: false,
-                delete_driven: false,
                 min_partition_entries: 8,
                 max_partition_entries: 32,
                 partition_cache_bytes: 1024,

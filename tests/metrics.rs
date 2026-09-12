@@ -463,18 +463,6 @@ async fn operations_record_the_documented_series() {
         &[("operation", "batch_mutate"), ("outcome", "committed")]
     ));
     assert!(seen("ktann.fixup.drain.entries", &[("kind", "split")]));
-    for stage in [
-        "training_load",
-        "training_preprocess",
-        "training",
-        "relocation_apply",
-    ] {
-        assert!(seen(
-            "ktann.fixup.stage.duration",
-            &[("kind", "split"), ("stage", stage)]
-        ));
-    }
-    assert!(seen("ktann.fixup.source.level", &[("kind", "split")]));
     assert!(seen("ktann.fixup.state_age", &[("kind", "split")]));
     assert!(series.iter().any(|(name, _)| name == "ktann.fixup.backlog"));
 }
