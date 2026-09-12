@@ -354,6 +354,16 @@ pub async fn replace_record<T: WriteTxn>(
     target: &RecordLocation,
     entry: &LeafEntry,
 ) -> Result<()> {
+    let index = validated_input(txn, record, entry)?.logical_index_id();
+    let id = record.record_id();
+    expect_record(txn.get_for_update(record_key(index, id)).await?)?
+        .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
+    let location = expect_location(txn.get_for_update(location_key(index, id)).await?)?
+        .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
+    if &location != expected {
+        return Err(Error::new(ErrorKind::Corruption));
+    }
+
     let mut leaves = LeafAccumulator::new();
     replace_record_with_headers(
         txn,
@@ -375,6 +385,11 @@ pub async fn replace_record<T: WriteTxn>(
 ///
 /// Follows [`replace_record`], with every write queued into the shared
 /// `writes`: Header and Synopsis adjustments accumulate until its flush.
+///
+/// The caller must have update-protected and validated this Record/Location
+/// pair in the same transaction, with its location equal to `expected`. No
+/// intervening write may change that pair. Foreground batches use distinct
+/// Record IDs and obtain these locations through [`read_locations_for_update`].
 pub(crate) async fn replace_record_with_headers<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     writes: &mut WriteSinks<'_, '_>,
@@ -390,16 +405,6 @@ pub(crate) async fn replace_record_with_headers<T: WriteTxn>(
 
     let record_key = record_key(index, id);
     let location_key = location_key(index, id);
-    let existing = expect_record(txn.get_for_update(record_key.clone()).await?)?
-        .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
-    if existing.record_id() != id {
-        return Err(Error::new(ErrorKind::Corruption));
-    }
-    let location = expect_location(txn.get_for_update(location_key.clone()).await?)?
-        .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
-    if &location != expected {
-        return Err(Error::new(ErrorKind::Corruption));
-    }
 
     writes
         .deferred
@@ -544,16 +549,20 @@ pub async fn read_locations_for_update<T: WriteTxn>(
         keys.push(record_key(index, id));
         keys.push(location_key(index, id));
     }
-    let mut values = txn.batch_get_for_update(keys).await?.into_iter();
+    // Warm raw bytes together, then decode one pair at a time so even codec
+    // failures carry the Record ID's input position and old vectors are dropped
+    // immediately. The apply path consumes the validated location directly.
+    txn.warm_for_update(keys).await?;
     let mut locations = Vec::with_capacity(ids.len());
-    for position in 0..ids.len() {
-        let pair = match (values.next(), values.next()) {
-            (Some(record), Some(location)) => classify_location_pair(record, location)
-                .map_err(|error| error.at_position(position))?,
-            // The typed batch read returns exactly one value per input key.
-            _ => return Err(Error::new(ErrorKind::Backend)),
-        };
-        locations.push(pair);
+    for (position, id) in ids.iter().enumerate() {
+        let location = async {
+            let record = txn.get_for_update(record_key(index, id)).await?;
+            let location = txn.get_for_update(location_key(index, id)).await?;
+            classify_location_pair(record, location)
+        }
+        .await
+        .map_err(|error| error.at_position(position))?;
+        locations.push(location);
     }
     Ok(locations)
 }
@@ -586,9 +595,9 @@ pub(crate) enum MembershipPrefetch<'a> {
         payload: bool,
         target: &'a RecordLocation,
     },
-    /// A replacement's reads: the stored Record and Location, the target Leaf
-    /// Entry and leaf Synopsis, and the source Leaf Entry and leaf Header when
-    /// the move crosses leaves.
+    /// A replacement's reads: the target Leaf Entry and leaf Synopsis, and
+    /// the source Leaf Entry and leaf Header when the move crosses leaves.
+    /// Its Record/Location pair is already validated and update-protected.
     Replace {
         id: &'a Bytes,
         expected: &'a RecordLocation,
@@ -653,8 +662,6 @@ pub(crate) async fn prefetch_membership_for_update<T: WriteTxn>(
                 expected,
                 target,
             } => {
-                keys.push(record_key(index, id));
-                keys.push(location_key(index, id));
                 keys.push(entry_key(index, target, id));
                 if warmed_synopses.insert((target.tree_key().clone(), target.leaf())) {
                     keys.push(synopsis_key(index, target));
