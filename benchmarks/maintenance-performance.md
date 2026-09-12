@@ -185,6 +185,71 @@ benefit from batching parent-body scans here. Discovery, drain limits, workers,
 transaction admission, and numeric preprocessing retain their existing behavior.
 Large/deep-tree candidate-scan optimization remains a separate measured follow-up.
 
+## FoundationDB tail-latency follow-up
+
+A separate confirmation window ran on 2026-09-12, 03:19:26–03:49:05 UTC,
+with no competing build/test/benchmark task. Both full scenarios used twelve
+interleaved A/B pairs each (48 fresh worker/store runs total), alternating B/C
+and C/B. The initial six pairs left search tails inconclusive, so each scenario
+was extended once to a fixed total of twelve; sampling stopped at that bound.
+These results are separate from the earlier three-pair matrix, not pooled with it.
+
+The saved A/B binaries have the same harness and instrumentation and the retained
+training/relocation algorithms. Their SHA-256 hashes are
+`34edf0eced1871b89a2342f9d8972c02f13f91575a17082bf57a504c2eaf3a7a` (baseline) and
+`d92f9302c40f8d34bec9274f48aca71a94d1e3aeaf6254b01949ec88fc17200c` (candidate).
+The subsequent PR simplification only changed post-delete validation allocations,
+test setup, enum placement, and documentation; it did not change those algorithms.
+
+Before measurement, the tail gate was set to exclude an increase exceeding both
+10% and 1 ms. For each pair, the normalized difference is
+`(candidate - baseline) / max(0.10 * baseline, 1 ms)`; its one-sided bootstrap
+95% upper estimate must be at most one. Twelve-pair bounds use 100,000 paired
+resamples with seed 162. These are empirical uncertainty estimates for this local
+workload, not simultaneous confidence guarantees across all metrics. A small
+point estimate alone does not establish non-regression.
+
+| Tail metric | Median ms, baseline → candidate | Median paired change | One-sided 95% upper change | Gate |
+| --- | ---: | ---: | ---: | --- |
+| Import submission p95 | 148.474 → 144.957 | -5.02% | -0.12% | Pass |
+| Import submission p99 | 243.274 → 218.026 | -6.04% | -0.18% | Pass |
+| Immediate search p95 | 72.341 → 77.413 | +1.50% | +12.93% | Inconclusive |
+| Immediate search p99 | 114.556 → 108.509 | -3.48% | +0.93% | Pass |
+| Stable cold search p95 | 68.154 → 70.574 | +2.58% | +7.48% | Pass |
+| Stable cold search p99 | 88.780 → 83.270 | -0.83% | +8.52% | Pass |
+| Stable warm search p95 | 66.758 → 67.728 | +1.99% | +8.98% | Pass |
+| Stable warm search p99 | 71.374 → 72.753 | +2.48% | +12.84% | Inconclusive |
+| Delete workload write p95 | 8.997 → 9.249 | +1.78% | +5.34% | Pass |
+| Delete workload write p99 | 13.974 → 14.563 | +3.43% | +8.22% | Pass |
+| Delete workload search p95 | 31.877 → 31.547 | +0.50% | +16.43% | Inconclusive |
+| Delete workload search p99 | 48.523 → 46.379 | +0.44% | +4.56% | Pass |
+
+The independent medians and median paired changes differ because the latter
+compares adjacent runs before aggregation. Import wall time improved 8.21% by
+paired median, while complete lifecycle wall time improved 1.74%. Delete workload
+wall time was effectively flat (-0.27%). Client-process CPU fell 0.70% for the
+import lifecycle and 4.13% for deletes; peak RSS changed -0.03% and +1.99%.
+Read/mutation bytes were effectively unchanged. Retry medians were 135 → 135
+for the import lifecycle and 28 → 29.5 for deletes. No physical RPC claim follows
+from the API-call counters.
+
+All 48 runs completed final invariant verification and maintenance backlog was
+zero at the convergence/workload boundary. Every measured recall mean and minimum
+was 1.0; all delete workloads accepted all 3,750 deletes. Search truncation
+profiles retained the same limits as the original matrix.
+
+**Disposition:** delete write p99 passes the predeclared gate. Immediate search
+p95, stable warm search p99, and delete-workload search p95 remain inconclusive:
+their paired medians are only +1.50%, +2.48%, and +0.50%, but upper estimates still
+exceed 10% and 1 ms. This does not establish a repeatable regression or its cause,
+and does not establish the requested all-tail non-regression. Keep the PR in
+draft; do not change the threshold or continue sampling until a favorable result.
+The existing code commit passed all four GitHub CI jobs, including FoundationDB
+integration; CI success does not resolve this performance uncertainty.
+
+Raw JSONs, commands, hashes, the predeclared gate/extension record, analysis script,
+and verification audit are in `.benchmark-data/results/issue-162/fdb-confirmation/`.
+
 ## Correctness and verification
 
 The final version passed 577 core library and integration tests in release mode,
