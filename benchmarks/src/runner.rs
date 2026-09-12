@@ -8,8 +8,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use ktann::api::{
     DataType, ErrorKind, FieldId, FieldSchema, ImportOptions, ImportSession, Index, IndexConfig,
-    Metric, Mutation, MutationOutcome, OperationOptions, Record, RuntimeConfig, SearchBudgets,
-    SearchOptions, SearchRequest, Value, VerifyOptions,
+    Metric, Mutation, OperationOptions, Record, RuntimeConfig, SearchBudgets, SearchOptions,
+    SearchRequest, Value, VerifyOptions,
 };
 use ktann::runtime::Runtime;
 use ktann::storage::backend::Backend;
@@ -20,8 +20,8 @@ use crate::metrics::{CapturedMetrics, MetricCapture};
 use crate::report::{
     AdmissionTarget, BackendIo, BenchmarkReport, BudgetConfiguration, BudgetSummary, Configuration,
     ConvergencePhase, Distribution, Environment, ImportPhase, LifecycleMeasurements,
-    MaintenanceSummary, MutationWorkload, OperationClass, OperationSummary, PartitionStateCounts,
-    PhaseResources, QualityPoint, QualitySweepMeasurements, RecallSummary, ReportMeasurements,
+    MaintenanceSummary, OperationClass, OperationSummary, PartitionStateCounts, PhaseResources,
+    QualityPoint, QualitySweepMeasurements, RecallSummary, ReportMeasurements,
     SearchBudgetConfiguration, SearchPhase, SearchTruncation, SteadyStateMeasurements, Topology,
     WorkloadDispatch, WriteAmplification, aggregate_rejection_rate,
 };
@@ -76,10 +76,6 @@ pub struct ScenarioSpec {
     pub search_percent: u8,
     /// Whether updates concentrate on a small conflict set.
     pub hot_updates: bool,
-    /// Records per atomic batch in the timed workload.
-    pub mutation_batch_size: usize,
-    /// Deterministic membership transition exercised by each atomic batch.
-    pub mutation_workload: MutationWorkload,
     /// Runtime Partition Cache capacity.
     pub partition_cache_bytes: u64,
     /// Runtime foreground concurrency and wait bound.
@@ -125,65 +121,11 @@ pub fn scenarios(profile: &str) -> Result<Vec<ScenarioSpec>, String> {
     match profile {
         "smoke" => Ok(smoke_scenarios()),
         "full" => Ok(full_scenarios()),
-        "batch" => Ok(batch_scenarios()),
         "large" => large_scenarios(),
         _ => Err(format!(
-            "unknown profile `{profile}`; expected smoke, full, batch, or large"
+            "unknown profile `{profile}`; expected smoke, full, or large"
         )),
     }
-}
-
-/// Isolates atomic mutation costs on stable leaf topologies.
-fn batch_scenarios() -> Vec<ScenarioSpec> {
-    let common = smoke_scenarios().remove(0);
-    let mut scenarios: Vec<_> = [
-        ("batch-128-1-1", 128, 1, 1),
-        ("batch-128-32-1", 128, 32, 1),
-        ("batch-1536-1-1", 1536, 1, 1),
-        ("batch-1536-32-1", 1536, 32, 1),
-        ("batch-1536-128-1", 1536, 128, 1),
-        ("batch-1536-32-4", 1536, 32, 4),
-    ]
-    .into_iter()
-    .map(
-        |(name, dimension, mutation_batch_size, concurrency)| ScenarioSpec {
-            name,
-            profile: "batch",
-            base_vectors: 512,
-            query_vectors: 1,
-            dimension,
-            search_percent: 0,
-            mutation_batch_size,
-            concurrency,
-            warmup_operations: (2048 / mutation_batch_size).min(64),
-            measured_operations: (16_384 / mutation_batch_size).min(512),
-            max_partition_entries: 4096,
-            maintenance_workers: 0,
-            ..common.clone()
-        },
-    )
-    .collect();
-    let common = scenarios[3].clone();
-    for (name, mutation_workload) in [
-        ("batch-migrate-1536-32-1", MutationWorkload::Migrate),
-        ("batch-insert-1536-32-1", MutationWorkload::Insert),
-        ("batch-delete-1536-32-1", MutationWorkload::Delete),
-    ] {
-        scenarios.push(ScenarioSpec {
-            name,
-            mutation_workload,
-            base_vectors: if mutation_workload == MutationWorkload::Delete {
-                17_408
-            } else {
-                512
-            },
-            max_partition_entries: 32_768,
-            warmup_operations: 32,
-            measured_operations: 512,
-            ..common.clone()
-        });
-    }
-    scenarios
 }
 
 /// Small deterministic matrix used to catch runner and adapter breakage in CI.
@@ -200,8 +142,6 @@ fn smoke_scenarios() -> Vec<ScenarioSpec> {
         seed: 0x38_0001,
         search_percent: 100,
         hot_updates: false,
-        mutation_batch_size: 1,
-        mutation_workload: MutationWorkload::Upsert,
         partition_cache_bytes: 4 << 20,
         foreground_limit: 8,
         blocking_resource_limit: None,
@@ -261,8 +201,6 @@ fn smoke_scenarios() -> Vec<ScenarioSpec> {
             warmup_operations: 0,
             measured_operations: 8,
             hot_updates: false,
-            mutation_batch_size: 1,
-            mutation_workload: MutationWorkload::Upsert,
             blocking_resource_limit: None,
             dispatch: WorkloadDispatch::Continuous,
             ..common.clone()
@@ -284,8 +222,6 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
         seed,
         search_percent: 100,
         hot_updates: false,
-        mutation_batch_size: 1,
-        mutation_workload: MutationWorkload::Upsert,
         partition_cache_bytes: 64 << 20,
         foreground_limit: 32,
         blocking_resource_limit: None,
@@ -362,8 +298,6 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
             warmup_operations: 0,
             measured_operations: 100,
             hot_updates: false,
-            mutation_batch_size: 1,
-            mutation_workload: MutationWorkload::Upsert,
             blocking_resource_limit: None,
             dispatch: WorkloadDispatch::Continuous,
             // Adaptive admission starts at one and may probe up to four
@@ -393,8 +327,6 @@ fn large_scenarios() -> Result<Vec<ScenarioSpec>, String> {
         seed: 0x38_2001,
         search_percent: 100,
         hot_updates: false,
-        mutation_batch_size: 1,
-        mutation_workload: MutationWorkload::Upsert,
         partition_cache_bytes: 512 << 20,
         foreground_limit: 64,
         blocking_resource_limit: Some(64),
@@ -544,8 +476,6 @@ pub async fn run_scenario<B: Backend>(
             tree_key_field_count: index_config.tree_key_fields().len(),
             search_percent: spec.search_percent,
             hot_updates: spec.hot_updates,
-            mutation_batch_size: spec.mutation_batch_size,
-            mutation_workload: spec.mutation_workload,
             min_partition_entries: index_config.min_partition_entries(),
             max_partition_entries: index_config.max_partition_entries(),
             partition_cache_bytes: spec.partition_cache_bytes,
@@ -1605,7 +1535,9 @@ async fn rediscover_topology_work<B: Backend>(
 fn topology_is_settled(topology: &Topology, max_partition_entries: u32) -> bool {
     let leaf_entries = topology.entries_by_level.get(&1).copied().unwrap_or(0);
     let largest_leaf = topology.max_entries_by_level.get(&1).copied().unwrap_or(0);
-    leaf_entries == topology.vector_records
+    topology.partitions > 1
+        && topology.entries > topology.vector_records
+        && leaf_entries == topology.vector_records
         && largest_leaf <= max_partition_entries
         && topology.actionable_partitions == 0
         && topology.partition_states.transitional() == 0
@@ -1820,17 +1752,10 @@ enum WorkItem {
         /// Exact truth only for read-only workloads whose model stays valid.
         truth: Option<ExactTruth>,
     },
-    /// One replacement through the single-record public API.
+    /// One replacement upsert derived from a stable base vector.
     Upsert {
-        /// Fully validated record prepared outside operation timing.
+        /// Fully validated Record constructed before operation timing starts.
         record: Record,
-    },
-    /// One atomic batch, materialized outside operation timing.
-    Batch {
-        /// Distinct Record IDs within this batch.
-        mutations: Vec<Mutation>,
-        /// The successful result required for every member.
-        expected: MutationOutcome,
     },
 }
 
@@ -1887,17 +1812,15 @@ fn work_items(
             let request = search_request(dataset, spec, query_index)?;
             items.push(WorkItem::Search { request, truth });
         } else {
-            if spec.profile == "batch" {
-                items.push(batch_work_item(dataset, spec, operation)?);
-                continue;
-            }
             let ordinal = if spec.hot_updates {
                 operation % dataset.base.len().min(8)
             } else {
                 operation % dataset.base.len()
             };
             let mut vector = dataset.base[ordinal].to_vec();
-            // Toggle around the original vector so replacements never drift.
+            // Toggle one finite component around the original vector. Every
+            // operation remains a replacement rather than accumulating drift,
+            // so the workload is replayable under arbitrary task scheduling.
             vector[0] += if operation % 2 == 0 { 0.001 } else { -0.001 };
             let generation = i64::try_from(operation).unwrap_or(i64::MAX);
             let record = Record::new(
@@ -1910,64 +1833,6 @@ fn work_items(
         }
     }
     Ok(items)
-}
-
-/// Prepares one batch with observable membership changes and distinct IDs.
-fn batch_work_item(
-    dataset: &BenchmarkDataset,
-    spec: &ScenarioSpec,
-    operation: usize,
-) -> Result<WorkItem, String> {
-    let mut mutations = Vec::with_capacity(spec.mutation_batch_size);
-    for member in 0..spec.mutation_batch_size {
-        let sequence = operation * spec.mutation_batch_size + member;
-        let ordinal = sequence % dataset.base.len();
-        if spec.mutation_workload == MutationWorkload::Delete {
-            // Delete scenarios populate exactly warmup + measured Record IDs.
-            let id = dataset
-                .ids
-                .get(sequence)
-                .ok_or("delete workload exceeds populated IDs")?;
-            mutations.push(Mutation::Delete(id.clone()));
-            continue;
-        }
-        let id = if spec.mutation_workload == MutationWorkload::Insert {
-            Bytes::from(format!("insert-{sequence}"))
-        } else {
-            dataset.ids[ordinal].clone()
-        };
-        let bucket = if spec.mutation_workload == MutationWorkload::Migrate
-            && (sequence / dataset.base.len()) % 2 == 0
-        {
-            1 + (ordinal % 8) as i64
-        } else {
-            0
-        };
-        let mut vector = dataset.base[ordinal].to_vec();
-        vector[0] += if operation % 2 == 0 { 0.001 } else { -0.001 };
-        let record = Record::new(
-            id,
-            Arc::<[f32]>::from(vector),
-            vec![Value::I64(bucket), Value::I64(operation as i64)],
-        )
-        .map_err(|error| error_at("construct batch record", error))?;
-        mutations.push(if spec.mutation_workload == MutationWorkload::Insert {
-            Mutation::Insert(record)
-        } else {
-            Mutation::Upsert(record)
-        });
-    }
-    let expected = match spec.mutation_workload {
-        MutationWorkload::Insert => MutationOutcome::Inserted,
-        MutationWorkload::Delete => MutationOutcome::Deleted { existed: true },
-        MutationWorkload::Upsert | MutationWorkload::Migrate => {
-            MutationOutcome::Upserted { replaced: true }
-        }
-    };
-    Ok(WorkItem::Batch {
-        mutations,
-        expected,
-    })
 }
 
 /// Spreads a percentage mix uniformly instead of clustering one operation kind.
@@ -2142,23 +2007,6 @@ async fn execute_item<B: Backend>(
                 .await
                 .map(|_| None)
                 .map_err(|error| error.kind()),
-        ),
-        WorkItem::Batch {
-            mutations,
-            expected,
-        } => (
-            OperationClass::Write,
-            index
-                .batch_mutate(mutations)
-                .await
-                .map_err(|error| error.kind())
-                .and_then(|outcomes| {
-                    if outcomes.iter().all(|outcome| *outcome == expected) {
-                        Ok(None)
-                    } else {
-                        Err(ErrorKind::Corruption)
-                    }
-                }),
         ),
     };
     OperationObservation {

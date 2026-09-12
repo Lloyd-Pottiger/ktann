@@ -1310,8 +1310,6 @@ mod tests {
                 tree_key_field_count: 1,
                 search_percent: 100,
                 hot_updates: false,
-                mutation_batch_size: 1,
-                mutation_workload: crate::report::MutationWorkload::Upsert,
                 min_partition_entries: 8,
                 max_partition_entries: 32,
                 partition_cache_bytes: 1024,

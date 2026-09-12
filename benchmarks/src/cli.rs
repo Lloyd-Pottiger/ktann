@@ -828,7 +828,7 @@ fn shell_quote(value: &OsStr) -> String {
 
 /// Returns the stable help shown for missing or unknown public commands.
 fn usage() -> String {
-    "usage:\n  ktann-bench run --backend rocksdb|foundationdb [--profile smoke|full|batch|large] [--scenario NAME] [--worker-threads N] [--write-beam-size N] [--base-vectors N] [--query-vectors N] [--query-offset N] [--max-partition-entries N] [--maintenance-workers N] [--import-max-in-flight-batches N] [--import-batch-size N] [--import-backlog-watermark N] [--output PATH]\n  ktann-bench compare --baseline PATH --candidate PATH [--maximum-relative-regression N] [--maximum-recall-drop N] [--maximum-rejection-rate-increase N] [--output PATH]".to_owned()
+    "usage:\n  ktann-bench run --backend rocksdb|foundationdb [--profile smoke|full|large] [--scenario NAME] [--worker-threads N] [--write-beam-size N] [--base-vectors N] [--query-vectors N] [--query-offset N] [--max-partition-entries N] [--maintenance-workers N] [--import-max-in-flight-batches N] [--import-batch-size N] [--import-backlog-watermark N] [--output PATH]\n  ktann-bench compare --baseline PATH --candidate PATH [--maximum-relative-regression N] [--maximum-recall-drop N] [--maximum-rejection-rate-increase N] [--output PATH]".to_owned()
 }
 
 #[cfg(test)]

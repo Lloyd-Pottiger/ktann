@@ -356,14 +356,9 @@ pub async fn replace_record<T: WriteTxn>(
 ) -> Result<()> {
     let index = validated_input(txn, record, entry)?.logical_index_id();
     let id = record.record_id();
-    let record_key = record_key(index, id);
-    let location_key = location_key(index, id);
-    let existing = expect_record(txn.get_for_update(record_key.clone()).await?)?
+    expect_record(txn.get_for_update(record_key(index, id)).await?)?
         .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
-    if existing.record_id() != id {
-        return Err(Error::new(ErrorKind::Corruption));
-    }
-    let location = expect_location(txn.get_for_update(location_key.clone()).await?)?
+    let location = expect_location(txn.get_for_update(location_key(index, id)).await?)?
         .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
     if &location != expected {
         return Err(Error::new(ErrorKind::Corruption));
@@ -600,9 +595,9 @@ pub(crate) enum MembershipPrefetch<'a> {
         payload: bool,
         target: &'a RecordLocation,
     },
-    /// A replacement's reads: the stored Record and Location, the target Leaf
-    /// Entry and leaf Synopsis, and the source Leaf Entry and leaf Header when
-    /// the move crosses leaves.
+    /// A replacement's reads: the target Leaf Entry and leaf Synopsis, and
+    /// the source Leaf Entry and leaf Header when the move crosses leaves.
+    /// Its Record/Location pair is already validated and update-protected.
     Replace {
         id: &'a Bytes,
         expected: &'a RecordLocation,
@@ -667,8 +662,6 @@ pub(crate) async fn prefetch_membership_for_update<T: WriteTxn>(
                 expected,
                 target,
             } => {
-                keys.push(record_key(index, id));
-                keys.push(location_key(index, id));
                 keys.push(entry_key(index, target, id));
                 if warmed_synopses.insert((target.tree_key().clone(), target.leaf())) {
                     keys.push(synopsis_key(index, target));
