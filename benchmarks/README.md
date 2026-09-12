@@ -182,6 +182,47 @@ that declared operating region fails instead of emitting a statistically weak
 baseline. The smoke scenario measures 640 operations; the full scenario
 measures 2,000 operations.
 
+## Atomic batch mutation profile
+
+`--profile batch` measures `Index::batch_mutate` on both production adapters:
+
+```sh
+cargo run --release -p ktann-benchmarks --all-features --bin ktann-bench -- \
+  run --backend rocksdb --profile batch --worker-threads 4 --output batch.json
+```
+
+The replacement matrix uses 128- and 1536-dimensional vectors, batch sizes
+1, 32, and 128, and concurrency 1 or 4. Additional 1536-dimensional cases
+insert fresh IDs, delete disjoint existing IDs, and move existing records
+between their original Tree Key and eight other Tree Keys. Every successful
+batch must return the intended membership outcomes, so absent deletes and
+accidental insert-on-upsert cannot count as useful work. The single-record
+API calls in the existing `smoke` and `full` profiles remain unchanged.
+
+Dataset creation, initial loading, topology verification, and request
+materialization happen outside the timed region. Warmup precedes each
+measurement. These cases use workerless, settled leaf topologies to isolate
+foreground costs; they do not establish deep-tree or import-to-stable
+performance. Use `full` for maintenance/search interaction and `large` for
+import lifecycle and real-dataset quality measurements.
+
+Report schema v4 records `mutation_batch_size` and `mutation_workload` in the
+comparison configuration. Throughput remains successful **batches/s** in this
+profile; multiply by `mutation_batch_size` for **records/s**. Latency p50/p95/p99
+is per successful atomic batch. CPU, peak RSS, backend IO, commit counts, retry
+counts, and logical write amplification use the existing report fields;
+normalize per-batch counts by batch size when comparing per-record costs.
+Peak RSS includes setup and the materialized requests.
+
+Run baseline and candidate binaries serially on an otherwise idle host,
+alternate their order across at least three repetitions, and retain each
+JSON distribution. Concurrent benchmarks against the same FoundationDB
+server invalidate an isolated comparison. The batch profile does not measure
+allocator call counts or physical disk write amplification.
+
+See [the batch mutation investigation](batch-mutate-investigation.md) for
+measured candidate results, final disposition, and evidence limits.
+
 ## Comparing results
 
 Capture baseline and candidate suites on the same otherwise idle host, with

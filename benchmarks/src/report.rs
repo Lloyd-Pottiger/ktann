@@ -5,13 +5,28 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 /// Current complete benchmark suite/report JSON contract.
-pub const REPORT_SCHEMA_VERSION: u32 = 3;
+pub const REPORT_SCHEMA_VERSION: u32 = 4;
 
 /// Supplies the v2 default when decoding a report created before write-beam
 /// configuration became part of the report contract. The schema-version check
 /// still prevents comparing that report with a v3 report.
 const fn default_write_beam_size() -> u32 {
     1
+}
+
+/// Mutation contract exercised by a deterministic benchmark workload.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationWorkload {
+    /// Replace existing records within their original Tree Key.
+    #[default]
+    Upsert,
+    /// Move existing records between their original tree and eight other trees.
+    Migrate,
+    /// Insert fresh Record IDs on every operation.
+    Insert,
+    /// Delete a disjoint, previously populated Record ID set on every operation.
+    Delete,
 }
 
 /// Reports produced by one suite command on one comparable host.
@@ -94,6 +109,10 @@ pub struct Configuration {
     pub search_percent: u8,
     /// Whether writes target a small conflict set.
     pub hot_updates: bool,
+    /// Records per atomic batch in the timed workload.
+    pub mutation_batch_size: usize,
+    /// Atomic mutation workload; ordinary mixed scenarios use replacement upserts.
+    pub mutation_workload: MutationWorkload,
     /// Logical Index merge threshold.
     pub min_partition_entries: u32,
     /// Logical Index split threshold.

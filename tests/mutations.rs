@@ -1368,3 +1368,57 @@ async fn batched_deletes_read_membership_in_bounded_calls() {
         assert_record_absent(&index, &rid(i)).await;
     }
 }
+
+/// Decode failures in the Upsert subset retain the original batch position.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_upsert_corruption_keeps_input_position_and_rolls_back() {
+    use ktann::storage::backend::WriteTxn;
+    use ktann::storage::keys;
+
+    for corrupt_location in [false, true] {
+        let backend = backend(DeterministicConfig::default());
+        let runtime =
+            Runtime::new(backend.clone(), support::manual_maintenance_config()).expect("runtime");
+        let index = runtime
+            .create_index("corrupt-upsert", config())
+            .await
+            .expect("index");
+        index
+            .batch_mutate(vec![
+                Mutation::Insert(record(&rid(1), 1.0, 1)),
+                Mutation::Insert(record(&rid(2), 2.0, 1)),
+            ])
+            .await
+            .expect("seed records");
+        let key = if corrupt_location {
+            keys::location_key(index.logical_index_id(), &rid(2))
+        } else {
+            keys::record_key(index.logical_index_id(), &rid(2))
+        }
+        .expect("key");
+        let mut raw = backend.begin_write().await.expect("transaction");
+        raw.put(Bytes::from(key), Bytes::from_static(b"malformed"))
+            .await
+            .expect("corrupt value");
+        raw.commit().await.expect("commit corruption");
+
+        let error = index
+            .batch_mutate(vec![
+                Mutation::Insert(record(&rid(3), 3.0, 1)),
+                Mutation::Upsert(record(&rid(1), 4.0, 1)),
+                Mutation::Upsert(record(&rid(2), 5.0, 1)),
+            ])
+            .await
+            .expect_err("batch must fail closed");
+        assert_eq!(error.kind(), ErrorKind::Corruption);
+        assert_eq!(error.position(), Some(2));
+        assert_record_absent(&index, &rid(3)).await;
+        let existing = index
+            .get(rid(1), GetOptions::default())
+            .await
+            .expect("get")
+            .expect("record");
+        assert_eq!(existing.vector(), record(&rid(1), 1.0, 1).vector());
+        runtime.shutdown().await.expect("shutdown");
+    }
+}
