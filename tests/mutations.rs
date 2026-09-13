@@ -1092,7 +1092,7 @@ async fn widen_tree(backend: &SharedBackend, manifest: &IndexManifest, bucket: i
 async fn batched_inserts_share_routing_and_apply_writes_once() {
     let backend = backend(DeterministicConfig::default());
     // Exact backend operation counts are incompatible with background fixup
-    // workers: the 40 inserts over-fill both seeded leaves, and a worker that
+    // workers: the 43 inserts over-fill both seeded leaves, and a worker that
     // wakes inside the counted window adds its own reads (flaky on stable CI
     // since #102). This test drives no maintenance, so it runs workerless.
     let runtime = Runtime::new(backend.clone(), support::manual_maintenance_config())
@@ -1104,7 +1104,7 @@ async fn batched_inserts_share_routing_and_apply_writes_once() {
     let manifest = read_manifest(&backend, index.logical_index_id()).await;
     seed_grown_tree(&backend, &manifest, 1).await;
 
-    const N: usize = 40;
+    const N: usize = 43;
     backend.inner().reset_operation_counts();
     let outcomes = index
         .batch_mutate(
@@ -1150,18 +1150,18 @@ async fn batched_inserts_share_routing_and_apply_writes_once() {
         "batched update reads: {counts:?}"
     );
 
-    // Functional outcome: all 40 records split across the two leaves.
-    assert_eq!(leaf_member_ids(&backend, &manifest, 1, 2).await.len(), 20);
-    assert_eq!(leaf_member_ids(&backend, &manifest, 1, 3).await.len(), 20);
+    // All records, including a partial routing group, land in the correct leaf.
+    assert_eq!(leaf_member_ids(&backend, &manifest, 1, 2).await.len(), 22);
+    assert_eq!(leaf_member_ids(&backend, &manifest, 1, 3).await.len(), 21);
     // The committed Headers carry the exact per-item arithmetic the unbatched
     // sequence produced: one count increment and one cache-epoch bump per
     // record over the seeded epoch 0.
     let header_2 = read_header(&backend, &manifest, 1, 2).await;
-    assert_eq!(header_2.entry_count(), 20);
-    assert_eq!(header_2.cache_epoch(), 20);
+    assert_eq!(header_2.entry_count(), 22);
+    assert_eq!(header_2.cache_epoch(), 22);
     let header_3 = read_header(&backend, &manifest, 1, 3).await;
-    assert_eq!(header_3.entry_count(), 20);
-    assert_eq!(header_3.cache_epoch(), 20);
+    assert_eq!(header_3.entry_count(), 21);
+    assert_eq!(header_3.cache_epoch(), 21);
     for i in 0..N as u8 {
         assert!(
             index

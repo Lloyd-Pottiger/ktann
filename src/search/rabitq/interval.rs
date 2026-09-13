@@ -68,10 +68,95 @@ pub(super) fn approximate_distance(
         let reconstruction = scale * f64::from(signed_code);
         let product = query_component * reconstruction;
         dot += product;
-        dot_lower = add_down(dot_lower, multiply_down(query_component, reconstruction));
-        dot_upper = add_up(dot_upper, multiply_up(query_component, reconstruction));
+        (dot_lower, dot_upper) = extend_dot_interval(dot_lower, dot_upper, product);
     }
 
+    finish_distance(code, query, dot, dot_lower, dot_upper)
+}
+
+/// Interleaves independent scores without changing any score's accumulation order.
+/// Shared query loads and independent dependency chains reduce scoring work while
+/// retaining the scalar rough value and directed-rounding endpoints bit-for-bit.
+pub(super) fn approximate_distances(
+    codes: &[RaBitQ7<'_>; 4],
+    query: &RaBitQQuery<'_>,
+) -> Result<[ApproximateDistance; 4]> {
+    if codes
+        .iter()
+        .any(|code| code.dimension != query.components.len())
+    {
+        return Err(Error::invalid_argument());
+    }
+    let scales = codes.each_ref().map(|code| f64::from(code.scale));
+    let mut dots = [0.0_f64; 4];
+    let mut lowers = [0.0_f64; 4];
+    let mut uppers = [0.0_f64; 4];
+    for (index, &component) in query.components.iter().enumerate() {
+        let component = f64::from(component);
+        for lane in 0..4 {
+            let reconstruction = scales[lane] * f64::from(codes[lane].signed_code(index));
+            let product = component * reconstruction;
+            dots[lane] += product;
+            (lowers[lane], uppers[lane]) = extend_dot_interval(lowers[lane], uppers[lane], product);
+        }
+    }
+    let [a, b, c, d] = std::array::from_fn(|lane| {
+        finish_distance(&codes[lane], query, dots[lane], lowers[lane], uppers[lane])
+    });
+    Ok([a?, b?, c?, d?])
+}
+
+/// Extends a dot interval under the validated f32-query / packed-code bounds.
+///
+/// A nonzero product is at least 2^-298 and below 2^262: neither underflow nor
+/// overflow is possible. Its adjacent f64 values are also nonzero. With at most
+/// MAX_DIMENSION (16,384) terms, even outward-rounded sums stay below 2^277.
+/// These bounds let us share the product's neighbors and omit nonfinite cases
+/// while preserving the general multiply/add rounding rules, including zeros.
+fn extend_dot_interval(lower: f64, upper: f64, product: f64) -> (f64, f64) {
+    if product == 0.0 {
+        return (lower + product, upper + product);
+    }
+    let (product_lower, product_upper) = finite_neighbors(product);
+    let lower_sum = lower + product_lower;
+    let upper_sum = upper + product_upper;
+    (
+        if lower == 0.0 {
+            lower_sum
+        } else {
+            finite_neighbors(lower_sum).0
+        },
+        if upper == 0.0 {
+            upper_sum
+        } else {
+            finite_neighbors(upper_sum).1
+        },
+    )
+}
+
+/// Returns outward adjacent values for a finite, bounded dot product or sum.
+fn finite_neighbors(value: f64) -> (f64, f64) {
+    const SIGN: u64 = 1 << 63;
+    let bits = value.to_bits();
+    if bits & !SIGN == 0 {
+        return (f64::from_bits(SIGN | 1), f64::from_bits(1));
+    }
+    if bits & SIGN == 0 {
+        (f64::from_bits(bits - 1), f64::from_bits(bits + 1))
+    } else {
+        (f64::from_bits(bits + 1), f64::from_bits(bits - 1))
+    }
+}
+
+/// Converts a completed dot product and its bounds to a metric-specific interval.
+fn finish_distance(
+    code: &RaBitQ7<'_>,
+    query: &RaBitQQuery<'_>,
+    dot: f64,
+    dot_lower: f64,
+    dot_upper: f64,
+) -> Result<ApproximateDistance> {
+    let scale = f64::from(code.scale);
     let error_upper = f64::from(code.reconstruction_error_upper);
     let (rough, center_lower, center_upper, radius_upper, clamp_lower) = match query.metric {
         Metric::InnerProduct => {
@@ -133,4 +218,62 @@ pub(super) fn validate_distance(rough: f64, lower: f64, upper: f64) -> Result<()
         return Err(Error::invalid_argument());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extend_dot_interval;
+    use crate::api::MAX_DIMENSION;
+    use crate::search::rabitq::rounding::{add_down, add_up, multiply_down, multiply_up};
+
+    #[test]
+    fn finite_dot_updates_match_general_rounding_at_every_step() {
+        let values = [
+            0.0,
+            -0.0,
+            f32::from_bits(1),
+            -f32::from_bits(1),
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            1.0,
+            -1.0,
+            f32::MAX,
+            -f32::MAX,
+        ];
+        for scale in [0.0, f32::from_bits(1), f32::MIN_POSITIVE, 1.0, f32::MAX] {
+            for phase in 0..values.len() {
+                let zero = if phase % 2 == 0 { 0.0 } else { -0.0 };
+                let mut actual = (zero, zero);
+                let mut expected = (zero, zero);
+                for index in 0..MAX_DIMENSION {
+                    let left = f64::from(values[(index * 37 + phase) % values.len()]);
+                    let code = ((index * 19 + phase) % 127) as i16 - 63;
+                    let right = f64::from(scale) * f64::from(code);
+                    actual = extend_dot_interval(actual.0, actual.1, left * right);
+                    expected = (
+                        add_down(expected.0, multiply_down(left, right)),
+                        add_up(expected.1, multiply_up(left, right)),
+                    );
+                    assert_eq!(
+                        (actual.0.to_bits(), actual.1.to_bits()),
+                        (expected.0.to_bits(), expected.1.to_bits())
+                    );
+                }
+            }
+        }
+        // Cancellation can produce a zero sum even though both addends are nonzero.
+        for product in [1.0, -1.0, 2.0_f64.powi(-298), -2.0_f64.powi(-298)] {
+            for initial in [-multiply_down(product, 1.0), -multiply_up(product, 1.0)] {
+                let actual = extend_dot_interval(initial, initial, product);
+                let expected = (
+                    add_down(initial, multiply_down(product, 1.0)),
+                    add_up(initial, multiply_up(product, 1.0)),
+                );
+                assert_eq!(
+                    (actual.0.to_bits(), actual.1.to_bits()),
+                    (expected.0.to_bits(), expected.1.to_bits())
+                );
+            }
+        }
+    }
 }

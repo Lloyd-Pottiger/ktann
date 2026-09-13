@@ -72,6 +72,14 @@ impl<'a> RaBitQ7<'a> {
     ) -> Result<ApproximateDistance> {
         interval::approximate_distance(self, query)
     }
+
+    /// Scores four independent packed codes with the scalar arithmetic contract.
+    pub(crate) fn approximate_distances(
+        codes: &[Self; 4],
+        query: &RaBitQQuery<'_>,
+    ) -> Result<[ApproximateDistance; 4]> {
+        interval::approximate_distances(codes, query)
+    }
 }
 
 impl fmt::Debug for RaBitQ7<'_> {

@@ -636,7 +636,25 @@ impl Traversal {
             self.leaf_entry_budget_exhausted = true;
         }
         let mut batch = Vec::with_capacity(funded);
-        for entry in &entries[..funded] {
+        // Immutable bodies have already validated every code against the Manifest.
+        // Batch only funded entries; preserve their order and the scalar tail.
+        let mut chunks = entries[..funded].chunks_exact(4);
+        for entries in &mut chunks {
+            let codes = std::array::from_fn(|lane| {
+                RaBitQ7::from_validated_leaf_bytes(entries[lane].rabitq7(), dimension)
+            });
+            let distances = RaBitQ7::approximate_distances(&codes, context.query)
+                .map_err(|_| Error::new(ErrorKind::Corruption))?;
+            for (entry, distance) in entries.iter().zip(distances) {
+                batch.push(LeafCandidate::new(
+                    entry.record_id().clone(),
+                    entry.fields().into(),
+                    distance,
+                    RecordLocation::new(tree_key.clone(), partition),
+                ));
+            }
+        }
+        for entry in chunks.remainder() {
             // `load_body` decoded and validated every payload against this
             // Manifest before returning the immutable body. Reuse that
             // validation while scoring its packed codes without allocation.

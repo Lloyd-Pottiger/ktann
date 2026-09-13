@@ -353,6 +353,87 @@ fn packed_scores_match_expanded_reference_at_layout_and_numeric_boundaries() {
 }
 
 #[test]
+fn interleaved_scores_preserve_scalar_bits_at_numeric_and_layout_boundaries() {
+    let values = [
+        0.0,
+        -0.0,
+        f32::from_bits(1),
+        -f32::from_bits(1),
+        f32::MIN_POSITIVE,
+        -f32::MIN_POSITIVE,
+        0.1,
+        -7.0,
+        f32::MAX,
+        -f32::MAX,
+    ];
+    for dimension in [
+        1,
+        2,
+        3,
+        4,
+        7,
+        8,
+        9,
+        15,
+        16,
+        17,
+        65,
+        127,
+        128,
+        129,
+        768,
+        MAX_DIMENSION,
+    ] {
+        let components: Vec<f32> = (0..dimension)
+            .map(|index| values[index % values.len()])
+            .collect();
+        let payloads: [_; 4] = std::array::from_fn(|lane| {
+            let codes: Vec<i8> = (0..dimension)
+                .map(|index| ((index * 37 + lane * 19) % 127) as i8 - 63)
+                .collect();
+            let (scale, error) = [
+                (0.0, 0.0),
+                (f32::from_bits(1), f32::MIN_POSITIVE),
+                (1.0, 0.1),
+                (f32::MAX, f32::MAX),
+            ][lane];
+            independently_encode_payload(&codes, scale, error)
+        });
+        let codes = payloads
+            .each_ref()
+            .map(|payload| RaBitQ7::decode(payload, dimension).unwrap());
+        for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
+            let query = RaBitQQuery::new(&components, metric).unwrap();
+            let distances = RaBitQ7::approximate_distances(&codes, &query).unwrap();
+            for (code, distance) in codes.iter().zip(distances) {
+                let scalar = code.approximate_distance(&query).unwrap();
+                assert_distance_bits_equal(distance, scalar);
+            }
+        }
+    }
+}
+
+#[test]
+fn interleaved_scores_reject_a_dimension_mismatch_in_every_lane() {
+    let matching = RaBitQ7::quantize(&[1.0, -1.0]).unwrap();
+    let short = RaBitQ7::quantize(&[1.0]).unwrap();
+    let query = RaBitQQuery::new(&[1.0, -1.0], Metric::L2).unwrap();
+    for mismatched_lane in 0..4 {
+        let codes = std::array::from_fn(|lane| {
+            if lane == mismatched_lane {
+                RaBitQ7::decode(&short, 1).unwrap()
+            } else {
+                RaBitQ7::decode(&matching, 2).unwrap()
+            }
+        });
+        assert_kind(
+            RaBitQ7::approximate_distances(&codes, &query),
+            ErrorKind::InvalidArgument,
+        );
+    }
+}
+
+#[test]
 fn leaf_overlap_obeys_formula_cap_and_stable_ordering() {
     let candidates = (0_u16..300)
         .map(|index| candidate(index, f64::from(index), 0.0, 1_000.0 + f64::from(index)))

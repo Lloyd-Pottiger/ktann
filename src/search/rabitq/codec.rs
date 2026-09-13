@@ -124,12 +124,15 @@ pub(super) fn from_validated_bytes(encoded: &[u8], dimension: usize) -> RaBitQ7<
 impl RaBitQ7<'_> {
     /// Expands one signed code at a time in scalar accumulation order.
     pub(super) fn signed_codes(&self) -> impl ExactSizeIterator<Item = i8> + '_ {
-        (0..self.dimension).map(|index| {
-            let negative =
-                self.signs[index / u8::BITS as usize] & (1_u8 << (index % u8::BITS as usize)) != 0;
-            let magnitude = decode_magnitude(self.magnitudes, index) as i8;
-            if negative { -magnitude } else { magnitude }
-        })
+        (0..self.dimension).map(|index| self.signed_code(index))
+    }
+
+    /// Decodes one component from the canonical packed streams.
+    pub(super) fn signed_code(&self, index: usize) -> i8 {
+        let negative =
+            self.signs[index / u8::BITS as usize] & (1_u8 << (index % u8::BITS as usize)) != 0;
+        let magnitude = decode_magnitude(self.magnitudes, index) as i8;
+        if negative { -magnitude } else { magnitude }
     }
 }
 

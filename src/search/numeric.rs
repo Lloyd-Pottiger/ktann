@@ -141,6 +141,46 @@ impl VectorKernel {
         }
     }
 
+    /// Computes independent routing distances against one shared centroid.
+    ///
+    /// Interleaving vectors exposes independent accumulators to the compiler
+    /// without reassociating any vector's scalar-f64 additions. Every lane is
+    /// bit-for-bit identical to `routing_distance`, including signed zero.
+    pub(crate) fn routing_distances<const N: usize>(
+        &self,
+        routings: [&[f32]; N],
+        centroid: &[f32],
+    ) -> Result<[f64; N]> {
+        for routing in routings {
+            validate_vector(routing, self.dimension, VectorSource::Caller)?;
+        }
+        validate_vector(centroid, self.dimension, VectorSource::Persistent)?;
+        let mut distances = [0.0; N];
+        match self.metric {
+            Metric::L2 => {
+                for (dimension, &component) in centroid.iter().enumerate() {
+                    let component = f64::from(component);
+                    for lane in 0..N {
+                        let difference = f64::from(routings[lane][dimension]) - component;
+                        distances[lane] += difference * difference;
+                    }
+                }
+            }
+            Metric::Cosine | Metric::InnerProduct => {
+                for (dimension, &component) in centroid.iter().enumerate() {
+                    let component = f64::from(component);
+                    for lane in 0..N {
+                        distances[lane] += f64::from(routings[lane][dimension]) * component;
+                    }
+                }
+                for distance in &mut distances {
+                    *distance = -*distance;
+                }
+            }
+        }
+        Ok(distances)
+    }
+
     /// Computes the exact scalar-f64 distance to one committed Vector Record.
     ///
     /// The query is caller-owned, whereas the record is decoded persistent
@@ -707,6 +747,76 @@ mod tests {
             }
         }
         assert_eq!(hash, 0x2398_08d9_e8ca_5477);
+    }
+
+    #[test]
+    fn interleaved_routing_preserves_scalar_distance_bits() {
+        let mut random = ChaCha8::new(SEED);
+        let extremes = [
+            0.0,
+            -0.0,
+            f32::MAX,
+            -f32::MAX,
+            f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            1.0,
+            -1.0,
+        ];
+        for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
+            for dimension in [1, 2, 3, 7, 16, 17, 128, 768, MAX_DIMENSION] {
+                let kernel = VectorKernel::new(dimension, metric, SEED).unwrap();
+                for trial in 0..12 {
+                    let mut component = || {
+                        let bits = random.next_u32().unwrap();
+                        if trial == 0 {
+                            0.0
+                        } else if trial == 1 {
+                            extremes[bits as usize % extremes.len()]
+                        } else {
+                            // Clear one exponent bit to keep arbitrary signs,
+                            // mantissas and broad finite magnitudes.
+                            f32::from_bits(bits & 0xfeff_ffff)
+                        }
+                    };
+                    let centroid: Vec<_> = (0..dimension).map(|_| component()).collect();
+                    let vectors: [Vec<f32>; 4] =
+                        std::array::from_fn(|_| (0..dimension).map(|_| component()).collect());
+                    let distances = kernel
+                        .routing_distances(vectors.each_ref().map(Vec::as_slice), &centroid)
+                        .unwrap();
+                    for (vector, distance) in vectors.iter().zip(distances) {
+                        assert_eq!(
+                            distance.to_bits(),
+                            kernel
+                                .routing_distance(vector, &centroid)
+                                .unwrap()
+                                .to_bits(),
+                            "metric={metric:?} dimension={dimension} trial={trial}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn interleaved_routing_validates_every_lane_and_centroid() {
+        let kernel = VectorKernel::new(2, Metric::L2, SEED).unwrap();
+        let valid = [1.0, 2.0];
+        for invalid in [&[1.0][..], &[1.0, f32::NAN], &[f32::INFINITY, 1.0]] {
+            for lane in 0..4 {
+                let mut vectors = [&valid[..]; 4];
+                vectors[lane] = invalid;
+                assert_kind(
+                    kernel.routing_distances(vectors, &valid),
+                    ErrorKind::InvalidArgument,
+                );
+            }
+            assert_kind(
+                kernel.routing_distances([&valid; 4], invalid),
+                ErrorKind::Corruption,
+            );
+        }
     }
 
     #[test]
