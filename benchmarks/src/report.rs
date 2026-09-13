@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 /// Current complete benchmark suite/report JSON contract.
-pub const REPORT_SCHEMA_VERSION: u32 = 3;
+pub const REPORT_SCHEMA_VERSION: u32 = 4;
 
 /// Supplies the v2 default when decoding a report created before write-beam
 /// configuration became part of the report contract. The schema-version check
@@ -273,14 +273,42 @@ pub enum ReportMeasurements {
     /// Import-to-search lifecycle phase measurements.
     Lifecycle(Box<LifecycleMeasurements>),
     /// Ordered single-variable ANN quality points over one converged index.
-    QualitySweep(QualitySweepMeasurements),
+    QualitySweep(Box<QualitySweepMeasurements>),
 }
 
 /// Measurements for one ordered leaf-beam quality curve.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct QualitySweepMeasurements {
+    /// Construction through the first complete, maintenance-converged audit.
+    pub construction: ConstructionMeasurements,
     /// Points ordered from the narrowest beam through the production default.
     pub points: Vec<QualityPoint>,
+}
+
+/// Construction costs before oracle preparation and query warmup.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ConstructionMeasurements {
+    /// Continuous elapsed time from import start through verified convergence.
+    pub wall_seconds: f64,
+    /// Process CPU across the same complete construction interval.
+    pub cpu_seconds: Option<f64>,
+    /// Whole-worker peak RSS at construction end, including dataset loading.
+    pub peak_rss_bytes: Option<u64>,
+    /// Foreground import, including concurrent Structure Maintenance.
+    pub import: ConstructionPhase,
+    /// Remaining maintenance, rediscovery and complete topology verification.
+    pub convergence: ConstructionPhase,
+}
+
+/// Resource, admission and cache observations for one construction interval.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ConstructionPhase {
+    /// Wall time, process resources, logical IO and write/maintenance work.
+    pub resources: PhaseResources,
+    /// Gate waits and native actor occupancy; these can overlap wall time.
+    pub admission: AdmissionSummary,
+    /// Cache activity and accounted bytes at the phase boundary.
+    pub cache: CacheSummary,
 }
 
 /// One fully measured leaf-beam point.
@@ -431,6 +459,9 @@ pub struct WriteAttribution {
     pub mutation_bytes: BTreeMap<String, u64>,
     /// Native commit wait grouped by operation and commit outcome.
     pub commit_wait_ms: BTreeMap<String, Distribution>,
+    /// Mutation attempt phase elapsed times, including errors/cancellation.
+    /// Concurrent attempts overlap; these are not additive process wall times.
+    pub mutation_stage_ms: BTreeMap<String, Distribution>,
 }
 
 /// Structure Maintenance work observed in one accounting phase.

@@ -49,6 +49,28 @@ impl SearchStage {
     }
 }
 
+/// Disjoint phases of one foreground mutation attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MutationStage {
+    /// Snapshot routing and update-protected route validation.
+    Routing,
+    /// Existing Location reads and advisory membership prefetch.
+    Prefetch,
+    /// Input-order membership construction, buffered writes and discoveries.
+    Apply,
+}
+
+impl MutationStage {
+    /// Returns the bounded metric label value.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Routing => "routing",
+            Self::Prefetch => "prefetch",
+            Self::Apply => "apply",
+        }
+    }
+}
+
 /// One observed foreground operation or maintenance write step (key
 /// `operation`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

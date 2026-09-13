@@ -216,6 +216,11 @@ impl CapturedMetrics {
     #[must_use]
     pub fn write_attribution(&self) -> WriteAttribution {
         WriteAttribution {
+            mutation_stage_ms: self
+                .distributions_rendered("ktann.mutation.stage.duration")
+                .into_iter()
+                .map(|(labels, distribution)| (labels, distribution.seconds_to_milliseconds()))
+                .collect(),
             attempts: self.counters_rendered("ktann.write.attempts"),
             retries: self.counters_rendered("ktann.write.retries"),
             mutation_operations: self.counters_rendered("ktann.write.mutations"),
@@ -388,7 +393,14 @@ mod tests {
             vec![0.001, 0.003],
         );
 
+        captured.histograms.insert(
+            SeriesKey::new("ktann.mutation.stage.duration", &[("stage", "routing")]),
+            vec![0.004, 0.006],
+        );
         let writes = captured.write_attribution();
+        let routing = &writes.mutation_stage_ms["stage=routing"];
+        assert_eq!(routing.count, 2);
+        assert_eq!(routing.mean, 5.0);
         assert_eq!(
             writes
                 .attempts

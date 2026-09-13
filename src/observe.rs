@@ -27,6 +27,7 @@
 //! | `ktann.operation.duration` | histogram | operation, outcome |
 //! | `ktann.foreground.admission` | counter | operation, outcome |
 //! | `ktann.write.retries` | counter | operation |
+//! | `ktann.mutation.stage.duration` | histogram | stage |
 //! | `ktann.write.attempts` | counter | operation, outcome |
 //! | `ktann.write.mutations` | counter | operation, outcome |
 //! | `ktann.write.mutation_bytes` | counter | operation, outcome |

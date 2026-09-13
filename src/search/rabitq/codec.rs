@@ -71,77 +71,66 @@ pub(super) fn quantize(vector: &[f32]) -> Result<Bytes> {
     )
 }
 
-pub(super) fn decode(encoded: &[u8], dimension: usize) -> Result<RaBitQ7> {
-    encoded_len(dimension).map_err(|_| corrupt())?;
-    let mut signed_codes = allocate_codes(dimension)?;
-    let metadata = parse(encoded, dimension, |code| signed_codes.push(code))?;
-    Ok(RaBitQ7 {
-        scale: metadata.scale,
-        code_norm_squared: metadata.code_norm_squared,
-        reconstruction_error_upper: metadata.reconstruction_error_upper,
-        signed_codes: signed_codes.into_boxed_slice(),
-    })
-}
-
-pub(super) fn validate(encoded: &[u8], dimension: usize) -> Result<()> {
-    parse(encoded, dimension, |_| {}).map(|_| ())
-}
-
-struct Metadata {
-    scale: f32,
-    code_norm_squared: u32,
-    reconstruction_error_upper: f32,
-}
-
-fn parse(encoded: &[u8], dimension: usize, mut accept_code: impl FnMut(i8)) -> Result<Metadata> {
+pub(super) fn decode(encoded: &[u8], dimension: usize) -> Result<RaBitQ7<'_>> {
     let expected_len = encoded_len(dimension).map_err(|_| corrupt())?;
     if encoded.len() != expected_len || !padding_is_zero(encoded, dimension) {
         return Err(corrupt());
     }
 
-    let scale_bits = read_u32_le(encoded, 0);
-    let code_norm_squared = read_u32_le(encoded, 4);
-    let error_bits = read_u32_le(encoded, 8);
-    let scale = f32::from_bits(scale_bits);
-    let reconstruction_error_upper = f32::from_bits(error_bits);
-    if !canonical_nonnegative(scale) || !canonical_nonnegative(reconstruction_error_upper) {
+    let code = from_validated_bytes(encoded, dimension);
+    if !canonical_nonnegative(code.scale) || !canonical_nonnegative(code.reconstruction_error_upper)
+    {
         return Err(corrupt());
     }
 
-    let sign_start = HEADER_BYTES;
-    let magnitude_start = sign_start + sign_bytes(dimension);
     let mut actual_norm = 0_u32;
     for index in 0..dimension {
-        let negative = encoded[sign_start + index / u8::BITS as usize]
-            & (1_u8 << (index % u8::BITS as usize))
-            != 0;
-        let magnitude = decode_magnitude(&encoded[magnitude_start..], index);
+        let negative =
+            code.signs[index / u8::BITS as usize] & (1_u8 << (index % u8::BITS as usize)) != 0;
+        let magnitude = decode_magnitude(code.magnitudes, index);
         if magnitude == 0 && negative {
             return Err(corrupt());
         }
-        let code = if negative {
-            -(magnitude as i8)
-        } else {
-            magnitude as i8
-        };
-        accept_code(code);
         actual_norm = actual_norm
             .checked_add(u32::from(magnitude).pow(2))
             .ok_or_else(corrupt)?;
     }
 
-    if actual_norm != code_norm_squared {
+    if actual_norm != code.code_norm_squared {
         return Err(corrupt());
     }
-    if code_norm_squared == 0 && (scale_bits != 0 || error_bits != 0) {
+    if code.code_norm_squared == 0
+        && (code.scale.to_bits() != 0 || code.reconstruction_error_upper.to_bits() != 0)
+    {
         return Err(corrupt());
     }
 
-    Ok(Metadata {
-        scale,
-        code_norm_squared,
-        reconstruction_error_upper,
-    })
+    Ok(code)
+}
+
+/// Reads metadata and borrows streams after their layout has been established.
+pub(super) fn from_validated_bytes(encoded: &[u8], dimension: usize) -> RaBitQ7<'_> {
+    let magnitude_start = HEADER_BYTES + sign_bytes(dimension);
+    RaBitQ7 {
+        scale: f32::from_bits(read_u32_le(encoded, 0)),
+        code_norm_squared: read_u32_le(encoded, 4),
+        reconstruction_error_upper: f32::from_bits(read_u32_le(encoded, 8)),
+        dimension,
+        signs: &encoded[HEADER_BYTES..magnitude_start],
+        magnitudes: &encoded[magnitude_start..],
+    }
+}
+
+impl RaBitQ7<'_> {
+    /// Expands one signed code at a time in scalar accumulation order.
+    pub(super) fn signed_codes(&self) -> impl ExactSizeIterator<Item = i8> + '_ {
+        (0..self.dimension).map(|index| {
+            let negative =
+                self.signs[index / u8::BITS as usize] & (1_u8 << (index % u8::BITS as usize)) != 0;
+            let magnitude = decode_magnitude(self.magnitudes, index) as i8;
+            if negative { -magnitude } else { magnitude }
+        })
+    }
 }
 
 fn zero_code(encoded_len: usize) -> Result<Bytes> {

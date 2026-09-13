@@ -456,6 +456,9 @@ async fn operations_record_the_documented_series() {
     for stage in ["approximate_selection", "exact_reranking"] {
         assert!(seen("ktann.search.stage.duration", &[("stage", stage)]));
     }
+    for stage in ["routing", "prefetch", "apply"] {
+        assert!(seen("ktann.mutation.stage.duration", &[("stage", stage)]));
+    }
     assert!(seen("ktann.import.wait", &[("gate", "in_flight_slot")]));
     assert!(seen("ktann.import.wait", &[("gate", "backlog")]));
     assert!(seen(

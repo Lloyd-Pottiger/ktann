@@ -190,7 +190,7 @@ fn add(counter: &AtomicU64, value: usize) {
 }
 
 /// Computes the timed-region delta from two monotonic snapshots.
-fn subtract(after: BackendIo, before: &BackendIo) -> BackendIo {
+pub(crate) fn subtract(after: BackendIo, before: &BackendIo) -> BackendIo {
     after
         .checked_sub(before)
         .expect("monotonic Backend counters never decrease")

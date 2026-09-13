@@ -2,12 +2,117 @@ use bytes::Bytes;
 use num_bigint::BigInt;
 use proptest::prelude::*;
 
-use crate::api::{ErrorKind, Metric};
+use crate::api::{ErrorKind, MAX_DIMENSION, Metric};
+
+use super::rounding::{add_down, add_up, multiply_down, multiply_up, next_down, next_up, sqrt_up};
 
 use super::{
     ApproximateCandidate, ApproximateDistance, RaBitQ7, RaBitQQuery, select_global_overlap,
     select_leaf_overlap,
 };
+
+#[test]
+fn adjacent_values_cover_ieee_boundaries() {
+    // Literal neighbors cover signed zeros, subnormal/normal transitions,
+    // ordinary positive/negative values, infinities, and unchanged NaN payloads.
+    let cases: [(u64, u64, u64); 18] = [
+        (
+            0x0000_0000_0000_0000,
+            0x0000_0000_0000_0001,
+            0x8000_0000_0000_0001,
+        ),
+        (
+            0x8000_0000_0000_0000,
+            0x0000_0000_0000_0001,
+            0x8000_0000_0000_0001,
+        ),
+        (
+            0x0000_0000_0000_0001,
+            0x0000_0000_0000_0002,
+            0x0000_0000_0000_0000,
+        ),
+        (
+            0x8000_0000_0000_0001,
+            0x8000_0000_0000_0000,
+            0x8000_0000_0000_0002,
+        ),
+        (
+            0x000f_ffff_ffff_ffff,
+            0x0010_0000_0000_0000,
+            0x000f_ffff_ffff_fffe,
+        ),
+        (
+            0x800f_ffff_ffff_ffff,
+            0x800f_ffff_ffff_fffe,
+            0x8010_0000_0000_0000,
+        ),
+        (
+            0x0010_0000_0000_0000,
+            0x0010_0000_0000_0001,
+            0x000f_ffff_ffff_ffff,
+        ),
+        (
+            0x8010_0000_0000_0000,
+            0x800f_ffff_ffff_ffff,
+            0x8010_0000_0000_0001,
+        ),
+        (
+            0x3ff0_0000_0000_0000,
+            0x3ff0_0000_0000_0001,
+            0x3fef_ffff_ffff_ffff,
+        ),
+        (
+            0xbff0_0000_0000_0000,
+            0xbfef_ffff_ffff_ffff,
+            0xbff0_0000_0000_0001,
+        ),
+        (
+            0x7fef_ffff_ffff_ffff,
+            0x7ff0_0000_0000_0000,
+            0x7fef_ffff_ffff_fffe,
+        ),
+        (
+            0xffef_ffff_ffff_ffff,
+            0xffef_ffff_ffff_fffe,
+            0xfff0_0000_0000_0000,
+        ),
+        (
+            0x7ff0_0000_0000_0000,
+            0x7ff0_0000_0000_0000,
+            0x7fef_ffff_ffff_ffff,
+        ),
+        (
+            0xfff0_0000_0000_0000,
+            0xffef_ffff_ffff_ffff,
+            0xfff0_0000_0000_0000,
+        ),
+        (
+            0x7ff0_0000_0000_0001,
+            0x7ff0_0000_0000_0001,
+            0x7ff0_0000_0000_0001,
+        ),
+        (
+            0xfff0_1234_5678_abcd,
+            0xfff0_1234_5678_abcd,
+            0xfff0_1234_5678_abcd,
+        ),
+        (
+            0x7ff8_1234_5678_abcd,
+            0x7ff8_1234_5678_abcd,
+            0x7ff8_1234_5678_abcd,
+        ),
+        (
+            0xfff8_0000_0000_0001,
+            0xfff8_0000_0000_0001,
+            0xfff8_0000_0000_0001,
+        ),
+    ];
+    for (bits, upper, lower) in cases {
+        let value = f64::from_bits(bits);
+        assert_eq!(next_up(value).to_bits(), upper, "input bits={bits:016x}");
+        assert_eq!(next_down(value).to_bits(), lower, "input bits={bits:016x}");
+    }
+}
 
 #[test]
 fn zero_vector_has_the_canonical_all_zero_payload() {
@@ -84,6 +189,9 @@ fn caller_input_and_arithmetic_fail_as_invalid_argument() {
     assert_kind(RaBitQ7::quantize(&[f32::NAN]), ErrorKind::InvalidArgument);
 
     let encoded = RaBitQ7::quantize(&[1.0, -1.0]).expect("fixture is encodable");
+    for dimension in [0, MAX_DIMENSION + 1] {
+        assert_corruption(RaBitQ7::decode(&encoded, dimension));
+    }
     let code = RaBitQ7::decode(&encoded, 2).expect("fixture decodes");
     let short_query = RaBitQQuery::new(&[1.0], Metric::L2).expect("finite query");
     assert_kind(
@@ -190,6 +298,61 @@ fn conservative_intervals_cover_mixed_exponents_and_dot_cancellation() {
 }
 
 #[test]
+fn packed_scores_match_expanded_reference_at_layout_and_numeric_boundaries() {
+    let query_values = [
+        0.0,
+        -0.0,
+        f32::from_bits(1),
+        -f32::from_bits(1),
+        f32::MIN_POSITIVE,
+        -f32::MIN_POSITIVE,
+        0.1,
+        -7.0,
+        f32::MAX,
+        -f32::MAX,
+    ];
+    // These lengths straddle both packed streams' byte boundaries and cover
+    // every signed magnitude at every stream offset, through the dimension cap.
+    for dimension in [
+        1,
+        2,
+        3,
+        4,
+        7,
+        8,
+        9,
+        15,
+        16,
+        17,
+        65,
+        127,
+        128,
+        129,
+        768,
+        MAX_DIMENSION,
+    ] {
+        let codes: Vec<i8> = (0..dimension)
+            .map(|index| ((index * 37 % 127) as i16 - 63) as i8)
+            .collect();
+        let components: Vec<f32> = (0..dimension)
+            .map(|index| query_values[index % query_values.len()])
+            .collect();
+        for (scale, error) in [
+            (0.0, 0.0),
+            (0.0, f32::from_bits(1)),
+            (f32::from_bits(1), f32::MIN_POSITIVE),
+            (1.0, 0.0),
+            (f32::MAX, f32::MAX),
+        ] {
+            let encoded = independently_encode_payload(&codes, scale, error);
+            assert_validated_packed_parity(&encoded, &components);
+        }
+        let zero = RaBitQ7::quantize(&vec![0.0; dimension]).expect("zero vector is encodable");
+        assert_validated_packed_parity(&zero, &components);
+    }
+}
+
+#[test]
 fn leaf_overlap_obeys_formula_cap_and_stable_ordering() {
     let candidates = (0_u16..300)
         .map(|index| candidate(index, f64::from(index), 0.0, 1_000.0 + f64::from(index)))
@@ -244,6 +407,13 @@ fn global_overlap_uses_kth_upper_endpoint_then_rerank_cap() {
 
 proptest! {
     #[test]
+    fn adjacent_values_match_floating_reference(bits in any::<u64>()) {
+        let value = f64::from_bits(bits);
+        prop_assert_eq!(next_up(value).to_bits(), floating_reference_next_up(value).to_bits());
+        prop_assert_eq!(next_down(value).to_bits(), floating_reference_next_down(value).to_bits());
+    }
+
+    #[test]
     fn payloads_are_deterministic_and_intervals_cover_brute_force(
         pairs in prop::collection::vec((-10_000_i16..=10_000, -10_000_i16..=10_000), 1..65)
     ) {
@@ -273,6 +443,7 @@ proptest! {
             let prepared = RaBitQQuery::new(&query, metric).expect("generated query is valid");
             let interval = decoded.approximate_distance(&prepared)
                 .expect("generated distance is finite");
+            assert_distance_bits_equal(interval, expanded_reference_distance(&first, &query, metric));
             prop_assert!(interval.lower() <= exact,
                 "lower {} excluded exact {} for {:?}", interval.lower(), exact, metric);
             prop_assert!(exact <= interval.upper(),
@@ -299,6 +470,10 @@ proptest! {
             let prepared = RaBitQQuery::new(&components, metric).expect("finite query is valid");
             let interval = decoded.approximate_distance(&prepared)
                 .expect("f32 inputs stay finite in scalar f64");
+            assert_distance_bits_equal(
+                interval,
+                expanded_reference_distance(&encoded, &components, metric),
+            );
             prop_assert!(interval.lower() <= exact && exact <= interval.upper());
         }
     }
@@ -432,6 +607,178 @@ fn candidate(index: u16, rough: f64, lower: f64, upper: f64) -> ApproximateCandi
         distance,
         index,
     )
+}
+
+/// Exercises the same trusted constructor used after a validated body load.
+fn assert_validated_packed_parity(encoded: &[u8], components: &[f32]) {
+    RaBitQ7::validate(encoded, components.len()).expect("fixture is canonical");
+    let code = RaBitQ7::from_validated_leaf_bytes(encoded, components.len());
+    for metric in [Metric::InnerProduct, Metric::Cosine, Metric::L2] {
+        let query = RaBitQQuery::new(components, metric).expect("finite query is valid");
+        let distance = code
+            .approximate_distance(&query)
+            .expect("distance is finite");
+        assert_distance_bits_equal(
+            distance,
+            expanded_reference_distance(encoded, components, metric),
+        );
+    }
+}
+
+fn assert_distance_bits_equal(actual: ApproximateDistance, expected: ApproximateDistance) {
+    assert_eq!(
+        [
+            actual.rough().to_bits(),
+            actual.lower().to_bits(),
+            actual.upper().to_bits()
+        ],
+        [
+            expected.rough().to_bits(),
+            expected.lower().to_bits(),
+            expected.upper().to_bits()
+        ],
+    );
+}
+
+/// Writes each stream bit independently of the production packing arithmetic.
+fn independently_encode_payload(codes: &[i8], scale: f32, error: f32) -> Vec<u8> {
+    let magnitude_start = 12 + codes.len().div_ceil(8);
+    let mut encoded = vec![0_u8; magnitude_start + (codes.len() * 6).div_ceil(8)];
+    let norm: u32 = codes
+        .iter()
+        .map(|code| u32::from(code.unsigned_abs()).pow(2))
+        .sum();
+    encoded[0..4].copy_from_slice(&scale.to_bits().to_le_bytes());
+    encoded[4..8].copy_from_slice(&norm.to_le_bytes());
+    encoded[8..12].copy_from_slice(&error.to_bits().to_le_bytes());
+    for (index, &code) in codes.iter().enumerate() {
+        if code < 0 {
+            encoded[12 + index / 8] |= 1 << (index % 8);
+        }
+        for bit in 0..6 {
+            if code.unsigned_abs() & (1 << bit) != 0 {
+                let offset = index * 6 + bit;
+                encoded[magnitude_start + offset / 8] |= 1 << (offset % 8);
+            }
+        }
+    }
+    encoded
+}
+
+/// Expanded scalar reference for bit-exact rough values and interval endpoints.
+fn expanded_reference_distance(
+    encoded: &[u8],
+    components: &[f32],
+    metric: Metric,
+) -> ApproximateDistance {
+    let signed_codes = independently_decode_codes(encoded, components.len());
+    let scale = f32::from_bits(read_u32_le(encoded, 0));
+    let code_norm_squared = read_u32_le(encoded, 4);
+    let reconstruction_error_upper = f32::from_bits(read_u32_le(encoded, 8));
+    let mut norm_squared = 0.0_f64;
+    let mut norm_squared_lower = 0.0_f64;
+    let mut norm_squared_upper = 0.0_f64;
+    for &component in components {
+        let component = f64::from(component);
+        norm_squared += component * component;
+        norm_squared_lower = add_down(norm_squared_lower, multiply_down(component, component));
+        norm_squared_upper = add_up(norm_squared_upper, multiply_up(component, component));
+    }
+    let scale = f64::from(scale);
+    let mut dot = 0.0_f64;
+    let mut dot_lower = 0.0_f64;
+    let mut dot_upper = 0.0_f64;
+    for (&query_component, &signed_code) in components.iter().zip(&signed_codes) {
+        let query_component = f64::from(query_component);
+        let reconstruction = scale * f64::from(signed_code);
+        let product = query_component * reconstruction;
+        dot += product;
+        dot_lower = add_down(dot_lower, multiply_down(query_component, reconstruction));
+        dot_upper = add_up(dot_upper, multiply_up(query_component, reconstruction));
+    }
+
+    let error_upper = f64::from(reconstruction_error_upper);
+    let (rough, center_lower, center_upper, radius_upper, clamp_lower) = match metric {
+        Metric::InnerProduct => {
+            let radius = multiply_up(sqrt_up(norm_squared_upper), error_upper);
+            (-dot, -dot_upper, -dot_lower, radius, false)
+        }
+        Metric::Cosine => {
+            let radius = multiply_up(sqrt_up(norm_squared_upper), error_upper);
+            (
+                1.0 - dot,
+                add_down(1.0, -dot_upper),
+                add_up(1.0, -dot_lower),
+                radius,
+                false,
+            )
+        }
+        Metric::L2 => {
+            let reconstruction_norm_squared = scale * scale * f64::from(code_norm_squared);
+            let reconstruction_norm_squared_lower =
+                multiply_down(multiply_down(scale, scale), f64::from(code_norm_squared));
+            let reconstruction_norm_squared_upper =
+                multiply_up(multiply_up(scale, scale), f64::from(code_norm_squared));
+            let rough = (norm_squared + reconstruction_norm_squared - 2.0 * dot).max(0.0);
+            let lower = add_down(
+                add_down(norm_squared_lower, reconstruction_norm_squared_lower),
+                -multiply_up(2.0, dot_upper),
+            )
+            .max(0.0);
+            let upper = add_up(
+                add_up(norm_squared_upper, reconstruction_norm_squared_upper),
+                -multiply_down(2.0, dot_lower),
+            )
+            .max(0.0);
+            let root_distance_upper = sqrt_up(upper);
+            let linear_error = multiply_up(multiply_up(2.0, root_distance_upper), error_upper);
+            let squared_error = multiply_up(error_upper, error_upper);
+            let radius = add_up(linear_error, squared_error);
+            (rough, lower, upper, radius, true)
+        }
+    };
+
+    let mut lower = add_down(center_lower, -radius_upper);
+    if clamp_lower {
+        lower = lower.max(0.0);
+    }
+    let upper = add_up(center_upper, radius_upper);
+    ApproximateDistance::from_conservative_bounds(rough, lower, upper)
+        .expect("finite expanded reference interval")
+}
+
+/// Floating comparisons independently select the upward neighbor for the bit oracle.
+fn floating_reference_next_up(value: f64) -> f64 {
+    if value.is_nan() || value == f64::INFINITY {
+        return value;
+    }
+    if value == 0.0 {
+        return f64::from_bits(1);
+    }
+
+    let bits = value.to_bits();
+    if value > 0.0 {
+        f64::from_bits(bits + 1)
+    } else {
+        f64::from_bits(bits - 1)
+    }
+}
+
+/// Floating comparisons independently select the downward neighbor for the bit oracle.
+fn floating_reference_next_down(value: f64) -> f64 {
+    if value.is_nan() || value == f64::NEG_INFINITY {
+        return value;
+    }
+    if value == 0.0 {
+        return -f64::from_bits(1);
+    }
+
+    let bits = value.to_bits();
+    if value > 0.0 {
+        f64::from_bits(bits - 1)
+    } else {
+        f64::from_bits(bits + 1)
+    }
 }
 
 fn finite_f32() -> impl Strategy<Value = f32> {

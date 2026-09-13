@@ -52,7 +52,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use bytes::Bytes;
 
 use crate::api::{Error, ErrorKind, Mutation, MutationOutcome, PartitionKey, Record, Result};
-use crate::observe::labels::Operation;
+use crate::observe::labels::{MutationStage, Operation};
+use crate::observe::metrics;
 use crate::runtime::import::ImportPermit;
 use crate::runtime::lifecycle::{RetryPolicy, now_unix_millis};
 use crate::runtime::{OperationContext, writes};
@@ -169,6 +170,7 @@ async fn apply_all<T: WriteTxn>(
 ) -> Result<ApplyOutcome> {
     debug_assert_eq!(mutations.len(), prepared.len());
     let started_at = now_unix_millis();
+    let routing_timer = metrics::mutation_stage_started(MutationStage::Routing);
     let (targets, draining_sources) =
         match route_all(txn, kernel, prepared, started_at, write_beam_size).await? {
             RouteAll::Routed {
@@ -179,8 +181,12 @@ async fn apply_all<T: WriteTxn>(
             // nothing and retries whole.
             RouteAll::NoReadyMergeTarget => return Ok(ApplyOutcome::NoReadyMergeTarget),
         };
+    drop(routing_timer);
+    let prefetch_timer = metrics::mutation_stage_started(MutationStage::Prefetch);
     let expected = read_locations(txn, mutations).await?;
     prefetch_membership(txn, mutations, prepared, &targets, &expected).await;
+    drop(prefetch_timer);
+    let _apply_timer = metrics::mutation_stage_started(MutationStage::Apply);
     let mut deferred = txn.mutations();
     let mut leaves = membership::LeafAccumulator::new();
     let mut writes = membership::WriteSinks {

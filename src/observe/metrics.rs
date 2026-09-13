@@ -4,14 +4,14 @@
 //! bounded enums in [`super::labels`]. All helpers are no-ops until a metrics
 //! recorder is installed.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::api::{SearchBudgetExhaustion, SearchBudgetUsage, VerifyIssueKind, VerifyReport};
 use crate::search::cache::PartitionKind;
 
 use super::labels::{
     BudgetDimension, CacheInstallResult, CacheLookupResult, FixupAdmission, FixupExecution,
-    FixupKind, FixupStepResult, ImportConcurrencyAdjustment, ImportGate, Operation,
+    FixupKind, FixupStepResult, ImportConcurrencyAdjustment, ImportGate, MutationStage, Operation,
     OperationOutcome, SearchStage, VerifyCompletion, WriteAttemptOutcome, cache_level, key,
     verify_issue,
 };
@@ -30,6 +30,7 @@ pub(crate) mod names {
     pub(crate) const SEARCH_BUDGET_USAGE: &str = "ktann.search.budget.usage";
     pub(crate) const SEARCH_BUDGET_EXHAUSTED: &str = "ktann.search.budget.exhausted";
     pub(crate) const SEARCH_STAGE_DURATION: &str = "ktann.search.stage.duration";
+    pub(crate) const MUTATION_STAGE_DURATION: &str = "ktann.mutation.stage.duration";
     pub(crate) const CACHE_LOOKUP: &str = "ktann.cache.lookup";
     pub(crate) const CACHE_INSTALL: &str = "ktann.cache.install";
     pub(crate) const CACHE_BYTES: &str = "ktann.cache.bytes";
@@ -122,6 +123,33 @@ pub(crate) fn write_commit_finished(
         key::OUTCOME => outcome.as_str(),
     )
     .record(duration.as_secs_f64());
+}
+
+/// Measures an attempt phase, including early errors and cancelled futures.
+///
+/// Elapsed times include awaited work and overlap other concurrent operations;
+/// their sum is service/wait time, not a decomposition of process wall time.
+pub(crate) fn mutation_stage_started(stage: MutationStage) -> MutationStageTimer {
+    MutationStageTimer {
+        stage,
+        started: Instant::now(),
+    }
+}
+
+/// Scope-owned observation so unsuccessful attempts retain their elapsed cost.
+pub(crate) struct MutationStageTimer {
+    stage: MutationStage,
+    started: Instant,
+}
+
+impl Drop for MutationStageTimer {
+    fn drop(&mut self) {
+        metrics::histogram!(
+            names::MUTATION_STAGE_DURATION,
+            key::STAGE => self.stage.as_str(),
+        )
+        .record(self.started.elapsed().as_secs_f64());
+    }
 }
 
 /// Records the logical budget usage and exhaustion of one search.
@@ -326,6 +354,42 @@ mod tests {
     }
 
     #[test]
+    fn mutation_stages_retain_errors_and_cancelled_work() {
+        use std::future::{Future, pending};
+        use std::task::{Context, Waker};
+
+        let (recorder, snapshotter) = recorder();
+        metrics::with_local_recorder(&recorder, || {
+            let fail = || -> Result<(), ()> {
+                let _timer = mutation_stage_started(MutationStage::Apply);
+                Err(())
+            };
+            assert!(fail().is_err());
+
+            let mut cancelled = Box::pin(async {
+                let _timer = mutation_stage_started(MutationStage::Routing);
+                pending::<()>().await;
+            });
+            assert!(
+                cancelled
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            drop(cancelled);
+        });
+        let values = snapshotter.snapshot().into_vec();
+        assert_eq!(values.len(), 2);
+        for (key, _, _, value) in values {
+            assert_eq!(key.key().name(), names::MUTATION_STAGE_DURATION);
+            let DebugValue::Histogram(samples) = value else {
+                panic!("duration histogram")
+            };
+            assert_eq!(samples.len(), 1);
+        }
+    }
+
+    #[test]
     fn emissions_use_only_allowlisted_labels() {
         let (recorder, snapshotter) = recorder();
         metrics::with_local_recorder(&recorder, || {
@@ -349,6 +413,7 @@ mod tests {
                 },
             );
             search_stage_finished(SearchStage::ApproximateSelection, Duration::from_millis(1));
+            drop(mutation_stage_started(MutationStage::Routing));
             cache_lookup(PartitionKind::Leaf, CacheLookupResult::Hit);
             cache_install(PartitionKind::Internal, CacheInstallResult::SkippedStale);
             cache_bytes(512);
@@ -399,6 +464,7 @@ mod tests {
             names::SEARCH_BUDGET_USAGE,
             names::SEARCH_BUDGET_EXHAUSTED,
             names::SEARCH_STAGE_DURATION,
+            names::MUTATION_STAGE_DURATION,
             names::CACHE_LOOKUP,
             names::CACHE_INSTALL,
             names::CACHE_BYTES,

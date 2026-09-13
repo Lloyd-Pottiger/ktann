@@ -291,6 +291,36 @@ fn compare_quality_sweep(
     candidate: &QualitySweepMeasurements,
     policy: ComparisonPolicy,
 ) {
+    relative_regression(
+        result,
+        key,
+        "construction wall seconds",
+        baseline.construction.wall_seconds,
+        candidate.construction.wall_seconds,
+        policy.maximum_relative_regression,
+    );
+    compare_optional_resource(
+        result,
+        key,
+        "construction CPU seconds",
+        baseline.construction.cpu_seconds,
+        candidate.construction.cpu_seconds,
+        policy.maximum_relative_regression,
+    );
+    compare_optional_resource(
+        result,
+        key,
+        "construction peak RSS bytes",
+        baseline
+            .construction
+            .peak_rss_bytes
+            .map(|bytes| bytes as f64),
+        candidate
+            .construction
+            .peak_rss_bytes
+            .map(|bytes| bytes as f64),
+        policy.maximum_relative_regression,
+    );
     if baseline.points.len() != candidate.points.len()
         || baseline
             .points
@@ -1405,18 +1435,20 @@ mod tests {
         let ReportMeasurements::SteadyState(measurements) = baseline.measurements else {
             panic!("steady fixture")
         };
-        baseline.measurements = ReportMeasurements::QualitySweep(QualitySweepMeasurements {
-            points: vec![
-                QualityPoint {
-                    leaf_beam_size: 1,
-                    measurements: (*measurements).clone(),
-                },
-                QualityPoint {
-                    leaf_beam_size: 32,
-                    measurements: (*measurements).clone(),
-                },
-            ],
-        });
+        baseline.measurements =
+            ReportMeasurements::QualitySweep(Box::new(QualitySweepMeasurements {
+                construction: Default::default(),
+                points: vec![
+                    QualityPoint {
+                        leaf_beam_size: 1,
+                        measurements: (*measurements).clone(),
+                    },
+                    QualityPoint {
+                        leaf_beam_size: 32,
+                        measurements: (*measurements).clone(),
+                    },
+                ],
+            }));
         let mut candidate = baseline.clone();
         let ReportMeasurements::QualitySweep(sweep) = &mut candidate.measurements else {
             panic!("quality fixture")
@@ -1435,6 +1467,44 @@ mod tests {
                 .iter()
                 .any(|regression| regression.contains("leaf_beam=32")
                     && regression.contains("throughput"))
+        );
+    }
+
+    #[test]
+    fn quality_comparison_includes_construction_cost() {
+        let mut baseline = report();
+        baseline.configuration.leaf_beam_sweep = vec![1];
+        let ReportMeasurements::SteadyState(measurements) = baseline.measurements else {
+            panic!("steady fixture")
+        };
+        let construction = crate::report::ConstructionMeasurements {
+            wall_seconds: 10.0,
+            ..Default::default()
+        };
+        baseline.measurements =
+            ReportMeasurements::QualitySweep(Box::new(QualitySweepMeasurements {
+                construction,
+                points: vec![QualityPoint {
+                    leaf_beam_size: 1,
+                    measurements: *measurements,
+                }],
+            }));
+        let mut candidate = baseline.clone();
+        let ReportMeasurements::QualitySweep(sweep) = &mut candidate.measurements else {
+            panic!("quality fixture")
+        };
+        sweep.construction.wall_seconds = 20.0;
+        let comparison = compare(
+            &suite(baseline),
+            &suite(candidate),
+            ComparisonPolicy::default(),
+        )
+        .expect("comparable curves");
+        assert!(
+            comparison
+                .regressions
+                .iter()
+                .any(|r| r.contains("construction wall seconds"))
         );
     }
 

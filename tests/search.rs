@@ -215,6 +215,91 @@ async fn search_matches_brute_force_and_reports_exact_usage() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn packed_search_preserves_results_and_budgets_across_cache_modes() {
+    let vectors: [[f32; 9]; 4] = [
+        [1.0, -2.0, 3.0, 0.0, 0.5, -0.5, 4.0, -4.0, 2.0],
+        [1.0, -2.0, 3.0, 0.0, 0.5, -0.5, 4.0, -4.0, 2.0],
+        [-3.0, 4.0, 2.0, -1.0, 0.25, 1.0, -2.0, 3.0, 1.0],
+        [2.0, 1.0, -4.0, 3.0, -0.25, 2.0, 1.0, -1.0, 4.0],
+    ];
+    let hit_bits = |outcome: &SearchOutcome| {
+        outcome
+            .hits
+            .iter()
+            .map(|hit| (hit.id().clone(), hit.distance().to_bits()))
+            .collect::<Vec<_>>()
+    };
+    for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
+        let backend = shared_backend(DeterministicConfig::default());
+        let setup_runtime = make_runtime(backend.clone());
+        let index = setup_runtime
+            .create_index(
+                "cache-parity",
+                IndexConfig::new(9, metric).expect("valid config"),
+            )
+            .await
+            .expect("create index");
+        for (id, vector) in [b"a", b"b", b"c", b"d"].into_iter().zip(vectors) {
+            let record = Record::new(Bytes::from_static(id), Arc::from(vector), vec![])
+                .expect("valid record");
+            index.insert(record).await.expect("insert record");
+        }
+        setup_runtime
+            .shutdown()
+            .await
+            .expect("shutdown setup runtime");
+
+        // Reopen the same persistent index with a fresh cache in each mode.
+        // The first uncached result is the control for this metric; duplicate
+        // vectors exercise ties and the leaf budget leaves one entry unfunded.
+        let mut control: Option<SearchOutcome> = None;
+        for capacity in [0, 1, 1 << 20] {
+            let runtime_config = support::manual_maintenance_config()
+                .with_partition_cache_bytes(capacity)
+                .expect("valid cache capacity");
+            let runtime = Runtime::new(backend.clone(), runtime_config).expect("valid runtime");
+            let index = runtime
+                .open_index("cache-parity")
+                .await
+                .expect("open index");
+            let mut scans = [0; 2];
+            for scan_count in &mut scans {
+                let options = SearchOptions::default()
+                    .with_visited_leaf_entries(3)
+                    .expect("valid leaf budget");
+                let request = SearchRequest::new(Arc::from(vectors[0]), 2)
+                    .expect("valid query")
+                    .with_options(options);
+                backend.inner().reset_operation_counts();
+                let outcome = index.search(request).await.expect("search");
+                *scan_count = backend.inner().operation_counts().scan;
+                assert_eq!(outcome.hits.len(), 2);
+                assert_eq!(outcome.usage.visited_partitions, 1);
+                assert_eq!(outcome.usage.visited_leaf_entries, 3);
+                assert!(outcome.exhausted.visited_leaf_entries);
+                if let Some(expected) = &control {
+                    assert_eq!(hit_bits(&outcome), hit_bits(expected));
+                    assert_eq!(outcome.usage, expected.usage);
+                    assert_eq!(outcome.exhausted, expected.exhausted);
+                    assert_eq!(
+                        outcome.rabitq_overlap_truncated,
+                        expected.rabitq_overlap_truncated
+                    );
+                } else {
+                    control = Some(outcome);
+                }
+            }
+            // The cold search scans the directory and the one leaf body. A
+            // retained body removes exactly that body scan on the rerun;
+            // disabled and oversized caches must read it again.
+            assert!(scans[0] >= 2);
+            assert_eq!(scans[1], scans[0] - usize::from(capacity > 1));
+            runtime.shutdown().await.expect("shutdown");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multi_tree_fanout_merges_one_deterministic_order() {
     let (_backend, runtime, index) = setup().await;
     let rows = fanout_rows();

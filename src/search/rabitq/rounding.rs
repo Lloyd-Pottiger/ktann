@@ -1,37 +1,44 @@
 //! Directed scalar-f64 rounding used by conservative numeric bounds.
 
+// With the IEEE-754 sign bit removed, infinity precedes every NaN encoding.
+// Preserve NaN bits unchanged; other nonzero values follow unsigned bit order,
+// reversed for negatives. Each infinity is fixed only in its outward direction.
+const SIGN_BIT: u64 = 0x8000_0000_0000_0000;
+const MAGNITUDE_MASK: u64 = 0x7fff_ffff_ffff_ffff;
+const INFINITY_BITS: u64 = 0x7ff0_0000_0000_0000;
+
 /// Returns the adjacent representable f64 toward positive infinity.
 pub(super) fn next_up(value: f64) -> f64 {
-    if value.is_nan() || value == f64::INFINITY {
+    let bits = value.to_bits();
+    let magnitude = bits & MAGNITUDE_MASK;
+    if magnitude > INFINITY_BITS || bits == INFINITY_BITS {
         return value;
     }
-    if value == 0.0 {
+    if magnitude == 0 {
         return f64::from_bits(1);
     }
-
-    let bits = value.to_bits();
-    if value > 0.0 {
-        f64::from_bits(bits + 1)
+    f64::from_bits(if bits & SIGN_BIT == 0 {
+        bits + 1
     } else {
-        f64::from_bits(bits - 1)
-    }
+        bits - 1
+    })
 }
 
 /// Returns the adjacent representable f64 toward negative infinity.
 pub(super) fn next_down(value: f64) -> f64 {
-    if value.is_nan() || value == f64::NEG_INFINITY {
+    let bits = value.to_bits();
+    let magnitude = bits & MAGNITUDE_MASK;
+    if magnitude > INFINITY_BITS || bits == (SIGN_BIT | INFINITY_BITS) {
         return value;
     }
-    if value == 0.0 {
-        return -f64::from_bits(1);
+    if magnitude == 0 {
+        return f64::from_bits(SIGN_BIT | 1);
     }
-
-    let bits = value.to_bits();
-    if value > 0.0 {
-        f64::from_bits(bits - 1)
+    f64::from_bits(if bits & SIGN_BIT == 0 {
+        bits - 1
     } else {
-        f64::from_bits(bits + 1)
-    }
+        bits + 1
+    })
 }
 
 /// Adds two values and rounds the result upward.

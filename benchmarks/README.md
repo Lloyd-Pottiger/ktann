@@ -56,10 +56,18 @@ otherwise idle hosts.
 The separate `large` profile is an optimized scheduled/manual quality run and
 never runs in smoke CI. It loads the fixed external inputs described in
 [`datasets/README.md`](datasets/README.md), creates one converged index per
-dataset, and sweeps leaf beam `1, 4, 8, 16, 32` while holding the four Search
+dataset, and sweeps leaf beam `1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128`
+while holding the four Search
 Budgets, k-derived exact-rerank policy, `k`, Runtime limits, Index configuration,
 concurrency, dataset, and Backend fixed. The curves use Cohere 1M with cosine
 and SIFT1M with L2, each with 1,000 held-out queries and supplied ground truth.
+
+The large quality curve keeps request `k=10` and the same 1,000 distinct queries,
+with 10,000 measured operations per beam. Repeated queries reduce timing noise;
+they are not additional independent recall samples. The effective
+rerank limit remains 64, so high recall targets may be unreachable with this
+query policy. Compare actual operating points at equal or better recall;
+interpolated curves do not establish latency or throughput non-regression.
 
 ```sh
 cargo run --release -p ktann-benchmarks --bin ktann-bench -- \
@@ -100,11 +108,21 @@ records the adapter's physical key-prefix charge alongside its mutation-count
 and mutation-byte ceilings:
 `steady_state` for the existing workload cases, `lifecycle` for the
 `import-to-search-lifecycle` case, or `quality_sweep` for an ordered large ANN
-curve. The lifecycle case does not change the setup
-exclusions or workload semantics of the steady-state scenarios described below.
+curve. A quality sweep also reports construction from import start through the
+first complete, maintenance-converged topology audit: continuous total wall/CPU,
+whole-worker peak RSS at that boundary, and separate import/convergence resources,
+logical IO, write/maintenance activity, admission and cache summaries. Concurrent
+maintenance is already inside import; convergence includes subsequent rediscovery
+and verification. Dataset/index creation, metric-summary rendering, oracle
+preparation and query warmup are outside construction. Raw import metric samples
+are retained through the bounded convergence phase and released before queries. Construction RSS still includes earlier dataset
+loading because it is a process-lifetime high-water mark.
 
-Setup is excluded from the wall-clock, CPU, latency, throughput, metric, and
-Backend-IO deltas. Setup includes dataset loading, index creation and batch
+The lifecycle case and quality-sweep construction accounting do not change the
+setup exclusions or workload semantics of the search points described below.
+
+For steady-state workloads and quality-sweep search points, setup is excluded
+from the wall-clock, CPU, latency, throughput, metric, and Backend-IO deltas. Setup includes dataset loading, index creation and batch
 load, demand-driven topology convergence, verification, brute-force oracle
 construction for ordinary scenarios, supplied ground-truth validation for
 large scenarios, operation materialization, cache warmup, and draining
@@ -112,6 +130,13 @@ warmup's Structure Maintenance backlog. A second invariant audit runs after
 measurement.
 Peak RSS is different: the operating-system high-water mark necessarily covers
 the entire isolated worker, including setup and warmup.
+
+Mutation stage durations cover routing (including protected route validation),
+Location/membership prefetch, and buffered membership application. They retain
+failed/cancelled work and overlap concurrent operations; they are aggregate
+elapsed service/wait times, not percentages that sum to wall time. Transaction
+open/manifest checks, preprocessing and retry waits are not separately timed by
+these three probes. Logical scan calls/bytes are not physical IO requests.
 
 The timed workload reports:
 

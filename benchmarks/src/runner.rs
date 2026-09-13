@@ -14,16 +14,17 @@ use ktann::api::{
 use ktann::runtime::Runtime;
 use ktann::storage::backend::Backend;
 
-use crate::backend::{BackendCounters, MeasuredBackend};
+use crate::backend::{BackendCounters, MeasuredBackend, subtract};
 use crate::dataset::{self, BenchmarkDataset};
 use crate::metrics::{CapturedMetrics, MetricCapture};
 use crate::report::{
     AdmissionTarget, BackendIo, BenchmarkReport, BudgetConfiguration, BudgetSummary, Configuration,
-    ConvergencePhase, Distribution, Environment, ImportPhase, LifecycleMeasurements,
-    MaintenanceSummary, OperationClass, OperationSummary, PartitionStateCounts, PhaseResources,
-    QualityPoint, QualitySweepMeasurements, RecallSummary, ReportMeasurements,
-    SearchBudgetConfiguration, SearchPhase, SearchTruncation, SteadyStateMeasurements, Topology,
-    WorkloadDispatch, WriteAmplification, aggregate_rejection_rate,
+    ConstructionMeasurements, ConstructionPhase, ConvergencePhase, Distribution, Environment,
+    ImportPhase, LifecycleMeasurements, MaintenanceSummary, OperationClass, OperationSummary,
+    PartitionStateCounts, PhaseResources, QualityPoint, QualitySweepMeasurements, RecallSummary,
+    ReportMeasurements, SearchBudgetConfiguration, SearchPhase, SearchTruncation,
+    SteadyStateMeasurements, Topology, WorkloadDispatch, WriteAmplification,
+    aggregate_rejection_rate,
 };
 use crate::resource::ResourceSnapshot;
 
@@ -333,11 +334,12 @@ fn large_scenarios() -> Result<Vec<ScenarioSpec>, String> {
         concurrency: 16,
         dispatch: WorkloadDispatch::Continuous,
         warmup_operations: 1_000,
-        measured_operations: 1_000,
+        // Repeat the fixed query corpus to reduce short-interval timing noise.
+        measured_operations: 10_000,
         k: 10,
         search_options,
         write_beam_size: 8,
-        leaf_beam_sweep: vec![1, 4, 8, 16, 32],
+        leaf_beam_sweep: vec![1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128],
         // Keep the shared leaf/internal fanout below sqrt(1M) so the
         // million-vector corpus must form at least three searchable levels.
         max_partition_entries: 128,
@@ -427,7 +429,10 @@ pub async fn run_scenario<B: Backend>(
             .map_err(|error| error_at("shut down runtime", error));
         let (topology, measurements) = measured?;
         shutdown?;
-        (topology, ReportMeasurements::QualitySweep(measurements))
+        (
+            topology,
+            ReportMeasurements::QualitySweep(Box::new(measurements)),
+        )
     } else if spec.lifecycle {
         let (topology, lifecycle) = run_lifecycle_case(
             backend,
@@ -648,7 +653,7 @@ async fn run_lifecycle_case<B: Backend>(
             convergence_resources_after,
             convergence_backend_io,
             &convergence_metrics,
-            metric_capture,
+            metric_capture.fixup_backlog(),
         ),
         from_import_finish_seconds: convergence_completed
             .duration_since(import_finished)
@@ -684,7 +689,7 @@ async fn run_lifecycle_case<B: Backend>(
         reset_resources_after,
         reset_backend_io,
         &reset_metrics,
-        metric_capture,
+        metric_capture.fixup_backlog(),
     );
 
     let stable_cold_search = run_search_phase(
@@ -929,7 +934,7 @@ async fn run_import_phase<B: Backend>(
             resources_after,
             backend_io,
             &metrics,
-            metric_capture,
+            metric_capture.fixup_backlog(),
         ),
         submitted_batches,
         accepted_batches,
@@ -1016,7 +1021,7 @@ async fn run_search_phase<B: Backend>(
             resources_after,
             backend_io,
             &metrics,
-            metric_capture,
+            metric_capture.fixup_backlog(),
         ),
         first_query_latency_ms,
         search: OperationSummary {
@@ -1065,7 +1070,7 @@ fn phase_resources(
     after: ResourceSnapshot,
     backend_io: BackendIo,
     metrics: &CapturedMetrics,
-    metric_capture: &MetricCapture,
+    backlog_at_end: usize,
 ) -> PhaseResources {
     PhaseResources {
         wall_seconds,
@@ -1078,7 +1083,7 @@ fn phase_resources(
             execution: metrics.counters_rendered("ktann.fixup.execution"),
             steps: metrics.counters_rendered("ktann.fixup.steps"),
             drain_entries: metrics.distributions_rendered("ktann.fixup.drain.entries"),
-            backlog_at_end: metric_capture.fixup_backlog(),
+            backlog_at_end,
         },
     }
 }
@@ -1105,7 +1110,8 @@ async fn run_with_runtime<B: Backend>(
     spec: &ScenarioSpec,
     dataset: &BenchmarkDataset,
 ) -> Result<(Topology, SteadyStateMeasurements), String> {
-    let (index, topology) = prepare_index(runtime, metric_capture, spec, dataset).await?;
+    let (index, topology, _) =
+        prepare_index(runtime, backend_counters, metric_capture, spec, dataset).await?;
     let measurements = measure_steady_workload(
         &index,
         backend_counters,
@@ -1127,7 +1133,8 @@ async fn run_quality_sweep<B: Backend>(
     spec: &ScenarioSpec,
     dataset: &mut BenchmarkDataset,
 ) -> Result<(Topology, QualitySweepMeasurements), String> {
-    let (index, topology) = prepare_index(runtime, metric_capture, spec, dataset).await?;
+    let (index, topology, construction) =
+        prepare_index(runtime, backend_counters, metric_capture, spec, dataset).await?;
     if topology.max_level.is_none_or(|level| level < 3) {
         return Err(format!(
             "large quality topology has max level {:?} with {} partitions by level {:?}; expected at least three searchable levels",
@@ -1167,71 +1174,125 @@ async fn run_quality_sweep<B: Backend>(
     }
     verify_measured_state(&index, spec).await?;
     validate_quality_frontier(&points, spec.measured_operations)?;
-    Ok((topology, QualitySweepMeasurements { points }))
+    Ok((
+        topology,
+        QualitySweepMeasurements {
+            construction,
+            points,
+        },
+    ))
 }
 
-/// Creates, loads, and converges one fresh Logical Index outside measurement.
+/// Creates and measures a fresh Logical Index before the search interval.
 async fn prepare_index<B: Backend>(
     runtime: &Runtime<MeasuredBackend<B>>,
+    backend_counters: &BackendCounters,
     metric_capture: &MetricCapture,
     spec: &ScenarioSpec,
     dataset: &BenchmarkDataset,
-) -> Result<(Index<MeasuredBackend<B>>, Topology), String> {
+) -> Result<
+    (
+        Index<MeasuredBackend<B>>,
+        Topology,
+        ConstructionMeasurements,
+    ),
+    String,
+> {
     let index_config = index_config(spec)?;
     let index = runtime
         .create_index("benchmark", index_config)
         .await
         .map_err(|error| error_at("create index", error))?;
 
-    // Setup is deliberately complete before any timer or counter baseline:
-    // load transactions, split training, verification, oracle construction,
-    // and cache warmup therefore cannot make measured operations look slower.
+    // Dataset/index creation is excluded. Import keeps streaming its batches;
+    // constructing every batch before this boundary would change memory use.
+    drop(metric_capture.snapshot());
+    let backend_before = backend_counters.snapshot();
+    let resources_before = ResourceSnapshot::capture()?;
     let import_started = phase_started(spec, "import");
     load_index(&index, dataset, spec).await?;
+    let import_completed = Instant::now();
+    let import_seconds = import_completed
+        .duration_since(import_started)
+        .as_secs_f64();
     phase_completed(spec, "import", import_started);
-    log_import_diagnostics(spec, metric_capture);
+    let import_after = ResourceSnapshot::capture()?;
+    let import_backend = backend_counters.snapshot();
+    let import_metrics = metric_capture.snapshot();
+    let import_backlog = metric_capture.fixup_backlog();
+
     let deadline = Instant::now() + settle_timeout(spec);
     let (topology, _) =
         settle_and_drain_topology(&index, dataset, spec, metric_capture, deadline).await?;
-    Ok((index, topology))
+    let completed = Instant::now();
+    let convergence_seconds = completed.duration_since(import_completed).as_secs_f64();
+    let wall_seconds = completed.duration_since(import_started).as_secs_f64();
+    let resources_after = ResourceSnapshot::capture()?;
+    let backend_after = backend_counters.snapshot();
+    let convergence_metrics = metric_capture.snapshot();
+    let convergence_backlog = metric_capture.fixup_backlog();
+    // Render the captured phase samples only after the continuous timer stops.
+    let import = ConstructionPhase {
+        resources: phase_resources(
+            import_seconds,
+            resources_before,
+            import_after,
+            subtract(import_backend.clone(), &backend_before),
+            &import_metrics,
+            import_backlog,
+        ),
+        admission: import_metrics.admission_summary(),
+        cache: import_metrics.cache_summary(),
+    };
+    drop(import_metrics);
+    log_import_diagnostics(spec, &import);
+    let convergence = ConstructionPhase {
+        resources: phase_resources(
+            convergence_seconds,
+            import_after,
+            resources_after,
+            subtract(backend_after, &import_backend),
+            &convergence_metrics,
+            convergence_backlog,
+        ),
+        admission: convergence_metrics.admission_summary(),
+        cache: convergence_metrics.cache_summary(),
+    };
+    let construction = ConstructionMeasurements {
+        wall_seconds,
+        cpu_seconds: Some(resources_after.cpu_seconds_since(resources_before)),
+        peak_rss_bytes: Some(resources_after.peak_rss_bytes()),
+        import,
+        convergence,
+    };
+    Ok((index, topology, construction))
 }
 
-/// Logs the import phase's admission, contention, and commit diagnostics.
-///
-/// Quality profiles measure only the post-setup sweep, so the import phase's
-/// own metrics would otherwise be invisible at exactly the scales where import
-/// throughput matters. The snapshot consumes the import interval's counters
-/// and histograms, keeping later phase intervals disjoint.
-fn log_import_diagnostics(spec: &ScenarioSpec, metric_capture: &MetricCapture) {
-    let metrics = metric_capture.snapshot();
-    for (gate, samples) in metrics.histograms_by_label("ktann.import.wait", "gate") {
-        let wait = Distribution::from_samples(samples).seconds_to_milliseconds();
+/// Renders the same captured import interval that is retained in the report.
+fn log_import_diagnostics(spec: &ScenarioSpec, import: &ConstructionPhase) {
+    for (gate, wait) in &import.admission.import_wait_ms {
         eprintln!(
             "[{}] import wait gate={gate}: count={} mean={:.3}ms p95={:.3}ms max={:.3}ms",
             spec.name, wait.count, wait.mean, wait.p95, wait.max,
         );
     }
-    for (direction, samples) in
-        metrics.histograms_by_label("ktann.import.concurrency.limit", "direction")
-    {
-        let limits = Distribution::from_samples(samples);
+    for (direction, limits) in &import.admission.import_concurrency_limit {
         eprintln!(
             "[{}] import concurrency {direction}: count={} max-limit={:.0}",
             spec.name, limits.count, limits.max,
         );
     }
-    let attempts = metrics.counters_rendered("ktann.write.attempts");
+    let attempts = &import.resources.writes.attempts;
     if !attempts.is_empty() {
         eprintln!("[{}] import write attempts: {attempts:?}", spec.name);
     }
-    for (labels, distribution) in metrics.distributions_rendered("ktann.write.commit.duration") {
-        let wait = distribution.seconds_to_milliseconds();
+    for (labels, wait) in &import.resources.writes.commit_wait_ms {
         eprintln!(
             "[{}] import commit wait {labels}: count={} mean={:.3}ms p95={:.3}ms",
             spec.name, wait.count, wait.mean, wait.p95,
         );
     }
-    let steps = metrics.counters_rendered("ktann.fixup.steps");
+    let steps = &import.resources.maintenance.steps;
     if !steps.is_empty() {
         eprintln!("[{}] import-phase fixup steps: {steps:?}", spec.name);
     }
@@ -2328,7 +2389,10 @@ mod tests {
     #[test]
     fn large_profile_is_an_explicit_single_variable_beam_sweep() {
         for scenario in scenarios("large").expect("large profile") {
-            assert_eq!(scenario.leaf_beam_sweep, [1, 4, 8, 16, 32]);
+            assert_eq!(
+                scenario.leaf_beam_sweep,
+                [1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128]
+            );
             assert_eq!(scenario.search_options.scanned_tree_keys(), Some(1));
             assert_eq!(scenario.search_options.visited_partitions(), Some(16_384));
             assert_eq!(

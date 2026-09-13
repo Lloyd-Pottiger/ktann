@@ -24,15 +24,17 @@ pub(crate) use interval::RaBitQQuery;
 pub(crate) use selection::OverlapSelection;
 pub(crate) use selection::{ApproximateCandidate, select_global_overlap, select_leaf_overlap};
 
-/// One decoded canonical absolute RaBitQ7 payload.
-pub(crate) struct RaBitQ7 {
+/// One borrowed canonical absolute RaBitQ7 payload.
+pub(crate) struct RaBitQ7<'a> {
     scale: f32,
     code_norm_squared: u32,
     reconstruction_error_upper: f32,
-    signed_codes: Box<[i8]>,
+    dimension: usize,
+    signs: &'a [u8],
+    magnitudes: &'a [u8],
 }
 
-impl RaBitQ7 {
+impl<'a> RaBitQ7<'a> {
     /// Returns the exact payload length for a dimension.
     pub(crate) fn encoded_len(dimension: usize) -> Result<usize> {
         codec::encoded_len(dimension)
@@ -43,14 +45,24 @@ impl RaBitQ7 {
         codec::quantize(vector)
     }
 
-    /// Decodes and validates one persistent payload.
-    pub(crate) fn decode(encoded: &[u8], dimension: usize) -> Result<Self> {
+    /// Borrows and validates one persistent payload without expanding its codes.
+    pub(crate) fn decode(encoded: &'a [u8], dimension: usize) -> Result<Self> {
         codec::decode(encoded, dimension)
     }
 
-    /// Validates a payload without retaining its expanded signed codes.
-    pub(crate) fn validate(encoded: &[u8], dimension: usize) -> Result<()> {
-        codec::validate(encoded, dimension)
+    /// Validates a persistent payload without allocating or retaining a view.
+    pub(crate) fn validate(encoded: &'a [u8], dimension: usize) -> Result<()> {
+        Self::decode(encoded, dimension).map(|_| ())
+    }
+
+    /// Borrows leaf bytes already validated by `cache::load_body`.
+    ///
+    /// Only use for an immutable body returned by `load_body`, with the same
+    /// Manifest dimension. Its storage scan validated every payload before
+    /// publication, even when cache insertion was disabled or skipped. A
+    /// general `LeafEntry::new` does not establish this invariant.
+    pub(super) fn from_validated_leaf_bytes(encoded: &'a [u8], dimension: usize) -> Self {
+        codec::from_validated_bytes(encoded, dimension)
     }
 
     /// Computes a scalar-f64 rough distance and conservative interval.
@@ -62,7 +74,7 @@ impl RaBitQ7 {
     }
 }
 
-impl fmt::Debug for RaBitQ7 {
+impl fmt::Debug for RaBitQ7<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("RaBitQ7([REDACTED])")
     }
