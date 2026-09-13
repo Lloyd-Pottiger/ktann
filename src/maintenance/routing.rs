@@ -806,13 +806,21 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                 {
                     return Err(Error::new(ErrorKind::Corruption));
                 }
-                for member in &scan_members[body_slots[index]] {
-                    nearest[member.member].consider(
-                        kernel,
-                        routings[member.member],
-                        entry,
-                        body,
-                    )?;
+                // Independent records share the centroid while each distance
+                // retains its format-defined scalar accumulation order.
+                let mut groups = scan_members[body_slots[index]].chunks_exact(4);
+                for group in &mut groups {
+                    let vectors =
+                        std::array::from_fn::<_, 4, _>(|lane| routings[group[lane].member]);
+                    let distances = kernel.routing_distances(vectors, entry.centroid())?;
+                    for (member, distance) in group.iter().zip(distances) {
+                        nearest[member.member].consider(distance, entry, body);
+                    }
+                }
+                for member in groups.remainder() {
+                    let distance =
+                        kernel.routing_distance(routings[member.member], entry.centroid())?;
+                    nearest[member.member].consider(distance, entry, body);
                 }
                 Ok(())
             })
@@ -880,14 +888,7 @@ impl NearestChildren {
         }
     }
 
-    fn consider(
-        &mut self,
-        kernel: &VectorKernel,
-        routing: &[f32],
-        entry: &ChildEntry,
-        owner: PartitionKey,
-    ) -> Result<()> {
-        let distance = kernel.routing_distance(routing, entry.centroid())?;
+    fn consider(&mut self, distance: f64, entry: &ChildEntry, owner: PartitionKey) {
         let candidate = WriteChildCandidate {
             distance,
             child: entry.child(),
@@ -899,7 +900,6 @@ impl NearestChildren {
             self.best.pop();
             self.best.push(candidate);
         }
-        Ok(())
     }
 
     fn into_best(self) -> impl Iterator<Item = (f64, PartitionKey, PartitionKey)> {

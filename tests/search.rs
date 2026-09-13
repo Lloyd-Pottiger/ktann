@@ -446,33 +446,31 @@ async fn every_budget_dimension_reports_exactly_its_own_exhaustion() {
     );
     runtime.shutdown().await.expect("shutdown");
 
-    // Visited Leaf Entries: the budget funds the first three entries in
-    // canonical Record ID order and stops mid-leaf.
+    // Visited Leaf Entries fund a canonical Record ID prefix. Later entries
+    // are closer, so each result must retain the end of its funded prefix.
     let (_backend, runtime, index) = setup().await;
-    let rows: Vec<Row> = vec![
-        (b"a".to_vec(), 1.0, 1, None),
-        (b"b".to_vec(), 2.0, 1, None),
-        (b"c".to_vec(), 3.0, 1, None),
-        (b"d".to_vec(), 4.0, 1, None),
-        (b"e".to_vec(), 5.0, 1, None),
-    ];
+    let rows: Vec<Row> = (0..9)
+        .map(|i| (vec![b'a' + i], f32::from(9 - i), 1, None))
+        .collect();
     insert_all(&index, &rows).await;
-    let options = SearchOptions::default()
-        .with_visited_leaf_entries(3)
-        .expect("valid override");
-    let outcome = index
-        .search(search_request(2).with_options(options))
-        .await
-        .expect("search");
-    assert_eq!(outcome.usage.visited_leaf_entries, 3);
-    assert!(outcome.exhausted.visited_leaf_entries);
-    assert!(!outcome.exhausted.scanned_tree_keys);
-    assert!(!outcome.exhausted.visited_partitions);
-    assert!(!outcome.exhausted.exact_rerank_candidates);
-    assert_eq!(
-        hit_parts(&outcome),
-        brute_force(&rows[..3], 0.0, 2, |_| true)
-    );
+    for funded in 3..=rows.len() {
+        let options = SearchOptions::default()
+            .with_visited_leaf_entries(funded as u32)
+            .expect("valid override");
+        let outcome = index
+            .search(search_request(2).with_options(options))
+            .await
+            .expect("search");
+        assert_eq!(outcome.usage.visited_leaf_entries, funded as u32);
+        assert_eq!(outcome.exhausted.visited_leaf_entries, funded < rows.len());
+        assert!(!outcome.exhausted.scanned_tree_keys);
+        assert!(!outcome.exhausted.visited_partitions);
+        assert!(!outcome.exhausted.exact_rerank_candidates);
+        assert_eq!(
+            hit_parts(&outcome),
+            brute_force(&rows[..funded], 0.0, 2, |_| true)
+        );
+    }
     runtime.shutdown().await.expect("shutdown");
 
     // Exact rerank candidates: two trees of ten identical vectors each. Every
