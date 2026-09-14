@@ -103,13 +103,11 @@ pub(crate) fn select_leaf_overlap<T>(
     );
     let overlap_threshold = nth_upper_endpoint(&mut candidates, rough_count - 1);
 
-    candidates.select_nth_unstable_by(rough_count - 1, compare_rough);
-    let mut position = 0_usize;
-    candidates.retain(|candidate| {
-        let keep = position < rough_count || candidate.distance.lower() <= overlap_threshold;
-        position += 1;
-        keep
-    });
+    // The r-th rough distance is at most the r-th upper endpoint because
+    // every interval contains its rough distance. Thus every rough top-r
+    // candidate already overlaps the threshold; selecting that set separately
+    // cannot add a survivor.
+    candidates.retain(|candidate| candidate.distance.lower() <= overlap_threshold);
 
     let overlap_cap = rough_count
         .checked_mul(4)
