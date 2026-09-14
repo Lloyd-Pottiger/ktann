@@ -646,12 +646,7 @@ impl Traversal {
             let distances = RaBitQ7::approximate_distances(&codes, context.query)
                 .map_err(|_| Error::new(ErrorKind::Corruption))?;
             for (entry, distance) in entries.iter().zip(distances) {
-                batch.push(LeafCandidate::new(
-                    entry.record_id().clone(),
-                    entry.fields().into(),
-                    distance,
-                    RecordLocation::new(tree_key.clone(), partition),
-                ));
+                batch.push((entry, distance));
             }
         }
         for entry in chunks.remainder() {
@@ -664,23 +659,36 @@ impl Traversal {
             let distance = code
                 .approximate_distance(context.query)
                 .map_err(|_| Error::new(ErrorKind::Corruption))?;
-            batch.push(LeafCandidate::new(
-                entry.record_id().clone(),
-                entry.fields().into(),
-                distance,
-                RecordLocation::new(tree_key.clone(), partition),
-            ));
+            batch.push((entry, distance));
         }
-        let filtered = filter_candidates(batch, predicate, &mut self.visited_leaf_entries)?;
-        let pool: Vec<ApproximateCandidate<LeafCandidate>> = filtered
+        // Borrow projections until overlap selection has discarded excess entries.
+        // Only survivors need owned fields and locations for global reranking.
+        let filtered = filter_candidates(
+            batch,
+            predicate,
+            &mut self.visited_leaf_entries,
+            |(entry, _)| entry.fields(),
+        )?;
+        let pool = filtered
             .into_iter()
-            .map(ApproximateCandidate::from)
+            .map(|(entry, distance)| {
+                ApproximateCandidate::new(entry.record_id().clone(), distance, entry)
+            })
             .collect();
         let selection = select_leaf_overlap(pool, context.request.k, context.rerank_cap)?;
         if selection.truncated() {
             self.rabitq_overlap_truncated = true;
         }
-        self.candidates.extend(selection.into_values());
+        self.candidates
+            .extend(selection.into_candidates().into_iter().map(|candidate| {
+                let (record_id, distance, entry) = candidate.into_parts();
+                LeafCandidate::new(
+                    record_id,
+                    entry.fields().into(),
+                    distance,
+                    RecordLocation::new(tree_key.clone(), partition),
+                )
+            }));
         Ok(())
     }
 

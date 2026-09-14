@@ -69,7 +69,6 @@ impl<T> OverlapSelection<T> {
     }
 
     /// Consumes the result and returns its selected candidates.
-    #[cfg(test)]
     pub(crate) fn into_candidates(self) -> Vec<ApproximateCandidate<T>> {
         self.candidates
     }
