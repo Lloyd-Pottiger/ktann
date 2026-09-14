@@ -138,11 +138,12 @@ impl ExactRerankOutcome {
 /// result qualifies; FALSE and UNKNOWN are rejected. Candidate order is
 /// preserved. A field projection that disagrees with the compiled schema is
 /// Corruption.
-pub(crate) fn filter_candidates(
-    candidates: Vec<LeafCandidate>,
+pub(crate) fn filter_candidates<T>(
+    candidates: Vec<T>,
     predicate: Option<&CompiledPredicate>,
     visited_leaf_entries: &mut u32,
-) -> Result<Vec<LeafCandidate>> {
+    fields: impl Fn(&T) -> &[Value],
+) -> Result<Vec<T>> {
     let considered =
         u32::try_from(candidates.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
     *visited_leaf_entries = visited_leaf_entries
@@ -154,7 +155,7 @@ pub(crate) fn filter_candidates(
     };
     let mut filtered = Vec::with_capacity(candidates.len());
     for candidate in candidates {
-        if predicate.matches(candidate.fields())? {
+        if predicate.matches(fields(&candidate))? {
             filtered.push(candidate);
         }
     }
@@ -520,8 +521,13 @@ mod tests {
 
         // No predicate admits every entry but still charges each one.
         let mut visited = 0;
-        let admitted = filter_candidates(candidates(&records), None, &mut visited)
-            .expect("filter without predicate");
+        let admitted = filter_candidates(
+            candidates(&records),
+            None,
+            &mut visited,
+            LeafCandidate::fields,
+        )
+        .expect("filter without predicate");
         assert_eq!(visited, total);
         assert_eq!(admitted.len(), records.len());
         // Filtering preserves the input order and the rough distances.
@@ -540,8 +546,13 @@ mod tests {
         )
         .expect("compile");
         let mut visited = 7;
-        let admitted = filter_candidates(candidates(&records), Some(&compiled), &mut visited)
-            .expect("filter with predicate");
+        let admitted = filter_candidates(
+            candidates(&records),
+            Some(&compiled),
+            &mut visited,
+            LeafCandidate::fields,
+        )
+        .expect("filter with predicate");
         assert_eq!(visited, 7 + total);
         let expected: Vec<&str> = records
             .iter()
@@ -620,9 +631,13 @@ mod tests {
                     CompiledPredicate::compile(predicate.clone(), manifest.config().fields())
                         .expect("compile");
                 let mut visited = 0;
-                let filtered =
-                    filter_candidates(candidates(&records), Some(&compiled), &mut visited)
-                        .expect("filter");
+                let filtered = filter_candidates(
+                    candidates(&records),
+                    Some(&compiled),
+                    &mut visited,
+                    LeafCandidate::fields,
+                )
+                .expect("filter");
                 assert_eq!(visited, records.len() as u32);
                 let budget = filtered.len() as u32;
                 let data = record_group_data(&manifest, &records);
@@ -728,8 +743,13 @@ mod tests {
             let compiled =
                 CompiledPredicate::compile(predicate, manifest.config().fields()).expect("compile");
             let mut visited = 0;
-            let admitted = filter_candidates(candidates(&records), Some(&compiled), &mut visited)
-                .expect("filter");
+            let admitted = filter_candidates(
+                candidates(&records),
+                Some(&compiled),
+                &mut visited,
+                LeafCandidate::fields,
+            )
+            .expect("filter");
             assert_eq!(visited, records.len() as u32);
             let admitted: Vec<&[u8]> = admitted
                 .iter()
