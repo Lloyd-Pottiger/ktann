@@ -3,7 +3,8 @@
 //!
 //! This module owns the search pipeline's filter and rerank stage (design
 //! `search.md` steps 4, 6, and 7). Traversal (#9) supplies Leaf Candidates in
-//! deterministic rough-distance order; exact predicate filtering keeps only
+//! per-leaf selections for global overlap selection; exact predicate filtering
+//! keeps only
 //! SQL TRUE entries; exact reranking batch-loads the original Vector Records
 //! from one consistent snapshot, computes exact f64 distances over the
 //! unrotated vectors, and builds Search Hits ordered by distance and then

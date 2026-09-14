@@ -32,12 +32,6 @@ impl<T> ApproximateCandidate<T> {
         &self.record_id
     }
 
-    /// Returns the candidate's rough distance and conservative interval.
-    #[cfg(test)]
-    pub(crate) const fn distance(&self) -> ApproximateDistance {
-        self.distance
-    }
-
     /// Returns the caller-owned value.
     #[cfg(test)]
     pub(crate) const fn value(&self) -> &T {
@@ -62,7 +56,7 @@ impl<T> OverlapSelection<T> {
         self.truncated
     }
 
-    /// Returns the selected candidates in rough-distance ranking order.
+    /// Returns the selected candidates.
     #[cfg(test)]
     pub(crate) fn candidates(&self) -> &[ApproximateCandidate<T>] {
         &self.candidates
@@ -73,7 +67,7 @@ impl<T> OverlapSelection<T> {
         self.candidates
     }
 
-    /// Consumes the result and returns the carried values in ranking order.
+    /// Consumes the result and returns the carried values.
     pub(crate) fn into_values(self) -> Vec<T> {
         self.candidates
             .into_iter()
@@ -86,7 +80,7 @@ impl<T> OverlapSelection<T> {
 ///
 /// The returned set is capped at `min(4*r, remaining_rerank_budget)`. A true
 /// truncation bit is the source of `rabitq_overlap_truncated` for local
-/// selection.
+/// selection. Ordering is deferred to global selection.
 pub(crate) fn select_leaf_overlap<T>(
     mut candidates: Vec<ApproximateCandidate<T>>,
     k: usize,
@@ -128,7 +122,7 @@ pub(crate) fn select_leaf_overlap<T>(
 ///
 /// The global threshold is the kth-smallest upper endpoint, or positive
 /// infinity when fewer than `k` candidates exist. The rerank budget then caps
-/// survivors by rough distance and Record ID.
+/// survivors by rough distance and Record ID and returns them in that order.
 pub(crate) fn select_global_overlap<T>(
     mut candidates: Vec<ApproximateCandidate<T>>,
     k: usize,
@@ -143,11 +137,9 @@ pub(crate) fn select_global_overlap<T>(
         nth_upper_endpoint(&mut candidates, k - 1)
     };
     candidates.retain(|candidate| candidate.distance.lower() <= overlap_threshold);
-    Ok(cap_survivors(
-        candidates,
-        remaining_rerank_budget,
-        compare_rough,
-    ))
+    let mut selection = cap_survivors(candidates, remaining_rerank_budget, compare_rough);
+    selection.candidates.sort_unstable_by(compare_rough);
+    Ok(selection)
 }
 
 fn nth_upper_endpoint<T>(candidates: &mut [ApproximateCandidate<T>], index: usize) -> f64 {
@@ -170,8 +162,8 @@ fn compare_local_cap<T>(
         .then_with(|| compare_rough(left, right))
 }
 
-/// Caps the surviving candidates at `cap` under `compare`, then restores the
-/// deterministic rough ranking order.
+/// Caps the surviving candidates at `cap` under `compare` without sorting
+/// candidates that the next selection stage may discard.
 fn cap_survivors<T>(
     mut candidates: Vec<ApproximateCandidate<T>>,
     cap: usize,
@@ -181,7 +173,6 @@ fn cap_survivors<T>(
     if truncated {
         truncate_candidates(&mut candidates, cap, compare);
     }
-    candidates.sort_unstable_by(compare_rough);
     OverlapSelection {
         candidates,
         truncated,
