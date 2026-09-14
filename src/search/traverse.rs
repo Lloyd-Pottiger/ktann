@@ -117,9 +117,9 @@ impl<'a> TraversalRequest<'a> {
 
 /// The bounded, deterministic result of forest traversal.
 ///
-/// Candidates are merged across every visited leaf and ordered by rough
-/// distance then unsigned lexicographic Record ID bytes, ready for global
-/// overlap selection and exact reranking. The usage counters and exhaustion
+/// Candidates are merged across every visited leaf for global overlap
+/// selection, which owns their final rough-distance/Record-ID ordering.
+/// The usage counters and exhaustion
 /// flags fold into the Search Outcome's `visited_partitions` and
 /// `visited_leaf_entries` dimensions.
 pub(crate) struct TraversalOutcome {
@@ -135,7 +135,7 @@ pub(crate) struct TraversalOutcome {
 }
 
 impl TraversalOutcome {
-    /// Returns the merged candidates in rough-distance/Record-ID order.
+    /// Returns the merged candidate pool before global overlap selection.
     #[cfg(test)]
     pub(crate) fn candidates(&self) -> &[LeafCandidate] {
         &self.candidates
@@ -721,8 +721,8 @@ impl Traversal {
         Ok(())
     }
 
-    /// Deduplicates defensively, orders the merged candidates, and reports.
-    fn finish(mut self) -> Result<TraversalOutcome> {
+    /// Rejects duplicate membership and reports the merged candidate pool.
+    fn finish(self) -> Result<TraversalOutcome> {
         // Exact membership admits at most one Leaf Entry per Vector Record in
         // one snapshot, even across draining split bodies; a duplicate Record
         // ID is Corruption rather than silently deduplicated.
@@ -732,10 +732,8 @@ impl Traversal {
                 return Err(Error::new(ErrorKind::Corruption));
             }
         }
-        self.candidates.sort_unstable_by(|left, right| {
-            compare_finite(left.distance().rough(), right.distance().rough())
-                .then_with(|| left.record_id().cmp(right.record_id()))
-        });
+        // Global overlap selection partitions this pool before ordering only
+        // its bounded survivors. Sorting the entire pool here adds no contract.
         Ok(TraversalOutcome {
             candidates: self.candidates,
             maintenance: self.maintenance,
@@ -1126,13 +1124,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn leaf_candidates_are_rough_ordered_and_deterministic() {
+    async fn leaf_candidate_membership_is_deterministic() {
         let manifest = manifest();
         let mut fixture = Fixture::new(&manifest);
         let tree = fixture.tree(1);
         fixture.header(&tree, 1, 1, 3, PartitionState::Ready);
         fixture.synopsis(&tree, 1, 1, &[0, 0, 0]);
-        // Scan order is Record ID order; rough order follows the norm.
+        // Scan order differs from distance order; traversal returns the selected set.
         fixture.entry(&tree, 1, 1, "far", 0, [3.0, 0.0]);
         fixture.entry(&tree, 1, 1, "mid", 0, [2.0, 0.0]);
         fixture.entry(&tree, 1, 1, "near", 0, [1.0, 0.0]);
@@ -1149,10 +1147,9 @@ mod tests {
         )
         .await
         .expect("traverse");
-        assert_eq!(
-            candidate_ids(&outcome),
-            vec![b"near".as_slice(), b"mid".as_slice(), b"far".as_slice()]
-        );
+        let mut ids = candidate_ids(&outcome);
+        ids.sort_unstable();
+        assert_eq!(ids, vec![b"far".as_slice(), b"mid", b"near"]);
         assert_eq!(outcome.visited_partitions(), 1);
         assert_eq!(outcome.visited_leaf_entries(), 3);
         assert!(!outcome.partition_budget_exhausted());
@@ -1228,7 +1225,7 @@ mod tests {
         let trees = vec![tree_ref(&first), tree_ref(&second)];
 
         // Both roots are seeded up front and every leaf is visited under a
-        // generous budget; merged candidates order by rough distance.
+        // generous budget; global selection owns their eventual ranking.
         let outcome = run(
             fixture.items.clone(),
             &manifest,
@@ -1240,15 +1237,9 @@ mod tests {
         )
         .await
         .expect("traverse");
-        assert_eq!(
-            candidate_ids(&outcome),
-            vec![
-                b"b1".as_slice(),
-                b"a4".as_slice(),
-                b"b9".as_slice(),
-                b"a16".as_slice()
-            ]
-        );
+        let mut ids = candidate_ids(&outcome);
+        ids.sort_unstable();
+        assert_eq!(ids, vec![b"a16".as_slice(), b"a4", b"b1", b"b9"]);
         assert_eq!(outcome.visited_partitions(), 2);
         assert!(!outcome.partition_budget_exhausted());
 
@@ -1840,10 +1831,9 @@ mod tests {
         )
         .await
         .expect("traverse");
-        assert_eq!(
-            candidate_ids(&outcome),
-            vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]
-        );
+        let mut ids = candidate_ids(&outcome);
+        ids.sort_unstable();
+        assert_eq!(ids, vec![b"a".as_slice(), b"b", b"c"]);
         assert_eq!(outcome.visited_partitions(), 3);
         assert_eq!(outcome.visited_leaf_entries(), 3);
         assert!(!outcome.partition_budget_exhausted());

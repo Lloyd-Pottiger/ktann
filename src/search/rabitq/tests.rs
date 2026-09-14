@@ -434,19 +434,16 @@ fn interleaved_scores_reject_a_dimension_mismatch_in_every_lane() {
 }
 
 #[test]
-fn leaf_overlap_obeys_formula_cap_and_stable_ordering() {
+fn leaf_overlap_obeys_formula_cap_and_stable_membership() {
     let candidates = (0_u16..300)
         .map(|index| candidate(index, f64::from(index), 0.0, 1_000.0 + f64::from(index)))
         .collect();
     let selection = select_leaf_overlap(candidates, 1, usize::MAX).expect("selection succeeds");
     assert!(selection.truncated());
     assert_eq!(selection.candidates().len(), 256);
-    assert!(
-        selection
-            .candidates()
-            .windows(2)
-            .all(|pair| pair[0].distance().rough() <= pair[1].distance().rough())
-    );
+    let mut ids = selected_ids(selection);
+    ids.sort_unstable();
+    assert_eq!(ids, (0..256).collect::<Vec<_>>());
 
     let candidates = vec![candidate(2, 1.0, 0.0, 2.0), candidate(1, 1.0, 0.0, 2.0)];
     let selection = select_leaf_overlap(candidates, 1, 1).expect("selection succeeds");
@@ -578,13 +575,26 @@ proptest! {
             .expect("generated leaf selection is valid");
         let (expected_leaf, expected_leaf_truncated) = brute_force_leaf(&specs, k, budget);
         prop_assert_eq!(actual_leaf.truncated(), expected_leaf_truncated);
-        prop_assert_eq!(selected_ids(actual_leaf), expected_leaf);
+        let mut actual_leaf_ids = selected_ids(actual_leaf);
+        let mut expected_leaf_ids = expected_leaf;
+        actual_leaf_ids.sort_unstable();
+        expected_leaf_ids.sort_unstable();
+        prop_assert_eq!(actual_leaf_ids, expected_leaf_ids);
 
         let actual_global = select_global_overlap(build_candidates(&specs), k, budget)
             .expect("generated global selection is valid");
         let (expected_global, expected_global_truncated) = brute_force_global(&specs, k, budget);
         prop_assert_eq!(actual_global.truncated(), expected_global_truncated);
-        prop_assert_eq!(selected_ids(actual_global), expected_global);
+        prop_assert_eq!(selected_ids(actual_global), expected_global.clone());
+
+        // Traversal supplies a merged pool without a global pre-sort. The
+        // final selection and truncation must not depend on that pool order.
+        let mut reversed = build_candidates(&specs);
+        reversed.reverse();
+        let reordered = select_global_overlap(reversed, k, budget)
+            .expect("reordered selection is valid");
+        prop_assert_eq!(reordered.truncated(), expected_global_truncated);
+        prop_assert_eq!(selected_ids(reordered), expected_global);
     }
 }
 
