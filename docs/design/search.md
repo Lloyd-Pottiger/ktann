@@ -73,6 +73,20 @@ Production v1 uses the scalar f64 reference kernel for rotated query/code dot
 products. This avoids an unaccounted f32/SIMD rounding term and makes the stored
 reconstruction error sufficient for conservative intervals.
 
+The scalar dot product keeps component order and bounds its accumulated
+roundoff once after scoring. Reconstruction `stored_scale * c_i` is exact in
+f64: an f32 significand times a six-bit integer needs at most 30 significant
+bits. With unit roundoff `u = 2^-53` and dimension `n <= 16384`, the product
+and sum error is bounded by `gamma_n * sum(abs(q_i * x_hat_i))`, where
+`gamma_n = n*u/(1-n*u) <= 2*n*u`. Cauchy–Schwarz bounds the absolute sum by
+`norm(q) * norm(x_hat)`. Thus the computed dot's conservative endpoints are
+`dot ± n*2^-52*norm(q)*norm(x_hat)`, rounded outward. Both norms and the
+error products use upward-rounded bounds; `norm(x_hat)` uses the exact stored
+integer squared code norm and nonnegative stored scale. The finite f32 inputs,
+six-bit codes and dimension limit exclude overflow and underflow in these dot
+products and sums. This numerical roundoff bound is applied before the
+reconstruction-error radius below.
+
 For query `q`, reconstruction `x_hat`, and error upper bound `E`:
 
 | Metric | rough distance `d_hat` | radius `B` |
