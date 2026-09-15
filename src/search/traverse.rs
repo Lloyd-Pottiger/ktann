@@ -50,6 +50,7 @@
 //!   only when they prove `NoMatch`; exact predicate evaluation admits
 //!   entries; RaBitQ intervals only order candidates and drive the bounded
 //!   conservative overlap selection.
+use std::borrow::Borrow;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt;
@@ -60,8 +61,8 @@ use crate::storage::ReadLogicalTxn;
 use crate::storage::backend::ReadOps;
 use crate::storage::keys::{LogicalKey, TreeKey};
 use crate::storage::values::{
-    IndexManifest, PartitionHeader, PartitionState, PartitionTransition, PersistentValue,
-    RecordLocation, expect_header, expect_synopsis,
+    IndexManifest, LeafEntry, PartitionHeader, PartitionState, PartitionTransition,
+    PersistentValue, RecordLocation, expect_header, expect_synopsis,
 };
 
 use super::beam_width;
@@ -69,7 +70,9 @@ use super::cache::{BodyEntries, PartitionCache, load_body};
 use super::numeric::{VectorKernel, compare_finite};
 use super::plan::EnumeratedTree;
 use super::predicate::{CompiledPredicate, SynopsisClassification};
-use super::rabitq::{ApproximateCandidate, RaBitQ7, RaBitQQuery, select_leaf_overlap};
+use super::rabitq::{
+    ApproximateCandidate, ApproximateDistance, RaBitQ7, RaBitQQuery, select_leaf_overlap,
+};
 use super::rerank::{LeafCandidate, filter_candidates};
 
 /// The default leaf-level base beam (design `search.md` section 6).
@@ -635,46 +638,33 @@ impl Traversal {
         if funded < entries.len() {
             self.leaf_entry_budget_exhausted = true;
         }
-        let mut batch = Vec::with_capacity(funded);
-        // Immutable bodies have already validated every code against the Manifest.
-        // Batch only funded entries; preserve their order and the scalar tail.
-        let mut chunks = entries[..funded].chunks_exact(4);
-        for entries in &mut chunks {
-            let codes = std::array::from_fn(|lane| {
-                RaBitQ7::from_validated_leaf_bytes(entries[lane].rabitq7(), dimension)
-            });
-            let distances = RaBitQ7::approximate_distances(&codes, context.query)
-                .map_err(|_| Error::new(ErrorKind::Corruption))?;
-            for (entry, distance) in entries.iter().zip(distances) {
-                batch.push((entry, distance));
-            }
-        }
-        for entry in chunks.remainder() {
-            // `load_body` decoded and validated every payload against this
-            // Manifest before returning the immutable body. Reuse that
-            // validation while scoring its packed codes without allocation.
-            let code = RaBitQ7::from_validated_leaf_bytes(entry.rabitq7(), dimension);
-            // The query and the decoded code are validated finite, so a
-            // non-conservative distance here means corrupted state.
-            let distance = code
-                .approximate_distance(context.query)
-                .map_err(|_| Error::new(ErrorKind::Corruption))?;
-            batch.push((entry, distance));
-        }
-        // Borrow projections until overlap selection has discarded excess entries.
-        // Only survivors need owned fields and locations for global reranking.
-        let filtered = filter_candidates(
-            batch,
-            predicate,
-            &mut self.visited_leaf_entries,
-            |(entry, _)| entry.fields(),
-        )?;
-        let pool = filtered
+        // Only predicate evaluation needs a temporary list of entry references.
+        // Without a predicate (including AllMatch), score the body directly.
+        let pool = if let Some(predicate) = predicate {
+            let filtered = filter_candidates(
+                entries[..funded].iter().collect(),
+                Some(predicate),
+                &mut self.visited_leaf_entries,
+                |entry| entry.fields(),
+            )?;
+            score_leaf_entries(&filtered, dimension, context.query)?
+                .into_iter()
+                .map(|(entry, distance)| {
+                    ApproximateCandidate::new(entry.record_id().clone(), distance, *entry)
+                })
+                .collect()
+        } else {
+            let batch = score_leaf_entries(&entries[..funded], dimension, context.query)?;
+            filter_candidates(batch, None, &mut self.visited_leaf_entries, |(entry, _)| {
+                entry.fields()
+            })?
             .into_iter()
             .map(|(entry, distance)| {
                 ApproximateCandidate::new(entry.record_id().clone(), distance, entry)
             })
-            .collect();
+            .collect()
+        };
+        // Only local survivors need owned fields and locations for global reranking.
         let selection = select_leaf_overlap(pool, context.request.k, context.rerank_cap)?;
         if selection.truncated() {
             self.rabitq_overlap_truncated = true;
@@ -744,6 +734,39 @@ impl Traversal {
             rabitq_overlap_truncated: self.rabitq_overlap_truncated,
         })
     }
+}
+
+/// Scores a body slice or references to its exact predicate matches.
+///
+/// Both inputs use the same four-entry slices and scalar tail, preserving each
+/// score's accumulation order without copying the unfiltered body's references.
+fn score_leaf_entries<'a, T: Borrow<LeafEntry>>(
+    entries: &'a [T],
+    dimension: usize,
+    query: &RaBitQQuery<'_>,
+) -> Result<Vec<(&'a T, ApproximateDistance)>> {
+    let mut batch = Vec::with_capacity(entries.len());
+    let mut chunks = entries.chunks_exact(4);
+    for entries in &mut chunks {
+        let codes = std::array::from_fn(|lane| {
+            RaBitQ7::from_validated_leaf_bytes(entries[lane].borrow().rabitq7(), dimension)
+        });
+        let distances = RaBitQ7::approximate_distances(&codes, query)
+            .map_err(|_| Error::new(ErrorKind::Corruption))?;
+        for (entry, distance) in entries.iter().zip(distances) {
+            batch.push((entry, distance));
+        }
+    }
+    for entry in chunks.remainder() {
+        // Loading the immutable body validates every payload before filtering,
+        // so rejected entries cannot hide malformed persistent codes.
+        let code = RaBitQ7::from_validated_leaf_bytes(entry.borrow().rabitq7(), dimension);
+        let distance = code
+            .approximate_distance(query)
+            .map_err(|_| Error::new(ErrorKind::Corruption))?;
+        batch.push((entry, distance));
+    }
+    Ok(batch)
 }
 
 #[cfg(test)]
@@ -1187,16 +1210,14 @@ mod tests {
             &manifest,
             &[tree_ref(&tree)],
             None,
-            4,
-            budgets(8, 8, 8),
+            1,
+            budgets(8, 8, 1),
             DEFAULT_LEAF_BEAM,
         )
         .await
         .expect("traverse");
-        assert_eq!(
-            candidate_ids(&outcome),
-            vec![b"a".as_slice(), b"b".as_slice()]
-        );
+        assert_eq!(candidate_ids(&outcome), vec![b"a".as_slice()]);
+        assert!(outcome.rabitq_overlap_truncated());
     }
 
     #[tokio::test]
@@ -1993,7 +2014,7 @@ mod tests {
         let mut fixture = Fixture::new(&manifest);
         let tree = fixture.tree(1);
         fixture.header(&tree, 1, 1, 1, PartitionState::Ready);
-        fixture.synopsis(&tree, 1, 1, &[0]);
+        fixture.synopsis(&tree, 1, 1, &[0, 1]);
         let mut value = encode(
             &manifest,
             &PersistentValue::LeafEntry(LeafEntry::new(
@@ -2005,6 +2026,26 @@ mod tests {
         value.pop();
         fixture.raw_entry(&tree, 1, "x", value);
         assert_corrupt(fixture.items.clone(), &manifest, &[tree_ref(&tree)]).await;
+
+        // A conservative MayMatch synopsis requires loading the body. Even
+        // though the entry's field would fail the exact predicate, its damaged
+        // code must still be rejected before filtering can discard it.
+        assert_corruption(
+            run(
+                fixture.items,
+                &manifest,
+                &[tree_ref(&tree)],
+                Some(Predicate::Compare {
+                    field: FieldId(1),
+                    op: CompareOp::Eq,
+                    value: Value::I64(1),
+                }),
+                8,
+                budgets(16, 16, 64),
+                DEFAULT_LEAF_BEAM,
+            )
+            .await,
+        );
 
         // A truncated canonical Child Entry payload likewise fails closed.
         let mut fixture = Fixture::new(&manifest);

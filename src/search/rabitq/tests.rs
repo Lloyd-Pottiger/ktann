@@ -558,9 +558,9 @@ proptest! {
 
     #[test]
     fn optimized_overlap_selection_matches_brute_force_sorting(
-        raw in prop::collection::vec((-1_000_i16..=1_000, 0_u8..=20, 0_u8..=20), 1..100),
-        k in 1_usize..50,
-        budget in 0_usize..300,
+        raw in prop::collection::vec((-1_000_i16..=1_000, 0_u8..=255, 0_u8..=255), 1..600),
+        k in 1_usize..150,
+        budget in 0_usize..800,
     ) {
         let specs: Vec<CandidateSpec> = raw.into_iter().enumerate().map(
             |(index, (rough, lower_width, upper_width))| CandidateSpec {

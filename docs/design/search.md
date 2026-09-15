@@ -139,6 +139,11 @@ One consistent snapshot performs:
 6. original Vector Record batch loading and exact reranking;
 7. deterministic top-k ordering and budget report construction.
 
+Every funded Leaf Entry counts against the visited-entry budget. Exact leaf
+filtering precedes RaBitQ scoring, so rejected entries consume no scoring work.
+The complete loaded body is still decoded and validated before filtering;
+predicate rejection cannot hide malformed persistent entries.
+
 Traversal is a level-scaled beam. The leaf-level base beam defaults to 128 and
 SearchOptions may override it per request within the hard cap; moving one
 level toward the root divides it by two with minimum one. All admitted parents
@@ -159,6 +164,11 @@ the global kth-smallest upper endpoint (positive infinity when fewer than `k`
 exist), retains overlapping candidates, truncates by rough distance and Record
 ID to the remaining rerank budget, then loads original vectors. Any local
 overlap truncation sets `rabitq_overlap_truncated`.
+
+The local overlap test already includes the rough top `r`: each rough distance
+is at most its upper endpoint, so the r-th rough distance is at most the r-th
+upper endpoint, and every top-`r` candidate's lower endpoint is no larger than
+its rough distance. No separate rough top-`r` selection is necessary.
 
 Intermediate traversal follows the persistent reference rules exactly:
 
