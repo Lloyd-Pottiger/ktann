@@ -127,12 +127,46 @@ impl RaBitQ7<'_> {
         (0..self.dimension).map(|index| self.signed_code(index))
     }
 
+    /// Loads four complete components from three magnitude bytes and a sign nibble.
+    /// The caller only requests blocks wholly inside the validated dimension.
+    #[inline]
+    pub(super) fn code_block(&self, block: usize) -> CodeBlock {
+        let offset = block * 3;
+        let packed = u32::from(self.magnitudes[offset])
+            | (u32::from(self.magnitudes[offset + 1]) << 8)
+            | (u32::from(self.magnitudes[offset + 2]) << 16);
+        let signs = self.signs[block / 2] >> ((block % 2) * 4);
+        CodeBlock {
+            magnitudes: packed,
+            signs,
+        }
+    }
+
     /// Decodes one component from the canonical packed streams.
     pub(super) fn signed_code(&self, index: usize) -> i8 {
         let negative =
             self.signs[index / u8::BITS as usize] & (1_u8 << (index % u8::BITS as usize)) != 0;
         let magnitude = decode_magnitude(self.magnitudes, index) as i8;
         if negative { -magnitude } else { magnitude }
+    }
+}
+
+/// A complete four-component packed group, loaded once for scalar-order scoring.
+pub(super) struct CodeBlock {
+    magnitudes: u32,
+    signs: u8,
+}
+
+impl CodeBlock {
+    /// Expands one of the four components directly from the loaded group.
+    pub(super) fn signed_code(&self, component: usize) -> i8 {
+        let magnitude =
+            ((self.magnitudes >> (component * MAGNITUDE_BITS)) & u32::from(MAX_MAGNITUDE)) as i8;
+        if self.signs & (1 << component) == 0 {
+            magnitude
+        } else {
+            -magnitude
+        }
     }
 }
 
