@@ -4,7 +4,7 @@ use proptest::prelude::*;
 
 use crate::api::{ErrorKind, MAX_DIMENSION, Metric};
 
-use super::rounding::{add_down, add_up, multiply_down, multiply_up, next_down, next_up, sqrt_up};
+use super::rounding::{next_down, next_up};
 
 use super::{
     ApproximateCandidate, ApproximateDistance, RaBitQ7, RaBitQQuery, select_global_overlap,
@@ -521,7 +521,7 @@ proptest! {
             let prepared = RaBitQQuery::new(&query, metric).expect("generated query is valid");
             let interval = decoded.approximate_distance(&prepared)
                 .expect("generated distance is finite");
-            assert_distance_bits_equal(interval, expanded_reference_distance(&first, &query, metric));
+            assert_rough_bits_equal(interval, expanded_reference_rough(&first, &query, metric));
             prop_assert!(interval.lower() <= exact,
                 "lower {} excluded exact {} for {:?}", interval.lower(), exact, metric);
             prop_assert!(exact <= interval.upper(),
@@ -548,12 +548,23 @@ proptest! {
             let prepared = RaBitQQuery::new(&components, metric).expect("finite query is valid");
             let interval = decoded.approximate_distance(&prepared)
                 .expect("f32 inputs stay finite in scalar f64");
-            assert_distance_bits_equal(
+            assert_rough_bits_equal(
                 interval,
-                expanded_reference_distance(&encoded, &components, metric),
+                expanded_reference_rough(&encoded, &components, metric),
             );
             prop_assert!(interval.lower() <= exact && exact <= interval.upper());
         }
+    }
+
+    #[test]
+    fn aggregate_dot_intervals_cover_exact_generated_reconstructions(
+        entries in prop::collection::vec((finite_f32(), -63_i8..64), 1..129)
+            .prop_filter("nonzero reconstruction", |entries| entries.iter().any(|(_, c)| *c != 0)),
+        scale in finite_f32().prop_filter("positive scale", |scale| *scale > 0.0),
+    ) {
+        let (components, codes): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
+        let encoded = independently_encode_payload(&codes, scale, 0.0);
+        assert_exact_reconstructed_dot(&encoded, &components);
     }
 
     #[test]
@@ -709,11 +720,15 @@ fn assert_validated_packed_parity(encoded: &[u8], components: &[f32]) {
         let distance = code
             .approximate_distance(&query)
             .expect("distance is finite");
-        assert_distance_bits_equal(
+        assert_rough_bits_equal(
             distance,
-            expanded_reference_distance(encoded, components, metric),
+            expanded_reference_rough(encoded, components, metric),
         );
     }
+}
+
+fn assert_rough_bits_equal(actual: ApproximateDistance, expected: f64) {
+    assert_eq!(actual.rough().to_bits(), expected.to_bits());
 }
 
 fn assert_distance_bits_equal(actual: ApproximateDistance, expected: ApproximateDistance) {
@@ -756,86 +771,24 @@ fn independently_encode_payload(codes: &[i8], scale: f32, error: f32) -> Vec<u8>
     encoded
 }
 
-/// Expanded scalar reference for bit-exact rough values and interval endpoints.
-fn expanded_reference_distance(
-    encoded: &[u8],
-    components: &[f32],
-    metric: Metric,
-) -> ApproximateDistance {
+/// Independent packed decoding and scalar accumulation preserve rough scores.
+fn expanded_reference_rough(encoded: &[u8], components: &[f32], metric: Metric) -> f64 {
     let signed_codes = independently_decode_codes(encoded, components.len());
-    let scale = f32::from_bits(read_u32_le(encoded, 0));
-    let code_norm_squared = read_u32_le(encoded, 4);
-    let reconstruction_error_upper = f32::from_bits(read_u32_le(encoded, 8));
+    let scale = f64::from(f32::from_bits(read_u32_le(encoded, 0)));
+    let code_norm_squared = f64::from(read_u32_le(encoded, 4));
     let mut norm_squared = 0.0_f64;
-    let mut norm_squared_lower = 0.0_f64;
-    let mut norm_squared_upper = 0.0_f64;
-    for &component in components {
+    let mut dot = 0.0_f64;
+    for (&component, &signed_code) in components.iter().zip(&signed_codes) {
         let component = f64::from(component);
         norm_squared += component * component;
-        norm_squared_lower = add_down(norm_squared_lower, multiply_down(component, component));
-        norm_squared_upper = add_up(norm_squared_upper, multiply_up(component, component));
-    }
-    let scale = f64::from(scale);
-    let mut dot = 0.0_f64;
-    let mut dot_lower = 0.0_f64;
-    let mut dot_upper = 0.0_f64;
-    for (&query_component, &signed_code) in components.iter().zip(&signed_codes) {
-        let query_component = f64::from(query_component);
         let reconstruction = scale * f64::from(signed_code);
-        let product = query_component * reconstruction;
-        dot += product;
-        dot_lower = add_down(dot_lower, multiply_down(query_component, reconstruction));
-        dot_upper = add_up(dot_upper, multiply_up(query_component, reconstruction));
+        dot += component * reconstruction;
     }
-
-    let error_upper = f64::from(reconstruction_error_upper);
-    let (rough, center_lower, center_upper, radius_upper, clamp_lower) = match metric {
-        Metric::InnerProduct => {
-            let radius = multiply_up(sqrt_up(norm_squared_upper), error_upper);
-            (-dot, -dot_upper, -dot_lower, radius, false)
-        }
-        Metric::Cosine => {
-            let radius = multiply_up(sqrt_up(norm_squared_upper), error_upper);
-            (
-                1.0 - dot,
-                add_down(1.0, -dot_upper),
-                add_up(1.0, -dot_lower),
-                radius,
-                false,
-            )
-        }
-        Metric::L2 => {
-            let reconstruction_norm_squared = scale * scale * f64::from(code_norm_squared);
-            let reconstruction_norm_squared_lower =
-                multiply_down(multiply_down(scale, scale), f64::from(code_norm_squared));
-            let reconstruction_norm_squared_upper =
-                multiply_up(multiply_up(scale, scale), f64::from(code_norm_squared));
-            let rough = (norm_squared + reconstruction_norm_squared - 2.0 * dot).max(0.0);
-            let lower = add_down(
-                add_down(norm_squared_lower, reconstruction_norm_squared_lower),
-                -multiply_up(2.0, dot_upper),
-            )
-            .max(0.0);
-            let upper = add_up(
-                add_up(norm_squared_upper, reconstruction_norm_squared_upper),
-                -multiply_down(2.0, dot_lower),
-            )
-            .max(0.0);
-            let root_distance_upper = sqrt_up(upper);
-            let linear_error = multiply_up(multiply_up(2.0, root_distance_upper), error_upper);
-            let squared_error = multiply_up(error_upper, error_upper);
-            let radius = add_up(linear_error, squared_error);
-            (rough, lower, upper, radius, true)
-        }
-    };
-
-    let mut lower = add_down(center_lower, -radius_upper);
-    if clamp_lower {
-        lower = lower.max(0.0);
+    match metric {
+        Metric::InnerProduct => -dot,
+        Metric::Cosine => 1.0 - dot,
+        Metric::L2 => (norm_squared + scale * scale * code_norm_squared - 2.0 * dot).max(0.0),
     }
-    let upper = add_up(center_upper, radius_upper);
-    ApproximateDistance::from_conservative_bounds(rough, lower, upper)
-        .expect("finite expanded reference interval")
 }
 
 /// Floating comparisons independently select the upward neighbor for the bit oracle.
@@ -949,4 +902,69 @@ fn assert_corruption<T>(result: crate::api::Result<T>) {
 fn assert_kind<T>(result: crate::api::Result<T>, expected: ErrorKind) {
     let error = result.err().expect("operation must fail");
     assert_eq!(error.kind(), expected);
+}
+
+/// Exact integer dot products exercise cancellation and the full f32 exponent
+/// range without relying on a floating-point oracle's own rounding error.
+#[test]
+fn aggregate_dot_bound_covers_exact_rational_reconstruction() {
+    let values = [
+        0.0,
+        -0.0,
+        f32::from_bits(1),
+        -f32::from_bits(1),
+        f32::MIN_POSITIVE,
+        -f32::MIN_POSITIVE,
+        1.0,
+        -1.0,
+        f32::MAX,
+        -f32::MAX,
+    ];
+    for dimension in [1, 2, 3, 4, 7, 8, 127, 128, 784, MAX_DIMENSION] {
+        for scale in [f32::from_bits(1), f32::MIN_POSITIVE, 1.0, f32::MAX] {
+            let codes: Vec<i8> = (0..dimension)
+                .map(|i| ((i * 19) % 127) as i8 - 63)
+                .collect();
+            let components: Vec<f32> = (0..dimension)
+                .map(|i| values[(i * 37 + 3) % values.len()])
+                .collect();
+            let encoded = independently_encode_payload(&codes, scale, 0.0);
+            assert_exact_reconstructed_dot(&encoded, &components);
+        }
+    }
+}
+
+/// The exact reconstructed dot uses integer arithmetic in units of 2^-298;
+/// shifting by 776 puts it in the same units as the f64 endpoint oracle.
+fn assert_exact_reconstructed_dot(encoded: &[u8], components: &[f32]) {
+    let code = RaBitQ7::decode(encoded, components.len()).expect("canonical reconstruction");
+    let query = RaBitQQuery::new(components, Metric::InnerProduct).expect("query");
+    let distance = code.approximate_distance(&query).expect("bounded dot");
+    let scale = scaled_f32_integer(f32::from_bits(read_u32_le(encoded, 0)));
+    let codes = independently_decode_codes(encoded, components.len());
+    let exact = -components
+        .iter()
+        .zip(codes)
+        .fold(BigInt::from(0), |sum, (&q, c)| {
+            sum + scaled_f32_integer(q) * &scale * c
+        })
+        << 776_usize;
+    assert!(scaled_f64_integer(distance.lower()) <= exact);
+    assert!(exact <= scaled_f64_integer(distance.upper()));
+}
+
+/// Represents a finite f64 exactly in units of 2^-1074.
+fn scaled_f64_integer(value: f64) -> BigInt {
+    assert!(value.is_finite());
+    let bits = value.to_bits();
+    let exponent = (bits >> 52) & 0x7ff;
+    let fraction = bits & ((1 << 52) - 1);
+    let significand = if exponent == 0 {
+        fraction
+    } else {
+        (1 << 52) | fraction
+    };
+    let shift = if exponent == 0 { 0 } else { exponent - 1 };
+    let integer = BigInt::from(significand) << shift as usize;
+    if bits >> 63 == 0 { integer } else { -integer }
 }
