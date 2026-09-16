@@ -562,25 +562,38 @@ impl Traversal {
         let BodyEntries::Internal(entries) = body.entries() else {
             return Err(Error::new(ErrorKind::Corruption));
         };
-        for child in entries {
-            let distance = context
-                .kernel
-                .routing_distance(context.request.routing, child.centroid())?;
-            // Every non-root partition has exactly one incoming Child
-            // Entry; a second reference is Corruption, not a duplicate to
-            // deduplicate.
-            if !self.referenced.insert((tree, child.child())) {
-                return Err(Error::new(ErrorKind::Corruption));
+        for children in entries.chunks(4) {
+            let distances = if children.len() == 4 {
+                context.kernel.routing_centroid_distances(
+                    context.request.routing,
+                    std::array::from_fn::<_, 4, _>(|lane| children[lane].centroid()),
+                )?
+            } else {
+                let mut distances = [0.0; 4];
+                for (child, distance) in children.iter().zip(&mut distances) {
+                    *distance = context
+                        .kernel
+                        .routing_distance(context.request.routing, child.centroid())?;
+                }
+                distances
+            };
+            for (child, distance) in children.iter().zip(distances) {
+                // Every non-root partition has exactly one incoming Child
+                // Entry; a second reference is Corruption, not a duplicate to
+                // deduplicate.
+                if !self.referenced.insert((tree, child.child())) {
+                    return Err(Error::new(ErrorKind::Corruption));
+                }
+                self.next_frontier
+                    .entry((tree, level - 1))
+                    .or_default()
+                    .push(FrontierEntry {
+                        distance,
+                        tree,
+                        partition: child.child(),
+                        expected_level: Some(level - 1),
+                    });
             }
-            self.next_frontier
-                .entry((tree, level - 1))
-                .or_default()
-                .push(FrontierEntry {
-                    distance,
-                    tree,
-                    partition: child.child(),
-                    expected_level: Some(level - 1),
-                });
         }
         Ok(())
     }
