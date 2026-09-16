@@ -91,10 +91,26 @@ pub(super) fn approximate_distances(
     }
     let scales = codes.each_ref().map(|code| f64::from(code.scale));
     let mut dots = [0.0_f64; 4];
-    for (index, &component) in query.components.iter().enumerate() {
+    // Decode complete packed groups once while preserving scalar accumulation order.
+    let mut blocks = query.components.chunks_exact(4);
+    for (block, components) in blocks.by_ref().enumerate() {
+        let decoded: [_; 4] = std::array::from_fn(|lane| codes[lane].code_block(block));
+        for (component_index, &component) in components.iter().enumerate() {
+            let component = f64::from(component);
+            for lane in 0..4 {
+                let reconstruction =
+                    scales[lane] * f64::from(decoded[lane].signed_code(component_index));
+                let product = component * reconstruction;
+                dots[lane] += product;
+            }
+        }
+    }
+    let tail_start = query.components.len() - blocks.remainder().len();
+    for (offset, &component) in blocks.remainder().iter().enumerate() {
         let component = f64::from(component);
         for lane in 0..4 {
-            let reconstruction = scales[lane] * f64::from(codes[lane].signed_code(index));
+            let reconstruction =
+                scales[lane] * f64::from(codes[lane].signed_code(tail_start + offset));
             let product = component * reconstruction;
             dots[lane] += product;
         }
