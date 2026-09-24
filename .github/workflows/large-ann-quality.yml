@@ -9,8 +9,7 @@ on:
 permissions:
   contents: read
 
-# The labeled runner is dedicated to benchmarks; serializing runs keeps the
-# host otherwise idle and preserves same-host curve comparability.
+# Serialize large runs to avoid overlapping expensive benchmark workflows.
 concurrency:
   group: ktann-large-ann-quality
   cancel-in-progress: false
@@ -21,8 +20,8 @@ env:
 jobs:
   rocksdb-large-quality:
     name: RocksDB million-vector quality curves
-    runs-on: [self-hosted, ktann-benchmark]
-    timeout-minutes: 1440
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust

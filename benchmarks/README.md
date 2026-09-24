@@ -81,9 +81,11 @@ saturated or structurally shallow run fails instead of publishing a
 non-discriminating artifact.
 
 `.github/workflows/large-ann-quality.yml` runs weekly and on manual dispatch
-on a dedicated self-hosted runner labeled `ktann-benchmark`. Its concurrency
-group serializes runs so the host is otherwise idle; it retains the validated
-dataset cache and uploads the schema-versioned JSON artifact for 90 days.
+on a GitHub-hosted `ubuntu-latest` runner with a six-hour job timeout. Its
+concurrency group serializes large runs, and it uploads the schema-versioned
+JSON artifact for 90 days. Each run downloads and validates the datasets on
+its fresh runner. These runs verify the large profile and produce quality
+curves; use a fixed, otherwise idle host for performance comparisons across runs.
 
 FoundationDB requires a reachable local cluster, the client library, and
 `fdbcli`. The runner queries `fdbcli --exec status json` so the connected
