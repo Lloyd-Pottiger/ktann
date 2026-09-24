@@ -155,6 +155,31 @@ impl VectorKernel {
             validate_vector(routing, self.dimension, VectorSource::Caller)?;
         }
         validate_vector(centroid, self.dimension, VectorSource::Persistent)?;
+        Ok(self.interleaved_distances(routings, centroid))
+    }
+
+    /// Scores independent persistent centroids against one query, preserving
+    /// each scalar routing distance's accumulation order and exact bits.
+    pub(crate) fn routing_centroid_distances<const N: usize>(
+        &self,
+        routing: &[f32],
+        centroids: [&[f32]; N],
+    ) -> Result<[f64; N]> {
+        validate_vector(routing, self.dimension, VectorSource::Caller)?;
+        for centroid in centroids {
+            validate_vector(centroid, self.dimension, VectorSource::Persistent)?;
+        }
+        // Squared L2 and negative dot products are symmetric, including their
+        // scalar IEEE-754 results; validation still follows input ownership.
+        Ok(self.interleaved_distances(centroids, routing))
+    }
+
+    /// Interleaves validated vectors without reassociating their additions.
+    fn interleaved_distances<const N: usize>(
+        &self,
+        routings: [&[f32]; N],
+        centroid: &[f32],
+    ) -> [f64; N] {
         let mut distances = [0.0; N];
         match self.metric {
             Metric::L2 => {
@@ -178,7 +203,7 @@ impl VectorKernel {
                 }
             }
         }
-        Ok(distances)
+        distances
     }
 
     /// Computes the exact scalar-f64 distance to one committed Vector Record.
@@ -784,7 +809,23 @@ mod tests {
                     let distances = kernel
                         .routing_distances(vectors.each_ref().map(Vec::as_slice), &centroid)
                         .unwrap();
-                    for (vector, distance) in vectors.iter().zip(distances) {
+                    let centroid_distances = kernel
+                        .routing_centroid_distances(
+                            &centroid,
+                            vectors.each_ref().map(Vec::as_slice),
+                        )
+                        .unwrap();
+                    for ((vector, distance), centroid_distance) in
+                        vectors.iter().zip(distances).zip(centroid_distances)
+                    {
+                        assert_eq!(
+                            centroid_distance.to_bits(),
+                            kernel
+                                .routing_distance(&centroid, vector)
+                                .unwrap()
+                                .to_bits(),
+                            "centroid metric={metric:?} dimension={dimension} trial={trial}"
+                        );
                         assert_eq!(
                             distance.to_bits(),
                             kernel
@@ -811,10 +852,18 @@ mod tests {
                     kernel.routing_distances(vectors, &valid),
                     ErrorKind::InvalidArgument,
                 );
+                assert_kind(
+                    kernel.routing_centroid_distances(&valid, vectors),
+                    ErrorKind::Corruption,
+                );
             }
             assert_kind(
                 kernel.routing_distances([&valid; 4], invalid),
                 ErrorKind::Corruption,
+            );
+            assert_kind(
+                kernel.routing_centroid_distances(invalid, [&valid; 4]),
+                ErrorKind::InvalidArgument,
             );
         }
     }

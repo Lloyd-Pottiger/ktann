@@ -159,9 +159,9 @@ pub(super) struct CodeBlock {
 
 impl CodeBlock {
     /// Expands one of the four components directly from the loaded group.
-    pub(super) fn signed_code(&self, component: usize) -> i8 {
+    pub(super) fn signed_code(&self, component: usize) -> i32 {
         let magnitude =
-            ((self.magnitudes >> (component * MAGNITUDE_BITS)) & u32::from(MAX_MAGNITUDE)) as i8;
+            ((self.magnitudes >> (component * MAGNITUDE_BITS)) & u32::from(MAX_MAGNITUDE)) as i32;
         if self.signs & (1 << component) == 0 {
             magnitude
         } else {
