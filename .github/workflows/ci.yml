@@ -39,6 +39,9 @@ jobs:
         run: >-
           cargo +"${{ matrix.toolchain }}" doc --workspace --all-features
           --no-deps
+      - name: Remove generated documentation before cache cleanup
+        # rust-cache mistakes rustdoc source directories named tests for build artifacts.
+        run: cargo +"${{ matrix.toolchain }}" clean --doc
       - name: Run RocksDB benchmark smoke profile including lifecycle
         if: matrix.toolchain == 'stable'
         run: >-
