@@ -729,7 +729,7 @@ impl Traversal {
         // Exact membership admits at most one Leaf Entry per Vector Record in
         // one snapshot, even across draining split bodies; a duplicate Record
         // ID is Corruption rather than silently deduplicated.
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::with_capacity(self.candidates.len());
         for candidate in &self.candidates {
             if !seen.insert(candidate.record_id().as_ref()) {
                 return Err(Error::new(ErrorKind::Corruption));
