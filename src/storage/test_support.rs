@@ -32,6 +32,8 @@ pub(crate) struct MockReadTxn {
     pub(crate) data: BTreeMap<Vec<u8>, Vec<u8>>,
     /// The number of point reads performed.
     pub(crate) gets: usize,
+    /// The key counts of batched point-read requests.
+    pub(crate) batch_sizes: Vec<usize>,
     /// The number of scans performed.
     pub(crate) scans: usize,
     /// The maximum number of keys one batched get accepts.
@@ -46,6 +48,7 @@ impl MockReadTxn {
         Self {
             data: items.into_iter().collect(),
             gets: 0,
+            batch_sizes: Vec::new(),
             scans: 0,
             max_batch_size: 10_000,
             scans_fail: false,
@@ -73,6 +76,7 @@ impl ReadOps for MockReadTxn {
     }
 
     async fn batch_get(&mut self, keys: Vec<Bytes>) -> Result<Vec<Option<Bytes>>> {
+        self.batch_sizes.push(keys.len());
         if self.batch_gets_fail {
             return Err(Error::new(ErrorKind::Backend));
         }

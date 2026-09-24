@@ -78,6 +78,9 @@ use super::rerank::{LeafCandidate, filter_candidates};
 /// The default leaf-level base beam (design `search.md` section 6).
 pub(crate) const DEFAULT_LEAF_BEAM: u32 = 128;
 
+/// Bounds the metadata held while visiting an already-funded internal beam.
+const INTERNAL_HEADER_BATCH: usize = 32;
+
 /// One bounded traversal request over the enumerated trees of one snapshot.
 ///
 /// `routing` is the validated, metric-preprocessed, rotated query vector.
@@ -362,8 +365,18 @@ impl Traversal {
             if self.visited_partitions == context.request.budgets.visited_partitions() {
                 break;
             }
-            let Reverse(entry) = self.frontier.pop().expect("frontier checked non-empty");
-            self.visit_partition(txn, context, entry).await?;
+            let remaining = context.request.budgets.visited_partitions() - self.visited_partitions;
+            if remaining > 1
+                && self.frontier.len() > 1
+                && self.frontier.peek().is_some_and(|Reverse(entry)| {
+                    entry.expected_level.is_some_and(|level| level > 1)
+                })
+            {
+                self.visit_internal_beam(txn, context, remaining).await?;
+            } else {
+                let Reverse(entry) = self.frontier.pop().expect("frontier checked non-empty");
+                self.visit_partition(txn, context, entry, None).await?;
+            }
             // A depleted Leaf Entry budget stops the whole traversal: every
             // remaining leaf visit consumes it, and expanding internal nodes
             // could only queue more unfundable leaf work.
@@ -381,12 +394,58 @@ impl Traversal {
         Ok(())
     }
 
+    /// Batches a funded prefix without changing its visitation order.
+    ///
+    /// Non-root internal entries neither consume Leaf Entry budget nor inject
+    /// root-split targets into the active frontier. Thus every fetched Header
+    /// will be visited unless the whole operation fails. Roots and leaves keep
+    /// their demand-driven reads; in particular, leaf-budget exhaustion never
+    /// causes speculative metadata reads for later leaves.
+    async fn visit_internal_beam<T: ReadOps>(
+        &mut self,
+        txn: &mut ReadLogicalTxn<'_, T>,
+        context: &VisitContext<'_>,
+        remaining: u32,
+    ) -> Result<()> {
+        let limit = INTERNAL_HEADER_BATCH.min(remaining as usize);
+        let mut entries = Vec::with_capacity(limit.min(self.frontier.len()));
+        while entries.len() < limit
+            && self
+                .frontier
+                .peek()
+                .is_some_and(|Reverse(entry)| entry.expected_level.is_some_and(|level| level > 1))
+        {
+            entries.push(self.frontier.pop().expect("frontier checked non-empty").0);
+        }
+        if entries.len() == 1 {
+            return self.visit_partition(txn, context, entries[0], None).await;
+        }
+        let keys = entries
+            .iter()
+            .map(|entry| LogicalKey::Header {
+                index: context.manifest.logical_index_id(),
+                tree_key: context.request.trees[entry.tree as usize]
+                    .tree_key()
+                    .clone(),
+                partition: entry.partition,
+            })
+            .collect();
+        let headers = txn.batch_get(keys).await?;
+        for (entry, value) in entries.into_iter().zip(headers) {
+            let header = expect_header(value)?.ok_or_else(|| Error::new(ErrorKind::Corruption))?;
+            self.visit_partition(txn, context, entry, Some(header))
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Visits one queued partition body and accounts for it.
     async fn visit_partition<T: ReadOps>(
         &mut self,
         txn: &mut ReadLogicalTxn<'_, T>,
         context: &VisitContext<'_>,
         entry: FrontierEntry,
+        prefetched_header: Option<PartitionHeader>,
     ) -> Result<()> {
         self.visited_partitions = self
             .visited_partitions
@@ -402,28 +461,29 @@ impl Traversal {
             tree_key: tree_key.clone(),
             partition: entry.partition,
         };
-        let (header, synopsis) =
-            if context.request.predicate.is_some() && entry.expected_level == Some(1) {
-                let mut values = txn
-                    .batch_get(vec![
-                        header_key,
-                        LogicalKey::Synopsis {
-                            index,
-                            tree_key: tree_key.clone(),
-                            partition: entry.partition,
-                        },
-                    ])
-                    .await?;
-                let synopsis = expect_synopsis(values.pop().flatten())?
-                    .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
-                let header = expect_header(values.pop().flatten())?
-                    .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
-                (header, Some(synopsis))
-            } else {
-                let header = expect_header(txn.get(header_key).await?)?
-                    .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
-                (header, None)
-            };
+        let (header, synopsis) = if let Some(header) = prefetched_header {
+            (header, None)
+        } else if context.request.predicate.is_some() && entry.expected_level == Some(1) {
+            let mut values = txn
+                .batch_get(vec![
+                    header_key,
+                    LogicalKey::Synopsis {
+                        index,
+                        tree_key: tree_key.clone(),
+                        partition: entry.partition,
+                    },
+                ])
+                .await?;
+            let synopsis = expect_synopsis(values.pop().flatten())?
+                .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
+            let header = expect_header(values.pop().flatten())?
+                .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
+            (header, Some(synopsis))
+        } else {
+            let header = expect_header(txn.get(header_key).await?)?
+                .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
+            (header, None)
+        };
 
         // Every Child Entry descends exactly one level, so a referenced
         // partition's Header must agree with the level its edge established;
@@ -1130,6 +1190,93 @@ mod tests {
                 assert!(!outcome.rabitq_overlap_truncated());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn internal_header_batches_are_bounded_and_read_each_header_once() {
+        let manifest = manifest();
+        let mut fixture = Fixture::new(&manifest);
+        let tree = fixture.tree(1);
+        fixture.header(&tree, 1, 3, 70, PartitionState::Ready);
+        for partition in 2..72 {
+            fixture.child(&tree, 1, partition, [partition as f32, 0.0]);
+            fixture.header(&tree, partition, 2, 0, PartitionState::Ready);
+        }
+        let trees = [tree_ref(&tree)];
+        let kernel = VectorKernel::new(DIMENSION, Metric::L2, SEED).expect("valid kernel");
+        for capacity in [0, 1 << 20] {
+            let cache = PartitionCache::new(capacity);
+            for _ in 0..2 {
+                let mut txn =
+                    ReadLogicalTxn::for_index(MockReadTxn::new(fixture.items.clone()), &manifest)
+                        .expect("bind manifest");
+                let outcome = traverse(
+                    &mut txn,
+                    &cache,
+                    &kernel,
+                    TraversalRequest::new(&QUERY, &trees, None, 4, budgets(100, 8, 8), 256)
+                        .expect("valid request"),
+                )
+                .await
+                .expect("traverse empty internal beam");
+                assert_eq!(outcome.visited_partitions(), 71);
+                assert!(!outcome.partition_budget_exhausted());
+                let raw = txn.into_raw();
+                assert_eq!(raw.gets, 1, "only the root needs an individual Header read");
+                assert_eq!(raw.batch_sizes.iter().sum::<usize>(), 70);
+                assert!(
+                    raw.batch_sizes
+                        .iter()
+                        .all(|&size| size <= super::INTERNAL_HEADER_BATCH)
+                );
+                assert!(
+                    raw.batch_sizes.len() < 70,
+                    "internal Header requests are coalesced"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_header_batch_does_not_read_beyond_partition_budget() {
+        let manifest = manifest();
+        let mut fixture = Fixture::new(&manifest);
+        let tree = fixture.tree(1);
+        fixture.header(&tree, 1, 3, 3, PartitionState::Ready);
+        for partition in 2..5 {
+            fixture.child(&tree, 1, partition, [partition as f32, 0.0]);
+        }
+        fixture.header(&tree, 2, 2, 0, PartitionState::Ready);
+        fixture.header(&tree, 3, 2, 0, PartitionState::Ready);
+        // The last selected child is corrupt (missing Header), but it is not
+        // encountered until the query can fund all four partition visits.
+        for limit in 1..4 {
+            let outcome = run(
+                fixture.items.clone(),
+                &manifest,
+                &[tree_ref(&tree)],
+                None,
+                4,
+                budgets(limit, 8, 8),
+                DEFAULT_LEAF_BEAM,
+            )
+            .await
+            .expect("unfunded missing Header is not read");
+            assert_eq!(outcome.visited_partitions(), limit);
+            assert!(outcome.partition_budget_exhausted());
+        }
+        assert_corruption(
+            run(
+                fixture.items,
+                &manifest,
+                &[tree_ref(&tree)],
+                None,
+                4,
+                budgets(4, 8, 8),
+                DEFAULT_LEAF_BEAM,
+            )
+            .await,
+        );
     }
 
     #[tokio::test]
