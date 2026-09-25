@@ -84,7 +84,22 @@ pub(super) fn decode(encoded: &[u8], dimension: usize) -> Result<RaBitQ7<'_>> {
     }
 
     let mut actual_norm = 0_u32;
-    for index in 0..dimension {
+    // A complete group shares three magnitude bytes and one sign nibble.
+    // Four six-bit squares fit in u32; only the running total can overflow.
+    for index in 0..dimension / 4 {
+        let block = code.code_block(index);
+        let mut block_norm = 0_u32;
+        for component in 0..4 {
+            let magnitude =
+                (block.magnitudes >> (component * MAGNITUDE_BITS)) & u32::from(MAX_MAGNITUDE);
+            if magnitude == 0 && block.signs & (1 << component) != 0 {
+                return Err(corrupt());
+            }
+            block_norm += magnitude * magnitude;
+        }
+        actual_norm = actual_norm.checked_add(block_norm).ok_or_else(corrupt)?;
+    }
+    for index in dimension / 4 * 4..dimension {
         let negative =
             code.signs[index / u8::BITS as usize] & (1_u8 << (index % u8::BITS as usize)) != 0;
         let magnitude = decode_magnitude(code.magnitudes, index);
