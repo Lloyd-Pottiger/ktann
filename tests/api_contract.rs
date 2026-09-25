@@ -21,6 +21,25 @@ fn assert_invalid<T>(result: ktann::api::Result<T>) {
 }
 
 #[test]
+fn runtime_cache_defaults_to_physical_memory_fraction() -> ktann::api::Result<()> {
+    let mut system = sysinfo::System::new();
+    system.refresh_memory_specifics(sysinfo::MemoryRefreshKind::nothing().with_ram());
+    let config = RuntimeConfig::default();
+    assert_eq!(
+        config.partition_cache_bytes(),
+        (system.total_memory() / 4).min(usize::MAX as u64),
+    );
+    config.validate()?;
+
+    for bytes in [0, 4096] {
+        let overridden = config.clone().with_partition_cache_bytes(bytes)?;
+        assert_eq!(overridden.partition_cache_bytes(), bytes);
+        overridden.validate()?;
+    }
+    Ok(())
+}
+
+#[test]
 fn immutable_configuration_enforces_schema_contract() -> ktann::api::Result<()> {
     assert_invalid(IndexConfig::new(0, Metric::L2));
     assert_invalid(IndexConfig::new(16_385, Metric::L2));
