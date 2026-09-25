@@ -184,6 +184,24 @@ fn malformed_payloads_fail_closed() {
 }
 
 #[test]
+fn every_component_rejects_negative_zero_and_unaccounted_magnitude() {
+    for dimension in [4, 7, 8, 9] {
+        let zero = independently_encode_payload(&vec![0; dimension], 0.0, 0.0);
+        RaBitQ7::decode(&zero, dimension).expect("canonical zero code");
+        for index in 0..dimension {
+            let mut negative_zero = zero.clone();
+            negative_zero[12 + index / 8] |= 1 << (index % 8);
+            assert_corruption(RaBitQ7::decode(&negative_zero, dimension));
+
+            let mut wrong_norm = zero.clone();
+            let magnitude_start = 12 + dimension.div_ceil(8);
+            wrong_norm[magnitude_start + index * 6 / 8] |= 1 << (index * 6 % 8);
+            assert_corruption(RaBitQ7::decode(&wrong_norm, dimension));
+        }
+    }
+}
+
+#[test]
 fn caller_input_and_arithmetic_fail_as_invalid_argument() {
     assert_kind(RaBitQ7::quantize(&[]), ErrorKind::InvalidArgument);
     assert_kind(RaBitQ7::quantize(&[f32::NAN]), ErrorKind::InvalidArgument);

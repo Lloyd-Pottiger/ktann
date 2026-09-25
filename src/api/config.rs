@@ -4,6 +4,8 @@ use std::collections::HashSet;
 use std::thread;
 use std::time::Duration;
 
+use sysinfo::{MemoryRefreshKind, System};
+
 use super::schema::{MAX_ENCODED_SYNOPSIS_BYTES, MAX_FIELDS, MAX_STRING_BYTES};
 use super::{DataType, Error, FieldId, FieldSchema, Metric, Result, SearchBudgets, SynopsisConfig};
 
@@ -17,7 +19,6 @@ const DEFAULT_FIXUP_QUEUE_CAPACITY: usize = 1_024;
 const DEFAULT_FOREGROUND_OPERATION_LIMIT: usize = 1_024;
 const MAX_FOREGROUND_OPERATION_LIMIT: usize = 65_536;
 const DEFAULT_ATTEMPTS: u32 = 8;
-const DEFAULT_PARTITION_CACHE_BYTES: u64 = 256 * 1_024 * 1_024;
 const DEFAULT_TREE_KEY_SCAN_RANGES: u32 = 1_024;
 const DEFAULT_WRITE_BEAM_SIZE: u32 = 8;
 const MAX_WRITE_BEAM_SIZE: u32 = 16_384;
@@ -215,6 +216,10 @@ impl IndexConfig {
 }
 
 /// Process-local configuration owned by one Runtime.
+///
+/// The default partition cache budget is one quarter of the machine's total
+/// physical memory, capped at `usize::MAX`. If memory discovery is unavailable,
+/// the default cache is disabled. Explicit cache capacities override this budget.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct RuntimeConfig {
@@ -238,13 +243,16 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         let available = thread::available_parallelism().map_or(1, usize::from);
         let workers = available.clamp(1, 8);
+        let mut system = System::new();
+        system.refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
+        let partition_cache_bytes = (system.total_memory() / 4).min(usize::MAX as u64);
         Self {
             foreground_operation_limit: DEFAULT_FOREGROUND_OPERATION_LIMIT,
             maintenance_workers: workers,
             fixup_queue_capacity: DEFAULT_FIXUP_QUEUE_CAPACITY,
             fixup_attempts: DEFAULT_ATTEMPTS,
             foreground_attempts: DEFAULT_ATTEMPTS,
-            partition_cache_bytes: DEFAULT_PARTITION_CACHE_BYTES,
+            partition_cache_bytes,
             default_search_budgets: SearchBudgets::default(),
             tree_key_scan_ranges: DEFAULT_TREE_KEY_SCAN_RANGES,
             write_beam_size: DEFAULT_WRITE_BEAM_SIZE,

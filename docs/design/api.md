@@ -181,6 +181,14 @@ one leaf. Adapter config owns backend resources such as RocksDB blocking
 concurrency. Search options may only lower or override process defaults within
 hard caps; changing them cannot alter index correctness.
 
+The default partition cache budget is computed when `RuntimeConfig` is created
+from total physical memory, not currently available memory. Each Runtime owns
+its budget; it is shared by that Runtime's Logical Indexes, not reserved up
+front or divided across Runtime instances. If the system cannot report total
+memory, the default is zero (cache disabled). An explicit
+`with_partition_cache_bytes` value takes precedence, including zero. Applications
+with container or shared-process limits can supply their own byte budget.
+
 The v1 defaults and caps are:
 
 | Setting | Default | Hard cap / validation |
@@ -189,7 +197,7 @@ The v1 defaults and caps are:
 | Maintenance workers | `min(available_parallelism, 8)`, min 1 | zero disables background maintenance |
 | Pending/running fixups | 1,024 | positive, at least worker count |
 | Fixup / foreground attempts | 8 each | at least 1 |
-| Partition cache | 256 MiB | zero disables; must fit `usize` |
+| Partition cache | 25% of machine total physical memory, capped at `usize::MAX` | zero disables; must fit `usize` |
 | Scanned Tree Keys | 4,096 | 65,536 |
 | Visited partitions | 1,024 | 16,384 |
 | Visited Leaf Entries | 65,536 | 1,048,576 |
