@@ -1,13 +1,12 @@
-# KTANN plus benchmark bridge
+# VectorDBBench bridge
 
-This is a **benchmark-only** VectorDBBench integration, not a KTANN service API.
-The supported upstream revision is
-[`1760db148b951363f2282261f30179dfd2ce3790`](https://github.com/Lloyd-Pottiger/VectorDBBench/tree/1760db148b951363f2282261f30179dfd2ce3790).
-The overlay adds only a client, connection/case configuration, DB enum/registry
-entries and CLI registration. It does not change runner workloads or metrics.
+`ktann-vdbbench-bridge` is a benchmark-only Rust binary, not a KTANN service API.
+KTANN owns the bridge, its native tests and dataset provenance. The Python
+client, CLI registration, run tools and process integration tests belong to
+[VectorDBBench](https://github.com/Lloyd-Pottiger/VectorDBBench).
+There is no Python overlay or installer in this repository.
 
-See [VALIDATION.md](VALIDATION.md) for measured integration runs and verification
-coverage, including the limits on interpreting their performance numbers.
+See [VALIDATION.md](VALIDATION.md) for historical measurements and their limits.
 
 ## Ownership and supported workload
 
@@ -65,153 +64,46 @@ the quality workload against oversized leaves while maintenance is progressing. 
 FoundationDB snapshot lifetime; a failed snapshot fails the run rather than
 claiming readiness.
 
-## Build and install
+## Build and run
 
-Requires Unix-domain sockets (macOS/Linux), Rust per the repository MSRV,
-a C++ toolchain/libclang for RocksDB, Python 3.11+, and the pinned upstream
-Python dependencies. Use an otherwise idle host for publishable measurements.
-Budget at least 16 GiB RAM and 30 GiB free disk for these cases, plus persistent
-backend storage and the FoundationDB server. The adapter caps bridge frames at
-8 MiB and connections at 128; these are bounds, not a whole-host memory limit.
-VectorDBBench and FoundationDB also consume memory in separate processes.
+Build an optimized bridge in the KTANN checkout:
 
 ```sh
-# In KTANN; the FoundationDB feature additionally needs its native client library.
-export PATH=/Users/lloyd/.local/foundationdb/7.3.69/bin:$PATH
-export FDB_CLUSTER_FILE=/Users/lloyd/.local/foundationdb/7.3.69/etc/fdb.cluster
-export DYLD_LIBRARY_PATH=/Users/lloyd/.local/lib
-export RUSTFLAGS='-L native=/Users/lloyd/.local/lib'
-cargo build --release -p ktann-benchmarks --bin ktann-vdbbench-bridge --all-features
-
-python3.12 -m venv /tmp/ktann-vdbbench-venv
-. /tmp/ktann-vdbbench-venv/bin/activate
-python benchmarks/vectordbbench/install.py ~/projects/VectorDBBench
-pip install -e ~/projects/VectorDBBench
-export IR_DATASETS_HOME=/tmp/ktann-vdbbench-ir
-export MPLCONFIGDIR=/tmp/ktann-vdbbench-mpl
-export LOG_FILE=/tmp/ktann-vdbbench.log
-vectordbbench ktann --help
+cargo build --release -p ktann-benchmarks --bin ktann-vdbbench-bridge
+# Add --all-features for FoundationDB; configure its native client and cluster
+# as described in the parent benchmark README.
 ```
 
-The installer checks the exact upstream HEAD, changes only its three registration
-sites and CLI imports, and copies the owned `ktann/` module. Re-running it updates
-the overlay. It never changes the checkout revision or installs a monkey patch.
-RocksDB-only builds may omit `--all-features` and the FoundationDB environment.
+Use a VectorDBBench checkout containing the KTANN adapter and install it with
+`pip install -e .`. Its `scripts/ktann/README.md` documents dataset preparation,
+canonical CLI runs and companion reports. The launcher accepts the bridge path
+and `--manifests /path/to/ktann/benchmarks/datasets`; it does not modify either
+checkout. It records the VectorDBBench revision and bridge binary SHA-256.
 
-FoundationDB requires a running cluster. Follow the repository's local server
-instructions and check `fdbcli --exec 'status minimal'`. The bridge records the
-linked client and connected server identities separately; build with the 7.3 API.
-The launcher generates a unique `ktann-vdbbench-*` Backend Namespace. Never point
-another process at the same namespace or RocksDB directory during a run.
+The native bridge uses protocol version 1 over a Unix socket: four-byte
+big-endian frame length followed by JSON, bounded to 8 MiB and 128 connections.
+Use a dedicated backend location and a fresh bridge for each run. Shutdown
+finishes import, drops the benchmark index and unlinks its socket. A killed
+process can leave a stale socket; remove it only after confirming the process
+has exited. The bridge never unlinks a preexisting socket automatically.
 
-## Fixed data and reproducible optimized runs
+## Verification
 
-Source URLs, object revisions, lengths and checksums are pinned in
-[`../datasets/cohere-1m.json`](../datasets/cohere-1m.json) and
-[`../datasets/sift-1m.json`](../datasets/sift-1m.json). Acquisition commands and
-provenance are in [`../datasets/README.md`](../datasets/README.md).
-The preparation command can acquire missing files with `--download`; it always
-validates source lengths and pinned SHA-256/S3 multipart-MD5 checksums. SIFT
-conversion is bounded by 10,000-row chunks, preserves every vector, query, ID
-and supplied top-100 neighbor, and writes converted-file SHA-256 checksums.
-It does not truncate the million-vector ground truth to a 500K subset. The
-pinned upstream runner may also acquire `scalar_labels.parquet` during Cohere
-preparation; the unfiltered KTANN workload does not use those labels.
+Native tests remain in `benchmarks/src/bridge.rs` and `bridge/topology.rs`:
 
 ```sh
-cache="$PWD/.benchmark-data/vectordb_bench/dataset"
-sift="$PWD/.benchmark-data/vdbbench-sift1m"
-python benchmarks/vectordbbench/datasets.py cohere-1m --cache "$cache" \
-  --output "$PWD/.benchmark-data/vdbbench-cohere-provenance"
-python benchmarks/vectordbbench/datasets.py sift-1m --cache "$cache" --output "$sift"
-
-# Run each combination separately on an idle host; do not run backends concurrently.
-python benchmarks/vectordbbench/run.py \
-  --checkout "$HOME/projects/VectorDBBench" \
-  --bridge "$PWD/target/release/ktann-vdbbench-bridge" \
-  --cache "$cache" --sift "$sift" \
-  --case sift-1m --backend rocksdb \
-  --output "$PWD/.benchmark-data/results/vdbbench-sift1m-rocksdb" \
-  --concurrency 1,2,4,8,16 --duration 30 --leaf-beam 32
-```
-
-Repeat with `--case cohere-1m` and/or `--backend foundationdb`, using a distinct
-output directory each time and identical concurrency, duration, k and tuning.
-The launcher uses upstream `--k 100 --load-concurrency 1 --insert-batch-size 50`,
-performs checksum validation, launches the ordinary CLI and shuts down the bridge
-in a `finally` block. It rejects failed canonical result labels and missing
-concurrency results. Optimizer timeouts remain bounded by the bridge even if
-the upstream case grants a longer allowance. Small synthetic tests below verify
-protocol correctness; they are not large-scale performance evidence.
-
-## Artifacts and metric meanings
-
-All public results must say **KTANN plus benchmark bridge**. Report the two
-backends separately. JSON serialization, socket IO, Python overhead, scheduling
-and queueing are included in upstream measured latencies and QPS. Upstream
-latency also includes Python input coercion before the wire-request timer.
-
-| Artifact | Meaning |
-| --- | --- |
-| `canonical/KTANN/result_*.json` | Unmodified upstream insert duration, optimize duration, their sum `load_duration`, serial p95/p99, mean recall@k, maximum-QPS headline and every per-concurrency QPS/latency list |
-| `canonical-p50.json` | Source-linked copies of upstream serial/per-concurrency p50; this pinned revision already supplies these fields |
-| `bridge.json` | Labelled companion: KTANN phase timing, Search Budget totals/exhaustion, topology, process CPU/peak RSS, Backend IO, backend identity/limits, wire bounds/version |
-| `clients/client-*.json`, `client-summary.json` | Per-worker and aggregate wire round-trip, JSON encode/decode, KTANN elapsed time, overhead, bounded latency histograms, continuous first-insert-through-final-search time |
-| `invocation.json`, `dataset.json` | Exact commands, upstream/KTANN revisions, binary SHA-256, host/Python facts and data identity/checksums |
-| `runner.log`, `bridge.log` | Failure and lifecycle diagnostics |
-
-The client continuous interval starts on entry to the first bridge insert
-request, before JSON encoding, and ends after decoding the final successful
-search response, using this host's shared monotonic clock. Initial input
-coercion before that first request is outside this interval. It includes
-process handoff, optimize, all search stages and intervening idle time. Bridge
-phase sums exclude Python and socket work. Its continuous interval starts on
-entry to import and ends after KTANN search, so use the **client** interval for
-the continuous bridge-client case. The client overhead is round-trip minus KTANN search time:
-JSON + IPC + queue/lock/scheduling wait; it is **not pure socket latency**. Decode
-and encode seconds are also reported independently. Log2-nanosecond histogram
-p50 values are labelled bucket upper bounds; use copied canonical p50 values for
-published serial/per-concurrency latency comparisons. Histograms use constant
-memory rather than retaining every query duration.
-
-Search Budget arrays are ordered Tree Keys, partitions, Leaf Entries, exact
-reranks; exhaustion arrays add RaBitQ overlap truncation last. Backend IO is
-logical adapter-boundary IO, not physical disk IO. CPU/RSS describe the bridge
-process, not the separate Python runner or FoundationDB server. Shutdown captures
-the companion before cleanup, deletes the dedicated Logical Index, shuts down
-Runtime and releases native ownership, then unlinks only its own socket. The
-RocksDB directory is retained under the result directory; obsolete SST bytes
-may remain until compaction. SIGINT uses the
-same path. SIGKILL cannot clean up; after confirming the old process is gone,
-remove its stale socket and launch a fresh bridge with the same dedicated
-backend location to reset the old Logical Index. The bridge never unlinks a
-preexisting socket automatically.
-
-## Tests and upstream contribution
-
-```sh
-export KTANN_BRIDGE_BIN="$PWD/target/release/ktann-vdbbench-bridge"
-export PYTHONPATH="$HOME/projects/VectorDBBench"
-python -m unittest discover -s benchmarks/vectordbbench/tests -v
-KTANN_TEST_BACKEND=foundationdb python -m unittest discover \
-  -s benchmarks/vectordbbench/tests -v
 cargo test -p ktann-benchmarks --all-features
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo fmt --all -- --check
 ```
 
-The process tests also execute the official CLI and assert canonical metric
-relationships and retention of both requested concurrency results. They cover
-a live client's pickle boundary, loader/optimizer handoff,
-concurrent spawned search workers, both backend selections, socket collision,
-clean and crash restart, native cleanup, shutdown with an incomplete frame,
-signed IDs, frame limits and non-retryable errors.
-The CLI takes the same registry/configuration path as other upstream adapters.
+Run the process tests from the VectorDBBench checkout, with its dependencies
+installed and the bridge built above:
 
-For an upstream PR, contribute `ktann/` as
-`vectordb_bench/backend/clients/ktann/`, the enum/config/case registry entries and
-CLI registration produced by `install.py`, plus the process-contract tests.
-Keep the Rust bridge and dataset provenance here. Document the pinned bridge
-binary/hash and version-1 protocol in the upstream adapter README. Publish the
-canonical result JSON alongside the labelled companion artifacts; do not add
-KTANN-only definitions to upstream metric fields.
+```sh
+export KTANN_BRIDGE_BIN=/path/to/ktann/target/release/ktann-vdbbench-bridge
+python -m unittest discover -s tests -p 'test_ktann_bridge.py' -v
+KTANN_TEST_BACKEND=foundationdb python -m unittest discover \
+  -s tests -p 'test_ktann_bridge.py' -v
+```
+
+These tests cover spawned workers, pickling, concurrent search, official CLI
+metrics, signed IDs, protocol errors, crash/restart and cleanup on both backends.
