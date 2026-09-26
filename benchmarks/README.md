@@ -436,7 +436,49 @@ transaction, latency, and atomicity requirements rather than from tree size.
 
 ## VectorDBBench interoperability
 
-The separate [VectorDBBench integration](vectordbbench/README.md) runs canonical
-spawned-process workloads through a bounded, benchmark-only Unix socket bridge.
-It supports RocksDB and FoundationDB with shared configuration and retains
-upstream results alongside explicitly labelled KTANN companion reports.
+`ktann-vdbbench-bridge` is a benchmark-only Rust binary supporting RocksDB and
+FoundationDB. One process owns the Runtime, backend and index across
+VectorDBBench's loader, optimizer and search workers. The Python client, CLI
+registration, run tools and process tests belong to the separate
+[VectorDBBench repository](https://github.com/Lloyd-Pottiger/VectorDBBench).
+
+The supported workload is unfiltered, single-tenant, IDs-only L2 or cosine
+search with signed 64-bit record IDs. Search inherits the public API defaults;
+explicit beam and budget overrides are recorded in the companion report.
+Canonical VectorDBBench metrics remain unchanged; native timings, topology,
+resources and backend IO are reported separately. See
+[Cohere default calibration](cohere-defaults-calibration.md) for measured
+recall and the limits of those measurements.
+
+Protocol version 1 uses a four-byte big-endian length followed by JSON over a
+Unix socket, bounded to 8 MiB per frame and 128 connections. Each insert commits
+at most 50 records and finishes its Import Session before acknowledging success.
+Unknown outcomes must not be replayed automatically. Optimize checks the exact
+record count and waits for no actionable or transitional partitions, failing
+on invalid snapshots or its bounded deadline.
+
+Build from the KTANN checkout:
+
+```sh
+cargo build --release -p ktann-benchmarks --bin ktann-vdbbench-bridge
+# For FoundationDB, add --all-features and configure the native client/cluster
+# using the FoundationDB instructions above.
+cargo test -p ktann-benchmarks --all-features
+```
+
+Use a VectorDBBench checkout containing the KTANN adapter, installed with
+`pip install -e .`. Its `scripts/ktann/README.md` describes dataset preparation
+and runs; pass the built bridge and `--manifests /path/to/ktann/benchmarks/datasets`
+to its launcher. Run the process tests from that checkout:
+
+```sh
+export KTANN_BRIDGE_BIN=/path/to/ktann/target/release/ktann-vdbbench-bridge
+python -m unittest discover -s tests -p 'test_ktann_bridge.py' -v
+KTANN_TEST_BACKEND=foundationdb python -m unittest discover \
+  -s tests -p 'test_ktann_bridge.py' -v
+```
+
+Use a fresh bridge and dedicated backend location per case. Shutdown finishes
+import, drops the benchmark index and removes its socket. After a crash, remove
+a stale socket only after confirming the old process has exited; the bridge
+never unlinks a preexisting socket automatically.
