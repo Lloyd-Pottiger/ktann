@@ -528,14 +528,28 @@ impl<B: Backend> Service<B> {
 
                 loop {
                     if Instant::now() >= deadline {
-                        return Err(("timeout", "topology readiness deadline exceeded".into()));
+                        return Err((
+                            "timeout",
+                            format!(
+                                "topology readiness deadline exceeded; last snapshot: {}",
+                                state.topology
+                            ),
+                        ));
                     }
                     let snapshot = tokio::time::timeout_at(
                         tokio::time::Instant::from_std(deadline),
                         topology::snapshot(&self.backend, index.logical_index_id(), records),
                     )
                     .await
-                    .map_err(|_| ("timeout", "topology snapshot deadline exceeded".into()))?
+                    .map_err(|_| {
+                        (
+                            "timeout",
+                            format!(
+                                "topology snapshot deadline exceeded; last snapshot: {}",
+                                state.topology
+                            ),
+                        )
+                    })?
                     .map_err(api_error)?;
                     state.topology = snapshot.facts;
                     if snapshot.ready {
@@ -543,12 +557,12 @@ impl<B: Backend> Service<B> {
                         state.optimize_seconds = start.elapsed().as_secs_f64();
                         return Ok(state.topology.clone());
                     }
-                    eprintln!(
-                        "optimize audit after {:.1}s: {}",
-                        start.elapsed().as_secs_f64(),
-                        state.topology
-                    );
                     if previous_progress != Some(snapshot.progress) {
+                        eprintln!(
+                            "optimize audit after {:.1}s: {}",
+                            start.elapsed().as_secs_f64(),
+                            state.topology
+                        );
                         previous_progress = Some(snapshot.progress);
                         last_progress = Instant::now();
                     }
