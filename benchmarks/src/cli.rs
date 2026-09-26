@@ -687,7 +687,7 @@ async fn run_foundationdb(
     reason = "the FoundationDB binding requires one process-global network boot"
 )]
 /// Boots the single FoundationDB network owned by one worker process.
-fn boot_foundationdb() -> foundationdb::api::NetworkAutoStop {
+pub(crate) fn boot_foundationdb() -> foundationdb::api::NetworkAutoStop {
     // SAFETY: a worker executes exactly one scenario, boots the process-global
     // network once, and retains this guard until all handles have been dropped.
     unsafe { foundationdb::boot() }
@@ -695,7 +695,7 @@ fn boot_foundationdb() -> foundationdb::api::NetworkAutoStop {
 
 /// Returns the linked client and connected server versions used by this run.
 #[cfg(feature = "foundationdb")]
-fn foundationdb_runtime_identity() -> Result<String, String> {
+pub(crate) fn foundationdb_runtime_identity() -> Result<String, String> {
     let client = foundationdb_client_version();
     let server = Command::new("fdbcli")
         .args(["--exec", "status json"])

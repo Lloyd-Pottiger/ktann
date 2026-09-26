@@ -164,6 +164,15 @@ impl SearchOptions {
         self.leaf_beam_size
     }
 
+    /// Returns the leaf-level beam after applying the engine default.
+    #[must_use]
+    pub const fn resolved_leaf_beam_size(self) -> u32 {
+        match self.leaf_beam_size {
+            Some(value) => value,
+            None => crate::search::traverse::DEFAULT_LEAF_BEAM,
+        }
+    }
+
     /// Resolves overrides against Runtime defaults and validates them for `k`.
     ///
     /// `SearchBudgets` fields are set only by validating constructors, so the

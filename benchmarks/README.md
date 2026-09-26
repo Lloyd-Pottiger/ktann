@@ -25,6 +25,17 @@ final foreground mutation still assigns each record to exactly one leaf. The
 default is eight, so the option is explicit when measuring another import beam
 and its quality effect.
 
+`--profile large --scenario quality-defaults-cohere-1m` calibrates recall@100
+on the complete Cohere1M cosine corpus with public API Search Budget defaults.
+It builds one index, then sweeps leaf beams 32, 128, 256, 384, 512 and 1024. Each
+point warms up on all 1000 canonical queries and measures those 1000 queries
+once, retaining recall, latency, CPU, Backend IO and budget exhaustion. This
+scenario uses import backlog watermark one to finish maintenance during load;
+the existing `quality-cohere-1m` and `quality-sift-1m` curves retain their k=10
+configuration and expanded traversal budgets.
+Measured quality and resource trade-offs are recorded in
+[the Cohere default calibration](cohere-defaults-calibration.md).
+
 Setup stays excluded from every reported measurement, but the setup import is
 where large-scale write behavior is decided. After each quality scenario's
 batch load, the runner therefore logs the import interval's diagnostics to
@@ -422,3 +433,10 @@ retryable commits, and mutation work without changing recall or forcing unsafe
 concurrency. Wall time and p95 submit latency remained close to the fixed
 baseline rather than improving uniformly. Callers choose batch size from their
 transaction, latency, and atomicity requirements rather than from tree size.
+
+## VectorDBBench interoperability
+
+The separate [VectorDBBench integration](vectordbbench/README.md) runs canonical
+spawned-process workloads through a bounded, benchmark-only Unix socket bridge.
+It supports RocksDB and FoundationDB with shared configuration and retains
+upstream results alongside explicitly labelled KTANN companion reports.
