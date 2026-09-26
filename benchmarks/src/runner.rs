@@ -349,23 +349,9 @@ fn large_scenarios() -> Result<Vec<ScenarioSpec>, String> {
         import_backlog_watermark: 2,
         maintenance_workers: 2,
     };
-    // Calibrate recall@100 against public Search Budget defaults on one index.
-    // Every point visits the complete canonical query corpus once after warmup.
-    let mut defaults = scenario(
-        "quality-defaults-cohere-1m",
-        "cohere-1m",
-        768,
-        Metric::Cosine,
-    );
-    defaults.k = 100;
-    defaults.search_options = SearchOptions::default();
-    defaults.leaf_beam_sweep = vec![32, 128, 256, 384, 512, 1024];
-    defaults.measured_operations = 1_000;
-    defaults.import_backlog_watermark = 1;
     Ok(vec![
         scenario("quality-cohere-1m", "cohere-1m", 768, Metric::Cosine),
         scenario("quality-sift-1m", "sift-1m", 128, Metric::L2),
-        defaults,
     ])
 }
 
@@ -2403,12 +2389,6 @@ mod tests {
     #[test]
     fn large_profile_is_an_explicit_single_variable_beam_sweep() {
         for scenario in scenarios("large").expect("large profile") {
-            if scenario.name == "quality-defaults-cohere-1m" {
-                assert_eq!(scenario.k, 100);
-                assert_eq!(scenario.search_options, SearchOptions::default());
-                assert_eq!(scenario.measured_operations, scenario.query_vectors);
-                continue;
-            }
             assert_eq!(
                 scenario.leaf_beam_sweep,
                 [1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128]

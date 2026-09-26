@@ -25,15 +25,6 @@ final foreground mutation still assigns each record to exactly one leaf. The
 default is eight, so the option is explicit when measuring another import beam
 and its quality effect.
 
-`--profile large --scenario quality-defaults-cohere-1m` calibrates recall@100
-on the complete Cohere1M cosine corpus with public API Search Budget defaults.
-It builds one index, then sweeps leaf beams 32, 128, 256, 384, 512 and 1024. Each
-point warms up on all 1000 canonical queries and measures those 1000 queries
-once, retaining recall, latency, CPU, Backend IO and budget exhaustion. This
-scenario uses import backlog watermark one to finish maintenance during load;
-the existing `quality-cohere-1m` and `quality-sift-1m` curves retain their k=10
-configuration and expanded traversal budgets.
-
 Setup stays excluded from every reported measurement, but the setup import is
 where large-scale write behavior is decided. After each quality scenario's
 batch load, the runner therefore logs the import interval's diagnostics to
