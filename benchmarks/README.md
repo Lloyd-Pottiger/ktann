@@ -33,8 +33,6 @@ once, retaining recall, latency, CPU, Backend IO and budget exhaustion. This
 scenario uses import backlog watermark one to finish maintenance during load;
 the existing `quality-cohere-1m` and `quality-sift-1m` curves retain their k=10
 configuration and expanded traversal budgets.
-Measured quality and resource trade-offs are recorded in
-[the Cohere default calibration](cohere-defaults-calibration.md).
 
 Setup stays excluded from every reported measurement, but the setup import is
 where large-scale write behavior is decided. After each quality scenario's
@@ -446,9 +444,7 @@ The supported workload is unfiltered, single-tenant, IDs-only L2 or cosine
 search with signed 64-bit record IDs. Search inherits the public API defaults;
 explicit beam and budget overrides are recorded in the companion report.
 Canonical VectorDBBench metrics remain unchanged; native timings, topology,
-resources and backend IO are reported separately. See
-[Cohere default calibration](cohere-defaults-calibration.md) for measured
-recall and the limits of those measurements.
+resources and backend IO are reported separately.
 
 Protocol version 1 uses a four-byte big-endian length followed by JSON over a
 Unix socket, bounded to 8 MiB per frame and 128 connections. Each insert commits
