@@ -7,3 +7,13 @@ RaBitQ candidate retention is bounded in two stages. For a leaf with n eligible 
 The owned SearchRequest contains query vector, `k` in `1..=65,536`, optional typed Predicate, and request SearchOptions. Optional nonzero Tree Key, partition, and Leaf Entry budget overrides use Runtime defaults when absent and return InvalidArgument rather than clamp when above the fixed runtime hard caps. Exact-rerank sizing is engine-owned: checked arithmetic computes `max(64,k+ceil(k/2))`, bounded by the Runtime's exact-rerank ceiling and the fixed 65,536 hard cap. The 64-candidate floor matches the RaBitQ leaf rough-set floor and protects concentrated cosine and inner-product distributions. The effective ceiling must remain at least `k`. SearchOutcome is a non-exhaustive structure containing hits, typed usage counters, one exhaustion boolean per budget dimension, and the overlap-truncation flag.
 
 Usage measures logical algorithm work, not backend RPC shape: Tree Keys actually decoded and checked from the directory; distinct `{Tree Key, Partition Key}` bodies logically visited, including cache hits; Leaf Entries read and considered under the exact predicate, including entries whose evaluation is skipped because the Synopsis proves AllMatch; and Vector Records actually read and exactly reranked. A dimension is exhausted only if eligible pending work is prevented by its depleted budget, not merely because natural completion lands exactly on the limit. Several dimensions may be exhausted together. Search stops starting work that consumes each exhausted dimension, finishes already-materialized permissible work, and returns deterministically ordered exact-distance/Record-ID hits.
+
+## Amendment: default rerank headroom (2026-09-27)
+
+The original k-derived policy above is superseded by `max(64,k+ceil(k/4))`,
+still bounded by the Runtime ceiling and the fixed 65,536 hard cap. The
+64-candidate floor and the requirement that the effective budget be at least
+`k` are unchanged. This reduces original-vector reads at larger `k` while
+retaining candidate headroom for approximate ranking errors. For example,
+`k=100` now defaults to 125 candidates instead of 150. This is a tunable ANN
+policy, not a guarantee of equal recall for every workload.
