@@ -1,0 +1,572 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index d4b0da3..6d7e21c 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -25,6 +25,7 @@ path = "src/lib.rs"
+
+ [features]
+ default = []
++quality-diagnostics = []
+
+ [dependencies]
+ bytes = "1"
+diff --git a/benchmarks/Cargo.toml b/benchmarks/Cargo.toml
+index 335c37b..da1eef6 100644
+--- a/benchmarks/Cargo.toml
++++ b/benchmarks/Cargo.toml
+@@ -17,6 +17,7 @@ path = "src/bin/vdbbench_bridge.rs"
+
+ [features]
+ default = ["rocksdb"]
++quality-diagnostics = ["ktann/quality-diagnostics"]
+ rocksdb = ["dep:ktann-rocksdb", "dep:rocksdb"]
+ foundationdb = ["dep:foundationdb", "dep:foundationdb-sys", "dep:ktann-foundationdb"]
+
+diff --git a/benchmarks/src/cli.rs b/benchmarks/src/cli.rs
+index 701d322..c3da332 100644
+--- a/benchmarks/src/cli.rs
++++ b/benchmarks/src/cli.rs
+@@ -566,13 +566,32 @@ async fn run_rocksdb(
+
+     let directory =
+         tempfile::tempdir().map_err(|error| format!("create RocksDB tempdir: {error}"))?;
+-    let database_path = directory.path().join("database");
++    let database_path = std::env::var_os("KTANN_DIAG_DATABASE")
++        .map_or_else(|| directory.path().join("database"), PathBuf::from);
++    let reuse = std::env::var_os("KTANN_DIAG_REUSE").is_some();
++    if std::env::var_os("KTANN_DIAG_DATABASE").is_some() && database_path.exists() != reuse {
++        return Err("fixed database existence does not match build/reuse mode".to_owned());
++    }
+     let mut database_options = Options::default();
+     database_options.create_if_missing(true);
+     let database = Arc::new(
+         OptimisticTransactionDB::open(&database_options, &database_path)
+             .map_err(|error| format!("open RocksDB: {error}"))?,
+     );
++    let receipt = std::env::var_os("KTANN_DIAG_RECEIPT").map(PathBuf::from);
++    let before_hash = if reuse {
++        let path = receipt.as_ref().ok_or("fixed reuse needs receipt")?;
++        let saved: serde_json::Value =
++            serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
++                .map_err(|e| e.to_string())?;
++        let actual = diagnostic_database_hash(&database)?;
++        if saved["database_sha256"].as_str() != Some(actual.as_str()) {
++            return Err("fixed database digest mismatch before search".to_owned());
++        }
++        Some(actual)
++    } else {
++        None
++    };
+     let limit = scenario
+         .blocking_resource_limit
+         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
+@@ -594,9 +613,40 @@ async fn run_rocksdb(
+         options.worker_threads,
+     )
+     .await?;
++    if let Some(path) = receipt {
++        let digest = diagnostic_database_hash(&database)?;
++        if before_hash.as_ref().is_some_and(|before| before != &digest) {
++            return Err("fixed database mutated during search".to_owned());
++        }
++        let mut saved: serde_json::Value =
++            serde_json::from_slice(&fs::read(&path).map_err(|e| e.to_string())?)
++                .map_err(|e| e.to_string())?;
++        saved["database_sha256"] = serde_json::json!(digest);
++        fs::write(
++            path,
++            serde_json::to_vec_pretty(&saved).map_err(|e| e.to_string())?,
++        )
++        .map_err(|e| e.to_string())?;
++        eprintln!("FIXED_DATABASE_SHA256 {digest}");
++    }
+     Ok(report)
+ }
+
++/// Hashes logical KV contents, independent of compaction and physical files.
++#[cfg(feature = "rocksdb")]
++fn diagnostic_database_hash(database: &rocksdb::OptimisticTransactionDB) -> Result<String, String> {
++    use sha2::{Digest, Sha256};
++    let mut hash = Sha256::new();
++    for row in database.snapshot().iterator(rocksdb::IteratorMode::Start) {
++        let (key, value) = row.map_err(|e| e.to_string())?;
++        hash.update((key.len() as u64).to_le_bytes());
++        hash.update(&key);
++        hash.update((value.len() as u64).to_le_bytes());
++        hash.update(&value);
++    }
++    Ok(format!("{:x}", hash.finalize()))
++}
++
+ #[cfg(not(feature = "rocksdb"))]
+ /// Reports that this executable lacks RocksDB support.
+ async fn run_rocksdb(
+diff --git a/benchmarks/src/runner.rs b/benchmarks/src/runner.rs
+index 33f674e..95903f1 100644
+--- a/benchmarks/src/runner.rs
++++ b/benchmarks/src/runner.rs
+@@ -313,9 +313,14 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
+ fn large_scenarios() -> Result<Vec<ScenarioSpec>, String> {
+     let search_options = SearchOptions::default()
+         .with_scanned_tree_keys(1)
+-        .and_then(|options| options.with_visited_partitions(16_384))
+-        .and_then(|options| options.with_visited_leaf_entries(1_048_576))
++        .and_then(|options| options.with_visited_partitions(1_024))
++        .and_then(|options| options.with_visited_leaf_entries(65_536))
+         .map_err(|error| error_at("configure large search", error))?;
++    let parameter = |name: &str, default: usize| -> usize {
++        std::env::var(name).map_or(default, |value| value.parse().expect("diagnostic integer"))
++    };
++    let diagnostic = std::env::var_os("KTANN_DIAG_TRACE").is_some();
++    assert!(!diagnostic || cfg!(feature = "quality-diagnostics"));
+     let scenario = |name, dataset, dimension, metric| ScenarioSpec {
+         name,
+         dataset,
+@@ -328,18 +333,33 @@ fn large_scenarios() -> Result<Vec<ScenarioSpec>, String> {
+         seed: 0x38_2001,
+         search_percent: 100,
+         hot_updates: false,
+-        partition_cache_bytes: 512 << 20,
++        partition_cache_bytes: (parameter("KTANN_DIAG_CACHE_MIB", 512) as u64) << 20,
+         foreground_limit: 64,
+         blocking_resource_limit: Some(64),
+-        concurrency: 16,
++        concurrency: if diagnostic {
++            1
++        } else {
++            parameter("KTANN_DIAG_CONCURRENCY", 4)
++        },
+         dispatch: WorkloadDispatch::Continuous,
+-        warmup_operations: 1_000,
++        warmup_operations: if diagnostic {
++            0
++        } else {
++            parameter("KTANN_DIAG_WARMUP", 1_000)
++        },
+         // Repeat the fixed query corpus to reduce short-interval timing noise.
+-        measured_operations: 10_000,
+-        k: 10,
++        measured_operations: parameter(
++            "KTANN_DIAG_OPERATIONS",
++            if diagnostic { 1_000 } else { 2_000 },
++        ),
++        k: 100,
+         search_options,
+         write_beam_size: 8,
+-        leaf_beam_sweep: vec![1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128],
++        leaf_beam_sweep: std::env::var("KTANN_DIAG_BEAMS")
++            .unwrap_or_else(|_| "64,96,128,192,256,384".to_owned())
++            .split(',')
++            .map(|value| value.parse().expect("diagnostic beam"))
++            .collect(),
+         // Keep the shared leaf/internal fanout below sqrt(1M) so the
+         // million-vector corpus must form at least three searchable levels.
+         max_partition_entries: 128,
+@@ -542,6 +562,23 @@ fn runtime_config(
+     } else {
+         config
+     };
++    // Isolated fixed-index experiment: keep all other search budgets unchanged.
++    let config = if let Ok(value) = std::env::var("KTANN_DIAG_RERANK") {
++        let limit: u32 = value
++            .parse()
++            .map_err(|_| "invalid rerank experiment limit")?;
++        config.and_then(|config| {
++            let defaults = config.default_search_budgets();
++            config.with_default_search_budgets(SearchBudgets::new(
++                defaults.scanned_tree_keys(),
++                defaults.visited_partitions(),
++                defaults.visited_leaf_entries(),
++                limit,
++            )?)
++        })
++    } else {
++        config
++    };
+     config
+         .and_then(|config| config.validate().map(|()| config))
+         .map_err(|error| error_at("configure runtime", error))
+@@ -1150,6 +1187,7 @@ async fn run_quality_sweep<B: Backend>(
+     dataset.base = Vec::new();
+     let mut points = Vec::with_capacity(spec.leaf_beam_sweep.len());
+     for beam in &spec.leaf_beam_sweep {
++        eprintln!("DIAGNOSTIC_BEAM {beam}");
+         let mut point = spec.clone();
+         point.search_options = point
+             .search_options
+@@ -1164,6 +1202,11 @@ async fn run_quality_sweep<B: Backend>(
+             Some(&truth),
+         )
+         .await?;
++        // Sample resident memory after timing, while the warmed cache stays live.
++        eprintln!(
++            "CACHE_CAPACITY_RSS beam={beam} rss_kib={}",
++            command_output("ps", &["-o", "rss=", "-p", &std::process::id().to_string()])
++        );
+         // getrusage exposes only the process-lifetime high-water mark, which
+         // setup already established and cannot attribute to one beam point.
+         measurements.peak_rss_bytes = None;
+@@ -1199,6 +1242,26 @@ async fn prepare_index<B: Backend>(
+     String,
+ > {
+     let index_config = index_config(spec)?;
++    if std::env::var_os("KTANN_DIAG_REUSE").is_some() {
++        let path = std::env::var_os("KTANN_DIAG_RECEIPT").ok_or("fixed reuse needs receipt")?;
++        let saved: serde_json::Value =
++            serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?)
++                .map_err(|e| e.to_string())?;
++        let identity = serde_json::to_value(&dataset.metadata).map_err(|e| e.to_string())?;
++        if saved["dataset"] != identity {
++            return Err("fixed dataset mismatch".to_owned());
++        }
++        let index = runtime
++            .open_index("benchmark")
++            .await
++            .map_err(|e| error_at("open fixed index", e))?;
++        verify_measured_state(&index, spec).await?;
++        let topology =
++            serde_json::from_value(saved["topology"].clone()).map_err(|e| e.to_string())?;
++        let construction =
++            serde_json::from_value(saved["construction"].clone()).map_err(|e| e.to_string())?;
++        return Ok((index, topology, construction));
++    }
+     let index = runtime
+         .create_index("benchmark", index_config)
+         .await
+@@ -1265,6 +1328,17 @@ async fn prepare_index<B: Backend>(
+         import,
+         convergence,
+     };
++    if let Some(path) = std::env::var_os("KTANN_DIAG_RECEIPT") {
++        let saved = serde_json::json!({"dataset": dataset.metadata, "topology": topology, "construction": construction});
++        use std::io::Write as _;
++        let mut file = std::fs::OpenOptions::new()
++            .write(true)
++            .create_new(true)
++            .open(path)
++            .map_err(|e| e.to_string())?;
++        file.write_all(&serde_json::to_vec_pretty(&saved).map_err(|e| e.to_string())?)
++            .map_err(|e| e.to_string())?;
++    }
+     Ok((index, topology, construction))
+ }
+
+@@ -1416,6 +1490,15 @@ fn validate_quality_frontier(
+ ) -> Result<(), String> {
+     let expected_searches = u64::try_from(expected_searches)
+         .map_err(|_| "large quality search count exceeds u64".to_owned())?;
++    // Diagnostic observations execute a control and a traced search per request.
++    // Both contribute normal engine metrics; only one contributes recall input.
++    let expected_budget_samples = expected_searches
++        * if cfg!(feature = "quality-diagnostics") && std::env::var_os("KTANN_DIAG_TRACE").is_some()
++        {
++            2
++        } else {
++            1
++        };
+     let mut recalls = Vec::with_capacity(points.len());
+     let mut leaf_work = Vec::with_capacity(points.len());
+     for point in points {
+@@ -1441,7 +1524,7 @@ fn validate_quality_frontier(
+         if search.attempted != expected_searches
+             || search.accepted != expected_searches
+             || recall.queries != expected_searches
+-            || leaf_budget.usage.count != expected_searches
++            || leaf_budget.usage.count != expected_budget_samples
+         {
+             return Err(format!(
+                 "leaf beam {} completed {}/{} searches with {} recall and {} Leaf Entry samples; expected {expected_searches}",
+@@ -1462,7 +1545,8 @@ fn validate_quality_frontier(
+         .zip(recalls.iter().copied().reduce(f64::max))
+         .is_some_and(|(minimum, maximum)| maximum > minimum);
+     let work_moves = leaf_work.windows(2).any(|window| window[1] > window[0]);
+-    if !recall_moves || !work_moves {
++    // A fixed-beam budget experiment has no cross-beam frontier to compare.
++    if points.len() != 1 && (!recall_moves || !work_moves) {
+         return Err(
+             "large quality sweep did not produce a nontrivial quality/work frontier".to_owned(),
+         );
+@@ -2048,6 +2132,48 @@ async fn execute_item<B: Backend>(
+ ) -> OperationObservation {
+     let started = Instant::now();
+     let (class, result) = match item {
++        #[cfg(feature = "quality-diagnostics")]
++        WorkItem::Search { request, truth } if std::env::var_os("KTANN_DIAG_TRACE").is_some() => {
++            let truth = truth.expect("diagnostic truth");
++            assert!(request.predicate().is_none());
++            assert_eq!(truth.len(), request.k());
++            let control = index.search(request.clone()).await.expect("control query");
++            ktann::quality_trace::begin(truth.iter().map(|(id, _)| id.clone()).collect());
++            let outcome = index.search(request).await.expect("diagnostic query");
++            let observation = ktann::quality_trace::finish(&outcome);
++            let identities = |value: &ktann::api::SearchOutcome| {
++                value
++                    .hits
++                    .iter()
++                    .map(|hit| (hit.id().clone(), hit.distance().to_bits()))
++                    .collect::<Vec<_>>()
++            };
++            assert_eq!(identities(&control), identities(&outcome));
++            assert_eq!(control.usage, outcome.usage);
++            assert_eq!(control.exhausted, outcome.exhausted);
++            assert_eq!(
++                control.rabitq_overlap_truncated,
++                outcome.rabitq_overlap_truncated
++            );
++            eprintln!(
++                "ATTRIBUTION {}",
++                serde_json::json!({
++                    "truth": observation.truth, "hits": observation.hits, "counts": observation.counts,
++                    "visited_partition_budget_exhausted": outcome.exhausted.visited_partitions,
++                    "visited_leaf_budget_exhausted": outcome.exhausted.visited_leaf_entries,
++                    "rerank_budget_exhausted": outcome.exhausted.exact_rerank_candidates,
++                    "local_overlap_truncated": outcome.rabitq_overlap_truncated,
++                    "same_tree_control_matches": true,
++                })
++            );
++            (
++                OperationClass::Search,
++                Ok(Some(RecallInput {
++                    hit_ids: outcome.hits.iter().map(|hit| hit.id().clone()).collect(),
++                    truth,
++                })),
++            )
++        }
+         WorkItem::Search { request, truth } => (
+             OperationClass::Search,
+             index
+@@ -2389,22 +2515,16 @@ mod tests {
+     #[test]
+     fn large_profile_is_an_explicit_single_variable_beam_sweep() {
+         for scenario in scenarios("large").expect("large profile") {
+-            assert_eq!(
+-                scenario.leaf_beam_sweep,
+-                [1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128]
+-            );
++            assert_eq!(scenario.leaf_beam_sweep, [64, 96, 128, 192, 256, 384]);
+             assert_eq!(scenario.search_options.scanned_tree_keys(), Some(1));
+-            assert_eq!(scenario.search_options.visited_partitions(), Some(16_384));
+-            assert_eq!(
+-                scenario.search_options.visited_leaf_entries(),
+-                Some(1_048_576)
+-            );
++            assert_eq!(scenario.search_options.visited_partitions(), Some(1_024));
++            assert_eq!(scenario.search_options.visited_leaf_entries(), Some(65_536));
+             assert_eq!(scenario.search_options.leaf_beam_size(), None);
+             let budgets = scenario
+                 .search_options
+                 .resolve(SearchBudgets::default(), scenario.k)
+                 .expect("large search budgets resolve");
+-            assert_eq!(budgets.exact_rerank_candidates(), 64);
++            assert_eq!(budgets.exact_rerank_candidates(), 150);
+             let max_partition_entries = usize::try_from(scenario.max_partition_entries)
+                 .expect("partition fanout fits usize");
+             assert!(
+diff --git a/src/lib.rs b/src/lib.rs
+index 3be84a5..c5def1f 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -35,6 +35,8 @@
+ pub mod api;
+ pub mod maintenance;
+ mod observe;
++#[cfg(feature = "quality-diagnostics")]
++pub mod quality_trace;
+ pub mod runtime;
+ pub mod search;
+ pub mod storage;
+diff --git a/src/runtime/search.rs b/src/runtime/search.rs
+index 5de278f..525b91d 100644
+--- a/src/runtime/search.rs
++++ b/src/runtime/search.rs
+@@ -173,6 +173,11 @@ pub(crate) async fn search<B: Backend>(
+     let selection = select_global_overlap(pool, prepared.request.k(), rerank_budget)?;
+     let rerank_budget_exhausted = selection.truncated();
+     let selected: Vec<LeafCandidate> = selection.into_values();
++    #[cfg(feature = "quality-diagnostics")]
++    crate::quality_trace::record(
++        crate::quality_trace::Stage::GlobalRetained,
++        selected.iter().map(|candidate| candidate.record_id()),
++    );
+     metrics::search_stage_finished(
+         SearchStage::ApproximateSelection,
+         approximate_started.elapsed(),
+diff --git a/src/search/rabitq/selection.rs b/src/search/rabitq/selection.rs
+index 4db47b5..782c6e7 100644
+--- a/src/search/rabitq/selection.rs
++++ b/src/search/rabitq/selection.rs
+@@ -109,11 +109,25 @@ pub(crate) fn select_leaf_overlap<T>(
+     // cannot add a survivor.
+     candidates.retain(|candidate| candidate.distance.lower() <= overlap_threshold);
+
++    #[cfg(feature = "quality-diagnostics")]
++    crate::quality_trace::record(
++        crate::quality_trace::Stage::LocalEligible,
++        candidates.iter().map(|candidate| &candidate.record_id),
++    );
+     let overlap_cap = rough_count
+         .checked_mul(4)
+         .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?
+         .min(remaining_rerank_budget);
+-    Ok(cap_survivors(candidates, overlap_cap, compare_local_cap))
++    let selection = cap_survivors(candidates, overlap_cap, compare_local_cap);
++    #[cfg(feature = "quality-diagnostics")]
++    crate::quality_trace::record(
++        crate::quality_trace::Stage::LocalRetained,
++        selection
++            .candidates
++            .iter()
++            .map(|candidate| &candidate.record_id),
++    );
++    Ok(selection)
+ }
+
+ /// Selects globally overlapping candidates before exact reranking.
+@@ -135,6 +149,11 @@ pub(crate) fn select_global_overlap<T>(
+         nth_upper_endpoint(&mut candidates, k - 1)
+     };
+     candidates.retain(|candidate| candidate.distance.lower() <= overlap_threshold);
++    #[cfg(feature = "quality-diagnostics")]
++    crate::quality_trace::record(
++        crate::quality_trace::Stage::GlobalEligible,
++        candidates.iter().map(|candidate| &candidate.record_id),
++    );
+     let mut selection = cap_survivors(candidates, remaining_rerank_budget, compare_rough);
+     selection.candidates.sort_unstable_by(compare_rough);
+     Ok(selection)
+diff --git a/src/search/traverse.rs b/src/search/traverse.rs
+index 97ca300..e2f11b0 100644
+--- a/src/search/traverse.rs
++++ b/src/search/traverse.rs
+@@ -711,6 +711,11 @@ impl Traversal {
+         if funded < entries.len() {
+             self.leaf_entry_budget_exhausted = true;
+         }
++        #[cfg(feature = "quality-diagnostics")]
++        crate::quality_trace::record(
++            crate::quality_trace::Stage::Visited,
++            entries[..funded].iter().map(|entry| entry.record_id()),
++        );
+         // Only predicate evaluation needs a temporary list of entry references.
+         // Without a predicate (including AllMatch), score the body directly.
+         let pool = if let Some(predicate) = predicate {
+diff --git a/src/quality_trace.rs b/src/quality_trace.rs
+new file mode 100644
+--- /dev/null
++++ b/src/quality_trace.rs
+@@ -0,0 +1,115 @@
++//! Experiment-only recall attribution; never included in the production patch.
++//!
++//! The isolated harness admits exactly one search at a time. A process-local
++//! collector follows that request across Runtime-spawned tasks. Only ground
++//! truth IDs are retained, and no diagnostic observation influences selection.
++
++use std::collections::BTreeSet;
++use std::sync::Mutex;
++
++use crate::api::SearchOutcome;
++use bytes::Bytes;
++
++/// Successively smaller candidate sets in the existing search pipeline.
++#[derive(Clone, Copy)]
++pub enum Stage {
++    /// Entries funded by the traversal budget before local selection.
++    Visited = 0,
++    /// Entries surviving the local conservative interval predicate.
++    LocalEligible = 1,
++    /// Entries surviving the local overlap cap.
++    LocalRetained = 2,
++    /// Entries surviving the global conservative interval predicate.
++    GlobalEligible = 3,
++    /// Entries admitted for exact reranking after the global cap.
++    GlobalRetained = 4,
++}
++
++struct Trace {
++    truth: BTreeSet<Bytes>,
++    hits: [BTreeSet<Bytes>; 5],
++    counts: [usize; 5],
++}
++
++static ACTIVE: Mutex<Option<Trace>> = Mutex::new(None);
++
++/// Counts at successive sets, ending in exact output hits.
++#[derive(Debug)]
++pub struct Observation {
++    /// The complete reference top-k denominator.
++    pub truth: usize,
++    /// Ground truth hits at visited/local-eligible/local-retained/global-eligible/
++    /// global-retained/final-output stages, respectively.
++    pub hits: [usize; 6],
++    /// Total IDs at those same stages.
++    pub counts: [usize; 6],
++}
++
++/// Begins one isolated, unfiltered request with distinct reference IDs.
++pub fn begin(truth: Vec<Bytes>) {
++    let mut active = ACTIVE.lock().unwrap();
++    assert!(active.is_none(), "diagnostic searches must be serial");
++    let count = truth.len();
++    let truth: BTreeSet<_> = truth.into_iter().collect();
++    assert_eq!(truth.len(), count);
++    assert!(count > 0);
++    *active = Some(Trace {
++        truth,
++        hits: std::array::from_fn(|_| BTreeSet::new()),
++        counts: [0; 5],
++    });
++}
++
++/// Observes IDs without changing their order, distance, or ownership.
++pub fn record<'a>(stage: Stage, ids: impl IntoIterator<Item = &'a Bytes>) {
++    let mut active = ACTIVE.lock().unwrap();
++    let Some(trace) = active.as_mut() else { return };
++    let stage = stage as usize;
++    for id in ids {
++        trace.counts[stage] += 1;
++        if trace.truth.contains(id) {
++            assert!(
++                trace.hits[stage].insert(id.clone()),
++                "duplicate truth membership"
++            );
++        }
++    }
++}
++
++/// Closes the request, proving that attribution stages are nested and cover
++/// the traversal/rerank work reported by the normal Search Outcome.
++pub fn finish(outcome: &SearchOutcome) -> Observation {
++    let trace = ACTIVE.lock().unwrap().take().expect("active diagnostic");
++    for pair in trace.hits.windows(2) {
++        assert!(pair[1].is_subset(&pair[0]), "non-nested attribution stages");
++    }
++    let final_hits: BTreeSet<_> = outcome
++        .hits
++        .iter()
++        .map(|hit| hit.id().clone())
++        .filter(|id| trace.truth.contains(id))
++        .collect();
++    assert!(final_hits.is_subset(&trace.hits[4]));
++    assert_eq!(trace.counts[0], outcome.usage.visited_leaf_entries as usize);
++    assert_eq!(
++        trace.counts[4],
++        outcome.usage.exact_rerank_candidates as usize
++    );
++    Observation {
++        truth: trace.truth.len(),
++        hits: std::array::from_fn(|stage| {
++            if stage == 5 {
++                final_hits.len()
++            } else {
++                trace.hits[stage].len()
++            }
++        }),
++        counts: std::array::from_fn(|stage| {
++            if stage == 5 {
++                outcome.hits.len()
++            } else {
++                trace.counts[stage]
++            }
++        }),
++    }
++}
