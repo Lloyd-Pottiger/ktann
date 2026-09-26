@@ -428,7 +428,7 @@ transaction, latency, and atomicity requirements rather than from tree size.
 `ktann-vdbbench-bridge` is a benchmark-only Rust binary supporting RocksDB and
 FoundationDB. One process owns the Runtime, backend and index across
 VectorDBBench's loader, optimizer and search workers. The Python client, CLI
-registration, run tools and process tests belong to the separate
+registration and process tests belong to the separate
 [VectorDBBench repository](https://github.com/Lloyd-Pottiger/VectorDBBench).
 
 The supported workload is unfiltered, single-tenant, IDs-only L2 or cosine
@@ -454,9 +454,10 @@ cargo test -p ktann-benchmarks --all-features
 ```
 
 Use a VectorDBBench checkout containing the KTANN adapter, installed with
-`pip install -e .`. Its `scripts/ktann/README.md` describes dataset preparation
-and runs; pass the built bridge and `--manifests /path/to/ktann/benchmarks/datasets`
-to its launcher. Run the process tests from that checkout:
+`pip install -e .`. Its `vectordb_bench/backend/clients/ktann/README.md` describes
+bridge startup and canonical CLI runs. Client companion timings are optional
+via `--companion-dir`; native diagnostics remain in the bridge report.
+Run the process tests from that checkout:
 
 ```sh
 export KTANN_BRIDGE_BIN=/path/to/ktann/target/release/ktann-vdbbench-bridge
