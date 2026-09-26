@@ -29,7 +29,7 @@ use crate::search::plan::{TreeKeyPlan, enumerate_tree_keys, plan_tree_keys};
 use crate::search::predicate::CompiledPredicate;
 use crate::search::rabitq::{ApproximateCandidate, select_global_overlap};
 use crate::search::rerank::{LeafCandidate, exact_rerank};
-use crate::search::traverse::{DEFAULT_LEAF_BEAM, TraversalRequest, traverse};
+use crate::search::traverse::{TraversalRequest, traverse};
 use crate::storage::backend::{Backend, ScanLimits};
 use crate::storage::keys::TreeKey;
 use crate::storage::values::IndexManifest;
@@ -74,10 +74,7 @@ impl PreparedSearch {
     ) -> Result<Self> {
         let config = manifest.config();
         let budgets = request.validate(config.dimension(), config.fields(), defaults)?;
-        let leaf_beam = request
-            .options()
-            .leaf_beam_size()
-            .unwrap_or(DEFAULT_LEAF_BEAM);
+        let leaf_beam = request.options().resolved_leaf_beam_size();
         let kernel = VectorKernel::new(
             config.dimension(),
             config.metric(),

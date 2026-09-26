@@ -11,6 +11,10 @@ description = "Reproducible whole-system performance baselines for KTANN"
 name = "ktann-bench"
 path = "src/main.rs"
 
+[[bin]]
+name = "ktann-vdbbench-bridge"
+path = "src/bin/vdbbench_bridge.rs"
+
 [features]
 default = ["rocksdb"]
 rocksdb = ["dep:ktann-rocksdb", "dep:rocksdb"]
@@ -34,7 +38,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "signal"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 xxhash-rust = { version = "=0.8.18", features = ["xxh3"] }
 
 [lints.rust]
