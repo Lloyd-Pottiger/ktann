@@ -4,8 +4,10 @@ use std::fmt;
 
 use crate::api::{Error, MAX_DIMENSION, Metric, Result};
 
+#[cfg(test)]
+use super::RaBitQ7;
 use super::rounding::{add_down, add_up, multiply_down, multiply_up, sqrt_up};
-use super::{ApproximateDistance, RaBitQ7};
+use super::{ApproximateDistance, CodeHeader, DecodedRaBitQ7};
 
 /// One validated, metric-specific query prepared once per Search.
 pub(crate) struct RaBitQQuery<'a> {
@@ -56,6 +58,7 @@ impl fmt::Debug for RaBitQQuery<'_> {
     }
 }
 
+#[cfg(test)]
 pub(super) fn approximate_distance(
     code: &RaBitQ7<'_>,
     query: &RaBitQQuery<'_>,
@@ -64,7 +67,7 @@ pub(super) fn approximate_distance(
         return Err(Error::invalid_argument());
     }
 
-    let scale = f64::from(code.scale);
+    let scale = f64::from(code.header.scale);
     let mut dot = 0.0_f64;
     for (&query_component, signed_code) in query.components.iter().zip(code.signed_codes()) {
         let query_component = f64::from(query_component);
@@ -73,67 +76,57 @@ pub(super) fn approximate_distance(
         dot += product;
     }
 
-    finish_distance(code, query, dot)
+    finish_distance(&code.header, query, dot)
 }
 
-/// Interleaves independent scores without changing any score's accumulation order.
-/// Shared query loads and independent dependency chains reduce scoring work while
-/// retaining the scalar rough value and the same conservative error bound.
-pub(super) fn approximate_distances(
-    codes: &[RaBitQ7<'_>; 4],
+/// Interleaves decoded lanes without reordering any lane's scalar-f64 sum.
+pub(super) fn approximate_distances<const N: usize>(
+    codes: [&DecodedRaBitQ7; N],
     query: &RaBitQQuery<'_>,
-) -> Result<[ApproximateDistance; 4]> {
+) -> Result<[ApproximateDistance; N]> {
     if codes
         .iter()
-        .any(|code| code.dimension != query.components.len())
+        .any(|code| code.codes.len() != query.components.len())
     {
         return Err(Error::invalid_argument());
     }
-    let scales = codes.each_ref().map(|code| f64::from(code.scale));
-    let mut dots = [0.0_f64; 4];
-    // Decode complete packed groups once while preserving scalar accumulation order.
-    let mut blocks = query.components.chunks_exact(4);
-    for (block, components) in blocks.by_ref().enumerate() {
-        let decoded: [_; 4] = std::array::from_fn(|lane| codes[lane].code_block(block));
-        for (component_index, &component) in components.iter().enumerate() {
-            let component = f64::from(component);
-            for lane in 0..4 {
-                let reconstruction =
-                    scales[lane] * f64::from(decoded[lane].signed_code(component_index));
-                let product = component * reconstruction;
-                dots[lane] += product;
-            }
-        }
-    }
-    let tail_start = query.components.len() - blocks.remainder().len();
-    for (offset, &component) in blocks.remainder().iter().enumerate() {
+    let scales = codes.map(|code| f64::from(code.header.scale));
+    let mut dots = [0.0_f64; N];
+    for (index, &component) in query.components.iter().enumerate() {
         let component = f64::from(component);
-        for lane in 0..4 {
-            let reconstruction =
-                scales[lane] * f64::from(codes[lane].signed_code(tail_start + offset));
+        for lane in 0..N {
+            let reconstruction = scales[lane] * f64::from(codes[lane].codes[index]);
             let product = component * reconstruction;
             dots[lane] += product;
         }
     }
-    let [a, b, c, d] = std::array::from_fn(|lane| finish_distance(&codes[lane], query, dots[lane]));
-    Ok([a?, b?, c?, d?])
+    let mut distances = [ApproximateDistance {
+        rough: 0.0,
+        lower: 0.0,
+        upper: 0.0,
+    }; N];
+    for (lane, distance) in distances.iter_mut().enumerate() {
+        *distance = finish_distance(&codes[lane].header, query, dots[lane])?;
+    }
+    Ok(distances)
 }
 
 /// Converts a completed dot product and its bounds to a metric-specific interval.
 fn finish_distance(
-    code: &RaBitQ7<'_>,
+    header: &CodeHeader,
     query: &RaBitQQuery<'_>,
     dot: f64,
 ) -> Result<ApproximateDistance> {
-    let scale = f64::from(code.scale);
-    let error_upper = f64::from(code.reconstruction_error_upper);
+    let scale = f64::from(header.scale);
+    let error_upper = f64::from(header.reconstruction_error_upper);
     // Reconstruction is exact in f64 (f32 scale times a six-bit integer).
     // For n products accumulated in order, roundoff is bounded by
     // gamma_n * sum(abs(q_i * x_hat_i)), with u = 2^-53. Since n <= 16384,
     // gamma_n = n*u/(1-n*u) <= 2*n*u = n*EPSILON. Cauchy-Schwarz bounds
     // the absolute sum by ||q|| * ||x_hat||. All bound operations round up;
     // f32 inputs and six-bit codes cannot underflow or overflow this kernel.
-    let reconstruction_norm_upper = multiply_up(scale, sqrt_up(f64::from(code.code_norm_squared)));
+    let reconstruction_norm_upper =
+        multiply_up(scale, sqrt_up(f64::from(header.code_norm_squared)));
     let dot_error = multiply_up(query.dot_error_factor, reconstruction_norm_upper);
     let dot_lower = add_down(dot, -dot_error);
     let dot_upper = add_up(dot, dot_error);
@@ -153,13 +146,15 @@ fn finish_distance(
             )
         }
         Metric::L2 => {
-            let reconstruction_norm_squared = scale * scale * f64::from(code.code_norm_squared);
+            let reconstruction_norm_squared = scale * scale * f64::from(header.code_norm_squared);
             let reconstruction_norm_squared_lower = multiply_down(
                 multiply_down(scale, scale),
-                f64::from(code.code_norm_squared),
+                f64::from(header.code_norm_squared),
             );
-            let reconstruction_norm_squared_upper =
-                multiply_up(multiply_up(scale, scale), f64::from(code.code_norm_squared));
+            let reconstruction_norm_squared_upper = multiply_up(
+                multiply_up(scale, scale),
+                f64::from(header.code_norm_squared),
+            );
             let rough = (query.norm_squared + reconstruction_norm_squared - 2.0 * dot).max(0.0);
             let lower = add_down(
                 add_down(query.norm_squared_lower, reconstruction_norm_squared_lower),

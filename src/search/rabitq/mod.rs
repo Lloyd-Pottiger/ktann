@@ -26,12 +26,57 @@ pub(crate) use selection::{ApproximateCandidate, select_global_overlap, select_l
 
 /// One borrowed canonical absolute RaBitQ7 payload.
 pub(crate) struct RaBitQ7<'a> {
-    scale: f32,
-    code_norm_squared: u32,
-    reconstruction_error_upper: f32,
+    header: CodeHeader,
     dimension: usize,
     signs: &'a [u8],
     magnitudes: &'a [u8],
+}
+
+/// Numeric metadata shared by packed storage and the decoded cache form.
+#[derive(Clone, Copy)]
+struct CodeHeader {
+    scale: f32,
+    code_norm_squared: u32,
+    reconstruction_error_upper: f32,
+}
+
+/// A validated code expanded once for an immutable cached leaf body.
+/// The packed payload is not retained alongside these signed components.
+pub(crate) struct DecodedRaBitQ7 {
+    header: CodeHeader,
+    codes: Box<[i8]>,
+}
+
+impl DecodedRaBitQ7 {
+    /// Expands a payload already validated by the Leaf Entry decoder.
+    pub(crate) fn from_validated_leaf_bytes(encoded: &[u8], dimension: usize) -> Self {
+        let packed = RaBitQ7::from_validated_leaf_bytes(encoded, dimension);
+        let dimension = packed.dimension;
+        let mut codes = Vec::with_capacity(dimension);
+        // Decode each complete packed group once, including its sign nibble.
+        for index in 0..dimension / 4 {
+            let block = packed.code_block(index);
+            codes.extend((0..4).map(|component| block.signed_code(component) as i8));
+        }
+        codes.extend((dimension / 4 * 4..dimension).map(|index| packed.signed_code(index)));
+        Self {
+            header: packed.header,
+            codes: codes.into_boxed_slice(),
+        }
+    }
+
+    /// Returns the retained signed-code allocation size in bytes.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.codes.len()
+    }
+
+    /// Scores independent lanes with the scalar accumulation order in each lane.
+    pub(crate) fn approximate_distances<const N: usize>(
+        codes: [&Self; N],
+        query: &RaBitQQuery<'_>,
+    ) -> Result<[ApproximateDistance; N]> {
+        interval::approximate_distances(codes, query)
+    }
 }
 
 impl<'a> RaBitQ7<'a> {
@@ -55,30 +100,19 @@ impl<'a> RaBitQ7<'a> {
         Self::decode(encoded, dimension).map(|_| ())
     }
 
-    /// Borrows leaf bytes already validated by `cache::load_body`.
-    ///
-    /// Only use for an immutable body returned by `load_body`, with the same
-    /// Manifest dimension. Its storage scan validated every payload before
-    /// publication, even when cache insertion was disabled or skipped. A
-    /// general `LeafEntry::new` does not establish this invariant.
+    /// Borrows bytes validated by the Leaf Entry decoder for this Manifest dimension.
+    /// A general `LeafEntry::new` does not establish that invariant.
     pub(super) fn from_validated_leaf_bytes(encoded: &'a [u8], dimension: usize) -> Self {
         codec::from_validated_bytes(encoded, dimension)
     }
 
     /// Computes a scalar-f64 rough distance and conservative interval.
+    #[cfg(test)]
     pub(crate) fn approximate_distance(
         &self,
         query: &RaBitQQuery<'_>,
     ) -> Result<ApproximateDistance> {
         interval::approximate_distance(self, query)
-    }
-
-    /// Scores four independent packed codes with the scalar arithmetic contract.
-    pub(crate) fn approximate_distances(
-        codes: &[Self; 4],
-        query: &RaBitQQuery<'_>,
-    ) -> Result<[ApproximateDistance; 4]> {
-        interval::approximate_distances(codes, query)
     }
 }
 

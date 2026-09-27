@@ -61,17 +61,17 @@ use crate::storage::ReadLogicalTxn;
 use crate::storage::backend::ReadOps;
 use crate::storage::keys::{LogicalKey, TreeKey};
 use crate::storage::values::{
-    IndexManifest, LeafEntry, PartitionHeader, PartitionState, PartitionTransition,
-    PersistentValue, RecordLocation, expect_header, expect_synopsis,
+    IndexManifest, PartitionHeader, PartitionState, PartitionTransition, PersistentValue,
+    RecordLocation, expect_header, expect_synopsis,
 };
 
 use super::beam_width;
-use super::cache::{BodyEntries, PartitionCache, load_body};
+use super::cache::{BodyEntries, CachedLeafEntry, PartitionCache, load_body};
 use super::numeric::{VectorKernel, compare_finite};
 use super::plan::EnumeratedTree;
 use super::predicate::{CompiledPredicate, SynopsisClassification};
 use super::rabitq::{
-    ApproximateCandidate, ApproximateDistance, RaBitQ7, RaBitQQuery, select_leaf_overlap,
+    ApproximateCandidate, ApproximateDistance, DecodedRaBitQ7, RaBitQQuery, select_leaf_overlap,
 };
 use super::rerank::{LeafCandidate, filter_candidates};
 
@@ -660,7 +660,6 @@ impl Traversal {
         let BodyEntries::Leaf(entries) = body.entries() else {
             return Err(Error::new(ErrorKind::Corruption));
         };
-        let dimension = context.manifest.config().dimension();
         // Only predicate evaluation needs a temporary list of entry references.
         // Without a predicate (including AllMatch), score the body directly.
         let pool = if let Some(predicate) = predicate {
@@ -670,14 +669,14 @@ impl Traversal {
                 &mut self.visited_leaf_entries,
                 |entry| entry.fields(),
             )?;
-            score_leaf_entries(&filtered, dimension, context.query)?
+            score_leaf_entries(&filtered, context.query)?
                 .into_iter()
                 .map(|(entry, distance)| {
                     ApproximateCandidate::new(entry.record_id().clone(), distance, *entry)
                 })
                 .collect()
         } else {
-            let batch = score_leaf_entries(entries, dimension, context.query)?;
+            let batch = score_leaf_entries(entries, context.query)?;
             filter_candidates(batch, None, &mut self.visited_leaf_entries, |(entry, _)| {
                 entry.fields()
             })?
@@ -762,18 +761,15 @@ impl Traversal {
 ///
 /// Both inputs use the same four-entry slices and scalar tail, preserving each
 /// score's accumulation order without copying the unfiltered body's references.
-fn score_leaf_entries<'a, T: Borrow<LeafEntry>>(
+fn score_leaf_entries<'a, T: Borrow<CachedLeafEntry>>(
     entries: &'a [T],
-    dimension: usize,
     query: &RaBitQQuery<'_>,
 ) -> Result<Vec<(&'a T, ApproximateDistance)>> {
     let mut batch = Vec::with_capacity(entries.len());
     let mut chunks = entries.chunks_exact(4);
     for entries in &mut chunks {
-        let codes = std::array::from_fn(|lane| {
-            RaBitQ7::from_validated_leaf_bytes(entries[lane].borrow().rabitq7(), dimension)
-        });
-        let distances = RaBitQ7::approximate_distances(&codes, query)
+        let codes: [_; 4] = std::array::from_fn(|lane| entries[lane].borrow().code());
+        let distances = DecodedRaBitQ7::approximate_distances(codes, query)
             .map_err(|_| Error::new(ErrorKind::Corruption))?;
         for (entry, distance) in entries.iter().zip(distances) {
             batch.push((entry, distance));
@@ -782,9 +778,7 @@ fn score_leaf_entries<'a, T: Borrow<LeafEntry>>(
     for entry in chunks.remainder() {
         // Loading the immutable body validates every payload before filtering,
         // so rejected entries cannot hide malformed persistent codes.
-        let code = RaBitQ7::from_validated_leaf_bytes(entry.borrow().rabitq7(), dimension);
-        let distance = code
-            .approximate_distance(query)
+        let [distance] = DecodedRaBitQ7::approximate_distances([entry.borrow().code()], query)
             .map_err(|_| Error::new(ErrorKind::Corruption))?;
         batch.push((entry, distance));
     }

@@ -103,10 +103,47 @@ impl CacheKey {
     }
 }
 
+/// Search-only Leaf Entry representation; owns expanded codes instead of packed bytes.
+pub(crate) struct CachedLeafEntry {
+    record_id: bytes::Bytes,
+    fields: Box<[Value]>,
+    code: super::rabitq::DecodedRaBitQ7,
+}
+
+impl CachedLeafEntry {
+    /// Consumes an already validated persistent entry and releases its packed code.
+    fn from_leaf(entry: LeafEntry, dimension: usize) -> Self {
+        let (record_id, fields, packed) = entry.into_parts();
+        // Persistent decoding slices the ID and packed code from one wire buffer.
+        // Detach the ID so the cache does not keep that packed buffer alive.
+        let record_id = bytes::Bytes::copy_from_slice(&record_id);
+        Self {
+            record_id,
+            fields,
+            code: super::rabitq::DecodedRaBitQ7::from_validated_leaf_bytes(&packed, dimension),
+        }
+    }
+
+    /// Returns the owning Vector Record's ID.
+    pub(crate) fn record_id(&self) -> &bytes::Bytes {
+        &self.record_id
+    }
+
+    /// Returns the exact filter projection.
+    pub(crate) fn fields(&self) -> &[Value] {
+        &self.fields
+    }
+
+    /// Returns the code expanded while loading this immutable body.
+    pub(crate) fn code(&self) -> &super::rabitq::DecodedRaBitQ7 {
+        &self.code
+    }
+}
+
 /// The decoded search body of one partition.
 pub(crate) enum BodyEntries {
     /// The decoded Leaf Entries of a leaf partition.
-    Leaf(Box<[LeafEntry]>),
+    Leaf(Box<[CachedLeafEntry]>),
     /// The decoded Child Entries of an internal partition.
     Internal(Box<[ChildEntry]>),
 }
@@ -542,7 +579,7 @@ pub(super) async fn load_body<T: ReadOps>(
         PartitionKind::Internal => LogicalRange::child_entries(manifest, tree_key, partition),
     }?;
 
-    let mut leaf_entries: Vec<LeafEntry> = Vec::new();
+    let mut leaf_entries: Vec<CachedLeafEntry> = Vec::new();
     let mut child_entries: Vec<ChildEntry> = Vec::new();
     let mut bytes = size_of::<CachedBody>() as u64;
     let mut cursor: Option<LogicalScanCursor> = None;
@@ -552,6 +589,7 @@ pub(super) async fn load_body<T: ReadOps>(
         for item in page.into_items() {
             match (kind, item.into_value()) {
                 (PartitionKind::Leaf, PersistentValue::LeafEntry(entry)) => {
+                    let entry = CachedLeafEntry::from_leaf(entry, manifest.config().dimension());
                     bytes = bytes.saturating_add(leaf_entry_bytes(&entry));
                     leaf_entries.push(entry);
                 }
@@ -585,11 +623,11 @@ pub(super) async fn load_body<T: ReadOps>(
 }
 
 /// The accounted decoded size of one Leaf Entry: the envelope, the Record ID
-/// and RaBitQ7 byte strings, and every filter field including string payloads.
-fn leaf_entry_bytes(entry: &LeafEntry) -> u64 {
-    let mut bytes = size_of::<LeafEntry>() as u64;
+/// and expanded signed codes, and every filter field including string payloads.
+fn leaf_entry_bytes(entry: &CachedLeafEntry) -> u64 {
+    let mut bytes = size_of::<CachedLeafEntry>() as u64;
     bytes = bytes.saturating_add(entry.record_id().len() as u64);
-    bytes = bytes.saturating_add(entry.rabitq7().len() as u64);
+    bytes = bytes.saturating_add(entry.code.heap_bytes() as u64);
     for field in entry.fields() {
         bytes = bytes.saturating_add(field_bytes(field));
     }
@@ -629,8 +667,8 @@ mod tests {
 
     use super::super::rabitq::RaBitQ7;
     use super::{
-        BodyEntries, CacheKey, CachedBody, PartitionCache, PartitionKind, child_entry_bytes,
-        leaf_entry_bytes, load_body,
+        BodyEntries, CacheKey, CachedBody, CachedLeafEntry, PartitionCache, PartitionKind,
+        child_entry_bytes, leaf_entry_bytes, load_body,
     };
 
     fn index() -> LogicalIndexId {
@@ -664,12 +702,36 @@ mod tests {
         )
     }
 
+    #[test]
+    fn expanded_leaf_does_not_retain_the_packed_wire_buffer() {
+        let packed = RaBitQ7::quantize(&[1.0; 768]).expect("valid code");
+        let mut wire = vec![b'i', b'd'];
+        wire.extend_from_slice(&packed);
+        let wire = Bytes::from(wire);
+        let entry = LeafEntry::new(wire.slice(..2), Vec::new(), wire.slice(2..));
+        assert!(!wire.is_unique());
+        let cached = CachedLeafEntry::from_leaf(entry, 768);
+        assert!(
+            wire.is_unique(),
+            "cached IDs must not retain the packed payload"
+        );
+        assert_eq!(cached.record_id().as_ref(), b"id");
+        assert_eq!(cached.code().heap_bytes(), 768);
+        assert_eq!(
+            leaf_entry_bytes(&cached),
+            (size_of::<CachedLeafEntry>() + 2 + 768) as u64
+        );
+    }
+
     fn child_entry(child: u64) -> ChildEntry {
         ChildEntry::new(pk(child), vec![1.0])
     }
 
     fn cached_leaf_body(epoch: u64, ids: &[&[u8]]) -> Arc<CachedBody> {
-        let entries: Vec<LeafEntry> = ids.iter().map(|id| leaf_entry(id)).collect();
+        let entries: Vec<CachedLeafEntry> = ids
+            .iter()
+            .map(|id| CachedLeafEntry::from_leaf(leaf_entry(id), 1))
+            .collect();
         let mut bytes = size_of::<CachedBody>() as u64;
         for entry in &entries {
             bytes += leaf_entry_bytes(entry);
