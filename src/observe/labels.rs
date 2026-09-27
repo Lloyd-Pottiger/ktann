@@ -227,7 +227,6 @@ pub(crate) enum BudgetDimension {
     /// Distinct partition bodies logically visited.
     VisitedPartitions,
     /// Leaf Entries read and considered under the exact Filter Predicate.
-    VisitedLeafEntries,
     /// Vector Records read and exactly reranked.
     ExactRerankCandidates,
 }
@@ -238,7 +237,6 @@ impl BudgetDimension {
         match self {
             Self::ScannedTreeKeys => "scanned_tree_keys",
             Self::VisitedPartitions => "visited_partitions",
-            Self::VisitedLeafEntries => "visited_leaf_entries",
             Self::ExactRerankCandidates => "exact_rerank_candidates",
         }
     }
@@ -549,7 +547,6 @@ mod tests {
         assert_bounded(&[
             BudgetDimension::ScannedTreeKeys.as_str(),
             BudgetDimension::VisitedPartitions.as_str(),
-            BudgetDimension::VisitedLeafEntries.as_str(),
             BudgetDimension::ExactRerankCandidates.as_str(),
             cache_level(PartitionKind::Leaf),
             cache_level(PartitionKind::Internal),

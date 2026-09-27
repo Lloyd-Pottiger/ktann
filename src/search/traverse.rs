@@ -28,9 +28,9 @@
 //! - **Bounded work, charged before it starts.** Each distinct
 //!   `{Tree Key, Partition Key}` body is visited and charged to the Partition
 //!   budget at most once. Decoded bodies arrive whole from the
-//!   snapshot-validated cache, but Leaf Entries are charged and considered
-//!   only while the Leaf Entry budget funds them, in canonical body order, so
-//!   cache warmth never changes the logical accounting. A budget dimension is
+//!   snapshot-validated cache. All Leaf Entries in an admitted leaf are
+//!   considered in canonical body order; cache warmth never changes the
+//!   logical accounting. A budget dimension is
 //!   reported exhausted only when eligible pending work was actually prevented
 //!   by its depletion — never merely because natural completion landed
 //!   exactly on the limit (ADR 0011).
@@ -61,17 +61,17 @@ use crate::storage::ReadLogicalTxn;
 use crate::storage::backend::ReadOps;
 use crate::storage::keys::{LogicalKey, TreeKey};
 use crate::storage::values::{
-    IndexManifest, LeafEntry, PartitionHeader, PartitionState, PartitionTransition,
-    PersistentValue, RecordLocation, expect_header, expect_synopsis,
+    IndexManifest, PartitionHeader, PartitionState, PartitionTransition, PersistentValue,
+    RecordLocation, expect_header, expect_synopsis,
 };
 
 use super::beam_width;
-use super::cache::{BodyEntries, PartitionCache, load_body};
+use super::cache::{BodyEntries, CachedLeafEntry, PartitionCache, load_body};
 use super::numeric::{VectorKernel, compare_finite};
 use super::plan::EnumeratedTree;
 use super::predicate::{CompiledPredicate, SynopsisClassification};
 use super::rabitq::{
-    ApproximateCandidate, ApproximateDistance, RaBitQ7, RaBitQQuery, select_leaf_overlap,
+    ApproximateCandidate, ApproximateDistance, DecodedRaBitQ7, RaBitQQuery, select_leaf_overlap,
 };
 use super::rerank::{LeafCandidate, filter_candidates};
 
@@ -85,8 +85,9 @@ const INTERNAL_HEADER_BATCH: usize = 32;
 ///
 /// `routing` is the validated, metric-preprocessed, rotated query vector.
 /// `trees` are the materialized eligible trees in canonical Tree Key order.
-/// `budgets` bound visited partitions and Leaf Entries; the exact-rerank
-/// budget additionally caps every per-leaf overlap selection. `leaf_beam` is
+/// `budgets` bound visited partitions and cap every per-leaf overlap selection
+/// through the exact-rerank budget. All entries in an admitted leaf are
+/// considered; their count is observational. `leaf_beam` is
 /// the leaf-level base beam; [`DEFAULT_LEAF_BEAM`] is the production default.
 pub(crate) struct TraversalRequest<'a> {
     routing: &'a [f32],
@@ -125,18 +126,16 @@ impl<'a> TraversalRequest<'a> {
 ///
 /// Candidates are merged across every visited leaf for global overlap
 /// selection, which owns their final rough-distance/Record-ID ordering.
-/// The usage counters and exhaustion
-/// flags fold into the Search Outcome's `visited_partitions` and
-/// `visited_leaf_entries` dimensions.
+/// Reports visited-partition and Leaf Entry usage together with partition
+/// budget exhaustion and overlap truncation.
 pub(crate) struct TraversalOutcome {
     candidates: Vec<LeafCandidate>,
     /// Visited partitions worth offering to the Runtime's demand-driven Fixup
     /// queue: split or merge states and threshold-crossing `Ready` partitions.
     maintenance: Vec<(TreeKey, PartitionKey)>,
     visited_partitions: u32,
-    visited_leaf_entries: u32,
+    visited_leaf_entries: u64,
     partition_budget_exhausted: bool,
-    leaf_entry_budget_exhausted: bool,
     rabitq_overlap_truncated: bool,
 }
 
@@ -168,7 +167,7 @@ impl TraversalOutcome {
 
     /// Returns the Leaf Entries read and considered under the exact predicate.
     #[must_use]
-    pub(crate) const fn visited_leaf_entries(&self) -> u32 {
+    pub(crate) const fn visited_leaf_entries(&self) -> u64 {
         self.visited_leaf_entries
     }
 
@@ -176,12 +175,6 @@ impl TraversalOutcome {
     #[must_use]
     pub(crate) const fn partition_budget_exhausted(&self) -> bool {
         self.partition_budget_exhausted
-    }
-
-    /// Returns whether the depleted Leaf Entry budget prevented eligible work.
-    #[must_use]
-    pub(crate) const fn leaf_entry_budget_exhausted(&self) -> bool {
-        self.leaf_entry_budget_exhausted
     }
 
     /// Returns whether any per-leaf overlap cap discarded a qualifying overlap.
@@ -202,10 +195,6 @@ impl fmt::Debug for TraversalOutcome {
             .field(
                 "partition_budget_exhausted",
                 &self.partition_budget_exhausted,
-            )
-            .field(
-                "leaf_entry_budget_exhausted",
-                &self.leaf_entry_budget_exhausted,
             )
             .field("rabitq_overlap_truncated", &self.rabitq_overlap_truncated)
             .finish()
@@ -309,9 +298,8 @@ struct Traversal {
     /// queue: split or merge states and threshold-crossing `Ready` partitions.
     maintenance: Vec<(TreeKey, PartitionKey)>,
     visited_partitions: u32,
-    visited_leaf_entries: u32,
+    visited_leaf_entries: u64,
     partition_budget_exhausted: bool,
-    leaf_entry_budget_exhausted: bool,
     rabitq_overlap_truncated: bool,
 }
 
@@ -327,7 +315,6 @@ impl Traversal {
             visited_partitions: 0,
             visited_leaf_entries: 0,
             partition_budget_exhausted: false,
-            leaf_entry_budget_exhausted: false,
             rabitq_overlap_truncated: false,
         };
         for (ordinal, tree) in trees.iter().enumerate() {
@@ -377,16 +364,10 @@ impl Traversal {
                 let Reverse(entry) = self.frontier.pop().expect("frontier checked non-empty");
                 self.visit_partition(txn, context, entry, None).await?;
             }
-            // A depleted Leaf Entry budget stops the whole traversal: every
-            // remaining leaf visit consumes it, and expanding internal nodes
-            // could only queue more unfundable leaf work.
-            if self.leaf_entry_budget_exhausted {
-                break;
-            }
         }
         // Every still-queued entry is eligible work, prevented exactly when
-        // the Partition budget is fully spent; several dimensions may be
-        // exhausted together, while natural completion on the limit (an empty
+        // the Partition budget is fully spent. Natural completion on the limit
+        // (an empty
         // frontier) is not exhaustion.
         self.partition_budget_exhausted = self.visited_partitions
             == context.request.budgets.visited_partitions()
@@ -396,11 +377,9 @@ impl Traversal {
 
     /// Batches a funded prefix without changing its visitation order.
     ///
-    /// Non-root internal entries neither consume Leaf Entry budget nor inject
-    /// root-split targets into the active frontier. Thus every fetched Header
-    /// will be visited unless the whole operation fails. Roots and leaves keep
-    /// their demand-driven reads; in particular, leaf-budget exhaustion never
-    /// causes speculative metadata reads for later leaves.
+    /// Non-root internal entries do not inject root-split targets into the
+    /// active frontier. Every fetched Header will therefore be visited unless
+    /// the whole operation fails. Roots and leaves retain demand-driven reads.
     async fn visit_internal_beam<T: ReadOps>(
         &mut self,
         txn: &mut ReadLogicalTxn<'_, T>,
@@ -658,17 +637,9 @@ impl Traversal {
         Ok(())
     }
 
-    /// Considers one Leaf Partition's entries under the Leaf Entry budget,
-    /// filters them exactly, and merges the bounded overlap selection.
-    ///
-    /// The caller guarantees the leaf is non-empty and not synopsis-pruned, so
-    /// a budget that funds no entry is provably pending work: the leaf is
-    /// reported exhausted without spending a body load. Otherwise the decoded
-    /// body arrives whole from the snapshot-validated cache and entries are
-    /// charged and considered in canonical body order only while the remaining
-    /// Leaf Entry budget funds them — a depleted budget with unconsidered
-    /// entries is exhaustion and stops the whole traversal, regardless of
-    /// cache warmth.
+    /// Considers every entry of an admitted Leaf Partition, filters exactly,
+    /// and merges the bounded overlap selection. The snapshot-validated cache
+    /// supplies the whole decoded body; scanning has no independent entry cap.
     async fn scan_leaf<T: ReadOps>(
         &mut self,
         txn: &mut ReadLogicalTxn<'_, T>,
@@ -678,19 +649,6 @@ impl Traversal {
         header: &PartitionHeader,
         predicate: Option<&CompiledPredicate>,
     ) -> Result<()> {
-        let remaining = usize::try_from(
-            context
-                .request
-                .budgets
-                .visited_leaf_entries()
-                .checked_sub(self.visited_leaf_entries)
-                .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?,
-        )
-        .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
-        if remaining == 0 {
-            self.leaf_entry_budget_exhausted = true;
-            return Ok(());
-        }
         let body = load_body(
             txn,
             context.cache,
@@ -703,31 +661,23 @@ impl Traversal {
         let BodyEntries::Leaf(entries) = body.entries() else {
             return Err(Error::new(ErrorKind::Corruption));
         };
-        let dimension = context.manifest.config().dimension();
-        let funded = entries.len().min(remaining);
-        // Unconsidered entries are eligible work the depleted budget prevents.
-        // The already-funded entries below stay materialized and still flow
-        // through selection.
-        if funded < entries.len() {
-            self.leaf_entry_budget_exhausted = true;
-        }
         // Only predicate evaluation needs a temporary list of entry references.
         // Without a predicate (including AllMatch), score the body directly.
         let pool = if let Some(predicate) = predicate {
             let filtered = filter_candidates(
-                entries[..funded].iter().collect(),
+                entries.iter().collect(),
                 Some(predicate),
                 &mut self.visited_leaf_entries,
                 |entry| entry.fields(),
             )?;
-            score_leaf_entries(&filtered, dimension, context.query)?
+            score_leaf_entries(&filtered, context.query)?
                 .into_iter()
                 .map(|(entry, distance)| {
                     ApproximateCandidate::new(entry.record_id().clone(), distance, *entry)
                 })
                 .collect()
         } else {
-            let batch = score_leaf_entries(&entries[..funded], dimension, context.query)?;
+            let batch = score_leaf_entries(entries, context.query)?;
             filter_candidates(batch, None, &mut self.visited_leaf_entries, |(entry, _)| {
                 entry.fields()
             })?
@@ -803,7 +753,6 @@ impl Traversal {
             visited_partitions: self.visited_partitions,
             visited_leaf_entries: self.visited_leaf_entries,
             partition_budget_exhausted: self.partition_budget_exhausted,
-            leaf_entry_budget_exhausted: self.leaf_entry_budget_exhausted,
             rabitq_overlap_truncated: self.rabitq_overlap_truncated,
         })
     }
@@ -813,18 +762,15 @@ impl Traversal {
 ///
 /// Both inputs use the same four-entry slices and scalar tail, preserving each
 /// score's accumulation order without copying the unfiltered body's references.
-fn score_leaf_entries<'a, T: Borrow<LeafEntry>>(
+fn score_leaf_entries<'a, T: Borrow<CachedLeafEntry>>(
     entries: &'a [T],
-    dimension: usize,
     query: &RaBitQQuery<'_>,
 ) -> Result<Vec<(&'a T, ApproximateDistance)>> {
     let mut batch = Vec::with_capacity(entries.len());
     let mut chunks = entries.chunks_exact(4);
     for entries in &mut chunks {
-        let codes = std::array::from_fn(|lane| {
-            RaBitQ7::from_validated_leaf_bytes(entries[lane].borrow().rabitq7(), dimension)
-        });
-        let distances = RaBitQ7::approximate_distances(&codes, query)
+        let codes: [_; 4] = std::array::from_fn(|lane| entries[lane].borrow().code());
+        let distances = DecodedRaBitQ7::approximate_distances(codes, query)
             .map_err(|_| Error::new(ErrorKind::Corruption))?;
         for (entry, distance) in entries.iter().zip(distances) {
             batch.push((entry, distance));
@@ -833,9 +779,7 @@ fn score_leaf_entries<'a, T: Borrow<LeafEntry>>(
     for entry in chunks.remainder() {
         // Loading the immutable body validates every payload before filtering,
         // so rejected entries cannot hide malformed persistent codes.
-        let code = RaBitQ7::from_validated_leaf_bytes(entry.borrow().rabitq7(), dimension);
-        let distance = code
-            .approximate_distance(query)
+        let [distance] = DecodedRaBitQ7::approximate_distances([entry.borrow().code()], query)
             .map_err(|_| Error::new(ErrorKind::Corruption))?;
         batch.push((entry, distance));
     }
@@ -906,8 +850,8 @@ mod tests {
         EnumeratedTree::new(key.clone(), test_tree_manifest())
     }
 
-    fn budgets(partitions: u32, leaf_entries: u32, rerank: u32) -> SearchBudgets {
-        SearchBudgets::new(1_024, partitions, leaf_entries, rerank).expect("valid budgets")
+    fn budgets(partitions: u32, rerank: u32) -> SearchBudgets {
+        SearchBudgets::new(1_024, partitions, rerank).expect("valid budgets")
     }
 
     fn encode(manifest: &IndexManifest, value: &PersistentValue) -> Vec<u8> {
@@ -1104,7 +1048,7 @@ mod tests {
                 trees,
                 None,
                 8,
-                budgets(16, 16, 64),
+                budgets(16, 64),
                 DEFAULT_LEAF_BEAM,
             )
             .await,
@@ -1128,7 +1072,7 @@ mod tests {
     #[test]
     fn request_rejects_zero_k_or_beam() {
         let trees = vec![];
-        let budget = budgets(8, 8, 8);
+        let budget = budgets(8, 8);
         assert!(TraversalRequest::new(&QUERY, &trees, None, 0, budget, 1).is_err());
         assert!(TraversalRequest::new(&QUERY, &trees, None, 1, budget, 0).is_err());
     }
@@ -1162,7 +1106,7 @@ mod tests {
                         &trees,
                         None,
                         4,
-                        budgets(8, 8, 8),
+                        budgets(8, 8),
                         DEFAULT_LEAF_BEAM,
                     )
                     .expect("valid request"),
@@ -1186,7 +1130,6 @@ mod tests {
                 assert_eq!(outcome.visited_partitions(), 3);
                 assert_eq!(outcome.visited_leaf_entries(), 2);
                 assert!(!outcome.partition_budget_exhausted());
-                assert!(!outcome.leaf_entry_budget_exhausted());
                 assert!(!outcome.rabitq_overlap_truncated());
             }
         }
@@ -1214,7 +1157,7 @@ mod tests {
                     &mut txn,
                     &cache,
                     &kernel,
-                    TraversalRequest::new(&QUERY, &trees, None, 4, budgets(100, 8, 8), 256)
+                    TraversalRequest::new(&QUERY, &trees, None, 4, budgets(100, 8), 256)
                         .expect("valid request"),
                 )
                 .await
@@ -1257,7 +1200,7 @@ mod tests {
                 &[tree_ref(&tree)],
                 None,
                 4,
-                budgets(limit, 8, 8),
+                budgets(limit, 8),
                 DEFAULT_LEAF_BEAM,
             )
             .await
@@ -1272,7 +1215,7 @@ mod tests {
                 &[tree_ref(&tree)],
                 None,
                 4,
-                budgets(4, 8, 8),
+                budgets(4, 8),
                 DEFAULT_LEAF_BEAM,
             )
             .await,
@@ -1293,7 +1236,7 @@ mod tests {
             &[tree_ref(&tree)],
             None,
             4,
-            budgets(8, 8, 8),
+            budgets(8, 8),
             DEFAULT_LEAF_BEAM,
         )
         .await
@@ -1301,7 +1244,6 @@ mod tests {
         assert_eq!(outcome.visited_partitions(), 1);
         assert_eq!(outcome.visited_leaf_entries(), 0);
         assert!(!outcome.partition_budget_exhausted());
-        assert!(!outcome.leaf_entry_budget_exhausted());
         assert!(!outcome.rabitq_overlap_truncated());
         assert!(outcome.into_candidates().is_empty());
     }
@@ -1325,7 +1267,7 @@ mod tests {
             &trees,
             None,
             4,
-            budgets(8, 8, 8),
+            budgets(8, 8),
             DEFAULT_LEAF_BEAM,
         )
         .await
@@ -1336,7 +1278,6 @@ mod tests {
         assert_eq!(outcome.visited_partitions(), 1);
         assert_eq!(outcome.visited_leaf_entries(), 3);
         assert!(!outcome.partition_budget_exhausted());
-        assert!(!outcome.leaf_entry_budget_exhausted());
 
         // An identical snapshot, request, and budgets select identically.
         let rerun = run(
@@ -1345,7 +1286,7 @@ mod tests {
             &trees,
             None,
             4,
-            budgets(8, 8, 8),
+            budgets(8, 8),
             DEFAULT_LEAF_BEAM,
         )
         .await
@@ -1371,7 +1312,7 @@ mod tests {
             &[tree_ref(&tree)],
             None,
             1,
-            budgets(8, 8, 1),
+            budgets(8, 1),
             DEFAULT_LEAF_BEAM,
         )
         .await
@@ -1413,7 +1354,7 @@ mod tests {
             &trees,
             None,
             8,
-            budgets(16, 16, 64),
+            budgets(16, 64),
             DEFAULT_LEAF_BEAM,
         )
         .await
@@ -1432,7 +1373,7 @@ mod tests {
             &trees,
             None,
             8,
-            budgets(1, 16, 64),
+            budgets(1, 64),
             DEFAULT_LEAF_BEAM,
         )
         .await
@@ -1443,7 +1384,6 @@ mod tests {
         );
         assert_eq!(outcome.visited_partitions(), 1);
         assert!(outcome.partition_budget_exhausted());
-        assert!(!outcome.leaf_entry_budget_exhausted());
     }
 
     #[tokio::test]
@@ -1471,7 +1411,7 @@ mod tests {
             &trees,
             None,
             8,
-            budgets(3, 16, 64),
+            budgets(3, 64),
             DEFAULT_LEAF_BEAM,
         )
         .await
@@ -1490,7 +1430,7 @@ mod tests {
             &trees,
             None,
             8,
-            budgets(2, 16, 64),
+            budgets(2, 64),
             DEFAULT_LEAF_BEAM,
         )
         .await
@@ -1501,7 +1441,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_leaf_consumes_no_leaf_entry_budget() {
+    async fn empty_leaf_does_not_increase_entry_usage() {
         let manifest = manifest();
         let mut fixture = Fixture::new(&manifest);
         let tree = fixture.tree(1);
@@ -1520,7 +1460,7 @@ mod tests {
             &[tree_ref(&tree)],
             None,
             8,
-            budgets(16, 16, 64),
+            budgets(16, 64),
             DEFAULT_LEAF_BEAM,
         )
         .await
@@ -1528,7 +1468,6 @@ mod tests {
         assert_eq!(candidate_ids(&outcome), vec![b"x".as_slice()]);
         assert_eq!(outcome.visited_partitions(), 3);
         assert_eq!(outcome.visited_leaf_entries(), 1);
-        assert!(!outcome.leaf_entry_budget_exhausted());
     }
 
     #[tokio::test]
@@ -1563,7 +1502,7 @@ mod tests {
             &trees,
             None,
             8,
-            budgets(16, 16, 64),
+            budgets(16, 64),
             4,
         )
         .await
@@ -1588,7 +1527,7 @@ mod tests {
             &trees,
             None,
             8,
-            budgets(16, 16, 64),
+            budgets(16, 64),
             2,
         )
         .await
@@ -1599,7 +1538,6 @@ mod tests {
         );
         assert_eq!(outcome.visited_partitions(), 4);
         assert!(!outcome.partition_budget_exhausted());
-        assert!(!outcome.leaf_entry_budget_exhausted());
 
         // Beam 1 is a greedy single path to the nearest leaf.
         let outcome = run(
@@ -1608,7 +1546,7 @@ mod tests {
             &trees,
             None,
             8,
-            budgets(16, 16, 64),
+            budgets(16, 64),
             1,
         )
         .await
@@ -1656,7 +1594,7 @@ mod tests {
             &[tree_ref(&tree)],
             None,
             8,
-            budgets(16, 16, 64),
+            budgets(16, 64),
             4,
         )
         .await
@@ -1705,7 +1643,7 @@ mod tests {
             &trees,
             Some(predicate),
             8,
-            budgets(16, 16, 64),
+            budgets(16, 64),
             DEFAULT_LEAF_BEAM,
         )
         .await
@@ -1714,7 +1652,6 @@ mod tests {
         assert_eq!(outcome.visited_partitions(), 3);
         assert_eq!(outcome.visited_leaf_entries(), 2);
         assert!(!outcome.partition_budget_exhausted());
-        assert!(!outcome.leaf_entry_budget_exhausted());
 
         // A predicate that always holds over pk2's synopsis is AllMatch:
         // evaluation is skipped but every entry is still charged and admitted.
@@ -1736,7 +1673,7 @@ mod tests {
             &trees,
             Some(always),
             8,
-            budgets(16, 16, 64),
+            budgets(16, 64),
             DEFAULT_LEAF_BEAM,
         )
         .await
@@ -1746,94 +1683,6 @@ mod tests {
             vec![b"p".as_slice(), b"q".as_slice()]
         );
         assert_eq!(outcome.visited_leaf_entries(), 2);
-    }
-
-    #[tokio::test]
-    async fn leaf_budget_stops_mid_leaf_precisely() {
-        let manifest = manifest();
-        let mut fixture = Fixture::new(&manifest);
-        let tree = fixture.tree(1);
-        fixture.header(&tree, 1, 1, 5, PartitionState::Ready);
-        fixture.synopsis(&tree, 1, 1, &[0, 0, 0, 0, 0]);
-        for (index, record_id) in ["e0", "e1", "e2", "e3", "e4"].iter().enumerate() {
-            #[expect(clippy::cast_precision_loss, reason = "tiny fixture ordinals")]
-            fixture.entry(&tree, 1, 1, record_id, 0, [index as f32 + 1.0, 0.0]);
-        }
-
-        // The scan proceeds in Record ID order; the budget funds only e0..e2.
-        let outcome = run(
-            fixture.items,
-            &manifest,
-            &[tree_ref(&tree)],
-            None,
-            8,
-            budgets(16, 3, 64),
-            DEFAULT_LEAF_BEAM,
-        )
-        .await
-        .expect("traverse");
-        assert_eq!(
-            candidate_ids(&outcome),
-            vec![b"e0".as_slice(), b"e1".as_slice(), b"e2".as_slice()]
-        );
-        assert_eq!(outcome.visited_leaf_entries(), 3);
-        assert!(outcome.leaf_entry_budget_exhausted());
-        assert!(!outcome.partition_budget_exhausted());
-    }
-
-    #[tokio::test]
-    async fn leaf_budget_exact_completion_then_pending_leaf_exhausts() {
-        let manifest = manifest();
-        let mut fixture = Fixture::new(&manifest);
-        let first = fixture.tree(1);
-        fixture.header(&first, 1, 1, 2, PartitionState::Ready);
-        fixture.synopsis(&first, 1, 1, &[0, 0]);
-        fixture.entry(&first, 1, 1, "a1", 0, [1.0, 0.0]);
-        fixture.entry(&first, 1, 1, "a2", 0, [2.0, 0.0]);
-        let second = fixture.tree(2);
-        fixture.header(&second, 1, 1, 1, PartitionState::Ready);
-        fixture.synopsis(&second, 2, 1, &[0]);
-        fixture.entry(&second, 2, 1, "b1", 0, [3.0, 0.0]);
-        let trees = vec![tree_ref(&first), tree_ref(&second)];
-
-        // The budget exactly covers the first tree's entries: natural
-        // completion is not exhaustion, but the pending non-empty second leaf
-        // is prevented work.
-        let outcome = run(
-            fixture.items.clone(),
-            &manifest,
-            &trees,
-            None,
-            8,
-            budgets(16, 2, 64),
-            DEFAULT_LEAF_BEAM,
-        )
-        .await
-        .expect("traverse");
-        assert_eq!(
-            candidate_ids(&outcome),
-            vec![b"a1".as_slice(), b"a2".as_slice()]
-        );
-        assert_eq!(outcome.visited_partitions(), 2);
-        assert_eq!(outcome.visited_leaf_entries(), 2);
-        assert!(outcome.leaf_entry_budget_exhausted());
-        assert!(!outcome.partition_budget_exhausted());
-
-        // Funding every entry exactly empties the frontier: no exhaustion.
-        let outcome = run(
-            fixture.items,
-            &manifest,
-            &trees,
-            None,
-            8,
-            budgets(16, 3, 64),
-            DEFAULT_LEAF_BEAM,
-        )
-        .await
-        .expect("traverse");
-        assert_eq!(outcome.visited_leaf_entries(), 3);
-        assert!(!outcome.leaf_entry_budget_exhausted());
-        assert!(!outcome.partition_budget_exhausted());
     }
 
     #[tokio::test]
@@ -1855,7 +1704,7 @@ mod tests {
             &[tree_ref(&tree)],
             None,
             1,
-            budgets(16, 16, 1),
+            budgets(16, 1),
             DEFAULT_LEAF_BEAM,
         )
         .await
@@ -1863,7 +1712,6 @@ mod tests {
         assert_eq!(candidate_ids(&outcome), vec![b"a".as_slice()]);
         assert!(outcome.rabitq_overlap_truncated());
         assert_eq!(outcome.visited_leaf_entries(), 3);
-        assert!(!outcome.leaf_entry_budget_exhausted());
     }
 
     #[tokio::test]
@@ -1918,7 +1766,7 @@ mod tests {
             &[tree_ref(&tree)],
             None,
             8,
-            budgets(16, 16, 64),
+            budgets(16, 64),
             DEFAULT_LEAF_BEAM,
         )
         .await
@@ -1960,7 +1808,7 @@ mod tests {
             &[tree_ref(&tree)],
             None,
             8,
-            budgets(16, 16, 64),
+            budgets(16, 64),
             DEFAULT_LEAF_BEAM,
         )
         .await
@@ -2007,7 +1855,7 @@ mod tests {
             &[tree_ref(&tree)],
             None,
             8,
-            budgets(16, 16, 64),
+            budgets(16, 64),
             DEFAULT_LEAF_BEAM,
         )
         .await
@@ -2048,7 +1896,7 @@ mod tests {
             &[tree_ref(&tree)],
             None,
             8,
-            budgets(16, 16, 64),
+            budgets(16, 64),
             DEFAULT_LEAF_BEAM,
         )
         .await
@@ -2160,7 +2008,7 @@ mod tests {
                 &[tree_ref(&tree)],
                 Some(predicate),
                 8,
-                budgets(16, 16, 64),
+                budgets(16, 64),
                 DEFAULT_LEAF_BEAM,
             )
             .await,
@@ -2201,7 +2049,7 @@ mod tests {
                     value: Value::I64(1),
                 }),
                 8,
-                budgets(16, 16, 64),
+                budgets(16, 64),
                 DEFAULT_LEAF_BEAM,
             )
             .await,

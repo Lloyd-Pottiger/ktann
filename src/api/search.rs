@@ -10,7 +10,6 @@ use super::{Error, FieldSchema, Predicate, Result, validate_id};
 const MAX_K: usize = 65_536;
 const MAX_SCANNED_TREE_KEYS: u32 = 65_536;
 const MAX_VISITED_PARTITIONS: u32 = 16_384;
-const MAX_VISITED_LEAF_ENTRIES: u32 = 1_048_576;
 const MAX_EXACT_RERANK_CANDIDATES: u32 = 65_536;
 /// Beam width is counted in partitions, so anything wider than the visited
 /// partition hard cap is guaranteed to exhaust that budget instead.
@@ -22,7 +21,6 @@ const MAX_LEAF_BEAM_SIZE: u32 = MAX_VISITED_PARTITIONS;
 pub struct SearchBudgets {
     scanned_tree_keys: u32,
     visited_partitions: u32,
-    visited_leaf_entries: u32,
     exact_rerank_candidates: u32,
 }
 
@@ -31,7 +29,6 @@ impl Default for SearchBudgets {
         Self {
             scanned_tree_keys: 4_096,
             visited_partitions: 1_024,
-            visited_leaf_entries: 65_536,
             exact_rerank_candidates: 65_536,
         }
     }
@@ -42,13 +39,11 @@ impl SearchBudgets {
     pub fn new(
         scanned_tree_keys: u32,
         visited_partitions: u32,
-        visited_leaf_entries: u32,
         exact_rerank_candidates: u32,
     ) -> Result<Self> {
         let budgets = Self {
             scanned_tree_keys,
             visited_partitions,
-            visited_leaf_entries,
             exact_rerank_candidates,
         };
         budgets.validate_hard_caps()?;
@@ -60,8 +55,6 @@ impl SearchBudgets {
             || self.scanned_tree_keys > MAX_SCANNED_TREE_KEYS
             || self.visited_partitions == 0
             || self.visited_partitions > MAX_VISITED_PARTITIONS
-            || self.visited_leaf_entries == 0
-            || self.visited_leaf_entries > MAX_VISITED_LEAF_ENTRIES
             || self.exact_rerank_candidates == 0
             || self.exact_rerank_candidates > MAX_EXACT_RERANK_CANDIDATES
         {
@@ -82,12 +75,6 @@ impl SearchBudgets {
         self.visited_partitions
     }
 
-    /// Returns the visited Leaf Entry limit.
-    #[must_use]
-    pub const fn visited_leaf_entries(self) -> u32 {
-        self.visited_leaf_entries
-    }
-
     /// Returns the exact-rerank candidate limit.
     #[must_use]
     pub const fn exact_rerank_candidates(self) -> u32 {
@@ -102,7 +89,6 @@ impl SearchBudgets {
 pub struct SearchOptions {
     scanned_tree_keys: Option<u32>,
     visited_partitions: Option<u32>,
-    visited_leaf_entries: Option<u32>,
     leaf_beam_size: Option<u32>,
 }
 
@@ -121,13 +107,6 @@ impl SearchOptions {
         Ok(self)
     }
 
-    /// Overrides the positive visited Leaf Entry budget.
-    pub fn with_visited_leaf_entries(mut self, value: u32) -> Result<Self> {
-        validate_override(value, MAX_VISITED_LEAF_ENTRIES)?;
-        self.visited_leaf_entries = Some(value);
-        Ok(self)
-    }
-
     /// Returns the scanned Tree Key budget override.
     #[must_use]
     pub const fn scanned_tree_keys(self) -> Option<u32> {
@@ -138,12 +117,6 @@ impl SearchOptions {
     #[must_use]
     pub const fn visited_partitions(self) -> Option<u32> {
         self.visited_partitions
-    }
-
-    /// Returns the visited Leaf Entry budget override.
-    #[must_use]
-    pub const fn visited_leaf_entries(self) -> Option<u32> {
-        self.visited_leaf_entries
     }
 
     /// Overrides the positive leaf-level base beam width.
@@ -184,9 +157,6 @@ impl SearchOptions {
             visited_partitions: self
                 .visited_partitions
                 .unwrap_or(defaults.visited_partitions),
-            visited_leaf_entries: self
-                .visited_leaf_entries
-                .unwrap_or(defaults.visited_leaf_entries),
             exact_rerank_candidates: defaults.exact_rerank_candidates.min(exact_default),
         };
         let k = u32::try_from(k).map_err(|_| Error::invalid_argument())?;
@@ -352,7 +322,7 @@ impl fmt::Debug for SearchHit {
     }
 }
 
-/// Logical work charged to each Search Budget dimension.
+/// Logical search work, including uncapped Leaf Entry scans.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct SearchBudgetUsage {
@@ -361,7 +331,7 @@ pub struct SearchBudgetUsage {
     /// Distinct partition bodies logically visited, including cache hits.
     pub visited_partitions: u32,
     /// Leaf Entries read and considered under the exact Filter Predicate.
-    pub visited_leaf_entries: u32,
+    pub visited_leaf_entries: u64,
     /// Vector Records read and exactly reranked.
     pub exact_rerank_candidates: u32,
 }
@@ -374,8 +344,6 @@ pub struct SearchBudgetExhaustion {
     pub scanned_tree_keys: bool,
     /// Visited partition budget prevented eligible work.
     pub visited_partitions: bool,
-    /// Visited Leaf Entry budget prevented eligible work.
-    pub visited_leaf_entries: bool,
     /// Exact-rerank candidate budget prevented eligible work.
     pub exact_rerank_candidates: bool,
 }
@@ -386,7 +354,7 @@ pub struct SearchBudgetExhaustion {
 pub struct SearchOutcome {
     /// Exactly reranked hits ordered by distance and Record ID.
     pub hits: Vec<SearchHit>,
-    /// Logical work charged to Search Budgets.
+    /// Logical search work, including Leaf Entry scans.
     pub usage: SearchBudgetUsage,
     /// Every Search Budget dimension that prevented eligible work.
     pub exhausted: SearchBudgetExhaustion,

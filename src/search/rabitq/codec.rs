@@ -4,8 +4,8 @@ use bytes::Bytes;
 
 use crate::api::{Error, ErrorKind, MAX_DIMENSION, Result};
 
-use super::RaBitQ7;
 use super::rounding::{next_down, next_up};
+use super::{CodeHeader, RaBitQ7};
 
 const HEADER_BYTES: usize = 12;
 const MAX_MAGNITUDE: u8 = 63;
@@ -78,7 +78,8 @@ pub(super) fn decode(encoded: &[u8], dimension: usize) -> Result<RaBitQ7<'_>> {
     }
 
     let code = from_validated_bytes(encoded, dimension);
-    if !canonical_nonnegative(code.scale) || !canonical_nonnegative(code.reconstruction_error_upper)
+    if !canonical_nonnegative(code.header.scale)
+        || !canonical_nonnegative(code.header.reconstruction_error_upper)
     {
         return Err(corrupt());
     }
@@ -111,11 +112,12 @@ pub(super) fn decode(encoded: &[u8], dimension: usize) -> Result<RaBitQ7<'_>> {
             .ok_or_else(corrupt)?;
     }
 
-    if actual_norm != code.code_norm_squared {
+    if actual_norm != code.header.code_norm_squared {
         return Err(corrupt());
     }
-    if code.code_norm_squared == 0
-        && (code.scale.to_bits() != 0 || code.reconstruction_error_upper.to_bits() != 0)
+    if code.header.code_norm_squared == 0
+        && (code.header.scale.to_bits() != 0
+            || code.header.reconstruction_error_upper.to_bits() != 0)
     {
         return Err(corrupt());
     }
@@ -127,9 +129,11 @@ pub(super) fn decode(encoded: &[u8], dimension: usize) -> Result<RaBitQ7<'_>> {
 pub(super) fn from_validated_bytes(encoded: &[u8], dimension: usize) -> RaBitQ7<'_> {
     let magnitude_start = HEADER_BYTES + sign_bytes(dimension);
     RaBitQ7 {
-        scale: f32::from_bits(read_u32_le(encoded, 0)),
-        code_norm_squared: read_u32_le(encoded, 4),
-        reconstruction_error_upper: f32::from_bits(read_u32_le(encoded, 8)),
+        header: CodeHeader {
+            scale: f32::from_bits(read_u32_le(encoded, 0)),
+            code_norm_squared: read_u32_le(encoded, 4),
+            reconstruction_error_upper: f32::from_bits(read_u32_le(encoded, 8)),
+        },
         dimension,
         signs: &encoded[HEADER_BYTES..magnitude_start],
         magnitudes: &encoded[magnitude_start..],
@@ -138,6 +142,7 @@ pub(super) fn from_validated_bytes(encoded: &[u8], dimension: usize) -> RaBitQ7<
 
 impl RaBitQ7<'_> {
     /// Expands one signed code at a time in scalar accumulation order.
+    #[cfg(test)]
     pub(super) fn signed_codes(&self) -> impl ExactSizeIterator<Item = i8> + '_ {
         (0..self.dimension).map(|index| self.signed_code(index))
     }
@@ -166,7 +171,7 @@ impl RaBitQ7<'_> {
     }
 }
 
-/// A complete four-component packed group, loaded once for scalar-order scoring.
+/// A complete four-component packed group, loaded once for decoding.
 pub(super) struct CodeBlock {
     magnitudes: u32,
     signs: u8,

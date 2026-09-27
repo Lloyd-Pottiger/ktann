@@ -580,11 +580,6 @@ fn search_budget_configuration(
             request_override: options.visited_partitions(),
             effective_limit: effective.visited_partitions(),
         },
-        visited_leaf_entries: BudgetConfiguration {
-            runtime_default: defaults.visited_leaf_entries(),
-            request_override: options.visited_leaf_entries(),
-            effective_limit: effective.visited_leaf_entries(),
-        },
         exact_rerank_candidates: BudgetConfiguration {
             runtime_default: defaults.exact_rerank_candidates(),
             request_override: None,
@@ -1026,7 +1021,6 @@ async fn run_search_phase<B: Backend>(
             .fold(SearchTruncation::default(), |mut summary, (outcome, _)| {
                 summary.scanned_tree_keys += u64::from(outcome.exhausted.scanned_tree_keys);
                 summary.visited_partitions += u64::from(outcome.exhausted.visited_partitions);
-                summary.visited_leaf_entries += u64::from(outcome.exhausted.visited_leaf_entries);
                 summary.exact_rerank_candidates +=
                     u64::from(outcome.exhausted.exact_rerank_candidates);
                 summary.rabitq_overlap += u64::from(outcome.rabitq_overlap_truncated);
@@ -1057,6 +1051,9 @@ async fn run_search_phase<B: Backend>(
         recall_at_k: recall_summary(&recalls),
         truncation,
         search_budgets: budget_summaries(&metrics),
+        visited_leaf_entries: Distribution::from_samples(
+            metrics.histogram("ktann.search.leaf_entries", &[]),
+        ),
         search_stages_ms: search_stage_summaries(&metrics),
         cache: metrics.cache_summary(),
         backend_admission: metrics.admission_summary(),
@@ -1397,6 +1394,9 @@ async fn measure_steady_workload<B: Backend>(
         operations,
         recall_at_k: recall_summary(&recalls),
         search_budgets: budget_summaries(&metrics),
+        visited_leaf_entries: Distribution::from_samples(
+            metrics.histogram("ktann.search.leaf_entries", &[]),
+        ),
         search_stages_ms: search_stage_summaries(&metrics),
         cache: metrics.cache_summary(),
         backend_admission: metrics.admission_summary(),
@@ -1446,20 +1446,11 @@ fn validate_quality_frontier(
             point.measurements.recall_at_k.as_ref().ok_or_else(|| {
                 format!("leaf beam {} has no recall results", point.leaf_beam_size)
             })?;
-        let leaf_budget = point
-            .measurements
-            .search_budgets
-            .get("visited_leaf_entries")
-            .ok_or_else(|| {
-                format!(
-                    "leaf beam {} has no Leaf Entry budget results",
-                    point.leaf_beam_size
-                )
-            })?;
+        let leaf_work_usage = &point.measurements.visited_leaf_entries;
         if search.attempted != expected_searches
             || search.accepted != expected_searches
             || recall.queries != expected_searches
-            || leaf_budget.usage.count != expected_searches
+            || leaf_work_usage.count != expected_searches
         {
             return Err(format!(
                 "leaf beam {} completed {}/{} searches with {} recall and {} Leaf Entry samples; expected {expected_searches}",
@@ -1467,11 +1458,11 @@ fn validate_quality_frontier(
                 search.accepted,
                 search.attempted,
                 recall.queries,
-                leaf_budget.usage.count,
+                leaf_work_usage.count,
             ));
         }
         recalls.push(recall.mean);
-        leaf_work.push(leaf_budget.usage.mean);
+        leaf_work.push(leaf_work_usage.mean);
     }
     let recall_moves = recalls
         .iter()
@@ -2137,12 +2128,11 @@ fn recall_summary(recalls: &[f64]) -> Option<RecallSummary> {
     })
 }
 
-/// Converts the four public Search Budget dimensions without inventing work.
+/// Summarizes usage and exhaustion for the three Search Budget dimensions.
 fn budget_summaries(metrics: &CapturedMetrics) -> BTreeMap<String, BudgetSummary> {
     [
         "scanned_tree_keys",
         "visited_partitions",
-        "visited_leaf_entries",
         "exact_rerank_candidates",
     ]
     .into_iter()
@@ -2259,7 +2249,7 @@ mod tests {
     use ktann::api::{SearchBudgets, SearchOptions};
 
     use crate::report::{
-        BudgetSummary, Distribution, OperationClass, OperationSummary, QualityPoint, RecallSummary,
+        Distribution, OperationClass, OperationSummary, QualityPoint, RecallSummary,
         SteadyStateMeasurements, Topology,
     };
 
@@ -2305,17 +2295,11 @@ mod tests {
             OperationClass::Search,
             operation_summary(searches, searches, 0),
         );
-        measurements.search_budgets.insert(
-            "visited_leaf_entries".to_owned(),
-            BudgetSummary {
-                usage: Distribution {
-                    count: searches,
-                    mean: leaf_work,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        );
+        measurements.visited_leaf_entries = Distribution {
+            count: searches,
+            mean: leaf_work,
+            ..Default::default()
+        };
         QualityPoint {
             leaf_beam_size: beam,
             measurements,

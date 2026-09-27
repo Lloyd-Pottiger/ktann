@@ -236,7 +236,7 @@ async fn operations_record_the_documented_series() {
     // Demand-driven maintenance settles the 17 records into a split tree.
     audit::settle(&index, &backend, 17).await;
 
-    // Searches: one with sufficient budgets, one with a leaf-entry budget
+    // Searches: one with sufficient budgets, one with a partition budget
     // of one that must report exhaustion.
     index
         .search(SearchRequest::new(Arc::from([3.1_f32]), 1).expect("request"))
@@ -248,13 +248,13 @@ async fn operations_record_the_documented_series() {
                 .expect("request")
                 .with_options(
                     SearchOptions::default()
-                        .with_visited_leaf_entries(1)
+                        .with_visited_partitions(1)
                         .expect("valid budget"),
                 ),
         )
         .await
         .expect("tight search");
-    assert!(tight.exhausted.visited_leaf_entries);
+    assert!(tight.exhausted.visited_partitions);
 
     // Verification of the settled index completes.
     let report = index
@@ -346,12 +346,8 @@ async fn operations_record_the_documented_series() {
     );
 
     // Exactly one budget exhaustion across all dimensions: the tight
-    // leaf-entry search. The settle polls run with default budgets.
-    for dimension in [
-        "scanned_tree_keys",
-        "visited_partitions",
-        "exact_rerank_candidates",
-    ] {
+    // partition-limited search. The settle polls run with default budgets.
+    for dimension in ["scanned_tree_keys", "exact_rerank_candidates"] {
         assert_eq!(
             bumped("ktann.search.budget.exhausted", &[("dimension", dimension)]),
             0
@@ -360,7 +356,7 @@ async fn operations_record_the_documented_series() {
     assert_eq!(
         bumped(
             "ktann.search.budget.exhausted",
-            &[("dimension", "visited_leaf_entries")]
+            &[("dimension", "visited_partitions")]
         ),
         1
     );
@@ -445,7 +441,6 @@ async fn operations_record_the_documented_series() {
     for dimension in [
         "scanned_tree_keys",
         "visited_partitions",
-        "visited_leaf_entries",
         "exact_rerank_candidates",
     ] {
         assert!(seen(
@@ -453,6 +448,7 @@ async fn operations_record_the_documented_series() {
             &[("dimension", dimension)]
         ));
     }
+    assert!(seen("ktann.search.leaf_entries", &[]));
     for stage in ["approximate_selection", "exact_reranking"] {
         assert!(seen("ktann.search.stage.duration", &[("stage", stage)]));
     }

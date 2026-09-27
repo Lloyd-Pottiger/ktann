@@ -769,6 +769,66 @@ fn dimensional_count_identity_and_size_invariants_fail_closed() {
 }
 
 #[test]
+fn vector_components_preserve_bits_and_reject_noncanonical_lanes() {
+    let finite = [
+        0.0_f32,
+        f32::from_bits(1),
+        -f32::from_bits(1),
+        f32::MIN_POSITIVE,
+        -f32::MIN_POSITIVE,
+        f32::MAX,
+        -f32::MAX,
+    ];
+    for dimension in [1, 3, 4, 5, 7, 8, 9, 17, 768, 16_384] {
+        let manifest = IndexManifest::new(
+            IndexLifecycle::Active,
+            id(1),
+            IndexConfig::new(dimension, Metric::L2).expect("valid dimension"),
+            [0; 32],
+            vec![],
+        )
+        .expect("valid manifest");
+        let codec = index_codec(&manifest);
+        let components: Vec<_> = (0..dimension)
+            .map(|index| finite[index % finite.len()])
+            .collect();
+        let value = PersistentValue::PartitionCentroid(PartitionCentroid::new(components.clone()));
+        let bytes = codec.encode(&value).expect("encode finite components");
+        let PersistentValue::PartitionCentroid(decoded) =
+            decode_value(codec, id(1), &value, &bytes).expect("decode canonical vector")
+        else {
+            panic!("expected centroid");
+        };
+        assert_eq!(
+            decoded
+                .components()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            components
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+        );
+        for component in [0, dimension / 2, dimension - 1] {
+            for invalid in [
+                0x8000_0000_u32,
+                0x7f80_0000,
+                0xff80_0000,
+                0x7fc0_0001,
+                0x7f80_0001,
+            ] {
+                let mut malformed = bytes.clone();
+                // One kind byte and one u32 dimension precede the components.
+                let offset = 5 + 4 * component;
+                malformed[offset..offset + 4].copy_from_slice(&invalid.to_be_bytes());
+                assert_corrupt(decode_value(codec, id(1), &value, &malformed));
+            }
+        }
+    }
+}
+
+#[test]
 fn schema_and_synopsis_invariants_fail_closed() {
     let manifest = rich_manifest();
     let codec = index_codec(&manifest);

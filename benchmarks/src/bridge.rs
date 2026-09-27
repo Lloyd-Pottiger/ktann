@@ -139,7 +139,6 @@ enum Operation {
         dimension: usize,
         metric: String,
         dataset: String,
-        leaf_budget: Option<u32>,
         leaf_beam: Option<u32>,
     },
     Insert {
@@ -202,7 +201,7 @@ struct Measurements {
     received_bytes: u64,
     sent_bytes: u64,
     budget: [u64; 4],
-    exhausted: [u64; 5],
+    exhausted: [u64; 4],
     last_search: Option<Instant>,
 }
 impl Default for Measurements {
@@ -216,7 +215,7 @@ impl Default for Measurements {
             received_bytes: 0,
             sent_bytes: 0,
             budget: [0; 4],
-            exhausted: [0; 5],
+            exhausted: [0; 4],
             last_search: None,
         }
     }
@@ -414,7 +413,6 @@ impl<B: Backend> Service<B> {
                 dimension,
                 metric,
                 dataset,
-                leaf_budget,
                 leaf_beam,
             } => {
                 if dataset.is_empty() || dataset.len() > 1024 {
@@ -429,11 +427,6 @@ impl<B: Backend> Service<B> {
                     .and_then(|c| c.with_partition_entries(32, 128))
                     .map_err(api_error)?;
                 let mut search = SearchOptions::default();
-                if let Some(budget) = leaf_budget {
-                    search = search
-                        .with_visited_leaf_entries(budget)
-                        .map_err(api_error)?;
-                }
                 if let Some(beam) = leaf_beam {
                     search = search.with_leaf_beam_size(beam).map_err(api_error)?;
                 }
@@ -522,7 +515,6 @@ impl<B: Backend> Service<B> {
                 let probe_options = SearchOptions::default()
                     .with_scanned_tree_keys(1)
                     .and_then(|s| s.with_visited_partitions(128))
-                    .and_then(|s| s.with_visited_leaf_entries(128))
                     .and_then(|s| s.with_leaf_beam_size(1))
                     .map_err(api_error)?;
 
@@ -628,18 +620,17 @@ impl<B: Backend> Service<B> {
                 m.buckets[bucket] += 1;
                 let u = result.usage;
                 for (sum, value) in m.budget.iter_mut().zip([
-                    u.scanned_tree_keys,
-                    u.visited_partitions,
+                    u64::from(u.scanned_tree_keys),
+                    u64::from(u.visited_partitions),
                     u.visited_leaf_entries,
-                    u.exact_rerank_candidates,
+                    u64::from(u.exact_rerank_candidates),
                 ]) {
-                    *sum += u64::from(value);
+                    *sum += value;
                 }
                 let e = result.exhausted;
                 for (sum, value) in m.exhausted.iter_mut().zip([
                     e.scanned_tree_keys,
                     e.visited_partitions,
-                    e.visited_leaf_entries,
                     e.exact_rerank_candidates,
                     result.rabitq_overlap_truncated,
                 ]) {
@@ -695,11 +686,10 @@ impl<B: Backend> Service<B> {
             "search_budgets": {
                 "scanned_tree_keys": SearchBudgets::default().scanned_tree_keys(),
                 "visited_partitions": SearchBudgets::default().visited_partitions(),
-                "visited_leaf_entries": state.search.visited_leaf_entries().unwrap_or(SearchBudgets::default().visited_leaf_entries()),
                 "leaf_beam": state.search.resolved_leaf_beam_size(),
                 "exact_rerank_candidates": "KTANN default derived from k"
             },
-            "search_budget_usage_totals": m.budget,
+            "search_usage_totals": m.budget,
             "search_exhaustion_counts": m.exhausted,
             "topology": state.topology,
             "resource": { "peak_rss_bytes": resources.peak_rss_bytes(), "cpu_seconds": resources.cpu_seconds_since(self.baseline) },

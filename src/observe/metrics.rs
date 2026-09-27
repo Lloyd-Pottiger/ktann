@@ -27,6 +27,7 @@ pub(crate) mod names {
     pub(crate) const WRITE_MUTATIONS: &str = "ktann.write.mutations";
     pub(crate) const WRITE_MUTATION_BYTES: &str = "ktann.write.mutation_bytes";
     pub(crate) const WRITE_COMMIT_DURATION: &str = "ktann.write.commit.duration";
+    pub(crate) const SEARCH_LEAF_ENTRIES: &str = "ktann.search.leaf_entries";
     pub(crate) const SEARCH_BUDGET_USAGE: &str = "ktann.search.budget.usage";
     pub(crate) const SEARCH_BUDGET_EXHAUSTED: &str = "ktann.search.budget.exhausted";
     pub(crate) const SEARCH_STAGE_DURATION: &str = "ktann.search.stage.duration";
@@ -152,8 +153,9 @@ impl Drop for MutationStageTimer {
     }
 }
 
-/// Records the logical budget usage and exhaustion of one search.
+/// Records logical search work and exhaustion of the remaining budgets.
 pub(crate) fn search_budget(usage: &SearchBudgetUsage, exhausted: &SearchBudgetExhaustion) {
+    metrics::histogram!(names::SEARCH_LEAF_ENTRIES).record(usage.visited_leaf_entries as f64);
     let dimensions = [
         (
             BudgetDimension::ScannedTreeKeys,
@@ -164,11 +166,6 @@ pub(crate) fn search_budget(usage: &SearchBudgetUsage, exhausted: &SearchBudgetE
             BudgetDimension::VisitedPartitions,
             usage.visited_partitions,
             exhausted.visited_partitions,
-        ),
-        (
-            BudgetDimension::VisitedLeafEntries,
-            usage.visited_leaf_entries,
-            exhausted.visited_leaf_entries,
         ),
         (
             BudgetDimension::ExactRerankCandidates,
@@ -461,6 +458,7 @@ mod tests {
             names::OPERATION_DURATION,
             names::FOREGROUND_ADMISSION,
             names::WRITE_RETRIES,
+            names::SEARCH_LEAF_ENTRIES,
             names::SEARCH_BUDGET_USAGE,
             names::SEARCH_BUDGET_EXHAUSTED,
             names::SEARCH_STAGE_DURATION,

@@ -200,7 +200,6 @@ The v1 defaults and caps are:
 | Partition cache | 25% of machine total physical memory, capped at `usize::MAX` | zero disables; must fit `usize` |
 | Scanned Tree Keys | 4,096 | 65,536 |
 | Visited partitions | 1,024 | 16,384 |
-| Visited Leaf Entries | 65,536 | 1,048,576 |
 | Exact rerank candidates | `min(max(64,k+ceil(k/4)),65,536)` | Runtime ceiling 65,536; effective value at least `k` |
 | Leaf beam size | 128 | 16,384 |
 | Write beam size | 8 | 16,384 |
@@ -216,12 +215,15 @@ current interval.
 `SearchRequest` contains a finite vector of exact dimension, `k`, an optional
 Predicate, and SearchOptions. `k` is `1..=65,536`; the effective exact-rerank
 budget is `max(64,k+ceil(k/4))` under the Runtime ceiling and must remain at
-least `k`. SearchOptions may override Tree Key, partition, and Leaf Entry bounds and
+least `k`. SearchOptions may override Tree Key and partition bounds and
 the leaf-level base beam width per request; the beam is a traversal-quality
 knob, not an accounted budget dimension, and the visited-partition budget still
 bounds the work it schedules.
 
-`SearchOutcome` contains ordered Search Hits, Search Budget usage, an exhaustive
+Leaf Entry scans have no separate budget; all entries in an admitted leaf are
+considered. Their usage is reported with a 64-bit counter and no exhaustion flag.
+
+`SearchOutcome` contains ordered Search Hits, logical search work, an exhaustive
 set of exhausted dimensions, and `rabitq_overlap_truncated`. A hit contains only
 Record ID and exact f64 distance. Payload and stored fields are loaded through
 get/batch_get rather than search.

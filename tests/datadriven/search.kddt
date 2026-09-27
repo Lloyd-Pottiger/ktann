@@ -94,17 +94,6 @@ r000002: 3.2921
 r000004: 3.4862
 usage: scanned_tree_keys=1 visited_partitions=1 visited_leaf_entries=2000 exact_rerank_candidates=5
 
-# A depleted Leaf Entry budget truncates and says so.
-search k=5 vector=[0,0,0,0,0,0,0,0] visited-leaf-entries=50
-----
-r000009: 1.4586
-r000016: 1.7387
-r000018: 1.8086
-r000028: 1.8168
-r000008: 2.1333
-usage: scanned_tree_keys=1 visited_partitions=1 visited_leaf_entries=50 exact_rerank_candidates=5
-exhausted: visited_leaf_entries
-
 # ----------------------------------------------------------------------
 # A5: an empty tree reports zero hits with budget usage still accounted.
 # ----------------------------------------------------------------------

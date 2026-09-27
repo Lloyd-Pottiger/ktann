@@ -3,7 +3,7 @@
 //! One search runs over one consistent backend snapshot (design `search.md`
 //! section 6 and ADR 0011): the persisted Active Manifest is validated and
 //! bound, Tree Keys are enumerated under the scanned-key budget, every
-//! eligible tree is traversed under the partition and Leaf Entry budgets with
+//! eligible tree is traversed under the partition budget with
 //! snapshot-validated cache reads, the merged candidates pass global overlap
 //! selection, and the survivors' Vector Records are batch-loaded and exactly
 //! reranked — all from the same snapshot.
@@ -156,7 +156,6 @@ pub(crate) async fn search<B: Backend>(
     let visited_partitions = traversal.visited_partitions();
     let visited_leaf_entries = traversal.visited_leaf_entries();
     let partition_budget_exhausted = traversal.partition_budget_exhausted();
-    let leaf_entry_budget_exhausted = traversal.leaf_entry_budget_exhausted();
     let rabitq_overlap_truncated = traversal.rabitq_overlap_truncated();
 
     // Global overlap selection retains every candidate whose conservative
@@ -204,7 +203,6 @@ pub(crate) async fn search<B: Backend>(
         exhausted: SearchBudgetExhaustion {
             scanned_tree_keys: enumeration.scanned_tree_key_budget_exhausted(),
             visited_partitions: partition_budget_exhausted,
-            visited_leaf_entries: leaf_entry_budget_exhausted,
             exact_rerank_candidates: rerank_exhausted,
         },
         rabitq_overlap_truncated,
