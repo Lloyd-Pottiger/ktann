@@ -142,11 +142,11 @@ impl ExactRerankOutcome {
 pub(crate) fn filter_candidates<T>(
     candidates: Vec<T>,
     predicate: Option<&CompiledPredicate>,
-    visited_leaf_entries: &mut u32,
+    visited_leaf_entries: &mut u64,
     fields: impl Fn(&T) -> &[Value],
 ) -> Result<Vec<T>> {
     let considered =
-        u32::try_from(candidates.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
+        u64::try_from(candidates.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
     *visited_leaf_entries = visited_leaf_entries
         .checked_add(considered)
         .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
@@ -529,7 +529,7 @@ mod tests {
             LeafCandidate::fields,
         )
         .expect("filter without predicate");
-        assert_eq!(visited, total);
+        assert_eq!(visited, u64::from(total));
         assert_eq!(admitted.len(), records.len());
         // Filtering preserves the input order and the rough distances.
         for (index, candidate) in admitted.iter().enumerate() {
@@ -554,7 +554,7 @@ mod tests {
             LeafCandidate::fields,
         )
         .expect("filter with predicate");
-        assert_eq!(visited, 7 + total);
+        assert_eq!(visited, u64::from(7 + total));
         let expected: Vec<&str> = records
             .iter()
             .filter(|record| record.tag == Some("red"))
@@ -639,7 +639,7 @@ mod tests {
                     LeafCandidate::fields,
                 )
                 .expect("filter");
-                assert_eq!(visited, records.len() as u32);
+                assert_eq!(visited, records.len() as u64);
                 let budget = filtered.len() as u32;
                 let data = record_group_data(&manifest, &records);
                 let outcome = rerank(&manifest, mock_txn(data), filtered, 4, budget)
@@ -751,7 +751,7 @@ mod tests {
                 LeafCandidate::fields,
             )
             .expect("filter");
-            assert_eq!(visited, records.len() as u32);
+            assert_eq!(visited, records.len() as u64);
             let admitted: Vec<&[u8]> = admitted
                 .iter()
                 .map(|candidate| candidate.record_id().as_ref())

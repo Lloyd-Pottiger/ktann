@@ -703,11 +703,6 @@ fn compare_lifecycle_search(
             candidate.truncation.visited_partitions,
         ),
         (
-            "visited Leaf Entries",
-            baseline.truncation.visited_leaf_entries,
-            candidate.truncation.visited_leaf_entries,
-        ),
-        (
             "exact rerank candidates",
             baseline.truncation.exact_rerank_candidates,
             candidate.truncation.exact_rerank_candidates,
@@ -1352,7 +1347,6 @@ mod tests {
                 search_budgets: SearchBudgetConfiguration {
                     scanned_tree_keys: budget_configuration(4_096, 4_096),
                     visited_partitions: budget_configuration(1_024, 1_024),
-                    visited_leaf_entries: budget_configuration(65_536, 65_536),
                     exact_rerank_candidates: budget_configuration(65_536, 100),
                 },
                 write_beam_size: 8,

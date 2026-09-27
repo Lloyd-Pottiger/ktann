@@ -247,7 +247,7 @@ async fn redaction_audit_covers_all_paths() {
 
     // Searches: a predicate over the canary field exercises Bloom synopsis
     // pruning; the repeated search over the settled tree exercises cache
-    // hits; the tiny Leaf Entry budget exhausts that dimension against any
+    // hits; the tiny partition budget exhausts that dimension against any
     // non-empty leaf (a pruned partition is ineligible, so the Leaf Entry
     // dimension is the deterministic one).
     index
@@ -262,7 +262,7 @@ async fn redaction_audit_covers_all_paths() {
         .expect("valid request")
         .with_options(
             SearchOptions::default()
-                .with_visited_leaf_entries(1)
+                .with_visited_partitions(1)
                 .expect("valid override"),
         );
     index.search(constrained).await.expect("constrained search");
@@ -438,7 +438,6 @@ async fn redaction_audit_covers_all_paths() {
     for dimension in [
         "scanned_tree_keys",
         "visited_partitions",
-        "visited_leaf_entries",
         "exact_rerank_candidates",
     ] {
         has_series(
@@ -447,10 +446,11 @@ async fn redaction_audit_covers_all_paths() {
             &[("dimension", dimension)],
         );
     }
+    has_series(&series, "ktann.search.leaf_entries", &[]);
     has_series(
         &series,
         "ktann.search.budget.exhausted",
-        &[("dimension", "visited_leaf_entries")],
+        &[("dimension", "visited_partitions")],
     );
     has_series(
         &series,

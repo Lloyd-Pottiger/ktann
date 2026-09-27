@@ -539,9 +539,6 @@ impl Harness {
                 if outcome.exhausted.visited_partitions {
                     exhausted.push("visited_partitions");
                 }
-                if outcome.exhausted.visited_leaf_entries {
-                    exhausted.push("visited_leaf_entries");
-                }
                 if outcome.exhausted.exact_rerank_candidates {
                     exhausted.push("exact_rerank_candidates");
                 }
@@ -604,7 +601,7 @@ impl Harness {
                 truncated += 1;
             }
             total_partitions += u64::from(outcome.usage.visited_partitions);
-            total_leaf_entries += u64::from(outcome.usage.visited_leaf_entries);
+            total_leaf_entries += outcome.usage.visited_leaf_entries;
             total_rerank += u64::from(outcome.usage.exact_rerank_candidates);
         }
         let count = queries.len() as f64;
@@ -1587,11 +1584,6 @@ fn search_options(directive: &Directive) -> SearchOptions {
     if let Some(value) = directive.arg("visited-partitions") {
         options = options
             .with_visited_partitions(value.parse().expect("visited-partitions"))
-            .expect("valid");
-    }
-    if let Some(value) = directive.arg("visited-leaf-entries") {
-        options = options
-            .with_visited_leaf_entries(value.parse().expect("visited-leaf-entries"))
             .expect("valid");
     }
     if let Some(value) = directive.arg("beam-size") {

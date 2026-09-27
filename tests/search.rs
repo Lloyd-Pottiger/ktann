@@ -139,7 +139,6 @@ fn assert_no_budget_exhaustion(outcome: &SearchOutcome) {
     assert!(
         !outcome.exhausted.scanned_tree_keys
             && !outcome.exhausted.visited_partitions
-            && !outcome.exhausted.visited_leaf_entries
             && !outcome.exhausted.exact_rerank_candidates,
         "no budget dimension is exhausted: {:?}",
         outcome.exhausted
@@ -251,7 +250,7 @@ async fn packed_search_preserves_results_and_budgets_across_cache_modes() {
 
         // Reopen the same persistent index with a fresh cache in each mode.
         // The first uncached result is the control for this metric; duplicate
-        // vectors exercise ties and the leaf budget leaves one entry unfunded.
+        // vectors exercise ties across the full leaf.
         let mut control: Option<SearchOutcome> = None;
         for capacity in [0, 1, 1 << 20] {
             let runtime_config = support::manual_maintenance_config()
@@ -264,9 +263,7 @@ async fn packed_search_preserves_results_and_budgets_across_cache_modes() {
                 .expect("open index");
             let mut scans = [0; 2];
             for scan_count in &mut scans {
-                let options = SearchOptions::default()
-                    .with_visited_leaf_entries(3)
-                    .expect("valid leaf budget");
+                let options = SearchOptions::default();
                 let request = SearchRequest::new(Arc::from(vectors[0]), 2)
                     .expect("valid query")
                     .with_options(options);
@@ -275,8 +272,7 @@ async fn packed_search_preserves_results_and_budgets_across_cache_modes() {
                 *scan_count = backend.inner().operation_counts().scan;
                 assert_eq!(outcome.hits.len(), 2);
                 assert_eq!(outcome.usage.visited_partitions, 1);
-                assert_eq!(outcome.usage.visited_leaf_entries, 3);
-                assert!(outcome.exhausted.visited_leaf_entries);
+                assert_eq!(outcome.usage.visited_leaf_entries, 4);
                 if let Some(expected) = &control {
                     assert_eq!(hit_bits(&outcome), hit_bits(expected));
                     assert_eq!(outcome.usage, expected.usage);
@@ -416,7 +412,6 @@ async fn every_budget_dimension_reports_exactly_its_own_exhaustion() {
     assert_eq!(outcome.usage.scanned_tree_keys, 2);
     assert!(outcome.exhausted.scanned_tree_keys);
     assert!(!outcome.exhausted.visited_partitions);
-    assert!(!outcome.exhausted.visited_leaf_entries);
     assert!(!outcome.exhausted.exact_rerank_candidates);
     assert_eq!(
         hit_parts(&outcome),
@@ -438,7 +433,6 @@ async fn every_budget_dimension_reports_exactly_its_own_exhaustion() {
     assert_eq!(outcome.usage.visited_partitions, 2);
     assert!(!outcome.exhausted.scanned_tree_keys);
     assert!(outcome.exhausted.visited_partitions);
-    assert!(!outcome.exhausted.visited_leaf_entries);
     assert!(!outcome.exhausted.exact_rerank_candidates);
     assert_eq!(
         hit_parts(&outcome),
@@ -446,39 +440,11 @@ async fn every_budget_dimension_reports_exactly_its_own_exhaustion() {
     );
     runtime.shutdown().await.expect("shutdown");
 
-    // Visited Leaf Entries fund a canonical Record ID prefix. Later entries
-    // are closer, so each result must retain the end of its funded prefix.
-    let (_backend, runtime, index) = setup().await;
-    let rows: Vec<Row> = (0..9)
-        .map(|i| (vec![b'a' + i], f32::from(9 - i), 1, None))
-        .collect();
-    insert_all(&index, &rows).await;
-    for funded in 3..=rows.len() {
-        let options = SearchOptions::default()
-            .with_visited_leaf_entries(funded as u32)
-            .expect("valid override");
-        let outcome = index
-            .search(search_request(2).with_options(options))
-            .await
-            .expect("search");
-        assert_eq!(outcome.usage.visited_leaf_entries, funded as u32);
-        assert_eq!(outcome.exhausted.visited_leaf_entries, funded < rows.len());
-        assert!(!outcome.exhausted.scanned_tree_keys);
-        assert!(!outcome.exhausted.visited_partitions);
-        assert!(!outcome.exhausted.exact_rerank_candidates);
-        assert_eq!(
-            hit_parts(&outcome),
-            brute_force(&rows[..funded], 0.0, 2, |_| true)
-        );
-    }
-    runtime.shutdown().await.expect("shutdown");
-
     // Exact rerank candidates: two trees of ten identical vectors each. Every
     // interval coincides, so the per-leaf caps and the merged selection both
     // truncate to the Runtime ceiling and report it.
     let backend = shared_backend(DeterministicConfig::default());
-    let search_budgets =
-        SearchBudgets::new(4_096, 1_024, 65_536, 3).expect("valid exact-rerank ceiling");
+    let search_budgets = SearchBudgets::new(4_096, 1_024, 3).expect("valid exact-rerank ceiling");
     let runtime_config = support::manual_maintenance_config()
         .with_default_search_budgets(search_budgets)
         .expect("valid runtime search budgets");
@@ -499,7 +465,6 @@ async fn every_budget_dimension_reports_exactly_its_own_exhaustion() {
     assert!(outcome.rabitq_overlap_truncated);
     assert!(!outcome.exhausted.scanned_tree_keys);
     assert!(!outcome.exhausted.visited_partitions);
-    assert!(!outcome.exhausted.visited_leaf_entries);
     assert_eq!(outcome.hits.len(), 2);
     assert!(outcome.hits.iter().all(|hit| hit.distance() == 1.0));
 

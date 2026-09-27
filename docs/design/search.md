@@ -153,7 +153,7 @@ One consistent snapshot performs:
 6. original Vector Record batch loading and exact reranking;
 7. deterministic top-k ordering and budget report construction.
 
-Every funded Leaf Entry counts against the visited-entry budget. Exact leaf
+Every Leaf Entry in an admitted partition is considered and counted. Exact leaf
 filtering precedes RaBitQ scoring, so rejected entries consume no scoring work.
 The complete loaded body is still decoded and validated before filtering;
 predicate rejection cannot hide malformed persistent entries.
@@ -166,7 +166,7 @@ globally nearest beam for each tree. This prevents one wide parent from
 consuming the next level's beam before other admitted parents contribute their
 children. Eligible trees advance fairly. Ties use Tree Key, Partition Key,
 then Record ID.
-Partition, Leaf Entry, rerank, and optional RaBitQ-overlap bounds are charged
+Partition, rerank, and optional RaBitQ-overlap bounds are charged
 before corresponding work. No speculative read-ahead occurs beyond a budget.
 
 For a leaf with `n` eligible entries, checked arithmetic computes
@@ -200,10 +200,14 @@ state. Exact Record Location/Leaf Entry ownership prevents duplicate result
 membership; defensive duplicate Record IDs encountered in one snapshot are
 Corruption rather than silently deduplicated.
 
+Leaf Entry scans have no independent cap. Beam and the partition budget limit
+which partitions are admitted; actual partition sizes determine scan work.
+Leaf Entry usage is a 64-bit counter, not an exhaustion dimension.
+
 ## 7. Search budgets and response
 
-SearchOptions overrides nonzero bounds for Tree Keys, partitions, and Leaf
-Entries within hard caps, plus the leaf-level base beam width. Exact-rerank
+SearchOptions overrides nonzero bounds for Tree Keys and partitions within
+hard caps, plus the leaf-level base beam width. Exact-rerank
 sizing is owned by search: checked arithmetic computes
 `max(64,k+ceil(k/4))`, matching the leaf rough-set floor, and bounds it by the
 Runtime's exact-rerank ceiling. Defaults are process-local and benchmark-tunable.
@@ -213,7 +217,7 @@ pending work.
 The API deliberately has no `complete` boolean: ANN search is approximate even
 when no logical budget is exhausted. It also has no quality score or
 continuation token. Callers needing more traversal work may resubmit with
-higher Tree Key, partition, or Leaf Entry budgets, or a wider beam. Exact-rerank
+higher Tree Key or partition budgets, or a wider beam. Exact-rerank
 sizing changes only with `k` or the engine policy. RaBitQ estimate distances
 likewise stay internal: there is deliberately no estimate-only response mode or
 skip-rerank switch. Focused selection tests protect the candidate policy, while

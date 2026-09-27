@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 /// Current complete benchmark suite/report JSON contract.
-pub const REPORT_SCHEMA_VERSION: u32 = 4;
+pub const REPORT_SCHEMA_VERSION: u32 = 5;
 
 /// Supplies the v2 default when decoding a report created before write-beam
 /// configuration became part of the report contract. The schema-version check
@@ -165,8 +165,6 @@ pub struct SearchBudgetConfiguration {
     pub scanned_tree_keys: BudgetConfiguration,
     /// Visited partition limit configuration.
     pub visited_partitions: BudgetConfiguration,
-    /// Visited Leaf Entry limit configuration.
-    pub visited_leaf_entries: BudgetConfiguration,
     /// Exact-rerank candidate limit configuration.
     pub exact_rerank_candidates: BudgetConfiguration,
 }
@@ -339,6 +337,8 @@ pub struct SteadyStateMeasurements {
     pub recall_at_k: Option<RecallSummary>,
     /// Search budget use for every public dimension.
     pub search_budgets: BTreeMap<String, BudgetSummary>,
+    /// Leaf Entries considered, independent of search budgets.
+    pub visited_leaf_entries: Distribution,
     /// Approximate-selection and exact-reranking stage latency.
     pub search_stages_ms: BTreeMap<String, Distribution>,
     /// Partition Cache observations.
@@ -517,6 +517,8 @@ pub struct SearchPhase {
     pub truncation: SearchTruncation,
     /// Search Budget use for every public dimension.
     pub search_budgets: BTreeMap<String, BudgetSummary>,
+    /// Leaf Entries considered, independent of search budgets.
+    pub visited_leaf_entries: Distribution,
     /// Approximate-selection and exact-reranking latency.
     pub search_stages_ms: BTreeMap<String, Distribution>,
     /// Partition Cache behavior during the pass.
@@ -532,8 +534,6 @@ pub struct SearchTruncation {
     pub scanned_tree_keys: u64,
     /// Searches exhausting the visited-partition budget.
     pub visited_partitions: u64,
-    /// Searches exhausting the visited-Leaf-Entry budget.
-    pub visited_leaf_entries: u64,
     /// Searches exhausting the exact-rerank-candidate budget.
     pub exact_rerank_candidates: u64,
     /// Searches truncated by a per-leaf RaBitQ overlap cap.

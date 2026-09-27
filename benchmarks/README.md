@@ -173,15 +173,16 @@ The timed workload reports:
 - logical write amplification as attempted mutation operations and bytes per
   successful public write, including retry attempts.
 
-`configuration.search_budgets` exposes the same four dimension names used by
+`configuration.search_budgets` exposes the same three dimension names used by
 the steady-state measurement payload's `search_budgets`:
-`scanned_tree_keys`, `visited_partitions`, `visited_leaf_entries`, and
+`scanned_tree_keys`, `visited_partitions`, and
 `exact_rerank_candidates`. Each configuration entry distinguishes the Runtime
 `runtime_default`, an optional per-request `request_override`, and the concrete
 `effective_limit`; exact reranking is engine-sized, so that dimension's request
 override is always absent. The measurement entry can therefore compare its
-usage and exhausted-search count directly with the governing limit. `visited_leaf_entries`
-counts derived Leaf Entries considered during filtering and approximate
+usage and exhausted-search count directly with the governing limit. The separate
+`visited_leaf_entries` measurement records the distribution of uncapped Leaf Entry
+scans through `ktann.search.leaf_entries`. It counts entries considered during filtering and approximate
 selection; `exact_rerank_candidates` counts original Vector Records loaded and
 exactly reranked.
 

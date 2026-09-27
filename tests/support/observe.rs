@@ -322,7 +322,6 @@ const ALLOWED_LABEL_VALUES: &[(&str, &[&str])] = &[
         &[
             "scanned_tree_keys",
             "visited_partitions",
-            "visited_leaf_entries",
             "exact_rerank_candidates",
         ],
     ),

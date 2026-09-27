@@ -240,7 +240,7 @@ fn search_rejects_invalid_k_dimension_and_budgets() -> ktann::api::Result<()> {
     );
     assert_eq!(SearchOptions::default().leaf_beam_size(), None);
 
-    let tight_runtime_budgets = SearchBudgets::new(4_096, 1_024, 65_536, 9)?;
+    let tight_runtime_budgets = SearchBudgets::new(4_096, 1_024, 9)?;
     let mut request = SearchRequest::new(Arc::from([1.0_f32, 2.0]), 10)?;
     assert_invalid(request.validate(2, &[], tight_runtime_budgets));
 
@@ -257,7 +257,7 @@ fn search_rejects_invalid_k_dimension_and_budgets() -> ktann::api::Result<()> {
         let budgets = request.validate(2, &[], SearchBudgets::default())?;
         assert_eq!(budgets.exact_rerank_candidates(), expected);
     }
-    let runtime_cap = SearchBudgets::new(4_096, 1_024, 65_536, 12)?;
+    let runtime_cap = SearchBudgets::new(4_096, 1_024, 12)?;
     let mut request = SearchRequest::new(Arc::from([1.0_f32, 2.0]), 10)?;
     assert_eq!(
         request

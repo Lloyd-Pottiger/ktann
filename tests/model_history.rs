@@ -1007,7 +1007,6 @@ impl Driver {
         }
         let exhausted = outcome.exhausted.scanned_tree_keys
             || outcome.exhausted.visited_partitions
-            || outcome.exhausted.visited_leaf_entries
             || outcome.exhausted.exact_rerank_candidates
             || outcome.rabitq_overlap_truncated;
         if exhausted {
