@@ -244,7 +244,15 @@ fn search_rejects_invalid_k_dimension_and_budgets() -> ktann::api::Result<()> {
     let mut request = SearchRequest::new(Arc::from([1.0_f32, 2.0]), 10)?;
     assert_invalid(request.validate(2, &[], tight_runtime_budgets));
 
-    for (k, expected) in [(1, 64), (10, 64), (43, 65), (65_536, 65_536)] {
+    for (k, expected) in [
+        (1, 64),
+        (10, 64),
+        (51, 64),
+        (52, 65),
+        (100, 125),
+        (101, 127),
+        (65_536, 65_536),
+    ] {
         let mut request = SearchRequest::new(Arc::from([1.0_f32, 2.0]), k)?;
         let budgets = request.validate(2, &[], SearchBudgets::default())?;
         assert_eq!(budgets.exact_rerank_candidates(), expected);

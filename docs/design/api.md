@@ -201,7 +201,7 @@ The v1 defaults and caps are:
 | Scanned Tree Keys | 4,096 | 65,536 |
 | Visited partitions | 1,024 | 16,384 |
 | Visited Leaf Entries | 65,536 | 1,048,576 |
-| Exact rerank candidates | `min(max(64,k+ceil(k/2)),65,536)` | Runtime ceiling 65,536; effective value at least `k` |
+| Exact rerank candidates | `min(max(64,k+ceil(k/4)),65,536)` | Runtime ceiling 65,536; effective value at least `k` |
 | Leaf beam size | 128 | 16,384 |
 | Write beam size | 8 | 16,384 |
 | Tree Key scan ranges | 1,024 | wider conservative fallback |
@@ -215,7 +215,7 @@ current interval.
 
 `SearchRequest` contains a finite vector of exact dimension, `k`, an optional
 Predicate, and SearchOptions. `k` is `1..=65,536`; the effective exact-rerank
-budget is `max(64,k+ceil(k/2))` under the Runtime ceiling and must remain at
+budget is `max(64,k+ceil(k/4))` under the Runtime ceiling and must remain at
 least `k`. SearchOptions may override Tree Key, partition, and Leaf Entry bounds and
 the leaf-level base beam width per request; the beam is a traversal-quality
 knob, not an accounted budget dimension, and the visited-partition budget still

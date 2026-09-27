@@ -205,7 +205,7 @@ Corruption rather than silently deduplicated.
 SearchOptions overrides nonzero bounds for Tree Keys, partitions, and Leaf
 Entries within hard caps, plus the leaf-level base beam width. Exact-rerank
 sizing is owned by search: checked arithmetic computes
-`max(64,k+ceil(k/2))`, matching the leaf rough-set floor, and bounds it by the
+`max(64,k+ceil(k/4))`, matching the leaf rough-set floor, and bounds it by the
 Runtime's exact-rerank ceiling. Defaults are process-local and benchmark-tunable.
 One successful response reports usage and each dimension that prevented
 pending work.

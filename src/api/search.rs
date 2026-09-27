@@ -205,12 +205,13 @@ fn validate_override(value: u32, maximum: u32) -> Result<()> {
     }
 }
 
+/// Keeps 25% candidate headroom while retaining the small-query floor.
 fn default_exact_rerank(k: usize) -> Result<u32> {
     if !(1..=MAX_K).contains(&k) {
         return Err(Error::invalid_argument());
     }
     let value = k
-        .checked_add(k.div_ceil(2))
+        .checked_add(k.div_ceil(4))
         .ok_or_else(Error::invalid_argument)?
         .clamp(64, MAX_K);
     u32::try_from(value).map_err(|_| Error::invalid_argument())

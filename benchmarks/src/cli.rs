@@ -573,12 +573,17 @@ async fn run_rocksdb(
         OptimisticTransactionDB::open(&database_options, &database_path)
             .map_err(|error| format!("open RocksDB: {error}"))?,
     );
-    let limit = scenario
-        .blocking_resource_limit
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
-    let config = RocksDbConfig::default()
-        .with_blocking_resource_limit(limit)
-        .map_err(|error| format!("RocksDB config: {error:?}"))?;
+    let config = RocksDbConfig::default();
+    let config = if let Some(limit) = scenario.blocking_resource_limit {
+        config
+            .with_blocking_resource_limit(limit)
+            .map_err(|error| format!("RocksDB config: {error:?}"))?
+    } else {
+        config
+    };
+    // Report the effective adapter limit even when the scenario uses its default.
+    let mut effective_scenario = scenario.clone();
+    effective_scenario.blocking_resource_limit = Some(config.blocking_resource_limit());
     let backend = RocksDbBackend::with_config(
         Arc::clone(&database),
         BackendNamespace::new("ktann-benchmark")
@@ -589,7 +594,7 @@ async fn run_rocksdb(
         "rocksdb",
         "rust-rocksdb=0.24.0; rocksdb=10.4.2".to_owned(),
         backend,
-        scenario,
+        &effective_scenario,
         options.reproduction_command.clone(),
         options.worker_threads,
     )
