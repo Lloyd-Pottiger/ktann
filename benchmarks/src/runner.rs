@@ -2128,7 +2128,7 @@ fn recall_summary(recalls: &[f64]) -> Option<RecallSummary> {
     })
 }
 
-/// Converts the four public Search Budget dimensions without inventing work.
+/// Summarizes usage and exhaustion for the three Search Budget dimensions.
 fn budget_summaries(metrics: &CapturedMetrics) -> BTreeMap<String, BudgetSummary> {
     [
         "scanned_tree_keys",

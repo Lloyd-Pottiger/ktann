@@ -133,7 +133,7 @@ impl ExactRerankOutcome {
 
 /// Applies the optional exact Filter Predicate to Leaf Candidates.
 ///
-/// Every candidate is charged to `visited_leaf_entries`, including candidates
+/// Every candidate is counted in `visited_leaf_entries`, including candidates
 /// admitted without evaluation when no predicate exists: each one is a Leaf
 /// Entry read and considered under the exact predicate. Only a SQL TRUE
 /// result qualifies; FALSE and UNKNOWN are rejected. Candidate order is

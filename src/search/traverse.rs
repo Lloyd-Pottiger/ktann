@@ -85,8 +85,9 @@ const INTERNAL_HEADER_BATCH: usize = 32;
 ///
 /// `routing` is the validated, metric-preprocessed, rotated query vector.
 /// `trees` are the materialized eligible trees in canonical Tree Key order.
-/// `budgets` bound visited partitions and Leaf Entries; the exact-rerank
-/// budget additionally caps every per-leaf overlap selection. `leaf_beam` is
+/// `budgets` bound visited partitions and cap every per-leaf overlap selection
+/// through the exact-rerank budget. All entries in an admitted leaf are
+/// considered; their count is observational. `leaf_beam` is
 /// the leaf-level base beam; [`DEFAULT_LEAF_BEAM`] is the production default.
 pub(crate) struct TraversalRequest<'a> {
     routing: &'a [f32],
