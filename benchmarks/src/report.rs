@@ -109,9 +109,9 @@ pub struct Configuration {
     /// Pending-plus-running Fixup capacity.
     pub fixup_queue_capacity: usize,
     /// Whole Foreground Mutation attempt ceiling.
-    pub mutation_attempt_limit: usize,
+    pub mutation_attempt_limit: u32,
     /// Whole Structure Maintenance attempt ceiling.
-    pub maintenance_attempt_limit: usize,
+    pub maintenance_attempt_limit: u32,
     /// Runtime defaults, request overrides, and effective per-search limits.
     pub search_budgets: SearchBudgetConfiguration,
     /// Per-level beam used while importing records into the tree.

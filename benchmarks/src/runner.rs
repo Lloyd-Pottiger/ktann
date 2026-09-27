@@ -311,47 +311,47 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
 
 /// Fixed public million-vector quality curves reserved for optimized workers.
 fn large_scenarios() -> Result<Vec<ScenarioSpec>, String> {
-    let search_options = SearchOptions::default()
-        .with_scanned_tree_keys(1)
-        .and_then(|options| options.with_visited_partitions(16_384))
-        .and_then(|options| options.with_visited_leaf_entries(1_048_576))
-        .map_err(|error| error_at("configure large search", error))?;
-    let scenario = |name, dataset, dimension, metric| ScenarioSpec {
-        name,
-        dataset,
-        profile: "large",
-        base_vectors: 1_000_000,
-        query_vectors: 1_000,
-        query_offset: 0,
-        dimension,
-        metric,
-        seed: 0x38_2001,
-        search_percent: 100,
-        hot_updates: false,
-        partition_cache_bytes: 512 << 20,
-        foreground_limit: 64,
-        blocking_resource_limit: Some(64),
-        concurrency: 16,
-        dispatch: WorkloadDispatch::Continuous,
-        warmup_operations: 1_000,
-        // Repeat the fixed query corpus to reduce short-interval timing noise.
-        measured_operations: 10_000,
-        k: 10,
-        search_options,
-        write_beam_size: 8,
-        leaf_beam_sweep: vec![1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128],
-        // Keep the shared leaf/internal fanout below sqrt(1M) so the
-        // million-vector corpus must form at least three searchable levels.
-        max_partition_entries: 128,
-        lifecycle: false,
-        import_batch_size: 50,
-        import_max_in_flight_batches: 4,
-        import_backlog_watermark: 2,
-        maintenance_workers: 2,
+    let defaults = RuntimeConfig::default();
+    let scenario = |name, dataset, dimension, metric| -> Result<ScenarioSpec, String> {
+        let index = IndexConfig::new(dimension, metric)
+            .map_err(|error| error_at("configure large index", error))?;
+        Ok(ScenarioSpec {
+            name,
+            dataset,
+            profile: "large",
+            base_vectors: 1_000_000,
+            query_vectors: 1_000,
+            query_offset: 0,
+            dimension,
+            metric,
+            seed: 0x38_2001,
+            search_percent: 100,
+            hot_updates: false,
+            partition_cache_bytes: defaults.partition_cache_bytes(),
+            foreground_limit: defaults.foreground_operation_limit(),
+            blocking_resource_limit: None,
+            concurrency: 16,
+            dispatch: WorkloadDispatch::Continuous,
+            warmup_operations: 1_000,
+            // Repeat the fixed query corpus to reduce short-interval timing noise.
+            measured_operations: 10_000,
+            k: 100,
+            search_options: SearchOptions::default(),
+            write_beam_size: defaults.write_beam_size(),
+            leaf_beam_sweep: vec![1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128, 192, 256, 384],
+            // Keep the shared leaf/internal fanout below sqrt(1M) so the
+            // million-vector corpus must form at least three searchable levels.
+            max_partition_entries: index.max_partition_entries(),
+            lifecycle: false,
+            import_batch_size: 50,
+            import_max_in_flight_batches: defaults.import_max_in_flight_batches(),
+            import_backlog_watermark: defaults.import_backlog_watermark(),
+            maintenance_workers: defaults.maintenance_workers(),
+        })
     };
     Ok(vec![
-        scenario("quality-cohere-1m", "cohere-1m", 768, Metric::Cosine),
-        scenario("quality-sift-1m", "sift-1m", 128, Metric::L2),
+        scenario("quality-cohere-1m", "cohere-1m", 768, Metric::Cosine)?,
+        scenario("quality-sift-1m", "sift-1m", 128, Metric::L2)?,
     ])
 }
 
@@ -408,6 +408,9 @@ pub async fn run_scenario<B: Backend>(
     let admission = backend.admission_budget();
     let metric_capture = MetricCapture::install()?;
     let primary_runtime_config = runtime_config(spec, spec.maintenance_workers)?;
+    let fixup_queue_capacity = primary_runtime_config.fixup_queue_capacity();
+    let mutation_attempt_limit = primary_runtime_config.foreground_attempts();
+    let maintenance_attempt_limit = primary_runtime_config.fixup_attempts();
     let index_config = index_config(spec)?;
     let default_search_budgets = primary_runtime_config.default_search_budgets();
     let search_budgets =
@@ -489,9 +492,9 @@ pub async fn run_scenario<B: Backend>(
             convergence_maintenance_workers: spec
                 .lifecycle
                 .then_some(CONVERGENCE_MAINTENANCE_WORKERS),
-            fixup_queue_capacity: FIXUP_QUEUE_CAPACITY,
-            mutation_attempt_limit: 32,
-            maintenance_attempt_limit: 32,
+            fixup_queue_capacity,
+            mutation_attempt_limit,
+            maintenance_attempt_limit,
             search_budgets,
             write_beam_size: spec.write_beam_size,
             leaf_beam_size_override: spec.search_options.leaf_beam_size(),
@@ -526,12 +529,22 @@ fn runtime_config(
     // The Fixup queue retains the default capacity so the default Import
     // Session backlog watermark remains within it. RuntimeConfig validates
     // those two process-local resource bounds together at Runtime creation.
-    let config = RuntimeConfig::default()
+    let defaults = RuntimeConfig::default();
+    let fixup_queue_capacity = if spec.profile == "large" {
+        defaults.fixup_queue_capacity()
+    } else {
+        FIXUP_QUEUE_CAPACITY
+    };
+    let config = defaults
         .with_foreground_operation_limit(spec.foreground_limit)
-        .and_then(|config| config.with_maintenance(maintenance_workers, FIXUP_QUEUE_CAPACITY))
-        .and_then(|config| config.with_attempts(32, 32))
+        .and_then(|config| config.with_maintenance(maintenance_workers, fixup_queue_capacity))
         .and_then(|config| config.with_partition_cache_bytes(spec.partition_cache_bytes))
         .and_then(|config| config.with_write_beam_size(spec.write_beam_size));
+    let config = if spec.profile == "large" {
+        config
+    } else {
+        config.and_then(|config| config.with_attempts(32, 32))
+    };
     let config = if spec.lifecycle || spec.profile == "large" {
         config.and_then(|config| {
             config.with_import_limits(
@@ -773,7 +786,12 @@ const fn metric_name(metric: Metric) -> &'static str {
 /// Builds the public Index configuration shared by steady and lifecycle cases.
 fn index_config(spec: &ScenarioSpec) -> Result<IndexConfig, String> {
     let config = IndexConfig::new(spec.dimension, spec.metric).and_then(|config| {
-        config.with_partition_entries(spec.max_partition_entries / 4, spec.max_partition_entries)
+        if spec.profile == "large" && spec.max_partition_entries == config.max_partition_entries() {
+            Ok(config)
+        } else {
+            config
+                .with_partition_entries(spec.max_partition_entries / 4, spec.max_partition_entries)
+        }
     });
     let config = if spec.profile == "large" {
         config
@@ -2387,24 +2405,58 @@ mod tests {
     }
 
     #[test]
-    fn large_profile_is_an_explicit_single_variable_beam_sweep() {
+    fn large_profile_uses_library_defaults_for_the_top_100_beam_sweep() {
         for scenario in scenarios("large").expect("large profile") {
             assert_eq!(
                 scenario.leaf_beam_sweep,
-                [1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128]
+                [1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128, 192, 256, 384]
             );
-            assert_eq!(scenario.search_options.scanned_tree_keys(), Some(1));
-            assert_eq!(scenario.search_options.visited_partitions(), Some(16_384));
+            assert_eq!(scenario.k, 100);
+            assert_eq!(scenario.search_options, SearchOptions::default());
+            assert_eq!(scenario.blocking_resource_limit, None);
+            let defaults = ktann::api::RuntimeConfig::default();
+            let actual = runtime_config(&scenario, scenario.maintenance_workers)
+                .expect("large runtime config");
             assert_eq!(
-                scenario.search_options.visited_leaf_entries(),
-                Some(1_048_576)
+                actual.partition_cache_bytes(),
+                defaults.partition_cache_bytes()
             );
-            assert_eq!(scenario.search_options.leaf_beam_size(), None);
+            assert_eq!(
+                actual.foreground_operation_limit(),
+                defaults.foreground_operation_limit()
+            );
+            assert_eq!(actual.maintenance_workers(), defaults.maintenance_workers());
+            assert_eq!(
+                actual.fixup_queue_capacity(),
+                defaults.fixup_queue_capacity()
+            );
+            assert_eq!(actual.foreground_attempts(), defaults.foreground_attempts());
+            assert_eq!(actual.fixup_attempts(), defaults.fixup_attempts());
+            assert_eq!(actual.write_beam_size(), defaults.write_beam_size());
+            assert_eq!(
+                actual.import_max_in_flight_batches(),
+                defaults.import_max_in_flight_batches()
+            );
+            assert_eq!(
+                actual.import_backlog_watermark(),
+                defaults.import_backlog_watermark()
+            );
             let budgets = scenario
                 .search_options
-                .resolve(SearchBudgets::default(), scenario.k)
+                .resolve(actual.default_search_budgets(), scenario.k)
                 .expect("large search budgets resolve");
-            assert_eq!(budgets.exact_rerank_candidates(), 64);
+            assert_eq!(
+                budgets,
+                SearchOptions::default()
+                    .resolve(defaults.default_search_budgets(), 100)
+                    .expect("default search budgets resolve")
+            );
+            assert_eq!(budgets.exact_rerank_candidates(), 125);
+            assert_eq!(
+                super::index_config(&scenario).expect("large index config"),
+                ktann::api::IndexConfig::new(scenario.dimension, scenario.metric)
+                    .expect("default index config")
+            );
             let max_partition_entries = usize::try_from(scenario.max_partition_entries)
                 .expect("partition fanout fits usize");
             assert!(

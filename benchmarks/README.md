@@ -56,17 +56,28 @@ otherwise idle hosts.
 The separate `large` profile is an optimized scheduled/manual quality run and
 never runs in smoke CI. It loads the fixed external inputs described in
 [`datasets/README.md`](datasets/README.md), creates one converged index per
-dataset, and sweeps leaf beam `1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128`
+dataset, and sweeps leaf beam `1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128, 192, 256, 384`
 while holding the four Search
 Budgets, k-derived exact-rerank policy, `k`, Runtime limits, Index configuration,
 concurrency, dataset, and Backend fixed. The curves use Cohere 1M with cosine
 and SIFT1M with L2, each with 1,000 held-out queries and supplied ground truth.
 
-The large quality curve keeps request `k=10` and the same 1,000 distinct queries,
+Runtime and Logical Index settings follow the library defaults, including the
+partition cache (one quarter of physical memory), maintenance concurrency,
+retry limits and partition occupancy. Request Search Budgets have no overrides;
+only the beam changes across the curve, which includes the default beam of 128.
+RocksDB uses its default blocking-resource limit. Explicit diagnostic CLI
+options still override their named settings and are recorded in the report.
+The workload retains 16 concurrent clients, 1,000 warmups and import batches of
+50 records; these are benchmark load settings, not library defaults. Reports
+record resolved cache bytes, limits, attempts, partition bounds and budgets,
+so compare runs on equivalent hosts and check those values before comparing
+results. Earlier large reports with top-10 and fixed limits are not comparable.
+
+The large quality curve keeps request `k=100` and the same 1,000 distinct queries,
 with 10,000 measured operations per beam. Repeated queries reduce timing noise;
 they are not additional independent recall samples. The effective
-rerank limit remains 64, so high recall targets may be unreachable with this
-query policy. Compare actual operating points at equal or better recall;
+rerank limit is 125 under the engine default policy. Compare actual operating points at equal or better recall;
 interpolated curves do not establish latency or throughput non-regression.
 
 ```sh
