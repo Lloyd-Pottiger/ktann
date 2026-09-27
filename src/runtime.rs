@@ -71,6 +71,7 @@ impl<B: Backend> Runtime<B> {
                     foreground: Arc::new(Semaphore::new(foreground_limit)),
                     foreground_waiting: Arc::new(Semaphore::new(foreground_limit)),
                     fixups: Mutex::new(FixupQueue::new(config.fixup_queue_capacity())),
+                    fixup_reporting: Mutex::new(()),
                     fixup_available: Notify::new(),
                     fixup_released: Notify::new(),
                     maintenance_cancel: CancellationToken::new(),
@@ -368,6 +369,8 @@ pub(crate) struct RuntimeInner<B: Backend> {
     foreground: Arc<Semaphore>,
     foreground_waiting: Arc<Semaphore>,
     fixups: Mutex<FixupQueue>,
+    /// Serializes backlog metric callbacks without holding the Fixup queue lock.
+    fixup_reporting: Mutex<()>,
     fixup_available: Notify,
     /// Signalled when a released Fixup queue slot opens the Import Session
     /// backlog gate, so gated submissions re-check the watermark.

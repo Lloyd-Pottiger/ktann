@@ -247,7 +247,7 @@ impl<B: Backend> RuntimeInner<B> {
         let mut enqueued = 0_u64;
         let mut duplicate = 0_u64;
         let mut saturated = 0_u64;
-        let backlog = {
+        {
             let mut queue = self.lock_fixups();
             for (tree_key, partition) in partitions {
                 let key = FixupKey {
@@ -264,11 +264,10 @@ impl<B: Backend> RuntimeInner<B> {
                     FixupAdmission::Saturated => saturated += 1,
                 }
             }
-            queue.backlog()
-        };
+        }
         // Facade calls stay outside the queue lock.
         report_admissions(enqueued, duplicate, saturated);
-        metrics::fixup_backlog(backlog);
+        self.report_fixup_backlog(metrics::fixup_backlog);
     }
 
     /// Returns the cumulative Fixup queue statistics.
@@ -353,8 +352,8 @@ impl<B: Backend> RuntimeInner<B> {
     /// finish their bounded step and stop at the next cancellation point.
     pub(crate) fn stop_maintenance(&self) {
         self.maintenance_cancel.cancel();
-        let backlog = self.lock_fixups().drain_pending();
-        metrics::fixup_backlog(backlog);
+        self.lock_fixups().drain_pending();
+        self.report_fixup_backlog(metrics::fixup_backlog);
     }
 
     /// Returns the backend for maintenance work, or `None` once it is gone.
@@ -376,8 +375,8 @@ impl<B: Backend> RuntimeInner<B> {
             tokio::pin!(notified);
             notified.as_mut().enable();
             if self.maintenance_cancel.is_cancelled() {
-                let backlog = self.lock_fixups().drain_pending();
-                metrics::fixup_backlog(backlog);
+                self.lock_fixups().drain_pending();
+                self.report_fixup_backlog(metrics::fixup_backlog);
                 return None;
             }
             if let Some(offer) = self.lock_fixups().pop() {
@@ -386,11 +385,34 @@ impl<B: Backend> RuntimeInner<B> {
             tokio::select! {
                 biased;
                 () = self.maintenance_cancel.cancelled() => {
-                    let backlog = self.lock_fixups().drain_pending();
-                    metrics::fixup_backlog(backlog);
+                    self.lock_fixups().drain_pending();
+                    self.report_fixup_backlog(metrics::fixup_backlog);
                     return None;
                 }
                 () = notified => {}
+            }
+        }
+    }
+
+    /// Publishes the latest backlog without racing an older gauge update.
+    ///
+    /// A concurrent or reentrant reporter leaves publication to the active one.
+    /// Recheck after releasing the reporting guard: a queue change while the
+    /// callback ran must either be covered by another reporter or trigger a
+    /// fresh publication here. Recorder callbacks never hold the queue lock.
+    fn report_fixup_backlog(&self, mut publish: impl FnMut(usize)) {
+        loop {
+            let reporting = match self.fixup_reporting.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::WouldBlock) => return,
+                // A recorder panic cannot damage the queue or this unit guard.
+                Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            };
+            let backlog = self.lock_fixups().backlog();
+            publish(backlog);
+            drop(reporting);
+            if self.lock_fixups().backlog() == backlog {
+                return;
             }
         }
     }
@@ -459,7 +481,7 @@ impl<B: Backend> Drop for RunningFixup<'_, B> {
         } else {
             None
         };
-        let (can_yield, gate_open, backlog, enqueued, duplicate, saturated) = {
+        let (can_yield, gate_open, enqueued, duplicate, saturated) = {
             let mut queue = self.inner.lock_fixups();
             let can_yield = self.yield_back && !self.inner.maintenance_cancel.is_cancelled();
             if can_yield {
@@ -467,7 +489,6 @@ impl<B: Backend> Drop for RunningFixup<'_, B> {
                 (
                     can_yield,
                     backlog < self.inner.config().import_backlog_watermark(),
-                    backlog,
                     0,
                     0,
                     0,
@@ -497,7 +518,6 @@ impl<B: Backend> Drop for RunningFixup<'_, B> {
                 (
                     can_yield,
                     backlog < self.inner.config().import_backlog_watermark(),
-                    backlog,
                     enqueued,
                     duplicate,
                     saturated,
@@ -505,7 +525,7 @@ impl<B: Backend> Drop for RunningFixup<'_, B> {
             }
         };
         report_admissions(enqueued, duplicate, saturated);
-        metrics::fixup_backlog(backlog);
+        self.inner.report_fixup_backlog(metrics::fixup_backlog);
         if can_yield {
             self.inner.fixup_available.notify_one();
         } else {
@@ -953,6 +973,83 @@ mod tests {
             .and_then(|config| config.with_import_limits(1, 1))
             .expect("valid maintenance config");
         Runtime::new(FailingBackend, config).expect("multi-thread runtime")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backlog_publication_catches_a_concurrent_drain() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::mpsc;
+
+        let runtime = failing_runtime(0, 4);
+        let inner = Arc::clone(&runtime.handle.inner);
+        let manifest = manifest(1);
+        assert_eq!(
+            inner.lock_fixups().offer(key(&manifest, 0, 1), &manifest),
+            FixupAdmission::Enqueued
+        );
+        let observed = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let reporting_inner = Arc::clone(&inner);
+        let reporting_observed = Arc::clone(&observed);
+        let reporter = std::thread::spawn(move || {
+            let mut paused = false;
+            reporting_inner.report_fixup_backlog(|backlog| {
+                if !paused {
+                    paused = true;
+                    entered_tx.send(()).expect("test is waiting");
+                    release_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("release reporter");
+                }
+                reporting_observed.store(backlog, Ordering::SeqCst);
+            });
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("publisher started");
+        assert_eq!(inner.lock_fixups().drain_pending(), 0);
+        inner.report_fixup_backlog(|backlog| observed.store(backlog, Ordering::SeqCst));
+        release_tx.send(()).expect("reporter is waiting");
+        reporter.join().expect("reporter finished");
+        assert_eq!(
+            observed.load(Ordering::SeqCst),
+            0,
+            "quiescent queue must not retain an older nonzero gauge"
+        );
+        runtime.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backlog_publication_allows_reentrant_queue_changes() {
+        let runtime = failing_runtime(0, 4);
+        let inner = &runtime.handle.inner;
+        let manifest = manifest(1);
+        inner.lock_fixups().offer(key(&manifest, 0, 1), &manifest);
+        let observed = std::cell::Cell::new(usize::MAX);
+        inner.report_fixup_backlog(|backlog| {
+            if backlog != 0 {
+                inner.lock_fixups().drain_pending();
+                inner.report_fixup_backlog(|current| observed.set(current));
+            }
+            observed.set(backlog);
+        });
+        assert_eq!(observed.get(), 0);
+        runtime.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backlog_publication_recovers_after_recorder_panic() {
+        let runtime = failing_runtime(0, 4);
+        let inner = &runtime.handle.inner;
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            inner.report_fixup_backlog(|_| panic!("recorder failed"));
+        }));
+        assert!(failed.is_err());
+        let mut observed = None;
+        inner.report_fixup_backlog(|backlog| observed = Some(backlog));
+        assert_eq!(observed, Some(0));
+        runtime.shutdown().await.expect("shutdown");
     }
 
     /// Polls `condition` with a generous real-time bound.
