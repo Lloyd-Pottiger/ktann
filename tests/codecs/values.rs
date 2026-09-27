@@ -230,7 +230,7 @@ fn namespace_and_manifest_golden_bytes() {
     expected.extend_from_slice(&0_u16.to_be_bytes());
     expected.extend_from_slice(&0_u16.to_be_bytes());
     expected.extend_from_slice(&16_u32.to_be_bytes());
-    expected.extend_from_slice(&128_u32.to_be_bytes());
+    expected.extend_from_slice(&512_u32.to_be_bytes());
     expected.extend_from_slice(&[0; 32]);
     assert_eq!(
         codec

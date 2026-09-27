@@ -22,7 +22,7 @@ state.
 The large profile accepts `--write-beam-size N` for import diagnostics. The
 write beam is applied globally at each tree level, like the search beam; the
 final foreground mutation still assigns each record to exactly one leaf. The
-default is eight, so the option is explicit when measuring another import beam
+default is four, so the option is explicit when measuring another import beam
 and its quality effect.
 
 Setup stays excluded from every reported measurement, but the setup import is
