@@ -113,10 +113,6 @@ impl Decoder {
         Ok(Self { bytes, position: 1 })
     }
 
-    pub(super) fn remaining(&self) -> usize {
-        self.bytes.len() - self.position
-    }
-
     fn take_range(&mut self, length: usize) -> Result<(usize, usize)> {
         let end = self.position.checked_add(length).ok_or_else(corrupt)?;
         if end > self.bytes.len() {
@@ -177,13 +173,25 @@ impl Decoder {
         Ok(i64::from_be_bytes(self.array()?))
     }
 
-    pub(super) fn canonical_f32(&mut self) -> Result<f32> {
-        let bits = self.u32()?;
-        let value = f32::from_bits(bits);
-        if !value.is_finite() || (value == 0.0 && bits != 0) {
+    /// Decodes a contiguous vector before checking canonical component bits.
+    /// Keeping conversion separate lets the compiler batch the byte swaps while
+    /// preserving the same finite, positive-zero-only wire contract.
+    pub(super) fn canonical_f32s(&mut self, count: usize) -> Result<Box<[f32]>> {
+        let byte_count = count.checked_mul(4).ok_or_else(corrupt)?;
+        let values: Vec<f32> = self
+            .take(byte_count)?
+            .chunks_exact(4)
+            .map(|bytes| f32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            .collect();
+        // A full reduction keeps validation vectorizable instead of branching
+        // out at each component. The Manifest bounds this work even on corruption.
+        let invalid = values.iter().fold(false, |invalid, value| {
+            invalid | !value.is_finite() | (value.to_bits() == 0x8000_0000)
+        });
+        if invalid {
             return Err(corrupt());
         }
-        Ok(value)
+        Ok(values.into_boxed_slice())
     }
 
     pub(super) fn canonical_f64(&mut self) -> Result<f64> {

@@ -34,15 +34,7 @@ pub(super) fn decode_vector(decoder: &mut Decoder, dimension: usize) -> Result<B
     if usize::try_from(decoder.u32()?).map_err(|_| corrupt())? != dimension {
         return Err(corrupt());
     }
-    let byte_count = dimension.checked_mul(4).ok_or_else(corrupt)?;
-    if decoder.remaining() < byte_count {
-        return Err(corrupt());
-    }
-    let mut vector = Vec::with_capacity(dimension);
-    for _ in 0..dimension {
-        vector.push(decoder.canonical_f32()?);
-    }
-    Ok(vector.into_boxed_slice())
+    decoder.canonical_f32s(dimension)
 }
 
 pub(super) fn encode_fields(
