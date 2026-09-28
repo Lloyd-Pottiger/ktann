@@ -275,7 +275,7 @@ fn search_rejects_invalid_k_dimension_and_budgets() -> ktann::api::Result<()> {
 #[test]
 fn runtime_and_verify_limits_fail_closed() {
     assert_eq!(RuntimeConfig::default().import_backlog_watermark(), 2);
-    assert_eq!(RuntimeConfig::default().write_beam_size(), 8);
+    assert_eq!(RuntimeConfig::default().write_beam_size(), 4);
     assert_invalid(RuntimeConfig::default().with_stalled_timeout(std::time::Duration::ZERO));
     let recovery_index = IndexConfig::new(1, Metric::L2)
         .expect("index")
