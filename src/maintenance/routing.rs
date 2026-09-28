@@ -67,16 +67,17 @@
 //!   vectors are InvalidArgument.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 
 use crate::api::{Error, ErrorKind, PartitionKey, Result};
 use crate::search::beam_width;
+use crate::search::cache::{BodyEntries, CacheKey, CachedBody, PartitionCache, PartitionKind};
 use crate::search::numeric::{VectorKernel, compare_finite};
 use crate::storage::backend::{ReadOps, ScanLimits, WriteTxn};
 use crate::storage::keys::{LogicalKey, MAX_TREE_KEY_BYTES, TreeKey};
 use crate::storage::values::{
     ChildEntry, IndexManifest, PartitionCentroid, PartitionHeader, PartitionState,
-    PartitionTransition, PersistentValue, TreeManifest, expect_centroid, expect_child_entry_ref,
-    expect_header,
+    PartitionTransition, PersistentValue, TreeManifest, expect_centroid, expect_header,
 };
 use crate::storage::{
     LogicalRange, LogicalReader, LogicalScanCursor, ReadLogicalTxn, WriteLogicalTxn, topology,
@@ -237,6 +238,7 @@ pub async fn route_leaf_for_write_with_beam<T: WriteTxn>(
         root,
         &[&routing],
         write_beam_size,
+        None,
     )
     .await?;
     match descent {
@@ -275,6 +277,9 @@ pub(crate) enum GroupedDescent {
 ///
 /// Every routing vector must be the exact output of
 /// [`VectorKernel::preprocess`] under `kernel` for the bound Logical Index.
+/// This is the foreground pre-mutation phase: internal bodies must still be
+/// committed snapshot data. Only lazy creation of a new leaf root may have
+/// staged writes. Never use this entry point after staging internal changes.
 pub(crate) async fn route_leaves_for_write_preprocessed<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     tree_key: &TreeKey,
@@ -282,6 +287,7 @@ pub(crate) async fn route_leaves_for_write_preprocessed<T: WriteTxn>(
     routings: &[&[f32]],
     started_at_unix_millis: u64,
     write_beam_size: u32,
+    cache: &PartitionCache,
 ) -> Result<GroupedDescent> {
     let manifest = txn.require_manifest()?;
     if write_beam_size == 0 {
@@ -305,6 +311,7 @@ pub(crate) async fn route_leaves_for_write_preprocessed<T: WriteTxn>(
         root,
         routings,
         write_beam_size,
+        Some(cache),
     )
     .await?;
     if let GroupedDescent::Routed(routes) = &descent {
@@ -448,9 +455,14 @@ async fn descend<R: LogicalReader>(
             }
             Hop::Children { bodies, next_level } => {
                 let mut nearest = NearestChild::default();
-                scan_bodies(reader, manifest, tree_key, &bodies, &mut |index, entry| {
-                    nearest.consider(kernel, routing, entry, bodies[index].0)
-                })
+                scan_bodies(
+                    reader,
+                    manifest,
+                    tree_key,
+                    &bodies,
+                    None,
+                    &mut |index, entry| nearest.consider(kernel, routing, entry, bodies[index].0),
+                )
                 .await?;
                 let (child, owner) = nearest.finish()?;
                 parent = Some(owner);
@@ -516,6 +528,10 @@ struct PendingBeamMember {
 /// its own top-N candidates. A vector still receives exactly one final Route;
 /// the beam changes which leaves are eligible for that choice, not the
 /// foreground membership invariant.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "snapshot routing inputs and an optional shared cache"
+)]
 async fn descend_grouped_with_beam<R: LogicalReader>(
     reader: &mut R,
     manifest: &IndexManifest,
@@ -524,6 +540,7 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
     root: PartitionKey,
     routings: &[&[f32]],
     write_beam_size: u32,
+    cache: Option<&PartitionCache>,
 ) -> Result<GroupedDescent> {
     let mut routes: Vec<Option<(f64, Route)>> = vec![None; routings.len()];
     let mut pending: BTreeMap<(PartitionKey, Option<u32>), Vec<PendingBeamMember>> =
@@ -798,32 +815,39 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
             let nearest = nearest
                 .as_mut()
                 .ok_or_else(|| Error::new(ErrorKind::Backend))?;
-            scan_bodies(reader, manifest, tree_key, &bodies, &mut |index, entry| {
-                let (body, _) = bodies[index];
-                if incoming_owners
-                    .insert(entry.child(), body)
-                    .is_some_and(|owner| owner != body)
-                {
-                    return Err(Error::new(ErrorKind::Corruption));
-                }
-                // Independent records share the centroid while each distance
-                // retains its format-defined scalar accumulation order.
-                let mut groups = scan_members[body_slots[index]].chunks_exact(4);
-                for group in &mut groups {
-                    let vectors =
-                        std::array::from_fn::<_, 4, _>(|lane| routings[group[lane].member]);
-                    let distances = kernel.routing_distances(vectors, entry.centroid())?;
-                    for (member, distance) in group.iter().zip(distances) {
+            scan_bodies(
+                reader,
+                manifest,
+                tree_key,
+                &bodies,
+                cache,
+                &mut |index, entry| {
+                    let (body, _) = bodies[index];
+                    if incoming_owners
+                        .insert(entry.child(), body)
+                        .is_some_and(|owner| owner != body)
+                    {
+                        return Err(Error::new(ErrorKind::Corruption));
+                    }
+                    // Independent records share the centroid while each distance
+                    // retains its format-defined scalar accumulation order.
+                    let mut groups = scan_members[body_slots[index]].chunks_exact(4);
+                    for group in &mut groups {
+                        let vectors =
+                            std::array::from_fn::<_, 4, _>(|lane| routings[group[lane].member]);
+                        let distances = kernel.routing_distances(vectors, entry.centroid())?;
+                        for (member, distance) in group.iter().zip(distances) {
+                            nearest[member.member].consider(distance, entry, body);
+                        }
+                    }
+                    for member in groups.remainder() {
+                        let distance =
+                            kernel.routing_distance(routings[member.member], entry.centroid())?;
                         nearest[member.member].consider(distance, entry, body);
                     }
-                }
-                for member in groups.remainder() {
-                    let distance =
-                        kernel.routing_distance(routings[member.member], entry.centroid())?;
-                    nearest[member.member].consider(distance, entry, body);
-                }
-                Ok(())
-            })
+                    Ok(())
+                },
+            )
             .await?;
         }
 
@@ -1237,6 +1261,7 @@ async fn scan_bodies<R: LogicalReader>(
     manifest: &IndexManifest,
     tree_key: &TreeKey,
     bodies: &[(PartitionKey, PartitionHeader)],
+    cache: Option<&PartitionCache>,
     visit: &mut impl FnMut(usize, &ChildEntry) -> Result<()>,
 ) -> Result<()> {
     /// One body's in-progress scan: its exact range, continuation, and the
@@ -1246,17 +1271,52 @@ async fn scan_bodies<R: LogicalReader>(
         cursor: Option<LogicalScanCursor>,
         seen: usize,
         done: bool,
+        entries: Option<Vec<ChildEntry>>,
     }
 
     let limits = child_scan_limits(manifest.config().dimension())?;
+    let cache = cache.filter(|cache| cache.capacity_bytes() > 0);
+    // Bound all in-flight fill buffers together, including a wave of misses.
+    let mut fill_bytes = cache.map_or(0, PartitionCache::capacity_bytes);
     let mut scans = bodies
         .iter()
-        .map(|(partition, _)| {
+        .enumerate()
+        .map(|(index, (partition, header))| {
+            let cached = cache.and_then(|cache| {
+                let key = CacheKey::new(
+                    manifest.logical_index_id(),
+                    tree_key.clone(),
+                    *partition,
+                    PartitionKind::Internal,
+                );
+                cache.lookup(&key, header.cache_epoch())
+            });
+            if let Some(body) = &cached {
+                let BodyEntries::Internal(entries) = body.entries() else {
+                    return Err(Error::new(ErrorKind::Corruption));
+                };
+                for entry in entries {
+                    visit(index, entry)?;
+                }
+            }
+            let body_bytes =
+                CachedBody::internal_bytes(header.entry_count(), manifest.config().dimension());
+            let entries = if cached.is_none() && body_bytes <= fill_bytes {
+                fill_bytes -= body_bytes;
+                Some(Vec::with_capacity(header.entry_count() as usize))
+            } else {
+                None
+            };
             Ok(BodyScan {
                 range: LogicalRange::child_entries(manifest, tree_key, *partition)?,
                 cursor: None,
-                seen: 0,
-                done: false,
+                seen: if cached.is_some() {
+                    header.entry_count() as usize
+                } else {
+                    0
+                },
+                done: cached.is_some(),
+                entries,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1279,17 +1339,42 @@ async fn scan_bodies<R: LogicalReader>(
                 // The typed batch scan returns exactly one page per leg.
                 return Err(Error::new(ErrorKind::Backend));
             };
-            for item in page.items() {
-                visit(index, expect_child_entry_ref(item.value())?)?;
+            scan.cursor = page.next_cursor().cloned();
+            for item in page.into_items() {
+                let PersistentValue::ChildEntry(entry) = item.into_value() else {
+                    return Err(Error::new(ErrorKind::Corruption));
+                };
+                if scan.seen >= bodies[index].1.entry_count() as usize {
+                    return Err(Error::new(ErrorKind::Corruption));
+                }
+                visit(index, &entry)?;
+                if let Some(entries) = &mut scan.entries {
+                    entries.push(entry);
+                }
                 scan.seen += 1;
             }
-            scan.cursor = page.into_next_cursor();
             scan.done = scan.cursor.is_none();
         }
     }
     for (scan, (_, header)) in scans.iter().zip(bodies) {
         if scan.seen != header.entry_count() as usize {
             return Err(Error::new(ErrorKind::Corruption));
+        }
+    }
+    if let Some(cache) = cache {
+        for (scan, (partition, header)) in scans.into_iter().zip(bodies) {
+            if let Some(entries) = scan.entries {
+                let key = CacheKey::new(
+                    manifest.logical_index_id(),
+                    tree_key.clone(),
+                    *partition,
+                    PartitionKind::Internal,
+                );
+                cache.install(
+                    key,
+                    Arc::new(CachedBody::internal(header.cache_epoch(), entries)),
+                );
+            }
         }
     }
     Ok(())

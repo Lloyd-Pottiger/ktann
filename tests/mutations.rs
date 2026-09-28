@@ -1422,3 +1422,92 @@ async fn batch_upsert_corruption_keeps_input_position_and_rolls_back() {
         runtime.shutdown().await.expect("shutdown");
     }
 }
+
+/// Cached routing must preserve membership through aborts and topology changes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_routing_cache_reuses_only_matching_committed_bodies() {
+    for capacity in [0, 1, 1 << 20] {
+        let backend = backend(DeterministicConfig::default());
+        let runtime = Runtime::new(
+            backend.clone(),
+            support::manual_maintenance_config()
+                .with_partition_cache_bytes(capacity)
+                .expect("cache capacity"),
+        )
+        .expect("runtime");
+        let index = runtime
+            .create_index("cached-routing", config_1d())
+            .await
+            .expect("index");
+        let manifest = read_manifest(&backend, index.logical_index_id()).await;
+        seed_grown_tree(&backend, &manifest, 1).await;
+        backend
+            .inner()
+            .push_fault(CommitFault::Abort)
+            .expect("fault");
+        backend.inner().reset_operation_counts();
+        index
+            .insert(record_1d(b"a", 0.5, 1))
+            .await
+            .expect("retry insert");
+        assert_eq!(
+            backend.inner().operation_counts().batch_scan,
+            if capacity <= 1 { 2 } else { 1 }
+        );
+
+        backend.inner().reset_operation_counts();
+        index
+            .insert(record_1d(b"b", 10.5, 1))
+            .await
+            .expect("warm insert");
+        assert_eq!(
+            backend.inner().operation_counts().batch_scan,
+            usize::from(capacity <= 1)
+        );
+        assert_eq!(
+            leaf_member_ids(&backend, &manifest, 1, 2).await,
+            BTreeSet::from([Bytes::from_static(b"a")])
+        );
+        assert_eq!(
+            leaf_member_ids(&backend, &manifest, 1, 3).await,
+            BTreeSet::from([Bytes::from_static(b"b")])
+        );
+
+        // A committed new child changes the parent's body and its epoch.
+        let key = tree_key(1);
+        let id = manifest.logical_index_id();
+        let pk = |value| PartitionKey::new(value).expect("partition");
+        seed_topology(
+            &backend,
+            &manifest,
+            [
+                (
+                    LogicalKey::Header {
+                        index: id,
+                        tree_key: key.clone(),
+                        partition: pk(1),
+                    },
+                    PersistentValue::PartitionHeader(
+                        PartitionHeader::new(2, 3, 1, PartitionState::Ready).expect("header"),
+                    ),
+                ),
+                header_entry(id, &key, pk(4), 1, 0),
+                state_entry(id, &key, pk(4)),
+                synopsis_entry(&manifest, &key, pk(4)),
+                edge_entry(id, &key, pk(1), pk(4), 20.0),
+            ],
+        )
+        .await;
+        backend.inner().reset_operation_counts();
+        index
+            .insert(record_1d(b"c", 20.0, 1))
+            .await
+            .expect("new child insert");
+        assert_eq!(backend.inner().operation_counts().batch_scan, 1);
+        assert_eq!(
+            leaf_member_ids(&backend, &manifest, 1, 4).await,
+            BTreeSet::from([Bytes::from_static(b"c")])
+        );
+        runtime.shutdown().await.expect("shutdown");
+    }
+}

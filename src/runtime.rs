@@ -268,12 +268,18 @@ pub(crate) struct OperationContext<B: Backend> {
     backend: Arc<B>,
     options: OperationOptions,
     write_beam_size: u32,
+    partition_cache: Arc<PartitionCache>,
     commit_start: Option<CommitStart>,
 }
 
 impl<B: Backend> OperationContext<B> {
     pub(crate) fn backend(&self) -> Arc<B> {
         Arc::clone(&self.backend)
+    }
+
+    /// Shares the bounded cache for committed internal routing bodies.
+    pub(crate) fn partition_cache(&self) -> Arc<PartitionCache> {
+        Arc::clone(&self.partition_cache)
     }
 
     /// Returns the configured per-level beam for foreground write routing.
@@ -421,6 +427,7 @@ impl<B: Backend> RuntimeInner<B> {
             backend,
             options,
             write_beam_size: self.config.write_beam_size(),
+            partition_cache: self.partition_cache(),
             commit_start: Some(commit_start),
         };
         // `observed` tracks whether the spawned task reported the operation's

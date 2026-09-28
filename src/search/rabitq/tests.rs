@@ -807,12 +807,18 @@ fn expanded_reference_rough(encoded: &[u8], components: &[f32], metric: Metric) 
     let code_norm_squared = f64::from(read_u32_le(encoded, 4));
     let mut norm_squared = 0.0_f64;
     let mut dot = 0.0_f64;
-    for (&component, &signed_code) in components.iter().zip(&signed_codes) {
+    let mut odd_dot = 0.0_f64;
+    for (index, (&component, &signed_code)) in components.iter().zip(&signed_codes).enumerate() {
         let component = f64::from(component);
         norm_squared += component * component;
-        let reconstruction = scale * f64::from(signed_code);
-        dot += component * reconstruction;
+        let product = component * f64::from(signed_code);
+        if index % 2 == 0 {
+            dot += product;
+        } else {
+            odd_dot += product;
+        }
     }
+    let dot = (dot + odd_dot) * scale;
     match metric {
         Metric::InnerProduct => -dot,
         Metric::Cosine => 1.0 - dot,

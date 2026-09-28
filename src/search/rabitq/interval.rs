@@ -69,17 +69,27 @@ pub(super) fn approximate_distance(
 
     let scale = f64::from(code.header.scale);
     let mut dot = 0.0_f64;
-    for (&query_component, signed_code) in query.components.iter().zip(code.signed_codes()) {
+    let mut odd_dot = 0.0_f64;
+    for (index, (&query_component, signed_code)) in
+        query.components.iter().zip(code.signed_codes()).enumerate()
+    {
         let query_component = f64::from(query_component);
-        let reconstruction = scale * f64::from(signed_code);
-        let product = query_component * reconstruction;
-        dot += product;
+        let product = query_component * f64::from(signed_code);
+        if index % 2 == 0 {
+            dot += product;
+        } else {
+            odd_dot += product;
+        }
     }
 
-    finish_distance(&code.header, query, dot)
+    finish_distance(&code.header, query, (dot + odd_dot) * scale)
 }
 
-/// Interleaves decoded lanes without reordering any lane's scalar-f64 sum.
+/// Scores decoded lanes using two independent scalar-f64 partial sums.
+///
+/// Query/code products are exact in f64. The two sums and final scale need
+/// at most `dimension` rounding steps per term, preserving the dot-error
+/// bound in `finish_distance` while shortening the addition dependency chain.
 pub(super) fn approximate_distances<const N: usize>(
     codes: [&DecodedRaBitQ7; N],
     query: &RaBitQQuery<'_>,
@@ -92,12 +102,21 @@ pub(super) fn approximate_distances<const N: usize>(
     }
     let scales = codes.map(|code| f64::from(code.header.scale));
     let mut dots = [0.0_f64; N];
-    for (index, &component) in query.components.iter().enumerate() {
-        let component = f64::from(component);
+    let mut odd_dots = [0.0_f64; N];
+    for (pair_index, pair) in query.components.chunks_exact(2).enumerate() {
+        let index = pair_index * 2;
+        let even = f64::from(pair[0]);
+        let odd = f64::from(pair[1]);
         for lane in 0..N {
-            let reconstruction = scales[lane] * f64::from(codes[lane].codes[index]);
-            let product = component * reconstruction;
-            dots[lane] += product;
+            dots[lane] += even * f64::from(codes[lane].codes[index]);
+            odd_dots[lane] += odd * f64::from(codes[lane].codes[index + 1]);
+        }
+    }
+    if query.components.len() % 2 != 0 {
+        let index = query.components.len() - 1;
+        let component = f64::from(query.components[index]);
+        for lane in 0..N {
+            dots[lane] += component * f64::from(codes[lane].codes[index]);
         }
     }
     let mut distances = [ApproximateDistance {
@@ -106,7 +125,11 @@ pub(super) fn approximate_distances<const N: usize>(
         upper: 0.0,
     }; N];
     for (lane, distance) in distances.iter_mut().enumerate() {
-        *distance = finish_distance(&codes[lane].header, query, dots[lane])?;
+        *distance = finish_distance(
+            &codes[lane].header,
+            query,
+            (dots[lane] + odd_dots[lane]) * scales[lane],
+        )?;
     }
     Ok(distances)
 }
@@ -119,8 +142,11 @@ fn finish_distance(
 ) -> Result<ApproximateDistance> {
     let scale = f64::from(header.scale);
     let error_upper = f64::from(header.reconstruction_error_upper);
-    // Reconstruction is exact in f64 (f32 scale times a six-bit integer).
-    // For n products accumulated in order, roundoff is bounded by
+    // Each query-component times signed code is exact in f64 (at most 30 bits).
+    // Two partial sums, their reduction, and one final scale multiplication
+    // have at most ceil(n/2)+1 rounded operations per term for n >= 2,
+    // which is at most n. For n=1 only the final scale multiplication rounds.
+    // Thus roundoff is bounded by
     // gamma_n * sum(abs(q_i * x_hat_i)), with u = 2^-53. Since n <= 16384,
     // gamma_n = n*u/(1-n*u) <= 2*n*u = n*EPSILON. Cauchy-Schwarz bounds
     // the absolute sum by ||q|| * ||x_hat||. All bound operations round up;
