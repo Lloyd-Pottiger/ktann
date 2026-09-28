@@ -101,6 +101,7 @@ pub(crate) async fn mutate<B: Backend>(
     let kernel = routing::kernel_for(handle_manifest)?;
     let prepared = prepare_all(handle_manifest, &kernel, mutations)?;
     let write_beam_size = context.write_beam_size();
+    let cache = context.partition_cache();
     let backend = context.backend();
     let mut failed_attempts = 0_u32;
     loop {
@@ -118,6 +119,7 @@ pub(crate) async fn mutate<B: Backend>(
                     mutations,
                     &prepared,
                     write_beam_size,
+                    &cache,
                 ))
             },
         )
@@ -167,12 +169,13 @@ async fn apply_all<T: WriteTxn>(
     mutations: &[Mutation],
     prepared: &[Option<PreparedRecord>],
     write_beam_size: u32,
+    cache: &crate::search::cache::PartitionCache,
 ) -> Result<ApplyOutcome> {
     debug_assert_eq!(mutations.len(), prepared.len());
     let started_at = now_unix_millis();
     let routing_timer = metrics::mutation_stage_started(MutationStage::Routing);
     let (targets, draining_sources) =
-        match route_all(txn, kernel, prepared, started_at, write_beam_size).await? {
+        match route_all(txn, kernel, prepared, started_at, write_beam_size, cache).await? {
             RouteAll::Routed {
                 targets,
                 draining_sources,
@@ -263,6 +266,7 @@ async fn route_all<T: WriteTxn>(
     prepared: &[Option<PreparedRecord>],
     started_at: u64,
     write_beam_size: u32,
+    cache: &crate::search::cache::PartitionCache,
 ) -> Result<RouteAll> {
     let mut targets: Vec<Option<RecordLocation>> = vec![None; prepared.len()];
     let mut draining_sources = Vec::new();
@@ -295,6 +299,7 @@ async fn route_all<T: WriteTxn>(
             &routings,
             started_at,
             write_beam_size,
+            cache,
         )
         .await
         .map_err(|error| error.at_position(group.first_position))?

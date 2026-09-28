@@ -32,6 +32,14 @@ Ready partitions and ReceivingSplit targets are not offered because their
 current state cannot advance independently. Failure to enqueue never changes
 the mutation result or correctness.
 
+Grouped foreground routing may reuse committed internal bodies from the shared
+Partition Cache (ADR 0023). It reads Header and State in the current transaction,
+checks the body epoch, and still update-protects the selected leaf and incoming
+edge. Cache fills happen only in preparation before internal changes are staged;
+lazy creation writes only a leaf root. Aborting the mutation cannot publish
+uncommitted body data. One wave's fill buffers share the existing cache byte
+capacity; disabled and oversized bodies retain bounded streaming scans.
+
 ## 2. Tree shape
 
 Each Tree Key lazily installs one initial leaf root with its Tree Manifest.

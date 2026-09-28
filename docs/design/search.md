@@ -69,22 +69,28 @@ Corruption.
 
 ## 3. Conservative approximate intervals
 
-Production v1 uses the scalar f64 reference kernel for rotated query/code dot
-products. This avoids an unaccounted f32/SIMD rounding term and makes the stored
-reconstruction error sufficient for conservative intervals.
+Production uses a deterministic f64 kernel for rotated query/code dot
+products. Each lane accumulates even and odd components independently,
+combines the two sums, and applies the stored scale once. This shortens the
+addition dependency chain without allocation or a new f32/SIMD rounding term.
 
-The scalar dot product keeps component order and bounds its accumulated
-roundoff once after scoring. Reconstruction `stored_scale * c_i` is exact in
-f64: an f32 significand times a six-bit integer needs at most 30 significant
-bits. With unit roundoff `u = 2^-53` and dimension `n <= 16384`, the product
-and sum error is bounded by `gamma_n * sum(abs(q_i * x_hat_i))`, where
+Each `q_i * c_i` product is exact in f64: an f32 significand times a six-bit
+integer needs at most 30 significant bits. For dimension `n >= 2`, each term
+encounters at most `ceil(n/2)-1` partial-sum additions, one reduction, and one
+scale multiplication: at most `ceil(n/2)+1 <= n` rounding steps. For `n=1`,
+only the final scale multiplication can round. The same bound therefore
+covers odd dimensions, cancellation, and zero scale.
+
+With unit roundoff `u = 2^-53` and `n <= 16384`, accumulated error is bounded
+by `gamma_n * sum(abs(q_i * x_hat_i))`, where
 `gamma_n = n*u/(1-n*u) <= 2*n*u`. Cauchy–Schwarz bounds the absolute sum by
 `norm(q) * norm(x_hat)`. Thus the computed dot's conservative endpoints are
 `dot ± n*2^-52*norm(q)*norm(x_hat)`, rounded outward. Both norms and the
 error products use upward-rounded bounds; `norm(x_hat)` uses the exact stored
-integer squared code norm and nonnegative stored scale. The finite f32 inputs,
-six-bit codes and dimension limit exclude overflow and underflow in these dot
-products and sums. This numerical roundoff bound is applied before the
+integer squared code norm and nonnegative stored scale. Finite f32 inputs and
+the dimension limit exclude f64 overflow. Nonzero partial sums are multiples
+of `2^-149`; the final scaled result cannot be smaller than `2^-298`, excluding
+f64 underflow. This numerical roundoff bound is applied before the
 reconstruction-error radius below.
 
 For query `q`, reconstruction `x_hat`, and error upper bound `E`:
@@ -226,6 +232,9 @@ search reports exact-rerank usage, exhaustion, and stage latency.
 ## 8. Partition cache
 
 The Runtime shares byte-bounded caches of decoded internal and leaf search data.
+Foreground preparation also reuses committed internal bodies before staging
+internal changes, under the same snapshot/epoch rules (ADR 0023); general write
+routing and leaf mutation do not fill this cache.
 A key contains Logical Index ID, canonical Tree Key, Partition Key, and kind.
 Every entry contains Header cache epoch. Search reads the Header from its own
 snapshot and may reuse cached data only when epoch and kind match; otherwise it

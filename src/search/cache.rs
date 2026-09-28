@@ -25,7 +25,9 @@
 //! capacity is served but never installed, keeping memory bounded. The eviction
 //! policy is an internal benchmark-tunable detail, not a persistent or public
 //! compatibility contract; cache warmth never changes logical search-budget
-//! accounting.
+//! accounting. Foreground preparation also reuses committed internal bodies
+//! before staging internal changes (ADR 0023); arbitrary write transactions
+//! must never publish their read-your-writes bodies here.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -159,6 +161,27 @@ pub(crate) struct CachedBody {
 }
 
 impl CachedBody {
+    /// Accounts the envelope and fixed-dimension decoded Child Entries.
+    pub(crate) fn internal_bytes(count: u32, dimension: usize) -> u64 {
+        let entry_bytes = (size_of::<ChildEntry>() as u64)
+            .saturating_add((dimension as u64).saturating_mul(size_of::<f32>() as u64));
+        (size_of::<Self>() as u64).saturating_add(u64::from(count).saturating_mul(entry_bytes))
+    }
+
+    /// Wraps a complete, count-validated committed internal body.
+    pub(crate) fn internal(epoch: u64, entries: Vec<ChildEntry>) -> Self {
+        let bytes = entries
+            .iter()
+            .fold(size_of::<Self>() as u64, |bytes, entry| {
+                bytes.saturating_add(child_entry_bytes(entry))
+            });
+        Self {
+            epoch,
+            bytes,
+            entries: BodyEntries::Internal(entries.into_boxed_slice()),
+        }
+    }
+
     /// Returns the Header cache epoch this body was decoded from.
     #[cfg(test)]
     pub(crate) const fn epoch(&self) -> u64 {
@@ -247,8 +270,7 @@ impl PartitionCache {
     }
 
     /// Returns the configured byte capacity.
-    #[cfg(test)]
-    fn capacity_bytes(&self) -> u64 {
+    pub(crate) fn capacity_bytes(&self) -> u64 {
         self.capacity_bytes
     }
 
