@@ -28,7 +28,11 @@ async fn foundationdb_bulk_publication_mutation_and_interrupted_cleanup() {
     support::clear_test_keys(&cleanup).await;
     let runtime = Runtime::new(
         backend(),
-        RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
+        RuntimeConfig::default()
+            .with_maintenance(0, 1)
+            .unwrap()
+            .with_import_limits(1, 1)
+            .unwrap(),
     )
     .unwrap();
     let config = IndexConfig::new(128, Metric::Cosine)
@@ -119,7 +123,11 @@ async fn foundationdb_bulk_publication_mutation_and_interrupted_cleanup() {
     txn.commit().await.unwrap();
     let restarted = Runtime::new(
         backend(),
-        RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
+        RuntimeConfig::default()
+            .with_maintenance(0, 1)
+            .unwrap()
+            .with_import_limits(1, 1)
+            .unwrap(),
     )
     .unwrap();
     assert_eq!(
