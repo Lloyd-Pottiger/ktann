@@ -1162,20 +1162,17 @@ mod tests {
         let manifest = manifest(1);
         let first = (tree_key(1), PartitionKey::new(1).expect("nonzero"));
         let second = (tree_key(1), PartitionKey::new(2).expect("nonzero"));
+        // One batch holds the queue lock across both admissions, so a worker
+        // cannot retire the first offer before the second encounters capacity.
         runtime
             .handle
             .inner
-            .offer_fixups(&manifest, [first.clone()]);
-        // With capacity one, the second distinct key is dropped while the
-        // first holds a pending or running slot.
-        runtime
-            .handle
-            .inner
-            .offer_fixups(&manifest, [second.clone()]);
+            .offer_fixups(&manifest, [first, second.clone()]);
         eventually(|| runtime.handle.inner.lock_fixups().admitted.is_empty()).await;
         let stats = runtime.handle.inner.fixup_stats();
-        let dropped = stats.saturated + stats.duplicate;
-        assert!(dropped >= 1, "the second offer coalesced or dropped");
+        assert_eq!(stats.enqueued, 1);
+        assert_eq!(stats.saturated, 1);
+        assert_eq!(stats.duplicate, 0);
         // After the first retired, the second key admits and retires too.
         runtime.handle.inner.offer_fixups(&manifest, [second]);
         eventually(|| {
