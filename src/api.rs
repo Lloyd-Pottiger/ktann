@@ -5,6 +5,7 @@
 //! validation methods so callers can reject an operation before opening a
 //! storage transaction.
 
+mod bulk;
 mod config;
 mod error;
 mod identifiers;
@@ -16,6 +17,7 @@ mod schema;
 mod search;
 mod verify;
 
+pub use bulk::BulkBuildOptions;
 pub(crate) use config::MAX_DIMENSION;
 pub use config::{IndexConfig, RuntimeConfig};
 pub use error::{Error, ErrorKind, Result};

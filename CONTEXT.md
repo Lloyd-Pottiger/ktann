@@ -135,6 +135,12 @@ _Avoid_: Search-time validation, automatic repair
 A process-local scheduler that submits ordinary batch Foreground Mutations in bounded waves while applying Structure Maintenance backpressure.
 _Avoid_: Bulk-build generation, atomic whole-import transaction
 
+**Bulk Construction**:
+A distinct operation that creates a complete capacity-constrained tree model and stages exact membership in a non-serving Building Logical Index before atomic publication. It does not grant exclusive ownership of an ordinary Import Session.
+
+**Building Index**:
+A named but non-serving Logical Index owned by one persisted random construction nonce. Ordinary create/open fail with IndexBuilding; explicit drop fences and removes incomplete construction.
+
 **Import Admission**:
 The process-local decision that accepts one validated Import Session batch when learned write capacity and the Fixup Backlog permit it.
 _Avoid_: Import commit, topology barrier
@@ -186,8 +192,9 @@ _Avoid_: Transaction ID, durable job ID
   topology asynchronously. Import Sessions schedule ordinary Foreground Mutations.
 - The Split Threshold triggers maintenance; it is not a synchronous hard bound
   on partition size. A mutation can retry after a topology conflict.
-- Every committed intermediate topology remains searchable. After a worker
-  stops, maintenance resumes when a relevant access discovers pending work.
+- Every committed intermediate topology of an Active Logical Index remains searchable.
+  Building topology is not public and may be incomplete until verified publication.
+  After a worker stops, maintenance resumes when a relevant access discovers pending work.
 - Import Admission uses observed contention and the Fixup Backlog. Partition
   count alone does not establish independent write capacity.
 - A Vector Record is owned and encoded by KTANN, not a host application's

@@ -1350,6 +1350,9 @@ mod tests {
                     exact_rerank_candidates: budget_configuration(65_536, 100),
                 },
                 write_beam_size: 8,
+                bulk_refinement_rounds: None,
+                bulk_neighbor_centroids: None,
+                bulk_input_limit_bytes: None,
                 leaf_beam_size_override: None,
                 leaf_beam_sweep: Vec::new(),
                 blocking_resource_limit: Some(2),
@@ -1472,6 +1475,8 @@ mod tests {
             panic!("steady fixture")
         };
         let construction = crate::report::ConstructionMeasurements {
+            refinement_rounds: 0,
+            refinement_moves: 0,
             wall_seconds: 10.0,
             ..Default::default()
         };

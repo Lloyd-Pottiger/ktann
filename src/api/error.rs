@@ -18,6 +18,8 @@ pub enum ErrorKind {
     IndexNotFound,
     /// The requested Logical Index is being dropped.
     IndexDropping,
+    /// An unpublished bulk construction owns the Index Name.
+    IndexBuilding,
     /// Insert found an existing Vector Record with the same Record ID.
     RecordAlreadyExists,
     /// The persistent format is known but unsupported by this build.
@@ -57,6 +59,7 @@ impl ErrorKind {
             Self::IndexAlreadyExists => "index already exists",
             Self::IndexNotFound => "index not found",
             Self::IndexDropping => "index is being dropped",
+            Self::IndexBuilding => "index is being built",
             Self::RecordAlreadyExists => "record already exists",
             Self::UnsupportedFormat => "unsupported format",
             Self::Unsupported => "backend does not support operation",

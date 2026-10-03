@@ -23,6 +23,7 @@ use crate::storage::backend::{Backend, CommitCancellation, CommitStart};
 
 use self::fixup::FixupQueue;
 
+pub(crate) mod bulk;
 pub(crate) mod fixup;
 pub(crate) mod import;
 pub(crate) mod lifecycle;
@@ -101,7 +102,8 @@ impl<B: Backend> Runtime<B> {
     /// configuration: retrying after an unknown commit outcome recovers the
     /// current index from a fresh snapshot. A different configuration returns
     /// [`ErrorKind::IndexAlreadyExists`], and a Dropping same-name index
-    /// returns [`ErrorKind::IndexDropping`].
+    /// returns [`ErrorKind::IndexDropping`]. Unpublished same-name construction
+    /// returns [`ErrorKind::IndexBuilding`].
     pub async fn create_index(&self, name: &str, config: IndexConfig) -> Result<Index<B>> {
         self.create_index_with_control(name, config, OperationOptions::default())
             .await
@@ -125,6 +127,45 @@ impl<B: Backend> Runtime<B> {
                 options,
                 move |mut context| async move {
                     lifecycle::create_index(&mut context, name, config, retry).await
+                },
+            )
+            .await?;
+        Index::new(Arc::clone(&self.handle.inner), handle_name, manifest)
+    }
+
+    /// Builds and atomically publishes a new index from a complete record set.
+    ///
+    /// Construction reserves the name in durable `Building` state. Ordinary
+    /// create/open return `IndexBuilding` until publication. A failed,
+    /// interrupted or cancelled construction remains unpublished; call
+    /// `drop_index` to remove it before rebuilding. No existing index is
+    /// replaced. Cancellation guards publication, while invisible staging
+    /// transactions may already have committed. Published centroids remain
+    /// immutable and the resulting handle supports ordinary mutations.
+    ///
+    /// The explicit input limit does not bound total resident memory; see
+    /// [`crate::api::BulkBuildOptions`]. Construction verifies the complete
+    /// staged index in one snapshot before publication, so a backend whose
+    /// snapshot expires during that audit returns an error without publishing.
+    pub async fn build_index(
+        &self,
+        name: &str,
+        config: IndexConfig,
+        records: Vec<crate::api::Record>,
+        build_options: crate::api::BulkBuildOptions,
+        operation_options: OperationOptions,
+    ) -> Result<Index<B>> {
+        let name = IndexName::new(name)?;
+        config.validate()?;
+        let handle_name = name.clone();
+        let retry = lifecycle::RetryPolicy::from_config(self.config());
+        let manifest = self
+            .run_foreground(
+                Operation::BuildIndex,
+                None,
+                operation_options,
+                move |mut context| async move {
+                    bulk::build(&mut context, name, config, records, build_options, retry).await
                 },
             )
             .await?;
@@ -270,6 +311,8 @@ pub(crate) struct OperationContext<B: Backend> {
     write_beam_size: u32,
     partition_cache: Arc<PartitionCache>,
     commit_start: Option<CommitStart>,
+    // Bulk CPU tasks retain this shared admission through actual task exit.
+    cpu_admission: Option<Arc<Admission<B>>>,
 }
 
 impl<B: Backend> OperationContext<B> {
@@ -420,6 +463,19 @@ impl<B: Backend> RuntimeInner<B> {
                 return Err(error);
             }
         };
+        // Ordinary operations retain direct admission without an allocation.
+        // A bulk build shares ownership with cooperatively cancelled CPU work.
+        let admission = if operation == Operation::BuildIndex {
+            ForegroundAdmission::Shared {
+                guard: Arc::new(admission),
+            }
+        } else {
+            ForegroundAdmission::Direct { _guard: admission }
+        };
+        let cpu_admission = match &admission {
+            ForegroundAdmission::Shared { guard } => Some(Arc::clone(guard)),
+            ForegroundAdmission::Direct { .. } => None,
+        };
         let cancellation = options.cancellation().cloned();
         let deadline = options.deadline();
         let (commit_cancellation, commit_start) = CommitCancellation::pair();
@@ -429,6 +485,7 @@ impl<B: Backend> RuntimeInner<B> {
             write_beam_size: self.config.write_beam_size(),
             partition_cache: self.partition_cache(),
             commit_start: Some(commit_start),
+            cpu_admission,
         };
         // `observed` tracks whether the spawned task reported the operation's
         // true outcome; the caller side reports only when it won the
@@ -691,6 +748,12 @@ enum Phase {
     Closing,
     Releasing,
     Closed,
+}
+
+/// Only bulk construction needs shared ownership of a foreground admission.
+enum ForegroundAdmission<B: Backend> {
+    Direct { _guard: Admission<B> },
+    Shared { guard: Arc<Admission<B>> },
 }
 
 struct Admission<B: Backend> {

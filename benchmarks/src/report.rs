@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 /// Current complete benchmark suite/report JSON contract.
-pub const REPORT_SCHEMA_VERSION: u32 = 5;
+pub const REPORT_SCHEMA_VERSION: u32 = 6;
 
 /// Reports produced by one suite command on one comparable host.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -109,6 +109,12 @@ pub struct Configuration {
     pub search_budgets: SearchBudgetConfiguration,
     /// Per-level beam used while importing records into the tree.
     pub write_beam_size: u32,
+    /// Local refinement rounds, or None for ordinary import.
+    pub bulk_refinement_rounds: Option<usize>,
+    /// Resolved bulk centroid neighbor count.
+    pub bulk_neighbor_centroids: Option<usize>,
+    /// Resolved bulk source-data byte limit, excluding workspace.
+    pub bulk_input_limit_bytes: Option<u64>,
     /// Per-request leaf-level base beam override, when present.
     pub leaf_beam_size_override: Option<u32>,
     /// Ordered leaf-beam values for a single-variable quality sweep.
@@ -278,6 +284,10 @@ pub struct QualitySweepMeasurements {
 /// Construction costs before oracle preparation and query warmup.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ConstructionMeasurements {
+    /// Completed local rounds across all trees (zero for ordinary import).
+    pub refinement_rounds: u64,
+    /// Accepted positive-gain moves across completed local rounds.
+    pub refinement_moves: u64,
     /// Continuous elapsed time from import start through verified convergence.
     pub wall_seconds: f64,
     /// Process CPU across the same complete construction interval.

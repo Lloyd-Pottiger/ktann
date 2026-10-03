@@ -46,7 +46,8 @@ their physical keyspaces are neither portable nor mutually compatible.
 - Online migration of schema, metric, dimension, Tree Key, quantizer, or
   persistent format.
 - Redis, a production in-memory backend, durable maintenance jobs, repair on
-  read, automatic repair, bulk-build generations, or staging indexes.
+  read, automatic repair, or bulk-build generations. A separate unpublished
+  construction path is described by proposed ADR 0024.
 - Compatibility with any implementation predating the first stable format.
 
 ## 4. Authoritative invariants

@@ -50,7 +50,7 @@ use bytes::Bytes;
 use xxhash_rust::xxh3::xxh3_128_with_seed;
 
 use crate::api::{
-    DataType, LogicalIndexId, PartitionKey, Result, VerifyIssue, VerifyIssueKind,
+    DataType, Error, ErrorKind, LogicalIndexId, PartitionKey, Result, VerifyIssue, VerifyIssueKind,
     VerifyObjectCounts, VerifyOptions, VerifyReport, VerifyTopology,
 };
 use crate::maintenance::fixup;
@@ -90,8 +90,37 @@ pub(crate) async fn verify<B: Backend>(
     context.checkpoint()?;
     let backend = context.backend();
     let txn = open_validated_read(backend.as_ref(), manifest).await?;
-    let mut raw = txn.into_raw();
+    verify_raw(context, manifest, options, txn.into_raw()).await
+}
 
+/// Audits an unpublished construction using the same checks and one snapshot.
+/// The exact Building identity is checked before opening the audit; the final
+/// publication transaction fences drop or any lifecycle change.
+pub(crate) async fn verify_build<B: Backend>(
+    context: &mut OperationContext<B>,
+    manifest: &IndexManifest,
+    options: VerifyOptions,
+) -> Result<VerifyReport> {
+    let backend = context.backend();
+    let raw = backend.begin_read().await?;
+    let mut txn = crate::storage::ReadLogicalTxn::for_index(raw, manifest);
+    let current = txn
+        .get(LogicalKey::Manifest(manifest.logical_index_id()))
+        .await?;
+    if !matches!(current, Some(PersistentValue::IndexManifest(ref current)) if current == manifest
+        && matches!(current.lifecycle(), crate::storage::values::IndexLifecycle::Building { .. }))
+    {
+        return Err(Error::new(ErrorKind::IndexNotFound));
+    }
+    verify_raw(context, manifest, options, txn.into_raw()).await
+}
+
+async fn verify_raw<B: Backend>(
+    context: &mut OperationContext<B>,
+    manifest: &IndexManifest,
+    options: VerifyOptions,
+    mut raw: B::ReadTxn<'_>,
+) -> Result<VerifyReport> {
     let mut cx = Context::new(manifest, &options);
     check_allocator(&mut cx, &mut raw).await?;
     scan_index(&mut cx, context, &mut raw).await?;

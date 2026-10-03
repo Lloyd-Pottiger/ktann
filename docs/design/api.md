@@ -54,6 +54,17 @@ Create is idempotent for the same name and configuration after an unknown commit
 outcome. Open rejects a Dropping index, unsupported format, backend mismatch, or
 configuration mismatch. Drop is idempotent and follows the storage lifecycle.
 
+The alternative `Runtime::build_index(name, config, records, build_options,
+operation_options)` reserves a Building name, computes balanced final membership
+with bounded local refinement, stages under an exact owner fence, verifies the
+complete staged snapshot, and atomically publishes Active. `BulkBuildOptions`
+requires an input-data byte limit and allows 0..=5 rounds and 1..=32 neighbor
+centroids. Zero rounds selects the same builder without refinement. The input
+limit excludes proportional preprocessing, training and verification workspace.
+Create/open return `IndexBuilding` during construction. Failure or cancellation
+can retain Building; the caller uses `drop_index` before rebuilding. No existing
+index is replaced and no published centroid is rewritten. See proposed ADR 0024.
+
 ## 2. Records and mutations
 
 ```rust

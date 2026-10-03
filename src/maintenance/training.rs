@@ -257,14 +257,25 @@ struct TrainedSplit {
 /// exposure. The split must still be able to advance on a valid persistent
 /// state, so an undersized set trains degenerate centroids: a single entry
 /// replicates as both centroids, and an empty source yields two zero vectors.
-fn train<I: Ord>(kernel: &VectorKernel, mut entries: Vec<(I, Box<[f32]>)>) -> Result<TrainedSplit> {
+fn train<I: Ord>(kernel: &VectorKernel, entries: Vec<(I, Box<[f32]>)>) -> Result<TrainedSplit> {
+    train_with_checkpoint(kernel, entries, &|| Ok(()))
+}
+
+/// Construction can cancel numerical work without changing published split training.
+fn train_with_checkpoint<I: Ord>(
+    kernel: &VectorKernel,
+    mut entries: Vec<(I, Box<[f32]>)>,
+    checkpoint: &impl Fn() -> Result<()>,
+) -> Result<TrainedSplit> {
     for (_, vector) in &entries {
+        checkpoint()?;
         if vector.len() != kernel.dimension() || vector.iter().any(|c| !c.is_finite()) {
             return Err(Error::new(ErrorKind::Corruption));
         }
     }
     if kernel.is_cosine() {
         for (_, vector) in &mut entries {
+            checkpoint()?;
             *vector = kernel.normalize_centroid(vector)?;
         }
     }
@@ -293,6 +304,7 @@ fn train<I: Ord>(kernel: &VectorKernel, mut entries: Vec<(I, Box<[f32]>)>) -> Re
     // kernel's caller-versus-persistent error distinction collapses to
     // Corruption here.
     let distance = |vector: &[f32], centroid: &[f32]| -> Result<f64> {
+        checkpoint()?;
         kernel
             .routing_distance(vector, centroid)
             .map_err(|_| Error::new(ErrorKind::Corruption))
@@ -308,6 +320,7 @@ fn train<I: Ord>(kernel: &VectorKernel, mut entries: Vec<(I, Box<[f32]>)>) -> Re
     let mut previous: Option<Vec<bool>> = None;
     let mut rounds = 0_usize;
     loop {
+        checkpoint()?;
         let assignment = assign(&entries, &left, &right, half, &distance)?;
         let stable = previous.as_ref() == Some(&assignment);
         // The same canonical membership produces byte-identical means. The
@@ -428,6 +441,58 @@ fn mean<'a>(dimension: usize, members: impl Iterator<Item = &'a [f32]>) -> Resul
         centroid.push(component);
     }
     Ok(centroid.into_boxed_slice())
+}
+
+/// Partitions construction inputs into a power-of-two number of balanced
+/// groups using the same deterministic binary training as foreground splits.
+/// Every group is emitted in canonical input identity order.
+pub(crate) fn construction_groups(
+    kernel: &VectorKernel,
+    entries: Vec<(usize, Box<[f32]>)>,
+    maximum: usize,
+    checkpoint: &impl Fn() -> Result<()>,
+) -> Result<Vec<Vec<usize>>> {
+    let groups = entries.len().div_ceil(maximum).next_power_of_two();
+    fn divide(
+        kernel: &VectorKernel,
+        mut entries: Vec<(usize, Box<[f32]>)>,
+        groups: usize,
+        output: &mut Vec<Vec<usize>>,
+        checkpoint: &impl Fn() -> Result<()>,
+    ) -> Result<()> {
+        checkpoint()?;
+        entries.sort_by_key(|entry| entry.0);
+        if groups == 1 {
+            output.push(entries.into_iter().map(|entry| entry.0).collect());
+            return Ok(());
+        }
+        let centers = train_with_checkpoint(kernel, entries.clone(), checkpoint)?;
+        let distance = |vector: &[f32], centroid: &[f32]| {
+            checkpoint()?;
+            kernel.routing_distance(vector, centroid)
+        };
+        let assignment = assign(
+            &entries,
+            &centers.left,
+            &centers.right,
+            entries.len() / 2,
+            &distance,
+        )?;
+        let mut left = Vec::with_capacity(entries.len() / 2);
+        let mut right = Vec::with_capacity(entries.len().div_ceil(2));
+        for (entry, is_left) in entries.into_iter().zip(assignment) {
+            if is_left {
+                left.push(entry);
+            } else {
+                right.push(entry);
+            }
+        }
+        divide(kernel, left, groups / 2, output, checkpoint)?;
+        divide(kernel, right, groups / 2, output, checkpoint)
+    }
+    let mut output = Vec::with_capacity(groups);
+    divide(kernel, entries, groups, &mut output, checkpoint)?;
+    Ok(output)
 }
 
 #[cfg(test)]

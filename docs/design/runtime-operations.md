@@ -129,6 +129,15 @@ whole-import result.
 its complete contract, while process-local or cluster-wide topology convergence
 remains demand-driven and separately observable.
 
+Unpublished bulk construction uses a separate ownership and publication protocol
+(proposed ADR 0024), rather than Import Session admission. Every staging write
+update-protects the complete Building manifest and replays only deterministic
+writes after unknown outcomes. The Runtime cancellation boundary protects final
+publication; earlier non-serving writes can survive cancellation. Explicit drop
+provides durable cleanup and fences an in-flight builder. Verification uses the
+same complete one-snapshot audit as serving indexes and must succeed before
+publication; snapshot expiry leaves construction unpublished.
+
 ## 5. Metrics, tracing, and privacy
 
 KTANN emits through the `metrics` and `tracing` facades. Metric labels use

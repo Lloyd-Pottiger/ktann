@@ -38,8 +38,10 @@ impl<B: Backend> Index<B> {
         name: IndexName,
         manifest: IndexManifest,
     ) -> Result<Self> {
-        if manifest.lifecycle() != IndexLifecycle::Active {
-            return Err(Error::new(ErrorKind::IndexDropping));
+        match manifest.lifecycle() {
+            IndexLifecycle::Active => {}
+            IndexLifecycle::Building { .. } => return Err(Error::new(ErrorKind::IndexBuilding)),
+            IndexLifecycle::Dropping => return Err(Error::new(ErrorKind::IndexDropping)),
         }
         Ok(Self {
             runtime,

@@ -238,6 +238,7 @@ async fn recover_create<B: Backend>(
 fn classify_existing(manifest: IndexManifest, config: &IndexConfig) -> Result<IndexManifest> {
     match manifest.lifecycle() {
         IndexLifecycle::Dropping => Err(Error::new(ErrorKind::IndexDropping)),
+        IndexLifecycle::Building { .. } => Err(Error::new(ErrorKind::IndexBuilding)),
         IndexLifecycle::Active if manifest.config() == config => Ok(manifest),
         IndexLifecycle::Active => Err(Error::new(ErrorKind::IndexAlreadyExists)),
     }
@@ -263,6 +264,7 @@ pub(crate) async fn open_index<B: Backend>(
     match manifest.lifecycle() {
         IndexLifecycle::Active => Ok(manifest),
         IndexLifecycle::Dropping => Err(Error::new(ErrorKind::IndexDropping)),
+        IndexLifecycle::Building { .. } => Err(Error::new(ErrorKind::IndexBuilding)),
     }
 }
 
@@ -304,7 +306,7 @@ pub(crate) async fn drop_index<B: Backend>(
         };
         let manifest = read_manifest_for_update(&mut txn, entry.logical_index_id()).await?;
         let step = match manifest.lifecycle() {
-            IndexLifecycle::Active => {
+            IndexLifecycle::Active | IndexLifecycle::Building { .. } => {
                 let dropping = manifest.with_lifecycle(IndexLifecycle::Dropping);
                 txn.put(
                     LogicalKey::Manifest(manifest.logical_index_id()),
@@ -476,7 +478,9 @@ async fn read_manifest_for_update<T: WriteTxn>(
     }
 }
 
-fn derive_bloom_parameters(config: &IndexConfig) -> Result<Vec<Option<BloomParameters>>> {
+pub(crate) fn derive_bloom_parameters(
+    config: &IndexConfig,
+) -> Result<Vec<Option<BloomParameters>>> {
     config
         .fields()
         .iter()
@@ -484,7 +488,7 @@ fn derive_bloom_parameters(config: &IndexConfig) -> Result<Vec<Option<BloomParam
         .collect()
 }
 
-fn derive_rotation_seed(logical_index_id: LogicalIndexId) -> [u8; 32] {
+pub(crate) fn derive_rotation_seed(logical_index_id: LogicalIndexId) -> [u8; 32] {
     let first = xxh3_128_with_seed(&logical_index_id.get().to_be_bytes(), ROTATION_SEED_DOMAIN);
     let second = xxh3_128_with_seed(
         &first.to_le_bytes(),

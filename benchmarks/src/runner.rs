@@ -7,9 +7,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use ktann::api::{
-    DataType, ErrorKind, FieldId, FieldSchema, ImportOptions, ImportSession, Index, IndexConfig,
-    Metric, Mutation, OperationOptions, Record, RuntimeConfig, SearchBudgets, SearchOptions,
-    SearchRequest, Value, VerifyOptions,
+    BulkBuildOptions, DataType, ErrorKind, FieldId, FieldSchema, ImportOptions, ImportSession,
+    Index, IndexConfig, Metric, Mutation, OperationOptions, Record, RuntimeConfig, SearchBudgets,
+    SearchOptions, SearchRequest, Value, VerifyOptions,
 };
 use ktann::runtime::Runtime;
 use ktann::storage::backend::Backend;
@@ -97,6 +97,8 @@ pub struct ScenarioSpec {
     pub search_options: SearchOptions,
     /// Per-level beam used while importing records into the tree.
     pub write_beam_size: u32,
+    /// Unpublished bulk builder rounds; None selects ordinary import.
+    pub bulk_refinement_rounds: Option<usize>,
     /// Ordered single-variable beam values; empty for ordinary scenarios.
     pub leaf_beam_sweep: Vec<u32>,
     /// Logical Index maximum partition size.
@@ -153,6 +155,7 @@ fn smoke_scenarios() -> Vec<ScenarioSpec> {
         k: 10,
         search_options: SearchOptions::default(),
         write_beam_size: 8,
+        bulk_refinement_rounds: None,
         leaf_beam_sweep: Vec::new(),
         max_partition_entries: 32,
         lifecycle: false,
@@ -233,6 +236,7 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
         k: 10,
         search_options: SearchOptions::default(),
         write_beam_size: 8,
+        bulk_refinement_rounds: None,
         leaf_beam_sweep: Vec::new(),
         max_partition_entries: 128,
         lifecycle: false,
@@ -338,6 +342,7 @@ fn large_scenarios() -> Result<Vec<ScenarioSpec>, String> {
             k: 100,
             search_options: SearchOptions::default(),
             write_beam_size: defaults.write_beam_size(),
+            bulk_refinement_rounds: None,
             leaf_beam_sweep: vec![1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128, 192, 256, 384],
             // Keep the shared leaf/internal fanout below sqrt(1M) so the
             // million-vector corpus must form at least three searchable levels.
@@ -497,6 +502,9 @@ pub async fn run_scenario<B: Backend>(
             maintenance_attempt_limit,
             search_budgets,
             write_beam_size: spec.write_beam_size,
+            bulk_refinement_rounds: spec.bulk_refinement_rounds,
+            bulk_neighbor_centroids: spec.bulk_refinement_rounds.map(|_| 32),
+            bulk_input_limit_bytes: spec.bulk_refinement_rounds.map(|_| 32 << 30),
             leaf_beam_size_override: spec.search_options.leaf_beam_size(),
             leaf_beam_sweep: spec.leaf_beam_sweep.clone(),
             blocking_resource_limit: spec.blocking_resource_limit,
@@ -1185,10 +1193,16 @@ async fn prepare_index<B: Backend>(
     String,
 > {
     let index_config = index_config(spec)?;
-    let index = runtime
-        .create_index("benchmark", index_config)
-        .await
-        .map_err(|error| error_at("create index", error))?;
+    let index = if spec.bulk_refinement_rounds.is_none() {
+        Some(
+            runtime
+                .create_index("benchmark", index_config.clone())
+                .await
+                .map_err(|error| error_at("create index", error))?,
+        )
+    } else {
+        None
+    };
 
     // Dataset/index creation is excluded. Import keeps streaming its batches;
     // constructing every batch before this boundary would change memory use.
@@ -1196,7 +1210,38 @@ async fn prepare_index<B: Backend>(
     let backend_before = backend_counters.snapshot();
     let resources_before = ResourceSnapshot::capture()?;
     let import_started = phase_started(spec, "import");
-    load_index(&index, dataset, spec).await?;
+    let index = if let Some(rounds) = spec.bulk_refinement_rounds {
+        let fields = if spec.profile == "large" {
+            Vec::new()
+        } else {
+            vec![Value::I64(0), Value::I64(0)]
+        };
+        let records = dataset
+            .ids
+            .iter()
+            .zip(&dataset.base)
+            .map(|(id, vector)| {
+                Record::new(id.clone(), vector.clone(), fields.clone())
+                    .map_err(|error| error_at("construct bulk record", error))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        runtime
+            .build_index(
+                "benchmark",
+                index_config,
+                records,
+                BulkBuildOptions::new(32 << 30)
+                    .and_then(|options| options.with_refinement_rounds(rounds))
+                    .map_err(|error| error_at("bulk options", error))?,
+                OperationOptions::default(),
+            )
+            .await
+            .map_err(|error| error_at("bulk construction", error))?
+    } else {
+        let index = index.expect("ordinary import created index");
+        load_index(&index, dataset, spec).await?;
+        index
+    };
     let import_completed = Instant::now();
     let import_seconds = import_completed
         .duration_since(import_started)
@@ -1230,6 +1275,8 @@ async fn prepare_index<B: Backend>(
         admission: import_metrics.admission_summary(),
         cache: import_metrics.cache_summary(),
     };
+    let refinement_rounds = import_metrics.counter("ktann.bulk.refinement.rounds", &[]);
+    let refinement_moves = import_metrics.counter("ktann.bulk.refinement.moves", &[]);
     drop(import_metrics);
     log_import_diagnostics(spec, &import);
     let convergence = ConstructionPhase {
@@ -1245,6 +1292,8 @@ async fn prepare_index<B: Backend>(
         cache: convergence_metrics.cache_summary(),
     };
     let construction = ConstructionMeasurements {
+        refinement_rounds,
+        refinement_moves,
         wall_seconds,
         cpu_seconds: Some(resources_after.cpu_seconds_since(resources_before)),
         peak_rss_bytes: Some(resources_after.peak_rss_bytes()),

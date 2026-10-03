@@ -13,6 +13,11 @@ use super::{FORMAT_VERSION, MAX_SYNOPSIS_BYTES, ROTATION_SEED_BYTES, corrupt};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum IndexLifecycle {
+    /// The Logical Index is reserved for unpublished bulk construction.
+    Building {
+        /// Random identity of the exclusive construction owner.
+        owner: [u8; 16],
+    },
     /// The Logical Index accepts ordinary operations.
     Active,
     /// The Logical Index is being deleted.
@@ -250,8 +255,12 @@ pub(super) fn encode_index_manifest(encoder: &mut Encoder, manifest: &IndexManif
     encoder.u16(FORMAT_VERSION);
     encoder.u8(match manifest.lifecycle {
         IndexLifecycle::Active => 0,
+        IndexLifecycle::Building { .. } => 2,
         IndexLifecycle::Dropping => 1,
     });
+    if let IndexLifecycle::Building { owner } = manifest.lifecycle {
+        encoder.bytes(&owner);
+    }
     encoder.u64(manifest.logical_index_id.get());
     let config = manifest.config();
     encoder.u32(u32::try_from(config.dimension()).map_err(|_| Error::invalid_argument())?);
@@ -294,6 +303,9 @@ pub(super) fn decode_index_manifest(decoder: &mut Decoder) -> Result<IndexManife
     }
     let lifecycle = match decoder.u8()? {
         0 => IndexLifecycle::Active,
+        2 => IndexLifecycle::Building {
+            owner: decoder.array()?,
+        },
         1 => IndexLifecycle::Dropping,
         _ => return Err(corrupt()),
     };

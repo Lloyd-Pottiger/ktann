@@ -254,3 +254,16 @@ Use a fresh bridge and dedicated backend location per case. Shutdown finishes
 import, drops the Logical Index, and removes the socket. After a crash, confirm
 the old process has exited before removing its stale socket; startup never
 unlinks a preexisting socket.
+
+### Capacity-refined construction alternative
+
+Quality sweeps accept `--bulk-refinement-rounds 0..5`. Omit the flag for the
+ordinary import baseline, use `0` for the balanced builder control, and use `2`
+or `5` for bounded local refinement. Reports record resolved rounds, 32 neighbor
+centroids and the 32 GiB source-data limit. The complete timed import includes
+source Record construction, name reservation, planning, refinement, bounded
+staging, complete internal audit and publication. Workspace is additional to the
+source limit. Convergence and the external before/after sweep verification are
+also retained and reported. Compare all three paths: balanced initialization
+changes occupancy/tree shape independently of refinement. Archive the executable
+and source/binary hashes before timing under the shared resource lock.

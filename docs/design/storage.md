@@ -76,6 +76,14 @@ Create reserves an ID and atomically inserts the name mapping and Active
 Manifest. ID gaps are valid. Drop transitions the Manifest to Dropping before
 deleting data; all ordinary operations update-protect and validate Active state.
 
+The separate bulk-construction alternative reserves a Building manifest with a
+16-byte OS-random owner nonce before staging. Every staging transaction compares
+and update-protects that exact manifest. Record/Location/Leaf/payload groups are
+indivisible even while Building topology is incomplete. A complete snapshot audit
+precedes the atomic Building-to-Active transition; ordinary operations reject
+Building. Explicit drop can fence Building and remove its index-owned range.
+See proposed ADR 0024.
+
 FoundationDB may atomically clear the complete data range and remove the
 Dropping Manifest. Without transactional range clear, core deletes bounded
 pages of logical keys while preserving the Dropping Manifest, then atomically

@@ -145,6 +145,7 @@ pub(crate) fn opened_manifest(
             IndexLifecycle::Active if current.has_same_immutable_identity(handle) => Ok(current),
             IndexLifecycle::Active => Err(Error::new(ErrorKind::Corruption)),
             IndexLifecycle::Dropping => Err(Error::new(ErrorKind::IndexDropping)),
+            IndexLifecycle::Building { .. } => Err(Error::new(ErrorKind::IndexBuilding)),
         },
         Some(_) => Err(Error::new(ErrorKind::Corruption)),
         None => Err(Error::new(ErrorKind::IndexNotFound)),
