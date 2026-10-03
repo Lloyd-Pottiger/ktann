@@ -136,9 +136,6 @@ pub(super) fn encode_leaf_entry(
     encode_record_id(encoder, &entry.record_id)?;
     encode_fields(encoder, manifest.config().fields(), &entry.fields)?;
     let expected = RaBitQ7::encoded_len(manifest.config().dimension())?;
-    if entry.rabitq7.len() != expected {
-        return Err(Error::invalid_argument());
-    }
     RaBitQ7::validate(&entry.rabitq7, manifest.config().dimension())
         .map_err(|_| Error::invalid_argument())?;
     encoder.sized_bytes(&entry.rabitq7, expected)
@@ -172,9 +169,6 @@ pub(super) fn decode_leaf_entry(
     let fields = decode_fields(decoder, manifest.config().fields())?;
     let expected = RaBitQ7::encoded_len(manifest.config().dimension()).map_err(|_| corrupt())?;
     let rabitq7 = decoder.sized_bytes(expected)?;
-    if rabitq7.len() != expected {
-        return Err(corrupt());
-    }
     RaBitQ7::validate(&rabitq7, manifest.config().dimension())?;
     Ok(LeafEntry::new(record_id, fields, rabitq7))
 }

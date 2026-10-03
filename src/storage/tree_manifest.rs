@@ -159,15 +159,15 @@ pub async fn reserve_partition_keys<T: WriteTxn>(
         return Err(Error::new(ErrorKind::IdExhausted));
     }
     let next = high_water + 1;
-    let last = high_water.saturating_add(u64::from(count));
+    let last = partition_key(high_water.saturating_add(u64::from(count)))?;
     txn.put(
         key,
-        PersistentValue::TreeManifest(TreeManifest::new(manifest.root(), partition_key(last)?)?),
+        PersistentValue::TreeManifest(TreeManifest::new(manifest.root(), last)?),
     )
     .await?;
     Ok(PartitionKeyReservation {
         next: partition_key(next)?,
-        last: partition_key(last)?,
+        last,
     })
 }
 

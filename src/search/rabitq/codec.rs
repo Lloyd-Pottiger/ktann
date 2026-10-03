@@ -12,9 +12,6 @@ const MAX_MAGNITUDE: u8 = 63;
 const MAGNITUDE_BITS: usize = 6;
 
 pub(super) fn quantize(vector: &[f32]) -> Result<Bytes> {
-    if !(1..=MAX_DIMENSION).contains(&vector.len()) {
-        return Err(Error::invalid_argument());
-    }
     let dimension = vector.len();
     let encoded_len = encoded_len(dimension)?;
 
@@ -37,9 +34,7 @@ pub(super) fn quantize(vector: &[f32]) -> Result<Bytes> {
         let magnitude = (f64::from(component.abs()) / step)
             .round()
             .clamp(0.0, f64::from(MAX_MAGNITUDE)) as u8;
-        let code = if magnitude == 0 {
-            0
-        } else if component.is_sign_negative() {
+        let code = if component.is_sign_negative() {
             -(magnitude as i8)
         } else {
             magnitude as i8

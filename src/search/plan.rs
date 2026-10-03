@@ -108,7 +108,7 @@ impl TreeKeyPlan {
             let value = values
                 .get(check.ordinal)
                 .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
-            if !check.contains(value)? {
+            if !check.contains(value) {
                 return Ok(false);
             }
         }
@@ -587,8 +587,8 @@ impl FieldSet {
         for left in &self.intervals {
             for right in &other.intervals {
                 intervals.push(Interval {
-                    lo: max_lo(left.lo.clone(), right.lo.clone()),
-                    hi: min_hi(left.hi.clone(), right.hi.clone()),
+                    lo: max_lo(&left.lo, &right.lo),
+                    hi: min_hi(&left.hi, &right.hi),
                 });
             }
         }
@@ -645,20 +645,20 @@ struct FieldCheck {
 }
 
 impl FieldCheck {
-    fn contains(&self, value: &Value) -> Result<bool> {
+    fn contains(&self, value: &Value) -> bool {
         for interval in &self.intervals {
             if let Some(lo) = &interval.lo
                 && bound_order(value, lo) == Ordering::Less
             {
-                return Ok(false);
+                return false;
             }
             match &interval.hi {
-                Some(hi) if bound_order(value, hi) == Ordering::Less => return Ok(true),
-                None => return Ok(true),
+                Some(hi) if bound_order(value, hi) == Ordering::Less => return true,
+                None => return true,
                 Some(_) => {}
             }
         }
-        Ok(false)
+        false
     }
 }
 
@@ -751,20 +751,20 @@ fn overlaps_or_adjacent(last: &Interval, next: &Interval) -> bool {
 }
 
 /// Returns the greater lower bound, where `None` is unbounded below.
-fn max_lo(left: Option<Value>, right: Option<Value>) -> Option<Value> {
-    if cmp_lower(&left, &right) == Ordering::Less {
-        right
+fn max_lo(left: &Option<Value>, right: &Option<Value>) -> Option<Value> {
+    if cmp_lower(left, right) == Ordering::Less {
+        right.clone()
     } else {
-        left
+        left.clone()
     }
 }
 
 /// Returns the lesser upper bound, where `None` is unbounded above.
-fn min_hi(left: Option<Value>, right: Option<Value>) -> Option<Value> {
-    if cmp_upper(&left, &right) == Ordering::Greater {
-        right
+fn min_hi(left: &Option<Value>, right: &Option<Value>) -> Option<Value> {
+    if cmp_upper(left, right) == Ordering::Greater {
+        right.clone()
     } else {
-        left
+        left.clone()
     }
 }
 

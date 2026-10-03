@@ -41,26 +41,14 @@ impl SearchBudgets {
         visited_partitions: u32,
         exact_rerank_candidates: u32,
     ) -> Result<Self> {
-        let budgets = Self {
+        validate_override(scanned_tree_keys, MAX_SCANNED_TREE_KEYS)?;
+        validate_override(visited_partitions, MAX_VISITED_PARTITIONS)?;
+        validate_override(exact_rerank_candidates, MAX_EXACT_RERANK_CANDIDATES)?;
+        Ok(Self {
             scanned_tree_keys,
             visited_partitions,
             exact_rerank_candidates,
-        };
-        budgets.validate_hard_caps()?;
-        Ok(budgets)
-    }
-
-    pub(crate) fn validate_hard_caps(&self) -> Result<()> {
-        if self.scanned_tree_keys == 0
-            || self.scanned_tree_keys > MAX_SCANNED_TREE_KEYS
-            || self.visited_partitions == 0
-            || self.visited_partitions > MAX_VISITED_PARTITIONS
-            || self.exact_rerank_candidates == 0
-            || self.exact_rerank_candidates > MAX_EXACT_RERANK_CANDIDATES
-        {
-            return Err(Error::invalid_argument());
-        }
-        Ok(())
+        })
     }
 
     /// Returns the scanned Tree Key limit.

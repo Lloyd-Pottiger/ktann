@@ -100,7 +100,6 @@ impl IndexConfig {
             if !names.insert(field.name()) {
                 return Err(Error::invalid_argument());
             }
-            field.synopsis().validate()?;
             if matches!(field.synopsis(), SynopsisConfig::MinMaxBloom { .. }) {
                 bloom_fields += 1;
             }

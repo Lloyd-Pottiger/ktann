@@ -195,51 +195,37 @@ impl Backend for FoundationDbBackend {
     }
 }
 
-impl ReadOps for FoundationDbReadTxn<'_> {
-    async fn get(&mut self, key: Bytes) -> Result<Option<Bytes>> {
-        get(&self.transaction, self.prefix, key, ReadMode::Snapshot).await
-    }
+/// Implements the shared snapshot reads of both transaction types.
+macro_rules! impl_read_ops {
+    ($txn:ident) => {
+        impl ReadOps for $txn<'_> {
+            async fn get(&mut self, key: Bytes) -> Result<Option<Bytes>> {
+                get(&self.transaction, self.prefix, key, ReadMode::Snapshot).await
+            }
 
-    async fn batch_get(&mut self, keys: Vec<Bytes>) -> Result<Vec<Option<Bytes>>> {
-        batch_get(&self.transaction, self.prefix, keys, ReadMode::Snapshot).await
-    }
+            async fn batch_get(&mut self, keys: Vec<Bytes>) -> Result<Vec<Option<Bytes>>> {
+                batch_get(&self.transaction, self.prefix, keys, ReadMode::Snapshot).await
+            }
 
-    async fn scan(&mut self, range: &KeyRange, limits: ScanLimits) -> Result<ScanPage> {
-        scan(&self.transaction, self.prefix, range, limits).await
-    }
+            async fn scan(&mut self, range: &KeyRange, limits: ScanLimits) -> Result<ScanPage> {
+                scan(&self.transaction, self.prefix, range, limits).await
+            }
 
-    async fn batch_scan(
-        &mut self,
-        ranges: &[KeyRange],
-        limits: ScanLimits,
-    ) -> Result<Vec<ScanPage>> {
-        batch_scan(&self.transaction, self.prefix, ranges, limits).await
-    }
+            async fn batch_scan(
+                &mut self,
+                ranges: &[KeyRange],
+                limits: ScanLimits,
+            ) -> Result<Vec<ScanPage>> {
+                batch_scan(&self.transaction, self.prefix, ranges, limits).await
+            }
+        }
+    };
 }
+
+impl_read_ops!(FoundationDbReadTxn);
+impl_read_ops!(FoundationDbWriteTxn);
 
 impl ReadTxn for FoundationDbReadTxn<'_> {}
-
-impl ReadOps for FoundationDbWriteTxn<'_> {
-    async fn get(&mut self, key: Bytes) -> Result<Option<Bytes>> {
-        get(&self.transaction, self.prefix, key, ReadMode::Snapshot).await
-    }
-
-    async fn batch_get(&mut self, keys: Vec<Bytes>) -> Result<Vec<Option<Bytes>>> {
-        batch_get(&self.transaction, self.prefix, keys, ReadMode::Snapshot).await
-    }
-
-    async fn scan(&mut self, range: &KeyRange, limits: ScanLimits) -> Result<ScanPage> {
-        scan(&self.transaction, self.prefix, range, limits).await
-    }
-
-    async fn batch_scan(
-        &mut self,
-        ranges: &[KeyRange],
-        limits: ScanLimits,
-    ) -> Result<Vec<ScanPage>> {
-        batch_scan(&self.transaction, self.prefix, ranges, limits).await
-    }
-}
 
 impl FoundationDbWriteTxn<'_> {
     fn charge(&mut self, mutation_count: usize, mutation_bytes: usize) -> Result<()> {
