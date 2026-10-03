@@ -335,13 +335,12 @@ impl Traversal {
                 self.visit_beam(txn, context, remaining).await?;
             } else {
                 let Reverse(entry) = self.frontier.pop().expect("frontier checked non-empty");
-                self.visit_partition(txn, context, entry, None).await?;
+                self.visit_partition(txn, context, entry).await?;
             }
         }
         // Every still-queued entry is eligible work, prevented exactly when
         // the Partition budget is fully spent. Natural completion on the limit
-        // (an empty
-        // frontier) is not exhaustion.
+        // (an empty frontier) is not exhaustion.
         self.partition_budget_exhausted = self.visited_partitions
             == context.request.budgets.visited_partitions()
             && (!self.frontier.is_empty() || !self.next_frontier.is_empty());
@@ -371,7 +370,7 @@ impl Traversal {
             entries.push(self.frontier.pop().expect("frontier checked non-empty").0);
         }
         if entries.len() == 1 {
-            return self.visit_partition(txn, context, entries[0], None).await;
+            return self.visit_partition(txn, context, entries[0]).await;
         }
         let mut keys = Vec::with_capacity(entries.len() * 2);
         for entry in &entries {
@@ -547,12 +546,8 @@ impl Traversal {
         txn: &mut ReadLogicalTxn<'_, T>,
         context: &VisitContext<'_>,
         entry: FrontierEntry,
-        metadata: Option<(PartitionHeader, Option<PartitionSynopsis>)>,
     ) -> Result<()> {
-        let Some(visit) = self
-            .prepare_partition(txn, context, entry, metadata)
-            .await?
-        else {
+        let Some(visit) = self.prepare_partition(txn, context, entry, None).await? else {
             return Ok(());
         };
         let tree_key = context.request.trees[entry.tree as usize].tree_key();
