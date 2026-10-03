@@ -1,7 +1,7 @@
 use std::fmt;
 
 use bytes::Bytes;
-use foundationdb::options::StreamingMode;
+use foundationdb::options::{StreamingMode, TransactionOption};
 use foundationdb::{Database, FdbError, RangeOption, Transaction};
 use futures_util::TryStreamExt;
 use futures_util::future::try_join_all;
@@ -178,6 +178,11 @@ impl Backend for FoundationDbBackend {
 
     async fn begin_read(&self) -> Result<FoundationDbReadTxn<'_>> {
         let transaction = self.begin_transaction().await?;
+        // ReadTxn cannot mutate; avoid native read-your-writes bookkeeping.
+        // The read version is pinned, but no key reads have started yet.
+        transaction
+            .set_option(TransactionOption::ReadYourWritesDisable)
+            .map_err(map_operation_error)?;
         Ok(FoundationDbReadTxn {
             transaction,
             prefix: &self.prefix,
