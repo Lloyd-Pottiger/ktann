@@ -30,7 +30,10 @@ use crate::storage::values::{
 };
 
 use super::beam_width;
-use super::cache::{BodyEntries, CachedLeafEntry, PartitionCache, load_body};
+use super::cache::{
+    BODY_PREFETCH_BATCH, BodyEntries, BodyRequest, CachedBody, CachedLeafEntry, PartitionCache,
+    load_body, prefetch_bodies,
+};
 use super::numeric::{VectorKernel, compare_finite};
 use super::plan::EnumeratedTree;
 use super::predicate::{CompiledPredicate, SynopsisClassification};
@@ -202,6 +205,13 @@ struct VisitContext<'a> {
     /// The exact-rerank budget converted for the per-leaf overlap caps.
     rerank_cap: usize,
     request: TraversalRequest<'a>,
+}
+
+/// A funded, metadata-validated visit whose body survived Synopsis pruning.
+struct PreparedVisit<'a> {
+    entry: FrontierEntry,
+    header: PartitionHeader,
+    predicate: Option<&'a CompiledPredicate>,
 }
 
 /// One queued frontier partition.
@@ -381,32 +391,52 @@ impl Traversal {
             }
         }
         let mut values = txn.batch_get(keys).await?.into_iter();
-        for entry in entries {
-            let header = expect_header(values.next().flatten())?
-                .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
-            let synopsis = if context.request.predicate.is_some() && entry.expected_level == Some(1)
-            {
-                Some(
-                    expect_synopsis(values.next().flatten())?
-                        .ok_or_else(|| Error::new(ErrorKind::Corruption))?,
-                )
-            } else {
-                None
-            };
-            self.visit_partition(txn, context, entry, Some((header, synopsis)))
-                .await?;
+        for entries in entries.chunks(BODY_PREFETCH_BATCH) {
+            let mut visits = Vec::with_capacity(entries.len());
+            for &entry in entries {
+                let header = expect_header(values.next().flatten())?
+                    .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
+                let synopsis =
+                    if context.request.predicate.is_some() && entry.expected_level == Some(1) {
+                        Some(
+                            expect_synopsis(values.next().flatten())?
+                                .ok_or_else(|| Error::new(ErrorKind::Corruption))?,
+                        )
+                    } else {
+                        None
+                    };
+                if let Some(visit) = self
+                    .prepare_partition(txn, context, entry, Some((header, synopsis)))
+                    .await?
+                {
+                    visits.push(visit);
+                }
+            }
+            let requests: Vec<_> = visits
+                .iter()
+                .map(|visit| BodyRequest {
+                    tree_key: context.request.trees[visit.entry.tree as usize].tree_key(),
+                    partition: visit.entry.partition,
+                    header: &visit.header,
+                })
+                .collect();
+            let reads = prefetch_bodies(txn, context.cache, context.manifest, &requests).await?;
+            for (visit, read) in visits.into_iter().zip(reads) {
+                let body = read.finish(txn, context.cache, context.manifest).await?;
+                self.visit_body(context, &visit, &body)?;
+            }
         }
         Ok(())
     }
 
-    /// Visits one queued partition body and accounts for it.
-    async fn visit_partition<T: ReadOps>(
+    /// Charges a visit and validates metadata before any body prefetch.
+    async fn prepare_partition<'a, T: ReadOps>(
         &mut self,
         txn: &mut ReadLogicalTxn<'_, T>,
-        context: &VisitContext<'_>,
+        context: &VisitContext<'a>,
         entry: FrontierEntry,
         prefetched_metadata: Option<(PartitionHeader, Option<PartitionSynopsis>)>,
-    ) -> Result<()> {
+    ) -> Result<Option<PreparedVisit<'a>>> {
         self.visited_partitions = self
             .visited_partitions
             .checked_add(1)
@@ -467,9 +497,8 @@ impl Traversal {
                 .await?;
         }
 
-        if level > 1 {
-            self.visit_internal(txn, context, tree_key, entry.tree, entry.partition, &header)
-                .await
+        let predicate = if level > 1 {
+            None
         } else {
             let effective_predicate = match context.request.predicate {
                 Some(predicate) => {
@@ -490,7 +519,7 @@ impl Traversal {
                     match predicate.classify(context.manifest, &synopsis, header.entry_count())? {
                         // The synopsis proves no entry can satisfy the
                         // predicate: prune the leaf without charging entries.
-                        SynopsisClassification::NoMatch => return Ok(()),
+                        SynopsisClassification::NoMatch => return Ok(None),
                         // Every entry provably matches: skip per-entry
                         // evaluation but still charge every entry read.
                         SynopsisClassification::AllMatch => None,
@@ -500,18 +529,62 @@ impl Traversal {
                 None => None,
             };
             // The exact Header count authoritatively proves emptiness.
-            if header.entry_count() > 0 {
-                self.scan_leaf(
-                    txn,
-                    context,
-                    tree_key,
-                    entry.partition,
-                    &header,
-                    effective_predicate,
-                )
-                .await?;
+            if header.entry_count() == 0 {
+                return Ok(None);
             }
-            Ok(())
+            effective_predicate
+        };
+        Ok(Some(PreparedVisit {
+            entry,
+            header,
+            predicate,
+        }))
+    }
+
+    /// Loads a single visit when roots or budget boundaries prevent batching.
+    async fn visit_partition<T: ReadOps>(
+        &mut self,
+        txn: &mut ReadLogicalTxn<'_, T>,
+        context: &VisitContext<'_>,
+        entry: FrontierEntry,
+        metadata: Option<(PartitionHeader, Option<PartitionSynopsis>)>,
+    ) -> Result<()> {
+        let Some(visit) = self
+            .prepare_partition(txn, context, entry, metadata)
+            .await?
+        else {
+            return Ok(());
+        };
+        let tree_key = context.request.trees[entry.tree as usize].tree_key();
+        let body = load_body(
+            txn,
+            context.cache,
+            context.manifest,
+            tree_key,
+            entry.partition,
+            &visit.header,
+        )
+        .await?;
+        self.visit_body(context, &visit, &body)
+    }
+
+    /// Consumes complete bodies in the original deterministic traversal order.
+    fn visit_body(
+        &mut self,
+        context: &VisitContext<'_>,
+        visit: &PreparedVisit<'_>,
+        body: &CachedBody,
+    ) -> Result<()> {
+        if visit.header.level() > 1 {
+            self.visit_internal(context, visit.entry.tree, &visit.header, body)
+        } else {
+            self.scan_leaf(
+                context,
+                context.request.trees[visit.entry.tree as usize].tree_key(),
+                visit.entry.partition,
+                body,
+                visit.predicate,
+            )
         }
     }
 
@@ -562,24 +635,13 @@ impl Traversal {
     /// The decoded body comes from the snapshot-validated cache. Every Child
     /// Entry enters the frontier so children from all admitted same-depth
     /// parents compete by routing distance when the next depth is popped.
-    async fn visit_internal<T: ReadOps>(
+    fn visit_internal(
         &mut self,
-        txn: &mut ReadLogicalTxn<'_, T>,
         context: &VisitContext<'_>,
-        tree_key: &TreeKey,
         tree: u32,
-        partition: PartitionKey,
         header: &PartitionHeader,
+        body: &CachedBody,
     ) -> Result<()> {
-        let body = load_body(
-            txn,
-            context.cache,
-            context.manifest,
-            tree_key,
-            partition,
-            header,
-        )
-        .await?;
         let level = header.level();
         let BodyEntries::Internal(entries) = body.entries() else {
             return Err(Error::new(ErrorKind::Corruption));
@@ -623,24 +685,14 @@ impl Traversal {
     /// Considers every entry of an admitted Leaf Partition, filters exactly,
     /// and merges the bounded overlap selection. The snapshot-validated cache
     /// supplies the whole decoded body; scanning has no independent entry cap.
-    async fn scan_leaf<T: ReadOps>(
+    fn scan_leaf(
         &mut self,
-        txn: &mut ReadLogicalTxn<'_, T>,
         context: &VisitContext<'_>,
         tree_key: &TreeKey,
         partition: PartitionKey,
-        header: &PartitionHeader,
+        body: &CachedBody,
         predicate: Option<&CompiledPredicate>,
     ) -> Result<()> {
-        let body = load_body(
-            txn,
-            context.cache,
-            context.manifest,
-            tree_key,
-            partition,
-            header,
-        )
-        .await?;
         let BodyEntries::Leaf(entries) = body.entries() else {
             return Err(Error::new(ErrorKind::Corruption));
         };
@@ -1162,6 +1214,11 @@ mod tests {
                     assert_eq!(outcome.visited_partitions(), 71);
                     assert!(!outcome.partition_budget_exhausted());
                     let raw = txn.into_raw();
+                    assert!(
+                        raw.batch_scan_sizes
+                            .iter()
+                            .all(|&size| { size <= super::BODY_PREFETCH_BATCH })
+                    );
                     assert_eq!(raw.gets, 1, "only the root needs an individual Header read");
                     let keys_per_partition = if predicate.is_some() { 2 } else { 1 };
                     assert_eq!(

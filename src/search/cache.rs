@@ -22,7 +22,7 @@ use crate::storage::keys::TreeKey;
 use crate::storage::values::{
     ChildEntry, IndexManifest, LeafEntry, PartitionHeader, PersistentValue,
 };
-use crate::storage::{LogicalRange, LogicalScanCursor, ReadLogicalTxn};
+use crate::storage::{LogicalRange, LogicalScanCursor, LogicalScanPage, ReadLogicalTxn};
 
 /// One bounded page of a complete body scan.
 ///
@@ -555,6 +555,172 @@ impl CacheInner {
     }
 }
 
+/// Maximum bodies whose first pages may be held by one traversal batch.
+/// At most four ordinary 1 MiB pages are buffered; subsequent pages stream
+/// through one body at a time under the existing scan limits.
+pub(super) const BODY_PREFETCH_BATCH: usize = 4;
+
+/// The snapshot authority for a body read.
+pub(super) struct BodyRequest<'a> {
+    pub(super) tree_key: &'a TreeKey,
+    pub(super) partition: PartitionKey,
+    pub(super) header: &'a PartitionHeader,
+}
+
+/// A validated cache hit or a body with an optional prefetched first page.
+/// No incomplete body is published to the cache.
+pub(super) enum BodyRead {
+    Cached(Arc<CachedBody>),
+    Scan(Box<BodyScan>),
+}
+
+/// Cold-read state is boxed so warm batches retain only small cache handles.
+pub(super) struct BodyScan {
+    key: CacheKey,
+    header: PartitionHeader,
+    range: LogicalRange,
+    first_page: Option<LogicalScanPage>,
+}
+
+impl BodyRead {
+    /// Validates the cache epoch before choosing a snapshot body scan.
+    fn start(
+        cache: &PartitionCache,
+        manifest: &IndexManifest,
+        request: &BodyRequest<'_>,
+    ) -> Result<Self> {
+        let kind = PartitionKind::from_level(request.header.level());
+        let key = CacheKey::new(
+            manifest.logical_index_id(),
+            request.tree_key.clone(),
+            request.partition,
+            kind,
+        );
+        if let Some(body) = cache.lookup(&key, request.header.cache_epoch()) {
+            return Ok(Self::Cached(body));
+        }
+        let range = match kind {
+            PartitionKind::Leaf => {
+                LogicalRange::leaf_entries(manifest, request.tree_key, request.partition)
+            }
+            PartitionKind::Internal => {
+                LogicalRange::child_entries(manifest, request.tree_key, request.partition)
+            }
+        }?;
+        Ok(Self::Scan(Box::new(BodyScan {
+            key,
+            header: *request.header,
+            range,
+            first_page: None,
+        })))
+    }
+
+    /// Streams the rest of one body, validates its count, and publishes it.
+    pub(super) async fn finish<T: ReadOps>(
+        self,
+        txn: &mut ReadLogicalTxn<'_, T>,
+        cache: &PartitionCache,
+        manifest: &IndexManifest,
+    ) -> Result<Arc<CachedBody>> {
+        let (key, header, range, mut first_page) = match self {
+            Self::Cached(body) => return Ok(body),
+            Self::Scan(scan) => {
+                let BodyScan {
+                    key,
+                    header,
+                    range,
+                    first_page,
+                } = *scan;
+                (key, header, range, first_page)
+            }
+        };
+        let kind = key.kind;
+        let mut leaf_entries: Vec<CachedLeafEntry> = Vec::new();
+        let mut child_entries: Vec<ChildEntry> = Vec::new();
+        let mut bytes = size_of::<CachedBody>() as u64;
+        let mut cursor: Option<LogicalScanCursor> = None;
+        loop {
+            let page = match first_page.take() {
+                Some(page) => page,
+                None => txn.scan(&range, cursor.as_ref(), BODY_SCAN_LIMITS).await?,
+            };
+            cursor = page.next_cursor().cloned();
+            for item in page.into_items() {
+                match (kind, item.into_value()) {
+                    (PartitionKind::Leaf, PersistentValue::LeafEntry(entry)) => {
+                        let entry =
+                            CachedLeafEntry::from_leaf(entry, manifest.config().dimension());
+                        bytes = bytes.saturating_add(leaf_entry_bytes(&entry));
+                        leaf_entries.push(entry);
+                    }
+                    (PartitionKind::Internal, PersistentValue::ChildEntry(entry)) => {
+                        bytes = bytes.saturating_add(child_entry_bytes(&entry));
+                        child_entries.push(entry);
+                    }
+                    _ => return Err(Error::new(ErrorKind::Corruption)),
+                }
+            }
+            if cursor.is_none() {
+                break;
+            }
+        }
+        let entry_count = leaf_entries.len() + child_entries.len();
+        if entry_count != header.entry_count() as usize {
+            return Err(Error::new(ErrorKind::Corruption));
+        }
+
+        let entries = match kind {
+            PartitionKind::Leaf => BodyEntries::Leaf(leaf_entries.into_boxed_slice()),
+            PartitionKind::Internal => BodyEntries::Internal(child_entries.into_boxed_slice()),
+        };
+        let body = Arc::new(CachedBody {
+            epoch: header.cache_epoch(),
+            bytes,
+            entries,
+        });
+        cache.install(key, Arc::clone(&body));
+        Ok(body)
+    }
+}
+
+/// Prefetches only first pages of cache misses in an already-funded batch.
+/// Callers pass at most BODY_PREFETCH_BATCH requests, after Synopsis pruning.
+/// Cached bodies are shared; a miss retains one page until its ordered visit.
+pub(super) async fn prefetch_bodies<T: ReadOps>(
+    txn: &mut ReadLogicalTxn<'_, T>,
+    cache: &PartitionCache,
+    manifest: &IndexManifest,
+    requests: &[BodyRequest<'_>],
+) -> Result<Vec<BodyRead>> {
+    let mut reads = requests
+        .iter()
+        .map(|request| BodyRead::start(cache, manifest, request))
+        .collect::<Result<Vec<_>>>()?;
+    let legs: Vec<_> = reads
+        .iter()
+        .filter_map(|read| match read {
+            BodyRead::Cached(_) => None,
+            BodyRead::Scan(scan) => Some((&scan.range, None)),
+        })
+        .collect();
+    if legs.is_empty() {
+        return Ok(reads);
+    }
+    let pages = if legs.len() == 1 {
+        vec![txn.scan(legs[0].0, None, BODY_SCAN_LIMITS).await?]
+    } else {
+        txn.batch_scan(&legs, BODY_SCAN_LIMITS).await?
+    };
+    let slots = reads.iter_mut().filter_map(|read| match read {
+        BodyRead::Cached(_) => None,
+        BodyRead::Scan(scan) => Some(&mut scan.first_page),
+    });
+    for (slot, page) in slots.zip(pages) {
+        *slot = Some(page);
+    }
+    Ok(reads)
+}
+
 /// Loads one partition's decoded search body, validated against the snapshot
 /// Header and cached under its cache epoch.
 ///
@@ -572,59 +738,17 @@ pub(super) async fn load_body<T: ReadOps>(
     partition: PartitionKey,
     header: &PartitionHeader,
 ) -> Result<Arc<CachedBody>> {
-    let index = manifest.logical_index_id();
-    let kind = PartitionKind::from_level(header.level());
-    let key = CacheKey::new(index, tree_key.clone(), partition, kind);
-    if let Some(body) = cache.lookup(&key, header.cache_epoch()) {
-        return Ok(body);
-    }
-
-    let range = match kind {
-        PartitionKind::Leaf => LogicalRange::leaf_entries(manifest, tree_key, partition),
-        PartitionKind::Internal => LogicalRange::child_entries(manifest, tree_key, partition),
-    }?;
-
-    let mut leaf_entries: Vec<CachedLeafEntry> = Vec::new();
-    let mut child_entries: Vec<ChildEntry> = Vec::new();
-    let mut bytes = size_of::<CachedBody>() as u64;
-    let mut cursor: Option<LogicalScanCursor> = None;
-    loop {
-        let page = txn.scan(&range, cursor.as_ref(), BODY_SCAN_LIMITS).await?;
-        cursor = page.next_cursor().cloned();
-        for item in page.into_items() {
-            match (kind, item.into_value()) {
-                (PartitionKind::Leaf, PersistentValue::LeafEntry(entry)) => {
-                    let entry = CachedLeafEntry::from_leaf(entry, manifest.config().dimension());
-                    bytes = bytes.saturating_add(leaf_entry_bytes(&entry));
-                    leaf_entries.push(entry);
-                }
-                (PartitionKind::Internal, PersistentValue::ChildEntry(entry)) => {
-                    bytes = bytes.saturating_add(child_entry_bytes(&entry));
-                    child_entries.push(entry);
-                }
-                _ => return Err(Error::new(ErrorKind::Corruption)),
-            }
-        }
-        if cursor.is_none() {
-            break;
-        }
-    }
-    let entry_count = leaf_entries.len() + child_entries.len();
-    if entry_count != header.entry_count() as usize {
-        return Err(Error::new(ErrorKind::Corruption));
-    }
-
-    let entries = match kind {
-        PartitionKind::Leaf => BodyEntries::Leaf(leaf_entries.into_boxed_slice()),
-        PartitionKind::Internal => BodyEntries::Internal(child_entries.into_boxed_slice()),
-    };
-    let body = Arc::new(CachedBody {
-        epoch: header.cache_epoch(),
-        bytes,
-        entries,
-    });
-    cache.install(key, Arc::clone(&body));
-    Ok(body)
+    BodyRead::start(
+        cache,
+        manifest,
+        &BodyRequest {
+            tree_key,
+            partition,
+            header,
+        },
+    )?
+    .finish(txn, cache, manifest)
+    .await
 }
 
 /// The accounted decoded size of one Leaf Entry: the envelope, the Record ID
@@ -1033,6 +1157,114 @@ mod tests {
         )
         .await?;
         Ok((body, txn.into_raw()))
+    }
+
+    #[tokio::test]
+    async fn prefetch_reads_only_misses_and_streams_continuations_in_order() {
+        let manifest = manifest();
+        let cache = PartitionCache::new(1 << 20);
+        cache.install(
+            key(1, PartitionKind::Leaf),
+            cached_leaf_body(11, &[b"cached"]),
+        );
+        let mut data = BTreeMap::new();
+        let ids: Vec<_> = (0_u32..300).map(|id| id.to_be_bytes()).collect();
+        for id in &ids {
+            let (key, value) = leaf_item(&manifest, 2, id);
+            data.insert(key, value);
+        }
+        let (key, value) = leaf_item(&manifest, 3, b"last");
+        data.insert(key, value);
+        let headers = [1, 300, 1].map(|count| {
+            PartitionHeader::new(1, count, 11, PartitionState::Ready).expect("header")
+        });
+        let tree = tree_key();
+        let requests: Vec<_> = headers
+            .iter()
+            .enumerate()
+            .map(|(i, header)| super::BodyRequest {
+                tree_key: &tree,
+                partition: pk(i as u64 + 1),
+                header,
+            })
+            .collect();
+        let mut txn = ReadLogicalTxn::for_index(mock_txn(data), &manifest);
+        let reads = super::prefetch_bodies(&mut txn, &cache, &manifest, &requests)
+            .await
+            .expect("prefetch");
+        assert_eq!(cache.len(), 1, "incomplete reads must not be installed");
+        let mut bodies = Vec::new();
+        for read in reads {
+            bodies.push(
+                read.finish(&mut txn, &cache, &manifest)
+                    .await
+                    .expect("finish"),
+            );
+        }
+        assert_eq!(leaf_ids(&bodies[0]), vec![Bytes::from_static(b"cached")]);
+        assert_eq!(
+            leaf_ids(&bodies[1]),
+            ids.iter()
+                .map(|id| Bytes::copy_from_slice(id))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(leaf_ids(&bodies[2]), vec![Bytes::from_static(b"last")]);
+        let reads = super::prefetch_bodies(&mut txn, &cache, &manifest, &requests)
+            .await
+            .expect("warm reads");
+        assert!(
+            reads
+                .iter()
+                .all(|read| matches!(read, super::BodyRead::Cached(_)))
+        );
+        let raw = txn.into_raw();
+        assert_eq!(
+            raw.batch_scan_sizes,
+            vec![2],
+            "only cache misses are batched"
+        );
+        assert_eq!(raw.scans, 3, "two prefetched pages and one continuation");
+        assert_eq!(cache.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn corruption_after_a_prefetched_page_is_not_cached() {
+        let manifest = manifest();
+        let cache = PartitionCache::new(1 << 20);
+        let mut data = BTreeMap::new();
+        for id in 0_u32..257 {
+            let (key, mut value) = leaf_item(&manifest, 1, &id.to_be_bytes());
+            if id == 256 {
+                value = vec![0xff];
+            }
+            data.insert(key, value);
+        }
+        let headers = [257, 0].map(|count| {
+            PartitionHeader::new(1, count, 11, PartitionState::Ready).expect("header")
+        });
+        let tree = tree_key();
+        let requests: Vec<_> = headers
+            .iter()
+            .enumerate()
+            .map(|(i, header)| super::BodyRequest {
+                tree_key: &tree,
+                partition: pk(i as u64 + 1),
+                header,
+            })
+            .collect();
+        let mut txn = ReadLogicalTxn::for_index(mock_txn(data), &manifest);
+        let reads = super::prefetch_bodies(&mut txn, &cache, &manifest, &requests)
+            .await
+            .expect("first pages are valid");
+        let first = reads.into_iter().next().expect("first body");
+        let error = first
+            .finish(&mut txn, &cache, &manifest)
+            .await
+            .err()
+            .expect("corrupt continuation");
+        assert_eq!(error.kind(), ErrorKind::Corruption);
+        assert_eq!(cache.len(), 0);
+        assert_eq!(txn.into_raw().scans, 3);
     }
 
     #[tokio::test]

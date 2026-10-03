@@ -36,6 +36,8 @@ pub(crate) struct MockReadTxn {
     pub(crate) batch_sizes: Vec<usize>,
     /// The number of scans performed.
     pub(crate) scans: usize,
+    /// Number of ranges submitted in each batched scan.
+    pub(crate) batch_scan_sizes: Vec<usize>,
     /// The maximum number of keys one batched get accepts.
     pub(crate) max_batch_size: usize,
     scans_fail: bool,
@@ -50,6 +52,7 @@ impl MockReadTxn {
             gets: 0,
             batch_sizes: Vec::new(),
             scans: 0,
+            batch_scan_sizes: Vec::new(),
             max_batch_size: 10_000,
             scans_fail: false,
             batch_gets_fail: false,
@@ -135,6 +138,7 @@ impl ReadOps for MockReadTxn {
         ranges: &[KeyRange],
         limits: ScanLimits,
     ) -> Result<Vec<ScanPage>> {
+        self.batch_scan_sizes.push(ranges.len());
         let mut pages = Vec::with_capacity(ranges.len());
         for range in ranges {
             pages.push(self.scan(range, limits).await?);
