@@ -285,7 +285,7 @@ pub async fn drain_batch<B: Backend>(
         manifest,
         tree_key,
         source,
-        Some(source_header),
+        source_header,
         topology::Movement::Split,
         backend.admission_budget(),
     )

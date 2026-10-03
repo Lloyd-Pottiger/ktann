@@ -172,7 +172,7 @@ pub async fn drain_batch<B: Backend>(
             manifest,
             tree_key,
             source,
-            Some(source_header),
+            source_header,
             topology::Movement::Merge,
             backend.admission_budget(),
         )
@@ -436,7 +436,7 @@ async fn drain_attempt<T: WriteTxn>(
                     .kernel
                     .preprocess(candidate.record().vector())
                     .map_err(|_| Error::new(ErrorKind::Corruption))?;
-                let target = routing::nearest_ready_candidate(
+                let (_, target) = routing::nearest_ready_candidate(
                     &plan.kernel,
                     &routing,
                     source,
@@ -444,9 +444,8 @@ async fn drain_attempt<T: WriteTxn>(
                 )?
                 // The read phase proved at least one Ready candidate, and the
                 // plan's fixed candidate set cannot shrink inside the attempt.
-                .ok_or_else(|| Error::new(ErrorKind::Backend))?
-                .partition();
-                moves.push((candidate, target));
+                .ok_or_else(|| Error::new(ErrorKind::Backend))?;
+                moves.push((candidate, target.partition()));
             }
             if !revalidate_targets(txn, tree_key, level, &moves).await? {
                 return Ok(Attempt::Reselect);
@@ -459,15 +458,14 @@ async fn drain_attempt<T: WriteTxn>(
                 topology::read_child_drain_candidates(txn, tree_key, source, children).await?;
             let mut moves = Vec::new();
             for entry in candidates.into_iter().flatten() {
-                let target = routing::nearest_ready_candidate(
+                let (_, target) = routing::nearest_ready_candidate(
                     &plan.kernel,
                     entry.centroid(),
                     source,
                     &plan.candidates,
                 )?
-                .ok_or_else(|| Error::new(ErrorKind::Backend))?
-                .partition();
-                moves.push((entry, target));
+                .ok_or_else(|| Error::new(ErrorKind::Backend))?;
+                moves.push((entry, target.partition()));
             }
             if !revalidate_targets(txn, tree_key, level, &moves).await? {
                 return Ok(Attempt::Reselect);

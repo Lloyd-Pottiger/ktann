@@ -50,7 +50,7 @@ impl CompiledPredicate {
             })
             .collect();
         Ok(Self {
-            expression: CompiledExpression::compile(predicate)?,
+            expression: CompiledExpression::compile(predicate),
             field_count: fields.len(),
             referenced_fields,
         })
@@ -171,11 +171,11 @@ enum CompiledExpression {
 
 impl CompiledExpression {
     /// Converts an already validated public AST without changing its shape.
-    fn compile(predicate: Predicate) -> Result<Self> {
-        Ok(match predicate {
-            Predicate::And(children) => Self::And(Self::compile_children(children)?),
-            Predicate::Or(children) => Self::Or(Self::compile_children(children)?),
-            Predicate::Not(child) => Self::Not(Box::new(Self::compile(*child)?)),
+    fn compile(predicate: Predicate) -> Self {
+        match predicate {
+            Predicate::And(children) => Self::And(Self::compile_children(children)),
+            Predicate::Or(children) => Self::Or(Self::compile_children(children)),
+            Predicate::Not(child) => Self::Not(Box::new(Self::compile(*child))),
             Predicate::Compare { field, op, value } => Self::Compare {
                 field: usize::from(field.0),
                 op,
@@ -183,19 +183,15 @@ impl CompiledExpression {
             },
             Predicate::In { field, values } => Self::In {
                 field: usize::from(field.0),
-                values: CompiledIn::compile(values)?,
+                values: CompiledIn::compile(values),
             },
             Predicate::IsNull(field) => Self::IsNull(usize::from(field.0)),
             Predicate::IsNotNull(field) => Self::IsNotNull(usize::from(field.0)),
-        })
+        }
     }
 
-    fn compile_children(children: Vec<Predicate>) -> Result<Box<[Self]>> {
-        Ok(children
-            .into_iter()
-            .map(Self::compile)
-            .collect::<Result<Vec<_>>>()?
-            .into_boxed_slice())
+    fn compile_children(children: Vec<Predicate>) -> Box<[Self]> {
+        children.into_iter().map(Self::compile).collect()
     }
 
     /// Evaluates one node with the SQL three-valued truth tables.
@@ -292,23 +288,13 @@ impl CompiledExpression {
 struct CompiledIn(Box<[Value]>);
 
 impl CompiledIn {
-    fn compile(mut values: Vec<Value>) -> Result<Self> {
-        let Some(first) = values.first() else {
-            return Ok(Self(values.into_boxed_slice()));
-        };
-        if matches!(first, Value::Null)
-            || values
-                .iter()
-                .skip(1)
-                .any(|value| typed_order(first, value).is_none())
-        {
-            return Err(Error::invalid_argument());
-        }
+    /// Sorts and deduplicates IN values validated at predicate compilation.
+    fn compile(mut values: Vec<Value>) -> Self {
         values.sort_unstable_by(|left, right| {
             typed_order(left, right).expect("validated IN values share one scalar domain")
         });
         values.dedup_by(|left, right| typed_order(left, right) == Some(Ordering::Equal));
-        Ok(Self(values.into_boxed_slice()))
+        Self(values.into_boxed_slice())
     }
 
     fn evaluate(&self, stored: &Value) -> Result<TruthValue> {

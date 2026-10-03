@@ -112,14 +112,11 @@ impl IndexManifest {
     ///
     /// All immutable identity, configuration, and derived codec fields are
     /// retained exactly. Callers use this only for lifecycle transitions.
-    pub fn with_lifecycle(&self, lifecycle: IndexLifecycle) -> Result<Self> {
-        Self::new(
-            lifecycle,
-            self.logical_index_id,
-            self.config.clone(),
-            self.rotation_seed,
-            self.bloom_parameters.to_vec(),
-        )
+    #[must_use]
+    pub fn with_lifecycle(&self, lifecycle: IndexLifecycle) -> Self {
+        let mut manifest = self.clone();
+        manifest.lifecycle = lifecycle;
+        manifest
     }
 
     /// Returns the owned Logical Index ID.

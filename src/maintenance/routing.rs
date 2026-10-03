@@ -445,7 +445,7 @@ async fn descend<R: LogicalReader>(
                 left,
                 right,
             } => {
-                let target = nearer_redirect_target(kernel, routing, &left, &right)?;
+                let (_, target) = nearer_redirect_target(kernel, routing, &left, &right)?;
                 return Ok(Route {
                     leaf: target.partition,
                     leaf_header: target.header,
@@ -475,7 +475,7 @@ async fn descend<R: LogicalReader>(
                 partition = source;
             }
             Hop::MergeReroute { level, candidates } => {
-                let Some(candidate) =
+                let Some((_, candidate)) =
                     nearest_ready_candidate(kernel, routing, partition, &candidates)?
                 else {
                     // No Ready same-level target exists while the source is
@@ -716,12 +716,8 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                     right,
                 } => {
                     for member in members {
-                        let target =
+                        let (distance, target) =
                             nearer_redirect_target(kernel, routings[member.member], &left, &right)?;
-                        let distance = kernel.routing_distance(
-                            routings[member.member],
-                            target.centroid.components(),
-                        )?;
                         consider_write_route(
                             &mut routes,
                             member.member,
@@ -771,7 +767,7 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                 }
                 Hop::MergeReroute { level, candidates } => {
                     for member in members {
-                        let Some(candidate) = nearest_ready_candidate(
+                        let Some((distance, candidate)) = nearest_ready_candidate(
                             kernel,
                             routings[member.member],
                             partition,
@@ -780,8 +776,6 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                         else {
                             return Ok(GroupedDescent::NoReadyMergeTarget);
                         };
-                        let distance = kernel
-                            .routing_distance(routings[member.member], candidate.centroid())?;
                         if level == 1 {
                             consider_write_route(
                                 &mut routes,
@@ -1175,7 +1169,8 @@ async fn drain_redirect<R: LogicalReader>(
     })
 }
 
-/// Chooses the nearer of one draining leaf's two persisted targets.
+/// Chooses the nearer of one draining leaf's two persisted targets, returning
+/// its routing distance with the target.
 ///
 /// The persisted target centroids are routing models learned at exposure;
 /// exact movement, not centroid freshness, preserves membership (ADR 0014).
@@ -1184,7 +1179,7 @@ fn nearer_redirect_target<'a>(
     routing: &[f32],
     left: &'a DrainTarget,
     right: &'a DrainTarget,
-) -> Result<&'a DrainTarget> {
+) -> Result<(f64, &'a DrainTarget)> {
     let left_distance = kernel.routing_distance(routing, left.centroid.components())?;
     let right_distance = kernel.routing_distance(routing, right.centroid.components())?;
     Ok(
@@ -1195,9 +1190,9 @@ fn nearer_redirect_target<'a>(
             right_distance,
         ) == left.partition
         {
-            left
+            (left_distance, left)
         } else {
-            right
+            (right_distance, right)
         },
     )
 }
@@ -1444,6 +1439,7 @@ pub(crate) fn nearer_of_two(
 /// `Ready` candidate other than the source, nearer routing distance first
 /// with the Partition Key tie-break — ADR 0008's canonical reselection rule,
 /// shared by the merge drain and the write descent's merge redirect.
+/// Returns the selected routing distance with the candidate.
 ///
 /// Persisted candidate centroids are routing models, so kernel errors here
 /// are fail-closed Corruption rather than caller error.
@@ -1452,7 +1448,7 @@ pub(crate) fn nearest_ready_candidate<'c>(
     routing: &[f32],
     source: PartitionKey,
     candidates: &'c [topology::LevelCandidate],
-) -> Result<Option<&'c topology::LevelCandidate>> {
+) -> Result<Option<(f64, &'c topology::LevelCandidate)>> {
     let mut best: Option<(f64, PartitionKey, &topology::LevelCandidate)> = None;
     for candidate in candidates {
         if !candidate.is_legal_merge_target(source) {
@@ -1474,7 +1470,7 @@ pub(crate) fn nearest_ready_candidate<'c>(
             best = Some((distance, candidate.partition(), candidate));
         }
     }
-    Ok(best.map(|(_, _, candidate)| candidate))
+    Ok(best.map(|(distance, _, candidate)| (distance, candidate)))
 }
 
 /// Builds the page bounds for a Child Entry scan during descent.

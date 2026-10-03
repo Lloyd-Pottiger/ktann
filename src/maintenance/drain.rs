@@ -106,18 +106,17 @@ pub(crate) async fn read_drain_batch<T: ReadOps>(
 /// Fixes one drain batch from the read snapshot: the source's current
 /// smallest entries, or `None` when the exact count is already zero.
 ///
-/// A missing Header alongside a present State, and an exact count that
-/// disagrees with the scanned entry set, are Corruption.
+/// The caller supplies the Header from a validated authority pair. An exact
+/// count that disagrees with the scanned entry set is Corruption.
 pub(crate) async fn next_drain_batch<T: ReadOps>(
     txn: &mut ReadLogicalTxn<'_, T>,
     manifest: &IndexManifest,
     tree_key: &TreeKey,
     source: PartitionKey,
-    source_header: Option<PartitionHeader>,
+    header: PartitionHeader,
     movement: Movement,
     budget: AdmissionBudget,
 ) -> Result<Option<DrainBatch>> {
-    let header = source_header.ok_or_else(|| Error::new(ErrorKind::Corruption))?;
     if header.entry_count() == 0 {
         return Ok(None);
     }
