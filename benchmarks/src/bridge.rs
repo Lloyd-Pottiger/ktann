@@ -528,9 +528,16 @@ impl<B: Backend> Service<B> {
                             ),
                         ));
                     }
+                    let probe_due = last_progress.elapsed() >= Duration::from_secs(5)
+                        && last_probe.is_none_or(|at| at.elapsed() >= Duration::from_secs(30));
                     let snapshot = tokio::time::timeout_at(
                         tokio::time::Instant::from_std(deadline),
-                        topology::snapshot(&self.backend, index.logical_index_id(), records),
+                        topology::snapshot(
+                            &self.backend,
+                            index.logical_index_id(),
+                            records,
+                            probe_due,
+                        ),
                     )
                     .await
                     .map_err(|_| {
@@ -558,9 +565,7 @@ impl<B: Backend> Service<B> {
                         previous_progress = Some(snapshot.progress);
                         last_progress = Instant::now();
                     }
-                    if last_progress.elapsed() >= Duration::from_secs(5)
-                        && last_probe.is_none_or(|at| at.elapsed() >= Duration::from_secs(30))
-                    {
+                    if probe_due && last_progress.elapsed() >= Duration::from_secs(5) {
                         last_probe = Some(Instant::now());
                         let root_probe = state
                             .root_probe

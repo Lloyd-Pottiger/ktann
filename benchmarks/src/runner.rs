@@ -526,9 +526,8 @@ fn runtime_config(
     spec: &ScenarioSpec,
     maintenance_workers: usize,
 ) -> Result<RuntimeConfig, String> {
-    // The Fixup queue retains the default capacity so the default Import
-    // Session backlog watermark remains within it. RuntimeConfig validates
-    // those two process-local resource bounds together at Runtime creation.
+    // Large imports need the default Fixup queue capacity to accommodate
+    // their Import Session backlog watermark.
     let defaults = RuntimeConfig::default();
     let fixup_queue_capacity = if spec.profile == "large" {
         defaults.fixup_queue_capacity()
@@ -669,9 +668,7 @@ async fn run_lifecycle_case<B: Backend>(
         maintenance_drain_seconds,
     };
 
-    // A new Runtime is the public, deterministic cache-reset boundary. It
-    // preserves the stable persistent topology while ensuring the following
-    // query pass starts with an empty process-local Partition Cache.
+    // Reopening the Runtime starts the cold search with an empty Partition Cache.
     let reset_started = Instant::now();
     let reset_resources_before = ResourceSnapshot::capture()?;
     let reset_backend_before = backend_counters.snapshot();
@@ -722,10 +719,7 @@ async fn run_lifecycle_case<B: Backend>(
         .duration_since(case_baseline.started)
         .as_secs_f64();
     let case_resources_after = stable_warm.resources_after;
-    let case_backend_io = stable_warm
-        .backend_after
-        .checked_sub(&case_baseline.backend_io)
-        .ok_or_else(|| "continuous Backend counters decreased".to_owned())?;
+    let case_backend_io = subtract(stable_warm.backend_after, &case_baseline.backend_io);
     let stable_warm_search = stable_warm.phase;
     search_runtime
         .shutdown()
@@ -810,46 +804,26 @@ fn mutation_batches(
     phase: &str,
 ) -> Result<Vec<Vec<Mutation>>, String> {
     dataset
-        .base
+        .ids
         .chunks(batch_size)
-        .enumerate()
-        .map(|(batch, vectors)| {
-            let start = batch
-                .checked_mul(batch_size)
-                .ok_or_else(|| "import record ordinal overflow".to_owned())?;
-            mutation_batch(
-                dataset,
-                vectors,
-                start,
-                &[Value::I64(0), Value::I64(0)],
-                phase,
-            )
-        })
+        .zip(dataset.base.chunks(batch_size))
+        .map(|(ids, vectors)| mutation_batch(ids, vectors, &[Value::I64(0), Value::I64(0)], phase))
         .collect()
 }
 
 /// Builds one bounded batch of insert mutations from aligned dataset rows.
 fn mutation_batch(
-    dataset: &BenchmarkDataset,
+    ids: &[Bytes],
     vectors: &[Arc<[f32]>],
-    start: usize,
     fields: &[Value],
     phase: &str,
 ) -> Result<Vec<Mutation>, String> {
-    vectors
-        .iter()
-        .enumerate()
-        .map(|(offset, vector)| {
-            let ordinal = start
-                .checked_add(offset)
-                .ok_or_else(|| "load record ordinal overflow".to_owned())?;
-            Record::new(
-                dataset.ids[ordinal].clone(),
-                Arc::clone(vector),
-                fields.to_vec(),
-            )
-            .map(Mutation::Insert)
-            .map_err(|error| error_at(phase, error))
+    ids.iter()
+        .zip(vectors)
+        .map(|(id, vector)| {
+            Record::new(id.clone(), Arc::clone(vector), fields.to_vec())
+                .map(Mutation::Insert)
+                .map_err(|error| error_at(phase, error))
         })
         .collect()
 }
@@ -1005,9 +979,7 @@ async fn run_search_phase<B: Backend>(
     let wall_seconds = completed_at.duration_since(started).as_secs_f64();
     let resources_after = ResourceSnapshot::capture()?;
     let backend_after = backend_counters.snapshot();
-    let backend_io = backend_after
-        .checked_sub(&backend_before)
-        .ok_or_else(|| "phase Backend counters decreased".to_owned())?;
+    let backend_io = subtract(backend_after.clone(), &backend_before);
     let metrics = metric_capture.snapshot();
     let attempted = u64::try_from(requests.len()).map_err(|_| "query count overflow")?;
     let accepted = u64::try_from(outcomes.len()).map_err(|_| "query count overflow")?;
@@ -1156,9 +1128,8 @@ async fn run_quality_sweep<B: Backend>(
             topology.max_level, topology.partitions, topology.partitions_by_level
         ));
     }
-    // Compute truth while the imported vectors are still available. Bounded
-    // diagnostic datasets deliberately discard supplied full-corpus truth, so
-    // this also preserves exact truth for the selected base/query subset.
+    // Compute exact truth before releasing the base vectors, including
+    // bounded subsets whose full-corpus ground truth no longer applies.
     let truth = exact_truth(dataset, spec.metric, spec.k);
     // Release the imported million-vector corpus before measuring search.
     dataset.ids = Vec::new();
@@ -1336,8 +1307,7 @@ async fn measure_steady_workload<B: Backend>(
         execute_items(index.clone(), warmup, spec.concurrency, spec.dispatch).await?;
     phase_completed(spec, &warmup_phase, warmup_started);
 
-    // Reset setup counters and histograms before the measured interval. Gauges
-    // retain current process state and need no compatibility fallback.
+    // Reset setup counters and histograms; gauges retain current process state.
     let _ = metric_capture.snapshot();
     wait_for_maintenance(metric_capture, settle_timeout(spec)).await?;
     let backend_before = backend_counters.snapshot();
@@ -1541,11 +1511,12 @@ async fn load_index<B: Backend>(
     } else {
         vec![Value::I64(0), Value::I64(0)]
     };
-    for (batch, vectors) in dataset.base.chunks(batch_size).enumerate() {
-        let start = batch
-            .checked_mul(batch_size)
-            .ok_or_else(|| "load record ordinal overflow".to_owned())?;
-        let mutations = mutation_batch(dataset, vectors, start, &fields, "construct load record")?;
+    for (ids, vectors) in dataset
+        .ids
+        .chunks(batch_size)
+        .zip(dataset.base.chunks(batch_size))
+    {
+        let mutations = mutation_batch(ids, vectors, &fields, "construct load record")?;
         if let Some(import) = import.as_mut() {
             import
                 .submit(mutations)
@@ -1943,8 +1914,6 @@ async fn execute_continuous<B: Backend>(
     while let Some(result) = tasks.join_next().await {
         let observation = result.map_err(|error| format!("workload task failed: {error}"))?;
         aggregate.push(observation);
-        // Replenish on each completion rather than waiting for the slowest
-        // operation in a wave, so admission sees sustained client pressure.
         if let Some(item) = items.next() {
             let index = index.clone();
             tasks.spawn(async move { execute_item(&index, item).await });

@@ -49,59 +49,89 @@ where
     }
 }
 
+/// Suite selection and output destination.
 #[derive(Clone, Debug)]
-/// User-selected suite inputs retained across isolated worker launches.
 struct RunOptions {
-    /// Production Backend measured by every selected scenario.
-    backend: String,
-    /// Named scale and dataset matrix.
     profile: String,
-    /// Optional stable scenario key; absence selects the complete profile.
     scenario: Option<String>,
-    /// Atomic JSON destination; absence writes the suite to stdout.
     output: Option<PathBuf>,
-    /// Tokio execution threads created independently in every worker.
+    execution: ExecutionOptions,
+}
+
+/// Inputs for one isolated scenario process.
+#[derive(Clone, Debug)]
+struct WorkerOptions {
+    profile: String,
+    scenario: String,
+    reproduction_command: String,
+    execution: ExecutionOptions,
+}
+
+/// Execution settings shared by the suite and its scenario workers.
+#[derive(Clone, Debug)]
+struct ExecutionOptions {
+    backend: String,
     worker_threads: usize,
-    /// Optional override for the import/write routing beam.
     write_beam_size: Option<u32>,
-    /// Optional indexed-vector limit for large diagnostic runs.
     base_vectors: Option<usize>,
-    /// Optional held-out-query limit for large diagnostic runs.
     query_vectors: Option<usize>,
-    /// Optional held-out-query window start for large diagnostic runs.
     query_offset: Option<usize>,
-    /// Optional maximum partition size override.
     max_partition_entries: Option<u32>,
-    /// Diagnostic overrides for the import lifecycle scenario.
     lifecycle: LifecycleOverrides,
 }
 
-#[derive(Clone, Debug)]
-/// Internal arguments passed to exactly one fresh scenario process.
-struct WorkerOptions {
-    /// Production Backend selected by the parent process.
-    backend: String,
-    /// Named scale matrix containing the requested scenario.
-    profile: String,
-    /// Stable scenario key executed by this worker alone.
-    scenario: String,
-    /// Public parent command stored in the report, not the hidden worker call.
-    reproduction_command: String,
-    /// Tokio execution threads for the isolated worker runtime.
-    worker_threads: usize,
-    /// Optional override for the import/write routing beam.
-    write_beam_size: Option<u32>,
-    /// Optional indexed-vector limit for large diagnostic runs.
-    base_vectors: Option<usize>,
-    /// Optional held-out-query limit for large diagnostic runs.
-    query_vectors: Option<usize>,
-    /// Optional held-out-query window start for large diagnostic runs.
-    query_offset: Option<usize>,
-    /// Optional maximum partition size override.
-    max_partition_entries: Option<u32>,
-    /// Diagnostic overrides for the import lifecycle scenario.
-    lifecycle: LifecycleOverrides,
+impl ExecutionOptions {
+    fn parse(values: &BTreeMap<String, String>) -> Result<Self, String> {
+        let backend = required(values, "backend")?;
+        if backend != "rocksdb" && backend != "foundationdb" {
+            return Err("--backend must be rocksdb or foundationdb".to_owned());
+        }
+        Ok(Self {
+            backend,
+            worker_threads: match values.get("worker-threads") {
+                Some(value) => parse_positive(value, "worker-threads")?,
+                None => default_worker_threads(),
+            },
+            write_beam_size: values
+                .get("write-beam-size")
+                .map(|value| parse_positive_u32(value, "write-beam-size"))
+                .transpose()?,
+            base_vectors: values
+                .get("base-vectors")
+                .map(|value| parse_positive(value, "base-vectors"))
+                .transpose()?,
+            query_vectors: values
+                .get("query-vectors")
+                .map(|value| parse_positive(value, "query-vectors"))
+                .transpose()?,
+            query_offset: values
+                .get("query-offset")
+                .map(|value| parse_nonnegative(value, "query-offset"))
+                .transpose()?,
+            max_partition_entries: values
+                .get("max-partition-entries")
+                .map(|value| parse_positive_u32(value, "max-partition-entries"))
+                .transpose()?,
+            lifecycle: LifecycleOverrides::parse(values)?,
+        })
+    }
 }
+
+const SCENARIO_OPTIONS: &[&str] = &[
+    "backend",
+    "profile",
+    "scenario",
+    "worker-threads",
+    "write-beam-size",
+    "base-vectors",
+    "query-vectors",
+    "query-offset",
+    "max-partition-entries",
+    "maintenance-workers",
+    "import-max-in-flight-batches",
+    "import-batch-size",
+    "import-backlog-watermark",
+];
 
 /// Optional diagnostic bounds applied to the selected scenario.
 #[derive(Clone, Debug, Default)]
@@ -157,79 +187,25 @@ impl LifecycleOverrides {
     }
 }
 
+/// Report paths and comparison thresholds.
 #[derive(Clone, Debug)]
-/// Inputs and materiality thresholds for one report comparison.
 struct CompareOptions {
-    /// Previously accepted versioned suite.
     baseline: PathBuf,
-    /// Newly measured versioned suite.
     candidate: PathBuf,
-    /// Structured result destination; absence writes to stdout.
     output: Option<PathBuf>,
-    /// Fractional ceiling for worsening cost metrics, for example `0.20`.
-    maximum_relative_regression: f64,
-    /// Absolute ceiling for recall@k loss.
-    maximum_recall_drop: f64,
-    /// Absolute ceiling for an admission-rejection rate increase.
-    maximum_rejection_rate_increase: f64,
+    policy: ComparisonPolicy,
 }
 
 /// Validates public suite options at the process boundary.
 fn parse_run_options(arguments: &[OsString]) -> Result<RunOptions, String> {
-    let values = option_map(
-        arguments,
-        &[
-            "backend",
-            "profile",
-            "scenario",
-            "output",
-            "worker-threads",
-            "write-beam-size",
-            "base-vectors",
-            "query-vectors",
-            "query-offset",
-            "max-partition-entries",
-            "maintenance-workers",
-            "import-max-in-flight-batches",
-            "import-batch-size",
-            "import-backlog-watermark",
-        ],
-    )?;
-    let backend = required(&values, "backend")?;
-    if backend != "rocksdb" && backend != "foundationdb" {
-        return Err("--backend must be rocksdb or foundationdb".to_owned());
-    }
+    let values = option_map(arguments, &[SCENARIO_OPTIONS, &["output"]].concat())?;
     let profile = values
         .get("profile")
         .cloned()
         .unwrap_or_else(|| "smoke".to_owned());
-    let worker_threads = match values.get("worker-threads") {
-        Some(value) => parse_positive(value, "worker-threads")?,
-        None => default_worker_threads(),
-    };
     let scenario = values.get("scenario").cloned();
-    let write_beam_size = values
-        .get("write-beam-size")
-        .map(|value| parse_positive_u32(value, "write-beam-size"))
-        .transpose()?;
-    let base_vectors = values
-        .get("base-vectors")
-        .map(|value| parse_positive(value, "base-vectors"))
-        .transpose()?;
-    let query_vectors = values
-        .get("query-vectors")
-        .map(|value| parse_positive(value, "query-vectors"))
-        .transpose()?;
-    let query_offset = values
-        .get("query-offset")
-        .map(|value| parse_nonnegative(value, "query-offset"))
-        .transpose()?;
-    let max_partition_entries = values
-        .get("max-partition-entries")
-        .map(|value| parse_positive_u32(value, "max-partition-entries"))
-        .transpose()?;
-    let lifecycle = LifecycleOverrides::parse(&values)?;
-    if !lifecycle.is_empty()
+    let execution = ExecutionOptions::parse(&values)?;
+    if !execution.lifecycle.is_empty()
         && profile != "large"
         && scenario.as_deref() != Some(IMPORT_LIFECYCLE_SCENARIO)
     {
@@ -238,71 +214,24 @@ fn parse_run_options(arguments: &[OsString]) -> Result<RunOptions, String> {
         ));
     }
     Ok(RunOptions {
-        backend,
         profile,
         scenario,
         output: values.get("output").map(PathBuf::from),
-        worker_threads,
-        write_beam_size,
-        base_vectors,
-        query_vectors,
-        query_offset,
-        max_partition_entries,
-        lifecycle,
+        execution,
     })
 }
 
-/// Validates the hidden single-scenario worker contract.
+/// Parses the internal worker command using the same execution settings.
 fn parse_worker_options(arguments: &[OsString]) -> Result<WorkerOptions, String> {
     let values = option_map(
         arguments,
-        &[
-            "backend",
-            "profile",
-            "scenario",
-            "reproduction-command",
-            "worker-threads",
-            "write-beam-size",
-            "base-vectors",
-            "query-vectors",
-            "query-offset",
-            "max-partition-entries",
-            "maintenance-workers",
-            "import-max-in-flight-batches",
-            "import-batch-size",
-            "import-backlog-watermark",
-        ],
+        &[SCENARIO_OPTIONS, &["reproduction-command"]].concat(),
     )?;
     Ok(WorkerOptions {
-        backend: required(&values, "backend")?,
         profile: required(&values, "profile")?,
         scenario: required(&values, "scenario")?,
         reproduction_command: required(&values, "reproduction-command")?,
-        worker_threads: match values.get("worker-threads") {
-            Some(value) => parse_positive(value, "worker-threads")?,
-            None => default_worker_threads(),
-        },
-        write_beam_size: values
-            .get("write-beam-size")
-            .map(|value| parse_positive_u32(value, "write-beam-size"))
-            .transpose()?,
-        base_vectors: values
-            .get("base-vectors")
-            .map(|value| parse_positive(value, "base-vectors"))
-            .transpose()?,
-        query_vectors: values
-            .get("query-vectors")
-            .map(|value| parse_positive(value, "query-vectors"))
-            .transpose()?,
-        query_offset: values
-            .get("query-offset")
-            .map(|value| parse_nonnegative(value, "query-offset"))
-            .transpose()?,
-        max_partition_entries: values
-            .get("max-partition-entries")
-            .map(|value| parse_positive_u32(value, "max-partition-entries"))
-            .transpose()?,
-        lifecycle: LifecycleOverrides::parse(&values)?,
+        execution: ExecutionOptions::parse(&values)?,
     })
 }
 
@@ -339,9 +268,11 @@ fn parse_compare_options(arguments: &[OsString]) -> Result<CompareOptions, Strin
         baseline: PathBuf::from(required(&values, "baseline")?),
         candidate: PathBuf::from(required(&values, "candidate")?),
         output: values.get("output").map(PathBuf::from),
-        maximum_relative_regression,
-        maximum_recall_drop,
-        maximum_rejection_rate_increase,
+        policy: ComparisonPolicy {
+            maximum_relative_regression,
+            maximum_recall_drop,
+            maximum_rejection_rate_increase,
+        },
     })
 }
 
@@ -453,21 +384,36 @@ fn run_suite(options: RunOptions) -> Result<(), String> {
         let mut command = Command::new(&executable);
         command
             .arg("__worker")
-            .args(["--backend", &options.backend])
+            .args(["--backend", &options.execution.backend])
             .args(["--profile", &options.profile])
             .args(["--scenario", scenario.name])
             .args(["--reproduction-command", &reproduction_command])
-            .args(["--worker-threads", &options.worker_threads.to_string()])
+            .args([
+                "--worker-threads",
+                &options.execution.worker_threads.to_string(),
+            ])
             .stderr(Stdio::inherit());
-        let lifecycle = &options.lifecycle;
+        let lifecycle = &options.execution.lifecycle;
         for (name, value) in [
-            ("write-beam-size", option_string(options.write_beam_size)),
-            ("base-vectors", option_string(options.base_vectors)),
-            ("query-vectors", option_string(options.query_vectors)),
-            ("query-offset", option_string(options.query_offset)),
+            (
+                "write-beam-size",
+                option_string(options.execution.write_beam_size),
+            ),
+            (
+                "base-vectors",
+                option_string(options.execution.base_vectors),
+            ),
+            (
+                "query-vectors",
+                option_string(options.execution.query_vectors),
+            ),
+            (
+                "query-offset",
+                option_string(options.execution.query_offset),
+            ),
             (
                 "max-partition-entries",
-                option_string(options.max_partition_entries),
+                option_string(options.execution.max_partition_entries),
             ),
             (
                 "maintenance-workers",
@@ -514,24 +460,24 @@ fn run_worker(options: WorkerOptions) -> Result<(), String> {
         .into_iter()
         .find(|scenario| scenario.name == options.scenario)
         .ok_or_else(|| format!("unknown scenario `{}`", options.scenario))?;
-    options.lifecycle.apply(&mut scenario);
-    if let Some(write_beam_size) = options.write_beam_size {
+    options.execution.lifecycle.apply(&mut scenario);
+    if let Some(write_beam_size) = options.execution.write_beam_size {
         scenario.write_beam_size = write_beam_size;
     }
-    if let Some(base_vectors) = options.base_vectors {
+    if let Some(base_vectors) = options.execution.base_vectors {
         scenario.base_vectors = base_vectors;
     }
-    if let Some(query_vectors) = options.query_vectors {
+    if let Some(query_vectors) = options.execution.query_vectors {
         scenario.query_vectors = query_vectors;
     }
-    if let Some(query_offset) = options.query_offset {
+    if let Some(query_offset) = options.execution.query_offset {
         scenario.query_offset = query_offset;
     }
-    if let Some(max_partition_entries) = options.max_partition_entries {
+    if let Some(max_partition_entries) = options.execution.max_partition_entries {
         scenario.max_partition_entries = max_partition_entries;
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(options.worker_threads)
+        .worker_threads(options.execution.worker_threads)
         .enable_all()
         .build()
         .map_err(|error| format!("build Tokio runtime: {error}"))?;
@@ -546,10 +492,10 @@ async fn run_backend(
     options: &WorkerOptions,
     scenario: &ScenarioSpec,
 ) -> Result<BenchmarkReport, String> {
-    match options.backend.as_str() {
+    match options.execution.backend.as_str() {
         "rocksdb" => run_rocksdb(options, scenario).await,
         "foundationdb" => run_foundationdb(options, scenario).await,
-        _ => Err(format!("unknown backend `{}`", options.backend)),
+        _ => Err(format!("unknown backend `{}`", options.execution.backend)),
     }
 }
 
@@ -596,7 +542,7 @@ async fn run_rocksdb(
         backend,
         &effective_scenario,
         options.reproduction_command.clone(),
-        options.worker_threads,
+        options.execution.worker_threads,
     )
     .await?;
     Ok(report)
@@ -644,7 +590,7 @@ async fn run_foundationdb(
         backend,
         scenario,
         options.reproduction_command.clone(),
-        options.worker_threads,
+        options.execution.worker_threads,
     )
     .await;
 
@@ -759,15 +705,7 @@ async fn run_foundationdb(
 fn compare_reports(options: CompareOptions) -> Result<(), String> {
     let baseline: BenchmarkSuite = read_json(&options.baseline)?;
     let candidate: BenchmarkSuite = read_json(&options.candidate)?;
-    let comparison = compare::compare(
-        &baseline,
-        &candidate,
-        ComparisonPolicy {
-            maximum_relative_regression: options.maximum_relative_regression,
-            maximum_recall_drop: options.maximum_recall_drop,
-            maximum_rejection_rate_increase: options.maximum_rejection_rate_increase,
-        },
-    )?;
+    let comparison = compare::compare(&baseline, &candidate, options.policy)?;
     write_json(options.output.as_deref(), &comparison)?;
     if comparison.failed() {
         Err("material benchmark regressions detected".to_owned())
@@ -858,10 +796,10 @@ mod tests {
         ]
         .map(std::ffi::OsString::from);
         let options = parse_run_options(&arguments).expect("valid lifecycle overrides");
-        assert_eq!(options.lifecycle.maintenance_workers, Some(0));
-        assert_eq!(options.lifecycle.max_in_flight_batches, Some(4));
-        assert_eq!(options.lifecycle.batch_size, Some(25));
-        assert_eq!(options.lifecycle.backlog_watermark, Some(1));
+        assert_eq!(options.execution.lifecycle.maintenance_workers, Some(0));
+        assert_eq!(options.execution.lifecycle.max_in_flight_batches, Some(4));
+        assert_eq!(options.execution.lifecycle.batch_size, Some(25));
+        assert_eq!(options.execution.lifecycle.backlog_watermark, Some(1));
     }
 
     #[test]
@@ -887,7 +825,7 @@ mod tests {
         .map(std::ffi::OsString::from);
         let options = parse_run_options(&arguments).expect("large diagnostic override");
         assert_eq!(options.profile, "large");
-        assert_eq!(options.lifecycle.maintenance_workers, Some(0));
+        assert_eq!(options.execution.lifecycle.maintenance_workers, Some(0));
     }
 
     #[test]
@@ -924,9 +862,9 @@ mod tests {
         ]
         .map(std::ffi::OsString::from);
         let options = parse_compare_options(&arguments).expect("documented options");
-        assert_eq!(options.maximum_relative_regression, 0.10);
-        assert_eq!(options.maximum_recall_drop, 0.01);
-        assert_eq!(options.maximum_rejection_rate_increase, 0.03);
+        assert_eq!(options.policy.maximum_relative_regression, 0.10);
+        assert_eq!(options.policy.maximum_recall_drop, 0.01);
+        assert_eq!(options.policy.maximum_rejection_rate_increase, 0.03);
     }
 
     #[test]
