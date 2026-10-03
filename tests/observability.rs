@@ -1,4 +1,4 @@
-//! Privacy-safe metrics and tracing audits (issue #36).
+//! Privacy-safe metrics and tracing audits.
 //!
 //! These tests drive the public API on the deterministic backend with
 //! canary-shaped sensitive data through success, failure, corruption, retry,

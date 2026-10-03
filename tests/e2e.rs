@@ -1,4 +1,4 @@
-//! The data-driven integration corpus runner (issue #94).
+//! The data-driven integration corpus runner.
 //!
 //! Executes every block of every `tests/datadriven/*.kddt` file against the
 //! public Runtime/Index API on the deterministic backend, and diffs the
@@ -68,11 +68,10 @@
 //!   the output to one tree, keeping its ordinal in directory order.
 //! - `drop-index` — drops the index.
 //!
-//! The split and merge directives drive the #10/#31 state machines explicitly
-//! (foreground mutations never trigger structural maintenance on their own in
-//! the current build), so corpus files decide the exact interleaving of
-//! topology transitions, foreground mutations, and searches: every committed
-//! intermediate state stays searchable and auditable.
+//! The split and merge directives drive the state machines explicitly.
+//! Background maintenance workers are disabled so corpus files control the
+//! interleaving of topology transitions, foreground mutations, and searches.
+//! Every committed intermediate state stays searchable and auditable.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -952,7 +951,7 @@ impl Harness {
     /// (empty) `tree=V` tree — including in-flight split/merge intermediate
     /// states — directly from the annotated text, so corpus files can
     /// construct states that are tedious to reach by driving the state
-    /// machines (issue #100, item C2). Installed states are byte-equivalent
+    /// machines. Installed states are byte-equivalent
     /// to what the state machines persist; later directives drive them
     /// exactly like state-machine output.
     async fn load_index(&mut self, directive: &Directive) -> String {
@@ -1559,7 +1558,7 @@ fn fill_fields(
             match schema.data_type() {
                 DataType::I64 => Value::I64(ordinal as i64),
                 DataType::F64 => Value::f64(ordinal as f64 + 0.5).expect("finite"),
-                DataType::Bool => Value::Bool(ordinal % 2 == 0),
+                DataType::Bool => Value::Bool(ordinal.is_multiple_of(2)),
                 DataType::String => Value::string(format!("s{ordinal:06}")).expect("string"),
                 _ => unreachable!("supported field types"),
             }

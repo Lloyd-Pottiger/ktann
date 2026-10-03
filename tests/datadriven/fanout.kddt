@@ -59,7 +59,7 @@ usage: scanned_tree_keys=2 visited_partitions=2 visited_leaf_entries=1000 exact_
 exhausted: scanned_tree_keys
 truncated: rabitq_overlap
 
-# --- Cross-tree isolation (issue #100, item D2) ---
+# --- Cross-tree isolation ---
 # Churn on trees 2..4 — splits, merges, inserts, upserts, deletes — must
 # leave tree 1 byte-identical, in structure and in content. The two
 # format-tree snapshots and the two filtered searches below are the

@@ -113,7 +113,7 @@ fn record_values_are_adjacent_and_ordered_by_record_id() {
 
     assert!(keys.is_sorted());
 
-    for (record_id, group) in record_ids.iter().zip(keys.chunks_exact(3)) {
+    for (record_id, group) in record_ids.iter().zip(keys.as_chunks::<3>().0.iter()) {
         assert!(matches!(
             decode_key(&[], &Bytes::copy_from_slice(&group[0])).expect("decode Record"),
             LogicalKey::Record { id, .. } if id == *record_id

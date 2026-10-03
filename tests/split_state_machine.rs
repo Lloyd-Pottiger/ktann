@@ -1,4 +1,4 @@
-//! Searchable split state machine contract tests (#10).
+//! Searchable split state machine contract tests.
 //!
 //! Every committed split phase must stay searchable and preserve exact
 //! membership; moves atomically update target/source state and Record
@@ -312,10 +312,10 @@ async fn root_leaf_split_runs_end_to_end_and_stays_searchable() {
             .expect("entry");
         // The upsert re-encoded r0's vector; every other entry moved with
         // its absolute RaBitQ7 payload copied verbatim.
-        if id != &rid(0) {
-            if let Some(before_entry) = before.get(id) {
-                assert_eq!(&entry, before_entry, "RaBitQ7 payload copied verbatim");
-            }
+        if id != &rid(0)
+            && let Some(before_entry) = before.get(id)
+        {
+            assert_eq!(&entry, before_entry, "RaBitQ7 payload copied verbatim");
         }
     }
     // The drain moved every snapshotted source entry except the upsert's
@@ -936,7 +936,7 @@ async fn advance_converges_a_split_whose_source_shrank_to_one_entry() {
     assert_searchable(&backend, &manifest, &key, remaining).await;
 
     // Exposure trains on the shrunken snapshot; the machine must advance on
-    // this valid persistent state instead of reporting Corruption (#113).
+    // this valid persistent state instead of reporting Corruption.
     let outcomes = drive_split_to_completion(&backend, &manifest, &key, pk(1)).await;
     assert!(matches!(outcomes.last(), Some(Advance::Completed { .. })));
     assert_searchable(&backend, &manifest, &key, remaining).await;
@@ -971,7 +971,7 @@ async fn advance_converges_a_split_whose_source_emptied_out() {
     assert_searchable(&backend, &manifest, &key, &[]).await;
 
     // An empty Splitting source trains two zero centroids, drains nothing,
-    // and completes through the ordinary zero-count completion (#113).
+    // and completes through the ordinary zero-count completion.
     let outcomes = drive_split_to_completion(&backend, &manifest, &key, pk(1)).await;
     assert!(matches!(outcomes.last(), Some(Advance::Completed { .. })));
     assert_searchable(&backend, &manifest, &key, &[]).await;

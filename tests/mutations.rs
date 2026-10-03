@@ -1093,8 +1093,8 @@ async fn batched_inserts_share_routing_and_apply_writes_once() {
     let backend = backend(DeterministicConfig::default());
     // Exact backend operation counts are incompatible with background fixup
     // workers: the 43 inserts over-fill both seeded leaves, and a worker that
-    // wakes inside the counted window adds its own reads (flaky on stable CI
-    // since #102). This test drives no maintenance, so it runs workerless.
+    // wakes inside the counted window adds its own reads. This test measures
+    // foreground work only, so it runs without maintenance workers.
     let runtime = Runtime::new(backend.clone(), support::manual_maintenance_config())
         .expect("runtime is valid");
     let index = runtime

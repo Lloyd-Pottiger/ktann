@@ -1,10 +1,10 @@
-//! Public bounded search operation contract tests (issue #30).
+//! Public bounded search operation contract tests.
 //!
 //! Every test drives the public `Index::search` API against the deterministic
 //! in-memory backend. Hits are compared with a brute-force exact-distance
 //! oracle; budget usage, exhaustion flags, and overlap truncation are asserted
 //! per dimension. Intermediate topology states are hand-installed through the
-//! public storage API because the split state machines (#10) do not exist yet.
+//! public storage API to isolate search behavior from maintenance scheduling.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -788,7 +788,7 @@ async fn inconsistent_persistent_state_fails_closed() {
 }
 
 /// One Record ID reachable from two partitions at once — the leftover state
-/// of a failed update in the reference corpus (issue #100, item A4). Where
+/// of a failed update in the reference corpus. Where
 /// CockroachDB dedupes and reranks the true distance, KTANN fails closed: a
 /// duplicate Record ID in one snapshot is Corruption, never silently
 /// deduplicated (design search.md section 6).

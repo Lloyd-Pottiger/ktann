@@ -2,14 +2,13 @@
 
 ## Project Sources of Truth
 
-KTANN is in active implementation with no stable release. Do not add backward
+KTANN has no stable release. Do not add backward
 compatibility machinery unless the task explicitly requires it. Read `README.md`
-for project status; verify available APIs and behavior in code because parts of
-the design are not yet implemented.
+for project status; verify available APIs and behavior against the code.
 
 - `CONTEXT.md`: canonical domain language and system-wide invariants.
 - `docs/design/overview.md`: product boundary, authoritative invariants, target
-  architecture, end-to-end behavior, and implementation order.
+  architecture, end-to-end behavior, and validation.
 - `docs/design/`: detailed contracts for the public API, storage, search,
   maintenance, and runtime/operations modules.
 - `docs/adr/`: accepted architectural decisions and their rationale. Add an ADR
@@ -20,6 +19,10 @@ Any local `refwiki/` material is background reading, not an authoritative KTANN
 contract. Do not edit or depend on it unless the task explicitly requires it.
 
 ## Commands
+
+`make help` lists convenient targets. Default Makefile targets exclude the
+FoundationDB package; `make verify-all` includes every package and feature and
+requires its native client library. `make test-fdb` also needs a local cluster.
 
 - Build: `cargo build --workspace`
 - Test: `cargo test --workspace`
@@ -34,8 +37,8 @@ across crates. For documentation-only changes, check accuracy, links, and the
 diff; Cargo checks are unnecessary. After relevant checks pass, broaden testing
 only for unresolved risks or failures. Report what ran and any verification gaps.
 Never run Cargo commands concurrently: they contend on Cargo and target-directory
-locks. Use Rust Edition 2024, MSRV 1.85, and stable CI; no nightly-only production
-features.
+locks. Use Rust Edition 2024 and the latest stable toolchain in development and CI.
+Production code uses no nightly features.
 
 ## Workflow Principles
 
@@ -45,9 +48,8 @@ features.
   effects before editing.
 - Use the domain terms from `CONTEXT.md` exactly. Do not introduce synonyms
   such as "table" for Logical Index or "partition key" for Tree Key.
-- Implement in the dependency order in the overview unless the task establishes
-  a smaller self-contained vertical slice. Do not add placeholder abstractions
-  for later stages.
+- Keep changes self-contained and runnable. Do not add placeholder abstractions
+  for hypothetical future features.
 - Keep each responsibility at its documented owner: logical codecs and atomic
   index operations in core storage; backend limits and error classification in
   the adapters; lifecycle and admission behavior in runtime/operations.

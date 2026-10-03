@@ -180,24 +180,19 @@ _Avoid_: Transaction ID, durable job ID
 - A **Search Outcome** may vary with searchable topology shape and Search Budget even when exact membership is unchanged
 - A filtered search returns at most its requested number of **Vector Records** within its **Search Budget**
 
-## Example dialogue
+## Contract clarifications
 
-> **Dev:** "Can a split delay a Foreground Mutation?"
-> **Domain expert:** "The Foreground Mutation may retry on a topology conflict, but the Structure Maintenance itself is asynchronous and every committed state remains searchable."
->
-> **Dev:** "What happens if a Fixup Worker crashes and nobody accesses that partition?"
-> **Domain expert:** "The partition remains searchable in its durable intermediate state; Demand-Driven Maintenance resumes only after a relevant future access."
->
-> **Dev:** "Can Import Admission use the partition count as its concurrency?"
-> **Domain expert:** "No. Partition count does not reveal writable independence; use observed contention and the Fixup Backlog, then validate the resulting topology and search quality."
-
-## Flagged ambiguities
-
-- "前台写入/后台写入" blurred ordinary data mutation with topology work; resolved as **Foreground Mutation** versus **Structure Maintenance**, with import remaining a scheduler of the former.
-- "max partition entries" suggested a synchronous hard bound; resolved as the **Split Threshold**, which triggers asynchronous Structure Maintenance.
-- "原始数据" was ambiguous between an engine-owned record and a host business row; resolved as the engine-owned **Vector Record**.
-- "pre-filter" was ambiguous between pruning and exact filtering; resolved as an exact **Filter Predicate** aided by conservative **Partition Synopses**.
-- "forest" was ambiguous between independent namespaces, disjoint shards, and replicated recall trees; resolved as a **Sharded Forest** of disjoint records.
-- "payload" was ambiguous with the source value; resolved as the optional **Opaque Payload**, separate from searchable Vector Record fields.
-- Value ownership was ambiguous between user-defined bytes and an engine schema; resolved: KTANN defines and versions the canonical **Vector Record** format.
-- "Maintenance Owner" suggested a persistent coordinator; resolved: structure maintenance has no global owner or lease.
+- Foreground Mutations change records atomically; Structure Maintenance changes
+  topology asynchronously. Import Sessions schedule ordinary Foreground Mutations.
+- The Split Threshold triggers maintenance; it is not a synchronous hard bound
+  on partition size. A mutation can retry after a topology conflict.
+- Every committed intermediate topology remains searchable. After a worker
+  stops, maintenance resumes when a relevant access discovers pending work.
+- Import Admission uses observed contention and the Fixup Backlog. Partition
+  count alone does not establish independent write capacity.
+- A Vector Record is owned and encoded by KTANN, not a host application's
+  business row. An Opaque Payload is separate from searchable fields.
+- Exact Filter Predicates determine which hits qualify. Conservative Partition
+  Synopses only prune work and never replace exact filtering.
+- A Sharded Forest contains disjoint records, not replicated recall trees.
+- Structure Maintenance requires no global owner or lease.

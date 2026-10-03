@@ -478,8 +478,10 @@ fn read_fvecs(path: &Path, dimension: usize, limit: usize) -> Result<Vec<Arc<[f3
             .map_err(|error| format!("read {}: {error}", path.display()))?;
         vectors.push(
             bytes
-                .chunks_exact(4)
-                .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte chunk")))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| f32::from_le_bytes(*bytes))
                 .collect(),
         );
     }

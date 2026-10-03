@@ -1,7 +1,5 @@
 # Public API, Configuration, and Errors
 
-Status: Implementation-ready
-
 This module owns KTANN's caller-visible Rust contract. Storage representation,
 search internals, and maintenance states are defined by their own modules.
 

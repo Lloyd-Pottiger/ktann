@@ -1,4 +1,4 @@
-//! Deterministic binary K-means split training contract tests (#83).
+//! Deterministic binary K-means split training contract tests.
 
 use bytes::Bytes;
 use ktann::api::{
@@ -259,7 +259,7 @@ async fn a_missing_source_header_is_corruption() {
 async fn an_empty_leaf_source_trains_zero_centroids() {
     // Foreground deletes may legally empty a Splitting source before exposure
     // (ADR 0014); training must still emit a deterministic pair so the split
-    // can advance (#113).
+    // can advance.
     let backend = DeterministicBackend::default();
     let manifest = manifest();
     let key = tree_key(1);

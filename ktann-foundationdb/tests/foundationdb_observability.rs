@@ -1,4 +1,4 @@
-//! FoundationDB adapter metric assertions (issue #36), gated on a local
+//! FoundationDB adapter metric assertions, gated on a local
 //! FoundationDB 7.3 cluster like the rest of the adapter integration suite.
 
 use bytes::Bytes;

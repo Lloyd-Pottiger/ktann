@@ -1,4 +1,4 @@
-//! Replayable crash-history and model-validation coverage (issue #37): one
+//! Replayable crash-history and model-validation coverage: one
 //! seeded script drives the public API through lifecycle transitions, atomic
 //! Foreground Mutations (some armed with commit faults), manually advanced
 //! split/merge Structure Maintenance, queue loss via crash/reopen, unknown
@@ -225,7 +225,7 @@ fn generate_script(seed: u64, steps: usize) -> Vec<Step> {
         // so the single tree repeatedly crosses the split threshold in
         // growth phases and the merge threshold in shrink phases instead of
         // settling at one steady topology.
-        let growth = script.len() / PHASE_STEPS % 2 == 0;
+        let growth = (script.len() / PHASE_STEPS).is_multiple_of(2);
         let step = match rng.below(100) {
             0..=42 => Step::Mutate {
                 mutation: draw_mutation(&mut rng, growth),

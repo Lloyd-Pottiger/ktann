@@ -1,4 +1,4 @@
-//! The `load-index` corpus directive's fixture installer (issue #100, item C2).
+//! The `load-index` corpus directive's fixture installer.
 //!
 //! A `load-index` block annotates one tree's exact persistent topology in
 //! `format-tree` shape — partition lines nested by two-space indentation, leaf

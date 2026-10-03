@@ -1,7 +1,5 @@
 # Filtering and Approximate Search
 
-Status: Implementation-ready
-
 This module owns vector numeric semantics, persistent RaBitQ7 codes, Tree Key
 query planning, predicate evaluation and synopses, bounded traversal, exact
 reranking, and cache correctness.

@@ -459,10 +459,10 @@ fn validate_key_identity(
     value: &PersistentValue,
     manifest: Option<&IndexManifest>,
 ) -> Result<()> {
-    if let (Some(expected), Some(actual)) = (manifest, key.index()) {
-        if expected.logical_index_id() != actual {
-            return Err(corrupt());
-        }
+    if let (Some(expected), Some(actual)) = (manifest, key.index())
+        && expected.logical_index_id() != actual
+    {
+        return Err(corrupt());
     }
     match (key, value) {
         (LogicalKey::Manifest(expected), PersistentValue::IndexManifest(actual))

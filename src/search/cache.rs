@@ -463,11 +463,11 @@ impl CacheInner {
         evicted: &mut Vec<Arc<CachedBody>>,
     ) {
         while self.small_bytes + self.main_bytes > capacity_bytes {
-            if self.small_bytes > small_capacity_bytes {
-                if let Some(key) = self.pop_live(QueueKind::Small) {
-                    self.evict_small_front(key, evicted);
-                    continue;
-                }
+            if self.small_bytes > small_capacity_bytes
+                && let Some(key) = self.pop_live(QueueKind::Small)
+            {
+                self.evict_small_front(key, evicted);
+                continue;
             }
             if let Some(key) = self.pop_live(QueueKind::Main) {
                 self.evict_main_front(key, evicted);
@@ -917,7 +917,7 @@ mod tests {
                     let partition = u64::from(state % 4 + 1);
                     let epoch = u64::from(state % 8 + 1);
                     let key = key(partition, PartitionKind::Leaf);
-                    if state % 2 == 0 {
+                    if state.is_multiple_of(2) {
                         if let Some(hit) = cache.lookup(&key, epoch) {
                             assert_eq!(hit.epoch(), epoch);
                         }

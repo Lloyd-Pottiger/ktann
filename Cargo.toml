@@ -3,9 +3,9 @@ members = ["benchmarks", "ktann-foundationdb", "ktann-rocksdb"]
 resolver = "3"
 
 [workspace.package]
+license = "MIT"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
 repository = "https://github.com/Lloyd-Pottiger/ktann"
 
 [workspace.lints.rust]
@@ -16,8 +16,8 @@ unsafe_code = "forbid"
 name = "ktann"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 repository.workspace = true
+license.workspace = true
 description = "K-means Tree Approximate Nearest Neighbor library"
 
 [lib]

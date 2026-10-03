@@ -1,4 +1,4 @@
-//! Metric recording contract tests (issue #100, item C3).
+//! Metric recording contract tests.
 //!
 //! `observability.rs` audits that captured telemetry never leaks caller data;
 //! this suite asserts the other side: the documented `ktann.*` series (design

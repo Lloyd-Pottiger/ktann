@@ -230,7 +230,7 @@ fn update_vector(hasher: &mut Xxh3, vector: &[f32]) {
     hasher.update(&(vector.len() as u64).to_le_bytes());
     let mut encoded = [0_u8; 4_096];
     for components in vector.chunks(encoded.len() / size_of::<f32>()) {
-        for (bytes, component) in encoded.chunks_exact_mut(4).zip(components) {
+        for (bytes, component) in encoded.as_chunks_mut::<4>().0.iter_mut().zip(components) {
             bytes.copy_from_slice(&component.to_bits().to_le_bytes());
         }
         hasher.update(&encoded[..size_of_val(components)]);

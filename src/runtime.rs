@@ -327,10 +327,10 @@ impl CancelBeforeCommit {
 
 impl Drop for CancelBeforeCommit {
     fn drop(&mut self) {
-        if let Some(task) = self.task.take() {
-            if self.commit_cancellation.cancel() {
-                task.abort();
-            }
+        if let Some(task) = self.task.take()
+            && self.commit_cancellation.cancel()
+        {
+            task.abort();
         }
     }
 }

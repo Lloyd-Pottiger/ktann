@@ -531,19 +531,16 @@ impl TreeWalk {
             }
             if let (Some(parent_summary), Some(child_summary)) =
                 (self.partitions.get(parent), self.partitions.get(child))
-            {
-                if let (Some(parent_level), Some(child_level)) =
+                && let (Some(parent_level), Some(child_level)) =
                     (parent_summary.level, child_summary.level)
-                {
-                    if parent_level != child_level.saturating_add(1) {
-                        cx.issue(
-                            VerifyIssueKind::Membership,
-                            Some(tree_key),
-                            Some(*parent),
-                            None,
-                        );
-                    }
-                }
+                && parent_level != child_level.saturating_add(1)
+            {
+                cx.issue(
+                    VerifyIssueKind::Membership,
+                    Some(tree_key),
+                    Some(*parent),
+                    None,
+                );
             }
             match incoming.entry(*child) {
                 Entry::Occupied(_) => {
@@ -651,15 +648,14 @@ impl TreeWalk {
                                 }
                                 if let (Some(target_level), Some(source_level)) =
                                     (target_summary.level, summary.level)
+                                    && target_level != source_level
                                 {
-                                    if target_level != source_level {
-                                        cx.issue(
-                                            VerifyIssueKind::Reachability,
-                                            Some(tree_key),
-                                            Some(*partition),
-                                            None,
-                                        );
-                                    }
+                                    cx.issue(
+                                        VerifyIssueKind::Reachability,
+                                        Some(tree_key),
+                                        Some(*partition),
+                                        None,
+                                    );
                                 }
                             }
                             // A Splitting target may be reserved but not yet
@@ -695,14 +691,13 @@ impl TreeWalk {
                 .partitions
                 .get(&partition)
                 .and_then(|summary| summary.transition)
+                && let Some((left, right)) = split_targets(transition)
             {
-                if let Some((left, right)) = split_targets(transition) {
-                    if self.partitions.contains_key(&left) {
-                        stack.push(left);
-                    }
-                    if self.partitions.contains_key(&right) {
-                        stack.push(right);
-                    }
+                if self.partitions.contains_key(&left) {
+                    stack.push(left);
+                }
+                if self.partitions.contains_key(&right) {
+                    stack.push(right);
                 }
             }
         }
@@ -762,15 +757,14 @@ fn conservative(
                 return false;
             }
         }
-        if let (Some(stored_bloom), Some(recomputed_bloom)) = (stored.bloom(), recomputed.bloom()) {
-            if stored_bloom.len() != recomputed_bloom.len()
+        if let (Some(stored_bloom), Some(recomputed_bloom)) = (stored.bloom(), recomputed.bloom())
+            && (stored_bloom.len() != recomputed_bloom.len()
                 || stored_bloom
                     .iter()
                     .zip(recomputed_bloom.iter())
-                    .any(|(stored, recomputed)| *recomputed & !*stored != 0)
-            {
-                return false;
-            }
+                    .any(|(stored, recomputed)| *recomputed & !*stored != 0))
+        {
+            return false;
         }
     }
     true

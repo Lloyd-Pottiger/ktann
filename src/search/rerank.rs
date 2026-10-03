@@ -2,7 +2,7 @@
 //! reranking.
 //!
 //! This module owns the search pipeline's filter and rerank stage (design
-//! `search.md` steps 4, 6, and 7). Traversal (#9) supplies Leaf Candidates in
+//! `search.md` steps 4, 6, and 7). Traversal supplies Leaf Candidates in
 //! per-leaf selections for global overlap selection; exact predicate filtering
 //! keeps only
 //! SQL TRUE entries; exact reranking batch-loads the original Vector Records
@@ -99,7 +99,7 @@ impl From<LeafCandidate> for ApproximateCandidate<LeafCandidate> {
 
 /// The exact-rerank stage's hits and its owned Search Budget accounting.
 ///
-/// The traversal/search integration (#9, #30) folds the usage counter into
+/// The traversal/search integration folds the usage counter into
 /// `SearchBudgetUsage::exact_rerank_candidates` and the exhaustion flag into
 /// `SearchBudgetExhaustion::exact_rerank_candidates`.
 pub(crate) struct ExactRerankOutcome {

@@ -1,4 +1,4 @@
-//! Recall parity on the embedded RocksDB backend (issue #100): the public
+//! Recall parity on the embedded RocksDB backend: the public
 //! Runtime/Index API over the real adapter meets the recall contract the
 //! deterministic-backend corpus pins, including across an orderly close and
 //! reopen of the database path.

@@ -1,4 +1,4 @@
-//! Bounded maintenance scheduling contract tests (#32).
+//! Bounded maintenance scheduling contract tests.
 //!
 //! The Runtime's process-local Fixup queue drives split and merge work units
 //! discovered by ordinary mutations and searches. These tests prove the

@@ -758,7 +758,7 @@ async fn a_splitting_leaf_root_still_accepts_writes() {
 }
 
 #[tokio::test]
-async fn a_merging_partition_is_corruption_until_merge_exists() {
+async fn a_merging_root_is_corruption() {
     let backend = DeterministicBackend::default();
     let manifest = manifest();
     let key = tree_key(1);
@@ -770,8 +770,8 @@ async fn a_merging_partition_is_corruption_until_merge_exists() {
             .expect("create");
         txn.commit().await.expect("commit");
     }
-    // Merging is unreachable before the merge state machine (#31); routing
-    // fails closed rather than guessing at a traversal rule.
+    // The root cannot enter Merging; only non-root partitions can merge.
+    // Routing rejects this invalid persistent topology.
     write_topology(
         &backend,
         &manifest,
@@ -794,7 +794,7 @@ async fn a_merging_partition_is_corruption_until_merge_exists() {
 
     let error = route_leaf(&mut read_txn(&backend, &manifest).await, &key, &[1.0])
         .await
-        .expect_err("merging is unreachable");
+        .expect_err("a root cannot merge");
     assert_eq!(error.kind(), ErrorKind::Corruption);
 }
 

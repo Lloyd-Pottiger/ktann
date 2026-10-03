@@ -36,7 +36,7 @@ curl --fail --location --continue-at - \
 
 VectorDBBench's `sift_small_500k` object set has train/test files but declares
 `with_gt = false` and publishes no `neighbors.parquet`; it therefore cannot
-satisfy issue #126's supplied-ground-truth requirement. The L2 curve uses the
+satisfy the supplied-ground-truth requirement. The L2 curve uses the
 original TexMex SIFT1M corpus mirrored at the fixed
 `qbo-odp/sift1m@bd8ccad6c2a0a0a3a7519f6d37c0e5a2d59fe55b` revision. The
 mirror preserves the original `fvecs`/`ivecs` files and publishes their SHA-256

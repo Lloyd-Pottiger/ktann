@@ -2,8 +2,8 @@
 name = "ktann-foundationdb"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 repository.workspace = true
+license.workspace = true
 description = "FoundationDB storage adapter for KTANN"
 readme = "README.md"
 

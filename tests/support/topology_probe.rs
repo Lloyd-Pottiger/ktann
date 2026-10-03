@@ -582,15 +582,13 @@ pub async fn all_partitions(
         let Some(header) = header_of(backend, manifest, key, partition).await else {
             continue;
         };
-        if let Some(state) = state_of(backend, manifest, key, partition).await {
-            if partition == pk(1) {
-                if let PartitionTransition::Splitting { left, right, .. }
-                | PartitionTransition::DrainingSplit { left, right, .. } = state
-                {
-                    frontier.push(left);
-                    frontier.push(right);
-                }
-            }
+        if let Some(state) = state_of(backend, manifest, key, partition).await
+            && partition == pk(1)
+            && let PartitionTransition::Splitting { left, right, .. }
+            | PartitionTransition::DrainingSplit { left, right, .. } = state
+        {
+            frontier.push(left);
+            frontier.push(right);
         }
         if header.level() > 1 {
             for entry in scan_child_entries(backend, manifest, key, partition).await {

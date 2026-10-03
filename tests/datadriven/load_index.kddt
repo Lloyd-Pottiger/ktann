@@ -1,6 +1,6 @@
 # ----------------------------------------------------------------------
 # load-index: exact persistent topologies installed from annotated
-# format-tree-shaped text (issue #100, item C2), including in-flight
+# format-tree-shaped text, including in-flight
 # split/merge intermediate states that are tedious to reach by driving the
 # state machines. Installed states are byte-equivalent to state-machine
 # output, so split-step/merge-step/search/validate/format-tree all drive them

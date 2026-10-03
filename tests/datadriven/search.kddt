@@ -2,7 +2,7 @@
 # Bounded search over a clustered dataset: exact hits, budget accounting,
 # predicate filtering, and truncation reporting. Later sections cover ties
 # and duplicates at the k boundary, empty trees and partitions, and the
-# same scenario under every metric (issue #100, items A3/A5).
+# same scenario under every metric.
 # ----------------------------------------------------------------------
 new-index dimension=8 metric=L2 fields=bucket:i64,score:f64? tree-key-fields=0 min-entries=8 max-entries=32
 ----

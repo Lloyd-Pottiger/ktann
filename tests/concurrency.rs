@@ -1,4 +1,4 @@
-//! Seeded interleaving end-to-end coverage (issue #100, item D1), in the
+//! Seeded interleaving end-to-end coverage, in the
 //! spirit of CockroachDB vecindex's `TestIndexConcurrency`: several async
 //! tasks run public-API mutations and searches against one shared Index while
 //! a concurrent driver task advances the split/merge state machines, and the

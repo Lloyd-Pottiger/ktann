@@ -1,7 +1,5 @@
 # Runtime, Import, Observability, and Verification
 
-Status: Implementation-ready
-
 This module owns process-local admission and lifecycle, maintenance scheduling,
 Import Sessions, observability/privacy, offline verification behavior, and the
 whole-system validation matrix.

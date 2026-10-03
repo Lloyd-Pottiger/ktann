@@ -2,8 +2,8 @@
 name = "ktann-benchmarks"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 repository.workspace = true
+license.workspace = true
 publish = false
 description = "Reproducible whole-system performance baselines for KTANN"
 
