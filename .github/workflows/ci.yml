@@ -14,42 +14,36 @@ env:
 
 jobs:
   test:
-    name: Test (${{ matrix.toolchain }})
+    name: Test (stable)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        toolchain: [1.85.0, stable]
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
-        run: rustup toolchain install "${{ matrix.toolchain }}" --profile minimal
+        run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@v2
         with:
           # GitHub caches are immutable, so build-mode changes need a fresh key
           # before later steps can contribute their artifacts.
-          shared-key: test-${{ matrix.toolchain }}-complete-build-modes-v1
+          shared-key: test-stable-complete-build-modes-v1
       - name: Install FoundationDB client
         run: .github/scripts/setup-foundationdb.sh client
       - name: Test workspace
-        run: cargo +"${{ matrix.toolchain }}" test --workspace --all-targets
+        run: cargo +stable test --workspace --all-targets
       - name: Check public documentation
         env:
           RUSTDOCFLAGS: -Dwarnings
         run: >-
-          cargo +"${{ matrix.toolchain }}" doc --workspace --all-features
+          cargo +stable doc --workspace --all-features
           --no-deps
       - name: Remove generated documentation before cache cleanup
         # rust-cache mistakes rustdoc source directories named tests for build artifacts.
-        run: cargo +"${{ matrix.toolchain }}" clean --doc
+        run: cargo +stable clean --doc
       - name: Run RocksDB benchmark smoke profile including lifecycle
-        if: matrix.toolchain == 'stable'
         run: >-
           cargo +stable run -p ktann-benchmarks --bin ktann-bench --
           run --backend rocksdb --profile smoke --worker-threads 2
           --output "${{ runner.temp }}/rocksdb-smoke.json"
       - name: Upload RocksDB benchmark smoke report
-        if: matrix.toolchain == 'stable'
         uses: actions/upload-artifact@v4
         with:
           name: rocksdb-smoke
@@ -59,14 +53,14 @@ jobs:
           KTANN_ROCKSDB_DURABILITY_PHASE: write
           KTANN_ROCKSDB_DURABILITY_PATH: ${{ runner.temp }}/ktann-rocksdb-durability
         run: >-
-          cargo +"${{ matrix.toolchain }}" test -p ktann-rocksdb
+          cargo +stable test -p ktann-rocksdb
           --test rocksdb_durability -- --ignored
       - name: Verify RocksDB durability probe in a fresh process
         env:
           KTANN_ROCKSDB_DURABILITY_PHASE: verify
           KTANN_ROCKSDB_DURABILITY_PATH: ${{ runner.temp }}/ktann-rocksdb-durability
         run: >-
-          cargo +"${{ matrix.toolchain }}" test -p ktann-rocksdb
+          cargo +stable test -p ktann-rocksdb
           --test rocksdb_durability -- --ignored
 
   foundationdb:

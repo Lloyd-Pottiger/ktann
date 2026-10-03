@@ -917,8 +917,7 @@ fn min_value(ty: DataType) -> Value {
     }
 }
 
-/// The next representable finite f64, computed with explicit bit arithmetic
-/// so the planner stays on MSRV 1.85 without `f64::next_up`.
+/// The next representable finite f64, with zero canonicalized to positive zero.
 fn next_finite(value: f64) -> Option<f64> {
     let bits = value.to_bits();
     let next = if value >= 0.0 {

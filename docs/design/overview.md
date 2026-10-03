@@ -85,8 +85,8 @@ ktann-foundationdb/     FoundationDB transaction and physical-key adapter
 ktann-rocksdb/          RocksDB OptimisticTransactionDB adapter
 ```
 
-Rust Edition 2024 and MSRV 1.85 are required. CI checks MSRV and current stable;
-production code uses no nightly features.
+Rust Edition 2024 and the latest stable toolchain are required. Development and
+CI both follow stable. Production code uses no nightly features.
 
 | Module design | Sole owner of |
 | --- | --- |

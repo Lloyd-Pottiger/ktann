@@ -55,7 +55,7 @@ impl CommitGate {
     async fn maybe_wait(&self) {
         let held = self
             .block_next
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |pending| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |pending| {
                 pending.checked_sub(1)
             })
             .is_ok();

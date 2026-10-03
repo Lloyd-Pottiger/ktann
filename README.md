@@ -70,8 +70,9 @@ FoundationDB.
 
 ## Get started
 
-Use Rust 1.85 or newer. RocksDB builds require a C++ toolchain and Clang/libclang;
-FoundationDB additionally requires its 7.3 native client library. See the
+Use the latest stable Rust toolchain. RocksDB builds require a C++ toolchain
+and Clang/libclang; FoundationDB additionally requires its 7.3 native client
+library. See the
 [RocksDB](ktann-rocksdb/README.md) and
 [FoundationDB](ktann-foundationdb/README.md) adapter guides for integration.
 

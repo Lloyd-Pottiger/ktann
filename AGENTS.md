@@ -37,8 +37,8 @@ across crates. For documentation-only changes, check accuracy, links, and the
 diff; Cargo checks are unnecessary. After relevant checks pass, broaden testing
 only for unresolved risks or failures. Report what ran and any verification gaps.
 Never run Cargo commands concurrently: they contend on Cargo and target-directory
-locks. Use Rust Edition 2024, MSRV 1.85, and stable CI; no nightly-only production
-features.
+locks. Use Rust Edition 2024 and the latest stable toolchain in development and CI.
+Production code uses no nightly features.
 
 ## Workflow Principles
 
