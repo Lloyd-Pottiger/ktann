@@ -18,7 +18,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde::Deserialize;
 use sha2::Sha256;
 
-use super::{BenchmarkDataset, checksum, validate_dimension};
+use super::{BenchmarkDataset, checksum};
 use crate::report::{DatasetFileMetadata, DatasetMetadata, DatasetSourceMetadata};
 
 const DEFAULT_CACHE_DIR: &str = "/tmp/vectordb_bench/dataset";
@@ -518,6 +518,7 @@ fn read_i32(reader: &mut impl Read, path: &Path) -> Result<i32, String> {
     Ok(i32::from_le_bytes(bytes))
 }
 
+/// Checks dataset-wide counts and references after row-level decoding.
 fn validate_loaded(
     manifest: &Manifest,
     ids: &[Bytes],
@@ -538,8 +539,6 @@ fn validate_loaded(
             manifest.id
         ));
     }
-    validate_dimension(base, manifest.dimension)?;
-    validate_dimension(queries, manifest.dimension)?;
     let unique: HashSet<&Bytes> = ids.iter().collect();
     if unique.len() != ids.len() {
         return Err(format!(

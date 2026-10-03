@@ -157,7 +157,7 @@ pub fn generate(spec: &str, dimension: usize, seed: u64) -> Dataset {
                 distinct > 0,
                 "dups spec `{spec}` needs at least one base vector"
             );
-            let bases: Vec<Vec<f32>> = (0..distinct)
+            let bases: Vec<Arc<[f32]>> = (0..distinct)
                 .map(|_| {
                     (0..dimension)
                         .map(|_| next_f32(&mut rng, -1.0, 1.0))
@@ -168,7 +168,7 @@ pub fn generate(spec: &str, dimension: usize, seed: u64) -> Dataset {
                 .map(|_| {
                     let base = &bases[rng.below(distinct as u64) as usize];
                     if rng.next().is_multiple_of(2) {
-                        base.clone().into()
+                        Arc::clone(base)
                     } else {
                         base.iter()
                             .map(|component| component + (gaussian(&mut rng) * 1e-3) as f32)
