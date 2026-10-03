@@ -55,7 +55,8 @@ cargo run --release -p ktann-benchmarks --bin ktann-bench -- \
 Each curve uses `k=100`, 1,000 held-out queries, 1,000 warmups, 16 concurrent
 clients, and 10,000 measured operations per beam. Repeated queries reduce timing
 noise; they do not add independent recall samples. Import batches contain 50
-records. The leaf beam sweep is `8, 16, 24, 32, 48, 64, 128, 192, 256, 384`.
+records. The leaf beam sweep is
+`1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128, 192, 256, 384`.
 
 Runtime and Logical Index settings use library defaults, including Partition
 Cache sizing, maintenance concurrency, retry limits, and partition occupancy.
@@ -74,6 +75,13 @@ otherwise idle host for performance comparisons.
 `--write-beam-size N` overrides the write routing beam. Large runs also accept
 `--base-vectors N`, `--query-vectors N`, `--query-offset N`, and
 `--max-partition-entries N`. Resolved overrides are recorded in each report.
+
+`--leaf-beam-sweep 64,80,96,112,128` selects at least two strictly increasing,
+positive beam widths for a quality sweep. Use finer spacing around the target
+recall to compare measured operating points. `--measured-operations N` controls
+the operation count per point without changing warmup. Keep it at least as large
+as the query corpus to cover every query, and use the same count across timing
+comparisons. Both overrides are recorded in the resolved report configuration.
 
 These import options apply to `--profile large` or an explicitly selected
 `--scenario import-to-search-lifecycle`:
