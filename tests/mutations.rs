@@ -632,11 +632,7 @@ async fn a_dropping_or_dropped_index_fails_closed() {
         let mut txn = WriteLogicalTxn::bootstrap(raw, limits, budget);
         txn.put(
             LogicalKey::Manifest(manifest.logical_index_id()),
-            PersistentValue::IndexManifest(
-                manifest
-                    .with_lifecycle(IndexLifecycle::Dropping)
-                    .expect("dropping manifest"),
-            ),
+            PersistentValue::IndexManifest(manifest.with_lifecycle(IndexLifecycle::Dropping)),
         )
         .await
         .expect("put dropping manifest");

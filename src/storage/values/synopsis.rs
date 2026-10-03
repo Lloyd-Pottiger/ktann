@@ -77,11 +77,8 @@ impl FieldSynopsis {
         let (Some(parameters), Some(bloom)) = (parameters, self.bloom.as_ref()) else {
             return true;
         };
-        let (first, step) = bloom_hash(value, data_type);
-        bloom_probes(first, step, parameters).all(|bit| {
-            let byte = bit / 8;
-            bloom[byte] & (1_u8 << (bit % 8)) != 0
-        })
+        let bit = bloom_bit(value, data_type, parameters);
+        bloom[bit / 8] & (1_u8 << (bit % 8)) != 0
     }
 }
 
@@ -324,13 +321,11 @@ fn expand_field(
         let mut bloom = bloom
             .try_into_mut()
             .unwrap_or_else(|bytes| bytes.as_ref().into());
-        let (first, step) = bloom_hash(value, data_type);
-        for bit in bloom_probes(first, step, parameters) {
-            let byte = bit / 8;
-            let mask = 1_u8 << (bit % 8);
-            changed |= bloom[byte] & mask == 0;
-            bloom[byte] |= mask;
-        }
+        let bit = bloom_bit(value, data_type, parameters);
+        let byte = bit / 8;
+        let mask = 1_u8 << (bit % 8);
+        changed |= bloom[byte] & mask == 0;
+        bloom[byte] |= mask;
         // Saturation only weakens pruning; it never breaks the conservative
         // contract (ADR 0021), so a rising fill ratio is purely diagnostic.
         let set_bits: u64 = bloom.iter().map(|byte| u64::from(byte.count_ones())).sum();
@@ -352,20 +347,18 @@ fn value_order(left: &Value, right: &Value) -> Ordering {
     typed_order(left, right).expect("validated synopsis values have the same scalar domain")
 }
 
-fn bloom_hash(value: &Value, data_type: DataType) -> (u64, u64) {
+fn bloom_hash(value: &Value, data_type: DataType) -> u128 {
     let mut hasher = Xxh3::with_seed(BLOOM_XXH3_SEED_V1);
     visit_typed_value_bytes(data_type, false, value, |bytes| hasher.update(bytes))
         .expect("validated non-NULL synopsis value matches its scalar domain");
-    let hash = hasher.digest128();
-    (hash as u64, (hash >> 64) as u64)
+    hasher.digest128()
 }
 
-fn bloom_probes(first: u64, step: u64, parameters: BloomParameters) -> impl Iterator<Item = usize> {
-    (0..parameters.hash_count()).map(move |probe| {
-        let bit = first.wrapping_add(u64::from(probe).wrapping_mul(step))
-            % u64::from(parameters.bit_count());
-        usize::try_from(bit).expect("Bloom bit index fits usize")
-    })
+/// Selects the single persisted probe from the low half of the v1 hash.
+/// Manifest validation guarantees the one-probe shape (ADR 0021).
+fn bloom_bit(value: &Value, data_type: DataType, parameters: BloomParameters) -> usize {
+    let bit = (bloom_hash(value, data_type) as u64) % u64::from(parameters.bit_count());
+    usize::try_from(bit).expect("Bloom bit index fits usize")
 }
 
 fn validate_field_synopsis(
@@ -507,10 +500,10 @@ mod tests {
         assert_eq!(
             hashes,
             vec![
-                (0x24f3_6f48_8673_1ec8, 0xb202_285b_0901_f22d),
-                (0x20e4_eebe_2bf2_55d3, 0x53b7_79fe_8cda_6696),
-                (0x20d8_9706_4446_f999, 0xb47c_3828_9492_441b),
-                (0x61f2_bba0_0fba_cbec, 0xf8c5_68d7_1177_7557),
+                0xb202_285b_0901_f22d_24f3_6f48_8673_1ec8,
+                0x53b7_79fe_8cda_6696_20e4_eebe_2bf2_55d3,
+                0xb47c_3828_9492_441b_20d8_9706_4446_f999,
+                0xf8c5_68d7_1177_7557_61f2_bba0_0fba_cbec,
             ]
         );
     }

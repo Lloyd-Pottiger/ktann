@@ -324,7 +324,6 @@ impl TreeSchema {
 /// negation can only complement when both hold, and even then only when the
 /// product constrains at most one field.
 struct Constraints {
-    types: Box<[DataType]>,
     sets: Vec<Option<FieldSet>>,
     exact: bool,
     tree_pure: bool,
@@ -333,7 +332,6 @@ struct Constraints {
 impl Constraints {
     fn full(types: &[DataType]) -> Self {
         Self {
-            types: types.into(),
             sets: vec![None; types.len()],
             exact: true,
             tree_pure: true,
@@ -360,7 +358,6 @@ impl Constraints {
     fn impossible(types: &[DataType]) -> Self {
         Self {
             sets: types.iter().map(|ty| Some(FieldSet::empty(*ty))).collect(),
-            types: types.into(),
             exact: true,
             tree_pure: true,
         }
@@ -391,21 +388,20 @@ impl Constraints {
     /// excludes keys where only some fields fall outside their sets, so it is
     /// not sound; those negations widen to the full domain and rely on exact
     /// predicate evaluation later.
-    fn negated(&self) -> Self {
-        let constrained: Vec<(usize, &FieldSet)> = self
+    fn negated(&self, types: &[DataType]) -> Self {
+        let mut constrained = self
             .sets
             .iter()
             .enumerate()
-            .filter_map(|(ordinal, set)| set.as_ref().map(|set| (ordinal, set)))
-            .collect();
-        match constrained.as_slice() {
-            [] => Self::impossible(&self.types),
-            [(ordinal, set)] => {
-                let mut negated = Constraints::full(&self.types);
-                negated.sets[*ordinal] = Some(set.complement());
+            .filter_map(|(ordinal, set)| set.as_ref().map(|set| (ordinal, set)));
+        match (constrained.next(), constrained.next()) {
+            (None, _) => Self::impossible(types),
+            (Some((ordinal, set)), None) => {
+                let mut negated = Constraints::full(types);
+                negated.sets[ordinal] = Some(set.complement());
                 negated
             }
-            _ => Self::wide(&self.types),
+            _ => Self::wide(types),
         }
     }
 }
@@ -436,7 +432,7 @@ fn derive(predicate: &Predicate, schema: &TreeSchema) -> Result<Constraints> {
         Predicate::Not(child) => {
             let child_constraints = derive(child, schema)?;
             if child_constraints.exact && child_constraints.tree_pure {
-                Ok(child_constraints.negated())
+                Ok(child_constraints.negated(&schema.types))
             } else {
                 Ok(Constraints::wide(&schema.types))
             }

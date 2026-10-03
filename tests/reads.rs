@@ -410,13 +410,7 @@ async fn dropping_manifest_fails_reads_closed() {
     let runtime = make_runtime(shared.clone());
     let index = runtime.open_index("docs").await.expect("open index");
 
-    put_manifest(
-        &shared,
-        manifest
-            .with_lifecycle(IndexLifecycle::Dropping)
-            .expect("dropping"),
-    )
-    .await;
+    put_manifest(&shared, manifest.with_lifecycle(IndexLifecycle::Dropping)).await;
 
     let get = index
         .get(Bytes::from_static(b"alpha"), GetOptions::default())

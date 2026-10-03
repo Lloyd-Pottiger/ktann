@@ -303,60 +303,42 @@ pub(crate) async fn drop_index<B: Backend>(
             return Err(Error::new(ErrorKind::Corruption));
         };
         let manifest = read_manifest_for_update(&mut txn, entry.logical_index_id()).await?;
-        match manifest.lifecycle() {
+        let step = match manifest.lifecycle() {
             IndexLifecycle::Active => {
-                let dropping = manifest.with_lifecycle(IndexLifecycle::Dropping)?;
+                let dropping = manifest.with_lifecycle(IndexLifecycle::Dropping);
                 txn.put(
                     LogicalKey::Manifest(manifest.logical_index_id()),
                     PersistentValue::IndexManifest(dropping),
                 )
                 .await?;
-                match commit_drop_step(context, txn, false).await {
-                    CommitStep::Committed { complete } => {
-                        debug_assert!(!complete);
-                        continue;
-                    }
-                    CommitStep::RetryableAbort => {
-                        retry
-                            .wait_or_exhaust(Operation::DropIndex, &mut failed_attempts)
-                            .await?;
-                        continue;
-                    }
-                    CommitStep::Unknown => {
-                        cursor = None;
-                        unknown_attempts += 1;
-                        if unknown_attempts >= retry.attempts {
-                            return recover_drop_after_unknown(backend.as_ref(), &name_key).await;
-                        }
-                        continue;
-                    }
-                    CommitStep::Error(error) => return Err(error),
+                DropStep::Commit {
+                    cursor: None,
+                    complete: false,
                 }
             }
             IndexLifecycle::Dropping => {
                 let raw = txn.into_raw();
                 txn = WriteLogicalTxn::for_drop(raw, &manifest, hard_limits, budget)?;
+
+                let Some(existing) = txn.get_for_update(name_key.clone()).await? else {
+                    txn.rollback().await;
+                    return Ok(());
+                };
+                let PersistentValue::IndexNameEntry(entry) = existing else {
+                    return Err(Error::new(ErrorKind::Corruption));
+                };
+                let current = read_manifest_for_update(&mut txn, entry.logical_index_id()).await?;
+                if current.lifecycle() != IndexLifecycle::Dropping {
+                    return Err(Error::new(ErrorKind::Corruption));
+                }
+                if current.logical_index_id() != manifest.logical_index_id() {
+                    return Err(Error::new(ErrorKind::Corruption));
+                }
+
+                prepare_delete_step(&mut txn, &name_key, &current, capabilities, cursor.as_ref())
+                    .await?
             }
-        }
-
-        let Some(existing) = txn.get_for_update(name_key.clone()).await? else {
-            txn.rollback().await;
-            return Ok(());
         };
-        let PersistentValue::IndexNameEntry(entry) = existing else {
-            return Err(Error::new(ErrorKind::Corruption));
-        };
-        let current = read_manifest_for_update(&mut txn, entry.logical_index_id()).await?;
-        if current.lifecycle() != IndexLifecycle::Dropping {
-            return Err(Error::new(ErrorKind::Corruption));
-        }
-        if current.logical_index_id() != manifest.logical_index_id() {
-            return Err(Error::new(ErrorKind::Corruption));
-        }
-
-        let step =
-            prepare_delete_step(&mut txn, &name_key, &current, capabilities, cursor.as_ref())
-                .await?;
         match step {
             DropStep::Advance { cursor: next } => {
                 txn.rollback().await;
@@ -365,46 +347,26 @@ pub(crate) async fn drop_index<B: Backend>(
             DropStep::Commit {
                 cursor: next,
                 complete,
-            } => match commit_drop_step(context, txn, complete).await {
-                CommitStep::Committed { complete: true } => return Ok(()),
-                CommitStep::Committed { complete: false } => {
+            } => match context.commit(move |start| txn.commit_with(start)).await {
+                Ok(()) if complete => return Ok(()),
+                Ok(()) => {
                     cursor = next;
                 }
-                CommitStep::RetryableAbort => {
+                Err(error) if error.kind() == ErrorKind::RetryableAbort => {
                     retry
                         .wait_or_exhaust(Operation::DropIndex, &mut failed_attempts)
                         .await?;
                 }
-                CommitStep::Unknown => {
+                Err(error) if error.kind() == ErrorKind::CommitOutcomeUnknown => {
                     cursor = None;
                     unknown_attempts += 1;
                     if unknown_attempts >= retry.attempts {
                         return recover_drop_after_unknown(backend.as_ref(), &name_key).await;
                     }
                 }
-                CommitStep::Error(error) => return Err(error),
+                Err(error) => return Err(error),
             },
         }
-    }
-}
-
-enum CommitStep {
-    Committed { complete: bool },
-    RetryableAbort,
-    Unknown,
-    Error(Error),
-}
-
-async fn commit_drop_step<B: Backend>(
-    context: &mut OperationContext<B>,
-    txn: WriteLogicalTxn<'_, B::WriteTxn<'_>>,
-    complete: bool,
-) -> CommitStep {
-    match context.commit(move |start| txn.commit_with(start)).await {
-        Ok(()) => CommitStep::Committed { complete },
-        Err(error) if error.kind() == ErrorKind::RetryableAbort => CommitStep::RetryableAbort,
-        Err(error) if error.kind() == ErrorKind::CommitOutcomeUnknown => CommitStep::Unknown,
-        Err(error) => CommitStep::Error(error),
     }
 }
 

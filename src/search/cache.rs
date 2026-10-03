@@ -181,7 +181,7 @@ impl CachedBody {
 ///
 /// The eviction policy is S3-FIFO: a probationary small FIFO queue holding one
 /// tenth of the byte capacity, a main FIFO queue giving second chances through
-/// 2-bit frequency counters, and a non-resident ghost queue of keys evicted
+/// 2-bit frequency counters, and a ghost history queue of keys evicted
 /// from the small queue. A hit only increments a saturating frequency counter
 /// and never touches a queue, keeping the locked section short. The policy is
 /// an internal benchmark-tunable detail, not a persistent or public
@@ -204,7 +204,8 @@ struct CacheInner {
     small: VecDeque<QueueRecord>,
     /// The main FIFO queue, reinserting entries that spent a second chance.
     main: VecDeque<QueueRecord>,
-    /// The non-resident ghost queue of keys evicted from the small queue.
+    /// Recent small-queue eviction history, retained until FIFO aging even
+    /// when a key is admitted again. The set and FIFO contain the same keys.
     ghost_set: HashSet<CacheKey>,
     ghost_order: VecDeque<CacheKey>,
     queue_tick: u64,
@@ -377,7 +378,7 @@ impl CacheInner {
     fn insert(&mut self, key: CacheKey, body: Arc<CachedBody>, small_capacity_bytes: u64) {
         // Ghost hits and bodies too large for the small queue enter the main
         // queue directly; everything else starts in the small queue.
-        let queue = if self.ghost_set.remove(&key) || body.bytes > small_capacity_bytes {
+        let queue = if self.ghost_set.contains(&key) || body.bytes > small_capacity_bytes {
             QueueKind::Main
         } else {
             QueueKind::Small
@@ -768,6 +769,25 @@ mod tests {
                 .collect(),
             BodyEntries::Internal(_) => panic!("expected a leaf body"),
         }
+    }
+
+    #[test]
+    fn ghost_history_stays_bounded_under_repeated_eviction_and_refill() {
+        let body = cached_leaf_body(1, &[]);
+        let cache = PartitionCache::new(10 * body.bytes);
+        for epoch in 1..=300 {
+            for partition in 1..=11 {
+                cache.install(
+                    key(partition, PartitionKind::Leaf),
+                    cached_leaf_body(epoch, &[]),
+                );
+            }
+        }
+
+        let inner = cache.lock();
+        let limit = inner.slots.len().saturating_mul(2).saturating_add(1_024);
+        assert!(inner.ghost_set.len() <= limit);
+        assert!(inner.ghost_order.len() <= limit);
     }
 
     #[test]
