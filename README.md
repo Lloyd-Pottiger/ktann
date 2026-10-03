@@ -100,13 +100,6 @@ incremental maintenance to keep search and updates practical as data changes.
 Its benchmark suite measures the costs together: recall, latency distributions,
 throughput, CPU, memory, backend IO, contention, and write amplification.
 
-The checked-in [import calibration](benchmarks/import-admission-calibration.md)
-records three-run SIFTsmall experiments with 10,000 vectors, 128 dimensions,
-100 queries, and `k=10`. The selected configuration achieved mean recall@10 of
-1.0 on both adapters with no search-budget exhaustion. These are dated,
-small-dataset calibration results, not a current throughput claim or a
-million-vector performance guarantee.
-
 Reproduce measurements on your hardware:
 
 ```sh

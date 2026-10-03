@@ -309,79 +309,7 @@ the warmed steady-state rules, it compares import throughput and submit
 latency, batch failures and gate waits, finish-to-stable time, each query
 stage's latency/throughput/recall/cache/budget results, and phase Backend IO.
 
-### Historical measurement: actionable maintenance discovery
-
-An otherwise-idle Apple M1 Pro run on 2026-08-28 compared revision `da57d81`
-with actionable, batch-coalesced maintenance discovery. Both runs used the
-`full` `import-to-search-lifecycle` scenario: SIFTsmall, 10,000 records,
-200 batches, one in-flight batch, and two maintenance workers.
-
-| Backend | Implementation | Fixup admissions | Fixup executions | Import read transactions | Import wall seconds |
-| --- | --- | ---: | ---: | ---: | ---: |
-| RocksDB | `da57d81` | 10,000 | 5,145 | 14,115 | 3.147 |
-| RocksDB | actionable discovery | 109 | 109 | 4,041 | 3.515 |
-| FoundationDB | `da57d81` | 10,000 | 5,145 | 14,113 | 27.205 |
-| FoundationDB | actionable discovery | 109 | 109 | 4,041 | 27.721 |
-
-The measured implementation removed all 5,036 merge-idle and 5,038/5,036
-split-idle steps reported during RocksDB/FoundationDB import. Both sides still
-reported 2,602 successful commits, 109 split begin/completion steps, 1,857
-split drain steps, complete convergence, recall@10 of 1.0 in the immediate,
-stable-cold, and stable-warm passes, and no Search Budget truncation. This
-single paired run proves the work reduction, not a latency improvement; wall
-time and retry variation require repeated sampling before drawing a latency or
-contention conclusion.
-
-The RocksDB reports were produced with:
-
-```sh
-cargo run --release -p ktann-benchmarks --bin ktann-bench -- \
-  run --backend rocksdb --profile full \
-  --scenario import-to-search-lifecycle --output REPORT.json
-```
-
-The FoundationDB reports used the documented local environment and:
-
-```sh
-cargo run --release -p ktann-benchmarks \
-  --no-default-features --features foundationdb --bin ktann-bench -- \
-  run --backend foundationdb --profile full \
-  --scenario import-to-search-lifecycle --output REPORT.json
-```
-
-### Historical measurement: adaptive leaf draining
-
-Three independent same-host runs on 2026-08-28 compared revision `ccb4090`
-with the adaptive leaf relocation batch. Both sides used the `full`
-`import-to-search-lifecycle` scenario, SIFTsmall, 10,000 records, 200 batches,
-one in-flight batch, and two maintenance workers. Each timing is the arithmetic
-mean with the sample coefficient of variation in parentheses.
-
-| Backend | Measurement | `ccb4090` | Adaptive drain | Change |
-| --- | --- | ---: | ---: | ---: |
-| RocksDB | Case wall seconds | 6.311 (3.12%) | 4.880 (0.27%) | -22.7% |
-| RocksDB | Import wall seconds | 3.997 (4.78%) | 2.781 (1.00%) | -30.4% |
-| RocksDB | Case CPU seconds | 8.454 (1.44%) | 6.439 (0.84%) | -23.8% |
-| RocksDB | Import retryable commits | 310.7 (0.74%) | 250.0 (1.74%) | -19.5% |
-| RocksDB | Import mutation operations | 147,496 (0.21%) | 131,759 (0.60%) | -10.7% |
-| FoundationDB | Case wall seconds | 34.522 (0.54%) | 23.405 (0.44%) | -32.2% |
-| FoundationDB | Import wall seconds | 29.035 (0.68%) | 18.467 (0.50%) | -36.4% |
-| FoundationDB | Case CPU seconds | 12.956 (0.44%) | 8.887 (0.75%) | -31.4% |
-| FoundationDB | Import retryable commits | 464.3 (1.11%) | 293.3 (1.57%) | -36.8% |
-| FoundationDB | Import mutation operations | 173,590 (0.53%) | 134,572 (0.30%) | -22.5% |
-
-The workload's 128-entry partition limit selected a 32-entry contention cap
-(since raised to the full configured threshold; see
-[maintenance design](../docs/design/maintenance.md) §4.2).
-On both adapters, successful import commits fell from 2,602 to 1,290, read
-transactions from 4,041 to 1,417, and split drain steps from 1,857 to 545.
-Every run accepted all 10,000 records, converged completely, reported
-recall@10 of 1.0 in immediate, stable-cold, and stable-warm search, and had no
-Search Budget truncation. The three-run result therefore validates lower
-whole-system work and latency without trading away the scenario's correctness
-or recall contract.
-
-### Adaptive import admission validation
+### Evaluating adaptive import admission
 
 Adaptive import admission uses observed write contention rather than raw
 partition count: an atomic batch may update many leaves, skew can keep one leaf
@@ -393,47 +321,15 @@ retrying a contended batch. The default backlog watermark is two, allowing one
 pending or running Fixup to coexist with import before new admission pauses.
 Submitted batches remain indivisible atomic operations.
 
-The complete batch-size, concurrency-ceiling, maintenance-worker, and backlog
-watermark matrix, including three-run variance, logical Backend IO, Fixup work,
-convergence, and rejected configurations, is recorded in
-[`import-admission-calibration.md`](import-admission-calibration.md).
-
-Three interleaved same-host full SIFTsmall runs on 2026-08-29 compared revision
-`ca5b00b` with fixed concurrency one and backlog watermark 512 against adaptive
-admission with a ceiling of four and backlog watermark two. Both sides used
-50-record batches and two maintenance workers. Every run accepted 10,000 of
-10,000 records, converged to 442 partitions, shut down cleanly, and reported
-mean and minimum recall@10 of 1.0 in immediate, stable-cold, and stable-warm
-search without Search Budget exhaustion. Reproduce the adaptive side with the
-RocksDB and FoundationDB commands above plus these arguments, using a distinct
-output path for each run:
-
-```text
---import-max-in-flight-batches 4 --import-batch-size 50 \
-  --import-backlog-watermark 2 --output REPORT.json
-```
-
-| Backend | Measurement | Fixed mean | Adaptive mean | Change |
-| --- | --- | ---: | ---: | ---: |
-| RocksDB | Case wall seconds | 4.900 | 4.470 | -8.8% |
-| RocksDB | Import wall seconds | 2.773 | 2.418 | -12.8% |
-| RocksDB | Import CPU seconds | 4.677 | 3.798 | -18.8% |
-| RocksDB | Retryable commits | 217.3 | 165.7 | -23.8% |
-| RocksDB | Mutation operations | 126,443 | 117,060 | -7.4% |
-| RocksDB | p95 submit latency ms | 34.8 | 28.2 | -18.8% |
-| FoundationDB | Case wall seconds | 24.780 | 24.333 | -1.8% |
-| FoundationDB | Import wall seconds | 19.584 | 19.317 | -1.4% |
-| FoundationDB | Import CPU seconds | 7.078 | 6.510 | -8.0% |
-| FoundationDB | Retryable commits | 289.3 | 231.0 | -20.2% |
-| FoundationDB | Mutation operations | 134,606 | 125,245 | -7.0% |
-| FoundationDB | p95 submit latency ms | 210.1 | 205.8 | -2.0% |
-
-The single-Tree-Key corpus supported one probe of concurrency two, observed
-contention, and returned to one. Adaptive admission therefore reduced CPU,
-retryable commits, and mutation work without changing recall or forcing unsafe
-concurrency. Wall time and p95 submit latency remained close to the fixed
-baseline rather than improving uniformly. Callers choose batch size from their
-transaction, latency, and atomicity requirements rather than from tree size.
+Use the `import-to-search-lifecycle` scenario to compare batch sizes,
+concurrency ceilings, maintenance-worker counts, and backlog watermarks. Keep
+inputs and host conditions fixed, repeat each configuration, and retain the
+reports with their revision and configuration metadata. Evaluate accepted
+records, failures, convergence, immediate and stable recall, search budgets,
+latency, CPU, and backend IO together; fewer retries or a quieter queue alone
+are not evidence of an improvement. See
+[ADR 0022](../docs/adr/0022-feedback-controlled-import-admission.md) for the
+admission policy and its invariants.
 
 ## VectorDBBench interoperability
 
