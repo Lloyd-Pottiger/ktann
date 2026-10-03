@@ -55,6 +55,16 @@ supports transactional logical range clear. Its adapter exposes actual database
 limits and keeps write transactions short; snapshot expiry is a Backend error,
 not a hidden four-second deadline.
 
+Snapshot `batch_get` may combine two equal-length keys with consecutive final
+bytes into one native range request, notably adjacent Record/Location values.
+It fetches at most two rows, returns only the requested keys, and point-reads
+missing targets if intervening keys or a short page prevented completion.
+Order, duplicates, absent values, and the transaction snapshot are preserved.
+The combined read remains bounded even when key extensions intervene. Maximum
+length keys and update-protected reads use ordinary point reads, preserving
+native key limits and exact write-conflict scope. Range values retain their
+native owner rather than copying value buffers.
+
 RocksDB uses `OptimisticTransactionDB`. ReadTxn owns a Snapshot. WriteTxn enables
 a transaction snapshot and binds every read option to it while retaining
 read-your-writes. Point `get_for_update` establishes conflicts; state machines

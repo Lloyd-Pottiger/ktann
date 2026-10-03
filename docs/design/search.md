@@ -173,6 +173,22 @@ then Record ID.
 Partition, rerank, and optional RaBitQ-overlap bounds are charged
 before corresponding work. No speculative read-ahead occurs beyond a budget.
 
+Traversal batches snapshot Header reads for a funded prefix of up to 32
+non-root partitions, including leaves. Filtered leaf visits include their
+Synopses in the same batch, with at most 64 keys in flight. Visits, body loads,
+candidate selection, and budget accounting retain their original order. Roots
+are read individually because their transition state can inject split targets
+ahead of the queued work. Batching changes backend scheduling, not the selected
+partitions or recall policy.
+
+Within that funded prefix, traversal validates metadata and applies Synopsis
+pruning before prefetching body pages. At most four first pages of cache misses
+are read together, each under the existing 256-entry/1 MiB encoded scan limits
+(including the backend's oversized-first-item rule). Cache hits do not scan.
+Visits consume those pages in order and stream any continuation through one
+body at a time; a complete body passes count validation before cache publication.
+This bounds temporary prefetching independently of complete partition size.
+
 For a leaf with `n` eligible entries, checked arithmetic computes
 `r = min(n, max(2*k, 64))`. The leaf keeps the rough top `r`, uses the r-th
 smallest upper endpoint as its overlap threshold, includes entries whose lower
