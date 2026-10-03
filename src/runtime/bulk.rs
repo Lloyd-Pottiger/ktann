@@ -61,7 +61,7 @@ fn validate_input(
         .collect();
     let mut tree_members = BTreeMap::<TreeKey, Vec<usize>>::new();
     let mut bytes = 0_usize;
-    for (position, record) in records.iter().enumerate() {
+    for (position, record) in records.iter_mut().enumerate() {
         checkpoint()?;
         record.validate(config.dimension(), config.fields())?;
         let values: Vec<_> = config
