@@ -224,10 +224,12 @@ impl Plan {
         &self,
         manifest: &IndexManifest,
         records: &[Record],
+        checkpoint: &impl Fn() -> Result<()>,
     ) -> Result<Vec<(LogicalKey, PersistentValue)>> {
         let index = manifest.logical_index_id();
         let mut output = Vec::new();
         for tree in &self.trees {
+            checkpoint()?;
             let high_water = tree
                 .parts
                 .iter()
@@ -245,6 +247,7 @@ impl Plan {
                 )?),
             ));
             for part in &tree.parts {
+                checkpoint()?;
                 output.push((
                     LogicalKey::Header {
                         index,
@@ -280,6 +283,7 @@ impl Plan {
                 if part.level == 1 {
                     let mut synopsis = PartitionSynopsis::empty(manifest);
                     for &position in &part.members {
+                        checkpoint()?;
                         synopsis.expand(manifest, records[position].fields())?;
                     }
                     output.push((
@@ -292,6 +296,7 @@ impl Plan {
                     ));
                 } else {
                     for &child in &part.members {
+                        checkpoint()?;
                         let child = &tree.parts[child];
                         output.push((
                             LogicalKey::ChildEntry {
@@ -708,7 +713,7 @@ pub(crate) async fn build<B: Backend>(
     .await?;
     let manifest = reserve(context, &name, &config, &retry).await?;
     let planning_manifest = manifest.clone();
-    let (plan, records) = controlled_compute(
+    let (plan, records, topology) = controlled_compute(
         context.options.clone(),
         context.cpu_admission.clone().expect("bulk admission"),
         move |control| {
@@ -719,21 +724,20 @@ pub(crate) async fn build<B: Backend>(
                 tree_members,
                 &options,
             )?;
-            Ok((plan, records))
+            let topology = plan
+                .topology(&planning_manifest, &records, &|| control.checkpoint())?
+                .into_iter()
+                .map(|row| {
+                    control.checkpoint()?;
+                    Ok(vec![row])
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok((plan, records, topology))
         },
     )
     .await?;
-    stage(
-        context,
-        &manifest,
-        &plan
-            .topology(&manifest, &records)?
-            .into_iter()
-            .map(|row| vec![row])
-            .collect::<Vec<_>>(),
-        &retry,
-    )
-    .await?;
+    stage(context, &manifest, &topology, &retry).await?;
+    drop(topology);
     // Record projections stay bounded; the complete dataset is never copied
     // into a second collection of encoded persistent values.
     for first in (0..records.len()).step_by(64) {
@@ -834,11 +838,20 @@ mod tests {
         assert_eq!(leaves[1].center.as_ref(), [9.5]);
     }
 
-    /// Exercise real numerical planning, not just its caller's error return.
+    /// Exercise real planning and serialization, not just caller error returns.
     /// Aborting the owning async task drops the guard; after the blocked
     /// checkpoint resumes, the blocking task must stop at that checkpoint.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropped_planning_owner_stops_blocking_work() {
+        assert_dropped_owner_stops_work(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_topology_owner_stops_blocking_work() {
+        assert_dropped_owner_stops_work(true).await;
+    }
+
+    async fn assert_dropped_owner_stops_work(topology: bool) {
         let config = IndexConfig::new(8, crate::api::Metric::L2)
             .unwrap()
             .with_partition_entries(2, 4)
@@ -896,16 +909,18 @@ mod tests {
                         }
                         control.checkpoint()
                     };
-                    let result = Plan::new(
-                        &checkpoint,
-                        &manifest,
-                        &records,
-                        BTreeMap::from([(
-                            TreeKey::encode(&[], &[]).unwrap(),
-                            (0..records.len()).collect(),
-                        )]),
-                        &BulkBuildOptions::new(1 << 20).unwrap(),
-                    );
+                    let members = BTreeMap::from([(
+                        TreeKey::encode(&[], &[]).unwrap(),
+                        (0..records.len()).collect(),
+                    )]);
+                    let options = BulkBuildOptions::new(1 << 20).unwrap();
+                    let result = if topology {
+                        let plan =
+                            Plan::new(&|| Ok(()), &manifest, &records, members, &options).unwrap();
+                        plan.topology(&manifest, &records, &checkpoint).map(|_| ())
+                    } else {
+                        Plan::new(&checkpoint, &manifest, &records, members, &options).map(|_| ())
+                    };
                     finished_send
                         .send(result.err().map(|error| error.kind()))
                         .unwrap();
