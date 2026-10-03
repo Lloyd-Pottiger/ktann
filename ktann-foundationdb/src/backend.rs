@@ -357,7 +357,7 @@ impl WriteTxn for FoundationDbWriteTxn<'_> {
             .await
             .map(|_| ())
             .map_err(|error| map_commit_error(error.into()));
-        observe::commit(observe::CommitOutcome::from_result(&result));
+        observe::commit(&result);
         result
     }
 

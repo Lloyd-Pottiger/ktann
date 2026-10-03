@@ -63,7 +63,7 @@ async fn absent_point_and_batch_reads_preserve_shape() {
     let backend = DeterministicBackend::default();
     let manifest = manifest();
     let raw = backend.begin_read().await.expect("begin read");
-    let mut txn = ReadLogicalTxn::for_index(raw, &manifest).expect("bind manifest");
+    let mut txn = ReadLogicalTxn::for_index(raw, &manifest);
 
     assert_eq!(txn.get(record_key(b"missing")).await.expect("get"), None);
 
@@ -271,7 +271,7 @@ async fn partition_scans_decode_mixed_families_and_page_without_read_ahead() {
     txn.commit().await.expect("commit");
 
     let raw = backend.begin_read().await.expect("begin read");
-    let mut txn = ReadLogicalTxn::for_index(raw, &manifest).expect("bind manifest");
+    let mut txn = ReadLogicalTxn::for_index(raw, &manifest);
     let range =
         LogicalRange::partition(&manifest, &tree_key, partition).expect("valid partition range");
     let mut cursor = None;
@@ -360,7 +360,7 @@ async fn batched_typed_scans_paginate_each_leg_independently() {
     let range_a = LogicalRange::leaf_entries(&manifest, &tree_key, pk(1)).expect("range a");
     let range_b = LogicalRange::leaf_entries(&manifest, &tree_key, pk(2)).expect("range b");
     let raw = backend.begin_read().await.expect("begin read");
-    let mut txn = ReadLogicalTxn::for_index(raw, &manifest).expect("bind manifest");
+    let mut txn = ReadLogicalTxn::for_index(raw, &manifest);
     let limits = ScanLimits {
         item_limit: 2,
         byte_limit: usize::MAX,
@@ -449,7 +449,7 @@ async fn reads_and_scans_fail_closed_on_key_value_identity_mismatch() {
     seed_mismatched_record(&backend, &manifest).await;
 
     let raw = backend.begin_read().await.expect("begin read");
-    let mut txn = ReadLogicalTxn::for_index(raw, &manifest).expect("bind manifest");
+    let mut txn = ReadLogicalTxn::for_index(raw, &manifest);
     let error = txn
         .get(record_key(b"requested"))
         .await
@@ -483,8 +483,7 @@ fn mutation_builder_enforces_count_and_byte_limits_without_partial_change() {
         max_mutation_bytes: usize::MAX,
         mutation_key_overhead_bytes: 0,
     };
-    let mut builder =
-        MutationBuilder::for_index(&manifest, hard_limits, count_budget).expect("valid builder");
+    let mut builder = MutationBuilder::for_index(&manifest, hard_limits, count_budget);
     builder.delete(record_key(b"a")).expect("first delete");
     builder.delete(record_key(b"b")).expect("second delete");
     let full_size = builder.size();
@@ -499,8 +498,7 @@ fn mutation_builder_enforces_count_and_byte_limits_without_partial_change() {
         max_mutation_bytes: usize::MAX,
         mutation_key_overhead_bytes: 0,
     };
-    let mut sizing =
-        MutationBuilder::for_index(&manifest, hard_limits, generous_budget).expect("valid builder");
+    let mut sizing = MutationBuilder::for_index(&manifest, hard_limits, generous_budget);
     sizing
         .put(record_key(b"sized"), record(b"sized"))
         .expect("sizing mutation");
@@ -511,8 +509,7 @@ fn mutation_builder_enforces_count_and_byte_limits_without_partial_change() {
         max_mutation_bytes: exact_bytes - 1,
         mutation_key_overhead_bytes: 0,
     };
-    let mut limited =
-        MutationBuilder::for_index(&manifest, hard_limits, byte_budget).expect("valid builder");
+    let mut limited = MutationBuilder::for_index(&manifest, hard_limits, byte_budget);
     let error = limited
         .put(record_key(b"sized"), record(b"sized"))
         .expect_err("mutation exceeds byte budget");
@@ -532,8 +529,7 @@ fn mutation_builder_rejects_wrong_value_family_and_hard_limits() {
         max_mutation_bytes: usize::MAX,
         mutation_key_overhead_bytes: 0,
     };
-    let mut builder =
-        MutationBuilder::for_index(&manifest, hard_limits, budget).expect("valid builder");
+    let mut builder = MutationBuilder::for_index(&manifest, hard_limits, budget);
     let error = builder
         .delete(record_key(b"a"))
         .expect_err("logical key exceeds hard limit");
@@ -547,8 +543,7 @@ fn mutation_builder_rejects_wrong_value_family_and_hard_limits() {
             max_value_bytes: 4_096,
         },
         budget,
-    )
-    .expect("valid builder");
+    );
     let error = builder
         .put(
             record_key(b"a"),
@@ -592,8 +587,7 @@ fn tree_local_inputs_must_match_the_bound_tree_key_schema() {
             max_mutation_bytes: 1_024,
             mutation_key_overhead_bytes: 0,
         },
-    )
-    .expect("valid builder");
+    );
     let error = builder
         .delete(LogicalKey::Header {
             index: id(7),
@@ -626,8 +620,7 @@ async fn range_clear_is_included_in_transaction_admission() {
         &manifest,
         backend.hard_limits(),
         backend.admission_budget(),
-    )
-    .expect("bind manifest");
+    );
     let range = LogicalRange::index(&manifest);
     let raw_range = keys::index_range(id(7));
     let expected_bytes = raw_range.start().len() + raw_range.end().len();
@@ -658,8 +651,7 @@ async fn applying_a_builder_charges_its_exact_final_size() {
         &manifest,
         backend.hard_limits(),
         backend.admission_budget(),
-    )
-    .expect("bind manifest");
+    );
     let mut mutations = txn.mutations();
     mutations
         .put(record_key(b"z"), record(b"z"))
@@ -704,8 +696,7 @@ fn manifest_write_with_different_immutable_config_is_rejected_when_bound() {
         mutation_key_overhead_bytes: 0,
     };
 
-    let mut builder =
-        MutationBuilder::for_index(&manifest, hard_limits, budget).expect("bind manifest");
+    let mut builder = MutationBuilder::for_index(&manifest, hard_limits, budget);
     let error = builder
         .put(
             LogicalKey::Manifest(id(7)),
@@ -728,8 +719,7 @@ async fn duplicate_insert_fails_closed_on_corrupt_existing_value() {
         &manifest,
         backend.hard_limits(),
         backend.admission_budget(),
-    )
-    .expect("bind manifest");
+    );
     // A duplicate insert at the corrupted key must fail closed rather than
     // report AlreadyExists on undecodable bytes.
     let error = txn
@@ -843,7 +833,7 @@ async fn range_and_cursor_bind_the_tree_key_schema() {
 
     let range = LogicalRange::tree_manifests(&string_manifest);
     let raw = backend.begin_read().await.expect("begin read");
-    let mut txn = ReadLogicalTxn::for_index(raw, &int_manifest).expect("bind int manifest");
+    let mut txn = ReadLogicalTxn::for_index(raw, &int_manifest);
     let error = txn
         .scan(
             &range,
@@ -885,7 +875,7 @@ async fn reading_a_manifest_with_different_immutable_config_fails_closed() {
     }
 
     let raw = backend.begin_read().await.expect("begin read");
-    let mut txn = ReadLogicalTxn::for_index(raw, &manifest).expect("bind manifest");
+    let mut txn = ReadLogicalTxn::for_index(raw, &manifest);
     let error = txn
         .get(LogicalKey::Manifest(id(7)))
         .await
@@ -933,7 +923,7 @@ async fn seed_record(backend: &DeterministicBackend, record_id: &'static [u8]) {
     let limits = backend.hard_limits();
     let budget = backend.admission_budget();
     let raw = backend.begin_write().await.expect("begin seed");
-    let mut txn = WriteLogicalTxn::for_index(raw, &manifest, limits, budget).expect("bind index");
+    let mut txn = WriteLogicalTxn::for_index(raw, &manifest, limits, budget);
     txn.put(record_key(record_id), record(record_id))
         .await
         .expect("seed record");
@@ -952,7 +942,6 @@ async fn index_write_txn<'b, 'm>(
         backend.hard_limits(),
         backend.admission_budget(),
     )
-    .expect("bind index")
 }
 
 #[tokio::test]

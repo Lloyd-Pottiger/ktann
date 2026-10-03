@@ -993,7 +993,7 @@ mod tests {
         mock: MockReadTxn,
         partition: u64,
     ) -> Result<(Arc<CachedBody>, MockReadTxn)> {
-        let mut txn = ReadLogicalTxn::for_index(mock, manifest).expect("bind manifest");
+        let mut txn = ReadLogicalTxn::for_index(mock, manifest);
         let header = expect_header(
             txn.get(LogicalKey::Header {
                 index: manifest.logical_index_id(),

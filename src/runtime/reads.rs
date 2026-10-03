@@ -82,7 +82,7 @@ pub(crate) async fn open_validated_read<'b, 'm, B: Backend>(
     let raw = backend.begin_read().await?;
     let mut txn = ReadLogicalTxn::bootstrap(raw);
     validate_manifest(&mut txn, handle_manifest).await?;
-    ReadLogicalTxn::for_index(txn.into_raw(), handle_manifest)
+    Ok(ReadLogicalTxn::for_index(txn.into_raw(), handle_manifest))
 }
 
 /// Opens one validated read snapshot and reads one partition's authority

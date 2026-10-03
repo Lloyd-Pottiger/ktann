@@ -50,7 +50,12 @@ pub(crate) async fn open_validated_write<'b, 'm, B: Backend>(
         txn.rollback().await;
         return Err(error);
     }
-    WriteLogicalTxn::for_index(txn.into_raw(), handle_manifest, hard_limits, budget)
+    Ok(WriteLogicalTxn::for_index(
+        txn.into_raw(),
+        handle_manifest,
+        hard_limits,
+        budget,
+    ))
 }
 
 /// Runs one bounded write operation as a sequence of whole attempts.

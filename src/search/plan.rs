@@ -1649,8 +1649,7 @@ mod tests {
         budget: u32,
         data: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> TreeKeyEnumeration {
-        let mut txn =
-            ReadLogicalTxn::for_index(MockReadTxn::new(data), manifest).expect("bind manifest");
+        let mut txn = ReadLogicalTxn::for_index(MockReadTxn::new(data), manifest);
         enumerate_tree_keys(
             &mut txn,
             manifest,
@@ -1816,8 +1815,7 @@ mod tests {
             .map(|value| directory_item(&manifest, &types, &[i64_value(value)]))
             .collect();
         let plan = plan_tree_keys(&manifest, None, 1_024).expect("plan");
-        let mut txn =
-            ReadLogicalTxn::for_index(MockReadTxn::new(data), &manifest).expect("bind manifest");
+        let mut txn = ReadLogicalTxn::for_index(MockReadTxn::new(data), &manifest);
         let enumeration = enumerate_tree_keys(
             &mut txn,
             &manifest,
@@ -1855,8 +1853,7 @@ mod tests {
         let (key, _) = directory_item(&manifest, &types, &[i64_value(1)]);
         let garbage = vec![0x00, 0x00];
         let plan = plan_tree_keys(&manifest, None, 1_024).expect("plan");
-        let mut txn = ReadLogicalTxn::for_index(MockReadTxn::new(vec![(key, garbage)]), &manifest)
-            .expect("bind manifest");
+        let mut txn = ReadLogicalTxn::for_index(MockReadTxn::new(vec![(key, garbage)]), &manifest);
         let error = enumerate_tree_keys(
             &mut txn,
             &manifest,
@@ -1884,8 +1881,7 @@ mod tests {
                 TreeManifest::new(pk(1), pk(1)).expect("valid tree manifest"),
             ))
             .expect("encode");
-        let mut txn = ReadLogicalTxn::for_index(MockReadTxn::new(vec![(key, value)]), &manifest)
-            .expect("bind manifest");
+        let mut txn = ReadLogicalTxn::for_index(MockReadTxn::new(vec![(key, value)]), &manifest);
         let error = enumerate_tree_keys(
             &mut txn,
             &manifest,

@@ -81,7 +81,7 @@ async fn seed_record(
     let raw = backend.begin_write().await.expect("begin write");
     let limits = backend.hard_limits();
     let budget = backend.admission_budget();
-    let mut txn = WriteLogicalTxn::for_index(raw, manifest, limits, budget).expect("bind index");
+    let mut txn = WriteLogicalTxn::for_index(raw, manifest, limits, budget);
     let id = Bytes::copy_from_slice(id);
     txn.put(
         keys::LogicalKey::Record {
@@ -347,8 +347,7 @@ async fn reads_use_one_consistent_backend_snapshot() {
         &manifest,
         shared.hard_limits(),
         shared.admission_budget(),
-    )
-    .expect("bind index");
+    );
     let id = Bytes::from_static(b"pending");
     txn.put(
         keys::LogicalKey::Record {
@@ -588,8 +587,7 @@ async fn partial_record_groups_are_corruption() {
         &manifest,
         shared.hard_limits(),
         shared.admission_budget(),
-    )
-    .expect("bind index");
+    );
     txn.put(
         keys::LogicalKey::Location {
             index: manifest.logical_index_id(),
@@ -616,8 +614,7 @@ async fn partial_record_groups_are_corruption() {
         &manifest,
         shared.hard_limits(),
         shared.admission_budget(),
-    )
-    .expect("bind index");
+    );
     txn.put(
         keys::LogicalKey::Payload {
             index: manifest.logical_index_id(),

@@ -31,6 +31,7 @@ fi
 
 PACKAGE_DIR="$(mktemp -d)"
 readonly PACKAGE_DIR
+trap 'rm -rf -- "$PACKAGE_DIR"' EXIT
 readonly CLIENT_PACKAGE="$PACKAGE_DIR/foundationdb-clients.deb"
 readonly SERVER_PACKAGE="$PACKAGE_DIR/foundationdb-server.deb"
 readonly RELEASE_URL="https://github.com/apple/foundationdb/releases/download/$FDB_VERSION"

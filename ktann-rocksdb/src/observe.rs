@@ -20,46 +20,17 @@ const BLOCKING_WAIT: &str = "ktann.backend.blocking.wait";
 /// Duration a native actor held its bounded slot, in seconds.
 const BLOCKING_HELD: &str = "ktann.backend.blocking.held";
 
-/// The bounded `outcome` label of one native commit.
-#[derive(Clone, Copy)]
-pub(crate) enum CommitOutcome {
-    /// The commit definitely succeeded.
-    Committed,
-    /// The commit definitely failed and nothing was committed.
-    Retryable,
-    /// Whether the commit succeeded cannot be determined.
-    Unknown,
-    /// The commit failed with any other classified error.
-    Failed,
-}
-
-impl CommitOutcome {
-    /// The bounded label value.
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Committed => "committed",
-            Self::Retryable => "retryable",
-            Self::Unknown => "unknown",
-            Self::Failed => "failed",
-        }
-    }
-
-    /// Classifies one commit result by its stable error category.
-    pub(crate) fn from_result(result: &ktann::api::Result<()>) -> Self {
-        match result {
-            Ok(()) => Self::Committed,
-            Err(error) => match error.kind() {
-                ErrorKind::RetryableAbort => Self::Retryable,
-                ErrorKind::CommitOutcomeUnknown => Self::Unknown,
-                _ => Self::Failed,
-            },
-        }
-    }
-}
-
-/// Counts one native commit's bounded outcome.
-pub(crate) fn commit(outcome: CommitOutcome) {
-    metrics::counter!(COMMIT, "backend" => BACKEND, "outcome" => outcome.as_str()).increment(1);
+/// Counts one native commit by its bounded outcome category.
+pub(crate) fn commit(result: &ktann::api::Result<()>) {
+    let outcome = match result {
+        Ok(()) => "committed",
+        Err(error) => match error.kind() {
+            ErrorKind::RetryableAbort => "retryable",
+            ErrorKind::CommitOutcomeUnknown => "unknown",
+            _ => "failed",
+        },
+    };
+    metrics::counter!(COMMIT, "backend" => BACKEND, "outcome" => outcome).increment(1);
 }
 
 /// Records one async wait for a native actor slot.

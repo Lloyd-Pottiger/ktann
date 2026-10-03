@@ -578,11 +578,12 @@ impl<T> ReadLogicalTxn<'static, T> {
 
 impl<'manifest, T> ReadLogicalTxn<'manifest, T> {
     /// Binds a read transaction to one supported Index Manifest.
-    pub fn for_index(raw: T, manifest: &'manifest IndexManifest) -> Result<Self> {
-        Ok(Self {
+    #[must_use]
+    pub fn for_index(raw: T, manifest: &'manifest IndexManifest) -> Self {
+        Self {
             raw,
             binding: LogicalBinding::for_index(manifest),
-        })
+        }
     }
 
     /// Unwraps the raw transaction so a manifest-validated read can rebind it.
@@ -814,16 +815,13 @@ impl MutationBuilder<'static> {
 
 impl<'manifest> MutationBuilder<'manifest> {
     /// Creates a builder bound to one supported Index Manifest.
+    #[must_use]
     pub fn for_index(
         manifest: &'manifest IndexManifest,
         hard_limits: HardLimits,
         budget: AdmissionBudget,
-    ) -> Result<Self> {
-        Ok(Self::new(
-            LogicalBinding::for_index(manifest),
-            hard_limits,
-            budget,
-        ))
+    ) -> Self {
+        Self::new(LogicalBinding::for_index(manifest), hard_limits, budget)
     }
 
     fn new(
@@ -991,20 +989,21 @@ impl<T> WriteLogicalTxn<'static, T> {
 
 impl<'manifest, T> WriteLogicalTxn<'manifest, T> {
     /// Binds a write transaction to one supported Index Manifest.
+    #[must_use]
     pub fn for_index(
         raw: T,
         manifest: &'manifest IndexManifest,
         hard_limits: HardLimits,
         budget: AdmissionBudget,
-    ) -> Result<Self> {
-        Ok(Self {
+    ) -> Self {
+        Self {
             raw,
             binding: LogicalBinding::for_index(manifest),
             hard_limits,
             budget,
             size: TransactionSize::default(),
             read_cache: BTreeMap::new(),
-        })
+        }
     }
 
     /// Binds a write transaction to one Dropping Manifest transition.

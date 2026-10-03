@@ -549,7 +549,7 @@ impl WriteTxn for RocksDbWriteTxn<'_> {
             .await
             .map_err(|source| Error::with_source(ErrorKind::Backend, source))?;
         drop(cancellation);
-        observe::commit(observe::CommitOutcome::from_result(&result));
+        observe::commit(&result);
         result
     }
 
