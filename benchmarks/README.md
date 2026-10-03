@@ -1,106 +1,35 @@
-# KTANN performance baselines
+# KTANN benchmarks
 
-`ktann-bench` measures ANN quality and whole-system costs through KTANN's public
-`Runtime` and `Index` APIs. It produces versioned JSON intended for same-host,
-same-input comparisons. These results are empirical baselines, not a v1 SLA.
+`ktann-bench` measures ANN quality and resource costs through the public
+`Runtime` and `Index` APIs. It writes JSON reports for reproducible, same-host
+comparisons. Results are empirical measurements, not an SLA.
 
-## Running a suite
+## Run
 
-Build and run benchmarks with optimizations enabled:
+Build and run with optimizations enabled:
 
 ```sh
 cargo run --release -p ktann-benchmarks --bin ktann-bench -- \
   run --backend rocksdb --profile smoke --output rocksdb-smoke.json
 ```
 
-`--scenario NAME` selects one scenario, and `--worker-threads N` fixes the
-Tokio executor size. The emitted `reproduction_command` records the complete
-parent invocation. Each scenario runs in a fresh subprocess so its metrics
-recorder, Partition Cache, and peak RSS do not contain another scenario's
-state.
+Each scenario runs in a fresh subprocess to isolate metrics, Partition Cache,
+and process peak RSS. `--scenario NAME` selects one scenario;
+`--worker-threads N` sets each worker's Tokio thread count. Reports include the
+resolved configuration and the full parent command needed to reproduce a run.
 
-The large profile accepts `--write-beam-size N` for import diagnostics. The
-write beam is applied globally at each tree level, like the search beam; the
-final foreground mutation still assigns each record to exactly one leaf. The
-default is four, so the option is explicit when measuring another import beam
-and its quality effect.
+| Profile | Workloads | Purpose |
+| --- | --- | --- |
+| `smoke` | Deterministic synthetic ANN, cache-disabled ANN, 95/5 and hot 50/50 search/update, saturated backend admission, import-to-search lifecycle | Functional CI checks |
+| `full` | Synthetic workloads plus SIFTsmall, Fashion-MNIST, clustered, skewed, and duplicate-heavy inputs | Performance comparisons on an otherwise idle host |
+| `large` | Cohere 1M cosine and SIFT1M L2 quality curves | Recall versus search cost on supplied ground truth |
 
-Setup stays excluded from every reported measurement, but the setup import is
-where large-scale write behavior is decided. After each quality scenario's
-batch load, the runner therefore logs the import interval's diagnostics to
-stderr: admission waits by gate, learned Import Session concurrency
-adjustments, write attempts by operation and outcome, native commit waits, and
-Fixup steps. The import metric interval is consumed at that point, so later
-phase accounting remains disjoint.
+### FoundationDB
 
-For controlled `import-to-search-lifecycle` diagnostics,
-`--maintenance-workers N` overrides the import Runtime's Structure Maintenance
-worker count (including zero), `--import-max-in-flight-batches N` overrides the
-positive Import Session concurrency ceiling, `--import-batch-size N` overrides the
-positive records per atomic batch, and `--import-backlog-watermark N` overrides
-the positive process-local Fixup backlog gate. After immediate search, the runner
-reopens the same index with the profile's
-`convergence_maintenance_workers` count so an import-only run can still reach
-the stable search phases. These options require explicitly selecting that
-lifecycle scenario so ordinary suites retain their fixed configuration.
-
-The `smoke` profile uses a small deterministic synthetic dataset and exercises
-warm-cache ANN, cache-disabled ANN, 95/5 search/update, hot 50/50
-search/update, saturated Backend admission, and one bounded import-to-search
-lifecycle. It is a functional CI signal, not a stable performance sample. The
-`full` profile adds checked-in SIFTsmall
-and Fashion-MNIST inputs plus clustered, skewed, and duplicate-heavy synthetic
-distributions at representative sizes. Full runs are intended for optimized,
-otherwise idle hosts.
-
-The separate `large` profile is an optimized scheduled/manual quality run and
-never runs in smoke CI. It loads the fixed external inputs described in
-[`datasets/README.md`](datasets/README.md), creates one converged index per
-dataset, and sweeps leaf beam `1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128, 192, 256, 384`
-while holding the four Search
-Budgets, k-derived exact-rerank policy, `k`, Runtime limits, Index configuration,
-concurrency, dataset, and Backend fixed. The curves use Cohere 1M with cosine
-and SIFT1M with L2, each with 1,000 held-out queries and supplied ground truth.
-
-Runtime and Logical Index settings follow the library defaults, including the
-partition cache (one quarter of physical memory), maintenance concurrency,
-retry limits and partition occupancy. Request Search Budgets have no overrides;
-only the beam changes across the curve, which includes the default beam of 128.
-RocksDB uses its default blocking-resource limit. Explicit diagnostic CLI
-options still override their named settings and are recorded in the report.
-The workload retains 16 concurrent clients, 1,000 warmups and import batches of
-50 records; these are benchmark load settings, not library defaults. Reports
-record resolved cache bytes, limits, attempts, partition bounds and budgets,
-so compare runs on equivalent hosts and check those values before comparing
-results. Earlier large reports with top-10 and fixed limits are not comparable.
-
-The large quality curve keeps request `k=100` and the same 1,000 distinct queries,
-with 10,000 measured operations per beam. Repeated queries reduce timing noise;
-they are not additional independent recall samples. The effective
-rerank limit is 125 under the engine default policy. Compare actual operating points at equal or better recall;
-interpolated curves do not establish latency or throughput non-regression.
-
-```sh
-cargo run --release -p ktann-benchmarks --bin ktann-bench -- \
-  run --backend rocksdb --profile large --worker-threads 8 \
-  --output rocksdb-large.json
-```
-
-Each large worker verifies at least three searchable topology levels and
-requires both recall and visited-Leaf-Entry work to move across its curve. A
-saturated or structurally shallow run fails instead of publishing a
-non-discriminating artifact.
-
-`.github/workflows/large-ann-quality.yml` runs weekly and on manual dispatch
-on a GitHub-hosted `ubuntu-latest` runner with a six-hour job timeout. Its
-concurrency group serializes large runs, and it uploads the schema-versioned
-JSON artifact for 90 days. Each run downloads and validates the datasets on
-its fresh runner. These runs verify the large profile and produce quality
-curves; use a fixed, otherwise idle host for performance comparisons across runs.
-
-FoundationDB requires a reachable local cluster, the client library, and
-`fdbcli`. The runner queries `fdbcli --exec status json` so the connected
-server version becomes part of the comparable runtime identity:
+FoundationDB requires a reachable cluster, its native client library, and
+`fdbcli` on `PATH`. Set `FDB_CLUSTER_FILE` when needed. The runner obtains the
+server version through `fdbcli --exec status json` and clears each worker's
+process-unique Backend Namespace before exit.
 
 ```sh
 cargo run --release -p ktann-benchmarks \
@@ -108,125 +37,152 @@ cargo run --release -p ktann-benchmarks \
   run --backend foundationdb --profile smoke --output foundationdb-smoke.json
 ```
 
-Set `FDB_CLUSTER_FILE` when the default cluster file is not appropriate. The
-runner assigns every FoundationDB worker a process-unique namespace and clears
-that namespace before exit. RocksDB's `blocking_resource_limit` scenario input
-has no FoundationDB equivalent; it is recorded as configuration and only
-changes RocksDB's native blocking actor bound.
+The `blocking_resource_limit` scenario setting applies only to RocksDB's native
+blocking actor bound.
 
-## Measurement contract
+### Large datasets
 
-Each report stores exactly one tagged `measurements` payload per scenario and
-records the adapter's physical key-prefix charge alongside its mutation-count
-and mutation-byte ceilings:
-`steady_state` for the existing workload cases, `lifecycle` for the
-`import-to-search-lifecycle` case, or `quality_sweep` for an ordered large ANN
-curve. A quality sweep also reports construction from import start through the
-first complete, maintenance-converged topology audit: continuous total wall/CPU,
-whole-worker peak RSS at that boundary, and separate import/convergence resources,
-logical IO, write/maintenance activity, admission and cache summaries. Concurrent
-maintenance is already inside import; convergence includes subsequent rediscovery
-and verification. Dataset/index creation, metric-summary rendering, oracle
-preparation and query warmup are outside construction. Raw import metric samples
-are retained through the bounded convergence phase and released before queries. Construction RSS still includes earlier dataset
-loading because it is a process-lifetime high-water mark.
+Prepare the pinned files described in [datasets/README.md](datasets/README.md).
+Use `KTANN_BENCH_DATASET_CACHE` for a persistent cache; the default is
+`/tmp/vectordb_bench/dataset`.
 
-The lifecycle case and quality-sweep construction accounting do not change the
-setup exclusions or workload semantics of the search points described below.
+```sh
+cargo run --release -p ktann-benchmarks --bin ktann-bench -- \
+  run --backend rocksdb --profile large --worker-threads 8 \
+  --output rocksdb-large.json
+```
 
-For steady-state workloads and quality-sweep search points, setup is excluded
-from the wall-clock, CPU, latency, throughput, metric, and Backend-IO deltas. Setup includes dataset loading, index creation and batch
-load, demand-driven topology convergence, verification, brute-force oracle
-construction for ordinary scenarios, supplied ground-truth validation for
-large scenarios, operation materialization, cache warmup, and draining
-warmup's Structure Maintenance backlog. A second invariant audit runs after
-measurement.
-Peak RSS is different: the operating-system high-water mark necessarily covers
-the entire isolated worker, including setup and warmup.
+Each curve uses `k=100`, 1,000 held-out queries, 1,000 warmups, 16 concurrent
+clients, and 10,000 measured operations per beam. Repeated queries reduce timing
+noise; they do not add independent recall samples. Import batches contain 50
+records. The leaf beam sweep is `8, 16, 24, 32, 48, 64, 128, 192, 256, 384`.
 
-Mutation stage durations cover routing (including protected route validation),
-Location/membership prefetch, and buffered membership application. They retain
-failed/cancelled work and overlap concurrent operations; they are aggregate
-elapsed service/wait times, not percentages that sum to wall time. Transaction
-open/manifest checks, preprocessing and retry waits are not separately timed by
-these three probes. Logical scan calls/bytes are not physical IO requests.
+Runtime and Logical Index settings use library defaults, including Partition
+Cache sizing, maintenance concurrency, retry limits, and partition occupancy.
+Search Budget limits and the k-derived exact-rerank policy remain fixed across
+the curve; the effective rerank limit is 125. Reports record resolved settings,
+so check them before comparing runs. Each worker requires at least three
+searchable topology levels and variation in both recall and visited Leaf Entry
+work; shallow or saturated curves fail validation.
 
-The timed workload reports:
+The [large ANN workflow](../.github/workflows/large-ann-quality.yml) runs weekly
+and on manual dispatch, validates datasets, and uploads reports. Use a fixed,
+otherwise idle host for performance comparisons.
 
-- accepted-operation throughput plus attempted, accepted, admission-rejected,
-  and stable error-category counts by search/write class;
-- accepted end-to-end latency distributions by search/write class; rejection
-  rates are derived from the reported outcome counts;
-- exact recall@k against metric-specific brute-force truth for ordinary
-  immutable ANN scenarios; large quality scenarios use the dataset's supplied
-  exact-neighbor truth (`cosine` for Cohere and `L2` for SIFT);
-- every Search Budget dimension and separate `approximate_selection` and
-  `exact_reranking` stage latency;
-- Partition Cache hits, misses, stale misses, installs, and accounted bytes;
-- blocking-resource wait/held time and Import admission wait where emitted;
-- Backend-boundary logical reads, scans, returned items/bytes, transaction
-  attempts, commit outcomes, and attempted mutations/bytes;
-- phase-local whole write attempts, retries, logical mutations/bytes, and native
-  commit wait attributed by `batch_mutate`, `split_fixup`, and `merge_fixup`;
-- Fixup state-machine advance results and entries moved per committed split or
-  merge drain step;
-- logical write amplification as attempted mutation operations and bytes per
-  successful public write, including retry attempts.
+### Diagnostic options
 
-`configuration.search_budgets` exposes the same three dimension names used by
-the steady-state measurement payload's `search_budgets`:
-`scanned_tree_keys`, `visited_partitions`, and
-`exact_rerank_candidates`. Each configuration entry distinguishes the Runtime
-`runtime_default`, an optional per-request `request_override`, and the concrete
-`effective_limit`; exact reranking is engine-sized, so that dimension's request
-override is always absent. The measurement entry can therefore compare its
-usage and exhausted-search count directly with the governing limit. The separate
-`visited_leaf_entries` measurement records the distribution of uncapped Leaf Entry
-scans through `ktann.search.leaf_entries`. It counts entries considered during filtering and approximate
-selection; `exact_rerank_candidates` counts original Vector Records loaded and
-exactly reranked.
+`--write-beam-size N` overrides the write routing beam. Large runs also accept
+`--base-vectors N`, `--query-vectors N`, `--query-offset N`, and
+`--max-partition-entries N`. Resolved overrides are recorded in each report.
 
-The configuration also records `leaf_beam_size_override` because this
-per-request traversal input affects recall and partition work even though it is
-not a Search Budget dimension.
+These import options apply to `--profile large` or an explicitly selected
+`--scenario import-to-search-lifecycle`:
 
-Large reports record the ordered `leaf_beam_sweep` once and emit one point per
-beam. Every point contains mean/min recall@k, search-latency p50/p95/p99,
-throughput, CPU, process peak RSS, all Search Budget usage and exhaustion,
-approximate/rerank stage latency, Partition Cache behavior, and Backend IO. The
-topology records Tree count, true Partition Header count, maximum level, and
-Partition counts by level from the same successful invariant audit.
+| Option | Meaning |
+| --- | --- |
+| `--maintenance-workers N` | Import Runtime maintenance workers; zero is allowed |
+| `--import-max-in-flight-batches N` | Positive Import Session concurrency ceiling |
+| `--import-batch-size N` | Positive records per atomic batch |
+| `--import-backlog-watermark N` | Positive process-local Fixup Backlog watermark |
 
-Foreground `wall_seconds`, throughput, and operation latency stop when the last
-public operation completes. `maintenance_drain_seconds`, CPU, and Backend IO
-continue until the pending-plus-running Fixup backlog returns to zero, so
-maintenance causally triggered by measured writes is attributed to that run
-without inflating foreground latency. Recall calculation happens after all
-resource sampling.
+After immediate search, the lifecycle runner reopens the Logical Index with
+its configured convergence workers, allowing an import with maintenance disabled
+to reach the stable search phases. Import Sessions adapt concurrency below the
+configured ceiling; see [ADR 0022](../docs/adr/0022-feedback-controlled-import-admission.md).
 
-Mixed update/search scenarios omit recall because the immutable pre-run oracle
-would be stale after concurrent updates. Failed operations are counted by
-stable error category and excluded from successful latency and throughput;
-they still contribute any Backend work attempted before failure. The logical
-write-amplification definition is backend-neutral and deliberately distinct
-from RocksDB engine-level physical write amplification.
+## Measurements
 
-The `backend-admission-saturated` scenario submits fixed concurrent waves. A
-wave drains before the next begins, preventing fast `LimitExceeded` results
-from recursively generating nearly all remaining attempts while accepted work
-is still in flight. Runtime admission limits are unchanged. Both profiles
-require at least 100 accepted searches and 100 accepted writes, with an overall
-rejection rate from 25% through 75%. A run outside
-that declared operating region fails instead of emitting a statistically weak
-baseline. The smoke scenario measures 640 operations; the full scenario
-measures 2,000 operations.
+Reports contain one tagged payload per scenario: `steady_state`, `lifecycle`,
+or `quality_sweep`. Configuration includes backend mutation limits, physical
+key-prefix charges, cache limits, Search Budgets, and beam overrides.
 
-## Comparing results
+Steady-state measurements exclude dataset loading and validation, index creation,
+batch import, invariant verification, oracle construction, request materialization,
+cache warmup, and draining warmup's maintenance backlog. A second invariant audit
+runs after measurement. Import diagnostics are written to stderr and consumed
+before later measurement phases so their accounting remains disjoint.
 
-Capture baseline and candidate suites on the same otherwise idle host, with
-the same build profile, feature set, compiler and Rust flags, worker count,
-Backend client/server identity and limits, scenario configuration, and dataset
-checksum. Then run:
+Reports include:
+
+- Attempted, accepted, rejected, and failed operations by search/write class,
+  accepted-operation throughput, and accepted end-to-end latency distributions.
+- Recall@k against metric-specific brute-force truth for immutable ordinary ANN
+  scenarios, or supplied ground truth for large datasets.
+- Search Budget usage and exhaustion, visited Leaf Entries, approximate-selection
+  and exact-reranking latency, and Partition Cache activity.
+- CPU, process peak RSS, backend logical reads/scans/items/bytes, transaction
+  attempts and commit outcomes, and attempted mutation operations/bytes.
+- Admission and blocking-resource waits, operation-attributed write attempts and
+  native commit waits, Fixup steps, and entries moved by split/merge drains.
+- Logical write amplification: attempted mutation operations and bytes per
+  successful public write, including retries and failed work.
+
+Foreground timing ends when the last public operation completes. Backend and
+maintenance counters include the subsequent bounded drain. Mutation stage
+latencies include failed/cancelled work and overlapping operations; they are
+aggregate service/wait times, not percentages of wall time. Logical scans and
+write amplification do not measure physical storage IO or engine amplification.
+
+Search Budget configuration distinguishes the Runtime default, optional request
+override, and effective limit for `scanned_tree_keys`, `visited_partitions`, and
+`exact_rerank_candidates`. Exact reranking is engine-sized, with no request
+budget override. `visited_leaf_entries` counts uncapped filtering and
+approximate-selection work; it is separate from records loaded for exact
+reranking. The leaf beam is also a separate traversal setting.
+
+Peak RSS always covers the entire worker, including setup and warmup. It is a
+process high-water mark, not a phase-local or additive measurement.
+
+### Quality curves
+
+A `quality_sweep` records the ordered beam sweep and one measurement point per
+beam, plus Tree count, Partition Header count, maximum level, and partitions by
+level from the invariant audit. Construction spans import through the first
+complete maintenance-converged topology audit. Import and convergence resources
+are reported separately; concurrent maintenance is already included in import.
+Dataset/index creation, oracle preparation, metric rendering, and query warmup
+are outside construction timing. Construction RSS still includes dataset loading.
+Raw import metrics are retained through bounded convergence and released before
+queries.
+
+Compare actual operating points at equal or better recall. Interpolated curves
+do not establish latency or throughput non-regression. Per-point peak RSS cannot
+isolate individual beams within the worker and is excluded from comparison.
+
+### Admission saturation
+
+`backend-admission-saturated` submits fixed concurrent waves, draining each
+before starting the next. A valid run requires at least 100 accepted searches
+and 100 accepted writes, with 25–75% overall rejection. Smoke measures 640
+operations; full measures 2,000. Runs outside this region fail validation.
+
+### Import-to-search lifecycle
+
+Each lifecycle worker creates a fresh Backend Namespace and Logical Index and
+prepares its dataset, requests, and exact oracle before timing. The continuous
+case starts before the first `ImportSession::submit` and ends after warmed search:
+
+1. `import` ends after `ImportSession::finish` and includes concurrent maintenance.
+   Finish is a batch-outcome barrier, not a topology-convergence barrier. The
+   scenario fails unless every submitted record is accepted.
+2. `immediate_search` runs the fixed queries before the runner drives convergence.
+3. `convergence` uses bounded public `verify` and `search` calls, requires unchanged
+   topology across three observations, drains the observed Fixup Backlog, and
+   rechecks counts. `from_import_finish_seconds` includes immediate search.
+4. `cache_reset` shuts down the Runtime and reopens the same Logical Index in a
+   new Runtime, giving the cold pass an empty process-local Partition Cache.
+5. `stable_cold_search` runs the queries once; `stable_warm_search` repeats them.
+
+Case wall time, CPU, and backend IO include all phases and intervening harness
+work. Unattributed overhead is derived by subtracting named phases. Evaluate
+import throughput, failures, convergence, recall, latency, CPU, and IO together;
+fewer retries alone do not establish an improvement.
+
+## Compare
+
+Capture baseline and candidate on the same otherwise idle host with matching
+build settings, compiler, Rust flags, worker count, backend identity and limits,
+scenario configuration, and dataset checksum:
 
 ```sh
 cargo run --release -p ktann-benchmarks --bin ktann-bench -- \
@@ -234,138 +190,50 @@ cargo run --release -p ktann-benchmarks --bin ktann-bench -- \
   --output comparison.json
 ```
 
-The comparator refuses different report schemas, scenario sets, inputs, or
-hardware/runtime fingerprints. By default it flags more than 20% regression in
-p95 latency, throughput, CPU, peak RSS, or logical write amplification, and an
-absolute mean recall drop greater than 0.02. Admission rejection is compared
-across the fixed operation mix with a five-percentage-point absolute increase
-threshold. Per-class outcomes remain in the report, while the aggregate avoids
-mistaking scheduler-dependent permit allocation between searches and writes
-for an admission regression. Override
-these materiality bounds with `--maximum-relative-regression`,
-`--maximum-recall-drop`, and `--maximum-rejection-rate-increase`. All accept
-fractions: for example, `0.10` means ten percentage points for the absolute
-thresholds and 10% for the relative threshold. Thresholds absorb ordinary
-measurement noise; changing them is benchmark policy, not a public KTANN
-guarantee. Latency distributions additionally require at least a 1 ms absolute
-p95 increase before a relative increase is material, avoiding large ratios on
-sub-millisecond samples.
+The comparator rejects different schemas, scenario sets, inputs, or
+hardware/runtime fingerprints. Default regression thresholds are:
 
-For `quality_sweep` reports, comparison pairs identical beam points and applies
-the existing recall, latency, throughput, CPU, cache, Search Budget, and
-Backend-IO policies to every point. Per-point RSS is unavailable because the
-operating-system high-water mark cannot distinguish multiple beam points in one
-worker. Compare only artifacts from the same otherwise idle host and fixed
-dataset cache; beam values and other tuning inputs are experiment coordinates,
-not a production SLA.
+| Measure | Threshold |
+| --- | --- |
+| p95 latency, throughput, CPU, peak RSS, logical write amplification | More than 20% relative regression |
+| Mean recall | More than 0.02 absolute drop |
+| Overall admission rejection rate | More than 0.05 absolute increase |
 
-`git_revision` receives a `-dirty` suffix when tracked or untracked workspace
-changes are present. Commit or otherwise preserve the exact patch before using
-such a local report as a durable baseline.
+Latency also requires at least a 1 ms absolute p95 increase. Rejection is compared
+across the fixed operation mix because permit allocation between searches and
+writes can vary. Override thresholds with `--maximum-relative-regression`,
+`--maximum-recall-drop`, and `--maximum-rejection-rate-increase`; all take fractions.
 
-## Import-to-search lifecycle
+Quality sweeps compare corresponding beam points. Lifecycle comparisons include
+import throughput, submit latency, failures, waits, finish-to-stable time, search
+phases, and backend IO. Preserve the exact source revision and patch used for
+local baselines; `git_revision` has a `-dirty` suffix when the workspace changes.
 
-Every lifecycle worker opens a fresh isolated Backend Namespace and creates a
-fresh Logical Index through `Runtime::create_index` before timing. Dataset
-loading, record/request materialization, and exact-oracle construction are also
-complete before the continuous case timer. The timer begins immediately before
-the first `ImportSession::submit` and ends when the final warmed search returns.
+## VectorDBBench
 
-The report keeps these boundaries distinct:
+`ktann-vdbbench-bridge` owns one Runtime, backend, and Logical Index across
+VectorDBBench's loader, optimizer, and search workers. The Python adapter and
+process tests live in the [VectorDBBench repository](https://github.com/Lloyd-Pottiger/VectorDBBench).
 
-1. `import` begins before the first submit and ends after
-   `ImportSession::finish`. It reports accepted batches and records, throughput,
-   submit percentiles, gate waits, batch failures, CPU, Backend IO, peak RSS,
-   operation-attributed write work, Fixup steps, drain batch sizes, and
-   concurrent Structure Maintenance. `finish` remains only an accepted
-   batch-outcome barrier. The case fails if any submitted record is not
-   accepted, so subsequent recall always measures the complete fixed corpus.
-2. `immediate_search` is the first fixed query pass after finish, before the
-   runner drives convergence. It reports first-query and p50/p95/p99 latency,
-   throughput, mean/minimum recall@k, truncation, Search Budget use, cache
-   behavior, CPU, and Backend IO.
-3. `convergence` uses bounded public `verify` and `search` calls until a
-   structured topology is verified unchanged across three observations, drains
-   the observed Fixup backlog, and verifies that the counts remain unchanged.
-   Its active phase costs are separate, while `from_import_finish_seconds` includes
-   the preceding immediate-search pass so time to verified readiness is not
-   understated.
-4. `cache_reset` shuts down the first Runtime, creates a new Runtime over the
-   same Backend Namespace, and reopens the Index. This gives the stable cold
-   pass a deterministic empty process-local Partition Cache without changing
-   persistent topology.
-5. `stable_cold_search` runs the fixed query set once; `stable_warm_search`
-   repeats it immediately to expose warmed steady-state behavior.
+The bridge supports RocksDB and FoundationDB, unfiltered single-tenant IDs-only
+L2/cosine search, and signed 64-bit record IDs. Search uses public API defaults;
+overrides and native diagnostics appear in a companion report without changing
+canonical VectorDBBench metrics.
 
-`case_wall_seconds`, `case_cpu_seconds`, and `case_backend_io` cover the
-continuous case. Unattributed harness overhead is derived by subtracting the
-named phases from those totals, so the report does not store a second accounting
-authority. Peak RSS is the operating-system process high-water mark at each
-boundary and is not additive; the import value can therefore include the
-pre-timed dataset and oracle resident in the isolated worker.
-
-The comparator requires identical lifecycle bounds and inputs. In addition to
-the warmed steady-state rules, it compares import throughput and submit
-latency, batch failures and gate waits, finish-to-stable time, each query
-stage's latency/throughput/recall/cache/budget results, and phase Backend IO.
-
-### Evaluating adaptive import admission
-
-Adaptive import admission uses observed write contention rather than raw
-partition count: an atomic batch may update many leaves, skew can keep one leaf
-hot in a large tree, and concurrent Structure Maintenance can conflict while
-the process-local queue is nearly empty. `ImportSession` treats its configured
-maximum in-flight value as a ceiling. It starts at one, cautiously probes higher
-concurrency after saturated clean completion windows, and contracts before
-retrying a contended batch. The default backlog watermark is two, allowing one
-pending or running Fixup to coexist with import before new admission pauses.
-Submitted batches remain indivisible atomic operations.
-
-Use the `import-to-search-lifecycle` scenario to compare batch sizes,
-concurrency ceilings, maintenance-worker counts, and backlog watermarks. Keep
-inputs and host conditions fixed, repeat each configuration, and retain the
-reports with their revision and configuration metadata. Evaluate accepted
-records, failures, convergence, immediate and stable recall, search budgets,
-latency, CPU, and backend IO together; fewer retries or a quieter queue alone
-are not evidence of an improvement. See
-[ADR 0022](../docs/adr/0022-feedback-controlled-import-admission.md) for the
-admission policy and its invariants.
-
-## VectorDBBench interoperability
-
-`ktann-vdbbench-bridge` is a benchmark-only Rust binary supporting RocksDB and
-FoundationDB. One process owns the Runtime, backend and index across
-VectorDBBench's loader, optimizer and search workers. The Python client, CLI
-registration and process tests belong to the separate
-[VectorDBBench repository](https://github.com/Lloyd-Pottiger/VectorDBBench).
-
-The supported workload is unfiltered, single-tenant, IDs-only L2 or cosine
-search with signed 64-bit record IDs. Search inherits the public API defaults;
-explicit beam and budget overrides are recorded in the companion report.
-Canonical VectorDBBench metrics remain unchanged; native timings, topology,
-resources and backend IO are reported separately.
-
-Protocol version 1 uses a four-byte big-endian length followed by JSON over a
-Unix socket, bounded to 8 MiB per frame and 128 connections. Each insert commits
-at most 50 records and finishes its Import Session before acknowledging success.
-Unknown outcomes must not be replayed automatically. Optimize checks the exact
-record count and waits for no actionable or transitional partitions, failing
-on invalid snapshots or its bounded deadline.
-
-Build from the KTANN checkout:
+Protocol version 1 uses length-prefixed JSON over a Unix socket: a four-byte
+big-endian length, at most 8 MiB per frame, and at most 128 connections. Inserts
+commit at most 50 records per batch and finish the Import Session before success.
+Do not automatically replay unknown outcomes. Optimize verifies the exact record
+count and waits for no actionable or transitional partitions within a deadline.
 
 ```sh
 cargo build --release -p ktann-benchmarks --bin ktann-vdbbench-bridge
-# For FoundationDB, add --all-features and configure the native client/cluster
-# using the FoundationDB instructions above.
-cargo test -p ktann-benchmarks --all-features
 ```
 
-Use a VectorDBBench checkout containing the KTANN adapter, installed with
-`pip install -e .`. Its `vectordb_bench/backend/clients/ktann/README.md` describes
-bridge startup and canonical CLI runs. Client companion timings are optional
-via `--companion-dir`; native diagnostics remain in the bridge report.
-Run the process tests from that checkout:
+For FoundationDB, add `--all-features` and configure its native client and cluster.
+Install the VectorDBBench checkout with `pip install -e .`; its
+`vectordb_bench/backend/clients/ktann/README.md` documents startup and CLI usage.
+Run its process tests from that checkout:
 
 ```sh
 export KTANN_BRIDGE_BIN=/path/to/ktann/target/release/ktann-vdbbench-bridge
@@ -375,6 +243,6 @@ KTANN_TEST_BACKEND=foundationdb python -m unittest discover \
 ```
 
 Use a fresh bridge and dedicated backend location per case. Shutdown finishes
-import, drops the benchmark index and removes its socket. After a crash, remove
-a stale socket only after confirming the old process has exited; the bridge
-never unlinks a preexisting socket automatically.
+import, drops the Logical Index, and removes the socket. After a crash, confirm
+the old process has exited before removing its stale socket; startup never
+unlinks a preexisting socket.

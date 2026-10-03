@@ -216,21 +216,21 @@ impl CapturedMetrics {
     #[must_use]
     pub fn write_attribution(&self) -> WriteAttribution {
         WriteAttribution {
-            mutation_stage_ms: self
-                .distributions_rendered("ktann.mutation.stage.duration")
-                .into_iter()
-                .map(|(labels, distribution)| (labels, distribution.seconds_to_milliseconds()))
-                .collect(),
+            mutation_stage_ms: self.distributions_ms("ktann.mutation.stage.duration"),
             attempts: self.counters_rendered("ktann.write.attempts"),
             retries: self.counters_rendered("ktann.write.retries"),
             mutation_operations: self.counters_rendered("ktann.write.mutations"),
             mutation_bytes: self.counters_rendered("ktann.write.mutation_bytes"),
-            commit_wait_ms: self
-                .distributions_rendered("ktann.write.commit.duration")
-                .into_iter()
-                .map(|(labels, distribution)| (labels, distribution.seconds_to_milliseconds()))
-                .collect(),
+            commit_wait_ms: self.distributions_ms("ktann.write.commit.duration"),
         }
+    }
+
+    /// Converts duration series to milliseconds while preserving their label sets.
+    fn distributions_ms(&self, name: &str) -> BTreeMap<String, Distribution> {
+        self.distributions_rendered(name)
+            .into_iter()
+            .map(|(labels, distribution)| (labels, distribution.seconds_to_milliseconds()))
+            .collect()
     }
 
     /// Converts captured cache series into the report schema.

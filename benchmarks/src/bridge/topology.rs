@@ -1,8 +1,6 @@
-//! Read-only benchmark readiness snapshot. This is not a full record-integrity audit.
+//! Read-only readiness snapshots for the bridge's single Tree Key.
 //!
-//! The bridge creates exactly one Tree Key and performs no deletes. Header counts
-//! suffice to observe split/merge readiness without re-reading and re-encoding a
-//! million Vector Records on every poll. Production codecs own the persistent format.
+//! Header counts establish maintenance readiness, not full record integrity.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -26,12 +24,13 @@ pub(super) struct Snapshot {
 }
 
 /// A readiness round reads at most 262,144 allocated Header slots in 256-key
-/// batches and retains at most 32 maintenance probes. Missing slots are legal
+/// batches and, when requested, loads at most 32 maintenance probes. Missing slots are legal
 /// allocator gaps or deleted partitions. All live Headers use one read snapshot.
 pub(super) async fn snapshot<B: Backend>(
     backend: &B,
     index: LogicalIndexId,
     records: u64,
+    collect_probes: bool,
 ) -> Result<Snapshot> {
     let corrupt = || Error::new(ErrorKind::Corruption);
     let mut txn = backend.begin_read().await?;
@@ -117,7 +116,7 @@ pub(super) async fn snapshot<B: Backend>(
             if needs_work && partition == tree.root() {
                 needs_root_probe = true;
             }
-            if needs_work && partition != tree.root() && probe_keys.len() < 32 {
+            if collect_probes && needs_work && partition != tree.root() && probe_keys.len() < 32 {
                 probe_keys.push(partition);
             }
         }
@@ -125,26 +124,28 @@ pub(super) async fn snapshot<B: Backend>(
     if !root_present {
         return Err(corrupt());
     }
-    let centroid_keys = probe_keys
-        .iter()
-        .map(|p| Bytes::from(keys::centroid_key(index, &tree_key, *p)))
-        .collect();
-    let mut probes = Vec::new();
-    for (partition, bytes) in probe_keys
-        .into_iter()
-        .zip(txn.batch_get(centroid_keys).await?)
-    {
-        let key = LogicalKey::Centroid {
-            index,
-            tree_key: tree_key.clone(),
-            partition,
-        };
-        let PersistentValue::PartitionCentroid(centroid) =
-            codec.decode(&key, bytes.ok_or_else(corrupt)?)?
-        else {
-            return Err(corrupt());
-        };
-        probes.push(Arc::from(centroid.components()));
+    let mut probes = Vec::with_capacity(probe_keys.len());
+    if !probe_keys.is_empty() {
+        let centroid_keys = probe_keys
+            .iter()
+            .map(|p| Bytes::from(keys::centroid_key(index, &tree_key, *p)))
+            .collect();
+        for (partition, bytes) in probe_keys
+            .into_iter()
+            .zip(txn.batch_get(centroid_keys).await?)
+        {
+            let key = LogicalKey::Centroid {
+                index,
+                tree_key: tree_key.clone(),
+                partition,
+            };
+            let PersistentValue::PartitionCentroid(centroid) =
+                codec.decode(&key, bytes.ok_or_else(corrupt)?)?
+            else {
+                return Err(corrupt());
+            };
+            probes.push(Arc::from(centroid.components()));
+        }
     }
     Ok(Snapshot {
         progress: progress.digest(),
@@ -203,7 +204,7 @@ mod tests {
             })
             .collect();
         index.batch_mutate(mutations).await.unwrap();
-        let metadata = snapshot(&backend, index.logical_index_id(), 64)
+        let metadata = snapshot(&backend, index.logical_index_id(), 64, false)
             .await
             .unwrap();
         let full = index.verify(VerifyOptions::default()).await.unwrap();
@@ -215,7 +216,7 @@ mod tests {
         );
         assert_eq!(metadata.facts["partitions"], full.topology.partitions);
         assert!(
-            !snapshot(&backend, index.logical_index_id(), 65)
+            !snapshot(&backend, index.logical_index_id(), 65, true)
                 .await
                 .unwrap()
                 .ready
@@ -231,7 +232,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let pending = snapshot(&backend, index.logical_index_id(), 65)
+        let pending = snapshot(&backend, index.logical_index_id(), 65, true)
             .await
             .unwrap();
         assert!(!pending.ready);

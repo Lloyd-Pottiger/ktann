@@ -1931,7 +1931,7 @@ mod tests {
     }
 
     #[test]
-    fn compares_each_issue_38_measurement_family() {
+    fn compares_steady_measurement_families() {
         let mut baseline_report = report();
         let measurements = steady_mut(&mut baseline_report);
         measurements.maintenance_drain_seconds = 1.0;
