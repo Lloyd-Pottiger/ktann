@@ -1,7 +1,5 @@
 # KTANN Vector Index Design Overview
 
-Status: Implementation-ready
-
 This document is the system-level design for KTANN. It defines the product
 boundary, authoritative invariants, module ownership, and end-to-end behavior.
 Detailed contracts live in the module designs linked below. Domain terms are
@@ -16,7 +14,7 @@ backend. One Logical Index is a Tree-Key-sharded forest of incrementally
 maintained binary K-means trees. Search uses conservative predicate pruning,
 RaBitQ7 approximate ranking, and exact reranking over the original vectors.
 
-The first stable release supports FoundationDB and RocksDB through one logical
+KTANN supports FoundationDB and RocksDB through one logical
 storage contract. The adapters share Rust interfaces and logical codecs, but
 their physical keyspaces are neither portable nor mutually compatible.
 
@@ -201,18 +199,7 @@ common Backend API does not invent a long-lived snapshot facility.
   values, vectors, or payloads. Traces may use the explicitly allowed stable
   identifiers and hashes defined by the operations design.
 
-## 8. Delivery and validation
-
-Implementation proceeds in coherent increments:
-
-1. Workspace, domain types, exact codecs, deterministic test backend, and
-   backend contract suite.
-2. Typed storage, FoundationDB adapter, lifecycle, mutation, and point reads.
-3. Predicate evaluation, synopses, Tree Key directory, and initial routing.
-4. Search, scalar-f64 RaBitQ7, exact reranking, and epoch-safe cache.
-5. Split and merge state machines plus the maintenance runtime.
-6. RocksDB adapter and blocking-resource admission.
-7. Import, verification, observability, crash histories, and benchmarks.
+## 8. Validation
 
 Tests protect current contracts: backend transaction semantics; codec golden
 vectors; model-based mutation and crash histories; synopsis and numeric

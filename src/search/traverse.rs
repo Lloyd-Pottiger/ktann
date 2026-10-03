@@ -10,7 +10,7 @@
 //! snapshot-validated Partition Cache (ADR 0010); cache warmth never changes
 //! the logical budget accounting below. Global overlap selection, exact Vector
 //! Record loading and reranking, and Search Outcome assembly stay with the
-//! rerank stage and the public search operation (#30).
+//! rerank stage and the public search operation.
 //!
 //! # Contract
 //!

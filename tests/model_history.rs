@@ -1,4 +1,4 @@
-//! Replayable crash-history and model-validation coverage (issue #37): one
+//! Replayable crash-history and model-validation coverage: one
 //! seeded script drives the public API through lifecycle transitions, atomic
 //! Foreground Mutations (some armed with commit faults), manually advanced
 //! split/merge Structure Maintenance, queue loss via crash/reopen, unknown

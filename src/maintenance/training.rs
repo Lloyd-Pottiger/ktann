@@ -1,7 +1,7 @@
 //! Deterministic binary K-means split training (ADR 0015).
 //!
 //! Split training turns one consistent snapshot of a split source into the two
-//! target centroids the split state machine (#10) persists on the exposed
+//! target centroids the split state machine persists on the exposed
 //! targets. Training output is a routing model, not persistent authority
 //! (ADR 0014): concurrent source writes need not restart training, and every
 //! committed split phase stays searchable regardless of centroid freshness.

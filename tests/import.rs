@@ -25,8 +25,7 @@ use support::{
 mod support;
 
 /// A generous bound on every wait in these tests: a missed wakeup or a lost
-/// Fixup offer must fail the test in seconds, never hang a CI job for hours
-/// (issue #109).
+/// Fixup offer must fail the test in seconds, never hang a CI job for hours.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Holds chosen commits before their commit boundary until released.

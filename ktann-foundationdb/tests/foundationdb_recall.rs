@@ -1,4 +1,4 @@
-//! Recall parity against a local FoundationDB 7.3 cluster (issue #100): the
+//! Recall parity against a local FoundationDB 7.3 cluster: the
 //! public Runtime/Index API over the real adapter meets the recall contract
 //! the deterministic-backend corpus pins. Durability across a cluster
 //! restart is covered by the phased `foundationdb_durability` binary.

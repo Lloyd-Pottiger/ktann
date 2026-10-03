@@ -1,4 +1,4 @@
-//! Capture harness for the privacy-safe metrics and tracing audits (issue #36).
+//! Capture harness for the privacy-safe metrics and tracing audits.
 //!
 //! One global `metrics` recorder and one global `tracing` subscriber capture
 //! every emission the process makes. Audit tests serialize through

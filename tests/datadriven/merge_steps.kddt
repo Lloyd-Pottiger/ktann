@@ -1,6 +1,6 @@
 # ----------------------------------------------------------------------
-# Merge state machine, one bounded transition at a time (issue #31; the split
-# side is covered in split_steps.kddt). Every committed intermediate state
+# Merge state machine, one bounded transition at a time. The split
+# side is covered in split_steps.kddt. Every committed intermediate state
 # must stay searchable and pass the exact-membership audit; format-tree
 # renders each phase.
 #

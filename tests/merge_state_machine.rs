@@ -1,4 +1,4 @@
-//! Searchable merge state machine contract tests (#31).
+//! Searchable merge state machine contract tests.
 //!
 //! Every committed merge phase must stay searchable and preserve exact
 //! membership; each bounded drain batch reselects the nearest Ready same-level

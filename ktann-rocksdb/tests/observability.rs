@@ -1,4 +1,4 @@
-//! RocksDB adapter metric assertions (issue #36).
+//! RocksDB adapter metric assertions.
 //!
 //! The adapter emits its blocking-admission and commit observations through
 //! the `metrics` facade under the `ktann.*` namespace with only the bounded

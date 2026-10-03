@@ -1,7 +1,5 @@
 # Foreground Mutation and Structure Maintenance
 
-Status: Implementation-ready
-
 This module owns record routing, exact foreground membership changes, binary
 K-means tree shape, and persistent split/merge state machines.
 

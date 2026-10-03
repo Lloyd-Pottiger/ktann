@@ -258,7 +258,7 @@ fn validate_steady_operation_summaries(
     Ok(())
 }
 
-/// Applies every issue #38 comparison family to one comparable scenario pair.
+/// Applies every supported comparison family to one comparable scenario pair.
 fn compare_report(
     key: &str,
     baseline: &BenchmarkReport,

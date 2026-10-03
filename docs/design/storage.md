@@ -1,7 +1,5 @@
 # Transactional Storage and Persistent Format
 
-Status: Implementation-ready
-
 This module owns the common backend contract, persistent identity and lifecycle,
 logical key/value codecs, and typed atomic storage operations.
 

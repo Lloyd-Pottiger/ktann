@@ -1,5 +1,5 @@
-//! API-level recall parity scenario for the production adapter crates
-//! (issue #100): the public Runtime/Index API over a real backend must meet
+//! API-level recall parity scenario for the production adapter crates.
+//! The public Runtime/Index API over a real backend must meet
 //! the same recall contract the deterministic-backend corpus pins.
 //!
 //! Each adapter test includes this file by path (`#[path = ...]`) and drives

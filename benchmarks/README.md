@@ -309,7 +309,7 @@ the warmed steady-state rules, it compares import throughput and submit
 latency, batch failures and gate waits, finish-to-stable time, each query
 stage's latency/throughput/recall/cache/budget results, and phase Backend IO.
 
-### Actionable maintenance validation
+### Historical measurement: actionable maintenance discovery
 
 An otherwise-idle Apple M1 Pro run on 2026-08-28 compared revision `da57d81`
 with actionable, batch-coalesced maintenance discovery. Both runs used the
@@ -323,7 +323,7 @@ with actionable, batch-coalesced maintenance discovery. Both runs used the
 | FoundationDB | `da57d81` | 10,000 | 5,145 | 14,113 | 27.205 |
 | FoundationDB | actionable discovery | 109 | 109 | 4,041 | 27.721 |
 
-The current implementation removed all 5,036 merge-idle and 5,038/5,036
+The measured implementation removed all 5,036 merge-idle and 5,038/5,036
 split-idle steps reported during RocksDB/FoundationDB import. Both sides still
 reported 2,602 successful commits, 109 split begin/completion steps, 1,857
 split drain steps, complete convergence, recall@10 of 1.0 in the immediate,
@@ -349,7 +349,7 @@ cargo run --release -p ktann-benchmarks \
   --scenario import-to-search-lifecycle --output REPORT.json
 ```
 
-### Adaptive leaf-drain validation
+### Historical measurement: adaptive leaf draining
 
 Three independent same-host runs on 2026-08-28 compared revision `ccb4090`
 with the adaptive leaf relocation batch. Both sides used the `full`
@@ -372,7 +372,7 @@ mean with the sample coefficient of variation in parentheses.
 
 The workload's 128-entry partition limit selected a 32-entry contention cap
 (since raised to the full configured threshold; see
-`docs/design/maintenance.md` §4.2).
+[maintenance design](../docs/design/maintenance.md) §4.2).
 On both adapters, successful import commits fell from 2,602 to 1,290, read
 transactions from 4,041 to 1,417, and split drain steps from 1,857 to 545.
 Every run accepted all 10,000 records, converged completely, reported

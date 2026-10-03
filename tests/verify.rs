@@ -1,4 +1,4 @@
-//! Public bounded read-only verification contract tests (issue #35).
+//! Public bounded read-only verification contract tests.
 //!
 //! Every test drives the public `Index::verify` API against the deterministic
 //! in-memory backend. A healthy index verifies complete and issue-free —
