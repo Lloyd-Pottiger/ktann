@@ -964,8 +964,7 @@ mod tests {
         budgets: SearchBudgets,
         beam: u32,
     ) -> Result<TraversalOutcome> {
-        let mut txn =
-            ReadLogicalTxn::for_index(MockReadTxn::new(items), manifest).expect("bind manifest");
+        let mut txn = ReadLogicalTxn::for_index(MockReadTxn::new(items), manifest);
         let kernel = VectorKernel::new(DIMENSION, Metric::L2, SEED).expect("valid kernel");
         let compiled = predicate
             .map(|predicate| CompiledPredicate::compile(predicate, manifest.config().fields()))
@@ -1058,8 +1057,7 @@ mod tests {
             let cache = PartitionCache::new(capacity);
             for pass in 0..2 {
                 let mut txn =
-                    ReadLogicalTxn::for_index(MockReadTxn::new(fixture.items.clone()), &manifest)
-                        .expect("bind manifest");
+                    ReadLogicalTxn::for_index(MockReadTxn::new(fixture.items.clone()), &manifest);
                 let outcome = traverse(
                     &mut txn,
                     &cache,
@@ -1114,8 +1112,7 @@ mod tests {
             let cache = PartitionCache::new(capacity);
             for _ in 0..2 {
                 let mut txn =
-                    ReadLogicalTxn::for_index(MockReadTxn::new(fixture.items.clone()), &manifest)
-                        .expect("bind manifest");
+                    ReadLogicalTxn::for_index(MockReadTxn::new(fixture.items.clone()), &manifest);
                 let outcome = traverse(
                     &mut txn,
                     &cache,

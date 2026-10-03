@@ -140,8 +140,7 @@ async fn typed_put(
         manifest,
         backend.hard_limits(),
         backend.admission_budget(),
-    )
-    .expect("bind index");
+    );
     txn.put(key, value).await.expect("typed put");
     txn.commit().await.expect("commit");
 }
@@ -166,7 +165,7 @@ async fn read_leaf_entry(
     id: Bytes,
 ) -> LeafEntry {
     let raw = backend.begin_read().await.expect("begin read");
-    let mut txn = ReadLogicalTxn::for_index(raw, manifest).expect("bind index");
+    let mut txn = ReadLogicalTxn::for_index(raw, manifest);
     match txn
         .get(LogicalKey::LeafEntry {
             index: manifest.logical_index_id(),

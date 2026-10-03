@@ -473,8 +473,7 @@ pub async fn install(
         &manifest,
         backend.hard_limits(),
         backend.admission_budget(),
-    )
-    .expect("bind index");
+    );
     txn.put(
         LogicalKey::TreeManifest {
             index: iid,
@@ -649,7 +648,7 @@ async fn existing_high_water(
     line: usize,
 ) -> u64 {
     let raw = backend.begin_read().await.expect("begin read");
-    let mut txn = ReadLogicalTxn::for_index(raw, manifest).expect("bind index");
+    let mut txn = ReadLogicalTxn::for_index(raw, manifest);
     let Some(existing) = tree_manifest::read_tree_manifest(&mut txn, tree_key)
         .await
         .expect("read tree manifest")
@@ -696,7 +695,7 @@ async fn read_root_entries(
     tree_key: &TreeKey,
 ) -> BTreeMap<Bytes, LeafEntry> {
     let raw = backend.begin_read().await.expect("begin read");
-    let mut txn = ReadLogicalTxn::for_index(raw, manifest).expect("bind index");
+    let mut txn = ReadLogicalTxn::for_index(raw, manifest);
     let range = LogicalRange::leaf_entries(manifest, tree_key, root_key()).expect("leaf range");
     let mut entries = BTreeMap::new();
     for item in super::audit::scan_all(&mut txn, &range)

@@ -83,7 +83,7 @@ async fn read_location(
     record_id: &[u8],
 ) -> Option<RecordLocation> {
     let raw = backend.begin_read().await.expect("begin read");
-    let mut txn = ReadLogicalTxn::for_index(raw, manifest).expect("bind index");
+    let mut txn = ReadLogicalTxn::for_index(raw, manifest);
     match txn
         .get(LogicalKey::Location {
             index: manifest.logical_index_id(),
@@ -105,7 +105,7 @@ async fn read_header(
     partition: u64,
 ) -> PartitionHeader {
     let raw = backend.begin_read().await.expect("begin read");
-    let mut txn = ReadLogicalTxn::for_index(raw, manifest).expect("bind index");
+    let mut txn = ReadLogicalTxn::for_index(raw, manifest);
     match txn
         .get(LogicalKey::Header {
             index: manifest.logical_index_id(),
@@ -127,7 +127,7 @@ async fn leaf_member_ids(
     partition: u64,
 ) -> BTreeSet<Bytes> {
     let raw = backend.begin_read().await.expect("begin read");
-    let mut txn = ReadLogicalTxn::for_index(raw, manifest).expect("bind index");
+    let mut txn = ReadLogicalTxn::for_index(raw, manifest);
     let range = LogicalRange::leaf_entries(
         manifest,
         &tree_key(bucket),
@@ -157,7 +157,7 @@ async fn leaf_member_ids(
 
 async fn tree_exists(backend: &SharedBackend, manifest: &IndexManifest, bucket: i64) -> bool {
     let raw = backend.begin_read().await.expect("begin read");
-    let mut txn = ReadLogicalTxn::for_index(raw, manifest).expect("bind index");
+    let mut txn = ReadLogicalTxn::for_index(raw, manifest);
     tree_manifest::read_tree_manifest(&mut txn, &tree_key(bucket))
         .await
         .expect("read tree manifest")
@@ -972,8 +972,7 @@ async fn seed_topology(
         manifest,
         backend.hard_limits(),
         backend.admission_budget(),
-    )
-    .expect("bind index");
+    );
     for (key, value) in entries {
         txn.put(key, value).await.expect("seed topology");
     }
@@ -993,8 +992,7 @@ async fn seed_grown_tree(backend: &SharedBackend, manifest: &IndexManifest, buck
         manifest,
         backend.hard_limits(),
         backend.admission_budget(),
-    )
-    .expect("bind index");
+    );
     tree_manifest::create_tree(&mut txn, &key, 0)
         .await
         .expect("create tree");

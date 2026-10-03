@@ -94,7 +94,7 @@ async fn open_walk_txn<'b, 'm, B: Backend>(
         .begin_read()
         .await
         .map_err(|error| format!("begin read: {error:?}"))?;
-    ReadLogicalTxn::for_index(raw, manifest).map_err(|error| format!("bind manifest: {error:?}"))
+    Ok(ReadLogicalTxn::for_index(raw, manifest))
 }
 
 /// Scans one logical range to exhaustion in bounded pages.

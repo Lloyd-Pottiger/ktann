@@ -56,7 +56,6 @@ pub async fn write_txn<'b, 'm>(
         backend.hard_limits(),
         backend.admission_budget(),
     )
-    .expect("bind manifest")
 }
 
 /// Begins a typed read transaction bound to `manifest`.
@@ -65,7 +64,7 @@ pub async fn read_txn<'b, 'm>(
     manifest: &'m IndexManifest,
 ) -> ReadLogicalTxn<'m, <DeterministicBackend as Backend>::ReadTxn<'b>> {
     let raw = backend.begin_read().await.expect("begin read");
-    ReadLogicalTxn::for_index(raw, manifest).expect("bind manifest")
+    ReadLogicalTxn::for_index(raw, manifest)
 }
 
 /// Installs the tree's Tree Manifest and initial leaf root so fixtures can

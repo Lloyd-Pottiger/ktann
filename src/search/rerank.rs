@@ -432,7 +432,7 @@ mod tests {
         k: usize,
         budget: u32,
     ) -> Result<ExactRerankOutcome> {
-        let mut txn = ReadLogicalTxn::for_index(txn, manifest).expect("bind manifest");
+        let mut txn = ReadLogicalTxn::for_index(txn, manifest);
         let kernel =
             VectorKernel::new(DIMENSION, manifest.config().metric(), SEED).expect("valid kernel");
         exact_rerank(&mut txn, &kernel, &QUERY, candidates, k, budget).await

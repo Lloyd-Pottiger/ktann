@@ -495,7 +495,7 @@ async fn a_draining_root_split_stays_searchable_with_exact_membership() {
     // re-encoding vectors.
     let mut entries = {
         let raw = backend.begin_read().await.expect("begin read");
-        let mut txn = ReadLogicalTxn::for_index(raw, &manifest).expect("bind index");
+        let mut txn = ReadLogicalTxn::for_index(raw, &manifest);
         let range = LogicalRange::leaf_entries(&manifest, &key, pk(1)).expect("leaf range");
         let page = txn
             .scan(
@@ -532,8 +532,7 @@ async fn a_draining_root_split_stays_searchable_with_exact_membership() {
         &manifest,
         backend.hard_limits(),
         backend.admission_budget(),
-    )
-    .expect("bind index");
+    );
     let header = |partition, count, state| {
         (
             LogicalKey::Header {
@@ -708,8 +707,7 @@ async fn inconsistent_persistent_state_fails_closed() {
             &manifest,
             backend.hard_limits(),
             backend.admission_budget(),
-        )
-        .expect("bind index");
+        );
         txn.put(
             LogicalKey::Header {
                 index: iid,
@@ -744,8 +742,7 @@ async fn inconsistent_persistent_state_fails_closed() {
             &manifest,
             backend.hard_limits(),
             backend.admission_budget(),
-        )
-        .expect("bind index");
+        );
         txn.put(
             LogicalKey::Location {
                 index: iid,
@@ -811,7 +808,7 @@ async fn a_duplicate_record_id_across_partitions_fails_closed() {
     // than re-encoding vectors.
     let mut entries = {
         let raw = backend.begin_read().await.expect("begin read");
-        let mut txn = ReadLogicalTxn::for_index(raw, &manifest).expect("bind index");
+        let mut txn = ReadLogicalTxn::for_index(raw, &manifest);
         let range = LogicalRange::leaf_entries(&manifest, &key, pk(1)).expect("leaf range");
         let page = txn
             .scan(
@@ -850,8 +847,7 @@ async fn a_duplicate_record_id_across_partitions_fails_closed() {
         &manifest,
         backend.hard_limits(),
         backend.admission_budget(),
-    )
-    .expect("bind index");
+    );
     let header = |partition, count, state| {
         (
             LogicalKey::Header {

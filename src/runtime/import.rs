@@ -403,8 +403,7 @@ impl<B: Backend> ImportCoordinator<B> {
     /// cancellation path as dropping the session.
     pub(crate) async fn drain(mut self) -> Vec<ImportBatchResult> {
         let mut results = Vec::with_capacity(self.batches.len());
-        for index in 0..self.batches.len() {
-            let (token, task) = &mut self.batches[index];
+        for (token, task) in &mut self.batches {
             results.push(ImportBatchResult {
                 token: *token,
                 result: super::join_task(task).await,

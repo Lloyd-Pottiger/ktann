@@ -158,10 +158,9 @@ All persistent algorithms that affect bytes are format protocol:
   existing 64-KiB complete-Synopsis limit;
 - RaBitQ7 uses the exact layout defined by the search design.
 
-These constants and steps must be written next to codec golden vectors before
-the first format is emitted. “Implementation-defined” randomness or hashing is
-not permitted because processes and restarts must produce equivalent summaries
-and codes.
+Codec golden vectors fix these constants and steps. Processes and restarts
+must produce equivalent summaries and codes; implementation-defined randomness
+or hashing is not permitted.
 
 ## 7. Typed atomic operations
 
