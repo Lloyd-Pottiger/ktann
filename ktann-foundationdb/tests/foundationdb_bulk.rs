@@ -66,6 +66,7 @@ async fn foundationdb_bulk_publication_mutation_and_interrupted_cleanup() {
             .values()
             .all(|count| *count <= 32)
     );
+    assert_eq!(report.topology.actionable_partitions, 0);
     assert_eq!(report.objects.vector_records, 1025);
     let result = index
         .search(SearchRequest::new(vec![1.0; 128], 10).unwrap())

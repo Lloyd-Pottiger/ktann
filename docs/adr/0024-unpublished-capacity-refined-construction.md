@@ -37,7 +37,16 @@ resumption, or process-local exclusivity assumption. An ambiguous operation does
 not automatically remove a competing builder's data.
 
 Construction first uses the existing deterministic balanced binary training to
-produce a power-of-two number of leaves with legal occupancy. Zero refinement
+produce a power-of-two number of leaves. Initial leaf planning targets
+`max(maximum / 2, 2 * minimum)` entries, while refinement and publication retain
+the configured maximum. The minimum clamp preserves legal non-root occupancy
+under balanced subdivision, including dense-capacity configurations. Internal
+fanout continues to use the configured maximum. At one million records with
+minimum 16 and maximum 512 this initializes 4096 leaves rather than 2048. This choice
+provides more granularity and space for moves; it is an experiment in combined
+initialization, granularity and slack, not proof that capacity rejection caused
+previous performance differences. The full-data 4096 comparison must include
+same-builder zero-round and refined controls. Zero refinement
 rounds is the construction control. Each bounded local round selects at most 32
 nearest leaf centroids, proposes each record's best positive-gain move, applies
 proposals in descending gain order under exact minimum/maximum counts, then

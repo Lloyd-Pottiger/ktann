@@ -143,6 +143,10 @@ impl Plan {
         }
         let maximum = config.max_partition_entries() as usize;
         let minimum = config.min_partition_entries() as usize;
+        // Validated configuration guarantees 2 * minimum <= maximum. Balanced
+        // power-of-two subdivision produces non-root groups above half this
+        // target, preserving minimum occupancy while leaving refinement space.
+        let initial_leaf_target = (maximum / 2).max(2 * minimum);
         let mut trees = Vec::with_capacity(tree_members.len());
         let mut owners = vec![(0, 0); records.len()];
         for (key, members) in tree_members {
@@ -153,7 +157,7 @@ impl Plan {
                     .iter()
                     .map(|&position| (position, vectors[position].clone()))
                     .collect(),
-                maximum,
+                initial_leaf_target,
                 checkpoint,
             )?;
             let mut parts = Vec::with_capacity(groups.len());
@@ -806,6 +810,63 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         mpsc,
     };
+
+    #[test]
+    fn initial_leaf_slack_preserves_partition_occupancy_boundaries() {
+        for (minimum, maximum, count, expected_leaves) in [
+            (2, 4, 4, 1),
+            (2, 4, 5, 2),
+            (2, 4, 9, 4),
+            (16, 512, 512, 2),
+            (16, 512, 513, 4),
+            (127, 255, 255, 2),
+        ] {
+            let config = IndexConfig::new(1, crate::api::Metric::L2)
+                .unwrap()
+                .with_partition_entries(minimum, maximum)
+                .unwrap();
+            let manifest = IndexManifest::new(
+                IndexLifecycle::Building { owner: [1; 16] },
+                LogicalIndexId::new(1).unwrap(),
+                config,
+                [0; 32],
+                vec![],
+            )
+            .unwrap();
+            let records: Vec<_> = (0_usize..count)
+                .map(|position| {
+                    Record::new(
+                        Bytes::from(position.to_be_bytes().to_vec()),
+                        vec![position as f32],
+                        vec![],
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let plan = Plan::new(
+                &|| Ok(()),
+                &manifest,
+                &records,
+                BTreeMap::from([(TreeKey::encode(&[], &[]).unwrap(), (0..count).collect())]),
+                &BulkBuildOptions::new(1 << 20)
+                    .unwrap()
+                    .with_refinement_rounds(0)
+                    .unwrap(),
+            )
+            .unwrap();
+            let parts = &plan.trees[0].parts;
+            assert_eq!(
+                parts.iter().filter(|part| part.level == 1).count(),
+                expected_leaves
+            );
+            for part in parts {
+                assert!(part.members.len() <= maximum as usize);
+                if part.key != PartitionKey::new(1).unwrap() {
+                    assert!(part.members.len() >= minimum as usize);
+                }
+            }
+        }
+    }
 
     #[test]
     fn refinement_improves_assignment_and_respects_occupancy() {
