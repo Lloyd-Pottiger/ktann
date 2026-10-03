@@ -33,7 +33,6 @@ impl<T> ApproximateCandidate<T> {
     }
 
     /// Returns the caller-owned value.
-    #[cfg(test)]
     pub(crate) const fn value(&self) -> &T {
         &self.value
     }

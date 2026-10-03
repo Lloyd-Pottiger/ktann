@@ -1,23 +1,12 @@
-//! Metrics, tracing, and privacy (design `runtime-operations.md` section 5).
+//! Metrics, tracing, and telemetry privacy.
 //!
-//! KTANN emits through the `metrics` and `tracing` facades; without an
-//! installed recorder or subscriber every emission is a no-op. This module is
-//! the only place metric series and span fields are constructed, so the
-//! documented redaction policy holds by construction:
+//! Emissions use the `metrics` and `tracing` facades. Labels come only from
+//! bounded enums. Traces contain Logical Index IDs, Partition Keys, stable
+//! Tree Key hashes, bounded labels, counts, and error kinds. Raw caller data
+//! and adapter error sources are never recorded.
 //!
-//! - Metric label values come only from the bounded enums in [`labels`]. Raw
-//!   Index Names, Tree Keys, Record IDs, field values, vectors, and payloads
-//!   can never become a label, because no constructor here accepts caller
-//!   data.
-//! - Trace spans and events carry only Logical Index IDs, Partition Keys,
-//!   stable Tree Key hashes, bounded label strings, counts, and error kinds.
-//!   Error sources are never recorded: adapter-native errors may embed
-//!   backend-internal strings and stay reachable only through
-//!   `std::error::Error::source`.
-//!
-//! All series live in one `ktann.*` namespace. Metric names and span nesting
-//! are not public API. Durations are recorded in seconds, ratios in `0.0..=1.0`,
-//! and sizes in bytes.
+//! Series use the `ktann.*` namespace. Durations are seconds, sizes are bytes,
+//! and ratios are in `0.0..=1.0`. Names and span nesting are internal details.
 //!
 //! # Metric inventory
 //!

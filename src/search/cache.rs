@@ -1,33 +1,15 @@
-//! The snapshot-validated Partition Cache (design `search.md` section 8, ADR
-//! 0010).
+//! Byte-bounded cache of snapshot-validated, immutable Partition search bodies.
 //!
-//! The Runtime shares one byte-bounded, process-local cache of decoded
-//! partition search bodies. Internal bodies hold Child Entries (Child Partition
-//! Key and full-f32 centroid); leaf bodies hold Leaf Entries (Record ID,
-//! absolute RaBitQ7 search data, and exact filter fields). Empty bodies are
-//! cached too. State, Synopsis, Vector Record, and Payload data is never
-//! cached.
+//! Bodies contain Child Entries or Leaf Entries, including empty partitions.
+//! A body is reusable only when its kind and epoch match the snapshot Header.
+//! Older cached epochs are evicted; newer epochs survive historical reads.
+//! Misses load and validate complete bodies in the same transaction. Corrupt
+//! bodies are never cached; oversized bodies are served without installation.
 //!
-//! Validation follows the snapshot Header: a search reads the Header from its
-//! own consistent snapshot, derives the body kind from the Header level, and
-//! may reuse a cached body only when the cached epoch equals the snapshot
-//! Header's cache epoch. A cached older epoch is a miss and is evicted; a
-//! cached newer epoch means the search holds a historical snapshot, so it
-//! misses without evicting the useful newer entry. On a miss the same search
-//! transaction scans and decodes the complete body, then verifies its exact entry
-//! count against the initial Header before publishing. Corruption is never
-//! cached: a body that fails to decode or has a mismatched entry count is a
-//! `Corruption` error and nothing is installed.
-//!
-//! Entries are immutable and never pinned. Concurrent misses may duplicate work
-//! and race to publish equal or newer epochs; there is deliberately no
-//! singleflight waiter or cancellation state. A body larger than the cache
-//! capacity is served but never installed, keeping memory bounded. The eviction
-//! policy is an internal benchmark-tunable detail, not a persistent or public
-//! compatibility contract; cache warmth never changes logical search-budget
-//! accounting. Foreground preparation also reuses committed internal bodies
-//! before staging internal changes (ADR 0023); arbitrary write transactions
-//! must never publish their read-your-writes bodies here.
+//! Concurrent misses may load independently. Cache warmth does not change
+//! logical budget accounting. Foreground preparation may reuse committed
+//! internal bodies; write transactions must never publish read-your-writes
+//! bodies (ADR 0023).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};

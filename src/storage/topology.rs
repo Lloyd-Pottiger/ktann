@@ -1,52 +1,25 @@
-//! Typed atomic topology operations for the expose-then-drain split protocol
-//! (ADR 0014) and the target-reselecting merge protocol (ADR 0008).
+//! Atomic topology steps for expose-then-drain splits (ADR 0014) and
+//! target-reselecting merges (ADR 0008).
 //!
-//! These operations are the only writers of partition topology: partition
-//! creation, split and merge state transitions, Child Entry installation and
-//! removal, and the structural entry moves that drain a source into its
-//! targets — a split's two persisted `ReceivingSplit` targets, or a merge's
-//! per-batch reselected `Ready` targets. Each operation performs one bounded,
-//! atomically committable step inside the caller's transaction; the
-//! multi-transaction drivers live in [`crate::maintenance::split`] and
-//! [`crate::maintenance::merge`]. Every authoritative read a step depends on
-//! is update-protected, so a concurrent transition, foreground mutation, or
-//! adjacent-level move aborts the commit with [`ErrorKind::RetryableAbort`]
-//! and the whole step retries from a fresh snapshot.
+//! Maintenance drives these bounded transactions across snapshots. Each step
+//! uses update-protected authority reads and recognizes previously committed
+//! progress, allowing recovery from unknown commit outcomes.
 //!
-//! # Contract
+//! - Split exposure atomically creates both `ReceivingSplit` targets with
+//!   centroids and advances the source from `Splitting` to `DrainingSplit`.
+//! - Every non-root target has one Child Entry installed with its creation;
+//!   root targets occupy exclusive slots in Partition Key 1's split State.
+//!   Stale source or parent authority aborts before writes.
+//! - Drain batches atomically insert target entries, delete source entries,
+//!   update Record Locations for leaves, and update exact counts, cache epochs,
+//!   and target Synopses once per partition. Entries already removed by a
+//!   completed concurrent mutation are skipped; other mismatches are Corruption.
+//! - The exact source Header count alone determines completion. At zero, only
+//!   four metadata keys remain; cleanup uses a transactional range clear or
+//!   bounded point deletes according to backend capabilities.
 //!
-//! - **Expose-then-drain.** A split begins by reserving two never-reused
-//!   target Partition Keys and marking the source `Splitting`; one exposure
-//!   transaction then unique-creates both targets as `ReceivingSplit {
-//!   source }` with their persisted centroids and advances the source to
-//!   `DrainingSplit` atomically, so no committed state holds a partially
-//!   exposed split. Repeating a committed step is harmless: every operation
-//!   recognizes the state a previous committed attempt left and reports it
-//!   instead of failing, so the documented recovery from an unknown commit
-//!   outcome is to re-drive the same step.
-//! - **One incoming reference.** A non-root target's creation and its Child
-//!   Entry insertion into the source's current parent are one atomic step; a
-//!   root target is instead owned by the exclusive target slot named by
-//!   Partition Key 1's persisted `Splitting` state until root completion
-//!   converts the root in place (ADR 0007). Exposure abandons without
-//!   writing when the source no longer names the targets or the discovered
-//!   parent cannot accept a new child.
-//! - **Exact movement.** Draining moves one bounded batch per transaction:
-//!   each moved entry's target insert, source delete, and — for leaves —
-//!   Record Location change commit atomically, with both exact Header counts
-//!   and cache epochs and the target Synopsis read and written once per
-//!   partition per batch. A source entry removed by a concurrent completed
-//!   mutation is skipped; a remaining membership mismatch is Corruption.
-//! - **Zero-count completion.** The exact update-protected source Header count
-//!   is the sole authority for emptiness; completion never rescans entries
-//!   (ADR 0014). After exact count zero a partition prefix holds only its four
-//!   fixed metadata keys, so the final transaction removes the source with one
-//!   transactional range clear when the backend supports it, or with bounded
-//!   point deletes of those keys otherwise.
-//! - **Fail closed.** Missing or mismatched authority values, a level or state
-//!   disagreement, a duplicate or missing incoming reference, and an
-//!   impossible count are Corruption. On any returned error the caller must
-//!   not commit the transaction; rolling back leaves no partial change.
+//! Authority, level, state, reference, and count mismatches fail with
+//! [`ErrorKind::Corruption`]. Callers must roll back on any error.
 
 use bytes::Bytes;
 

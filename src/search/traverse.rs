@@ -1,55 +1,19 @@
-//! Deterministic bounded best-first traversal across Tree Key-selected trees.
+//! Deterministic, bounded best-first traversal across selected Tree Keys.
 //!
-//! This module owns the search pipeline's traversal stage (design
-//! `search.md` step 3 and the per-leaf half of steps 4 and 5). Given the Tree
-//! Keys materialized by bounded directory enumeration, it advances every
-//! eligible tree fairly through one global best-first frontier, expands
-//! internal partitions through their Child Entries, prunes Leaf Partitions
-//! through their conservative synopses, and reduces each visited leaf to its
-//! bounded RaBitQ overlap candidates. Partition bodies are loaded through the
-//! snapshot-validated Partition Cache (ADR 0010); cache warmth never changes
-//! the logical budget accounting below. Global overlap selection, exact Vector
-//! Record loading and reranking, and Search Outcome assembly stay with the
-//! rerank stage and the public search operation.
+//! Roots are always admitted; each later depth competes within a level-scaled
+//! beam. Each distinct partition is charged before visiting its complete body.
+//! Beam pruning is not budget exhaustion; exhaustion means eligible work was
+//! prevented by a depleted budget (ADR 0011).
 //!
-//! # Contract
+//! Current Child Entries reach non-root partitions in every committed state.
+//! A Splitting root exposes only its body; DrainingSplit also injects both
+//! persisted targets at the root level. ReceivingSplit or Merging roots,
+//! missing authority, inconsistent levels or counts, duplicate references,
+//! and duplicate candidate Record IDs are Corruption.
 //!
-//! - **Deterministic level beam.** The active frontier is one priority queue
-//!   ordered by `(routing distance, Tree Key enumeration order, Partition
-//!   Key)`. Every tree's root is queued up front; each tree and level selects
-//!   its nearest next-level beam before those entries enter the frontier, so a
-//!   wide first parent cannot monopolize its tree's next level.
-//! - **Level-scaled beam.** Per tree and level, at most `beam(level)`
-//!   Child Entry-referenced partitions enter the frontier: the leaf-level
-//!   base beam defaults to [`DEFAULT_LEAF_BEAM`] and halves toward the root
-//!   with a minimum of one. Root-split target injection is topology-mandated
-//!   membership coverage, not beam admission, and is never pruned. Beam
-//!   pruning is not budget exhaustion and is not reported as one.
-//! - **Bounded work, charged before it starts.** Each distinct
-//!   `{Tree Key, Partition Key}` body is visited and charged to the Partition
-//!   budget at most once. Decoded bodies arrive whole from the
-//!   snapshot-validated cache. All Leaf Entries in an admitted leaf are
-//!   considered in canonical body order; cache warmth never changes the
-//!   logical accounting. A budget dimension is
-//!   reported exhausted only when eligible pending work was actually prevented
-//!   by its depletion — never merely because natural completion landed
-//!   exactly on the limit (ADR 0011).
-//! - **Intermediate topology.** Non-root partitions in every committed state
-//!   are reached only through their current Child Entries and searched as
-//!   ordinary same-level bodies. A Splitting root exposes no targets, so only
-//!   its body is searched; a DrainingSplit root additionally injects both
-//!   persisted targets into its own level's frontier, each consuming
-//!   Partition budget. A root claiming ReceivingSplit or Merging is
-//!   Corruption.
-//! - **Fail closed.** A missing Header, Synopsis, or referenced State, a
-//!   wrong-kind value, a level that fails to descend exactly one level per
-//!   hop, a body whose decoded entries disagree with the Header's exact
-//!   count, a second incoming reference to one partition, or a duplicate
-//!   Record ID among the admitted candidates is Corruption.
-//! - **Approximate bounds are never exact filters.** Synopses prune a leaf
-//!   only when they prove `NoMatch`; exact predicate evaluation admits
-//!   entries; RaBitQ intervals only order candidates and drive the bounded
-//!   conservative overlap selection.
+//! Synopses prune only proven NoMatch leaves. Exact predicates admit entries;
+//! conservative RaBitQ intervals select candidates for exact reranking.
+
 use std::borrow::Borrow;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -70,9 +34,7 @@ use super::cache::{BodyEntries, CachedLeafEntry, PartitionCache, load_body};
 use super::numeric::{VectorKernel, compare_finite};
 use super::plan::EnumeratedTree;
 use super::predicate::{CompiledPredicate, SynopsisClassification};
-use super::rabitq::{
-    ApproximateCandidate, ApproximateDistance, DecodedRaBitQ7, RaBitQQuery, select_leaf_overlap,
-};
+use super::rabitq::{ApproximateCandidate, DecodedRaBitQ7, RaBitQQuery, select_leaf_overlap};
 use super::rerank::{LeafCandidate, filter_candidates};
 
 /// The default leaf-level base beam (design `search.md` section 6).
@@ -663,29 +625,20 @@ impl Traversal {
         };
         // Only predicate evaluation needs a temporary list of entry references.
         // Without a predicate (including AllMatch), score the body directly.
+        let filtered;
         let pool = if let Some(predicate) = predicate {
-            let filtered = filter_candidates(
+            filtered = filter_candidates(
                 entries.iter().collect(),
                 Some(predicate),
                 &mut self.visited_leaf_entries,
                 |entry| entry.fields(),
             )?;
             score_leaf_entries(&filtered, context.query)?
-                .into_iter()
-                .map(|(entry, distance)| {
-                    ApproximateCandidate::new(entry.record_id().clone(), distance, *entry)
-                })
-                .collect()
         } else {
             let batch = score_leaf_entries(entries, context.query)?;
-            filter_candidates(batch, None, &mut self.visited_leaf_entries, |(entry, _)| {
-                entry.fields()
+            filter_candidates(batch, None, &mut self.visited_leaf_entries, |candidate| {
+                candidate.value().fields()
             })?
-            .into_iter()
-            .map(|(entry, distance)| {
-                ApproximateCandidate::new(entry.record_id().clone(), distance, entry)
-            })
-            .collect()
         };
         // Only local survivors need owned fields and locations for global reranking.
         let selection = select_leaf_overlap(pool, context.request.k, context.rerank_cap)?;
@@ -765,7 +718,7 @@ impl Traversal {
 fn score_leaf_entries<'a, T: Borrow<CachedLeafEntry>>(
     entries: &'a [T],
     query: &RaBitQQuery<'_>,
-) -> Result<Vec<(&'a T, ApproximateDistance)>> {
+) -> Result<Vec<ApproximateCandidate<&'a CachedLeafEntry>>> {
     let mut batch = Vec::with_capacity(entries.len());
     let (chunks, remainder) = entries.as_chunks::<4>();
     for entries in chunks {
@@ -773,7 +726,12 @@ fn score_leaf_entries<'a, T: Borrow<CachedLeafEntry>>(
         let distances = DecodedRaBitQ7::approximate_distances(codes, query)
             .map_err(|_| Error::new(ErrorKind::Corruption))?;
         for (entry, distance) in entries.iter().zip(distances) {
-            batch.push((entry, distance));
+            let entry = entry.borrow();
+            batch.push(ApproximateCandidate::new(
+                entry.record_id().clone(),
+                distance,
+                entry,
+            ));
         }
     }
     for entry in remainder {
@@ -781,7 +739,12 @@ fn score_leaf_entries<'a, T: Borrow<CachedLeafEntry>>(
         // so rejected entries cannot hide malformed persistent codes.
         let [distance] = DecodedRaBitQ7::approximate_distances([entry.borrow().code()], query)
             .map_err(|_| Error::new(ErrorKind::Corruption))?;
-        batch.push((entry, distance));
+        let entry = entry.borrow();
+        batch.push(ApproximateCandidate::new(
+            entry.record_id().clone(),
+            distance,
+            entry,
+        ));
     }
     Ok(batch)
 }

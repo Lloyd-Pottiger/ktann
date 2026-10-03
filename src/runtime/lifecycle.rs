@@ -497,8 +497,7 @@ async fn read_manifest<T: crate::storage::backend::ReadOps>(
 ) -> Result<IndexManifest> {
     match txn.get(LogicalKey::Manifest(logical_index_id)).await? {
         Some(PersistentValue::IndexManifest(manifest)) => Ok(manifest),
-        Some(_) => Err(Error::new(ErrorKind::Corruption)),
-        None => Err(Error::new(ErrorKind::Corruption)),
+        _ => Err(Error::new(ErrorKind::Corruption)),
     }
 }
 
@@ -511,8 +510,7 @@ async fn read_manifest_for_update<T: WriteTxn>(
         .await?
     {
         Some(PersistentValue::IndexManifest(manifest)) => Ok(manifest),
-        Some(_) => Err(Error::new(ErrorKind::Corruption)),
-        None => Err(Error::new(ErrorKind::Corruption)),
+        _ => Err(Error::new(ErrorKind::Corruption)),
     }
 }
 

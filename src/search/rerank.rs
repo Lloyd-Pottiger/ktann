@@ -1,14 +1,8 @@
-//! Exact Leaf Entry filtering, bounded Vector Record loading, and exact
-//! reranking.
+//! Exact Leaf Entry filtering and bounded Vector Record reranking.
 //!
-//! This module owns the search pipeline's filter and rerank stage (design
-//! `search.md` steps 4, 6, and 7). Traversal supplies Leaf Candidates in
-//! per-leaf selections for global overlap selection; exact predicate filtering
-//! keeps only
-//! SQL TRUE entries; exact reranking batch-loads the original Vector Records
-//! from one consistent snapshot, computes exact f64 distances over the
-//! unrotated vectors, and builds Search Hits ordered by distance and then
-//! unsigned lexicographic Record ID bytes.
+//! Only SQL TRUE entries qualify. Record loads use one snapshot and verify
+//! authoritative ownership and filter fields. Exact f64 distances use original,
+//! unrotated vectors; ties use unsigned lexicographic Record ID order.
 
 use std::collections::BTreeSet;
 

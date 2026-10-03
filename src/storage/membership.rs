@@ -1,34 +1,16 @@
-//! Typed atomic record-membership operations.
+//! Atomic Foreground Mutations of exact record membership (ADR 0001).
 //!
-//! The exact-membership invariant (ADR 0001) gives every committed Vector
-//! Record exactly one Record Location and one corresponding Leaf Entry. These
-//! primitives are the only foreground writers of that membership: each one
-//! performs the complete mutation — Vector Record, Record Location, Opaque
-//! Payload, Leaf Entry, exact Header count and cache epoch, and the target
-//! Synopsis — inside the caller's one transaction, so a commit either installs
-//! the whole mutation or nothing. Routing and retry orchestration live in the
-//! maintenance module; these functions take the caller's exact expected and
-//! target locations and never route.
+//! Each mutation updates the Vector Record, Record Location, Opaque Payload,
+//! Leaf Entry, exact Header count, cache epoch, and Synopsis in one transaction.
+//! Routing and retries belong to maintenance; these operations use the supplied
+//! expected and target locations.
 //!
-//! Record-group writes (Vector Record, Record Location, Opaque Payload, Leaf
-//! Entry) are queued into the caller's [`MutationBuilder`] and become visible
-//! only when it is applied, so a whole mutation batch lands in canonical key
-//! order with one backend write call; the queue replaces backend unique
-//! inserts with update-protected existence checks. Exact Header counts and
-//! Synopsis expansions accumulate per leaf in a `LeafAccumulator` and join
-//! the queued writes when it is flushed, so a batch touching one leaf N times
-//! reads and writes the leaf's Header and Synopsis once; later items observe
-//! earlier items' adjustments through the accumulator. Deferral is exact
-//! because a validated batch holds at most one item per Record ID; callers
-//! must enforce that before queueing.
+//! Record-group writes are queued in a [`MutationBuilder`]. Header and Synopsis
+//! changes accumulate per leaf so a batch reads and writes each authority once.
+//! Callers must validate that each Record ID appears at most once in the batch.
 //!
-//! Every authoritative read a mutation depends on is update-protected, so a
-//! concurrent change to the same membership or leaf Header aborts the commit
-//! with [`ErrorKind::RetryableAbort`] instead of producing a partial write. A
-//! missing, extra, or mismatched authoritative value is
-//! [`ErrorKind::Corruption`] and fails closed without repair. On any returned
-//! error the caller must not commit the transaction; rolling back leaves no
-//! partial change.
+//! Authoritative reads are update-protected. Invariant mismatches fail with
+//! [`ErrorKind::Corruption`]; callers must roll back on any error.
 
 use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 

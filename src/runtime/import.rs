@@ -1,36 +1,17 @@
-//! Import Session batch admission and ordered outcome collection.
+//! Import Session admission and outcomes in submission order.
 //!
-//! One coordinator owns the process-local state of a single Import Session: a
-//! adaptive bounded-concurrency controller, the monotonically increasing Batch
-//! Token sequence, and the accepted batch tasks in submission order. Every
-//! admitted batch runs the ordinary foreground mutation path
-//! ([`Index::run_mutations`]),
-//! so its atomicity, retry, error, and maintenance behavior is identical to a
-//! normal `batch_mutate` and import changes neither Foreground Mutation
-//! atomicity nor Logical Index lifecycle.
+//! A session starts with one active batch and adjusts concurrency from clean
+//! completions and retryable contention up to its configured ceiling. Accepted
+//! batches use [`Index::run_mutations`] and the Runtime's foreground admission,
+//! preserving ordinary mutation atomicity, retries, and maintenance behavior.
+//! Waiting callers retain their unsubmitted batches; the session keeps only
+//! in-flight tasks and one outcome per accepted Batch Token until `drain`.
 //!
-//! Admission is bounded in both directions: a session starts with one active
-//! batch, learns additional concurrency from saturated clean completions and retryable
-//! conflicts up to its configured ceiling, and has no session-internal queue:
-//! a caller waiting for a slot or the backlog gate holds its own
-//! unsubmitted batch, while admitted batches additionally pass the Runtime's
-//! bounded foreground admission. Session memory is bounded by the in-flight
-//! batch payloads plus one outcome entry per accepted token, collected on
-//! `drain`.
-//!
-//! Dropping the coordinator aborts every incomplete batch task. Tokio drops an
-//! aborted task's future, which runs the caller-drop guard inside
-//! `run_foreground`: a batch whose commit has not started is cancelled, while
-//! a started commit keeps running detached under the Runtime's in-flight guard
-//! and finishes without an Import Session result consumer.
-//!
-//! `submit_batch` also waits for the Runtime's Structure Maintenance backlog
-//! gate (design `runtime-operations.md` §4): a non-empty batch admits only
-//! once the process-local Fixup backlog — pending plus running — is below the
-//! configured watermark. The gate is process-local backpressure, never a
-//! durable or cluster-wide barrier; losing it cannot affect persistent
-//! correctness, and an empty batch does no storage work so it bypasses the
-//! gate exactly like it bypasses the in-flight slot.
+//! Non-empty batches also wait for the process-local Fixup Backlog to fall
+//! below the configured watermark. Empty batches bypass both admission gates.
+//! Dropping the session aborts incomplete batch tasks; caller-drop guards
+//! cancel work before commit, while started commits finish under the Runtime's
+//! in-flight guard even after their result consumer disappears.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;

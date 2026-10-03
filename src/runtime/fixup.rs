@@ -1,43 +1,20 @@
-//! Bounded process-local Fixup scheduling (design `runtime-operations.md` §3).
+//! Bounded, deduplicating process-local Structure Maintenance scheduling.
 //!
-//! A Fixup is one demand-driven unit of Structure Maintenance: one partition
-//! of one tree of one Logical Index, offered by a relevant mutation or search
-//! and rediscovered from durable state when executed. This module owns the
-//! Runtime's bounded, deduplicating process-local queue, the maintenance
-//! workers that execute queued Fixups, and their shutdown behavior. The
-//! split/merge state machines themselves live in [`crate::maintenance`].
+//! One Logical Index ID, Tree Key, and Partition Key occupies one admission
+//! slot across pending and running work. Queue capacity, worker count, retry
+//! backoff, and steps per execution are bounded. Duplicate and saturated
+//! offers are counted; lost work is rediscovered from searchable durable
+//! states by later relevant accesses (ADR 0006).
 //!
-//! # Contract
+//! Workers settle completed work, stall merges without a legal target,
+//! yield successful unfinished work to the queue tail, and retire errors or
+//! cancelled work without changing durable state. A completed split replaces
+//! its admission with bounded offers for both targets and the updated parent
+//! in one queue transition, then publishes the final backlog.
 //!
-//! - **Bounded everything.** Pending plus running Fixups never exceed the
-//!   configured queue capacity, worker count is fixed at construction, every
-//!   execution runs at most the configured number of whole state-machine steps
-//!   with the capped jittered backoff of [`RetryPolicy::for_fixup`], and queue
-//!   memory is proportional to capacity. Overload drops offers; it never
-//!   affects persistent correctness.
-//! - **Deduplicating admission.** One key — Logical Index ID, Tree Key, and
-//!   Partition Key — occupies at most one slot, whether pending or running.
-//!   A duplicate offer coalesces into the admitted one; a saturated queue
-//!   drops the offer. Both outcomes are counted in [`FixupStats`].
-//! - **Loss is safe.** The queue is process-local and may be lost at any
-//!   time: every committed state-machine state remains searchable, and a later
-//!   relevant access re-offers the partition (Demand-Driven Maintenance, ADR
-//!   0006). There is no durable scan, queue, leader, lease, or claim.
-//! - **Bounded execution.** One execution drives one partition through the
-//!   split or merge state machine for at most the configured steps. It settles
-//!   when no work remains, stalls when a merge has no legal target, yields
-//!   successful unfinished work to the back of the queue, and retires on an
-//!   error or shutdown; retirement never removes durable state.
-//! - **Bounded split follow-up.** A completed split replaces its source slot
-//!   with offers for both newly `Ready` targets and the updated parent in one
-//!   queue transition, then publishes the final backlog. This discovers an
-//!   immediately overfull target or parent without turning one worker execution
-//!   into an unbounded cascade; saturation and process loss retain their
-//!   ordinary rediscovery semantics.
-//! - **Shutdown.** Stopping admission cancels pending work immediately and
-//!   lets an admitted step finish its bounded transaction; workers are
-//!   accounted in the Runtime's lifecycle so the backend is released only
-//!   after every worker has stopped.
+//! Shutdown cancels pending work and lets an admitted bounded transaction
+//! finish. Worker lifecycle guards keep the backend alive until all workers
+//! stop. The split and merge state machines live in [`crate::maintenance`].
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, MutexGuard};
@@ -132,7 +109,6 @@ impl FixupStats {
 pub(crate) struct FixupQueue {
     pending: VecDeque<FixupOffer>,
     admitted: HashSet<FixupKey>,
-    running: usize,
     capacity: usize,
     stats: FixupStats,
 }
@@ -143,7 +119,6 @@ impl FixupQueue {
         Self {
             pending: VecDeque::new(),
             admitted: HashSet::new(),
-            running: 0,
             capacity,
             stats: FixupStats::default(),
         }
@@ -151,7 +126,7 @@ impl FixupQueue {
 
     /// The process-local maintenance backlog: pending plus running Fixups.
     fn backlog(&self) -> usize {
-        self.pending.len().saturating_add(self.running)
+        self.admitted.len()
     }
 
     /// Admits one offered Fixup under the deduplication and capacity policy.
@@ -182,9 +157,7 @@ impl FixupQueue {
     /// The key keeps its slot while running, so concurrent duplicate offers
     /// still coalesce. [`FixupQueue::finish`] releases the slot.
     fn pop(&mut self) -> Option<FixupOffer> {
-        let offer = self.pending.pop_front()?;
-        self.running = self.running.saturating_add(1);
-        Some(offer)
+        self.pending.pop_front()
     }
 
     /// Releases one running Fixup's slot after its execution ended, returning
@@ -194,7 +167,6 @@ impl FixupQueue {
     /// worker task is aborted mid-execution: an interrupted Fixup never leaks
     /// its admission slot.
     fn finish(&mut self, key: &FixupKey) -> usize {
-        self.running = self.running.saturating_sub(1);
         self.admitted.remove(key);
         self.backlog()
     }
@@ -202,7 +174,6 @@ impl FixupQueue {
     /// Returns one successfully progressing Fixup to the queue tail without
     /// releasing its bounded admission slot.
     fn yield_back(&mut self, offer: &FixupOffer) -> usize {
-        self.running = self.running.saturating_sub(1);
         debug_assert!(self.admitted.contains(&offer.key));
         self.pending.push_back(FixupOffer {
             key: offer.key.clone(),
@@ -787,7 +758,7 @@ mod tests {
 
         // A running Fixup keeps its slot against new offers.
         let first = queue.pop().expect("one pending offer");
-        assert_eq!(queue.running, 1);
+        assert_eq!(queue.backlog(), 2);
         assert_eq!(
             queue.offer(key(&manifest, 1, 3), &manifest),
             FixupAdmission::Saturated
@@ -799,7 +770,7 @@ mod tests {
         );
 
         queue.finish(&first.key);
-        assert_eq!(queue.running, 0);
+        assert_eq!(queue.backlog(), 1);
         // The still-pending second offer keeps its slot; the freed slot
         // admits again.
         assert_eq!(queue.admitted.len(), 1);
@@ -831,12 +802,12 @@ mod tests {
         queue.drain_pending();
         // Pending work is cancelled; the running admission survives.
         assert!(queue.pending.is_empty());
-        assert_eq!(queue.running, 1);
+        assert_eq!(queue.backlog(), 1);
         assert_eq!(queue.admitted.len(), 1);
         assert!(queue.pop().is_none());
         queue.finish(&first.key);
         assert!(queue.admitted.is_empty());
-        assert_eq!(queue.running, 0);
+        assert_eq!(queue.backlog(), 0);
     }
 
     /// A backend whose every operation fails: Fixup executions retire
@@ -1177,11 +1148,11 @@ mod tests {
         assert_eq!(stats.enqueued, 1);
         assert_eq!(stats.retired, 1);
         assert_eq!(stats.settled, 0);
-        let (pending, running) = {
+        let (pending, backlog) = {
             let queue = runtime.handle.inner.lock_fixups();
-            (queue.pending.len(), queue.running)
+            (queue.pending.len(), queue.backlog())
         };
-        assert_eq!((pending, running), (0, 0));
+        assert_eq!((pending, backlog), (0, 0));
         runtime.shutdown().await.expect("shutdown succeeds");
     }
 
@@ -1230,7 +1201,7 @@ mod tests {
             let queue = runtime.handle.inner.lock_fixups();
             assert!(queue.pending.is_empty());
             assert!(queue.admitted.is_empty());
-            assert_eq!(queue.running, 0);
+            assert_eq!(queue.backlog(), 0);
         }
         // Offers after shutdown are dropped without being counted or run.
         let retired = runtime.handle.inner.fixup_stats().retired;
