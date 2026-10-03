@@ -255,6 +255,7 @@ macro_rules! expect_variant {
     };
 }
 
+expect_variant!(expect_tree_manifest, TreeManifest, TreeManifest);
 expect_variant!(expect_record, VectorRecord, VectorRecord);
 expect_variant!(expect_location, RecordLocation, RecordLocation);
 expect_variant!(expect_header, PartitionHeader, PartitionHeader);

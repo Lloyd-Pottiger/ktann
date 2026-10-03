@@ -1,20 +1,13 @@
-//! Whole-attempt write transaction scaffolding (ADR 0012).
+//! Manifest-validated write attempts shared by mutations and maintenance.
 //!
-//! This module is the single home of the begin-write → manifest-validation →
-//! whole-retry scaffolding shared by foreground mutations and Structure
-//! Maintenance steps. Each attempt opens a fresh write transaction,
-//! update-protects and validates the persisted Active Index Manifest so no
-//! operation commits into a dropping Logical Index, runs the caller's step,
-//! and commits. A definite abort replays the whole step from a fresh snapshot
-//! under the caller's bounded [`RetryPolicy`]; exhaustion returns
-//! `ContentionExhausted`. A commit of unknown outcome is returned, never
-//! retried (ADR 0012): the caller recovers by re-driving the same operation,
-//! which observes the persisted state and proceeds idempotently.
+//! Each attempt opens a fresh transaction, update-protects and validates the
+//! Active Index Manifest, runs the caller's step, and commits. Definite aborts
+//! replay the whole attempt under bounded [`RetryPolicy`]; exhaustion returns
+//! `ContentionExhausted`. Unknown commit outcomes are returned without retry
+//! (ADR 0012); callers recover through the owning operation's protocol.
 //!
-//! A foreground operation passes its [`OperationContext`] so every attempt
-//! honors the caller's cancellation and deadline and the commit crosses the
-//! Runtime's native commit boundary; a maintenance step has no caller control
-//! and commits plainly.
+//! Foreground attempts honor [`OperationContext`] cancellation and deadlines
+//! and cross the Runtime's native commit boundary. Maintenance commits directly.
 
 use std::future::Future;
 use std::time::Instant;

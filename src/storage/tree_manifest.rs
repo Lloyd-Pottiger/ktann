@@ -1,21 +1,15 @@
-//! Typed Tree Manifest directory operations.
+//! Atomic Tree Manifest creation and Partition Key allocation.
 //!
-//! One Tree Key lazily creates one tree. Creation atomically installs the
-//! Tree Manifest directory entry — whose value carries the stable root
-//! Partition Key and the per-tree Partition Key high-water mark — together
-//! with the tree's initial leaf root Header, empty Synopsis, and Ready State,
-//! so every committed tree has one searchable entry point from the moment its
-//! Tree Key exists. Unique insertion makes concurrent creation install exactly
-//! one tree, and reservation advances the high-water mark through an
-//! update-protected read, so concurrent allocators never share or reuse a
-//! Partition Key.
+//! Creation installs one Tree Manifest and its searchable empty root in the
+//! same transaction. Update-protected reservations advance the per-tree
+//! high-water mark; allocated Partition Keys are never shared or reused.
 
 use crate::api::{Error, ErrorKind, PartitionKey, Result};
 use crate::storage::backend::{InsertOutcome, ReadOps, WriteTxn};
 use crate::storage::keys::{LogicalKey, TreeKey};
 use crate::storage::values::{
     IndexManifest, PartitionHeader, PartitionState, PartitionSynopsis, PartitionTransition,
-    PersistentValue, TreeManifest,
+    PersistentValue, TreeManifest, expect_tree_manifest,
 };
 use crate::storage::{ReadLogicalTxn, WriteLogicalTxn};
 
@@ -68,8 +62,8 @@ pub async fn read_tree_manifest<T: ReadOps>(
     txn: &mut ReadLogicalTxn<'_, T>,
     tree_key: &TreeKey,
 ) -> Result<Option<TreeManifest>> {
-    let key = tree_manifest_key_for(txn.require_manifest()?, tree_key)?;
-    expect_manifest(txn.get(key).await?)
+    let key = tree_manifest_key_for(txn.require_manifest()?, tree_key);
+    expect_tree_manifest(txn.get(key).await?)
 }
 
 /// Reads one Tree Manifest and establishes a conflict on its key.
@@ -77,8 +71,8 @@ pub async fn read_tree_manifest_for_update<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     tree_key: &TreeKey,
 ) -> Result<Option<TreeManifest>> {
-    let key = tree_manifest_key_for(txn.require_manifest()?, tree_key)?;
-    expect_manifest(txn.get_for_update(key).await?)
+    let key = tree_manifest_key_for(txn.require_manifest()?, tree_key);
+    expect_tree_manifest(txn.get_for_update(key).await?)
 }
 
 /// Lazily creates the tree for one Tree Key.
@@ -157,8 +151,8 @@ pub async fn reserve_partition_keys<T: WriteTxn>(
     if count == 0 {
         return Err(Error::invalid_argument());
     }
-    let key = tree_manifest_key_for(txn.require_manifest()?, tree_key)?;
-    let manifest = expect_manifest(txn.get_for_update(key.clone()).await?)?
+    let key = tree_manifest_key_for(txn.require_manifest()?, tree_key);
+    let manifest = expect_tree_manifest(txn.get_for_update(key.clone()).await?)?
         .ok_or_else(Error::invalid_argument)?;
     let high_water = manifest.partition_key_high_water().get();
     if high_water == u64::MAX {
@@ -177,22 +171,12 @@ pub async fn reserve_partition_keys<T: WriteTxn>(
     })
 }
 
-/// Extracts the Tree Manifest from a typed read, failing closed on a
-/// wrong-kind value.
-fn expect_manifest(value: Option<PersistentValue>) -> Result<Option<TreeManifest>> {
-    match value {
-        Some(PersistentValue::TreeManifest(manifest)) => Ok(Some(manifest)),
-        Some(_) => Err(Error::new(ErrorKind::Corruption)),
-        None => Ok(None),
-    }
-}
-
 /// Builds the typed Tree Manifest key for one transaction binding.
-fn tree_manifest_key_for(manifest: &IndexManifest, tree_key: &TreeKey) -> Result<LogicalKey> {
-    Ok(LogicalKey::TreeManifest {
+fn tree_manifest_key_for(manifest: &IndexManifest, tree_key: &TreeKey) -> LogicalKey {
+    LogicalKey::TreeManifest {
         index: manifest.logical_index_id(),
         tree_key: tree_key.clone(),
-    })
+    }
 }
 
 /// Constructs a Partition Key from checked caller-validated arithmetic.

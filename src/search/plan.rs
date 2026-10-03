@@ -1,19 +1,10 @@
-//! Predicate-to-Tree-Key range planning and bounded directory enumeration.
+//! Conservative Tree Key range planning and bounded directory enumeration.
 //!
-//! Planning derives one conservative, deterministic set of disjoint half-open
-//! directory ranges from a Filter Predicate. Leading Tree Key fields narrowed
-//! to exact points extend byte prefixes; at most one later field narrows with
-//! a representable typed half-open interval, and fields beyond that stay
-//! unbounded. When exact disjoint expansion would exceed the configured range
-//! limit the plan widens conservatively and relies on exact predicate
-//! evaluation later. Every constrained field keeps a typed membership check,
-//! because memcomparable String prefix ranges may cover values extended by a
-//! leading `0x00` byte.
-//!
-//! Enumeration pages the directory forward in canonical key order, counts
-//! every decoded Tree Key against one global scanned-Tree-Key budget, and
-//! materializes only keys counted inside that budget, so an unlimited number
-//! of stored trees cannot cause unbounded query memory or read-ahead.
+//! Leading point constraints extend byte prefixes; one later interval may
+//! narrow a range. Excess range expansion widens conservatively. Typed checks
+//! remove false positives, including String prefix extensions by `0x00`.
+//! Enumeration follows canonical key order and charges every decoded Tree Key
+//! before materialization, bounding query memory and read-ahead.
 
 use std::cmp::Ordering;
 
