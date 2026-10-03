@@ -13,7 +13,7 @@ use ktann::storage::values::{
     PartitionTransition, PersistentValue, TreeManifest,
 };
 
-use support::DeterministicBackend;
+use support::MemoryBackend;
 use support::builders::{create_committed_tree, id, manifest, pk, read_txn, tree_key, write_txn};
 
 #[allow(dead_code)]
@@ -67,7 +67,7 @@ fn edge(child: PartitionKey, centroid: f32) -> PersistentValue {
 /// Header entry counts must be exact because routing proves every scanned
 /// Child Entry set against them.
 async fn write_topology(
-    backend: &DeterministicBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     values: Vec<(LogicalKey, PersistentValue)>,
 ) {
@@ -80,7 +80,7 @@ async fn write_topology(
 
 /// Seeds the grown root shape: root PK 1 at level 2 with leaf children PK 2
 /// (centroid 0.0) and PK 3 (centroid 10.0).
-async fn seed_grown_root(backend: &DeterministicBackend, manifest: &IndexManifest, key: &TreeKey) {
+async fn seed_grown_root(backend: &MemoryBackend, manifest: &IndexManifest, key: &TreeKey) {
     create_committed_tree(backend, manifest, key).await;
     write_topology(
         backend,
@@ -103,7 +103,7 @@ async fn seed_grown_root(backend: &DeterministicBackend, manifest: &IndexManifes
 /// parents, PK 4 (centroid 1.0) and PK 6 (centroid 10.0), keeping every
 /// internal fanout at exactly two and every descent exactly one level.
 async fn move_edge_under_new_parent(
-    backend: &DeterministicBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     key: &TreeKey,
 ) {
@@ -138,7 +138,7 @@ async fn move_edge_under_new_parent(
 
 #[tokio::test]
 async fn absent_tree_routes_to_none_for_reads() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
 
@@ -150,7 +150,7 @@ async fn absent_tree_routes_to_none_for_reads() {
 
 #[tokio::test]
 async fn first_insert_creates_the_tree_and_routes_to_the_empty_root() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
 
@@ -186,7 +186,7 @@ async fn first_insert_creates_the_tree_and_routes_to_the_empty_root() {
 
 #[tokio::test]
 async fn invalid_vectors_are_rejected_before_the_tree_is_created() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
 
@@ -206,7 +206,7 @@ async fn invalid_vectors_are_rejected_before_the_tree_is_created() {
 
 #[tokio::test]
 async fn concurrent_first_inserts_install_one_tree_and_reroute() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
 
@@ -239,7 +239,7 @@ async fn concurrent_first_inserts_install_one_tree_and_reroute() {
 
 #[tokio::test]
 async fn grown_root_routes_to_the_nearest_child_and_breaks_ties() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
     seed_grown_root(&backend, &manifest, &key).await;
@@ -272,7 +272,7 @@ async fn grown_root_routes_to_the_nearest_child_and_breaks_ties() {
 
 #[tokio::test]
 async fn write_beam_keeps_a_second_internal_path_in_play() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
     create_committed_tree(&backend, &manifest, &key).await;
@@ -325,7 +325,7 @@ async fn write_beam_keeps_a_second_internal_path_in_play() {
 
 #[tokio::test]
 async fn write_beam_is_global_across_parents_at_each_level() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
     create_committed_tree(&backend, &manifest, &key).await;
@@ -386,7 +386,7 @@ async fn write_beam_is_global_across_parents_at_each_level() {
 
 #[tokio::test]
 async fn write_beam_rejects_duplicate_incoming_child_references() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
     create_committed_tree(&backend, &manifest, &key).await;
@@ -419,7 +419,7 @@ async fn write_beam_rejects_duplicate_incoming_child_references() {
 
 #[tokio::test]
 async fn descent_decrements_levels_through_ordinary_internal_partitions() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
     create_committed_tree(&backend, &manifest, &key).await;
@@ -467,7 +467,7 @@ async fn descent_decrements_levels_through_ordinary_internal_partitions() {
 
 #[tokio::test]
 async fn a_stale_observation_is_replaced_by_fresh_routing() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
     seed_grown_root(&backend, &manifest, &key).await;
@@ -494,7 +494,7 @@ async fn a_stale_observation_is_replaced_by_fresh_routing() {
 
 #[tokio::test]
 async fn a_concurrent_edge_move_conflicts_and_reroutes_deterministically() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
     seed_grown_root(&backend, &manifest, &key).await;
@@ -527,7 +527,7 @@ async fn a_concurrent_edge_move_conflicts_and_reroutes_deterministically() {
 
 #[tokio::test]
 async fn a_concurrent_leaf_header_change_conflicts() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
     seed_grown_root(&backend, &manifest, &key).await;
@@ -556,7 +556,7 @@ async fn a_concurrent_leaf_header_change_conflicts() {
 
 #[tokio::test]
 async fn a_missing_root_header_is_corruption() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
 
@@ -583,7 +583,7 @@ async fn a_missing_root_header_is_corruption() {
 
 #[tokio::test]
 async fn a_child_at_the_wrong_level_is_corruption() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
     create_committed_tree(&backend, &manifest, &key).await;
@@ -612,7 +612,7 @@ async fn a_child_at_the_wrong_level_is_corruption() {
 
 #[tokio::test]
 async fn a_self_loop_is_corruption_instead_of_a_cycle() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
     create_committed_tree(&backend, &manifest, &key).await;
@@ -638,7 +638,7 @@ async fn a_self_loop_is_corruption_instead_of_a_cycle() {
 
 #[tokio::test]
 async fn an_internal_partition_must_match_its_exact_header_count() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
 
     // One child with an exact count of one: legal for a stable internal
@@ -707,7 +707,7 @@ async fn an_internal_partition_must_match_its_exact_header_count() {
 
 #[tokio::test]
 async fn a_splitting_leaf_root_still_accepts_writes() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
 
@@ -759,7 +759,7 @@ async fn a_splitting_leaf_root_still_accepts_writes() {
 
 #[tokio::test]
 async fn a_merging_root_is_corruption() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
 
@@ -800,7 +800,7 @@ async fn a_merging_root_is_corruption() {
 
 #[tokio::test]
 async fn a_draining_header_without_matching_state_is_corruption() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
 
@@ -832,7 +832,7 @@ async fn a_draining_header_without_matching_state_is_corruption() {
 
 #[tokio::test]
 async fn a_ready_header_with_a_draining_state_is_corruption() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
     create_committed_tree(&backend, &manifest, &key).await;
@@ -862,7 +862,7 @@ async fn a_ready_header_with_a_draining_state_is_corruption() {
 
 #[tokio::test]
 async fn a_receiving_split_root_is_corruption() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
     create_committed_tree(&backend, &manifest, &key).await;
@@ -904,7 +904,7 @@ async fn a_receiving_split_root_is_corruption() {
 
 #[tokio::test]
 async fn malformed_child_entry_bytes_are_corruption() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
     seed_grown_root(&backend, &manifest, &key).await;
@@ -927,7 +927,7 @@ async fn malformed_child_entry_bytes_are_corruption() {
 
 #[tokio::test]
 async fn allocation_exhaustion_is_stable_and_the_tree_stays_routable() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
 
@@ -975,7 +975,7 @@ async fn allocation_exhaustion_is_stable_and_the_tree_stays_routable() {
 
 #[tokio::test]
 async fn a_drain_redirect_survives_edges_moved_to_different_parents() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
     create_committed_tree(&backend, &manifest, &key).await;

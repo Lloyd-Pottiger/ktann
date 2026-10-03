@@ -84,7 +84,7 @@ Production code uses no nightly features.
 - Fail closed: invalid persistent encoding or invariant mismatches are
   `Corruption`; invalid caller input and non-finite caller-derived arithmetic
   are `InvalidArgument`. Do not skip, repair, or hide corruption on hot paths.
-- Preserve transaction semantics across the deterministic test backend,
+- Preserve transaction semantics across Memory (including its test controls),
   FoundationDB, and RocksDB. Expose real backend capability differences
   explicitly; never weaken the shared contract to accommodate an adapter.
 - Unknown commit outcomes must follow the documented idempotency/recovery
@@ -135,7 +135,7 @@ Test observable contracts with deterministic, replayable inputs, using the
 owning design's evidence matrix to select the layer without duplicating coverage.
 
 - Backend semantics: run the shared contract suite unchanged on affected
-  backends; shared-contract changes cover the deterministic backend, FoundationDB,
+  backends; shared-contract changes cover Memory, FoundationDB,
   and RocksDB. Cover conflicts, snapshots, read-your-writes, pagination, limits,
   rollback, commit outcomes, durability, and declared capabilities.
 - Persistent formats: golden bytes, ordering properties, malformed/noncanonical

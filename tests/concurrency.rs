@@ -39,7 +39,7 @@ use ktann::storage::values::{PartitionHeader, PartitionState};
 mod support;
 
 use support::oracle::{Model, ModelRecord};
-use support::{DeterministicBackend, DeterministicConfig, Rng, SharedBackend, audit};
+use support::{MemoryBackend, Rng, TestConfig, audit};
 
 /// The base seed every per-task script derives from.
 const BASE_SEED: u64 = 0x5EED_D100_0000_0001;
@@ -110,7 +110,7 @@ enum Work {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn seeded_interleaving_converges_with_exact_membership() {
-    let backend = SharedBackend::new(DeterministicBackend::new(DeterministicConfig::default()));
+    let backend = MemoryBackend::with_test_config(TestConfig::default());
     // No background workers: topology moves only when the driver task below
     // drives the public state machines, one bounded transition at a time.
     let config = support::manual_maintenance_config()
@@ -169,7 +169,7 @@ async fn seeded_interleaving_converges_with_exact_membership() {
 /// exact-membership audit must pass.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn seeded_interleaving_with_background_fixups_converges() {
-    let backend = SharedBackend::new(DeterministicBackend::new(DeterministicConfig::default()));
+    let backend = MemoryBackend::with_test_config(TestConfig::default());
     let config = RuntimeConfig::default()
         .with_maintenance(2, 64)
         .and_then(|config| config.with_attempts(ATTEMPTS, ATTEMPTS))
@@ -260,7 +260,7 @@ fn draw_vector(rng: &mut Rng) -> [f32; DIMENSION] {
 /// model exact: without fault injection every committed operation reports its
 /// outcome definitely, and disjoint ID ranges mean only this task's earlier
 /// operations can affect its IDs.
-async fn run_script(task: usize, script: Vec<Op>, index: Index<SharedBackend>) -> Model {
+async fn run_script(task: usize, script: Vec<Op>, index: Index<MemoryBackend>) -> Model {
     let mut model = Model::new();
     for (step, op) in script.into_iter().enumerate() {
         match op {
@@ -328,7 +328,7 @@ async fn run_script(task: usize, script: Vec<Op>, index: Index<SharedBackend>) -
 /// when every candidate has declined and mutations are done, the remaining
 /// under-full partitions have no legal target and the topology is settled.
 async fn drive_maintenance(
-    backend: SharedBackend,
+    backend: MemoryBackend,
     index: LogicalIndexId,
     config: RuntimeConfig,
     mutations_done: Arc<AtomicBool>,
@@ -488,7 +488,7 @@ fn collect_candidates(
 /// Draws every task's script and spawns one task per script. Scripts are
 /// fully drawn before any task spawns: the interleaving never influences
 /// which operations exist, only when they commit.
-fn spawn_scripts(index: &Index<SharedBackend>) -> Vec<tokio::task::JoinHandle<Model>> {
+fn spawn_scripts(index: &Index<MemoryBackend>) -> Vec<tokio::task::JoinHandle<Model>> {
     let scripts: Vec<Vec<Op>> = (0..TASKS).map(generate_script).collect();
     scripts
         .into_iter()

@@ -1,13 +1,9 @@
 //! Backend-neutral transaction contract tests.
 //!
-//! These tests drive a deterministic in-memory mock backend exclusively through
-//! the public [`ktann::storage::backend`] seam. The backend models the contract
-//! (snapshot isolation, read-your-writes, update-protected conflicts including
-//! ABA, ordered scans and batches, unique insertion, rollback, commit outcomes,
-//! hard limits and admission budgets, and the range-clear capability) without
-//! depending on any production adapter. Resource bounds, fault injection,
-//! replay history, and restart semantics use the test-backend-specific seams in
-//! [`support`].
+//! These tests drive the production Memory adapter through the public
+//! [`ktann::storage::backend`] seam. Its optional test controls exercise resource
+//! bounds, injected commit outcomes, replay history, simulated range clear, and
+//! restart semantics on the same transaction implementation.
 
 use std::future::Future;
 
@@ -27,8 +23,8 @@ mod support;
 
 use shared_backend_contract::{BackendHarness, Fault, FaultInjection, RestartMode};
 use support::{
-    CommitFault, CommitOutcome, DeterministicBackend, DeterministicConfig, DeterministicReadTxn,
-    DeterministicWriteTxn, Durability, HistoryEntry,
+    CommitFault, CommitOutcome, Durability, HistoryEntry, MemoryBackend, MemoryReadTxn,
+    MemoryWriteTxn, TestConfig,
 };
 
 /// Drives an already-borrowing future to completion on a current-thread
@@ -52,21 +48,21 @@ fn range(start: &[u8], end: &[u8]) -> KeyRange {
     KeyRange::new(start.to_vec(), end.to_vec())
 }
 
-fn mock() -> DeterministicBackend {
-    DeterministicBackend::new(DeterministicConfig::default())
+fn mock() -> MemoryBackend {
+    MemoryBackend::with_test_config(TestConfig::default())
 }
 
-fn mock_with_clear() -> DeterministicBackend {
-    let config = DeterministicConfig {
+fn mock_with_clear() -> MemoryBackend {
+    let config = TestConfig {
         capabilities: Capabilities {
             transactional_clear_range: true,
         },
         ..Default::default()
     };
-    DeterministicBackend::new(config)
+    MemoryBackend::with_test_config(config)
 }
 
-fn seed(backend: &DeterministicBackend, entries: &[(&'static [u8], &'static [u8])]) {
+fn seed(backend: &MemoryBackend, entries: &[(&'static [u8], &'static [u8])]) {
     block_on(async {
         let mut txn = backend.begin_write().await.expect("begin write");
         for (entry_key, entry_value) in entries {
@@ -89,33 +85,33 @@ fn outcomes(history: &[HistoryEntry]) -> Vec<CommitOutcome> {
     history.iter().map(|entry| entry.outcome).collect()
 }
 
-/// Adapts the deterministic test backend to the shared [`BackendHarness`] seam.
+/// Adapts Memory's deterministic test controls to the shared [`BackendHarness`] seam.
 ///
 /// Controlled faults map one-to-one onto the backend's fault plan, and restart
-/// reuses [`DeterministicBackend::reopen`], so the shared durability case
+/// reuses [`MemoryBackend::reopen`], so the shared durability case
 /// observes the configured [`Durability`].
 struct DeterministicHarness {
-    backend: DeterministicBackend,
+    backend: MemoryBackend,
     restart: RestartMode,
 }
 
 impl DeterministicHarness {
-    fn new(config: DeterministicConfig) -> Self {
+    fn new(config: TestConfig) -> Self {
         let restart = match config.durability {
             Durability::Durable => RestartMode::Durable,
             Durability::Ephemeral => RestartMode::Ephemeral,
         };
         Self {
-            backend: DeterministicBackend::new(config),
+            backend: MemoryBackend::with_test_config(config),
             restart,
         }
     }
 }
 
 impl BackendHarness for DeterministicHarness {
-    type Backend = DeterministicBackend;
+    type Backend = MemoryBackend;
 
-    fn backend(&self) -> &DeterministicBackend {
+    fn backend(&self) -> &MemoryBackend {
         &self.backend
     }
 
@@ -153,17 +149,13 @@ impl BackendHarness for DeterministicHarness {
 #[test]
 fn transaction_types_are_send() {
     fn assert_send<T: Send>() {}
-    // `DeterministicReadTxn` and `DeterministicWriteTxn` are `Send` for any
-    // backend lifetime. Their `PhantomData<Cell<()>>` field makes them `!Sync`,
-    // and yet they still satisfy `ReadTxn`/`WriteTxn`, proving the interface
-    // requires only `Send`.
-    assert_send::<DeterministicReadTxn<'static>>();
-    assert_send::<DeterministicWriteTxn<'static>>();
+    assert_send::<MemoryReadTxn>();
+    assert_send::<MemoryWriteTxn<'static>>();
 }
 
 #[test]
-fn deterministic_backend_runs_the_shared_contract_suite_durable() {
-    let harness = DeterministicHarness::new(DeterministicConfig {
+fn memory_backend_runs_the_shared_contract_suite_durable() {
+    let harness = DeterministicHarness::new(TestConfig {
         durability: Durability::Durable,
         capabilities: Capabilities {
             transactional_clear_range: true,
@@ -174,8 +166,8 @@ fn deterministic_backend_runs_the_shared_contract_suite_durable() {
 }
 
 #[test]
-fn deterministic_backend_runs_the_shared_contract_suite_ephemeral() {
-    let harness = DeterministicHarness::new(DeterministicConfig {
+fn memory_backend_runs_the_shared_contract_suite_ephemeral() {
+    let harness = DeterministicHarness::new(TestConfig {
         durability: Durability::Ephemeral,
         capabilities: Capabilities {
             transactional_clear_range: true,
@@ -186,8 +178,8 @@ fn deterministic_backend_runs_the_shared_contract_suite_ephemeral() {
 }
 
 #[test]
-fn deterministic_backend_declines_range_clear_in_the_shared_suite() {
-    let harness = DeterministicHarness::new(DeterministicConfig {
+fn memory_backend_declines_range_clear_in_the_shared_suite() {
+    let harness = DeterministicHarness::new(TestConfig {
         durability: Durability::Durable,
         capabilities: Capabilities {
             transactional_clear_range: false,
@@ -323,14 +315,14 @@ fn scan_accounts_bytes_and_allows_oversized_first_item() {
 
 #[test]
 fn scan_resumes_after_a_key_at_the_backend_length_ceiling() {
-    let config = DeterministicConfig {
+    let config = TestConfig {
         hard_limits: HardLimits {
             max_key_bytes: 2,
             max_value_bytes: 4_096,
         },
         ..Default::default()
     };
-    let backend = DeterministicBackend::new(config);
+    let backend = MemoryBackend::with_test_config(config);
     seed(&backend, &[(b"\x01\x01", b"1"), (b"\x01\x02", b"2")]);
 
     block_on(async {
@@ -393,11 +385,11 @@ fn scan_rejects_zero_limits_before_work() {
 
 #[test]
 fn scan_page_item_cap_is_enforced() {
-    let config = DeterministicConfig {
+    let config = TestConfig {
         max_scan_page_items: 1,
         ..Default::default()
     };
-    let backend = DeterministicBackend::new(config);
+    let backend = MemoryBackend::with_test_config(config);
     seed(&backend, &[(b"a", b"1"), (b"b", b"2")]);
 
     block_on(async {
@@ -420,11 +412,11 @@ fn scan_page_item_cap_is_enforced() {
 
 #[test]
 fn scan_page_byte_cap_is_enforced() {
-    let config = DeterministicConfig {
+    let config = TestConfig {
         max_scan_page_bytes: 2,
         ..Default::default()
     };
-    let backend = DeterministicBackend::new(config);
+    let backend = MemoryBackend::with_test_config(config);
     seed(&backend, &[(b"a", b"1"), (b"b", b"2")]);
 
     block_on(async {
@@ -460,7 +452,7 @@ fn empty_batch_mutate_succeeds() {
 
 #[test]
 fn batch_mutate_capacity_failure_leaves_no_partial_state() {
-    let backend = DeterministicBackend::new(DeterministicConfig::new(
+    let backend = MemoryBackend::with_test_config(TestConfig::new(
         HardLimits {
             max_key_bytes: 1_024,
             max_value_bytes: 1_024,
@@ -639,7 +631,7 @@ fn unknown_not_applied_persists_nothing() {
 
 #[test]
 fn hard_limit_rejects_oversized_key_and_value() {
-    let backend = DeterministicBackend::new(DeterministicConfig::new(
+    let backend = MemoryBackend::with_test_config(TestConfig::new(
         HardLimits {
             max_key_bytes: 2,
             max_value_bytes: 2,
@@ -672,7 +664,7 @@ fn hard_limit_rejects_oversized_key_and_value() {
 
 #[test]
 fn admission_budget_rejects_excess_mutations_and_bytes() {
-    let backend = DeterministicBackend::new(DeterministicConfig::new(
+    let backend = MemoryBackend::with_test_config(TestConfig::new(
         HardLimits {
             max_key_bytes: 1_024,
             max_value_bytes: 1_024,
@@ -711,11 +703,11 @@ fn admission_budget_rejects_excess_mutations_and_bytes() {
 
 #[test]
 fn active_transaction_limit_is_enforced() {
-    let config = DeterministicConfig {
+    let config = TestConfig {
         max_active_transactions: 1,
         ..Default::default()
     };
-    let backend = DeterministicBackend::new(config);
+    let backend = MemoryBackend::with_test_config(config);
 
     block_on(async {
         let open = backend.begin_read().await.expect("first admits");
@@ -737,30 +729,37 @@ fn active_transaction_limit_is_enforced() {
 
 #[test]
 fn read_set_limit_is_enforced() {
-    let config = DeterministicConfig {
+    let config = TestConfig {
         max_read_set: 1,
         ..Default::default()
     };
-    let backend = DeterministicBackend::new(config);
+    let backend = MemoryBackend::with_test_config(config);
 
     block_on(async {
-        let mut txn = backend.begin_write().await.expect("begin write");
-        txn.get_for_update(key(b"a")).await.expect("first read");
-        let error = txn
-            .get_for_update(key(b"b"))
-            .await
-            .expect_err("read set full");
-        assert_eq!(error.kind(), ErrorKind::LimitExceeded);
+        for first_reads in [vec![key(b"a")], vec![key(b"a"), key(b"a")]] {
+            let mut txn = backend.begin_write().await.expect("begin write");
+            txn.batch_get_for_update(first_reads)
+                .await
+                .expect("one distinct key fits");
+            txn.get_for_update(key(b"a"))
+                .await
+                .expect("a protected key needs no additional capacity");
+            let error = txn
+                .get_for_update(key(b"b"))
+                .await
+                .expect_err("read set full");
+            assert_eq!(error.kind(), ErrorKind::LimitExceeded);
+        }
     });
 }
 
 #[test]
 fn mutation_buffer_limit_is_enforced() {
-    let config = DeterministicConfig {
+    let config = TestConfig {
         max_mutation_buffer: 1,
         ..Default::default()
     };
-    let backend = DeterministicBackend::new(config);
+    let backend = MemoryBackend::with_test_config(config);
 
     block_on(async {
         let mut txn = backend.begin_write().await.expect("begin write");
@@ -775,11 +774,11 @@ fn mutation_buffer_limit_is_enforced() {
 
 #[test]
 fn batch_size_limit_is_enforced() {
-    let config = DeterministicConfig {
+    let config = TestConfig {
         max_batch_size: 2,
         ..Default::default()
     };
-    let backend = DeterministicBackend::new(config);
+    let backend = MemoryBackend::with_test_config(config);
 
     block_on(async {
         let mut txn = backend.begin_read().await.expect("begin read");
@@ -805,11 +804,11 @@ fn batch_size_limit_is_enforced() {
 
 #[test]
 fn db_key_limit_is_enforced() {
-    let config = DeterministicConfig {
+    let config = TestConfig {
         max_db_keys: 1,
         ..Default::default()
     };
-    let backend = DeterministicBackend::new(config);
+    let backend = MemoryBackend::with_test_config(config);
     seed(&backend, &[(b"a", b"1")]);
 
     block_on(async {
@@ -824,11 +823,11 @@ fn db_key_limit_is_enforced() {
 
 #[test]
 fn db_byte_limit_is_enforced() {
-    let config = DeterministicConfig {
+    let config = TestConfig {
         max_db_bytes: 4,
         ..Default::default()
     };
-    let backend = DeterministicBackend::new(config);
+    let backend = MemoryBackend::with_test_config(config);
     seed(&backend, &[(b"a", b"1"), (b"b", b"2")]);
 
     block_on(async {
@@ -843,11 +842,11 @@ fn db_byte_limit_is_enforced() {
 
 #[test]
 fn retained_version_eviction_rejects_too_old_commit() {
-    let config = DeterministicConfig {
+    let config = TestConfig {
         max_retained_versions: 1,
         ..Default::default()
     };
-    let backend = DeterministicBackend::new(config);
+    let backend = MemoryBackend::with_test_config(config);
 
     block_on(async {
         let mut stale = backend.begin_write().await.expect("begin write");
@@ -873,11 +872,11 @@ fn retained_version_eviction_rejects_too_old_commit() {
 
 #[test]
 fn fault_plan_limit_is_enforced() {
-    let config = DeterministicConfig {
+    let config = TestConfig {
         max_fault_plan: 2,
         ..Default::default()
     };
-    let backend = DeterministicBackend::new(config);
+    let backend = MemoryBackend::with_test_config(config);
 
     backend
         .set_fault_plan(vec![CommitFault::Normal, CommitFault::Abort])
@@ -947,11 +946,11 @@ fn clear_range_composes_with_other_mutations_in_txn() {
 
 #[test]
 fn durable_restart_preserves_committed_data() {
-    let config = DeterministicConfig {
+    let config = TestConfig {
         durability: Durability::Durable,
         ..Default::default()
     };
-    let backend = DeterministicBackend::new(config);
+    let backend = MemoryBackend::with_test_config(config);
     seed(&backend, &[(b"a", b"1"), (b"b", b"2")]);
 
     let restarted = backend.reopen();
@@ -965,7 +964,7 @@ fn durable_restart_preserves_committed_data() {
 
 #[test]
 fn ephemeral_restart_starts_empty() {
-    let backend = DeterministicBackend::new(DeterministicConfig::default());
+    let backend = MemoryBackend::with_test_config(TestConfig::default());
     seed(&backend, &[(b"a", b"1")]);
 
     let restarted = backend.reopen();
@@ -1026,12 +1025,12 @@ fn same_seed_and_plan_reproduce_identical_history() {
         CommitFault::Normal,
     ];
 
-    let backend_a = DeterministicBackend::new(DeterministicConfig::default());
+    let backend_a = MemoryBackend::with_test_config(TestConfig::default());
     backend_a.set_fault_plan(plan.clone()).expect("plan fits");
-    let backend_b = DeterministicBackend::new(DeterministicConfig::default());
+    let backend_b = MemoryBackend::with_test_config(TestConfig::default());
     backend_b.set_fault_plan(plan).expect("plan fits");
 
-    let replay = |backend: &DeterministicBackend| {
+    let replay = |backend: &MemoryBackend| {
         block_on(async {
             for value in [b"1", b"2", b"3", b"4", b"5"] {
                 let mut txn = backend.begin_write().await.expect("begin write");
@@ -1050,11 +1049,11 @@ fn same_seed_and_plan_reproduce_identical_history() {
 
 #[test]
 fn history_ring_truncation_is_exposed() {
-    let config = DeterministicConfig {
+    let config = TestConfig {
         max_history_entries: 2,
         ..Default::default()
     };
-    let backend = DeterministicBackend::new(config);
+    let backend = MemoryBackend::with_test_config(config);
     assert!(!backend.history_truncated());
 
     seed(&backend, &[(b"a", b"1")]);
@@ -1135,7 +1134,7 @@ fn scan_rejects_zero_limits_for_empty_ranges() {
 
 #[test]
 fn hard_key_limit_applies_to_every_point_read() {
-    let config = DeterministicConfig {
+    let config = TestConfig {
         hard_limits: HardLimits {
             max_key_bytes: 1,
             max_value_bytes: 4_096,
@@ -1143,7 +1142,7 @@ fn hard_key_limit_applies_to_every_point_read() {
         max_read_set: 1,
         ..Default::default()
     };
-    let backend = DeterministicBackend::new(config);
+    let backend = MemoryBackend::with_test_config(config);
     let oversized = Bytes::from_static(b"too long");
 
     block_on(async {
@@ -1256,7 +1255,7 @@ fn unknown_applied_fault_does_not_bypass_point_conflicts() {
 
 #[test]
 fn clear_range_charges_one_mutation_and_its_boundaries() {
-    let config = DeterministicConfig {
+    let config = TestConfig {
         admission_budget: AdmissionBudget {
             max_mutations: 1,
             max_mutation_bytes: 2,
@@ -1268,7 +1267,7 @@ fn clear_range_charges_one_mutation_and_its_boundaries() {
         max_mutation_buffer: 1,
         ..Default::default()
     };
-    let backend = DeterministicBackend::new(config);
+    let backend = MemoryBackend::with_test_config(config);
     seed(&backend, &[(b"a", b"")]);
     seed(&backend, &[(b"b", b"")]);
 
@@ -1341,14 +1340,14 @@ fn committed_range_clear_conflicts_with_a_protected_point_read() {
 
 #[test]
 fn range_clear_union_normalizes_overlap_adjacency_and_order() {
-    let config = DeterministicConfig {
+    let config = TestConfig {
         capabilities: Capabilities {
             transactional_clear_range: true,
         },
         max_mutation_buffer: 1,
         ..Default::default()
     };
-    let backend = DeterministicBackend::new(config);
+    let backend = MemoryBackend::with_test_config(config);
     for (entry_key, value) in [
         (b"b".as_slice(), b"1".as_slice()),
         (b"y".as_slice(), b"2".as_slice()),

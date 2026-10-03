@@ -95,7 +95,7 @@ use support::datadriven::{self, Directive, Mismatch};
 use support::dataset::{self, Dataset};
 use support::load_index::{FixturePartition, FixtureState, LoadFixture};
 use support::oracle::{self, Model, ModelRecord};
-use support::{CommitFault, DeterministicBackend, DeterministicConfig, Durability, SharedBackend};
+use support::{CommitFault, Durability, MemoryBackend, TestConfig};
 
 /// The corpus directory, relative to the crate root.
 const CORPUS_DIR: &str = "tests/datadriven";
@@ -158,9 +158,9 @@ type ModelFilter = Box<dyn Fn(&ModelRecord) -> bool>;
 
 /// One corpus file's world: backend, runtime, index, and the caller model.
 struct Harness {
-    backend: Option<SharedBackend>,
-    runtime: Option<Runtime<SharedBackend>>,
-    index: Option<Index<SharedBackend>>,
+    backend: Option<MemoryBackend>,
+    runtime: Option<Runtime<MemoryBackend>>,
+    index: Option<Index<MemoryBackend>>,
     name: String,
     model: Model,
     dataset: Option<Dataset>,
@@ -189,7 +189,7 @@ impl Harness {
         self.index = None;
     }
 
-    fn index(&self) -> &Index<SharedBackend> {
+    fn index(&self) -> &Index<MemoryBackend> {
         self.index
             .as_ref()
             .expect("directive requires new-index first")
@@ -256,11 +256,11 @@ impl Harness {
                 )
                 .expect("valid partition entries");
         }
-        let backend_config = DeterministicConfig {
+        let backend_config = TestConfig {
             durability: Durability::Durable,
-            ..DeterministicConfig::default()
+            ..TestConfig::default()
         };
-        let backend = SharedBackend::new(DeterministicBackend::new(backend_config));
+        let backend = MemoryBackend::with_test_config(backend_config);
         // The corpus drives the split/merge state machines through its own
         // split-step/merge-step directives and asserts every intermediate
         // state, so its Runtime runs without background maintenance workers;
@@ -1198,7 +1198,6 @@ impl Harness {
         self.backend
             .as_ref()
             .expect("inject-fault requires new-index first")
-            .inner()
             .push_fault(kind)
             .expect("push fault");
         "ok\n".to_string()
@@ -1210,7 +1209,7 @@ impl Harness {
             .backend
             .take()
             .expect("restart requires new-index first");
-        let backend = SharedBackend::new(backend.inner().reopen());
+        let backend = backend.reopen();
         let runtime =
             Runtime::new(backend.clone(), support::manual_maintenance_config()).expect("runtime");
         match runtime.open_index(&self.name).await {

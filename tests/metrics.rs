@@ -22,7 +22,7 @@ use ktann::api::{
 use ktann::runtime::Runtime;
 
 use support::observe::CounterSeries;
-use support::{DeterministicBackend, DeterministicConfig, SharedBackend, audit, observe};
+use support::{MemoryBackend, TestConfig, audit, observe};
 
 #[allow(dead_code)]
 mod support;
@@ -88,7 +88,7 @@ async fn foreground_batches_offer_only_coalesced_actionable_partitions() {
     let _serial = observe::audit_lock().await;
     let capture = observe::capture();
 
-    let backend = SharedBackend::new(DeterministicBackend::new(DeterministicConfig::default()));
+    let backend = MemoryBackend::with_test_config(TestConfig::default());
     let config = RuntimeConfig::default()
         .with_maintenance(1, 16)
         .and_then(|config| config.with_import_limits(1, 1))
@@ -165,7 +165,7 @@ async fn operations_record_the_documented_series() {
     let capture = observe::capture();
     let before = capture.metric_counters();
 
-    let backend = SharedBackend::new(DeterministicBackend::new(DeterministicConfig::default()));
+    let backend = MemoryBackend::with_test_config(TestConfig::default());
     let config = RuntimeConfig::default()
         .with_maintenance(2, 16)
         .and_then(|config| config.with_import_limits(1, 1))

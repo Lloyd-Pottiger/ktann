@@ -18,7 +18,7 @@ use ktann::storage::{
     LogicalRange, MutationBuilder, ReadLogicalTxn, TransactionSize, WriteLogicalTxn,
 };
 
-use super::support::{DeterministicBackend, DeterministicConfig, DeterministicWriteTxn};
+use super::support::{MemoryBackend, MemoryWriteTxn, TestConfig};
 
 fn id(value: u64) -> LogicalIndexId {
     LogicalIndexId::new(value).expect("test Logical Index ID is nonzero")
@@ -60,7 +60,7 @@ fn record(record_id: &'static [u8]) -> PersistentValue {
 
 #[tokio::test]
 async fn absent_point_and_batch_reads_preserve_shape() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let raw = backend.begin_read().await.expect("begin read");
     let mut txn = ReadLogicalTxn::for_index(raw, &manifest);
@@ -82,7 +82,7 @@ async fn absent_point_and_batch_reads_preserve_shape() {
 
 #[tokio::test]
 async fn namespace_manifest_and_name_directory_operations_are_typed() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let name = IndexName::new("documents").expect("valid name");
     let raw = backend.begin_write().await.expect("begin write");
@@ -148,13 +148,13 @@ async fn namespace_manifest_and_name_directory_operations_are_typed() {
 
 #[tokio::test]
 async fn duplicate_insert_does_not_require_remaining_mutation_budget() {
-    let backend = DeterministicBackend::new(DeterministicConfig {
+    let backend = MemoryBackend::with_test_config(TestConfig {
         admission_budget: AdmissionBudget {
             max_mutations: 1,
             max_mutation_bytes: 1_024,
             mutation_key_overhead_bytes: 0,
         },
-        ..DeterministicConfig::default()
+        ..TestConfig::default()
     });
     let name = IndexName::new("documents").expect("valid name");
     let raw = backend.begin_write().await.expect("begin write");
@@ -184,7 +184,7 @@ async fn duplicate_insert_does_not_require_remaining_mutation_budget() {
 
 #[tokio::test]
 async fn partition_scans_decode_mixed_families_and_page_without_read_ahead() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let tree_key = tree_key();
     let partition = pk(1);
@@ -330,7 +330,7 @@ async fn partition_scans_decode_mixed_families_and_page_without_read_ahead() {
 
 #[tokio::test]
 async fn batched_typed_scans_paginate_each_leg_independently() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let tree_key = tree_key();
     let mut txn = index_write_txn(&backend, &manifest).await;
@@ -429,7 +429,7 @@ async fn batched_typed_scans_paginate_each_leg_independently() {
 
 /// Seeds a committed Vector Record whose encoded Record ID ("actual") disagrees
 /// with the Record ID in its key ("requested"), for fail-closed decode tests.
-async fn seed_mismatched_record(backend: &DeterministicBackend, manifest: &IndexManifest) {
+async fn seed_mismatched_record(backend: &MemoryBackend, manifest: &IndexManifest) {
     let mismatched = ValueCodec::for_index(manifest)
         .encode(&record(b"actual"))
         .expect("encode mismatched record");
@@ -444,7 +444,7 @@ async fn seed_mismatched_record(backend: &DeterministicBackend, manifest: &Index
 
 #[tokio::test]
 async fn reads_and_scans_fail_closed_on_key_value_identity_mismatch() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     seed_mismatched_record(&backend, &manifest).await;
 
@@ -601,7 +601,7 @@ fn tree_local_inputs_must_match_the_bound_tree_key_schema() {
 
 #[tokio::test]
 async fn range_clear_is_included_in_transaction_admission() {
-    let config = DeterministicConfig {
+    let config = TestConfig {
         capabilities: Capabilities {
             transactional_clear_range: true,
         },
@@ -610,9 +610,9 @@ async fn range_clear_is_included_in_transaction_admission() {
             max_mutation_bytes: 1_024,
             mutation_key_overhead_bytes: 0,
         },
-        ..DeterministicConfig::default()
+        ..TestConfig::default()
     };
-    let backend = DeterministicBackend::new(config);
+    let backend = MemoryBackend::with_test_config(config);
     let manifest = manifest();
     let raw = backend.begin_write().await.expect("begin write");
     let mut txn = WriteLogicalTxn::for_index(
@@ -643,7 +643,7 @@ async fn range_clear_is_included_in_transaction_admission() {
 
 #[tokio::test]
 async fn applying_a_builder_charges_its_exact_final_size() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let raw = backend.begin_write().await.expect("begin write");
     let mut txn = WriteLogicalTxn::for_index(
@@ -709,7 +709,7 @@ fn manifest_write_with_different_immutable_config_is_rejected_when_bound() {
 
 #[tokio::test]
 async fn duplicate_insert_fails_closed_on_corrupt_existing_value() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     seed_mismatched_record(&backend, &manifest).await;
 
@@ -732,15 +732,15 @@ async fn duplicate_insert_fails_closed_on_corrupt_existing_value() {
 
 #[tokio::test]
 async fn duplicate_insert_establishes_an_update_protected_conflict() {
-    let config = DeterministicConfig {
+    let config = TestConfig {
         admission_budget: AdmissionBudget {
             max_mutations: 1,
             max_mutation_bytes: 1_024,
             mutation_key_overhead_bytes: 0,
         },
-        ..DeterministicConfig::default()
+        ..TestConfig::default()
     };
-    let backend = DeterministicBackend::new(config);
+    let backend = MemoryBackend::with_test_config(config);
     let name = IndexName::new("documents").expect("valid name");
     let limits = backend.hard_limits();
     let budget = backend.admission_budget();
@@ -799,7 +799,7 @@ async fn duplicate_insert_establishes_an_update_protected_conflict() {
 
 #[tokio::test]
 async fn range_and_cursor_bind_the_tree_key_schema() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let string_manifest = IndexManifest::new(
         IndexLifecycle::Active,
         id(7),
@@ -850,7 +850,7 @@ async fn range_and_cursor_bind_the_tree_key_schema() {
 
 #[tokio::test]
 async fn reading_a_manifest_with_different_immutable_config_fails_closed() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let different = IndexManifest::new(
         IndexLifecycle::Active,
@@ -885,15 +885,15 @@ async fn reading_a_manifest_with_different_immutable_config_fails_closed() {
 
 #[tokio::test]
 async fn insert_at_exhausted_budget_for_absent_key_returns_limit_exceeded() {
-    let config = DeterministicConfig {
+    let config = TestConfig {
         admission_budget: AdmissionBudget {
             max_mutations: 1,
             max_mutation_bytes: 1_024,
             mutation_key_overhead_bytes: 0,
         },
-        ..DeterministicConfig::default()
+        ..TestConfig::default()
     };
-    let backend = DeterministicBackend::new(config);
+    let backend = MemoryBackend::with_test_config(config);
     let raw = backend.begin_write().await.expect("begin write");
     let mut txn =
         WriteLogicalTxn::bootstrap(raw, backend.hard_limits(), backend.admission_budget());
@@ -918,7 +918,7 @@ async fn insert_at_exhausted_budget_for_absent_key_returns_limit_exceeded() {
 }
 
 /// Seeds one committed Record value and resets the backend call counters.
-async fn seed_record(backend: &DeterministicBackend, record_id: &'static [u8]) {
+async fn seed_record(backend: &MemoryBackend, record_id: &'static [u8]) {
     let manifest = manifest();
     let limits = backend.hard_limits();
     let budget = backend.admission_budget();
@@ -932,9 +932,9 @@ async fn seed_record(backend: &DeterministicBackend, record_id: &'static [u8]) {
 }
 
 async fn index_write_txn<'b, 'm>(
-    backend: &'b DeterministicBackend,
+    backend: &'b MemoryBackend,
     manifest: &'m IndexManifest,
-) -> WriteLogicalTxn<'m, DeterministicWriteTxn<'b>> {
+) -> WriteLogicalTxn<'m, MemoryWriteTxn<'b>> {
     let raw = backend.begin_write().await.expect("begin write");
     WriteLogicalTxn::for_index(
         raw,
@@ -946,7 +946,7 @@ async fn index_write_txn<'b, 'm>(
 
 #[tokio::test]
 async fn repeat_reads_reuse_the_transaction_cache() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     seed_record(&backend, b"cached").await;
     let mut txn = index_write_txn(&backend, &manifest).await;
@@ -991,7 +991,7 @@ async fn repeat_reads_reuse_the_transaction_cache() {
 
 #[tokio::test]
 async fn cached_update_protected_reads_still_conflict() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     seed_record(&backend, b"cached").await;
 
@@ -1022,7 +1022,7 @@ async fn cached_update_protected_reads_still_conflict() {
 
 #[tokio::test]
 async fn writes_refresh_cached_reads() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     seed_record(&backend, b"cached").await;
     let mut txn = index_write_txn(&backend, &manifest).await;

@@ -17,8 +17,7 @@ use ktann::storage::backend::{
 use ktann::storage::keys::KeyRange;
 
 use support::{
-    CommitFault, CommitOutcome, DeterministicBackend, DeterministicConfig, DeterministicReadTxn,
-    DeterministicWriteTxn,
+    CommitFault, CommitOutcome, MemoryBackend, MemoryReadTxn, MemoryWriteTxn, TestConfig,
 };
 
 #[allow(dead_code)]
@@ -103,21 +102,18 @@ impl CommitGate {
 
 #[derive(Clone)]
 struct GatedBackend {
-    inner: Arc<DeterministicBackend>,
+    inner: MemoryBackend,
     gate: Arc<CommitGate>,
 }
 
 impl GatedBackend {
-    fn new(inner: DeterministicBackend, gate: Arc<CommitGate>) -> Self {
-        Self {
-            inner: Arc::new(inner),
-            gate,
-        }
+    fn new(inner: MemoryBackend, gate: Arc<CommitGate>) -> Self {
+        Self { inner, gate }
     }
 }
 
 impl Backend for GatedBackend {
-    type ReadTxn<'backend> = DeterministicReadTxn<'backend>;
+    type ReadTxn<'backend> = MemoryReadTxn;
 
     type WriteTxn<'backend> = GatedWriteTxn<'backend>;
 
@@ -150,7 +146,7 @@ impl Backend for GatedBackend {
 }
 
 struct GatedWriteTxn<'backend> {
-    inner: DeterministicWriteTxn<'backend>,
+    inner: MemoryWriteTxn<'backend>,
     gate: Arc<CommitGate>,
 }
 
@@ -279,7 +275,7 @@ async fn setup_with_index(
 ) {
     let gate = Arc::new(CommitGate::default());
     let backend = GatedBackend::new(
-        DeterministicBackend::new(DeterministicConfig::default()),
+        MemoryBackend::with_test_config(TestConfig::default()),
         Arc::clone(&gate),
     );
     let runtime = Runtime::new(backend.clone(), runtime_config).expect("runtime is valid");

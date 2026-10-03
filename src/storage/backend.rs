@@ -3,8 +3,9 @@
 //! This module is the seam between KTANN's logical storage and any concrete
 //! transactional KV backend. It owns no persistent bytes: keys and values are
 //! opaque [`bytes::Bytes`], and every adapter prepends its own bounded
-//! physical prefix. Concrete backends live in the `ktann-foundationdb` and
-//! `ktann-rocksdb` crates; a deterministic in-memory mock exists only in tests.
+//! physical prefix where needed. Concrete backends live in `ktann-foundationdb`,
+//! `ktann-rocksdb`, and `ktann-memory`; Memory's optional `test-support` feature
+//! provides deterministic fault injection for tests of this same contract.
 //!
 //! # Snapshot and transaction semantics
 //!
