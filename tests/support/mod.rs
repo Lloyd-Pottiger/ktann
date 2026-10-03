@@ -610,10 +610,10 @@ impl DeterministicWriteTxn<'_> {
     /// Rejects a key or value that exceeds the backend's hard limits.
     fn check_key_value(&self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
         check_key(&self.backend.config, key)?;
-        if let Some(value) = value {
-            if value.len() > self.backend.config.hard_limits.max_value_bytes {
-                return Err(limit_exceeded());
-            }
+        if let Some(value) = value
+            && value.len() > self.backend.config.hard_limits.max_value_bytes
+        {
+            return Err(limit_exceeded());
         }
         Ok(())
     }

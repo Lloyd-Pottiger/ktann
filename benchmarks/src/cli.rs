@@ -350,11 +350,11 @@ fn option_map(
     arguments: &[OsString],
     allowed: &[&str],
 ) -> Result<BTreeMap<String, String>, String> {
-    if arguments.len() % 2 != 0 {
+    if !arguments.len().is_multiple_of(2) {
         return Err("every option must have a value".to_owned());
     }
     let mut values = BTreeMap::new();
-    for pair in arguments.chunks_exact(2) {
+    for pair in arguments.as_chunks::<2>().0.iter() {
         let key = pair[0]
             .to_str()
             .and_then(|value| value.strip_prefix("--"))

@@ -660,10 +660,10 @@ struct FieldCheck {
 impl FieldCheck {
     fn contains(&self, value: &Value) -> Result<bool> {
         for interval in &self.intervals {
-            if let Some(lo) = &interval.lo {
-                if bound_order(value, lo) == Ordering::Less {
-                    return Ok(false);
-                }
+            if let Some(lo) = &interval.lo
+                && bound_order(value, lo) == Ordering::Less
+            {
+                return Ok(false);
             }
             match &interval.hi {
                 Some(hi) if bound_order(value, hi) == Ordering::Less => return Ok(true),

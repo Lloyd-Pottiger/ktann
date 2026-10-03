@@ -372,10 +372,10 @@ async fn read_tree_manifest_plain<T: WriteTxn>(
 /// Every hop must descend exactly one level, so a level that fails to
 /// decrement — including any cycle — is Corruption.
 fn check_level(header: &PartitionHeader, expected_level: Option<u32>) -> Result<()> {
-    if let Some(expected) = expected_level {
-        if header.level() != expected {
-            return Err(Error::new(ErrorKind::Corruption));
-        }
+    if let Some(expected) = expected_level
+        && header.level() != expected
+    {
+        return Err(Error::new(ErrorKind::Corruption));
     }
     Ok(())
 }
@@ -831,8 +831,8 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                     }
                     // Independent records share the centroid while each distance
                     // retains its format-defined scalar accumulation order.
-                    let mut groups = scan_members[body_slots[index]].chunks_exact(4);
-                    for group in &mut groups {
+                    let (groups, remainder) = scan_members[body_slots[index]].as_chunks::<4>();
+                    for group in groups {
                         let vectors =
                             std::array::from_fn::<_, 4, _>(|lane| routings[group[lane].member]);
                         let distances = kernel.routing_distances(vectors, entry.centroid())?;
@@ -840,7 +840,7 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                             nearest[member.member].consider(distance, entry, body);
                         }
                     }
-                    for member in groups.remainder() {
+                    for member in remainder {
                         let distance =
                             kernel.routing_distance(routings[member.member], entry.centroid())?;
                         nearest[member.member].consider(distance, entry, body);

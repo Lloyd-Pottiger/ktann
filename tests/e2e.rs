@@ -1558,7 +1558,7 @@ fn fill_fields(
             match schema.data_type() {
                 DataType::I64 => Value::I64(ordinal as i64),
                 DataType::F64 => Value::f64(ordinal as f64 + 0.5).expect("finite"),
-                DataType::Bool => Value::Bool(ordinal % 2 == 0),
+                DataType::Bool => Value::Bool(ordinal.is_multiple_of(2)),
                 DataType::String => Value::string(format!("s{ordinal:06}")).expect("string"),
                 _ => unreachable!("supported field types"),
             }

@@ -1554,26 +1554,26 @@ async fn level_bodies<R: LogicalReader>(
         // transition commit atomically (ADR 0014): a Splitting root's targets
         // cannot exist yet, so an absent target is skipped, while a
         // DrainingSplit root's targets exist by construction.
-        if current_level == root_header.level() {
-            if let Some(root_state) = read_state(reader, index, tree_key, root).await? {
-                let draining = matches!(root_state, PartitionTransition::DrainingSplit { .. });
-                let targets = match root_state {
-                    PartitionTransition::Splitting { left, right, .. }
-                    | PartitionTransition::DrainingSplit { left, right, .. } => [left, right],
-                    _ => [root, root],
-                };
-                for target in targets {
-                    if target == root || bodies.contains(&target) {
-                        continue;
-                    }
-                    let exists = read_header_opt(reader, index, tree_key, target)
-                        .await?
-                        .is_some();
-                    if !exists && !draining {
-                        continue;
-                    }
-                    bodies.push(target);
+        if current_level == root_header.level()
+            && let Some(root_state) = read_state(reader, index, tree_key, root).await?
+        {
+            let draining = matches!(root_state, PartitionTransition::DrainingSplit { .. });
+            let targets = match root_state {
+                PartitionTransition::Splitting { left, right, .. }
+                | PartitionTransition::DrainingSplit { left, right, .. } => [left, right],
+                _ => [root, root],
+            };
+            for target in targets {
+                if target == root || bodies.contains(&target) {
+                    continue;
                 }
+                let exists = read_header_opt(reader, index, tree_key, target)
+                    .await?
+                    .is_some();
+                if !exists && !draining {
+                    continue;
+                }
+                bodies.push(target);
             }
         }
 

@@ -467,10 +467,10 @@ impl Traversal {
         // Every Child Entry descends exactly one level, so a referenced
         // partition's Header must agree with the level its edge established;
         // the same check rejects cycles before they can repeat a partition.
-        if let Some(expected) = entry.expected_level {
-            if header.level() != expected {
-                return Err(Error::new(ErrorKind::Corruption));
-            }
+        if let Some(expected) = entry.expected_level
+            && header.level() != expected
+        {
+            return Err(Error::new(ErrorKind::Corruption));
         }
         let level = header.level();
 
@@ -767,8 +767,8 @@ fn score_leaf_entries<'a, T: Borrow<CachedLeafEntry>>(
     query: &RaBitQQuery<'_>,
 ) -> Result<Vec<(&'a T, ApproximateDistance)>> {
     let mut batch = Vec::with_capacity(entries.len());
-    let mut chunks = entries.chunks_exact(4);
-    for entries in &mut chunks {
+    let (chunks, remainder) = entries.as_chunks::<4>();
+    for entries in chunks {
         let codes: [_; 4] = std::array::from_fn(|lane| entries[lane].borrow().code());
         let distances = DecodedRaBitQ7::approximate_distances(codes, query)
             .map_err(|_| Error::new(ErrorKind::Corruption))?;
@@ -776,7 +776,7 @@ fn score_leaf_entries<'a, T: Borrow<CachedLeafEntry>>(
             batch.push((entry, distance));
         }
     }
-    for entry in chunks.remainder() {
+    for entry in remainder {
         // Loading the immutable body validates every payload before filtering,
         // so rejected entries cannot hide malformed persistent codes.
         let [distance] = DecodedRaBitQ7::approximate_distances([entry.borrow().code()], query)

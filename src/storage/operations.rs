@@ -1167,10 +1167,10 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
     /// caller only needs a plain read; otherwise the read goes to the backend
     /// so the conflict is established natively.
     async fn get_raw(&mut self, key: Bytes, for_update: bool) -> Result<Option<Bytes>> {
-        if let Some(entry) = self.read_cache.get(&key) {
-            if entry.update_protected || !for_update {
-                return Ok(entry.value.clone());
-            }
+        if let Some(entry) = self.read_cache.get(&key)
+            && (entry.update_protected || !for_update)
+        {
+            return Ok(entry.value.clone());
         }
         let value = if for_update {
             self.raw.get_for_update(key.clone()).await?

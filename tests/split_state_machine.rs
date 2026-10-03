@@ -312,10 +312,10 @@ async fn root_leaf_split_runs_end_to_end_and_stays_searchable() {
             .expect("entry");
         // The upsert re-encoded r0's vector; every other entry moved with
         // its absolute RaBitQ7 payload copied verbatim.
-        if id != &rid(0) {
-            if let Some(before_entry) = before.get(id) {
-                assert_eq!(&entry, before_entry, "RaBitQ7 payload copied verbatim");
-            }
+        if id != &rid(0)
+            && let Some(before_entry) = before.get(id)
+        {
+            assert_eq!(&entry, before_entry, "RaBitQ7 payload copied verbatim");
         }
     }
     // The drain moved every snapshotted source entry except the upsert's

@@ -103,7 +103,7 @@ pub(super) fn approximate_distances<const N: usize>(
     let scales = codes.map(|code| f64::from(code.header.scale));
     let mut dots = [0.0_f64; N];
     let mut odd_dots = [0.0_f64; N];
-    for (pair_index, pair) in query.components.chunks_exact(2).enumerate() {
+    for (pair_index, pair) in query.components.as_chunks::<2>().0.iter().enumerate() {
         let index = pair_index * 2;
         let even = f64::from(pair[0]);
         let odd = f64::from(pair[1]);
@@ -112,7 +112,7 @@ pub(super) fn approximate_distances<const N: usize>(
             odd_dots[lane] += odd * f64::from(codes[lane].codes[index + 1]);
         }
     }
-    if query.components.len() % 2 != 0 {
+    if !query.components.len().is_multiple_of(2) {
         let index = query.components.len() - 1;
         let component = f64::from(query.components[index]);
         for lane in 0..N {

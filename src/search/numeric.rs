@@ -432,7 +432,7 @@ fn generate_pairs(dimension: usize, random: &mut ChaCha8) -> Result<Box<[[usize;
 
     let pair_count = dimension / 2;
     let mut pairs = allocate_vec(pair_count)?;
-    for pair in permutation.chunks_exact(2) {
+    for pair in permutation.as_chunks::<2>().0 {
         pairs.push([pair[0], pair[1]]);
     }
     Ok(pairs.into_boxed_slice())
@@ -457,7 +457,7 @@ impl ChaCha8 {
     fn new(seed: [u8; 32]) -> Self {
         // The format interprets each consecutive key word as little-endian.
         let mut key = [0; 8];
-        for (word, bytes) in key.iter_mut().zip(seed.chunks_exact(4)) {
+        for (word, bytes) in key.iter_mut().zip(seed.as_chunks::<4>().0.iter()) {
             *word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         }
         Self {

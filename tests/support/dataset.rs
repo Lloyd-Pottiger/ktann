@@ -141,7 +141,7 @@ pub fn generate(spec: &str, dimension: usize, seed: u64) -> Dataset {
             (0..count)
                 .map(|_| {
                     let mut pick = 0_usize;
-                    while pick + 1 < hotspots.len() && rng.next() % 2 == 0 {
+                    while pick + 1 < hotspots.len() && rng.next().is_multiple_of(2) {
                         pick += 1;
                     }
                     let base = hotspots[pick];
@@ -167,7 +167,7 @@ pub fn generate(spec: &str, dimension: usize, seed: u64) -> Dataset {
             (0..count)
                 .map(|_| {
                     let base = &bases[rng.below(distinct as u64) as usize];
-                    if rng.next() % 2 == 0 {
+                    if rng.next().is_multiple_of(2) {
                         base.clone().into()
                     } else {
                         base.iter()

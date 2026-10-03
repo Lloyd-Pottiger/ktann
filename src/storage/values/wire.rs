@@ -180,7 +180,9 @@ impl Decoder {
         let byte_count = count.checked_mul(4).ok_or_else(corrupt)?;
         let values: Vec<f32> = self
             .take(byte_count)?
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|bytes| f32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
             .collect();
         // A full reduction keeps validation vectorizable instead of branching

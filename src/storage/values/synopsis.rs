@@ -407,10 +407,10 @@ fn validate_non_null_value(value: &Value, data_type: DataType) -> Result<()> {
         (DataType::F64, Value::F64(value)) if value.is_finite() => {}
         _ => return Err(Error::invalid_argument()),
     }
-    if let Value::String(value) = value {
-        if value.len() > MAX_STRING_BYTES {
-            return Err(Error::invalid_argument());
-        }
+    if let Value::String(value) = value
+        && value.len() > MAX_STRING_BYTES
+    {
+        return Err(Error::invalid_argument());
     }
     Ok(())
 }

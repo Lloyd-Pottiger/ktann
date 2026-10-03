@@ -498,19 +498,19 @@ impl<B: Backend> Drop for RunningFixup<'_, B> {
                 let mut enqueued = 0_u64;
                 let mut duplicate = 0_u64;
                 let mut saturated = 0_u64;
-                if !self.inner.maintenance_cancel.is_cancelled() {
-                    if let Some((targets, parent)) = split_followups {
-                        for partition in targets.into_iter().chain(parent) {
-                            let key = FixupKey {
-                                index: self.offer.key.index,
-                                tree_key: self.offer.key.tree_key.clone(),
-                                partition,
-                            };
-                            match queue.offer(key, &self.offer.manifest) {
-                                FixupAdmission::Enqueued => enqueued += 1,
-                                FixupAdmission::Duplicate => duplicate += 1,
-                                FixupAdmission::Saturated => saturated += 1,
-                            }
+                if !self.inner.maintenance_cancel.is_cancelled()
+                    && let Some((targets, parent)) = split_followups
+                {
+                    for partition in targets.into_iter().chain(parent) {
+                        let key = FixupKey {
+                            index: self.offer.key.index,
+                            tree_key: self.offer.key.tree_key.clone(),
+                            partition,
+                        };
+                        match queue.offer(key, &self.offer.manifest) {
+                            FixupAdmission::Enqueued => enqueued += 1,
+                            FixupAdmission::Duplicate => duplicate += 1,
+                            FixupAdmission::Saturated => saturated += 1,
                         }
                     }
                 }

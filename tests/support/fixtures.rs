@@ -49,15 +49,17 @@ pub fn read_ivecs(dir: &Path, name: &str) -> Vec<Vec<i32>> {
     let width = i32::from_le_bytes(bytes[..4].try_into().expect("prefix")) as usize;
     let record = 4 + width * 4;
     assert!(
-        width > 0 && bytes.len() % record == 0,
+        width > 0 && bytes.len().is_multiple_of(record),
         "truncated ivecs fixture `{name}`"
     );
     (0..bytes.len() / record)
         .map(|index| {
             let payload = &bytes[index * record + 4..(index + 1) * record];
             payload
-                .chunks_exact(4)
-                .map(|chunk| i32::from_le_bytes(chunk.try_into().expect("component")))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| i32::from_le_bytes(*chunk))
                 .collect()
         })
         .collect()
@@ -69,7 +71,7 @@ fn parse_fvecs(bytes: &[u8], name: &str) -> Vec<Arc<[f32]>> {
     let dimension = i32::from_le_bytes(bytes[..4].try_into().expect("prefix")) as usize;
     let record = 4 + dimension * 4;
     assert!(
-        dimension > 0 && bytes.len() % record == 0,
+        dimension > 0 && bytes.len().is_multiple_of(record),
         "truncated fvecs fixture `{name}`"
     );
     (0..bytes.len() / record)
@@ -80,8 +82,10 @@ fn parse_fvecs(bytes: &[u8], name: &str) -> Vec<Arc<[f32]>> {
                 "inconsistent fvecs dimension in fixture `{name}`"
             );
             payload[4..]
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("component")))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| f32::from_le_bytes(*chunk))
                 .collect()
         })
         .collect()
