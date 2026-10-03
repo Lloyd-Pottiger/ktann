@@ -11,14 +11,15 @@ use ktann::api::{
 use ktann::maintenance::routing::route_leaf;
 use ktann::maintenance::{merge, split};
 use ktann::runtime::{RetryPolicy, Runtime};
-use ktann::storage::backend::{AdmissionBudget, Backend, Capabilities, ScanLimits};
+use ktann::storage::backend::{AdmissionBudget, Capabilities, ScanLimits};
 use ktann::storage::keys::{LogicalKey, TreeKey};
 use ktann::storage::values::{
     ChildEntry, IndexManifest, LeafEntry, PartitionCentroid, PartitionHeader, PartitionSynopsis,
     PartitionTransition, PersistentValue, RecordLocation,
 };
-use ktann::storage::{LogicalRange, ReadLogicalTxn, WriteLogicalTxn, tree_manifest};
+use ktann::storage::{LogicalRange, tree_manifest};
 
+use super::builders::{pk, read_txn, write_txn};
 use super::{CommitFault, DeterministicBackend, DeterministicConfig, SharedBackend};
 
 pub fn backend() -> SharedBackend {
@@ -78,10 +79,6 @@ pub fn retry() -> RetryPolicy {
     RetryPolicy::for_fixup(&RuntimeConfig::default())
 }
 
-pub fn tree_key(bucket: i64) -> TreeKey {
-    TreeKey::encode(&[DataType::I64], &[Value::I64(bucket)]).expect("canonical key")
-}
-
 pub fn rid(value: u8) -> Bytes {
     Bytes::copy_from_slice(&[b'r', value])
 }
@@ -93,31 +90,6 @@ pub fn record(id: &[u8], x: f32, bucket: i64) -> Record {
         vec![Value::I64(bucket)],
     )
     .expect("valid record")
-}
-
-pub fn pk(value: u64) -> PartitionKey {
-    PartitionKey::new(value).expect("test Partition Key is nonzero")
-}
-
-pub async fn read_txn<'b, 'm>(
-    backend: &'b SharedBackend,
-    manifest: &'m IndexManifest,
-) -> ReadLogicalTxn<'m, <SharedBackend as Backend>::ReadTxn<'b>> {
-    let raw = backend.begin_read().await.expect("begin read");
-    ReadLogicalTxn::for_index(raw, manifest)
-}
-
-pub async fn write_txn<'b, 'm>(
-    backend: &'b SharedBackend,
-    manifest: &'m IndexManifest,
-) -> WriteLogicalTxn<'m, <SharedBackend as Backend>::WriteTxn<'b>> {
-    let raw = backend.begin_write().await.expect("begin write");
-    WriteLogicalTxn::for_index(
-        raw,
-        manifest,
-        backend.hard_limits(),
-        backend.admission_budget(),
-    )
 }
 
 /// Installs the Tree Manifest and initial leaf root so fixtures can grow the

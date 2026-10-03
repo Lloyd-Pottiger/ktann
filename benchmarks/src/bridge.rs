@@ -676,8 +676,7 @@ impl<B: Backend> Service<B> {
                 "foreground_limit": 128, "import_max_in_flight_batches": 4, "import_backlog_watermark": 1,
                 "readiness_header_slot_limit": 262144, "readiness_probe_limit": 32,
                 "readiness_stall_seconds": 5, "readiness_probe_interval_seconds": 30,
-                "readiness_probe_leaf_beam": 1, "readiness_probe_partition_budget": 128,
-                "readiness_probe_leaf_entry_budget": 128
+                "readiness_probe_leaf_beam": 1, "readiness_probe_partition_budget": 128
             },
             "continuous_first_insert_through_final_search_seconds": state.started.zip(m.last_search).map(|(a,b)| b.duration_since(a).as_secs_f64()),
             "phases": {

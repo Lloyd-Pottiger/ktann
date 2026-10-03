@@ -692,13 +692,12 @@ impl DeterministicWriteTxn<'_> {
 
         let too_old = !self.read_set.is_empty() && self.version < evicted_through(&state);
         let can_apply = !too_old && !self.conflicts(&state);
-        let (outcome, should_apply) = match fault {
-            CommitFault::Normal if can_apply => (CommitOutcome::Committed, true),
-            CommitFault::Normal => (CommitOutcome::Aborted, false),
-            CommitFault::Abort => (CommitOutcome::Aborted, false),
-            CommitFault::UnknownApplied if can_apply => (CommitOutcome::UnknownApplied, true),
-            CommitFault::UnknownApplied => (CommitOutcome::Aborted, false),
-            CommitFault::UnknownNotApplied => (CommitOutcome::UnknownNotApplied, false),
+        let outcome = match fault {
+            CommitFault::Normal if can_apply => CommitOutcome::Committed,
+            CommitFault::Normal | CommitFault::Abort => CommitOutcome::Aborted,
+            CommitFault::UnknownApplied if can_apply => CommitOutcome::UnknownApplied,
+            CommitFault::UnknownApplied => CommitOutcome::Aborted,
+            CommitFault::UnknownNotApplied => CommitOutcome::UnknownNotApplied,
         };
 
         let mut entry = HistoryEntry {
@@ -710,7 +709,10 @@ impl DeterministicWriteTxn<'_> {
             fingerprint: fingerprint(&self.clear_ranges, &self.pending),
         };
 
-        let applied_version = if should_apply {
+        if matches!(
+            outcome,
+            CommitOutcome::Committed | CommitOutcome::UnknownApplied
+        ) {
             let new_map = apply_staged(&state.committed, &self.clear_ranges, &self.pending);
             let new_db_bytes = try_sum_bytes(&new_map)?;
             if new_map.len() > config.max_db_keys || new_db_bytes > config.max_db_bytes {
@@ -733,23 +735,19 @@ impl DeterministicWriteTxn<'_> {
             });
             gc_versions(&mut state, config.max_retained_versions);
             entry.version = new_version;
-            Some(new_version)
-        } else {
-            None
-        };
+        }
 
         state.history.push(entry);
 
-        match (outcome, applied_version) {
-            (CommitOutcome::Committed, Some(_)) => Ok(()),
-            (CommitOutcome::UnknownApplied, Some(_)) => {
+        match outcome {
+            CommitOutcome::Committed => Ok(()),
+            CommitOutcome::Aborted => Err(Error::new(ErrorKind::RetryableAbort)),
+            CommitOutcome::UnknownApplied | CommitOutcome::UnknownNotApplied => {
                 Err(Error::new(ErrorKind::CommitOutcomeUnknown))
             }
-            (CommitOutcome::Aborted, None) => Err(Error::new(ErrorKind::RetryableAbort)),
-            (CommitOutcome::UnknownNotApplied, None) => {
-                Err(Error::new(ErrorKind::CommitOutcomeUnknown))
+            CommitOutcome::LimitExceeded => {
+                unreachable!("capacity failures return before classification")
             }
-            _ => unreachable!("commit outcome and application state must agree"),
         }
     }
 
@@ -881,7 +879,9 @@ impl ReadOps for DeterministicWriteTxn<'_> {
         self.backend.count(|counts| counts.scan += 1);
         // Read-your-writes: a non-empty range scans the snapshot with the
         // staged overlay merged in.
-        let merged = if range.start() < range.end() {
+        let merged = if range.start() < range.end()
+            && (!self.pending.is_empty() || !self.clear_ranges.is_empty())
+        {
             Some(apply_staged(
                 &self.snapshot,
                 &self.clear_ranges,
@@ -906,7 +906,9 @@ impl ReadOps for DeterministicWriteTxn<'_> {
         self.backend.count(|counts| counts.batch_scan += 1);
         // Read-your-writes: the staged overlay is merged once and shared by
         // every range in the batch.
-        let merged = if ranges.iter().any(|range| range.start() < range.end()) {
+        let merged = if ranges.iter().any(|range| range.start() < range.end())
+            && (!self.pending.is_empty() || !self.clear_ranges.is_empty())
+        {
             Some(apply_staged(
                 &self.snapshot,
                 &self.clear_ranges,

@@ -20,12 +20,12 @@ use ktann::storage::values::{
 };
 use ktann::storage::{topology, tree_manifest};
 
+use support::builders::{pk, read_txn, tree_key, write_txn};
 use support::topology_probe::{
     all_partitions, assert_exact_membership, assert_fault_kind, assert_searchable, backend,
     backend_with_clear, centroid_of, config, create_committed_tree, drive_split_to_completion,
-    edge_of, header_of, leaf_entry_of, location_of, make_runtime, pk, reachable_leaves, read_txn,
-    record, retry, rid, scan_child_entries, scan_leaf_entries, seed_records, state_of, synopsis_of,
-    tree_key, write_txn,
+    edge_of, header_of, leaf_entry_of, location_of, make_runtime, reachable_leaves, record, retry,
+    rid, scan_child_entries, scan_leaf_entries, seed_records, state_of, synopsis_of,
 };
 use support::{
     CommitFault, DeterministicBackend, DeterministicConfig, Rng, SharedBackend, read_manifest,

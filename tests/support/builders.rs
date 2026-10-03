@@ -45,10 +45,10 @@ pub fn tree_key(value: i64) -> TreeKey {
 }
 
 /// Begins a typed write transaction bound to `manifest`.
-pub async fn write_txn<'b, 'm>(
-    backend: &'b DeterministicBackend,
+pub async fn write_txn<'b, 'm, B: Backend>(
+    backend: &'b B,
     manifest: &'m IndexManifest,
-) -> WriteLogicalTxn<'m, <DeterministicBackend as Backend>::WriteTxn<'b>> {
+) -> WriteLogicalTxn<'m, B::WriteTxn<'b>> {
     let raw = backend.begin_write().await.expect("begin write");
     WriteLogicalTxn::for_index(
         raw,
@@ -59,10 +59,10 @@ pub async fn write_txn<'b, 'm>(
 }
 
 /// Begins a typed read transaction bound to `manifest`.
-pub async fn read_txn<'b, 'm>(
-    backend: &'b DeterministicBackend,
+pub async fn read_txn<'b, 'm, B: Backend>(
+    backend: &'b B,
     manifest: &'m IndexManifest,
-) -> ReadLogicalTxn<'m, <DeterministicBackend as Backend>::ReadTxn<'b>> {
+) -> ReadLogicalTxn<'m, B::ReadTxn<'b>> {
     let raw = backend.begin_read().await.expect("begin read");
     ReadLogicalTxn::for_index(raw, manifest)
 }

@@ -308,7 +308,7 @@ async fn concurrent_creation_installs_exactly_one_tree() {
             let key = key.clone();
             tokio::spawn(async move {
                 loop {
-                    let mut txn = write_txn(&backend, &manifest).await;
+                    let mut txn = write_txn(backend.as_ref(), &manifest).await;
                     let outcome = tree_manifest::create_tree(&mut txn, &key, 0)
                         .await
                         .expect("create");
@@ -333,7 +333,7 @@ async fn concurrent_creation_installs_exactly_one_tree() {
     assert_eq!((created, existing), (1, 7));
 
     let manifest_after =
-        tree_manifest::read_tree_manifest(&mut read_txn(&backend, &manifest).await, &key)
+        tree_manifest::read_tree_manifest(&mut read_txn(backend.as_ref(), &manifest).await, &key)
             .await
             .expect("read")
             .expect("manifest exists");
@@ -364,7 +364,7 @@ async fn concurrent_reservations_partition_the_keyspace() {
             let key = key.clone();
             tokio::spawn(async move {
                 loop {
-                    let mut txn = write_txn(&backend, &manifest).await;
+                    let mut txn = write_txn(backend.as_ref(), &manifest).await;
                     let reservation =
                         match tree_manifest::reserve_partition_keys(&mut txn, &key, PER_TASK).await
                         {
@@ -397,7 +397,7 @@ async fn concurrent_reservations_partition_the_keyspace() {
     assert_eq!(total, TASKS * u64::from(PER_TASK));
 
     let manifest_after =
-        tree_manifest::read_tree_manifest(&mut read_txn(&backend, &manifest).await, &key)
+        tree_manifest::read_tree_manifest(&mut read_txn(backend.as_ref(), &manifest).await, &key)
             .await
             .expect("read")
             .expect("manifest exists");

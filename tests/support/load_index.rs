@@ -63,17 +63,6 @@ pub enum FixtureState {
 }
 
 impl FixtureState {
-    /// The Header discriminator corresponding to this state.
-    fn kind(self) -> PartitionState {
-        match self {
-            Self::Ready => PartitionState::Ready,
-            Self::Splitting { .. } => PartitionState::Splitting,
-            Self::ReceivingSplit { .. } => PartitionState::ReceivingSplit,
-            Self::DrainingSplit { .. } => PartitionState::DrainingSplit,
-            Self::Merging => PartitionState::Merging,
-        }
-    }
-
     /// The persistent State value of this state at one start time.
     fn transition(self, started_at_unix_millis: u64) -> PartitionTransition {
         match self {
@@ -491,6 +480,7 @@ pub async fn install(
     .expect("write tree manifest");
     for (partition, planned) in fixture.partitions.iter().zip(&plan.partitions) {
         let key = partition.key;
+        let transition = partition.state.transition(started_at_unix_millis);
         txn.put(
             LogicalKey::Header {
                 index: iid,
@@ -502,7 +492,7 @@ pub async fn install(
                     partition.level,
                     planned.count,
                     cache_epoch,
-                    partition.state.kind(),
+                    transition.state(),
                 )
                 .expect("valid header"),
             ),
@@ -515,7 +505,7 @@ pub async fn install(
                 tree_key: tree_key.clone(),
                 partition: key,
             },
-            PersistentValue::PartitionState(partition.state.transition(started_at_unix_millis)),
+            PersistentValue::PartitionState(transition),
         )
         .await
         .expect("write state");
