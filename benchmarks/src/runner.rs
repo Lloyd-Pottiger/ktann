@@ -719,7 +719,7 @@ async fn run_lifecycle_case<B: Backend>(
         .duration_since(case_baseline.started)
         .as_secs_f64();
     let case_resources_after = stable_warm.resources_after;
-    let case_backend_io = subtract(stable_warm.backend_after, &case_baseline.backend_io);
+    let case_backend_io = subtract(&stable_warm.backend_after, &case_baseline.backend_io);
     let stable_warm_search = stable_warm.phase;
     search_runtime
         .shutdown()
@@ -979,7 +979,7 @@ async fn run_search_phase<B: Backend>(
     let wall_seconds = completed_at.duration_since(started).as_secs_f64();
     let resources_after = ResourceSnapshot::capture()?;
     let backend_after = backend_counters.snapshot();
-    let backend_io = subtract(backend_after.clone(), &backend_before);
+    let backend_io = subtract(&backend_after, &backend_before);
     let metrics = metric_capture.snapshot();
     let attempted = u64::try_from(requests.len()).map_err(|_| "query count overflow")?;
     let accepted = u64::try_from(outcomes.len()).map_err(|_| "query count overflow")?;
@@ -1223,7 +1223,7 @@ async fn prepare_index<B: Backend>(
             import_seconds,
             resources_before,
             import_after,
-            subtract(import_backend.clone(), &backend_before),
+            subtract(&import_backend, &backend_before),
             &import_metrics,
             import_backlog,
         ),
@@ -1237,7 +1237,7 @@ async fn prepare_index<B: Backend>(
             convergence_seconds,
             import_after,
             resources_after,
-            subtract(backend_after, &import_backend),
+            subtract(&backend_after, &import_backend),
             &convergence_metrics,
             convergence_backlog,
         ),

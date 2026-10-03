@@ -620,7 +620,7 @@ pub(crate) async fn prefetch_membership_for_update<T: WriteTxn>(
     let mut keys = Vec::new();
     // Leaf-level keys repeat per item routed to the same leaf; warm each
     // distinct leaf's Synopsis or source Header once.
-    let mut warmed_synopses: BTreeSet<(TreeKey, PartitionKey)> = BTreeSet::new();
+    let mut warmed_synopses = BTreeSet::new();
     let mut warmed_headers: BTreeSet<(TreeKey, PartitionKey)> = BTreeSet::new();
     for item in items {
         match *item {
@@ -635,7 +635,7 @@ pub(crate) async fn prefetch_membership_for_update<T: WriteTxn>(
                     keys.push(payload_key(index, id));
                 }
                 keys.push(entry_key(index, target, id));
-                if warmed_synopses.insert((target.tree_key().clone(), target.leaf())) {
+                if warmed_synopses.insert((target.tree_key(), target.leaf())) {
                     keys.push(synopsis_key(index, target));
                 }
             }
@@ -645,7 +645,7 @@ pub(crate) async fn prefetch_membership_for_update<T: WriteTxn>(
                 target,
             } => {
                 keys.push(entry_key(index, target, id));
-                if warmed_synopses.insert((target.tree_key().clone(), target.leaf())) {
+                if warmed_synopses.insert((target.tree_key(), target.leaf())) {
                     keys.push(synopsis_key(index, target));
                 }
                 if expected != target {

@@ -298,11 +298,7 @@ fn train<I: Ord>(kernel: &VectorKernel, mut entries: Vec<(I, Box<[f32]>)>) -> Re
             .map_err(|_| Error::new(ErrorKind::Corruption))
     };
 
-    let source = mean(
-        kernel.dimension(),
-        entries.len(),
-        entries.iter().map(|entry| &*entry.1),
-    )?;
+    let source = mean(kernel.dimension(), entries.iter().map(|entry| &*entry.1))?;
     let left_seed = farthest(&entries, &source, &distance)?;
     let right_seed = farthest(&entries, &entries[left_seed].1, &distance)?;
 
@@ -393,10 +389,8 @@ fn cluster_mean<I>(
     assignment: &[bool],
     left: bool,
 ) -> Result<Box<[f32]>> {
-    let count = assignment.iter().filter(|&&member| member == left).count();
     let centroid = mean(
         kernel.dimension(),
-        count,
         entries
             .iter()
             .zip(assignment)
@@ -410,19 +404,17 @@ fn cluster_mean<I>(
     }
 }
 
-/// Computes the component-wise mean of `count` members with f64 accumulation,
+/// Computes the component-wise mean of the members with f64 accumulation,
 /// converting to finite f32.
 ///
 /// The mean of finite components lies within their range, so the conversion
 /// cannot overflow; a non-finite component — including one produced by an
 /// impossible empty cluster — is Corruption.
-fn mean<'a>(
-    dimension: usize,
-    count: usize,
-    members: impl Iterator<Item = &'a [f32]>,
-) -> Result<Box<[f32]>> {
+fn mean<'a>(dimension: usize, members: impl Iterator<Item = &'a [f32]>) -> Result<Box<[f32]>> {
     let mut sums = vec![0.0_f64; dimension];
+    let mut count = 0_usize;
     for vector in members {
+        count += 1;
         for (sum, &component) in sums.iter_mut().zip(vector.iter()) {
             *sum += f64::from(component);
         }
@@ -663,11 +655,7 @@ mod tests {
                 .map_err(|_| Error::new(ErrorKind::Corruption))
         };
 
-        let source = mean(
-            kernel.dimension(),
-            entries.len(),
-            entries.iter().map(|entry| &*entry.1),
-        )?;
+        let source = mean(kernel.dimension(), entries.iter().map(|entry| &*entry.1))?;
         let left_seed = farthest(&entries, &source, &distance)?;
         let right_seed = farthest(&entries, &entries[left_seed].1, &distance)?;
 

@@ -168,24 +168,15 @@ fn cap_survivors<T>(
 ) -> OverlapSelection<T> {
     let truncated = candidates.len() > cap;
     if truncated {
-        truncate_candidates(&mut candidates, cap, compare);
+        if cap == 0 {
+            candidates.clear();
+        } else {
+            candidates.select_nth_unstable_by(cap - 1, compare);
+            candidates.truncate(cap);
+        }
     }
     OverlapSelection {
         candidates,
         truncated,
-    }
-}
-
-/// Truncates to `cap`, keeping the strongest candidates under `compare`.
-fn truncate_candidates<T>(
-    candidates: &mut Vec<ApproximateCandidate<T>>,
-    cap: usize,
-    compare: impl Fn(&ApproximateCandidate<T>, &ApproximateCandidate<T>) -> Ordering,
-) {
-    if cap == 0 {
-        candidates.clear();
-    } else {
-        candidates.select_nth_unstable_by(cap - 1, compare);
-        candidates.truncate(cap);
     }
 }

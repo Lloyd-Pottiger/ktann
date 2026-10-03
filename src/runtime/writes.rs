@@ -131,9 +131,10 @@ pub(crate) async fn run_write_attempts_with_optional_import_permit<'b, 'm, B: Ba
             context.checkpoint()?;
         }
         let mut txn = open_validated_write(backend, handle_manifest).await?;
-        let error = match step(&mut txn).await {
+        let stepped = step(&mut txn).await;
+        let size = txn.size();
+        let attempted = match stepped {
             Ok(outcome) => {
-                let size = txn.size();
                 let committed = match context.as_deref_mut() {
                     Some(context) => {
                         context
@@ -152,34 +153,25 @@ pub(crate) async fn run_write_attempts_with_optional_import_permit<'b, 'm, B: Ba
                         committed
                     }
                 };
-                let attempt_outcome = WriteAttemptOutcome::from_result(&committed);
-                metrics::write_attempt_finished(
-                    operation,
-                    attempt_outcome,
-                    size.mutations(),
-                    size.bytes(),
-                );
-                match committed {
-                    Ok(()) => return Ok(outcome),
-                    // The commit boundary is included in the whole-attempt
-                    // retry; an unknown outcome is returned, never retried.
-                    Err(error) => error,
-                }
+                committed.map(|()| outcome)
             }
             Err(error) => {
-                let size = txn.size();
                 txn.rollback().await;
-                metrics::write_attempt_finished(
-                    operation,
-                    WriteAttemptOutcome::from_error(error.kind()),
-                    size.mutations(),
-                    size.bytes(),
-                );
-                error
+                Err(error)
             }
         };
-        if error.kind() != ErrorKind::RetryableAbort {
-            return Err(error);
+        metrics::write_attempt_finished(
+            operation,
+            WriteAttemptOutcome::from_result(&attempted),
+            size.mutations(),
+            size.bytes(),
+        );
+        match attempted {
+            Ok(outcome) => return Ok(outcome),
+            // The commit boundary is included in the whole-attempt retry;
+            // an unknown outcome is returned, never retried.
+            Err(error) if error.kind() == ErrorKind::RetryableAbort => {}
+            Err(error) => return Err(error),
         }
         wait_before_retry(retry, operation, &mut failed_attempts, permit).await?;
     }

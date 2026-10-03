@@ -1195,13 +1195,13 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
     ) -> Result<Vec<Option<Bytes>>> {
         let mut values: Vec<Option<Bytes>> = Vec::with_capacity(keys.len());
         let mut missing = Vec::new();
-        for (index, key) in keys.iter().enumerate() {
-            match self.read_cache.get(key) {
+        for (index, key) in keys.into_iter().enumerate() {
+            match self.read_cache.get(&key) {
                 Some(entry) if entry.update_protected || !for_update => {
                     values.push(entry.value.clone());
                 }
                 _ => {
-                    missing.push((index, key.clone()));
+                    missing.push((index, key));
                     values.push(None);
                 }
             }
@@ -1209,14 +1209,11 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
         if missing.is_empty() {
             return Ok(values);
         }
+        let missing_keys = missing.iter().map(|(_, key)| key.clone()).collect();
         let fetched = if for_update {
-            self.raw
-                .batch_get_for_update(missing.iter().map(|(_, key)| key.clone()).collect())
-                .await?
+            self.raw.batch_get_for_update(missing_keys).await?
         } else {
-            self.raw
-                .batch_get(missing.iter().map(|(_, key)| key.clone()).collect())
-                .await?
+            self.raw.batch_get(missing_keys).await?
         };
         if fetched.len() != missing.len() {
             return Err(Error::new(ErrorKind::Backend));

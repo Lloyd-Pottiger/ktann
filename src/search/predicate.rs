@@ -230,7 +230,7 @@ impl CompiledExpression {
                 }
                 Ok(TruthValue::from_bool(compare(stored, value, *op)?))
             }
-            Self::In { field, values } => values.evaluate(&fields[*field]),
+            Self::In { field, values } => Ok(values.evaluate(&fields[*field])),
             Self::IsNull(field) => Ok(TruthValue::from_bool(matches!(fields[*field], Value::Null))),
             Self::IsNotNull(field) => Ok(TruthValue::from_bool(!matches!(
                 fields[*field],
@@ -297,15 +297,13 @@ impl CompiledIn {
         Self(values.into_boxed_slice())
     }
 
-    fn evaluate(&self, stored: &Value) -> Result<TruthValue> {
+    /// Evaluates an IN set against a schema-validated stored field.
+    fn evaluate(&self, stored: &Value) -> TruthValue {
         if self.0.is_empty() {
-            return Ok(TruthValue::False);
+            return TruthValue::False;
         }
         if matches!(stored, Value::Null) {
-            return Ok(TruthValue::Unknown);
-        }
-        if typed_order(&self.0[0], stored).is_none() {
-            return Err(corrupt());
+            return TruthValue::Unknown;
         }
         let contains = self
             .0
@@ -313,7 +311,7 @@ impl CompiledIn {
                 typed_order(value, stored).expect("validated IN values share the stored domain")
             })
             .is_ok();
-        Ok(TruthValue::from_bool(contains))
+        TruthValue::from_bool(contains)
     }
 }
 

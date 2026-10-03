@@ -70,7 +70,7 @@ impl BackendCounters {
     /// Returns work performed since `before`.
     #[must_use]
     pub fn since(&self, before: &BackendIo) -> BackendIo {
-        subtract(self.snapshot(), before)
+        subtract(&self.snapshot(), before)
     }
 }
 
@@ -190,7 +190,7 @@ fn add(counter: &AtomicU64, value: usize) {
 }
 
 /// Computes the timed-region delta from two monotonic snapshots.
-pub(crate) fn subtract(after: BackendIo, before: &BackendIo) -> BackendIo {
+pub(crate) fn subtract(after: &BackendIo, before: &BackendIo) -> BackendIo {
     after
         .checked_sub(before)
         .expect("monotonic Backend counters never decrease")

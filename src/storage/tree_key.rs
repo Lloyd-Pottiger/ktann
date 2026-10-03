@@ -265,19 +265,7 @@ fn check_scalar(ty: DataType, bytes: &[u8]) -> Result<usize> {
             take_array::<8>(bytes)?;
             Ok(8)
         }
-        DataType::F64 => {
-            let encoded = u64::from_be_bytes(take_array::<8>(bytes)?);
-            let bits = if encoded & SIGN != 0 {
-                encoded ^ SIGN
-            } else {
-                !encoded
-            };
-            let value = f64::from_bits(bits);
-            if !value.is_finite() || (value == 0.0 && value.is_sign_negative()) {
-                return Err(corrupt());
-            }
-            Ok(8)
-        }
+        DataType::F64 => decode_scalar(ty, bytes).map(|(_, consumed)| consumed),
         DataType::String => check_string(bytes),
     }
 }
