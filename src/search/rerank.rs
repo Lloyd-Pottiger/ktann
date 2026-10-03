@@ -20,9 +20,9 @@ use super::rabitq::{ApproximateCandidate, ApproximateDistance};
 /// The number of Vector Records loaded per backend batch.
 ///
 /// Each record reads two logical keys (record body and Record Location), so
-/// one batch issues at most 128 encoded keys — comfortably below backend batch
+/// one batch issues at most 512 encoded keys — comfortably below backend batch
 /// ceilings — and bounds the number of decoded records held in flight.
-const RECORD_LOAD_BATCH: usize = 64;
+const RECORD_LOAD_BATCH: usize = 256;
 
 /// One leaf candidate admitted for exact filtering and reranking.
 ///
@@ -941,13 +941,12 @@ mod tests {
     #[tokio::test]
     async fn record_loads_respect_bounded_backend_batches() {
         let manifest = manifest(Metric::L2);
-        // 70 records force two bounded batches (64 + 6). The mock's ceiling
-        // admits exactly one bounded batch of 128 keys; a single unbounded
-        // read of all 140 keys would fail with LimitExceeded.
-        let records = fixture_records(70);
+        // Force a full batch and a partial batch. The mock admits one batch
+        // of record/location pairs, but rejects one unbounded read.
+        let records = fixture_records(super::RECORD_LOAD_BATCH as i32 + 6);
         let data = record_group_data(&manifest, &records);
         let mut txn = mock_txn(data);
-        txn.max_batch_size = 2 * 64;
+        txn.max_batch_size = 2 * super::RECORD_LOAD_BATCH;
         let outcome = rerank(
             &manifest,
             txn,
