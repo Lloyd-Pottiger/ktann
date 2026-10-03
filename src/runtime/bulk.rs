@@ -144,7 +144,7 @@ impl Plan {
         let maximum = config.max_partition_entries() as usize;
         let minimum = config.min_partition_entries() as usize;
         // Validated configuration guarantees 2 * minimum <= maximum. Balanced
-        // power-of-two subdivision produces non-root groups above half this
+        // power-of-two subdivision produces non-root groups at least half this
         // target, preserving minimum occupancy while leaving refinement space.
         let initial_leaf_target = (maximum / 2).max(2 * minimum);
         let mut trees = Vec::with_capacity(tree_members.len());
