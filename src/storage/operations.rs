@@ -1209,24 +1209,32 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
         if missing.is_empty() {
             return Ok(values);
         }
-        let missing_keys = missing.iter().map(|(_, key)| key.clone()).collect();
+        // Group repeated misses before the native read. Sorting the existing
+        // position buffer avoids a second lookup map and preserves caller order
+        // when the results are scattered back below.
+        missing.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+        let mut missing_keys: Vec<_> = missing.iter().map(|(_, key)| key.clone()).collect();
+        missing_keys.dedup();
+        let missing_count = missing_keys.len();
         let fetched = if for_update {
             self.raw.batch_get_for_update(missing_keys).await?
         } else {
             self.raw.batch_get(missing_keys).await?
         };
-        if fetched.len() != missing.len() {
+        if fetched.len() != missing_count {
             return Err(Error::new(ErrorKind::Backend));
         }
-        for ((index, key), value) in missing.into_iter().zip(fetched) {
+        for (positions, value) in missing.chunk_by(|a, b| a.1 == b.1).zip(fetched) {
             self.read_cache.insert(
-                key,
+                positions[0].1.clone(),
                 ReadCacheEntry {
                     value: value.clone(),
                     update_protected: for_update,
                 },
             );
-            values[index] = value;
+            for (index, _) in positions {
+                values[*index] = value.clone();
+            }
         }
         Ok(values)
     }

@@ -474,6 +474,7 @@ pub async fn delete_record<T: WriteTxn>(
             leaves: &mut leaves,
         },
         id,
+        None,
     )
     .await?;
     leaves.flush(txn, deferred)?;
@@ -486,11 +487,13 @@ pub async fn delete_record<T: WriteTxn>(
 /// Deletes one record and returns the changed Header for maintenance discovery.
 ///
 /// Follows [`delete_record`], with every write queued into the shared
-/// `writes`: the Header adjustment accumulates until its flush.
+/// `writes`: the Header adjustment accumulates until its flush. A prefetched
+/// Location must come from an update-protected read in this transaction.
 pub(crate) async fn delete_record_with_header<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     writes: &mut WriteSinks<'_, '_>,
     id: &Bytes,
+    prefetched_location: Option<RecordLocation>,
 ) -> Result<DeleteReport> {
     let index = txn.require_manifest()?.logical_index_id();
 
@@ -499,8 +502,11 @@ pub(crate) async fn delete_record_with_header<T: WriteTxn>(
         return Ok(DeleteReport::NotFound);
     }
     let location_key = location_key(index, id);
-    let location = expect_location(txn.get_for_update(location_key.clone()).await?)?
-        .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
+    let location = match prefetched_location {
+        Some(location) => location,
+        None => expect_location(txn.get_for_update(location_key.clone()).await?)?
+            .ok_or_else(|| Error::new(ErrorKind::Corruption))?,
+    };
     let entry_key = entry_key(index, &location, id);
     expect_leaf_entry(txn.get_for_update(entry_key.clone()).await?)?
         .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
@@ -601,7 +607,10 @@ const MEMBERSHIP_READ_CHUNK: usize = 1_024;
 ///
 /// The per-item membership operations re-read exactly these keys through the
 /// checked typed path when they apply; served from the warmed cache, they
-/// cost no backend round trip per record. The batched reads establish the
+/// cost no backend round trip per record. Successfully decoded delete
+/// Locations are returned in delete-item order for the apply path to consume;
+/// an empty result leaves all Locations to that path's checked reads.
+/// The batched reads establish the
 /// per-key conflicts the per-item reads rely on; a delete of an absent record
 /// additionally protects its (necessarily absent) Location, which exact
 /// membership only ever writes together with the already-protected Record.
@@ -613,9 +622,9 @@ const MEMBERSHIP_READ_CHUNK: usize = 1_024;
 pub(crate) async fn prefetch_membership_for_update<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     items: &[MembershipPrefetch<'_>],
-) {
+) -> Vec<Option<RecordLocation>> {
     let Some(index) = txn.bound_manifest().map(IndexManifest::logical_index_id) else {
-        return;
+        return Vec::new();
     };
     let mut keys = Vec::new();
     // Leaf-level keys repeat per item routed to the same leaf; warm each
@@ -662,7 +671,7 @@ pub(crate) async fn prefetch_membership_for_update<T: WriteTxn>(
         }
     }
     if !warm_chunks_for_update(txn, keys).await {
-        return;
+        return Vec::new();
     }
     // A delete's leaf Header and Leaf Entry keys follow from its stored
     // Location, so they warm in a second wave served from the first wave's
@@ -676,10 +685,11 @@ pub(crate) async fn prefetch_membership_for_update<T: WriteTxn>(
         location_keys.push(location_key(index, id));
     }
     let Ok(locations) = txn.batch_get_for_update(location_keys).await else {
-        return;
+        return Vec::new();
     };
     let mut locations = locations.into_iter();
     let mut leaf_keys = Vec::new();
+    let mut prefetched = Vec::new();
     for item in items {
         let &MembershipPrefetch::Delete { id } = item else {
             continue;
@@ -690,14 +700,16 @@ pub(crate) async fn prefetch_membership_for_update<T: WriteTxn>(
                 if warmed_headers.insert((location.tree_key().clone(), location.leaf())) {
                     leaf_keys.push(header_key(index, &location));
                 }
+                prefetched.push(Some(location));
             }
             // A fully absent Record ID warms nothing.
-            Some(None) => {}
+            Some(None) => prefetched.push(None),
             // A short batch defers every remaining key to the checked path.
-            _ => return,
+            _ => return Vec::new(),
         }
     }
     let _ = warm_chunks_for_update(txn, leaf_keys).await;
+    prefetched
 }
 
 /// Warms `keys` in bounded update-protected batches, returning false when a
