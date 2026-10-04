@@ -730,18 +730,18 @@ pub async fn relocate_leaf_entries<T: WriteTxn>(
             )
             .await?,
         )?;
-        txn.delete(LogicalKey::LeafEntry {
+        let mut mutations = txn.mutations();
+        mutations.delete(LogicalKey::LeafEntry {
             index,
             tree_key: tree_key.clone(),
             partition: drain.source,
             id: id.clone(),
-        })
-        .await?;
-        txn.put(
+        })?;
+        mutations.put(
             LogicalKey::Location { index, id },
             PersistentValue::RecordLocation(RecordLocation::new(tree_key.clone(), *target)),
-        )
-        .await?;
+        )?;
+        txn.apply(mutations).await?;
     }
 
     // Preserve move order even when a partition receives and then sends entries.
