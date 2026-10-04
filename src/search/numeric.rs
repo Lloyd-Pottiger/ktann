@@ -155,7 +155,7 @@ impl VectorKernel {
             validate_vector(routing, self.dimension, VectorSource::Caller)?;
         }
         validate_vector(centroid, self.dimension, VectorSource::Persistent)?;
-        Ok(self.interleaved_distances(routings, centroid))
+        Ok(self.routing_distances_validated(routings, centroid))
     }
 
     /// Scores independent persistent centroids against one query, preserving
@@ -171,11 +171,16 @@ impl VectorKernel {
         }
         // Squared L2 and negative dot products are symmetric, including their
         // scalar IEEE-754 results; validation still follows input ownership.
-        Ok(self.interleaved_distances(centroids, routing))
+        Ok(self.routing_distances_validated(centroids, routing))
     }
 
-    /// Interleaves validated vectors without reassociating their additions.
-    fn interleaved_distances<const N: usize>(
+    /// Scores finite vectors of this kernel's dimension without revalidating
+    /// each component for every distance. Callers must establish those input
+    /// invariants through preprocessing, persistent decoding, or validation.
+    ///
+    /// Interleaving preserves each scalar-f64 accumulation order, including
+    /// signed zero; a single lane also serves a partial routing group.
+    pub(crate) fn routing_distances_validated<const N: usize>(
         &self,
         routings: [&[f32]; N],
         centroid: &[f32],
@@ -809,6 +814,14 @@ mod tests {
                     let distances = kernel
                         .routing_distances(vectors.each_ref().map(Vec::as_slice), &centroid)
                         .unwrap();
+                    let validated_distances = kernel.routing_distances_validated(
+                        vectors.each_ref().map(Vec::as_slice),
+                        &centroid,
+                    );
+                    assert_eq!(
+                        validated_distances.map(f64::to_bits),
+                        distances.map(f64::to_bits),
+                    );
                     let centroid_distances = kernel
                         .routing_centroid_distances(
                             &centroid,
@@ -818,6 +831,12 @@ mod tests {
                     for ((vector, distance), centroid_distance) in
                         vectors.iter().zip(distances).zip(centroid_distances)
                     {
+                        assert_eq!(
+                            kernel.routing_distances_validated([vector.as_slice()], &centroid)[0]
+                                .to_bits(),
+                            distance.to_bits(),
+                            "single lane metric={metric:?} dimension={dimension} trial={trial}"
+                        );
                         assert_eq!(
                             centroid_distance.to_bits(),
                             kernel

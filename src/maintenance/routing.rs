@@ -815,6 +815,24 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                 .into_iter()
                 .map(|(partition, (header, slots))| ((partition, header), slots))
                 .unzip();
+            // Overlapping split-family hops can request the same body for
+            // one record more than once. Score each record once per entry,
+            // retaining its multiplicity in the beam's candidate multiset.
+            let body_members: Vec<Vec<(usize, usize)>> = body_slots
+                .into_iter()
+                .map(|slots| {
+                    let mut members: Vec<usize> = slots
+                        .into_iter()
+                        .flat_map(|slot| scan_members[slot].iter().map(|member| member.member))
+                        .collect();
+                    members.sort_unstable();
+                    members
+                        .chunk_by(|a, b| a == b)
+                        .map(|group| (group[0], group.len()))
+                        .collect()
+                })
+                .collect();
+            drop(scan_members);
             let nearest = nearest
                 .as_mut()
                 .ok_or_else(|| Error::new(ErrorKind::Backend))?;
@@ -832,22 +850,27 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                     {
                         return Err(Error::new(ErrorKind::Corruption));
                     }
-                    // Independent records share the centroid while each distance
-                    // retains its format-defined scalar accumulation order.
-                    for &slot in &body_slots[index] {
-                        let (groups, remainder) = scan_members[slot].as_chunks::<4>();
-                        for group in groups {
-                            let vectors =
-                                std::array::from_fn::<_, 4, _>(|lane| routings[group[lane].member]);
-                            let distances = kernel.routing_distances(vectors, entry.centroid())?;
-                            for (member, distance) in group.iter().zip(distances) {
-                                nearest[member.member].consider(distance, entry, body);
+                    // Queries came from preprocess; Child Entry decoding checked
+                    // centroid dimensions and finite components before either
+                    // streaming them or filling the epoch-validated body cache.
+                    // Reuse those invariants across all distances in this body.
+                    let (groups, remainder) = body_members[index].as_chunks::<4>();
+                    for group in groups {
+                        let vectors =
+                            std::array::from_fn::<_, 4, _>(|lane| routings[group[lane].0]);
+                        let distances =
+                            kernel.routing_distances_validated(vectors, entry.centroid());
+                        for (&(member, repetitions), distance) in group.iter().zip(distances) {
+                            for _ in 0..repetitions {
+                                nearest[member].consider(distance, entry, body);
                             }
                         }
-                        for member in remainder {
-                            let distance = kernel
-                                .routing_distance(routings[member.member], entry.centroid())?;
-                            nearest[member.member].consider(distance, entry, body);
+                    }
+                    for &(member, repetitions) in remainder {
+                        let [distance] = kernel
+                            .routing_distances_validated([routings[member]], entry.centroid());
+                        for _ in 0..repetitions {
+                            nearest[member].consider(distance, entry, body);
                         }
                     }
                     Ok(())
