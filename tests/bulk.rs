@@ -783,16 +783,21 @@ async fn oversized_single_record_group_cannot_partially_commit_or_publish() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_construction_publishes_then_accepts_ordinary_insert() {
     let runtime = make_runtime(MemoryBackend::with_test_config(TestConfig::default()));
+    let caller = CancellationToken::new();
     let index = runtime
         .build_index(
             "bulk",
             config(),
             vec![],
             options(5),
-            OperationOptions::default(),
+            OperationOptions::default().with_cancellation(caller.clone()),
         )
         .await
         .unwrap();
+    assert!(
+        !caller.is_cancelled(),
+        "construction must not cancel the caller"
+    );
     index.insert(records(1).pop().unwrap()).await.unwrap();
     assert!(
         index

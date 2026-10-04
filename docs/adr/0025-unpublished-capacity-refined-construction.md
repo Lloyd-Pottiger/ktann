@@ -1,13 +1,13 @@
 # Unpublished capacity-refined construction
 
-Status: proposed alternative implementation; not selected for integration.
+Status: proposed.
 
 The existing Import Session intentionally performs ordinary concurrent mutation
 batches into a serving index. It cannot own published partitions exclusively,
 and routing centroids and their cached Child Entry projections are immutable.
 Rewriting those centroids after `finish` would violate snapshot and concurrent
-mutation contracts. The offline quality experiment therefore cannot become an
-online optimize operation.
+mutation contracts. Construction-time refinement therefore uses a separate unpublished build
+operation.
 
 Add a distinct `Runtime::build_index` operation. It reserves the requested name
 and a fresh Logical Index ID in a durable `Building { owner }` lifecycle. The

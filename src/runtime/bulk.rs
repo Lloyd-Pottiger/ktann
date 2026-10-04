@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 use tokio_util::sync::CancellationToken;
 
 use crate::api::{
-    BulkBuildOptions, Error, ErrorKind, IndexConfig, IndexName, LogicalIndexId, PartitionKey,
-    Record, Result, Value, VerifyOptions,
+    BulkBuildOptions, Error, ErrorKind, IndexConfig, IndexName, PartitionKey, Record, Result,
+    Value, VerifyOptions,
 };
 use crate::maintenance::training::construction_groups;
 use crate::search::numeric::VectorKernel;
@@ -13,13 +13,13 @@ use crate::search::rabitq::RaBitQ7;
 use crate::storage::backend::Backend;
 use crate::storage::keys::{LogicalKey, TreeKey};
 use crate::storage::values::{
-    ChildEntry, IndexIdAllocator, IndexLifecycle, IndexManifest, IndexNameEntry, LeafEntry,
-    OpaquePayload, PartitionCentroid, PartitionHeader, PartitionState, PartitionSynopsis,
-    PartitionTransition, PersistentValue, RecordLocation, TreeManifest, VectorRecord,
+    ChildEntry, IndexIdAllocator, IndexLifecycle, IndexManifest, LeafEntry, OpaquePayload,
+    PartitionCentroid, PartitionHeader, PartitionState, PartitionSynopsis, PartitionTransition,
+    PersistentValue, RecordLocation, TreeManifest, VectorRecord,
 };
 use crate::storage::{ReadLogicalTxn, WriteLogicalTxn};
 
-use super::{OperationContext, lifecycle, verify};
+use super::{OperationContext, check_control, lifecycle, verify};
 
 /// A construction partition; members are record positions for leaves and
 /// indices into `parts` for internal partitions. Parents are created last.
@@ -392,7 +392,7 @@ fn refine(
     }
     for _ in 0..options.rounds {
         checkpoint()?;
-        let mut neighbors = Vec::with_capacity(leaves.len());
+        let mut moves = Vec::new();
         for (source, leaf) in leaves.iter().enumerate() {
             checkpoint()?;
             let mut distances = Vec::with_capacity(leaves.len() - 1);
@@ -430,33 +430,23 @@ fn refine(
                 distances.truncate(options.neighbors);
             }
             distances.sort_unstable_by(compare);
-            neighbors.push(
-                distances
-                    .into_iter()
-                    .map(|(_, target)| target)
-                    .collect::<Box<[_]>>(),
-            );
-        }
-        let mut moves = Vec::new();
-        for (source, leaf) in leaves.iter().enumerate() {
-            checkpoint()?;
             for &position in &leaf.members {
                 let vector = &vectors[position];
                 let old = kernel.routing_distance(vector, &leaf.center)?;
                 let mut best = (old, source);
-                let (batches, tail) = neighbors[source].as_chunks::<4>();
+                let (batches, tail) = distances.as_chunks::<4>();
                 for targets in batches {
                     let distances = kernel.routing_centroid_distances(
                         vector,
-                        targets.map(|target| leaves[target].center.as_ref()),
+                        targets.map(|(_, target)| leaves[target].center.as_ref()),
                     )?;
-                    for (&target, distance) in targets.iter().zip(distances) {
+                    for (&(_, target), distance) in targets.iter().zip(distances) {
                         if distance < best.0 {
                             best = (distance, target);
                         }
                     }
                 }
-                for &target in tail {
+                for &(_, target) in tail {
                     let distance = kernel.routing_distance(vector, &leaves[target].center)?;
                     if distance < best.0 {
                         best = (distance, target);
@@ -535,37 +525,20 @@ async fn reserve<B: Backend>(
                 IndexLifecycle::Active => ErrorKind::IndexAlreadyExists,
             }));
         }
-        let high_water = match txn.get_for_update(LogicalKey::IndexIdAllocator).await? {
-            None => 0,
-            Some(PersistentValue::IndexIdAllocator(allocator)) => allocator.high_water(),
+        let allocator = match txn.get_for_update(LogicalKey::IndexIdAllocator).await? {
+            None => IndexIdAllocator::new(0),
+            Some(PersistentValue::IndexIdAllocator(allocator)) => allocator,
             Some(_) => return Err(Error::new(ErrorKind::Corruption)),
         };
-        let next = high_water
-            .checked_add(1)
-            .ok_or_else(|| Error::new(ErrorKind::IdExhausted))?;
-        let id = LogicalIndexId::new(next)?;
-        let manifest = IndexManifest::new(
+        let manifest = lifecycle::initialize_index(
+            &mut txn,
+            name,
+            config,
+            allocator,
             IndexLifecycle::Building { owner },
-            id,
-            config.clone(),
-            lifecycle::derive_rotation_seed(id),
-            lifecycle::derive_bloom_parameters(config)?,
-        )?;
-        txn.put(
-            LogicalKey::IndexIdAllocator,
-            PersistentValue::IndexIdAllocator(IndexIdAllocator::new(next)),
         )
         .await?;
-        txn.put(
-            LogicalKey::IndexNameDirectory(name.clone()),
-            PersistentValue::IndexNameEntry(IndexNameEntry::new(id)),
-        )
-        .await?;
-        txn.put(
-            LogicalKey::Manifest(id),
-            PersistentValue::IndexManifest(manifest.clone()),
-        )
-        .await?;
+        let id = manifest.logical_index_id();
         match txn.commit().await {
             Ok(()) => return Ok(manifest),
             Err(error) if error.kind() == ErrorKind::RetryableAbort => {
@@ -626,7 +599,7 @@ async fn fenced_txn<'a, B: Backend>(
 async fn stage<B: Backend>(
     context: &OperationContext<B>,
     manifest: &IndexManifest,
-    groups: &[Vec<(LogicalKey, PersistentValue)>],
+    groups: &[impl AsRef<[(LogicalKey, PersistentValue)]>],
     retry: &lifecycle::RetryPolicy,
 ) -> Result<()> {
     let backend = context.backend();
@@ -639,7 +612,7 @@ async fn stage<B: Backend>(
         let mut txn = fenced_txn(backend.as_ref(), manifest).await?;
         let mut put_error = None;
         'groups: for group in &groups[offset..end] {
-            for (key, value) in group {
+            for (key, value) in group.as_ref() {
                 if let Err(error) = txn.put(key.clone(), value.clone()).await {
                     put_error = Some(error);
                     break 'groups;
@@ -680,46 +653,24 @@ async fn stage<B: Backend>(
     Ok(())
 }
 
-/// Cancels a planning task when its owning foreground future is dropped.
-struct CancelPlanning(CancellationToken);
-impl Drop for CancelPlanning {
-    fn drop(&mut self) {
-        self.0.cancel();
-    }
-}
-
-/// Shared cooperative control for validation and numerical planning.
-struct PlanningControl {
-    cancellation: CancellationToken,
-    options: crate::api::OperationOptions,
-}
-impl PlanningControl {
-    fn checkpoint(&self) -> Result<()> {
-        if self.cancellation.is_cancelled() {
-            return Err(Error::new(ErrorKind::Cancelled));
-        }
-        super::check_control(&self.options)
-    }
-}
-
 /// Keeps heavy CPU work off Tokio and cancels it when its owning future drops.
 /// Existing foreground admission bounds the number of these owned tasks.
 async fn controlled_compute<T: Send + 'static>(
     options: crate::api::OperationOptions,
     keep_alive: impl Send + 'static,
-    work: impl FnOnce(&PlanningControl) -> Result<T> + Send + 'static,
+    work: impl FnOnce(&crate::api::OperationOptions) -> Result<T> + Send + 'static,
 ) -> Result<T> {
-    let cancellation = CancellationToken::new();
-    let _guard = CancelPlanning(cancellation.clone());
+    let cancellation = options
+        .cancellation()
+        .map(CancellationToken::child_token)
+        .unwrap_or_default();
+    let _guard = cancellation.clone().drop_guard();
+    let options = options.with_cancellation(cancellation);
     tokio::task::spawn_blocking(move || {
         // Retain admission even after the owning async future is cancelled.
         let _keep_alive = keep_alive;
-        let control = PlanningControl {
-            cancellation,
-            options,
-        };
-        control.checkpoint()?;
-        work(&control)
+        check_control(&options)?;
+        work(&options)
     })
     .await
     .map_err(|error| Error::with_source(ErrorKind::Other, error))?
@@ -745,7 +696,7 @@ pub(crate) async fn build<B: Backend>(
                 &validation_config,
                 &mut records,
                 &validation_options,
-                &|| control.checkpoint(),
+                &|| check_control(control),
             )?;
             Ok((records, tree_members))
         },
@@ -758,18 +709,18 @@ pub(crate) async fn build<B: Backend>(
         context.cpu_admission.clone().expect("bulk admission"),
         move |control| {
             let plan = Plan::new(
-                &|| control.checkpoint(),
+                &|| check_control(control),
                 &planning_manifest,
                 &records,
                 tree_members,
                 &options,
             )?;
             let topology = plan
-                .topology(&planning_manifest, &records, &|| control.checkpoint())?
+                .topology(&planning_manifest, &records, &|| check_control(control))?
                 .into_iter()
                 .map(|row| {
-                    control.checkpoint()?;
-                    Ok(vec![row])
+                    check_control(control)?;
+                    Ok([row])
                 })
                 .collect::<Result<Vec<_>>>()?;
             Ok((plan, records, topology))
@@ -840,6 +791,7 @@ pub(crate) async fn build<B: Backend>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::LogicalIndexId;
     use bytes::Bytes;
     use std::sync::{
         Arc,
@@ -1023,46 +975,45 @@ mod tests {
             }
         }
         let admission = HeldAdmission(released.clone());
+        let caller = CancellationToken::new();
+        let operation_options =
+            crate::api::OperationOptions::default().with_cancellation(caller.clone());
         let owner = tokio::spawn(async move {
-            controlled_compute(
-                crate::api::OperationOptions::default(),
-                admission,
-                move |control| {
-                    let started_send = std::sync::Mutex::new(Some(started_send));
-                    let checkpoint = || {
-                        let call = worker_calls.fetch_add(1, Ordering::SeqCst);
-                        if call == 50 {
-                            started_send
-                                .lock()
-                                .unwrap()
-                                .take()
-                                .unwrap()
-                                .send(())
-                                .unwrap();
-                            resume_receive
-                                .recv_timeout(std::time::Duration::from_secs(10))
-                                .unwrap();
-                        }
-                        control.checkpoint()
-                    };
-                    let members = BTreeMap::from([(
-                        TreeKey::encode(&[], &[]).unwrap(),
-                        (0..records.len()).collect(),
-                    )]);
-                    let options = BulkBuildOptions::new(1 << 20).unwrap();
-                    let result = if topology {
-                        let plan =
-                            Plan::new(&|| Ok(()), &manifest, &records, members, &options).unwrap();
-                        plan.topology(&manifest, &records, &checkpoint).map(|_| ())
-                    } else {
-                        Plan::new(&checkpoint, &manifest, &records, members, &options).map(|_| ())
-                    };
-                    finished_send
-                        .send(result.err().map(|error| error.kind()))
-                        .unwrap();
-                    Ok(())
-                },
-            )
+            controlled_compute(operation_options, admission, move |control| {
+                let started_send = std::sync::Mutex::new(Some(started_send));
+                let checkpoint = || {
+                    let call = worker_calls.fetch_add(1, Ordering::SeqCst);
+                    if call == 50 {
+                        started_send
+                            .lock()
+                            .unwrap()
+                            .take()
+                            .unwrap()
+                            .send(())
+                            .unwrap();
+                        resume_receive
+                            .recv_timeout(std::time::Duration::from_secs(10))
+                            .unwrap();
+                    }
+                    check_control(control)
+                };
+                let members = BTreeMap::from([(
+                    TreeKey::encode(&[], &[]).unwrap(),
+                    (0..records.len()).collect(),
+                )]);
+                let options = BulkBuildOptions::new(1 << 20).unwrap();
+                let result = if topology {
+                    let plan =
+                        Plan::new(&|| Ok(()), &manifest, &records, members, &options).unwrap();
+                    plan.topology(&manifest, &records, &checkpoint).map(|_| ())
+                } else {
+                    Plan::new(&checkpoint, &manifest, &records, members, &options).map(|_| ())
+                };
+                finished_send
+                    .send(result.err().map(|error| error.kind()))
+                    .unwrap();
+                Ok(())
+            })
             .await
             .unwrap();
         });
@@ -1085,5 +1036,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(released.load(Ordering::SeqCst), 1);
+        assert!(
+            !caller.is_cancelled(),
+            "dropping planning must not cancel the caller"
+        );
     }
 }

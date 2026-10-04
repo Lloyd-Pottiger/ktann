@@ -145,8 +145,8 @@ impl<B: Backend> Runtime<B> {
     ///
     /// The explicit input limit does not bound total resident memory; see
     /// [`crate::api::BulkBuildOptions`]. Construction verifies the complete
-    /// staged index in one snapshot before publication, so a backend whose
-    /// snapshot expires during that audit returns an error without publishing.
+    /// immutable staged index through bounded, owner-checked snapshot pages
+    /// before publication. A failed or incomplete audit leaves it unpublished.
     pub async fn build_index(
         &self,
         name: &str,

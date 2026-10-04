@@ -169,38 +169,8 @@ pub(crate) async fn create_index<B: Backend>(
             return classify_existing(manifest, &config);
         }
 
-        let next_high_water = allocator
-            .high_water()
-            .checked_add(1)
-            .ok_or_else(id_exhausted)?;
-        let logical_index_id = LogicalIndexId::new(next_high_water).map_err(|_| id_exhausted())?;
-        let manifest = IndexManifest::new(
-            IndexLifecycle::Active,
-            logical_index_id,
-            config.clone(),
-            derive_rotation_seed(logical_index_id),
-            derive_bloom_parameters(&config)?,
-        )?;
-
-        let inserted = txn
-            .insert(
-                name_key,
-                PersistentValue::IndexNameEntry(IndexNameEntry::new(logical_index_id)),
-            )
-            .await?;
-        if inserted != crate::storage::backend::InsertOutcome::Inserted {
-            return Err(Error::new(ErrorKind::Backend));
-        }
-        txn.put(
-            LogicalKey::IndexIdAllocator,
-            PersistentValue::IndexIdAllocator(IndexIdAllocator::new(next_high_water)),
-        )
-        .await?;
-        txn.put(
-            LogicalKey::Manifest(logical_index_id),
-            PersistentValue::IndexManifest(manifest.clone()),
-        )
-        .await?;
+        let manifest =
+            initialize_index(&mut txn, &name, &config, allocator, IndexLifecycle::Active).await?;
 
         match context.commit(move |start| txn.commit_with(start)).await {
             Ok(()) => return Ok(manifest),
@@ -215,6 +185,50 @@ pub(crate) async fn create_index<B: Backend>(
             Err(error) => return Err(error),
         }
     }
+}
+
+/// Installs a fresh identity and manifest in the caller's transaction.
+/// The caller has update-protected the allocator and checked that the name is absent.
+pub(crate) async fn initialize_index<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    name: &IndexName,
+    config: &IndexConfig,
+    allocator: IndexIdAllocator,
+    lifecycle: IndexLifecycle,
+) -> Result<IndexManifest> {
+    let next_high_water = allocator
+        .high_water()
+        .checked_add(1)
+        .ok_or_else(id_exhausted)?;
+    let logical_index_id = LogicalIndexId::new(next_high_water).map_err(|_| id_exhausted())?;
+    let manifest = IndexManifest::new(
+        lifecycle,
+        logical_index_id,
+        config.clone(),
+        derive_rotation_seed(logical_index_id),
+        derive_bloom_parameters(config)?,
+    )?;
+
+    let inserted = txn
+        .insert(
+            LogicalKey::IndexNameDirectory(name.clone()),
+            PersistentValue::IndexNameEntry(IndexNameEntry::new(logical_index_id)),
+        )
+        .await?;
+    if inserted != crate::storage::backend::InsertOutcome::Inserted {
+        return Err(Error::new(ErrorKind::Backend));
+    }
+    txn.put(
+        LogicalKey::IndexIdAllocator,
+        PersistentValue::IndexIdAllocator(IndexIdAllocator::new(next_high_water)),
+    )
+    .await?;
+    txn.put(
+        LogicalKey::Manifest(logical_index_id),
+        PersistentValue::IndexManifest(manifest.clone()),
+    )
+    .await?;
+    Ok(manifest)
 }
 
 async fn recover_create<B: Backend>(
@@ -478,9 +492,7 @@ async fn read_manifest_for_update<T: WriteTxn>(
     }
 }
 
-pub(crate) fn derive_bloom_parameters(
-    config: &IndexConfig,
-) -> Result<Vec<Option<BloomParameters>>> {
+fn derive_bloom_parameters(config: &IndexConfig) -> Result<Vec<Option<BloomParameters>>> {
     config
         .fields()
         .iter()
@@ -488,7 +500,7 @@ pub(crate) fn derive_bloom_parameters(
         .collect()
 }
 
-pub(crate) fn derive_rotation_seed(logical_index_id: LogicalIndexId) -> [u8; 32] {
+fn derive_rotation_seed(logical_index_id: LogicalIndexId) -> [u8; 32] {
     let first = xxh3_128_with_seed(&logical_index_id.get().to_be_bytes(), ROTATION_SEED_DOMAIN);
     let second = xxh3_128_with_seed(
         &first.to_le_bytes(),
