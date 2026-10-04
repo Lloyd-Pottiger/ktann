@@ -42,6 +42,10 @@ use crate::storage::{LogicalRange, LogicalReader, WriteLogicalTxn};
 /// is a fixed persistent format protocol choice.
 const SPLIT_TARGETS: u32 = 2;
 
+/// Maximum concurrent discovery pages, independent of the tree's fanout.
+/// Each leg retains the ordinary page bound; at most eight pages are live.
+const DISCOVERY_BODY_BATCH: usize = 8;
+
 /// The bound on one incoming-edge discovery or entry scan page.
 ///
 /// Paging only shapes I/O: discovery walks whole tree levels and every page is
@@ -1517,18 +1521,16 @@ async fn find_incoming_edge<T: WriteTxn>(
     let bodies = level_bodies(txn, manifest, tree_key, parent_level).await?;
     // Only the parent level's matches are collected.
     let mut found: Option<(PartitionKey, ChildEntry)> = None;
-    for body in &bodies {
-        scan_child_edges(txn, manifest, tree_key, *body, &mut |entry| {
-            if entry.child() == partition {
-                if found.is_some() {
-                    return Err(corrupt());
-                }
-                found = Some((*body, entry.clone()));
+    scan_child_edges(txn, manifest, tree_key, &bodies, &mut |body, entry| {
+        if entry.child() == partition {
+            if found.is_some() {
+                return Err(corrupt());
             }
-            Ok(())
-        })
-        .await?;
-    }
+            found = Some((body, entry.clone()));
+        }
+        Ok(())
+    })
+    .await?;
     Ok(found)
 }
 
@@ -1563,27 +1565,40 @@ async fn lock_incoming_edge<T: WriteTxn>(
     Ok(parent)
 }
 
-/// Scans one internal body's complete Child Entry set in bounded discovery
-/// pages, visiting each entry by reference without materializing the page.
+/// Scans complete Child Entry sets in bounded waves, with an independent
+/// continuation for each body. Finished legs leave the next round immediately.
 async fn scan_child_edges<R: LogicalReader>(
     reader: &mut R,
     manifest: &IndexManifest,
     tree_key: &TreeKey,
-    body: PartitionKey,
-    visit: &mut impl FnMut(&ChildEntry) -> Result<()>,
+    bodies: &[PartitionKey],
+    visit: &mut impl FnMut(PartitionKey, &ChildEntry) -> Result<()>,
 ) -> Result<()> {
-    let range = LogicalRange::child_entries(manifest, tree_key, body)?;
-    let mut cursor = None;
-    loop {
-        let page = reader
-            .scan(&range, cursor.as_ref(), DISCOVERY_SCAN_LIMITS)
-            .await?;
-        for item in page.items() {
-            visit(expect_child_entry_ref(item.value())?)?;
-        }
-        cursor = page.into_next_cursor();
-        if cursor.is_none() {
-            break;
+    for chunk in bodies.chunks(DISCOVERY_BODY_BATCH) {
+        let mut pending = chunk
+            .iter()
+            .map(|&body| {
+                Ok((
+                    body,
+                    LogicalRange::child_entries(manifest, tree_key, body)?,
+                    None,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        while !pending.is_empty() {
+            let legs = pending
+                .iter()
+                .map(|(_, range, cursor)| (range, cursor.as_ref()))
+                .collect::<Vec<_>>();
+            let pages = reader.batch_scan(&legs, DISCOVERY_SCAN_LIMITS).await?;
+            // Typed batch scans return exactly one page per leg in input order.
+            for ((body, _, cursor), page) in pending.iter_mut().zip(pages) {
+                for item in page.items() {
+                    visit(*body, expect_child_entry_ref(item.value())?)?;
+                }
+                *cursor = page.into_next_cursor();
+            }
+            pending.retain(|(_, _, cursor)| cursor.is_some());
         }
     }
     Ok(())
@@ -1651,12 +1666,22 @@ async fn level_bodies<R: LogicalReader>(
 
         // Descend: intermediate levels contribute only child Partition Keys.
         let mut next = Vec::new();
-        for body in &bodies {
-            let header = read_header(reader, index, tree_key, *body).await?;
-            if header.level() != current_level {
-                return Err(corrupt());
+        for chunk in bodies.chunks(DISCOVERY_BODY_BATCH) {
+            let keys = chunk
+                .iter()
+                .map(|&partition| LogicalKey::Header {
+                    index,
+                    tree_key: tree_key.clone(),
+                    partition,
+                })
+                .collect();
+            for value in reader.batch_get(keys).await? {
+                let header = expect_header(value)?.ok_or_else(corrupt)?;
+                if header.level() != current_level {
+                    return Err(corrupt());
+                }
             }
-            scan_child_edges(reader, manifest, tree_key, *body, &mut |entry| {
+            scan_child_edges(reader, manifest, tree_key, chunk, &mut |_, entry| {
                 next.push(entry.child());
                 Ok(())
             })
@@ -1730,13 +1755,11 @@ pub(crate) async fn same_level_candidates<R: LogicalReader>(
     let bodies = level_bodies(reader, manifest, tree_key, parent_level).await?;
 
     let mut edges: Vec<(PartitionKey, ChildEntry)> = Vec::new();
-    for body in &bodies {
-        scan_child_edges(reader, manifest, tree_key, *body, &mut |entry| {
-            edges.push((*body, entry.clone()));
-            Ok(())
-        })
-        .await?;
-    }
+    scan_child_edges(reader, manifest, tree_key, &bodies, &mut |body, entry| {
+        edges.push((body, entry.clone()));
+        Ok(())
+    })
+    .await?;
 
     // Candidate Headers are batch-read in bounded chunks.
     let mut headers = Vec::with_capacity(edges.len());
@@ -2068,6 +2091,62 @@ mod tests {
             max_mutation_bytes: bytes,
             mutation_key_overhead_bytes: overhead,
         }
+    }
+
+    #[tokio::test]
+    async fn discovery_visits_every_edge_once_across_uneven_pages_and_waves() {
+        use std::collections::BTreeMap;
+
+        use crate::storage::ReadLogicalTxn;
+        use crate::storage::keys;
+        use crate::storage::test_support::{MockReadTxn, pk};
+        use crate::storage::values::{ChildEntry, PersistentValue, ValueCodec};
+
+        let manifest = manifest();
+        let tree_key = tree_key();
+        let mut items = Vec::new();
+        let mut expected = BTreeMap::new();
+        // Empty, short, exact-page and multiple-page bodies span two waves.
+        let sizes = [0, 1, 128, 129, 257, 2, 0, 130, 3, 258];
+        let bodies: Vec<_> = (1..=sizes.len() as u64).map(pk).collect();
+        for (&body, size) in bodies.iter().zip(sizes) {
+            for child in 100..100 + size {
+                let child = pk(child);
+                let centroid = vec![child.get() as f32; manifest.config().dimension()];
+                items.push((
+                    keys::child_entry_key(manifest.logical_index_id(), &tree_key, body, child),
+                    ValueCodec::for_index(&manifest)
+                        .encode(&PersistentValue::ChildEntry(ChildEntry::new(
+                            child, centroid,
+                        )))
+                        .expect("encode child"),
+                ));
+                expected.insert((body, child), 0);
+            }
+        }
+        let mut read = ReadLogicalTxn::for_index(MockReadTxn::new(items), &manifest);
+        super::scan_child_edges(
+            &mut read,
+            &manifest,
+            &tree_key,
+            &bodies,
+            &mut |body, entry| {
+                *expected
+                    .get_mut(&(body, entry.child()))
+                    .expect("known edge") += 1;
+                Ok(())
+            },
+        )
+        .await
+        .expect("discovery");
+        assert!(expected.values().all(|&visits| visits == 1));
+        let raw = read.into_raw();
+        assert!(
+            raw.batch_scan_sizes
+                .iter()
+                .all(|&size| size <= super::DISCOVERY_BODY_BATCH)
+        );
+        assert!(raw.batch_scan_sizes.iter().any(|&size| size > 1));
     }
 
     #[test]

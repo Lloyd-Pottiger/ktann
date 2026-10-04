@@ -116,9 +116,10 @@ impl fmt::Debug for SplitCentroids {
 /// trains from the full-f32 centroids in its Child Entries and reads no
 /// Vector Records. The transaction is only read from; training holds no KV
 /// locks and changes nothing, so any failure leaves the searchable source
-/// intact.
+/// intact. The transaction is consumed and closed after loading, before the
+/// in-memory Lloyd rounds begin.
 pub async fn train_split_centroids<T: ReadOps>(
-    txn: &mut ReadLogicalTxn<'_, T>,
+    mut txn: ReadLogicalTxn<'_, T>,
     tree_key: &TreeKey,
     source: PartitionKey,
 ) -> Result<SplitCentroids> {
@@ -139,10 +140,12 @@ pub async fn train_split_centroids<T: ReadOps>(
     };
     let kernel = kernel_for(manifest)?;
     let trained = if header.level() == 1 {
-        let entries = load_leaf_source(txn, manifest, tree_key, source, &kernel).await?;
+        let entries = load_leaf_source(&mut txn, manifest, tree_key, source, &kernel).await?;
+        drop(txn);
         train(&kernel, entries)?
     } else {
-        let entries = load_internal_source(txn, manifest, tree_key, source).await?;
+        let entries = load_internal_source(&mut txn, manifest, tree_key, source).await?;
+        drop(txn);
         train(&kernel, entries)?
     };
     Ok(SplitCentroids {
@@ -308,7 +311,7 @@ fn train<I: Ord>(kernel: &VectorKernel, mut entries: Vec<(I, Box<[f32]>)>) -> Re
     let mut previous: Option<Vec<bool>> = None;
     let mut rounds = 0_usize;
     loop {
-        let assignment = assign(&entries, &left, &right, half, &distance)?;
+        let assignment = assign(kernel, &entries, &left, &right, half)?;
         let stable = previous.as_ref() == Some(&assignment);
         // The same canonical membership produces byte-identical means. The
         // confirming round still counts, but has no centroid work to repeat.
@@ -334,16 +337,36 @@ fn train<I: Ord>(kernel: &VectorKernel, mut entries: Vec<(I, Box<[f32]>)>) -> Re
 /// Entries are in canonical ID order, so the position tie-break on equal
 /// differences is the Child or Record ID tie-break. The returned mask marks
 /// left membership per entry position.
-fn assign<I, D: Fn(&[f32], &[f32]) -> Result<f64>>(
+fn assign<I>(
+    kernel: &VectorKernel,
     entries: &[(I, Box<[f32]>)],
     left: &[f32],
     right: &[f32],
     half: usize,
-    distance: &D,
 ) -> Result<Vec<bool>> {
     let mut differences = Vec::with_capacity(entries.len());
-    for (_, vector) in entries {
-        differences.push(distance(vector, left)? - distance(vector, right)?);
+    // Independent lanes preserve each scalar distance's exact addition order,
+    // while sharing centroid validation and exposing instruction parallelism.
+    let (chunks, remainder) = entries.as_chunks::<4>();
+    for chunk in chunks {
+        let vectors = chunk.each_ref().map(|entry| &*entry.1);
+        let left = kernel
+            .routing_distances(vectors, left)
+            .map_err(|_| Error::new(ErrorKind::Corruption))?;
+        let right = kernel
+            .routing_distances(vectors, right)
+            .map_err(|_| Error::new(ErrorKind::Corruption))?;
+        differences.extend(
+            left.into_iter()
+                .zip(right)
+                .map(|(left, right)| left - right),
+        );
+    }
+    for (_, vector) in remainder {
+        let [left, right] = kernel
+            .routing_centroid_distances(vector, [left, right])
+            .map_err(|_| Error::new(ErrorKind::Corruption))?;
+        differences.push(left - right);
     }
     let mut order: Vec<usize> = (0..entries.len()).collect();
     // Only the left membership matters. The canonical position makes this
@@ -490,8 +513,8 @@ mod tests {
         // Identical centroids make every distance difference zero, so the
         // balanced left cluster is exactly the first floor(n/2) canonical IDs.
         let entries = entries(&[&[0.0], &[1.0], &[2.0], &[10.0], &[4.5]]);
-        let distance = |_: &[f32], _: &[f32]| -> Result<f64> { Ok(0.0) };
-        let assignment = assign(&entries, &[0.0], &[0.0], 2, &distance).expect("assigned");
+        let assignment =
+            assign(&kernel(1, Metric::L2), &entries, &[0.0], &[0.0], 2).expect("assigned");
         assert_eq!(assignment, vec![true, true, false, false, false]);
     }
 
@@ -706,7 +729,7 @@ mod tests {
     #[test]
     fn optimized_training_matches_full_sort_protocol_bytes_and_rounds() {
         for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
-            for dimension in [1, 3, 16] {
+            for dimension in [1, 3, 16, 128] {
                 let kernel = kernel(dimension, metric);
                 for count in [0, 1, 2, 3, 5, 32, 127, 128, 129] {
                     for pattern in 0..4 {

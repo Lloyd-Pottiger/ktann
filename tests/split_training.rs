@@ -52,7 +52,7 @@ async fn train(
     key: &TreeKey,
     source: PartitionKey,
 ) -> ktann::api::Result<SplitCentroids> {
-    train_split_centroids(&mut read_txn(backend, manifest).await, key, source).await
+    train_split_centroids(read_txn(backend, manifest).await, key, source).await
 }
 
 /// A dimension-1 Vector Record holding `vector`.
@@ -390,8 +390,8 @@ async fn an_unbound_transaction_is_rejected() {
     let key = tree_key(1);
 
     let raw = backend.begin_read().await.expect("begin read");
-    let mut txn = ReadLogicalTxn::bootstrap(raw);
-    let error = train_split_centroids(&mut txn, &key, pk(1))
+    let txn = ReadLogicalTxn::bootstrap(raw);
+    let error = train_split_centroids(txn, &key, pk(1))
         .await
         .expect_err("unbound transaction");
     assert_eq!(error.kind(), ErrorKind::InvalidArgument);

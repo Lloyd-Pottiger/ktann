@@ -46,8 +46,8 @@ use crate::runtime::{reads, writes};
 use crate::storage::backend::{Backend, ReadOps, WriteTxn};
 use crate::storage::keys::{LogicalKey, TreeKey};
 use crate::storage::values::{
-    IndexManifest, PartitionCentroid, PartitionHeader, PartitionState, PartitionTransition,
-    expect_centroid, expect_header,
+    IndexManifest, PartitionCentroid, PartitionState, PartitionTransition, expect_centroid,
+    expect_header,
 };
 use crate::storage::{ReadLogicalTxn, WriteLogicalTxn, topology};
 
@@ -206,8 +206,7 @@ pub async fn expose_targets<B: Backend>(
         }
         _ => return Ok(TargetExposure::SourceAdvanced),
     };
-    let centroids = training::train_split_centroids(&mut read, tree_key, source).await?;
-    drop(read);
+    let centroids = training::train_split_centroids(read, tree_key, source).await?;
 
     let mut failed_attempts = 0_u32;
     loop {
@@ -270,11 +269,27 @@ pub async fn drain_batch<B: Backend>(
 ) -> Result<DrainStep> {
     // The read phase fixes the batch from one consistent snapshot; one
     // batched read covers both source authority values.
-    let (mut read, pair) = reads::open_authority_read(backend, manifest, tree_key, source).await?;
-    let Some((source_header, state)) = pair else {
-        // A completed split removed both authority values.
+    let Some(observed) = reads::open_authority_read(backend, manifest, tree_key, source).await?
+    else {
         return Ok(DrainStep::SourceAdvanced);
     };
+    drain_observed(backend, manifest, tree_key, source, retry, observed).await
+}
+
+/// Fixes the drain candidates in the snapshot that classified the source.
+async fn drain_observed<B: Backend>(
+    backend: &B,
+    manifest: &IndexManifest,
+    tree_key: &TreeKey,
+    source: PartitionKey,
+    retry: &RetryPolicy,
+    observed: reads::PartitionRead<'_, B::ReadTxn<'_>>,
+) -> Result<DrainStep> {
+    let reads::PartitionRead {
+        txn: mut read,
+        header: source_header,
+        state,
+    } = observed;
     let (left, right) = match state {
         PartitionTransition::DrainingSplit { left, right, .. } => (left, right),
         PartitionTransition::Splitting { .. } => return Ok(DrainStep::NotDraining),
@@ -541,11 +556,10 @@ pub async fn advance<B: Backend>(
     started_at_unix_millis: u64,
     retry: &RetryPolicy,
 ) -> Result<Advance> {
-    let (read, pair) = reads::open_authority_read(backend, manifest, tree_key, partition).await?;
-    drop(read);
+    let observed = reads::open_authority_read(backend, manifest, tree_key, partition).await?;
     // Nothing was ever persisted here, or a completed split already removed
     // every value: nothing to advance.
-    let Some(authority) = pair else {
+    let Some(authority) = observed else {
         return Ok(Advance::Idle);
     };
     advance_observed(
@@ -560,10 +574,10 @@ pub async fn advance<B: Backend>(
     .await
 }
 
-/// Runs one split step from an already validated Header and State pair.
+/// Runs one split step from a validated authority snapshot.
 ///
 /// The shared Fixup dispatcher uses this entry point after its single
-/// preflight read. Public direct drivers retain [`advance`] as the complete
+/// preflight read, reusing its snapshot for drain discovery. Direct drivers retain [`advance`] as the complete
 /// read-and-dispatch operation.
 pub(crate) async fn advance_observed<B: Backend>(
     backend: &B,
@@ -572,9 +586,10 @@ pub(crate) async fn advance_observed<B: Backend>(
     partition: PartitionKey,
     started_at_unix_millis: u64,
     retry: &RetryPolicy,
-    authority: (PartitionHeader, PartitionTransition),
+    authority: reads::PartitionRead<'_, B::ReadTxn<'_>>,
 ) -> Result<Advance> {
-    let (header, state) = authority;
+    let header = authority.header;
+    let state = authority.state;
     if matches!(
         state,
         PartitionTransition::Splitting { .. } | PartitionTransition::DrainingSplit { .. }
@@ -588,6 +603,7 @@ pub(crate) async fn advance_observed<B: Backend>(
 
     match state {
         PartitionTransition::Ready { .. } => {
+            drop(authority);
             if header.entry_count() <= manifest.config().max_partition_entries() {
                 return Ok(Advance::Idle);
             }
@@ -609,6 +625,7 @@ pub(crate) async fn advance_observed<B: Backend>(
             }
         }
         PartitionTransition::Splitting { .. } => {
+            drop(authority);
             match expose_targets(
                 backend,
                 manifest,
@@ -624,7 +641,7 @@ pub(crate) async fn advance_observed<B: Backend>(
             }
         }
         PartitionTransition::DrainingSplit { left, right, .. } => {
-            match drain_batch(backend, manifest, tree_key, partition, retry).await? {
+            match drain_observed(backend, manifest, tree_key, partition, retry, authority).await? {
                 DrainStep::Drained { moved, remaining } => {
                     if remaining == 0 {
                         match complete_split(
