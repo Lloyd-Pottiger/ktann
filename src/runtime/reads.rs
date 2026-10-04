@@ -85,23 +85,26 @@ pub(crate) async fn open_validated_read<'b, 'm, B: Backend>(
     Ok(ReadLogicalTxn::for_index(txn.into_raw(), handle_manifest))
 }
 
-/// Opens one validated read snapshot and reads one partition's authority
-/// pair from it: the shared Structure Maintenance preflight.
+/// One validated partition authority pair and the snapshot that owns it.
 ///
-/// The Manifest validation of [`open_validated_read`] runs first, then one
-/// batched plain read covers both authority values, all in the same
-/// consistent snapshot. The transaction stays open so the caller can fix more
-/// of its step — a drain batch, the same-level candidates — from that
-/// snapshot; a caller that needs only the pair drops it immediately.
+/// Maintenance keeps this snapshot through candidate discovery, then drops it
+/// before opening the write transaction that revalidates the proposed movement.
+pub(crate) struct PartitionRead<'m, T> {
+    pub(crate) txn: ReadLogicalTxn<'m, T>,
+    pub(crate) header: PartitionHeader,
+    pub(crate) state: PartitionTransition,
+}
+
+/// Opens one validated snapshot and reads a partition's Header and State.
+///
+/// Both values must agree. An absent pair means the partition was removed or
+/// never existed; a partial pair is Corruption.
 pub(crate) async fn open_authority_read<'b, 'm, B: Backend>(
     backend: &'b B,
     handle_manifest: &'m IndexManifest,
     tree_key: &TreeKey,
     partition: PartitionKey,
-) -> Result<(
-    ReadLogicalTxn<'m, B::ReadTxn<'b>>,
-    Option<(PartitionHeader, PartitionTransition)>,
-)> {
+) -> Result<Option<PartitionRead<'m, B::ReadTxn<'b>>>> {
     let mut txn = open_validated_read(backend, handle_manifest).await?;
     let pair = topology::read_authority_pair(
         &mut txn,
@@ -110,7 +113,7 @@ pub(crate) async fn open_authority_read<'b, 'm, B: Backend>(
         partition,
     )
     .await?;
-    Ok((txn, pair))
+    Ok(pair.map(|(header, state)| PartitionRead { txn, header, state }))
 }
 
 /// Validates the persisted Manifest of the opened handle, with update

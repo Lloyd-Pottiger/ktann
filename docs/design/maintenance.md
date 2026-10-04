@@ -103,7 +103,8 @@ and movement but cannot start its own split or merge.
 
 ### 4.2 Drain
 
-Each maintenance iteration reads a bounded source-entry page, then opens a short
+Each maintenance iteration reads a bounded source-entry page in the validated
+snapshot that classified the source, closes that snapshot, then opens a short
 write transaction and re-reads each entry and its authoritative routing data.
 For every remaining entry it deterministically chooses a target, uniquely
 inserts the target entry, deletes the source entry, and updates both exact
@@ -153,6 +154,10 @@ target Child Entries.
 A worker encountering an eligible Ready partition locks its incoming reference
 and validates that at least one legal same-level Ready target exists before
 changing the source to Merging.
+
+Same-level discovery and incoming-edge lookup batch independent partition scans
+in waves of at most eight pages, with a separate continuation per body. The walk
+still visits every required edge and validates every intermediate Header level.
 
 Merging stores no fixed target and no drain cursor. Each bounded batch performs
 ordinary same-level routing, skips the source and non-Ready candidates, and

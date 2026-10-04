@@ -1407,7 +1407,7 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
 /// The typed read surface both logical transaction kinds expose.
 ///
 /// Read-only and write logical transactions decode the same typed `get`,
-/// `batch_get`, `scan`, and `batch_scan` operations; this trait lets algorithm
+/// `batch_get` and `batch_scan` operations; this trait lets algorithm
 /// modules write one read helper or traversal that serves both transaction
 /// kinds without duplicating the logic. It grants no update protection: write
 /// transactions establish conflicts only through the `for_update` operations,
@@ -1424,14 +1424,6 @@ pub(crate) trait LogicalReader {
         &mut self,
         keys: Vec<LogicalKey>,
     ) -> impl Future<Output = Result<Vec<Option<PersistentValue>>>> + Send;
-
-    /// Scans one bounded typed page from an exact Logical Range.
-    fn scan(
-        &mut self,
-        range: &LogicalRange,
-        cursor: Option<&LogicalScanCursor>,
-        limits: ScanLimits,
-    ) -> impl Future<Output = Result<LogicalScanPage>> + Send;
 
     /// Scans one bounded typed page from each `(range, cursor)` leg,
     /// preserving input order.
@@ -1457,15 +1449,6 @@ impl<T: ReadOps> LogicalReader for ReadLogicalTxn<'_, T> {
         ReadLogicalTxn::batch_get(self, keys)
     }
 
-    fn scan(
-        &mut self,
-        range: &LogicalRange,
-        cursor: Option<&LogicalScanCursor>,
-        limits: ScanLimits,
-    ) -> impl Future<Output = Result<LogicalScanPage>> + Send {
-        ReadLogicalTxn::scan(self, range, cursor, limits)
-    }
-
     fn batch_scan(
         &mut self,
         legs: &[(&LogicalRange, Option<&LogicalScanCursor>)],
@@ -1488,15 +1471,6 @@ impl<T: WriteTxn> LogicalReader for WriteLogicalTxn<'_, T> {
         keys: Vec<LogicalKey>,
     ) -> impl Future<Output = Result<Vec<Option<PersistentValue>>>> + Send {
         WriteLogicalTxn::batch_get(self, keys)
-    }
-
-    fn scan(
-        &mut self,
-        range: &LogicalRange,
-        cursor: Option<&LogicalScanCursor>,
-        limits: ScanLimits,
-    ) -> impl Future<Output = Result<LogicalScanPage>> + Send {
-        WriteLogicalTxn::scan(self, range, cursor, limits)
     }
 
     fn batch_scan(

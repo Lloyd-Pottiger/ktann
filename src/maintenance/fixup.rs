@@ -81,15 +81,15 @@ pub(crate) async fn advance<B: Backend>(
     partition: PartitionKey,
     policy: StepPolicy<'_>,
 ) -> Result<Advance> {
-    let (read, pair) = reads::open_authority_read(backend, manifest, tree_key, partition).await?;
-    drop(read);
-    let Some(authority) = pair else {
+    let Some(authority) =
+        reads::open_authority_read(backend, manifest, tree_key, partition).await?
+    else {
         return Ok(Advance::Idle);
     };
-    let header = authority.0;
+    let header = authority.header;
     if policy
         .recovery_timeout
-        .is_some_and(|timeout| !recovery_due(authority.1, policy.now_unix_millis, timeout))
+        .is_some_and(|timeout| !recovery_due(authority.state, policy.now_unix_millis, timeout))
     {
         return Ok(Advance::Idle);
     }

@@ -123,7 +123,7 @@ async fn root_leaf_split_runs_end_to_end_and_stays_searchable() {
     // Exposure publishes both targets parentless — owned by the root's slot —
     // and advances the source to DrainingSplit in the same transaction; the
     // transition deliberately ignores the source's count.
-    let trained = train_split_centroids(&mut read_txn(&backend, &manifest).await, &key, pk(1))
+    let trained = train_split_centroids(read_txn(&backend, &manifest).await, &key, pk(1))
         .await
         .expect("train");
     let exposed = split::expose_targets(&backend, &manifest, &key, pk(1), 1_100, &retry())
@@ -1050,7 +1050,7 @@ async fn exposure_recovers_from_every_commit_outcome() {
         split::begin_split(&backend, &manifest, &key, pk(1), 1_000, &retry())
             .await
             .expect("begin");
-        let trained = train_split_centroids(&mut read_txn(&backend, &manifest).await, &key, pk(1))
+        let trained = train_split_centroids(read_txn(&backend, &manifest).await, &key, pk(1))
             .await
             .expect("train");
 
@@ -1315,7 +1315,7 @@ async fn a_concurrent_source_write_aborts_begin_and_exposure() {
     // Exposure update-protects and rewrites the source authority pair, so an
     // insert into the Splitting source conflicts with it; the whole-step
     // retry absorbs the abort (ADR 0014).
-    let trained = train_split_centroids(&mut read_txn(&backend, &manifest).await, &key, pk(1))
+    let trained = train_split_centroids(read_txn(&backend, &manifest).await, &key, pk(1))
         .await
         .expect("train");
     let runtime = make_runtime(backend.clone());
@@ -1371,7 +1371,7 @@ async fn a_concurrent_exposure_aborts_the_losing_attempt() {
     split::begin_split(&backend, &manifest, &key, pk(1), 1_000, &retry())
         .await
         .expect("begin");
-    let trained = train_split_centroids(&mut read_txn(&backend, &manifest).await, &key, pk(1))
+    let trained = train_split_centroids(read_txn(&backend, &manifest).await, &key, pk(1))
         .await
         .expect("train");
 
@@ -1422,7 +1422,7 @@ async fn a_stale_worker_cannot_recreate_a_target_after_completion() {
     split::begin_split(&backend, &manifest, &key, pk(1), 1_000, &retry())
         .await
         .expect("begin");
-    let trained = train_split_centroids(&mut read_txn(&backend, &manifest).await, &key, pk(1))
+    let trained = train_split_centroids(read_txn(&backend, &manifest).await, &key, pk(1))
         .await
         .expect("train");
     let outcomes = drive_split_to_completion(&backend, &manifest, &key, pk(1)).await;

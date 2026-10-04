@@ -49,9 +49,7 @@ use crate::runtime::RetryPolicy;
 use crate::runtime::{reads, writes};
 use crate::storage::backend::{Backend, WriteTxn};
 use crate::storage::keys::{LogicalKey, TreeKey};
-use crate::storage::values::{
-    IndexManifest, PartitionHeader, PartitionState, PartitionTransition, expect_header,
-};
+use crate::storage::values::{IndexManifest, PartitionState, PartitionTransition, expect_header};
 use crate::storage::{WriteLogicalTxn, topology};
 
 use super::drain::{self, DrainBatch};
@@ -152,17 +150,30 @@ pub async fn drain_batch<B: Backend>(
     source: PartitionKey,
     retry: &RetryPolicy,
 ) -> Result<DrainStep> {
+    let Some(observed) = reads::open_authority_read(backend, manifest, tree_key, source).await?
+    else {
+        return Ok(DrainStep::SourceAdvanced);
+    };
+    drain_observed(backend, manifest, tree_key, source, retry, observed).await
+}
+
+/// Discovers the first batch in the dispatch snapshot and refreshes it only
+/// when target revalidation requires a new route.
+async fn drain_observed<'b, B: Backend>(
+    backend: &'b B,
+    manifest: &IndexManifest,
+    tree_key: &TreeKey,
+    source: PartitionKey,
+    retry: &RetryPolicy,
+    mut observed: reads::PartitionRead<'_, B::ReadTxn<'b>>,
+) -> Result<DrainStep> {
     let mut failed_attempts = 0_u32;
     loop {
-        // The read phase fixes the batch and the candidate set from one
-        // consistent snapshot; one batched read covers both source authority
-        // values.
-        let (mut read, pair) =
-            reads::open_authority_read(backend, manifest, tree_key, source).await?;
-        let Some((source_header, state)) = pair else {
-            // A completed merge removed both authority values.
-            return Ok(DrainStep::SourceAdvanced);
-        };
+        let reads::PartitionRead {
+            txn: mut read,
+            header: source_header,
+            state,
+        } = observed;
         if !matches!(state, PartitionTransition::Merging { .. }) {
             return Ok(DrainStep::NotMerging);
         }
@@ -220,7 +231,13 @@ pub async fn drain_batch<B: Backend>(
             Attempt::Reselect => {
                 retry
                     .wait_or_exhaust(Operation::MergeFixup, &mut failed_attempts)
-                    .await?
+                    .await?;
+                let Some(next) =
+                    reads::open_authority_read(backend, manifest, tree_key, source).await?
+                else {
+                    return Ok(DrainStep::SourceAdvanced);
+                };
+                observed = next;
             }
         }
     }
@@ -267,11 +284,10 @@ pub async fn advance<B: Backend>(
     started_at_unix_millis: u64,
     retry: &RetryPolicy,
 ) -> Result<Advance> {
-    let (read, pair) = reads::open_authority_read(backend, manifest, tree_key, partition).await?;
-    drop(read);
+    let observed = reads::open_authority_read(backend, manifest, tree_key, partition).await?;
     // Nothing was ever persisted here, or a completed merge already removed
     // every value: nothing to advance.
-    let Some(authority) = pair else {
+    let Some(authority) = observed else {
         return Ok(Advance::Idle);
     };
     advance_observed(
@@ -286,21 +302,22 @@ pub async fn advance<B: Backend>(
     .await
 }
 
-/// Runs one merge step from an already validated Header and State pair.
+/// Runs one merge step from a validated authority snapshot.
 ///
 /// The shared Fixup dispatcher uses this entry point after its single
-/// preflight read. Public direct drivers retain [`advance`] as the complete
+/// preflight read, reusing its snapshot for drain discovery. Direct drivers retain [`advance`] as the complete
 /// read-and-dispatch operation.
-pub(crate) async fn advance_observed<B: Backend>(
-    backend: &B,
+pub(crate) async fn advance_observed<'b, B: Backend>(
+    backend: &'b B,
     manifest: &IndexManifest,
     tree_key: &TreeKey,
     partition: PartitionKey,
     started_at_unix_millis: u64,
     retry: &RetryPolicy,
-    authority: (PartitionHeader, PartitionTransition),
+    authority: reads::PartitionRead<'_, B::ReadTxn<'b>>,
 ) -> Result<Advance> {
-    let (header, state) = authority;
+    let header = authority.header;
+    let state = authority.state;
     if matches!(state, PartitionTransition::Merging { .. }) {
         metrics::fixup_state_age(
             FixupKind::Merge,
@@ -311,6 +328,7 @@ pub(crate) async fn advance_observed<B: Backend>(
 
     match state {
         PartitionTransition::Ready { .. } => {
+            drop(authority);
             // Roots never merge; skipping them here keeps rediscovery of a
             // small tree's under-full root from committing an empty write
             // transaction on every pass.
@@ -340,7 +358,7 @@ pub(crate) async fn advance_observed<B: Backend>(
             }
         }
         PartitionTransition::Merging { .. } => {
-            match drain_batch(backend, manifest, tree_key, partition, retry).await? {
+            match drain_observed(backend, manifest, tree_key, partition, retry, authority).await? {
                 DrainStep::Drained { moved, remaining } => {
                     if remaining == 0 {
                         match complete_merge(backend, manifest, tree_key, partition, retry).await? {
