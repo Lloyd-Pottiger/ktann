@@ -2255,7 +2255,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "foundationdb")]
     use std::collections::BTreeMap;
 
     use ktann::api::{SearchBudgets, SearchOptions};
