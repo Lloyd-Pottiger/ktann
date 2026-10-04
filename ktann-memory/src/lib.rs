@@ -320,7 +320,10 @@ impl ReadOps for MemoryReadTxn {
     ) -> Result<Vec<ScanPage>> {
         #[cfg(feature = "test-support")]
         {
-            self.lease.0.count(|c| c.batch_scan += 1);
+            self.lease.0.count(|c| {
+                c.batch_scan += 1;
+                c.batch_scan_ranges += ranges.len();
+            });
             self.lease.0.check_batch(ranges.len())?;
         }
         validate_scan(limits)?;

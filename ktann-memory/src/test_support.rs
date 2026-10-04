@@ -210,6 +210,8 @@ pub struct OperationCounts {
     pub scan: usize,
     /// `batch_scan` calls.
     pub batch_scan: usize,
+    /// Range legs submitted across all `batch_scan` calls.
+    pub batch_scan_ranges: usize,
     /// `clear_range` calls.
     pub clear_range: usize,
 }

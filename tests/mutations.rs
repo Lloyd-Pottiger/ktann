@@ -1417,6 +1417,152 @@ async fn batch_membership_corruption_keeps_input_position_and_rolls_back() {
     }
 }
 
+/// Routes entering different members of one internal split family share its
+/// body scans, including when several beam paths belong to the same record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batched_routing_scans_each_split_family_body_once() {
+    for (capacity, beam, body_entries) in [
+        (0, 1, 2),
+        (0, 6, 2),
+        (1, 1, 2),
+        (1, 6, 2),
+        (1 << 20, 1, 2),
+        (1 << 20, 6, 2),
+        (0, 6, 130),
+        (1 << 20, 6, 130),
+    ] {
+        let backend = backend(TestConfig::default());
+        let runtime = Runtime::new(
+            backend.clone(),
+            support::manual_maintenance_config()
+                .with_partition_cache_bytes(capacity)
+                .expect("cache capacity")
+                .with_write_beam_size(beam)
+                .expect("write beam"),
+        )
+        .expect("runtime");
+        let index = runtime
+            .create_index("split-family-routing", config_1d())
+            .await
+            .expect("index");
+        let manifest = read_manifest(&backend, index.logical_index_id()).await;
+        seed_grown_tree(&backend, &manifest, 1).await;
+        deepen_tree(&backend, &manifest, 1).await;
+
+        // Root -> source 2 and targets 3/8. Source 2 still owns leaves
+        // 4/5, target 3 owns leaves 6/7, and target 8 is empty. Every
+        // incoming path must see the union of those three bodies.
+        let key = tree_key(1);
+        let id = manifest.logical_index_id();
+        let pk = |value| PartitionKey::new(value).expect("partition");
+        let mut entries = vec![
+            header_entry(id, &key, pk(1), 3, 3),
+            edge_entry(id, &key, pk(1), pk(8), 20.0),
+        ];
+        for (partition, count, transition) in [
+            (
+                pk(2),
+                body_entries,
+                PartitionTransition::DrainingSplit {
+                    left: pk(3),
+                    right: pk(8),
+                    started_at_unix_millis: 0,
+                },
+            ),
+            (
+                pk(3),
+                body_entries,
+                PartitionTransition::ReceivingSplit {
+                    source: pk(2),
+                    started_at_unix_millis: 0,
+                },
+            ),
+            (
+                pk(8),
+                0,
+                PartitionTransition::ReceivingSplit {
+                    source: pk(2),
+                    started_at_unix_millis: 0,
+                },
+            ),
+        ] {
+            entries.push((
+                LogicalKey::Header {
+                    index: id,
+                    tree_key: key.clone(),
+                    partition,
+                },
+                PersistentValue::PartitionHeader(
+                    PartitionHeader::new(2, count, 0, transition.state()).expect("header"),
+                ),
+            ));
+            entries.push((
+                LogicalKey::State {
+                    index: id,
+                    tree_key: key.clone(),
+                    partition,
+                },
+                PersistentValue::PartitionState(transition),
+            ));
+        }
+        // Faraway children force three scan pages without changing the
+        // nearest leaves for this batch. Seed complete leaf authorities
+        // so the topology remains valid even for a wider future beam.
+        for offset in 2..body_entries {
+            for (parent, child) in [
+                (pk(2), pk(100 + u64::from(offset))),
+                (pk(3), pk(300 + u64::from(offset))),
+            ] {
+                entries.extend([
+                    edge_entry(id, &key, parent, child, 1_000.0 + offset as f32),
+                    header_entry(id, &key, child, 1, 0),
+                    state_entry(id, &key, child),
+                    synopsis_entry(&manifest, &key, child),
+                ]);
+            }
+        }
+        for chunk in entries.chunks(128) {
+            seed_topology(&backend, &manifest, chunk.iter().cloned()).await;
+        }
+
+        for pass in 0..2_u8 {
+            backend.reset_operation_counts();
+            index
+                .batch_mutate(
+                    [0.0, 1.0, 10.0, 11.0, 20.0]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(item, x)| Mutation::Insert(record_1d(&[pass, item as u8], x, 1)))
+                        .collect(),
+                )
+                .await
+                .expect("batch insert through split family");
+            let counts = backend.operation_counts();
+            let expected_ranges = if pass == 1 && capacity > 1 {
+                0
+            } else {
+                // Root, empty target, and every page of both nonempty bodies.
+                2 + 2 * body_entries.div_ceil(64) as usize
+            };
+            assert_eq!(
+                counts.batch_scan_ranges, expected_ranges,
+                "capacity={capacity}, beam={beam}, body_entries={body_entries}, pass={pass}: {counts:?}"
+            );
+        }
+        for (leaf, items) in [(4, vec![0]), (5, vec![1]), (6, vec![2]), (7, vec![3, 4])] {
+            let expected = (0..2_u8)
+                .flat_map(|pass| items.iter().map(move |&item| Bytes::from(vec![pass, item])))
+                .collect();
+            assert_eq!(
+                leaf_member_ids(&backend, &manifest, 1, leaf).await,
+                expected,
+                "capacity={capacity}, beam={beam}, leaf={leaf}"
+            );
+        }
+        runtime.shutdown().await.expect("shutdown");
+    }
+}
+
 /// Cached routing must preserve membership through aborts and topology changes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn write_routing_cache_reuses_only_matching_committed_bodies() {
