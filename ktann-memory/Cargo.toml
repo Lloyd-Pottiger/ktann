@@ -1,0 +1,23 @@
+[package]
+name = "ktann-memory"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "In-memory transactional storage adapter for KTANN"
+readme = "README.md"
+
+[features]
+default = []
+test-support = []
+
+[dependencies]
+bytes = "1"
+imbl = { version = "7", default-features = false }
+ktann = { path = ".." }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

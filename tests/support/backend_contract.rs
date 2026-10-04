@@ -3,8 +3,8 @@
 //! This module owns the backend-neutral transaction contract cases and the
 //! [`BackendHarness`] seam every adapter implements to run them. Cases drive a
 //! backend exclusively through the public [`ktann::storage::backend`]
-//! interface, so they run unchanged against the deterministic test backend and
-//! each production adapter. Each case is a small, named async function with a
+//! interface, so they run unchanged against each production adapter, including
+//! Memory with its optional test controls. Each case is a small, named async function with a
 //! stable replay seed; on failure it reports the case name and seed together
 //! with a safe error category or count, never a raw key, value, or backend
 //! error source.

@@ -1,7 +1,5 @@
 //! Tree Manifest directory and Partition Key allocation contract tests.
 
-use std::sync::Arc;
-
 use bytes::Bytes;
 use ktann::api::ErrorKind;
 use ktann::storage::LogicalRange;
@@ -15,14 +13,14 @@ use ktann::storage::values::{
     PersistentValue, TreeManifest,
 };
 
-use support::DeterministicBackend;
+use support::MemoryBackend;
 use support::builders::{id, manifest, pk, read_txn, tree_key, write_txn};
 
 #[allow(dead_code)]
 mod support;
 
 async fn create_tree_on(
-    backend: &DeterministicBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     key: &TreeKey,
     started_at_unix_millis: u64,
@@ -36,7 +34,7 @@ async fn create_tree_on(
 }
 
 async fn reserve_on(
-    backend: &DeterministicBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     key: &TreeKey,
     count: u32,
@@ -50,7 +48,7 @@ async fn reserve_on(
 }
 
 async fn read_value(
-    backend: &DeterministicBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     key: LogicalKey,
 ) -> Option<PersistentValue> {
@@ -60,7 +58,7 @@ async fn read_value(
 
 #[tokio::test]
 async fn creation_installs_the_manifest_and_the_initial_leaf_root() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
 
@@ -159,7 +157,7 @@ async fn creation_installs_the_manifest_and_the_initial_leaf_root() {
 
 #[tokio::test]
 async fn duplicate_creation_is_idempotent_and_changes_nothing() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
 
@@ -192,7 +190,7 @@ async fn duplicate_creation_is_idempotent_and_changes_nothing() {
 
 #[tokio::test]
 async fn reservations_are_monotonic_disjoint_and_persistent() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
 
@@ -218,7 +216,7 @@ async fn reservations_are_monotonic_disjoint_and_persistent() {
 
 #[tokio::test]
 async fn near_exhaustion_reserves_the_final_suffix_then_reports_exhaustion() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
 
@@ -260,7 +258,7 @@ async fn near_exhaustion_reserves_the_final_suffix_then_reports_exhaustion() {
 
 #[tokio::test]
 async fn reservation_rejects_missing_trees_and_zero_counts() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
 
@@ -296,19 +294,18 @@ async fn reservation_rejects_missing_trees_and_zero_counts() {
 
 #[tokio::test]
 async fn concurrent_creation_installs_exactly_one_tree() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
-    let backend = Arc::new(backend);
     let key = tree_key(1);
 
     let tasks = (0..8)
         .map(|_| {
-            let backend = Arc::clone(&backend);
+            let backend = backend.clone();
             let manifest = manifest.clone();
             let key = key.clone();
             tokio::spawn(async move {
                 loop {
-                    let mut txn = write_txn(backend.as_ref(), &manifest).await;
+                    let mut txn = write_txn(&backend, &manifest).await;
                     let outcome = tree_manifest::create_tree(&mut txn, &key, 0)
                         .await
                         .expect("create");
@@ -333,7 +330,7 @@ async fn concurrent_creation_installs_exactly_one_tree() {
     assert_eq!((created, existing), (1, 7));
 
     let manifest_after =
-        tree_manifest::read_tree_manifest(&mut read_txn(backend.as_ref(), &manifest).await, &key)
+        tree_manifest::read_tree_manifest(&mut read_txn(&backend, &manifest).await, &key)
             .await
             .expect("read")
             .expect("manifest exists");
@@ -342,7 +339,7 @@ async fn concurrent_creation_installs_exactly_one_tree() {
 
 #[tokio::test]
 async fn concurrent_reservations_partition_the_keyspace() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
 
@@ -354,17 +351,16 @@ async fn concurrent_reservations_partition_the_keyspace() {
         txn.commit().await.expect("commit");
     }
 
-    let backend = Arc::new(backend);
     const TASKS: u64 = 8;
     const PER_TASK: u32 = 16;
     let tasks = (0..TASKS)
         .map(|_| {
-            let backend = Arc::clone(&backend);
+            let backend = backend.clone();
             let manifest = manifest.clone();
             let key = key.clone();
             tokio::spawn(async move {
                 loop {
-                    let mut txn = write_txn(backend.as_ref(), &manifest).await;
+                    let mut txn = write_txn(&backend, &manifest).await;
                     let reservation =
                         match tree_manifest::reserve_partition_keys(&mut txn, &key, PER_TASK).await
                         {
@@ -397,7 +393,7 @@ async fn concurrent_reservations_partition_the_keyspace() {
     assert_eq!(total, TASKS * u64::from(PER_TASK));
 
     let manifest_after =
-        tree_manifest::read_tree_manifest(&mut read_txn(backend.as_ref(), &manifest).await, &key)
+        tree_manifest::read_tree_manifest(&mut read_txn(&backend, &manifest).await, &key)
             .await
             .expect("read")
             .expect("manifest exists");
@@ -406,7 +402,7 @@ async fn concurrent_reservations_partition_the_keyspace() {
 
 #[tokio::test]
 async fn corruption_fails_closed_on_directory_reads() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
 
@@ -439,7 +435,7 @@ async fn corruption_fails_closed_on_directory_reads() {
 
 #[tokio::test]
 async fn a_wrong_value_kind_at_the_directory_key_is_corruption() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
 
@@ -474,7 +470,7 @@ async fn a_wrong_value_kind_at_the_directory_key_is_corruption() {
 
 #[tokio::test]
 async fn read_tree_manifest_for_update_establishes_conflicts() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
 

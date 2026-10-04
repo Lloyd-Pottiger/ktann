@@ -27,9 +27,7 @@ use support::topology_probe::{
     edge_of, header_of, leaf_entry_of, location_of, make_runtime, reachable_leaves, record, retry,
     rid, scan_child_entries, scan_leaf_entries, seed_records, state_of, synopsis_of,
 };
-use support::{
-    CommitFault, DeterministicBackend, DeterministicConfig, Rng, SharedBackend, read_manifest,
-};
+use support::{CommitFault, MemoryBackend, Rng, TestConfig, read_manifest};
 
 #[allow(dead_code)]
 mod support;
@@ -37,7 +35,7 @@ mod support;
 /// Drains one split source to exact zero, one bounded batch at a time,
 /// returning the total moved entries.
 async fn drain_to_zero(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     key: &TreeKey,
     source: PartitionKey,
@@ -341,7 +339,7 @@ async fn root_leaf_split_runs_end_to_end_and_stays_searchable() {
 // ---------------------------------------------------------------------------
 
 async fn split_root_into_two_leaves(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     key: &TreeKey,
 ) -> (PartitionKey, PartitionKey) {
@@ -985,7 +983,7 @@ async fn advance_converges_a_split_whose_source_emptied_out() {
 
 /// Builds a committed over-maximum leaf root with six records and returns its
 /// manifest; the caller drives the split with explicit transactions.
-async fn seed_over_max_root(backend: &SharedBackend) -> (IndexManifest, TreeKey) {
+async fn seed_over_max_root(backend: &MemoryBackend) -> (IndexManifest, TreeKey) {
     let runtime = make_runtime(backend.clone());
     let index = runtime
         .create_index("index", config(1, 4))
@@ -1007,7 +1005,7 @@ async fn begin_split_recovers_from_every_commit_outcome() {
         let backend = backend();
         let (manifest, key) = seed_over_max_root(&backend).await;
 
-        backend.inner().push_fault(fault).expect("push fault");
+        backend.push_fault(fault).expect("push fault");
         let mut txn = write_txn(&backend, &manifest).await;
         let started = topology::begin_split(&mut txn, &key, pk(1), 1_000)
             .await
@@ -1056,7 +1054,7 @@ async fn exposure_recovers_from_every_commit_outcome() {
             .await
             .expect("train");
 
-        backend.inner().push_fault(fault).expect("push fault");
+        backend.push_fault(fault).expect("push fault");
         let mut txn = write_txn(&backend, &manifest).await;
         let exposed = topology::expose_split_targets(
             &mut txn,
@@ -1139,7 +1137,7 @@ async fn finalize_recovers_from_every_commit_outcome() {
 
         // Drain everything, then finalize under the injected fault.
         drain_to_zero(&backend, &manifest, &key, pk(1)).await;
-        backend.inner().push_fault(fault).expect("push fault");
+        backend.push_fault(fault).expect("push fault");
         let mut txn = write_txn(&backend, &manifest).await;
         topology::finalize_split(
             &mut txn,
@@ -1203,7 +1201,6 @@ async fn drain_recovers_from_unknown_outcomes_without_losing_membership() {
 
     // The first batch's commit reports an unknown outcome after applying.
     backend
-        .inner()
         .push_fault(CommitFault::UnknownApplied)
         .expect("push fault");
     let error = split::drain_batch(&backend, &manifest, &key, pk(1), &retry())
@@ -1238,11 +1235,11 @@ async fn drain_recovers_from_unknown_outcomes_without_losing_membership() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restarted_process_rediscovers_the_durable_split_state() {
-    let durable = DeterministicConfig {
+    let durable = TestConfig {
         durability: support::Durability::Durable,
-        ..DeterministicConfig::default()
+        ..TestConfig::default()
     };
-    let backend = SharedBackend::new(DeterministicBackend::new(durable));
+    let backend = MemoryBackend::with_test_config(durable);
     let runtime = make_runtime(backend.clone());
     let index = runtime
         .create_index("index", config(1, 4))
@@ -1264,7 +1261,7 @@ async fn a_restarted_process_rediscovers_the_durable_split_state() {
 
     // The process is gone; a reopened backend rediscovers the durable
     // DrainingSplit state and converges it.
-    let reopened = SharedBackend::new(backend.inner().reopen());
+    let reopened = backend.reopen();
     let outcomes = drive_split_to_completion(&reopened, &manifest, &key, pk(1)).await;
     assert!(matches!(outcomes.last(), Some(Advance::Completed { .. })));
     assert_searchable(&reopened, &manifest, &key, &records).await;
@@ -1402,7 +1399,7 @@ async fn a_concurrent_exposure_aborts_the_losing_attempt() {
 
     // A re-driven exposure observes the committed DrainingSplit state and
     // adopts it without writing anything.
-    let key_count = backend.inner().db_key_count();
+    let key_count = backend.db_key_count();
     let mut txn = write_txn(&backend, &manifest).await;
     let redriven = topology::expose_split_targets(
         &mut txn,
@@ -1415,7 +1412,7 @@ async fn a_concurrent_exposure_aborts_the_losing_attempt() {
     .expect("redriven expose");
     assert_eq!(redriven, topology::SplitExposure::AlreadyExposed);
     txn.commit().await.expect("redrive writes nothing");
-    assert_eq!(backend.inner().db_key_count(), key_count, "no writes");
+    assert_eq!(backend.db_key_count(), key_count, "no writes");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1430,7 +1427,7 @@ async fn a_stale_worker_cannot_recreate_a_target_after_completion() {
         .expect("train");
     let outcomes = drive_split_to_completion(&backend, &manifest, &key, pk(1)).await;
     assert!(matches!(outcomes.last(), Some(Advance::Completed { .. })));
-    let key_count = backend.inner().db_key_count();
+    let key_count = backend.db_key_count();
 
     // The split is complete: the source State now says Ready (the root was
     // converted), so the stale exposure attempt abandons without writing.
@@ -1446,11 +1443,7 @@ async fn a_stale_worker_cannot_recreate_a_target_after_completion() {
     .expect("stale expose");
     assert_eq!(outcome, topology::SplitExposure::SourceAdvanced);
     txn.commit().await.expect("nothing written");
-    assert_eq!(
-        backend.inner().db_key_count(),
-        key_count,
-        "no orphan writes"
-    );
+    assert_eq!(backend.db_key_count(), key_count, "no orphan writes");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1509,7 +1502,7 @@ async fn a_concurrent_drain_move_conflicts_with_a_foreground_delete() {
 /// children PK 2 (the drained source) and PK 3, and exposed targets PK 4 and
 /// PK 5. Returns after committing the fixture.
 async fn seed_completable_non_root_split(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     key: &TreeKey,
 ) {
@@ -1894,7 +1887,7 @@ async fn drain_fails_closed_on_an_inconsistent_entry() {
 
     // Corrupt one Record Location through the raw seam: it names a leaf that
     // is not the source.
-    let mut raw = backend.inner().begin_write().await.expect("begin write");
+    let mut raw = backend.begin_write().await.expect("begin write");
     raw.put(
         Bytes::from(
             keys::location_key(manifest.logical_index_id(), &rid(2)).expect("location key"),
@@ -1918,7 +1911,7 @@ async fn drain_fails_closed_on_an_inconsistent_entry() {
 /// Membership assertion tolerant of one corrupted record: every other record
 /// keeps exact membership.
 async fn assert_searchable_present(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     key: &TreeKey,
     records: &[(Bytes, f32)],
@@ -2002,10 +1995,7 @@ async fn seeded_model_history_interleaving_mutations_and_splits() {
             }
             // Inject one definite abort into the next commit.
             6 => {
-                backend
-                    .inner()
-                    .push_fault(CommitFault::Abort)
-                    .expect("fault");
+                backend.push_fault(CommitFault::Abort).expect("fault");
             }
             // Advance one random partition's split state.
             _ => {
@@ -2354,7 +2344,6 @@ async fn non_root_finalize_recovers_from_an_unknown_commit_outcome() {
 
         // Finalize under an injected applied-but-unknown commit outcome.
         backend
-            .inner()
             .push_fault(CommitFault::UnknownApplied)
             .expect("push fault");
         let mut txn = write_txn(&backend, &manifest).await;

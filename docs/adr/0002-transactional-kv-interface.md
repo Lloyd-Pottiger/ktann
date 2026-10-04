@@ -1,5 +1,9 @@
 # Require one transactional KV interface
 
+The restriction of in-memory implementations to tests below is superseded by
+[ADR 0024](0024-production-memory-adapter.md). The transactional interface and
+persistent-adapter decisions remain in force.
+
 KTANN supports FoundationDB and RocksDB through adapters that provide consistent
 snapshots, atomic multi-key transactions, ordered range scans, update-protected
 reads, unique insertion, transaction limits, and explicit commit-outcome

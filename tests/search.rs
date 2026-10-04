@@ -25,13 +25,13 @@ use ktann::storage::values::{
 use ktann::storage::{LogicalRange, ReadLogicalTxn, WriteLogicalTxn};
 use tokio_util::sync::CancellationToken;
 
-use support::{DeterministicBackend, DeterministicConfig, SharedBackend};
+use support::{MemoryBackend, TestConfig};
 
 #[allow(dead_code)]
 mod support;
 
-fn shared_backend(config: DeterministicConfig) -> SharedBackend {
-    SharedBackend::new(DeterministicBackend::new(config))
+fn shared_backend(config: TestConfig) -> MemoryBackend {
+    MemoryBackend::with_test_config(config)
 }
 
 /// A one-dimensional L2 index: rotation is the identity at dimension 1, so the
@@ -51,7 +51,7 @@ fn config() -> IndexConfig {
         .expect("valid tree key fields")
 }
 
-fn make_runtime(backend: SharedBackend) -> Runtime<SharedBackend> {
+fn make_runtime(backend: MemoryBackend) -> Runtime<MemoryBackend> {
     // Search fixtures pin exact intermediate topology states; background
     // maintenance workers would advance them concurrently.
     Runtime::new(backend, support::manual_maintenance_config()).expect("runtime is valid")
@@ -82,15 +82,15 @@ fn record(row: &Row) -> Record {
     .expect("valid record")
 }
 
-async fn insert_all(index: &Index<SharedBackend>, rows: &[Row]) {
+async fn insert_all(index: &Index<MemoryBackend>, rows: &[Row]) {
     for row in rows {
         index.insert(record(row)).await.expect("insert record");
     }
 }
 
 /// Builds a default backend/runtime/index triple; insert `rows` afterwards.
-async fn setup() -> (SharedBackend, Runtime<SharedBackend>, Index<SharedBackend>) {
-    let backend = shared_backend(DeterministicConfig::default());
+async fn setup() -> (MemoryBackend, Runtime<MemoryBackend>, Index<MemoryBackend>) {
+    let backend = shared_backend(TestConfig::default());
     let runtime = make_runtime(backend.clone());
     let index = runtime
         .create_index("index", config())
@@ -229,7 +229,7 @@ async fn packed_search_preserves_results_and_budgets_across_cache_modes() {
             .collect::<Vec<_>>()
     };
     for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
-        let backend = shared_backend(DeterministicConfig::default());
+        let backend = shared_backend(TestConfig::default());
         let setup_runtime = make_runtime(backend.clone());
         let index = setup_runtime
             .create_index(
@@ -267,9 +267,9 @@ async fn packed_search_preserves_results_and_budgets_across_cache_modes() {
                 let request = SearchRequest::new(Arc::from(vectors[0]), 2)
                     .expect("valid query")
                     .with_options(options);
-                backend.inner().reset_operation_counts();
+                backend.reset_operation_counts();
                 let outcome = index.search(request).await.expect("search");
-                *scan_count = backend.inner().operation_counts().scan;
+                *scan_count = backend.operation_counts().scan;
                 assert_eq!(outcome.hits.len(), 2);
                 assert_eq!(outcome.usage.visited_partitions, 1);
                 assert_eq!(outcome.usage.visited_leaf_entries, 4);
@@ -443,7 +443,7 @@ async fn every_budget_dimension_reports_exactly_its_own_exhaustion() {
     // Exact rerank candidates: two trees of ten identical vectors each. Every
     // interval coincides, so the per-leaf caps and the merged selection both
     // truncate to the Runtime ceiling and report it.
-    let backend = shared_backend(DeterministicConfig::default());
+    let backend = shared_backend(TestConfig::default());
     let search_budgets = SearchBudgets::new(4_096, 1_024, 3).expect("valid exact-rerank ceiling");
     let runtime_config = support::manual_maintenance_config()
         .with_default_search_budgets(search_budgets)
@@ -983,9 +983,9 @@ async fn a_duplicate_record_id_across_partitions_fails_closed() {
 async fn backend_limits_paginate_scans_and_bound_batches() {
     // One item per backend scan page: directory enumeration and body loads
     // paginate through cursors without changing the outcome.
-    let backend = shared_backend(DeterministicConfig {
+    let backend = shared_backend(TestConfig {
         max_scan_page_items: 1,
-        ..DeterministicConfig::default()
+        ..TestConfig::default()
     });
     let runtime = make_runtime(backend);
     let index = runtime
@@ -1004,9 +1004,9 @@ async fn backend_limits_paginate_scans_and_bound_batches() {
     // keys for the tree-creating first insert) but is below the rerank
     // batch's 16 keys (8 candidates, 2 keys each) surfaces LimitExceeded
     // rather than a partial result.
-    let backend = shared_backend(DeterministicConfig {
+    let backend = shared_backend(TestConfig {
         max_batch_size: 12,
-        ..DeterministicConfig::default()
+        ..TestConfig::default()
     });
     let runtime = make_runtime(backend);
     let index = runtime
@@ -1027,7 +1027,7 @@ async fn backend_limits_paginate_scans_and_bound_batches() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_dropping_or_dropped_index_fails_closed_for_search() {
-    let backend = shared_backend(DeterministicConfig::default());
+    let backend = shared_backend(TestConfig::default());
     let runtime = make_runtime(backend.clone());
     let dropping = runtime
         .create_index("dropping", config())

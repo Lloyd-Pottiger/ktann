@@ -15,40 +15,37 @@ use ktann::storage::values::{
 use ktann::storage::{ReadLogicalTxn, WriteLogicalTxn};
 
 use support::builders::seed_named_index;
-use support::{
-    CommitFault, CommitOutcome, DeterministicBackend, DeterministicConfig, Durability,
-    SharedBackend,
-};
+use support::{CommitFault, CommitOutcome, Durability, MemoryBackend, TestConfig};
 
 #[allow(dead_code)]
 mod support;
 
-fn backend(config: DeterministicConfig) -> SharedBackend {
-    SharedBackend::new(DeterministicBackend::new(config))
+fn backend(config: TestConfig) -> MemoryBackend {
+    MemoryBackend::with_test_config(config)
 }
 
-fn clear_config() -> DeterministicConfig {
-    DeterministicConfig {
+fn clear_config() -> TestConfig {
+    TestConfig {
         capabilities: Capabilities {
             transactional_clear_range: true,
         },
         durability: Durability::Durable,
-        ..DeterministicConfig::default()
+        ..TestConfig::default()
     }
 }
 
-fn no_clear_config() -> DeterministicConfig {
-    DeterministicConfig {
+fn no_clear_config() -> TestConfig {
+    TestConfig {
         capabilities: Capabilities {
             transactional_clear_range: false,
         },
         durability: Durability::Durable,
-        ..DeterministicConfig::default()
+        ..TestConfig::default()
     }
 }
 
-fn paged_config(page_mutations: usize) -> DeterministicConfig {
-    DeterministicConfig {
+fn paged_config(page_mutations: usize) -> TestConfig {
+    TestConfig {
         admission_budget: AdmissionBudget {
             max_mutations: page_mutations,
             max_mutation_bytes: 1 << 20,
@@ -71,7 +68,7 @@ fn config_with_dimension(dimension: usize) -> IndexConfig {
     IndexConfig::new(dimension, Metric::L2).expect("valid config")
 }
 
-fn make_runtime(backend: SharedBackend) -> ktann::runtime::Runtime<SharedBackend> {
+fn make_runtime(backend: MemoryBackend) -> ktann::runtime::Runtime<MemoryBackend> {
     ktann::runtime::Runtime::new(
         backend,
         RuntimeConfig::default()
@@ -89,7 +86,7 @@ fn name(value: &str) -> IndexName {
     IndexName::new(value).expect("valid test name")
 }
 
-async fn read_manifest(backend: &SharedBackend, name: &IndexName) -> Option<IndexManifest> {
+async fn read_manifest(backend: &MemoryBackend, name: &IndexName) -> Option<IndexManifest> {
     let raw = backend.begin_read().await.expect("begin read");
     let mut txn = ReadLogicalTxn::bootstrap(raw);
     let entry = txn
@@ -109,7 +106,7 @@ async fn read_manifest(backend: &SharedBackend, name: &IndexName) -> Option<Inde
     }
 }
 
-async fn read_allocator(backend: &SharedBackend) -> u64 {
+async fn read_allocator(backend: &MemoryBackend) -> u64 {
     let raw = backend.begin_read().await.expect("begin read");
     let mut txn = ReadLogicalTxn::bootstrap(raw);
     match txn
@@ -123,7 +120,7 @@ async fn read_allocator(backend: &SharedBackend) -> u64 {
     }
 }
 
-async fn seed_allocator(backend: &SharedBackend, high_water: u64) {
+async fn seed_allocator(backend: &MemoryBackend, high_water: u64) {
     let raw = backend.begin_write().await.expect("begin write");
     let limits = backend.hard_limits();
     let budget = backend.admission_budget();
@@ -137,7 +134,7 @@ async fn seed_allocator(backend: &SharedBackend, high_water: u64) {
     txn.commit().await.expect("commit allocator");
 }
 
-async fn seed_index_owned_keys(backend: &SharedBackend, manifest: &IndexManifest, count: usize) {
+async fn seed_index_owned_keys(backend: &MemoryBackend, manifest: &IndexManifest, count: usize) {
     let codec = ValueCodec::for_index(manifest);
     for item in 0..count {
         let record_id = Bytes::copy_from_slice(format!("record-{item:03}").as_bytes());
@@ -159,13 +156,9 @@ async fn seed_index_owned_keys(backend: &SharedBackend, manifest: &IndexManifest
     }
 }
 
-async fn assert_drop_complete(backend: &SharedBackend, name: &IndexName) {
+async fn assert_drop_complete(backend: &MemoryBackend, name: &IndexName) {
     assert_eq!(read_manifest(backend, name).await, None);
-    assert_eq!(
-        backend.inner().db_key_count(),
-        1,
-        "only the allocator remains"
-    );
+    assert_eq!(backend.db_key_count(), 1, "only the allocator remains");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -242,7 +235,7 @@ async fn invalid_names_and_configs_fail_before_storage_work() {
             .kind(),
         ErrorKind::InvalidArgument
     );
-    assert_eq!(shared.inner().db_key_count(), 0);
+    assert_eq!(shared.db_key_count(), 0);
 
     runtime.shutdown().await.expect("shutdown");
 }
@@ -251,7 +244,6 @@ async fn invalid_names_and_configs_fail_before_storage_work() {
 async fn create_retries_definite_aborts_without_reallocating() {
     let shared = backend(no_clear_config());
     shared
-        .inner()
         .set_fault_plan(vec![CommitFault::Abort, CommitFault::Normal])
         .expect("set plan");
     let runtime = make_runtime(shared.clone());
@@ -263,7 +255,6 @@ async fn create_retries_definite_aborts_without_reallocating() {
     assert_eq!(index.logical_index_id(), id(1));
     assert_eq!(read_allocator(&shared).await, 1);
     let outcomes = shared
-        .inner()
         .history()
         .into_iter()
         .map(|entry| entry.outcome)
@@ -280,7 +271,6 @@ async fn create_retries_definite_aborts_without_reallocating() {
 async fn unknown_applied_create_recovers_without_allocating_a_new_id() {
     let shared = backend(no_clear_config());
     shared
-        .inner()
         .set_fault_plan(vec![CommitFault::UnknownApplied])
         .expect("set plan");
     let runtime = make_runtime(shared.clone());
@@ -306,7 +296,6 @@ async fn unknown_applied_create_recovers_without_allocating_a_new_id() {
 async fn unknown_not_applied_create_never_reallocates_a_missing_name() {
     let shared = backend(no_clear_config());
     shared
-        .inner()
         .set_fault_plan(vec![CommitFault::UnknownNotApplied])
         .expect("set plan");
     let runtime = make_runtime(shared.clone());
@@ -335,7 +324,6 @@ async fn unknown_not_applied_create_never_reallocates_a_missing_name() {
 async fn unknown_applied_create_reports_a_later_conflicting_config() {
     let shared = backend(no_clear_config());
     shared
-        .inner()
         .set_fault_plan(vec![CommitFault::UnknownApplied])
         .expect("set plan");
     let runtime = make_runtime(shared.clone());
@@ -408,7 +396,6 @@ async fn clear_range_drop_is_atomic_and_recovers_unknown_outcomes() {
     .await;
     seed_index_owned_keys(&shared, &seeded, 20).await;
     shared
-        .inner()
         .set_fault_plan(vec![CommitFault::UnknownApplied])
         .expect("set plan");
     let runtime = make_runtime(shared.clone());
@@ -417,7 +404,6 @@ async fn clear_range_drop_is_atomic_and_recovers_unknown_outcomes() {
     assert_drop_complete(&shared, &name("docs")).await;
     assert_eq!(
         shared
-            .inner()
             .history()
             .iter()
             .filter(|entry| entry.outcome == CommitOutcome::UnknownApplied)
@@ -440,9 +426,8 @@ async fn point_delete_drop_is_bounded_resumable_and_restarts_after_unknown() {
     )
     .await;
     seed_index_owned_keys(&shared, &seeded, 11).await;
-    let seeded_entries = shared.inner().history().len();
+    let seeded_entries = shared.history().len();
     shared
-        .inner()
         .set_fault_plan(vec![CommitFault::UnknownApplied])
         .expect("set plan");
     let runtime = make_runtime(shared.clone());
@@ -450,7 +435,7 @@ async fn point_delete_drop_is_bounded_resumable_and_restarts_after_unknown() {
     runtime.drop_index("docs").await.expect("paged drop");
     assert_drop_complete(&shared, &name("docs")).await;
 
-    let history = shared.inner().history();
+    let history = shared.history();
     assert!(
         history[seeded_entries..]
             .iter()
@@ -477,7 +462,6 @@ async fn drop_recovers_when_the_initial_dropping_mark_was_not_applied() {
     )
     .await;
     shared
-        .inner()
         .set_fault_plan(vec![CommitFault::UnknownNotApplied])
         .expect("set plan");
     let runtime = make_runtime(shared.clone());
@@ -486,7 +470,6 @@ async fn drop_recovers_when_the_initial_dropping_mark_was_not_applied() {
     assert_drop_complete(&shared, &name("docs")).await;
     assert_eq!(
         shared
-            .inner()
             .history()
             .iter()
             .filter(|entry| entry.outcome == CommitOutcome::UnknownNotApplied)
@@ -526,8 +509,7 @@ async fn durable_restart_reopens_created_and_dropped_lifecycle_states() {
         .expect("create");
     runtime.shutdown().await.expect("shutdown");
 
-    let reopened = shared.inner().reopen();
-    let reopened_backend = SharedBackend::new(reopened);
+    let reopened_backend = shared.reopen();
     let runtime = make_runtime(reopened_backend.clone());
     let opened = runtime.open_index("docs").await.expect("reopen");
     assert_eq!(opened.logical_index_id(), id(1));
@@ -538,8 +520,8 @@ async fn durable_restart_reopens_created_and_dropped_lifecycle_states() {
         .expect("drop after restart");
     assert_drop_complete(&reopened_backend, &name("docs")).await;
 
-    let after_drop = reopened_backend.inner().reopen();
-    let runtime = make_runtime(SharedBackend::new(after_drop));
+    let after_drop = reopened_backend.reopen();
+    let runtime = make_runtime(after_drop);
     assert_eq!(
         runtime
             .open_index("docs")
@@ -564,7 +546,6 @@ async fn exhausted_unknown_budget_still_recovers_a_provable_completion() {
     .await;
     seed_index_owned_keys(&shared, &seeded, 5).await;
     shared
-        .inner()
         .set_fault_plan(vec![CommitFault::UnknownApplied])
         .expect("set plan");
     let runtime = ktann::runtime::Runtime::new(
@@ -595,7 +576,6 @@ async fn exhausted_unknown_budget_returns_unknown_when_drop_is_incomplete() {
     )
     .await;
     shared
-        .inner()
         .set_fault_plan(vec![CommitFault::UnknownNotApplied])
         .expect("set plan");
     let runtime = ktann::runtime::Runtime::new(
@@ -677,7 +657,6 @@ async fn point_delete_drop_resumes_from_prefix_after_restart() {
     .await;
     seed_index_owned_keys(&shared, &seeded, 9).await;
     shared
-        .inner()
         .set_fault_plan(vec![CommitFault::UnknownApplied])
         .expect("set plan");
     let runtime = ktann::runtime::Runtime::new(
@@ -705,7 +684,7 @@ async fn point_delete_drop_resumes_from_prefix_after_restart() {
     );
     runtime.shutdown().await.expect("shutdown");
 
-    let reopened = SharedBackend::new(shared.inner().reopen());
+    let reopened = shared.reopen();
     let runtime = make_runtime(reopened.clone());
     runtime
         .drop_index("docs")
@@ -727,7 +706,6 @@ async fn drop_recovers_when_the_initial_dropping_mark_was_applied() {
     )
     .await;
     shared
-        .inner()
         .set_fault_plan(vec![CommitFault::UnknownApplied])
         .expect("set plan");
     let runtime = make_runtime(shared.clone());
@@ -788,5 +766,5 @@ async fn drop_removes_only_the_named_index_owned_range() {
 #[test]
 fn index_handle_is_send_and_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<ktann::api::Index<SharedBackend>>();
+    assert_send_sync::<ktann::api::Index<MemoryBackend>>();
 }

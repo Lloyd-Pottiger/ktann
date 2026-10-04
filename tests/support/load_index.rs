@@ -32,7 +32,7 @@ use ktann::storage::values::{
 };
 use ktann::storage::{LogicalRange, ReadLogicalTxn, WriteLogicalTxn, tree_manifest};
 
-use super::{SharedBackend, read_manifest};
+use super::{MemoryBackend, read_manifest};
 
 /// The state annotation of one fixture partition line.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -410,8 +410,8 @@ pub struct InstallSummary {
 /// `search` that warmed the runtime partition cache under the tree's
 /// pre-install epochs can never serve a stale body.
 pub async fn install(
-    backend: &SharedBackend,
-    index: &Index<SharedBackend>,
+    backend: &MemoryBackend,
+    index: &Index<MemoryBackend>,
     fixture: &LoadFixture,
     tree_key: &TreeKey,
     started_at_unix_millis: u64,
@@ -632,7 +632,7 @@ fn root_key() -> PartitionKey {
 /// the way that the tree is still empty: absent, or present with an empty
 /// level-1 Ready root.
 async fn existing_high_water(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     tree_key: &TreeKey,
     line: usize,
@@ -680,7 +680,7 @@ async fn existing_high_water(
 /// Reads back the decoded Leaf Entry envelopes the insert phase committed to
 /// the tree's root leaf, keyed by Record ID.
 async fn read_root_entries(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     tree_key: &TreeKey,
 ) -> BTreeMap<Bytes, LeafEntry> {

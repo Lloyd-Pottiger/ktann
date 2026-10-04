@@ -31,16 +31,13 @@ use support::topology_probe::{
     header_of, leaf_entry_of, location_of, make_runtime, reachable_leaves, record, retry, rid,
     scan_child_entries, scan_leaf_entries, seed_records, state_of, synopsis_of,
 };
-use support::{
-    CommitFault, DeterministicBackend, DeterministicConfig, Durability, Rng, SharedBackend, audit,
-    read_manifest,
-};
+use support::{CommitFault, Durability, MemoryBackend, Rng, TestConfig, audit, read_manifest};
 
 #[allow(dead_code)]
 mod support;
 
 /// Runs the persistent-state audit against the caller's record model.
-async fn run_audit(backend: &SharedBackend, manifest: &IndexManifest, records: &[(Bytes, f32)]) {
+async fn run_audit(backend: &MemoryBackend, manifest: &IndexManifest, records: &[(Bytes, f32)]) {
     let model: Model = records
         .iter()
         .map(|(id, x)| {
@@ -61,7 +58,7 @@ async fn run_audit(backend: &SharedBackend, manifest: &IndexManifest, records: &
 /// Drains one merge source to exact zero, one bounded batch at a time,
 /// returning the total moved entries.
 async fn merge_drain_to_zero(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     key: &TreeKey,
     source: PartitionKey,
@@ -85,7 +82,7 @@ async fn merge_drain_to_zero(
 
 /// Runs one full merge of `source`: begin, drain to zero, complete.
 async fn merge_partition(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     key: &TreeKey,
     source: PartitionKey,
@@ -102,7 +99,7 @@ async fn merge_partition(
 }
 
 /// Deletes every id through the public API, keeping the model in step.
-async fn delete_ids(index: &Index<SharedBackend>, records: &mut Vec<(Bytes, f32)>, ids: &[Bytes]) {
+async fn delete_ids(index: &Index<MemoryBackend>, records: &mut Vec<(Bytes, f32)>, ids: &[Bytes]) {
     for id in ids {
         assert!(index.delete(id.clone()).await.expect("delete"));
         records.retain(|(record_id, _)| record_id != id);
@@ -111,7 +108,7 @@ async fn delete_ids(index: &Index<SharedBackend>, records: &mut Vec<(Bytes, f32)
 
 /// The Record IDs held by one leaf, in Leaf Entry key order.
 async fn leaf_ids(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     key: &TreeKey,
     leaf: PartitionKey,
@@ -127,8 +124,8 @@ async fn leaf_ids(
 /// entries with the largest vectors; returns the kept (id, x) pairs in
 /// ascending-x order.
 async fn trim_leaf(
-    index: &Index<SharedBackend>,
-    backend: &SharedBackend,
+    index: &Index<MemoryBackend>,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     key: &TreeKey,
     leaf: PartitionKey,
@@ -159,7 +156,7 @@ async fn trim_leaf(
 
 /// The single persisted routing centroid component of one partition.
 async fn leaf_centroid(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     key: &TreeKey,
     leaf: PartitionKey,
@@ -191,10 +188,10 @@ fn expected_target(x: f32, targets: &[(PartitionKey, f32)]) -> PartitionKey {
 /// A committed two-leaf tree: six records split off the root, leaving PK 2
 /// (x in {0,1,2}) and PK 3 (x in {3,4,5}) under the level-2 root.
 async fn two_leaf_tree(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
 ) -> (
-    Runtime<SharedBackend>,
-    Index<SharedBackend>,
+    Runtime<MemoryBackend>,
+    Index<MemoryBackend>,
     IndexManifest,
     TreeKey,
     Vec<(Bytes, f32)>,
@@ -226,10 +223,10 @@ async fn two_leaf_tree(
 /// past the maximum and split, leaving PK 3 (x in {3,4,5}) and PK 4/PK 5
 /// sharing x in {0, 0.25, 0.75, 1, 1.25, 2}.
 async fn three_leaf_tree(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
 ) -> (
-    Runtime<SharedBackend>,
-    Index<SharedBackend>,
+    Runtime<MemoryBackend>,
+    Index<MemoryBackend>,
     IndexManifest,
     TreeKey,
     Vec<(Bytes, f32)>,
@@ -254,10 +251,10 @@ async fn three_leaf_tree(
 
 /// A committed wide-config two-leaf tree: 33 records split off the root.
 async fn wide_two_leaf_tree(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
 ) -> (
-    Runtime<SharedBackend>,
-    Index<SharedBackend>,
+    Runtime<MemoryBackend>,
+    Index<MemoryBackend>,
     IndexManifest,
     TreeKey,
     Vec<(Bytes, f32)>,
@@ -281,10 +278,10 @@ async fn wide_two_leaf_tree(
 /// A committed wide-config three-leaf tree: the right leaf grown past the
 /// maximum (x = 33..49 all route right) and split.
 async fn wide_three_leaf_tree(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
 ) -> (
-    Runtime<SharedBackend>,
-    Index<SharedBackend>,
+    Runtime<MemoryBackend>,
+    Index<MemoryBackend>,
     IndexManifest,
     TreeKey,
     Vec<(Bytes, f32)>,
@@ -311,8 +308,8 @@ async fn wide_three_leaf_tree(
 /// below-minimum source in one batch; `backend_with_merge_drain_budget`
 /// bounds the batch to eight entries for two-batch reselection coverage.
 struct MiddleLeafMerge {
-    runtime: Runtime<SharedBackend>,
-    index: Index<SharedBackend>,
+    runtime: Runtime<MemoryBackend>,
+    index: Index<MemoryBackend>,
     manifest: IndexManifest,
     key: TreeKey,
     records: Vec<(Bytes, f32)>,
@@ -321,7 +318,7 @@ struct MiddleLeafMerge {
     kept: Vec<(Bytes, f32)>,
 }
 
-async fn begin_middle_leaf_merge(backend: &SharedBackend) -> MiddleLeafMerge {
+async fn begin_middle_leaf_merge(backend: &MemoryBackend) -> MiddleLeafMerge {
     let (runtime, index, manifest, key, mut records) = wide_three_leaf_tree(backend).await;
     // The merge source is the middle leaf by entry x-order, so its entries
     // straddle the two targets' midpoint and both receive entries.
@@ -938,7 +935,7 @@ async fn completion_removes_exactly_the_source_prefix_with_and_without_range_cle
         let moved = merge_drain_to_zero(&backend, &manifest, &key, pk(2)).await;
         assert_eq!(moved, 1);
 
-        let keys_before = backend.inner().db_key_count();
+        let keys_before = backend.db_key_count();
         let completed = merge::complete_merge(&backend, &manifest, &key, pk(2), &retry())
             .await
             .expect("complete");
@@ -947,7 +944,7 @@ async fn completion_removes_exactly_the_source_prefix_with_and_without_range_cle
         // Centroid, Synopsis — plus its incoming Child Entry are removed, by
         // one transactional range clear or by bounded point deletes.
         assert_eq!(
-            backend.inner().db_key_count(),
+            backend.db_key_count(),
             keys_before - 5,
             "exactly the source prefix and its incoming edge are removed"
         );
@@ -1028,11 +1025,11 @@ async fn advance_rediscovers_and_converges_a_cold_merge() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restarted_process_rediscovers_the_durable_merge_state() {
-    let durable = DeterministicConfig {
+    let durable = TestConfig {
         durability: Durability::Durable,
-        ..DeterministicConfig::default()
+        ..TestConfig::default()
     };
-    let backend = SharedBackend::new(DeterministicBackend::new(durable));
+    let backend = MemoryBackend::with_test_config(durable);
     let (runtime, index, manifest, key, mut records) = two_leaf_tree(&backend).await;
     trim_leaf(&index, &backend, &manifest, &key, pk(2), 1, &mut records).await;
     let start = merge::begin_merge(&backend, &manifest, &key, pk(2), 1_000, &retry())
@@ -1043,7 +1040,7 @@ async fn a_restarted_process_rediscovers_the_durable_merge_state() {
 
     // The process is gone; a reopened backend rediscovers the durable Merging
     // state and converges it with advance alone.
-    let reopened = SharedBackend::new(backend.inner().reopen());
+    let reopened = backend.reopen();
     let outcomes = drive_merge_to_completion(&reopened, &manifest, &key, pk(2)).await;
     assert_eq!(outcomes.last(), Some(&merge::Advance::Completed));
     assert_searchable(&reopened, &manifest, &key, &records).await;
@@ -1057,7 +1054,7 @@ async fn a_restarted_process_rediscovers_the_durable_merge_state() {
 /// Builds a committed two-leaf tree with PK 2 trimmed below the minimum — a
 /// merge-eligible leaf — and returns its manifest; the caller drives the
 /// merge with explicit transactions.
-async fn seed_mergeable_leaf(backend: &SharedBackend) -> (IndexManifest, TreeKey) {
+async fn seed_mergeable_leaf(backend: &MemoryBackend) -> (IndexManifest, TreeKey) {
     let (runtime, index, manifest, key, mut records) = two_leaf_tree(backend).await;
     trim_leaf(&index, backend, &manifest, &key, pk(2), 1, &mut records).await;
     runtime.shutdown().await.expect("shutdown");
@@ -1067,7 +1064,7 @@ async fn seed_mergeable_leaf(backend: &SharedBackend) -> (IndexManifest, TreeKey
 /// Builds a committed merge drained to exact zero: PK 2 is Merging with an
 /// empty entry range, ready for completion.
 async fn seed_drained_merge(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
 ) -> (IndexManifest, TreeKey, Vec<(Bytes, f32)>) {
     let (runtime, index, manifest, key, mut records) = two_leaf_tree(backend).await;
     trim_leaf(&index, backend, &manifest, &key, pk(2), 1, &mut records).await;
@@ -1091,7 +1088,7 @@ async fn begin_merge_recovers_from_every_commit_outcome() {
         let backend = backend();
         let (manifest, key) = seed_mergeable_leaf(&backend).await;
 
-        backend.inner().push_fault(fault).expect("push fault");
+        backend.push_fault(fault).expect("push fault");
         let mut txn = write_txn(&backend, &manifest).await;
         let started = topology::begin_merge(&mut txn, &key, pk(2), 1_000)
             .await
@@ -1146,7 +1143,7 @@ async fn drain_recovers_from_unknown_outcomes_without_losing_membership() {
 
         // The batch's commit reports an unknown outcome; it may or may not
         // have applied.
-        backend.inner().push_fault(fault).expect("push fault");
+        backend.push_fault(fault).expect("push fault");
         let error = merge::drain_batch(&backend, &manifest, &key, pk(2), &retry())
             .await
             .expect_err("unknown outcome");
@@ -1203,7 +1200,7 @@ async fn finalize_recovers_from_every_commit_outcome() {
             };
             let (manifest, key, records) = seed_drained_merge(&backend).await;
 
-            backend.inner().push_fault(fault).expect("push fault");
+            backend.push_fault(fault).expect("push fault");
             let mut txn = write_txn(&backend, &manifest).await;
             let completed = topology::finalize_merge(&mut txn, &key, pk(2), removal)
                 .await
@@ -2084,7 +2081,7 @@ async fn begin_reports_not_eligible_for_ineligible_sources() {
 /// children PK 2 (the drained Merging source) and PK 3 (Ready). Returns after
 /// committing the fixture.
 async fn seed_completable_non_root_merge(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     key: &TreeKey,
 ) {
@@ -2480,7 +2477,7 @@ async fn drain_fails_closed_on_a_malformed_record_location() {
     assert_eq!(start, topology::MergeStart::Started);
 
     // Corrupt the draining record's Location through the raw seam.
-    let mut raw = backend.inner().begin_write().await.expect("begin write");
+    let mut raw = backend.begin_write().await.expect("begin write");
     raw.put(
         Bytes::from(
             keys::location_key(manifest.logical_index_id(), &kept[0].0).expect("location key"),
@@ -2723,10 +2720,7 @@ async fn seeded_model_history_interleaving_mutations_splits_and_merges() {
             }
             // Inject one definite abort into the next commit.
             6 => {
-                backend
-                    .inner()
-                    .push_fault(CommitFault::Abort)
-                    .expect("fault");
+                backend.push_fault(CommitFault::Abort).expect("fault");
             }
             // Advance one random partition's split state.
             7..=8 => {
