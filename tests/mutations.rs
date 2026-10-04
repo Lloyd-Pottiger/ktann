@@ -1355,18 +1355,18 @@ async fn batched_deletes_read_membership_in_bounded_calls() {
     }
 }
 
-/// Decode failures in the Upsert subset retain the original batch position.
+/// Upsert and delete decode failures retain the original batch position.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn batch_upsert_corruption_keeps_input_position_and_rolls_back() {
+async fn batch_membership_corruption_keeps_input_position_and_rolls_back() {
     use ktann::storage::backend::WriteTxn;
     use ktann::storage::keys;
 
-    for corrupt_location in [false, true] {
+    for (delete, corrupt_location) in [(false, false), (false, true), (true, false), (true, true)] {
         let backend = backend(TestConfig::default());
         let runtime =
             Runtime::new(backend.clone(), support::manual_maintenance_config()).expect("runtime");
         let index = runtime
-            .create_index("corrupt-upsert", config())
+            .create_index("corrupt-mutation", config())
             .await
             .expect("index");
         index
@@ -1391,8 +1391,16 @@ async fn batch_upsert_corruption_keeps_input_position_and_rolls_back() {
         let error = index
             .batch_mutate(vec![
                 Mutation::Insert(record(&rid(3), 3.0, 1)),
-                Mutation::Upsert(record(&rid(1), 4.0, 1)),
-                Mutation::Upsert(record(&rid(2), 5.0, 1)),
+                if delete {
+                    Mutation::Delete(rid(1))
+                } else {
+                    Mutation::Upsert(record(&rid(1), 4.0, 1))
+                },
+                if delete {
+                    Mutation::Delete(rid(2))
+                } else {
+                    Mutation::Upsert(record(&rid(2), 5.0, 1))
+                },
             ])
             .await
             .expect_err("batch must fail closed");

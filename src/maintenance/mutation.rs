@@ -186,8 +186,8 @@ async fn apply_all<T: WriteTxn>(
         };
     drop(routing_timer);
     let prefetch_timer = metrics::mutation_stage_started(MutationStage::Prefetch);
-    let expected = read_locations(txn, mutations).await?;
-    prefetch_membership(txn, mutations, prepared, &targets, &expected).await;
+    let mut expected = read_locations(txn, mutations).await?;
+    prefetch_membership(txn, mutations, prepared, &targets, &mut expected).await;
     drop(prefetch_timer);
     let _apply_timer = metrics::mutation_stage_started(MutationStage::Apply);
     let mut deferred = txn.mutations();
@@ -207,7 +207,7 @@ async fn apply_all<T: WriteTxn>(
             txn,
             mutation,
             routed,
-            expected[position].as_ref(),
+            expected[position].take(),
             &mut writes,
             &mut changed_headers,
         )
@@ -375,7 +375,7 @@ async fn prefetch_membership<T: WriteTxn>(
     mutations: &[Mutation],
     prepared: &[Option<PreparedRecord>],
     targets: &[Option<RecordLocation>],
-    expected: &[Option<RecordLocation>],
+    expected: &mut [Option<RecordLocation>],
 ) {
     let mut items = Vec::with_capacity(mutations.len());
     for (position, mutation) in mutations.iter().enumerate() {
@@ -403,7 +403,17 @@ async fn prefetch_membership<T: WriteTxn>(
         };
         items.push(item);
     }
-    membership::prefetch_membership_for_update(txn, &items).await;
+    let locations = membership::prefetch_membership_for_update(txn, &items).await;
+    for (expected, location) in mutations
+        .iter()
+        .zip(expected)
+        .filter_map(|(mutation, expected)| {
+            matches!(mutation, Mutation::Delete(_)).then_some(expected)
+        })
+        .zip(locations)
+    {
+        *expected = location;
+    }
 }
 
 /// One insert-shaped prefetch item: the Record and Location existence checks,
@@ -433,7 +443,7 @@ async fn apply_one<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     mutation: &Mutation,
     routed: Option<(&PreparedRecord, &RecordLocation)>,
-    expected: Option<&RecordLocation>,
+    expected: Option<RecordLocation>,
     writes: &mut membership::WriteSinks<'_, '_>,
     changed_headers: &mut BTreeMap<(TreeKey, PartitionKey), PartitionHeader>,
 ) -> Result<MutationOutcome> {
@@ -454,7 +464,7 @@ async fn apply_one<T: WriteTxn>(
         }
         Mutation::Upsert(_) => {
             let (prepared, target) = routed.ok_or_else(|| Error::new(ErrorKind::Backend))?;
-            let (outcome, target_header) = match expected {
+            let (outcome, target_header) = match expected.as_ref() {
                 None => {
                     let header = membership::insert_record_with_header(
                         txn,
@@ -491,7 +501,7 @@ async fn apply_one<T: WriteTxn>(
             Ok(outcome)
         }
         Mutation::Delete(id) => {
-            let report = membership::delete_record_with_header(txn, writes, id).await?;
+            let report = membership::delete_record_with_header(txn, writes, id, expected).await?;
             let existed = match report {
                 membership::DeleteReport::Deleted { location, header } => {
                     record_header(changed_headers, &location, header);

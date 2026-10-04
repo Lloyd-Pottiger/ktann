@@ -944,6 +944,51 @@ async fn index_write_txn<'b, 'm>(
     )
 }
 
+/// Repeated cold keys must consume only one backend read slot per key,
+/// including absent keys and cached snapshot reads upgraded for update.
+#[tokio::test]
+async fn batch_reads_deduplicate_misses_and_preserve_positions() {
+    let backend = MemoryBackend::with_test_config(TestConfig {
+        max_batch_size: 2,
+        ..TestConfig::default()
+    });
+    let manifest = manifest();
+    seed_record(&backend, b"present").await;
+    let mut txn = index_write_txn(&backend, &manifest).await;
+    let keys = vec![
+        record_key(b"present"),
+        record_key(b"absent"),
+        record_key(b"present"),
+        record_key(b"absent"),
+        record_key(b"present"),
+    ];
+    let expected = vec![
+        Some(record(b"present")),
+        None,
+        Some(record(b"present")),
+        None,
+        Some(record(b"present")),
+    ];
+    assert_eq!(
+        txn.batch_get(keys.clone()).await.expect("two native keys"),
+        expected
+    );
+    assert_eq!(backend.operation_counts().batch_get, 1);
+    assert_eq!(
+        txn.batch_get_for_update(keys.clone())
+            .await
+            .expect("two conflict keys"),
+        expected,
+    );
+    assert_eq!(backend.operation_counts().batch_get_for_update, 1);
+    assert_eq!(
+        txn.batch_get_for_update(keys).await.expect("cached batch"),
+        expected
+    );
+    assert_eq!(backend.operation_counts().batch_get_for_update, 1);
+    txn.rollback().await;
+}
+
 #[tokio::test]
 async fn repeat_reads_reuse_the_transaction_cache() {
     let backend = MemoryBackend::new();
