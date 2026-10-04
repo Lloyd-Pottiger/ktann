@@ -102,14 +102,11 @@ Create reserves an ID and atomically inserts the name mapping and Active
 Manifest. ID gaps are valid. Drop transitions the Manifest to Dropping before
 deleting data; all ordinary operations update-protect and validate Active state.
 
-Offline refinement uses the existing Active Manifest and fixed Partition Keys;
-it adds no lifecycle state or ownership nonce. Bounded transactions preserve
-Record/Location/Leaf/payload membership and capacity constraints while relocating
-leaf records. Centroid replacement atomically updates the partition's centroid,
-incoming parent projection and parent Header cache epoch; internal means propagate bottom-up.
-This is a narrow offline exception to immutable serving centroids under caller
-exclusivity. A failed operation can leave a valid, partially refined Active index.
-See proposed ADR 0025.
+Offline refinement preserves the Active Manifest, Partition Keys and topology.
+Record relocation preserves exact membership, payloads and capacity constraints
+in bounded transactions. Centroid replacement atomically updates the centroid,
+incoming parent projection and parent Header cache epoch. The operation has no
+additional persistent lifecycle state.
 
 FoundationDB may atomically clear the complete data range and remove the
 Dropping Manifest. Without transactional range clear, core deletes bounded

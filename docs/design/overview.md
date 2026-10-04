@@ -46,8 +46,7 @@ their physical keyspaces are neither portable nor mutually compatible.
 - Online migration of schema, metric, dimension, Tree Key, quantizer, or
   persistent format.
 - Redis, durable maintenance jobs, repair on read, automatic repair, or
-  bulk-build generations. Offline refinement of a settled index is described
-  in proposed ADR 0025; it preserves topology and adds no lifecycle state.
+  bulk-build generations, or staging indexes.
 - Compatibility with any implementation predating the first stable format.
 
 ## 4. Authoritative invariants
@@ -76,8 +75,8 @@ their physical keyspaces are neither portable nor mutually compatible.
     Invalid caller input or non-finite caller-derived arithmetic is
     `InvalidArgument`.
 11. Centroids are immutable while serving. Caller-exclusive offline refinement
-    may replace a centroid only with its incoming parent projection and centroid
-    epoch atomically updated; it preserves Partition Keys and topology.
+    replaces its incoming parent projection and parent Header cache epoch
+    atomically; Partition Keys and topology remain fixed.
 
 ## 5. Architecture and ownership
 

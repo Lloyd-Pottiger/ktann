@@ -107,8 +107,7 @@ async fn ready_refinement_moves_membership_and_epochs_without_rewriting_records(
     let candidates = topology::read_leaf_drain_candidates(
         &mut txn,
         &fixture::tree_key(),
-        fixture::partition(2),
-        std::slice::from_ref(&id),
+        &[(fixture::partition(2), id.clone())],
     )
     .await
     .expect("candidates");
@@ -117,15 +116,9 @@ async fn ready_refinement_moves_membership_and_epochs_without_rewriting_records(
         fixture::partition(3),
     )];
     assert_eq!(
-        topology::relocate_leaf_entries(
-            &mut txn,
-            &fixture::tree_key(),
-            fixture::partition(2),
-            moves,
-            Movement::Refine
-        )
-        .await
-        .expect("move"),
+        topology::relocate_leaf_entries(&mut txn, &fixture::tree_key(), moves, Movement::Refine)
+            .await
+            .expect("move"),
         1
     );
     // Readers cannot observe the relocation before its one commit.
@@ -176,15 +169,13 @@ async fn aborted_refinement_leaves_ready_membership_unchanged() {
     let candidates = topology::read_leaf_drain_candidates(
         &mut txn,
         &fixture::tree_key(),
-        fixture::partition(2),
-        std::slice::from_ref(&id),
+        &[(fixture::partition(2), id.clone())],
     )
     .await
     .expect("candidates");
     topology::relocate_leaf_entries(
         &mut txn,
         &fixture::tree_key(),
-        fixture::partition(2),
         vec![(
             candidates.into_iter().next().expect("slot").expect("entry"),
             fixture::partition(3),
@@ -218,15 +209,13 @@ async fn refinement_rejects_a_move_back_into_its_source() {
     let candidates = topology::read_leaf_drain_candidates(
         &mut txn,
         &fixture::tree_key(),
-        fixture::partition(2),
-        &[id],
+        &[(fixture::partition(2), id)],
     )
     .await
     .expect("candidates");
     let error = topology::relocate_leaf_entries(
         &mut txn,
         &fixture::tree_key(),
-        fixture::partition(2),
         vec![(
             candidates.into_iter().next().expect("slot").expect("entry"),
             fixture::partition(2),
@@ -236,4 +225,100 @@ async fn refinement_rejects_a_move_back_into_its_source() {
     .await
     .expect_err("same leaf");
     assert_eq!(error.kind(), ErrorKind::Corruption);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refinement_exchanges_records_across_sources_in_one_batch() {
+    let (backend, manifest) = setup().await;
+    let steps = [
+        (2, 3, Bytes::from_static(&[b'r', 3])),
+        (3, 2, Bytes::from_static(&[b'r', 7])),
+    ];
+    let mut entries = Vec::new();
+    for (source, _, id) in &steps {
+        entries.push(
+            read(
+                &backend,
+                &manifest,
+                entry_key(&manifest, *source, id.clone()),
+            )
+            .await,
+        );
+    }
+    let parent = read(&backend, &manifest, header_key(&manifest, 1)).await;
+    let mut txn = WriteLogicalTxn::for_index(
+        backend.begin_write().await.expect("write"),
+        &manifest,
+        backend.hard_limits(),
+        backend.admission_budget(),
+    );
+    let candidates: Vec<_> = steps
+        .iter()
+        .map(|(source, _, id)| (fixture::partition(*source), id.clone()))
+        .collect();
+    let candidates =
+        topology::read_leaf_drain_candidates(&mut txn, &fixture::tree_key(), &candidates)
+            .await
+            .expect("candidates");
+    let moves = candidates
+        .into_iter()
+        .zip(&steps)
+        .map(|(candidate, (_, target, _))| {
+            (candidate.expect("candidate"), fixture::partition(*target))
+        })
+        .collect();
+    assert_eq!(
+        topology::relocate_leaf_entries(&mut txn, &fixture::tree_key(), moves, Movement::Refine)
+            .await
+            .expect("exchange"),
+        2
+    );
+    txn.commit().await.expect("commit exchange");
+    for ((source, target, id), entry) in steps.into_iter().zip(entries) {
+        assert_eq!(
+            read(
+                &backend,
+                &manifest,
+                entry_key(&manifest, source, id.clone())
+            )
+            .await,
+            None
+        );
+        assert_eq!(
+            read(
+                &backend,
+                &manifest,
+                entry_key(&manifest, target, id.clone())
+            )
+            .await,
+            entry
+        );
+        let Some(PersistentValue::RecordLocation(location)) = read(
+            &backend,
+            &manifest,
+            LogicalKey::Location {
+                index: manifest.logical_index_id(),
+                id,
+            },
+        )
+        .await
+        else {
+            panic!("location")
+        };
+        assert_eq!(location.leaf(), fixture::partition(target));
+    }
+    for partition in [2, 3] {
+        let Some(PersistentValue::PartitionHeader(header)) =
+            read(&backend, &manifest, header_key(&manifest, partition)).await
+        else {
+            panic!("header")
+        };
+        assert_eq!(header.entry_count(), 4);
+        assert_eq!(header.cache_epoch(), 2);
+        assert_eq!(header.state(), PartitionState::Ready);
+    }
+    assert_eq!(
+        read(&backend, &manifest, header_key(&manifest, 1)).await,
+        parent
+    );
 }

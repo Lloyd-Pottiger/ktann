@@ -76,13 +76,6 @@ otherwise idle host for performance comparisons.
 `--base-vectors N`, `--query-vectors N`, `--query-offset N`, and
 `--max-partition-entries N`. Resolved overrides are recorded in each report.
 
-`--leaf-beam-sweep 64,80,96,112,128` selects at least two strictly increasing,
-positive beam widths for a quality sweep. Use finer spacing around the target
-recall to compare measured operating points. `--measured-operations N` controls
-the operation count per point without changing warmup. Keep it at least as large
-as the query corpus to cover every query, and use the same count across timing
-comparisons. Both overrides are recorded in the resolved report configuration.
-
 These import options apply to `--profile large` or an explicitly selected
 `--scenario import-to-search-lifecycle`:
 

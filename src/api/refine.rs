@@ -9,13 +9,12 @@ use super::{Error, OperationOptions, Result};
 #[derive(Clone, Debug)]
 pub struct RefineOptions {
     pub(crate) rounds: usize,
-    pub(crate) neighbors: usize,
     pub(crate) input_bytes: usize,
     pub(crate) operation_options: OperationOptions,
 }
 
 impl RefineOptions {
-    /// Creates controls with two refinement rounds and 32 neighbor centroids.
+    /// Creates controls with two refinement rounds.
     /// `input_bytes` must be positive. Zero rounds refreshes centroids without moving records.
     pub fn new(input_bytes: usize) -> Result<Self> {
         if input_bytes == 0 {
@@ -23,7 +22,6 @@ impl RefineOptions {
         }
         Ok(Self {
             rounds: 2,
-            neighbors: 32,
             input_bytes,
             operation_options: OperationOptions::default(),
         })
@@ -38,14 +36,6 @@ impl RefineOptions {
         Ok(self)
     }
 
-    /// Selects one through 32 candidate neighbor centroids per leaf.
-    pub fn with_neighbor_centroids(mut self, neighbors: usize) -> Result<Self> {
-        if !(1..=32).contains(&neighbors) {
-            return Err(Error::invalid_argument());
-        }
-        self.neighbors = neighbors;
-        Ok(self)
-    }
     /// Sets deadline and cancellation control for the operation.
     #[must_use]
     pub fn with_operation_options(mut self, options: OperationOptions) -> Self {

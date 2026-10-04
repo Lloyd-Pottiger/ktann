@@ -1467,7 +1467,7 @@ async fn a_concurrent_drain_move_conflicts_with_a_foreground_delete() {
     // The drain's update-protected entry read conflicts with a concurrent
     // delete of the same record; the batch retries and skips the moved entry.
     let mut attempt = write_txn(&backend, &manifest).await;
-    let candidate = topology::read_leaf_drain_candidates(&mut attempt, &key, pk(1), &[rid(3)])
+    let candidate = topology::read_leaf_drain_candidates(&mut attempt, &key, &[(pk(1), rid(3))])
         .await
         .expect("read candidate")
         .into_iter()
@@ -1479,7 +1479,6 @@ async fn a_concurrent_drain_move_conflicts_with_a_foreground_delete() {
     topology::relocate_leaf_entries(
         &mut attempt,
         &key,
-        pk(1),
         vec![(candidate, pk(3))],
         topology::Movement::Split,
     )
@@ -2530,9 +2529,16 @@ async fn leaf_relocation_rejects_duplicate_and_existing_destinations() {
         } else {
             vec![rid(3), rid(3)]
         };
-        let candidates = topology::read_leaf_drain_candidates(&mut txn, &key, pk(1), &ids)
-            .await
-            .expect("read candidates");
+        let candidates = topology::read_leaf_drain_candidates(
+            &mut txn,
+            &key,
+            &ids.iter()
+                .cloned()
+                .map(|id| (pk(1), id))
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .expect("read candidates");
         if existing {
             // Uncommitted writes must be visible to the uniqueness check.
             txn.put(
@@ -2553,15 +2559,10 @@ async fn leaf_relocation_rejects_duplicate_and_existing_destinations() {
             .into_iter()
             .map(|entry| (entry.expect("candidate"), pk(3)))
             .collect();
-        let error = topology::relocate_leaf_entries(
-            &mut txn,
-            &key,
-            pk(1),
-            moves,
-            topology::Movement::Split,
-        )
-        .await
-        .expect_err("duplicate destination");
+        let error =
+            topology::relocate_leaf_entries(&mut txn, &key, moves, topology::Movement::Split)
+                .await
+                .expect_err("duplicate destination");
         assert_eq!(error.kind(), ErrorKind::Corruption);
         drop(txn);
         assert_searchable(&backend, &manifest, &key, &records).await;
@@ -2581,7 +2582,7 @@ async fn leaf_relocation_conflicts_with_a_concurrent_destination_insert() {
         .await
         .expect("expose");
     let mut attempt = write_txn(&backend, &manifest).await;
-    let candidate = topology::read_leaf_drain_candidates(&mut attempt, &key, pk(1), &[rid(3)])
+    let candidate = topology::read_leaf_drain_candidates(&mut attempt, &key, &[(pk(1), rid(3))])
         .await
         .expect("read candidate")
         .pop()
@@ -2591,7 +2592,6 @@ async fn leaf_relocation_conflicts_with_a_concurrent_destination_insert() {
     topology::relocate_leaf_entries(
         &mut attempt,
         &key,
-        pk(1),
         vec![(candidate, pk(3))],
         topology::Movement::Split,
     )

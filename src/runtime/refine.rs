@@ -36,6 +36,7 @@ struct Part {
 struct Tree {
     key: TreeKey,
     parts: Vec<Part>,
+    rounds: Vec<Vec<Move>>,
 }
 
 struct Loaded {
@@ -44,19 +45,11 @@ struct Loaded {
     vectors: Vec<Box<[f32]>>,
 }
 
-/// Accepted moves retain their greedy admission order across rounds.
+/// One accepted move; each round contains at most one move per record.
 struct Move {
-    tree: TreeKey,
     source: PartitionKey,
     target: PartitionKey,
     id: Bytes,
-}
-
-struct CentroidUpdate {
-    tree: TreeKey,
-    partition: PartitionKey,
-    parent: PartitionKey,
-    center: Box<[f32]>,
 }
 
 fn corrupt() -> Error {
@@ -158,11 +151,6 @@ async fn load<B: Backend>(
                         tree_key: key.clone(),
                         partition,
                     },
-                    LogicalKey::Centroid {
-                        index,
-                        tree_key: key.clone(),
-                        partition,
-                    },
                 ])
                 .await?
                 .into_iter();
@@ -180,15 +168,6 @@ async fn load<B: Backend>(
             if expected_level.is_some_and(|level| level != header.level()) {
                 return Err(corrupt());
             }
-            let center = match values.next() {
-                Some(Some(PersistentValue::PartitionCentroid(center))) if parent.is_some() => {
-                    center.components().into()
-                }
-                Some(None) if parent.is_none() => {
-                    vec![0.0; manifest.config().dimension()].into_boxed_slice()
-                }
-                _ => return Err(corrupt()),
-            };
             drop(txn);
             if header.entry_count() > manifest.config().max_partition_entries()
                 || (parent.is_some()
@@ -200,7 +179,7 @@ async fn load<B: Backend>(
                 key: partition,
                 parent,
                 level: header.level(),
-                center,
+                center: vec![0.0; manifest.config().dimension()].into_boxed_slice(),
                 members: Vec::new(),
                 children: Vec::new(),
             };
@@ -216,33 +195,20 @@ async fn load<B: Backend>(
                 let (items, next) = txn.scan(&range, cursor.as_ref(), PAGE).await?.into_parts();
                 if header.level() == 1 {
                     let mut entries = Vec::with_capacity(items.len());
-                    let mut keys = Vec::with_capacity(items.len() * 2);
                     for item in items {
                         let PersistentValue::LeafEntry(entry) = item.into_value() else {
                             return Err(corrupt());
                         };
-                        keys.push(LogicalKey::Record {
-                            index,
-                            id: entry.record_id().clone(),
-                        });
-                        keys.push(LogicalKey::Location {
-                            index,
-                            id: entry.record_id().clone(),
-                        });
                         entries.push(entry);
                     }
-                    let mut records = txn.batch_get(keys).await?.into_iter();
-                    for entry in entries {
-                        let Some(Some(PersistentValue::VectorRecord(record))) = records.next()
-                        else {
-                            return Err(corrupt());
-                        };
-                        let Some(Some(PersistentValue::RecordLocation(location))) = records.next()
-                        else {
-                            return Err(corrupt());
-                        };
-                        if record.record_id() != entry.record_id()
-                            || record.fields() != entry.fields()
+                    let ids = entries
+                        .iter()
+                        .map(|entry| entry.record_id().clone())
+                        .collect();
+                    let records = txn.read_record_groups(ids, false).await?;
+                    for (entry, group) in entries.into_iter().zip(records) {
+                        let (record, location, _) = group.ok_or_else(corrupt)?.into_parts();
+                        if record.fields() != entry.fields()
                             || location.tree_key() != &key
                             || location.leaf() != partition
                         {
@@ -285,7 +251,11 @@ async fn load<B: Backend>(
             parts.push(part);
         }
         parts.sort_by_key(|part| (part.level, part.key));
-        loaded.trees.push(Tree { key, parts });
+        loaded.trees.push(Tree {
+            key,
+            parts,
+            rounds: Vec::new(),
+        });
     }
     Ok(loaded)
 }
@@ -296,7 +266,7 @@ fn plan(
     manifest: &IndexManifest,
     options: &RefineOptions,
     checkpoint: &impl Fn() -> Result<()>,
-) -> Result<(Vec<Move>, Vec<CentroidUpdate>)> {
+) -> Result<Vec<Tree>> {
     let kernel = VectorKernel::new(
         manifest.config().dimension(),
         manifest.config().metric(),
@@ -306,8 +276,6 @@ fn plan(
         checkpoint()?;
         *vector = kernel.preprocess(vector)?;
     }
-    let mut moves = Vec::new();
-    let mut updates = Vec::new();
     for tree in &mut loaded.trees {
         let leaf_count = tree.parts.partition_point(|part| part.level == 1);
         // Recompute even unchanged leaf memberships: imported centroids may be stale.
@@ -322,7 +290,7 @@ fn plan(
                 )?;
             }
         }
-        for (position, source, target) in refine(
+        tree.rounds = refine(
             checkpoint,
             &kernel,
             &loaded.vectors,
@@ -330,14 +298,19 @@ fn plan(
             manifest.config().min_partition_entries() as usize,
             manifest.config().max_partition_entries() as usize,
             options,
-        )? {
-            moves.push(Move {
-                tree: tree.key.clone(),
-                source,
-                target,
-                id: loaded.ids[position].clone(),
-            });
-        }
+        )?
+        .into_iter()
+        .map(|round| {
+            round
+                .into_iter()
+                .map(|(position, source, target)| Move {
+                    source,
+                    target,
+                    id: loaded.ids[position].clone(),
+                })
+                .collect()
+        })
+        .collect();
         let positions: BTreeMap<_, _> = tree
             .parts
             .iter()
@@ -355,18 +328,13 @@ fn plan(
             )?;
             tree.parts[i].center = center;
         }
-        for part in tree.parts.drain(..) {
-            if let Some(parent) = part.parent {
-                updates.push(CentroidUpdate {
-                    tree: tree.key.clone(),
-                    partition: part.key,
-                    parent,
-                    center: part.center,
-                });
-            }
+        // Only final routing centers and ordered moves are needed during writes.
+        for part in &mut tree.parts {
+            part.members = Vec::new();
+            part.children = Vec::new();
         }
     }
-    Ok((moves, updates))
+    Ok(loaded.trees)
 }
 
 /// Refines an ordinary index using existing retry/commit boundaries.
@@ -379,7 +347,7 @@ pub(crate) async fn run<B: Backend>(
     context.checkpoint()?;
     let loaded = load(context, manifest, &options).await?;
     let planning_manifest = manifest.clone();
-    let (moves, updates) = controlled_compute(
+    let trees = controlled_compute(
         context.options.clone(),
         context.cpu_admission.clone().expect("refinement admission"),
         move |control| {
@@ -390,95 +358,82 @@ pub(crate) async fn run<B: Backend>(
     )
     .await?;
     let backend = context.backend();
-    let mut offset = 0;
-    let mut batch = 128;
-    while offset < moves.len() {
-        let end = (offset + batch).min(moves.len());
-        let prefix = &moves[offset..end];
-        let result = writes::run_write_attempts(
-            backend.as_ref(),
-            Some(context),
-            manifest,
-            &retry,
-            Operation::Refine,
-            |txn| {
-                Box::pin(async move {
-                    // Groups stay contiguous: a later round can move the same record again.
-                    let mut start = 0;
-                    while start < prefix.len() {
-                        let first = &prefix[start];
-                        let count = prefix[start..]
-                            .iter()
-                            .take_while(|step| {
-                                step.tree == first.tree && step.source == first.source
-                            })
-                            .count();
-                        let group = &prefix[start..start + count];
-                        let ids: Vec<_> = group.iter().map(|step| step.id.clone()).collect();
-                        let entries = topology::read_leaf_drain_candidates(
-                            txn,
-                            &first.tree,
-                            first.source,
-                            &ids,
-                        )
-                        .await?;
-                        let entries = entries
-                            .into_iter()
-                            .zip(group)
-                            .map(|(entry, step)| {
-                                entry.map(|entry| (entry, step.target)).ok_or_else(corrupt)
-                            })
-                            .collect::<Result<Vec<_>>>()?;
-                        topology::relocate_leaf_entries(
-                            txn,
-                            &first.tree,
-                            first.source,
-                            entries,
-                            topology::Movement::Refine,
-                        )
-                        .await?;
-                        start += count;
+    for tree in trees {
+        for round in &tree.rounds {
+            let mut offset = 0;
+            let mut batch = 128;
+            while offset < round.len() {
+                let end = (offset + batch).min(round.len());
+                let prefix = &round[offset..end];
+                let result = writes::run_write_attempts(
+                    backend.as_ref(),
+                    Some(context),
+                    manifest,
+                    &retry,
+                    Operation::Refine,
+                    |txn| {
+                        let key = &tree.key;
+                        Box::pin(async move {
+                            // One round moves each record at most once, so all sources
+                            // exist at the start of this transaction.
+                            let candidates: Vec<_> = prefix
+                                .iter()
+                                .map(|step| (step.source, step.id.clone()))
+                                .collect();
+                            let entries =
+                                topology::read_leaf_drain_candidates(txn, key, &candidates).await?;
+                            let moves = entries
+                                .into_iter()
+                                .zip(prefix)
+                                .map(|(entry, step)| Ok((entry.ok_or_else(corrupt)?, step.target)))
+                                .collect::<Result<Vec<_>>>()?;
+                            topology::relocate_leaf_entries(
+                                txn,
+                                key,
+                                moves,
+                                topology::Movement::Refine,
+                            )
+                            .await?;
+                            Ok(())
+                        })
+                    },
+                )
+                .await;
+                match result {
+                    Ok(()) => offset = end,
+                    Err(error)
+                        if batch > 1
+                            && matches!(
+                                error.kind(),
+                                ErrorKind::LimitExceeded | ErrorKind::TransactionTooLarge
+                            ) =>
+                    {
+                        batch = batch.div_ceil(2);
                     }
-                    Ok(())
-                })
-            },
-        )
-        .await;
-        match result {
-            Ok(()) => offset = end,
-            Err(error)
-                if batch > 1
-                    && matches!(
-                        error.kind(),
-                        ErrorKind::LimitExceeded | ErrorKind::TransactionTooLarge
-                    ) =>
-            {
-                batch = batch.div_ceil(2)
+                    Err(error) => return Err(error),
+                }
             }
-            Err(error) => return Err(error),
         }
-    }
-    for update in &updates {
-        writes::run_write_attempts(
-            backend.as_ref(),
-            Some(context),
-            manifest,
-            &retry,
-            Operation::Refine,
-            |txn| {
-                Box::pin(async move {
-                    topology::update_centroid(
-                        txn,
-                        &update.tree,
-                        update.partition,
-                        update.parent,
-                        update.center.clone(),
-                    )
-                    .await
-                })
-            },
-        )
-        .await?;
+        for part in &tree.parts {
+            let Some(parent) = part.parent else {
+                continue;
+            };
+            writes::run_write_attempts(
+                backend.as_ref(),
+                Some(context),
+                manifest,
+                &retry,
+                Operation::Refine,
+                |txn| {
+                    let key = &tree.key;
+                    Box::pin(async move {
+                        topology::update_centroid(txn, key, part.key, parent, part.center.clone())
+                            .await
+                    })
+                },
+            )
+            .await?;
+        }
     }
     Ok(())
 }
@@ -510,13 +465,14 @@ fn refine(
     minimum: usize,
     maximum: usize,
     options: &RefineOptions,
-) -> Result<Vec<(usize, PartitionKey, PartitionKey)>> {
-    let mut accepted = Vec::new();
+) -> Result<Vec<Vec<(usize, PartitionKey, PartitionKey)>>> {
+    let mut rounds = Vec::new();
     if leaves.len() < 2 {
-        return Ok(accepted);
+        return Ok(rounds);
     }
     for _ in 0..options.rounds {
         checkpoint()?;
+        let mut accepted = Vec::new();
         let mut moves = Vec::new();
         for (source, leaf) in leaves.iter().enumerate() {
             checkpoint()?;
@@ -550,9 +506,9 @@ fn refine(
             let compare = |left: &(f64, usize), right: &(f64, usize)| {
                 left.0.total_cmp(&right.0).then(left.1.cmp(&right.1))
             };
-            if distances.len() > options.neighbors {
-                distances.select_nth_unstable_by(options.neighbors, compare);
-                distances.truncate(options.neighbors);
+            if distances.len() > 32 {
+                distances.select_nth_unstable_by(32, compare);
+                distances.truncate(32);
             }
             distances.sort_unstable_by(compare);
             for &position in &leaf.members {
@@ -597,6 +553,7 @@ fn refine(
         if targets.is_empty() {
             break;
         }
+        rounds.push(accepted);
         let mut members = vec![Vec::new(); leaves.len()];
         for (source, leaf) in leaves.iter().enumerate() {
             for &position in &leaf.members {
@@ -612,7 +569,7 @@ fn refine(
             leaf.members = members;
         }
     }
-    Ok(accepted)
+    Ok(rounds)
 }
 
 /// Keeps heavy CPU work off Tokio and cancels it when its owning future drops.
@@ -685,35 +642,29 @@ mod tests {
             })
             .collect();
         // Exchange one member between adjacent clusters. The ninth leaf is
-        // unchanged and exercises the centroid batch tail. Varying the neighbor
-        // count covers both partial selection and a partial distance batch.
-        for neighbor_count in [2, 4, 5, 8, 32] {
-            let mut leaves: Vec<_> = (0..9)
-                .map(|cluster| Part {
-                    parent: None,
-                    children: vec![],
-                    key: PartitionKey::new(cluster as u64 + 2).unwrap(),
-                    level: 1,
-                    members: (cluster * 3..cluster * 3 + 3).collect(),
-                    center: vec![cluster as f32 * 10.0].into(),
-                })
-                .collect();
-            for pair in leaves[..8].as_chunks_mut::<2>().0 {
-                let (left, right) = pair.split_at_mut(1);
-                std::mem::swap(&mut left[0].members[2], &mut right[0].members[2]);
-            }
-            let options = RefineOptions::new(4096)
-                .unwrap()
-                .with_neighbor_centroids(neighbor_count)
-                .unwrap();
-            refine(&|| Ok(()), &kernel, &vectors, &mut leaves, 1, 5, &options).unwrap();
-            for (cluster, leaf) in leaves.iter().enumerate() {
-                assert_eq!(
-                    leaf.members,
-                    (cluster * 3..cluster * 3 + 3).collect::<Vec<_>>(),
-                    "neighbors={neighbor_count}, cluster={cluster}"
-                );
-            }
+        // unchanged and exercises the centroid and candidate batch tails.
+        let mut leaves: Vec<_> = (0..9)
+            .map(|cluster| Part {
+                parent: None,
+                children: vec![],
+                key: PartitionKey::new(cluster as u64 + 2).unwrap(),
+                level: 1,
+                members: (cluster * 3..cluster * 3 + 3).collect(),
+                center: vec![cluster as f32 * 10.0].into(),
+            })
+            .collect();
+        for pair in leaves[..8].as_chunks_mut::<2>().0 {
+            let (left, right) = pair.split_at_mut(1);
+            std::mem::swap(&mut left[0].members[2], &mut right[0].members[2]);
+        }
+        let options = RefineOptions::new(4096).unwrap();
+        refine(&|| Ok(()), &kernel, &vectors, &mut leaves, 1, 5, &options).unwrap();
+        for (cluster, leaf) in leaves.iter().enumerate() {
+            assert_eq!(
+                leaf.members,
+                (cluster * 3..cluster * 3 + 3).collect::<Vec<_>>(),
+                "cluster={cluster}"
+            );
         }
     }
 

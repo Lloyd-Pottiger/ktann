@@ -16,3 +16,4 @@ rustc-ice-*.txt
 refwiki/
 /AGENTS.override.md
 /.benchmark-data/
+/docs/research/

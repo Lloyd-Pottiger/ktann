@@ -138,7 +138,7 @@ A process-local scheduler that submits ordinary batch Foreground Mutations in bo
 _Avoid_: Bulk-build generation, atomic whole-import transaction
 
 **Offline Refinement**:
-A caller-exclusive preparation operation on an existing Active Logical Index after ordinary Import Session completion and settled Ready topology, before serving. It relocates existing leaf membership under capacity constraints and recomputes centroids, incoming parent projections and parent Header cache epochs in bounded atomic transactions. Partition Keys and topology stay fixed. Errors can leave a partially refined valid index; there is no publication lifecycle or resume protocol.
+A caller-exclusive preparation operation on a settled Active Logical Index before serving. It improves leaf assignments and centroids under capacity constraints while preserving Partition Keys, topology and exact membership. Errors can leave a valid, partially refined index.
 _Avoid_: Bulk Construction, Building Index, atomic whole-operation refinement
 
 **Import Admission**:

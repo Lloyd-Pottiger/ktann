@@ -78,8 +78,6 @@ struct ExecutionOptions {
     query_vectors: Option<usize>,
     query_offset: Option<usize>,
     max_partition_entries: Option<u32>,
-    leaf_beam_sweep: Option<Vec<u32>>,
-    measured_operations: Option<usize>,
     lifecycle: LifecycleOverrides,
 }
 
@@ -119,14 +117,6 @@ impl ExecutionOptions {
                 .get("max-partition-entries")
                 .map(|value| parse_positive_u32(value, "max-partition-entries"))
                 .transpose()?,
-            leaf_beam_sweep: values
-                .get("leaf-beam-sweep")
-                .map(|value| parse_beam_sweep(value))
-                .transpose()?,
-            measured_operations: values
-                .get("measured-operations")
-                .map(|value| parse_positive(value, "measured-operations"))
-                .transpose()?,
             lifecycle: LifecycleOverrides::parse(values)?,
         })
     }
@@ -143,27 +133,11 @@ const SCENARIO_OPTIONS: &[&str] = &[
     "query-vectors",
     "query-offset",
     "max-partition-entries",
-    "leaf-beam-sweep",
-    "measured-operations",
     "maintenance-workers",
     "import-max-in-flight-batches",
     "import-batch-size",
     "import-backlog-watermark",
 ];
-
-/// Parses an increasing curve so every point is unambiguous in comparisons.
-fn parse_beam_sweep(value: &str) -> Result<Vec<u32>, String> {
-    let beams = value
-        .split(',')
-        .map(|item| parse_positive_u32(item, "leaf-beam-sweep"))
-        .collect::<Result<Vec<_>, _>>()?;
-    if beams.len() < 2 || beams.windows(2).any(|pair| pair[0] >= pair[1]) {
-        return Err(
-            "--leaf-beam-sweep requires at least two increasing positive widths".to_owned(),
-        );
-    }
-    Ok(beams)
-}
 
 /// Optional diagnostic bounds applied to the selected scenario.
 #[derive(Clone, Debug, Default)]
@@ -452,20 +426,6 @@ fn run_suite(options: RunOptions) -> Result<(), String> {
                 option_string(options.execution.max_partition_entries),
             ),
             (
-                "leaf-beam-sweep",
-                options.execution.leaf_beam_sweep.as_ref().map(|beams| {
-                    beams
-                        .iter()
-                        .map(u32::to_string)
-                        .collect::<Vec<_>>()
-                        .join(",")
-                }),
-            ),
-            (
-                "measured-operations",
-                option_string(options.execution.measured_operations),
-            ),
-            (
                 "maintenance-workers",
                 option_string(lifecycle.maintenance_workers),
             ),
@@ -531,15 +491,6 @@ fn run_worker(options: WorkerOptions) -> Result<(), String> {
     }
     if let Some(max_partition_entries) = options.execution.max_partition_entries {
         scenario.max_partition_entries = max_partition_entries;
-    }
-    if let Some(beams) = &options.execution.leaf_beam_sweep {
-        if scenario.leaf_beam_sweep.is_empty() {
-            return Err("--leaf-beam-sweep requires a quality-sweep scenario".to_owned());
-        }
-        scenario.leaf_beam_sweep.clone_from(beams);
-    }
-    if let Some(operations) = options.execution.measured_operations {
-        scenario.measured_operations = operations;
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(options.execution.worker_threads)
@@ -836,45 +787,12 @@ fn shell_quote(value: &OsStr) -> String {
 
 /// Returns the stable help shown for missing or unknown public commands.
 fn usage() -> String {
-    "usage:\n  ktann-bench run --backend rocksdb|foundationdb [--profile smoke|full|large] [--scenario NAME] [--worker-threads N] [--write-beam-size N] [--refinement-rounds 0..5] [--base-vectors N] [--query-vectors N] [--query-offset N] [--max-partition-entries N] [--leaf-beam-sweep N,N,...] [--measured-operations N] [--maintenance-workers N] [--import-max-in-flight-batches N] [--import-batch-size N] [--import-backlog-watermark N] [--output PATH]\n  ktann-bench compare --baseline PATH --candidate PATH [--maximum-relative-regression N] [--maximum-recall-drop N] [--maximum-rejection-rate-increase N] [--output PATH]".to_owned()
+    "usage:\n  ktann-bench run --backend rocksdb|foundationdb [--profile smoke|full|large] [--scenario NAME] [--worker-threads N] [--write-beam-size N] [--refinement-rounds 0..5] [--base-vectors N] [--query-vectors N] [--query-offset N] [--max-partition-entries N] [--maintenance-workers N] [--import-max-in-flight-batches N] [--import-batch-size N] [--import-backlog-watermark N] [--output PATH]\n  ktann-bench compare --baseline PATH --candidate PATH [--maximum-relative-regression N] [--maximum-recall-drop N] [--maximum-rejection-rate-increase N] [--output PATH]".to_owned()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        option_map, parse_beam_sweep, parse_compare_options, parse_run_options, shell_quote,
-    };
-
-    #[test]
-    fn quality_sweep_widths_are_positive_unique_and_increasing() {
-        assert_eq!(parse_beam_sweep("64,80,96,128").unwrap(), [64, 80, 96, 128]);
-        for invalid in ["", "0,1", "1", "1,1", "2,1", "1,", "1,x", "1,4294967296"] {
-            assert!(parse_beam_sweep(invalid).is_err(), "{invalid}");
-        }
-    }
-
-    #[test]
-    fn quality_measurement_overrides_are_parsed() {
-        let arguments = [
-            "--backend",
-            "rocksdb",
-            "--profile",
-            "large",
-            "--scenario",
-            "quality-cohere-1m",
-            "--leaf-beam-sweep",
-            "96,100,104",
-            "--measured-operations",
-            "10000",
-        ]
-        .map(std::ffi::OsString::from);
-        let options = parse_run_options(&arguments).expect("quality overrides");
-        assert_eq!(options.execution.leaf_beam_sweep, Some(vec![96, 100, 104]));
-        assert_eq!(options.execution.measured_operations, Some(10000));
-        let mut invalid = arguments;
-        invalid[9] = "0".into();
-        assert!(parse_run_options(&invalid).is_err());
-    }
+    use super::{option_map, parse_compare_options, parse_run_options, shell_quote};
 
     #[test]
     fn offline_refinement_option_accepts_zero_rounds() {

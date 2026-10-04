@@ -436,8 +436,9 @@ async fn drain_attempt<T: WriteTxn>(
     );
     let moved = match &plan.batch {
         DrainBatch::Leaf(record_ids) => {
+            let candidates: Vec<_> = record_ids.iter().cloned().map(|id| (source, id)).collect();
             let candidates =
-                topology::read_leaf_drain_candidates(txn, tree_key, source, record_ids).await?;
+                topology::read_leaf_drain_candidates(txn, tree_key, &candidates).await?;
             let mut moves = Vec::new();
             for candidate in candidates.into_iter().flatten() {
                 // A `None` slot is a concurrently removed entry: skipped.
@@ -456,8 +457,7 @@ async fn drain_attempt<T: WriteTxn>(
                 )?;
                 moves.push((candidate, target));
             }
-            topology::relocate_leaf_entries(txn, tree_key, source, moves, topology::Movement::Split)
-                .await?
+            topology::relocate_leaf_entries(txn, tree_key, moves, topology::Movement::Split).await?
         }
         DrainBatch::Child(children) => {
             let candidates =

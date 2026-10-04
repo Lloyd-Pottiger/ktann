@@ -1315,24 +1315,19 @@ async fn a_concurrent_delete_conflicts_with_a_drain_batch_and_the_retry_skips_it
         .expect("a first entry")
         .clone();
     let mut attempt = write_txn(&backend, &manifest).await;
-    let candidate = topology::read_leaf_drain_candidates(
-        &mut attempt,
-        &key,
-        source,
-        std::slice::from_ref(&victim),
-    )
-    .await
-    .expect("read candidate")
-    .into_iter()
-    .next()
-    .expect("one slot")
-    .expect("candidate exists");
+    let candidate =
+        topology::read_leaf_drain_candidates(&mut attempt, &key, &[(source, victim.clone())])
+            .await
+            .expect("read candidate")
+            .into_iter()
+            .next()
+            .expect("one slot")
+            .expect("candidate exists");
     assert!(index.delete(victim.clone()).await.expect("delete"));
     records.retain(|(id, _)| id != &victim);
     topology::relocate_leaf_entries(
         &mut attempt,
         &key,
-        source,
         vec![(candidate, target)],
         topology::Movement::Merge,
     )
@@ -1406,8 +1401,11 @@ async fn a_concurrent_target_transition_aborts_the_relocate_and_the_next_batch_r
     let candidate = topology::read_leaf_drain_candidates(
         &mut attempt,
         &key,
-        pk(3),
-        std::slice::from_ref(&kept[0].0),
+        &(std::slice::from_ref(&kept[0].0))
+            .iter()
+            .cloned()
+            .map(|id| (pk(3), id))
+            .collect::<Vec<_>>(),
     )
     .await
     .expect("read candidate")
@@ -1418,7 +1416,6 @@ async fn a_concurrent_target_transition_aborts_the_relocate_and_the_next_batch_r
     topology::relocate_leaf_entries(
         &mut attempt,
         &key,
-        pk(3),
         vec![(candidate, split_target)],
         topology::Movement::Merge,
     )

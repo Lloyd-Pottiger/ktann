@@ -55,28 +55,24 @@ Create is idempotent for the same name and configuration after an unknown commit
 outcome. Open rejects a Dropping index, unsupported format, backend mismatch, or
 configuration mismatch. Drop is idempotent and follows the storage lifecycle.
 
-`Index::refine(options)` is an offline preparation operation on an existing
-Active index after ordinary Import Session completion and settled Ready topology,
-before serving. The caller must ensure that no other operations are in flight or
-begin on this index, including maintenance from other runtimes, until it returns.
-Local queued or running fixups and non-Ready topology are rejected. Runtime workers
-may remain idle; closing and reopening Runtime is unnecessary.
+`Index::refine(options)` prepares an existing Active index after ordinary import
+and settled Ready topology, before serving. The caller must exclude all other
+index operations, including maintenance from other runtimes, until it returns.
+Local queued or running fixups and non-Ready topology are rejected; idle Runtime
+workers may remain running.
 
-`RefineOptions::new(input_bytes)` requires a positive resident input byte limit;
-it defaults to two refinement rounds and 32 neighbor centroids. Builders accept
-`with_refinement_rounds(0..=5)`, `with_neighbor_centroids(1..=32)`, and
-`with_operation_options(OperationOptions)`. The input limit bounds loaded vectors,
-IDs, centroids and topology representation; numerical workspace and move lists
-add memory. Zero rounds recomputes centroids without relocating records.
+`RefineOptions::new(input_bytes)` requires a positive input byte limit and defaults
+to two rounds. Builders accept `with_refinement_rounds(0..=5)` and
+`with_operation_options(OperationOptions)`. The limit covers loaded vectors, IDs,
+centroids and topology; numerical workspace and move lists require additional
+memory. Zero rounds refreshes centroids without relocating records.
 
-Refinement preserves Partition Keys and topology, relocates existing leaf records
-under capacity constraints in bounded atomic transactions, and recomputes leaf and
-internal centroids with their incoming parent projections and centroid epochs.
-Each committed state preserves exact record membership and searchable projections.
-There is no new lifecycle state, construction owner nonce, publication transaction,
-or whole-operation rollback. Cancellation, errors or unknown commit outcomes can
-leave a partially refined valid index; the caller may drop and rebuild it. The
-operation offers no resume protocol. See proposed ADR 0025.
+Refinement preserves Partition Keys and topology. Bounded atomic transactions
+relocate records within capacity constraints and update centroids with their
+incoming parent projections and parent Header cache epochs. Every commit preserves
+exact membership and searchable projections. Cancellation, errors or unknown
+commit outcomes can leave a valid, partially refined index. There is no
+whole-operation rollback or resume protocol; the caller may drop and rebuild it.
 
 ## 2. Records and mutations
 

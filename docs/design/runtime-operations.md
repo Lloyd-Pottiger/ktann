@@ -129,18 +129,12 @@ whole-import result.
 its complete contract, while process-local or cluster-wide topology convergence
 remains demand-driven and separately observable.
 
-Offline `Index::refine` runs after ordinary import and settled Ready topology
-(proposed ADR 0025). The caller excludes all other index operations and
-other-runtime maintenance for the full operation. Admission rejects existing
-local queued or running fixups, and planning rejects non-Ready topology. Idle
-Runtime workers can remain running without a new pause or reopen protocol.
-
-Numerical planning is cooperatively cancelled; bounded apply transactions move
-exact leaf membership and update centroid/projection/epoch groups atomically.
-Existing Partition Keys and topology remain fixed. Cancellation and unknown commit
-outcomes may leave a partially refined valid index. There is no operation-wide
-atomicity, publication audit or resume lifecycle; the caller can drop and rebuild
-when required. `Index::verify` retains its single-snapshot contract.
+Offline `Index::refine` requires caller-exclusive access and settled Ready topology
+as specified in [the API contract](api.md). Admission rejects local queued or
+running fixups. Numerical planning runs off the async executor, remains
+cooperatively cancellable, and retains foreground admission until CPU work ends.
+Apply uses ordinary bounded write attempts; cancellation or an unknown commit
+outcome can leave a valid, partially refined index.
 
 ## 5. Metrics, tracing, and privacy
 
