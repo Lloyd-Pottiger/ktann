@@ -5,7 +5,7 @@ use ktann::api::{ErrorKind, PartitionKey};
 use ktann::maintenance::routing::{
     Route, route_leaf, route_leaf_for_write, route_leaf_for_write_with_beam,
 };
-use ktann::storage::backend::{Backend, WriteTxn};
+use ktann::storage::backend::{Backend, ReadOps, WriteTxn};
 use ktann::storage::keys::{self, LogicalKey, TreeKey};
 use ktann::storage::tree_manifest;
 use ktann::storage::values::{
@@ -190,12 +190,16 @@ async fn invalid_vectors_are_rejected_before_the_tree_is_created() {
     let manifest = manifest();
     let key = tree_key(1);
 
-    let mut txn = write_txn(&backend, &manifest).await;
-    let error = route_leaf_for_write(&mut txn, &key, &[1.0, 2.0], 100)
-        .await
-        .expect_err("wrong dimension");
-    assert_eq!(error.kind(), ErrorKind::InvalidArgument);
-    txn.rollback().await;
+    for beam in [1, 4] {
+        for vector in [&[1.0, 2.0][..], &[f32::NAN], &[f32::INFINITY]] {
+            let mut txn = write_txn(&backend, &manifest).await;
+            let error = route_leaf_for_write_with_beam(&mut txn, &key, vector, 100, beam)
+                .await
+                .expect_err("invalid routing vector");
+            assert_eq!(error.kind(), ErrorKind::InvalidArgument);
+            txn.rollback().await;
+        }
+    }
 
     // Validation precedes storage work, so no tree exists afterwards either.
     let route = route_leaf(&mut read_txn(&backend, &manifest).await, &key, &[1.0])
@@ -382,6 +386,92 @@ async fn write_beam_is_global_across_parents_at_each_level() {
         .expect("beam write route");
     assert_eq!(beam_route.leaf(), pk(34));
     beam.rollback().await;
+}
+
+/// Reusing a split-family distance must not turn the beam's existing
+/// candidate multiset into a set and thereby admit an additional branch.
+#[tokio::test]
+async fn split_family_distance_reuse_preserves_beam_multiplicity() {
+    let backend = MemoryBackend::new();
+    let manifest = manifest();
+    let key = tree_key(1);
+    create_committed_tree(&backend, &manifest, &key).await;
+    let mut values = vec![
+        (header_key_at(&key, pk(1)), header(4, 3)),
+        (edge_key_at(&key, pk(1), pk(2)), edge(pk(2), 0.0)),
+        (edge_key_at(&key, pk(1), pk(3)), edge(pk(3), 1.0)),
+        (edge_key_at(&key, pk(1), pk(8)), edge(pk(8), 2.0)),
+    ];
+    for (partition, count, state) in [
+        (
+            2,
+            2,
+            PartitionTransition::DrainingSplit {
+                left: pk(3),
+                right: pk(8),
+                started_at_unix_millis: 0,
+            },
+        ),
+        (
+            3,
+            1,
+            PartitionTransition::ReceivingSplit {
+                source: pk(2),
+                started_at_unix_millis: 0,
+            },
+        ),
+        (
+            8,
+            0,
+            PartitionTransition::ReceivingSplit {
+                source: pk(2),
+                started_at_unix_millis: 0,
+            },
+        ),
+    ] {
+        values.push((
+            header_key_at(&key, pk(partition)),
+            PersistentValue::PartitionHeader(
+                PartitionHeader::new(3, count, 0, state.state()).expect("header"),
+            ),
+        ));
+        values.push((
+            state_key_at(&key, pk(partition)),
+            PersistentValue::PartitionState(state),
+        ));
+    }
+    for (parent, child, leaf, centroid, leaf_centroid) in [
+        (2, 4, 10, 0.0, 100.0),
+        (2, 5, 11, 1.0, 101.0),
+        (3, 6, 12, 2.0, 0.0),
+    ] {
+        values.extend([
+            (
+                edge_key_at(&key, pk(parent), pk(child)),
+                edge(pk(child), centroid),
+            ),
+            (header_key_at(&key, pk(child)), header(2, 1)),
+            (state_key_at(&key, pk(child)), ready_state()),
+            (
+                edge_key_at(&key, pk(child), pk(leaf)),
+                edge(pk(leaf), leaf_centroid),
+            ),
+            (header_key_at(&key, pk(leaf)), header(1, 0)),
+            (state_key_at(&key, pk(leaf)), ready_state()),
+        ]);
+    }
+    write_topology(&backend, &manifest, values).await;
+
+    // The root beam retains source 2 and target 3. Both resolve the same
+    // family, so level two retains [4, 4, 5, 5]. Removing multiplicity would
+    // admit child 6 and incorrectly change this route to its nearer leaf 12.
+    let mut txn = write_txn(&backend, &manifest).await;
+    let route = route_leaf_for_write_with_beam(&mut txn, &key, &[0.0], 200, 8)
+        .await
+        .expect("route through overlapping split family");
+    assert_eq!(route.leaf(), pk(10));
+    assert_eq!(route.parent(), Some(pk(4)));
+    txn.rollback().await;
 }
 
 #[tokio::test]
@@ -923,6 +1013,40 @@ async fn malformed_child_entry_bytes_are_corruption() {
         .await
         .expect_err("garbage child entry");
     assert_eq!(error.kind(), ErrorKind::Corruption);
+}
+
+#[tokio::test]
+async fn grouped_write_routing_rejects_nonfinite_child_centroids() {
+    let backend = MemoryBackend::new();
+    let manifest = manifest();
+    let key = tree_key(1);
+    seed_grown_root(&backend, &manifest, &key).await;
+    let entry_key = Bytes::from(keys::child_entry_key(id(7), &key, pk(1), pk(2)));
+
+    for component in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        // Keep the entry's structure valid but corrupt its sole centroid
+        // component, so the decode boundary must reject it before scoring.
+        let mut raw = backend.begin_write().await.expect("begin write");
+        let mut encoded = raw
+            .get(entry_key.clone())
+            .await
+            .expect("read entry")
+            .expect("entry exists")
+            .to_vec();
+        let offset = encoded.len() - size_of::<f32>();
+        encoded[offset..].copy_from_slice(&component.to_bits().to_be_bytes());
+        raw.put(entry_key.clone(), Bytes::from(encoded))
+            .await
+            .expect("corrupt entry");
+        raw.commit().await.expect("commit corruption");
+
+        let mut txn = write_txn(&backend, &manifest).await;
+        let error = route_leaf_for_write_with_beam(&mut txn, &key, &[1.0], 100, 4)
+            .await
+            .expect_err("nonfinite centroid");
+        assert_eq!(error.kind(), ErrorKind::Corruption);
+        txn.rollback().await;
+    }
 }
 
 #[tokio::test]
