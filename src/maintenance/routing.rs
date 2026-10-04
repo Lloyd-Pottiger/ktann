@@ -643,11 +643,11 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
         let mut child_level = None;
         // Every Child Entry body the wave's resolved hops ask for, collected
         // during resolution and then scanned in batched lockstep rounds, so
-        // one level's bodies share each backend round trip. `scan_members`
-        // holds the waiting beam members of one resolved hop per slot, and
-        // `body_slots` maps each collected body back to its hop's slot.
-        let mut bodies: Vec<(PartitionKey, PartitionHeader)> = Vec::new();
-        let mut body_slots: Vec<usize> = Vec::new();
+        // one level's bodies share each backend round trip. Split-family
+        // hops can overlap: each body retains all requesting hop slots but
+        // is scanned only once. Members stay grouped by hop without copying
+        // their vectors or changing the candidates contributed by each path.
+        let mut bodies: BTreeMap<PartitionKey, (PartitionHeader, Vec<usize>)> = BTreeMap::new();
         let mut scan_members: Vec<Vec<PendingBeamMember>> = Vec::new();
         // Read the complete current wave before doing any routing work. This
         // keeps authority reads proportional to tree depth, while the
@@ -753,8 +753,13 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                     // collected body of the level in batched lockstep rounds.
                     let slot = scan_members.len();
                     scan_members.push(members);
-                    body_slots.extend(std::iter::repeat_n(slot, hop_bodies.len()));
-                    bodies.extend(hop_bodies);
+                    for (partition, header) in hop_bodies {
+                        bodies
+                            .entry(partition)
+                            .or_insert_with(|| (header, Vec::new()))
+                            .1
+                            .push(slot);
+                    }
                     debug_assert!(
                         expected_level.is_none_or(|level| level > next_level),
                         "child level must descend"
@@ -806,6 +811,10 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
         // is scanned in batched lockstep rounds, feeding the shared per-vector
         // beams and the dual-ownership check exactly as a sequential scan did.
         if !bodies.is_empty() {
+            let (bodies, body_slots): (Vec<_>, Vec<_>) = bodies
+                .into_iter()
+                .map(|(partition, (header, slots))| ((partition, header), slots))
+                .unzip();
             let nearest = nearest
                 .as_mut()
                 .ok_or_else(|| Error::new(ErrorKind::Backend))?;
@@ -825,19 +834,21 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                     }
                     // Independent records share the centroid while each distance
                     // retains its format-defined scalar accumulation order.
-                    let (groups, remainder) = scan_members[body_slots[index]].as_chunks::<4>();
-                    for group in groups {
-                        let vectors =
-                            std::array::from_fn::<_, 4, _>(|lane| routings[group[lane].member]);
-                        let distances = kernel.routing_distances(vectors, entry.centroid())?;
-                        for (member, distance) in group.iter().zip(distances) {
+                    for &slot in &body_slots[index] {
+                        let (groups, remainder) = scan_members[slot].as_chunks::<4>();
+                        for group in groups {
+                            let vectors =
+                                std::array::from_fn::<_, 4, _>(|lane| routings[group[lane].member]);
+                            let distances = kernel.routing_distances(vectors, entry.centroid())?;
+                            for (member, distance) in group.iter().zip(distances) {
+                                nearest[member.member].consider(distance, entry, body);
+                            }
+                        }
+                        for member in remainder {
+                            let distance = kernel
+                                .routing_distance(routings[member.member], entry.centroid())?;
                             nearest[member.member].consider(distance, entry, body);
                         }
-                    }
-                    for member in remainder {
-                        let distance =
-                            kernel.routing_distance(routings[member.member], entry.centroid())?;
-                        nearest[member.member].consider(distance, entry, body);
                     }
                     Ok(())
                 },
