@@ -96,6 +96,10 @@ otherwise idle host for performance comparisons.
 
 ### Diagnostic options
 
+See [million-vector residency diagnostics](search-production.md) for measured
+CPU saturation on SIFT1M, Cohere warmup drift, and the distinction between
+Partition Cache residency and raw-vector backend cache residency.
+
 `--write-beam-size N` overrides the write routing beam. Large runs also accept
 `--base-vectors N`, `--query-vectors N`, `--query-offset N`, and
 `--max-partition-entries N`. Resolved overrides are recorded in each report.
