@@ -1,7 +1,7 @@
 use std::fmt;
 
 use bytes::Bytes;
-use foundationdb::options::StreamingMode;
+use foundationdb::options::{StreamingMode, TransactionOption};
 use foundationdb::{Database, FdbError, RangeOption, Transaction};
 use futures_util::TryStreamExt;
 use futures_util::future::try_join_all;
@@ -178,6 +178,11 @@ impl Backend for FoundationDbBackend {
 
     async fn begin_read(&self) -> Result<FoundationDbReadTxn<'_>> {
         let transaction = self.begin_transaction().await?;
+        // ReadTxn cannot mutate; avoid native read-your-writes bookkeeping.
+        // The read version is pinned, but no key reads have started yet.
+        transaction
+            .set_option(TransactionOption::ReadYourWritesDisable)
+            .map_err(map_operation_error)?;
         Ok(FoundationDbReadTxn {
             transaction,
             prefix: &self.prefix,
@@ -418,16 +423,122 @@ async fn batch_get(
             .iter()
             .map(|key| prefix.encode_key(key))
             .collect::<Result<Vec<_>>>()?;
-        let reads = keys
+        // Keep native point futures small when no range coalescing applies,
+        // especially on the update-protected path used by foreground writes.
+        if !mode.is_snapshot()
+            || !keys
+                .windows(2)
+                .any(|pair| consecutive_keys(&pair[0], &pair[1]))
+        {
+            let reads = keys
+                .iter()
+                .map(|key| transaction.get(key, mode.is_snapshot()));
+            values.extend(
+                try_join_all(reads)
+                    .await
+                    .map_err(map_operation_error)?
+                    .into_iter()
+                    .map(|value| value.map(Bytes::from_owner)),
+            );
+            continue;
+        }
+        let mut remaining = keys.as_slice();
+        let reads = std::iter::from_fn(|| {
+            let first = remaining.first()?;
+            let count = if remaining
+                .get(1)
+                .is_some_and(|second| consecutive_keys(first, second))
+            {
+                2
+            } else {
+                1
+            };
+            let (part, rest) = remaining.split_at(count);
+            remaining = rest;
+            Some(async move {
+                if part.len() == 2 {
+                    read_snapshot_pair(transaction, &part[0], &part[1])
+                        .await
+                        .map(|values| (values, 2))
+                } else {
+                    let value = transaction
+                        .get(&part[0], true)
+                        .await
+                        .map_err(map_operation_error)?;
+                    Ok(([value.map(Bytes::from_owner), None], 1))
+                }
+            })
+        });
+        for (part, count) in try_join_all(reads).await? {
+            values.extend(part.into_iter().take(count));
+        }
+    }
+    Ok(values)
+}
+
+/// Only combine equal-length keys with consecutive final bytes. Extensions of
+/// the first key can still intervene; the pair reader handles that boundedly.
+fn consecutive_keys(first: &[u8], second: &[u8]) -> bool {
+    let (Some((&left, left_prefix)), Some((&right, right_prefix))) =
+        (first.split_last(), second.split_last())
+    else {
+        return false;
+    };
+    second.len() < FDB_MAX_KEY_BYTES
+        && left.checked_add(1) == Some(right)
+        && left_prefix == right_prefix
+}
+
+/// Keeps a native range result alive without copying its value bytes.
+struct RangeValue(foundationdb::future::FdbValue);
+
+impl AsRef<[u8]> for RangeValue {
+    fn as_ref(&self) -> &[u8] {
+        self.0.value()
+    }
+}
+
+/// Reads two nearby snapshot keys with one native request in the common case.
+/// Fetch at most two rows, ignore intervening keys, and point-read any missing
+/// targets if the page is incomplete. Never add range conflicts to a write read.
+async fn read_snapshot_pair(
+    transaction: &Transaction,
+    first: &[u8],
+    second: &[u8],
+) -> Result<[Option<Bytes>; 2]> {
+    let mut end = second.to_vec();
+    end.push(0);
+    let options = RangeOption {
+        limit: Some(2),
+        mode: StreamingMode::WantAll,
+        ..RangeOption::from(first..end.as_slice())
+    };
+    let rows = transaction
+        .get_range(&options, 1, true)
+        .await
+        .map_err(map_operation_error)?;
+    let more = rows.more();
+    let mut values = [None, None];
+    for row in rows {
+        let slot = if row.key() == first {
+            &mut values[0]
+        } else if row.key() == second {
+            &mut values[1]
+        } else {
+            continue;
+        };
+        *slot = Some(Bytes::from_owner(RangeValue(row)));
+    }
+    if more {
+        let keys = [first, second];
+        let missing: Vec<_> = (0..2).filter(|&index| values[index].is_none()).collect();
+        let reads = missing
             .iter()
-            .map(|key| transaction.get(key, mode.is_snapshot()));
-        values.extend(
-            try_join_all(reads)
-                .await
-                .map_err(map_operation_error)?
-                .into_iter()
-                .map(|value| value.map(Bytes::from_owner)),
-        );
+            .map(|&index| transaction.get(keys[index], true));
+        let found = try_join_all(reads).await.map_err(map_operation_error)?;
+        for (index, value) in missing.into_iter().zip(found) {
+            values[index] = value.map(Bytes::from_owner);
+        }
     }
     Ok(values)
 }

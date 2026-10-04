@@ -14,7 +14,7 @@ backend. One Logical Index is a Tree-Key-sharded forest of incrementally
 maintained binary K-means trees. Search uses conservative predicate pruning,
 RaBitQ7 approximate ranking, and exact reranking over the original vectors.
 
-KTANN supports FoundationDB and RocksDB through one logical
+KTANN supports Memory, FoundationDB, and RocksDB through one logical
 storage contract. The adapters share Rust interfaces and logical codecs, but
 their physical keyspaces are neither portable nor mutually compatible.
 
@@ -45,9 +45,9 @@ their physical keyspaces are neither portable nor mutually compatible.
   cross-backend persistent-data interchange format.
 - Online migration of schema, metric, dimension, Tree Key, quantizer, or
   persistent format.
-- Redis, a production in-memory backend, durable maintenance jobs, repair on
-  read, automatic repair, or bulk-build generations. A separate unpublished
-  construction path is described by proposed ADR 0024.
+- Redis, durable maintenance jobs, repair on read, automatic repair, or
+  bulk-build generations. A separate unpublished construction path is
+  described by proposed ADR 0025.
 - Compatibility with any implementation predating the first stable format.
 
 ## 4. Authoritative invariants
@@ -78,10 +78,11 @@ their physical keyspaces are neither portable nor mutually compatible.
 
 ## 5. Architecture and ownership
 
-The Rust workspace contains three production crates:
+The Rust workspace contains four production crates:
 
 ```text
 ktann/                  public API, algorithms, logical storage and codecs
+ktann-memory/          ephemeral in-process transactional adapter
 ktann-foundationdb/     FoundationDB transaction and physical-key adapter
 ktann-rocksdb/          RocksDB OptimisticTransactionDB adapter
 ```

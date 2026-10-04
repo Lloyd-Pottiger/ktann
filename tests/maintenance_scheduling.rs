@@ -24,7 +24,7 @@ use ktann::runtime::Runtime;
 use ktann::storage::values::PartitionState;
 
 use support::oracle::{Model, ModelRecord};
-use support::{CommitFault, DeterministicBackend, DeterministicConfig, SharedBackend, audit};
+use support::{CommitFault, MemoryBackend, TestConfig, audit};
 
 #[allow(dead_code)]
 mod support;
@@ -55,8 +55,8 @@ fn runtime_config(workers: usize, capacity: usize, fixup_attempts: u32) -> Runti
         .expect("valid runtime config")
 }
 
-fn backend() -> SharedBackend {
-    SharedBackend::new(DeterministicBackend::new(DeterministicConfig::default()))
+fn backend() -> MemoryBackend {
+    MemoryBackend::with_test_config(TestConfig::default())
 }
 
 fn rid(value: u8) -> Bytes {
@@ -75,15 +75,15 @@ fn model_record(x: f32) -> ModelRecord {
 }
 
 /// Inserts one record through the public API and mirrors it into the model.
-async fn insert(index: &Index<SharedBackend>, model: &mut Model, id: u8, x: f32) {
+async fn insert(index: &Index<MemoryBackend>, model: &mut Model, id: u8, x: f32) {
     index.insert(record(id, x)).await.expect("insert");
     model.insert(rid(id), model_record(x));
 }
 
 /// The reachable partitions' states and the total exact leaf entry count.
 async fn topology(
-    backend: &SharedBackend,
-    index: &Index<SharedBackend>,
+    backend: &MemoryBackend,
+    index: &Index<MemoryBackend>,
 ) -> (Vec<PartitionState>, u32) {
     let partitions = audit::list_partitions(backend, index.logical_index_id())
         .await
@@ -102,9 +102,9 @@ async fn topology(
 }
 
 /// Waits for one deterministic backend commit without offering more work.
-async fn wait_for_commit(backend: &SharedBackend, previous: usize) {
+async fn wait_for_commit(backend: &MemoryBackend, previous: usize) {
     let deadline = Instant::now() + Duration::from_secs(30);
-    while backend.inner().history().len() == previous {
+    while backend.history().len() == previous {
         assert!(Instant::now() < deadline, "timed out waiting for commit");
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
@@ -113,8 +113,8 @@ async fn wait_for_commit(backend: &SharedBackend, previous: usize) {
 /// Polls until every partition is `Ready` with at most `max_entries` entries,
 /// failing with `context` when one second passes without settling.
 async fn wait_for_ready_partitions(
-    backend: &SharedBackend,
-    index: &Index<SharedBackend>,
+    backend: &MemoryBackend,
+    index: &Index<MemoryBackend>,
     max_entries: u32,
     context: &str,
 ) {
@@ -135,7 +135,7 @@ async fn wait_for_ready_partitions(
 
 /// Asserts the quiescent end state: every partition Ready, and the full
 /// persistent-state audit passes against the model.
-async fn assert_converged(backend: &SharedBackend, index: &Index<SharedBackend>, model: &Model) {
+async fn assert_converged(backend: &MemoryBackend, index: &Index<MemoryBackend>, model: &Model) {
     let (states, _) = topology(backend, index).await;
     assert!(
         states.iter().all(|state| *state == PartitionState::Ready),
@@ -147,7 +147,7 @@ async fn assert_converged(backend: &SharedBackend, index: &Index<SharedBackend>,
 }
 
 /// Asserts every modeled record reads back through the public API.
-async fn assert_records(index: &Index<SharedBackend>, model: &Model) {
+async fn assert_records(index: &Index<MemoryBackend>, model: &Model) {
     for id in model.keys() {
         let stored = index
             .get(id.clone(), Default::default())
@@ -161,7 +161,7 @@ async fn assert_records(index: &Index<SharedBackend>, model: &Model) {
 /// Drives demand-driven rediscovery until the topology settles: every search
 /// visits and offers cold partitions, so repeated searches converge the
 /// forest without any manual state-machine drive.
-async fn settle(index: &Index<SharedBackend>, backend: &SharedBackend, model: &Model) {
+async fn settle(index: &Index<MemoryBackend>, backend: &MemoryBackend, model: &Model) {
     audit::settle(index, backend, model.len() as u32).await;
 }
 
@@ -338,10 +338,9 @@ async fn queue_loss_leaves_searchable_state_and_search_resumes_it() {
     let runtime_a = Runtime::new(backend.clone(), runtime_config(1, 4, 1)).expect("runtime");
     let index_a = runtime_a.open_index("cold").await.expect("open index");
     backend
-        .inner()
         .push_fault(CommitFault::UnknownApplied)
         .expect("fault");
-    let commits = backend.inner().history().len();
+    let commits = backend.history().len();
     drive_one_step(&index_a).await;
     wait_for_commit(&backend, commits).await;
     let (states, _) = topology(&backend, &index_a).await;
@@ -428,7 +427,7 @@ async fn lost_oversized_ready_offer_is_rediscovered_after_reopen() {
 }
 
 /// Offers one rediscovery pass through a search.
-async fn drive_one_step(index: &Index<SharedBackend>) {
+async fn drive_one_step(index: &Index<MemoryBackend>) {
     let request = SearchRequest::new(Arc::from([0.0_f32]), 1).expect("valid request");
     let _ = index.search(request).await;
 }
@@ -452,8 +451,8 @@ async fn unknown_outcome_retires_and_rediscovery_resumes(fault: CommitFault, nam
     let runtime = Runtime::new(backend.clone(), runtime_config(1, 4, 1)).expect("runtime");
     let index = runtime.open_index(name).await.expect("open index");
 
-    backend.inner().push_fault(fault).expect("fault");
-    let commits = backend.inner().history().len();
+    backend.push_fault(fault).expect("fault");
+    let commits = backend.history().len();
     drive_one_step(&index).await;
     wait_for_commit(&backend, commits).await;
 

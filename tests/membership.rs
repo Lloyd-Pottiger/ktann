@@ -14,7 +14,7 @@ use ktann::storage::values::{
 use ktann::storage::{LogicalRange, RecordGroupRead, WriteLogicalTxn};
 
 use support::builders::{create_committed_tree, id, manifest, pk, read_txn, tree_key, write_txn};
-use support::{CommitFault, CommitOutcome, DeterministicBackend, Rng};
+use support::{CommitFault, CommitOutcome, MemoryBackend, Rng};
 
 #[allow(dead_code)]
 mod support;
@@ -52,7 +52,7 @@ fn payload(tag: &'static [u8]) -> OpaquePayload {
 /// Seeds the grown root shape: internal root PK 1 at level 2 with leaf
 /// children PK 2 (centroid 0.0) and PK 3 (centroid 10.0), each with its Header
 /// and empty Synopsis installed.
-async fn seed_grown_root(backend: &DeterministicBackend, manifest: &IndexManifest, key: &TreeKey) {
+async fn seed_grown_root(backend: &MemoryBackend, manifest: &IndexManifest, key: &TreeKey) {
     create_committed_tree(backend, manifest, key).await;
     let mut txn = write_txn(backend, manifest).await;
     let header_key = |partition| LogicalKey::Header {
@@ -101,7 +101,7 @@ async fn seed_grown_root(backend: &DeterministicBackend, manifest: &IndexManifes
 }
 
 async fn insert_committed(
-    backend: &DeterministicBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     record: &VectorRecord,
     payload: Option<&OpaquePayload>,
@@ -118,7 +118,7 @@ async fn insert_committed(
 }
 
 async fn read_header_at(
-    backend: &DeterministicBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     tree_key: &TreeKey,
     partition: PartitionKey,
@@ -139,7 +139,7 @@ async fn read_header_at(
 }
 
 async fn read_synopsis_at(
-    backend: &DeterministicBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     tree_key: &TreeKey,
     partition: PartitionKey,
@@ -160,7 +160,7 @@ async fn read_synopsis_at(
 }
 
 async fn read_entry_at(
-    backend: &DeterministicBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     location: &RecordLocation,
     record_id: &Bytes,
@@ -183,7 +183,7 @@ async fn read_entry_at(
 }
 
 async fn read_group(
-    backend: &DeterministicBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     record_id: Bytes,
     include_payload: bool,
@@ -196,7 +196,7 @@ async fn read_group(
 }
 
 async fn leaf_member_ids(
-    backend: &DeterministicBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     tree_key: &TreeKey,
     partition: PartitionKey,
@@ -226,7 +226,7 @@ async fn leaf_member_ids(
 
 #[tokio::test]
 async fn insert_commits_the_complete_record_group() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
     create_committed_tree(&backend, &manifest, &key).await;
@@ -267,7 +267,7 @@ async fn insert_commits_the_complete_record_group() {
 
 #[tokio::test]
 async fn duplicate_insert_is_record_already_exists_and_changes_nothing() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
     create_committed_tree(&backend, &manifest, &key).await;
@@ -312,7 +312,7 @@ async fn duplicate_insert_is_record_already_exists_and_changes_nothing() {
 
 #[tokio::test]
 async fn same_leaf_replace_rewrites_entry_payload_and_epoch() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
     create_committed_tree(&backend, &manifest, &key).await;
@@ -393,7 +393,7 @@ async fn same_leaf_replace_rewrites_entry_payload_and_epoch() {
 
 #[tokio::test]
 async fn cross_leaf_and_cross_tree_moves_retarget_membership_and_counts() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
     seed_grown_root(&backend, &manifest, &key).await;
@@ -540,7 +540,7 @@ async fn cross_leaf_and_cross_tree_moves_retarget_membership_and_counts() {
 
 #[tokio::test]
 async fn delete_removes_the_whole_group_and_is_idempotent() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
     create_committed_tree(&backend, &manifest, &key).await;
@@ -603,7 +603,7 @@ async fn delete_removes_the_whole_group_and_is_idempotent() {
 
 #[tokio::test]
 async fn delete_uses_the_stored_location_not_routing() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
     seed_grown_root(&backend, &manifest, &key).await;
@@ -648,7 +648,7 @@ async fn delete_uses_the_stored_location_not_routing() {
 
 #[tokio::test]
 async fn rollback_discards_the_whole_mutation() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
     create_committed_tree(&backend, &manifest, &key).await;
@@ -676,7 +676,7 @@ async fn rollback_discards_the_whole_mutation() {
 
 #[tokio::test]
 async fn concurrent_leaf_mutations_conflict_and_retry_cleanly() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
     create_committed_tree(&backend, &manifest, &key).await;
@@ -749,7 +749,7 @@ async fn concurrent_leaf_mutations_conflict_and_retry_cleanly() {
 
 #[tokio::test]
 async fn unknown_commit_outcomes_surface_and_preserve_membership() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
     create_committed_tree(&backend, &manifest, &key).await;
@@ -828,7 +828,7 @@ async fn unknown_commit_outcomes_surface_and_preserve_membership() {
 
 #[tokio::test]
 async fn invalid_caller_input_is_rejected_before_any_write() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
     create_committed_tree(&backend, &manifest, &key).await;
@@ -877,7 +877,7 @@ async fn invalid_caller_input_is_rejected_before_any_write() {
 
 #[tokio::test]
 async fn replace_fails_closed_on_absent_or_stale_membership() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
     seed_grown_root(&backend, &manifest, &key).await;
@@ -935,7 +935,7 @@ async fn replace_fails_closed_on_absent_or_stale_membership() {
 
 #[tokio::test]
 async fn a_target_that_no_longer_accepts_writes_is_corruption() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
     create_committed_tree(&backend, &manifest, &key).await;
@@ -979,7 +979,7 @@ async fn a_target_that_no_longer_accepts_writes_is_corruption() {
 /// leaf's Header count and scanned Leaf Entry membership match the model's
 /// per-leaf membership exactly.
 async fn verify_model(
-    backend: &DeterministicBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     model: &BTreeMap<u8, (i64, RecordLocation)>,
     leaves: &[(TreeKey, u64)],
@@ -1031,7 +1031,7 @@ async fn membership_matches_a_seeded_model() {
     const ID_SPACE: u8 = 12;
 
     for seed in 1..=SEEDS {
-        let backend = DeterministicBackend::default();
+        let backend = MemoryBackend::new();
         let manifest = manifest();
         let first = tree_key(1);
         let second = tree_key(2);

@@ -20,10 +20,10 @@ use ktann::storage::values::{
 use ktann::storage::{LogicalRange, tree_manifest};
 
 use super::builders::{pk, read_txn, write_txn};
-use super::{CommitFault, DeterministicBackend, DeterministicConfig, SharedBackend};
+use super::{CommitFault, MemoryBackend, TestConfig};
 
-pub fn backend() -> SharedBackend {
-    SharedBackend::new(DeterministicBackend::new(DeterministicConfig::default()))
+pub fn backend() -> MemoryBackend {
+    MemoryBackend::with_test_config(TestConfig::default())
 }
 
 /// A deterministic backend whose admission budget bounds a leaf merge drain
@@ -33,25 +33,25 @@ pub fn backend() -> SharedBackend {
 /// target and one for the source Header; a merge may touch one target per
 /// entry, so a batch of eight charges 41 mutations and a ninth entry would
 /// exceed the 41-mutation budget.
-pub fn backend_with_merge_drain_budget() -> SharedBackend {
-    let config = DeterministicConfig {
+pub fn backend_with_merge_drain_budget() -> MemoryBackend {
+    let config = TestConfig {
         admission_budget: AdmissionBudget {
             max_mutations: 41,
-            ..DeterministicConfig::default().admission_budget
+            ..TestConfig::default().admission_budget
         },
-        ..DeterministicConfig::default()
+        ..TestConfig::default()
     };
-    SharedBackend::new(DeterministicBackend::new(config))
+    MemoryBackend::with_test_config(config)
 }
 
-pub fn backend_with_clear() -> SharedBackend {
-    let config = DeterministicConfig {
+pub fn backend_with_clear() -> MemoryBackend {
+    let config = TestConfig {
         capabilities: Capabilities {
             transactional_clear_range: true,
         },
-        ..DeterministicConfig::default()
+        ..TestConfig::default()
     };
-    SharedBackend::new(DeterministicBackend::new(config))
+    MemoryBackend::with_test_config(config)
 }
 
 /// A one-dimensional L2 index over one i64 tree-key field with the given
@@ -69,7 +69,7 @@ pub fn config(minimum: u32, maximum: u32) -> IndexConfig {
         .expect("valid partition entries")
 }
 
-pub fn make_runtime(backend: SharedBackend) -> Runtime<SharedBackend> {
+pub fn make_runtime(backend: MemoryBackend) -> Runtime<MemoryBackend> {
     // These suites drive the state machines by hand; background maintenance
     // workers would race the manual drives.
     Runtime::new(backend, super::manual_maintenance_config()).expect("runtime is valid")
@@ -95,7 +95,7 @@ pub fn record(id: &[u8], x: f32, bucket: i64) -> Record {
 /// Installs the Tree Manifest and initial leaf root so fixtures can grow the
 /// root shape from a committed empty root.
 pub async fn create_committed_tree(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     key: &TreeKey,
 ) {
@@ -107,7 +107,7 @@ pub async fn create_committed_tree(
 }
 
 pub async fn header_of(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     key: &TreeKey,
     partition: PartitionKey,
@@ -129,7 +129,7 @@ pub async fn header_of(
 }
 
 pub async fn state_of(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     key: &TreeKey,
     partition: PartitionKey,
@@ -151,7 +151,7 @@ pub async fn state_of(
 }
 
 pub async fn centroid_of(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     key: &TreeKey,
     partition: PartitionKey,
@@ -173,7 +173,7 @@ pub async fn centroid_of(
 }
 
 pub async fn synopsis_of(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     key: &TreeKey,
     partition: PartitionKey,
@@ -195,7 +195,7 @@ pub async fn synopsis_of(
 }
 
 pub async fn location_of(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     id: &Bytes,
 ) -> Option<RecordLocation> {
@@ -215,7 +215,7 @@ pub async fn location_of(
 }
 
 pub async fn leaf_entry_of(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     key: &TreeKey,
     partition: PartitionKey,
@@ -239,7 +239,7 @@ pub async fn leaf_entry_of(
 }
 
 pub async fn edge_of(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     key: &TreeKey,
     parent: PartitionKey,
@@ -263,7 +263,7 @@ pub async fn edge_of(
 }
 
 pub async fn scan_child_entries(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     key: &TreeKey,
     partition: PartitionKey,
@@ -298,7 +298,7 @@ pub async fn scan_child_entries(
 }
 
 pub async fn scan_leaf_entries(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     key: &TreeKey,
     partition: PartitionKey,
@@ -341,7 +341,7 @@ pub async fn scan_leaf_entries(
 /// unchanged. Every internal body's scanned Child Entry count must equal its
 /// exact Header count, and no partition may be discovered twice.
 pub async fn reachable_leaves(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     key: &TreeKey,
 ) -> BTreeMap<PartitionKey, PartitionHeader> {
@@ -407,7 +407,7 @@ pub async fn reachable_leaves(
 /// Leaf Entry, and the reachable leaves' exact counts sum to the record
 /// count.
 pub async fn assert_exact_membership(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     key: &TreeKey,
     records: &[(Bytes, f32)],
@@ -433,7 +433,7 @@ pub async fn assert_exact_membership(
 
 /// Asserts that routing reaches a live leaf for every record's vector.
 pub async fn assert_searchable(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     key: &TreeKey,
     records: &[(Bytes, f32)],
@@ -450,7 +450,7 @@ pub async fn assert_searchable(
 /// Seeds records 0..count at x = 0.0, 1.0, ... into one tree through the
 /// public mutation API.
 pub async fn seed_records(
-    index: &Index<SharedBackend>,
+    index: &Index<MemoryBackend>,
     bucket: i64,
     count: u8,
 ) -> Vec<(Bytes, f32)> {
@@ -469,7 +469,7 @@ pub async fn seed_records(
 /// Drives `split::advance` until the partition is no longer making progress,
 /// returning the observed outcome sequence.
 pub async fn drive_split_to_completion(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     key: &TreeKey,
     partition: PartitionKey,
@@ -500,7 +500,7 @@ pub async fn drive_split_to_completion(
 /// Drives `merge::advance` until the partition is no longer making progress,
 /// returning the observed outcome sequence.
 pub async fn drive_merge_to_completion(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     key: &TreeKey,
     partition: PartitionKey,
@@ -540,7 +540,7 @@ pub fn assert_fault_kind(fault: CommitFault, error: &ktann::api::Error) {
 /// Enumerates every partition of one tree, following Child Entries and the
 /// root's persisted split target slots.
 pub async fn all_partitions(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     key: &TreeKey,
 ) -> Vec<PartitionKey> {

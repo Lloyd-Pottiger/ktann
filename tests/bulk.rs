@@ -18,8 +18,8 @@ use std::sync::{
 };
 use std::time::Duration;
 use support::{
-    CommitFault, DeterministicBackend, DeterministicConfig, DeterministicReadTxn,
-    DeterministicWriteTxn, SharedBackend, manual_maintenance_config,
+    CommitFault, MemoryBackend, MemoryReadTxn, MemoryWriteTxn, TestConfig,
+    manual_maintenance_config,
 };
 use tokio_util::sync::CancellationToken;
 #[allow(dead_code)]
@@ -83,14 +83,14 @@ impl CommitGate {
 
 #[derive(Clone)]
 struct GatedBackend {
-    inner: Arc<DeterministicBackend>,
+    inner: Arc<MemoryBackend>,
     gate: Arc<CommitGate>,
     read_gate: Arc<CommitGate>,
     scan_limit: usize,
 }
 
 impl GatedBackend {
-    fn new(inner: Arc<DeterministicBackend>, gate: Arc<CommitGate>) -> Self {
+    fn new(inner: Arc<MemoryBackend>, gate: Arc<CommitGate>) -> Self {
         Self {
             inner,
             gate,
@@ -101,7 +101,7 @@ impl GatedBackend {
 }
 
 impl Backend for GatedBackend {
-    type ReadTxn<'backend> = GatedReadTxn<'backend>;
+    type ReadTxn<'backend> = GatedReadTxn;
 
     type WriteTxn<'backend> = GatedWriteTxn<'backend>;
 
@@ -138,12 +138,12 @@ impl Backend for GatedBackend {
 }
 
 /// A deterministic short-lived snapshot; only the scan budget is artificial.
-struct GatedReadTxn<'backend> {
-    inner: DeterministicReadTxn<'backend>,
+struct GatedReadTxn {
+    inner: MemoryReadTxn,
     gate: Arc<CommitGate>,
     remaining_scans: usize,
 }
-impl GatedReadTxn<'_> {
+impl GatedReadTxn {
     async fn admit_scans(&mut self, count: usize) -> ktann::api::Result<()> {
         self.gate.maybe_wait().await;
         self.remaining_scans = self
@@ -153,7 +153,7 @@ impl GatedReadTxn<'_> {
         Ok(())
     }
 }
-impl ReadOps for GatedReadTxn<'_> {
+impl ReadOps for GatedReadTxn {
     async fn get(&mut self, key: Bytes) -> ktann::api::Result<Option<Bytes>> {
         self.inner.get(key).await
     }
@@ -173,10 +173,10 @@ impl ReadOps for GatedReadTxn<'_> {
         self.inner.batch_scan(ranges, limits).await
     }
 }
-impl ReadTxn for GatedReadTxn<'_> {}
+impl ReadTxn for GatedReadTxn {}
 
 struct GatedWriteTxn<'backend> {
-    inner: DeterministicWriteTxn<'backend>,
+    inner: MemoryWriteTxn<'backend>,
     gate: Arc<CommitGate>,
 }
 
@@ -276,14 +276,14 @@ fn options(rounds: usize) -> BulkBuildOptions {
         .with_refinement_rounds(rounds)
         .unwrap()
 }
-fn make_runtime(backend: SharedBackend) -> Runtime<SharedBackend> {
+fn make_runtime(backend: MemoryBackend) -> Runtime<MemoryBackend> {
     Runtime::new(backend, manual_maintenance_config()).unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refined_build_preserves_exact_membership_fields_payload_and_mutations() {
     for rounds in [0, 2, 5] {
-        let backend = SharedBackend::new(DeterministicBackend::default());
+        let backend = MemoryBackend::with_test_config(TestConfig::default());
         let runtime = make_runtime(backend);
         let source = records(53);
         let index = runtime
@@ -361,9 +361,8 @@ async fn refined_build_preserves_exact_membership_fields_payload_and_mutations()
 async fn unknown_stage_is_replayed_and_unknown_publication_is_resolved() {
     // Six records in two root leaves: reservation, topology, records, publish.
     for fault in [CommitFault::UnknownApplied, CommitFault::UnknownNotApplied] {
-        let backend = SharedBackend::new(DeterministicBackend::default());
+        let backend = MemoryBackend::with_test_config(TestConfig::default());
         backend
-            .inner()
             .set_fault_plan(vec![
                 CommitFault::UnknownApplied,
                 fault,
@@ -391,13 +390,12 @@ async fn unknown_stage_is_replayed_and_unknown_publication_is_resolved() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_publication_stays_unpublished_and_can_be_dropped_after_restart() {
-    let persistent = DeterministicConfig {
+    let persistent = TestConfig {
         durability: support::Durability::Durable,
         ..Default::default()
     };
-    let backend = SharedBackend::new(DeterministicBackend::new(persistent));
+    let backend = MemoryBackend::with_test_config(persistent);
     backend
-        .inner()
         .set_fault_plan(vec![
             CommitFault::Normal,
             CommitFault::Normal,
@@ -430,7 +428,7 @@ async fn failed_publication_stays_unpublished_and_can_be_dropped_after_restart()
         ErrorKind::IndexBuilding
     );
     runtime.shutdown().await.unwrap();
-    let reopened = make_runtime(SharedBackend::new(backend.inner().reopen()));
+    let reopened = make_runtime(backend.reopen());
     assert_eq!(
         reopened.open_index("bulk").await.unwrap_err().kind(),
         ErrorKind::IndexBuilding
@@ -451,7 +449,7 @@ async fn failed_publication_stays_unpublished_and_can_be_dropped_after_restart()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancellation_before_publication_retains_only_unpublished_construction() {
-    let inner = Arc::new(DeterministicBackend::default());
+    let inner = Arc::new(MemoryBackend::with_test_config(TestConfig::default()));
     let gate = Arc::new(CommitGate::default());
     gate.hold_next(2);
     let runtime = Runtime::new(
@@ -496,7 +494,7 @@ async fn cancellation_before_publication_retains_only_unpublished_construction()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drop_fences_in_flight_staging_and_new_name_owner() {
-    let inner = Arc::new(DeterministicBackend::default());
+    let inner = Arc::new(MemoryBackend::with_test_config(TestConfig::default()));
     let gate = Arc::new(CommitGate::default());
     gate.hold_next(2);
     let runtime = Runtime::new(
@@ -543,7 +541,7 @@ async fn drop_fences_in_flight_staging_and_new_name_owner() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ambiguous_reservation_cannot_borrow_competing_build_ownership() {
-    let inner = Arc::new(DeterministicBackend::default());
+    let inner = Arc::new(MemoryBackend::with_test_config(TestConfig::default()));
     let gate = Arc::new(CommitGate::default());
     gate.hold_next(1);
     let loser = Runtime::new(
@@ -603,9 +601,9 @@ async fn ambiguous_reservation_cannot_borrow_competing_build_ownership() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn validation_does_not_reserve_name_and_adapter_budgets_bound_staging() {
-    let mut config_backend = DeterministicConfig::default();
+    let mut config_backend = TestConfig::default();
     config_backend.admission_budget.max_mutations = 4;
-    let backend = SharedBackend::new(DeterministicBackend::new(config_backend));
+    let backend = MemoryBackend::with_test_config(config_backend);
     let runtime = make_runtime(backend);
     let mut duplicate = records(2);
     duplicate.push(duplicate[0].clone());
@@ -650,7 +648,7 @@ async fn validation_does_not_reserve_name_and_adapter_budgets_bound_staging() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn publication_preserves_older_unpublished_snapshot() {
-    let inner = Arc::new(DeterministicBackend::default());
+    let inner = Arc::new(MemoryBackend::with_test_config(TestConfig::default()));
     let gate = Arc::new(CommitGate::default());
     gate.hold_next(2);
     let runtime = Runtime::new(
@@ -711,9 +709,9 @@ async fn publication_preserves_older_unpublished_snapshot() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oversized_single_record_group_cannot_partially_commit_or_publish() {
-    let mut config_backend = DeterministicConfig::default();
+    let mut config_backend = TestConfig::default();
     config_backend.admission_budget.max_mutations = 3; // Reservation fits, payload group does not.
-    let backend = SharedBackend::new(DeterministicBackend::new(config_backend));
+    let backend = MemoryBackend::with_test_config(config_backend);
     let runtime = make_runtime(backend.clone());
     let error = runtime
         .build_index(
@@ -784,7 +782,7 @@ async fn oversized_single_record_group_cannot_partially_commit_or_publish() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_construction_publishes_then_accepts_ordinary_insert() {
-    let runtime = make_runtime(SharedBackend::new(DeterministicBackend::default()));
+    let runtime = make_runtime(MemoryBackend::with_test_config(TestConfig::default()));
     let index = runtime
         .build_index(
             "bulk",
@@ -810,7 +808,7 @@ async fn empty_construction_publishes_then_accepts_ordinary_insert() {
 /// Construction is immutable during its audit; an Active index is not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn build_audit_renews_short_snapshots_but_online_verify_does_not() {
-    let inner = Arc::new(DeterministicBackend::default());
+    let inner = Arc::new(MemoryBackend::with_test_config(TestConfig::default()));
     let mut backend = GatedBackend::new(inner.clone(), Arc::new(CommitGate::default()));
     backend.scan_limit = 1;
     let runtime = Runtime::new(backend, manual_maintenance_config()).unwrap();
@@ -853,7 +851,7 @@ async fn build_audit_renews_short_snapshots_but_online_verify_does_not() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drop_during_build_audit_cannot_publish_over_a_new_name_owner() {
     let backend = GatedBackend::new(
-        Arc::new(DeterministicBackend::default()),
+        Arc::new(MemoryBackend::with_test_config(TestConfig::default())),
         Arc::new(CommitGate::default()),
     );
     let read_gate = Arc::clone(&backend.read_gate);

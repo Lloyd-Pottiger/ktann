@@ -57,9 +57,7 @@ use tokio_util::sync::CancellationToken;
 mod support;
 
 use support::oracle::{self, Model, ModelRecord};
-use support::{
-    CommitFault, DeterministicBackend, DeterministicConfig, Durability, Rng, SharedBackend, audit,
-};
+use support::{CommitFault, Durability, MemoryBackend, Rng, TestConfig, audit};
 
 /// The vector dimension.
 const DIMENSION: usize = 4;
@@ -542,7 +540,7 @@ struct PartitionTracker {
 }
 
 impl PartitionTracker {
-    async fn check(&mut self, backend: &SharedBackend, index: LogicalIndexId, step: usize) {
+    async fn check(&mut self, backend: &MemoryBackend, index: LogicalIndexId, step: usize) {
         let listing = audit::list_partitions(backend, index)
             .await
             .expect("partition listing");
@@ -589,11 +587,11 @@ struct CaseStats {
 /// The sequential driver: current Runtime and Index handles, the exact model,
 /// identity histories, the logical maintenance clock, and the trace ring.
 struct Driver {
-    backend: SharedBackend,
+    backend: MemoryBackend,
     config: RuntimeConfig,
     retry: RetryPolicy,
-    runtime: Option<Runtime<SharedBackend>>,
-    index: Option<Index<SharedBackend>>,
+    runtime: Option<Runtime<MemoryBackend>>,
+    index: Option<Index<MemoryBackend>>,
     model: Model,
     current_id: LogicalIndexId,
     seen_index_ids: BTreeSet<LogicalIndexId>,
@@ -607,10 +605,10 @@ impl Driver {
     /// Opens a fresh case on a durable deterministic backend with zero
     /// maintenance workers, so topology moves only under manual drives.
     async fn new(seed: u64, steps: usize) -> Self {
-        let backend = SharedBackend::new(DeterministicBackend::new(DeterministicConfig {
+        let backend = MemoryBackend::with_test_config(TestConfig {
             durability: Durability::Durable,
-            ..DeterministicConfig::default()
-        }));
+            ..TestConfig::default()
+        });
         let config = support::manual_maintenance_config()
             .with_attempts(FIXUP_ATTEMPTS, FOREGROUND_ATTEMPTS)
             .expect("valid attempt bounds");
@@ -639,11 +637,11 @@ impl Driver {
         }
     }
 
-    fn index(&self) -> &Index<SharedBackend> {
+    fn index(&self) -> &Index<MemoryBackend> {
         self.index.as_ref().expect("live index handle")
     }
 
-    fn runtime(&self) -> &Runtime<SharedBackend> {
+    fn runtime(&self) -> &Runtime<MemoryBackend> {
         self.runtime.as_ref().expect("live runtime")
     }
 
@@ -707,7 +705,7 @@ impl Driver {
     ) {
         self.stats.mutations += 1;
         if let Some(fault) = fault {
-            self.backend.inner().push_fault(fault).expect("push fault");
+            self.backend.push_fault(fault).expect("push fault");
         }
         let id = mutation.id();
         let had = self.model.contains_key(&id);
@@ -782,7 +780,6 @@ impl Driver {
         // fault queued; clear leftovers so later steps arm cleanly.
         if fault.is_some() {
             self.backend
-                .inner()
                 .set_fault_plan(Vec::new())
                 .expect("clear fault plan");
         }
@@ -798,7 +795,7 @@ impl Driver {
     ) {
         self.stats.batches += 1;
         if let Some(fault) = fault {
-            self.backend.inner().push_fault(fault).expect("push fault");
+            self.backend.push_fault(fault).expect("push fault");
         }
         let api: Vec<Mutation> = mutations.iter().map(DrawnMutation::to_api).collect();
         match self.index().batch_mutate(api).await {
@@ -867,7 +864,6 @@ impl Driver {
         }
         if fault.is_some() {
             self.backend
-                .inner()
                 .set_fault_plan(Vec::new())
                 .expect("clear fault plan");
         }
@@ -1073,7 +1069,7 @@ impl Driver {
         self.stats.advances += 1;
         self.clock += 100;
         if let Some(fault) = fault {
-            self.backend.inner().push_fault(fault).expect("push fault");
+            self.backend.push_fault(fault).expect("push fault");
         }
         match work {
             Work::Split => {
@@ -1125,7 +1121,6 @@ impl Driver {
         }
         if fault.is_some() {
             self.backend
-                .inner()
                 .set_fault_plan(Vec::new())
                 .expect("clear fault plan");
         }
@@ -1203,8 +1198,7 @@ impl Driver {
 
     /// Reopens the durable backend and opens the index under a fresh Runtime.
     async fn reopen(&mut self, n: usize) {
-        let reopened = self.backend.inner().reopen();
-        self.backend = SharedBackend::new(reopened);
+        self.backend = self.backend.reopen();
         let runtime =
             Runtime::new(self.backend.clone(), self.config.clone()).expect("runtime is valid");
         let index = runtime

@@ -63,7 +63,7 @@ centroids. Zero rounds selects the same builder without refinement. The input
 limit excludes proportional preprocessing, training and verification workspace.
 Create/open return `IndexBuilding` during construction. Failure or cancellation
 can retain Building; the caller uses `drop_index` before rebuilding. No existing
-index is replaced and no published centroid is rewritten. See proposed ADR 0024.
+index is replaced and no published centroid is rewritten. See proposed ADR 0025.
 
 ## 2. Records and mutations
 

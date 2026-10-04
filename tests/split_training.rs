@@ -13,7 +13,7 @@ use ktann::storage::values::{
     PersistentValue, VectorRecord,
 };
 
-use support::DeterministicBackend;
+use support::MemoryBackend;
 use support::builders::{create_committed_tree, id, manifest, pk, read_txn, tree_key, write_txn};
 
 #[allow(dead_code)]
@@ -47,7 +47,7 @@ fn rid(value: u8) -> Bytes {
 }
 
 async fn train(
-    backend: &DeterministicBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     key: &TreeKey,
     source: PartitionKey,
@@ -94,7 +94,7 @@ fn leaf_entry(
 /// Commits typed values in chunks that stay inside the test backend's
 /// admission budget.
 async fn write_values(
-    backend: &DeterministicBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     values: Vec<(LogicalKey, PersistentValue)>,
 ) {
@@ -110,7 +110,7 @@ async fn write_values(
 /// Seeds a leaf source on Partition Key 1: one Vector Record and one Leaf
 /// Entry per `(Record ID, vector)` pair.
 async fn seed_leaf_source(
-    backend: &DeterministicBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     key: &TreeKey,
     records: &[(Bytes, f32)],
@@ -126,7 +126,7 @@ async fn seed_leaf_source(
 
 #[tokio::test]
 async fn leaf_training_trains_from_the_original_vector_records() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
     seed_leaf_source(
@@ -154,7 +154,7 @@ async fn leaf_training_trains_from_the_original_vector_records() {
 
 #[tokio::test]
 async fn cosine_leaf_training_applies_metric_preprocessing() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = cosine_manifest();
     let key = tree_key(1);
     seed_leaf_source(
@@ -176,7 +176,7 @@ async fn cosine_leaf_training_applies_metric_preprocessing() {
 
 #[tokio::test]
 async fn internal_training_reads_child_centroids_without_vector_records() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
     create_committed_tree(&backend, &manifest, &key).await;
@@ -216,7 +216,7 @@ async fn internal_training_reads_child_centroids_without_vector_records() {
 
 #[tokio::test]
 async fn an_absent_source_vector_record_is_corruption() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
     create_committed_tree(&backend, &manifest, &key).await;
@@ -245,7 +245,7 @@ async fn an_absent_source_vector_record_is_corruption() {
 
 #[tokio::test]
 async fn a_missing_source_header_is_corruption() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
 
@@ -260,7 +260,7 @@ async fn an_empty_leaf_source_trains_zero_centroids() {
     // Foreground deletes may legally empty a Splitting source before exposure
     // (ADR 0014); training must still emit a deterministic pair so the split
     // can advance.
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
     create_committed_tree(&backend, &manifest, &key).await;
@@ -274,7 +274,7 @@ async fn an_empty_leaf_source_trains_zero_centroids() {
 
 #[tokio::test]
 async fn a_lone_leaf_entry_replicates_as_both_centroids() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
     seed_leaf_source(&backend, &manifest, &key, &[(rid(0), 3.0)]).await;
@@ -288,7 +288,7 @@ async fn a_lone_leaf_entry_replicates_as_both_centroids() {
 
 #[tokio::test]
 async fn a_lone_child_centroid_replicates_for_internal_training() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
     create_committed_tree(&backend, &manifest, &key).await;
@@ -328,7 +328,7 @@ async fn a_lone_child_centroid_replicates_for_internal_training() {
 
 #[tokio::test]
 async fn malformed_leaf_entry_bytes_are_corruption() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
     seed_leaf_source(
@@ -357,7 +357,7 @@ async fn malformed_leaf_entry_bytes_are_corruption() {
 
 #[tokio::test]
 async fn training_loads_the_complete_source_across_pages_and_batches() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let manifest = manifest();
     let key = tree_key(1);
 
@@ -386,7 +386,7 @@ async fn training_loads_the_complete_source_across_pages_and_batches() {
 
 #[tokio::test]
 async fn an_unbound_transaction_is_rejected() {
-    let backend = DeterministicBackend::default();
+    let backend = MemoryBackend::new();
     let key = tree_key(1);
 
     let raw = backend.begin_read().await.expect("begin read");

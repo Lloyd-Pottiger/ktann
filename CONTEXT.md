@@ -14,6 +14,8 @@ _Avoid_: Logical Index ID, Tree Key
 
 **Backend Namespace**:
 The caller-selected storage scope within which Index Names are unique and Logical Index IDs are allocated.
+For the Memory adapter, a newly created backend supplies this scope; clones
+share it, and its contents are ephemeral.
 _Avoid_: Logical Index, Tree Key
 
 **Index Manifest**:

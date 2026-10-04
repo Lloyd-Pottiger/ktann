@@ -11,7 +11,7 @@ use ktann::storage::values::{
 };
 use ktann::storage::{ReadLogicalTxn, WriteLogicalTxn, tree_manifest};
 
-use super::{DeterministicBackend, SharedBackend};
+use super::MemoryBackend;
 
 /// A nonzero Logical Index ID for fixtures.
 pub fn id(value: u64) -> LogicalIndexId {
@@ -70,7 +70,7 @@ pub async fn read_txn<'b, 'm, B: Backend>(
 /// Installs the tree's Tree Manifest and initial leaf root so fixtures can
 /// grow the root shape from a committed empty root.
 pub async fn create_committed_tree(
-    backend: &DeterministicBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     key: &TreeKey,
 ) {
@@ -84,7 +84,7 @@ pub async fn create_committed_tree(
 /// Seeds the Index ID allocator, Index Name directory, and Manifest rows of
 /// one named index holding `config`, committing each in its own transaction.
 pub async fn seed_named_index(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
     name: &IndexName,
     logical_index_id: LogicalIndexId,
     lifecycle: IndexLifecycle,

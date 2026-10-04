@@ -23,6 +23,121 @@ fn range(start: &[u8], end: &[u8]) -> KeyRange {
     KeyRange::new(start.to_vec(), end.to_vec())
 }
 
+/// Paired snapshot reads retain point-read semantics even across intervening
+/// keys, missing targets, duplicate inputs, large values, and old snapshots.
+async fn check_paired_reads(backend: &FoundationDbBackend) {
+    let mut seed = backend.begin_write().await.expect("begin paired seed");
+    for name in [
+        b"paired/a0".as_slice(),
+        b"paired/a1",
+        b"paired/b0",
+        b"paired/b0/x",
+        b"paired/b0/y",
+        b"paired/b1",
+        b"paired/c0/x",
+        b"paired/c0/y",
+        b"paired/c1",
+        b"paired/e0",
+        b"paired/f1",
+    ] {
+        seed.put(key(name), key(name))
+            .await
+            .expect("seed paired key");
+    }
+    let large = Bytes::from(vec![7; backend.hard_limits().max_value_bytes]);
+    for name in [b"paired/large0".as_slice(), b"paired/large1"] {
+        seed.put(key(name), large.clone())
+            .await
+            .expect("large value");
+    }
+    let mut boundary = vec![b'z'; backend.hard_limits().max_key_bytes];
+    *boundary.last_mut().unwrap() = 1;
+    let boundary_first = Bytes::from(boundary.clone());
+    *boundary.last_mut().unwrap() = 2;
+    let boundary_second = Bytes::from(boundary);
+    seed.put(boundary_first.clone(), key(b"first"))
+        .await
+        .unwrap();
+    seed.put(boundary_second.clone(), key(b"second"))
+        .await
+        .unwrap();
+    seed.commit().await.expect("commit paired seed");
+
+    let mut snapshot = backend.begin_read().await.expect("pin paired snapshot");
+    let mut update = backend.begin_write().await.unwrap();
+    update.put(key(b"paired/a0"), key(b"new")).await.unwrap();
+    update.commit().await.unwrap();
+    let names: &[&'static [u8]] = &[
+        b"paired/a0",
+        b"paired/a1",
+        b"paired/a1",
+        b"paired/a0",
+        b"paired/b0",
+        b"paired/b1",
+        b"paired/c0",
+        b"paired/c1",
+        b"paired/d0",
+        b"paired/d1",
+        b"paired/e0",
+        b"paired/e1",
+        b"paired/f0",
+        b"paired/f1",
+    ];
+    let expected: Vec<_> = names
+        .iter()
+        .map(|&name| match name {
+            b"paired/c0" | b"paired/d0" | b"paired/d1" | b"paired/e1" | b"paired/f0" => None,
+            _ => Some(key(name)),
+        })
+        .collect();
+    assert_eq!(
+        snapshot
+            .batch_get(names.iter().map(|&name| key(name)).collect())
+            .await
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        snapshot
+            .batch_get(vec![key(b"paired/large0"), key(b"paired/large1")])
+            .await
+            .unwrap(),
+        vec![Some(large.clone()), Some(large)]
+    );
+    assert_eq!(
+        snapshot
+            .batch_get(vec![boundary_first, boundary_second])
+            .await
+            .unwrap(),
+        vec![Some(key(b"first")), Some(key(b"second"))]
+    );
+    drop(snapshot);
+
+    // Update-protected reads must not acquire conflicts on intervening keys.
+    let mut protected = backend.begin_write().await.unwrap();
+    assert_eq!(
+        protected
+            .batch_get_for_update(vec![key(b"paired/conflict0"), key(b"paired/conflict1")])
+            .await
+            .unwrap(),
+        vec![None, None]
+    );
+    let mut intervening = backend.begin_write().await.unwrap();
+    intervening
+        .put(key(b"paired/conflict0/child"), key(b"unrelated"))
+        .await
+        .unwrap();
+    intervening.commit().await.unwrap();
+    protected
+        .put(key(b"paired/result"), key(b"ok"))
+        .await
+        .unwrap();
+    protected
+        .commit()
+        .await
+        .expect("point conflict scope unchanged");
+}
+
 /// Adapts a [`FoundationDbBackend`] to the shared harness seam.
 ///
 /// FoundationDB reports unknown commit outcomes naturally but cannot stage a
@@ -109,6 +224,7 @@ async fn foundationdb_adapter_preserves_the_backend_contract() {
     let primary = harness.backend;
 
     check_native_transaction_limit(cluster_file.as_deref()).await;
+    check_paired_reads(&primary).await;
 
     // Adapter-specific: two namespaces over one cluster are isolated.
     let mut write = primary.begin_write().await.expect("begin write");

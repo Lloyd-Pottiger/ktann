@@ -17,29 +17,29 @@ use ktann::storage::values::{
 use tokio_util::sync::CancellationToken;
 
 use support::builders::seed_named_index;
-use support::{DeterministicBackend, DeterministicConfig, SharedBackend};
+use support::{MemoryBackend, TestConfig};
 
 #[allow(dead_code)]
 mod support;
 
-fn backend(config: DeterministicConfig) -> SharedBackend {
-    SharedBackend::new(DeterministicBackend::new(config))
+fn backend(config: TestConfig) -> MemoryBackend {
+    MemoryBackend::with_test_config(config)
 }
 
-fn batch_config(max_batch_size: usize) -> DeterministicConfig {
-    DeterministicConfig {
+fn batch_config(max_batch_size: usize) -> TestConfig {
+    TestConfig {
         max_batch_size,
-        ..DeterministicConfig::default()
+        ..TestConfig::default()
     }
 }
 
-fn key_limit_config(max_key_bytes: usize) -> DeterministicConfig {
-    DeterministicConfig {
+fn key_limit_config(max_key_bytes: usize) -> TestConfig {
+    TestConfig {
         hard_limits: HardLimits {
             max_key_bytes,
-            ..DeterministicConfig::default().hard_limits
+            ..TestConfig::default().hard_limits
         },
-        ..DeterministicConfig::default()
+        ..TestConfig::default()
     }
 }
 
@@ -54,7 +54,7 @@ fn config() -> IndexConfig {
         .expect("valid tree key fields")
 }
 
-fn make_runtime(backend: SharedBackend) -> ktann::runtime::Runtime<SharedBackend> {
+fn make_runtime(backend: MemoryBackend) -> ktann::runtime::Runtime<MemoryBackend> {
     ktann::runtime::Runtime::new(backend, RuntimeConfig::default()).expect("runtime is valid")
 }
 
@@ -71,7 +71,7 @@ fn tree_key(bucket: i64) -> TreeKey {
 }
 
 async fn seed_record(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     id: &[u8],
     vector: Vec<f32>,
@@ -124,7 +124,7 @@ async fn seed_record(
     txn.commit().await.expect("commit record");
 }
 
-async fn put_raw(backend: &SharedBackend, key: Vec<u8>, value: Vec<u8>) {
+async fn put_raw(backend: &MemoryBackend, key: Vec<u8>, value: Vec<u8>) {
     let mut raw = backend.begin_write().await.expect("begin write");
     raw.put(Bytes::from(key), Bytes::from(value))
         .await
@@ -132,7 +132,7 @@ async fn put_raw(backend: &SharedBackend, key: Vec<u8>, value: Vec<u8>) {
     raw.commit().await.expect("commit raw value");
 }
 
-async fn put_manifest(backend: &SharedBackend, manifest: IndexManifest) {
+async fn put_manifest(backend: &MemoryBackend, manifest: IndexManifest) {
     let raw = backend.begin_write().await.expect("begin write");
     let limits = backend.hard_limits();
     let budget = backend.admission_budget();
@@ -148,11 +148,11 @@ async fn put_manifest(backend: &SharedBackend, manifest: IndexManifest) {
 
 /// A Runtime opened on a seeded Active index with seeded records.
 struct Fixture {
-    runtime: ktann::runtime::Runtime<SharedBackend>,
-    index: ktann::api::Index<SharedBackend>,
+    runtime: ktann::runtime::Runtime<MemoryBackend>,
+    index: ktann::api::Index<MemoryBackend>,
 }
 
-async fn fixture(shared: SharedBackend) -> Fixture {
+async fn fixture(shared: MemoryBackend) -> Fixture {
     let manifest = seed_named_index(
         &shared,
         &name("docs"),
@@ -187,7 +187,7 @@ async fn fixture(shared: SharedBackend) -> Fixture {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_returns_canonical_record_and_closed_payload_projection() {
-    let fixture = fixture(backend(DeterministicConfig::default())).await;
+    let fixture = fixture(backend(TestConfig::default())).await;
 
     let record = fixture
         .index
@@ -259,7 +259,7 @@ async fn get_returns_canonical_record_and_closed_payload_projection() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn batch_get_preserves_order_duplicates_and_absence() {
-    let fixture = fixture(backend(DeterministicConfig::default())).await;
+    let fixture = fixture(backend(TestConfig::default())).await;
 
     let ids = vec![
         Bytes::from_static(b"missing"),
@@ -304,7 +304,7 @@ async fn batch_get_preserves_order_duplicates_and_absence() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn batch_get_decodes_mixed_tree_keys() {
-    let fixture = fixture(backend(DeterministicConfig::default())).await;
+    let fixture = fixture(backend(TestConfig::default())).await;
 
     let ids = vec![
         Bytes::from_static(b"gamma"),
@@ -327,7 +327,7 @@ async fn batch_get_decodes_mixed_tree_keys() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reads_use_one_consistent_backend_snapshot() {
-    let shared = backend(DeterministicConfig::default());
+    let shared = backend(TestConfig::default());
     let manifest = seed_named_index(
         &shared,
         &name("docs"),
@@ -397,7 +397,7 @@ async fn reads_use_one_consistent_backend_snapshot() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropping_manifest_fails_reads_closed() {
-    let shared = backend(DeterministicConfig::default());
+    let shared = backend(TestConfig::default());
     let manifest = seed_named_index(
         &shared,
         &name("docs"),
@@ -428,7 +428,7 @@ async fn dropping_manifest_fails_reads_closed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropped_index_fails_reads_closed() {
-    let shared = backend(DeterministicConfig::default());
+    let shared = backend(TestConfig::default());
     let manifest = seed_named_index(
         &shared,
         &name("docs"),
@@ -459,7 +459,7 @@ async fn dropped_index_fails_reads_closed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unsupported_manifest_format_fails_reads_closed() {
-    let shared = backend(DeterministicConfig::default());
+    let shared = backend(TestConfig::default());
     let manifest = seed_named_index(
         &shared,
         &name("docs"),
@@ -495,7 +495,7 @@ async fn unsupported_manifest_format_fails_reads_closed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manifest_identity_mismatch_is_corruption() {
-    let shared = backend(DeterministicConfig::default());
+    let shared = backend(TestConfig::default());
     let manifest = seed_named_index(
         &shared,
         &name("docs"),
@@ -537,7 +537,7 @@ async fn manifest_identity_mismatch_is_corruption() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn partial_record_groups_are_corruption() {
-    let shared = backend(DeterministicConfig::default());
+    let shared = backend(TestConfig::default());
     let manifest = seed_named_index(
         &shared,
         &name("docs"),
@@ -635,7 +635,7 @@ async fn partial_record_groups_are_corruption() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn record_key_value_identity_mismatch_is_corruption() {
-    let shared = backend(DeterministicConfig::default());
+    let shared = backend(TestConfig::default());
     let manifest = seed_named_index(
         &shared,
         &name("docs"),
@@ -674,7 +674,7 @@ async fn record_key_value_identity_mismatch_is_corruption() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invalid_ids_fail_validation_with_position() {
-    let fixture = fixture(backend(DeterministicConfig::default())).await;
+    let fixture = fixture(backend(TestConfig::default())).await;
 
     let error = fixture
         .index
@@ -788,7 +788,7 @@ async fn batch_reads_enforce_backend_batch_and_key_limits() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancellation_and_deadline_fail_reads_before_work() {
-    let fixture = fixture(backend(DeterministicConfig::default())).await;
+    let fixture = fixture(backend(TestConfig::default())).await;
 
     let cancellation = CancellationToken::new();
     cancellation.cancel();
@@ -817,7 +817,7 @@ async fn cancellation_and_deadline_fail_reads_before_work() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reads_after_shutdown_fail_closed() {
-    let fixture = fixture(backend(DeterministicConfig::default())).await;
+    let fixture = fixture(backend(TestConfig::default())).await;
     fixture.runtime.shutdown().await.expect("shutdown");
 
     let error = fixture
@@ -834,7 +834,7 @@ async fn reads_after_shutdown_fail_closed() {
     assert_eq!(error.kind(), ErrorKind::RuntimeClosed);
 }
 
-async fn delete_raw(backend: &SharedBackend, key: Vec<u8>) {
+async fn delete_raw(backend: &MemoryBackend, key: Vec<u8>) {
     let mut raw = backend.begin_write().await.expect("begin write");
     raw.delete(Bytes::from(key))
         .await

@@ -26,7 +26,7 @@ use ktann::storage::keys;
 use tokio_util::sync::CancellationToken;
 
 use support::observe::{audit_lock, capture};
-use support::{CommitFault, DeterministicBackend, DeterministicConfig, SharedBackend, audit};
+use support::{CommitFault, MemoryBackend, TestConfig, audit};
 
 #[allow(dead_code)]
 mod support;
@@ -106,7 +106,7 @@ fn search_request(k: usize) -> SearchRequest {
 
 /// Polls until every partition of the index is `Ready`: all offered Fixups
 /// have executed to completion.
-async fn wait_for_maintenance(backend: &SharedBackend, index: &Index<SharedBackend>) {
+async fn wait_for_maintenance(backend: &MemoryBackend, index: &Index<MemoryBackend>) {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut ready_rounds = 0_u8;
     loop {
@@ -134,7 +134,7 @@ async fn wait_for_maintenance(backend: &SharedBackend, index: &Index<SharedBacke
 }
 
 /// Writes garbage bytes at one raw key, bypassing every invariant.
-async fn raw_put(backend: &SharedBackend, key: Vec<u8>) {
+async fn raw_put(backend: &MemoryBackend, key: Vec<u8>) {
     let mut txn = backend.begin_write().await.expect("begin write");
     txn.put(Bytes::from(key), Bytes::from_static(b"garbage"))
         .await
@@ -166,7 +166,7 @@ async fn redaction_audit_covers_all_paths() {
     capture.clear();
 
     // Phase A: success paths with live maintenance workers.
-    let backend = SharedBackend::new(DeterministicBackend::new(DeterministicConfig::default()));
+    let backend = MemoryBackend::with_test_config(TestConfig::default());
     let runtime = Runtime::new(
         backend.clone(),
         RuntimeConfig::default()
@@ -281,7 +281,7 @@ async fn redaction_audit_covers_all_paths() {
 
     // Phase B: retry, commit-unknown, corruption, and cancellation paths with
     // maintenance disabled so fault injection is deterministic.
-    let backend = SharedBackend::new(DeterministicBackend::new(DeterministicConfig::default()));
+    let backend = MemoryBackend::with_test_config(TestConfig::default());
     let runtime =
         Runtime::new(backend.clone(), support::manual_maintenance_config()).expect("runtime");
     let dirty = runtime
@@ -292,17 +292,13 @@ async fn redaction_audit_covers_all_paths() {
         dirty.insert(record(n, 3)).await.expect("insert");
     }
 
-    backend
-        .inner()
-        .push_fault(CommitFault::Abort)
-        .expect("fault");
+    backend.push_fault(CommitFault::Abort).expect("fault");
     dirty
         .insert(record(14, 3))
         .await
         .expect("insert after retry");
 
     backend
-        .inner()
         .push_fault(CommitFault::UnknownApplied)
         .expect("fault");
     let unknown = dirty

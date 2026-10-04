@@ -16,8 +16,9 @@ application with the storage backend that fits your deployment.
 - **Built for changing data.** Online inserts, updates, and deletes do not
   require rebuilding the index. Background splits and merges preserve a
   searchable topology at every committed step.
-- **Embedded or distributed storage.** Use RocksDB for an embedded deployment
-  or FoundationDB for transactional distributed storage. Both adapters share
+- **In-memory, embedded, or distributed storage.** Use Memory for ephemeral
+  indexes, RocksDB for embedded persistence, or FoundationDB for transactional
+  distributed storage. All adapters share
   the same index algorithms and logical transaction contract.
 - **Filters that mean what they say.** Typed metadata predicates use SQL
   `WHERE` semantics. Partition summaries prune unnecessary work; every returned
@@ -33,7 +34,7 @@ application with the storage backend that fits your deployment.
   read-only index verification, metrics, tracing, and graceful shutdown support
   the full lifecycle of an index.
 
-The core library, both storage adapters, search, online maintenance, import,
+The core library, all three storage adapters, search, online maintenance, import,
 and verification are implemented. KTANN is pre-1.0: APIs and persistent formats
 may change, and there is no stable release yet.
 
@@ -49,6 +50,7 @@ KTANN Runtime + Index
        v
 Backend-neutral transaction contract
        |
+       +-- Memory          ephemeral in-process storage
        +-- RocksDB         embedded storage
        +-- FoundationDB    distributed storage
 ```
@@ -70,7 +72,8 @@ FoundationDB.
 
 ## Get started
 
-Use the latest stable Rust toolchain. RocksDB builds require a C++ toolchain
+Use the latest stable Rust toolchain. The [Memory adapter](ktann-memory/README.md)
+needs no native libraries or external services. RocksDB builds require a C++ toolchain
 and Clang/libclang; FoundationDB additionally requires its 7.3 native client
 library. See the
 [RocksDB](ktann-rocksdb/README.md) and
@@ -79,10 +82,11 @@ library. See the
 From a checkout:
 
 ```sh
-make build       # Core, RocksDB adapter, and benchmark tools
+make build       # Core, Memory and RocksDB adapters, and benchmark tools
 make test        # Tests that do not need a FoundationDB installation
 make doc         # Generate API documentation in target/doc
 make bench       # Run the optimized RocksDB smoke benchmark
+cargo test -p ktann-memory  # Memory adapter, no native dependencies
 ```
 
 For embedding, use the `ktann` crate together with a storage adapter. Construct

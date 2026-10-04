@@ -50,10 +50,36 @@ idempotent persistent-state recovery rule.
 
 ## 3. Backend mappings
 
+Memory uses a structurally shared ordered map with immutable read snapshots
+and optimistic write transactions. Each new backend is one isolated Backend
+Namespace; clones share its keyspace. Commits validate protected point reads,
+including absent-key ABA changes, and atomically publish only the staged writes
+on the latest committed root. A short-lived mutex serializes snapshot
+registration and commits. There is no IO, persistence, eviction, or total-memory
+quota. Live snapshots retain old data; applications control their lifetime.
+Conflict history is reclaimed when writers finish and capped at 100,000 key
+references and 8 MiB of key bytes. Writers with protected reads older than that
+window abort with `RetryableAbort`. The adapter enforces 10,000-byte keys,
+100,000-byte values, and budgets of 10,000 mutations and 1 MiB per transaction.
+It does not advertise transactional range clear, so index drop uses bounded
+point deletes. See [ADR 0024](../adr/0024-production-memory-adapter.md).
+
 FoundationDB maps update-protected reads to conflict-establishing reads and
 supports transactional logical range clear. Its adapter exposes actual database
 limits and keeps write transactions short; snapshot expiry is a Backend error,
 not a hidden four-second deadline.
+ReadTxn disables native read-your-writes bookkeeping because it cannot mutate;
+its pinned snapshot is unchanged. WriteTxn retains native read-your-writes.
+
+Snapshot `batch_get` may combine two equal-length keys with consecutive final
+bytes into one native range request, notably adjacent Record/Location values.
+It fetches at most two rows, returns only the requested keys, and point-reads
+missing targets if intervening keys or a short page prevented completion.
+Order, duplicates, absent values, and the transaction snapshot are preserved.
+The combined read remains bounded even when key extensions intervene. Maximum
+length keys and update-protected reads use ordinary point reads, preserving
+native key limits and exact write-conflict scope. Range values retain their
+native owner rather than copying value buffers.
 
 RocksDB uses `OptimisticTransactionDB`. ReadTxn owns a Snapshot. WriteTxn enables
 a transaction snapshot and binds every read option to it while retaining
@@ -82,7 +108,7 @@ and update-protects that exact manifest. Record/Location/Leaf/payload groups are
 indivisible even while Building topology is incomplete. A complete snapshot audit
 precedes the atomic Building-to-Active transition; ordinary operations reject
 Building. Explicit drop can fence Building and remove its index-owned range.
-See proposed ADR 0024.
+See proposed ADR 0025.
 
 FoundationDB may atomically clear the complete data range and remove the
 Dropping Manifest. Without transactional range clear, core deletes bounded
@@ -208,8 +234,11 @@ proof, such as index drop.
 
 ## 9. Verification
 
-Backend contract tests run unchanged against a deterministic test backend,
-FoundationDB, and RocksDB. They cover snapshot consistency, read-your-writes,
+Backend contract tests run unchanged against Memory, FoundationDB, and RocksDB.
+Core tests use Memory's optional `test-support` controls for faults, replay,
+resource ceilings, and simulated restart; there is no separate in-memory
+transaction implementation. Default adapter builds omit this instrumentation.
+The tests cover snapshot consistency, read-your-writes,
 conflicts, unique insertion, gap-free scan pagination across item and byte
 boundaries, empty ranges, oversized values, exact-boundary exhaustion, batched
 multi-range scans with independent per-range pagination, limits,

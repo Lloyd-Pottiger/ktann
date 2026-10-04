@@ -28,7 +28,7 @@ use ktann::storage::values::{
 use ktann::storage::{ReadLogicalTxn, WriteLogicalTxn};
 use tokio_util::sync::CancellationToken;
 
-use support::{DeterministicBackend, DeterministicConfig, SharedBackend, audit};
+use support::{MemoryBackend, TestConfig, audit};
 
 #[allow(dead_code)]
 mod support;
@@ -91,8 +91,8 @@ fn record_wide(id: u32, dimension: usize, bucket: i64) -> Record {
 
 async fn setup(
     config: IndexConfig,
-) -> (SharedBackend, Runtime<SharedBackend>, Index<SharedBackend>) {
-    let backend = SharedBackend::new(DeterministicBackend::new(DeterministicConfig::default()));
+) -> (MemoryBackend, Runtime<MemoryBackend>, Index<MemoryBackend>) {
+    let backend = MemoryBackend::with_test_config(TestConfig::default());
     let runtime =
         Runtime::new(backend.clone(), support::manual_maintenance_config()).expect("runtime");
     let index = runtime
@@ -102,7 +102,7 @@ async fn setup(
     (backend, runtime, index)
 }
 
-async fn insert_all(index: &Index<SharedBackend>, records: Vec<Record>) {
+async fn insert_all(index: &Index<MemoryBackend>, records: Vec<Record>) {
     // The deterministic backend's default admission budget bounds one
     // transaction, so loads commit in bounded batches.
     for chunk in records.chunks(100) {
@@ -115,9 +115,9 @@ async fn insert_all(index: &Index<SharedBackend>, records: Vec<Record>) {
 
 /// Two records in one tree's single root leaf: `r0` scores 0, `r1` scores 1.
 async fn two_record_setup() -> (
-    SharedBackend,
-    Runtime<SharedBackend>,
-    Index<SharedBackend>,
+    MemoryBackend,
+    Runtime<MemoryBackend>,
+    Index<MemoryBackend>,
     IndexManifest,
 ) {
     let (backend, runtime, index) = setup(config()).await;
@@ -129,7 +129,7 @@ async fn two_record_setup() -> (
 /// Writes one typed but semantically inconsistent value, bypassing the
 /// mutation protocol's invariants.
 async fn typed_put(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     key: LogicalKey,
     value: PersistentValue,
@@ -145,20 +145,20 @@ async fn typed_put(
     txn.commit().await.expect("commit");
 }
 
-async fn raw_put(backend: &SharedBackend, key: Vec<u8>, value: Bytes) {
+async fn raw_put(backend: &MemoryBackend, key: Vec<u8>, value: Bytes) {
     let mut txn = backend.begin_write().await.expect("begin write");
     txn.put(Bytes::from(key), value).await.expect("raw put");
     txn.commit().await.expect("commit");
 }
 
-async fn raw_delete(backend: &SharedBackend, key: Vec<u8>) {
+async fn raw_delete(backend: &MemoryBackend, key: Vec<u8>) {
     let mut txn = backend.begin_write().await.expect("begin write");
     txn.delete(Bytes::from(key)).await.expect("raw delete");
     txn.commit().await.expect("commit");
 }
 
 async fn read_leaf_entry(
-    backend: &SharedBackend,
+    backend: &MemoryBackend,
     manifest: &IndexManifest,
     bucket: i64,
     partition: PartitionKey,
@@ -210,7 +210,7 @@ async fn healthy_index_verifies_complete_and_writes_nothing() {
     .await;
     // Six records across three trees, each a single Ready root leaf.
 
-    backend.inner().reset_operation_counts();
+    backend.reset_operation_counts();
     let report = index
         .verify(VerifyOptions::default())
         .await
@@ -235,7 +235,7 @@ async fn healthy_index_verifies_complete_and_writes_nothing() {
     assert_eq!(report.topology.actionable_partitions, 0);
 
     // The audit is read-only: no mutation or clear calls reached the backend.
-    let counts = backend.inner().operation_counts();
+    let counts = backend.operation_counts();
     assert_eq!(counts.put, 0);
     assert_eq!(counts.insert, 0);
     assert_eq!(counts.delete, 0);
@@ -821,7 +821,7 @@ async fn dropped_index_verify_fails_closed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn corruption_in_one_index_does_not_leak_into_another() {
-    let backend = SharedBackend::new(DeterministicBackend::new(DeterministicConfig::default()));
+    let backend = MemoryBackend::with_test_config(TestConfig::default());
     let runtime =
         Runtime::new(backend.clone(), support::manual_maintenance_config()).expect("runtime");
     let first = runtime

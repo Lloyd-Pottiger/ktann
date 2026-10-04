@@ -29,6 +29,8 @@ jobs:
         run: .github/scripts/setup-foundationdb.sh client
       - name: Test workspace
         run: cargo +stable test --workspace --all-targets
+      - name: Test Memory without test controls, including quick start
+        run: cargo +stable test -p ktann-memory
       - name: Check public documentation
         env:
           RUSTDOCFLAGS: -Dwarnings
