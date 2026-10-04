@@ -103,13 +103,18 @@ pub(super) fn approximate_distances<const N: usize>(
     let scales = codes.map(|code| f64::from(code.header.scale));
     let mut dots = [0.0_f64; N];
     let mut odd_dots = [0.0_f64; N];
-    for (pair_index, pair) in query.components.as_chunks::<2>().0.iter().enumerate() {
-        let index = pair_index * 2;
+    // Matching dimensions give every code iterator exactly the query's pair count.
+    // Chunk traversal lets the compiler hoist code pointers and bounds checks.
+    let mut code_pairs = codes.map(|code| code.codes.as_chunks::<2>().0.iter());
+    for pair in query.components.as_chunks::<2>().0 {
         let even = f64::from(pair[0]);
         let odd = f64::from(pair[1]);
         for lane in 0..N {
-            dots[lane] += even * f64::from(codes[lane].codes[index]);
-            odd_dots[lane] += odd * f64::from(codes[lane].codes[index + 1]);
+            let code_pair = code_pairs[lane]
+                .next()
+                .expect("validated matching dimensions");
+            dots[lane] += even * f64::from(code_pair[0]);
+            odd_dots[lane] += odd * f64::from(code_pair[1]);
         }
     }
     if !query.components.len().is_multiple_of(2) {

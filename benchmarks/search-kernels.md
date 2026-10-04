@@ -1,9 +1,9 @@
 # Resident search kernel trials
 
-Neither candidate established a repeatable whole-search improvement sufficient
-for retention. Both were restored; the production search implementation remains
-at the [resident baseline](search-residency.md). The earlier exact-reranking
-optimization remains unchanged.
+The routing-validation and query-widening candidates did not establish a
+repeatable whole-search improvement and were restored. A subsequent safe
+code-chunk traversal did improve both million-vector workloads and is retained.
+The earlier exact-reranking optimization remains unchanged.
 
 ## Controlled workload
 
@@ -136,3 +136,59 @@ adding `--reuse-index true --query-concurrency 16,4` and using each archived
 executable in B/C/C/B order with separate output files. Continue comparisons
 with reopened fixtures on both sides; a fresh import changes storage/cache
 lifecycle and is not a causal counterpart.
+
+## Traverse decoded codes in pairs
+
+The retained candidate changes only `approximate_distances`: after validating
+matching dimensions, each lane advances an iterator over two signed codes.
+The query still supplies one even and one odd component per iteration, with
+separate sums and the same final addition and scale. The trailing odd component,
+interval calculation, errors, record loads, and cache representations are
+unchanged. The iterators allocate nothing and add no per-search heap storage.
+Existing bitwise tests cover both one and four lanes, odd dimensions, numeric
+extremes, and all metrics.
+
+The emitted arm64 four-lane baseline loop contained two shared code-index bounds
+branches and four code-pointer reloads per pair. The candidate removes those
+branches and keeps the pointers in registers outside the loop. Signed-code
+conversion and arithmetic remain scalar. This establishes the instruction
+mechanism without claiming hardware-cache or bandwidth attribution.
+
+A separate B/C/C/B comparison used the controlled workload above, with the same
+fixtures and options. Values below are arithmetic means of two repetitions;
+latencies are means of the per-run percentiles, rather than pooled percentiles.
+
+| Dataset | Clients | QPS baseline → candidate | CPU ms/query baseline → candidate | p50 ms baseline → candidate | p99 ms baseline → candidate |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Cohere | 16 | 831 → 902 (+8.6%) | 9.327 → 8.630 (−7.5%) | 18.735 → 17.259 | 27.948 → 26.085 |
+| Cohere | 4 | 505 → 548 (+8.6%) | 7.887 → 7.251 (−8.1%) | 7.898 → 7.273 | 8.378 → 7.703 |
+| SIFT | 16 | 2112 → 2222 (+5.2%) | 3.624 → 3.520 (−2.9%) | 7.194 → 6.916 | 11.884 → 10.962 |
+| SIFT | 4 | 1305 → 1352 (+3.6%) | 3.040 → 2.955 (−2.8%) | 3.009 → 2.927 | 3.320 → 3.209 |
+
+Both candidate repetitions outperform both baseline repetitions in QPS,
+CPU/query, p50 and p99 at every point. Saturated CPU occupancy was 7.63–7.87
+cores baseline and 7.77–7.80 candidate for Cohere, 7.46–7.85 baseline and
+7.77–7.87 candidate for SIFT. Some saturated QPS benefit therefore includes
+occupancy variation; CPU/query and four-client measurements also improve.
+Cohere's four-client approximate-selection mean falls from 5.64–5.68 to
+5.03–5.04 ms, while exact reranking stays near 2.16 ms; SIFT's corresponding
+approximate mean falls from 2.24–2.28 to 2.16 ms.
+
+All reports have identical dataset, topology, recall (within `1e-12` for
+concurrent mean reduction), budgets, visited entries, decoded-cache statistics,
+logical backend IO, successful search counts, and empty error counts. Each point
+has zero physical writes, with 0 or 4 KiB physical reads for Cohere and zero for
+SIFT. Final native cache occupancy matches the earlier trials. This demonstrates
+a resident RocksDB search improvement on these corpora and this arm64 host;
+it does not establish FoundationDB or other-architecture performance.
+
+Evidence is retained under
+`/Users/lloyd/projects/ktann/.benchmark-data/results/search-chunks-20261005-31d4`,
+including eight JSON reports and logs, scripts, source diff, binaries, disassembly,
+hashes, invariant comparison, and verification logs.
+
+Verification passed: 234 library tests (one existing training benchmark ignored),
+43 codec tests, 15 search tests, the public API corpus, and the independent ground
+truth test. Formatting and `cargo clippy -p ktann --all-targets --all-features --
+-D warnings` passed. An independent read-only review of the full change set found
+no actionable issues.
