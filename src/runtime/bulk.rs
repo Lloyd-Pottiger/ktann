@@ -396,7 +396,25 @@ fn refine(
         for (source, leaf) in leaves.iter().enumerate() {
             checkpoint()?;
             let mut distances = Vec::with_capacity(leaves.len() - 1);
-            for (target, candidate) in leaves.iter().enumerate() {
+            // Reuse the search kernel's independent accumulators without
+            // changing any distance bits or the deterministic target ordering.
+            let (batches, tail) = leaves.as_chunks::<4>();
+            for (batch, candidates) in batches.iter().enumerate() {
+                let scores = kernel.routing_centroid_distances(
+                    &leaf.center,
+                    candidates
+                        .each_ref()
+                        .map(|candidate| candidate.center.as_ref()),
+                )?;
+                for (lane, distance) in scores.into_iter().enumerate() {
+                    let target = batch * 4 + lane;
+                    if target != source {
+                        distances.push((distance, target));
+                    }
+                }
+            }
+            for (offset, candidate) in tail.iter().enumerate() {
+                let target = batches.len() * 4 + offset;
                 if target != source {
                     distances.push((
                         kernel.routing_distance(&leaf.center, &candidate.center)?,
@@ -404,13 +422,19 @@ fn refine(
                     ));
                 }
             }
-            distances.sort_by(|left, right| left.0.total_cmp(&right.0).then(left.1.cmp(&right.1)));
-            distances.truncate(options.neighbors);
+            let compare = |left: &(f64, usize), right: &(f64, usize)| {
+                left.0.total_cmp(&right.0).then(left.1.cmp(&right.1))
+            };
+            if distances.len() > options.neighbors {
+                distances.select_nth_unstable_by(options.neighbors, compare);
+                distances.truncate(options.neighbors);
+            }
+            distances.sort_unstable_by(compare);
             neighbors.push(
                 distances
                     .into_iter()
                     .map(|(_, target)| target)
-                    .collect::<Vec<_>>(),
+                    .collect::<Box<[_]>>(),
             );
         }
         let mut moves = Vec::new();
@@ -420,7 +444,19 @@ fn refine(
                 let vector = &vectors[position];
                 let old = kernel.routing_distance(vector, &leaf.center)?;
                 let mut best = (old, source);
-                for &target in &neighbors[source] {
+                let (batches, tail) = neighbors[source].as_chunks::<4>();
+                for targets in batches {
+                    let distances = kernel.routing_centroid_distances(
+                        vector,
+                        targets.map(|target| leaves[target].center.as_ref()),
+                    )?;
+                    for (&target, distance) in targets.iter().zip(distances) {
+                        if distance < best.0 {
+                            best = (distance, target);
+                        }
+                    }
+                }
+                for &target in tail {
                     let distance = kernel.routing_distance(vector, &leaves[target].center)?;
                     if distance < best.0 {
                         best = (distance, target);
@@ -897,6 +933,45 @@ mod tests {
         assert_eq!(leaves[1].members, [2, 3]);
         assert_eq!(leaves[0].center.as_ref(), [0.5]);
         assert_eq!(leaves[1].center.as_ref(), [9.5]);
+    }
+
+    #[test]
+    fn refinement_batches_preserve_target_mapping_and_tail_neighbors() {
+        let kernel = VectorKernel::new(1, crate::api::Metric::L2, [0; 32]).unwrap();
+        let vectors: Vec<Box<[f32]>> = (0..9)
+            .flat_map(|cluster| {
+                [-0.1, 0.0, 0.1].map(|offset| vec![cluster as f32 * 10.0 + offset].into())
+            })
+            .collect();
+        // Exchange one member between adjacent clusters. The ninth leaf is
+        // unchanged and exercises the centroid batch tail. Varying the neighbor
+        // count covers both partial selection and a partial distance batch.
+        for neighbor_count in [2, 4, 5, 8, 32] {
+            let mut leaves: Vec<_> = (0..9)
+                .map(|cluster| Part {
+                    key: PartitionKey::new(cluster as u64 + 2).unwrap(),
+                    level: 1,
+                    members: (cluster * 3..cluster * 3 + 3).collect(),
+                    center: vec![cluster as f32 * 10.0].into(),
+                })
+                .collect();
+            for pair in leaves[..8].as_chunks_mut::<2>().0 {
+                let (left, right) = pair.split_at_mut(1);
+                std::mem::swap(&mut left[0].members[2], &mut right[0].members[2]);
+            }
+            let options = BulkBuildOptions::new(4096)
+                .unwrap()
+                .with_neighbor_centroids(neighbor_count)
+                .unwrap();
+            refine(&|| Ok(()), &kernel, &vectors, &mut leaves, 1, 5, &options).unwrap();
+            for (cluster, leaf) in leaves.iter().enumerate() {
+                assert_eq!(
+                    leaf.members,
+                    (cluster * 3..cluster * 3 + 3).collect::<Vec<_>>(),
+                    "neighbors={neighbor_count}, cluster={cluster}"
+                );
+            }
+        }
     }
 
     /// Exercise real planning and serialization, not just caller error returns.
