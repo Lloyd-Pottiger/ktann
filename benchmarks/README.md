@@ -106,6 +106,8 @@ Partition Cache residency and raw-vector backend cache residency.
 
 [Resident production search baseline](search-residency.md) establishes stable
 million-vector CPU saturation with timed physical IO and retained fixtures.
+[Resident kernel trials](search-kernels.md) records repeated routing/rough-scoring
+experiments, their unchanged correctness/work, and why neither candidate was retained.
 
 The raw RocksDB block cache is independent of the decoded Partition Cache.
 `--rocksdb-block-cache-bytes N` sets its capacity (default 8 MiB); the worker
