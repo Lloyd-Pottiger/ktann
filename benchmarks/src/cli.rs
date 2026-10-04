@@ -78,6 +78,9 @@ struct ExecutionOptions {
     query_vectors: Option<usize>,
     query_offset: Option<usize>,
     max_partition_entries: Option<u32>,
+    query_concurrency: Option<Vec<usize>>,
+    partition_cache_bytes: Option<u64>,
+    leaf_beam_size: Option<u32>,
     lifecycle: LifecycleOverrides,
 }
 
@@ -117,6 +120,27 @@ impl ExecutionOptions {
                 .get("max-partition-entries")
                 .map(|value| parse_positive_u32(value, "max-partition-entries"))
                 .transpose()?,
+            query_concurrency: values
+                .get("query-concurrency")
+                .map(|value| {
+                    value
+                        .split(',')
+                        .map(|item| parse_positive(item, "query-concurrency"))
+                        .collect()
+                })
+                .transpose()?,
+            partition_cache_bytes: values
+                .get("partition-cache-bytes")
+                .map(|value| {
+                    value.parse::<u64>().map_err(|_| {
+                        "--partition-cache-bytes must be a nonnegative 64-bit integer".to_owned()
+                    })
+                })
+                .transpose()?,
+            leaf_beam_size: values
+                .get("leaf-beam-size")
+                .map(|value| parse_positive_u32(value, "leaf-beam-size"))
+                .transpose()?,
             lifecycle: LifecycleOverrides::parse(values)?,
         })
     }
@@ -127,6 +151,9 @@ const SCENARIO_OPTIONS: &[&str] = &[
     "profile",
     "scenario",
     "worker-threads",
+    "query-concurrency",
+    "partition-cache-bytes",
+    "leaf-beam-size",
     "write-beam-size",
     "refinement-rounds",
     "base-vectors",
@@ -211,6 +238,11 @@ fn parse_run_options(arguments: &[OsString]) -> Result<RunOptions, String> {
         .unwrap_or_else(|| "smoke".to_owned());
     let scenario = values.get("scenario").cloned();
     let execution = ExecutionOptions::parse(&values)?;
+    if profile != "large"
+        && (execution.query_concurrency.is_some() || execution.leaf_beam_size.is_some())
+    {
+        return Err("--query-concurrency and --leaf-beam-size require --profile large".to_owned());
+    }
     if !execution.lifecycle.is_empty()
         && profile != "large"
         && scenario.as_deref() != Some(IMPORT_LIFECYCLE_SCENARIO)
@@ -402,6 +434,24 @@ fn run_suite(options: RunOptions) -> Result<(), String> {
         let lifecycle = &options.execution.lifecycle;
         for (name, value) in [
             (
+                "query-concurrency",
+                options.execution.query_concurrency.as_ref().map(|values| {
+                    values
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                }),
+            ),
+            (
+                "partition-cache-bytes",
+                option_string(options.execution.partition_cache_bytes),
+            ),
+            (
+                "leaf-beam-size",
+                option_string(options.execution.leaf_beam_size),
+            ),
+            (
                 "write-beam-size",
                 option_string(options.execution.write_beam_size),
             ),
@@ -471,6 +521,21 @@ fn run_worker(options: WorkerOptions) -> Result<(), String> {
         .find(|scenario| scenario.name == options.scenario)
         .ok_or_else(|| format!("unknown scenario `{}`", options.scenario))?;
     options.execution.lifecycle.apply(&mut scenario);
+    if let Some(concurrency) = &options.execution.query_concurrency {
+        if scenario.profile != "large" {
+            return Err("--query-concurrency requires --profile large".to_owned());
+        }
+        scenario.query_concurrency_sweep = concurrency.clone();
+    }
+    if let Some(bytes) = options.execution.partition_cache_bytes {
+        scenario.partition_cache_bytes = bytes;
+    }
+    if let Some(beam) = options.execution.leaf_beam_size {
+        if scenario.profile != "large" {
+            return Err("--leaf-beam-size requires --profile large".to_owned());
+        }
+        scenario.leaf_beam_sweep = vec![beam];
+    }
     if let Some(rounds) = options.execution.refinement_rounds {
         if rounds > 5 || scenario.leaf_beam_sweep.is_empty() {
             return Err("--refinement-rounds requires a quality sweep and 0..=5 rounds".to_owned());
@@ -793,6 +858,42 @@ fn usage() -> String {
 #[cfg(test)]
 mod tests {
     use super::{option_map, parse_compare_options, parse_run_options, shell_quote};
+
+    #[test]
+    fn large_search_diagnostics_parse_and_reject_invalid_counts() {
+        let arguments = [
+            "--backend",
+            "rocksdb",
+            "--profile",
+            "large",
+            "--query-concurrency",
+            "1,4,16,4",
+            "--partition-cache-bytes",
+            "0",
+            "--leaf-beam-size",
+            "32",
+        ]
+        .map(std::ffi::OsString::from);
+        let options = parse_run_options(&arguments).expect("large diagnostics");
+        assert_eq!(options.execution.query_concurrency, Some(vec![1, 4, 16, 4]));
+        assert_eq!(options.execution.partition_cache_bytes, Some(0));
+        assert_eq!(options.execution.leaf_beam_size, Some(32));
+        for counts in ["", "0", "1,0", "1,", "-1"] {
+            let arguments = [
+                "--backend",
+                "rocksdb",
+                "--profile",
+                "large",
+                "--query-concurrency",
+                counts,
+            ]
+            .map(std::ffi::OsString::from);
+            assert!(parse_run_options(&arguments).is_err(), "{counts}");
+        }
+        let arguments =
+            ["--backend", "rocksdb", "--query-concurrency", "1"].map(std::ffi::OsString::from);
+        assert!(parse_run_options(&arguments).is_err());
+    }
 
     #[test]
     fn offline_refinement_option_accepts_zero_rounds() {

@@ -85,6 +85,8 @@ pub struct ScenarioSpec {
     pub blocking_resource_limit: Option<usize>,
     /// Concurrent clients in the timed workload.
     pub concurrency: usize,
+    /// Large-profile client counts measured on the same imported index.
+    pub query_concurrency_sweep: Vec<usize>,
     /// Dispatch policy for the bounded concurrent clients.
     pub dispatch: WorkloadDispatch,
     /// Operations outside the timed region that establish steady state.
@@ -156,6 +158,7 @@ fn smoke_scenarios() -> Vec<ScenarioSpec> {
         search_options: SearchOptions::default(),
         write_beam_size: 8,
         refinement_rounds: None,
+        query_concurrency_sweep: Vec::new(),
         leaf_beam_sweep: Vec::new(),
         max_partition_entries: 32,
         lifecycle: false,
@@ -237,6 +240,7 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
         search_options: SearchOptions::default(),
         write_beam_size: 8,
         refinement_rounds: None,
+        query_concurrency_sweep: Vec::new(),
         leaf_beam_sweep: Vec::new(),
         max_partition_entries: 128,
         lifecycle: false,
@@ -343,6 +347,7 @@ fn large_scenarios() -> Result<Vec<ScenarioSpec>, String> {
             search_options: SearchOptions::default(),
             write_beam_size: defaults.write_beam_size(),
             refinement_rounds: None,
+            query_concurrency_sweep: Vec::new(),
             leaf_beam_sweep: vec![1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128, 192, 256, 384],
             // Keep the shared leaf/internal fanout below sqrt(1M) so the
             // million-vector corpus must form at least three searchable levels.
@@ -507,6 +512,7 @@ pub async fn run_scenario<B: Backend>(
             refinement_input_limit_bytes: spec.refinement_rounds.map(|_| 32 << 30),
             leaf_beam_size_override: spec.search_options.leaf_beam_size(),
             leaf_beam_sweep: spec.leaf_beam_sweep.clone(),
+            query_concurrency_sweep: spec.query_concurrency_sweep.clone(),
             blocking_resource_limit: spec.blocking_resource_limit,
             backend_max_mutations: admission.max_mutations,
             backend_max_mutation_bytes: admission.max_mutation_bytes,
@@ -1142,32 +1148,43 @@ async fn run_quality_sweep<B: Backend>(
     // Release the imported million-vector corpus before measuring search.
     dataset.ids = Vec::new();
     dataset.base = Vec::new();
-    let mut points = Vec::with_capacity(spec.leaf_beam_sweep.len());
-    for beam in &spec.leaf_beam_sweep {
-        let mut point = spec.clone();
-        point.search_options = point
-            .search_options
-            .with_leaf_beam_size(*beam)
-            .map_err(|error| error_at("configure quality point", error))?;
-        let mut measurements = measure_steady_workload(
-            &index,
-            backend_counters,
-            metric_capture,
-            &point,
-            dataset,
-            Some(&truth),
-        )
-        .await?;
-        // getrusage exposes only the process-lifetime high-water mark, which
-        // setup already established and cannot attribute to one beam point.
-        measurements.peak_rss_bytes = None;
-        points.push(QualityPoint {
-            leaf_beam_size: *beam,
-            measurements,
-        });
+    let concurrencies = if spec.query_concurrency_sweep.is_empty() {
+        std::slice::from_ref(&spec.concurrency)
+    } else {
+        &spec.query_concurrency_sweep
+    };
+    let mut points = Vec::with_capacity(spec.leaf_beam_sweep.len() * concurrencies.len());
+    for concurrency in concurrencies {
+        for beam in &spec.leaf_beam_sweep {
+            let mut point = spec.clone();
+            point.concurrency = *concurrency;
+            point.search_options = point
+                .search_options
+                .with_leaf_beam_size(*beam)
+                .map_err(|error| error_at("configure quality point", error))?;
+            let mut measurements = measure_steady_workload(
+                &index,
+                backend_counters,
+                metric_capture,
+                &point,
+                dataset,
+                Some(&truth),
+            )
+            .await?;
+            // getrusage exposes only the process-lifetime high-water mark, which
+            // setup already established and cannot attribute to one beam point.
+            measurements.peak_rss_bytes = None;
+            points.push(QualityPoint {
+                leaf_beam_size: *beam,
+                concurrency: *concurrency,
+                measurements,
+            });
+        }
+        // Each client count retains the full quality/completion contract.
+        let start = points.len() - spec.leaf_beam_sweep.len();
+        validate_quality_frontier(&points[start..], spec.measured_operations)?;
     }
     verify_measured_state(&index, spec).await?;
-    validate_quality_frontier(&points, spec.measured_operations)?;
     Ok((
         topology,
         QualitySweepMeasurements {
@@ -1332,6 +1349,7 @@ async fn measure_steady_workload<B: Backend>(
         .search_options
         .leaf_beam_size()
         .map_or_else(|| "workload".to_owned(), |beam| format!("beam {beam}"));
+    let point = format!("{point} concurrency {}", spec.concurrency);
     let warmup_phase = format!("{point} warmup");
     let warmup_started = phase_started(spec, &warmup_phase);
     let _warmup_result =
@@ -1472,7 +1490,7 @@ fn validate_quality_frontier(
         .zip(recalls.iter().copied().reduce(f64::max))
         .is_some_and(|(minimum, maximum)| maximum > minimum);
     let work_moves = leaf_work.windows(2).any(|window| window[1] > window[0]);
-    if !recall_moves || !work_moves {
+    if points.len() > 1 && (!recall_moves || !work_moves) {
         return Err(
             "large quality sweep did not produce a nontrivial quality/work frontier".to_owned(),
         );
@@ -2313,6 +2331,7 @@ mod tests {
         };
         QualityPoint {
             leaf_beam_size: beam,
+            concurrency: 16,
             measurements,
         }
     }
@@ -2459,6 +2478,19 @@ mod tests {
                 "the shared partition fanout must force a third topology level"
             );
         }
+    }
+
+    #[test]
+    fn single_beam_diagnostic_still_requires_every_search_to_complete() {
+        let mut points = vec![quality_point(32, 2, 0.9, 10.0)];
+        assert!(validate_quality_frontier(&points, 2).is_ok());
+        points[0]
+            .measurements
+            .recall_at_k
+            .as_mut()
+            .expect("recall")
+            .queries = 1;
+        assert!(validate_quality_frontier(&points, 2).is_err());
     }
 
     #[test]

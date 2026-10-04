@@ -325,8 +325,11 @@ fn compare_quality_sweep(
         || baseline
             .points
             .iter()
-            .map(|point| point.leaf_beam_size)
-            .ne(candidate.points.iter().map(|point| point.leaf_beam_size))
+            .map(|point| (point.concurrency, point.leaf_beam_size))
+            .ne(candidate
+                .points
+                .iter()
+                .map(|point| (point.concurrency, point.leaf_beam_size)))
     {
         result
             .regressions
@@ -334,7 +337,10 @@ fn compare_quality_sweep(
         return;
     }
     for (baseline, candidate) in baseline.points.iter().zip(&candidate.points) {
-        let point_key = format!("{key}/leaf_beam={}", baseline.leaf_beam_size);
+        let point_key = format!(
+            "{key}/concurrency={}/leaf_beam={}",
+            baseline.concurrency, baseline.leaf_beam_size
+        );
         compare_steady_state(
             result,
             &point_key,
@@ -1355,6 +1361,7 @@ mod tests {
                 refinement_input_limit_bytes: None,
                 leaf_beam_size_override: None,
                 leaf_beam_sweep: Vec::new(),
+                query_concurrency_sweep: Vec::new(),
                 blocking_resource_limit: Some(2),
                 backend_max_mutations: 100,
                 backend_max_mutation_bytes: 1_000,
@@ -1449,10 +1456,12 @@ mod tests {
                 points: vec![
                     QualityPoint {
                         leaf_beam_size: 1,
+                        concurrency: 16,
                         measurements: (*measurements).clone(),
                     },
                     QualityPoint {
                         leaf_beam_size: 32,
+                        concurrency: 16,
                         measurements: (*measurements).clone(),
                     },
                 ],
@@ -1479,6 +1488,40 @@ mod tests {
     }
 
     #[test]
+    fn quality_comparison_rejects_changed_point_concurrency() {
+        let mut baseline = report();
+        let ReportMeasurements::SteadyState(measurements) = baseline.measurements else {
+            panic!("steady fixture")
+        };
+        baseline.measurements =
+            ReportMeasurements::QualitySweep(Box::new(QualitySweepMeasurements {
+                construction: Default::default(),
+                points: vec![QualityPoint {
+                    leaf_beam_size: 32,
+                    concurrency: 4,
+                    measurements: *measurements,
+                }],
+            }));
+        let mut candidate = baseline.clone();
+        let ReportMeasurements::QualitySweep(sweep) = &mut candidate.measurements else {
+            panic!("quality fixture")
+        };
+        sweep.points[0].concurrency = 16;
+        let comparison = compare(
+            &suite(baseline),
+            &suite(candidate),
+            ComparisonPolicy::default(),
+        )
+        .expect("comparison");
+        assert!(
+            comparison
+                .regressions
+                .iter()
+                .any(|r| r.contains("quality sweep points changed"))
+        );
+    }
+
+    #[test]
     fn quality_comparison_includes_construction_cost() {
         let mut baseline = report();
         baseline.configuration.leaf_beam_sweep = vec![1];
@@ -1496,6 +1539,7 @@ mod tests {
                 construction,
                 points: vec![QualityPoint {
                     leaf_beam_size: 1,
+                    concurrency: 16,
                     measurements: *measurements,
                 }],
             }));
