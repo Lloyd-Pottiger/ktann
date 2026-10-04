@@ -27,6 +27,7 @@ pub(crate) mod fixup;
 pub(crate) mod import;
 pub(crate) mod lifecycle;
 pub(crate) mod reads;
+pub(crate) mod refine;
 pub(crate) mod search;
 pub(crate) mod verify;
 pub(crate) mod writes;
@@ -270,6 +271,8 @@ pub(crate) struct OperationContext<B: Backend> {
     write_beam_size: u32,
     partition_cache: Arc<PartitionCache>,
     commit_start: Option<CommitStart>,
+    // Refinement CPU tasks retain this shared admission through actual task exit.
+    cpu_admission: Option<Arc<Admission<B>>>,
 }
 
 impl<B: Backend> OperationContext<B> {
@@ -420,6 +423,19 @@ impl<B: Backend> RuntimeInner<B> {
                 return Err(error);
             }
         };
+        // Ordinary operations retain direct admission without an allocation.
+        // Refinement shares ownership with cooperatively cancelled CPU work.
+        let admission = if operation == Operation::Refine {
+            ForegroundAdmission::Shared {
+                guard: Arc::new(admission),
+            }
+        } else {
+            ForegroundAdmission::Direct { _guard: admission }
+        };
+        let cpu_admission = match &admission {
+            ForegroundAdmission::Shared { guard } => Some(Arc::clone(guard)),
+            ForegroundAdmission::Direct { .. } => None,
+        };
         let cancellation = options.cancellation().cloned();
         let deadline = options.deadline();
         let (commit_cancellation, commit_start) = CommitCancellation::pair();
@@ -429,6 +445,7 @@ impl<B: Backend> RuntimeInner<B> {
             write_beam_size: self.config.write_beam_size(),
             partition_cache: self.partition_cache(),
             commit_start: Some(commit_start),
+            cpu_admission,
         };
         // `observed` tracks whether the spawned task reported the operation's
         // true outcome; the caller side reports only when it won the
@@ -691,6 +708,12 @@ enum Phase {
     Closing,
     Releasing,
     Closed,
+}
+
+/// Only offline refinement needs shared ownership of a foreground admission.
+enum ForegroundAdmission<B: Backend> {
+    Direct { _guard: Admission<B> },
+    Shared { guard: Arc<Admission<B>> },
 }
 
 struct Admission<B: Backend> {

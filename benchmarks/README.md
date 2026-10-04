@@ -55,7 +55,8 @@ cargo run --release -p ktann-benchmarks --bin ktann-bench -- \
 Each curve uses `k=100`, 1,000 held-out queries, 1,000 warmups, 16 concurrent
 clients, and 10,000 measured operations per beam. Repeated queries reduce timing
 noise; they do not add independent recall samples. Import batches contain 50
-records. The leaf beam sweep is `8, 16, 24, 32, 48, 64, 128, 192, 256, 384`.
+records. The leaf beam sweep is
+`1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128, 192, 256, 384`.
 
 Runtime and Logical Index settings use library defaults, including Partition
 Cache sizing, maintenance concurrency, retry limits, and partition occupancy.
@@ -246,3 +247,23 @@ Use a fresh bridge and dedicated backend location per case. Shutdown finishes
 import, drops the Logical Index, and removes the socket. After a crash, confirm
 the old process has exited before removing its stale socket; startup never
 unlinks a preexisting socket.
+
+### Offline refinement after import
+
+Quality sweeps accept `--refinement-rounds 0..5`. Omit the flag for the ordinary
+import baseline; `0` recomputes centroids without relocation rounds, and `2` or
+`5` requests bounded local refinement. Every path uses ordinary import and settles
+topology until maintenance is drained before refinement. The runner issues no
+other index operations during refinement and starts measured queries afterward.
+The existing tree's partition IDs and topology remain fixed.
+
+Reports record the requested rounds, 32 neighbor centroids, the 32 GiB refinement
+input limit, completed rounds and moves. The input limit covers loaded vectors,
+IDs, centroids and topology representation; numerical workspace and move lists
+add memory. Construction wall time, CPU and backend work include import,
+maintenance convergence and refinement. The convergence phase includes refinement.
+Compare the ordinary baseline and each refinement setting on identical import
+and search parameters; zero rounds is a centroid-recomputation control. Existing
+bulk-builder research measurements use a different initialization/publication
+pipeline and do not establish quality or performance for this API. Archive the
+executable and source/binary hashes before timing under the shared resource lock.

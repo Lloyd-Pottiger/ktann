@@ -197,6 +197,15 @@ impl FixupQueue {
 }
 
 impl<B: Backend> RuntimeInner<B> {
+    /// Includes pending and running work; worker handoff stays under the same lock.
+    /// Refinement's caller must exclude new offers from concurrent index operations.
+    pub(crate) fn has_fixups(&self, index: LogicalIndexId) -> bool {
+        self.lock_fixups()
+            .admitted
+            .iter()
+            .any(|key| key.index == index)
+    }
+
     /// Offers one batch of discovered partitions to the bounded Fixup queue.
     ///
     /// Best-effort by contract: an offer after shutdown began, a duplicate

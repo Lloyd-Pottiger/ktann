@@ -8,8 +8,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use ktann::api::{
     DataType, ErrorKind, FieldId, FieldSchema, ImportOptions, ImportSession, Index, IndexConfig,
-    Metric, Mutation, OperationOptions, Record, RuntimeConfig, SearchBudgets, SearchOptions,
-    SearchRequest, Value, VerifyOptions,
+    Metric, Mutation, OperationOptions, Record, RefineOptions, RuntimeConfig, SearchBudgets,
+    SearchOptions, SearchRequest, Value, VerifyOptions,
 };
 use ktann::runtime::Runtime;
 use ktann::storage::backend::Backend;
@@ -97,6 +97,8 @@ pub struct ScenarioSpec {
     pub search_options: SearchOptions,
     /// Per-level beam used while importing records into the tree.
     pub write_beam_size: u32,
+    /// Offline refinement rounds after ordinary import; None skips refinement.
+    pub refinement_rounds: Option<usize>,
     /// Ordered single-variable beam values; empty for ordinary scenarios.
     pub leaf_beam_sweep: Vec<u32>,
     /// Logical Index maximum partition size.
@@ -153,6 +155,7 @@ fn smoke_scenarios() -> Vec<ScenarioSpec> {
         k: 10,
         search_options: SearchOptions::default(),
         write_beam_size: 8,
+        refinement_rounds: None,
         leaf_beam_sweep: Vec::new(),
         max_partition_entries: 32,
         lifecycle: false,
@@ -233,6 +236,7 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
         k: 10,
         search_options: SearchOptions::default(),
         write_beam_size: 8,
+        refinement_rounds: None,
         leaf_beam_sweep: Vec::new(),
         max_partition_entries: 128,
         lifecycle: false,
@@ -338,6 +342,7 @@ fn large_scenarios() -> Result<Vec<ScenarioSpec>, String> {
             k: 100,
             search_options: SearchOptions::default(),
             write_beam_size: defaults.write_beam_size(),
+            refinement_rounds: None,
             leaf_beam_sweep: vec![1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128, 192, 256, 384],
             // Keep the shared leaf/internal fanout below sqrt(1M) so the
             // million-vector corpus must form at least three searchable levels.
@@ -497,6 +502,9 @@ pub async fn run_scenario<B: Backend>(
             maintenance_attempt_limit,
             search_budgets,
             write_beam_size: spec.write_beam_size,
+            refinement_rounds: spec.refinement_rounds,
+            refinement_neighbor_centroids: spec.refinement_rounds.map(|_| 32),
+            refinement_input_limit_bytes: spec.refinement_rounds.map(|_| 32 << 30),
             leaf_beam_size_override: spec.search_options.leaf_beam_size(),
             leaf_beam_sweep: spec.leaf_beam_sweep.clone(),
             blocking_resource_limit: spec.blocking_resource_limit,
@@ -1208,8 +1216,27 @@ async fn prepare_index<B: Backend>(
     let import_backlog = metric_capture.fixup_backlog();
 
     let deadline = Instant::now() + settle_timeout(spec);
-    let (topology, _) =
+    let (mut topology, _) =
         settle_and_drain_topology(&index, dataset, spec, metric_capture, deadline).await?;
+    if let Some(rounds) = spec.refinement_rounds {
+        wait_for_maintenance_until(metric_capture, deadline).await?;
+        let options = RefineOptions::new(32 << 30)
+            .and_then(|options| options.with_refinement_rounds(rounds))
+            .map_err(|error| error_at("refinement options", error))?;
+        let refinement_started = phase_started(spec, "refinement");
+        index
+            .refine(options)
+            .await
+            .map_err(|error| error_at("offline refinement", error))?;
+        phase_completed(spec, "refinement", refinement_started);
+        topology = verified_topology(
+            &index,
+            spec,
+            "verify refined topology",
+            Instant::now() + settle_timeout(spec),
+        )
+        .await?;
+    }
     let completed = Instant::now();
     let convergence_seconds = completed.duration_since(import_completed).as_secs_f64();
     let wall_seconds = completed.duration_since(import_started).as_secs_f64();
@@ -1230,6 +1257,8 @@ async fn prepare_index<B: Backend>(
         admission: import_metrics.admission_summary(),
         cache: import_metrics.cache_summary(),
     };
+    let refinement_rounds = convergence_metrics.counter("ktann.refine.rounds", &[]);
+    let refinement_moves = convergence_metrics.counter("ktann.refine.moves", &[]);
     drop(import_metrics);
     log_import_diagnostics(spec, &import);
     let convergence = ConstructionPhase {
@@ -1245,6 +1274,8 @@ async fn prepare_index<B: Backend>(
         cache: convergence_metrics.cache_summary(),
     };
     let construction = ConstructionMeasurements {
+        refinement_rounds,
+        refinement_moves,
         wall_seconds,
         cpu_seconds: Some(resources_after.cpu_seconds_since(resources_before)),
         peak_rss_bytes: Some(resources_after.peak_rss_bytes()),
@@ -2204,15 +2235,26 @@ fn git_revision() -> String {
 
 /// Identifies a failed benchmark phase without exposing caller-derived data.
 ///
-/// KTANN intentionally keeps public errors terse and privacy-safe. The phase
-/// prefix restores enough operational context to diagnose a broken benchmark
-/// while the suffix remains restricted to the stable public error category.
+/// Keep arbitrary source messages private, but retain FoundationDB's numeric
+/// error code so snapshot expiry is distinguishable from other backend failures.
 fn error_at(phase: &str, error: ktann::api::Error) -> String {
     format!("{phase}: {:?}", error.kind())
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn benchmark_error_keeps_arbitrary_source_messages_private() {
+        let error = ktann::api::Error::with_source(
+            ktann::api::ErrorKind::Backend,
+            std::io::Error::other("private record contents"),
+        );
+        assert_eq!(
+            super::error_at("construction", error),
+            "construction: Backend"
+        );
+    }
+
     use std::collections::BTreeMap;
 
     use ktann::api::{SearchBudgets, SearchOptions};

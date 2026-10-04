@@ -16,7 +16,11 @@ use super::manifest::IndexManifest;
 use super::record::{decode_record_id, encode_record_id};
 use super::wire::{Decoder, Encoder};
 
-/// An internal-partition entry and its immutable routing projection.
+/// An internal-partition entry and its routing projection.
+///
+/// The projection is immutable during online operations. Offline refinement
+/// replaces it atomically with the child centroid and advances the parent
+/// cache epoch.
 #[derive(Clone, PartialEq)]
 pub struct ChildEntry {
     child: PartitionKey,
@@ -39,7 +43,7 @@ impl ChildEntry {
         self.child
     }
 
-    /// Returns the immutable child centroid projection.
+    /// Returns the child centroid projection.
     #[must_use]
     pub fn centroid(&self) -> &[f32] {
         &self.centroid

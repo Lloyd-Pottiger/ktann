@@ -12,6 +12,7 @@ mod import;
 mod index;
 mod operation;
 mod record;
+mod refine;
 mod schema;
 mod search;
 mod verify;
@@ -28,6 +29,7 @@ pub use operation::{
 };
 pub(crate) use operation::{validate_id, validate_ids};
 pub use record::{PayloadProjection, Record, StoredRecord};
+pub use refine::RefineOptions;
 pub use schema::{CompareOp, DataType, FieldSchema, Metric, Predicate, SynopsisConfig, Value};
 pub use search::{
     SearchBudgetExhaustion, SearchBudgetUsage, SearchBudgets, SearchHit, SearchOptions,

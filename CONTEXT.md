@@ -90,7 +90,7 @@ A searchable derived projection of one Vector Record within a Leaf Partition.
 _Avoid_: Vector Record, search result
 
 **Child Entry**:
-An internal-partition entry containing one child Partition Key and its immutable centroid projection.
+An internal-partition entry containing one child Partition Key and its centroid projection. The projection is immutable while serving; offline refinement replaces it atomically with the child centroid.
 _Avoid_: Parent pointer, Leaf Entry
 
 **Filter Predicate**:
@@ -136,6 +136,10 @@ _Avoid_: Search-time validation, automatic repair
 **Import Session**:
 A process-local scheduler that submits ordinary batch Foreground Mutations in bounded waves while applying Structure Maintenance backpressure.
 _Avoid_: Bulk-build generation, atomic whole-import transaction
+
+**Offline Refinement**:
+A caller-exclusive preparation operation on a settled Active Logical Index before serving. It improves leaf assignments and centroids under capacity constraints while preserving Partition Keys, topology and exact membership. Errors can leave a valid, partially refined index.
+_Avoid_: Bulk Construction, Building Index, atomic whole-operation refinement
 
 **Import Admission**:
 The process-local decision that accepts one validated Import Session batch when learned write capacity and the Fixup Backlog permit it.
@@ -188,8 +192,8 @@ _Avoid_: Transaction ID, durable job ID
   topology asynchronously. Import Sessions schedule ordinary Foreground Mutations.
 - The Split Threshold triggers maintenance; it is not a synchronous hard bound
   on partition size. A mutation can retry after a topology conflict.
-- Every committed intermediate topology remains searchable. After a worker
-  stops, maintenance resumes when a relevant access discovers pending work.
+- Every committed intermediate topology of an Active Logical Index remains searchable.
+  After a worker stops, maintenance resumes when a relevant access discovers pending work.
 - Import Admission uses observed contention and the Fixup Backlog. Partition
   count alone does not establish independent write capacity.
 - A Vector Record is owned and encoded by KTANN, not a host application's

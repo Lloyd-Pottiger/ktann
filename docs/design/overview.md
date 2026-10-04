@@ -45,8 +45,8 @@ their physical keyspaces are neither portable nor mutually compatible.
   cross-backend persistent-data interchange format.
 - Online migration of schema, metric, dimension, Tree Key, quantizer, or
   persistent format.
-- Redis, durable maintenance jobs, repair on
-  read, automatic repair, bulk-build generations, or staging indexes.
+- Redis, durable maintenance jobs, repair on read, automatic repair, or
+  bulk-build generations, or staging indexes.
 - Compatibility with any implementation predating the first stable format.
 
 ## 4. Authoritative invariants
@@ -74,6 +74,9 @@ their physical keyspaces are neither portable nor mutually compatible.
 10. Invalid persistent encoding or an invariant mismatch is `Corruption`.
     Invalid caller input or non-finite caller-derived arithmetic is
     `InvalidArgument`.
+11. Centroids are immutable while serving. Caller-exclusive offline refinement
+    replaces its incoming parent projection and parent Header cache epoch
+    atomically; Partition Keys and topology remain fixed.
 
 ## 5. Architecture and ownership
 

@@ -9,15 +9,15 @@ use crate::maintenance::mutation;
 use crate::observe::labels::Operation;
 use crate::runtime::import::ImportPermit;
 use crate::runtime::{OperationContext, RuntimeInner};
-use crate::runtime::{lifecycle, reads, search, verify};
+use crate::runtime::{lifecycle, reads, refine, search, verify};
 use crate::storage::backend::Backend;
 use crate::storage::values::{IndexLifecycle, IndexManifest};
 
 use super::{
     Error, ErrorKind, GetOptions, ImportOptions, ImportSession, IndexConfig, IndexName,
-    LogicalIndexId, Mutation, MutationOutcome, OperationOptions, Record, Result, SearchOutcome,
-    SearchRequest, StoredRecord, UpsertResult, VerifyOptions, VerifyReport, validate_id,
-    validate_ids, validate_mutations,
+    LogicalIndexId, Mutation, MutationOutcome, OperationOptions, Record, RefineOptions, Result,
+    SearchOutcome, SearchRequest, StoredRecord, UpsertResult, VerifyOptions, VerifyReport,
+    validate_id, validate_ids, validate_mutations,
 };
 
 /// A cheap cloneable handle to one Active Logical Index.
@@ -38,8 +38,9 @@ impl<B: Backend> Index<B> {
         name: IndexName,
         manifest: IndexManifest,
     ) -> Result<Self> {
-        if manifest.lifecycle() != IndexLifecycle::Active {
-            return Err(Error::new(ErrorKind::IndexDropping));
+        match manifest.lifecycle() {
+            IndexLifecycle::Active => {}
+            IndexLifecycle::Dropping => return Err(Error::new(ErrorKind::IndexDropping)),
         }
         Ok(Self {
             runtime,
@@ -301,6 +302,32 @@ impl<B: Backend> Index<B> {
             Operation::Verify,
             operation_options,
             move |mut context| async move { verify::verify(&mut context, &manifest, options).await },
+        )
+        .await
+    }
+
+    /// Refines an imported index before serving it, without changing its identity.
+    ///
+    /// The caller must exclude all other operations and maintenance on this index,
+    /// including other Runtime instances. Finish outstanding work first. Local
+    /// queued/running maintenance or a non-Ready topology returns `InvalidArgument`.
+    /// Each committed batch preserves membership and routing consistency, but the
+    /// whole operation is not atomic. On cancellation, unknown commit or another
+    /// failure, keep the index offline and drop/rebuild it if needed. There is no
+    /// persistent progress or automatic recovery protocol.
+    pub async fn refine(&self, options: RefineOptions) -> Result<()> {
+        let manifest = Arc::clone(&self.manifest);
+        let runtime = Arc::clone(&self.runtime);
+        let retry = lifecycle::RetryPolicy::from_config(self.runtime.config());
+        self.run_foreground(
+            Operation::Refine,
+            options.operation_options.clone(),
+            move |mut context| async move {
+                if runtime.has_fixups(manifest.logical_index_id()) {
+                    return Err(Error::invalid_argument());
+                }
+                refine::run(&mut context, &manifest, options, retry).await
+            },
         )
         .await
     }

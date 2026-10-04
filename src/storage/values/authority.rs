@@ -125,12 +125,15 @@ impl PartitionHeader {
     }
 }
 
-/// A full-f32 immutable routing centroid.
+/// A full-f32 routing centroid, immutable during online operations.
+///
+/// Caller-exclusive offline refinement may replace a nonroot centroid and
+/// its parent Child Entry projection in one transaction.
 #[derive(Clone, PartialEq)]
 pub struct PartitionCentroid(Box<[f32]>);
 
 impl PartitionCentroid {
-    /// Creates an immutable centroid.
+    /// Creates a routing centroid.
     #[must_use]
     pub fn new(components: impl Into<Box<[f32]>>) -> Self {
         Self(components.into())

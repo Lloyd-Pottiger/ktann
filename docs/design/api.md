@@ -33,15 +33,16 @@ impl<B: Backend> Index<B> {
     pub async fn search(&self, request: SearchRequest) -> Result<SearchOutcome>;
     pub fn import_session(&self, options: ImportOptions) -> Result<ImportSession<B>>;
     pub async fn verify(&self, options: VerifyOptions) -> Result<VerifyReport>;
+    pub async fn refine(&self, options: RefineOptions) -> Result<()>;
 }
 ```
 
 Every operation has a companion `_with_control` form accepting
 `OperationOptions` in addition to its ordinary request/options argument; the
-simple form uses default operation control. `verify` is the one exception:
-its deadline and cancellation control ride inside `VerifyOptions`, which the
-single form takes in full. Runtime construction requires an
-active Tokio multi-thread runtime, validates all process configuration, and
+simple form uses default operation control. `verify` and `refine` are exceptions:
+their deadline and cancellation control ride inside `VerifyOptions` and
+`RefineOptions`, which their single forms take in full. Runtime construction
+requires an active Tokio multi-thread runtime, validates all process configuration, and
 immediately starts maintenance workers. Successful Runtime shutdown drains
 admitted work, awaits the backend's native-resource shutdown hook, and only then
 releases the backend.
@@ -53,6 +54,25 @@ physical-key limits on both v1 backends.
 Create is idempotent for the same name and configuration after an unknown commit
 outcome. Open rejects a Dropping index, unsupported format, backend mismatch, or
 configuration mismatch. Drop is idempotent and follows the storage lifecycle.
+
+`Index::refine(options)` prepares an existing Active index after ordinary import
+and settled Ready topology, before serving. The caller must exclude all other
+index operations, including maintenance from other runtimes, until it returns.
+Local queued or running fixups and non-Ready topology are rejected; idle Runtime
+workers may remain running.
+
+`RefineOptions::new(input_bytes)` requires a positive input byte limit and defaults
+to two rounds. Builders accept `with_refinement_rounds(0..=5)` and
+`with_operation_options(OperationOptions)`. The limit covers loaded vectors, IDs,
+centroids and topology; numerical workspace and move lists require additional
+memory. Zero rounds refreshes centroids without relocating records.
+
+Refinement preserves Partition Keys and topology. Bounded atomic transactions
+relocate records within capacity constraints and update centroids with their
+incoming parent projections and parent Header cache epochs. Every commit preserves
+exact membership and searchable projections. Cancellation, errors or unknown
+commit outcomes can leave a valid, partially refined index. There is no
+whole-operation rollback or resume protocol; the caller may drop and rebuild it.
 
 ## 2. Records and mutations
 

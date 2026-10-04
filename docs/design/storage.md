@@ -102,6 +102,12 @@ Create reserves an ID and atomically inserts the name mapping and Active
 Manifest. ID gaps are valid. Drop transitions the Manifest to Dropping before
 deleting data; all ordinary operations update-protect and validate Active state.
 
+Offline refinement preserves the Active Manifest, Partition Keys and topology.
+Record relocation preserves exact membership, payloads and capacity constraints
+in bounded transactions. Centroid replacement atomically updates the centroid,
+incoming parent projection and parent Header cache epoch. The operation has no
+additional persistent lifecycle state.
+
 FoundationDB may atomically clear the complete data range and remove the
 Dropping Manifest. Without transactional range clear, core deletes bounded
 pages of logical keys while preserving the Dropping Manifest, then atomically
@@ -116,7 +122,7 @@ The core defines one logical namespace for:
 - Index Manifest;
 - Vector Record, Opaque Payload, and Record Location;
 - Tree Manifest directory entries;
-- Partition Header, immutable Centroid, Synopsis, and transition State;
+- Partition Header, serving-immutable Centroid, Synopsis, and transition State;
 - Leaf Entry and Child Entry.
 
 Every data key begins with Logical Index ID, so drop owns one contiguous logical
@@ -158,7 +164,9 @@ used for recovery age checks and diagnostic metrics. Zero denotes an unavailable
 and paged deletion restart from the
 current prefix beginning.
 Leaf Entries contain Record ID, typed filter fields, and absolute RaBitQ7 bytes;
-Child Entries contain child Partition Key and immutable centroid projection.
+Child Entries contain child Partition Key and a centroid projection matching the
+child centroid. Serving centroids are immutable; offline refinement replaces the
+centroid and incoming projection atomically.
 
 All persistent algorithms that affect bytes are format protocol:
 

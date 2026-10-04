@@ -760,7 +760,7 @@ pub(crate) fn removed_entry(header: PartitionHeader) -> Result<PartitionHeader> 
 }
 
 /// Returns `header` with its count unchanged and epoch bumped.
-fn touched_entry(header: PartitionHeader) -> Result<PartitionHeader> {
+pub(crate) fn touched_entry(header: PartitionHeader) -> Result<PartitionHeader> {
     adjust_header(header, header.entry_count())
 }
 

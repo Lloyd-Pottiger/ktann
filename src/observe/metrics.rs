@@ -42,6 +42,8 @@ pub(crate) mod names {
     pub(crate) const FIXUP_DRAIN_ENTRIES: &str = "ktann.fixup.drain.entries";
     pub(crate) const FIXUP_STATE_AGE: &str = "ktann.fixup.state_age";
     pub(crate) const BLOOM_FILL_RATIO: &str = "ktann.bloom.fill_ratio";
+    pub(crate) const REFINEMENT_ROUNDS: &str = "ktann.refine.rounds";
+    pub(crate) const REFINEMENT_MOVES: &str = "ktann.refine.moves";
     pub(crate) const IMPORT_WAIT: &str = "ktann.import.wait";
     pub(crate) const IMPORT_CONCURRENCY_LIMIT: &str = "ktann.import.concurrency.limit";
     pub(crate) const VERIFY_REPORTS: &str = "ktann.verify.reports";
@@ -305,6 +307,12 @@ pub(crate) fn verify_report(report: &VerifyReport) {
                 .increment(count);
         }
     }
+}
+
+/// Reports one planned refinement round's accepted moves, without data labels.
+pub(crate) fn refinement_round(moves: usize) {
+    metrics::counter!(names::REFINEMENT_ROUNDS).increment(1);
+    metrics::counter!(names::REFINEMENT_MOVES).increment(moves as u64);
 }
 
 #[cfg(test)]

@@ -73,6 +73,7 @@ struct ExecutionOptions {
     backend: String,
     worker_threads: usize,
     write_beam_size: Option<u32>,
+    refinement_rounds: Option<usize>,
     base_vectors: Option<usize>,
     query_vectors: Option<usize>,
     query_offset: Option<usize>,
@@ -95,6 +96,10 @@ impl ExecutionOptions {
             write_beam_size: values
                 .get("write-beam-size")
                 .map(|value| parse_positive_u32(value, "write-beam-size"))
+                .transpose()?,
+            refinement_rounds: values
+                .get("refinement-rounds")
+                .map(|value| parse_nonnegative(value, "refinement-rounds"))
                 .transpose()?,
             base_vectors: values
                 .get("base-vectors")
@@ -123,6 +128,7 @@ const SCENARIO_OPTIONS: &[&str] = &[
     "scenario",
     "worker-threads",
     "write-beam-size",
+    "refinement-rounds",
     "base-vectors",
     "query-vectors",
     "query-offset",
@@ -400,6 +406,10 @@ fn run_suite(options: RunOptions) -> Result<(), String> {
                 option_string(options.execution.write_beam_size),
             ),
             (
+                "refinement-rounds",
+                option_string(options.execution.refinement_rounds),
+            ),
+            (
                 "base-vectors",
                 option_string(options.execution.base_vectors),
             ),
@@ -461,6 +471,12 @@ fn run_worker(options: WorkerOptions) -> Result<(), String> {
         .find(|scenario| scenario.name == options.scenario)
         .ok_or_else(|| format!("unknown scenario `{}`", options.scenario))?;
     options.execution.lifecycle.apply(&mut scenario);
+    if let Some(rounds) = options.execution.refinement_rounds {
+        if rounds > 5 || scenario.leaf_beam_sweep.is_empty() {
+            return Err("--refinement-rounds requires a quality sweep and 0..=5 rounds".to_owned());
+        }
+        scenario.refinement_rounds = Some(rounds);
+    }
     if let Some(write_beam_size) = options.execution.write_beam_size {
         scenario.write_beam_size = write_beam_size;
     }
@@ -771,12 +787,30 @@ fn shell_quote(value: &OsStr) -> String {
 
 /// Returns the stable help shown for missing or unknown public commands.
 fn usage() -> String {
-    "usage:\n  ktann-bench run --backend rocksdb|foundationdb [--profile smoke|full|large] [--scenario NAME] [--worker-threads N] [--write-beam-size N] [--base-vectors N] [--query-vectors N] [--query-offset N] [--max-partition-entries N] [--maintenance-workers N] [--import-max-in-flight-batches N] [--import-batch-size N] [--import-backlog-watermark N] [--output PATH]\n  ktann-bench compare --baseline PATH --candidate PATH [--maximum-relative-regression N] [--maximum-recall-drop N] [--maximum-rejection-rate-increase N] [--output PATH]".to_owned()
+    "usage:\n  ktann-bench run --backend rocksdb|foundationdb [--profile smoke|full|large] [--scenario NAME] [--worker-threads N] [--write-beam-size N] [--refinement-rounds 0..5] [--base-vectors N] [--query-vectors N] [--query-offset N] [--max-partition-entries N] [--maintenance-workers N] [--import-max-in-flight-batches N] [--import-batch-size N] [--import-backlog-watermark N] [--output PATH]\n  ktann-bench compare --baseline PATH --candidate PATH [--maximum-relative-regression N] [--maximum-recall-drop N] [--maximum-rejection-rate-increase N] [--output PATH]".to_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{option_map, parse_compare_options, parse_run_options, shell_quote};
+
+    #[test]
+    fn offline_refinement_option_accepts_zero_rounds() {
+        let arguments = [
+            "--backend",
+            "rocksdb",
+            "--scenario",
+            "quality-cohere-1m",
+            "--refinement-rounds",
+            "0",
+        ]
+        .map(std::ffi::OsString::from);
+        let options = parse_run_options(&arguments).expect("offline refinement option");
+        assert_eq!(options.execution.refinement_rounds, Some(0));
+        let mut invalid = arguments;
+        invalid[5] = "-1".into();
+        assert!(parse_run_options(&invalid).is_err());
+    }
 
     #[test]
     fn lifecycle_parser_accepts_diagnostic_overrides() {

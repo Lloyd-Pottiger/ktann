@@ -129,6 +129,13 @@ whole-import result.
 its complete contract, while process-local or cluster-wide topology convergence
 remains demand-driven and separately observable.
 
+Offline `Index::refine` requires caller-exclusive access and settled Ready topology
+as specified in [the API contract](api.md). Admission rejects local queued or
+running fixups. Numerical planning runs off the async executor, remains
+cooperatively cancellable, and retains foreground admission until CPU work ends.
+Apply uses ordinary bounded write attempts; cancellation or an unknown commit
+outcome can leave a valid, partially refined index.
+
 ## 5. Metrics, tracing, and privacy
 
 KTANN emits through the `metrics` and `tracing` facades. Metric labels use

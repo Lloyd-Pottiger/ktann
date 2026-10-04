@@ -77,6 +77,8 @@ impl MutationStage {
 pub(crate) enum Operation {
     /// `Runtime::create_index`.
     CreateIndex,
+    /// `Runtime::refine`.
+    Refine,
     /// `Runtime::open_index`.
     OpenIndex,
     /// `Runtime::drop_index`.
@@ -108,6 +110,7 @@ impl Operation {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::CreateIndex => "create_index",
+            Self::Refine => "refine",
             Self::OpenIndex => "open_index",
             Self::DropIndex => "drop_index",
             Self::Insert => "insert",

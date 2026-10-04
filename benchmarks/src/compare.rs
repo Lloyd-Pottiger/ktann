@@ -1296,7 +1296,7 @@ mod tests {
         WorkloadDispatch, WriteAmplification,
     };
 
-    use super::{ComparisonPolicy, compare};
+    use super::{ComparisonPolicy, compare, ensure_comparable};
 
     fn budget_configuration(runtime_default: u32, effective_limit: u32) -> BudgetConfiguration {
         BudgetConfiguration {
@@ -1350,6 +1350,9 @@ mod tests {
                     exact_rerank_candidates: budget_configuration(65_536, 100),
                 },
                 write_beam_size: 8,
+                refinement_rounds: None,
+                refinement_neighbor_centroids: None,
+                refinement_input_limit_bytes: None,
                 leaf_beam_size_override: None,
                 leaf_beam_sweep: Vec::new(),
                 blocking_resource_limit: Some(2),
@@ -1423,6 +1426,17 @@ mod tests {
     }
 
     #[test]
+    fn refinement_provenance_must_match_for_regression_comparison() {
+        let baseline = report();
+        ensure_comparable(&baseline, &baseline).expect("valid report fixture");
+        let mut candidate = baseline.clone();
+        candidate.configuration.refinement_rounds = Some(2);
+        candidate.configuration.refinement_neighbor_centroids = Some(32);
+        candidate.configuration.refinement_input_limit_bytes = Some(32 << 30);
+        assert!(ensure_comparable(&baseline, &candidate).is_err());
+    }
+
+    #[test]
     fn quality_curves_compare_identical_beam_points_independently() {
         let mut baseline = report();
         baseline.configuration.leaf_beam_sweep = vec![1, 32];
@@ -1472,6 +1486,8 @@ mod tests {
             panic!("steady fixture")
         };
         let construction = crate::report::ConstructionMeasurements {
+            refinement_rounds: 0,
+            refinement_moves: 0,
             wall_seconds: 10.0,
             ..Default::default()
         };
