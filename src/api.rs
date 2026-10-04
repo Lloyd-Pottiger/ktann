@@ -5,7 +5,6 @@
 //! validation methods so callers can reject an operation before opening a
 //! storage transaction.
 
-mod bulk;
 mod config;
 mod error;
 mod identifiers;
@@ -13,11 +12,11 @@ mod import;
 mod index;
 mod operation;
 mod record;
+mod refine;
 mod schema;
 mod search;
 mod verify;
 
-pub use bulk::BulkBuildOptions;
 pub(crate) use config::MAX_DIMENSION;
 pub use config::{IndexConfig, RuntimeConfig};
 pub use error::{Error, ErrorKind, Result};
@@ -30,6 +29,7 @@ pub use operation::{
 };
 pub(crate) use operation::{validate_id, validate_ids};
 pub use record::{PayloadProjection, Record, StoredRecord};
+pub use refine::RefineOptions;
 pub use schema::{CompareOp, DataType, FieldSchema, Metric, Predicate, SynopsisConfig, Value};
 pub use search::{
     SearchBudgetExhaustion, SearchBudgetUsage, SearchBudgets, SearchHit, SearchOptions,

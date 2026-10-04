@@ -169,8 +169,38 @@ pub(crate) async fn create_index<B: Backend>(
             return classify_existing(manifest, &config);
         }
 
-        let manifest =
-            initialize_index(&mut txn, &name, &config, allocator, IndexLifecycle::Active).await?;
+        let next_high_water = allocator
+            .high_water()
+            .checked_add(1)
+            .ok_or_else(id_exhausted)?;
+        let logical_index_id = LogicalIndexId::new(next_high_water).map_err(|_| id_exhausted())?;
+        let manifest = IndexManifest::new(
+            IndexLifecycle::Active,
+            logical_index_id,
+            config.clone(),
+            derive_rotation_seed(logical_index_id),
+            derive_bloom_parameters(&config)?,
+        )?;
+
+        let inserted = txn
+            .insert(
+                name_key,
+                PersistentValue::IndexNameEntry(IndexNameEntry::new(logical_index_id)),
+            )
+            .await?;
+        if inserted != crate::storage::backend::InsertOutcome::Inserted {
+            return Err(Error::new(ErrorKind::Backend));
+        }
+        txn.put(
+            LogicalKey::IndexIdAllocator,
+            PersistentValue::IndexIdAllocator(IndexIdAllocator::new(next_high_water)),
+        )
+        .await?;
+        txn.put(
+            LogicalKey::Manifest(logical_index_id),
+            PersistentValue::IndexManifest(manifest.clone()),
+        )
+        .await?;
 
         match context.commit(move |start| txn.commit_with(start)).await {
             Ok(()) => return Ok(manifest),
@@ -185,50 +215,6 @@ pub(crate) async fn create_index<B: Backend>(
             Err(error) => return Err(error),
         }
     }
-}
-
-/// Installs a fresh identity and manifest in the caller's transaction.
-/// The caller has update-protected the allocator and checked that the name is absent.
-pub(crate) async fn initialize_index<T: WriteTxn>(
-    txn: &mut WriteLogicalTxn<'_, T>,
-    name: &IndexName,
-    config: &IndexConfig,
-    allocator: IndexIdAllocator,
-    lifecycle: IndexLifecycle,
-) -> Result<IndexManifest> {
-    let next_high_water = allocator
-        .high_water()
-        .checked_add(1)
-        .ok_or_else(id_exhausted)?;
-    let logical_index_id = LogicalIndexId::new(next_high_water).map_err(|_| id_exhausted())?;
-    let manifest = IndexManifest::new(
-        lifecycle,
-        logical_index_id,
-        config.clone(),
-        derive_rotation_seed(logical_index_id),
-        derive_bloom_parameters(config)?,
-    )?;
-
-    let inserted = txn
-        .insert(
-            LogicalKey::IndexNameDirectory(name.clone()),
-            PersistentValue::IndexNameEntry(IndexNameEntry::new(logical_index_id)),
-        )
-        .await?;
-    if inserted != crate::storage::backend::InsertOutcome::Inserted {
-        return Err(Error::new(ErrorKind::Backend));
-    }
-    txn.put(
-        LogicalKey::IndexIdAllocator,
-        PersistentValue::IndexIdAllocator(IndexIdAllocator::new(next_high_water)),
-    )
-    .await?;
-    txn.put(
-        LogicalKey::Manifest(logical_index_id),
-        PersistentValue::IndexManifest(manifest.clone()),
-    )
-    .await?;
-    Ok(manifest)
 }
 
 async fn recover_create<B: Backend>(
@@ -252,7 +238,6 @@ async fn recover_create<B: Backend>(
 fn classify_existing(manifest: IndexManifest, config: &IndexConfig) -> Result<IndexManifest> {
     match manifest.lifecycle() {
         IndexLifecycle::Dropping => Err(Error::new(ErrorKind::IndexDropping)),
-        IndexLifecycle::Building { .. } => Err(Error::new(ErrorKind::IndexBuilding)),
         IndexLifecycle::Active if manifest.config() == config => Ok(manifest),
         IndexLifecycle::Active => Err(Error::new(ErrorKind::IndexAlreadyExists)),
     }
@@ -278,7 +263,6 @@ pub(crate) async fn open_index<B: Backend>(
     match manifest.lifecycle() {
         IndexLifecycle::Active => Ok(manifest),
         IndexLifecycle::Dropping => Err(Error::new(ErrorKind::IndexDropping)),
-        IndexLifecycle::Building { .. } => Err(Error::new(ErrorKind::IndexBuilding)),
     }
 }
 
@@ -320,7 +304,7 @@ pub(crate) async fn drop_index<B: Backend>(
         };
         let manifest = read_manifest_for_update(&mut txn, entry.logical_index_id()).await?;
         let step = match manifest.lifecycle() {
-            IndexLifecycle::Active | IndexLifecycle::Building { .. } => {
+            IndexLifecycle::Active => {
                 let dropping = manifest.with_lifecycle(IndexLifecycle::Dropping);
                 txn.put(
                     LogicalKey::Manifest(manifest.logical_index_id()),

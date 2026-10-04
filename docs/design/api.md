@@ -33,15 +33,16 @@ impl<B: Backend> Index<B> {
     pub async fn search(&self, request: SearchRequest) -> Result<SearchOutcome>;
     pub fn import_session(&self, options: ImportOptions) -> Result<ImportSession<B>>;
     pub async fn verify(&self, options: VerifyOptions) -> Result<VerifyReport>;
+    pub async fn refine(&self, options: RefineOptions) -> Result<()>;
 }
 ```
 
 Every operation has a companion `_with_control` form accepting
 `OperationOptions` in addition to its ordinary request/options argument; the
-simple form uses default operation control. `verify` is the one exception:
-its deadline and cancellation control ride inside `VerifyOptions`, which the
-single form takes in full. Runtime construction requires an
-active Tokio multi-thread runtime, validates all process configuration, and
+simple form uses default operation control. `verify` and `refine` are exceptions:
+their deadline and cancellation control ride inside `VerifyOptions` and
+`RefineOptions`, which their single forms take in full. Runtime construction
+requires an active Tokio multi-thread runtime, validates all process configuration, and
 immediately starts maintenance workers. Successful Runtime shutdown drains
 admitted work, awaits the backend's native-resource shutdown hook, and only then
 releases the backend.
@@ -54,16 +55,28 @@ Create is idempotent for the same name and configuration after an unknown commit
 outcome. Open rejects a Dropping index, unsupported format, backend mismatch, or
 configuration mismatch. Drop is idempotent and follows the storage lifecycle.
 
-The alternative `Runtime::build_index(name, config, records, build_options,
-operation_options)` reserves a Building name, computes balanced final membership
-with bounded local refinement, stages under an exact owner fence, verifies the
-complete staged snapshot, and atomically publishes Active. `BulkBuildOptions`
-requires an input-data byte limit and allows 0..=5 rounds and 1..=32 neighbor
-centroids. Zero rounds selects the same builder without refinement. The input
-limit excludes proportional preprocessing, training and verification workspace.
-Create/open return `IndexBuilding` during construction. Failure or cancellation
-can retain Building; the caller uses `drop_index` before rebuilding. No existing
-index is replaced and no published centroid is rewritten. See proposed ADR 0025.
+`Index::refine(options)` is an offline preparation operation on an existing
+Active index after ordinary Import Session completion and settled Ready topology,
+before serving. The caller must ensure that no other operations are in flight or
+begin on this index, including maintenance from other runtimes, until it returns.
+Local queued or running fixups and non-Ready topology are rejected. Runtime workers
+may remain idle; closing and reopening Runtime is unnecessary.
+
+`RefineOptions::new(input_bytes)` requires a positive resident input byte limit;
+it defaults to two refinement rounds and 32 neighbor centroids. Builders accept
+`with_refinement_rounds(0..=5)`, `with_neighbor_centroids(1..=32)`, and
+`with_operation_options(OperationOptions)`. The input limit bounds loaded vectors,
+IDs, centroids and topology representation; numerical workspace and move lists
+add memory. Zero rounds recomputes centroids without relocating records.
+
+Refinement preserves Partition Keys and topology, relocates existing leaf records
+under capacity constraints in bounded atomic transactions, and recomputes leaf and
+internal centroids with their incoming parent projections and centroid epochs.
+Each committed state preserves exact record membership and searchable projections.
+There is no new lifecycle state, construction owner nonce, publication transaction,
+or whole-operation rollback. Cancellation, errors or unknown commit outcomes can
+leave a partially refined valid index; the caller may drop and rebuild it. The
+operation offers no resume protocol. See proposed ADR 0025.
 
 ## 2. Records and mutations
 

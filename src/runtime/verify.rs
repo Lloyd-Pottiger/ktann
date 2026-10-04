@@ -1,8 +1,4 @@
-//! Bounded verification of serving snapshots and exclusively owned builds.
-//!
-//! [`verify_build`] reuses the invariant ledgers for a completed, immutable
-//! Building index. It validates the exclusive build owner on each read page;
-//! its caller must finish staging before auditing and fence publication after.
+//! Bounded read-only verification of one consistent backend snapshot.
 //!
 //! [`verify`] implements the `Index::verify` audit of ADR 0019 and
 //! `docs/design/runtime-operations.md` §6. Exactly one backend read
@@ -54,7 +50,7 @@ use bytes::Bytes;
 use xxhash_rust::xxh3::xxh3_128_with_seed;
 
 use crate::api::{
-    DataType, Error, ErrorKind, LogicalIndexId, PartitionKey, Result, VerifyIssue, VerifyIssueKind,
+    DataType, LogicalIndexId, PartitionKey, Result, VerifyIssue, VerifyIssueKind,
     VerifyObjectCounts, VerifyOptions, VerifyReport, VerifyTopology,
 };
 use crate::maintenance::fixup;
@@ -94,52 +90,11 @@ pub(crate) async fn verify<B: Backend>(
     context.checkpoint()?;
     let backend = context.backend();
     let txn = open_validated_read(backend.as_ref(), manifest).await?;
-    verify_raw(context, manifest, options, txn.into_raw(), None).await
-}
+    let mut raw = txn.into_raw();
 
-/// Audits a completed, unpublished construction under its exclusive owner.
-/// Staging must have finished before calling: no library operation can mutate
-/// this Building index except drop. Fresh, owner-validated transactions can
-/// therefore read each bounded page of the same immutable construction image.
-/// Publication still fences the exact owner after all checks have succeeded.
-pub(crate) async fn verify_build<B: Backend>(
-    context: &mut OperationContext<B>,
-    manifest: &IndexManifest,
-    options: VerifyOptions,
-) -> Result<VerifyReport> {
-    let backend = context.backend();
-    let raw = open_build_read(backend.as_ref(), manifest).await?;
-    verify_raw(context, manifest, options, raw, Some(backend.as_ref())).await
-}
-
-/// A dropped index or a different build owner cannot supply an audit page.
-async fn open_build_read<'backend, B: Backend>(
-    backend: &'backend B,
-    manifest: &IndexManifest,
-) -> Result<B::ReadTxn<'backend>> {
-    let raw = backend.begin_read().await?;
-    let mut txn = crate::storage::ReadLogicalTxn::for_index(raw, manifest);
-    let current = txn
-        .get(LogicalKey::Manifest(manifest.logical_index_id()))
-        .await?;
-    if !matches!(current, Some(PersistentValue::IndexManifest(ref current)) if current == manifest
-        && matches!(current.lifecycle(), crate::storage::values::IndexLifecycle::Building { .. }))
-    {
-        return Err(Error::new(ErrorKind::IndexNotFound));
-    }
-    Ok(txn.into_raw())
-}
-
-async fn verify_raw<'backend, B: Backend>(
-    context: &mut OperationContext<B>,
-    manifest: &IndexManifest,
-    options: VerifyOptions,
-    mut raw: B::ReadTxn<'backend>,
-    build_backend: Option<&'backend B>,
-) -> Result<VerifyReport> {
     let mut cx = Context::new(manifest, &options);
     check_allocator(&mut cx, &mut raw).await?;
-    scan_index(&mut cx, context, &mut raw, build_backend).await?;
+    scan_index(&mut cx, context, &mut raw).await?;
     let report = cx.finish();
     metrics::verify_report(&report);
     Ok(report)
@@ -359,11 +314,10 @@ async fn check_allocator<T: ReadOps>(cx: &mut Context<'_>, raw: &mut T) -> Resul
 
 /// Scans the index-owned key space in one ordered pass, dispatching every
 /// decoded object to its ledger, then runs the cross-range finalization.
-async fn scan_index<'backend, B: Backend>(
+async fn scan_index<B: Backend, T: ReadOps>(
     cx: &mut Context<'_>,
     context: &OperationContext<B>,
-    raw: &mut B::ReadTxn<'backend>,
-    build_backend: Option<&'backend B>,
+    raw: &mut T,
 ) -> Result<()> {
     let mut records = RecordLedger::new(cx.manifest)?;
     let mut topology = TopologyLedger::new(cx.manifest);
@@ -373,11 +327,6 @@ async fn scan_index<'backend, B: Backend>(
     let mut start = range.start().to_vec();
     while !cx.truncated() {
         context.checkpoint()?;
-        if let Some(backend) = build_backend {
-            // Only the completed, exclusively owned build permits renewal.
-            // Ordinary Index::verify retains its original snapshot throughout.
-            *raw = open_build_read(backend, cx.manifest).await?;
-        }
         let page = raw
             .scan(&KeyRange::new(start, end.clone()), VERIFY_SCAN)
             .await?;

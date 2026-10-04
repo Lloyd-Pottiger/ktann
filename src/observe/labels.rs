@@ -77,8 +77,8 @@ impl MutationStage {
 pub(crate) enum Operation {
     /// `Runtime::create_index`.
     CreateIndex,
-    /// `Runtime::build_index`.
-    BuildIndex,
+    /// `Runtime::refine`.
+    Refine,
     /// `Runtime::open_index`.
     OpenIndex,
     /// `Runtime::drop_index`.
@@ -110,7 +110,7 @@ impl Operation {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::CreateIndex => "create_index",
-            Self::BuildIndex => "build_index",
+            Self::Refine => "refine",
             Self::OpenIndex => "open_index",
             Self::DropIndex => "drop_index",
             Self::Insert => "insert",
@@ -204,7 +204,6 @@ pub(crate) const fn error_kind(kind: ErrorKind) -> &'static str {
         ErrorKind::IndexAlreadyExists => "index_already_exists",
         ErrorKind::IndexNotFound => "index_not_found",
         ErrorKind::IndexDropping => "index_dropping",
-        ErrorKind::IndexBuilding => "index_building",
         ErrorKind::RecordAlreadyExists => "record_already_exists",
         ErrorKind::UnsupportedFormat => "unsupported_format",
         ErrorKind::Unsupported => "unsupported",

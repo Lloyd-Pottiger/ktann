@@ -90,7 +90,7 @@ A searchable derived projection of one Vector Record within a Leaf Partition.
 _Avoid_: Vector Record, search result
 
 **Child Entry**:
-An internal-partition entry containing one child Partition Key and its immutable centroid projection.
+An internal-partition entry containing one child Partition Key and its centroid projection. The projection is immutable while serving; offline refinement replaces it atomically with the child centroid.
 _Avoid_: Parent pointer, Leaf Entry
 
 **Filter Predicate**:
@@ -137,11 +137,9 @@ _Avoid_: Search-time validation, automatic repair
 A process-local scheduler that submits ordinary batch Foreground Mutations in bounded waves while applying Structure Maintenance backpressure.
 _Avoid_: Bulk-build generation, atomic whole-import transaction
 
-**Bulk Construction**:
-A distinct operation that creates a complete capacity-constrained tree model and stages exact membership in a non-serving Building Logical Index before atomic publication. It does not grant exclusive ownership of an ordinary Import Session.
-
-**Building Index**:
-A named but non-serving Logical Index owned by one persisted random construction nonce. Ordinary create/open fail with IndexBuilding; explicit drop fences and removes incomplete construction.
+**Offline Refinement**:
+A caller-exclusive preparation operation on an existing Active Logical Index after ordinary Import Session completion and settled Ready topology, before serving. It relocates existing leaf membership under capacity constraints and recomputes centroids, incoming parent projections and parent Header cache epochs in bounded atomic transactions. Partition Keys and topology stay fixed. Errors can leave a partially refined valid index; there is no publication lifecycle or resume protocol.
+_Avoid_: Bulk Construction, Building Index, atomic whole-operation refinement
 
 **Import Admission**:
 The process-local decision that accepts one validated Import Session batch when learned write capacity and the Fixup Backlog permit it.
@@ -195,7 +193,6 @@ _Avoid_: Transaction ID, durable job ID
 - The Split Threshold triggers maintenance; it is not a synchronous hard bound
   on partition size. A mutation can retry after a topology conflict.
 - Every committed intermediate topology of an Active Logical Index remains searchable.
-  Building topology is not public and may be incomplete until verified publication.
   After a worker stops, maintenance resumes when a relevant access discovers pending work.
 - Import Admission uses observed contention and the Fixup Backlog. Partition
   count alone does not establish independent write capacity.

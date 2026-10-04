@@ -102,12 +102,13 @@ Create reserves an ID and atomically inserts the name mapping and Active
 Manifest. ID gaps are valid. Drop transitions the Manifest to Dropping before
 deleting data; all ordinary operations update-protect and validate Active state.
 
-The separate bulk-construction alternative reserves a Building manifest with a
-16-byte OS-random owner nonce before staging. Every staging transaction compares
-and update-protects that exact manifest. Record/Location/Leaf/payload groups are
-indivisible even while Building topology is incomplete. A complete snapshot audit
-precedes the atomic Building-to-Active transition; ordinary operations reject
-Building. Explicit drop can fence Building and remove its index-owned range.
+Offline refinement uses the existing Active Manifest and fixed Partition Keys;
+it adds no lifecycle state or ownership nonce. Bounded transactions preserve
+Record/Location/Leaf/payload membership and capacity constraints while relocating
+leaf records. Centroid replacement atomically updates the partition's centroid,
+incoming parent projection and parent Header cache epoch; internal means propagate bottom-up.
+This is a narrow offline exception to immutable serving centroids under caller
+exclusivity. A failed operation can leave a valid, partially refined Active index.
 See proposed ADR 0025.
 
 FoundationDB may atomically clear the complete data range and remove the
@@ -124,7 +125,7 @@ The core defines one logical namespace for:
 - Index Manifest;
 - Vector Record, Opaque Payload, and Record Location;
 - Tree Manifest directory entries;
-- Partition Header, immutable Centroid, Synopsis, and transition State;
+- Partition Header, serving-immutable Centroid, Synopsis, and transition State;
 - Leaf Entry and Child Entry.
 
 Every data key begins with Logical Index ID, so drop owns one contiguous logical
@@ -166,7 +167,9 @@ used for recovery age checks and diagnostic metrics. Zero denotes an unavailable
 and paged deletion restart from the
 current prefix beginning.
 Leaf Entries contain Record ID, typed filter fields, and absolute RaBitQ7 bytes;
-Child Entries contain child Partition Key and immutable centroid projection.
+Child Entries contain child Partition Key and a centroid projection matching the
+child centroid. Serving centroids are immutable; offline refinement replaces the
+centroid and incoming projection atomically.
 
 All persistent algorithms that affect bytes are format protocol:
 

@@ -26,7 +26,7 @@ use bytes::Bytes;
 use crate::api::{Error, ErrorKind, LogicalIndexId, PartitionKey, Result};
 use crate::storage::backend::{AdmissionBudget, Capabilities, ScanLimits, WriteTxn};
 use crate::storage::keys::{self, LogicalKey, TreeKey};
-use crate::storage::membership::{added_entry, expect_inserted, removed_entry};
+use crate::storage::membership::{added_entry, expect_inserted, removed_entry, touched_entry};
 use crate::storage::tree_manifest::reserve_partition_keys;
 use crate::storage::values::{
     ChildEntry, IndexManifest, LeafEntry, PartitionCentroid, PartitionHeader, PartitionState,
@@ -509,6 +509,8 @@ pub enum Movement {
     /// A `Merging` source draining into per-batch reselected `Ready` targets
     /// (ADR 0008).
     Merge,
+    /// Caller-exclusive refinement between existing `Ready` leaves.
+    Refine,
 }
 
 impl Movement {
@@ -517,6 +519,7 @@ impl Movement {
         match self {
             Self::Split => PartitionState::DrainingSplit,
             Self::Merge => PartitionState::Merging,
+            Self::Refine => PartitionState::Ready,
         }
     }
 
@@ -524,7 +527,7 @@ impl Movement {
     fn target_state(self) -> PartitionState {
         match self {
             Self::Split => PartitionState::ReceivingSplit,
-            Self::Merge => PartitionState::Ready,
+            Self::Merge | Self::Refine => PartitionState::Ready,
         }
     }
 }
@@ -534,7 +537,7 @@ impl Movement {
 /// The bound charges exact codec sizes for the current Manifest and Tree Key,
 /// the Backend adapter's per-key physical overhead, and the worst target
 /// distribution for the movement protocol. A split may touch both persisted
-/// targets; a merge may route every entry to a different Ready target.
+/// targets; a merge or refinement may route every entry to a different Ready target.
 pub(crate) fn leaf_relocation_batch_limit(
     manifest: &IndexManifest,
     tree_key: &TreeKey,
@@ -603,7 +606,7 @@ impl LeafRelocationCharge {
     fn size(&self, entries: usize, movement: Movement) -> Option<(usize, usize)> {
         let targets = match movement {
             Movement::Split => entries.min(2),
-            Movement::Merge => entries,
+            Movement::Merge | Movement::Refine => entries,
         };
         let mutations = entries
             .checked_mul(3)
@@ -625,8 +628,8 @@ impl LeafRelocationCharge {
     }
 }
 
-/// Atomically moves one batch of verified leaf entries from the draining
-/// source to their chosen targets.
+/// Atomically moves one batch of verified leaf entries from the source
+/// to their chosen targets.
 ///
 /// Each move copies the Leaf Entry — including its absolute RaBitQ7 payload —
 /// unchanged to the target, unique-inserts it, deletes the source entry, and
@@ -635,13 +638,14 @@ impl LeafRelocationCharge {
 /// cache epochs, and synopsis expansions in memory, and writes each authority
 /// value back once, so a batch never pays per-entry authority round trips.
 /// The source and every target must be a leaf in the states `movement` names:
-/// the exact-membership invariant holds only while movement runs inside one
-/// structural protocol. Returns the number of moved entries.
+/// callers provide candidates read in this transaction and preserve the
+/// protocol, including caller exclusivity for refinement. Returns the number
+/// of moved entries.
 pub async fn relocate_leaf_entries<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     tree_key: &TreeKey,
     source: PartitionKey,
-    mut moves: Vec<(LeafDrainEntry, PartitionKey)>,
+    moves: Vec<(LeafDrainEntry, PartitionKey)>,
     movement: Movement,
 ) -> Result<usize> {
     if moves.is_empty() {
@@ -653,9 +657,12 @@ pub async fn relocate_leaf_entries<T: WriteTxn>(
     // One update-protected read of each touched partition Header, and one of
     // each receiving target's Synopsis: a batch never pays per-partition
     // authority round trips.
-    moves.sort_unstable_by_key(|(_, target)| *target);
     let mut targets: Vec<PartitionKey> = moves.iter().map(|(_, target)| *target).collect();
+    targets.sort_unstable();
     targets.dedup();
+    if targets.contains(&source) {
+        return Err(corrupt());
+    }
     let mut header_keys = Vec::with_capacity(targets.len() + 1);
     for target in &targets {
         header_keys.push(LogicalKey::Header {
@@ -751,18 +758,21 @@ pub async fn relocate_leaf_entries<T: WriteTxn>(
         PersistentValue::PartitionHeader(source_header),
     )
     .await?;
-    let mut grouped_moves = moves.iter().peekable();
-    for ((target, header), mut synopsis) in target_headers.into_iter().zip(target_synopses) {
-        let mut header = header;
-        let mut synopsis_changed = false;
-        while let Some((drain, move_target)) = grouped_moves.peek() {
-            if *move_target != target {
-                break;
-            }
-            header = added_entry(header)?;
-            synopsis_changed |= synopsis.expand(manifest, drain.entry.fields())?;
-            grouped_moves.next();
-        }
+    // Preserve caller order for entry mutations; aggregate metadata by target
+    // without sorting the accepted moves or rescanning them per target.
+    let mut summaries: Vec<_> = target_headers.into_iter().zip(target_synopses).collect();
+    let mut synopsis_changes = vec![false; targets.len()];
+    for (drain, target) in &moves {
+        let position = targets
+            .binary_search(target)
+            .expect("target collected from moves");
+        let ((_, header), synopsis) = &mut summaries[position];
+        *header = added_entry(*header)?;
+        synopsis_changes[position] |= synopsis.expand(manifest, drain.entry.fields())?;
+    }
+    for (((target, header), synopsis), synopsis_changed) in
+        summaries.into_iter().zip(synopsis_changes)
+    {
         txn.put(
             LogicalKey::Header {
                 index,
@@ -784,8 +794,108 @@ pub async fn relocate_leaf_entries<T: WriteTxn>(
             .await?;
         }
     }
-    debug_assert!(grouped_moves.next().is_none());
     Ok(moved)
+}
+
+/// Updates one nonroot centroid and its parent's routing projection atomically.
+///
+/// Both partitions must be Ready, with a matching existing child edge and
+/// centroid. A changed projection advances only the parent's cache epoch;
+/// membership counts, states, and leaf encodings remain unchanged.
+/// Callers must roll back the transaction on error.
+pub(crate) async fn update_centroid<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    tree_key: &TreeKey,
+    partition: PartitionKey,
+    parent: PartitionKey,
+    centroid: Box<[f32]>,
+) -> Result<()> {
+    if partition == root_partition() || partition == parent {
+        return Err(corrupt());
+    }
+    let index = txn.require_manifest()?.logical_index_id();
+    let child_header_key = LogicalKey::Header {
+        index,
+        tree_key: tree_key.clone(),
+        partition,
+    };
+    let parent_header_key = LogicalKey::Header {
+        index,
+        tree_key: tree_key.clone(),
+        partition: parent,
+    };
+    let centroid_key = LogicalKey::Centroid {
+        index,
+        tree_key: tree_key.clone(),
+        partition,
+    };
+    let edge_key = LogicalKey::ChildEntry {
+        index,
+        tree_key: tree_key.clone(),
+        partition: parent,
+        child: partition,
+    };
+    let mut values = txn
+        .batch_get_for_update(vec![
+            child_header_key,
+            parent_header_key.clone(),
+            centroid_key.clone(),
+            edge_key.clone(),
+        ])
+        .await?
+        .into_iter();
+    let child_header = expect_header(
+        values
+            .next()
+            .ok_or_else(|| Error::new(ErrorKind::Backend))?,
+    )?
+    .ok_or_else(corrupt)?;
+    let parent_header = expect_header(
+        values
+            .next()
+            .ok_or_else(|| Error::new(ErrorKind::Backend))?,
+    )?
+    .ok_or_else(corrupt)?;
+    let old_centroid = expect_centroid(
+        values
+            .next()
+            .ok_or_else(|| Error::new(ErrorKind::Backend))?,
+    )?
+    .ok_or_else(corrupt)?;
+    let edge = expect_child_entry(
+        values
+            .next()
+            .ok_or_else(|| Error::new(ErrorKind::Backend))?,
+    )?
+    .ok_or_else(corrupt)?;
+    if child_header.state() != PartitionState::Ready
+        || parent_header.state() != PartitionState::Ready
+        || child_header.level().checked_add(1) != Some(parent_header.level())
+        || edge.child() != partition
+        || edge.centroid() != old_centroid.components()
+    {
+        return Err(corrupt());
+    }
+    if centroid.as_ref() == old_centroid.components() {
+        return Ok(());
+    }
+    let parent_header = touched_entry(parent_header)?;
+    txn.put(
+        centroid_key,
+        PersistentValue::PartitionCentroid(PartitionCentroid::new(centroid.clone())),
+    )
+    .await?;
+    txn.put(
+        edge_key,
+        PersistentValue::ChildEntry(ChildEntry::new(partition, centroid)),
+    )
+    .await?;
+    txn.put(
+        parent_header_key,
+        PersistentValue::PartitionHeader(parent_header),
+    )
+    .await?;
+    Ok(())
 }
 
 /// Re-reads one batch of internal drain candidates inside the drain write
@@ -1980,7 +2090,7 @@ mod tests {
         let manifest = manifest();
         let tree_key = tree_key();
         let overhead = 17;
-        for movement in [Movement::Split, Movement::Merge] {
+        for movement in [Movement::Split, Movement::Merge, Movement::Refine] {
             let charge = LeafRelocationCharge::new(&manifest, &tree_key, overhead).expect("charge");
             let (mutations, bytes) = charge.size(1, movement).expect("one move fits usize");
             assert_eq!(
@@ -2020,7 +2130,7 @@ mod tests {
         let tree_key = tree_key();
         let overhead = 23;
         let entries = 37;
-        for movement in [Movement::Split, Movement::Merge] {
+        for movement in [Movement::Split, Movement::Merge, Movement::Refine] {
             let charge = LeafRelocationCharge::new(&manifest, &tree_key, overhead).expect("charge");
             let (mutations, bytes) = charge
                 .size(entries, movement)
@@ -2073,7 +2183,7 @@ mod tests {
         let manifest = manifest();
         let tree_key = tree_key();
         let budget = budget(10_000, 1 << 20, 263);
-        for movement in [Movement::Split, Movement::Merge] {
+        for movement in [Movement::Split, Movement::Merge, Movement::Refine] {
             let limit = leaf_relocation_batch_limit(&manifest, &tree_key, movement, budget)
                 .expect("production-sized budget admits a move");
             let charge =

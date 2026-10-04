@@ -110,11 +110,11 @@ pub struct Configuration {
     /// Per-level beam used while importing records into the tree.
     pub write_beam_size: u32,
     /// Local refinement rounds, or None for ordinary import.
-    pub bulk_refinement_rounds: Option<usize>,
-    /// Resolved bulk centroid neighbor count.
-    pub bulk_neighbor_centroids: Option<usize>,
-    /// Resolved bulk source-data byte limit, excluding workspace.
-    pub bulk_input_limit_bytes: Option<u64>,
+    pub refinement_rounds: Option<usize>,
+    /// Resolved offline refinement centroid neighbor count.
+    pub refinement_neighbor_centroids: Option<usize>,
+    /// Resolved refinement input byte limit, excluding numerical workspace.
+    pub refinement_input_limit_bytes: Option<u64>,
     /// Per-request leaf-level base beam override, when present.
     pub leaf_beam_size_override: Option<u32>,
     /// Ordered leaf-beam values for a single-variable quality sweep.
@@ -284,11 +284,11 @@ pub struct QualitySweepMeasurements {
 /// Construction costs before oracle preparation and query warmup.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ConstructionMeasurements {
-    /// Completed local rounds across all trees (zero for ordinary import).
+    /// Completed offline relocation rounds (zero when refinement is skipped).
     pub refinement_rounds: u64,
     /// Accepted positive-gain moves across completed local rounds.
     pub refinement_moves: u64,
-    /// Continuous elapsed time from import start through verified convergence.
+    /// Continuous elapsed time from import start through convergence and refinement.
     pub wall_seconds: f64,
     /// Process CPU across the same complete construction interval.
     pub cpu_seconds: Option<f64>,

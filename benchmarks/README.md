@@ -255,15 +255,22 @@ import, drops the Logical Index, and removes the socket. After a crash, confirm
 the old process has exited before removing its stale socket; startup never
 unlinks a preexisting socket.
 
-### Capacity-refined construction alternative
+### Offline refinement after import
 
-Quality sweeps accept `--bulk-refinement-rounds 0..5`. Omit the flag for the
-ordinary import baseline, use `0` for the balanced builder control, and use `2`
-or `5` for bounded local refinement. Reports record resolved rounds, 32 neighbor
-centroids and the 32 GiB source-data limit. The complete timed import includes
-source Record construction, name reservation, planning, refinement, bounded
-staging, complete internal audit and publication. Workspace is additional to the
-source limit. Convergence and the external before/after sweep verification are
-also retained and reported. Compare all three paths: balanced initialization
-changes occupancy/tree shape independently of refinement. Archive the executable
-and source/binary hashes before timing under the shared resource lock.
+Quality sweeps accept `--refinement-rounds 0..5`. Omit the flag for the ordinary
+import baseline; `0` recomputes centroids without relocation rounds, and `2` or
+`5` requests bounded local refinement. Every path uses ordinary import and settles
+topology until maintenance is drained before refinement. The runner issues no
+other index operations during refinement and starts measured queries afterward.
+The existing tree's partition IDs and topology remain fixed.
+
+Reports record the requested rounds, 32 neighbor centroids, the 32 GiB refinement
+input limit, completed rounds and moves. The input limit covers loaded vectors,
+IDs, centroids and topology representation; numerical workspace and move lists
+add memory. Construction wall time, CPU and backend work include import,
+maintenance convergence and refinement. The convergence phase includes refinement.
+Compare the ordinary baseline and each refinement setting on identical import
+and search parameters; zero rounds is a centroid-recomputation control. Existing
+bulk-builder research measurements use a different initialization/publication
+pipeline and do not establish quality or performance for this API. Archive the
+executable and source/binary hashes before timing under the shared resource lock.

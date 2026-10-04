@@ -941,29 +941,3 @@ fn reopened_manifest_reproduces_identical_index_value_bytes() {
             .expect("encode after reopen")
     );
 }
-
-#[test]
-fn building_manifest_owns_a_canonical_fixed_nonce() {
-    let owner = [0xa5; 16];
-    let manifest = minimal_manifest().with_lifecycle(IndexLifecycle::Building { owner });
-    let value = PersistentValue::IndexManifest(manifest);
-    let codec = ValueCodec::bootstrap();
-    let key = LogicalKey::Manifest(id(1));
-    let bytes = codec.encode(&value).unwrap();
-    let active = codec
-        .encode(&PersistentValue::IndexManifest(minimal_manifest()))
-        .unwrap();
-    let mut expected = active[..3].to_vec();
-    expected.push(2);
-    expected.extend_from_slice(&owner);
-    expected.extend_from_slice(&active[4..]);
-    assert_eq!(bytes, expected);
-    assert_eq!(codec.decode(&key, bytes.clone().into()).unwrap(), value);
-    assert_eq!(
-        codec
-            .decode(&key, Bytes::copy_from_slice(&bytes[..19]))
-            .unwrap_err()
-            .kind(),
-        ErrorKind::Corruption
-    );
-}

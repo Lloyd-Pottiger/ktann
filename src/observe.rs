@@ -34,8 +34,8 @@
 //! | `ktann.fixup.drain.entries` | histogram | kind |
 //! | `ktann.fixup.state_age` | histogram | kind |
 //! | `ktann.bloom.fill_ratio` | histogram | — |
-//! | `ktann.bulk.refinement.rounds` | counter | — |
-//! | `ktann.bulk.refinement.moves` | counter | — |
+//! | `ktann.refine.rounds` | counter | — |
+//! | `ktann.refine.moves` | counter | — |
 //! | `ktann.import.wait` | histogram | gate |
 //! | `ktann.import.concurrency.limit` | histogram | direction |
 //! | `ktann.verify.reports` | counter | outcome |

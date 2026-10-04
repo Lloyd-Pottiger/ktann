@@ -129,17 +129,18 @@ whole-import result.
 its complete contract, while process-local or cluster-wide topology convergence
 remains demand-driven and separately observable.
 
-Unpublished bulk construction uses a separate ownership and publication protocol
-(proposed ADR 0025), rather than Import Session admission. Every staging write
-update-protects the complete Building manifest and replays only deterministic
-writes after unknown outcomes. The Runtime cancellation boundary protects final
-publication; earlier non-serving writes can survive cancellation. Explicit drop
-provides durable cleanup and fences an in-flight builder. After staging ends,
-construction is immutable under its exclusive owner. A complete audit uses the
-same invariant ledgers as serving verification, with a fresh owner-validated
-transaction for each bounded page. Drop can invalidate the build; the final
-publication transaction checks the exact owner again. Audit failure leaves the
-index unpublished. Ordinary `Index::verify` retains its single-snapshot contract.
+Offline `Index::refine` runs after ordinary import and settled Ready topology
+(proposed ADR 0025). The caller excludes all other index operations and
+other-runtime maintenance for the full operation. Admission rejects existing
+local queued or running fixups, and planning rejects non-Ready topology. Idle
+Runtime workers can remain running without a new pause or reopen protocol.
+
+Numerical planning is cooperatively cancelled; bounded apply transactions move
+exact leaf membership and update centroid/projection/epoch groups atomically.
+Existing Partition Keys and topology remain fixed. Cancellation and unknown commit
+outcomes may leave a partially refined valid index. There is no operation-wide
+atomicity, publication audit or resume lifecycle; the caller can drop and rebuild
+when required. `Index::verify` retains its single-snapshot contract.
 
 ## 5. Metrics, tracing, and privacy
 
