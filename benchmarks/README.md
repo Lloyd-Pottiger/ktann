@@ -104,9 +104,14 @@ Partition Cache residency and raw-vector backend cache residency.
 `--base-vectors N`, `--query-vectors N`, `--query-offset N`, and
 `--max-partition-entries N`. Resolved overrides are recorded in each report.
 
+[Resident production search baseline](search-residency.md) establishes stable
+million-vector CPU saturation with timed physical IO and retained fixtures.
+
 The raw RocksDB block cache is independent of the decoded Partition Cache.
 `--rocksdb-block-cache-bytes N` sets its capacity (default 8 MiB); the worker
-prints final occupied and pinned bytes to stderr. `--warmup-operations N` sets
+prints occupied and pinned bytes to stderr after the final full audit; those
+values include audit reads and do not describe individual timed points.
+`--warmup-operations N` sets
 per-point untimed warmup, including zero for diagnostics. Each timed point
 records `physical_read_bytes` and `physical_write_bytes` from OS process
 accounting (Darwin `proc_pid_rusage`, Linux `/proc/self/io`). These are physical
