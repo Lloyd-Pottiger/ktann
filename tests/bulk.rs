@@ -85,16 +85,23 @@ impl CommitGate {
 struct GatedBackend {
     inner: Arc<DeterministicBackend>,
     gate: Arc<CommitGate>,
+    read_gate: Arc<CommitGate>,
+    scan_limit: usize,
 }
 
 impl GatedBackend {
     fn new(inner: Arc<DeterministicBackend>, gate: Arc<CommitGate>) -> Self {
-        Self { inner, gate }
+        Self {
+            inner,
+            gate,
+            read_gate: Arc::new(CommitGate::default()),
+            scan_limit: usize::MAX,
+        }
     }
 }
 
 impl Backend for GatedBackend {
-    type ReadTxn<'backend> = DeterministicReadTxn<'backend>;
+    type ReadTxn<'backend> = GatedReadTxn<'backend>;
 
     type WriteTxn<'backend> = GatedWriteTxn<'backend>;
 
@@ -115,7 +122,11 @@ impl Backend for GatedBackend {
     }
 
     async fn begin_read(&self) -> ktann::api::Result<Self::ReadTxn<'_>> {
-        self.inner.begin_read().await
+        Ok(GatedReadTxn {
+            inner: self.inner.begin_read().await?,
+            gate: Arc::clone(&self.read_gate),
+            remaining_scans: self.scan_limit,
+        })
     }
 
     async fn begin_write(&self) -> ktann::api::Result<Self::WriteTxn<'_>> {
@@ -125,6 +136,44 @@ impl Backend for GatedBackend {
         })
     }
 }
+
+/// A deterministic short-lived snapshot; only the scan budget is artificial.
+struct GatedReadTxn<'backend> {
+    inner: DeterministicReadTxn<'backend>,
+    gate: Arc<CommitGate>,
+    remaining_scans: usize,
+}
+impl GatedReadTxn<'_> {
+    async fn admit_scans(&mut self, count: usize) -> ktann::api::Result<()> {
+        self.gate.maybe_wait().await;
+        self.remaining_scans = self
+            .remaining_scans
+            .checked_sub(count)
+            .ok_or_else(|| ktann::api::Error::new(ErrorKind::Backend))?;
+        Ok(())
+    }
+}
+impl ReadOps for GatedReadTxn<'_> {
+    async fn get(&mut self, key: Bytes) -> ktann::api::Result<Option<Bytes>> {
+        self.inner.get(key).await
+    }
+    async fn batch_get(&mut self, keys: Vec<Bytes>) -> ktann::api::Result<Vec<Option<Bytes>>> {
+        self.inner.batch_get(keys).await
+    }
+    async fn scan(&mut self, range: &KeyRange, limits: ScanLimits) -> ktann::api::Result<ScanPage> {
+        self.admit_scans(1).await?;
+        self.inner.scan(range, limits).await
+    }
+    async fn batch_scan(
+        &mut self,
+        ranges: &[KeyRange],
+        limits: ScanLimits,
+    ) -> ktann::api::Result<Vec<ScanPage>> {
+        self.admit_scans(ranges.len()).await?;
+        self.inner.batch_scan(ranges, limits).await
+    }
+}
+impl ReadTxn for GatedReadTxn<'_> {}
 
 struct GatedWriteTxn<'backend> {
     inner: DeterministicWriteTxn<'backend>,
@@ -755,5 +804,88 @@ async fn empty_construction_publishes_then_accepts_ordinary_insert() {
             .issues
             .is_empty()
     );
+    runtime.shutdown().await.unwrap();
+}
+
+/// Construction is immutable during its audit; an Active index is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn build_audit_renews_short_snapshots_but_online_verify_does_not() {
+    let inner = Arc::new(DeterministicBackend::default());
+    let mut backend = GatedBackend::new(inner.clone(), Arc::new(CommitGate::default()));
+    backend.scan_limit = 1;
+    let runtime = Runtime::new(backend, manual_maintenance_config()).unwrap();
+    let index = runtime
+        .build_index(
+            "bulk",
+            config(),
+            records(1025),
+            options(0),
+            OperationOptions::default(),
+        )
+        .await
+        .expect("immutable build must span short-lived read transactions");
+    assert_eq!(
+        index
+            .verify(VerifyOptions::default())
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Backend
+    );
+    let stable = Runtime::new(
+        GatedBackend::new(inner, Arc::new(CommitGate::default())),
+        manual_maintenance_config(),
+    )
+    .unwrap();
+    let report = stable
+        .open_index("bulk")
+        .await
+        .unwrap()
+        .verify(VerifyOptions::default())
+        .await
+        .unwrap();
+    assert!(report.complete && report.issues.is_empty());
+    assert_eq!(report.objects.vector_records, 1025);
+    stable.shutdown().await.unwrap();
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drop_during_build_audit_cannot_publish_over_a_new_name_owner() {
+    let backend = GatedBackend::new(
+        Arc::new(DeterministicBackend::default()),
+        Arc::new(CommitGate::default()),
+    );
+    let read_gate = Arc::clone(&backend.read_gate);
+    read_gate.hold_next(1);
+    let runtime = Runtime::new(backend, manual_maintenance_config()).unwrap();
+    let builder = runtime.clone();
+    let task = tokio::spawn(async move {
+        builder
+            .build_index(
+                "bulk",
+                config(),
+                records(1025),
+                options(0),
+                OperationOptions::default(),
+            )
+            .await
+    });
+    read_gate.wait_until_entered(1).await;
+    runtime.drop_index("bulk").await.unwrap();
+    let replacement = runtime.create_index("bulk", config()).await.unwrap();
+    read_gate.release();
+    let error = task.await.unwrap().unwrap_err();
+    assert!(matches!(
+        error.kind(),
+        ErrorKind::IndexNotFound | ErrorKind::IndexDropping
+    ));
+    assert_eq!(
+        runtime.open_index("bulk").await.unwrap().logical_index_id(),
+        replacement.logical_index_id()
+    );
+    let report = replacement.verify(VerifyOptions::default()).await.unwrap();
+    assert!(report.complete && report.issues.is_empty());
+    assert_eq!(report.objects.vector_records, 0);
     runtime.shutdown().await.unwrap();
 }

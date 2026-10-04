@@ -134,9 +134,12 @@ Unpublished bulk construction uses a separate ownership and publication protocol
 update-protects the complete Building manifest and replays only deterministic
 writes after unknown outcomes. The Runtime cancellation boundary protects final
 publication; earlier non-serving writes can survive cancellation. Explicit drop
-provides durable cleanup and fences an in-flight builder. Verification uses the
-same complete one-snapshot audit as serving indexes and must succeed before
-publication; snapshot expiry leaves construction unpublished.
+provides durable cleanup and fences an in-flight builder. After staging ends,
+construction is immutable under its exclusive owner. A complete audit uses the
+same invariant ledgers as serving verification, with a fresh owner-validated
+transaction for each bounded page. Drop can invalidate the build; the final
+publication transaction checks the exact owner again. Audit failure leaves the
+index unpublished. Ordinary `Index::verify` retains its single-snapshot contract.
 
 ## 5. Metrics, tracing, and privacy
 

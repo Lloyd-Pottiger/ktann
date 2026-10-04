@@ -23,7 +23,15 @@ on unknown staging outcomes. Each record group (record, location, leaf entry and
 optional payload) is indivisible within one staging transaction; a record group
 that cannot fit the adapter fails construction unpublished. The final transaction compares the same identity
 and changes Building to Active, after auditing the staged topology and membership
-through the ordinary verification implementation in one snapshot. The guarded
+through the verification invariant ledgers. Once staging finishes, only drop
+can change this non-serving construction: no operation can open it for mutation
+and builders cannot adopt another owner's work. The audit validates the exact
+Building owner in a fresh transaction for each bounded page, preventing a large
+build from depending on one long-lived backend snapshot. Publication fences the
+same owner again. Late commits from ambiguous staging attempts contain the same
+deterministic values, and publication's manifest write conflicts with any still
+pending stage that read the old Building state. Ordinary serving verification
+continues to require one snapshot. The guarded
 foreground commit boundary applies only to that publication. Unknown publication
 is recovered only by reading the exact Active identity.
 
@@ -64,10 +72,11 @@ not workspace: preprocessed vectors, binary-training copies, memberships,
 centroids, proposals, topology rows and verification state add memory. Exact
 neighbor selection costs O(leaves² × dimension) per round; record proposals cost
 O(records × neighbor count × dimension). Bounded rounds limit repetition, not
-construction latency. The complete audit has the existing one-snapshot lifetime
-constraint and a 1 GiB resident audit limit. A backend that cannot complete it
-returns an error and leaves Building unpublished. Large FoundationDB construction
-therefore remains unproved.
+construction latency. The complete audit retains a 1 GiB resident ledger limit. Each owner check and
+bounded page scan must fit the backend's snapshot lifetime; the entire audit
+need not fit in one snapshot. A failed page or exhausted audit limit leaves
+Building unpublished. Large FoundationDB construction still requires an explicit
+native validation result; ordinary `Index::verify` is not a renewable audit.
 
 This extends ADR 0017 with a non-serving construction lifecycle and ADR 0015
 with a separate initial-construction path; ordinary incremental topology and

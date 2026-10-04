@@ -2253,15 +2253,52 @@ fn git_revision() -> String {
 
 /// Identifies a failed benchmark phase without exposing caller-derived data.
 ///
-/// KTANN intentionally keeps public errors terse and privacy-safe. The phase
-/// prefix restores enough operational context to diagnose a broken benchmark
-/// while the suffix remains restricted to the stable public error category.
+/// Keep arbitrary source messages private, but retain FoundationDB's numeric
+/// error code so snapshot expiry is distinguishable from other backend failures.
 fn error_at(phase: &str, error: ktann::api::Error) -> String {
-    format!("{phase}: {:?}", error.kind())
+    let summary = format!("{phase}: {:?}", error.kind());
+    #[cfg(feature = "foundationdb")]
+    {
+        let mut source = std::error::Error::source(&error);
+        while let Some(cause) = source {
+            if let Some(fdb) = cause.downcast_ref::<foundationdb::FdbError>() {
+                return format!("{summary} (FoundationDB code {})", fdb.code());
+            }
+            source = cause.source();
+        }
+    }
+    summary
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn benchmark_error_keeps_arbitrary_source_messages_private() {
+        let error = ktann::api::Error::with_source(
+            ktann::api::ErrorKind::Backend,
+            std::io::Error::other("private record contents"),
+        );
+        assert_eq!(
+            super::error_at("construction", error),
+            "construction: Backend"
+        );
+    }
+
+    #[cfg(feature = "foundationdb")]
+    #[test]
+    fn benchmark_error_preserves_nested_foundationdb_code() {
+        let error = ktann::api::Error::with_source(
+            ktann::api::ErrorKind::Backend,
+            ktann::api::Error::with_source(
+                ktann::api::ErrorKind::Backend,
+                foundationdb::FdbError::from_code(1007),
+            ),
+        );
+        assert_eq!(
+            super::error_at("construction", error),
+            "construction: Backend (FoundationDB code 1007)",
+        );
+    }
     use std::collections::BTreeMap;
 
     use ktann::api::{SearchBudgets, SearchOptions};
@@ -2536,3 +2573,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, feature = "foundationdb"))]
+#[path = "foundationdb_bulk_validation.rs"]
+mod foundationdb_bulk_validation;
