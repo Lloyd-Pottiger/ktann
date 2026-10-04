@@ -291,36 +291,44 @@ fn compare_quality_sweep(
     candidate: &QualitySweepMeasurements,
     policy: ComparisonPolicy,
 ) {
-    relative_regression(
-        result,
-        key,
-        "construction wall seconds",
-        baseline.construction.wall_seconds,
-        candidate.construction.wall_seconds,
-        policy.maximum_relative_regression,
-    );
-    compare_optional_resource(
-        result,
-        key,
-        "construction CPU seconds",
-        baseline.construction.cpu_seconds,
-        candidate.construction.cpu_seconds,
-        policy.maximum_relative_regression,
-    );
-    compare_optional_resource(
-        result,
-        key,
-        "construction peak RSS bytes",
-        baseline
-            .construction
-            .peak_rss_bytes
-            .map(|bytes| bytes as f64),
-        candidate
-            .construction
-            .peak_rss_bytes
-            .map(|bytes| bytes as f64),
-        policy.maximum_relative_regression,
-    );
+    if baseline.reused_index != candidate.reused_index {
+        result
+            .regressions
+            .push(format!("{key}: index reuse changed"));
+        return;
+    }
+    if !baseline.reused_index {
+        relative_regression(
+            result,
+            key,
+            "construction wall seconds",
+            baseline.construction.wall_seconds,
+            candidate.construction.wall_seconds,
+            policy.maximum_relative_regression,
+        );
+        compare_optional_resource(
+            result,
+            key,
+            "construction CPU seconds",
+            baseline.construction.cpu_seconds,
+            candidate.construction.cpu_seconds,
+            policy.maximum_relative_regression,
+        );
+        compare_optional_resource(
+            result,
+            key,
+            "construction peak RSS bytes",
+            baseline
+                .construction
+                .peak_rss_bytes
+                .map(|bytes| bytes as f64),
+            candidate
+                .construction
+                .peak_rss_bytes
+                .map(|bytes| bytes as f64),
+            policy.maximum_relative_regression,
+        );
+    }
     if baseline.points.len() != candidate.points.len()
         || baseline
             .points
@@ -1452,6 +1460,7 @@ mod tests {
         };
         baseline.measurements =
             ReportMeasurements::QualitySweep(Box::new(QualitySweepMeasurements {
+                reused_index: false,
                 construction: Default::default(),
                 points: vec![
                     QualityPoint {
@@ -1495,6 +1504,7 @@ mod tests {
         };
         baseline.measurements =
             ReportMeasurements::QualitySweep(Box::new(QualitySweepMeasurements {
+                reused_index: false,
                 construction: Default::default(),
                 points: vec![QualityPoint {
                     leaf_beam_size: 32,
@@ -1536,6 +1546,7 @@ mod tests {
         };
         baseline.measurements =
             ReportMeasurements::QualitySweep(Box::new(QualitySweepMeasurements {
+                reused_index: false,
                 construction,
                 points: vec![QualityPoint {
                     leaf_beam_size: 1,

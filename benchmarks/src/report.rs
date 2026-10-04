@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 /// Current complete benchmark suite/report JSON contract.
-pub const REPORT_SCHEMA_VERSION: u32 = 7;
+pub const REPORT_SCHEMA_VERSION: u32 = 8;
 
 /// Reports produced by one suite command on one comparable host.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -277,6 +277,8 @@ pub enum ReportMeasurements {
 /// Measurements for one ordered leaf-beam quality curve.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct QualitySweepMeasurements {
+    /// True when construction was skipped; construction measurements are empty.
+    pub reused_index: bool,
     /// Construction through the first complete, maintenance-converged audit.
     pub construction: ConstructionMeasurements,
     /// Points ordered by client count, then from narrowest to widest beam.
@@ -333,6 +335,10 @@ pub struct SteadyStateMeasurements {
     pub maintenance_drain_seconds: f64,
     /// User/system CPU through foreground work and maintenance drain.
     pub cpu_seconds: Option<f64>,
+    /// Physical storage reads charged to this process during measurement and drain.
+    pub physical_read_bytes: Option<u64>,
+    /// Physical storage writes charged to this process during measurement and drain.
+    pub physical_write_bytes: Option<u64>,
     /// Whole-worker peak RSS, including setup, warmup, and measurement.
     pub peak_rss_bytes: Option<u64>,
     /// Successful operations per wall-clock second.

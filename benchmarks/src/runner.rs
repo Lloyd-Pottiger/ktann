@@ -83,6 +83,10 @@ pub struct ScenarioSpec {
     pub foreground_limit: usize,
     /// RocksDB native actor bound; ignored by other Backends.
     pub blocking_resource_limit: Option<usize>,
+    /// Retained RocksDB fixture directory for controlled search comparisons.
+    pub persisted_index: Option<std::path::PathBuf>,
+    /// Reopen a verified fixture instead of importing it again.
+    pub reuse_index: bool,
     /// Concurrent clients in the timed workload.
     pub concurrency: usize,
     /// Large-profile client counts measured on the same imported index.
@@ -150,6 +154,8 @@ fn smoke_scenarios() -> Vec<ScenarioSpec> {
         partition_cache_bytes: 4 << 20,
         foreground_limit: 8,
         blocking_resource_limit: None,
+        persisted_index: None,
+        reuse_index: false,
         concurrency: 2,
         dispatch: WorkloadDispatch::Continuous,
         warmup_operations: 16,
@@ -209,6 +215,8 @@ fn smoke_scenarios() -> Vec<ScenarioSpec> {
             measured_operations: 8,
             hot_updates: false,
             blocking_resource_limit: None,
+            persisted_index: None,
+            reuse_index: false,
             dispatch: WorkloadDispatch::Continuous,
             ..common.clone()
         },
@@ -232,6 +240,8 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
         partition_cache_bytes: 64 << 20,
         foreground_limit: 32,
         blocking_resource_limit: None,
+        persisted_index: None,
+        reuse_index: false,
         concurrency: 4,
         dispatch: WorkloadDispatch::Continuous,
         warmup_operations: query_vectors,
@@ -308,6 +318,8 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
             measured_operations: 100,
             hot_updates: false,
             blocking_resource_limit: None,
+            persisted_index: None,
+            reuse_index: false,
             dispatch: WorkloadDispatch::Continuous,
             // Adaptive admission starts at one and may probe up to four
             // concurrent batches after sustained conflict-free completions.
@@ -338,6 +350,8 @@ fn large_scenarios() -> Result<Vec<ScenarioSpec>, String> {
             partition_cache_bytes: defaults.partition_cache_bytes(),
             foreground_limit: defaults.foreground_operation_limit(),
             blocking_resource_limit: None,
+            persisted_index: None,
+            reuse_index: false,
             concurrency: 16,
             dispatch: WorkloadDispatch::Continuous,
             warmup_operations: 1_000,
@@ -1134,8 +1148,60 @@ async fn run_quality_sweep<B: Backend>(
     spec: &ScenarioSpec,
     dataset: &mut BenchmarkDataset,
 ) -> Result<(Topology, QualitySweepMeasurements), String> {
-    let (index, topology, construction) =
-        prepare_index(runtime, backend_counters, metric_capture, spec, dataset).await?;
+    // The fixture records every construction input; query and cache settings
+    // may vary only when they do not change the stored tree.
+    let identity = format!(
+        "{:?};dataset={};write-beam={};refinement={:?}",
+        index_config(spec)?,
+        dataset.metadata.checksum_xxh3_128,
+        spec.write_beam_size,
+        spec.refinement_rounds
+    );
+    let manifest_path = spec
+        .persisted_index
+        .as_ref()
+        .map(|path| path.join("fixture.json"));
+    let (index, topology, construction) = if spec.reuse_index {
+        let path = manifest_path
+            .as_ref()
+            .expect("reuse has a fixture directory");
+        let persisted: PersistedFixture = serde_json::from_slice(
+            &std::fs::read(path).map_err(|error| format!("read fixture manifest: {error}"))?,
+        )
+        .map_err(|error| format!("decode fixture manifest: {error}"))?;
+        if persisted.identity != identity {
+            return Err("persisted fixture construction inputs differ".to_owned());
+        }
+        let index = runtime
+            .open_index("benchmark")
+            .await
+            .map_err(|error| error_at("reopen fixture index", error))?;
+        let topology = verified_topology(
+            &index,
+            spec,
+            "verify reused fixture",
+            Instant::now() + settle_timeout(spec),
+        )
+        .await?;
+        if topology != persisted.topology {
+            return Err("persisted fixture topology changed".to_owned());
+        }
+        (index, topology, ConstructionMeasurements::default())
+    } else {
+        let prepared =
+            prepare_index(runtime, backend_counters, metric_capture, spec, dataset).await?;
+        if let Some(path) = &manifest_path {
+            let fixture = PersistedFixture {
+                identity,
+                topology: prepared.1.clone(),
+            };
+            let bytes = serde_json::to_vec_pretty(&fixture)
+                .map_err(|error| format!("encode fixture manifest: {error}"))?;
+            std::fs::write(path, bytes)
+                .map_err(|error| format!("write fixture manifest: {error}"))?;
+        }
+        prepared
+    };
     if topology.max_level.is_none_or(|level| level < 3) {
         return Err(format!(
             "large quality topology has max level {:?} with {} partitions by level {:?}; expected at least three searchable levels",
@@ -1188,10 +1254,18 @@ async fn run_quality_sweep<B: Backend>(
     Ok((
         topology,
         QualitySweepMeasurements {
+            reused_index: spec.reuse_index,
             construction,
             points,
         },
     ))
+}
+
+/// Completed, verified persisted fixture identity and topology.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedFixture {
+    identity: String,
+    topology: Topology,
 }
 
 /// Creates and measures a fresh Logical Index before the search interval.
@@ -1403,6 +1477,12 @@ async fn measure_steady_workload<B: Backend>(
     let measurements = SteadyStateMeasurements {
         wall_seconds,
         maintenance_drain_seconds,
+        physical_read_bytes: resources_after
+            .disk_io_bytes_since(resources_before)
+            .map(|bytes| bytes.0),
+        physical_write_bytes: resources_after
+            .disk_io_bytes_since(resources_before)
+            .map(|bytes| bytes.1),
         cpu_seconds: Some(resources_after.cpu_seconds_since(resources_before)),
         peak_rss_bytes: Some(resources_after.peak_rss_bytes()),
         throughput_per_second: if wall_seconds > 0.0 {

@@ -81,6 +81,10 @@ struct ExecutionOptions {
     query_concurrency: Option<Vec<usize>>,
     partition_cache_bytes: Option<u64>,
     leaf_beam_size: Option<u32>,
+    rocksdb_block_cache_bytes: Option<usize>,
+    warmup_operations: Option<usize>,
+    rocksdb_path: Option<PathBuf>,
+    reuse_index: bool,
     lifecycle: LifecycleOverrides,
 }
 
@@ -89,6 +93,15 @@ impl ExecutionOptions {
         let backend = required(values, "backend")?;
         if backend != "rocksdb" && backend != "foundationdb" {
             return Err("--backend must be rocksdb or foundationdb".to_owned());
+        }
+        if values.contains_key("reuse-index") && !values.contains_key("rocksdb-path") {
+            return Err("--reuse-index requires --rocksdb-path".to_owned());
+        }
+        if backend != "rocksdb"
+            && (values.contains_key("rocksdb-block-cache-bytes")
+                || values.contains_key("rocksdb-path"))
+        {
+            return Err("RocksDB cache and fixture options require --backend rocksdb".to_owned());
         }
         Ok(Self {
             backend,
@@ -137,6 +150,20 @@ impl ExecutionOptions {
                     })
                 })
                 .transpose()?,
+            rocksdb_path: values.get("rocksdb-path").map(PathBuf::from),
+            reuse_index: match values.get("reuse-index").map(String::as_str) {
+                None | Some("false") => false,
+                Some("true") => true,
+                Some(_) => return Err("--reuse-index must be true or false".to_owned()),
+            },
+            rocksdb_block_cache_bytes: values
+                .get("rocksdb-block-cache-bytes")
+                .map(|value| parse_positive(value, "rocksdb-block-cache-bytes"))
+                .transpose()?,
+            warmup_operations: values
+                .get("warmup-operations")
+                .map(|value| parse_nonnegative(value, "warmup-operations"))
+                .transpose()?,
             leaf_beam_size: values
                 .get("leaf-beam-size")
                 .map(|value| parse_positive_u32(value, "leaf-beam-size"))
@@ -154,6 +181,10 @@ const SCENARIO_OPTIONS: &[&str] = &[
     "query-concurrency",
     "partition-cache-bytes",
     "leaf-beam-size",
+    "rocksdb-block-cache-bytes",
+    "warmup-operations",
+    "rocksdb-path",
+    "reuse-index",
     "write-beam-size",
     "refinement-rounds",
     "base-vectors",
@@ -238,6 +269,9 @@ fn parse_run_options(arguments: &[OsString]) -> Result<RunOptions, String> {
         .unwrap_or_else(|| "smoke".to_owned());
     let scenario = values.get("scenario").cloned();
     let execution = ExecutionOptions::parse(&values)?;
+    if execution.rocksdb_path.is_some() && (profile != "large" || scenario.is_none()) {
+        return Err("--rocksdb-path requires --profile large and one --scenario".to_owned());
+    }
     if profile != "large"
         && (execution.query_concurrency.is_some() || execution.leaf_beam_size.is_some())
     {
@@ -434,6 +468,26 @@ fn run_suite(options: RunOptions) -> Result<(), String> {
         let lifecycle = &options.execution.lifecycle;
         for (name, value) in [
             (
+                "rocksdb-path",
+                options
+                    .execution
+                    .rocksdb_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
+            ),
+            (
+                "reuse-index",
+                options.execution.reuse_index.then(|| "true".to_owned()),
+            ),
+            (
+                "rocksdb-block-cache-bytes",
+                option_string(options.execution.rocksdb_block_cache_bytes),
+            ),
+            (
+                "warmup-operations",
+                option_string(options.execution.warmup_operations),
+            ),
+            (
                 "query-concurrency",
                 options.execution.query_concurrency.as_ref().map(|values| {
                     values
@@ -521,6 +575,16 @@ fn run_worker(options: WorkerOptions) -> Result<(), String> {
         .find(|scenario| scenario.name == options.scenario)
         .ok_or_else(|| format!("unknown scenario `{}`", options.scenario))?;
     options.execution.lifecycle.apply(&mut scenario);
+    if options.execution.rocksdb_path.is_some() {
+        if scenario.profile != "large" {
+            return Err("--rocksdb-path requires --profile large".to_owned());
+        }
+        scenario.persisted_index = options.execution.rocksdb_path.clone();
+        scenario.reuse_index = options.execution.reuse_index;
+    }
+    if let Some(count) = options.execution.warmup_operations {
+        scenario.warmup_operations = count;
+    }
     if let Some(concurrency) = &options.execution.query_concurrency {
         if scenario.profile != "large" {
             return Err("--query-concurrency requires --profile large".to_owned());
@@ -589,13 +653,41 @@ async fn run_rocksdb(
     use std::sync::Arc;
 
     use ktann_rocksdb::{BackendNamespace, RocksDbBackend, RocksDbConfig};
-    use rocksdb::{OptimisticTransactionDB, Options};
+    use rocksdb::{BlockBasedOptions, Cache, OptimisticTransactionDB, Options};
 
-    let directory =
-        tempfile::tempdir().map_err(|error| format!("create RocksDB tempdir: {error}"))?;
-    let database_path = directory.path().join("database");
+    let temporary = if options.execution.rocksdb_path.is_none() {
+        Some(tempfile::tempdir().map_err(|error| format!("create RocksDB tempdir: {error}"))?)
+    } else {
+        None
+    };
+    let directory = options
+        .execution
+        .rocksdb_path
+        .as_deref()
+        .or_else(|| temporary.as_ref().map(tempfile::TempDir::path))
+        .expect("persistent or temporary directory");
+    if options.execution.rocksdb_path.is_some() {
+        if options.execution.reuse_index {
+            if !directory.join("fixture.json").is_file() {
+                return Err("persisted index has no completed fixture manifest".to_owned());
+            }
+        } else {
+            fs::create_dir(directory)
+                .map_err(|error| format!("create fresh persisted index directory: {error}"))?;
+        }
+    }
+    let database_path = directory.join("database");
     let mut database_options = Options::default();
-    database_options.create_if_missing(true);
+    database_options.create_if_missing(!options.execution.reuse_index);
+    // RocksDB owns raw-vector residency independently of the Partition Cache.
+    let cache_bytes = options
+        .execution
+        .rocksdb_block_cache_bytes
+        .unwrap_or(8 * 1024 * 1024);
+    let cache = Cache::new_lru_cache(cache_bytes);
+    let mut table_options = BlockBasedOptions::default();
+    table_options.set_block_cache(&cache);
+    database_options.set_block_based_table_factory(&table_options);
     let database = Arc::new(
         OptimisticTransactionDB::open(&database_options, &database_path)
             .map_err(|error| format!("open RocksDB: {error}"))?,
@@ -619,13 +711,18 @@ async fn run_rocksdb(
     );
     let report = runner::run_scenario(
         "rocksdb",
-        "rust-rocksdb=0.24.0; rocksdb=10.4.2".to_owned(),
+        format!("rust-rocksdb=0.24.0; rocksdb=10.4.2; block-cache-bytes={cache_bytes}"),
         backend,
         &effective_scenario,
         options.reproduction_command.clone(),
         options.execution.worker_threads,
     )
     .await?;
+    eprintln!(
+        "rocksdb block cache: capacity={cache_bytes} usage={} pinned={}",
+        cache.get_usage(),
+        cache.get_pinned_usage()
+    );
     Ok(report)
 }
 
@@ -852,12 +949,65 @@ fn shell_quote(value: &OsStr) -> String {
 
 /// Returns the stable help shown for missing or unknown public commands.
 fn usage() -> String {
-    "usage:\n  ktann-bench run --backend rocksdb|foundationdb [--profile smoke|full|large] [--scenario NAME] [--worker-threads N] [--write-beam-size N] [--refinement-rounds 0..5] [--base-vectors N] [--query-vectors N] [--query-offset N] [--max-partition-entries N] [--maintenance-workers N] [--import-max-in-flight-batches N] [--import-batch-size N] [--import-backlog-watermark N] [--output PATH]\n  ktann-bench compare --baseline PATH --candidate PATH [--maximum-relative-regression N] [--maximum-recall-drop N] [--maximum-rejection-rate-increase N] [--output PATH]".to_owned()
+    "usage:\n  ktann-bench run --backend rocksdb|foundationdb [--profile smoke|full|large] [--scenario NAME] [--worker-threads N] [--query-concurrency N,...] [--partition-cache-bytes N] [--leaf-beam-size N] [--warmup-operations N] [--rocksdb-block-cache-bytes N] [--rocksdb-path PATH] [--reuse-index true|false] [--write-beam-size N] [--refinement-rounds 0..5] [--base-vectors N] [--query-vectors N] [--query-offset N] [--max-partition-entries N] [--maintenance-workers N] [--import-max-in-flight-batches N] [--import-batch-size N] [--import-backlog-watermark N] [--output PATH]\n  ktann-bench compare --baseline PATH --candidate PATH [--maximum-relative-regression N] [--maximum-recall-drop N] [--maximum-rejection-rate-increase N] [--output PATH]".to_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{option_map, parse_compare_options, parse_run_options, shell_quote};
+
+    #[test]
+    fn native_cache_and_fixture_controls_are_validated() {
+        let parse = |arguments: &[&str]| {
+            parse_run_options(
+                &arguments
+                    .iter()
+                    .map(std::ffi::OsString::from)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let options = parse(&[
+            "--backend",
+            "rocksdb",
+            "--profile",
+            "large",
+            "--scenario",
+            "quality-sift-1m",
+            "--rocksdb-block-cache-bytes",
+            "4096",
+            "--warmup-operations",
+            "0",
+            "--rocksdb-path",
+            "/tmp/fixture",
+            "--reuse-index",
+            "true",
+        ])
+        .unwrap();
+        assert_eq!(options.execution.rocksdb_block_cache_bytes, Some(4096));
+        assert_eq!(options.execution.warmup_operations, Some(0));
+        assert!(options.execution.reuse_index);
+        for arguments in [
+            vec!["--backend", "rocksdb", "--rocksdb-block-cache-bytes", "0"],
+            vec![
+                "--backend",
+                "foundationdb",
+                "--rocksdb-block-cache-bytes",
+                "4096",
+            ],
+            vec!["--backend", "rocksdb", "--reuse-index", "true"],
+            vec!["--backend", "rocksdb", "--rocksdb-path", "/tmp/fixture"],
+            vec![
+                "--backend",
+                "rocksdb",
+                "--profile",
+                "large",
+                "--rocksdb-path",
+                "/tmp/fixture",
+            ],
+        ] {
+            assert!(parse(&arguments).is_err(), "{arguments:?}");
+        }
+    }
 
     #[test]
     fn large_search_diagnostics_parse_and_reject_invalid_counts() {
