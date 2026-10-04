@@ -708,9 +708,11 @@ fn dimensional_count_identity_and_size_invariants_fail_closed() {
     let mut bytes = codec.encode(&vector).expect("encode");
     bytes[4..8].copy_from_slice(&2_u32.to_be_bytes());
     assert_corrupt(decode_value(codec, id(1), &vector, &bytes));
-    let mut bytes = codec.encode(&vector).expect("encode");
-    bytes[8..12].copy_from_slice(&(-0.0_f32).to_bits().to_be_bytes());
-    assert_corrupt(decode_value(codec, id(1), &vector, &bytes));
+    for invalid in [f32::NEG_INFINITY, f32::INFINITY, f32::NAN, -0.0] {
+        let mut bytes = codec.encode(&vector).expect("encode");
+        bytes[8..12].copy_from_slice(&invalid.to_bits().to_be_bytes());
+        assert_corrupt(decode_value(codec, id(1), &vector, &bytes));
+    }
 
     let payload =
         PersistentValue::OpaquePayload(OpaquePayload::new(Bytes::new()).expect("valid payload"));

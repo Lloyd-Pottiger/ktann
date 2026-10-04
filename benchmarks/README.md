@@ -4,6 +4,30 @@
 `Runtime` and `Index` APIs. It writes JSON reports for reproducible, same-host
 comparisons. Results are empirical measurements, not an SLA.
 
+## Warmed-cache CPU isolation
+
+Use the public-API in-memory example to separate search computation from native
+backend and RPC waits:
+
+```sh
+cargo run --release --example search_cpu -- 768 4000 1,4,16 5000 cosine 100
+cargo run --release --example search_cpu -- 128 12000 1,4,16 5000 l2 100
+```
+
+Arguments are dimension, measured queries per concurrency, comma-separated
+concurrency, record count, metric, and `k`. The example keeps one leaf, warms a
+32-query deterministic corpus, and checks ordered IDs and exact distance bits
+against the warmup for every search. It reports QPS, p50/p99 latency, process CPU
+seconds, average occupied CPU cores, CPU time per query, and rerank work.
+Keep builds and other benchmarks outside the timed runs; alternate archived
+baseline and candidate binaries. See [the measured CPU baseline](search-cpu.md).
+
+This isolates a flat, fully resident workload. It does not measure production
+adapter IO or establish million-vector/multi-partition performance. KTANN's
+Partition Cache stores decoded index entries; exact reranking still loads raw
+Vector Records and Record Locations from the backend snapshot. A warm Partition
+Cache therefore does not imply that all search IO has disappeared.
+
 ## Run
 
 Build and run with optimizations enabled:

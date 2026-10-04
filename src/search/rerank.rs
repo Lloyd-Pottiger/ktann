@@ -207,25 +207,27 @@ pub(crate) async fn exact_rerank<T: ReadOps>(
         .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
     let load_count = candidates.len().min(budget);
     let exhausted = candidates.len() > budget;
-
     let mut scored: Vec<(Bytes, ExactDistance)> = Vec::with_capacity(load_count);
-    for batch in candidates[..load_count].chunks(RECORD_LOAD_BATCH) {
-        let ids = batch
-            .iter()
-            .map(|candidate| candidate.record_id.clone())
-            .collect();
-        let groups = txn.read_record_groups(ids, false).await?;
-        for (candidate, group) in batch.iter().zip(groups) {
-            let group = group.ok_or_else(|| Error::new(ErrorKind::Corruption))?;
-            let record = group.record();
-            if record.record_id() != candidate.record_id()
-                || group.location() != candidate.location()
-                || record.fields() != candidate.fields()
-            {
-                return Err(Error::new(ErrorKind::Corruption));
+    if load_count != 0 {
+        let exact_query = kernel.prepare_exact_query(query)?;
+        for batch in candidates[..load_count].chunks(RECORD_LOAD_BATCH) {
+            let ids = batch
+                .iter()
+                .map(|candidate| candidate.record_id.clone())
+                .collect();
+            let groups = txn.read_record_groups(ids, false).await?;
+            for (candidate, group) in batch.iter().zip(groups) {
+                let group = group.ok_or_else(|| Error::new(ErrorKind::Corruption))?;
+                let record = group.record();
+                if record.record_id() != candidate.record_id()
+                    || group.location() != candidate.location()
+                    || record.fields() != candidate.fields()
+                {
+                    return Err(Error::new(ErrorKind::Corruption));
+                }
+                let distance = exact_query.distance_validated(record.vector())?;
+                scored.push((candidate.record_id.clone(), distance));
             }
-            let distance = kernel.exact_distance(query, record.vector())?;
-            scored.push((candidate.record_id.clone(), distance));
         }
     }
 

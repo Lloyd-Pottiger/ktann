@@ -211,35 +211,57 @@ impl VectorKernel {
         distances
     }
 
-    /// Computes the exact scalar-f64 distance to one committed Vector Record.
-    ///
-    /// The query is caller-owned, whereas the record is decoded persistent
-    /// state. That distinction determines whether malformed numeric input is
-    /// `InvalidArgument` or `Corruption`.
-    pub(crate) fn exact_distance(&self, query: &[f32], record: &[f32]) -> Result<ExactDistance> {
+    /// Validates one caller query and prepares its invariant exact-score data.
+    pub(crate) fn prepare_exact_query<'a>(&self, query: &'a [f32]) -> Result<ExactQuery<'a>> {
         validate_vector(query, self.dimension, VectorSource::Caller)?;
-        validate_vector(record, self.dimension, VectorSource::Persistent)?;
+        let norm = if self.metric == Metric::Cosine {
+            let norm = vector_norm(query, VectorSource::Caller)?;
+            if norm == 0.0 {
+                return Err(vector_error(VectorSource::Caller));
+            }
+            norm
+        } else {
+            0.0
+        };
+        Ok(ExactQuery {
+            components: query,
+            metric: self.metric,
+            norm,
+        })
+    }
+}
 
+/// A validated exact query reused across all candidates in one rerank operation.
+///
+/// Cosine retains the original scalar-f64 query norm; components and arithmetic
+/// order are unchanged, so preparation does not alter exact distances.
+pub(crate) struct ExactQuery<'a> {
+    components: &'a [f32],
+    metric: Metric,
+    norm: f64,
+}
+
+impl ExactQuery<'_> {
+    /// Scores a finite record of the query dimension, established by persistent
+    /// decoding in `ReadLogicalTxn::read_record_groups`. Cosine still rejects
+    /// zero norms; exact distance arithmetic remains scalar-f64.
+    pub(crate) fn distance_validated(&self, record: &[f32]) -> Result<ExactDistance> {
         match self.metric {
             Metric::L2 => {
-                let squared = squared_l2(query, record);
+                let squared = squared_l2(self.components, record);
                 finite_exact_distance(squared, squared.sqrt())
             }
             Metric::InnerProduct => {
-                let distance = -dot_product(query, record);
+                let distance = -dot_product(self.components, record);
                 finite_exact_distance(distance, distance)
             }
             Metric::Cosine => {
-                let query_norm = vector_norm(query, VectorSource::Caller)?;
-                if query_norm == 0.0 {
-                    return Err(vector_error(VectorSource::Caller));
-                }
                 let record_norm = vector_norm(record, VectorSource::Persistent)?;
                 if record_norm == 0.0 {
                     return Err(vector_error(VectorSource::Persistent));
                 }
-
-                let distance = 1.0 - dot_product(query, record) / (query_norm * record_norm);
+                let distance =
+                    1.0 - dot_product(self.components, record) / (self.norm * record_norm);
                 finite_exact_distance(distance, distance)
             }
         }
@@ -609,7 +631,9 @@ mod tests {
     fn exact_l2_uses_squared_ranking_and_euclidean_output() {
         let kernel = VectorKernel::new(3, Metric::L2, SEED).unwrap();
         let exact = kernel
-            .exact_distance(&[1.0, 2.0, 3.0], &[4.0, 6.0, 3.0])
+            .prepare_exact_query(&[1.0, 2.0, 3.0])
+            .unwrap()
+            .distance_validated(&[4.0, 6.0, 3.0])
             .unwrap();
         assert_eq!(exact.ranking(), 25.0);
         assert_eq!(exact.distance(), 5.0);
@@ -619,7 +643,9 @@ mod tests {
     fn exact_inner_product_is_negated() {
         let kernel = VectorKernel::new(3, Metric::InnerProduct, SEED).unwrap();
         let exact = kernel
-            .exact_distance(&[1.0, -2.0, 3.0], &[4.0, 5.0, -6.0])
+            .prepare_exact_query(&[1.0, -2.0, 3.0])
+            .unwrap()
+            .distance_validated(&[4.0, 5.0, -6.0])
             .unwrap();
         assert_eq!(exact.ranking(), 24.0);
         assert_eq!(exact.distance(), 24.0);
@@ -628,28 +654,23 @@ mod tests {
     #[test]
     fn exact_cosine_recomputes_f64_norms_without_clamping() {
         let kernel = VectorKernel::new(2, Metric::Cosine, SEED).unwrap();
-        let same = kernel.exact_distance(&[3.0, 4.0], &[6.0, 8.0]).unwrap();
+        let query = kernel.prepare_exact_query(&[3.0, 4.0]).unwrap();
+        let same = query.distance_validated(&[6.0, 8.0]).unwrap();
         assert_eq!(same.distance(), 0.0);
 
-        let opposite = kernel.exact_distance(&[3.0, 4.0], &[-6.0, -8.0]).unwrap();
+        let opposite = query.distance_validated(&[-6.0, -8.0]).unwrap();
         assert_eq!(opposite.distance(), 2.0);
     }
 
     #[test]
-    fn exact_distance_distinguishes_caller_errors_from_corruption() {
+    fn exact_query_and_record_reject_zero_cosine_norms() {
         let kernel = VectorKernel::new(2, Metric::Cosine, SEED).unwrap();
         assert_kind(
-            kernel.exact_distance(&[0.0, 0.0], &[1.0, 0.0]),
+            kernel.prepare_exact_query(&[0.0, 0.0]),
             ErrorKind::InvalidArgument,
         );
-        assert_kind(
-            kernel.exact_distance(&[1.0, 0.0], &[0.0, 0.0]),
-            ErrorKind::Corruption,
-        );
-        assert_kind(
-            kernel.exact_distance(&[1.0, 0.0], &[f32::NAN, 0.0]),
-            ErrorKind::Corruption,
-        );
+        let query = kernel.prepare_exact_query(&[1.0, 0.0]).unwrap();
+        assert_kind(query.distance_validated(&[0.0, 0.0]), ErrorKind::Corruption);
     }
 
     #[test]
@@ -667,7 +688,8 @@ mod tests {
 
             for metric in [Metric::L2, Metric::InnerProduct, Metric::Cosine] {
                 let kernel = VectorKernel::new(dimension, metric, SEED).unwrap();
-                let exact = kernel.exact_distance(&query, &record).unwrap();
+                let prepared = kernel.prepare_exact_query(&query).unwrap();
+                let exact = prepared.distance_validated(&record).unwrap();
                 let query64: Vec<f64> = query.iter().map(|&value| f64::from(value)).collect();
                 let record64: Vec<f64> = record.iter().map(|&value| f64::from(value)).collect();
                 let oracle = match metric {
