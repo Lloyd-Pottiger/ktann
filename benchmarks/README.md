@@ -76,6 +76,50 @@ otherwise idle host for performance comparisons.
 `--base-vectors N`, `--query-vectors N`, `--query-offset N`, and
 `--max-partition-entries N`. Resolved overrides are recorded in each report.
 
+The raw RocksDB block cache is independent of the decoded Partition Cache.
+`--rocksdb-block-cache-bytes N` sets its capacity (default 8 MiB); the worker
+prints occupied and pinned bytes to stderr after the final full audit; those
+values include audit reads and do not describe individual timed points.
+`--warmup-operations N` sets
+per-point untimed warmup, including zero for diagnostics. Each timed point
+records `physical_read_bytes` and `physical_write_bytes` from OS process
+accounting (Darwin `proc_pid_rusage`, Linux `/proc/self/io`). These are physical
+bytes charged to the application process, rather than logical backend reads;
+for FoundationDB they exclude the separate server process. Zero physical reads
+can also mean OS page-cache hits, so combine this evidence with cache occupancy
+and repeated stable latency before describing a workload as resident.
+
+For controlled large RocksDB comparisons, create a fixture with
+`--rocksdb-path /absolute/new-directory` and one explicit `--scenario`.
+The directory must not already exist. Subsequent runs use that same path with
+`--reuse-index true`. The fixture checks the dataset checksum, index settings,
+write beam and refinement inputs, then fully verifies the persisted topology
+before queries. Reused reports set `construction: null`; comparison omits
+construction costs and rejects mixing fresh and reused runs. Cache capacity,
+client counts, warmup and read beam can
+change without reconstructing the tree. Keep both comparison binaries and the
+fixture manifest with the reports. Reports use schema version 8.
+
+Large search diagnostics accept `--query-concurrency 1,4,16,4,1` and
+`--leaf-beam-size 32`. The worker imports and verifies the index once, then
+warms and measures each client count in order on that same index. Repeated counts
+help detect drift; each point reports its own concurrency, latency, CPU, recall,
+cache observations, backend logical IO, and admission waits. Without these
+options the standard beam curve and 16 clients are unchanged. A single beam
+checks complete search and recall samples without requiring a quality curve.
+`--partition-cache-bytes N` sets the decoded partition cache capacity for any
+profile; zero disables it. This cache excludes raw vectors read during reranking
+and does not replace RocksDB's block cache or FoundationDB's server cache.
+
+```sh
+KTANN_BENCH_DATASET_CACHE=/path/to/dataset-cache \
+  cargo run --release -p ktann-benchmarks --bin ktann-bench -- \
+  run --backend rocksdb --profile large --scenario quality-sift-1m \
+  --worker-threads 8 --query-concurrency 1,4,16,64,16,4,1 \
+  --partition-cache-bytes 1073741824 --leaf-beam-size 32 \
+  --output sift-search-concurrency.json
+```
+
 These import options apply to `--profile large` or an explicitly selected
 `--scenario import-to-search-lifecycle`:
 

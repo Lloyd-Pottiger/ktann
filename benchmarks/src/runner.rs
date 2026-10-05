@@ -83,8 +83,14 @@ pub struct ScenarioSpec {
     pub foreground_limit: usize,
     /// RocksDB native actor bound; ignored by other Backends.
     pub blocking_resource_limit: Option<usize>,
+    /// Retained RocksDB fixture directory for controlled search comparisons.
+    pub persisted_index: Option<std::path::PathBuf>,
+    /// Reopen a verified fixture instead of importing it again.
+    pub reuse_index: bool,
     /// Concurrent clients in the timed workload.
     pub concurrency: usize,
+    /// Large-profile client counts measured on the same imported index.
+    pub query_concurrency_sweep: Vec<usize>,
     /// Dispatch policy for the bounded concurrent clients.
     pub dispatch: WorkloadDispatch,
     /// Operations outside the timed region that establish steady state.
@@ -148,6 +154,8 @@ fn smoke_scenarios() -> Vec<ScenarioSpec> {
         partition_cache_bytes: 4 << 20,
         foreground_limit: 8,
         blocking_resource_limit: None,
+        persisted_index: None,
+        reuse_index: false,
         concurrency: 2,
         dispatch: WorkloadDispatch::Continuous,
         warmup_operations: 16,
@@ -156,6 +164,7 @@ fn smoke_scenarios() -> Vec<ScenarioSpec> {
         search_options: SearchOptions::default(),
         write_beam_size: 8,
         refinement_rounds: None,
+        query_concurrency_sweep: Vec::new(),
         leaf_beam_sweep: Vec::new(),
         max_partition_entries: 32,
         lifecycle: false,
@@ -206,6 +215,8 @@ fn smoke_scenarios() -> Vec<ScenarioSpec> {
             measured_operations: 8,
             hot_updates: false,
             blocking_resource_limit: None,
+            persisted_index: None,
+            reuse_index: false,
             dispatch: WorkloadDispatch::Continuous,
             ..common.clone()
         },
@@ -229,6 +240,8 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
         partition_cache_bytes: 64 << 20,
         foreground_limit: 32,
         blocking_resource_limit: None,
+        persisted_index: None,
+        reuse_index: false,
         concurrency: 4,
         dispatch: WorkloadDispatch::Continuous,
         warmup_operations: query_vectors,
@@ -237,6 +250,7 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
         search_options: SearchOptions::default(),
         write_beam_size: 8,
         refinement_rounds: None,
+        query_concurrency_sweep: Vec::new(),
         leaf_beam_sweep: Vec::new(),
         max_partition_entries: 128,
         lifecycle: false,
@@ -304,6 +318,8 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
             measured_operations: 100,
             hot_updates: false,
             blocking_resource_limit: None,
+            persisted_index: None,
+            reuse_index: false,
             dispatch: WorkloadDispatch::Continuous,
             // Adaptive admission starts at one and may probe up to four
             // concurrent batches after sustained conflict-free completions.
@@ -334,6 +350,8 @@ fn large_scenarios() -> Result<Vec<ScenarioSpec>, String> {
             partition_cache_bytes: defaults.partition_cache_bytes(),
             foreground_limit: defaults.foreground_operation_limit(),
             blocking_resource_limit: None,
+            persisted_index: None,
+            reuse_index: false,
             concurrency: 16,
             dispatch: WorkloadDispatch::Continuous,
             warmup_operations: 1_000,
@@ -343,6 +361,7 @@ fn large_scenarios() -> Result<Vec<ScenarioSpec>, String> {
             search_options: SearchOptions::default(),
             write_beam_size: defaults.write_beam_size(),
             refinement_rounds: None,
+            query_concurrency_sweep: Vec::new(),
             leaf_beam_sweep: vec![1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128, 192, 256, 384],
             // Keep the shared leaf/internal fanout below sqrt(1M) so the
             // million-vector corpus must form at least three searchable levels.
@@ -507,6 +526,7 @@ pub async fn run_scenario<B: Backend>(
             refinement_input_limit_bytes: spec.refinement_rounds.map(|_| 32 << 30),
             leaf_beam_size_override: spec.search_options.leaf_beam_size(),
             leaf_beam_sweep: spec.leaf_beam_sweep.clone(),
+            query_concurrency_sweep: spec.query_concurrency_sweep.clone(),
             blocking_resource_limit: spec.blocking_resource_limit,
             backend_max_mutations: admission.max_mutations,
             backend_max_mutation_bytes: admission.max_mutation_bytes,
@@ -1128,8 +1148,59 @@ async fn run_quality_sweep<B: Backend>(
     spec: &ScenarioSpec,
     dataset: &mut BenchmarkDataset,
 ) -> Result<(Topology, QualitySweepMeasurements), String> {
-    let (index, topology, construction) =
-        prepare_index(runtime, backend_counters, metric_capture, spec, dataset).await?;
+    // Reuse requires the same dataset and construction inputs.
+    let identity = format!(
+        "{:?};dataset={};write-beam={};refinement={:?}",
+        index_config(spec)?,
+        dataset.metadata.checksum_xxh3_128,
+        spec.write_beam_size,
+        spec.refinement_rounds
+    );
+    let manifest_path = spec
+        .persisted_index
+        .as_ref()
+        .map(|path| path.join("fixture.json"));
+    let (index, topology, construction) = if spec.reuse_index {
+        let path = manifest_path
+            .as_ref()
+            .expect("reuse has a fixture directory");
+        let persisted: PersistedFixture = serde_json::from_slice(
+            &std::fs::read(path).map_err(|error| format!("read fixture manifest: {error}"))?,
+        )
+        .map_err(|error| format!("decode fixture manifest: {error}"))?;
+        if persisted.identity != identity {
+            return Err("persisted fixture construction inputs differ".to_owned());
+        }
+        let index = runtime
+            .open_index("benchmark")
+            .await
+            .map_err(|error| error_at("reopen fixture index", error))?;
+        let topology = verified_topology(
+            &index,
+            spec,
+            "verify reused fixture",
+            Instant::now() + settle_timeout(spec),
+        )
+        .await?;
+        if topology != persisted.topology {
+            return Err("persisted fixture topology changed".to_owned());
+        }
+        (index, topology, None)
+    } else {
+        let (index, topology, construction) =
+            prepare_index(runtime, backend_counters, metric_capture, spec, dataset).await?;
+        if let Some(path) = &manifest_path {
+            let fixture = PersistedFixture {
+                identity,
+                topology: topology.clone(),
+            };
+            let bytes = serde_json::to_vec_pretty(&fixture)
+                .map_err(|error| format!("encode fixture manifest: {error}"))?;
+            std::fs::write(path, bytes)
+                .map_err(|error| format!("write fixture manifest: {error}"))?;
+        }
+        (index, topology, Some(construction))
+    };
     if topology.max_level.is_none_or(|level| level < 3) {
         return Err(format!(
             "large quality topology has max level {:?} with {} partitions by level {:?}; expected at least three searchable levels",
@@ -1142,32 +1213,43 @@ async fn run_quality_sweep<B: Backend>(
     // Release the imported million-vector corpus before measuring search.
     dataset.ids = Vec::new();
     dataset.base = Vec::new();
-    let mut points = Vec::with_capacity(spec.leaf_beam_sweep.len());
-    for beam in &spec.leaf_beam_sweep {
-        let mut point = spec.clone();
-        point.search_options = point
-            .search_options
-            .with_leaf_beam_size(*beam)
-            .map_err(|error| error_at("configure quality point", error))?;
-        let mut measurements = measure_steady_workload(
-            &index,
-            backend_counters,
-            metric_capture,
-            &point,
-            dataset,
-            Some(&truth),
-        )
-        .await?;
-        // getrusage exposes only the process-lifetime high-water mark, which
-        // setup already established and cannot attribute to one beam point.
-        measurements.peak_rss_bytes = None;
-        points.push(QualityPoint {
-            leaf_beam_size: *beam,
-            measurements,
-        });
+    let concurrencies = if spec.query_concurrency_sweep.is_empty() {
+        std::slice::from_ref(&spec.concurrency)
+    } else {
+        &spec.query_concurrency_sweep
+    };
+    let mut points = Vec::with_capacity(spec.leaf_beam_sweep.len() * concurrencies.len());
+    for concurrency in concurrencies {
+        for beam in &spec.leaf_beam_sweep {
+            let mut point = spec.clone();
+            point.concurrency = *concurrency;
+            point.search_options = point
+                .search_options
+                .with_leaf_beam_size(*beam)
+                .map_err(|error| error_at("configure quality point", error))?;
+            let mut measurements = measure_steady_workload(
+                &index,
+                backend_counters,
+                metric_capture,
+                &point,
+                dataset,
+                Some(&truth),
+            )
+            .await?;
+            // getrusage exposes only the process-lifetime high-water mark, which
+            // setup already established and cannot attribute to one beam point.
+            measurements.peak_rss_bytes = None;
+            points.push(QualityPoint {
+                leaf_beam_size: *beam,
+                concurrency: *concurrency,
+                measurements,
+            });
+        }
+        // Each client count retains the full quality/completion contract.
+        let start = points.len() - spec.leaf_beam_sweep.len();
+        validate_quality_frontier(&points[start..], spec.measured_operations)?;
     }
     verify_measured_state(&index, spec).await?;
-    validate_quality_frontier(&points, spec.measured_operations)?;
     Ok((
         topology,
         QualitySweepMeasurements {
@@ -1175,6 +1257,13 @@ async fn run_quality_sweep<B: Backend>(
             points,
         },
     ))
+}
+
+/// Completed, verified persisted fixture identity and topology.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedFixture {
+    identity: String,
+    topology: Topology,
 }
 
 /// Creates and measures a fresh Logical Index before the search interval.
@@ -1332,6 +1421,7 @@ async fn measure_steady_workload<B: Backend>(
         .search_options
         .leaf_beam_size()
         .map_or_else(|| "workload".to_owned(), |beam| format!("beam {beam}"));
+    let point = format!("{point} concurrency {}", spec.concurrency);
     let warmup_phase = format!("{point} warmup");
     let warmup_started = phase_started(spec, &warmup_phase);
     let _warmup_result =
@@ -1385,6 +1475,12 @@ async fn measure_steady_workload<B: Backend>(
     let measurements = SteadyStateMeasurements {
         wall_seconds,
         maintenance_drain_seconds,
+        physical_read_bytes: resources_after
+            .disk_io_bytes_since(resources_before)
+            .map(|bytes| bytes.0),
+        physical_write_bytes: resources_after
+            .disk_io_bytes_since(resources_before)
+            .map(|bytes| bytes.1),
         cpu_seconds: Some(resources_after.cpu_seconds_since(resources_before)),
         peak_rss_bytes: Some(resources_after.peak_rss_bytes()),
         throughput_per_second: if wall_seconds > 0.0 {
@@ -1472,7 +1568,7 @@ fn validate_quality_frontier(
         .zip(recalls.iter().copied().reduce(f64::max))
         .is_some_and(|(minimum, maximum)| maximum > minimum);
     let work_moves = leaf_work.windows(2).any(|window| window[1] > window[0]);
-    if !recall_moves || !work_moves {
+    if points.len() > 1 && (!recall_moves || !work_moves) {
         return Err(
             "large quality sweep did not produce a nontrivial quality/work frontier".to_owned(),
         );
@@ -2313,6 +2409,7 @@ mod tests {
         };
         QualityPoint {
             leaf_beam_size: beam,
+            concurrency: 16,
             measurements,
         }
     }
@@ -2459,6 +2556,19 @@ mod tests {
                 "the shared partition fanout must force a third topology level"
             );
         }
+    }
+
+    #[test]
+    fn single_beam_diagnostic_still_requires_every_search_to_complete() {
+        let mut points = vec![quality_point(32, 2, 0.9, 10.0)];
+        assert!(validate_quality_frontier(&points, 2).is_ok());
+        points[0]
+            .measurements
+            .recall_at_k
+            .as_mut()
+            .expect("recall")
+            .queries = 1;
+        assert!(validate_quality_frontier(&points, 2).is_err());
     }
 
     #[test]

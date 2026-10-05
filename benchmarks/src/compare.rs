@@ -291,42 +291,47 @@ fn compare_quality_sweep(
     candidate: &QualitySweepMeasurements,
     policy: ComparisonPolicy,
 ) {
-    relative_regression(
-        result,
-        key,
-        "construction wall seconds",
-        baseline.construction.wall_seconds,
-        candidate.construction.wall_seconds,
-        policy.maximum_relative_regression,
-    );
-    compare_optional_resource(
-        result,
-        key,
-        "construction CPU seconds",
-        baseline.construction.cpu_seconds,
-        candidate.construction.cpu_seconds,
-        policy.maximum_relative_regression,
-    );
-    compare_optional_resource(
-        result,
-        key,
-        "construction peak RSS bytes",
-        baseline
-            .construction
-            .peak_rss_bytes
-            .map(|bytes| bytes as f64),
-        candidate
-            .construction
-            .peak_rss_bytes
-            .map(|bytes| bytes as f64),
-        policy.maximum_relative_regression,
-    );
+    if baseline.construction.is_some() != candidate.construction.is_some() {
+        result
+            .regressions
+            .push(format!("{key}: index reuse changed"));
+        return;
+    }
+    if let (Some(baseline), Some(candidate)) = (&baseline.construction, &candidate.construction) {
+        relative_regression(
+            result,
+            key,
+            "construction wall seconds",
+            baseline.wall_seconds,
+            candidate.wall_seconds,
+            policy.maximum_relative_regression,
+        );
+        compare_optional_resource(
+            result,
+            key,
+            "construction CPU seconds",
+            baseline.cpu_seconds,
+            candidate.cpu_seconds,
+            policy.maximum_relative_regression,
+        );
+        compare_optional_resource(
+            result,
+            key,
+            "construction peak RSS bytes",
+            baseline.peak_rss_bytes.map(|bytes| bytes as f64),
+            candidate.peak_rss_bytes.map(|bytes| bytes as f64),
+            policy.maximum_relative_regression,
+        );
+    }
     if baseline.points.len() != candidate.points.len()
         || baseline
             .points
             .iter()
-            .map(|point| point.leaf_beam_size)
-            .ne(candidate.points.iter().map(|point| point.leaf_beam_size))
+            .map(|point| (point.concurrency, point.leaf_beam_size))
+            .ne(candidate
+                .points
+                .iter()
+                .map(|point| (point.concurrency, point.leaf_beam_size)))
     {
         result
             .regressions
@@ -334,7 +339,10 @@ fn compare_quality_sweep(
         return;
     }
     for (baseline, candidate) in baseline.points.iter().zip(&candidate.points) {
-        let point_key = format!("{key}/leaf_beam={}", baseline.leaf_beam_size);
+        let point_key = format!(
+            "{key}/concurrency={}/leaf_beam={}",
+            baseline.concurrency, baseline.leaf_beam_size
+        );
         compare_steady_state(
             result,
             &point_key,
@@ -1296,7 +1304,9 @@ mod tests {
         WorkloadDispatch, WriteAmplification,
     };
 
-    use super::{ComparisonPolicy, compare, ensure_comparable};
+    use super::{
+        ComparisonPolicy, ComparisonReport, compare, compare_quality_sweep, ensure_comparable,
+    };
 
     fn budget_configuration(runtime_default: u32, effective_limit: u32) -> BudgetConfiguration {
         BudgetConfiguration {
@@ -1355,6 +1365,7 @@ mod tests {
                 refinement_input_limit_bytes: None,
                 leaf_beam_size_override: None,
                 leaf_beam_sweep: Vec::new(),
+                query_concurrency_sweep: Vec::new(),
                 blocking_resource_limit: Some(2),
                 backend_max_mutations: 100,
                 backend_max_mutation_bytes: 1_000,
@@ -1445,14 +1456,16 @@ mod tests {
         };
         baseline.measurements =
             ReportMeasurements::QualitySweep(Box::new(QualitySweepMeasurements {
-                construction: Default::default(),
+                construction: Some(Default::default()),
                 points: vec![
                     QualityPoint {
                         leaf_beam_size: 1,
+                        concurrency: 16,
                         measurements: (*measurements).clone(),
                     },
                     QualityPoint {
                         leaf_beam_size: 32,
+                        concurrency: 16,
                         measurements: (*measurements).clone(),
                     },
                 ],
@@ -1479,6 +1492,68 @@ mod tests {
     }
 
     #[test]
+    fn quality_comparison_rejects_changed_point_concurrency() {
+        let mut baseline = report();
+        let ReportMeasurements::SteadyState(measurements) = baseline.measurements else {
+            panic!("steady fixture")
+        };
+        baseline.measurements =
+            ReportMeasurements::QualitySweep(Box::new(QualitySweepMeasurements {
+                construction: Some(Default::default()),
+                points: vec![QualityPoint {
+                    leaf_beam_size: 32,
+                    concurrency: 4,
+                    measurements: *measurements,
+                }],
+            }));
+        let mut candidate = baseline.clone();
+        let ReportMeasurements::QualitySweep(sweep) = &mut candidate.measurements else {
+            panic!("quality fixture")
+        };
+        sweep.points[0].concurrency = 16;
+        let comparison = compare(
+            &suite(baseline),
+            &suite(candidate),
+            ComparisonPolicy::default(),
+        )
+        .expect("comparison");
+        assert!(
+            comparison
+                .regressions
+                .iter()
+                .any(|r| r.contains("quality sweep points changed"))
+        );
+    }
+
+    #[test]
+    fn quality_comparison_requires_matching_construction_presence() {
+        for baseline_built in [false, true] {
+            for candidate_built in [false, true] {
+                let baseline = QualitySweepMeasurements {
+                    construction: baseline_built.then(Default::default),
+                    ..Default::default()
+                };
+                let candidate = QualitySweepMeasurements {
+                    construction: candidate_built.then(Default::default),
+                    ..Default::default()
+                };
+                let mut result = ComparisonReport::default();
+                compare_quality_sweep(
+                    &mut result,
+                    "fixture",
+                    &baseline,
+                    &candidate,
+                    ComparisonPolicy::default(),
+                );
+                assert_eq!(
+                    result.regressions.is_empty(),
+                    baseline_built == candidate_built
+                );
+            }
+        }
+    }
+
+    #[test]
     fn quality_comparison_includes_construction_cost() {
         let mut baseline = report();
         baseline.configuration.leaf_beam_sweep = vec![1];
@@ -1493,9 +1568,10 @@ mod tests {
         };
         baseline.measurements =
             ReportMeasurements::QualitySweep(Box::new(QualitySweepMeasurements {
-                construction,
+                construction: Some(construction),
                 points: vec![QualityPoint {
                     leaf_beam_size: 1,
+                    concurrency: 16,
                     measurements: *measurements,
                 }],
             }));
@@ -1503,7 +1579,11 @@ mod tests {
         let ReportMeasurements::QualitySweep(sweep) = &mut candidate.measurements else {
             panic!("quality fixture")
         };
-        sweep.construction.wall_seconds = 20.0;
+        sweep
+            .construction
+            .as_mut()
+            .expect("fresh construction")
+            .wall_seconds = 20.0;
         let comparison = compare(
             &suite(baseline),
             &suite(candidate),
