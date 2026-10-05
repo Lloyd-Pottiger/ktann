@@ -12,7 +12,7 @@ use super::{DataType, Error, FieldId, FieldSchema, Metric, Result, SearchBudgets
 pub(crate) const MAX_DIMENSION: usize = 16_384;
 const MAX_BLOOM_FIELDS: usize = 4;
 const MAX_TREE_KEY_BYTES: usize = 8 * 1_024;
-const DEFAULT_MIN_PARTITION_ENTRIES: u32 = 16;
+const DEFAULT_MIN_PARTITION_ENTRIES: u32 = 64;
 const DEFAULT_MAX_PARTITION_ENTRIES: u32 = 512;
 const MAX_PARTITION_ENTRIES: u32 = 65_536;
 const DEFAULT_FIXUP_QUEUE_CAPACITY: usize = 1_024;

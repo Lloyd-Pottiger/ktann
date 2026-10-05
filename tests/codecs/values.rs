@@ -23,11 +23,15 @@ fn pk(value: u64) -> PartitionKey {
     PartitionKey::new(value).expect("test Partition Key is nonzero")
 }
 
+// Golden codec fixtures use fixed configuration independent of tuning defaults.
 fn minimal_manifest() -> IndexManifest {
     IndexManifest::new(
         IndexLifecycle::Active,
         id(1),
-        IndexConfig::new(1, Metric::L2).expect("valid config"),
+        IndexConfig::new(1, Metric::L2)
+            .expect("valid config")
+            .with_partition_entries(16, 512)
+            .expect("fixed codec configuration"),
         [0; 32],
         vec![],
     )

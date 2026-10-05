@@ -6,8 +6,9 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use ktann::api::{
-    ImportOptions, Index, IndexConfig, Metric, Mutation, OperationOptions, Record, RuntimeConfig,
-    SearchBudgets, SearchOptions, SearchRequest,
+    CompareOp, DataType, FieldId, FieldSchema, ImportOptions, Index, IndexConfig, Metric, Mutation,
+    OperationOptions, Predicate, Record, RuntimeConfig, SearchOptions, SearchRequest,
+    Value as FieldValue,
 };
 use ktann::runtime::Runtime;
 use ktann::storage::backend::Backend;
@@ -78,19 +79,16 @@ pub fn run() -> Result<(), String> {
     match options.backend.as_str() {
         #[cfg(feature = "rocksdb")]
         "rocksdb" => executor.block_on(async {
-            use ktann_rocksdb::{BackendNamespace, RocksDbBackend, RocksDbConfig};
+            use ktann_rocksdb::{BackendNamespace, RocksDbBackend};
             let mut config = rocksdb::Options::default();
             config.create_if_missing(true);
             let db = Arc::new(
                 rocksdb::OptimisticTransactionDB::open(&config, &options.database)
                     .map_err(|e| e.to_string())?,
             );
-            let backend = RocksDbBackend::with_config(
+            let backend = RocksDbBackend::new(
                 db,
                 BackendNamespace::new("ktann-vdbbench").map_err(|e| e.to_string())?,
-                RocksDbConfig::default()
-                    .with_blocking_resource_limit(64)
-                    .map_err(|e| e.to_string())?,
             );
             serve(
                 backend,
@@ -151,6 +149,8 @@ enum Operation {
     Search {
         vector: Vec<f32>,
         k: usize,
+        /// Inclusive signed record-ID threshold used by VectorDBBench numeric filters.
+        id_min: Option<i64>,
     },
     Health,
     Shutdown,
@@ -254,14 +254,7 @@ async fn serve<B: Backend>(backend: B, identity: String, options: &Options) -> R
         backend.admission_budget()
     );
     let (backend, counters) = MeasuredBackend::new(backend);
-    let config = RuntimeConfig::default()
-        .with_foreground_operation_limit(128)
-        .and_then(|c| c.with_maintenance(2, 1024))
-        .and_then(|c| c.with_attempts(32, 32))
-        .and_then(|c| c.with_partition_cache_bytes(512 << 20))
-        .and_then(|c| c.with_write_beam_size(8))
-        .and_then(|c| c.with_import_limits(4, 1))
-        .map_err(|e| e.to_string())?;
+    let config = RuntimeConfig::default();
     let service = Arc::new(Service {
         runtime: Runtime::new(backend.clone(), config).map_err(|e| e.to_string())?,
         backend,
@@ -424,7 +417,7 @@ impl<B: Backend> Service<B> {
                     _ => return Err(invalid("only L2 and COSINE are supported")),
                 };
                 let config = IndexConfig::new(dimension, metric_kind)
-                    .and_then(|c| c.with_partition_entries(32, 128))
+                    .and_then(|c| c.with_fields(vec![FieldSchema::new("id", DataType::I64)?]))
                     .map_err(api_error)?;
                 let mut search = SearchOptions::default();
                 if let Some(beam) = leaf_beam {
@@ -474,9 +467,12 @@ impl<B: Backend> Service<B> {
                     if mutations.is_empty() && state.root_probe.is_none() {
                         root_probe = Some(Arc::clone(&vector));
                     }
-                    let record =
-                        Record::new(Bytes::copy_from_slice(&id.to_be_bytes()), vector, vec![])
-                            .map_err(api_error)?;
+                    let record = Record::new(
+                        Bytes::copy_from_slice(&id.to_be_bytes()),
+                        vector,
+                        vec![FieldValue::I64(*id)],
+                    )
+                    .map_err(api_error)?;
                     mutations.push(Mutation::Insert(record));
                 }
                 let start = Instant::now();
@@ -586,7 +582,7 @@ impl<B: Backend> Service<B> {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             }
-            Operation::Search { vector, k } => {
+            Operation::Search { vector, k, id_min } => {
                 let state = self.state.read().await;
                 if !state.ready {
                     return Err(invalid("optimize must succeed before search"));
@@ -595,9 +591,16 @@ impl<B: Backend> Service<B> {
                     .index
                     .as_ref()
                     .ok_or_else(|| invalid("reset required"))?;
-                let request = SearchRequest::new(vector, k)
+                let mut request = SearchRequest::new(vector, k)
                     .map_err(api_error)?
                     .with_options(state.search);
+                if let Some(id_min) = id_min {
+                    request = request.with_predicate(Predicate::Compare {
+                        field: FieldId(0),
+                        op: CompareOp::GreaterOrEqual,
+                        value: FieldValue::I64(id_min),
+                    });
+                }
                 let start = Instant::now();
                 let result = index.search(request).await.map_err(api_error)?;
                 let elapsed = start.elapsed();
@@ -654,6 +657,8 @@ impl<B: Backend> Service<B> {
             .lock()
             .expect("measurement mutex poisoned");
         let resources = ResourceSnapshot::capture()?;
+        let runtime_config = self.runtime.config();
+        let index_config = state.index.as_ref().map(Index::config);
         let mut cumulative = 0;
         let p50 = m.buckets.iter().position(|count| {
             cumulative += count;
@@ -671,9 +676,16 @@ impl<B: Backend> Service<B> {
             "records": state.records,
             "ready": state.ready,
             "configuration": {
-                "min_partition_entries": 32, "max_partition_entries": 128, "write_beam_size": 8,
-                "maintenance_workers": 2, "partition_cache_bytes": 512_u64 << 20,
-                "foreground_limit": 128, "import_max_in_flight_batches": 4, "import_backlog_watermark": 1,
+                "min_partition_entries": index_config.map(IndexConfig::min_partition_entries),
+                "max_partition_entries": index_config.map(IndexConfig::max_partition_entries),
+                "write_beam_size": runtime_config.write_beam_size(),
+                "maintenance_workers": runtime_config.maintenance_workers(),
+                "partition_cache_bytes": runtime_config.partition_cache_bytes(),
+                "foreground_limit": runtime_config.foreground_operation_limit(),
+                "foreground_attempts": runtime_config.foreground_attempts(),
+                "fixup_attempts": runtime_config.fixup_attempts(),
+                "import_max_in_flight_batches": runtime_config.import_max_in_flight_batches(),
+                "import_backlog_watermark": runtime_config.import_backlog_watermark(),
                 "readiness_header_slot_limit": 262144, "readiness_probe_limit": 32,
                 "readiness_stall_seconds": 5, "readiness_probe_interval_seconds": 30,
                 "readiness_probe_leaf_beam": 1, "readiness_probe_partition_budget": 128
@@ -688,8 +700,8 @@ impl<B: Backend> Service<B> {
             "ktann_search_p50_upper_bound_seconds": p50.filter(|_| m.searches > 0).map(|i| 2f64.powi(i as i32) / 1e9),
             "search_latency_log2_nanoseconds_histogram": m.buckets.to_vec(),
             "search_budgets": {
-                "scanned_tree_keys": SearchBudgets::default().scanned_tree_keys(),
-                "visited_partitions": SearchBudgets::default().visited_partitions(),
+                "scanned_tree_keys": runtime_config.default_search_budgets().scanned_tree_keys(),
+                "visited_partitions": runtime_config.default_search_budgets().visited_partitions(),
                 "leaf_beam": state.search.resolved_leaf_beam_size(),
                 "exact_rerank_candidates": "KTANN default derived from k"
             },
