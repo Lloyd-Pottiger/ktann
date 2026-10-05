@@ -4,30 +4,6 @@
 `Runtime` and `Index` APIs. It writes JSON reports for reproducible, same-host
 comparisons. Results are empirical measurements, not an SLA.
 
-## Warmed-cache CPU isolation
-
-Use the public-API in-memory example to separate search computation from native
-backend and RPC waits:
-
-```sh
-cargo run --release --example search_cpu -- 768 4000 1,4,16 5000 cosine 100
-cargo run --release --example search_cpu -- 128 12000 1,4,16 5000 l2 100
-```
-
-Arguments are dimension, measured queries per concurrency, comma-separated
-concurrency, record count, metric, and `k`. The example keeps one leaf, warms a
-32-query deterministic corpus, and checks ordered IDs and exact distance bits
-against the warmup for every search. It reports QPS, p50/p99 latency, process CPU
-seconds, average occupied CPU cores, CPU time per query, and rerank work.
-Keep builds and other benchmarks outside the timed runs; alternate archived
-baseline and candidate binaries. See [the measured CPU baseline](search-cpu.md).
-
-This isolates a flat, fully resident workload. It does not measure production
-adapter IO or establish million-vector/multi-partition performance. KTANN's
-Partition Cache stores decoded index entries; exact reranking still loads raw
-Vector Records and Record Locations from the backend snapshot. A warm Partition
-Cache therefore does not imply that all search IO has disappeared.
-
 ## Run
 
 Build and run with optimizations enabled:
@@ -96,18 +72,9 @@ otherwise idle host for performance comparisons.
 
 ### Diagnostic options
 
-See [million-vector residency diagnostics](search-production.md) for measured
-CPU saturation on SIFT1M, Cohere warmup drift, and the distinction between
-Partition Cache residency and raw-vector backend cache residency.
-
 `--write-beam-size N` overrides the write routing beam. Large runs also accept
 `--base-vectors N`, `--query-vectors N`, `--query-offset N`, and
 `--max-partition-entries N`. Resolved overrides are recorded in each report.
-
-[Resident production search baseline](search-residency.md) establishes stable
-million-vector CPU saturation with timed physical IO and retained fixtures.
-[Resident kernel trials](search-kernels.md) records repeated routing/rough-scoring
-experiments, their unchanged correctness/work, and the retained code-chunk traversal.
 
 The raw RocksDB block cache is independent of the decoded Partition Cache.
 `--rocksdb-block-cache-bytes N` sets its capacity (default 8 MiB); the worker
@@ -127,9 +94,9 @@ For controlled large RocksDB comparisons, create a fixture with
 The directory must not already exist. Subsequent runs use that same path with
 `--reuse-index true`. The fixture checks the dataset checksum, index settings,
 write beam and refinement inputs, then fully verifies the persisted topology
-before queries. Reused reports mark `reused_index: true` and leave construction
-measurements empty; comparison omits construction costs and rejects mixing
-fresh and reused runs. Cache capacity, client counts, warmup and read beam can
+before queries. Reused reports set `construction: null`; comparison omits
+construction costs and rejects mixing fresh and reused runs. Cache capacity,
+client counts, warmup and read beam can
 change without reconstructing the tree. Keep both comparison binaries and the
 fixture manifest with the reports. Reports use schema version 8.
 
@@ -145,7 +112,7 @@ profile; zero disables it. This cache excludes raw vectors read during reranking
 and does not replace RocksDB's block cache or FoundationDB's server cache.
 
 ```sh
-KTANN_BENCH_DATASET_CACHE=/Users/lloyd/projects/ktann/.benchmark-data/vectordb_bench/dataset \
+KTANN_BENCH_DATASET_CACHE=/path/to/dataset-cache \
   cargo run --release -p ktann-benchmarks --bin ktann-bench -- \
   run --backend rocksdb --profile large --scenario quality-sift-1m \
   --worker-threads 8 --query-concurrency 1,4,16,64,16,4,1 \

@@ -1148,8 +1148,7 @@ async fn run_quality_sweep<B: Backend>(
     spec: &ScenarioSpec,
     dataset: &mut BenchmarkDataset,
 ) -> Result<(Topology, QualitySweepMeasurements), String> {
-    // The fixture records every construction input; query and cache settings
-    // may vary only when they do not change the stored tree.
+    // Reuse requires the same dataset and construction inputs.
     let identity = format!(
         "{:?};dataset={};write-beam={};refinement={:?}",
         index_config(spec)?,
@@ -1186,21 +1185,21 @@ async fn run_quality_sweep<B: Backend>(
         if topology != persisted.topology {
             return Err("persisted fixture topology changed".to_owned());
         }
-        (index, topology, ConstructionMeasurements::default())
+        (index, topology, None)
     } else {
-        let prepared =
+        let (index, topology, construction) =
             prepare_index(runtime, backend_counters, metric_capture, spec, dataset).await?;
         if let Some(path) = &manifest_path {
             let fixture = PersistedFixture {
                 identity,
-                topology: prepared.1.clone(),
+                topology: topology.clone(),
             };
             let bytes = serde_json::to_vec_pretty(&fixture)
                 .map_err(|error| format!("encode fixture manifest: {error}"))?;
             std::fs::write(path, bytes)
                 .map_err(|error| format!("write fixture manifest: {error}"))?;
         }
-        prepared
+        (index, topology, Some(construction))
     };
     if topology.max_level.is_none_or(|level| level < 3) {
         return Err(format!(
@@ -1254,7 +1253,6 @@ async fn run_quality_sweep<B: Backend>(
     Ok((
         topology,
         QualitySweepMeasurements {
-            reused_index: spec.reuse_index,
             construction,
             points,
         },

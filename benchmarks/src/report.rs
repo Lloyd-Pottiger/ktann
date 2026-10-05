@@ -277,10 +277,9 @@ pub enum ReportMeasurements {
 /// Measurements for one ordered leaf-beam quality curve.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct QualitySweepMeasurements {
-    /// True when construction was skipped; construction measurements are empty.
-    pub reused_index: bool,
     /// Construction through the first complete, maintenance-converged audit.
-    pub construction: ConstructionMeasurements,
+    /// Absent when the benchmark reuses a persisted index.
+    pub construction: Option<ConstructionMeasurements>,
     /// Points ordered by client count, then from narrowest to widest beam.
     pub points: Vec<QualityPoint>,
 }
