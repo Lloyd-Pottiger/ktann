@@ -260,10 +260,16 @@ local baselines; `git_revision` has a `-dirty` suffix when the workspace changes
 VectorDBBench's loader, optimizer, and search workers. The Python adapter and
 process tests live in the [VectorDBBench repository](https://github.com/Lloyd-Pottiger/VectorDBBench).
 
-The bridge supports RocksDB and FoundationDB, unfiltered single-tenant IDs-only
-L2/cosine search, and signed 64-bit record IDs. Search uses public API defaults;
-overrides and native diagnostics appear in a companion report without changing
-canonical VectorDBBench metrics.
+The bridge supports RocksDB and FoundationDB, single-tenant IDs-only L2/cosine
+search, and signed 64-bit record IDs. Each record stores its ID in an `i64` filter
+field. Search accepts an optional inclusive `id_min` threshold, evaluated by the
+native exact predicate before candidate selection. This supports VectorDBBench
+Cohere 1M unfiltered, 1% excluded, and 99% excluded cases. The bridge uses the
+public IndexConfig, RuntimeConfig, and backend adapter defaults, including
+partition entries 64/512. Only an explicit client leaf-beam option overrides
+search defaults. Native diagnostics read the effective index and Runtime
+configuration without changing canonical VectorDBBench metrics. Bounded
+readiness probes used by Optimize are separate from measured searches.
 
 Protocol version 1 uses length-prefixed JSON over a Unix socket: a four-byte
 big-endian length, at most 8 MiB per frame, and at most 128 connections. Inserts

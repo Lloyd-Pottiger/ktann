@@ -186,7 +186,7 @@ non-null Tree Key FieldIds, and minimum/maximum partition entries. Limits are:
 | Fields | at most 16 |
 | Bloom-enabled fields | at most 4 |
 | Encoded Tree Key | schema worst case at most 8 KiB |
-| Partition entries | `1 <= min`, `2 * min <= max <= 65,536`; defaults 16/512 |
+| Partition entries | `1 <= min`, `2 * min <= max <= 65,536`; defaults 64/512 |
 
 RaBitQ7, binary fanout, Lloyd rounds, rotation algorithm, logical codecs, and
 hard safety caps are defined by the Persistent Format.
