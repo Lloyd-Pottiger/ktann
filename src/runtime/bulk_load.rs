@@ -1,14 +1,16 @@
 //! A single fenced, resumable load task over a sealed serving artifact.
 
-use super::{OperationContext, lifecycle::RetryPolicy};
+use super::{
+    OperationContext,
+    bulk_worker::{blocking, building},
+    lifecycle::RetryPolicy,
+};
 use crate::api::{BulkBuildStatus, BulkLoadOptions, Error, ErrorKind, Result};
 use crate::bulk::{ServingArtifact, ServingEntry, ServingReader};
 use crate::observe::labels::Operation;
 use crate::storage::backend::{AdmissionBudget, Backend};
 use crate::storage::keys::LogicalKey;
-use crate::storage::values::{
-    BuildDescriptor, BuildLoad, IndexLifecycle, IndexManifest, PersistentValue,
-};
+use crate::storage::values::{BuildDescriptor, BuildLoad, IndexManifest, PersistentValue};
 use crate::storage::{MutationBuilder, WriteLogicalTxn};
 
 /// Maps a persistent checkpoint to the caller-visible loading phase.
@@ -62,29 +64,21 @@ pub(crate) async fn load<B: Backend>(
     if load.complete {
         return Ok(());
     }
-    let keep_alive = context.cpu_admission.clone().expect("bulk load admission");
-    let mut stream = tokio::task::spawn_blocking({
-        let keep_alive = keep_alive.clone();
-        move || {
-            let _guard = keep_alive;
-            artifact.reader().map(|reader| Stream {
-                prefix_sha256: reader.prefix_sha256(),
-                reader,
-                pending: None,
-                consumed: 0,
-            })
-        }
+    let mut stream = blocking(context, move || {
+        artifact.reader().map(|reader| Stream {
+            prefix_sha256: reader.prefix_sha256(),
+            reader,
+            pending: None,
+            consumed: 0,
+        })
     })
-    .await
-    .map_err(|e| Error::with_source(ErrorKind::Other, e))??;
+    .await?;
     loop {
         context.checkpoint()?;
         let committed = load.entries;
         let expected_prefix = load.prefix_sha256;
-        let guard = keep_alive.clone();
         let control = context.options.clone();
-        let (next_stream, entries, complete) = tokio::task::spawn_blocking(move || {
-            let _guard = guard;
+        let (next_stream, entries, complete) = blocking(context, move || {
             let (entries, complete) = stream.next_chunk(
                 committed,
                 expected_prefix,
@@ -94,8 +88,7 @@ pub(crate) async fn load<B: Backend>(
             )?;
             Ok::<_, Error>((stream, entries, complete))
         })
-        .await
-        .map_err(|e| Error::with_source(ErrorKind::Other, e))??;
+        .await?;
         stream = next_stream;
         // Prefix replay validates identity without issuing redundant data writes.
         if stream.consumed < committed {
@@ -191,27 +184,6 @@ impl Stream {
     }
 }
 
-async fn fence<T: crate::storage::backend::WriteTxn>(
-    txn: &mut WriteLogicalTxn<'_, T>,
-    index: &IndexManifest,
-) -> Result<()> {
-    let id = index.logical_index_id();
-    let manifest = match txn.get_for_update(LogicalKey::Manifest(id)).await? {
-        Some(PersistentValue::IndexManifest(m)) => m,
-        None => return Err(Error::new(ErrorKind::IndexNotFound)),
-        _ => return Err(corrupt()),
-    };
-    if !manifest.has_same_immutable_identity(index) {
-        return Err(corrupt());
-    }
-    match manifest.lifecycle() {
-        IndexLifecycle::Building => {}
-        IndexLifecycle::Dropping => return Err(Error::new(ErrorKind::IndexDropping)),
-        IndexLifecycle::Active => return Err(Error::invalid_argument()),
-    }
-    Ok(())
-}
-
 async fn read_load<T: crate::storage::backend::WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     index: &IndexManifest,
@@ -244,7 +216,7 @@ async fn claim<B: Backend>(
             backend.hard_limits(),
             budget,
         );
-        fence(&mut txn, index).await?;
+        building(&mut txn, index).await?;
         super::bulk_scheduler::authorize(context, &mut txn, index.logical_index_id()).await?;
         match txn
             .get(LogicalKey::BuildDescriptor(index.logical_index_id()))
@@ -310,7 +282,7 @@ async fn commit_chunk<B: Backend>(
             backend.hard_limits(),
             budget,
         );
-        fence(&mut txn, index).await?;
+        building(&mut txn, index).await?;
         super::bulk_scheduler::authorize(context, &mut txn, index.logical_index_id()).await?;
         let current = read_load(&mut txn, index).await?.ok_or_else(corrupt)?;
         if current == *after {
@@ -338,24 +310,11 @@ async fn commit_chunk<B: Backend>(
         txn.apply(batch).await?;
         match context.commit(|start| txn.commit_with(start)).await {
             Ok(()) => return Ok(()),
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    ErrorKind::RetryableAbort | ErrorKind::CommitOutcomeUnknown
-                ) =>
-            {
-                if let Err(exhausted) = retry
-                    .wait_or_exhaust(Operation::LoadBulkBuild, &mut attempts)
-                    .await
-                {
-                    return Err(if e.kind() == ErrorKind::CommitOutcomeUnknown {
-                        e
-                    } else {
-                        exhausted
-                    });
-                }
+            Err(e) => {
+                retry
+                    .after_commit_error(Operation::LoadBulkBuild, &mut attempts, e)
+                    .await?
             }
-            Err(e) => return Err(e),
         }
     }
 }

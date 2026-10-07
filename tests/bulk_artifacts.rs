@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use ktann::api::{DataType, Error, ErrorKind, FieldSchema, IndexConfig, Metric, Record, Value};
-use ktann::bulk::{ARTIFACT_MANIFEST_BYTES, ArtifactManifest, InputSnapshot, TreeArtifact};
+use ktann::bulk::{ARTIFACT_MANIFEST_BYTES, ArtifactManifest, ForestArtifact, InputSnapshot};
 use ktann::construction::ConstructionOptions;
 
 struct Directory(PathBuf);
@@ -139,23 +139,23 @@ fn sealed_tree_can_be_reopened_and_rebuilt_deterministically() {
         (0..101).map(|id| Ok(record(id))),
     )
     .unwrap();
-    let (artifact, report) = TreeArtifact::build(
+    let (artifact, report) = ForestArtifact::build(
         &directory.0.join("plan"),
         &input,
         [7; 32],
-        options(),
+        forest_options(),
         1_000_000,
     )
     .unwrap();
     assert_eq!(report.records, 101);
     let expected = ArtifactManifest::decode(&artifact.manifest().encode()).unwrap();
     drop(artifact);
-    let reopened = TreeArtifact::open(
+    let reopened = ForestArtifact::open(
         &directory.0.join("plan"),
         expected,
         &input,
         [7; 32],
-        options(),
+        forest_options(),
     )
     .unwrap();
     let plans = reopened
@@ -164,11 +164,11 @@ fn sealed_tree_can_be_reopened_and_rebuilt_deterministically() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(plans.len() as u64, report.partitions);
-    assert_eq!(plans.last().unwrap().key.get(), 1);
+    assert_eq!(plans.last().unwrap().partition.key.get(), 1);
     let mut ids: Vec<_> = plans
         .iter()
-        .filter(|plan| plan.level == 1)
-        .flat_map(|plan| plan.entries.iter().cloned())
+        .filter(|plan| plan.partition.level == 1)
+        .flat_map(|plan| plan.partition.entries.iter().cloned())
         .collect();
     ids.sort();
     assert_eq!(
@@ -177,22 +177,22 @@ fn sealed_tree_can_be_reopened_and_rebuilt_deterministically() {
             .map(|id| record(id).id().clone())
             .collect::<Vec<_>>()
     );
-    let (rebuilt, _) = TreeArtifact::build(
+    let (rebuilt, _) = ForestArtifact::build(
         &directory.0.join("retry"),
         &input,
         [7; 32],
-        options(),
+        forest_options(),
         1_000_000,
     )
     .unwrap();
     assert_eq!(reopened.manifest(), rebuilt.manifest());
     assert_eq!(
-        TreeArtifact::open(
+        ForestArtifact::open(
             &directory.0.join("plan"),
             reopened.manifest().clone(),
             &input,
             [8; 32],
-            options()
+            forest_options()
         )
         .err()
         .unwrap()
@@ -207,8 +207,14 @@ fn empty_snapshot_and_tree_are_complete_verifiable_artifacts() {
     let input = InputSnapshot::create(&directory.0.join("input"), config(), 130, []).unwrap();
     input.verify().unwrap();
     assert_eq!(input.manifest().items(), 0);
-    let (artifact, report) =
-        TreeArtifact::build(&directory.0.join("plan"), &input, [7; 32], options(), 130).unwrap();
+    let (artifact, report) = ForestArtifact::build(
+        &directory.0.join("plan"),
+        &input,
+        [7; 32],
+        forest_options(),
+        130,
+    )
+    .unwrap();
     assert_eq!(report.records, 0);
     artifact.verify().unwrap();
     assert_eq!(artifact.manifest().items(), 0);
@@ -265,7 +271,7 @@ fn duplicate_ids_and_output_quota_fail_before_plan_sealing() {
     .unwrap();
     let path = directory.0.join("duplicate");
     assert_eq!(
-        TreeArtifact::build(&path, &input, [7; 32], options(), 1_000_000)
+        ForestArtifact::build(&path, &input, [7; 32], forest_options(), 1_000_000)
             .err()
             .unwrap()
             .kind(),
@@ -281,7 +287,7 @@ fn duplicate_ids_and_output_quota_fail_before_plan_sealing() {
     .unwrap();
     let path = directory.0.join("quota");
     assert_eq!(
-        TreeArtifact::build(&path, &unique, [7; 32], options(), 130)
+        ForestArtifact::build(&path, &unique, [7; 32], forest_options(), 130)
             .err()
             .unwrap()
             .kind(),
@@ -331,7 +337,7 @@ fn swapping_valid_frames_fails_whole_file_identity_before_plan_sealing() {
     assert!(reader.next().is_none());
     let output = directory.0.join("plan");
     assert_eq!(
-        TreeArtifact::build(&output, &snapshot, [7; 32], options(), 1_000_000)
+        ForestArtifact::build(&output, &snapshot, [7; 32], forest_options(), 1_000_000)
             .err()
             .unwrap()
             .kind(),

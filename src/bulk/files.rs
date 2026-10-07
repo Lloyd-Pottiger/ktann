@@ -100,6 +100,14 @@ impl ArtifactManifest {
         self.kind == 0
     }
 
+    pub(crate) const fn is_forest(&self) -> bool {
+        self.kind == 2
+    }
+
+    pub(crate) const fn is_serving(&self) -> bool {
+        self.kind == 3
+    }
+
     pub(super) fn matches(&self, kind: u8, binding: [u8; 32]) -> bool {
         self.kind == kind && self.binding == binding
     }

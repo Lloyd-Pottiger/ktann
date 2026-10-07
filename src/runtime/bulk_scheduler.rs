@@ -7,7 +7,9 @@ use crate::api::{
 use crate::observe::labels::Operation;
 use crate::storage::backend::{Backend, ReadOps, ScanLimits, WriteTxn};
 use crate::storage::keys::{self, KeyRange, LogicalKey};
-use crate::storage::values::{BuildSchedule, IndexLifecycle, IndexManifest, PersistentValue};
+use crate::storage::values::{
+    BuildSchedule, IndexLifecycle, IndexManifest, PersistentValue, ValueCodec,
+};
 use crate::storage::{ReadLogicalTxn, WriteLogicalTxn};
 use std::{
     sync::Arc,
@@ -52,24 +54,10 @@ pub(crate) async fn enqueue<B: Backend>(
     context: &mut OperationContext<B>,
     index: IndexManifest,
     name: crate::api::IndexName,
-    mut options: BulkWorkerOptions,
+    options: BulkWorkerOptions,
     retry: RetryPolicy,
 ) -> Result<()> {
-    options.validate()?;
-    let path = options.workspace.clone();
-    options.workspace = bulk_worker::blocking(context, move || {
-        let path =
-            std::fs::canonicalize(path).map_err(|e| Error::with_source(ErrorKind::Other, e))?;
-        if !std::fs::metadata(&path)
-            .map_err(|e| Error::with_source(ErrorKind::Other, e))?
-            .is_dir()
-        {
-            return Err(Error::invalid_argument());
-        }
-        Ok(path)
-    })
-    .await?;
-    options.validate()?;
+    let options = bulk_worker::normalize_options(context, options).await?;
     let mut attempts = 0;
     loop {
         context.checkpoint()?;
@@ -365,17 +353,30 @@ async fn discover<B: Backend>(
             },
         )
         .await?;
+    let now = now_ms()?;
     let mut ids = Vec::new();
+    let mut last_scanned = None;
     for item in page.items() {
-        match keys::decode_key(&[], item.key())? {
-            LogicalKey::BuildSchedule(id) => ids.push(id),
-            _ => return Err(bulk_worker::corrupt()),
+        let key = keys::decode_key(&[], item.key())?;
+        let LogicalKey::BuildSchedule(id) = key else {
+            return Err(bulk_worker::corrupt());
+        };
+        let PersistentValue::BuildSchedule(schedule) =
+            ValueCodec::bootstrap().decode(&key, item.value().clone())?
+        else {
+            return Err(bulk_worker::corrupt());
+        };
+        last_scanned = Some(id);
+        // This snapshot only avoids futile attempts; claim still establishes
+        // authority transactionally before any work is started.
+        if schedule.expires_ms <= now {
+            ids.push(id);
         }
     }
     let next = if page.is_terminal() {
         None
     } else {
-        ids.last().copied()
+        last_scanned
     };
     Ok((ids, next))
 }

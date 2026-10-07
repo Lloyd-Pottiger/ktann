@@ -157,9 +157,9 @@ detection belongs to the later global preparation sort. Source shape binds the
 dimension and ordered field names/types/nullability. Metric, Tree Key selection,
 partition sizes, and synopsis policy remain consumer choices.
 
-`TreeArtifact::build` consumes and verifies a snapshot, invokes the existing
-single-tree constructor, and seals child-before-parent partition plans. It
-currently rejects configurations with Tree Key fields. Its descriptor binds the
+`ForestArtifact::build` consumes and verifies a snapshot, groups by Tree Key,
+invokes the existing constructor, and seals child-before-parent partition plans.
+Without Tree Key fields it builds a single tree through the same pipeline. Its descriptor binds the
 complete source manifest, metric, persisted rotation seed supplied by the caller,
 construction version, and all construction options. Full Records remain in the
 source for the exact assignment join and serving-value encoder.
@@ -475,8 +475,9 @@ Together these establish exact membership, rather than trusting counts or an
 aggregate checksum alone.
 
 Publication attempted before loading completes returns resumable `BulkBuildBusy`,
-without recording a terminal failure. Sealing atomically update-protects and writes the Building Manifest, marks the
-completed Build Load sealed, and creates Build Validation. This conflicts with
+without recording a terminal failure. Sealing atomically update-protects the
+Building Manifest and Build Load, marks the completed load sealed, and creates
+Build Validation. Updating Build Load conflicts with
 in-flight writers and rejects subsequent claims. The lifecycle remains Building;
 `status` reports Validating with verified/total entries. A validator scans the
 entire index prefix in bounded pages, decodes known control keys, and compares

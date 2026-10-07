@@ -44,13 +44,14 @@ impl BuildWorkspace {
             || self.token == [0; 32]
             || self.hard_limits.max_key_bytes == 0
             || self.hard_limits.max_value_bytes == 0
-            || self.forest.as_ref().is_some_and(|a| {
-                a.epoch == 0 || a.epoch > self.epoch || a.manifest.encode()[8] != 2
-            })
+            || self
+                .forest
+                .as_ref()
+                .is_some_and(|a| a.epoch == 0 || a.epoch > self.epoch || !a.manifest.is_forest())
             || self.serving.as_ref().is_some_and(|a| {
                 a.epoch == 0
                     || a.epoch > self.epoch
-                    || a.manifest.encode()[8] != 3
+                    || !a.manifest.is_serving()
                     || self.forest.is_none()
             })
         {

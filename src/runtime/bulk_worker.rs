@@ -82,33 +82,33 @@ pub(crate) async fn building<T: crate::storage::backend::WriteTxn>(
         IndexLifecycle::Active => Err(Error::invalid_argument()),
     }
 }
-pub(crate) async fn workspace<B: Backend>(
+/// Resolves the shared workspace once at the worker/queue input boundary.
+pub(crate) async fn normalize_options<B: Backend>(
     context: &OperationContext<B>,
-    index: &IndexManifest,
-) -> Result<BuildWorkspace> {
-    let backend = context.backend();
-    let mut txn = ReadLogicalTxn::bootstrap(backend.begin_read().await?);
-    match txn
-        .get(LogicalKey::BuildWorkspace(index.logical_index_id()))
-        .await?
-    {
-        Some(PersistentValue::BuildWorkspace(w)) => Ok(w),
-        None => Err(Error::invalid_argument()),
-        _ => Err(corrupt()),
-    }
+    mut options: BulkWorkerOptions,
+) -> Result<BulkWorkerOptions> {
+    options.validate()?;
+    let root = options.workspace.clone();
+    options.workspace = blocking(context, move || {
+        let root = fs::canonicalize(root).map_err(io)?;
+        if !fs::metadata(&root).map_err(io)?.is_dir() {
+            return Err(Error::invalid_argument());
+        }
+        Ok(root)
+    })
+    .await?;
+    options.validate()?;
+    Ok(options)
 }
 
 pub(crate) async fn run<B: Backend>(
     context: &mut OperationContext<B>,
     index: IndexManifest,
     descriptor: BuildDescriptor,
-    mut options: BulkWorkerOptions,
+    options: BulkWorkerOptions,
     retry: RetryPolicy,
 ) -> Result<()> {
-    options.validate()?;
-    let root = options.workspace.clone();
-    options.workspace = blocking(context, move || fs::canonicalize(root).map_err(io)).await?;
-    options.validate()?;
+    let options = normalize_options(context, options).await?;
     // Lock before registration or any directory creation, so cleanup can remove
     // the ledger only when every potential creator has left this critical region.
     let root = options.workspace.clone();
@@ -238,7 +238,7 @@ async fn prepare_and_load<B: Backend>(
         }
     })
     .await?;
-    if state.serving.is_none() {
+    {
         let path = state.attempt(state.epoch);
         let lock = lock.clone();
         blocking(context, move || {
@@ -365,24 +365,11 @@ async fn accept<B: Backend>(
             .await?;
         match context.commit(|start| txn.commit_with(start)).await {
             Ok(()) => return Ok(()),
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    ErrorKind::RetryableAbort | ErrorKind::CommitOutcomeUnknown
-                ) =>
-            {
-                if let Err(exhausted) = retry
-                    .wait_or_exhaust(Operation::RunBulkBuild, &mut attempts)
-                    .await
-                {
-                    return Err(if e.kind() == ErrorKind::CommitOutcomeUnknown {
-                        e
-                    } else {
-                        exhausted
-                    });
-                }
+            Err(e) => {
+                retry
+                    .after_commit_error(Operation::RunBulkBuild, &mut attempts, e)
+                    .await?
             }
-            Err(e) => return Err(e),
         }
     }
 }
@@ -480,24 +467,11 @@ pub(crate) async fn cleanup<B: Backend>(
         txn.delete(key).await?;
         match context.commit(|start| txn.commit_with(start)).await {
             Ok(()) => return Ok(()),
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    ErrorKind::RetryableAbort | ErrorKind::CommitOutcomeUnknown
-                ) =>
-            {
-                if let Err(exhausted) = retry
-                    .wait_or_exhaust(Operation::CleanupBulkBuild, &mut attempts)
-                    .await
-                {
-                    return Err(if e.kind() == ErrorKind::CommitOutcomeUnknown {
-                        e
-                    } else {
-                        exhausted
-                    });
-                }
+            Err(e) => {
+                retry
+                    .after_commit_error(Operation::CleanupBulkBuild, &mut attempts, e)
+                    .await?
             }
-            Err(e) => return Err(e),
         }
     }
 }

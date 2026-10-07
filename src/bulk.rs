@@ -14,7 +14,6 @@ mod sort;
 
 pub use files::{ARTIFACT_MANIFEST_BYTES, ArtifactManifest};
 pub use input::{InputReader, InputSnapshot};
-pub use plan::{PlanReader, TreeArtifact};
 
 pub use forest::{ForestArtifact, ForestOptions, ForestPartition, ForestReader, ForestReport};
 

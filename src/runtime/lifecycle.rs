@@ -99,6 +99,31 @@ impl RetryPolicy {
         }
     }
 
+    /// Retries a failed commit without hiding an unknown outcome on exhaustion.
+    /// Callers remain responsible for resolving uncertain commits before retrying.
+    pub(crate) async fn after_commit_error(
+        self,
+        operation: Operation,
+        failed_attempts: &mut u32,
+        error: Error,
+    ) -> Result<()> {
+        if !matches!(
+            error.kind(),
+            ErrorKind::RetryableAbort | ErrorKind::CommitOutcomeUnknown
+        ) {
+            return Err(error);
+        }
+        self.wait_or_exhaust(operation, failed_attempts)
+            .await
+            .map_err(|exhausted| {
+                if error.kind() == ErrorKind::CommitOutcomeUnknown {
+                    error
+                } else {
+                    exhausted
+                }
+            })
+    }
+
     /// The shared tail of every whole-retry loop: observes the retry, waits
     /// out one failed attempt under the bounded policy, or returns
     /// `ContentionExhausted` when one more failure would exhaust it. The retry
