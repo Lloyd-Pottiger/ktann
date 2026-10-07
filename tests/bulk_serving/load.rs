@@ -6,6 +6,7 @@ use ktann::storage::backend::{
     ReadOps, ScanLimits, ScanPage,
 };
 use ktann::storage::keys::KeyRange;
+use ktann::storage::values::BuildPhase;
 use ktann_memory::test_support::{CommitFault, CommitOutcome, TestConfig};
 use ktann_memory::{MemoryReadTxn, MemoryWriteTxn};
 use std::sync::Arc;
@@ -59,14 +60,14 @@ async fn fixture<B: Backend>(
 async fn checkpoint(
     memory: &MemoryBackend,
     job: &BulkBuildJob<impl Backend>,
-) -> ktann::storage::values::BuildLoad {
+) -> ktann::storage::values::BuildProgress {
     let mut txn = ReadLogicalTxn::bootstrap(memory.begin_read().await.unwrap());
     match txn
-        .get(LogicalKey::BuildLoad(job.logical_index_id()))
+        .get(LogicalKey::BuildProgress(job.logical_index_id()))
         .await
         .unwrap()
     {
-        Some(PersistentValue::BuildLoad(load)) => load,
+        Some(PersistentValue::BuildProgress(load)) => load,
         _ => panic!("missing checkpoint"),
     }
 }
@@ -322,7 +323,7 @@ async fn cancellation_keeps_atomic_progress_and_reopen_resumes_without_prefix_wr
         ErrorKind::Cancelled
     );
     let progress = checkpoint(&memory, &job).await;
-    assert!(progress.entries() >= 6 && !progress.is_complete());
+    assert!(progress.entries() >= 6 && !matches!(progress.phase(), BuildPhase::Loaded));
     let before = memory.history().len();
     let resumed = runtime.open_bulk_build("bulk").await.unwrap();
     resumed
@@ -344,6 +345,78 @@ async fn cancellation_keeps_atomic_progress_and_reopen_resumes_without_prefix_wr
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_entry_count_remains_loading_until_eof_checkpoint_commits() {
+    let dir = Directory::new();
+    let memory = MemoryBackend::with_test_config(TestConfig::default());
+    let gate = Arc::new(Gate::default());
+    let runtime = Runtime::new(
+        Gated {
+            memory: memory.clone(),
+            gate: gate.clone(),
+        },
+        RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
+    )
+    .unwrap();
+    let (job, artifact) = fixture(&runtime, &memory, &dir, 1).await;
+    let options = BulkLoadOptions {
+        max_mutations: 2,
+        ..load_options()
+    };
+    // One claim, one commit per entry, then the separate EOF checkpoint.
+    gate.arm(artifact.manifest().items() as usize + 2);
+    let worker = job.clone();
+    let input = artifact.clone();
+    let cancellation = CancellationToken::new();
+    let control = OperationOptions::default().with_cancellation(cancellation.clone());
+    let task = tokio::spawn(async move {
+        worker
+            .load_serving_with_control(&input, options, control)
+            .await
+    });
+    gate.wait().await;
+    let total = artifact.manifest().items();
+    assert_eq!(
+        job.status().await.unwrap(),
+        BulkBuildStatus::Loading {
+            loaded_entries: total,
+            total_entries: total,
+        }
+    );
+    assert!(matches!(
+        checkpoint(&memory, &job).await.phase(),
+        BuildPhase::Loading { .. }
+    ));
+    // Cancellation cannot undo an in-flight commit. Force a definite abort,
+    // then cancellation prevents the retry from completing the EOF transition.
+    memory.set_fault_plan(vec![CommitFault::Abort]).unwrap();
+    cancellation.cancel();
+    gate.release.notify_one();
+    assert_eq!(
+        task.await.unwrap().unwrap_err().kind(),
+        ErrorKind::Cancelled
+    );
+    let before = memory.history().len();
+    runtime
+        .open_bulk_build("bulk")
+        .await
+        .unwrap()
+        .load_serving(&artifact, options)
+        .await
+        .unwrap();
+    assert_eq!(
+        job.status().await.unwrap(),
+        BulkBuildStatus::Loaded { entries: total }
+    );
+    // Recovery only claims and completes the checkpoint, without rewriting data.
+    assert!(
+        memory.history()[before..]
+            .iter()
+            .all(|entry| entry.mutations == 1)
+    );
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_load_and_checkpoint_codec_are_canonical_and_fail_closed() {
     let dir = Directory::new();
     let memory = MemoryBackend::new();
@@ -351,22 +424,19 @@ async fn empty_load_and_checkpoint_codec_are_canonical_and_fail_closed() {
     let (job, artifact) = fixture(&runtime, &memory, &dir, 0).await;
     job.load_serving(&artifact, load_options()).await.unwrap();
     let load = checkpoint(&memory, &job).await;
-    assert!(load.is_complete());
+    assert!(matches!(load.phase(), BuildPhase::Loaded));
     assert_eq!(load.entries(), 0);
-    let key = LogicalKey::BuildLoad(job.logical_index_id());
+    let key = LogicalKey::BuildProgress(job.logical_index_id());
     let value = ValueCodec::bootstrap()
-        .encode(&PersistentValue::BuildLoad(load.clone()))
+        .encode(&PersistentValue::BuildProgress(load.clone()))
         .unwrap();
     let mut expected = vec![14, 0, 0, 0, 89];
     expected.extend_from_slice(&artifact.manifest().encode());
     expected.extend_from_slice(&1_u64.to_be_bytes());
-    expected.extend_from_slice(&0_u64.to_be_bytes());
-    expected.extend_from_slice(load.prefix_sha256());
-    expected.push(1);
-    expected.push(0);
+    expected.push(1); // Loaded has no duplicate count or digest.
     assert_eq!(value, expected);
     assert_eq!(
-        keys::build_load_key(job.logical_index_id()),
+        keys::build_progress_key(job.logical_index_id()),
         [
             vec![1],
             job.logical_index_id().get().to_be_bytes().to_vec(),
@@ -374,7 +444,7 @@ async fn empty_load_and_checkpoint_codec_are_canonical_and_fail_closed() {
         ]
         .concat()
     );
-    for (offset, replacement) in [(101, 0), (109, 1), (142, 2), (13, 2)] {
+    for (offset, replacement) in [(101, 0), (102, 4), (13, 2)] {
         let mut invalid = value.clone();
         invalid[offset] = replacement;
         assert_eq!(
@@ -407,7 +477,7 @@ async fn corrupt_input_never_completes_and_repaired_identical_bytes_resume() {
         ErrorKind::Corruption
     );
     let partial = checkpoint(&memory, &job).await;
-    assert!(!partial.is_complete());
+    assert!(!matches!(partial.phase(), BuildPhase::Loaded));
     assert!(partial.entries() > 0);
     assert_eq!(
         runtime.open_index("bulk").await.unwrap_err().kind(),
@@ -425,7 +495,7 @@ async fn admission_and_artifact_identity_are_enforced_before_data_writes() {
     let memory = MemoryBackend::with_test_config(TestConfig::default());
     let runtime = runtime(memory.clone());
     let (job, artifact) = fixture(&runtime, &memory, &dir, 19).await;
-    for limit in [0, 153] {
+    for limit in [0, 152] {
         let err = job
             .load_serving(
                 &artifact,
@@ -447,7 +517,7 @@ async fn admission_and_artifact_identity_are_enforced_before_data_writes() {
             &artifact,
             BulkLoadOptions {
                 max_mutations: 7,
-                max_bytes: 154
+                max_bytes: 153
             }
         )
         .await
@@ -565,7 +635,7 @@ async fn replay_checks_the_exact_previously_committed_prefix_before_skipping_it(
         ErrorKind::Corruption
     );
     let before = checkpoint(&memory, &job).await;
-    assert!(before.entries() > 0 && !before.is_complete());
+    assert!(before.entries() > 0 && !matches!(before.phase(), BuildPhase::Loaded));
     fs::write(path, original).unwrap();
     // Repairing the file cannot bless a different prefix already in storage.
     assert_eq!(
@@ -578,7 +648,7 @@ async fn replay_checks_the_exact_previously_committed_prefix_before_skipping_it(
     let after = checkpoint(&memory, &job).await;
     assert_eq!(before.entries(), after.entries());
     assert_eq!(before.prefix_sha256(), after.prefix_sha256());
-    assert!(!after.is_complete());
+    assert!(!matches!(after.phase(), BuildPhase::Loaded));
     job.abort().await.unwrap();
     runtime.shutdown().await.unwrap();
 }

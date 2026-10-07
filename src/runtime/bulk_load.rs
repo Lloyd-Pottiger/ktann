@@ -10,20 +10,29 @@ use crate::bulk::{ServingArtifact, ServingEntry, ServingReader};
 use crate::observe::labels::Operation;
 use crate::storage::backend::{AdmissionBudget, Backend};
 use crate::storage::keys::LogicalKey;
-use crate::storage::values::{BuildDescriptor, BuildLoad, IndexManifest, PersistentValue};
+use crate::storage::values::{
+    BuildDescriptor, BuildPhase, BuildProgress, IndexManifest, PersistentValue,
+};
 use crate::storage::{MutationBuilder, WriteLogicalTxn};
 
 /// Maps a persistent checkpoint to the caller-visible loading phase.
-pub(crate) fn status(load: &BuildLoad) -> BulkBuildStatus {
-    if load.complete {
-        BulkBuildStatus::Loaded {
-            entries: load.entries,
-        }
-    } else {
-        BulkBuildStatus::Loading {
-            loaded_entries: load.entries,
+pub(crate) fn status(load: &BuildProgress) -> BulkBuildStatus {
+    match load.phase {
+        BuildPhase::Loading { entries, .. } => BulkBuildStatus::Loading {
+            loaded_entries: entries,
             total_entries: load.artifact.items(),
-        }
+        },
+        BuildPhase::Loaded => BulkBuildStatus::Loaded {
+            entries: load.artifact.items(),
+        },
+        BuildPhase::Validating { entries, .. } => BulkBuildStatus::Validating {
+            verified_entries: entries,
+            total_entries: load.artifact.items(),
+        },
+        BuildPhase::Validated => BulkBuildStatus::Validating {
+            verified_entries: load.artifact.items(),
+            total_entries: load.artifact.items(),
+        },
     }
 }
 
@@ -46,22 +55,22 @@ pub(crate) async fn load<B: Backend>(
         return Err(Error::invalid_argument());
     }
     // Registration has the same admission constraints as every checkpoint.
-    let initial = BuildLoad {
+    let initial = BuildProgress {
         artifact: artifact.manifest().clone(),
         epoch: 1,
-        entries: 0,
-        prefix_sha256: artifact.manifest().initial_sha256(),
-        complete: false,
-        sealed: false,
+        phase: BuildPhase::Loading {
+            entries: 0,
+            prefix_sha256: artifact.manifest().initial_sha256(),
+        },
     };
     let mut admission = MutationBuilder::for_index(&index, backend.hard_limits(), budget);
     admission.put(
-        LogicalKey::BuildLoad(index.logical_index_id()),
-        PersistentValue::BuildLoad(initial.clone()),
+        LogicalKey::BuildProgress(index.logical_index_id()),
+        PersistentValue::BuildProgress(initial.clone()),
     )?;
     let checkpoint_bytes = admission.size().bytes();
     let mut load = claim(context, &index, &descriptor, initial, budget, retry).await?;
-    if load.complete {
+    if matches!(load.phase, BuildPhase::Loaded) {
         return Ok(());
     }
     let mut stream = blocking(context, move || {
@@ -75,8 +84,8 @@ pub(crate) async fn load<B: Backend>(
     .await?;
     loop {
         context.checkpoint()?;
-        let committed = load.entries;
-        let expected_prefix = load.prefix_sha256;
+        let committed = load.entries();
+        let expected_prefix = *load.prefix_sha256();
         let control = context.options.clone();
         let (next_stream, entries, complete) = blocking(context, move || {
             let (entries, complete) = stream.next_chunk(
@@ -97,18 +106,23 @@ pub(crate) async fn load<B: Backend>(
         if entries.is_empty() && !complete {
             continue;
         }
-        let next = BuildLoad {
-            entries: load
-                .entries
-                .checked_add(entries.len() as u64)
-                .ok_or_else(corrupt)?,
-            complete,
-            prefix_sha256: stream.prefix_sha256,
+        let next = BuildProgress {
+            phase: if complete {
+                BuildPhase::Loaded
+            } else {
+                BuildPhase::Loading {
+                    entries: load
+                        .entries()
+                        .checked_add(entries.len() as u64)
+                        .ok_or_else(corrupt)?,
+                    prefix_sha256: stream.prefix_sha256,
+                }
+            },
             ..load.clone()
         };
         commit_chunk(context, &index, &load, &next, &entries, budget, retry).await?;
         load = next;
-        if load.complete {
+        if matches!(load.phase, BuildPhase::Loaded) {
             return Ok(());
         }
     }
@@ -184,15 +198,15 @@ impl Stream {
     }
 }
 
-async fn read_load<T: crate::storage::backend::WriteTxn>(
+pub(crate) async fn read_progress<T: crate::storage::backend::WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     index: &IndexManifest,
-) -> Result<Option<BuildLoad>> {
+) -> Result<Option<BuildProgress>> {
     match txn
-        .get_for_update(LogicalKey::BuildLoad(index.logical_index_id()))
+        .get_for_update(LogicalKey::BuildProgress(index.logical_index_id()))
         .await?
     {
-        Some(PersistentValue::BuildLoad(load)) => Ok(Some(load)),
+        Some(PersistentValue::BuildProgress(load)) => Ok(Some(load)),
         None => Ok(None),
         _ => Err(corrupt()),
     }
@@ -202,10 +216,10 @@ async fn claim<B: Backend>(
     context: &mut OperationContext<B>,
     index: &IndexManifest,
     descriptor: &BuildDescriptor,
-    initial: BuildLoad,
+    initial: BuildProgress,
     budget: AdmissionBudget,
     retry: RetryPolicy,
-) -> Result<BuildLoad> {
+) -> Result<BuildProgress> {
     let mut attempts = 0;
     loop {
         context.checkpoint()?;
@@ -225,16 +239,19 @@ async fn claim<B: Backend>(
             Some(PersistentValue::BuildDescriptor(d)) if d == *descriptor => {}
             _ => return Err(corrupt()),
         }
-        let load = match read_load(&mut txn, index).await? {
+        let load = match read_progress(&mut txn, index).await? {
             None => initial.clone(),
             Some(mut current) => {
                 if current.artifact != initial.artifact {
                     return Err(Error::invalid_argument());
                 }
-                if current.sealed {
+                if matches!(
+                    current.phase,
+                    BuildPhase::Validating { .. } | BuildPhase::Validated
+                ) {
                     return Err(Error::invalid_argument());
                 }
-                if current.complete {
+                if matches!(current.phase, BuildPhase::Loaded) {
                     return Ok(current);
                 }
                 current.epoch = current
@@ -245,8 +262,8 @@ async fn claim<B: Backend>(
             }
         };
         txn.put(
-            LogicalKey::BuildLoad(index.logical_index_id()),
-            PersistentValue::BuildLoad(load.clone()),
+            LogicalKey::BuildProgress(index.logical_index_id()),
+            PersistentValue::BuildProgress(load.clone()),
         )
         .await?;
         match context.commit(|start| txn.commit_with(start)).await {
@@ -266,8 +283,8 @@ async fn claim<B: Backend>(
 async fn commit_chunk<B: Backend>(
     context: &mut OperationContext<B>,
     index: &IndexManifest,
-    before: &BuildLoad,
-    after: &BuildLoad,
+    before: &BuildProgress,
+    after: &BuildProgress,
     entries: &[ServingEntry],
     budget: AdmissionBudget,
     retry: RetryPolicy,
@@ -284,7 +301,7 @@ async fn commit_chunk<B: Backend>(
         );
         building(&mut txn, index).await?;
         super::bulk_scheduler::authorize(context, &mut txn, index.logical_index_id()).await?;
-        let current = read_load(&mut txn, index).await?.ok_or_else(corrupt)?;
+        let current = read_progress(&mut txn, index).await?.ok_or_else(corrupt)?;
         if current == *after {
             return Ok(());
         }
@@ -300,8 +317,8 @@ async fn commit_chunk<B: Backend>(
         // Rebuild the small mutation batch on retry; codecs do not perform IO.
         let mut batch = txn.mutations();
         batch.put(
-            LogicalKey::BuildLoad(index.logical_index_id()),
-            PersistentValue::BuildLoad(after.clone()),
+            LogicalKey::BuildProgress(index.logical_index_id()),
+            PersistentValue::BuildProgress(after.clone()),
         )?;
         for entry in entries {
             // The bound ServingReader already validated ownership and codecs.

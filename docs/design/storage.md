@@ -259,11 +259,23 @@ endian. Bootstrap transactions may access the descriptor alongside the Manifest
 for atomic reservation. Serving transactions still validate an Active Manifest.
 See [ADR 0026](../adr/0026-building-reservations.md).
 
-The index-owned Build Load key (`0x06`) stores value tag `0x0e`, a sized
-89-byte Serving Artifact manifest, positive u64 epoch, u64 committed-entry
-cursor, 32-byte prefix SHA-256, and canonical completion and sealed bytes. Sealed requires completion. Completion requires cursor == item count and prefix hash == artifact hash.
-This metadata is codec-validated but excluded from serving membership ledgers.
-See the implemented load protocol in [Bulk Build](bulk-build.md).
+The index-owned Build Progress key (`0x06`, value tag `0x0e`) stores one sized
+89-byte Serving Artifact manifest, a positive u64 load epoch, and a phase byte:
+
+- `0` Loading: u64 committed entries and a 32-byte artifact-prefix SHA-256.
+- `1` Loaded: no additional fields; the complete artifact was read through EOF.
+- `2` Validating: sized backend cursor (at most 16 KiB), u64 compared entries,
+  and a 32-byte artifact-prefix SHA-256.
+- `3` Validated: no additional fields; the backend scan and artifact EOF checks
+  both completed. Publication still requires an Active Manifest transaction.
+
+Unfinished counts cannot exceed the artifact count; zero entries require the
+artifact-header digest. Counts/digests alone never imply completion. Terminal
+phases derive their total count/digest from the artifact. These control bytes
+are validated but excluded from serving membership ledgers. Debug output redacts
+locators/cursors. Unknown phases, malformed/trailing bytes and unused key/value
+kinds fail closed. No compatibility layer is retained.
+See the implemented protocol in [Bulk Build](bulk-build.md).
 
 
 Namespace key `[0, 2] || LogicalIndexId:u64be` stores Build Workspace (tag `0x0f`).
@@ -274,13 +286,8 @@ artifact descriptors (flag, epoch, sized 89-byte manifest), and a bounded failur
 code. Accepted Forest/Serving kinds and epoch bounds are validated; Serving
 requires Forest. All integer encodings are big endian.
 
-Index key kind `0x07` stores Build Validation (tag `0x10`): sized Serving manifest,
-sized backend scan cursor (at most 16 KiB), compared entries u64, prefix SHA-256,
-and canonical completion byte. Complete requires empty cursor, total entry count
-and full artifact hash. Initial proof requires the artifact-header digest.
-Workspace and proof Debug output redact locators/cursors. These formats have no
-compatibility layer; malformed, trailing and noncanonical bytes fail closed.
-See [ADR 0027](../adr/0027-bulk-workspace-and-publication.md).
+See [ADR 0027](../adr/0027-bulk-workspace-and-publication.md) and
+[ADR 0029](../adr/0029-unified-bulk-progress.md).
 
 
 Namespace key `[0,3] || LogicalIndexId:u64be` stores Build Schedule, tag `0x11`:

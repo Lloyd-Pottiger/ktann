@@ -332,8 +332,7 @@ impl<'manifest> LogicalBinding<'manifest> {
                 key,
                 LogicalKey::Manifest(_)
                     | LogicalKey::BuildDescriptor(_)
-                    | LogicalKey::BuildLoad(_)
-                    | LogicalKey::BuildValidation(_)
+                    | LogicalKey::BuildProgress(_)
             ),
             (Some(manifest), Some(index)) => index == manifest.logical_index_id(),
             (Some(manifest), None) => match key {

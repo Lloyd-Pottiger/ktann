@@ -1053,39 +1053,72 @@ fn bulk_workspace_golden_and_malformed_ownership() {
 }
 
 #[test]
-fn bulk_validation_golden_and_malformed_proofs() {
+fn bulk_progress_phases_have_canonical_bytes_and_reject_malformed_checkpoints() {
+    use ktann::storage::values::BuildPhase;
     use sha2::{Digest, Sha256};
-    let manifest = minimal_manifest();
-    let codec = ValueCodec::for_index(&manifest);
-    let key = LogicalKey::BuildValidation(id(1));
+    let codec = ValueCodec::bootstrap();
+    let key = LogicalKey::BuildProgress(id(1));
     let mut artifact = b"KTANNBF\x01\x03".to_vec();
     artifact.extend_from_slice(&[0; 32]);
     let hash = Sha256::digest(&artifact);
     artifact.extend_from_slice(&0_u64.to_be_bytes());
     artifact.extend_from_slice(&41_u64.to_be_bytes());
     artifact.extend_from_slice(&hash);
-    let mut golden = vec![0x10, 0, 0, 0, 89];
-    golden.extend_from_slice(&artifact);
-    golden.extend_from_slice(&[0; 4]);
-    golden.extend_from_slice(&0_u64.to_be_bytes());
-    golden.extend_from_slice(&hash);
-    golden.push(1);
-    let value = codec.decode(&key, Bytes::from(golden.clone())).unwrap();
-    assert_eq!(codec.encode(&value).unwrap(), golden);
-    for length in 0..golden.len() {
-        assert!(
-            codec
-                .decode(&key, Bytes::copy_from_slice(&golden[..length]))
-                .is_err()
-        );
+    for phase in 0..=3 {
+        let mut golden = vec![0x0e, 0, 0, 0, 89];
+        golden.extend_from_slice(&artifact);
+        golden.extend_from_slice(&1_u64.to_be_bytes());
+        golden.push(phase);
+        let cursor = b"private-cursor";
+        if phase == 2 {
+            golden.extend_from_slice(&(cursor.len() as u32).to_be_bytes());
+            golden.extend_from_slice(cursor);
+        }
+        if phase == 0 || phase == 2 {
+            golden.extend_from_slice(&0_u64.to_be_bytes());
+            golden.extend_from_slice(&hash);
+        }
+        let value = codec.decode(&key, Bytes::from(golden.clone())).unwrap();
+        assert_eq!(codec.encode(&value).unwrap(), golden);
+        let PersistentValue::BuildProgress(progress) = &value else {
+            panic!("progress")
+        };
+        // Equal counts/digests do not collapse empty, unfinished stages into completion.
+        assert!(matches!(
+            (phase, progress.phase()),
+            (0, BuildPhase::Loading { .. })
+                | (1, BuildPhase::Loaded)
+                | (2, BuildPhase::Validating { .. })
+                | (3, BuildPhase::Validated)
+        ));
+        assert!(!format!("{:?}", progress.phase()).contains("private-cursor"));
+        for length in 0..golden.len() {
+            assert!(
+                codec
+                    .decode(&key, Bytes::copy_from_slice(&golden[..length]))
+                    .is_err()
+            );
+        }
+        for (offset, replacement) in [(13, 2), (101, 0), (102, 4)] {
+            let mut malformed = golden.clone();
+            malformed[offset] = replacement;
+            assert!(codec.decode(&key, Bytes::from(malformed)).is_err());
+        }
+        if phase == 0 || phase == 2 {
+            for offset in [golden.len() - 33, golden.len() - 1] {
+                let mut malformed = golden.clone();
+                malformed[offset] ^= 1; // Nonzero empty count or invalid initial digest.
+                assert!(codec.decode(&key, Bytes::from(malformed)).is_err());
+            }
+        }
+        if phase == 2 {
+            let mut malformed = golden.clone();
+            malformed[103..107].copy_from_slice(&(16_385_u32).to_be_bytes());
+            assert!(codec.decode(&key, Bytes::from(malformed)).is_err());
+        }
+        golden.push(0);
+        assert!(codec.decode(&key, Bytes::from(golden)).is_err());
     }
-    for offset in [13, 105, 106, golden.len() - 1] {
-        let mut malformed = golden.clone();
-        malformed[offset] ^= 3;
-        assert!(codec.decode(&key, Bytes::from(malformed)).is_err());
-    }
-    golden.push(0);
-    assert!(codec.decode(&key, Bytes::from(golden)).is_err());
 }
 
 #[test]

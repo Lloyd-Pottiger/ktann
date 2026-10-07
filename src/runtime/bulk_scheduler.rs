@@ -8,7 +8,7 @@ use crate::observe::labels::Operation;
 use crate::storage::backend::{Backend, ReadOps, ScanLimits, WriteTxn};
 use crate::storage::keys::{self, KeyRange, LogicalKey};
 use crate::storage::values::{
-    BuildSchedule, IndexLifecycle, IndexManifest, PersistentValue, ValueCodec,
+    BuildPhase, BuildSchedule, IndexLifecycle, IndexManifest, PersistentValue, ValueCodec,
 };
 use crate::storage::{ReadLogicalTxn, WriteLogicalTxn};
 use std::{
@@ -225,7 +225,7 @@ async fn drive<B: Backend>(
     {
         return Err(Error::new(kind));
     }
-    let sealed = matches!(txn.get(LogicalKey::BuildLoad(id)).await?, Some(PersistentValue::BuildLoad(l)) if l.sealed);
+    let sealed = matches!(txn.get(LogicalKey::BuildProgress(id)).await?, Some(PersistentValue::BuildProgress(p)) if matches!(p.phase, BuildPhase::Validating { .. } | BuildPhase::Validated));
     drop(txn);
     if !sealed {
         bulk_worker::run(

@@ -107,16 +107,17 @@ artifact manifest; later calls may resume only that exact identity. The complete
 artifact is the sealed inventory for this single task, so no paged task
 registration is needed.
 
-Index-owned key kind `0x06` stores Build Load value tag `0x0e`: a sized 89-byte
-artifact manifest, a positive u64 owner epoch, a u64 committed-entry cursor,
-a 32-byte committed-prefix SHA-256, and canonical completion and sealed bytes. Every new
-invocation takes over by incrementing the epoch transactionally. Automatic scheduling adds renewable queue ownership; explicit loads retain
-their existing epoch protocol. Every
-chunk update-protects the Building Manifest and Build Load checkpoint, checks
-that epoch and cursor, and commits its serving KV puts and new cursor atomically.
-The immutable Build Descriptor is checked when claiming; ordinary chunks do not
-rewrite the shared Manifest. An old prepared transaction conflicts with takeover
-or abort, and its retry reports `BulkBuildSuperseded`, Dropping, or absence.
+Index-owned key kind `0x06` stores Build Progress (value tag `0x0e`): one sized
+89-byte artifact manifest, a positive u64 load epoch, and a canonical phase.
+Loading carries committed entries and the artifact-prefix SHA-256; Loaded carries
+no checkpoint fields. Completion is recorded only after artifact EOF verification,
+not inferred from counts. Each unfinished load invocation takes over by increasing
+the epoch; repeating a Loaded invocation is an idempotent no-op. Epoch overflow
+fails without resetting ownership. Every chunk update-protects the Building
+Manifest and Build Progress, checks its epoch, and atomically writes serving
+entries plus the next progress state. It does not rewrite the shared Manifest.
+An old prepared transaction conflicts with takeover, sealing, or drop and then
+observes the durable replacement state.
 
 A claim whose commit outcome is unknown grants no worker authority; the caller
 may retry, taking a new epoch. Unknown chunk commits are resolved by reading the
@@ -427,7 +428,7 @@ Recovery reuses accepted predecessors. Once Serving is accepted, it does not
 reopen Source or Forest. Otherwise the immutable source is checked against its
 reserved manifest. An unknown claim grants no authority; callers retry with a
 new epoch. Unknown acceptance is resolved against the exact before/after record.
-Loading uses the independent Build Load epoch and bounded atomic checkpoint
+Loading uses the independent load epoch in Build Progress and bounded atomic checkpoint
 protocol above. Terminal preparation/validation errors persist in Build Workspace
 and surface as `Failed { kind }`; abort/rebuild is required. Cancellation and
 transient failures leave resumable work.
@@ -476,18 +477,19 @@ aggregate checksum alone.
 
 Publication attempted before loading completes returns resumable `BulkBuildBusy`,
 without recording a terminal failure. Sealing atomically update-protects the
-Building Manifest and Build Load, marks the completed load sealed, and creates
-Build Validation. Updating Build Load conflicts with
+Building Manifest and Build Progress, then changes Loaded to Validating with an
+empty scan cursor, zero compared entries, and the artifact-header digest. Updating
+the same progress key conflicts with
 in-flight writers and rejects subsequent claims. The lifecycle remains Building;
 `status` reports Validating with verified/total entries. A validator scans the
 entire index prefix in bounded pages, decodes known control keys, and compares
 all remaining keys and values one-to-one with the accepted sorted artifact.
-Missing, extra, or changed data fails closed. Each proof checkpoint atomically
+Missing, extra, or changed data fails closed. Each Validating checkpoint atomically
 persists scan cursor, compared entry count, and artifact-prefix SHA-256. Recovery
-replays and verifies that file prefix before continuing. Completion requires EOF
-and the full accepted artifact digest. Frozen data permits safe page retries.
+replays and verifies that file prefix before continuing. Transition to Validated requires the complete backend scan, artifact EOF
+and the full accepted artifact digest. Counts alone never authorize this transition. Frozen data permits safe page retries.
 
-Publication checks the sealed load, completed proof, workspace identity, and
+Publication checks the Validated progress, workspace identity, and
 Building Manifest in one small transaction, then changes only the Manifest to
 Active. Unknown outcomes and concurrent publishers resolve against the original
 Logical Index ID. Ordinary operations become available only after that commit;
@@ -506,7 +508,7 @@ Publication may therefore already be committed when cleanup reports an error;
 `status`/idempotent `publish` resolve it. All jobs using one root share this IO
 barrier. The caller owns the root, coordination file, and source snapshot.
 
-Constant-size Build Descriptor, Build Load, and completed Build Validation remain
+Constant-size Build Descriptor and Validated Build Progress remain
 inside the Active index to support original-identity status and publication
 retries. They are removed with the index. Preparation files and namespace ledger
 are reclaimed independently. Crash recovery does not require an in-memory job

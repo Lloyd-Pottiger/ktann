@@ -692,17 +692,9 @@ pub(crate) async fn build_status<B: Backend>(
             {
                 return Ok(BulkBuildStatus::Failed { kind });
             }
-            if let Some(PersistentValue::BuildValidation(v)) =
-                txn.get(LogicalKey::BuildValidation(id)).await?
-            {
-                return Ok(BulkBuildStatus::Validating {
-                    verified_entries: v.entries,
-                    total_entries: v.artifact.items(),
-                });
-            }
-            match txn.get(LogicalKey::BuildLoad(id)).await? {
+            match txn.get(LogicalKey::BuildProgress(id)).await? {
                 None => BulkBuildStatus::Preparing,
-                Some(PersistentValue::BuildLoad(load)) => super::bulk_load::status(&load),
+                Some(PersistentValue::BuildProgress(load)) => super::bulk_load::status(&load),
                 _ => return Err(Error::new(ErrorKind::Corruption)),
             }
         }

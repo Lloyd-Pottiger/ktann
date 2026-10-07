@@ -605,8 +605,7 @@ impl ServingReader {
                 logical,
                 LogicalKey::Manifest(_)
                     | LogicalKey::BuildDescriptor(_)
-                    | LogicalKey::BuildLoad(_)
-                    | LogicalKey::BuildValidation(_)
+                    | LogicalKey::BuildProgress(_)
             )
         {
             return Err(corrupt());

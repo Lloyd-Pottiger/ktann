@@ -214,6 +214,12 @@ joins. It preserves source records and payloads and uses the online projection
 codecs. It excludes lifecycle bookkeeping and conveys no loading or publication
 authority; sealed backend validation is still required.
 
+**Build Progress**: The index-owned persistent state shared by loading and exact
+validation. It fixes one Serving Artifact and load epoch; its phase is Loading,
+Loaded, Validating, or Validated. Only unfinished phases carry checkpoints.
+Stage changes and data/proof advancement commit atomically on this same key.
+It does not duplicate the Index Manifest's publication lifecycle.
+
 **Build Load**: The single fenced task that loads one immutable Serving Artifact
 into a hidden Building index. Its epoch rejects superseded workers, and its
 entry cursor commits atomically with each data chunk. Loaded means the artifact
@@ -225,8 +231,8 @@ preparation directory, options, epoch, accepted artifacts and terminal failure.
 It survives removal of the index prefix until exclusive-lock cleanup completes.
 
 **Build Validation**: A paged exact comparison proof between a core-accepted
-Serving Artifact and frozen backend serving KV bytes. The completed proof and
-sealed Build Load authorize one atomic transition from Building to Active.
+Serving Artifact and frozen backend serving KV bytes. The Validated phase of Build Progress records completion and authorizes one
+atomic transition from Building to Active under the remaining ownership fences.
 
 
 **Build Schedule**: Namespace-scoped durable request for automatic execution of

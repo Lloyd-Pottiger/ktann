@@ -6,7 +6,7 @@ use crate::observe::labels::Operation;
 use crate::storage::backend::Backend;
 use crate::storage::keys::LogicalKey;
 use crate::storage::values::{
-    BuildDescriptor, BuildWorkspace, IndexLifecycle, IndexManifest, PersistentValue,
+    BuildDescriptor, BuildPhase, BuildWorkspace, IndexLifecycle, IndexManifest, PersistentValue,
     PreparedArtifact,
 };
 use crate::storage::{ReadLogicalTxn, WriteLogicalTxn};
@@ -175,10 +175,13 @@ async fn claim<B: Backend>(
             }
             _ => return Err(corrupt()),
         };
-        if let Some(PersistentValue::BuildLoad(load)) = txn
-            .get(LogicalKey::BuildLoad(index.logical_index_id()))
+        if let Some(PersistentValue::BuildProgress(load)) = txn
+            .get(LogicalKey::BuildProgress(index.logical_index_id()))
             .await?
-            && load.sealed
+            && matches!(
+                load.phase,
+                BuildPhase::Validating { .. } | BuildPhase::Validated
+            )
         {
             return Err(Error::invalid_argument());
         }

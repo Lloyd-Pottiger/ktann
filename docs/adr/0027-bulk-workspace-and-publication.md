@@ -1,7 +1,8 @@
 # ADR 0027: Durable workspace ownership and exact Bulk Build publication
 
 Status: Accepted. The automatic-scheduling deferral is superseded by
-[ADR 0028](0028-automatic-bulk-scheduling.md).
+[ADR 0028](0028-automatic-bulk-scheduling.md). The separate load/proof record layout
+is refined by [ADR 0029](0029-unified-bulk-progress.md).
 
 ## Context
 

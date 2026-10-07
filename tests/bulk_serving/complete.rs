@@ -99,11 +99,11 @@ async fn build_publish_reopen_cleanup_and_online_mutations_are_complete() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sealed_backend_damage_is_terminal_and_cannot_publish() {
-    for extra in [false, true] {
+    for (count, extra) in [(19, false), (19, true), (0, true)] {
         let dir = Directory::new();
         let memory = MemoryBackend::new();
         let runtime = runtime(memory.clone());
-        let (job, _) = fixture(&runtime, &memory, &dir, 19).await;
+        let (job, _) = fixture(&runtime, &memory, &dir, count).await;
         let opts = worker_options(&dir);
         job.run_worker(opts.clone()).await.unwrap();
         let mut txn = memory.begin_write().await.unwrap();
@@ -263,7 +263,7 @@ async fn unknown_outcomes_at_sealing_proof_and_publication_are_idempotent() {
             let runtime = runtime(memory.clone());
             let (job, artifact) = fixture(&runtime, &memory, &dir, 19).await;
             job.run_worker(worker_options(&dir)).await.unwrap();
-            let pages = (artifact.manifest().items() + 4)
+            let pages = (artifact.manifest().items() + 3)
                 .div_ceil(load_options().max_mutations as u64) as usize;
             let position = if point == 2 { pages + 1 } else { point };
             let mut plan = vec![CommitFault::Normal; position];
@@ -335,11 +335,22 @@ async fn abort_wins_against_a_prepared_publication_transaction() {
     let opts = worker_options(&dir);
     job.run_worker(opts.clone()).await.unwrap();
     let pages =
-        (artifact.manifest().items() + 4).div_ceil(load_options().max_mutations as u64) as usize;
+        (artifact.manifest().items() + 3).div_ceil(load_options().max_mutations as u64) as usize;
     gate.arm(pages + 2);
     let publisher = job.clone();
     let pending = tokio::spawn(async move { publisher.publish().await });
     gate.wait().await;
+    assert!(matches!(
+        checkpoint(&memory, &job).await.phase(),
+        BuildPhase::Validated
+    ));
+    assert_eq!(
+        job.status().await.unwrap(),
+        BulkBuildStatus::Validating {
+            verified_entries: artifact.manifest().items(),
+            total_entries: artifact.manifest().items(),
+        }
+    );
     job.abort().await.unwrap();
     gate.release.notify_one();
     assert_eq!(

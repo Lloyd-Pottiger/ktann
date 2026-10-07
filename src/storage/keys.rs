@@ -87,8 +87,7 @@ const KIND_RECORD_GROUP: u8 = 0x01;
 const KIND_TREE_MANIFEST: u8 = 0x03;
 const KIND_PARTITION: u8 = 0x04;
 const KIND_BUILD_DESCRIPTOR: u8 = 0x05;
-const KIND_BUILD_LOAD: u8 = 0x06;
-const KIND_BUILD_VALIDATION: u8 = 0x07;
+const KIND_BUILD_PROGRESS: u8 = 0x06;
 
 const RECORD_VALUE: u8 = 0x00;
 const RECORD_LOCATION: u8 = 0x01;
@@ -121,14 +120,12 @@ pub enum LogicalKey {
     Manifest(LogicalIndexId),
     /// Immutable input identity and construction parameters of a Bulk Build.
     BuildDescriptor(LogicalIndexId),
-    /// Fenced progress for loading one sealed serving artifact.
-    BuildLoad(LogicalIndexId),
+    /// Fenced progress through serving-data loading and backend validation.
+    BuildProgress(LogicalIndexId),
     /// Durable workspace ownership and preparation progress, outside index data.
     BuildWorkspace(LogicalIndexId),
     /// Durable distributed scheduler queue and lease.
     BuildSchedule(LogicalIndexId),
-    /// Checkpoint over sealed backend data.
-    BuildValidation(LogicalIndexId),
     /// A Vector Record.
     Record {
         /// The owning Logical Index ID.
@@ -225,10 +222,9 @@ impl LogicalKey {
             | Self::IndexNameDirectory(_)
             | Self::BuildWorkspace(_)
             | Self::BuildSchedule(_) => None,
-            Self::Manifest(index)
-            | Self::BuildDescriptor(index)
-            | Self::BuildLoad(index)
-            | Self::BuildValidation(index) => Some(*index),
+            Self::Manifest(index) | Self::BuildDescriptor(index) | Self::BuildProgress(index) => {
+                Some(*index)
+            }
             Self::Record { index, .. }
             | Self::Location { index, .. }
             | Self::Payload { index, .. }
@@ -256,10 +252,9 @@ impl LogicalKey {
             | Self::IndexNameDirectory(_)
             | Self::Manifest(_)
             | Self::BuildDescriptor(_)
-            | Self::BuildLoad(_)
+            | Self::BuildProgress(_)
             | Self::BuildWorkspace(_)
             | Self::BuildSchedule(_)
-            | Self::BuildValidation(_)
             | Self::Record { .. }
             | Self::Location { .. }
             | Self::Payload { .. } => None,
@@ -280,11 +275,9 @@ impl fmt::Debug for LogicalKey {
                 .debug_tuple("BuildWorkspace")
                 .field(index)
                 .finish(),
-            Self::BuildValidation(index) => formatter
-                .debug_tuple("BuildValidation")
-                .field(index)
-                .finish(),
-            Self::BuildLoad(index) => formatter.debug_tuple("BuildLoad").field(index).finish(),
+            Self::BuildProgress(index) => {
+                formatter.debug_tuple("BuildProgress").field(index).finish()
+            }
             Self::BuildDescriptor(index) => formatter
                 .debug_tuple("BuildDescriptor")
                 .field(index)
@@ -497,11 +490,11 @@ pub fn build_descriptor_key(index: LogicalIndexId) -> Vec<u8> {
     bytes
 }
 
-/// The fenced serving-load progress key for `index`.
+/// The fenced loading/validation progress key for `index`.
 #[must_use]
-pub fn build_load_key(index: LogicalIndexId) -> Vec<u8> {
+pub fn build_progress_key(index: LogicalIndexId) -> Vec<u8> {
     let mut bytes = index_prefix(index);
-    bytes.push(KIND_BUILD_LOAD);
+    bytes.push(KIND_BUILD_PROGRESS);
     bytes
 }
 
@@ -516,14 +509,6 @@ pub fn build_workspace_key(index: LogicalIndexId) -> Vec<u8> {
 pub fn build_schedule_key(index: LogicalIndexId) -> Vec<u8> {
     let mut bytes = vec![SCOPE_NAMESPACE, NS_BUILD_SCHEDULE];
     bytes.extend_from_slice(&index.get().to_be_bytes());
-    bytes
-}
-
-/// The sealed backend validation checkpoint key.
-#[must_use]
-pub fn build_validation_key(index: LogicalIndexId) -> Vec<u8> {
-    let mut bytes = index_prefix(index);
-    bytes.push(KIND_BUILD_VALIDATION);
     bytes
 }
 
@@ -650,10 +635,9 @@ pub(crate) fn encode_key(key: &LogicalKey) -> Result<Vec<u8>> {
         LogicalKey::IndexNameDirectory(name) => Ok(name_directory_key(name)),
         LogicalKey::Manifest(index) => Ok(manifest_key(*index)),
         LogicalKey::BuildDescriptor(index) => Ok(build_descriptor_key(*index)),
-        LogicalKey::BuildLoad(index) => Ok(build_load_key(*index)),
+        LogicalKey::BuildProgress(index) => Ok(build_progress_key(*index)),
         LogicalKey::BuildWorkspace(index) => Ok(build_workspace_key(*index)),
         LogicalKey::BuildSchedule(index) => Ok(build_schedule_key(*index)),
-        LogicalKey::BuildValidation(index) => Ok(build_validation_key(*index)),
         LogicalKey::Record { index, id } => record_key(*index, id),
         LogicalKey::Location { index, id } => location_key(*index, id),
         LogicalKey::Payload { index, id } => payload_key(*index, id),
@@ -736,11 +720,8 @@ fn decode_index_key(types: &[DataType], key: &Bytes, offset: usize) -> Result<Lo
     let rest = offset + LOGICAL_INDEX_ID_BYTES + 1;
 
     match kind {
-        KIND_BUILD_VALIDATION if body.len() == LOGICAL_INDEX_ID_BYTES + 1 => {
-            Ok(LogicalKey::BuildValidation(index))
-        }
-        KIND_BUILD_LOAD if body.len() == LOGICAL_INDEX_ID_BYTES + 1 => {
-            Ok(LogicalKey::BuildLoad(index))
+        KIND_BUILD_PROGRESS if body.len() == LOGICAL_INDEX_ID_BYTES + 1 => {
+            Ok(LogicalKey::BuildProgress(index))
         }
         KIND_BUILD_DESCRIPTOR if body.len() == LOGICAL_INDEX_ID_BYTES + 1 => {
             Ok(LogicalKey::BuildDescriptor(index))

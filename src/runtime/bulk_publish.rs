@@ -1,6 +1,7 @@
 //! Exact paged validation of frozen backend bytes and one-transaction activation.
 use super::{
     OperationContext,
+    bulk_load::read_progress,
     bulk_worker::{self, blocking, corrupt},
     lifecycle::RetryPolicy,
 };
@@ -10,7 +11,7 @@ use crate::observe::labels::Operation;
 use crate::storage::backend::{Backend, ReadOps, ScanLimits};
 use crate::storage::keys::{self, KeyRange, LogicalKey};
 use crate::storage::values::{
-    BuildDescriptor, BuildValidation, BuildWorkspace, IndexLifecycle, IndexManifest,
+    BuildDescriptor, BuildPhase, BuildProgress, BuildWorkspace, IndexLifecycle, IndexManifest,
     PersistentValue, ValueCodec,
 };
 use crate::storage::{ReadLogicalTxn, WriteLogicalTxn};
@@ -113,24 +114,11 @@ async fn read_active<T: crate::storage::backend::ReadTxn>(
         _ => Err(corrupt()),
     }
 }
-async fn read_proof<T: crate::storage::backend::WriteTxn>(
-    txn: &mut WriteLogicalTxn<'_, T>,
-    index: &IndexManifest,
-) -> Result<Option<BuildValidation>> {
-    match txn
-        .get_for_update(LogicalKey::BuildValidation(index.logical_index_id()))
-        .await?
-    {
-        None => Ok(None),
-        Some(PersistentValue::BuildValidation(v)) => Ok(Some(v)),
-        _ => Err(corrupt()),
-    }
-}
 async fn fence<T: crate::storage::backend::WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     index: &IndexManifest,
     state: &BuildWorkspace,
-) -> Result<()> {
+) -> Result<BuildProgress> {
     bulk_worker::building(txn, index).await?;
     match txn
         .get_for_update(LogicalKey::BuildWorkspace(index.logical_index_id()))
@@ -140,16 +128,14 @@ async fn fence<T: crate::storage::backend::WriteTxn>(
             if w.token == state.token && w.serving == state.serving && w.failure.is_none() => {}
         _ => return Err(corrupt()),
     }
-    match txn
-        .get_for_update(LogicalKey::BuildLoad(index.logical_index_id()))
-        .await?
-    {
-        Some(PersistentValue::BuildLoad(l))
-            if l.complete
-                && l.sealed
-                && l.artifact == state.serving.as_ref().ok_or_else(corrupt)?.manifest =>
+    match read_progress(txn, index).await? {
+        Some(progress)
+            if matches!(
+                progress.phase,
+                BuildPhase::Validating { .. } | BuildPhase::Validated
+            ) && progress.artifact == state.serving.as_ref().ok_or_else(corrupt)?.manifest =>
         {
-            Ok(())
+            Ok(progress)
         }
         _ => Err(corrupt()),
     }
@@ -160,7 +146,7 @@ async fn seal<B: Backend>(
     descriptor: &BuildDescriptor,
     state: &BuildWorkspace,
     retry: RetryPolicy,
-) -> Result<BuildValidation> {
+) -> Result<BuildProgress> {
     let mut attempts = 0;
     loop {
         context.checkpoint()?;
@@ -186,55 +172,42 @@ async fn seal<B: Backend>(
             Some(PersistentValue::BuildDescriptor(d)) if d == *descriptor => {}
             _ => return Err(corrupt()),
         }
-        let mut load = match txn
-            .get_for_update(LogicalKey::BuildLoad(index.logical_index_id()))
+        let mut progress = read_progress(&mut txn, index)
             .await?
+            .ok_or_else(|| Error::new(ErrorKind::BulkBuildBusy))?;
+        // Preparation accepts the artifact before loading begins. A publisher
+        // arriving early must leave this ordinary in-progress work resumable.
+        if matches!(progress.phase, BuildPhase::Loading { .. }) {
+            return Err(Error::new(ErrorKind::BulkBuildBusy));
+        }
+        if progress.artifact
+            != state
+                .serving
+                .as_ref()
+                .ok_or_else(Error::invalid_argument)?
+                .manifest
         {
-            // Serving acceptance precedes loading. A publisher arriving in
-            // that window must not turn ordinary in-progress work into a
-            // terminal validation failure.
-            None => return Err(Error::new(ErrorKind::BulkBuildBusy)),
-            Some(PersistentValue::BuildLoad(l)) if !l.complete => {
-                return Err(Error::new(ErrorKind::BulkBuildBusy));
-            }
-            Some(PersistentValue::BuildLoad(l))
-                if l.artifact
-                    == state
-                        .serving
-                        .as_ref()
-                        .ok_or_else(Error::invalid_argument)?
-                        .manifest =>
-            {
-                l
-            }
-            _ => return Err(Error::invalid_argument()),
-        };
-        if load.sealed {
-            return read_proof(&mut txn, index).await?.ok_or_else(corrupt);
+            return Err(Error::invalid_argument());
         }
-        if read_proof(&mut txn, index).await?.is_some() {
-            return Err(corrupt());
+        if matches!(
+            progress.phase,
+            BuildPhase::Validating { .. } | BuildPhase::Validated
+        ) {
+            return Ok(progress);
         }
-        load.sealed = true;
-        let proof = BuildValidation {
-            artifact: load.artifact.clone(),
+        // Updating the same checkpoint key freezes all previously claimed loads.
+        progress.phase = BuildPhase::Validating {
             cursor: Bytes::new(),
             entries: 0,
-            prefix_sha256: load.artifact.initial_sha256(),
-            complete: false,
+            prefix_sha256: progress.artifact.initial_sha256(),
         };
         txn.put(
-            LogicalKey::BuildLoad(index.logical_index_id()),
-            PersistentValue::BuildLoad(load),
-        )
-        .await?;
-        txn.put(
-            LogicalKey::BuildValidation(index.logical_index_id()),
-            PersistentValue::BuildValidation(proof.clone()),
+            LogicalKey::BuildProgress(index.logical_index_id()),
+            PersistentValue::BuildProgress(progress.clone()),
         )
         .await?;
         match context.commit(|start| txn.commit_with(start)).await {
-            Ok(()) => return Ok(proof),
+            Ok(()) => return Ok(progress),
             Err(e) => {
                 retry
                     .after_commit_error(Operation::PublishBulkBuild, &mut attempts, e)
@@ -253,7 +226,7 @@ async fn validate_and_publish<B: Backend>(
     retry: RetryPolicy,
 ) -> Result<IndexManifest> {
     let mut proof = seal(context, index, descriptor, state, retry).await?;
-    if !proof.complete {
+    if !matches!(proof.phase, BuildPhase::Validated) {
         let guard = lock.clone();
         let mut reader = blocking(context, move || {
             let _lock = guard;
@@ -263,8 +236,8 @@ async fn validate_and_publish<B: Backend>(
         let mut skipped = 0;
         // Reconstruct the exact source prefix in bounded, cancellation-aware
         // steps. The backend proof must name the identical prefix before reuse.
-        while skipped < proof.entries {
-            let take = (proof.entries - skipped).min(state.options.load.max_mutations as u64);
+        while skipped < proof.entries() {
+            let take = (proof.entries() - skipped).min(state.options.load.max_mutations as u64);
             let guard = lock.clone();
             let control = context.options.clone();
             reader = blocking(context, move || {
@@ -278,10 +251,10 @@ async fn validate_and_publish<B: Backend>(
             .await?;
             skipped += take;
         }
-        if reader.prefix_sha256() != proof.prefix_sha256 {
+        if reader.prefix_sha256() != *proof.prefix_sha256() {
             return Err(corrupt());
         }
-        while !proof.complete {
+        while !matches!(proof.phase, BuildPhase::Validated) {
             let (next_reader, next) =
                 page(context, index, state, reader, &proof, lock.clone(), retry).await?;
             reader = next_reader;
@@ -295,14 +268,17 @@ async fn page<B: Backend>(
     index: &IndexManifest,
     state: &BuildWorkspace,
     reader: ServingReader,
-    before: &BuildValidation,
+    before: &BuildProgress,
     lock: Arc<std::fs::File>,
     retry: RetryPolicy,
-) -> Result<(ServingReader, BuildValidation)> {
+) -> Result<(ServingReader, BuildProgress)> {
+    let BuildPhase::Validating { cursor, .. } = &before.phase else {
+        return Err(corrupt());
+    };
     let backend = context.backend();
     let mut attempts = 0;
     let mut reader = Some(reader);
-    let mut after: Option<BuildValidation> = None;
+    let mut after: Option<BuildProgress> = None;
     loop {
         context.checkpoint()?;
         let mut txn = WriteLogicalTxn::bootstrap(
@@ -310,9 +286,8 @@ async fn page<B: Backend>(
             backend.hard_limits(),
             backend.admission_budget(),
         );
-        fence(&mut txn, index, state).await?;
+        let current = fence(&mut txn, index, state).await?;
         super::bulk_scheduler::authorize(context, &mut txn, index.logical_index_id()).await?;
-        let current = read_proof(&mut txn, index).await?.ok_or_else(corrupt)?;
         if after.as_ref().is_some_and(|after| *after == current) {
             return Ok((reader.take().expect("reader"), current));
         }
@@ -321,10 +296,10 @@ async fn page<B: Backend>(
         }
         if after.is_none() {
             let mut raw = txn.into_raw();
-            let start = if before.cursor.is_empty() {
+            let start = if cursor.is_empty() {
                 Bytes::from(keys::index_range(index.logical_index_id()).start().to_vec())
             } else {
-                before.cursor.clone()
+                cursor.clone()
             };
             let end = keys::index_range(index.logical_index_id()).end().to_vec();
             let page = raw
@@ -356,8 +331,7 @@ async fn page<B: Backend>(
                     logical,
                     LogicalKey::Manifest(_)
                         | LogicalKey::BuildDescriptor(_)
-                        | LogicalKey::BuildLoad(_)
-                        | LogicalKey::BuildValidation(_)
+                        | LogicalKey::BuildProgress(_)
                 ) {
                     ValueCodec::for_index(index).decode(&logical, value)?;
                 } else {
@@ -368,6 +342,7 @@ async fn page<B: Backend>(
             let guard = lock.clone();
             let control = context.options.clone();
             let mut next_proof = before.clone();
+            let mut compared = before.entries();
             let (input, verified) = blocking(context, move || {
                 let _lock = guard;
                 for (key, value) in data {
@@ -376,14 +351,21 @@ async fn page<B: Backend>(
                     if expected.key != key || expected.value != value {
                         return Err(corrupt());
                     }
-                    next_proof.entries = next_proof.entries.checked_add(1).ok_or_else(corrupt)?;
+                    compared = compared.checked_add(1).ok_or_else(corrupt)?;
                 }
                 if terminal && input.next().transpose()?.is_some() {
                     return Err(corrupt());
                 }
-                next_proof.prefix_sha256 = input.prefix_sha256();
-                next_proof.cursor = next.unwrap_or_default();
-                next_proof.complete = terminal;
+                next_proof.phase = if terminal {
+                    // Exhausting the reader above verified the full artifact.
+                    BuildPhase::Validated
+                } else {
+                    BuildPhase::Validating {
+                        cursor: next.expect("nonterminal scan cursor"),
+                        entries: compared,
+                        prefix_sha256: input.prefix_sha256(),
+                    }
+                };
                 Ok((input, next_proof))
             })
             .await?;
@@ -393,8 +375,8 @@ async fn page<B: Backend>(
                 WriteLogicalTxn::bootstrap(raw, backend.hard_limits(), backend.admission_budget());
         }
         txn.put(
-            LogicalKey::BuildValidation(index.logical_index_id()),
-            PersistentValue::BuildValidation(after.as_ref().expect("page checked").clone()),
+            LogicalKey::BuildProgress(index.logical_index_id()),
+            PersistentValue::BuildProgress(after.as_ref().expect("page checked").clone()),
         )
         .await?;
         match context.commit(|start| txn.commit_with(start)).await {
@@ -411,7 +393,7 @@ async fn activate<B: Backend>(
     context: &mut OperationContext<B>,
     index: &IndexManifest,
     state: &BuildWorkspace,
-    proof: &BuildValidation,
+    proof: &BuildProgress,
     retry: RetryPolicy,
 ) -> Result<IndexManifest> {
     let active = index.clone().with_lifecycle(IndexLifecycle::Active);
@@ -428,9 +410,9 @@ async fn activate<B: Backend>(
         if current.lifecycle() == IndexLifecycle::Active {
             return Ok(current);
         }
-        fence(&mut txn, index, state).await?;
+        let current = fence(&mut txn, index, state).await?;
         super::bulk_scheduler::authorize(context, &mut txn, index.logical_index_id()).await?;
-        if !proof.complete || read_proof(&mut txn, index).await?.as_ref() != Some(proof) {
+        if !matches!(proof.phase, BuildPhase::Validated) || current != *proof {
             return Err(corrupt());
         }
         txn.put(
