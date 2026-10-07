@@ -1087,3 +1087,31 @@ fn bulk_validation_golden_and_malformed_proofs() {
     golden.push(0);
     assert!(codec.decode(&key, Bytes::from(golden)).is_err());
 }
+
+#[test]
+fn build_schedule_golden_and_malformed_lease() {
+    let codec = ValueCodec::bootstrap();
+    let key = LogicalKey::BuildSchedule(id(1));
+    let mut golden = vec![0x11, 0, 0, 0, 1, b'x', 0, 0, 0, 5];
+    golden.extend_from_slice(b"/bulk");
+    for n in [1_u64, 1, 1, 1, 1, 2, 1] {
+        golden.extend_from_slice(&n.to_be_bytes());
+    }
+    golden.extend_from_slice(&[1; 32]);
+    golden.extend_from_slice(&1_u64.to_be_bytes());
+    let value = codec.decode(&key, Bytes::from(golden.clone())).unwrap();
+    assert_eq!(codec.encode(&value).unwrap(), golden);
+    for length in 0..golden.len() {
+        assert!(
+            codec
+                .decode(&key, Bytes::copy_from_slice(&golden[..length]))
+                .is_err()
+        );
+    }
+    let mut invalid = golden.clone();
+    let length = invalid.len();
+    invalid[length - 8..].fill(0);
+    assert!(codec.decode(&key, Bytes::from(invalid)).is_err());
+    golden.push(0);
+    assert!(codec.decode(&key, Bytes::from(golden)).is_err());
+}

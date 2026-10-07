@@ -92,3 +92,10 @@ FoundationDB. Filesystem qualification across hosts is outside these tests.
 
 See [ADR 0026](../adr/0026-building-reservations.md) and
 [ADR 0027](../adr/0027-bulk-workspace-and-publication.md) for persistence decisions.
+
+## Automatic scheduling
+
+`enqueue` persists worker options for automatic preparation, loading, and
+publication. Scheduler ownership fences worker, load, and publication writes.
+Bounded leases permit takeover after a worker stops renewing; namespace cleanup
+reclaims orphaned owned files. Manual completion remains available.

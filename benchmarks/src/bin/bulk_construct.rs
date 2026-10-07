@@ -1,6 +1,6 @@
 //! Streaming SIFT construction probe for the Bulk Build algorithm gate.
 //!
-//! Usage: ktann-bulk-construct INPUT.fvecs OUTPUT_DIRECTORY [RECORD_LIMIT] [FOREST_TREES] [--serving]
+//! Usage: `ktann-bulk-construct INPUT.fvecs OUTPUT_DIRECTORY [RECORD_LIMIT] [FOREST_TREES] [--serving]`
 //! This measures pure construction, not load/validation/publication or an SLA.
 
 use std::fs::{self, File};

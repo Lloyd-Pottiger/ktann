@@ -218,6 +218,7 @@ async fn claim<B: Backend>(
             budget,
         );
         super::bulk_worker::building(&mut txn, index).await?;
+        super::bulk_scheduler::authorize(context, &mut txn, index.logical_index_id()).await?;
         match txn
             .get(LogicalKey::BuildDescriptor(index.logical_index_id()))
             .await?
@@ -289,6 +290,7 @@ async fn commit_chunk<B: Backend>(
             budget,
         );
         super::bulk_worker::building(&mut txn, index).await?;
+        super::bulk_scheduler::authorize(context, &mut txn, index.logical_index_id()).await?;
         let current = read_load(&mut txn, index).await?.ok_or_else(corrupt)?;
         if current == *after {
             return Ok(());

@@ -336,9 +336,10 @@ impl<'manifest> LogicalBinding<'manifest> {
                     | LogicalKey::BuildValidation(_)
             ),
             (Some(manifest), Some(index)) => index == manifest.logical_index_id(),
-            (Some(_), None) => {
-                self.allow_name_mapping && matches!(key, LogicalKey::IndexNameDirectory(_))
-            }
+            (Some(manifest), None) => match key {
+                LogicalKey::BuildSchedule(id) => *id == manifest.logical_index_id(),
+                _ => self.allow_name_mapping && matches!(key, LogicalKey::IndexNameDirectory(_)),
+            },
         };
         if !valid {
             return Err(Error::invalid_argument());

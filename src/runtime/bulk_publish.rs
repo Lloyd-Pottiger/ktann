@@ -164,6 +164,7 @@ async fn begin_validation<B: Backend>(
             backend.admission_budget(),
         );
         bulk_worker::building(&mut txn, index).await?;
+        super::bulk_scheduler::authorize(context, &mut txn, index.logical_index_id()).await?;
         match txn
             .get_for_update(LogicalKey::BuildWorkspace(index.logical_index_id()))
             .await?
@@ -307,6 +308,7 @@ async fn page<B: Backend>(
             backend.admission_budget(),
         );
         fence(&mut txn, index, state).await?;
+        super::bulk_scheduler::authorize(context, &mut txn, index.logical_index_id()).await?;
         let current = read_proof(&mut txn, index).await?.ok_or_else(corrupt)?;
         if after.as_ref().is_some_and(|after| *after == current) {
             return Ok((reader.take().expect("reader"), current));
@@ -439,6 +441,7 @@ async fn activate<B: Backend>(
             return Ok(current);
         }
         fence(&mut txn, index, state).await?;
+        super::bulk_scheduler::authorize(context, &mut txn, index.logical_index_id()).await?;
         if !proof.complete || read_proof(&mut txn, index).await?.as_ref() != Some(proof) {
             return Err(corrupt());
         }
