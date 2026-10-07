@@ -341,7 +341,8 @@ The optional fourth argument to `ktann-bulk-construct` selects the forest path:
 `ktann-bulk-construct INPUT.fvecs OUTPUT_DIRECTORY RECORD_LIMIT FOREST_TREES`.
 A positive tree count assigns the original SIFT ordinal modulo that count to an
 I64 Tree Key field; `0` exercises the empty Tree Key through the forest path.
-Omitting this argument preserves the single-tree probe. Forest reports include
+Omitting this argument runs the same forest pipeline with one empty Tree Key.
+Both modes report global-sort and per-tree resource budgets. Reports include
 separate global-sort and per-tree scratch peaks/write totals. Their quotas add
 while both stages retain files. The probe verifies sealed topology framing but
 does not measure backend loading, exact serving validation, publication, or recall.

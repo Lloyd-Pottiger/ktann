@@ -1,6 +1,10 @@
 //! A single fenced, resumable load task over a sealed serving artifact.
 
-use super::{OperationContext, lifecycle::RetryPolicy};
+use super::{
+    OperationContext,
+    bulk_worker::{blocking, building},
+    lifecycle::RetryPolicy,
+};
 use crate::api::{BulkBuildStatus, BulkLoadOptions, Error, ErrorKind, Result};
 use crate::bulk::{ServingArtifact, ServingEntry, ServingReader};
 use crate::observe::labels::Operation;
@@ -61,7 +65,7 @@ pub(crate) async fn load<B: Backend>(
     if load.complete {
         return Ok(());
     }
-    let mut stream = super::bulk_worker::blocking(context, move || {
+    let mut stream = blocking(context, move || {
         artifact.reader().map(|reader| Stream {
             prefix_sha256: reader.prefix_sha256(),
             reader,
@@ -75,7 +79,7 @@ pub(crate) async fn load<B: Backend>(
         let committed = load.entries;
         let expected_prefix = load.prefix_sha256;
         let control = context.options.clone();
-        let (next_stream, entries, complete) = super::bulk_worker::blocking(context, move || {
+        let (next_stream, entries, complete) = blocking(context, move || {
             let (entries, complete) = stream.next_chunk(
                 committed,
                 expected_prefix,
@@ -217,7 +221,7 @@ async fn claim<B: Backend>(
             backend.hard_limits(),
             budget,
         );
-        super::bulk_worker::building(&mut txn, index).await?;
+        building(&mut txn, index).await?;
         super::bulk_scheduler::authorize(context, &mut txn, index.logical_index_id()).await?;
         match txn
             .get(LogicalKey::BuildDescriptor(index.logical_index_id()))
@@ -289,7 +293,7 @@ async fn commit_chunk<B: Backend>(
             backend.hard_limits(),
             budget,
         );
-        super::bulk_worker::building(&mut txn, index).await?;
+        building(&mut txn, index).await?;
         super::bulk_scheduler::authorize(context, &mut txn, index.logical_index_id()).await?;
         let current = read_load(&mut txn, index).await?.ok_or_else(corrupt)?;
         if current == *after {
@@ -317,24 +321,11 @@ async fn commit_chunk<B: Backend>(
         txn.apply(batch).await?;
         match context.commit(|start| txn.commit_with(start)).await {
             Ok(()) => return Ok(()),
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    ErrorKind::RetryableAbort | ErrorKind::CommitOutcomeUnknown
-                ) =>
-            {
-                if let Err(exhausted) = retry
-                    .wait_or_exhaust(Operation::LoadBulkBuild, &mut attempts)
-                    .await
-                {
-                    return Err(if e.kind() == ErrorKind::CommitOutcomeUnknown {
-                        e
-                    } else {
-                        exhausted
-                    });
-                }
+            Err(e) => {
+                retry
+                    .after_commit_error(Operation::LoadBulkBuild, &mut attempts, e)
+                    .await?
             }
-            Err(e) => return Err(e),
         }
     }
 }

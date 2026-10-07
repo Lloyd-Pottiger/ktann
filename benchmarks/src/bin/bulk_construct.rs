@@ -12,7 +12,7 @@ use bytes::Bytes;
 use ktann::api::{
     DataType, Error, ErrorKind, FieldId, FieldSchema, IndexConfig, Metric, Record, Value,
 };
-use ktann::bulk::{ForestArtifact, ForestOptions, InputSnapshot, TreeArtifact};
+use ktann::bulk::{ForestArtifact, ForestOptions, InputSnapshot};
 use ktann::construction::{CONSTRUCTION_VERSION, ConstructionOptions};
 use sha2::{Digest, Sha256};
 
@@ -140,116 +140,81 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let snapshot_seconds = snapshot_started.elapsed().as_secs_f64();
     let construction_started = Instant::now();
-    if let Some(requested_trees) = forest_trees {
-        let forest_options = ForestOptions {
-            tree: options,
-            sort_memory_bytes: 64 * 1024 * 1024,
-            sort_scratch_bytes: 32 * 1024 * 1024 * 1024,
-        };
-        let (plan, report) = ForestArtifact::build(
-            &output.join("plan"),
-            &input,
-            SEED,
-            forest_options,
-            32 * 1024 * 1024 * 1024,
-        )?;
-        let construction_seconds = construction_started.elapsed().as_secs_f64();
-        let verification_started = Instant::now();
-        plan.verify()?;
-        let verification_seconds = verification_started.elapsed().as_secs_f64();
-        let mut result = serde_json::json!({
-            "scope": "durable input, global duplicate detection and multi-tree plan; excludes backend loading, exact serving validation and publication",
-            "source_sha256": source_sha256, "source_bytes": source_bytes,
-            "records": report.records, "dimension": DIMENSION, "metric": "l2",
-            "algorithm_version": CONSTRUCTION_VERSION, "rotation_seed": SEED,
-            "requested_trees": requested_trees, "trees": report.trees, "partitions": report.partitions,
-            "sample_items": options.sample_items, "min_partition_entries": options.min_partition_entries, "max_partition_entries": options.max_partition_entries,
-            "tree_memory_budget_bytes": options.memory_bytes, "tree_scratch_budget_bytes": options.scratch_bytes,
-            "sort_memory_budget_bytes": forest_options.sort_memory_bytes, "sort_scratch_budget_bytes": forest_options.sort_scratch_bytes,
-            "peak_sort_scratch_bytes": report.peak_sort_scratch_bytes, "sort_written_bytes": report.sort_written_bytes,
-            "peak_tree_scratch_bytes": report.peak_tree_scratch_bytes, "tree_written_bytes": report.tree_written_bytes,
-            "preparation_seconds": preparation_seconds, "snapshot_seconds": snapshot_seconds,
-            "construction_seconds": construction_seconds, "artifact_verification_seconds": verification_seconds,
-            "total_seconds": started.elapsed().as_secs_f64(), "input_snapshot_bytes": input.manifest().bytes(),
-            "plan_bytes": plan.manifest().bytes(), "plan_sha256": plan.manifest().sha256(),
-        });
-        if encode_serving {
-            use ktann::api::LogicalIndexId;
-            use ktann::bulk::{ServingArtifact, ServingOptions};
-            use ktann::storage::backend::HardLimits;
-            use ktann::storage::values::{BloomParameters, IndexLifecycle, IndexManifest};
-            let bloom = config
-                .fields()
-                .iter()
-                .map(|field| BloomParameters::derive(field.synopsis()))
-                .collect::<ktann::api::Result<Vec<_>>>()?;
-            let index = IndexManifest::new(
-                IndexLifecycle::Building,
-                LogicalIndexId::new(1)?,
-                config.clone(),
-                SEED,
-                bloom,
-            )?;
-            let serving_options = ServingOptions {
-                memory_bytes: 128 * 1024 * 1024,
-                scratch_bytes: 64 * 1024 * 1024 * 1024,
-                hard_limits: HardLimits {
-                    max_key_bytes: 10_000,
-                    max_value_bytes: 100_000,
-                },
-            };
-            let serving_started = Instant::now();
-            let (serving, serving_report) = ServingArtifact::build(
-                &output.join("serving"),
-                &input,
-                &plan,
-                &index,
-                serving_options,
-                64 * 1024 * 1024 * 1024,
-            )?;
-            let serving_seconds = serving_started.elapsed().as_secs_f64();
-            let verify_started = Instant::now();
-            serving.verify()?;
-            result["serving"] = serde_json::json!({ "records": serving_report.records, "partitions": serving_report.partitions, "keys": serving_report.keys, "bytes": serving.manifest().bytes(), "sha256": serving.manifest().sha256(), "encoding_seconds": serving_seconds, "verification_seconds": verify_started.elapsed().as_secs_f64(), "peak_scratch_bytes": serving_report.peak_scratch_bytes, "scratch_written_bytes": serving_report.scratch_written_bytes, "memory_budget_bytes": serving_options.memory_bytes, "scratch_budget_bytes": serving_options.scratch_bytes, "max_key_bytes": serving_options.hard_limits.max_key_bytes, "max_value_bytes": serving_options.hard_limits.max_value_bytes });
-            result["scope"] = serde_json::json!(
-                "durable source, forest, exact joins and serving KV encoding; excludes backend loading, sealed backend validation, publication and recall"
-            );
-            result["total_seconds"] = serde_json::json!(started.elapsed().as_secs_f64());
-        }
-        let json = serde_json::to_vec_pretty(&result)?;
-        fs::write(output.join("report.json"), &json)?;
-        println!("{}", String::from_utf8(json)?);
-        return Ok(());
-    }
-    let (plan, report) = TreeArtifact::build(
+    let forest_options = ForestOptions {
+        tree: options,
+        sort_memory_bytes: 64 * 1024 * 1024,
+        sort_scratch_bytes: 32 * 1024 * 1024 * 1024,
+    };
+    let (plan, report) = ForestArtifact::build(
         &output.join("plan"),
         &input,
         SEED,
-        options,
+        forest_options,
         32 * 1024 * 1024 * 1024,
     )?;
     let construction_seconds = construction_started.elapsed().as_secs_f64();
     let verification_started = Instant::now();
     plan.verify()?;
     let verification_seconds = verification_started.elapsed().as_secs_f64();
-    let result = serde_json::json!({
-        "scope": "durable input and single-tree plan; excludes backend loading, exact serving validation and publication",
+    let mut result = serde_json::json!({
+        "scope": "durable input, global duplicate detection and multi-tree plan; excludes backend loading, exact serving validation and publication",
         "source_sha256": source_sha256, "source_bytes": source_bytes,
         "records": report.records, "dimension": DIMENSION, "metric": "l2",
         "algorithm_version": CONSTRUCTION_VERSION, "rotation_seed": SEED,
-        "sample_items": options.sample_items, "min_partition_entries": options.min_partition_entries,
-        "max_partition_entries": options.max_partition_entries,
-        "memory_budget_bytes": options.memory_bytes, "scratch_budget_bytes": options.scratch_bytes,
-        "preparation_seconds": preparation_seconds, "construction_seconds": construction_seconds,
-        "snapshot_seconds": snapshot_seconds, "artifact_verification_seconds": verification_seconds,
-        "total_seconds": started.elapsed().as_secs_f64(), "partitions": report.partitions,
-        "partition_high_water": report.partition_high_water,
-        "peak_scratch_bytes": report.peak_scratch_bytes,
-        "scratch_written_bytes": report.scratch_written_bytes,
-        "input_snapshot_bytes": input.manifest().bytes(),
-        "plan_bytes": plan.manifest().bytes(),
-        "plan_sha256": plan.manifest().sha256(),
+        "requested_trees": forest_trees, "trees": report.trees, "partitions": report.partitions,
+        "sample_items": options.sample_items, "min_partition_entries": options.min_partition_entries, "max_partition_entries": options.max_partition_entries,
+        "tree_memory_budget_bytes": options.memory_bytes, "tree_scratch_budget_bytes": options.scratch_bytes,
+        "sort_memory_budget_bytes": forest_options.sort_memory_bytes, "sort_scratch_budget_bytes": forest_options.sort_scratch_bytes,
+        "peak_sort_scratch_bytes": report.peak_sort_scratch_bytes, "sort_written_bytes": report.sort_written_bytes,
+        "peak_tree_scratch_bytes": report.peak_tree_scratch_bytes, "tree_written_bytes": report.tree_written_bytes,
+        "preparation_seconds": preparation_seconds, "snapshot_seconds": snapshot_seconds,
+        "construction_seconds": construction_seconds, "artifact_verification_seconds": verification_seconds,
+        "total_seconds": started.elapsed().as_secs_f64(), "input_snapshot_bytes": input.manifest().bytes(),
+        "plan_bytes": plan.manifest().bytes(), "plan_sha256": plan.manifest().sha256(),
     });
+    if encode_serving {
+        use ktann::api::LogicalIndexId;
+        use ktann::bulk::{ServingArtifact, ServingOptions};
+        use ktann::storage::backend::HardLimits;
+        use ktann::storage::values::{BloomParameters, IndexLifecycle, IndexManifest};
+        let bloom = config
+            .fields()
+            .iter()
+            .map(|field| BloomParameters::derive(field.synopsis()))
+            .collect::<ktann::api::Result<Vec<_>>>()?;
+        let index = IndexManifest::new(
+            IndexLifecycle::Building,
+            LogicalIndexId::new(1)?,
+            config.clone(),
+            SEED,
+            bloom,
+        )?;
+        let serving_options = ServingOptions {
+            memory_bytes: 128 * 1024 * 1024,
+            scratch_bytes: 64 * 1024 * 1024 * 1024,
+            hard_limits: HardLimits {
+                max_key_bytes: 10_000,
+                max_value_bytes: 100_000,
+            },
+        };
+        let serving_started = Instant::now();
+        let (serving, serving_report) = ServingArtifact::build(
+            &output.join("serving"),
+            &input,
+            &plan,
+            &index,
+            serving_options,
+            64 * 1024 * 1024 * 1024,
+        )?;
+        let serving_seconds = serving_started.elapsed().as_secs_f64();
+        let verify_started = Instant::now();
+        serving.verify()?;
+        result["serving"] = serde_json::json!({ "records": serving_report.records, "partitions": serving_report.partitions, "keys": serving_report.keys, "bytes": serving.manifest().bytes(), "sha256": serving.manifest().sha256(), "encoding_seconds": serving_seconds, "verification_seconds": verify_started.elapsed().as_secs_f64(), "peak_scratch_bytes": serving_report.peak_scratch_bytes, "scratch_written_bytes": serving_report.scratch_written_bytes, "memory_budget_bytes": serving_options.memory_bytes, "scratch_budget_bytes": serving_options.scratch_bytes, "max_key_bytes": serving_options.hard_limits.max_key_bytes, "max_value_bytes": serving_options.hard_limits.max_value_bytes });
+        result["scope"] = serde_json::json!(
+            "durable source, forest, exact joins and serving KV encoding; excludes backend loading, sealed backend validation, publication and recall"
+        );
+        result["total_seconds"] = serde_json::json!(started.elapsed().as_secs_f64());
+    }
     let json = serde_json::to_vec_pretty(&result)?;
     fs::write(output.join("report.json"), &json)?;
     println!("{}", String::from_utf8(json)?);
