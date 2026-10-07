@@ -5,7 +5,7 @@
 //! `runtime-operations.md` section 5, inventory in `src/observe.rs`) actually
 //! fire with the expected labels and counts as the public API drives work —
 //! foreground operations succeeding and failing, budget exhaustion, the
-//! demand-driven Fixup queue, import gates, and verification.
+//! demand-driven Fixup queue and verification.
 //!
 //! Metric names are not public API, so the expected strings are duplicated
 //! here deliberately: the test is an independent check of the implementation
@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use ktann::api::{
-    DataType, FieldId, FieldSchema, ImportOptions, IndexConfig, Metric, Mutation, Record,
-    RuntimeConfig, SearchOptions, SearchRequest, UpsertResult, Value, VerifyOptions,
+    DataType, FieldId, FieldSchema, IndexConfig, Metric, Mutation, Record, RuntimeConfig,
+    SearchOptions, SearchRequest, UpsertResult, Value, VerifyOptions,
 };
 use ktann::runtime::Runtime;
 
@@ -91,7 +91,6 @@ async fn foreground_batches_offer_only_coalesced_actionable_partitions() {
     let backend = MemoryBackend::with_test_config(TestConfig::default());
     let config = RuntimeConfig::default()
         .with_maintenance(1, 16)
-        .and_then(|config| config.with_import_limits(1, 1))
         .expect("valid runtime config");
     let runtime = Runtime::new(backend, config).expect("runtime");
     let index = runtime
@@ -168,7 +167,6 @@ async fn operations_record_the_documented_series() {
     let backend = MemoryBackend::with_test_config(TestConfig::default());
     let config = RuntimeConfig::default()
         .with_maintenance(2, 16)
-        .and_then(|config| config.with_import_limits(1, 1))
         .expect("valid runtime config");
     let runtime = Runtime::new(backend.clone(), config).expect("runtime");
     let index = runtime
@@ -213,10 +211,6 @@ async fn operations_record_the_documented_series() {
         .expect("batch get");
     assert_eq!(batch.len(), 2);
 
-    // An import session: two ordinary mutation batches.
-    let mut session = index
-        .import_session(ImportOptions::default())
-        .expect("import session");
     for wave in 0..2_u8 {
         let mutations = (0..3_u8)
             .map(|n| {
@@ -224,15 +218,8 @@ async fn operations_record_the_documented_series() {
                 Mutation::Insert(record(&format!("r{id:03}"), f32::from(id)))
             })
             .collect();
-        session.submit(mutations).await.expect("submit");
+        index.batch_mutate(mutations).await.expect("batch");
     }
-    let results = session.finish().await;
-    assert!(
-        results
-            .iter()
-            .all(|result| result.result.as_ref().expect("batch ok").len() == 3)
-    );
-
     // Demand-driven maintenance settles the 17 records into a split tree.
     audit::settle(&index, &backend, 17).await;
 
@@ -455,8 +442,6 @@ async fn operations_record_the_documented_series() {
     for stage in ["routing", "prefetch", "apply"] {
         assert!(seen("ktann.mutation.stage.duration", &[("stage", stage)]));
     }
-    assert!(seen("ktann.import.wait", &[("gate", "in_flight_slot")]));
-    assert!(seen("ktann.import.wait", &[("gate", "backlog")]));
     assert!(seen(
         "ktann.write.commit.duration",
         &[("operation", "batch_mutate"), ("outcome", "committed")]

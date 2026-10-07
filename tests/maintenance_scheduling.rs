@@ -51,7 +51,6 @@ fn runtime_config(workers: usize, capacity: usize, fixup_attempts: u32) -> Runti
     RuntimeConfig::default()
         .with_maintenance(workers, capacity)
         .and_then(|config| config.with_attempts(fixup_attempts, 8))
-        .and_then(|config| config.with_import_limits(1, 1))
         .expect("valid runtime config")
 }
 

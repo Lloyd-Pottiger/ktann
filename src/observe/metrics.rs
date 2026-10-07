@@ -11,9 +11,8 @@ use crate::search::cache::PartitionKind;
 
 use super::labels::{
     BudgetDimension, CacheInstallResult, CacheLookupResult, FixupAdmission, FixupExecution,
-    FixupKind, FixupStepResult, ImportConcurrencyAdjustment, ImportGate, MutationStage, Operation,
-    OperationOutcome, SearchStage, VerifyCompletion, WriteAttemptOutcome, cache_level, key,
-    verify_issue,
+    FixupKind, FixupStepResult, MutationStage, Operation, OperationOutcome, SearchStage,
+    VerifyCompletion, WriteAttemptOutcome, cache_level, key, verify_issue,
 };
 
 /// The metric names of the `ktann.*` namespace; the inventory table in
@@ -44,8 +43,6 @@ pub(crate) mod names {
     pub(crate) const BLOOM_FILL_RATIO: &str = "ktann.bloom.fill_ratio";
     pub(crate) const REFINEMENT_ROUNDS: &str = "ktann.refine.rounds";
     pub(crate) const REFINEMENT_MOVES: &str = "ktann.refine.moves";
-    pub(crate) const IMPORT_WAIT: &str = "ktann.import.wait";
-    pub(crate) const IMPORT_CONCURRENCY_LIMIT: &str = "ktann.import.concurrency.limit";
     pub(crate) const VERIFY_REPORTS: &str = "ktann.verify.reports";
     pub(crate) const VERIFY_ISSUES: &str = "ktann.verify.issues";
 }
@@ -266,21 +263,6 @@ pub(crate) fn bloom_fill_ratio(ratio: f64) {
     metrics::histogram!(names::BLOOM_FILL_RATIO).record(ratio);
 }
 
-/// Records one Import Session admission wait behind one gate.
-pub(crate) fn import_wait(gate: ImportGate, duration: Duration) {
-    metrics::histogram!(names::IMPORT_WAIT, key::GATE => gate.as_str())
-        .record(duration.as_secs_f64());
-}
-
-/// Records one learned Import Session concurrency change and its new limit.
-pub(crate) fn import_concurrency_adjusted(adjustment: ImportConcurrencyAdjustment, limit: usize) {
-    metrics::histogram!(
-        names::IMPORT_CONCURRENCY_LIMIT,
-        key::DIRECTION => adjustment.as_str(),
-    )
-    .record(limit as f64);
-}
-
 /// Records one verification report's completeness and per-kind issue counts.
 pub(crate) fn verify_report(report: &VerifyReport) {
     let completion = if report.complete {
@@ -427,8 +409,6 @@ mod tests {
             fixup_execution(FixupExecution::Settled);
             fixup_state_age(FixupKind::Split, 7_000, 1_000);
             bloom_fill_ratio(0.25);
-            import_wait(ImportGate::Backlog, Duration::from_millis(2));
-            import_concurrency_adjusted(ImportConcurrencyAdjustment::Increased, 2);
             verify_report(&VerifyReport {
                 complete: false,
                 issues: vec![VerifyIssue {
@@ -479,8 +459,6 @@ mod tests {
             names::FIXUP_EXECUTION,
             names::FIXUP_STATE_AGE,
             names::BLOOM_FILL_RATIO,
-            names::IMPORT_WAIT,
-            names::IMPORT_CONCURRENCY_LIMIT,
             names::VERIFY_REPORTS,
             names::VERIFY_ISSUES,
         ] {

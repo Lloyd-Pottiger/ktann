@@ -139,7 +139,7 @@ fields, noncanonical values, nonzero padding, and trailing bytes.
 
 ## 6. Persistent values
 
-The Index Manifest stores the persistent format version (`FORMAT_VERSION = 1`),
+The Index Manifest stores the persistent format version (`FORMAT_VERSION = 2`),
 lifecycle state, immutable configuration, Logical Index ID, RaBitQ rotation
 seed, and exact Bloom parameters. The Persistent Format covers Logical Keys,
 stored values, adapter physical keys, and algorithms that determine persisted
@@ -248,3 +248,36 @@ Codec tests use golden bytes, ordering properties, malformed/noncanonical input,
 and cross-process deterministic vectors for rotation, Bloom, Tree Key, values,
 and RaBitQ7. Model tests assert that typed atomic operations preserve exact
 membership under conflicts and injected unknown outcomes.
+
+
+Bulk Build reservations add lifecycle byte `2` (Building; Active remains `0`,
+Dropping `1`) and index-owned key kind `0x05` for the Build Descriptor. Descriptor
+value tag `0x0d` contains construction version u32, a length-prefixed absolute
+UTF-8 source path (maximum 4096 bytes), a length-prefixed 89-byte input artifact
+manifest, min/max entries u32, and sample/memory/scratch ceilings u64, all big
+endian. Bootstrap transactions may access the descriptor alongside the Manifest
+for atomic reservation. Serving transactions still validate an Active Manifest.
+See [ADR 0026](../adr/0026-building-reservations.md).
+
+The index-owned Build Load key (`0x06`) stores value tag `0x0e`, a sized
+89-byte Serving Artifact manifest, positive u64 epoch, u64 committed-entry
+cursor, 32-byte prefix SHA-256, and canonical completion and sealed bytes. Sealed requires completion. Completion requires cursor == item count and prefix hash == artifact hash.
+This metadata is codec-validated but excluded from serving membership ledgers.
+See the implemented load protocol in [Bulk Build](bulk-build.md).
+
+
+Namespace key `[0, 2] || LogicalIndexId:u64be` stores Build Workspace (tag `0x0f`).
+It survives index-prefix removal. Its canonical value contains a sized absolute
+UTF-8 root (at most 3900 bytes), nine u64 resource/admission/hard-limit values,
+a nonzero 32-byte ownership token, positive u64 epoch, two optional accepted
+artifact descriptors (flag, epoch, sized 89-byte manifest), and a bounded failure
+code. Accepted Forest/Serving kinds and epoch bounds are validated; Serving
+requires Forest. All integer encodings are big endian.
+
+Index key kind `0x07` stores Build Validation (tag `0x10`): sized Serving manifest,
+sized backend scan cursor (at most 16 KiB), compared entries u64, prefix SHA-256,
+and canonical completion byte. Complete requires empty cursor, total entry count
+and full artifact hash. Initial proof requires the artifact-header digest.
+Workspace and proof Debug output redact locators/cursors. These formats have no
+compatibility layer; malformed, trailing and noncanonical bytes fail closed.
+See [ADR 0027](../adr/0027-bulk-workspace-and-publication.md).

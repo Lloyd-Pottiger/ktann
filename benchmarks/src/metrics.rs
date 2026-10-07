@@ -261,25 +261,9 @@ impl CapturedMetrics {
             Distribution::from_samples(values)
         };
         let milliseconds = |name: &str| distribution(name).seconds_to_milliseconds();
-        let import_wait_ms = self
-            .histograms_by_label("ktann.import.wait", "gate")
-            .into_iter()
-            .map(|(gate, values)| {
-                (
-                    gate,
-                    Distribution::from_samples(values).seconds_to_milliseconds(),
-                )
-            })
-            .collect();
         AdmissionSummary {
             blocking_wait_ms: milliseconds("ktann.backend.blocking.wait"),
             blocking_held_ms: milliseconds("ktann.backend.blocking.held"),
-            import_wait_ms,
-            import_concurrency_limit: self
-                .histograms_by_label("ktann.import.concurrency.limit", "direction")
-                .into_iter()
-                .map(|(direction, values)| (direction, Distribution::from_samples(values)))
-                .collect(),
         }
     }
 

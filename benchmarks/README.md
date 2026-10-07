@@ -126,16 +126,33 @@ These import options apply to `--profile large` or an explicitly selected
 | Option | Meaning |
 | --- | --- |
 | `--maintenance-workers N` | Import Runtime maintenance workers; zero is allowed |
-| `--import-max-in-flight-batches N` | Positive Import Session concurrency ceiling |
 | `--import-batch-size N` | Positive records per atomic batch |
-| `--import-backlog-watermark N` | Positive process-local Fixup Backlog watermark |
 
 After immediate search, the lifecycle runner reopens the Logical Index with
 its configured convergence workers, allowing an import with maintenance disabled
-to reach the stable search phases. Import Sessions adapt concurrency below the
-configured ceiling; see [ADR 0022](../docs/adr/0022-feedback-controlled-import-admission.md).
+to reach the stable search phases. Online loads submit batches sequentially; see
+[ADR 0025](../docs/adr/0025-caller-owned-online-batch-submission.md).
 
 ## Measurements
+
+The preparation/construction gate has a separate streaming SIFT probe:
+
+```sh
+cargo run --release -p ktann-benchmarks --bin ktann-bulk-construct -- \
+  "$KTANN_BENCH_DATASET_CACHE/sift1m/sift_base.fvecs" \
+  /path/to/new-output-directory
+```
+
+An optional final argument limits records for a smoke run. The output directory
+must be new. It contains sealed `input/` and `plan/` artifact directories and
+`report.json`, including source SHA-256, options, separate snapshot/construction/
+artifact-verification timings, peak scratch bytes and cumulative scratch writes.
+The probe uses one Tree Key and streams source vectors; payloads and backend IO
+are outside this probe's scope. Completed artifacts can be reopened against saved
+manifests; interrupted sorting runs are recomputed. Source snapshots and final
+artifacts have separate 32 GiB quotas in addition to the sort scratch quota.
+These results cannot establish end-to-end speedup or serving
+recall: loading, validation, publication and query measurements are still required.
 
 Reports contain one tagged payload per scenario: `steady_state`, `lifecycle`,
 or `quality_sweep`. Configuration includes backend mutation limits, physical
@@ -205,9 +222,9 @@ operations; full measures 2,000. Runs outside this region fail validation.
 
 Each lifecycle worker creates a fresh Backend Namespace and Logical Index and
 prepares its dataset, requests, and exact oracle before timing. The continuous
-case starts before the first `ImportSession::submit` and ends after warmed search:
+case starts before the first direct `batch_mutate` call and ends after warmed search:
 
-1. `import` ends after `ImportSession::finish` and includes concurrent maintenance.
+1. `import` ends after completion of all direct batch calls and includes concurrent maintenance.
    Finish is a batch-outcome barrier, not a topology-convergence barrier. The
    scenario fails unless every submitted record is accepted.
 2. `immediate_search` runs the fixed queries before the runner drives convergence.
@@ -273,7 +290,7 @@ readiness probes used by Optimize are separate from measured searches.
 
 Protocol version 1 uses length-prefixed JSON over a Unix socket: a four-byte
 big-endian length, at most 8 MiB per frame, and at most 128 connections. Inserts
-commit at most 50 records per batch and finish the Import Session before success.
+commit at most 50 records per batch and wait for the atomic batch result before success.
 Do not automatically replay unknown outcomes. Optimize verifies the exact record
 count and waits for no actionable or transitional partitions within a deadline.
 
@@ -317,3 +334,38 @@ and search parameters; zero rounds is a centroid-recomputation control. Existing
 bulk-builder research measurements use a different initialization/publication
 pipeline and do not establish quality or performance for this API. Archive the
 executable and source/binary hashes before timing under the shared resource lock.
+
+### Multi-tree Bulk Build preparation probe
+
+The optional fourth argument to `ktann-bulk-construct` selects the forest path:
+`ktann-bulk-construct INPUT.fvecs OUTPUT_DIRECTORY RECORD_LIMIT FOREST_TREES`.
+A positive tree count assigns the original SIFT ordinal modulo that count to an
+I64 Tree Key field; `0` exercises the empty Tree Key through the forest path.
+Omitting this argument preserves the single-tree probe. Forest reports include
+separate global-sort and per-tree scratch peaks/write totals. Their quotas add
+while both stages retain files. The probe verifies sealed topology framing but
+does not measure backend loading, exact serving validation, publication, or recall.
+
+Append `--serving` after `FOREST_TREES` to also execute exact joins and encode a
+serving artifact. This probe uses a synthetic Logical Index ID and explicit
+10,000-byte key / 100,000-byte value limits; it does not reserve or write a real
+backend. The nested `serving` report separates encoding and full-file verification
+time, output bytes, and scratch IO. The sort budget charges actual allocated
+payload capacities and row slots, allowing small and large projections to share
+a byte ceiling without allocating the maximum value size for every row.
+
+
+## Complete Bulk Build probe
+
+`cargo run --release -p ktann-benchmarks --bin ktann-bulk-build -- <sift-directory> <new-output-directory> [record-limit]`
+
+The SIFT directory contains `sift_base.fvecs`, `sift_query.fvecs`, and
+`sift_groundtruth.ivecs`. Default count is 1,000,000. The probe streams a source
+snapshot, reserves a RocksDB index, runs preparation/loading, publishes through
+exact validation, checks point reads, and measures held-out top-10 queries.
+Official recall is reported only for the full population. `report.json` separates
+phase wall times and query latency; use `/usr/bin/time -l` for process resource
+counts on macOS. Reports retain the source and RocksDB database, while successful
+publication reclaims worker-owned artifacts. Run on an idle host; the result is
+not directly comparable to the file-only `ktann-bulk-construct` probe and does not
+establish distributed throughput or an online insertion speedup.

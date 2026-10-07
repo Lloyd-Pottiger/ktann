@@ -78,9 +78,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use ktann::api::{
-    CompareOp, DataType, ErrorKind, FieldId, FieldSchema, ImportOptions, Index, IndexConfig,
-    Metric, Mutation, PartitionKey, Predicate, Record, RuntimeConfig, SearchOptions, SearchRequest,
-    Value,
+    CompareOp, DataType, ErrorKind, FieldId, FieldSchema, Index, IndexConfig, Metric, Mutation,
+    PartitionKey, Predicate, Record, RuntimeConfig, SearchOptions, SearchRequest, Value,
 };
 use ktann::maintenance::merge::{self, Advance as MergeAdvance};
 use ktann::maintenance::split::{self, Advance};
@@ -318,55 +317,21 @@ impl Harness {
             })
             .collect();
 
-        match via {
-            Via::Import => {
-                // Serialized import keeps the corpus deterministic: pipelined
-                // batches inserting into the same leaf legitimately race, and
-                // a bounded-retry exhaustion under that contention is engine
-                // behavior for engine tests, not for this corpus.
-                let options = ImportOptions::default()
-                    .with_max_in_flight_batches(1)
-                    .expect("import options");
-                let mut session = self
+        for chunk in records.chunks(batch_size) {
+            let result = match via {
+                Via::Batch => self
                     .index()
-                    .import_session(options)
-                    .expect("import session");
-                for chunk in records.chunks(batch_size) {
-                    let mutations = chunk.iter().cloned().map(Mutation::Insert).collect();
-                    session.submit(mutations).await.expect("import submit");
+                    .batch_mutate(chunk.iter().cloned().map(Mutation::Insert).collect())
+                    .await
+                    .map(|_| ()),
+                Via::Single => self.index().insert(chunk[0].clone()).await,
+            };
+            match result {
+                Ok(()) => self.accept_model_chunk(chunk),
+                Err(error) if error.kind() == ErrorKind::CommitOutcomeUnknown => {
+                    self.recover_chunk(chunk).await;
                 }
-                for (chunk, result) in records.chunks(batch_size).zip(session.finish().await) {
-                    match result.result {
-                        Ok(outcomes) => {
-                            assert_eq!(outcomes.len(), chunk.len());
-                            self.accept_model_chunk(chunk);
-                        }
-                        Err(error) if error.kind() == ErrorKind::CommitOutcomeUnknown => {
-                            self.recover_chunk(chunk).await;
-                        }
-                        Err(error) => return format!("error: {:?}\n", error.kind()),
-                    }
-                }
-            }
-            Via::Batch | Via::Single => {
-                for chunk in records.chunks(batch_size) {
-                    let result = match via {
-                        Via::Batch => self
-                            .index()
-                            .batch_mutate(chunk.iter().cloned().map(Mutation::Insert).collect())
-                            .await
-                            .map(|_| ()),
-                        Via::Single => self.index().insert(chunk[0].clone()).await,
-                        Via::Import => unreachable!("handled above"),
-                    };
-                    match result {
-                        Ok(()) => self.accept_model_chunk(chunk),
-                        Err(error) if error.kind() == ErrorKind::CommitOutcomeUnknown => {
-                            self.recover_chunk(chunk).await;
-                        }
-                        Err(error) => return format!("error: {:?}\n", error.kind()),
-                    }
-                }
+                Err(error) => return format!("error: {:?}\n", error.kind()),
             }
         }
         let summary = format!("loaded {count} records (dataset={spec}, seed={seed})\n");
@@ -1511,7 +1476,6 @@ impl TreeRule {
 enum Via {
     Batch,
     Single,
-    Import,
 }
 
 impl Via {
@@ -1519,7 +1483,6 @@ impl Via {
         match directive.arg("via").unwrap_or("batch") {
             "batch" => Via::Batch,
             "single" => Via::Single,
-            "import" => Via::Import,
             other => panic!("unknown via `{other}` at line {}", directive.line),
         }
     }

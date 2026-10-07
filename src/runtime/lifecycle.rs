@@ -144,6 +144,16 @@ pub(crate) async fn create_index<B: Backend>(
     config: IndexConfig,
     retry: RetryPolicy,
 ) -> Result<IndexManifest> {
+    reserve_index(context, name, config, None, retry).await
+}
+
+pub(crate) async fn reserve_index<B: Backend>(
+    context: &mut OperationContext<B>,
+    name: IndexName,
+    config: IndexConfig,
+    descriptor: Option<crate::storage::values::BuildDescriptor>,
+    retry: RetryPolicy,
+) -> Result<IndexManifest> {
     let mut failed_attempts = 0_u32;
     loop {
         context.checkpoint()?;
@@ -165,6 +175,13 @@ pub(crate) async fn create_index<B: Backend>(
                 return Err(Error::new(ErrorKind::Corruption));
             };
             let manifest = read_manifest_for_update(&mut txn, entry.logical_index_id()).await?;
+            if let Some(expected) = &descriptor {
+                let stored = txn
+                    .get_for_update(LogicalKey::BuildDescriptor(entry.logical_index_id()))
+                    .await?;
+                txn.rollback().await;
+                return classify_build(manifest, &config, expected, stored);
+            }
             txn.rollback().await;
             return classify_existing(manifest, &config);
         }
@@ -175,7 +192,11 @@ pub(crate) async fn create_index<B: Backend>(
             .ok_or_else(id_exhausted)?;
         let logical_index_id = LogicalIndexId::new(next_high_water).map_err(|_| id_exhausted())?;
         let manifest = IndexManifest::new(
-            IndexLifecycle::Active,
+            if descriptor.is_some() {
+                IndexLifecycle::Building
+            } else {
+                IndexLifecycle::Active
+            },
             logical_index_id,
             config.clone(),
             derive_rotation_seed(logical_index_id),
@@ -202,15 +223,36 @@ pub(crate) async fn create_index<B: Backend>(
         )
         .await?;
 
+        if let Some(descriptor) = &descriptor {
+            txn.put(
+                LogicalKey::BuildDescriptor(logical_index_id),
+                PersistentValue::BuildDescriptor(descriptor.clone()),
+            )
+            .await?;
+        }
+
         match context.commit(move |start| txn.commit_with(start)).await {
             Ok(()) => return Ok(manifest),
             Err(error) if error.kind() == ErrorKind::RetryableAbort => {
                 retry
-                    .wait_or_exhaust(Operation::CreateIndex, &mut failed_attempts)
+                    .wait_or_exhaust(
+                        if descriptor.is_some() {
+                            Operation::StartBulkBuild
+                        } else {
+                            Operation::CreateIndex
+                        },
+                        &mut failed_attempts,
+                    )
                     .await?;
             }
             Err(error) if error.kind() == ErrorKind::CommitOutcomeUnknown => {
-                return recover_create(backend.as_ref(), &name, &config).await;
+                return recover_create(
+                    backend.as_ref(),
+                    &name,
+                    &config,
+                    descriptor.as_ref().map(|d| (logical_index_id, d)),
+                )
+                .await;
             }
             Err(error) => return Err(error),
         }
@@ -221,6 +263,7 @@ async fn recover_create<B: Backend>(
     backend: &B,
     name: &IndexName,
     config: &IndexConfig,
+    build: Option<(LogicalIndexId, &crate::storage::values::BuildDescriptor)>,
 ) -> Result<IndexManifest> {
     let raw = backend.begin_read().await?;
     let mut txn = ReadLogicalTxn::bootstrap(raw);
@@ -231,12 +274,43 @@ async fn recover_create<B: Backend>(
     let PersistentValue::IndexNameEntry(entry) = existing else {
         return Err(Error::new(ErrorKind::Corruption));
     };
+    if build.is_some_and(|(id, _)| id != entry.logical_index_id()) {
+        return Err(Error::new(ErrorKind::CommitOutcomeUnknown));
+    }
     let manifest = read_manifest(&mut txn, entry.logical_index_id()).await?;
+    if let Some((id, expected)) = build {
+        let stored = txn.get(LogicalKey::BuildDescriptor(id)).await?;
+        return classify_build(manifest, config, expected, stored);
+    }
     classify_existing(manifest, config)
+}
+
+fn classify_build(
+    manifest: IndexManifest,
+    config: &IndexConfig,
+    expected: &crate::storage::values::BuildDescriptor,
+    stored: Option<PersistentValue>,
+) -> Result<IndexManifest> {
+    match manifest.lifecycle() {
+        IndexLifecycle::Dropping => Err(Error::new(ErrorKind::IndexDropping)),
+        IndexLifecycle::Active => Err(Error::new(ErrorKind::IndexAlreadyExists)),
+        IndexLifecycle::Building => match stored {
+            Some(PersistentValue::BuildDescriptor(actual))
+                if &actual == expected && manifest.config() == config =>
+            {
+                Ok(manifest)
+            }
+            Some(PersistentValue::BuildDescriptor(_)) => {
+                Err(Error::new(ErrorKind::IndexAlreadyExists))
+            }
+            _ => Err(Error::new(ErrorKind::Corruption)),
+        },
+    }
 }
 
 fn classify_existing(manifest: IndexManifest, config: &IndexConfig) -> Result<IndexManifest> {
     match manifest.lifecycle() {
+        IndexLifecycle::Building => Err(Error::new(ErrorKind::IndexBuilding)),
         IndexLifecycle::Dropping => Err(Error::new(ErrorKind::IndexDropping)),
         IndexLifecycle::Active if manifest.config() == config => Ok(manifest),
         IndexLifecycle::Active => Err(Error::new(ErrorKind::IndexAlreadyExists)),
@@ -262,6 +336,7 @@ pub(crate) async fn open_index<B: Backend>(
     let manifest = read_manifest(&mut txn, entry.logical_index_id()).await?;
     match manifest.lifecycle() {
         IndexLifecycle::Active => Ok(manifest),
+        IndexLifecycle::Building => Err(Error::new(ErrorKind::IndexBuilding)),
         IndexLifecycle::Dropping => Err(Error::new(ErrorKind::IndexDropping)),
     }
 }
@@ -280,6 +355,16 @@ pub(crate) async fn drop_index<B: Backend>(
     context: &mut OperationContext<B>,
     name: IndexName,
     retry: RetryPolicy,
+) -> Result<()> {
+    drop_index_bound(context, name, retry, None).await
+}
+
+/// A build abort can only remove its original, unpublished identity.
+pub(crate) async fn drop_index_bound<B: Backend>(
+    context: &mut OperationContext<B>,
+    name: IndexName,
+    retry: RetryPolicy,
+    build_id: Option<LogicalIndexId>,
 ) -> Result<()> {
     let name_key = LogicalKey::IndexNameDirectory(name);
     let mut cursor: Option<LogicalScanCursor> = None;
@@ -303,8 +388,17 @@ pub(crate) async fn drop_index<B: Backend>(
             return Err(Error::new(ErrorKind::Corruption));
         };
         let manifest = read_manifest_for_update(&mut txn, entry.logical_index_id()).await?;
+        if let Some(id) = build_id {
+            if id != entry.logical_index_id() {
+                txn.rollback().await;
+                return Ok(());
+            }
+            if manifest.lifecycle() == IndexLifecycle::Active {
+                return Err(Error::invalid_argument());
+            }
+        }
         let step = match manifest.lifecycle() {
-            IndexLifecycle::Active => {
+            IndexLifecycle::Active | IndexLifecycle::Building => {
                 let dropping = manifest.with_lifecycle(IndexLifecycle::Dropping);
                 txn.put(
                     LogicalKey::Manifest(manifest.logical_index_id()),
@@ -361,7 +455,8 @@ pub(crate) async fn drop_index<B: Backend>(
                     cursor = None;
                     unknown_attempts += 1;
                     if unknown_attempts >= retry.attempts {
-                        return recover_drop_after_unknown(backend.as_ref(), &name_key).await;
+                        return recover_drop_after_unknown(backend.as_ref(), &name_key, build_id)
+                            .await;
                     }
                 }
                 Err(error) => return Err(error),
@@ -440,7 +535,11 @@ async fn prepare_delete_step<T: WriteTxn>(
     }
 }
 
-async fn recover_drop_after_unknown<B: Backend>(backend: &B, name_key: &LogicalKey) -> Result<()> {
+async fn recover_drop_after_unknown<B: Backend>(
+    backend: &B,
+    name_key: &LogicalKey,
+    build_id: Option<LogicalIndexId>,
+) -> Result<()> {
     let raw = backend.begin_read().await?;
     let mut txn = ReadLogicalTxn::bootstrap(raw);
     let Some(existing) = txn.get(name_key.clone()).await? else {
@@ -449,6 +548,9 @@ async fn recover_drop_after_unknown<B: Backend>(backend: &B, name_key: &LogicalK
     let PersistentValue::IndexNameEntry(entry) = existing else {
         return Err(Error::new(ErrorKind::Corruption));
     };
+    if build_id.is_some_and(|id| id != entry.logical_index_id()) {
+        return Ok(());
+    }
     let _ = read_manifest(&mut txn, entry.logical_index_id()).await?;
     Err(Error::new(ErrorKind::CommitOutcomeUnknown))
 }
@@ -498,6 +600,90 @@ fn derive_rotation_seed(logical_index_id: LogicalIndexId) -> [u8; 32] {
 
 fn id_exhausted() -> Error {
     Error::new(ErrorKind::IdExhausted)
+}
+
+/// Reopens durable request metadata; no source file IO runs on the executor.
+pub(crate) async fn open_build<B: Backend>(
+    context: &mut OperationContext<B>,
+    name: IndexName,
+) -> Result<(IndexManifest, crate::storage::values::BuildDescriptor)> {
+    context.checkpoint()?;
+    let backend = context.backend();
+    let mut txn = ReadLogicalTxn::bootstrap(backend.begin_read().await?);
+    let entry = match txn.get(LogicalKey::IndexNameDirectory(name)).await? {
+        Some(PersistentValue::IndexNameEntry(entry)) => entry,
+        None => return Err(Error::new(ErrorKind::IndexNotFound)),
+        _ => return Err(Error::new(ErrorKind::Corruption)),
+    };
+    let manifest = read_manifest(&mut txn, entry.logical_index_id()).await?;
+    if manifest.lifecycle() == IndexLifecycle::Dropping {
+        return Err(Error::new(ErrorKind::IndexDropping));
+    }
+    let descriptor = match txn
+        .get(LogicalKey::BuildDescriptor(entry.logical_index_id()))
+        .await?
+    {
+        Some(PersistentValue::BuildDescriptor(descriptor)) => descriptor,
+        None if manifest.lifecycle() != IndexLifecycle::Building => {
+            return Err(Error::invalid_argument());
+        }
+        _ => return Err(Error::new(ErrorKind::Corruption)),
+    };
+    Ok((manifest, descriptor))
+}
+
+/// Reads only the original identity; a reused name cannot retarget a job.
+pub(crate) async fn build_status<B: Backend>(
+    context: &mut OperationContext<B>,
+    expected: IndexManifest,
+    descriptor: crate::storage::values::BuildDescriptor,
+) -> Result<crate::api::BulkBuildStatus> {
+    use crate::api::BulkBuildStatus;
+    context.checkpoint()?;
+    let backend = context.backend();
+    let mut txn = ReadLogicalTxn::bootstrap(backend.begin_read().await?);
+    let id = expected.logical_index_id();
+    let manifest = match txn.get(LogicalKey::Manifest(id)).await? {
+        None => return Ok(BulkBuildStatus::Aborted),
+        Some(PersistentValue::IndexManifest(manifest)) => manifest,
+        _ => return Err(Error::new(ErrorKind::Corruption)),
+    };
+    if !manifest.has_same_immutable_identity(&expected) {
+        return Err(Error::new(ErrorKind::Corruption));
+    }
+    // Dropping may already have removed the request descriptor in a prior page.
+    if manifest.lifecycle() == IndexLifecycle::Dropping {
+        return Ok(BulkBuildStatus::Dropping);
+    }
+    match txn.get(LogicalKey::BuildDescriptor(id)).await? {
+        Some(PersistentValue::BuildDescriptor(actual)) if actual == descriptor => {}
+        _ => return Err(Error::new(ErrorKind::Corruption)),
+    }
+    Ok(match manifest.lifecycle() {
+        IndexLifecycle::Building => {
+            if let Some(PersistentValue::BuildWorkspace(w)) =
+                txn.get(LogicalKey::BuildWorkspace(id)).await?
+                && let Some(kind) = w.failure
+            {
+                return Ok(BulkBuildStatus::Failed { kind });
+            }
+            if let Some(PersistentValue::BuildValidation(v)) =
+                txn.get(LogicalKey::BuildValidation(id)).await?
+            {
+                return Ok(BulkBuildStatus::Validating {
+                    verified_entries: v.entries,
+                    total_entries: v.artifact.items(),
+                });
+            }
+            match txn.get(LogicalKey::BuildLoad(id)).await? {
+                None => BulkBuildStatus::Preparing,
+                Some(PersistentValue::BuildLoad(load)) => super::bulk_load::status(&load),
+                _ => return Err(Error::new(ErrorKind::Corruption)),
+            }
+        }
+        IndexLifecycle::Active => BulkBuildStatus::Published,
+        IndexLifecycle::Dropping => unreachable!("handled above"),
+    })
 }
 
 #[cfg(test)]

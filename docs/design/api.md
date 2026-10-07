@@ -31,7 +31,6 @@ impl<B: Backend> Index<B> {
     pub async fn batch_get(&self, ids: Vec<Bytes>, options: GetOptions)
         -> Result<Vec<Option<StoredRecord>>>;
     pub async fn search(&self, request: SearchRequest) -> Result<SearchOutcome>;
-    pub fn import_session(&self, options: ImportOptions) -> Result<ImportSession<B>>;
     pub async fn verify(&self, options: VerifyOptions) -> Result<VerifyReport>;
     pub async fn refine(&self, options: RefineOptions) -> Result<()>;
 }
@@ -52,7 +51,7 @@ they are not normalized. The fixed bound permits create admission to prove
 physical-key limits on both v1 backends.
 
 Create is idempotent for the same name and configuration after an unknown commit
-outcome. Open rejects a Dropping index, unsupported format, backend mismatch, or
+outcome. Open rejects a Building or Dropping index, unsupported format, backend mismatch, or
 configuration mismatch. Drop is idempotent and follows the storage lifecycle.
 
 `Index::refine(options)` prepares an existing Active index after ordinary import
@@ -120,7 +119,7 @@ once. Record Location is never public.
 
 Point reads open one consistent read snapshot and validate the persisted
 Manifest first: an Active Manifest with the handle's exact immutable identity
-proceeds, a Dropping Manifest returns `IndexDropping`, a missing Manifest
+proceeds, a Building Manifest returns `IndexBuilding`, a Dropping Manifest returns `IndexDropping`, a missing Manifest
 returns `IndexNotFound`, and any other mismatch is `Corruption`. Each read then
 loads the requested Record Group — the Vector Record and Record Location pair,
 plus the Opaque Payload when requested — from the same snapshot. An absent
@@ -222,8 +221,6 @@ The v1 defaults and caps are:
 | Leaf beam size | 128 | 16,384 |
 | Write beam size | 8 | 16,384 |
 | Tree Key scan ranges | 1,024 | wider conservative fallback |
-| Import maximum in-flight batches | `min(available_parallelism,4)`, min 1 | positive |
-| Import backlog watermark | 2 | within queue capacity |
 
 Retry backoff starts at 1 ms, doubles to 100 ms, and applies full jitter in the
 current interval.
@@ -263,7 +260,7 @@ starts it is not cancelled; the real result wins.
 
 Errors are non-exhaustive and preserve a diagnostic source. Stable kinds are:
 
-- `InvalidArgument`, `IndexAlreadyExists`, `IndexNotFound`, `IndexDropping`,
+- `InvalidArgument`, `IndexAlreadyExists`, `IndexNotFound`, `IndexBuilding`, `IndexDropping`,
   `RecordAlreadyExists`, and `UnsupportedFormat`;
 - `TransactionTooLarge`, `LimitExceeded`, `ContentionExhausted`,
   `CommitOutcomeUnknown`, and `IdExhausted`;
@@ -282,15 +279,9 @@ commit of unknown outcome.
 
 ## 7. Import and verification shapes
 
-`ImportSession::submit(&mut self, Vec<Mutation>)` waits for local capacity,
-admits exactly one ordinary atomic batch, and returns a unique process-local
-`BatchToken`. Each session starts with one active batch and learns concurrency
-from saturated clean completions and retryable conflicts up to its configured ceiling;
-multiple accepted batches may execute concurrently within that learned bound.
-`finish(self)` waits for all accepted work and returns ordered
-`ImportBatchResult { token, result }` values in submission order. Dropping the
-session cancels work not yet admitted to commit; committing work continues under
-the Runtime's in-flight guard.
+Online loading uses ordinary `Index::batch_mutate` calls with caller-owned bounded
+concurrency and result handling. Repository loaders submit batches sequentially;
+there is no session completion or whole-load atomicity contract.
 
 Verify returns a bounded report with `complete`, coarse issue kinds, safe
 identifiers, and logical-object counts. Options bound issues, objects, memory,
@@ -303,6 +294,36 @@ is no continuation or repair API.
 - Compile tests protect constructors, builder ownership, non-exhaustive enums,
   Send/Sync requirements, and redacted formatting.
 - Focused tests cover record/schema/predicate boundaries, batch ordering,
-  cancellation-before-commit, commit-result priority, search metadata, import
-  token ordering, and lifecycle idempotency.
+  cancellation-before-commit, commit-result priority, search metadata, and lifecycle idempotency.
 - Public tests assert behavior, not private cache, task, or codec structure.
+
+
+## Bulk Build
+
+`Runtime::start_bulk_build(name, input, construction_options)` reserves a hidden
+Building index from a caller-owned immutable `InputSnapshot`; `open_bulk_build`
+recovers its identity-bound `BulkBuildJob`. Identical requests retain the ID.
+The descriptor exposes source identity and construction parameters, with redacted
+Debug output. Reservation itself starts no background worker.
+
+Create an existing durable workspace root and pass `BulkWorkerOptions::new(root)`
+to `job.run_worker`. This prepares accepted Forest and Serving artifacts and
+loads the backend in bounded transactions. Repeating the same options resumes
+accepted work and takes over old worker epochs. `job.publish()` freezes loading,
+performs resumable exact paged validation, and returns the ordinary Active Index.
+Publishing before loading completes returns `BulkBuildBusy`; finish or resume
+loading and retry. Both operations and `status`/`abort` have `_with_control` variants. A failed job
+reports `Failed { kind }` and requires abort/rebuild; cancellation is resumable.
+
+`load_serving` remains a lower-level fenced load primitive. It fixes one immutable
+artifact and commits data plus checkpoints atomically under `BulkLoadOptions` and
+adapter admission limits. A completed load remains hidden; publication also
+requires core worker acceptance of that artifact.
+
+`abort` rejects Active indexes and is idempotent for an absent original ID. Both
+abort and publish attempt owned-file reclamation; a busy workspace defers cleanup.
+Other cleanup failures may be returned after the lifecycle commit, so inspect
+status or retry the same operation. `job.cleanup()` retries reclamation;
+`Runtime::cleanup_bulk_builds(maximum, after)` performs bounded orphan discovery.
+The caller retains source files, workspace root, and its coordination lock file.
+See [Bulk Build](bulk-build.md) for filesystem requirements and recovery semantics.

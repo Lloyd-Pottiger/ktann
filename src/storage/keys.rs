@@ -79,11 +79,15 @@ const SCOPE_INDEX: u8 = 0x01;
 
 const NS_INDEX_ID_ALLOCATOR: u8 = 0x00;
 const NS_INDEX_NAME_DIRECTORY: u8 = 0x01;
+const NS_BUILD_WORKSPACE: u8 = 0x02;
 
 const KIND_MANIFEST: u8 = 0x00;
 const KIND_RECORD_GROUP: u8 = 0x01;
 const KIND_TREE_MANIFEST: u8 = 0x03;
 const KIND_PARTITION: u8 = 0x04;
+const KIND_BUILD_DESCRIPTOR: u8 = 0x05;
+const KIND_BUILD_LOAD: u8 = 0x06;
+const KIND_BUILD_VALIDATION: u8 = 0x07;
 
 const RECORD_VALUE: u8 = 0x00;
 const RECORD_LOCATION: u8 = 0x01;
@@ -114,6 +118,14 @@ pub enum LogicalKey {
     IndexNameDirectory(IndexName),
     /// The Index Manifest of one Logical Index.
     Manifest(LogicalIndexId),
+    /// Immutable input identity and construction parameters of a Bulk Build.
+    BuildDescriptor(LogicalIndexId),
+    /// Fenced progress for loading one sealed serving artifact.
+    BuildLoad(LogicalIndexId),
+    /// Durable workspace ownership and preparation progress, outside index data.
+    BuildWorkspace(LogicalIndexId),
+    /// Checkpoint over sealed backend data.
+    BuildValidation(LogicalIndexId),
     /// A Vector Record.
     Record {
         /// The owning Logical Index ID.
@@ -206,8 +218,11 @@ impl LogicalKey {
     /// Returns the owning Logical Index ID for an index-scoped key.
     pub(crate) const fn index(&self) -> Option<LogicalIndexId> {
         match self {
-            Self::IndexIdAllocator | Self::IndexNameDirectory(_) => None,
-            Self::Manifest(index) => Some(*index),
+            Self::IndexIdAllocator | Self::IndexNameDirectory(_) | Self::BuildWorkspace(_) => None,
+            Self::Manifest(index)
+            | Self::BuildDescriptor(index)
+            | Self::BuildLoad(index)
+            | Self::BuildValidation(index) => Some(*index),
             Self::Record { index, .. }
             | Self::Location { index, .. }
             | Self::Payload { index, .. }
@@ -234,6 +249,10 @@ impl LogicalKey {
             Self::IndexIdAllocator
             | Self::IndexNameDirectory(_)
             | Self::Manifest(_)
+            | Self::BuildDescriptor(_)
+            | Self::BuildLoad(_)
+            | Self::BuildWorkspace(_)
+            | Self::BuildValidation(_)
             | Self::Record { .. }
             | Self::Location { .. }
             | Self::Payload { .. } => None,
@@ -247,6 +266,19 @@ impl fmt::Debug for LogicalKey {
             Self::IndexIdAllocator => formatter.write_str("IndexIdAllocator"),
             Self::IndexNameDirectory(_) => formatter.write_str("IndexNameDirectory([REDACTED])"),
             Self::Manifest(index) => formatter.debug_tuple("Manifest").field(index).finish(),
+            Self::BuildWorkspace(index) => formatter
+                .debug_tuple("BuildWorkspace")
+                .field(index)
+                .finish(),
+            Self::BuildValidation(index) => formatter
+                .debug_tuple("BuildValidation")
+                .field(index)
+                .finish(),
+            Self::BuildLoad(index) => formatter.debug_tuple("BuildLoad").field(index).finish(),
+            Self::BuildDescriptor(index) => formatter
+                .debug_tuple("BuildDescriptor")
+                .field(index)
+                .finish(),
             Self::Record { index, .. } => formatter
                 .debug_struct("Record")
                 .field("index", index)
@@ -447,6 +479,37 @@ pub fn manifest_key(index: LogicalIndexId) -> Vec<u8> {
     bytes
 }
 
+/// The immutable Bulk Build request key for `index`.
+#[must_use]
+pub fn build_descriptor_key(index: LogicalIndexId) -> Vec<u8> {
+    let mut bytes = index_prefix(index);
+    bytes.push(KIND_BUILD_DESCRIPTOR);
+    bytes
+}
+
+/// The fenced serving-load progress key for `index`.
+#[must_use]
+pub fn build_load_key(index: LogicalIndexId) -> Vec<u8> {
+    let mut bytes = index_prefix(index);
+    bytes.push(KIND_BUILD_LOAD);
+    bytes
+}
+
+/// Namespace-owned workspace ledger key; survives index-prefix removal.
+#[must_use]
+pub fn build_workspace_key(index: LogicalIndexId) -> Vec<u8> {
+    let mut bytes = vec![SCOPE_NAMESPACE, NS_BUILD_WORKSPACE];
+    bytes.extend_from_slice(&index.get().to_be_bytes());
+    bytes
+}
+/// The sealed backend validation checkpoint key.
+#[must_use]
+pub fn build_validation_key(index: LogicalIndexId) -> Vec<u8> {
+    let mut bytes = index_prefix(index);
+    bytes.push(KIND_BUILD_VALIDATION);
+    bytes
+}
+
 /// The Vector Record key for `id` in `index`.
 pub fn record_key(index: LogicalIndexId, id: &Bytes) -> Result<Vec<u8>> {
     let mut bytes = record_group_prefix(index, id)?;
@@ -569,6 +632,10 @@ pub(crate) fn encode_key(key: &LogicalKey) -> Result<Vec<u8>> {
         LogicalKey::IndexIdAllocator => Ok(index_id_allocator_key()),
         LogicalKey::IndexNameDirectory(name) => Ok(name_directory_key(name)),
         LogicalKey::Manifest(index) => Ok(manifest_key(*index)),
+        LogicalKey::BuildDescriptor(index) => Ok(build_descriptor_key(*index)),
+        LogicalKey::BuildLoad(index) => Ok(build_load_key(*index)),
+        LogicalKey::BuildWorkspace(index) => Ok(build_workspace_key(*index)),
+        LogicalKey::BuildValidation(index) => Ok(build_validation_key(*index)),
         LogicalKey::Record { index, id } => record_key(*index, id),
         LogicalKey::Location { index, id } => location_key(*index, id),
         LogicalKey::Payload { index, id } => payload_key(*index, id),
@@ -627,6 +694,10 @@ pub fn decode_key(types: &[DataType], key: &Bytes) -> Result<LogicalKey> {
 fn decode_namespace_key(body: &[u8]) -> Result<LogicalKey> {
     match body.first() {
         Some(&NS_INDEX_ID_ALLOCATOR) if body.len() == 1 => Ok(LogicalKey::IndexIdAllocator),
+        Some(&NS_BUILD_WORKSPACE) if body.len() == 9 => Ok(LogicalKey::BuildWorkspace(
+            LogicalIndexId::new(u64::from_be_bytes(body[1..].try_into().expect("fixed id")))
+                .map_err(|_| corrupt())?,
+        )),
         Some(&NS_INDEX_NAME_DIRECTORY) => {
             Ok(LogicalKey::IndexNameDirectory(decode_name(&body[1..])?))
         }
@@ -643,6 +714,15 @@ fn decode_index_key(types: &[DataType], key: &Bytes, offset: usize) -> Result<Lo
     let rest = offset + LOGICAL_INDEX_ID_BYTES + 1;
 
     match kind {
+        KIND_BUILD_VALIDATION if body.len() == LOGICAL_INDEX_ID_BYTES + 1 => {
+            Ok(LogicalKey::BuildValidation(index))
+        }
+        KIND_BUILD_LOAD if body.len() == LOGICAL_INDEX_ID_BYTES + 1 => {
+            Ok(LogicalKey::BuildLoad(index))
+        }
+        KIND_BUILD_DESCRIPTOR if body.len() == LOGICAL_INDEX_ID_BYTES + 1 => {
+            Ok(LogicalKey::BuildDescriptor(index))
+        }
         KIND_MANIFEST if body.len() == LOGICAL_INDEX_ID_BYTES + 1 => {
             Ok(LogicalKey::Manifest(index))
         }

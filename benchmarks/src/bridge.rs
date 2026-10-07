@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use ktann::api::{
-    CompareOp, DataType, FieldId, FieldSchema, ImportOptions, Index, IndexConfig, Metric, Mutation,
+    CompareOp, DataType, FieldId, FieldSchema, Index, IndexConfig, Metric, Mutation,
     OperationOptions, Predicate, Record, RuntimeConfig, SearchOptions, SearchRequest,
     Value as FieldValue,
 };
@@ -477,15 +477,9 @@ impl<B: Backend> Service<B> {
                 }
                 let start = Instant::now();
                 state.started.get_or_insert(start);
-                let mut session = index
-                    .import_session(ImportOptions::default())
-                    .map_err(api_error)?;
-                session.submit(mutations).await.map_err(api_error)?;
-                let outcomes = session.finish().await;
+                let outcome = index.batch_mutate(mutations).await;
                 state.insert_seconds += start.elapsed().as_secs_f64();
-                for outcome in outcomes {
-                    outcome.result.map_err(api_error)?;
-                }
+                outcome.map_err(api_error)?;
                 state.records += ids.len() as u64;
                 if let Some(probe) = root_probe {
                     state.root_probe = Some(probe);
@@ -684,8 +678,6 @@ impl<B: Backend> Service<B> {
                 "foreground_limit": runtime_config.foreground_operation_limit(),
                 "foreground_attempts": runtime_config.foreground_attempts(),
                 "fixup_attempts": runtime_config.fixup_attempts(),
-                "import_max_in_flight_batches": runtime_config.import_max_in_flight_batches(),
-                "import_backlog_watermark": runtime_config.import_backlog_watermark(),
                 "readiness_header_slot_limit": 262144, "readiness_probe_limit": 32,
                 "readiness_stall_seconds": 5, "readiness_probe_interval_seconds": 30,
                 "readiness_probe_leaf_beam": 1, "readiness_probe_partition_budget": 128

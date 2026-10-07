@@ -30,11 +30,11 @@ application with the storage backend that fits your deployment.
   partition visits, and exact reranking. Results expose budget truncation;
   runtime admission, caches, queues, retries, and maintenance concurrency are
   bounded too.
-- **Operations are part of the design.** Adaptive bulk-import admission,
+- **Operations are part of the design.** Bounded batch mutations,
   read-only index verification, metrics, tracing, and graceful shutdown support
   the full lifecycle of an index.
 
-The core library, all three storage adapters, search, online maintenance, import,
+The core library, all three storage adapters, search, online maintenance, batch loading,
 and verification are implemented. KTANN is pre-1.0: APIs and persistent formats
 may change, and there is no stable release yet.
 
@@ -159,3 +159,16 @@ format, and operational invariants.
 ## License
 
 Licensed under the [MIT License](LICENSE).
+
+
+### Initial Bulk Build
+
+For a finite initial dataset, write an immutable `bulk::InputSnapshot`, reserve
+with `Runtime::start_bulk_build`, and call `BulkBuildJob::run_worker` with an
+existing durable workspace. `publish` performs resumable exact backend validation
+and returns the ordinary Active `Index`. The name remains unavailable to reads
+and online mutations until publication. Reopen a job with `open_bulk_build` to
+resume, or abort it and reclaim its owned files. See the [API contract](docs/design/api.md#bulk-build)
+and [recovery design](docs/design/bulk-build.md) for options, filesystem semantics,
+and bounded cleanup. This is an explicit worker API, without an automatic
+multi-host scheduler.

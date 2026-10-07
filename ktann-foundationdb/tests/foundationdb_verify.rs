@@ -55,7 +55,6 @@ async fn foundationdb_verify_completes_within_one_snapshot() {
         backend,
         RuntimeConfig::default()
             .with_maintenance(0, 1)
-            .and_then(|config| config.with_import_limits(1, 1))
             .expect("valid maintenance config"),
     )
     .expect("runtime");
@@ -98,4 +97,27 @@ async fn foundationdb_verify_completes_within_one_snapshot() {
         BackendNamespace::new("ktann-issue-35-verify").expect("namespace"),
     );
     clear_test_keys(&cleanup).await;
+}
+
+#[path = "../../tests/support/bulk_load_adapter.rs"]
+mod bulk_load_adapter;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a local FoundationDB 7.3 client and cluster"]
+async fn foundationdb_fenced_bulk_load_survives_reopen() {
+    let _network = boot_foundationdb();
+    let cluster_file = std::env::var("FDB_CLUSTER_FILE").ok();
+    let backend = || {
+        FoundationDbBackend::new(
+            Database::new(cluster_file.as_deref()).unwrap(),
+            BackendNamespace::new("ktann-bulk-load-verify").unwrap(),
+        )
+    };
+    clear_test_keys(&backend()).await;
+    let directory =
+        std::env::temp_dir().join(format!("ktann-fdb-bulk-load-{}", std::process::id()));
+    std::fs::create_dir(&directory).unwrap();
+    bulk_load_adapter::exercise(backend, &directory).await;
+    clear_test_keys(&backend()).await;
+    std::fs::remove_dir_all(directory).unwrap();
 }

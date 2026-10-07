@@ -115,7 +115,7 @@ impl TreeKey {
     /// Malformed, truncated, noncanonical, overlong, or trailing bytes fail as
     /// [`ErrorKind::Corruption`]. The Tree Key borrows `bytes` instead of
     /// copying it.
-    pub(super) fn from_encoded(types: &[DataType], bytes: Bytes) -> Result<Self> {
+    pub(crate) fn from_encoded(types: &[DataType], bytes: Bytes) -> Result<Self> {
         check_complete(types, &bytes)?;
         Ok(Self(bytes))
     }

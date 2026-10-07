@@ -28,7 +28,9 @@ default = []
 
 [dependencies]
 bytes = "1"
+getrandom = "0.3"
 metrics = "0.24"
+sha2 = "0.10"
 sysinfo = { version = "0.36.1", default-features = false, features = ["system"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }

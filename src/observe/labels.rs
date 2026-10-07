@@ -24,10 +24,6 @@ pub(crate) mod key {
     pub(crate) const RESULT: &str = "result";
     /// The Fixup state machine or verification issue kind.
     pub(crate) const KIND: &str = "kind";
-    /// One Import Session admission gate.
-    pub(crate) const GATE: &str = "gate";
-    /// One adaptive-control direction.
-    pub(crate) const DIRECTION: &str = "direction";
 }
 
 /// One measured search stage (key `stage`).
@@ -77,6 +73,22 @@ impl MutationStage {
 pub(crate) enum Operation {
     /// `Runtime::create_index`.
     CreateIndex,
+    /// Bulk Build lifecycle operation.
+    AbortBulkBuild,
+    /// Bulk Build lifecycle operation.
+    BulkBuildStatus,
+    /// Bulk Build lifecycle operation.
+    OpenBulkBuild,
+    /// Bulk Build lifecycle operation.
+    StartBulkBuild,
+    /// Fenced serving artifact loading.
+    LoadBulkBuild,
+    /// Durable preparation and loading.
+    RunBulkBuild,
+    /// Sealed validation and atomic publication.
+    PublishBulkBuild,
+    /// Reclaim build-owned files.
+    CleanupBulkBuild,
     /// `Runtime::refine`.
     Refine,
     /// `Runtime::open_index`.
@@ -89,7 +101,7 @@ pub(crate) enum Operation {
     Upsert,
     /// `Index::delete`.
     Delete,
-    /// `Index::batch_mutate`, including one Import Session batch.
+    /// `Index::batch_mutate`.
     BatchMutate,
     /// `Index::get`.
     Get,
@@ -110,6 +122,14 @@ impl Operation {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::CreateIndex => "create_index",
+            Self::AbortBulkBuild => "abort_bulk_build",
+            Self::BulkBuildStatus => "bulk_build_status",
+            Self::OpenBulkBuild => "open_bulk_build",
+            Self::StartBulkBuild => "start_bulk_build",
+            Self::LoadBulkBuild => "load_bulk_build",
+            Self::RunBulkBuild => "run_bulk_build",
+            Self::PublishBulkBuild => "publish_bulk_build",
+            Self::CleanupBulkBuild => "cleanup_bulk_build",
             Self::Refine => "refine",
             Self::OpenIndex => "open_index",
             Self::DropIndex => "drop_index",
@@ -202,6 +222,9 @@ pub(crate) const fn error_kind(kind: ErrorKind) -> &'static str {
     match kind {
         ErrorKind::InvalidArgument => "invalid_argument",
         ErrorKind::IndexAlreadyExists => "index_already_exists",
+        ErrorKind::IndexBuilding => "index_building",
+        ErrorKind::BulkBuildSuperseded => "bulk_build_superseded",
+        ErrorKind::BulkBuildBusy => "bulk_build_busy",
         ErrorKind::IndexNotFound => "index_not_found",
         ErrorKind::IndexDropping => "index_dropping",
         ErrorKind::RecordAlreadyExists => "record_already_exists",
@@ -401,44 +424,6 @@ impl FixupExecution {
     }
 }
 
-/// One Import Session admission gate (key `gate`).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ImportGate {
-    /// The bounded in-flight batch slot.
-    InFlightSlot,
-    /// The maintenance backlog watermark.
-    Backlog,
-}
-
-impl ImportGate {
-    /// The bounded label value.
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::InFlightSlot => "in_flight_slot",
-            Self::Backlog => "backlog",
-        }
-    }
-}
-
-/// One adaptive Import Session concurrency change (key `direction`).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ImportConcurrencyAdjustment {
-    /// A clean completion window admitted one more concurrent batch.
-    Increased,
-    /// Retryable contention contracted the active batch window.
-    Decreased,
-}
-
-impl ImportConcurrencyAdjustment {
-    /// The bounded label value.
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Increased => "increased",
-            Self::Decreased => "decreased",
-        }
-    }
-}
-
 /// The completeness outcome of one verification report (key `outcome`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum VerifyCompletion {
@@ -497,6 +482,14 @@ mod tests {
     fn label_values_are_bounded_snake_case() {
         assert_bounded(&[
             Operation::CreateIndex.as_str(),
+            Operation::StartBulkBuild.as_str(),
+            Operation::LoadBulkBuild.as_str(),
+            Operation::RunBulkBuild.as_str(),
+            Operation::PublishBulkBuild.as_str(),
+            Operation::CleanupBulkBuild.as_str(),
+            Operation::OpenBulkBuild.as_str(),
+            Operation::BulkBuildStatus.as_str(),
+            Operation::AbortBulkBuild.as_str(),
             Operation::OpenIndex.as_str(),
             Operation::DropIndex.as_str(),
             Operation::Insert.as_str(),
@@ -529,6 +522,8 @@ mod tests {
             OperationOutcome::Ok.as_str(),
             error_kind(ErrorKind::InvalidArgument),
             error_kind(ErrorKind::IndexAlreadyExists),
+            error_kind(ErrorKind::IndexBuilding),
+            error_kind(ErrorKind::BulkBuildSuperseded),
             error_kind(ErrorKind::IndexNotFound),
             error_kind(ErrorKind::IndexDropping),
             error_kind(ErrorKind::RecordAlreadyExists),
@@ -568,8 +563,6 @@ mod tests {
             FixupExecution::Stalled.as_str(),
             FixupExecution::Yielded.as_str(),
             FixupExecution::Retired.as_str(),
-            ImportGate::InFlightSlot.as_str(),
-            ImportGate::Backlog.as_str(),
             VerifyCompletion::Complete.as_str(),
             VerifyCompletion::Incomplete.as_str(),
             verify_issue(VerifyIssueKind::InvalidEncoding),

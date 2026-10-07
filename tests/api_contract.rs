@@ -7,10 +7,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use ktann::api::{
-    CompareOp, DataType, Error, ErrorKind, FieldId, FieldSchema, ImportOptions, IndexConfig,
-    IndexName, Metric, Mutation, PayloadProjection, Predicate, Record, RuntimeConfig,
-    SearchBudgets, SearchHit, SearchOptions, SearchRequest, SynopsisConfig, Value, VerifyOptions,
-    validate_mutations,
+    CompareOp, DataType, Error, ErrorKind, FieldId, FieldSchema, IndexConfig, IndexName, Metric,
+    Mutation, PayloadProjection, Predicate, Record, RuntimeConfig, SearchBudgets, SearchHit,
+    SearchOptions, SearchRequest, SynopsisConfig, Value, VerifyOptions, validate_mutations,
 };
 
 fn assert_invalid<T>(result: ktann::api::Result<T>) {
@@ -274,7 +273,6 @@ fn search_rejects_invalid_k_dimension_and_budgets() -> ktann::api::Result<()> {
 
 #[test]
 fn runtime_and_verify_limits_fail_closed() {
-    assert_eq!(RuntimeConfig::default().import_backlog_watermark(), 2);
     assert_eq!(RuntimeConfig::default().write_beam_size(), 4);
     assert_invalid(RuntimeConfig::default().with_stalled_timeout(std::time::Duration::ZERO));
     let recovery_index = IndexConfig::new(1, Metric::L2)
@@ -314,7 +312,7 @@ fn runtime_and_verify_limits_fail_closed() {
     assert_invalid(RuntimeConfig::default().with_maintenance(2, 1));
     assert_invalid(RuntimeConfig::default().with_maintenance(0, 0));
     // Zero workers disables background maintenance scheduling; the queue
-    // capacity bound still applies and must cover the import watermark.
+    // capacity bound still applies.
     assert_eq!(
         RuntimeConfig::default()
             .with_maintenance(0, 1_024)
@@ -322,19 +320,6 @@ fn runtime_and_verify_limits_fail_closed() {
             .maintenance_workers(),
         0
     );
-    let unsafe_import_limits = RuntimeConfig::default()
-        .with_import_limits(1, 1_025)
-        .expect("builder defers cross-setting validation");
-    assert_invalid(unsafe_import_limits.validate());
-    assert_invalid(ImportOptions::default().with_max_in_flight_batches(0));
-    assert_eq!(
-        ImportOptions::default()
-            .with_max_in_flight_batches(2)
-            .expect("positive in-flight override")
-            .max_in_flight_batches(),
-        Some(2)
-    );
-    assert_eq!(ImportOptions::default().max_in_flight_batches(), None);
     assert_invalid(VerifyOptions::default().with_issue_limit(10_001));
     assert_invalid(VerifyOptions::default().with_memory_limit_bytes(1_073_741_825));
 }

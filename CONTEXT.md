@@ -133,25 +133,19 @@ _Avoid_: Periodic repair scan, durable job queue
 A bounded read-only audit of one Logical Index's persistent invariants that either completes within one backend snapshot or returns no cross-snapshot conclusion.
 _Avoid_: Search-time validation, automatic repair
 
-**Import Session**:
-A process-local scheduler that submits ordinary batch Foreground Mutations in bounded waves while applying Structure Maintenance backpressure.
-_Avoid_: Bulk-build generation, atomic whole-import transaction
+**Input Snapshot**:
+A finite immutable source of complete Records for Bulk Build preparation, identified by a schema-bound, checksummed manifest. It is not a backend transaction snapshot or a serving Logical Index.
+
+**Construction Artifact**:
+An immutable, sealed output of construction work, identified independently of its filesystem location. A single-tree topology artifact contains partition plans; it does not by itself establish serving membership or authorize publication.
 
 **Offline Refinement**:
 A caller-exclusive preparation operation on a settled Active Logical Index before serving. It improves leaf assignments and centroids under capacity constraints while preserving Partition Keys, topology and exact membership. Errors can leave a valid, partially refined index.
 _Avoid_: Bulk Construction, Building Index, atomic whole-operation refinement
 
-**Import Admission**:
-The process-local decision that accepts one validated Import Session batch when learned write capacity and the Fixup Backlog permit it.
-_Avoid_: Import commit, topology barrier
-
 **Fixup Backlog**:
-The process-local count of pending plus running actionable Fixups used to apply Structure Maintenance backpressure.
+The process-local count of pending plus running actionable Fixups used to observe bounded Structure Maintenance work.
 _Avoid_: Partition count, convergence state
-
-**Batch Token**:
-An Import Session receipt identifying one accepted mutation batch whose ordered outcomes are collected when the session finishes.
-_Avoid_: Transaction ID, durable job ID
 
 ## Relationships
 
@@ -178,10 +172,7 @@ _Avoid_: Transaction ID, durable job ID
 - A **Fixup Worker** may advance **Structure Maintenance** for any **Logical Index**
 - **Demand-Driven Maintenance** may leave a cold partition in a searchable intermediate topology state indefinitely
 - **Index Verification** may run concurrently with Foreground Mutations and never changes persistent data
-- An **Import Session** changes neither Foreground Mutation atomicity nor persistent Logical Index lifecycle
-- **Import Admission** learns useful batch concurrency from observed write contention and pauses when the **Fixup Backlog** reaches its configured watermark
 - A **Fixup Backlog** is neither a durable maintenance queue nor evidence that topology has converged
-- An **Import Session** issues one **Batch Token** for each accepted mutation batch and reports those batch outcomes in submission order
 - A **Leaf Partition** crossing its **Split Threshold** makes Structure Maintenance actionable without making the partition unsearchable
 - A **Search Outcome** may vary with searchable topology shape and Search Budget even when exact membership is unchanged
 - A filtered search returns at most its requested number of **Vector Records** within its **Search Budget**
@@ -189,16 +180,50 @@ _Avoid_: Transaction ID, durable job ID
 ## Contract clarifications
 
 - Foreground Mutations change records atomically; Structure Maintenance changes
-  topology asynchronously. Import Sessions schedule ordinary Foreground Mutations.
+  topology asynchronously. Online loaders submit ordinary bounded atomic batches.
 - The Split Threshold triggers maintenance; it is not a synchronous hard bound
   on partition size. A mutation can retry after a topology conflict.
 - Every committed intermediate topology of an Active Logical Index remains searchable.
   After a worker stops, maintenance resumes when a relevant access discovers pending work.
-- Import Admission uses observed contention and the Fixup Backlog. Partition
-  count alone does not establish independent write capacity.
+- Online callers own bounded batch concurrency and result handling; there is no
+  process-local session scheduler or whole-load atomicity contract.
 - A Vector Record is owned and encoded by KTANN, not a host application's
   business row. An Opaque Payload is separate from searchable fields.
 - Exact Filter Predicates determine which hits qualify. Conservative Partition
   Synopses only prune work and never replace exact filtering.
 - A Sharded Forest contains disjoint records, not replicated recall trees.
 - Structure Maintenance requires no global owner or lease.
+
+### Bulk Build Reservation
+
+A durable name and Logical Index ID held by a Building Manifest, with a separate
+immutable Build Descriptor identifying the caller-owned input snapshot and
+construction parameters. Ordinary operations reject Building. Job handles bind
+the never-reused ID; abort cannot follow a reused name or remove a published index.
+Reservation itself launches no work; `run_worker` prepares/loads and `publish`
+validates and activates the index.
+
+**Forest Artifact**: A sealed, caller-owned topology artifact for every nonempty
+Tree Key in one finite Input Snapshot. Preparation rejects globally duplicate
+Record IDs before constructing trees. It carries no backend loading or publication
+authority; exact serving-membership validation is still required.
+
+**Serving Artifact**: A sealed, sorted file of canonical serving KV pairs for a
+specific Logical Index identity, produced by exact source/assignment and topology
+joins. It preserves source records and payloads and uses the online projection
+codecs. It excludes lifecycle bookkeeping and conveys no loading or publication
+authority; sealed backend validation is still required.
+
+**Build Load**: The single fenced task that loads one immutable Serving Artifact
+into a hidden Building index. Its epoch rejects superseded workers, and its
+entry cursor commits atomically with each data chunk. Loaded means the artifact
+stream finished; it is not sealed backend validation or permission to publish.
+
+
+**Build Workspace**: Namespace-scoped durable ownership of one job's token-named
+preparation directory, options, epoch, accepted artifacts and terminal failure.
+It survives removal of the index prefix until exclusive-lock cleanup completes.
+
+**Build Validation**: A paged exact comparison proof between a core-accepted
+Serving Artifact and frozen backend serving KV bytes. The completed proof and
+sealed Build Load authorize one atomic transition from Building to Active.

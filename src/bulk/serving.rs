@@ -1,0 +1,752 @@
+//! Exact external joins from finite source and topology to serving key/value bytes.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use bytes::{Buf, Bytes};
+use sha2::{Digest, Sha256};
+
+use crate::api::{Error, ErrorKind, PartitionKey, Result};
+use crate::search::numeric::VectorKernel;
+use crate::search::rabitq::RaBitQ7;
+use crate::storage::backend::HardLimits;
+use crate::storage::keys::{self, LogicalKey, TreeKey};
+use crate::storage::values::{
+    ChildEntry, IndexLifecycle, IndexManifest, LeafEntry, MAX_VALUE_BYTES, OpaquePayload,
+    PartitionCentroid, PartitionHeader, PartitionState, PartitionSynopsis, PartitionTransition,
+    PersistentValue, RecordLocation, TreeManifest, ValueCodec, VectorRecord, source,
+};
+
+use super::files::{ArtifactManifest, Reader, Writer, corrupt, io_error};
+use super::sort::{Row, Sorter, Space};
+use super::{ForestArtifact, InputSnapshot};
+
+// The largest logical key has a full Tree Key, an escaped Record ID, and
+// fixed identity/discriminator components. Leave room for scratch stream tags.
+const MAX_KEY: usize = keys::MAX_TREE_KEY_BYTES + 2 * keys::MAX_RECORD_ID_BYTES + 64;
+const MAX_ROW: usize = 8 + MAX_KEY + MAX_VALUE_BYTES + 1;
+
+/// Resource ceilings and target adapter limits for serving-value preparation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ServingOptions {
+    /// One external sort's allocated buffers, including bounded merge readers.
+    /// Source/value decoding and one Synopsis are separately codec-bounded.
+    pub memory_bytes: usize,
+    /// All simultaneous scratch runs, including retained join inputs.
+    pub scratch_bytes: u64,
+    /// Adapter-declared logical key and value limits, checked before sealing.
+    pub hard_limits: HardLimits,
+}
+
+/// Counts and scratch evidence from successfully encoded serving data.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ServingReport {
+    /// Exactly joined original records and leaf assignments.
+    pub records: u64,
+    /// Validated partitions, each with exactly one root path.
+    pub partitions: u64,
+    /// Encoded serving key/value pairs, excluding lifecycle bookkeeping.
+    pub keys: u64,
+    /// Peak simultaneous scratch bytes over all passes.
+    pub peak_scratch_bytes: u64,
+    /// Total scratch writes, including merge passes.
+    pub scratch_written_bytes: u64,
+}
+
+/// One canonical logical key and value, before adapter namespace encoding.
+/// This value conveys no authority to write Building data or publish an index.
+pub struct ServingEntry {
+    /// Canonical index-owned logical key bytes.
+    pub key: Bytes,
+    /// Canonical value bytes validated against the target Index Manifest.
+    pub value: Bytes,
+}
+
+/// A sealed, sorted serving-data artifact for one immutable Logical Index.
+///
+/// Creation proves exact source/leaf membership and parent/child relationships
+/// through external joins, then encodes all serving values through core codecs.
+/// It excludes the Manifest, name directory, allocator and build bookkeeping.
+/// Loading must still fence each transaction and validate the sealed backend
+/// before publication; this artifact does not grant either authority.
+#[derive(Clone)]
+pub struct ServingArtifact {
+    directory: PathBuf,
+    artifact: ArtifactManifest,
+    index: IndexManifest,
+    limits: HardLimits,
+    source: ArtifactManifest,
+    construction: crate::construction::ConstructionOptions,
+}
+
+impl ServingArtifact {
+    /// Reopens an identity accepted by the fenced core preparation worker.
+    pub(crate) fn accepted(
+        directory: &Path,
+        artifact: ArtifactManifest,
+        index: &IndexManifest,
+        descriptor: &crate::storage::values::BuildDescriptor,
+        limits: HardLimits,
+    ) -> Result<Self> {
+        let value = Self {
+            directory: directory.to_owned(),
+            artifact,
+            index: index.clone(),
+            limits,
+            source: descriptor.input().clone(),
+            construction: descriptor.options(),
+        };
+        value.reader()?;
+        Ok(value)
+    }
+
+    pub(crate) fn matches_build(
+        &self,
+        index: &IndexManifest,
+        descriptor: &crate::storage::values::BuildDescriptor,
+    ) -> bool {
+        self.index.has_same_immutable_identity(index)
+            && self.source == *descriptor.input()
+            && self.construction == descriptor.options()
+    }
+
+    /// Synchronously encodes a complete forest into a new caller-owned directory.
+    ///
+    /// Input and forest identities must match the target configuration and seed.
+    /// Memory is independent of total records and trees. The scratch quota
+    /// covers every join/sort run; `maximum_bytes` separately bounds final data
+    /// and its manifest. Failed directories remain unsealed and caller owned.
+    pub fn build(
+        directory: &Path,
+        input: &InputSnapshot,
+        forest: &ForestArtifact,
+        index: &IndexManifest,
+        options: ServingOptions,
+        maximum_bytes: u64,
+    ) -> Result<(Self, ServingReport)> {
+        validate(directory, input, forest, index, options)?;
+        let codec = ValueCodec::for_index(index);
+        let id = index.logical_index_id();
+        let mut writer = Writer::new(
+            directory,
+            3,
+            binding(input, forest, index, options)?,
+            maximum_bytes,
+        )?;
+        let scratch = directory.join("scratch");
+        let mut space = Space::new(&scratch, options.scratch_bytes, MAX_ROW)?;
+        let mut records = Sorter::new(&mut space, options.memory_bytes)?;
+        for record in input.reader()? {
+            let record = record?;
+            records.push(Row {
+                key: record.id().to_vec(),
+                value: source::encode(index.config(), record)?,
+            })?;
+        }
+        let record_run = records.finish()?;
+        let mut topology = Sorter::new(&mut space, options.memory_bytes)?;
+        for row in forest.reader()? {
+            let row = row?;
+            let plan = row.partition;
+            let node_key = keys::header_key(id, &row.tree_key, plan.key);
+            let mut meta = Vec::with_capacity(9 + 4 * index.config().dimension());
+            meta.push(0);
+            meta.extend_from_slice(&plan.level.to_be_bytes());
+            meta.extend_from_slice(&(plan.entries.len() as u32).to_be_bytes());
+            for component in &plan.centroid {
+                meta.extend_from_slice(&component.to_bits().to_be_bytes());
+            }
+            topology.push(Row {
+                key: tagged(1, &node_key),
+                value: meta,
+            })?;
+            for entry in plan.entries {
+                if plan.level == 1 {
+                    topology.push(Row {
+                        key: tagged(0, &entry),
+                        value: node_key.clone(),
+                    })?;
+                } else {
+                    let child = PartitionKey::new(u64::from_be_bytes(
+                        entry.as_ref().try_into().map_err(|_| corrupt())?,
+                    ))
+                    .map_err(|_| corrupt())?;
+                    let mut parent = Vec::with_capacity(13);
+                    parent.push(1);
+                    parent.extend_from_slice(&plan.key.get().to_be_bytes());
+                    parent.extend_from_slice(&plan.level.to_be_bytes());
+                    topology.push(Row {
+                        key: tagged(1, &keys::header_key(id, &row.tree_key, child)),
+                        value: parent,
+                    })?;
+                }
+            }
+        }
+        let topology_run = topology.finish()?;
+        let mut records = space.reader(&record_run)?;
+        let mut topology = space.reader(&topology_run)?;
+        let mut next = topology.next()?;
+        let mut output = Sorter::new(&mut space, options.memory_bytes)?;
+        let kernel = VectorKernel::new(
+            index.config().dimension(),
+            index.config().metric(),
+            *index.rotation_seed(),
+        )?;
+        let (types, count) = index.tree_key_types();
+        let types = &types[..count];
+        let mut report = ServingReport::default();
+        let mut previous = None;
+        while let Some(record) = records.next()? {
+            if previous.as_ref() == Some(&record.key) {
+                return Err(Error::new(ErrorKind::RecordAlreadyExists));
+            }
+            previous = Some(record.key.clone());
+            let assignment = next.take().ok_or_else(corrupt)?;
+            if assignment.key != tagged(0, &record.key) {
+                return Err(corrupt());
+            }
+            let (tree, leaf) = node(&assignment.value, index)?;
+            let record = source::decode(index.config(), Bytes::from(record.value))?;
+            let values = index
+                .config()
+                .tree_key_fields()
+                .iter()
+                .map(|field| record.fields()[field.0 as usize].clone())
+                .collect::<Vec<_>>();
+            if TreeKey::encode(types, &values)? != tree {
+                return Err(corrupt());
+            }
+            let record_id = record.id().clone();
+            emit(
+                &mut output,
+                codec,
+                options.hard_limits,
+                LogicalKey::Record {
+                    index: id,
+                    id: record_id.clone(),
+                },
+                PersistentValue::VectorRecord(VectorRecord::new(
+                    record_id.clone(),
+                    Box::from(record.vector()),
+                    Box::from(record.fields()),
+                )),
+            )?;
+            emit(
+                &mut output,
+                codec,
+                options.hard_limits,
+                LogicalKey::Location {
+                    index: id,
+                    id: record_id.clone(),
+                },
+                PersistentValue::RecordLocation(RecordLocation::new(tree.clone(), leaf)),
+            )?;
+            if let Some(payload) = record.payload() {
+                emit(
+                    &mut output,
+                    codec,
+                    options.hard_limits,
+                    LogicalKey::Payload {
+                        index: id,
+                        id: record_id.clone(),
+                    },
+                    PersistentValue::OpaquePayload(OpaquePayload::new(payload.clone())?),
+                )?;
+            }
+            let leaf_key = LogicalKey::LeafEntry {
+                index: id,
+                tree_key: tree,
+                partition: leaf,
+                id: record_id.clone(),
+            };
+            let entry = PersistentValue::LeafEntry(LeafEntry::new(
+                record_id,
+                Box::from(record.fields()),
+                RaBitQ7::quantize(&kernel.preprocess(record.vector())?)?,
+            ));
+            let key = keys::encode_key(&leaf_key)?;
+            let value = codec.encode_for_key(&leaf_key, &entry)?;
+            check_limits(&key, &value, options.hard_limits)?;
+            // A separate sorted prefix groups exact field projections by leaf
+            // for Synopsis construction without retaining all leaves in RAM.
+            output.push(Row {
+                key: tagged(0, &key),
+                value: value.clone(),
+            })?;
+            output.push(Row {
+                key: tagged(1, &key),
+                value,
+            })?;
+            report.records = add(report.records, 1)?;
+            next = topology.next()?;
+        }
+        drop((records, previous));
+        if next.as_ref().is_some_and(|row| row.key.first() != Some(&1))
+            || report.records != input.manifest().items()
+        {
+            return Err(corrupt());
+        }
+        let mut tree_state: Option<(TreeKey, PartitionKey)> = None;
+        while let Some(row) = next.take() {
+            if row.key.first() != Some(&1)
+                || row.value.len() != 9 + 4 * index.config().dimension()
+                || row.value[0] != 0
+            {
+                return Err(corrupt());
+            }
+            let (tree, partition) = node(&row.key[1..], index)?;
+            let level = u32::from_be_bytes(row.value[1..5].try_into().expect("level"));
+            let count = u32::from_be_bytes(row.value[5..9].try_into().expect("count"));
+            let centroid: Box<[f32]> = row.value[9..]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| f32::from_bits(u32::from_be_bytes(*bytes)))
+                .collect();
+            next = topology.next()?;
+            if partition.get() == 1 {
+                if next.as_ref().is_some_and(|entry| entry.key == row.key) {
+                    return Err(corrupt());
+                }
+            } else {
+                let parent = next.take().ok_or_else(corrupt)?;
+                if parent.key != row.key || parent.value.len() != 13 || parent.value[0] != 1 {
+                    return Err(corrupt());
+                }
+                let parent_key = PartitionKey::new(u64::from_be_bytes(
+                    parent.value[1..9].try_into().expect("parent"),
+                ))
+                .map_err(|_| corrupt())?;
+                let parent_level =
+                    u32::from_be_bytes(parent.value[9..].try_into().expect("parent level"));
+                if level.checked_add(1) != Some(parent_level) {
+                    return Err(corrupt());
+                }
+                emit(
+                    &mut output,
+                    codec,
+                    options.hard_limits,
+                    LogicalKey::ChildEntry {
+                        index: id,
+                        tree_key: tree.clone(),
+                        partition: parent_key,
+                        child: partition,
+                    },
+                    PersistentValue::ChildEntry(ChildEntry::new(partition, centroid.clone())),
+                )?;
+                emit(
+                    &mut output,
+                    codec,
+                    options.hard_limits,
+                    LogicalKey::Centroid {
+                        index: id,
+                        tree_key: tree.clone(),
+                        partition,
+                    },
+                    PersistentValue::PartitionCentroid(PartitionCentroid::new(centroid)),
+                )?;
+                next = topology.next()?;
+                if next.as_ref().is_some_and(|entry| entry.key == row.key) {
+                    return Err(corrupt());
+                }
+            }
+            if tree_state
+                .as_ref()
+                .is_some_and(|(previous, _)| previous != &tree)
+            {
+                let (previous, high_water) = tree_state.take().expect("previous tree");
+                emit_tree(
+                    &mut output,
+                    codec,
+                    options.hard_limits,
+                    index,
+                    previous,
+                    high_water,
+                )?;
+            }
+            tree_state = Some((tree.clone(), partition));
+            emit(
+                &mut output,
+                codec,
+                options.hard_limits,
+                LogicalKey::Header {
+                    index: id,
+                    tree_key: tree.clone(),
+                    partition,
+                },
+                PersistentValue::PartitionHeader(PartitionHeader::new(
+                    level,
+                    count,
+                    1,
+                    PartitionState::Ready,
+                )?),
+            )?;
+            emit(
+                &mut output,
+                codec,
+                options.hard_limits,
+                LogicalKey::State {
+                    index: id,
+                    tree_key: tree,
+                    partition,
+                },
+                PersistentValue::PartitionState(PartitionTransition::Ready {
+                    started_at_unix_millis: 0,
+                }),
+            )?;
+            report.partitions = add(report.partitions, 1)?;
+        }
+        if let Some((tree, high_water)) = tree_state {
+            emit_tree(
+                &mut output,
+                codec,
+                options.hard_limits,
+                index,
+                tree,
+                high_water,
+            )?;
+        }
+        drop(topology);
+        let output_run = output.finish()?;
+        space.remove(record_run)?;
+        space.remove(topology_run)?;
+        let mut output = space.reader(&output_run)?;
+        let mut next = output.next()?;
+        let mut synopses = Sorter::new(&mut space, options.memory_bytes)?;
+        let mut synopsis: Option<(LogicalKey, PartitionSynopsis)> = None;
+        while next.as_ref().is_some_and(|row| row.key.first() == Some(&0)) {
+            let row = next.take().expect("projection");
+            let key = keys::decode_key(types, &Bytes::copy_from_slice(&row.key[1..]))?;
+            let LogicalKey::LeafEntry {
+                tree_key,
+                partition,
+                ..
+            } = &key
+            else {
+                return Err(corrupt());
+            };
+            let synopsis_key = LogicalKey::Synopsis {
+                index: id,
+                tree_key: tree_key.clone(),
+                partition: *partition,
+            };
+            if synopsis
+                .as_ref()
+                .is_some_and(|(key, _)| key != &synopsis_key)
+            {
+                flush_synopsis(
+                    &mut synopses,
+                    codec,
+                    options.hard_limits,
+                    synopsis.take().expect("previous leaf"),
+                )?;
+            }
+            let value = codec.decode(&key, Bytes::from(row.value))?;
+            let PersistentValue::LeafEntry(entry) = value else {
+                return Err(corrupt());
+            };
+            let (_, accumulator) =
+                synopsis.get_or_insert_with(|| (synopsis_key, PartitionSynopsis::empty(index)));
+            accumulator.expand(index, entry.fields())?;
+            next = output.next()?;
+        }
+        if let Some(synopsis) = synopsis {
+            flush_synopsis(&mut synopses, codec, options.hard_limits, synopsis)?;
+        }
+        let synopsis_run = synopses.finish()?;
+        let mut synopses = space.reader(&synopsis_run)?;
+        let mut next_synopsis = synopses.next()?;
+        let mut previous_key: Option<Vec<u8>> = None;
+        while next.is_some() || next_synopsis.is_some() {
+            if next.as_ref().is_some_and(|row| row.key.first() != Some(&1)) {
+                return Err(corrupt());
+            }
+            let take_synopsis = match (&next, &next_synopsis) {
+                (Some(row), Some(synopsis)) => synopsis.key.as_slice() < &row.key[1..],
+                (None, Some(_)) => true,
+                _ => false,
+            };
+            let row = if take_synopsis {
+                let row = next_synopsis.take().expect("selected synopsis");
+                next_synopsis = synopses.next()?;
+                row
+            } else {
+                let mut row = next.take().expect("selected serving row");
+                row.key.remove(0);
+                next = output.next()?;
+                row
+            };
+            if previous_key
+                .as_ref()
+                .is_some_and(|previous| previous >= &row.key)
+            {
+                return Err(corrupt());
+            }
+            let mut body = Vec::with_capacity(4 + row.key.len() + row.value.len());
+            body.extend_from_slice(&(row.key.len() as u32).to_be_bytes());
+            body.extend_from_slice(&row.key);
+            body.extend_from_slice(&row.value);
+            writer.append(&body)?;
+            previous_key = Some(row.key);
+            report.keys = add(report.keys, 1)?;
+        }
+        drop((output, synopses));
+        space.remove(output_run)?;
+        space.remove(synopsis_run)?;
+        fs::remove_dir(scratch).map_err(io_error)?;
+        report.peak_scratch_bytes = space.peak;
+        report.scratch_written_bytes = space.written;
+        let artifact = writer.seal()?;
+        Ok((
+            Self {
+                directory: directory.to_owned(),
+                artifact,
+                index: index.clone(),
+                limits: options.hard_limits,
+                source: input.manifest().clone(),
+                construction: forest.construction,
+            },
+            report,
+        ))
+    }
+
+    /// Reopens a sealed artifact against its exact source, topology and identity.
+    pub fn open(
+        directory: &Path,
+        expected: ArtifactManifest,
+        input: &InputSnapshot,
+        forest: &ForestArtifact,
+        index: &IndexManifest,
+        options: ServingOptions,
+    ) -> Result<Self> {
+        validate(directory, input, forest, index, options)?;
+        if !expected.matches(3, binding(input, forest, index, options)?) {
+            return Err(Error::invalid_argument());
+        }
+        let artifact = Self {
+            directory: directory.to_owned(),
+            artifact: expected,
+            index: index.clone(),
+            limits: options.hard_limits,
+            source: input.manifest().clone(),
+            construction: forest.construction,
+        };
+        artifact.reader()?;
+        Ok(artifact)
+    }
+
+    /// Persisted identity of the complete serving file.
+    #[must_use]
+    pub const fn manifest(&self) -> &ArtifactManifest {
+        &self.artifact
+    }
+
+    /// Reads strictly increasing, canonical serving pairs for the bound index.
+    /// Successful exhaustion verifies the entire file; a prefix is not proof of
+    /// complete output. Lifecycle/name/build keys are never accepted here.
+    pub fn reader(&self) -> Result<ServingReader> {
+        Ok(ServingReader {
+            reader: Reader::open(
+                &self.directory,
+                &self.artifact,
+                4 + MAX_KEY + MAX_VALUE_BYTES,
+            )?,
+            index: self.index.clone(),
+            limits: self.limits,
+            previous: None,
+            finished: false,
+        })
+    }
+
+    /// Verifies complete framing, key order, index ownership and value codecs.
+    /// This is not a substitute for validating the backend after fenced loading.
+    pub fn verify(&self) -> Result<()> {
+        for row in self.reader()? {
+            row?;
+        }
+        Ok(())
+    }
+}
+
+/// Fused, validating iterator of canonical serving key/value bytes.
+pub struct ServingReader {
+    reader: Reader,
+    index: IndexManifest,
+    limits: HardLimits,
+    previous: Option<Bytes>,
+    finished: bool,
+}
+impl ServingReader {
+    pub(crate) fn prefix_sha256(&self) -> [u8; 32] {
+        self.reader.prefix_sha256()
+    }
+
+    fn decode(&mut self, mut bytes: Bytes) -> Result<ServingEntry> {
+        if bytes.len() < 4 {
+            return Err(corrupt());
+        }
+        let length = bytes.get_u32() as usize;
+        if length == 0 || length > MAX_KEY || length >= bytes.len() {
+            return Err(corrupt());
+        }
+        let key = bytes.split_to(length);
+        check_limits(&key, &bytes, self.limits).map_err(|_| corrupt())?;
+        if self
+            .previous
+            .as_ref()
+            .is_some_and(|previous| previous >= &key)
+        {
+            return Err(corrupt());
+        }
+        let (types, count) = self.index.tree_key_types();
+        let logical = keys::decode_key(&types[..count], &key)?;
+        if logical.index() != Some(self.index.logical_index_id())
+            || matches!(
+                logical,
+                LogicalKey::Manifest(_)
+                    | LogicalKey::BuildDescriptor(_)
+                    | LogicalKey::BuildLoad(_)
+                    | LogicalKey::BuildValidation(_)
+            )
+        {
+            return Err(corrupt());
+        }
+        ValueCodec::for_index(&self.index).decode(&logical, bytes.clone())?;
+        self.previous = Some(key.clone());
+        Ok(ServingEntry { key, value: bytes })
+    }
+}
+impl Iterator for ServingReader {
+    type Item = Result<ServingEntry>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        let result = match self.reader.next() {
+            Some(row) => row.and_then(|row| self.decode(row)),
+            None => {
+                self.finished = true;
+                return None;
+            }
+        };
+        self.finished = result.is_err();
+        Some(result)
+    }
+}
+impl std::iter::FusedIterator for ServingReader {}
+
+fn tagged(tag: u8, key: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(1 + key.len());
+    bytes.push(tag);
+    bytes.extend_from_slice(key);
+    bytes
+}
+fn add(a: u64, b: u64) -> Result<u64> {
+    a.checked_add(b)
+        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))
+}
+fn check_limits(key: &[u8], value: &[u8], limits: HardLimits) -> Result<()> {
+    if key.len() > limits.max_key_bytes || value.len() > limits.max_value_bytes {
+        return Err(Error::new(ErrorKind::LimitExceeded));
+    }
+    Ok(())
+}
+fn emit(
+    output: &mut Sorter<'_>,
+    codec: ValueCodec<'_>,
+    limits: HardLimits,
+    key: LogicalKey,
+    value: PersistentValue,
+) -> Result<()> {
+    let bytes = keys::encode_key(&key)?;
+    let value = codec.encode_for_key(&key, &value)?;
+    check_limits(&bytes, &value, limits)?;
+    output.push(Row {
+        key: tagged(1, &bytes),
+        value,
+    })
+}
+fn emit_tree(
+    output: &mut Sorter<'_>,
+    codec: ValueCodec<'_>,
+    limits: HardLimits,
+    index: &IndexManifest,
+    tree: TreeKey,
+    high_water: PartitionKey,
+) -> Result<()> {
+    emit(
+        output,
+        codec,
+        limits,
+        LogicalKey::TreeManifest {
+            index: index.logical_index_id(),
+            tree_key: tree,
+        },
+        PersistentValue::TreeManifest(TreeManifest::new(PartitionKey::new(1)?, high_water)?),
+    )
+}
+fn flush_synopsis(
+    output: &mut Sorter<'_>,
+    codec: ValueCodec<'_>,
+    limits: HardLimits,
+    (key, synopsis): (LogicalKey, PartitionSynopsis),
+) -> Result<()> {
+    let bytes = keys::encode_key(&key)?;
+    let value = codec.encode_for_key(&key, &PersistentValue::PartitionSynopsis(synopsis))?;
+    check_limits(&bytes, &value, limits)?;
+    output.push(Row { key: bytes, value })
+}
+fn node(bytes: &[u8], index: &IndexManifest) -> Result<(TreeKey, PartitionKey)> {
+    let (types, count) = index.tree_key_types();
+    match keys::decode_key(&types[..count], &Bytes::copy_from_slice(bytes))? {
+        LogicalKey::Header {
+            index: owner,
+            tree_key,
+            partition,
+        } if owner == index.logical_index_id() => Ok((tree_key, partition)),
+        _ => Err(corrupt()),
+    }
+}
+fn validate(
+    directory: &Path,
+    input: &InputSnapshot,
+    forest: &ForestArtifact,
+    index: &IndexManifest,
+    options: ServingOptions,
+) -> Result<()> {
+    super::sort::validate_memory(options.memory_bytes, MAX_ROW)?;
+    if !forest.matches_source(input, index)
+        || directory.as_os_str().len() > 4096
+        || options.scratch_bytes == 0
+        || options.hard_limits.max_key_bytes == 0
+        || options.hard_limits.max_value_bytes == 0
+    {
+        return Err(Error::invalid_argument());
+    }
+    Ok(())
+}
+fn binding(
+    input: &InputSnapshot,
+    forest: &ForestArtifact,
+    index: &IndexManifest,
+    options: ServingOptions,
+) -> Result<[u8; 32]> {
+    let mut hash = Sha256::new();
+    hash.update(b"KTANN serving artifact v1");
+    hash.update(input.manifest().encode());
+    hash.update(forest.manifest().encode());
+    hash.update(
+        ValueCodec::bootstrap().encode(&PersistentValue::IndexManifest(
+            index.with_lifecycle(IndexLifecycle::Building),
+        ))?,
+    );
+    for value in [
+        options.memory_bytes as u64,
+        options.scratch_bytes,
+        options.hard_limits.max_key_bytes as u64,
+        options.hard_limits.max_value_bytes as u64,
+    ] {
+        hash.update(value.to_be_bytes());
+    }
+    Ok(hash.finalize().into())
+}

@@ -227,7 +227,7 @@ fn namespace_and_manifest_golden_bytes() {
         b"\x01\x00\x00\x00\x00\x00\x00\x00\x01"
     );
 
-    let mut expected = vec![0x02, 0x00, 0x01, 0x00];
+    let mut expected = vec![0x02, 0x00, 0x02, 0x00];
     expected.extend_from_slice(&1_u64.to_be_bytes());
     expected.extend_from_slice(&1_u32.to_be_bytes());
     expected.push(0x00);
@@ -568,7 +568,7 @@ fn unsupported_manifest_formats_fail_closed() {
     let bootstrap = ValueCodec::bootstrap();
     let value = PersistentValue::IndexManifest(minimal_manifest());
     let key = key_for_value(id(1), &value);
-    for format in [0_u16, 2, u16::MAX] {
+    for format in [0_u16, 1, 3, u16::MAX] {
         let mut bytes = bootstrap.encode(&value).expect("encode Manifest");
         bytes[1..3].copy_from_slice(&format.to_be_bytes());
         assert_eq!(
@@ -946,4 +946,144 @@ fn reopened_manifest_reproduces_identical_index_value_bytes() {
             .encode(&value)
             .expect("encode after reopen")
     );
+}
+
+#[test]
+fn building_manifest_and_request_descriptor_have_canonical_bytes() {
+    use ktann::bulk::ArtifactManifest;
+    use ktann::construction::{CONSTRUCTION_VERSION, ConstructionOptions};
+    use ktann::storage::values::BuildDescriptor;
+    let codec = ValueCodec::bootstrap();
+    let building = minimal_manifest().with_lifecycle(IndexLifecycle::Building);
+    let bytes = codec
+        .encode(&PersistentValue::IndexManifest(building.clone()))
+        .unwrap();
+    assert_eq!(&bytes[..4], &[2, 0, 2, 2]);
+    assert_eq!(
+        decode(codec, &LogicalKey::Manifest(id(1)), &bytes).unwrap(),
+        PersistentValue::IndexManifest(building)
+    );
+
+    let mut input_bytes = [0; 89];
+    input_bytes[..8].copy_from_slice(b"KTANNBF\x01");
+    input_bytes[49..57].copy_from_slice(&41_u64.to_be_bytes());
+    let input = ArtifactManifest::decode(&input_bytes).unwrap();
+    let options = ConstructionOptions {
+        min_partition_entries: 2,
+        max_partition_entries: 4,
+        sample_items: 8,
+        memory_bytes: 2 * 1024 * 1024,
+        scratch_bytes: 16 * 1024 * 1024,
+    };
+    let descriptor = BuildDescriptor::new("/source".into(), input, options).unwrap();
+    let value = PersistentValue::BuildDescriptor(descriptor);
+    let key = LogicalKey::BuildDescriptor(id(1));
+    let bytes = codec.encode(&value).unwrap();
+    let mut expected = vec![0x0d];
+    expected.extend_from_slice(&CONSTRUCTION_VERSION.to_be_bytes());
+    expected.extend_from_slice(&7_u32.to_be_bytes());
+    expected.extend_from_slice(b"/source");
+    expected.extend_from_slice(&89_u32.to_be_bytes());
+    expected.extend_from_slice(&input_bytes);
+    expected.extend_from_slice(&2_u32.to_be_bytes());
+    expected.extend_from_slice(&4_u32.to_be_bytes());
+    for number in [8_u64, 2 * 1024 * 1024, 16 * 1024 * 1024] {
+        expected.extend_from_slice(&number.to_be_bytes());
+    }
+    assert_eq!(bytes.as_slice(), expected.as_slice());
+    assert_eq!(decode(codec, &key, &bytes).unwrap(), value);
+    for end in 0..bytes.len() {
+        assert!(decode(codec, &key, &bytes[..end]).is_err());
+    }
+    let mut trailing = bytes.to_vec();
+    trailing.push(0);
+    assert_corrupt(decode(codec, &key, &trailing));
+    let mut invalid = bytes.to_vec();
+    invalid[9] = b'x';
+    assert_corrupt(decode(codec, &key, &invalid));
+    let mut unsupported = bytes.to_vec();
+    unsupported[1..5].copy_from_slice(&u32::MAX.to_be_bytes());
+    assert_eq!(
+        decode(codec, &key, &unsupported).unwrap_err().kind(),
+        ErrorKind::UnsupportedFormat
+    );
+    input_bytes[8] = 1;
+    assert!(
+        BuildDescriptor::new(
+            "/source".into(),
+            ArtifactManifest::decode(&input_bytes).unwrap(),
+            options
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn bulk_workspace_golden_and_malformed_ownership() {
+    let codec = ValueCodec::bootstrap();
+    let key = LogicalKey::BuildWorkspace(id(1));
+    let mut golden = vec![0x0f, 0, 0, 0, 5];
+    golden.extend_from_slice(b"/bulk");
+    for n in [1_u64, 1, 1, 1, 1, 2, 1, 1, 1] {
+        golden.extend_from_slice(&n.to_be_bytes());
+    }
+    golden.extend_from_slice(&[1; 32]);
+    golden.extend_from_slice(&1_u64.to_be_bytes());
+    golden.extend_from_slice(&[0, 0, 0]);
+    let value = codec.decode(&key, Bytes::from(golden.clone())).unwrap();
+    assert_eq!(codec.encode(&value).unwrap(), golden);
+    for length in 0..golden.len() {
+        assert!(
+            codec
+                .decode(&key, Bytes::copy_from_slice(&golden[..length]))
+                .is_err()
+        );
+    }
+    for (offset, replacement) in [(5, b'x'), (golden.len() - 1, 255), (golden.len() - 3, 2)] {
+        let mut malformed = golden.clone();
+        malformed[offset] = replacement;
+        assert!(codec.decode(&key, Bytes::from(malformed)).is_err());
+    }
+    let mut zero_token = golden.clone();
+    zero_token[82..114].fill(0);
+    assert!(codec.decode(&key, Bytes::from(zero_token)).is_err());
+    let mut trailing = golden;
+    trailing.push(0);
+    assert!(codec.decode(&key, Bytes::from(trailing)).is_err());
+}
+
+#[test]
+fn bulk_validation_golden_and_malformed_proofs() {
+    use sha2::{Digest, Sha256};
+    let manifest = minimal_manifest();
+    let codec = ValueCodec::for_index(&manifest);
+    let key = LogicalKey::BuildValidation(id(1));
+    let mut artifact = b"KTANNBF\x01\x03".to_vec();
+    artifact.extend_from_slice(&[0; 32]);
+    let hash = Sha256::digest(&artifact);
+    artifact.extend_from_slice(&0_u64.to_be_bytes());
+    artifact.extend_from_slice(&41_u64.to_be_bytes());
+    artifact.extend_from_slice(&hash);
+    let mut golden = vec![0x10, 0, 0, 0, 89];
+    golden.extend_from_slice(&artifact);
+    golden.extend_from_slice(&[0; 4]);
+    golden.extend_from_slice(&0_u64.to_be_bytes());
+    golden.extend_from_slice(&hash);
+    golden.push(1);
+    let value = codec.decode(&key, Bytes::from(golden.clone())).unwrap();
+    assert_eq!(codec.encode(&value).unwrap(), golden);
+    for length in 0..golden.len() {
+        assert!(
+            codec
+                .decode(&key, Bytes::copy_from_slice(&golden[..length]))
+                .is_err()
+        );
+    }
+    for offset in [13, 105, 106, golden.len() - 1] {
+        let mut malformed = golden.clone();
+        malformed[offset] ^= 3;
+        assert!(codec.decode(&key, Bytes::from(malformed)).is_err());
+    }
+    golden.push(0);
+    assert!(codec.decode(&key, Bytes::from(golden)).is_err());
 }
