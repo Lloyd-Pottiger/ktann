@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use crate::backend::{BackendCounters, MeasuredBackend};
 use crate::resource::ResourceSnapshot;
 
+mod bulk;
 mod topology;
 
 /// Wire frames are a big-endian u32 length followed by UTF-8 JSON.
@@ -39,6 +40,7 @@ struct Options {
     database: PathBuf,
     report: PathBuf,
     backend: String,
+    bulk_workspace: Option<PathBuf>,
 }
 
 /// Runs a single bridge until shutdown or SIGINT, then closes the Runtime.
@@ -52,6 +54,7 @@ pub fn run() -> Result<(), String> {
         database: PathBuf::new(),
         report: PathBuf::new(),
         backend: "rocksdb".into(),
+        bulk_workspace: None,
     };
     while let Some(arg) = args.next() {
         let value = args.next().ok_or(
@@ -62,6 +65,7 @@ pub fn run() -> Result<(), String> {
             "--database" => options.database = value.into(),
             "--report" => options.report = value.into(),
             "--backend" => options.backend = value,
+            "--bulk-workspace" => options.bulk_workspace = Some(value.into()),
             _ => return Err(format!("unknown argument {arg}")),
         }
     }
@@ -159,6 +163,8 @@ enum Operation {
 /// Lifecycle state is exclusive for mutation and shared for concurrent search.
 struct State<B: Backend> {
     index: Option<Index<MeasuredBackend<B>>>,
+    bulk: Option<bulk::Staging>,
+    bulk_report: Value,
     ready: bool,
     records: u64,
     dimension: usize,
@@ -176,6 +182,8 @@ impl<B: Backend> Default for State<B> {
     fn default() -> Self {
         Self {
             index: None,
+            bulk: None,
+            bulk_report: Value::Null,
             ready: false,
             records: 0,
             dimension: 0,
@@ -224,6 +232,7 @@ impl Default for Measurements {
 /// Shared process owner. No KTANN handle crosses the Python process boundary.
 struct Service<B: Backend> {
     runtime: Runtime<MeasuredBackend<B>>,
+    bulk_workspace: Option<PathBuf>,
     backend: MeasuredBackend<B>,
     state: RwLock<State<B>>,
     measurements: Mutex<Measurements>,
@@ -257,6 +266,7 @@ async fn serve<B: Backend>(backend: B, identity: String, options: &Options) -> R
     let config = RuntimeConfig::default();
     let service = Arc::new(Service {
         runtime: Runtime::new(backend.clone(), config).map_err(|e| e.to_string())?,
+        bulk_workspace: options.bulk_workspace.clone(),
         backend,
         state: RwLock::new(State::default()),
         measurements: Mutex::new(Measurements::default()),
@@ -425,19 +435,29 @@ impl<B: Backend> Service<B> {
                 }
                 let mut state = self.state.write().await;
                 // One case per bridge keeps all reported resource high-water marks attributable.
-                if state.index.is_some() {
+                if state.dimension != 0 {
                     return Err(invalid("one case per bridge; restart for another reset"));
                 }
                 self.runtime
                     .drop_index("vdbbench")
                     .await
                     .map_err(api_error)?;
-                let index = self
-                    .runtime
-                    .create_index("vdbbench", config)
-                    .await
-                    .map_err(api_error)?;
-                state.index = Some(index);
+                if let Some(root) = &self.bulk_workspace {
+                    let root = root.clone();
+                    state.bulk = Some(
+                        tokio::task::spawn_blocking(move || bulk::Staging::new(root, config))
+                            .await
+                            .map_err(|e| ("other", e.to_string()))?
+                            .map_err(api_error)?,
+                    );
+                } else {
+                    state.index = Some(
+                        self.runtime
+                            .create_index("vdbbench", config)
+                            .await
+                            .map_err(api_error)?,
+                    );
+                }
                 state.dimension = dimension;
                 state.metric = metric;
                 state.dataset = dataset;
@@ -452,19 +472,17 @@ impl<B: Backend> Service<B> {
                 if state.ready {
                     return Err(invalid("inserts after optimize are unsupported"));
                 }
-                let index = state
-                    .index
-                    .as_ref()
-                    .ok_or_else(|| invalid("reset required"))?
-                    .clone();
-                let mut mutations = Vec::with_capacity(ids.len());
+                if state.dimension == 0 {
+                    return Err(invalid("reset required"));
+                }
+                let mut records = Vec::with_capacity(ids.len());
                 let mut root_probe = None;
                 for (id, vector) in ids.iter().zip(vectors) {
                     if vector.len() != state.dimension {
                         return Err(invalid("wrong vector dimension"));
                     }
                     let vector: Arc<[f32]> = vector.into();
-                    if mutations.is_empty() && state.root_probe.is_none() {
+                    if records.is_empty() && state.root_probe.is_none() {
                         root_probe = Some(Arc::clone(&vector));
                     }
                     let record = Record::new(
@@ -473,13 +491,35 @@ impl<B: Backend> Service<B> {
                         vec![FieldValue::I64(*id)],
                     )
                     .map_err(api_error)?;
-                    mutations.push(Mutation::Insert(record));
+                    records.push(record);
                 }
                 let start = Instant::now();
                 state.started.get_or_insert(start);
-                let outcome = index.batch_mutate(mutations).await;
-                state.insert_seconds += start.elapsed().as_secs_f64();
-                outcome.map_err(api_error)?;
+                if self.bulk_workspace.is_some() {
+                    let staging = state
+                        .bulk
+                        .take()
+                        .ok_or_else(|| invalid("bulk input already sealed or failed"))?;
+                    state.bulk = Some(
+                        tokio::task::spawn_blocking(move || staging.append(records))
+                            .await
+                            .map_err(|e| ("other", e.to_string()))?
+                            .map_err(api_error)?,
+                    );
+                } else {
+                    let index = state
+                        .index
+                        .as_ref()
+                        .ok_or_else(|| invalid("reset required"))?;
+                    let outcome = index
+                        .batch_mutate(records.into_iter().map(Mutation::Insert).collect())
+                        .await;
+                    state.insert_seconds += start.elapsed().as_secs_f64();
+                    outcome.map_err(api_error)?;
+                }
+                if self.bulk_workspace.is_some() {
+                    state.insert_seconds += start.elapsed().as_secs_f64();
+                }
                 state.records += ids.len() as u64;
                 if let Some(probe) = root_probe {
                     state.root_probe = Some(probe);
@@ -490,6 +530,32 @@ impl<B: Backend> Service<B> {
                 let mut state = self.state.write().await;
                 if state.records != records || records == 0 {
                     return Err(invalid("optimize record count mismatch or empty dataset"));
+                }
+                if self.bulk_workspace.is_some() {
+                    if state.ready {
+                        return Ok(state.topology.clone());
+                    }
+                    let start = Instant::now();
+                    let staging = state
+                        .bulk
+                        .take()
+                        .ok_or_else(|| invalid("bulk input already sealed or failed"))?;
+                    let (index, report) = bulk::build(&self.runtime, staging)
+                        .await
+                        .map_err(api_error)?;
+                    let snapshot =
+                        topology::snapshot(&self.backend, index.logical_index_id(), records, false)
+                            .await
+                            .map_err(api_error)?;
+                    if !snapshot.ready {
+                        return Err(("corruption", "published bulk topology is not ready".into()));
+                    }
+                    state.index = Some(index);
+                    state.bulk_report = report;
+                    state.topology = snapshot.facts;
+                    state.ready = true;
+                    state.optimize_seconds = start.elapsed().as_secs_f64();
+                    return Ok(state.topology.clone());
                 }
                 let index = state
                     .index
@@ -684,7 +750,8 @@ impl<B: Backend> Service<B> {
             },
             "continuous_first_insert_through_final_search_seconds": state.started.zip(m.last_search).map(|(a,b)| b.duration_since(a).as_secs_f64()),
             "phases": {
-                "committed_import_seconds": state.insert_seconds,
+                "committed_import_seconds": self.bulk_workspace.is_none().then_some(state.insert_seconds),
+                "input_staging_seconds": self.bulk_workspace.is_some().then_some(state.insert_seconds),
                 "optimize_seconds": state.optimize_seconds,
                 "ktann_search_seconds_sum": m.search_seconds
             },
@@ -700,6 +767,8 @@ impl<B: Backend> Service<B> {
             "search_usage_totals": m.budget,
             "search_exhaustion_counts": m.exhausted,
             "topology": state.topology,
+            "build_mode": if self.bulk_workspace.is_some() { "bulk" } else { "online" },
+            "bulk_build": state.bulk_report,
             "resource": { "peak_rss_bytes": resources.peak_rss_bytes(), "cpu_seconds": resources.cpu_seconds_since(self.baseline) },
             "backend_io": self.counters.snapshot(),
             "bridge": {

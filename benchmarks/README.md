@@ -315,6 +315,26 @@ import, drops the Logical Index, and removes the socket. After a crash, confirm
 the old process has exited before removing its stale socket; startup never
 unlinks a preexisting socket.
 
+### Bulk Build through VectorDBBench
+
+Pass `--bulk-workspace /absolute/new/directory` to `ktann-vdbbench-bridge` to
+measure the core Bulk Build path. Use a fresh bridge, RocksDB directory and
+workspace for each case. The Python adapter and canonical runner remain unchanged.
+Insert requests stage bounded batches of original IDs/vectors; they do not write
+serving data. Optimize seals an InputSnapshot, reserves the Building index, runs
+`run_worker`, and calls `publish` for exact validation and atomic activation.
+Search remains unavailable until publication and topology readiness succeed.
+
+The native report identifies `build_mode: bulk` and records input staging,
+snapshot creation, preparation/loading, and validation/publication/cleanup times.
+`committed_import_seconds` is null in this mode: canonical load time measures
+input receipt, while canonical load plus optimize/index time covers the build.
+Staging's raw file is removed after the snapshot is sealed. The source snapshot
+and report remain caller-owned; successful publication reclaims core attempts.
+Construction uses the index's min/max defaults, sample 256, 256 MiB tree memory,
+and 64 GiB tree scratch; the report records worker limits. No online insertion or
+post-build refinement is substituted into this path.
+
 ### Offline refinement after import
 
 Quality sweeps accept `--refinement-rounds 0..5`. Omit the flag for the ordinary
