@@ -13,11 +13,16 @@ fn settings() -> BulkSchedulerOptions {
 async fn wait_active<B: Backend>(job: &BulkBuildJob<B>) {
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
-            match job.status().await.unwrap() {
-                BulkBuildStatus::Published => break,
-                BulkBuildStatus::Failed { kind } => panic!("scheduled build failed: {kind:?}"),
-                _ => tokio::time::sleep(Duration::from_millis(10)).await,
+            match job.status().await {
+                Ok(BulkBuildStatus::Published) => break,
+                Ok(BulkBuildStatus::Failed { kind }) => panic!("scheduled build failed: {kind:?}"),
+                Ok(_) => {}
+                // The single-permit case deliberately saturates admission;
+                // observation follows the same bounded retry contract as users.
+                Err(error) if error.kind() == ErrorKind::LimitExceeded => {}
+                Err(error) => panic!("status failed: {error:?}"),
             }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
