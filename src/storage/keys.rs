@@ -80,6 +80,7 @@ const SCOPE_INDEX: u8 = 0x01;
 const NS_INDEX_ID_ALLOCATOR: u8 = 0x00;
 const NS_INDEX_NAME_DIRECTORY: u8 = 0x01;
 const NS_BUILD_WORKSPACE: u8 = 0x02;
+const NS_BUILD_SCHEDULE: u8 = 0x03;
 
 const KIND_MANIFEST: u8 = 0x00;
 const KIND_RECORD_GROUP: u8 = 0x01;
@@ -124,6 +125,8 @@ pub enum LogicalKey {
     BuildLoad(LogicalIndexId),
     /// Durable workspace ownership and preparation progress, outside index data.
     BuildWorkspace(LogicalIndexId),
+    /// Durable distributed scheduler queue and lease.
+    BuildSchedule(LogicalIndexId),
     /// Checkpoint over sealed backend data.
     BuildValidation(LogicalIndexId),
     /// A Vector Record.
@@ -218,7 +221,10 @@ impl LogicalKey {
     /// Returns the owning Logical Index ID for an index-scoped key.
     pub(crate) const fn index(&self) -> Option<LogicalIndexId> {
         match self {
-            Self::IndexIdAllocator | Self::IndexNameDirectory(_) | Self::BuildWorkspace(_) => None,
+            Self::IndexIdAllocator
+            | Self::IndexNameDirectory(_)
+            | Self::BuildWorkspace(_)
+            | Self::BuildSchedule(_) => None,
             Self::Manifest(index)
             | Self::BuildDescriptor(index)
             | Self::BuildLoad(index)
@@ -252,6 +258,7 @@ impl LogicalKey {
             | Self::BuildDescriptor(_)
             | Self::BuildLoad(_)
             | Self::BuildWorkspace(_)
+            | Self::BuildSchedule(_)
             | Self::BuildValidation(_)
             | Self::Record { .. }
             | Self::Location { .. }
@@ -266,6 +273,9 @@ impl fmt::Debug for LogicalKey {
             Self::IndexIdAllocator => formatter.write_str("IndexIdAllocator"),
             Self::IndexNameDirectory(_) => formatter.write_str("IndexNameDirectory([REDACTED])"),
             Self::Manifest(index) => formatter.debug_tuple("Manifest").field(index).finish(),
+            Self::BuildSchedule(index) => {
+                formatter.debug_tuple("BuildSchedule").field(index).finish()
+            }
             Self::BuildWorkspace(index) => formatter
                 .debug_tuple("BuildWorkspace")
                 .field(index)
@@ -502,6 +512,13 @@ pub fn build_workspace_key(index: LogicalIndexId) -> Vec<u8> {
     bytes.extend_from_slice(&index.get().to_be_bytes());
     bytes
 }
+/// Namespace scheduler queue key, surviving index-prefix deletion.
+pub fn build_schedule_key(index: LogicalIndexId) -> Vec<u8> {
+    let mut bytes = vec![SCOPE_NAMESPACE, NS_BUILD_SCHEDULE];
+    bytes.extend_from_slice(&index.get().to_be_bytes());
+    bytes
+}
+
 /// The sealed backend validation checkpoint key.
 #[must_use]
 pub fn build_validation_key(index: LogicalIndexId) -> Vec<u8> {
@@ -635,6 +652,7 @@ pub(crate) fn encode_key(key: &LogicalKey) -> Result<Vec<u8>> {
         LogicalKey::BuildDescriptor(index) => Ok(build_descriptor_key(*index)),
         LogicalKey::BuildLoad(index) => Ok(build_load_key(*index)),
         LogicalKey::BuildWorkspace(index) => Ok(build_workspace_key(*index)),
+        LogicalKey::BuildSchedule(index) => Ok(build_schedule_key(*index)),
         LogicalKey::BuildValidation(index) => Ok(build_validation_key(*index)),
         LogicalKey::Record { index, id } => record_key(*index, id),
         LogicalKey::Location { index, id } => location_key(*index, id),
@@ -695,6 +713,10 @@ fn decode_namespace_key(body: &[u8]) -> Result<LogicalKey> {
     match body.first() {
         Some(&NS_INDEX_ID_ALLOCATOR) if body.len() == 1 => Ok(LogicalKey::IndexIdAllocator),
         Some(&NS_BUILD_WORKSPACE) if body.len() == 9 => Ok(LogicalKey::BuildWorkspace(
+            LogicalIndexId::new(u64::from_be_bytes(body[1..].try_into().expect("fixed id")))
+                .map_err(|_| corrupt())?,
+        )),
+        Some(&NS_BUILD_SCHEDULE) if body.len() == 9 => Ok(LogicalKey::BuildSchedule(
             LogicalIndexId::new(u64::from_be_bytes(body[1..].try_into().expect("fixed id")))
                 .map_err(|_| corrupt())?,
         )),

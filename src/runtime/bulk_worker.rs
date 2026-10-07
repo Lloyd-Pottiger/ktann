@@ -139,6 +139,7 @@ async fn claim<B: Backend>(
             backend.admission_budget(),
         );
         building(&mut txn, index).await?;
+        super::bulk_scheduler::authorize(context, &mut txn, index.logical_index_id()).await?;
         match txn
             .get(LogicalKey::BuildDescriptor(index.logical_index_id()))
             .await?
@@ -348,6 +349,7 @@ async fn accept<B: Backend>(
             backend.admission_budget(),
         );
         building(&mut txn, index).await?;
+        super::bulk_scheduler::authorize(context, &mut txn, index.logical_index_id()).await?;
         let key = LogicalKey::BuildWorkspace(index.logical_index_id());
         let current = match txn.get_for_update(key.clone()).await? {
             Some(PersistentValue::BuildWorkspace(w)) => w,

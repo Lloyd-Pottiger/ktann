@@ -281,3 +281,14 @@ and full artifact hash. Initial proof requires the artifact-header digest.
 Workspace and proof Debug output redact locators/cursors. These formats have no
 compatibility layer; malformed, trailing and noncanonical bytes fail closed.
 See [ADR 0027](../adr/0027-bulk-workspace-and-publication.md).
+
+
+Namespace key `[0,3] || LogicalIndexId:u64be` stores Build Schedule, tag `0x11`:
+sized UTF-8 Index Name (1..=255 bytes), the shared Worker Options encoding (sized
+root and seven u64 resource/admission values), a 32-byte owner token, and u64 UTC
+expiry milliseconds. Zero token means unowned; an unowned nonzero expiry is a
+retry delay. Nonzero owner requires nonzero expiry. The token and options are
+redacted in Debug. Index-bound transactions may access only their own namespace
+Build Schedule to protect mutations against automatic takeover. Queue removal
+is separate from index-prefix deletion. All values are canonical and reject
+truncation, trailing bytes, and invalid ownership encodings.

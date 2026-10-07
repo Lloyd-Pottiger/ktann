@@ -7,8 +7,9 @@ loads it; `publish` validates the frozen backend and atomically makes it Active.
 Import Sessions were removed under [ADR 0025](../adr/0025-caller-owned-online-batch-submission.md).
 [ADR 0027](../adr/0027-bulk-workspace-and-publication.md) records the bounded
 coarse-task protocol and workspace ownership. This implementation supports
-explicit worker invocation/takeover, not automatic distributed scheduling or
-parallel construction of one job. Multi-host shared-filesystem qualification
+explicit worker invocation and automatic distributed scheduling under
+[ADR 0028](../adr/0028-automatic-bulk-scheduling.md). A single job remains the
+unit of work; its tree construction is not parallelized. Multi-host shared-filesystem qualification
 remains a deployment requirement; it is not established by local adapter tests.
 
 ### Implemented reservation contract
@@ -109,8 +110,8 @@ registration is needed.
 Index-owned key kind `0x06` stores Build Load value tag `0x0e`: a sized 89-byte
 artifact manifest, a positive u64 owner epoch, a u64 committed-entry cursor,
 a 32-byte committed-prefix SHA-256, and canonical completion and sealed bytes. Every new
-invocation takes over by incrementing the epoch transactionally. There is no
-automatic lease-based takeover yet. Every
+invocation takes over by incrementing the epoch transactionally. Automatic scheduling adds renewable queue ownership; explicit loads retain
+their existing epoch protocol. Every
 chunk update-protects the Building Manifest and Build Load checkpoint, checks
 that epoch and cursor, and commits its serving KV puts and new cursor atomically.
 The immutable Build Descriptor is checked when claiming; ordinary chunks do not
@@ -408,7 +409,8 @@ The first implementation has one preparation task, one load task, and one paged
 validation proof per job. The single accepted Serving Artifact is the complete
 load inventory. No per-record task queue, paginated task registration, lease
 service, or hierarchical proof reduction is needed for this finite inventory.
-Workers are explicitly invoked; each invocation takes a new preparation epoch.
+Workers are explicitly invoked or claimed by the automatic scheduler; each
+invocation takes a new preparation epoch.
 This trades intra-job parallelism for a small, recoverable protocol. Different
 jobs can run concurrently within Runtime admission and backend limits.
 
@@ -429,6 +431,39 @@ Loading uses the independent Build Load epoch and bounded atomic checkpoint
 protocol above. Terminal preparation/validation errors persist in Build Workspace
 and surface as `Failed { kind }`; abort/rebuild is required. Cancellation and
 transient failures leave resumable work.
+
+### Automatic distributed scheduling
+
+`job.schedule(worker_options)` persists an idempotent request for that original
+Logical Index ID. `runtime.run_bulk_scheduler(settings, control)` is the
+long-running process entry point: it polls bounded namespace pages, competes for
+expired/unowned jobs, renews ownership, runs preparation/loading, resumes sealed
+validation, and publishes automatically. Configure `max_jobs` (1..=64),
+`poll_interval` (at least 1 ms), and `lease_duration` (at least three poll
+intervals). Defaults are one job, one-second polling, and a 30-second lease.
+
+Queue records survive process loss and index-prefix removal. They persist the
+name/options, random owner token and expiry. All build mutation transactions
+update-protect the token, including acceptance, load chunks, proof pages and
+activation. A superseded worker cannot commit even if its native IO finishes
+later. Queued jobs reject manual worker/load/publish mutation attempts with
+`BulkBuildBusy`; explicit abort remains available. Existing job status reports
+Preparing until progress begins, then Loading/Loaded/Validating/Published or
+Failed. No automatic scheduler is created merely by reserving a job.
+
+Unknown queue/claim commits resolve by reading the same identity/token. Work
+failures remain resumable or persist Failed according to the existing worker
+contract; one failed job does not stop discovery. Corrupt coordination metadata
+surfaces as a scheduler error. Successful publication/cleanup retires the queue;
+cleanup busy errors retain it for retry. Interrupted Dropping jobs resume the
+original identity's drop cleanup, never a replacement name. Failed jobs retire
+from scheduling but retain their workspace until explicitly aborted.
+
+Stopping/dropping the scheduler cancels local work. Native IO retains its old
+admission/lock guards until actual exit; another process can reclaim the queue
+after expiry. Token changes, not elapsed wall time, enforce correctness. Clock
+skew affects recovery latency and redundant IO. Each process must expose the
+same immutable source and workspace paths; filesystem qualification is separate.
 
 ## 7. Sealing, exact validation, publication, and reclamation
 
@@ -534,5 +569,5 @@ Its report distinguishes preparation/loading and validation/publication time.
 Measurements are empirical, not an SLA or a comparison to online insertion.
 Cohere, larger populations, concurrent-serving impact, multi-host filesystem
 failure injection, and distributed scaling require separate qualification. The
-first release does not claim a 1B SLA, an automatic distributed scheduler, or a
+implementation does not claim a 1B SLA or a
 recall/speedup threshold that has not been measured against an agreed baseline.

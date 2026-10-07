@@ -203,3 +203,15 @@ activates the original identity. Terminal failures persist; transient failures
 and cancellation remain resumable. Root advisory locks order native IO against
 reclamation. Busy cleanup is deferred; namespace cleanup pages discover orphaned
 workspaces after ordinary index deletion. See [Bulk Build](bulk-build.md).
+
+
+Automatic Bulk Build scheduling uses `schedule_bulk_build` for queue discovery,
+lease coordination and scheduled attempts. Its bounded JoinSet admits at most
+`max_jobs` per scheduler, additionally limited by shared foreground admission.
+Lease renewal runs inside the admitted attempt, without acquiring another
+foreground permit. Dropping the scheduler cancels child tasks; shutdown stops
+discovery and cancels active attempts. Native IO may outlive cancellation while
+retaining admission and file locks. Expired queue owners are replaceable by any
+participating Runtime; each build mutation transaction verifies the owner token.
+A failed job is durably inspectable and does not stop unrelated jobs. Invalid
+coordination state is surfaced rather than retried indefinitely.

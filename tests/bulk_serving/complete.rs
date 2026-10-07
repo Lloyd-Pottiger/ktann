@@ -2,7 +2,7 @@
 use super::*;
 use ktann::api::BulkWorkerOptions;
 
-fn worker_options(dir: &Directory) -> BulkWorkerOptions {
+pub(super) fn worker_options(dir: &Directory) -> BulkWorkerOptions {
     let root = dir.0.join("work");
     fs::create_dir(&root).unwrap();
     let mut worker = BulkWorkerOptions::new(root);

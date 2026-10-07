@@ -69,27 +69,9 @@ impl fmt::Debug for BuildWorkspace {
 }
 pub(super) fn encode(e: &mut Encoder, w: &BuildWorkspace) -> Result<()> {
     w.validate()?;
-    let o = &w.options;
-    e.sized_bytes(
-        o.workspace
-            .to_str()
-            .ok_or_else(Error::invalid_argument)?
-            .as_bytes(),
-        3900,
-    )?;
-    for n in [
-        o.sort_memory_bytes as u64,
-        o.sort_scratch_bytes,
-        o.serving_memory_bytes as u64,
-        o.serving_scratch_bytes,
-        o.max_artifact_bytes,
-        o.load.max_mutations as u64,
-        o.load.max_bytes as u64,
-        w.hard_limits.max_key_bytes as u64,
-        w.hard_limits.max_value_bytes as u64,
-    ] {
-        e.u64(n);
-    }
+    encode_options(e, &w.options)?;
+    e.u64(w.hard_limits.max_key_bytes as u64);
+    e.u64(w.hard_limits.max_value_bytes as u64);
     e.bytes(&w.token);
     e.u64(w.epoch);
     for artifact in [&w.forest, &w.serving] {
@@ -114,20 +96,7 @@ pub(super) fn encode(e: &mut Encoder, w: &BuildWorkspace) -> Result<()> {
     Ok(())
 }
 pub(super) fn decode(d: &mut Decoder) -> Result<BuildWorkspace> {
-    let path = d.sized_bytes(3900)?;
-    let workspace = PathBuf::from(std::str::from_utf8(&path).map_err(|_| corrupt())?);
-    let options = BulkWorkerOptions {
-        workspace,
-        sort_memory_bytes: usize::try_from(d.u64()?).map_err(|_| corrupt())?,
-        sort_scratch_bytes: d.u64()?,
-        serving_memory_bytes: usize::try_from(d.u64()?).map_err(|_| corrupt())?,
-        serving_scratch_bytes: d.u64()?,
-        max_artifact_bytes: d.u64()?,
-        load: BulkLoadOptions {
-            max_mutations: usize::try_from(d.u64()?).map_err(|_| corrupt())?,
-            max_bytes: usize::try_from(d.u64()?).map_err(|_| corrupt())?,
-        },
-    };
+    let options = decode_options(d)?;
     let hard_limits = HardLimits {
         max_key_bytes: usize::try_from(d.u64()?).map_err(|_| corrupt())?,
         max_value_bytes: usize::try_from(d.u64()?).map_err(|_| corrupt())?,
@@ -169,4 +138,46 @@ pub(super) fn decode(d: &mut Decoder) -> Result<BuildWorkspace> {
     };
     value.validate().map_err(|_| corrupt())?;
     Ok(value)
+}
+
+pub(super) fn encode_options(e: &mut Encoder, o: &BulkWorkerOptions) -> Result<()> {
+    o.validate()?;
+    e.sized_bytes(
+        o.workspace
+            .to_str()
+            .ok_or_else(Error::invalid_argument)?
+            .as_bytes(),
+        3900,
+    )?;
+    for n in [
+        o.sort_memory_bytes as u64,
+        o.sort_scratch_bytes,
+        o.serving_memory_bytes as u64,
+        o.serving_scratch_bytes,
+        o.max_artifact_bytes,
+        o.load.max_mutations as u64,
+        o.load.max_bytes as u64,
+    ] {
+        e.u64(n);
+    }
+    Ok(())
+}
+
+pub(super) fn decode_options(d: &mut Decoder) -> Result<BulkWorkerOptions> {
+    let path = d.sized_bytes(3900)?;
+    let workspace = PathBuf::from(std::str::from_utf8(&path).map_err(|_| corrupt())?);
+    let options = BulkWorkerOptions {
+        workspace,
+        sort_memory_bytes: usize::try_from(d.u64()?).map_err(|_| corrupt())?,
+        sort_scratch_bytes: d.u64()?,
+        serving_memory_bytes: usize::try_from(d.u64()?).map_err(|_| corrupt())?,
+        serving_scratch_bytes: d.u64()?,
+        max_artifact_bytes: d.u64()?,
+        load: BulkLoadOptions {
+            max_mutations: usize::try_from(d.u64()?).map_err(|_| corrupt())?,
+            max_bytes: usize::try_from(d.u64()?).map_err(|_| corrupt())?,
+        },
+    };
+    options.validate().map_err(|_| corrupt())?;
+    Ok(options)
 }

@@ -25,6 +25,7 @@ use self::fixup::FixupQueue;
 
 pub(crate) mod bulk_load;
 pub(crate) mod bulk_publish;
+pub(crate) mod bulk_scheduler;
 pub(crate) mod bulk_worker;
 pub(crate) mod fixup;
 pub(crate) mod lifecycle;
@@ -46,6 +47,18 @@ pub struct Runtime<B: Backend> {
 }
 
 impl<B: Backend> Runtime<B> {
+    /// Runs automatic distributed Bulk Build scheduling until cancelled or shutdown.
+    /// Call once per participating Runtime. Jobs are durably queued with
+    /// `BulkBuildJob::schedule`; expiry permits another process to take over.
+    /// This future owns its bounded workers; dropping it cancels local work.
+    pub async fn run_bulk_scheduler(
+        &self,
+        options: crate::api::BulkSchedulerOptions,
+        control: OperationOptions,
+    ) -> Result<()> {
+        bulk_scheduler::run(self, options, control).await
+    }
+
     /// Reserves a new, hidden Logical Index and its immutable source identity.
     ///
     /// Repeating an identical request reopens the reservation. This API does
@@ -384,6 +397,7 @@ impl<B: Backend> Drop for RuntimeHandle<B> {
 }
 
 pub(crate) struct OperationContext<B: Backend> {
+    bulk_authority: Option<[u8; 32]>,
     backend: Arc<B>,
     options: OperationOptions,
     write_beam_size: u32,
@@ -545,6 +559,7 @@ impl<B: Backend> RuntimeInner<B> {
             Operation::Refine
                 | Operation::LoadBulkBuild
                 | Operation::RunBulkBuild
+                | Operation::ScheduleBulkBuild
                 | Operation::PublishBulkBuild
                 | Operation::CleanupBulkBuild
         ) {
@@ -562,6 +577,7 @@ impl<B: Backend> RuntimeInner<B> {
         let deadline = options.deadline();
         let (commit_cancellation, commit_start) = CommitCancellation::pair();
         let context = OperationContext {
+            bulk_authority: None,
             backend,
             options,
             write_beam_size: self.config.write_beam_size(),

@@ -1,5 +1,5 @@
 //! End-to-end SIFT build, paged publication, and held-out recall on RocksDB.
-//! Usage: ktann-bulk-build DATASET_DIRECTORY NEW_OUTPUT_DIRECTORY [RECORD_LIMIT]
+//! Usage: `ktann-bulk-build DATASET_DIRECTORY NEW_OUTPUT_DIRECTORY [RECORD_LIMIT]`
 use bytes::Bytes;
 use ktann::api::{
     BulkWorkerOptions, Error, ErrorKind, GetOptions, IndexConfig, Metric, Record, RuntimeConfig,

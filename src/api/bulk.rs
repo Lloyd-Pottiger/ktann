@@ -136,6 +136,42 @@ impl fmt::Debug for BulkWorkerOptions {
     }
 }
 
+/// Per-process automatic Bulk Build scheduling bounds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BulkSchedulerOptions {
+    /// Maximum jobs admitted concurrently by this scheduler (1..=64).
+    pub max_jobs: usize,
+    /// Queue polling and retry delay, at least one millisecond.
+    pub poll_interval: std::time::Duration,
+    /// Renewable lease duration; at least three poll intervals.
+    pub lease_duration: std::time::Duration,
+}
+impl Default for BulkSchedulerOptions {
+    fn default() -> Self {
+        Self {
+            max_jobs: 1,
+            poll_interval: std::time::Duration::from_secs(1),
+            lease_duration: std::time::Duration::from_secs(30),
+        }
+    }
+}
+impl BulkSchedulerOptions {
+    pub(crate) fn validate(self) -> Result<()> {
+        if self.max_jobs == 0
+            || self.max_jobs > 64
+            || self.poll_interval.as_millis() == 0
+            || self
+                .poll_interval
+                .checked_mul(3)
+                .is_none_or(|minimum| self.lease_duration < minimum)
+            || self.lease_duration.as_millis() > u128::from(u64::MAX)
+        {
+            return Err(super::Error::invalid_argument());
+        }
+        Ok(())
+    }
+}
+
 /// A recoverable reservation for one new Logical Index.
 ///
 /// This handle never follows a reused Index Name. Reservation launches no work;
@@ -249,6 +285,41 @@ impl<B: Backend> BulkBuildJob<B> {
                         manifest,
                         descriptor,
                         artifact,
+                        options,
+                        retry,
+                    )
+                    .await
+                },
+            )
+            .await
+    }
+
+    /// Durably queues this job for automatic preparation, loading and publication.
+    /// Repeating identical options is idempotent. Run a Runtime scheduler on each
+    /// participating process; all must have access to the shared source/workspace.
+    pub async fn schedule(&self, options: BulkWorkerOptions) -> Result<()> {
+        self.schedule_with_control(options, OperationOptions::default())
+            .await
+    }
+    /// Queues work with explicit cancellation and deadline control.
+    pub async fn schedule_with_control(
+        &self,
+        options: BulkWorkerOptions,
+        control: OperationOptions,
+    ) -> Result<()> {
+        let manifest = self.manifest.clone();
+        let name = self.name.clone();
+        let retry = lifecycle::RetryPolicy::from_config(self.runtime.config());
+        self.runtime
+            .run_foreground(
+                Operation::ScheduleBulkBuild,
+                Some(self.logical_index_id()),
+                control,
+                move |mut context| async move {
+                    crate::runtime::bulk_scheduler::enqueue(
+                        &mut context,
+                        manifest,
+                        name,
                         options,
                         retry,
                     )

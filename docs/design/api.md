@@ -327,3 +327,14 @@ status or retry the same operation. `job.cleanup()` retries reclamation;
 `Runtime::cleanup_bulk_builds(maximum, after)` performs bounded orphan discovery.
 The caller retains source files, workspace root, and its coordination lock file.
 See [Bulk Build](bulk-build.md) for filesystem requirements and recovery semantics.
+
+
+Automatic scheduling is opt-in: after reservation call
+`job.schedule(BulkWorkerOptions::new(shared_workspace)).await?`, then run
+`runtime.run_bulk_scheduler(BulkSchedulerOptions::default(), control).await`
+on each worker process. The scheduler future runs until cancellation or Runtime
+shutdown and owns bounded local job tasks. It discovers jobs automatically,
+renews leases, takes over expired workers, publishes and retries cleanup. Stop it
+with `OperationOptions` cancellation/deadline or Runtime shutdown; stopping it does
+not abort durable jobs. Queued jobs reject manual mutation attempts with
+`BulkBuildBusy`. A job's failure remains observable through `status`.

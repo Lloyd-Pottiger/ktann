@@ -227,3 +227,11 @@ It survives removal of the index prefix until exclusive-lock cleanup completes.
 **Build Validation**: A paged exact comparison proof between a core-accepted
 Serving Artifact and frozen backend serving KV bytes. The completed proof and
 sealed Build Load authorize one atomic transition from Building to Active.
+
+
+**Build Schedule**: Namespace-scoped durable request for automatic execution of
+one Bulk Build Job. It fixes worker options and the original name/ID and carries
+a renewable owner token with an expiry for takeover. A committed token change
+fences every old build writer; time alone is not write authority. It is separate
+from artifact ownership in Build Workspace and retires after completion/cleanup
+or a persisted terminal job failure.

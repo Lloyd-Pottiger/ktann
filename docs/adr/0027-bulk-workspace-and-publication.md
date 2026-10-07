@@ -1,6 +1,7 @@
 # ADR 0027: Durable workspace ownership and exact Bulk Build publication
 
-Status: Accepted
+Status: Accepted. The automatic-scheduling deferral is superseded by
+[ADR 0028](0028-automatic-bulk-scheduling.md).
 
 ## Context
 

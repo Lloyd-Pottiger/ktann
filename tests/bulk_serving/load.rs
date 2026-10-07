@@ -585,3 +585,6 @@ async fn replay_checks_the_exact_previously_committed_prefix_before_skipping_it(
 
 #[path = "complete.rs"]
 mod complete;
+
+#[path = "scheduler.rs"]
+mod scheduler;
