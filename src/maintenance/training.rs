@@ -249,6 +249,19 @@ struct TrainedSplit {
     rounds: usize,
 }
 
+/// Applies the serving split's numeric protocol to a bounded offline sample.
+/// The caller owns sample selection and its memory bound.
+pub(crate) fn train_sample(
+    kernel: &VectorKernel,
+    entries: Vec<(Bytes, Box<[f32]>)>,
+) -> Result<SplitCentroids> {
+    let trained = train(kernel, entries)?;
+    Ok(SplitCentroids {
+        left: PartitionCentroid::new(trained.left),
+        right: PartitionCentroid::new(trained.right),
+    })
+}
+
 /// Runs the deterministic balanced K-means protocol over one loaded source.
 ///
 /// The entries are reordered by canonical ID before seeding, so the result is

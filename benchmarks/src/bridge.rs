@@ -484,8 +484,9 @@ impl<B: Backend> Service<B> {
                 }
                 let start = Instant::now();
                 state.started.get_or_insert(start);
-                index.batch_mutate(mutations).await.map_err(api_error)?;
+                let outcome = index.batch_mutate(mutations).await;
                 state.insert_seconds += start.elapsed().as_secs_f64();
+                outcome.map_err(api_error)?;
                 state.records += ids.len() as u64;
                 if let Some(probe) = root_probe {
                     state.root_probe = Some(probe);

@@ -15,6 +15,15 @@ path = "src/main.rs"
 name = "ktann-vdbbench-bridge"
 path = "src/bin/vdbbench_bridge.rs"
 
+[[bin]]
+name = "ktann-bulk-construct"
+path = "src/bin/bulk_construct.rs"
+
+[[bin]]
+name = "ktann-bulk-build"
+path = "src/bin/bulk_build.rs"
+required-features = ["rocksdb"]
+
 [features]
 default = ["rocksdb"]
 rocksdb = ["dep:ktann-rocksdb", "dep:rocksdb"]
