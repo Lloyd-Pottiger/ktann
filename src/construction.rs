@@ -105,6 +105,9 @@ pub fn construct_tree(
         options,
         kernel,
         sort_rows,
+        // A rank key is 20 bytes. Projection uses at most half the bytes of
+        // even the shortest vector row, bounding retained-input scratch use.
+        project_splits: 12 + 1 + dimension * 4 >= 2 * 20,
     };
     let mut input = work.writer()?;
     for record in records {
@@ -167,6 +170,7 @@ struct Run {
     path: PathBuf,
     count: u64,
     bytes: u64,
+    vector_bytes: usize,
 }
 struct Output {
     run: Run,
@@ -246,10 +250,16 @@ struct Workspace {
     options: ConstructionOptions,
     kernel: VectorKernel,
     sort_rows: usize,
+    project_splits: bool,
 }
 
 impl Workspace {
     fn writer(&mut self) -> Result<Output> {
+        self.writer_with_vector_bytes(self.kernel.dimension() * 4)
+    }
+
+    // Split keys carry no vector payload; their merge runs share the same quota.
+    fn writer_with_vector_bytes(&mut self, vector_bytes: usize) -> Result<Output> {
         let path = self.directory.join(format!("{:016x}.run", self.next_file));
         self.next_file = self.next_file.checked_add(1).ok_or_else(limit)?;
         let file = OpenOptions::new()
@@ -262,6 +272,7 @@ impl Workspace {
                 path,
                 count: 0,
                 bytes: 0,
+                vector_bytes,
             },
             writer: BufWriter::with_capacity(BUFFER_BYTES, file),
         })
@@ -315,7 +326,7 @@ impl Workspace {
         Ok(Input {
             reader: BufReader::with_capacity(BUFFER_BYTES, file),
             remaining: run.count,
-            encoded_vector: vec![0; self.kernel.dimension() * 4],
+            encoded_vector: vec![0; run.vector_bytes],
         })
     }
 
@@ -327,8 +338,22 @@ impl Workspace {
 
     /// Binary carry merging bounds run inventory to at most 64 descriptors and
     /// opens only two inputs plus one output regardless of input cardinality.
-    fn sort(&mut self, input: Run, mut prepare: impl FnMut(&mut Row) -> Result<()>) -> Result<Run> {
-        let mut reader = self.reader(&input)?;
+    fn sort(&mut self, input: Run, prepare: impl FnMut(&mut Row) -> Result<()>) -> Result<Run> {
+        let vector_bytes = input.vector_bytes;
+        let runs = self.sort_runs(&input, vector_bytes, prepare)?;
+        self.remove(input)?;
+        self.merge_runs(runs, vector_bytes)
+    }
+
+    // Project directly into bounded sort buffers, without materializing a second
+    // unsorted input. The caller controls when the original run can be removed.
+    fn sort_runs(
+        &mut self,
+        input: &Run,
+        vector_bytes: usize,
+        mut prepare: impl FnMut(&mut Row) -> Result<()>,
+    ) -> Result<Vec<Option<Run>>> {
+        let mut reader = self.reader(input)?;
         let mut levels: Vec<Option<Run>> = Vec::new();
         loop {
             // A quota is a ceiling, not an instruction to reserve it all for a
@@ -347,7 +372,7 @@ impl Workspace {
                 break;
             }
             rows.sort_unstable_by(Row::compare);
-            let mut output = self.writer()?;
+            let mut output = self.writer_with_vector_bytes(vector_bytes)?;
             for row in rows {
                 self.append(&mut output, &row)?;
             }
@@ -369,8 +394,10 @@ impl Workspace {
                 }
             }
         }
-        drop(reader);
-        self.remove(input)?;
+        Ok(levels)
+    }
+
+    fn merge_runs(&mut self, levels: Vec<Option<Run>>, vector_bytes: usize) -> Result<Run> {
         let mut result = None;
         for run in levels.into_iter().flatten() {
             result = Some(match result {
@@ -381,7 +408,7 @@ impl Workspace {
         match result {
             Some(run) => Ok(run),
             None => {
-                let empty = self.writer()?;
+                let empty = self.writer_with_vector_bytes(vector_bytes)?;
                 self.finish(empty)
             }
         }
@@ -392,7 +419,7 @@ impl Workspace {
         let mut r = self.reader(&right)?;
         let mut a = l.next()?;
         let mut b = r.next()?;
-        let mut output = self.writer()?;
+        let mut output = self.writer_with_vector_bytes(left.vector_bytes)?;
         while a.is_some() || b.is_some() {
             let take_left = match (&a, &b) {
                 (Some(a), Some(b)) => a.compare(b).is_le(),
@@ -426,9 +453,11 @@ impl Workspace {
         emit: &mut impl FnMut(PartitionPlan) -> Result<()>,
     ) -> Result<()> {
         if input.count <= u64::from(self.options.max_partition_entries) {
-            // Only final groups need canonical accumulation order. Root inputs
-            // are already in ID order from preflight or ascending parent keys.
-            let input = if root {
+            // Projected splits scatter stably from preflight ID order. Their
+            // ordinals resolve ties exactly like IDs, and terminal means can
+            // stream directly in canonical order. Tiny rows use the original
+            // full-row sorter, whose children still need this final ID sort.
+            let input = if root || self.project_splits {
                 input
             } else {
                 self.sort(input, |_| Ok(()))?
@@ -508,33 +537,67 @@ impl Workspace {
         )?;
         let half = input.count / 2;
         let kernel = self.kernel.clone();
-        let assigned = self.sort(input, |row| {
-            row.order = kernel.routing_distance(&row.vector, centroids.left().components())?
+        let distance_difference = |row: &Row| -> Result<f64> {
+            let distance = kernel.routing_distance(&row.vector, centroids.left().components())?
                 - kernel.routing_distance(&row.vector, centroids.right().components())?;
-            if !row.order.is_finite() {
+            if !distance.is_finite() {
                 return Err(Error::invalid_argument());
             }
-            Ok(())
-        })?;
-        drop((kernel, centroids));
-        let mut reader = self.reader(&assigned)?;
+            Ok(distance)
+        };
+        let boundary = if self.project_splits {
+            // ID order is invariant along stable scatters. Fixed-width ordinals
+            // give exactly the same distance ties without copying arbitrary IDs.
+            let mut ordinal = 0_u64;
+            let runs = self.sort_runs(&input, 0, |row| {
+                row.order = distance_difference(row)?;
+                row.id = Bytes::copy_from_slice(&ordinal.to_be_bytes());
+                row.vector = Box::default();
+                ordinal += 1;
+                Ok(())
+            })?;
+            let keys = self.merge_runs(runs, 0)?;
+            let mut reader = self.reader(&keys)?;
+            let mut boundary = None;
+            for _ in 0..half {
+                boundary = reader.next()?;
+            }
+            let boundary = boundary.ok_or_else(corrupt)?;
+            let ordinal =
+                u64::from_be_bytes(boundary.id.as_ref().try_into().map_err(|_| corrupt())?);
+            drop(reader);
+            self.remove(keys)?;
+            Some((boundary.order, ordinal))
+        } else {
+            None
+        };
+        let input = if boundary.is_some() {
+            input
+        } else {
+            self.sort(input, |row| {
+                row.order = distance_difference(row)?;
+                Ok(())
+            })?
+        };
+        let mut reader = self.reader(&input)?;
         let mut left = self.writer()?;
         let mut right = self.writer()?;
-        let mut ordinal = 0;
+        let mut ordinal = 0_u64;
         while let Some(mut row) = reader.next()? {
-            row.order = 0.0;
-            self.append(
-                if ordinal < half {
-                    &mut left
-                } else {
-                    &mut right
-                },
-                &row,
-            )?;
+            let to_left = match boundary {
+                Some((distance, cut)) => distance_difference(&row)?
+                    .total_cmp(&distance)
+                    .then_with(|| ordinal.cmp(&cut))
+                    .is_le(),
+                None => ordinal < half,
+            };
             ordinal += 1;
+            row.order = 0.0;
+            self.append(if to_left { &mut left } else { &mut right }, &row)?;
         }
         drop(reader);
-        self.remove(assigned)?;
+        self.remove(input)?;
+        drop((kernel, centroids));
         let left = self.finish(left)?;
         let right = self.finish(right)?;
         self.group(left, level, false, parents, emit)?;
@@ -775,6 +838,57 @@ mod tests {
             assert_eq!(a.level, b.level);
             assert_eq!(a.entries, b.entries);
             assert_eq!(a.centroid, b.centroid);
+        }
+    }
+
+    #[test]
+    fn projected_splits_keep_variable_id_ties_canonical_across_spill_budgets() {
+        for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
+            let make = |reverse: bool, budget: usize| {
+                let directory = Directory::new();
+                let mut settings = options();
+                settings.memory_bytes = budget;
+                let mut input: Vec<_> = (0_u64..513)
+                    .map(|id| {
+                        let encoded = id.to_be_bytes();
+                        let first = encoded.iter().position(|byte| *byte != 0).unwrap_or(7);
+                        ConstructionRecord {
+                            id: Bytes::copy_from_slice(&encoded[first..]),
+                            vector: vec![1.0, (id % 3) as f32, -0.0, 0.0, 0.0, 0.0, 0.0]
+                                .into_boxed_slice(),
+                        }
+                    })
+                    .collect();
+                if reverse {
+                    input.reverse();
+                }
+                let mut plans = BTreeMap::new();
+                construct_tree(
+                    &directory.0,
+                    7,
+                    metric,
+                    [7; 32],
+                    settings,
+                    input.into_iter().map(Ok),
+                    |plan| {
+                        assert!(plan.entries.windows(2).all(|ids| ids[0] < ids[1]));
+                        plans.insert(plan.key.get(), (plan.level, plan.entries, plan.centroid));
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 0);
+                plans
+            };
+            let a = make(false, 200_000);
+            let b = make(true, 600_000);
+            assert_eq!(a, b);
+            let ids: std::collections::BTreeSet<_> = a
+                .values()
+                .filter(|(level, _, _)| *level == 1)
+                .flat_map(|(_, entries, _)| entries.iter().cloned())
+                .collect();
+            assert_eq!(ids.len(), 513);
         }
     }
 

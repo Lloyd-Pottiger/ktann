@@ -1,5 +1,7 @@
-//! Recomputable, byte-bounded binary merge sorting for input preparation.
+//! Recomputable, byte-bounded multiway merge sorting for input preparation.
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -8,9 +10,11 @@ use crate::api::{Error, ErrorKind, Result};
 
 use super::files::{corrupt, io_error};
 
-// Amortize file syscalls while keeping two caller readers plus a three-buffer
-// merge within validate_memory's existing 512 KiB IO/metadata reservation.
+// Two caller readers, eight 32 KiB merge readers and one 64 KiB writer
+// use at most 448 KiB of the 512 KiB IO/metadata reservation.
 const BUFFER_BYTES: usize = 64 * 1024;
+const MERGE_BUFFER_BYTES: usize = 32 * 1024;
+const MAX_FAN_IN: usize = 8;
 
 /// One sortable projection. Neither vectors nor field values appear in Debug.
 #[derive(Eq, Ord, PartialEq, PartialOrd)]
@@ -26,7 +30,7 @@ impl Row {
 }
 
 pub(super) struct Run {
-    path: PathBuf,
+    file_id: u64,
     bytes: u64,
     rows: u64,
 }
@@ -57,7 +61,8 @@ impl Space {
     }
 
     fn writer(&mut self) -> Result<(Run, BufWriter<File>)> {
-        let path = self.directory.join(self.next.to_string());
+        let file_id = self.next;
+        let path = self.directory.join(file_id.to_string());
         self.next = self.next.checked_add(1).ok_or_else(limit)?;
         let file = OpenOptions::new()
             .create_new(true)
@@ -66,7 +71,7 @@ impl Space {
             .map_err(io_error)?;
         Ok((
             Run {
-                path,
+                file_id,
                 bytes: 0,
                 rows: 0,
             },
@@ -100,12 +105,16 @@ impl Space {
     }
 
     pub fn reader(&self, run: &Run) -> Result<RunReader> {
-        let file = File::open(&run.path).map_err(io_error)?;
+        self.reader_with_capacity(run, BUFFER_BYTES)
+    }
+
+    fn reader_with_capacity(&self, run: &Run, capacity: usize) -> Result<RunReader> {
+        let file = File::open(self.directory.join(run.file_id.to_string())).map_err(io_error)?;
         if file.metadata().map_err(io_error)?.len() != run.bytes {
             return Err(corrupt());
         }
         Ok(RunReader {
-            file: BufReader::with_capacity(BUFFER_BYTES, file),
+            file: BufReader::with_capacity(capacity, file),
             remaining: run.rows,
             bytes: run.bytes,
             maximum_row: self.maximum_row,
@@ -113,35 +122,40 @@ impl Space {
     }
 
     pub fn remove(&mut self, run: Run) -> Result<()> {
-        fs::remove_file(run.path).map_err(io_error)?;
+        fs::remove_file(self.directory.join(run.file_id.to_string())).map_err(io_error)?;
         self.live -= run.bytes;
         Ok(())
     }
 
-    fn merge(&mut self, left: Run, right: Run) -> Result<Run> {
-        let mut a = self.reader(&left)?;
-        let mut b = self.reader(&right)?;
+    fn merge(&mut self, inputs: Vec<Run>) -> Result<Run> {
+        let capacity = if inputs.len() <= 4 {
+            BUFFER_BYTES
+        } else {
+            MERGE_BUFFER_BYTES
+        };
+        let mut readers = inputs
+            .iter()
+            .map(|run| self.reader_with_capacity(run, capacity))
+            .collect::<Result<Vec<_>>>()?;
+        let mut heads = BinaryHeap::with_capacity(readers.len());
+        for (index, reader) in readers.iter_mut().enumerate() {
+            if let Some(row) = reader.next()? {
+                heads.push(Reverse((row, index)));
+            }
+        }
         let (mut run, mut output) = self.writer()?;
-        let mut x = a.next()?;
-        let mut y = b.next()?;
-        while x.is_some() || y.is_some() {
-            let take_left = match (&x, &y) {
-                (Some(x), Some(y)) => x <= y,
-                (Some(_), None) => true,
-                _ => false,
-            };
-            if take_left {
-                self.append(&mut run, &mut output, x.as_ref().expect("selected row"))?;
-                x = a.next()?;
-            } else {
-                self.append(&mut run, &mut output, y.as_ref().expect("selected row"))?;
-                y = b.next()?;
+        while let Some(Reverse((row, index))) = heads.pop() {
+            self.append(&mut run, &mut output, &row)?;
+            drop(row);
+            if let Some(next) = readers[index].next()? {
+                heads.push(Reverse((next, index)));
             }
         }
         output.flush().map_err(io_error)?;
-        drop((a, b, output));
-        self.remove(left)?;
-        self.remove(right)?;
+        drop((readers, output));
+        for input in inputs {
+            self.remove(input)?;
+        }
         Ok(run)
     }
 }
@@ -185,41 +199,53 @@ impl RunReader {
 }
 
 /// Accounts allocated row payloads and row slots separately; sort_unstable
-/// allocates no additional array. Binary carry bounds live run descriptors.
+/// allocates no additional array. Base-fan-in carry bounds live run descriptors.
 pub(super) struct Sorter<'a> {
     space: &'a mut Space,
     rows: Vec<Row>,
     budget: usize,
     payload_bytes: usize,
-    runs: Vec<Option<Run>>,
+    runs: Vec<Vec<Run>>,
+    fan_in: usize,
 }
 
 pub(super) fn validate_memory(memory: usize, maximum_row: usize) -> Result<usize> {
-    // While spilling, the caller can retain one source row and two merge
-    // readers hold rows. Reserve a fourth row for transient decoding/copying,
-    // IO buffers and fixed run/path metadata. The remaining budget owns rows.
-    let reserved = maximum_row
-        .checked_mul(4)
-        .and_then(|n| n.checked_add(512 * 1024))
+    memory_plan(memory, maximum_row).map(|(_, budget)| budget)
+}
+
+// Larger rows or small budgets reduce fan-in, rather than rejecting a budget
+// that can still support a two-way merge. All merge heads are explicitly charged.
+fn memory_plan(memory: usize, maximum_row: usize) -> Result<(usize, usize)> {
+    let minimum = maximum_row
+        .checked_add(std::mem::size_of::<Row>())
         .ok_or_else(limit)?;
-    let budget = memory
-        .checked_sub(reserved)
-        .ok_or_else(Error::invalid_argument)?;
-    if budget < maximum_row + std::mem::size_of::<Row>() {
-        return Err(Error::invalid_argument());
+    for fan_in in (2..=MAX_FAN_IN).rev() {
+        let Some(reserved) = maximum_row
+            .checked_mul(fan_in + 2)
+            .and_then(|n| n.checked_add(512 * 1024))
+        else {
+            continue;
+        };
+        if let Some(budget) = memory
+            .checked_sub(reserved)
+            .filter(|budget| *budget >= minimum)
+        {
+            return Ok((fan_in, budget));
+        }
     }
-    Ok(budget)
+    Err(Error::invalid_argument())
 }
 
 impl<'a> Sorter<'a> {
     pub fn new(space: &'a mut Space, memory: usize) -> Result<Self> {
-        let budget = validate_memory(memory, space.maximum_row)?;
+        let (fan_in, budget) = memory_plan(memory, space.maximum_row)?;
         Ok(Self {
             space,
             rows: Vec::new(),
             budget,
             payload_bytes: 0,
             runs: Vec::new(),
+            fan_in,
         })
     }
 
@@ -278,30 +304,34 @@ impl<'a> Sorter<'a> {
         let mut level = 0;
         loop {
             if level == self.runs.len() {
-                self.runs.push(Some(run));
+                self.runs.push(Vec::with_capacity(self.fan_in));
+            }
+            self.runs[level].push(run);
+            if self.runs[level].len() < self.fan_in {
                 break;
             }
-            if let Some(other) = self.runs[level].take() {
-                run = self.space.merge(other, run)?;
-                level += 1;
-            } else {
-                self.runs[level] = Some(run);
-                break;
-            }
+            run = self.space.merge(std::mem::take(&mut self.runs[level]))?;
+            level += 1;
         }
         Ok(())
     }
 
     pub fn finish(mut self) -> Result<Run> {
         self.spill()?;
-        let mut result = None;
-        for run in self.runs.into_iter().flatten() {
-            result = Some(match result {
-                None => run,
-                Some(other) => self.space.merge(other, run)?,
-            });
+        let mut runs: Vec<_> = self.runs.into_iter().flatten().collect();
+        // Merge smaller runs first. The first partial fan-in leaves a count
+        // congruent to one modulo (fan_in-1), avoiding repeated large merges.
+        while runs.len() > 1 {
+            runs.sort_unstable_by_key(|run| (run.bytes, run.file_id));
+            let count = if runs.len() <= self.fan_in {
+                runs.len()
+            } else {
+                2 + (runs.len() - 2) % (self.fan_in - 1)
+            };
+            let inputs = runs.drain(..count).collect();
+            runs.push(self.space.merge(inputs)?);
         }
-        match result {
+        match runs.pop() {
             Some(run) => Ok(run),
             None => {
                 let (run, mut file) = self.space.writer()?;
@@ -314,4 +344,70 @@ impl<'a> Sorter<'a> {
 
 fn limit() -> Error {
     Error::new(ErrorKind::LimitExceeded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Directory(PathBuf);
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn bounded_merges_preserve_full_lexical_order_and_reclaim_runs() {
+        let row_bound = 128;
+        let overhead = std::mem::size_of::<Row>();
+        for (case, memory, count) in [
+            (0, 512 * 1024 + 5 * row_bound + overhead, 400_u16),
+            (
+                1,
+                512 * 1024 + 10 * row_bound + 10 * (row_bound + overhead),
+                2000,
+            ),
+        ] {
+            let directory = Directory(std::env::temp_dir().join(format!(
+                    "ktann-merge-{}-{case}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                )));
+            let mut space = Space::new(&directory.0, 1024 * 1024, row_bound).unwrap();
+            let mut expected: Vec<_> = (0..count)
+                .rev()
+                .map(|id| {
+                    (
+                        (id % 17).to_be_bytes().to_vec(),
+                        vec![(id % 251) as u8; (id % 80 + 1) as usize],
+                    )
+                })
+                .collect();
+            let mut sorter = Sorter::new(&mut space, memory).unwrap();
+            for (key, value) in &expected {
+                sorter
+                    .push(Row {
+                        key: key.clone(),
+                        value: value.clone(),
+                    })
+                    .unwrap();
+            }
+            let run = sorter.finish().unwrap();
+            let mut reader = space.reader(&run).unwrap();
+            let mut actual = Vec::new();
+            while let Some(row) = reader.next().unwrap() {
+                actual.push((row.key, row.value));
+            }
+            expected.sort();
+            assert_eq!(actual, expected);
+            drop(reader);
+            space.remove(run).unwrap();
+            assert_eq!(space.live, 0);
+            assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 0);
+        }
+    }
 }

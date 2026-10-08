@@ -2,6 +2,10 @@
 
 Status: **Implemented for a complete, resumable initial build.**
 
+Throughput and search-quality limitations, with a proposed redesign, are tracked
+in [Bulk Build Throughput Redesign](bulk-build-performance.md). The redesign is
+a draft and does not change the implemented contract below.
+
 `start_bulk_build` reserves a hidden Logical Index; `run_worker` prepares and
 loads it; `publish` validates the frozen backend and atomically makes it Active.
 Import Sessions were removed under [ADR 0025](../adr/0025-caller-owned-online-batch-submission.md).
@@ -355,14 +359,25 @@ population is below the minimum remains a single leaf root.
 
 Each partition's final centroid is computed from its complete assigned group,
 with canonical ID accumulation order and the current metric-specific treatment.
-Only final groups need an ID sort. Intermediate groups do not require one because
-hash sampling and distance/ID split assignment are independent of input order.
-Root inputs are already ordered by the initial duplicate preflight or by ascending
-allocated parent keys. Final groups reuse the bounded sorting machinery.
+Root inputs are ordered by the initial duplicate preflight or by ascending
+allocated parent keys. When the shortest encoded vector row is at least twice
+the 20-byte split key, sort only `(distance_difference, input_ordinal)` to find
+the exact boundary, then sequentially rescan and stably scatter the original
+rows. Canonical ID order is preserved through each child, so ordinals resolve
+ties identically to IDs and final centroids need no additional ID sort. For
+smaller rows, sort complete rows and restore ID order only in final groups.
+This row-width choice bounds the retained-input cost without changing grouping,
+centroid bytes, algorithm identity or the configured memory ceiling.
 Sample centroids guide grouping; they are not used as substitutes for final
 centroids. Leaf groups are final assignments, not a requirement that every record
 would subsequently follow greedy nearest-centroid insertion to that same leaf.
 Search quality must be measured under the resulting topology.
+
+The artifact pipeline's generic external sorter uses two to eight merge inputs,
+selected from its existing memory budget and maximum encoded row size. All row
+heads and IO buffers are reserved before forming runs. Numeric run IDs bound
+pending metadata; final consolidation merges smaller runs first to avoid
+repeatedly rewriting a large run. There is no new public tuning parameter.
 
 This explicitly uses external sorting and repeated data passes. It is not a
 single-pass algorithm and does not promise cheap construction at 1B scale. A
