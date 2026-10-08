@@ -147,7 +147,7 @@ pub fn construct_tree(
             work.remove(parents)?;
             return Ok(work.report);
         }
-        input = work.sort(parents, |_| Ok(()))?;
+        input = parents;
         level = level.checked_add(1).ok_or_else(limit)?;
     }
 }
@@ -426,6 +426,13 @@ impl Workspace {
         emit: &mut impl FnMut(PartitionPlan) -> Result<()>,
     ) -> Result<()> {
         if input.count <= u64::from(self.options.max_partition_entries) {
+            // Only final groups need canonical accumulation order. Root inputs
+            // are already in ID order from preflight or ascending parent keys.
+            let input = if root {
+                input
+            } else {
+                self.sort(input, |_| Ok(()))?
+            };
             let key = if root {
                 1
             } else {
@@ -530,8 +537,6 @@ impl Workspace {
         self.remove(assigned)?;
         let left = self.finish(left)?;
         let right = self.finish(right)?;
-        let left = self.sort(left, |_| Ok(()))?;
-        let right = self.sort(right, |_| Ok(()))?;
         self.group(left, level, false, parents, emit)?;
         self.group(right, level, false, parents, emit)
     }

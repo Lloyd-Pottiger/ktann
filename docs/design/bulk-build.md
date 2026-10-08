@@ -354,7 +354,11 @@ also respects the minimum for every non-root final group. A tree whose entire
 population is below the minimum remains a single leaf root.
 
 Each partition's final centroid is computed from its complete assigned group,
-with deterministic accumulation order and the current metric-specific treatment.
+with canonical ID accumulation order and the current metric-specific treatment.
+Only final groups need an ID sort. Intermediate groups do not require one because
+hash sampling and distance/ID split assignment are independent of input order.
+Root inputs are already ordered by the initial duplicate preflight or by ascending
+allocated parent keys. Final groups reuse the bounded sorting machinery.
 Sample centroids guide grouping; they are not used as substitutes for final
 centroids. Leaf groups are final assignments, not a requirement that every record
 would subsequently follow greedy nearest-centroid insertion to that same leaf.
