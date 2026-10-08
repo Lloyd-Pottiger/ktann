@@ -8,7 +8,9 @@ use crate::api::{Error, ErrorKind, Result};
 
 use super::files::{corrupt, io_error};
 
-const BUFFER_BYTES: usize = 8192;
+// Amortize file syscalls while keeping two caller readers plus a three-buffer
+// merge within validate_memory's existing 512 KiB IO/metadata reservation.
+const BUFFER_BYTES: usize = 64 * 1024;
 
 /// One sortable projection. Neither vectors nor field values appear in Debug.
 #[derive(Eq, Ord, PartialEq, PartialOrd)]
