@@ -19,7 +19,7 @@ mod verify;
 
 pub use bulk::{
     BulkBuildJob, BulkBuildStatus, BulkCleanupPage, BulkLoadOptions, BulkSchedulerOptions,
-    BulkWorkerOptions,
+    BulkWorkerOptions, BulkWorkerReport,
 };
 pub(crate) use config::MAX_DIMENSION;
 pub use config::{IndexConfig, RuntimeConfig};

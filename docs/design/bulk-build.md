@@ -99,3 +99,7 @@ See [ADR 0026](../adr/0026-building-reservations.md) and
 publication. Scheduler ownership fences worker, load, and publication writes.
 Bounded leases permit takeover after a worker stops renewing; namespace cleanup
 reclaims orphaned owned files. Manual completion remains available.
+
+Receipt-time preparation can be passed with `run_worker_with_prepared_input`.
+It is a volatile optimization: its source identity, configuration, and options
+are checked before use; recovery recomputes it from the sealed Input Snapshot.

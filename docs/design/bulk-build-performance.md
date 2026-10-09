@@ -533,3 +533,87 @@ unchanged. These results do not establish equal whole-process memory use or a
 query-speed improvement. Whole-run CPU likewise is not build-only CPU. Raw
 reports and identity assertions are in `full-baseline/`, `full-candidate/` and
 `full-comparison.json` under the report directory above.
+
+
+## Receipt-time bounded preparation and sorter capacity
+
+`PreparedInputWriter` captures the unchanged original-order source while
+projecting Tree Keys, IDs and vectors into bounded sorted runs. A consuming
+append supplies backpressure. One-use preparation is bound to source identity,
+configuration and options before the worker claims a workspace; it is not a
+new durable checkpoint. Losing it leaves ordinary worker/scheduler recovery
+from the sealed source intact. Local ID duplicates fail during spills, and a
+complete global uniqueness check still precedes partition emission.
+
+The two row buffers split the budget after one shared IO/merge reservation;
+their IO runs serially. Merge fan-in accounts for both minimum row buffers.
+Capacity growth also reserves space for incoming payloads instead of occupying
+the budget with empty Row slots. This shared sorter improvement applies to
+ordinary preparation and serving sorts too. No memory limit was raised, and
+partition training and metric normalization still begin after EOF.
+
+A new complete canonical Cohere1M/RocksDB comparison against `f6dbb42` gives:
+
+| Metric | Before | Final candidate |
+| --- | ---: | ---: |
+| Receipt | 74.051 s | 73.319 s |
+| Optimize through publication | 328.754 s | 267.163 s |
+| Total load to Ready | 402.806 s | 340.482 s |
+| Recall@100 | 0.8907 | 0.8907 |
+| Maximum QPS | 269.004 | 270.089 |
+| Serial p50 / p95 / p99 | 25.3 / 32.5 / 37.9 ms | 22.5 / 29.2 / 34.9 ms |
+| Whole-run native CPU | 875.913 s | 875.977 s |
+| Whole-run maximum RSS | 1.617 GB | 1.889 GB |
+| Completed searches | 21,710 | 23,577 |
+
+Both completed normally, reached Ready with 1,000,000 records, and have identical
+source SHA, rotation seed, configuration, construction/sort/serving budgets and
+load limits. Total load falls 15.5% (1.18x), and Optimize falls 18.7%. This is one
+complete comparison on a shared development host, not a repeated end-to-end
+speedup or query-performance guarantee. It includes both receipt preparation
+and the shared sorter capacity change, not an isolated parallelism effect.
+
+Whole-run RSS rises by 272 MB (16.8%), with 8.6% more completed searches in the
+fixed-duration query workload. Those reports include backend/cache and allocator
+state and do not isolate construction memory; the different query counts are
+not proof of the cause. No equal-memory-use or RSS improvement claim is made.
+The configured memory ceilings remain unchanged. Whole-run CPU likewise cannot
+be interpreted as build-only CPU.
+
+The final candidate now exposes the previously opaque post-EOF worker phases:
+forest 105.191 s, serving joins/encoding 86.746 s, backend loading 37.642 s,
+and validation/publication/cleanup 37.545 s. Source sealing takes 0.019 s.
+Forest preparation reports 11.303 GB global-sort writes and 30.838 GB tree
+writes, with respective scratch peaks 6.180/6.730 GB; sort counts include work
+performed during receipt. Serving encoding and exact publication validation
+remain substantial costs after this change.
+
+Three alternating pairs in each of 12 complementary cases compare receipt plus
+forest construction through both APIs in the final binary. Cases cover all
+metrics, small/wide vectors, multiple Tree Keys, long IDs and spill/roomy memory.
+All source and forest manifests match. Sort writes and peak scratch never
+increase in this matrix. Eleven cases show median reductions of about 6%–20%;
+one long-ID inner-product case is effectively flat (+0.5%). Small-vector sort
+writes fall 520,000 to 260,000 bytes, wide-vector writes 27.810 to 18.540 MB,
+and multi-tree writes remain 1.160 MB. These short probes are mechanism evidence,
+not large-workload speedup estimates. They use the final shared sorter on both
+paths; the complete comparison above uses the frozen pre-change binary.
+
+An initial candidate completed loading but its query subprocess failed because
+files in the temporary Python environment disappeared during execution. Its
+331.626 s load and zero-query resource report are excluded from complete-run
+comparisons. The final candidate was rebuilt after the budget/capacity fixes and
+rerun in a persistent venv, restoring the retained exact package versions. The
+cause of the temporary-file deletion was not established. Raw failure evidence,
+requirements, environment checks and final success are retained separately.
+
+Validation: 245 core unit tests (one existing ignored), 18 artifact tests,
+33 serving/lifecycle tests, seven final real client process tests, workspace
+all-target/all-feature Clippy, formatting and diff checks. Independent review
+closed the minimum-memory fan-in finding and confirmed the boundary-validation
+and capacity fixes with no remaining actionable findings. Tests cover invalid
+configuration before file creation, duplicate IDs within/across batches,
+source/forest equality, mismatched preparation rejection, and recovery when the
+volatile work is lost. Raw reports, final binary hashes, probe source and review
+notes are under
+`/Users/lloyd/projects/ktann/.benchmark-data/results/bulk-pipeline-20261009/`.
