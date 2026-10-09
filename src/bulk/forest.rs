@@ -1,6 +1,7 @@
 //! Complete finite-source grouping and multi-tree topology construction.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use bytes::{Buf, Bytes};
@@ -98,7 +99,11 @@ impl ForestArtifact {
             options.sort_scratch_bytes,
             maximum_row(config),
         )?;
-        let mut ids = Sorter::new(&mut space, options.sort_memory_bytes)?;
+        // Sort only IDs for the global uniqueness check. Spool each tree
+        // projection once, avoiding vector-sized duplicate-detection merges
+        // without decoding the original payloads a second time.
+        let (mut projected, mut projection_writer) = space.writer()?;
+        let mut ids = Sorter::new(&space, options.sort_memory_bytes)?;
         for record in input.reader()? {
             let record = record?;
             let values = config
@@ -107,47 +112,43 @@ impl ForestArtifact {
                 .map(|id| record.fields()[id.0 as usize].clone())
                 .collect::<Vec<_>>();
             let key = TreeKey::encode(&types, &values)?;
-            let mut value = Vec::with_capacity(4 + key.as_bytes().len() + 4 * config.dimension());
-            value.extend_from_slice(&(key.as_bytes().len() as u32).to_be_bytes());
-            value.extend_from_slice(key.as_bytes());
+            ids.push(
+                &mut space,
+                Row {
+                    key: record.id().to_vec(),
+                    value: Vec::new(),
+                },
+            )?;
+            let mut value = Vec::with_capacity(2 + record.id().len() + 4 * config.dimension());
+            value.extend_from_slice(&(record.id().len() as u16).to_be_bytes());
+            value.extend_from_slice(record.id());
             for component in record.vector() {
                 value.extend_from_slice(&component.to_bits().to_be_bytes());
             }
-            ids.push(Row {
-                key: record.id().to_vec(),
-                value,
-            })?;
+            space.append(
+                &mut projected,
+                &mut projection_writer,
+                &Row {
+                    key: key.as_bytes().to_vec(),
+                    value,
+                },
+            )?;
         }
+        projection_writer.flush().map_err(io_error)?;
+        drop(projection_writer);
         // Reaching EOF above verifies the complete source identity. No output
         // frame is accepted before the global duplicate pass finishes, either.
-        let id_run = ids.finish()?;
-        let mut source = space.reader(&id_run)?;
-        let mut trees = Sorter::new(&mut space, options.sort_memory_bytes)?;
-        let mut previous = None;
-        while let Some(row) = source.next()? {
-            if previous.as_ref() == Some(&row.key) {
-                return Err(Error::new(ErrorKind::RecordAlreadyExists));
-            }
-            previous = Some(row.key.clone());
-            if row.value.len() < 4 {
-                return Err(corrupt());
-            }
-            let length =
-                u32::from_be_bytes(row.value[..4].try_into().expect("fixed length")) as usize;
-            if length > MAX_TREE_KEY_BYTES || row.value.len() != 4 + length + 4 * config.dimension()
-            {
-                return Err(corrupt());
-            }
-            let key = row.value[4..4 + length].to_vec();
-            let mut value = Vec::with_capacity(2 + row.key.len() + 4 * config.dimension());
-            value.extend_from_slice(&(row.key.len() as u16).to_be_bytes());
-            value.extend_from_slice(&row.key);
-            value.extend_from_slice(&row.value[4 + length..]);
-            trees.push(Row { key, value })?;
+        if !ids.unique_keys(&mut space)? {
+            return Err(Error::new(ErrorKind::RecordAlreadyExists));
         }
-        drop((source, previous));
-        let tree_run = trees.finish()?;
-        space.remove(id_run)?;
+        let mut source = space.reader(&projected)?;
+        let mut trees = Sorter::new(&space, options.sort_memory_bytes)?;
+        while let Some(row) = source.next()? {
+            trees.push(&mut space, row)?;
+        }
+        drop(source);
+        let tree_run = trees.finish(&mut space)?;
+        space.remove(projected)?;
         let mut source = space.reader(&tree_run)?;
         let mut next = source.next()?;
         let mut report = ForestReport::default();

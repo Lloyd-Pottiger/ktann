@@ -10,7 +10,7 @@ use crate::api::{Error, ErrorKind, Result};
 
 use super::files::{corrupt, io_error};
 
-// Two caller readers, eight 32 KiB merge readers and one 64 KiB writer
+// Two caller IO buffers, eight 32 KiB merge readers and one 64 KiB writer
 // use at most 448 KiB of the 512 KiB IO/metadata reservation.
 const BUFFER_BYTES: usize = 64 * 1024;
 const MERGE_BUFFER_BYTES: usize = 32 * 1024;
@@ -60,7 +60,7 @@ impl Space {
         })
     }
 
-    fn writer(&mut self) -> Result<(Run, BufWriter<File>)> {
+    pub fn writer(&mut self) -> Result<(Run, BufWriter<File>)> {
         let file_id = self.next;
         let path = self.directory.join(file_id.to_string());
         self.next = self.next.checked_add(1).ok_or_else(limit)?;
@@ -79,7 +79,7 @@ impl Space {
         ))
     }
 
-    fn append(&mut self, run: &mut Run, writer: &mut BufWriter<File>, row: &Row) -> Result<()> {
+    pub fn append(&mut self, run: &mut Run, writer: &mut BufWriter<File>, row: &Row) -> Result<()> {
         let bytes = row.encoded_bytes();
         if bytes > self.maximum_row {
             return Err(limit());
@@ -200,8 +200,7 @@ impl RunReader {
 
 /// Accounts allocated row payloads and row slots separately; sort_unstable
 /// allocates no additional array. Base-fan-in carry bounds live run descriptors.
-pub(super) struct Sorter<'a> {
-    space: &'a mut Space,
+pub(super) struct Sorter {
     rows: Vec<Row>,
     budget: usize,
     payload_bytes: usize,
@@ -236,11 +235,10 @@ fn memory_plan(memory: usize, maximum_row: usize) -> Result<(usize, usize)> {
     Err(Error::invalid_argument())
 }
 
-impl<'a> Sorter<'a> {
-    pub fn new(space: &'a mut Space, memory: usize) -> Result<Self> {
+impl Sorter {
+    pub fn new(space: &Space, memory: usize) -> Result<Self> {
         let (fan_in, budget) = memory_plan(memory, space.maximum_row)?;
         Ok(Self {
-            space,
             rows: Vec::new(),
             budget,
             payload_bytes: 0,
@@ -249,8 +247,8 @@ impl<'a> Sorter<'a> {
         })
     }
 
-    pub fn push(&mut self, row: Row) -> Result<()> {
-        if row.encoded_bytes() > self.space.maximum_row {
+    pub fn push(&mut self, space: &mut Space, row: Row) -> Result<()> {
+        if row.encoded_bytes() > space.maximum_row {
             return Err(limit());
         }
         let payload = row
@@ -266,7 +264,7 @@ impl<'a> Sorter<'a> {
             .and_then(|n| n.checked_add(slots.checked_mul(slot)?))
             .ok_or_else(limit)?;
         if required > self.budget {
-            self.spill()?;
+            self.spill(space)?;
         }
         if payload + slot > self.budget {
             return Err(limit());
@@ -288,16 +286,16 @@ impl<'a> Sorter<'a> {
         Ok(())
     }
 
-    fn spill(&mut self) -> Result<()> {
+    fn spill(&mut self, space: &mut Space) -> Result<()> {
         if self.rows.is_empty() {
             return Ok(());
         }
         let mut rows = std::mem::take(&mut self.rows);
         self.payload_bytes = 0;
         rows.sort_unstable();
-        let (mut run, mut output) = self.space.writer()?;
+        let (mut run, mut output) = space.writer()?;
         for row in rows {
-            self.space.append(&mut run, &mut output, &row)?;
+            space.append(&mut run, &mut output, &row)?;
         }
         output.flush().map_err(io_error)?;
         drop(output);
@@ -310,14 +308,37 @@ impl<'a> Sorter<'a> {
             if self.runs[level].len() < self.fan_in {
                 break;
             }
-            run = self.space.merge(std::mem::take(&mut self.runs[level]))?;
+            run = space.merge(std::mem::take(&mut self.runs[level]))?;
             level += 1;
         }
         Ok(())
     }
 
-    pub fn finish(mut self) -> Result<Run> {
-        self.spill()?;
+    /// Checks global key uniqueness and reclaims spilled runs. A buffered-only
+    /// input needs no output file because its sorted rows are consumed here.
+    pub fn unique_keys(mut self, space: &mut Space) -> Result<bool> {
+        if self.runs.is_empty() {
+            self.rows.sort_unstable();
+            return Ok(self.rows.windows(2).all(|rows| rows[0].key != rows[1].key));
+        }
+        let run = self.finish(space)?;
+        let mut reader = space.reader(&run)?;
+        let mut previous = None;
+        let mut unique = true;
+        while let Some(row) = reader.next()? {
+            if previous.as_ref() == Some(&row.key) {
+                unique = false;
+                break;
+            }
+            previous = Some(row.key);
+        }
+        drop(reader);
+        space.remove(run)?;
+        Ok(unique)
+    }
+
+    pub fn finish(mut self, space: &mut Space) -> Result<Run> {
+        self.spill(space)?;
         let mut runs: Vec<_> = self.runs.into_iter().flatten().collect();
         // Merge smaller runs first. The first partial fan-in leaves a count
         // congruent to one modulo (fan_in-1), avoiding repeated large merges.
@@ -329,12 +350,12 @@ impl<'a> Sorter<'a> {
                 2 + (runs.len() - 2) % (self.fan_in - 1)
             };
             let inputs = runs.drain(..count).collect();
-            runs.push(self.space.merge(inputs)?);
+            runs.push(space.merge(inputs)?);
         }
         match runs.pop() {
             Some(run) => Ok(run),
             None => {
-                let (run, mut file) = self.space.writer()?;
+                let (run, mut file) = space.writer()?;
                 file.flush().map_err(io_error)?;
                 Ok(run)
             }
@@ -354,6 +375,38 @@ mod tests {
     impl Drop for Directory {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn uniqueness_checks_buffered_and_spilled_keys_and_reclaims_runs() {
+        for memory in [
+            512 * 1024 + 5 * 128 + std::mem::size_of::<Row>(),
+            1024 * 1024,
+        ] {
+            for duplicate in [false, true] {
+                let directory = Directory(std::env::temp_dir().join(format!(
+                    "ktann-unique-{}-{memory}-{duplicate}",
+                    std::process::id()
+                )));
+                let mut space = Space::new(&directory.0, 1024 * 1024, 128).unwrap();
+                let mut sorter = Sorter::new(&space, memory).unwrap();
+                for id in (0..400_u16).rev() {
+                    let key = if duplicate && id == 399 { 0 } else { id };
+                    sorter
+                        .push(
+                            &mut space,
+                            Row {
+                                key: key.to_be_bytes().to_vec(),
+                                value: id.to_be_bytes().to_vec(),
+                            },
+                        )
+                        .unwrap();
+                }
+                assert_eq!(sorter.unique_keys(&mut space).unwrap(), !duplicate);
+                assert_eq!(space.live, 0);
+                assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 0);
+            }
         }
     }
 
@@ -387,16 +440,19 @@ mod tests {
                     )
                 })
                 .collect();
-            let mut sorter = Sorter::new(&mut space, memory).unwrap();
+            let mut sorter = Sorter::new(&space, memory).unwrap();
             for (key, value) in &expected {
                 sorter
-                    .push(Row {
-                        key: key.clone(),
-                        value: value.clone(),
-                    })
+                    .push(
+                        &mut space,
+                        Row {
+                            key: key.clone(),
+                            value: value.clone(),
+                        },
+                    )
                     .unwrap();
             }
-            let run = sorter.finish().unwrap();
+            let run = sorter.finish(&mut space).unwrap();
             let mut reader = space.reader(&run).unwrap();
             let mut actual = Vec::new();
             while let Some(row) = reader.next().unwrap() {

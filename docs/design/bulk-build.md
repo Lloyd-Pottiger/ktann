@@ -340,9 +340,17 @@ Input Snapshot; append failure consumes the writer and leaves caller-owned,
 unsealed files. No raw input rewrite is required at EOF. Job allocation and
 forest construction still require the sealed input identity.
 
-Externally sort by Record ID across the whole Logical Index. Reject duplicate
-IDs, including duplicates in different Tree Keys. There is no last-writer-wins
-rule or dependence on worker completion order. Then group by canonical Tree Key.
+Externally sort only Record IDs across the whole Logical Index. During the
+same source pass, sequentially spool the Tree Key, Record ID, and vector
+projection under the shared sort scratch quota. This avoids carrying vectors
+through duplicate-detection merges or decoding source payloads twice. Reject
+duplicate IDs, including duplicates in different Tree Keys, before sorting
+the projection by canonical Tree Key or emitting partitions. There is no
+last-writer-wins rule or dependence on worker completion order. ID sorting and
+Tree Key sorting share one memory budget and run sequentially; projection IO
+buffers are included in the existing sort IO reservation. If the complete ID
+set fits that sort budget, uniqueness is checked directly in the sorted buffer
+without writing an intermediate ID run.
 Carry record count and content digests through the task manifests. Empty input
 produces an empty Active index without synthetic Tree Manifests.
 

@@ -135,16 +135,19 @@ impl ServingArtifact {
         )?;
         let scratch = directory.join("scratch");
         let mut space = Space::new(&scratch, options.scratch_bytes, MAX_ROW)?;
-        let mut records = Sorter::new(&mut space, options.memory_bytes)?;
+        let mut records = Sorter::new(&space, options.memory_bytes)?;
         for record in input.reader()? {
             let record = record?;
-            records.push(Row {
-                key: record.id().to_vec(),
-                value: source::encode(index.config(), record)?,
-            })?;
+            records.push(
+                &mut space,
+                Row {
+                    key: record.id().to_vec(),
+                    value: source::encode(index.config(), record)?,
+                },
+            )?;
         }
-        let record_run = records.finish()?;
-        let mut topology = Sorter::new(&mut space, options.memory_bytes)?;
+        let record_run = records.finish(&mut space)?;
+        let mut topology = Sorter::new(&space, options.memory_bytes)?;
         for row in forest.reader()? {
             let row = row?;
             let plan = row.partition;
@@ -156,16 +159,22 @@ impl ServingArtifact {
             for component in &plan.centroid {
                 meta.extend_from_slice(&component.to_bits().to_be_bytes());
             }
-            topology.push(Row {
-                key: tagged(1, &node_key),
-                value: meta,
-            })?;
+            topology.push(
+                &mut space,
+                Row {
+                    key: tagged(1, &node_key),
+                    value: meta,
+                },
+            )?;
             for entry in plan.entries {
                 if plan.level == 1 {
-                    topology.push(Row {
-                        key: tagged(0, &entry),
-                        value: node_key.clone(),
-                    })?;
+                    topology.push(
+                        &mut space,
+                        Row {
+                            key: tagged(0, &entry),
+                            value: node_key.clone(),
+                        },
+                    )?;
                 } else {
                     let child = PartitionKey::new(u64::from_be_bytes(
                         entry.as_ref().try_into().map_err(|_| corrupt())?,
@@ -175,18 +184,21 @@ impl ServingArtifact {
                     parent.push(1);
                     parent.extend_from_slice(&plan.key.get().to_be_bytes());
                     parent.extend_from_slice(&plan.level.to_be_bytes());
-                    topology.push(Row {
-                        key: tagged(1, &keys::header_key(id, &row.tree_key, child)),
-                        value: parent,
-                    })?;
+                    topology.push(
+                        &mut space,
+                        Row {
+                            key: tagged(1, &keys::header_key(id, &row.tree_key, child)),
+                            value: parent,
+                        },
+                    )?;
                 }
             }
         }
-        let topology_run = topology.finish()?;
+        let topology_run = topology.finish(&mut space)?;
         let mut records = space.reader(&record_run)?;
         let mut topology = space.reader(&topology_run)?;
         let mut next = topology.next()?;
-        let mut output = Sorter::new(&mut space, options.memory_bytes)?;
+        let mut output = Sorter::new(&space, options.memory_bytes)?;
         let kernel = VectorKernel::new(
             index.config().dimension(),
             index.config().metric(),
@@ -218,6 +230,7 @@ impl ServingArtifact {
             }
             let record_id = record.id().clone();
             emit(
+                &mut space,
                 &mut output,
                 codec,
                 options.hard_limits,
@@ -232,6 +245,7 @@ impl ServingArtifact {
                 )),
             )?;
             emit(
+                &mut space,
                 &mut output,
                 codec,
                 options.hard_limits,
@@ -243,6 +257,7 @@ impl ServingArtifact {
             )?;
             if let Some(payload) = record.payload() {
                 emit(
+                    &mut space,
                     &mut output,
                     codec,
                     options.hard_limits,
@@ -269,14 +284,20 @@ impl ServingArtifact {
             check_limits(&key, &value, options.hard_limits)?;
             // A separate sorted prefix groups exact field projections by leaf
             // for Synopsis construction without retaining all leaves in RAM.
-            output.push(Row {
-                key: tagged(0, &key),
-                value: value.clone(),
-            })?;
-            output.push(Row {
-                key: tagged(1, &key),
-                value,
-            })?;
+            output.push(
+                &mut space,
+                Row {
+                    key: tagged(0, &key),
+                    value: value.clone(),
+                },
+            )?;
+            output.push(
+                &mut space,
+                Row {
+                    key: tagged(1, &key),
+                    value,
+                },
+            )?;
             report.records = add(report.records, 1)?;
             next = topology.next()?;
         }
@@ -323,6 +344,7 @@ impl ServingArtifact {
                     return Err(corrupt());
                 }
                 emit(
+                    &mut space,
                     &mut output,
                     codec,
                     options.hard_limits,
@@ -335,6 +357,7 @@ impl ServingArtifact {
                     PersistentValue::ChildEntry(ChildEntry::new(partition, centroid.clone())),
                 )?;
                 emit(
+                    &mut space,
                     &mut output,
                     codec,
                     options.hard_limits,
@@ -356,6 +379,7 @@ impl ServingArtifact {
             {
                 let (previous, high_water) = tree_state.take().expect("previous tree");
                 emit_tree(
+                    &mut space,
                     &mut output,
                     codec,
                     options.hard_limits,
@@ -366,6 +390,7 @@ impl ServingArtifact {
             }
             tree_state = Some((tree.clone(), partition));
             emit(
+                &mut space,
                 &mut output,
                 codec,
                 options.hard_limits,
@@ -382,6 +407,7 @@ impl ServingArtifact {
                 )?),
             )?;
             emit(
+                &mut space,
                 &mut output,
                 codec,
                 options.hard_limits,
@@ -398,6 +424,7 @@ impl ServingArtifact {
         }
         if let Some((tree, high_water)) = tree_state {
             emit_tree(
+                &mut space,
                 &mut output,
                 codec,
                 options.hard_limits,
@@ -407,12 +434,12 @@ impl ServingArtifact {
             )?;
         }
         drop(topology);
-        let output_run = output.finish()?;
+        let output_run = output.finish(&mut space)?;
         space.remove(record_run)?;
         space.remove(topology_run)?;
         let mut output = space.reader(&output_run)?;
         let mut next = output.next()?;
-        let mut synopses = Sorter::new(&mut space, options.memory_bytes)?;
+        let mut synopses = Sorter::new(&space, options.memory_bytes)?;
         let mut synopsis: Option<(LogicalKey, PartitionSynopsis)> = None;
         while next.as_ref().is_some_and(|row| row.key.first() == Some(&0)) {
             let row = next.take().expect("projection");
@@ -435,6 +462,7 @@ impl ServingArtifact {
                 .is_some_and(|(key, _)| key != &synopsis_key)
             {
                 flush_synopsis(
+                    &mut space,
                     &mut synopses,
                     codec,
                     options.hard_limits,
@@ -451,9 +479,15 @@ impl ServingArtifact {
             next = output.next()?;
         }
         if let Some(synopsis) = synopsis {
-            flush_synopsis(&mut synopses, codec, options.hard_limits, synopsis)?;
+            flush_synopsis(
+                &mut space,
+                &mut synopses,
+                codec,
+                options.hard_limits,
+                synopsis,
+            )?;
         }
-        let synopsis_run = synopses.finish()?;
+        let synopsis_run = synopses.finish(&mut space)?;
         let mut synopses = space.reader(&synopsis_run)?;
         let mut next_synopsis = synopses.next()?;
         let mut previous_key: Option<Vec<u8>> = None;
@@ -651,7 +685,8 @@ fn check_limits(key: &[u8], value: &[u8], limits: HardLimits) -> Result<()> {
     Ok(())
 }
 fn emit(
-    output: &mut Sorter<'_>,
+    space: &mut Space,
+    output: &mut Sorter,
     codec: ValueCodec<'_>,
     limits: HardLimits,
     key: LogicalKey,
@@ -660,13 +695,17 @@ fn emit(
     let bytes = keys::encode_key(&key)?;
     let value = codec.encode_for_key(&key, &value)?;
     check_limits(&bytes, &value, limits)?;
-    output.push(Row {
-        key: tagged(1, &bytes),
-        value,
-    })
+    output.push(
+        space,
+        Row {
+            key: tagged(1, &bytes),
+            value,
+        },
+    )
 }
 fn emit_tree(
-    output: &mut Sorter<'_>,
+    space: &mut Space,
+    output: &mut Sorter,
     codec: ValueCodec<'_>,
     limits: HardLimits,
     index: &IndexManifest,
@@ -674,6 +713,7 @@ fn emit_tree(
     high_water: PartitionKey,
 ) -> Result<()> {
     emit(
+        space,
         output,
         codec,
         limits,
@@ -685,7 +725,8 @@ fn emit_tree(
     )
 }
 fn flush_synopsis(
-    output: &mut Sorter<'_>,
+    space: &mut Space,
+    output: &mut Sorter,
     codec: ValueCodec<'_>,
     limits: HardLimits,
     (key, synopsis): (LogicalKey, PartitionSynopsis),
@@ -693,7 +734,7 @@ fn flush_synopsis(
     let bytes = keys::encode_key(&key)?;
     let value = codec.encode_for_key(&key, &PersistentValue::PartitionSynopsis(synopsis))?;
     check_limits(&bytes, &value, limits)?;
-    output.push(Row { key: bytes, value })
+    output.push(space, Row { key: bytes, value })
 }
 fn node(bytes: &[u8], index: &IndexManifest) -> Result<(TreeKey, PartitionKey)> {
     let (types, count) = index.tree_key_types();

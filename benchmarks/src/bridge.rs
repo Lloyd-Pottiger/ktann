@@ -6,11 +6,10 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use ktann::api::{
-    CompareOp, DataType, FieldId, FieldSchema, Index, IndexConfig, Metric, Mutation,
-    OperationOptions, Predicate, Record, RuntimeConfig, SearchOptions, SearchRequest,
-    Value as FieldValue,
+    CompareOp, DataType, FieldId, FieldSchema, Index, IndexConfig, Metric, Mutation, Predicate,
+    Record, RuntimeConfig, SearchOptions, SearchRequest, Value as FieldValue,
 };
-use ktann::runtime::Runtime;
+use ktann::runtime::{RetryPolicy, Runtime};
 use ktann::storage::backend::Backend;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -218,7 +217,6 @@ struct State<B: Backend> {
     metric: String,
     dataset: String,
     search: SearchOptions,
-    root_probe: Option<Arc<[f32]>>,
     started: Option<Instant>,
     insert_seconds: f64,
     optimize_seconds: f64,
@@ -237,7 +235,6 @@ impl<B: Backend> Default for State<B> {
             metric: String::new(),
             dataset: String::new(),
             search: SearchOptions::default(),
-            root_probe: None,
             started: None,
             insert_seconds: 0.0,
             optimize_seconds: 0.0,
@@ -310,7 +307,13 @@ async fn serve<B: Backend>(backend: B, identity: String, options: &Options) -> R
         backend.admission_budget()
     );
     let (backend, counters) = MeasuredBackend::new(backend);
+    // A finite import may contend with several topology workers on one tree.
+    // Extend the existing whole-operation abort retry budget, not unknown commits.
     let config = RuntimeConfig::default();
+    let config = config
+        .clone()
+        .with_attempts(config.fixup_attempts(), 32)
+        .map_err(|e| e.to_string())?;
     let service = Arc::new(Service {
         runtime: Runtime::new(backend.clone(), config).map_err(|e| e.to_string())?,
         bulk_workspace: options.bulk_workspace.clone(),
@@ -523,15 +526,11 @@ impl<B: Backend> Service<B> {
                     return Err(invalid("reset required"));
                 }
                 let mut records = Vec::with_capacity(ids.len());
-                let mut root_probe = None;
                 for (id, vector) in ids.iter().zip(vectors) {
                     if vector.len() != state.dimension {
                         return Err(invalid("wrong vector dimension"));
                     }
                     let vector: Arc<[f32]> = vector.into();
-                    if records.is_empty() && state.root_probe.is_none() {
-                        root_probe = Some(Arc::clone(&vector));
-                    }
                     let record = Record::new(
                         Bytes::copy_from_slice(&id.to_be_bytes()),
                         vector,
@@ -568,9 +567,6 @@ impl<B: Backend> Service<B> {
                     state.insert_seconds += start.elapsed().as_secs_f64();
                 }
                 state.records += ids.len() as u64;
-                if let Some(probe) = root_probe {
-                    state.root_probe = Some(probe);
-                }
                 Ok(json!({"inserted":ids.len()}))
             }
             Operation::Optimize { records } => {
@@ -599,7 +595,7 @@ impl<B: Backend> Service<B> {
                     }
                     state.index = Some(index);
                     state.bulk_report = report;
-                    state.topology = snapshot.facts;
+                    state.topology = snapshot.facts.clone();
                     state.ready = true;
                     state.optimize_seconds = start.elapsed().as_secs_f64();
                     return Ok(state.topology.clone());
@@ -612,14 +608,7 @@ impl<B: Backend> Service<B> {
                 let start = Instant::now();
                 let deadline = start + Duration::from_secs(3500);
                 let mut previous_progress = None;
-                let mut last_progress = Instant::now();
-                let mut last_probe: Option<Instant> = None;
-                // Rediscovery needs to touch the target, not execute a quality benchmark.
-                let probe_options = SearchOptions::default()
-                    .with_scanned_tree_keys(1)
-                    .and_then(|s| s.with_visited_partitions(128))
-                    .and_then(|s| s.with_leaf_beam_size(1))
-                    .map_err(api_error)?;
+                let retry = RetryPolicy::for_fixup(self.runtime.config());
 
                 loop {
                     if Instant::now() >= deadline {
@@ -631,16 +620,9 @@ impl<B: Backend> Service<B> {
                             ),
                         ));
                     }
-                    let probe_due = last_progress.elapsed() >= Duration::from_secs(5)
-                        && last_probe.is_none_or(|at| at.elapsed() >= Duration::from_secs(30));
                     let snapshot = tokio::time::timeout_at(
                         tokio::time::Instant::from_std(deadline),
-                        topology::snapshot(
-                            &self.backend,
-                            index.logical_index_id(),
-                            records,
-                            probe_due,
-                        ),
+                        topology::snapshot(&self.backend, index.logical_index_id(), records, true),
                     )
                     .await
                     .map_err(|_| {
@@ -653,7 +635,7 @@ impl<B: Backend> Service<B> {
                         )
                     })?
                     .map_err(api_error)?;
-                    state.topology = snapshot.facts;
+                    state.topology = snapshot.facts.clone();
                     if snapshot.ready {
                         state.ready = true;
                         state.optimize_seconds = start.elapsed().as_secs_f64();
@@ -666,27 +648,25 @@ impl<B: Backend> Service<B> {
                             state.topology
                         );
                         previous_progress = Some(snapshot.progress);
-                        last_progress = Instant::now();
                     }
-                    if probe_due && last_progress.elapsed() >= Duration::from_secs(5) {
-                        last_probe = Some(Instant::now());
-                        let root_probe = state
-                            .root_probe
-                            .iter()
-                            .filter(|_| snapshot.needs_root_probe);
-                        for vector in snapshot.probes.iter().chain(root_probe) {
-                            index
-                                .search_with_control(
-                                    SearchRequest::new(Arc::clone(vector), 10)
-                                        .map_err(api_error)?
-                                        .with_options(probe_options),
-                                    OperationOptions::default().with_deadline(deadline),
-                                )
-                                .await
-                                .map_err(api_error)?;
-                        }
+                    let progressed = tokio::time::timeout_at(
+                        tokio::time::Instant::from_std(deadline),
+                        snapshot.advance(&self.backend, &retry),
+                    )
+                    .await
+                    .map_err(|_| {
+                        (
+                            "timeout",
+                            format!(
+                                "maintenance deadline exceeded; last snapshot: {}",
+                                state.topology
+                            ),
+                        )
+                    })?
+                    .map_err(api_error)?;
+                    if !progressed {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
                     }
-                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             }
             Operation::Search { vector, k, id_min } => {
@@ -791,9 +771,9 @@ impl<B: Backend> Service<B> {
                 "foreground_limit": runtime_config.foreground_operation_limit(),
                 "foreground_attempts": runtime_config.foreground_attempts(),
                 "fixup_attempts": runtime_config.fixup_attempts(),
-                "readiness_header_slot_limit": 262144, "readiness_probe_limit": 32,
-                "readiness_stall_seconds": 5, "readiness_probe_interval_seconds": 30,
-                "readiness_probe_leaf_beam": 1, "readiness_probe_partition_budget": 128
+                "readiness_header_slot_limit": topology::MAX_HEADER_SLOTS,
+                "readiness_advance_limit": topology::MAX_ADVANCE_STEPS,
+                "readiness_idle_interval_seconds": 1,
             },
             "continuous_first_insert_through_final_search_seconds": state.started.zip(m.last_search).map(|(a,b)| b.duration_since(a).as_secs_f64()),
             "phases": {
