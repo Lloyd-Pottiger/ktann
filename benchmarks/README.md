@@ -282,11 +282,19 @@ search, and signed 64-bit record IDs. Each record stores its ID in an `i64` filt
 field. Search accepts an optional inclusive `id_min` threshold, evaluated by the
 native exact predicate before candidate selection. This supports VectorDBBench
 Cohere 1M unfiltered, 1% excluded, and 99% excluded cases. The bridge uses the
-public IndexConfig, RuntimeConfig, and backend adapter defaults, including
-partition entries 64/512. Only an explicit client leaf-beam option overrides
-search defaults. Native diagnostics read the effective index and Runtime
-configuration without changing canonical VectorDBBench metrics. Bounded
-readiness probes used by Optimize are separate from measured searches.
+public IndexConfig and backend adapter defaults, including partition entries
+64/512. The bridge raises the Runtime foreground attempt limit from 8 to 32
+for finite imports contending with topology maintenance; fixup attempts and
+bounded backoff remain unchanged. Only an explicit client leaf-beam option
+overrides search defaults. Native diagnostics read the effective index and Runtime
+configuration without changing canonical VectorDBBench metrics. Optimize
+scans at most 262,144 allocated header slots per readiness round and advances
+at most 32 actionable split/merge sources through the existing bounded
+maintenance steps, alongside Runtime workers. Authority is re-read by each
+step. Successful steps immediately start another readiness round; a round
+that cannot advance any selected source waits one second. This recovers cold work without depending on approximate search routing;
+receiving split destinations are not scheduled independently. These steps are
+separate from measured searches.
 
 Protocol version 2 uses a four-byte big-endian frame length over a Unix socket,
 at most 8 MiB per frame and at most 128 connections. Control/search requests and
@@ -298,6 +306,9 @@ before success in online mode. Bulk receipt acknowledges capture of the batch;
 it is not per-batch durability or a published index.
 Do not automatically replay unknown outcomes. Optimize verifies the exact record
 count and waits for no actionable or transitional partitions within a deadline.
+Definitely aborted attempts may retry within the configured bound. Maintenance
+commit uncertainty is resolved by the next authority read; online insert
+commit uncertainty is returned to the caller.
 
 ```sh
 cargo build --release -p ktann-benchmarks --bin ktann-vdbbench-bridge

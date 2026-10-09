@@ -352,6 +352,110 @@ completed online load, recall or QPS result. The bridge's existing rediscovery
 probes repeatedly select the first 32 pending centroids with leaf beam 1;
 approximate routing need not visit their target partitions. Review confirmed
 this liveness gap, but did not establish it as the cause of this particular
-plateau. Large online completion and the bulk-versus-online comparison remain
-unverified. Raw logs and the unsuccessful recovery diagnostic are retained in
+plateau. At that point, large online completion and the bulk-versus-online comparison
+were unverified; the completed follow-up is recorded below. Raw logs and the unsuccessful recovery diagnostic are retained in
 the evidence directory; small online process tests passed.
+
+
+## Compact global uniqueness sorting (2026-10-09)
+
+The forest previously carried full vectors through global ID sorting before
+sorting them again by Tree Key. It now sorts IDs alone and sequentially spools
+the existing tree projection under the same scratch quota. Source payloads are
+decoded once. Buffered IDs are checked without writing a run; spilled IDs retain
+bounded external merge sorting. No training, membership, artifact identity or
+memory-budget change is involved.
+
+A serial Cohere1M forest-only comparison against `c65eed6`, using the same sealed
+source, seed, sample 256, 64 MiB sort and 256 MiB construction budgets, measured:
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| Forest build | 177.670 s | 171.480 s |
+| Global sort writes | 18.546 GB | 12.360 GB |
+| Global sort peak scratch | 9.272 GB | 9.270 GB |
+| Tree construction writes | 52.635 GB | 52.635 GB |
+| Native CPU, user + system | 164.53 s | 162.36 s |
+| Maximum resident memory | 350.323 MB | 350.159 MB |
+
+The complete forest manifests are byte-identical. Sort writes fall 33.4%, but
+forest wall time falls only 3.5%; this is not a several-times speedup or a new
+end-to-end VectorDBBench result. Unchanged tree construction still accounts for
+most temporary writes. An intermediate candidate measured 170.463 s with the
+same forest, illustrating that the small timing difference is not a precise
+performance guarantee.
+
+Complementary alternating before/after/after/before runs use variable-length
+IDs and eight-dimensional vectors: 100k records without payload, and 20k with
+16 KiB payload per record. Final forest bytes match in all runs. Low-dimensional
+wall times are 1.232/1.243 s before and 1.234/1.219 s after; payload times are
+2.180/2.179 s before and 2.177/2.179 s after. Sort writes decline from 30.10 to
+29.90 MB and 6.02 to 5.98 MB respectively. An intermediate implementation that
+always wrote the ID run increased these writes and was superseded.
+
+Validation: 242 core unit tests (one existing ignored), 14 artifact tests,
+32 serving tests, four bridge tests and seven real client process tests pass;
+workspace all-target/all-feature Clippy and formatting pass. Fresh independent
+reviews found no actionable issues. Reproduction tools, binary hashes, patches,
+raw time/resource reports and intermediate experiments are archived under
+`/Users/lloyd/projects/ktann/.benchmark-data/results/bulk-projection-20261009/`.
+
+
+## Complete online readiness comparison (2026-10-09)
+
+Approximate centroid probes cannot guarantee that cold maintenance sources are
+visited. A committed two-split, identical-vector regression leaves an oversized
+cold source and reproduces this gap. The benchmark bridge now reads bounded
+Header snapshots and directly advances up to 32 split/merge sources per round,
+using the existing authority-revalidating state machines. Progress starts the
+next round immediately; idle/stalled/deferred-error rounds wait one second.
+The header scan ceiling remains 262,144 allocated slots. Online import uses the
+existing foreground retry policy with 32 attempts (previously 8), retaining its
+bounded backoff and returning unknown insert outcomes without replay.
+
+The final canonical RocksDB/Cohere1M run completed: 1M records, no actionable or
+transitional partitions, maximum leaf size 512. Query concurrency was 1/5/10/20
+for 30 seconds each, using the same default search budget as the earlier bulk
+run. The completed measurements are:
+
+| Metric | Earlier binary-ingress bulk | Online with readiness recovery |
+| --- | ---: | ---: |
+| Receipt / insertion | 62.926 s | 222.286 s |
+| Optimize | 328.803 s | 827.685 s |
+| Complete load | 391.729 s | 1049.971 s |
+| Recall@100 | 0.8907 | 0.8875 |
+| Maximum QPS | 287.342 | 314.464 |
+| Serial p95 / p99 | 28.6 / 30.5 ms | 26.3 / 27.7 ms |
+| Native peak RSS | 2.007 GB | 5.802 GB |
+
+For these completed runs, bulk reaches the benchmark's stable readiness state
+2.68x faster with similar measured recall, while online query throughput and
+tail latency are better. This is one online run compared with the earlier bulk
+run, not repeated evidence of a universal speedup or a fresh end-to-end run of
+the compact-ID change. The two forests' algorithms and partition counts differ;
+previous online query-quality observations also differ from this run. Neither
+an index-quality improvement nor the historical quality gap's general resolution
+is established. Online's insertion completion alone is not stable readiness;
+this benchmark does not measure the latency/quality of searching while online
+maintenance is still active.
+
+The native partition-cache configuration is 4 GiB in both modes; forest working
+memory remains separately bounded. Whole-run CPU, including all benchmark
+queries, is 948.671/3532.180 seconds, with different query counts; this is not a
+build-only CPU comparison. The online report has zero failed/unknown commits
+and 23,545 retryable commit aborts. Its final header snapshot is a readiness
+audit, not a full backend integrity verification.
+
+Two preceding recovery runs are excluded: the first exhausted the old eight
+foreground attempts at 970,400 inserted records; the next was intentionally
+stopped because its driver imposed a fixed one-second wait even after progress.
+Their logs remain available. All four bridge tests, including cold-source
+convergence and full small-fixture integrity verification, and all seven real
+client process tests pass. Independent review found no actionable issues in
+both the recovery path and its work-conserving scheduling follow-up.
+
+Raw canonical reports, native diagnostics, failure logs, binary identity and
+review notes are under
+`/Users/lloyd/projects/ktann/.benchmark-data/results/bulk-recovery-20261009/`.
+The final binary identity is also recorded in the sibling
+`bulk-projection-20261009/final-binaries.sha256`.
