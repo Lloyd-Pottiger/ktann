@@ -33,16 +33,9 @@ impl InputSnapshot {
         maximum_bytes: u64,
         records: impl IntoIterator<Item = Result<Record>>,
     ) -> Result<Self> {
-        config.validate()?;
-        let mut writer = Writer::new(directory, 0, schema_binding(&config), maximum_bytes)?;
-        for record in records {
-            writer.append(&source::encode(&config, record?)?)?;
-        }
-        Ok(Self {
-            directory: directory.to_path_buf(),
-            config,
-            manifest: writer.seal()?,
-        })
+        InputSnapshotWriter::new(directory, config, maximum_bytes)?
+            .append(records)?
+            .seal()
     }
 
     /// Reopens a snapshot against the identity saved by its owner.
@@ -97,6 +90,51 @@ impl InputSnapshot {
 
     pub(crate) fn directory(&self) -> &Path {
         &self.directory
+    }
+}
+
+/// Incrementally writes a finite input without an intermediate staging file.
+///
+/// The caller owns the directory, including unsealed files after cancellation
+/// or failure. Only `seal` returns an immutable snapshot suitable for a build.
+/// Each append consumes the writer so an error cannot later seal a partial batch.
+pub struct InputSnapshotWriter {
+    directory: PathBuf,
+    config: IndexConfig,
+    writer: Writer,
+}
+
+impl InputSnapshotWriter {
+    /// Creates an exclusive snapshot directory and reserves its framing quota.
+    pub fn new(directory: &Path, config: IndexConfig, maximum_bytes: u64) -> Result<Self> {
+        config.validate()?;
+        let writer = Writer::new(directory, 0, schema_binding(&config), maximum_bytes)?;
+        Ok(Self {
+            directory: directory.to_path_buf(),
+            config,
+            writer,
+        })
+    }
+
+    /// Appends a bounded-memory stream of full records in arrival order.
+    ///
+    /// Only one encoded record is buffered. Failure consumes this writer and
+    /// leaves an unsealed directory; it does not acknowledge a partial batch.
+    pub fn append(mut self, records: impl IntoIterator<Item = Result<Record>>) -> Result<Self> {
+        for record in records {
+            self.writer
+                .append(&source::encode(&self.config, record?)?)?;
+        }
+        Ok(self)
+    }
+
+    /// Flushes and durably seals the snapshot without rereading its records.
+    pub fn seal(self) -> Result<InputSnapshot> {
+        Ok(InputSnapshot {
+            directory: self.directory,
+            config: self.config,
+            manifest: self.writer.seal()?,
+        })
     }
 }
 

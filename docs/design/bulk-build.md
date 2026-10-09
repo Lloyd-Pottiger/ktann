@@ -334,6 +334,12 @@ and backend size limits as online mutations. Preserve original Vector Records
 and payloads; use the existing metric normalization and persisted rotation for
 routing and quantization. Stream normalization to immutable scratch files.
 
+Input capture may use `InputSnapshotWriter` to validate and encode records and
+update integrity hashes as batches arrive. Only `seal` exposes an immutable
+Input Snapshot; append failure consumes the writer and leaves caller-owned,
+unsealed files. No raw input rewrite is required at EOF. Job allocation and
+forest construction still require the sealed input identity.
+
 Externally sort by Record ID across the whole Logical Index. Reject duplicate
 IDs, including duplicates in different Tree Keys. There is no last-writer-wins
 rule or dependence on worker completion order. Then group by canonical Tree Key.

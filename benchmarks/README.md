@@ -288,9 +288,14 @@ search defaults. Native diagnostics read the effective index and Runtime
 configuration without changing canonical VectorDBBench metrics. Bounded
 readiness probes used by Optimize are separate from measured searches.
 
-Protocol version 1 uses length-prefixed JSON over a Unix socket: a four-byte
-big-endian length, at most 8 MiB per frame, and at most 128 connections. Inserts
-commit at most 50 records per batch and wait for the atomic batch result before success.
+Protocol version 2 uses a four-byte big-endian frame length over a Unix socket,
+at most 8 MiB per frame and at most 128 connections. Control/search requests and
+responses are JSON. Inserts carry `KTI` plus byte version 2, big-endian u32 record
+count and dimension, then little-endian i64 IDs and row-major little-endian f32
+vectors. JSON inserts are rejected; client and bridge must be updated together.
+Inserts commit at most 50 records per batch and wait for the atomic batch result
+before success in online mode. Bulk receipt acknowledges capture of the batch;
+it is not per-batch durability or a published index.
 Do not automatically replay unknown outcomes. Optimize verifies the exact record
 count and waits for no actionable or transitional partitions within a deadline.
 
@@ -329,8 +334,13 @@ The native report identifies `build_mode: bulk` and records input staging,
 snapshot creation, preparation/loading, and validation/publication/cleanup times.
 `committed_import_seconds` is null in this mode: canonical load time measures
 input receipt, while canonical load plus optimize/index time covers the build.
-Staging's raw file is removed after the snapshot is sealed. The source snapshot
-and report remain caller-owned; successful publication reclaims core attempts.
+Bulk receipt writes canonical source frames and their hashes directly through
+`InputSnapshotWriter`, without a raw staging file or EOF rewrite. `snapshot_seconds`
+now measures only final flush, fsync and sealing; record encoding/hashing is
+included in receipt. The source snapshot and report remain caller-owned;
+successful publication reclaims core attempts. Forest construction still begins
+after EOF seals the source; this is incremental input preparation, not streaming
+final tree assignment.
 Construction uses the index's min/max defaults, sample 256, 256 MiB tree memory,
 and 64 GiB tree scratch; the report records worker limits. No online insertion or
 post-build refinement is substituted into this path.

@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use ktann::api::{DataType, Error, ErrorKind, FieldSchema, IndexConfig, Metric, Record, Value};
-use ktann::bulk::{ARTIFACT_MANIFEST_BYTES, ArtifactManifest, ForestArtifact, InputSnapshot};
+use ktann::bulk::{
+    ARTIFACT_MANIFEST_BYTES, ArtifactManifest, ForestArtifact, InputSnapshot, InputSnapshotWriter,
+};
 use ktann::construction::ConstructionOptions;
 
 struct Directory(PathBuf);
@@ -768,4 +770,60 @@ fn forest_reader_rejects_invalid_tree_envelopes_and_premature_roots() {
             }
         }
     }
+}
+
+#[test]
+fn streaming_snapshot_matches_one_pass_and_never_seals_failed_input() {
+    let directory = Directory::new();
+    let rows: Vec<_> = (0..31).map(record).collect();
+    let one = InputSnapshot::create(
+        &directory.0.join("one"),
+        config(),
+        1_000_000,
+        rows.iter().cloned().map(Ok),
+    )
+    .unwrap();
+    let path = directory.0.join("stream");
+    let mut writer = InputSnapshotWriter::new(&path, config(), 1_000_000).unwrap();
+    for batch in rows.chunks(7) {
+        writer = writer.append(batch.iter().cloned().map(Ok)).unwrap();
+        assert!(!path.join("manifest.bin").exists());
+    }
+    let streamed = writer.seal().unwrap();
+    streamed.verify().unwrap();
+    assert_eq!(one.manifest(), streamed.manifest());
+    assert_eq!(
+        fs::read(directory.0.join("one/data.bin")).unwrap(),
+        fs::read(path.join("data.bin")).unwrap()
+    );
+
+    for (name, quota, rows) in [
+        (
+            "invalid",
+            1_000_000,
+            vec![Ok(record(0)), Err(Error::new(ErrorKind::Other))],
+        ),
+        (
+            "quota",
+            ARTIFACT_MANIFEST_BYTES as u64 + 41,
+            vec![Ok(record(0))],
+        ),
+    ] {
+        let path = directory.0.join(name);
+        assert!(
+            InputSnapshotWriter::new(&path, config(), quota)
+                .unwrap()
+                .append(rows)
+                .is_err()
+        );
+        assert!(!path.join("manifest.bin").exists());
+    }
+    let path = directory.0.join("cancelled");
+    drop(
+        InputSnapshotWriter::new(&path, config(), 1_000_000)
+            .unwrap()
+            .append([Ok(record(0))])
+            .unwrap(),
+    );
+    assert!(!path.join("manifest.bin").exists());
 }

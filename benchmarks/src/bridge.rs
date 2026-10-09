@@ -26,8 +26,8 @@ use crate::resource::ResourceSnapshot;
 mod bulk;
 mod topology;
 
-/// Wire frames are a big-endian u32 length followed by UTF-8 JSON.
-const VERSION: u32 = 1;
+/// Length-prefixed frames carry JSON control requests or binary float32 inserts.
+const VERSION: u32 = 2;
 const MAX_FRAME: usize = 8 << 20;
 const MAX_BATCH: usize = 50;
 const MAX_CONNECTIONS: usize = 128;
@@ -143,6 +143,7 @@ enum Operation {
         dataset: String,
         leaf_beam: Option<u32>,
     },
+    #[serde(skip_deserializing)]
     Insert {
         ids: Vec<i64>,
         vectors: Vec<Vec<f32>>,
@@ -160,10 +161,56 @@ enum Operation {
     Shutdown,
 }
 
+/// Binary inserts use KTI/version, big-endian count/dimension, then little-endian
+/// i64 IDs and row-major f32 values. Validate the entire shape before allocating.
+fn decode_request(data: &[u8]) -> Result<Request, String> {
+    if !data.starts_with(b"KTI") {
+        return serde_json::from_slice(data).map_err(|e| e.to_string());
+    }
+    if data.len() < 12 || &data[..4] != b"KTI\x02" {
+        return Err("invalid binary insert header or version".into());
+    }
+    let count = u32::from_be_bytes(data[4..8].try_into().unwrap()) as usize;
+    let dimension = u32::from_be_bytes(data[8..12].try_into().unwrap()) as usize;
+    if count == 0 || count > MAX_BATCH || dimension == 0 {
+        return Err("invalid binary insert shape".into());
+    }
+    let vector_bytes = dimension.checked_mul(4).ok_or("binary insert overflow")?;
+    let bytes = vector_bytes
+        .checked_add(8)
+        .and_then(|row| row.checked_mul(count))
+        .and_then(|body| body.checked_add(12))
+        .ok_or("binary insert overflow")?;
+    if data.len() != bytes {
+        return Err("binary insert length does not match shape".into());
+    }
+    let ids_end = 12 + count * 8;
+    let ids = data[12..ids_end]
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|id| i64::from_le_bytes(*id))
+        .collect();
+    let vectors = data[ids_end..]
+        .chunks_exact(vector_bytes)
+        .map(|row| {
+            row.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| f32::from_le_bytes(*v))
+                .collect()
+        })
+        .collect();
+    Ok(Request {
+        version: VERSION,
+        operation: Operation::Insert { ids, vectors },
+    })
+}
+
 /// Lifecycle state is exclusive for mutation and shared for concurrent search.
 struct State<B: Backend> {
     index: Option<Index<MeasuredBackend<B>>>,
-    bulk: Option<bulk::Staging>,
+    bulk: Option<bulk::InputCapture>,
     bulk_report: Value,
     ready: bool,
     records: u64,
@@ -345,7 +392,7 @@ async fn exchange<B: Backend>(stream: &mut UnixStream, service: &Service<B>) -> 
         .await
         .map_err(|e| e.to_string())?;
     let start = Instant::now();
-    let parsed = serde_json::from_slice::<Request>(&data);
+    let parsed = decode_request(&data);
     let decoded = start.elapsed().as_secs_f64();
     let shutdown = matches!(
         &parsed,
@@ -445,7 +492,7 @@ impl<B: Backend> Service<B> {
                 if let Some(root) = &self.bulk_workspace {
                     let root = root.clone();
                     state.bulk = Some(
-                        tokio::task::spawn_blocking(move || bulk::Staging::new(root, config))
+                        tokio::task::spawn_blocking(move || bulk::InputCapture::new(root, config))
                             .await
                             .map_err(|e| ("other", e.to_string()))?
                             .map_err(api_error)?,
@@ -773,7 +820,7 @@ impl<B: Backend> Service<B> {
             "backend_io": self.counters.snapshot(),
             "bridge": {
                 "decode_seconds": m.decode_seconds, "encode_seconds": m.encode_seconds,
-                "received_json_bytes": m.received_bytes, "sent_json_bytes": m.sent_bytes,
+                "received_body_bytes": m.received_bytes, "sent_body_bytes": m.sent_bytes,
                 "max_frame_bytes": MAX_FRAME, "max_batch": MAX_BATCH, "max_connections": MAX_CONNECTIONS
             }
         }))
@@ -783,6 +830,40 @@ impl<B: Backend> Service<B> {
 #[cfg(test)]
 mod tests {
     use super::Request;
+
+    #[test]
+    fn binary_insert_preserves_bits_and_rejects_incomplete_or_excess_bodies() {
+        let mut frame = b"KTI\x02".to_vec();
+        frame.extend_from_slice(&2_u32.to_be_bytes());
+        frame.extend_from_slice(&2_u32.to_be_bytes());
+        for id in [i64::MIN, i64::MAX] {
+            frame.extend_from_slice(&id.to_le_bytes());
+        }
+        for value in [-0.0_f32, f32::MAX, 1.25, -2.5] {
+            frame.extend_from_slice(&value.to_le_bytes());
+        }
+        let request = super::decode_request(&frame).unwrap();
+        let super::Operation::Insert { ids, vectors } = request.operation else {
+            panic!("insert expected");
+        };
+        assert_eq!(ids, [i64::MIN, i64::MAX]);
+        assert_eq!(vectors[0][0].to_bits(), (-0.0_f32).to_bits());
+        assert_eq!(vectors, [vec![-0.0, f32::MAX], vec![1.25, -2.5]]);
+        for end in 0..frame.len() {
+            assert!(super::decode_request(&frame[..end]).is_err());
+        }
+        let mut trailing = frame.clone();
+        trailing.push(0);
+        assert!(super::decode_request(&trailing).is_err());
+        for (count, dimension) in [(0, 2), (51, 2), (2, 0), (2, u32::MAX)] {
+            let mut bad = frame.clone();
+            bad[4..8].copy_from_slice(&u32::to_be_bytes(count));
+            bad[8..12].copy_from_slice(&u32::to_be_bytes(dimension));
+            assert!(super::decode_request(&bad).is_err());
+        }
+        frame[3] = 1;
+        assert!(super::decode_request(&frame).is_err());
+    }
 
     #[test]
     fn envelope_rejects_unknown_operations_fields_and_noninteger_ids() {
