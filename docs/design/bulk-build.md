@@ -363,9 +363,10 @@ sample size determine training; the same sealed input and configuration must
 produce identical task outputs. Train two centroids on the sample using the
 existing metric rules and balanced two-cluster numeric procedure.
 
-Assign the complete group by externally sorting
-`(distance_to_left - distance_to_right, canonical_id)` and cutting at
-`floor(n / 2)`. This guarantees progress for duplicates, equal distances, and
+Assign the complete group by the total order
+`(distance_to_left - distance_to_right, canonical_id)`, cutting at
+`floor(n / 2)`. Groups larger than the reserved row buffer use external
+sorting; groups that fit use in-place selection over one loaded buffer. This guarantees progress for duplicates, equal distances, and
 skew; nearest-centroid assignment alone does not. Recurse until each group fits
 the maximum. Since `2 * minimum <= maximum`, splitting only oversized groups
 also respects the minimum for every non-root final group. A tree whose entire
@@ -374,7 +375,17 @@ population is below the minimum remains a single leaf root.
 Each partition's final centroid is computed from its complete assigned group,
 with canonical ID accumulation order and the current metric-specific treatment.
 Root inputs are ordered by the initial duplicate preflight or by ascending
-allocated parent keys. When the shortest encoded vector row is at least twice
+allocated parent keys. A group that fits the construction row allowance is
+loaded once and recursively divided into disjoint slices of that buffer.
+Training clones only the bounded selected sample, and releases it and its
+centroids before descending. Each terminal slice is sorted by canonical ID
+before consuming its rows through the same partition emitter as external
+construction. The row allowance already reserves memory for training, terminal
+entries and IO; it does not increase with total source size. No descendants of
+a resident group are materialized as scratch runs. This changes physical work,
+not sampling, grouping, centroid bytes, partition allocation or algorithm identity.
+
+For external groups, when the shortest encoded vector row is at least twice
 the 20-byte split key, sort only `(distance_difference, input_ordinal)` to find
 the exact boundary, then sequentially rescan and stably scatter the original
 rows. Canonical ID order is preserved through each child, so ordinals resolve

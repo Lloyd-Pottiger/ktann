@@ -75,7 +75,7 @@ pub struct ConstructionReport {
     pub scratch_written_bytes: u64,
 }
 
-/// Constructs a bottom-up tree with bounded binary external merges and samples.
+/// Constructs a bottom-up tree with bounded memory and external merge fallback.
 ///
 /// `directory` must not exist. The caller owns its reclamation, including after
 /// failure. Final plans are emitted synchronously in child-before-parent order;
@@ -181,6 +181,7 @@ struct Input {
     remaining: u64,
     encoded_vector: Vec<u8>,
 }
+#[derive(Default)]
 struct Row {
     order: f64,
     id: Bytes,
@@ -444,6 +445,130 @@ impl Workspace {
         self.finish(output)
     }
 
+    // Both storage paths share allocation order and canonical centroid accumulation.
+    fn emit_partition(
+        &mut self,
+        rows: impl Iterator<Item = Result<Row>>,
+        count: u64,
+        level: u32,
+        root: bool,
+        parents: &mut Output,
+        emit: &mut impl FnMut(PartitionPlan) -> Result<()>,
+    ) -> Result<()> {
+        let key = if root {
+            1
+        } else {
+            self.report
+                .partition_high_water
+                .max(1)
+                .checked_add(1)
+                .ok_or_else(limit)?
+        };
+        self.report.partition_high_water = self.report.partition_high_water.max(key);
+        let key = PartitionKey::new(key)?;
+        let mut entries = Vec::with_capacity(count as usize);
+        let mut sums = vec![0.0_f64; self.kernel.dimension()];
+        for row in rows {
+            let row = row?;
+            let vector = if self.kernel.is_cosine() {
+                self.kernel.normalize_centroid(&row.vector)?
+            } else {
+                row.vector
+            };
+            for (sum, value) in sums.iter_mut().zip(vector.iter()) {
+                *sum += f64::from(*value);
+            }
+            entries.push(row.id);
+        }
+        let mean: Box<[f32]> = sums
+            .into_iter()
+            .map(|sum| (sum / count as f64) as f32)
+            .collect();
+        let centroid = self.kernel.normalize_centroid(&mean)?;
+        if !root {
+            self.append(
+                parents,
+                &Row {
+                    order: 0.0,
+                    id: Bytes::copy_from_slice(&key.get().to_be_bytes()),
+                    vector: centroid.clone(),
+                },
+            )?;
+        }
+        emit(PartitionPlan {
+            key,
+            level,
+            centroid,
+            entries,
+        })?;
+        self.report.partitions = self.report.partitions.checked_add(1).ok_or_else(limit)?;
+        Ok(())
+    }
+
+    // This buffer uses the same conservative row allowance as external sorting.
+    // Recursive children borrow disjoint slices; only the bounded training sample
+    // is copied, and it is released before descending into either child.
+    fn resident_group(
+        &mut self,
+        rows: &mut [Row],
+        level: u32,
+        root: bool,
+        parents: &mut Output,
+        emit: &mut impl FnMut(PartitionPlan) -> Result<()>,
+    ) -> Result<()> {
+        if rows.len() <= self.options.max_partition_entries as usize {
+            rows.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+            let count = rows.len() as u64;
+            return self.emit_partition(
+                rows.iter_mut().map(|row| Ok(std::mem::take(row))),
+                count,
+                level,
+                root,
+                parents,
+                emit,
+            );
+        }
+        let mut sample = BinaryHeap::new();
+        for (ordinal, row) in rows.iter().enumerate() {
+            let item = (xxh3_128_with_seed(&row.id, SAMPLE_SEED), &row.id, ordinal);
+            if sample.len() < self.options.sample_items {
+                sample.push(item);
+            } else if sample.peek().is_some_and(|max| &item < max) {
+                sample.pop();
+                sample.push(item);
+            }
+        }
+        let centroids = train_sample(
+            &self.kernel,
+            sample
+                .into_iter()
+                .map(|(_, _, ordinal)| {
+                    let row = &rows[ordinal];
+                    (row.id.clone(), row.vector.clone())
+                })
+                .collect(),
+        )?;
+        for row in rows.iter_mut() {
+            row.order = self
+                .kernel
+                .routing_distance(&row.vector, centroids.left().components())?
+                - self
+                    .kernel
+                    .routing_distance(&row.vector, centroids.right().components())?;
+            if !row.order.is_finite() {
+                return Err(Error::invalid_argument());
+            }
+        }
+        let half = rows.len() / 2;
+        // Unique IDs give the same half as external sorting or ordinal ties.
+        // Selection may reorder each child; leaves restore ID accumulation order.
+        rows.select_nth_unstable_by(half, Row::compare);
+        drop(centroids);
+        let (left, right) = rows.split_at_mut(half);
+        self.resident_group(left, level, false, parents, emit)?;
+        self.resident_group(right, level, false, parents, emit)
+    }
+
     fn group(
         &mut self,
         input: Run,
@@ -452,6 +577,16 @@ impl Workspace {
         parents: &mut Output,
         emit: &mut impl FnMut(PartitionPlan) -> Result<()>,
     ) -> Result<()> {
+        if input.count <= self.sort_rows as u64 {
+            let mut rows = Vec::with_capacity(input.count as usize);
+            let mut reader = self.reader(&input)?;
+            while let Some(row) = reader.next()? {
+                rows.push(row);
+            }
+            drop(reader);
+            self.remove(input)?;
+            return self.resident_group(&mut rows, level, root, parents, emit);
+        }
         if input.count <= u64::from(self.options.max_partition_entries) {
             // Projected splits scatter stably from preflight ID order. Their
             // ordinals resolve ties exactly like IDs, and terminal means can
@@ -462,53 +597,15 @@ impl Workspace {
             } else {
                 self.sort(input, |_| Ok(()))?
             };
-            let key = if root {
-                1
-            } else {
-                self.report
-                    .partition_high_water
-                    .max(1)
-                    .checked_add(1)
-                    .ok_or_else(limit)?
-            };
-            self.report.partition_high_water = self.report.partition_high_water.max(key);
-            let key = PartitionKey::new(key)?;
             let mut reader = self.reader(&input)?;
-            let mut entries = Vec::with_capacity(input.count as usize);
-            let mut sums = vec![0.0_f64; self.kernel.dimension()];
-            while let Some(row) = reader.next()? {
-                let vector = if self.kernel.is_cosine() {
-                    self.kernel.normalize_centroid(&row.vector)?
-                } else {
-                    row.vector
-                };
-                for (sum, value) in sums.iter_mut().zip(vector.iter()) {
-                    *sum += f64::from(*value);
-                }
-                entries.push(row.id);
-            }
-            let mean: Box<[f32]> = sums
-                .into_iter()
-                .map(|sum| (sum / input.count as f64) as f32)
-                .collect();
-            let centroid = self.kernel.normalize_centroid(&mean)?;
-            if !root {
-                self.append(
-                    parents,
-                    &Row {
-                        order: 0.0,
-                        id: Bytes::copy_from_slice(&key.get().to_be_bytes()),
-                        vector: centroid.clone(),
-                    },
-                )?;
-            }
-            emit(PartitionPlan {
-                key,
+            self.emit_partition(
+                std::iter::from_fn(|| reader.next().transpose()),
+                input.count,
                 level,
-                centroid,
-                entries,
-            })?;
-            self.report.partitions = self.report.partitions.checked_add(1).ok_or_else(limit)?;
+                root,
+                parents,
+                emit,
+            )?;
             drop(reader);
             self.remove(input)?;
             return Ok(());
@@ -889,6 +986,73 @@ mod tests {
                 .flat_map(|(_, entries, _)| entries.iter().cloned())
                 .collect();
             assert_eq!(ids.len(), 513);
+        }
+    }
+
+    #[test]
+    fn minimum_memory_and_resident_groups_emit_identical_plan_bits() {
+        for dimension in [2, 7] {
+            let mut constrained = options();
+            let (mut low, mut high) = (0, constrained.memory_bytes);
+            while low < high {
+                let middle = low + (high - low) / 2;
+                constrained.memory_bytes = middle;
+                if validate_options(dimension, constrained).is_ok() {
+                    high = middle;
+                } else {
+                    low = middle + 1;
+                }
+            }
+            constrained.memory_bytes = low;
+            assert_eq!(validate_options(dimension, constrained).unwrap(), 1);
+            for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
+                let make = |memory| {
+                    let directory = Directory::new();
+                    let mut settings = constrained;
+                    settings.memory_bytes = memory;
+                    let records = (0_u64..257).rev().map(|id| {
+                        let encoded = id.to_be_bytes();
+                        let first = encoded.iter().position(|byte| *byte != 0).unwrap_or(7);
+                        let mut key = encoded[first..].to_vec();
+                        if id % 2 == 0 {
+                            key.resize(MAX_ID_BYTES, 0);
+                        }
+                        Ok(ConstructionRecord {
+                            id: Bytes::from(key),
+                            vector: (0..dimension)
+                                .map(|axis| if axis == 0 { 1.0 } else { (id % 3) as f32 })
+                                .collect(),
+                        })
+                    });
+                    let mut plans = BTreeMap::new();
+                    construct_tree(
+                        &directory.0,
+                        dimension,
+                        metric,
+                        [7; 32],
+                        settings,
+                        records,
+                        |plan| {
+                            plans.insert(
+                                plan.key.get(),
+                                (
+                                    plan.level,
+                                    plan.centroid
+                                        .iter()
+                                        .map(|value| value.to_bits())
+                                        .collect::<Vec<_>>(),
+                                    plan.entries,
+                                ),
+                            );
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                    assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 0);
+                    plans
+                };
+                assert_eq!(make(low), make(4 * 1024 * 1024));
+            }
         }
     }
 
