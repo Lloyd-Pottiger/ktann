@@ -68,9 +68,10 @@ that remains a limitation of the current evidence.
 * The scheduler assigns whole jobs. Single-job forest construction is sequential;
   adding scheduler hosts does not divide one large tree among them.
 
-Receipt alone currently takes 413–439 s. Even free construction limits speedup
+The original JSON receipt path took 413–439 s. Even free construction limits speedup
 against the observed 749–842 s online baseline to roughly 1.7–2.0x. A 3x
-end-to-end target therefore requires improving receipt too. Applying the same
+end-to-end target therefore required improving receipt too; the streaming input
+section below records that change. Applying the same
 transport improvement to online changes the comparison baseline as well.
 
 ## Proposed boundary and data flow
@@ -279,3 +280,78 @@ in general. Further algorithm work must improve total training/assignment/IO
 cost and matched-recall query cost together. The implemented IO changes do not
 resolve Bulk Build's lower default-beam recall or demonstrate a 3x end-to-end
 speedup over online import.
+
+## Streaming input capture and binary transport (2026-10-09)
+
+The benchmark adapter uses the same binary float32 insert transport for online
+and bulk modes. It retains the 50-record batch and 8 MiB frame bounds and awaits
+each acknowledgement. Protocol version 2 rejects stale version-1 clients;
+there is no dual-format fallback for inserts. NumPy performs bounded conversion
+and finite-value validation, replacing Python scalar conversion/check loops and
+JSON decimal float serialization. The Rust decoder validates count, dimension
+and exact body length before allocating vectors.
+
+`InputSnapshotWriter` incrementally validates and encodes canonical records and
+updates their integrity hashes as batches arrive. Appending consumes the writer;
+an error cannot subsequently seal a partial batch. EOF only flushes, syncs and
+seals the source. Failed/cancelled sources remain caller-owned and unsealed.
+`InputSnapshot::create` delegates to the same implementation. This removes the
+raw temporary file and the subsequent full read/encode/rewrite, while preserving
+source bytes and immutable publication rules.
+
+Two alternating baseline/candidate measurements used 100,000 real Cohere vectors
+preloaded outside the timed section, fresh RocksDB databases and no profiler:
+receipt fell 39.69/39.43 s to 4.37/4.46 s, about 9x faster; receipt plus Optimize
+fell 70.07/70.35 s to 32.36/32.79 s. Source manifests are identical across all
+four runs. A separate profile attributed 29.3 s to JSON encoding and substantial
+additional time to Python per-component checks; profiling timings are not used
+as the speedup denominator. Request bodies fell from 1.535 GB to 308 MB for
+100,000 vectors. Native decode fell 2.70 s to 0.013 s. Canonical source encoding
+moves into receipt, so the near-zero snapshot sealing time is not free work.
+
+Clean-run RSS varied: baseline 545–722 MB, candidate 855–872 MB. Additional phase
+memory maps showed received physical footprint 72.8/68.7 MiB and post-build peak
+physical footprint 345.3/372.8 MiB, with comparable post-build resident totals
+699.2/693.0 MiB and substantial empty malloc regions in both. This rules out
+retaining the full received dataset in that run, but does not justify claiming a
+whole-process memory reduction or attributing all RSS variation to one cause.
+The source writer retains only bounded IO/record buffers.
+
+A same-revision canonical Cohere 1M comparison (JSON/raw staging versus
+binary/canonical capture) measured:
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| Receipt | 413.007 s | 62.926 s |
+| Optimize | 353.230 s | 328.803 s |
+| Total load | 766.237 s | 391.729 s |
+| Recall@100 | 0.8907 | 0.8907 |
+| Maximum QPS | 288.857 | 287.342 |
+| Serial p95 / p99 | 23.8 / 24.4 ms | 28.6 / 30.5 ms |
+| Native peak RSS | 1.839 GB | 2.007 GB |
+
+The load time is 48.9% shorter (1.956x). The full source manifests match exactly.
+Native prepare/load is 290.361/292.375 s; snapshot finalization is 26.499/0.018 s,
+with canonical encoding now counted during receipt. This demonstrates the
+receipt improvement and measures its full bulk benefit, but one full pair does
+not isolate the higher RSS or serial tail latency. No memory reduction or query
+latency improvement is claimed. These are two bulk runs with the same tree
+algorithm, not a completed comparison with online import.
+
+This change starts input preparation during receipt. Global ID/tree sorting and
+final partition training still begin after source sealing. Moving those stages
+before EOF requires an explicit contract for reusable sorted input or a new
+partitioning algorithm; the incremental writer alone does not supply it.
+Evidence, profiles, source patches and raw runs are under
+`/Users/lloyd/projects/ktann/.benchmark-data/results/bulk-ingress-20261009/`.
+
+The same binary transport was also exercised by a canonical online Cohere 1M
+run. Its insert worker finished in 238.04 s, but Optimize stopped showing
+progress with 133 transitional partitions and was interrupted. It supplies no
+completed online load, recall or QPS result. The bridge's existing rediscovery
+probes repeatedly select the first 32 pending centroids with leaf beam 1;
+approximate routing need not visit their target partitions. Review confirmed
+this liveness gap, but did not establish it as the cause of this particular
+plateau. Large online completion and the bulk-versus-online comparison remain
+unverified. Raw logs and the unsuccessful recovery diagnostic are retained in
+the evidence directory; small online process tests passed.
