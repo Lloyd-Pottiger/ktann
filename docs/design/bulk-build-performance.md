@@ -459,3 +459,77 @@ review notes are under
 `/Users/lloyd/projects/ktann/.benchmark-data/results/bulk-recovery-20261009/`.
 The final binary identity is also recorded in the sibling
 `bulk-projection-20261009/final-binaries.sha256`.
+
+
+## Budgeted in-memory groups (2026-10-09)
+
+The remaining construction cost included repeatedly writing and decoding groups
+that already fit the configured memory reservation. Such a group now loads once
+and uses in-place distance/ID selection over disjoint child slices. Only the
+bounded training sample is copied; terminal rows are restored to canonical ID
+order and consumed by the same emitter as external construction. Larger groups
+keep the existing external path. Memory options, logical construction version,
+source validation and publication rules are unchanged.
+
+Against `d868e41`, a serial Cohere1M forest comparison with the same sealed source,
+rotation seed, sample 256, 64 MiB sorting and 256 MiB construction budgets gives:
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| Forest build | 170.689 s | 115.044 s |
+| Tree scratch writes | 52.635 GB | 30.838 GB |
+| Global sort writes | 12.360 GB | 12.360 GB |
+| Peak tree scratch | 6.730 GB | 6.730 GB |
+| Native CPU, user + system | 159.16 s | 108.77 s |
+| Maximum RSS | 356.778 MB | 344.867 MB |
+| macOS peak physical footprint | 335.627 MB | 338.510 MB |
+
+Complete forest manifests are identical. Forest elapsed time falls 32.6% (1.48x),
+tree writes fall 41.4%, and CPU falls 31.7%. RSS and physical footprint move in
+opposite directions by small amounts; no general memory reduction is claimed.
+
+Three alternating baseline/candidate repetitions across 21 complementary cases
+cover all three metrics, short and maximum-length IDs, repeated vectors, row
+projection thresholds, and small/roomy budgets. Every plan byte matches; peak
+scratch is unchanged in every case. Per-case median elapsed reductions range
+from about 24% to 65%, with fewer scratch writes throughout. A regression test
+also compares minimum-valid memory (one sort row, forcing external groups)
+against resident construction, checking centroid bits, IDs and partition keys.
+
+Validation passes: 243 core unit tests (one existing ignored), 14 artifact tests,
+32 serving tests, seven real client process tests, workspace all-target/all-feature
+Clippy, formatting and independent read-only review. Reproduction sources,
+binary hashes, source patch, raw timings and review notes are archived under
+`/Users/lloyd/projects/ktann/.benchmark-data/results/bulk-resident-20261009/`.
+This physical-work change does not start partition training before input EOF.
+
+A fresh serial canonical VectorDBBench pair on RocksDB, including receipt,
+publication and all configured query stages, completed successfully:
+
+| Metric | Before (`d868e41`) | After |
+| --- | ---: | ---: |
+| Receipt | 65.480 s | 65.768 s |
+| Optimize (construction through publication) | 368.109 s | 313.891 s |
+| Total load to Ready | 433.589 s | 379.660 s |
+| Recall@100 | 0.8907 | 0.8907 |
+| Maximum QPS | 257.749 | 266.614 |
+| Serial p50 / p95 / p99 | 23.6 / 30.6 / 33.3 ms | 23.7 / 26.7 / 30.9 ms |
+| Whole-run native CPU | 908.407 s | 906.618 s |
+| Whole-run maximum RSS | 1.339 GB | 1.597 GB |
+
+Both reports confirm Ready with 1,000,000 records and identical source SHA,
+rotation seed, configuration and construction budget. Total load falls 12.4%
+(1.14x); Optimize falls 14.7%. This is one fresh complete pair, not a repeated
+end-to-end speedup claim. Historical full-run timings above are not substituted
+for this baseline. Completed baseline-generated database/workspace data was
+reclaimed before candidate timing to restore disk headroom; reports and source
+identity were retained.
+
+Whole-run RSS rises by 258 MB (19.2%). This measurement includes publication,
+backend/cache allocations and timed query stages with different query counts;
+it does not isolate construction memory. The separate forest measurement above
+shows no corresponding RSS increase, and the construction reservation is
+unchanged. These results do not establish equal whole-process memory use or a
+query-speed improvement. Whole-run CPU likewise is not build-only CPU. Raw
+reports and identity assertions are in `full-baseline/`, `full-candidate/` and
+`full-comparison.json` under the report directory above.
