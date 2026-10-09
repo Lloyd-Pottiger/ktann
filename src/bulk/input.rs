@@ -123,7 +123,7 @@ impl InputSnapshotWriter {
     pub fn append(mut self, records: impl IntoIterator<Item = Result<Record>>) -> Result<Self> {
         for record in records {
             self.writer
-                .append(&source::encode(&self.config, record?)?)?;
+                .append(&source::encode(&self.config, &mut record?)?)?;
         }
         Ok(self)
     }
@@ -180,4 +180,81 @@ fn schema_binding(config: &IndexConfig) -> [u8; 32] {
         hash.update([u8::from(field.is_nullable())]);
     }
     hash.finalize().into()
+}
+
+/// Receipt-time source capture and bounded Tree Key/ID sorting.
+/// Appending is synchronous: callers must apply backpressure and run it on a
+/// blocking executor. Neither partition training nor publication starts here.
+/// Both directories remain caller owned, including after failure or cancellation.
+pub struct PreparedInputWriter {
+    source: InputSnapshotWriter,
+    preparation: super::forest::ForestPreparation,
+}
+
+/// One-use receipt-time work bound to an immutable, original-order source.
+/// This is not a durable checkpoint. If lost, reopen the source and run the
+/// ordinary worker; it recomputes the same forest from the source snapshot.
+pub struct PreparedInput {
+    pub(super) source: InputSnapshot,
+    pub(super) preparation: super::forest::ForestPreparation,
+}
+
+impl PreparedInput {
+    /// The durable source identity used to reserve or resume the build.
+    pub fn source(&self) -> &InputSnapshot {
+        &self.source
+    }
+
+    pub(crate) fn matches(
+        &self,
+        config: &IndexConfig,
+        manifest: &ArtifactManifest,
+        options: super::ForestOptions,
+    ) -> bool {
+        self.source.manifest == *manifest
+            && self.source.config == *config
+            && self.preparation.options == options
+    }
+}
+
+impl PreparedInputWriter {
+    /// Creates source capture and sorting within the declared shared sort budget.
+    /// Row buffers split the memory remaining after one shared IO reservation.
+    /// Scratch shares one ceiling; the two sorters perform IO serially.
+    pub fn new(
+        source_directory: &Path,
+        preparation_directory: &Path,
+        config: IndexConfig,
+        maximum_bytes: u64,
+        options: super::ForestOptions,
+    ) -> Result<Self> {
+        config.validate()?;
+        let preparation =
+            super::forest::ForestPreparation::new(preparation_directory, &config, options)?;
+        Ok(Self {
+            source: InputSnapshotWriter::new(source_directory, config, maximum_bytes)?,
+            preparation,
+        })
+    }
+
+    /// Captures and sorts a batch before acknowledging it. Consuming ownership
+    /// prevents an error from subsequently sealing a partially accepted batch.
+    pub fn append(mut self, records: impl IntoIterator<Item = Result<Record>>) -> Result<Self> {
+        for record in records {
+            let mut record = record?;
+            let encoded = source::encode(&self.source.config, &mut record)?;
+            self.source.writer.append(&encoded)?;
+            self.preparation.append(&self.source.config, &record)?;
+        }
+        Ok(self)
+    }
+
+    /// Seals the original source. Global duplicate checking and final merges
+    /// complete when the prepared work is consumed by forest construction.
+    pub fn seal(self) -> Result<PreparedInput> {
+        Ok(PreparedInput {
+            source: self.source.seal()?,
+            preparation: self.preparation,
+        })
+    }
 }

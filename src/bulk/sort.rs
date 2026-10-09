@@ -121,6 +121,10 @@ impl Space {
         })
     }
 
+    pub fn reclaim_directory(&self) -> Result<()> {
+        fs::remove_dir(&self.directory).map_err(io_error)
+    }
+
     pub fn remove(&mut self, run: Run) -> Result<()> {
         fs::remove_file(self.directory.join(run.file_id.to_string())).map_err(io_error)?;
         self.live -= run.bytes;
@@ -206,17 +210,19 @@ pub(super) struct Sorter {
     payload_bytes: usize,
     runs: Vec<Vec<Run>>,
     fan_in: usize,
+    reject_duplicate_keys: bool,
 }
 
 pub(super) fn validate_memory(memory: usize, maximum_row: usize) -> Result<usize> {
-    memory_plan(memory, maximum_row).map(|(_, budget)| budget)
+    memory_plan(memory, maximum_row, 1).map(|(_, budget)| budget)
 }
 
 // Larger rows or small budgets reduce fan-in, rather than rejecting a budget
 // that can still support a two-way merge. All merge heads are explicitly charged.
-fn memory_plan(memory: usize, maximum_row: usize) -> Result<(usize, usize)> {
+fn memory_plan(memory: usize, maximum_row: usize, buffers: usize) -> Result<(usize, usize)> {
     let minimum = maximum_row
         .checked_add(std::mem::size_of::<Row>())
+        .and_then(|row| row.checked_mul(buffers))
         .ok_or_else(limit)?;
     for fan_in in (2..=MAX_FAN_IN).rev() {
         let Some(reserved) = maximum_row
@@ -237,14 +243,32 @@ fn memory_plan(memory: usize, maximum_row: usize) -> Result<(usize, usize)> {
 
 impl Sorter {
     pub fn new(space: &Space, memory: usize) -> Result<Self> {
-        let (fan_in, budget) = memory_plan(memory, space.maximum_row)?;
+        let (fan_in, budget) = memory_plan(memory, space.maximum_row, 1)?;
         Ok(Self {
             rows: Vec::new(),
             budget,
             payload_bytes: 0,
             runs: Vec::new(),
             fan_in,
+            reject_duplicate_keys: false,
         })
+    }
+
+    // Paired receipt sorters retain disjoint row buffers, but push/finish run
+    // serially. Reserve merge heads and IO buffers once for the active sorter.
+    // The first sorter checks local ID duplicates as each run is written.
+    pub fn pair(space: &Space, memory: usize) -> Result<(Self, Self)> {
+        let (fan_in, budget) = memory_plan(memory, space.maximum_row, 2)?;
+        let first = budget / 2;
+        let make = |budget, reject_duplicate_keys| Self {
+            rows: Vec::new(),
+            budget,
+            payload_bytes: 0,
+            runs: Vec::new(),
+            fan_in,
+            reject_duplicate_keys,
+        };
+        Ok((make(first, true), make(budget - first, false)))
     }
 
     pub fn push(&mut self, space: &mut Space, row: Row) -> Result<()> {
@@ -270,7 +294,11 @@ impl Sorter {
             return Err(limit());
         }
         if self.rows.len() == self.rows.capacity() {
-            let available = (self.budget - self.payload_bytes - payload) / slot;
+            // Reserve room for the payloads of new slots too. Reserving only
+            // Row headers can exhaust the budget with mostly empty capacity,
+            // forcing a spill even when the actual uniform rows would fit.
+            let available = self.rows.len()
+                + (self.budget - self.payload_bytes - self.rows.len() * slot) / (slot + payload);
             let desired = self
                 .rows
                 .capacity()
@@ -293,6 +321,9 @@ impl Sorter {
         let mut rows = std::mem::take(&mut self.rows);
         self.payload_bytes = 0;
         rows.sort_unstable();
+        if self.reject_duplicate_keys && rows.windows(2).any(|pair| pair[0].key == pair[1].key) {
+            return Err(Error::new(ErrorKind::RecordAlreadyExists));
+        }
         let (mut run, mut output) = space.writer()?;
         for row in rows {
             space.append(&mut run, &mut output, &row)?;
@@ -376,6 +407,53 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn paired_sorters_do_not_spill_uniform_rows_that_fit_the_budget() {
+        let directory = Directory(
+            std::env::temp_dir().join(format!("ktann-paired-fit-{}", std::process::id())),
+        );
+        let mut space = Space::new(&directory.0, 1024 * 1024, 128).unwrap();
+        let (mut ids, mut trees) = Sorter::pair(&space, 2 * 1024 * 1024).unwrap();
+        for id in 0..10000_u64 {
+            ids.push(
+                &mut space,
+                Row {
+                    key: id.to_be_bytes().to_vec(),
+                    value: Vec::new(),
+                },
+            )
+            .unwrap();
+            trees
+                .push(
+                    &mut space,
+                    Row {
+                        key: Vec::new(),
+                        value: vec![0; 18],
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(space.written, 0);
+        assert!(ids.unique_keys(&mut space).unwrap());
+        let run = trees.finish(&mut space).unwrap();
+        space.remove(run).unwrap();
+        assert_eq!(space.live, 0);
+    }
+
+    #[test]
+    fn paired_sorters_accept_the_minimum_shared_memory_budget() {
+        let directory =
+            Directory(std::env::temp_dir().join(format!("ktann-paired-{}", std::process::id())));
+        let row_bound = 128;
+        let memory = 512 * 1024 + 6 * row_bound + 2 * std::mem::size_of::<Row>();
+        let space = Space::new(&directory.0, 1024 * 1024, row_bound).unwrap();
+        assert!(Sorter::pair(&space, memory).is_ok());
+        assert_eq!(
+            Sorter::pair(&space, memory - 1).err().unwrap().kind(),
+            ErrorKind::InvalidArgument
+        );
     }
 
     #[test]

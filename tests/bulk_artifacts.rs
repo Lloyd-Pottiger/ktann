@@ -827,3 +827,143 @@ fn streaming_snapshot_matches_one_pass_and_never_seals_failed_input() {
     );
     assert!(!path.join("manifest.bin").exists());
 }
+
+#[test]
+fn receipt_sorting_preserves_source_and_forest_bytes_with_spills() {
+    use ktann::bulk::PreparedInputWriter;
+    for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
+        for count in [0, 73, 3000] {
+            let dir = Directory::new();
+            let config = forest_config(metric);
+            let mut options = forest_options();
+            options.sort_memory_bytes *= 2;
+            let records = || (0..count).rev().map(|id| Ok(forest_record(id)));
+            let original = InputSnapshot::create(
+                &dir.0.join("original"),
+                config.clone(),
+                8_000_000,
+                records(),
+            )
+            .unwrap();
+            let mut writer = PreparedInputWriter::new(
+                &dir.0.join("source"),
+                &dir.0.join("sorting"),
+                config,
+                8_000_000,
+                options,
+            )
+            .unwrap();
+            let mut input = records();
+            loop {
+                let batch: Vec<_> = input.by_ref().take(17).collect();
+                if batch.is_empty() {
+                    break;
+                }
+                writer = writer.append(batch).unwrap();
+            }
+            let prepared = writer.seal().unwrap();
+            assert_eq!(original.manifest(), prepared.source().manifest());
+            let (before, _) = ForestArtifact::build(
+                &dir.0.join("before"),
+                &original,
+                [7; 32],
+                options,
+                8_000_000,
+            )
+            .unwrap();
+            let (after, _) =
+                ForestArtifact::build_prepared(&dir.0.join("after"), prepared, [7; 32], 8_000_000)
+                    .unwrap();
+            assert_eq!(before.manifest(), after.manifest());
+            assert_eq!(forest_shape(&before), forest_shape(&after));
+            assert!(!dir.0.join("sorting").exists());
+        }
+    }
+}
+
+#[test]
+fn receipt_sorting_rejects_cross_batch_duplicates_and_invalid_records() {
+    use ktann::bulk::PreparedInputWriter;
+    let dir = Directory::new();
+    let mut options = forest_options();
+    options.sort_memory_bytes *= 2;
+    let writer = PreparedInputWriter::new(
+        &dir.0.join("source"),
+        &dir.0.join("sorting"),
+        forest_config(Metric::L2),
+        8_000_000,
+        options,
+    )
+    .unwrap();
+    let writer = writer
+        .append((0..3000).map(|id| Ok(forest_record(id))))
+        .unwrap();
+    let prepared = writer
+        .append([Ok(forest_record(0))])
+        .unwrap()
+        .seal()
+        .unwrap();
+    assert_eq!(
+        ForestArtifact::build_prepared(&dir.0.join("forest"), prepared, [7; 32], 8_000_000)
+            .err()
+            .unwrap()
+            .kind(),
+        ErrorKind::RecordAlreadyExists
+    );
+    assert!(!dir.0.join("forest/manifest.bin").exists());
+    let writer = PreparedInputWriter::new(
+        &dir.0.join("invalid"),
+        &dir.0.join("invalid-sort"),
+        forest_config(Metric::L2),
+        8_000_000,
+        options,
+    )
+    .unwrap();
+    assert_eq!(
+        writer.append([Ok(record(1))]).err().unwrap().kind(),
+        ErrorKind::InvalidArgument
+    );
+    assert!(!dir.0.join("invalid/manifest.bin").exists());
+}
+
+#[test]
+fn receipt_sorting_rejects_local_duplicates_before_sealing() {
+    let dir = Directory::new();
+    let mut options = forest_options();
+    options.sort_memory_bytes *= 2;
+    let writer = ktann::bulk::PreparedInputWriter::new(
+        &dir.0.join("source"),
+        &dir.0.join("sort"),
+        forest_config(Metric::L2),
+        8_000_000,
+        options,
+    )
+    .unwrap();
+    let error = writer
+        .append((0..10000).map(|_| Ok(forest_record(1))))
+        .err()
+        .unwrap();
+    assert_eq!(error.kind(), ErrorKind::RecordAlreadyExists);
+    assert!(!dir.0.join("source/manifest.bin").exists());
+}
+
+#[test]
+fn receipt_sorting_validates_configuration_before_creating_files() {
+    let dir = Directory::new();
+    let invalid = config()
+        .with_tree_key_fields(vec![ktann::api::FieldId(99)])
+        .unwrap();
+    let mut options = forest_options();
+    options.sort_memory_bytes *= 2;
+    let error = ktann::bulk::PreparedInputWriter::new(
+        &dir.0.join("source"),
+        &dir.0.join("sort"),
+        invalid,
+        8_000_000,
+        options,
+    )
+    .err()
+    .unwrap();
+    assert_eq!(error.kind(), ErrorKind::InvalidArgument);
+    assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 0);
+}

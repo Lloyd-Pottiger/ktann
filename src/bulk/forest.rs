@@ -7,13 +7,14 @@ use std::path::{Path, PathBuf};
 use bytes::{Buf, Bytes};
 use sha2::{Digest, Sha256};
 
-use crate::api::{DataType, Error, ErrorKind, IndexConfig, Metric, Result};
+use crate::api::{DataType, Error, ErrorKind, IndexConfig, Metric, Record, Result};
 use crate::construction::{
     CONSTRUCTION_VERSION, ConstructionOptions, ConstructionRecord, PartitionPlan, construct_tree,
 };
 use crate::storage::keys::{MAX_TREE_KEY_BYTES, TreeKey};
 
 use super::files::{ArtifactManifest, Reader, Writer, corrupt, io_error};
+use super::input::PreparedInput;
 use super::sort::{Row, Sorter, Space};
 use super::{InputSnapshot, plan};
 
@@ -72,6 +73,43 @@ pub struct ForestArtifact {
     pub(super) construction: ConstructionOptions,
 }
 
+// Volatile work derived from the same validated records as the sealed snapshot.
+// Two sorters share a fixed memory ceiling and a single scratch quota.
+pub(super) struct ForestPreparation {
+    pub options: ForestOptions,
+    space: Space,
+    ids: Sorter,
+    trees: Sorter,
+    types: Vec<DataType>,
+}
+
+impl ForestPreparation {
+    pub fn new(directory: &Path, config: &IndexConfig, options: ForestOptions) -> Result<Self> {
+        validate(config, directory, options)?;
+        let space = Space::new(directory, options.sort_scratch_bytes, maximum_row(config))?;
+        let (ids, trees) = Sorter::pair(&space, options.sort_memory_bytes)?;
+        Ok(Self {
+            options,
+            ids,
+            trees,
+            space,
+            types: tree_types(config),
+        })
+    }
+
+    pub fn append(&mut self, config: &IndexConfig, record: &Record) -> Result<()> {
+        self.ids.push(
+            &mut self.space,
+            Row {
+                key: record.id().to_vec(),
+                value: Vec::new(),
+            },
+        )?;
+        self.trees
+            .push(&mut self.space, project(config, &self.types, record)?)
+    }
+}
+
 impl ForestArtifact {
     /// Builds every nonempty tree into one sealed, canonically ordered artifact.
     ///
@@ -92,7 +130,7 @@ impl ForestArtifact {
         validate(input.config(), directory, options)?;
         let config = input.config();
         let types = tree_types(config);
-        let mut writer = Writer::new(directory, 2, binding(input, seed, options), maximum_bytes)?;
+        let writer = Writer::new(directory, 2, binding(input, seed, options), maximum_bytes)?;
         let sort_directory = directory.join("sort");
         let mut space = Space::new(
             &sort_directory,
@@ -106,12 +144,6 @@ impl ForestArtifact {
         let mut ids = Sorter::new(&space, options.sort_memory_bytes)?;
         for record in input.reader()? {
             let record = record?;
-            let values = config
-                .tree_key_fields()
-                .iter()
-                .map(|id| record.fields()[id.0 as usize].clone())
-                .collect::<Vec<_>>();
-            let key = TreeKey::encode(&types, &values)?;
             ids.push(
                 &mut space,
                 Row {
@@ -119,19 +151,10 @@ impl ForestArtifact {
                     value: Vec::new(),
                 },
             )?;
-            let mut value = Vec::with_capacity(2 + record.id().len() + 4 * config.dimension());
-            value.extend_from_slice(&(record.id().len() as u16).to_be_bytes());
-            value.extend_from_slice(record.id());
-            for component in record.vector() {
-                value.extend_from_slice(&component.to_bits().to_be_bytes());
-            }
             space.append(
                 &mut projected,
                 &mut projection_writer,
-                &Row {
-                    key: key.as_bytes().to_vec(),
-                    value,
-                },
+                &project(config, &types, &record)?,
             )?;
         }
         projection_writer.flush().map_err(io_error)?;
@@ -149,6 +172,43 @@ impl ForestArtifact {
         drop(source);
         let tree_run = trees.finish(&mut space)?;
         space.remove(projected)?;
+        Self::construct(directory, input, seed, options, writer, space, tree_run)
+    }
+
+    /// Consumes receipt-time sorting work without rescanning the source.
+    /// The caller owns scratch directories on failure, just as with `build`.
+    pub fn build_prepared(
+        directory: &Path,
+        prepared: PreparedInput,
+        seed: [u8; 32],
+        maximum_bytes: u64,
+    ) -> Result<(Self, ForestReport)> {
+        let PreparedInput {
+            source,
+            preparation,
+        } = prepared;
+        let options = preparation.options;
+        validate(source.config(), directory, options)?;
+        let writer = Writer::new(directory, 2, binding(&source, seed, options), maximum_bytes)?;
+        let mut space = preparation.space;
+        if !preparation.ids.unique_keys(&mut space)? {
+            return Err(Error::new(ErrorKind::RecordAlreadyExists));
+        }
+        let run = preparation.trees.finish(&mut space)?;
+        Self::construct(directory, &source, seed, options, writer, space, run)
+    }
+
+    fn construct(
+        directory: &Path,
+        input: &InputSnapshot,
+        seed: [u8; 32],
+        options: ForestOptions,
+        mut writer: Writer,
+        mut space: Space,
+        tree_run: super::sort::Run,
+    ) -> Result<(Self, ForestReport)> {
+        let config = input.config();
+        let types = tree_types(config);
         let mut source = space.reader(&tree_run)?;
         let mut next = source.next()?;
         let mut report = ForestReport::default();
@@ -196,7 +256,7 @@ impl ForestArtifact {
         }
         drop(source);
         space.remove(tree_run)?;
-        fs::remove_dir(sort_directory).map_err(io_error)?;
+        space.reclaim_directory()?;
         if report.records != input.manifest().items() {
             return Err(corrupt());
         }
@@ -387,6 +447,26 @@ impl Iterator for ForestReader {
     }
 }
 impl std::iter::FusedIterator for ForestReader {}
+
+// Both receipt-time and snapshot-time preparation use identical projection bytes.
+fn project(config: &IndexConfig, types: &[DataType], record: &Record) -> Result<Row> {
+    let values = config
+        .tree_key_fields()
+        .iter()
+        .map(|id| record.fields()[id.0 as usize].clone())
+        .collect::<Vec<_>>();
+    let key = TreeKey::encode(types, &values)?;
+    let mut value = Vec::with_capacity(2 + record.id().len() + 4 * config.dimension());
+    value.extend_from_slice(&(record.id().len() as u16).to_be_bytes());
+    value.extend_from_slice(record.id());
+    for component in record.vector() {
+        value.extend_from_slice(&component.to_bits().to_be_bytes());
+    }
+    Ok(Row {
+        key: key.as_bytes().to_vec(),
+        value,
+    })
+}
 
 fn tree_types(config: &IndexConfig) -> Vec<DataType> {
     config

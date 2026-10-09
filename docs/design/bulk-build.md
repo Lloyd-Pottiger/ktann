@@ -340,6 +340,29 @@ Input Snapshot; append failure consumes the writer and leaves caller-owned,
 unsealed files. No raw input rewrite is required at EOF. Job allocation and
 forest construction still require the sealed input identity.
 
+`PreparedInputWriter` optionally performs Tree Key/vector projection and bounded
+run sorting during receipt, using the same projection codec as snapshot-time
+preparation. ID and Tree Key sorters split the row-buffer budget after one shared IO
+reservation, and share one scratch quota. Their IO runs serially; only one set
+of merge heads and IO buffers is live at a time. Undersized budgets are rejected
+before capture.
+Sorted ID runs reject local duplicates; the final merge rejects duplicates
+across runs and Tree Keys before any partition is emitted. Append is synchronous
+and consuming, so callers apply batch backpressure instead of growing a queue.
+It does not normalize/rotate vectors or train partitions before EOF.
+
+Sealing returns the unchanged, original-order Input Snapshot and one-use
+`PreparedInput`. `run_worker_with_prepared_input` checks its source identity,
+configuration and preparation options before claiming a workspace. The normal
+worker consumes these sorted projections directly, avoiding a source reread and
+projection spool. This preparation is volatile and caller owned, never an
+accepted checkpoint. On loss, ordinary workers and the scheduler recompute it
+from the sealed snapshot. Accepted Forest/Serving Artifacts keep their existing
+fencing and recovery rules; unused caller preparation is reclaimable by its
+owner. `BulkWorkerReport` separates forest, serving and backend-load wall times
+and reports forest scratch IO; reused stages have zero work time.
+
+
 Externally sort only Record IDs across the whole Logical Index. During the
 same source pass, sequentially spool the Tree Key, Record ID, and vector
 projection under the shared sort scratch quota. This avoids carrying vectors

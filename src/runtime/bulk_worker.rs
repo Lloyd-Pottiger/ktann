@@ -1,7 +1,9 @@
 //! Durable, attempt-fenced preparation and namespace-owned artifact reclamation.
 use super::{OperationContext, lifecycle::RetryPolicy};
-use crate::api::{BulkWorkerOptions, Error, ErrorKind, Result};
-use crate::bulk::{ForestArtifact, ForestOptions, InputSnapshot, ServingArtifact, ServingOptions};
+use crate::api::{BulkWorkerOptions, BulkWorkerReport, Error, ErrorKind, Result};
+use crate::bulk::{
+    ForestArtifact, ForestOptions, InputSnapshot, PreparedInput, ServingArtifact, ServingOptions,
+};
 use crate::observe::labels::Operation;
 use crate::storage::backend::Backend;
 use crate::storage::keys::LogicalKey;
@@ -14,6 +16,7 @@ use std::{
     fs::{self, File, OpenOptions},
     path::Path,
     sync::Arc,
+    time::Instant,
 };
 
 /// A shared root lock is retained by native work, even when its async waiter is
@@ -106,15 +109,35 @@ pub(crate) async fn run<B: Backend>(
     index: IndexManifest,
     descriptor: BuildDescriptor,
     options: BulkWorkerOptions,
+    prepared: Option<PreparedInput>,
     retry: RetryPolicy,
-) -> Result<()> {
+) -> Result<BulkWorkerReport> {
     let options = normalize_options(context, options).await?;
+    if let Some(input) = &prepared {
+        let forest_options = ForestOptions {
+            tree: descriptor.options(),
+            sort_memory_bytes: options.sort_memory_bytes,
+            sort_scratch_bytes: options.sort_scratch_bytes,
+        };
+        if !input.matches(index.config(), descriptor.input(), forest_options) {
+            return Err(Error::invalid_argument());
+        }
+    }
     // Lock before registration or any directory creation, so cleanup can remove
     // the ledger only when every potential creator has left this critical region.
     let root = options.workspace.clone();
     let lock = Arc::new(blocking(context, move || lock_root(&root, false)).await?);
     let mut state = claim(context, &index, &descriptor, options, retry).await?;
-    let result = prepare_and_load(context, &index, &descriptor, &mut state, lock, retry).await;
+    let result = prepare_and_load(
+        context,
+        &index,
+        &descriptor,
+        &mut state,
+        lock,
+        prepared,
+        retry,
+    )
+    .await;
     if let Err(error) = &result {
         record_failure(context, &index, &state, error.kind(), retry).await?;
     }
@@ -207,8 +230,16 @@ async fn prepare_and_load<B: Backend>(
     descriptor: &BuildDescriptor,
     state: &mut BuildWorkspace,
     lock: Arc<File>,
+    prepared: Option<PreparedInput>,
     retry: RetryPolicy,
-) -> Result<()> {
+) -> Result<BulkWorkerReport> {
+    let mut report = BulkWorkerReport::default();
+    let prepared = if state.forest.is_some() || state.serving.is_some() {
+        drop(prepared);
+        None
+    } else {
+        prepared
+    };
     if let Some(accepted) = &state.serving {
         let path = state.attempt(accepted.epoch).join("serving");
         let expected = accepted.manifest.clone();
@@ -221,7 +252,8 @@ async fn prepare_and_load<B: Backend>(
             ServingArtifact::accepted(&path, expected, &manifest, &descriptor_copy, limits)
         })
         .await?;
-        return super::bulk_load::load(
+        let start = Instant::now();
+        super::bulk_load::load(
             context,
             index.clone(),
             descriptor.clone(),
@@ -229,7 +261,9 @@ async fn prepare_and_load<B: Backend>(
             state.options.load,
             retry,
         )
-        .await;
+        .await?;
+        report.load = start.elapsed();
+        return Ok(report);
     }
     let input = blocking(context, {
         let descriptor = descriptor.clone();
@@ -283,12 +317,17 @@ async fn prepare_and_load<B: Backend>(
         let seed = *index.rotation_seed();
         let quota = state.options.max_artifact_bytes;
         let lock = lock.clone();
-        let forest = blocking(context, move || {
+        let start = Instant::now();
+        let (forest, forest_report) = blocking(context, move || {
             let _lock = lock;
-            ForestArtifact::build(&path, &source, seed, forest_options, quota)
-                .map(|(artifact, _)| artifact)
+            match prepared {
+                Some(input) => ForestArtifact::build_prepared(&path, input, seed, quota),
+                None => ForestArtifact::build(&path, &source, seed, forest_options, quota),
+            }
         })
         .await?;
+        report.forest = start.elapsed();
+        report.forest_report = Some(forest_report);
         let mut after = state.clone();
         after.forest = Some(PreparedArtifact {
             epoch: state.epoch,
@@ -308,12 +347,14 @@ async fn prepare_and_load<B: Backend>(
         let manifest = index.clone();
         let quota = state.options.max_artifact_bytes;
         let lock = lock.clone();
+        let start = Instant::now();
         let serving = blocking(context, move || {
             let _lock = lock;
             ServingArtifact::build(&path, &input, &forest, &manifest, serving_options, quota)
                 .map(|(artifact, _)| artifact)
         })
         .await?;
+        report.serving = start.elapsed();
         let mut after = state.clone();
         after.serving = Some(PreparedArtifact {
             epoch: state.epoch,
@@ -325,6 +366,7 @@ async fn prepare_and_load<B: Backend>(
     };
     // The shared root lock spans the entire async load; detached reader tasks
     // hold only open immutable file handles and cannot recreate deleted paths.
+    let start = Instant::now();
     super::bulk_load::load(
         context,
         index.clone(),
@@ -333,7 +375,9 @@ async fn prepare_and_load<B: Backend>(
         state.options.load,
         retry,
     )
-    .await
+    .await?;
+    report.load = start.elapsed();
+    Ok(report)
 }
 async fn accept<B: Backend>(
     context: &mut OperationContext<B>,

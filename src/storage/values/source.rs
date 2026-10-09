@@ -12,7 +12,7 @@ use super::{ValueKind, corrupt};
 // This body is framed by the independently versioned bulk input format. Reuse
 // the serving primitives so original vectors and typed fields have one canonical
 // representation, without inventing an Index Manifest before name reservation.
-pub(crate) fn encode(config: &IndexConfig, mut record: Record) -> Result<Vec<u8>> {
+pub(crate) fn encode(config: &IndexConfig, record: &mut Record) -> Result<Vec<u8>> {
     record.validate(config.dimension(), config.fields())?;
     let mut encoder = Encoder::new(ValueKind::VectorRecord);
     encode_record_id(&mut encoder, record.id())?;

@@ -533,3 +533,64 @@ async fn premature_publish_does_not_fail_an_in_progress_load() {
         runtime.shutdown().await.unwrap();
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepared_receipt_and_lost_preparation_both_publish_complete_indexes() {
+    use ktann::bulk::PreparedInputWriter;
+    for mode in 0..3 {
+        let dir = Directory::new();
+        let memory = MemoryBackend::new();
+        let runtime = runtime(memory);
+        let mut opts = worker_options(&dir);
+        opts.sort_memory_bytes *= 2;
+        let mut forest = options();
+        forest.sort_memory_bytes = opts.sort_memory_bytes;
+        forest.sort_scratch_bytes = opts.sort_scratch_bytes;
+        let prepared = PreparedInputWriter::new(
+            &dir.0.join("source"),
+            &dir.0.join("receipt"),
+            config(Metric::L2, true),
+            4_000_000,
+            forest,
+        )
+        .unwrap()
+        .append((0..73).map(|id| Ok(record(id))))
+        .unwrap()
+        .seal()
+        .unwrap();
+        let source = prepared.source().clone();
+        let job = runtime
+            .start_bulk_build("bulk", &source, forest.tree)
+            .await
+            .unwrap();
+        let report = if mode == 0 {
+            job.run_worker_with_prepared_input(opts.clone(), prepared, Default::default())
+                .await
+                .unwrap()
+        } else {
+            if mode == 1 {
+                drop(prepared);
+            } else {
+                let mut mismatched = opts.clone();
+                mismatched.sort_memory_bytes *= 2;
+                assert_eq!(
+                    job.run_worker_with_prepared_input(mismatched, prepared, Default::default())
+                        .await
+                        .unwrap_err()
+                        .kind(),
+                    ErrorKind::InvalidArgument
+                );
+            }
+            fs::remove_dir_all(dir.0.join("receipt")).unwrap();
+            job.run_worker(opts.clone()).await.unwrap()
+        };
+        assert!(!report.forest.is_zero());
+        assert!(!report.serving.is_zero());
+        assert!(!report.load.is_zero());
+        let index = job.publish().await.unwrap();
+        let verified = index.verify(VerifyOptions::default()).await.unwrap();
+        assert!(verified.complete && verified.issues.is_empty());
+        assert_eq!(verified.objects.vector_records, 73);
+        runtime.shutdown().await.unwrap();
+    }
+}

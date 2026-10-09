@@ -77,6 +77,21 @@ pub struct BulkCleanupPage {
     pub next: Option<LogicalIndexId>,
 }
 
+/// Wall times of work performed by one worker invocation, excluding receipt.
+/// Reused artifact stages have zero duration; publication is timed separately.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BulkWorkerReport {
+    /// Forest sorting/training and immutable plan emission.
+    pub forest: std::time::Duration,
+    /// Preparation IO counts, including receipt-time sorting when supplied.
+    /// Absent when an accepted forest is reused.
+    pub forest_report: Option<crate::bulk::ForestReport>,
+    /// Exact joins and serving encoding.
+    pub serving: std::time::Duration,
+    /// Backend artifact loading, including checkpoint transactions.
+    pub load: std::time::Duration,
+}
+
 /// Resource bounds and an existing durable, shared preparation workspace.
 /// Workers require reliable advisory file locks, atomic rename, and fsync on
 /// this filesystem. The root and its coordination lock remain caller owned.
@@ -332,7 +347,7 @@ impl<B: Backend> BulkBuildJob<B> {
     /// Resumes preparation and loading, reusing previously accepted artifacts.
     /// The new invocation takes a durable attempt epoch. Completion leaves the
     /// index hidden; call `publish` to validate and activate it.
-    pub async fn run_worker(&self, options: BulkWorkerOptions) -> Result<()> {
+    pub async fn run_worker(&self, options: BulkWorkerOptions) -> Result<BulkWorkerReport> {
         self.run_worker_with_control(options, OperationOptions::default())
             .await
     }
@@ -341,7 +356,28 @@ impl<B: Backend> BulkBuildJob<B> {
         &self,
         options: BulkWorkerOptions,
         control: OperationOptions,
-    ) -> Result<()> {
+    ) -> Result<BulkWorkerReport> {
+        self.run_worker_input(options, None, control).await
+    }
+
+    /// Reuses bounded receipt-time sorting. Loss of this volatile preparation
+    /// never prevents ordinary `run_worker` recovery from the sealed source.
+    pub async fn run_worker_with_prepared_input(
+        &self,
+        options: BulkWorkerOptions,
+        prepared: crate::bulk::PreparedInput,
+        control: OperationOptions,
+    ) -> Result<BulkWorkerReport> {
+        self.run_worker_input(options, Some(prepared), control)
+            .await
+    }
+
+    async fn run_worker_input(
+        &self,
+        options: BulkWorkerOptions,
+        prepared: Option<crate::bulk::PreparedInput>,
+        control: OperationOptions,
+    ) -> Result<BulkWorkerReport> {
         let manifest = self.manifest.clone();
         let descriptor = self.descriptor.clone();
         let retry = lifecycle::RetryPolicy::from_config(self.runtime.config());
@@ -356,6 +392,7 @@ impl<B: Backend> BulkBuildJob<B> {
                         manifest,
                         descriptor,
                         options,
+                        prepared,
                         retry,
                     )
                     .await

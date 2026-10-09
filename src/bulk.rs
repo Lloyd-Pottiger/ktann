@@ -13,7 +13,9 @@ mod serving;
 mod sort;
 
 pub use files::{ARTIFACT_MANIFEST_BYTES, ArtifactManifest};
-pub use input::{InputReader, InputSnapshot, InputSnapshotWriter};
+pub use input::{
+    InputReader, InputSnapshot, InputSnapshotWriter, PreparedInput, PreparedInputWriter,
+};
 
 pub use forest::{ForestArtifact, ForestOptions, ForestPartition, ForestReader, ForestReport};
 

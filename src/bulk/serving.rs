@@ -137,12 +137,12 @@ impl ServingArtifact {
         let mut space = Space::new(&scratch, options.scratch_bytes, MAX_ROW)?;
         let mut records = Sorter::new(&space, options.memory_bytes)?;
         for record in input.reader()? {
-            let record = record?;
+            let mut record = record?;
             records.push(
                 &mut space,
                 Row {
                     key: record.id().to_vec(),
-                    value: source::encode(index.config(), record)?,
+                    value: source::encode(index.config(), &mut record)?,
                 },
             )?;
         }

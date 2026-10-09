@@ -233,6 +233,7 @@ async fn drive<B: Backend>(
             manifest.clone(),
             descriptor.clone(),
             schedule.options,
+            None,
             retry,
         )
         .await?;
