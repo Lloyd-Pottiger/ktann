@@ -593,17 +593,9 @@ pub(crate) async fn cleanup_pending<B: Backend>(
     }
     let backend = context.backend();
     let mut raw = backend.begin_read().await?;
-    let start = match after {
-        None => vec![0, 2],
-        Some(id) => {
-            let mut key = crate::storage::keys::build_workspace_key(id);
-            key.push(0);
-            key
-        }
-    };
     let page = raw
         .scan(
-            &crate::storage::keys::KeyRange::new(start, vec![0, 3]),
+            &crate::storage::keys::build_workspace_range(after),
             crate::storage::backend::ScanLimits {
                 item_limit: maximum,
                 byte_limit: 1024 * 1024,

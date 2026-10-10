@@ -39,6 +39,24 @@ pub struct ConstructionOptions {
     pub scratch_bytes: u64,
 }
 
+impl ConstructionOptions {
+    /// Checks configuration invariants independent of vector dimension.
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.min_partition_entries == 0
+            || self
+                .min_partition_entries
+                .checked_mul(2)
+                .is_none_or(|minimum| minimum > self.max_partition_entries)
+            || self.sample_items < 2
+            || self.memory_bytes == 0
+            || self.scratch_bytes == 0
+        {
+            return Err(Error::invalid_argument());
+        }
+        Ok(())
+    }
+}
+
 /// One original vector, identified by its canonical Record ID.
 pub struct ConstructionRecord {
     /// Record ID, unique across the containing Logical Index.
@@ -731,15 +749,8 @@ pub(crate) fn validate_options(dimension: usize, options: ConstructionOptions) -
         // owns one encoded vector buffer in addition to its decoded row.
         .and_then(|n| n.checked_add(3 * dimension * 4))
         .ok_or_else(limit)?;
-    if options.min_partition_entries == 0
-        || options
-            .min_partition_entries
-            .checked_mul(2)
-            .is_none_or(|n| n > options.max_partition_entries)
-        || options.sample_items < 2
-        || options.memory_bytes <= reserved.checked_add(row_bound).ok_or_else(limit)?
-        || options.scratch_bytes == 0
-    {
+    options.validate()?;
+    if options.memory_bytes <= reserved.checked_add(row_bound).ok_or_else(limit)? {
         return Err(Error::invalid_argument());
     }
     Ok((options.memory_bytes - reserved) / row_bound)

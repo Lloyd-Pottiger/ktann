@@ -822,6 +822,30 @@ fn decode_partition_key(
     }
 }
 
+/// Namespace-owned workspace records strictly after the supplied index ID.
+pub(crate) fn build_workspace_range(after: Option<LogicalIndexId>) -> KeyRange {
+    let prefix = vec![SCOPE_NAMESPACE, NS_BUILD_WORKSPACE];
+    let end = successor(&prefix);
+    let start = after.map_or(prefix, |id| {
+        let mut key = build_workspace_key(id);
+        key.push(0);
+        key
+    });
+    KeyRange { start, end }
+}
+
+/// Scheduled build records strictly after the supplied index ID.
+pub(crate) fn build_schedule_range(after: Option<LogicalIndexId>) -> KeyRange {
+    let prefix = vec![SCOPE_NAMESPACE, NS_BUILD_SCHEDULE];
+    let end = successor(&prefix);
+    let start = after.map_or(prefix, |id| {
+        let mut key = build_schedule_key(id);
+        key.push(0);
+        key
+    });
+    KeyRange { start, end }
+}
+
 /// The contiguous range of every key owned by one Logical Index.
 #[must_use]
 pub fn index_range(index: LogicalIndexId) -> KeyRange {

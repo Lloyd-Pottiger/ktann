@@ -1088,7 +1088,7 @@ fn cache_miss_ratio(lookups: &BTreeMap<String, u64>) -> f64 {
     misses as f64 / total as f64
 }
 
-/// Compares Backend blocking and Import admission p95 distributions.
+/// Compares Backend blocking p95 distributions.
 fn compare_admission(
     result: &mut ComparisonReport,
     scenario: &str,

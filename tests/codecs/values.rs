@@ -1008,15 +1008,17 @@ fn building_manifest_and_request_descriptor_have_canonical_bytes() {
         decode(codec, &key, &unsupported).unwrap_err().kind(),
         ErrorKind::UnsupportedFormat
     );
-    input_bytes[8] = 1;
-    assert!(
-        BuildDescriptor::new(
-            "/source".into(),
-            ArtifactManifest::decode(&input_bytes).unwrap(),
-            options
-        )
-        .is_err()
-    );
+    for kind in [2, 3] {
+        input_bytes[8] = kind;
+        assert!(
+            BuildDescriptor::new(
+                "/source".into(),
+                ArtifactManifest::decode(&input_bytes).unwrap(),
+                options
+            )
+            .is_err()
+        );
+    }
 }
 
 #[test]

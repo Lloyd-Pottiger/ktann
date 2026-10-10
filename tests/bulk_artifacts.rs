@@ -290,6 +290,14 @@ fn manifest_identity_and_version_are_checked_independently_of_data() {
     assert_eq!(a.verify().unwrap_err().kind(), ErrorKind::Corruption);
     let mut encoded = b.manifest().encode();
     assert_eq!(encoded.len(), ARTIFACT_MANIFEST_BYTES);
+    for kind in [1, 4, u8::MAX] {
+        encoded[8] = kind;
+        assert_eq!(
+            ArtifactManifest::decode(&encoded).unwrap_err().kind(),
+            ErrorKind::Corruption
+        );
+    }
+    encoded = b.manifest().encode();
     encoded[7] += 1;
     assert_eq!(
         ArtifactManifest::decode(&encoded).unwrap_err().kind(),

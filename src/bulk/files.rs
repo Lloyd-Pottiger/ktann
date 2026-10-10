@@ -73,7 +73,7 @@ impl ArtifactManifest {
         if bytes[7] != MAGIC[7] {
             return Err(Error::new(ErrorKind::UnsupportedFormat));
         }
-        if !matches!(bytes[8], 0..=3) {
+        if !matches!(bytes[8], 0 | 2 | 3) {
             return Err(corrupt());
         }
         let manifest = Self {

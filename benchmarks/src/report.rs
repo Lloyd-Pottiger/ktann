@@ -139,7 +139,7 @@ pub struct Configuration {
     pub measured_operations: usize,
     /// Requested result count.
     pub k: usize,
-    /// Records submitted in each direct batch loading batch, when applicable.
+    /// Records submitted in each direct batch, when applicable.
     pub import_batch_size: Option<usize>,
 }
 
