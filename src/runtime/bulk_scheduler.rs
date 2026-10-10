@@ -1,5 +1,5 @@
 //! Namespace queue discovery, renewable claims, and identity-fenced execution.
-use super::{OperationContext, Runtime, bulk_publish, bulk_worker, lifecycle::RetryPolicy};
+use super::{OperationContext, Runtime, bulk_worker, lifecycle::RetryPolicy};
 use crate::api::{
     BulkSchedulerOptions, BulkWorkerOptions, Error, ErrorKind, LogicalIndexId, OperationOptions,
     Result,
@@ -8,7 +8,7 @@ use crate::observe::labels::Operation;
 use crate::storage::backend::{Backend, ReadOps, ScanLimits, WriteTxn};
 use crate::storage::keys::{self, KeyRange, LogicalKey};
 use crate::storage::values::{
-    BuildPhase, BuildSchedule, IndexLifecycle, IndexManifest, PersistentValue, ValueCodec,
+    BuildSchedule, IndexLifecycle, IndexManifest, PersistentValue, ValueCodec,
 };
 use crate::storage::{ReadLogicalTxn, WriteLogicalTxn};
 use std::{
@@ -219,27 +219,10 @@ async fn drive<B: Backend>(
         Some(PersistentValue::BuildDescriptor(d)) => d,
         _ => return Err(bulk_worker::corrupt()),
     };
-    if let Some(PersistentValue::BuildWorkspace(w)) =
-        txn.get(LogicalKey::BuildWorkspace(id)).await?
-        && let Some(kind) = w.failure
-    {
-        return Err(Error::new(kind));
-    }
-    let sealed = matches!(txn.get(LogicalKey::BuildProgress(id)).await?, Some(PersistentValue::BuildProgress(p)) if matches!(p.phase, BuildPhase::Validating { .. } | BuildPhase::Validated));
     drop(txn);
-    if !sealed {
-        bulk_worker::run(
-            context,
-            manifest.clone(),
-            descriptor.clone(),
-            schedule.options,
-            None,
-            retry,
-        )
-        .await?;
-    }
-    bulk_publish::publish(context, manifest, descriptor, retry).await?;
-    bulk_worker::cleanup(context, id, retry).await
+    bulk_worker::complete(context, manifest, descriptor, schedule.options, None, retry)
+        .await
+        .map(|_| ())
 }
 
 /// Releases the schedule and reports whether the worker persisted a terminal failure.

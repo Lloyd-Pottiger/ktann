@@ -77,10 +77,10 @@ pub struct BulkCleanupPage {
     pub next: Option<LogicalIndexId>,
 }
 
-/// Wall times of work performed by one worker invocation, excluding receipt.
-/// Reused artifact stages have zero duration; publication is timed separately.
+/// Work performed while completing one build, excluding input receipt.
+/// Reused stages have zero duration; a retry returns only work done by that call.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct BulkWorkerReport {
+pub struct BulkBuildReport {
     /// Forest sorting/training and immutable plan emission.
     pub forest: std::time::Duration,
     /// Preparation IO counts, including receipt-time sorting when supplied.
@@ -92,6 +92,10 @@ pub struct BulkWorkerReport {
     pub serving_report: Option<crate::bulk::ServingReport>,
     /// Backend artifact loading, including checkpoint transactions.
     pub load: std::time::Duration,
+    /// Exact validation, atomic publication and owned-workspace cleanup.
+    pub publish: std::time::Duration,
+    /// Persisted construction seed for reproducing the completed index.
+    pub rotation_seed: [u8; 32],
 }
 
 /// Resource bounds and an existing durable, shared preparation workspace.
@@ -192,8 +196,8 @@ impl BulkSchedulerOptions {
 /// A recoverable reservation for one new Logical Index.
 ///
 /// This handle never follows a reused Index Name. Reservation launches no work;
-/// callers explicitly run workers and publish after loading. Preparation, loading,
-/// and validation are resumable. Source snapshots remain caller owned, including
+/// callers schedule it or complete it directly. Preparation, loading, and
+/// validation are resumable. Source snapshots remain caller owned, including
 /// after abort, and are reverified when consumed.
 pub struct BulkBuildJob<B: Backend> {
     runtime: Arc<RuntimeInner<B>>,
@@ -229,20 +233,6 @@ impl<B: Backend> BulkBuildJob<B> {
         self.manifest.logical_index_id()
     }
 
-    /// Immutable index identity, configuration, and persisted construction seed.
-    /// The lifecycle here is the handle's opening snapshot; use `status` for
-    /// current lifecycle. Reading it confers no backend write authority.
-    #[must_use]
-    pub fn index_manifest(&self) -> &IndexManifest {
-        &self.manifest
-    }
-
-    /// Immutable input locator, checksum, and construction parameters.
-    #[must_use]
-    pub fn descriptor(&self) -> &BuildDescriptor {
-        &self.descriptor
-    }
-
     /// Reads the original Logical Index's current lifecycle.
     pub async fn status(&self) -> Result<BulkBuildStatus> {
         self.status_with_control(OperationOptions::default()).await
@@ -259,53 +249,6 @@ impl<B: Backend> BulkBuildJob<B> {
                 options,
                 move |mut context| async move {
                     lifecycle::build_status(&mut context, manifest, descriptor).await
-                },
-            )
-            .await
-    }
-
-    /// Loads a sealed serving artifact into this hidden Building index.
-    ///
-    /// The first call fixes the artifact identity. Subsequent calls resume it
-    /// and take over from earlier invocations through a persisted epoch. A
-    /// superseded call cannot commit further chunks. Any failure may leave a
-    /// committed prefix; retry with the same artifact or abort the build.
-    /// Completion does not authorize publication. Files remain caller owned.
-    pub async fn load_serving(
-        &self,
-        artifact: &crate::bulk::ServingArtifact,
-        options: BulkLoadOptions,
-    ) -> Result<()> {
-        self.load_serving_with_control(artifact, options, OperationOptions::default())
-            .await
-    }
-
-    /// Loads with explicit cancellation and deadline control.
-    pub async fn load_serving_with_control(
-        &self,
-        artifact: &crate::bulk::ServingArtifact,
-        options: BulkLoadOptions,
-        control: OperationOptions,
-    ) -> Result<()> {
-        let artifact = artifact.clone();
-        let manifest = self.manifest.clone();
-        let descriptor = self.descriptor.clone();
-        let retry = lifecycle::RetryPolicy::from_config(self.runtime.config());
-        self.runtime
-            .run_foreground(
-                Operation::LoadBulkBuild,
-                Some(self.logical_index_id()),
-                control,
-                move |mut context| async move {
-                    crate::runtime::bulk_load::load(
-                        &mut context,
-                        manifest,
-                        descriptor,
-                        artifact,
-                        options,
-                        retry,
-                    )
-                    .await
                 },
             )
             .await
@@ -346,50 +289,29 @@ impl<B: Backend> BulkBuildJob<B> {
             .await
     }
 
-    /// Resumes preparation and loading, reusing previously accepted artifacts.
-    /// The new invocation takes a durable attempt epoch. Completion leaves the
-    /// index hidden; call `publish` to validate and activate it.
-    pub async fn run_worker(&self, options: BulkWorkerOptions) -> Result<BulkWorkerReport> {
-        self.run_worker_with_control(options, OperationOptions::default())
-            .await
-    }
-    /// Runs a worker with explicit cancellation/deadline control.
-    pub async fn run_worker_with_control(
-        &self,
-        options: BulkWorkerOptions,
-        control: OperationOptions,
-    ) -> Result<BulkWorkerReport> {
-        self.run_worker_input(options, None, control).await
-    }
-
-    /// Reuses bounded receipt-time sorting. Loss of this volatile preparation
-    /// never prevents ordinary `run_worker` recovery from the sealed source.
-    pub async fn run_worker_with_prepared_input(
-        &self,
-        options: BulkWorkerOptions,
-        prepared: crate::bulk::PreparedInput,
-        control: OperationOptions,
-    ) -> Result<BulkWorkerReport> {
-        self.run_worker_input(options, Some(prepared), control)
-            .await
-    }
-
-    async fn run_worker_input(
+    /// Completes preparation, loading, validation, publication and workspace cleanup.
+    ///
+    /// Retry this operation on the same job to resume durable progress. A published
+    /// job returns its original index. Queued jobs are owned by the scheduler and
+    /// reject direct execution. Optional receipt-time preparation avoids sorting
+    /// the source again; recovery needs only the sealed source.
+    pub async fn complete(
         &self,
         options: BulkWorkerOptions,
         prepared: Option<crate::bulk::PreparedInput>,
         control: OperationOptions,
-    ) -> Result<BulkWorkerReport> {
+    ) -> Result<(super::Index<B>, BulkBuildReport)> {
         let manifest = self.manifest.clone();
         let descriptor = self.descriptor.clone();
         let retry = lifecycle::RetryPolicy::from_config(self.runtime.config());
-        self.runtime
+        let (active, report) = self
+            .runtime
             .run_foreground(
                 Operation::RunBulkBuild,
                 Some(self.logical_index_id()),
                 control,
                 move |mut context| async move {
-                    crate::runtime::bulk_worker::run(
+                    crate::runtime::bulk_worker::complete(
                         &mut context,
                         manifest,
                         descriptor,
@@ -400,40 +322,15 @@ impl<B: Backend> BulkBuildJob<B> {
                     .await
                 },
             )
-            .await
-    }
-    /// Freezes writes, resumes exact paged backend validation, and publishes.
-    /// Unknown publication is resolved by the original Logical Index identity.
-    pub async fn publish(&self) -> Result<super::Index<B>> {
-        self.publish_with_control(OperationOptions::default()).await
-    }
-    /// Publishes with cancellation and deadline control.
-    pub async fn publish_with_control(&self, control: OperationOptions) -> Result<super::Index<B>> {
-        let manifest = self.manifest.clone();
-        let descriptor = self.descriptor.clone();
-        let retry = lifecycle::RetryPolicy::from_config(self.runtime.config());
-        let active = self
-            .runtime
-            .run_foreground(
-                Operation::PublishBulkBuild,
-                Some(self.logical_index_id()),
-                control,
-                move |mut context| async move {
-                    crate::runtime::bulk_publish::publish(&mut context, manifest, descriptor, retry)
-                        .await
-                },
-            )
             .await?;
-        match self.cleanup().await {
-            Err(e) if e.kind() == super::ErrorKind::BulkBuildBusy => {}
-            result => result?,
-        }
-        super::Index::new(Arc::clone(&self.runtime), self.name.clone(), active)
+        let index = super::Index::new(Arc::clone(&self.runtime), self.name.clone(), active)?;
+        Ok((index, report))
     }
+
     /// Reclaims owned attempt files after publication or abort. This is safe to
     /// retry after process loss, including after index data has been dropped.
     /// Busy means workspace IO still holds a shared lock; retry after it exits.
-    pub async fn cleanup(&self) -> Result<()> {
+    async fn cleanup_owned(&self) -> Result<()> {
         let index = self.manifest.clone();
         let retry = lifecycle::RetryPolicy::from_config(self.runtime.config());
         self.runtime
@@ -476,7 +373,7 @@ impl<B: Backend> BulkBuildJob<B> {
                 },
             )
             .await?;
-        match self.cleanup().await {
+        match self.cleanup_owned().await {
             Err(e) if e.kind() == super::ErrorKind::BulkBuildBusy => Ok(()),
             result => result,
         }
@@ -501,3 +398,6 @@ impl<B: Backend> fmt::Debug for BulkBuildJob<B> {
             .finish_non_exhaustive()
     }
 }
+
+#[cfg(feature = "test-support")]
+mod test_support;

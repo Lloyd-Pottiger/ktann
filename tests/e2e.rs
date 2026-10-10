@@ -16,7 +16,7 @@
 //!   starts a fresh backend, Runtime, and index; the harness model resets.
 //!   Field types: `i64`, `f64`, `bool`, `string`; a `?` suffix makes the
 //!   field nullable.
-//! - `load dataset=SPEC tree=V|A..B [via=batch|single|import] [seed=N] [batch=N]`
+//! - `load dataset=SPEC tree=V|A..B [via=batch|single] [seed=N] [batch=N]`
 //!   inserts a dataset through the public mutation API. SPECs are generated
 //!   synthetically except `file:NAME[:N]`, which loads (the first N vectors
 //!   of) a checked-in fixture from `tests/datadriven/data/` and ignores

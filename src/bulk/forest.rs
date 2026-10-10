@@ -11,7 +11,10 @@ use crate::api::{DataType, Error, ErrorKind, IndexConfig, Metric, Record, Result
 use crate::construction::{
     CONSTRUCTION_VERSION, ConstructionOptions, ConstructionRecord, PartitionPlan, construct_tree,
 };
-use crate::storage::keys::{MAX_TREE_KEY_BYTES, TreeKey};
+use crate::storage::keys::{
+    MAX_TREE_KEY_BYTES, TreeKey, decode_escaped_terminated, push_escaped_terminated,
+    scan_escaped_terminated,
+};
 
 use super::files::{ArtifactManifest, Reader, Writer, corrupt, io_error};
 use super::input::PreparedInput;
@@ -69,7 +72,6 @@ pub struct ForestArtifact {
     config: IndexConfig,
     source: ArtifactManifest,
     seed: [u8; 32],
-    pub(super) construction: ConstructionOptions,
 }
 
 // Volatile work derived from the same validated records as the sealed snapshot.
@@ -269,7 +271,6 @@ impl ForestArtifact {
                 config: config.clone(),
                 source: input.manifest().clone(),
                 seed,
-                construction: options.tree,
             },
             report,
         ))
@@ -294,7 +295,6 @@ impl ForestArtifact {
             config: input.config().clone(),
             source: input.manifest().clone(),
             seed,
-            construction: options.tree,
         };
         artifact.reader()?;
         Ok(artifact)
@@ -336,15 +336,6 @@ impl ForestArtifact {
             rooted: false,
             finished: false,
         })
-    }
-
-    /// Verifies framing, canonical tree order, local partition allocation, root
-    /// closure, and total leaf assignments. Exact membership joins are separate.
-    pub fn verify(&self) -> Result<()> {
-        for partition in self.reader()? {
-            partition?;
-        }
-        Ok(())
     }
 }
 
@@ -453,9 +444,11 @@ fn project(config: &IndexConfig, types: &[DataType], record: &Record) -> Result<
         .map(|id| record.fields()[id.0 as usize].clone())
         .collect::<Vec<_>>();
     let key = TreeKey::encode(types, &values)?;
-    let mut value = Vec::with_capacity(2 + record.id().len() + 4 * config.dimension());
-    value.extend_from_slice(&(record.id().len() as u16).to_be_bytes());
-    value.extend_from_slice(record.id());
+    let mut value = Vec::with_capacity(2 + 2 * record.id().len() + 4 * config.dimension());
+    // Tuple escaping preserves Record ID order within each Tree Key. The extra
+    // zero separates the terminator from vectors whose first byte can be 0xFF.
+    push_escaped_terminated(&mut value, record.id());
+    value.push(0);
     for component in record.vector() {
         value.extend_from_slice(&component.to_bits().to_be_bytes());
     }
@@ -473,7 +466,7 @@ fn tree_types(config: &IndexConfig) -> Vec<DataType> {
         .collect()
 }
 fn maximum_row(config: &IndexConfig) -> usize {
-    8 + crate::api::MAX_RECORD_ID_BYTES + 4 + MAX_TREE_KEY_BYTES + 4 * config.dimension()
+    8 + 2 * crate::api::MAX_RECORD_ID_BYTES + 2 + MAX_TREE_KEY_BYTES + 4 * config.dimension()
 }
 fn validate(config: &IndexConfig, directory: &Path, options: ForestOptions) -> Result<()> {
     crate::construction::validate_options(config.dimension(), options.tree)?;
@@ -488,24 +481,22 @@ fn validate(config: &IndexConfig, directory: &Path, options: ForestOptions) -> R
     Ok(())
 }
 fn projection(value: Vec<u8>, dimension: usize) -> Result<ConstructionRecord> {
-    if value.len() < 2 {
-        return Err(corrupt());
-    }
-    let length = u16::from_be_bytes(value[..2].try_into().expect("fixed length")) as usize;
-    if length == 0
-        || length > crate::api::MAX_RECORD_ID_BYTES
-        || value.len() != 2 + length + dimension * 4
+    let scan = scan_escaped_terminated(&value, crate::api::MAX_RECORD_ID_BYTES)?;
+    let vector_offset = scan.consumed + 1;
+    if scan.decoded_len == 0
+        || value.get(scan.consumed) != Some(&0)
+        || value.len() != vector_offset + dimension * 4
     {
         return Err(corrupt());
     }
-    let vector = value[2 + length..]
+    let vector = value[vector_offset..]
         .as_chunks::<4>()
         .0
         .iter()
         .map(|bytes| f32::from_bits(u32::from_be_bytes(*bytes)))
         .collect::<Box<[_]>>();
     Ok(ConstructionRecord {
-        id: Bytes::copy_from_slice(&value[2..2 + length]),
+        id: Bytes::from(decode_escaped_terminated(&value, &scan)),
         vector,
     })
 }
@@ -540,4 +531,20 @@ fn binding(input: &InputSnapshot, seed: [u8; 32], options: ForestOptions) -> [u8
         hash.update(value.to_be_bytes());
     }
     hash.finalize().into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn projection_separates_escaped_id_from_vector_starting_with_ff() {
+        let config = IndexConfig::new(1, Metric::L2).unwrap();
+        let component = f32::from_bits(0xff00_0001);
+        let record = Record::new(Bytes::from_static(b"a\0"), vec![component], vec![]).unwrap();
+        let row = project(&config, &tree_types(&config), &record).unwrap();
+        let decoded = projection(row.value, config.dimension()).unwrap();
+        assert_eq!(decoded.id, *record.id());
+        assert_eq!(decoded.vector[0].to_bits(), component.to_bits());
+    }
 }

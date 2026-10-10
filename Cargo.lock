@@ -850,6 +850,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "getrandom 0.3.4",
+ "ktann",
  "ktann-memory",
  "metrics",
  "metrics-util",

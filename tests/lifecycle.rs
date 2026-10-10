@@ -769,8 +769,8 @@ fn index_handle_is_send_and_sync() {
     assert_send_sync::<ktann::api::Index<MemoryBackend>>();
 }
 
-fn bulk_options(config: &IndexConfig) -> ktann::construction::ConstructionOptions {
-    ktann::construction::ConstructionOptions {
+fn bulk_options(config: &IndexConfig) -> ktann::bulk::ConstructionOptions {
+    ktann::bulk::ConstructionOptions {
         min_partition_entries: config.min_partition_entries(),
         max_partition_entries: config.max_partition_entries(),
         sample_items: 8,

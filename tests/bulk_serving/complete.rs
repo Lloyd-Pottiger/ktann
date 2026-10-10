@@ -1,4 +1,4 @@
-//! Complete worker/publication/reclamation recovery through public APIs.
+//! Build completion and internal publication/reclamation recovery.
 use super::*;
 use ktann::api::BulkWorkerOptions;
 
@@ -23,14 +23,14 @@ fn artifact_directories(root: &std::path::Path) -> usize {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn build_publish_reopen_cleanup_and_online_mutations_are_complete() {
+async fn complete_resumes_loaded_build_and_retries_published_index() {
     for count in [0, 73] {
         let dir = Directory::new();
         let memory = MemoryBackend::new();
         let first = runtime(memory.clone());
-        let (job, _) = fixture(&first, &memory, &dir, count).await;
+        let job = reserve_fixture(&first, &dir, count).await;
         let opts = worker_options(&dir);
-        job.run_worker(opts.clone()).await.unwrap();
+        job.prepare_and_load(opts.clone()).await.unwrap();
         let id = job.logical_index_id();
         assert!(matches!(
             job.status().await.unwrap(),
@@ -39,8 +39,10 @@ async fn build_publish_reopen_cleanup_and_online_mutations_are_complete() {
         first.shutdown().await.unwrap();
         let runtime = runtime(memory.clone());
         let job = runtime.open_bulk_build("bulk").await.unwrap();
-        job.run_worker(opts.clone()).await.unwrap(); // accepted immutable outputs survive restart
-        let index = job.publish().await.unwrap();
+        let (index, _) = job
+            .complete(opts.clone(), None, OperationOptions::default())
+            .await
+            .unwrap();
         assert_eq!(index.logical_index_id(), id);
         assert_eq!(job.status().await.unwrap(), BulkBuildStatus::Published);
         assert_eq!(artifact_directories(&opts.workspace), 0);
@@ -81,8 +83,12 @@ async fn build_publish_reopen_cleanup_and_online_mutations_are_complete() {
                 .unwrap()
                 .is_some()
         );
-        assert_eq!(job.publish().await.unwrap().logical_index_id(), id);
-        job.cleanup().await.unwrap();
+        fs::remove_dir_all(dir.0.join("source")).unwrap();
+        let (reopened, _) = job
+            .complete(opts.clone(), None, OperationOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(reopened.logical_index_id(), id);
         runtime.drop_index("bulk").await.unwrap();
         let replacement = runtime
             .create_index("bulk", config(Metric::L2, true))
@@ -90,7 +96,10 @@ async fn build_publish_reopen_cleanup_and_online_mutations_are_complete() {
             .unwrap();
         assert_ne!(replacement.logical_index_id(), id);
         assert_eq!(
-            job.publish().await.unwrap_err().kind(),
+            job.complete(opts.clone(), None, OperationOptions::default())
+                .await
+                .unwrap_err()
+                .kind(),
             ErrorKind::IndexNotFound
         );
         runtime.shutdown().await.unwrap();
@@ -103,9 +112,9 @@ async fn sealed_backend_damage_is_terminal_and_cannot_publish() {
         let dir = Directory::new();
         let memory = MemoryBackend::new();
         let runtime = runtime(memory.clone());
-        let (job, _) = fixture(&runtime, &memory, &dir, count).await;
+        let job = reserve_fixture(&runtime, &dir, count).await;
         let opts = worker_options(&dir);
-        job.run_worker(opts.clone()).await.unwrap();
+        job.prepare_and_load(opts.clone()).await.unwrap();
         let mut txn = memory.begin_write().await.unwrap();
         if extra {
             txn.put(
@@ -133,7 +142,10 @@ async fn sealed_backend_damage_is_terminal_and_cannot_publish() {
         }
         txn.commit().await.unwrap();
         assert_eq!(
-            job.publish().await.unwrap_err().kind(),
+            job.complete(opts.clone(), None, Default::default())
+                .await
+                .unwrap_err()
+                .kind(),
             ErrorKind::Corruption
         );
         assert_eq!(
@@ -147,7 +159,10 @@ async fn sealed_backend_damage_is_terminal_and_cannot_publish() {
             ErrorKind::IndexBuilding
         );
         assert_eq!(
-            job.run_worker(opts.clone()).await.unwrap_err().kind(),
+            job.complete(opts.clone(), None, Default::default())
+                .await
+                .unwrap_err()
+                .kind(),
             ErrorKind::Corruption
         );
         job.abort().await.unwrap();
@@ -171,12 +186,14 @@ async fn cancelled_validation_reuses_proofs_and_rejects_further_loads() {
     .unwrap();
     let (job, artifact) = fixture(&runtime, &memory, &dir, 19).await;
     let opts = worker_options(&dir);
-    job.run_worker(opts).await.unwrap();
-    gate.arm(2);
+    job.prepare_and_load(opts.clone()).await.unwrap();
+    gate.arm(3);
     let worker = job.clone();
     let cancellation = CancellationToken::new();
     let control = OperationOptions::default().with_cancellation(cancellation.clone());
-    let pending = tokio::spawn(async move { worker.publish_with_control(control).await });
+    let completion_options = opts.clone();
+    let pending =
+        tokio::spawn(async move { worker.complete(completion_options, None, control).await });
     gate.wait().await;
     assert_eq!(
         job.load_serving(&artifact, load_options())
@@ -195,11 +212,11 @@ async fn cancelled_validation_reuses_proofs_and_rejects_further_loads() {
         job.status().await.unwrap(),
         BulkBuildStatus::Validating { .. }
     ));
-    let index = runtime
+    let (index, _) = runtime
         .open_bulk_build("bulk")
         .await
         .unwrap()
-        .publish()
+        .complete(opts, None, OperationOptions::default())
         .await
         .unwrap();
     assert!(
@@ -226,12 +243,13 @@ async fn abort_during_native_preparation_leaves_recoverable_namespace_cleanup() 
         RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
     )
     .unwrap();
-    let (job, _) = fixture(&runtime, &memory, &dir, 19).await;
+    let job = reserve_fixture(&runtime, &dir, 19).await;
     let opts = worker_options(&dir);
     gate.arm(2);
     let worker = job.clone();
     let args = opts.clone();
-    let pending = tokio::spawn(async move { worker.run_worker(args).await });
+    let pending =
+        tokio::spawn(async move { worker.complete(args, None, Default::default()).await });
     gate.wait().await;
     job.abort().await.unwrap();
     assert_eq!(job.status().await.unwrap(), BulkBuildStatus::Aborted);
@@ -262,14 +280,16 @@ async fn unknown_outcomes_at_sealing_proof_and_publication_are_idempotent() {
             let memory = MemoryBackend::with_test_config(TestConfig::default());
             let runtime = runtime(memory.clone());
             let (job, artifact) = fixture(&runtime, &memory, &dir, 19).await;
-            job.run_worker(worker_options(&dir)).await.unwrap();
+            let opts = worker_options(&dir);
+            job.prepare_and_load(opts.clone()).await.unwrap();
             let pages = (artifact.manifest().items() + 3)
                 .div_ceil(load_options().max_mutations as u64) as usize;
             let position = if point == 2 { pages + 1 } else { point };
-            let mut plan = vec![CommitFault::Normal; position];
+            // Resume claims the worker once before validation.
+            let mut plan = vec![CommitFault::Normal; position + 1];
             plan.push(fault);
             memory.set_fault_plan(plan).unwrap();
-            let index = job.publish().await.unwrap();
+            let (index, _) = job.complete(opts, None, Default::default()).await.unwrap();
             assert!(
                 index
                     .verify(VerifyOptions::default())
@@ -291,19 +311,24 @@ async fn worker_claim_and_artifact_acceptance_unknown_outcomes_recover() {
             let dir = Directory::new();
             let memory = MemoryBackend::with_test_config(TestConfig::default());
             let runtime = runtime(memory.clone());
-            let (job, _) = fixture(&runtime, &memory, &dir, 19).await;
+            let job = reserve_fixture(&runtime, &dir, 19).await;
             let opts = worker_options(&dir);
             let mut plan = vec![CommitFault::Normal; position];
             plan.push(fault);
             memory.set_fault_plan(plan).unwrap();
-            let first = job.run_worker(opts.clone()).await;
+            let first = job.complete(opts.clone(), None, Default::default()).await;
             if position == 0 {
                 assert_eq!(first.unwrap_err().kind(), ErrorKind::CommitOutcomeUnknown);
-                job.run_worker(opts.clone()).await.unwrap();
+                job.complete(opts.clone(), None, Default::default())
+                    .await
+                    .unwrap();
             } else {
                 first.unwrap();
             }
-            let index = job.publish().await.unwrap();
+            let (index, _) = job
+                .complete(opts.clone(), None, Default::default())
+                .await
+                .unwrap();
             assert!(
                 index
                     .verify(VerifyOptions::default())
@@ -333,12 +358,17 @@ async fn abort_wins_against_a_prepared_publication_transaction() {
     .unwrap();
     let (job, artifact) = fixture(&runtime, &memory, &dir, 19).await;
     let opts = worker_options(&dir);
-    job.run_worker(opts.clone()).await.unwrap();
+    job.prepare_and_load(opts.clone()).await.unwrap();
     let pages =
         (artifact.manifest().items() + 3).div_ceil(load_options().max_mutations as u64) as usize;
-    gate.arm(pages + 2);
+    gate.arm(pages + 3);
     let publisher = job.clone();
-    let pending = tokio::spawn(async move { publisher.publish().await });
+    let publish_options = opts.clone();
+    let pending = tokio::spawn(async move {
+        publisher
+            .complete(publish_options, None, Default::default())
+            .await
+    });
     gate.wait().await;
     assert!(matches!(
         checkpoint(&memory, &job).await.phase(),
@@ -375,11 +405,14 @@ async fn preparation_failure_is_durable_and_partial_files_are_owned_until_abort(
     let dir = Directory::new();
     let memory = MemoryBackend::new();
     let runtime = runtime(memory.clone());
-    let (job, _) = fixture(&runtime, &memory, &dir, 19).await;
+    let job = reserve_fixture(&runtime, &dir, 19).await;
     let mut opts = worker_options(&dir);
     opts.max_artifact_bytes = 100;
     assert_eq!(
-        job.run_worker(opts.clone()).await.unwrap_err().kind(),
+        job.complete(opts.clone(), None, Default::default())
+            .await
+            .unwrap_err()
+            .kind(),
         ErrorKind::LimitExceeded
     );
     assert_eq!(
@@ -395,7 +428,10 @@ async fn preparation_failure_is_durable_and_partial_files_are_owned_until_abort(
         }
     );
     assert_eq!(
-        job.publish().await.unwrap_err().kind(),
+        job.complete(opts.clone(), None, Default::default())
+            .await
+            .unwrap_err()
+            .kind(),
         ErrorKind::LimitExceeded
     );
     assert_eq!(artifact_directories(&opts.workspace), 1);
@@ -410,9 +446,9 @@ async fn cleanup_outcome_unknown_and_pagination_are_recoverable_after_drop() {
     let dir = Directory::new();
     let memory = MemoryBackend::with_test_config(TestConfig::default());
     let runtime = runtime(memory.clone());
-    let (job, _) = fixture(&runtime, &memory, &dir, 19).await;
+    let job = reserve_fixture(&runtime, &dir, 19).await;
     let opts = worker_options(&dir);
-    job.run_worker(opts.clone()).await.unwrap();
+    job.prepare_and_load(opts.clone()).await.unwrap();
     // The ordinary drop path removes index data but retains the cleanup ledger.
     runtime.drop_index("bulk").await.unwrap();
     assert_eq!(artifact_directories(&opts.workspace), 1);
@@ -435,7 +471,7 @@ async fn cleanup_outcome_unknown_and_pagination_are_recoverable_after_drop() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn concurrent_publishers_resolve_the_same_active_identity() {
+async fn concurrent_completions_resolve_the_same_active_identity() {
     let dir = Directory::new();
     let memory = MemoryBackend::with_test_config(TestConfig::default());
     let gate = Arc::new(Gate::default());
@@ -447,17 +483,31 @@ async fn concurrent_publishers_resolve_the_same_active_identity() {
         RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
     )
     .unwrap();
-    let (job, _) = fixture(&runtime, &memory, &dir, 19).await;
-    job.run_worker(worker_options(&dir)).await.unwrap();
-    gate.arm(2);
+    let job = reserve_fixture(&runtime, &dir, 19).await;
+    let opts = worker_options(&dir);
+    job.prepare_and_load(opts.clone()).await.unwrap();
+    gate.arm(3);
     let other = job.clone();
-    let pending = tokio::spawn(async move { other.publish().await });
+    let other_options = opts.clone();
+    let pending = tokio::spawn(async move {
+        other
+            .complete(other_options, None, Default::default())
+            .await
+    });
     gate.wait().await;
-    let first = job.publish().await.unwrap();
+    let first = job.complete(opts.clone(), None, Default::default()).await;
+    if let Err(error) = &first {
+        assert_eq!(error.kind(), ErrorKind::BulkBuildBusy);
+    }
     gate.release.notify_one();
-    let second = pending.await.unwrap().unwrap();
+    let (second, _) = pending.await.unwrap().unwrap();
+    let (first, _) = match first {
+        Ok(completed) => completed,
+        // Concurrent workspace cleanup can hold its exclusive lock. Retrying
+        // completion must recover the same published identity.
+        Err(_) => job.complete(opts, None, Default::default()).await.unwrap(),
+    };
     assert_eq!(first.logical_index_id(), second.logical_index_id());
-    job.cleanup().await.unwrap();
     runtime.shutdown().await.unwrap();
 }
 
@@ -474,64 +524,22 @@ async fn preparation_takeover_fences_the_old_artifact_acceptance() {
         RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
     )
     .unwrap();
-    let (job, _) = fixture(&runtime, &memory, &dir, 19).await;
+    let job = reserve_fixture(&runtime, &dir, 19).await;
     let opts = worker_options(&dir);
     gate.arm(2);
     let old = job.clone();
     let old_options = opts.clone();
-    let pending = tokio::spawn(async move { old.run_worker(old_options).await });
+    let pending =
+        tokio::spawn(async move { old.complete(old_options, None, Default::default()).await });
     gate.wait().await;
-    job.run_worker(opts).await.unwrap();
+    job.prepare_and_load(opts.clone()).await.unwrap();
     gate.release.notify_one();
     assert_eq!(
         pending.await.unwrap().unwrap_err().kind(),
         ErrorKind::BulkBuildSuperseded
     );
-    job.publish().await.unwrap();
+    job.complete(opts, None, Default::default()).await.unwrap();
     runtime.shutdown().await.unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn premature_publish_does_not_fail_an_in_progress_load() {
-    for commit in [4, 5] {
-        let dir = Directory::new();
-        let memory = MemoryBackend::with_test_config(TestConfig::default());
-        let gate = Arc::new(Gate::default());
-        let runtime = Runtime::new(
-            Gated {
-                memory: memory.clone(),
-                gate: gate.clone(),
-            },
-            RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
-        )
-        .unwrap();
-        let (job, _) = fixture(&runtime, &memory, &dir, 19).await;
-        let opts = worker_options(&dir);
-        gate.arm(commit);
-        let worker = job.clone();
-        let pending = tokio::spawn(async move { worker.run_worker(opts).await });
-        gate.wait().await;
-        assert_eq!(
-            job.publish().await.unwrap_err().kind(),
-            ErrorKind::BulkBuildBusy
-        );
-        assert!(!matches!(
-            job.status().await.unwrap(),
-            BulkBuildStatus::Failed { .. }
-        ));
-        gate.release.notify_one();
-        pending.await.unwrap().unwrap();
-        let index = job.publish().await.unwrap();
-        assert!(
-            index
-                .verify(VerifyOptions::default())
-                .await
-                .unwrap()
-                .issues
-                .is_empty()
-        );
-        runtime.shutdown().await.unwrap();
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -563,8 +571,8 @@ async fn prepared_receipt_and_lost_preparation_both_publish_complete_indexes() {
             .start_bulk_build("bulk", &source, forest.tree)
             .await
             .unwrap();
-        let report = if mode == 0 {
-            job.run_worker_with_prepared_input(opts.clone(), prepared, Default::default())
+        let (index, report) = if mode == 0 {
+            job.complete(opts.clone(), Some(prepared), Default::default())
                 .await
                 .unwrap()
         } else {
@@ -574,7 +582,7 @@ async fn prepared_receipt_and_lost_preparation_both_publish_complete_indexes() {
                 let mut mismatched = opts.clone();
                 mismatched.sort_memory_bytes *= 2;
                 assert_eq!(
-                    job.run_worker_with_prepared_input(mismatched, prepared, Default::default())
+                    job.complete(mismatched, Some(prepared), Default::default())
                         .await
                         .unwrap_err()
                         .kind(),
@@ -582,12 +590,13 @@ async fn prepared_receipt_and_lost_preparation_both_publish_complete_indexes() {
                 );
             }
             fs::remove_dir_all(dir.0.join("receipt")).unwrap();
-            job.run_worker(opts.clone()).await.unwrap()
+            job.complete(opts.clone(), None, Default::default())
+                .await
+                .unwrap()
         };
         assert!(!report.forest.is_zero());
         assert!(!report.serving.is_zero());
         assert!(!report.load.is_zero());
-        let index = job.publish().await.unwrap();
         let verified = index.verify(VerifyOptions::default()).await.unwrap();
         assert!(verified.complete && verified.issues.is_empty());
         assert_eq!(verified.objects.vector_records, 73);

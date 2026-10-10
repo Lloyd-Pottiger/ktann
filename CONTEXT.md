@@ -200,10 +200,11 @@ A durable name and Logical Index ID held by a Building Manifest, with a separate
 immutable Build Descriptor identifying the caller-owned input snapshot and
 construction parameters. Ordinary operations reject Building. Job handles bind
 the never-reused ID; abort cannot follow a reused name or remove a published index.
-Reservation itself launches no work; `run_worker` prepares/loads and `publish`
-validates and activates the index.
+Reservation itself launches no work. `complete` drives preparation, loading,
+validation, activation and owned-file reclamation. Scheduled jobs execute the
+same phases under renewable ownership.
 
-**Forest Artifact**: A sealed, caller-owned topology artifact for every nonempty
+**Forest Artifact**: A sealed topology artifact for every nonempty
 Tree Key in one finite Input Snapshot. Preparation rejects globally duplicate
 Record IDs before constructing trees. It carries no backend loading or publication
 authority; exact serving-membership validation is still required.

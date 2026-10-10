@@ -1,13 +1,12 @@
-//! Real-adapter persistence and exact-byte checks for fenced serving loading.
+//! Real-adapter persistence and ordinary serving after complete Bulk Builds.
 use bytes::Bytes;
 use ktann::api::{
-    BulkBuildStatus, BulkLoadOptions, DataType, ErrorKind, FieldId, FieldSchema, IndexConfig,
-    Metric, Record, RuntimeConfig, Value,
+    BulkBuildStatus, BulkLoadOptions, DataType, ErrorKind, FieldId, FieldSchema, GetOptions,
+    IndexConfig, Metric, PayloadProjection, Record, RuntimeConfig, Value,
 };
-use ktann::bulk::{ForestArtifact, ForestOptions, InputSnapshot, ServingArtifact, ServingOptions};
-use ktann::construction::ConstructionOptions;
+use ktann::bulk::{ConstructionOptions, InputSnapshot};
 use ktann::runtime::Runtime;
-use ktann::storage::backend::{Backend, ReadOps};
+use ktann::storage::backend::Backend;
 use std::path::Path;
 
 pub async fn exercise<B: Backend>(backend: impl Fn() -> B, directory: &Path) {
@@ -41,7 +40,6 @@ pub async fn exercise<B: Backend>(backend: impl Fn() -> B, directory: &Path) {
         scratch_bytes: 16 * 1024 * 1024,
     };
     let raw = backend();
-    let hard_limits = raw.hard_limits();
     let runtime = Runtime::new(
         raw,
         RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
@@ -52,36 +50,10 @@ pub async fn exercise<B: Backend>(backend: impl Fn() -> B, directory: &Path) {
         .await
         .unwrap();
     let id = job.logical_index_id();
-    let (forest, _) = ForestArtifact::build(
-        &directory.join("forest"),
-        &source,
-        *job.index_manifest().rotation_seed(),
-        ForestOptions {
-            tree,
-            sort_memory_bytes: 1024 * 1024,
-            sort_scratch_bytes: 16 * 1024 * 1024,
-        },
-        1024 * 1024,
-    )
-    .unwrap();
-    let (serving, _) = ServingArtifact::build(
-        &directory.join("serving"),
-        &source,
-        &forest,
-        job.index_manifest(),
-        ServingOptions {
-            memory_bytes: 8 * 1024 * 1024,
-            scratch_bytes: 32 * 1024 * 1024,
-            hard_limits,
-        },
-        4 * 1024 * 1024,
-    )
-    .unwrap();
     let options = BulkLoadOptions {
         max_mutations: 17,
         max_bytes: 4096,
     };
-    job.load_serving(&serving, options).await.unwrap();
     let root = directory.join("worker");
     std::fs::create_dir(&root).unwrap();
     let mut worker = ktann::api::BulkWorkerOptions::new(root);
@@ -91,7 +63,7 @@ pub async fn exercise<B: Backend>(backend: impl Fn() -> B, directory: &Path) {
     worker.serving_scratch_bytes = 32 * 1024 * 1024;
     worker.max_artifact_bytes = 4 * 1024 * 1024;
     worker.load = options;
-    job.run_worker(worker.clone()).await.unwrap();
+    // Reopen the reservation on a new Runtime before driving the complete flow.
     runtime.shutdown().await.unwrap();
     let runtime = Runtime::new(
         backend(),
@@ -100,25 +72,40 @@ pub async fn exercise<B: Backend>(backend: impl Fn() -> B, directory: &Path) {
     .unwrap();
     let reopened = runtime.open_bulk_build("bulk-loader").await.unwrap();
     assert_eq!(reopened.logical_index_id(), id);
-    reopened.load_serving(&serving, options).await.unwrap();
-    assert_eq!(
-        reopened.status().await.unwrap(),
-        BulkBuildStatus::Loaded {
-            entries: serving.manifest().items()
-        }
-    );
+    assert_eq!(reopened.status().await.unwrap(), BulkBuildStatus::Preparing);
     assert_eq!(
         runtime.open_index("bulk-loader").await.unwrap_err().kind(),
         ErrorKind::IndexBuilding
     );
-    let raw = backend();
-    let mut txn = raw.begin_read().await.unwrap();
-    for entry in serving.reader().unwrap() {
-        let entry = entry.unwrap();
-        assert_eq!(txn.get(entry.key).await.unwrap(), Some(entry.value));
+    reopened
+        .complete(worker.clone(), None, Default::default())
+        .await
+        .unwrap();
+    runtime.shutdown().await.unwrap();
+    let runtime = Runtime::new(
+        backend(),
+        RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
+    )
+    .unwrap();
+    let reopened = runtime.open_bulk_build("bulk-loader").await.unwrap();
+    assert_eq!(reopened.logical_index_id(), id);
+    let index = runtime.open_index("bulk-loader").await.unwrap();
+    for id in 0..128_u64 {
+        let record = index
+            .get(
+                Bytes::copy_from_slice(&id.to_be_bytes()),
+                GetOptions::default().with_payload(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.vector(), &[id as f32, 1.0]);
+        assert_eq!(record.fields(), &[Value::I64((id % 2) as i64)]);
+        assert_eq!(
+            record.payload(),
+            &PayloadProjection::Present(Bytes::from_static(b"data"))
+        );
     }
-    drop(txn);
-    let index = reopened.publish().await.unwrap();
     let verified = index
         .verify(ktann::api::VerifyOptions::default())
         .await

@@ -300,41 +300,60 @@ is no continuation or repair API.
 
 ## Bulk Build
 
-`Runtime::start_bulk_build(name, input, construction_options)` reserves a hidden
-Building index from a caller-owned immutable `InputSnapshot`; `open_bulk_build`
-recovers its identity-bound `BulkBuildJob`. Identical requests retain the ID.
-The descriptor exposes source identity and construction parameters, with redacted
-Debug output. Reservation itself starts no background worker.
+`Runtime::start_bulk_build(name, input, construction_options)` atomically reserves
+an Index Name, never-reused Logical Index ID, Building Manifest and immutable
+Build Descriptor from a caller-owned `bulk::InputSnapshot`. Identical requests
+retain the ID; conflicting requests fail. Unknown reservation commits resolve
+against the attempted ID. Reservation starts no worker or filesystem work.
+Ordinary create/open and serving operations reject Building with `IndexBuilding`.
+
+`Runtime::open_bulk_build(name)` recovers the identity-bound job without reading
+source files. The handle never follows name reuse. Reopening a Dropping job
+returns `IndexDropping` because cleanup may have removed its descriptor; an
+existing handle or normal `drop_index` can finish cleanup.
+
+`bulk::InputSnapshotWriter` captures complete records in a new caller-owned
+directory. `PreparedInputWriter` additionally prepares bounded sorted projections
+for one-use reuse at completion. Failed append cannot seal partial input. The
+source remains caller owned after success, failure or abort. Tree construction
+options are public through `bulk::ConstructionOptions`.
 
 Create an existing durable workspace root and pass `BulkWorkerOptions::new(root)`
-to `job.run_worker`. This prepares accepted Forest and Serving artifacts and
-loads the backend in bounded transactions. Repeating the same options resumes
-accepted work and takes over old worker epochs. `job.publish()` freezes loading,
-performs resumable exact paged validation, and returns the ordinary Active Index.
-Publishing before loading completes returns `BulkBuildBusy`; finish or resume
-loading and retry. Both operations and `status`/`abort` have `_with_control` variants. A failed job
-reports `Failed { kind }` and requires abort/rebuild; cancellation is resumable.
+to `job.complete(options, prepared_input, control)`. Completion prepares and
+loads the backend in bounded transactions, validates exact backend bytes,
+atomically publishes, and reclaims owned files. It returns `(Index,
+BulkBuildReport)`. The optional one-use `PreparedInput` avoids repeating source
+preparation; `None` reconstructs it from the sealed snapshot. The report contains
+forest, serving, load and publication wall times, forest scratch IO, and the
+persisted rotation seed. Publication time includes file reclamation; reused
+stages report zero work time.
 
-`load_serving` remains a lower-level fenced load primitive. It fixes one immutable
-artifact and commits data plus checkpoints atomically under `BulkLoadOptions` and
-adapter admission limits. A completed load remains hidden; publication also
-requires core worker acceptance of that artifact.
+Repeating completion resumes durable progress, including cancelled validation.
+A Published job returns the same Active index without reopening input or
+artifact files. `status` reports Preparing, Loading/Loaded, Validating, Published, Failed,
+Dropping or Aborted; Loading and Validating include entry progress. A terminal
+`Failed { kind }` requires abort/rebuild; cancellation leaves resumable work.
+Start, open, status, schedule and abort have `_with_control` variants. Artifact readers and individual execution stages are
+internal; the public operation owns their sequencing.
 
-`abort` rejects Active indexes and is idempotent for an absent original ID. Both
-abort and publish attempt owned-file reclamation; a busy workspace defers cleanup.
-Other cleanup failures may be returned after the lifecycle commit, so inspect
-status or retry the same operation. `job.cleanup()` retries reclamation;
+`abort` rejects Active indexes and is idempotent for an absent original ID.
+Completion and abort attempt owned-file reclamation. Completion can return a
+cleanup error, including `BulkBuildBusy`, after publication; inspect status or
+retry the same operation under the original identity. Abort tolerates Busy and
+retains the ownership record for later cleanup.
 `Runtime::cleanup_bulk_builds(maximum, after)` performs bounded orphan discovery.
 The caller retains source files, workspace root, and its coordination lock file.
 See [Bulk Build](bulk-build.md) for filesystem requirements and recovery semantics.
-
 
 Automatic scheduling is opt-in: after reservation call
 `job.schedule(BulkWorkerOptions::new(shared_workspace)).await?`, then run
 `runtime.run_bulk_scheduler(BulkSchedulerOptions::default(), control).await`
 on each worker process. The scheduler future runs until cancellation or Runtime
-shutdown and owns bounded local job tasks. It discovers jobs automatically,
-renews leases, takes over expired workers, publishes and retries cleanup. Stop it
-with `OperationOptions` cancellation/deadline or Runtime shutdown; stopping it does
-not abort durable jobs. Queued jobs reject manual mutation attempts with
+shutdown and owns bounded local job tasks. It discovers jobs, renews leases,
+takes over expired workers, completes builds and retries cleanup. Stop it with
+`OperationOptions` cancellation/deadline or Runtime shutdown; stopping it does
+not abort durable jobs. Queued jobs reject manual completion with
 `BulkBuildBusy`. A job's failure remains observable through `status`.
+`BulkSchedulerOptions` bounds active jobs (1–64), polling (at least 1 ms) and
+lease duration (at least three polling intervals). Defaults are one job,
+one-second polling and a 30-second lease.

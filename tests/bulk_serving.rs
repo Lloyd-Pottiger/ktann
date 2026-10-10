@@ -9,13 +9,14 @@ use ktann::api::{
     DataType, ErrorKind, FieldId, FieldSchema, GetOptions, IndexConfig, Metric, Mutation,
     PayloadProjection, Record, RuntimeConfig, SynopsisConfig, Value, VerifyOptions,
 };
-use ktann::bulk::{ForestArtifact, ForestOptions, InputSnapshot, ServingArtifact, ServingOptions};
-use ktann::construction::ConstructionOptions;
+use ktann::bulk::ConstructionOptions;
+use ktann::bulk::{ForestOptions, InputSnapshot};
 use ktann::runtime::Runtime;
 use ktann::storage::ReadLogicalTxn;
 use ktann::storage::backend::{Backend, WriteTxn};
 use ktann::storage::keys::{self, LogicalKey};
 use ktann::storage::values::{IndexLifecycle, IndexManifest, PersistentValue, ValueCodec};
+use ktann::test_support::{ForestArtifact, ServingArtifact, ServingOptions};
 use ktann_memory::MemoryBackend;
 
 struct Directory(PathBuf);
@@ -262,17 +263,8 @@ async fn encoded_artifact_verifies_and_matches_online_leaf_values_for_every_metr
             assert_eq!(report.records, 73);
             assert!(report.partitions > 1);
             assert!(!directory.0.join("serving/scratch").exists());
-            let reopened = ServingArtifact::open(
-                &directory.0.join("serving"),
-                artifact.manifest().clone(),
-                &input,
-                &forest,
-                &manifest,
-                serving_options(&backend),
-            )
-            .unwrap();
             job.load_serving(
-                &reopened,
+                &artifact,
                 ktann::api::BulkLoadOptions {
                     max_mutations: 17,
                     max_bytes: 4096,
@@ -397,7 +389,9 @@ async fn serving_empty_input_and_resource_failures_never_publish_or_seal_partial
         )
         .unwrap();
         assert_eq!(report.records, count);
-        artifact.verify().unwrap();
+        for entry in artifact.reader().unwrap() {
+            entry.unwrap();
+        }
         if count == 0 {
             assert_eq!(report.keys, 0);
             assert_eq!(report.partitions, 0);
@@ -522,7 +516,9 @@ async fn serving_exact_joins_reject_validly_framed_but_wrong_membership_and_edge
         let forged =
             ForestArtifact::open(&path, expected, &input, *index.rotation_seed(), options())
                 .unwrap();
-        forged.verify().unwrap(); // counts/checksums alone do not prove a join
+        for partition in forged.reader().unwrap() {
+            partition.unwrap();
+        }
         let output = directory.0.join("serving");
         assert_eq!(
             ServingArtifact::build(

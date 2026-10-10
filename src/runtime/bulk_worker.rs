@@ -1,6 +1,6 @@
 //! Durable, attempt-fenced preparation and namespace-owned artifact reclamation.
 use super::{OperationContext, lifecycle::RetryPolicy};
-use crate::api::{BulkWorkerOptions, BulkWorkerReport, Error, ErrorKind, Result};
+use crate::api::{BulkBuildReport, BulkWorkerOptions, Error, ErrorKind, Result};
 use crate::bulk::{
     ForestArtifact, ForestOptions, InputSnapshot, PreparedInput, ServingArtifact, ServingOptions,
 };
@@ -104,6 +104,70 @@ pub(crate) async fn normalize_options<B: Backend>(
     Ok(options)
 }
 
+/// Completes the reservation through publication, resuming from its sealed phase.
+/// Cleanup errors remain retryable after publication under the same index identity.
+pub(crate) async fn complete<B: Backend>(
+    context: &mut OperationContext<B>,
+    index: IndexManifest,
+    descriptor: BuildDescriptor,
+    options: BulkWorkerOptions,
+    prepared: Option<PreparedInput>,
+    retry: RetryPolicy,
+) -> Result<(IndexManifest, BulkBuildReport)> {
+    context.checkpoint()?;
+    let id = index.logical_index_id();
+    let needs_worker = {
+        let backend = context.backend();
+        let mut txn = ReadLogicalTxn::bootstrap(backend.begin_read().await?);
+        let current = match txn.get(LogicalKey::Manifest(id)).await? {
+            Some(PersistentValue::IndexManifest(current))
+                if current.has_same_immutable_identity(&index) =>
+            {
+                current
+            }
+            None => return Err(Error::new(ErrorKind::IndexNotFound)),
+            _ => return Err(corrupt()),
+        };
+        match current.lifecycle() {
+            IndexLifecycle::Dropping => return Err(Error::new(ErrorKind::IndexDropping)),
+            IndexLifecycle::Active => false,
+            IndexLifecycle::Building => {
+                if let Some(PersistentValue::BuildWorkspace(workspace)) =
+                    txn.get(LogicalKey::BuildWorkspace(id)).await?
+                    && let Some(kind) = workspace.failure
+                {
+                    return Err(Error::new(kind));
+                }
+                !matches!(
+                    txn.get(LogicalKey::BuildProgress(id)).await?,
+                    Some(PersistentValue::BuildProgress(progress))
+                        if matches!(progress.phase, BuildPhase::Validating { .. } | BuildPhase::Validated)
+                )
+            }
+        }
+    };
+    let mut report = if needs_worker {
+        run(
+            context,
+            index.clone(),
+            descriptor.clone(),
+            options,
+            prepared,
+            retry,
+        )
+        .await?
+    } else {
+        drop(prepared);
+        BulkBuildReport::default()
+    };
+    report.rotation_seed = *index.rotation_seed();
+    let started = Instant::now();
+    let active = super::bulk_publish::publish(context, index, descriptor, retry).await?;
+    cleanup(context, id, retry).await?;
+    report.publish = started.elapsed();
+    Ok((active, report))
+}
+
 pub(crate) async fn run<B: Backend>(
     context: &mut OperationContext<B>,
     index: IndexManifest,
@@ -111,7 +175,7 @@ pub(crate) async fn run<B: Backend>(
     options: BulkWorkerOptions,
     prepared: Option<PreparedInput>,
     retry: RetryPolicy,
-) -> Result<BulkWorkerReport> {
+) -> Result<BulkBuildReport> {
     let options = normalize_options(context, options).await?;
     if let Some(input) = &prepared {
         let forest_options = ForestOptions {
@@ -232,8 +296,8 @@ async fn prepare_and_load<B: Backend>(
     lock: Arc<File>,
     prepared: Option<PreparedInput>,
     retry: RetryPolicy,
-) -> Result<BulkWorkerReport> {
-    let mut report = BulkWorkerReport::default();
+) -> Result<BulkBuildReport> {
+    let mut report = BulkBuildReport::default();
     let prepared = if state.forest.is_some() || state.serving.is_some() {
         drop(prepared);
         None
@@ -244,12 +308,11 @@ async fn prepare_and_load<B: Backend>(
         let path = state.attempt(accepted.epoch).join("serving");
         let expected = accepted.manifest.clone();
         let manifest = index.clone();
-        let descriptor_copy = descriptor.clone();
         let limits = state.hard_limits;
         let guard = lock.clone();
         blocking(context, move || {
             let _lock = guard;
-            ServingArtifact::accepted(&path, expected, &manifest, &descriptor_copy, limits)
+            ServingArtifact::accepted(&path, expected, &manifest, limits)
         })
         .await?
     } else {

@@ -44,9 +44,6 @@ pub(crate) async fn load<B: Backend>(
     options: BulkLoadOptions,
     retry: RetryPolicy,
 ) -> Result<()> {
-    if !artifact.matches_build(&index, &descriptor) {
-        return Err(Error::invalid_argument());
-    }
     let backend = context.backend();
     let mut budget = backend.admission_budget();
     budget.max_mutations = budget.max_mutations.min(options.max_mutations);

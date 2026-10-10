@@ -89,8 +89,6 @@ pub struct ServingArtifact {
     artifact: ArtifactManifest,
     index: IndexManifest,
     limits: HardLimits,
-    source: ArtifactManifest,
-    construction: crate::construction::ConstructionOptions,
 }
 
 impl ServingArtifact {
@@ -99,7 +97,6 @@ impl ServingArtifact {
         directory: &Path,
         artifact: ArtifactManifest,
         index: &IndexManifest,
-        descriptor: &crate::storage::values::BuildDescriptor,
         limits: HardLimits,
     ) -> Result<Self> {
         let value = Self {
@@ -107,21 +104,9 @@ impl ServingArtifact {
             artifact,
             index: index.clone(),
             limits,
-            source: descriptor.input().clone(),
-            construction: descriptor.options(),
         };
         value.reader()?;
         Ok(value)
-    }
-
-    pub(crate) fn matches_build(
-        &self,
-        index: &IndexManifest,
-        descriptor: &crate::storage::values::BuildDescriptor,
-    ) -> bool {
-        self.index.has_same_immutable_identity(index)
-            && self.source == *descriptor.input()
-            && self.construction == descriptor.options()
     }
 
     /// Synchronously encodes a complete forest into a new caller-owned directory.
@@ -232,11 +217,11 @@ impl ServingArtifact {
             if previous.as_ref() == Some(&record.key) {
                 return Err(Error::new(ErrorKind::RecordAlreadyExists));
             }
-            previous = Some(record.key.clone());
             let assignment = next.take().ok_or_else(corrupt)?;
             if assignment.key != tagged(0, &record.key) {
                 return Err(corrupt());
             }
+            previous = Some(record.key);
             let (tree, leaf) = node(&assignment.value, index)?;
             let record = source::decode(index.config(), Bytes::from(record.value))?;
             let values = index
@@ -450,7 +435,7 @@ impl ServingArtifact {
         let (mut synopsis_run, mut synopsis_writer) = space.writer()?;
         let mut synopsis: Option<(LogicalKey, PartitionSynopsis)> = None;
         while let Some(row) = output.next()? {
-            let key = keys::decode_key(types, &Bytes::copy_from_slice(&row.key))?;
+            let key = keys::decode_key(types, &Bytes::from(row.key))?;
             let LogicalKey::LeafEntry {
                 tree_key,
                 partition,
@@ -534,36 +519,9 @@ impl ServingArtifact {
                 artifact,
                 index: index.clone(),
                 limits: options.hard_limits,
-                source: input.manifest().clone(),
-                construction: forest.construction,
             },
             report,
         ))
-    }
-
-    /// Reopens a sealed artifact against its exact source, topology and identity.
-    pub fn open(
-        directory: &Path,
-        expected: ArtifactManifest,
-        input: &InputSnapshot,
-        forest: &ForestArtifact,
-        index: &IndexManifest,
-        options: ServingOptions,
-    ) -> Result<Self> {
-        validate(directory, input, forest, index, options)?;
-        if !expected.matches(3, binding(input, forest, index, options)?) {
-            return Err(Error::invalid_argument());
-        }
-        let artifact = Self {
-            directory: directory.to_owned(),
-            artifact: expected,
-            index: index.clone(),
-            limits: options.hard_limits,
-            source: input.manifest().clone(),
-            construction: forest.construction,
-        };
-        artifact.reader()?;
-        Ok(artifact)
     }
 
     /// Persisted identity of the complete serving file.
@@ -587,15 +545,6 @@ impl ServingArtifact {
             previous: None,
             finished: false,
         })
-    }
-
-    /// Verifies complete framing, key order, index ownership and value codecs.
-    /// This is not a substitute for validating the backend after fenced loading.
-    pub fn verify(&self) -> Result<()> {
-        for row in self.reader()? {
-            row?;
-        }
-        Ok(())
     }
 }
 

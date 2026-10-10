@@ -80,8 +80,8 @@ pub struct ConstructionReport {
 /// `directory` must not exist. The caller owns its reclamation, including after
 /// failure. Final plans are emitted synchronously in child-before-parent order;
 /// consumers must not publish them until this function and exact validation
-/// complete. Duplicate Record IDs fail before any partition is emitted.
-/// Cross-Tree-Key duplicate detection belongs to the input preparation stage.
+/// complete. Input must be strictly ordered by Record ID. Global uniqueness and
+/// canonical input ordering belong to the enclosing forest preparation stage.
 ///
 /// The rotation seed must be the target Logical Index's persisted seed. Options
 /// and this algorithm's version must be sealed in the enclosing build descriptor.
@@ -110,8 +110,6 @@ pub fn construct_tree(
         project_splits: 12 + 1 + dimension * 4 >= 2 * 20,
     };
     let mut input = work.writer()?;
-    let mut ordered = true;
-    let mut previous = None;
     for record in records {
         let record = record?;
         validate_id(&record.id)?;
@@ -122,29 +120,9 @@ pub fn construct_tree(
             vector,
         };
         work.append(&mut input, &row)?;
-        if ordered {
-            ordered = previous.as_ref().is_none_or(|id| id < &row.id);
-            previous = ordered.then_some(row.id);
-        }
     }
-    drop(previous);
     let input = work.finish(input)?;
     work.report.records = input.count;
-    // Strict ID order proves both canonical accumulation order and uniqueness.
-    let input = if ordered {
-        input
-    } else {
-        let input = work.sort(input, |_| Ok(()))?;
-        let mut previous = None;
-        let mut reader = work.reader(&input)?;
-        while let Some(row) = reader.next()? {
-            if previous.as_ref() == Some(&row.id) {
-                return Err(Error::new(ErrorKind::RecordAlreadyExists));
-            }
-            previous = Some(row.id);
-        }
-        input
-    };
     if input.count == 0 {
         work.remove(input)?;
         return Ok(work.report);
@@ -931,39 +909,25 @@ mod tests {
     }
 
     #[test]
-    fn spill_bound_and_input_order_do_not_change_the_plan() {
+    fn spill_budgets_do_not_change_the_plan() {
         let (first, a) = build(records(257, false), options(), Metric::L2);
         assert!(first.scratch_written_bytes > first.peak_scratch_bytes);
-        for memory_factor in [1, 3] {
-            for reverse in [false, true] {
-                let mut input = records(257, false);
-                if reverse {
-                    input.reverse();
-                } else {
-                    input.swap(255, 256);
-                }
-                let mut settings = options();
-                settings.memory_bytes *= memory_factor;
-                let (report, b) = build(input, settings, Metric::L2);
-                if memory_factor == 1 {
-                    assert!(first.scratch_written_bytes < report.scratch_written_bytes);
-                    assert!(first.peak_scratch_bytes <= report.peak_scratch_bytes);
-                }
-                assert_eq!(a.len(), b.len());
-                for (key, a) in &a {
-                    let b = &b[key];
-                    assert_eq!(a.level, b.level);
-                    assert_eq!(a.entries, b.entries);
-                    assert_eq!(a.centroid, b.centroid);
-                }
-            }
+        let mut settings = options();
+        settings.memory_bytes *= 3;
+        let (_, b) = build(records(257, false), settings, Metric::L2);
+        assert_eq!(a.len(), b.len());
+        for (key, a) in &a {
+            let b = &b[key];
+            assert_eq!(a.level, b.level);
+            assert_eq!(a.entries, b.entries);
+            assert_eq!(a.centroid, b.centroid);
         }
     }
 
     #[test]
     fn projected_splits_keep_variable_id_ties_canonical_across_spill_budgets() {
         for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
-            let make = |reverse: bool, budget: usize| {
+            let make = |budget: usize| {
                 let directory = Directory::new();
                 let mut settings = options();
                 settings.memory_bytes = budget;
@@ -978,9 +942,7 @@ mod tests {
                         }
                     })
                     .collect();
-                if reverse {
-                    input.reverse();
-                }
+                input.sort_unstable_by(|a, b| a.id.cmp(&b.id));
                 let mut plans = BTreeMap::new();
                 construct_tree(
                     &directory.0,
@@ -999,8 +961,8 @@ mod tests {
                 assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 0);
                 plans
             };
-            let a = make(false, 200_000);
-            let b = make(true, 600_000);
+            let a = make(200_000);
+            let b = make(600_000);
             assert_eq!(a, b);
             let ids: std::collections::BTreeSet<_> = a
                 .values()
@@ -1032,20 +994,23 @@ mod tests {
                     let directory = Directory::new();
                     let mut settings = constrained;
                     settings.memory_bytes = memory;
-                    let records = (0_u64..257).rev().map(|id| {
-                        let encoded = id.to_be_bytes();
-                        let first = encoded.iter().position(|byte| *byte != 0).unwrap_or(7);
-                        let mut key = encoded[first..].to_vec();
-                        if id % 2 == 0 {
-                            key.resize(MAX_ID_BYTES, 0);
-                        }
-                        Ok(ConstructionRecord {
-                            id: Bytes::from(key),
-                            vector: (0..dimension)
-                                .map(|axis| if axis == 0 { 1.0 } else { (id % 3) as f32 })
-                                .collect(),
+                    let mut records: Vec<_> = (0_u64..257)
+                        .map(|id| {
+                            let encoded = id.to_be_bytes();
+                            let first = encoded.iter().position(|byte| *byte != 0).unwrap_or(7);
+                            let mut key = encoded[first..].to_vec();
+                            if id % 2 == 0 {
+                                key.resize(MAX_ID_BYTES, 0);
+                            }
+                            ConstructionRecord {
+                                id: Bytes::from(key),
+                                vector: (0..dimension)
+                                    .map(|axis| if axis == 0 { 1.0 } else { (id % 3) as f32 })
+                                    .collect(),
+                            }
                         })
-                    });
+                        .collect();
+                    records.sort_unstable_by(|a, b| a.id.cmp(&b.id));
                     let mut plans = BTreeMap::new();
                     construct_tree(
                         &directory.0,
@@ -1053,7 +1018,7 @@ mod tests {
                         metric,
                         [7; 32],
                         settings,
-                        records,
+                        records.into_iter().map(Ok),
                         |plan| {
                             plans.insert(
                                 plan.key.get(),
@@ -1079,23 +1044,13 @@ mod tests {
     }
 
     #[test]
-    fn empty_single_root_duplicates_and_quotas() {
+    fn empty_single_root_and_quotas() {
         let (empty, plans) = build(vec![], options(), Metric::L2);
         assert_eq!(empty.records, 0);
         assert!(plans.is_empty());
         let (_, plans) = build(records(1, true), options(), Metric::L2);
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[&1].level, 1);
-
-        for (left, right) in [(8, 1), (1, 8), (1, 1)] {
-            let dir = Directory::new();
-            let input = records(left, true).into_iter().chain(records(right, true));
-            let error = construct_tree(&dir.0, 2, Metric::L2, [7; 32], options(), input, |_| {
-                panic!("duplicate input cannot emit a plan")
-            })
-            .unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::RecordAlreadyExists);
-        }
 
         let dir = Directory::new();
         let mut bounded = options();

@@ -1,327 +1,77 @@
 # Resumable Bulk Build
 
-Status: **Implemented for a complete, resumable initial build.**
+Bulk Build constructs a new Logical Index from a finite immutable input snapshot.
+Its Building Manifest hides partial data until exact validation and one atomic
+publication commit make it Active. Existing unrelated indexes remain available.
+Appending to an Active index, online name swaps, CDC catch-up and replacement
+generations are outside this contract.
 
-The current physical pipeline, measured throughput and search quality, and open
-validation limits are tracked in [Bulk Build Performance](bulk-build-performance.md).
+[ADR 0022](../adr/0022-resumable-bulk-build.md) records the architectural choices.
+The [API contract](api.md#bulk-build) owns caller operations and error behavior;
+[Storage](storage.md#10-bulk-build-records) owns persistent encodings. This document
+owns the construction algorithm, stage transitions and recovery protocol.
+See the [benchmark guide](../../benchmarks/README.md#bulk-build-through-vectordbbench)
+for performance measurement and reproduction.
 
-`start_bulk_build` reserves a hidden Logical Index; `run_worker` prepares and
-loads it; `publish` validates the frozen backend and atomically makes it Active.
-[ADR 0027](../adr/0027-bulk-workspace-and-publication.md) records the bounded
-coarse-task protocol and workspace ownership. This implementation supports
-explicit worker invocation and automatic distributed scheduling under
-[ADR 0028](../adr/0028-automatic-bulk-scheduling.md). A single job remains the
-unit of work; its tree construction is not parallelized. Multi-host shared-filesystem qualification
-remains a deployment requirement; it is not established by local adapter tests.
+## Ownership and execution
 
-## API and artifact contracts
+The storage layer owns identity allocation, lifecycle records, canonical codecs,
+checkpoints and transactional validation. The pure construction module produces
+partition plans without backend IO. Runtime owns bounded blocking work, retries,
+cancellation and admission. Adapters own transaction limits, commit outcomes and
+physical encoding.
 
-### Reservation
+Direct completion and automatic scheduling use the same internal
+`bulk_worker::complete` path. A job has one preparation task, one load task and
+paged exact validation. Its accepted Serving Artifact is the complete load
+inventory; there is no per-record queue or independent per-partition loading.
+Trees and recursive subgroups execute sequentially. Independent jobs can run
+concurrently within Runtime and backend limits.
 
-`Runtime::start_bulk_build` atomically reserves the name and a never-reused
-Logical Index ID with a Building Manifest and an immutable Build Descriptor.
-The descriptor persists the absolute UTF-8 source directory, expected input
-manifest, construction algorithm version, options, and resource ceilings.
-Identical requests reopen the reservation; conflicting requests fail. An unknown
-reservation commit is resolved against its attempted ID, never a replacement.
-`open_bulk_build` recovers the request without reading source files. Ordinary
-create/open and serving paths reject Building with `IndexBuilding`.
+The caller owns the immutable source and workspace root. Job-owned directories
+require reliable advisory locks, atomic rename and fsync. Multi-host workers
+need source and workspace mounts with those semantics; node-local files are
+not distributed artifacts, and object storage is not supported. FoundationDB
+permits workers in separate processes; RocksDB workers remain in the owning
+process. Memory supports ephemeral jobs and protocol tests, not crash durability.
 
-`BulkBuildJob::status` follows the original ID. `abort` transitions Building to
-Dropping and uses bounded existing backend cleanup; an old handle cannot remove
-a replacement under the same name, and abort rejects a published index. Input
-files remain caller owned. Runtime operation controls and admission apply to
-all job operations. No construction workers are launched by reservation yet.
-Worker-owned files require a namespace cleanup ledger before creation;
-reservation alone creates no filesystem artifacts. Dropping jobs can be cleaned
-through `drop_index` or an existing job handle; reopening Dropping returns
-`IndexDropping` because cleanup may already have removed the descriptor.
+## Construction algorithm
 
-### Multi-tree construction
+### Capture and establish unique identity
 
-`ForestArtifact::build` consumes the complete finite source and externally sorts
-Record ID projections before constructing any tree. IDs duplicated across any
-Tree Keys fail the entire build. A second bounded external sort groups original
-vectors by canonical Tree Key; each group streams through the existing
-single-tree constructor. Full Records and payloads remain in the source snapshot.
-The implementation never retains the whole source or a directory of all trees.
+Validate schema, dimensions, finite vector values and canonical Record IDs as
+for online mutations. Preserve complete original records, field values and
+payload presence in the source. Preparation groups original vectors by Tree Key;
+metric normalization and persisted rotation are applied by construction and
+serving encoding, not by changing the source snapshot.
 
-Sort buffers, merge fan-in, and scratch accounting follow the
-[construction algorithm](#4-construction-algorithm). Source decoding and final
-frame encoding are separately codec-bounded caller IO. Successful construction
-removes temporary runs; failed output stays unsealed in its owner's directory.
-The artifact APIs write caller-owned outputs. Runtime workers instead register
-and reclaim job-owned files under the [Build Workspace protocol](#5-durable-preparation-fencing-and-retries).
+Input capture validates and hashes records as they arrive. A consuming append
+that fails cannot later seal a partial batch. EOF flushes, syncs and seals the
+source. Captured batches are not published index mutations or independently
+durable receipts.
 
-Forest artifact kind `2` uses the existing independently versioned framing.
-Each body is a u32 Tree Key byte length, canonical Tree Key, then the existing
-partition-plan body. Its binding includes the complete source identity, ordered
-Tree Key field selection, metric, persisted seed, construction version, and all
-resource options. Trees are in canonical order; partitions are child-before-parent
-with each root last. Reopen/verification checks local allocation, occupancy,
-ordered tree closure, and total leaf assignments as well as all file checksums.
-This does not replace the later exact membership and serving-value validation.
-Empty input emits no partitions or synthetic Tree Manifest.
+Optional receipt-time preparation sorts compact Record ID and Tree Key/vector
+projections while retaining original source order. Two sorters share one IO
+reservation, memory ceiling and scratch quota; their IO is serial. Callers apply
+backpressure between batches. No normalization, rotation or partition training
+runs before EOF. The resulting one-use preparation is bound to the source,
+configuration and options; it avoids repeating the source scan and sort.
+It is caller-owned, volatile work, never a durable recovery checkpoint. If it is
+lost, workers reconstruct it from the sealed source.
 
-### Serving-data artifact
-
-`ServingArtifact::build` binds the source, forest and immutable Index Manifest,
-including its Logical Index ID, persisted rotation seed and Bloom parameters.
-External joins match every source Record to exactly one leaf assignment and
-check its actual Tree Key. A second join matches every non-root partition to
-exactly one incoming reference one level above; roots have no incoming reference.
-With the forest's unique root and local allocation checks, decreasing levels and
-one parent per non-root prove reachability without retaining the graph in memory.
-
-The encoder reuses core codecs and online preprocessing: original Records and
-payload presence are preserved, Leaf Entries use absolute RaBitQ7 codes, and
-Child Entries copy finalized child centroids exactly. Headers have exact counts,
-cache epoch 1, and Ready state; transition timestamps are 0 (unavailable). Non-root
-centroids and leaf-only Synopses follow existing serving layout. Synopses are
-reduced from exact leaf fields, including persisted Bloom parameters. Tree
-Manifest high-water marks cover each complete plan.
-
-Artifact kind `3` contains strictly ordered unique canonical logical KV pairs;
-each framed body is a u32 key length, key bytes and value bytes. No Manifest,
-name mapping, namespace allocator or build metadata is included. Reader validation
-checks index ownership, canonical key/value codecs, key order and declared adapter
-limits, as well as complete file identity. These checks do not grant write or
-publication authority. Target limits and sort options are part of the artifact
-binding; admission/chunk budgets are enforced by the fenced loader. Source and
-value decoding and one Synopsis remain separately codec-bounded IO allocations;
-sort payload capacities, slots and merge buffers have an explicit memory ceiling.
-All simultaneous scratch runs share one quota and failed directories stay caller
-owned and unsealed. The artifact itself is a prepared input to later loading,
-not proof that a backend contains that complete data.
-
-The ordinary Active verifier validates any retained Build Descriptor's codec but
-excludes it from membership/topology ledgers; malformed build metadata remains an
-InvalidEncoding issue. This allows bookkeeping reclamation after publication.
-
-### Fenced serving load
-
-`BulkBuildJob::load_serving(artifact, BulkLoadOptions)` explicitly drives one
-coarse, sequential load task. It does not launch construction or distributed
-workers. The serving handle must match the reserved source, construction options,
-and immutable Index Manifest. The first claim atomically fixes the complete
-artifact manifest; later calls may resume only that exact identity. The complete
-artifact is the sealed inventory for this single task, so no paged task
-registration is needed.
-
-Index-owned key kind `0x06` stores Build Progress (value tag `0x0e`): one sized
-89-byte artifact manifest, a positive u64 load epoch, and a canonical phase.
-Loading carries committed entries and the artifact-prefix SHA-256; Loaded carries
-no checkpoint fields. Completion is recorded only after artifact EOF verification,
-not inferred from counts. Each unfinished load invocation takes over by increasing
-the epoch; repeating a Loaded invocation is an idempotent no-op. Epoch overflow
-fails without resetting ownership. Every chunk update-protects the Building
-Manifest and Build Progress, checks its epoch, and atomically writes serving
-entries plus the next progress state. It does not rewrite the shared Manifest.
-An old prepared transaction conflicts with takeover, sealing, or drop and then
-observes the durable replacement state.
-
-A claim whose commit outcome is unknown grants no worker authority; the caller
-may retry, taking a new epoch. Unknown chunk commits are resolved by reading the
-same epoch's checkpoint before replaying deterministic bytes. Each transaction
-charges both data and checkpoint mutations, including adapter namespace overhead,
-against the smaller of caller and adapter admission budgets. Canonical KV bytes
-from the validating serving reader are passed through without re-encoding.
-
-File reading runs on bounded blocking tasks retaining foreground admission.
-Recovery replays the committed prefix without rewriting it, reconstructing the
-whole-file SHA-256 state in bounded chunks. Before skipping that prefix, its
-digest must match the checkpoint committed with the backend bytes. A changed
-committed prefix fails closed and requires abort/rebuild, including when validly
-framed damage was only detected by the earlier whole-file check. Memory is bounded by the chunk byte
-budget, one look-ahead frame, codec buffers, and adapter transaction buffering;
-recovery IO/time remains proportional to the committed prefix. Full reader
-exhaustion, including final digest validation, is required before atomically
-marking Loaded, even when the cursor already equals the declared item count.
-Cancellation and errors can leave a committed prefix. Files remain caller owned;
-restoring the identical immutable artifact permits resumption only when its
-committed-prefix digest still matches.
-
-Status distinguishes Preparing, Loading (committed and total entry counts), and
-Loaded while the Manifest remains Building. Loaded grants no publication
-permission and performs no backend validation. The worker/publication APIs add persistent failure reporting, owned-file
-cleanup and sealed backend validation as described below. The current loader does not
-require record groups to fit one transaction: all intermediate data is hidden
-and cannot be read by serving operations.
-
-### Preparation files
-
-`InputSnapshot::create` streams complete original Records (IDs, vectors, typed
-fields, and optional payloads) into a new, exclusively owned directory.
-Absent payload and present-empty payload remain distinct. Schema validation and
-canonical encoding reuse storage's existing record primitives without inventing
-an Index Manifest before reservation. Source order is preserved; duplicate-ID
-detection belongs to the later global preparation sort. Source shape binds the
-dimension and ordered field names/types/nullability. Metric, Tree Key selection,
-partition sizes, and synopsis policy remain consumer choices.
-
-The independently versioned file format uses an 89-byte manifest: eight magic/
-version bytes, a one-byte artifact kind, a 32-byte binding, two big-endian u64s
-(item count and exact data-file bytes), and a 32-byte SHA-256. Data starts with
-the same magic/kind/binding, then bounded frames containing a big-endian u32
-length, body, and body SHA-256. The manifest hashes the entire data file, so
-reordering otherwise valid frames also fails verification. Input bodies reuse
-the canonical record/vector/field wire primitives and append payload presence
-and optional bounded payload bytes. Plan bodies contain key, level, count,
-full-f32 centroid, and canonical length-prefixed entry identities.
-
-Sealing flushes and syncs data, renames it, syncs its directory, then syncs and
-renames the manifest completion marker and syncs the directory and its parent.
-Reopen requires the expected manifest saved by the owner, rather than trusting
-the directory's current descriptor. Opening checks metadata/header identity;
-successful reader exhaustion checks every frame, canonical body, exact count,
-EOF, and whole-file hash. Dropping a reader early proves only its consumed
-frames. Input verification must finish before a dependent plan can be sealed.
-The job worker fences authority before accepting a sealed file.
-
-Source storage, temporary sort storage, and final artifact storage have separate
-explicit quotas. Preparation's total disk allowance must cover their sum;
-the current pure-construction memory budget excludes the caller's source record
-and artifact encoding buffers. Failure leaves an unsealed attempt directory for
-its owner to reclaim. No API overwrites or recursively cleans an existing
-directory. Crash recovery can reopen completed artifacts against their saved
-descriptors; interrupted construction attempts are recomputed in a new directory.
-
-## 1. Problem and scope
-
-Bulk Build constructs a **new Logical Index from a finite immutable input
-snapshot**, then makes it queryable in one publication step. During construction,
-ordinary reads and writes to that index are rejected. Existing unrelated indexes
-remain available. Construction and loading use bounded memory and transactions;
-the complete input need not fit in memory.
-
-Non-goals are appending a build to an Active Logical Index, accepting concurrent
-mutations into the build, rebuilding behind an existing Index Name, online name
-swapping, CDC catch-up, changing search semantics, and promising linear speedup.
-These require separate contracts rather than implicit extensions of this path.
-
-Success means lower end-to-end time to a searchable, structurally ready index,
-without sacrificing exact membership, recovery, bounded resources, or recall and
-latency at the same Search Budget. Upload, preparation, validation, and publication
-are part of the reported time; moving work out of the foreground is not a saving
-by itself.
-
-## 2. Public boundary
-
-Online writes use `Index::batch_mutate`; offline initial construction uses
-`BulkBuildJob`. Callers own online batch submission, bounded concurrency, and
-result handling. Each batch retains its atomicity, retry, cancellation, and
-unknown-commit contract; there is no session-wide ordering or completion
-contract. [ADR 0025](../adr/0025-caller-owned-online-batch-submission.md) defines
-caller-owned online submission, and [ADR 0026](../adr/0026-building-reservations.md)
-defines reservation of the hidden Building lifecycle.
-
-The public operations are:
-
-- `Runtime::start_bulk_build(name, input, construction)` reserves the name and
-  returns a `BulkBuildJob` under the [reservation contract](#reservation).
-- `Runtime::open_bulk_build(name)` recovers a handle after process loss.
-- `BulkBuildJob::status()` returns durable phase, entry progress, and failures.
-- `BulkBuildJob::run_worker(worker_options)` drives preparation and loading.
-- `BulkBuildJob::schedule(worker_options)` queues automatic execution through
-  `Runtime::run_bulk_scheduler(settings, control)`.
-- `BulkBuildJob::publish()` validates and publishes, returning an ordinary
-  `Index` only after Active is known to have committed.
-- `BulkBuildJob::abort()` fences work and transitions through normal drop cleanup.
-
-Dropping a handle or stopping a worker stops local execution, not the job. A
-terminal input or integrity failure leaves the index non-serving with inspectable
-failure information until explicitly aborted. Ordinary create/open report
-`IndexBuilding` for a reserved building name; they never attach to partial data.
-An existing Active name makes a new start fail; recovery through a known job
-identity can report that its publication already succeeded. Every handle binds
-the never-reused Logical Index ID, so name reuse cannot redirect a retry to a
-different index. Abort rejects Active: deleting a published index requires the
-ordinary explicit drop operation.
-
-## 3. Ownership and deployment
-
-Core storage owns build lifecycle records, task claims, checkpoints, publication,
-canonical keys, and invariant validation. A pure construction module owns
-clustering and final partition descriptions. Runtime owns bounded workers,
-retry policy, cancellation, and resource admission. Adapters retain ownership of
-transaction size limits, commit classification, and physical encoding.
-
-Input decoding and immutable scratch artifacts are a narrow build IO boundary.
-Build IO uses a filesystem directory with atomic finalization of immutable
-artifacts. Multi-host workers require that directory on shared
-durable storage with the same semantics; node-local paths are not distributed
-artifacts. Object storage is not supported by this IO contract.
-The source descriptor records schema, format, immutable file identities, byte
-lengths, digests, and deterministic record ordinals. Mutable sources are rejected
-or first materialized as immutable snapshots. Credentials are runtime inputs,
-never persisted in descriptors or logs.
-
-FoundationDB supports multi-process/multi-host workers. RocksDB supports
-workers in its owning process; this design does not make an embedded database
-safe for arbitrary multi-process access. Memory supports ephemeral construction
-and tests, not crash-durable jobs. Shared storage bandwidth and the final KV
-backend remain throughput limits even with more compute workers.
-
-## 4. Construction algorithm
-
-### Normalize and establish unique identity
-
-Validate the same schema, dimensions, finite numeric values, Tree Key encoding,
-and backend size limits as online mutations. Preserve original Vector Records
-and payloads; use the existing metric normalization and persisted rotation for
-routing and quantization. Stream normalization to immutable scratch files.
-
-Input capture may use `InputSnapshotWriter` to validate and encode records and
-update integrity hashes as batches arrive. Only `seal` exposes an immutable
-Input Snapshot; append failure consumes the writer and leaves caller-owned,
-unsealed files. No raw input rewrite is required at EOF. Job allocation and
-forest construction still require the sealed input identity.
-
-`PreparedInputWriter` optionally performs Tree Key/vector projection and bounded
-run sorting during receipt, using the same projection codec as snapshot-time
-preparation. ID and Tree Key sorters split the row-buffer budget after one shared IO
-reservation, and share one scratch quota. Their IO runs serially; only one set
-of merge heads and IO buffers is live at a time. Undersized budgets are rejected
-before capture.
-Sorted ID runs reject local duplicates; the final merge rejects duplicates
-across runs and Tree Keys before any partition is emitted. Append is synchronous
-and consuming, so callers apply batch backpressure instead of growing a queue.
-It does not normalize/rotate vectors or train partitions before EOF.
-
-Sealing returns the unchanged, original-order Input Snapshot and one-use
-`PreparedInput`. `run_worker_with_prepared_input` checks its source identity,
-configuration and preparation options before claiming a workspace. The normal
-worker consumes these sorted projections directly, avoiding a source reread and
-projection spool. This preparation is volatile and caller owned, never an
-accepted checkpoint. On loss, ordinary workers and the scheduler recompute it
-from the sealed snapshot. Accepted Forest/Serving Artifacts keep their existing
-fencing and recovery rules; unused caller preparation is reclaimable by its
-owner. `BulkWorkerReport` separates forest, serving and backend-load wall times
-and reports forest scratch IO; reused stages have zero work time.
-
-
-Externally sort only Record IDs across the whole Logical Index. During the
-same source pass, sequentially spool the Tree Key, Record ID, and vector
-projection under the shared sort scratch quota. This avoids carrying vectors
-through duplicate-detection merges or decoding source payloads twice. Reject
-duplicate IDs, including duplicates in different Tree Keys, before sorting
-the projection by canonical Tree Key or emitting partitions. There is no
-last-writer-wins rule or dependence on worker completion order. ID sorting and
-Tree Key sorting share one memory budget and run sequentially; projection IO
-buffers are included in the existing sort IO reservation. If the complete ID
-set fits that sort budget, uniqueness is checked directly in the sorted buffer
-without writing an intermediate ID run.
-Carry record count and content digests through the task manifests. Empty input
-produces an empty Active index without synthetic Tree Manifests.
+Ordinary preparation externally sorts global Record IDs while spooling Tree Key,
+ID and vector projections in the same source pass. It rejects duplicates across
+all Tree Keys before emitting partitions, then sorts projections by canonical
+Tree Key and Record ID. Full records and payloads stay in the source; there is no all-record
+map or directory of every tree in memory. ID sorting and Tree Key sorting share
+one memory budget. An ID set that fits is checked directly in its sorted buffer.
+Empty input produces an Active empty index without synthetic Tree Manifests.
 
 ### Form bounded leaf groups
 
-The single-tree constructor checks for strictly increasing canonical Record IDs
-while writing its input run. That order proves uniqueness and permits direct
-grouping without an initial full-vector sort or duplicate-check scan. Any equal
-or decreasing ID selects the full sort and duplicate check before partition
-emission. Both paths establish the same canonical order for accumulation,
-sampling, and tie-breaking; only one preceding ID is retained during detection.
+The forest stage supplies each single-tree constructor with globally unique
+Record IDs in canonical order. The constructor consumes that order directly
+for grouping, accumulation, sampling, and tie-breaking.
 
 For each Tree Key, recursively divide groups larger than `max_partition_entries`.
 Large groups use a bounded deterministic sample: select the lowest seeded hashes
@@ -333,24 +83,24 @@ existing metric rules and balanced two-cluster numeric procedure.
 Assign the complete group by the total order
 `(distance_to_left - distance_to_right, canonical_id)`, cutting at
 `floor(n / 2)`. Groups larger than the reserved row buffer use external
-sorting; groups that fit use in-place selection over one loaded buffer. This guarantees progress for duplicates, equal distances, and
-skew; nearest-centroid assignment alone does not. Recurse until each group fits
+sorting; groups that fit use in-place selection over one loaded buffer. This
+guarantees progress for duplicates, equal distances, and skew; nearest-centroid assignment alone does not. Recurse until each group fits
 the maximum. Since `2 * minimum <= maximum`, splitting only oversized groups
 also respects the minimum for every non-root final group. A tree whose entire
 population is below the minimum remains a single leaf root.
 
 Each partition's final centroid is computed from its complete assigned group,
 with canonical ID accumulation order and the current metric-specific treatment.
-Root inputs are ordered by the initial duplicate preflight or by ascending
-allocated parent keys. A group that fits the construction row allowance is
+Root inputs follow canonical Record ID order or ascending allocated parent keys. A group that fits the construction row allowance is
 loaded once and recursively divided into disjoint slices of that buffer.
 Training clones only the bounded selected sample, and releases it and its
 centroids before descending. Each terminal slice is sorted by canonical ID
 before consuming its rows through the same partition emitter as external
 construction. The row allowance already reserves memory for training, terminal
 entries and IO; it does not increase with total source size. No descendants of
-a resident group are materialized as scratch runs. This changes physical work,
-not sampling, grouping, centroid bytes, partition allocation or algorithm identity.
+a resident group are materialized as scratch runs. Both resident and spill paths
+preserve sampling, grouping, centroid bytes, partition allocation and algorithm
+identity.
 
 For external groups, when the shortest encoded vector row is at least twice
 the 20-byte split key, sort only `(distance_difference, input_ordinal)` to find
@@ -378,215 +128,190 @@ overlap, so their disk ceilings add; durable artifact outputs have separate
 quotas. One job processes its trees and recursive subgroups sequentially.
 Concurrency comes from independent jobs under Runtime and backend admission.
 
-### Assemble the serving topology bottom-up
+### Assemble the forest
 
-Binary splitting describes the training operation, not a requirement that every
-serving internal partition has exactly two Child Entries. Do not publish the
-recursive grouping history as the serving tree.
+After assigning leaf membership, group the finalized leaf centroids into bounded
+parents with the same grouping procedure. Repeat until one root contains the
+remaining entries. Each parent references children exactly one level below.
+Root Partition Key is 1; non-root keys are allocated deterministically, and the
+Tree Manifest high-water mark covers the complete plan.
 
-Create level-1 leaves from the final record groups. Cluster their full-f32
-centroids into bounded parent groups using the same grouping procedure, then
-repeat at each level until a single root can contain the remaining entries.
-Every parent references only children one level below. Root Partition Key is 1;
-non-root Partition Keys are assigned deterministically in a sealed tree plan.
-The Tree Manifest allocator high-water mark covers every assigned key before
-publication. Parallel tasks consume their assigned keys, never a shared allocator
-per record.
+Internal centroids use the existing internal-training semantics. Incoming Child
+Entries are generated only after child centroids are final. The sealed Forest
+Artifact orders trees canonically and partitions child-before-parent, with each
+root last. Its reader checks allocation, occupancy, tree closure and total leaf
+assignments. These structural checks do not replace exact membership validation.
 
-Compute a non-root internal centroid from its assigned Child Entry centroids
-using current internal-training semantics. Generate incoming Child Entry
-projections only after child centroids are final. All partitions are Ready,
-counts are exact, and Synopses are conservative under existing storage rules.
-Do not publish ReceivingSplit, DrainingSplit, or other maintenance transitions.
+### Establish exact membership and encode serving data
 
-### Encode and load
+External joins match every source Record to exactly one leaf assignment with
+the same Tree Key. A second join matches every non-root partition to exactly one
+incoming reference one level above; roots have none. Unique roots, valid local
+allocation, decreasing levels and one parent per non-root prove reachability
+without retaining the graph in memory.
 
-Freeze the complete topology before generating dependent persistent bytes. Use
-existing logical codecs, metric normalization, persisted rotation, and Bloom
-parameters. Encode each Leaf Entry with the absolute, centroid-independent
-RaBitQ7 code of the preprocessed record vector, exactly as online mutations do.
-Each Child Entry stores its child's full-f32 centroid. Derive Header counts and
-Synopses from final assignments once; loading records does not increment shared
-partition counters or enqueue Fixups.
+Encode existing serving values with core codecs, metric normalization, persisted
+rotation and Bloom parameters. Leaf Entries use the same absolute RaBitQ7 codes
+as online mutations. Child Entries copy finalized full-f32 centroids. Headers
+are Ready, with exact counts, cache epoch 1 and transition timestamp 0
+(unavailable). Leaf Synopses are reduced from exact fields. No split/merge
+transitions or per-record shared-counter updates are emitted.
 
-Load Vector Record/payload/Record Location/Leaf Entry groups with bounded
-transactions; where one atomic group is required, validate it fits before load.
-Metadata has separate disjoint task ownership. Deterministic chunk manifests
-identify exact keys and values. Every write transaction validates its current
-build authority and commits its chunk checkpoint in the same transaction.
-Backend-specific direct file ingestion is outside this initial protocol.
+Record groups stream into the artifact in final key order. Tree rows are sorted
+and merged with an ordered Synopsis run. The Serving Artifact contains strictly
+ordered unique canonical KV pairs; lifecycle, namespace and build bookkeeping
+are excluded. Readers validate index ownership, key order, value codecs and
+adapter limits. Source decoding, value decoding and one Synopsis are separately
+codec-bounded IO allocations; sort payloads, slots and merge buffers are charged
+to explicit memory and shared scratch ceilings.
 
-## 5. Durable preparation, fencing, and retries
+## Artifact sealing and workspace ownership
 
-The first implementation has one preparation task, one load task, and one paged
-validation proof per job. The single accepted Serving Artifact is the complete
-load inventory. No per-record task queue, paginated task registration, lease
-service, or hierarchical proof reduction is needed for this finite inventory.
-Workers are explicitly invoked or claimed by the automatic scheduler; each
-invocation takes a new preparation epoch.
-This trades intra-job parallelism for a small, recoverable protocol. Different
-jobs can run concurrently within Runtime admission and backend limits.
+Artifacts bind their source, configuration and construction identity. The exact
+[file layout](storage.md#11-bulk-build-files) is independent of the backend format.
+Writers create new directories and never overwrite an existing attempt. Sealing
+flushes and syncs data, renames it and syncs the directory, then syncs and renames
+the manifest completion marker and syncs the directory and parent.
 
-`run_worker(BulkWorkerOptions)` requires an existing absolute workspace root.
-Before creating any job-owned files, it holds a shared advisory lock on
-`<root>/.ktann-build-lock` and registers a namespace-scoped Build Workspace.
-The record fixes the options, backend hard limits, random ownership token, epoch,
-and accepted Forest/Serving Artifact descriptors. Job files live under
-`<root>/<token>/attempt-<epoch>/`. Parent directories are fsynced. Only an output
-accepted transactionally under the current epoch and Building Manifest can
-become an input. Interrupted or superseded attempts remain owned cleanup work.
+Reopen uses the expected manifest held by the owner, not a descriptor read from
+the candidate directory. Opening checks metadata/header identity; successful
+reader exhaustion checks every frame, canonical body, exact count, EOF and the
+whole-file hash. Early reader termination proves only the consumed prefix.
+Source verification must finish before dependent output can be sealed. A sealed
+file grants no authority until accepted transactionally by its current worker.
 
-Recovery reuses accepted predecessors. Once Serving is accepted, it does not
-reopen Source or Forest. Otherwise the immutable source is checked against its
-reserved manifest. An unknown claim grants no authority; callers retry with a
-new epoch. Unknown acceptance is resolved against the exact before/after record.
-Loading uses the independent load epoch in Build Progress and bounded atomic checkpoint
-protocol above. Terminal preparation/validation errors persist in Build Workspace
-and surface as `Failed { kind }`; abort/rebuild is required. Cancellation and
-transient failures leave resumable work.
+Before creating files, a worker holds a shared advisory lock on
+`<root>/.ktann-build-lock` and registers namespace-scoped Build Workspace. This
+record fixes resource options, backend limits, ownership token, preparation
+epoch and accepted artifact identities. Files live under
+`<root>/<token>/attempt-<epoch>/`; parent directories are fsynced.
 
-### Automatic distributed scheduling
+A preparation invocation takes a new epoch. Only the current epoch under a
+Building Manifest can accept its output. Recovery reuses accepted predecessors:
+with Serving accepted it need not reopen Source or Forest; otherwise it checks
+the source against the reserved identity. Interrupted or superseded attempts
+remain owned cleanup work. Unknown preparation claims confer no authority;
+retries claim a new epoch. Unknown acceptance resolves against the exact
+before/after record.
 
-`job.schedule(worker_options)` persists an idempotent request for that original
-Logical Index ID. `runtime.run_bulk_scheduler(settings, control)` is the
-long-running process entry point: it polls bounded namespace pages, competes for
-expired/unowned jobs, renews ownership, runs preparation/loading, resumes sealed
-validation, and publishes automatically. Configure `max_jobs` (1..=64),
-`poll_interval` (at least 1 ms), and `lease_duration` (at least three poll
-intervals). Defaults are one job, one-second polling, and a 30-second lease.
+Completion resumes Validating or Validated progress without another preparation
+claim. An Active identity only needs any remaining cleanup. Terminal preparation
+or validation errors persist in Build Workspace; cancellation and classified
+transient errors leave resumable work. Recomputing unaccepted attempts uses a
+new directory and cannot overwrite another worker's files.
 
-Queue records survive process loss and index-prefix removal. They persist the
-name/options, random owner token and expiry. All build mutation transactions
-update-protect the token, including acceptance, load chunks, proof pages and
-activation. A superseded worker cannot commit even if its native IO finishes
-later. Queued jobs reject manual worker/load/publish mutation attempts with
-`BulkBuildBusy`; explicit abort remains available. Existing job status reports
-Preparing until progress begins, then Loading/Loaded/Validating/Published or
-Failed. No automatic scheduler is created merely by reserving a job.
+## Fenced loading
 
-Unknown queue/claim commits resolve by reading the same identity/token. Work
-failures remain resumable or persist Failed according to the existing worker
-contract; one failed job does not stop discovery. Corrupt coordination metadata
-surfaces as a scheduler error. Renewal and build futures advance concurrently,
-including while renewal waits for a backend transaction slot. Only a persisted
-terminal worker failure is retired without propagating its error; other errors
-reach the scheduler, which retries its explicitly classified transient errors.
-Successful publication/cleanup retires the queue;
-cleanup busy errors retain it for retry. Interrupted Dropping jobs resume the
-original identity's drop cleanup, never a replacement name. Failed jobs retire
-from scheduling but retain their workspace until explicitly aborted.
+The loader accepts only Serving data matching the reserved source, construction
+options and immutable Index Manifest. Its first claim fixes the artifact
+identity; retries must use that identity. Build Progress owns the load epoch,
+phase and checkpoint. Files remain immutable throughout loading and validation.
 
-Stopping/dropping the scheduler cancels local work. Native IO retains its old
-admission/lock guards until actual exit; another process can reclaim the queue
-after expiry. Token changes, not elapsed wall time, enforce correctness. Clock
-skew affects recovery latency and redundant IO. Each process must expose the
-same immutable source and workspace paths; filesystem qualification is separate.
+Each chunk transaction update-protects the Building Manifest and current epoch,
+writes deterministic KV bytes, and advances the checkpoint atomically. It also
+checks workspace identity and any scheduler owner. Stale workers cannot commit.
+Unknown claims grant no authority; unknown chunk outcomes resolve against the
+same epoch's checkpoint before replay. Admission charges data and checkpoint
+mutations plus adapter namespace overhead against the smaller of configured and
+backend limits. Canonical validated KV bytes pass through without re-encoding.
 
-## 6. Sealing, exact validation, publication, and reclamation
+A record and its related serving entries may span load transactions: Building
+data is hidden from serving operations. Atomic visibility is established by
+publication after exact validation, not by atomic record-group loading.
 
-`publish` requires the Serving Artifact accepted by core preparation. A manually
-loaded artifact alone does not authorize publication. The core encoder's exact
-source/membership/topology joins establish the artifact's correctness; validation
-then proves that the backend contains exactly that artifact, byte for byte.
-Together these establish exact membership, rather than trusting counts or an
-aggregate checksum alone.
+File reads run on bounded blocking tasks retaining admission. Recovery replays
+the committed prefix without rewriting it, rebuilding whole-file SHA-256 state
+in bounded chunks. Its digest must match the checkpoint before skipping that
+prefix. Changed bytes fail closed; restoring identical immutable bytes permits
+resumption only when the committed-prefix digest matches. Memory is bounded by
+the chunk budget, one look-ahead frame, codec buffers and adapter buffering.
+Recovery IO/time is proportional to the committed prefix.
 
-Publication attempted before loading completes returns resumable `BulkBuildBusy`,
-without recording a terminal failure. Sealing atomically update-protects the
-Building Manifest and Build Progress, then changes Loaded to Validating with an
-empty scan cursor, zero compared entries, and the artifact-header digest. Updating
-the same progress key conflicts with
-in-flight writers and rejects subsequent claims. The lifecycle remains Building;
-`status` reports Validating with verified/total entries. A validator scans the
-entire index prefix in bounded pages, decodes known control keys, and compares
-all remaining keys and values one-to-one with the accepted sorted artifact.
-Missing, extra, or changed data fails closed. Each Validating checkpoint atomically
-persists scan cursor, compared entry count, and artifact-prefix SHA-256. Recovery
-replays and verifies that file prefix before continuing. Transition to Validated requires the complete backend scan, artifact EOF
-and the full accepted artifact digest. Counts alone never authorize this transition. Frozen data permits safe page retries.
+Full reader exhaustion and final digest validation are required before atomically
+marking Loaded, even when the checkpoint count equals the declared total. Errors
+or cancellation may leave a committed prefix. Loaded is still hidden and grants
+no publication authority.
 
-Publication checks the Validated progress, workspace identity, and
-Building Manifest in one small transaction, then changes only the Manifest to
-Active. Unknown outcomes and concurrent publishers resolve against the original
-Logical Index ID. Ordinary operations become available only after that commit;
-no prefix swap or data copy occurs. Abort and publication serialize on the same
-Manifest. An old handle can never publish a replacement using the same name.
+## Automatic distributed scheduling
 
-The namespace Build Workspace survives index-prefix deletion. `publish` and
-`abort` attempt reclamation; `cleanup` retries one job, and
-`Runtime::cleanup_bulk_builds(maximum, after)` discovers orphaned records in
-bounded pages. Building jobs are retained. Cleanup takes the root's exclusive
-advisory lock, removes only the token-owned directory, fsyncs its parent, then
-removes the durable record. Active native IO retains the shared lock even if its
-async waiter is cancelled. A busy root defers reclamation without invalidating a
-successful publish/abort; other cleanup errors are reported and can be retried.
-Publication may therefore already be committed when cleanup reports an error;
-`status`/idempotent `publish` resolve it. All jobs using one root share this IO
-barrier. The caller owns the root, coordination file, and source snapshot.
+A durable namespace queue identifies each scheduled job and its immutable worker
+options. A bounded discovery loop claims eligible unowned or expired jobs,
+renews ownership and drives the same completion path. Queue records survive
+process loss and index-prefix removal.
 
-Constant-size Build Descriptor and Validated Build Progress remain
-inside the Active index to support original-identity status and publication
-retries. They are removed with the index. Preparation files and namespace ledger
-are reclaimed independently. Crash recovery does not require an in-memory job
-registry or the original worker process.
+Every build mutation update-protects the random owner token, including artifact
+acceptance, load chunks, validation pages and activation. Expiry permits takeover;
+only a committed token change revokes the old owner. Native IO finishing after
+that change cannot authorize stale writes. Unknown queue/claim commits resolve
+against the same attempted identity/token. Manual completion rejects queued jobs;
+explicit abort remains available.
 
-## 7. Resource and operational contract
+Renewal and build futures advance concurrently, including while renewal waits
+for a backend transaction slot. Terminal persisted worker failures retire from
+the queue; other errors reach the scheduler, which retries its classified
+transient errors. Corrupt coordination metadata is surfaced. Successful
+publication and cleanup retire the entry; busy cleanup retains it for retry.
+Interrupted Dropping jobs finish cleanup for their original ID.
 
-Construction, sort, artifact, load mutation/byte, and scan-page ceilings are
-explicit. Memory limits bound the relevant algorithm buffers, not total process
-RSS, adapter caches, allocator overhead, or all concurrent jobs. Native file and
-construction work uses bounded blocking admission retained until the closure
-exits. Cancellation stops admission/checkpoints; a running native stage may
-finish before releasing resources. Operators bound aggregate concurrent jobs.
+Cancellation, deadline or Runtime shutdown stops local tasks without aborting
+durable jobs. A dropped scheduler cannot renew indefinitely; another process
+can recover after expiry. Polling, active jobs and leases are bounded per
+process, not globally. Clock skew may delay takeover or cause redundant work,
+but transactionally checked owner tokens preserve write exclusion. Predictable
+recovery latency requires reasonably synchronized clocks.
 
-Load admission takes the smaller of configured and backend limits and charges
-checkpoint/namespace overhead. It is deterministic bounded admission, not an
-adaptive latency controller. Online Fixup Backlog does not gate Bulk Build.
-The source and accepted artifacts consume durable disk in addition to temporary
-sort scratch; per-artifact ceilings are not a global filesystem quota. Provision
-aggregate space and throughput for the chosen number of jobs.
+## Exact validation, publication and reclamation
 
-The filesystem must provide reliable advisory locks, atomic rename and fsync.
-Local Memory tests establish protocol behavior, RocksDB establishes local disk
-recovery, and FoundationDB establishes transactional adapter behavior. These do
-not qualify an arbitrary network filesystem or provide a multi-host SLA.
+Sealing changes Loaded to Validating under update protection on the same Build
+Progress key checked by all load writes. Validation and loading therefore cannot
+advance concurrently. Bounded pages scan all backend serving keys and compare
+them byte-for-byte with the accepted artifact. Bookkeeping is excluded from
+membership ledgers, but malformed build metadata remains corruption.
 
-## 8. Alternatives and trade-offs
+Each page update-protects the Manifest, workspace, progress and scheduler
+identity and commits its proof checkpoint atomically. Restart verifies and
+skips the already-proven artifact prefix. Validated requires complete backend
+scan, artifact EOF and the accepted digest; counts alone are insufficient.
+Missing, extra or mismatched backend entries persist a terminal failure.
 
-| Alternative | Decision |
-| --- | --- |
-| Increase online batch concurrency | Does not remove hot leaves or movement; callers use bounded direct mutations, without a Session API. |
-| Pre-create sampled leaves, then use ordinary batches | Smaller change, but shared counters and skew-driven maintenance remain; useful as a benchmark comparator, not the chosen final path. |
-| Disable maintenance while loading one root | Reject: transfers cost to huge partitions, later training, and read quality. |
-| Train and publish the full recursive binary grouping tree | Reject: does not preserve serving occupancy and level structure merely by using k=2. |
-| Direct backend SST/file ingestion | Defer: adapter-specific and cannot replace portable lifecycle and exact validation. |
-| Build a replacement generation behind an Active name | Defer: requires write capture, cutover, and old-generation reclamation absent from the initial-load contract. |
+Publication checks Validated progress and all remaining ownership fences in one
+small transaction, then changes only the Manifest to Active. No prefix swap or
+data copy occurs. Unknown outcomes and concurrent publishers resolve against the
+original Logical Index ID. Abort and publication serialize on the same Manifest;
+an old handle cannot publish a replacement under a reused name.
 
-Selected costs are temporary storage, repeated sorting/scanning, durable build
-metadata, delayed query availability, and a second construction algorithm to
-validate. The benefit is eliminating online split contention and relocation from
-initial construction while exposing independent tasks. No speedup or recall
-claim is accepted before measurement.
+Build Workspace survives index-prefix removal. Reclamation takes the root's
+exclusive advisory lock, removes only the token-owned directory, fsyncs its
+parent and then removes the durable record. Native IO retains the shared lock
+even when its async waiter is cancelled. All jobs using one root share this
+barrier. Caller-owned source, root and coordination file remain untouched.
 
-## 9. Implementation and validation
+Completion can report a cleanup error, including Busy, after publication. Retry
+under the same identity to finish cleanup. Abort tolerates Busy and leaves the
+ownership ledger for later reclamation. Namespace cleanup retains Building jobs
+and reclaims orphaned work in bounded pages. Build Descriptor and Validated Build
+Progress remain inside an Active index for original-identity status and recovery;
+normal index drop removes them. No live coordinator or original worker is needed.
 
-The implemented path spans `construction`, `bulk`, runtime lifecycle/worker/load/
-publish modules, persistent codecs, and all adapters' shared transaction contract.
-The public APIs and repository callers use direct online batches or the
-Bulk Build workflow.
+## Resource limits and validation
 
-Tests cover exact artifact joins, all metrics' online encoding parity, bounded
-load admission, stale worker fencing, unknown commits, cancellation, terminal
-failure, empty input, backend omissions/extras, paged proof recovery, concurrent
-publication, abort races, reopen, ordinary reads/mutations, and orphan cleanup.
-RocksDB and FoundationDB share a full prepare/load/reopen/publish/verify test.
-Persistent encodings fail closed on malformed bytes.
+Construction, sorting, artifacts, load transactions and scan pages have explicit
+ceilings. Algorithm budgets are not process-RSS limits: source decoding, output
+encoding, adapter caches, allocator reservation and OS residency also consume
+memory. Source, sort scratch and accepted artifacts have separate disk limits;
+operators provision their aggregate cost and concurrent-job throughput.
+Construction remains bounded independently of dataset size, including spill
+paths. Native work retains blocking admission until its closure exits.
 
-`ktann-bulk-build` measures complete SIFT construction through RocksDB publication
-and cleanup, followed by point-read checks and held-out query recall/latency.
-Its report distinguishes preparation/loading and validation/publication time.
-Measurements are empirical, not an SLA or a comparison to online insertion.
-Cohere, larger populations, concurrent-serving impact, multi-host filesystem
-failure injection, and distributed scaling require separate qualification. The
-implementation does not claim a 1B SLA or a
-recall/speedup threshold that has not been measured against an agreed baseline.
+Tests cover all metric encodings, exact membership and topology joins, empty and
+skewed inputs, deterministic spill/resident output, quotas, adapter admission,
+stale workers, unknown commits, cancellation, backend omissions/extras, paged
+validation, abort races, publication retries and orphan cleanup. See
+`tests/bulk_artifacts.rs`, `tests/bulk_serving.rs` and the shared adapter contract
+in `tests/support/bulk_load_adapter.rs`. Core implementation owners are
+`src/construction.rs`, `src/bulk/` and `src/runtime/bulk_{worker,load,publish,scheduler}.rs`.
+
+Local protocol and adapter tests do not qualify arbitrary multi-host filesystems
+or terabyte-scale performance. Benchmark complete receive-to-Ready time and
+read cost at matched recall, including CPU, IO, scratch and RSS; an isolated
+stage improvement is not a whole-system performance guarantee.

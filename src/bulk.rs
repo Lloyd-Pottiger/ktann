@@ -1,15 +1,14 @@
-//! Durable, bounded files used by Bulk Build preparation.
+//! Durable input capture and resource options for resumable Bulk Builds.
 //!
-//! These APIs prepare immutable input snapshots, tree plans and serving KV files. They do
-//! not reserve a Logical Index, load backend data, or make an index queryable.
-//! A coordinator must persist each returned manifest before assigning dependent
-//! work, and reopen files against that expected manifest after a restart.
+//! Source snapshots remain caller owned. Reserve a job through the Runtime,
+//! then schedule it or complete it directly. Optional receipt-time preparation
+//! avoids sorting the source again without becoming recovery authority.
 
 mod files;
-mod forest;
+pub(crate) mod forest;
 mod input;
 mod plan;
-mod serving;
+pub(crate) mod serving;
 mod sort;
 
 pub use files::{ARTIFACT_MANIFEST_BYTES, ArtifactManifest};
@@ -17,6 +16,9 @@ pub use input::{
     InputReader, InputSnapshot, InputSnapshotWriter, PreparedInput, PreparedInputWriter,
 };
 
-pub use forest::{ForestArtifact, ForestOptions, ForestPartition, ForestReader, ForestReport};
+pub use crate::construction::ConstructionOptions;
+pub use forest::{ForestOptions, ForestReport};
+pub use serving::ServingReport;
 
-pub use serving::{ServingArtifact, ServingEntry, ServingOptions, ServingReader, ServingReport};
+pub(crate) use forest::ForestArtifact;
+pub(crate) use serving::{ServingArtifact, ServingEntry, ServingOptions, ServingReader};

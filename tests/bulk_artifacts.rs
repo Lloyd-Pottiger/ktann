@@ -6,10 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use ktann::api::{DataType, Error, ErrorKind, FieldSchema, IndexConfig, Metric, Record, Value};
-use ktann::bulk::{
-    ARTIFACT_MANIFEST_BYTES, ArtifactManifest, ForestArtifact, InputSnapshot, InputSnapshotWriter,
-};
-use ktann::construction::ConstructionOptions;
+use ktann::bulk::ConstructionOptions;
+use ktann::bulk::{ARTIFACT_MANIFEST_BYTES, ArtifactManifest, InputSnapshot, InputSnapshotWriter};
+use ktann::test_support::ForestArtifact;
 
 struct Directory(PathBuf);
 
@@ -146,7 +145,11 @@ fn empty_snapshot_and_tree_are_complete_verifiable_artifacts() {
     )
     .unwrap();
     assert_eq!(report.records, 0);
-    artifact.verify().unwrap();
+    artifact
+        .reader()
+        .unwrap()
+        .try_for_each(|row| row.map(|_| ()))
+        .unwrap();
     assert_eq!(artifact.manifest().items(), 0);
 }
 
@@ -338,7 +341,7 @@ fn forest_record(id: u64) -> Record {
 }
 
 type ForestShape = std::collections::BTreeMap<(Vec<u8>, u64), (u32, Vec<u32>, Vec<Bytes>)>;
-fn forest_shape(artifact: &ktann::bulk::ForestArtifact) -> ForestShape {
+fn forest_shape(artifact: &ktann::test_support::ForestArtifact) -> ForestShape {
     artifact
         .reader()
         .unwrap()
@@ -359,9 +362,9 @@ fn forest_shape(artifact: &ktann::bulk::ForestArtifact) -> ForestShape {
 
 #[test]
 fn forest_globally_groups_exact_membership_and_matches_independent_tree_builds() {
-    use ktann::bulk::ForestArtifact;
-    use ktann::construction::{ConstructionRecord, construct_tree};
     use ktann::storage::keys::TreeKey;
+    use ktann::test_support::ForestArtifact;
+    use ktann::test_support::construction::{ConstructionRecord, construct_tree};
     use std::collections::{BTreeMap, BTreeSet};
     for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
         let directory = Directory::new();
@@ -380,7 +383,11 @@ fn forest_globally_groups_exact_membership_and_matches_independent_tree_builds()
             4 * 1024 * 1024,
         )
         .unwrap();
-        artifact.verify().unwrap();
+        artifact
+            .reader()
+            .unwrap()
+            .try_for_each(|row| row.map(|_| ()))
+            .unwrap();
         assert_eq!(report.records, 317);
         assert_eq!(report.trees, 14);
         assert!(report.peak_sort_scratch_bytes <= forest_options().sort_scratch_bytes);
@@ -452,7 +459,7 @@ fn forest_globally_groups_exact_membership_and_matches_independent_tree_builds()
 
 #[test]
 fn forest_sort_spills_and_source_order_do_not_change_topology() {
-    use ktann::bulk::ForestArtifact;
+    use ktann::test_support::ForestArtifact;
     let directory = Directory::new();
     let a = InputSnapshot::create(
         &directory.0.join("a"),
@@ -531,7 +538,7 @@ fn forest_sort_spills_and_source_order_do_not_change_topology() {
 
 #[test]
 fn forest_rejects_cross_tree_duplicates_before_output_and_enforces_quotas() {
-    use ktann::bulk::ForestArtifact;
+    use ktann::test_support::ForestArtifact;
     let directory = Directory::new();
     let duplicate = Record::new(
         forest_record(0).id().clone(),
@@ -604,7 +611,7 @@ fn forest_rejects_cross_tree_duplicates_before_output_and_enforces_quotas() {
 
 #[test]
 fn forest_empty_input_has_no_tree_and_changed_source_cannot_seal() {
-    use ktann::bulk::ForestArtifact;
+    use ktann::test_support::ForestArtifact;
     let directory = Directory::new();
     for (index, config) in [config(), forest_config(Metric::L2)]
         .into_iter()
@@ -625,7 +632,11 @@ fn forest_empty_input_has_no_tree_and_changed_source_cannot_seal() {
             130,
         )
         .unwrap();
-        artifact.verify().unwrap();
+        artifact
+            .reader()
+            .unwrap()
+            .try_for_each(|row| row.map(|_| ()))
+            .unwrap();
         assert_eq!(report.records, 0);
         assert_eq!(report.trees, 0);
         assert_eq!(report.partitions, 0);
@@ -658,7 +669,7 @@ fn forest_empty_input_has_no_tree_and_changed_source_cannot_seal() {
 
 #[test]
 fn forest_reader_rejects_invalid_tree_envelopes_and_premature_roots() {
-    use ktann::bulk::ForestArtifact;
+    use ktann::test_support::ForestArtifact;
     use sha2::{Digest, Sha256};
     for root_early in [false, true] {
         let directory = Directory::new();
@@ -695,7 +706,15 @@ fn forest_reader_rejects_invalid_tree_envelopes_and_premature_roots() {
             forest_options(),
         )
         .unwrap();
-        assert_eq!(reopened.verify().unwrap_err().kind(), ErrorKind::Corruption);
+        assert_eq!(
+            reopened
+                .reader()
+                .unwrap()
+                .try_for_each(|row| row.map(|_| ()))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Corruption
+        );
         let mut reader = reopened.reader().unwrap();
         while let Some(row) = reader.next() {
             if row.is_err() {
@@ -900,4 +919,85 @@ fn receipt_sorting_validates_configuration_before_creating_files() {
     .unwrap();
     assert_eq!(error.kind(), ErrorKind::InvalidArgument);
     assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 0);
+}
+
+#[test]
+fn variable_id_forest_is_identical_across_construction_budgets_and_preparation() {
+    use ktann::bulk::PreparedInputWriter;
+    for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
+        for tied in [true, false] {
+            let dir = Directory::new();
+            let config = IndexConfig::new(7, metric)
+                .unwrap()
+                .with_partition_entries(2, 4)
+                .unwrap();
+            let records: Vec<_> = (0_u64..257)
+                .rev()
+                .map(|id| {
+                    let encoded = id.to_be_bytes();
+                    let first = encoded.iter().position(|byte| *byte != 0).unwrap_or(7);
+                    let mut key = encoded[first..].to_vec();
+                    if id % 2 == 0 {
+                        key.resize(255, 0);
+                    }
+                    Record::new(
+                        Bytes::from(key),
+                        (0..7)
+                            .map(|axis| {
+                                if axis == 0 {
+                                    1.0
+                                } else if tied {
+                                    0.0
+                                } else {
+                                    (id % 3) as f32
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                        vec![],
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let input = InputSnapshot::create(
+                &dir.0.join("input"),
+                config.clone(),
+                8_000_000,
+                records.iter().cloned().map(Ok),
+            )
+            .unwrap();
+            let mut small = forest_options();
+            small.tree.memory_bytes = 160 * 1024;
+            small.sort_memory_bytes *= 2;
+            let mut large = small;
+            large.tree.memory_bytes = 4 * 1024 * 1024;
+            let (resident, _) =
+                ForestArtifact::build(&dir.0.join("resident"), &input, [7; 32], large, 8_000_000)
+                    .unwrap();
+            let expected = forest_shape(&resident);
+            let (streamed, _) =
+                ForestArtifact::build(&dir.0.join("streamed"), &input, [7; 32], small, 8_000_000)
+                    .unwrap();
+            assert_eq!(forest_shape(&streamed), expected);
+            let prepared = PreparedInputWriter::new(
+                &dir.0.join("prepared-input"),
+                &dir.0.join("sorting"),
+                config,
+                8_000_000,
+                small,
+            )
+            .unwrap()
+            .append(records.into_iter().map(Ok))
+            .unwrap()
+            .seal()
+            .unwrap();
+            let (prepared, _) = ForestArtifact::build_prepared(
+                &dir.0.join("prepared-forest"),
+                prepared,
+                [7; 32],
+                8_000_000,
+            )
+            .unwrap();
+            assert_eq!(forest_shape(&prepared), expected);
+        }
+    }
 }

@@ -858,56 +858,47 @@ async fn run_import_phase<B: Backend>(
     let resources_before = ResourceSnapshot::capture()?;
     let backend_before = backend_counters.snapshot();
     let started = Instant::now();
-    let mut submitted_batch_sizes = Vec::with_capacity(batches.len());
-    let mut submit_latency_ms = Vec::with_capacity(batches.len());
-    let mut failures = BTreeMap::new();
-    let mut results = Vec::with_capacity(batches.len());
-    for batch in batches {
-        let records = batch.len();
-        let submit_started = Instant::now();
-        submitted_batch_sizes.push(records);
-        results.push(index.batch_mutate(batch).await);
-        submit_latency_ms.push(submit_started.elapsed().as_secs_f64() * 1_000.0);
-    }
-    let wall_seconds = started.elapsed().as_secs_f64();
-    let resources_after = ResourceSnapshot::capture()?;
-    let backend_io = backend_counters.since(&backend_before);
-    let metrics = metric_capture.snapshot();
-    if results.len() != submitted_batch_sizes.len() {
-        return Err("Direct batch loading result count differs from submitted batches".to_owned());
-    }
+    let submitted_batches =
+        u64::try_from(batches.len()).map_err(|_| "import batch count overflow".to_owned())?;
+    let mut submitted_records = 0_u64;
     let mut accepted_batches = 0_u64;
     let mut accepted_records = 0_u64;
-    let submitted_records = submitted_batch_sizes.iter().try_fold(0_u64, |total, size| {
-        total.checked_add(u64::try_from(*size).ok()?)
-    });
-    let submitted_records =
-        submitted_records.ok_or_else(|| "import record count overflow".to_owned())?;
-    for (batch_size, result) in submitted_batch_sizes.iter().zip(results) {
+    let mut submit_latency_ms = Vec::with_capacity(batches.len());
+    let mut failures = BTreeMap::new();
+    for batch in batches {
+        let records = batch.len();
+        submitted_records = submitted_records
+            .checked_add(u64::try_from(records).map_err(|_| "import record count overflow")?)
+            .ok_or_else(|| "import record count overflow".to_owned())?;
+        let submit_started = Instant::now();
+        let result = index.batch_mutate(batch).await;
+        submit_latency_ms.push(submit_started.elapsed().as_secs_f64() * 1_000.0);
         match result {
             Ok(outcomes) => {
-                accepted_batches = accepted_batches.saturating_add(1);
-                accepted_records = accepted_records.saturating_add(
-                    u64::try_from(outcomes.len()).map_err(|_| "import record count overflow")?,
-                );
-                if outcomes.len() != *batch_size {
+                if outcomes.len() != records {
                     return Err(
                         "Direct batch loading outcome count differs from batch size".to_owned()
                     );
                 }
+                accepted_batches = accepted_batches.saturating_add(1);
+                accepted_records = accepted_records.saturating_add(
+                    u64::try_from(outcomes.len()).map_err(|_| "import record count overflow")?,
+                );
             }
             Err(error) => {
                 *failures.entry(format!("{:?}", error.kind())).or_default() += 1;
             }
         }
     }
+    let wall_seconds = started.elapsed().as_secs_f64();
+    let resources_after = ResourceSnapshot::capture()?;
+    let backend_io = backend_counters.since(&backend_before);
+    let metrics = metric_capture.snapshot();
     if accepted_records != submitted_records {
         return Err(format!(
             "Direct batch loading accepted {accepted_records} of {submitted_records} records; batch failures: {failures:?}"
         ));
     }
-    let submitted_batches = u64::try_from(submitted_batch_sizes.len())
-        .map_err(|_| "import batch count overflow".to_owned())?;
     let phase = ImportPhase {
         resources: phase_resources(
             wall_seconds,

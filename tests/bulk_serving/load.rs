@@ -21,12 +21,11 @@ fn load_options() -> BulkLoadOptions {
         max_bytes: 2048,
     }
 }
-async fn fixture<B: Backend>(
+async fn reserve_fixture<B: Backend>(
     runtime: &Runtime<B>,
-    memory: &MemoryBackend,
     dir: &Directory,
     count: u64,
-) -> (BulkBuildJob<B>, ServingArtifact) {
+) -> BulkBuildJob<B> {
     let input = InputSnapshot::create(
         &dir.0.join("source"),
         config(Metric::L2, true),
@@ -34,10 +33,24 @@ async fn fixture<B: Backend>(
         (0..count).map(|id| Ok(record(id))),
     )
     .unwrap();
-    let job = runtime
+    runtime
         .start_bulk_build("bulk", &input, options().tree)
         .await
-        .unwrap();
+        .unwrap()
+}
+async fn fixture<B: Backend>(
+    runtime: &Runtime<B>,
+    memory: &MemoryBackend,
+    dir: &Directory,
+    count: u64,
+) -> (BulkBuildJob<B>, ServingArtifact) {
+    let job = reserve_fixture(runtime, dir, count).await;
+    let input = InputSnapshot::open(
+        &dir.0.join("source"),
+        job.index_manifest().config().clone(),
+        job.descriptor().input().clone(),
+    )
+    .unwrap();
     let (forest, _) = ForestArtifact::build(
         &dir.0.join("forest"),
         &input,
@@ -542,8 +555,8 @@ async fn admission_and_artifact_identity_are_enforced_before_data_writes() {
         ErrorKind::LimitExceeded
     );
     assert_eq!(checkpoint(&memory, &job).await.entries(), 0);
-    // A valid artifact for this exact source/index but with another descriptor
-    // cannot replace the immutable input registered by the first attempt.
+    // Changing preparation parameters produces another sealed artifact identity;
+    // the loader must retain the identity registered by the first attempt.
     let source = InputSnapshot::open(
         &dir.0.join("source"),
         job.index_manifest().config().clone(),
@@ -578,23 +591,6 @@ async fn admission_and_artifact_identity_are_enforced_before_data_writes() {
     );
     assert_eq!(checkpoint(&memory, &job).await.epoch(), 1);
     job.load_serving(&artifact, load_options()).await.unwrap();
-    // A second index has a different immutable identity even with identical input.
-    let other_job = runtime
-        .start_bulk_build("other", &source, options().tree)
-        .await
-        .unwrap();
-    assert_eq!(
-        other_job
-            .load_serving(&artifact, load_options())
-            .await
-            .unwrap_err()
-            .kind(),
-        ErrorKind::InvalidArgument
-    );
-    assert_eq!(
-        other_job.status().await.unwrap(),
-        BulkBuildStatus::Preparing
-    );
     runtime.shutdown().await.unwrap();
 }
 

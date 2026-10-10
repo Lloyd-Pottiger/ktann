@@ -44,9 +44,7 @@ fn index_config(minimum: u32, maximum: u32) -> IndexConfig {
         .expect("valid partition entries")
 }
 
-/// A Runtime configuration with the maintenance knobs under test. The import
-/// backlog watermark must stay within the queue capacity, so it is pinned to
-/// one for the small test queues.
+/// A Runtime configuration with the maintenance knobs under test.
 fn runtime_config(workers: usize, capacity: usize, fixup_attempts: u32) -> RuntimeConfig {
     RuntimeConfig::default()
         .with_maintenance(workers, capacity)

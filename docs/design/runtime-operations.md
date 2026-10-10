@@ -93,7 +93,7 @@ Callers load records with ordinary `Index::batch_mutate` operations and bound
 concurrency explicitly. Repository consumers use sequential submission. Every
 batch retains ordinary admission, atomicity, bounded retry, cancellation, and
 unknown-commit behavior. There is no session-level scheduling, token, completion
-barrier, or Fixup Backlog gate; see [ADR 0025](../adr/0025-caller-owned-online-batch-submission.md).
+barrier, or Fixup Backlog gate; see [ADR 0022](../adr/0022-resumable-bulk-build.md).
 
 Offline `Index::refine` requires caller-exclusive access and settled Ready topology
 as specified in [the API contract](api.md). Admission rejects local queued or

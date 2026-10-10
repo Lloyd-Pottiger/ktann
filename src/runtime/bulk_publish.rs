@@ -67,12 +67,11 @@ async fn publish_inner<B: Backend>(
     let path = state.attempt(accepted.epoch).join("serving");
     let expected = accepted.manifest.clone();
     let manifest = index.clone();
-    let source = descriptor.clone();
     let limits = state.hard_limits;
     let guard = lock.clone();
     let artifact = blocking(context, move || {
         let _lock = guard;
-        ServingArtifact::accepted(&path, expected, &manifest, &source, limits)
+        ServingArtifact::accepted(&path, expected, &manifest, limits)
     })
     .await;
     let result = match artifact {

@@ -158,7 +158,7 @@ fn has_series(series: &[(String, Vec<(String, String)>)], name: &str, labels: &[
 }
 
 /// The full audit battery: success, failure, corruption, retry, cancellation,
-/// import, verification, and maintenance paths, all under canary data.
+/// batch mutation, verification, and maintenance paths, all under canary data.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redaction_audit_covers_all_paths() {
     let _serialize = audit_lock().await;

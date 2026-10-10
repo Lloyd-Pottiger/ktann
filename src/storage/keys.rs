@@ -62,9 +62,9 @@ use crate::api::{
 #[doc(inline)]
 pub use super::tree_key::{MAX_STRING_BYTES, MAX_TREE_KEY_BYTES, TreeKey};
 
-pub(crate) use super::tree_key::tree_key_hash;
-use super::tree_key::{
-    decode_escaped_terminated, push_escaped_terminated, scan_escaped_terminated, take_array,
+use super::tree_key::take_array;
+pub(crate) use super::tree_key::{
+    decode_escaped_terminated, push_escaped_terminated, scan_escaped_terminated, tree_key_hash,
 };
 
 /// The fixed encoded width of a [`LogicalIndexId`] in bytes.

@@ -34,9 +34,9 @@ application with the storage backend that fits your deployment.
   read-only index verification, metrics, tracing, and graceful shutdown support
   the full lifecycle of an index.
 
-The core library, all three storage adapters, search, online maintenance, batch loading,
-and verification are implemented. KTANN is pre-1.0: APIs and persistent formats
-may change, and there is no stable release yet.
+The core library, all three storage adapters, search, online maintenance, batch
+loading, resumable Bulk Build, and verification are implemented. KTANN is
+pre-1.0: APIs and persistent formats may change, and there is no stable release yet.
 
 ## How it works
 
@@ -141,7 +141,8 @@ require separate process or server restarts as described in the adapter guides.
 - [Architecture](docs/design/overview.md): boundaries, invariants, and module ownership.
 - [API](docs/design/api.md): lifecycle, mutations, filters, and search requests.
 - [Search](docs/design/search.md): routing, ranking, caches, and query budgets.
-- [Operations](docs/design/runtime-operations.md): import, verification, telemetry, and shutdown.
+- [Operations](docs/design/runtime-operations.md): loading, verification, telemetry, and shutdown.
+- [Bulk Build](docs/design/bulk-build.md): resumable initial construction and atomic publication.
 - [Storage](docs/design/storage.md) and [maintenance](docs/design/maintenance.md): transaction and topology contracts.
 - [Domain glossary](CONTEXT.md) and [architectural decisions](docs/adr/): terminology and rationale.
 - [Benchmarks](benchmarks/README.md): reproducible quality and performance evaluation.
@@ -164,14 +165,16 @@ Licensed under the [MIT License](LICENSE).
 ### Initial Bulk Build
 
 For a finite initial dataset, write an immutable `bulk::InputSnapshot`, reserve
-with `Runtime::start_bulk_build`, and call `BulkBuildJob::run_worker` with an
-existing durable workspace. `publish` performs resumable exact backend validation
-and returns the ordinary Active `Index`. The name remains unavailable to reads
-and online mutations until publication. Reopen a job with `open_bulk_build` to
-resume, or abort it and reclaim its owned files. See the [API contract](docs/design/api.md#bulk-build)
-and [recovery design](docs/design/bulk-build.md) for options, filesystem semantics,
-and bounded cleanup. To distribute queued jobs automatically, call `job.schedule(worker_options)`
-and run `Runtime::run_bulk_scheduler` on each worker process. Renewable leases
-provide automatic takeover after process loss; each job remains a coarse unit
-of work. FoundationDB supports separate worker processes, while RocksDB remains
-in its owning process. Shared-filesystem deployment requirements still apply.
+with `Runtime::start_bulk_build`, and call
+`job.complete(worker_options, prepared_input, control)` with an existing durable
+workspace. Completion prepares, loads, validates and publishes the index, then
+reclaims owned files. It returns the ordinary Active `Index` and a
+`BulkBuildReport`. The name remains unavailable to reads and online mutations
+until publication. Reopen a job with `open_bulk_build` to resume, or abort it.
+See the [API contract](docs/design/api.md#bulk-build) and
+[recovery design](docs/design/bulk-build.md) for resource limits and recovery.
+To distribute jobs, call `job.schedule(worker_options)` and run
+`Runtime::run_bulk_scheduler` on each worker process. Renewable leases provide
+automatic takeover after process loss; each job remains a coarse unit of work.
+FoundationDB supports separate worker processes, while RocksDB remains in its
+owning process. Shared-filesystem deployment requirements still apply.

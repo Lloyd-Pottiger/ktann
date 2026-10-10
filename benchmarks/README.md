@@ -131,28 +131,9 @@ These import options apply to `--profile large` or an explicitly selected
 After immediate search, the lifecycle runner reopens the Logical Index with
 its configured convergence workers, allowing an import with maintenance disabled
 to reach the stable search phases. Online loads submit batches sequentially; see
-[ADR 0025](../docs/adr/0025-caller-owned-online-batch-submission.md).
+[ADR 0022](../docs/adr/0022-resumable-bulk-build.md).
 
 ## Measurements
-
-The preparation/construction gate has a separate streaming SIFT probe:
-
-```sh
-cargo run --release -p ktann-benchmarks --bin ktann-bulk-construct -- \
-  "$KTANN_BENCH_DATASET_CACHE/sift1m/sift_base.fvecs" \
-  /path/to/new-output-directory
-```
-
-An optional final argument limits records for a smoke run. The output directory
-must be new. It contains sealed `input/` and `plan/` artifact directories and
-`report.json`, including source SHA-256, options, separate snapshot/construction/
-artifact-verification timings, peak scratch bytes and cumulative scratch writes.
-The probe uses one Tree Key and streams source vectors; payloads and backend IO
-are outside this probe's scope. Completed artifacts can be reopened against saved
-manifests; interrupted sorting runs are recomputed. Source snapshots and final
-artifacts have separate 32 GiB quotas in addition to the sort scratch quota.
-These results cannot establish end-to-end speedup or serving
-recall: loading, validation, publication and query measurements are still required.
 
 Reports contain one tagged payload per scenario: `steady_state`, `lifecycle`,
 or `quality_sweep`. Configuration includes backend mutation limits, physical
@@ -337,8 +318,8 @@ Pass `--bulk-workspace /absolute/new/directory` to `ktann-vdbbench-bridge` to
 measure the core Bulk Build path. Use a fresh bridge, RocksDB directory and
 workspace for each case. The Python adapter and canonical runner remain unchanged.
 Insert requests stage bounded batches of original IDs/vectors; they do not write
-serving data. Optimize seals an InputSnapshot, reserves the Building index, runs
-`run_worker`, and calls `publish` for exact validation and atomic activation.
+serving data. Optimize seals an InputSnapshot, reserves the Building index, calls
+`complete` to prepare, load, validate, and atomically activate the index.
 Search remains unavailable until publication and topology readiness succeed.
 
 The native report identifies `build_mode: bulk` and records input staging,
@@ -346,8 +327,9 @@ snapshot creation, preparation/loading, and validation/publication/cleanup times
 `committed_import_seconds` is null in this mode: canonical load time measures
 input receipt, while canonical load plus optimize/index time covers the build.
 Bulk receipt writes canonical source frames and their hashes directly through
-`InputSnapshotWriter`, without a raw staging file or EOF rewrite. `snapshot_seconds`
-now measures only final flush, fsync and sealing; record encoding/hashing is
+`PreparedInputWriter`, which also performs bounded receipt-time sorting,
+without a raw staging file or EOF rewrite. `snapshot_seconds`
+measures only final flush, fsync and sealing; record encoding/hashing is
 included in receipt. The source snapshot and report remain caller-owned;
 successful publication reclaims core attempts. Forest construction still begins
 after EOF seals the source; this is incremental input preparation, not streaming
@@ -355,6 +337,29 @@ final tree assignment.
 Construction uses the index's min/max defaults, sample 256, 256 MiB tree memory,
 and 64 GiB tree scratch; the report records worker limits. No online insertion or
 post-build refinement is substituted into this path.
+
+For an online/bulk comparison, use the same release binary, dataset identity,
+backend settings, query set and concurrency. Run serially on an otherwise idle
+host with fresh database, socket and report locations. Enable
+`--bulk-workspace` only for the bulk case. The Cohere workload is:
+
+```sh
+vectordbbench ktann --socket-path /tmp/ktann-bench.sock \
+  --dataset-identity cohere-1m --case-type Performance768D1M \
+  --load-concurrency 1 --insert-batch-size 50 --k 100
+```
+
+Compare complete receive-to-Ready time and query latency/QPS at matched recall;
+equal beam does not imply equal quality. Record stage times, physical IO, scratch
+peak, CPU, page faults and RSS. Distinguish Ready RSS from the full-run peak, and
+fixed-query diagnostics from canonical timed QPS. Repeat both modes and include
+small/skewed inputs, long IDs and constrained-memory spill paths alongside the
+large dataset profiles.
+
+Keep measured reports under `.benchmark-data/results/`, with the source revision,
+binary hash, settings, dataset identity and raw evidence. Results apply to that
+configuration; a changed binary needs a new measurement. Local performance
+reports are not versioned design contracts or a universal speedup guarantee.
 
 ### Offline refinement after import
 
@@ -376,27 +381,6 @@ bulk-builder research measurements use a different initialization/publication
 pipeline and do not establish quality or performance for this API. Archive the
 executable and source/binary hashes before timing under the shared resource lock.
 
-### Multi-tree Bulk Build preparation probe
-
-The optional fourth argument to `ktann-bulk-construct` selects the forest path:
-`ktann-bulk-construct INPUT.fvecs OUTPUT_DIRECTORY RECORD_LIMIT FOREST_TREES`.
-A positive tree count assigns the original SIFT ordinal modulo that count to an
-I64 Tree Key field; `0` exercises the empty Tree Key through the forest path.
-Omitting this argument runs the same forest pipeline with one empty Tree Key.
-Both modes report global-sort and per-tree resource budgets. Reports include
-separate global-sort and per-tree scratch peaks/write totals. Their quotas add
-while both stages retain files. The probe verifies sealed topology framing but
-does not measure backend loading, exact serving validation, publication, or recall.
-
-Append `--serving` after `FOREST_TREES` to also execute exact joins and encode a
-serving artifact. This probe uses a synthetic Logical Index ID and explicit
-10,000-byte key / 100,000-byte value limits; it does not reserve or write a real
-backend. The nested `serving` report separates encoding and full-file verification
-time, output bytes, and scratch IO. The sort budget charges actual allocated
-payload capacities and row slots, allowing small and large projections to share
-a byte ceiling without allocating the maximum value size for every row.
-
-
 ## Complete Bulk Build probe
 
 `cargo run --release -p ktann-benchmarks --bin ktann-bulk-build -- <sift-directory> <new-output-directory> [record-limit]`
@@ -406,11 +390,11 @@ The SIFT directory contains `sift_base.fvecs`, `sift_query.fvecs`, and
 snapshot, reserves a RocksDB index, runs preparation/loading, publishes through
 exact validation, checks point reads, and measures held-out top-10 queries.
 Official recall is reported only for the full population. `report.json` separates
-phase wall times and query latency; use `/usr/bin/time -l` for process resource
+phase wall times, forest and serving scratch IO, construction seed, and query
+latency; use `/usr/bin/time -l` for process resource
 counts on macOS. Reports retain the source and RocksDB database, while successful
-publication reclaims worker-owned artifacts. Run on an idle host; the result is
-not directly comparable to the file-only `ktann-bulk-construct` probe and does not
-establish distributed throughput or an online insertion speedup.
+publication reclaims worker-owned artifacts. Run on an idle host. The result
+does not establish distributed throughput or an online insertion speedup.
 
 Bulk Build bridge reports include `serving_detail` wall times for source
 sorting, topology sorting, exact joins/encoding, output merging, Synopsis

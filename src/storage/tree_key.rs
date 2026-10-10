@@ -150,7 +150,7 @@ pub(super) fn take_array<const N: usize>(bytes: &[u8]) -> Result<[u8; N]> {
 
 /// Appends `bytes` with the v1 tuple escaping: `0x00` becomes `0x00 0xFF` and
 /// a single `0x00` terminates the string.
-pub(super) fn push_escaped_terminated(out: &mut Vec<u8>, bytes: &[u8]) {
+pub(crate) fn push_escaped_terminated(out: &mut Vec<u8>, bytes: &[u8]) {
     for &byte in bytes {
         if byte == 0x00 {
             out.extend_from_slice(&[0x00, 0xFF]);
@@ -165,7 +165,7 @@ pub(super) fn push_escaped_terminated(out: &mut Vec<u8>, bytes: &[u8]) {
 /// [`scan_escaped_terminated`], returning its raw bytes in one exactly sized
 /// buffer. The scan guarantees the input is well-formed, so the walk cannot
 /// fail.
-pub(super) fn decode_escaped_terminated(bytes: &[u8], scan: &EscapedScan) -> Vec<u8> {
+pub(crate) fn decode_escaped_terminated(bytes: &[u8], scan: &EscapedScan) -> Vec<u8> {
     debug_assert!(scan.consumed <= bytes.len());
     let mut value = Vec::with_capacity(scan.decoded_len);
     let mut offset = 0;
@@ -183,18 +183,18 @@ pub(super) fn decode_escaped_terminated(bytes: &[u8], scan: &EscapedScan) -> Vec
 }
 
 /// The layout of one tuple-escaped string, scanned without decoding it.
-pub(super) struct EscapedScan {
+pub(crate) struct EscapedScan {
     /// The decoded length in bytes.
-    pub(super) decoded_len: usize,
+    pub(crate) decoded_len: usize,
     /// The consumed length including the terminator.
-    pub(super) consumed: usize,
+    pub(crate) consumed: usize,
     /// Whether the encoded form contains any `0x00 0xFF` escape pair.
     pub(super) escaped: bool,
 }
 
 /// Scans one tuple-escaped string without materializing it. Truncated input, a
 /// missing terminator, or a decoded string longer than `maximum` fails closed.
-pub(super) fn scan_escaped_terminated(bytes: &[u8], maximum: usize) -> Result<EscapedScan> {
+pub(crate) fn scan_escaped_terminated(bytes: &[u8], maximum: usize) -> Result<EscapedScan> {
     let mut scan = EscapedScan {
         decoded_len: 0,
         consumed: 0,
