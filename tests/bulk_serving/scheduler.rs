@@ -64,7 +64,7 @@ async fn heartbeat_waiting_for_a_transaction_slot_allows_progress_and_cancellati
             RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
         )
         .unwrap();
-        let (job, _) = fixture(&runtime, &memory, &dir, 5).await;
+        let job = reserve_fixture(&runtime, &dir, 5).await;
         job.schedule(worker_options(&dir)).await.unwrap();
         // Claim the schedule, then hold the workspace transaction across a heartbeat.
         gate.arm(2);
@@ -120,7 +120,7 @@ async fn scheduler_reports_missing_or_corrupt_build_descriptor() {
             RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
         )
         .unwrap();
-        let (job, _) = fixture(&runtime, &memory, &dir, 0).await;
+        let job = reserve_fixture(&runtime, &dir, 0).await;
         job.schedule(worker_options(&dir)).await.unwrap();
         let mut txn = memory.begin_write().await.unwrap();
         let key = keys::build_descriptor_key(job.logical_index_id()).into();
@@ -158,7 +158,7 @@ async fn automatic_publish_across_runtimes_with_single_foreground_permit() {
         .unwrap();
     let first = Runtime::new(memory.clone(), config.clone()).unwrap();
     let second = Runtime::new(memory.clone(), config).unwrap();
-    let (job, _) = fixture(&first, &memory, &dir, 73).await;
+    let job = reserve_fixture(&first, &dir, 73).await;
     let options = worker_options(&dir);
     job.schedule(options.clone()).await.unwrap();
     job.schedule(options).await.unwrap();
@@ -293,7 +293,7 @@ async fn renewal_prevents_takeover_while_preparation_is_paused() {
         RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
     )
     .unwrap();
-    let (job, _) = fixture(&first, &memory, &dir, 19).await;
+    let job = reserve_fixture(&first, &dir, 19).await;
     job.schedule(worker_options(&dir)).await.unwrap();
     gate.arm(3);
     let stop = CancellationToken::new();
@@ -363,7 +363,7 @@ async fn unknown_enqueue_and_claim_resolve_without_duplicate_jobs() {
             RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
         )
         .unwrap();
-        let (job, _) = fixture(&runtime, &memory, &dir, 19).await;
+        let job = reserve_fixture(&runtime, &dir, 19).await;
         memory.set_fault_plan(vec![fault]).unwrap();
         job.schedule(worker_options(&dir)).await.unwrap();
         memory.set_fault_plan(vec![fault]).unwrap();
@@ -398,7 +398,7 @@ async fn terminal_failure_and_queued_abort_leave_no_scheduler_work() {
             RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
         )
         .unwrap();
-        let (job, _) = fixture(&runtime, &memory, &dir, 19).await;
+        let job = reserve_fixture(&runtime, &dir, 19).await;
         let mut options = worker_options(&dir);
         if fail {
             options.max_artifact_bytes = 100;
@@ -458,7 +458,7 @@ async fn takeover_fences_a_scheduled_chunk_prepared_by_the_old_owner() {
         RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
     )
     .unwrap();
-    let (job, _) = fixture(&first, &memory, &dir, 19).await;
+    let job = reserve_fixture(&first, &dir, 19).await;
     job.schedule(worker_options(&dir)).await.unwrap();
     gate.arm(6);
     let stop = CancellationToken::new();
@@ -542,7 +542,7 @@ async fn separate_runtimes_progress_different_jobs_in_one_workspace() {
         RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
     )
     .unwrap();
-    let (one, _) = fixture(&first, &memory, &dir, 19).await;
+    let one = reserve_fixture(&first, &dir, 19).await;
     let input = InputSnapshot::create(
         &dir.0.join("source-two"),
         config(Metric::L2, true),
@@ -611,7 +611,7 @@ async fn enqueue_rejects_a_file_as_workspace_before_creating_queue_state() {
         RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
     )
     .unwrap();
-    let (job, _) = fixture(&runtime, &memory, &dir, 0).await;
+    let job = reserve_fixture(&runtime, &dir, 0).await;
     let options = ktann::api::BulkWorkerOptions::new(dir.0.join("source/data.bin"));
     assert_eq!(
         job.schedule(options).await.unwrap_err().kind(),

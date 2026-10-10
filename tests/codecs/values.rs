@@ -951,8 +951,9 @@ fn reopened_manifest_reproduces_identical_index_value_bytes() {
 #[test]
 fn building_manifest_and_request_descriptor_have_canonical_bytes() {
     use ktann::bulk::ArtifactManifest;
-    use ktann::construction::{CONSTRUCTION_VERSION, ConstructionOptions};
+    use ktann::bulk::ConstructionOptions;
     use ktann::storage::values::BuildDescriptor;
+    use ktann::test_support::construction::CONSTRUCTION_VERSION;
     let codec = ValueCodec::bootstrap();
     let building = minimal_manifest().with_lifecycle(IndexLifecycle::Building);
     let bytes = codec

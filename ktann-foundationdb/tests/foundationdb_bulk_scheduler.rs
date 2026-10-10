@@ -5,8 +5,8 @@ use ktann::api::{
     BulkBuildStatus, BulkSchedulerOptions, BulkWorkerOptions, IndexConfig, Metric,
     OperationOptions, Record, RuntimeConfig, VerifyOptions,
 };
+use ktann::bulk::ConstructionOptions;
 use ktann::bulk::InputSnapshot;
-use ktann::construction::ConstructionOptions;
 use ktann::runtime::Runtime;
 use ktann::storage::backend::{Backend, ReadOps};
 use ktann_foundationdb::{BackendNamespace, FoundationDbBackend};

@@ -1,6 +1,6 @@
 //! Durable, attempt-fenced preparation and namespace-owned artifact reclamation.
 use super::{OperationContext, lifecycle::RetryPolicy};
-use crate::api::{BulkWorkerOptions, BulkWorkerReport, Error, ErrorKind, Result};
+use crate::api::{BulkWorkerOptions, BulkBuildReport, Error, ErrorKind, Result};
 use crate::bulk::{
     ForestArtifact, ForestOptions, InputSnapshot, PreparedInput, ServingArtifact, ServingOptions,
 };
@@ -114,9 +114,11 @@ pub(crate) async fn complete<B: Backend>(
     index: IndexManifest,
     descriptor: BuildDescriptor,
     options: BulkWorkerOptions,
+    mut prepared: Option<PreparedInput>,
     retry: RetryPolicy,
-) -> Result<IndexManifest> {
+) -> Result<(IndexManifest, BulkBuildReport)> {
     let mut attempts = 0;
+    let mut report = BulkBuildReport::default();
     loop {
         context.checkpoint()?;
         let result = async {
@@ -124,12 +126,12 @@ pub(crate) async fn complete<B: Backend>(
                 .await
             {
                 Err(error) if error.kind() == ErrorKind::BulkBuildBusy => {
-                    run(
+                    report = run(
                         context,
                         index.clone(),
                         descriptor.clone(),
                         options.clone(),
-                        None,
+                        prepared.take(),
                         retry,
                     )
                     .await?;
@@ -154,7 +156,8 @@ pub(crate) async fn complete<B: Backend>(
                     Err(error) if error.kind() == ErrorKind::BulkBuildBusy => {}
                     result => result?,
                 }
-                return Ok(active);
+                report.rotation_seed = *index.rotation_seed();
+                return Ok((active, report));
             }
             Err(error)
                 if matches!(
@@ -179,7 +182,7 @@ pub(crate) async fn run<B: Backend>(
     options: BulkWorkerOptions,
     prepared: Option<PreparedInput>,
     retry: RetryPolicy,
-) -> Result<BulkWorkerReport> {
+) -> Result<BulkBuildReport> {
     let options = normalize_options(context, options).await?;
     if let Some(input) = &prepared {
         let forest_options = ForestOptions {
@@ -304,8 +307,8 @@ async fn prepare_and_load<B: Backend>(
     lock: Arc<File>,
     prepared: Option<PreparedInput>,
     retry: RetryPolicy,
-) -> Result<BulkWorkerReport> {
-    let mut report = BulkWorkerReport::default();
+) -> Result<BulkBuildReport> {
+    let mut report = BulkBuildReport::default();
     let prepared = if state.forest.is_some() || state.serving.is_some() {
         drop(prepared);
         None

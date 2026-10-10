@@ -5,8 +5,7 @@ use ktann::api::{
     BulkWorkerOptions, Error, ErrorKind, GetOptions, IndexConfig, Metric, Record, RuntimeConfig,
     SearchRequest,
 };
-use ktann::bulk::InputSnapshot;
-use ktann::construction::ConstructionOptions;
+use ktann::bulk::{ConstructionOptions, InputSnapshot};
 use ktann::runtime::Runtime;
 use ktann_rocksdb::{BackendNamespace, RocksDbBackend};
 use rocksdb::{OptimisticTransactionDB, Options};
@@ -107,14 +106,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     let worker = BulkWorkerOptions::new(output.join("workspace"));
     let build_started = Instant::now();
-    job.run_worker(worker).await?;
-    let build_and_load_seconds = build_started.elapsed().as_secs_f64();
-    eprintln!(
-        "loaded {records} records in {build_and_load_seconds:.3}s; validating and publishing"
-    );
-    let publication = Instant::now();
-    let index = job.publish().await?;
-    let validation_publication_cleanup_seconds = publication.elapsed().as_secs_f64();
+    let (index, stages) = job.complete(worker, None, Default::default()).await?;
+    let validation_publication_cleanup_seconds = stages.publish.as_secs_f64();
+    let build_and_load_seconds =
+        build_started.elapsed().as_secs_f64() - validation_publication_cleanup_seconds;
     let build_total_seconds = started.elapsed().as_secs_f64();
     // Exercise ordinary serving against the original source, outside build time.
     let mut originals = BufReader::new(File::open(dataset.join("sift_base.fvecs"))?);
@@ -168,7 +163,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     runtime.shutdown().await?;
     latencies.sort_by(f64::total_cmp);
-    let report = serde_json::json!({"backend":"rocksdb","records":records,"dimension":DIMENSION,"source_manifest_sha256":source.manifest().sha256(),"snapshot_seconds":snapshot_seconds,"build_and_load_seconds":build_and_load_seconds,"validation_publication_cleanup_seconds":validation_publication_cleanup_seconds,"total_build_seconds":build_total_seconds,"held_out_queries":queries,"recall_at_10":(records==1_000_000).then_some(recall/queries as f64),"search_p50_seconds":latencies[queries/2],"search_p95_seconds":latencies[(queries*95/100).min(queries-1)],"scope":"source snapshot, durable worker, load, exact sealed backend validation, atomic publication, cleanup, and ordinary serving; no throughput comparison claimed"});
+    let report = serde_json::json!({
+        "backend": "rocksdb", "records": records, "dimension": DIMENSION,
+        "source_manifest_sha256": source.manifest().sha256(),
+        "rotation_seed": stages.rotation_seed,
+        "snapshot_seconds": snapshot_seconds,
+        "build_and_load_seconds": build_and_load_seconds,
+        "forest_seconds": stages.forest.as_secs_f64(),
+        "serving_seconds": stages.serving.as_secs_f64(),
+        "load_seconds": stages.load.as_secs_f64(),
+        "forest_detail": stages.forest_report.map(|r| serde_json::json!({
+            "trees": r.trees, "records": r.records, "partitions": r.partitions,
+            "peak_sort_scratch_bytes": r.peak_sort_scratch_bytes,
+            "sort_written_bytes": r.sort_written_bytes,
+            "peak_tree_scratch_bytes": r.peak_tree_scratch_bytes,
+            "tree_written_bytes": r.tree_written_bytes,
+        })),
+        "serving_detail": stages.serving_report.map(|r| serde_json::json!({
+            "source_sort_seconds": r.source_sort.as_secs_f64(),
+            "topology_sort_seconds": r.topology_sort.as_secs_f64(),
+            "join_encode_seconds": r.join_encode.as_secs_f64(),
+            "output_merge_seconds": r.output_merge.as_secs_f64(),
+            "synopsis_seconds": r.synopsis.as_secs_f64(),
+            "final_emit_seconds": r.final_emit.as_secs_f64(),
+            "records": r.records, "partitions": r.partitions, "keys": r.keys,
+            "peak_scratch_bytes": r.peak_scratch_bytes,
+            "scratch_written_bytes": r.scratch_written_bytes,
+        })),
+        "validation_publication_cleanup_seconds": validation_publication_cleanup_seconds,
+        "total_build_seconds": build_total_seconds,
+        "held_out_queries": queries,
+        "recall_at_10": (records == 1_000_000).then_some(recall / queries as f64),
+        "search_p50_seconds": latencies[queries / 2],
+        "search_p95_seconds": latencies[(queries * 95 / 100).min(queries - 1)],
+        "scope": "source snapshot, durable worker, load, exact sealed backend validation, atomic publication, cleanup, and ordinary serving; no throughput comparison claimed",
+    });
     let json = serde_json::to_string_pretty(&report)?;
     fs::write(output.join("report.json"), &json)?;
     println!("{json}");
