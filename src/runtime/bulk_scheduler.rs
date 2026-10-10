@@ -391,7 +391,7 @@ pub(crate) async fn run<B: Backend>(
                 match result {
                     Some(Err(e)) => break Err(Error::with_source(ErrorKind::Other,e)),
                     Some(Ok(Err(e))) if e.kind() == ErrorKind::RuntimeClosed && runtime.handle.inner.maintenance_cancel.is_cancelled() => break Ok(()),
-                    Some(Ok(Err(e))) if !matches!(e.kind(), ErrorKind::RetryableAbort | ErrorKind::ContentionExhausted | ErrorKind::CommitOutcomeUnknown | ErrorKind::LimitExceeded | ErrorKind::BulkBuildSuperseded) => break Err(e),
+                    Some(Ok(Err(e))) if !matches!(e.kind(), ErrorKind::RetryableAbort | ErrorKind::ContentionExhausted | ErrorKind::CommitOutcomeUnknown | ErrorKind::LimitExceeded | ErrorKind::BulkBuildSuperseded | ErrorKind::BulkBuildBusy) => break Err(e),
                     _ => {}
                 }
             }
