@@ -411,3 +411,17 @@ counts on macOS. Reports retain the source and RocksDB database, while successfu
 publication reclaims worker-owned artifacts. Run on an idle host; the result is
 not directly comparable to the file-only `ktann-bulk-construct` probe and does not
 establish distributed throughput or an online insertion speedup.
+
+Bulk Build bridge reports include `serving_detail` wall times for source
+sorting, topology sorting, exact joins/encoding, output merging, Synopsis
+reduction, and final emission/sealing, plus total and peak serving scratch bytes.
+`ready_peak_rss_bytes` captures the bridge process's resident-memory high-water
+mark immediately after successful publication and cleanup, before queries.
+The whole-run peak remains separate and may include later query cache growth.
+A resumed worker reports no detail for an already accepted serving artifact.
+
+Core and benchmark SHA-256 use sha2 0.11's default runtime CPU detection,
+including AArch64 SHA-2 instructions with a software fallback. Artifact framing,
+per-frame checksums, whole-file hashes and publication verification are unchanged.
+Performance comparisons must record the CPU architecture and resolved dependency
+versions; the gain from hardware hashing is platform dependent.

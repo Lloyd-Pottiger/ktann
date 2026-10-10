@@ -79,6 +79,8 @@ pub(super) async fn build<B: Backend>(
     let start = Instant::now();
     let index = job.publish().await?;
     let publish_seconds = start.elapsed().as_secs_f64();
+    let ready_resources = crate::resource::ResourceSnapshot::capture()
+        .map_err(|error| io(std::io::Error::other(error)))?;
     Ok((
         index,
         json!({
@@ -86,6 +88,17 @@ pub(super) async fn build<B: Backend>(
             "tree_written_bytes": stages.forest_report.map(|r| r.tree_written_bytes),
             "peak_sort_scratch_bytes": stages.forest_report.map(|r| r.peak_sort_scratch_bytes),
             "peak_tree_scratch_bytes": stages.forest_report.map(|r| r.peak_tree_scratch_bytes),
+            "ready_peak_rss_bytes": ready_resources.peak_rss_bytes(),
+            "serving_detail": stages.serving_report.map(|r| json!({
+                "source_sort_seconds": r.source_sort.as_secs_f64(),
+                "topology_sort_seconds": r.topology_sort.as_secs_f64(),
+                "join_encode_seconds": r.join_encode.as_secs_f64(),
+                "output_merge_seconds": r.output_merge.as_secs_f64(),
+                "synopsis_seconds": r.synopsis.as_secs_f64(),
+                "final_emit_seconds": r.final_emit.as_secs_f64(),
+                "scratch_written_bytes": r.scratch_written_bytes,
+                "peak_scratch_bytes": r.peak_scratch_bytes,
+            })),
             "forest_seconds": stages.forest.as_secs_f64(),
             "serving_seconds": stages.serving.as_secs_f64(),
             "load_seconds": stages.load.as_secs_f64(),

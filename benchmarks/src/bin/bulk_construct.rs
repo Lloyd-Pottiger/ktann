@@ -110,7 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         hasher.update(&buffer[..bytes]);
     }
-    let source_sha256 = format!("{:x}", hasher.finalize());
+    let source_sha256 = format!("{:x}", bytes::Bytes::copy_from_slice(&hasher.finalize()));
     let preparation_seconds = started.elapsed().as_secs_f64();
     fs::create_dir(output)?;
     let options = ConstructionOptions {

@@ -88,6 +88,8 @@ pub struct BulkWorkerReport {
     pub forest_report: Option<crate::bulk::ForestReport>,
     /// Exact joins and serving encoding.
     pub serving: std::time::Duration,
+    /// Exact join and encoding evidence; absent when serving data is reused.
+    pub serving_report: Option<crate::bulk::ServingReport>,
     /// Backend artifact loading, including checkpoint transactions.
     pub load: std::time::Duration,
 }

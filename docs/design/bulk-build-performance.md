@@ -617,3 +617,73 @@ source/forest equality, mismatched preparation rejection, and recovery when the
 volatile work is lost. Raw reports, final binary hashes, probe source and review
 notes are under
 `/Users/lloyd/projects/ktann/.benchmark-data/results/bulk-pipeline-20261009/`.
+
+
+## Runtime SHA-256 acceleration and phase evidence (2026-10-10)
+
+The retained change upgrades core and benchmark SHA-256 to sha2 0.11's default
+runtime CPU detection with a software fallback ([upstream documentation](https://docs.rs/crate/sha2/0.11.0)). This avoids software compression
+on supported AArch64 CPUs without the old asm feature's native build dependency
+and Windows restriction. Serving joins, codecs, artifact bytes, checksums,
+publication proofs, scheduling and all memory/scratch budgets are unchanged.
+Coarse Serving phase timings and scratch evidence now flow through the worker
+report. The bridge captures a separate peak RSS immediately after publication
+and cleanup, before queries; this is a high-water mark, not instantaneous RSS.
+
+On an Apple M1 Pro with 16 GiB RAM, a five-second source-sort CPU sample found
+327/427 top-of-stack samples in software SHA-256 compression. The isolated
+Cohere1M Serving comparison, reusing exactly the same source and forest, reduces
+89.895 to 53.610 seconds and native CPU from 82.29 to 47.78 seconds. Peak RSS is
+286.622/286.900 MB. The 4,031,515,788-byte artifact, 3,010,259 keys and SHA-256 all
+match. Scratch writes stay 27.991 GB and peak scratch stays 12.526 GB; the retained
+change does not claim an IO-volume reduction.
+
+The complete canonical RocksDB/Cohere1M sequence runs baseline, retained candidate,
+then the same frozen baseline again. Every run uses 1M 768D vectors, sample 256,
+construction 256 MiB, serving 128 MiB, the same source SHA/seed/configuration and
+load limits, and concurrency 1/5/10/20 for 30 seconds each. MB/GB below are decimal.
+
+| Metric | Baseline A | Retained | Baseline B |
+| --- | ---: | ---: | ---: |
+| Receipt (s) | 75.182 | 60.454 | 82.040 |
+| Optimize (s) | 296.051 | 234.103 | 309.459 |
+| Load to Ready (s) | 371.233 | 294.558 | 391.499 |
+| Forest (s) | 125.366 | 133.444 | 135.195 |
+| Serving (s) | 90.643 | 57.988 | 92.434 |
+| Backend load (s) | 40.226 | 23.807 | 41.232 |
+| Validate/publish/cleanup (s) | 39.744 | 18.817 | 40.553 |
+| Ready peak RSS (MB) | 392.905 | 428.245 | 431.096 |
+| Whole-run peak RSS (MB) | 1238.614 | 1868.677 | 1572.192 |
+| Whole-run native CPU (s) | 798.118 | 760.409 | 876.527 |
+| Completed queries | 19002 | 21840 | 21823 |
+| Recall@100 | 0.8907 | 0.8907 | 0.8907 |
+| Maximum QPS | 258.451 | 261.925 | 257.990 |
+
+The candidate reduces total load to Ready by 20.7% and 24.8% relative to the two
+baseline runs. Its Ready peak RSS is within the baseline range. Whole-run peak
+RSS is still higher: 1.869 GB versus 1.239/1.572 GB. Baseline B and the candidate
+complete almost the same number of queries (21,823/21,840), so query count does
+not explain that difference. This remains an unresolved query-inclusive resource
+observation; neither causation nor whole-process memory parity is established.
+No configured resource ceiling was raised. Both baseline runs
+are included to expose host variation; these are development-host observations,
+not a universal acceleration factor. Query throughput and whole-run CPU/RSS
+include a variable number of completed timed searches, so they do not isolate
+build costs. No query-speed or equal-memory-use claim is made. The hardware-hash
+gain is architecture dependent; x86, software-only CPUs and FoundationDB
+end-to-end performance were not measured in this round.
+
+A compact ID/ordinal membership join was evaluated and removed. With software
+SHA-256 its second complete source scan raised Serving time from 89.895 to
+98.673 seconds despite reducing scratch writes. With sha2 0.11 it reached
+47.755–49.471 seconds versus 53.610 for the retained original join, but peak RSS
+rose to 300.237–319.193 MB. The modest extra speed did not justify the additional
+scan, memory cost and software-hash tradeoff. No alternate join or asm-only
+configuration remains in production code.
+
+Final retained checks: 245 core unit tests (one existing ignored), 18 artifact
+and 33 serving/lifecycle tests, 48 benchmark-library tests, workspace all-target/
+all-feature Clippy, formatting and diff checks pass. Fresh independent review
+found no actionable issues, including after the compact join was removed.
+Raw measurements, CPU sample, frozen-binary hashes, probe source, test logs and canonical
+reports are recorded under `.benchmark-data/results/bulk-serving-20261010/`.
