@@ -563,7 +563,8 @@ async fn separate_runtimes_progress_different_jobs_in_one_workspace() {
         ..settings()
     };
     let stop = CancellationToken::new();
-    gate.arm(3);
+    // Pause the workspace claim with the shared root lock already held.
+    gate.arm(2);
     let a = tokio::spawn({
         let runtime = first.clone();
         let stop = stop.clone();
@@ -591,13 +592,35 @@ async fn separate_runtimes_progress_different_jobs_in_one_workspace() {
     });
     wait_active(&two).await;
     assert_ne!(one.status().await.unwrap(), BulkBuildStatus::Published);
+    // Wait until the published job has encountered busy cleanup and released
+    // its queue claim for retry, before allowing the other worker to finish.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let queue = read_queue(&memory, two.logical_index_id()).await;
+            if queue[queue.len() - 40..queue.len() - 8] == [0; 32] {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
     gate.release.notify_one();
     wait_active(&one).await;
     wait_empty(&memory, one.logical_index_id()).await;
     wait_empty(&memory, two.logical_index_id()).await;
     stop.cancel();
-    let _ = a.await.unwrap();
-    let _ = b.await.unwrap();
+    assert_eq!(a.await.unwrap().unwrap_err().kind(), ErrorKind::Cancelled);
+    assert_eq!(b.await.unwrap().unwrap_err().kind(), ErrorKind::Cancelled);
+    let mut txn = ReadLogicalTxn::bootstrap(memory.begin_read().await.unwrap());
+    for id in [one.logical_index_id(), two.logical_index_id()] {
+        assert!(
+            txn.get(LogicalKey::BuildWorkspace(id))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
     first.shutdown().await.unwrap();
     second.shutdown().await.unwrap();
 }
