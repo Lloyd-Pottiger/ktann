@@ -242,13 +242,14 @@ async fn drive<B: Backend>(
     bulk_worker::cleanup(context, id, retry).await
 }
 
+/// Releases the schedule and reports whether the worker persisted a terminal failure.
 async fn finish<B: Backend>(
     context: &mut OperationContext<B>,
     id: LogicalIndexId,
     success: bool,
     delay: Duration,
     retry: RetryPolicy,
-) -> Result<()> {
+) -> Result<bool> {
     let mut attempts = 0;
     loop {
         context.checkpoint()?;
@@ -259,14 +260,14 @@ async fn finish<B: Backend>(
             backend.admission_budget(),
         );
         let key = LogicalKey::BuildSchedule(id);
+        let failed = matches!(txn.get(LogicalKey::BuildWorkspace(id)).await?, Some(PersistentValue::BuildWorkspace(w)) if w.failure.is_some());
         let Some(PersistentValue::BuildSchedule(mut s)) = txn.get_for_update(key.clone()).await?
         else {
-            return Ok(());
+            return Ok(failed);
         };
         if Some(s.owner) != context.bulk_authority {
             return Err(Error::new(ErrorKind::BulkBuildSuperseded));
         }
-        let failed = matches!(txn.get(LogicalKey::BuildWorkspace(id)).await?, Some(PersistentValue::BuildWorkspace(w)) if w.failure.is_some());
         if success || failed {
             txn.delete(key).await?;
         } else {
@@ -275,7 +276,7 @@ async fn finish<B: Backend>(
             txn.put(key, PersistentValue::BuildSchedule(s)).await?;
         }
         match context.commit(|start| txn.commit_with(start)).await {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(failed),
             Err(e)
                 if matches!(
                     e.kind(),
@@ -301,22 +302,28 @@ async fn execute<B: Backend>(
         return Ok(());
     };
     let backend = context.backend();
-    let result = {
+    let (result, work_finished) = {
         let work = drive(&mut context, id, s.clone(), retry);
-        tokio::pin!(work);
-        let mut heartbeat = tokio::time::interval(settings.lease_duration / 3);
-        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        heartbeat.tick().await;
-        loop {
-            tokio::select! {
-                result = &mut work => break result,
-                _ = heartbeat.tick() => {
-                    if let Err(e) = renew(backend.as_ref(), id, s.owner, settings.lease_duration).await { break Err(e); }
+        let renewals = async {
+            let mut heartbeat = tokio::time::interval(settings.lease_duration / 3);
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            heartbeat.tick().await;
+            loop {
+                heartbeat.tick().await;
+                if let Err(error) =
+                    renew(backend.as_ref(), id, s.owner, settings.lease_duration).await
+                {
+                    break Err(error);
                 }
             }
+        };
+        // A pending renewal must not stop work that holds a backend transaction slot.
+        tokio::select! {
+            result = work => (result, true),
+            result = renewals => (result, false),
         }
     };
-    finish(
+    let failed = finish(
         &mut context,
         id,
         result.is_ok(),
@@ -324,9 +331,13 @@ async fn execute<B: Backend>(
         retry,
     )
     .await?;
-    // A terminal job failure is persisted by the worker and retired above;
-    // transient work remains queued. Only coordination failures stop this attempt.
-    Ok(())
+    // Only persisted worker failures are handled here. The scheduler classifies
+    // transient errors; coordination failures must reach its caller.
+    if work_finished && failed {
+        Ok(())
+    } else {
+        result
+    }
 }
 
 async fn discover<B: Backend>(
