@@ -47,6 +47,106 @@ async fn wait_empty(memory: &MemoryBackend, id: LogicalIndexId) {
     .unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn heartbeat_waiting_for_a_transaction_slot_allows_progress_and_cancellation() {
+    for cancel_while_waiting in [false, true] {
+        let dir = Directory::new();
+        let memory = MemoryBackend::with_test_config(TestConfig::default());
+        let gate = Arc::new(Gate {
+            write_slots: Some(Arc::new(tokio::sync::Semaphore::new(1))),
+            ..Gate::default()
+        });
+        let runtime = Runtime::new(
+            Gated {
+                memory: memory.clone(),
+                gate: gate.clone(),
+            },
+            RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
+        )
+        .unwrap();
+        let (job, _) = fixture(&runtime, &memory, &dir, 5).await;
+        job.schedule(worker_options(&dir)).await.unwrap();
+        // Claim the schedule, then hold the workspace transaction across a heartbeat.
+        gate.arm(2);
+        let stop = CancellationToken::new();
+        let scheduler = tokio::spawn({
+            let runtime = runtime.clone();
+            let stop = stop.clone();
+            async move {
+                runtime
+                    .run_bulk_scheduler(
+                        BulkSchedulerOptions {
+                            max_jobs: 1,
+                            ..settings()
+                        },
+                        OperationOptions::default().with_cancellation(stop),
+                    )
+                    .await
+            }
+        });
+        gate.wait().await;
+        tokio::time::timeout(Duration::from_secs(5), gate.waiting_for_slot.notified())
+            .await
+            .unwrap();
+        if cancel_while_waiting {
+            stop.cancel();
+        }
+        gate.release.notify_one();
+        if !cancel_while_waiting {
+            wait_active(&job).await;
+            wait_empty(&memory, job.logical_index_id()).await;
+        }
+        stop.cancel();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), scheduler)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Cancelled
+        );
+        runtime.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scheduler_reports_missing_or_corrupt_build_descriptor() {
+    for corrupt in [false, true] {
+        let dir = Directory::new();
+        let memory = MemoryBackend::with_test_config(TestConfig::default());
+        let runtime = Runtime::new(
+            memory.clone(),
+            RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
+        )
+        .unwrap();
+        let (job, _) = fixture(&runtime, &memory, &dir, 0).await;
+        job.schedule(worker_options(&dir)).await.unwrap();
+        let mut txn = memory.begin_write().await.unwrap();
+        let key = keys::build_descriptor_key(job.logical_index_id()).into();
+        if corrupt {
+            txn.put(key, Bytes::from_static(b"invalid descriptor"))
+                .await
+                .unwrap();
+        } else {
+            txn.delete(key).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                runtime.run_bulk_scheduler(settings(), OperationOptions::default()),
+            )
+            .await
+            .unwrap()
+            .unwrap_err()
+            .kind(),
+            ErrorKind::Corruption
+        );
+        runtime.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn automatic_publish_across_runtimes_with_single_foreground_permit() {
     let dir = Directory::new();
