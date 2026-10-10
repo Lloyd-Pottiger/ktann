@@ -1,6 +1,7 @@
 //! Exact external joins from finite source and topology to serving key/value bytes.
 
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -19,7 +20,7 @@ use crate::storage::values::{
 };
 
 use super::files::{ArtifactManifest, Reader, Writer, corrupt, io_error};
-use super::sort::{Row, Sorter, Space};
+use super::sort::{Row, Run, Sorter, Space};
 use super::{ForestArtifact, InputSnapshot};
 
 // The largest logical key has a full Tree Key, an escaped Record ID, and
@@ -226,6 +227,7 @@ impl ServingArtifact {
         let (types, count) = index.tree_key_types();
         let types = &types[..count];
         let mut previous = None;
+        let mut previous_key = None;
         while let Some(record) = records.next()? {
             if previous.as_ref() == Some(&record.key) {
                 return Err(Error::new(ErrorKind::RecordAlreadyExists));
@@ -247,11 +249,17 @@ impl ServingArtifact {
                 return Err(corrupt());
             }
             let record_id = record.id().clone();
-            emit(
-                &mut space,
-                &mut output,
-                codec,
-                options.hard_limits,
+            // Record IDs and their Record/Location/Payload suffixes already
+            // follow the logical key order, before all tree/partition keys.
+            let mut write_record = |key, value| {
+                write_entry(
+                    &mut writer,
+                    &mut previous_key,
+                    &mut report,
+                    encoded(codec, options.hard_limits, key, value)?,
+                )
+            };
+            write_record(
                 LogicalKey::Record {
                     index: id,
                     id: record_id.clone(),
@@ -262,11 +270,7 @@ impl ServingArtifact {
                     Box::from(record.fields()),
                 )),
             )?;
-            emit(
-                &mut space,
-                &mut output,
-                codec,
-                options.hard_limits,
+            write_record(
                 LogicalKey::Location {
                     index: id,
                     id: record_id.clone(),
@@ -274,11 +278,7 @@ impl ServingArtifact {
                 PersistentValue::RecordLocation(RecordLocation::new(tree.clone(), leaf)),
             )?;
             if let Some(payload) = record.payload() {
-                emit(
-                    &mut space,
-                    &mut output,
-                    codec,
-                    options.hard_limits,
+                write_record(
                     LogicalKey::Payload {
                         index: id,
                         id: record_id.clone(),
@@ -300,22 +300,7 @@ impl ServingArtifact {
             let key = keys::encode_key(&leaf_key)?;
             let value = codec.encode_for_key(&leaf_key, &entry)?;
             check_limits(&key, &value, options.hard_limits)?;
-            // A separate sorted prefix groups exact field projections by leaf
-            // for Synopsis construction without retaining all leaves in RAM.
-            output.push(
-                &mut space,
-                Row {
-                    key: tagged(0, &key),
-                    value: value.clone(),
-                },
-            )?;
-            output.push(
-                &mut space,
-                Row {
-                    key: tagged(1, &key),
-                    value,
-                },
-            )?;
+            output.push(&mut space, Row { key, value })?;
             report.records = add(report.records, 1)?;
             next = topology.next()?;
         }
@@ -459,20 +444,20 @@ impl ServingArtifact {
         space.remove(topology_run)?;
         report.output_merge = start.elapsed();
         let start = Instant::now();
+        // Leaf groups and Synopsis keys share the same Tree Key/Partition Key
+        // ordering, so their reduced output needs no further sort.
         let mut output = space.reader(&output_run)?;
-        let mut next = output.next()?;
-        let mut synopses = Sorter::new(&space, options.memory_bytes)?;
+        let (mut synopsis_run, mut synopsis_writer) = space.writer()?;
         let mut synopsis: Option<(LogicalKey, PartitionSynopsis)> = None;
-        while next.as_ref().is_some_and(|row| row.key.first() == Some(&0)) {
-            let row = next.take().expect("projection");
-            let key = keys::decode_key(types, &Bytes::copy_from_slice(&row.key[1..]))?;
+        while let Some(row) = output.next()? {
+            let key = keys::decode_key(types, &Bytes::copy_from_slice(&row.key))?;
             let LogicalKey::LeafEntry {
                 tree_key,
                 partition,
                 ..
             } = &key
             else {
-                return Err(corrupt());
+                continue;
             };
             let synopsis_key = LogicalKey::Synopsis {
                 index: id,
@@ -485,7 +470,8 @@ impl ServingArtifact {
             {
                 flush_synopsis(
                     &mut space,
-                    &mut synopses,
+                    &mut synopsis_run,
+                    &mut synopsis_writer,
                     codec,
                     options.hard_limits,
                     synopsis.take().expect("previous leaf"),
@@ -498,29 +484,28 @@ impl ServingArtifact {
             let (_, accumulator) =
                 synopsis.get_or_insert_with(|| (synopsis_key, PartitionSynopsis::empty(index)));
             accumulator.expand(index, entry.fields())?;
-            next = output.next()?;
         }
         if let Some(synopsis) = synopsis {
             flush_synopsis(
                 &mut space,
-                &mut synopses,
+                &mut synopsis_run,
+                &mut synopsis_writer,
                 codec,
                 options.hard_limits,
                 synopsis,
             )?;
         }
-        let synopsis_run = synopses.finish(&mut space)?;
+        synopsis_writer.flush().map_err(io_error)?;
+        drop((output, synopsis_writer));
         report.synopsis = start.elapsed();
         let start = Instant::now();
+        let mut output = space.reader(&output_run)?;
+        let mut next = output.next()?;
         let mut synopses = space.reader(&synopsis_run)?;
         let mut next_synopsis = synopses.next()?;
-        let mut previous_key: Option<Vec<u8>> = None;
         while next.is_some() || next_synopsis.is_some() {
-            if next.as_ref().is_some_and(|row| row.key.first() != Some(&1)) {
-                return Err(corrupt());
-            }
             let take_synopsis = match (&next, &next_synopsis) {
-                (Some(row), Some(synopsis)) => synopsis.key.as_slice() < &row.key[1..],
+                (Some(row), Some(synopsis)) => synopsis.key < row.key,
                 (None, Some(_)) => true,
                 _ => false,
             };
@@ -529,24 +514,11 @@ impl ServingArtifact {
                 next_synopsis = synopses.next()?;
                 row
             } else {
-                let mut row = next.take().expect("selected serving row");
-                row.key.remove(0);
+                let row = next.take().expect("selected serving row");
                 next = output.next()?;
                 row
             };
-            if previous_key
-                .as_ref()
-                .is_some_and(|previous| previous >= &row.key)
-            {
-                return Err(corrupt());
-            }
-            let mut body = Vec::with_capacity(4 + row.key.len() + row.value.len());
-            body.extend_from_slice(&(row.key.len() as u32).to_be_bytes());
-            body.extend_from_slice(&row.key);
-            body.extend_from_slice(&row.value);
-            writer.append(&body)?;
-            previous_key = Some(row.key);
-            report.keys = add(report.keys, 1)?;
+            write_entry(&mut writer, &mut previous_key, &mut report, row)?;
         }
         drop((output, synopses));
         space.remove(output_run)?;
@@ -717,17 +689,39 @@ fn emit(
     key: LogicalKey,
     value: PersistentValue,
 ) -> Result<()> {
-    let bytes = keys::encode_key(&key)?;
-    let value = codec.encode_for_key(&key, &value)?;
-    check_limits(&bytes, &value, limits)?;
-    output.push(
-        space,
-        Row {
-            key: tagged(1, &bytes),
-            value,
-        },
-    )
+    output.push(space, encoded(codec, limits, key, value)?)
 }
+fn encoded(
+    codec: ValueCodec<'_>,
+    limits: HardLimits,
+    key: LogicalKey,
+    value: PersistentValue,
+) -> Result<Row> {
+    let value = codec.encode_for_key(&key, &value)?;
+    let key = keys::encode_key(&key)?;
+    check_limits(&key, &value, limits)?;
+    Ok(Row { key, value })
+}
+/// Enforces canonical order across the streamed Record Groups and sorted tree data.
+fn write_entry(
+    writer: &mut Writer,
+    previous: &mut Option<Vec<u8>>,
+    report: &mut ServingReport,
+    row: Row,
+) -> Result<()> {
+    if previous.as_ref().is_some_and(|key| key >= &row.key) {
+        return Err(corrupt());
+    }
+    let mut body = Vec::with_capacity(4 + row.key.len() + row.value.len());
+    body.extend_from_slice(&(row.key.len() as u32).to_be_bytes());
+    body.extend_from_slice(&row.key);
+    body.extend_from_slice(&row.value);
+    writer.append(&body)?;
+    *previous = Some(row.key);
+    report.keys = add(report.keys, 1)?;
+    Ok(())
+}
+
 fn emit_tree(
     space: &mut Space,
     output: &mut Sorter,
@@ -751,7 +745,8 @@ fn emit_tree(
 }
 fn flush_synopsis(
     space: &mut Space,
-    output: &mut Sorter,
+    run: &mut Run,
+    writer: &mut BufWriter<File>,
     codec: ValueCodec<'_>,
     limits: HardLimits,
     (key, synopsis): (LogicalKey, PartitionSynopsis),
@@ -759,7 +754,7 @@ fn flush_synopsis(
     let bytes = keys::encode_key(&key)?;
     let value = codec.encode_for_key(&key, &PersistentValue::PartitionSynopsis(synopsis))?;
     check_limits(&bytes, &value, limits)?;
-    output.push(space, Row { key: bytes, value })
+    space.append(run, writer, &Row { key: bytes, value })
 }
 fn node(bytes: &[u8], index: &IndexManifest) -> Result<(TreeKey, PartitionKey)> {
     let (types, count) = index.tree_key_types();

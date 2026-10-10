@@ -26,7 +26,7 @@ mod bulk;
 mod topology;
 
 /// Length-prefixed frames carry JSON control requests or binary float32 inserts.
-const VERSION: u32 = 2;
+const VERSION: u32 = 1;
 const MAX_FRAME: usize = 8 << 20;
 const MAX_BATCH: usize = 50;
 const MAX_CONNECTIONS: usize = 128;
@@ -166,7 +166,7 @@ fn decode_request(data: &[u8]) -> Result<Request, String> {
     if !data.starts_with(b"KTI") {
         return serde_json::from_slice(data).map_err(|e| e.to_string());
     }
-    if data.len() < 12 || &data[..4] != b"KTI\x02" {
+    if data.len() < 12 || &data[..4] != b"KTI\x01" {
         return Err("invalid binary insert header or version".into());
     }
     let count = u32::from_be_bytes(data[4..8].try_into().unwrap()) as usize;
@@ -813,7 +813,7 @@ mod tests {
 
     #[test]
     fn binary_insert_preserves_bits_and_rejects_incomplete_or_excess_bodies() {
-        let mut frame = b"KTI\x02".to_vec();
+        let mut frame = b"KTI\x01".to_vec();
         frame.extend_from_slice(&2_u32.to_be_bytes());
         frame.extend_from_slice(&2_u32.to_be_bytes());
         for id in [i64::MIN, i64::MAX] {
@@ -841,7 +841,7 @@ mod tests {
             bad[8..12].copy_from_slice(&u32::to_be_bytes(dimension));
             assert!(super::decode_request(&bad).is_err());
         }
-        frame[3] = 1;
+        frame[3] = 2;
         assert!(super::decode_request(&frame).is_err());
     }
 

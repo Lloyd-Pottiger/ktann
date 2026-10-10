@@ -56,11 +56,30 @@ impl Bridge {
     }
     fn request(&mut self, mut request: Value) -> Value {
         request["version"] = json!(1);
-        let data = serde_json::to_vec(&request).unwrap();
+        self.exchange(&serde_json::to_vec(&request).unwrap())
+    }
+    fn insert(&mut self, ids: &[i64], vectors: &[Vec<f32>]) -> Value {
+        assert_eq!(ids.len(), vectors.len());
+        let dimension = vectors[0].len();
+        let mut data = b"KTI\x01".to_vec();
+        data.extend_from_slice(&(ids.len() as u32).to_be_bytes());
+        data.extend_from_slice(&(dimension as u32).to_be_bytes());
+        for id in ids {
+            data.extend_from_slice(&id.to_le_bytes());
+        }
+        for vector in vectors {
+            assert_eq!(vector.len(), dimension);
+            for value in vector {
+                data.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        self.exchange(&data)
+    }
+    fn exchange(&mut self, data: &[u8]) -> Value {
         self.stream
             .write_all(&(data.len() as u32).to_be_bytes())
             .unwrap();
-        self.stream.write_all(&data).unwrap();
+        self.stream.write_all(data).unwrap();
         let mut size = [0; 4];
         self.stream.read_exact(&mut size).unwrap();
         let mut bytes = vec![0; u32::from_be_bytes(size) as usize];
@@ -98,16 +117,16 @@ fn staged_bulk_build_publishes_and_reports_real_build_phases() {
     for start in [0, 50, 100, 150] {
         let ids: Vec<_> = (start..start + 50).collect();
         let vectors: Vec<_> = ids.iter().map(|id| vec![*id as f32, 1., 2., 3.]).collect();
-        assert_eq!(
-            bridge.request(json!({"op":"insert","ids":ids,"vectors":vectors}))["ok"],
-            true
-        );
+        let response = bridge.insert(&ids, &vectors);
+        assert_eq!(response["ok"], true, "{response}");
     }
     assert_eq!(
         bridge.request(json!({"op":"search","vector":[7.,1.,2.,3.],"k":1}))["ok"],
         false
     );
-    assert!(!bridge.directory.path().join("bulk/source").exists());
+    let source = bridge.directory.path().join("bulk/source");
+    assert!(source.is_dir());
+    assert!(!source.join("manifest.bin").exists());
     assert_eq!(
         bridge.request(json!({"op":"optimize","records":200}))["ok"],
         true
@@ -119,10 +138,7 @@ fn staged_bulk_build_publishes_and_reports_real_build_phases() {
     let response = bridge.request(json!({"op":"search","vector":[7.,1.,2.,3.],"k":1}));
     assert_eq!(response["ok"], true);
     assert_eq!(response["result"]["ids"], json!([7]));
-    assert_eq!(
-        bridge.request(json!({"op":"insert","ids":[201],"vectors":[[1.,2.,3.,4.]]}))["ok"],
-        false
-    );
+    assert_eq!(bridge.insert(&[201], &[vec![1., 2., 3., 4.]])["ok"], false);
     bridge.stop();
     let report: Value = serde_json::from_slice(
         &std::fs::read(bridge.directory.path().join("report.json")).unwrap(),
@@ -138,7 +154,7 @@ fn staged_bulk_build_publishes_and_reports_real_build_phases() {
     ] {
         assert!(report["bulk_build"][phase].as_f64().unwrap() > 0.);
     }
-    assert!(!bridge.directory.path().join("bulk/input.bin").exists());
+    assert!(source.join("manifest.bin").exists());
 }
 #[test]
 fn duplicate_staged_ids_fail_before_publication() {
@@ -147,11 +163,8 @@ fn duplicate_staged_ids_fail_before_publication() {
         bridge.request(json!({"op":"reset","dimension":4,"metric":"L2","dataset":"duplicate"}))["ok"],
         true
     );
-    assert_eq!(
-        bridge.request(json!({"op":"insert","ids":[1,1],"vectors":[[1.,2.,3.,4.],[2.,3.,4.,5.]]}))
-            ["ok"],
-        true
-    );
+    let response = bridge.insert(&[1, 1], &[vec![1., 2., 3., 4.], vec![2., 3., 4., 5.]]);
+    assert_eq!(response["ok"], true, "{response}");
     assert_eq!(
         bridge.request(json!({"op":"optimize","records":2}))["ok"],
         false

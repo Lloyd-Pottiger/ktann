@@ -132,78 +132,6 @@ fn full_records_survive_restart_with_payload_presence_and_canonical_fields() {
 }
 
 #[test]
-fn sealed_tree_can_be_reopened_and_rebuilt_deterministically() {
-    let directory = Directory::new();
-    let input = InputSnapshot::create(
-        &directory.0.join("input"),
-        config(),
-        1_000_000,
-        (0..101).map(|id| Ok(record(id))),
-    )
-    .unwrap();
-    let (artifact, report) = ForestArtifact::build(
-        &directory.0.join("plan"),
-        &input,
-        [7; 32],
-        forest_options(),
-        1_000_000,
-    )
-    .unwrap();
-    assert_eq!(report.records, 101);
-    let expected = ArtifactManifest::decode(&artifact.manifest().encode()).unwrap();
-    drop(artifact);
-    let reopened = ForestArtifact::open(
-        &directory.0.join("plan"),
-        expected,
-        &input,
-        [7; 32],
-        forest_options(),
-    )
-    .unwrap();
-    let plans = reopened
-        .reader()
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    assert_eq!(plans.len() as u64, report.partitions);
-    assert_eq!(plans.last().unwrap().partition.key.get(), 1);
-    let mut ids: Vec<_> = plans
-        .iter()
-        .filter(|plan| plan.partition.level == 1)
-        .flat_map(|plan| plan.partition.entries.iter().cloned())
-        .collect();
-    ids.sort();
-    assert_eq!(
-        ids,
-        (0..101)
-            .map(|id| record(id).id().clone())
-            .collect::<Vec<_>>()
-    );
-    let (rebuilt, _) = ForestArtifact::build(
-        &directory.0.join("retry"),
-        &input,
-        [7; 32],
-        forest_options(),
-        1_000_000,
-    )
-    .unwrap();
-    assert_eq!(reopened.manifest(), rebuilt.manifest());
-    assert_eq!(
-        ForestArtifact::open(
-            &directory.0.join("plan"),
-            reopened.manifest().clone(),
-            &input,
-            [8; 32],
-            forest_options()
-        )
-        .err()
-        .unwrap()
-        .kind(),
-        ErrorKind::InvalidArgument
-    );
-}
-
-#[test]
 fn empty_snapshot_and_tree_are_complete_verifiable_artifacts() {
     let directory = Directory::new();
     let input = InputSnapshot::create(&directory.0.join("input"), config(), 130, []).unwrap();
@@ -458,15 +386,18 @@ fn forest_globally_groups_exact_membership_and_matches_independent_tree_builds()
         assert!(report.peak_sort_scratch_bytes <= forest_options().sort_scratch_bytes);
         assert!(!directory.0.join("forest/sort").exists());
         assert!(!directory.0.join("forest/tree").exists());
+        let expected_manifest = ArtifactManifest::decode(&artifact.manifest().encode()).unwrap();
+        drop(artifact);
         let reopened = ForestArtifact::open(
             &directory.0.join("forest"),
-            artifact.manifest().clone(),
+            expected_manifest,
             &source,
             [7; 32],
             forest_options(),
         )
         .unwrap();
         let shape = forest_shape(&reopened);
+        assert_eq!(shape.len() as u64, report.partitions);
         let mut expected: BTreeMap<Vec<u8>, Vec<ConstructionRecord>> = BTreeMap::new();
         for id in 0..317 {
             let record = forest_record(id);
@@ -565,7 +496,7 @@ fn forest_sort_spills_and_source_order_do_not_change_topology() {
     )
     .unwrap();
     assert_eq!(small.manifest(), repeat.manifest());
-    assert!(
+    assert_eq!(
         ForestArtifact::open(
             &directory.0.join("small"),
             small.manifest().clone(),
@@ -573,7 +504,10 @@ fn forest_sort_spills_and_source_order_do_not_change_topology() {
             [8; 32],
             forest_options()
         )
-        .is_err()
+        .err()
+        .unwrap()
+        .kind(),
+        ErrorKind::InvalidArgument
     );
     let regrouped = InputSnapshot::open(
         &directory.0.join("a"),

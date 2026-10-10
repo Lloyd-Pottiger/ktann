@@ -2,9 +2,8 @@
 
 Status: **Implemented for a complete, resumable initial build.**
 
-Throughput and search-quality limitations, with a proposed redesign, are tracked
-in [Bulk Build Throughput Redesign](bulk-build-performance.md). The redesign is
-a draft and does not change the implemented contract below.
+The current physical pipeline, measured throughput and search quality, and open
+validation limits are tracked in [Bulk Build Performance](bulk-build-performance.md).
 
 `start_bulk_build` reserves a hidden Logical Index; `run_worker` prepares and
 loads it; `publish` validates the frozen backend and atomically makes it Active.

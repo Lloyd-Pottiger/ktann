@@ -240,109 +240,96 @@ async fn prepare_and_load<B: Backend>(
     } else {
         prepared
     };
-    if let Some(accepted) = &state.serving {
+    let serving = if let Some(accepted) = &state.serving {
         let path = state.attempt(accepted.epoch).join("serving");
         let expected = accepted.manifest.clone();
         let manifest = index.clone();
         let descriptor_copy = descriptor.clone();
         let limits = state.hard_limits;
         let guard = lock.clone();
-        let serving = blocking(context, move || {
+        blocking(context, move || {
             let _lock = guard;
             ServingArtifact::accepted(&path, expected, &manifest, &descriptor_copy, limits)
         })
-        .await?;
-        let start = Instant::now();
-        super::bulk_load::load(
-            context,
-            index.clone(),
-            descriptor.clone(),
-            serving,
-            state.options.load,
-            retry,
-        )
-        .await?;
-        report.load = start.elapsed();
-        return Ok(report);
-    }
-    let input = blocking(context, {
-        let descriptor = descriptor.clone();
-        let config = index.config().clone();
-        let lock = lock.clone();
-        move || {
-            let _lock = lock;
-            InputSnapshot::open(descriptor.source(), config, descriptor.input().clone())
-        }
-    })
-    .await?;
-    {
-        let path = state.attempt(state.epoch);
-        let lock = lock.clone();
-        blocking(context, move || {
-            let _lock = lock;
-            fs::create_dir_all(path.parent().expect("owned directory")).map_err(io)?;
-            fs::create_dir(&path).map_err(io)?;
-            File::open(path.parent().expect("parent"))
-                .and_then(|f| f.sync_all())
-                .map_err(io)?;
-            File::open(
-                path.parent()
-                    .and_then(Path::parent)
-                    .expect("workspace root"),
-            )
-            .and_then(|f| f.sync_all())
-            .map_err(io)
-        })
-        .await?;
-    }
-    let forest_options = ForestOptions {
-        tree: descriptor.options(),
-        sort_memory_bytes: state.options.sort_memory_bytes,
-        sort_scratch_bytes: state.options.sort_scratch_bytes,
-    };
-    let forest = if let Some(accepted) = &state.forest {
-        let path = state.attempt(accepted.epoch).join("forest");
-        let expected = accepted.manifest.clone();
-        let source = input.clone();
-        let seed = *index.rotation_seed();
-        let lock = lock.clone();
-        blocking(context, move || {
-            let _lock = lock;
-            ForestArtifact::open(&path, expected, &source, seed, forest_options)
-        })
         .await?
     } else {
-        let path = state.attempt(state.epoch).join("forest");
-        let source = input.clone();
-        let seed = *index.rotation_seed();
-        let quota = state.options.max_artifact_bytes;
-        let lock = lock.clone();
-        let start = Instant::now();
-        let (forest, forest_report) = blocking(context, move || {
-            let _lock = lock;
-            match prepared {
-                Some(input) => ForestArtifact::build_prepared(&path, input, seed, quota),
-                None => ForestArtifact::build(&path, &source, seed, forest_options, quota),
+        let input = blocking(context, {
+            let descriptor = descriptor.clone();
+            let config = index.config().clone();
+            let lock = lock.clone();
+            move || {
+                let _lock = lock;
+                InputSnapshot::open(descriptor.source(), config, descriptor.input().clone())
             }
         })
         .await?;
-        report.forest = start.elapsed();
-        report.forest_report = Some(forest_report);
-        let mut after = state.clone();
-        after.forest = Some(PreparedArtifact {
-            epoch: state.epoch,
-            manifest: forest.manifest().clone(),
-        });
-        accept(context, index, state, &after, retry).await?;
-        *state = after;
-        forest
-    };
-    let serving_options = ServingOptions {
-        memory_bytes: state.options.serving_memory_bytes,
-        scratch_bytes: state.options.serving_scratch_bytes,
-        hard_limits: state.hard_limits,
-    };
-    let serving = {
+        {
+            let path = state.attempt(state.epoch);
+            let lock = lock.clone();
+            blocking(context, move || {
+                let _lock = lock;
+                fs::create_dir_all(path.parent().expect("owned directory")).map_err(io)?;
+                fs::create_dir(&path).map_err(io)?;
+                File::open(path.parent().expect("parent"))
+                    .and_then(|f| f.sync_all())
+                    .map_err(io)?;
+                File::open(
+                    path.parent()
+                        .and_then(Path::parent)
+                        .expect("workspace root"),
+                )
+                .and_then(|f| f.sync_all())
+                .map_err(io)
+            })
+            .await?;
+        }
+        let forest_options = ForestOptions {
+            tree: descriptor.options(),
+            sort_memory_bytes: state.options.sort_memory_bytes,
+            sort_scratch_bytes: state.options.sort_scratch_bytes,
+        };
+        let forest = if let Some(accepted) = &state.forest {
+            let path = state.attempt(accepted.epoch).join("forest");
+            let expected = accepted.manifest.clone();
+            let source = input.clone();
+            let seed = *index.rotation_seed();
+            let lock = lock.clone();
+            blocking(context, move || {
+                let _lock = lock;
+                ForestArtifact::open(&path, expected, &source, seed, forest_options)
+            })
+            .await?
+        } else {
+            let path = state.attempt(state.epoch).join("forest");
+            let source = input.clone();
+            let seed = *index.rotation_seed();
+            let quota = state.options.max_artifact_bytes;
+            let lock = lock.clone();
+            let start = Instant::now();
+            let (forest, forest_report) = blocking(context, move || {
+                let _lock = lock;
+                match prepared {
+                    Some(input) => ForestArtifact::build_prepared(&path, input, seed, quota),
+                    None => ForestArtifact::build(&path, &source, seed, forest_options, quota),
+                }
+            })
+            .await?;
+            report.forest = start.elapsed();
+            report.forest_report = Some(forest_report);
+            let mut after = state.clone();
+            after.forest = Some(PreparedArtifact {
+                epoch: state.epoch,
+                manifest: forest.manifest().clone(),
+            });
+            accept(context, index, state, &after, retry).await?;
+            *state = after;
+            forest
+        };
+        let serving_options = ServingOptions {
+            memory_bytes: state.options.serving_memory_bytes,
+            scratch_bytes: state.options.serving_scratch_bytes,
+            hard_limits: state.hard_limits,
+        };
         let path = state.attempt(state.epoch).join("serving");
         let manifest = index.clone();
         let quota = state.options.max_artifact_bytes;

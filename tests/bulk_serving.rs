@@ -158,6 +158,71 @@ async fn encoded_leaf(backend: &MemoryBackend, manifest: &IndexManifest, id: u64
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serving_streams_record_groups_in_escaped_id_order() {
+    let directory = Directory::new();
+    let backend = MemoryBackend::new();
+    let runtime = runtime(backend.clone());
+    let config = IndexConfig::new(3, Metric::L2)
+        .unwrap()
+        .with_partition_entries(2, 4)
+        .unwrap();
+    let ids: &[&[u8]] = &[b"a\xff", b"\0\0", b"a", b"\xff", b"a\0", b"\0"];
+    let input = InputSnapshot::create(
+        &directory.0.join("input"),
+        config,
+        1 << 20,
+        ids.iter().map(|id| {
+            Record::new(Bytes::copy_from_slice(id), vec![1.0, 2.0, 3.0], vec![])?
+                .with_payload(Bytes::from_static(b"payload"))
+        }),
+    )
+    .unwrap();
+    let job = runtime
+        .start_bulk_build("bulk", &input, options().tree)
+        .await
+        .unwrap();
+    let manifest = job.index_manifest();
+    let (forest, _) = ForestArtifact::build(
+        &directory.0.join("forest"),
+        &input,
+        *manifest.rotation_seed(),
+        options(),
+        1 << 20,
+    )
+    .unwrap();
+    let (artifact, _) = ServingArtifact::build(
+        &directory.0.join("serving"),
+        &input,
+        &forest,
+        manifest,
+        serving_options(&backend),
+        1 << 20,
+    )
+    .unwrap();
+    let actual: Vec<_> = artifact
+        .reader()
+        .unwrap()
+        .map(|entry| entry.unwrap().key)
+        .collect();
+    let mut expected = Vec::new();
+    for id in ids {
+        let id = Bytes::copy_from_slice(id);
+        let index = manifest.logical_index_id();
+        for key in [
+            keys::record_key(index, &id),
+            keys::location_key(index, &id),
+            keys::payload_key(index, &id),
+        ] {
+            expected.push(Bytes::from(key.unwrap()));
+        }
+    }
+    expected.sort();
+    assert_eq!(&actual[..expected.len()], expected);
+    assert!(actual.windows(2).all(|pair| pair[0] < pair[1]));
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn encoded_artifact_verifies_and_matches_online_leaf_values_for_every_metric() {
     for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
         for keyed in [false, true] {
