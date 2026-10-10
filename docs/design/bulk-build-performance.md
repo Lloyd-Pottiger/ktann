@@ -1,12 +1,14 @@
 # Bulk Build Throughput Redesign
 
-Status: **Draft for the wider redesign.** Byte-preserving IO improvements are
-implemented; algorithm replacement and the end-to-end throughput target remain open.
-This document records qualified IO changes and proposes further work; the
-implemented lifecycle remains specified in
+Status: **Measured on RocksDB/Cohere1M; wider validation remains open.** The
+latest same-revision comparison observes 2.85–3.98x faster loading to Ready,
+with similar diagnostic query throughput around 95.3% recall. Larger-data,
+FoundationDB, other-CPU and broader quality/frontier validation remain open.
+Historical proposals and measurements are retained below; the implemented
+lifecycle remains specified in
 [Resumable Bulk Build](bulk-build.md) and ADRs 0027/0028.
 
-## Problem and evidence
+## Historical starting point (2026-10-07)
 
 Bulk Build must shorten the time from receiving input to a searchable index,
 while preserving index correctness and competitive search quality. Resumability
@@ -687,3 +689,146 @@ all-feature Clippy, formatting and diff checks pass. Fresh independent review
 found no actionable issues, including after the compact join was removed.
 Raw measurements, CPU sample, frozen-binary hashes, probe source, test logs and canonical
 reports are recorded under `.benchmark-data/results/bulk-serving-20261010/`.
+
+## Same-index memory diagnosis and online comparison (2026-10-10)
+
+This measurement-only follow-up tests production revision `2ead212`; it adds no
+production implementation or configuration change. All full runs use the same
+frozen bridge binary and dataset manifest on the Apple M1 Pro / 16 GiB host:
+RocksDB, Cohere1M, 768-dimensional cosine, one loader, batches of 50, and canonical
+VectorDBBench concurrency 1/5/10/20 for 30 seconds each. Shared Runtime and backend
+settings match, including eight maintenance workers and the 4 GiB partition
+cache. Bulk retains its separate 256 MiB construction and 128 MiB Serving working
+budgets. These budgets are not a process-RSS ceiling.
+
+### Complete load, including structural readiness
+
+The full runs occurred serially in Bulk A / online / Bulk B order, with diagnostic
+work between runs. No build or other benchmark overlapped a timed run. Online is
+the current direct `batch_mutate` path under ADR 0025. Both modes complete the
+same bounded Header readiness audit: one million records, no actionable or
+transitional partitions, and maximum leaf size at most 512. This audit does not
+claim global clustering optimality or replace a full backend integrity check.
+
+| Canonical metric | Bulk A | Online batches | Bulk B |
+| --- | ---: | ---: | ---: |
+| Receipt / insertion (s) | 57.703 | 266.447 | 53.576 |
+| Optimize to Ready (s) | 176.092 | 663.543 | 272.327 |
+| Complete load to Ready (s) | 233.795 | 929.989 | 325.902 |
+| Recall@100, beam 128 | 0.8907 | 0.8848 | 0.8907 |
+| Maximum canonical QPS, beam 128 | 270.422 | 309.326 | 262.525 |
+| Serial p95 (ms) | 30.4 | 25.1 | 25.5 |
+| Sampled full-run RSS peak (GB, decimal) | 1.899 | 5.155 | 1.690 |
+
+Both bulk source manifests are byte-identical. The observed load-time ratio is
+**2.85–3.98x** in Bulk's favor. The sizable difference between the two identical
+bulk runs is retained rather than selecting the faster run. There is only one
+new online run; these observations are not confidence intervals or a universal
+speed guarantee. Earlier historical online results used different revisions
+and completion behavior and are not the baseline for this ratio.
+
+RSS is sampled every 250 ms in the bridge process. The table excludes subsequent
+`vmmap`/heap inspection and includes all canonical query phases; it is neither a
+build-only measurement nor a live-allocation total. Full native bridge shutdown
+summaries are unavailable because the dedicated processes were terminated after
+queries to preserve their databases for exact-index replay. The first wrapper
+also made an unsupported post-run diagnostic request: upstream VectorDBBench
+had already completed successfully, but that wrapper exited with an error. Its
+canonical JSON and continuous samples remain valid; the capture failure and
+missing native summary are recorded explicitly. The subsequent wrappers exit
+successfully and verify Ready through the supported health operation.
+
+### Comparable query quality
+
+A separate diagnostic reopens the exact completed indices, checks their Header
+readiness, and evaluates every one of the 1,000 ground-truth queries at common
+beams on Bulk A and online. A final Bulk B check at beam 256 reproduces every
+Bulk A result hash at that beam. Other search/runtime settings match. Query beam does not affect build
+inputs or construction, so calibration does not rebuild either index.
+
+| Beam | Bulk Recall@100 | Online Recall@100 | Bulk fixed-count QPS | Online fixed-count QPS |
+| --- | ---: | ---: | ---: | ---: |
+| 128 | 0.89074 | 0.88483 | — | — |
+| 192 | 0.93123 | 0.92455 | — | — |
+| 256 | 0.95341 | 0.94551 | 141.42 | 160.93 |
+| 288 | 0.96083 | 0.95306 | 118.49 | 138.84 |
+
+The throughput columns use 4,000 fixed queries at concurrency 20, after the
+1,000-query evaluation warms the cache, with identical per-worker query
+assignments. They are diagnostic fixed-count timings, separate from canonical
+VectorDBBench QPS. At approximately **95.3% recall**, Bulk with beam 256 reaches
+**141.42 QPS** and online with beam 288 reaches **138.84 QPS**. Their recalls differ
+by 0.035 percentage points. This supports similar query throughput in this
+quality neighborhood; it does not establish a query speedup or an optimal ANN
+frontier. The differing beams are explicit. At equal beam, Bulk has higher recall
+and lower measured throughput; the default-beam QPS gap alone is not a
+matched-quality comparison.
+
+### What the query-memory measurements establish
+
+The controlled replay changes the SHA dependency between 0.10.9 and 0.11 while
+keeping the query implementation, persisted index, query assignments, counts,
+and concurrency phases fixed. Each variant runs 19,000 queries: a serial
+1,000-query warmup, then concurrency 1/5/10/20, including three repeated
+4,000-query rounds at concurrency 20. A separate cold-cache variant starts
+concurrency 20 immediately and repeats the same 1,000-query corpus three times.
+All 41,000 result hashes match the same query reference; backend mutation counts
+remain zero.
+
+| Diagnostic process | Cache bytes (MB) | Final live malloc bytes (MB) | Final malloc-reserved bytes (MB) | Native peak RSS (MB) |
+| --- | ---: | ---: | ---: | ---: |
+| SHA 0.10.9, fixed 19K queries | 886.435 | 1106.626 | 1358.971 | 1354.007 |
+| SHA 0.11, fixed 19K queries | 886.435 | 1106.643 | 1363.165 | 1285.587 |
+| SHA 0.11, cold concurrency 20, 3K queries | 886.435 | 1106.633 | 1400.914 | 1392.919 |
+
+MB here is decimal. The cache and live heap plateau after warmup. The paired
+final allocator-reserved sizes differ by 4 MiB, while their live allocations
+differ by about 17 KB. This does not reproduce a SHA-upgrade query-heap
+regression or per-query live-heap accumulation in the tested workload. The
+lower RSS of one replay is not a memory-optimization claim: `vmmap` also records
+compressed/swapped pages, and reserved, live, and resident bytes are distinct.
+The cold concurrent first round performs 702 additional scans and reads about
+56.13 MB more than the serial warmup. Its increased peak and reserved space
+support concurrent cold-cache loading as one transient-memory contributor.
+A diagnostic allocator pressure-relief request reports zero bytes released and
+does not reduce the reserved-byte count; no allocator-release workaround remains.
+
+The final full Bulk B process and a fresh process reopening **that same database**
+provide a second control. After 1,000 queries, the reopen reproduces the reference
+results and performs no writes. The native heap census falls from
+**1,254,773,728 to 1,106,592,288 live bytes**, a difference of **148,181,440 bytes**.
+The heap reports show **141 allocations of 1 MiB disappearing**, which account
+for almost all of that difference, and three `rocksdb::MemTable` objects becoming
+one. The saved RocksDB options specify 1 MiB arena blocks and a **128 MiB write
+history target**. RocksDB 10.4.2's `OptimisticTransactionDB::Open` enables this
+history by default; `max_write_buffer_size_to_maintain` retains flushed memtables
+for transaction conflict checking. The heap/configuration evidence is consistent
+with retained write history and active memtable storage after loading. Shrinking
+that history is not a free query-memory optimization: insufficient history can
+cause optimistic commit failures.
+
+The same full-process `vmmap` reports `262.6M` of malloc-zone dirty-plus-swapped
+fragmentation, versus `107.4M` after reopening. Thus the full pipeline's footprint
+includes load-lifetime backend state and allocator fragmentation in addition to
+the stable query cache. These controls identify substantial contributors; they
+do **not** uniquely assign every byte of the earlier 1.87 GB versus 1.24–1.57 GB
+historical peak difference. They also do not establish process-memory parity
+across complete builds. No leak fix, cache-budget change, memtable-history
+reduction, or allocator tuning was introduced on this evidence.
+
+The temporary reopen, cache-gauge and malloc probes remain in separate diagnostic
+patches and executables; none is retained in production source. The restored production bridge rebuild has the exact frozen
+binary SHA-256 used in all three canonical runs. The final checks cover three
+successful upstream cases, identical binary/dataset/source identities, 41K
+same-index query comparisons, another 1K final-rebuild comparisons, and 25K
+quality-calibration queries (including the Bulk B beam-256 check). Production Rust and dependency files are unchanged;
+this follow-up adds documentation only. Larger-than-memory datasets,
+FoundationDB, other CPUs, repeated online runs, and broader quality/frontier
+validation remain open.
+
+Raw canonical JSON, RSS traces, heap/vmmap output, RocksDB options, frozen binary
+hashes, diagnostic source/patches and verification scripts are retained under
+`.benchmark-data/results/bulk-memory-import-20261010/`. `verification.json` and
+`memory-verification.json` record the cross-run checks; `summary.json` contains
+normalized measurements. The first bulk database was reclaimed only after all
+of its diagnostic runs, preserving its source manifest and every report.
