@@ -103,3 +103,6 @@ reclaims orphaned owned files. Manual completion remains available.
 Receipt-time preparation can be passed with `run_worker_with_prepared_input`.
 It is a volatile optimization: its source identity, configuration, and options
 are checked before use; recovery recomputes it from the sealed Input Snapshot.
+
+Measured throughput, search quality, and evidence limits are recorded in
+[Bulk Build Performance](bulk-build-performance.md).

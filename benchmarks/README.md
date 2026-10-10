@@ -296,9 +296,9 @@ that cannot advance any selected source waits one second. This recovers cold wor
 receiving split destinations are not scheduled independently. These steps are
 separate from measured searches.
 
-Protocol version 2 uses a four-byte big-endian frame length over a Unix socket,
+Protocol version 1 uses a four-byte big-endian frame length over a Unix socket,
 at most 8 MiB per frame and at most 128 connections. Control/search requests and
-responses are JSON. Inserts carry `KTI` plus byte version 2, big-endian u32 record
+responses are JSON. Inserts carry `KTI` plus byte version 1, big-endian u32 record
 count and dimension, then little-endian i64 IDs and row-major little-endian f32
 vectors. JSON inserts are rejected; client and bridge must be updated together.
 Inserts commit at most 50 records per batch and wait for the atomic batch result
