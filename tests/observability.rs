@@ -158,7 +158,7 @@ fn has_series(series: &[(String, Vec<(String, String)>)], name: &str, labels: &[
 }
 
 /// The full audit battery: success, failure, corruption, retry, cancellation,
-/// import, verification, and maintenance paths, all under canary data.
+/// batch mutation, verification, and maintenance paths, all under canary data.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redaction_audit_covers_all_paths() {
     let _serialize = audit_lock().await;
@@ -171,7 +171,6 @@ async fn redaction_audit_covers_all_paths() {
         backend.clone(),
         RuntimeConfig::default()
             .with_maintenance(1, 16)
-            .and_then(|config| config.with_import_limits(1, 2))
             .expect("valid runtime config"),
     )
     .expect("runtime");
@@ -224,21 +223,12 @@ async fn redaction_audit_covers_all_paths() {
         .await
         .expect("batch get");
 
-    // Import Session backpressure: one in-flight slot, two batches.
-    let mut session = index
-        .import_session(Default::default())
-        .expect("import session");
-    session
-        .submit(vec![Mutation::Insert(record(10, 7))])
-        .await
-        .expect("submit first batch");
-    session
-        .submit(vec![Mutation::Insert(record(11, 7))])
-        .await
-        .expect("submit second batch");
-    let results = session.finish().await;
-    assert_eq!(results.len(), 2);
-    assert!(results[0].result.is_ok() && results[1].result.is_ok());
+    for id in [10, 11] {
+        index
+            .batch_mutate(vec![Mutation::Insert(record(id, 7))])
+            .await
+            .expect("batch");
+    }
 
     // One search may rediscover threshold-crossing leaves; let every offered
     // Fixup finish so partition epochs are stable for the cached search.
@@ -472,8 +462,6 @@ async fn redaction_audit_covers_all_paths() {
     );
     has_series(&series, "ktann.fixup.drain.entries", &[("kind", "split")]);
     has_series(&series, "ktann.fixup.state_age", &[("kind", "split")]);
-    has_series(&series, "ktann.import.wait", &[("gate", "in_flight_slot")]);
-    has_series(&series, "ktann.import.wait", &[("gate", "backlog")]);
     has_series(&series, "ktann.verify.reports", &[("outcome", "complete")]);
     has_series(
         &series,

@@ -139,12 +139,8 @@ pub struct Configuration {
     pub measured_operations: usize,
     /// Requested result count.
     pub k: usize,
-    /// Records submitted in each Import Session batch, when applicable.
+    /// Records submitted in each direct batch, when applicable.
     pub import_batch_size: Option<usize>,
-    /// Maximum concurrently executing Import Session batches, when applicable.
-    pub import_max_in_flight_batches: Option<usize>,
-    /// Fixup backlog watermark gating Import Session submission, when applicable.
-    pub import_backlog_watermark: Option<usize>,
 }
 
 /// Configuration and effective limit for one public Search Budget dimension.
@@ -268,7 +264,7 @@ impl PartitionStateCounts {
 pub enum ReportMeasurements {
     /// Existing steady-state or mixed-workload measurements.
     SteadyState(Box<SteadyStateMeasurements>),
-    /// Import-to-search lifecycle phase measurements.
+    /// Load-to-search lifecycle phase measurements.
     Lifecycle(Box<LifecycleMeasurements>),
     /// Ordered single-variable ANN quality points over one converged index.
     QualitySweep(Box<QualitySweepMeasurements>),
@@ -375,7 +371,7 @@ pub struct LifecycleMeasurements {
     pub case_backend_io: BackendIo,
     /// Import submission and accepted-batch completion.
     pub import: ImportPhase,
-    /// First fixed query pass immediately after Import Session finish.
+    /// First fixed query pass immediately after direct batch completion.
     pub immediate_search: SearchPhase,
     /// Public-API-driven, verified topology stabilization.
     pub convergence: ConvergencePhase,
@@ -490,12 +486,12 @@ pub struct MaintenanceSummary {
     pub backlog_at_end: usize,
 }
 
-/// Import Session results from first submission through `finish`.
+/// Direct batch results from first submission through the last completion.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ImportPhase {
-    /// Resources charged through completion of `ImportSession::finish`.
+    /// Resources charged through completion of all direct batches.
     pub resources: PhaseResources,
-    /// Batches for which `submit` returned a Batch Token.
+    /// Batches submitted through `Index::batch_mutate`.
     pub submitted_batches: u64,
     /// Submitted batches whose ordinary atomic mutation completed successfully.
     pub accepted_batches: u64,
@@ -503,11 +499,11 @@ pub struct ImportPhase {
     pub accepted_records: u64,
     /// Successful accepted records per import wall second.
     pub records_per_second: f64,
-    /// End-to-end `submit` latency, including in-flight and backlog gates.
+    /// End-to-end atomic batch latency, including Runtime admission.
     pub submit_latency_ms: Distribution,
     /// Failed submissions and accepted batch outcomes by stable error category.
     pub batch_failures: BTreeMap<String, u64>,
-    /// Backend and Import Session gate wait distributions.
+    /// Backend admission wait distributions.
     pub admission: AdmissionSummary,
 }
 
@@ -556,7 +552,7 @@ pub struct SearchTruncation {
 pub struct ConvergencePhase {
     /// Resources charged after immediate search while actively converging.
     pub resources: PhaseResources,
-    /// Elapsed wall time from Import Session finish through stable verification.
+    /// Elapsed wall time from direct batch completion through stable verification.
     pub from_import_finish_seconds: f64,
     /// Time spent waiting for the pending-plus-running Fixup backlog to drain.
     pub maintenance_drain_seconds: f64,
@@ -778,10 +774,6 @@ pub struct AdmissionSummary {
     pub blocking_wait_ms: Distribution,
     /// RocksDB native actor hold time, milliseconds.
     pub blocking_held_ms: Distribution,
-    /// Import gate waits, milliseconds, by gate.
-    pub import_wait_ms: BTreeMap<String, Distribution>,
-    /// Learned concurrency limit after each adjustment, by direction.
-    pub import_concurrency_limit: BTreeMap<String, Distribution>,
 }
 
 /// Backend-neutral attempted logical KV work.

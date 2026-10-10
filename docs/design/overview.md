@@ -6,6 +6,10 @@ Detailed contracts live in the module designs linked below. Domain terms are
 defined in [`CONTEXT.md`](../../CONTEXT.md); rationale for hard-to-reverse choices
 is recorded in [`docs/adr`](../adr/).
 
+[Resumable Bulk Build](bulk-build.md) constructs an initial index from an
+immutable Input Snapshot. It reserves a hidden Building Logical Index, prepares
+and loads complete serving data, then validates and atomically publishes it.
+
 ## 1. Purpose
 
 KTANN is an asynchronous Rust library that stores source vectors and their
@@ -24,6 +28,8 @@ their physical keyspaces are neither portable nor mutually compatible.
   membership and affected metadata.
 - Support insert, replacement upsert, delete, and atomic mutation batches while
   the index remains searchable.
+- Support resumable initial construction with bounded resources and atomic
+  publication of a validated index.
 - Maintain split and merge topology asynchronously without a durable work queue,
   leader, lease, or unsearchable committed state.
 - Support Tree Key routing and SQL `WHERE`-style typed predicates. Every returned
@@ -46,13 +52,14 @@ their physical keyspaces are neither portable nor mutually compatible.
 - Online migration of schema, metric, dimension, Tree Key, quantizer, or
   persistent format.
 - Redis, durable maintenance jobs, repair on read, automatic repair, or
-  bulk-build generations, or staging indexes.
+  replacing an Active index through a staged generation.
 - Compatibility with any implementation predating the first stable format.
 
 ## 4. Authoritative invariants
 
-1. Every Vector Record has exactly one Record Location and one corresponding
-   Leaf Entry in each committed state.
+1. Every Vector Record in an Active Logical Index has exactly one Record
+   Location and one corresponding Leaf Entry in each committed state. Building
+   data remains inaccessible until sealed validation and publication.
 2. A foreground mutation atomically changes the Vector Record, Record Location,
    Leaf Entry, exact Partition Header counts, and affected Partition Synopses.
 3. Every ordinary non-root partition has exactly one incoming Child Entry. The
@@ -62,7 +69,7 @@ their physical keyspaces are neither portable nor mutually compatible.
    exact counts and cache epochs, and, for a leaf entry, changes Record Location.
 5. Partition Header count is exact. A zero count is sufficient to complete
    structural removal; completion does not rescan to prove emptiness.
-6. Every committed topology state is searchable. A cold intermediate state may
+6. Every committed Active topology state is searchable. A cold intermediate state may
    remain until a later relevant access rediscovers it.
 7. A Partition Synopsis is conservative. `NoMatch` proves no entry can satisfy
    the predicate; `AllMatch` proves every entry does. Every schema field,
@@ -98,7 +105,7 @@ CI both follow stable. Production code uses no nightly features.
 | [Storage](storage.md) | backend transaction contract, logical keys/codecs, typed atomic operations, manifests |
 | [Search](search.md) | numeric semantics, RaBitQ7, predicates, Tree Key planning, traversal, rerank, cache correctness |
 | [Maintenance](maintenance.md) | foreground routing and mutation protocol, tree shape, split/merge state machines |
-| [Runtime and operations](runtime-operations.md) | admission, retry scheduling, shutdown, import, observability, verification and validation |
+| [Runtime and operations](runtime-operations.md) | admission, retry scheduling, shutdown, batch loading, Bulk Build scheduling, observability, verification and validation |
 
 Backend crates own transaction mechanics, physical prefixes, backend limits,
 error classification, and declared capabilities. They do not specialize index
@@ -153,7 +160,7 @@ state may attempt a bounded fixup; no process owns the state. Completion removes
 obsolete data using transactional range clear when supported, otherwise using
 paged point deletion before the final topology switch.
 
-### 6.5 Shutdown and import
+### 6.5 Shutdown and loading
 
 Runtime shutdown stops new admission and waits for already admitted foreground
 operations and commits. Those operations retain their real results, including
@@ -166,12 +173,10 @@ cleanup, so successful Runtime shutdown permits immediate database reopen or
 teardown. Direct adapter users consume `RocksDbBackend` with its asynchronous
 shutdown for the same guarantee; transaction-handle Drop remains nonblocking.
 
-An Import Session accepts ordinary atomic mutation batches under adaptive,
-bounded concurrency and maintenance backpressure. It learns useful concurrency
-from actual retryable contention rather than scanning tree topology. `submit` returns a process-local
-Batch Token after admission. `finish` waits for accepted work and returns batch
-results in submission order. No import state is persistent and no whole import
-is atomic.
+Online loaders submit ordinary atomic mutation batches with explicit bounded
+concurrency and handle each result. Repository loaders submit sequentially.
+There is no session-level admission or completion protocol and no whole-load
+atomicity; see [ADR 0022](../adr/0022-resumable-bulk-build.md).
 
 ### 6.6 Drop and verify
 

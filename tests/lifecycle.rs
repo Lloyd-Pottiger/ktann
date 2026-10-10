@@ -768,3 +768,210 @@ fn index_handle_is_send_and_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<ktann::api::Index<MemoryBackend>>();
 }
+
+fn bulk_options(config: &IndexConfig) -> ktann::bulk::ConstructionOptions {
+    ktann::bulk::ConstructionOptions {
+        min_partition_entries: config.min_partition_entries(),
+        max_partition_entries: config.max_partition_entries(),
+        sample_items: 8,
+        memory_bytes: 16 * 1024 * 1024,
+        scratch_bytes: 16 * 1024 * 1024,
+    }
+}
+
+struct BulkSource(std::path::PathBuf);
+impl BulkSource {
+    fn new() -> (Self, ktann::bulk::InputSnapshot) {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "ktann-reservation-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let input =
+            ktann::bulk::InputSnapshot::create(&path, config(), 1024 * 1024, std::iter::empty())
+                .unwrap();
+        (Self(path), input)
+    }
+}
+impl Drop for BulkSource {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bulk_reservation_reopens_blocks_serving_and_never_retargets_abort() {
+    use ktann::api::BulkBuildStatus;
+    for backend_config in [clear_config(), paged_config(4)] {
+        let shared = backend(backend_config);
+        let runtime = make_runtime(shared.clone());
+        let (source, input) = BulkSource::new();
+        let options = bulk_options(&config());
+        let job = runtime
+            .start_bulk_build("bulk", &input, options)
+            .await
+            .unwrap();
+        assert_eq!(job.status().await.unwrap(), BulkBuildStatus::Preparing);
+        assert_eq!(
+            runtime.open_index("bulk").await.unwrap_err().kind(),
+            ErrorKind::IndexBuilding
+        );
+        assert_eq!(
+            runtime
+                .create_index("bulk", config())
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::IndexBuilding
+        );
+        let repeated = runtime
+            .start_bulk_build("bulk", &input, options)
+            .await
+            .unwrap();
+        assert_eq!(job.logical_index_id(), repeated.logical_index_id());
+        let mut other = options;
+        other.sample_items += 1;
+        assert_eq!(
+            runtime
+                .start_bulk_build("bulk", &input, other)
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::IndexAlreadyExists
+        );
+        runtime.shutdown().await.unwrap();
+        let reopened_runtime = make_runtime(shared.clone());
+        let reopened = reopened_runtime.open_bulk_build("bulk").await.unwrap();
+        assert_eq!(job.logical_index_id(), reopened.logical_index_id());
+        assert_eq!(reopened.descriptor().input(), input.manifest());
+        reopened.abort().await.unwrap();
+        assert_drop_complete(&shared, &name("bulk")).await;
+        assert_eq!(reopened.status().await.unwrap(), BulkBuildStatus::Aborted);
+        assert!(source.0.join("data.bin").exists());
+        let replacement = reopened_runtime
+            .create_index("bulk", config())
+            .await
+            .unwrap();
+        assert_ne!(replacement.logical_index_id(), reopened.logical_index_id());
+        reopened.abort().await.unwrap();
+        assert_eq!(
+            reopened_runtime
+                .open_index("bulk")
+                .await
+                .unwrap()
+                .logical_index_id(),
+            replacement.logical_index_id()
+        );
+        assert_eq!(read_allocator(&shared).await, 2);
+        reopened_runtime.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bulk_reservation_commit_recovery_and_validation_are_atomic() {
+    for fault in [
+        CommitFault::Abort,
+        CommitFault::UnknownApplied,
+        CommitFault::UnknownNotApplied,
+    ] {
+        let shared = backend(no_clear_config());
+        let runtime = make_runtime(shared.clone());
+        let (_source, input) = BulkSource::new();
+        let options = bulk_options(&config());
+        let mut invalid = options;
+        invalid.memory_bytes = 1;
+        assert_eq!(
+            runtime
+                .start_bulk_build("bulk", &input, invalid)
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidArgument
+        );
+        assert_eq!(read_allocator(&shared).await, 0);
+        shared.set_fault_plan(vec![fault]).unwrap();
+        let started = runtime.start_bulk_build("bulk", &input, options).await;
+        if matches!(fault, CommitFault::UnknownNotApplied) {
+            assert_eq!(started.unwrap_err().kind(), ErrorKind::CommitOutcomeUnknown);
+            assert_eq!(read_allocator(&shared).await, 0);
+            assert_eq!(
+                runtime.open_bulk_build("bulk").await.unwrap_err().kind(),
+                ErrorKind::IndexNotFound
+            );
+        } else {
+            let job = started.unwrap();
+            assert_eq!(job.logical_index_id(), id(1));
+            assert_eq!(
+                runtime.open_bulk_build("bulk").await.unwrap().descriptor(),
+                job.descriptor()
+            );
+            shared
+                .set_fault_plan(vec![CommitFault::UnknownApplied])
+                .unwrap();
+            job.abort().await.unwrap();
+        }
+        runtime.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bulk_controls_and_published_abort_preserve_identity() {
+    let shared = backend(no_clear_config());
+    let runtime = make_runtime(shared.clone());
+    let (_source, input) = BulkSource::new();
+    let cancelled = tokio_util::sync::CancellationToken::new();
+    cancelled.cancel();
+    let control = ktann::api::OperationOptions::default().with_cancellation(cancelled);
+    assert_eq!(
+        runtime
+            .start_bulk_build_with_control("bulk", &input, bulk_options(&config()), control.clone())
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Cancelled
+    );
+    assert_eq!(read_allocator(&shared).await, 0);
+    let job = runtime
+        .start_bulk_build("bulk", &input, bulk_options(&config()))
+        .await
+        .unwrap();
+    assert_eq!(
+        job.abort_with_control(control).await.unwrap_err().kind(),
+        ErrorKind::Cancelled
+    );
+    assert_eq!(
+        job.status().await.unwrap(),
+        ktann::api::BulkBuildStatus::Preparing
+    );
+    // Simulate the future publisher's lifecycle transition to exercise the
+    // abort guard independently of the unimplemented data-loading protocol.
+    let manifest = read_manifest(&shared, &name("bulk")).await.unwrap();
+    let mut txn = WriteLogicalTxn::bootstrap(
+        shared.begin_write().await.unwrap(),
+        shared.hard_limits(),
+        shared.admission_budget(),
+    );
+    txn.put(
+        keys::LogicalKey::Manifest(job.logical_index_id()),
+        PersistentValue::IndexManifest(manifest.with_lifecycle(IndexLifecycle::Active)),
+    )
+    .await
+    .unwrap();
+    txn.commit().await.unwrap();
+    assert_eq!(
+        job.status().await.unwrap(),
+        ktann::api::BulkBuildStatus::Published
+    );
+    assert_eq!(
+        job.abort().await.unwrap_err().kind(),
+        ErrorKind::InvalidArgument
+    );
+    assert_eq!(
+        runtime.open_index("bulk").await.unwrap().logical_index_id(),
+        job.logical_index_id()
+    );
+    runtime.drop_index("bulk").await.unwrap();
+    assert_drop_complete(&shared, &name("bulk")).await;
+    runtime.shutdown().await.unwrap();
+}

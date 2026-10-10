@@ -126,14 +126,12 @@ These import options apply to `--profile large` or an explicitly selected
 | Option | Meaning |
 | --- | --- |
 | `--maintenance-workers N` | Import Runtime maintenance workers; zero is allowed |
-| `--import-max-in-flight-batches N` | Positive Import Session concurrency ceiling |
 | `--import-batch-size N` | Positive records per atomic batch |
-| `--import-backlog-watermark N` | Positive process-local Fixup Backlog watermark |
 
 After immediate search, the lifecycle runner reopens the Logical Index with
 its configured convergence workers, allowing an import with maintenance disabled
-to reach the stable search phases. Import Sessions adapt concurrency below the
-configured ceiling; see [ADR 0022](../docs/adr/0022-feedback-controlled-import-admission.md).
+to reach the stable search phases. Online loads submit batches sequentially; see
+[ADR 0022](../docs/adr/0022-resumable-bulk-build.md).
 
 ## Measurements
 
@@ -205,9 +203,9 @@ operations; full measures 2,000. Runs outside this region fail validation.
 
 Each lifecycle worker creates a fresh Backend Namespace and Logical Index and
 prepares its dataset, requests, and exact oracle before timing. The continuous
-case starts before the first `ImportSession::submit` and ends after warmed search:
+case starts before the first direct `batch_mutate` call and ends after warmed search:
 
-1. `import` ends after `ImportSession::finish` and includes concurrent maintenance.
+1. `import` ends after completion of all direct batch calls and includes concurrent maintenance.
    Finish is a batch-outcome barrier, not a topology-convergence barrier. The
    scenario fails unless every submitted record is accepted.
 2. `immediate_search` runs the fixed queries before the runner drives convergence.
@@ -265,17 +263,33 @@ search, and signed 64-bit record IDs. Each record stores its ID in an `i64` filt
 field. Search accepts an optional inclusive `id_min` threshold, evaluated by the
 native exact predicate before candidate selection. This supports VectorDBBench
 Cohere 1M unfiltered, 1% excluded, and 99% excluded cases. The bridge uses the
-public IndexConfig, RuntimeConfig, and backend adapter defaults, including
-partition entries 64/512. Only an explicit client leaf-beam option overrides
-search defaults. Native diagnostics read the effective index and Runtime
-configuration without changing canonical VectorDBBench metrics. Bounded
-readiness probes used by Optimize are separate from measured searches.
+public IndexConfig and backend adapter defaults, including partition entries
+64/512. The bridge raises the Runtime foreground attempt limit from 8 to 32
+for finite imports contending with topology maintenance; fixup attempts and
+bounded backoff remain unchanged. Only an explicit client leaf-beam option
+overrides search defaults. Native diagnostics read the effective index and Runtime
+configuration without changing canonical VectorDBBench metrics. Optimize
+scans at most 262,144 allocated header slots per readiness round and advances
+at most 32 actionable split/merge sources through the existing bounded
+maintenance steps, alongside Runtime workers. Authority is re-read by each
+step. Successful steps immediately start another readiness round; a round
+that cannot advance any selected source waits one second. This recovers cold work without depending on approximate search routing;
+receiving split destinations are not scheduled independently. These steps are
+separate from measured searches.
 
-Protocol version 1 uses length-prefixed JSON over a Unix socket: a four-byte
-big-endian length, at most 8 MiB per frame, and at most 128 connections. Inserts
-commit at most 50 records per batch and finish the Import Session before success.
+Protocol version 1 uses a four-byte big-endian frame length over a Unix socket,
+at most 8 MiB per frame and at most 128 connections. Control/search requests and
+responses are JSON. Inserts carry `KTI` plus byte version 1, big-endian u32 record
+count and dimension, then little-endian i64 IDs and row-major little-endian f32
+vectors. JSON inserts are rejected; client and bridge must be updated together.
+Inserts commit at most 50 records per batch and wait for the atomic batch result
+before success in online mode. Bulk receipt acknowledges capture of the batch;
+it is not per-batch durability or a published index.
 Do not automatically replay unknown outcomes. Optimize verifies the exact record
 count and waits for no actionable or transitional partitions within a deadline.
+Definitely aborted attempts may retry within the configured bound. Maintenance
+commit uncertainty is resolved by the next authority read; online insert
+commit uncertainty is returned to the caller.
 
 ```sh
 cargo build --release -p ktann-benchmarks --bin ktann-vdbbench-bridge
@@ -298,6 +312,55 @@ import, drops the Logical Index, and removes the socket. After a crash, confirm
 the old process has exited before removing its stale socket; startup never
 unlinks a preexisting socket.
 
+### Bulk Build through VectorDBBench
+
+Pass `--bulk-workspace /absolute/new/directory` to `ktann-vdbbench-bridge` to
+measure the core Bulk Build path. Use a fresh bridge, RocksDB directory and
+workspace for each case. The Python adapter and canonical runner remain unchanged.
+Insert requests stage bounded batches of original IDs/vectors; they do not write
+serving data. Optimize seals an InputSnapshot, reserves the Building index, calls
+`complete` to prepare, load, validate, and atomically activate the index.
+Search remains unavailable until publication and topology readiness succeed.
+
+The native report identifies `build_mode: bulk` and records input staging,
+snapshot creation, preparation/loading, and validation/publication/cleanup times.
+`committed_import_seconds` is null in this mode: canonical load time measures
+input receipt, while canonical load plus optimize/index time covers the build.
+Bulk receipt writes canonical source frames and their hashes directly through
+`PreparedInputWriter`, which also performs bounded receipt-time sorting,
+without a raw staging file or EOF rewrite. `snapshot_seconds`
+measures only final flush, fsync and sealing; record encoding/hashing is
+included in receipt. The source snapshot and report remain caller-owned;
+successful publication reclaims core attempts. Forest construction still begins
+after EOF seals the source; this is incremental input preparation, not streaming
+final tree assignment.
+Construction uses the index's min/max defaults, sample 256, 256 MiB tree memory,
+and 64 GiB tree scratch; the report records worker limits. No online insertion or
+post-build refinement is substituted into this path.
+
+For an online/bulk comparison, use the same release binary, dataset identity,
+backend settings, query set and concurrency. Run serially on an otherwise idle
+host with fresh database, socket and report locations. Enable
+`--bulk-workspace` only for the bulk case. The Cohere workload is:
+
+```sh
+vectordbbench ktann --socket-path /tmp/ktann-bench.sock \
+  --dataset-identity cohere-1m --case-type Performance768D1M \
+  --load-concurrency 1 --insert-batch-size 50 --k 100
+```
+
+Compare complete receive-to-Ready time and query latency/QPS at matched recall;
+equal beam does not imply equal quality. Record stage times, physical IO, scratch
+peak, CPU, page faults and RSS. Distinguish Ready RSS from the full-run peak, and
+fixed-query diagnostics from canonical timed QPS. Repeat both modes and include
+small/skewed inputs, long IDs and constrained-memory spill paths alongside the
+large dataset profiles.
+
+Keep measured reports under `.benchmark-data/results/`, with the source revision,
+binary hash, settings, dataset identity and raw evidence. Results apply to that
+configuration; a changed binary needs a new measurement. Local performance
+reports are not versioned design contracts or a universal speedup guarantee.
+
 ### Offline refinement after import
 
 Quality sweeps accept `--refinement-rounds 0..5`. Omit the flag for the ordinary
@@ -317,3 +380,32 @@ and search parameters; zero rounds is a centroid-recomputation control. Existing
 bulk-builder research measurements use a different initialization/publication
 pipeline and do not establish quality or performance for this API. Archive the
 executable and source/binary hashes before timing under the shared resource lock.
+
+## Complete Bulk Build probe
+
+`cargo run --release -p ktann-benchmarks --bin ktann-bulk-build -- <sift-directory> <new-output-directory> [record-limit]`
+
+The SIFT directory contains `sift_base.fvecs`, `sift_query.fvecs`, and
+`sift_groundtruth.ivecs`. Default count is 1,000,000. The probe streams a source
+snapshot, reserves a RocksDB index, runs preparation/loading, publishes through
+exact validation, checks point reads, and measures held-out top-10 queries.
+Official recall is reported only for the full population. `report.json` separates
+phase wall times, forest and serving scratch IO, construction seed, and query
+latency; use `/usr/bin/time -l` for process resource
+counts on macOS. Reports retain the source and RocksDB database, while successful
+publication reclaims worker-owned artifacts. Run on an idle host. The result
+does not establish distributed throughput or an online insertion speedup.
+
+Bulk Build bridge reports include `serving_detail` wall times for source
+sorting, topology sorting, exact joins/encoding, output merging, Synopsis
+reduction, and final emission/sealing, plus total and peak serving scratch bytes.
+`ready_peak_rss_bytes` captures the bridge process's resident-memory high-water
+mark immediately after successful publication and cleanup, before queries.
+The whole-run peak remains separate and may include later query cache growth.
+A resumed worker reports no detail for an already accepted serving artifact.
+
+Core and benchmark SHA-256 use sha2 0.11's default runtime CPU detection,
+including AArch64 SHA-2 instructions with a software fallback. Artifact framing,
+per-frame checksums, whole-file hashes and publication verification are unchanged.
+Performance comparisons must record the CPU architecture and resolved dependency
+versions; the gain from hardware hashing is platform dependent.

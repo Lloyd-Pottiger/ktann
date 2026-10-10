@@ -61,32 +61,43 @@ use crate::api::{Error, ErrorKind, MAX_ENCODED_SYNOPSIS_BYTES, Result};
 use super::keys::{LogicalKey, TreeKey};
 
 mod authority;
+mod build;
 mod data;
 mod entry;
 mod manifest;
+mod progress;
 mod record;
+mod schedule;
+pub(crate) mod source;
 mod synopsis;
 mod wire;
+mod workspace;
 
 #[doc(inline)]
 pub use authority::{
     PartitionCentroid, PartitionHeader, PartitionState, PartitionTransition, TreeManifest,
 };
 #[doc(inline)]
+pub use build::BuildDescriptor;
+#[doc(inline)]
 pub use entry::{ChildEntry, LeafEntry};
 #[doc(inline)]
 pub use manifest::{
     BloomParameters, IndexIdAllocator, IndexLifecycle, IndexManifest, IndexNameEntry,
 };
+pub use progress::{BuildPhase, BuildProgress};
 #[doc(inline)]
 pub use record::{OpaquePayload, RecordLocation, VectorRecord};
+pub use schedule::BuildSchedule;
 #[doc(inline)]
 pub use synopsis::{FieldSynopsis, PartitionSynopsis};
+pub use workspace::BuildWorkspace;
+pub(crate) use workspace::PreparedArtifact;
 
 use wire::{Decoder, Encoder};
 
 /// The persistent format version emitted and accepted by this build.
-pub const FORMAT_VERSION: u16 = 1;
+pub const FORMAT_VERSION: u16 = 2;
 
 /// The maximum encoded Opaque Payload size.
 pub const MAX_PAYLOAD_BYTES: usize = crate::api::MAX_PAYLOAD_BYTES;
@@ -115,7 +126,7 @@ pub(crate) fn leaf_relocation_value_sizes(
     })
 }
 
-const MAX_VALUE_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_VALUE_BYTES: usize = 1024 * 1024;
 const ROTATION_SEED_BYTES: usize = 32;
 
 const TAG_INDEX_ID_ALLOCATOR: u8 = 0x00;
@@ -131,11 +142,23 @@ const TAG_CHILD_ENTRY: u8 = 0x09;
 const TAG_LEAF_ENTRY: u8 = 0x0a;
 const TAG_PARTITION_SYNOPSIS: u8 = 0x0b;
 const TAG_PARTITION_STATE: u8 = 0x0c;
+const TAG_BUILD_DESCRIPTOR: u8 = 0x0d;
+const TAG_BUILD_WORKSPACE: u8 = 0x0f;
+const TAG_BUILD_SCHEDULE: u8 = 0x11;
+const TAG_BUILD_PROGRESS: u8 = 0x0e;
 
 /// The persistent value family expected at a logical key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ValueKind {
+    /// Immutable Bulk Build input and construction parameters.
+    BuildDescriptor,
+    /// Durable workspace ownership and preparation state.
+    BuildWorkspace,
+    /// Distributed scheduler lease.
+    BuildSchedule,
+    /// Atomic loading/validation progress.
+    BuildProgress,
     /// The namespace Logical Index ID allocator.
     IndexIdAllocator,
     /// An Index Name to Logical Index ID mapping.
@@ -167,6 +190,10 @@ pub enum ValueKind {
 impl ValueKind {
     const fn tag(self) -> u8 {
         match self {
+            Self::BuildDescriptor => TAG_BUILD_DESCRIPTOR,
+            Self::BuildWorkspace => TAG_BUILD_WORKSPACE,
+            Self::BuildSchedule => TAG_BUILD_SCHEDULE,
+            Self::BuildProgress => TAG_BUILD_PROGRESS,
             Self::IndexIdAllocator => TAG_INDEX_ID_ALLOCATOR,
             Self::IndexNameEntry => TAG_INDEX_NAME_ENTRY,
             Self::IndexManifest => TAG_INDEX_MANIFEST,
@@ -188,6 +215,14 @@ impl ValueKind {
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum PersistentValue {
+    /// Immutable Bulk Build input and construction parameters.
+    BuildDescriptor(BuildDescriptor),
+    /// Durable workspace ownership and preparation state.
+    BuildWorkspace(BuildWorkspace),
+    /// Durable automatic scheduling request.
+    BuildSchedule(BuildSchedule),
+    /// Atomic loading/validation progress.
+    BuildProgress(BuildProgress),
     /// The namespace Logical Index ID allocator.
     IndexIdAllocator(IndexIdAllocator),
     /// An Index Name directory mapping.
@@ -221,6 +256,10 @@ impl PersistentValue {
     #[must_use]
     pub const fn kind(&self) -> ValueKind {
         match self {
+            Self::BuildDescriptor(_) => ValueKind::BuildDescriptor,
+            Self::BuildWorkspace(_) => ValueKind::BuildWorkspace,
+            Self::BuildSchedule(_) => ValueKind::BuildSchedule,
+            Self::BuildProgress(_) => ValueKind::BuildProgress,
             Self::IndexIdAllocator(_) => ValueKind::IndexIdAllocator,
             Self::IndexNameEntry(_) => ValueKind::IndexNameEntry,
             Self::IndexManifest(_) => ValueKind::IndexManifest,
@@ -303,6 +342,10 @@ impl<'a> ValueCodec<'a> {
     pub fn encode(self, value: &PersistentValue) -> Result<Vec<u8>> {
         let mut encoder = Encoder::new(value.kind());
         match value {
+            PersistentValue::BuildDescriptor(value) => build::encode(&mut encoder, value)?,
+            PersistentValue::BuildWorkspace(value) => workspace::encode(&mut encoder, value)?,
+            PersistentValue::BuildSchedule(value) => schedule::encode(&mut encoder, value)?,
+            PersistentValue::BuildProgress(value) => progress::encode(&mut encoder, value)?,
             PersistentValue::IndexIdAllocator(value) => {
                 manifest::encode_index_id_allocator(&mut encoder, *value);
             }
@@ -380,6 +423,18 @@ impl<'a> ValueCodec<'a> {
         }
         let mut decoder = Decoder::framed(expected, bytes)?;
         let value = match expected {
+            ValueKind::BuildSchedule => {
+                PersistentValue::BuildSchedule(schedule::decode(&mut decoder)?)
+            }
+            ValueKind::BuildWorkspace => {
+                PersistentValue::BuildWorkspace(workspace::decode(&mut decoder)?)
+            }
+            ValueKind::BuildProgress => {
+                PersistentValue::BuildProgress(progress::decode(&mut decoder)?)
+            }
+            ValueKind::BuildDescriptor => {
+                PersistentValue::BuildDescriptor(build::decode(&mut decoder)?)
+            }
             ValueKind::IndexIdAllocator => PersistentValue::IndexIdAllocator(
                 manifest::decode_index_id_allocator(&mut decoder)?,
             ),
@@ -442,6 +497,10 @@ const fn value_kind_for_key(key: &LogicalKey) -> ValueKind {
         LogicalKey::IndexIdAllocator => ValueKind::IndexIdAllocator,
         LogicalKey::IndexNameDirectory(_) => ValueKind::IndexNameEntry,
         LogicalKey::Manifest(_) => ValueKind::IndexManifest,
+        LogicalKey::BuildDescriptor(_) => ValueKind::BuildDescriptor,
+        LogicalKey::BuildWorkspace(_) => ValueKind::BuildWorkspace,
+        LogicalKey::BuildSchedule(_) => ValueKind::BuildSchedule,
+        LogicalKey::BuildProgress(_) => ValueKind::BuildProgress,
         LogicalKey::Record { .. } => ValueKind::VectorRecord,
         LogicalKey::Location { .. } => ValueKind::RecordLocation,
         LogicalKey::Payload { .. } => ValueKind::OpaquePayload,

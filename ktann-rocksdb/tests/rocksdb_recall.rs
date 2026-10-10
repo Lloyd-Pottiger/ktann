@@ -53,3 +53,18 @@ async fn rocksdb_recall_matches_the_corpus_contract() {
         .expect("record survives reopen");
     runtime.shutdown().await.expect("shutdown");
 }
+
+#[path = "../../tests/support/bulk_load_adapter.rs"]
+mod bulk_load_adapter;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rocksdb_fenced_bulk_load_survives_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = Arc::new(open_database(&directory.path().join("database")));
+    let namespace = BackendNamespace::new("ktann-bulk-load-verify").unwrap();
+    bulk_load_adapter::exercise(
+        || RocksDbBackend::new(Arc::clone(&database), namespace.clone()),
+        directory.path(),
+    )
+    .await;
+}

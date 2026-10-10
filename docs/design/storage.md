@@ -139,7 +139,7 @@ fields, noncanonical values, nonzero padding, and trailing bytes.
 
 ## 6. Persistent values
 
-The Index Manifest stores the persistent format version (`FORMAT_VERSION = 1`),
+The Index Manifest stores the persistent format version (`FORMAT_VERSION = 2`),
 lifecycle state, immutable configuration, Logical Index ID, RaBitQ rotation
 seed, and exact Bloom parameters. The Persistent Format covers Logical Keys,
 stored values, adapter physical keys, and algorithms that determine persisted
@@ -248,3 +248,88 @@ Codec tests use golden bytes, ordering properties, malformed/noncanonical input,
 and cross-process deterministic vectors for rotation, Bloom, Tree Key, values,
 and RaBitQ7. Model tests assert that typed atomic operations preserve exact
 membership under conflicts and injected unknown outcomes.
+
+
+## 10. Bulk Build records
+
+Bulk Build reservations add lifecycle byte `2` (Building; Active remains `0`,
+Dropping `1`) and index-owned key kind `0x05` for the Build Descriptor. Descriptor
+value tag `0x0d` contains construction version u32, a length-prefixed absolute
+UTF-8 source path (maximum 4096 bytes), a length-prefixed 89-byte input artifact
+manifest, min/max entries u32, and sample/memory/scratch ceilings u64, all big
+endian. Bootstrap transactions may access the descriptor alongside the Manifest
+for atomic reservation. Serving transactions still validate an Active Manifest.
+See [ADR 0022](../adr/0022-resumable-bulk-build.md).
+
+The index-owned Build Progress key (`0x06`, value tag `0x0e`) stores one sized
+89-byte Serving Artifact manifest, a positive u64 load epoch, and a phase byte:
+
+- `0` Loading: u64 committed entries and a 32-byte artifact-prefix SHA-256.
+- `1` Loaded: no additional fields; the complete artifact was read through EOF.
+- `2` Validating: sized backend cursor (at most 16 KiB), u64 compared entries,
+  and a 32-byte artifact-prefix SHA-256.
+- `3` Validated: no additional fields; the backend scan and artifact EOF checks
+  both completed. Publication still requires an Active Manifest transaction.
+
+Unfinished counts cannot exceed the artifact count; zero entries require the
+artifact-header digest. Counts/digests alone never imply completion. Terminal
+phases derive their total count/digest from the artifact. These control bytes
+are validated but excluded from serving membership ledgers. Debug output redacts
+locators/cursors. Unknown phases, malformed/trailing bytes and unused key/value
+kinds fail closed. No compatibility layer is retained.
+See the implemented protocol in [Bulk Build](bulk-build.md).
+
+
+Namespace key `[0, 2] || LogicalIndexId:u64be` stores Build Workspace (tag `0x0f`).
+It survives index-prefix removal. Its canonical value contains a sized absolute
+UTF-8 root (at most 3900 bytes), nine u64 resource/admission/hard-limit values,
+a nonzero 32-byte ownership token, positive u64 epoch, two optional accepted
+artifact descriptors (flag, epoch, sized 89-byte manifest), and a bounded failure
+code. Accepted Forest/Serving kinds and epoch bounds are validated; Serving
+requires Forest. All integer encodings are big endian.
+
+See [ADR 0022](../adr/0022-resumable-bulk-build.md).
+
+
+Namespace key `[0,3] || LogicalIndexId:u64be` stores Build Schedule, tag `0x11`:
+sized UTF-8 Index Name (1..=255 bytes), the shared Worker Options encoding (sized
+root and seven u64 resource/admission values), a 32-byte owner token, and u64 UTC
+expiry milliseconds. Zero token means unowned; an unowned nonzero expiry is a
+retry delay. Nonzero owner requires nonzero expiry. The token and options are
+redacted in Debug. Index-bound transactions may access only their own namespace
+Build Schedule to protect mutations against automatic takeover. Queue removal
+is separate from index-prefix deletion. All values are canonical and reject
+truncation, trailing bytes, and invalid ownership encodings.
+
+## 11. Bulk Build files
+
+Input, Forest and Serving Artifacts use an independently versioned immutable
+file format. An 89-byte manifest contains eight magic/version bytes, a one-byte
+kind, a 32-byte binding, two big-endian u64s (item count and data-file bytes),
+and a 32-byte SHA-256. The data header repeats magic/kind/binding. Each bounded
+frame contains a big-endian u32 body length, body bytes and a body SHA-256.
+The manifest hashes the whole file; reordering valid frames fails verification.
+Paths are excluded from identity, so identical bytes may be relocated.
+
+- Input kind `0` preserves original-order records using canonical record,
+  vector and field primitives, payload presence and bounded payload bytes.
+  Its binding covers source schema shape. Metric, Tree Key field selection,
+  partition thresholds and Synopsis policy belong to the consuming index.
+- Forest kind `2` frames contain a u32 Tree Key length, canonical Tree Key and
+  partition plan. Plans encode key, level, count, full-f32 centroid and
+  length-prefixed entry identities. The binding covers the source identity,
+  ordered Tree Key field selection, metric, persisted seed, construction
+  version and resource options. Trees are canonical; partitions are ordered
+  child-before-parent with each root last.
+- Serving kind `3` frames contain a u32 key length, key bytes and value bytes.
+  Keys are strictly ordered and unique. The binding covers source/forest
+  identities, immutable Index Manifest, target hard limits and sort options.
+  Manifest, name mapping, allocator and build bookkeeping are excluded.
+
+Readers validate identity, canonical bodies, framing, count and whole-file EOF.
+Forest readers additionally check local allocation, occupancy and tree closure;
+Serving readers check index ownership, codecs, order and adapter limits. These
+checks prove file validity, not worker authority or complete backend contents.
+The [build protocol](bulk-build.md#artifact-sealing-and-workspace-ownership)
+owns sealing, acceptance and recovery; exact backend validation precedes
+publication.

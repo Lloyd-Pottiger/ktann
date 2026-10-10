@@ -5,10 +5,10 @@
 //! validation methods so callers can reject an operation before opening a
 //! storage transaction.
 
+mod bulk;
 mod config;
 mod error;
 mod identifiers;
-mod import;
 mod index;
 mod operation;
 mod record;
@@ -17,15 +17,17 @@ mod schema;
 mod search;
 mod verify;
 
+pub use bulk::{
+    BulkBuildJob, BulkBuildReport, BulkBuildStatus, BulkCleanupPage, BulkLoadOptions,
+    BulkSchedulerOptions, BulkWorkerOptions,
+};
 pub(crate) use config::MAX_DIMENSION;
 pub use config::{IndexConfig, RuntimeConfig};
 pub use error::{Error, ErrorKind, Result};
-pub use identifiers::{BatchToken, FieldId, IndexName, LogicalIndexId, PartitionKey};
-pub use import::ImportSession;
+pub use identifiers::{FieldId, IndexName, LogicalIndexId, PartitionKey};
 pub use index::Index;
 pub use operation::{
-    GetOptions, ImportBatchResult, ImportOptions, Mutation, MutationOutcome, OperationOptions,
-    UpsertResult, validate_mutations,
+    GetOptions, Mutation, MutationOutcome, OperationOptions, UpsertResult, validate_mutations,
 };
 pub(crate) use operation::{validate_id, validate_ids};
 pub use record::{PayloadProjection, Record, StoredRecord};

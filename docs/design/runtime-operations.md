@@ -1,7 +1,7 @@
-# Runtime, Import, Observability, and Verification
+# Runtime, Observability, and Verification
 
 This module owns process-local admission and lifecycle, maintenance scheduling,
-Import Sessions, observability/privacy, offline verification behavior, and the
+online loading, observability/privacy, offline verification behavior, and the
 whole-system validation matrix.
 
 ## 1. Runtime ownership
@@ -24,7 +24,7 @@ creating an unbounded process-local queue.
 
 Shutdown is idempotent:
 
-1. atomically stop new foreground, import, and maintenance admission;
+1. atomically stop new foreground and maintenance admission;
 2. cancel queued work that has not begun;
 3. wait for admitted foreground operations and detached commit completions;
 4. stop workers and release process-local resources.
@@ -87,47 +87,13 @@ progress: this is an assistance threshold, not task expiry or a lease.
 Later relevant access rediscovers deferred work; no timer schedules it.
 
 
-## 4. Import Session
+## 4. Online loading and refinement
 
-An Import Session is a non-cloneable process-local coordinator bound to one
-Index. `submit` applies ordinary batch validation, waits for an adaptive
-concurrency slot and backlog gate, admits exactly one ordinary atomic mutation
-operation, and returns a Batch Token. Tokens are monotonically increasing
-within the session and have no persistent or transaction identity.
-
-Each session starts with one active batch and treats the configured maximum
-in-flight value as a hard ceiling on accepted, nonterminal batches. Clean
-completions raise the learned active limit additively only while that limit is
-saturated and another submission is waiting. A retryable write conflict
-contracts it multiplicatively and releases the contended batch's active slot,
-waits for the process-local Fixup backlog to drain completely, and then gives
-the paused batch priority when reacquiring under the smaller limit before the
-next ordinary whole-operation attempt. Waiting for quiescence only after
-observed contention prevents one remaining hot Fixup from repeatedly
-conflicting with the same bounded retry. This feedback measures demonstrated
-write overlap, including data skew, Tree Key distribution, and concurrent
-Structure Maintenance. It does not scan, persist, or infer a partition count.
-The default backlog watermark is two, allowing one pending or running Fixup to
-coexist with ordinary import admission while pausing new admission before
-maintenance backlog grows further. Explicit overrides remain process-local
-tuning bounds.
-
-Accepted batches may execute concurrently within the learned limit. Their
-atomicity, retry, error, and maintenance behavior is identical to normal
-mutate. Import never splits or combines caller-submitted batches; batch size is
-part of the caller's atomicity and transaction-budget choice. `finish` closes admission,
-waits for all accepted tokens, and returns every batch result in submission
-order; a failed batch does not discard other known results. The caller can
-select the first failure if desired without losing outcome information.
-
-Dropping a session cancels batches not yet admitted to commit. Started commits
-remain owned by Runtime in-flight guards and finish without an Import Session
-observer. Import never claims a cluster-wide maintenance barrier or an atomic
-whole-import result.
-
-`finish` does not wait for the Runtime's maintenance backlog: batch outcomes are
-its complete contract, while process-local or cluster-wide topology convergence
-remains demand-driven and separately observable.
+Callers load records with ordinary `Index::batch_mutate` operations and bound
+concurrency explicitly. Repository consumers use sequential submission. Every
+batch retains ordinary admission, atomicity, bounded retry, cancellation, and
+unknown-commit behavior. There is no session-level scheduling, token, completion
+barrier, or Fixup Backlog gate; see [ADR 0022](../adr/0022-resumable-bulk-build.md).
 
 Offline `Index::refine` requires caller-exclusive access and settled Ready topology
 as specified in [the API contract](api.md). Admission rejects local queued or
@@ -140,7 +106,7 @@ outcome can leave a valid, partially refined index.
 
 KTANN emits through the `metrics` and `tracing` facades. Metric labels use
 only fixed categories: backend, operation, outcome, partition level/state, fixup
-kind, cache level/result, budget dimension, search/mutation stage, import gate, and
+kind, cache level/result, budget dimension, search/mutation stage, and
 verification issue kind. Raw Index Name, IDs, Tree Key, Record ID, field
 values, vector, and payload are forbidden labels.
 
@@ -153,7 +119,7 @@ rejection; whole write attempts, exact logical mutation work, commit wait,
 conflicts/retries, and commit unknown; logical budget use; cache bytes/results;
 maintenance admission, backlog, state-machine steps, drain batch sizes, retries,
 state age, and completion; Bloom saturation; RocksDB semaphore wait/blocking
-duration; and import backpressure. Names use one `ktann.*`
+duration. Names use one `ktann.*`
 namespace but individual metric names and span nesting are not public API.
 
 ## 6. Verification
@@ -223,3 +189,29 @@ benchmark-tunable implementation details.
 - Rollback means continuing to use an older separate Logical Index until a new
   one is validated and traffic is switched externally. The v1 format is never
   mutated backward in place.
+
+
+Bulk Build reservation, worker, load, publication, status, abort and cleanup use
+foreground operation control and bounded retry policies. Native construction and
+file IO run on blocking tasks with shared admission retained until actual exit,
+even when the awaiting future is cancelled. Running native stages are not
+preempted; subsequent admissions and checkpoints observe cancellation.
+
+Worker epochs fence accepted outputs; load epochs fence atomic KV checkpoints.
+Publication seals writers, resumes bounded exact validation, then atomically
+activates the original identity. Terminal failures persist; transient failures
+and cancellation remain resumable. Root advisory locks order native IO against
+reclamation. Busy cleanup is deferred; namespace cleanup pages discover orphaned
+workspaces after ordinary index deletion. See [Bulk Build](bulk-build.md).
+
+
+Automatic Bulk Build scheduling uses `schedule_bulk_build` for queue discovery,
+lease coordination and scheduled attempts. Its bounded JoinSet admits at most
+`max_jobs` per scheduler, additionally limited by shared foreground admission.
+Lease renewal runs inside the admitted attempt, without acquiring another
+foreground permit. Dropping the scheduler cancels child tasks; shutdown stops
+discovery and cancels active attempts. Native IO may outlive cancellation while
+retaining admission and file locks. Expired queue owners are replaceable by any
+participating Runtime; each build mutation transaction verifies the owner token.
+A failed job is durably inspectable and does not stop unrelated jobs. Invalid
+coordination state is surfaced rather than retried indefinitely.

@@ -490,6 +490,10 @@ fn process_item(
         ) => {
             topology.absorb_child_entry(cx, tree_key, *partition, *child);
         }
+        // Build metadata may survive publication. Its codec was validated
+        // above, but it participates in neither serving membership ledger.
+        (LogicalKey::BuildDescriptor(_), PersistentValue::BuildDescriptor(_))
+        | (LogicalKey::BuildProgress(_), PersistentValue::BuildProgress(_)) => {}
         // The Manifest was validated before the scan; namespace keys cannot
         // sort inside the index-owned range, and a successful typed decode
         // always yields the key's value family.

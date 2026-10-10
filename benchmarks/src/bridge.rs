@@ -6,11 +6,10 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use ktann::api::{
-    CompareOp, DataType, FieldId, FieldSchema, ImportOptions, Index, IndexConfig, Metric, Mutation,
-    OperationOptions, Predicate, Record, RuntimeConfig, SearchOptions, SearchRequest,
-    Value as FieldValue,
+    CompareOp, DataType, FieldId, FieldSchema, Index, IndexConfig, Metric, Mutation, Predicate,
+    Record, RuntimeConfig, SearchOptions, SearchRequest, Value as FieldValue,
 };
-use ktann::runtime::Runtime;
+use ktann::runtime::{RetryPolicy, Runtime};
 use ktann::storage::backend::Backend;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -23,9 +22,10 @@ use tokio_util::sync::CancellationToken;
 use crate::backend::{BackendCounters, MeasuredBackend};
 use crate::resource::ResourceSnapshot;
 
+mod bulk;
 mod topology;
 
-/// Wire frames are a big-endian u32 length followed by UTF-8 JSON.
+/// Length-prefixed frames carry JSON control requests or binary float32 inserts.
 const VERSION: u32 = 1;
 const MAX_FRAME: usize = 8 << 20;
 const MAX_BATCH: usize = 50;
@@ -39,6 +39,7 @@ struct Options {
     database: PathBuf,
     report: PathBuf,
     backend: String,
+    bulk_workspace: Option<PathBuf>,
 }
 
 /// Runs a single bridge until shutdown or SIGINT, then closes the Runtime.
@@ -52,6 +53,7 @@ pub fn run() -> Result<(), String> {
         database: PathBuf::new(),
         report: PathBuf::new(),
         backend: "rocksdb".into(),
+        bulk_workspace: None,
     };
     while let Some(arg) = args.next() {
         let value = args.next().ok_or(
@@ -62,6 +64,7 @@ pub fn run() -> Result<(), String> {
             "--database" => options.database = value.into(),
             "--report" => options.report = value.into(),
             "--backend" => options.backend = value,
+            "--bulk-workspace" => options.bulk_workspace = Some(value.into()),
             _ => return Err(format!("unknown argument {arg}")),
         }
     }
@@ -139,6 +142,7 @@ enum Operation {
         dataset: String,
         leaf_beam: Option<u32>,
     },
+    #[serde(skip_deserializing)]
     Insert {
         ids: Vec<i64>,
         vectors: Vec<Vec<f32>>,
@@ -156,16 +160,63 @@ enum Operation {
     Shutdown,
 }
 
+/// Binary inserts use KTI/version, big-endian count/dimension, then little-endian
+/// i64 IDs and row-major f32 values. Validate the entire shape before allocating.
+fn decode_request(data: &[u8]) -> Result<Request, String> {
+    if !data.starts_with(b"KTI") {
+        return serde_json::from_slice(data).map_err(|e| e.to_string());
+    }
+    if data.len() < 12 || &data[..4] != b"KTI\x01" {
+        return Err("invalid binary insert header or version".into());
+    }
+    let count = u32::from_be_bytes(data[4..8].try_into().unwrap()) as usize;
+    let dimension = u32::from_be_bytes(data[8..12].try_into().unwrap()) as usize;
+    if count == 0 || count > MAX_BATCH || dimension == 0 {
+        return Err("invalid binary insert shape".into());
+    }
+    let vector_bytes = dimension.checked_mul(4).ok_or("binary insert overflow")?;
+    let bytes = vector_bytes
+        .checked_add(8)
+        .and_then(|row| row.checked_mul(count))
+        .and_then(|body| body.checked_add(12))
+        .ok_or("binary insert overflow")?;
+    if data.len() != bytes {
+        return Err("binary insert length does not match shape".into());
+    }
+    let ids_end = 12 + count * 8;
+    let ids = data[12..ids_end]
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|id| i64::from_le_bytes(*id))
+        .collect();
+    let vectors = data[ids_end..]
+        .chunks_exact(vector_bytes)
+        .map(|row| {
+            row.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| f32::from_le_bytes(*v))
+                .collect()
+        })
+        .collect();
+    Ok(Request {
+        version: VERSION,
+        operation: Operation::Insert { ids, vectors },
+    })
+}
+
 /// Lifecycle state is exclusive for mutation and shared for concurrent search.
 struct State<B: Backend> {
     index: Option<Index<MeasuredBackend<B>>>,
+    bulk: Option<bulk::InputCapture>,
+    bulk_report: Value,
     ready: bool,
     records: u64,
     dimension: usize,
     metric: String,
     dataset: String,
     search: SearchOptions,
-    root_probe: Option<Arc<[f32]>>,
     started: Option<Instant>,
     insert_seconds: f64,
     optimize_seconds: f64,
@@ -176,13 +227,14 @@ impl<B: Backend> Default for State<B> {
     fn default() -> Self {
         Self {
             index: None,
+            bulk: None,
+            bulk_report: Value::Null,
             ready: false,
             records: 0,
             dimension: 0,
             metric: String::new(),
             dataset: String::new(),
             search: SearchOptions::default(),
-            root_probe: None,
             started: None,
             insert_seconds: 0.0,
             optimize_seconds: 0.0,
@@ -224,6 +276,7 @@ impl Default for Measurements {
 /// Shared process owner. No KTANN handle crosses the Python process boundary.
 struct Service<B: Backend> {
     runtime: Runtime<MeasuredBackend<B>>,
+    bulk_workspace: Option<PathBuf>,
     backend: MeasuredBackend<B>,
     state: RwLock<State<B>>,
     measurements: Mutex<Measurements>,
@@ -254,9 +307,16 @@ async fn serve<B: Backend>(backend: B, identity: String, options: &Options) -> R
         backend.admission_budget()
     );
     let (backend, counters) = MeasuredBackend::new(backend);
+    // A finite import may contend with several topology workers on one tree.
+    // Extend the existing whole-operation abort retry budget, not unknown commits.
     let config = RuntimeConfig::default();
+    let config = config
+        .clone()
+        .with_attempts(config.fixup_attempts(), 32)
+        .map_err(|e| e.to_string())?;
     let service = Arc::new(Service {
         runtime: Runtime::new(backend.clone(), config).map_err(|e| e.to_string())?,
+        bulk_workspace: options.bulk_workspace.clone(),
         backend,
         state: RwLock::new(State::default()),
         measurements: Mutex::new(Measurements::default()),
@@ -335,7 +395,7 @@ async fn exchange<B: Backend>(stream: &mut UnixStream, service: &Service<B>) -> 
         .await
         .map_err(|e| e.to_string())?;
     let start = Instant::now();
-    let parsed = serde_json::from_slice::<Request>(&data);
+    let parsed = decode_request(&data);
     let decoded = start.elapsed().as_secs_f64();
     let shutdown = matches!(
         &parsed,
@@ -425,19 +485,29 @@ impl<B: Backend> Service<B> {
                 }
                 let mut state = self.state.write().await;
                 // One case per bridge keeps all reported resource high-water marks attributable.
-                if state.index.is_some() {
+                if state.dimension != 0 {
                     return Err(invalid("one case per bridge; restart for another reset"));
                 }
                 self.runtime
                     .drop_index("vdbbench")
                     .await
                     .map_err(api_error)?;
-                let index = self
-                    .runtime
-                    .create_index("vdbbench", config)
-                    .await
-                    .map_err(api_error)?;
-                state.index = Some(index);
+                if let Some(root) = &self.bulk_workspace {
+                    let root = root.clone();
+                    state.bulk = Some(
+                        tokio::task::spawn_blocking(move || bulk::InputCapture::new(root, config))
+                            .await
+                            .map_err(|e| ("other", e.to_string()))?
+                            .map_err(api_error)?,
+                    );
+                } else {
+                    state.index = Some(
+                        self.runtime
+                            .create_index("vdbbench", config)
+                            .await
+                            .map_err(api_error)?,
+                    );
+                }
                 state.dimension = dimension;
                 state.metric = metric;
                 state.dataset = dataset;
@@ -452,50 +522,83 @@ impl<B: Backend> Service<B> {
                 if state.ready {
                     return Err(invalid("inserts after optimize are unsupported"));
                 }
-                let index = state
-                    .index
-                    .as_ref()
-                    .ok_or_else(|| invalid("reset required"))?
-                    .clone();
-                let mut mutations = Vec::with_capacity(ids.len());
-                let mut root_probe = None;
+                if state.dimension == 0 {
+                    return Err(invalid("reset required"));
+                }
+                let mut records = Vec::with_capacity(ids.len());
                 for (id, vector) in ids.iter().zip(vectors) {
                     if vector.len() != state.dimension {
                         return Err(invalid("wrong vector dimension"));
                     }
                     let vector: Arc<[f32]> = vector.into();
-                    if mutations.is_empty() && state.root_probe.is_none() {
-                        root_probe = Some(Arc::clone(&vector));
-                    }
                     let record = Record::new(
                         Bytes::copy_from_slice(&id.to_be_bytes()),
                         vector,
                         vec![FieldValue::I64(*id)],
                     )
                     .map_err(api_error)?;
-                    mutations.push(Mutation::Insert(record));
+                    records.push(record);
                 }
                 let start = Instant::now();
                 state.started.get_or_insert(start);
-                let mut session = index
-                    .import_session(ImportOptions::default())
-                    .map_err(api_error)?;
-                session.submit(mutations).await.map_err(api_error)?;
-                let outcomes = session.finish().await;
-                state.insert_seconds += start.elapsed().as_secs_f64();
-                for outcome in outcomes {
-                    outcome.result.map_err(api_error)?;
+                if self.bulk_workspace.is_some() {
+                    let staging = state
+                        .bulk
+                        .take()
+                        .ok_or_else(|| invalid("bulk input already sealed or failed"))?;
+                    state.bulk = Some(
+                        tokio::task::spawn_blocking(move || staging.append(records))
+                            .await
+                            .map_err(|e| ("other", e.to_string()))?
+                            .map_err(api_error)?,
+                    );
+                } else {
+                    let index = state
+                        .index
+                        .as_ref()
+                        .ok_or_else(|| invalid("reset required"))?;
+                    let outcome = index
+                        .batch_mutate(records.into_iter().map(Mutation::Insert).collect())
+                        .await;
+                    state.insert_seconds += start.elapsed().as_secs_f64();
+                    outcome.map_err(api_error)?;
+                }
+                if self.bulk_workspace.is_some() {
+                    state.insert_seconds += start.elapsed().as_secs_f64();
                 }
                 state.records += ids.len() as u64;
-                if let Some(probe) = root_probe {
-                    state.root_probe = Some(probe);
-                }
                 Ok(json!({"inserted":ids.len()}))
             }
             Operation::Optimize { records } => {
                 let mut state = self.state.write().await;
                 if state.records != records || records == 0 {
                     return Err(invalid("optimize record count mismatch or empty dataset"));
+                }
+                if self.bulk_workspace.is_some() {
+                    if state.ready {
+                        return Ok(state.topology.clone());
+                    }
+                    let start = Instant::now();
+                    let staging = state
+                        .bulk
+                        .take()
+                        .ok_or_else(|| invalid("bulk input already sealed or failed"))?;
+                    let (index, report) = bulk::build(&self.runtime, staging)
+                        .await
+                        .map_err(api_error)?;
+                    let snapshot =
+                        topology::snapshot(&self.backend, index.logical_index_id(), records, false)
+                            .await
+                            .map_err(api_error)?;
+                    if !snapshot.ready {
+                        return Err(("corruption", "published bulk topology is not ready".into()));
+                    }
+                    state.index = Some(index);
+                    state.bulk_report = report;
+                    state.topology = snapshot.facts.clone();
+                    state.ready = true;
+                    state.optimize_seconds = start.elapsed().as_secs_f64();
+                    return Ok(state.topology.clone());
                 }
                 let index = state
                     .index
@@ -505,14 +608,7 @@ impl<B: Backend> Service<B> {
                 let start = Instant::now();
                 let deadline = start + Duration::from_secs(3500);
                 let mut previous_progress = None;
-                let mut last_progress = Instant::now();
-                let mut last_probe: Option<Instant> = None;
-                // Rediscovery needs to touch the target, not execute a quality benchmark.
-                let probe_options = SearchOptions::default()
-                    .with_scanned_tree_keys(1)
-                    .and_then(|s| s.with_visited_partitions(128))
-                    .and_then(|s| s.with_leaf_beam_size(1))
-                    .map_err(api_error)?;
+                let retry = RetryPolicy::for_fixup(self.runtime.config());
 
                 loop {
                     if Instant::now() >= deadline {
@@ -524,16 +620,9 @@ impl<B: Backend> Service<B> {
                             ),
                         ));
                     }
-                    let probe_due = last_progress.elapsed() >= Duration::from_secs(5)
-                        && last_probe.is_none_or(|at| at.elapsed() >= Duration::from_secs(30));
                     let snapshot = tokio::time::timeout_at(
                         tokio::time::Instant::from_std(deadline),
-                        topology::snapshot(
-                            &self.backend,
-                            index.logical_index_id(),
-                            records,
-                            probe_due,
-                        ),
+                        topology::snapshot(&self.backend, index.logical_index_id(), records, true),
                     )
                     .await
                     .map_err(|_| {
@@ -546,7 +635,7 @@ impl<B: Backend> Service<B> {
                         )
                     })?
                     .map_err(api_error)?;
-                    state.topology = snapshot.facts;
+                    state.topology = snapshot.facts.clone();
                     if snapshot.ready {
                         state.ready = true;
                         state.optimize_seconds = start.elapsed().as_secs_f64();
@@ -559,27 +648,25 @@ impl<B: Backend> Service<B> {
                             state.topology
                         );
                         previous_progress = Some(snapshot.progress);
-                        last_progress = Instant::now();
                     }
-                    if probe_due && last_progress.elapsed() >= Duration::from_secs(5) {
-                        last_probe = Some(Instant::now());
-                        let root_probe = state
-                            .root_probe
-                            .iter()
-                            .filter(|_| snapshot.needs_root_probe);
-                        for vector in snapshot.probes.iter().chain(root_probe) {
-                            index
-                                .search_with_control(
-                                    SearchRequest::new(Arc::clone(vector), 10)
-                                        .map_err(api_error)?
-                                        .with_options(probe_options),
-                                    OperationOptions::default().with_deadline(deadline),
-                                )
-                                .await
-                                .map_err(api_error)?;
-                        }
+                    let progressed = tokio::time::timeout_at(
+                        tokio::time::Instant::from_std(deadline),
+                        snapshot.advance(&self.backend, &retry),
+                    )
+                    .await
+                    .map_err(|_| {
+                        (
+                            "timeout",
+                            format!(
+                                "maintenance deadline exceeded; last snapshot: {}",
+                                state.topology
+                            ),
+                        )
+                    })?
+                    .map_err(api_error)?;
+                    if !progressed {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
                     }
-                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             }
             Operation::Search { vector, k, id_min } => {
@@ -684,15 +771,14 @@ impl<B: Backend> Service<B> {
                 "foreground_limit": runtime_config.foreground_operation_limit(),
                 "foreground_attempts": runtime_config.foreground_attempts(),
                 "fixup_attempts": runtime_config.fixup_attempts(),
-                "import_max_in_flight_batches": runtime_config.import_max_in_flight_batches(),
-                "import_backlog_watermark": runtime_config.import_backlog_watermark(),
-                "readiness_header_slot_limit": 262144, "readiness_probe_limit": 32,
-                "readiness_stall_seconds": 5, "readiness_probe_interval_seconds": 30,
-                "readiness_probe_leaf_beam": 1, "readiness_probe_partition_budget": 128
+                "readiness_header_slot_limit": topology::MAX_HEADER_SLOTS,
+                "readiness_advance_limit": topology::MAX_ADVANCE_STEPS,
+                "readiness_idle_interval_seconds": 1,
             },
             "continuous_first_insert_through_final_search_seconds": state.started.zip(m.last_search).map(|(a,b)| b.duration_since(a).as_secs_f64()),
             "phases": {
-                "committed_import_seconds": state.insert_seconds,
+                "committed_import_seconds": self.bulk_workspace.is_none().then_some(state.insert_seconds),
+                "input_staging_seconds": self.bulk_workspace.is_some().then_some(state.insert_seconds),
                 "optimize_seconds": state.optimize_seconds,
                 "ktann_search_seconds_sum": m.search_seconds
             },
@@ -708,11 +794,13 @@ impl<B: Backend> Service<B> {
             "search_usage_totals": m.budget,
             "search_exhaustion_counts": m.exhausted,
             "topology": state.topology,
+            "build_mode": if self.bulk_workspace.is_some() { "bulk" } else { "online" },
+            "bulk_build": state.bulk_report,
             "resource": { "peak_rss_bytes": resources.peak_rss_bytes(), "cpu_seconds": resources.cpu_seconds_since(self.baseline) },
             "backend_io": self.counters.snapshot(),
             "bridge": {
                 "decode_seconds": m.decode_seconds, "encode_seconds": m.encode_seconds,
-                "received_json_bytes": m.received_bytes, "sent_json_bytes": m.sent_bytes,
+                "received_body_bytes": m.received_bytes, "sent_body_bytes": m.sent_bytes,
                 "max_frame_bytes": MAX_FRAME, "max_batch": MAX_BATCH, "max_connections": MAX_CONNECTIONS
             }
         }))
@@ -722,6 +810,40 @@ impl<B: Backend> Service<B> {
 #[cfg(test)]
 mod tests {
     use super::Request;
+
+    #[test]
+    fn binary_insert_preserves_bits_and_rejects_incomplete_or_excess_bodies() {
+        let mut frame = b"KTI\x01".to_vec();
+        frame.extend_from_slice(&2_u32.to_be_bytes());
+        frame.extend_from_slice(&2_u32.to_be_bytes());
+        for id in [i64::MIN, i64::MAX] {
+            frame.extend_from_slice(&id.to_le_bytes());
+        }
+        for value in [-0.0_f32, f32::MAX, 1.25, -2.5] {
+            frame.extend_from_slice(&value.to_le_bytes());
+        }
+        let request = super::decode_request(&frame).unwrap();
+        let super::Operation::Insert { ids, vectors } = request.operation else {
+            panic!("insert expected");
+        };
+        assert_eq!(ids, [i64::MIN, i64::MAX]);
+        assert_eq!(vectors[0][0].to_bits(), (-0.0_f32).to_bits());
+        assert_eq!(vectors, [vec![-0.0, f32::MAX], vec![1.25, -2.5]]);
+        for end in 0..frame.len() {
+            assert!(super::decode_request(&frame[..end]).is_err());
+        }
+        let mut trailing = frame.clone();
+        trailing.push(0);
+        assert!(super::decode_request(&trailing).is_err());
+        for (count, dimension) in [(0, 2), (51, 2), (2, 0), (2, u32::MAX)] {
+            let mut bad = frame.clone();
+            bad[4..8].copy_from_slice(&u32::to_be_bytes(count));
+            bad[8..12].copy_from_slice(&u32::to_be_bytes(dimension));
+            assert!(super::decode_request(&bad).is_err());
+        }
+        frame[3] = 2;
+        assert!(super::decode_request(&frame).is_err());
+    }
 
     #[test]
     fn envelope_rejects_unknown_operations_fields_and_noninteger_ids() {

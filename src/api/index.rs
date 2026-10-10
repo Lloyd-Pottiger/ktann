@@ -7,17 +7,16 @@ use bytes::Bytes;
 
 use crate::maintenance::mutation;
 use crate::observe::labels::Operation;
-use crate::runtime::import::ImportPermit;
 use crate::runtime::{OperationContext, RuntimeInner};
 use crate::runtime::{lifecycle, reads, refine, search, verify};
 use crate::storage::backend::Backend;
 use crate::storage::values::{IndexLifecycle, IndexManifest};
 
 use super::{
-    Error, ErrorKind, GetOptions, ImportOptions, ImportSession, IndexConfig, IndexName,
-    LogicalIndexId, Mutation, MutationOutcome, OperationOptions, Record, RefineOptions, Result,
-    SearchOutcome, SearchRequest, StoredRecord, UpsertResult, VerifyOptions, VerifyReport,
-    validate_id, validate_ids, validate_mutations,
+    Error, ErrorKind, GetOptions, IndexConfig, IndexName, LogicalIndexId, Mutation,
+    MutationOutcome, OperationOptions, Record, RefineOptions, Result, SearchOutcome, SearchRequest,
+    StoredRecord, UpsertResult, VerifyOptions, VerifyReport, validate_id, validate_ids,
+    validate_mutations,
 };
 
 /// A cheap cloneable handle to one Active Logical Index.
@@ -40,6 +39,7 @@ impl<B: Backend> Index<B> {
     ) -> Result<Self> {
         match manifest.lifecycle() {
             IndexLifecycle::Active => {}
+            IndexLifecycle::Building => return Err(Error::new(ErrorKind::IndexBuilding)),
             IndexLifecycle::Dropping => return Err(Error::new(ErrorKind::IndexDropping)),
         }
         Ok(Self {
@@ -189,27 +189,6 @@ impl<B: Backend> Index<B> {
             .await
     }
 
-    /// Opens a bounded Import Session on this index.
-    ///
-    /// The session admits ordinary atomic mutation batches under bounded
-    /// concurrency; see [`ImportSession`] for the admission, ordering,
-    /// cancellation, and shutdown contract. `options.max_in_flight_batches()`
-    /// overrides the Runtime's configured adaptive-concurrency ceiling.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ErrorKind::RuntimeClosed`] when the Runtime is shutting down
-    /// or has shut down.
-    pub fn import_session(&self, options: ImportOptions) -> Result<ImportSession<B>> {
-        if !self.runtime.is_accepting() {
-            return Err(Error::new(ErrorKind::RuntimeClosed));
-        }
-        let max_in_flight_batches = options
-            .max_in_flight_batches()
-            .unwrap_or_else(|| self.runtime.config().import_max_in_flight_batches());
-        Ok(ImportSession::new(self.clone(), max_in_flight_batches))
-    }
-
     /// Runs one bounded approximate search over one consistent snapshot.
     ///
     /// The request is validated against this index's immutable configuration
@@ -339,11 +318,6 @@ impl<B: Backend> Index<B> {
         validate_mutations(mutations, config.dimension(), config.fields())
     }
 
-    /// Returns the owning Runtime's shared state.
-    pub(crate) fn runtime(&self) -> &Arc<RuntimeInner<B>> {
-        &self.runtime
-    }
-
     /// Runs one foreground operation observed under this index's identity.
     pub(crate) async fn run_foreground<T, F, Fut>(
         &self,
@@ -359,22 +333,6 @@ impl<B: Backend> Index<B> {
         let index = Some(self.manifest.logical_index_id());
         self.runtime
             .run_foreground(operation, index, options, work)
-            .await
-    }
-
-    /// Runs one validated mutation batch under foreground admission.
-    ///
-    /// A committed batch's maintenance discoveries — split candidates,
-    /// shrunken leaves, and draining sources rerouted around — are offered to
-    /// the Runtime's bounded Fixup queue after success; losing them never
-    /// affects correctness.
-    pub(crate) async fn run_mutations(
-        &self,
-        operation: Operation,
-        mutations: Vec<Mutation>,
-        operation_options: OperationOptions,
-    ) -> Result<Vec<MutationOutcome>> {
-        self.run_mutations_with_import_permit(operation, mutations, operation_options, None)
             .await
     }
 
@@ -396,53 +354,31 @@ impl<B: Backend> Index<B> {
         }
     }
 
-    /// Runs one Import Session batch with its adaptive concurrency permit.
-    pub(crate) async fn run_import_mutations(
-        &self,
-        operation: Operation,
-        mutations: Vec<Mutation>,
-        operation_options: OperationOptions,
-        permit: ImportPermit<B>,
-    ) -> Result<Vec<MutationOutcome>> {
-        self.run_mutations_with_import_permit(operation, mutations, operation_options, Some(permit))
-            .await
-    }
-
     /// Executes a mutation batch and offers only its committed maintenance.
-    async fn run_mutations_with_import_permit(
+    /// Losing maintenance discoveries does not affect correctness.
+    async fn run_mutations(
         &self,
         operation: Operation,
         mutations: Vec<Mutation>,
         operation_options: OperationOptions,
-        permit: Option<ImportPermit<B>>,
     ) -> Result<Vec<MutationOutcome>> {
         let retry = lifecycle::RetryPolicy::from_config(self.runtime.config());
         let manifest = Arc::clone(&self.manifest);
-        let (report, permit) = self
+        let report = self
             .run_foreground(
                 operation,
                 operation_options,
                 move |mut context| async move {
-                    let mut permit = permit;
-                    let report = mutation::mutate(
-                        &mut context,
-                        &manifest,
-                        &mutations,
-                        retry,
-                        operation,
-                        permit.as_mut(),
-                    )
-                    .await?;
-                    Ok((report, permit))
+                    let report =
+                        mutation::mutate(&mut context, &manifest, &mutations, retry, operation)
+                            .await?;
+                    Ok(report)
                 },
             )
             .await?;
         if !report.maintenance.is_empty() {
             self.runtime
                 .offer_fixups(&self.manifest, report.maintenance);
-        }
-        if let Some(permit) = permit {
-            permit.complete();
         }
         Ok(report.outcomes)
     }

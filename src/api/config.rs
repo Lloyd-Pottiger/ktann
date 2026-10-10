@@ -231,8 +231,6 @@ pub struct RuntimeConfig {
     default_search_budgets: SearchBudgets,
     tree_key_scan_ranges: u32,
     write_beam_size: u32,
-    import_max_in_flight_batches: usize,
-    import_backlog_watermark: usize,
     stalled_timeout: Option<Duration>,
     retry_initial_backoff: Duration,
     retry_max_backoff: Duration,
@@ -255,8 +253,6 @@ impl Default for RuntimeConfig {
             default_search_budgets: SearchBudgets::default(),
             tree_key_scan_ranges: DEFAULT_TREE_KEY_SCAN_RANGES,
             write_beam_size: DEFAULT_WRITE_BEAM_SIZE,
-            import_max_in_flight_batches: available.clamp(1, 4),
-            import_backlog_watermark: 2,
             stalled_timeout: None,
             retry_initial_backoff: Duration::from_millis(1),
             retry_max_backoff: Duration::from_millis(100),
@@ -345,27 +341,6 @@ impl RuntimeConfig {
         Ok(self)
     }
 
-    /// Sets the Import Session concurrency ceiling and backlog admission bound.
-    ///
-    /// A session starts with one active batch and learns useful concurrency up
-    /// to `in_flight` from clean completions and retryable contention. A
-    /// non-empty batch admits only once the process-local Fixup backlog
-    /// (pending plus running) is below `backlog_watermark`; a zero watermark
-    /// holds every non-empty batch. The gate is process-local backpressure and
-    /// never a durable or cluster-wide barrier.
-    pub fn with_import_limits(
-        mut self,
-        in_flight: usize,
-        backlog_watermark: usize,
-    ) -> Result<Self> {
-        if in_flight == 0 {
-            return Err(Error::invalid_argument());
-        }
-        self.import_max_in_flight_batches = in_flight;
-        self.import_backlog_watermark = backlog_watermark;
-        Ok(self)
-    }
-
     /// Sets the inclusive retry backoff range.
     pub fn with_retry_backoff(mut self, initial: Duration, maximum: Duration) -> Result<Self> {
         if initial.is_zero() || initial > maximum {
@@ -388,8 +363,6 @@ impl RuntimeConfig {
             || self.tree_key_scan_ranges == 0
             || self.write_beam_size == 0
             || self.write_beam_size > MAX_WRITE_BEAM_SIZE
-            || self.import_max_in_flight_batches == 0
-            || self.import_backlog_watermark > self.fixup_queue_capacity
             || self.retry_initial_backoff.is_zero()
             || self.retry_initial_backoff > self.retry_max_backoff
         {
@@ -452,19 +425,6 @@ impl RuntimeConfig {
     #[must_use]
     pub const fn write_beam_size(&self) -> u32 {
         self.write_beam_size
-    }
-
-    /// Returns the Import Session adaptive-concurrency ceiling.
-    #[must_use]
-    pub const fn import_max_in_flight_batches(&self) -> usize {
-        self.import_max_in_flight_batches
-    }
-
-    /// Returns the Import Session backlog watermark set by
-    /// [`Self::with_import_limits`].
-    #[must_use]
-    pub const fn import_backlog_watermark(&self) -> usize {
-        self.import_backlog_watermark
     }
 
     /// Returns the minimum state age before a worker assists rediscovered work.

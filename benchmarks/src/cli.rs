@@ -192,18 +192,14 @@ const SCENARIO_OPTIONS: &[&str] = &[
     "query-offset",
     "max-partition-entries",
     "maintenance-workers",
-    "import-max-in-flight-batches",
     "import-batch-size",
-    "import-backlog-watermark",
 ];
 
 /// Optional diagnostic bounds applied to the selected scenario.
 #[derive(Clone, Debug, Default)]
 struct LifecycleOverrides {
     maintenance_workers: Option<usize>,
-    max_in_flight_batches: Option<usize>,
     batch_size: Option<usize>,
-    backlog_watermark: Option<usize>,
 }
 
 impl LifecycleOverrides {
@@ -213,40 +209,23 @@ impl LifecycleOverrides {
                 .get("maintenance-workers")
                 .map(|value| parse_nonnegative(value, "maintenance-workers"))
                 .transpose()?,
-            max_in_flight_batches: values
-                .get("import-max-in-flight-batches")
-                .map(|value| parse_positive(value, "import-max-in-flight-batches"))
-                .transpose()?,
             batch_size: values
                 .get("import-batch-size")
                 .map(|value| parse_positive(value, "import-batch-size"))
-                .transpose()?,
-            backlog_watermark: values
-                .get("import-backlog-watermark")
-                .map(|value| parse_positive(value, "import-backlog-watermark"))
                 .transpose()?,
         })
     }
 
     fn is_empty(&self) -> bool {
-        self.maintenance_workers.is_none()
-            && self.max_in_flight_batches.is_none()
-            && self.batch_size.is_none()
-            && self.backlog_watermark.is_none()
+        self.maintenance_workers.is_none() && self.batch_size.is_none()
     }
 
     fn apply(&self, scenario: &mut ScenarioSpec) {
         if let Some(workers) = self.maintenance_workers {
             scenario.maintenance_workers = workers;
         }
-        if let Some(maximum) = self.max_in_flight_batches {
-            scenario.import_max_in_flight_batches = maximum;
-        }
         if let Some(batch_size) = self.batch_size {
             scenario.import_batch_size = batch_size;
-        }
-        if let Some(watermark) = self.backlog_watermark {
-            scenario.import_backlog_watermark = watermark;
         }
     }
 }
@@ -533,15 +512,7 @@ fn run_suite(options: RunOptions) -> Result<(), String> {
                 "maintenance-workers",
                 option_string(lifecycle.maintenance_workers),
             ),
-            (
-                "import-max-in-flight-batches",
-                option_string(lifecycle.max_in_flight_batches),
-            ),
             ("import-batch-size", option_string(lifecycle.batch_size)),
-            (
-                "import-backlog-watermark",
-                option_string(lifecycle.backlog_watermark),
-            ),
         ] {
             if let Some(value) = value {
                 command.args([format!("--{name}"), value]);
@@ -949,7 +920,7 @@ fn shell_quote(value: &OsStr) -> String {
 
 /// Returns the stable help shown for missing or unknown public commands.
 fn usage() -> String {
-    "usage:\n  ktann-bench run --backend rocksdb|foundationdb [--profile smoke|full|large] [--scenario NAME] [--worker-threads N] [--query-concurrency N,...] [--partition-cache-bytes N] [--leaf-beam-size N] [--warmup-operations N] [--rocksdb-block-cache-bytes N] [--rocksdb-path PATH] [--reuse-index true|false] [--write-beam-size N] [--refinement-rounds 0..5] [--base-vectors N] [--query-vectors N] [--query-offset N] [--max-partition-entries N] [--maintenance-workers N] [--import-max-in-flight-batches N] [--import-batch-size N] [--import-backlog-watermark N] [--output PATH]\n  ktann-bench compare --baseline PATH --candidate PATH [--maximum-relative-regression N] [--maximum-recall-drop N] [--maximum-rejection-rate-increase N] [--output PATH]".to_owned()
+    "usage:\n  ktann-bench run --backend rocksdb|foundationdb [--profile smoke|full|large] [--scenario NAME] [--worker-threads N] [--query-concurrency N,...] [--partition-cache-bytes N] [--leaf-beam-size N] [--warmup-operations N] [--rocksdb-block-cache-bytes N] [--rocksdb-path PATH] [--reuse-index true|false] [--write-beam-size N] [--refinement-rounds 0..5] [--base-vectors N] [--query-vectors N] [--query-offset N] [--max-partition-entries N] [--maintenance-workers N] [--import-batch-size N] [--output PATH]\n  ktann-bench compare --baseline PATH --candidate PATH [--maximum-relative-regression N] [--maximum-recall-drop N] [--maximum-rejection-rate-increase N] [--output PATH]".to_owned()
 }
 
 #[cfg(test)]
@@ -1072,19 +1043,13 @@ mod tests {
             "import-to-search-lifecycle",
             "--maintenance-workers",
             "0",
-            "--import-max-in-flight-batches",
-            "4",
             "--import-batch-size",
             "25",
-            "--import-backlog-watermark",
-            "1",
         ]
         .map(std::ffi::OsString::from);
         let options = parse_run_options(&arguments).expect("valid lifecycle overrides");
         assert_eq!(options.execution.lifecycle.maintenance_workers, Some(0));
-        assert_eq!(options.execution.lifecycle.max_in_flight_batches, Some(4));
         assert_eq!(options.execution.lifecycle.batch_size, Some(25));
-        assert_eq!(options.execution.lifecycle.backlog_watermark, Some(1));
     }
 
     #[test]

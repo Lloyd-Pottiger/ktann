@@ -21,7 +21,7 @@ use std::sync::{Arc, MutexGuard};
 
 use tracing::{Instrument as _, Span};
 
-use crate::api::{Error, ErrorKind, LogicalIndexId, PartitionKey, Result};
+use crate::api::{LogicalIndexId, PartitionKey, Result};
 use crate::maintenance::{fixup as maintenance_fixup, merge, split};
 use crate::observe::labels::{FixupAdmission, FixupExecution, FixupKind, FixupStepResult};
 use crate::observe::{metrics, trace};
@@ -56,12 +56,6 @@ struct FixupOffer {
     manifest: Arc<IndexManifest>,
     /// A yielded worker keeps advancing without waiting for recovery age.
     continuing: bool,
-}
-
-/// Terminal states of one wait on the process-local import backlog gate.
-enum BacklogGate {
-    Open,
-    MaintenanceCancelled,
 }
 
 /// Cumulative, privacy-safe observations of the process-local Fixup queue.
@@ -255,58 +249,6 @@ impl<B: Backend> RuntimeInner<B> {
         self.lock_fixups().stats
     }
 
-    /// Waits for the Import Session backlog gate (design
-    /// `runtime-operations.md` §4): admission pauses until the process-local
-    /// Fixup backlog drops below the configured watermark.
-    ///
-    /// The wait is cancellation-safe and wakes on every queue slot release
-    /// that opens the gate; once the Runtime stops accepting work it fails
-    /// with [`ErrorKind::RuntimeClosed`] instead of waiting for the backlog.
-    pub(crate) async fn wait_for_backlog_below(&self) -> Result<()> {
-        match self
-            .wait_for_backlog_gate(self.config().import_backlog_watermark())
-            .await
-        {
-            BacklogGate::Open => Ok(()),
-            BacklogGate::MaintenanceCancelled => Err(Error::new(ErrorKind::RuntimeClosed)),
-        }
-    }
-
-    /// Waits for maintenance to quiesce before retrying admitted import work.
-    ///
-    /// Shutdown cancels maintenance but must not replace an already-admitted
-    /// foreground operation's real result with `RuntimeClosed`. Once
-    /// maintenance cancellation is visible, the retry proceeds under its
-    /// ordinary bounded policy while Runtime shutdown continues to wait for it.
-    pub(crate) async fn wait_for_backlog_before_retry(&self) {
-        let _ = self.wait_for_backlog_gate(1).await;
-    }
-
-    /// Waits until backlog falls below `watermark` or maintenance stops.
-    async fn wait_for_backlog_gate(&self, watermark: usize) -> BacklogGate {
-        debug_assert!(watermark > 0);
-        loop {
-            // Register before checking so a slot release between the check and
-            // await cannot be lost.
-            let notified = self.fixup_released.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.lock_fixups().backlog() < watermark {
-                return BacklogGate::Open;
-            }
-            if self.maintenance_cancel.is_cancelled() {
-                return BacklogGate::MaintenanceCancelled;
-            }
-            tokio::select! {
-                biased;
-                () = self.maintenance_cancel.cancelled() => {
-                    return BacklogGate::MaintenanceCancelled;
-                }
-                () = notified => {}
-            }
-        }
-    }
-
     /// Starts the configured maintenance workers.
     ///
     /// Workers are counted in the Runtime's lifecycle activity from
@@ -461,18 +403,12 @@ impl<B: Backend> Drop for RunningFixup<'_, B> {
         } else {
             None
         };
-        let (can_yield, gate_open, enqueued, duplicate, saturated) = {
+        let (can_yield, enqueued, duplicate, saturated) = {
             let mut queue = self.inner.lock_fixups();
             let can_yield = self.yield_back && !self.inner.maintenance_cancel.is_cancelled();
             if can_yield {
-                let backlog = queue.yield_back(self.offer);
-                (
-                    can_yield,
-                    backlog < self.inner.config().import_backlog_watermark(),
-                    0,
-                    0,
-                    0,
-                )
+                queue.yield_back(self.offer);
+                (can_yield, 0, 0, 0)
             } else {
                 queue.finish(&self.offer.key);
                 let mut enqueued = 0_u64;
@@ -494,14 +430,7 @@ impl<B: Backend> Drop for RunningFixup<'_, B> {
                         }
                     }
                 }
-                let backlog = queue.backlog();
-                (
-                    can_yield,
-                    backlog < self.inner.config().import_backlog_watermark(),
-                    enqueued,
-                    duplicate,
-                    saturated,
-                )
+                (can_yield, enqueued, duplicate, saturated)
             }
         };
         report_admissions(enqueued, duplicate, saturated);
@@ -512,11 +441,6 @@ impl<B: Backend> Drop for RunningFixup<'_, B> {
             for _ in 0..enqueued {
                 self.inner.fixup_available.notify_one();
             }
-        }
-        // Wake gated Import Session submissions only after the source release
-        // and any split follow-ups form one observable queue transition.
-        if !can_yield && gate_open {
-            self.inner.fixup_released.notify_waiters();
         }
     }
 }
@@ -950,7 +874,6 @@ mod tests {
     fn failing_runtime(workers: usize, capacity: usize) -> Runtime<FailingBackend> {
         let config = RuntimeConfig::default()
             .with_maintenance(workers, capacity)
-            .and_then(|config| config.with_import_limits(1, 1))
             .expect("valid maintenance config");
         Runtime::new(FailingBackend, config).expect("multi-thread runtime")
     }
@@ -1042,106 +965,6 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn import_retry_waits_for_maintenance_to_quiesce() {
-        let config = RuntimeConfig::default()
-            .with_maintenance(0, 2)
-            .and_then(|config| config.with_import_limits(1, 2))
-            .expect("valid maintenance config");
-        let runtime = Runtime::new(FailingBackend, config).expect("multi-thread runtime");
-        let manifest = manifest(1);
-        let offer = {
-            let mut queue = runtime.handle.inner.lock_fixups();
-            assert_eq!(
-                queue.offer(key(&manifest, 1, 1), &manifest),
-                FixupAdmission::Enqueued
-            );
-            queue.pop().expect("running maintenance")
-        };
-
-        let mut retry = std::pin::pin!(runtime.handle.inner.wait_for_backlog_before_retry());
-        tokio::select! {
-            () = retry.as_mut() => {
-                panic!("a contended import retry must not overlap running maintenance")
-            }
-            () = async {
-                for _ in 0..64 {
-                    tokio::task::yield_now().await;
-                }
-            } => {}
-        }
-
-        {
-            let mut queue = runtime.handle.inner.lock_fixups();
-            assert_eq!(queue.finish(&offer.key), 0);
-        }
-        runtime.handle.inner.fixup_released.notify_waiters();
-        tokio::time::timeout(Duration::from_secs(1), retry)
-            .await
-            .expect("the retry resumes after maintenance quiesces");
-        runtime.shutdown().await.expect("shutdown succeeds");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn split_followups_keep_the_import_retry_gate_closed() {
-        let config = RuntimeConfig::default()
-            .with_maintenance(0, 8)
-            .and_then(|config| config.with_import_limits(1, 2))
-            .expect("valid maintenance config");
-        let runtime = Runtime::new(FailingBackend, config).expect("multi-thread runtime");
-        let manifest = manifest(1);
-        let offer = {
-            let mut queue = runtime.handle.inner.lock_fixups();
-            assert_eq!(
-                queue.offer(key(&manifest, 1, 1), &manifest),
-                FixupAdmission::Enqueued
-            );
-            queue.pop().expect("running split")
-        };
-
-        let mut retry = std::pin::pin!(runtime.handle.inner.wait_for_backlog_before_retry());
-        tokio::select! {
-            () = retry.as_mut() => panic!("the retry must wait for the running split"),
-            () = tokio::task::yield_now() => {}
-        }
-
-        drop(RunningFixup {
-            inner: &runtime.handle.inner,
-            offer: &offer,
-            yield_back: false,
-            split_followups: Some((
-                [
-                    PartitionKey::new(2).expect("nonzero"),
-                    PartitionKey::new(3).expect("nonzero"),
-                ],
-                Some(PartitionKey::new(4).expect("nonzero")),
-            )),
-        });
-
-        {
-            let queue = runtime.handle.inner.lock_fixups();
-            assert_eq!(queue.backlog(), 3);
-            assert!(!queue.admitted.contains(&offer.key));
-        }
-        tokio::select! {
-            () = retry.as_mut() => {
-                panic!("the retry must not observe a gap before split follow-ups")
-            }
-            () = async {
-                for _ in 0..64 {
-                    tokio::task::yield_now().await;
-                }
-            } => {}
-        }
-
-        assert_eq!(runtime.handle.inner.lock_fixups().drain_pending(), 0);
-        runtime.handle.inner.fixup_released.notify_waiters();
-        tokio::time::timeout(Duration::from_secs(1), retry)
-            .await
-            .expect("the retry resumes after every follow-up retires");
-        runtime.shutdown().await.expect("shutdown succeeds");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

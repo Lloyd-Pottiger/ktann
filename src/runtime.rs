@@ -23,8 +23,11 @@ use crate::storage::backend::{Backend, CommitCancellation, CommitStart};
 
 use self::fixup::FixupQueue;
 
+pub(crate) mod bulk_load;
+pub(crate) mod bulk_publish;
+pub(crate) mod bulk_scheduler;
+pub(crate) mod bulk_worker;
 pub(crate) mod fixup;
-pub(crate) mod import;
 pub(crate) mod lifecycle;
 pub(crate) mod reads;
 pub(crate) mod refine;
@@ -44,6 +47,115 @@ pub struct Runtime<B: Backend> {
 }
 
 impl<B: Backend> Runtime<B> {
+    /// Runs automatic distributed Bulk Build scheduling until cancelled or shutdown.
+    /// Call once per participating Runtime. Jobs are durably queued with
+    /// `BulkBuildJob::schedule`; expiry permits another process to take over.
+    /// This future owns its bounded workers; dropping it cancels local work.
+    pub async fn run_bulk_scheduler(
+        &self,
+        options: crate::api::BulkSchedulerOptions,
+        control: OperationOptions,
+    ) -> Result<()> {
+        bulk_scheduler::run(self, options, control).await
+    }
+
+    /// Reserves a new, hidden Logical Index and its immutable source identity.
+    ///
+    /// Repeating an identical request reopens the reservation. This API does
+    /// not launch workers; the source snapshot remains caller owned.
+    pub async fn start_bulk_build(
+        &self,
+        name: &str,
+        input: &crate::bulk::InputSnapshot,
+        construction: crate::construction::ConstructionOptions,
+    ) -> Result<crate::api::BulkBuildJob<B>> {
+        self.start_bulk_build_with_control(name, input, construction, OperationOptions::default())
+            .await
+    }
+
+    /// Reserves a Bulk Build with explicit cancellation and deadline control.
+    pub async fn start_bulk_build_with_control(
+        &self,
+        name: &str,
+        input: &crate::bulk::InputSnapshot,
+        construction: crate::construction::ConstructionOptions,
+        options: OperationOptions,
+    ) -> Result<crate::api::BulkBuildJob<B>> {
+        let name = IndexName::new(name)?;
+        let config = input.config().clone();
+        crate::construction::validate_options(config.dimension(), construction)?;
+        if construction.min_partition_entries != config.min_partition_entries()
+            || construction.max_partition_entries != config.max_partition_entries()
+        {
+            return Err(Error::invalid_argument());
+        }
+        let source =
+            std::path::absolute(input.directory()).map_err(|_| Error::invalid_argument())?;
+        let descriptor = crate::storage::values::BuildDescriptor::new(
+            source,
+            input.manifest().clone(),
+            construction,
+        )?;
+        let request = descriptor.clone();
+        let request_name = name.clone();
+        let retry = lifecycle::RetryPolicy::from_config(self.config());
+        let manifest = self
+            .run_foreground(
+                Operation::StartBulkBuild,
+                None,
+                options,
+                move |mut context| async move {
+                    lifecycle::reserve_index(
+                        &mut context,
+                        request_name,
+                        config,
+                        Some(request),
+                        retry,
+                    )
+                    .await
+                },
+            )
+            .await?;
+        Ok(crate::api::BulkBuildJob::new(
+            Arc::clone(&self.handle.inner),
+            name,
+            manifest,
+            descriptor,
+        ))
+    }
+
+    /// Recovers a Bulk Build's persisted identity without reading source files.
+    pub async fn open_bulk_build(&self, name: &str) -> Result<crate::api::BulkBuildJob<B>> {
+        self.open_bulk_build_with_control(name, OperationOptions::default())
+            .await
+    }
+
+    /// Recovers a Bulk Build with explicit cancellation and deadline control.
+    pub async fn open_bulk_build_with_control(
+        &self,
+        name: &str,
+        options: OperationOptions,
+    ) -> Result<crate::api::BulkBuildJob<B>> {
+        let name = IndexName::new(name)?;
+        let request_name = name.clone();
+        let (manifest, descriptor) = self
+            .run_foreground(
+                Operation::OpenBulkBuild,
+                None,
+                options,
+                move |mut context| async move {
+                    lifecycle::open_build(&mut context, request_name).await
+                },
+            )
+            .await?;
+        Ok(crate::api::BulkBuildJob::new(
+            Arc::clone(&self.handle.inner),
+            name,
+            manifest,
+            descriptor,
+        ))
+    }
+
     /// Creates a Runtime on the current Tokio multi-thread runtime.
     ///
     /// Construction starts the configured maintenance workers immediately;
@@ -74,7 +186,6 @@ impl<B: Backend> Runtime<B> {
                     fixups: Mutex::new(FixupQueue::new(config.fixup_queue_capacity())),
                     fixup_reporting: Mutex::new(()),
                     fixup_available: Notify::new(),
-                    fixup_released: Notify::new(),
                     maintenance_cancel: CancellationToken::new(),
                     lifecycle: Mutex::new(Lifecycle {
                         phase: Phase::Accepting,
@@ -88,6 +199,26 @@ impl<B: Backend> Runtime<B> {
         };
         runtime.handle.inner.start_maintenance();
         Ok(runtime)
+    }
+
+    /// Visits a bounded page of workspace cleanup records, including orphaned
+    /// records whose index was aborted or dropped by another process. Continue
+    /// with the returned cursor, and retry pending work after workers stop.
+    pub async fn cleanup_bulk_builds(
+        &self,
+        maximum: usize,
+        after: Option<crate::api::LogicalIndexId>,
+    ) -> Result<crate::api::BulkCleanupPage> {
+        let retry = lifecycle::RetryPolicy::from_config(self.config());
+        self.run_foreground(
+            Operation::CleanupBulkBuild,
+            None,
+            OperationOptions::default(),
+            move |mut context| async move {
+                bulk_worker::cleanup_pending(&mut context, maximum, after, retry).await
+            },
+        )
+        .await
     }
 
     /// Returns the validated process-local configuration.
@@ -192,7 +323,7 @@ impl<B: Backend> Runtime<B> {
 
     /// Stops admission and waits for all admitted work to finish.
     ///
-    /// Shutdown is idempotent. It atomically stops new foreground, import, and
+    /// Shutdown is idempotent. It atomically stops new foreground and
     /// maintenance admission, cancels queued Fixups that have not begun, waits
     /// for admitted foreground operations and detached commit completions,
     /// then stops the maintenance workers and releases the backend. Operations
@@ -266,6 +397,7 @@ impl<B: Backend> Drop for RuntimeHandle<B> {
 }
 
 pub(crate) struct OperationContext<B: Backend> {
+    bulk_authority: Option<[u8; 32]>,
     backend: Arc<B>,
     options: OperationOptions,
     write_beam_size: u32,
@@ -381,9 +513,6 @@ pub(crate) struct RuntimeInner<B: Backend> {
     /// Serializes backlog metric callbacks without holding the Fixup queue lock.
     fixup_reporting: Mutex<()>,
     fixup_available: Notify,
-    /// Signalled when a released Fixup queue slot opens the Import Session
-    /// backlog gate, so gated submissions re-check the watermark.
-    fixup_released: Notify,
     maintenance_cancel: CancellationToken,
     lifecycle: Mutex<Lifecycle<B>>,
     terminal: Notify,
@@ -425,7 +554,15 @@ impl<B: Backend> RuntimeInner<B> {
         };
         // Ordinary operations retain direct admission without an allocation.
         // Refinement shares ownership with cooperatively cancelled CPU work.
-        let admission = if operation == Operation::Refine {
+        let admission = if matches!(
+            operation,
+            Operation::Refine
+                | Operation::LoadBulkBuild
+                | Operation::RunBulkBuild
+                | Operation::ScheduleBulkBuild
+                | Operation::PublishBulkBuild
+                | Operation::CleanupBulkBuild
+        ) {
             ForegroundAdmission::Shared {
                 guard: Arc::new(admission),
             }
@@ -440,6 +577,7 @@ impl<B: Backend> RuntimeInner<B> {
         let deadline = options.deadline();
         let (commit_cancellation, commit_start) = CommitCancellation::pair();
         let context = OperationContext {
+            bulk_authority: None,
             backend,
             options,
             write_beam_size: self.config.write_beam_size(),
@@ -643,7 +781,7 @@ impl<B: Backend> RuntimeInner<B> {
         self.lock_lifecycle().phase
     }
 
-    /// Returns whether the Runtime still admits new foreground and import work.
+    /// Returns whether the Runtime still admits new foreground work.
     pub(crate) fn is_accepting(&self) -> bool {
         self.phase() == Phase::Accepting
     }
@@ -673,7 +811,7 @@ struct Lifecycle<B: Backend> {
 }
 
 impl<B: Backend> Lifecycle<B> {
-    /// Whether the Runtime still admits new foreground, import, and
+    /// Whether the Runtime still admits new foreground and
     /// maintenance work.
     fn is_accepting(&self) -> bool {
         self.phase == Phase::Accepting

@@ -31,7 +31,6 @@ impl<B: Backend> Index<B> {
     pub async fn batch_get(&self, ids: Vec<Bytes>, options: GetOptions)
         -> Result<Vec<Option<StoredRecord>>>;
     pub async fn search(&self, request: SearchRequest) -> Result<SearchOutcome>;
-    pub fn import_session(&self, options: ImportOptions) -> Result<ImportSession<B>>;
     pub async fn verify(&self, options: VerifyOptions) -> Result<VerifyReport>;
     pub async fn refine(&self, options: RefineOptions) -> Result<()>;
 }
@@ -52,7 +51,7 @@ they are not normalized. The fixed bound permits create admission to prove
 physical-key limits on both v1 backends.
 
 Create is idempotent for the same name and configuration after an unknown commit
-outcome. Open rejects a Dropping index, unsupported format, backend mismatch, or
+outcome. Open rejects a Building or Dropping index, unsupported format, backend mismatch, or
 configuration mismatch. Drop is idempotent and follows the storage lifecycle.
 
 `Index::refine(options)` prepares an existing Active index after ordinary import
@@ -120,7 +119,7 @@ once. Record Location is never public.
 
 Point reads open one consistent read snapshot and validate the persisted
 Manifest first: an Active Manifest with the handle's exact immutable identity
-proceeds, a Dropping Manifest returns `IndexDropping`, a missing Manifest
+proceeds, a Building Manifest returns `IndexBuilding`, a Dropping Manifest returns `IndexDropping`, a missing Manifest
 returns `IndexNotFound`, and any other mismatch is `Corruption`. Each read then
 loads the requested Record Group — the Vector Record and Record Location pair,
 plus the Opaque Payload when requested — from the same snapshot. An absent
@@ -222,8 +221,6 @@ The v1 defaults and caps are:
 | Leaf beam size | 128 | 16,384 |
 | Write beam size | 8 | 16,384 |
 | Tree Key scan ranges | 1,024 | wider conservative fallback |
-| Import maximum in-flight batches | `min(available_parallelism,4)`, min 1 | positive |
-| Import backlog watermark | 2 | within queue capacity |
 
 Retry backoff starts at 1 ms, doubles to 100 ms, and applies full jitter in the
 current interval.
@@ -263,7 +260,7 @@ starts it is not cancelled; the real result wins.
 
 Errors are non-exhaustive and preserve a diagnostic source. Stable kinds are:
 
-- `InvalidArgument`, `IndexAlreadyExists`, `IndexNotFound`, `IndexDropping`,
+- `InvalidArgument`, `IndexAlreadyExists`, `IndexNotFound`, `IndexBuilding`, `IndexDropping`,
   `RecordAlreadyExists`, and `UnsupportedFormat`;
 - `TransactionTooLarge`, `LimitExceeded`, `ContentionExhausted`,
   `CommitOutcomeUnknown`, and `IdExhausted`;
@@ -282,15 +279,9 @@ commit of unknown outcome.
 
 ## 7. Import and verification shapes
 
-`ImportSession::submit(&mut self, Vec<Mutation>)` waits for local capacity,
-admits exactly one ordinary atomic batch, and returns a unique process-local
-`BatchToken`. Each session starts with one active batch and learns concurrency
-from saturated clean completions and retryable conflicts up to its configured ceiling;
-multiple accepted batches may execute concurrently within that learned bound.
-`finish(self)` waits for all accepted work and returns ordered
-`ImportBatchResult { token, result }` values in submission order. Dropping the
-session cancels work not yet admitted to commit; committing work continues under
-the Runtime's in-flight guard.
+Online loading uses ordinary `Index::batch_mutate` calls with caller-owned bounded
+concurrency and result handling. Repository loaders submit batches sequentially;
+there is no session completion or whole-load atomicity contract.
 
 Verify returns a bounded report with `complete`, coarse issue kinds, safe
 identifiers, and logical-object counts. Options bound issues, objects, memory,
@@ -303,6 +294,66 @@ is no continuation or repair API.
 - Compile tests protect constructors, builder ownership, non-exhaustive enums,
   Send/Sync requirements, and redacted formatting.
 - Focused tests cover record/schema/predicate boundaries, batch ordering,
-  cancellation-before-commit, commit-result priority, search metadata, import
-  token ordering, and lifecycle idempotency.
+  cancellation-before-commit, commit-result priority, search metadata, and lifecycle idempotency.
 - Public tests assert behavior, not private cache, task, or codec structure.
+
+
+## Bulk Build
+
+`Runtime::start_bulk_build(name, input, construction_options)` atomically reserves
+an Index Name, never-reused Logical Index ID, Building Manifest and immutable
+Build Descriptor from a caller-owned `bulk::InputSnapshot`. Identical requests
+retain the ID; conflicting requests fail. Unknown reservation commits resolve
+against the attempted ID. Reservation starts no worker or filesystem work.
+Ordinary create/open and serving operations reject Building with `IndexBuilding`.
+
+`Runtime::open_bulk_build(name)` recovers the identity-bound job without reading
+source files. The handle never follows name reuse. Reopening a Dropping job
+returns `IndexDropping` because cleanup may have removed its descriptor; an
+existing handle or normal `drop_index` can finish cleanup.
+
+`bulk::InputSnapshotWriter` captures complete records in a new caller-owned
+directory. `PreparedInputWriter` additionally prepares bounded sorted projections
+for one-use reuse at completion. Failed append cannot seal partial input. The
+source remains caller owned after success, failure or abort. Tree construction
+options are public through `bulk::ConstructionOptions`.
+
+Create an existing durable workspace root and pass `BulkWorkerOptions::new(root)`
+to `job.complete(options, prepared_input, control)`. Completion prepares and
+loads the backend in bounded transactions, validates exact backend bytes,
+atomically publishes, and reclaims owned files. It returns `(Index,
+BulkBuildReport)`. The optional one-use `PreparedInput` avoids repeating source
+preparation; `None` reconstructs it from the sealed snapshot. The report contains
+forest, serving, load and publication wall times, forest scratch IO, and the
+persisted rotation seed. Publication time includes file reclamation; reused
+stages report zero work time.
+
+Repeating completion resumes durable progress, including cancelled validation.
+A Published job returns the same Active index without reopening input or
+artifact files. `status` reports Preparing, Loading/Loaded, Validating, Published, Failed,
+Dropping or Aborted; Loading and Validating include entry progress. A terminal
+`Failed { kind }` requires abort/rebuild; cancellation leaves resumable work.
+Start, open, status, schedule and abort have `_with_control` variants. Artifact readers and individual execution stages are
+internal; the public operation owns their sequencing.
+
+`abort` rejects Active indexes and is idempotent for an absent original ID.
+Completion and abort attempt owned-file reclamation. Completion can return a
+cleanup error, including `BulkBuildBusy`, after publication; inspect status or
+retry the same operation under the original identity. Abort tolerates Busy and
+retains the ownership record for later cleanup.
+`Runtime::cleanup_bulk_builds(maximum, after)` performs bounded orphan discovery.
+The caller retains source files, workspace root, and its coordination lock file.
+See [Bulk Build](bulk-build.md) for filesystem requirements and recovery semantics.
+
+Automatic scheduling is opt-in: after reservation call
+`job.schedule(BulkWorkerOptions::new(shared_workspace)).await?`, then run
+`runtime.run_bulk_scheduler(BulkSchedulerOptions::default(), control).await`
+on each worker process. The scheduler future runs until cancellation or Runtime
+shutdown and owns bounded local job tasks. It discovers jobs, renews leases,
+takes over expired workers, completes builds and retries cleanup. Stop it with
+`OperationOptions` cancellation/deadline or Runtime shutdown; stopping it does
+not abort durable jobs. Queued jobs reject manual completion with
+`BulkBuildBusy`. A job's failure remains observable through `status`.
+`BulkSchedulerOptions` bounds active jobs (1–64), polling (at least 1 ms) and
+lease duration (at least three polling intervals). Defaults are one job,
+one-second polling and a 30-second lease.

@@ -25,10 +25,14 @@ path = "src/lib.rs"
 
 [features]
 default = []
+# Low-level fault injection controls are excluded from production builds.
+test-support = []
 
 [dependencies]
 bytes = "1"
+getrandom = { version = "0.3", features = ["std"] }
 metrics = "0.24"
+sha2 = "0.11"
 sysinfo = { version = "0.36.1", default-features = false, features = ["system"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -36,6 +40,8 @@ tracing = "0.1"
 xxhash-rust = { version = "=0.8.18", features = ["xxh3"] }
 
 [dev-dependencies]
+# Keep integration fault tests enabled under ordinary `cargo test`.
+ktann = { path = ".", features = ["test-support"] }
 ktann-memory = { path = "ktann-memory", features = ["test-support"] }
 metrics-util = "0.20"
 num-bigint = "0.4"
