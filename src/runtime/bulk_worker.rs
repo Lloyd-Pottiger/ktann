@@ -348,13 +348,13 @@ async fn prepare_and_load<B: Backend>(
         let quota = state.options.max_artifact_bytes;
         let lock = lock.clone();
         let start = Instant::now();
-        let serving = blocking(context, move || {
+        let (serving, serving_report) = blocking(context, move || {
             let _lock = lock;
             ServingArtifact::build(&path, &input, &forest, &manifest, serving_options, quota)
-                .map(|(artifact, _)| artifact)
         })
         .await?;
         report.serving = start.elapsed();
+        report.serving_report = Some(serving_report);
         let mut after = state.clone();
         after.serving = Some(PreparedArtifact {
             epoch: state.epoch,

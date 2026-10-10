@@ -45,7 +45,7 @@ parquet = { version = "54", default-features = false, features = ["arrow", "snap
 rocksdb = { version = "0.24", default-features = false, features = ["bindgen-runtime"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "signal"] }
 tokio-util = { version = "0.7", features = ["rt"] }

@@ -16,7 +16,7 @@ use bytes::Bytes;
 use md5::{Digest as _, Md5};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde::Deserialize;
-use sha2::Sha256;
+use sha2::{Digest as _, Sha256};
 
 use super::{BenchmarkDataset, checksum};
 use crate::report::{DatasetFileMetadata, DatasetMetadata, DatasetSourceMetadata};
@@ -233,7 +233,10 @@ fn sha256(path: &Path) -> Result<String, String> {
         }
         hasher.update(&buffer[..count]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(format!(
+        "{:x}",
+        bytes::Bytes::copy_from_slice(&hasher.finalize())
+    ))
 }
 
 fn s3_etag(path: &Path, part_bytes: Option<usize>) -> Result<String, String> {

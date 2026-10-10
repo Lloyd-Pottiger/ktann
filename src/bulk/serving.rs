@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use bytes::{Buf, Bytes};
 use sha2::{Digest, Sha256};
@@ -41,6 +42,18 @@ pub struct ServingOptions {
 /// Counts and scratch evidence from successfully encoded serving data.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ServingReport {
+    /// Reading and sorting source records for the exact membership join.
+    pub source_sort: Duration,
+    /// Sorting forest assignments and parent references.
+    pub topology_sort: Duration,
+    /// Exact joins, value encoding, and output spill writes.
+    pub join_encode: Duration,
+    /// Merging sorted serving runs.
+    pub output_merge: Duration,
+    /// Reducing leaf projections into exact synopses.
+    pub synopsis: Duration,
+    /// Writing and sealing canonical serving data.
+    pub final_emit: Duration,
     /// Exactly joined original records and leaf assignments.
     pub records: u64,
     /// Validated partitions, each with exactly one root path.
@@ -135,6 +148,8 @@ impl ServingArtifact {
         )?;
         let scratch = directory.join("scratch");
         let mut space = Space::new(&scratch, options.scratch_bytes, MAX_ROW)?;
+        let mut report = ServingReport::default();
+        let start = Instant::now();
         let mut records = Sorter::new(&space, options.memory_bytes)?;
         for record in input.reader()? {
             let mut record = record?;
@@ -147,6 +162,8 @@ impl ServingArtifact {
             )?;
         }
         let record_run = records.finish(&mut space)?;
+        report.source_sort = start.elapsed();
+        let start = Instant::now();
         let mut topology = Sorter::new(&space, options.memory_bytes)?;
         for row in forest.reader()? {
             let row = row?;
@@ -195,6 +212,8 @@ impl ServingArtifact {
             }
         }
         let topology_run = topology.finish(&mut space)?;
+        report.topology_sort = start.elapsed();
+        let start = Instant::now();
         let mut records = space.reader(&record_run)?;
         let mut topology = space.reader(&topology_run)?;
         let mut next = topology.next()?;
@@ -206,7 +225,6 @@ impl ServingArtifact {
         )?;
         let (types, count) = index.tree_key_types();
         let types = &types[..count];
-        let mut report = ServingReport::default();
         let mut previous = None;
         while let Some(record) = records.next()? {
             if previous.as_ref() == Some(&record.key) {
@@ -434,9 +452,13 @@ impl ServingArtifact {
             )?;
         }
         drop(topology);
+        report.join_encode = start.elapsed();
+        let start = Instant::now();
         let output_run = output.finish(&mut space)?;
         space.remove(record_run)?;
         space.remove(topology_run)?;
+        report.output_merge = start.elapsed();
+        let start = Instant::now();
         let mut output = space.reader(&output_run)?;
         let mut next = output.next()?;
         let mut synopses = Sorter::new(&space, options.memory_bytes)?;
@@ -488,6 +510,8 @@ impl ServingArtifact {
             )?;
         }
         let synopsis_run = synopses.finish(&mut space)?;
+        report.synopsis = start.elapsed();
+        let start = Instant::now();
         let mut synopses = space.reader(&synopsis_run)?;
         let mut next_synopsis = synopses.next()?;
         let mut previous_key: Option<Vec<u8>> = None;
@@ -531,6 +555,7 @@ impl ServingArtifact {
         report.peak_scratch_bytes = space.peak;
         report.scratch_written_bytes = space.written;
         let artifact = writer.seal()?;
+        report.final_emit = start.elapsed();
         Ok((
             Self {
                 directory: directory.to_owned(),

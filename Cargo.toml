@@ -30,7 +30,7 @@ default = []
 bytes = "1"
 getrandom = { version = "0.3", features = ["std"] }
 metrics = "0.24"
-sha2 = "0.10"
+sha2 = "0.11"
 sysinfo = { version = "0.36.1", default-features = false, features = ["system"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
