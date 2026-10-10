@@ -36,17 +36,10 @@ impl BuildDescriptor {
             || source
                 .to_str()
                 .is_none_or(|path| path.len() > MAX_SOURCE_PATH_BYTES || path.contains('\0'))
-            || options.min_partition_entries == 0
-            || options
-                .min_partition_entries
-                .checked_mul(2)
-                .is_none_or(|minimum| minimum > options.max_partition_entries)
-            || options.sample_items < 2
-            || options.memory_bytes == 0
-            || options.scratch_bytes == 0
         {
             return Err(Error::invalid_argument());
         }
+        options.validate()?;
         Ok(Self {
             source,
             input,

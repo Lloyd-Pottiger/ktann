@@ -6,7 +6,7 @@ use crate::api::{
 };
 use crate::observe::labels::Operation;
 use crate::storage::backend::{Backend, ReadOps, ScanLimits, WriteTxn};
-use crate::storage::keys::{self, KeyRange, LogicalKey};
+use crate::storage::keys::{self, LogicalKey};
 use crate::storage::values::{
     BuildSchedule, IndexLifecycle, IndexManifest, PersistentValue, ValueCodec,
 };
@@ -331,17 +331,9 @@ async fn discover<B: Backend>(
     context.checkpoint()?;
     let backend = context.backend();
     let mut txn = backend.begin_read().await?;
-    let start = after.map_or_else(
-        || vec![0, 3],
-        |id| {
-            let mut key = keys::build_schedule_key(id);
-            key.push(0);
-            key
-        },
-    );
     let page = txn
         .scan(
-            &KeyRange::new(start, vec![0, 4]),
+            &keys::build_schedule_range(after),
             ScanLimits {
                 item_limit: limit,
                 byte_limit: 1024 * 1024,

@@ -13,7 +13,7 @@ const DISK_LIMIT: u64 = 64 * 1024 * 1024 * 1024;
 /// Caller-owned input is encoded and hashed on receipt; EOF only seals it.
 pub(super) struct InputCapture {
     root: PathBuf,
-    config: IndexConfig,
+    construction: ConstructionOptions,
     writer: PreparedInputWriter,
 }
 fn io(error: std::io::Error) -> Error {
@@ -27,20 +27,21 @@ impl InputCapture {
         fs::create_dir(&root).map_err(io)?;
         fs::create_dir(root.join("workspace")).map_err(io)?;
         let worker = BulkWorkerOptions::new(root.join("workspace"));
+        let construction = construction_options(&config);
         let writer = PreparedInputWriter::new(
             &root.join("source"),
             &root.join("preparation"),
-            config.clone(),
+            config,
             DISK_LIMIT,
             ForestOptions {
-                tree: construction_options(&config),
+                tree: construction,
                 sort_memory_bytes: worker.sort_memory_bytes,
                 sort_scratch_bytes: worker.sort_scratch_bytes,
             },
         )?;
         Ok(Self {
             root,
-            config,
+            construction,
             writer,
         })
     }
@@ -58,8 +59,7 @@ pub(super) async fn build<B: Backend>(
     staging: InputCapture,
 ) -> Result<(Index<B>, serde_json::Value)> {
     let workspace = staging.root.join("workspace");
-    let config = staging.config.clone();
-    let options = construction_options(&config);
+    let options = staging.construction;
     let start = Instant::now();
     let prepared = tokio::task::spawn_blocking(move || staging.finish())
         .await
