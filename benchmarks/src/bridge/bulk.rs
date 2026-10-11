@@ -1,6 +1,7 @@
 //! Streaming input capture and real core Bulk Build for the benchmark bridge.
 use ktann::api::{BulkWorkerOptions, Error, ErrorKind, Index, IndexConfig, Record, Result};
-use ktann::bulk::{ConstructionOptions, ForestOptions, PreparedInput, PreparedInputWriter};
+use ktann::bulk::{ForestOptions, PreparedInput, PreparedInputWriter};
+use ktann::construction::ConstructionOptions;
 use ktann::runtime::Runtime;
 use ktann::storage::backend::Backend;
 use serde_json::json;
@@ -34,7 +35,9 @@ impl InputCapture {
             config,
             DISK_LIMIT,
             ForestOptions {
-                tree: construction,
+                sample_items: construction.sample_items,
+                tree_memory_bytes: construction.memory_bytes,
+                tree_scratch_bytes: construction.scratch_bytes,
                 sort_memory_bytes: worker.sort_memory_bytes,
                 sort_scratch_bytes: worker.sort_scratch_bytes,
             },
@@ -72,7 +75,7 @@ pub(super) async fn build<B: Backend>(
     let worker = BulkWorkerOptions::new(workspace);
     let start = Instant::now();
     let (index, stages) = job
-        .complete(worker.clone(), Some(prepared), Default::default())
+        .complete_with_report(worker.clone(), Some(prepared), Default::default())
         .await?;
     let publish_seconds = stages.publish.as_secs_f64();
     let prepare_load_seconds = start.elapsed().as_secs_f64() - publish_seconds;

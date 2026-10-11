@@ -14,7 +14,8 @@ hidden Building index, with exact validation before atomic publication.
 KTANN is an asynchronous Rust library that stores source vectors and their
 searchable approximate-nearest-neighbor index atomically in a transactional KV
 backend. One Logical Index is a Tree-Key-sharded forest of incrementally
-maintained binary K-means trees. Search uses conservative predicate pruning,
+maintained centroid-routing trees. Bulk Build uses bounded multi-center grouping
+at every level; online maintenance uses balanced binary splits. Search uses conservative predicate pruning,
 RaBitQ7 approximate ranking, and exact reranking over the original vectors.
 
 KTANN supports Memory, FoundationDB, and RocksDB through one logical

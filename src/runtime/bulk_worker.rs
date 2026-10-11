@@ -1,6 +1,6 @@
 //! Durable, attempt-fenced preparation and namespace-owned artifact reclamation.
 use super::{OperationContext, lifecycle::RetryPolicy};
-use crate::api::{BulkWorkerOptions, BulkBuildReport, Error, ErrorKind, Result};
+use crate::api::{BulkBuildReport, BulkWorkerOptions, Error, ErrorKind, Result};
 use crate::bulk::{
     ForestArtifact, ForestOptions, InputSnapshot, PreparedInput, ServingArtifact, ServingOptions,
 };
@@ -122,10 +122,14 @@ pub(crate) async fn complete<B: Backend>(
     loop {
         context.checkpoint()?;
         let result = async {
-            match super::bulk_publish::publish(context, index.clone(), descriptor.clone(), retry)
-                .await
-            {
+            let started = Instant::now();
+            let publication =
+                super::bulk_publish::publish(context, index.clone(), descriptor.clone(), retry)
+                    .await;
+            report.publish += started.elapsed();
+            match publication {
                 Err(error) if error.kind() == ErrorKind::BulkBuildBusy => {
+                    let publication_time = report.publish;
                     report = run(
                         context,
                         index.clone(),
@@ -135,8 +139,17 @@ pub(crate) async fn complete<B: Backend>(
                         retry,
                     )
                     .await?;
-                    super::bulk_publish::publish(context, index.clone(), descriptor.clone(), retry)
-                        .await
+                    report.publish = publication_time;
+                    let started = Instant::now();
+                    let publication = super::bulk_publish::publish(
+                        context,
+                        index.clone(),
+                        descriptor.clone(),
+                        retry,
+                    )
+                    .await;
+                    report.publish += started.elapsed();
+                    publication
                 }
                 result => result,
             }
@@ -152,10 +165,16 @@ pub(crate) async fn complete<B: Backend>(
         };
         match result {
             Ok(active) => {
+                let started = Instant::now();
                 match cleanup(context, index.logical_index_id(), retry).await {
-                    Err(error) if error.kind() == ErrorKind::BulkBuildBusy => {}
+                    // Manual callers can defer cleanup to the namespace sweep.
+                    // Scheduled jobs must retain their queue entry until cleanup succeeds.
+                    Err(error)
+                        if error.kind() == ErrorKind::BulkBuildBusy
+                            && context.bulk_authority.is_none() => {}
                     result => result?,
                 }
+                report.publish += started.elapsed();
                 report.rotation_seed = *index.rotation_seed();
                 return Ok((active, report));
             }
@@ -374,7 +393,14 @@ async fn prepare_and_load<B: Backend>(
             let lock = lock.clone();
             blocking(context, move || {
                 let _lock = lock;
-                ForestArtifact::open(&path, expected, source.manifest(), source.config().clone(), seed, forest_options.sample_items)
+                ForestArtifact::open(
+                    &path,
+                    expected,
+                    source.manifest(),
+                    source.config().clone(),
+                    seed,
+                    forest_options.sample_items,
+                )
             })
             .await?
         } else {

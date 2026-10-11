@@ -5,7 +5,8 @@ use ktann::api::{
     BulkWorkerOptions, Error, ErrorKind, GetOptions, IndexConfig, Metric, Record, RuntimeConfig,
     SearchRequest,
 };
-use ktann::bulk::{ConstructionOptions, InputSnapshot};
+use ktann::bulk::InputSnapshot;
+use ktann::construction::ConstructionOptions;
 use ktann::runtime::Runtime;
 use ktann_rocksdb::{BackendNamespace, RocksDbBackend};
 use rocksdb::{OptimisticTransactionDB, Options};
@@ -106,7 +107,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     let worker = BulkWorkerOptions::new(output.join("workspace"));
     let build_started = Instant::now();
-    let (index, stages) = job.complete(worker, None, Default::default()).await?;
+    let (index, stages) = job
+        .complete_with_report(worker, None, Default::default())
+        .await?;
     let validation_publication_cleanup_seconds = stages.publish.as_secs_f64();
     let build_and_load_seconds =
         build_started.elapsed().as_secs_f64() - validation_publication_cleanup_seconds;

@@ -768,11 +768,11 @@ async fn prepared_receipt_and_lost_preparation_both_publish_complete_indexes() {
         .unwrap();
         let source = prepared.source().clone();
         let job = runtime
-            .start_bulk_build("bulk", &source, forest.tree)
+            .start_bulk_build("bulk", &source, construction_options())
             .await
             .unwrap();
-        let report = if mode == 0 {
-            job.run_worker_with_prepared_input(opts.clone(), prepared, Default::default())
+        let (index, report) = if mode == 0 {
+            job.complete_with_report(opts.clone(), Some(prepared), Default::default())
                 .await
                 .unwrap()
         } else {
@@ -782,7 +782,7 @@ async fn prepared_receipt_and_lost_preparation_both_publish_complete_indexes() {
                 let mut mismatched = opts.clone();
                 mismatched.sort_memory_bytes *= 2;
                 assert_eq!(
-                    job.run_worker_with_prepared_input(mismatched, prepared, Default::default())
+                    job.complete_with_report(mismatched, Some(prepared), Default::default())
                         .await
                         .unwrap_err()
                         .kind(),
@@ -790,12 +790,20 @@ async fn prepared_receipt_and_lost_preparation_both_publish_complete_indexes() {
                 );
             }
             fs::remove_dir_all(dir.0.join("receipt")).unwrap();
-            job.run_worker(opts.clone()).await.unwrap()
+            job.complete_with_report(opts.clone(), None, Default::default())
+                .await
+                .unwrap()
         };
         assert!(!report.forest.is_zero());
         assert!(!report.serving.is_zero());
         assert!(!report.load.is_zero());
-        let index = job.publish().await.unwrap();
+        assert!(!report.publish.is_zero());
+        assert_eq!(report.rotation_seed, *job.index_manifest().rotation_seed());
+        let (_, reused) = job
+            .complete_with_report(opts.clone(), None, Default::default())
+            .await
+            .unwrap();
+        assert!(reused.forest.is_zero() && reused.serving.is_zero() && reused.load.is_zero());
         let verified = index.verify(VerifyOptions::default()).await.unwrap();
         assert!(verified.complete && verified.issues.is_empty());
         assert_eq!(verified.objects.vector_records, 73);

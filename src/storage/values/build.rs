@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::api::{Error, Result};
 use crate::bulk::{ARTIFACT_MANIFEST_BYTES, ArtifactManifest};
-use crate::construction::{CONSTRUCTION_VERSION, ConstructionOptions};
+use crate::construction::ConstructionOptions;
 
 use super::corrupt;
 use super::wire::{Decoder, Encoder};
@@ -73,7 +73,6 @@ impl fmt::Debug for BuildDescriptor {
 }
 
 pub(super) fn encode(encoder: &mut Encoder, descriptor: &BuildDescriptor) -> Result<()> {
-    encoder.u32(CONSTRUCTION_VERSION);
     encoder.sized_bytes(
         descriptor
             .source
@@ -93,9 +92,6 @@ pub(super) fn encode(encoder: &mut Encoder, descriptor: &BuildDescriptor) -> Res
 }
 
 pub(super) fn decode(decoder: &mut Decoder) -> Result<BuildDescriptor> {
-    if decoder.u32()? != CONSTRUCTION_VERSION {
-        return Err(Error::new(crate::api::ErrorKind::UnsupportedFormat));
-    }
     let path = decoder.sized_bytes(MAX_SOURCE_PATH_BYTES)?;
     let source = PathBuf::from(std::str::from_utf8(&path).map_err(|_| corrupt())?);
     let input = ArtifactManifest::decode(&decoder.sized_bytes(ARTIFACT_MANIFEST_BYTES)?)?;

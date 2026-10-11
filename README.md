@@ -60,10 +60,12 @@ Backend-neutral transaction contract
 ```
 
 Caller-declared **Tree Key** fields divide an index into disjoint shards, each
-with an incremental binary K-means tree. This lets applications route searches
+with a centroid-routing tree. This lets applications route searches
 by fields such as tenant or collection. Internal partitions route by centroid
 distance; leaf partitions apply exact predicates and rank compact RaBitQ7
-representations before reranking over the original vectors.
+representations before reranking over the original vectors. Bulk Build groups all
+tree levels with the same bounded multi-center protocol; online maintenance uses
+balanced binary splits.
 
 Each search uses a single consistent backend snapshot. Approximate candidate
 selection can miss true nearest neighbors, even when it returns `k` hits;

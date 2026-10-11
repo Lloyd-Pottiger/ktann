@@ -122,7 +122,7 @@ pub async fn exercise<B: Backend>(backend: impl Fn() -> B, directory: &Path) {
         assert_eq!(txn.get(entry.key).await.unwrap(), Some(entry.value));
     }
     drop(txn);
-    let index = reopened.complete(worker).await.unwrap();
+    let index = reopened.complete(worker.clone()).await.unwrap();
     let verified = index
         .verify(ktann::api::VerifyOptions::default())
         .await

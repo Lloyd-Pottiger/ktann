@@ -95,14 +95,16 @@ See [ADR 0026](../adr/0026-building-reservations.md) and
 
 ## Automatic scheduling
 
-`enqueue` persists worker options for automatic preparation, loading, and
+`schedule` persists worker options for automatic preparation, loading, and
 publication. Scheduler ownership fences worker, load, and publication writes.
 Bounded leases permit takeover after a worker stops renewing; namespace cleanup
 reclaims orphaned owned files. Manual completion remains available.
 
-Receipt-time preparation can be passed with `run_worker_with_prepared_input`.
+Receipt-time preparation can be passed with `complete_with_report`.
 It is a volatile optimization: its source identity, configuration, and options
 are checked before use; recovery recomputes it from the sealed Input Snapshot.
 
-Measured throughput, search quality, and evidence limits are recorded in
-[Bulk Build Performance](bulk-build-performance.md).
+`complete_with_report(options, prepared_input, control)` completes the same
+protocol while returning stage timing and the persisted rotation seed. Reused
+preparation and loading stages report zero work. These measurements are
+per-invocation observations, not throughput or latency guarantees.

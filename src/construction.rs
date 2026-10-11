@@ -38,6 +38,22 @@ pub struct ConstructionOptions {
 }
 
 impl ConstructionOptions {
+    /// Checks dimension-independent invariants before persisting a build request.
+    pub(crate) fn validate(self) -> Result<()> {
+        if self.min_partition_entries == 0
+            || self
+                .min_partition_entries
+                .checked_mul(2)
+                .is_none_or(|minimum| minimum > self.max_partition_entries)
+            || self.sample_items < 2
+            || self.memory_bytes == 0
+            || self.scratch_bytes == 0
+        {
+            return Err(Error::invalid_argument());
+        }
+        Ok(())
+    }
+
     /// Return the resident row allowance after reserving non-resident working space.
     /// Caller-owned input buffers and emitted plans retained by the consumer are
     /// outside this budget; construction owns only the buffers needed to emit them.
@@ -63,17 +79,7 @@ impl ConstructionOptions {
             // One sequential input reader retains an encoded vector buffer.
             .and_then(|n| n.checked_add(dimension * 4))
             .ok_or(Error::new(ErrorKind::LimitExceeded))?;
-        if self.min_partition_entries == 0
-            || self
-                .min_partition_entries
-                .checked_mul(2)
-                .is_none_or(|minimum| minimum > self.max_partition_entries)
-            || self.sample_items < 2
-            || self.memory_bytes == 0
-            || self.scratch_bytes == 0
-        {
-            return Err(Error::invalid_argument());
-        }
+        self.validate()?;
         if self.memory_bytes
             <= reserved
                 .checked_add(row_bound)

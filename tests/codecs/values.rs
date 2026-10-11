@@ -951,9 +951,8 @@ fn reopened_manifest_reproduces_identical_index_value_bytes() {
 #[test]
 fn building_manifest_and_request_descriptor_have_canonical_bytes() {
     use ktann::bulk::ArtifactManifest;
-    use ktann::bulk::ConstructionOptions;
+    use ktann::construction::ConstructionOptions;
     use ktann::storage::values::BuildDescriptor;
-    use ktann::test_support::construction::CONSTRUCTION_VERSION;
     let codec = ValueCodec::bootstrap();
     let building = minimal_manifest().with_lifecycle(IndexLifecycle::Building);
     let bytes = codec
@@ -981,7 +980,6 @@ fn building_manifest_and_request_descriptor_have_canonical_bytes() {
     let key = LogicalKey::BuildDescriptor(id(1));
     let bytes = codec.encode(&value).unwrap();
     let mut expected = vec![0x0d];
-    expected.extend_from_slice(&CONSTRUCTION_VERSION.to_be_bytes());
     expected.extend_from_slice(&7_u32.to_be_bytes());
     expected.extend_from_slice(b"/source");
     expected.extend_from_slice(&89_u32.to_be_bytes());
@@ -1000,14 +998,8 @@ fn building_manifest_and_request_descriptor_have_canonical_bytes() {
     trailing.push(0);
     assert_corrupt(decode(codec, &key, &trailing));
     let mut invalid = bytes.to_vec();
-    invalid[9] = b'x';
+    invalid[5] = b'x';
     assert_corrupt(decode(codec, &key, &invalid));
-    let mut unsupported = bytes.to_vec();
-    unsupported[1..5].copy_from_slice(&u32::MAX.to_be_bytes());
-    assert_eq!(
-        decode(codec, &key, &unsupported).unwrap_err().kind(),
-        ErrorKind::UnsupportedFormat
-    );
     for kind in [2, 3] {
         input_bytes[8] = kind;
         assert!(

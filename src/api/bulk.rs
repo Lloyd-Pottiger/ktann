@@ -365,7 +365,9 @@ impl<B: Backend> BulkBuildJob<B> {
         options: BulkWorkerOptions,
         control: OperationOptions,
     ) -> Result<super::Index<B>> {
-        self.complete_with_report(options, None, control).await.map(|(index, _)| index)
+        self.complete_with_report(options, None, control)
+            .await
+            .map(|(index, _)| index)
     }
 
     /// Completes preparation, loading, validation, publication and workspace cleanup.
@@ -409,7 +411,7 @@ impl<B: Backend> BulkBuildJob<B> {
     /// Resumes preparation and loading, reusing previously accepted artifacts.
     /// The new invocation takes a durable attempt epoch. Completion leaves the
     /// index hidden; call `publish` to validate and activate it.
-    pub async fn run_worker(&self, options: BulkWorkerOptions) -> Result<BulkBuildReport> {
+    pub async fn run_worker(&self, options: BulkWorkerOptions) -> Result<()> {
         self.run_worker_with_control(options, OperationOptions::default())
             .await
     }
@@ -418,28 +420,7 @@ impl<B: Backend> BulkBuildJob<B> {
         &self,
         options: BulkWorkerOptions,
         control: OperationOptions,
-    ) -> Result<BulkBuildReport> {
-        self.run_worker_input(options, None, control).await
-    }
-
-    /// Reuses bounded receipt-time sorting. Loss of this volatile preparation
-    /// never prevents ordinary `run_worker` recovery from the sealed source.
-    pub async fn run_worker_with_prepared_input(
-        &self,
-        options: BulkWorkerOptions,
-        prepared: crate::bulk::PreparedInput,
-        control: OperationOptions,
-    ) -> Result<BulkBuildReport> {
-        self.run_worker_input(options, Some(prepared), control)
-            .await
-    }
-
-    async fn run_worker_input(
-        &self,
-        options: BulkWorkerOptions,
-        prepared: Option<crate::bulk::PreparedInput>,
-        control: OperationOptions,
-    ) -> Result<BulkBuildReport> {
+    ) -> Result<()> {
         let manifest = self.manifest.clone();
         let descriptor = self.descriptor.clone();
         let retry = lifecycle::RetryPolicy::from_config(self.runtime.config());
@@ -454,13 +435,15 @@ impl<B: Backend> BulkBuildJob<B> {
                         manifest,
                         descriptor,
                         options,
-                        prepared,
+                        None,
                         retry,
                     )
                     .await
+                    .map(|_| ())
                 },
             )
             .await
+            .map(|_| ())
     }
     /// Requires completed loading, resumes exact paged validation, and publishes.
     /// Unknown publication is resolved by the original Logical Index identity.

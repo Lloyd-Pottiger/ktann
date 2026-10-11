@@ -241,7 +241,7 @@ It survives removal of the index prefix until exclusive-lock cleanup completes.
 
 **Build Validation**: A paged exact comparison proof between a core-accepted
 Serving Artifact and frozen backend serving KV bytes. The completed proof and
-sealed Build Load authorize one atomic transition from Building to Active.
+immutable completed Build Load authorize one atomic transition from Building to Active.
 
 
 **Build Schedule**: Namespace-scoped durable request for automatic execution of

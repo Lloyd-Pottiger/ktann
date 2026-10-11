@@ -34,7 +34,7 @@
 
 pub mod api;
 pub mod bulk;
-mod construction;
+pub mod construction;
 pub mod maintenance;
 mod observe;
 pub mod runtime;

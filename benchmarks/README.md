@@ -131,7 +131,7 @@ These import options apply to `--profile large` or an explicitly selected
 After immediate search, the lifecycle runner reopens the Logical Index with
 its configured convergence workers, allowing an import with maintenance disabled
 to reach the stable search phases. Online loads submit batches sequentially; see
-[ADR 0022](../docs/adr/0022-resumable-bulk-build.md).
+[the mutation contract](../docs/design/api.md).
 
 ## Measurements
 

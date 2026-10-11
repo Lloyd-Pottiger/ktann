@@ -2,8 +2,8 @@
 //!
 //! This module is excluded from production builds unless `test-support` is enabled.
 
-pub use crate::bulk::forest::{ForestArtifact, ForestPartition, ForestReader};
-pub use crate::bulk::serving::{ServingArtifact, ServingEntry, ServingOptions, ServingReader};
+pub use crate::bulk::{ForestArtifact, ForestPartition, ForestReader};
+pub use crate::bulk::{ServingArtifact, ServingEntry, ServingOptions, ServingReader};
 
 /// Pure tree-construction primitives used by algorithm tests.
 pub mod construction {

@@ -53,7 +53,7 @@ async fn publish_inner<B: Backend>(
             .await?
         {
             Some(PersistentValue::BuildWorkspace(state)) => state,
-            None => return Err(Error::invalid_argument()),
+            None => return Err(Error::new(ErrorKind::BulkBuildBusy)),
             _ => return Err(corrupt()),
         }
     };

@@ -311,6 +311,11 @@ to `job.complete`. It resumes preparation, loading, exact validation, publicatio
 and owned-file cleanup under one operation control scope, returning an Active
 Index. Repeating completion after publication resolves the same identity without
 requiring source or workspace files.
+`complete_with_report(options, prepared_input, control)` follows the same recovery
+protocol and returns the Index plus a `BulkBuildReport`. Optional receipt-time
+preparation is validated against the reserved input and worker options. The
+report records work performed by this invocation; reused preparation and loading
+stages have zero duration.
 
 For explicit phase control, `job.run_worker` prepares accepted Forest and Serving artifacts and
 loads the backend in bounded transactions. Repeating the same options resumes

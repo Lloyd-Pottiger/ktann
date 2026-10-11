@@ -708,5 +708,17 @@ fn serving_reopens_after_relocation_and_rejects_wrong_bindings_and_corruption() 
     );
 }
 
+// Recovery and publication tests share the same bounded artifact fixture.
 #[path = "bulk_serving/load.rs"]
 mod load;
+
+fn construction_options() -> ktann::construction::ConstructionOptions {
+    let forest = options();
+    ktann::construction::ConstructionOptions {
+        min_partition_entries: 2,
+        max_partition_entries: 4,
+        sample_items: forest.sample_items,
+        memory_bytes: forest.tree_memory_bytes,
+        scratch_bytes: forest.tree_scratch_bytes,
+    }
+}
