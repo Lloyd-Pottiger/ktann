@@ -117,7 +117,7 @@ fn construction_options(config: &IndexConfig) -> ConstructionOptions {
     ConstructionOptions {
         min_partition_entries: config.min_partition_entries(),
         max_partition_entries: config.max_partition_entries(),
-        sample_items: 256,
+        sample_items: 1024,
         memory_bytes: 256 * 1024 * 1024,
         scratch_bytes: DISK_LIMIT,
     }

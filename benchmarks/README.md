@@ -334,9 +334,9 @@ included in receipt. The source snapshot and report remain caller-owned;
 successful publication reclaims core attempts. Forest construction still begins
 after EOF seals the source; this is incremental input preparation, not streaming
 final tree assignment.
-Construction uses the index's min/max defaults, sample 256, 256 MiB tree memory,
-and 64 GiB tree scratch; the report records worker limits. No online insertion or
-post-build refinement is substituted into this path.
+Construction uses the index's min/max defaults, a training sample cap of 1024,
+256 MiB tree memory, and 64 GiB tree scratch; the report records worker limits.
+No online insertion or post-build refinement is substituted into this path.
 
 For an online/bulk comparison, use the same release binary, dataset identity,
 backend settings, query set and concurrency. Run serially on an otherwise idle
