@@ -31,7 +31,6 @@ impl<B: Backend> Index<B> {
     pub async fn batch_get(&self, ids: Vec<Bytes>, options: GetOptions)
         -> Result<Vec<Option<StoredRecord>>>;
     pub async fn search(&self, request: SearchRequest) -> Result<SearchOutcome>;
-    pub fn import_session(&self, options: ImportOptions) -> Result<ImportSession<B>>;
     pub async fn verify(&self, options: VerifyOptions) -> Result<VerifyReport>;
     pub async fn refine(&self, options: RefineOptions) -> Result<()>;
 }
@@ -222,8 +221,6 @@ The v1 defaults and caps are:
 | Leaf beam size | 128 | 16,384 |
 | Write beam size | 8 | 16,384 |
 | Tree Key scan ranges | 1,024 | wider conservative fallback |
-| Import maximum in-flight batches | `min(available_parallelism,4)`, min 1 | positive |
-| Import backlog watermark | 2 | within queue capacity |
 
 Retry backoff starts at 1 ms, doubles to 100 ms, and applies full jitter in the
 current interval.
@@ -280,17 +277,7 @@ Display and Debug redact Index Name, raw Tree Key, Record ID, field values,
 vectors, and payload. Cancellation never rewrites a successful commit or a
 commit of unknown outcome.
 
-## 7. Import and verification shapes
-
-`ImportSession::submit(&mut self, Vec<Mutation>)` waits for local capacity,
-admits exactly one ordinary atomic batch, and returns a unique process-local
-`BatchToken`. Each session starts with one active batch and learns concurrency
-from saturated clean completions and retryable conflicts up to its configured ceiling;
-multiple accepted batches may execute concurrently within that learned bound.
-`finish(self)` waits for all accepted work and returns ordered
-`ImportBatchResult { token, result }` values in submission order. Dropping the
-session cancels work not yet admitted to commit; committing work continues under
-the Runtime's in-flight guard.
+## 7. Verification shape
 
 Verify returns a bounded report with `complete`, coarse issue kinds, safe
 identifiers, and logical-object counts. Options bound issues, objects, memory,
@@ -303,6 +290,5 @@ is no continuation or repair API.
 - Compile tests protect constructors, builder ownership, non-exhaustive enums,
   Send/Sync requirements, and redacted formatting.
 - Focused tests cover record/schema/predicate boundaries, batch ordering,
-  cancellation-before-commit, commit-result priority, search metadata, import
-  token ordering, and lifecycle idempotency.
+  cancellation-before-commit, commit-result priority, search metadata, and lifecycle idempotency.
 - Public tests assert behavior, not private cache, task, or codec structure.

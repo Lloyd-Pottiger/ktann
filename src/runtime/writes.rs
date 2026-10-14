@@ -20,7 +20,6 @@ use crate::storage::backend::Backend;
 use crate::storage::values::IndexManifest;
 
 use super::OperationContext;
-use super::import::ImportPermit;
 use super::lifecycle::RetryPolicy;
 use super::reads;
 
@@ -58,6 +57,15 @@ pub(crate) async fn open_validated_write<'b, 'm, B: Backend>(
     ))
 }
 
+/// Records the native commit wait and outcome of one finished commit call.
+fn observe_commit(operation: Operation, committed: &Result<()>, started: Instant) {
+    metrics::write_commit_finished(
+        operation,
+        WriteAttemptOutcome::from_result(committed),
+        started.elapsed(),
+    );
+}
+
 /// Runs one bounded write operation as a sequence of whole attempts.
 ///
 /// Each attempt opens a fresh manifest-validated write transaction, runs
@@ -70,59 +78,10 @@ pub(crate) async fn open_validated_write<'b, 'm, B: Backend>(
 /// maintenance step — the attempt commits plainly.
 pub(crate) async fn run_write_attempts<'b, 'm, B: Backend, O>(
     backend: &'b B,
-    context: Option<&mut OperationContext<B>>,
-    handle_manifest: &'m IndexManifest,
-    retry: &RetryPolicy,
-    operation: Operation,
-    step: impl for<'a> FnMut(&'a mut WriteLogicalTxn<'m, B::WriteTxn<'b>>) -> StepFuture<'a, O>,
-) -> Result<O> {
-    let mut permit = None;
-    run_write_attempts_with_optional_import_permit(
-        backend,
-        context,
-        handle_manifest,
-        retry,
-        operation,
-        &mut permit,
-        step,
-    )
-    .await
-}
-
-/// Applies one bounded retry delay around an optional slow-path control.
-pub(crate) async fn wait_before_retry<B: Backend>(
-    retry: &RetryPolicy,
-    operation: Operation,
-    failed_attempts: &mut u32,
-    permit: &mut Option<&mut ImportPermit<B>>,
-) -> Result<()> {
-    if let Some(permit) = permit.as_deref_mut() {
-        permit.observe_contention();
-    }
-    retry.wait_or_exhaust(operation, failed_attempts).await?;
-    if let Some(permit) = permit.as_deref_mut() {
-        permit.resume_after_backoff().await;
-    }
-    Ok(())
-}
-
-/// Records the native commit wait and outcome of one finished commit call.
-fn observe_commit(operation: Operation, committed: &Result<()>, started: Instant) {
-    metrics::write_commit_finished(
-        operation,
-        WriteAttemptOutcome::from_result(committed),
-        started.elapsed(),
-    );
-}
-
-/// Shared whole-attempt loop behind the ordinary and observed entry points.
-pub(crate) async fn run_write_attempts_with_optional_import_permit<'b, 'm, B: Backend, O>(
-    backend: &'b B,
     mut context: Option<&mut OperationContext<B>>,
     handle_manifest: &'m IndexManifest,
     retry: &RetryPolicy,
     operation: Operation,
-    permit: &mut Option<&mut ImportPermit<B>>,
     mut step: impl for<'a> FnMut(&'a mut WriteLogicalTxn<'m, B::WriteTxn<'b>>) -> StepFuture<'a, O>,
 ) -> Result<O> {
     let mut failed_attempts = 0_u32;
@@ -173,7 +132,9 @@ pub(crate) async fn run_write_attempts_with_optional_import_permit<'b, 'm, B: Ba
             Err(error) if error.kind() == ErrorKind::RetryableAbort => {}
             Err(error) => return Err(error),
         }
-        wait_before_retry(retry, operation, &mut failed_attempts, permit).await?;
+        retry
+            .wait_or_exhaust(operation, &mut failed_attempts)
+            .await?;
     }
 }
 

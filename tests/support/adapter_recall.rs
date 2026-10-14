@@ -159,7 +159,6 @@ pub async fn run<B: Backend>(backend: B, base: Vec<Arc<[f32]>>, queries: Vec<Arc
         RuntimeConfig::default()
             .with_maintenance(2, 16)
             .and_then(|config| config.with_attempts(32, 32))
-            .and_then(|config| config.with_import_limits(1, 1))
             .expect("valid runtime config"),
     )
     .expect("runtime");

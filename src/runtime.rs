@@ -24,7 +24,6 @@ use crate::storage::backend::{Backend, CommitCancellation, CommitStart};
 use self::fixup::FixupQueue;
 
 pub(crate) mod fixup;
-pub(crate) mod import;
 pub(crate) mod lifecycle;
 pub(crate) mod reads;
 pub(crate) mod refine;
@@ -74,7 +73,6 @@ impl<B: Backend> Runtime<B> {
                     fixups: Mutex::new(FixupQueue::new(config.fixup_queue_capacity())),
                     fixup_reporting: Mutex::new(()),
                     fixup_available: Notify::new(),
-                    fixup_released: Notify::new(),
                     maintenance_cancel: CancellationToken::new(),
                     lifecycle: Mutex::new(Lifecycle {
                         phase: Phase::Accepting,
@@ -192,7 +190,7 @@ impl<B: Backend> Runtime<B> {
 
     /// Stops admission and waits for all admitted work to finish.
     ///
-    /// Shutdown is idempotent. It atomically stops new foreground, import, and
+    /// Shutdown is idempotent. It atomically stops new foreground and
     /// maintenance admission, cancels queued Fixups that have not begun, waits
     /// for admitted foreground operations and detached commit completions,
     /// then stops the maintenance workers and releases the backend. Operations
@@ -381,9 +379,6 @@ pub(crate) struct RuntimeInner<B: Backend> {
     /// Serializes backlog metric callbacks without holding the Fixup queue lock.
     fixup_reporting: Mutex<()>,
     fixup_available: Notify,
-    /// Signalled when a released Fixup queue slot opens the Import Session
-    /// backlog gate, so gated submissions re-check the watermark.
-    fixup_released: Notify,
     maintenance_cancel: CancellationToken,
     lifecycle: Mutex<Lifecycle<B>>,
     terminal: Notify,
@@ -643,7 +638,7 @@ impl<B: Backend> RuntimeInner<B> {
         self.lock_lifecycle().phase
     }
 
-    /// Returns whether the Runtime still admits new foreground and import work.
+    /// Returns whether the Runtime still admits new foreground work.
     pub(crate) fn is_accepting(&self) -> bool {
         self.phase() == Phase::Accepting
     }
@@ -673,7 +668,7 @@ struct Lifecycle<B: Backend> {
 }
 
 impl<B: Backend> Lifecycle<B> {
-    /// Whether the Runtime still admits new foreground, import, and
+    /// Whether the Runtime still admits new foreground and
     /// maintenance work.
     fn is_accepting(&self) -> bool {
         self.phase == Phase::Accepting

@@ -24,10 +24,6 @@ pub(crate) mod key {
     pub(crate) const RESULT: &str = "result";
     /// The Fixup state machine or verification issue kind.
     pub(crate) const KIND: &str = "kind";
-    /// One Import Session admission gate.
-    pub(crate) const GATE: &str = "gate";
-    /// One adaptive-control direction.
-    pub(crate) const DIRECTION: &str = "direction";
 }
 
 /// One measured search stage (key `stage`).
@@ -89,7 +85,7 @@ pub(crate) enum Operation {
     Upsert,
     /// `Index::delete`.
     Delete,
-    /// `Index::batch_mutate`, including one Import Session batch.
+    /// `Index::batch_mutate`.
     BatchMutate,
     /// `Index::get`.
     Get,
@@ -401,44 +397,6 @@ impl FixupExecution {
     }
 }
 
-/// One Import Session admission gate (key `gate`).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ImportGate {
-    /// The bounded in-flight batch slot.
-    InFlightSlot,
-    /// The maintenance backlog watermark.
-    Backlog,
-}
-
-impl ImportGate {
-    /// The bounded label value.
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::InFlightSlot => "in_flight_slot",
-            Self::Backlog => "backlog",
-        }
-    }
-}
-
-/// One adaptive Import Session concurrency change (key `direction`).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ImportConcurrencyAdjustment {
-    /// A clean completion window admitted one more concurrent batch.
-    Increased,
-    /// Retryable contention contracted the active batch window.
-    Decreased,
-}
-
-impl ImportConcurrencyAdjustment {
-    /// The bounded label value.
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Increased => "increased",
-            Self::Decreased => "decreased",
-        }
-    }
-}
-
 /// The completeness outcome of one verification report (key `outcome`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum VerifyCompletion {
@@ -568,8 +526,6 @@ mod tests {
             FixupExecution::Stalled.as_str(),
             FixupExecution::Yielded.as_str(),
             FixupExecution::Retired.as_str(),
-            ImportGate::InFlightSlot.as_str(),
-            ImportGate::Backlog.as_str(),
             VerifyCompletion::Complete.as_str(),
             VerifyCompletion::Incomplete.as_str(),
             verify_issue(VerifyIssueKind::InvalidEncoding),

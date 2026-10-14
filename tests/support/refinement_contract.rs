@@ -20,11 +20,7 @@ pub async fn setup<B: Backend>(
 ) -> (Runtime<B>, Index<B>, IndexManifest) {
     let runtime = Runtime::new(
         runtime_backend,
-        RuntimeConfig::default()
-            .with_maintenance(0, 1)
-            .unwrap()
-            .with_import_limits(1, 1)
-            .unwrap(),
+        RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
     )
     .unwrap();
     let index = runtime

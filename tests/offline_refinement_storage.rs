@@ -19,7 +19,6 @@ async fn setup() -> (MemoryBackend, IndexManifest) {
         backend.clone(),
         RuntimeConfig::default()
             .with_maintenance(0, 1)
-            .and_then(|config| config.with_import_limits(1, 1))
             .expect("manual maintenance"),
     )
     .expect("runtime");

@@ -69,7 +69,7 @@ new-index name=fashion dimension=784 metric=L2 fields=bucket:i64,label:i64 tree-
 ----
 created index "fashion"
 
-load dataset=file:fashion_mnist_base.idx3-ubyte tree=1 via=import batch=100
+load dataset=file:fashion_mnist_base.idx3-ubyte tree=1 via=batch batch=100
 ----
 loaded 10000 records (dataset=file:fashion_mnist_base.idx3-ubyte, seed=42)
 

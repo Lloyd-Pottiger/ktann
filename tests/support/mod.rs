@@ -37,7 +37,6 @@ pub mod topology_probe;
 pub fn manual_maintenance_config() -> RuntimeConfig {
     RuntimeConfig::default()
         .with_maintenance(0, 1)
-        .and_then(|config| config.with_import_limits(1, 1))
         .expect("valid manual-maintenance config")
 }
 

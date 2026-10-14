@@ -524,9 +524,9 @@ fn compare_lifecycle(
     compare_distribution(
         result,
         key,
-        "import submit latency",
-        &baseline.import.submit_latency_ms,
-        &candidate.import.submit_latency_ms,
+        "import batch latency",
+        &baseline.import.batch_latency_ms,
+        &candidate.import.batch_latency_ms,
         policy.maximum_relative_regression,
     );
     compare_count_maps(
@@ -1088,7 +1088,7 @@ fn cache_miss_ratio(lookups: &BTreeMap<String, u64>) -> f64 {
     misses as f64 / total as f64
 }
 
-/// Compares Backend blocking and Import admission p95 distributions.
+/// Compares Backend blocking admission p95 distributions.
 fn compare_admission(
     result: &mut ComparisonReport,
     scenario: &str,
@@ -1110,14 +1110,6 @@ fn compare_admission(
     ] {
         compare_distribution(result, scenario, name, baseline, candidate, threshold);
     }
-    compare_distributions(
-        result,
-        scenario,
-        "import admission",
-        &baseline.import_wait_ms,
-        &candidate.import_wait_ms,
-        threshold,
-    );
 }
 
 /// Compares one distribution without treating a missing series as zero work.
@@ -1376,8 +1368,6 @@ mod tests {
                 measured_operations: 100,
                 k: 10,
                 import_batch_size: None,
-                import_max_in_flight_batches: None,
-                import_backlog_watermark: None,
             },
             dataset: DatasetMetadata {
                 name: "clustered".to_owned(),
