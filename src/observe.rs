@@ -36,8 +36,6 @@
 //! | `ktann.bloom.fill_ratio` | histogram | — |
 //! | `ktann.refine.rounds` | counter | — |
 //! | `ktann.refine.moves` | counter | — |
-//! | `ktann.import.wait` | histogram | gate |
-//! | `ktann.import.concurrency.limit` | histogram | direction |
 //! | `ktann.verify.reports` | counter | outcome |
 //! | `ktann.verify.issues` | counter | kind |
 //!

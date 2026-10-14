@@ -98,7 +98,7 @@ CI both follow stable. Production code uses no nightly features.
 | [Storage](storage.md) | backend transaction contract, logical keys/codecs, typed atomic operations, manifests |
 | [Search](search.md) | numeric semantics, RaBitQ7, predicates, Tree Key planning, traversal, rerank, cache correctness |
 | [Maintenance](maintenance.md) | foreground routing and mutation protocol, tree shape, split/merge state machines |
-| [Runtime and operations](runtime-operations.md) | admission, retry scheduling, shutdown, import, observability, verification and validation |
+| [Runtime and operations](runtime-operations.md) | admission, retry scheduling, shutdown, observability, verification and validation |
 
 Backend crates own transaction mechanics, physical prefixes, backend limits,
 error classification, and declared capabilities. They do not specialize index
@@ -153,7 +153,7 @@ state may attempt a bounded fixup; no process owns the state. Completion removes
 obsolete data using transactional range clear when supported, otherwise using
 paged point deletion before the final topology switch.
 
-### 6.5 Shutdown and import
+### 6.5 Shutdown
 
 Runtime shutdown stops new admission and waits for already admitted foreground
 operations and commits. Those operations retain their real results, including
@@ -165,13 +165,6 @@ releasing it. For RocksDB this is the completion barrier for native actor
 cleanup, so successful Runtime shutdown permits immediate database reopen or
 teardown. Direct adapter users consume `RocksDbBackend` with its asynchronous
 shutdown for the same guarantee; transaction-handle Drop remains nonblocking.
-
-An Import Session accepts ordinary atomic mutation batches under adaptive,
-bounded concurrency and maintenance backpressure. It learns useful concurrency
-from actual retryable contention rather than scanning tree topology. `submit` returns a process-local
-Batch Token after admission. `finish` waits for accepted work and returns batch
-results in submission order. No import state is persistent and no whole import
-is atomic.
 
 ### 6.6 Drop and verify
 

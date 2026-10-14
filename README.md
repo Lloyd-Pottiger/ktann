@@ -30,11 +30,10 @@ application with the storage backend that fits your deployment.
   partition visits, and exact reranking. Results expose budget truncation;
   runtime admission, caches, queues, retries, and maintenance concurrency are
   bounded too.
-- **Operations are part of the design.** Adaptive bulk-import admission,
-  read-only index verification, metrics, tracing, and graceful shutdown support
-  the full lifecycle of an index.
+- **Operations are part of the design.** Read-only index verification,
+  metrics, tracing, and graceful shutdown support the full lifecycle of an index.
 
-The core library, all three storage adapters, search, online maintenance, import,
+The core library, all three storage adapters, search, online maintenance,
 and verification are implemented. KTANN is pre-1.0: APIs and persistent formats
 may change, and there is no stable release yet.
 
@@ -141,7 +140,7 @@ require separate process or server restarts as described in the adapter guides.
 - [Architecture](docs/design/overview.md): boundaries, invariants, and module ownership.
 - [API](docs/design/api.md): lifecycle, mutations, filters, and search requests.
 - [Search](docs/design/search.md): routing, ranking, caches, and query budgets.
-- [Operations](docs/design/runtime-operations.md): import, verification, telemetry, and shutdown.
+- [Operations](docs/design/runtime-operations.md): maintenance, refinement, verification, telemetry, and shutdown.
 - [Storage](docs/design/storage.md) and [maintenance](docs/design/maintenance.md): transaction and topology contracts.
 - [Domain glossary](CONTEXT.md) and [architectural decisions](docs/adr/): terminology and rationale.
 - [Benchmarks](benchmarks/README.md): reproducible quality and performance evaluation.

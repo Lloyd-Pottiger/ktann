@@ -7,9 +7,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use ktann::api::{
-    DataType, ErrorKind, FieldId, FieldSchema, ImportOptions, ImportSession, Index, IndexConfig,
-    Metric, Mutation, OperationOptions, Record, RefineOptions, RuntimeConfig, SearchBudgets,
-    SearchOptions, SearchRequest, Value, VerifyOptions,
+    DataType, ErrorKind, FieldId, FieldSchema, Index, IndexConfig, Metric, Mutation,
+    OperationOptions, Record, RefineOptions, RuntimeConfig, SearchBudgets, SearchOptions,
+    SearchRequest, Value, VerifyOptions,
 };
 use ktann::runtime::Runtime;
 use ktann::storage::backend::Backend;
@@ -111,12 +111,8 @@ pub struct ScenarioSpec {
     pub max_partition_entries: u32,
     /// Whether this scenario measures the import-to-search lifecycle.
     pub lifecycle: bool,
-    /// Records per Import Session batch in a lifecycle scenario.
+    /// Records per atomic batch load batch in a lifecycle scenario.
     pub import_batch_size: usize,
-    /// Explicit Import Session maximum accepted-batch ceiling.
-    pub import_max_in_flight_batches: usize,
-    /// Explicit Runtime Fixup backlog watermark for Import Session admission.
-    pub import_backlog_watermark: usize,
     /// Background Structure Maintenance workers.
     pub maintenance_workers: usize,
 }
@@ -169,8 +165,6 @@ fn smoke_scenarios() -> Vec<ScenarioSpec> {
         max_partition_entries: 32,
         lifecycle: false,
         import_batch_size: 32,
-        import_max_in_flight_batches: 2,
-        import_backlog_watermark: 2,
         maintenance_workers: 2,
     };
     vec![
@@ -255,8 +249,6 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
         max_partition_entries: 128,
         lifecycle: false,
         import_batch_size: 50,
-        import_max_in_flight_batches: 4,
-        import_backlog_watermark: 2,
         maintenance_workers: 2,
     };
     let clustered = ann("ann-clustered", "clustered", 5_000, 100, 128, 0x38_1001);
@@ -321,9 +313,6 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
             persisted_index: None,
             reuse_index: false,
             dispatch: WorkloadDispatch::Continuous,
-            // Adaptive admission starts at one and may probe up to four
-            // concurrent batches after sustained conflict-free completions.
-            import_max_in_flight_batches: 4,
             ..clustered.clone()
         },
     ]
@@ -368,8 +357,6 @@ fn large_scenarios() -> Result<Vec<ScenarioSpec>, String> {
             max_partition_entries: index.max_partition_entries(),
             lifecycle: false,
             import_batch_size: 50,
-            import_max_in_flight_batches: defaults.import_max_in_flight_batches(),
-            import_backlog_watermark: defaults.import_backlog_watermark(),
             maintenance_workers: defaults.maintenance_workers(),
         })
     };
@@ -538,10 +525,6 @@ pub async fn run_scenario<B: Backend>(
             k: spec.k,
             import_batch_size: (spec.lifecycle || spec.profile == "large")
                 .then_some(spec.import_batch_size),
-            import_max_in_flight_batches: (spec.lifecycle || spec.profile == "large")
-                .then_some(spec.import_max_in_flight_batches),
-            import_backlog_watermark: (spec.lifecycle || spec.profile == "large")
-                .then_some(spec.import_backlog_watermark),
         },
         dataset: dataset.metadata,
         topology,
@@ -554,8 +537,6 @@ fn runtime_config(
     spec: &ScenarioSpec,
     maintenance_workers: usize,
 ) -> Result<RuntimeConfig, String> {
-    // Large imports need the default Fixup queue capacity to accommodate
-    // their Import Session backlog watermark.
     let defaults = RuntimeConfig::default();
     let fixup_queue_capacity = if spec.profile == "large" {
         defaults.fixup_queue_capacity()
@@ -571,16 +552,6 @@ fn runtime_config(
         config
     } else {
         config.and_then(|config| config.with_attempts(32, 32))
-    };
-    let config = if spec.lifecycle || spec.profile == "large" {
-        config.and_then(|config| {
-            config.with_import_limits(
-                spec.import_max_in_flight_batches,
-                spec.import_backlog_watermark,
-            )
-        })
-    } else {
-        config
     };
     config
         .and_then(|config| config.validate().map(|()| config))
@@ -615,7 +586,7 @@ fn search_budget_configuration(
     })
 }
 
-/// Measures one fresh Index from Import Session submission through warm search.
+/// Measures one fresh Index from atomic batch load submission through warm search.
 async fn run_lifecycle_case<B: Backend>(
     backend: MeasuredBackend<B>,
     import_runtime_config: RuntimeConfig,
@@ -634,16 +605,9 @@ async fn run_lifecycle_case<B: Backend>(
     let batches = mutation_batches(dataset, spec.import_batch_size, "construct import record")?;
     let truths = exact_truth(dataset, spec.metric, spec.k);
     let requests = lifecycle_requests(dataset, spec)?;
-    let import_options = ImportOptions::default()
-        .with_max_in_flight_batches(spec.import_max_in_flight_batches)
-        .map_err(|error| error_at("configure Import Session", error))?;
-    let import_session = index
-        .import_session(import_options)
-        .map_err(|error| error_at("open Import Session", error))?;
-
     let _ = metric_capture.snapshot();
     let (import, case_baseline) =
-        run_import_phase(import_session, batches, backend_counters, metric_capture).await?;
+        run_import_phase(&index, batches, backend_counters, metric_capture).await?;
     let import_finished = Instant::now();
     let immediate_search =
         run_search_phase(&index, &requests, &truths, backend_counters, metric_capture)
@@ -877,9 +841,9 @@ fn search_request(
         .map_err(|error| error_at("construct search request", error))
 }
 
-/// Executes one real bounded Import Session and summarizes accepted outcomes.
+/// Loads atomic batches sequentially and summarizes committed outcomes.
 async fn run_import_phase<B: Backend>(
-    mut session: ImportSession<MeasuredBackend<B>>,
+    index: &Index<MeasuredBackend<B>>,
     batches: Vec<Vec<Mutation>>,
     backend_counters: &BackendCounters,
     metric_capture: &MetricCapture,
@@ -890,58 +854,42 @@ async fn run_import_phase<B: Backend>(
     let resources_before = ResourceSnapshot::capture()?;
     let backend_before = backend_counters.snapshot();
     let started = Instant::now();
-    let mut submitted_batch_sizes = Vec::with_capacity(batches.len());
-    let mut submit_latency_ms = Vec::with_capacity(batches.len());
+    let submitted_batches =
+        u64::try_from(batches.len()).map_err(|_| "import batch count overflow".to_owned())?;
+    let mut batch_latency_ms = Vec::with_capacity(batches.len());
     let mut failures = BTreeMap::new();
+    let mut accepted_batches = 0_u64;
+    let mut accepted_records = 0_u64;
+    let mut submitted_records = 0_u64;
     for batch in batches {
         let records = batch.len();
-        let submit_started = Instant::now();
-        match session.submit(batch).await {
-            Ok(_) => submitted_batch_sizes.push(records),
+        submitted_records += u64::try_from(records).map_err(|_| "import record count overflow")?;
+        let batch_started = Instant::now();
+        let result = index.batch_mutate(batch).await;
+        batch_latency_ms.push(batch_started.elapsed().as_secs_f64() * 1_000.0);
+        match result {
+            Ok(outcomes) => {
+                if outcomes.len() != records {
+                    return Err("atomic batch outcome count differs from batch size".to_owned());
+                }
+                accepted_batches += 1;
+                accepted_records +=
+                    u64::try_from(records).map_err(|_| "import record count overflow")?;
+            }
             Err(error) => {
                 *failures.entry(format!("{:?}", error.kind())).or_default() += 1;
             }
         }
-        submit_latency_ms.push(submit_started.elapsed().as_secs_f64() * 1_000.0);
     }
-    let results = session.finish().await;
     let wall_seconds = started.elapsed().as_secs_f64();
     let resources_after = ResourceSnapshot::capture()?;
     let backend_io = backend_counters.since(&backend_before);
     let metrics = metric_capture.snapshot();
-    if results.len() != submitted_batch_sizes.len() {
-        return Err("Import Session result count differs from submitted batches".to_owned());
-    }
-    let mut accepted_batches = 0_u64;
-    let mut accepted_records = 0_u64;
-    let submitted_records = submitted_batch_sizes.iter().try_fold(0_u64, |total, size| {
-        total.checked_add(u64::try_from(*size).ok()?)
-    });
-    let submitted_records =
-        submitted_records.ok_or_else(|| "import record count overflow".to_owned())?;
-    for (batch_size, result) in submitted_batch_sizes.iter().zip(results) {
-        match result.result {
-            Ok(outcomes) => {
-                accepted_batches = accepted_batches.saturating_add(1);
-                accepted_records = accepted_records.saturating_add(
-                    u64::try_from(outcomes.len()).map_err(|_| "import record count overflow")?,
-                );
-                if outcomes.len() != *batch_size {
-                    return Err("Import Session outcome count differs from batch size".to_owned());
-                }
-            }
-            Err(error) => {
-                *failures.entry(format!("{:?}", error.kind())).or_default() += 1;
-            }
-        }
-    }
     if accepted_records != submitted_records {
         return Err(format!(
-            "Import Session accepted {accepted_records} of {submitted_records} records; batch failures: {failures:?}"
+            "atomic batch load committed {accepted_records} of {submitted_records} records; batch failures: {failures:?}"
         ));
     }
-    let submitted_batches = u64::try_from(submitted_batch_sizes.len())
-        .map_err(|_| "import batch count overflow".to_owned())?;
     let phase = ImportPhase {
         resources: phase_resources(
             wall_seconds,
@@ -959,7 +907,7 @@ async fn run_import_phase<B: Backend>(
         } else {
             0.0
         },
-        submit_latency_ms: Distribution::from_samples(submit_latency_ms),
+        batch_latency_ms: Distribution::from_samples(batch_latency_ms),
         batch_failures: failures,
         admission: metrics.admission_summary(),
     };
@@ -1376,18 +1324,6 @@ async fn prepare_index<B: Backend>(
 
 /// Renders the same captured import interval that is retained in the report.
 fn log_import_diagnostics(spec: &ScenarioSpec, import: &ConstructionPhase) {
-    for (gate, wait) in &import.admission.import_wait_ms {
-        eprintln!(
-            "[{}] import wait gate={gate}: count={} mean={:.3}ms p95={:.3}ms max={:.3}ms",
-            spec.name, wait.count, wait.mean, wait.p95, wait.max,
-        );
-    }
-    for (direction, limits) in &import.admission.import_concurrency_limit {
-        eprintln!(
-            "[{}] import concurrency {direction}: count={} max-limit={:.0}",
-            spec.name, limits.count, limits.max,
-        );
-    }
     let attempts = &import.resources.writes.attempts;
     if !attempts.is_empty() {
         eprintln!("[{}] import write attempts: {attempts:?}", spec.name);
@@ -1615,19 +1551,6 @@ async fn load_index<B: Backend>(
     dataset: &BenchmarkDataset,
     spec: &ScenarioSpec,
 ) -> Result<(), String> {
-    let mut import = if spec.profile == "large" {
-        Some(
-            index
-                .import_session(
-                    ImportOptions::default()
-                        .with_max_in_flight_batches(spec.import_max_in_flight_batches)
-                        .map_err(|error| error_at("configure load import", error))?,
-                )
-                .map_err(|error| error_at("open load import", error))?,
-        )
-    } else {
-        None
-    };
     let batch_size = if spec.profile == "large" {
         spec.import_batch_size
     } else {
@@ -1644,13 +1567,6 @@ async fn load_index<B: Backend>(
         .zip(dataset.base.chunks(batch_size))
     {
         let mutations = mutation_batch(ids, vectors, &fields, "construct load record")?;
-        if let Some(import) = import.as_mut() {
-            import
-                .submit(mutations)
-                .await
-                .map_err(|error| error_at("submit load records", error))?;
-            continue;
-        }
         let mut attempts = 0_u32;
         loop {
             match index.batch_mutate(mutations.clone()).await {
@@ -1661,13 +1577,6 @@ async fn load_index<B: Backend>(
                 }
                 Err(error) => return Err(error_at("load records", error)),
             }
-        }
-    }
-    if let Some(import) = import {
-        for result in import.finish().await {
-            result
-                .result
-                .map_err(|error| error_at("load records", error))?;
         }
     }
     Ok(())
@@ -2525,14 +2434,6 @@ mod tests {
             assert_eq!(actual.foreground_attempts(), defaults.foreground_attempts());
             assert_eq!(actual.fixup_attempts(), defaults.fixup_attempts());
             assert_eq!(actual.write_beam_size(), defaults.write_beam_size());
-            assert_eq!(
-                actual.import_max_in_flight_batches(),
-                defaults.import_max_in_flight_batches()
-            );
-            assert_eq!(
-                actual.import_backlog_watermark(),
-                defaults.import_backlog_watermark()
-            );
             let budgets = scenario
                 .search_options
                 .resolve(actual.default_search_budgets(), scenario.k)

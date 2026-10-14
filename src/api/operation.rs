@@ -1,4 +1,4 @@
-//! Foreground Mutation, point-read, operation-control, and import values.
+//! Foreground Mutation, point-read, operation-control values.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -7,7 +7,7 @@ use std::time::Instant;
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
-use super::{BatchToken, Error, MAX_RECORD_ID_BYTES, Record, Result};
+use super::{Error, MAX_RECORD_ID_BYTES, Record, Result};
 
 /// One atomic Foreground Mutation item.
 #[derive(Clone)]
@@ -169,38 +169,4 @@ impl GetOptions {
     pub const fn includes_payload(self) -> bool {
         self.include_payload
     }
-}
-
-/// Bounded Import Session admission options.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[non_exhaustive]
-pub struct ImportOptions {
-    max_in_flight_batches: Option<usize>,
-}
-
-impl ImportOptions {
-    /// Overrides the Runtime's positive adaptive-concurrency ceiling.
-    pub fn with_max_in_flight_batches(mut self, batches: usize) -> Result<Self> {
-        if batches == 0 {
-            return Err(Error::invalid_argument());
-        }
-        self.max_in_flight_batches = Some(batches);
-        Ok(self)
-    }
-
-    /// Returns the optional adaptive-concurrency ceiling override.
-    #[must_use]
-    pub const fn max_in_flight_batches(self) -> Option<usize> {
-        self.max_in_flight_batches
-    }
-}
-
-/// One Import Session batch result in submission order.
-#[derive(Debug)]
-#[non_exhaustive]
-pub struct ImportBatchResult {
-    /// The unique process-local Batch Token returned by submission.
-    pub token: BatchToken,
-    /// The ordinary atomic batch result.
-    pub result: Result<Vec<MutationOutcome>>,
 }

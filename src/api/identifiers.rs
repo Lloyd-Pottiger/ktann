@@ -77,22 +77,3 @@ impl PartitionKey {
 /// The zero-based position of a field in a Vector Record schema.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FieldId(pub u16);
-
-/// A process-local identity assigned to an accepted Import Session batch.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct BatchToken(NonZeroU64);
-
-impl BatchToken {
-    /// Creates a nonzero Batch Token.
-    pub fn new(value: u64) -> Result<Self> {
-        NonZeroU64::new(value)
-            .map(Self)
-            .ok_or_else(Error::invalid_argument)
-    }
-
-    /// Returns the process-local integer identity.
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0.get()
-    }
-}

@@ -126,14 +126,11 @@ These import options apply to `--profile large` or an explicitly selected
 | Option | Meaning |
 | --- | --- |
 | `--maintenance-workers N` | Import Runtime maintenance workers; zero is allowed |
-| `--import-max-in-flight-batches N` | Positive Import Session concurrency ceiling |
 | `--import-batch-size N` | Positive records per atomic batch |
-| `--import-backlog-watermark N` | Positive process-local Fixup Backlog watermark |
 
 After immediate search, the lifecycle runner reopens the Logical Index with
 its configured convergence workers, allowing an import with maintenance disabled
-to reach the stable search phases. Import Sessions adapt concurrency below the
-configured ceiling; see [ADR 0022](../docs/adr/0022-feedback-controlled-import-admission.md).
+to reach the stable search phases. Data loading uses sequential ordinary atomic batches.
 
 ## Measurements
 
@@ -205,10 +202,10 @@ operations; full measures 2,000. Runs outside this region fail validation.
 
 Each lifecycle worker creates a fresh Backend Namespace and Logical Index and
 prepares its dataset, requests, and exact oracle before timing. The continuous
-case starts before the first `ImportSession::submit` and ends after warmed search:
+case starts before the first `Index::batch_mutate` and ends after warmed search:
 
-1. `import` ends after `ImportSession::finish` and includes concurrent maintenance.
-   Finish is a batch-outcome barrier, not a topology-convergence barrier. The
+1. `import` ends after the final batch completes and includes concurrent maintenance.
+   Batch completion does not imply topology convergence. The
    scenario fails unless every submitted record is accepted.
 2. `immediate_search` runs the fixed queries before the runner drives convergence.
 3. `convergence` uses bounded public `verify` and `search` calls, requires unchanged
@@ -250,7 +247,7 @@ writes can vary. Override thresholds with `--maximum-relative-regression`,
 `--maximum-recall-drop`, and `--maximum-rejection-rate-increase`; all take fractions.
 
 Quality sweeps compare corresponding beam points. Lifecycle comparisons include
-import throughput, submit latency, failures, waits, finish-to-stable time, search
+import throughput, batch latency, failures, waits, load-completion-to-stable time, search
 phases, and backend IO. Preserve the exact source revision and patch used for
 local baselines; `git_revision` has a `-dirty` suffix when the workspace changes.
 
@@ -273,7 +270,7 @@ readiness probes used by Optimize are separate from measured searches.
 
 Protocol version 1 uses length-prefixed JSON over a Unix socket: a four-byte
 big-endian length, at most 8 MiB per frame, and at most 128 connections. Inserts
-commit at most 50 records per batch and finish the Import Session before success.
+commit at most 50 records per atomic batch and return after the batch completes.
 Do not automatically replay unknown outcomes. Optimize verifies the exact record
 count and waits for no actionable or transitional partitions within a deadline.
 

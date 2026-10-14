@@ -173,7 +173,6 @@ async fn seeded_interleaving_with_background_fixups_converges() {
     let config = RuntimeConfig::default()
         .with_maintenance(2, 64)
         .and_then(|config| config.with_attempts(ATTEMPTS, ATTEMPTS))
-        .and_then(|config| config.with_import_limits(1, 1))
         .expect("valid runtime config");
     let runtime = Runtime::new(backend.clone(), config).expect("runtime is valid");
     let index = runtime
