@@ -38,8 +38,31 @@ pub struct ConstructionOptions {
 }
 
 impl ConstructionOptions {
-    /// Checks configuration invariants independent of vector dimension.
-    pub(crate) fn validate(&self) -> Result<()> {
+    /// Return the resident row allowance after reserving non-resident working space.
+    /// Caller-owned input buffers and emitted plans retained by the consumer are
+    /// outside this budget; construction owns only the buffers needed to emit them.
+    fn resident_rows(self, dimension: usize) -> Result<usize> {
+        let row_bound = dimension
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(MAX_ID_BYTES + ROW_OVERHEAD_BYTES))
+            .ok_or(Error::new(ErrorKind::LimitExceeded))?;
+        // Reserve row-sized space for the bounded training sample, up to eight
+        // centers and their f64 accumulators, and final partition emission. Charge
+        // maximum-length IDs and allocation overhead even when actual rows are small.
+        let reserved_rows = self
+            .sample_items
+            .max(self.max_partition_entries as usize)
+            .checked_mul(8)
+            .ok_or(Error::new(ErrorKind::LimitExceeded))?;
+        // IO buffers and the reader's encoded-vector buffer are reserved separately
+        // from decoded resident rows. Only the remainder may hold a resident group;
+        // resident recursion borrows slices of that one allocation.
+        let reserved = row_bound
+            .checked_mul(reserved_rows)
+            .and_then(|n| n.checked_add(16 * BUFFER_BYTES))
+            // One sequential input reader retains an encoded vector buffer.
+            .and_then(|n| n.checked_add(dimension * 4))
+            .ok_or(Error::new(ErrorKind::LimitExceeded))?;
         if self.min_partition_entries == 0
             || self
                 .min_partition_entries
@@ -51,7 +74,14 @@ impl ConstructionOptions {
         {
             return Err(Error::invalid_argument());
         }
-        Ok(())
+        if self.memory_bytes
+            <= reserved
+                .checked_add(row_bound)
+                .ok_or(Error::new(ErrorKind::LimitExceeded))?
+        {
+            return Err(Error::invalid_argument());
+        }
+        Ok((self.memory_bytes - reserved) / row_bound)
     }
 }
 
@@ -111,8 +141,8 @@ pub fn construct_tree(
     mut emit: impl FnMut(PartitionPlan) -> Result<()>,
 ) -> Result<ConstructionReport> {
     let kernel = VectorKernel::new(dimension, metric, rotation_seed)?;
-    let resident_rows = validate_options(dimension, options)?;
-    fs::create_dir(directory).map_err(io_error)?;
+    let resident_rows = options.resident_rows(dimension)?;
+    fs::create_dir(directory).map_err(|error| Error::with_source(ErrorKind::Backend, error))?;
     let mut work = Workspace {
         directory: directory.to_owned(),
         next_file: 0,
@@ -127,14 +157,9 @@ pub fn construct_tree(
         let record = record?;
         validate_id(&record.id)?;
         let vector = work.kernel.preprocess(&record.vector)?;
-        let row = Row {
-            label: 0,
-            id: record.id,
-            vector,
-        };
-        work.append(&mut input, &row)?;
+        work.append(&mut input, &record.id, &vector)?;
     }
-    let input = work.finish(input)?;
+    let input = input.finish()?;
     work.report.records = input.count;
     if input.count == 0 {
         work.remove(input)?;
@@ -143,27 +168,29 @@ pub fn construct_tree(
     let mut level = 1;
     let mut input = input;
     loop {
-        let root = input.count <= u64::from(options.max_partition_entries);
-        let mut parents = work.writer()?;
-        work.group(input, level, root, &mut parents, &mut emit)?;
-        let parents = work.finish(parents)?;
-        if root {
-            work.remove(parents)?;
+        if input.count <= u64::from(options.max_partition_entries) {
+            // The complete level fits in the root. It has no parent run, and
+            // its input is already canonical, so emit it directly from disk.
+            let mut reader = work.reader(&input)?;
+            work.emit_partition(
+                std::iter::from_fn(|| reader.next().transpose()),
+                input.count,
+                level,
+                None,
+                &mut emit,
+            )?;
+            drop(reader);
+            work.remove(input)?;
             return Ok(work.report);
         }
+        let mut parents = work.writer()?;
+        work.group(input, level, &mut parents, &mut emit)?;
+        let parents = parents.finish()?;
         input = parents;
-        level = level.checked_add(1).ok_or_else(limit)?;
+        level = level
+            .checked_add(1)
+            .ok_or(Error::new(ErrorKind::LimitExceeded))?;
     }
-}
-
-fn io_error(_: std::io::Error) -> Error {
-    Error::new(ErrorKind::Backend)
-}
-fn limit() -> Error {
-    Error::new(ErrorKind::LimitExceeded)
-}
-fn corrupt() -> Error {
-    Error::new(ErrorKind::Corruption)
 }
 
 /// An immutable canonical-ID run; each file belongs to this invocation.
@@ -176,6 +203,17 @@ struct Output {
     run: Run,
     writer: BufWriter<File>,
 }
+impl Output {
+    fn finish(mut self) -> Result<Run> {
+        self.writer
+            .flush()
+            .map_err(|error| Error::with_source(ErrorKind::Backend, error))?;
+        // These intermediate runs are recomputable, not accepted durable artifacts.
+        drop(self.writer);
+        Ok(self.run)
+    }
+}
+
 struct Input {
     reader: BufReader<File>,
     remaining: u64,
@@ -200,23 +238,32 @@ impl Input {
     fn next(&mut self) -> Result<Option<Row>> {
         if self.remaining == 0 {
             let mut tail = [0];
-            if self.reader.read(&mut tail).map_err(io_error)? != 0 {
-                return Err(corrupt());
+            if self
+                .reader
+                .read(&mut tail)
+                .map_err(|error| Error::with_source(ErrorKind::Backend, error))?
+                != 0
+            {
+                return Err(Error::new(ErrorKind::Corruption));
             }
             return Ok(None);
         }
         let mut len = [0; 4];
-        self.reader.read_exact(&mut len).map_err(|_| corrupt())?;
+        self.reader
+            .read_exact(&mut len)
+            .map_err(|error| Error::with_source(ErrorKind::Corruption, error))?;
         let len = u32::from_be_bytes(len) as usize;
         if len == 0 || len > MAX_ID_BYTES {
-            return Err(corrupt());
+            return Err(Error::new(ErrorKind::Corruption));
         }
         let mut id = vec![0; len];
-        self.reader.read_exact(&mut id).map_err(|_| corrupt())?;
+        self.reader
+            .read_exact(&mut id)
+            .map_err(|error| Error::with_source(ErrorKind::Corruption, error))?;
         // Read each vector in one call, including vectors larger than the IO buffer.
         self.reader
             .read_exact(&mut self.encoded_vector)
-            .map_err(|_| corrupt())?;
+            .map_err(|error| Error::with_source(ErrorKind::Corruption, error))?;
         let vector: Vec<f32> = self
             .encoded_vector
             .as_chunks::<4>()
@@ -228,7 +275,7 @@ impl Input {
             .iter()
             .fold(false, |invalid, value| invalid | !value.is_finite())
         {
-            return Err(corrupt());
+            return Err(Error::new(ErrorKind::Corruption));
         }
         self.remaining -= 1;
         Ok(Some(Row {
@@ -252,12 +299,15 @@ struct Workspace {
 impl Workspace {
     fn writer(&mut self) -> Result<Output> {
         let path = self.directory.join(format!("{:016x}.run", self.next_file));
-        self.next_file = self.next_file.checked_add(1).ok_or_else(limit)?;
+        self.next_file = self
+            .next_file
+            .checked_add(1)
+            .ok_or(Error::new(ErrorKind::LimitExceeded))?;
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&path)
-            .map_err(io_error)?;
+            .map_err(|error| Error::with_source(ErrorKind::Backend, error))?;
         Ok(Output {
             run: Run {
                 path,
@@ -268,46 +318,59 @@ impl Workspace {
         })
     }
 
-    fn append(&mut self, output: &mut Output, row: &Row) -> Result<()> {
-        let bytes = 4 + row.id.len() as u64 + 4 * row.vector.len() as u64;
-        let total = self.bytes.checked_add(bytes).ok_or_else(limit)?;
+    fn append(&mut self, output: &mut Output, id: &[u8], vector: &[f32]) -> Result<()> {
+        let bytes = 4 + id.len() as u64 + 4 * vector.len() as u64;
+        let total = self
+            .bytes
+            .checked_add(bytes)
+            .ok_or(Error::new(ErrorKind::LimitExceeded))?;
         if total > self.options.scratch_bytes {
-            return Err(limit());
+            return Err(Error::new(ErrorKind::LimitExceeded));
         }
         output
             .writer
-            .write_all(&(row.id.len() as u32).to_be_bytes())
-            .map_err(io_error)?;
-        output.writer.write_all(&row.id).map_err(io_error)?;
-        for component in &row.vector {
+            .write_all(&(id.len() as u32).to_be_bytes())
+            .map_err(|error| Error::with_source(ErrorKind::Backend, error))?;
+        output
+            .writer
+            .write_all(id)
+            .map_err(|error| Error::with_source(ErrorKind::Backend, error))?;
+        for component in vector {
             output
                 .writer
                 .write_all(&component.to_bits().to_be_bytes())
-                .map_err(io_error)?;
+                .map_err(|error| Error::with_source(ErrorKind::Backend, error))?;
         }
-        output.run.count = output.run.count.checked_add(1).ok_or_else(limit)?;
-        output.run.bytes = output.run.bytes.checked_add(bytes).ok_or_else(limit)?;
+        output.run.count = output
+            .run
+            .count
+            .checked_add(1)
+            .ok_or(Error::new(ErrorKind::LimitExceeded))?;
+        output.run.bytes = output
+            .run
+            .bytes
+            .checked_add(bytes)
+            .ok_or(Error::new(ErrorKind::LimitExceeded))?;
         self.bytes = total;
         self.report.peak_scratch_bytes = self.report.peak_scratch_bytes.max(total);
         self.report.scratch_written_bytes = self
             .report
             .scratch_written_bytes
             .checked_add(bytes)
-            .ok_or_else(limit)?;
+            .ok_or(Error::new(ErrorKind::LimitExceeded))?;
         Ok(())
     }
 
-    fn finish(&self, mut output: Output) -> Result<Run> {
-        output.writer.flush().map_err(io_error)?;
-        // These intermediate runs are recomputable, not accepted durable artifacts.
-        drop(output.writer);
-        Ok(output.run)
-    }
-
     fn reader(&self, run: &Run) -> Result<Input> {
-        let file = File::open(&run.path).map_err(io_error)?;
-        if file.metadata().map_err(io_error)?.len() != run.bytes {
-            return Err(corrupt());
+        let file =
+            File::open(&run.path).map_err(|error| Error::with_source(ErrorKind::Backend, error))?;
+        if file
+            .metadata()
+            .map_err(|error| Error::with_source(ErrorKind::Backend, error))?
+            .len()
+            != run.bytes
+        {
+            return Err(Error::new(ErrorKind::Corruption));
         }
         Ok(Input {
             reader: BufReader::with_capacity(BUFFER_BYTES, file),
@@ -317,12 +380,17 @@ impl Workspace {
     }
 
     fn remove(&mut self, run: Run) -> Result<()> {
-        fs::remove_file(run.path).map_err(io_error)?;
-        self.bytes = self.bytes.checked_sub(run.bytes).ok_or_else(corrupt)?;
+        fs::remove_file(run.path).map_err(|error| Error::with_source(ErrorKind::Backend, error))?;
+        self.bytes = self
+            .bytes
+            .checked_sub(run.bytes)
+            .ok_or(Error::new(ErrorKind::Corruption))?;
         Ok(())
     }
 
     /// Emit a final group in canonical ID order, using every member for its mean.
+    /// A parent output identifies a non-root partition; only the final root
+    /// has no parent and receives the reserved key 1.
     /// Both grouping paths must restore this order before calling: f64 addition
     /// is order-sensitive, so equal membership alone does not guarantee equal bits.
     fn emit_partition(
@@ -330,18 +398,17 @@ impl Workspace {
         rows: impl Iterator<Item = Result<Row>>,
         count: u64,
         level: u32,
-        root: bool,
-        parents: &mut Output,
+        parents: Option<&mut Output>,
         emit: &mut impl FnMut(PartitionPlan) -> Result<()>,
     ) -> Result<()> {
-        let key = if root {
+        let key = if parents.is_none() {
             1
         } else {
             self.report
                 .partition_high_water
                 .max(1)
                 .checked_add(1)
-                .ok_or_else(limit)?
+                .ok_or(Error::new(ErrorKind::LimitExceeded))?
         };
         self.report.partition_high_water = self.report.partition_high_water.max(key);
         let key = PartitionKey::new(key)?;
@@ -364,15 +431,8 @@ impl Workspace {
             .map(|sum| (sum / count as f64) as f32)
             .collect();
         let centroid = self.kernel.normalize_centroid(&mean)?;
-        if !root {
-            self.append(
-                parents,
-                &Row {
-                    label: 0,
-                    id: Bytes::copy_from_slice(&key.get().to_be_bytes()),
-                    vector: centroid.clone(),
-                },
-            )?;
+        if let Some(parents) = parents {
+            self.append(parents, &key.get().to_be_bytes(), &centroid)?;
         }
         emit(PartitionPlan {
             key,
@@ -380,7 +440,11 @@ impl Workspace {
             centroid,
             entries,
         })?;
-        self.report.partitions = self.report.partitions.checked_add(1).ok_or_else(limit)?;
+        self.report.partitions = self
+            .report
+            .partitions
+            .checked_add(1)
+            .ok_or(Error::new(ErrorKind::LimitExceeded))?;
         Ok(())
     }
 
@@ -391,7 +455,6 @@ impl Workspace {
         &mut self,
         rows: &mut [Row],
         level: u32,
-        root: bool,
         parents: &mut Output,
         emit: &mut impl FnMut(PartitionPlan) -> Result<()>,
     ) -> Result<()> {
@@ -402,8 +465,7 @@ impl Workspace {
                 rows.iter_mut().map(|row| Ok(std::mem::take(row))),
                 count,
                 level,
-                root,
-                parents,
+                Some(parents),
                 emit,
             );
         }
@@ -445,7 +507,7 @@ impl Workspace {
                 rest.select_nth_unstable_by(count, Row::compare);
             }
             let (child, tail) = rest.split_at_mut(count);
-            self.resident_group(child, level, false, parents, emit)?;
+            self.resident_group(child, level, parents, emit)?;
             rest = tail;
         }
         Ok(())
@@ -455,7 +517,6 @@ impl Workspace {
         &mut self,
         input: Run,
         level: u32,
-        root: bool,
         parents: &mut Output,
         emit: &mut impl FnMut(PartitionPlan) -> Result<()>,
     ) -> Result<()> {
@@ -467,7 +528,7 @@ impl Workspace {
             }
             drop(reader);
             self.remove(input)?;
-            return self.resident_group(&mut rows, level, root, parents, emit);
+            return self.resident_group(&mut rows, level, parents, emit);
         }
         if input.count <= u64::from(self.options.max_partition_entries) {
             // Stable scatters preserve canonical ID order for streamed means.
@@ -476,8 +537,7 @@ impl Workspace {
                 std::iter::from_fn(|| reader.next().transpose()),
                 input.count,
                 level,
-                root,
-                parents,
+                Some(parents),
                 emit,
             )?;
             drop(reader);
@@ -543,17 +603,17 @@ impl Workspace {
             let label = self.nearest(&row.vector, &centers);
             let child = ends.partition_point(|&end| end <= ranks[label]);
             ranks[label] += 1;
-            self.append(&mut outputs[child], &row)?;
+            self.append(&mut outputs[child], &row.id, &row.vector)?;
         }
         drop(reader);
         self.remove(input)?;
         drop(centers);
         let runs: Vec<_> = outputs
             .into_iter()
-            .map(|out| self.finish(out))
+            .map(Output::finish)
             .collect::<Result<_>>()?;
         for run in runs {
-            self.group(run, level, false, parents, emit)?;
+            self.group(run, level, parents, emit)?;
         }
         Ok(())
     }
@@ -742,38 +802,6 @@ impl Ord for Sample {
             .cmp(&other.hash)
             .then_with(|| self.row.id.cmp(&other.row.id))
     }
-}
-
-/// Return the resident row allowance after reserving non-resident working space.
-/// Caller-owned input buffers and emitted plans retained by the consumer are
-/// outside this budget; construction owns only the buffers needed to emit them.
-pub(crate) fn validate_options(dimension: usize, options: ConstructionOptions) -> Result<usize> {
-    let row_bound = dimension
-        .checked_mul(4)
-        .and_then(|n| n.checked_add(MAX_ID_BYTES + ROW_OVERHEAD_BYTES))
-        .ok_or_else(limit)?;
-    // Reserve row-sized space for the bounded training sample, up to eight
-    // centers and their f64 accumulators, and final partition emission. Charge
-    // maximum-length IDs and allocation overhead even when actual rows are small.
-    let resident_rows = options
-        .sample_items
-        .max(options.max_partition_entries as usize)
-        .checked_mul(8)
-        .ok_or_else(limit)?;
-    // IO buffers and the reader's encoded-vector buffer are reserved separately
-    // from decoded resident rows. Only the remainder may hold a resident group;
-    // resident recursion borrows slices of that one allocation.
-    let reserved = row_bound
-        .checked_mul(resident_rows)
-        .and_then(|n| n.checked_add(16 * BUFFER_BYTES))
-        // One sequential input reader retains an encoded vector buffer.
-        .and_then(|n| n.checked_add(dimension * 4))
-        .ok_or_else(limit)?;
-    options.validate()?;
-    if options.memory_bytes <= reserved.checked_add(row_bound).ok_or_else(limit)? {
-        return Err(Error::invalid_argument());
-    }
-    Ok((options.memory_bytes - reserved) / row_bound)
 }
 
 #[cfg(test)]
@@ -995,14 +1023,14 @@ mod tests {
             while low < high {
                 let middle = low + (high - low) / 2;
                 constrained.memory_bytes = middle;
-                if validate_options(dimension, constrained).is_ok() {
+                if constrained.resident_rows(dimension).is_ok() {
                     high = middle;
                 } else {
                     low = middle + 1;
                 }
             }
             constrained.memory_bytes = low;
-            assert_eq!(validate_options(dimension, constrained).unwrap(), 1);
+            assert_eq!(constrained.resident_rows(dimension).unwrap(), 1);
             for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
                 let make = |memory| {
                     let directory = Directory::new();
@@ -1142,18 +1170,19 @@ mod tests {
         let dir = Directory::new();
         fs::create_dir(&dir.0).unwrap();
         fs::write(dir.0.join("sentinel"), b"caller data").unwrap();
-        assert!(
-            construct_tree(
-                &dir.0,
-                2,
-                Metric::L2,
-                [7; 32],
-                options(),
-                records(1, true),
-                |_| { panic!("existing directory cannot emit") }
-            )
-            .is_err()
-        );
+        let error = construct_tree(
+            &dir.0,
+            2,
+            Metric::L2,
+            [7; 32],
+            options(),
+            records(1, true),
+            |_| panic!("existing directory cannot emit"),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Backend);
+        let source = std::error::Error::source(&error).unwrap();
+        assert!(source.downcast_ref::<std::io::Error>().is_some());
         assert_eq!(fs::read(dir.0.join("sentinel")).unwrap(), b"caller data");
 
         let dir = Directory::new();
@@ -1319,7 +1348,7 @@ mod tests {
                 memory_bytes: reserved + row_capacity * row_bound,
                 scratch_bytes: 64 * 1024 * 1024,
             };
-            assert_eq!(validate_options(dimension, options).unwrap(), row_capacity);
+            assert_eq!(options.resident_rows(dimension).unwrap(), row_capacity);
             let records = (0_u64..33).map(|id| {
                 Ok(ConstructionRecord {
                     id: Bytes::copy_from_slice(&id.to_be_bytes()),
