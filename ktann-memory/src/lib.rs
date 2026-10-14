@@ -95,6 +95,8 @@ impl State {
         self.prune_history();
     }
 
+    /// Drops obsolete or over-budget conflict history and advances the oldest verifiable revision.
+    /// Writers older than that floor must fail rather than commit without complete conflict evidence.
     fn prune_history(&mut self) {
         let oldest = self
             .writers
@@ -147,6 +149,7 @@ impl MemoryBackend {
 
 impl Backend for MemoryBackend {
     type ReadTxn<'a> = MemoryReadTxn;
+
     type WriteTxn<'a> = MemoryWriteTxn<'a>;
 
     fn hard_limits(&self) -> HardLimits {
@@ -303,16 +306,19 @@ impl ReadOps for MemoryReadTxn {
         self.lease.0.count(|c| c.get += 1);
         self.lookup(&key)
     }
+
     async fn batch_get(&mut self, keys: Vec<Bytes>) -> Result<Vec<Option<Bytes>>> {
         #[cfg(feature = "test-support")]
         self.lease.0.count(|c| c.batch_get += 1);
         self.lookup_batch(&keys)
     }
+
     async fn scan(&mut self, range: &KeyRange, limits: ScanLimits) -> Result<ScanPage> {
         #[cfg(feature = "test-support")]
         self.lease.0.count(|c| c.scan += 1);
         self.scan_page(range, limits)
     }
+
     async fn batch_scan(
         &mut self,
         ranges: &[KeyRange],
@@ -333,6 +339,7 @@ impl ReadOps for MemoryReadTxn {
             .collect()
     }
 }
+
 impl ReadTxn for MemoryReadTxn {}
 
 /// An optimistic write transaction with a private read-your-writes snapshot.
@@ -557,6 +564,8 @@ impl WriteTxn for MemoryWriteTxn<'_> {
         Err(Error::new(ErrorKind::Unsupported))
     }
 
+    /// Checks conflicts and publishes the buffered write set under one backend lock.
+    /// Commit admission and injected outcome handling share this serialized publication boundary.
     async fn commit_with(self, start: CommitStart) -> Result<()> {
         let mut state = self.backend.lock()?;
         // No await follows this claim: fault resolution and publication are one

@@ -197,6 +197,7 @@ const SMALL_QUEUE_DIVISOR: u64 = 10;
 /// The maximum value of a slot's frequency counter.
 const MAX_FREQUENCY: u8 = 3;
 
+/// Mutex-protected cache contents and eviction history; queue generations distinguish stale records.
 struct CacheInner {
     slots: HashMap<CacheKey, CacheSlot>,
     /// The probationary small FIFO queue: one record per enqueue, matched to
@@ -213,6 +214,7 @@ struct CacheInner {
     main_bytes: u64,
 }
 
+/// The current body and eviction state for a key; its generation identifies the live queue record.
 struct CacheSlot {
     body: Arc<CachedBody>,
     frequency: u8,
@@ -220,12 +222,14 @@ struct CacheSlot {
     queue_tick: u64,
 }
 
+/// Distinguishes probationary entries from entries admitted to the main eviction queue.
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum QueueKind {
     Small,
     Main,
 }
 
+/// An enqueue generation; older records for a replaced or requeued slot are ignored.
 struct QueueRecord {
     key: CacheKey,
     tick: u64,
@@ -375,6 +379,7 @@ impl CacheInner {
         self.queue_tick
     }
 
+    /// Admits a body to the small or main queue and updates byte accounting for any replaced slot.
     fn insert(&mut self, key: CacheKey, body: Arc<CachedBody>, small_capacity_bytes: u64) {
         // Ghost hits and bodies too large for the small queue enter the main
         // queue directly; everything else starts in the small queue.

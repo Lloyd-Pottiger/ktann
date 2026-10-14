@@ -25,6 +25,7 @@ const DEFAULT_CACHE_DIR: &str = "/tmp/vectordb_bench/dataset";
 
 type IdVectors = (Vec<Bytes>, Vec<Arc<[f32]>>);
 
+/// Selects the decoder for a manifest-pinned external dataset.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 enum DatasetFormat {
     #[serde(rename = "vectordbbench_parquet")]
@@ -33,6 +34,7 @@ enum DatasetFormat {
     TexMexFvecs,
 }
 
+/// Pins dataset provenance, expected dimensions, and the query subset used by the large profile.
 #[derive(Clone, Debug, Deserialize)]
 struct Manifest {
     id: String,
@@ -47,6 +49,7 @@ struct Manifest {
     files: Vec<ManifestFile>,
 }
 
+/// One required cached file, including its source location, length, and integrity check.
 #[derive(Clone, Debug, Deserialize)]
 struct ManifestFile {
     role: String,
@@ -56,6 +59,7 @@ struct ManifestFile {
     checksum: FileChecksum,
 }
 
+/// Describes the source checksum; multipart S3 ETags also require the original part size.
 #[derive(Clone, Debug, Deserialize)]
 struct FileChecksum {
     algorithm: String,
@@ -121,6 +125,7 @@ fn parse_manifest(name: &str) -> Result<Manifest, String> {
     serde_json::from_str(bytes).map_err(|error| format!("decode {name} dataset manifest: {error}"))
 }
 
+/// Rejects inconsistent dataset shape, unsupported metrics, and missing or ambiguous file roles.
 fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
     if manifest.dimension == 0
         || manifest.base_vectors < 500_000
@@ -184,6 +189,7 @@ fn file_for<'a>(manifest: &'a Manifest, role: &str) -> Result<&'a ManifestFile, 
         .ok_or_else(|| format!("dataset manifest {} is missing {role}", manifest.id))
 }
 
+/// Verifies cached file sizes and source checksums before any dataset decoding.
 fn validate_files(cache: &Path, manifest: &Manifest) -> Result<(), String> {
     for file in &manifest.files {
         let path = cache.join(&file.path);
@@ -236,6 +242,7 @@ fn sha256(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// Reproduces the source S3 ETag, including multipart hashing with the recorded part size.
 fn s3_etag(path: &Path, part_bytes: Option<usize>) -> Result<String, String> {
     let part_bytes = part_bytes.ok_or_else(|| "s3 ETag checksum needs part_bytes".to_owned())?;
     if part_bytes == 0 {

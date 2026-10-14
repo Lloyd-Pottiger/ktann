@@ -320,6 +320,7 @@ impl Predicate {
         self.validate_at(fields, 1, &mut nodes)
     }
 
+    /// Validates one predicate subtree against the schema while enforcing depth and total-node limits.
     fn validate_at(
         &mut self,
         fields: &[FieldSchema],

@@ -631,6 +631,7 @@ mod tests {
             assert_eq!(train(&kernel, entries).expect("trained"), trained);
         }
     }
+
     // Independent full-sort/recompute protocol oracle for persisted centroid
     // bytes and round counts. It intentionally retains the specified numeric
     // reduction order while the implementation chooses only a membership set.

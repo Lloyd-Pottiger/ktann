@@ -33,6 +33,7 @@
 //! ```
 
 pub mod api;
+pub mod bulk;
 pub mod construction;
 pub mod maintenance;
 mod observe;

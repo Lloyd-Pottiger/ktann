@@ -204,3 +204,10 @@ properties; deterministic search budgets; lifecycle recovery; and focused
 recall, latency, contention, memory, and write-amplification benchmarks. The
 detailed evidence matrix is in the module designs. No compatibility suite for
 an unshipped format and no duplicated implementation-path tests are required.
+
+## Offline artifact preparation
+
+The synchronous [`bulk` module](bulk-artifacts.md) owns bounded input capture,
+external sorting, forest files, and serving artifact assembly. It reuses core
+construction and storage codecs and never writes backend state. The non-goals
+above concerning bulk-build generations and staging indexes remain unchanged.

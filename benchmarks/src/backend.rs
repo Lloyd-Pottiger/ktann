@@ -361,6 +361,7 @@ impl<B: Backend> Backend for MeasuredBackend<B> {
         = MeasuredTxn<B::ReadTxn<'backend>>
     where
         Self: 'backend;
+
     type WriteTxn<'backend>
         = MeasuredTxn<B::WriteTxn<'backend>>
     where

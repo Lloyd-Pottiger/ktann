@@ -928,6 +928,7 @@ mod tests {
 
     impl Backend for TestBackend {
         type ReadTxn<'backend> = TestTxn;
+
         type WriteTxn<'backend> = TestTxn;
 
         fn hard_limits(&self) -> HardLimits {

@@ -246,6 +246,7 @@ pub(super) fn decode_index_name_entry(decoder: &mut Decoder) -> Result<IndexName
     Ok(IndexNameEntry::new(decoder.logical_index_id()?))
 }
 
+/// Serializes the index configuration and its derived Bloom parameters in canonical field order.
 pub(super) fn encode_index_manifest(encoder: &mut Encoder, manifest: &IndexManifest) -> Result<()> {
     encoder.u16(FORMAT_VERSION);
     encoder.u8(match manifest.lifecycle {
@@ -287,6 +288,7 @@ pub(super) fn encode_index_manifest(encoder: &mut Encoder, manifest: &IndexManif
     Ok(())
 }
 
+/// Reconstructs and validates the persisted configuration, identity, and derived Bloom parameters.
 pub(super) fn decode_index_manifest(decoder: &mut Decoder) -> Result<IndexManifest> {
     let format_version = decoder.u16()?;
     if format_version != FORMAT_VERSION {

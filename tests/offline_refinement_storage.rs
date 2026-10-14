@@ -63,6 +63,7 @@ fn header_key(manifest: &IndexManifest, partition: u64) -> LogicalKey {
         partition: fixture::partition(partition),
     }
 }
+
 fn entry_key(manifest: &IndexManifest, partition: u64, id: Bytes) -> LogicalKey {
     LogicalKey::LeafEntry {
         index: manifest.logical_index_id(),

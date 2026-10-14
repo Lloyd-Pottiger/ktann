@@ -33,12 +33,14 @@ struct Part {
     children: Vec<PartitionKey>,
 }
 
+/// A loaded tree and its planned refinement rounds; member indexes refer to the shared record arrays.
 struct Tree {
     key: TreeKey,
     parts: Vec<Part>,
     rounds: Vec<Vec<Move>>,
 }
 
+/// The bounded refinement input, with record IDs and vectors shared across the loaded topology.
 struct Loaded {
     trees: Vec<Tree>,
     ids: Vec<Bytes>,
@@ -81,6 +83,7 @@ async fn page<B: Backend>(
         .await
 }
 
+/// Loads and cross-checks records, locations, and tree membership under the refinement input budget.
 async fn load<B: Backend>(
     context: &OperationContext<B>,
     manifest: &IndexManifest,
@@ -437,6 +440,7 @@ pub(crate) async fn run<B: Backend>(
     }
     Ok(())
 }
+
 /// Computes a metric-correct mean with f64 accumulation in canonical order.
 fn mean<'a>(kernel: &VectorKernel, members: impl Iterator<Item = &'a [f32]>) -> Result<Box<[f32]>> {
     let mut sum = vec![0.0_f64; kernel.dimension()];
@@ -598,6 +602,7 @@ async fn controlled_compute<T: Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn refinement_improves_assignment_and_respects_occupancy() {
         let kernel = VectorKernel::new(1, crate::api::Metric::L2, [0; 32]).unwrap();

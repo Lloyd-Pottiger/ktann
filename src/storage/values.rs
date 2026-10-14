@@ -65,6 +65,7 @@ mod data;
 mod entry;
 mod manifest;
 mod record;
+pub(crate) mod source;
 mod synopsis;
 mod wire;
 
@@ -115,7 +116,7 @@ pub(crate) fn leaf_relocation_value_sizes(
     })
 }
 
-const MAX_VALUE_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_VALUE_BYTES: usize = 1024 * 1024;
 const ROTATION_SEED_BYTES: usize = 32;
 
 const TAG_INDEX_ID_ALLOCATOR: u8 = 0x00;
@@ -455,6 +456,7 @@ const fn value_kind_for_key(key: &LogicalKey) -> ValueKind {
     }
 }
 
+/// Rejects a decoded value whose embedded identity disagrees with the logical key that contains it.
 fn validate_key_identity(
     key: &LogicalKey,
     value: &PersistentValue,

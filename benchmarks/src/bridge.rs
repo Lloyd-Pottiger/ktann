@@ -132,6 +132,7 @@ struct Request {
 
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+/// Operations accepted by the versioned VectorDBBench process bridge.
 enum Operation {
     Reset {
         dimension: usize,
@@ -204,6 +205,7 @@ struct Measurements {
     exhausted: [u64; 4],
     last_search: Option<Instant>,
 }
+
 impl Default for Measurements {
     fn default() -> Self {
         Self {
@@ -236,12 +238,14 @@ struct Service<B: Backend> {
 
 /// Removes only the socket created by this process, including on setup failure.
 struct SocketGuard(PathBuf);
+
 impl Drop for SocketGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
 }
 
+/// Owns the Unix socket and shared runtime for benchmark client connections.
 async fn serve<B: Backend>(backend: B, identity: String, options: &Options) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     let listener = UnixListener::bind(&options.socket).map_err(|e| e.to_string())?;
@@ -324,6 +328,7 @@ async fn connection<B: Backend>(mut stream: UnixStream, service: Arc<Service<B>>
     }
 }
 
+/// Processes one length-bounded request and response, recording decode and execution time separately.
 async fn exchange<B: Backend>(stream: &mut UnixStream, service: &Service<B>) -> Result<(), String> {
     let size = stream.read_u32().await.map_err(|e| e.to_string())? as usize;
     if size == 0 || size > MAX_FRAME {
@@ -383,9 +388,11 @@ async fn exchange<B: Backend>(stream: &mut UnixStream, service: &Service<B>) -> 
 
 /// Errors never invite automatic replay of inserts with unknown outcomes.
 type BridgeResult = Result<Value, (&'static str, String)>;
+
 fn api_error(error: ktann::api::Error) -> (&'static str, String) {
     ("ktann", format!("{:?}: {error}", error.kind()))
 }
+
 fn invalid(message: &str) -> (&'static str, String) {
     ("invalid_argument", message.into())
 }
