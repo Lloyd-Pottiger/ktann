@@ -185,3 +185,17 @@ _Avoid_: Partition count, convergence state
   Synopses only prune work and never replace exact filtering.
 - A Sharded Forest contains disjoint records, not replicated recall trees.
 - Structure Maintenance requires no global owner or lease.
+
+## Offline artifacts
+
+- An **Input Snapshot** is a finite, immutable, caller-owned file of full Vector
+  Records in receipt order, bound to an Index Configuration.
+- A **Forest Artifact** contains deterministic partition plans for all Tree Keys,
+  bound to the Input Snapshot, semantic configuration, rotation seed, and training
+  sample size. Resource budgets do not determine artifact identity.
+- A **Serving Artifact** contains canonical logical key/value bytes derived from
+  exact joins between an Input Snapshot and its Forest Artifact, bound to a target
+  Index Manifest. Adapter limits constrain production or consumption without
+  changing artifact identity. It grants no loading or publication authority.
+- An **Artifact Manifest** identifies sealed file bytes by kind, binding, count,
+  size, and SHA-256 digest. The caller retains the trusted expected identity.

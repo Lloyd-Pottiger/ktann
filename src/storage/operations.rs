@@ -857,6 +857,8 @@ impl<'manifest> MutationBuilder<'manifest> {
         self.queue(encoded_key, None)
     }
 
+    /// Coalesces mutations by key while charging only their final buffered footprint.
+    /// Admission failure leaves both the previous mutation and its accounting unchanged.
     fn queue(&mut self, key: Bytes, value: Option<Bytes>) -> Result<()> {
         check_hard_limits(self.hard_limits, &key, value.as_ref())?;
         let new_bytes = mutation_bytes(&key, value.as_ref())?;

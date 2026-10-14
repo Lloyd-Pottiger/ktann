@@ -6,6 +6,7 @@ use crate::api::{Error, LogicalIndexId, PartitionKey, Result};
 
 use super::{MAX_VALUE_BYTES, ValueKind, corrupt};
 
+/// Builds canonical big-endian value bodies; format-specific callers supply the field order.
 pub(super) struct Encoder {
     bytes: Vec<u8>,
 }
@@ -100,6 +101,7 @@ pub(super) fn canonical_f64_bits(value: f64) -> Result<u64> {
     Ok(if value == 0.0 { 0 } else { value.to_bits() })
 }
 
+/// Consumes a value body without reading past its bounds; callers must also require exact exhaustion.
 pub(super) struct Decoder {
     bytes: Bytes,
     position: usize,

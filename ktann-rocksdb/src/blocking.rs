@@ -36,6 +36,7 @@ impl std::fmt::Debug for JobQueue {
     }
 }
 
+/// The worker queue and its shutdown flag, protected by the queue mutex.
 #[derive(Default)]
 struct QueueState {
     jobs: VecDeque<Job>,
@@ -98,6 +99,7 @@ pub(crate) struct BlockingPool {
     limit: usize,
 }
 
+/// Shared admission permits and active-job tracking used to wait for native cleanup.
 #[derive(Debug)]
 struct AdmissionState {
     permits: Arc<Semaphore>,
@@ -219,6 +221,7 @@ fn worker_loop(queue: &JobQueue) {
     }
 }
 
+/// Keeps a job admitted through native cleanup; dropping it releases capacity and wakes idle waiters.
 struct ActivePermit {
     _permit: OwnedSemaphorePermit,
     state: Arc<AdmissionState>,

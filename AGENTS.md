@@ -40,6 +40,17 @@ Never run Cargo commands concurrently: they contend on Cargo and target-director
 locks. Use Rust Edition 2024 and the latest stable toolchain in development and CI.
 Production code uses no nightly features.
 
+## Code Readability
+
+- Keep a blank line between adjacent functions, methods, and type or impl
+  definitions. Run `cargo fmt --all`; stable rustfmt preserves this spacing
+  but does not insert missing separators with its default configuration.
+- Document key internal types and functions as well as public APIs. Explain
+  their role, ownership, invariants, and failure or resource boundaries where
+  those are not obvious from the signature.
+- Comment non-obvious algorithmic and concurrency decisions. Keep comments
+  accurate when editing code; avoid comments that only repeat names or syntax.
+
 ## Workflow Principles
 
 - Before a non-trivial change, read `CONTEXT.md`, the relevant sections of

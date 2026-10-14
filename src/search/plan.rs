@@ -528,6 +528,7 @@ impl FieldSet {
         }
     }
 
+    /// Converts a typed comparison into the non-null value ranges where it can be true.
     fn from_compare(ty: DataType, op: CompareOp, value: &Value) -> Result<Self> {
         let next = next_value(ty, value)?;
         let intervals = match op {
@@ -595,6 +596,7 @@ impl FieldSet {
         Self::normalize(self.ty, intervals)
     }
 
+    /// Complements normalized intervals within the non-null domain; null truth is handled separately.
     fn complement(&self) -> Self {
         if self.intervals.is_empty() {
             return Self::normalize(self.ty, vec![Interval { lo: None, hi: None }]);

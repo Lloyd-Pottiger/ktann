@@ -11,6 +11,7 @@ const HEADER_BYTES: usize = 12;
 const MAX_MAGNITUDE: u8 = 63;
 const MAGNITUDE_BITS: usize = 6;
 
+/// Encodes a finite vector as canonical RaBitQ7 codes with scale and error bounds for distance evaluation.
 pub(super) fn quantize(vector: &[f32]) -> Result<Bytes> {
     let dimension = vector.len();
     let encoded_len = encoded_len(dimension)?;
@@ -66,6 +67,7 @@ pub(super) fn quantize(vector: &[f32]) -> Result<Bytes> {
     )
 }
 
+/// Validates the complete RaBitQ7 encoding before exposing the decoded header and borrowed bitstream.
 pub(super) fn decode(encoded: &[u8], dimension: usize) -> Result<RaBitQ7<'_>> {
     let expected_len = encoded_len(dimension).map_err(|_| corrupt())?;
     if encoded.len() != expected_len || !padding_is_zero(encoded, dimension) {

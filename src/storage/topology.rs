@@ -583,6 +583,7 @@ struct LeafRelocationCharge {
 }
 
 impl LeafRelocationCharge {
+    /// Precomputes conservative relocation costs, including adapter overhead for every physical mutation.
     fn new(
         manifest: &IndexManifest,
         tree_key: &TreeKey,

@@ -293,6 +293,7 @@ impl Control {
     }
 }
 
+/// Counts an admitted transaction as active until its lease is dropped.
 pub(crate) struct Lease(pub(crate) Arc<Control>);
 
 impl Drop for Lease {
@@ -426,6 +427,7 @@ pub(crate) fn limit_exceeded() -> Error {
     Error::new(ErrorKind::LimitExceeded)
 }
 
+/// Coalesces overlapping or touching clear ranges into an ordered, disjoint inventory.
 pub(crate) fn merge_clear_range(clear_ranges: &[KeyRange], added: &KeyRange) -> Vec<KeyRange> {
     let mut merged = Vec::with_capacity(clear_ranges.len().saturating_add(1));
     let mut start = added.start().to_vec();

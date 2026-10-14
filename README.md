@@ -37,6 +37,10 @@ The core library, all three storage adapters, search, online maintenance,
 and verification are implemented. KTANN is pre-1.0: APIs and persistent formats
 may change, and there is no stable release yet.
 
+The [`bulk` module](docs/design/bulk-artifacts.md) prepares bounded offline input,
+forest, and serving artifacts. Backend loading and publication are outside this
+module.
+
 ## How it works
 
 ```text

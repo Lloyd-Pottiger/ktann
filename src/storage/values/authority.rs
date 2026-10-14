@@ -303,6 +303,7 @@ pub(super) fn encode_partition_state(
     Ok(())
 }
 
+/// Decodes partition lifecycle state, rejecting unknown tags and invalid referenced Partition Keys.
 pub(super) fn decode_partition_state(decoder: &mut Decoder) -> Result<PartitionTransition> {
     let kind = decode_state_kind(decoder.u8()?)?;
     let started_at_unix_millis = decoder.u64()?;

@@ -29,6 +29,7 @@ const FDB_TRANSACTION_TOO_LARGE: i32 = 2101;
 const FDB_KEY_TOO_LARGE: i32 = 2102;
 const FDB_VALUE_TOO_LARGE: i32 = 2103;
 
+/// Maps logical keys into one physical namespace and accounts for the prefix in key-size limits.
 #[derive(Debug)]
 struct PhysicalPrefix {
     bytes: Bytes,
@@ -153,6 +154,7 @@ impl fmt::Debug for FoundationDbWriteTxn<'_> {
 
 impl Backend for FoundationDbBackend {
     type ReadTxn<'backend> = FoundationDbReadTxn<'backend>;
+
     type WriteTxn<'backend> = FoundationDbWriteTxn<'backend>;
 
     fn hard_limits(&self) -> HardLimits {
@@ -355,11 +357,13 @@ impl WriteTxn for FoundationDbWriteTxn<'_> {
     async fn rollback(self) {}
 }
 
+/// A validated, namespace-encoded mutation staged before touching the native transaction.
 enum PreparedMutation {
     Put { key: Bytes, value: Bytes },
     Delete { key: Bytes },
 }
 
+/// Selects snapshot reads or reads that establish conflict protection for a write transaction.
 #[derive(Clone, Copy)]
 enum ReadMode {
     Snapshot,
@@ -411,6 +415,8 @@ async fn get(
         .map_err(map_operation_error)
 }
 
+/// Performs bounded batches of point reads, coalescing consecutive snapshot keys when possible.
+/// Update-protected reads retain point-read conflict semantics.
 async fn batch_get(
     transaction: &Transaction,
     prefix: &PhysicalPrefix,

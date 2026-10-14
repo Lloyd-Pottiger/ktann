@@ -394,6 +394,8 @@ struct RunningFixup<'a, B: Backend> {
 }
 
 impl<B: Backend> Drop for RunningFixup<'_, B> {
+    /// Returns an unfinished offer to the queue or completes it and admits split follow-ups.
+    /// Wakeups occur after releasing the queue lock so workers can make progress immediately.
     fn drop(&mut self) {
         let split_followups = if self.inner.is_accepting() {
             self.split_followups.take()
@@ -834,6 +836,7 @@ mod tests {
 
     impl Backend for FailingBackend {
         type ReadTxn<'backend> = FailingTxn;
+
         type WriteTxn<'backend> = FailingTxn;
 
         fn hard_limits(&self) -> HardLimits {

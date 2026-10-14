@@ -15,15 +15,19 @@ impl BackendHarness for Harness {
     fn backend(&self) -> &MemoryBackend {
         &self.0
     }
+
     fn fault_injection(&self) -> FaultInjection {
         FaultInjection::Unavailable
     }
+
     fn inject_fault(&self, _: Fault) {
         unreachable!("no injected faults")
     }
+
     fn restart_mode(&self) -> RestartMode {
         RestartMode::Ephemeral
     }
+
     fn restart(&self) -> Self {
         Self::default()
     }

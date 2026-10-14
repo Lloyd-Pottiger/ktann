@@ -114,6 +114,7 @@ impl CompiledPredicate {
         self.expression.evaluate(fields)
     }
 
+    /// Checks persisted fields against the compiled schema; mismatches are corruption, not predicate misses.
     fn validate_stored_fields(&self, fields: &[Value]) -> Result<()> {
         if fields.len() != self.field_count {
             return Err(corrupt());
@@ -365,6 +366,8 @@ fn null_seeded_bounds(synopsis: &FieldSynopsis) -> (TruthSet, Option<(&Value, &V
     (truths, bounds)
 }
 
+/// Computes every comparison truth value still possible under the synopsis.
+/// Bloom membership can rule equality out, but cannot establish it on its own.
 fn compare_truths(
     synopsis: &FieldSynopsis,
     op: CompareOp,
@@ -418,6 +421,7 @@ fn compare_truths(
     Ok(truths)
 }
 
+/// Bounds IN results using null presence, value bounds, and Bloom membership without losing SQL UNKNOWN.
 fn in_truths(
     synopsis: &FieldSynopsis,
     values: &CompiledIn,
@@ -482,7 +486,9 @@ struct TruthSet(u8);
 
 impl TruthSet {
     const EMPTY: Self = Self(0);
+
     const FALSE: Self = Self(1 << TruthValue::False as u8);
+
     const TRUE: Self = Self(1 << TruthValue::True as u8);
 
     fn insert(&mut self, truth: TruthValue) {

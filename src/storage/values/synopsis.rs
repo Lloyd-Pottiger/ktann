@@ -163,6 +163,7 @@ impl fmt::Debug for PartitionSynopsis {
     }
 }
 
+/// Validates a synopsis against its index configuration before encoding its ordered fields.
 pub(super) fn encode_partition_synopsis(
     encoder: &mut Encoder,
     manifest: &IndexManifest,
@@ -197,6 +198,7 @@ pub(super) fn encode_partition_synopsis(
     Ok(())
 }
 
+/// Decodes configured synopsis fields and validates their shape and bounds before returning them.
 pub(super) fn decode_partition_synopsis(
     decoder: &mut Decoder,
     manifest: &IndexManifest,
@@ -231,6 +233,7 @@ pub(super) fn decode_partition_synopsis(
     Ok(synopsis)
 }
 
+/// Checks configured field shapes and that Bloom filters agree with their recorded extrema.
 fn validate_synopsis(synopsis: &PartitionSynopsis, manifest: &IndexManifest) -> Result<()> {
     validate_synopsis_shape(synopsis, manifest)?;
     for ((synopsis, field), parameters) in synopsis
@@ -361,6 +364,7 @@ fn bloom_bit(value: &Value, data_type: DataType, parameters: BloomParameters) ->
     usize::try_from(bit).expect("Bloom bit index fits usize")
 }
 
+/// Checks null presence, typed bounds, and Bloom shape against the configured synopsis policy.
 fn validate_field_synopsis(
     synopsis: &FieldSynopsis,
     field: &FieldSchema,

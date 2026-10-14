@@ -41,7 +41,7 @@ impl ConstructionOptions {
     /// Return the resident row allowance after reserving non-resident working space.
     /// Caller-owned input buffers and emitted plans retained by the consumer are
     /// outside this budget; construction owns only the buffers needed to emit them.
-    fn resident_rows(self, dimension: usize) -> Result<usize> {
+    pub(crate) fn resident_rows(self, dimension: usize) -> Result<usize> {
         let row_bound = dimension
             .checked_mul(4)
             .and_then(|n| n.checked_add(MAX_ID_BYTES + ROW_OVERHEAD_BYTES))
@@ -199,10 +199,13 @@ struct Run {
     count: u64,
     bytes: u64,
 }
+
+/// An unfinished scratch run; flushing returns the descriptor used by later passes.
 struct Output {
     run: Run,
     writer: BufWriter<File>,
 }
+
 impl Output {
     fn finish(mut self) -> Result<Run> {
         self.writer
@@ -214,11 +217,14 @@ impl Output {
     }
 }
 
+/// Streams a run with a reusable vector decoding buffer and an exact remaining-row count.
 struct Input {
     reader: BufReader<File>,
     remaining: u64,
     encoded_vector: Vec<u8>,
 }
+
+/// A construction point with a temporary cluster label; labels and IDs define deterministic order.
 #[derive(Default)]
 struct Row {
     label: usize,
@@ -235,6 +241,7 @@ impl Row {
 }
 
 impl Input {
+    /// Reads one scratch row, rejecting invalid ID lengths, non-finite vector components, and trailing bytes.
     fn next(&mut self) -> Result<Option<Row>> {
         if self.remaining == 0 {
             let mut tail = [0];
@@ -286,6 +293,8 @@ impl Input {
     }
 }
 
+/// Owns construction scratch files and accounts their overlap against the shared disk ceiling.
+/// The resident-row limit determines when a group can switch to the in-memory path.
 struct Workspace {
     directory: PathBuf,
     next_file: u64,
@@ -318,6 +327,7 @@ impl Workspace {
         })
     }
 
+    /// Charges the live scratch budget before appending an ID and vector to an unfinished run.
     fn append(&mut self, output: &mut Output, id: &[u8], vector: &[f32]) -> Result<()> {
         let bytes = 4 + id.len() as u64 + 4 * vector.len() as u64;
         let total = self
@@ -513,6 +523,8 @@ impl Workspace {
         Ok(())
     }
 
+    /// Constructs one group in memory when it fits; otherwise samples, partitions, and recurses.
+    /// Both paths use deterministic sampling and ordering so spill decisions do not change topology.
     fn group(
         &mut self,
         input: Run,
@@ -781,21 +793,26 @@ fn group_sizes(counts: &[u64], min: u64) -> Vec<u64> {
     sizes
 }
 
+/// Orders sample candidates by hash and ID so a bounded max-heap retains the same global sample.
 struct Sample {
     hash: u128,
     row: Row,
 }
+
 impl PartialEq for Sample {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other).is_eq()
     }
 }
+
 impl Eq for Sample {}
+
 impl PartialOrd for Sample {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
+
 impl Ord for Sample {
     fn cmp(&self, other: &Self) -> Ordering {
         self.hash
@@ -813,6 +830,7 @@ mod tests {
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
     struct Directory(PathBuf);
+
     impl Directory {
         fn new() -> Self {
             Self(std::env::temp_dir().join(format!(
@@ -826,6 +844,7 @@ mod tests {
                 )))
         }
     }
+
     impl Drop for Directory {
         fn drop(&mut self) {
             if self.0.exists() {
@@ -1267,6 +1286,7 @@ mod tests {
             );
         }
     }
+
     #[test]
     fn separated_clusters_keep_their_exact_natural_membership() {
         let expected: BTreeSet<Vec<Bytes>> = [(0_u64, 8), (8, 17), (17, 27)]

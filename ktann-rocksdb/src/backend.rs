@@ -29,11 +29,13 @@ const MAX_SCAN_PAGE_BYTES: usize = 80 << 10;
 const MAX_BATCH_POINT_READS: usize = 1_024;
 const PHYSICAL_PREFIX_HEADER: &[u8] = b"\0ktann-rocksdb";
 
+/// Maps logical keys into one physical namespace and accounts for the prefix in key-size limits.
 #[derive(Clone, Debug)]
 struct PhysicalPrefix {
     bytes: Bytes,
 }
 
+/// A half-open physical scan range after namespace encoding and cursor adjustment.
 struct PhysicalRange {
     start: Bytes,
     end: Bytes,
@@ -190,6 +192,7 @@ pub struct RocksDbWriteTxn<'backend> {
     prefix: &'backend PhysicalPrefix,
 }
 
+/// Requests executed by the native worker that owns one read snapshot.
 enum ReadCommand {
     Get {
         key: Bytes,
@@ -211,6 +214,7 @@ enum ReadCommand {
     },
 }
 
+/// Requests serialized by the native worker that owns one write transaction.
 enum WriteCommand {
     Get {
         key: Bytes,
@@ -285,6 +289,7 @@ impl CommitOwnership {
     }
 }
 
+/// Cancels commit admission if the caller drops its future before native commit begins.
 struct CancelCommitOnDrop {
     ownership: CommitOwnership,
 }
@@ -305,6 +310,7 @@ impl fmt::Debug for RocksDbWriteTxn<'_> {
 
 impl Backend for RocksDbBackend {
     type ReadTxn<'backend> = RocksDbReadTxn<'backend>;
+
     type WriteTxn<'backend> = RocksDbWriteTxn<'backend>;
 
     fn hard_limits(&self) -> HardLimits {
@@ -566,6 +572,7 @@ impl WriteTxn for RocksDbWriteTxn<'_> {
     }
 }
 
+/// Keeps a RocksDB snapshot on its native worker and serves commands until the caller disconnects.
 fn read_actor(
     database: Arc<OptimisticTransactionDB>,
     prefix: PhysicalPrefix,
@@ -602,6 +609,8 @@ fn read_actor(
     }
 }
 
+/// Owns a native write transaction, serializing reads, buffered mutations, and commit.
+/// Commit admission is claimed on this worker before invoking the native commit operation.
 fn write_actor(
     database: Arc<OptimisticTransactionDB>,
     prefix: PhysicalPrefix,
@@ -745,6 +754,7 @@ fn respond<T>(response: oneshot::Sender<Result<T>>, operation: impl FnOnce() -> 
     response.send(operation()).is_ok()
 }
 
+/// A validated physical mutation ready for native application and admission accounting.
 enum PreparedMutation {
     Put { key: Bytes, value: Bytes },
     Delete { key: Bytes },

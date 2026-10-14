@@ -89,6 +89,7 @@ impl IndexConfig {
         self.validate_partition_entries()
     }
 
+    /// Validates the field inventory and index-wide limits before any storage work begins.
     fn validate_schema(&self) -> Result<()> {
         if self.fields.len() > MAX_FIELDS {
             return Err(Error::invalid_argument());
@@ -130,6 +131,7 @@ impl IndexConfig {
         Ok(())
     }
 
+    /// Checks that Tree Key field references are valid and unique within the configured schema.
     fn validate_tree_key_fields(&self) -> Result<()> {
         let mut tree_fields = HashSet::with_capacity(self.tree_key_fields.len());
         let mut worst_case_tree_key_bytes = 0_usize;

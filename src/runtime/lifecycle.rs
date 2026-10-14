@@ -370,6 +370,7 @@ pub(crate) async fn drop_index<B: Backend>(
     }
 }
 
+/// Separates scan-only progress from a deletion batch that must commit before advancing.
 enum DropStep {
     Advance {
         cursor: LogicalScanCursor,
@@ -380,6 +381,7 @@ enum DropStep {
     },
 }
 
+/// Prepares one bounded deletion step, removing the name and manifest only when deletion is complete.
 async fn prepare_delete_step<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     name_key: &LogicalKey,
