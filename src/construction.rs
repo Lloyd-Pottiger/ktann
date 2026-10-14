@@ -322,6 +322,9 @@ impl Workspace {
         Ok(())
     }
 
+    /// Emit a final group in canonical ID order, using every member for its mean.
+    /// Both grouping paths must restore this order before calling: f64 addition
+    /// is order-sensitive, so equal membership alone does not guarantee equal bits.
     fn emit_partition(
         &mut self,
         rows: impl Iterator<Item = Result<Row>>,
@@ -404,6 +407,9 @@ impl Workspace {
                 emit,
             );
         }
+        // Keep the smallest (seeded ID hash, ID) pairs, matching the external
+        // sampler. Unique IDs resolve hash collisions; the ordinal only locates
+        // the resident row and cannot affect which records enter the sample.
         let mut sample = BinaryHeap::new();
         for (ordinal, row) in rows.iter().enumerate() {
             let item = (xxh3_128_with_seed(&row.id, SAMPLE_SEED), &row.id, ordinal);
@@ -429,6 +435,9 @@ impl Workspace {
         }
         let sizes = group_sizes(&counts, u64::from(self.options.min_partition_entries));
         drop(centers);
+        // Cutting the total (center label, ID) order selects exact memberships
+        // without sorting each slice. Recursive training reorders its sample,
+        // and final emission reorders members, so slice order is immaterial.
         let mut rest = rows;
         for count in sizes {
             let count = count as usize;
@@ -476,6 +485,8 @@ impl Workspace {
             return Ok(());
         }
         let mut reader = self.reader(&input)?;
+        // The bounded max-heap retains the same smallest (hash, ID) pairs as
+        // resident sampling, regardless of the order in which rows are visited.
         let mut sample = BinaryHeap::new();
         while let Some(row) = reader.next()? {
             let item = Sample {
@@ -524,7 +535,10 @@ impl Workspace {
             .collect::<Result<_>>()?;
         let mut reader = self.reader(&input)?;
         // Canonical input order gives each row its rank in (center, ID) order
-        // without sorting vectors. Stable scatter preserves that ID invariant.
+        // without sorting vectors. Clamped boundaries cut that same total order
+        // as resident selection, even when a boundary crosses a natural cluster.
+        // Each output is an ID-ordered subsequence of the input, preserving the
+        // canonical run invariant for the next recursion or centroid reduction.
         while let Some(row) = reader.next()? {
             let label = self.nearest(&row.vector, &centers);
             let child = ends.partition_point(|&end| end <= ranks[label]);
@@ -583,8 +597,8 @@ impl Workspace {
 
     /// Train at most eight centers, in canonical sample order, with ten Lloyd rounds.
     /// The first center is farthest from the sample mean; subsequent centers are
-    /// farthest from their nearest seed. Empty centers retain their seed until
-    /// full-group counts determine the capacity-constrained boundaries.
+    /// farthest from their nearest seed. Empty centers retain their previous
+    /// position; full-group counts determine the capacity-constrained boundaries.
     fn multi_centers(
         &self,
         mut entries: Vec<(Bytes, Box<[f32]>)>,
@@ -595,6 +609,9 @@ impl Workspace {
             .div_ceil(u64::from(self.options.max_partition_entries))
             .min(8) as usize;
         let k = entries.len().min(desired).max(2);
+        // Heap iteration and resident slice order may differ. Canonical sample
+        // order fixes both floating-point reduction order and seed tie-breaking:
+        // the strict farthest-distance comparison keeps the first ID on ties.
         entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         if self.kernel.is_cosine() {
             for (_, vector) in &mut entries {
@@ -636,6 +653,9 @@ impl Workspace {
             }
             seeds.push(entries[farthest].1.clone());
         }
+        // Fixed iteration cap bounds training work. Stable assignments already
+        // produced the current centers in the preceding round, so no further
+        // update is needed; empty centers retain their current position.
         let mut previous = vec![usize::MAX; entries.len()];
         let mut sums = vec![vec![0.0_f64; dim]; k];
         let mut counts = vec![0_u64; k];
@@ -676,6 +696,9 @@ impl Workspace {
 /// Bounds also reserve enough rows and capacity for all remaining children.
 fn group_sizes(counts: &[u64], min: u64) -> Vec<u64> {
     let n: u64 = counts.iter().sum();
+    // This is a recursion bound, not the final partition size: oversized
+    // children are split again until they meet max_partition_entries. Even
+    // identical vectors concentrated in one center must make strict progress.
     let max = n - n.div_ceil(4);
     let mut natural_end = 0;
     let mut previous = 0;
@@ -683,8 +706,12 @@ fn group_sizes(counts: &[u64], min: u64) -> Vec<u64> {
     for (index, count) in counts.iter().enumerate() {
         natural_end += count;
         let remaining = (counts.len() - index - 1) as u64;
-        // Saturation expresses a lower bound of zero when remaining
-        // capacity already exceeds the entire group's cardinality.
+        // The lower bound gives this child at least min rows and leaves no
+        // more than remaining * max rows. The upper bound caps this child at
+        // max while reserving remaining * min rows. Clamping preserves each
+        // natural boundary that satisfies both constraints. Saturation handles
+        // remaining capacity larger than n without underflow or multiplication
+        // overflow; that constraint then contributes a lower bound of zero.
         let lower = (previous + min).max(n.saturating_sub(remaining.saturating_mul(max)));
         let upper = previous.saturating_add(max).min(n - remaining * min);
         let end = natural_end.clamp(lower, upper);
@@ -717,17 +744,25 @@ impl Ord for Sample {
     }
 }
 
-/// Validates resource ceilings before a job reserves a name.
+/// Return the resident row allowance after reserving non-resident working space.
+/// Caller-owned input buffers and emitted plans retained by the consumer are
+/// outside this budget; construction owns only the buffers needed to emit them.
 pub(crate) fn validate_options(dimension: usize, options: ConstructionOptions) -> Result<usize> {
     let row_bound = dimension
         .checked_mul(4)
         .and_then(|n| n.checked_add(MAX_ID_BYTES + ROW_OVERHEAD_BYTES))
         .ok_or_else(limit)?;
+    // Reserve row-sized space for the bounded training sample, up to eight
+    // centers and their f64 accumulators, and final partition emission. Charge
+    // maximum-length IDs and allocation overhead even when actual rows are small.
     let resident_rows = options
         .sample_items
         .max(options.max_partition_entries as usize)
         .checked_mul(8)
         .ok_or_else(limit)?;
+    // IO buffers and the reader's encoded-vector buffer are reserved separately
+    // from decoded resident rows. Only the remainder may hold a resident group;
+    // resident recursion borrows slices of that one allocation.
     let reserved = row_bound
         .checked_mul(resident_rows)
         .and_then(|n| n.checked_add(16 * BUFFER_BYTES))
