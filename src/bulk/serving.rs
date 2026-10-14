@@ -86,12 +86,41 @@ pub struct ServingEntry {
 #[derive(Clone)]
 pub struct ServingArtifact {
     directory: PathBuf,
+    source: ArtifactManifest,
     artifact: ArtifactManifest,
     index: IndexManifest,
     limits: HardLimits,
 }
 
 impl ServingArtifact {
+    /// Reopens bytes whose identity was durably accepted by the fenced worker.
+    pub(crate) fn accepted(
+        directory: &Path,
+        artifact: ArtifactManifest,
+        index: &IndexManifest,
+        descriptor: &crate::storage::values::BuildDescriptor,
+        limits: HardLimits,
+    ) -> Result<Self> {
+        let value = Self {
+            directory: directory.to_owned(),
+            source: descriptor.input().clone(),
+            artifact,
+            index: index.clone(),
+            limits,
+        };
+        value.reader()?;
+        Ok(value)
+    }
+
+    /// Checks the source and target identities retained at construction or open.
+    pub(crate) fn matches_build(
+        &self,
+        index: &IndexManifest,
+        descriptor: &crate::storage::values::BuildDescriptor,
+    ) -> bool {
+        self.index.has_same_immutable_identity(index) && self.source == *descriptor.input()
+    }
+
     /// Reopens using trusted upstream identities; their files and build budgets
     /// are not required. Consumer limits are checked while reading and failures
     /// are `LimitExceeded`. Full integrity requires exhausting the reader.
@@ -112,6 +141,7 @@ impl ServingArtifact {
         }
         let artifact = Self {
             directory: directory.to_owned(),
+            source: source.clone(),
             artifact: expected,
             index: index.clone(),
             limits,
@@ -538,6 +568,7 @@ impl ServingArtifact {
         Ok((
             Self {
                 directory,
+                source: input.manifest().clone(),
                 artifact,
                 index: index.clone(),
                 limits: options.hard_limits,
@@ -580,6 +611,11 @@ pub struct ServingReader {
 }
 
 impl ServingReader {
+    /// Digest through the last validated entry for a durable load checkpoint.
+    pub(crate) fn prefix_sha256(&self) -> [u8; 32] {
+        self.reader.prefix_sha256()
+    }
+
     /// Checks consumer limits, strict key order, and target-index value validity before yielding an entry.
     fn decode(&mut self, mut bytes: Bytes) -> Result<ServingEntry> {
         if bytes.len() < 4 {
@@ -601,7 +637,13 @@ impl ServingReader {
         let (types, count) = self.index.tree_key_types();
         let logical = keys::decode_key(&types[..count], &key)?;
         if logical.index() != Some(self.index.logical_index_id())
-            || matches!(logical, LogicalKey::Manifest(_))
+            || matches!(
+                logical,
+                LogicalKey::Manifest(_)
+                    | LogicalKey::BuildDescriptor(_)
+                    | LogicalKey::BuildLoad(_)
+                    | LogicalKey::BuildValidation(_)
+            )
         {
             return Err(corrupt());
         }

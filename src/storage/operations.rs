@@ -328,7 +328,13 @@ impl<'manifest> LogicalBinding<'manifest> {
     fn validate_input_key(&self, key: &LogicalKey) -> Result<()> {
         let valid = match (self.manifest, key.index()) {
             (None, None) => true,
-            (None, Some(_)) => matches!(key, LogicalKey::Manifest(_)),
+            (None, Some(_)) => matches!(
+                key,
+                LogicalKey::Manifest(_)
+                    | LogicalKey::BuildDescriptor(_)
+                    | LogicalKey::BuildLoad(_)
+                    | LogicalKey::BuildValidation(_)
+            ),
             (Some(manifest), Some(index)) => index == manifest.logical_index_id(),
             (Some(_), None) => {
                 self.allow_name_mapping && matches!(key, LogicalKey::IndexNameDirectory(_))
@@ -849,6 +855,13 @@ impl<'manifest> MutationBuilder<'manifest> {
         let encoded_key = encode_input_key(&self.binding, &key)?;
         let encoded_value = Bytes::from(self.binding.codec().encode_for_key(&key, &value)?);
         self.queue(encoded_key, Some(encoded_value))
+    }
+
+    /// Queues bytes already validated against this builder's Manifest. Internal
+    /// artifact readers own canonical codec and index-identity validation; this
+    /// method still enforces adapter hard limits and physical admission budgets.
+    pub(crate) fn put_encoded(&mut self, key: Bytes, value: Bytes) -> Result<()> {
+        self.queue(key, Some(value))
     }
 
     /// Queues a typed delete, superseding an earlier mutation to the same key.

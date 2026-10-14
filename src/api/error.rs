@@ -10,6 +10,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ErrorKind {
+    /// The Logical Index is reserved by a Bulk Build and is not serving.
+    IndexBuilding,
+    /// A newer invocation took over this Bulk Build load task.
+    BulkBuildSuperseded,
+    /// Loading has not finished, or active workspace IO prevents reclamation.
+    BulkBuildBusy,
     /// Caller input or caller-derived arithmetic is invalid.
     InvalidArgument,
     /// The requested Index Name already has a conflicting Logical Index.
@@ -53,6 +59,9 @@ pub enum ErrorKind {
 impl ErrorKind {
     const fn message(self) -> &'static str {
         match self {
+            Self::IndexBuilding => "index is being built",
+            Self::BulkBuildSuperseded => "bulk build worker was superseded",
+            Self::BulkBuildBusy => "bulk build is busy",
             Self::InvalidArgument => "invalid argument",
             Self::IndexAlreadyExists => "index already exists",
             Self::IndexNotFound => "index not found",

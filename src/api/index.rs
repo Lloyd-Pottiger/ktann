@@ -39,6 +39,7 @@ impl<B: Backend> Index<B> {
     ) -> Result<Self> {
         match manifest.lifecycle() {
             IndexLifecycle::Active => {}
+            IndexLifecycle::Building => return Err(Error::new(ErrorKind::IndexBuilding)),
             IndexLifecycle::Dropping => return Err(Error::new(ErrorKind::IndexDropping)),
         }
         Ok(Self {
@@ -354,6 +355,7 @@ impl<B: Backend> Index<B> {
     }
 
     /// Executes a mutation batch and offers only its committed maintenance.
+    /// Losing maintenance discoveries does not affect correctness.
     async fn run_mutations(
         &self,
         operation: Operation,

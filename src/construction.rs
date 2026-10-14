@@ -85,6 +85,9 @@ impl ConstructionOptions {
     }
 }
 
+/// Version of deterministic construction persisted in Bulk Build descriptors.
+pub const CONSTRUCTION_VERSION: u32 = 1;
+
 /// One original vector, identified by its canonical Record ID.
 pub struct ConstructionRecord {
     /// Record ID, unique across the containing Logical Index.

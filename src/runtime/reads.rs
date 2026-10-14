@@ -147,6 +147,7 @@ pub(crate) fn opened_manifest(
         Some(PersistentValue::IndexManifest(current)) => match current.lifecycle() {
             IndexLifecycle::Active if current.has_same_immutable_identity(handle) => Ok(current),
             IndexLifecycle::Active => Err(Error::new(ErrorKind::Corruption)),
+            IndexLifecycle::Building => Err(Error::new(ErrorKind::IndexBuilding)),
             IndexLifecycle::Dropping => Err(Error::new(ErrorKind::IndexDropping)),
         },
         Some(_) => Err(Error::new(ErrorKind::Corruption)),

@@ -22,6 +22,11 @@ pub struct InputSnapshot {
 }
 
 impl InputSnapshot {
+    /// Caller-owned snapshot directory used by durable build recovery.
+    pub(crate) fn directory(&self) -> &Path {
+        &self.directory
+    }
+
     /// Streams records into a new directory and durably seals its manifest.
     ///
     /// `maximum_bytes` bounds the complete snapshot including file framing and

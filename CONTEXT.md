@@ -133,12 +133,18 @@ _Avoid_: Periodic repair scan, durable job queue
 A bounded read-only audit of one Logical Index's persistent invariants that either completes within one backend snapshot or returns no cross-snapshot conclusion.
 _Avoid_: Search-time validation, automatic repair
 
+**Input Snapshot**:
+A finite immutable source of complete Records for Bulk Build preparation, identified by a schema-bound, checksummed manifest. It is not a backend transaction snapshot or a serving Logical Index.
+
+**Construction Artifact**:
+An immutable, sealed output of construction work, identified independently of its filesystem location. A single-tree topology artifact contains partition plans; it does not by itself establish serving membership or authorize publication.
+
 **Offline Refinement**:
 A caller-exclusive preparation operation on a settled Active Logical Index before serving. It improves leaf assignments and centroids under capacity constraints while preserving Partition Keys, topology and exact membership. Errors can leave a valid, partially refined index.
 _Avoid_: Bulk Construction, Building Index, atomic whole-operation refinement
 
 **Fixup Backlog**:
-The process-local count of pending plus running actionable Fixups used to observe Structure Maintenance work.
+The process-local count of pending plus running actionable Fixups used to observe bounded Structure Maintenance work.
 _Avoid_: Partition count, convergence state
 
 ## Relationships
@@ -174,11 +180,13 @@ _Avoid_: Partition count, convergence state
 ## Contract clarifications
 
 - Foreground Mutations change records atomically; Structure Maintenance changes
-  topology asynchronously.
+  topology asynchronously. Online loaders submit ordinary bounded atomic batches.
 - The Split Threshold triggers maintenance; it is not a synchronous hard bound
   on partition size. A mutation can retry after a topology conflict.
 - Every committed intermediate topology of an Active Logical Index remains searchable.
   After a worker stops, maintenance resumes when a relevant access discovers pending work.
+- Online callers own bounded batch concurrency and result handling; there is no
+  process-local session scheduler or whole-load atomicity contract.
 - A Vector Record is owned and encoded by KTANN, not a host application's
   business row. An Opaque Payload is separate from searchable fields.
 - Exact Filter Predicates determine which hits qualify. Conservative Partition
@@ -199,3 +207,37 @@ _Avoid_: Partition count, convergence state
   changing artifact identity. It grants no loading or publication authority.
 - An **Artifact Manifest** identifies sealed file bytes by kind, binding, count,
   size, and SHA-256 digest. The caller retains the trusted expected identity.
+
+### Bulk Build Reservation
+
+A durable name and Logical Index ID held by a Building Manifest, with a separate
+immutable Build Descriptor identifying the caller-owned input snapshot and
+construction parameters. Ordinary operations reject Building. Job handles bind
+the never-reused ID; abort cannot follow a reused name or remove a published index.
+Reservation itself launches no work; `run_worker` prepares/loads and `publish`
+validates and activates the index.
+
+**Forest Artifact**: A sealed, caller-owned topology artifact for every nonempty
+Tree Key in one finite Input Snapshot. Preparation rejects globally duplicate
+Record IDs before constructing trees. It carries no backend loading or publication
+authority; exact serving-membership validation is still required.
+
+**Serving Artifact**: A sealed, sorted file of canonical serving KV pairs for a
+specific Logical Index identity, produced by exact source/assignment and topology
+joins. It preserves source records and payloads and uses the online projection
+codecs. It excludes lifecycle bookkeeping and conveys no loading or publication
+authority; sealed backend validation is still required.
+
+**Build Load**: The single fenced task that loads one immutable Serving Artifact
+into a hidden Building index. Its epoch rejects superseded workers, and its
+entry cursor commits atomically with each data chunk. Loaded means the artifact
+stream finished; it is not sealed backend validation or permission to publish.
+
+
+**Build Workspace**: Namespace-scoped durable ownership of one job's token-named
+preparation directory, options, epoch, accepted artifacts and terminal failure.
+It survives removal of the index prefix until exclusive-lock cleanup completes.
+
+**Build Validation**: A paged exact comparison proof between a core-accepted
+Serving Artifact and frozen backend serving KV bytes. The completed proof and
+sealed Build Load authorize one atomic transition from Building to Active.
