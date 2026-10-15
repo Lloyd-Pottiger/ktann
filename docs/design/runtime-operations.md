@@ -198,7 +198,7 @@ even when the awaiting future is cancelled. Running native stages are not
 preempted; subsequent admissions and checkpoints observe cancellation.
 
 Worker epochs fence accepted outputs; load epochs fence atomic KV checkpoints.
-Publication seals writers, resumes bounded exact validation, then atomically
+Completed loading fences writers. Publication resumes bounded exact validation, then atomically
 activates the original identity. Terminal failures persist; transient failures
 and cancellation remain resumable. Root advisory locks order native IO against
 reclamation. Busy cleanup is deferred; namespace cleanup pages discover orphaned

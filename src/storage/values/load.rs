@@ -12,7 +12,9 @@ use super::wire::{Decoder, Encoder};
 ///
 /// The artifact cannot be replaced after registration. A new invocation takes
 /// over by increasing the epoch; data and progress commit together. Completion
-/// means every artifact entry was loaded, not that publication is authorized.
+/// means every artifact entry and EOF were verified, not that publication is
+/// authorized. A completed checkpoint never changes: claims return it unchanged,
+/// and outstanding chunks cannot match its predecessor to commit more writes.
 #[derive(Clone, Eq, PartialEq)]
 pub struct BuildLoad {
     pub(crate) artifact: ArtifactManifest,
@@ -20,7 +22,6 @@ pub struct BuildLoad {
     pub(crate) entries: u64,
     pub(crate) prefix_sha256: [u8; 32],
     pub(crate) complete: bool,
-    pub(crate) sealed: bool,
 }
 
 impl BuildLoad {
@@ -53,7 +54,6 @@ impl BuildLoad {
     fn validate(&self) -> Result<()> {
         if self.artifact.encode()[8] != 3
             || self.epoch == 0
-            || (self.sealed && !self.complete)
             || self.entries > self.artifact.items()
             || (self.entries == 0 && self.prefix_sha256 != self.artifact.initial_sha256())
             || (self.complete
@@ -83,7 +83,6 @@ pub(super) fn encode(encoder: &mut Encoder, load: &BuildLoad) -> Result<()> {
     encoder.u64(load.entries);
     encoder.bytes(&load.prefix_sha256);
     encoder.u8(u8::from(load.complete));
-    encoder.u8(u8::from(load.sealed));
     Ok(())
 }
 
@@ -97,18 +96,12 @@ pub(super) fn decode(decoder: &mut Decoder) -> Result<BuildLoad> {
         1 => true,
         _ => return Err(corrupt()),
     };
-    let sealed = match decoder.u8()? {
-        0 => false,
-        1 => true,
-        _ => return Err(corrupt()),
-    };
     let load = BuildLoad {
         artifact,
         epoch,
         entries,
         prefix_sha256,
         complete,
-        sealed,
     };
     load.validate().map_err(|_| corrupt())?;
     Ok(load)

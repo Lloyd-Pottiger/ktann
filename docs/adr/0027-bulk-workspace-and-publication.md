@@ -35,3 +35,13 @@ A busy root can delay cleanup of other jobs sharing that root. Reliable advisory
 locks, rename, and fsync are deployment requirements. Multi-host filesystem
 qualification is separate from transactional adapter tests. Repeated prefix
 reads and exact validation are deliberate IO costs for recovery and integrity.
+
+## Implementation refinement (2026-10-15)
+
+The completed load checkpoint is the permanent writer fence: later claims cannot
+change it, and stale chunks must match their exact predecessor before committing.
+Validation therefore needs only its own proof record; a separate sealed bit and
+unchanged Manifest/Load writes add no guarantee. The manual complete operation
+uses publication's phase checks and starts a worker only when publication is not
+ready. Loading and validation keep separate checkpoints because they describe
+distinct progress and terminal evidence.

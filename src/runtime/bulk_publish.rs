@@ -52,25 +52,28 @@ async fn publish_inner<B: Backend>(
         .serving
         .as_ref()
         .ok_or_else(|| Error::new(ErrorKind::BulkBuildBusy))?;
-    let root = state.options.workspace.clone();
-    let lock = Arc::new(blocking(context, move || bulk_worker::lock_root(&root, false)).await?);
-    let path = state.attempt(accepted.epoch).join("serving");
-    let expected = accepted.manifest.clone();
-    let manifest = index.clone();
-    let source = descriptor.clone();
-    let limits = state.hard_limits;
-    let guard = lock.clone();
-    let artifact = blocking(context, move || {
-        let _lock = guard;
-        ServingArtifact::accepted(&path, expected, &manifest, &source, limits)
-    })
-    .await;
-    let result = match artifact {
-        Ok(artifact) => {
-            validate_and_publish(context, &index, &descriptor, &state, artifact, lock, retry).await
+    let result = async {
+        let proof = begin_validation(context, &index, &descriptor, &state, retry).await?;
+        if proof.complete {
+            return activate(context, &index, &state, &proof, retry).await;
         }
-        Err(error) => Err(error),
-    };
+        let root = state.options.workspace.clone();
+        let lock = Arc::new(blocking(context, move || bulk_worker::lock_root(&root, false)).await?);
+        let path = state.attempt(accepted.epoch).join("serving");
+        let expected = accepted.manifest.clone();
+        let manifest = index.clone();
+        let source = descriptor.input().clone();
+        let forest = state.forest.as_ref().ok_or_else(corrupt)?.manifest.clone();
+        let limits = state.hard_limits;
+        let guard = lock.clone();
+        let artifact = blocking(context, move || {
+            let _lock = guard;
+            ServingArtifact::open(&path, expected, &source, &forest, &manifest, limits)
+        })
+        .await?;
+        validate_and_publish(context, &index, &state, artifact, proof, lock, retry).await
+    }
+    .await;
     if let Err(e) = &result {
         bulk_worker::record_failure(context, &index, &state, e.kind(), retry).await?;
     }
@@ -130,16 +133,14 @@ async fn fence<T: crate::storage::backend::WriteTxn>(
         .await?
     {
         Some(PersistentValue::BuildLoad(l))
-            if l.complete
-                && l.sealed
-                && l.artifact == state.serving.as_ref().ok_or_else(corrupt)?.manifest =>
+            if l.complete && l.artifact == state.serving.as_ref().ok_or_else(corrupt)?.manifest =>
         {
             Ok(())
         }
         _ => Err(corrupt()),
     }
 }
-async fn seal<B: Backend>(
+async fn begin_validation<B: Backend>(
     context: &mut OperationContext<B>,
     index: &IndexManifest,
     descriptor: &BuildDescriptor,
@@ -170,7 +171,7 @@ async fn seal<B: Backend>(
             Some(PersistentValue::BuildDescriptor(d)) if d == *descriptor => {}
             _ => return Err(corrupt()),
         }
-        let mut load = match txn
+        let load = match txn
             .get_for_update(LogicalKey::BuildLoad(index.logical_index_id()))
             .await?
         {
@@ -193,13 +194,9 @@ async fn seal<B: Backend>(
             }
             _ => return Err(Error::invalid_argument()),
         };
-        if load.sealed {
-            return read_proof(&mut txn, index).await?.ok_or_else(corrupt);
+        if let Some(proof) = read_proof(&mut txn, index).await? {
+            return Ok(proof);
         }
-        if read_proof(&mut txn, index).await?.is_some() {
-            return Err(corrupt());
-        }
-        load.sealed = true;
         let proof = BuildValidation {
             artifact: load.artifact.clone(),
             cursor: Bytes::new(),
@@ -207,16 +204,6 @@ async fn seal<B: Backend>(
             prefix_sha256: load.artifact.initial_sha256(),
             complete: false,
         };
-        txn.put(
-            LogicalKey::Manifest(index.logical_index_id()),
-            PersistentValue::IndexManifest(index.clone().with_lifecycle(IndexLifecycle::Building)),
-        )
-        .await?;
-        txn.put(
-            LogicalKey::BuildLoad(index.logical_index_id()),
-            PersistentValue::BuildLoad(load),
-        )
-        .await?;
         txn.put(
             LogicalKey::BuildValidation(index.logical_index_id()),
             PersistentValue::BuildValidation(proof.clone()),
@@ -248,47 +235,44 @@ async fn seal<B: Backend>(
 async fn validate_and_publish<B: Backend>(
     context: &mut OperationContext<B>,
     index: &IndexManifest,
-    descriptor: &BuildDescriptor,
     state: &BuildWorkspace,
     artifact: ServingArtifact,
+    mut proof: BuildValidation,
     lock: Arc<std::fs::File>,
     retry: RetryPolicy,
 ) -> Result<IndexManifest> {
-    let mut proof = seal(context, index, descriptor, state, retry).await?;
-    if !proof.complete {
+    let guard = lock.clone();
+    let mut reader = blocking(context, move || {
+        let _lock = guard;
+        artifact.reader()
+    })
+    .await?;
+    let mut skipped = 0;
+    // Reconstruct the exact source prefix in bounded, cancellation-aware
+    // steps. The backend proof must name the identical prefix before reuse.
+    while skipped < proof.entries {
+        let take = (proof.entries - skipped).min(state.options.load.max_mutations as u64);
         let guard = lock.clone();
-        let mut reader = blocking(context, move || {
+        let control = context.options.clone();
+        reader = blocking(context, move || {
             let _lock = guard;
-            artifact.reader()
+            for _ in 0..take {
+                super::check_control(&control)?;
+                reader.next().ok_or_else(corrupt)??;
+            }
+            Ok(reader)
         })
         .await?;
-        let mut skipped = 0;
-        // Reconstruct the exact source prefix in bounded, cancellation-aware
-        // steps. The backend proof must name the identical prefix before reuse.
-        while skipped < proof.entries {
-            let take = (proof.entries - skipped).min(state.options.load.max_mutations as u64);
-            let guard = lock.clone();
-            let control = context.options.clone();
-            reader = blocking(context, move || {
-                let _lock = guard;
-                for _ in 0..take {
-                    super::check_control(&control)?;
-                    reader.next().ok_or_else(corrupt)??;
-                }
-                Ok(reader)
-            })
-            .await?;
-            skipped += take;
-        }
-        if reader.prefix_sha256() != proof.prefix_sha256 {
-            return Err(corrupt());
-        }
-        while !proof.complete {
-            let (next_reader, next) =
-                page(context, index, state, reader, &proof, lock.clone(), retry).await?;
-            reader = next_reader;
-            proof = next;
-        }
+        skipped += take;
+    }
+    if reader.prefix_sha256() != proof.prefix_sha256 {
+        return Err(corrupt());
+    }
+    while !proof.complete {
+        let (next_reader, next) =
+            page(context, index, state, reader, &proof, lock.clone(), retry).await?;
+        reader = next_reader;
+        proof = next;
     }
     activate(context, index, state, &proof, retry).await
 }

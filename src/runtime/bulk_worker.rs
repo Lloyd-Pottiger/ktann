@@ -111,26 +111,23 @@ pub(crate) async fn complete<B: Backend>(
     loop {
         context.checkpoint()?;
         let result = async {
-            if let Some(active) = super::bulk_publish::already_active(context, &index).await? {
-                return Ok(active);
+            match super::bulk_publish::publish(context, index.clone(), descriptor.clone(), retry)
+                .await
+            {
+                Err(error) if error.kind() == ErrorKind::BulkBuildBusy => {
+                    run(
+                        context,
+                        index.clone(),
+                        descriptor.clone(),
+                        options.clone(),
+                        retry,
+                    )
+                    .await?;
+                    super::bulk_publish::publish(context, index.clone(), descriptor.clone(), retry)
+                        .await
+                }
+                result => result,
             }
-            let sealed = {
-                let backend = context.backend();
-                let mut txn = ReadLogicalTxn::bootstrap(backend.begin_read().await?);
-                matches!(txn.get(LogicalKey::BuildLoad(index.logical_index_id())).await?,
-                    Some(PersistentValue::BuildLoad(load)) if load.sealed)
-            };
-            if !sealed {
-                run(
-                    context,
-                    index.clone(),
-                    descriptor.clone(),
-                    options.clone(),
-                    retry,
-                )
-                .await?;
-            }
-            super::bulk_publish::publish(context, index.clone(), descriptor.clone(), retry).await
         }
         .await;
         // A peer can publish and reclaim files during any native IO or KV await.
@@ -239,12 +236,13 @@ async fn claim<B: Backend>(
             }
             _ => return Err(corrupt()),
         };
-        if let Some(PersistentValue::BuildLoad(load)) = txn
-            .get(LogicalKey::BuildLoad(index.logical_index_id()))
+        if txn
+            .get(LogicalKey::BuildValidation(index.logical_index_id()))
             .await?
-            && load.sealed
+            .is_some()
         {
-            return Err(Error::invalid_argument());
+            // Validation owns the next phase; this worker can no longer claim it.
+            return Err(Error::new(ErrorKind::BulkBuildSuperseded));
         }
         txn.put(
             LogicalKey::BuildWorkspace(index.logical_index_id()),
@@ -274,12 +272,13 @@ async fn prepare_and_load<B: Backend>(
         let path = state.attempt(accepted.epoch).join("serving");
         let expected = accepted.manifest.clone();
         let manifest = index.clone();
-        let descriptor_copy = descriptor.clone();
+        let source = descriptor.input().clone();
+        let forest = state.forest.as_ref().ok_or_else(corrupt)?.manifest.clone();
         let limits = state.hard_limits;
         let guard = lock.clone();
         let serving = blocking(context, move || {
             let _lock = guard;
-            ServingArtifact::accepted(&path, expected, &manifest, &descriptor_copy, limits)
+            ServingArtifact::open(&path, expected, &source, &forest, &manifest, limits)
         })
         .await?;
         return super::bulk_load::load(
@@ -302,26 +301,24 @@ async fn prepare_and_load<B: Backend>(
         }
     })
     .await?;
-    if state.serving.is_none() {
-        let path = state.attempt(state.epoch);
-        let lock = lock.clone();
-        blocking(context, move || {
-            let _lock = lock;
-            fs::create_dir_all(path.parent().expect("owned directory")).map_err(io)?;
-            fs::create_dir(&path).map_err(io)?;
-            File::open(path.parent().expect("parent"))
-                .and_then(|f| f.sync_all())
-                .map_err(io)?;
-            File::open(
-                path.parent()
-                    .and_then(Path::parent)
-                    .expect("workspace root"),
-            )
+    let path = state.attempt(state.epoch);
+    let guard = lock.clone();
+    blocking(context, move || {
+        let _lock = guard;
+        fs::create_dir_all(path.parent().expect("owned directory")).map_err(io)?;
+        fs::create_dir(&path).map_err(io)?;
+        File::open(path.parent().expect("parent"))
             .and_then(|f| f.sync_all())
-            .map_err(io)
-        })
-        .await?;
-    }
+            .map_err(io)?;
+        File::open(
+            path.parent()
+                .and_then(Path::parent)
+                .expect("workspace root"),
+        )
+        .and_then(|f| f.sync_all())
+        .map_err(io)
+    })
+    .await?;
     let forest_options = ForestOptions {
         sample_items: descriptor.options().sample_items,
         tree_memory_bytes: descriptor.options().memory_bytes,

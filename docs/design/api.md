@@ -314,7 +314,8 @@ requiring source or workspace files.
 
 For explicit phase control, `job.run_worker` prepares accepted Forest and Serving artifacts and
 loads the backend in bounded transactions. Repeating the same options resumes
-accepted work and takes over old worker epochs. `job.publish()` freezes loading,
+accepted work and takes over old worker epochs. A worker arriving after validation
+has begun returns `BulkBuildSuperseded`; `complete` retries publication. `job.publish()` requires the immutable completed load,
 performs resumable exact paged validation, and returns the ordinary Active Index.
 Publishing before loading completes returns `BulkBuildBusy`; finish or resume
 loading and retry. Both operations and `status`/`abort` have `_with_control` variants. A failed job

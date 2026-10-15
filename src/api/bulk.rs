@@ -331,7 +331,7 @@ impl<B: Backend> BulkBuildJob<B> {
             )
             .await
     }
-    /// Freezes writes, resumes exact paged backend validation, and publishes.
+    /// Requires completed loading, resumes exact paged validation, and publishes.
     /// Unknown publication is resolved by the original Logical Index identity.
     pub async fn publish(&self) -> Result<super::Index<B>> {
         self.publish_with_control(OperationOptions::default()).await

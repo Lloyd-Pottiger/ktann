@@ -46,7 +46,11 @@ limits and caller budgets bound mutation count and physical bytes. Unknown
 outcomes reread durable state. Recovery reconstructs the artifact prefix in
 bounded memory; it does not rewrite the committed prefix.
 
-Publication seals the loader before validating. Preparation has proved exact
+Completed loading permanently fences data writes: new claims return the same
+checkpoint and stale chunks cannot match it as their predecessor. Publication
+registers a validation proof only after loading is complete; this proof owns the
+validation phase without an additional sealing flag or checkpoint update.
+Preparation has proved exact
 source/forest joins; validation then compares every serving backend key/value
 against the accepted immutable Serving Artifact in bounded pages. Missing, extra,
 or different bytes fail closed. Lifecycle and build metadata are excluded from
@@ -55,8 +59,10 @@ No serving writer can change the frozen Building index. One final transaction
 checks the completed proof and original identity and changes its Manifest to
 Active. There is no partially visible serving state.
 
-`complete` skips preparation after sealing and resolves an already Active
-identity before opening files. Concurrent invocations use bounded retries for
+`complete` first attempts publication and runs preparation/loading only when it
+is not ready. It resumes Loaded builds without taking over a worker, and resolves
+an already Active identity before opening files. A completed validation proof
+can activate the index without reopening the accepted artifact files. Concurrent invocations use bounded retries for
 superseded attempts; a peer's successful publication resolves to the same index.
 Unknown publication outcomes likewise resolve through the original ID. Cancellation
 and transient failures remain resumable; terminal failures persist until abort.

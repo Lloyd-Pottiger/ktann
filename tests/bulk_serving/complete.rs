@@ -567,3 +567,168 @@ async fn complete_resumes_after_concurrent_publication_and_reclaimed_paths() {
     assert_eq!(report.objects.vector_records, 73);
     runtime.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completed_load_fences_old_chunks_and_resumes_without_worker_takeover() {
+    let dir = Directory::new();
+    let memory = MemoryBackend::with_test_config(TestConfig::default());
+    let old_gate = Arc::new(Gate::default());
+    let publication_gate = Arc::new(Gate::default());
+    let config = RuntimeConfig::default().with_maintenance(0, 1).unwrap();
+    let old_runtime = Runtime::new(
+        Gated {
+            memory: memory.clone(),
+            gate: old_gate.clone(),
+        },
+        config.clone(),
+    )
+    .unwrap();
+    let runtime = Runtime::new(
+        Gated {
+            memory: memory.clone(),
+            gate: publication_gate.clone(),
+        },
+        config,
+    )
+    .unwrap();
+    let (old, artifact) = fixture(&old_runtime, &memory, &dir, 19).await;
+    old_gate.arm(2);
+    let pending_load =
+        tokio::spawn(async move { old.load_serving(&artifact, load_options()).await });
+    old_gate.wait().await;
+    let job = runtime.open_bulk_build("bulk").await.unwrap();
+    let options = worker_options(&dir);
+    job.run_worker(options.clone()).await.unwrap();
+    let completed = checkpoint(&memory, &job).await;
+    let workspace_key = Bytes::from(keys::build_workspace_key(job.logical_index_id()));
+    let workspace = memory
+        .begin_read()
+        .await
+        .unwrap()
+        .get(workspace_key.clone())
+        .await
+        .unwrap();
+    publication_gate.arm(2); // proof registration committed; first comparison page is held
+    let worker = job.clone();
+    let pending_publish = tokio::spawn(async move { worker.complete(options).await });
+    publication_gate.wait().await;
+    assert!(matches!(
+        job.status().await.unwrap(),
+        BulkBuildStatus::Validating { .. }
+    ));
+    assert_eq!(
+        memory
+            .begin_read()
+            .await
+            .unwrap()
+            .get(workspace_key)
+            .await
+            .unwrap(),
+        workspace
+    );
+    old_gate.release.notify_one();
+    assert_eq!(
+        pending_load.await.unwrap().unwrap_err().kind(),
+        ErrorKind::BulkBuildSuperseded
+    );
+    assert_eq!(checkpoint(&memory, &job).await, completed);
+    publication_gate.release.notify_one();
+    let index = pending_publish.await.unwrap().unwrap();
+    let report = index.verify(VerifyOptions::default()).await.unwrap();
+    assert!(report.complete && report.issues.is_empty());
+    assert_eq!(report.objects.vector_records, 19);
+    old_runtime.shutdown().await.unwrap();
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completed_validation_publishes_without_reopening_artifacts() {
+    let dir = Directory::new();
+    let memory = MemoryBackend::with_test_config(TestConfig::default());
+    let gate = Arc::new(Gate::default());
+    let runtime = Runtime::new(
+        Gated {
+            memory: memory.clone(),
+            gate: gate.clone(),
+        },
+        RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
+    )
+    .unwrap();
+    let (job, _) = fixture(&runtime, &memory, &dir, 0).await;
+    let options = worker_options(&dir);
+    job.run_worker(options.clone()).await.unwrap();
+    gate.arm(3); // registration and the one empty-inventory page precede activation
+    let worker = job.clone();
+    let cancellation = CancellationToken::new();
+    let control = OperationOptions::default().with_cancellation(cancellation.clone());
+    let pending = tokio::spawn(async move { worker.publish_with_control(control).await });
+    gate.wait().await;
+    memory.set_fault_plan(vec![CommitFault::Abort]).unwrap();
+    cancellation.cancel();
+    gate.release.notify_one();
+    assert_eq!(
+        pending.await.unwrap().unwrap_err().kind(),
+        ErrorKind::Cancelled
+    );
+    assert!(matches!(
+        job.status().await.unwrap(),
+        BulkBuildStatus::Validating { .. }
+    ));
+    for entry in fs::read_dir(&options.workspace).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            fs::remove_dir_all(entry.path()).unwrap();
+        }
+    }
+    let index = job.complete(options).await.unwrap();
+    assert!(
+        index
+            .verify(VerifyOptions::default())
+            .await
+            .unwrap()
+            .issues
+            .is_empty()
+    );
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn complete_retries_when_validation_wins_before_worker_takeover() {
+    let dir = Directory::new();
+    let memory = MemoryBackend::with_test_config(TestConfig::default());
+    let gate = Arc::new(Gate::default());
+    let runtime = Runtime::new(
+        Gated {
+            memory: memory.clone(),
+            gate: gate.clone(),
+        },
+        RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
+    )
+    .unwrap();
+    let (job, _) = fixture(&runtime, &memory, &dir, 19).await;
+    let options = worker_options(&dir);
+    job.run_worker(options.clone()).await.unwrap();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(options.workspace.join(".ktann-build-lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    // Manifest and Workspace snapshots precede proof registration. Pause the
+    // recovery snapshot after publication fails to acquire the shared root lock.
+    gate.arm_read(3);
+    let worker = job.clone();
+    let pending = tokio::spawn(async move { worker.complete(options).await });
+    gate.wait().await;
+    assert!(matches!(
+        job.status().await.unwrap(),
+        BulkBuildStatus::Validating { .. }
+    ));
+    lock.unlock().unwrap();
+    gate.release.notify_one();
+    let index = pending.await.unwrap().unwrap();
+    let report = index.verify(VerifyOptions::default()).await.unwrap();
+    assert!(report.complete && report.issues.is_empty());
+    assert_eq!(report.objects.vector_records, 19);
+    runtime.shutdown().await.unwrap();
+}

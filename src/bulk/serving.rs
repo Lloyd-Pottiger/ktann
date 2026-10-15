@@ -93,32 +93,9 @@ pub struct ServingArtifact {
 }
 
 impl ServingArtifact {
-    /// Reopens bytes whose identity was durably accepted by the fenced worker.
-    pub(crate) fn accepted(
-        directory: &Path,
-        artifact: ArtifactManifest,
-        index: &IndexManifest,
-        descriptor: &crate::storage::values::BuildDescriptor,
-        limits: HardLimits,
-    ) -> Result<Self> {
-        let value = Self {
-            directory: directory.to_owned(),
-            source: descriptor.input().clone(),
-            artifact,
-            index: index.clone(),
-            limits,
-        };
-        value.reader()?;
-        Ok(value)
-    }
-
     /// Checks the source and target identities retained at construction or open.
-    pub(crate) fn matches_build(
-        &self,
-        index: &IndexManifest,
-        descriptor: &crate::storage::values::BuildDescriptor,
-    ) -> bool {
-        self.index.has_same_immutable_identity(index) && self.source == *descriptor.input()
+    pub(crate) fn matches_build(&self, index: &IndexManifest, source: &ArtifactManifest) -> bool {
+        self.index.has_same_immutable_identity(index) && self.source == *source
     }
 
     /// Reopens using trusted upstream identities; their files and build budgets

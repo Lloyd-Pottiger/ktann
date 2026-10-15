@@ -151,11 +151,12 @@ async fn claims_and_chunks_recover_unknown_outcomes_without_rewriting_committed_
     }
 }
 
-// Pause one chosen commit after its conflict reads, without sleeps or scheduler
+// Pause one chosen commit or snapshot read without sleeps or scheduler
 // assumptions. All other transactions continue through the production adapter.
 #[derive(Default)]
 struct Gate {
     remaining: AtomicUsize,
+    read_remaining: AtomicUsize,
     reached: Notify,
     release: Notify,
 }
@@ -163,6 +164,10 @@ impl Gate {
     fn arm(&self, commit: usize) {
         self.remaining.store(commit, Ordering::SeqCst);
     }
+    fn arm_read(&self, read: usize) {
+        self.read_remaining.store(read, Ordering::SeqCst);
+    }
+
     async fn wait(&self) {
         tokio::time::timeout(Duration::from_secs(10), self.reached.notified())
             .await
@@ -191,6 +196,15 @@ impl Backend for Gated {
         self.memory.capabilities()
     }
     async fn begin_read(&self) -> Result<MemoryReadTxn> {
+        if self
+            .gate
+            .read_remaining
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1))
+            == Ok(1)
+        {
+            self.gate.reached.notify_one();
+            self.gate.release.notified().await;
+        }
         self.memory.begin_read().await
     }
     async fn begin_write(&self) -> Result<GatedTxn<'_>> {
@@ -380,7 +394,6 @@ async fn empty_load_and_checkpoint_codec_are_canonical_and_fail_closed() {
     expected.extend_from_slice(&0_u64.to_be_bytes());
     expected.extend_from_slice(load.prefix_sha256());
     expected.push(1);
-    expected.push(0);
     assert_eq!(value, expected);
     assert_eq!(
         keys::build_load_key(job.logical_index_id()),
@@ -442,7 +455,7 @@ async fn admission_and_artifact_identity_are_enforced_before_data_writes() {
     let memory = MemoryBackend::with_test_config(TestConfig::default());
     let runtime = runtime(memory.clone());
     let (job, artifact) = fixture(&runtime, &memory, &dir, 19).await;
-    for limit in [0, 153] {
+    for limit in [0, 152] {
         let err = job
             .load_serving(
                 &artifact,

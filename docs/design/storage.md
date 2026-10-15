@@ -261,7 +261,10 @@ See [ADR 0026](../adr/0026-building-reservations.md).
 
 The index-owned Build Load key (`0x06`) stores value tag `0x0e`, a sized
 89-byte Serving Artifact manifest, positive u64 epoch, u64 committed-entry
-cursor, 32-byte prefix SHA-256, and canonical completion and sealed bytes. Sealed requires completion. Completion requires cursor == item count and prefix hash == artifact hash.
+cursor, 32-byte prefix SHA-256, and a canonical completion byte. Completion
+requires cursor == item count and prefix hash == artifact hash. A completed
+checkpoint is immutable and fences further data writes; validation progress is
+owned solely by Build Validation, with no separate sealed flag.
 This metadata is codec-validated but excluded from serving membership ledgers.
 See the implemented load protocol in [Bulk Build](bulk-build.md).
 
