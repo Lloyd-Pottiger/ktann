@@ -40,26 +40,16 @@ capacity; disabled and oversized bodies retain bounded streaming scans.
 
 ## 2. Tree shape
 
-Each Tree Key lazily installs one initial leaf root with its Tree Manifest.
+Foreground insertion lazily installs one initial leaf root with its Tree Manifest
+for a new Tree Key.
 Leaf partitions are level 1; partitions above level 1 contain Child Entries.
 The level therefore determines the partition kind without a second persistent
-discriminator. Internal fanout is exactly two. Partition identities are never
-reused. An ordinary non-root split allocates and exposes two new targets, then
-removes the source at completion. Root Partition Key 1 remains stable and is
-converted in place to an internal root only after its entries drain, so every committed state
-has one searchable entry point.
-
-Split training reads the complete source through one consistent snapshot and
-runs at most ten deterministic Lloyd rounds outside the write transaction.
-Initial centroids use deterministic farthest-pair seeding with canonical
-tie-breakers. Each round orders entries by distance difference and assigns
-exactly `floor(n/2)` to the left cluster, with identity tie-breaking. Assignment
-stability stops early. Training output is not persistent authority; published
-target centroids are routing models and concurrent source writes need not
-restart training. Because Splitting accepts foreground writes, the source can
-legally shrink below two entries before exposure; training then emits
-degenerate centroids — the single entry replicated, or zero vectors when the
-source is empty — so every committed split state can always advance.
+discriminator. Each online split creates two targets; an internal partition may
+contain more than two Child Entries as its children split. Partition identities
+are never reused. An ordinary non-root split allocates and exposes two new
+targets, then removes the source at completion. Root Partition Key 1 remains
+stable and is converted in place to an internal root only after its entries
+drain, so every committed state has one searchable entry point.
 
 Merge is eligible for a Ready non-root partition below the configured minimum.
 The worker reselects a legal target for each bounded batch under current
@@ -86,11 +76,25 @@ committed state.
 
 ## 4. Split
 
-### 4.1 Start
+### 4.1 Start, train, and expose
 
 A short start transaction update-protects a Ready partition above maximum,
 revalidates its threshold, reserves never-reused target Partition Keys, and writes
-`Splitting { left, right }` on the source. One exposure transaction then
+`Splitting { left, right }` on the source.
+
+Split training reads the complete source through one consistent snapshot and
+runs at most ten deterministic Lloyd rounds outside the write transaction.
+Initial centroids use deterministic farthest-pair seeding with canonical
+tie-breakers. Each round orders entries by distance difference and assigns
+exactly `floor(n/2)` to the left cluster, with identity tie-breaking. Assignment
+stability stops early. Training output is not persistent authority; published
+target centroids are routing models and concurrent source writes need not
+restart training. Because Splitting accepts foreground writes, the source can
+legally shrink below two entries before exposure; training then emits
+degenerate centroids — the single entry replicated, or zero vectors when the
+source is empty — so every committed split state can always advance.
+
+One exposure transaction then
 unique-creates both targets as `ReceivingSplit { source }` with their persisted
 centroids, installs both Child Entries into the source's current parent (for a
 non-root split), and advances the source to `DrainingSplit { left, right }`
@@ -186,27 +190,16 @@ Foreground mutations never wait for a whole split/merge. They may conflict with
 one bounded fixup and retry from a fresh snapshot. Fixups do not hold locks
 across transactions or reserve a durable owner.
 
-`stalled_timeout` is the minimum age of a persisted `Splitting`,
-`DrainingSplit`, or `Merging` state before an independently rediscovered Fixup
-may assist it. Its default is
-`max(1 ms, 1 s * max_partition_entries / 128)`; overrides must be positive.
-The worker checks `now - started >= timeout` in its existing authority read,
-after process-local queue deduplication. Ready threshold crossings start
-immediately. A progressing worker, including one yielded to the queue tail,
-continues without an age delay. An unavailable timestamp permits recovery;
-a known future timestamp defers recovery until the age threshold is met.
-The timestamp measures time in the state, rather than time since the last
-progress: this is an assistance threshold, not task expiry or a lease.
-Later relevant access rediscovers deferred work; no timer schedules it.
-`FixupExecution::Stalled` reports a merge execution with no available target;
-the recovery age threshold applies to both split and merge source states.
+Independently rediscovered source states are eligible for assistance only after
+the runtime's [recovery age check](runtime-operations.md#32-recovery-age-and-timestamps).
+A progressing worker continues without that delay. `FixupExecution::Stalled`
+reports a merge execution with no available target; it does not imply a lease or
+an exclusive owner.
 
-State timestamps also provide diagnostic ages. A sample is recorded when both
-Unix-epoch millisecond timestamps are nonzero and the current time is at least
-the state-start time. The nonnegative difference is reported in seconds. Any
-process may assist an encountered state after bounded admission and the recovery age check. Conditional convergence requires rediscovery, repeated
-admission, eventual backend success, and a legal merge target; correctness does
-not require convergence.
+Conditional convergence requires rediscovery, repeated admission, eventual
+backend success, and a legal merge target; correctness does not require
+convergence. Runtime owns the timestamp rules, diagnostic age metrics, and
+process-local scheduling policy.
 
 Natural mismatches—wrong location, missing authoritative entry, duplicate
 incoming reference, impossible count, or malformed state—return Corruption and

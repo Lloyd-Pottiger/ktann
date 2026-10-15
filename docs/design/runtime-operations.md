@@ -27,7 +27,8 @@ Shutdown is idempotent:
 1. atomically stop new foreground and maintenance admission;
 2. cancel queued work that has not begun;
 3. wait for admitted foreground operations and detached commit completions;
-4. stop workers and release process-local resources.
+4. stop maintenance workers;
+5. await the backend native-resource shutdown hook, then release resources.
 
 Admitted operations return their actual result. `RuntimeClosed` applies only to
 new admission and never masks success, failure, or CommitOutcomeUnknown from an
@@ -36,6 +37,8 @@ resource cleanup but cannot synchronously return failures; callers that need a
 known outcome call shutdown explicitly.
 
 ## 3. Maintenance scheduling
+
+### 3.1 Queue and worker lifecycle
 
 Relevant mutation and search paths may offer an actionable Fixup key to a
 bounded, deduplicating process-local queue. Eligibility is derived from the
@@ -66,6 +69,8 @@ Zero workers disables background scheduling: that Runtime's offers are
 dropped, and topology changes advance only when driven outside it, which
 stays correct because every committed intermediate state remains searchable.
 
+### 3.2 Recovery age and timestamps
+
 The Runtime supplies unsigned 64-bit Unix-epoch millisecond timestamps for
 partition state transitions. A wall-clock sample before the epoch or outside
 the `u64` millisecond range is represented by zero, denoting an unavailable
@@ -86,7 +91,6 @@ The timestamp measures time in the state, rather than time since the last
 progress: this is an assistance threshold, not task expiry or a lease.
 Later relevant access rediscovers deferred work; no timer schedules it.
 
-
 ## 4. Online loading and refinement
 
 Callers load records with ordinary `Index::batch_mutate` operations and bound
@@ -96,11 +100,15 @@ unknown-commit behavior. There is no session-level scheduling, token, completion
 barrier, or Fixup Backlog gate.
 
 Offline `Index::refine` requires caller-exclusive access and settled Ready topology
-as specified in [the API contract](api.md). Admission rejects local queued or
+as specified in [the API contract](api.md#73-offline-refinement). Admission rejects local queued or
 running fixups. Numerical planning runs off the async executor, remains
 cooperatively cancellable, and retains foreground admission until CPU work ends.
 Apply uses ordinary bounded write attempts; cancellation or an unknown commit
 outcome can leave a valid, partially refined index.
+
+Bulk Build creates a new hidden index and publishes it only after exact
+validation. Its [dedicated contract](bulk-build.md) owns manual completion,
+automatic scheduling, worker admission, cancellation, and recovery.
 
 ## 5. Metrics, tracing, and privacy
 
@@ -155,7 +163,23 @@ Such an audit runs against a caller-provided offline copy or separately opened
 backend instance suitable for the workload. The common API does not expose a
 fictional renewable/native long-lived snapshot.
 
-## 7. Whole-system validation
+## 7. Operational limitations
+
+- Demand-driven maintenance offers no time-bound cluster-wide convergence.
+- RocksDB handle Drop starts nonblocking actor cleanup. Runtime shutdown invokes
+  the backend cleanup hook after foreground drain and waits before releasing the
+  adapter, so successful shutdown permits native database reopen or teardown.
+  Direct adapter users call its consuming asynchronous shutdown. Dedicated
+  native actors may outlive an ungraceful Tokio runtime drop.
+- Verify has no repair mode and may require an offline copy for large
+  FoundationDB indexes.
+- Search quality depends on explicit budgets and data distribution; KTANN publishes
+  measured baselines rather than an unsupported SLA.
+- Rollback means continuing to use an older separate Logical Index until a new
+  one is validated and traffic is switched externally. Persistent data is never
+  downgraded in place.
+
+## 8. Whole-system validation
 
 | Contract | Evidence |
 | --- | --- |
@@ -173,48 +197,3 @@ CI uses small deterministic seed sets and focused integration services. Nightly
 runs expand seeds, crash histories, and benchmarks. Failures print replayable
 seeds. Tests do not freeze internal cache eviction, task layout, or other
 benchmark-tunable implementation details.
-
-## 8. Operational limitations
-
-- Demand-driven maintenance offers no time-bound cluster-wide convergence.
-- RocksDB handle Drop starts nonblocking actor cleanup. Runtime shutdown invokes
-  the backend cleanup hook after foreground drain and waits before releasing the
-  adapter, so successful shutdown permits native database reopen or teardown.
-  Direct adapter users call its consuming asynchronous shutdown. Dedicated
-  native actors may outlive an ungraceful Tokio runtime drop.
-- Verify has no repair mode and may require an offline copy for large
-  FoundationDB indexes.
-- Search quality depends on explicit budgets and data distribution; v1 publishes
-  measured baselines rather than an unsupported SLA.
-- Rollback means continuing to use an older separate Logical Index until a new
-  one is validated and traffic is switched externally. The v1 format is never
-  mutated backward in place.
-
-
-Bulk Build reservation, worker, load, publication, status, abort and cleanup use
-foreground operation control and bounded retry policies. Native construction and
-file IO run on blocking tasks with shared admission retained until actual exit,
-even when the awaiting future is cancelled. Running native stages are not
-preempted; subsequent admissions and checkpoints observe cancellation.
-
-Worker epochs fence accepted outputs; load epochs fence atomic KV checkpoints.
-Completed loading fences writers. Publication resumes bounded exact validation, then atomically
-activates the original identity. Terminal failures persist; transient failures
-and cancellation remain resumable. Root advisory locks order native IO against
-reclamation. Busy cleanup is deferred; namespace cleanup pages discover orphaned
-workspaces after ordinary index deletion. See [Bulk Build](bulk-build.md).
-
-
-Automatic Bulk Build scheduling uses `schedule_bulk_build` for queue discovery,
-lease coordination and scheduled attempts. Its bounded JoinSet admits at most
-`max_jobs` per scheduler, additionally limited by shared foreground admission.
-Discovery starts with a page sized to the available slots and widens across
-leased entries, examining at most 256 queue records per poll. Its cursor follows
-the last consumed record, so filling the available slots never skips remaining queued work.
-Lease renewal runs inside the admitted attempt, without acquiring another
-foreground permit. Dropping the scheduler cancels child tasks; shutdown stops
-discovery and cancels active attempts. Native IO may outlive cancellation while
-retaining admission and file locks. Expired queue owners are replaceable by any
-participating Runtime; each build mutation transaction verifies the owner token.
-A failed job is durably inspectable and does not stop unrelated jobs. Invalid
-coordination state is surfaced rather than retried indefinitely.

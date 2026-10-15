@@ -1,8 +1,11 @@
-# Filtering and Approximate Search
+# Approximate Search and Partition Caching
 
-This module owns vector numeric semantics, persistent RaBitQ7 codes, Tree Key
-query planning, predicate evaluation and synopses, bounded traversal, exact
-reranking, and cache correctness.
+This module owns vector numeric semantics, persistent RaBitQ7 codes, budgeted
+Tree Key enumeration, bounded traversal, candidate selection, exact reranking,
+and cache correctness.
+
+Filter semantics, Tree Key range planning, and synopsis classification are
+defined by [Filtering](filtering.md).
 
 ## 1. Vector and distance semantics
 
@@ -104,54 +107,32 @@ clamped to zero. Cosine is not clamped. A future optimized kernel is permitted
 only after its proven rounding bound is added to `B`; tests alone are not a
 substitute for that bound.
 
-## 4. Tree Key planning
+## 4. Tree Key enumeration
 
-Tree Key fields form an ordered memcomparable tuple. Each valid record maps to
-one Tree Key and one tree. Empty Tree Key schema means one tree. Empty trees and
-their Tree Manifests remain until index drop.
+[Filtering](filtering.md#4-conservative-tree-key-planning) derives conservative
+Tree Key ranges. Search enumerates forward directory pages in canonical order,
+counting every decoded/checked Tree Key against one global budget. At most the
+budgeted eligible keys are materialized, and enumeration finishes before
+partition traversal. Empty trees and their Tree Manifests remain until index drop.
 
-Predicate compilation derives exact field-prefix ranges when possible. Equality
-and bounded `IN` on leading Tree Key fields create direct ranges; representable
-ranges on the next field narrow them. If exact disjoint range expansion would
-exceed 1,024 ranges, planning widens conservatively and relies on exact predicate
-evaluation later.
+## 5. Filter integration
 
-Search enumerates forward directory pages in canonical key order and counts
-every decoded/checked Tree Key against one global budget. At most the budgeted
-eligible keys are materialized before traversal, so an unlimited number of
-stored trees cannot cause unbounded memory. Enumeration finishes before
-partition traversal to make budget use deterministic.
-
-## 5. Predicates and Partition Synopses
-
-One compiled evaluator implements SQL TRUE/FALSE/UNKNOWN. Only TRUE qualifies a
-record. Leaf Entry fields are evaluated before approximate candidate admission.
-
-Every field, including Tree Key fields, maintains its configured synopsis:
-
-- MinMax stores exact min/max among non-NULL values, plus exact `has_null` and
-  `has_non_null` flags;
-- MinMaxBloom adds a fixed-size Bloom summary for equality/IN pruning.
-
-The compiler evaluates a predicate over possible truth-value sets. A synopsis
-result is `NoMatch` only when TRUE is impossible, and `AllMatch` only when TRUE
-is the sole possibility. `Not` complements truth sets rather than inverting a
-boolean pruning result.
-
-Insertion incrementally widens MinMax, sets NULL-presence flags, and sets Bloom
-bits. Delete and replacement never shrink a synopsis; stale history may weaken
-pruning but cannot make it unsound. A new split target starts from the canonical
-empty synopsis, and movement expands only the actual target. Synopsis and entry
-changes commit atomically.
+[Filtering](filtering.md#5-partition-synopsis-classification) defines exact
+eligibility and conservative synopsis classification. Search uses `NoMatch` to
+prune leaves and admits only entries that make the complete predicate TRUE,
+before RaBitQ candidate selection. All pruning and evaluation use the same
+snapshot as traversal and reranking.
 
 ## 6. Search algorithm
+
+### 6.1 Snapshot and traversal order
 
 One consistent snapshot performs:
 
 1. Active Manifest validation and request compilation;
 2. bounded Tree Key enumeration;
-3. deterministic best-first traversal of every eligible tree under one global
-   Partition budget;
+3. deterministic level-scaled beam traversal of every eligible tree under one
+   global partition budget;
 4. synopsis pruning and exact leaf predicate evaluation;
 5. bounded RaBitQ candidate selection;
 6. original Vector Record batch loading and exact reranking;
@@ -173,6 +154,8 @@ then Record ID.
 Partition, rerank, and optional RaBitQ-overlap bounds are charged
 before corresponding work. No speculative read-ahead occurs beyond a budget.
 
+### 6.2 Bounded IO and prefetching
+
 Traversal batches snapshot Header reads for a funded prefix of up to 32
 non-root partitions, including leaves. Filtered leaf visits include their
 Synopses in the same batch, with at most 64 keys in flight. Visits, body loads,
@@ -189,6 +172,8 @@ Visits consume those pages in order and stream any continuation through one
 body at a time; a complete body passes count validation before cache publication.
 This bounds temporary prefetching independently of complete partition size.
 
+### 6.3 Candidate selection
+
 For a leaf with `n` eligible entries, checked arithmetic computes
 `r = min(n, max(2*k, 64))`. The leaf keeps the rough top `r`, uses the r-th
 smallest upper endpoint as its overlap threshold, includes entries whose lower
@@ -203,6 +188,8 @@ The local overlap test already includes the rough top `r`: each rough distance
 is at most its upper endpoint, so the r-th rough distance is at most the r-th
 upper endpoint, and every top-`r` candidate's lower endpoint is no larger than
 its rough distance. No separate rough top-`r` selection is necessary.
+
+### 6.4 Intermediate topology
 
 Intermediate traversal follows the persistent reference rules exactly:
 
@@ -220,11 +207,11 @@ state. Exact Record Location/Leaf Entry ownership prevents duplicate result
 membership; defensive duplicate Record IDs encountered in one snapshot are
 Corruption rather than silently deduplicated.
 
+## 7. Search budgets and response
+
 Leaf Entry scans have no independent cap. Beam and the partition budget limit
 which partitions are admitted; actual partition sizes determine scan work.
 Leaf Entry usage is a 64-bit counter, not an exhaustion dimension.
-
-## 7. Search budgets and response
 
 SearchOptions overrides nonzero bounds for Tree Keys and partitions within
 hard caps, plus the leaf-level base beam width. Exact-rerank
@@ -281,4 +268,4 @@ Corruption is never cached.
   without asserting a particular eviction algorithm.
 - Recall and performance benchmarks compare brute force on fixed public and
   synthetic distributions and report all budget use; they establish baselines,
-  not an unsupported v1 SLA.
+  not an unsupported SLA.
