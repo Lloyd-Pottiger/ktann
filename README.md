@@ -104,6 +104,20 @@ filters, request controls, and result semantics; the
 [adapter recall test](tests/support/adapter_recall.rs) exercises this flow
 against both real storage engines.
 
+### Initial Bulk Build
+
+For a finite initial dataset, write an immutable `bulk::InputSnapshot`, reserve
+with `Runtime::start_bulk_build`, and call `BulkBuildJob::complete` with an
+existing durable workspace. It prepares and loads artifacts, performs resumable
+exact backend validation, and returns the ordinary Active `Index`. The name remains unavailable to reads
+and online mutations until publication. Reopen a job with `open_bulk_build` to
+resume, or abort it and reclaim its owned files. See the [Bulk Build contract](docs/design/bulk-build.md) for options, filesystem semantics,
+and bounded cleanup. To distribute queued jobs automatically, call `job.schedule(worker_options)`
+and run `Runtime::run_bulk_scheduler` on each worker process. Renewable leases
+provide automatic takeover after process loss; each job remains a coarse unit
+of work. FoundationDB supports separate worker processes, while RocksDB remains
+in its owning process. Shared-filesystem deployment requirements still apply.
+
 ## Performance you can measure
 
 KTANN combines compact candidate ranking, byte-bounded partition caches, and
@@ -144,8 +158,11 @@ require separate process or server restarts as described in the adapter guides.
 
 ## Documentation
 
+- [Documentation guide](docs/README.md): module ownership, reading paths, and the complete ADR index.
 - [Architecture](docs/design/overview.md): boundaries, invariants, and module ownership.
+- [Filtering](docs/design/filtering.md): typed predicates, NULL semantics, Tree Key planning, and synopsis invariants.
 - [API](docs/design/api.md): lifecycle, mutations, filters, and search requests.
+- [Bulk Build](docs/design/bulk-build.md) and [offline artifacts](docs/design/bulk-artifacts.md): initial construction, recovery, publication, and cleanup.
 - [Search](docs/design/search.md): routing, ranking, caches, and query budgets.
 - [Operations](docs/design/runtime-operations.md): maintenance, refinement, verification, telemetry, and shutdown.
 - [Storage](docs/design/storage.md) and [maintenance](docs/design/maintenance.md): transaction and topology contracts.
@@ -165,19 +182,3 @@ format, and operational invariants.
 ## License
 
 Licensed under the [MIT License](LICENSE).
-
-
-### Initial Bulk Build
-
-For a finite initial dataset, write an immutable `bulk::InputSnapshot`, reserve
-with `Runtime::start_bulk_build`, and call `BulkBuildJob::complete` with an
-existing durable workspace. It prepares and loads artifacts, performs resumable
-exact backend validation, and returns the ordinary Active `Index`. The name remains unavailable to reads
-and online mutations until publication. Reopen a job with `open_bulk_build` to
-resume, or abort it and reclaim its owned files. See the [API contract](docs/design/api.md#bulk-build)
-and [recovery design](docs/design/bulk-build.md) for options, filesystem semantics,
-and bounded cleanup. To distribute queued jobs automatically, call `job.schedule(worker_options)`
-and run `Runtime::run_bulk_scheduler` on each worker process. Renewable leases
-provide automatic takeover after process loss; each job remains a coarse unit
-of work. FoundationDB supports separate worker processes, while RocksDB remains
-in its owning process. Shared-filesystem deployment requirements still apply.

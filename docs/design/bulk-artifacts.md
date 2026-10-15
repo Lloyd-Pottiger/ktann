@@ -1,10 +1,11 @@
-# Bounded offline artifacts
+# Bounded Offline Artifacts
 
 `bulk/` prepares caller-owned immutable files without modifying a KV Backend.
 It does not reserve Logical Index IDs, schedule jobs, load data, or publish an
-index. Existing serving lifecycle and exact-membership contracts are unchanged.
+index. [Bulk Build](bulk-build.md) owns those lifecycle operations. Existing
+serving lifecycle and exact-membership contracts are unchanged.
 
-## Pipeline
+## 1. Pipeline
 
 1. `InputSnapshotWriter` captures full Vector Records, including optional Opaque
    Payloads, in arrival order. Configuration validation and canonical source
@@ -36,7 +37,7 @@ manifests and target Index Manifest. Neither operation requires upstream files o
 construction budgets. Serving readers apply the consumer's current adapter limits;
 exceeding them is `LimitExceeded`, not evidence of corrupt data.
 
-## Files, trust, and failure
+## 2. Files, trust, and failure
 
 A versioned header binds each data file to its kind and configuration identity.
 Frames carry bounded lengths and SHA-256 checksums. The 89-byte Artifact Manifest
@@ -56,7 +57,7 @@ ceilings are `LimitExceeded`; malformed persistent bytes and inconsistent
 artifact relationships are `Corruption`. IO errors retain the library error
 classification used by the file helpers.
 
-## Resource contract
+## 3. Resource contract
 
 All operations are synchronous. Async callers must provide blocking execution
 and backpressure. Output quotas include framing and the manifest. Sort memory
@@ -73,7 +74,7 @@ different minimum memory budgets and spill behavior. See the option fields for
 each stage's precise accounting. Successful stages
 remove scratch; callers own cleanup after failure or cancellation.
 
-## Verification
+## 4. Verification
 
 `tests/bulk_artifacts.rs` covers restart identity, canonical full records, receipt
 preparation, global duplicate rejection, spills, resource ceilings, deterministic

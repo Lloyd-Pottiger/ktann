@@ -36,51 +36,40 @@ impl<B: Backend> Index<B> {
 }
 ```
 
-Every operation has a companion `_with_control` form accepting
-`OperationOptions` in addition to its ordinary request/options argument; the
-simple form uses default operation control. `verify` and `refine` are exceptions:
-their deadline and cancellation control ride inside `VerifyOptions` and
-`RefineOptions`, which their single forms take in full. Runtime construction
-requires an active Tokio multi-thread runtime, validates all process configuration, and
+Create, open, drop, record reads/mutations, and search have companion
+`_with_control` forms accepting `OperationOptions`; their simple forms use
+default operation control. `shutdown` has no control variant. For `verify` and
+`refine`, deadline and cancellation control are part of `VerifyOptions` and
+`RefineOptions`.
+
+Runtime construction requires an active Tokio multi-thread runtime, validates
+all process configuration, and
 immediately starts maintenance workers. Successful Runtime shutdown drains
 admitted work, awaits the backend's native-resource shutdown hook, and only then
 releases the backend.
 
 Index Names are `1..=255` UTF-8 bytes and are compared by their original bytes;
 they are not normalized. The fixed bound permits create admission to prove
-physical-key limits on both v1 backends.
+physical-key limits on all supported backends.
 
 Create is idempotent for the same name and configuration after an unknown commit
 outcome. Open rejects a Building or Dropping index, unsupported format, backend mismatch, or
 configuration mismatch. Drop is idempotent and follows the storage lifecycle.
 
-`Index::refine(options)` prepares an existing Active index after ordinary import
-and settled Ready topology, before serving. The caller must exclude all other
-index operations, including maintenance from other runtimes, until it returns.
-Local queued or running fixups and non-Ready topology are rejected; idle Runtime
-workers may remain running.
-
-`RefineOptions::new(input_bytes)` requires a positive input byte limit and defaults
-to two rounds. Builders accept `with_refinement_rounds(0..=5)` and
-`with_operation_options(OperationOptions)`. The limit covers loaded vectors, IDs,
-centroids and topology; numerical workspace and move lists require additional
-memory. Zero rounds refreshes centroids without relocating records.
-
-Refinement preserves Partition Keys and topology. Bounded atomic transactions
-relocate records within capacity constraints and update centroids with their
-incoming parent projections and parent Header cache epochs. Every commit preserves
-exact membership and searchable projections. Cancellation, errors or unknown
-commit outcomes can leave a valid, partially refined index. There is no
-whole-operation rollback or resume protocol; the caller may drop and rebuild it.
-
 ## 2. Records and mutations
 
+### 2.1 Records and atomic mutations
+
 ```rust
-pub struct Record {
-    pub id: Bytes,
-    pub vector: Arc<[f32]>,
-    pub fields: Box<[Value]>,
-    pub payload: Option<Bytes>,
+pub struct Record { /* private fields */ }
+
+impl Record {
+    pub fn new(
+        id: Bytes,
+        vector: impl Into<Arc<[f32]>>,
+        fields: impl Into<Box<[Value]>>,
+    ) -> Result<Self>;
+    pub fn with_payload(self, payload: Bytes) -> Result<Self>;
 }
 
 pub enum Mutation {
@@ -112,6 +101,8 @@ atomic transaction and is never split. Outcomes correspond to inputs in order;
 an item failure returns one operation error with the input position and no
 partial outcomes. Validation is completed before the write transaction begins.
 
+### 2.2 Point and batch reads
+
 `StoredRecord` returns the ID, vector, typed fields, and a closed payload
 projection: `NotLoaded`, `Absent`, or `Present(Bytes)`. Batch get is same-order
 and same-length; duplicate IDs return repeated values while storage may load
@@ -130,6 +121,9 @@ backend key and batch limits surface `LimitExceeded`. Cancellation and deadline
 apply to the whole read through the shared operation-control contract.
 
 ## 3. Schema and predicates
+
+The [filtering design](filtering.md) defines schema binding, three-valued
+evaluation, conservative planning, and synopsis invariants.
 
 ```rust
 pub struct FieldId(pub u16);
@@ -176,6 +170,8 @@ depth 64, and 1,024 values per `IN`.
 
 ## 4. Immutable and runtime configuration
 
+### 4.1 Index configuration
+
 `IndexConfig` persists dimension, metric, ordered fields, ordered unique
 non-null Tree Key FieldIds, and minimum/maximum partition entries. Limits are:
 
@@ -187,8 +183,10 @@ non-null Tree Key FieldIds, and minimum/maximum partition entries. Limits are:
 | Encoded Tree Key | schema worst case at most 8 KiB |
 | Partition entries | `1 <= min`, `2 * min <= max <= 65,536`; defaults 64/512 |
 
-RaBitQ7, binary fanout, Lloyd rounds, rotation algorithm, logical codecs, and
+RaBitQ7, online split arity, Lloyd rounds, rotation algorithm, logical codecs, and
 hard safety caps are defined by the Persistent Format.
+
+### 4.2 Runtime configuration
 
 `RuntimeConfig` owns the foreground operation limit, cache bytes, worker count,
 queue capacity, the `stalled_timeout` recovery age threshold, retry/backoff,
@@ -206,7 +204,7 @@ memory, the default is zero (cache disabled). An explicit
 `with_partition_cache_bytes` value takes precedence, including zero. Applications
 with container or shared-process limits can supply their own byte budget.
 
-The v1 defaults and caps are:
+The runtime defaults and caps are:
 
 | Setting | Default | Hard cap / validation |
 | --- | ---: | ---: |
@@ -219,7 +217,7 @@ The v1 defaults and caps are:
 | Visited partitions | 1,024 | 16,384 |
 | Exact rerank candidates | `min(max(64,k+ceil(k/4)),65,536)` | Runtime ceiling 65,536; effective value at least `k` |
 | Leaf beam size | 128 | 16,384 |
-| Write beam size | 8 | 16,384 |
+| Write beam size | 4 | 16,384 |
 | Tree Key scan ranges | 1,024 | wider conservative fallback |
 
 Retry backoff starts at 1 ms, doubles to 100 ms, and applies full jitter in the
@@ -247,7 +245,7 @@ Search success means all returned hits are valid and exactly reranked; it does
 not mean the global top-k was explored. There is no general completeness flag,
 quality score, or continuation. Repeating an identical request with larger
 budgets is the supported way to request more work, without a monotonic-result
-guarantee across budgets. With the fixed scalar-f64 v1 kernel, identical
+guarantee across budgets. With the deterministic f64 kernel, identical
 snapshot, codec, request, and budgets produce deterministic selection.
 
 ## 6. Operation control and errors
@@ -262,10 +260,11 @@ Errors are non-exhaustive and preserve a diagnostic source. Stable kinds are:
 
 - `InvalidArgument`, `IndexAlreadyExists`, `IndexNotFound`, `IndexBuilding`, `IndexDropping`,
   `RecordAlreadyExists`, and `UnsupportedFormat`;
-- `TransactionTooLarge`, `LimitExceeded`, `ContentionExhausted`,
+- `BulkBuildBusy` and `BulkBuildSuperseded`;
+- `TransactionTooLarge`, `LimitExceeded`, `ContentionExhausted`, `RetryableAbort`,
   `CommitOutcomeUnknown`, and `IdExhausted`;
 - `DeadlineExceeded`, `Cancelled`, and `RuntimeClosed`;
-- `Backend` and `Corruption`.
+- `Unsupported`, `Backend`, `Other`, and `Corruption`.
 
 Malformed input, schema mismatch, and non-finite caller-derived arithmetic are
 InvalidArgument. Adapter-declared transaction admission failure is
@@ -277,11 +276,48 @@ Display and Debug redact Index Name, raw Tree Key, Record ID, field values,
 vectors, and payload. Cancellation never rewrites a successful commit or a
 commit of unknown outcome.
 
-## 7. Import and verification shapes
+## 7. Loading and verification
+
+### 7.1 Online loading
 
 Online loading uses ordinary `Index::batch_mutate` calls with caller-owned bounded
 concurrency and result handling. Repository loaders submit batches sequentially;
 there is no session completion or whole-load atomicity contract.
+
+### 7.2 Bulk Build
+
+`Runtime::start_bulk_build` reserves a hidden Building index from an immutable
+Input Snapshot; `open_bulk_build` recovers its identity-bound `BulkBuildJob`.
+Call `job.complete` for manual completion, or opt into automatic execution with
+`job.schedule` and `Runtime::run_bulk_scheduler`. Publication returns an ordinary
+Active `Index`; incomplete builds are not available to serving operations.
+
+The [Bulk Build contract](bulk-build.md) defines these entry points, explicit
+phase control, status, recovery, cancellation, and cleanup. The synchronous
+[artifact pipeline](bulk-artifacts.md) owns input capture and artifact preparation.
+
+### 7.3 Offline refinement
+
+`Index::refine(options)` prepares an existing Active index after ordinary import
+and settled Ready topology, before serving. The caller must exclude all other
+index operations, including maintenance from other runtimes, until it returns.
+Local queued or running fixups and non-Ready topology are rejected; idle Runtime
+workers may remain running.
+
+`RefineOptions::new(input_bytes)` requires a positive input byte limit and defaults
+to two rounds. Builders accept `with_refinement_rounds(0..=5)` and
+`with_operation_options(OperationOptions)`. The limit covers loaded vectors, IDs,
+centroids and topology; numerical workspace and move lists require additional
+memory. Zero rounds refreshes centroids without relocating records.
+
+Refinement preserves Partition Keys and topology. Bounded atomic transactions
+relocate records within capacity constraints and update centroids with their
+incoming parent projections and parent Header cache epochs. Every commit preserves
+exact membership and searchable projections. Cancellation, errors or unknown
+commit outcomes can leave a valid, partially refined index. There is no
+whole-operation rollback or resume protocol; the caller may drop and rebuild it.
+
+### 7.4 Verification
 
 Verify returns a bounded report with `complete`, coarse issue kinds, safe
 identifiers, and logical-object counts. Options bound issues, objects, memory,
@@ -296,56 +332,3 @@ is no continuation or repair API.
 - Focused tests cover record/schema/predicate boundaries, batch ordering,
   cancellation-before-commit, commit-result priority, search metadata, and lifecycle idempotency.
 - Public tests assert behavior, not private cache, task, or codec structure.
-
-
-## Bulk Build
-
-`Runtime::start_bulk_build(name, input, construction_options)` reserves a hidden
-Building index from a caller-owned immutable `InputSnapshot`; `open_bulk_build`
-recovers its identity-bound `BulkBuildJob`. Identical requests retain the ID.
-The descriptor exposes source identity and construction parameters, with redacted
-Debug output. Reservation itself starts no background worker.
-
-Create an existing durable workspace root and pass `BulkWorkerOptions::new(root)`
-to `job.complete`. It resumes preparation, loading, exact validation, publication,
-and owned-file cleanup under one operation control scope, returning an Active
-Index. Repeating completion after publication resolves the same identity without
-requiring source or workspace files.
-`complete_with_report(options, prepared_input, control)` follows the same recovery
-protocol and returns the Index plus a `BulkBuildReport`. Optional receipt-time
-preparation is validated against the reserved input and worker options. The
-report records work performed by this invocation; reused preparation and loading
-stages have zero duration.
-
-For explicit phase control, `job.run_worker` prepares accepted Forest and Serving artifacts and
-loads the backend in bounded transactions. Repeating the same options resumes
-accepted work and takes over old worker epochs. A worker arriving after validation
-has begun returns `BulkBuildSuperseded`; `complete` retries publication. `job.publish()` requires the immutable completed load,
-performs resumable exact paged validation, and returns the ordinary Active Index.
-Publishing before loading completes returns `BulkBuildBusy`; finish or resume
-loading and retry. Both operations and `status`/`abort` have `_with_control` variants. A failed job
-reports `Failed { kind }` and requires abort/rebuild; cancellation is resumable.
-
-`load_serving` remains a lower-level fenced load primitive. It fixes one immutable
-artifact and commits data plus checkpoints atomically under `BulkLoadOptions` and
-adapter admission limits. A completed load remains hidden; publication also
-requires core worker acceptance of that artifact.
-
-`abort` rejects Active indexes and is idempotent for an absent original ID. Both
-abort and publish attempt owned-file reclamation; a busy workspace defers cleanup.
-Other cleanup failures may be returned after the lifecycle commit, so inspect
-status or retry the same operation. `job.cleanup()` retries reclamation;
-`Runtime::cleanup_bulk_builds(maximum, after)` performs bounded orphan discovery.
-The caller retains source files, workspace root, and its coordination lock file.
-See [Bulk Build](bulk-build.md) for filesystem requirements and recovery semantics.
-
-
-Automatic scheduling is opt-in: after reservation call
-`job.schedule(BulkWorkerOptions::new(shared_workspace)).await?`, then run
-`runtime.run_bulk_scheduler(BulkSchedulerOptions::default(), control).await`
-on each worker process. The scheduler future runs until cancellation or Runtime
-shutdown and owns bounded local job tasks. It discovers jobs automatically,
-renews leases, takes over expired workers, publishes and retries cleanup. Stop it
-with `OperationOptions` cancellation/deadline or Runtime shutdown; stopping it does
-not abort durable jobs. Queued jobs reject manual mutation attempts with
-`BulkBuildBusy`. A job's failure remains observable through `status`.

@@ -50,6 +50,8 @@ idempotent persistent-state recovery rule.
 
 ## 3. Backend mappings
 
+### 3.1 Memory
+
 Memory uses a structurally shared ordered map with immutable read snapshots
 and optimistic write transactions. Each new backend is one isolated Backend
 Namespace; clones share its keyspace. Commits validate protected point reads,
@@ -63,6 +65,8 @@ window abort with `RetryableAbort`. The adapter enforces 10,000-byte keys,
 100,000-byte values, and budgets of 10,000 mutations and 1 MiB per transaction.
 It does not advertise transactional range clear, so index drop uses bounded
 point deletes. See [ADR 0024](../adr/0024-production-memory-adapter.md).
+
+### 3.2 FoundationDB
 
 FoundationDB maps update-protected reads to conflict-establishing reads and
 supports transactional logical range clear. Its adapter exposes actual database
@@ -81,6 +85,8 @@ length keys and update-protected reads use ordinary point reads, preserving
 native key limits and exact write-conflict scope. Range values retain their
 native owner rather than copying value buffers.
 
+### 3.3 RocksDB
+
 RocksDB uses `OptimisticTransactionDB`. ReadTxn owns a Snapshot. WriteTxn enables
 a transaction snapshot and binds every read option to it while retaining
 read-your-writes. Point `get_for_update` establishes conflicts; state machines
@@ -93,13 +99,16 @@ transactions reuse their actor rather than reacquiring admission, so saturating
 the configured live-actor limit delays only new transaction creation. A
 backend shutdown hook waits for detached cleanup before Runtime releases the
 adapter; direct users get the same barrier from consuming asynchronous adapter
-shutdown. RocksDB v1 does not advertise transactional range clear.
+shutdown. RocksDB does not advertise transactional range clear.
 
 ## 4. Persistent identity and lifecycle
 
 A Backend Namespace contains name mappings and never-reused Logical Index IDs.
 Create reserves an ID and atomically inserts the name mapping and Active
-Manifest. ID gaps are valid. Drop transitions the Manifest to Dropping before
+Manifest. Bulk Build instead reserves a hidden Building Manifest and an immutable
+Build Descriptor; [publication](bulk-build.md#5-loading-and-exact-validation)
+transitions it to Active after exact validation. ID gaps are valid. Drop
+transitions the Manifest to Dropping before
 deleting data; all ordinary operations update-protect and validate Active state.
 
 Offline refinement preserves the Active Manifest, Partition Keys and topology.
@@ -119,7 +128,8 @@ the lifecycle records.
 The core defines one logical namespace for:
 
 - allocator and Index Name mapping;
-- Index Manifest;
+- namespace-owned Build Workspace and Build Schedule;
+- Index Manifest, Build Descriptor, Build Load, and Build Validation;
 - Vector Record, Opaque Payload, and Record Location;
 - Tree Manifest directory entries;
 - Partition Header, serving-immutable Centroid, Synopsis, and transition State;
@@ -138,6 +148,8 @@ supports field-prefix half-open ranges. Decoders reject unknown tags, duplicate
 fields, noncanonical values, nonzero padding, and trailing bytes.
 
 ## 6. Persistent values
+
+### 6.1 Manifests and serving values
 
 The Index Manifest stores the persistent format version (`FORMAT_VERSION = 2`),
 lifecycle state, immutable configuration, Logical Index ID, RaBitQ rotation
@@ -168,6 +180,8 @@ Child Entries contain child Partition Key and a centroid projection matching the
 child centroid. Serving centroids are immutable; offline refinement replaces the
 centroid and incoming projection atomically.
 
+### 6.2 Deterministic persistent algorithms
+
 All persistent algorithms that affect bytes are format protocol:
 
 - the seeded Givens rotation uses the persisted 32 bytes as the ChaCha8 256-bit
@@ -196,59 +210,7 @@ Codec golden vectors fix these constants and steps. Processes and restarts
 must produce equivalent summaries and codes; implementation-defined randomness
 or hashing is not permitted.
 
-## 7. Typed atomic operations
-
-Only this module may compose raw logical keys. It exposes typed operations for:
-
-- validating/opening manifests and tree directory pages;
-- reserving persistent IDs;
-- reading records, locations, headers, states, synopses, and entries;
-- atomically changing record membership and exact metadata;
-- installing and advancing split/merge states;
-- bounded deletion of one partition prefix or full index range.
-
-Algorithm modules do not hand-build keys or partially update counts/synopses.
-Natural decode or cross-value invariant failures return Corruption.
-
-## 8. Partition deletion
-
-Partition removal has one common correctness order:
-
-1. install or retain the terminal transition state that keeps obsolete data
-   unreachable or safely covered;
-2. if transactional range clear is available, clear the full partition prefix
-   in the final atomic topology transaction;
-3. otherwise delete bounded point-key pages while the terminal state remains;
-4. after an empty page proves the prefix empty, atomically perform the final
-   topology switch and remove Header, State, and remaining metadata.
-
-Split and merge may not describe an atomic “delete full prefix” on an adapter
-that lacks transactional range clear.
-
-For a split or merge source, the exact zero Header count is itself the
-emptiness proof: the drained prefix holds only its fixed metadata keys, so
-steps 3 and 4 collapse into the final transaction — bounded point deletes of
-those keys commit atomically with the topology switch, and the terminal state
-never outlives it. The paged form remains for removals without an exact-count
-proof, such as index drop.
-
-## 9. Verification
-
-Backend contract tests run unchanged against Memory, FoundationDB, and RocksDB.
-Core tests use Memory's optional `test-support` controls for faults, replay,
-resource ceilings, and simulated restart; there is no separate in-memory
-transaction implementation. Default adapter builds omit this instrumentation.
-The tests cover snapshot consistency, read-your-writes,
-conflicts, unique insertion, gap-free scan pagination across item and byte
-boundaries, empty ranges, oversized values, exact-boundary exhaustion, batched
-multi-range scans with independent per-range pagination, limits,
-rollback, commit outcome, range-clear capability, and durability mappings.
-
-Codec tests use golden bytes, ordering properties, malformed/noncanonical input,
-and cross-process deterministic vectors for rotation, Bloom, Tree Key, values,
-and RaBitQ7. Model tests assert that typed atomic operations preserve exact
-membership under conflicts and injected unknown outcomes.
-
+### 6.3 Build metadata
 
 Bulk Build reservations add lifecycle byte `2` (Building; Active remains `0`,
 Dropping `1`) and index-owned key kind `0x05` for the Build Descriptor. Descriptor
@@ -268,7 +230,6 @@ owned solely by Build Validation, with no separate sealed flag.
 This metadata is codec-validated but excluded from serving membership ledgers.
 See the implemented load protocol in [Bulk Build](bulk-build.md).
 
-
 Namespace key `[0, 2] || LogicalIndexId:u64be` stores Build Workspace (tag `0x0f`).
 It survives index-prefix removal. Its canonical value contains a sized absolute
 UTF-8 root (at most 3900 bytes), nine u64 resource/admission/hard-limit values,
@@ -285,7 +246,6 @@ Workspace and proof Debug output redact locators/cursors. These formats have no
 compatibility layer; malformed, trailing and noncanonical bytes fail closed.
 See [ADR 0027](../adr/0027-bulk-workspace-and-publication.md).
 
-
 Namespace key `[0,3] || LogicalIndexId:u64be` stores Build Schedule, tag `0x11`:
 sized UTF-8 Index Name (1..=255 bytes), the shared Worker Options encoding (sized
 root and seven u64 resource/admission values), a 32-byte owner token, and u64 UTC
@@ -295,3 +255,52 @@ redacted in Debug. Index-bound transactions may access only their own namespace
 Build Schedule to protect mutations against automatic takeover. Queue removal
 is separate from index-prefix deletion. All values are canonical and reject
 truncation, trailing bytes, and invalid ownership encodings.
+
+## 7. Typed atomic operations
+
+Only this module may compose raw logical keys. It exposes typed operations for:
+
+- validating/opening manifests and tree directory pages;
+- reserving persistent IDs;
+- reading records, locations, headers, states, synopses, and entries;
+- atomically changing record membership and exact metadata;
+- installing and advancing split/merge states;
+- bounded deletion of one partition prefix or full index range.
+
+Algorithm modules do not hand-build keys or partially update counts/synopses.
+Natural decode or cross-value invariant failures return Corruption.
+
+## 8. Partition deletion
+
+Split and merge drain a source while its committed transition state remains
+searchable. The exact zero Header count proves that all entries have drained;
+only the fixed source metadata remains. One final transaction validates that
+proof, changes topology, and removes the source:
+
+- with transactional range clear, clear the complete source prefix;
+- otherwise, delete its fixed metadata keys with bounded point deletes.
+
+Both paths remove the source atomically with the topology switch. Neither path
+rescans entries or leaves a terminal state awaiting paged cleanup. Root split
+completion instead converts the stable root in place, as defined by
+[maintenance](maintenance.md#43-complete).
+
+Full index drop has no equivalent zero-count proof. Its bounded deletion and
+Dropping lifecycle are defined in [persistent identity and lifecycle](#4-persistent-identity-and-lifecycle).
+
+## 9. Verification
+
+Backend contract tests run unchanged against Memory, FoundationDB, and RocksDB.
+Core tests use Memory's optional `test-support` controls for faults, replay,
+resource ceilings, and simulated restart; there is no separate in-memory
+transaction implementation. Default adapter builds omit this instrumentation.
+The tests cover snapshot consistency, read-your-writes,
+conflicts, unique insertion, gap-free scan pagination across item and byte
+boundaries, empty ranges, oversized values, exact-boundary exhaustion, batched
+multi-range scans with independent per-range pagination, limits,
+rollback, commit outcome, range-clear capability, and durability mappings.
+
+Codec tests use golden bytes, ordering properties, malformed/noncanonical input,
+and cross-process deterministic vectors for rotation, Bloom, Tree Key, values,
+and RaBitQ7. Model tests assert that typed atomic operations preserve exact
+membership under conflicts and injected unknown outcomes.

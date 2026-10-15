@@ -6,9 +6,6 @@ Detailed contracts live in the module designs linked below. Domain terms are
 defined in [`CONTEXT.md`](../../CONTEXT.md); rationale for hard-to-reverse choices
 is recorded in [`docs/adr`](../adr/).
 
-[Bulk Build](bulk-build.md) implements resumable initial construction behind a
-hidden Building index, with exact validation before atomic publication.
-
 ## 1. Purpose
 
 KTANN is an asynchronous Rust library that stores source vectors and their
@@ -100,8 +97,11 @@ CI both follow stable. Production code uses no nightly features.
 | Module design | Sole owner of |
 | --- | --- |
 | [Public API](api.md) | caller-visible types, validation, configuration, errors, lifecycle calls |
+| [Bulk Build](bulk-build.md) | reservation, worker recovery, loading, exact publication, scheduling, cleanup |
+| [Offline artifacts](bulk-artifacts.md) | input capture, bounded sorting, forest construction, serving artifact assembly |
 | [Storage](storage.md) | backend transaction contract, logical keys/codecs, typed atomic operations, manifests |
-| [Search](search.md) | numeric semantics, RaBitQ7, predicates, Tree Key planning, traversal, rerank, cache correctness |
+| [Filtering](filtering.md) | predicate semantics, Tree Key range planning, synopsis classification |
+| [Search](search.md) | numeric semantics, RaBitQ7, traversal, rerank, budgets, cache correctness |
 | [Maintenance](maintenance.md) | foreground routing and mutation protocol, tree shape, split/merge state machines |
 | [Runtime and operations](runtime-operations.md) | admission, retry scheduling, shutdown, observability, verification and validation |
 
@@ -134,6 +134,11 @@ Committed mutations may enqueue bounded process-local maintenance. Queue loss
 does not affect correctness because persistent transition states stay
 searchable and later accesses can rediscover them.
 
+Online loaders submit ordinary atomic mutation batches with explicit bounded
+concurrency and handle each result. Repository loaders submit sequentially.
+There is no session-level admission or completion protocol and no whole-load
+atomicity.
+
 ### 6.3 Search
 
 Search validates the request and opens one consistent read snapshot. It plans
@@ -155,8 +160,9 @@ Split and merge are persistent, incremental state machines. Each short
 transaction preserves all invariants and leaves a traversal rule that covers
 both source and target membership. Any process that encounters an intermediate
 state may attempt a bounded fixup; no process owns the state. Completion removes
-obsolete data using transactional range clear when supported, otherwise using
-paged point deletion before the final topology switch.
+the drained source after its exact count reaches zero. The final topology
+transaction clears the source prefix when supported, otherwise deletes its fixed
+metadata keys; no entry rescan is needed.
 
 ### 6.5 Shutdown
 
@@ -171,11 +177,6 @@ cleanup, so successful Runtime shutdown permits immediate database reopen or
 teardown. Direct adapter users consume `RocksDbBackend` with its asynchronous
 shutdown for the same guarantee; transaction-handle Drop remains nonblocking.
 
-Online loaders submit ordinary atomic mutation batches with explicit bounded
-concurrency and handle each result. Repository loaders submit sequentially.
-There is no session-level admission or completion protocol and no whole-load
-atomicity.
-
 ### 6.6 Drop and verify
 
 Drop first marks the Manifest `Dropping`, making open and data operations fail
@@ -187,6 +188,20 @@ Verify is a bounded, read-only audit of one consistent snapshot. It never
 repairs data. Large FoundationDB audits run against a caller-provided offline
 copy or another backend instance that can keep the required snapshot; the
 common Backend API does not invent a long-lived snapshot facility.
+
+### 6.7 Bulk Build
+
+[Bulk Build](bulk-build.md) constructs a new Logical Index from an immutable Input
+Snapshot. Reservation hides it in Building state. Manual completion or an opt-in
+automatic scheduler prepares artifacts, loads bounded transactions, and validates
+exact serving bytes before atomically publishing the original identity as Active.
+Durable checkpoints permit recovery; owned workspace files are reclaimed separately.
+It does not replace an existing Active index.
+
+The synchronous [`bulk` module](bulk-artifacts.md) owns bounded input capture,
+external sorting, forest files, and serving artifact assembly. It reuses core
+construction and storage codecs and never writes backend state. The non-goals
+above concerning bulk-build generations and staging indexes remain unchanged.
 
 ## 7. Performance and operational constraints
 
@@ -214,10 +229,3 @@ properties; deterministic search budgets; lifecycle recovery; and focused
 recall, latency, contention, memory, and write-amplification benchmarks. The
 detailed evidence matrix is in the module designs. No compatibility suite for
 an unshipped format and no duplicated implementation-path tests are required.
-
-## Offline artifact preparation
-
-The synchronous [`bulk` module](bulk-artifacts.md) owns bounded input capture,
-external sorting, forest files, and serving artifact assembly. It reuses core
-construction and storage codecs and never writes backend state. The non-goals
-above concerning bulk-build generations and staging indexes remain unchanged.
