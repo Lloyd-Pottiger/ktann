@@ -97,17 +97,11 @@ pub(crate) async fn enqueue<B: Backend>(
         .await?;
         match context.commit(|start| txn.commit_with(start)).await {
             Ok(()) => return Ok(()),
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    ErrorKind::RetryableAbort | ErrorKind::CommitOutcomeUnknown
-                ) =>
-            {
+            Err(error) => {
                 retry
-                    .wait_or_exhaust(Operation::ScheduleBulkBuild, &mut attempts)
-                    .await?
+                    .after_commit_error(Operation::ScheduleBulkBuild, &mut attempts, error)
+                    .await?;
             }
-            Err(e) => return Err(e),
         }
     }
 }
@@ -151,17 +145,11 @@ async fn claim<B: Backend>(
                 context.bulk_authority = Some(owner);
                 return Ok(Some(s));
             }
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    ErrorKind::RetryableAbort | ErrorKind::CommitOutcomeUnknown
-                ) =>
-            {
+            Err(error) => {
                 retry
-                    .wait_or_exhaust(Operation::ScheduleBulkBuild, &mut attempts)
-                    .await?
+                    .after_commit_error(Operation::ScheduleBulkBuild, &mut attempts, error)
+                    .await?;
             }
-            Err(e) => return Err(e),
         }
     }
 }
@@ -260,17 +248,11 @@ async fn finish<B: Backend>(
         }
         match context.commit(|start| txn.commit_with(start)).await {
             Ok(()) => return Ok(failed),
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    ErrorKind::RetryableAbort | ErrorKind::CommitOutcomeUnknown
-                ) =>
-            {
+            Err(error) => {
                 retry
-                    .wait_or_exhaust(Operation::ScheduleBulkBuild, &mut attempts)
-                    .await?
+                    .after_commit_error(Operation::ScheduleBulkBuild, &mut attempts, error)
+                    .await?;
             }
-            Err(e) => return Err(e),
         }
     }
 }
@@ -331,41 +313,51 @@ async fn discover<B: Backend>(
     context.checkpoint()?;
     let backend = context.backend();
     let mut txn = backend.begin_read().await?;
-    let page = txn
-        .scan(
-            &keys::build_schedule_range(after),
-            ScanLimits {
-                item_limit: limit,
-                byte_limit: 1024 * 1024,
-            },
-        )
-        .await?;
+    // Start with available slots so a ready queue does not overfetch. Widen only
+    // past leased entries, with a fixed per-poll bound independent of concurrency.
+    let mut remaining = 256;
+    let mut page_limit = limit;
+    let mut cursor = after;
     let now = now_ms()?;
     let mut ids = Vec::new();
-    let mut last_scanned = None;
-    for item in page.items() {
-        let key = keys::decode_key(&[], item.key())?;
-        let LogicalKey::BuildSchedule(id) = key else {
-            return Err(bulk_worker::corrupt());
-        };
-        let PersistentValue::BuildSchedule(schedule) =
-            ValueCodec::bootstrap().decode(&key, item.value().clone())?
-        else {
-            return Err(bulk_worker::corrupt());
-        };
-        last_scanned = Some(id);
-        // This snapshot only avoids futile attempts; claim still establishes
-        // authority transactionally before any work is started.
-        if schedule.expires_ms <= now {
-            ids.push(id);
+    while remaining != 0 {
+        let page = txn
+            .scan(
+                &keys::build_schedule_range(cursor),
+                ScanLimits {
+                    item_limit: page_limit.min(remaining),
+                    byte_limit: 1024 * 1024,
+                },
+            )
+            .await?;
+        for item in page.items() {
+            let key = keys::decode_key(&[], item.key())?;
+            let LogicalKey::BuildSchedule(id) = key else {
+                return Err(bulk_worker::corrupt());
+            };
+            let PersistentValue::BuildSchedule(schedule) =
+                ValueCodec::bootstrap().decode(&key, item.value().clone())?
+            else {
+                return Err(bulk_worker::corrupt());
+            };
+            cursor = Some(id);
+            // Claim establishes authority transactionally; this snapshot only
+            // avoids futile attempts against leases that have not expired.
+            if schedule.expires_ms <= now {
+                ids.push(id);
+                if ids.len() == limit {
+                    return Ok((ids, cursor));
+                }
+            }
         }
+        if page.is_terminal() {
+            return Ok((ids, None));
+        }
+        remaining -= page.items().len();
+        page_limit = (page_limit * 2).min(remaining);
+        context.checkpoint()?;
     }
-    let next = if page.is_terminal() {
-        None
-    } else {
-        last_scanned
-    };
-    Ok((ids, next))
+    Ok((ids, cursor))
 }
 
 pub(crate) async fn run<B: Backend>(

@@ -208,6 +208,9 @@ workspaces after ordinary index deletion. See [Bulk Build](bulk-build.md).
 Automatic Bulk Build scheduling uses `schedule_bulk_build` for queue discovery,
 lease coordination and scheduled attempts. Its bounded JoinSet admits at most
 `max_jobs` per scheduler, additionally limited by shared foreground admission.
+Discovery starts with a page sized to the available slots and widens across
+leased entries, examining at most 256 queue records per poll. Its cursor follows
+the last consumed record, so filling the available slots never skips remaining queued work.
 Lease renewal runs inside the admitted attempt, without acquiring another
 foreground permit. Dropping the scheduler cancels child tasks; shutdown stops
 discovery and cancels active attempts. Native IO may outlive cancellation while

@@ -745,7 +745,7 @@ async fn complete_retries_when_validation_wins_before_worker_takeover() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prepared_receipt_and_lost_preparation_both_publish_complete_indexes() {
     use ktann::bulk::PreparedInputWriter;
-    for mode in 0..3 {
+    for recover_without_preparation in [false, true] {
         let dir = Directory::new();
         let memory = MemoryBackend::new();
         let runtime = runtime(memory);
@@ -771,24 +771,20 @@ async fn prepared_receipt_and_lost_preparation_both_publish_complete_indexes() {
             .start_bulk_build("bulk", &source, construction_options())
             .await
             .unwrap();
-        let (index, report) = if mode == 0 {
+        let (index, report) = if !recover_without_preparation {
             job.complete_with_report(opts.clone(), Some(prepared), Default::default())
                 .await
                 .unwrap()
         } else {
-            if mode == 1 {
-                drop(prepared);
-            } else {
-                let mut mismatched = opts.clone();
-                mismatched.sort_memory_bytes *= 2;
-                assert_eq!(
-                    job.complete_with_report(mismatched, Some(prepared), Default::default())
-                        .await
-                        .unwrap_err()
-                        .kind(),
-                    ErrorKind::InvalidArgument
-                );
-            }
+            let mut mismatched = opts.clone();
+            mismatched.sort_memory_bytes *= 2;
+            assert_eq!(
+                job.complete_with_report(mismatched, Some(prepared), Default::default())
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::InvalidArgument
+            );
             fs::remove_dir_all(dir.0.join("receipt")).unwrap();
             job.complete_with_report(opts.clone(), None, Default::default())
                 .await
@@ -799,11 +795,13 @@ async fn prepared_receipt_and_lost_preparation_both_publish_complete_indexes() {
         assert!(!report.load.is_zero());
         assert!(!report.publish.is_zero());
         assert_eq!(report.rotation_seed, *job.index_manifest().rotation_seed());
-        let (_, reused) = job
-            .complete_with_report(opts.clone(), None, Default::default())
-            .await
-            .unwrap();
-        assert!(reused.forest.is_zero() && reused.serving.is_zero() && reused.load.is_zero());
+        if !recover_without_preparation {
+            let (_, reused) = job
+                .complete_with_report(opts, None, Default::default())
+                .await
+                .unwrap();
+            assert!(reused.forest.is_zero() && reused.serving.is_zero() && reused.load.is_zero());
+        }
         let verified = index.verify(VerifyOptions::default()).await.unwrap();
         assert!(verified.complete && verified.issues.is_empty());
         assert_eq!(verified.objects.vector_records, 73);

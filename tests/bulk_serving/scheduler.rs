@@ -388,6 +388,100 @@ async fn unknown_enqueue_and_claim_resolve_without_duplicate_jobs() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_enqueue_exhaustion_preserves_uncertainty() {
+    for fault in [CommitFault::UnknownApplied, CommitFault::UnknownNotApplied] {
+        let dir = Directory::new();
+        let memory = MemoryBackend::with_test_config(TestConfig::default());
+        let runtime = Runtime::new(
+            memory.clone(),
+            RuntimeConfig::default()
+                .with_maintenance(0, 1)
+                .unwrap()
+                .with_attempts(1, 1)
+                .unwrap(),
+        )
+        .unwrap();
+        let job = reservation(&runtime, &dir, 0).await.0;
+        let options = worker_options(&dir);
+        memory.set_fault_plan(vec![fault]).unwrap();
+        assert_eq!(
+            job.schedule(options.clone()).await.unwrap_err().kind(),
+            ErrorKind::CommitOutcomeUnknown
+        );
+        job.schedule(options).await.unwrap();
+        runtime.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discovery_passes_leased_entries_without_a_poll_per_entry() {
+    let dir = Directory::new();
+    let memory = MemoryBackend::new();
+    let runtime = Runtime::new(
+        memory.clone(),
+        RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
+    )
+    .unwrap();
+    let mut leased = Vec::new();
+    for n in 0..32 {
+        leased.push(
+            runtime
+                .create_index(&format!("leased-{n}"), config(Metric::L2, true))
+                .await
+                .unwrap()
+                .logical_index_id(),
+        );
+    }
+    let (job, source) = reservation(&runtime, &dir, 0).await;
+    let options = worker_options(&dir);
+    job.schedule(options.clone()).await.unwrap();
+    let second = runtime
+        .start_bulk_build("second", &source, construction_options())
+        .await
+        .unwrap();
+    second.schedule(options).await.unwrap();
+    // A published job can retain its queue entry while its owner cleans up.
+    // Keep those earlier entries leased throughout the discovery test.
+    let mut entry = read_queue(&memory, job.logical_index_id()).await;
+    let len = entry.len();
+    entry[len - 40..len - 8].fill(1);
+    entry[len - 8..].copy_from_slice(&u64::MAX.to_be_bytes());
+    let mut txn = memory.begin_write().await.unwrap();
+    for id in leased {
+        txn.put(
+            keys::build_schedule_key(id).into(),
+            Bytes::copy_from_slice(&entry),
+        )
+        .await
+        .unwrap();
+    }
+    txn.commit().await.unwrap();
+    let stop = CancellationToken::new();
+    let scheduler = tokio::spawn({
+        let runtime = runtime.clone();
+        let stop = stop.clone();
+        async move {
+            runtime
+                .run_bulk_scheduler(
+                    BulkSchedulerOptions::default(),
+                    OperationOptions::default().with_cancellation(stop),
+                )
+                .await
+        }
+    });
+    // One slot and a one-second poll: scanning one entry per poll would need
+    // over 32 seconds, beyond wait_active's bound. Both runnable jobs must run.
+    wait_active(&job).await;
+    wait_active(&second).await;
+    stop.cancel();
+    assert_eq!(
+        scheduler.await.unwrap().unwrap_err().kind(),
+        ErrorKind::Cancelled
+    );
+    runtime.shutdown().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn terminal_failure_and_queued_abort_leave_no_scheduler_work() {
     for fail in [true, false] {

@@ -439,7 +439,6 @@ impl<B: Backend> BulkBuildJob<B> {
                         retry,
                     )
                     .await
-                    .map(|_| ())
                 },
             )
             .await
