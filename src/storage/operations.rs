@@ -328,7 +328,13 @@ impl<'manifest> LogicalBinding<'manifest> {
     fn validate_input_key(&self, key: &LogicalKey) -> Result<()> {
         let valid = match (self.manifest, key.index()) {
             (None, None) => true,
-            (None, Some(_)) => matches!(key, LogicalKey::Manifest(_)),
+            (None, Some(_)) => matches!(
+                key,
+                LogicalKey::Manifest(_)
+                    | LogicalKey::BuildDescriptor(_)
+                    | LogicalKey::BuildLoad(_)
+                    | LogicalKey::BuildValidation(_)
+            ),
             (Some(manifest), Some(index)) => index == manifest.logical_index_id(),
             (Some(_), None) => {
                 self.allow_name_mapping && matches!(key, LogicalKey::IndexNameDirectory(_))
@@ -566,7 +572,8 @@ pub struct ReadLogicalTxn<'manifest, T> {
 }
 
 impl<T> ReadLogicalTxn<'static, T> {
-    /// Binds a read transaction to namespace values and Index Manifests.
+    /// Binds a read transaction to namespace, Manifest, and Bulk Build metadata;
+    /// serving keys require an index-bound transaction.
     #[must_use]
     pub fn bootstrap(raw: T) -> Self {
         Self {
@@ -806,7 +813,8 @@ pub struct MutationBuilder<'manifest> {
 }
 
 impl MutationBuilder<'static> {
-    /// Creates a builder for namespace values and Index Manifests.
+    /// Creates a builder for namespace, Manifest, and Bulk Build metadata;
+    /// serving keys require an index-bound builder.
     #[must_use]
     pub fn bootstrap(hard_limits: HardLimits, budget: AdmissionBudget) -> Self {
         Self::new(LogicalBinding::bootstrap(), hard_limits, budget)
@@ -849,6 +857,13 @@ impl<'manifest> MutationBuilder<'manifest> {
         let encoded_key = encode_input_key(&self.binding, &key)?;
         let encoded_value = Bytes::from(self.binding.codec().encode_for_key(&key, &value)?);
         self.queue(encoded_key, Some(encoded_value))
+    }
+
+    /// Queues bytes already validated against this builder's Manifest. Internal
+    /// artifact readers own canonical codec and index-identity validation; this
+    /// method still enforces adapter hard limits and physical admission budgets.
+    pub(crate) fn put_encoded(&mut self, key: Bytes, value: Bytes) -> Result<()> {
+        self.queue(key, Some(value))
     }
 
     /// Queues a typed delete, superseding an earlier mutation to the same key.
@@ -975,7 +990,8 @@ struct ReadCacheEntry {
 }
 
 impl<T> WriteLogicalTxn<'static, T> {
-    /// Binds a write transaction to namespace values and Index Manifests.
+    /// Binds a write transaction to namespace, Manifest, and Bulk Build metadata;
+    /// serving keys require an index-bound transaction.
     #[must_use]
     pub fn bootstrap(raw: T, hard_limits: HardLimits, budget: AdmissionBudget) -> Self {
         Self {

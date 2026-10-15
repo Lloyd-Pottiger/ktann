@@ -6,6 +6,9 @@ Detailed contracts live in the module designs linked below. Domain terms are
 defined in [`CONTEXT.md`](../../CONTEXT.md); rationale for hard-to-reverse choices
 is recorded in [`docs/adr`](../adr/).
 
+[Bulk Build](bulk-build.md) implements resumable initial construction behind a
+hidden Building index, with exact validation before atomic publication.
+
 ## 1. Purpose
 
 KTANN is an asynchronous Rust library that stores source vectors and their
@@ -51,8 +54,9 @@ their physical keyspaces are neither portable nor mutually compatible.
 
 ## 4. Authoritative invariants
 
-1. Every Vector Record has exactly one Record Location and one corresponding
-   Leaf Entry in each committed state.
+1. Every Vector Record in an Active Logical Index has exactly one Record
+   Location and one corresponding Leaf Entry in each committed state. Building
+   data remains inaccessible until sealed validation and publication.
 2. A foreground mutation atomically changes the Vector Record, Record Location,
    Leaf Entry, exact Partition Header counts, and affected Partition Synopses.
 3. Every ordinary non-root partition has exactly one incoming Child Entry. The
@@ -62,7 +66,7 @@ their physical keyspaces are neither portable nor mutually compatible.
    exact counts and cache epochs, and, for a leaf entry, changes Record Location.
 5. Partition Header count is exact. A zero count is sufficient to complete
    structural removal; completion does not rescan to prove emptiness.
-6. Every committed topology state is searchable. A cold intermediate state may
+6. Every committed Active topology state is searchable. A cold intermediate state may
    remain until a later relevant access rediscovers it.
 7. A Partition Synopsis is conservative. `NoMatch` proves no entry can satisfy
    the predicate; `AllMatch` proves every entry does. Every schema field,
@@ -165,6 +169,11 @@ releasing it. For RocksDB this is the completion barrier for native actor
 cleanup, so successful Runtime shutdown permits immediate database reopen or
 teardown. Direct adapter users consume `RocksDbBackend` with its asynchronous
 shutdown for the same guarantee; transaction-handle Drop remains nonblocking.
+
+Online loaders submit ordinary atomic mutation batches with explicit bounded
+concurrency and handle each result. Repository loaders submit sequentially.
+There is no session-level admission or completion protocol and no whole-load
+atomicity.
 
 ### 6.6 Drop and verify
 

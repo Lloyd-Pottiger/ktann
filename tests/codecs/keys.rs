@@ -855,3 +855,17 @@ fn encode_rejects_invalid_input() {
         ErrorKind::InvalidArgument
     );
 }
+
+#[test]
+fn build_descriptor_key_is_canonical_and_index_owned() {
+    let key = LogicalKey::BuildDescriptor(id(1));
+    let encoded = ktann::storage::keys::build_descriptor_key(id(1));
+    assert_eq!(
+        encoded.as_slice(),
+        b"\x01\x00\x00\x00\x00\x00\x00\x00\x01\x05"
+    );
+    assert_eq!(decode_key(&[], &Bytes::from(encoded.clone())).unwrap(), key);
+    let mut overlong = encoded.to_vec();
+    overlong.push(0);
+    assert!(decode_key(&[], &Bytes::from(overlong)).is_err());
+}

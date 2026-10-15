@@ -476,7 +476,7 @@ async fn unsupported_manifest_format_fails_reads_closed() {
     let mut bytes = ValueCodec::bootstrap()
         .encode(&PersistentValue::IndexManifest(manifest.clone()))
         .expect("encode manifest");
-    bytes[1..3].copy_from_slice(&2_u16.to_be_bytes());
+    bytes[1..3].copy_from_slice(&u16::MAX.to_be_bytes());
     put_raw(
         &shared,
         keys::manifest_key(manifest.logical_index_id()),

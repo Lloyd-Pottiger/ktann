@@ -707,3 +707,6 @@ fn serving_reopens_after_relocation_and_rejects_wrong_bindings_and_corruption() 
         ErrorKind::Corruption
     );
 }
+
+#[path = "bulk_serving/load.rs"]
+mod load;

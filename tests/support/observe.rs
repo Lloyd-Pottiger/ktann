@@ -259,6 +259,10 @@ const ALLOWED_LABEL_VALUES: &[(&str, &[&str])] = &[
         "operation",
         &[
             "create_index",
+            "start_bulk_build",
+            "open_bulk_build",
+            "bulk_build_status",
+            "abort_bulk_build",
             "open_index",
             "drop_index",
             "insert",
@@ -280,6 +284,7 @@ const ALLOWED_LABEL_VALUES: &[(&str, &[&str])] = &[
             // Stable ErrorKind categories.
             "invalid_argument",
             "index_already_exists",
+            "index_building",
             "index_not_found",
             "index_dropping",
             "record_already_exists",

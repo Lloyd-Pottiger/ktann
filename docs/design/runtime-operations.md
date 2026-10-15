@@ -1,7 +1,7 @@
 # Runtime, Observability, and Verification
 
 This module owns process-local admission and lifecycle, maintenance scheduling,
-observability/privacy, offline verification behavior, and the
+online loading, observability/privacy, offline verification behavior, and the
 whole-system validation matrix.
 
 ## 1. Runtime ownership
@@ -87,7 +87,13 @@ progress: this is an assistance threshold, not task expiry or a lease.
 Later relevant access rediscovers deferred work; no timer schedules it.
 
 
-## 4. Offline refinement
+## 4. Online loading and refinement
+
+Callers load records with ordinary `Index::batch_mutate` operations and bound
+concurrency explicitly. Repository consumers use sequential submission. Every
+batch retains ordinary admission, atomicity, bounded retry, cancellation, and
+unknown-commit behavior. There is no session-level scheduling, token, completion
+barrier, or Fixup Backlog gate.
 
 Offline `Index::refine` requires caller-exclusive access and settled Ready topology
 as specified in [the API contract](api.md). Admission rejects local queued or
@@ -183,3 +189,17 @@ benchmark-tunable implementation details.
 - Rollback means continuing to use an older separate Logical Index until a new
   one is validated and traffic is switched externally. The v1 format is never
   mutated backward in place.
+
+
+Bulk Build reservation, worker, load, publication, status, abort and cleanup use
+foreground operation control and bounded retry policies. Native construction and
+file IO run on blocking tasks with shared admission retained until actual exit,
+even when the awaiting future is cancelled. Running native stages are not
+preempted; subsequent admissions and checkpoints observe cancellation.
+
+Worker epochs fence accepted outputs; load epochs fence atomic KV checkpoints.
+Completed loading fences writers. Publication resumes bounded exact validation, then atomically
+activates the original identity. Terminal failures persist; transient failures
+and cancellation remain resumable. Root advisory locks order native IO against
+reclamation. Busy cleanup is deferred; namespace cleanup pages discover orphaned
+workspaces after ordinary index deletion. See [Bulk Build](bulk-build.md).

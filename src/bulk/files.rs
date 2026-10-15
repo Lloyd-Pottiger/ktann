@@ -31,6 +31,20 @@ pub struct ArtifactManifest {
 }
 
 impl ArtifactManifest {
+    /// Whether this identity describes a caller-owned input snapshot.
+    pub(crate) fn is_input(&self) -> bool {
+        self.kind == 0
+    }
+
+    /// Digest before any frames, used by the initial durable checkpoint.
+    pub(crate) fn initial_sha256(&self) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash.update(MAGIC);
+        hash.update([self.kind]);
+        hash.update(self.binding);
+        hash.finalize().into()
+    }
+
     /// Number of records or partitions in the artifact.
     #[must_use]
     pub const fn items(&self) -> u64 {
@@ -231,6 +245,11 @@ pub(super) struct Reader {
 }
 
 impl Reader {
+    /// Digest of all bytes consumed through the current frame.
+    pub(super) fn prefix_sha256(&self) -> [u8; 32] {
+        self.hash.clone().finalize().into()
+    }
+
     /// Checks the completion manifest and header against the trusted identity.
     /// Frame and whole-file integrity are checked as the returned reader is consumed.
     pub(super) fn open(
