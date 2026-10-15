@@ -31,18 +31,24 @@ pub struct ArtifactManifest {
 }
 
 impl ArtifactManifest {
-    /// Whether this identity describes a caller-owned input snapshot.
-    pub(crate) fn is_input(&self) -> bool {
+    /// Whether this identity denotes serving entries.
+    pub(crate) const fn is_serving(&self) -> bool {
+        self.kind == 3
+    }
+
+    /// Whether this identity denotes a forest artifact.
+    pub(crate) const fn is_forest(&self) -> bool {
+        self.kind == 2
+    }
+
+    /// Whether this identity denotes an input snapshot.
+    pub(crate) const fn is_input(&self) -> bool {
         self.kind == 0
     }
 
-    /// Digest before any frames, used by the initial durable checkpoint.
+    /// Digest of the header used by resumable entry checkpoints.
     pub(crate) fn initial_sha256(&self) -> [u8; 32] {
-        let mut hash = Sha256::new();
-        hash.update(MAGIC);
-        hash.update([self.kind]);
-        hash.update(self.binding);
-        hash.finalize().into()
+        Sha256::digest(&self.encode()[..HEADER_BYTES as usize]).into()
     }
 
     /// Number of records or partitions in the artifact.
@@ -245,7 +251,7 @@ pub(super) struct Reader {
 }
 
 impl Reader {
-    /// Digest of all bytes consumed through the current frame.
+    /// Digest of the verified prefix consumed by this reader.
     pub(super) fn prefix_sha256(&self) -> [u8; 32] {
         self.hash.clone().finalize().into()
     }

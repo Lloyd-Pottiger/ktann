@@ -92,3 +92,19 @@ FoundationDB. Filesystem qualification across hosts is outside these tests.
 
 See [ADR 0026](../adr/0026-building-reservations.md) and
 [ADR 0027](../adr/0027-bulk-workspace-and-publication.md) for persistence decisions.
+
+## Automatic scheduling
+
+`schedule` persists worker options for automatic preparation, loading, and
+publication. Scheduler ownership fences worker, load, and publication writes.
+Bounded leases permit takeover after a worker stops renewing; namespace cleanup
+reclaims orphaned owned files. Manual completion remains available.
+
+Receipt-time preparation can be passed with `complete_with_report`.
+It is a volatile optimization: its source identity, configuration, and options
+are checked before use; recovery recomputes it from the sealed Input Snapshot.
+
+`complete_with_report(options, prepared_input, control)` completes the same
+protocol while returning stage timing and the persisted rotation seed. Reused
+preparation and loading stages report zero work. These measurements are
+per-invocation observations, not throughput or latency guarantees.

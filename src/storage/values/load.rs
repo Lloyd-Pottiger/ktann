@@ -52,7 +52,7 @@ impl BuildLoad {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.artifact.encode()[8] != 3
+        if !self.artifact.is_serving()
             || self.epoch == 0
             || self.entries > self.artifact.items()
             || (self.entries == 0 && self.prefix_sha256 != self.artifact.initial_sha256())

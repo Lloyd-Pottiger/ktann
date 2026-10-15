@@ -311,6 +311,11 @@ to `job.complete`. It resumes preparation, loading, exact validation, publicatio
 and owned-file cleanup under one operation control scope, returning an Active
 Index. Repeating completion after publication resolves the same identity without
 requiring source or workspace files.
+`complete_with_report(options, prepared_input, control)` follows the same recovery
+protocol and returns the Index plus a `BulkBuildReport`. Optional receipt-time
+preparation is validated against the reserved input and worker options. The
+report records work performed by this invocation; reused preparation and loading
+stages have zero duration.
 
 For explicit phase control, `job.run_worker` prepares accepted Forest and Serving artifacts and
 loads the backend in bounded transactions. Repeating the same options resumes
@@ -333,3 +338,14 @@ status or retry the same operation. `job.cleanup()` retries reclamation;
 `Runtime::cleanup_bulk_builds(maximum, after)` performs bounded orphan discovery.
 The caller retains source files, workspace root, and its coordination lock file.
 See [Bulk Build](bulk-build.md) for filesystem requirements and recovery semantics.
+
+
+Automatic scheduling is opt-in: after reservation call
+`job.schedule(BulkWorkerOptions::new(shared_workspace)).await?`, then run
+`runtime.run_bulk_scheduler(BulkSchedulerOptions::default(), control).await`
+on each worker process. The scheduler future runs until cancellation or Runtime
+shutdown and owns bounded local job tasks. It discovers jobs automatically,
+renews leases, takes over expired workers, publishes and retries cleanup. Stop it
+with `OperationOptions` cancellation/deadline or Runtime shutdown; stopping it does
+not abort durable jobs. Queued jobs reject manual mutation attempts with
+`BulkBuildBusy`. A job's failure remains observable through `status`.

@@ -40,3 +40,8 @@ mod observe;
 pub mod runtime;
 pub mod search;
 pub mod storage;
+
+/// Internal controls for adapter and fault-injection tests.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod test_support;

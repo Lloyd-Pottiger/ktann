@@ -41,10 +41,22 @@ async fn publish_inner<B: Backend>(
     descriptor: BuildDescriptor,
     retry: RetryPolicy,
 ) -> Result<IndexManifest> {
-    if let Some(active) = already_active(context, &index).await? {
-        return Ok(active);
-    }
-    let state = bulk_worker::workspace(context, &index).await?;
+    context.checkpoint()?;
+    let state = {
+        let backend = context.backend();
+        let mut txn = ReadLogicalTxn::bootstrap(backend.begin_read().await?);
+        if let Some(active) = read_active(&mut txn, &index).await? {
+            return Ok(active);
+        }
+        match txn
+            .get(LogicalKey::BuildWorkspace(index.logical_index_id()))
+            .await?
+        {
+            Some(PersistentValue::BuildWorkspace(state)) => state,
+            None => return Err(Error::new(ErrorKind::BulkBuildBusy)),
+            _ => return Err(corrupt()),
+        }
+    };
     if let Some(kind) = state.failure {
         return Err(Error::new(kind));
     }
@@ -88,6 +100,12 @@ pub(super) async fn already_active<B: Backend>(
     context.checkpoint()?;
     let backend = context.backend();
     let mut txn = ReadLogicalTxn::bootstrap(backend.begin_read().await?);
+    read_active(&mut txn, expected).await
+}
+async fn read_active<T: crate::storage::backend::ReadTxn>(
+    txn: &mut ReadLogicalTxn<'_, T>,
+    expected: &IndexManifest,
+) -> Result<Option<IndexManifest>> {
     match txn
         .get(LogicalKey::Manifest(expected.logical_index_id()))
         .await?
@@ -164,6 +182,7 @@ async fn begin_validation<B: Backend>(
             backend.admission_budget(),
         );
         bulk_worker::building(&mut txn, index).await?;
+        super::bulk_scheduler::authorize(context, &mut txn, index.logical_index_id()).await?;
         match txn
             .get_for_update(LogicalKey::BuildWorkspace(index.logical_index_id()))
             .await?
@@ -218,24 +237,11 @@ async fn begin_validation<B: Backend>(
         .await?;
         match context.commit(|start| txn.commit_with(start)).await {
             Ok(()) => return Ok(proof),
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    ErrorKind::RetryableAbort | ErrorKind::CommitOutcomeUnknown
-                ) =>
-            {
-                if let Err(exhausted) = retry
-                    .wait_or_exhaust(Operation::PublishBulkBuild, &mut attempts)
-                    .await
-                {
-                    return Err(if e.kind() == ErrorKind::CommitOutcomeUnknown {
-                        e
-                    } else {
-                        exhausted
-                    });
-                }
+            Err(e) => {
+                retry
+                    .after_commit_error(Operation::PublishBulkBuild, &mut attempts, e)
+                    .await?
             }
-            Err(e) => return Err(e),
         }
     }
 }
@@ -307,6 +313,7 @@ async fn page<B: Backend>(
             backend.admission_budget(),
         );
         fence(&mut txn, index, state).await?;
+        super::bulk_scheduler::authorize(context, &mut txn, index.logical_index_id()).await?;
         let current = read_proof(&mut txn, index).await?.ok_or_else(corrupt)?;
         if after.as_ref().is_some_and(|after| *after == current) {
             return Ok((reader.take().expect("reader"), current));
@@ -394,24 +401,11 @@ async fn page<B: Backend>(
         .await?;
         match context.commit(|start| txn.commit_with(start)).await {
             Ok(()) => return Ok((reader.take().expect("reader"), after.take().expect("proof"))),
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    ErrorKind::RetryableAbort | ErrorKind::CommitOutcomeUnknown
-                ) =>
-            {
-                if let Err(exhausted) = retry
-                    .wait_or_exhaust(Operation::PublishBulkBuild, &mut attempts)
-                    .await
-                {
-                    return Err(if e.kind() == ErrorKind::CommitOutcomeUnknown {
-                        e
-                    } else {
-                        exhausted
-                    });
-                }
+            Err(e) => {
+                retry
+                    .after_commit_error(Operation::PublishBulkBuild, &mut attempts, e)
+                    .await?
             }
-            Err(e) => return Err(e),
         }
     }
 }
@@ -439,6 +433,7 @@ async fn activate<B: Backend>(
             return Ok(current);
         }
         fence(&mut txn, index, state).await?;
+        super::bulk_scheduler::authorize(context, &mut txn, index.logical_index_id()).await?;
         if !proof.complete || read_proof(&mut txn, index).await?.as_ref() != Some(proof) {
             return Err(corrupt());
         }

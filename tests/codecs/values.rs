@@ -951,7 +951,7 @@ fn reopened_manifest_reproduces_identical_index_value_bytes() {
 #[test]
 fn building_manifest_and_request_descriptor_have_canonical_bytes() {
     use ktann::bulk::ArtifactManifest;
-    use ktann::construction::{CONSTRUCTION_VERSION, ConstructionOptions};
+    use ktann::construction::ConstructionOptions;
     use ktann::storage::values::BuildDescriptor;
     let codec = ValueCodec::bootstrap();
     let building = minimal_manifest().with_lifecycle(IndexLifecycle::Building);
@@ -980,7 +980,6 @@ fn building_manifest_and_request_descriptor_have_canonical_bytes() {
     let key = LogicalKey::BuildDescriptor(id(1));
     let bytes = codec.encode(&value).unwrap();
     let mut expected = vec![0x0d];
-    expected.extend_from_slice(&CONSTRUCTION_VERSION.to_be_bytes());
     expected.extend_from_slice(&7_u32.to_be_bytes());
     expected.extend_from_slice(b"/source");
     expected.extend_from_slice(&89_u32.to_be_bytes());
@@ -999,23 +998,19 @@ fn building_manifest_and_request_descriptor_have_canonical_bytes() {
     trailing.push(0);
     assert_corrupt(decode(codec, &key, &trailing));
     let mut invalid = bytes.to_vec();
-    invalid[9] = b'x';
+    invalid[5] = b'x';
     assert_corrupt(decode(codec, &key, &invalid));
-    let mut unsupported = bytes.to_vec();
-    unsupported[1..5].copy_from_slice(&u32::MAX.to_be_bytes());
-    assert_eq!(
-        decode(codec, &key, &unsupported).unwrap_err().kind(),
-        ErrorKind::UnsupportedFormat
-    );
-    input_bytes[8] = 2;
-    assert!(
-        BuildDescriptor::new(
-            "/source".into(),
-            ArtifactManifest::decode(&input_bytes).unwrap(),
-            options
-        )
-        .is_err()
-    );
+    for kind in [2, 3] {
+        input_bytes[8] = kind;
+        assert!(
+            BuildDescriptor::new(
+                "/source".into(),
+                ArtifactManifest::decode(&input_bytes).unwrap(),
+                options
+            )
+            .is_err()
+        );
+    }
 }
 
 #[test]
@@ -1084,6 +1079,34 @@ fn bulk_validation_golden_and_malformed_proofs() {
         malformed[offset] ^= 3;
         assert!(codec.decode(&key, Bytes::from(malformed)).is_err());
     }
+    golden.push(0);
+    assert!(codec.decode(&key, Bytes::from(golden)).is_err());
+}
+
+#[test]
+fn build_schedule_golden_and_malformed_lease() {
+    let codec = ValueCodec::bootstrap();
+    let key = LogicalKey::BuildSchedule(id(1));
+    let mut golden = vec![0x11, 0, 0, 0, 1, b'x', 0, 0, 0, 5];
+    golden.extend_from_slice(b"/bulk");
+    for n in [1_u64, 1, 1, 1, 1, 2, 1] {
+        golden.extend_from_slice(&n.to_be_bytes());
+    }
+    golden.extend_from_slice(&[1; 32]);
+    golden.extend_from_slice(&1_u64.to_be_bytes());
+    let value = codec.decode(&key, Bytes::from(golden.clone())).unwrap();
+    assert_eq!(codec.encode(&value).unwrap(), golden);
+    for length in 0..golden.len() {
+        assert!(
+            codec
+                .decode(&key, Bytes::copy_from_slice(&golden[..length]))
+                .is_err()
+        );
+    }
+    let mut invalid = golden.clone();
+    let length = invalid.len();
+    invalid[length - 8..].fill(0);
+    assert!(codec.decode(&key, Bytes::from(invalid)).is_err());
     golden.push(0);
     assert!(codec.decode(&key, Bytes::from(golden)).is_err());
 }

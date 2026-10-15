@@ -25,6 +25,8 @@ path = "src/lib.rs"
 
 [features]
 default = []
+# Low-level fault injection controls are excluded from production builds.
+test-support = []
 
 [dependencies]
 bytes = "1"
@@ -38,6 +40,8 @@ tracing = "0.1"
 xxhash-rust = { version = "=0.8.18", features = ["xxh3"] }
 
 [dev-dependencies]
+# Keep integration fault tests enabled under ordinary `cargo test`.
+ktann = { path = ".", features = ["test-support"] }
 ktann-memory = { path = "ktann-memory", features = ["test-support"] }
 metrics-util = "0.20"
 num-bigint = "0.4"

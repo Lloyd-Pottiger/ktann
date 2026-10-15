@@ -168,6 +168,8 @@ struct Gate {
     read_remaining: AtomicUsize,
     reached: Notify,
     release: Notify,
+    write_slots: Option<Arc<tokio::sync::Semaphore>>,
+    waiting_for_slot: Notify,
 }
 impl Gate {
     fn arm(&self, commit: usize) {
@@ -191,6 +193,7 @@ struct Gated {
 struct GatedTxn<'a> {
     inner: MemoryWriteTxn<'a>,
     gate: Arc<Gate>,
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 impl Backend for Gated {
     type ReadTxn<'a> = MemoryReadTxn;
@@ -217,9 +220,22 @@ impl Backend for Gated {
         self.memory.begin_read().await
     }
     async fn begin_write(&self) -> Result<GatedTxn<'_>> {
+        let permit = if let Some(slots) = &self.gate.write_slots {
+            let permit = match slots.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    self.gate.waiting_for_slot.notify_one();
+                    slots.clone().acquire_owned().await.unwrap()
+                }
+            };
+            Some(permit)
+        } else {
+            None
+        };
         Ok(GatedTxn {
             inner: self.memory.begin_write().await?,
             gate: self.gate.clone(),
+            _permit: permit,
         })
     }
 }
@@ -637,3 +653,6 @@ async fn replay_checks_the_exact_previously_committed_prefix_before_skipping_it(
 
 #[path = "complete.rs"]
 mod complete;
+
+#[path = "scheduler.rs"]
+mod scheduler;

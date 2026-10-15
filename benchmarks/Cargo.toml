@@ -15,6 +15,11 @@ path = "src/main.rs"
 name = "ktann-vdbbench-bridge"
 path = "src/bin/vdbbench_bridge.rs"
 
+[[bin]]
+name = "ktann-bulk-build"
+path = "src/bin/bulk_build.rs"
+required-features = ["rocksdb"]
+
 [features]
 default = ["rocksdb"]
 rocksdb = ["dep:ktann-rocksdb", "dep:rocksdb"]
@@ -36,7 +41,7 @@ parquet = { version = "54", default-features = false, features = ["arrow", "snap
 rocksdb = { version = "0.24", default-features = false, features = ["bindgen-runtime"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "signal"] }
 tokio-util = { version = "0.7", features = ["rt"] }

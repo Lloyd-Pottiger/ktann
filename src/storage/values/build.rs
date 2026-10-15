@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::api::{Error, Result};
 use crate::bulk::{ARTIFACT_MANIFEST_BYTES, ArtifactManifest};
-use crate::construction::{CONSTRUCTION_VERSION, ConstructionOptions};
+use crate::construction::ConstructionOptions;
 
 use super::corrupt;
 use super::wire::{Decoder, Encoder};
@@ -36,17 +36,10 @@ impl BuildDescriptor {
             || source
                 .to_str()
                 .is_none_or(|path| path.len() > MAX_SOURCE_PATH_BYTES || path.contains('\0'))
-            || options.min_partition_entries == 0
-            || options
-                .min_partition_entries
-                .checked_mul(2)
-                .is_none_or(|minimum| minimum > options.max_partition_entries)
-            || options.sample_items < 2
-            || options.memory_bytes == 0
-            || options.scratch_bytes == 0
         {
             return Err(Error::invalid_argument());
         }
+        options.validate()?;
         Ok(Self {
             source,
             input,
@@ -80,7 +73,6 @@ impl fmt::Debug for BuildDescriptor {
 }
 
 pub(super) fn encode(encoder: &mut Encoder, descriptor: &BuildDescriptor) -> Result<()> {
-    encoder.u32(CONSTRUCTION_VERSION);
     encoder.sized_bytes(
         descriptor
             .source
@@ -100,9 +92,6 @@ pub(super) fn encode(encoder: &mut Encoder, descriptor: &BuildDescriptor) -> Res
 }
 
 pub(super) fn decode(decoder: &mut Decoder) -> Result<BuildDescriptor> {
-    if decoder.u32()? != CONSTRUCTION_VERSION {
-        return Err(Error::new(crate::api::ErrorKind::UnsupportedFormat));
-    }
     let path = decoder.sized_bytes(MAX_SOURCE_PATH_BYTES)?;
     let source = PathBuf::from(std::str::from_utf8(&path).map_err(|_| corrupt())?);
     let input = ArtifactManifest::decode(&decoder.sized_bytes(ARTIFACT_MANIFEST_BYTES)?)?;

@@ -77,6 +77,27 @@ pub struct BulkCleanupPage {
     pub next: Option<LogicalIndexId>,
 }
 
+/// Work performed while completing one build, excluding input receipt.
+/// Reused stages have zero duration; a retry returns only work done by that call.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BulkBuildReport {
+    /// Forest sorting/training and immutable plan emission.
+    pub forest: std::time::Duration,
+    /// Preparation IO counts, including receipt-time sorting when supplied.
+    /// Absent when an accepted forest is reused.
+    pub forest_report: Option<crate::bulk::ForestReport>,
+    /// Exact joins and serving encoding.
+    pub serving: std::time::Duration,
+    /// Exact join and encoding evidence; absent when serving data is reused.
+    pub serving_report: Option<crate::bulk::ServingReport>,
+    /// Backend artifact loading, including checkpoint transactions.
+    pub load: std::time::Duration,
+    /// Exact validation, atomic publication and owned-workspace cleanup.
+    pub publish: std::time::Duration,
+    /// Persisted construction seed for reproducing the completed index.
+    pub rotation_seed: [u8; 32],
+}
+
 /// Resource bounds and an existing durable, shared preparation workspace.
 /// Workers require reliable advisory file locks, atomic rename, and fsync on
 /// this filesystem. The root and its coordination lock remain caller owned.
@@ -136,11 +157,46 @@ impl fmt::Debug for BulkWorkerOptions {
     }
 }
 
+/// Per-process automatic Bulk Build scheduling bounds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BulkSchedulerOptions {
+    /// Maximum jobs admitted concurrently by this scheduler (1..=64).
+    pub max_jobs: usize,
+    /// Queue polling and retry delay, at least one millisecond.
+    pub poll_interval: std::time::Duration,
+    /// Renewable lease duration; at least three poll intervals.
+    pub lease_duration: std::time::Duration,
+}
+impl Default for BulkSchedulerOptions {
+    fn default() -> Self {
+        Self {
+            max_jobs: 1,
+            poll_interval: std::time::Duration::from_secs(1),
+            lease_duration: std::time::Duration::from_secs(30),
+        }
+    }
+}
+impl BulkSchedulerOptions {
+    pub(crate) fn validate(self) -> Result<()> {
+        if self.max_jobs == 0
+            || self.max_jobs > 64
+            || self.poll_interval.as_millis() == 0
+            || self
+                .poll_interval
+                .checked_mul(3)
+                .is_none_or(|minimum| self.lease_duration < minimum)
+            || self.lease_duration.as_millis() > u128::from(u64::MAX)
+        {
+            return Err(super::Error::invalid_argument());
+        }
+        Ok(())
+    }
+}
+
 /// A recoverable reservation for one new Logical Index.
 ///
 /// This handle never follows a reused Index Name. Reservation launches no work;
-/// callers use `complete` or explicitly run workers and publish after loading.
-/// Preparation, loading,
+/// callers explicitly run workers and publish after loading. Preparation, loading,
 /// and validation are resumable. Source snapshots remain caller owned, including
 /// after abort, and are reverified when consumed.
 pub struct BulkBuildJob<B: Backend> {
@@ -259,6 +315,41 @@ impl<B: Backend> BulkBuildJob<B> {
             .await
     }
 
+    /// Durably queues this job for automatic preparation, loading and publication.
+    /// Repeating identical options is idempotent. Run a Runtime scheduler on each
+    /// participating process; all must have access to the shared source/workspace.
+    pub async fn schedule(&self, options: BulkWorkerOptions) -> Result<()> {
+        self.schedule_with_control(options, OperationOptions::default())
+            .await
+    }
+    /// Queues work with explicit cancellation and deadline control.
+    pub async fn schedule_with_control(
+        &self,
+        options: BulkWorkerOptions,
+        control: OperationOptions,
+    ) -> Result<()> {
+        let manifest = self.manifest.clone();
+        let name = self.name.clone();
+        let retry = lifecycle::RetryPolicy::from_config(self.runtime.config());
+        self.runtime
+            .run_foreground(
+                Operation::ScheduleBulkBuild,
+                Some(self.logical_index_id()),
+                control,
+                move |mut context| async move {
+                    crate::runtime::bulk_scheduler::enqueue(
+                        &mut context,
+                        manifest,
+                        name,
+                        options,
+                        retry,
+                    )
+                    .await
+                },
+            )
+            .await
+    }
+
     /// Completes preparation, loading, exact validation, and atomic publication.
     /// Retries resume the durable phase, including after an unknown commit or
     /// publication by another caller. Owned files are reclaimed when no IO holds
@@ -274,10 +365,27 @@ impl<B: Backend> BulkBuildJob<B> {
         options: BulkWorkerOptions,
         control: OperationOptions,
     ) -> Result<super::Index<B>> {
+        self.complete_with_report(options, None, control)
+            .await
+            .map(|(index, _)| index)
+    }
+
+    /// Completes preparation, loading, validation, publication and workspace cleanup.
+    ///
+    /// Retry this operation on the same job to resume durable progress. A published
+    /// job returns its original index. Queued jobs are owned by the scheduler and
+    /// reject direct execution. Optional receipt-time preparation avoids sorting
+    /// the source again; recovery needs only the sealed source.
+    pub async fn complete_with_report(
+        &self,
+        options: BulkWorkerOptions,
+        prepared: Option<crate::bulk::PreparedInput>,
+        control: OperationOptions,
+    ) -> Result<(super::Index<B>, BulkBuildReport)> {
         let manifest = self.manifest.clone();
         let descriptor = self.descriptor.clone();
         let retry = lifecycle::RetryPolicy::from_config(self.runtime.config());
-        let active = self
+        let (active, report) = self
             .runtime
             .run_foreground(
                 Operation::RunBulkBuild,
@@ -289,13 +397,15 @@ impl<B: Backend> BulkBuildJob<B> {
                         manifest,
                         descriptor,
                         options,
+                        prepared,
                         retry,
                     )
                     .await
                 },
             )
             .await?;
-        super::Index::new(Arc::clone(&self.runtime), self.name.clone(), active)
+        let index = super::Index::new(Arc::clone(&self.runtime), self.name.clone(), active)?;
+        Ok((index, report))
     }
 
     /// Resumes preparation and loading, reusing previously accepted artifacts.
@@ -325,12 +435,14 @@ impl<B: Backend> BulkBuildJob<B> {
                         manifest,
                         descriptor,
                         options,
+                        None,
                         retry,
                     )
                     .await
                 },
             )
             .await
+            .map(|_| ())
     }
     /// Requires completed loading, resumes exact paged validation, and publishes.
     /// Unknown publication is resolved by the original Logical Index identity.

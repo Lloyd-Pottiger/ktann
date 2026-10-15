@@ -85,6 +85,8 @@ pub(crate) enum Operation {
     LoadBulkBuild,
     /// Durable preparation and loading.
     RunBulkBuild,
+    /// Queue/lease coordination for automatic Bulk Builds.
+    ScheduleBulkBuild,
     /// Sealed validation and atomic publication.
     PublishBulkBuild,
     /// Reclaim build-owned files.
@@ -128,6 +130,7 @@ impl Operation {
             Self::StartBulkBuild => "start_bulk_build",
             Self::LoadBulkBuild => "load_bulk_build",
             Self::RunBulkBuild => "run_bulk_build",
+            Self::ScheduleBulkBuild => "schedule_bulk_build",
             Self::PublishBulkBuild => "publish_bulk_build",
             Self::CleanupBulkBuild => "cleanup_bulk_build",
             Self::Refine => "refine",
@@ -485,6 +488,7 @@ mod tests {
             Operation::StartBulkBuild.as_str(),
             Operation::LoadBulkBuild.as_str(),
             Operation::RunBulkBuild.as_str(),
+            Operation::ScheduleBulkBuild.as_str(),
             Operation::PublishBulkBuild.as_str(),
             Operation::CleanupBulkBuild.as_str(),
             Operation::OpenBulkBuild.as_str(),

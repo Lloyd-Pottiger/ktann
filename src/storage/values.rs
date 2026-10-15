@@ -68,6 +68,7 @@ mod entry;
 mod load;
 mod manifest;
 mod record;
+mod schedule;
 pub(crate) mod source;
 mod synopsis;
 mod validation;
@@ -89,6 +90,7 @@ pub use manifest::{
 };
 #[doc(inline)]
 pub use record::{OpaquePayload, RecordLocation, VectorRecord};
+pub use schedule::BuildSchedule;
 #[doc(inline)]
 pub use synopsis::{FieldSynopsis, PartitionSynopsis};
 pub use validation::BuildValidation;
@@ -145,6 +147,7 @@ const TAG_PARTITION_SYNOPSIS: u8 = 0x0b;
 const TAG_PARTITION_STATE: u8 = 0x0c;
 const TAG_BUILD_DESCRIPTOR: u8 = 0x0d;
 const TAG_BUILD_WORKSPACE: u8 = 0x0f;
+const TAG_BUILD_SCHEDULE: u8 = 0x11;
 const TAG_BUILD_VALIDATION: u8 = 0x10;
 const TAG_BUILD_LOAD: u8 = 0x0e;
 
@@ -157,6 +160,8 @@ pub enum ValueKind {
     /// Fenced serving artifact load checkpoint.
     /// Bulk Build control metadata.
     BuildWorkspace,
+    /// Distributed scheduler lease.
+    BuildSchedule,
     /// Bulk Build control metadata.
     BuildValidation,
     /// Atomic serving load progress.
@@ -194,6 +199,7 @@ impl ValueKind {
         match self {
             Self::BuildDescriptor => TAG_BUILD_DESCRIPTOR,
             Self::BuildWorkspace => TAG_BUILD_WORKSPACE,
+            Self::BuildSchedule => TAG_BUILD_SCHEDULE,
             Self::BuildValidation => TAG_BUILD_VALIDATION,
             Self::BuildLoad => TAG_BUILD_LOAD,
             Self::IndexIdAllocator => TAG_INDEX_ID_ALLOCATOR,
@@ -222,6 +228,8 @@ pub enum PersistentValue {
     /// Fenced serving artifact load checkpoint.
     /// Bulk Build control metadata.
     BuildWorkspace(BuildWorkspace),
+    /// Durable automatic scheduling request.
+    BuildSchedule(BuildSchedule),
     /// Bulk Build control metadata.
     BuildValidation(BuildValidation),
     /// Atomic serving load progress.
@@ -261,6 +269,7 @@ impl PersistentValue {
         match self {
             Self::BuildDescriptor(_) => ValueKind::BuildDescriptor,
             Self::BuildWorkspace(_) => ValueKind::BuildWorkspace,
+            Self::BuildSchedule(_) => ValueKind::BuildSchedule,
             Self::BuildValidation(_) => ValueKind::BuildValidation,
             Self::BuildLoad(_) => ValueKind::BuildLoad,
             Self::IndexIdAllocator(_) => ValueKind::IndexIdAllocator,
@@ -348,6 +357,7 @@ impl<'a> ValueCodec<'a> {
         match value {
             PersistentValue::BuildDescriptor(value) => build::encode(&mut encoder, value)?,
             PersistentValue::BuildWorkspace(value) => workspace::encode(&mut encoder, value)?,
+            PersistentValue::BuildSchedule(value) => schedule::encode(&mut encoder, value)?,
             PersistentValue::BuildValidation(value) => validation::encode(&mut encoder, value)?,
             PersistentValue::BuildLoad(value) => load::encode(&mut encoder, value)?,
             PersistentValue::IndexIdAllocator(value) => {
@@ -427,6 +437,9 @@ impl<'a> ValueCodec<'a> {
         }
         let mut decoder = Decoder::framed(expected, bytes)?;
         let value = match expected {
+            ValueKind::BuildSchedule => {
+                PersistentValue::BuildSchedule(schedule::decode(&mut decoder)?)
+            }
             ValueKind::BuildWorkspace => {
                 PersistentValue::BuildWorkspace(workspace::decode(&mut decoder)?)
             }
@@ -501,6 +514,7 @@ const fn value_kind_for_key(key: &LogicalKey) -> ValueKind {
         LogicalKey::Manifest(_) => ValueKind::IndexManifest,
         LogicalKey::BuildDescriptor(_) => ValueKind::BuildDescriptor,
         LogicalKey::BuildWorkspace(_) => ValueKind::BuildWorkspace,
+        LogicalKey::BuildSchedule(_) => ValueKind::BuildSchedule,
         LogicalKey::BuildValidation(_) => ValueKind::BuildValidation,
         LogicalKey::BuildLoad(_) => ValueKind::BuildLoad,
         LogicalKey::Record { .. } => ValueKind::VectorRecord,

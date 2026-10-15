@@ -80,6 +80,7 @@ jobs:
           cargo +stable test -p ktann-foundationdb
           --test foundationdb_adapter --test foundationdb_faults
           --test foundationdb_verify --test foundationdb_observability
+          --test foundationdb_bulk_load --test foundationdb_bulk_scheduler
           --test foundationdb_recall -- --ignored
       - name: Run FoundationDB benchmark smoke profile including lifecycle
         run: >-

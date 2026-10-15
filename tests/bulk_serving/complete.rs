@@ -2,7 +2,7 @@
 use super::*;
 use ktann::api::BulkWorkerOptions;
 
-fn worker_options(dir: &Directory) -> BulkWorkerOptions {
+pub(super) fn worker_options(dir: &Directory) -> BulkWorkerOptions {
     let root = dir.0.join("work");
     fs::create_dir(&root).unwrap();
     let mut worker = BulkWorkerOptions::new(root);
@@ -740,4 +740,71 @@ async fn complete_retries_when_validation_wins_before_worker_takeover() {
     assert!(report.complete && report.issues.is_empty());
     assert_eq!(report.objects.vector_records, 19);
     runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepared_receipt_and_lost_preparation_both_publish_complete_indexes() {
+    use ktann::bulk::PreparedInputWriter;
+    for recover_without_preparation in [false, true] {
+        let dir = Directory::new();
+        let memory = MemoryBackend::new();
+        let runtime = runtime(memory);
+        let mut opts = worker_options(&dir);
+        opts.sort_memory_bytes *= 2;
+        let mut forest = options();
+        forest.sort_memory_bytes = opts.sort_memory_bytes;
+        forest.sort_scratch_bytes = opts.sort_scratch_bytes;
+        let prepared = PreparedInputWriter::new(
+            &dir.0.join("source"),
+            &dir.0.join("receipt"),
+            config(Metric::L2, true),
+            4_000_000,
+            forest,
+        )
+        .unwrap()
+        .append((0..73).map(|id| Ok(record(id))))
+        .unwrap()
+        .seal()
+        .unwrap();
+        let source = prepared.source().clone();
+        let job = runtime
+            .start_bulk_build("bulk", &source, construction_options())
+            .await
+            .unwrap();
+        let (index, report) = if !recover_without_preparation {
+            job.complete_with_report(opts.clone(), Some(prepared), Default::default())
+                .await
+                .unwrap()
+        } else {
+            let mut mismatched = opts.clone();
+            mismatched.sort_memory_bytes *= 2;
+            assert_eq!(
+                job.complete_with_report(mismatched, Some(prepared), Default::default())
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::InvalidArgument
+            );
+            fs::remove_dir_all(dir.0.join("receipt")).unwrap();
+            job.complete_with_report(opts.clone(), None, Default::default())
+                .await
+                .unwrap()
+        };
+        assert!(!report.forest.is_zero());
+        assert!(!report.serving.is_zero());
+        assert!(!report.load.is_zero());
+        assert!(!report.publish.is_zero());
+        assert_eq!(report.rotation_seed, *job.index_manifest().rotation_seed());
+        if !recover_without_preparation {
+            let (_, reused) = job
+                .complete_with_report(opts, None, Default::default())
+                .await
+                .unwrap();
+            assert!(reused.forest.is_zero() && reused.serving.is_zero() && reused.load.is_zero());
+        }
+        let verified = index.verify(VerifyOptions::default()).await.unwrap();
+        assert!(verified.complete && verified.issues.is_empty());
+        assert_eq!(verified.objects.vector_records, 73);
+        runtime.shutdown().await.unwrap();
+    }
 }

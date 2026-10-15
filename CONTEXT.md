@@ -214,10 +214,11 @@ A durable name and Logical Index ID held by a Building Manifest, with a separate
 immutable Build Descriptor identifying the caller-owned input snapshot and
 construction parameters. Ordinary operations reject Building. Job handles bind
 the never-reused ID; abort cannot follow a reused name or remove a published index.
-Reservation itself launches no work; `run_worker` prepares/loads and `publish`
-validates and activates the index.
+Reservation itself launches no work. `complete` drives preparation, loading,
+validation, activation and owned-file reclamation. Scheduled jobs execute the
+same phases under renewable ownership.
 
-**Forest Artifact**: A sealed, caller-owned topology artifact for every nonempty
+**Forest Artifact**: A sealed topology artifact for every nonempty
 Tree Key in one finite Input Snapshot. Preparation rejects globally duplicate
 Record IDs before constructing trees. It carries no backend loading or publication
 authority; exact serving-membership validation is still required.
@@ -240,4 +241,12 @@ It survives removal of the index prefix until exclusive-lock cleanup completes.
 
 **Build Validation**: A paged exact comparison proof between a core-accepted
 Serving Artifact and frozen backend serving KV bytes. The completed proof and
-sealed Build Load authorize one atomic transition from Building to Active.
+immutable completed Build Load authorize one atomic transition from Building to Active.
+
+
+**Build Schedule**: Namespace-scoped durable request for automatic execution of
+one Bulk Build Job. It fixes worker options and the original name/ID and carries
+a renewable owner token with an expiry for takeover. A committed token change
+fences every old build writer; time alone is not write authority. It is separate
+from artifact ownership in Build Workspace and retires after completion/cleanup
+or a persisted terminal job failure.

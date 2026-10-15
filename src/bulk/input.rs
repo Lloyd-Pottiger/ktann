@@ -203,6 +203,18 @@ pub struct PreparedInput {
 }
 
 impl PreparedInput {
+    /// Checks that volatile preparation belongs to this source and exact worker options.
+    pub(crate) fn matches(
+        &self,
+        config: &IndexConfig,
+        manifest: &ArtifactManifest,
+        options: super::ForestOptions,
+    ) -> bool {
+        self.source.manifest == *manifest
+            && self.source.config == *config
+            && self.preparation.options == options
+    }
+
     /// The immutable source captured during receipt.
     pub fn source(&self) -> &InputSnapshot {
         &self.source

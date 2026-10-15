@@ -1,7 +1,9 @@
 //! Durable, attempt-fenced preparation and namespace-owned artifact reclamation.
 use super::{OperationContext, lifecycle::RetryPolicy};
-use crate::api::{BulkWorkerOptions, Error, ErrorKind, Result};
-use crate::bulk::{ForestArtifact, ForestOptions, InputSnapshot, ServingArtifact, ServingOptions};
+use crate::api::{BulkBuildReport, BulkWorkerOptions, Error, ErrorKind, Result};
+use crate::bulk::{
+    ForestArtifact, ForestOptions, InputSnapshot, PreparedInput, ServingArtifact, ServingOptions,
+};
 use crate::observe::labels::Operation;
 use crate::storage::backend::Backend;
 use crate::storage::keys::LogicalKey;
@@ -14,6 +16,7 @@ use std::{
     fs::{self, File, OpenOptions},
     path::Path,
     sync::Arc,
+    time::Instant,
 };
 
 /// A shared root lock is retained by native work, even when its async waiter is
@@ -85,20 +88,23 @@ pub(crate) async fn building<T: crate::storage::backend::WriteTxn>(
         IndexLifecycle::Active => Err(Error::invalid_argument()),
     }
 }
-pub(crate) async fn workspace<B: Backend>(
+/// Resolves the shared workspace once at the worker/queue input boundary.
+pub(crate) async fn normalize_options<B: Backend>(
     context: &OperationContext<B>,
-    index: &IndexManifest,
-) -> Result<BuildWorkspace> {
-    let backend = context.backend();
-    let mut txn = ReadLogicalTxn::bootstrap(backend.begin_read().await?);
-    match txn
-        .get(LogicalKey::BuildWorkspace(index.logical_index_id()))
-        .await?
-    {
-        Some(PersistentValue::BuildWorkspace(w)) => Ok(w),
-        None => Err(Error::new(ErrorKind::BulkBuildBusy)),
-        _ => Err(corrupt()),
-    }
+    mut options: BulkWorkerOptions,
+) -> Result<BulkWorkerOptions> {
+    options.validate()?;
+    let root = options.workspace.clone();
+    options.workspace = blocking(context, move || {
+        let root = fs::canonicalize(root).map_err(io)?;
+        if !fs::metadata(&root).map_err(io)?.is_dir() {
+            return Err(Error::invalid_argument());
+        }
+        Ok(root)
+    })
+    .await?;
+    options.validate()?;
+    Ok(options)
 }
 
 /// Resumes the durable phase and atomically publishes the original identity.
@@ -108,26 +114,42 @@ pub(crate) async fn complete<B: Backend>(
     index: IndexManifest,
     descriptor: BuildDescriptor,
     options: BulkWorkerOptions,
+    mut prepared: Option<PreparedInput>,
     retry: RetryPolicy,
-) -> Result<IndexManifest> {
+) -> Result<(IndexManifest, BulkBuildReport)> {
     let mut attempts = 0;
+    let mut report = BulkBuildReport::default();
     loop {
         context.checkpoint()?;
         let result = async {
-            match super::bulk_publish::publish(context, index.clone(), descriptor.clone(), retry)
-                .await
-            {
+            let started = Instant::now();
+            let publication =
+                super::bulk_publish::publish(context, index.clone(), descriptor.clone(), retry)
+                    .await;
+            report.publish += started.elapsed();
+            match publication {
                 Err(error) if error.kind() == ErrorKind::BulkBuildBusy => {
-                    run(
+                    let publication_time = report.publish;
+                    report = run(
                         context,
                         index.clone(),
                         descriptor.clone(),
                         options.clone(),
+                        prepared.take(),
                         retry,
                     )
                     .await?;
-                    super::bulk_publish::publish(context, index.clone(), descriptor.clone(), retry)
-                        .await
+                    report.publish = publication_time;
+                    let started = Instant::now();
+                    let publication = super::bulk_publish::publish(
+                        context,
+                        index.clone(),
+                        descriptor.clone(),
+                        retry,
+                    )
+                    .await;
+                    report.publish += started.elapsed();
+                    publication
                 }
                 result => result,
             }
@@ -143,11 +165,18 @@ pub(crate) async fn complete<B: Backend>(
         };
         match result {
             Ok(active) => {
+                let started = Instant::now();
                 match cleanup(context, index.logical_index_id(), retry).await {
-                    Err(error) if error.kind() == ErrorKind::BulkBuildBusy => {}
+                    // Manual callers can defer cleanup to the namespace sweep.
+                    // Scheduled jobs must retain their queue entry until cleanup succeeds.
+                    Err(error)
+                        if error.kind() == ErrorKind::BulkBuildBusy
+                            && context.bulk_authority.is_none() => {}
                     result => result?,
                 }
-                return Ok(active);
+                report.publish += started.elapsed();
+                report.rotation_seed = *index.rotation_seed();
+                return Ok((active, report));
             }
             Err(error)
                 if matches!(
@@ -169,19 +198,38 @@ pub(crate) async fn run<B: Backend>(
     context: &mut OperationContext<B>,
     index: IndexManifest,
     descriptor: BuildDescriptor,
-    mut options: BulkWorkerOptions,
+    options: BulkWorkerOptions,
+    prepared: Option<PreparedInput>,
     retry: RetryPolicy,
-) -> Result<()> {
-    options.validate()?;
-    let root = options.workspace.clone();
-    options.workspace = blocking(context, move || fs::canonicalize(root).map_err(io)).await?;
-    options.validate()?;
+) -> Result<BulkBuildReport> {
+    let options = normalize_options(context, options).await?;
+    if let Some(input) = &prepared {
+        let forest_options = ForestOptions {
+            sample_items: descriptor.options().sample_items,
+            tree_memory_bytes: descriptor.options().memory_bytes,
+            tree_scratch_bytes: descriptor.options().scratch_bytes,
+            sort_memory_bytes: options.sort_memory_bytes,
+            sort_scratch_bytes: options.sort_scratch_bytes,
+        };
+        if !input.matches(index.config(), descriptor.input(), forest_options) {
+            return Err(Error::invalid_argument());
+        }
+    }
     // Lock before registration or any directory creation, so cleanup can remove
     // the ledger only when every potential creator has left this critical region.
     let root = options.workspace.clone();
     let lock = Arc::new(blocking(context, move || lock_root(&root, false)).await?);
     let mut state = claim(context, &index, &descriptor, options, retry).await?;
-    let result = prepare_and_load(context, &index, &descriptor, &mut state, lock, retry).await;
+    let result = prepare_and_load(
+        context,
+        &index,
+        &descriptor,
+        &mut state,
+        lock,
+        prepared,
+        retry,
+    )
+    .await;
     if let Err(error) = &result {
         record_failure(context, &index, &state, error.kind(), retry).await?;
     }
@@ -208,6 +256,7 @@ async fn claim<B: Backend>(
             backend.admission_budget(),
         );
         building(&mut txn, index).await?;
+        super::bulk_scheduler::authorize(context, &mut txn, index.logical_index_id()).await?;
         match txn
             .get(LogicalKey::BuildDescriptor(index.logical_index_id()))
             .await?
@@ -275,9 +324,17 @@ async fn prepare_and_load<B: Backend>(
     descriptor: &BuildDescriptor,
     state: &mut BuildWorkspace,
     lock: Arc<File>,
+    prepared: Option<PreparedInput>,
     retry: RetryPolicy,
-) -> Result<()> {
-    if let Some(accepted) = &state.serving {
+) -> Result<BulkBuildReport> {
+    let mut report = BulkBuildReport::default();
+    let prepared = if state.forest.is_some() || state.serving.is_some() {
+        drop(prepared);
+        None
+    } else {
+        prepared
+    };
+    let serving = if let Some(accepted) = &state.serving {
         let path = state.attempt(accepted.epoch).join("serving");
         let expected = accepted.manifest.clone();
         let manifest = index.clone();
@@ -285,112 +342,110 @@ async fn prepare_and_load<B: Backend>(
         let forest = state.forest.as_ref().ok_or_else(corrupt)?.manifest.clone();
         let limits = state.hard_limits;
         let guard = lock.clone();
-        let serving = blocking(context, move || {
+        blocking(context, move || {
             let _lock = guard;
             ServingArtifact::open(&path, expected, &source, &forest, &manifest, limits)
         })
-        .await?;
-        return super::bulk_load::load(
-            context,
-            index.clone(),
-            descriptor.clone(),
-            serving,
-            state.options.load,
-            retry,
-        )
-        .await;
-    }
-    let input = blocking(context, {
-        let descriptor = descriptor.clone();
-        let config = index.config().clone();
-        let lock = lock.clone();
-        move || {
-            let _lock = lock;
-            InputSnapshot::open(descriptor.source(), config, descriptor.input().clone())
-        }
-    })
-    .await?;
-    let path = state.attempt(state.epoch);
-    let guard = lock.clone();
-    blocking(context, move || {
-        let _lock = guard;
-        fs::create_dir_all(path.parent().expect("owned directory")).map_err(io)?;
-        fs::create_dir(&path).map_err(io)?;
-        File::open(path.parent().expect("parent"))
-            .and_then(|f| f.sync_all())
-            .map_err(io)?;
-        File::open(
-            path.parent()
-                .and_then(Path::parent)
-                .expect("workspace root"),
-        )
-        .and_then(|f| f.sync_all())
-        .map_err(io)
-    })
-    .await?;
-    let forest_options = ForestOptions {
-        sample_items: descriptor.options().sample_items,
-        tree_memory_bytes: descriptor.options().memory_bytes,
-        tree_scratch_bytes: descriptor.options().scratch_bytes,
-        sort_memory_bytes: state.options.sort_memory_bytes,
-        sort_scratch_bytes: state.options.sort_scratch_bytes,
-    };
-    let forest = if let Some(accepted) = &state.forest {
-        let path = state.attempt(accepted.epoch).join("forest");
-        let expected = accepted.manifest.clone();
-        let source = input.manifest().clone();
-        let config = index.config().clone();
-        let seed = *index.rotation_seed();
-        let lock = lock.clone();
-        blocking(context, move || {
-            let _lock = lock;
-            ForestArtifact::open(
-                &path,
-                expected,
-                &source,
-                config,
-                seed,
-                forest_options.sample_items,
-            )
-        })
         .await?
     } else {
-        let path = state.attempt(state.epoch).join("forest");
-        let source = input.clone();
-        let seed = *index.rotation_seed();
-        let quota = state.options.max_artifact_bytes;
-        let lock = lock.clone();
-        let forest = blocking(context, move || {
-            let _lock = lock;
-            ForestArtifact::build(&path, &source, seed, forest_options, quota)
-                .map(|(artifact, _)| artifact)
+        let input = blocking(context, {
+            let descriptor = descriptor.clone();
+            let config = index.config().clone();
+            let lock = lock.clone();
+            move || {
+                let _lock = lock;
+                InputSnapshot::open(descriptor.source(), config, descriptor.input().clone())
+            }
         })
         .await?;
-        let mut after = state.clone();
-        after.forest = Some(PreparedArtifact {
-            epoch: state.epoch,
-            manifest: forest.manifest().clone(),
-        });
-        accept(context, index, state, &after, retry).await?;
-        *state = after;
-        forest
-    };
-    let serving_options = ServingOptions {
-        memory_bytes: state.options.serving_memory_bytes,
-        scratch_bytes: state.options.serving_scratch_bytes,
-        hard_limits: state.hard_limits,
-    };
-    let serving = {
+        {
+            let path = state.attempt(state.epoch);
+            let lock = lock.clone();
+            blocking(context, move || {
+                let _lock = lock;
+                fs::create_dir_all(path.parent().expect("owned directory")).map_err(io)?;
+                fs::create_dir(&path).map_err(io)?;
+                File::open(path.parent().expect("parent"))
+                    .and_then(|f| f.sync_all())
+                    .map_err(io)?;
+                File::open(
+                    path.parent()
+                        .and_then(Path::parent)
+                        .expect("workspace root"),
+                )
+                .and_then(|f| f.sync_all())
+                .map_err(io)
+            })
+            .await?;
+        }
+        let forest_options = ForestOptions {
+            sample_items: descriptor.options().sample_items,
+            tree_memory_bytes: descriptor.options().memory_bytes,
+            tree_scratch_bytes: descriptor.options().scratch_bytes,
+            sort_memory_bytes: state.options.sort_memory_bytes,
+            sort_scratch_bytes: state.options.sort_scratch_bytes,
+        };
+        let forest = if let Some(accepted) = &state.forest {
+            let path = state.attempt(accepted.epoch).join("forest");
+            let expected = accepted.manifest.clone();
+            let source = input.clone();
+            let seed = *index.rotation_seed();
+            let lock = lock.clone();
+            blocking(context, move || {
+                let _lock = lock;
+                ForestArtifact::open(
+                    &path,
+                    expected,
+                    source.manifest(),
+                    source.config().clone(),
+                    seed,
+                    forest_options.sample_items,
+                )
+            })
+            .await?
+        } else {
+            let path = state.attempt(state.epoch).join("forest");
+            let source = input.clone();
+            let seed = *index.rotation_seed();
+            let quota = state.options.max_artifact_bytes;
+            let lock = lock.clone();
+            let start = Instant::now();
+            let (forest, forest_report) = blocking(context, move || {
+                let _lock = lock;
+                match prepared {
+                    Some(input) => ForestArtifact::build_prepared(&path, input, seed, quota),
+                    None => ForestArtifact::build(&path, &source, seed, forest_options, quota),
+                }
+            })
+            .await?;
+            report.forest = start.elapsed();
+            report.forest_report = Some(forest_report);
+            let mut after = state.clone();
+            after.forest = Some(PreparedArtifact {
+                epoch: state.epoch,
+                manifest: forest.manifest().clone(),
+            });
+            accept(context, index, state, &after, retry).await?;
+            *state = after;
+            forest
+        };
+        let serving_options = ServingOptions {
+            memory_bytes: state.options.serving_memory_bytes,
+            scratch_bytes: state.options.serving_scratch_bytes,
+            hard_limits: state.hard_limits,
+        };
         let path = state.attempt(state.epoch).join("serving");
         let manifest = index.clone();
         let quota = state.options.max_artifact_bytes;
         let lock = lock.clone();
-        let serving = blocking(context, move || {
+        let start = Instant::now();
+        let (serving, serving_report) = blocking(context, move || {
             let _lock = lock;
             ServingArtifact::build(&path, &input, &forest, &manifest, serving_options, quota)
-                .map(|(artifact, _)| artifact)
         })
         .await?;
+        report.serving = start.elapsed();
+        report.serving_report = Some(serving_report);
         let mut after = state.clone();
         after.serving = Some(PreparedArtifact {
             epoch: state.epoch,
@@ -402,6 +457,7 @@ async fn prepare_and_load<B: Backend>(
     };
     // The shared root lock spans the entire async load; detached reader tasks
     // hold only open immutable file handles and cannot recreate deleted paths.
+    let start = Instant::now();
     super::bulk_load::load(
         context,
         index.clone(),
@@ -410,7 +466,9 @@ async fn prepare_and_load<B: Backend>(
         state.options.load,
         retry,
     )
-    .await
+    .await?;
+    report.load = start.elapsed();
+    Ok(report)
 }
 /// Publishes accepted outputs or terminal failure only for the exact claimed
 /// workspace state. Reading the successor makes uncertain commits idempotent.
@@ -431,6 +489,7 @@ async fn accept<B: Backend>(
             backend.admission_budget(),
         );
         building(&mut txn, index).await?;
+        super::bulk_scheduler::authorize(context, &mut txn, index.logical_index_id()).await?;
         let key = LogicalKey::BuildWorkspace(index.logical_index_id());
         let current = match txn.get_for_update(key.clone()).await? {
             Some(PersistentValue::BuildWorkspace(w)) => w,
@@ -446,24 +505,11 @@ async fn accept<B: Backend>(
             .await?;
         match context.commit(|start| txn.commit_with(start)).await {
             Ok(()) => return Ok(()),
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    ErrorKind::RetryableAbort | ErrorKind::CommitOutcomeUnknown
-                ) =>
-            {
-                if let Err(exhausted) = retry
-                    .wait_or_exhaust(Operation::RunBulkBuild, &mut attempts)
-                    .await
-                {
-                    return Err(if e.kind() == ErrorKind::CommitOutcomeUnknown {
-                        e
-                    } else {
-                        exhausted
-                    });
-                }
+            Err(e) => {
+                retry
+                    .after_commit_error(Operation::RunBulkBuild, &mut attempts, e)
+                    .await?
             }
-            Err(e) => return Err(e),
         }
     }
 }
@@ -563,24 +609,11 @@ pub(crate) async fn cleanup<B: Backend>(
         txn.delete(key).await?;
         match context.commit(|start| txn.commit_with(start)).await {
             Ok(()) => return Ok(()),
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    ErrorKind::RetryableAbort | ErrorKind::CommitOutcomeUnknown
-                ) =>
-            {
-                if let Err(exhausted) = retry
-                    .wait_or_exhaust(Operation::CleanupBulkBuild, &mut attempts)
-                    .await
-                {
-                    return Err(if e.kind() == ErrorKind::CommitOutcomeUnknown {
-                        e
-                    } else {
-                        exhausted
-                    });
-                }
+            Err(e) => {
+                retry
+                    .after_commit_error(Operation::CleanupBulkBuild, &mut attempts, e)
+                    .await?
             }
-            Err(e) => return Err(e),
         }
     }
 }
@@ -605,17 +638,9 @@ pub(crate) async fn cleanup_pending<B: Backend>(
     }
     let backend = context.backend();
     let mut raw = backend.begin_read().await?;
-    let start = match after {
-        None => vec![0, 2],
-        Some(id) => {
-            let mut key = crate::storage::keys::build_workspace_key(id);
-            key.push(0);
-            key
-        }
-    };
     let page = raw
         .scan(
-            &crate::storage::keys::KeyRange::new(start, vec![0, 3]),
+            &crate::storage::keys::build_workspace_range(after),
             crate::storage::backend::ScanLimits {
                 item_limit: maximum,
                 byte_limit: 1024 * 1024,
