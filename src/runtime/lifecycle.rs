@@ -147,6 +147,8 @@ pub(crate) async fn create_index<B: Backend>(
     reserve_index(context, name, config, None, retry).await
 }
 
+/// Atomically allocates identity, reserves the name, and writes lifecycle metadata.
+/// A descriptor selects a hidden Building reservation; ordinary create is Active.
 pub(crate) async fn reserve_index<B: Backend>(
     context: &mut OperationContext<B>,
     name: IndexName,
@@ -259,6 +261,8 @@ pub(crate) async fn reserve_index<B: Backend>(
     }
 }
 
+/// Resolves an uncertain reservation from a fresh snapshot. Bulk recovery must
+/// match the attempted ID as well as the request, so name reuse cannot retarget it.
 async fn recover_create<B: Backend>(
     backend: &B,
     name: &IndexName,
@@ -285,6 +289,8 @@ async fn recover_create<B: Backend>(
     classify_existing(manifest, config)
 }
 
+/// Reopens only the same configuration and immutable build request; a matching
+/// name alone is insufficient to claim an existing reservation.
 fn classify_build(
     manifest: IndexManifest,
     config: &IndexConfig,
@@ -537,6 +543,8 @@ async fn prepare_delete_step<T: WriteTxn>(
     }
 }
 
+/// Resolves drop by the current name mapping. A bound abort is finished once that
+/// name no longer targets its original ID, even if a replacement index now exists.
 async fn recover_drop_after_unknown<B: Backend>(
     backend: &B,
     name_key: &LogicalKey,

@@ -10,7 +10,8 @@
 //! discriminant, malformed length, noncanonical scalar, inconsistent identity,
 //! or trailing byte is [`ErrorKind::Corruption`].
 //!
-//! [`ValueCodec::bootstrap`] handles namespace values and Index Manifests.
+//! [`ValueCodec::bootstrap`] handles namespace values, Index Manifests, and
+//! schema-independent Bulk Build metadata.
 //! [`ValueCodec::for_index`] binds all remaining codecs to the Manifest's exact
 //! dimension, schema, Tree Key definition, and Bloom parameters. Adapters own
 //! backend physical prefixes.
@@ -321,7 +322,8 @@ pub struct ValueCodec<'a> {
 }
 
 impl ValueCodec<'static> {
-    /// Creates the bootstrap codec for namespace values and Index Manifests.
+    /// Creates the codec for namespace values, Index Manifests, and schema-independent
+    /// Bulk Build metadata. Serving values require a Manifest-bound codec.
     #[must_use]
     pub const fn bootstrap() -> Self {
         Self { manifest: None }

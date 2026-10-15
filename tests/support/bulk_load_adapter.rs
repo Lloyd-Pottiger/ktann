@@ -10,6 +10,8 @@ use ktann::runtime::Runtime;
 use ktann::storage::backend::{Backend, ReadOps};
 use std::path::Path;
 
+/// Exercises both manual loading and worker acceptance across a real backend
+/// reopen, then checks exact bytes before publication and ordinary verification.
 pub async fn exercise<B: Backend>(backend: impl Fn() -> B, directory: &Path) {
     let config = IndexConfig::new(2, Metric::L2)
         .unwrap()

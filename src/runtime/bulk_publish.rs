@@ -79,6 +79,8 @@ async fn publish_inner<B: Backend>(
     }
     result
 }
+/// Recognizes publication only for the handle's immutable identity, independently
+/// of file availability or subsequent reuse of its original name.
 pub(super) async fn already_active<B: Backend>(
     context: &OperationContext<B>,
     expected: &IndexManifest,

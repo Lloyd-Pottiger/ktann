@@ -139,7 +139,8 @@ impl fmt::Debug for BulkWorkerOptions {
 /// A recoverable reservation for one new Logical Index.
 ///
 /// This handle never follows a reused Index Name. Reservation launches no work;
-/// callers explicitly run workers and publish after loading. Preparation, loading,
+/// callers use `complete` or explicitly run workers and publish after loading.
+/// Preparation, loading,
 /// and validation are resumable. Source snapshots remain caller owned, including
 /// after abort, and are reverified when consumed.
 pub struct BulkBuildJob<B: Backend> {

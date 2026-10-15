@@ -916,7 +916,7 @@ async fn bulk_reservation_commit_recovery_and_validation_are_atomic() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn bulk_controls_and_published_abort_preserve_identity() {
+async fn bulk_controls_cancel_before_lifecycle_changes() {
     let shared = backend(no_clear_config());
     let runtime = make_runtime(shared.clone());
     let (_source, input) = BulkSource::new();
@@ -944,34 +944,7 @@ async fn bulk_controls_and_published_abort_preserve_identity() {
         job.status().await.unwrap(),
         ktann::api::BulkBuildStatus::Preparing
     );
-    // Simulate the future publisher's lifecycle transition to exercise the
-    // abort guard independently of the unimplemented data-loading protocol.
-    let manifest = read_manifest(&shared, &name("bulk")).await.unwrap();
-    let mut txn = WriteLogicalTxn::bootstrap(
-        shared.begin_write().await.unwrap(),
-        shared.hard_limits(),
-        shared.admission_budget(),
-    );
-    txn.put(
-        keys::LogicalKey::Manifest(job.logical_index_id()),
-        PersistentValue::IndexManifest(manifest.with_lifecycle(IndexLifecycle::Active)),
-    )
-    .await
-    .unwrap();
-    txn.commit().await.unwrap();
-    assert_eq!(
-        job.status().await.unwrap(),
-        ktann::api::BulkBuildStatus::Published
-    );
-    assert_eq!(
-        job.abort().await.unwrap_err().kind(),
-        ErrorKind::InvalidArgument
-    );
-    assert_eq!(
-        runtime.open_index("bulk").await.unwrap().logical_index_id(),
-        job.logical_index_id()
-    );
-    runtime.drop_index("bulk").await.unwrap();
+    job.abort().await.unwrap();
     assert_drop_complete(&shared, &name("bulk")).await;
     runtime.shutdown().await.unwrap();
 }

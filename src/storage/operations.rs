@@ -572,7 +572,8 @@ pub struct ReadLogicalTxn<'manifest, T> {
 }
 
 impl<T> ReadLogicalTxn<'static, T> {
-    /// Binds a read transaction to namespace values and Index Manifests.
+    /// Binds a read transaction to namespace, Manifest, and Bulk Build metadata;
+    /// serving keys require an index-bound transaction.
     #[must_use]
     pub fn bootstrap(raw: T) -> Self {
         Self {
@@ -812,7 +813,8 @@ pub struct MutationBuilder<'manifest> {
 }
 
 impl MutationBuilder<'static> {
-    /// Creates a builder for namespace values and Index Manifests.
+    /// Creates a builder for namespace, Manifest, and Bulk Build metadata;
+    /// serving keys require an index-bound builder.
     #[must_use]
     pub fn bootstrap(hard_limits: HardLimits, budget: AdmissionBudget) -> Self {
         Self::new(LogicalBinding::bootstrap(), hard_limits, budget)
@@ -988,7 +990,8 @@ struct ReadCacheEntry {
 }
 
 impl<T> WriteLogicalTxn<'static, T> {
-    /// Binds a write transaction to namespace values and Index Manifests.
+    /// Binds a write transaction to namespace, Manifest, and Bulk Build metadata;
+    /// serving keys require an index-bound transaction.
     #[must_use]
     pub fn bootstrap(raw: T, hard_limits: HardLimits, budget: AdmissionBudget) -> Self {
         Self {

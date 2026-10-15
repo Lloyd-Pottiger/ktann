@@ -44,6 +44,15 @@ async fn build_publish_reopen_cleanup_and_online_mutations_are_complete() {
         let index = job.complete(opts.clone()).await.unwrap();
         assert_eq!(index.logical_index_id(), id);
         assert_eq!(job.status().await.unwrap(), BulkBuildStatus::Published);
+        assert_eq!(
+            job.abort().await.unwrap_err().kind(),
+            ErrorKind::InvalidArgument
+        );
+        assert_eq!(
+            runtime.open_index("bulk").await.unwrap().logical_index_id(),
+            id
+        );
+
         assert_eq!(artifact_directories(&opts.workspace), 0);
         assert!(dir.0.join("relocated-source/data.bin").exists());
         let report = index.verify(VerifyOptions::default()).await.unwrap();

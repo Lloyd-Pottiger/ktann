@@ -61,6 +61,7 @@ pub(crate) async fn blocking<B: Backend, T: Send + 'static>(
     .await
     .map_err(|e| Error::with_source(ErrorKind::Other, e))?
 }
+/// Reads and conflict-protects the exact handle identity before lifecycle decisions.
 pub(crate) async fn manifest<T: crate::storage::backend::WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     expected: &IndexManifest,
