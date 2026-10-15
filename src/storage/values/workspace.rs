@@ -11,6 +11,7 @@ use std::{fmt, path::PathBuf};
 /// An accepted immutable artifact in an attempt-owned directory.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PreparedArtifact {
+    /// May precede the workspace epoch: takeover retains accepted attempt files.
     pub epoch: u64,
     pub manifest: ArtifactManifest,
 }
@@ -21,6 +22,7 @@ pub struct BuildWorkspace {
     pub(crate) options: BulkWorkerOptions,
     pub(crate) hard_limits: HardLimits,
     pub(crate) token: [u8; 32],
+    /// Fences preparation acceptance, independently of the loader's epoch.
     pub(crate) epoch: u64,
     pub(crate) forest: Option<PreparedArtifact>,
     pub(crate) serving: Option<PreparedArtifact>,

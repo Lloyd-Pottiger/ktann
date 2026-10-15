@@ -114,6 +114,8 @@ async fn read_proof<T: crate::storage::backend::WriteTxn>(
         _ => Err(corrupt()),
     }
 }
+/// Binds every validation/activation transaction to the same completed inventory
+/// and workspace owner; a terminal failure or lifecycle change invalidates the proof.
 async fn fence<T: crate::storage::backend::WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     index: &IndexManifest,
@@ -140,6 +142,9 @@ async fn fence<T: crate::storage::backend::WriteTxn>(
         _ => Err(corrupt()),
     }
 }
+/// Registers or recovers the validation proof over an immutable completed load.
+/// Update-protected reads serialize proof creation against publication and abort;
+/// no additional write-freeze state or unchanged Manifest write is needed.
 async fn begin_validation<B: Backend>(
     context: &mut OperationContext<B>,
     index: &IndexManifest,
@@ -276,6 +281,9 @@ async fn validate_and_publish<B: Backend>(
     }
     activate(context, index, state, &proof, retry).await
 }
+/// Compares one bounded backend page, excluding lifecycle metadata, with the
+/// artifact stream. The proof advances only with those exact comparisons; a
+/// retry recognizes its committed successor before consuming more file entries.
 async fn page<B: Backend>(
     context: &mut OperationContext<B>,
     index: &IndexManifest,
@@ -405,6 +413,8 @@ async fn page<B: Backend>(
         }
     }
 }
+/// Makes the index visible in one transaction after rechecking ownership and the
+/// completed proof. Unknown outcomes are resolved by the original index identity.
 async fn activate<B: Backend>(
     context: &mut OperationContext<B>,
     index: &IndexManifest,

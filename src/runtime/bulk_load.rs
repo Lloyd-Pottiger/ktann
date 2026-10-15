@@ -23,6 +23,8 @@ pub(crate) fn status(load: &BuildLoad) -> BulkBuildStatus {
     }
 }
 
+/// Replays any committed prefix, then writes bounded data batches together with
+/// their checkpoints. The caller-owned artifact never grants publication authority.
 pub(crate) async fn load<B: Backend>(
     context: &mut OperationContext<B>,
     index: IndexManifest,
@@ -118,6 +120,8 @@ struct Stream {
     consumed: u64,
 }
 impl Stream {
+    /// Keeps one look-ahead entry when the byte budget ends a chunk. Its digest
+    /// must not enter the checkpoint until that entry is included in a later chunk.
     fn next_chunk(
         &mut self,
         committed: u64,
@@ -193,6 +197,8 @@ async fn read_load<T: crate::storage::backend::WriteTxn>(
     }
 }
 
+/// Fixes the artifact identity and takes a load epoch. An uncertain claim is
+/// returned to the caller rather than adopting a possibly newer invocation's epoch.
 async fn claim<B: Backend>(
     context: &mut OperationContext<B>,
     index: &IndexManifest,
@@ -261,6 +267,8 @@ async fn claim<B: Backend>(
     }
 }
 
+/// Compares the full predecessor before atomically writing data and progress.
+/// Observing the exact successor resolves an unknown commit without rewriting data.
 async fn commit_chunk<B: Backend>(
     context: &mut OperationContext<B>,
     index: &IndexManifest,

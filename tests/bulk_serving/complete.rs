@@ -28,7 +28,7 @@ async fn build_publish_reopen_cleanup_and_online_mutations_are_complete() {
         let dir = Directory::new();
         let memory = MemoryBackend::new();
         let first = runtime(memory.clone());
-        let (job, _) = fixture(&first, &memory, &dir, count).await;
+        let (job, _) = reservation(&first, &dir, count).await;
         let opts = worker_options(&dir);
         job.run_worker(opts.clone()).await.unwrap();
         let id = job.logical_index_id();
@@ -104,7 +104,7 @@ async fn sealed_backend_damage_is_terminal_and_cannot_publish() {
         let dir = Directory::new();
         let memory = MemoryBackend::new();
         let runtime = runtime(memory.clone());
-        let (job, _) = fixture(&runtime, &memory, &dir, 19).await;
+        let (job, _) = reservation(&runtime, &dir, 19).await;
         let opts = worker_options(&dir);
         job.run_worker(opts.clone()).await.unwrap();
         let mut txn = memory.begin_write().await.unwrap();
@@ -233,7 +233,7 @@ async fn abort_during_native_preparation_leaves_recoverable_namespace_cleanup() 
         RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
     )
     .unwrap();
-    let (job, _) = fixture(&runtime, &memory, &dir, 19).await;
+    let (job, _) = reservation(&runtime, &dir, 19).await;
     let opts = worker_options(&dir);
     gate.arm(2);
     let worker = job.clone();
@@ -298,7 +298,7 @@ async fn worker_claim_and_artifact_acceptance_unknown_outcomes_recover() {
             let dir = Directory::new();
             let memory = MemoryBackend::with_test_config(TestConfig::default());
             let runtime = runtime(memory.clone());
-            let (job, _) = fixture(&runtime, &memory, &dir, 19).await;
+            let (job, _) = reservation(&runtime, &dir, 19).await;
             let opts = worker_options(&dir);
             let mut plan = vec![CommitFault::Normal; position];
             plan.push(fault);
@@ -371,7 +371,7 @@ async fn preparation_failure_is_durable_and_partial_files_are_owned_until_abort(
     let dir = Directory::new();
     let memory = MemoryBackend::new();
     let runtime = runtime(memory.clone());
-    let (job, _) = fixture(&runtime, &memory, &dir, 19).await;
+    let (job, _) = reservation(&runtime, &dir, 19).await;
     let mut opts = worker_options(&dir);
     opts.max_artifact_bytes = 100;
     assert_eq!(
@@ -406,7 +406,7 @@ async fn cleanup_outcome_unknown_and_pagination_are_recoverable_after_drop() {
     let dir = Directory::new();
     let memory = MemoryBackend::with_test_config(TestConfig::default());
     let runtime = runtime(memory.clone());
-    let (job, _) = fixture(&runtime, &memory, &dir, 19).await;
+    let (job, _) = reservation(&runtime, &dir, 19).await;
     let opts = worker_options(&dir);
     job.run_worker(opts.clone()).await.unwrap();
     // The ordinary drop path removes index data but retains the cleanup ledger.
@@ -443,7 +443,7 @@ async fn concurrent_publishers_resolve_the_same_active_identity() {
         RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
     )
     .unwrap();
-    let (job, _) = fixture(&runtime, &memory, &dir, 19).await;
+    let (job, _) = reservation(&runtime, &dir, 19).await;
     job.run_worker(worker_options(&dir)).await.unwrap();
     gate.arm(2);
     let other = job.clone();
@@ -470,7 +470,7 @@ async fn preparation_takeover_fences_the_old_artifact_acceptance() {
         RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
     )
     .unwrap();
-    let (job, _) = fixture(&runtime, &memory, &dir, 19).await;
+    let (job, _) = reservation(&runtime, &dir, 19).await;
     let opts = worker_options(&dir);
     gate.arm(2);
     let old = job.clone();
@@ -501,7 +501,7 @@ async fn premature_publish_does_not_fail_an_in_progress_load() {
             RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
         )
         .unwrap();
-        let (job, _) = fixture(&runtime, &memory, &dir, 19).await;
+        let (job, _) = reservation(&runtime, &dir, 19).await;
         assert_eq!(
             job.publish().await.unwrap_err().kind(),
             ErrorKind::BulkBuildBusy
@@ -547,7 +547,7 @@ async fn complete_resumes_after_concurrent_publication_and_reclaimed_paths() {
         RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
     )
     .unwrap();
-    let (job, _) = fixture(&runtime, &memory, &dir, 73).await;
+    let (job, _) = reservation(&runtime, &dir, 73).await;
     let options = worker_options(&dir);
     gate.arm(1);
     let worker = job.clone();
@@ -654,7 +654,7 @@ async fn completed_validation_publishes_without_reopening_artifacts() {
         RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
     )
     .unwrap();
-    let (job, _) = fixture(&runtime, &memory, &dir, 0).await;
+    let (job, _) = reservation(&runtime, &dir, 0).await;
     let options = worker_options(&dir);
     job.run_worker(options.clone()).await.unwrap();
     gate.arm(3); // registration and the one empty-inventory page precede activation
@@ -705,7 +705,7 @@ async fn complete_retries_when_validation_wins_before_worker_takeover() {
         RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
     )
     .unwrap();
-    let (job, _) = fixture(&runtime, &memory, &dir, 19).await;
+    let (job, _) = reservation(&runtime, &dir, 19).await;
     let options = worker_options(&dir);
     job.run_worker(options.clone()).await.unwrap();
     let lock = fs::OpenOptions::new()

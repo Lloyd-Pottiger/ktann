@@ -27,12 +27,11 @@ fn load_options() -> BulkLoadOptions {
         max_bytes: 2048,
     }
 }
-async fn fixture<B: Backend>(
+async fn reservation<B: Backend>(
     runtime: &Runtime<B>,
-    memory: &MemoryBackend,
     dir: &Directory,
     count: u64,
-) -> (BulkBuildJob<B>, ServingArtifact) {
+) -> (BulkBuildJob<B>, InputSnapshot) {
     let input = InputSnapshot::create(
         &dir.0.join("source"),
         config(Metric::L2, true),
@@ -54,6 +53,16 @@ async fn fixture<B: Backend>(
         )
         .await
         .unwrap();
+    (job, input)
+}
+
+async fn fixture<B: Backend>(
+    runtime: &Runtime<B>,
+    memory: &MemoryBackend,
+    dir: &Directory,
+    count: u64,
+) -> (BulkBuildJob<B>, ServingArtifact) {
+    let (job, input) = reservation(runtime, dir, count).await;
     let (forest, _) = ForestArtifact::build(
         &dir.0.join("forest"),
         &input,

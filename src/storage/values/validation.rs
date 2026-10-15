@@ -10,9 +10,13 @@ use bytes::Bytes;
 #[derive(Clone, Eq, PartialEq)]
 pub struct BuildValidation {
     pub(crate) artifact: ArtifactManifest,
+    /// Backend continuation key, advancing past both serving and lifecycle keys.
     pub(crate) cursor: Bytes,
+    /// Compared serving entries only; lifecycle metadata is excluded.
     pub(crate) entries: u64,
+    /// Artifact-stream digest through the last compared entry, used on replay.
     pub(crate) prefix_sha256: [u8; 32],
+    /// Both streams are exhausted and their full inventory has been compared.
     pub(crate) complete: bool,
 }
 impl BuildValidation {

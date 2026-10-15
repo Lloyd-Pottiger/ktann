@@ -41,6 +41,8 @@ pub(crate) fn lock_root(root: &Path, exclusive: bool) -> Result<File> {
     })?;
     Ok(lock)
 }
+/// Retains CPU admission until native work exits, even if its async waiter is
+/// dropped. Callers capture any filesystem lock needed by that detached work.
 pub(crate) async fn blocking<B: Backend, T: Send + 'static>(
     context: &OperationContext<B>,
     work: impl FnOnce() -> Result<T> + Send + 'static,
@@ -160,6 +162,8 @@ pub(crate) async fn complete<B: Backend>(
     }
 }
 
+/// Runs one preparation/loading attempt, reusing accepted artifacts. Publication
+/// remains a separate phase, and terminal failures are recorded only by its owner.
 pub(crate) async fn run<B: Backend>(
     context: &mut OperationContext<B>,
     index: IndexManifest,
@@ -182,6 +186,8 @@ pub(crate) async fn run<B: Backend>(
     }
     result
 }
+/// Takes a preparation epoch while retaining accepted outputs from prior attempts.
+/// Once validation owns the next phase, this worker cannot supersede it.
 async fn claim<B: Backend>(
     context: &mut OperationContext<B>,
     index: &IndexManifest,
@@ -260,6 +266,8 @@ async fn claim<B: Backend>(
         }
     }
 }
+/// Reuses accepted Serving bytes without source IO; otherwise prepares the
+/// missing artifacts in the current attempt before handing them to the loader.
 async fn prepare_and_load<B: Backend>(
     context: &mut OperationContext<B>,
     index: &IndexManifest,
@@ -403,6 +411,8 @@ async fn prepare_and_load<B: Backend>(
     )
     .await
 }
+/// Publishes accepted outputs or terminal failure only for the exact claimed
+/// workspace state. Reading the successor makes uncertain commits idempotent.
 async fn accept<B: Backend>(
     context: &mut OperationContext<B>,
     index: &IndexManifest,
@@ -456,6 +466,8 @@ async fn accept<B: Backend>(
         }
     }
 }
+/// Persists terminal failures for the current owner; cancellation, contention,
+/// and lost ownership must leave the build resumable rather than poison it.
 pub(crate) async fn record_failure<B: Backend>(
     context: &mut OperationContext<B>,
     index: &IndexManifest,
