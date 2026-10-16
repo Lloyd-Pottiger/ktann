@@ -111,7 +111,7 @@ impl Drop for Bridge {
 fn staged_bulk_build_publishes_and_reports_real_build_phases() {
     let mut bridge = Bridge::start();
     assert_eq!(
-        bridge.request(json!({"op":"reset","dimension":4,"metric":"L2","dataset":"bulk-test"}))["ok"],
+        bridge.request(json!({"op":"reset","dimension":4,"metric":"L2","refinement_rounds":2,"refinement_input_bytes":33554432,"dataset":"bulk-test"}))["ok"],
         true
     );
     for start in [0, 50, 100, 150] {
@@ -146,7 +146,9 @@ fn staged_bulk_build_publishes_and_reports_real_build_phases() {
     .unwrap();
     assert_eq!(report["build_mode"], "bulk");
     assert_eq!(report["ready"], true);
-    assert!(report["phases"]["committed_import_seconds"].is_null());
+    assert!(report["phases"]["refinement_seconds"].as_f64().unwrap() > 0.);
+    assert_eq!(report["refinement"]["rounds"], 2);
+    assert_eq!(report["refinement"]["input_bytes"], 33554432);
     for phase in [
         "snapshot_seconds",
         "prepare_load_seconds",
@@ -160,7 +162,7 @@ fn staged_bulk_build_publishes_and_reports_real_build_phases() {
 fn duplicate_staged_ids_fail_before_publication() {
     let mut bridge = Bridge::start();
     assert_eq!(
-        bridge.request(json!({"op":"reset","dimension":4,"metric":"L2","dataset":"duplicate"}))["ok"],
+        bridge.request(json!({"op":"reset","dimension":4,"metric":"L2","refinement_rounds":2,"refinement_input_bytes":33554432,"dataset":"duplicate"}))["ok"],
         true
     );
     let response = bridge.insert(&[1, 1], &[vec![1., 2., 3., 4.], vec![2., 3., 4., 5.]]);
@@ -174,4 +176,47 @@ fn duplicate_staged_ids_fail_before_publication() {
         false
     );
     bridge.stop();
+}
+
+#[test]
+fn refinement_limit_failure_keeps_search_closed_after_bulk_publication() {
+    let mut bridge = Bridge::start();
+    assert_eq!(
+        bridge.request(
+            json!({"op":"reset","dimension":4,"metric":"L2","dataset":"limit",
+            "refinement_rounds":2,"refinement_input_bytes":1})
+        )["ok"],
+        true
+    );
+    assert_eq!(bridge.insert(&[1], &[vec![1., 2., 3., 4.]])["ok"], true);
+    for _ in 0..2 {
+        let response = bridge.request(json!({"op":"optimize","records":1}));
+        assert_eq!(response["ok"], false);
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("LimitExceeded")
+        );
+        assert_eq!(
+            bridge.request(json!({"op":"search","vector":[1.,2.,3.,4.],"k":1}))["ok"],
+            false
+        );
+    }
+    bridge.stop();
+    let report: Value = serde_json::from_slice(
+        &std::fs::read(bridge.directory.path().join("report.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(report["ready"], false);
+    assert!(report["bulk_build"].is_object());
+    let optimize = report["phases"]["optimize_seconds"].as_f64().unwrap();
+    let refinement = report["phases"]["refinement_seconds"].as_f64().unwrap();
+    let build = report["bulk_build"]["prepare_load_seconds"]
+        .as_f64()
+        .unwrap()
+        + report["bulk_build"]["validate_publish_cleanup_seconds"]
+            .as_f64()
+            .unwrap();
+    assert!(refinement > 0. && optimize >= build + refinement);
 }

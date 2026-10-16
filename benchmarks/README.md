@@ -258,47 +258,90 @@ local baselines; `git_revision` has a `-dirty` suffix when the workspace changes
 VectorDBBench's loader, optimizer, and search workers. The Python adapter and
 process tests live in the [VectorDBBench repository](https://github.com/Lloyd-Pottiger/VectorDBBench).
 
-The bridge supports RocksDB and FoundationDB, single-tenant IDs-only L2/cosine
-search, and signed 64-bit record IDs. Each record stores its ID in an `i64` filter
-field. Search accepts an optional inclusive `id_min` threshold, evaluated by the
-native exact predicate before candidate selection. This supports VectorDBBench
-Cohere 1M unfiltered, 1% excluded, and 99% excluded cases. The bridge uses the
-public IndexConfig and backend adapter defaults, including partition entries
-64/512. The bridge raises the Runtime foreground attempt limit from 8 to 32
-for finite imports contending with topology maintenance; fixup attempts and
-bounded backoff remain unchanged. Only an explicit client leaf-beam option
-overrides search defaults. Native diagnostics read the effective index and Runtime
-configuration without changing canonical VectorDBBench metrics. Optimize
-scans at most 262,144 allocated header slots per readiness round and advances
-at most 32 actionable split/merge sources through the existing bounded
-maintenance steps, alongside Runtime workers. Authority is re-read by each
-step. Successful steps immediately start another readiness round; a round
-that cannot advance any selected source waits one second. This recovers cold work without depending on approximate search routing;
-receiving split destinations are not scheduled independently. These steps are
-separate from measured searches.
+The bridge always uses Bulk Build followed by offline refinement. It supports
+RocksDB and FoundationDB, single-tenant IDs-only L2/cosine search, signed 64-bit
+record IDs, and an optional inclusive `id_min` predicate. This supports Cohere
+1M unfiltered, 1% excluded, and 99% excluded cases, plus custom ANN performance
+cases. Incremental online and read/write workloads are not supported.
 
-Protocol version 1 uses a four-byte big-endian frame length over a Unix socket,
-at most 8 MiB per frame and at most 128 connections. Control/search requests and
-responses are JSON. Inserts carry `KTI` plus byte version 1, big-endian u32 record
-count and dimension, then little-endian i64 IDs and row-major little-endian f32
-vectors. JSON inserts are rejected; client and bridge must be updated together.
-Inserts commit at most 50 records per batch and wait for the atomic batch result
-before success in online mode. Bulk receipt acknowledges capture of the batch;
-it is not per-batch durability or a published index.
-Do not automatically replay unknown outcomes. Optimize verifies the exact record
-count and waits for no actionable or transitional partitions within a deadline.
-Definitely aborted attempts may retry within the configured bound. Maintenance
-commit uncertainty is resolved by the next authority read; online insert
-commit uncertainty is returned to the caller.
+### Lifecycle and controls
+
+Insert requests capture bounded batches through `PreparedInputWriter`, which
+writes canonical source frames, hashes, and receipt-time sort runs. A successful
+insert acknowledges capture, not per-batch durability or publication. No
+`batch_mutate` path is used. Duplicate IDs can be detected when Optimize builds
+the index rather than when a batch is received; unknown inserts must not be
+replayed automatically.
+
+Optimize checks the expected record count, seals the Input Snapshot, then runs
+preparation, loading, exact validation and atomic publication. It next calls
+`Index::refine` and checks topology readiness before admitting search. A successful
+repeated Optimize returns the existing result without rebuilding or refining.
+If refinement fails, search stays closed and a retry refines the already published
+index. The bridge holds exclusive access throughout refinement and disables its
+Runtime maintenance workers. Shutdown cancels at operation checkpoints and waits
+for admitted work before dropping the index; socket timeouts do not release
+exclusive access from an unfinished operation.
+
+The Python client defaults to two refinement rounds and a 32 GiB input limit.
+Use `--refinement-rounds 0..5` and `--refinement-input-bytes BYTES` to configure
+these explicitly. Zero rounds still loads the index and refreshes centroids; it
+does not disable refinement. The input limit covers loaded vectors, IDs,
+centroids and topology, not total RSS: planning and migration proposals require
+additional memory. Exceeding the input limit fails Optimize rather than silently
+skipping refinement.
+
+Construction uses IndexConfig defaults (64/512 partition entries), a sample cap
+of 1024, 256 MiB tree memory and 64 GiB tree scratch. Only an explicit leaf-beam
+option changes the search defaults. Header readiness reads at most 262,144
+allocated slots; it is not a replacement for full integrity verification.
+
+### Running
 
 ```sh
 cargo build --release -p ktann-benchmarks --bin ktann-vdbbench-bridge
+target/release/ktann-vdbbench-bridge --backend rocksdb \
+  --socket /tmp/ktann-bench.sock --database /tmp/ktann-bench-db \
+  --report /tmp/ktann-bridge.json --bulk-workspace /tmp/ktann-bulk
 ```
 
-For FoundationDB, add `--all-features` and configure its native client and cluster.
-Install the VectorDBBench checkout with `pip install -e .`; its
-`vectordb_bench/backend/clients/ktann/README.md` documents startup and CLI usage.
-Run its process tests from that checkout:
+`--bulk-workspace` is required and must name a new absolute directory. Use a
+fresh bridge, workspace and dedicated backend location for each case. For
+FoundationDB, build with `--all-features` and configure its native client and
+cluster; `--database` then specifies the backend namespace. Startup never unlinks
+a preexisting socket. After a crash, confirm that the old process exited before
+removing its stale socket. Source snapshots and reports remain caller-owned;
+core-owned preparation files are reclaimed after publication.
+
+Install the VectorDBBench checkout with `pip install -e .`, then run:
+
+```sh
+vectordbbench ktann --socket-path /tmp/ktann-bench.sock \
+  --dataset-identity cohere-1m --case-type Performance768D1M \
+  --load-concurrency 1 --insert-batch-size 50 --k 100 \
+  --refinement-rounds 2 --refinement-input-bytes 34359738368
+```
+
+The private protocol is v1, with a big-endian u32 frame length, an 8 MiB frame
+limit and at most 128 connections. Control/search and responses are JSON.
+Binary inserts carry `KTI` plus byte version 1, big-endian u32 count/dimension,
+little-endian i64 IDs and row-major f32 values, with at most 50 records per batch.
+The reset request carries `refinement_rounds` and `refinement_input_bytes`.
+JSON inserts are rejected; update the client and bridge together.
+
+### Measurements and tests
+
+Canonical insert time measures input capture. Optimize time includes Bulk Build,
+refinement and readiness checks; canonical total load time includes both phases.
+Native reports identify `build_mode: bulk`, the refinement configuration,
+`phases.input_staging_seconds`, `phases.refinement_seconds`, total
+`phases.optimize_seconds`, and detailed Bulk Build stages. Optimize and refinement timers
+accumulate failed attempts as well as successful ones. Successful repeated
+Optimize calls leave those measurements unchanged. Compare identical datasets,
+query sets, construction/refinement settings and backend budgets; do not compare
+receipt-only timing with committed online insertion throughput.
+
+Run Python process tests against the matching bridge:
 
 ```sh
 export KTANN_BRIDGE_BIN=/path/to/ktann/target/release/ktann-vdbbench-bridge
@@ -307,59 +350,9 @@ KTANN_TEST_BACKEND=foundationdb python -m unittest discover \
   -s tests -p 'test_ktann_bridge.py' -v
 ```
 
-Use a fresh bridge and dedicated backend location per case. Shutdown finishes
-import, drops the Logical Index, and removes the socket. After a crash, confirm
-the old process has exited before removing its stale socket; startup never
-unlinks a preexisting socket.
-
-### Bulk Build through VectorDBBench
-
-Pass `--bulk-workspace /absolute/new/directory` to `ktann-vdbbench-bridge` to
-measure the core Bulk Build path. Use a fresh bridge, RocksDB directory and
-workspace for each case. The Python adapter and canonical runner remain unchanged.
-Insert requests stage bounded batches of original IDs/vectors; they do not write
-serving data. Optimize seals an InputSnapshot, reserves the Building index, calls
-`complete` to prepare, load, validate, and atomically activate the index.
-Search remains unavailable until publication and topology readiness succeed.
-
-The native report identifies `build_mode: bulk` and records input staging,
-snapshot creation, preparation/loading, and validation/publication/cleanup times.
-`committed_import_seconds` is null in this mode: canonical load time measures
-input receipt, while canonical load plus optimize/index time covers the build.
-Bulk receipt writes canonical source frames and their hashes directly through
-`PreparedInputWriter`, which also performs bounded receipt-time sorting,
-without a raw staging file or EOF rewrite. `snapshot_seconds`
-measures only final flush, fsync and sealing; record encoding/hashing is
-included in receipt. The source snapshot and report remain caller-owned;
-successful publication reclaims core attempts. Forest construction still begins
-after EOF seals the source; this is incremental input preparation, not streaming
-final tree assignment.
-Construction uses the index's min/max defaults, a training sample cap of 1024,
-256 MiB tree memory, and 64 GiB tree scratch; the report records worker limits.
-No online insertion or post-build refinement is substituted into this path.
-
-For an online/bulk comparison, use the same release binary, dataset identity,
-backend settings, query set and concurrency. Run serially on an otherwise idle
-host with fresh database, socket and report locations. Enable
-`--bulk-workspace` only for the bulk case. The Cohere workload is:
-
-```sh
-vectordbbench ktann --socket-path /tmp/ktann-bench.sock \
-  --dataset-identity cohere-1m --case-type Performance768D1M \
-  --load-concurrency 1 --insert-batch-size 50 --k 100
-```
-
-Compare complete receive-to-Ready time and query latency/QPS at matched recall;
-equal beam does not imply equal quality. Record stage times, physical IO, scratch
-peak, CPU, page faults and RSS. Distinguish Ready RSS from the full-run peak, and
-fixed-query diagnostics from canonical timed QPS. Repeat both modes and include
-small/skewed inputs, long IDs and constrained-memory spill paths alongside the
-large dataset profiles.
-
-Keep measured reports under `.benchmark-data/results/`, with the source revision,
-binary hash, settings, dataset identity and raw evidence. Results apply to that
-configuration; a changed binary needs a new measurement. Local performance
-reports are not versioned design contracts or a universal speedup guarantee.
+Keep local reports under `.benchmark-data/results/` with source revision, binary
+hash, settings, dataset identity and raw evidence. These checks do not establish
+large-dataset throughput, recall, peak memory or multi-host filesystem behavior.
 
 ### Offline refinement after import
 
