@@ -6,10 +6,11 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use ktann::api::{
-    CompareOp, DataType, FieldId, FieldSchema, Index, IndexConfig, Metric, Mutation, Predicate,
-    Record, RuntimeConfig, SearchOptions, SearchRequest, Value as FieldValue,
+    CompareOp, DataType, FieldId, FieldSchema, Index, IndexConfig, Metric, OperationOptions,
+    Predicate, Record, RefineOptions, RuntimeConfig, SearchOptions, SearchRequest,
+    Value as FieldValue,
 };
-use ktann::runtime::{RetryPolicy, Runtime};
+use ktann::runtime::Runtime;
 use ktann::storage::backend::Backend;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -39,7 +40,6 @@ struct Options {
     database: PathBuf,
     report: PathBuf,
     backend: String,
-    bulk_workspace: Option<PathBuf>,
 }
 
 /// Runs a single bridge until shutdown or SIGINT, then closes the Runtime.
@@ -53,7 +53,6 @@ pub fn run() -> Result<(), String> {
         database: PathBuf::new(),
         report: PathBuf::new(),
         backend: "rocksdb".into(),
-        bulk_workspace: None,
     };
     while let Some(arg) = args.next() {
         let value = args.next().ok_or(
@@ -64,7 +63,6 @@ pub fn run() -> Result<(), String> {
             "--database" => options.database = value.into(),
             "--report" => options.report = value.into(),
             "--backend" => options.backend = value,
-            "--bulk-workspace" => options.bulk_workspace = Some(value.into()),
             _ => return Err(format!("unknown argument {arg}")),
         }
     }
@@ -142,6 +140,8 @@ enum Operation {
         metric: String,
         dataset: String,
         leaf_beam: Option<u32>,
+        refinement_rounds: usize,
+        refinement_input_bytes: usize,
     },
     #[serde(skip_deserializing)]
     Insert {
@@ -221,6 +221,9 @@ struct State<B: Backend> {
     started: Option<Instant>,
     insert_seconds: f64,
     optimize_seconds: f64,
+    refinement_seconds: f64,
+    refinement_rounds: usize,
+    refinement_input_bytes: usize,
     topology: Value,
 }
 
@@ -239,6 +242,9 @@ impl<B: Backend> Default for State<B> {
             started: None,
             insert_seconds: 0.0,
             optimize_seconds: 0.0,
+            refinement_seconds: 0.0,
+            refinement_rounds: 0,
+            refinement_input_bytes: 0,
             topology: Value::Null,
         }
     }
@@ -278,7 +284,7 @@ impl Default for Measurements {
 /// Shared process owner. No KTANN handle crosses the Python process boundary.
 struct Service<B: Backend> {
     runtime: Runtime<MeasuredBackend<B>>,
-    bulk_workspace: Option<PathBuf>,
+    bulk_workspace: PathBuf,
     backend: MeasuredBackend<B>,
     state: RwLock<State<B>>,
     measurements: Mutex<Measurements>,
@@ -311,16 +317,18 @@ async fn serve<B: Backend>(backend: B, identity: String, options: &Options) -> R
         backend.admission_budget()
     );
     let (backend, counters) = MeasuredBackend::new(backend);
-    // A finite import may contend with several topology workers on one tree.
-    // Extend the existing whole-operation abort retry budget, not unknown commits.
-    let config = RuntimeConfig::default();
-    let config = config
-        .clone()
-        .with_attempts(config.fixup_attempts(), 32)
+    // Bulk Build creates settled topology; refinement requires exclusive access.
+    let config = RuntimeConfig::default()
+        .with_maintenance(0, 1)
+        .map_err(|e| e.to_string())?;
+    // Keep captured input and build files alive through retries and runtime shutdown.
+    let workspace = tempfile::Builder::new()
+        .prefix("ktann-vdbbench-")
+        .tempdir()
         .map_err(|e| e.to_string())?;
     let service = Arc::new(Service {
         runtime: Runtime::new(backend.clone(), config).map_err(|e| e.to_string())?,
-        bulk_workspace: options.bulk_workspace.clone(),
+        bulk_workspace: workspace.path().join("bulk"),
         backend,
         state: RwLock::new(State::default()),
         measurements: Mutex::new(Measurements::default()),
@@ -377,28 +385,23 @@ fn write_report(path: &Path, report: &Value) -> Result<(), String> {
 }
 
 async fn connection<B: Backend>(mut stream: UnixStream, service: Arc<Service<B>>) {
-    loop {
-        let response = tokio::select! {
-            _ = service.stop.cancelled() => return,
-            result = tokio::time::timeout(REQUEST_TIMEOUT, exchange(&mut stream, &service)) => result,
-        };
-        if !matches!(response, Ok(Ok(()))) {
-            return;
-        }
-    }
+    while exchange(&mut stream, &service).await.is_ok() {}
 }
 
-/// Processes one length-bounded request and response, recording decode and execution time separately.
+/// Bounds socket IO while admitted operations retain exclusive access until they finish.
 async fn exchange<B: Backend>(stream: &mut UnixStream, service: &Service<B>) -> Result<(), String> {
-    let size = stream.read_u32().await.map_err(|e| e.to_string())? as usize;
-    if size == 0 || size > MAX_FRAME {
-        return Err("invalid frame length".into());
-    }
-    let mut data = vec![0; size];
-    stream
-        .read_exact(&mut data)
-        .await
-        .map_err(|e| e.to_string())?;
+    let data = tokio::select! {
+        _ = service.stop.cancelled() => return Err("bridge stopped".into()),
+        result = tokio::time::timeout(REQUEST_TIMEOUT, async {
+            let size = stream.read_u32().await.map_err(|e| e.to_string())? as usize;
+            if size == 0 || size > MAX_FRAME {
+                return Err("invalid frame length".into());
+            }
+            let mut data = vec![0; size];
+            stream.read_exact(&mut data).await.map_err(|e| e.to_string())?;
+            Ok::<_, String>(data)
+        }) => result.map_err(|e| e.to_string())??,
+    };
     let start = Instant::now();
     let parsed = decode_request(&data);
     let decoded = start.elapsed().as_secs_f64();
@@ -429,17 +432,19 @@ async fn exchange<B: Backend>(stream: &mut UnixStream, service: &Service<B>) -> 
             .expect("measurement mutex poisoned");
         m.decode_seconds += decoded;
         m.encode_seconds += start.elapsed().as_secs_f64();
-        m.received_bytes += size as u64;
+        m.received_bytes += data.len() as u64;
         m.sent_bytes += response.len() as u64;
     }
-    stream
-        .write_u32(u32::try_from(response.len()).map_err(|e| e.to_string())?)
-        .await
-        .map_err(|e| e.to_string())?;
-    stream
-        .write_all(&response)
-        .await
-        .map_err(|e| e.to_string())?;
+    tokio::select! {
+        _ = service.stop.cancelled() => return Err("bridge stopped".into()),
+        result = tokio::time::timeout(REQUEST_TIMEOUT, async {
+            stream
+                .write_u32(u32::try_from(response.len()).map_err(|e| e.to_string())?)
+                .await
+                .map_err(|e| e.to_string())?;
+            stream.write_all(&response).await.map_err(|e| e.to_string())
+        }) => result.map_err(|e| e.to_string())??,
+    }
     if shutdown {
         service.stop.cancel();
     }
@@ -474,7 +479,12 @@ impl<B: Backend> Service<B> {
                 metric,
                 dataset,
                 leaf_beam,
+                refinement_rounds,
+                refinement_input_bytes,
             } => {
+                RefineOptions::new(refinement_input_bytes)
+                    .and_then(|options| options.with_refinement_rounds(refinement_rounds))
+                    .map_err(api_error)?;
                 if dataset.is_empty() || dataset.len() > 1024 {
                     return Err(invalid("dataset identity required (at most 1024 bytes)"));
                 }
@@ -499,22 +509,15 @@ impl<B: Backend> Service<B> {
                     .drop_index("vdbbench")
                     .await
                     .map_err(api_error)?;
-                if let Some(root) = &self.bulk_workspace {
-                    let root = root.clone();
-                    state.bulk = Some(
-                        tokio::task::spawn_blocking(move || bulk::InputCapture::new(root, config))
-                            .await
-                            .map_err(|e| ("other", e.to_string()))?
-                            .map_err(api_error)?,
-                    );
-                } else {
-                    state.index = Some(
-                        self.runtime
-                            .create_index("vdbbench", config)
-                            .await
-                            .map_err(api_error)?,
-                    );
-                }
+                let root = self.bulk_workspace.clone();
+                state.bulk = Some(
+                    tokio::task::spawn_blocking(move || bulk::InputCapture::new(root, config))
+                        .await
+                        .map_err(|e| ("other", e.to_string()))?
+                        .map_err(api_error)?,
+                );
+                state.refinement_rounds = refinement_rounds;
+                state.refinement_input_bytes = refinement_input_bytes;
                 state.dimension = dimension;
                 state.metric = metric;
                 state.dataset = dataset;
@@ -548,31 +551,17 @@ impl<B: Backend> Service<B> {
                 }
                 let start = Instant::now();
                 state.started.get_or_insert(start);
-                if self.bulk_workspace.is_some() {
-                    let staging = state
-                        .bulk
-                        .take()
-                        .ok_or_else(|| invalid("bulk input already sealed or failed"))?;
-                    state.bulk = Some(
-                        tokio::task::spawn_blocking(move || staging.append(records))
-                            .await
-                            .map_err(|e| ("other", e.to_string()))?
-                            .map_err(api_error)?,
-                    );
-                } else {
-                    let index = state
-                        .index
-                        .as_ref()
-                        .ok_or_else(|| invalid("reset required"))?;
-                    let outcome = index
-                        .batch_mutate(records.into_iter().map(Mutation::Insert).collect())
-                        .await;
-                    state.insert_seconds += start.elapsed().as_secs_f64();
-                    outcome.map_err(api_error)?;
-                }
-                if self.bulk_workspace.is_some() {
-                    state.insert_seconds += start.elapsed().as_secs_f64();
-                }
+                let staging = state
+                    .bulk
+                    .take()
+                    .ok_or_else(|| invalid("bulk input already sealed or failed"))?;
+                state.bulk = Some(
+                    tokio::task::spawn_blocking(move || staging.append(records))
+                        .await
+                        .map_err(|e| ("other", e.to_string()))?
+                        .map_err(api_error)?,
+                );
+                state.insert_seconds += start.elapsed().as_secs_f64();
                 state.records += ids.len() as u64;
                 Ok(json!({"inserted":ids.len()}))
             }
@@ -581,100 +570,49 @@ impl<B: Backend> Service<B> {
                 if state.records != records || records == 0 {
                     return Err(invalid("optimize record count mismatch or empty dataset"));
                 }
-                if self.bulk_workspace.is_some() {
-                    if state.ready {
-                        return Ok(state.topology.clone());
+                if state.ready {
+                    return Ok(state.topology.clone());
+                }
+                let start = Instant::now();
+                let result = async {
+                    let control = OperationOptions::default()
+                        .with_deadline(start + REQUEST_TIMEOUT)
+                        .with_cancellation(self.stop.clone());
+                    // Retain a published index if refinement fails, so retries do not
+                    // consume the source or repeat Bulk Build.
+                    if state.index.is_none() {
+                        let staging = state
+                            .bulk
+                            .take()
+                            .ok_or_else(|| invalid("bulk input already sealed or failed"))?;
+                        let (index, report) = bulk::build(&self.runtime, staging, control.clone())
+                            .await
+                            .map_err(api_error)?;
+                        state.index = Some(index);
+                        state.bulk_report = report;
                     }
-                    let start = Instant::now();
-                    let staging = state
-                        .bulk
-                        .take()
-                        .ok_or_else(|| invalid("bulk input already sealed or failed"))?;
-                    let (index, report) = bulk::build(&self.runtime, staging)
-                        .await
+                    let index = state.index.as_ref().expect("bulk build published").clone();
+                    let options = RefineOptions::new(state.refinement_input_bytes)
+                        .and_then(|options| options.with_refinement_rounds(state.refinement_rounds))
                         .map_err(api_error)?;
+                    let refinement_started = Instant::now();
+                    let result = index.refine(options.with_operation_options(control)).await;
+                    state.refinement_seconds += refinement_started.elapsed().as_secs_f64();
+                    result.map_err(api_error)?;
                     let snapshot =
-                        topology::snapshot(&self.backend, index.logical_index_id(), records, false)
+                        topology::snapshot(&self.backend, index.logical_index_id(), records)
                             .await
                             .map_err(api_error)?;
                     if !snapshot.ready {
-                        return Err(("corruption", "published bulk topology is not ready".into()));
+                        return Err(("corruption", "refined bulk topology is not ready".into()));
                     }
-                    state.index = Some(index);
-                    state.bulk_report = report;
-                    state.topology = snapshot.facts.clone();
+                    state.topology = snapshot.facts;
                     state.ready = true;
-                    state.optimize_seconds = start.elapsed().as_secs_f64();
-                    return Ok(state.topology.clone());
+                    Ok(state.topology.clone())
                 }
-                let index = state
-                    .index
-                    .as_ref()
-                    .ok_or_else(|| invalid("reset required"))?
-                    .clone();
-                let start = Instant::now();
-                let deadline = start + Duration::from_secs(3500);
-                let mut previous_progress = None;
-                let retry = RetryPolicy::for_fixup(self.runtime.config());
-
-                loop {
-                    if Instant::now() >= deadline {
-                        return Err((
-                            "timeout",
-                            format!(
-                                "topology readiness deadline exceeded; last snapshot: {}",
-                                state.topology
-                            ),
-                        ));
-                    }
-                    let snapshot = tokio::time::timeout_at(
-                        tokio::time::Instant::from_std(deadline),
-                        topology::snapshot(&self.backend, index.logical_index_id(), records, true),
-                    )
-                    .await
-                    .map_err(|_| {
-                        (
-                            "timeout",
-                            format!(
-                                "topology snapshot deadline exceeded; last snapshot: {}",
-                                state.topology
-                            ),
-                        )
-                    })?
-                    .map_err(api_error)?;
-                    state.topology = snapshot.facts.clone();
-                    if snapshot.ready {
-                        state.ready = true;
-                        state.optimize_seconds = start.elapsed().as_secs_f64();
-                        return Ok(state.topology.clone());
-                    }
-                    if previous_progress != Some(snapshot.progress) {
-                        eprintln!(
-                            "optimize audit after {:.1}s: {}",
-                            start.elapsed().as_secs_f64(),
-                            state.topology
-                        );
-                        previous_progress = Some(snapshot.progress);
-                    }
-                    let progressed = tokio::time::timeout_at(
-                        tokio::time::Instant::from_std(deadline),
-                        snapshot.advance(&self.backend, &retry),
-                    )
-                    .await
-                    .map_err(|_| {
-                        (
-                            "timeout",
-                            format!(
-                                "maintenance deadline exceeded; last snapshot: {}",
-                                state.topology
-                            ),
-                        )
-                    })?
-                    .map_err(api_error)?;
-                    if !progressed {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
-                }
+                .await;
+                state.optimize_seconds += start.elapsed().as_secs_f64();
+                result
             }
             Operation::Search { vector, k, id_min } => {
                 let state = self.state.read().await;
@@ -779,13 +717,12 @@ impl<B: Backend> Service<B> {
                 "foreground_attempts": runtime_config.foreground_attempts(),
                 "fixup_attempts": runtime_config.fixup_attempts(),
                 "readiness_header_slot_limit": topology::MAX_HEADER_SLOTS,
-                "readiness_advance_limit": topology::MAX_ADVANCE_STEPS,
                 "readiness_idle_interval_seconds": 1,
             },
             "continuous_first_insert_through_final_search_seconds": state.started.zip(m.last_search).map(|(a,b)| b.duration_since(a).as_secs_f64()),
             "phases": {
-                "committed_import_seconds": self.bulk_workspace.is_none().then_some(state.insert_seconds),
-                "input_staging_seconds": self.bulk_workspace.is_some().then_some(state.insert_seconds),
+                "input_staging_seconds": state.insert_seconds,
+                "refinement_seconds": state.refinement_seconds,
                 "optimize_seconds": state.optimize_seconds,
                 "ktann_search_seconds_sum": m.search_seconds
             },
@@ -801,7 +738,8 @@ impl<B: Backend> Service<B> {
             "search_usage_totals": m.budget,
             "search_exhaustion_counts": m.exhausted,
             "topology": state.topology,
-            "build_mode": if self.bulk_workspace.is_some() { "bulk" } else { "online" },
+            "build_mode": "bulk",
+            "refinement": {"rounds": state.refinement_rounds, "input_bytes": state.refinement_input_bytes},
             "bulk_build": state.bulk_report,
             "resource": { "peak_rss_bytes": resources.peak_rss_bytes(), "cpu_seconds": resources.cpu_seconds_since(self.baseline) },
             "backend_io": self.counters.snapshot(),

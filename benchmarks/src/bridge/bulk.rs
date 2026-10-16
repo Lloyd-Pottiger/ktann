@@ -1,5 +1,7 @@
 //! Streaming input capture and real core Bulk Build for the benchmark bridge.
-use ktann::api::{BulkWorkerOptions, Error, ErrorKind, Index, IndexConfig, Record, Result};
+use ktann::api::{
+    BulkWorkerOptions, Error, ErrorKind, Index, IndexConfig, OperationOptions, Record, Result,
+};
 use ktann::bulk::{ForestOptions, PreparedInput, PreparedInputWriter};
 use ktann::construction::ConstructionOptions;
 use ktann::runtime::Runtime;
@@ -11,7 +13,7 @@ use std::time::Instant;
 
 const DISK_LIMIT: u64 = 64 * 1024 * 1024 * 1024;
 
-/// Caller-owned input is encoded and hashed on receipt; EOF only seals it.
+/// Bridge-owned input is encoded and hashed on receipt; EOF only seals it.
 pub(super) struct InputCapture {
     root: PathBuf,
     construction: ConstructionOptions,
@@ -60,6 +62,7 @@ impl InputCapture {
 pub(super) async fn build<B: Backend>(
     runtime: &Runtime<B>,
     staging: InputCapture,
+    control: OperationOptions,
 ) -> Result<(Index<B>, serde_json::Value)> {
     let workspace = staging.root.join("workspace");
     let options = staging.construction;
@@ -75,7 +78,7 @@ pub(super) async fn build<B: Backend>(
     let worker = BulkWorkerOptions::new(workspace);
     let start = Instant::now();
     let (index, stages) = job
-        .complete_with_report(worker.clone(), Some(prepared), Default::default())
+        .complete_with_report(worker.clone(), Some(prepared), control)
         .await?;
     let publish_seconds = stages.publish.as_secs_f64();
     let prepare_load_seconds = start.elapsed().as_secs_f64() - publish_seconds;
