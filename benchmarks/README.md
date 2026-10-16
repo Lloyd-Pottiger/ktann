@@ -302,16 +302,19 @@ allocated slots; it is not a replacement for full integrity verification.
 cargo build --release -p ktann-benchmarks --bin ktann-vdbbench-bridge
 target/release/ktann-vdbbench-bridge --backend rocksdb \
   --socket /tmp/ktann-bench.sock --database /tmp/ktann-bench-db \
-  --report /tmp/ktann-bridge.json --bulk-workspace /tmp/ktann-bulk
+  --report /tmp/ktann-bridge.json
 ```
 
-`--bulk-workspace` is required and must name a new absolute directory. Use a
-fresh bridge, workspace and dedicated backend location for each case. For
-FoundationDB, build with `--all-features` and configure its native client and
+Use a fresh bridge and dedicated backend location for each case. The bridge
+creates its own temporary workspace and removes it on normal exit. Set `TMPDIR`
+to choose a disk with sufficient space. The workspace stays alive across Optimize
+retries within the same process. For FoundationDB, build with `--all-features`
+and configure its native client and
 cluster; `--database` then specifies the backend namespace. Startup never unlinks
 a preexisting socket. After a crash, confirm that the old process exited before
-removing its stale socket. Source snapshots and reports remain caller-owned;
-core-owned preparation files are reclaimed after publication.
+removing its stale socket. Reports remain caller-owned; temporary source snapshots
+are removed on normal exit. A crash may leave temporary files behind; core-owned
+preparation files are reclaimed after publication.
 
 Install the VectorDBBench checkout with `pip install -e .`, then run:
 

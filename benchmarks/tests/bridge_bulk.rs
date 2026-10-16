@@ -15,6 +15,8 @@ impl Bridge {
     fn start() -> Self {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("bridge.sock");
+        let scratch = directory.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
         let mut process = Command::new(env!("CARGO_BIN_EXE_ktann-vdbbench-bridge"))
             .arg("--backend")
             .arg("rocksdb")
@@ -24,8 +26,7 @@ impl Bridge {
             .arg(directory.path().join("database"))
             .arg("--report")
             .arg(directory.path().join("report.json"))
-            .arg("--bulk-workspace")
-            .arg(directory.path().join("bulk"))
+            .env("TMPDIR", &scratch)
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
@@ -92,6 +93,13 @@ impl Bridge {
         loop {
             if let Some(status) = self.process.try_wait().unwrap() {
                 assert!(status.success());
+                assert_eq!(
+                    std::fs::read_dir(self.directory.path().join("scratch"))
+                        .unwrap()
+                        .count(),
+                    0,
+                    "bridge must remove its temporary workspace on shutdown"
+                );
                 break;
             }
             assert!(Instant::now() < deadline, "bridge shutdown timeout");
@@ -124,7 +132,13 @@ fn staged_bulk_build_publishes_and_reports_real_build_phases() {
         bridge.request(json!({"op":"search","vector":[7.,1.,2.,3.],"k":1}))["ok"],
         false
     );
-    let source = bridge.directory.path().join("bulk/source");
+    let source = std::fs::read_dir(bridge.directory.path().join("scratch"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+        .join("bulk/source");
     assert!(source.is_dir());
     assert!(!source.join("manifest.bin").exists());
     assert_eq!(
@@ -139,6 +153,7 @@ fn staged_bulk_build_publishes_and_reports_real_build_phases() {
     assert_eq!(response["ok"], true);
     assert_eq!(response["result"]["ids"], json!([7]));
     assert_eq!(bridge.insert(&[201], &[vec![1., 2., 3., 4.]])["ok"], false);
+    assert!(source.join("manifest.bin").exists());
     bridge.stop();
     let report: Value = serde_json::from_slice(
         &std::fs::read(bridge.directory.path().join("report.json")).unwrap(),
@@ -156,7 +171,7 @@ fn staged_bulk_build_publishes_and_reports_real_build_phases() {
     ] {
         assert!(report["bulk_build"][phase].as_f64().unwrap() > 0.);
     }
-    assert!(source.join("manifest.bin").exists());
+    assert!(!source.exists());
 }
 #[test]
 fn duplicate_staged_ids_fail_before_publication() {

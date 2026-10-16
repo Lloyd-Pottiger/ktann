@@ -40,7 +40,6 @@ struct Options {
     database: PathBuf,
     report: PathBuf,
     backend: String,
-    bulk_workspace: PathBuf,
 }
 
 /// Runs a single bridge until shutdown or SIGINT, then closes the Runtime.
@@ -54,7 +53,6 @@ pub fn run() -> Result<(), String> {
         database: PathBuf::new(),
         report: PathBuf::new(),
         backend: "rocksdb".into(),
-        bulk_workspace: PathBuf::new(),
     };
     while let Some(arg) = args.next() {
         let value = args.next().ok_or(
@@ -65,16 +63,14 @@ pub fn run() -> Result<(), String> {
             "--database" => options.database = value.into(),
             "--report" => options.report = value.into(),
             "--backend" => options.backend = value,
-            "--bulk-workspace" => options.bulk_workspace = value.into(),
             _ => return Err(format!("unknown argument {arg}")),
         }
     }
     if options.socket.as_os_str().is_empty()
         || options.report.as_os_str().is_empty()
         || options.database.as_os_str().is_empty()
-        || options.bulk_workspace.as_os_str().is_empty()
     {
-        return Err("--socket, --database, --report, and --bulk-workspace are required (database is the FDB namespace for foundationdb)".into());
+        return Err("--socket, --database, and --report are required (database is the FDB namespace for foundationdb)".into());
     }
     // Bind without unlinking: a stale path must never evict a live bridge.
     let executor = tokio::runtime::Builder::new_multi_thread()
@@ -325,9 +321,14 @@ async fn serve<B: Backend>(backend: B, identity: String, options: &Options) -> R
     let config = RuntimeConfig::default()
         .with_maintenance(0, 1)
         .map_err(|e| e.to_string())?;
+    // Keep captured input and build files alive through retries and runtime shutdown.
+    let workspace = tempfile::Builder::new()
+        .prefix("ktann-vdbbench-")
+        .tempdir()
+        .map_err(|e| e.to_string())?;
     let service = Arc::new(Service {
         runtime: Runtime::new(backend.clone(), config).map_err(|e| e.to_string())?,
-        bulk_workspace: options.bulk_workspace.clone(),
+        bulk_workspace: workspace.path().join("bulk"),
         backend,
         state: RwLock::new(State::default()),
         measurements: Mutex::new(Measurements::default()),

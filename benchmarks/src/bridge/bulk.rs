@@ -13,7 +13,7 @@ use std::time::Instant;
 
 const DISK_LIMIT: u64 = 64 * 1024 * 1024 * 1024;
 
-/// Caller-owned input is encoded and hashed on receipt; EOF only seals it.
+/// Bridge-owned input is encoded and hashed on receipt; EOF only seals it.
 pub(super) struct InputCapture {
     root: PathBuf,
     construction: ConstructionOptions,
