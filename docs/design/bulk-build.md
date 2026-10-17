@@ -13,8 +13,10 @@ The rationale is recorded in [ADR 0026](../adr/0026-building-reservations.md),
 ## 1. Manual completion
 
 Create an Input Snapshot and call `Runtime::start_bulk_build(name, &input,
-construction_options)`. Construction partition bounds must match the Index
-Configuration. Reservation atomically allocates an ID, reserves its name, and
+construction_options)`. ConstructionOptions contains only the training sample
+size and memory/scratch budgets. Dimension, metric and capacities come from
+the Input Snapshot's Index Configuration and are persisted in the Manifest;
+the Build Descriptor does not store a second copy. Reservation atomically allocates an ID, reserves its name, and
 persists a Building Manifest and Build Descriptor. Repeating the same request
 recovers that identity. `open_bulk_build(name)` recovers without source IO.
 Ordinary open, reads, and mutations reject Building indexes. The descriptor

@@ -2013,7 +2013,7 @@ async fn the_root_never_merges() {
         .await
         .expect("root header");
     assert_eq!(root_header.entry_count(), 1);
-    assert!(root_header.entry_count() < manifest.config().min_partition_entries());
+    assert!(root_header.entry_count() < manifest.config().min_leaf_partition_entries());
     let start = merge::begin_merge(&backend, &manifest, &key, pk(1), 1_000, &retry())
         .await
         .expect("begin");

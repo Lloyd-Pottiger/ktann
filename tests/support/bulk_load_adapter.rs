@@ -15,7 +15,8 @@ use std::path::Path;
 pub async fn exercise<B: Backend>(backend: impl Fn() -> B, directory: &Path) {
     let config = IndexConfig::new(2, Metric::L2)
         .unwrap()
-        .with_partition_entries(4, 16)
+        .with_leaf_partition_entries(4, 16)
+        .and_then(|config| config.with_internal_partition_entries(2, 4))
         .unwrap()
         .with_fields(vec![FieldSchema::new("bucket", DataType::I64).unwrap()])
         .unwrap()
@@ -36,8 +37,6 @@ pub async fn exercise<B: Backend>(backend: impl Fn() -> B, directory: &Path) {
     )
     .unwrap();
     let tree = ConstructionOptions {
-        min_partition_entries: 4,
-        max_partition_entries: 16,
         sample_items: 16,
         memory_bytes: 2 * 1024 * 1024,
         scratch_bytes: 16 * 1024 * 1024,

@@ -285,8 +285,10 @@ pub(super) fn encode_index_manifest(encoder: &mut Encoder, manifest: &IndexManif
     for field in config.tree_key_fields() {
         encoder.u16(field.0);
     }
-    encoder.u32(config.min_partition_entries());
-    encoder.u32(config.max_partition_entries());
+    encoder.u32(config.min_leaf_partition_entries());
+    encoder.u32(config.max_leaf_partition_entries());
+    encoder.u32(config.min_internal_partition_entries());
+    encoder.u32(config.max_internal_partition_entries());
     encoder.bytes(&manifest.rotation_seed);
     Ok(())
 }
@@ -355,11 +357,16 @@ pub(super) fn decode_index_manifest(decoder: &mut Decoder) -> Result<IndexManife
     }
     let minimum = decoder.u32()?;
     let maximum = decoder.u32()?;
+    let internal_minimum = decoder.u32()?;
+    let internal_maximum = decoder.u32()?;
     let rotation_seed = decoder.array::<ROTATION_SEED_BYTES>()?;
     let config = IndexConfig::new(dimension, metric)
         .and_then(|config| config.with_fields(fields))
         .and_then(|config| config.with_tree_key_fields(tree_key_fields))
-        .and_then(|config| config.with_partition_entries(minimum, maximum))
+        .and_then(|config| config.with_leaf_partition_entries(minimum, maximum))
+        .and_then(|config| {
+            config.with_internal_partition_entries(internal_minimum, internal_maximum)
+        })
         .map_err(|_| corrupt())?;
     IndexManifest::new(
         lifecycle,

@@ -138,6 +138,10 @@ enum Operation {
     Reset {
         dimension: usize,
         metric: String,
+        min_leaf_partition_entries: Option<u32>,
+        max_leaf_partition_entries: Option<u32>,
+        min_internal_partition_entries: Option<u32>,
+        max_internal_partition_entries: Option<u32>,
         dataset: String,
         leaf_beam: Option<u32>,
         refinement_rounds: usize,
@@ -477,6 +481,10 @@ impl<B: Backend> Service<B> {
             Operation::Reset {
                 dimension,
                 metric,
+                min_leaf_partition_entries,
+                max_leaf_partition_entries,
+                min_internal_partition_entries,
+                max_internal_partition_entries,
                 dataset,
                 leaf_beam,
                 refinement_rounds,
@@ -494,6 +502,20 @@ impl<B: Backend> Service<B> {
                     _ => return Err(invalid("only L2 and COSINE are supported")),
                 };
                 let config = IndexConfig::new(dimension, metric_kind)
+                    .and_then(|c| {
+                        let minimum =
+                            min_leaf_partition_entries.unwrap_or(c.min_leaf_partition_entries());
+                        let maximum =
+                            max_leaf_partition_entries.unwrap_or(c.max_leaf_partition_entries());
+                        c.with_leaf_partition_entries(minimum, maximum)
+                    })
+                    .and_then(|c| {
+                        let minimum = min_internal_partition_entries
+                            .unwrap_or(c.min_internal_partition_entries());
+                        let maximum = max_internal_partition_entries
+                            .unwrap_or(c.max_internal_partition_entries());
+                        c.with_internal_partition_entries(minimum, maximum)
+                    })
                     .and_then(|c| c.with_fields(vec![FieldSchema::new("id", DataType::I64)?]))
                     .map_err(api_error)?;
                 let mut search = SearchOptions::default();
@@ -708,8 +730,10 @@ impl<B: Backend> Service<B> {
             "records": state.records,
             "ready": state.ready,
             "configuration": {
-                "min_partition_entries": index_config.map(IndexConfig::min_partition_entries),
-                "max_partition_entries": index_config.map(IndexConfig::max_partition_entries),
+                "min_leaf_partition_entries": index_config.map(IndexConfig::min_leaf_partition_entries),
+                "max_leaf_partition_entries": index_config.map(IndexConfig::max_leaf_partition_entries),
+                "min_internal_partition_entries": index_config.map(IndexConfig::min_internal_partition_entries),
+                "max_internal_partition_entries": index_config.map(IndexConfig::max_internal_partition_entries),
                 "write_beam_size": runtime_config.write_beam_size(),
                 "maintenance_workers": runtime_config.maintenance_workers(),
                 "partition_cache_bytes": runtime_config.partition_cache_bytes(),

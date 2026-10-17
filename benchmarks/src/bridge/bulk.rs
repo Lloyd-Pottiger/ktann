@@ -30,7 +30,11 @@ impl InputCapture {
         fs::create_dir(&root).map_err(io)?;
         fs::create_dir(root.join("workspace")).map_err(io)?;
         let worker = BulkWorkerOptions::new(root.join("workspace"));
-        let construction = construction_options(&config);
+        let construction = ConstructionOptions {
+            sample_items: 1024,
+            memory_bytes: 256 * 1024 * 1024,
+            scratch_bytes: DISK_LIMIT,
+        };
         let writer = PreparedInputWriter::new(
             &root.join("source"),
             &root.join("preparation"),
@@ -117,14 +121,4 @@ pub(super) async fn build<B: Backend>(
             "load_max_mutations": worker.load.max_mutations, "load_max_bytes": worker.load.max_bytes
         }),
     ))
-}
-
-fn construction_options(config: &IndexConfig) -> ConstructionOptions {
-    ConstructionOptions {
-        min_partition_entries: config.min_partition_entries(),
-        max_partition_entries: config.max_partition_entries(),
-        sample_items: 1024,
-        memory_bytes: 256 * 1024 * 1024,
-        scratch_bytes: DISK_LIMIT,
-    }
 }

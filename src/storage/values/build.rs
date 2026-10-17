@@ -83,8 +83,6 @@ pub(super) fn encode(encoder: &mut Encoder, descriptor: &BuildDescriptor) -> Res
     )?;
     encoder.sized_bytes(&descriptor.input.encode(), ARTIFACT_MANIFEST_BYTES)?;
     let options = descriptor.options;
-    encoder.u32(options.min_partition_entries);
-    encoder.u32(options.max_partition_entries);
     encoder.u64(options.sample_items as u64);
     encoder.u64(options.memory_bytes as u64);
     encoder.u64(options.scratch_bytes);
@@ -96,8 +94,6 @@ pub(super) fn decode(decoder: &mut Decoder) -> Result<BuildDescriptor> {
     let source = PathBuf::from(std::str::from_utf8(&path).map_err(|_| corrupt())?);
     let input = ArtifactManifest::decode(&decoder.sized_bytes(ARTIFACT_MANIFEST_BYTES)?)?;
     let options = ConstructionOptions {
-        min_partition_entries: decoder.u32()?,
-        max_partition_entries: decoder.u32()?,
         sample_items: usize::try_from(decoder.u64()?).map_err(|_| corrupt())?,
         memory_bytes: usize::try_from(decoder.u64()?).map_err(|_| corrupt())?,
         scratch_bytes: decoder.u64()?,

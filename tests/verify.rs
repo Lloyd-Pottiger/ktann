@@ -61,7 +61,8 @@ fn config_with(dimension: usize, partition_entries: Option<(u32, u32)>) -> Index
         .expect("valid tree key fields");
     match partition_entries {
         Some((minimum, maximum)) => config
-            .with_partition_entries(minimum, maximum)
+            .with_leaf_partition_entries(minimum, maximum)
+            .and_then(|config| config.with_internal_partition_entries(minimum, maximum))
             .expect("valid partition entries"),
         None => config,
     }

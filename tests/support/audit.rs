@@ -639,7 +639,6 @@ async fn render_partition<T: ReadOps>(
 /// Each poll searches, offering cold partitions to the Fixup queue. The
 /// real-time bound only guards against a broken implementation hanging.
 pub async fn settle<B: Backend>(index: &Index<B>, backend: &B, expected: u32) {
-    let maximum = index.config().max_partition_entries();
     let zeros: Arc<[f32]> = vec![0.0_f32; index.config().dimension()].into();
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut stable = 0_u32;
@@ -652,9 +651,9 @@ pub async fn settle<B: Backend>(index: &Index<B>, backend: &B, expected: u32) {
         let quiet = partitions
             .iter()
             .all(|(_, _, header)| header.state() == PartitionState::Ready)
-            && partitions
-                .iter()
-                .all(|(_, _, header)| header.entry_count() <= maximum)
+            && partitions.iter().all(|(_, _, header)| {
+                header.entry_count() <= index.config().max_partition_entries(header.level())
+            })
             && partitions
                 .iter()
                 .filter(|(_, _, header)| header.level() == 1)

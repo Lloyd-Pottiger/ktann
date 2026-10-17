@@ -107,8 +107,14 @@ pub struct ScenarioSpec {
     pub refinement_rounds: Option<usize>,
     /// Ordered single-variable beam values; empty for ordinary scenarios.
     pub leaf_beam_sweep: Vec<u32>,
-    /// Logical Index maximum partition size.
-    pub max_partition_entries: u32,
+    /// Minimum non-root leaf occupancy.
+    pub min_leaf_partition_entries: u32,
+    /// Leaf split threshold.
+    pub max_leaf_partition_entries: u32,
+    /// Minimum non-root internal occupancy.
+    pub min_internal_partition_entries: u32,
+    /// Internal split threshold.
+    pub max_internal_partition_entries: u32,
     /// Whether this scenario measures the import-to-search lifecycle.
     pub lifecycle: bool,
     /// Records per atomic batch load batch in a lifecycle scenario.
@@ -162,7 +168,10 @@ fn smoke_scenarios() -> Vec<ScenarioSpec> {
         refinement_rounds: None,
         query_concurrency_sweep: Vec::new(),
         leaf_beam_sweep: Vec::new(),
-        max_partition_entries: 32,
+        min_leaf_partition_entries: 8,
+        max_leaf_partition_entries: 32,
+        min_internal_partition_entries: 8,
+        max_internal_partition_entries: 32,
         lifecycle: false,
         import_batch_size: 32,
         maintenance_workers: 2,
@@ -246,7 +255,10 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
         refinement_rounds: None,
         query_concurrency_sweep: Vec::new(),
         leaf_beam_sweep: Vec::new(),
-        max_partition_entries: 128,
+        min_leaf_partition_entries: 32,
+        max_leaf_partition_entries: 128,
+        min_internal_partition_entries: 32,
+        max_internal_partition_entries: 128,
         lifecycle: false,
         import_batch_size: 50,
         maintenance_workers: 2,
@@ -352,9 +364,12 @@ fn large_scenarios() -> Result<Vec<ScenarioSpec>, String> {
             refinement_rounds: None,
             query_concurrency_sweep: Vec::new(),
             leaf_beam_sweep: vec![1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128, 192, 256, 384],
-            // Keep the shared leaf/internal fanout below sqrt(1M) so the
-            // million-vector corpus must form at least three searchable levels.
-            max_partition_entries: index.max_partition_entries(),
+            // Default capacities retain the multi-level million-vector workload;
+            // independent capacity overrides may intentionally change its depth.
+            min_leaf_partition_entries: index.min_leaf_partition_entries(),
+            max_leaf_partition_entries: index.max_leaf_partition_entries(),
+            min_internal_partition_entries: index.min_internal_partition_entries(),
+            max_internal_partition_entries: index.max_internal_partition_entries(),
             lifecycle: false,
             import_batch_size: 50,
             maintenance_workers: defaults.maintenance_workers(),
@@ -495,8 +510,10 @@ pub async fn run_scenario<B: Backend>(
             tree_key_field_count: index_config.tree_key_fields().len(),
             search_percent: spec.search_percent,
             hot_updates: spec.hot_updates,
-            min_partition_entries: index_config.min_partition_entries(),
-            max_partition_entries: index_config.max_partition_entries(),
+            min_leaf_partition_entries: index_config.min_leaf_partition_entries(),
+            max_leaf_partition_entries: index_config.max_leaf_partition_entries(),
+            min_internal_partition_entries: index_config.min_internal_partition_entries(),
+            max_internal_partition_entries: index_config.max_internal_partition_entries(),
             partition_cache_bytes: spec.partition_cache_bytes,
             foreground_limit: spec.foreground_limit,
             maintenance_workers: spec.maintenance_workers,
@@ -767,12 +784,15 @@ const fn metric_name(metric: Metric) -> &'static str {
 /// Builds the public Index configuration shared by steady and lifecycle cases.
 fn index_config(spec: &ScenarioSpec) -> Result<IndexConfig, String> {
     let config = IndexConfig::new(spec.dimension, spec.metric).and_then(|config| {
-        if spec.profile == "large" && spec.max_partition_entries == config.max_partition_entries() {
-            Ok(config)
-        } else {
-            config
-                .with_partition_entries(spec.max_partition_entries / 4, spec.max_partition_entries)
-        }
+        config
+            .with_leaf_partition_entries(
+                spec.min_leaf_partition_entries,
+                spec.max_leaf_partition_entries,
+            )?
+            .with_internal_partition_entries(
+                spec.min_internal_partition_entries,
+                spec.max_internal_partition_entries,
+            )
     });
     let config = if spec.profile == "large" {
         config
@@ -1609,13 +1629,15 @@ async fn rediscover_topology_work<B: Backend>(
 }
 
 /// Returns whether aggregate topology could be a fully settled search tree.
-fn topology_is_settled(topology: &Topology, max_partition_entries: u32) -> bool {
+fn topology_is_settled(topology: &Topology, config: &IndexConfig) -> bool {
     let leaf_entries = topology.entries_by_level.get(&1).copied().unwrap_or(0);
-    let largest_leaf = topology.max_entries_by_level.get(&1).copied().unwrap_or(0);
     topology.partitions > 1
         && topology.entries > topology.vector_records
         && leaf_entries == topology.vector_records
-        && largest_leaf <= max_partition_entries
+        && topology
+            .max_entries_by_level
+            .iter()
+            .all(|(level, count)| *count <= config.max_partition_entries(*level))
         && topology.actionable_partitions == 0
         && topology.partition_states.transitional() == 0
 }
@@ -1671,7 +1693,7 @@ async fn settle_and_drain_topology<B: Backend>(
             topology.partition_states.transitional(),
             topology.max_entries_by_level,
         );
-        if topology_is_settled(&topology, spec.max_partition_entries) {
+        if topology_is_settled(&topology, index.config()) {
             return Ok((topology, maintenance_drain_seconds));
         }
         if observe_topology_progress(&topology, &mut previous_topology, &mut unchanged_rounds)
@@ -2450,11 +2472,12 @@ mod tests {
                 ktann::api::IndexConfig::new(scenario.dimension, scenario.metric)
                     .expect("default index config")
             );
-            let max_partition_entries = usize::try_from(scenario.max_partition_entries)
+            let max_leaf_partition_entries = usize::try_from(scenario.max_leaf_partition_entries)
                 .expect("partition fanout fits usize");
             assert!(
-                max_partition_entries * max_partition_entries < scenario.base_vectors,
-                "the shared partition fanout must force a third topology level"
+                max_leaf_partition_entries * (scenario.max_internal_partition_entries as usize)
+                    < scenario.base_vectors,
+                "default capacities must force a third topology level"
             );
         }
     }
@@ -2499,8 +2522,17 @@ mod tests {
             actionable_partitions: 0,
         };
 
-        assert!(topology_is_settled(&topology, 1_842));
-        assert!(!topology_is_settled(&topology, 512));
+        assert!(topology_is_settled(
+            &topology,
+            &ktann::api::IndexConfig::new(2, ktann::api::Metric::L2)
+                .unwrap()
+                .with_leaf_partition_entries(64, 1_842)
+                .unwrap()
+        ));
+        assert!(!topology_is_settled(
+            &topology,
+            &ktann::api::IndexConfig::new(2, ktann::api::Metric::L2).unwrap()
+        ));
     }
 
     #[test]

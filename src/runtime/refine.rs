@@ -172,9 +172,10 @@ async fn load<B: Backend>(
                 return Err(corrupt());
             }
             drop(txn);
-            if header.entry_count() > manifest.config().max_partition_entries()
+            if header.entry_count() > manifest.config().max_partition_entries(header.level())
                 || (parent.is_some()
-                    && header.entry_count() < manifest.config().min_partition_entries())
+                    && header.entry_count()
+                        < manifest.config().min_partition_entries(header.level()))
             {
                 return Err(Error::invalid_argument());
             }
@@ -298,8 +299,8 @@ fn plan(
             &kernel,
             &loaded.vectors,
             &mut tree.parts[..leaf_count],
-            manifest.config().min_partition_entries() as usize,
-            manifest.config().max_partition_entries() as usize,
+            manifest.config().min_leaf_partition_entries() as usize,
+            manifest.config().max_leaf_partition_entries() as usize,
             options,
         )?
         .into_iter()

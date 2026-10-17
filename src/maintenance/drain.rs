@@ -38,11 +38,11 @@ const DRAIN_SCAN_LIMITS: ScanLimits = ScanLimits {
 /// relative to the index's ordinary partition size; the Backend budget remains
 /// the hard upper bound.
 fn leaf_drain_batch_limit(
-    max_partition_entries: u32,
+    max_leaf_partition_entries: u32,
     source_entries: u32,
     budget_limit: usize,
 ) -> usize {
-    (max_partition_entries as usize)
+    (max_leaf_partition_entries as usize)
         .min(budget_limit)
         .min(source_entries as usize)
 }
@@ -124,7 +124,7 @@ pub(crate) async fn next_drain_batch<T: ReadOps>(
         let budget_limit =
             topology::leaf_relocation_batch_limit(manifest, tree_key, movement, budget)?;
         leaf_drain_batch_limit(
-            manifest.config().max_partition_entries(),
+            manifest.config().max_leaf_partition_entries(),
             header.entry_count(),
             budget_limit,
         )

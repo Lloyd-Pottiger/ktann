@@ -391,7 +391,10 @@ fn index_config() -> IndexConfig {
         .expect("valid fields")
         .with_tree_key_fields(vec![FieldId(0)])
         .expect("valid tree key fields")
-        .with_partition_entries(MIN_PARTITION_ENTRIES, MAX_PARTITION_ENTRIES)
+        .with_leaf_partition_entries(MIN_PARTITION_ENTRIES, MAX_PARTITION_ENTRIES)
+        .and_then(|config| {
+            config.with_internal_partition_entries(MIN_PARTITION_ENTRIES, MAX_PARTITION_ENTRIES)
+        })
         .expect("valid partition entries")
 }
 
@@ -443,7 +446,7 @@ fn collect_candidates(
             .map(|(tree_key, partition, _)| (tree_key.clone(), *partition, Work::Merge)),
     );
 
-    let maximum = config.max_partition_entries();
+    let maximum = config.max_leaf_partition_entries();
     let mut over_full: Vec<_> = listing
         .iter()
         .filter(|(_, _, header)| {
@@ -463,7 +466,7 @@ fn collect_candidates(
             .map(|(tree_key, partition, _)| (tree_key.clone(), *partition, Work::Split)),
     );
 
-    let minimum = config.min_partition_entries();
+    let minimum = config.min_leaf_partition_entries();
     let mut under_full: Vec<_> = listing
         .iter()
         .filter(|(_, partition, header)| {

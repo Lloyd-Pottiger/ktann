@@ -83,12 +83,7 @@ impl<B: Backend> Runtime<B> {
     ) -> Result<crate::api::BulkBuildJob<B>> {
         let name = IndexName::new(name)?;
         let config = input.config().clone();
-        construction.resident_rows(config.dimension())?;
-        if construction.min_partition_entries != config.min_partition_entries()
-            || construction.max_partition_entries != config.max_partition_entries()
-        {
-            return Err(Error::invalid_argument());
-        }
+        construction.resident_rows(&config)?;
         let source =
             std::path::absolute(input.directory()).map_err(|_| Error::invalid_argument())?;
         let descriptor = crate::storage::values::BuildDescriptor::new(

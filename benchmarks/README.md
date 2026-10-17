@@ -74,7 +74,7 @@ otherwise idle host for performance comparisons.
 
 `--write-beam-size N` overrides the write routing beam. Large runs also accept
 `--base-vectors N`, `--query-vectors N`, `--query-offset N`, and
-`--max-partition-entries N`. Resolved overrides are recorded in each report.
+`--max-leaf-partition-entries N` and `--max-internal-partition-entries N`. Resolved overrides are recorded in each report.
 
 The raw RocksDB block cache is independent of the decoded Partition Cache.
 `--rocksdb-block-cache-bytes N` sets its capacity (default 8 MiB); the worker
@@ -405,3 +405,14 @@ including AArch64 SHA-2 instructions with a software fallback. Artifact framing,
 per-frame checksums, whole-file hashes and publication verification are unchanged.
 Performance comparisons must record the CPU architecture and resolved dependency
 versions; the gain from hardware hashing is platform dependent.
+
+The four capacity overrides are independent. Unspecified values retain the
+profile's configured values (the large profile uses IndexConfig defaults).
+Lowering a maximum below twice its minimum requires explicitly lowering that
+minimum as well; the CLI and bridge do not infer a different capacity pair. Reports record all four values and comparison
+rejects mismatched configurations. The VectorDBBench bridge's
+`reset` accepts optional `min_leaf_partition_entries`,
+`max_leaf_partition_entries`, `min_internal_partition_entries`, and
+`max_internal_partition_entries`; omitted fields use IndexConfig defaults.
+Bridge reports record all four resolved values. Invalid pairs fail before reset
+changes storage. Keep rerank budgets fixed when comparing capacity choices.

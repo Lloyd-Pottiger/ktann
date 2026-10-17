@@ -66,7 +66,8 @@ fn index_config() -> IndexConfig {
         .expect("valid fields")
         .with_tree_key_fields(vec![FieldId(0)])
         .expect("valid tree key fields")
-        .with_partition_entries(2, 8)
+        .with_leaf_partition_entries(2, 8)
+        .and_then(|config| config.with_internal_partition_entries(2, 8))
         .expect("valid partition entries")
 }
 

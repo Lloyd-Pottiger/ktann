@@ -474,10 +474,10 @@ async fn drive<B: Backend>(inner: &Arc<RuntimeInner<B>>, offer: &FixupOffer) -> 
     };
     let retry = RetryPolicy::for_fixup(inner.config());
     let attempts = inner.config().fixup_attempts();
-    let mut recovery_timeout = if offer.continuing {
+    let mut recovery = if offer.continuing {
         None
     } else {
-        Some(inner.config().stalled_timeout(offer.manifest.config()))
+        Some(inner.config())
     };
     for _ in 0..attempts {
         if inner.maintenance_cancel.is_cancelled() {
@@ -492,7 +492,7 @@ async fn drive<B: Backend>(inner: &Arc<RuntimeInner<B>>, offer: &FixupOffer) -> 
             key.partition,
             maintenance_fixup::StepPolicy {
                 now_unix_millis: started_at,
-                recovery_timeout: recovery_timeout.take(),
+                recovery: recovery.take(),
                 retry: &retry,
             },
         )

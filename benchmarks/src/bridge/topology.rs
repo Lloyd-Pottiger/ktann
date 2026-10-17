@@ -99,9 +99,10 @@ pub(super) async fn snapshot<B: Backend>(
             let in_transition = header.state() != PartitionState::Ready;
             transitional += u64::from(in_transition);
             let needs_work = in_transition
-                || header.entry_count() > manifest.config().max_partition_entries()
+                || header.entry_count() > manifest.config().max_partition_entries(header.level())
                 || (partition != tree.root()
-                    && header.entry_count() < manifest.config().min_partition_entries());
+                    && header.entry_count()
+                        < manifest.config().min_partition_entries(header.level()));
             actionable += u64::from(needs_work && header.state() != PartitionState::ReceivingSplit);
         }
     }
@@ -145,7 +146,8 @@ mod tests {
                 IndexConfig::new(2, Metric::L2)
                     .unwrap()
                     // Readiness follows the Manifest, not the bridge's fixed thresholds.
-                    .with_partition_entries(16, 64)
+                    .with_leaf_partition_entries(16, 64)
+                    .and_then(|config| config.with_internal_partition_entries(16, 64))
                     .unwrap(),
             )
             .await

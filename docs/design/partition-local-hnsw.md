@@ -1,8 +1,9 @@
 # Partition-local HNSW: fixed Bulk Build contract
 
-Status: contract decided; implementation pending. This document owns the first,
+Status: contract decided; independent capacities implemented; HNSW pending. This document owns the first,
 fixed-index stage of [issue #195](https://github.com/Lloyd-Pottiger/ktann/issues/195).
-It specifies the required end state, not APIs or guarantees already implemented.
+It specifies the required end state. Only the independent capacity prerequisite
+is implemented; the fixed-index and graph contracts remain pending.
 [Search](search.md), [Storage](storage.md), and [Bulk Build](bulk-build.md) retain
 ownership of their shared contracts. Subsequent implementation must update those
 contracts and their tests as the feature lands.
@@ -100,7 +101,8 @@ backend writes remain outside the library API's integrity guarantee.
 
 ## 4. Configuration ownership
 
-Names below describe required fields, not an already exported Rust interface.
+Names below describe required fields. Leaf/internal capacities are already
+exported by `IndexConfig`; the other additions are not yet implemented.
 Keep one canonical owner for each value and include semantic values in artifact
 bindings; copied bindings are validation evidence, not independently editable
 configuration.
@@ -399,16 +401,15 @@ by this documentation-only change:
    concurrent loading. Report actual topology; deduplicate configurations that
    collapse to the same graph. Local coverage is not final recall evidence.
 
-The immediate next step is capacity separation, not graph implementation:
-replace the shared pair throughout IndexConfig, Manifest codecs, construction
-options/bindings, root-fit/grouping logic, occupancy validation, refinement leaf
-bounds, maintenance thresholds/timeouts and test fixtures. Select bounds by
-partition level (leaf level 1; internal above it), including roots; preserve root
-minimum-occupancy exceptions. Both pairs require positive minimum,
-`2*minimum <= maximum`, and the existing 65,536 format cap until separately
-justified. Mutable maintenance must use the correct pair even though fixed mode
-will disable it. Audit every `min_partition_entries`/`max_partition_entries`
-consumer rather than only changing setters.
+Capacity separation is implemented throughout IndexConfig, Manifest codecs,
+construction and artifact bindings, root-fit/grouping, occupancy validation,
+refinement leaf bounds, and mutable maintenance thresholds/drain/recovery age.
+Level 1 selects leaf bounds; higher levels select internal bounds, including
+roots, with the root minimum-occupancy exception. Both pairs require positive
+minimum, `2*minimum <= maximum`, and maximum at most 65,536. Defaults remain
+64/512 for both pairs. Exact routing already uses these independently sized
+trees. All four values participate in Manifest and forest/serving identity;
+these pre-release contracts change directly without a version upgrade.
 
 Capacity experiments start with leaf maxima 64/128 and internal maxima
 4096/8192/16384/32768, subject to the measured working-set limits above. These are
@@ -417,9 +418,8 @@ layout/centroids when comparing internal grouping; no rerank-budget sweeps.
 
 There is no unresolved lifecycle or ownership decision blocking capacity work.
 The later graph implementation must specify canonical codec tags, deterministic
-HNSW algorithm details and finite level bounds before persisting bytes, advance
-Persistent Format and affected artifact/construction versions explicitly, and
-verify the working-set estimates. These are required implementation deliverables;
+HNSW algorithm details and finite level bounds before persisting bytes, update
+the owning storage and artifact contracts and verify the working-set estimates. These are required implementation deliverables;
 this document does not claim a performance or 100M/10B feasibility result.
 Production parameter choices and dynamic maintenance remain deferred. There is
 no stable release requiring compatibility machinery or migration of old builds.

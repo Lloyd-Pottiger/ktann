@@ -187,6 +187,22 @@ async fn create_open_and_drop_basic_contract() {
         ErrorKind::IndexAlreadyExists
     );
 
+    for changed in [
+        config().with_leaf_partition_entries(1, 512).unwrap(),
+        config().with_leaf_partition_entries(64, 256).unwrap(),
+        config().with_internal_partition_entries(1, 512).unwrap(),
+        config().with_internal_partition_entries(64, 256).unwrap(),
+    ] {
+        assert_eq!(
+            runtime
+                .create_index("docs", changed)
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::IndexAlreadyExists
+        );
+    }
+
     runtime.drop_index("docs").await.expect("drop index");
     assert_drop_complete(&shared, &name("docs")).await;
     assert_eq!(
@@ -769,10 +785,8 @@ fn index_handle_is_send_and_sync() {
     assert_send_sync::<ktann::api::Index<MemoryBackend>>();
 }
 
-fn bulk_options(config: &IndexConfig) -> ktann::construction::ConstructionOptions {
+fn bulk_options() -> ktann::construction::ConstructionOptions {
     ktann::construction::ConstructionOptions {
-        min_partition_entries: config.min_partition_entries(),
-        max_partition_entries: config.max_partition_entries(),
         sample_items: 8,
         memory_bytes: 16 * 1024 * 1024,
         scratch_bytes: 16 * 1024 * 1024,
@@ -807,7 +821,7 @@ async fn bulk_reservation_reopens_blocks_serving_and_never_retargets_abort() {
         let shared = backend(backend_config);
         let runtime = make_runtime(shared.clone());
         let (source, input) = BulkSource::new();
-        let options = bulk_options(&config());
+        let options = bulk_options();
         let job = runtime
             .start_bulk_build("bulk", &input, options)
             .await
@@ -878,7 +892,7 @@ async fn bulk_reservation_commit_recovery_and_validation_are_atomic() {
         let shared = backend(no_clear_config());
         let runtime = make_runtime(shared.clone());
         let (_source, input) = BulkSource::new();
-        let options = bulk_options(&config());
+        let options = bulk_options();
         let mut invalid = options;
         invalid.memory_bytes = 1;
         assert_eq!(
@@ -925,7 +939,7 @@ async fn bulk_controls_cancel_before_lifecycle_changes() {
     let control = ktann::api::OperationOptions::default().with_cancellation(cancelled);
     assert_eq!(
         runtime
-            .start_bulk_build_with_control("bulk", &input, bulk_options(&config()), control.clone())
+            .start_bulk_build_with_control("bulk", &input, bulk_options(), control.clone())
             .await
             .unwrap_err()
             .kind(),
@@ -933,7 +947,7 @@ async fn bulk_controls_cancel_before_lifecycle_changes() {
     );
     assert_eq!(read_allocator(&shared).await, 0);
     let job = runtime
-        .start_bulk_build("bulk", &input, bulk_options(&config()))
+        .start_bulk_build("bulk", &input, bulk_options())
         .await
         .unwrap();
     assert_eq!(
