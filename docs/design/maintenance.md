@@ -51,7 +51,9 @@ targets, then removes the source at completion. Root Partition Key 1 remains
 stable and is converted in place to an internal root only after its entries
 drain, so every committed state has one searchable entry point.
 
-Merge is eligible for a Ready non-root partition below the configured minimum.
+Split and merge thresholds select leaf bounds at level 1 and internal bounds
+at higher levels. Root splits use the root's current level. Merge is eligible
+for a Ready non-root partition below that level's configured minimum.
 The worker reselects a legal target for each bounded batch under current
 topology rather than persisting or relying on a stale target. Roots never
 collapse.
@@ -121,14 +123,14 @@ charge fits the current Backend Admission Budget. The charge uses the
 Manifest's dimension, fields and Bloom parameters, the current Tree Key, codec
 key/value sizes, adapter key-prefix overhead, and the operation's worst target
 distribution: two targets for split, or one distinct Ready target per entry for
-merge. It then caps that safe bound at the configured split threshold, limiting
+merge. It then caps that safe bound at the leaf split threshold, limiting
 conflict rollback and failure blast radius to one ordinary partition's worth of
 entries. Internal movement retains its fixed entry bound because it does not
 write Record Locations or Synopses.
 
 Drain placement normally chooses the nearer persisted target centroid. Exact
 remaining and target counts reserve the last entries needed for each target to
-reach the configured minimum when the source has enough entries, crediting
+reach the source level's configured minimum when the source has enough entries, crediting
 entries already redirected into the targets. Thus duplicate-heavy routing
 cannot immediately merge a small target back into its oversized source, while
 ordinary inputs retain the distance-based placement learned by balanced

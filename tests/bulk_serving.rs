@@ -44,7 +44,8 @@ impl Drop for Directory {
 fn config(metric: Metric, keyed: bool) -> IndexConfig {
     let config = IndexConfig::new(3, metric)
         .unwrap()
-        .with_partition_entries(2, 4)
+        .with_leaf_partition_entries(2, 4)
+        .and_then(|config| config.with_internal_partition_entries(2, 4))
         .unwrap()
         .with_fields(vec![
             FieldSchema::new("bucket", DataType::I64)
@@ -172,7 +173,8 @@ fn serving_streams_record_groups_in_escaped_id_order() {
     let directory = Directory::new();
     let config = IndexConfig::new(3, Metric::L2)
         .unwrap()
-        .with_partition_entries(2, 4)
+        .with_leaf_partition_entries(2, 4)
+        .and_then(|config| config.with_internal_partition_entries(2, 4))
         .unwrap();
     let ids: &[&[u8]] = &[b"a\xff", b"\0\0", b"a", b"\xff", b"a\0", b"\0"];
     let input = InputSnapshot::create(
@@ -585,7 +587,12 @@ fn serving_reopens_after_relocation_and_rejects_wrong_bindings_and_corruption() 
     for wrong_config in [
         IndexConfig::new(4, Metric::L2).unwrap(),
         IndexConfig::new(3, Metric::L2).unwrap(),
-        config.clone().with_partition_entries(3, 6).unwrap(),
+        config
+            .clone()
+            .with_leaf_partition_entries(3, 6)
+            .unwrap()
+            .with_internal_partition_entries(3, 6)
+            .unwrap(),
     ] {
         assert_eq!(
             ForestArtifact::open(
@@ -715,8 +722,6 @@ mod load;
 fn construction_options() -> ktann::construction::ConstructionOptions {
     let forest = options();
     ktann::construction::ConstructionOptions {
-        min_partition_entries: 2,
-        max_partition_entries: 4,
         sample_items: forest.sample_items,
         memory_bytes: forest.tree_memory_bytes,
         scratch_bytes: forest.tree_scratch_bytes,

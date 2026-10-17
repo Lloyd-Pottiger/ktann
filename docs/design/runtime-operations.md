@@ -81,7 +81,9 @@ millisecond difference is reported in seconds. Tokio monotonic time controls dea
 `stalled_timeout` is the minimum age of a persisted `Splitting`,
 `DrainingSplit`, or `Merging` state before an independently rediscovered Fixup
 may assist it. Its default is
-`max(1 ms, 1 s * max_partition_entries / 128)`; overrides must be positive.
+`max(1 ms, 1 s * level_maximum / 128)`, selecting the leaf maximum at level 1
+and the internal maximum above it; explicit overrides apply to both and must
+be positive.
 The worker checks `now - started >= timeout` in its existing authority read,
 after process-local queue deduplication. Ready threshold crossings start
 immediately. A progressing worker, including one yielded to the queue tail,

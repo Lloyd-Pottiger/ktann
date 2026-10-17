@@ -35,10 +35,8 @@ pub struct ForestOptions {
 }
 
 impl ForestOptions {
-    fn construction(self, config: &IndexConfig) -> ConstructionOptions {
+    fn construction(self) -> ConstructionOptions {
         ConstructionOptions {
-            min_partition_entries: config.min_partition_entries(),
-            max_partition_entries: config.max_partition_entries(),
             sample_items: self.sample_items,
             memory_bytes: self.tree_memory_bytes,
             scratch_bytes: self.tree_scratch_bytes,
@@ -263,10 +261,9 @@ impl ForestArtifact {
             });
             let built = construct_tree(
                 &scratch,
-                config.dimension(),
-                config.metric(),
+                config,
                 seed,
-                options.construction(config),
+                options.construction(),
                 records,
                 |partition| {
                     let mut frame = Vec::new();
@@ -359,7 +356,10 @@ impl ForestArtifact {
             + MAX_TREE_KEY_BYTES
             + 16
             + self.config.dimension() * 4
-            + self.config.max_partition_entries() as usize
+            + self
+                .config
+                .max_leaf_partition_entries()
+                .max(self.config.max_internal_partition_entries()) as usize
                 * (size_of::<u16>() + crate::api::MAX_RECORD_ID_BYTES);
         Ok(ForestReader {
             reader: Reader::open(&self.directory, &self.manifest, maximum_frame)?,
@@ -402,11 +402,7 @@ impl ForestReader {
             return Err(corrupt());
         }
         let tree = TreeKey::from_encoded(&self.types, frame.split_to(length))?;
-        let partition = plan::decode(
-            frame,
-            self.config.dimension(),
-            self.config.max_partition_entries(),
-        )?;
+        let partition = plan::decode(frame, &self.config)?;
         if self.tree.as_ref() != Some(&tree) {
             if self
                 .tree
@@ -428,7 +424,8 @@ impl ForestReader {
             self.rooted = true;
         } else {
             if partition.key.get() != self.next_key
-                || partition.entries.len() < self.config.min_partition_entries() as usize
+                || partition.entries.len()
+                    < self.config.min_partition_entries(partition.level) as usize
             {
                 return Err(corrupt());
             }
@@ -512,9 +509,7 @@ fn maximum_row(config: &IndexConfig) -> usize {
 }
 
 fn validate(config: &IndexConfig, directory: &Path, options: ForestOptions) -> Result<()> {
-    options
-        .construction(config)
-        .resident_rows(config.dimension())?;
+    options.construction().resident_rows(config)?;
     super::sort::validate_memory(options.sort_memory_bytes, maximum_row(config))?;
     if options.sort_scratch_bytes == 0 || directory.as_os_str().len() > 4096 {
         return Err(Error::invalid_argument());
@@ -567,8 +562,10 @@ fn binding(
     for id in config.tree_key_fields() {
         hash.update(id.0.to_be_bytes());
     }
-    hash.update(config.min_partition_entries().to_be_bytes());
-    hash.update(config.max_partition_entries().to_be_bytes());
+    hash.update(config.min_leaf_partition_entries().to_be_bytes());
+    hash.update(config.max_leaf_partition_entries().to_be_bytes());
+    hash.update(config.min_internal_partition_entries().to_be_bytes());
+    hash.update(config.max_internal_partition_entries().to_be_bytes());
     hash.update((sample_items as u64).to_be_bytes());
     hash.finalize().into()
 }

@@ -153,7 +153,9 @@ fields, noncanonical values, nonzero padding, and trailing bytes.
 
 The Index Manifest stores the persistent format version (`FORMAT_VERSION = 2`),
 lifecycle state, immutable configuration, Logical Index ID, RaBitQ rotation
-seed, and exact Bloom parameters. The Persistent Format covers Logical Keys,
+seed, and exact Bloom parameters. The configuration encodes four big-endian
+u32 capacities in leaf minimum, leaf maximum, internal minimum, internal maximum
+order before the rotation seed. Both pairs are validated on decode. The Persistent Format covers Logical Keys,
 stored values, adapter physical keys, and algorithms that determine persisted
 bytes. Loading a Manifest validates its format version; an unsupported version
 returns `UnsupportedFormat`.
@@ -214,10 +216,10 @@ or hashing is not permitted.
 
 Bulk Build reservations add lifecycle byte `2` (Building; Active remains `0`,
 Dropping `1`) and index-owned key kind `0x05` for the Build Descriptor. Descriptor
-value tag `0x0d` contains construction version u32, a length-prefixed absolute
+value tag `0x0d` contains a length-prefixed absolute
 UTF-8 source path (maximum 4096 bytes), a length-prefixed 89-byte input artifact
-manifest, min/max entries u32, and sample/memory/scratch ceilings u64, all big
-endian. Bootstrap transactions may access the descriptor alongside the Manifest
+manifest, and sample/memory/scratch ceilings u64, all big endian. Capacity,
+dimension and metric remain solely in the Index Manifest. Bootstrap transactions may access the descriptor alongside the Manifest
 for atomic reservation. Serving transactions still validate an Active Manifest.
 See [ADR 0026](../adr/0026-building-reservations.md).
 

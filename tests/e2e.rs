@@ -249,10 +249,16 @@ impl Harness {
             (directive.arg("min-entries"), directive.arg("max-entries"))
         {
             config = config
-                .with_partition_entries(
+                .with_leaf_partition_entries(
                     minimum.parse().expect("min-entries"),
                     maximum.parse().expect("max-entries"),
                 )
+                .and_then(|config| {
+                    config.with_internal_partition_entries(
+                        minimum.parse().expect("min-entries"),
+                        maximum.parse().expect("max-entries"),
+                    )
+                })
                 .expect("valid partition entries");
         }
         let backend_config = TestConfig {
@@ -697,7 +703,7 @@ impl Harness {
         if in_flight.is_some() {
             return in_flight;
         }
-        let maximum = manifest.config().max_partition_entries();
+        let maximum = manifest.config().max_leaf_partition_entries();
         listing
             .into_iter()
             .filter(|(key, _, header)| {
@@ -847,7 +853,7 @@ impl Harness {
         if in_flight.is_some() {
             return in_flight;
         }
-        let minimum = manifest.config().min_partition_entries();
+        let minimum = manifest.config().min_leaf_partition_entries();
         listing
             .into_iter()
             .filter(|(key, partition, header)| {

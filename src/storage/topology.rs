@@ -156,7 +156,7 @@ pub async fn begin_split<T: WriteTxn>(
         // any other state has nothing to (re)start.
         _ => return Ok(SplitStart::NotEligible),
     }
-    if header.entry_count() <= manifest.config().max_partition_entries() {
+    if header.entry_count() <= manifest.config().max_partition_entries(header.level()) {
         return Ok(SplitStart::NotEligible);
     }
 
@@ -1301,7 +1301,7 @@ pub async fn begin_merge<T: WriteTxn>(
     if source == root_partition() {
         return Ok(MergeStart::NotEligible);
     }
-    if header.entry_count() >= manifest.config().min_partition_entries() {
+    if header.entry_count() >= manifest.config().min_partition_entries(header.level()) {
         return Ok(MergeStart::NotEligible);
     }
 

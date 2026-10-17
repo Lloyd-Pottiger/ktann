@@ -1,6 +1,6 @@
 //! Canonical partition-plan bodies shared by forest readers and writers.
 use super::files::corrupt;
-use crate::api::{MAX_RECORD_ID_BYTES, PartitionKey, Result};
+use crate::api::{IndexConfig, MAX_RECORD_ID_BYTES, PartitionKey, Result};
 use crate::construction::PartitionPlan;
 use bytes::Bytes;
 
@@ -26,12 +26,9 @@ pub(super) fn encode(plan: &PartitionPlan, bytes: &mut Vec<u8>) {
 
 /// Decodes a canonical partition body, bounding allocations before reading entries.
 /// Leaf entries contain Record IDs; interior entries contain nonzero Partition Keys.
-pub(super) fn decode(
-    mut bytes: Bytes,
-    dimension: usize,
-    maximum_entries: u32,
-) -> Result<PartitionPlan> {
+pub(super) fn decode(mut bytes: Bytes, config: &IndexConfig) -> Result<PartitionPlan> {
     use bytes::Buf;
+    let dimension = config.dimension();
 
     if bytes.len() < 16 + dimension * 4 {
         return Err(corrupt());
@@ -39,7 +36,7 @@ pub(super) fn decode(
     let key = PartitionKey::new(bytes.get_u64()).map_err(|_| corrupt())?;
     let level = bytes.get_u32();
     let count = bytes.get_u32();
-    if level == 0 || count == 0 || count > maximum_entries {
+    if level == 0 || count == 0 || count > config.max_partition_entries(level) {
         return Err(corrupt());
     }
     let mut centroid = Vec::with_capacity(dimension);

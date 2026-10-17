@@ -44,8 +44,6 @@ async fn reservation<B: Backend>(
             "bulk",
             &input,
             ktann::construction::ConstructionOptions {
-                min_partition_entries: config(Metric::L2, true).min_partition_entries(),
-                max_partition_entries: config(Metric::L2, true).max_partition_entries(),
                 sample_items: options().sample_items,
                 memory_bytes: options().tree_memory_bytes,
                 scratch_bytes: options().tree_scratch_bytes,
@@ -556,8 +554,6 @@ async fn admission_and_artifact_identity_are_enforced_before_data_writes() {
             "other",
             &source,
             ktann::construction::ConstructionOptions {
-                min_partition_entries: config(Metric::L2, true).min_partition_entries(),
-                max_partition_entries: config(Metric::L2, true).max_partition_entries(),
                 sample_items: options().sample_items,
                 memory_bytes: options().tree_memory_bytes,
                 scratch_bytes: options().tree_scratch_bytes,

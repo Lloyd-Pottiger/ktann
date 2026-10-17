@@ -87,10 +87,14 @@ pub struct Configuration {
     pub search_percent: u8,
     /// Whether writes target a small conflict set.
     pub hot_updates: bool,
-    /// Logical Index merge threshold.
-    pub min_partition_entries: u32,
-    /// Logical Index split threshold.
-    pub max_partition_entries: u32,
+    /// Minimum non-root leaf occupancy.
+    pub min_leaf_partition_entries: u32,
+    /// Leaf split threshold.
+    pub max_leaf_partition_entries: u32,
+    /// Minimum non-root internal occupancy.
+    pub min_internal_partition_entries: u32,
+    /// Internal split threshold.
+    pub max_internal_partition_entries: u32,
     /// Runtime Partition Cache capacity.
     pub partition_cache_bytes: u64,
     /// Foreground operation concurrency limit.

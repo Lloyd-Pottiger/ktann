@@ -447,7 +447,9 @@ async fn drain_attempt<T: WriteTxn>(
         source_header.entry_count(),
         left_header.entry_count(),
         right_header.entry_count(),
-        manifest.config().min_partition_entries(),
+        manifest
+            .config()
+            .min_partition_entries(source_header.level()),
     );
     let moved = match &plan.batch {
         DrainBatch::Leaf(record_ids) => {
@@ -604,7 +606,7 @@ pub(crate) async fn advance_observed<B: Backend>(
     match state {
         PartitionTransition::Ready { .. } => {
             drop(authority);
-            if header.entry_count() <= manifest.config().max_partition_entries() {
+            if header.entry_count() <= manifest.config().max_partition_entries(header.level()) {
                 return Ok(Advance::Idle);
             }
             match begin_split(

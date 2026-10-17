@@ -70,7 +70,7 @@ An asynchronous topology change such as splitting or merging partitions that pre
 _Avoid_: Foreground mutation, rebuild
 
 **Split Threshold**:
-The configured Leaf Partition entry count that makes a Ready partition actionable for split without synchronously limiting its size.
+The configured entry count for a partition's level (leaf or internal) that makes a Ready partition actionable for split without synchronously limiting its size.
 _Avoid_: Hard partition limit, target partition size
 
 **Balanced Binary K-means Split**:

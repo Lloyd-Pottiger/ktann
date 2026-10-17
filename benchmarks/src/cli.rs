@@ -77,7 +77,10 @@ struct ExecutionOptions {
     base_vectors: Option<usize>,
     query_vectors: Option<usize>,
     query_offset: Option<usize>,
-    max_partition_entries: Option<u32>,
+    min_leaf_partition_entries: Option<u32>,
+    max_leaf_partition_entries: Option<u32>,
+    min_internal_partition_entries: Option<u32>,
+    max_internal_partition_entries: Option<u32>,
     query_concurrency: Option<Vec<usize>>,
     partition_cache_bytes: Option<u64>,
     leaf_beam_size: Option<u32>,
@@ -129,9 +132,21 @@ impl ExecutionOptions {
                 .get("query-offset")
                 .map(|value| parse_nonnegative(value, "query-offset"))
                 .transpose()?,
-            max_partition_entries: values
-                .get("max-partition-entries")
-                .map(|value| parse_positive_u32(value, "max-partition-entries"))
+            min_leaf_partition_entries: values
+                .get("min-leaf-partition-entries")
+                .map(|value| parse_positive_u32(value, "min-leaf-partition-entries"))
+                .transpose()?,
+            max_leaf_partition_entries: values
+                .get("max-leaf-partition-entries")
+                .map(|value| parse_positive_u32(value, "max-leaf-partition-entries"))
+                .transpose()?,
+            min_internal_partition_entries: values
+                .get("min-internal-partition-entries")
+                .map(|value| parse_positive_u32(value, "min-internal-partition-entries"))
+                .transpose()?,
+            max_internal_partition_entries: values
+                .get("max-internal-partition-entries")
+                .map(|value| parse_positive_u32(value, "max-internal-partition-entries"))
                 .transpose()?,
             query_concurrency: values
                 .get("query-concurrency")
@@ -190,7 +205,10 @@ const SCENARIO_OPTIONS: &[&str] = &[
     "base-vectors",
     "query-vectors",
     "query-offset",
-    "max-partition-entries",
+    "min-leaf-partition-entries",
+    "max-leaf-partition-entries",
+    "min-internal-partition-entries",
+    "max-internal-partition-entries",
     "maintenance-workers",
     "import-batch-size",
 ];
@@ -505,8 +523,20 @@ fn run_suite(options: RunOptions) -> Result<(), String> {
                 option_string(options.execution.query_offset),
             ),
             (
-                "max-partition-entries",
-                option_string(options.execution.max_partition_entries),
+                "min-leaf-partition-entries",
+                option_string(options.execution.min_leaf_partition_entries),
+            ),
+            (
+                "max-leaf-partition-entries",
+                option_string(options.execution.max_leaf_partition_entries),
+            ),
+            (
+                "min-internal-partition-entries",
+                option_string(options.execution.min_internal_partition_entries),
+            ),
+            (
+                "max-internal-partition-entries",
+                option_string(options.execution.max_internal_partition_entries),
             ),
             (
                 "maintenance-workers",
@@ -589,8 +619,17 @@ fn run_worker(options: WorkerOptions) -> Result<(), String> {
     if let Some(query_offset) = options.execution.query_offset {
         scenario.query_offset = query_offset;
     }
-    if let Some(max_partition_entries) = options.execution.max_partition_entries {
-        scenario.max_partition_entries = max_partition_entries;
+    if let Some(max_leaf_partition_entries) = options.execution.max_leaf_partition_entries {
+        scenario.max_leaf_partition_entries = max_leaf_partition_entries;
+    }
+    if let Some(maximum) = options.execution.max_internal_partition_entries {
+        scenario.max_internal_partition_entries = maximum;
+    }
+    if let Some(minimum) = options.execution.min_leaf_partition_entries {
+        scenario.min_leaf_partition_entries = minimum;
+    }
+    if let Some(minimum) = options.execution.min_internal_partition_entries {
+        scenario.min_internal_partition_entries = minimum;
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(options.execution.worker_threads)
@@ -920,7 +959,7 @@ fn shell_quote(value: &OsStr) -> String {
 
 /// Returns the stable help shown for missing or unknown public commands.
 fn usage() -> String {
-    "usage:\n  ktann-bench run --backend rocksdb|foundationdb [--profile smoke|full|large] [--scenario NAME] [--worker-threads N] [--query-concurrency N,...] [--partition-cache-bytes N] [--leaf-beam-size N] [--warmup-operations N] [--rocksdb-block-cache-bytes N] [--rocksdb-path PATH] [--reuse-index true|false] [--write-beam-size N] [--refinement-rounds 0..5] [--base-vectors N] [--query-vectors N] [--query-offset N] [--max-partition-entries N] [--maintenance-workers N] [--import-batch-size N] [--output PATH]\n  ktann-bench compare --baseline PATH --candidate PATH [--maximum-relative-regression N] [--maximum-recall-drop N] [--maximum-rejection-rate-increase N] [--output PATH]".to_owned()
+    "usage:\n  ktann-bench run --backend rocksdb|foundationdb [--profile smoke|full|large] [--scenario NAME] [--worker-threads N] [--query-concurrency N,...] [--partition-cache-bytes N] [--leaf-beam-size N] [--warmup-operations N] [--rocksdb-block-cache-bytes N] [--rocksdb-path PATH] [--reuse-index true|false] [--write-beam-size N] [--refinement-rounds 0..5] [--base-vectors N] [--query-vectors N] [--query-offset N] [--min-leaf-partition-entries N] [--max-leaf-partition-entries N] [--min-internal-partition-entries N] [--max-internal-partition-entries N] [--maintenance-workers N] [--import-batch-size N] [--output PATH]\n  ktann-bench compare --baseline PATH --candidate PATH [--maximum-relative-regression N] [--maximum-recall-drop N] [--maximum-rejection-rate-increase N] [--output PATH]".to_owned()
 }
 
 #[cfg(test)]

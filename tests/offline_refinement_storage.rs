@@ -27,7 +27,8 @@ async fn setup() -> (MemoryBackend, IndexManifest) {
             "refinement-storage",
             IndexConfig::new(1, Metric::L2)
                 .expect("config")
-                .with_partition_entries(2, 8)
+                .with_leaf_partition_entries(2, 8)
+                .and_then(|config| config.with_internal_partition_entries(1, 2))
                 .expect("capacity"),
         )
         .await

@@ -31,8 +31,10 @@ pub struct IndexConfig {
     metric: Metric,
     fields: Box<[FieldSchema]>,
     tree_key_fields: Box<[FieldId]>,
-    min_partition_entries: u32,
-    max_partition_entries: u32,
+    min_leaf_partition_entries: u32,
+    min_internal_partition_entries: u32,
+    max_leaf_partition_entries: u32,
+    max_internal_partition_entries: u32,
 }
 
 impl IndexConfig {
@@ -43,8 +45,10 @@ impl IndexConfig {
             metric,
             fields: Box::new([]),
             tree_key_fields: Box::new([]),
-            min_partition_entries: DEFAULT_MIN_PARTITION_ENTRIES,
-            max_partition_entries: DEFAULT_MAX_PARTITION_ENTRIES,
+            min_leaf_partition_entries: DEFAULT_MIN_PARTITION_ENTRIES,
+            min_internal_partition_entries: DEFAULT_MIN_PARTITION_ENTRIES,
+            max_leaf_partition_entries: DEFAULT_MAX_PARTITION_ENTRIES,
+            max_internal_partition_entries: DEFAULT_MAX_PARTITION_ENTRIES,
         };
         config.validate()?;
         Ok(config)
@@ -71,11 +75,19 @@ impl IndexConfig {
         Ok(self)
     }
 
-    /// Sets the minimum and maximum partition entry counts.
-    pub fn with_partition_entries(mut self, minimum: u32, maximum: u32) -> Result<Self> {
-        self.min_partition_entries = minimum;
-        self.max_partition_entries = maximum;
-        self.validate_partition_entries()?;
+    /// Sets leaf occupancy bounds and the asynchronous split threshold.
+    pub fn with_leaf_partition_entries(mut self, minimum: u32, maximum: u32) -> Result<Self> {
+        self.min_leaf_partition_entries = minimum;
+        self.max_leaf_partition_entries = maximum;
+        validate_partition_entries(minimum, maximum)?;
+        Ok(self)
+    }
+
+    /// Sets internal occupancy bounds and the asynchronous split threshold.
+    pub fn with_internal_partition_entries(mut self, minimum: u32, maximum: u32) -> Result<Self> {
+        validate_partition_entries(minimum, maximum)?;
+        self.min_internal_partition_entries = minimum;
+        self.max_internal_partition_entries = maximum;
         Ok(self)
     }
 
@@ -86,7 +98,14 @@ impl IndexConfig {
         }
         self.validate_schema()?;
         self.validate_tree_key_fields()?;
-        self.validate_partition_entries()
+        validate_partition_entries(
+            self.min_leaf_partition_entries,
+            self.max_leaf_partition_entries,
+        )?;
+        validate_partition_entries(
+            self.min_internal_partition_entries,
+            self.max_internal_partition_entries,
+        )
     }
 
     /// Validates the field inventory and index-wide limits before any storage work begins.
@@ -165,20 +184,6 @@ impl IndexConfig {
         Ok(())
     }
 
-    fn validate_partition_entries(&self) -> Result<()> {
-        let twice_minimum = self
-            .min_partition_entries
-            .checked_mul(2)
-            .ok_or_else(Error::invalid_argument)?;
-        if self.min_partition_entries == 0
-            || twice_minimum > self.max_partition_entries
-            || self.max_partition_entries > MAX_PARTITION_ENTRIES
-        {
-            return Err(Error::invalid_argument());
-        }
-        Ok(())
-    }
-
     /// Returns the exact vector dimension.
     #[must_use]
     pub const fn dimension(&self) -> usize {
@@ -203,17 +208,58 @@ impl IndexConfig {
         &self.tree_key_fields
     }
 
-    /// Returns the configured minimum partition entry count.
+    /// Returns the configured minimum leaf partition entry count.
     #[must_use]
-    pub const fn min_partition_entries(&self) -> u32 {
-        self.min_partition_entries
+    pub const fn min_leaf_partition_entries(&self) -> u32 {
+        self.min_leaf_partition_entries
     }
 
-    /// Returns the configured maximum partition entry count.
+    /// Returns the configured maximum leaf partition entry count.
     #[must_use]
-    pub const fn max_partition_entries(&self) -> u32 {
-        self.max_partition_entries
+    pub const fn max_leaf_partition_entries(&self) -> u32 {
+        self.max_leaf_partition_entries
     }
+
+    /// Returns the configured minimum internal partition entry count.
+    #[must_use]
+    pub const fn min_internal_partition_entries(&self) -> u32 {
+        self.min_internal_partition_entries
+    }
+
+    /// Returns the configured maximum internal partition entry count.
+    #[must_use]
+    pub const fn max_internal_partition_entries(&self) -> u32 {
+        self.max_internal_partition_entries
+    }
+
+    /// Selects occupancy by level; the root's minimum exception belongs to its caller.
+    pub const fn min_partition_entries(&self, level: u32) -> u32 {
+        if level == 1 {
+            self.min_leaf_partition_entries
+        } else {
+            self.min_internal_partition_entries
+        }
+    }
+
+    /// Selects the split threshold by level, including for the root.
+    pub const fn max_partition_entries(&self, level: u32) -> u32 {
+        if level == 1 {
+            self.max_leaf_partition_entries
+        } else {
+            self.max_internal_partition_entries
+        }
+    }
+}
+
+/// Validates each independently configured capacity pair.
+fn validate_partition_entries(minimum: u32, maximum: u32) -> Result<()> {
+    if minimum == 0
+        || minimum.checked_mul(2).is_none_or(|twice| twice > maximum)
+        || maximum > MAX_PARTITION_ENTRIES
+    {
+        return Err(Error::invalid_argument());
+    }
+    Ok(())
 }
 
 /// Process-local configuration owned by one Runtime.
@@ -431,11 +477,11 @@ impl RuntimeConfig {
 
     /// Returns the minimum state age before a worker assists rediscovered work.
     ///
-    /// The default is `max(1 ms, 1 s * max_partition_entries / 128)`.
+    /// The default is `max(1 ms, 1 s * level_maximum / 128)`.
     #[must_use]
-    pub fn stalled_timeout(&self, index: &IndexConfig) -> Duration {
+    pub fn stalled_timeout(&self, index: &IndexConfig, level: u32) -> Duration {
         self.stalled_timeout.unwrap_or_else(|| {
-            (Duration::from_secs(u64::from(index.max_partition_entries())) / 128)
+            (Duration::from_secs(u64::from(index.max_partition_entries(level))) / 128)
                 .max(Duration::from_millis(1))
         })
     }

@@ -173,7 +173,10 @@ depth 64, and 1,024 values per `IN`.
 ### 4.1 Index configuration
 
 `IndexConfig` persists dimension, metric, ordered fields, ordered unique
-non-null Tree Key FieldIds, and minimum/maximum partition entries. Limits are:
+non-null Tree Key FieldIds, and independent leaf/internal minimum and maximum
+partition entries. `with_leaf_partition_entries` and
+`with_internal_partition_entries` set each pair; all four values participate in
+immutable identity comparisons. Limits are:
 
 | Item | Contract |
 | --- | --- |
@@ -181,7 +184,13 @@ non-null Tree Key FieldIds, and minimum/maximum partition entries. Limits are:
 | Fields | at most 16 |
 | Bloom-enabled fields | at most 4 |
 | Encoded Tree Key | schema worst case at most 8 KiB |
-| Partition entries | `1 <= min`, `2 * min <= max <= 65,536`; defaults 64/512 |
+| Each partition capacity pair | `1 <= min`, `2 * min <= max <= 65,536`; defaults 64/512 |
+
+Level 1 selects leaf bounds; higher levels select internal bounds, including
+roots. Roots are exempt from minimum occupancy. Maxima are asynchronous split
+thresholds during online mutation and hard occupancy bounds for settled offline
+construction/refinement. Both pairs default to 64/512; experimental large
+internal capacities do not change those defaults.
 
 RaBitQ7, online split arity, Lloyd rounds, rotation algorithm, logical codecs, and
 hard safety caps are defined by the Persistent Format.

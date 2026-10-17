@@ -333,7 +333,7 @@ pub(crate) async fn advance_observed<'b, B: Backend>(
             // small tree's under-full root from committing an empty write
             // transaction on every pass.
             if partition == topology::root_partition()
-                || header.entry_count() >= manifest.config().min_partition_entries()
+                || header.entry_count() >= manifest.config().min_partition_entries(header.level())
             {
                 return Ok(Advance::Idle);
             }

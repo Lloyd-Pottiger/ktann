@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-use crate::api::{IndexConfig, PartitionKey, Result};
+use crate::api::{IndexConfig, PartitionKey, Result, RuntimeConfig};
 use crate::runtime::RetryPolicy;
 use crate::runtime::reads;
 use crate::storage::backend::Backend;
@@ -56,7 +56,7 @@ pub(crate) fn is_actionable(
 pub(crate) struct StepPolicy<'a> {
     pub(crate) now_unix_millis: u64,
     /// Applies to rediscovery; an already progressing worker has no age gate.
-    pub(crate) recovery_timeout: Option<Duration>,
+    pub(crate) recovery: Option<&'a RuntimeConfig>,
     pub(crate) retry: &'a RetryPolicy,
 }
 
@@ -87,10 +87,13 @@ pub(crate) async fn advance<B: Backend>(
         return Ok(Advance::Idle);
     };
     let header = authority.header;
-    if policy
-        .recovery_timeout
-        .is_some_and(|timeout| !recovery_due(authority.state, policy.now_unix_millis, timeout))
-    {
+    if policy.recovery.is_some_and(|runtime| {
+        !recovery_due(
+            authority.state,
+            policy.now_unix_millis,
+            runtime.stalled_timeout(manifest.config(), header.level()),
+        )
+    }) {
         return Ok(Advance::Idle);
     }
     let started_at_unix_millis = policy.now_unix_millis;
@@ -132,12 +135,14 @@ fn action(
     header: PartitionHeader,
 ) -> Option<Action> {
     match header.state() {
-        PartitionState::Ready if header.entry_count() > config.max_partition_entries() => {
+        PartitionState::Ready
+            if header.entry_count() > config.max_partition_entries(header.level()) =>
+        {
             Some(Action::Split)
         }
         PartitionState::Ready
             if partition != topology::root_partition()
-                && header.entry_count() < config.min_partition_entries() =>
+                && header.entry_count() < config.min_partition_entries(header.level()) =>
         {
             Some(Action::Merge)
         }
@@ -155,7 +160,8 @@ mod tests {
     fn config() -> IndexConfig {
         IndexConfig::new(1, Metric::L2)
             .expect("config")
-            .with_partition_entries(2, 8)
+            .with_leaf_partition_entries(2, 8)
+            .and_then(|config| config.with_internal_partition_entries(2, 8))
             .expect("partition entries")
     }
 
@@ -236,21 +242,40 @@ mod tests {
     }
 
     #[test]
-    fn eligibility_keeps_threshold_crossings_and_source_states() {
-        let config = config();
-        let root = topology::root_partition();
-        let child = PartitionKey::new(2).expect("child");
+    fn ready_thresholds_select_level_and_preserve_root_minimum_exception() {
+        let config = config()
+            .with_leaf_partition_entries(2, 4)
+            .unwrap()
+            .with_internal_partition_entries(8, 16)
+            .unwrap();
+        for (level, minimum, maximum) in [(1, 2, 4), (2, 8, 16), (4, 8, 16)] {
+            for (count, expected) in [
+                (minimum - 1, Some(Action::Merge)),
+                (minimum, None),
+                (maximum, None),
+                (maximum + 1, Some(Action::Split)),
+            ] {
+                let header = PartitionHeader::new(level, count, 0, PartitionState::Ready).unwrap();
+                assert_eq!(
+                    action(&config, PartitionKey::new(2).unwrap(), header),
+                    expected
+                );
+                assert_eq!(
+                    action(&config, topology::root_partition(), header),
+                    if expected == Some(Action::Merge) {
+                        None
+                    } else {
+                        expected
+                    }
+                );
+            }
+        }
+    }
 
-        assert!(is_actionable(
-            &config,
-            root,
-            header(9, PartitionState::Ready)
-        ));
-        assert!(is_actionable(
-            &config,
-            child,
-            header(1, PartitionState::Ready)
-        ));
+    #[test]
+    fn eligibility_keeps_source_states() {
+        let config = config();
+        let child = PartitionKey::new(2).expect("child");
         for state in [
             PartitionState::Splitting,
             PartitionState::DrainingSplit,

@@ -30,7 +30,8 @@ fn minimal_manifest() -> IndexManifest {
         id(1),
         IndexConfig::new(1, Metric::L2)
             .expect("valid config")
-            .with_partition_entries(16, 512)
+            .with_leaf_partition_entries(16, 512)
+            .and_then(|config| config.with_internal_partition_entries(8, 128))
             .expect("fixed codec configuration"),
         [0; 32],
         vec![],
@@ -54,7 +55,8 @@ fn rich_manifest() -> IndexManifest {
         .expect("valid fields")
         .with_tree_key_fields(vec![FieldId(0)])
         .expect("valid Tree Key fields")
-        .with_partition_entries(2, 4)
+        .with_leaf_partition_entries(2, 4)
+        .and_then(|config| config.with_internal_partition_entries(2, 4))
         .expect("valid partition limits");
     let mut seed = [0_u8; 32];
     for (value, byte) in seed.iter_mut().zip(0_u8..) {
@@ -235,6 +237,8 @@ fn namespace_and_manifest_golden_bytes() {
     expected.extend_from_slice(&0_u16.to_be_bytes());
     expected.extend_from_slice(&16_u32.to_be_bytes());
     expected.extend_from_slice(&512_u32.to_be_bytes());
+    expected.extend_from_slice(&8_u32.to_be_bytes());
+    expected.extend_from_slice(&128_u32.to_be_bytes());
     expected.extend_from_slice(&[0; 32]);
     assert_eq!(
         codec
@@ -969,8 +973,6 @@ fn building_manifest_and_request_descriptor_have_canonical_bytes() {
     input_bytes[49..57].copy_from_slice(&41_u64.to_be_bytes());
     let input = ArtifactManifest::decode(&input_bytes).unwrap();
     let options = ConstructionOptions {
-        min_partition_entries: 2,
-        max_partition_entries: 4,
         sample_items: 8,
         memory_bytes: 2 * 1024 * 1024,
         scratch_bytes: 16 * 1024 * 1024,
@@ -984,8 +986,6 @@ fn building_manifest_and_request_descriptor_have_canonical_bytes() {
     expected.extend_from_slice(b"/source");
     expected.extend_from_slice(&89_u32.to_be_bytes());
     expected.extend_from_slice(&input_bytes);
-    expected.extend_from_slice(&2_u32.to_be_bytes());
-    expected.extend_from_slice(&4_u32.to_be_bytes());
     for number in [8_u64, 2 * 1024 * 1024, 16 * 1024 * 1024] {
         expected.extend_from_slice(&number.to_be_bytes());
     }
