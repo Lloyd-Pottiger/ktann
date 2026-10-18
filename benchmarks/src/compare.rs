@@ -1327,6 +1327,8 @@ mod tests {
                 tokio_worker_threads: 4,
             },
             configuration: Configuration {
+                routing_experiment: None,
+                query_offset: 0,
                 backend: "rocksdb".to_owned(),
                 scenario: "ann".to_owned(),
                 profile: "smoke".to_owned(),
@@ -1448,6 +1450,7 @@ mod tests {
         };
         baseline.measurements =
             ReportMeasurements::QualitySweep(Box::new(QualitySweepMeasurements {
+                routing_setup: None,
                 construction: Some(Default::default()),
                 points: vec![
                     QualityPoint {
@@ -1491,6 +1494,7 @@ mod tests {
         };
         baseline.measurements =
             ReportMeasurements::QualitySweep(Box::new(QualitySweepMeasurements {
+                routing_setup: None,
                 construction: Some(Default::default()),
                 points: vec![QualityPoint {
                     leaf_beam_size: 32,
@@ -1522,10 +1526,12 @@ mod tests {
         for baseline_built in [false, true] {
             for candidate_built in [false, true] {
                 let baseline = QualitySweepMeasurements {
+                    routing_setup: None,
                     construction: baseline_built.then(Default::default),
                     ..Default::default()
                 };
                 let candidate = QualitySweepMeasurements {
+                    routing_setup: None,
                     construction: candidate_built.then(Default::default),
                     ..Default::default()
                 };
@@ -1553,13 +1559,15 @@ mod tests {
             panic!("steady fixture")
         };
         let construction = crate::report::ConstructionMeasurements {
-            refinement_rounds: 0,
-            refinement_moves: 0,
+            bulk: None,
+            refinement_rounds: Some(0),
+            refinement_moves: Some(0),
             wall_seconds: 10.0,
             ..Default::default()
         };
         baseline.measurements =
             ReportMeasurements::QualitySweep(Box::new(QualitySweepMeasurements {
+                routing_setup: None,
                 construction: Some(construction),
                 points: vec![QualityPoint {
                     leaf_beam_size: 1,

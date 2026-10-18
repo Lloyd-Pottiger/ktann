@@ -27,6 +27,8 @@ path = "src/lib.rs"
 default = []
 # Low-level fault injection controls are excluded from production builds.
 test-support = []
+# Experimental routing comparisons; never required by production serving.
+benchmark = []
 
 [dependencies]
 ktann-usearch = { path = "ktann-usearch" }

@@ -36,6 +36,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(3600);
 
 /// Private CLI options. A bridge owns exactly one isolated backend namespace.
 struct Options {
+    experiment: Option<crate::routing::Experiment>,
     socket: PathBuf,
     database: PathBuf,
     report: PathBuf,
@@ -49,6 +50,7 @@ struct Options {
 pub fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     let mut options = Options {
+        experiment: None,
         socket: PathBuf::new(),
         database: PathBuf::new(),
         report: PathBuf::new(),
@@ -59,6 +61,12 @@ pub fn run() -> Result<(), String> {
             "expected --socket PATH --database PATH --report PATH --backend rocksdb|foundationdb",
         )?;
         match arg.as_str() {
+            "--routing-experiment" => {
+                let experiment: crate::routing::Experiment =
+                    serde_json::from_str(&value).map_err(|e| e.to_string())?;
+                experiment.validate()?;
+                options.experiment = Some(experiment);
+            }
             "--socket" => options.socket = value.into(),
             "--database" => options.database = value.into(),
             "--report" => options.report = value.into(),
@@ -214,6 +222,7 @@ fn decode_request(data: &[u8]) -> Result<Request, String> {
 /// Lifecycle state is exclusive for mutation and shared for concurrent search.
 struct State<B: Backend> {
     index: Option<Index<MeasuredBackend<B>>>,
+    global_router: Option<Arc<ktann::benchmark::GlobalLeafRouter>>,
     bulk: Option<bulk::InputCapture>,
     bulk_report: Value,
     ready: bool,
@@ -235,6 +244,7 @@ impl<B: Backend> Default for State<B> {
     fn default() -> Self {
         Self {
             index: None,
+            global_router: None,
             bulk: None,
             bulk_report: Value::Null,
             ready: false,
@@ -287,6 +297,7 @@ impl Default for Measurements {
 
 /// Shared process owner. No KTANN handle crosses the Python process boundary.
 struct Service<B: Backend> {
+    experiment: Option<crate::routing::Experiment>,
     runtime: Runtime<MeasuredBackend<B>>,
     bulk_workspace: PathBuf,
     backend: MeasuredBackend<B>,
@@ -325,12 +336,20 @@ async fn serve<B: Backend>(backend: B, identity: String, options: &Options) -> R
     let config = RuntimeConfig::default()
         .with_maintenance(0, 1)
         .map_err(|e| e.to_string())?;
+    let config = if let Some(experiment) = &options.experiment {
+        config
+            .with_routing_working_bytes(experiment.routing_working_bytes)
+            .map_err(|e| e.to_string())?
+    } else {
+        config
+    };
     // Keep captured input and build files alive through retries and runtime shutdown.
     let workspace = tempfile::Builder::new()
         .prefix("ktann-vdbbench-")
         .tempdir()
         .map_err(|e| e.to_string())?;
     let service = Arc::new(Service {
+        experiment: options.experiment.clone(),
         runtime: Runtime::new(backend.clone(), config).map_err(|e| e.to_string())?,
         bulk_workspace: workspace.path().join("bulk"),
         backend,
@@ -518,7 +537,17 @@ impl<B: Backend> Service<B> {
                     })
                     .and_then(|c| c.with_fields(vec![FieldSchema::new("id", DataType::I64)?]))
                     .map_err(api_error)?;
+                let config = if let Some(experiment) = &self.experiment {
+                    config.with_fixed_graph(experiment.graph().map_err(api_error)?)
+                } else {
+                    config
+                };
                 let mut search = SearchOptions::default();
+                if let Some(experiment) = &self.experiment {
+                    search = search
+                        .with_routing_mode(experiment.production_mode())
+                        .map_err(api_error)?;
+                }
                 if let Some(beam) = leaf_beam {
                     search = search.with_leaf_beam_size(beam).map_err(api_error)?;
                 }
@@ -532,11 +561,14 @@ impl<B: Backend> Service<B> {
                     .await
                     .map_err(api_error)?;
                 let root = self.bulk_workspace.clone();
+                let experiment = self.experiment.clone();
                 state.bulk = Some(
-                    tokio::task::spawn_blocking(move || bulk::InputCapture::new(root, config))
-                        .await
-                        .map_err(|e| ("other", e.to_string()))?
-                        .map_err(api_error)?,
+                    tokio::task::spawn_blocking(move || {
+                        bulk::InputCapture::new(root, config, experiment, refinement_rounds as u8)
+                    })
+                    .await
+                    .map_err(|e| ("other", e.to_string()))?
+                    .map_err(api_error)?,
                 );
                 state.refinement_rounds = refinement_rounds;
                 state.refinement_input_bytes = refinement_input_bytes;
@@ -614,13 +646,31 @@ impl<B: Backend> Service<B> {
                         state.bulk_report = report;
                     }
                     let index = state.index.as_ref().expect("bulk build published").clone();
-                    let options = RefineOptions::new(state.refinement_input_bytes)
-                        .and_then(|options| options.with_refinement_rounds(state.refinement_rounds))
-                        .map_err(api_error)?;
-                    let refinement_started = Instant::now();
-                    let result = index.refine(options.with_operation_options(control)).await;
-                    state.refinement_seconds += refinement_started.elapsed().as_secs_f64();
-                    result.map_err(api_error)?;
+                    if self.experiment.is_none() {
+                        let options = RefineOptions::new(state.refinement_input_bytes)
+                            .and_then(|options| {
+                                options.with_refinement_rounds(state.refinement_rounds)
+                            })
+                            .map_err(api_error)?;
+                        let refinement_started = Instant::now();
+                        let result = index.refine(options.with_operation_options(control)).await;
+                        state.refinement_seconds += refinement_started.elapsed().as_secs_f64();
+                        result.map_err(api_error)?;
+                    }
+                    if let Some(experiment) = &self.experiment
+                        && experiment.global()
+                        && state.global_router.is_none()
+                    {
+                        state.global_router = Some(Arc::new(
+                            index
+                                .global_leaf_router(
+                                    experiment.global_working_bytes,
+                                    experiment.mode == crate::routing::Mode::GlobalHnsw,
+                                )
+                                .await
+                                .map_err(api_error)?,
+                        ));
+                    }
                     let snapshot =
                         topology::snapshot(&self.backend, index.logical_index_id(), records)
                             .await
@@ -656,7 +706,15 @@ impl<B: Backend> Service<B> {
                     });
                 }
                 let start = Instant::now();
-                let result = index.search(request).await.map_err(api_error)?;
+                let (result, _) = index
+                    .benchmark_search(
+                        request,
+                        state.global_router.clone(),
+                        self.experiment.as_ref().map_or(1, |e| e.ef_search as usize),
+                        None,
+                    )
+                    .await
+                    .map_err(api_error)?;
                 let elapsed = start.elapsed();
                 let ids: Vec<i64> = result
                     .hits
@@ -730,6 +788,7 @@ impl<B: Backend> Service<B> {
             "records": state.records,
             "ready": state.ready,
             "configuration": {
+                "routing_experiment": self.experiment,
                 "min_leaf_partition_entries": index_config.map(IndexConfig::min_leaf_partition_entries),
                 "max_leaf_partition_entries": index_config.map(IndexConfig::max_leaf_partition_entries),
                 "min_internal_partition_entries": index_config.map(IndexConfig::min_internal_partition_entries),

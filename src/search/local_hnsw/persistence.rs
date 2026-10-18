@@ -111,6 +111,8 @@ pub(crate) fn build_records(
         working_bytes,
         check,
     )?;
+    ::metrics::histogram!("ktann.routing.native_build_peak_bytes")
+        .record(graph.peak_bytes() as f64);
     persist_graph(
         centroids,
         &graph,

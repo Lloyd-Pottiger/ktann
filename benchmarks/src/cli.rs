@@ -40,6 +40,7 @@ where
     let arguments: Vec<OsString> = arguments.collect();
     match command.as_str() {
         "run" => run_suite(parse_run_options(&arguments)?),
+        "summarize-routing" => summarize_routing(&arguments),
         "compare" => compare_reports(parse_compare_options(&arguments)?),
         // Each public suite scenario executes in a fresh process so metrics
         // recorder state, Partition Cache, and peak RSS cannot leak between
@@ -70,6 +71,7 @@ struct WorkerOptions {
 /// Execution settings shared by the suite and its scenario workers.
 #[derive(Clone, Debug)]
 struct ExecutionOptions {
+    routing_experiment: Option<String>,
     backend: String,
     worker_threads: usize,
     write_beam_size: Option<u32>,
@@ -106,7 +108,14 @@ impl ExecutionOptions {
         {
             return Err("RocksDB cache and fixture options require --backend rocksdb".to_owned());
         }
+        let routing_experiment = values.get("routing-experiment").cloned();
+        if let Some(json) = &routing_experiment {
+            let experiment: crate::routing::Experiment = serde_json::from_str(json)
+                .map_err(|e| format!("invalid routing experiment JSON: {e}"))?;
+            experiment.validate()?;
+        }
         Ok(Self {
+            routing_experiment,
             backend,
             worker_threads: match values.get("worker-threads") {
                 Some(value) => parse_positive(value, "worker-threads")?,
@@ -189,6 +198,7 @@ impl ExecutionOptions {
 }
 
 const SCENARIO_OPTIONS: &[&str] = &[
+    "routing-experiment",
     "backend",
     "profile",
     "scenario",
@@ -266,10 +276,14 @@ fn parse_run_options(arguments: &[OsString]) -> Result<RunOptions, String> {
         .unwrap_or_else(|| "smoke".to_owned());
     let scenario = values.get("scenario").cloned();
     let execution = ExecutionOptions::parse(&values)?;
-    if execution.rocksdb_path.is_some() && (profile != "large" || scenario.is_none()) {
+    if execution.rocksdb_path.is_some()
+        && ((profile != "large" && scenario.as_deref() != Some("quality-routing-smoke"))
+            || scenario.is_none())
+    {
         return Err("--rocksdb-path requires --profile large and one --scenario".to_owned());
     }
     if profile != "large"
+        && scenario.as_deref() != Some("quality-routing-smoke")
         && (execution.query_concurrency.is_some() || execution.leaf_beam_size.is_some())
     {
         return Err("--query-concurrency and --leaf-beam-size require --profile large".to_owned());
@@ -543,6 +557,10 @@ fn run_suite(options: RunOptions) -> Result<(), String> {
                 option_string(lifecycle.maintenance_workers),
             ),
             ("import-batch-size", option_string(lifecycle.batch_size)),
+            (
+                "routing-experiment",
+                options.execution.routing_experiment.clone(),
+            ),
         ] {
             if let Some(value) = value {
                 command.args([format!("--{name}"), value]);
@@ -576,9 +594,22 @@ fn run_worker(options: WorkerOptions) -> Result<(), String> {
         .find(|scenario| scenario.name == options.scenario)
         .ok_or_else(|| format!("unknown scenario `{}`", options.scenario))?;
     options.execution.lifecycle.apply(&mut scenario);
+    if let Some(json) = &options.execution.routing_experiment {
+        if scenario.leaf_beam_sweep.is_empty() {
+            return Err("--routing-experiment requires a quality scenario".into());
+        }
+        let experiment: crate::routing::Experiment =
+            serde_json::from_str(json).map_err(|e| e.to_string())?;
+        scenario.search_options = scenario
+            .search_options
+            .with_routing_mode(experiment.production_mode())
+            .map_err(|e| e.to_string())?;
+        scenario.maintenance_workers = 0;
+        scenario.routing_experiment = Some(experiment);
+    }
     if options.execution.rocksdb_path.is_some() {
-        if scenario.profile != "large" {
-            return Err("--rocksdb-path requires --profile large".to_owned());
+        if scenario.leaf_beam_sweep.is_empty() {
+            return Err("--rocksdb-path requires a quality scenario".to_owned());
         }
         scenario.persisted_index = options.execution.rocksdb_path.clone();
         scenario.reuse_index = options.execution.reuse_index;
@@ -587,8 +618,8 @@ fn run_worker(options: WorkerOptions) -> Result<(), String> {
         scenario.warmup_operations = count;
     }
     if let Some(concurrency) = &options.execution.query_concurrency {
-        if scenario.profile != "large" {
-            return Err("--query-concurrency requires --profile large".to_owned());
+        if scenario.leaf_beam_sweep.is_empty() {
+            return Err("--query-concurrency requires a quality scenario".to_owned());
         }
         scenario.query_concurrency_sweep = concurrency.clone();
     }
@@ -596,8 +627,8 @@ fn run_worker(options: WorkerOptions) -> Result<(), String> {
         scenario.partition_cache_bytes = bytes;
     }
     if let Some(beam) = options.execution.leaf_beam_size {
-        if scenario.profile != "large" {
-            return Err("--leaf-beam-size requires --profile large".to_owned());
+        if scenario.leaf_beam_sweep.is_empty() {
+            return Err("--leaf-beam-size requires a quality scenario".to_owned());
         }
         scenario.leaf_beam_sweep = vec![beam];
     }
@@ -959,7 +990,64 @@ fn shell_quote(value: &OsStr) -> String {
 
 /// Returns the stable help shown for missing or unknown public commands.
 fn usage() -> String {
-    "usage:\n  ktann-bench run --backend rocksdb|foundationdb [--profile smoke|full|large] [--scenario NAME] [--worker-threads N] [--query-concurrency N,...] [--partition-cache-bytes N] [--leaf-beam-size N] [--warmup-operations N] [--rocksdb-block-cache-bytes N] [--rocksdb-path PATH] [--reuse-index true|false] [--write-beam-size N] [--refinement-rounds 0..5] [--base-vectors N] [--query-vectors N] [--query-offset N] [--min-leaf-partition-entries N] [--max-leaf-partition-entries N] [--min-internal-partition-entries N] [--max-internal-partition-entries N] [--maintenance-workers N] [--import-batch-size N] [--output PATH]\n  ktann-bench compare --baseline PATH --candidate PATH [--maximum-relative-regression N] [--maximum-recall-drop N] [--maximum-rejection-rate-increase N] [--output PATH]".to_owned()
+    "usage:\n  ktann-bench run --backend rocksdb|foundationdb [--profile smoke|full|large] [--routing-experiment JSON] [--scenario NAME] [--worker-threads N] [--query-concurrency N,...] [--partition-cache-bytes N] [--leaf-beam-size N] [--warmup-operations N] [--rocksdb-block-cache-bytes N] [--rocksdb-path PATH] [--reuse-index true|false] [--write-beam-size N] [--refinement-rounds 0..5] [--base-vectors N] [--query-vectors N] [--query-offset N] [--min-leaf-partition-entries N] [--max-leaf-partition-entries N] [--min-internal-partition-entries N] [--max-internal-partition-entries N] [--maintenance-workers N] [--import-batch-size N] [--output PATH]\n  ktann-bench summarize-routing --inputs PATH,PATH,...\n  ktann-bench compare --baseline PATH --candidate PATH [--maximum-relative-regression N] [--maximum-recall-drop N] [--maximum-rejection-rate-increase N] [--output PATH]".to_owned()
+}
+
+/// Summarizes routing matrix rows without treating unequal recall as a speedup.
+fn summarize_routing(arguments: &[OsString]) -> Result<(), String> {
+    let values = option_map(arguments, &["inputs"])?;
+    println!(
+        "file\tmode\tleaf_max\tinternal_max\tbeam\tef\tclients\trecall_mean\trecall_min\tQPS\tp95_ms\tlogical_read_bytes\tpeak_RSS_bytes"
+    );
+    for path in required(&values, "inputs")?.split(',') {
+        let bytes = fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
+        let suite: BenchmarkSuite =
+            serde_json::from_slice(&bytes).map_err(|e| format!("decode {path}: {e}"))?;
+        if suite.schema_version != REPORT_SCHEMA_VERSION {
+            return Err(format!("unsupported report schema in {path}"));
+        }
+        for report in suite.reports {
+            let Some(experiment) = report.configuration.routing_experiment else {
+                return Err(format!("{path} is not a routing experiment"));
+            };
+            let crate::report::ReportMeasurements::QualitySweep(sweep) = report.measurements else {
+                return Err(format!("{path} is not a quality sweep"));
+            };
+            let process_peak = sweep
+                .routing_setup
+                .as_ref()
+                .and_then(|setup| setup["measured_process_peak_rss_bytes"].as_u64());
+            for point in sweep.points {
+                let measured = point.measurements;
+                let recall = measured
+                    .recall_at_k
+                    .ok_or_else(|| format!("{path} has no final recall"))?;
+                let search = measured
+                    .operations
+                    .get(&crate::report::OperationClass::Search)
+                    .ok_or_else(|| format!("{path} has no search measurements"))?;
+                println!(
+                    "{path}\t{:?}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{:.2}\t{:.3}\t{}\t{}",
+                    experiment.mode,
+                    report.configuration.max_leaf_partition_entries,
+                    report.configuration.max_internal_partition_entries,
+                    point.leaf_beam_size,
+                    experiment.ef_search,
+                    point.concurrency,
+                    recall.mean,
+                    recall.min,
+                    measured.throughput_per_second,
+                    search.latency_ms.p95,
+                    measured.backend_io.bytes_read,
+                    measured
+                        .peak_rss_bytes
+                        .or(process_peak)
+                        .map_or_else(|| "unavailable".into(), |bytes| bytes.to_string())
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

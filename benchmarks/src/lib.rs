@@ -9,6 +9,7 @@ mod dataset;
 mod metrics;
 mod report;
 mod resource;
+mod routing;
 mod runner;
 
 pub mod bridge;

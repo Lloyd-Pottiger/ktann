@@ -110,6 +110,7 @@ impl<'a> GraphPreparation<'a> {
             self.index.config().max_internal_partition_entries() as usize,
             check,
         )?;
+        let started = std::time::Instant::now();
         let records = build_records(
             centroids,
             GraphSource {
@@ -122,6 +123,9 @@ impl<'a> GraphPreparation<'a> {
             self.budget,
             check,
         )?;
+        ::metrics::histogram!("ktann.routing.build_seconds")
+            .record(started.elapsed().as_secs_f64());
+        ::metrics::counter!("ktann.routing.stored_graph_bytes").increment(records.descriptor.bytes);
         let index = self.index.logical_index_id();
         emit(
             LogicalKey::GraphDescriptor {

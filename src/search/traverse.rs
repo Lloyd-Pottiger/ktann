@@ -64,9 +64,31 @@ pub(crate) struct TraversalRequest<'a> {
     budgets: SearchBudgets,
     leaf_beam: u32,
     routing_mode: RoutingMode,
+    #[cfg(feature = "benchmark")]
+    selected_leaves: Option<&'a [(PartitionKey, f64)]>,
+    #[cfg(feature = "benchmark")]
+    diagnostics: Option<&'a std::sync::Mutex<crate::benchmark::SearchDiagnostics>>,
 }
 
 impl<'a> TraversalRequest<'a> {
+    #[cfg(feature = "benchmark")]
+    pub(crate) fn with_diagnostics(
+        mut self,
+        diagnostics: Option<&'a std::sync::Mutex<crate::benchmark::SearchDiagnostics>>,
+    ) -> Self {
+        self.diagnostics = diagnostics;
+        self
+    }
+
+    #[cfg(feature = "benchmark")]
+    pub(crate) fn with_selected_leaves(
+        mut self,
+        leaves: Option<&'a [(PartitionKey, f64)]>,
+    ) -> Self {
+        self.selected_leaves = leaves;
+        self
+    }
+
     /// Uses the already validated public routing choice.
     pub(crate) fn with_routing_mode(mut self, mode: RoutingMode) -> Self {
         self.routing_mode = mode;
@@ -93,6 +115,10 @@ impl<'a> TraversalRequest<'a> {
             budgets,
             leaf_beam,
             routing_mode: RoutingMode::Exact,
+            #[cfg(feature = "benchmark")]
+            selected_leaves: None,
+            #[cfg(feature = "benchmark")]
+            diagnostics: None,
         })
     }
 }
@@ -222,6 +248,25 @@ pub(crate) async fn traverse<T: ReadOps>(
         request,
     };
     let mut state = Traversal::seed(context.request.trees)?;
+    #[cfg(feature = "benchmark")]
+    if let Some(leaves) = context.request.selected_leaves {
+        if context.request.trees.len() != 1 || manifest.config().fixed_graph().is_none() {
+            return Err(Error::invalid_argument());
+        }
+        state.frontier.clear();
+        state.referenced.clear();
+        for &(partition, distance) in leaves {
+            if !state.referenced.insert((0, partition)) {
+                return Err(Error::invalid_argument());
+            }
+            state.frontier.push(Reverse(FrontierEntry {
+                distance,
+                tree: 0,
+                partition,
+                expected_level: Some(1),
+            }));
+        }
+    }
     state.run(txn, &context).await?;
     state.finish()
 }
@@ -725,6 +770,9 @@ impl Traversal {
             .execution
             .candidates(graph, query, beam, context.request.routing_mode)
             .await?;
+        ::metrics::counter!("ktann.routing.parent_visits", "level" => routing_level_label(visit.header.level())).increment(1);
+        ::metrics::counter!("ktann.routing.merge_candidates").increment(candidates.len() as u64);
+        let merge_started = std::time::Instant::now();
         for (ordinal, (child, distance)) in candidates.into_iter().enumerate() {
             if ordinal % 64 == 0 {
                 context.execution.checkpoint()?;
@@ -737,6 +785,8 @@ impl Traversal {
                 context.request.leaf_beam,
             )?;
         }
+        ::metrics::histogram!("ktann.routing.merge_seconds")
+            .record(merge_started.elapsed().as_secs_f64());
         Ok(())
     }
 
@@ -888,6 +938,17 @@ impl Traversal {
         let BodyEntries::Leaf(entries) = body.entries() else {
             return Err(Error::new(ErrorKind::Corruption));
         };
+        #[cfg(feature = "benchmark")]
+        if let Some(diagnostics) = context.request.diagnostics {
+            let mut diagnostics = diagnostics
+                .lock()
+                .map_err(|_| Error::new(ErrorKind::Other))?;
+            diagnostics.leaves.push(partition);
+            diagnostics.neighbors_in_leaves += entries
+                .iter()
+                .filter(|entry| diagnostics.truth.contains(entry.record_id()))
+                .count();
+        }
         // Only predicate evaluation needs a temporary list of entry references.
         // Without a predicate (including AllMatch), score the body directly.
         let filtered;
@@ -1016,6 +1077,20 @@ fn score_leaf_entries<'a, T: Borrow<CachedLeafEntry>>(
         ));
     }
     Ok(batch)
+}
+
+/// Keeps metrics cardinality bounded even for unusually deep valid trees.
+fn routing_level_label(level: u32) -> &'static str {
+    const LEVELS: [&str; 32] = [
+        "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16",
+        "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31",
+        "32",
+    ];
+    level
+        .checked_sub(1)
+        .and_then(|level| LEVELS.get(level as usize))
+        .copied()
+        .unwrap_or("33+")
 }
 
 #[cfg(test)]
