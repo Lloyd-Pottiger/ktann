@@ -4,6 +4,8 @@
 //! borrows the authoritative Child Entries and uses the existing numeric
 //! kernel inside USearch, retaining its returned distances unchanged.
 
+pub(crate) mod persistence;
+
 use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -153,6 +155,7 @@ impl<'a> Centroids<'a> {
 pub(crate) struct LocalHnsw<'a> {
     centroids: Centroids<'a>,
     graph: ktann_usearch::Graph,
+    identity: [u8; 32],
 }
 
 impl<'a> LocalHnsw<'a> {
@@ -198,7 +201,12 @@ impl<'a> LocalHnsw<'a> {
                 proceed,
             )
         })?;
-        Ok(Self { centroids, graph })
+        let identity = persistence::identity(centroids, parameters, tree, parent, check)?;
+        Ok(Self {
+            centroids,
+            graph,
+            identity,
+        })
     }
 
     /// Returns the full clipped local beam, sorted by distance then child key.
@@ -269,6 +277,7 @@ fn native_error(error: ktann_usearch::Error) -> Error {
         ktann_usearch::Error::LimitExceeded => ErrorKind::LimitExceeded,
         ktann_usearch::Error::Cancelled => ErrorKind::Cancelled,
         ktann_usearch::Error::Invariant => ErrorKind::Other,
+        ktann_usearch::Error::InvalidEncoding => ErrorKind::Corruption,
     })
 }
 

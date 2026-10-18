@@ -1110,3 +1110,61 @@ fn build_schedule_golden_and_malformed_lease() {
     golden.push(0);
     assert!(codec.decode(&key, Bytes::from(golden)).is_err());
 }
+
+#[test]
+fn graph_envelope_golden_bounds_and_malformed_values() {
+    use ktann::storage::values::{GRAPH_CHUNK_BYTES, GraphChunk, MAX_GRAPH_VALUE_BYTES};
+    let codec = ValueCodec::bootstrap();
+    let tree_key = TreeKey::encode(&[], &[]).unwrap();
+    let descriptor_key = LogicalKey::GraphDescriptor {
+        index: id(1),
+        tree_key: tree_key.clone(),
+        partition: pk(2),
+    };
+    let chunk_key = LogicalKey::GraphChunk {
+        index: id(1),
+        tree_key,
+        partition: pk(2),
+        chunk: 0,
+    };
+    let mut golden = vec![0x12, ktann_usearch::NATIVE_ENCODING];
+    golden.extend_from_slice(&1_u32.to_be_bytes());
+    golden.extend_from_slice(&42_u64.to_be_bytes());
+    golden.extend_from_slice(&72_u64.to_be_bytes());
+    golden.extend_from_slice(&[7; 32]);
+    golden.extend_from_slice(&[8; 32]);
+    let descriptor = codec
+        .decode(&descriptor_key, Bytes::from(golden.clone()))
+        .unwrap();
+    assert_eq!(codec.encode(&descriptor).unwrap(), golden);
+    for length in 0..golden.len() {
+        assert_corrupt(codec.decode(&descriptor_key, Bytes::copy_from_slice(&golden[..length])));
+    }
+    for (offset, value) in [(0, 0x13), (1, 0), (5, 0), (21, 39), (2, 255), (14, 255)] {
+        let mut bad = golden.clone();
+        bad[offset] = value;
+        assert_corrupt(codec.decode(&descriptor_key, bad.into()));
+    }
+    let mut trailing = golden.clone();
+    trailing.push(0);
+    assert_corrupt(codec.decode(&descriptor_key, trailing.into()));
+    assert_corrupt(codec.decode(&chunk_key, golden.into()));
+    let chunk = PersistentValue::GraphChunk(GraphChunk::new(Bytes::from_static(&[0; 9])).unwrap());
+    let mut expected = vec![0x13, 0, 0, 0, 9];
+    expected.extend_from_slice(&[0; 9]);
+    assert_eq!(codec.encode(&chunk).unwrap(), expected);
+    assert_eq!(codec.decode(&chunk_key, expected.into()).unwrap(), chunk);
+    assert!(GraphChunk::new(Bytes::new()).is_err());
+    assert!(GraphChunk::new(Bytes::from(vec![0; GRAPH_CHUNK_BYTES + 1])).is_err());
+    let full = codec
+        .encode(&PersistentValue::GraphChunk(
+            GraphChunk::new(Bytes::from(vec![1; GRAPH_CHUNK_BYTES])).unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(full.len(), MAX_GRAPH_VALUE_BYTES);
+    assert_corrupt(codec.decode(&chunk_key, Bytes::from_static(&[0x13, 0, 0, 0, 0])));
+    let mut oversize = vec![0x13];
+    oversize.extend_from_slice(&((GRAPH_CHUNK_BYTES + 1) as u32).to_be_bytes());
+    oversize.resize(MAX_GRAPH_VALUE_BYTES + 1, 0);
+    assert_corrupt(codec.decode(&chunk_key, oversize.into()));
+}

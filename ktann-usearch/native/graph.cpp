@@ -106,7 +106,6 @@ struct GraphState {
     // Destruction order matters: the account must outlive all engine storage.
     Account account;
     Engine engine;
-    bool repaired = false;
     GraphState(std::uint32_t m, std::size_t limit)
         : account(limit, sizeof(GraphState) + sizeof(NativeGraph) + 128),
           engine(unum::usearch::index_config_t(m, 2 * m)) {}
@@ -169,7 +168,6 @@ std::unique_ptr<NativeGraph> build(std::uint32_t n, std::uint32_t m, std::uint32
             }
         }
         if (tail != n) {
-            state->repaired = true;
             for (std::uint32_t node = 0; node != n; ++node) {
                 checkpoint(context);
                 engine.ensure_successor(node, (node + 1) % n);
@@ -215,11 +213,72 @@ Stats NativeGraph::search(std::uint32_t ef, MetricContext const& context, Native
     return Stats{metric.calls, result.visited_members};
 }
 
+// Pin the generic native format consumed by the safe Rust validator. A USearch
+// upgrade changing the header or scalar layout requires a codec audit.
+static_assert(sizeof(unum::usearch::index_serialized_header_t) == 40);
+static_assert(offsetof(unum::usearch::index_serialized_header_t, entry_slot) == 32);
+
+std::size_t NativeGraph::encoded_size() const { return state->engine.serialized_length(); }
+
+void NativeGraph::save(rust::Slice<std::uint8_t> output, MetricContext const& context) const {
+    checkpoint(context);
+    std::size_t position = 0;
+    bool cancelled = false;
+    // Upstream stream functions are noexcept. Callbacks return false rather than
+    // throw; the bridge reports cancellation only after native frames return.
+    auto result = state->engine.save_to_stream([&](void const* source, std::size_t size) {
+        if (size > output.size() - position) return false;
+        auto* bytes = static_cast<std::uint8_t const*>(source);
+        for (std::size_t copied = 0; copied != size;) {
+            if (!proceed(context)) { cancelled = true; return false; }
+            auto count = std::min(size - copied, std::size_t(65536));
+            std::memcpy(output.data() + position, bytes + copied, count);
+            copied += count;
+            position += count;
+        }
+        return true;
+    });
+    if (cancelled) { result.error.release(); throw std::runtime_error("cancelled"); }
+    if (!result || position != output.size()) {
+        result.error.release();
+        throw std::runtime_error("native serialization failed");
+    }
+    checkpoint(context);
+}
+
+// Called only after Graph::decode validates the same immutable borrowed bytes.
+std::unique_ptr<NativeGraph> restore(rust::Slice<const std::uint8_t> bytes,
+    std::uint32_t n, std::uint32_t m, std::size_t limit, MetricContext const& context) {
+    checkpoint(context);
+    auto state = std::make_unique<GraphState>(m, limit);
+    AllocationScope scope(state->account);
+    std::size_t position = 0;
+    bool cancelled = false;
+    auto result = state->engine.load_from_stream([&](void* target, std::size_t size) {
+        if (size > bytes.size() - position) return false;
+        auto* output = static_cast<std::uint8_t*>(target);
+        for (std::size_t copied = 0; copied != size;) {
+            if (!proceed(context)) { cancelled = true; return false; }
+            auto count = std::min(size - copied, std::size_t(65536));
+            std::memcpy(output + copied, bytes.data() + position, count);
+            copied += count;
+            position += count;
+        }
+        return true;
+    });
+    if (cancelled) { result.error.release(); throw std::runtime_error("cancelled"); }
+    if (!result) throw std::runtime_error(result.error.release());
+    if (position != bytes.size() || state->engine.size() != n)
+        throw std::runtime_error("native deserialization failed");
+    state->engine.release_build_context();
+    checkpoint(context);
+    return std::make_unique<NativeGraph>(std::move(state));
+}
+
 std::size_t NativeGraph::resident_bytes() const { return state->account.used; }
 std::size_t NativeGraph::peak_bytes() const { return state->account.peak; }
 std::uint32_t NativeGraph::entry() const { return state->engine.entry_slot(); }
-std::uint32_t NativeGraph::level(std::uint32_t node) const { return state->engine.level_of_slot(node); }
-bool NativeGraph::repaired() const { return state->repaired; }
+std::uint32_t NativeGraph::level(std::uint32_t node) const { return state->engine.level_of(node); }
 std::size_t NativeWorkspace::allocated_bytes() const { return state->account.used; }
 std::size_t NativeWorkspace::allocation_count() const { return state->account.allocations; }
 

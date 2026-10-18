@@ -5,6 +5,9 @@
 
 use std::fmt;
 
+mod persistence;
+pub use persistence::{NATIVE_ENCODING, NATIVE_HEADER_BYTES, decode_bound, encoded_bound};
+
 #[allow(unsafe_code)] // CXX checks signatures; raw pointers stay inside its generated bridge.
 #[cxx::bridge(namespace = "ktann_usearch")]
 mod ffi {
@@ -44,6 +47,13 @@ mod ffi {
             limit: usize,
             context: &MetricContext,
         ) -> Result<UniquePtr<NativeGraph>>;
+        fn restore(
+            bytes: &[u8],
+            n: u32,
+            m: u32,
+            limit: usize,
+            context: &MetricContext,
+        ) -> Result<UniquePtr<NativeGraph>>;
         fn workspace(n: u32, m: u32, limit: usize) -> Result<UniquePtr<NativeWorkspace>>;
         fn search(
             self: &NativeGraph,
@@ -52,12 +62,13 @@ mod ffi {
             workspace: Pin<&mut NativeWorkspace>,
             output: &mut [Hit],
         ) -> Result<Stats>;
+        fn encoded_size(self: &NativeGraph) -> usize;
+        fn save(self: &NativeGraph, output: &mut [u8], context: &MetricContext) -> Result<()>;
         fn resident_bytes(self: &NativeGraph) -> usize;
         fn peak_bytes(self: &NativeGraph) -> usize;
         fn entry(self: &NativeGraph) -> u32;
         fn level(self: &NativeGraph, node: u32) -> u32;
         fn neighbors(self: &NativeGraph, node: u32, level: u32, output: &mut [u32]) -> usize;
-        fn repaired(self: &NativeGraph) -> bool;
         fn allocated_bytes(self: &NativeWorkspace) -> usize;
         fn allocation_count(self: &NativeWorkspace) -> usize;
     }
@@ -78,6 +89,8 @@ pub const MAX_NODES: usize = 65_536;
 pub enum Error {
     /// An invalid size, configuration, or non-finite callback distance.
     InvalidArgument,
+    /// Malformed or structurally invalid topology bytes.
+    InvalidEncoding,
     /// Allocation or admission failed.
     LimitExceeded,
     /// The operation-control callback rejected further work.
@@ -93,6 +106,7 @@ impl fmt::Display for Error {
             Self::LimitExceeded => "graph resource limit exceeded",
             Self::Cancelled => "graph operation cancelled",
             Self::Invariant => "graph invariant violated",
+            Self::InvalidEncoding => "invalid graph encoding",
         })
     }
 }
@@ -250,11 +264,6 @@ impl Graph {
             return Err(Error::InvalidArgument);
         }
         Ok(self.inner.neighbors(node, level, output))
-    }
-
-    /// Reports whether construction needed the deterministic connectivity repair.
-    pub fn repaired(&self) -> bool {
-        self.inner.repaired()
     }
 }
 

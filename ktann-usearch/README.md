@@ -8,7 +8,9 @@ partition seed derivation, routing distances, and operation-wide admission.
 
 The algorithm contract belongs to
 [partition-local-hnsw.md](../docs/design/partition-local-hnsw.md#41-local-core-algorithm-and-usearch-integration).
-There is no graph KV format or production routing switch here.
+Core storage owns graph KV envelopes and snapshot binding; this bridge owns
+validated native stream persistence. Production routing remains
+outside this crate.
 
 ## Dependency provenance and maintenance
 
@@ -22,10 +24,10 @@ There is no graph KV format or production routing switch here.
 
 The patch changes level sampling, deterministic tie ordering, and cancellation
 propagation along construction and approximate-search paths.
-It exposes external scratch, topology inspection, and one bounded
+It exposes external scratch, topology inspection, safe native loader cleanup, and one bounded
 successor-edge operation for connectivity repair. USearch retains ownership
 of graph insertion, diversity selection, reverse-link pruning and graph search.
-No upstream dense index, metric plugins, serialization, SIMD dispatch, or
+No upstream dense index, metric plugins, SIMD dispatch, or
 vector storage is instantiated by this bridge.
 
 Upper-layer greedy traversal can evaluate a node more than once; each move
@@ -83,3 +85,51 @@ invariants/reachability, all metrics against an independent oracle, duplicate
 centroids/full beam, input and memory boundaries, cancellation/scratch reuse,
 concurrent readers, and small independent-query quality fixtures. These fixtures
 do not establish end-to-end recall, latency, or production parameter defaults.
+
+### Native AddressSanitizer on macOS
+
+Set `CXX` to upstream LLVM Clang. Instrument the C++ bridge and vendored engine,
+and link the ASan runtime shipped with the installed stable Rust toolchain:
+
+```sh
+KTANN_ASAN_LIB="$(rustc --print sysroot)/lib"
+CXXFLAGS='-fsanitize=address -fno-omit-frame-pointer' \
+RUSTFLAGS="-C link-arg=$KTANN_ASAN_LIB/librustc-stable_rt.asan.dylib -C link-arg=-Wl,-rpath,$KTANN_ASAN_LIB" \
+ASAN_SYMBOLIZER_PATH="$(dirname "$CXX")/llvm-symbolizer" \
+ASAN_OPTIONS=detect_leaks=1 \
+cargo test -p ktann-usearch \
+  --target "$(rustc -vV | sed -n 's/^host: //p')" --target-dir target/asan
+```
+
+The explicit target keeps sanitizer flags off Cargo's host build tools. Rust's
+stable runtime avoids the LLVM 17 ASan initialization failure on macOS 26;
+the compiler's default runtime can fail before tests start. The explicit runtime
+and rpath affect only this test build; production linking is unchanged.
+This command instruments native code; safe Rust remains normally compiled.
+See the [upstream macOS initialization report](https://github.com/llvm/llvm-project/issues/200447).
+
+## Persistence safety boundary
+
+`Graph::encode` delegates to USearch's generic native `save_to_stream`.
+`Graph::decode` validates the pinned native layout in safe Rust before calling
+`load_from_stream` on the same immutable borrowed bytes. Validation covers
+header/configuration, both level copies, ordinal keys, exact lengths,
+degree/layer bounds, entry, duplicate/self edges, neighbor layers, and directed
+base reachability. Inactive reserved adjacency slots are opaque and preserved;
+they are never interpreted as edges. This is a version-pinned, native-endian
+u64-key/u32-slot format, not a portable canonical topology encoding.
+
+The loader patch checks node allocation, registers only fully initialized nodes,
+and frees a partially read node using its allocated size. Both stream callbacks
+copy in at most 64 KiB steps and return false on cancellation; they never throw
+through upstream `noexcept` functions. The bridge reports cancellation after
+native frames return. Partial restoration is never published. Loading calls no
+metric and performs no construction or repair.
+
+The format grammar, endian marker and source binding are specified in the owning
+local HNSW design. Decode admission covers borrowed encoded bytes, validation
+scratch, and native allocations; callers additionally charge their own retained
+inputs. Native streams include full reserved adjacency capacity, accounted in
+encoded-size bounds. Updating USearch requires rechecking the layout and the
+validator together. Golden native fixtures, malformed inputs, allocation-failure
+sweeps, partial-node cancellation and byte-preserving round trips cover this seam.

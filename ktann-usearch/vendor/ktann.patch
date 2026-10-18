@@ -7,7 +7,7 @@
 -        inline bool operator<(candidate_t other) const noexcept { return distance < other.distance; }
 +        inline bool operator<(candidate_t other) const noexcept { return distance < other.distance || (distance == other.distance && slot < other.slot); }
      };
- 
+
      using candidates_view_t = span_gt<candidate_t const>;
      using candidates_allocator_t = typename dynamic_allocator_traits_t::template rebind_alloc<candidate_t>;
      using top_candidates_t = sorted_buffer_gt<candidate_t, std::less<candidate_t>, candidates_allocator_t>;
@@ -18,7 +18,7 @@
 +        }
 +    };
 +    using next_candidates_t = max_heap_gt<candidate_t, next_less_t, candidates_allocator_t>;
- 
+
      /**
       *  @brief  A loosely-structured handle for every node. One such node is created for every member.
 @@ -2484,12 +2489,13 @@
@@ -37,7 +37,7 @@
          std::size_t computed_distances{};
          std::size_t computed_distances_in_refines{};
 @@ -2497,7 +2503,7 @@
- 
+
          /// @brief Heterogeneous distance calculation.
          template <typename value_at, typename metric_at, typename entry_at> //
 -        inline distance_t measure(value_at const& first, entry_at const& second, metric_at&& metric) noexcept {
@@ -46,7 +46,7 @@
                  std::is_same<entry_at, member_cref_t>::value || std::is_same<entry_at, member_citerator_t>::value,
                  "Unexpected type");
 @@ -2508,7 +2514,7 @@
- 
+
          /// @brief Homogeneous distance calculation.
          template <typename metric_at, typename entry_at> //
 -        inline distance_t measure(entry_at const& first, entry_at const& second, metric_at&& metric) noexcept {
@@ -57,19 +57,18 @@
 @@ -2534,6 +2540,7 @@
          }
      };
- 
+
 +private:
      /// @brief  Number of "slots" available for `node_t` objects. Equals to @b `limits_.members`.
      mutable std::atomic<std::size_t> nodes_capacity_{};
- 
-@@ -2581,6 +2588,17 @@
+
+@@ -2581,6 +2588,16 @@
      }
- 
+
    public:
 +    context_t& build_context() { return contexts_[0]; }
 +    void release_build_context() { contexts_ = {}; }
 +    std::size_t entry_slot() const noexcept { return entry_slot_; }
-+    std::size_t level_of_slot(std::size_t slot) const { return node_at_(slot).level(); }
 +    void ensure_successor(std::size_t slot, std::uint32_t successor) {
 +        auto neighbors = neighbors_(node_at_(slot), 0);
 +        for (auto neighbor : neighbors) if (neighbor == successor) return;
@@ -80,19 +79,19 @@
      std::size_t connectivity() const noexcept { return config_.connectivity; }
      std::size_t capacity() const noexcept { return nodes_capacity_; }
      std::size_t size() const noexcept { return nodes_count_; }
-@@ -3431,7 +3449,8 @@
+@@ -3431,7 +3448,8 @@
          metric_at&& metric,                        //
          index_search_config_t config = {},         //
          predicate_at&& predicate = predicate_at{}, //
 -        prefetch_at&& prefetch = prefetch_at{}) const usearch_noexcept_m {
 +        prefetch_at&& prefetch = prefetch_at{},
 +        context_t* external_context = nullptr) const usearch_noexcept_m {
- 
+
          // Someone is gonna fuzz this, so let's make sure we cover the basics
          if (!wanted)
-@@ -3442,13 +3461,14 @@
+@@ -3442,13 +3460,14 @@
              config.expansion = default_expansion_search();
- 
+
          // Using references is cleaner, but would result in UBSan false positives
 -        context_t* context_ptr = contexts_.data() ? contexts_.data() + config.thread : nullptr;
 +        context_t* context_ptr = external_context ? external_context :
@@ -101,16 +100,45 @@
          search_result_t result{*this, top_ptr};
          if (!nodes_count_.load(std::memory_order_relaxed))
              return result;
- 
+
 -        usearch_assert_m(contexts_.size() > config.thread, "Thread index out of bounds");
 +        usearch_assert_m(external_context || contexts_.size() > config.thread, "Thread index out of bounds");
          context_t& context = *context_ptr;
          top_candidates_t& top = *top_ptr;
          // Go down the level, tracking only the closest match
-@@ -4366,10 +4386,20 @@
+@@ -3789,18 +3808,27 @@
+             reset();
+             return result.failed("Out of memory");
+         }
+-        nodes_count_ = header_size.value;
++        // Count only initialized nodes: failure/cancellation must free a valid prefix.
++        nodes_count_ = 0;
+         max_level_ = static_cast<level_t>(header.max_level);
+         entry_slot_ = static_cast<compressed_slot_t>(header.entry_slot);
+
+         // Load the nodes
+         for (std::size_t i = 0; i != header_size.value; ++i) {
+             span_bytes_t node_bytes = node_malloc_(levels[i]);
++            if (!node_bytes) {
++                reset();
++                return result.failed("Out of memory");
++            }
+             if (!input(node_bytes.data(), node_bytes.size())) {
++                // The callback may have copied only a prefix. Its embedded level
++                // is not yet trusted, so free using the known allocation size.
++                tape_allocator_.deallocate(node_bytes.data(), node_bytes.size());
+                 reset();
+                 return result.failed("Failed to pull nodes from the stream");
+             }
+             nodes_[i] = node_t{node_bytes.data()};
++            ++nodes_count_;
+             if (!progress(i + 1, header_size.value))
+                 return result.failed("Terminated by user");
+         }
+@@ -4366,10 +4394,20 @@
          }
      }
- 
+
 -    level_t choose_random_level_(std::default_random_engine& level_generator) const noexcept {
 -        std::uniform_real_distribution<double> distribution(0.0, 1.0);
 -        double r = -std::log(distribution(level_generator)) * pre_.inverse_log_connectivity;
@@ -130,18 +158,18 @@
 +        }
 +        return level;
      }
- 
+
      struct candidates_range_t;
-@@ -4439,7 +4469,7 @@
+@@ -4439,7 +4477,7 @@
      template <typename value_at, typename metric_at, typename prefetch_at = dummy_prefetch_t>
      compressed_slot_t search_for_one_(                                //
          value_at&& query, metric_at&& metric, prefetch_at&& prefetch, //
 -        compressed_slot_t closest_slot, level_t begin_level, level_t end_level, context_t& context) const noexcept {
 +        compressed_slot_t closest_slot, level_t begin_level, level_t end_level, context_t& context) const {
- 
+
          visits_hash_set_t& visits = context.visits;
          visits.clear();
-@@ -4466,7 +4496,7 @@
+@@ -4466,7 +4504,7 @@
                  // Actual traversal
                  for (compressed_slot_t candidate_slot : closest_neighbors) {
                      distance_t candidate_dist = context.measure(query, citerator_at(candidate_slot), metric);
@@ -150,16 +178,16 @@
                          closest_dist = candidate_dist;
                          closest_slot = candidate_slot;
                          changed = true;
-@@ -4487,7 +4517,7 @@
+@@ -4487,7 +4525,7 @@
      template <typename value_at, typename metric_at, typename prefetch_at = dummy_prefetch_t>
      bool search_to_insert_(                                           //
          value_at&& query, metric_at&& metric, prefetch_at&& prefetch, //
 -        compressed_slot_t start_slot, level_t level, std::size_t top_limit, context_t& context) noexcept {
 +        compressed_slot_t start_slot, level_t level, std::size_t top_limit, context_t& context) {
- 
+
          visits_hash_set_t& visits = context.visits;
          next_candidates_t& next = context.next_candidates; // pop min, push
-@@ -4547,7 +4577,8 @@
+@@ -4547,7 +4585,8 @@
                  // so we don't have to lock it.
                  // node_lock_t successor_lock = node_lock_(successor_slot);
                  distance_t successor_dist = context.measure(query, citerator_at(successor_slot), metric);
@@ -169,9 +197,9 @@
                      // This can substantially grow our priority queue:
                      next.insert({-successor_dist, successor_slot});
                      // This will automatically evict poor matches:
-@@ -4716,7 +4747,8 @@
+@@ -4716,7 +4755,8 @@
                      continue;
- 
+
                  distance_t successor_dist = context.measure(query, citerator_at(successor_slot), metric);
 -                if (top.size() < top_limit || successor_dist < radius) {
 +                if (top.size() < top_limit || successor_dist < radius ||
@@ -179,7 +207,7 @@
                      // This can substantially grow our priority queue:
                      next.insert({-successor_dist, successor_slot});
                      if (is_dummy<predicate_at>() ||
-@@ -4761,7 +4793,7 @@
+@@ -4761,7 +4801,7 @@
      distance_t inter_neighbor_distance_(                                   //
          candidate_t const& candidate, candidate_t const& submitted,        //
          compressed_slot_t override_slot, override_value_at override_value, //
@@ -188,7 +216,7 @@
          if (candidate.slot == override_slot)
              return context.measure(override_value, citerator_at(submitted.slot), metric);
          else if (submitted.slot == override_slot)
-@@ -4774,7 +4806,7 @@
+@@ -4774,7 +4814,7 @@
      distance_t inter_neighbor_distance_(                            //
          candidate_t const& candidate, candidate_t const& submitted, //
          compressed_slot_t, std::nullptr_t,                          //
@@ -196,13 +224,13 @@
 +        metric_at&& metric, context_t& context) const {
          return context.measure(citerator_at(candidate.slot), citerator_at(submitted.slot), metric);
      }
- 
-@@ -4796,7 +4828,7 @@
+
+@@ -4796,7 +4836,7 @@
          std::size_t needed, top_candidates_t& top, context_t& context, //
          std::size_t& refines_counter,                                  //
          compressed_slot_t override_slot = ((std::numeric_limits<compressed_slot_t>::max))(),
 -        override_value_at override_value = {}) const noexcept {
 +        override_value_at override_value = {}) const {
- 
+
          // Avoid expensive computation, if the set is already small
          candidate_t* top_data = top.data();

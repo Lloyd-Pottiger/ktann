@@ -65,6 +65,7 @@ mod authority;
 mod build;
 mod data;
 mod entry;
+mod graph;
 mod load;
 mod manifest;
 mod record;
@@ -73,6 +74,7 @@ pub(crate) mod source;
 mod synopsis;
 mod validation;
 mod wire;
+pub use graph::{GRAPH_CHUNK_BYTES, GraphChunk, GraphDescriptor, MAX_GRAPH_VALUE_BYTES};
 mod workspace;
 
 #[doc(inline)]
@@ -150,11 +152,17 @@ const TAG_BUILD_WORKSPACE: u8 = 0x0f;
 const TAG_BUILD_SCHEDULE: u8 = 0x11;
 const TAG_BUILD_VALIDATION: u8 = 0x10;
 const TAG_BUILD_LOAD: u8 = 0x0e;
+const TAG_GRAPH_DESCRIPTOR: u8 = 0x12;
+const TAG_GRAPH_CHUNK: u8 = 0x13;
 
 /// The persistent value family expected at a logical key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ValueKind {
+    /// Local graph integrity metadata.
+    GraphDescriptor,
+    /// Local graph topology chunk.
+    GraphChunk,
     /// Immutable Bulk Build input and construction parameters.
     BuildDescriptor,
     /// Fenced serving artifact load checkpoint.
@@ -197,6 +205,8 @@ pub enum ValueKind {
 impl ValueKind {
     const fn tag(self) -> u8 {
         match self {
+            Self::GraphDescriptor => TAG_GRAPH_DESCRIPTOR,
+            Self::GraphChunk => TAG_GRAPH_CHUNK,
             Self::BuildDescriptor => TAG_BUILD_DESCRIPTOR,
             Self::BuildWorkspace => TAG_BUILD_WORKSPACE,
             Self::BuildSchedule => TAG_BUILD_SCHEDULE,
@@ -223,6 +233,10 @@ impl ValueKind {
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum PersistentValue {
+    /// Local graph integrity metadata.
+    GraphDescriptor(GraphDescriptor),
+    /// Local graph topology chunk.
+    GraphChunk(GraphChunk),
     /// Immutable Bulk Build input and construction parameters.
     BuildDescriptor(BuildDescriptor),
     /// Fenced serving artifact load checkpoint.
@@ -267,6 +281,8 @@ impl PersistentValue {
     #[must_use]
     pub const fn kind(&self) -> ValueKind {
         match self {
+            Self::GraphDescriptor(_) => ValueKind::GraphDescriptor,
+            Self::GraphChunk(_) => ValueKind::GraphChunk,
             Self::BuildDescriptor(_) => ValueKind::BuildDescriptor,
             Self::BuildWorkspace(_) => ValueKind::BuildWorkspace,
             Self::BuildSchedule(_) => ValueKind::BuildSchedule,
@@ -355,6 +371,10 @@ impl<'a> ValueCodec<'a> {
     pub fn encode(self, value: &PersistentValue) -> Result<Vec<u8>> {
         let mut encoder = Encoder::new(value.kind());
         match value {
+            PersistentValue::GraphDescriptor(value) => {
+                graph::encode_descriptor(&mut encoder, value)?
+            }
+            PersistentValue::GraphChunk(value) => graph::encode_chunk(&mut encoder, value)?,
             PersistentValue::BuildDescriptor(value) => build::encode(&mut encoder, value)?,
             PersistentValue::BuildWorkspace(value) => workspace::encode(&mut encoder, value)?,
             PersistentValue::BuildSchedule(value) => schedule::encode(&mut encoder, value)?,
@@ -447,6 +467,12 @@ impl<'a> ValueCodec<'a> {
                 PersistentValue::BuildValidation(validation::decode(&mut decoder)?)
             }
             ValueKind::BuildLoad => PersistentValue::BuildLoad(load::decode(&mut decoder)?),
+            ValueKind::GraphDescriptor => {
+                PersistentValue::GraphDescriptor(graph::decode_descriptor(&mut decoder)?)
+            }
+            ValueKind::GraphChunk => {
+                PersistentValue::GraphChunk(graph::decode_chunk(&mut decoder)?)
+            }
             ValueKind::BuildDescriptor => {
                 PersistentValue::BuildDescriptor(build::decode(&mut decoder)?)
             }
@@ -509,6 +535,8 @@ impl<'a> ValueCodec<'a> {
 
 const fn value_kind_for_key(key: &LogicalKey) -> ValueKind {
     match key {
+        LogicalKey::GraphDescriptor { .. } => ValueKind::GraphDescriptor,
+        LogicalKey::GraphChunk { .. } => ValueKind::GraphChunk,
         LogicalKey::IndexIdAllocator => ValueKind::IndexIdAllocator,
         LogicalKey::IndexNameDirectory(_) => ValueKind::IndexNameEntry,
         LogicalKey::Manifest(_) => ValueKind::IndexManifest,

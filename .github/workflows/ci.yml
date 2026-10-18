@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
@@ -16,6 +20,10 @@ jobs:
   test:
     name: Test (stable)
     runs-on: ubuntu-latest
+    env:
+      # Match normal dependencies so test and doc reuse the same build scripts.
+      # Otherwise libc/cfg-if debuginfo changes rebuild librocksdb-sys and its C++ library.
+      CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: 2
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
@@ -24,7 +32,7 @@ jobs:
         with:
           # GitHub caches are immutable, so build-mode changes need a fresh key
           # before later steps can contribute their artifacts.
-          shared-key: test-stable-complete-build-modes-v1
+          shared-key: test-stable-unified-build-debuginfo-v2
       - name: Install FoundationDB client
         run: .github/scripts/setup-foundationdb.sh client
       - name: Test workspace

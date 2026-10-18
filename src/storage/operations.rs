@@ -139,6 +139,19 @@ impl LogicalRange {
         )
     }
 
+    /// Scans the complete numbered chunk range of one partition-local graph.
+    pub fn graph_chunks(
+        manifest: &IndexManifest,
+        tree_key: &TreeKey,
+        partition: crate::api::PartitionKey,
+    ) -> Result<Self> {
+        Self::bind_partition(
+            manifest,
+            tree_key,
+            keys::graph_chunk_range(manifest.logical_index_id(), tree_key, partition),
+        )
+    }
+
     /// Binds one raw range to the Manifest's Logical Index ID and Tree Key
     /// schema.
     fn bind(manifest: &IndexManifest, raw: KeyRange) -> Self {
