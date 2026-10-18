@@ -20,6 +20,13 @@ At most the configured foreground operation limit may run and the same number
 may wait for admission; further calls fail with `LimitExceeded` rather than
 creating an unbounded process-local queue.
 
+Fixed-graph routing has a separate per-query working-byte ceiling configured by
+`RuntimeConfig::with_routing_working_bytes`; its accounting contract belongs to
+[Search](search.md#fixed-index-graph-bodies). Native restore and query tasks use
+the same cooperative CPU-task boundary as refinement. Search admission remains
+owned until those tasks actually exit, including when an awaiting future is
+dropped. Cache retention capacity does not bound such in-flight ownership.
+
 ## 2. Shutdown
 
 Shutdown is idempotent:

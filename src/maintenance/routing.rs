@@ -1324,7 +1324,7 @@ async fn scan_bodies<R: LogicalReader>(
                 let BodyEntries::Internal(entries) = body.entries() else {
                     return Err(Error::new(ErrorKind::Corruption));
                 };
-                for entry in entries {
+                for entry in entries.iter() {
                     visit(index, entry)?;
                 }
             }

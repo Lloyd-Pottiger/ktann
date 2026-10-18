@@ -4,6 +4,7 @@
 //! borrows the authoritative Child Entries and uses the existing numeric
 //! kernel inside USearch, retaining its returned distances unchanged.
 
+pub(crate) mod owned;
 pub(crate) mod persistence;
 
 use std::cell::Cell;
@@ -222,34 +223,58 @@ impl<'a> LocalHnsw<'a> {
         scratch: &mut Workspace,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<(Vec<Candidate>, ktann_usearch::Stats)> {
-        self.centroids.validate_query(query, beam)?;
-        if ef == 0 {
-            return Err(Error::invalid_argument());
-        }
-        let beam = beam.min(self.centroids.children.len());
-        admit(
-            self.centroids.bytes,
-            query.len() * 4,
+        search_graph(
+            self.centroids,
+            &self.graph,
+            query,
             beam,
-            self.graph
-                .resident_bytes()
-                .checked_add(scratch.allocated_bytes())
-                .ok_or_else(limit)?,
+            ef,
             working_bytes,
-        )?;
-        let mut hits = Vec::new();
-        hits.try_reserve_exact(beam).map_err(|_| limit())?;
-        hits.resize(beam, Candidate::default());
-        let distance = |_: u32, node: u32| {
-            self.centroids
-                .distance(query, self.centroids.children[node as usize].centroid())
-        };
-        let stats = controlled(check, |proceed| {
-            self.graph
-                .search(ef, &distance, proceed, scratch, &mut hits)
-        })?;
-        Ok((hits, stats))
+            scratch,
+            check,
+        )
     }
+}
+
+/// Shares the same native query path between borrowed construction cores and owned cache bodies.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the existing search inputs plus the borrowed graph and centroids"
+)]
+fn search_graph(
+    centroids: Centroids<'_>,
+    graph: &ktann_usearch::Graph,
+    query: &[f32],
+    beam: usize,
+    ef: usize,
+    working_bytes: usize,
+    scratch: &mut Workspace,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<(Vec<Candidate>, ktann_usearch::Stats)> {
+    centroids.validate_query(query, beam)?;
+    if ef == 0 {
+        return Err(Error::invalid_argument());
+    }
+    let beam = beam.min(centroids.children.len());
+    admit(
+        centroids.bytes,
+        query.len() * 4,
+        beam,
+        graph
+            .resident_bytes()
+            .checked_add(scratch.allocated_bytes())
+            .ok_or_else(limit)?,
+        working_bytes,
+    )?;
+    let mut hits = Vec::new();
+    hits.try_reserve_exact(beam).map_err(|_| limit())?;
+    hits.resize(beam, Candidate::default());
+    let distance =
+        |_: u32, node: u32| centroids.distance(query, centroids.children[node as usize].centroid());
+    let stats = controlled(check, |proceed| {
+        graph.search(ef, &distance, proceed, scratch, &mut hits)
+    })?;
+    Ok((hits, stats))
 }
 
 /// Domain-separated seed framing uses the canonical Tree Key bytes and parent ID.
@@ -271,7 +296,7 @@ fn limit() -> Error {
     Error::new(ErrorKind::LimitExceeded)
 }
 
-fn native_error(error: ktann_usearch::Error) -> Error {
+pub(crate) fn native_error(error: ktann_usearch::Error) -> Error {
     Error::new(match error {
         ktann_usearch::Error::InvalidArgument => ErrorKind::InvalidArgument,
         ktann_usearch::Error::LimitExceeded => ErrorKind::LimitExceeded,

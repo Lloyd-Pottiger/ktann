@@ -335,6 +335,7 @@ pub struct RuntimeConfig {
     fixup_attempts: u32,
     foreground_attempts: u32,
     partition_cache_bytes: u64,
+    routing_working_bytes: usize,
     default_search_budgets: SearchBudgets,
     tree_key_scan_ranges: u32,
     write_beam_size: u32,
@@ -357,6 +358,7 @@ impl Default for RuntimeConfig {
             fixup_attempts: DEFAULT_ATTEMPTS,
             foreground_attempts: DEFAULT_ATTEMPTS,
             partition_cache_bytes,
+            routing_working_bytes: 256 * 1024 * 1024,
             default_search_budgets: SearchBudgets::default(),
             tree_key_scan_ranges: DEFAULT_TREE_KEY_SCAN_RANGES,
             write_beam_size: DEFAULT_WRITE_BEAM_SIZE,
@@ -368,6 +370,22 @@ impl Default for RuntimeConfig {
 }
 
 impl RuntimeConfig {
+    /// Sets the per-query fixed-graph routing working-byte ceiling (default 256 MiB).
+    /// Includes held bodies, restoration buffers, native scratch and caller-reserved
+    /// candidate/identity state. Cache capacity controls retention independently.
+    pub fn with_routing_working_bytes(mut self, bytes: usize) -> Result<Self> {
+        if bytes == 0 {
+            return Err(Error::invalid_argument());
+        }
+        self.routing_working_bytes = bytes;
+        Ok(self)
+    }
+
+    /// Returns the fixed-graph routing working-byte ceiling.
+    pub const fn routing_working_bytes(&self) -> usize {
+        self.routing_working_bytes
+    }
+
     /// Sets the positive minimum state age for rediscovered maintenance to resume.
     pub fn with_stalled_timeout(mut self, timeout: Duration) -> Result<Self> {
         if timeout.is_zero() {
@@ -467,6 +485,7 @@ impl RuntimeConfig {
             || self.fixup_attempts == 0
             || self.foreground_attempts == 0
             || usize::try_from(self.partition_cache_bytes).is_err()
+            || self.routing_working_bytes == 0
             || self.tree_key_scan_ranges == 0
             || self.write_beam_size == 0
             || self.write_beam_size > MAX_WRITE_BEAM_SIZE

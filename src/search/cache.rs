@@ -1,6 +1,7 @@
 //! Byte-bounded cache of snapshot-validated, immutable Partition search bodies.
 //!
 //! Bodies contain Child Entries or Leaf Entries, including empty partitions.
+//! Explicit fixed-index reads can attach a restored graph sharing the Child Entries.
 //! A body is reusable only when its kind and epoch match the snapshot Header.
 //! Older cached epochs are evicted; newer epochs survive historical reads.
 //! Misses load and validate complete bodies in the same transaction. Corrupt
@@ -10,6 +11,15 @@
 //! logical budget accounting. Foreground preparation may reuse committed
 //! internal bodies; write transactions must never publish read-your-writes
 //! bodies (ADR 0023).
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "explicit graph reads are wired into traversal in step seven"
+    )
+)]
+pub(crate) mod graph;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -129,7 +139,7 @@ pub(crate) enum BodyEntries {
     /// The decoded Leaf Entries of a leaf partition.
     Leaf(Box<[CachedLeafEntry]>),
     /// The decoded Child Entries of an internal partition.
-    Internal(Box<[ChildEntry]>),
+    Internal(Arc<[ChildEntry]>),
 }
 
 /// One immutable decoded partition body with its validation epoch.
@@ -140,27 +150,29 @@ pub(crate) struct CachedBody {
     epoch: u64,
     bytes: u64,
     entries: BodyEntries,
+    graph: Option<Box<super::local_hnsw::owned::OwnedGraph>>,
 }
 
 impl CachedBody {
     /// Accounts the envelope and fixed-dimension decoded Child Entries.
     pub(crate) fn internal_bytes(count: u32, dimension: usize) -> u64 {
-        let entry_bytes = (size_of::<ChildEntry>() as u64)
+        let entry_bytes = (size_of::<ChildEntry>() as u64 + 32)
             .saturating_add((dimension as u64).saturating_mul(size_of::<f32>() as u64));
-        (size_of::<Self>() as u64).saturating_add(u64::from(count).saturating_mul(entry_bytes))
+        (size_of::<Self>() as u64 + 64).saturating_add(u64::from(count).saturating_mul(entry_bytes))
     }
 
     /// Wraps a complete, count-validated committed internal body.
     pub(crate) fn internal(epoch: u64, entries: Vec<ChildEntry>) -> Self {
         let bytes = entries
             .iter()
-            .fold(size_of::<Self>() as u64, |bytes, entry| {
+            .fold(size_of::<Self>() as u64 + 64, |bytes, entry| {
                 bytes.saturating_add(child_entry_bytes(entry))
             });
         Self {
             epoch,
             bytes,
-            entries: BodyEntries::Internal(entries.into_boxed_slice()),
+            entries: BodyEntries::Internal(entries.into()),
+            graph: None,
         }
     }
 
@@ -315,7 +327,11 @@ impl PartitionCache {
         {
             let mut inner = self.lock();
             if let Some(existing) = inner.slots.get(&key) {
-                if existing.body.epoch > body.epoch {
+                if existing.body.epoch > body.epoch
+                    || (existing.body.epoch == body.epoch
+                        && existing.body.graph.is_some()
+                        && body.graph.is_none())
+                {
                     drop(inner);
                     metrics::cache_install(kind, CacheInstallResult::SkippedStale);
                     return;
@@ -627,6 +643,24 @@ impl BodyRead {
         cache: &PartitionCache,
         manifest: &IndexManifest,
     ) -> Result<Arc<CachedBody>> {
+        let key = match &self {
+            Self::Cached(_) => None,
+            Self::Scan(scan) => Some(scan.key.clone()),
+        };
+        let body = self.read(txn, manifest, &|| Ok(())).await?;
+        if let Some(key) = key {
+            cache.install(key, Arc::clone(&body));
+        }
+        Ok(body)
+    }
+
+    /// Reads a complete body without publishing a partially validated graph load.
+    async fn read<T: ReadOps>(
+        self,
+        txn: &mut ReadLogicalTxn<'_, T>,
+        manifest: &IndexManifest,
+        check: &(dyn Fn() -> Result<()> + Sync),
+    ) -> Result<Arc<CachedBody>> {
         let (key, header, range, mut first_page) = match self {
             Self::Cached(body) => return Ok(body),
             Self::Scan(scan) => {
@@ -642,15 +676,24 @@ impl BodyRead {
         let kind = key.kind;
         let mut leaf_entries: Vec<CachedLeafEntry> = Vec::new();
         let mut child_entries: Vec<ChildEntry> = Vec::new();
-        let mut bytes = size_of::<CachedBody>() as u64;
+        let mut bytes = size_of::<CachedBody>() as u64
+            + if kind == PartitionKind::Internal {
+                64
+            } else {
+                0
+            };
         let mut cursor: Option<LogicalScanCursor> = None;
         loop {
+            check()?;
             let page = match first_page.take() {
                 Some(page) => page,
                 None => txn.scan(&range, cursor.as_ref(), BODY_SCAN_LIMITS).await?,
             };
             cursor = page.next_cursor().cloned();
             for item in page.into_items() {
+                if leaf_entries.len() + child_entries.len() >= header.entry_count() as usize {
+                    return Err(Error::new(ErrorKind::Corruption));
+                }
                 match (kind, item.into_value()) {
                     (PartitionKind::Leaf, PersistentValue::LeafEntry(entry)) => {
                         let entry =
@@ -676,14 +719,14 @@ impl BodyRead {
 
         let entries = match kind {
             PartitionKind::Leaf => BodyEntries::Leaf(leaf_entries.into_boxed_slice()),
-            PartitionKind::Internal => BodyEntries::Internal(child_entries.into_boxed_slice()),
+            PartitionKind::Internal => BodyEntries::Internal(child_entries.into()),
         };
         let body = Arc::new(CachedBody {
             epoch: header.cache_epoch(),
             bytes,
             entries,
+            graph: None,
         });
-        cache.install(key, Arc::clone(&body));
         Ok(body)
     }
 }
@@ -780,7 +823,7 @@ fn field_bytes(field: &Value) -> u64 {
 /// Partition Key, and the full-f32 centroid.
 fn child_entry_bytes(entry: &ChildEntry) -> u64 {
     let centroid = entry.centroid().len() as u64 * size_of::<f32>() as u64;
-    (size_of::<ChildEntry>() as u64).saturating_add(centroid)
+    (size_of::<ChildEntry>() as u64 + 32).saturating_add(centroid)
 }
 
 #[cfg(test)]
@@ -874,6 +917,7 @@ mod tests {
             epoch,
             bytes,
             entries: BodyEntries::Leaf(entries.into_boxed_slice()),
+            graph: None,
         })
     }
 
@@ -886,7 +930,8 @@ mod tests {
         Arc::new(CachedBody {
             epoch,
             bytes,
-            entries: BodyEntries::Internal(entries.into_boxed_slice()),
+            entries: BodyEntries::Internal(entries.into()),
+            graph: None,
         })
     }
 

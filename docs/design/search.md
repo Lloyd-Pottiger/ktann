@@ -255,6 +255,43 @@ byte shares may be configured, but the eviction policy is an internal
 benchmark-driven detail, not a persistent or public compatibility contract.
 Corruption is never cached.
 
+### Fixed-index graph bodies
+
+The explicit graph reader uses the complete query's existing validated logical
+transaction. It reads the snapshot Header and Graph Descriptor on every access,
+including hits. Ready internal kind, exact count, epoch, configured capacity and
+the descriptor's source binding must agree. Missing or mismatched graphs are
+Corruption; there is no exact fallback. Ordinary exact reads do not request graph
+records, for either mutable or fixed indexes.
+
+On a miss, the reader scans complete Child Entries and contiguous graph chunks
+from that same transaction, then restores the persisted native graph. It never
+builds a graph or changes its seed, construction parameters, adjacency or query
+distances. No partial graph body is installed. An entries-only cache body can be
+upgraded by sharing its immutable centroid allocation; the same cache key owns
+the complete body, and a racing equal-epoch exact fill cannot discard its graph.
+Older snapshots cannot replace newer cached epochs. Cached ownership includes
+native graph allocations, source binding, the numeric kernel's rotation schedule
+and the one shared Child Entry/centroid allocation. Eviction does not invalidate
+handles still held by queries.
+
+`RuntimeConfig::routing_working_bytes` (default 256 MiB) bounds one query's graph
+routing work independently of retained cache capacity. Before loading entries or
+chunks, the reader admits checked bounds for the complete body, kernel creation,
+chunk and assembly buffers, native validation/restoration, private query scratch,
+and candidate output. The caller reserves other retained query state, including
+global candidate merging and observed-child identities. Admission uses the same
+bound on warm and cold reads. Zero/insufficient cache capacity disables retention,
+not graph use; work exceeding the routing ceiling returns LimitExceeded.
+
+Each parent handle is consumed before loading the next. Restore and query work
+run on the blocking pool, retain foreground admission through actual task exit,
+and honor cancellation/deadlines. Scratch is private to each query; native graphs
+are immutable and shared. Snapshot expiry propagates to complete-query retry;
+neither graph reads nor CPU restoration open a new transaction. Production beam
+traversal remains exact; these interfaces provide the snapshot-bound input and
+unmodified local scores for its HNSW candidate-generation integration.
+
 ## 9. Validation
 
 - Golden and property tests cover signed-code encoding, error rounding,

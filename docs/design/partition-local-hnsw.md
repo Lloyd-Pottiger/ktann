@@ -2,8 +2,9 @@
 
 Status: fixed Bulk Build preparation and publication are implemented, including
 optional artifact refinement, final-centroid graph construction, immutable loading,
-and fixed-index write/maintenance restrictions. Production graph loading/cache and
-HNSW query traversal remain the next integration steps. This document owns the
+and fixed-index write/maintenance restrictions. Snapshot-bound graph reads and
+shared cache ownership are implemented; production HNSW traversal is the next
+integration step. This document owns the
 fixed-index contract of [issue #195](https://github.com/Lloyd-Pottiger/ktann/issues/195).
 [Search](search.md), [Storage](storage.md), and [Bulk Build](bulk-build.md) retain
 ownership of their shared contracts.
@@ -564,11 +565,12 @@ Capacity experiments start with leaf maxima 64/128 and internal maxima
 experimental inputs, not defaults. Independent sizing must preserve a fixed leaf
 layout/centroids when comparing internal grouping; no rerank-budget sweeps.
 
-There is no unresolved lifecycle or ownership decision blocking capacity work.
-The persistence implementation must specify canonical codec tags and chunk
-framing for the graph structure defined above, update the owning storage and
-artifact contracts, and verify the complete loading/encoding working-set
-estimates. These are required implementation deliverables;
-this document does not claim a performance or 100M/10B feasibility result.
+The graph format and snapshot reader implement the source and resource contracts
+above. [Search](search.md#fixed-index-graph-bodies) owns graph-cache admission,
+shared centroid ownership, and the explicit loading/query interfaces. Candidate
+generation must supply the existing query snapshot, reserve query-wide retained
+state, consume one parent at a time, and merge the returned child identities and
+unmodified routing distances under the existing global beam and budgets. This
+document does not claim an end-to-end performance or 100M/10B feasibility result.
 Production parameter choices and dynamic maintenance remain deferred. There is
 no stable release requiring compatibility machinery or migration of old builds.
