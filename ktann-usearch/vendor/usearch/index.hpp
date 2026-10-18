@@ -2591,7 +2591,6 @@ private:
     context_t& build_context() { return contexts_[0]; }
     void release_build_context() { contexts_ = {}; }
     std::size_t entry_slot() const noexcept { return entry_slot_; }
-    std::size_t level_of_slot(std::size_t slot) const { return node_at_(slot).level(); }
     void ensure_successor(std::size_t slot, std::uint32_t successor) {
         auto neighbors = neighbors_(node_at_(slot), 0);
         for (auto neighbor : neighbors) if (neighbor == successor) return;

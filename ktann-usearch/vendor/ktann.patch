@@ -62,14 +62,13 @@
      /// @brief  Number of "slots" available for `node_t` objects. Equals to @b `limits_.members`.
      mutable std::atomic<std::size_t> nodes_capacity_{};
 
-@@ -2581,6 +2588,17 @@
+@@ -2581,6 +2588,16 @@
      }
 
    public:
 +    context_t& build_context() { return contexts_[0]; }
 +    void release_build_context() { contexts_ = {}; }
 +    std::size_t entry_slot() const noexcept { return entry_slot_; }
-+    std::size_t level_of_slot(std::size_t slot) const { return node_at_(slot).level(); }
 +    void ensure_successor(std::size_t slot, std::uint32_t successor) {
 +        auto neighbors = neighbors_(node_at_(slot), 0);
 +        for (auto neighbor : neighbors) if (neighbor == successor) return;
@@ -80,7 +79,7 @@
      std::size_t connectivity() const noexcept { return config_.connectivity; }
      std::size_t capacity() const noexcept { return nodes_capacity_; }
      std::size_t size() const noexcept { return nodes_count_; }
-@@ -3431,7 +3449,8 @@
+@@ -3431,7 +3448,8 @@
          metric_at&& metric,                        //
          index_search_config_t config = {},         //
          predicate_at&& predicate = predicate_at{}, //
@@ -90,7 +89,7 @@
 
          // Someone is gonna fuzz this, so let's make sure we cover the basics
          if (!wanted)
-@@ -3442,13 +3461,14 @@
+@@ -3442,13 +3460,14 @@
              config.expansion = default_expansion_search();
 
          // Using references is cleaner, but would result in UBSan false positives
@@ -107,7 +106,7 @@
          context_t& context = *context_ptr;
          top_candidates_t& top = *top_ptr;
          // Go down the level, tracking only the closest match
-@@ -3789,18 +3809,27 @@
+@@ -3789,18 +3808,27 @@
              reset();
              return result.failed("Out of memory");
          }
@@ -136,7 +135,7 @@
              if (!progress(i + 1, header_size.value))
                  return result.failed("Terminated by user");
          }
-@@ -4366,10 +4395,20 @@
+@@ -4366,10 +4394,20 @@
          }
      }
 
@@ -161,7 +160,7 @@
      }
 
      struct candidates_range_t;
-@@ -4439,7 +4478,7 @@
+@@ -4439,7 +4477,7 @@
      template <typename value_at, typename metric_at, typename prefetch_at = dummy_prefetch_t>
      compressed_slot_t search_for_one_(                                //
          value_at&& query, metric_at&& metric, prefetch_at&& prefetch, //
@@ -170,7 +169,7 @@
 
          visits_hash_set_t& visits = context.visits;
          visits.clear();
-@@ -4466,7 +4505,7 @@
+@@ -4466,7 +4504,7 @@
                  // Actual traversal
                  for (compressed_slot_t candidate_slot : closest_neighbors) {
                      distance_t candidate_dist = context.measure(query, citerator_at(candidate_slot), metric);
@@ -179,7 +178,7 @@
                          closest_dist = candidate_dist;
                          closest_slot = candidate_slot;
                          changed = true;
-@@ -4487,7 +4526,7 @@
+@@ -4487,7 +4525,7 @@
      template <typename value_at, typename metric_at, typename prefetch_at = dummy_prefetch_t>
      bool search_to_insert_(                                           //
          value_at&& query, metric_at&& metric, prefetch_at&& prefetch, //
@@ -188,7 +187,7 @@
 
          visits_hash_set_t& visits = context.visits;
          next_candidates_t& next = context.next_candidates; // pop min, push
-@@ -4547,7 +4586,8 @@
+@@ -4547,7 +4585,8 @@
                  // so we don't have to lock it.
                  // node_lock_t successor_lock = node_lock_(successor_slot);
                  distance_t successor_dist = context.measure(query, citerator_at(successor_slot), metric);
@@ -198,7 +197,7 @@
                      // This can substantially grow our priority queue:
                      next.insert({-successor_dist, successor_slot});
                      // This will automatically evict poor matches:
-@@ -4716,7 +4756,8 @@
+@@ -4716,7 +4755,8 @@
                      continue;
 
                  distance_t successor_dist = context.measure(query, citerator_at(successor_slot), metric);
@@ -208,7 +207,7 @@
                      // This can substantially grow our priority queue:
                      next.insert({-successor_dist, successor_slot});
                      if (is_dummy<predicate_at>() ||
-@@ -4761,7 +4802,7 @@
+@@ -4761,7 +4801,7 @@
      distance_t inter_neighbor_distance_(                                   //
          candidate_t const& candidate, candidate_t const& submitted,        //
          compressed_slot_t override_slot, override_value_at override_value, //
@@ -217,7 +216,7 @@
          if (candidate.slot == override_slot)
              return context.measure(override_value, citerator_at(submitted.slot), metric);
          else if (submitted.slot == override_slot)
-@@ -4774,7 +4815,7 @@
+@@ -4774,7 +4814,7 @@
      distance_t inter_neighbor_distance_(                            //
          candidate_t const& candidate, candidate_t const& submitted, //
          compressed_slot_t, std::nullptr_t,                          //
@@ -226,7 +225,7 @@
          return context.measure(citerator_at(candidate.slot), citerator_at(submitted.slot), metric);
      }
 
-@@ -4796,7 +4837,7 @@
+@@ -4796,7 +4836,7 @@
          std::size_t needed, top_candidates_t& top, context_t& context, //
          std::size_t& refines_counter,                                  //
          compressed_slot_t override_slot = ((std::numeric_limits<compressed_slot_t>::max))(),

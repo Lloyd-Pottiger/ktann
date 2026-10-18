@@ -278,7 +278,7 @@ std::unique_ptr<NativeGraph> restore(rust::Slice<const std::uint8_t> bytes,
 std::size_t NativeGraph::resident_bytes() const { return state->account.used; }
 std::size_t NativeGraph::peak_bytes() const { return state->account.peak; }
 std::uint32_t NativeGraph::entry() const { return state->engine.entry_slot(); }
-std::uint32_t NativeGraph::level(std::uint32_t node) const { return state->engine.level_of_slot(node); }
+std::uint32_t NativeGraph::level(std::uint32_t node) const { return state->engine.level_of(node); }
 std::size_t NativeWorkspace::allocated_bytes() const { return state->account.used; }
 std::size_t NativeWorkspace::allocation_count() const { return state->account.allocations; }
 
