@@ -96,7 +96,10 @@ struct DeterministicHarness {
 }
 
 impl DeterministicHarness {
-    fn new(config: TestConfig) -> Self {
+    fn new(mut config: TestConfig) -> Self {
+        // The shared suite includes full-size graph values. Other test-control
+        // cases retain their smaller defaults to exercise backend limits.
+        config.hard_limits.max_value_bytes = ktann::storage::values::MAX_GRAPH_VALUE_BYTES;
         let restart = match config.durability {
             Durability::Durable => RestartMode::Durable,
             Durability::Ephemeral => RestartMode::Ephemeral,

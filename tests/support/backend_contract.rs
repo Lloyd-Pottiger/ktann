@@ -2,8 +2,8 @@
 //!
 //! This module owns the backend-neutral transaction contract cases and the
 //! [`BackendHarness`] seam every adapter implements to run them. Cases drive a
-//! backend exclusively through the public [`ktann::storage::backend`]
-//! interface, so they run unchanged against each production adapter, including
+//! backend through public storage interfaces, including typed logical transactions,
+//! so they run unchanged against each production adapter, including
 //! Memory with its optional test controls. Each case is a small, named async function with a
 //! stable replay seed; on failure it reports the case name and seed together
 //! with a safe error category or count, never a raw key, value, or backend
@@ -147,6 +147,7 @@ pub async fn run_suite<H: BackendHarness>(harness: &H) {
     case_scan_no_skip(harness, &CaseContext::new("scan_no_skip", 15)).await;
     case_scan_empty_range(harness, &CaseContext::new("scan_empty_range", 16)).await;
     case_batch_scan(harness, &CaseContext::new("batch_scan", 17)).await;
+    case_graph_storage(harness, &CaseContext::new("graph_storage", 18)).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1160,4 +1161,101 @@ async fn case_durability_mapping<H: BackendHarness>(harness: &H, ctx: &CaseConte
         }
         RestartMode::Unsupported => {}
     }
+}
+
+/// Full-size graph values and the final chunk survive typed writes and pagination.
+/// Topology restoration and source binding are checked by the owning core module.
+async fn case_graph_storage<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
+    use ktann::api::{IndexConfig, LogicalIndexId, Metric, PartitionKey};
+    use ktann::storage::keys::{LogicalKey, TreeKey};
+    use ktann::storage::values::{
+        GRAPH_CHUNK_BYTES, GraphChunk, IndexLifecycle, IndexManifest, PersistentValue, ValueCodec,
+    };
+    use ktann::storage::{LogicalRange, ReadLogicalTxn, WriteLogicalTxn};
+
+    let backend = harness.backend();
+    let index = LogicalIndexId::new(0x19504).unwrap();
+    let partition = PartitionKey::new(1).unwrap();
+    let tree = TreeKey::encode(&[], &[]).unwrap();
+    let manifest = IndexManifest::new(
+        IndexLifecycle::Active,
+        index,
+        IndexConfig::new(1, Metric::L2)
+            .unwrap()
+            .with_internal_partition_entries(4096, 16384)
+            .unwrap(),
+        [0; 32],
+        vec![],
+    )
+    .unwrap();
+    let key = LogicalKey::GraphDescriptor {
+        index,
+        tree_key: tree.clone(),
+        partition,
+    };
+    let codec = ValueCodec::for_index(&manifest);
+    // Canonical descriptor fixture: a sufficiently large node bound permits the body.
+    let mut bytes = vec![0x12, if cfg!(target_endian = "little") { 1 } else { 2 }];
+    bytes.extend_from_slice(&9000_u32.to_be_bytes());
+    bytes.extend_from_slice(&1_u64.to_be_bytes());
+    bytes.extend_from_slice(&((GRAPH_CHUNK_BYTES + 1) as u64).to_be_bytes());
+    bytes.extend_from_slice(&[0; 64]);
+    let descriptor = codec.decode(&key, bytes.into()).unwrap();
+    let mut write = WriteLogicalTxn::for_index(
+        backend.begin_write().await.unwrap(),
+        &manifest,
+        backend.hard_limits(),
+        backend.admission_budget(),
+    );
+    write.put(key.clone(), descriptor.clone()).await.unwrap();
+    let mut expected = Vec::new();
+    for (chunk, length) in [(0, GRAPH_CHUNK_BYTES), (1, 1)] {
+        let key = LogicalKey::GraphChunk {
+            index,
+            tree_key: tree.clone(),
+            partition,
+            chunk,
+        };
+        let value = PersistentValue::GraphChunk(
+            GraphChunk::new(Bytes::from(vec![chunk as u8; length])).unwrap(),
+        );
+        write.put(key.clone(), value.clone()).await.unwrap();
+        expected.push((key, value));
+    }
+    write.commit().await.unwrap();
+    let mut read = ReadLogicalTxn::for_index(backend.begin_read().await.unwrap(), &manifest);
+    let stored = read.get(key).await.unwrap();
+    check_true(
+        ctx,
+        "graph descriptor round-trips",
+        stored == Some(descriptor),
+    );
+    let range = LogicalRange::graph_chunks(&manifest, &tree, partition).unwrap();
+    let mut cursor = None;
+    let mut found = Vec::new();
+    loop {
+        let page = read
+            .scan(
+                &range,
+                cursor.as_ref(),
+                ScanLimits {
+                    item_limit: 1,
+                    byte_limit: 128 * 1024,
+                },
+            )
+            .await
+            .unwrap();
+        for item in page.items() {
+            found.push((item.key().clone(), item.value().clone()));
+        }
+        cursor = page.into_next_cursor();
+        if cursor.is_none() {
+            break;
+        }
+    }
+    check_true(
+        ctx,
+        "complete ordered graph chunks round-trip",
+        found == expected,
+    );
 }
