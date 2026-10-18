@@ -1,10 +1,10 @@
 # Partition-local HNSW: fixed Bulk Build contract
 
-Status: contract, independent capacities, and standalone local HNSW core implemented.
-Persistence and serving integration are pending. This document owns the first,
+Status: contract, independent capacities, standalone local HNSW core, and bounded
+persistence codecs/restoration implemented. Bulk Build and serving integration are pending. This document owns the first,
 fixed-index stage of [issue #195](https://github.com/Lloyd-Pottiger/ktann/issues/195).
-It specifies the required end state. The fixed-index lifecycle, graph storage,
-and production traversal contracts remain pending.
+It specifies the required end state. Fixed-index lifecycle, graph publication,
+and production traversal remain pending.
 [Search](search.md), [Storage](storage.md), and [Bulk Build](bulk-build.md) retain
 ownership of their shared contracts. Subsequent implementation must update those
 contracts and their tests as the feature lands.
@@ -140,6 +140,9 @@ Partition Key ties. The core borrows already-preprocessed vectors and does not
 normalize them. Graph construction order and derived per-partition
 seed are deterministic from the configured seed, canonical Tree Key and
 Partition Key; rebuilding the same accepted inputs must produce identical bytes.
+This reproducibility is tested across fresh processes on the same build/host;
+neither native encoding nor floating-point reconstruction promises cross-platform
+portability.
 Construction may parallelize only if it preserves this property and its declared
 resource bounds. The first implementation constructs one graph at a time.
 
@@ -212,8 +215,8 @@ bounded result buffers: one output buffer for graph search, and a heap plus
 output for the independent exact selector. Neighbor-pruning scratch is allocated
 only for construction. Workspace counters distinguish retained bytes from total
 allocation events. Allocation failure returns `LimitExceeded`; it never changes
-M or ef. Encoding buffers and publication IO remain owned by the later storage
-integration.
+M or ef. Encoding and restoration include their buffers in operation admission;
+publication IO remains owned by Bulk Build.
 
 Operation control is checked during input validation, between inserted nodes,
 at most every 64 distance calls, and during reachability and result loops.
@@ -290,21 +293,84 @@ ordinals only: no cross-partition edges, record IDs, reverse parent pointers,
 or independent centroid copies. The query's decoded Child Entries supply the
 vectors. This preserves one authoritative projection per parent/child edge.
 
-A small graph descriptor identifies the encoding, entry point/max level, node
-and chunk counts, total encoded size, the source Header cache epoch, and a digest
-of the canonical ordered Child Entries plus their Manifest graph configuration.
-It is integrity metadata, not a graph lifecycle or mutable generation. The
-Partition Header cache epoch remains the sole body-version authority. Binding
-must include complete centroid bytes and child identities, not just the count.
+The core stores the pinned USearch 2.26.4 generic native stream, with u64 keys
+and u32 slots. Safe Rust validates the entire immutable byte slice before the
+native loader reads it. The loader has a small allocation/cleanup patch: reject
+failed node allocations, count only initialized nodes, and free a partially
+read node using its known allocation size. It performs no distance calls,
+construction, pruning, or repair. Stream callbacks copy at most 64 KiB between
+cancellation checks and return failure through the upstream `noexcept` boundary;
+the bridge reports cancellation after that call returns.
 
-Adjacency/node metadata use deterministic numbered chunks with encoded values
-at most 64 KiB, including codec overhead. Split large adjacency sequences across
-chunks; never require the whole graph or one unbounded adjacency list in a KV
-value. Chunk boundaries are format-defined, independent of backend or memory
-budget. Missing, repeated, extra, out-of-order or inconsistent chunks fail
-validation. Every internal partition, including singleton internal roots if
-present, has a graph descriptor; leaf partitions have no graph keys. An empty
-forest and a leaf root need no special synthetic graph.
+The descriptor's integers are big-endian. Its value is exactly 86 bytes:
+`0x12 | encoding:u8 | nodes:u32 | source_epoch:u64 | payload_bytes:u64 |
+source_binding:32 bytes | topology_sha256:32 bytes`. Encoding 1 identifies the
+little-endian native layout below; encoding 2 identifies the big-endian layout.
+A reader rejects the other host byte order. The supported layout and key/slot
+widths are fixed by the vendored dependency; updates must revalidate the native
+layout and validator together. The project has no released format to migrate. The descriptor
+stores no duplicate entry point, levels, or graph configuration. Node count is
+in `1..=65536`; empty local cores are supported in memory but are not persistent
+internal bodies. The source Header must be Ready, at level greater than one,
+with the same exact count and epoch. Singleton internal partitions have the
+ordinary descriptor. Leaf partitions have no graph keys; empty forests and leaf
+roots need none.
+
+The native payload uses host-endian integers:
+
+- Header: five u64 fields: node count, M, base capacity (2*M), maximum level,
+  entry ordinal (40 bytes total).
+- Level table: one i16 per node in canonical Child Entry order.
+- Node tape, in the same order: key:u64 equal to the node ordinal, another i16
+  level equal to its table entry, then each layer from zero through that level.
+  Each layer is degree:u32 followed by its full capacity of u32 slots: 2*M at
+  the base, M above it. Only the first `degree` slots are edges. Inactive slots
+  are opaque native state, preserved by save/load and never traversed.
+
+Levels are in 0..=16. Base degree is at most `min(2*M,n-1)`, upper degree at most
+`min(M,n-1)`. Neighbor order is retained exactly because it can influence
+approximate search. No self, duplicate, out-of-range, or absent-target-layer edge
+is accepted. The entry has the global maximum level, and every node is reachable
+from it through directed base-layer edges. The standalone codec represents an
+empty core with maximum level `u64::MAX`, entry zero and no node records. No
+trailing bytes are accepted. Native bytes round-trip exactly, but are not a
+canonical representation of abstract topology: unused capacity may differ.
+Cross-host byte-order portability is not promised. Reserved slots increase
+payload size compared with an active-edge-only codec; encoded-size admission and chunking include all of
+them, including for a singleton with large M.
+
+Chunk values are `0x13 | payload_length:u32 | payload`. Every nonfinal payload
+has exactly 65,531 bytes, and the final payload has 1..=65,531 bytes, so the full
+value is at most 65,536 bytes. Chunk keys end in contiguous u32 ordinals from
+zero; count is `ceil(payload_bytes/65531)`. Boundaries are independent of backend,
+budget, node, and adjacency boundaries, including an adjacency crossing chunks.
+Missing, repeated, extra, reordered, wrong-size, or checksum-mismatched chunks
+fail with Corruption. Complete chunk-range scanning is required; reading only
+the declared point keys would conceal extras. The graph SHA-256 covers the
+concatenated payload. Checksums detect corruption, not authenticity; even bytes
+with a recomputed checksum undergo full structural validation before native use.
+
+Source identity is SHA-256 over `b"ktann/local-hnsw/source/v1\0"`, u64 Tree Key
+byte length and canonical bytes, u64 parent Partition Key, u64 M, u64
+`ef_construction`, 32-byte configured seed, metric u8 (L2=0, cosine=1,
+inner-product=2), u64 dimension, u64 child count, then each u64 child identity
+and each canonical f32 coordinate's u32 bits (zero always positive). The stored
+binding is SHA-256 over `b"ktann/local-hnsw/snapshot/v1\0"`, that identity,
+u64 Logical Index ID, u32 Header level, u32 count, and u64 cache epoch.
+Parameters are supplied by the owning preparation/snapshot integration; no
+second parameter authority is stored in the descriptor. The Header cache epoch
+remains the sole body-version authority.
+
+Encoding admits borrowed Child Entries, resident graph, and the exact output
+size. `GraphRecords` exposes zero-copy chunk slices.
+Restoration admits retained chunk bytes, the assembled payload, borrowed Child
+Entries, validation arrays/queue, and a conservative native allocation bound
+before reserving the body. Validation checks layout and edges together, followed by local
+reachability; no edge-sized Rust object graph or centroid copy is created.
+Allocations are fallible and operation control is checked through hashing,
+validation and native stream loading. Cancellation discards the unpublished graph.
+The caller must charge other retained caller-owned state and release chunk
+buffers when done; these bounds describe charged allocations, not RSS.
 
 Before accepting the Serving Artifact, validate:
 
@@ -453,8 +519,7 @@ Metrics retain existing privacy rules and do not label raw Tree Keys or vectors.
 
 ## 9. Acceptance and next implementation boundary
 
-The following checks are implementation acceptance criteria, not tests claimed
-by this documentation-only change:
+The following checks govern the complete feature, including integration steps:
 
 1. **Capability:** every public mutation path and fixup execution rejects fixed
    Active indexes without serving changes; exact routing cannot bypass it.

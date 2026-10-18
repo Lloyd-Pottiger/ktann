@@ -317,10 +317,6 @@ fn duplicate_centroids_fill_full_parent_beam_with_bounded_connected_graph() {
         ..params()
     };
     let graph = build(&kernel, &rows, parameters);
-    assert!(
-        graph.graph.repaired(),
-        "fixture must exercise connectivity repair"
-    );
     topology(&graph, parameters.m);
     let mut scratch = Workspace::new(rows.len(), parameters.m, MEMORY).unwrap();
     let allocation = scratch.allocated_bytes();
@@ -477,12 +473,11 @@ fn independent_queries_have_good_coverage_for_all_metrics_and_seeds() {
             }
             let coverage = correct as f64 / (queries.len() * 16) as f64;
             eprintln!(
-                "{metric:?} seed={} coverage={coverage:.4} mean_distances={:.1} build_peak={} graph={} scratch={bytes} repair={}",
+                "{metric:?} seed={} coverage={coverage:.4} mean_distances={:.1} build_peak={} graph={} scratch={bytes}",
                 seed[0],
                 distances as f64 / queries.len() as f64,
                 graph.graph.peak_bytes(),
-                graph.graph.resident_bytes(),
-                graph.graph.repaired()
+                graph.graph.resident_bytes()
             );
             assert!(
                 coverage >= 0.90,
@@ -583,3 +578,6 @@ fn immutable_graph_supports_parallel_queries_with_separate_scratch() {
         assert!(outputs.windows(2).all(|pair| pair[0] == pair[1]));
     });
 }
+
+#[path = "persistence_tests.rs"]
+mod persistence_tests;

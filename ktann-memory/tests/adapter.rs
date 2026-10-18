@@ -35,5 +35,10 @@ impl BackendHarness for Harness {
 
 #[tokio::test]
 async fn shared_backend_contract() {
-    backend_contract::run_suite(&Harness::default()).await;
+    let harness = Harness::default();
+    backend_contract::run_suite(&harness).await;
+    graph_storage::exercise(harness.backend()).await;
 }
+
+#[path = "../../tests/support/graph_storage.rs"]
+mod graph_storage;

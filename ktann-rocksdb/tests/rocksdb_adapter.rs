@@ -88,6 +88,7 @@ async fn rocksdb_adapter_preserves_the_backend_contract() {
 
         let harness = RocksDbHarness { backend: primary };
         shared_backend_contract::run_suite(&harness).await;
+        graph_storage::exercise(harness.backend()).await;
         let primary = harness.backend;
 
         // Adapter-specific: two namespaces over one database are isolated.
@@ -401,3 +402,6 @@ async fn scan_uses_total_order_with_a_hash_memtable() {
     drop(read);
     backend.shutdown().await;
 }
+
+#[path = "../../tests/support/graph_storage.rs"]
+mod graph_storage;

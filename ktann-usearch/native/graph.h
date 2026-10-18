@@ -29,11 +29,14 @@ class NativeGraph {
     std::uint32_t entry() const;
     std::uint32_t level(std::uint32_t node) const;
     std::size_t neighbors(std::uint32_t node, std::uint32_t level, rust::Slice<std::uint32_t>) const;
-    bool repaired() const;
+    std::size_t encoded_size() const;
+    void save(rust::Slice<std::uint8_t> output, MetricContext const&) const;
     std::unique_ptr<GraphState> state;
 };
 
 std::unique_ptr<NativeGraph> build(std::uint32_t n, std::uint32_t m, std::uint32_t ef,
     std::uint64_t seed, std::size_t limit, MetricContext const&);
+std::unique_ptr<NativeGraph> restore(rust::Slice<const std::uint8_t> bytes,
+    std::uint32_t n, std::uint32_t m, std::size_t limit, MetricContext const&);
 std::unique_ptr<NativeWorkspace> workspace(std::uint32_t n, std::uint32_t m, std::size_t limit);
 }

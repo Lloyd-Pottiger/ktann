@@ -61,6 +61,11 @@ impl VectorKernel {
         })
     }
 
+    /// Returns the routing metric for persisted graph source binding.
+    pub(crate) const fn metric(&self) -> Metric {
+        self.metric
+    }
+
     /// Returns the configured vector dimension.
     pub(crate) const fn dimension(&self) -> usize {
         self.dimension

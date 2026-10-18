@@ -133,7 +133,8 @@ The core defines one logical namespace for:
 - Vector Record, Opaque Payload, and Record Location;
 - Tree Manifest directory entries;
 - Partition Header, serving-immutable Centroid, Synopsis, and transition State;
-- Leaf Entry and Child Entry.
+- Leaf Entry and Child Entry;
+- partition-local Graph Descriptor and numbered Graph Chunks.
 
 Every data key begins with Logical Index ID, so drop owns one contiguous logical
 range. Tree-local keys embed the canonical encoded Tree Key and Partition Key;
@@ -181,6 +182,17 @@ Leaf Entries contain Record ID, typed filter fields, and absolute RaBitQ7 bytes;
 Child Entries contain child Partition Key and a centroid projection matching the
 child centroid. Serving centroids are immutable; offline refinement replaces the
 centroid and incoming projection atomically.
+
+Graph Descriptor and Graph Chunk values use tags `0x12` and `0x13`; their
+partition subkeys are `0x06` and `0x07`. Chunk keys end in a big-endian u32
+ordinal. Every complete graph value is at most 64 KiB. The descriptor binds
+one immutable topology to its source Header and canonical Child Entries;
+structural and digest validation precede native allocation. The exact envelope,
+topology grammar, source digest, and loading budget belong to
+[the local graph format](partition-local-hnsw.md#6-persisted-graph-and-snapshot-binding).
+Generic typed transactions support both families; `LogicalRange::graph_chunks`
+scans the complete chunk range with ordinary snapshot pagination. Producing
+these records alone does not authorize serving publication.
 
 ### 6.2 Deterministic persistent algorithms
 

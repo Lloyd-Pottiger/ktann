@@ -221,6 +221,7 @@ async fn foundationdb_adapter_preserves_the_backend_contract() {
 
     let harness = FoundationDbHarness { backend: primary };
     shared_backend_contract::run_suite(&harness).await;
+    graph_storage::exercise(harness.backend()).await;
     let primary = harness.backend;
 
     check_native_transaction_limit(cluster_file.as_deref()).await;
@@ -292,3 +293,6 @@ async fn foundationdb_adapter_preserves_the_backend_contract() {
     clear_test_keys(&reopened).await;
     clear_test_keys(&isolated).await;
 }
+
+#[path = "../../tests/support/graph_storage.rs"]
+mod graph_storage;

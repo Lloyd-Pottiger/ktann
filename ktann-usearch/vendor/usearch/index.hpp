@@ -3809,18 +3809,27 @@ private:
             reset();
             return result.failed("Out of memory");
         }
-        nodes_count_ = header_size.value;
+        // Count only initialized nodes: failure/cancellation must free a valid prefix.
+        nodes_count_ = 0;
         max_level_ = static_cast<level_t>(header.max_level);
         entry_slot_ = static_cast<compressed_slot_t>(header.entry_slot);
 
         // Load the nodes
         for (std::size_t i = 0; i != header_size.value; ++i) {
             span_bytes_t node_bytes = node_malloc_(levels[i]);
+            if (!node_bytes) {
+                reset();
+                return result.failed("Out of memory");
+            }
             if (!input(node_bytes.data(), node_bytes.size())) {
+                // The callback may have copied only a prefix. Its embedded level
+                // is not yet trusted, so free using the known allocation size.
+                tape_allocator_.deallocate(node_bytes.data(), node_bytes.size());
                 reset();
                 return result.failed("Failed to pull nodes from the stream");
             }
             nodes_[i] = node_t{node_bytes.data()};
+            ++nodes_count_;
             if (!progress(i + 1, header_size.value))
                 return result.failed("Terminated by user");
         }
