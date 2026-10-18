@@ -1,8 +1,58 @@
-use std::cell::Cell;
-use std::collections::{BTreeSet, VecDeque};
-
 use super::*;
 use crate::api::{DataType, Metric, Value};
+
+/// Holds borrowed test projections beside native topology for independent score,
+/// structure and round-trip comparisons. Production only exposes encoded builds
+/// and complete restored fixed bodies.
+#[derive(Debug)]
+pub(crate) struct TestGraph<'a> {
+    centroids: Centroids<'a>,
+    graph: ktann_usearch::Graph,
+    identity: [u8; 32],
+}
+
+impl<'a> TestGraph<'a> {
+    pub(crate) fn build(
+        centroids: Centroids<'a>,
+        parameters: Parameters,
+        tree: &TreeKey,
+        parent: PartitionKey,
+        working_bytes: usize,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Self> {
+        let (graph, identity) =
+            build_graph(centroids, parameters, tree, parent, working_bytes, check)?;
+        Ok(Self {
+            centroids,
+            graph,
+            identity,
+        })
+    }
+
+    pub(crate) fn search(
+        &self,
+        query: &[f32],
+        beam: usize,
+        ef: usize,
+        working_bytes: usize,
+        scratch: &mut Workspace,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<(Vec<Candidate>, ktann_usearch::Stats)> {
+        search_graph(
+            self.centroids,
+            &self.graph,
+            query,
+            beam,
+            ef,
+            working_bytes,
+            scratch,
+            check,
+        )
+    }
+}
+
+use std::cell::Cell;
+use std::collections::{BTreeSet, VecDeque};
 
 const MEMORY: usize = 128 * 1024 * 1024;
 
@@ -33,9 +83,9 @@ fn build<'a>(
     kernel: &'a VectorKernel,
     children: &'a [ChildEntry],
     parameters: Parameters,
-) -> LocalHnsw<'a> {
+) -> TestGraph<'a> {
     let centroids = Centroids::new(kernel, children, ktann_usearch::MAX_NODES, &|| Ok(())).unwrap();
-    LocalHnsw::build(centroids, parameters, &tree(), key(1), MEMORY, &|| Ok(())).unwrap()
+    TestGraph::build(centroids, parameters, &tree(), key(1), MEMORY, &|| Ok(())).unwrap()
 }
 
 // Independent scalar oracle: no graph distance callback or production selector.
@@ -93,7 +143,7 @@ fn fixture(count: usize, dimension: usize, seed: u64) -> Vec<Vec<f32>> {
 }
 
 /// Audit all layers and directed reachability independently of the builder.
-fn topology(graph: &LocalHnsw<'_>, m: usize) -> Vec<Vec<Vec<u32>>> {
+fn topology(graph: &TestGraph<'_>, m: usize) -> Vec<Vec<Vec<u32>>> {
     let n = graph.centroids.children.len();
     let native = &graph.graph;
     let mut buffer = vec![0; 2 * m];
@@ -175,7 +225,7 @@ fn rejects_invalid_inputs_and_admits_checked_resource_bounds() {
             ..params()
         };
         assert_eq!(
-            LocalHnsw::build(view, invalid, &tree(), key(1), MEMORY, &|| Ok(()))
+            TestGraph::build(view, invalid, &tree(), key(1), MEMORY, &|| Ok(()))
                 .unwrap_err()
                 .kind(),
             ErrorKind::InvalidArgument
@@ -183,14 +233,14 @@ fn rejects_invalid_inputs_and_admits_checked_resource_bounds() {
     }
     let bound = view.bytes + ktann_usearch::build_bound(2, params().m).unwrap();
     assert_eq!(
-        LocalHnsw::build(view, params(), &tree(), key(1), bound - 1, &|| panic!(
+        TestGraph::build(view, params(), &tree(), key(1), bound - 1, &|| panic!(
             "must reject before native work"
         ))
         .unwrap_err()
         .kind(),
         ErrorKind::LimitExceeded
     );
-    let graph = LocalHnsw::build(view, params(), &tree(), key(1), bound, &|| Ok(())).unwrap();
+    let graph = TestGraph::build(view, params(), &tree(), key(1), bound, &|| Ok(())).unwrap();
     assert!(graph.graph.peak_bytes() <= bound - view.bytes);
     let mut scratch = Workspace::new(2, params().m, MEMORY).unwrap();
     for (query, beam, ef) in [
@@ -390,7 +440,7 @@ fn seeded_builds_and_partition_identity_are_reproducible() {
             ..params()
         },
     );
-    let levels = |g: &LocalHnsw<'_>| (0..512).map(|n| g.graph.level(n)).collect::<Vec<_>>();
+    let levels = |g: &TestGraph<'_>| (0..512).map(|n| g.graph.level(n)).collect::<Vec<_>>();
     assert_ne!(levels(&first), levels(&third));
     let other_tree = TreeKey::encode(&[DataType::I64], &[Value::I64(3)]).unwrap();
     assert_ne!(
@@ -502,7 +552,7 @@ fn cancellation_unwinds_build_and_query_and_scratch_can_be_reused() {
         }
     };
     assert_eq!(
-        LocalHnsw::build(view, params(), &tree(), key(1), MEMORY, &stop)
+        TestGraph::build(view, params(), &tree(), key(1), MEMORY, &stop)
             .unwrap_err()
             .kind(),
         ErrorKind::DeadlineExceeded

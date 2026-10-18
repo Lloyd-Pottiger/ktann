@@ -242,6 +242,15 @@ the leaf-level base beam width per request; the beam is a traversal-quality
 knob, not an accounted budget dimension, and the visited-partition budget still
 bounds the work it schedules.
 
+`SearchOptions::with_routing_mode` selects `RoutingMode::Exact` (default) or
+`RoutingMode::PartitionLocalHnsw { ef_search }`. The latter requires a Fixed
+Index and positive `ef_search`; invalid selections return `InvalidArgument`
+before foreground admission, including for empty indexes. The enum carries no
+HNSW-only field in Exact mode. Leaf-only Fixed Indexes accept either mode and
+perform no graph work. The local graph uses `min(n, max(ef_search, B))`, where
+`n` is the parent size and `B` is the next-level beam. No routing mode changes
+the rerank budget.
+
 Leaf Entry scans have no separate budget; all entries in an admitted leaf are
 considered. Their usage is reported with a 64-bit counter and no exhaustion flag.
 

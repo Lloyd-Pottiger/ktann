@@ -4,8 +4,6 @@
 //! authoritative ownership and filter fields. Exact f64 distances use original,
 //! unrotated vectors; ties use unsigned lexicographic Record ID order.
 
-use std::collections::BTreeSet;
-
 use bytes::Bytes;
 
 use crate::api::{Error, ErrorKind, Result, SearchHit, Value};
@@ -50,6 +48,20 @@ impl LeafCandidate {
             distance,
             location,
         }
+    }
+
+    /// Conservative retained heap charge; shared byte payloads are charged per owner.
+    pub(crate) fn heap_bytes(&self) -> Result<usize> {
+        let bytes = self
+            .fields
+            .iter()
+            .try_fold(128_u64, |bytes, field| {
+                bytes.checked_add(super::cache::field_bytes(field))
+            })
+            .and_then(|bytes| bytes.checked_add(self.record_id.len() as u64))
+            .and_then(|bytes| bytes.checked_add(self.location.tree_key().as_bytes().len() as u64))
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+        usize::try_from(bytes).map_err(|_| Error::new(ErrorKind::LimitExceeded))
     }
 
     /// Returns the Record ID, the deterministic final tie-breaker.
@@ -173,9 +185,8 @@ pub(crate) fn filter_candidates<T>(
 /// The stage fails closed. A fully absent record group, a Record ID that does
 /// not match the requested candidate, a Record Location that disagrees with
 /// the candidate's source Tree Key or Leaf Partition, record fields that
-/// diverge from the candidate's Leaf Entry projection, or a duplicate Record
-/// ID among the candidates are all Corruption — never skipped or silently
-/// deduplicated.
+/// diverge from the candidate's Leaf Entry projection are Corruption. Traversal
+/// has already validated that candidate Record IDs are unique.
 ///
 /// Final ordering sorts by the exact ranking value and then unsigned
 /// lexicographic Record ID bytes, truncates to `k`, and builds Search Hits
@@ -191,16 +202,6 @@ pub(crate) async fn exact_rerank<T: ReadOps>(
 ) -> Result<ExactRerankOutcome> {
     if k == 0 {
         return Err(Error::invalid_argument());
-    }
-
-    // Exact Record Location/Leaf Entry ownership guarantees at most one
-    // candidate per Vector Record in one snapshot; a duplicate Record ID is
-    // Corruption rather than an overlap to deduplicate.
-    let mut seen = BTreeSet::new();
-    for candidate in &candidates {
-        if !seen.insert(candidate.record_id.as_ref()) {
-            return Err(Error::new(ErrorKind::Corruption));
-        }
     }
 
     let budget = usize::try_from(remaining_rerank_budget)
@@ -813,25 +814,6 @@ mod tests {
             vec![candidate(&records[1], 0.0)],
             1,
             1,
-        )
-        .await;
-        assert_eq!(
-            outcome.err().map(|error| error.kind()),
-            Some(ErrorKind::Corruption)
-        );
-    }
-
-    #[tokio::test]
-    async fn duplicate_candidate_record_ids_are_corruption() {
-        let manifest = manifest(Metric::L2);
-        let records = fixture_records(24);
-        let data = record_group_data(&manifest, &records[..1]);
-        let outcome = rerank(
-            &manifest,
-            mock_txn(data),
-            vec![candidate(&records[0], 0.0), candidate(&records[0], 1.0)],
-            2,
-            2,
         )
         .await;
         assert_eq!(

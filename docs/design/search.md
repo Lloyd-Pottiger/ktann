@@ -146,8 +146,15 @@ predicate rejection cannot hide malformed persistent entries.
 Traversal is a level-scaled beam. The leaf-level base beam defaults to 128 and
 SearchOptions may override it per request within the hard cap; moving one
 level toward the root divides it by two with minimum one. All admitted parents
-at one depth expose their Child Entries before the next depth selects the
-globally nearest beam for each tree. This prevents one wide parent from
+at one depth contribute before the next depth selects the globally nearest
+beam for each tree. `SearchOptions::routing_mode` defaults to Exact. Fixed
+Indexes can explicitly select PartitionLocalHnsw with positive `ef_search`;
+ordinary indexes reject that choice. Each parent contributes up to the full
+local next-level beam B, never a share divided among parents. Candidate scores
+come directly from the graph's f64 routing kernel evaluations. Exact scores all
+children. Both modes merge into a single bounded top-B heap per tree/level,
+ordered by distance and Partition Key. Every exposed Child Entry is checked
+for duplicate incoming references, including children omitted by local search. This prevents one wide parent from
 consuming the next level's beam before other admitted parents contribute their
 children. Eligible trees advance fairly. Ties use Tree Key, Partition Key,
 then Record ID.
@@ -257,23 +264,23 @@ Corruption is never cached.
 
 ### Fixed-index graph bodies
 
-The explicit graph reader uses the complete query's existing validated logical
-transaction. It reads the snapshot Header and Graph Descriptor on every access,
-including hits. Ready internal kind, exact count, epoch, configured capacity and
+The graph reader uses the complete query's existing validated logical
+transaction and the snapshot Header already read by traversal. It reads the
+Graph Descriptor on every access, including hits. Ready internal kind, exact count, epoch, configured capacity and
 the descriptor's source binding must agree. Missing or mismatched graphs are
-Corruption; there is no exact fallback. Ordinary exact reads do not request graph
-records, for either mutable or fixed indexes.
+Corruption; there is no exact fallback. Mutable-index exact reads do not request graph records. Both routing modes on
+Fixed Indexes validate complete graph bodies.
 
 On a miss, the reader scans complete Child Entries and contiguous graph chunks
 from that same transaction, then restores the persisted native graph. It never
 builds a graph or changes its seed, construction parameters, adjacency or query
-distances. No partial graph body is installed. An entries-only cache body can be
-upgraded by sharing its immutable centroid allocation; the same cache key owns
-the complete body, and a racing equal-epoch exact fill cannot discard its graph.
-Older snapshots cannot replace newer cached epochs. Cached ownership includes
-native graph allocations, source binding, the numeric kernel's rotation schedule
-and the one shared Child Entry/centroid allocation. Eviction does not invalidate
-handles still held by queries.
+distances. A fixed internal body owns its Child Entries, native graph, source
+binding, and numeric kernel together. The cache distinguishes leaf, ordinary
+internal, and fixed internal bodies; a fixed body cannot omit its graph.
+Cold reads retain unpublished entries and chunks until restoration succeeds,
+then publish one complete shared body. No entries-only cache object is created
+for a fixed internal partition. Older snapshots cannot replace newer cached
+epochs. Eviction does not invalidate handles still held by queries.
 
 `RuntimeConfig::routing_working_bytes` (default 256 MiB) bounds one query's graph
 routing work independently of retained cache capacity. Before loading entries or
@@ -288,9 +295,17 @@ Each parent handle is consumed before loading the next. Restore and query work
 run on the blocking pool, retain foreground admission through actual task exit,
 and honor cancellation/deadlines. Scratch is private to each query; native graphs
 are immutable and shared. Snapshot expiry propagates to complete-query retry;
-neither graph reads nor CPU restoration open a new transaction. Production beam
-traversal remains exact; these interfaces provide the snapshot-bound input and
-unmodified local scores for its HNSW candidate-generation integration.
+neither graph reads nor CPU restoration open a new transaction. Traversal passes
+its already-read snapshot Header into the reader, avoiding a duplicate Header
+read. Fixed internal bodies are consumed serially; ordinary and fixed leaf
+visits retain bounded metadata/body prefetch. Exact on a Fixed Index loads and
+validates the same mandatory graph body, then ignores adjacency; corruption
+never triggers a routing fallback. All children still participate in the
+query-wide incoming-edge integrity check. Its hash storage, live frontiers,
+query inputs, and any leaf candidates retained by shallower trees are charged
+before admitting the next graph. These checks and native scratch admission are
+independent of cache warmth. Graph exploration consumes no logical partition
+visits; each visited child body consumes its ordinary visit.
 
 ## 9. Validation
 

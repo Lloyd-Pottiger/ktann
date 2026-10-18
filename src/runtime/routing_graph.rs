@@ -2,22 +2,23 @@
 
 use super::{OperationContext, check_control, compute::controlled_compute};
 use crate::api::{PartitionKey, Result};
+use crate::search::cache::BodyRequest;
 use crate::search::cache::graph::{GraphRead, RoutingGraph, read_graph};
 use crate::storage::ReadLogicalTxn;
 use crate::storage::backend::{Backend, ReadOps};
-use crate::storage::keys::TreeKey;
 use crate::storage::values::IndexManifest;
 
-impl<B: Backend> OperationContext<B> {
-    /// Uses the complete query's already validated transaction; it never opens a
-    /// replacement snapshot. The caller reserves all other retained routing state
-    /// and releases/consumes each parent before requesting another graph.
-    pub(crate) async fn read_routing_graph<T: ReadOps>(
+impl<B: Backend> crate::search::cache::graph::RoutingExecution for OperationContext<B> {
+    fn checkpoint(&self) -> Result<()> {
+        self.checkpoint()
+    }
+
+    /// Loads through the query's snapshot and restores under its CPU admission.
+    async fn read<T: ReadOps>(
         &self,
         txn: &mut ReadLogicalTxn<'_, T>,
         manifest: &IndexManifest,
-        tree: &TreeKey,
-        parent: PartitionKey,
+        request: BodyRequest<'_>,
         retained_bytes: usize,
     ) -> Result<RoutingGraph> {
         let admission = self.cpu_admission.as_ref().expect("search CPU admission");
@@ -25,8 +26,7 @@ impl<B: Backend> OperationContext<B> {
             txn,
             &self.partition_cache,
             manifest,
-            tree,
-            parent,
+            request,
             admission.inner.config.routing_working_bytes(),
             retained_bytes,
             &|| self.checkpoint(),
@@ -47,19 +47,24 @@ impl<B: Backend> OperationContext<B> {
         }
     }
 
-    /// Consumes one parent handle. Native scratch is query-private, and admission
-    /// remains held until the blocking task exits even if the async future drops.
-    pub(crate) async fn search_routing_graph(
+    async fn candidates(
         &self,
         graph: RoutingGraph,
         query: Vec<f32>,
         beam: usize,
-        ef: usize,
-    ) -> Result<(Vec<(PartitionKey, f64)>, ktann_usearch::Stats)> {
+        mode: crate::api::RoutingMode,
+    ) -> Result<Vec<(PartitionKey, f64)>> {
         controlled_compute(
             self.options.clone(),
             self.cpu_admission.clone().expect("search CPU admission"),
-            move |options| graph.search(&query, beam, ef, &|| check_control(options)),
+            move |options| match mode {
+                crate::api::RoutingMode::PartitionLocalHnsw { ef_search } => Ok(graph
+                    .search(&query, beam, ef_search, &|| check_control(options))?
+                    .0),
+                crate::api::RoutingMode::Exact => {
+                    graph.exact(&query, beam, &|| check_control(options))
+                }
+            },
         )
         .await
     }

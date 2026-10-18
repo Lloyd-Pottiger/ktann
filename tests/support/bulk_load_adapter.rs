@@ -148,6 +148,47 @@ async fn exercise_mode<B: Backend>(backend: &impl Fn() -> B, directory: &Path, f
         verified.issues
     );
     assert_eq!(verified.objects.vector_records, 128);
+    // Exercise real storage reads for both serving modes after durable loading.
+    // The default beam is exhaustive for this small two-Tree-Key fixture.
+    let modes = if fixed {
+        vec![
+            ktann::api::RoutingMode::Exact,
+            ktann::api::RoutingMode::PartitionLocalHnsw { ef_search: 1 },
+        ]
+    } else {
+        vec![ktann::api::RoutingMode::Exact]
+    };
+    for mode in modes {
+        for _ in 0..2 {
+            let result = index
+                .search(
+                    ktann::api::SearchRequest::new(vec![0.0, 1.0], 8)
+                        .unwrap()
+                        .with_options(
+                            ktann::api::SearchOptions::default()
+                                .with_routing_mode(mode)
+                                .unwrap(),
+                        ),
+                )
+                .await
+                .unwrap();
+            let actual: Vec<_> = result
+                .hits
+                .iter()
+                .map(|hit| {
+                    (
+                        u64::from_be_bytes(hit.id().as_ref().try_into().unwrap()),
+                        hit.distance(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                actual,
+                (0..8_u64).map(|id| (id, id as f64)).collect::<Vec<_>>()
+            );
+        }
+    }
+
     assert_eq!(reopened.status().await.unwrap(), BulkBuildStatus::Published);
     runtime.drop_index("bulk-loader").await.unwrap();
     assert_eq!(

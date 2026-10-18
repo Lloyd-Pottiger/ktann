@@ -30,6 +30,7 @@ use crate::storage::values::{
 };
 
 use super::beam_width;
+use super::cache::graph::RoutingExecution;
 use super::cache::{
     BODY_PREFETCH_BATCH, BodyEntries, BodyRequest, CachedBody, CachedLeafEntry, PartitionCache,
     load_body, prefetch_bodies,
@@ -39,6 +40,7 @@ use super::plan::EnumeratedTree;
 use super::predicate::{CompiledPredicate, SynopsisClassification};
 use super::rabitq::{ApproximateCandidate, DecodedRaBitQ7, RaBitQQuery, select_leaf_overlap};
 use super::rerank::{LeafCandidate, filter_candidates};
+use crate::api::RoutingMode;
 
 /// The default leaf-level base beam (design `search.md` section 6).
 pub(crate) const DEFAULT_LEAF_BEAM: u32 = 128;
@@ -61,9 +63,16 @@ pub(crate) struct TraversalRequest<'a> {
     k: usize,
     budgets: SearchBudgets,
     leaf_beam: u32,
+    routing_mode: RoutingMode,
 }
 
 impl<'a> TraversalRequest<'a> {
+    /// Uses the already validated public routing choice.
+    pub(crate) fn with_routing_mode(mut self, mode: RoutingMode) -> Self {
+        self.routing_mode = mode;
+        self
+    }
+
     /// Creates one traversal request, rejecting a zero result limit or beam.
     pub(crate) fn new(
         routing: &'a [f32],
@@ -83,6 +92,7 @@ impl<'a> TraversalRequest<'a> {
             k,
             budgets,
             leaf_beam,
+            routing_mode: RoutingMode::Exact,
         })
     }
 }
@@ -179,10 +189,30 @@ pub(crate) async fn traverse<T: ReadOps>(
     cache: &PartitionCache,
     kernel: &VectorKernel,
     request: TraversalRequest<'_>,
+    execution: &impl RoutingExecution,
 ) -> Result<TraversalOutcome> {
     let manifest = txn.require_manifest()?;
     let query = RaBitQQuery::new(request.routing, manifest.config().metric())?;
+    let input_bytes = if manifest.config().fixed_graph().is_some() {
+        request.trees.iter().try_fold(
+            kernel
+                .heap_bytes()
+                .checked_add(request.routing.len() * 8)
+                .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?,
+            |bytes, tree| {
+                bytes
+                    .checked_add(
+                        2 * size_of::<EnumeratedTree>() + tree.tree_key().as_bytes().len() + 64,
+                    )
+                    .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))
+            },
+        )?
+    } else {
+        0
+    };
     let context = VisitContext {
+        input_bytes,
+        execution,
         manifest,
         cache,
         kernel,
@@ -197,7 +227,9 @@ pub(crate) async fn traverse<T: ReadOps>(
 }
 
 /// The manifest-bound inputs shared by every partition visit.
-struct VisitContext<'a> {
+struct VisitContext<'a, R> {
+    input_bytes: usize,
+    execution: &'a R,
     manifest: &'a IndexManifest,
     cache: &'a PartitionCache,
     kernel: &'a VectorKernel,
@@ -260,12 +292,14 @@ struct Traversal {
     frontier: BinaryHeap<Reverse<FrontierEntry>>,
     /// Children exposed by the current depth, grouped for next-level beam
     /// selection by tree and persistent level.
-    next_frontier: HashMap<(u32, u32), Vec<FrontierEntry>>,
+    next_frontier: HashMap<(u32, u32), BinaryHeap<FrontierEntry>>,
     /// Every referenced `{tree, partition}`: roots, injected root-split
     /// targets, and discovered Child Entries. A second reference to one body is
     /// Corruption.
     referenced: HashSet<(u32, PartitionKey)>,
     candidates: Vec<LeafCandidate>,
+    /// Owned payload charge accumulated once per retained leaf candidate.
+    candidate_heap_bytes: usize,
     /// Visited partitions worth offering to the Runtime's demand-driven Fixup
     /// queue: split or merge states and threshold-crossing `Ready` partitions.
     maintenance: Vec<(TreeKey, PartitionKey)>,
@@ -283,6 +317,7 @@ impl Traversal {
             next_frontier: HashMap::new(),
             referenced: HashSet::new(),
             candidates: Vec::new(),
+            candidate_heap_bytes: 0,
             maintenance: Vec::new(),
             visited_partitions: 0,
             visited_leaf_entries: 0,
@@ -310,11 +345,12 @@ impl Traversal {
     async fn run<T: ReadOps>(
         &mut self,
         txn: &mut ReadLogicalTxn<'_, T>,
-        context: &VisitContext<'_>,
+        context: &VisitContext<'_, impl RoutingExecution>,
     ) -> Result<()> {
         loop {
+            context.execution.checkpoint()?;
             if self.frontier.is_empty() {
-                self.select_next_frontier(context.request.leaf_beam);
+                self.select_next_frontier();
                 if self.frontier.is_empty() {
                     break;
                 }
@@ -325,7 +361,14 @@ impl Traversal {
                 break;
             }
             let remaining = context.request.budgets.visited_partitions() - self.visited_partitions;
+            // Fixed internal bodies are restored and consumed one at a time.
+            // Leaves retain the ordinary bounded prefetch path.
             if remaining > 1
+                && (context.manifest.config().fixed_graph().is_none()
+                    || self
+                        .frontier
+                        .peek()
+                        .is_some_and(|Reverse(entry)| entry.expected_level == Some(1)))
                 && self.frontier.len() > 1
                 && self
                     .frontier
@@ -356,7 +399,7 @@ impl Traversal {
     async fn visit_beam<T: ReadOps>(
         &mut self,
         txn: &mut ReadLogicalTxn<'_, T>,
-        context: &VisitContext<'_>,
+        context: &VisitContext<'_, impl RoutingExecution>,
         remaining: u32,
     ) -> Result<()> {
         let limit = PARTITION_METADATA_BATCH.min(remaining as usize);
@@ -432,7 +475,7 @@ impl Traversal {
     async fn prepare_partition<'a, T: ReadOps>(
         &mut self,
         txn: &mut ReadLogicalTxn<'_, T>,
-        context: &VisitContext<'a>,
+        context: &VisitContext<'a, impl RoutingExecution>,
         entry: FrontierEntry,
         prefetched_metadata: Option<(PartitionHeader, Option<PartitionSynopsis>)>,
     ) -> Result<Option<PreparedVisit<'a>>> {
@@ -485,6 +528,11 @@ impl Traversal {
             return Err(Error::new(ErrorKind::Corruption));
         }
         let level = header.level();
+        if context.manifest.config().fixed_graph().is_some()
+            && header.state() != PartitionState::Ready
+        {
+            return Err(Error::new(ErrorKind::Corruption));
+        }
 
         // A visit rediscovers only work the committed Header can advance.
         if fixup::is_actionable(context.manifest.config(), entry.partition, header) {
@@ -544,13 +592,16 @@ impl Traversal {
     async fn visit_partition<T: ReadOps>(
         &mut self,
         txn: &mut ReadLogicalTxn<'_, T>,
-        context: &VisitContext<'_>,
+        context: &VisitContext<'_, impl RoutingExecution>,
         entry: FrontierEntry,
     ) -> Result<()> {
         let Some(visit) = self.prepare_partition(txn, context, entry, None).await? else {
             return Ok(());
         };
         let tree_key = context.request.trees[entry.tree as usize].tree_key();
+        if visit.header.level() > 1 && context.manifest.config().fixed_graph().is_some() {
+            return self.visit_graph(txn, context, &visit).await;
+        }
         let body = load_body(
             txn,
             context.cache,
@@ -566,7 +617,7 @@ impl Traversal {
     /// Consumes complete bodies in the original deterministic traversal order.
     fn visit_body(
         &mut self,
-        context: &VisitContext<'_>,
+        context: &VisitContext<'_, impl RoutingExecution>,
         visit: &PreparedVisit<'_>,
         body: &CachedBody,
     ) -> Result<()> {
@@ -627,12 +678,157 @@ impl Traversal {
 
     /// Exposes one internal partition's children to the next depth's beam.
     ///
-    /// The decoded body comes from the snapshot-validated cache. Every Child
-    /// Entry enters the frontier so children from all admitted same-depth
-    /// parents compete by routing distance when the next depth is popped.
+    /// Reads and consumes one complete fixed body through the runtime CPU boundary.
+    async fn visit_graph<T: ReadOps>(
+        &mut self,
+        txn: &mut ReadLogicalTxn<'_, T>,
+        context: &VisitContext<'_, impl RoutingExecution>,
+        visit: &PreparedVisit<'_>,
+    ) -> Result<()> {
+        let level = visit.header.level() - 1;
+        let beam = beam_width(context.request.leaf_beam, level) as usize;
+        let retained = self
+            .routing_bytes(visit.header.entry_count() as usize, beam)?
+            .checked_add(context.input_bytes)
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+        let graph = context
+            .execution
+            .read(
+                txn,
+                context.manifest,
+                BodyRequest {
+                    tree_key: context.request.trees[visit.entry.tree as usize].tree_key(),
+                    partition: visit.entry.partition,
+                    header: &visit.header,
+                },
+                retained,
+            )
+            .await?;
+        self.referenced
+            .try_reserve(graph.children().len())
+            .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
+        // Validate every exposed edge, including children excluded by local top-B.
+        for (ordinal, child) in graph.children().iter().enumerate() {
+            if ordinal % 64 == 0 {
+                context.execution.checkpoint()?;
+            }
+            if !self.referenced.insert((visit.entry.tree, child.child())) {
+                return Err(Error::new(ErrorKind::Corruption));
+            }
+        }
+        let mut query = Vec::new();
+        query
+            .try_reserve_exact(context.request.routing.len())
+            .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
+        query.extend_from_slice(context.request.routing);
+        let candidates = context
+            .execution
+            .candidates(graph, query, beam, context.request.routing_mode)
+            .await?;
+        for (ordinal, (child, distance)) in candidates.into_iter().enumerate() {
+            if ordinal % 64 == 0 {
+                context.execution.checkpoint()?;
+            }
+            self.merge_child(
+                visit.entry.tree,
+                level,
+                child,
+                distance,
+                context.request.leaf_beam,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Conservative charged allocation bound, including simultaneous old/new hash
+    /// storage during growth and leaf candidates retained by shallower trees.
+    fn routing_bytes(&self, children: usize, beam: usize) -> Result<usize> {
+        let limit = || Error::new(ErrorKind::LimitExceeded);
+        let identities = self
+            .referenced
+            .len()
+            .checked_add(children)
+            .ok_or_else(limit)?
+            .max(self.referenced.capacity())
+            .checked_next_power_of_two()
+            .ok_or_else(limit)?;
+        let mut bytes = identities
+            .checked_mul(4 * (size_of::<(u32, PartitionKey)>() + 16))
+            .ok_or_else(limit)?;
+        let frontier = self
+            .next_frontier
+            .values()
+            .try_fold(self.frontier.capacity(), |n, heap| {
+                n.checked_add(heap.capacity())
+            })
+            .and_then(|n| n.checked_add(beam.min(children).max(4).min(beam)))
+            .and_then(|n| n.checked_mul(4 * size_of::<FrontierEntry>()))
+            .ok_or_else(limit)?;
+        bytes = bytes.checked_add(frontier).ok_or_else(limit)?;
+        let groups = self
+            .next_frontier
+            .capacity()
+            .checked_add(1)
+            .and_then(usize::checked_next_power_of_two)
+            .and_then(|n| {
+                n.checked_mul(4 * (size_of::<((u32, u32), BinaryHeap<FrontierEntry>)>() + 16))
+            })
+            .ok_or_else(limit)?;
+        bytes
+            .checked_add(groups)
+            .and_then(|bytes| bytes.checked_add(self.candidate_heap_bytes))
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    self.candidates
+                        .capacity()
+                        .checked_mul(size_of::<LeafCandidate>())?,
+                )
+            })
+            .ok_or_else(limit)
+    }
+
+    /// Maintains exactly one top-B container for each tree and target level.
+    fn merge_child(
+        &mut self,
+        tree: u32,
+        level: u32,
+        partition: PartitionKey,
+        distance: f64,
+        leaf_beam: u32,
+    ) -> Result<()> {
+        let width = beam_width(leaf_beam, level) as usize;
+        if !self.next_frontier.contains_key(&(tree, level)) {
+            self.next_frontier
+                .try_reserve(1)
+                .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
+        }
+        let heap = self.next_frontier.entry((tree, level)).or_default();
+        let entry = FrontierEntry {
+            distance,
+            tree,
+            partition,
+            expected_level: Some(level),
+        };
+        if heap.len() < width {
+            if heap.len() == heap.capacity() {
+                let capacity = width.min(heap.capacity().saturating_mul(2).max(4));
+                heap.try_reserve_exact(capacity - heap.len())
+                    .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
+            }
+            heap.push(entry);
+        } else if let Some(mut worst) = heap.peek_mut()
+            && entry < *worst
+        {
+            *worst = entry;
+        }
+        Ok(())
+    }
+
+    /// Exact mutable-index baseline; all exposed children compete in one
+    /// bounded tree/level heap under the existing total tie order.
     fn visit_internal(
         &mut self,
-        context: &VisitContext<'_>,
+        context: &VisitContext<'_, impl RoutingExecution>,
         tree: u32,
         header: &PartitionHeader,
         body: &CachedBody,
@@ -641,7 +837,10 @@ impl Traversal {
         let BodyEntries::Internal(entries) = body.entries() else {
             return Err(Error::new(ErrorKind::Corruption));
         };
-        for children in entries.chunks(4) {
+        for (batch, children) in entries.chunks(4).enumerate() {
+            if batch % 16 == 0 {
+                context.execution.checkpoint()?;
+            }
             let distances = if children.len() == 4 {
                 context.kernel.routing_centroid_distances(
                     context.request.routing,
@@ -663,15 +862,13 @@ impl Traversal {
                 if !self.referenced.insert((tree, child.child())) {
                     return Err(Error::new(ErrorKind::Corruption));
                 }
-                self.next_frontier
-                    .entry((tree, level - 1))
-                    .or_default()
-                    .push(FrontierEntry {
-                        distance,
-                        tree,
-                        partition: child.child(),
-                        expected_level: Some(level - 1),
-                    });
+                self.merge_child(
+                    tree,
+                    level - 1,
+                    child.child(),
+                    distance,
+                    context.request.leaf_beam,
+                )?;
             }
         }
         Ok(())
@@ -682,7 +879,7 @@ impl Traversal {
     /// supplies the whole decoded body; scanning has no independent entry cap.
     fn scan_leaf(
         &mut self,
-        context: &VisitContext<'_>,
+        context: &VisitContext<'_, impl RoutingExecution>,
         tree_key: &TreeKey,
         partition: PartitionKey,
         body: &CachedBody,
@@ -713,28 +910,32 @@ impl Traversal {
         if selection.truncated() {
             self.rabitq_overlap_truncated = true;
         }
+        let selected = selection.into_candidates();
         self.candidates
-            .extend(selection.into_candidates().into_iter().map(|candidate| {
-                let (record_id, distance, entry) = candidate.into_parts();
-                LeafCandidate::new(
-                    record_id,
-                    entry.fields().into(),
-                    distance,
-                    RecordLocation::new(tree_key.clone(), partition),
-                )
-            }));
+            .try_reserve(selected.len())
+            .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
+        for candidate in selected {
+            let (record_id, distance, entry) = candidate.into_parts();
+            let candidate = LeafCandidate::new(
+                record_id,
+                entry.fields().into(),
+                distance,
+                RecordLocation::new(tree_key.clone(), partition),
+            );
+            if context.manifest.config().fixed_graph().is_some() {
+                self.candidate_heap_bytes = self
+                    .candidate_heap_bytes
+                    .checked_add(candidate.heap_bytes()?)
+                    .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+            }
+            self.candidates.push(candidate);
+        }
         Ok(())
     }
 
-    /// Selects each tree-level's globally nearest next-depth beam.
-    fn select_next_frontier(&mut self, leaf_beam: u32) {
-        let groups = std::mem::take(&mut self.next_frontier);
-        for ((_tree, level), mut entries) in groups {
-            let width = usize::try_from(beam_width(leaf_beam, level)).unwrap_or(usize::MAX);
-            if entries.len() > width {
-                entries.select_nth_unstable_by(width - 1, FrontierEntry::cmp);
-                entries.truncate(width);
-            }
+    /// Promotes the completed globally selected beams only after all parents contribute.
+    fn select_next_frontier(&mut self) {
+        for (_, entries) in self.next_frontier.drain() {
             self.frontier.extend(entries.into_iter().map(Reverse));
         }
     }
@@ -819,6 +1020,90 @@ fn score_leaf_entries<'a, T: Borrow<CachedLeafEntry>>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bounded_merge_matches_full_exposure_without_full_beam_allocation() {
+        let mut state = super::Traversal::seed(&[]).unwrap();
+        // A very wide request over many tiny trees must grow with actual entries.
+        for tree in 0..4096 {
+            state.merge_child(tree, 1, pk(1), 0.0, 16_384).unwrap();
+        }
+        assert_eq!(
+            state
+                .next_frontier
+                .values()
+                .map(|heap| heap.len())
+                .sum::<usize>(),
+            4096
+        );
+        assert!(
+            state
+                .next_frontier
+                .values()
+                .all(|heap| heap.capacity() <= 4)
+        );
+
+        for width in [1, 4, 17, 128] {
+            let mut state = super::Traversal::seed(&[]).unwrap();
+            let mut all = Vec::new();
+            // Deliberately interleave parents and ties; the independent oracle
+            // materializes every candidate and sorts once after full exposure.
+            for ordinal in 1_u32..1000 {
+                let distance = f64::from((ordinal * 37) % 53);
+                let partition = pk(u64::from(ordinal));
+                state.merge_child(0, 1, partition, distance, width).unwrap();
+                all.push((distance, partition));
+                assert!(state.next_frontier[&(0, 1)].len() <= width as usize);
+                assert!(state.next_frontier[&(0, 1)].capacity() <= width as usize);
+            }
+            all.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.1.cmp(&b.1)));
+            all.truncate(width as usize);
+            let actual: Vec<_> = state
+                .next_frontier
+                .remove(&(0, 1))
+                .unwrap()
+                .into_sorted_vec()
+                .into_iter()
+                .map(|entry| (entry.distance, entry.partition))
+                .collect();
+            assert_eq!(actual, all);
+        }
+    }
+
+    struct ExactOnly;
+
+    impl RoutingExecution for ExactOnly {
+        fn checkpoint(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn read<T: ReadOps>(
+            &self,
+            _: &mut ReadLogicalTxn<'_, T>,
+            _: &IndexManifest,
+            _: super::BodyRequest<'_>,
+            _: usize,
+        ) -> Result<super::super::cache::graph::RoutingGraph> {
+            unreachable!("mutable fixture")
+        }
+        async fn candidates(
+            &self,
+            _: super::super::cache::graph::RoutingGraph,
+            _: Vec<f32>,
+            _: usize,
+            _: RoutingMode,
+        ) -> Result<Vec<(PartitionKey, f64)>> {
+            unreachable!("mutable fixture")
+        }
+    }
+
+    async fn traverse<T: ReadOps>(
+        txn: &mut ReadLogicalTxn<'_, T>,
+        cache: &PartitionCache,
+        kernel: &VectorKernel,
+        request: TraversalRequest<'_>,
+    ) -> Result<TraversalOutcome> {
+        super::traverse(txn, cache, kernel, request, &ExactOnly).await
+    }
+
     use bytes::Bytes;
 
     use crate::api::{
@@ -839,7 +1124,10 @@ mod tests {
     use super::super::plan::EnumeratedTree;
     use super::super::predicate::CompiledPredicate;
     use super::super::rabitq::RaBitQ7;
-    use super::{DEFAULT_LEAF_BEAM, TraversalOutcome, TraversalRequest, beam_width, traverse};
+    use super::{
+        DEFAULT_LEAF_BEAM, PartitionKey, ReadOps, RoutingExecution, RoutingMode, TraversalOutcome,
+        TraversalRequest, beam_width,
+    };
 
     const DIMENSION: usize = 2;
     const SEED: [u8; 32] = [9; 32];

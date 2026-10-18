@@ -1,13 +1,34 @@
-//! Explicit snapshot reads for fixed-index graphs. Exact routing never calls this path.
+//! Snapshot-bound fixed-index bodies shared by exact and graph routing.
 
 use super::*;
 use crate::api::Metric;
 use crate::search::local_hnsw::{
-    Candidate, Parameters, Workspace, owned::OwnedGraph, persistence::GraphSource,
+    Candidate, Parameters, Workspace, body::FixedInternalBody, native_error,
+    persistence::GraphSource,
 };
 use crate::search::numeric::VectorKernel;
 use crate::storage::keys::LogicalKey;
 use crate::storage::values::{GRAPH_CHUNK_BYTES, GraphChunk, GraphDescriptor, PartitionState};
+
+/// Runtime execution boundary: one snapshot, bounded owned CPU work and control.
+/// Traversal owns candidate selection; the runtime owns admission and dispatch.
+pub(crate) trait RoutingExecution {
+    fn checkpoint(&self) -> Result<()>;
+    async fn read<T: ReadOps>(
+        &self,
+        txn: &mut ReadLogicalTxn<'_, T>,
+        manifest: &IndexManifest,
+        request: BodyRequest<'_>,
+        retained_bytes: usize,
+    ) -> Result<RoutingGraph>;
+    async fn candidates(
+        &self,
+        graph: RoutingGraph,
+        query: Vec<f32>,
+        beam: usize,
+        mode: crate::api::RoutingMode,
+    ) -> Result<Vec<(PartitionKey, f64)>>;
+}
 
 /// An admitted complete snapshot read, ready for CPU restoration outside the executor.
 pub(crate) enum GraphRead {
@@ -23,7 +44,8 @@ pub(crate) struct GraphLoad {
     dimension: usize,
     metric: Metric,
     rotation_seed: [u8; 32],
-    body: Arc<CachedBody>,
+    children: Box<[ChildEntry]>,
+    body_bytes: u64,
     descriptor: GraphDescriptor,
     chunks: Vec<(u32, GraphChunk)>,
     working_bytes: usize,
@@ -40,6 +62,50 @@ pub(crate) struct RoutingGraph {
 }
 
 impl RoutingGraph {
+    /// Complete children, including those the local algorithm will not select.
+    pub(crate) fn children(&self) -> &[ChildEntry] {
+        self.partition().children()
+    }
+
+    fn partition(&self) -> &FixedInternalBody {
+        let BodyEntries::FixedInternal(partition) = &self.body.entries else {
+            unreachable!("validated fixed internal body")
+        };
+        partition
+    }
+
+    /// Exact routing still requires the validated graph body, but ignores adjacency.
+    pub(crate) fn exact(
+        self,
+        query: &[f32],
+        beam: usize,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Vec<(PartitionKey, f64)>> {
+        let hits = self
+            .partition()
+            .exact(query, beam, self.working_bytes, check)?;
+        self.map_candidates(hits, check)
+    }
+
+    /// Maps core ordinals without changing their scores or ordering.
+    fn map_candidates(
+        &self,
+        hits: Vec<Candidate>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Vec<(PartitionKey, f64)>> {
+        let entries = self.children();
+        let mut output = Vec::new();
+        output.try_reserve_exact(hits.len()).map_err(|_| limit())?;
+        for (ordinal, Candidate { node, distance }) in hits.into_iter().enumerate() {
+            if ordinal % 64 == 0 {
+                check()?;
+            }
+            output.push((entries[node as usize].child(), distance));
+        }
+        check()?;
+        Ok(output)
+    }
+
     /// Native query work; invoke only inside an admitted blocking task. Scratch is
     /// private to this query, while all concurrent queries share immutable topology.
     pub(crate) fn search(
@@ -50,10 +116,8 @@ impl RoutingGraph {
         check: &(dyn Fn() -> Result<()> + Sync),
     ) -> Result<(Vec<(PartitionKey, f64)>, ktann_usearch::Stats)> {
         check()?;
-        let BodyEntries::Internal(entries) = &self.body.entries else {
-            unreachable!("graph body")
-        };
-        let graph = self.body.graph.as_ref().expect("validated graph body");
+        let entries = self.children();
+        let graph = self.partition();
         let available = self
             .working_bytes
             .checked_sub(self.body.bytes as usize)
@@ -61,15 +125,7 @@ impl RoutingGraph {
         let mut scratch = Workspace::new(entries.len(), self.m, available).map_err(native_error)?;
         let (hits, stats) =
             graph.search(query, beam, ef, self.working_bytes, &mut scratch, check)?;
-        let mut children = Vec::new();
-        children
-            .try_reserve_exact(hits.len())
-            .map_err(|_| limit())?;
-        for Candidate { node, distance } in hits {
-            children.push((entries[node as usize].child(), distance));
-        }
-        check()?;
-        Ok((children, stats))
+        Ok((self.map_candidates(hits, check)?, stats))
     }
 }
 
@@ -89,18 +145,16 @@ impl GraphLoad {
             dimension,
             metric,
             rotation_seed,
-            body,
+            children,
+            body_bytes,
             descriptor,
             chunks,
             working_bytes,
             restore_bytes,
         } = *self;
-        let BodyEntries::Internal(entries) = &body.entries else {
-            unreachable!("internal source")
-        };
         let kernel = VectorKernel::new(dimension, metric, rotation_seed)?;
-        let graph = OwnedGraph::restore(
-            Arc::clone(entries),
+        let graph = FixedInternalBody::restore(
+            children,
             kernel,
             GraphSource {
                 index: key.index,
@@ -114,8 +168,7 @@ impl GraphLoad {
             restore_bytes,
             check,
         )?;
-        let bytes = body
-            .bytes
+        let bytes = body_bytes
             .checked_add(graph.additional_bytes() as u64)
             .ok_or_else(limit)?;
         if bytes > working_bytes as u64 {
@@ -124,8 +177,7 @@ impl GraphLoad {
         let body = Arc::new(CachedBody {
             epoch: header.cache_epoch(),
             bytes,
-            entries: BodyEntries::Internal(Arc::clone(entries)),
-            graph: Some(Box::new(graph)),
+            entries: BodyEntries::FixedInternal(Box::new(graph)),
         });
         check()?;
         cache.install(key, Arc::clone(&body));
@@ -139,16 +191,11 @@ impl GraphLoad {
 
 /// Reads authority and complete input from the caller's existing snapshot.
 /// Cache warmth never affects admission; missing graph data is Corruption.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "snapshot identity and explicit operation resource/control inputs"
-)]
 pub(crate) async fn read_graph<T: ReadOps>(
     txn: &mut ReadLogicalTxn<'_, T>,
     cache: &PartitionCache,
     manifest: &IndexManifest,
-    tree: &TreeKey,
-    parent: PartitionKey,
+    request: BodyRequest<'_>,
     working_bytes: usize,
     retained_bytes: usize,
     check: &(dyn Fn() -> Result<()> + Sync),
@@ -160,16 +207,12 @@ pub(crate) async fn read_graph<T: ReadOps>(
         .ok_or_else(Error::invalid_argument)?
         .parameters();
     let index = manifest.logical_index_id();
-    let Some(PersistentValue::PartitionHeader(header)) = txn
-        .get(LogicalKey::Header {
-            index,
-            tree_key: tree.clone(),
-            partition: parent,
-        })
-        .await?
-    else {
-        return Err(corrupt());
-    };
+    let BodyRequest {
+        tree_key: tree,
+        partition: parent,
+        header,
+    } = request;
+    let header = *header;
     if header.level() <= 1
         || header.state() != PartitionState::Ready
         || header.entry_count() == 0
@@ -239,33 +282,37 @@ pub(crate) async fn read_graph<T: ReadOps>(
     };
     let read = BodyRead::start(cache, manifest, &request)?;
     if let BodyRead::Cached(body) = &read {
-        let BodyEntries::Internal(entries) = &body.entries else {
+        let BodyEntries::FixedInternal(graph) = &body.entries else {
             return Err(corrupt());
         };
-        if entries.len() != n {
+        if graph.children().len() != n {
             return Err(corrupt());
         }
-        if let Some(graph) = &body.graph {
-            if !graph.matches(
-                GraphSource {
-                    index,
-                    tree,
-                    parent,
-                    header,
-                    parameters,
-                },
-                &descriptor,
-            ) {
-                return Err(corrupt());
-            }
-            return Ok(GraphRead::Cached(RoutingGraph {
-                body: Arc::clone(body),
-                m: parameters.m,
-                working_bytes,
-            }));
+        if !graph.matches(
+            GraphSource {
+                index,
+                tree,
+                parent,
+                header,
+                parameters,
+            },
+            &descriptor,
+        ) {
+            return Err(corrupt());
         }
+        return Ok(GraphRead::Cached(RoutingGraph {
+            body: Arc::clone(body),
+            m: parameters.m,
+            working_bytes,
+        }));
     }
-    let body = read.read(txn, manifest, check).await?;
+    let BodyRead::Scan(scan) = read else {
+        unreachable!("cached fixed body returned above")
+    };
+    let (entries, body_bytes) = scan.read(txn, manifest, check).await?;
+    let BodyEntries::Internal(children) = entries else {
+        unreachable!("internal source")
+    };
     let range = LogicalRange::graph_chunks(manifest, tree, parent)?;
     let mut cursor = None;
     let mut chunks = Vec::new();
@@ -313,7 +360,8 @@ pub(crate) async fn read_graph<T: ReadOps>(
         dimension: d,
         metric: manifest.config().metric(),
         rotation_seed: *manifest.rotation_seed(),
-        body,
+        children,
+        body_bytes,
         descriptor,
         chunks,
         working_bytes,
@@ -327,10 +375,6 @@ fn corrupt() -> Error {
 
 fn limit() -> Error {
     Error::new(ErrorKind::LimitExceeded)
-}
-
-fn native_error(error: ktann_usearch::Error) -> Error {
-    crate::search::local_hnsw::native_error(error)
 }
 
 #[cfg(test)]

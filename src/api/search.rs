@@ -70,17 +70,62 @@ impl SearchBudgets {
     }
 }
 
+/// Candidate generation inside each internal partition.
+///
+/// Exact is the default. HNSW requires a fixed index and a positive `ef_search`.
+/// The effective exploration width is clipped to the parent size and is at least
+/// the requested local beam; it does not change the exact-rerank budget.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RoutingMode {
+    /// Score every child centroid.
+    #[default]
+    Exact,
+    /// Search the persisted partition-local graph using its routing scores.
+    PartitionLocalHnsw {
+        /// Positive exploration width, raised to the local beam and clipped to parent size.
+        ef_search: usize,
+    },
+}
+
 /// Optional per-request overrides of Runtime Search Budgets and traversal
-/// width.
+/// width and internal routing.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct SearchOptions {
     scanned_tree_keys: Option<u32>,
     visited_partitions: Option<u32>,
     leaf_beam_size: Option<u32>,
+    routing_mode: RoutingMode,
 }
 
 impl SearchOptions {
+    /// Selects internal routing. HNSW is valid only on a fixed index.
+    ///
+    /// ```
+    /// use ktann::api::{RoutingMode, SearchOptions};
+    /// let options = SearchOptions::default().with_routing_mode(
+    ///     RoutingMode::PartitionLocalHnsw { ef_search: 64 },
+    /// )?;
+    /// # Ok::<(), ktann::api::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    /// Returns `InvalidArgument` for zero `ef_search`.
+    pub fn with_routing_mode(mut self, mode: RoutingMode) -> Result<Self> {
+        if matches!(mode, RoutingMode::PartitionLocalHnsw { ef_search: 0 }) {
+            return Err(Error::invalid_argument());
+        }
+        self.routing_mode = mode;
+        Ok(self)
+    }
+
+    /// Returns the internal candidate-generation mode (Exact by default).
+    #[must_use]
+    pub const fn routing_mode(self) -> RoutingMode {
+        self.routing_mode
+    }
+
     /// Overrides the positive scanned Tree Key budget.
     pub fn with_scanned_tree_keys(mut self, value: u32) -> Result<Self> {
         validate_override(value, MAX_SCANNED_TREE_KEYS)?;
@@ -207,7 +252,7 @@ impl SearchRequest {
         self
     }
 
-    /// Sets request Search Budget overrides.
+    /// Sets request Search Budgets, beam width, and internal routing.
     #[must_use]
     pub const fn with_options(mut self, options: SearchOptions) -> Self {
         self.options = options;

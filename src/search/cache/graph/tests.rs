@@ -2,9 +2,10 @@ use std::collections::BTreeMap;
 
 use super::*;
 use crate::api::{FixedGraphConfig, IndexConfig, LogicalIndexId};
-use crate::search::local_hnsw::{Centroids, LocalHnsw};
+use crate::search::local_hnsw::{Centroids, persistence::build_records, tests::TestGraph};
 use crate::storage::keys;
 use crate::storage::test_support::{MockReadTxn, pk};
+use crate::storage::values::expect_header;
 use crate::storage::values::{IndexLifecycle, ValueCodec};
 
 const W: usize = 16 * 1024 * 1024;
@@ -32,16 +33,24 @@ pub(crate) async fn exercise_runtime<B: crate::storage::backend::Backend>(
     let mut expected = None;
     for _ in 0..2 {
         let graph = context
-            .read_routing_graph(
+            .read(
                 &mut fixture.txn(),
                 &fixture.manifest,
-                &fixture.tree,
-                pk(1),
+                BodyRequest {
+                    tree_key: &fixture.tree,
+                    partition: pk(1),
+                    header: &fixture.header,
+                },
                 1024,
             )
             .await?;
-        let (hits, _) = context
-            .search_routing_graph(graph, vec![0.3, 0.1, 0.2], 7, 12)
+        let hits = context
+            .candidates(
+                graph,
+                vec![0.3, 0.1, 0.2],
+                7,
+                crate::api::RoutingMode::PartitionLocalHnsw { ef_search: 12 },
+            )
             .await?;
         if let Some(expected) = &expected {
             assert_eq!(&hits, expected);
@@ -94,18 +103,19 @@ impl Fixture {
             })
             .collect();
         let kernel = VectorKernel::new(3, metric, [7; 32]).unwrap();
-        let core = LocalHnsw::build(
+        let records = build_records(
             Centroids::new(&kernel, &children, count as usize, &|| Ok(())).unwrap(),
-            manifest.config().fixed_graph().unwrap().parameters(),
-            &tree,
-            pk(1),
+            GraphSource {
+                index: manifest.logical_index_id(),
+                tree: &tree,
+                parent: pk(1),
+                header,
+                parameters: manifest.config().fixed_graph().unwrap().parameters(),
+            },
             W,
             &|| Ok(()),
         )
         .unwrap();
-        let records = core
-            .persist(manifest.logical_index_id(), header, W, &|| Ok(()))
-            .unwrap();
         let mut fixture = Self {
             manifest,
             tree,
@@ -159,12 +169,25 @@ impl Fixture {
         limit: usize,
         retained: usize,
     ) -> Result<GraphRead> {
+        let mut txn = self.txn();
+        let header = expect_header(
+            txn.get(LogicalKey::Header {
+                index: self.index(),
+                tree_key: self.tree.clone(),
+                partition: pk(1),
+            })
+            .await?,
+        )?
+        .ok_or_else(corrupt)?;
         read_graph(
-            &mut self.txn(),
+            &mut txn,
             cache,
             &self.manifest,
-            &self.tree,
-            pk(1),
+            BodyRequest {
+                tree_key: &self.tree,
+                partition: pk(1),
+                header: &header,
+            },
             limit,
             retained,
             &|| Ok(()),
@@ -231,8 +254,11 @@ async fn pagination_and_snapshot_expiry_never_publish_partial_graphs() {
             &mut txn,
             &cache,
             &fixture.manifest,
-            &fixture.tree,
-            pk(1),
+            BodyRequest {
+                tree_key: &fixture.tree,
+                partition: pk(1),
+                header: &fixture.header,
+            },
             W,
             0,
             &|| Ok(()),
@@ -332,27 +358,11 @@ async fn concurrent_cold_fills_and_shared_warm_queries_survive_eviction() {
 }
 
 #[tokio::test]
-async fn restored_queries_and_exact_body_upgrade_share_centroids_for_all_metrics() {
+async fn restored_queries_match_native_search_for_all_metrics() {
     for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
         let fixture = Fixture::new(metric, 1, 1);
         let cache = PartitionCache::new(W as u64);
-        let exact = load_body(
-            &mut fixture.txn(),
-            &cache,
-            &fixture.manifest,
-            &fixture.tree,
-            pk(1),
-            &fixture.header,
-        )
-        .await
-        .unwrap();
         let loaded = fixture.load(&cache).await;
-        let (BodyEntries::Internal(a), BodyEntries::Internal(b)) =
-            (exact.entries(), loaded.body.entries())
-        else {
-            panic!()
-        };
-        assert!(Arc::ptr_eq(a, b), "upgrading does not copy centroids");
         let kernel = VectorKernel::new(3, metric, [7; 32]).unwrap();
         let parameters = fixture
             .manifest
@@ -360,7 +370,7 @@ async fn restored_queries_and_exact_body_upgrade_share_centroids_for_all_metrics
             .fixed_graph()
             .unwrap()
             .parameters();
-        let core = LocalHnsw::build(
+        let core = TestGraph::build(
             Centroids::new(&kernel, &fixture.children, 32, &|| Ok(())).unwrap(),
             parameters,
             &fixture.tree,
@@ -388,8 +398,11 @@ async fn restored_queries_and_exact_body_upgrade_share_centroids_for_all_metrics
             &mut txn,
             &cache,
             &fixture.manifest,
-            &fixture.tree,
-            pk(1),
+            BodyRequest {
+                tree_key: &fixture.tree,
+                partition: pk(1),
+                header: &fixture.header,
+            },
             W,
             0,
             &|| Ok(()),
@@ -399,28 +412,13 @@ async fn restored_queries_and_exact_body_upgrade_share_centroids_for_all_metrics
         assert!(matches!(warm, GraphRead::Cached(_)));
         let raw = txn.into_raw();
         assert_eq!(
-            raw.gets, 2,
-            "warm reads still validate Header and descriptor"
+            raw.gets, 1,
+            "warm graph reads validate the descriptor using the caller's snapshot Header"
         );
         assert_eq!(raw.scans, 0);
         let warm = warm.restore(&cache, &|| Ok(())).unwrap();
         let bytes = warm.body.bytes;
-        assert!(bytes > exact.bytes);
         assert_eq!(cache.total_bytes(), bytes);
-        cache.install(
-            CacheKey::new(
-                fixture.index(),
-                fixture.tree.clone(),
-                pk(1),
-                PartitionKind::Internal,
-            ),
-            exact,
-        );
-        assert_eq!(
-            cache.total_bytes(),
-            bytes,
-            "a racing exact fill cannot downgrade the graph"
-        );
         assert_eq!(warm.search(&query, 7, 12, &|| Ok(())).unwrap().0, actual);
     }
 }
@@ -576,7 +574,7 @@ async fn corrupt_or_cancelled_inputs_never_publish_partial_bodies() {
 }
 
 #[tokio::test]
-async fn warm_validation_rejects_changed_binding_and_exact_reads_ignore_graph_bytes() {
+async fn warm_validation_rejects_changed_binding() {
     let mut fixture = Fixture::new(Metric::L2, 1, 1);
     let cache = PartitionCache::new(W as u64);
     fixture.load(&cache).await;
@@ -601,22 +599,4 @@ async fn warm_validation_rejects_changed_binding_and_exact_reads_ignore_graph_by
         fixture.read(&cache, W, 0).await.err().unwrap().kind(),
         ErrorKind::Corruption
     );
-    for cache in [&cache, &PartitionCache::new(0)] {
-        let mut txn = fixture.txn();
-        load_body(
-            &mut txn,
-            cache,
-            &fixture.manifest,
-            &fixture.tree,
-            pk(1),
-            &fixture.header,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            txn.into_raw().gets,
-            0,
-            "exact routing never requests graph authority"
-        );
-    }
 }

@@ -24,13 +24,6 @@ use crate::storage::backend::{Backend, CommitCancellation, CommitStart};
 use self::fixup::FixupQueue;
 
 mod compute;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "explicit graph reads precede production traversal integration"
-    )
-)]
 mod routing_graph;
 
 pub(crate) mod bulk_load;

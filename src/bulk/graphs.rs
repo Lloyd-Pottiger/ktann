@@ -1,7 +1,10 @@
 //! One-at-a-time graph preparation from the exact canonical serving projections.
 
 use crate::api::{Error, ErrorKind, PartitionKey, Result};
-use crate::search::local_hnsw::{Centroids, LocalHnsw};
+use crate::search::local_hnsw::{
+    Centroids,
+    persistence::{GraphSource, build_records},
+};
 use crate::search::numeric::VectorKernel;
 use crate::storage::keys::{LogicalKey, TreeKey};
 use crate::storage::values::{ChildEntry, IndexManifest, PartitionHeader, PersistentValue};
@@ -107,15 +110,18 @@ impl<'a> GraphPreparation<'a> {
             self.index.config().max_internal_partition_entries() as usize,
             check,
         )?;
-        let graph = LocalHnsw::build(
+        let records = build_records(
             centroids,
-            parameters,
-            &tree_key,
-            partition,
+            GraphSource {
+                index: self.index.logical_index_id(),
+                tree: &tree_key,
+                parent: partition,
+                header,
+                parameters,
+            },
             self.budget,
             check,
         )?;
-        let records = graph.persist(self.index.logical_index_id(), header, self.budget, check)?;
         let index = self.index.logical_index_id();
         emit(
             LogicalKey::GraphDescriptor {
@@ -335,8 +341,9 @@ mod tests {
                     }
                     internal_levels.insert(header.level());
                     let centroids = Centroids::new(&kernel, &body.children, 4, &|| Ok(())).unwrap();
-                    let graph = LocalHnsw::restore(
-                        centroids,
+                    let graph = crate::search::local_hnsw::body::FixedInternalBody::restore(
+                        body.children.clone().into_boxed_slice(),
+                        VectorKernel::new(2, metric, [3; 32]).unwrap(),
                         GraphSource {
                             index: index.logical_index_id(),
                             tree: &tree,
@@ -344,8 +351,8 @@ mod tests {
                             header,
                             parameters: index.config().fixed_graph().unwrap().parameters(),
                         },
-                        &body.descriptor.unwrap(),
-                        body.chunks.into_iter().map(Ok),
+                        body.descriptor.unwrap(),
+                        body.chunks,
                         budget,
                         &|| Ok(()),
                     )

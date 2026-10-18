@@ -1,10 +1,10 @@
 //! One internal partition's immutable, canonical local routing graph.
 //!
 //! This module performs no IO, normalization, or production traversal. It
-//! borrows the authoritative Child Entries and uses the existing numeric
-//! kernel inside USearch, retaining its returned distances unchanged.
+//! builds encoded records from borrowed Child Entries and restores complete
+//! fixed internal bodies. The existing numeric kernel supplies native distances.
 
-pub(crate) mod owned;
+pub(crate) mod body;
 pub(crate) mod persistence;
 
 use std::cell::Cell;
@@ -89,6 +89,7 @@ impl<'a> Centroids<'a> {
     }
 
     /// Maps a result ordinal to the authoritative child Partition Key.
+    #[cfg(test)]
     pub(crate) fn child(self, candidate: Candidate) -> PartitionKey {
         self.children[candidate.node as usize].child()
     }
@@ -151,92 +152,50 @@ impl<'a> Centroids<'a> {
     }
 }
 
-/// An immutable USearch graph bound to one validated set of child projections.
-#[derive(Debug)]
-pub(crate) struct LocalHnsw<'a> {
-    centroids: Centroids<'a>,
-    graph: ktann_usearch::Graph,
-    identity: [u8; 32],
-}
-
-impl<'a> LocalHnsw<'a> {
-    /// Builds in canonical child order, binding the seed to tree and parent.
-    ///
-    /// Admission includes borrowed centroids, graph storage at the maximum
-    /// permitted level, and construction scratch before native work begins.
-    pub(crate) fn build(
-        centroids: Centroids<'a>,
-        parameters: Parameters,
-        tree: &TreeKey,
-        parent: PartitionKey,
-        working_bytes: usize,
-        check: &dyn Fn() -> Result<()>,
-    ) -> Result<Self> {
-        if parameters.ef_construction < parameters.m {
-            return Err(Error::invalid_argument());
-        }
-        let bound = ktann_usearch::build_bound(centroids.children.len(), parameters.m)
-            .map_err(native_error)?;
-        if centroids
-            .bytes
-            .checked_add(bound)
-            .is_none_or(|bytes| bytes > working_bytes)
-        {
-            return Err(limit());
-        }
-        let seed = partition_seed(parameters.seed, tree, parent);
-        let distance = |a: u32, b: u32| {
-            centroids.distance(
-                centroids.children[a as usize].centroid(),
-                centroids.children[b as usize].centroid(),
-            )
-        };
-        let graph = controlled(check, |proceed| {
-            ktann_usearch::Graph::build(
-                centroids.children.len(),
-                parameters.m,
-                parameters.ef_construction,
-                seed,
-                working_bytes - centroids.bytes,
-                &distance,
-                proceed,
-            )
-        })?;
-        let identity = persistence::identity(centroids, parameters, tree, parent, check)?;
-        Ok(Self {
-            centroids,
-            graph,
-            identity,
-        })
+/// Builds topology over borrowed projections; no Rust reference survives native work.
+fn build_graph(
+    centroids: Centroids<'_>,
+    parameters: Parameters,
+    tree: &TreeKey,
+    parent: PartitionKey,
+    working_bytes: usize,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<(ktann_usearch::Graph, [u8; 32])> {
+    if parameters.ef_construction < parameters.m {
+        return Err(Error::invalid_argument());
     }
-
-    /// Returns the full clipped local beam, sorted by distance then child key.
-    ///
-    /// `ef` is clipped before allocation. When beam covers all nodes, the bridge
-    /// scans and sorts once. No per-parent beam division or adaptive retry.
-    pub(crate) fn search(
-        &self,
-        query: &[f32],
-        beam: usize,
-        ef: usize,
-        working_bytes: usize,
-        scratch: &mut Workspace,
-        check: &dyn Fn() -> Result<()>,
-    ) -> Result<(Vec<Candidate>, ktann_usearch::Stats)> {
-        search_graph(
-            self.centroids,
-            &self.graph,
-            query,
-            beam,
-            ef,
-            working_bytes,
-            scratch,
-            check,
+    let bound =
+        ktann_usearch::build_bound(centroids.children.len(), parameters.m).map_err(native_error)?;
+    if centroids
+        .bytes
+        .checked_add(bound)
+        .is_none_or(|bytes| bytes > working_bytes)
+    {
+        return Err(limit());
+    }
+    let seed = partition_seed(parameters.seed, tree, parent);
+    let distance = |a: u32, b: u32| {
+        centroids.distance(
+            centroids.children[a as usize].centroid(),
+            centroids.children[b as usize].centroid(),
         )
-    }
+    };
+    let graph = controlled(check, |proceed| {
+        ktann_usearch::Graph::build(
+            centroids.children.len(),
+            parameters.m,
+            parameters.ef_construction,
+            seed,
+            working_bytes - centroids.bytes,
+            &distance,
+            proceed,
+        )
+    })?;
+    let identity = persistence::identity(centroids, parameters, tree, parent, check)?;
+    Ok((graph, identity))
 }
 
-/// Shares the same native query path between borrowed construction cores and owned cache bodies.
+/// Executes graph routing against a validated borrowed view of a complete body.
 #[expect(
     clippy::too_many_arguments,
     reason = "the existing search inputs plus the borrowed graph and centroids"
@@ -372,4 +331,4 @@ impl PartialEq for Ranked {
 impl Eq for Ranked {}
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

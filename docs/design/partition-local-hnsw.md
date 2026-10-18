@@ -3,8 +3,8 @@
 Status: fixed Bulk Build preparation and publication are implemented, including
 optional artifact refinement, final-centroid graph construction, immutable loading,
 and fixed-index write/maintenance restrictions. Snapshot-bound graph reads and
-shared cache ownership are implemented; production HNSW traversal is the next
-integration step. This document owns the
+shared cache ownership and production HNSW traversal are implemented, with
+explicit public routing selection and bounded per-tree/level candidate merging. This document owns the
 fixed-index contract of [issue #195](https://github.com/Lloyd-Pottiger/ktann/issues/195).
 [Search](search.md), [Storage](storage.md), and [Bulk Build](bulk-build.md) retain
 ownership of their shared contracts.
@@ -43,11 +43,11 @@ Current implementation boundaries:
 | --- | --- |
 | [`IndexConfig`](../../src/api/config.rs) | Independent leaf/internal min/max pairs are implemented; each maximum is capped at 65,536. FixedGraphConfig selects fixed mode and persists graph construction parameters. |
 | [`construct_tree`, `ConstructionOptions`](../../src/construction.rs) | Bottom-up construction selects capacities by level, including root-fit. Memory admission reserves sample, centroid and row buffers; caller-retained output is excluded. |
-| [`local_hnsw`](../../src/search/local_hnsw.rs), [`ktann-usearch`](../../ktann-usearch/README.md) | Standalone graph construction, search, exact local top-k, structural inspection, and reusable bounded scratch are implemented. Bulk Build constructs and persists graphs; production queries still use exact traversal. |
+| [`local_hnsw`](../../src/search/local_hnsw.rs), [`ktann-usearch`](../../ktann-usearch/README.md) | Standalone graph construction, search, exact local top-k, structural inspection, and reusable bounded scratch are implemented. Bulk Build constructs and persists graphs; production queries explicitly select exact or graph routing. |
 | [`ForestArtifact`](../../src/bulk/forest.rs), [`ServingArtifact`](../../src/bulk/serving.rs) | Forest plans bind source/configuration/rotation/sample size. Serving preparation proves exact joins and emits canonical values; optional artifact refinement completes before final forest acceptance; serving encoding builds graphs from final Child Entries. |
 | [`refine::run`, `plan`](../../src/runtime/refine.rs) | Existing Offline Refinement reads an Active index, plans in memory, commits member moves in batches, then replaces non-root centroids. Even zero rounds recomputes centroids. Failure can leave a valid partially refined index. |
 | [`update_centroid`](../../src/storage/topology.rs) | Atomically replaces the partition centroid and incoming Child Entry, advancing the parent's body cache epoch. It does not update a graph. |
-| [`Traversal::visit_internal`, `select_next_frontier`](../../src/search/traverse.rs) | Current exact traversal scores all exposed children, then selects each tree's next-depth beam globally. Local graph candidates must feed that same selection boundary. |
+| [`Traversal::visit_internal`, `select_next_frontier`](../../src/search/traverse.rs) | Exact and graph candidates feed the same bounded per-tree/level top-B selection. Every exposed Child Entry retains its duplicate-reference check. |
 | [`BodyRead::finish`, `PartitionCache`](../../src/search/cache.rs) | Cold search loads the complete decoded body before cache insertion. Cache capacity bounds retained entries, not the complete temporary body or evicted bodies still held by queries. |
 | [`bulk_load`](../../src/runtime/bulk_load.rs), [`bulk_publish`](../../src/runtime/bulk_publish.rs) | One accepted Serving Artifact, epoch-fenced chunk loading, immutable completed load, paged exact byte validation, then atomic activation. No graph-ready lifecycle state is needed. |
 
@@ -103,8 +103,8 @@ backend writes remain outside the library API's integrity guarantee.
 
 ## 4. Configuration ownership
 
-The table defines canonical ownership. Index/build fields are implemented;
-query-routing and graph-cache controls belong to the subsequent serving integration.
+The table defines canonical ownership for persisted construction, runtime
+resources, and per-query routing.
 Keep one canonical owner for each value and include semantic values in artifact
 bindings; copied bindings are validation evidence, not independently editable
 configuration.
@@ -200,8 +200,11 @@ The algorithm contract is:
 
 `Centroids` validates dimensions and finite values through the numeric kernel,
 without computing a distance, and checks capacity and canonical keys once at
-the borrowed-view boundary. Its `LocalHnsw` binding cannot outlive
-those vectors. `Graph` itself owns only topology and exposes entry, level and
+the borrowed-view boundary. Bulk construction consumes that view synchronously
+and returns only encoded graph records; callers do not retain a borrowed graph
+or sequence separate build and persistence operations. Restoration returns a
+complete fixed internal body that owns its projections, numeric kernel and
+validated graph. `Graph` itself owns only topology and exposes entry, level and
 bounded adjacency inspection; no Rust references or callbacks survive an FFI
 call. Immutable graphs support concurrent queries with separate workspaces.
 
@@ -567,7 +570,7 @@ layout/centroids when comparing internal grouping; no rerank-budget sweeps.
 
 The graph format and snapshot reader implement the source and resource contracts
 above. [Search](search.md#fixed-index-graph-bodies) owns graph-cache admission,
-shared centroid ownership, and the explicit loading/query interfaces. Candidate
+complete fixed-body ownership, and the explicit loading/query interfaces. Candidate
 generation must supply the existing query snapshot, reserve query-wide retained
 state, consume one parent at a time, and merge the returned child identities and
 unmodified routing distances under the existing global beam and budgets. This

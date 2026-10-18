@@ -8,6 +8,49 @@ use crate::storage::values::{
 };
 use bytes::Bytes;
 
+impl<'a> TestGraph<'a> {
+    fn persist(
+        &self,
+        index: LogicalIndexId,
+        header: PartitionHeader,
+        working_bytes: usize,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<GraphRecords> {
+        super::super::persistence::persist_graph(
+            self.centroids,
+            &self.graph,
+            self.identity,
+            index,
+            header,
+            working_bytes,
+            check,
+        )
+    }
+
+    fn restore(
+        centroids: Centroids<'a>,
+        source: GraphSource<'_>,
+        descriptor: &crate::storage::values::GraphDescriptor,
+        chunks: impl IntoIterator<Item = (u32, GraphChunk)>,
+        working_bytes: usize,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Self> {
+        let (graph, identity) = super::super::persistence::restore_graph(
+            centroids,
+            source,
+            descriptor,
+            chunks,
+            working_bytes,
+            check,
+        )?;
+        Ok(Self {
+            centroids,
+            graph,
+            identity,
+        })
+    }
+}
+
 fn index() -> LogicalIndexId {
     LogicalIndexId::new(7).unwrap()
 }
@@ -34,7 +77,7 @@ fn source(tree: &TreeKey, n: usize) -> GraphSource<'_> {
     }
 }
 
-fn records(graph: &LocalHnsw<'_>) -> GraphRecords {
+fn records(graph: &TestGraph<'_>) -> GraphRecords {
     graph
         .persist(
             index(),
@@ -53,11 +96,11 @@ fn snapshot_roundtrip_preserves_topology_scores_and_queries() {
             let rows = children(fixture(n, 4, 33));
             let graph = build(&kernel, &rows, parameters());
             let encoded = records(&graph);
-            let restored = LocalHnsw::restore(
+            let restored = TestGraph::restore(
                 graph.centroids,
                 source(&tree(), n),
                 &encoded.descriptor,
-                encoded.chunks().map(Ok),
+                encoded.chunks(),
                 MEMORY,
                 &|| Ok(()),
             )
@@ -144,11 +187,11 @@ fn source_binding_covers_identity_header_configuration_and_centroids() {
     }
     for source in cases {
         assert_eq!(
-            LocalHnsw::restore(
+            TestGraph::restore(
                 graph.centroids,
                 source,
                 &encoded.descriptor,
-                encoded.chunks().map(Ok),
+                encoded.chunks(),
                 MEMORY,
                 &|| Ok(())
             )
@@ -165,11 +208,11 @@ fn source_binding_covers_identity_header_configuration_and_centroids() {
         changed[0] = replacement;
         let view = Centroids::new(&kernel, &changed, 32, &|| Ok(())).unwrap();
         assert_eq!(
-            LocalHnsw::restore(
+            TestGraph::restore(
                 view,
                 expected,
                 &encoded.descriptor,
-                encoded.chunks().map(Ok),
+                encoded.chunks(),
                 MEMORY,
                 &|| Ok(())
             )
@@ -181,11 +224,11 @@ fn source_binding_covers_identity_header_configuration_and_centroids() {
     let other = VectorKernel::new(3, Metric::InnerProduct, [0; 32]).unwrap();
     let view = Centroids::new(&other, &rows, 32, &|| Ok(())).unwrap();
     assert_eq!(
-        LocalHnsw::restore(
+        TestGraph::restore(
             view,
             expected,
             &encoded.descriptor,
-            encoded.chunks().map(Ok),
+            encoded.chunks(),
             MEMORY,
             &|| Ok(())
         )
@@ -239,11 +282,11 @@ fn numbered_chunks_are_bounded_complete_and_integrity_checked() {
     bad.push(corrupt);
     for chunks in bad {
         assert_eq!(
-            LocalHnsw::restore(
+            TestGraph::restore(
                 graph.centroids,
                 source(&tree(), rows.len()),
                 &encoded.descriptor,
-                chunks.into_iter().map(Ok),
+                chunks,
                 MEMORY,
                 &|| Ok(())
             )
@@ -252,11 +295,11 @@ fn numbered_chunks_are_bounded_complete_and_integrity_checked() {
             ErrorKind::Corruption
         );
     }
-    let restored = LocalHnsw::restore(
+    let restored = TestGraph::restore(
         graph.centroids,
         source(&tree(), rows.len()),
         &encoded.descriptor,
-        chunks.into_iter().map(Ok),
+        chunks,
         MEMORY,
         &|| Ok(()),
     )
@@ -270,11 +313,11 @@ fn numbered_chunks_are_bounded_complete_and_integrity_checked() {
         ErrorKind::LimitExceeded
     );
     assert_eq!(
-        LocalHnsw::restore(
+        TestGraph::restore(
             graph.centroids,
             source(&tree(), rows.len()),
             &encoded.descriptor,
-            encoded.chunks().map(Ok),
+            encoded.chunks(),
             0,
             &|| Ok(())
         )
@@ -283,11 +326,11 @@ fn numbered_chunks_are_bounded_complete_and_integrity_checked() {
         ErrorKind::LimitExceeded
     );
     assert_eq!(
-        LocalHnsw::restore(
+        TestGraph::restore(
             graph.centroids,
             source(&tree(), rows.len()),
             &encoded.descriptor,
-            encoded.chunks().map(Ok),
+            encoded.chunks(),
             MEMORY,
             &|| Err(Error::new(ErrorKind::Cancelled))
         )
@@ -413,14 +456,14 @@ async fn typed_snapshot_scan_restores_a_usable_body() {
         }
     }
     let view = Centroids::new(&kernel, &children, 4096, &|| Ok(())).unwrap();
-    let restored = LocalHnsw::restore(
+    let restored = TestGraph::restore(
         view,
         GraphSource {
             header,
             ..source(&tree(), rows.len())
         },
         &descriptor,
-        chunks.into_iter().map(Ok),
+        chunks,
         MEMORY,
         &|| Ok(()),
     )
