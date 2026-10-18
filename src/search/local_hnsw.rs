@@ -4,6 +4,8 @@
 //! builds encoded records from borrowed Child Entries and restores complete
 //! fixed internal bodies. The existing numeric kernel supplies native distances.
 
+#[cfg(feature = "benchmark")]
+pub(crate) mod benchmark;
 pub(crate) mod body;
 pub(crate) mod persistence;
 
@@ -153,7 +155,7 @@ impl<'a> Centroids<'a> {
 }
 
 /// Builds topology over borrowed projections; no Rust reference survives native work.
-fn build_graph(
+pub(crate) fn build_graph(
     centroids: Centroids<'_>,
     parameters: Parameters,
     tree: &TreeKey,
@@ -200,7 +202,7 @@ fn build_graph(
     clippy::too_many_arguments,
     reason = "the existing search inputs plus the borrowed graph and centroids"
 )]
-fn search_graph(
+pub(crate) fn search_graph(
     centroids: Centroids<'_>,
     graph: &ktann_usearch::Graph,
     query: &[f32],

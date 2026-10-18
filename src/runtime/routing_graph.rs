@@ -57,13 +57,28 @@ impl<B: Backend> crate::search::cache::graph::RoutingExecution for OperationCont
         controlled_compute(
             self.options.clone(),
             self.cpu_admission.clone().expect("search CPU admission"),
-            move |options| match mode {
-                crate::api::RoutingMode::PartitionLocalHnsw { ef_search } => Ok(graph
-                    .search(&query, beam, ef_search, &|| check_control(options))?
-                    .0),
-                crate::api::RoutingMode::Exact => {
-                    graph.exact(&query, beam, &|| check_control(options))
-                }
+            move |options| {
+                let started = std::time::Instant::now();
+                let result = match mode {
+                    crate::api::RoutingMode::PartitionLocalHnsw { ef_search } => {
+                        let (hits, stats) =
+                            graph.search(&query, beam, ef_search, &|| check_control(options))?;
+                        ::metrics::counter!("ktann.routing.distances")
+                            .increment(stats.distances as u64);
+                        ::metrics::counter!("ktann.routing.graph_visits")
+                            .increment(stats.visits as u64);
+                        hits
+                    }
+                    crate::api::RoutingMode::Exact => {
+                        let count = graph.children().len();
+                        let hits = graph.exact(&query, beam, &|| check_control(options))?;
+                        ::metrics::counter!("ktann.routing.distances").increment(count as u64);
+                        hits
+                    }
+                };
+                ::metrics::histogram!("ktann.routing.compute_seconds")
+                    .record(started.elapsed().as_secs_f64());
+                Ok(result)
             },
         )
         .await

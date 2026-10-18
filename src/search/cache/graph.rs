@@ -117,6 +117,8 @@ impl RoutingGraph {
     ) -> Result<(Vec<(PartitionKey, f64)>, ktann_usearch::Stats)> {
         check()?;
         let entries = self.children();
+        ::metrics::histogram!("ktann.routing.effective_ef")
+            .record(ef.max(beam).min(entries.len()) as f64);
         let graph = self.partition();
         let available = self
             .working_bytes
@@ -152,6 +154,8 @@ impl GraphLoad {
             working_bytes,
             restore_bytes,
         } = *self;
+        let started = std::time::Instant::now();
+        let encoded_bytes = descriptor.bytes;
         let kernel = VectorKernel::new(dimension, metric, rotation_seed)?;
         let graph = FixedInternalBody::restore(
             children,
@@ -171,6 +175,11 @@ impl GraphLoad {
         let bytes = body_bytes
             .checked_add(graph.additional_bytes() as u64)
             .ok_or_else(limit)?;
+        ::metrics::counter!("ktann.routing.graph_loads").increment(1);
+        ::metrics::counter!("ktann.routing.graph_encoded_bytes").increment(encoded_bytes);
+        ::metrics::counter!("ktann.routing.graph_decoded_bytes").increment(bytes);
+        ::metrics::histogram!("ktann.routing.restore_seconds")
+            .record(started.elapsed().as_secs_f64());
         if bytes > working_bytes as u64 {
             return Err(limit());
         }

@@ -580,3 +580,10 @@ unmodified routing distances under the existing global beam and budgets. This
 document does not claim an end-to-end performance or 100M/10B feasibility result.
 Production parameter choices and dynamic maintenance remain deferred. There is
 no stable release requiring compatibility machinery or migration of old builds.
+
+
+The step-9 experiment entrypoints and metric semantics are documented in
+[benchmark routing experiments](../../benchmarks/README.md#fixed-index-routing-experiments-issue-195-step-9).
+Benchmark-only global routing and diagnostic replay are feature-gated and use the
+production leaf/rerank pipeline. They do not add a production global index or
+change the fixed-index mutation contract. Matched-recall tuning remains step 10.

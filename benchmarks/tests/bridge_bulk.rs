@@ -13,11 +13,21 @@ struct Bridge {
 }
 impl Bridge {
     fn start() -> Self {
+        Self::start_with(None)
+    }
+
+    fn start_with(experiment: Option<Value>) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("bridge.sock");
         let scratch = directory.path().join("scratch");
         std::fs::create_dir(&scratch).unwrap();
-        let mut process = Command::new(env!("CARGO_BIN_EXE_ktann-vdbbench-bridge"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ktann-vdbbench-bridge"));
+        if let Some(experiment) = experiment {
+            command
+                .arg("--routing-experiment")
+                .arg(experiment.to_string());
+        }
+        let mut process = command
             .arg("--backend")
             .arg("rocksdb")
             .arg("--socket")
@@ -234,4 +244,41 @@ fn refinement_limit_failure_keeps_search_closed_after_bulk_publication() {
             .as_f64()
             .unwrap();
     assert!(refinement > 0. && optimize >= build + refinement);
+}
+
+#[test]
+fn fixed_bridge_routes_after_artifact_refinement() {
+    for mode in ["partition-local-hnsw", "global-hnsw"] {
+        let mut bridge = Bridge::start_with(Some(
+            json!({"mode":mode, "m":8, "ef_construction":40, "graph_seed":9, "ef_search":16, "build_memory_bytes":33554432}),
+        ));
+        let reset = bridge.request(json!({"op":"reset","dimension":4,"metric":"L2","refinement_rounds":1,
+            "refinement_input_bytes":33554432,"dataset":"fixed", "min_leaf_partition_entries":4,
+            "max_leaf_partition_entries":16,"min_internal_partition_entries":4,"max_internal_partition_entries":16,"leaf_beam":4}));
+        assert_eq!(reset["ok"], true, "{reset}");
+        for start in [0, 50, 100, 150] {
+            let ids: Vec<_> = (start..start + 50).collect();
+            let vectors: Vec<_> = ids.iter().map(|id| vec![*id as f32, 1., 2., 3.]).collect();
+            assert_eq!(bridge.insert(&ids, &vectors)["ok"], true);
+        }
+        let optimize = bridge.request(json!({"op":"optimize","records":200}));
+        assert_eq!(optimize["ok"], true, "{optimize}");
+        let result = bridge.request(json!({"op":"search","vector":[7.,1.,2.,3.],"k":1}));
+        assert_eq!(result["result"]["ids"], json!([7]), "{result}");
+        bridge.stop();
+        let report: Value = serde_json::from_slice(
+            &std::fs::read(bridge.directory.path().join("report.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report["configuration"]["routing_experiment"]["mode"], mode);
+        for field in [
+            "construction_memory_bytes",
+            "sort_memory_bytes",
+            "serving_memory_bytes",
+            "graph_memory_bytes",
+            "refinement_memory_bytes",
+        ] {
+            assert_eq!(report["bulk_build"][field], 33554432, "{field}: {report}");
+        }
+    }
 }

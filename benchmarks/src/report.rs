@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 /// Current complete benchmark suite/report JSON contract.
-pub const REPORT_SCHEMA_VERSION: u32 = 8;
+pub const REPORT_SCHEMA_VERSION: u32 = 9;
 
 /// Reports produced by one suite command on one comparable host.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -67,6 +67,10 @@ pub struct Environment {
 /// Reproducible benchmark configuration.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Configuration {
+    /// Fixed-index experiment settings, absent for ordinary online benchmarks.
+    pub routing_experiment: Option<crate::routing::Experiment>,
+    /// Starting query row in the original dataset.
+    pub query_offset: usize,
     /// Production Backend under measurement.
     pub backend: String,
     /// Workload scenario.
@@ -280,6 +284,8 @@ pub struct QualitySweepMeasurements {
     /// Construction through the first complete, maintenance-converged audit.
     /// Absent when the benchmark reuses a persisted index.
     pub construction: Option<ConstructionMeasurements>,
+    /// Global setup cost/residency and the exact persisted fixture identity.
+    pub routing_setup: Option<serde_json::Value>,
     /// Points ordered by client count, then from narrowest to widest beam.
     pub points: Vec<QualityPoint>,
 }
@@ -287,10 +293,12 @@ pub struct QualitySweepMeasurements {
 /// Construction costs before oracle preparation and query warmup.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ConstructionMeasurements {
+    /// Bulk Build stage timings and immutable source binding, when applicable.
+    pub bulk: Option<serde_json::Value>,
     /// Completed offline relocation rounds (zero when refinement is skipped).
-    pub refinement_rounds: u64,
+    pub refinement_rounds: Option<u64>,
     /// Accepted positive-gain moves across completed local rounds.
-    pub refinement_moves: u64,
+    pub refinement_moves: Option<u64>,
     /// Continuous elapsed time from import start through convergence and refinement.
     pub wall_seconds: f64,
     /// Process CPU across the same complete construction interval.
@@ -328,6 +336,12 @@ pub struct QualityPoint {
 /// Measurements attributed to one steady-state scenario worker.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct SteadyStateMeasurements {
+    /// Measured successful query recall, in operation completion order.
+    pub per_query_recall: Vec<f64>,
+    /// Independent replay after timing and resource snapshots; no oracle IO is timed.
+    pub quality_diagnostics: Option<QualityDiagnostics>,
+    /// Routing-only counters and elapsed compute/merge samples, excluding body IO.
+    pub routing: RoutingMeasurements,
     /// Timed-region wall-clock duration.
     pub wall_seconds: f64,
     /// Time after foreground completion until its maintenance backlog drained.
@@ -859,6 +873,41 @@ pub struct WriteAmplification {
     pub write_retries: u64,
 }
 
+/// Records the resolved Bulk Build settings used by either benchmark entrypoint.
+/// Capture before transferring worker ownership to the build job.
+pub(crate) fn bulk_build_settings(
+    construction: &ktann::construction::ConstructionOptions,
+    worker: &ktann::api::BulkWorkerOptions,
+) -> serde_json::Map<String, serde_json::Value> {
+    use serde_json::json;
+    [
+        ("sample_items", json!(construction.sample_items)),
+        (
+            "construction_memory_bytes",
+            json!(construction.memory_bytes),
+        ),
+        (
+            "construction_scratch_bytes",
+            json!(construction.scratch_bytes),
+        ),
+        ("sort_memory_bytes", json!(worker.sort_memory_bytes)),
+        ("sort_scratch_bytes", json!(worker.sort_scratch_bytes)),
+        ("serving_memory_bytes", json!(worker.serving_memory_bytes)),
+        ("serving_scratch_bytes", json!(worker.serving_scratch_bytes)),
+        ("graph_memory_bytes", json!(worker.graph_memory_bytes)),
+        (
+            "refinement_memory_bytes",
+            json!(worker.refinement_memory_bytes),
+        ),
+        ("max_artifact_bytes", json!(worker.max_artifact_bytes)),
+        ("load_max_mutations", json!(worker.load.max_mutations)),
+        ("load_max_bytes", json!(worker.load.max_bytes)),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_owned(), value))
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{BackendIo, Distribution, LifecycleMeasurements};
@@ -924,4 +973,57 @@ mod tests {
             })
         );
     }
+}
+
+/// Work observed in the timed routing interval; zero means no work was recorded.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct RoutingMeasurements {
+    /// Native search expansion actually used, bounded by local beam and node count.
+    pub effective_ef: Distribution,
+    /// Complete fixed graph bodies restored during this interval.
+    pub graph_loads: u64,
+    /// Encoded graph bytes consumed on misses (can count the same graph repeatedly).
+    pub graph_encoded_bytes: u64,
+    /// Accounted complete decoded body bytes restored, including repeated misses.
+    pub graph_decoded_bytes: u64,
+    /// Restore CPU-task elapsed milliseconds, excluding backend reads.
+    pub restore_ms: Distribution,
+    /// Distances evaluated by exact or graph routing, excluding leaf work.
+    pub distances: u64,
+    /// Native graph expansion iterations.
+    pub graph_visits: u64,
+    /// Complete internal partitions consumed, grouped by actual tree level.
+    pub parent_visits_by_level: BTreeMap<String, u64>,
+    /// Candidates presented to the per-tree/level beam container.
+    pub merge_candidates: u64,
+    /// Per-parent compute wall time in milliseconds; this is not thread CPU time.
+    pub compute_ms: Distribution,
+    /// Per-parent candidate merge wall time in milliseconds.
+    pub merge_ms: Distribution,
+}
+
+/// Per-query quality decomposition, separate from measured latency/QPS.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct QualityDiagnostics {
+    /// Why the optional global exact centroid reference was unavailable.
+    pub global_reference_skipped: Option<String>,
+    /// One row per held-out query, in source query order.
+    pub queries: Vec<QueryQuality>,
+}
+
+/// A reproducible query's independent quality observations.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct QueryQuality {
+    /// Index into the selected query window (add configuration query offset for source).
+    pub query: usize,
+    /// True final top-k neighbors in the scanned leaves / number of true neighbors.
+    pub true_neighbor_leaf_coverage: f64,
+    /// True neighbors retained after leaf-local RaBitQ overlap selection.
+    pub local_candidate_coverage: f64,
+    /// True neighbors entering exact reranking; rerank budget remains engine-owned.
+    pub rerank_candidate_coverage: f64,
+    /// Returned true neighbors / number of true neighbors.
+    pub final_recall: f64,
+    /// Selected leaves overlapping global exact centroid top-beam, when feasible.
+    pub global_centroid_coverage: Option<f64>,
 }

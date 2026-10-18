@@ -98,7 +98,7 @@ before queries. Reused reports set `construction: null`; comparison omits
 construction costs and rejects mixing fresh and reused runs. Cache capacity,
 client counts, warmup and read beam can
 change without reconstructing the tree. Keep both comparison binaries and the
-fixture manifest with the reports. Reports use schema version 8.
+fixture manifest with the reports. Reports use schema version 9.
 
 Large search diagnostics accept `--query-concurrency 1,4,16,4,1` and
 `--leaf-beam-size 32`. The worker imports and verifies the index once, then
@@ -416,3 +416,124 @@ rejects mismatched configurations. The VectorDBBench bridge's
 `max_internal_partition_entries`; omitted fields use IndexConfig defaults.
 Bridge reports record all four resolved values. Invalid pairs fail before reset
 changes storage. Keep rerank budgets fixed when comparing capacity choices.
+
+
+## Fixed-index routing experiments (issue #195, step 9)
+
+`ktann-bench run --routing-experiment JSON` uses production Bulk Build and
+publication, including optional artifact refinement **before** graphs are built.
+It is supported by `large` quality scenarios and `quality-routing-smoke`. The
+ordinary online scenarios retain their existing import path. JSON rejects unknown
+fields; reports retain every resolved experiment setting. For example:
+
+```sh
+cargo build --release -p ktann-benchmarks --bin ktann-bench
+mkdir -p .benchmark-data/results
+B=target/release/ktann-bench
+$B run --backend rocksdb --profile smoke --scenario quality-routing-smoke \
+  --routing-experiment '{"mode":"exact","m":16,"ef_construction":200,"graph_seed":7,"ef_search":64}' \
+  --rocksdb-path .benchmark-data/results/routing-fixture \
+  --leaf-beam-size 4 --refinement-rounds 0 \
+  --output .benchmark-data/results/routing-exact.json
+$B run --backend rocksdb --profile smoke --scenario quality-routing-smoke \
+  --routing-experiment '{"mode":"partition-local-hnsw","m":16,"ef_construction":200,"graph_seed":7,"ef_search":64}' \
+  --rocksdb-path .benchmark-data/results/routing-fixture --reuse-index true \
+  --leaf-beam-size 4 --refinement-rounds 0 \
+  --output .benchmark-data/results/routing-local.json
+$B summarize-routing --inputs .benchmark-data/results/routing-exact.json,.benchmark-data/results/routing-local.json
+```
+
+Use a **new** fixture directory for each construction configuration. Reuse checks
+base-vector identity, capacities, graph parameters/seed, refinement and training
+sample size. Query windows are independent of fixture identity, allowing held-out
+validation with `--query-offset` and `--query-vectors`. The dataset checksum in each
+report still includes the actual query window. Rotation seed and source checksum
+are recorded on construction. `routing_setup.leaf_layout_sha256` streams final
+leaf identities, centroids and membership bytes; compare this fingerprint when
+claiming the same layout across routing modes or internal capacities.
+
+Modes are `exact` (production fixed-index tree routing),
+`partition-local-hnsw` (production local graphs), `global-exact`, and
+`global-hnsw`. Global modes are compiled only through the core `benchmark`
+feature and keep a separate, non-persisted global baseline. They use final stored
+centroids and the existing USearch engine. Selected leaves enter the production
+snapshot/leaf-scan/overlap/rerank pipeline. Global mode setup is untimed; query
+routing, private scratch allocation, dispatch and the production query are timed.
+This path preprocesses the query for global routing and again for production leaf
+scanning; its timings include that benchmark integration overhead.
+
+The experiment JSON accepts:
+
+| Field | Default | Meaning |
+| --- | ---: | --- |
+| `mode` | `exact` | Explicit routing policy |
+| `m`, `ef_construction` | 16, 200 | Persisted graph construction parameters |
+| `graph_seed` | 0 | u64 encoded little-endian into the first 8 of 32 seed bytes |
+| `ef_search` | 200 | Requested expansion; actual per-parent effective values are recorded |
+| `routing_working_bytes` | 268435456 | Production per-operation routing admission |
+| `global_working_bytes` | 268435456 | Global centroids/graph plus one query/build working set |
+| `sample_items` | 1024 | Existing construction training sample control |
+| `build_memory_bytes` | 268435456 | Each existing construction/sort/serving/graph/refinement worker bound |
+| `build_scratch_bytes` | 68719476736 | Existing scratch and per-artifact bound |
+
+Existing independent `--min-leaf-partition-entries`, `--max-leaf-partition-entries`,
+`--min-internal-partition-entries`, `--max-internal-partition-entries`, beam,
+concurrency, refinement, Partition Cache and RocksDB block-cache controls still
+apply. The rerank budget remains engine-owned and fixed for a given k. These are
+experimental settings, not selected production defaults. Construction resources
+are per existing worker phase, not a whole-process RSS limit.
+
+Global baselines support one Tree Key, at most 65,536 leaves (the shared local
+core/USearch limit), and 262,144 allocated Header slots. An explicitly selected
+global mode fails with a reason if its bound cannot be met; it never changes data
+size, mode or ef. A global exact reference used only for quality diagnostics may
+instead be recorded as skipped with a reason. The streaming fingerprint has the
+same Header-enumeration ceiling. Global retained bytes and setup time are reported;
+private query work is bounded separately for each concurrent caller. A global
+operation gate uses the Runtime foreground limit and retains its permit through
+native work and the production search. Total
+residency also includes runtime caches, backend/OS caches, dataset/oracle storage
+and other process state.
+
+### Measurement semantics and step 10 inputs
+
+Every worker reports construction phases, per-graph build/encode durations,
+native graph construction peaks (excluding Rust centroids/encoding), encoded graph
+payload bytes, process peak RSS, topology, and measured query latency/QPS/CPU.
+Routing counters distinguish distances, graph expansions, per-level parent visits
+(levels above 32 share `33+`), global tree-beam merge candidates, restore counts,
+encoded miss bytes, and accounted decoded body bytes. Repeated loads count again.
+Compute/merge/restore durations are **wall time**, not thread CPU. Process CPU is
+available over the complete timed interval. Logical read bytes are returned KV
+bytes; process physical IO is OS-dependent and unavailable values stay null.
+Graph payload size excludes KV keys and storage-engine amplification. Existing
+leaf-entry scan and truncation metrics remain separate from graph work.
+
+All timing/resource snapshots finish before diagnostic replay. For each unique
+query, `quality_diagnostics` records true-neighbor leaf coverage, local RaBitQ
+candidate coverage, rerank candidate coverage, final recall, and optional overlap
+with global exact centroid top-beam. These are distinct quantities. Timed queries
+also retain individual recall values in completion order. Offline-refinement move
+and completed-round counts are null when the artifact API does not expose them;
+requested rounds remain in configuration. Setup and diagnostics are never called
+cold-cache measurements. In particular, zero warmup does not flush RocksDB/OS
+caches, and later beam points can inherit the worker's Partition Cache. Use fresh
+workers and cache capacities (including zero) to measure loading and turnover;
+no system cache purge is performed.
+
+For step 10, use the existing `large` dataset cache and scenarios
+`quality-cohere-1m` / `quality-sift-1m`, k=100, separate calibration/validation query
+windows, multiple graph seeds, independent capacity pairs, beam/ef, cache budgets
+and client counts. Keep the leaf-layout fingerprint and query checksum with each
+result. `summarize-routing` emits TSV rows with mean/min final recall, QPS, p95,
+logical bytes and process-lifetime peak RSS before diagnostics (not per-point
+RSS); it does not declare a winner or compare unequal recall.
+The existing `compare` command remains a strict identical-input regression check.
+Select matched final recall rows (including the >90% target) before comparing
+capacity/performance. No full 1M matrix or default selection is part of step 9.
+
+The VectorDBBench bridge accepts the same `--routing-experiment JSON` at startup;
+the Python client/protocol is unchanged. Its requested refinement runs in artifact
+preparation for fixed mode. The native runner owns the detailed per-query oracle
+and routing metrics; bridge reports remain companion metrics, with VectorDBBench
+owning canonical recall. Use native runner controls for cache matrices.

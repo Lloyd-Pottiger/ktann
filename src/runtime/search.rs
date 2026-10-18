@@ -62,6 +62,11 @@ pub(crate) struct PreparedSearch {
     routing: Box<[f32]>,
     predicate: Option<CompiledPredicate>,
     plan: TreeKeyPlan,
+    #[cfg(feature = "benchmark")]
+    pub(crate) leaves: Option<Vec<(PartitionKey, f64)>>,
+    #[cfg(feature = "benchmark")]
+    pub(crate) diagnostics:
+        Option<std::sync::Arc<std::sync::Mutex<crate::benchmark::SearchDiagnostics>>>,
 }
 
 impl PreparedSearch {
@@ -102,6 +107,10 @@ impl PreparedSearch {
             routing,
             predicate,
             plan,
+            #[cfg(feature = "benchmark")]
+            leaves: None,
+            #[cfg(feature = "benchmark")]
+            diagnostics: None,
         })
     }
 }
@@ -143,19 +152,24 @@ pub(crate) async fn search<B: Backend>(
     .await?;
     context.checkpoint()?;
 
+    let traversal_request = TraversalRequest::new(
+        &prepared.routing,
+        enumeration.trees(),
+        prepared.predicate.as_ref(),
+        prepared.request.k(),
+        prepared.budgets,
+        prepared.leaf_beam,
+    )?
+    .with_routing_mode(prepared.request.options().routing_mode());
+    #[cfg(feature = "benchmark")]
+    let traversal_request = traversal_request
+        .with_selected_leaves(prepared.leaves.as_deref())
+        .with_diagnostics(prepared.diagnostics.as_deref());
     let mut traversal = traverse(
         &mut txn,
         cache,
         &prepared.kernel,
-        TraversalRequest::new(
-            &prepared.routing,
-            enumeration.trees(),
-            prepared.predicate.as_ref(),
-            prepared.request.k(),
-            prepared.budgets,
-            prepared.leaf_beam,
-        )?
-        .with_routing_mode(prepared.request.options().routing_mode()),
+        traversal_request,
         context,
     )
     .await?;
@@ -173,14 +187,34 @@ pub(crate) async fn search<B: Backend>(
     // truncation is eligible rerank work the depleted budget prevented.
     let rerank_budget = usize::try_from(prepared.budgets.exact_rerank_candidates())
         .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
-    let pool: Vec<ApproximateCandidate<LeafCandidate>> = traversal
-        .into_candidates()
+    let candidates = traversal.into_candidates();
+    #[cfg(feature = "benchmark")]
+    if let Some(diagnostics) = &prepared.diagnostics {
+        let mut diagnostics = diagnostics
+            .lock()
+            .map_err(|_| Error::new(ErrorKind::Other))?;
+        diagnostics.neighbors_after_local_selection = candidates
+            .iter()
+            .filter(|candidate| diagnostics.truth.contains(candidate.record_id()))
+            .count();
+    }
+    let pool: Vec<ApproximateCandidate<LeafCandidate>> = candidates
         .into_iter()
         .map(ApproximateCandidate::from)
         .collect();
     let selection = select_global_overlap(pool, prepared.request.k(), rerank_budget)?;
     let rerank_budget_exhausted = selection.truncated();
     let selected: Vec<LeafCandidate> = selection.into_values();
+    #[cfg(feature = "benchmark")]
+    if let Some(diagnostics) = &prepared.diagnostics {
+        let mut diagnostics = diagnostics
+            .lock()
+            .map_err(|_| Error::new(ErrorKind::Other))?;
+        diagnostics.neighbors_reranked = selected
+            .iter()
+            .filter(|candidate| diagnostics.truth.contains(candidate.record_id()))
+            .count();
+    }
     metrics::search_stage_finished(
         SearchStage::ApproximateSelection,
         approximate_started.elapsed(),

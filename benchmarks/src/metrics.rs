@@ -143,6 +143,34 @@ pub struct CapturedMetrics {
 }
 
 impl CapturedMetrics {
+    /// Converts only this interval's routing work; setup/warmup snapshots are drained.
+    pub fn routing_summary(&self) -> crate::report::RoutingMeasurements {
+        crate::report::RoutingMeasurements {
+            effective_ef: Distribution::from_samples(
+                self.histogram("ktann.routing.effective_ef", &[]),
+            ),
+            graph_loads: self.counter("ktann.routing.graph_loads", &[]),
+            graph_encoded_bytes: self.counter("ktann.routing.graph_encoded_bytes", &[]),
+            graph_decoded_bytes: self.counter("ktann.routing.graph_decoded_bytes", &[]),
+            restore_ms: Distribution::from_samples(
+                self.histogram("ktann.routing.restore_seconds", &[]),
+            )
+            .seconds_to_milliseconds(),
+            distances: self.counter("ktann.routing.distances", &[]),
+            graph_visits: self.counter("ktann.routing.graph_visits", &[]),
+            parent_visits_by_level: self.counters_rendered("ktann.routing.parent_visits"),
+            merge_candidates: self.counter("ktann.routing.merge_candidates", &[]),
+            compute_ms: Distribution::from_samples(
+                self.histogram("ktann.routing.compute_seconds", &[]),
+            )
+            .seconds_to_milliseconds(),
+            merge_ms: Distribution::from_samples(
+                self.histogram("ktann.routing.merge_seconds", &[]),
+            )
+            .seconds_to_milliseconds(),
+        }
+    }
+
     /// Returns one counter with the exact label set, or zero.
     #[must_use]
     pub fn counter(&self, name: &str, labels: &[(&str, &str)]) -> u64 {

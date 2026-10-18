@@ -224,13 +224,130 @@ impl<B: Backend> Index<B> {
         request: SearchRequest,
         operation_options: OperationOptions,
     ) -> Result<SearchOutcome> {
+        self.execute_search(self.prepare_search(request)?, operation_options)
+            .await
+    }
+
+    /// Streams the final leaf layout identity for benchmark comparability checks.
+    #[cfg(feature = "benchmark")]
+    pub async fn leaf_layout_fingerprint(&self) -> Result<[u8; 32]> {
+        let id = self.logical_index_id();
+        self.run_foreground(
+            Operation::Search,
+            OperationOptions::default(),
+            move |context| async move {
+                crate::benchmark::leaf_layout_fingerprint(context.backend().as_ref(), id).await
+            },
+        )
+        .await
+    }
+
+    /// Prepares a bounded global leaf-centroid comparison over this Fixed Index.
+    #[cfg(feature = "benchmark")]
+    pub async fn global_leaf_router(
+        &self,
+        bytes: usize,
+        hnsw: bool,
+    ) -> Result<crate::benchmark::GlobalLeafRouter> {
+        let id = self.logical_index_id();
+        let concurrency = self.runtime.config().foreground_operation_limit();
+        self.run_foreground(
+            Operation::Search,
+            OperationOptions::default(),
+            move |context| async move {
+                crate::benchmark::GlobalLeafRouter::load(
+                    context.backend().as_ref(),
+                    id,
+                    bytes,
+                    hnsw,
+                    concurrency,
+                )
+                .await
+            },
+        )
+        .await
+    }
+
+    /// Executes a benchmark query through production search, optionally selecting
+    /// leaves globally and collecting untimed quality diagnostics. A global
+    /// operation retains its admission permit through routing and reranking.
+    /// Diagnostics are returned exactly when `truth` is supplied.
+    #[cfg(feature = "benchmark")]
+    pub async fn benchmark_search(
+        &self,
+        request: SearchRequest,
+        router: Option<Arc<crate::benchmark::GlobalLeafRouter>>,
+        ef: usize,
+        truth: Option<Vec<Bytes>>,
+    ) -> Result<(SearchOutcome, Option<crate::benchmark::SearchDiagnostics>)> {
+        if (router.is_some() || truth.is_some())
+            && (self.config().fixed_graph().is_none()
+                || !self.config().tree_key_fields().is_empty())
+            || truth
+                .as_ref()
+                .is_some_and(|truth| truth.len() > request.k())
+        {
+            return Err(Error::invalid_argument());
+        }
+        let routing = router.map(|router| {
+            (
+                router,
+                request.vector().to_vec(),
+                request.options().resolved_leaf_beam_size() as usize,
+            )
+        });
+        let (leaves, _permit) = if let Some((router, query, beam)) = routing {
+            let id = self.logical_index_id();
+            let permit = router.permit().await?;
+            let (leaves, permit) = tokio::task::spawn_blocking(move || {
+                router
+                    .route(id, &query, beam, ef)
+                    .map(|leaves| (leaves, permit))
+            })
+            .await
+            .map_err(|error| Error::with_source(ErrorKind::Other, error))??;
+            (Some(leaves), Some(permit))
+        } else {
+            (None, None)
+        };
+        let mut prepared = self.prepare_search(request)?;
+        prepared.leaves = leaves;
+        let diagnostics = truth.map(|truth| {
+            Arc::new(std::sync::Mutex::new(
+                crate::benchmark::SearchDiagnostics::new(truth),
+            ))
+        });
+        prepared.diagnostics = diagnostics.clone();
+        let outcome = self
+            .execute_search(prepared, OperationOptions::default())
+            .await?;
+        let diagnostics = diagnostics
+            .map(|diagnostics| {
+                diagnostics
+                    .lock()
+                    .map(|value| value.clone())
+                    .map_err(|_| Error::new(ErrorKind::Other))
+            })
+            .transpose()?;
+        Ok((outcome, diagnostics))
+    }
+
+    /// Shares validation and preprocessing across production and benchmark calls.
+    fn prepare_search(&self, request: SearchRequest) -> Result<search::PreparedSearch> {
         let config = self.runtime.config();
-        let prepared = search::PreparedSearch::new(
+        search::PreparedSearch::new(
             &self.manifest,
             config.default_search_budgets(),
             config.tree_key_scan_ranges(),
             request,
-        )?;
+        )
+    }
+
+    async fn execute_search(
+        &self,
+        prepared: search::PreparedSearch,
+        operation_options: OperationOptions,
+    ) -> Result<SearchOutcome> {
         let manifest = Arc::clone(&self.manifest);
         let cache = self.runtime.partition_cache();
         let (outcome, maintenance) = self
