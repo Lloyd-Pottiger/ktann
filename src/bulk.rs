@@ -5,6 +5,7 @@
 
 mod files;
 mod forest;
+mod graphs;
 mod input;
 mod plan;
 mod serving;

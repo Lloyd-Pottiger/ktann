@@ -318,3 +318,19 @@ Codec tests use golden bytes, ordering properties, malformed/noncanonical input,
 and cross-process deterministic vectors for rotation, Bloom, Tree Key, values,
 and RaBitQ7. Model tests assert that typed atomic operations preserve exact
 membership under conflicts and injected unknown outcomes.
+
+### Fixed Bulk Build metadata
+
+The immutable Index Configuration stores an optional FixedGraphConfig (`M`,
+`ef_construction`, seed). Its Manifest encoding places a mode byte after the four
+capacity u32s: 0 for mutable, 1 followed by M:u32, ef_construction:u32 and seed:32
+for fixed, then the existing rotation seed. Build Descriptor encoding appends a
+refinement byte after construction budgets: 0 means omitted, 1..6 represent
+zero..five rounds. Worker options encode graph and refinement memory u64 limits
+after serving scratch and before artifact/load limits. These unreleased formats
+change directly; no migration or compatibility path exists.
+
+Final graph descriptor/chunks are ordinary Serving Artifact entries. Completed
+Build Load seals them with the Child Entries; exact publication validation covers
+all their bytes. The write-attempt owner rejects fixed Active mutations and
+maintenance while lifecycle/drop and fenced Building writes retain their authority.

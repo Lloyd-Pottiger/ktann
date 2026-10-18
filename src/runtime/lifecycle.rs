@@ -169,6 +169,9 @@ pub(crate) async fn create_index<B: Backend>(
     config: IndexConfig,
     retry: RetryPolicy,
 ) -> Result<IndexManifest> {
+    if config.fixed_graph().is_some() {
+        return Err(Error::invalid_argument());
+    }
     reserve_index(context, name, config, None, retry).await
 }
 

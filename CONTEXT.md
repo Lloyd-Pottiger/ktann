@@ -89,6 +89,11 @@ _Avoid_: Shard, bucket
 A searchable derived projection of one Vector Record within a Leaf Partition.
 _Avoid_: Vector Record, search result
 
+**Fixed Index**:
+A Bulk Build-only Logical Index with immutable published serving bytes and one
+persisted graph per internal partition. Exact query routing remains available;
+selecting it does not grant mutation or maintenance capability.
+
 **Child Entry**:
 An internal-partition entry containing one child Partition Key and its centroid projection. The projection is immutable while serving; offline refinement replaces it atomically with the child centroid.
 _Avoid_: Parent pointer, Leaf Entry

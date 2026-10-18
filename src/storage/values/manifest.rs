@@ -289,6 +289,15 @@ pub(super) fn encode_index_manifest(encoder: &mut Encoder, manifest: &IndexManif
     encoder.u32(config.max_leaf_partition_entries());
     encoder.u32(config.min_internal_partition_entries());
     encoder.u32(config.max_internal_partition_entries());
+    match config.fixed_graph() {
+        None => encoder.u8(0),
+        Some(graph) => {
+            encoder.u8(1);
+            encoder.u32(graph.m());
+            encoder.u32(graph.ef_construction());
+            encoder.bytes(&graph.seed());
+        }
+    }
     encoder.bytes(&manifest.rotation_seed);
     Ok(())
 }
@@ -359,6 +368,18 @@ pub(super) fn decode_index_manifest(decoder: &mut Decoder) -> Result<IndexManife
     let maximum = decoder.u32()?;
     let internal_minimum = decoder.u32()?;
     let internal_maximum = decoder.u32()?;
+    let fixed_graph = match decoder.u8()? {
+        0 => None,
+        1 => Some(
+            crate::api::FixedGraphConfig::new(
+                decoder.u32()?,
+                decoder.u32()?,
+                decoder.array::<32>()?,
+            )
+            .map_err(|_| corrupt())?,
+        ),
+        _ => return Err(corrupt()),
+    };
     let rotation_seed = decoder.array::<ROTATION_SEED_BYTES>()?;
     let config = IndexConfig::new(dimension, metric)
         .and_then(|config| config.with_fields(fields))
@@ -368,6 +389,10 @@ pub(super) fn decode_index_manifest(decoder: &mut Decoder) -> Result<IndexManife
             config.with_internal_partition_entries(internal_minimum, internal_maximum)
         })
         .map_err(|_| corrupt())?;
+    let config = match fixed_graph {
+        Some(graph) => config.with_fixed_graph(graph),
+        None => config,
+    };
     IndexManifest::new(
         lifecycle,
         logical_index_id,

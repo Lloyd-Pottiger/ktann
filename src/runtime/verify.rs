@@ -492,7 +492,9 @@ fn process_item(
         }
         // Build metadata may survive publication. Its codec was validated
         // above, but it participates in neither serving membership ledger.
-        (LogicalKey::BuildDescriptor(_), PersistentValue::BuildDescriptor(_))
+        (LogicalKey::GraphDescriptor { .. }, PersistentValue::GraphDescriptor(_))
+        | (LogicalKey::GraphChunk { .. }, PersistentValue::GraphChunk(_))
+        | (LogicalKey::BuildDescriptor(_), PersistentValue::BuildDescriptor(_))
         | (LogicalKey::BuildLoad(_), PersistentValue::BuildLoad(_))
         | (LogicalKey::BuildValidation(_), PersistentValue::BuildValidation(_)) => {}
         // The Manifest was validated before the scan; namespace keys cannot

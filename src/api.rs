@@ -18,11 +18,11 @@ mod search;
 mod verify;
 
 pub use bulk::{
-    BulkBuildJob, BulkBuildReport, BulkBuildStatus, BulkCleanupPage, BulkLoadOptions,
-    BulkSchedulerOptions, BulkWorkerOptions,
+    BulkBuildJob, BulkBuildOptions, BulkBuildReport, BulkBuildStatus, BulkCleanupPage,
+    BulkLoadOptions, BulkSchedulerOptions, BulkWorkerOptions,
 };
 pub(crate) use config::MAX_DIMENSION;
-pub use config::{IndexConfig, RuntimeConfig};
+pub use config::{FixedGraphConfig, IndexConfig, RuntimeConfig};
 pub use error::{Error, ErrorKind, Result};
 pub use identifiers::{FieldId, IndexName, LogicalIndexId, PartitionKey};
 pub use index::Index;
@@ -44,3 +44,5 @@ pub use verify::{
 
 pub(crate) use record::{MAX_PAYLOAD_BYTES, MAX_RECORD_ID_BYTES};
 pub(crate) use schema::{MAX_ENCODED_SYNOPSIS_BYTES, MAX_FIELDS, MAX_STRING_BYTES, typed_order};
+
+pub(crate) use refine::MAX_REFINEMENT_ROUNDS;

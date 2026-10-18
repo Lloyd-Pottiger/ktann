@@ -1,13 +1,12 @@
 # Partition-local HNSW: fixed Bulk Build contract
 
-Status: contract, independent capacities, standalone local HNSW core, and bounded
-persistence codecs/restoration implemented. Bulk Build and serving integration are pending. This document owns the first,
-fixed-index stage of [issue #195](https://github.com/Lloyd-Pottiger/ktann/issues/195).
-It specifies the required end state. Fixed-index lifecycle, graph publication,
-and production traversal remain pending.
+Status: fixed Bulk Build preparation and publication are implemented, including
+optional artifact refinement, final-centroid graph construction, immutable loading,
+and fixed-index write/maintenance restrictions. Production graph loading/cache and
+HNSW query traversal remain the next integration steps. This document owns the
+fixed-index contract of [issue #195](https://github.com/Lloyd-Pottiger/ktann/issues/195).
 [Search](search.md), [Storage](storage.md), and [Bulk Build](bulk-build.md) retain
-ownership of their shared contracts. Subsequent implementation must update those
-contracts and their tests as the feature lands.
+ownership of their shared contracts.
 
 ## 1. Scope and invariants
 
@@ -37,14 +36,14 @@ measured warm local speed is not evidence of an end-to-end benefit.
 
 ## 2. Evidence and changes required
 
-These are current implementation facts, not completed feature work:
+Current implementation boundaries:
 
 | Existing owner | Verified behavior and implication |
 | --- | --- |
-| [`IndexConfig`](../../src/api/config.rs) | Independent leaf/internal min/max pairs are implemented; each maximum is capped at 65,536. Fixed mode is not implemented. |
+| [`IndexConfig`](../../src/api/config.rs) | Independent leaf/internal min/max pairs are implemented; each maximum is capped at 65,536. FixedGraphConfig selects fixed mode and persists graph construction parameters. |
 | [`construct_tree`, `ConstructionOptions`](../../src/construction.rs) | Bottom-up construction selects capacities by level, including root-fit. Memory admission reserves sample, centroid and row buffers; caller-retained output is excluded. |
-| [`local_hnsw`](../../src/search/local_hnsw.rs), [`ktann-usearch`](../../ktann-usearch/README.md) | Standalone graph construction, search, exact local top-k, structural inspection, and reusable bounded scratch are implemented. No production caller selects this path yet. |
-| [`ForestArtifact`](../../src/bulk/forest.rs), [`ServingArtifact`](../../src/bulk/serving.rs) | Forest plans bind source/configuration/rotation/sample size. Serving preparation proves exact joins and emits canonical values; no graph or refinement stage exists. |
+| [`local_hnsw`](../../src/search/local_hnsw.rs), [`ktann-usearch`](../../ktann-usearch/README.md) | Standalone graph construction, search, exact local top-k, structural inspection, and reusable bounded scratch are implemented. Bulk Build constructs and persists graphs; production queries still use exact traversal. |
+| [`ForestArtifact`](../../src/bulk/forest.rs), [`ServingArtifact`](../../src/bulk/serving.rs) | Forest plans bind source/configuration/rotation/sample size. Serving preparation proves exact joins and emits canonical values; optional artifact refinement completes before final forest acceptance; serving encoding builds graphs from final Child Entries. |
 | [`refine::run`, `plan`](../../src/runtime/refine.rs) | Existing Offline Refinement reads an Active index, plans in memory, commits member moves in batches, then replaces non-root centroids. Even zero rounds recomputes centroids. Failure can leave a valid partially refined index. |
 | [`update_centroid`](../../src/storage/topology.rs) | Atomically replaces the partition centroid and incoming Child Entry, advancing the parent's body cache epoch. It does not update a graph. |
 | [`Traversal::visit_internal`, `select_next_frontier`](../../src/search/traverse.rs) | Current exact traversal scores all exposed children, then selects each tree's next-depth beam globally. Local graph candidates must feed that same selection boundary. |
@@ -103,8 +102,8 @@ backend writes remain outside the library API's integrity guarantee.
 
 ## 4. Configuration ownership
 
-Names below describe required fields. Leaf/internal capacities are already
-exported by `IndexConfig`; the other additions are not yet implemented.
+The table defines canonical ownership. Index/build fields are implemented;
+query-routing and graph-cache controls belong to the subsequent serving integration.
 Keep one canonical owner for each value and include semantic values in artifact
 bindings; copied bindings are validation evidence, not independently editable
 configuration.

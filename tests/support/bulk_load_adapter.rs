@@ -13,6 +13,14 @@ use std::path::Path;
 /// Exercises both manual loading and worker acceptance across a real backend
 /// reopen, then checks exact bytes before publication and ordinary verification.
 pub async fn exercise<B: Backend>(backend: impl Fn() -> B, directory: &Path) {
+    for fixed in [false, true] {
+        let path = directory.join(if fixed { "fixed" } else { "mutable" });
+        std::fs::create_dir(&path).unwrap();
+        exercise_mode(&backend, &path, fixed).await;
+    }
+}
+
+async fn exercise_mode<B: Backend>(backend: &impl Fn() -> B, directory: &Path, fixed: bool) {
     let config = IndexConfig::new(2, Metric::L2)
         .unwrap()
         .with_leaf_partition_entries(4, 16)
@@ -22,6 +30,11 @@ pub async fn exercise<B: Backend>(backend: impl Fn() -> B, directory: &Path) {
         .unwrap()
         .with_tree_key_fields(vec![FieldId(0)])
         .unwrap();
+    let config = if fixed {
+        config.with_fixed_graph(ktann::api::FixedGraphConfig::new(4, 16, [3; 32]).unwrap())
+    } else {
+        config
+    };
     let source = InputSnapshot::create(
         &directory.join("source"),
         config,
@@ -58,6 +71,8 @@ pub async fn exercise<B: Backend>(backend: impl Fn() -> B, directory: &Path) {
         &source,
         *job.index_manifest().rotation_seed(),
         ForestOptions {
+            refinement_rounds: None,
+            refinement_memory_bytes: 256 * 1024 * 1024,
             sample_items: tree.sample_items,
             tree_memory_bytes: tree.memory_bytes,
             tree_scratch_bytes: tree.scratch_bytes,
@@ -73,6 +88,7 @@ pub async fn exercise<B: Backend>(backend: impl Fn() -> B, directory: &Path) {
         &forest,
         job.index_manifest(),
         ServingOptions {
+            graph_memory_bytes: 256 * 1024 * 1024,
             memory_bytes: 8 * 1024 * 1024,
             scratch_bytes: 32 * 1024 * 1024,
             hard_limits,

@@ -96,6 +96,8 @@ fn record(id: u64) -> Record {
 
 fn options() -> ForestOptions {
     ForestOptions {
+        refinement_rounds: None,
+        refinement_memory_bytes: 256 * 1024 * 1024,
         sample_items: 8,
         tree_memory_bytes: 2 * 1024 * 1024,
         tree_scratch_bytes: 16 * 1024 * 1024,
@@ -106,6 +108,7 @@ fn options() -> ForestOptions {
 
 fn serving_options() -> ServingOptions {
     ServingOptions {
+        graph_memory_bytes: 256 * 1024 * 1024,
         memory_bytes: 8 * 1024 * 1024,
         scratch_bytes: 64 * 1024 * 1024,
         hard_limits: HardLimits {
@@ -267,6 +270,7 @@ async fn encoded_artifact_verifies_and_matches_online_leaf_values_for_every_metr
                 &forest,
                 &manifest,
                 ServingOptions {
+                    graph_memory_bytes: 256 * 1024 * 1024,
                     hard_limits: backend.hard_limits(),
                     ..serving_options()
                 },
@@ -482,6 +486,7 @@ fn serving_exact_joins_reject_validly_framed_but_wrong_membership_and_edges() {
             input.config().clone(),
             *index.rotation_seed(),
             options().sample_items,
+            None,
         )
         .unwrap();
         for partition in forged.reader().unwrap() {
@@ -579,6 +584,7 @@ fn serving_reopens_after_relocation_and_rejects_wrong_bindings_and_corruption() 
         config.clone(),
         *index.rotation_seed(),
         options().sample_items,
+        None,
     )
     .unwrap();
     for partition in forest.reader().unwrap() {
@@ -602,6 +608,7 @@ fn serving_reopens_after_relocation_and_rejects_wrong_bindings_and_corruption() 
                 wrong_config,
                 *index.rotation_seed(),
                 options().sample_items,
+                None,
             )
             .err()
             .unwrap()
@@ -617,6 +624,7 @@ fn serving_reopens_after_relocation_and_rejects_wrong_bindings_and_corruption() 
             config.clone(),
             *index.rotation_seed(),
             options().sample_items + 1,
+            None,
         )
         .err()
         .unwrap()
@@ -727,3 +735,6 @@ fn construction_options() -> ktann::construction::ConstructionOptions {
         scratch_bytes: forest.tree_scratch_bytes,
     }
 }
+
+#[path = "bulk_serving/fixed.rs"]
+mod fixed;

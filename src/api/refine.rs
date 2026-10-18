@@ -2,6 +2,9 @@
 
 use super::{Error, OperationOptions, Result};
 
+/// Shared finite numerical planning bound for ordinary and artifact refinement.
+pub(crate) const MAX_REFINEMENT_ROUNDS: usize = 5;
+
 /// Controls bounded-round refinement before serving an imported index.
 ///
 /// The input limit covers loaded vectors, IDs and topology, not total resident
@@ -29,7 +32,7 @@ impl RefineOptions {
 
     /// Selects zero through five local refinement rounds.
     pub fn with_refinement_rounds(mut self, rounds: usize) -> Result<Self> {
-        if rounds > 5 {
+        if rounds > MAX_REFINEMENT_ROUNDS {
             return Err(Error::invalid_argument());
         }
         self.rounds = rounds;

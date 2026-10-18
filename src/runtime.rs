@@ -67,7 +67,7 @@ impl<B: Backend> Runtime<B> {
         &self,
         name: &str,
         input: &crate::bulk::InputSnapshot,
-        construction: crate::construction::ConstructionOptions,
+        construction: impl Into<crate::api::BulkBuildOptions>,
     ) -> Result<crate::api::BulkBuildJob<B>> {
         self.start_bulk_build_with_control(name, input, construction, OperationOptions::default())
             .await
@@ -78,11 +78,13 @@ impl<B: Backend> Runtime<B> {
         &self,
         name: &str,
         input: &crate::bulk::InputSnapshot,
-        construction: crate::construction::ConstructionOptions,
+        construction: impl Into<crate::api::BulkBuildOptions>,
         options: OperationOptions,
     ) -> Result<crate::api::BulkBuildJob<B>> {
         let name = IndexName::new(name)?;
         let config = input.config().clone();
+        let preparation = construction.into();
+        let construction = preparation.construction;
         construction.resident_rows(&config)?;
         let source =
             std::path::absolute(input.directory()).map_err(|_| Error::invalid_argument())?;
@@ -90,7 +92,8 @@ impl<B: Backend> Runtime<B> {
             source,
             input.manifest().clone(),
             construction,
-        )?;
+        )?
+        .with_refinement_rounds(preparation.refinement_rounds)?;
         let request = descriptor.clone();
         let request_name = name.clone();
         let retry = lifecycle::RetryPolicy::from_config(self.config());

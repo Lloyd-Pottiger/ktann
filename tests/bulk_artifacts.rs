@@ -253,6 +253,8 @@ fn manifest_identity_and_version_are_checked_independently_of_data() {
 
 fn forest_options() -> ktann::bulk::ForestOptions {
     ktann::bulk::ForestOptions {
+        refinement_rounds: None,
+        refinement_memory_bytes: 256 * 1024 * 1024,
         sample_items: options().sample_items,
         tree_memory_bytes: options().memory_bytes,
         tree_scratch_bytes: options().scratch_bytes,
@@ -349,6 +351,7 @@ fn forest_globally_groups_exact_membership_and_matches_independent_tree_builds()
             source.config().clone(),
             [7; 32],
             forest_options().sample_items,
+            None,
         )
         .unwrap();
         let shape = forest_shape(&reopened);
@@ -448,7 +451,8 @@ fn forest_sort_spills_and_source_order_do_not_change_topology() {
             a.manifest(),
             a.config().clone(),
             [8; 32],
-            forest_options().sample_items
+            forest_options().sample_items,
+            None,
         )
         .err()
         .unwrap()
@@ -470,7 +474,8 @@ fn forest_sort_spills_and_source_order_do_not_change_topology() {
             regrouped.manifest(),
             regrouped.config().clone(),
             [9; 32],
-            forest_options().sample_items
+            forest_options().sample_items,
+            None,
         )
         .is_err()
     );
@@ -620,6 +625,7 @@ fn forest_reader_rejects_invalid_tree_envelopes_and_premature_roots() {
             input.config().clone(),
             [0; 32],
             forest_options().sample_items,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -938,6 +944,7 @@ fn forest_capacity_identity_and_round_trip_are_independent_by_level() {
             config.clone(),
             [0; 32],
             forest_options().sample_items,
+            None,
         )
         .unwrap();
         assert_eq!(forest_shape(&forest), forest_shape(&reopened));
@@ -973,7 +980,8 @@ fn forest_capacity_identity_and_round_trip_are_independent_by_level() {
                     source.manifest(),
                     changed,
                     [0; 32],
-                    forest_options().sample_items
+                    forest_options().sample_items,
+                    None,
                 )
                 .is_err()
             );

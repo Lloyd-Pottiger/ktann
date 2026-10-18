@@ -23,10 +23,56 @@ const DEFAULT_TREE_KEY_SCAN_RANGES: u32 = 1_024;
 const DEFAULT_WRITE_BEAM_SIZE: u32 = 4;
 const MAX_WRITE_BEAM_SIZE: u32 = 16_384;
 
+/// Immutable construction parameters for a fixed, Bulk Build-only index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FixedGraphConfig {
+    m: u32,
+    ef_construction: u32,
+    seed: [u8; 32],
+}
+
+impl FixedGraphConfig {
+    /// Creates graph parameters; degree is bounded by the persistent node limit.
+    pub fn new(m: u32, ef_construction: u32, seed: [u8; 32]) -> Result<Self> {
+        if !(2..=ktann_usearch::MAX_NODES as u32 / 2).contains(&m) || ef_construction < m {
+            return Err(Error::invalid_argument());
+        }
+        Ok(Self {
+            m,
+            ef_construction,
+            seed,
+        })
+    }
+
+    /// Maximum upper-layer degree.
+    pub const fn m(self) -> u32 {
+        self.m
+    }
+
+    /// Construction candidate budget.
+    pub const fn ef_construction(self) -> u32 {
+        self.ef_construction
+    }
+
+    /// Deterministic seed, further scoped by Tree Key and Partition Key.
+    pub const fn seed(self) -> [u8; 32] {
+        self.seed
+    }
+
+    pub(crate) fn parameters(self) -> crate::search::local_hnsw::Parameters {
+        crate::search::local_hnsw::Parameters {
+            m: self.m as usize,
+            ef_construction: self.ef_construction as usize,
+            seed: self.seed,
+        }
+    }
+}
+
 /// Immutable configuration persisted in an Index Manifest.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct IndexConfig {
+    fixed_graph: Option<FixedGraphConfig>,
     dimension: usize,
     metric: Metric,
     fields: Box<[FieldSchema]>,
@@ -38,9 +84,22 @@ pub struct IndexConfig {
 }
 
 impl IndexConfig {
+    /// Selects immutable serving bytes and internal-partition graphs.
+    #[must_use]
+    pub fn with_fixed_graph(mut self, graph: FixedGraphConfig) -> Self {
+        self.fixed_graph = Some(graph);
+        self
+    }
+
+    /// Graph construction parameters, or None for an ordinary mutable index.
+    pub const fn fixed_graph(&self) -> Option<FixedGraphConfig> {
+        self.fixed_graph
+    }
+
     /// Creates an immutable Logical Index configuration.
     pub fn new(dimension: usize, metric: Metric) -> Result<Self> {
         let config = Self {
+            fixed_graph: None,
             dimension,
             metric,
             fields: Box::new([]),
