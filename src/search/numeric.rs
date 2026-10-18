@@ -117,6 +117,14 @@ impl VectorKernel {
         Ok(processed.into_boxed_slice())
     }
 
+    /// Validates a caller's routing-space vector without normalization or scoring.
+    ///
+    /// Wrong dimensions and nonfinite components are `InvalidArgument`;
+    /// zero vectors and unnormalized inner-product magnitudes are valid.
+    pub(crate) fn validate_routing(&self, vector: &[f32]) -> Result<()> {
+        validate_vector(vector, self.dimension, VectorSource::Caller)
+    }
+
     /// Computes the deterministic routing distance from a preprocessed routing
     /// vector to a persistent routing centroid; smaller is nearer.
     ///
