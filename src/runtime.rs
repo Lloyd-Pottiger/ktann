@@ -23,6 +23,16 @@ use crate::storage::backend::{Backend, CommitCancellation, CommitStart};
 
 use self::fixup::FixupQueue;
 
+mod compute;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "explicit graph reads precede production traversal integration"
+    )
+)]
+mod routing_graph;
+
 pub(crate) mod bulk_load;
 pub(crate) mod bulk_publish;
 pub(crate) mod bulk_scheduler;
@@ -401,7 +411,7 @@ pub(crate) struct OperationContext<B: Backend> {
     write_beam_size: u32,
     partition_cache: Arc<PartitionCache>,
     commit_start: Option<CommitStart>,
-    // Refinement CPU tasks retain this shared admission through actual task exit.
+    // Foreground CPU tasks retain this shared admission through actual task exit.
     cpu_admission: Option<Arc<Admission<B>>>,
 }
 
@@ -551,10 +561,11 @@ impl<B: Backend> RuntimeInner<B> {
             }
         };
         // Ordinary operations retain direct admission without an allocation.
-        // Refinement shares ownership with cooperatively cancelled CPU work.
+        // Search and bulk/refinement operations share admission with CPU work.
         let admission = if matches!(
             operation,
-            Operation::Refine
+            Operation::Search
+                | Operation::Refine
                 | Operation::LoadBulkBuild
                 | Operation::RunBulkBuild
                 | Operation::ScheduleBulkBuild
@@ -846,7 +857,7 @@ enum Phase {
     Closed,
 }
 
-/// Only offline refinement needs shared ownership of a foreground admission.
+/// CPU work shares foreground admission until its cooperatively cancelled task exits.
 enum ForegroundAdmission<B: Backend> {
     Direct { _guard: Admission<B> },
     Shared { guard: Arc<Admission<B>> },
@@ -1141,6 +1152,23 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidArgument);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graph_reads_and_queries_run_under_search_admission() {
+        let (runtime, _drops) = test_runtime(2);
+        runtime
+            .run_foreground(
+                Operation::Search,
+                None,
+                OperationOptions::default(),
+                |context| async move {
+                    crate::search::cache::graph::tests::exercise_runtime(&context).await
+                },
+            )
+            .await
+            .unwrap();
+        runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

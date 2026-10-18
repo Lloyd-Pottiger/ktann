@@ -7,8 +7,7 @@ use crate::storage::values::{
 };
 use bytes::Bytes;
 
-/// Expected source of a persisted internal body. Construction quality remains
-/// caller-owned until the fixed-index Manifest integration lands.
+/// Snapshot source of a persisted internal body; parameters come from its Manifest.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GraphSource<'a> {
     pub(crate) index: LogicalIndexId,
@@ -70,7 +69,11 @@ pub(super) fn identity(
     Ok(hash.finalize().into())
 }
 
-fn binding(identity: [u8; 32], index: LogicalIndexId, header: PartitionHeader) -> [u8; 32] {
+pub(super) fn binding(
+    identity: [u8; 32],
+    index: LogicalIndexId,
+    header: PartitionHeader,
+) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(b"ktann/local-hnsw/snapshot/v1\0");
     hash.update(identity);

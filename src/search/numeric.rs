@@ -61,6 +61,22 @@ impl VectorKernel {
         })
     }
 
+    /// Heap storage retained by the deterministic rotation schedule.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.rotation
+            .rounds
+            .iter()
+            .map(|round| size_of_val(round.as_ref()) + 32)
+            .sum()
+    }
+
+    /// Schedule plus temporary permutation storage while constructing a kernel.
+    pub(crate) fn allocation_bound(dimension: usize) -> Option<usize> {
+        dimension
+            .checked_mul((ROTATION_ROUNDS + 1) * size_of::<usize>())?
+            .checked_add(256)
+    }
+
     /// Returns the routing metric for persisted graph source binding.
     pub(crate) const fn metric(&self) -> Metric {
         self.metric
