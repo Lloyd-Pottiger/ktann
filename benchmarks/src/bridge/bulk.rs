@@ -41,6 +41,8 @@ impl InputCapture {
             config,
             DISK_LIMIT,
             ForestOptions {
+                refinement_rounds: None,
+                refinement_memory_bytes: 256 * 1024 * 1024,
                 sample_items: construction.sample_items,
                 tree_memory_bytes: construction.memory_bytes,
                 tree_scratch_bytes: construction.scratch_bytes,

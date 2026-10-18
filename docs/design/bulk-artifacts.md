@@ -20,11 +20,18 @@ serving lifecycle and exact-membership contracts are unchanged.
    and delegates each tree to the existing deterministic construction algorithm.
    `build_prepared` consumes receipt-time preparation. Plans are emitted in
    canonical tree order, child-before-parent with root Partition Key 1 last.
-   The reader validates allocation, occupancy, levels, tree closure, and counts.
+   Optional bounded refinement runs on one retained tree before emission, reusing
+   the ordinary metric-correct assignment algorithm. Zero rounds refreshes leaf
+   and bottom-up internal centroids; omission preserves construction output.
+   Refinement semantics participate in the forest binding. The reader validates
+   allocation, occupancy, levels, tree closure, and counts.
 4. `ServingArtifact::build` uses bounded external joins to prove exact source/leaf
    membership and parent/child relationships. Core storage codecs encode records,
    locations, payloads, trees, partition metadata, entries, and synopses. Output
-   keys are unique and sorted, and adapter key/value limits are checked. It excludes
+   keys are unique and sorted, and adapter key/value limits are checked. For fixed
+   indexes, final canonical internal bodies feed one graph at a time; descriptor
+   and chunk keys follow that body's Child Entries. Graph encoding completes
+   before sealing and no serving projection changes afterward. It excludes
    the Index Manifest, name directory, and allocator. Its binding includes the
    exact target Index Manifest and source and forest identities. Build budgets and
    adapter limits do not affect content identity. Forest partition bounds come

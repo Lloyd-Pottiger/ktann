@@ -13,8 +13,11 @@ The rationale is recorded in [ADR 0026](../adr/0026-building-reservations.md),
 ## 1. Manual completion
 
 Create an Input Snapshot and call `Runtime::start_bulk_build(name, &input,
-construction_options)`. ConstructionOptions contains only the training sample
-size and memory/scratch budgets. Dimension, metric and capacities come from
+construction_options)`. ConstructionOptions contains the training sample size and construction budgets.
+Pass `BulkBuildOptions { construction, refinement_rounds }` to request optional
+artifact refinement; a plain ConstructionOptions selects no refinement. The
+Build Descriptor binds `None` separately from `Some(0)` (centroid refresh without
+moves), and accepts at most five rounds. These semantics cannot change on resume. Dimension, metric and capacities come from
 the Input Snapshot's Index Configuration and are persisted in the Manifest;
 the Build Descriptor does not store a second copy. Reservation atomically allocates an ID, reserves its name, and
 persists a Building Manifest and Build Descriptor. Repeating the same request
@@ -27,6 +30,21 @@ to `job.complete(options)`. It prepares, loads, validates, publishes, and attemp
 cleanup. `complete_with_control` applies cancellation and deadline control across
 the entire operation. No automatic scheduler is started. Explicit `run_worker`,
 `load_serving`, and `publish` APIs remain available for phase control.
+
+A configuration with `FixedGraphConfig` requires Bulk Build. Preparation refines
+membership and recomputes centroids before accepting the final Forest Artifact,
+then builds each internal graph exactly once from the final Child Entries while
+encoding Serving bytes. Omitted refinement preserves construction centroids.
+`refinement_memory_bytes` admits retained per-tree input, topology and numerical
+planning; `graph_memory_bytes` bounds one graph's centroids, native construction
+and serialization. Both are persisted worker resource limits, not semantic inputs.
+Failure exceeds neither budget by falling back or omitting work. Construction and
+refinement memory ceilings add while retained inputs feed construction.
+
+Fixed Active indexes reject all mutations and public refinement with
+`IndexReadOnly`, including empty batches and zero rounds. Runtime maintenance
+never admits fixed indexes. Reads, exact search, verification, reopen and drop
+retain their ordinary lifecycle behavior. Production HNSW routing is separate.
 
 ### 1.1 Completion reports
 

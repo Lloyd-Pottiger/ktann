@@ -22,6 +22,7 @@ pub struct BuildDescriptor {
     source: PathBuf,
     input: ArtifactManifest,
     options: ConstructionOptions,
+    refinement_rounds: Option<u8>,
 }
 
 impl BuildDescriptor {
@@ -44,7 +45,22 @@ impl BuildDescriptor {
             source,
             input,
             options,
+            refinement_rounds: None,
         })
+    }
+
+    /// Binds optional refinement to this reservation; None and Some(0) differ.
+    pub fn with_refinement_rounds(mut self, rounds: Option<u8>) -> Result<Self> {
+        if rounds.is_some_and(|rounds| usize::from(rounds) > crate::api::MAX_REFINEMENT_ROUNDS) {
+            return Err(Error::invalid_argument());
+        }
+        self.refinement_rounds = rounds;
+        Ok(self)
+    }
+
+    /// Requested bounded refinement rounds, before final forest acceptance.
+    pub const fn refinement_rounds(&self) -> Option<u8> {
+        self.refinement_rounds
     }
 
     /// Absolute source snapshot directory; its contents must match `input`.
@@ -86,6 +102,7 @@ pub(super) fn encode(encoder: &mut Encoder, descriptor: &BuildDescriptor) -> Res
     encoder.u64(options.sample_items as u64);
     encoder.u64(options.memory_bytes as u64);
     encoder.u64(options.scratch_bytes);
+    encoder.u8(descriptor.refinement_rounds.map_or(0, |rounds| rounds + 1));
     Ok(())
 }
 
@@ -98,5 +115,12 @@ pub(super) fn decode(decoder: &mut Decoder) -> Result<BuildDescriptor> {
         memory_bytes: usize::try_from(decoder.u64()?).map_err(|_| corrupt())?,
         scratch_bytes: decoder.u64()?,
     };
-    BuildDescriptor::new(source, input, options).map_err(|_| corrupt())
+    let refinement_rounds = match decoder.u8()? {
+        0 => None,
+        tag @ 1..=6 => Some(tag - 1),
+        _ => return Err(corrupt()),
+    };
+    BuildDescriptor::new(source, input, options)
+        .and_then(|d| d.with_refinement_rounds(refinement_rounds))
+        .map_err(|_| corrupt())
 }

@@ -166,7 +166,8 @@ impl<B: Backend> Index<B> {
     /// A nonempty batch is one atomic transaction and is never split: every
     /// mutation commits or none does. Outcomes correspond to inputs in order.
     /// Validation of the whole batch completes before storage work; duplicate
-    /// Record IDs are invalid. An empty batch succeeds with an empty result.
+    /// Record IDs are invalid. An empty mutable-index batch succeeds with an empty result.
+    /// Fixed indexes reject even an empty batch with `IndexReadOnly`.
     /// Any item failure returns one operation error carrying the input
     /// position and no partial outcomes. Retry and commit-outcome behavior
     /// match [`insert`](Self::insert).
@@ -181,6 +182,7 @@ impl<B: Backend> Index<B> {
         mut mutations: Vec<Mutation>,
         operation_options: OperationOptions,
     ) -> Result<Vec<MutationOutcome>> {
+        self.require_mutable()?;
         self.validate(&mut mutations)?;
         if mutations.is_empty() {
             return Ok(Vec::new());
@@ -295,6 +297,7 @@ impl<B: Backend> Index<B> {
     /// failure, keep the index offline and drop/rebuild it if needed. There is no
     /// persistent progress or automatic recovery protocol.
     pub async fn refine(&self, options: RefineOptions) -> Result<()> {
+        self.require_mutable()?;
         let manifest = Arc::clone(&self.manifest);
         let runtime = Arc::clone(&self.runtime);
         let retry = lifecycle::RetryPolicy::from_config(self.runtime.config());
@@ -309,6 +312,14 @@ impl<B: Backend> Index<B> {
             },
         )
         .await
+    }
+
+    /// Enforces the immutable-index capability before mutation planning.
+    fn require_mutable(&self) -> Result<()> {
+        if self.manifest.config().fixed_graph().is_some() {
+            return Err(Error::new(ErrorKind::IndexReadOnly));
+        }
+        Ok(())
     }
 
     /// Validates one mutation batch against this index's immutable
@@ -344,6 +355,7 @@ impl<B: Backend> Index<B> {
         operation_options: OperationOptions,
     ) -> Result<MutationOutcome> {
         let mut mutations = vec![mutation];
+        self.require_mutable()?;
         self.validate(&mut mutations)?;
         let outcomes = self
             .run_mutations(operation, mutations, operation_options)

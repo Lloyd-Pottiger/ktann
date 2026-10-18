@@ -34,6 +34,8 @@ pub struct ServingOptions {
     /// One external sort's allocated buffers, including bounded merge readers.
     /// Source/value decoding and one Synopsis are separately codec-bounded.
     pub memory_bytes: usize,
+    /// Combined centroid, native graph, and encoding ceiling for one partition.
+    pub graph_memory_bytes: usize,
     /// All simultaneous scratch runs, including retained join inputs.
     pub scratch_bytes: u64,
     /// Adapter-declared logical key and value limits, checked before sealing.
@@ -87,6 +89,7 @@ pub struct ServingEntry {
 pub struct ServingArtifact {
     directory: PathBuf,
     source: ArtifactManifest,
+    forest: ArtifactManifest,
     artifact: ArtifactManifest,
     index: IndexManifest,
     limits: HardLimits,
@@ -94,8 +97,23 @@ pub struct ServingArtifact {
 
 impl ServingArtifact {
     /// Checks the source and target identities retained at construction or open.
-    pub(crate) fn matches_build(&self, index: &IndexManifest, source: &ArtifactManifest) -> bool {
-        self.index.has_same_immutable_identity(index) && self.source == *source
+    pub(crate) fn matches_build(
+        &self,
+        index: &IndexManifest,
+        descriptor: &crate::storage::values::BuildDescriptor,
+    ) -> bool {
+        self.index.has_same_immutable_identity(index)
+            && self.source == *descriptor.input()
+            && self.forest.matches(
+                2,
+                super::forest::binding(
+                    descriptor.input(),
+                    index.config(),
+                    *index.rotation_seed(),
+                    descriptor.options().sample_items,
+                    descriptor.refinement_rounds(),
+                ),
+            )
     }
 
     /// Reopens using trusted upstream identities; their files and build budgets
@@ -119,6 +137,7 @@ impl ServingArtifact {
         let artifact = Self {
             directory: directory.to_owned(),
             source: source.clone(),
+            forest: forest.clone(),
             artifact: expected,
             index: index.clone(),
             limits,
@@ -141,6 +160,28 @@ impl ServingArtifact {
         options: ServingOptions,
         maximum_bytes: u64,
     ) -> Result<(Self, ServingReport)> {
+        Self::build_controlled(
+            directory,
+            input,
+            forest,
+            index,
+            options,
+            maximum_bytes,
+            &|| Ok(()),
+        )
+    }
+
+    /// Runtime preparation retains cooperative cancellation during native graph work.
+    pub(crate) fn build_controlled(
+        directory: &Path,
+        input: &InputSnapshot,
+        forest: &ForestArtifact,
+        index: &IndexManifest,
+        options: ServingOptions,
+        maximum_bytes: u64,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<(Self, ServingReport)> {
+        check()?;
         validate(directory, input, forest, index, options)?;
         let codec = ValueCodec::for_index(index);
         let id = index.logical_index_id();
@@ -517,7 +558,13 @@ impl ServingArtifact {
         let mut next = output.next()?;
         let mut synopses = space.reader(&synopsis_run)?;
         let mut next_synopsis = synopses.next()?;
+        let mut graphs = index
+            .config()
+            .fixed_graph()
+            .map(|_| super::graphs::GraphPreparation::new(index, options.graph_memory_bytes))
+            .transpose()?;
         while next.is_some() || next_synopsis.is_some() {
+            check()?;
             let take_synopsis = match (&next, &next_synopsis) {
                 (Some(row), Some(synopsis)) => synopsis.key < row.key,
                 (None, Some(_)) => true,
@@ -532,7 +579,34 @@ impl ServingArtifact {
                 next = output.next()?;
                 row
             };
+            if let Some(graphs) = &mut graphs {
+                let key = keys::decode_key(types, &Bytes::copy_from_slice(&row.key))?;
+                if matches!(
+                    key,
+                    LogicalKey::Header { .. } | LogicalKey::TreeManifest { .. }
+                ) {
+                    graphs.finish(check, |key, value| {
+                        let row = encoded(codec, options.hard_limits, key, value)?;
+                        write_entry(&mut writer, &mut previous_key, &mut report, row)
+                    })?;
+                }
+                if matches!(
+                    key,
+                    LogicalKey::Header { .. } | LogicalKey::ChildEntry { .. }
+                ) {
+                    graphs.observe(
+                        &key,
+                        codec.decode(&key, Bytes::copy_from_slice(&row.value))?,
+                    )?;
+                }
+            }
             write_entry(&mut writer, &mut previous_key, &mut report, row)?;
+        }
+        if let Some(graphs) = &mut graphs {
+            graphs.finish(check, |key, value| {
+                let row = encoded(codec, options.hard_limits, key, value)?;
+                write_entry(&mut writer, &mut previous_key, &mut report, row)
+            })?;
         }
         drop((output, synopses));
         space.remove(output_run)?;
@@ -546,6 +620,7 @@ impl ServingArtifact {
             Self {
                 directory,
                 source: input.manifest().clone(),
+                forest: forest.manifest().clone(),
                 artifact,
                 index: index.clone(),
                 limits: options.hard_limits,

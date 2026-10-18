@@ -239,6 +239,7 @@ fn namespace_and_manifest_golden_bytes() {
     expected.extend_from_slice(&512_u32.to_be_bytes());
     expected.extend_from_slice(&8_u32.to_be_bytes());
     expected.extend_from_slice(&128_u32.to_be_bytes());
+    expected.push(0); // mutable mode
     expected.extend_from_slice(&[0; 32]);
     assert_eq!(
         codec
@@ -989,6 +990,7 @@ fn building_manifest_and_request_descriptor_have_canonical_bytes() {
     for number in [8_u64, 2 * 1024 * 1024, 16 * 1024 * 1024] {
         expected.extend_from_slice(&number.to_be_bytes());
     }
+    expected.push(0); // refinement omitted
     assert_eq!(bytes.as_slice(), expected.as_slice());
     assert_eq!(decode(codec, &key, &bytes).unwrap(), value);
     for end in 0..bytes.len() {
@@ -1019,7 +1021,7 @@ fn bulk_workspace_golden_and_malformed_ownership() {
     let key = LogicalKey::BuildWorkspace(id(1));
     let mut golden = vec![0x0f, 0, 0, 0, 5];
     golden.extend_from_slice(b"/bulk");
-    for n in [1_u64, 1, 1, 1, 1, 2, 1, 1, 1] {
+    for n in [1_u64, 1, 1, 1, 1, 1, 1, 2, 1, 1, 1] {
         golden.extend_from_slice(&n.to_be_bytes());
     }
     golden.extend_from_slice(&[1; 32]);
@@ -1040,7 +1042,7 @@ fn bulk_workspace_golden_and_malformed_ownership() {
         assert!(codec.decode(&key, Bytes::from(malformed)).is_err());
     }
     let mut zero_token = golden.clone();
-    zero_token[82..114].fill(0);
+    zero_token[98..130].fill(0);
     assert!(codec.decode(&key, Bytes::from(zero_token)).is_err());
     let mut trailing = golden;
     trailing.push(0);
@@ -1089,7 +1091,7 @@ fn build_schedule_golden_and_malformed_lease() {
     let key = LogicalKey::BuildSchedule(id(1));
     let mut golden = vec![0x11, 0, 0, 0, 1, b'x', 0, 0, 0, 5];
     golden.extend_from_slice(b"/bulk");
-    for n in [1_u64, 1, 1, 1, 1, 2, 1] {
+    for n in [1_u64, 1, 1, 1, 1, 1, 1, 2, 1] {
         golden.extend_from_slice(&n.to_be_bytes());
     }
     golden.extend_from_slice(&[1; 32]);
@@ -1167,4 +1169,40 @@ fn graph_envelope_golden_bounds_and_malformed_values() {
     oversize.extend_from_slice(&((GRAPH_CHUNK_BYTES + 1) as u32).to_be_bytes());
     oversize.resize(MAX_GRAPH_VALUE_BYTES + 1, 0);
     assert_corrupt(codec.decode(&chunk_key, oversize.into()));
+}
+
+#[test]
+fn fixed_configuration_round_trip_and_malformed_parameters() {
+    use ktann::api::FixedGraphConfig;
+    for (m, ef) in [(1, 8), (32_769, 32_769), (8, 7)] {
+        assert!(FixedGraphConfig::new(m, ef, [3; 32]).is_err());
+    }
+    let graph = FixedGraphConfig::new(4, 16, [3; 32]).unwrap();
+    let base = minimal_manifest();
+    let fixed = IndexManifest::new(
+        IndexLifecycle::Building,
+        id(1),
+        base.config().clone().with_fixed_graph(graph),
+        [0; 32],
+        vec![],
+    )
+    .unwrap();
+    let codec = ValueCodec::bootstrap();
+    let value = PersistentValue::IndexManifest(fixed.clone());
+    let bytes = codec.encode(&value).unwrap();
+    let key = LogicalKey::Manifest(id(1));
+    assert_eq!(decode(codec, &key, &bytes).unwrap(), value);
+    let mode = bytes.len() - 73;
+    let mut expected = vec![1];
+    expected.extend_from_slice(&4_u32.to_be_bytes());
+    expected.extend_from_slice(&16_u32.to_be_bytes());
+    expected.extend_from_slice(&[3; 32]);
+    expected.extend_from_slice(&[0; 32]);
+    assert_eq!(&bytes[mode..], expected);
+    for (offset, value) in [(mode, 2), (mode + 4, 1), (mode + 8, 3)] {
+        let mut malformed = bytes.clone();
+        malformed[offset] = value;
+        assert_corrupt(decode(codec, &key, &malformed));
+    }
+    assert_ne!(fixed.config(), base.config());
 }

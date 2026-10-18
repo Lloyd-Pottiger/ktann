@@ -205,6 +205,8 @@ pub(crate) async fn run<B: Backend>(
     let options = normalize_options(context, options).await?;
     if let Some(input) = &prepared {
         let forest_options = ForestOptions {
+            refinement_rounds: descriptor.refinement_rounds(),
+            refinement_memory_bytes: options.refinement_memory_bytes,
             sample_items: descriptor.options().sample_items,
             tree_memory_bytes: descriptor.options().memory_bytes,
             tree_scratch_bytes: descriptor.options().scratch_bytes,
@@ -379,6 +381,8 @@ async fn prepare_and_load<B: Backend>(
             .await?;
         }
         let forest_options = ForestOptions {
+            refinement_rounds: descriptor.refinement_rounds(),
+            refinement_memory_bytes: state.options.refinement_memory_bytes,
             sample_items: descriptor.options().sample_items,
             tree_memory_bytes: descriptor.options().memory_bytes,
             tree_scratch_bytes: descriptor.options().scratch_bytes,
@@ -400,6 +404,7 @@ async fn prepare_and_load<B: Backend>(
                     source.config().clone(),
                     seed,
                     forest_options.sample_items,
+                    forest_options.refinement_rounds,
                 )
             })
             .await?
@@ -410,11 +415,25 @@ async fn prepare_and_load<B: Backend>(
             let quota = state.options.max_artifact_bytes;
             let lock = lock.clone();
             let start = Instant::now();
+            let control = context.options.clone();
             let (forest, forest_report) = blocking(context, move || {
                 let _lock = lock;
                 match prepared {
-                    Some(input) => ForestArtifact::build_prepared(&path, input, seed, quota),
-                    None => ForestArtifact::build(&path, &source, seed, forest_options, quota),
+                    Some(input) => ForestArtifact::build_prepared_controlled(
+                        &path,
+                        input,
+                        seed,
+                        quota,
+                        &|| super::check_control(&control),
+                    ),
+                    None => ForestArtifact::build_controlled(
+                        &path,
+                        &source,
+                        seed,
+                        forest_options,
+                        quota,
+                        &|| super::check_control(&control),
+                    ),
                 }
             })
             .await?;
@@ -430,6 +449,7 @@ async fn prepare_and_load<B: Backend>(
             forest
         };
         let serving_options = ServingOptions {
+            graph_memory_bytes: state.options.graph_memory_bytes,
             memory_bytes: state.options.serving_memory_bytes,
             scratch_bytes: state.options.serving_scratch_bytes,
             hard_limits: state.hard_limits,
@@ -439,9 +459,18 @@ async fn prepare_and_load<B: Backend>(
         let quota = state.options.max_artifact_bytes;
         let lock = lock.clone();
         let start = Instant::now();
+        let control = context.options.clone();
         let (serving, serving_report) = blocking(context, move || {
             let _lock = lock;
-            ServingArtifact::build(&path, &input, &forest, &manifest, serving_options, quota)
+            ServingArtifact::build_controlled(
+                &path,
+                &input,
+                &forest,
+                &manifest,
+                serving_options,
+                quota,
+                &|| super::check_control(&control),
+            )
         })
         .await?;
         report.serving = start.elapsed();
