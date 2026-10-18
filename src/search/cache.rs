@@ -320,11 +320,7 @@ impl PartitionCache {
         {
             let mut inner = self.lock();
             if let Some(existing) = inner.slots.get(&key) {
-                if existing.body.epoch > body.epoch
-                    || (existing.body.epoch == body.epoch
-                        && existing.body.graph.is_some()
-                        && body.graph.is_none())
-                {
+                if existing.body.epoch > body.epoch {
                     drop(inner);
                     metrics::cache_install(kind, CacheInstallResult::SkippedStale);
                     return;

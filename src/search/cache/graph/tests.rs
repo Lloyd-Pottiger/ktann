@@ -33,7 +33,7 @@ pub(crate) async fn exercise_runtime<B: crate::storage::backend::Backend>(
     let mut expected = None;
     for _ in 0..2 {
         let graph = context
-            .read_routing_graph(
+            .read(
                 &mut fixture.txn(),
                 &fixture.manifest,
                 BodyRequest {
@@ -357,27 +357,11 @@ async fn concurrent_cold_fills_and_shared_warm_queries_survive_eviction() {
 }
 
 #[tokio::test]
-async fn restored_queries_and_exact_body_upgrade_share_centroids_for_all_metrics() {
+async fn restored_queries_match_native_search_for_all_metrics() {
     for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
         let fixture = Fixture::new(metric, 1, 1);
         let cache = PartitionCache::new(W as u64);
-        let exact = load_body(
-            &mut fixture.txn(),
-            &cache,
-            &fixture.manifest,
-            &fixture.tree,
-            pk(1),
-            &fixture.header,
-        )
-        .await
-        .unwrap();
         let loaded = fixture.load(&cache).await;
-        let (BodyEntries::Internal(a), BodyEntries::Internal(b)) =
-            (exact.entries(), loaded.body.entries())
-        else {
-            panic!()
-        };
-        assert!(Arc::ptr_eq(a, b), "upgrading does not copy centroids");
         let kernel = VectorKernel::new(3, metric, [7; 32]).unwrap();
         let parameters = fixture
             .manifest
@@ -433,22 +417,7 @@ async fn restored_queries_and_exact_body_upgrade_share_centroids_for_all_metrics
         assert_eq!(raw.scans, 0);
         let warm = warm.restore(&cache, &|| Ok(())).unwrap();
         let bytes = warm.body.bytes;
-        assert!(bytes > exact.bytes);
         assert_eq!(cache.total_bytes(), bytes);
-        cache.install(
-            CacheKey::new(
-                fixture.index(),
-                fixture.tree.clone(),
-                pk(1),
-                PartitionKind::Internal,
-            ),
-            exact,
-        );
-        assert_eq!(
-            cache.total_bytes(),
-            bytes,
-            "a racing exact fill cannot downgrade the graph"
-        );
         assert_eq!(warm.search(&query, 7, 12, &|| Ok(())).unwrap().0, actual);
     }
 }
@@ -604,7 +573,7 @@ async fn corrupt_or_cancelled_inputs_never_publish_partial_bodies() {
 }
 
 #[tokio::test]
-async fn warm_validation_rejects_changed_binding_and_exact_reads_ignore_graph_bytes() {
+async fn warm_validation_rejects_changed_binding() {
     let mut fixture = Fixture::new(Metric::L2, 1, 1);
     let cache = PartitionCache::new(W as u64);
     fixture.load(&cache).await;
@@ -629,22 +598,4 @@ async fn warm_validation_rejects_changed_binding_and_exact_reads_ignore_graph_by
         fixture.read(&cache, W, 0).await.err().unwrap().kind(),
         ErrorKind::Corruption
     );
-    for cache in [&cache, &PartitionCache::new(0)] {
-        let mut txn = fixture.txn();
-        load_body(
-            &mut txn,
-            cache,
-            &fixture.manifest,
-            &fixture.tree,
-            pk(1),
-            &fixture.header,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            txn.into_raw().gets,
-            0,
-            "exact routing never requests graph authority"
-        );
-    }
 }

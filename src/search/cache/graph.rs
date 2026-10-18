@@ -289,25 +289,27 @@ pub(crate) async fn read_graph<T: ReadOps>(
         if entries.len() != n {
             return Err(corrupt());
         }
-        if let Some(graph) = &body.graph {
-            if !graph.matches(
-                GraphSource {
-                    index,
-                    tree,
-                    parent,
-                    header,
-                    parameters,
-                },
-                &descriptor,
-            ) {
-                return Err(corrupt());
-            }
-            return Ok(GraphRead::Cached(RoutingGraph {
-                body: Arc::clone(body),
-                m: parameters.m,
-                working_bytes,
-            }));
+        let graph = body
+            .graph
+            .as_ref()
+            .expect("fixed internal cache body has a graph");
+        if !graph.matches(
+            GraphSource {
+                index,
+                tree,
+                parent,
+                header,
+                parameters,
+            },
+            &descriptor,
+        ) {
+            return Err(corrupt());
         }
+        return Ok(GraphRead::Cached(RoutingGraph {
+            body: Arc::clone(body),
+            m: parameters.m,
+            working_bytes,
+        }));
     }
     let body = read.read(txn, manifest, check).await?;
     let range = LogicalRange::graph_chunks(manifest, tree, parent)?;

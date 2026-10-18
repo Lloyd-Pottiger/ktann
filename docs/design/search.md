@@ -274,9 +274,8 @@ Fixed Indexes validate complete graph bodies.
 On a miss, the reader scans complete Child Entries and contiguous graph chunks
 from that same transaction, then restores the persisted native graph. It never
 builds a graph or changes its seed, construction parameters, adjacency or query
-distances. No partial graph body is installed. An entries-only cache body can be
-upgraded by sharing its immutable centroid allocation; the same cache key owns
-the complete body, and a racing equal-epoch exact fill cannot discard its graph.
+distances. Only complete graph bodies are installed for fixed internal partitions;
+the body and graph share one immutable centroid allocation.
 Older snapshots cannot replace newer cached epochs. Cached ownership includes
 native graph allocations, source binding, the numeric kernel's rotation schedule
 and the one shared Child Entry/centroid allocation. Eviction does not invalidate

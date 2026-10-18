@@ -8,11 +8,13 @@ use crate::storage::ReadLogicalTxn;
 use crate::storage::backend::{Backend, ReadOps};
 use crate::storage::values::IndexManifest;
 
-impl<B: Backend> OperationContext<B> {
-    /// Uses the complete query's already validated transaction; it never opens a
-    /// replacement snapshot. The caller reserves all other retained routing state
-    /// and releases/consumes each parent before requesting another graph.
-    pub(crate) async fn read_routing_graph<T: ReadOps>(
+impl<B: Backend> crate::search::cache::graph::RoutingExecution for OperationContext<B> {
+    fn checkpoint(&self) -> Result<()> {
+        self.checkpoint()
+    }
+
+    /// Loads through the query's snapshot and restores under its CPU admission.
+    async fn read<T: ReadOps>(
         &self,
         txn: &mut ReadLogicalTxn<'_, T>,
         manifest: &IndexManifest,
@@ -43,23 +45,6 @@ impl<B: Backend> OperationContext<B> {
                 .await
             }
         }
-    }
-}
-
-impl<B: Backend> crate::search::cache::graph::RoutingExecution for OperationContext<B> {
-    fn checkpoint(&self) -> Result<()> {
-        self.checkpoint()
-    }
-
-    async fn read<T: ReadOps>(
-        &self,
-        txn: &mut ReadLogicalTxn<'_, T>,
-        manifest: &IndexManifest,
-        request: BodyRequest<'_>,
-        retained_bytes: usize,
-    ) -> Result<RoutingGraph> {
-        self.read_routing_graph(txn, manifest, request, retained_bytes)
-            .await
     }
 
     async fn candidates(
