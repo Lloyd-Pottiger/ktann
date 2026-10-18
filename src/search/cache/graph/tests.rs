@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use super::*;
 use crate::api::{FixedGraphConfig, IndexConfig, LogicalIndexId};
-use crate::search::local_hnsw::{Centroids, LocalHnsw};
+use crate::search::local_hnsw::{Centroids, persistence::build_records, tests::TestGraph};
 use crate::storage::keys;
 use crate::storage::test_support::{MockReadTxn, pk};
 use crate::storage::values::expect_header;
@@ -103,18 +103,19 @@ impl Fixture {
             })
             .collect();
         let kernel = VectorKernel::new(3, metric, [7; 32]).unwrap();
-        let core = LocalHnsw::build(
+        let records = build_records(
             Centroids::new(&kernel, &children, count as usize, &|| Ok(())).unwrap(),
-            manifest.config().fixed_graph().unwrap().parameters(),
-            &tree,
-            pk(1),
+            GraphSource {
+                index: manifest.logical_index_id(),
+                tree: &tree,
+                parent: pk(1),
+                header,
+                parameters: manifest.config().fixed_graph().unwrap().parameters(),
+            },
             W,
             &|| Ok(()),
         )
         .unwrap();
-        let records = core
-            .persist(manifest.logical_index_id(), header, W, &|| Ok(()))
-            .unwrap();
         let mut fixture = Self {
             manifest,
             tree,
@@ -369,7 +370,7 @@ async fn restored_queries_match_native_search_for_all_metrics() {
             .fixed_graph()
             .unwrap()
             .parameters();
-        let core = LocalHnsw::build(
+        let core = TestGraph::build(
             Centroids::new(&kernel, &fixture.children, 32, &|| Ok(())).unwrap(),
             parameters,
             &fixture.tree,

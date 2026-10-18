@@ -132,7 +132,9 @@ pub(crate) enum BodyEntries {
     /// The decoded Leaf Entries of a leaf partition.
     Leaf(Box<[CachedLeafEntry]>),
     /// The decoded Child Entries of an internal partition.
-    Internal(Arc<[ChildEntry]>),
+    Internal(Box<[ChildEntry]>),
+    /// A complete fixed internal partition; graph and projections have one owner.
+    FixedInternal(Box<super::local_hnsw::body::FixedInternalBody>),
 }
 
 /// One immutable decoded partition body with its validation epoch.
@@ -143,7 +145,6 @@ pub(crate) struct CachedBody {
     epoch: u64,
     bytes: u64,
     entries: BodyEntries,
-    graph: Option<Box<super::local_hnsw::owned::OwnedGraph>>,
 }
 
 impl CachedBody {
@@ -165,7 +166,6 @@ impl CachedBody {
             epoch,
             bytes,
             entries: BodyEntries::Internal(entries.into()),
-            graph: None,
         }
     }
 
@@ -632,36 +632,38 @@ impl BodyRead {
         cache: &PartitionCache,
         manifest: &IndexManifest,
     ) -> Result<Arc<CachedBody>> {
-        let key = match &self {
-            Self::Cached(_) => None,
-            Self::Scan(scan) => Some(scan.key.clone()),
-        };
-        let body = self.read(txn, manifest, &|| Ok(())).await?;
-        if let Some(key) = key {
-            cache.install(key, Arc::clone(&body));
+        match self {
+            Self::Cached(body) => Ok(body),
+            Self::Scan(scan) => {
+                let key = scan.key.clone();
+                let epoch = scan.header.cache_epoch();
+                let (entries, bytes) = scan.read(txn, manifest, &|| Ok(())).await?;
+                let body = Arc::new(CachedBody {
+                    epoch,
+                    bytes,
+                    entries,
+                });
+                cache.install(key, Arc::clone(&body));
+                Ok(body)
+            }
         }
-        Ok(body)
     }
+}
 
-    /// Reads a complete body without publishing a partially validated graph load.
+impl BodyScan {
+    /// Decodes unpublished data. The caller owns validation and cache publication.
     async fn read<T: ReadOps>(
-        self,
+        self: Box<Self>,
         txn: &mut ReadLogicalTxn<'_, T>,
         manifest: &IndexManifest,
         check: &(dyn Fn() -> Result<()> + Sync),
-    ) -> Result<Arc<CachedBody>> {
-        let (key, header, range, mut first_page) = match self {
-            Self::Cached(body) => return Ok(body),
-            Self::Scan(scan) => {
-                let BodyScan {
-                    key,
-                    header,
-                    range,
-                    first_page,
-                } = *scan;
-                (key, header, range, first_page)
-            }
-        };
+    ) -> Result<(BodyEntries, u64)> {
+        let BodyScan {
+            key,
+            header,
+            range,
+            mut first_page,
+        } = *self;
         let kind = key.kind;
         let mut leaf_entries: Vec<CachedLeafEntry> = Vec::new();
         let mut child_entries: Vec<ChildEntry> = Vec::new();
@@ -710,13 +712,7 @@ impl BodyRead {
             PartitionKind::Leaf => BodyEntries::Leaf(leaf_entries.into_boxed_slice()),
             PartitionKind::Internal => BodyEntries::Internal(child_entries.into()),
         };
-        let body = Arc::new(CachedBody {
-            epoch: header.cache_epoch(),
-            bytes,
-            entries,
-            graph: None,
-        });
-        Ok(body)
+        Ok((entries, bytes))
     }
 }
 
@@ -906,7 +902,6 @@ mod tests {
             epoch,
             bytes,
             entries: BodyEntries::Leaf(entries.into_boxed_slice()),
-            graph: None,
         })
     }
 
@@ -920,7 +915,6 @@ mod tests {
             epoch,
             bytes,
             entries: BodyEntries::Internal(entries.into()),
-            graph: None,
         })
     }
 
@@ -930,7 +924,9 @@ mod tests {
                 .iter()
                 .map(|entry| entry.record_id().clone())
                 .collect(),
-            BodyEntries::Internal(_) => panic!("expected a leaf body"),
+            BodyEntries::Internal(_) | BodyEntries::FixedInternal(_) => {
+                panic!("expected a leaf body")
+            }
         }
     }
 
@@ -1368,7 +1364,9 @@ mod tests {
                 let children: Vec<u64> = entries.iter().map(|entry| entry.child().get()).collect();
                 assert_eq!(children, vec![2, 3]);
             }
-            BodyEntries::Leaf(_) => panic!("expected an internal body"),
+            BodyEntries::Leaf(_) | BodyEntries::FixedInternal(_) => {
+                panic!("expected an internal body")
+            }
         }
     }
 

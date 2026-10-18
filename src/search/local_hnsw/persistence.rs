@@ -95,122 +95,143 @@ fn corrupt() -> Error {
     Error::new(ErrorKind::Corruption)
 }
 
-impl<'a> LocalHnsw<'a> {
-    /// Freezes a built graph into KV-sized records, bound to the source Header.
-    /// The budget includes borrowed centroids, native graph, and encoding scratch.
-    pub(crate) fn persist(
-        &self,
-        index: LogicalIndexId,
-        header: PartitionHeader,
-        working_bytes: usize,
-        check: &dyn Fn() -> Result<()>,
-    ) -> Result<GraphRecords> {
-        if !header_matches(header, self.centroids.children.len()) {
-            return Err(Error::invalid_argument());
-        }
-        let available = working_bytes
-            .checked_sub(self.centroids.bytes + 1024)
-            .ok_or_else(limit)?;
-        let body = Bytes::from(controlled(check, |proceed| {
-            self.graph.encode(available, proceed)
-        })?);
-        let mut hash = Sha256::new();
-        for chunk in body.chunks(GRAPH_CHUNK_BYTES) {
-            check()?;
-            hash.update(chunk);
-        }
-        let descriptor = GraphDescriptor {
-            nodes: self.centroids.children.len() as u32,
-            epoch: header.cache_epoch(),
-            bytes: body.len() as u64,
-            binding: binding(self.identity, index, header),
-            sha256: hash.finalize().into(),
-        };
-        Ok(GraphRecords { descriptor, body })
-    }
+/// Builds and encodes one final partition without exposing an intermediate graph.
+/// Admission includes borrowed projections, native construction and encoding scratch.
+pub(crate) fn build_records(
+    centroids: Centroids<'_>,
+    source: GraphSource<'_>,
+    working_bytes: usize,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<GraphRecords> {
+    let (graph, identity) = build_graph(
+        centroids,
+        source.parameters,
+        source.tree,
+        source.parent,
+        working_bytes,
+        check,
+    )?;
+    persist_graph(
+        centroids,
+        &graph,
+        identity,
+        source.index,
+        source.header,
+        working_bytes,
+        check,
+    )
+}
 
-    /// Loads a complete ordered chunk stream. The caller must use the same
-    /// snapshot for Header, Child Entries, descriptor, and chunks, and scan the
-    /// entire chunk range so extra keys cannot be hidden by a point-read list.
-    ///
-    /// Budget charges both retained chunk input and the assembled buffer, child
-    /// projections, validation scratch, and native restore allocations. Encoding
-    /// corruption is never repaired or routed through an exact fallback.
-    pub(crate) fn restore(
-        centroids: Centroids<'a>,
-        source: GraphSource<'_>,
-        descriptor: &GraphDescriptor,
-        chunks: impl IntoIterator<Item = (u32, GraphChunk)>,
-        working_bytes: usize,
-        check: &dyn Fn() -> Result<()>,
-    ) -> Result<Self> {
-        check()?;
-        if !header_matches(source.header, centroids.children.len())
-            || source.parameters.ef_construction < source.parameters.m
-            || descriptor.nodes as usize != centroids.children.len()
-            || descriptor.epoch != source.header.cache_epoch()
-        {
-            return Err(corrupt());
-        }
-        let length = usize::try_from(descriptor.bytes).map_err(|_| corrupt())?;
-        if length < ktann_usearch::NATIVE_HEADER_BYTES
-            || length
-                > ktann_usearch::encoded_bound(centroids.children.len(), source.parameters.m)
-                    .map_err(|_| corrupt())?
-        {
-            return Err(corrupt());
-        }
-        let available = working_bytes
-            .checked_sub(centroids.bytes)
-            .and_then(|v| v.checked_sub(length + 1024))
-            .ok_or_else(limit)?;
-        if ktann_usearch::decode_bound(centroids.children.len(), source.parameters.m, length)
-            .map_err(native_error)?
-            > available
-        {
-            return Err(limit());
-        }
-        let identity = identity(
-            centroids,
-            source.parameters,
-            source.tree,
-            source.parent,
-            check,
-        )?;
-        if descriptor.binding != binding(identity, source.index, source.header) {
-            return Err(corrupt());
-        }
-        let mut body = Vec::new();
-        body.try_reserve_exact(length).map_err(|_| limit())?;
-        let mut hash = Sha256::new();
-        for (count, (ordinal, chunk)) in chunks.into_iter().enumerate() {
-            check()?;
-            if ordinal as usize != count || count >= descriptor.chunks() as usize {
-                return Err(corrupt());
-            }
-            let expected = (length - body.len()).min(GRAPH_CHUNK_BYTES);
-            if chunk.bytes().len() != expected {
-                return Err(corrupt());
-            }
-            hash.update(chunk.bytes());
-            body.extend_from_slice(chunk.bytes());
-        }
-        if body.len() != length || <[u8; 32]>::from(hash.finalize()) != descriptor.sha256 {
-            return Err(corrupt());
-        }
-        let graph = controlled(check, |proceed| {
-            ktann_usearch::Graph::decode(
-                &body,
-                centroids.children.len(),
-                source.parameters.m,
-                available,
-                proceed,
-            )
-        })?;
-        Ok(Self {
-            centroids,
-            graph,
-            identity,
-        })
+pub(super) fn persist_graph(
+    centroids: Centroids<'_>,
+    graph: &ktann_usearch::Graph,
+    identity: [u8; 32],
+    index: LogicalIndexId,
+    header: PartitionHeader,
+    working_bytes: usize,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<GraphRecords> {
+    if !header_matches(header, centroids.children.len()) {
+        return Err(Error::invalid_argument());
     }
+    let available = working_bytes
+        .checked_sub(centroids.bytes + 1024)
+        .ok_or_else(limit)?;
+    let body = Bytes::from(controlled(check, |proceed| {
+        graph.encode(available, proceed)
+    })?);
+    let mut hash = Sha256::new();
+    for chunk in body.chunks(GRAPH_CHUNK_BYTES) {
+        check()?;
+        hash.update(chunk);
+    }
+    let descriptor = GraphDescriptor {
+        nodes: centroids.children.len() as u32,
+        epoch: header.cache_epoch(),
+        bytes: body.len() as u64,
+        binding: binding(identity, index, header),
+        sha256: hash.finalize().into(),
+    };
+    Ok(GraphRecords { descriptor, body })
+}
+
+/// Loads a complete ordered chunk stream. The caller must use the same
+/// snapshot for Header, Child Entries, descriptor, and chunks, and scan the
+/// entire chunk range so extra keys cannot be hidden by a point-read list.
+///
+/// Budget charges both retained chunk input and the assembled buffer, child
+/// projections, validation scratch, and native restore allocations. Encoding
+/// corruption is never repaired or routed through an exact fallback.
+pub(super) fn restore_graph(
+    centroids: Centroids<'_>,
+    source: GraphSource<'_>,
+    descriptor: &GraphDescriptor,
+    chunks: impl IntoIterator<Item = (u32, GraphChunk)>,
+    working_bytes: usize,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<(ktann_usearch::Graph, [u8; 32])> {
+    check()?;
+    if !header_matches(source.header, centroids.children.len())
+        || source.parameters.ef_construction < source.parameters.m
+        || descriptor.nodes as usize != centroids.children.len()
+        || descriptor.epoch != source.header.cache_epoch()
+    {
+        return Err(corrupt());
+    }
+    let length = usize::try_from(descriptor.bytes).map_err(|_| corrupt())?;
+    if length < ktann_usearch::NATIVE_HEADER_BYTES
+        || length
+            > ktann_usearch::encoded_bound(centroids.children.len(), source.parameters.m)
+                .map_err(|_| corrupt())?
+    {
+        return Err(corrupt());
+    }
+    let available = working_bytes
+        .checked_sub(centroids.bytes)
+        .and_then(|v| v.checked_sub(length + 1024))
+        .ok_or_else(limit)?;
+    if ktann_usearch::decode_bound(centroids.children.len(), source.parameters.m, length)
+        .map_err(native_error)?
+        > available
+    {
+        return Err(limit());
+    }
+    let identity = identity(
+        centroids,
+        source.parameters,
+        source.tree,
+        source.parent,
+        check,
+    )?;
+    if descriptor.binding != binding(identity, source.index, source.header) {
+        return Err(corrupt());
+    }
+    let mut body = Vec::new();
+    body.try_reserve_exact(length).map_err(|_| limit())?;
+    let mut hash = Sha256::new();
+    for (count, (ordinal, chunk)) in chunks.into_iter().enumerate() {
+        check()?;
+        if ordinal as usize != count || count >= descriptor.chunks() as usize {
+            return Err(corrupt());
+        }
+        let expected = (length - body.len()).min(GRAPH_CHUNK_BYTES);
+        if chunk.bytes().len() != expected {
+            return Err(corrupt());
+        }
+        hash.update(chunk.bytes());
+        body.extend_from_slice(chunk.bytes());
+    }
+    if body.len() != length || <[u8; 32]>::from(hash.finalize()) != descriptor.sha256 {
+        return Err(corrupt());
+    }
+    let graph = controlled(check, |proceed| {
+        ktann_usearch::Graph::decode(
+            &body,
+            centroids.children.len(),
+            source.parameters.m,
+            available,
+            proceed,
+        )
+    })?;
+    Ok((graph, identity))
 }

@@ -274,12 +274,13 @@ Fixed Indexes validate complete graph bodies.
 On a miss, the reader scans complete Child Entries and contiguous graph chunks
 from that same transaction, then restores the persisted native graph. It never
 builds a graph or changes its seed, construction parameters, adjacency or query
-distances. Only complete graph bodies are installed for fixed internal partitions;
-the body and graph share one immutable centroid allocation.
-Older snapshots cannot replace newer cached epochs. Cached ownership includes
-native graph allocations, source binding, the numeric kernel's rotation schedule
-and the one shared Child Entry/centroid allocation. Eviction does not invalidate
-handles still held by queries.
+distances. A fixed internal body owns its Child Entries, native graph, source
+binding, and numeric kernel together. The cache distinguishes leaf, ordinary
+internal, and fixed internal bodies; a fixed body cannot omit its graph.
+Cold reads retain unpublished entries and chunks until restoration succeeds,
+then publish one complete shared body. No entries-only cache object is created
+for a fixed internal partition. Older snapshots cannot replace newer cached
+epochs. Eviction does not invalidate handles still held by queries.
 
 `RuntimeConfig::routing_working_bytes` (default 256 MiB) bounds one query's graph
 routing work independently of retained cache capacity. Before loading entries or

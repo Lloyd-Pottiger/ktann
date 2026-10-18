@@ -200,8 +200,11 @@ The algorithm contract is:
 
 `Centroids` validates dimensions and finite values through the numeric kernel,
 without computing a distance, and checks capacity and canonical keys once at
-the borrowed-view boundary. Its `LocalHnsw` binding cannot outlive
-those vectors. `Graph` itself owns only topology and exposes entry, level and
+the borrowed-view boundary. Bulk construction consumes that view synchronously
+and returns only encoded graph records; callers do not retain a borrowed graph
+or sequence separate build and persistence operations. Restoration returns a
+complete fixed internal body that owns its projections, numeric kernel and
+validated graph. `Graph` itself owns only topology and exposes entry, level and
 bounded adjacency inspection; no Rust references or callbacks survive an FFI
 call. Immutable graphs support concurrent queries with separate workspaces.
 
@@ -567,7 +570,7 @@ layout/centroids when comparing internal grouping; no rerank-budget sweeps.
 
 The graph format and snapshot reader implement the source and resource contracts
 above. [Search](search.md#fixed-index-graph-bodies) owns graph-cache admission,
-shared centroid ownership, and the explicit loading/query interfaces. Candidate
+complete fixed-body ownership, and the explicit loading/query interfaces. Candidate
 generation must supply the existing query snapshot, reserve query-wide retained
 state, consume one parent at a time, and merge the returned child identities and
 unmodified routing distances under the existing global beam and budgets. This
