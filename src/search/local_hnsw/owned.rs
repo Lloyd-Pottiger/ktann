@@ -70,7 +70,22 @@ impl OwnedGraph {
         size_of::<Self>() + 32 + self.kernel.heap_bytes() + self.graph.resident_bytes()
     }
 
-    /// Executes the same query implementation as the borrowed construction core.
+    /// Exact baseline over the same validated centroid allocation.
+    pub(crate) fn exact(
+        &self,
+        query: &[f32],
+        beam: usize,
+        working_bytes: usize,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Vec<Candidate>> {
+        Centroids {
+            kernel: &self.kernel,
+            children: &self.children,
+            bytes: self.centroid_bytes,
+        }
+        .exact(query, beam, working_bytes, check)
+    }
+
     /// Admission by the owning reader includes the kernel, body and all query state.
     pub(crate) fn search(
         &self,

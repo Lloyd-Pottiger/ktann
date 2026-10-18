@@ -12,13 +12,6 @@
 //! internal bodies; write transactions must never publish read-your-writes
 //! bodies (ADR 0023).
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "explicit graph reads are wired into traversal in step seven"
-    )
-)]
 pub(crate) mod graph;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -582,10 +575,10 @@ impl CacheInner {
 pub(super) const BODY_PREFETCH_BATCH: usize = 4;
 
 /// The snapshot authority for a body read.
-pub(super) struct BodyRequest<'a> {
-    pub(super) tree_key: &'a TreeKey,
-    pub(super) partition: PartitionKey,
-    pub(super) header: &'a PartitionHeader,
+pub(crate) struct BodyRequest<'a> {
+    pub(crate) tree_key: &'a TreeKey,
+    pub(crate) partition: PartitionKey,
+    pub(crate) header: &'a PartitionHeader,
 }
 
 /// A validated cache hit or a body with an optional prefetched first page.
@@ -811,7 +804,7 @@ fn leaf_entry_bytes(entry: &CachedLeafEntry) -> u64 {
     bytes
 }
 
-fn field_bytes(field: &Value) -> u64 {
+pub(super) fn field_bytes(field: &Value) -> u64 {
     let payload = match field {
         Value::String(value) => value.len(),
         _ => 0,

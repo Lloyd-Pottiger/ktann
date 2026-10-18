@@ -89,6 +89,7 @@ impl<'a> Centroids<'a> {
     }
 
     /// Maps a result ordinal to the authoritative child Partition Key.
+    #[cfg(test)]
     pub(crate) fn child(self, candidate: Candidate) -> PartitionKey {
         self.children[candidate.node as usize].child()
     }
@@ -214,6 +215,7 @@ impl<'a> LocalHnsw<'a> {
     ///
     /// `ef` is clipped before allocation. When beam covers all nodes, the bridge
     /// scans and sorts once. No per-parent beam division or adaptive retry.
+    #[cfg(test)]
     pub(crate) fn search(
         &self,
         query: &[f32],

@@ -74,6 +74,13 @@ impl PreparedSearch {
     ) -> Result<Self> {
         let config = manifest.config();
         let budgets = request.validate(config.dimension(), config.fields(), defaults)?;
+        if matches!(
+            request.options().routing_mode(),
+            crate::api::RoutingMode::PartitionLocalHnsw { .. }
+        ) && config.fixed_graph().is_none()
+        {
+            return Err(Error::invalid_argument());
+        }
         let leaf_beam = request.options().resolved_leaf_beam_size();
         let kernel = VectorKernel::new(
             config.dimension(),
@@ -147,7 +154,9 @@ pub(crate) async fn search<B: Backend>(
             prepared.request.k(),
             prepared.budgets,
             prepared.leaf_beam,
-        )?,
+        )?
+        .with_routing_mode(prepared.request.options().routing_mode()),
+        context,
     )
     .await?;
     context.checkpoint()?;

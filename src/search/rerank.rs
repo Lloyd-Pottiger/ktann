@@ -52,6 +52,20 @@ impl LeafCandidate {
         }
     }
 
+    /// Conservative retained heap charge; shared byte payloads are charged per owner.
+    pub(crate) fn heap_bytes(&self) -> Result<usize> {
+        let bytes = self
+            .fields
+            .iter()
+            .try_fold(128_u64, |bytes, field| {
+                bytes.checked_add(super::cache::field_bytes(field))
+            })
+            .and_then(|bytes| bytes.checked_add(self.record_id.len() as u64))
+            .and_then(|bytes| bytes.checked_add(self.location.tree_key().as_bytes().len() as u64))
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+        usize::try_from(bytes).map_err(|_| Error::new(ErrorKind::LimitExceeded))
+    }
+
     /// Returns the Record ID, the deterministic final tie-breaker.
     pub(crate) const fn record_id(&self) -> &Bytes {
         &self.record_id

@@ -34,8 +34,8 @@ pub use record::{PayloadProjection, Record, StoredRecord};
 pub use refine::RefineOptions;
 pub use schema::{CompareOp, DataType, FieldSchema, Metric, Predicate, SynopsisConfig, Value};
 pub use search::{
-    SearchBudgetExhaustion, SearchBudgetUsage, SearchBudgets, SearchHit, SearchOptions,
-    SearchOutcome, SearchRequest,
+    RoutingMode, SearchBudgetExhaustion, SearchBudgetUsage, SearchBudgets, SearchHit,
+    SearchOptions, SearchOutcome, SearchRequest,
 };
 pub use verify::{
     VerifyIssue, VerifyIssueKind, VerifyObjectCounts, VerifyOptions, VerifyPartitionStateCounts,

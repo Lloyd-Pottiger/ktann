@@ -5,6 +5,7 @@ use crate::api::{FixedGraphConfig, IndexConfig, LogicalIndexId};
 use crate::search::local_hnsw::{Centroids, LocalHnsw};
 use crate::storage::keys;
 use crate::storage::test_support::{MockReadTxn, pk};
+use crate::storage::values::expect_header;
 use crate::storage::values::{IndexLifecycle, ValueCodec};
 
 const W: usize = 16 * 1024 * 1024;
@@ -35,13 +36,21 @@ pub(crate) async fn exercise_runtime<B: crate::storage::backend::Backend>(
             .read_routing_graph(
                 &mut fixture.txn(),
                 &fixture.manifest,
-                &fixture.tree,
-                pk(1),
+                BodyRequest {
+                    tree_key: &fixture.tree,
+                    partition: pk(1),
+                    header: &fixture.header,
+                },
                 1024,
             )
             .await?;
-        let (hits, _) = context
-            .search_routing_graph(graph, vec![0.3, 0.1, 0.2], 7, 12)
+        let hits = context
+            .candidates(
+                graph,
+                vec![0.3, 0.1, 0.2],
+                7,
+                crate::api::RoutingMode::PartitionLocalHnsw { ef_search: 12 },
+            )
             .await?;
         if let Some(expected) = &expected {
             assert_eq!(&hits, expected);
@@ -159,12 +168,25 @@ impl Fixture {
         limit: usize,
         retained: usize,
     ) -> Result<GraphRead> {
+        let mut txn = self.txn();
+        let header = expect_header(
+            txn.get(LogicalKey::Header {
+                index: self.index(),
+                tree_key: self.tree.clone(),
+                partition: pk(1),
+            })
+            .await?,
+        )?
+        .ok_or_else(corrupt)?;
         read_graph(
-            &mut self.txn(),
+            &mut txn,
             cache,
             &self.manifest,
-            &self.tree,
-            pk(1),
+            BodyRequest {
+                tree_key: &self.tree,
+                partition: pk(1),
+                header: &header,
+            },
             limit,
             retained,
             &|| Ok(()),
@@ -231,8 +253,11 @@ async fn pagination_and_snapshot_expiry_never_publish_partial_graphs() {
             &mut txn,
             &cache,
             &fixture.manifest,
-            &fixture.tree,
-            pk(1),
+            BodyRequest {
+                tree_key: &fixture.tree,
+                partition: pk(1),
+                header: &fixture.header,
+            },
             W,
             0,
             &|| Ok(()),
@@ -388,8 +413,11 @@ async fn restored_queries_and_exact_body_upgrade_share_centroids_for_all_metrics
             &mut txn,
             &cache,
             &fixture.manifest,
-            &fixture.tree,
-            pk(1),
+            BodyRequest {
+                tree_key: &fixture.tree,
+                partition: pk(1),
+                header: &fixture.header,
+            },
             W,
             0,
             &|| Ok(()),
@@ -399,8 +427,8 @@ async fn restored_queries_and_exact_body_upgrade_share_centroids_for_all_metrics
         assert!(matches!(warm, GraphRead::Cached(_)));
         let raw = txn.into_raw();
         assert_eq!(
-            raw.gets, 2,
-            "warm reads still validate Header and descriptor"
+            raw.gets, 1,
+            "warm graph reads validate the descriptor using the caller's snapshot Header"
         );
         assert_eq!(raw.scans, 0);
         let warm = warm.restore(&cache, &|| Ok(())).unwrap();

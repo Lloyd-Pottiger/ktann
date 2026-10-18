@@ -1,4 +1,4 @@
-//! Explicit snapshot reads for fixed-index graphs. Exact routing never calls this path.
+//! Snapshot-bound fixed-index bodies shared by exact and graph routing.
 
 use super::*;
 use crate::api::Metric;
@@ -8,6 +8,26 @@ use crate::search::local_hnsw::{
 use crate::search::numeric::VectorKernel;
 use crate::storage::keys::LogicalKey;
 use crate::storage::values::{GRAPH_CHUNK_BYTES, GraphChunk, GraphDescriptor, PartitionState};
+
+/// Runtime execution boundary: one snapshot, bounded owned CPU work and control.
+/// Traversal owns candidate selection; the runtime owns admission and dispatch.
+pub(crate) trait RoutingExecution {
+    fn checkpoint(&self) -> Result<()>;
+    async fn read<T: ReadOps>(
+        &self,
+        txn: &mut ReadLogicalTxn<'_, T>,
+        manifest: &IndexManifest,
+        request: BodyRequest<'_>,
+        retained_bytes: usize,
+    ) -> Result<RoutingGraph>;
+    async fn candidates(
+        &self,
+        graph: RoutingGraph,
+        query: Vec<f32>,
+        beam: usize,
+        mode: crate::api::RoutingMode,
+    ) -> Result<Vec<(PartitionKey, f64)>>;
+}
 
 /// An admitted complete snapshot read, ready for CPU restoration outside the executor.
 pub(crate) enum GraphRead {
@@ -40,6 +60,49 @@ pub(crate) struct RoutingGraph {
 }
 
 impl RoutingGraph {
+    /// Complete children, including those the local algorithm will not select.
+    pub(crate) fn children(&self) -> &[ChildEntry] {
+        let BodyEntries::Internal(entries) = &self.body.entries else {
+            unreachable!("validated internal graph")
+        };
+        entries
+    }
+
+    /// Exact routing still requires the validated graph body, but ignores adjacency.
+    pub(crate) fn exact(
+        self,
+        query: &[f32],
+        beam: usize,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Vec<(PartitionKey, f64)>> {
+        let hits = self
+            .body
+            .graph
+            .as_ref()
+            .expect("validated graph body")
+            .exact(query, beam, self.working_bytes, check)?;
+        self.map_candidates(hits, check)
+    }
+
+    /// Maps core ordinals without changing their scores or ordering.
+    fn map_candidates(
+        &self,
+        hits: Vec<Candidate>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Vec<(PartitionKey, f64)>> {
+        let entries = self.children();
+        let mut output = Vec::new();
+        output.try_reserve_exact(hits.len()).map_err(|_| limit())?;
+        for (ordinal, Candidate { node, distance }) in hits.into_iter().enumerate() {
+            if ordinal % 64 == 0 {
+                check()?;
+            }
+            output.push((entries[node as usize].child(), distance));
+        }
+        check()?;
+        Ok(output)
+    }
+
     /// Native query work; invoke only inside an admitted blocking task. Scratch is
     /// private to this query, while all concurrent queries share immutable topology.
     pub(crate) fn search(
@@ -50,9 +113,7 @@ impl RoutingGraph {
         check: &(dyn Fn() -> Result<()> + Sync),
     ) -> Result<(Vec<(PartitionKey, f64)>, ktann_usearch::Stats)> {
         check()?;
-        let BodyEntries::Internal(entries) = &self.body.entries else {
-            unreachable!("graph body")
-        };
+        let entries = self.children();
         let graph = self.body.graph.as_ref().expect("validated graph body");
         let available = self
             .working_bytes
@@ -61,15 +122,7 @@ impl RoutingGraph {
         let mut scratch = Workspace::new(entries.len(), self.m, available).map_err(native_error)?;
         let (hits, stats) =
             graph.search(query, beam, ef, self.working_bytes, &mut scratch, check)?;
-        let mut children = Vec::new();
-        children
-            .try_reserve_exact(hits.len())
-            .map_err(|_| limit())?;
-        for Candidate { node, distance } in hits {
-            children.push((entries[node as usize].child(), distance));
-        }
-        check()?;
-        Ok((children, stats))
+        Ok((self.map_candidates(hits, check)?, stats))
     }
 }
 
@@ -139,16 +192,11 @@ impl GraphLoad {
 
 /// Reads authority and complete input from the caller's existing snapshot.
 /// Cache warmth never affects admission; missing graph data is Corruption.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "snapshot identity and explicit operation resource/control inputs"
-)]
 pub(crate) async fn read_graph<T: ReadOps>(
     txn: &mut ReadLogicalTxn<'_, T>,
     cache: &PartitionCache,
     manifest: &IndexManifest,
-    tree: &TreeKey,
-    parent: PartitionKey,
+    request: BodyRequest<'_>,
     working_bytes: usize,
     retained_bytes: usize,
     check: &(dyn Fn() -> Result<()> + Sync),
@@ -160,16 +208,12 @@ pub(crate) async fn read_graph<T: ReadOps>(
         .ok_or_else(Error::invalid_argument)?
         .parameters();
     let index = manifest.logical_index_id();
-    let Some(PersistentValue::PartitionHeader(header)) = txn
-        .get(LogicalKey::Header {
-            index,
-            tree_key: tree.clone(),
-            partition: parent,
-        })
-        .await?
-    else {
-        return Err(corrupt());
-    };
+    let BodyRequest {
+        tree_key: tree,
+        partition: parent,
+        header,
+    } = request;
+    let header = *header;
     if header.level() <= 1
         || header.state() != PartitionState::Ready
         || header.entry_count() == 0
