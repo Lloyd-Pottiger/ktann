@@ -1,9 +1,10 @@
 # Partition-local HNSW: fixed Bulk Build contract
 
-Status: contract decided; independent capacities implemented; HNSW pending. This document owns the first,
+Status: contract, independent capacities, and standalone local HNSW core implemented.
+Persistence and serving integration are pending. This document owns the first,
 fixed-index stage of [issue #195](https://github.com/Lloyd-Pottiger/ktann/issues/195).
-It specifies the required end state. Only the independent capacity prerequisite
-is implemented; the fixed-index and graph contracts remain pending.
+It specifies the required end state. The fixed-index lifecycle, graph storage,
+and production traversal contracts remain pending.
 [Search](search.md), [Storage](storage.md), and [Bulk Build](bulk-build.md) retain
 ownership of their shared contracts. Subsequent implementation must update those
 contracts and their tests as the feature lands.
@@ -40,8 +41,9 @@ These are current implementation facts, not completed feature work:
 
 | Existing owner | Verified behavior and implication |
 | --- | --- |
-| [`IndexConfig`](../../src/api/config.rs) | One min/max pair currently governs both levels; maximum is capped at 65,536. It cannot yet express independent leaf/internal capacities or fixed mode. |
-| [`construct_tree`, `ConstructionOptions`](../../src/construction.rs) | Bottom-up construction uses the same pair at every level, including the root-fit decision. Memory admission reserves sample, centroid and row buffers; caller-retained output is excluded. |
+| [`IndexConfig`](../../src/api/config.rs) | Independent leaf/internal min/max pairs are implemented; each maximum is capped at 65,536. Fixed mode is not implemented. |
+| [`construct_tree`, `ConstructionOptions`](../../src/construction.rs) | Bottom-up construction selects capacities by level, including root-fit. Memory admission reserves sample, centroid and row buffers; caller-retained output is excluded. |
+| [`local_hnsw`](../../src/search/local_hnsw.rs), [`ktann-usearch`](../../ktann-usearch/README.md) | Standalone graph construction, search, exact local top-k, structural inspection, and reusable bounded scratch are implemented. No production caller selects this path yet. |
 | [`ForestArtifact`](../../src/bulk/forest.rs), [`ServingArtifact`](../../src/bulk/serving.rs) | Forest plans bind source/configuration/rotation/sample size. Serving preparation proves exact joins and emits canonical values; no graph or refinement stage exists. |
 | [`refine::run`, `plan`](../../src/runtime/refine.rs) | Existing Offline Refinement reads an Active index, plans in memory, commits member moves in batches, then replaces non-root centroids. Even zero rounds recomputes centroids. Failure can leave a valid partially refined index. |
 | [`update_centroid`](../../src/storage/topology.rs) | Atomically replaces the partition centroid and incoming Child Entry, advancing the parent's body cache epoch. It does not update a graph. |
@@ -132,14 +134,95 @@ and `B` the target next-level beam. Clip to `n` before allocating. No calibratio
 or automatic retry increases `ef_search` in this stage. Maximum node count comes
 from the configured internal capacity, within the checked index format cap.
 
-Use `VectorKernel` routing preprocessing and f64 distance semantics for graph
-construction and search: squared L2, negated dot product for cosine and inner
-product, with Partition Key ties. Do not substitute cosine distance or normalized
-vectors for inner product. Graph construction order and derived per-partition
+Use the existing `VectorKernel` routing scores for graph construction and
+search: squared L2, negated dot product for cosine and inner product, with
+Partition Key ties. The core borrows already-preprocessed vectors and does not
+normalize them. Graph construction order and derived per-partition
 seed are deterministic from the configured seed, canonical Tree Key and
 Partition Key; rebuilding the same accepted inputs must produce identical bytes.
 Construction may parallelize only if it preserves this property and its declared
 resource bounds. The first implementation constructs one graph at a time.
+
+### 4.1 Local core algorithm and USearch integration
+
+The implementation reuses USearch 2.26.4's C++ `index_gt<double>`, through the
+private `ktann-usearch` crate. The official Rust dense interface returns f32
+distances, copies vectors, and does not expose seed or level-cap controls.
+Finite accepted KTANN inputs near `1e20` can overflow its scores; subtracting
+one from its `1-dot` representation does not fix overflow. Its cosine metric
+also renormalizes inputs and treats two zero vectors differently from KTANN
+routing. The chosen generic graph calls the existing Rust kernel directly and
+retains the returned f64 scores. This preserves the supported input range and
+cross-parent score comparability without candidate distance recomputation or
+an additional f32-to-f64 reranking stage. The bridge does not enable fast-math.
+
+The algorithm contract is:
+
+- Require canonical strictly increasing Child Entry Partition Keys; reject
+  duplicate or noncanonical input. Dense u32 ordinals follow that order. Build
+  serially in ordinal order and retain no centroid copies in the native graph.
+- Require `2 <= M <= 32768` and `ef_construction >= M`. Layer zero has at most
+  `2*M` outgoing edges; upper layers have at most `M`. Actual degree also cannot
+  exceed the number of other nodes. Clip construction exploration to the node
+  count, preserving the supplied quality parameters as identity inputs.
+- Derive the per-partition u64 seed from the first eight bytes, little-endian,
+  of SHA-256 over `b"ktann/local-hnsw/v1\0"`, the 32-byte configured seed,
+  little-endian u64 canonical Tree Key byte length, those bytes, and the
+  little-endian u64 parent Partition Key.
+- Sample levels from a fixed SplitMix64 stream. For each node, start at zero;
+  promote while the next word is below `floor(2^64/M)`, stopping at level 16.
+  No further word is consumed at the cap. This gives seventeen finite layers
+  and avoids platform-dependent random distributions and logarithms. The
+  stream constants and operations are recorded in the vendored patch.
+- Preserve USearch's best-first construction and diversity neighbor selection:
+  consider candidates by distance/key; a candidate is discarded when an
+  already-selected neighbor is strictly closer to it than the insertion
+  distance. Reverse lists use the same bounded pruning. Do not force metric
+  properties that inner product lacks. Candidate heaps, greedy improvements,
+  and equal-distance admission use ordinal ties, equivalent to Partition Key
+  ties; signed zeros compare equal.
+- Audit directed layer-zero reachability from the entry point. Only if it is
+  incomplete, add the canonical cycle `i -> (i+1) mod n`, preserving an existing
+  successor edge and replacing the last edge when a list is full. This changes
+  at most one outgoing edge per node, respects `2*M`, and ensures reachability.
+  Native pruning alone failed this requirement on a repeated-centroid fixture.
+  Report whether repair was needed; it is part of construction, never query
+  fallback or adaptive expansion. Empty/singleton graphs need no cycle.
+- Search uses the full requested local beam and clipped effective ef. Native
+  query scratch is separate from immutable topology. It is reserved once and
+  reusable across parents and queries; successful searches do not grow its
+  allocations. Candidate output is O(min(n, B)). The exhaustive `B >= n` case
+  scores each node once and sorts the output in O(n log n); exact local top-k
+  is also independently callable without constructing a graph.
+
+`Centroids` validates dimensions and finite values through the numeric kernel,
+without computing a distance, and checks capacity and canonical keys once at
+the borrowed-view boundary. Its `LocalHnsw` binding cannot outlive
+those vectors. `Graph` itself owns only topology and exposes entry, level and
+bounded adjacency inspection; no Rust references or callbacks survive an FFI
+call. Immutable graphs support concurrent queries with separate workspaces.
+
+Before construction, admit a checked upper bound including borrowed centroids,
+all nodes at the maximum level, adjacency, locks and construction scratch.
+Native allocations enforce a separate charged-byte ceiling, including alignment
+and an allocator-overhead allowance. The graph reports resident and peak charged
+bytes; these are not process RSS measurements. Query admission includes the
+borrowed body, retained graph, the complete reusable workspace, query vector and
+bounded result buffers: one output buffer for graph search, and a heap plus
+output for the independent exact selector. Neighbor-pruning scratch is allocated
+only for construction. Workspace counters distinguish retained bytes from total
+allocation events. Allocation failure returns `LimitExceeded`; it never changes
+M or ef. Encoding buffers and publication IO remain owned by the later storage
+integration.
+
+Operation control is checked during input validation, between inserted nodes,
+at most every 64 distance calls, and during reachability and result loops.
+Cancellation unwinds native frames before returning the original KTANN error;
+no partial candidate list is published. Visited state prevents repeated scoring
+in best-first construction and base-layer query exploration. Upper-layer greedy
+traversal can rescore a node, but each move strictly improves the distance/key
+pair. Finite node, layer and degree limits bound work;
+allocation admission does not promise a latency bound for extreme parameters.
 
 ## 5. Preparation, refinement, loading and publication
 
@@ -279,8 +362,8 @@ Child Entry check for all children in each exposed parent, including children
 not selected by HNSW or local exact top-B. Its query-wide identity set counts
 against routing working memory. This retains an O(exposed child count) check
 even on warm graph hits; include its CPU/memory cost in end-to-end measurements.
-Distances for returned nodes are recomputed/retained using the exact routing
-kernel and ordered by distance then Partition Key.
+Distances returned by the local core are retained from its routing-kernel
+evaluations and ordered by distance then Partition Key, without recomputation.
 
 Every admitted parent at a given tree/depth contributes before the next depth
 selects its single global beam. Bound each tree/depth candidate container by `B`
@@ -298,8 +381,9 @@ children is a deterministic exhaustive case, independent of cache warmth; the
 fixed body still requires valid persisted graph data.
 
 Exploration has explicit finite bounds from `n`, bounded levels/degrees and
-`effective_ef`. Visited state prevents repeated node evaluation within a level;
-heap storage and stale entries must also be bounded. Check operation control
+`effective_ef`. Upper-layer greedy moves strictly improve distance/key; visited
+state prevents repeated node evaluation during base-layer exploration. Heap
+storage and stale entries must also be bounded. Check operation control
 between bounded work batches. The first stage adds no silently truncating graph
 budget: inability to allocate the admitted working set is `LimitExceeded`, and
 cancellation/deadline is an error, not an unexplained shorter candidate list.
@@ -417,9 +501,10 @@ experimental inputs, not defaults. Independent sizing must preserve a fixed leaf
 layout/centroids when comparing internal grouping; no rerank-budget sweeps.
 
 There is no unresolved lifecycle or ownership decision blocking capacity work.
-The later graph implementation must specify canonical codec tags, deterministic
-HNSW algorithm details and finite level bounds before persisting bytes, update
-the owning storage and artifact contracts and verify the working-set estimates. These are required implementation deliverables;
+The persistence implementation must specify canonical codec tags and chunk
+framing for the graph structure defined above, update the owning storage and
+artifact contracts, and verify the complete loading/encoding working-set
+estimates. These are required implementation deliverables;
 this document does not claim a performance or 100M/10B feasibility result.
 Production parameter choices and dynamic maintenance remain deferred. There is
 no stable release requiring compatibility machinery or migration of old builds.

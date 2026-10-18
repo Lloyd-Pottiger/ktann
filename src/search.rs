@@ -5,6 +5,14 @@
 //! RaBitQ selects approximate candidates before exact Vector Record reranking.
 
 pub(crate) mod cache;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "standalone local graph core; production traversal is a later step"
+    )
+)]
+pub(crate) mod local_hnsw;
 pub(crate) mod numeric;
 pub(crate) mod plan;
 pub(crate) mod predicate;
