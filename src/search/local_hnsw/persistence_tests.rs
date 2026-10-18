@@ -57,7 +57,7 @@ fn snapshot_roundtrip_preserves_topology_scores_and_queries() {
                 graph.centroids,
                 source(&tree(), n),
                 &encoded.descriptor,
-                encoded.chunks().map(Ok),
+                encoded.chunks(),
                 MEMORY,
                 &|| Ok(()),
             )
@@ -148,7 +148,7 @@ fn source_binding_covers_identity_header_configuration_and_centroids() {
                 graph.centroids,
                 source,
                 &encoded.descriptor,
-                encoded.chunks().map(Ok),
+                encoded.chunks(),
                 MEMORY,
                 &|| Ok(())
             )
@@ -169,7 +169,7 @@ fn source_binding_covers_identity_header_configuration_and_centroids() {
                 view,
                 expected,
                 &encoded.descriptor,
-                encoded.chunks().map(Ok),
+                encoded.chunks(),
                 MEMORY,
                 &|| Ok(())
             )
@@ -185,7 +185,7 @@ fn source_binding_covers_identity_header_configuration_and_centroids() {
             view,
             expected,
             &encoded.descriptor,
-            encoded.chunks().map(Ok),
+            encoded.chunks(),
             MEMORY,
             &|| Ok(())
         )
@@ -243,7 +243,7 @@ fn numbered_chunks_are_bounded_complete_and_integrity_checked() {
                 graph.centroids,
                 source(&tree(), rows.len()),
                 &encoded.descriptor,
-                chunks.into_iter().map(Ok),
+                chunks,
                 MEMORY,
                 &|| Ok(())
             )
@@ -256,7 +256,7 @@ fn numbered_chunks_are_bounded_complete_and_integrity_checked() {
         graph.centroids,
         source(&tree(), rows.len()),
         &encoded.descriptor,
-        chunks.into_iter().map(Ok),
+        chunks,
         MEMORY,
         &|| Ok(()),
     )
@@ -274,7 +274,7 @@ fn numbered_chunks_are_bounded_complete_and_integrity_checked() {
             graph.centroids,
             source(&tree(), rows.len()),
             &encoded.descriptor,
-            encoded.chunks().map(Ok),
+            encoded.chunks(),
             0,
             &|| Ok(())
         )
@@ -287,7 +287,7 @@ fn numbered_chunks_are_bounded_complete_and_integrity_checked() {
             graph.centroids,
             source(&tree(), rows.len()),
             &encoded.descriptor,
-            encoded.chunks().map(Ok),
+            encoded.chunks(),
             MEMORY,
             &|| Err(Error::new(ErrorKind::Cancelled))
         )
@@ -420,7 +420,7 @@ async fn typed_snapshot_scan_restores_a_usable_body() {
             ..source(&tree(), rows.len())
         },
         &descriptor,
-        chunks.into_iter().map(Ok),
+        chunks,
         MEMORY,
         &|| Ok(()),
     )

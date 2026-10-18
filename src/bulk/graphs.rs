@@ -345,7 +345,7 @@ mod tests {
                             parameters: index.config().fixed_graph().unwrap().parameters(),
                         },
                         &body.descriptor.unwrap(),
-                        body.chunks.into_iter().map(Ok),
+                        body.chunks,
                         budget,
                         &|| Ok(()),
                     )

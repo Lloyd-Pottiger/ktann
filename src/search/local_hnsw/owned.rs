@@ -37,14 +37,8 @@ impl OwnedGraph {
                 }
             })?;
         let centroid_bytes = centroids.bytes;
-        let restored = LocalHnsw::restore(
-            centroids,
-            source,
-            &descriptor,
-            chunks.into_iter().map(Ok),
-            working_bytes,
-            check,
-        )?;
+        let restored =
+            LocalHnsw::restore(centroids, source, &descriptor, chunks, working_bytes, check)?;
         let LocalHnsw {
             graph, identity, ..
         } = restored;

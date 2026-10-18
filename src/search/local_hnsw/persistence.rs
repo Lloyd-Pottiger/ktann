@@ -140,7 +140,7 @@ impl<'a> LocalHnsw<'a> {
         centroids: Centroids<'a>,
         source: GraphSource<'_>,
         descriptor: &GraphDescriptor,
-        chunks: impl IntoIterator<Item = Result<(u32, GraphChunk)>>,
+        chunks: impl IntoIterator<Item = (u32, GraphChunk)>,
         working_bytes: usize,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<Self> {
@@ -183,11 +183,9 @@ impl<'a> LocalHnsw<'a> {
         let mut body = Vec::new();
         body.try_reserve_exact(length).map_err(|_| limit())?;
         let mut hash = Sha256::new();
-        let mut count = 0;
-        for chunk in chunks {
+        for (count, (ordinal, chunk)) in chunks.into_iter().enumerate() {
             check()?;
-            let (ordinal, chunk) = chunk?;
-            if ordinal != count || count >= descriptor.chunks() {
+            if ordinal as usize != count || count >= descriptor.chunks() as usize {
                 return Err(corrupt());
             }
             let expected = (length - body.len()).min(GRAPH_CHUNK_BYTES);
@@ -196,12 +194,8 @@ impl<'a> LocalHnsw<'a> {
             }
             hash.update(chunk.bytes());
             body.extend_from_slice(chunk.bytes());
-            count += 1;
         }
-        if body.len() != length
-            || count != descriptor.chunks()
-            || <[u8; 32]>::from(hash.finalize()) != descriptor.sha256
-        {
+        if body.len() != length || <[u8; 32]>::from(hash.finalize()) != descriptor.sha256 {
             return Err(corrupt());
         }
         let graph = controlled(check, |proceed| {

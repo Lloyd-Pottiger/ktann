@@ -3,7 +3,7 @@
 use super::*;
 use crate::api::Metric;
 use crate::search::local_hnsw::{
-    Candidate, Parameters, Workspace, owned::OwnedGraph, persistence::GraphSource,
+    Candidate, Parameters, Workspace, native_error, owned::OwnedGraph, persistence::GraphSource,
 };
 use crate::search::numeric::VectorKernel;
 use crate::storage::keys::LogicalKey;
@@ -373,10 +373,6 @@ fn corrupt() -> Error {
 
 fn limit() -> Error {
     Error::new(ErrorKind::LimitExceeded)
-}
-
-fn native_error(error: ktann_usearch::Error) -> Error {
-    crate::search::local_hnsw::native_error(error)
 }
 
 #[cfg(test)]
