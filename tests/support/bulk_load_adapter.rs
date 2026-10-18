@@ -13,15 +13,25 @@ use std::path::Path;
 /// Exercises both manual loading and worker acceptance across a real backend
 /// reopen, then checks exact bytes before publication and ordinary verification.
 pub async fn exercise<B: Backend>(backend: impl Fn() -> B, directory: &Path) {
-    for fixed in [false, true] {
-        let path = directory.join(if fixed { "fixed" } else { "mutable" });
+    for (name, fixed, metric) in [
+        ("mutable", false, Metric::L2),
+        ("fixed-l2", true, Metric::L2),
+        ("fixed-cosine", true, Metric::Cosine),
+        ("fixed-ip", true, Metric::InnerProduct),
+    ] {
+        let path = directory.join(name);
         std::fs::create_dir(&path).unwrap();
-        exercise_mode(&backend, &path, fixed).await;
+        exercise_mode(&backend, &path, fixed, metric).await;
     }
 }
 
-async fn exercise_mode<B: Backend>(backend: &impl Fn() -> B, directory: &Path, fixed: bool) {
-    let config = IndexConfig::new(2, Metric::L2)
+async fn exercise_mode<B: Backend>(
+    backend: &impl Fn() -> B,
+    directory: &Path,
+    fixed: bool,
+    metric: Metric,
+) {
+    let config = IndexConfig::new(2, metric)
         .unwrap()
         .with_leaf_partition_entries(4, 16)
         .and_then(|config| config.with_internal_partition_entries(2, 4))
@@ -182,10 +192,25 @@ async fn exercise_mode<B: Backend>(backend: &impl Fn() -> B, directory: &Path, f
                     )
                 })
                 .collect();
-            assert_eq!(
-                actual,
-                (0..8_u64).map(|id| (id, id as f64)).collect::<Vec<_>>()
-            );
+            // The beam covers every leaf in this fixture. This original-vector
+            // oracle is independent of both routing implementations.
+            let mut expected: Vec<_> = (0..128_u64)
+                .map(|id| {
+                    let distance = match metric {
+                        Metric::L2 => id as f64,
+                        Metric::Cosine => 1.0 - 1.0 / ((id as f64).powi(2) + 1.0).sqrt(),
+                        Metric::InnerProduct => -1.0,
+                        _ => unreachable!(),
+                    };
+                    (id, distance)
+                })
+                .collect();
+            expected.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+            assert_eq!(actual.len(), 8);
+            for (actual, expected) in actual.iter().zip(expected.iter().take(8)) {
+                assert_eq!(actual.0, expected.0);
+                assert!((actual.1 - expected.1).abs() < 1e-12);
+            }
         }
     }
 

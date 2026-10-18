@@ -57,7 +57,9 @@ async fn build(
     fs::create_dir(&work).unwrap();
     let worker = BulkWorkerOptions::new(work);
     job.run_worker(worker.clone()).await.unwrap();
-    job.complete(worker).await.unwrap();
+    let index = job.complete(worker).await.unwrap();
+    let report = index.verify(VerifyOptions::default()).await.unwrap();
+    assert!(report.complete && report.issues.is_empty(), "{report:?}");
     runtime
 }
 
@@ -546,3 +548,6 @@ async fn warm_public_routing_reuses_bodies_without_changing_logical_work() {
     }
     builder.shutdown().await.unwrap();
 }
+
+#[path = "routing/verify.rs"]
+mod verify;

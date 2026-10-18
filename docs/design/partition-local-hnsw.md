@@ -4,7 +4,10 @@ Status: fixed Bulk Build preparation and publication are implemented, including
 optional artifact refinement, final-centroid graph construction, immutable loading,
 and fixed-index write/maintenance restrictions. Snapshot-bound graph reads and
 shared cache ownership and production HNSW traversal are implemented, with
-explicit public routing selection and bounded per-tree/level candidate merging. This document owns the
+explicit public routing selection and bounded per-tree/level candidate merging.
+Offline verification audits every fixed body and its centroid projections; the
+shared adapter integration corpus covers durable loading, reopening, publication,
+and both routing modes for all three metrics. This document owns the
 fixed-index contract of [issue #195](https://github.com/Lloyd-Pottiger/ktann/issues/195).
 [Search](search.md), [Storage](storage.md), and [Bulk Build](bulk-build.md) retain
 ownership of their shared contracts.

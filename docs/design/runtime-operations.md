@@ -22,8 +22,8 @@ creating an unbounded process-local queue.
 
 Fixed-graph routing has a separate per-query working-byte ceiling configured by
 `RuntimeConfig::with_routing_working_bytes`; its accounting contract belongs to
-[Search](search.md#fixed-index-graph-bodies). Native restore and query tasks use
-the same cooperative CPU-task boundary as refinement. Search admission remains
+[Search](search.md#fixed-index-graph-bodies). Native restore and query tasks, including offline graph verification, use
+the same cooperative CPU-task boundary as refinement. Foreground admission remains
 owned until those tasks actually exit, including when an awaiting future is
 dropped. Cache retention capacity does not bound such in-flight ownership.
 
@@ -151,7 +151,27 @@ deadline, and cancellation bounds:
 - one Record Location and Leaf Entry per Vector Record and no dangling entries;
 - Leaf Entry field/code agreement with the Vector Record;
 - conservative synopsis contents recomputed from leaf entries;
-- allocator high-water marks and ownership ranges.
+- allocator high-water marks and ownership ranges;
+- for fixed indexes, every internal partition's complete persisted graph and
+  every non-root centroid's agreement with its incoming Child Entry.
+
+Fixed-body verification consumes the same ordered scan, independently of search
+routing and cache contents. It restores one graph at a time through the existing
+fixed-body decoder: Header/source binding, child ordinals, chunk coverage and
+checksum, native topology, and local reachability are checked together. Leaf or
+ownerless graphs, and graphs in mutable indexes, are invalid. Fixed Headers must
+be Ready. The root needs no stored centroid because it has no incoming projection.
+Per-tree canonical centroid fingerprints join projections without retaining a
+second tree of vectors; topology ownership remains in the ordinary tree ledger.
+
+All retained children, chunks, projection joins, kernel construction, and native
+restore scratch share VerifyOptions' memory ceiling. Exhaustion returns an
+incomplete report, while cancellation and deadline errors propagate from native
+validation. The audit neither uses the routing cache nor populates it. Missing
+mandatory graphs or centroids report Reachability; malformed graph bodies or
+source bindings report InvalidEncoding; wrong graph ownership and divergent
+centroid projections report Membership. Generic codec failures retain their
+existing InvalidEncoding classification.
 
 The complete report also exposes audited Tree Manifest count, Partition Header
 count, maximum tree level, Partition Header and exact entry counts by level,

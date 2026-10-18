@@ -47,6 +47,11 @@ impl Limits {
         }
     }
 
+    /// Unreserved memory available for bounded native restoration.
+    pub(super) fn remaining_memory(&self) -> u64 {
+        self.memory_limit - self.memory_used
+    }
+
     /// Releases previously reserved resident state.
     pub(super) fn release_memory(&mut self, bytes: u64) {
         self.memory_used = self.memory_used.saturating_sub(bytes);

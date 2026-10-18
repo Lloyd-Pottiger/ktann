@@ -558,6 +558,7 @@ impl<B: Backend> RuntimeInner<B> {
         let admission = if matches!(
             operation,
             Operation::Search
+                | Operation::Verify
                 | Operation::Refine
                 | Operation::LoadBulkBuild
                 | Operation::RunBulkBuild
