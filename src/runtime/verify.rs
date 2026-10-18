@@ -4,7 +4,8 @@
 //! `docs/design/runtime-operations.md` §6. Exactly one backend read
 //! transaction pins the snapshot: the persisted Active Manifest validates
 //! first, and every later check — canonical encodings, tree reachability and
-//! unique incoming references, exact Header counts and legal State
+//! unique incoming references, complete fixed graphs and centroid projections,
+//! exact Header counts and legal State
 //! references, Record–Location–Leaf membership, Leaf Entry projection
 //! agreement, conservative Synopses, and allocator high-water marks — reads
 //! that single snapshot. Transaction expiry, deadline, and cancellation
@@ -26,7 +27,7 @@
 //! Issue kinds are deliberately coarse; the stable mapping is:
 //!
 //! - [`VerifyIssueKind::InvalidEncoding`]: a key or value fails canonical
-//!   decoding.
+//!   decoding, or a complete fixed graph fails source/topology validation.
 //! - [`VerifyIssueKind::Reachability`]: a required object is missing (a
 //!   partition Header or State, a leaf's Synopsis, a tree root, an edge
 //!   target, the allocator) or an unowned object exists (a partition without
@@ -63,6 +64,7 @@ use crate::storage::values::{IndexManifest, PartitionState, PersistentValue, Val
 use super::OperationContext;
 use super::reads::open_validated_read;
 
+mod graphs;
 mod limits;
 mod records;
 mod topology;
@@ -321,6 +323,7 @@ async fn scan_index<B: Backend, T: ReadOps>(
 ) -> Result<()> {
     let mut records = RecordLedger::new(cx.manifest)?;
     let mut topology = TopologyLedger::new(cx.manifest);
+    let mut graphs = graphs::GraphLedger::default();
 
     let range = keys::index_range(cx.index());
     let end = range.end().to_vec();
@@ -337,7 +340,7 @@ async fn scan_index<B: Backend, T: ReadOps>(
             if cx.truncated() {
                 break;
             }
-            process_item(cx, &mut records, &mut topology, item);
+            process_item(cx, &mut records, &mut topology, &mut graphs, item, context).await?;
         }
         cx.release_memory(page_bytes);
         match page.next_start() {
@@ -350,6 +353,10 @@ async fn scan_index<B: Backend, T: ReadOps>(
     if cx.truncated() {
         return Ok(());
     }
+    graphs.finish(cx, context).await?;
+    if cx.truncated() {
+        return Ok(());
+    }
     records.finalize_groups(cx);
     topology.finish(cx);
     if !cx.truncated() {
@@ -359,17 +366,19 @@ async fn scan_index<B: Backend, T: ReadOps>(
 }
 
 /// Decodes and dispatches one scanned item to the ledgers.
-fn process_item(
+async fn process_item<B: Backend>(
     cx: &mut Context<'_>,
     records: &mut RecordLedger,
     topology: &mut TopologyLedger,
+    graphs: &mut graphs::GraphLedger,
     item: &ScanItem,
-) {
+    context: &OperationContext<B>,
+) -> Result<()> {
     let key = match keys::decode_key(cx.tree_key_types(), item.key()) {
         Ok(key) => key,
         Err(_) => {
             cx.issue(VerifyIssueKind::InvalidEncoding, None, None, None);
-            return;
+            return Ok(());
         }
     };
     let value = match cx.codec.decode(&key, item.value().clone()) {
@@ -383,9 +392,13 @@ fn process_item(
                 partition,
                 record_id,
             );
-            return;
+            return Ok(());
         }
     };
+    graphs.observe(cx, &key, &value, context).await?;
+    if cx.truncated() {
+        return Ok(());
+    }
     cx.count(&value);
     // Record Groups sort after the Manifest and before Tree Manifests and
     // partition bodies; their group checks finalize when the first
@@ -490,8 +503,8 @@ fn process_item(
         ) => {
             topology.absorb_child_entry(cx, tree_key, *partition, *child);
         }
-        // Build metadata may survive publication. Its codec was validated
-        // above, but it participates in neither serving membership ledger.
+        // Graph integrity was checked by the graph ledger. Build metadata
+        // may survive publication and has no serving membership role.
         (LogicalKey::GraphDescriptor { .. }, PersistentValue::GraphDescriptor(_))
         | (LogicalKey::GraphChunk { .. }, PersistentValue::GraphChunk(_))
         | (LogicalKey::BuildDescriptor(_), PersistentValue::BuildDescriptor(_))
@@ -513,19 +526,26 @@ fn process_item(
             );
         }
     }
+    Ok(())
 }
 
-/// Extracts the safe partition and Record ID context of a decoded key.
-fn key_context(key: &LogicalKey) -> (Option<PartitionKey>, Option<Bytes>) {
-    let partition = match key {
+/// Returns the partition owner shared by issue context and fixed-body auditing.
+fn partition_key(key: &LogicalKey) -> Option<PartitionKey> {
+    match key {
         LogicalKey::Header { partition, .. }
         | LogicalKey::Synopsis { partition, .. }
         | LogicalKey::State { partition, .. }
         | LogicalKey::Centroid { partition, .. }
         | LogicalKey::LeafEntry { partition, .. }
-        | LogicalKey::ChildEntry { partition, .. } => Some(*partition),
+        | LogicalKey::ChildEntry { partition, .. }
+        | LogicalKey::GraphDescriptor { partition, .. }
+        | LogicalKey::GraphChunk { partition, .. } => Some(*partition),
         _ => None,
-    };
+    }
+}
+
+/// Extracts the safe partition and Record ID context of a decoded key.
+fn key_context(key: &LogicalKey) -> (Option<PartitionKey>, Option<Bytes>) {
     let record_id = match key {
         LogicalKey::Record { id, .. }
         | LogicalKey::Location { id, .. }
@@ -533,7 +553,7 @@ fn key_context(key: &LogicalKey) -> (Option<PartitionKey>, Option<Bytes>) {
         | LogicalKey::LeafEntry { id, .. } => Some(id.clone()),
         _ => None,
     };
-    (partition, record_id)
+    (partition_key(key), record_id)
 }
 
 /// Charges one scanned page's actual encoded bytes.
