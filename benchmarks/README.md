@@ -107,6 +107,10 @@ help detect drift; each point reports its own concurrency, latency, CPU, recall,
 cache observations, backend logical IO, and admission waits. Without these
 options the standard beam curve and 16 clients are unchanged. A single beam
 checks complete search and recall samples without requiring a quality curve.
+`--measured-operations N` overrides the positive timed operation count; omitting it
+keeps the selected profile default. Use the same count for compared runs; for
+quality scenarios, an integer multiple of the query window gives equal weight
+to each query. Warmup and full quality diagnostics remain separate.
 `--partition-cache-bytes N` sets the decoded partition cache capacity for any
 profile; zero disables it. This cache excludes raw vectors read during reranking
 and does not replace RocksDB's block cache or FoundationDB's server cache.

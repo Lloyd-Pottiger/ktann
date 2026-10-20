@@ -499,3 +499,53 @@ fn snapshot_binding_has_golden_bytes_and_canonical_zero() {
         );
     }
 }
+
+#[test]
+fn source_identity_has_golden_bytes_across_coordinate_blocks() {
+    // Independently encoded SHA-256 digests cover a partial and multiple full blocks.
+    let cases = [
+        (
+            257,
+            [
+                224, 4, 218, 42, 13, 226, 225, 94, 16, 65, 28, 45, 236, 192, 122, 146, 45, 53, 53,
+                192, 253, 49, 7, 180, 112, 99, 155, 51, 251, 241, 27, 33,
+            ],
+        ),
+        (
+            768,
+            [
+                17, 2, 3, 97, 185, 132, 136, 23, 240, 165, 134, 47, 16, 109, 27, 200, 131, 168, 6,
+                51, 160, 221, 220, 97, 6, 231, 60, 5, 100, 172, 209, 16,
+            ],
+        ),
+    ];
+    for (dimension, expected) in cases {
+        let kernel = VectorKernel::new(dimension, Metric::L2, [0; 32]).unwrap();
+        for zero in [0.0, -0.0] {
+            let rows = children(
+                (0..2)
+                    .map(|row| {
+                        (0..dimension)
+                            .map(|i| {
+                                let value = ((row * dimension + i) % 17) as f32 - 8.0;
+                                if value == 0.0 { zero } else { value }
+                            })
+                            .collect()
+                    })
+                    .collect(),
+            );
+            let view = Centroids::new(&kernel, &rows, rows.len(), &|| Ok(())).unwrap();
+            assert_eq!(
+                super::super::persistence::identity(
+                    view,
+                    parameters(),
+                    &tree(),
+                    key(1),
+                    &|| Ok(())
+                )
+                .unwrap(),
+                expected
+            );
+        }
+    }
+}

@@ -24,6 +24,8 @@ fn run(root: &Path, mode: &str, reuse: bool, budget: Option<usize>) -> Output {
             "0",
             "--warmup-operations",
             "0",
+            "--measured-operations",
+            "32",
             "--refinement-rounds",
             "0",
             "--routing-experiment",
@@ -64,6 +66,7 @@ fn all_routes_share_layout_and_keep_diagnostics_out_of_measurement() {
         .unwrap();
         assert_eq!(suite["schema_version"], 9);
         let report = &suite["reports"][0];
+        assert_eq!(report["configuration"]["measured_operations"], 32);
         assert_eq!(report["configuration"]["routing_experiment"]["mode"], *mode);
         assert_eq!(
             report["configuration"]["routing_experiment"]["graph_seed"],
@@ -91,7 +94,7 @@ fn all_routes_share_layout_and_keep_diagnostics_out_of_measurement() {
             }
         }
         let point = &sweep["points"][0]["measurements"];
-        assert_eq!(point["per_query_recall"].as_array().unwrap().len(), 64);
+        assert_eq!(point["per_query_recall"].as_array().unwrap().len(), 32);
         assert!(point["routing"]["distances"].as_u64().unwrap() > 0);
         if ordinal < 2 {
             assert!(point["routing"]["graph_loads"].as_u64().unwrap() > 0);

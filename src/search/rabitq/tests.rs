@@ -420,9 +420,18 @@ fn interleaved_scores_preserve_scalar_bits_at_numeric_and_layout_boundaries() {
         let codes = payloads
             .each_ref()
             .map(|payload| RaBitQ7::decode(payload, dimension).unwrap());
-        let decoded = payloads
-            .each_ref()
-            .map(|payload| super::DecodedRaBitQ7::from_validated_leaf_bytes(payload, dimension));
+        // Keep distinct entries in one body allocation; offsets must remain valid
+        // after every append and both four-lane and scalar scoring must agree.
+        let mut components_buffer = Vec::with_capacity(4 * dimension);
+        let decoded = payloads.each_ref().map(|payload| {
+            super::DecodedRaBitQ7::append_validated_leaf_bytes(
+                payload,
+                dimension,
+                &mut components_buffer,
+            )
+        });
+        assert_eq!(components_buffer.len(), 4 * dimension);
+        let decoded = decoded.each_ref().map(|code| code.view(&components_buffer));
         for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
             let query = RaBitQQuery::new(&components, metric).unwrap();
             let distances =
@@ -444,13 +453,16 @@ fn interleaved_scores_reject_a_dimension_mismatch_in_every_lane() {
     let short = RaBitQ7::quantize(&[1.0]).unwrap();
     let query = RaBitQQuery::new(&[1.0, -1.0], Metric::L2).unwrap();
     for mismatched_lane in 0..4 {
+        let mut components = Vec::new();
         let codes: [_; 4] = std::array::from_fn(|lane| {
-            if lane == mismatched_lane {
-                super::DecodedRaBitQ7::from_validated_leaf_bytes(&short, 1)
+            let (payload, dimension) = if lane == mismatched_lane {
+                (&short, 1)
             } else {
-                super::DecodedRaBitQ7::from_validated_leaf_bytes(&matching, 2)
-            }
+                (&matching, 2)
+            };
+            super::DecodedRaBitQ7::append_validated_leaf_bytes(payload, dimension, &mut components)
         });
+        let codes = codes.each_ref().map(|code| code.view(&components));
         assert_kind(
             super::DecodedRaBitQ7::approximate_distances(codes.each_ref(), &query),
             ErrorKind::InvalidArgument,
@@ -740,7 +752,13 @@ fn candidate(index: u16, rough: f64, lower: f64, upper: f64) -> ApproximateCandi
 fn assert_validated_packed_parity(encoded: &[u8], components: &[f32]) {
     RaBitQ7::validate(encoded, components.len()).expect("fixture is canonical");
     let code = RaBitQ7::from_validated_leaf_bytes(encoded, components.len());
-    let expanded = super::DecodedRaBitQ7::from_validated_leaf_bytes(encoded, components.len());
+    let mut expanded_codes = Vec::with_capacity(components.len());
+    let expanded = super::DecodedRaBitQ7::append_validated_leaf_bytes(
+        encoded,
+        components.len(),
+        &mut expanded_codes,
+    );
+    let expanded = expanded.view(&expanded_codes);
     for metric in [Metric::InnerProduct, Metric::Cosine, Metric::L2] {
         let query = RaBitQQuery::new(components, metric).expect("finite query is valid");
         let distance = code

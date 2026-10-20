@@ -88,6 +88,7 @@ struct ExecutionOptions {
     leaf_beam_size: Option<u32>,
     rocksdb_block_cache_bytes: Option<usize>,
     warmup_operations: Option<usize>,
+    measured_operations: Option<usize>,
     rocksdb_path: Option<PathBuf>,
     reuse_index: bool,
     lifecycle: LifecycleOverrides,
@@ -188,6 +189,10 @@ impl ExecutionOptions {
                 .get("warmup-operations")
                 .map(|value| parse_nonnegative(value, "warmup-operations"))
                 .transpose()?,
+            measured_operations: values
+                .get("measured-operations")
+                .map(|value| parse_positive(value, "measured-operations"))
+                .transpose()?,
             leaf_beam_size: values
                 .get("leaf-beam-size")
                 .map(|value| parse_positive_u32(value, "leaf-beam-size"))
@@ -208,6 +213,7 @@ const SCENARIO_OPTIONS: &[&str] = &[
     "leaf-beam-size",
     "rocksdb-block-cache-bytes",
     "warmup-operations",
+    "measured-operations",
     "rocksdb-path",
     "reuse-index",
     "write-beam-size",
@@ -499,6 +505,10 @@ fn run_suite(options: RunOptions) -> Result<(), String> {
                 option_string(options.execution.warmup_operations),
             ),
             (
+                "measured-operations",
+                option_string(options.execution.measured_operations),
+            ),
+            (
                 "query-concurrency",
                 options.execution.query_concurrency.as_ref().map(|values| {
                     values
@@ -616,6 +626,9 @@ fn run_worker(options: WorkerOptions) -> Result<(), String> {
     }
     if let Some(count) = options.execution.warmup_operations {
         scenario.warmup_operations = count;
+    }
+    if let Some(count) = options.execution.measured_operations {
+        scenario.measured_operations = count;
     }
     if let Some(concurrency) = &options.execution.query_concurrency {
         if scenario.leaf_beam_sweep.is_empty() {
@@ -990,7 +1003,7 @@ fn shell_quote(value: &OsStr) -> String {
 
 /// Returns the stable help shown for missing or unknown public commands.
 fn usage() -> String {
-    "usage:\n  ktann-bench run --backend rocksdb|foundationdb [--profile smoke|full|large] [--routing-experiment JSON] [--scenario NAME] [--worker-threads N] [--query-concurrency N,...] [--partition-cache-bytes N] [--leaf-beam-size N] [--warmup-operations N] [--rocksdb-block-cache-bytes N] [--rocksdb-path PATH] [--reuse-index true|false] [--write-beam-size N] [--refinement-rounds 0..5] [--base-vectors N] [--query-vectors N] [--query-offset N] [--min-leaf-partition-entries N] [--max-leaf-partition-entries N] [--min-internal-partition-entries N] [--max-internal-partition-entries N] [--maintenance-workers N] [--import-batch-size N] [--output PATH]\n  ktann-bench summarize-routing --inputs PATH,PATH,...\n  ktann-bench compare --baseline PATH --candidate PATH [--maximum-relative-regression N] [--maximum-recall-drop N] [--maximum-rejection-rate-increase N] [--output PATH]".to_owned()
+    "usage:\n  ktann-bench run --backend rocksdb|foundationdb [--profile smoke|full|large] [--routing-experiment JSON] [--scenario NAME] [--worker-threads N] [--query-concurrency N,...] [--partition-cache-bytes N] [--leaf-beam-size N] [--warmup-operations N] [--measured-operations N] [--rocksdb-block-cache-bytes N] [--rocksdb-path PATH] [--reuse-index true|false] [--write-beam-size N] [--refinement-rounds 0..5] [--base-vectors N] [--query-vectors N] [--query-offset N] [--min-leaf-partition-entries N] [--max-leaf-partition-entries N] [--min-internal-partition-entries N] [--max-internal-partition-entries N] [--maintenance-workers N] [--import-batch-size N] [--output PATH]\n  ktann-bench summarize-routing --inputs PATH,PATH,...\n  ktann-bench compare --baseline PATH --candidate PATH [--maximum-relative-regression N] [--maximum-recall-drop N] [--maximum-rejection-rate-increase N] [--output PATH]".to_owned()
 }
 
 /// Summarizes routing matrix rows without treating unequal recall as a speedup.
@@ -1084,8 +1097,11 @@ mod tests {
         assert_eq!(options.execution.rocksdb_block_cache_bytes, Some(4096));
         assert_eq!(options.execution.warmup_operations, Some(0));
         assert!(options.execution.reuse_index);
+        assert_eq!(options.execution.measured_operations, None);
         for arguments in [
             vec!["--backend", "rocksdb", "--rocksdb-block-cache-bytes", "0"],
+            vec!["--backend", "rocksdb", "--measured-operations", "0"],
+            vec!["--backend", "rocksdb", "--measured-operations", "invalid"],
             vec![
                 "--backend",
                 "foundationdb",
