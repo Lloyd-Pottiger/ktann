@@ -9,7 +9,7 @@ use crate::api::{Error, Result};
 use bytes::Bytes;
 
 /// Maximum complete graph value, including its type tag and length prefix.
-pub const MAX_GRAPH_VALUE_BYTES: usize = 64 * 1024;
+pub const MAX_GRAPH_VALUE_BYTES: usize = 100_000;
 /// Fixed payload width of every nonfinal chunk.
 pub const GRAPH_CHUNK_BYTES: usize = MAX_GRAPH_VALUE_BYTES - 5;
 

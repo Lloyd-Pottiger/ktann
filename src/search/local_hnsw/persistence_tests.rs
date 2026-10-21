@@ -89,6 +89,101 @@ fn records(graph: &TestGraph<'_>) -> GraphRecords {
 }
 
 #[test]
+fn ordinary_updates_preserve_metric_scores_canonical_children_and_source_integrity() {
+    for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
+        let kernel = VectorKernel::new(8, metric, [0; 32]).unwrap();
+        for duplicate in [false, true] {
+            let rows = children(if duplicate {
+                vec![vec![0.0; 8]; 65]
+            } else {
+                fixture(65, 8, 91)
+            });
+            let graph = build(&kernel, &rows, parameters());
+            let encoded = records(&graph);
+            for operation in 0..3 {
+                let mut next = rows.clone();
+                match operation {
+                    0 => next.insert(1, ChildEntry::new(key(11), vec![0.0; 8])),
+                    1 => next[16] = ChildEntry::new(next[16].child(), vec![0.5; 8]),
+                    _ => {
+                        next.remove(graph.graph.entry().unwrap() as usize);
+                    }
+                }
+                let centroids = Centroids::new(&kernel, &next, 4096, &|| Ok(())).unwrap();
+                let next_header =
+                    PartitionHeader::new(2, next.len() as u32, 43, PartitionState::Ready).unwrap();
+                let updated = super::super::persistence::update_records(
+                    graph.centroids,
+                    centroids,
+                    source(&tree(), rows.len()),
+                    &encoded.descriptor,
+                    encoded.chunks(),
+                    next_header,
+                    MEMORY,
+                    &|| Ok(()),
+                )
+                .unwrap();
+                let restored = TestGraph::restore(
+                    centroids,
+                    GraphSource {
+                        header: next_header,
+                        ..source(&tree(), next.len())
+                    },
+                    &updated.descriptor,
+                    updated.chunks(),
+                    MEMORY,
+                    &|| Ok(()),
+                )
+                .unwrap();
+                let mut scratch = Workspace::new(next.len(), parameters().m, MEMORY).unwrap();
+                for query in fixture(3, 8, 301) {
+                    let expected = centroids.exact(&query, 8, MEMORY, &|| Ok(())).unwrap();
+                    let (actual, _) = restored
+                        .search(&query, 8, next.len(), MEMORY, &mut scratch, &|| Ok(()))
+                        .unwrap();
+                    assert_eq!(
+                        actual, expected,
+                        "{metric:?} operation {operation}, duplicate={duplicate}"
+                    );
+                }
+                assert_eq!(
+                    super::super::persistence::update_records(
+                        graph.centroids,
+                        centroids,
+                        source(&tree(), rows.len()),
+                        &encoded.descriptor,
+                        encoded.chunks(),
+                        next_header,
+                        0,
+                        &|| Ok(())
+                    )
+                    .unwrap_err()
+                    .kind(),
+                    ErrorKind::LimitExceeded
+                );
+                let mut corrupted = encoded.descriptor.clone();
+                corrupted.sha256[0] ^= 1;
+                assert_eq!(
+                    super::super::persistence::update_records(
+                        graph.centroids,
+                        centroids,
+                        source(&tree(), rows.len()),
+                        &corrupted,
+                        encoded.chunks(),
+                        next_header,
+                        MEMORY,
+                        &|| Ok(())
+                    )
+                    .unwrap_err()
+                    .kind(),
+                    ErrorKind::Corruption
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn snapshot_roundtrip_preserves_topology_scores_and_queries() {
     for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
         for n in [1, 2, 257] {
@@ -357,7 +452,7 @@ async fn typed_snapshot_scan_restores_a_usable_body() {
         index(),
         IndexConfig::new(4, Metric::L2)
             .unwrap()
-            .with_internal_partition_entries(1024, 4096)
+            .with_internal_partition_entries(128, 4096)
             .unwrap(),
         [0; 32],
         vec![],

@@ -6,6 +6,8 @@
 use std::fmt;
 
 mod persistence;
+#[cfg(test)]
+mod updates_tests;
 pub use persistence::{NATIVE_ENCODING, NATIVE_HEADER_BYTES, decode_bound, encoded_bound};
 
 #[allow(unsafe_code)] // CXX checks signatures; raw pointers stay inside its generated bridge.
@@ -54,6 +56,15 @@ mod ffi {
             limit: usize,
             context: &MetricContext,
         ) -> Result<UniquePtr<NativeGraph>>;
+        fn evolve(
+            graph: UniquePtr<NativeGraph>,
+            mapping: &[u32],
+            changed: &[u32],
+            ef: u32,
+            seed: u64,
+            limit: usize,
+            context: &MetricContext,
+        ) -> Result<UniquePtr<NativeGraph>>;
         fn workspace(n: u32, m: u32, limit: usize) -> Result<UniquePtr<NativeWorkspace>>;
         fn search(
             self: &NativeGraph,
@@ -79,7 +90,7 @@ pub use ffi::Hit;
 /// Logical graph work, separate from KTANN partition-visit budgets.
 pub use ffi::Stats;
 
-/// Fixed maximum node level (seventeen layers, including layer zero).
+/// Global node-level ceiling; the degree-specific limit is [`max_level`].
 pub const MAX_LEVEL: u32 = 16;
 /// Maximum partition size supported by this bridge.
 pub const MAX_NODES: usize = 65_536;
@@ -146,6 +157,19 @@ fn validate(n: usize, m: usize) -> Result<(), Error> {
     Ok(())
 }
 
+/// Highest hierarchy level whose expected population at MAX_NODES is at least
+/// one. Integer arithmetic matches the native sampler and bounds persisted size.
+pub fn max_level(m: usize) -> u32 {
+    assert!(m >= 2);
+    let mut level = 0;
+    let mut population = MAX_NODES;
+    while population >= m {
+        population /= m;
+        level += 1;
+    }
+    level
+}
+
 /// Conservative admission bound for reusable query scratch, including overhead.
 pub fn workspace_bound(n: usize, m: usize) -> Result<usize, Error> {
     validate(n, m)?;
@@ -182,6 +206,67 @@ impl fmt::Debug for Graph {
 }
 
 impl Graph {
+    /// Consumes a private graph, replaces selected old slots, appends new slots,
+    /// and permutes the result into canonical order. `mapping[slot]` is the final
+    /// ordinal; distances use pre-permutation slots throughout this operation.
+    /// Deletion is deliberately handled by the caller's existing full builder.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "private topology transform with borrowed metric and operation controls"
+    )]
+    pub fn evolve(
+        self,
+        mapping: &[u32],
+        changed: &[u32],
+        ef: usize,
+        seed: u64,
+        limit: usize,
+        distance: &dyn Fn(u32, u32) -> f64,
+        check: &dyn Fn() -> bool,
+    ) -> Result<Self, Error> {
+        let n = mapping.len();
+        if n < self.n || ef < self.m || n == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        let native_limit = limit.checked_sub(n + 128).ok_or(Error::LimitExceeded)?;
+        if build_bound(n, self.m)? > native_limit {
+            return Err(Error::LimitExceeded);
+        }
+        let mut seen = Vec::new();
+        seen.try_reserve_exact(n)
+            .map_err(|_| Error::LimitExceeded)?;
+        seen.resize(n, false);
+        for &target in mapping {
+            if !check() {
+                return Err(Error::Cancelled);
+            }
+            let target = target as usize;
+            if target >= n || std::mem::replace(&mut seen[target], true) {
+                return Err(Error::InvalidArgument);
+            }
+        }
+        if changed.iter().any(|&slot| slot as usize >= self.n)
+            || changed.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(Error::InvalidArgument);
+        }
+        let context = MetricContext { distance, check };
+        let inner = ffi::evolve(
+            self.inner,
+            mapping,
+            changed,
+            ef.min(n) as u32,
+            seed,
+            native_limit,
+            &context,
+        )?;
+        Ok(Self {
+            inner,
+            n,
+            m: self.m,
+        })
+    }
+
     /// Builds in ordinal order with a fixed seed and borrowed distance callback.
     ///
     /// The callback receives only ordinals in `0..n`. It must return finite
@@ -415,5 +500,31 @@ mod tests {
             Err(Error::InvalidArgument)
         ));
         assert!(matches!(Workspace::new(8, 2, 0), Err(Error::LimitExceeded)));
+    }
+}
+
+#[cfg(test)]
+mod atomic_size_tests {
+    use super::*;
+
+    #[test]
+    fn supported_internal_shapes_fit_one_fdb_publication() {
+        // A split distributes at most threshold+2 nodes. A merge additionally
+        // retains an underfull source (minimum<=128); only one target per batch.
+        for capacity in [8192, 16384] {
+            for m in 2..=16 {
+                let nodes = capacity + 2 + 127;
+                let graph_bytes = encoded_bound(nodes, m).unwrap() + NATIVE_HEADER_BYTES;
+                // Two nonempty bodies can need one extra partial chunk.
+                let chunks = graph_bytes.div_ceil(99_995) + 1;
+                // Conservative maximum physical key length; charge mutation,
+                // both conflict endpoints, framing and per-mutation overhead.
+                let affected = graph_bytes + chunks * (3 * 10_000 + 64) + 900_000;
+                assert!(
+                    affected < 10_000_000,
+                    "capacity={capacity} M={m}: {affected}"
+                );
+            }
+        }
     }
 }

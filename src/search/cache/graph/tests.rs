@@ -242,8 +242,8 @@ impl ReadOps for PagedRead {
 
 #[tokio::test]
 async fn pagination_and_snapshot_expiry_never_publish_partial_graphs() {
-    let fixture = Fixture::with_size(Metric::L2, 1, 1, 1024, 8);
-    for fail_at_scan in [Some(1025), None] {
+    let fixture = Fixture::with_size(Metric::L2, 1, 1, 2048, 8);
+    for fail_at_scan in [Some(2049), None] {
         let cache = PartitionCache::new(W as u64);
         let raw = PagedRead {
             raw: MockReadTxn::new(fixture.data.clone()),
@@ -270,7 +270,7 @@ async fn pagination_and_snapshot_expiry_never_publish_partial_graphs() {
         } else {
             let graph = result.unwrap().restore(&cache, &|| Ok(())).unwrap();
             assert!(
-                txn.into_raw().raw.scans > 1025,
+                txn.into_raw().raw.scans > 2049,
                 "multiple graph pages were read"
             );
             assert_eq!(

@@ -184,7 +184,8 @@ immutable identity comparisons. Limits are:
 | Fields | at most 16 |
 | Bloom-enabled fields | at most 4 |
 | Encoded Tree Key | schema worst case at most 8 KiB |
-| Each partition capacity pair | `1 <= min`, `2 * min <= max <= 65,536`; defaults 64/512 |
+| Leaf partition capacity pair | `1 <= min`, `2 * min <= max <= 65,536`; defaults 64/512 |
+| Internal partition capacity pair | `1 <= min <= 128`, `2 * min <= max <= 16,384`; defaults 64/512 |
 
 Level 1 selects leaf bounds; higher levels select internal bounds, including
 roots. Roots are exempt from minimum occupancy. Maxima are asynchronous split

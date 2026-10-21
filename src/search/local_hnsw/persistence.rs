@@ -134,6 +134,117 @@ pub(crate) fn build_records(
     )
 }
 
+/// Prepares one complete replacement body. A deletion reuses the canonical
+/// builder; insertion and centroid replacement consume a private restored graph.
+/// Source corruption is never concealed by rebuilding.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "snapshot-bound source and proposed body with operation admission"
+)]
+pub(crate) fn update_records(
+    old: Centroids<'_>,
+    next: Centroids<'_>,
+    source: GraphSource<'_>,
+    descriptor: &GraphDescriptor,
+    chunks: impl IntoIterator<Item = (u32, GraphChunk)>,
+    next_header: PartitionHeader,
+    working_bytes: usize,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<GraphRecords> {
+    if next_header.level() != source.header.level()
+        || source.header.cache_epoch().checked_add(1) != Some(next_header.cache_epoch())
+        || !header_matches(next_header, next.children.len())
+    {
+        return Err(Error::invalid_argument());
+    }
+    let mapping_bytes = old
+        .children
+        .len()
+        .checked_add(next.children.len())
+        .and_then(|count| count.checked_mul(4))
+        .and_then(|bytes| bytes.checked_add(128))
+        .ok_or_else(limit)?;
+    let restore_budget = working_bytes
+        .checked_sub(next.bytes + mapping_bytes)
+        .ok_or_else(limit)?;
+    let (graph, _) = restore_graph(old, source, descriptor, chunks, restore_budget, check)?;
+    let mut mapping = Vec::new();
+    let mut changed = Vec::new();
+    mapping
+        .try_reserve_exact(next.children.len())
+        .map_err(|_| limit())?;
+    changed
+        .try_reserve_exact(old.children.len())
+        .map_err(|_| limit())?;
+    for (slot, child) in old.children.iter().enumerate() {
+        check()?;
+        let Ok(target) = next
+            .children
+            .binary_search_by_key(&child.child(), ChildEntry::child)
+        else {
+            drop(graph);
+            return build_records(
+                next,
+                GraphSource {
+                    header: next_header,
+                    ..source
+                },
+                working_bytes
+                    .checked_sub(old.bytes + mapping_bytes)
+                    .ok_or_else(limit)?,
+                check,
+            );
+        };
+        mapping.push(target as u32);
+        if child.centroid() != next.children[target].centroid() {
+            changed.push(slot as u32);
+        }
+    }
+    for (target, child) in next.children.iter().enumerate() {
+        check()?;
+        if old
+            .children
+            .binary_search_by_key(&child.child(), ChildEntry::child)
+            .is_err()
+        {
+            mapping.push(target as u32);
+        }
+    }
+    let available = working_bytes
+        .checked_sub(old.bytes + next.bytes + mapping_bytes)
+        .ok_or_else(limit)?;
+    let distance = |a: u32, b: u32| {
+        next.distance(
+            next.children[mapping[a as usize] as usize].centroid(),
+            next.children[mapping[b as usize] as usize].centroid(),
+        )
+    };
+    let graph = controlled(check, |proceed| {
+        graph.evolve(
+            &mapping,
+            &changed,
+            source.parameters.ef_construction,
+            partition_seed(source.parameters.seed, source.tree, source.parent)
+                ^ next_header.cache_epoch(),
+            available,
+            &distance,
+            proceed,
+        )
+    })?;
+    let identity = identity(next, source.parameters, source.tree, source.parent, check)?;
+    persist_graph(
+        next,
+        &graph,
+        identity,
+        source.index,
+        next_header,
+        working_bytes
+            .checked_sub(old.bytes + mapping_bytes)
+            .ok_or_else(limit)?,
+        check,
+    )
+}
+
 pub(super) fn persist_graph(
     centroids: Centroids<'_>,
     graph: &ktann_usearch::Graph,

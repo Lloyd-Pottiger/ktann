@@ -415,7 +415,7 @@ fn independent_partition_capacity_bounds_and_recovery_age() {
             .unwrap();
         assert_eq!(changed.max_internal_partition_entries(), 512);
         changed
-            .with_internal_partition_entries(minimum, maximum)
+            .with_internal_partition_entries(minimum.min(128), maximum.min(16_384))
             .unwrap()
             .validate()
             .unwrap();
@@ -441,4 +441,34 @@ fn independent_partition_capacity_bounds_and_recovery_age() {
         runtime.stalled_timeout(&config, 1),
         runtime.stalled_timeout(&config, 3)
     );
+}
+
+#[test]
+fn internal_graph_configuration_has_atomic_publication_bounds() {
+    use ktann::api::FixedGraphConfig;
+    for capacity in [8192, 16384] {
+        IndexConfig::new(768, Metric::L2)
+            .unwrap()
+            .with_internal_partition_entries(128, capacity)
+            .unwrap()
+            .validate()
+            .unwrap();
+    }
+    assert_invalid(
+        IndexConfig::new(128, Metric::L2)
+            .unwrap()
+            .with_internal_partition_entries(129, 16384),
+    );
+    assert_invalid(
+        IndexConfig::new(128, Metric::L2)
+            .unwrap()
+            .with_internal_partition_entries(128, 16385),
+    );
+    assert_invalid(FixedGraphConfig::new(17, 200, [0; 32]));
+    FixedGraphConfig::new(16, 200, [0; 32]).unwrap();
+    // Leaf occupancy is independent of the internal routing-graph envelope.
+    IndexConfig::new(128, Metric::L2)
+        .unwrap()
+        .with_leaf_partition_entries(1024, 65536)
+        .unwrap();
 }

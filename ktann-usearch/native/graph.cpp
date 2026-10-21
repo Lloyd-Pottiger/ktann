@@ -130,6 +130,36 @@ std::unique_ptr<NativeWorkspace> workspace(std::uint32_t n, std::uint32_t m, std
     return std::make_unique<NativeWorkspace>(std::move(state));
 }
 
+// Audit and repair only a private, complete graph before publication.
+void repair(Engine& engine, std::uint32_t n, MetricContext const& context) {
+    auto& scratch = engine.build_context();
+    // Native reverse-link pruning can disconnect duplicate-heavy graphs.
+    // Audit directed reachability. Only a disconnected graph gains the
+    // canonical directed cycle; replacing at most one edge per full node
+    // preserves the 2*M degree cap and makes all nodes reachable.
+    unum::usearch::buffer_gt<std::uint32_t, Allocator<std::uint32_t>> queue(n);
+    if (!queue) throw std::runtime_error("limit");
+    auto& visited = scratch.visits;
+    visited.clear();
+    queue[0] = engine.entry_slot();
+    visited.set(queue[0]);
+    std::size_t tail = 1, edges = 0;
+    for (std::size_t head = 0; head != tail; ++head) {
+        checkpoint(context);
+        for (auto neighbor : engine.neighbors(queue[head], 0)) {
+            if ((edges++ & 63) == 0) checkpoint(context);
+            auto node = static_cast<std::uint32_t>(neighbor.slot);
+            if (!visited.set(node)) queue[tail++] = node;
+        }
+    }
+    if (tail != n) {
+        for (std::uint32_t node = 0; node != n; ++node) {
+            checkpoint(context);
+            engine.ensure_successor(node, (node + 1) % n);
+        }
+    }
+}
+
 std::unique_ptr<NativeGraph> build(std::uint32_t n, std::uint32_t m, std::uint32_t ef,
     std::uint64_t seed, std::size_t limit, MetricContext const& context) {
     checkpoint(context);
@@ -148,35 +178,46 @@ std::unique_ptr<NativeGraph> build(std::uint32_t n, std::uint32_t m, std::uint32
             if (!added) throw std::runtime_error("limit");
         }
 
-        // Native reverse-link pruning can disconnect duplicate-heavy graphs.
-        // Audit directed reachability. Only a disconnected graph gains the
-        // canonical directed cycle; replacing at most one edge per full node
-        // preserves the 2*M degree cap and makes all nodes reachable.
-        unum::usearch::buffer_gt<std::uint32_t, Allocator<std::uint32_t>> queue(n);
-        if (!queue) throw std::runtime_error("limit");
-        auto& visited = scratch.visits;
-        visited.clear();
-        queue[0] = engine.entry_slot();
-        visited.set(queue[0]);
-        std::size_t tail = 1, edges = 0;
-        for (std::size_t head = 0; head != tail; ++head) {
-            checkpoint(context);
-            for (auto neighbor : engine.neighbors(queue[head], 0)) {
-                if ((edges++ & 63) == 0) checkpoint(context);
-                auto node = static_cast<std::uint32_t>(neighbor.slot);
-                if (!visited.set(node)) queue[tail++] = node;
-            }
-        }
-        if (tail != n) {
-            for (std::uint32_t node = 0; node != n; ++node) {
-                checkpoint(context);
-                engine.ensure_successor(node, (node + 1) % n);
-            }
-        }
+        repair(engine, n, context);
         engine.release_build_context();
     }
     checkpoint(context);
     return std::make_unique<NativeGraph>(std::move(state));
+}
+
+// Input ownership is consumed: failure can only discard this private graph.
+std::unique_ptr<NativeGraph> evolve(std::unique_ptr<NativeGraph> graph,
+    rust::Slice<const std::uint32_t> mapping, rust::Slice<const std::uint32_t> changed,
+    std::uint32_t ef, std::uint64_t seed, std::size_t limit, MetricContext const& context) {
+    checkpoint(context);
+    auto& state = *graph->state;
+    if (state.account.used > limit) throw std::runtime_error("limit");
+    state.account.limit = limit;
+    AllocationScope scope(state.account);
+    auto& engine = state.engine;
+    auto old_size = engine.size();
+    auto n = static_cast<std::uint32_t>(mapping.size());
+    if (!engine.reserve({n, 1})) throw std::runtime_error("limit");
+    prepare(engine.build_context(), n, engine.connectivity());
+    engine.build_context().level_generator = seed;
+    Metric metric{context};
+    for (auto slot : changed) {
+        checkpoint(context);
+        auto result = engine.update(engine.begin() + slot, slot, slot, metric,
+            unum::usearch::index_update_config_t{ef, 0});
+        if (!result) throw std::runtime_error("limit");
+    }
+    for (std::uint32_t slot = old_size; slot != n; ++slot) {
+        checkpoint(context);
+        auto result = engine.add(slot, slot, metric, unum::usearch::index_update_config_t{ef, 0});
+        if (!result) throw std::runtime_error("limit");
+    }
+    if (!engine.remap_slots(mapping, [&] { checkpoint(context); }))
+        throw std::runtime_error("limit");
+    repair(engine, n, context);
+    engine.release_build_context();
+    checkpoint(context);
+    return graph;
 }
 
 Stats NativeGraph::search(std::uint32_t ef, MetricContext const& context, NativeWorkspace& workspace,

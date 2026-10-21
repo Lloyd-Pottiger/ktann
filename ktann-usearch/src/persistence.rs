@@ -1,6 +1,6 @@
 //! Strict validation of the pinned USearch generic native stream before loading.
 
-use crate::{Error, Graph, MAX_LEVEL, MetricContext, build_bound, ffi, validate};
+use crate::{Error, Graph, MetricContext, build_bound, ffi, validate};
 
 /// Native u64-key/u32-slot USearch 2.26.4 stream: 1 is little-, 2 big-endian.
 /// The owning envelope must reject a different host's encoding before loading.
@@ -21,7 +21,7 @@ pub fn encoded_bound(n: usize, m: usize) -> Result<usize, Error> {
     validate(n, m)?;
     // Per node: level-table i16, key u64, embedded i16, then each layer's
     // u32 degree and reserved slots (2*M at base, M at every upper layer).
-    let layers = MAX_LEVEL as usize;
+    let layers = crate::max_level(m) as usize;
     n.checked_mul(12 + 4 * (layers + 1) + 4 * (2 * m + layers * m))
         .and_then(|bytes| bytes.checked_add(NATIVE_HEADER_BYTES))
         .ok_or(Error::LimitExceeded)
@@ -132,7 +132,7 @@ impl Graph {
         let max_level = cursor.wide()?;
         let entry = cursor.wide()?;
         if (n == 0 && (max_level != u64::MAX || entry != 0))
-            || (n != 0 && (max_level > u64::from(MAX_LEVEL) || entry >= n as u64))
+            || (n != 0 && (max_level > u64::from(crate::max_level(m)) || entry >= n as u64))
         {
             return Err(Error::InvalidEncoding);
         }
@@ -145,7 +145,7 @@ impl Graph {
         for _ in 0..n {
             checkpoint(check)?;
             let level = cursor.level()?;
-            if u32::from(level) > MAX_LEVEL {
+            if u32::from(level) > crate::max_level(m) {
                 return Err(Error::InvalidEncoding);
             }
             levels.push(level);

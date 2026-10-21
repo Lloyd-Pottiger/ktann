@@ -2589,7 +2589,37 @@ private:
 
   public:
     context_t& build_context() { return contexts_[0]; }
-    void release_build_context() { contexts_ = {}; }
+    void release_build_context() {
+        contexts_ = {};
+        limits_.threads_add = 0;
+        limits_.threads_search = 0;
+    }
+    // Representation-only permutation supplied and validated by KTANN. No edge
+    // selection occurs here; node tapes retain their levels and adjacency.
+    template <typename mapping_at, typename check_at>
+    bool remap_slots(mapping_at const& mapping, check_at&& check) {
+        // Centroid changes and append-only canonical insertions preserve slots.
+        std::size_t unchanged = 0;
+        for (; unchanged != size(); ++unchanged) {
+            check();
+            if (mapping[unchanged] != unchanged) break;
+        }
+        if (unchanged == size()) return true;
+        buffer_gt<node_t, nodes_allocator_t> reordered(nodes_capacity_);
+        if (!reordered) return false;
+        for (std::size_t old = 0; old != size(); ++old) {
+            check();
+            node_t node = node_at_(old);
+            node.key(mapping[old]);
+            for (level_t level = 0; level <= node.level(); ++level)
+                for (auto neighbor : neighbors_(node, level))
+                    neighbor = mapping[compressed_slot_t(neighbor)];
+            reordered[mapping[old]] = node;
+        }
+        nodes_ = std::move(reordered);
+        entry_slot_ = mapping[entry_slot_];
+        return true;
+    }
     std::size_t entry_slot() const noexcept { return entry_slot_; }
     void ensure_successor(std::size_t slot, std::uint32_t successor) {
         auto neighbors = neighbors_(node_at_(slot), 0);
@@ -4394,11 +4424,14 @@ private:
         }
     }
 
-    // KTANN: fixed SplitMix64 words, integer geometric sampling, at most 17 layers.
+    // KTANN: geometric levels stop when their expected population at 65536 nodes is below one.
     level_t choose_random_level_(std::uint64_t& state) const noexcept {
         std::uint64_t threshold = UINT64_MAX / config_.connectivity;
         threshold += UINT64_MAX % config_.connectivity == config_.connectivity - 1;
         level_t level = 0;
+        level_t highest = 0;
+        for (std::size_t population = 65536; population >= config_.connectivity;
+             population /= config_.connectivity) ++highest;
         while (level != 16) {
             std::uint64_t word = (state += UINT64_C(0x9e3779b97f4a7c15));
             word = (word ^ (word >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
@@ -4407,7 +4440,8 @@ private:
             if (word >= threshold) break;
             ++level;
         }
-        return level;
+        // Preserve the original RNG consumption even when truncating a rare tail.
+        return (std::min)(level, highest);
     }
 
     struct candidates_range_t;

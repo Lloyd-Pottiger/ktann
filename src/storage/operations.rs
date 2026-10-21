@@ -866,6 +866,24 @@ impl<'manifest> MutationBuilder<'manifest> {
         self.size
     }
 
+    /// Conservative affected-data cost of these point writes, including physical
+    /// key prefixes, write-conflict endpoints and per-mutation framing. Protected
+    /// reads are charged separately by the operation that owns them.
+    pub(crate) fn affected_bytes(&self) -> Result<usize> {
+        self.entries
+            .iter()
+            .try_fold(0_usize, |total, (key, value)| {
+                let key_bytes = key
+                    .len()
+                    .checked_add(self.budget.mutation_key_overhead_bytes)?;
+                total
+                    .checked_add(key_bytes.checked_mul(3)?)?
+                    .checked_add(value.as_ref().map_or(0, Bytes::len))?
+                    .checked_add(64)
+            })
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))
+    }
+
     /// Queues a typed put, superseding an earlier mutation to the same key.
     pub fn put(&mut self, key: LogicalKey, value: PersistentValue) -> Result<()> {
         let encoded_key = encode_input_key(&self.binding, &key)?;

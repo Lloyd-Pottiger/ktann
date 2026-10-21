@@ -102,7 +102,7 @@ pub(crate) use workspace::PreparedArtifact;
 use wire::{Decoder, Encoder};
 
 /// The persistent format version emitted and accepted by this build.
-pub const FORMAT_VERSION: u16 = 2;
+pub const FORMAT_VERSION: u16 = 3;
 
 /// The maximum encoded Opaque Payload size.
 pub const MAX_PAYLOAD_BYTES: usize = crate::api::MAX_PAYLOAD_BYTES;

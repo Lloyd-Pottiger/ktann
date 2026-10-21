@@ -38,5 +38,8 @@ std::unique_ptr<NativeGraph> build(std::uint32_t n, std::uint32_t m, std::uint32
     std::uint64_t seed, std::size_t limit, MetricContext const&);
 std::unique_ptr<NativeGraph> restore(rust::Slice<const std::uint8_t> bytes,
     std::uint32_t n, std::uint32_t m, std::size_t limit, MetricContext const&);
+std::unique_ptr<NativeGraph> evolve(std::unique_ptr<NativeGraph> graph,
+    rust::Slice<const std::uint32_t> mapping, rust::Slice<const std::uint32_t> changed,
+    std::uint32_t ef, std::uint64_t seed, std::size_t limit, MetricContext const&);
 std::unique_ptr<NativeWorkspace> workspace(std::uint32_t n, std::uint32_t m, std::size_t limit);
 }
