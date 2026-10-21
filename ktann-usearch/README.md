@@ -33,8 +33,8 @@ vector storage is instantiated by this bridge.
 Upper-layer greedy traversal can evaluate a node more than once; each move
 strictly improves the distance/ordinal pair. Visited state deduplicates
 best-first construction and base-layer query exploration. Full-coverage
-queries scan and sort in the bridge; native exact search and dynamic update
-are not exposed or adapted for KTANN callbacks.
+queries scan and sort in the bridge. Native exact search is not exposed;
+ordinary private updates use the adapted native update operation.
 
 Update the patched header and patch together. Verify the source hash when
 rebasing, regenerate the delta against the pinned original, and rerun the graph
@@ -133,3 +133,23 @@ inputs. Native streams include full reserved adjacency capacity, accounted in
 encoded-size bounds. Updating USearch requires rechecking the layout and the
 validator together. Golden native fixtures, malformed inputs, allocation-failure
 sweeps, partial-node cancellation and byte-preserving round trips cover this seam.
+
+## Private ordinary updates
+
+`Graph::evolve` consumes a privately restored graph. It delegates changed-node
+updates and appended nodes to USearch, then remaps ordinal keys and neighbor
+slots to the canonical child order. The source persisted graph and shared search
+handles remain immutable. Batches containing deletion reuse the existing builder.
+
+The pinned patch additionally releases and reinitializes thread scratch limits,
+and provides a checked slot permutation without changing neighbor selection.
+The bridge reapplies the existing directed-reachability repair, releases build
+scratch, and serializes only after successful cancellation and memory checks.
+Update tests cover permutation validation, source immutability, and cancellation;
+the owning crate covers metric scores and atomic snapshot-consistent publication.
+
+Graph levels are capped at `floor(log_M(65536))` after the original geometric
+sampler finishes, preserving its RNG word consumption for subsequent nodes.
+The safe parser and encoded-size bound enforce the same integer cap. The owning
+KTANN configuration limits M to 16 and internal capacity to 16,384 plus two
+transient slots; the native crate retains its broader standalone input limits.

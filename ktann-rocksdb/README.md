@@ -37,7 +37,7 @@ memtables are supported; the adapter forces total-order seeks for every
 contractual range scan.
 
 The adapter keeps WAL enabled and sets `sync=true` for every transaction. It
-uses conservative defaults of 10,000 mutations, 1 MiB of physical mutation
+uses conservative defaults of 10,000 mutations, 9,000,000 bytes of physical mutation
 bytes, and 80 KiB per scan page. RocksDB v1 reports transactional range clear
 as unsupported, so higher layers use bounded point deletes.
 

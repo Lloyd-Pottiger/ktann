@@ -225,7 +225,7 @@ pub(crate) async fn read_graph<T: ReadOps>(
     if header.level() <= 1
         || header.state() != PartitionState::Ready
         || header.entry_count() == 0
-        || header.entry_count() > manifest.config().max_internal_partition_entries()
+        || header.entry_count() > manifest.config().max_internal_partition_entries() + 2
     {
         return Err(corrupt());
     }

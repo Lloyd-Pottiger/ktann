@@ -26,7 +26,7 @@ disjoint, and the adapter subtracts the complete prefix length from
 FoundationDB's 10,000-byte physical-key limit.
 
 The adapter exposes FoundationDB's 100,000-byte value limit and applies the
-accepted conservative defaults of 10,000 mutations, 1 MiB of physical mutation
+accepted conservative defaults of 10,000 mutations, 9,000,000 bytes of physical mutation
 bytes, and 80 KiB per scan page. Native affected-data accounting remains the
 final authority and maps an oversized transaction to `TransactionTooLarge`.
 

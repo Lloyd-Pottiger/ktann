@@ -291,6 +291,13 @@ pub async fn expose_split_targets<T: WriteTxn>(
             // abandoning lets a later attempt rediscover the moved edge.
             _ => return Ok(SplitExposure::ParentNotAccepting),
         }
+        if manifest.config().fixed_graph().is_some()
+            && parent_header.entry_count() > manifest.config().max_internal_partition_entries()
+        {
+            // The parent must split first; two exposure edges use its reserved
+            // transient slots and cannot recursively consume unbounded headroom.
+            return Ok(SplitExposure::ParentNotAccepting);
+        }
         Some((parent, parent_header))
     };
 
@@ -991,6 +998,27 @@ pub async fn relocate_child_entries<T: WriteTxn>(
         }
     }
 
+    // Graph-aware drains rewrite the source and one destination together.
+    // Their combined serialization bound depends on the small merge source and
+    // the hard transient destination ceiling, not on a statistical graph size.
+    if manifest.config().fixed_graph().is_some() {
+        let ceiling = manifest.config().max_internal_partition_entries() + 2;
+        let source_limit = match movement {
+            Movement::Merge => manifest.config().min_internal_partition_entries() - 1,
+            _ => ceiling,
+        };
+        if target_headers.len() != 1 || source_header.entry_count() > source_limit {
+            return Err(Error::new(ErrorKind::LimitExceeded));
+        }
+        let target_count = target_headers[0].1.entry_count();
+        if u64::from(target_count) + moves.len() as u64 > u64::from(ceiling)
+            || (movement == Movement::Split
+                && u64::from(source_header.entry_count()) + u64::from(target_count)
+                    > u64::from(ceiling))
+        {
+            return Err(Error::new(ErrorKind::LimitExceeded));
+        }
+    }
     let moved = moves.len();
     for (entry, target) in &moves {
         expect_inserted(

@@ -62,12 +62,42 @@
      /// @brief  Number of "slots" available for `node_t` objects. Equals to @b `limits_.members`.
      mutable std::atomic<std::size_t> nodes_capacity_{};
 
-@@ -2581,6 +2588,16 @@
+@@ -2581,6 +2588,46 @@
      }
 
    public:
 +    context_t& build_context() { return contexts_[0]; }
-+    void release_build_context() { contexts_ = {}; }
++    void release_build_context() {
++        contexts_ = {};
++        limits_.threads_add = 0;
++        limits_.threads_search = 0;
++    }
++    // Representation-only permutation supplied and validated by KTANN. No edge
++    // selection occurs here; node tapes retain their levels and adjacency.
++    template <typename mapping_at, typename check_at>
++    bool remap_slots(mapping_at const& mapping, check_at&& check) {
++        // Centroid changes and append-only canonical insertions preserve slots.
++        std::size_t unchanged = 0;
++        for (; unchanged != size(); ++unchanged) {
++            check();
++            if (mapping[unchanged] != unchanged) break;
++        }
++        if (unchanged == size()) return true;
++        buffer_gt<node_t, nodes_allocator_t> reordered(nodes_capacity_);
++        if (!reordered) return false;
++        for (std::size_t old = 0; old != size(); ++old) {
++            check();
++            node_t node = node_at_(old);
++            node.key(mapping[old]);
++            for (level_t level = 0; level <= node.level(); ++level)
++                for (auto neighbor : neighbors_(node, level))
++                    neighbor = mapping[compressed_slot_t(neighbor)];
++            reordered[mapping[old]] = node;
++        }
++        nodes_ = std::move(reordered);
++        entry_slot_ = mapping[entry_slot_];
++        return true;
++    }
 +    std::size_t entry_slot() const noexcept { return entry_slot_; }
 +    void ensure_successor(std::size_t slot, std::uint32_t successor) {
 +        auto neighbors = neighbors_(node_at_(slot), 0);
@@ -79,7 +109,7 @@
      std::size_t connectivity() const noexcept { return config_.connectivity; }
      std::size_t capacity() const noexcept { return nodes_capacity_; }
      std::size_t size() const noexcept { return nodes_count_; }
-@@ -3431,7 +3448,8 @@
+@@ -3431,7 +3478,8 @@
          metric_at&& metric,                        //
          index_search_config_t config = {},         //
          predicate_at&& predicate = predicate_at{}, //
@@ -89,7 +119,7 @@
 
          // Someone is gonna fuzz this, so let's make sure we cover the basics
          if (!wanted)
-@@ -3442,13 +3460,14 @@
+@@ -3442,13 +3490,14 @@
              config.expansion = default_expansion_search();
 
          // Using references is cleaner, but would result in UBSan false positives
@@ -106,7 +136,7 @@
          context_t& context = *context_ptr;
          top_candidates_t& top = *top_ptr;
          // Go down the level, tracking only the closest match
-@@ -3789,18 +3808,27 @@
+@@ -3789,18 +3838,27 @@
              reset();
              return result.failed("Out of memory");
          }
@@ -135,7 +165,7 @@
              if (!progress(i + 1, header_size.value))
                  return result.failed("Terminated by user");
          }
-@@ -4366,10 +4394,20 @@
+@@ -4366,10 +4424,24 @@
          }
      }
 
@@ -143,11 +173,14 @@
 -        std::uniform_real_distribution<double> distribution(0.0, 1.0);
 -        double r = -std::log(distribution(level_generator)) * pre_.inverse_log_connectivity;
 -        return (level_t)r;
-+    // KTANN: fixed SplitMix64 words, integer geometric sampling, at most 17 layers.
++    // KTANN: geometric levels stop when their expected population at 65536 nodes is below one.
 +    level_t choose_random_level_(std::uint64_t& state) const noexcept {
 +        std::uint64_t threshold = UINT64_MAX / config_.connectivity;
 +        threshold += UINT64_MAX % config_.connectivity == config_.connectivity - 1;
 +        level_t level = 0;
++        level_t highest = 0;
++        for (std::size_t population = 65536; population >= config_.connectivity;
++             population /= config_.connectivity) ++highest;
 +        while (level != 16) {
 +            std::uint64_t word = (state += UINT64_C(0x9e3779b97f4a7c15));
 +            word = (word ^ (word >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
@@ -156,11 +189,12 @@
 +            if (word >= threshold) break;
 +            ++level;
 +        }
-+        return level;
++        // Preserve the original RNG consumption even when truncating a rare tail.
++        return (std::min)(level, highest);
      }
 
      struct candidates_range_t;
-@@ -4439,7 +4477,7 @@
+@@ -4439,7 +4511,7 @@
      template <typename value_at, typename metric_at, typename prefetch_at = dummy_prefetch_t>
      compressed_slot_t search_for_one_(                                //
          value_at&& query, metric_at&& metric, prefetch_at&& prefetch, //
@@ -169,7 +203,7 @@
 
          visits_hash_set_t& visits = context.visits;
          visits.clear();
-@@ -4466,7 +4504,7 @@
+@@ -4466,7 +4538,7 @@
                  // Actual traversal
                  for (compressed_slot_t candidate_slot : closest_neighbors) {
                      distance_t candidate_dist = context.measure(query, citerator_at(candidate_slot), metric);
@@ -178,7 +212,7 @@
                          closest_dist = candidate_dist;
                          closest_slot = candidate_slot;
                          changed = true;
-@@ -4487,7 +4525,7 @@
+@@ -4487,7 +4559,7 @@
      template <typename value_at, typename metric_at, typename prefetch_at = dummy_prefetch_t>
      bool search_to_insert_(                                           //
          value_at&& query, metric_at&& metric, prefetch_at&& prefetch, //
@@ -187,7 +221,7 @@
 
          visits_hash_set_t& visits = context.visits;
          next_candidates_t& next = context.next_candidates; // pop min, push
-@@ -4547,7 +4585,8 @@
+@@ -4547,7 +4619,8 @@
                  // so we don't have to lock it.
                  // node_lock_t successor_lock = node_lock_(successor_slot);
                  distance_t successor_dist = context.measure(query, citerator_at(successor_slot), metric);
@@ -197,7 +231,7 @@
                      // This can substantially grow our priority queue:
                      next.insert({-successor_dist, successor_slot});
                      // This will automatically evict poor matches:
-@@ -4716,7 +4755,8 @@
+@@ -4716,7 +4789,8 @@
                      continue;
 
                  distance_t successor_dist = context.measure(query, citerator_at(successor_slot), metric);
@@ -207,7 +241,7 @@
                      // This can substantially grow our priority queue:
                      next.insert({-successor_dist, successor_slot});
                      if (is_dummy<predicate_at>() ||
-@@ -4761,7 +4801,7 @@
+@@ -4761,7 +4835,7 @@
      distance_t inter_neighbor_distance_(                                   //
          candidate_t const& candidate, candidate_t const& submitted,        //
          compressed_slot_t override_slot, override_value_at override_value, //
@@ -216,7 +250,7 @@
          if (candidate.slot == override_slot)
              return context.measure(override_value, citerator_at(submitted.slot), metric);
          else if (submitted.slot == override_slot)
-@@ -4774,7 +4814,7 @@
+@@ -4774,7 +4848,7 @@
      distance_t inter_neighbor_distance_(                            //
          candidate_t const& candidate, candidate_t const& submitted, //
          compressed_slot_t, std::nullptr_t,                          //
@@ -225,7 +259,7 @@
          return context.measure(citerator_at(candidate.slot), citerator_at(submitted.slot), metric);
      }
 
-@@ -4796,7 +4836,7 @@
+@@ -4796,7 +4870,7 @@
          std::size_t needed, top_candidates_t& top, context_t& context, //
          std::size_t& refines_counter,                                  //
          compressed_slot_t override_slot = ((std::numeric_limits<compressed_slot_t>::max))(),

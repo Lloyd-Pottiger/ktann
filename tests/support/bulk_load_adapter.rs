@@ -10,6 +10,9 @@ use ktann::runtime::Runtime;
 use ktann::storage::backend::{Backend, ReadOps};
 use std::path::Path;
 
+#[path = "graph_updates.rs"]
+mod graph_updates;
+
 /// Exercises both manual loading and worker acceptance across a real backend
 /// reopen, then checks exact bytes before publication and ordinary verification.
 pub async fn exercise<B: Backend>(backend: impl Fn() -> B, directory: &Path) {
@@ -21,8 +24,19 @@ pub async fn exercise<B: Backend>(backend: impl Fn() -> B, directory: &Path) {
     ] {
         let path = directory.join(name);
         std::fs::create_dir(&path).unwrap();
-        exercise_mode(&backend, &path, fixed, metric).await;
+        exercise_mode(&backend, &path, fixed, metric, false, &|_, _| {}).await;
     }
+    exercise_updates(&backend, &directory.join("graph-updates"), &|_, _| {}).await;
+}
+
+/// The same graph-update corpus is used by all adapters; Memory adds commit faults.
+pub async fn exercise_updates<B: Backend>(
+    backend: &impl Fn() -> B,
+    directory: &Path,
+    fault: &dyn Fn(&'static str, usize),
+) {
+    std::fs::create_dir(directory).unwrap();
+    exercise_mode(backend, directory, true, Metric::L2, true, fault).await;
 }
 
 async fn exercise_mode<B: Backend>(
@@ -30,26 +44,38 @@ async fn exercise_mode<B: Backend>(
     directory: &Path,
     fixed: bool,
     metric: Metric,
+    updates: bool,
+    fault: &dyn Fn(&'static str, usize),
 ) {
     let config = IndexConfig::new(2, metric)
         .unwrap()
-        .with_leaf_partition_entries(4, 16)
-        .and_then(|config| config.with_internal_partition_entries(2, 4))
+        .with_leaf_partition_entries(if updates { 1 } else { 4 }, if updates { 2 } else { 16 })
+        .and_then(|config| {
+            config.with_internal_partition_entries(2, if updates { 2048 } else { 4 })
+        })
         .unwrap()
         .with_fields(vec![FieldSchema::new("bucket", DataType::I64).unwrap()])
         .unwrap()
         .with_tree_key_fields(vec![FieldId(0)])
         .unwrap();
     let config = if fixed {
-        config.with_fixed_graph(ktann::api::FixedGraphConfig::new(4, 16, [3; 32]).unwrap())
+        config.with_fixed_graph(
+            ktann::api::FixedGraphConfig::new(
+                if updates { 16 } else { 4 },
+                if updates { 64 } else { 16 },
+                [3; 32],
+            )
+            .unwrap(),
+        )
     } else {
         config
     };
+    let record_count: u64 = if updates { 4096 } else { 128 };
     let source = InputSnapshot::create(
         &directory.join("source"),
         config,
         1024 * 1024,
-        (0..128_u64).map(|id| {
+        (0..record_count).map(|id| {
             Record::new(
                 Bytes::copy_from_slice(&id.to_be_bytes()),
                 vec![id as f32, 1.0],
@@ -61,7 +87,11 @@ async fn exercise_mode<B: Backend>(
     .unwrap();
     let tree = ConstructionOptions {
         sample_items: 16,
-        memory_bytes: 2 * 1024 * 1024,
+        memory_bytes: if updates {
+            128 * 1024 * 1024
+        } else {
+            2 * 1024 * 1024
+        },
         scratch_bytes: 16 * 1024 * 1024,
     };
     let raw = backend();
@@ -108,7 +138,7 @@ async fn exercise_mode<B: Backend>(
     .unwrap();
     let options = BulkLoadOptions {
         max_mutations: 17,
-        max_bytes: 4096,
+        max_bytes: if updates { 128 * 1024 } else { 4096 },
     };
     job.load_serving(&serving, options).await.unwrap();
     let root = directory.join("worker");
@@ -157,7 +187,10 @@ async fn exercise_mode<B: Backend>(
         "{:?}",
         verified.issues
     );
-    assert_eq!(verified.objects.vector_records, 128);
+    assert_eq!(verified.objects.vector_records, record_count);
+    if updates {
+        graph_updates::exercise(&raw, &index, id, fault).await;
+    }
     // Exercise real storage reads for both serving modes after durable loading.
     // The default beam is exhaustive for this small two-Tree-Key fixture.
     let modes = if fixed {
@@ -194,7 +227,7 @@ async fn exercise_mode<B: Backend>(
                 .collect();
             // The beam covers every leaf in this fixture. This original-vector
             // oracle is independent of both routing implementations.
-            let mut expected: Vec<_> = (0..128_u64)
+            let mut expected: Vec<_> = (0..record_count)
                 .map(|id| {
                     let distance = match metric {
                         Metric::L2 => id as f64,

@@ -1182,7 +1182,7 @@ async fn case_graph_storage<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
         index,
         IndexConfig::new(1, Metric::L2)
             .unwrap()
-            .with_internal_partition_entries(4096, 16384)
+            .with_internal_partition_entries(128, 16384)
             .unwrap(),
         [0; 32],
         vec![],

@@ -62,7 +62,7 @@ quota. Live snapshots retain old data; applications control their lifetime.
 Conflict history is reclaimed when writers finish and capped at 100,000 key
 references and 8 MiB of key bytes. Writers with protected reads older than that
 window abort with `RetryableAbort`. The adapter enforces 10,000-byte keys,
-100,000-byte values, and budgets of 10,000 mutations and 1 MiB per transaction.
+100,000-byte values, and budgets of 10,000 mutations and 9,000,000 mutation bytes per transaction.
 It does not advertise transactional range clear, so index drop uses bounded
 point deletes. See [ADR 0024](../adr/0024-production-memory-adapter.md).
 
@@ -152,7 +152,7 @@ fields, noncanonical values, nonzero padding, and trailing bytes.
 
 ### 6.1 Manifests and serving values
 
-The Index Manifest stores the persistent format version (`FORMAT_VERSION = 2`),
+The Index Manifest stores the persistent format version (`FORMAT_VERSION = 3`),
 lifecycle state, immutable configuration, Logical Index ID, RaBitQ rotation
 seed, and exact Bloom parameters. The configuration encodes four big-endian
 u32 capacities in leaf minimum, leaf maximum, internal minimum, internal maximum
@@ -185,7 +185,7 @@ centroid and incoming projection atomically.
 
 Graph Descriptor and Graph Chunk values use tags `0x12` and `0x13`; their
 partition subkeys are `0x06` and `0x07`. Chunk keys end in a big-endian u32
-ordinal. Every complete graph value is at most 64 KiB. The descriptor binds
+ordinal. Every complete graph value is at most 100,000 bytes. The descriptor binds
 one immutable topology to its source Header and canonical Child Entries;
 structural and digest validation precede native allocation. The exact envelope,
 topology grammar, source digest, and loading budget belong to
@@ -334,3 +334,8 @@ Final graph descriptor/chunks are ordinary Serving Artifact entries. Completed
 Build Load seals them with the Child Entries; exact publication validation covers
 all their bytes. The write-attempt owner rejects fixed Active mutations and
 maintenance while lifecycle/drop and fenced Building writes retain their authority.
+
+Ordinary local-graph replacements use one transaction for all chunks, stale-tail
+chunk deletion, the descriptor and authoritative projections. There is no graph
+staging namespace or maintenance record. The bounded configuration and topology
+contract is owned by [the local graph design](partition-local-hnsw.md#ordinary-ready-partition-updates).

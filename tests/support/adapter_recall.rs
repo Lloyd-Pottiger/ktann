@@ -39,7 +39,9 @@ fn config(dimension: usize, minimum: u32, maximum: u32) -> IndexConfig {
         .with_tree_key_fields(vec![FieldId(0)])
         .expect("valid tree key fields")
         .with_leaf_partition_entries(minimum, maximum)
-        .and_then(|config| config.with_internal_partition_entries(minimum, maximum))
+        .and_then(|config| {
+            config.with_internal_partition_entries(minimum.min(128), maximum.min(16_384))
+        })
         .expect("valid partition entries")
 }
 

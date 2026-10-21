@@ -19,7 +19,7 @@ pub use ktann::storage::backend::BackendNamespace;
 const FDB_MAX_KEY_BYTES: usize = 10_000;
 const FDB_MAX_VALUE_BYTES: usize = 100_000;
 const DEFAULT_MAX_MUTATIONS: usize = 10_000;
-const DEFAULT_MAX_MUTATION_BYTES: usize = 1 << 20;
+const DEFAULT_MAX_MUTATION_BYTES: usize = 9_000_000;
 const MAX_SCAN_PAGE_BYTES: usize = 80 << 10;
 const MAX_CONCURRENT_READS: usize = 1_024;
 const PHYSICAL_PREFIX_HEADER: &[u8] = b"\0ktann";

@@ -44,7 +44,7 @@ Current implementation boundaries:
 
 | Existing owner | Verified behavior and implication |
 | --- | --- |
-| [`IndexConfig`](../../src/api/config.rs) | Independent leaf/internal min/max pairs are implemented; each maximum is capped at 65,536. FixedGraphConfig selects fixed mode and persists graph construction parameters. |
+| [`IndexConfig`](../../src/api/config.rs) | Independent leaf/internal min/max pairs are implemented; leaf maximum is capped at 65,536; internal maximum at 16,384 and internal minimum at 128. FixedGraphConfig selects fixed mode and persists graph construction parameters. |
 | [`construct_tree`, `ConstructionOptions`](../../src/construction.rs) | Bottom-up construction selects capacities by level, including root-fit. Memory admission reserves sample, centroid and row buffers; caller-retained output is excluded. |
 | [`local_hnsw`](../../src/search/local_hnsw.rs), [`ktann-usearch`](../../ktann-usearch/README.md) | Standalone graph construction, search, exact local top-k, structural inspection, and reusable bounded scratch are implemented. Bulk Build constructs and persists graphs; production queries explicitly select exact or graph routing. |
 | [`ForestArtifact`](../../src/bulk/forest.rs), [`ServingArtifact`](../../src/bulk/serving.rs) | Forest plans bind source/configuration/rotation/sample size. Serving preparation proves exact joins and emits canonical values; optional artifact refinement completes before final forest acceptance; serving encoding builds graphs from final Child Entries. |
@@ -167,7 +167,7 @@ The algorithm contract is:
 - Require canonical strictly increasing Child Entry Partition Keys; reject
   duplicate or noncanonical input. Dense u32 ordinals follow that order. Build
   serially in ordinal order and retain no centroid copies in the native graph.
-- Require `2 <= M <= 32768` and `ef_construction >= M`. Layer zero has at most
+- Require `2 <= M <= 16` and `ef_construction >= M`. Layer zero has at most
   `2*M` outgoing edges; upper layers have at most `M`. Actual degree also cannot
   exceed the number of other nodes. Clip construction exploration to the node
   count, preserving the supplied quality parameters as identity inputs.
@@ -177,9 +177,9 @@ The algorithm contract is:
   little-endian u64 parent Partition Key.
 - Sample levels from a fixed SplitMix64 stream. For each node, start at zero;
   promote while the next word is below `floor(2^64/M)`, stopping at level 16.
-  No further word is consumed at the cap. This gives seventeen finite layers
-  and avoids platform-dependent random distributions and logarithms. The
-  stream constants and operations are recorded in the vendored patch.
+  No further word is consumed at level 16. Cap the sampled result at
+  `floor(log_M(65536))` without changing stream consumption. Integer arithmetic
+  avoids platform-dependent random distributions and logarithms.
 - Preserve USearch's best-first construction and diversity neighbor selection:
   consider candidates by distance/key; a candidate is discarded when an
   already-selected neighbor is strictly closer to it than the insertion
@@ -222,7 +222,8 @@ output for the independent exact selector. Neighbor-pruning scratch is allocated
 only for construction. Workspace counters distinguish retained bytes from total
 allocation events. Allocation failure returns `LimitExceeded`; it never changes
 M or ef. Encoding and restoration include their buffers in operation admission;
-publication IO remains owned by Bulk Build.
+initial publication IO remains owned by Bulk Build. Ordinary update publication
+uses the atomic replacement protocol below.
 
 Operation control is checked during input validation, between inserted nodes,
 at most every 64 distance calls, and during reachability and result loops.
@@ -315,8 +316,8 @@ little-endian native layout below; encoding 2 identifies the big-endian layout.
 A reader rejects the other host byte order. The supported layout and key/slot
 widths are fixed by the vendored dependency; updates must revalidate the native
 layout and validator together. The project has no released format to migrate. The descriptor
-stores no duplicate entry point, levels, or graph configuration. Node count is
-in `1..=65536`; empty local cores are supported in memory but are not persistent
+stores no duplicate entry point, levels, or graph configuration. Persisted graph node count is
+in `1..=16386`; empty local cores are supported in memory but are not persistent
 internal bodies. The source Header must be Ready, at level greater than one,
 with the same exact count and epoch. Singleton internal partitions have the
 ordinary descriptor. Leaf partitions have no graph keys; empty forests and leaf
@@ -346,9 +347,9 @@ payload size compared with an active-edge-only codec; encoded-size admission and
 them, including for a singleton with large M.
 
 Chunk values are `0x13 | payload_length:u32 | payload`. Every nonfinal payload
-has exactly 65,531 bytes, and the final payload has 1..=65,531 bytes, so the full
-value is at most 65,536 bytes. Chunk keys end in contiguous u32 ordinals from
-zero; count is `ceil(payload_bytes/65531)`. Boundaries are independent of backend,
+has exactly 99,995 bytes, and the final payload has 1..=99,995 bytes, so the full
+value is at most 100,000 bytes. Chunk keys end in contiguous u32 ordinals from
+zero; count is `ceil(payload_bytes/99995)`. Boundaries are independent of backend,
 budget, node, and adjacency boundaries, including an adjacency crossing chunks.
 Missing, repeated, extra, reordered, wrong-size, or checksum-mismatched chunks
 fail with Corruption. Complete chunk-range scanning is required; reading only
@@ -470,12 +471,12 @@ partial Search Outcome. Keep graph work counters separate from that accounting.
 are authoritative for writes. The current
 [FoundationDB adapter](../../ktann-foundationdb/src/backend.rs) limits physical
 keys to 10,000 bytes and values to 100,000 bytes, with conservative admission of
-10,000 mutations and 1 MiB mutation bytes per transaction. Its physical prefix
+10,000 mutations and 9,000,000 mutation bytes per transaction. Its physical prefix
 counts against limits. FDB native affected-data limits can still reject a
 transaction below these policy budgets. RocksDB currently uses the same
 transaction admission sizes despite larger hard value limits.
 
-64-KiB graph values fit the current FDB value ceiling; they are not permission
+100,000-byte graph values fit the current FDB value ceiling; they are not permission
 to exceed another backend's advertised limit. Serving encoding checks every
 key/value, including chunk framing. Load planning accounts for graph keys,
 physical prefix bytes, checkpoints and fencing overhead, using the existing
@@ -561,13 +562,13 @@ construction and artifact bindings, root-fit/grouping, occupancy validation,
 refinement leaf bounds, and mutable maintenance thresholds/drain/recovery age.
 Level 1 selects leaf bounds; higher levels select internal bounds, including
 roots, with the root minimum-occupancy exception. Both pairs require positive
-minimum, `2*minimum <= maximum`, and maximum at most 65,536. Defaults remain
+minimum, `2*minimum <= maximum`, and maximum at most 16,384 for internal partitions (65,536 for leaves). Defaults remain
 64/512 for both pairs. Exact routing already uses these independently sized
 trees. All four values participate in Manifest and forest/serving identity;
 these pre-release contracts change directly without a version upgrade.
 
-Capacity experiments start with leaf maxima 64/128 and internal maxima
-4096/8192/16384/32768, subject to the measured working-set limits above. These are
+Earlier capacity experiments included 32768; current supported operating points
+include internal maxima 4096/8192/16384 and leaf maxima 64/128. These are
 experimental inputs, not defaults. Independent sizing must preserve a fixed leaf
 layout/centroids when comparing internal grouping; no rerank-budget sweeps.
 
@@ -587,3 +588,134 @@ The step-9 experiment entrypoints and metric semantics are documented in
 Benchmark-only global routing and diagnostic replay are feature-gated and use the
 production leaf/rerank pipeline. They do not add a production global index or
 change the fixed-index mutation contract. Matched-recall tuning remains step 10.
+
+## Ordinary Ready-partition updates
+
+Step 11 adds composable primitives in `storage::graph_updates`; it does not
+admit mutations through `Index`, enable automatic maintenance on Fixed Indexes,
+or change foreground write routing. Low-level storage callers already own
+transactional invariant preservation. The topology owner must compose child
+creation, removal or transfer with graph publication in the same transaction.
+Calling a parent-edge operation alone does not establish valid tree membership.
+
+### Algorithm and preparation
+
+`GraphUpdateSource::read` collects a complete Ready internal body from one
+snapshot with bounded scans. `prepare` consumes that source and a canonical,
+nonempty proposed Child Entry body. It validates the old graph before modifying
+it, checks finite coordinates, level/count/capacity, and constructs the next
+parent Header with one epoch increment. An unchanged body does not advance the epoch. An empty internal body and non-Ready topology states
+belong to the later topology-transition contract.
+
+Insertion and centroid replacement consume a private restored USearch graph.
+The distance callback uses proposed centroids throughout the update. Old slots
+retain their identity while USearch replaces their neighborhoods; inserted nodes
+are appended. A representation-only permutation then restores canonical child
+ordinal order, including keys, adjacency and entry slot. USearch still owns
+insertion, neighborhood selection and pruning. The existing directed-reachability
+audit and bounded successor repair run on the complete private result. Candidate
+distances are not recomputed.
+
+A batch containing any deletion uses the same canonical builder as initial
+construction. This removes nodes and their storage without tombstones or a
+separate stable-slot directory. The accepted cost is whole-parent construction
+for such a batch: the step-10 Cohere 128/16384 single-root case took 13.61 seconds
+for build/serialization. That measurement excludes centroid reads and publication
+and is not a latency promise for this update path. A small synthetic native probe
+also found a substantial single-centroid update cost advantage, but does not
+establish end-to-end maintenance throughput or long-run quality.
+
+`prepare` is synchronous CPU work. Its caller must dispatch it to bounded blocking
+execution and retain admission through actual exit. Its budget covers source and
+proposed centroids, kernel, restoration, native scratch, ordinal mapping, encoded
+output and the retained authoritative delta. Cancellation discards private state.
+Prepared graphs never populate the shared query cache. Ordinary leaf membership
+changes and cache misses do not cause preparation or parent-centroid changes.
+
+### Bounded atomic publication
+
+The production configuration supports internal split thresholds up to 16,384
+(8,192 remains a supported operating point), internal minimum occupancy up to
+128, and graph M in 2..=16. Leaves retain their independent capacity limits.
+Internal graph preparation permits two transient entries above the configured
+split threshold. Exposing a split's two targets waits when the parent is already
+above its threshold: ancestors must make room first.
+
+Native level sampling retains its original SplitMix64 word consumption and
+geometric distribution, but caps the returned level at `floor(log_M(65536))`.
+This is 4 for M=16; the expected population beyond that level is below one even
+at the native maximum node count. The integer calculation is shared semantically
+by sampling, safe decoding and serialization admission. For an accepted M, the
+height cap preserves the configured degree, ef and metric. Tests compare sampling
+before/after, including a seed with an original level 6 node.
+
+A node at level L occupies `16 + 8*M + L*(4 + 4*M)` serialized bytes, plus a
+40-byte header per graph. For M in 2..=16 the per-node bound is at most 416 bytes.
+The backend mutation-byte admission is 9,000,000 bytes; FDB's separate affected-
+data ceiling is 10,000,000 bytes and includes conflict ranges. Graph chunk values
+are at most 100,000 bytes (99,995 payload bytes plus framing).
+
+For graph-aware internal topology, a drain batch touches one source and one
+receiver. A split distributes at most `threshold + 2` children; do not charge
+both bodies as full independent copies of the original population. A merging
+source has fewer than 128 children; its receiver has at most `threshold + 2`
+after the batch. Thus at threshold 16,384, the two graph bodies hold at most
+16,513 nodes and occupy at most 6,869,488 bytes. At most 70 chunks suffice. Even
+with 10,000-byte physical keys, a conservative charge for framing, mutation keys,
+write-conflict endpoints and a 900,000-byte authority envelope remains below
+10,000,000 bytes. A native FDB 7.3 probe of this worst-case payload/key shape
+committed at approximately 9,868,260 affected bytes.
+
+`PreparedGraphUpdate::publish` update-protects the Active Manifest, source Header
+and descriptor, validates changed child authorities, then writes the complete
+replacement graph, deletes any obsolete tail chunks, and updates Child Entries,
+changed child centroids, Header and descriptor in one transaction. Its own
+non-graph changes and protected reads are bounded by the authority envelope;
+a topology coordinator must budget its additional mutations and all participating
+graphs against that same combined envelope. Preparation remains outside the
+transaction. A stale source fails before publication. The backend's actual
+admission and commit checks remain authoritative; arbitrary caller-composed
+extra writes are not exempt from them.
+
+After an unknown commit, `published` recognizes only the exact target Header and
+descriptor. Callers check it before repeating accompanying child creation/removal.
+An unchanged source permits retry; a superseded source cannot prove a past commit.
+Cancellation before commit discards the transaction. There is no begin/load,
+pending or retired generation, durable progress cursor, cancel operation or graph
+GC. Existing backend snapshots retain overwritten graph bytes for old queries;
+caches still validate the source epoch and descriptor before reuse.
+
+### Split/merge integration boundary
+
+The graph-aware storage drain validates a single receiver and the transient
+node ceilings. The following scheduling/composition rules are part of the next
+integration step; public Fixed Index writes remain rejected until it is complete:
+
+- Split exposure adds two parent references only when the parent is at or below
+  its threshold. Otherwise split the ancestor first. Foreground/structural changes
+  must respect the two-slot transient ceiling rather than treating it as another
+  asynchronous threshold.
+- Drain one receiver per transaction; choose a batch that fits the combined
+  authority envelope and receiver headroom. Split conservation bounds the two
+  graph bodies. Merge source membership only decreases after entry into Merging.
+- A receiver at its ceiling must split before accepting more children. Select
+  another Ready receiver or wait for that split; never publish an oversized body.
+  Small merge sources and one-receiver batches avoid both an unbounded fan-out
+  and a full-sized source+receiver transaction.
+- Leaf drains do not change parent centroids/graphs merely for membership moves.
+  Final source removal changes its parent's graph; root conversion creates a
+  small two-child root. Empty receiving/draining graph behavior, source-prefix
+  cleanup, epoch rebinding on state transitions and graph-aware write routing
+  still require integration. Do not rewrite unaffected receiver graphs at completion.
+- Every moved child and all affected graph descriptors must switch atomically;
+  a graph-aware transaction cannot reuse the old graph-free transition alone.
+
+Repeated-update quality and performance validation remains required before enabling
+mutable graph serving. The serialization proof and storage probes establish atomic
+publication feasibility, not throughput or long-running recall.
+
+Obsolete source-tail chunk deletions count against the same combined 900,000-byte
+non-payload envelope, including their physical keys and conflict costs. They are
+not additional to the bound. Ordinary publication includes those deletes before
+its envelope preflight; future topology composition must enforce this envelope
+across all participants. A smaller batch or narrower keys may be needed to fit.

@@ -32,9 +32,9 @@ pub struct FixedGraphConfig {
 }
 
 impl FixedGraphConfig {
-    /// Creates graph parameters; degree is bounded by the persistent node limit.
+    /// Creates graph parameters for bounded atomic internal-graph publication.
     pub fn new(m: u32, ef_construction: u32, seed: [u8; 32]) -> Result<Self> {
-        if !(2..=ktann_usearch::MAX_NODES as u32 / 2).contains(&m) || ef_construction < m {
+        if !(2..=16).contains(&m) || ef_construction < m {
             return Err(Error::invalid_argument());
         }
         Ok(Self {
@@ -145,6 +145,9 @@ impl IndexConfig {
     /// Sets internal occupancy bounds and the asynchronous split threshold.
     pub fn with_internal_partition_entries(mut self, minimum: u32, maximum: u32) -> Result<Self> {
         validate_partition_entries(minimum, maximum)?;
+        if maximum > 16_384 || minimum > 128 {
+            return Err(Error::invalid_argument());
+        }
         self.min_internal_partition_entries = minimum;
         self.max_internal_partition_entries = maximum;
         Ok(self)
@@ -153,6 +156,10 @@ impl IndexConfig {
     /// Validates every immutable and cross-field invariant.
     pub fn validate(&self) -> Result<()> {
         if !(1..=MAX_DIMENSION).contains(&self.dimension) {
+            return Err(Error::invalid_argument());
+        }
+        if self.max_internal_partition_entries > 16_384 || self.min_internal_partition_entries > 128
+        {
             return Err(Error::invalid_argument());
         }
         self.validate_schema()?;
