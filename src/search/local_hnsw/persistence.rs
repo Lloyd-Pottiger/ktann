@@ -59,11 +59,21 @@ pub(super) fn identity(
     }]);
     hash.update((centroids.kernel.dimension() as u64).to_be_bytes());
     hash.update((centroids.children.len() as u64).to_be_bytes());
+    // Batch canonical coordinates without retaining a second centroid body.
+    let mut coordinates = [0_u8; 1024];
     for child in centroids.children {
         check()?;
         hash.update(child.child().get().to_be_bytes());
-        for value in child.centroid() {
-            hash.update((if *value == 0.0 { 0 } else { value.to_bits() }).to_be_bytes());
+        for chunk in child
+            .centroid()
+            .chunks(coordinates.len() / size_of::<f32>())
+        {
+            for (value, encoded) in chunk.iter().zip(coordinates.as_chunks_mut::<4>().0) {
+                encoded.copy_from_slice(
+                    &(if *value == 0.0 { 0 } else { value.to_bits() }).to_be_bytes(),
+                );
+            }
+            hash.update(&coordinates[..std::mem::size_of_val(chunk)]);
         }
     }
     Ok(hash.finalize().into())

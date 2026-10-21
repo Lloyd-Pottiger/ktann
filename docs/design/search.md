@@ -249,9 +249,14 @@ snapshot and may reuse cached data only when epoch and kind match; otherwise it
 loads and decodes the partition from that snapshot.
 
 Leaf bodies expand validated RaBitQ7 components to signed bytes once on load.
-They retain the numeric header and expanded components instead of the packed
-payload; cached Record IDs own their bytes so they cannot keep the old encoded
-buffer alive. Cache accounting includes the expanded allocation. Scoring keeps
+Each leaf body owns one contiguous expanded-component buffer, and its entries
+retain numeric headers and ranges into that buffer instead of packed payloads.
+Initial reservation is capped at one scan page; larger bodies grow as validated
+entries arrive. Storage validation and the subsequent expansion remain separate
+passes, and complete body counts are checked before publication. Cached Record
+IDs own their bytes so they cannot keep the old encoded buffer alive. Cache
+accounting charges the shared expanded allocation once at the body owner, in
+addition to entry-owned data and the body envelope. Scoring keeps
 the scalar-f64 accumulation order and the same conservative interval arithmetic;
 the persistent RaBitQ7 format is unchanged.
 

@@ -42,17 +42,21 @@ struct CodeHeader {
 
 /// A validated code expanded once for an immutable cached leaf body.
 /// The packed payload is not retained alongside these signed components.
-pub(crate) struct DecodedRaBitQ7 {
+pub(crate) struct DecodedRaBitQ7<C> {
     header: CodeHeader,
-    codes: Box<[i8]>,
+    codes: C,
 }
 
-impl DecodedRaBitQ7 {
-    /// Expands a payload already validated by the Leaf Entry decoder.
-    pub(crate) fn from_validated_leaf_bytes(encoded: &[u8], dimension: usize) -> Self {
+impl DecodedRaBitQ7<std::ops::Range<usize>> {
+    /// Appends a validated payload to its leaf body's shared component buffer.
+    pub(crate) fn append_validated_leaf_bytes(
+        encoded: &[u8],
+        dimension: usize,
+        codes: &mut Vec<i8>,
+    ) -> Self {
         let packed = RaBitQ7::from_validated_leaf_bytes(encoded, dimension);
         let dimension = packed.dimension;
-        let mut codes = Vec::with_capacity(dimension);
+        let start = codes.len();
         // Decode each complete packed group once, including its sign nibble.
         for index in 0..dimension / 4 {
             let block = packed.code_block(index);
@@ -61,15 +65,20 @@ impl DecodedRaBitQ7 {
         codes.extend((dimension / 4 * 4..dimension).map(|index| packed.signed_code(index)));
         Self {
             header: packed.header,
-            codes: codes.into_boxed_slice(),
+            codes: start..codes.len(),
         }
     }
 
-    /// Returns the retained signed-code allocation size in bytes.
-    pub(crate) fn heap_bytes(&self) -> usize {
-        self.codes.len()
+    /// Borrows this entry's components from the owning immutable leaf body.
+    pub(crate) fn view<'a>(&self, codes: &'a [i8]) -> DecodedRaBitQ7<&'a [i8]> {
+        DecodedRaBitQ7 {
+            header: self.header,
+            codes: &codes[self.codes.clone()],
+        }
     }
+}
 
+impl DecodedRaBitQ7<&[i8]> {
     /// Scores independent lanes with the scalar accumulation order in each lane.
     pub(crate) fn approximate_distances<const N: usize>(
         codes: [&Self; N],

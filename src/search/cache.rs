@@ -90,16 +90,16 @@ impl CacheKey {
     }
 }
 
-/// Search-only Leaf Entry representation; owns expanded codes instead of packed bytes.
+/// Search-only Leaf Entry metadata indexing its body-owned expanded components.
 pub(crate) struct CachedLeafEntry {
     record_id: bytes::Bytes,
     fields: Box<[Value]>,
-    code: super::rabitq::DecodedRaBitQ7,
+    code: super::rabitq::DecodedRaBitQ7<std::ops::Range<usize>>,
 }
 
 impl CachedLeafEntry {
     /// Consumes an already validated persistent entry and releases its packed code.
-    fn from_leaf(entry: LeafEntry, dimension: usize) -> Self {
+    fn from_leaf(entry: LeafEntry, dimension: usize, codes: &mut Vec<i8>) -> Self {
         let (record_id, fields, packed) = entry.into_parts();
         // Persistent decoding slices the ID and packed code from one wire buffer.
         // Detach the ID so the cache does not keep that packed buffer alive.
@@ -107,7 +107,9 @@ impl CachedLeafEntry {
         Self {
             record_id,
             fields,
-            code: super::rabitq::DecodedRaBitQ7::from_validated_leaf_bytes(&packed, dimension),
+            code: super::rabitq::DecodedRaBitQ7::append_validated_leaf_bytes(
+                &packed, dimension, codes,
+            ),
         }
     }
 
@@ -122,15 +124,18 @@ impl CachedLeafEntry {
     }
 
     /// Returns the code expanded while loading this immutable body.
-    pub(crate) fn code(&self) -> &super::rabitq::DecodedRaBitQ7 {
-        &self.code
+    pub(crate) fn code<'a>(&self, codes: &'a [i8]) -> super::rabitq::DecodedRaBitQ7<&'a [i8]> {
+        self.code.view(codes)
     }
 }
 
 /// The decoded search body of one partition.
 pub(crate) enum BodyEntries {
-    /// The decoded Leaf Entries of a leaf partition.
-    Leaf(Box<[CachedLeafEntry]>),
+    /// Validated Leaf Entries and their one shared expanded-code buffer.
+    Leaf {
+        entries: Box<[CachedLeafEntry]>,
+        codes: Box<[i8]>,
+    },
     /// The decoded Child Entries of an internal partition.
     Internal(Box<[ChildEntry]>),
     /// A complete fixed internal partition; graph and projections have one owner.
@@ -666,6 +671,14 @@ impl BodyScan {
         } = *self;
         let kind = key.kind;
         let mut leaf_entries: Vec<CachedLeafEntry> = Vec::new();
+        // Do not trust an unchecked Header to request an unbounded allocation.
+        // Multi-page bodies grow only as actual validated entries arrive.
+        let mut codes = Vec::with_capacity(if kind == PartitionKind::Leaf {
+            (header.entry_count() as usize).min(BODY_SCAN_LIMITS.item_limit)
+                * manifest.config().dimension()
+        } else {
+            0
+        });
         let mut child_entries: Vec<ChildEntry> = Vec::new();
         let mut bytes = size_of::<CachedBody>() as u64
             + if kind == PartitionKind::Internal {
@@ -687,8 +700,11 @@ impl BodyScan {
                 }
                 match (kind, item.into_value()) {
                     (PartitionKind::Leaf, PersistentValue::LeafEntry(entry)) => {
-                        let entry =
-                            CachedLeafEntry::from_leaf(entry, manifest.config().dimension());
+                        let entry = CachedLeafEntry::from_leaf(
+                            entry,
+                            manifest.config().dimension(),
+                            &mut codes,
+                        );
                         bytes = bytes.saturating_add(leaf_entry_bytes(&entry));
                         leaf_entries.push(entry);
                     }
@@ -708,8 +724,13 @@ impl BodyScan {
             return Err(Error::new(ErrorKind::Corruption));
         }
 
+        // Expanded components belong to the body, not to individual entries.
+        bytes = bytes.saturating_add(codes.len() as u64);
         let entries = match kind {
-            PartitionKind::Leaf => BodyEntries::Leaf(leaf_entries.into_boxed_slice()),
+            PartitionKind::Leaf => BodyEntries::Leaf {
+                entries: leaf_entries.into_boxed_slice(),
+                codes: codes.into_boxed_slice(),
+            },
             PartitionKind::Internal => BodyEntries::Internal(child_entries.into()),
         };
         Ok((entries, bytes))
@@ -784,12 +805,11 @@ pub(super) async fn load_body<T: ReadOps>(
     .await
 }
 
-/// The accounted decoded size of one Leaf Entry: the envelope, the Record ID
-/// and expanded signed codes, and every filter field including string payloads.
+/// Entry-owned bytes: the envelope, Record ID, and filter fields with payloads.
+/// The shared expanded-code buffer is accounted once by the owning body.
 fn leaf_entry_bytes(entry: &CachedLeafEntry) -> u64 {
     let mut bytes = size_of::<CachedLeafEntry>() as u64;
     bytes = bytes.saturating_add(entry.record_id().len() as u64);
-    bytes = bytes.saturating_add(entry.code.heap_bytes() as u64);
     for field in entry.fields() {
         bytes = bytes.saturating_add(field_bytes(field));
     }
@@ -872,16 +892,17 @@ mod tests {
         let wire = Bytes::from(wire);
         let entry = LeafEntry::new(wire.slice(..2), Vec::new(), wire.slice(2..));
         assert!(!wire.is_unique());
-        let cached = CachedLeafEntry::from_leaf(entry, 768);
+        let mut codes = Vec::new();
+        let cached = CachedLeafEntry::from_leaf(entry, 768, &mut codes);
         assert!(
             wire.is_unique(),
             "cached IDs must not retain the packed payload"
         );
         assert_eq!(cached.record_id().as_ref(), b"id");
-        assert_eq!(cached.code().heap_bytes(), 768);
+        assert_eq!(codes.len(), 768);
         assert_eq!(
             leaf_entry_bytes(&cached),
-            (size_of::<CachedLeafEntry>() + 2 + 768) as u64
+            (size_of::<CachedLeafEntry>() + 2) as u64
         );
     }
 
@@ -890,18 +911,22 @@ mod tests {
     }
 
     fn cached_leaf_body(epoch: u64, ids: &[&[u8]]) -> Arc<CachedBody> {
+        let mut codes = Vec::new();
         let entries: Vec<CachedLeafEntry> = ids
             .iter()
-            .map(|id| CachedLeafEntry::from_leaf(leaf_entry(id), 1))
+            .map(|id| CachedLeafEntry::from_leaf(leaf_entry(id), 1, &mut codes))
             .collect();
-        let mut bytes = size_of::<CachedBody>() as u64;
+        let mut bytes = (size_of::<CachedBody>() + codes.len()) as u64;
         for entry in &entries {
             bytes += leaf_entry_bytes(entry);
         }
         Arc::new(CachedBody {
             epoch,
             bytes,
-            entries: BodyEntries::Leaf(entries.into_boxed_slice()),
+            entries: BodyEntries::Leaf {
+                entries: entries.into_boxed_slice(),
+                codes: codes.into_boxed_slice(),
+            },
         })
     }
 
@@ -920,7 +945,7 @@ mod tests {
 
     fn leaf_ids(body: &CachedBody) -> Vec<Bytes> {
         match body.entries() {
-            BodyEntries::Leaf(entries) => entries
+            BodyEntries::Leaf { entries, .. } => entries
                 .iter()
                 .map(|entry| entry.record_id().clone())
                 .collect(),
@@ -1017,7 +1042,7 @@ mod tests {
 
         assert!(matches!(
             cache.lookup(&leaf, 3).expect("leaf hit").entries(),
-            BodyEntries::Leaf(_)
+            BodyEntries::Leaf { .. }
         ));
         assert!(matches!(
             cache.lookup(&internal, 3).expect("internal hit").entries(),
@@ -1243,6 +1268,11 @@ mod tests {
                 .map(|id| Bytes::copy_from_slice(id))
                 .collect::<Vec<_>>()
         );
+        assert_eq!(
+            bodies[1].bytes,
+            (size_of::<CachedBody>() + 300 * (size_of::<CachedLeafEntry>() + 4 + 1)) as u64,
+            "all pages contribute IDs and expanded components exactly once"
+        );
         assert_eq!(leaf_ids(&bodies[2]), vec![Bytes::from_static(b"last")]);
         let reads = super::prefetch_bodies(&mut txn, &cache, &manifest, &requests)
             .await
@@ -1364,7 +1394,7 @@ mod tests {
                 let children: Vec<u64> = entries.iter().map(|entry| entry.child().get()).collect();
                 assert_eq!(children, vec![2, 3]);
             }
-            BodyEntries::Leaf(_) | BodyEntries::FixedInternal(_) => {
+            BodyEntries::Leaf { .. } | BodyEntries::FixedInternal(_) => {
                 panic!("expected an internal body")
             }
         }
@@ -1378,6 +1408,7 @@ mod tests {
 
         let (first, mock) = load(&cache, &manifest, mock, 1).await.expect("load");
         assert!(leaf_ids(&first).is_empty());
+        assert_eq!(first.bytes, size_of::<CachedBody>() as u64);
         let (second, mock) = load(&cache, &manifest, mock, 1).await.expect("load");
         assert_eq!(mock.scans, 1);
         assert!(Arc::ptr_eq(&first, &second));

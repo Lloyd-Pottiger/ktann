@@ -935,7 +935,7 @@ impl Traversal {
         body: &CachedBody,
         predicate: Option<&CompiledPredicate>,
     ) -> Result<()> {
-        let BodyEntries::Leaf(entries) = body.entries() else {
+        let BodyEntries::Leaf { entries, codes } = body.entries() else {
             return Err(Error::new(ErrorKind::Corruption));
         };
         #[cfg(feature = "benchmark")]
@@ -959,9 +959,9 @@ impl Traversal {
                 &mut self.visited_leaf_entries,
                 |entry| entry.fields(),
             )?;
-            score_leaf_entries(&filtered, context.query)?
+            score_leaf_entries(&filtered, codes, context.query)?
         } else {
-            let batch = score_leaf_entries(entries, context.query)?;
+            let batch = score_leaf_entries(entries, codes, context.query)?;
             filter_candidates(batch, None, &mut self.visited_leaf_entries, |candidate| {
                 candidate.value().fields()
             })?
@@ -1047,13 +1047,14 @@ impl Traversal {
 /// score's accumulation order without copying the unfiltered body's references.
 fn score_leaf_entries<'a, T: Borrow<CachedLeafEntry>>(
     entries: &'a [T],
+    components: &[i8],
     query: &RaBitQQuery<'_>,
 ) -> Result<Vec<ApproximateCandidate<&'a CachedLeafEntry>>> {
     let mut batch = Vec::with_capacity(entries.len());
     let (chunks, remainder) = entries.as_chunks::<4>();
     for entries in chunks {
-        let codes: [_; 4] = std::array::from_fn(|lane| entries[lane].borrow().code());
-        let distances = DecodedRaBitQ7::approximate_distances(codes, query)
+        let codes: [_; 4] = std::array::from_fn(|lane| entries[lane].borrow().code(components));
+        let distances = DecodedRaBitQ7::approximate_distances(codes.each_ref(), query)
             .map_err(|_| Error::new(ErrorKind::Corruption))?;
         for (entry, distance) in entries.iter().zip(distances) {
             let entry = entry.borrow();
@@ -1067,8 +1068,9 @@ fn score_leaf_entries<'a, T: Borrow<CachedLeafEntry>>(
     for entry in remainder {
         // Loading the immutable body validates every payload before filtering,
         // so rejected entries cannot hide malformed persistent codes.
-        let [distance] = DecodedRaBitQ7::approximate_distances([entry.borrow().code()], query)
-            .map_err(|_| Error::new(ErrorKind::Corruption))?;
+        let [distance] =
+            DecodedRaBitQ7::approximate_distances([&entry.borrow().code(components)], query)
+                .map_err(|_| Error::new(ErrorKind::Corruption))?;
         let entry = entry.borrow();
         batch.push(ApproximateCandidate::new(
             entry.record_id().clone(),

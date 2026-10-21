@@ -91,7 +91,7 @@ pub(super) fn approximate_distance(
 /// at most `dimension` rounding steps per term, preserving the dot-error
 /// bound in `finish_distance` while shortening the addition dependency chain.
 pub(super) fn approximate_distances<const N: usize>(
-    codes: [&DecodedRaBitQ7; N],
+    codes: [&DecodedRaBitQ7<&[i8]>; N],
     query: &RaBitQQuery<'_>,
 ) -> Result<[ApproximateDistance; N]> {
     if codes
