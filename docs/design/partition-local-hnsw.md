@@ -217,7 +217,7 @@ Ordinary leaf membership changes do not refresh parent centroids or rebuild grap
 
 | Topology change | Graph work in the same publication |
 | --- | --- |
-| Split exposure | Add the two target edges to the parent's graph; require parent headroom before exposure |
+| Split exposure | Add the two target edges to the parent's graph; require parent headroom and defer exposure into a ReceivingSplit parent |
 | Internal drain | Move children to one receiver per batch and replace both changed graph bodies |
 | Merge receiver reselection | Plan against a fresh Ready receiver and its available headroom |
 | Emptying or populating an internal body | Remove all graph records with the last child, or build a graph for the first child |
@@ -251,6 +251,13 @@ can temporarily hold two entries above its split threshold. Split exposure waits
 for ancestors to make room instead of exceeding this allowance. Together with
 the degree and level caps, these bounds limit a source/receiver graph rewrite;
 raising them requires revisiting the joint publication bound.
+
+A ReceivingSplit internal partition cannot accept new child split exposures
+until its source finishes draining. Moving entries from the source preserves
+their combined count; exposing a child's split would increase it even when the
+receiver itself has spare capacity. Deferring that exposure preserves the
+source/receiver bound and lets the ancestor finish before child maintenance
+resumes. Foreground leaf writes continue normally.
 
 Graph-aware internal drains target one receiver per transaction. All participants
 share a 900,000-byte authority envelope for non-payload changes and protected

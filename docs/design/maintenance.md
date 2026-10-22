@@ -227,7 +227,9 @@ it, prepares private native graphs under Runtime admission, then protects source
 versions and commits typed topology changes together with graph publication.
 It uses the same searchable states and exact membership operations described
 above. Internal drains select one receiver per transaction; exposure and drains
-respect graph transient capacity. State-only transitions keep the body epoch and
+respect graph transient capacity. Child split exposure into a ReceivingSplit
+parent waits for that parent's source to finish, preserving the combined
+source/receiver graph bound. State-only transitions keep the body epoch and
 graph unchanged. Leaf membership changes do not rebuild parent graphs.
 
 The [partition-local graph contract](partition-local-hnsw.md) owns the combined

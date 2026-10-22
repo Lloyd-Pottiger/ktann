@@ -240,9 +240,7 @@ pub(crate) async fn advance_observed<'b, B: Backend>(
                     let parent_header = body.header.ok_or_else(corrupt)?;
                     if !matches!(
                         parent_header.state(),
-                        PartitionState::Ready
-                            | PartitionState::Splitting
-                            | PartitionState::ReceivingSplit
+                        PartitionState::Ready | PartitionState::Splitting
                     ) || parent_header.entry_count()
                         > manifest.config().max_internal_partition_entries()
                     {

@@ -93,8 +93,8 @@ pub enum SplitExposure {
     /// completed); the step wrote nothing and must be abandoned.
     SourceAdvanced,
     /// The source's current parent cannot accept the new Child Entries (it
-    /// is itself draining or merging); the step wrote nothing and must be
-    /// abandoned so a later attempt can rediscover the source's parent.
+    /// is draining, merging, or lacks graph headroom); the step wrote nothing
+    /// and must be abandoned so a later attempt can rediscover the source's parent.
     ParentNotAccepting,
 }
 
@@ -292,10 +292,13 @@ pub async fn expose_split_targets<T: WriteTxn>(
             _ => return Ok(SplitExposure::ParentNotAccepting),
         }
         if manifest.config().local_graph().is_some()
-            && parent_header.entry_count() > manifest.config().max_internal_partition_entries()
+            && (parent_header.state() == PartitionState::ReceivingSplit
+                || parent_header.entry_count() > manifest.config().max_internal_partition_entries())
         {
-            // The parent must split first; two exposure edges use its reserved
-            // transient slots and cannot recursively consume unbounded headroom.
+            // A receiving parent must finish draining its source before adding
+            // new edges: spare receiver capacity does not imply spare capacity
+            // in their combined graph rewrite. Other parents reserve two slots
+            // for exposure and must split before consuming further headroom.
             return Ok(SplitExposure::ParentNotAccepting);
         }
         Some((parent, parent_header))

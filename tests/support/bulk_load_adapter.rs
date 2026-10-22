@@ -175,12 +175,21 @@ async fn exercise_mode<B: Backend>(
         ErrorKind::IndexBuilding
     );
     let raw = backend();
-    let mut txn = raw.begin_read().await.unwrap();
-    for entry in serving.reader().unwrap() {
-        let entry = entry.unwrap();
-        assert_eq!(txn.get(entry.key).await.unwrap(), Some(entry.value));
+    // Loading is complete and the hidden namespace is immutable, so batches
+    // need no shared snapshot. Keep reads within FoundationDB's transaction
+    // lifetime even when the artifact contains thousands of entries.
+    let mut entries = serving.reader().unwrap();
+    loop {
+        let batch: Vec<_> = entries.by_ref().take(128).map(Result::unwrap).collect();
+        if batch.is_empty() {
+            break;
+        }
+        let mut txn = raw.begin_read().await.unwrap();
+        let keys = batch.iter().map(|entry| entry.key.clone()).collect();
+        let actual = txn.batch_get(keys).await.unwrap();
+        let expected: Vec<_> = batch.into_iter().map(|entry| Some(entry.value)).collect();
+        assert_eq!(actual, expected);
     }
-    drop(txn);
     let index = reopened.complete(worker.clone()).await.unwrap();
     let verified = index
         .verify(ktann::api::VerifyOptions::default())

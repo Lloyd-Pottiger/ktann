@@ -1,5 +1,8 @@
 //! Repeated mutable graph quality experiment on held-out SIFT/Cohere queries.
-//! Usage: ktann-mutable-graph DATASET NEW_OUTPUT_DIRECTORY [RECORDS] [ROUNDS] [INTERNAL_MIN:MAX]
+//! Usage:
+//! ```text
+//! ktann-mutable-graph DATASET NEW_OUTPUT_DIRECTORY [RECORDS] [ROUNDS] [INTERNAL_MIN:MAX]
+//! ```
 #[path = "../../../tests/support/audit.rs"]
 #[allow(dead_code)]
 mod audit;
