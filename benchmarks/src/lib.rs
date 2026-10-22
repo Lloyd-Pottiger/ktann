@@ -14,9 +14,11 @@ mod runner;
 
 pub mod bridge;
 
-/// Repeated mutable graph update and rebuild quality experiments.
-#[cfg(feature = "rocksdb")]
-pub mod update_history;
+// Shared measurement and dataset helpers used by standalone benchmark binaries.
+pub use backend::MeasuredBackend;
+pub use dataset::{limit_with_query_offset, load, load_large};
+pub use metrics::MetricCapture;
+pub use resource::ResourceSnapshot;
 
 #[path = "../../tests/support/oracle.rs"]
 #[expect(
