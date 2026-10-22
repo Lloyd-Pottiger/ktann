@@ -24,6 +24,8 @@ use crate::storage::backend::{Backend, CommitCancellation, CommitStart};
 use self::fixup::FixupQueue;
 
 mod compute;
+pub(crate) mod graph_maintenance;
+pub use graph_maintenance::GraphMaintenance;
 mod routing_graph;
 
 pub(crate) mod bulk_load;
@@ -177,6 +179,9 @@ impl<B: Backend> Runtime<B> {
 
         let foreground_limit = config.foreground_operation_limit();
         let partition_cache = Arc::new(PartitionCache::new(config.partition_cache_bytes()));
+        let maintenance_cancel = CancellationToken::new();
+        let graph_maintenance =
+            graph_maintenance::GraphMaintenance::new(&config, maintenance_cancel.clone());
         let runtime = Self {
             handle: Arc::new(RuntimeHandle {
                 inner: Arc::new(RuntimeInner {
@@ -187,7 +192,8 @@ impl<B: Backend> Runtime<B> {
                     fixups: Mutex::new(FixupQueue::new(config.fixup_queue_capacity())),
                     fixup_reporting: Mutex::new(()),
                     fixup_available: Notify::new(),
-                    maintenance_cancel: CancellationToken::new(),
+                    maintenance_cancel,
+                    graph_maintenance,
                     lifecycle: Mutex::new(Lifecycle {
                         phase: Phase::Accepting,
                         active: 0,
@@ -515,6 +521,7 @@ pub(crate) struct RuntimeInner<B: Backend> {
     fixup_reporting: Mutex<()>,
     fixup_available: Notify,
     maintenance_cancel: CancellationToken,
+    graph_maintenance: graph_maintenance::GraphMaintenance,
     lifecycle: Mutex<Lifecycle<B>>,
     terminal: Notify,
 }

@@ -94,8 +94,14 @@ A Bulk Build-only Logical Index with immutable published serving bytes and one
 persisted graph per internal partition. Exact query routing remains available;
 selecting it does not grant mutation or maintenance capability.
 
+**Mutable Graph Index**:
+A Logical Index with partition-local HNSW graphs maintained atomically with
+internal membership changes. Foreground writes retain existing tree routing.
+Empty internal bodies have no graph; nonempty bodies in every searchable
+topology state have one snapshot-bound graph.
+
 **Child Entry**:
-An internal-partition entry containing one child Partition Key and its centroid projection. The projection is immutable while serving; offline refinement replaces it atomically with the child centroid.
+An internal-partition entry containing one child Partition Key and its centroid projection. Replacing the projection updates the child centroid atomically, together with the parent graph when configured.
 _Avoid_: Parent pointer, Leaf Entry
 
 **Filter Predicate**:

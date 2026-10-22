@@ -1,55 +1,33 @@
-//! Preparation and fenced publication of ordinary Ready-partition graph changes.
+//! Ordinary Ready-partition projection changes over the shared graph lifecycle.
 //!
-//! These storage primitives do not enable mutable graph serving. The topology
-//! owner must compose child creation/removal or transfers with `publish` in the
-//! same transaction. Callers roll back on any error, dispatch `prepare` to their
-//! bounded CPU executor, and retain admission until the computation exits.
+//! The topology owner composes child creation/removal with publication in the
+//! same transaction. Native preparation runs outside it under retained admission.
 
-use super::backend::{ReadOps, ScanLimits, WriteTxn};
+use super::backend::{ReadOps, WriteTxn};
+use super::graph_transitions::{GraphTransitionSource, PreparedGraphTransition};
 use super::keys::{LogicalKey, TreeKey};
 use super::values::{
-    ChildEntry, GraphChunk, GraphDescriptor, IndexLifecycle, IndexManifest, PartitionCentroid,
-    PartitionHeader, PartitionState, PersistentValue,
+    ChildEntry, IndexLifecycle, PartitionCentroid, PartitionHeader, PartitionState, PersistentValue,
 };
-use super::{LogicalRange, ReadLogicalTxn, WriteLogicalTxn};
+use super::{ReadLogicalTxn, WriteLogicalTxn};
 use crate::api::{Error, ErrorKind, PartitionKey, Result};
-use crate::search::local_hnsw::{
-    Centroids,
-    persistence::{GraphRecords, GraphSource, update_records},
-};
-use crate::search::numeric::VectorKernel;
-
-const PAGE: ScanLimits = ScanLimits {
-    item_limit: 64,
-    byte_limit: 256 * 1024,
-};
 
 fn corrupt() -> Error {
     Error::new(ErrorKind::Corruption)
 }
-
 fn stale() -> Error {
     Error::new(ErrorKind::RetryableAbort)
 }
-
 fn limit() -> Error {
     Error::new(ErrorKind::LimitExceeded)
 }
 
-/// Complete source from one backend snapshot, without retaining that transaction.
+/// Complete source for one ordinary nonempty Ready internal partition.
 #[derive(Debug)]
-pub struct GraphUpdateSource {
-    manifest: IndexManifest,
-    tree: TreeKey,
-    parent: PartitionKey,
-    header: PartitionHeader,
-    descriptor: GraphDescriptor,
-    children: Vec<ChildEntry>,
-    chunks: Vec<(u32, GraphChunk)>,
-}
+pub struct GraphUpdateSource(GraphTransitionSource);
 
 impl GraphUpdateSource {
-    /// Reads a bounded complete source. Native validation occurs during preparation.
+    /// Reads the shared bounded graph snapshot, with ordinary-update admission.
     pub async fn read<T: ReadOps>(
         txn: &mut ReadLogicalTxn<'_, T>,
         tree: &TreeKey,
@@ -57,209 +35,77 @@ impl GraphUpdateSource {
         working_bytes: usize,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<Self> {
-        check()?;
-        let manifest = txn.require_manifest()?.clone();
-        let index = manifest.logical_index_id();
+        let manifest = txn.require_manifest()?;
         if manifest.lifecycle() != IndexLifecycle::Active
-            || manifest.config().fixed_graph().is_none()
+            || manifest.config().local_graph().is_none()
         {
             return Err(Error::invalid_argument());
         }
-        let values = txn
-            .batch_get(vec![
-                LogicalKey::Manifest(index),
-                LogicalKey::Header {
-                    index,
-                    tree_key: tree.clone(),
-                    partition: parent,
-                },
-                LogicalKey::GraphDescriptor {
-                    index,
-                    tree_key: tree.clone(),
-                    partition: parent,
-                },
-            ])
-            .await?;
-        let mut values = values.into_iter();
-        if values.next().flatten() != Some(PersistentValue::IndexManifest(manifest.clone())) {
-            return Err(stale());
-        }
-        let Some(PersistentValue::PartitionHeader(header)) = values.next().flatten() else {
-            return Err(corrupt());
-        };
-        let Some(PersistentValue::GraphDescriptor(descriptor)) = values.next().flatten() else {
-            return Err(corrupt());
-        };
+        let source = GraphTransitionSource::read(txn, tree, parent, working_bytes, check).await?;
+        let header = source.header().ok_or_else(corrupt)?;
         if header.state() != PartitionState::Ready || header.level() <= 1 {
             return Err(stale());
         }
-        if header.entry_count() == 0
-            || header.entry_count() > manifest.config().max_internal_partition_entries() + 2
-        {
+        if header.entry_count() == 0 {
             return Err(corrupt());
         }
-        let entry_bytes = manifest
-            .config()
-            .dimension()
-            .checked_mul(4)
-            .and_then(|n| n.checked_add(std::mem::size_of::<ChildEntry>() + 64))
-            .ok_or_else(limit)?;
-        let retained = entry_bytes
-            .checked_mul(header.entry_count() as usize)
-            .and_then(|n| n.checked_add(usize::try_from(descriptor.bytes).ok()?))
-            .and_then(|n| n.checked_add(PAGE.byte_limit + 4096))
-            .ok_or_else(limit)?;
-        if retained > working_bytes {
-            return Err(limit());
-        }
-        let mut children = Vec::new();
-        children
-            .try_reserve_exact(header.entry_count() as usize)
-            .map_err(|_| limit())?;
-        let range = LogicalRange::child_entries(&manifest, tree, parent)?;
-        let mut cursor = None;
-        loop {
-            check()?;
-            let (items, next) = txn.scan(&range, cursor.as_ref(), PAGE).await?.into_parts();
-            for item in items {
-                if children.len() == header.entry_count() as usize {
-                    return Err(corrupt());
-                }
-                let PersistentValue::ChildEntry(child) = item.into_value() else {
-                    return Err(corrupt());
-                };
-                children.push(child);
-            }
-            cursor = next;
-            if cursor.is_none() {
-                break;
-            }
-        }
-        if children.len() != header.entry_count() as usize {
-            return Err(corrupt());
-        }
-        let mut chunks = Vec::new();
-        chunks
-            .try_reserve_exact(descriptor.chunks() as usize)
-            .map_err(|_| limit())?;
-        let range = LogicalRange::graph_chunks(&manifest, tree, parent)?;
-        let mut cursor = None;
-        loop {
-            check()?;
-            let (items, next) = txn.scan(&range, cursor.as_ref(), PAGE).await?.into_parts();
-            for item in items {
-                let LogicalKey::GraphChunk { chunk, .. } = item.key() else {
-                    return Err(corrupt());
-                };
-                let ordinal = *chunk;
-                if ordinal as usize != chunks.len() || chunks.len() == descriptor.chunks() as usize
-                {
-                    return Err(corrupt());
-                }
-                let PersistentValue::GraphChunk(chunk) = item.into_value() else {
-                    return Err(corrupt());
-                };
-                chunks.push((ordinal, chunk));
-            }
-            cursor = next;
-            if cursor.is_none() {
-                break;
-            }
-        }
-        Ok(Self {
-            manifest,
-            tree: tree.clone(),
-            parent,
-            header,
-            descriptor,
-            children,
-            chunks,
-        })
+        Ok(Self(source))
     }
 
-    /// Authoritative canonical Child Entries to transform into the proposed body.
+    /// Canonical authoritative projections to transform into the proposed body.
     pub fn children(&self) -> &[ChildEntry] {
-        &self.children
+        self.0.children()
     }
 
-    /// Prepares a canonical nonempty next body without IO or cache publication.
-    /// `None` denotes an unchanged body and does not advance the epoch.
+    /// Prepares a canonical nonempty next body. `None` leaves the epoch unchanged.
     pub fn prepare(
         self,
         next: Vec<ChildEntry>,
         working_bytes: usize,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<Option<PreparedGraphUpdate>> {
-        let config = self.manifest.config();
-        let kernel = VectorKernel::new(
-            config.dimension(),
-            config.metric(),
-            *self.manifest.rotation_seed(),
-        )?;
-        let capacity = config.max_internal_partition_entries() as usize + 2;
-        let old_centroids =
-            Centroids::new(&kernel, &self.children, capacity, check).map_err(|error| {
-                if error.kind() == ErrorKind::InvalidArgument {
-                    corrupt()
-                } else {
-                    error
-                }
-            })?;
-        let next_centroids = Centroids::new(&kernel, &next, capacity, check)?;
+        check()?;
         if next.is_empty()
             || next
                 .iter()
-                .any(|child| child.child() == self.parent || child.child().get() == 1)
+                .any(|child| child.child() == self.0.partition || child.child().get() == 1)
         {
             return Err(Error::invalid_argument());
         }
-        if self.children == next {
+        if self.children() == next {
             return Ok(None);
         }
+        let source_header = self.0.header().ok_or_else(corrupt)?;
         let header = PartitionHeader::new(
-            self.header.level(),
+            source_header.level(),
             next.len() as u32,
-            self.header
+            source_header
                 .cache_epoch()
                 .checked_add(1)
                 .ok_or_else(corrupt)?,
             PartitionState::Ready,
         )?;
-        let source = GraphSource {
-            index: self.manifest.logical_index_id(),
-            tree: &self.tree,
-            parent: self.parent,
-            header: self.header,
-            parameters: config.fixed_graph().ok_or_else(corrupt)?.parameters(),
-        };
         let change_capacity = self
-            .children
+            .children()
             .len()
             .checked_add(next.len())
             .ok_or_else(limit)?;
         let change_bytes = change_capacity
             .checked_mul(std::mem::size_of::<Change>())
             .ok_or_else(limit)?;
-        let available = working_bytes
-            .checked_sub(kernel.heap_bytes() + 4096 + change_bytes)
-            .ok_or_else(limit)?;
-        let records = update_records(
-            old_centroids,
-            next_centroids,
-            source,
-            &self.descriptor,
-            self.chunks,
-            header,
-            available,
+        let (graph, old, next) = self.0.prepare_with_entries(
+            Some(header),
+            next,
+            working_bytes.checked_sub(change_bytes).ok_or_else(limit)?,
             check,
         )?;
-        // Move changed projections into the delta rather than retaining a third
-        // full centroid allocation alongside the source and proposed bodies.
+        // Move projections after native work, avoiding a third centroid copy at
+        // the native allocation peak. Only changed entries survive preparation.
         let mut changes = Vec::new();
         changes
             .try_reserve_exact(change_capacity)
             .map_err(|_| limit())?;
-        let mut old = self.children.into_iter().peekable();
+        let mut old = old.into_iter().peekable();
         let mut new = next.into_iter().peekable();
         while old.peek().is_some() || new.peek().is_some() {
             check()?;
@@ -285,26 +131,16 @@ impl GraphUpdateSource {
                 }),
             }
         }
-        Ok(Some(PreparedGraphUpdate {
-            manifest: self.manifest,
-            tree: self.tree,
-            parent: self.parent,
-            source_header: self.header,
-            source: self.descriptor,
-            header,
-            records,
-            changes,
-        }))
+        Ok(Some(PreparedGraphUpdate { graph, changes }))
     }
 }
 
-/// Exact authoritative delta retained after private graph preparation.
+/// Changed projections, including their child authority expectations.
 #[derive(Debug)]
 struct Change {
     old: Option<ChildEntry>,
     new: Option<ChildEntry>,
 }
-
 impl Change {
     fn child(&self) -> PartitionKey {
         self.old
@@ -315,54 +151,40 @@ impl Change {
     }
 }
 
-/// Private graph result bound to one source epoch and one authoritative delta.
+/// Exact graph replacement plus the ordinary projection and centroid delta.
 #[derive(Debug)]
 pub struct PreparedGraphUpdate {
-    manifest: IndexManifest,
-    tree: TreeKey,
-    parent: PartitionKey,
-    source_header: PartitionHeader,
-    source: GraphDescriptor,
-    header: PartitionHeader,
-    records: GraphRecords,
+    graph: PreparedGraphTransition,
     changes: Vec<Change>,
 }
 
 impl PreparedGraphUpdate {
-    /// Checks exact durable publication before staging accompanying topology
-    /// writes after an unknown commit result. Supersession is not success evidence.
+    /// Resolves unknown commits only by the shared exact target identity.
     pub async fn published<T: WriteTxn>(&self, txn: &mut WriteLogicalTxn<'_, T>) -> Result<bool> {
-        let (header, descriptor) = authority(txn, &self.tree, self.parent).await?;
-        if header == self.header && descriptor == self.records.descriptor {
-            return Ok(true);
-        }
-        if header != self.source_header || descriptor != self.source {
-            return Err(stale());
-        }
-        Ok(false)
+        self.graph.published(txn).await
     }
 
-    /// Atomically replaces the graph and its authoritative projections. The
-    /// caller composes child creation/removal/reparenting in this transaction and
-    /// commits it. False recognizes an already committed identical result.
-    /// No durable staging exists: cancellation/rollback discards all writes.
+    /// Atomically publishes graph, parent projections/Header and child centroids.
+    /// False recognizes an identical result already committed. The caller owns
+    /// accompanying child creation/removal and must roll back on any error.
     pub async fn publish<T: WriteTxn>(&self, txn: &mut WriteLogicalTxn<'_, T>) -> Result<bool> {
         if self.published(txn).await? {
             return Ok(false);
         }
-        let header = self.source_header;
-        let index = self.manifest.logical_index_id();
+        let header = self.graph.source_header.ok_or_else(corrupt)?;
+        let index = self.graph.manifest.logical_index_id();
+        let tree = &self.graph.tree;
         for batch in self.changes.chunks(32) {
             let mut keys = Vec::with_capacity(batch.len() * 2);
             for change in batch {
                 keys.push(LogicalKey::Header {
                     index,
-                    tree_key: self.tree.clone(),
+                    tree_key: tree.clone(),
                     partition: change.child(),
                 });
                 keys.push(LogicalKey::Centroid {
                     index,
-                    tree_key: self.tree.clone(),
+                    tree_key: tree.clone(),
                     partition: change.child(),
                 });
             }
@@ -388,25 +210,11 @@ impl PreparedGraphUpdate {
             }
         }
         let mut builder = txn.mutations();
-        self.queue_publication(
-            &mut builder,
-            txn.admission_budget().mutation_key_overhead_bytes,
-        )?;
-        txn.apply(builder).await?;
-        Ok(true)
-    }
-
-    fn queue_publication(
-        &self,
-        builder: &mut super::MutationBuilder<'_>,
-        key_overhead: usize,
-    ) -> Result<()> {
-        let index = self.manifest.logical_index_id();
         for change in &self.changes {
             let key = LogicalKey::ChildEntry {
                 index,
-                tree_key: self.tree.clone(),
-                partition: self.parent,
+                tree_key: tree.clone(),
+                partition: self.graph.partition,
                 child: change.child(),
             };
             if let Some(new) = &change.new {
@@ -414,7 +222,7 @@ impl PreparedGraphUpdate {
                 builder.put(
                     LogicalKey::Centroid {
                         index,
-                        tree_key: self.tree.clone(),
+                        tree_key: tree.clone(),
                         partition: new.child(),
                     },
                     PersistentValue::PartitionCentroid(PartitionCentroid::new(new.centroid())),
@@ -426,105 +234,22 @@ impl PreparedGraphUpdate {
         builder.put(
             LogicalKey::Header {
                 index,
-                tree_key: self.tree.clone(),
-                partition: self.parent,
+                tree_key: tree.clone(),
+                partition: self.graph.partition,
             },
-            PersistentValue::PartitionHeader(self.header),
+            PersistentValue::PartitionHeader(self.graph.header.ok_or_else(corrupt)?),
         )?;
-        builder.put(
-            LogicalKey::GraphDescriptor {
-                index,
-                tree_key: self.tree.clone(),
-                partition: self.parent,
-            },
-            PersistentValue::GraphDescriptor(self.records.descriptor.clone()),
-        )?;
-        // Shorter replacements remove their old tail in the same commit.
-        for chunk in self.records.descriptor.chunks()..self.source.chunks() {
-            builder.delete(LogicalKey::GraphChunk {
-                index,
-                tree_key: self.tree.clone(),
-                partition: self.parent,
-                chunk,
-            })?;
-        }
-        // Bound authority changes and obsolete-tail deletes independently of new
-        // graph payloads. A topology coordinator includes its writes in the same 900 KB
-        // envelope when composing multiple graph publications.
-        let protected_key_bytes = self.tree.as_bytes().len() + 64;
-        let read_cost = (self.changes.len() * 2 + 3)
-            .checked_mul(2 * (protected_key_bytes + key_overhead) + 64)
-            .ok_or_else(limit)?;
-        if builder
-            .affected_bytes()?
-            .checked_add(read_cost)
+        self.graph.append_authority(&mut builder)?;
+        if txn
+            .affected_bytes()
+            .checked_add(builder.affected_bytes()?)
             .ok_or_else(limit)?
             > 900_000
         {
             return Err(limit());
         }
-        for (chunk, value) in self.records.chunks() {
-            builder.put(
-                LogicalKey::GraphChunk {
-                    index,
-                    tree_key: self.tree.clone(),
-                    partition: self.parent,
-                    chunk,
-                },
-                PersistentValue::GraphChunk(value),
-            )?;
-        }
-        Ok(())
+        self.graph.append_payload(&mut builder)?;
+        txn.apply(builder).await?;
+        Ok(true)
     }
-}
-
-/// Protects lifecycle and the exact source version without retaining a read
-/// transaction across native work. Backend snapshots preserve overwritten bytes.
-async fn authority<T: WriteTxn>(
-    txn: &mut WriteLogicalTxn<'_, T>,
-    tree: &TreeKey,
-    parent: PartitionKey,
-) -> Result<(PartitionHeader, GraphDescriptor)> {
-    let manifest = txn.require_manifest()?;
-    if manifest.lifecycle() != IndexLifecycle::Active || manifest.config().fixed_graph().is_none() {
-        return Err(stale());
-    }
-    let index = manifest.logical_index_id();
-    let values = txn
-        .batch_get_for_update(vec![
-            LogicalKey::Manifest(index),
-            LogicalKey::Header {
-                index,
-                tree_key: tree.clone(),
-                partition: parent,
-            },
-            LogicalKey::GraphDescriptor {
-                index,
-                tree_key: tree.clone(),
-                partition: parent,
-            },
-        ])
-        .await?;
-    let mut values = values.into_iter();
-    if values.next().flatten() != Some(PersistentValue::IndexManifest(manifest.clone())) {
-        return Err(stale());
-    }
-    let Some(PersistentValue::PartitionHeader(header)) = values.next().flatten() else {
-        return Err(corrupt());
-    };
-    let Some(PersistentValue::GraphDescriptor(descriptor)) = values.next().flatten() else {
-        return Err(corrupt());
-    };
-    if header.state() != PartitionState::Ready {
-        return Err(stale());
-    }
-    if descriptor.epoch != header.cache_epoch()
-        || descriptor.nodes != header.entry_count()
-        || header.level() <= 1
-        || header.entry_count() == 0
-        || header.entry_count() > manifest.config().max_internal_partition_entries() + 2
-    {
-        return Err(corrupt());
-    }
-    Ok((header, descriptor))
 }

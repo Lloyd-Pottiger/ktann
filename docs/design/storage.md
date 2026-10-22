@@ -321,7 +321,7 @@ membership under conflicts and injected unknown outcomes.
 
 ### Fixed Bulk Build metadata
 
-The immutable Index Configuration stores an optional FixedGraphConfig (`M`,
+The immutable Index Configuration stores an optional LocalGraphConfig (`M`,
 `ef_construction`, seed). Its Manifest encoding places a mode byte after the four
 capacity u32s: 0 for mutable, 1 followed by M:u32, ef_construction:u32 and seed:32
 for fixed, then the existing rotation seed. Build Descriptor encoding appends a
@@ -339,3 +339,9 @@ Ordinary local-graph replacements use one transaction for all chunks, stale-tail
 chunk deletion, the descriptor and authoritative projections. There is no graph
 staging namespace or maintenance record. The bounded configuration and topology
 contract is owned by [the local graph design](partition-local-hnsw.md#ordinary-ready-partition-updates).
+
+Graph-aware topology composes every participating replacement in that same
+transaction. `WriteLogicalTxn::affected_bytes` accounts for protected point reads,
+mutation keys/values, range endpoints and physical key overhead; topology and graph
+authority mutations share the 900,000-byte non-payload envelope before graph
+payloads are admitted. Empty internal bodies have no descriptor or chunks.

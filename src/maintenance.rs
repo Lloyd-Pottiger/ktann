@@ -17,6 +17,7 @@
 
 pub(crate) mod drain;
 pub(crate) mod fixup;
+pub mod graph_topology;
 pub mod merge;
 pub(crate) mod mutation;
 pub mod routing;

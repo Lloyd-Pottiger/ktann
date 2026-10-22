@@ -41,6 +41,10 @@
 //!   at exact count zero. A merge with no legal target never starts; a
 //!   `Merging` partition whose targets disappeared stalls searchable and
 //!   never reverts to `Ready`.
+//!
+//! Mutable graph indexes use [`super::graph_topology::advance`] for body-changing
+//! steps. These direct drivers reject such operations because graph preparation
+//! requires the caller's bounded native executor.
 
 use crate::api::{Error, ErrorKind, PartitionKey, Result};
 use crate::observe::labels::{FixupKind, Operation};
@@ -154,6 +158,9 @@ pub async fn drain_batch<B: Backend>(
     else {
         return Ok(DrainStep::SourceAdvanced);
     };
+    if manifest.config().mutable_graph().is_some() && observed.header.level() > 1 {
+        return Err(Error::invalid_argument());
+    }
     drain_observed(backend, manifest, tree_key, source, retry, observed).await
 }
 
@@ -253,6 +260,9 @@ pub async fn complete_merge<B: Backend>(
     source: PartitionKey,
     retry: &RetryPolicy,
 ) -> Result<topology::MergeCompletion> {
+    if manifest.config().mutable_graph().is_some() {
+        return Err(Error::invalid_argument());
+    }
     let removal = topology::SourceRemoval::for_capabilities(backend.capabilities());
     writes::run_write_attempts(
         backend,
@@ -284,6 +294,9 @@ pub async fn advance<B: Backend>(
     started_at_unix_millis: u64,
     retry: &RetryPolicy,
 ) -> Result<Advance> {
+    if manifest.config().mutable_graph().is_some() {
+        return Err(Error::invalid_argument());
+    }
     let observed = reads::open_authority_read(backend, manifest, tree_key, partition).await?;
     // Nothing was ever persisted here, or a completed merge already removed
     // every value: nothing to advance.

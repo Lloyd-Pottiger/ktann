@@ -20,12 +20,19 @@ At most the configured foreground operation limit may run and the same number
 may wait for admission; further calls fail with `LimitExceeded` rather than
 creating an unbounded process-local queue.
 
-Fixed-graph routing has a separate per-query working-byte ceiling configured by
+Graph routing has a separate per-query working-byte ceiling configured by
 `RuntimeConfig::with_routing_working_bytes`; its accounting contract belongs to
-[Search](search.md#fixed-index-graph-bodies). Native restore and query tasks, including offline graph verification, use
+[Search](search.md#graph-index-bodies). Native restore and query tasks, including offline graph verification, use
 the same cooperative CPU-task boundary as refinement. Foreground admission remains
 owned until those tasks actually exit, including when an awaiting future is
 dropped. Cache retention capacity does not bound such in-flight ownership.
+
+Mutable graph maintenance uses that working-byte ceiling for each complete
+multi-partition preparation. A Runtime-owned `GraphMaintenance` bounds native
+preparations by maintenance-worker count and retains its permit through CPU exit
+after cancellation. Workers also bound the snapshot plans waiting for native
+admission. Explicit low-level callers reuse one admission owner and bound their
+own concurrent drivers; an executor alone does not bound callers' waiting plans.
 
 ## 2. Shutdown
 

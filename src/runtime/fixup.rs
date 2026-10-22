@@ -494,6 +494,7 @@ async fn drive<B: Backend>(inner: &Arc<RuntimeInner<B>>, offer: &FixupOffer) -> 
                 now_unix_millis: started_at,
                 recovery: recovery.take(),
                 retry: &retry,
+                graph: Some(&inner.graph_maintenance),
             },
         )
         .await;

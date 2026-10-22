@@ -13,3 +13,14 @@ mod routing;
 mod runner;
 
 pub mod bridge;
+
+/// Repeated mutable graph update and rebuild quality experiments.
+#[cfg(feature = "rocksdb")]
+pub mod update_history;
+
+#[path = "../../tests/support/oracle.rs"]
+#[expect(
+    dead_code,
+    reason = "shared oracle also exposes integration-only filter helpers"
+)]
+mod oracle;

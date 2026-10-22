@@ -196,6 +196,21 @@ internal capacities do not change those defaults.
 RaBitQ7, online split arity, Lloyd rounds, rotation algorithm, logical codecs, and
 hard safety caps are defined by the Persistent Format.
 
+`IndexConfig::with_fixed_graph(LocalGraphConfig)` selects read-only Bulk Build
+serving. `with_mutable_graph(LocalGraphConfig)` selects graph-aware mutable
+serving, including ordinary empty-index creation and Bulk Build. These modes are
+distinct immutable Manifest and artifact identities; selecting one replaces the
+other. `local_graph()` exposes construction parameters for either mode, while
+`fixed_graph()` and `mutable_graph()` identify the serving policy. Query HNSW is
+available for both; foreground writes keep existing tree routing.
+
+Mutable graph maintenance prepares native graphs outside transactions using one
+shared Runtime admission owner. Explicit low-level maintenance uses
+`maintenance::graph_topology::advance` with a reused `runtime::GraphMaintenance`
+owner; graph-unaware split/merge entrypoints reject graph-changing mutable steps.
+The routing working-byte limit also bounds one complete maintenance preparation,
+including all participating source and proposed bodies and retained output.
+
 ### 4.2 Runtime configuration
 
 `RuntimeConfig` owns the foreground operation limit, cache bytes, worker count,
@@ -322,6 +337,10 @@ and settled Ready topology, before serving. The caller must exclude all other
 index operations, including maintenance from other runtimes, until it returns.
 Local queued or running fixups and non-Ready topology are rejected; idle Runtime
 workers may remain running.
+
+It rejects mutable graph indexes with `InvalidArgument`: serving refinement does
+not implement graph-aware centroid publication. Use optional artifact refinement
+before initial graph construction. Fixed indexes retain `IndexReadOnly`.
 
 `RefineOptions::new(input_bytes)` requires a positive input byte limit and defaults
 to two rounds. Builders accept `with_refinement_rounds(0..=5)` and

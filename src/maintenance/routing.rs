@@ -1321,10 +1321,12 @@ async fn scan_bodies<R: LogicalReader>(
                 cache.lookup(&key, header.cache_epoch())
             });
             if let Some(body) = &cached {
-                let BodyEntries::Internal(entries) = body.entries() else {
-                    return Err(Error::new(ErrorKind::Corruption));
+                let entries = match body.entries() {
+                    BodyEntries::Internal(entries) => entries.as_ref(),
+                    BodyEntries::FixedInternal(graph) => graph.children(),
+                    BodyEntries::Leaf { .. } => return Err(Error::new(ErrorKind::Corruption)),
                 };
-                for entry in entries.iter() {
+                for entry in entries {
                     visit(index, entry)?;
                 }
             }

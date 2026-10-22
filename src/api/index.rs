@@ -281,7 +281,7 @@ impl<B: Backend> Index<B> {
         truth: Option<Vec<Bytes>>,
     ) -> Result<(SearchOutcome, Option<crate::benchmark::SearchDiagnostics>)> {
         if (router.is_some() || truth.is_some())
-            && (self.config().fixed_graph().is_none()
+            && (self.config().local_graph().is_none()
                 || !self.config().tree_key_fields().is_empty())
             || truth
                 .as_ref()
@@ -404,7 +404,9 @@ impl<B: Backend> Index<B> {
         .await
     }
 
-    /// Refines an imported index before serving it, without changing its identity.
+    /// Refines an ordinary imported index before serving it, without changing its identity.
+    /// Mutable graph indexes reject this operation; refine their construction
+    /// artifact before graph construction and Bulk Build publication instead.
     ///
     /// The caller must exclude all other operations and maintenance on this index,
     /// including other Runtime instances. Finish outstanding work first. Local
@@ -415,6 +417,9 @@ impl<B: Backend> Index<B> {
     /// persistent progress or automatic recovery protocol.
     pub async fn refine(&self, options: RefineOptions) -> Result<()> {
         self.require_mutable()?;
+        if self.config().mutable_graph().is_some() {
+            return Err(Error::invalid_argument());
+        }
         let manifest = Arc::clone(&self.manifest);
         let runtime = Arc::clone(&self.runtime);
         let retry = lifecycle::RetryPolicy::from_config(self.runtime.config());

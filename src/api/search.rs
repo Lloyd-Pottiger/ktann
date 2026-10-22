@@ -72,7 +72,7 @@ impl SearchBudgets {
 
 /// Candidate generation inside each internal partition.
 ///
-/// Exact is the default. HNSW requires a fixed index and a positive `ef_search`.
+/// Exact is the default. HNSW requires a graph index and a positive `ef_search`.
 /// The effective exploration width is clipped to the parent size and is at least
 /// the requested local beam; it does not change the exact-rerank budget.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -100,7 +100,7 @@ pub struct SearchOptions {
 }
 
 impl SearchOptions {
-    /// Selects internal routing. HNSW is valid only on a fixed index.
+    /// Selects internal routing. HNSW is valid only on a graph index.
     ///
     /// ```
     /// use ktann::api::{RoutingMode, SearchOptions};

@@ -138,7 +138,7 @@ pub(crate) enum BodyEntries {
     },
     /// The decoded Child Entries of an internal partition.
     Internal(Box<[ChildEntry]>),
-    /// A complete fixed internal partition; graph and projections have one owner.
+    /// A complete internal graph body; graph and projections have one owner.
     FixedInternal(Box<super::local_hnsw::body::FixedInternalBody>),
 }
 
@@ -311,7 +311,9 @@ impl PartitionCache {
     ///
     /// A body larger than the capacity is skipped. An existing entry with a
     /// strictly newer epoch is never downgraded by a racing fill; an equal or
-    /// newer epoch replaces it. Installation evicts until the cache is within
+    /// newer epoch replaces it. A complete graph body retains its projections
+    /// against a racing projections-only fill at the same epoch. Installation
+    /// evicts until the cache is within
     /// its byte capacity.
     pub(crate) fn install(&self, key: CacheKey, body: Arc<CachedBody>) {
         let kind = key.kind;
@@ -325,7 +327,11 @@ impl PartitionCache {
         {
             let mut inner = self.lock();
             if let Some(existing) = inner.slots.get(&key) {
-                if existing.body.epoch > body.epoch {
+                if existing.body.epoch > body.epoch
+                    || (existing.body.epoch == body.epoch
+                        && matches!(&existing.body.entries, BodyEntries::FixedInternal(_))
+                        && matches!(&body.entries, BodyEntries::Internal(_)))
+                {
                     drop(inner);
                     metrics::cache_install(kind, CacheInstallResult::SkippedStale);
                     return;

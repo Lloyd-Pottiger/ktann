@@ -28,12 +28,7 @@ use crate::report::{
 };
 use crate::resource::ResourceSnapshot;
 
-#[path = "../../tests/support/oracle.rs"]
-#[expect(
-    dead_code,
-    reason = "the shared oracle also exposes filter helpers used only by integration tests"
-)]
-mod oracle;
+use crate::oracle;
 
 /// Queue capacity for demand-driven Structure Maintenance.
 const FIXUP_QUEUE_CAPACITY: usize = 1_024;

@@ -596,7 +596,7 @@ async fn render_partition<T: ReadOps>(
     if header.level() == 1 {
         if entries {
             for id in scan_leaf_ids(txn, manifest, tree_key, partition).await? {
-                out.push_str(&format!("{indent}  {}\n", super::datadriven::show_id(&id)));
+                out.push_str(&format!("{indent}  {}\n", String::from_utf8_lossy(&id)));
             }
         }
     } else {

@@ -1,7 +1,7 @@
 //! Production routing through published fixed indexes; quality is not an exactness promise.
 use super::*;
 use ktann::api::{
-    BulkBuildOptions, BulkWorkerOptions, CompareOp, FixedGraphConfig, OperationOptions, Predicate,
+    BulkBuildOptions, BulkWorkerOptions, CompareOp, LocalGraphConfig, OperationOptions, Predicate,
     RoutingMode, SearchOptions, SearchOutcome, SearchRequest,
 };
 use std::time::Instant;
@@ -37,7 +37,7 @@ async fn build(
     let runtime = runtime(backend);
     let input = InputSnapshot::create(
         &dir.0.join("input"),
-        config(metric, keyed).with_fixed_graph(FixedGraphConfig::new(2, 8, [41; 32]).unwrap()),
+        config(metric, keyed).with_fixed_graph(LocalGraphConfig::new(2, 8, [41; 32]).unwrap()),
         1 << 20,
         (0..count).map(|id| Ok(row(id))),
     )

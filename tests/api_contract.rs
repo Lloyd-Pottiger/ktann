@@ -445,7 +445,7 @@ fn independent_partition_capacity_bounds_and_recovery_age() {
 
 #[test]
 fn internal_graph_configuration_has_atomic_publication_bounds() {
-    use ktann::api::FixedGraphConfig;
+    use ktann::api::LocalGraphConfig;
     for capacity in [8192, 16384] {
         IndexConfig::new(768, Metric::L2)
             .unwrap()
@@ -464,8 +464,8 @@ fn internal_graph_configuration_has_atomic_publication_bounds() {
             .unwrap()
             .with_internal_partition_entries(128, 16385),
     );
-    assert_invalid(FixedGraphConfig::new(17, 200, [0; 32]));
-    FixedGraphConfig::new(16, 200, [0; 32]).unwrap();
+    assert_invalid(LocalGraphConfig::new(17, 200, [0; 32]));
+    LocalGraphConfig::new(16, 200, [0; 32]).unwrap();
     // Leaf occupancy is independent of the internal routing-graph envelope.
     IndexConfig::new(128, Metric::L2)
         .unwrap()

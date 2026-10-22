@@ -541,3 +541,41 @@ the Python client/protocol is unchanged. Its requested refinement runs in artifa
 preparation for fixed mode. The native runner owns the detailed per-query oracle
 and routing metrics; bridge reports remain companion metrics, with VectorDBBench
 owning canonical recall. Use native runner controls for cache matrices.
+
+### Mutable local-graph update history
+
+`ktann-mutable-graph` exercises ordinary writes and real background split/merge
+maintenance on a bounded prefix of a cached `sift-1m` or `cohere-1m` dataset:
+
+```sh
+KTANN_BENCH_DATASET_CACHE=/Users/lloyd/projects/ktann/.benchmark-data/vectordb_bench/dataset \
+  cargo run --release -p ktann-benchmarks --bin ktann-mutable-graph -- \
+  sift-1m .benchmark-data/results/mutable-sift-16384 16384 8
+```
+
+The output directory must be new. The default is 16,384 records and eight rounds.
+An optional final `INTERNAL_MIN:MAX` argument overrides the default `32:128`;
+representative wider-parent runs use `64:512`, for example append `64:512` after
+the record and round counts.
+Each round rotates its update/delete windows, updates 10% from reserved dataset
+rows outside the initial prefix, deletes 10%, settles maintenance, reinserts
+that many vectors with fresh IDs, and settles again. One hundred held-out queries
+starting at query offset 100 are independent of the inserted vectors. The runner
+uses each corpus's metric (SIFT L2, Cohere cosine), graph seed `[19; 32]`, M16,
+efConstruction64, efSearch64, and fixed exact-rerank budget125. Before measured updates it selects the first
+beam in 8/16/32/64/128/256 reaching mean recall92% on a separate 50-query
+calibration window (offset0), then freezes that beam for all evaluated phases.
+
+`report.json` records initial, per-round, and fresh-rebuild recall@100 against
+current exact ground truth; per-query recall, minimum/p05/p50 recall, query
+p50/p95 and CPU; process RSS high-water marks;
+uncached graph/topology verification and record coverage; attempted logical KV
+mutation bytes, commits and conflicts; maintenance step counts; and mutation
+throughput including maintenance. Initial import timing runs through settlement.
+Oracle computation, paired Exact routing, untimed true-neighbor leaf/candidate
+coverage diagnostics, and invariant verification are outside HNSW query timing.
+The large loader decodes all one million vectors before selecting a prefix, so
+cumulative peak RSS includes that full decode, the reserved update pool and oracle
+allocations; it is not graph working memory.
+Logical KV bytes do not measure native physical writes. These experiments cover
+the reported size and update history and do not establish a production SLA.

@@ -326,7 +326,7 @@ async fn takeover_and_abort_fence_an_already_prepared_old_chunk() {
         .unwrap();
         let config = config(Metric::L2, true);
         let config = if fixed {
-            config.with_fixed_graph(ktann::api::FixedGraphConfig::new(2, 8, [7; 32]).unwrap())
+            config.with_fixed_graph(ktann::api::LocalGraphConfig::new(2, 8, [7; 32]).unwrap())
         } else {
             config
         };

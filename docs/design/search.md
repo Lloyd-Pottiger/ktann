@@ -267,24 +267,31 @@ byte shares may be configured, but the eviction policy is an internal
 benchmark-driven detail, not a persistent or public compatibility contract.
 Corruption is never cached.
 
-### Fixed-index graph bodies
+### Graph index bodies
 
 The graph reader uses the complete query's existing validated logical
 transaction and the snapshot Header already read by traversal. It reads the
-Graph Descriptor on every access, including hits. Ready internal kind, exact count, epoch, configured capacity and
+Graph Descriptor on every access, including hits. Internal kind, exact count, epoch, configured capacity and
 the descriptor's source binding must agree. Missing or mismatched graphs are
-Corruption; there is no exact fallback. Mutable-index exact reads do not request graph records. Both routing modes on
-Fixed Indexes validate complete graph bodies.
+Corruption; there is no exact fallback. Ordinary indexes do not request graph
+records. Both routing modes on fixed and mutable graph indexes validate complete
+nonempty graph bodies. Fixed indexes require Ready state; mutable graph indexes
+allow every legal searchable state and skip graph loading for an exactly empty
+internal body after applying root split traversal.
 
 On a miss, the reader scans complete Child Entries and contiguous graph chunks
 from that same transaction, then restores the persisted native graph. It never
 builds a graph or changes its seed, construction parameters, adjacency or query
 distances. A fixed internal body owns its Child Entries, native graph, source
-binding, and numeric kernel together. The cache distinguishes leaf, ordinary
-internal, and fixed internal bodies; a fixed body cannot omit its graph.
+binding, and numeric kernel together. An internal cache entry may contain ordinary
+projections or the complete graph body. Mutable foreground exact routing reuses
+projections from either representation. When it populated ordinary projections
+first, the graph reader upgrades that same-epoch body after loading and validating
+the persisted graph. A late same-epoch projections-only fill cannot downgrade a
+complete graph body; a newer epoch may replace it normally.
 Cold reads retain unpublished entries and chunks until restoration succeeds,
-then publish one complete shared body. No entries-only cache object is created
-for a fixed internal partition. Older snapshots cannot replace newer cached
+then publish one complete shared body. Fixed indexes do not have foreground
+writes that populate projections-only entries. Older snapshots cannot replace newer cached
 epochs. Eviction does not invalidate handles still held by queries.
 
 `RuntimeConfig::routing_working_bytes` (default 256 MiB) bounds one query's graph

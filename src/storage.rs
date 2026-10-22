@@ -8,6 +8,7 @@
 //! transitions and entry moves (ADR 0014).
 
 pub mod backend;
+pub mod graph_transitions;
 pub mod graph_updates;
 pub mod keys;
 pub mod membership;

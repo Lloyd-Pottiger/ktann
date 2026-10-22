@@ -1,7 +1,7 @@
 //! Fixed publication and operation capabilities through public entrypoints.
 use super::*;
 use ktann::api::{
-    BulkBuildOptions, BulkBuildStatus, BulkWorkerOptions, FixedGraphConfig, RefineOptions,
+    BulkBuildOptions, BulkBuildStatus, BulkWorkerOptions, LocalGraphConfig, RefineOptions,
     SearchRequest,
 };
 
@@ -20,7 +20,7 @@ async fn fixed_publication_preserves_exact_membership_and_rejects_every_mutation
                 let backend = MemoryBackend::new();
                 let runtime = runtime(backend);
                 let config = config(metric, true)
-                    .with_fixed_graph(FixedGraphConfig::new(2, 8, [9; 32]).unwrap());
+                    .with_fixed_graph(LocalGraphConfig::new(2, 8, [9; 32]).unwrap());
                 assert_eq!(
                     runtime
                         .create_index("ordinary", config.clone())
@@ -128,7 +128,7 @@ async fn fixed_preparation_failure_is_terminal_hidden_and_identity_bound() {
         let dir = Directory::new();
         let runtime = runtime(MemoryBackend::new());
         let config = config(Metric::L2, false)
-            .with_fixed_graph(FixedGraphConfig::new(2, 8, [1; 32]).unwrap());
+            .with_fixed_graph(LocalGraphConfig::new(2, 8, [1; 32]).unwrap());
         let input = InputSnapshot::create(
             &dir.0.join("source"),
             config,
@@ -189,7 +189,7 @@ async fn explicit_load_checks_refinement_identity_and_graph_bytes_before_publish
     let memory = MemoryBackend::new();
     let runtime = runtime(memory.clone());
     let config =
-        config(Metric::L2, false).with_fixed_graph(FixedGraphConfig::new(2, 8, [1; 32]).unwrap());
+        config(Metric::L2, false).with_fixed_graph(LocalGraphConfig::new(2, 8, [1; 32]).unwrap());
     let input = InputSnapshot::create(
         &dir.0.join("source"),
         config,

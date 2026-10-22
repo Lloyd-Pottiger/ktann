@@ -30,3 +30,13 @@ non-payload envelope, including their physical keys and conflict costs. They are
 not additional to the bound. Ordinary publication includes those deletes before
 its envelope preflight; future topology composition must enforce this envelope
 across all participants. A smaller batch or narrower keys may be needed to fit.
+
+## Implementation clarification: mutable serving (2026-10-21)
+
+Topology integration preserves Fixed Index read-only behavior and introduces a
+separate mutable graph configuration identity. It retains the existing foreground
+write routing; HNSW write routing is outside this decision. The graph-aware driver
+composes private graph preparation with exact topology mutations, uses one
+receiver per internal drain and removes the graph as a body becomes empty.
+State-only transitions retain the body epoch. Both ordinary graph changes and
+topology changes share source fencing and graph publication machinery.

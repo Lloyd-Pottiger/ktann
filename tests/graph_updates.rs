@@ -2,6 +2,8 @@
 #[path = "support/bulk_load_adapter.rs"]
 mod bulk_load_adapter;
 
+use bulk_load_adapter::mutable_graph_history;
+
 use ktann_memory::{MemoryBackend, test_support::CommitFault};
 
 fn backend() -> MemoryBackend {
@@ -59,4 +61,29 @@ async fn graph_update_cost_probe() {
         .await;
     }
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mutable_graph_topology_commit_faults() {
+    for fault in [
+        CommitFault::Abort,
+        CommitFault::UnknownApplied,
+        CommitFault::UnknownNotApplied,
+    ] {
+        let backend = self::backend();
+        mutable_graph_history::exercise(|| backend.clone(), &|phase, attempt| {
+            if phase == "topology-finished" {
+                backend.set_fault_plan(Vec::new()).unwrap();
+            } else if attempt == 0 {
+                backend.push_fault(fault).unwrap();
+            }
+        })
+        .await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn memory_mutable_graph_history() {
+    let backend = self::backend();
+    mutable_graph_history::exercise(|| backend.clone(), &|_, _| {}).await;
 }

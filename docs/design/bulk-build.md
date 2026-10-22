@@ -31,7 +31,7 @@ cleanup. `complete_with_control` applies cancellation and deadline control acros
 the entire operation. No automatic scheduler is started. Explicit `run_worker`,
 `load_serving`, and `publish` APIs remain available for phase control.
 
-A configuration with `FixedGraphConfig` requires Bulk Build. Preparation refines
+A configuration with `LocalGraphConfig` requires Bulk Build. Preparation refines
 membership and recomputes centroids before accepting the final Forest Artifact,
 then builds each internal graph exactly once from the final Child Entries while
 encoding Serving bytes. Omitted refinement preserves construction centroids.

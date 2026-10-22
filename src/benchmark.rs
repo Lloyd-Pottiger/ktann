@@ -51,7 +51,7 @@ pub(crate) async fn leaf_layout_fingerprint<B: crate::storage::backend::Backend>
     else {
         return Err(corrupt());
     };
-    if manifest.config().fixed_graph().is_none() || !manifest.config().tree_key_fields().is_empty()
+    if manifest.config().local_graph().is_none() || !manifest.config().tree_key_fields().is_empty()
     {
         return Err(Error::invalid_argument());
     }

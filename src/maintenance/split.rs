@@ -37,6 +37,10 @@
 //!   of a `DrainingSplit` one, and completing at exact count zero. Repeating
 //!   `advance` converges a split; abandoning it at any point leaves a
 //!   searchable state.
+//!
+//! Mutable graph indexes use [`super::graph_topology::advance`] for body-changing
+//! steps. These direct drivers reject such operations because graph preparation
+//! requires the caller's bounded native executor.
 
 use crate::api::{Error, ErrorKind, PartitionKey, Result};
 use crate::observe::labels::{FixupKind, Operation};
@@ -191,6 +195,9 @@ pub async fn expose_targets<B: Backend>(
     started_at_unix_millis: u64,
     retry: &RetryPolicy,
 ) -> Result<TargetExposure> {
+    if manifest.config().mutable_graph().is_some() {
+        return Err(Error::invalid_argument());
+    }
     // One consistent snapshot classifies the source and trains both target
     // centroids without holding KV locks.
     let mut read = reads::open_validated_read(backend, manifest).await?;
@@ -273,6 +280,9 @@ pub async fn drain_batch<B: Backend>(
     else {
         return Ok(DrainStep::SourceAdvanced);
     };
+    if manifest.config().mutable_graph().is_some() && observed.header.level() > 1 {
+        return Err(Error::invalid_argument());
+    }
     drain_observed(backend, manifest, tree_key, source, retry, observed).await
 }
 
@@ -520,6 +530,9 @@ pub async fn complete_split<B: Backend>(
     started_at_unix_millis: u64,
     retry: &RetryPolicy,
 ) -> Result<topology::SplitCompletion> {
+    if manifest.config().mutable_graph().is_some() {
+        return Err(Error::invalid_argument());
+    }
     let removal = topology::SourceRemoval::for_capabilities(backend.capabilities());
     writes::run_write_attempts(
         backend,
@@ -558,6 +571,9 @@ pub async fn advance<B: Backend>(
     started_at_unix_millis: u64,
     retry: &RetryPolicy,
 ) -> Result<Advance> {
+    if manifest.config().mutable_graph().is_some() {
+        return Err(Error::invalid_argument());
+    }
     let observed = reads::open_authority_read(backend, manifest, tree_key, partition).await?;
     // Nothing was ever persisted here, or a completed split already removed
     // every value: nothing to advance.
@@ -695,7 +711,7 @@ pub(crate) async fn advance_observed<B: Backend>(
 /// Both centroids are persisted routing models, so kernel errors here are
 /// fail-closed Corruption rather than caller error. `balance` reserves entries
 /// needed to reach the deterministic half-total target quotas.
-fn nearer_target(
+pub(crate) fn nearer_target(
     kernel: &crate::search::numeric::VectorKernel,
     routing: &[f32],
     left: PartitionKey,
@@ -715,14 +731,15 @@ fn nearer_target(
 
 /// Exact remaining counts that keep both split targets viable while preserving
 /// nearest-centroid routing whenever possible.
-struct SplitBalance {
+#[derive(Clone, Copy)]
+pub(crate) struct SplitBalance {
     source_remaining: u64,
     left_needed: u64,
     right_needed: u64,
 }
 
 impl SplitBalance {
-    fn new(source: u32, left: u32, right: u32, minimum: u32) -> Self {
+    pub(crate) fn new(source: u32, left: u32, right: u32, minimum: u32) -> Self {
         Self {
             source_remaining: u64::from(source),
             left_needed: u64::from(minimum.saturating_sub(left)),

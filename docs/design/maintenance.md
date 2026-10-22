@@ -219,3 +219,19 @@ do not trigger automatic repair.
   cold intermediate states.
 - Contention benchmarks measure transaction retries and write amplification;
   they do not weaken invariants to improve throughput.
+
+## 8. Mutable graph indexes
+
+The graph-aware driver plans changed internal bodies from one snapshot, closes
+it, prepares private native graphs under Runtime admission, then protects source
+versions and commits typed topology changes together with graph publication.
+It uses the same searchable states and exact membership operations described
+above. Internal drains select one receiver per transaction; exposure and drains
+respect graph transient capacity. State-only transitions keep the body epoch and
+graph unchanged. Leaf membership changes do not rebuild parent graphs.
+
+The [partition-local graph contract](partition-local-hnsw.md) owns the combined
+transaction/memory envelope, empty-body representation and native update policy.
+The fixed mode remains read-only; the separate mutable mode enables maintenance.
+Explicit low-level callers reuse `GraphMaintenance` admission and call
+`graph_topology::advance`, rather than graph-unaware split/merge entrypoints.

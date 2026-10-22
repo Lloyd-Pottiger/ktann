@@ -381,8 +381,8 @@ fn model_record(vector: &[f32; DIMENSION], tag: i64) -> ModelRecord {
 /// A 4-dimensional L2 index with one i64 Tree Key field, one i64 filter
 /// field, and small partition entry bounds so splits (and, after deletes,
 /// merges) fire regularly.
-fn index_config() -> IndexConfig {
-    IndexConfig::new(DIMENSION, Metric::L2)
+fn index_config(graph: bool) -> IndexConfig {
+    let config = IndexConfig::new(DIMENSION, Metric::L2)
         .expect("valid dimension")
         .with_fields(vec![
             FieldSchema::new("bucket", DataType::I64).expect("valid field"),
@@ -395,7 +395,12 @@ fn index_config() -> IndexConfig {
         .and_then(|config| {
             config.with_internal_partition_entries(MIN_PARTITION_ENTRIES, MAX_PARTITION_ENTRIES)
         })
-        .expect("valid partition entries")
+        .expect("valid partition entries");
+    if graph {
+        config.with_mutable_graph(ktann::api::LocalGraphConfig::new(4, 16, [7; 32]).unwrap())
+    } else {
+        config
+    }
 }
 
 /// One drivable unit of Structure Maintenance.
@@ -495,14 +500,16 @@ struct TraceLog {
     seed: u64,
     steps: usize,
     lines: VecDeque<String>,
+    graph: bool,
 }
 
 impl TraceLog {
-    fn new(seed: u64, steps: usize) -> Self {
+    fn new(seed: u64, steps: usize, graph: bool) -> Self {
         Self {
             seed,
             steps,
             lines: VecDeque::with_capacity(TRACE_CAPACITY),
+            graph,
         }
     }
 
@@ -522,8 +529,10 @@ impl Drop for TraceLog {
                 self.seed, self.steps
             );
             eprintln!(
-                "replay: KTANN_MODEL_SEED={} KTANN_MODEL_STEPS={} cargo test --test model_history model_history_replay -- --nocapture",
-                self.seed, self.steps
+                "replay: KTANN_MODEL_GRAPH={} KTANN_MODEL_SEED={} KTANN_MODEL_STEPS={} cargo test --test model_history model_history_replay -- --nocapture",
+                u8::from(self.graph),
+                self.seed,
+                self.steps
             );
             eprintln!("last {} step traces (oldest first):", self.lines.len());
             for line in &self.lines {
@@ -602,12 +611,14 @@ struct Driver {
     clock: u64,
     stats: CaseStats,
     trace: TraceLog,
+    graph: bool,
+    graph_maintenance: Option<ktann::runtime::GraphMaintenance>,
 }
 
 impl Driver {
     /// Opens a fresh case on a durable deterministic backend with zero
     /// maintenance workers, so topology moves only under manual drives.
-    async fn new(seed: u64, steps: usize) -> Self {
+    async fn new(seed: u64, steps: usize, graph: bool) -> Self {
         let backend = MemoryBackend::with_test_config(TestConfig {
             durability: Durability::Durable,
             ..TestConfig::default()
@@ -618,7 +629,7 @@ impl Driver {
         let retry = RetryPolicy::for_fixup(&config);
         let runtime = Runtime::new(backend.clone(), config.clone()).expect("runtime is valid");
         let index = runtime
-            .create_index(INDEX_NAME, index_config())
+            .create_index(INDEX_NAME, index_config(graph))
             .await
             .expect("create index");
         let current_id = index.logical_index_id();
@@ -626,7 +637,7 @@ impl Driver {
         seen_index_ids.insert(current_id);
         Self {
             backend,
-            config,
+            config: config.clone(),
             retry,
             runtime: Some(runtime),
             index: Some(index),
@@ -636,7 +647,10 @@ impl Driver {
             tracker: PartitionTracker::default(),
             clock: 1_000,
             stats: CaseStats::default(),
-            trace: TraceLog::new(seed, steps),
+            trace: TraceLog::new(seed, steps, graph),
+            graph,
+            graph_maintenance: graph
+                .then(|| ktann::runtime::GraphMaintenance::new(&config, CancellationToken::new())),
         }
     }
 
@@ -696,6 +710,20 @@ impl Driver {
             "step {n}: every record carries bucket={TREE_BUCKET}"
         );
         self.tracker.check(&self.backend, self.current_id, n).await;
+        if self.graph {
+            // Check graph descriptors, topology projections and native readability
+            // in every committed intermediate state, including exposed/draining nodes.
+            let report = self
+                .index()
+                .verify(ktann::api::VerifyOptions::default())
+                .await
+                .unwrap();
+            assert!(
+                report.complete && report.issues.is_empty(),
+                "step {n}: {:?}",
+                report.issues
+            );
+        }
     }
 
     /// Runs one single mutation, agreeing with the model on definite
@@ -972,6 +1000,15 @@ impl Driver {
                 value: Value::I64(tag),
             });
         }
+        if self.graph {
+            request = request.with_options(
+                ktann::api::SearchOptions::default()
+                    .with_routing_mode(ktann::api::RoutingMode::PartitionLocalHnsw {
+                        ef_search: 64,
+                    })
+                    .unwrap(),
+            );
+        }
         let outcome = self
             .index()
             .search(request)
@@ -1073,6 +1110,45 @@ impl Driver {
         self.clock += 100;
         if let Some(fault) = fault {
             self.backend.push_fault(fault).expect("push fault");
+        }
+        if let Some(executor) = &self.graph_maintenance {
+            let result = ktann::maintenance::graph_topology::advance(
+                &self.backend,
+                &manifest,
+                &tree_key,
+                partition,
+                self.clock,
+                &self.retry,
+                executor,
+            )
+            .await;
+            if let Err(error) = result {
+                self.maintenance_error(n, "graph topology", partition, error);
+            } else {
+                let before = listing
+                    .iter()
+                    .find(|(tree, pk, _)| tree == &tree_key && *pk == partition)
+                    .unwrap()
+                    .2;
+                let after = audit::list_partitions(&self.backend, self.current_id)
+                    .await
+                    .unwrap();
+                let after = after
+                    .iter()
+                    .find(|(tree, pk, _)| tree == &tree_key && *pk == partition);
+                if before.state() == PartitionState::DrainingSplit
+                    && after.is_none_or(|(_, _, h)| h.state() == PartitionState::Ready)
+                {
+                    self.stats.splits += 1;
+                }
+                if before.state() == PartitionState::Merging && after.is_none() {
+                    self.stats.merges += 1;
+                }
+            }
+            if fault.is_some() {
+                self.backend.set_fault_plan(Vec::new()).unwrap();
+            }
+            return;
         }
         match work {
             Work::Split => {
@@ -1294,7 +1370,7 @@ impl Driver {
         drop(stale);
         let index = self
             .runtime()
-            .create_index(INDEX_NAME, index_config())
+            .create_index(INDEX_NAME, index_config(self.graph))
             .await
             .expect("step {n}: recreate index");
         let new_id = index.logical_index_id();
@@ -1395,7 +1471,12 @@ fn show(id: &Bytes) -> String {
 async fn run_case(seed: u64, steps: usize) {
     eprintln!("model_history: seed={seed} steps={steps}");
     let script = generate_script(seed, steps);
-    let mut driver = Driver::new(seed, steps).await;
+    let mut driver = Driver::new(
+        seed,
+        steps,
+        std::env::var("KTANN_MODEL_GRAPH").as_deref() == Ok("1"),
+    )
+    .await;
     for (n, step) in script.iter().enumerate() {
         driver.step(n, step).await;
         driver.post_step(n).await;
@@ -1447,5 +1528,20 @@ async fn model_history_expanded() {
     for i in 0..EXPANDED_SEEDS {
         let seed = EXPANDED_BASE_SEED ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         run_case(seed, EXPANDED_STEPS).await;
+    }
+}
+
+/// Replays the same fault/crash script through mutable graph topology. Small
+/// parents make routing exhaustive, so the existing exact oracle still applies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mutable_graph_model_history() {
+    for seed in CI_SEEDS {
+        let script = generate_script(seed, CI_STEPS);
+        let mut driver = Driver::new(seed, CI_STEPS, true).await;
+        for (n, step) in script.iter().enumerate() {
+            driver.step(n, step).await;
+            driver.post_step(n).await;
+        }
+        driver.finish().await;
     }
 }

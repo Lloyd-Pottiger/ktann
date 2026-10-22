@@ -212,7 +212,7 @@ pub(crate) async fn read_graph<T: ReadOps>(
     check()?;
     let parameters = manifest
         .config()
-        .fixed_graph()
+        .local_graph()
         .ok_or_else(Error::invalid_argument)?
         .parameters();
     let index = manifest.logical_index_id();
@@ -223,7 +223,7 @@ pub(crate) async fn read_graph<T: ReadOps>(
     } = request;
     let header = *header;
     if header.level() <= 1
-        || header.state() != PartitionState::Ready
+        || (manifest.config().fixed_graph().is_some() && header.state() != PartitionState::Ready)
         || header.entry_count() == 0
         || header.entry_count() > manifest.config().max_internal_partition_entries() + 2
     {
@@ -290,37 +290,46 @@ pub(crate) async fn read_graph<T: ReadOps>(
         header: &header,
     };
     let read = BodyRead::start(cache, manifest, &request)?;
-    if let BodyRead::Cached(body) = &read {
-        let BodyEntries::FixedInternal(graph) = &body.entries else {
-            return Err(corrupt());
-        };
-        if graph.children().len() != n {
-            return Err(corrupt());
+    let (children, body_bytes) = match read {
+        BodyRead::Cached(body) => match &body.entries {
+            BodyEntries::FixedInternal(graph) => {
+                if graph.children().len() != n
+                    || !graph.matches(
+                        GraphSource {
+                            index,
+                            tree,
+                            parent,
+                            header,
+                            parameters,
+                        },
+                        &descriptor,
+                    )
+                {
+                    return Err(corrupt());
+                }
+                return Ok(GraphRead::Cached(RoutingGraph {
+                    body: Arc::clone(&body),
+                    m: parameters.m,
+                    working_bytes,
+                }));
+            }
+            // Exact write routing can populate projections before the first
+            // graph query. Upgrade that complete body without another KV scan.
+            BodyEntries::Internal(children) => {
+                if children.len() != n {
+                    return Err(corrupt());
+                }
+                (children.clone(), body.bytes)
+            }
+            BodyEntries::Leaf { .. } => return Err(corrupt()),
+        },
+        BodyRead::Scan(scan) => {
+            let (entries, body_bytes) = scan.read(txn, manifest, check).await?;
+            let BodyEntries::Internal(children) = entries else {
+                unreachable!("internal source")
+            };
+            (children, body_bytes)
         }
-        if !graph.matches(
-            GraphSource {
-                index,
-                tree,
-                parent,
-                header,
-                parameters,
-            },
-            &descriptor,
-        ) {
-            return Err(corrupt());
-        }
-        return Ok(GraphRead::Cached(RoutingGraph {
-            body: Arc::clone(body),
-            m: parameters.m,
-            working_bytes,
-        }));
-    }
-    let BodyRead::Scan(scan) = read else {
-        unreachable!("cached fixed body returned above")
-    };
-    let (entries, body_bytes) = scan.read(txn, manifest, check).await?;
-    let BodyEntries::Internal(children) = entries else {
-        unreachable!("internal source")
     };
     let range = LogicalRange::graph_chunks(manifest, tree, parent)?;
     let mut cursor = None;

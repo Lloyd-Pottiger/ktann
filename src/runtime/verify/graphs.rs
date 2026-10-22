@@ -56,7 +56,7 @@ impl GraphLedger {
         let (Some(tree), Some(partition)) = (key.tree_key(), super::partition_key(key)) else {
             return Ok(());
         };
-        if cx.manifest.config().fixed_graph().is_none() {
+        if cx.manifest.config().local_graph().is_none() {
             if matches!(
                 value,
                 PersistentValue::GraphDescriptor(_) | PersistentValue::GraphChunk(_)
@@ -89,7 +89,9 @@ impl GraphLedger {
         match value {
             PersistentValue::PartitionHeader(header) => {
                 self.body.header = Some(*header);
-                if header.state() != PartitionState::Ready {
+                if cx.manifest.config().fixed_graph().is_some()
+                    && header.state() != PartitionState::Ready
+                {
                     cx.issue(
                         VerifyIssueKind::Membership,
                         Some(tree),
@@ -180,6 +182,21 @@ impl GraphLedger {
         context.checkpoint()?;
         let tree = self.tree.as_ref().unwrap();
         match body.header {
+            Some(header)
+                if header.level() > 1
+                    && header.entry_count() == 0
+                    && cx.manifest.config().mutable_graph().is_some() =>
+            {
+                if body.descriptor.is_some() || !body.chunks.is_empty() || !body.children.is_empty()
+                {
+                    cx.issue(
+                        VerifyIssueKind::Membership,
+                        Some(tree),
+                        Some(partition),
+                        None,
+                    );
+                }
+            }
             Some(header) if header.level() > 1 => {
                 if let Some(descriptor) = body.descriptor {
                     let dimension = cx.manifest.config().dimension();
@@ -192,7 +209,7 @@ impl GraphLedger {
                         let tree_owned = tree.clone();
                         let metric = cx.manifest.config().metric();
                         let seed = *cx.manifest.rotation_seed();
-                        let parameters = cx.manifest.config().fixed_graph().unwrap().parameters();
+                        let parameters = cx.manifest.config().local_graph().unwrap().parameters();
                         let working_bytes = cx.limits.remaining_memory() as usize;
                         let result = controlled_compute(
                             context.options.clone(),

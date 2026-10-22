@@ -101,7 +101,7 @@ impl<'a> GraphPreparation<'a> {
         let parameters = self
             .index
             .config()
-            .fixed_graph()
+            .local_graph()
             .expect("fixed preparation")
             .parameters();
         let centroids = Centroids::new(
@@ -162,7 +162,7 @@ fn limit() -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{FixedGraphConfig, IndexConfig, LogicalIndexId, Metric, Record};
+    use crate::api::{IndexConfig, LocalGraphConfig, LogicalIndexId, Metric, Record};
     use crate::bulk::{
         ForestArtifact, ForestOptions, InputSnapshot, ServingArtifact, ServingOptions,
     };
@@ -214,7 +214,7 @@ mod tests {
                     .unwrap()
                     .with_internal_partition_entries(2, 4)
                     .unwrap()
-                    .with_fixed_graph(FixedGraphConfig::new(2, 8, [4; 32]).unwrap());
+                    .with_fixed_graph(LocalGraphConfig::new(2, 8, [4; 32]).unwrap());
                 let index = IndexManifest::new(
                     IndexLifecycle::Building,
                     LogicalIndexId::new(1).unwrap(),
@@ -353,7 +353,7 @@ mod tests {
                             tree: &tree,
                             parent: PartitionKey::new(key).unwrap(),
                             header,
-                            parameters: index.config().fixed_graph().unwrap().parameters(),
+                            parameters: index.config().local_graph().unwrap().parameters(),
                         },
                         body.descriptor.unwrap(),
                         body.chunks,

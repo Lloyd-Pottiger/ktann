@@ -23,15 +23,22 @@ const DEFAULT_TREE_KEY_SCAN_RANGES: u32 = 1_024;
 const DEFAULT_WRITE_BEAM_SIZE: u32 = 4;
 const MAX_WRITE_BEAM_SIZE: u32 = 16_384;
 
-/// Immutable construction parameters for a fixed, Bulk Build-only index.
+/// Immutable construction parameters for partition-local HNSW graphs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FixedGraphConfig {
+pub struct LocalGraphConfig {
     m: u32,
     ef_construction: u32,
     seed: [u8; 32],
 }
 
-impl FixedGraphConfig {
+/// Serving policy and parameters form one immutable configuration choice.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum GraphMode {
+    Fixed(LocalGraphConfig),
+    Mutable(LocalGraphConfig),
+}
+
+impl LocalGraphConfig {
     /// Creates graph parameters for bounded atomic internal-graph publication.
     pub fn new(m: u32, ef_construction: u32, seed: [u8; 32]) -> Result<Self> {
         if !(2..=16).contains(&m) || ef_construction < m {
@@ -72,7 +79,7 @@ impl FixedGraphConfig {
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct IndexConfig {
-    fixed_graph: Option<FixedGraphConfig>,
+    graph: Option<GraphMode>,
     dimension: usize,
     metric: Metric,
     fields: Box<[FieldSchema]>,
@@ -86,20 +93,47 @@ pub struct IndexConfig {
 impl IndexConfig {
     /// Selects immutable serving bytes and internal-partition graphs.
     #[must_use]
-    pub fn with_fixed_graph(mut self, graph: FixedGraphConfig) -> Self {
-        self.fixed_graph = Some(graph);
+    pub fn with_fixed_graph(mut self, graph: LocalGraphConfig) -> Self {
+        self.graph = Some(GraphMode::Fixed(graph));
         self
     }
 
-    /// Graph construction parameters, or None for an ordinary mutable index.
-    pub const fn fixed_graph(&self) -> Option<FixedGraphConfig> {
-        self.fixed_graph
+    /// Selects mutable serving with atomically maintained partition-local graphs.
+    /// Foreground writes retain the existing exact tree routing.
+    #[must_use]
+    pub fn with_mutable_graph(mut self, graph: LocalGraphConfig) -> Self {
+        self.graph = Some(GraphMode::Mutable(graph));
+        self
+    }
+
+    /// Construction parameters for a read-only graph index.
+    pub const fn fixed_graph(&self) -> Option<LocalGraphConfig> {
+        match self.graph {
+            Some(GraphMode::Fixed(graph)) => Some(graph),
+            _ => None,
+        }
+    }
+
+    /// Construction parameters for a mutable graph index.
+    pub const fn mutable_graph(&self) -> Option<LocalGraphConfig> {
+        match self.graph {
+            Some(GraphMode::Mutable(graph)) => Some(graph),
+            _ => None,
+        }
+    }
+
+    /// Construction parameters for either graph serving policy.
+    pub const fn local_graph(&self) -> Option<LocalGraphConfig> {
+        match self.graph {
+            Some(GraphMode::Fixed(graph) | GraphMode::Mutable(graph)) => Some(graph),
+            None => None,
+        }
     }
 
     /// Creates an immutable Logical Index configuration.
     pub fn new(dimension: usize, metric: Metric) -> Result<Self> {
         let config = Self {
-            fixed_graph: None,
+            graph: None,
             dimension,
             metric,
             fields: Box::new([]),
