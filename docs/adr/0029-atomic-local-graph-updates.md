@@ -38,5 +38,8 @@ separate mutable graph configuration identity. It retains the existing foregroun
 write routing; HNSW write routing is outside this decision. The graph-aware driver
 composes private graph preparation with exact topology mutations, uses one
 receiver per internal drain and removes the graph as a body becomes empty.
-State-only transitions retain the body epoch. Both ordinary graph changes and
-topology changes share source fencing and graph publication machinery.
+State-only transitions retain the body epoch. `storage::graph_transitions` owns
+source fencing and graph publication for every topology body change. It replaces
+the step-11 Ready-only projection publication wrapper; the topology owner supplies
+its existing child-authority validation and all authority edits. Unknown outcomes
+return to topology rediscovery rather than replaying a prepared mutation.

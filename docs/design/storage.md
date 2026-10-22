@@ -338,7 +338,7 @@ maintenance while lifecycle/drop and fenced Building writes retain their authori
 Ordinary local-graph replacements use one transaction for all chunks, stale-tail
 chunk deletion, the descriptor and authoritative projections. There is no graph
 staging namespace or maintenance record. The bounded configuration and topology
-contract is owned by [the local graph design](partition-local-hnsw.md#ordinary-ready-partition-updates).
+contract is owned by [the local graph design](partition-local-hnsw.md#local-graph-transitions).
 
 Graph-aware topology composes every participating replacement in that same
 transaction. `WriteLogicalTxn::affected_bytes` accounts for protected point reads,

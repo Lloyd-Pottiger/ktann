@@ -9,7 +9,7 @@ mod oracle;
 use bytes::Bytes;
 use ktann::api::{
     Index, IndexConfig, LocalGraphConfig, Metric, Record, RoutingMode, RuntimeConfig,
-    SearchBudgets, SearchOptions, SearchRequest, VerifyOptions,
+    SearchBudgets, SearchOptions, SearchRequest, VerifyOptions, VerifyReport,
 };
 use ktann::runtime::Runtime;
 use ktann::storage::backend::Backend;
@@ -70,25 +70,14 @@ async fn settle<B: Backend>(index: &Index<B>, raw: &B, metrics: &MetricCapture) 
     );
 }
 
-async fn quality<B: Backend>(
-    index: &Index<B>,
-    corpus: &Corpus,
-    queries: &[Arc<[f32]>],
-    beam: u32,
-    mode: RoutingMode,
-) -> Value {
-    // Oracle is computed against the exact current records outside query timing.
-    let truth: Vec<BTreeSet<Bytes>> = queries
+/// Exact neighbors for one unchanged corpus/query set, shared across routing modes.
+fn ground_truth(metric: Metric, corpus: &Corpus, queries: &[Arc<[f32]>]) -> Vec<BTreeSet<Bytes>> {
+    queries
         .iter()
         .map(|query| {
             let mut all: Vec<_> = corpus
                 .iter()
-                .map(|(id, vector)| {
-                    (
-                        id,
-                        oracle::exact_distance(index.config().metric(), query, vector),
-                    )
-                })
+                .map(|(id, vector)| (id, oracle::exact_distance(metric, query, vector)))
                 .collect();
             all.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(b.0)));
             all.into_iter()
@@ -96,7 +85,25 @@ async fn quality<B: Backend>(
                 .map(|(id, _)| id.clone())
                 .collect()
         })
-        .collect();
+        .collect()
+}
+
+/// Audits the settled index once before comparing routing modes on its records.
+async fn verify_records<B: Backend>(index: &Index<B>, count: usize) -> VerifyReport {
+    let coverage = index.verify(VerifyOptions::default()).await.unwrap();
+    assert!(coverage.complete && coverage.issues.is_empty());
+    assert_eq!(coverage.objects.vector_records as usize, count);
+    coverage
+}
+
+async fn quality<B: Backend>(
+    index: &Index<B>,
+    truth: &[BTreeSet<Bytes>],
+    coverage: &VerifyReport,
+    queries: &[Arc<[f32]>],
+    beam: u32,
+    mode: RoutingMode,
+) -> Value {
     let mut latencies = Vec::new();
     let mut recall = 0.0;
     let mut per_query = Vec::new();
@@ -117,7 +124,7 @@ async fn quality<B: Backend>(
     }
     let resources = ResourceSnapshot::capture().unwrap();
     let started = Instant::now();
-    for (query, expected) in queries.iter().zip(&truth) {
+    for (query, expected) in queries.iter().zip(truth) {
         let start = Instant::now();
         let outcome = index
             .search(
@@ -139,11 +146,8 @@ async fn quality<B: Backend>(
     }
     let elapsed = started.elapsed().as_secs_f64();
     let after = ResourceSnapshot::capture().unwrap();
-    let coverage = index.verify(VerifyOptions::default()).await.unwrap();
-    assert!(coverage.complete && coverage.issues.is_empty());
-    assert_eq!(coverage.objects.vector_records as usize, corpus.len());
     let mut diagnostic_coverage = Vec::new();
-    for (query, expected) in queries.iter().zip(&truth) {
+    for (query, expected) in queries.iter().zip(truth) {
         let (_, diagnostic) = index
             .benchmark_search(
                 SearchRequest::new(query.clone(), 100)
@@ -183,15 +187,18 @@ async fn paired_quality<B: Backend>(
     queries: &[Arc<[f32]>],
     beam: u32,
 ) -> Value {
+    let truth = ground_truth(index.config().metric(), corpus, queries);
+    let coverage = verify_records(index, corpus.len()).await;
     let hnsw = quality(
         index,
-        corpus,
+        &truth,
+        &coverage,
         queries,
         beam,
         RoutingMode::PartitionLocalHnsw { ef_search: 64 },
     )
     .await;
-    let exact = quality(index, corpus, queries, beam, RoutingMode::Exact).await;
+    let exact = quality(index, &truth, &coverage, queries, beam, RoutingMode::Exact).await;
     json!({"partition_local_hnsw": hnsw, "exact": exact})
 }
 
@@ -284,29 +291,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let initial_after = ResourceSnapshot::capture()?;
     let initial_io = counters.since(&initial_io);
     eprintln!("initial topology settled: {initial_seconds:.3}s");
-    let mut frozen_beam = None;
-    for beam in [8, 16, 32, 64, 128, 256] {
-        let measured = quality(
-            &index,
-            &corpus,
-            &calibration_queries,
-            beam,
-            RoutingMode::PartitionLocalHnsw { ef_search: 64 },
-        )
-        .await;
-        let recall = measured["recall_at_100"].as_f64().unwrap();
-        eprintln!("calibration: beam={beam} recall={recall:.6}");
-        observations.push(json!({"phase": "calibration", "beam": beam, "quality": measured}));
-        std::fs::write(
-            output.join("report.json"),
-            serde_json::to_vec_pretty(&observations)?,
-        )?;
-        if recall >= 0.92 {
-            frozen_beam = Some(beam);
-            break;
+    let beam = {
+        let calibration_truth = ground_truth(metric, &corpus, &calibration_queries);
+        let calibration_coverage = verify_records(&index, corpus.len()).await;
+        let mut frozen_beam = None;
+        for beam in [8, 16, 32, 64, 128, 256] {
+            let measured = quality(
+                &index,
+                &calibration_truth,
+                &calibration_coverage,
+                &calibration_queries,
+                beam,
+                RoutingMode::PartitionLocalHnsw { ef_search: 64 },
+            )
+            .await;
+            let recall = measured["recall_at_100"].as_f64().unwrap();
+            eprintln!("calibration: beam={beam} recall={recall:.6}");
+            observations.push(json!({"phase": "calibration", "beam": beam, "quality": measured}));
+            std::fs::write(
+                output.join("report.json"),
+                serde_json::to_vec_pretty(&observations)?,
+            )?;
+            if recall >= 0.92 {
+                frozen_beam = Some(beam);
+                break;
+            }
         }
-    }
-    let beam = frozen_beam.ok_or("initial calibration did not reach recall 0.92")?;
+        frozen_beam.ok_or("initial calibration did not reach recall 0.92")?
+    };
     eprintln!("frozen beam={beam}; evaluation queries100..199");
     observations.push(json!({"phase": "initial", "frozen_beam": beam,
         "initial_import_and_settle_seconds": initial_seconds,

@@ -599,23 +599,23 @@ Benchmark-only global routing and diagnostic replay are feature-gated and use th
 production leaf/rerank pipeline. They do not add a production global index or
 change the fixed-index mutation contract. Matched-recall tuning remains step 10.
 
-## Ordinary Ready-partition updates
+## Local graph transitions
 
-Step 11 adds composable primitives in `storage::graph_updates`; it does not
-admit mutations through `Index`, enable automatic maintenance on Fixed Indexes,
-or change foreground write routing. Low-level storage callers already own
-transactional invariant preservation. The topology owner must compose child
-creation, removal or transfer with graph publication in the same transaction.
-Calling a parent-edge operation alone does not establish valid tree membership.
+`storage::graph_transitions` owns bounded graph snapshots, private preparation,
+source fencing and graph-record publication. The topology owner composes its
+Header, Child Entry and child creation/removal or movement in the same transaction.
+A graph replacement alone does not establish valid tree membership. Fixed Indexes
+retain their public read-only contract, and foreground write routing remains exact.
 
 ### Algorithm and preparation
 
-`GraphUpdateSource::read` collects a complete Ready internal body from one
-snapshot with bounded scans. `prepare` consumes that source and a canonical,
-nonempty proposed Child Entry body. It validates the old graph before modifying
-it, checks finite coordinates, level/count/capacity, and constructs the next
-parent Header with one epoch increment. An unchanged body does not advance the epoch. Empty internal bodies and non-Ready topology states use the topology-transition
-interface below.
+`GraphTransitionSource::read` collects a complete partition body from one snapshot
+with bounded scans. An absent partition is a creation source; empty internal and
+leaf bodies have no graph. `prepare` consumes the source, exact proposed Header and
+canonical proposed Child Entry body. It validates the old graph before modifying
+or removing it, and checks finite coordinates, level/count/capacity. The topology
+owner determines the final body epoch; state-only changes preserve it. No separate
+Ready-only projection update protocol exists.
 
 Insertion and centroid replacement consume a private restored USearch graph.
 The distance callback uses proposed centroids throughout the update. Old slots
@@ -638,7 +638,7 @@ establish end-to-end maintenance throughput or long-run quality.
 `prepare` is synchronous CPU work. Its caller must dispatch it to bounded blocking
 execution and retain admission through actual exit. Its budget covers source and
 proposed centroids, kernel, restoration, native scratch, ordinal mapping, encoded
-output and the retained authoritative delta. Cancellation discards private state.
+output and all retained graph plans. Cancellation discards private state.
 Prepared graphs never populate the shared query cache. Ordinary leaf membership
 changes and cache misses do not cause preparation or parent-centroid changes.
 
@@ -676,20 +676,18 @@ write-conflict endpoints and a 900,000-byte authority envelope remains below
 10,000,000 bytes. A native FDB 7.3 probe of this worst-case payload/key shape
 committed at approximately 9,868,260 affected bytes.
 
-`PreparedGraphUpdate::publish` update-protects the Active Manifest, source Header
-and descriptor, validates changed child authorities, then writes the complete
-replacement graph, deletes any obsolete tail chunks, and updates Child Entries,
-changed child centroids, Header and descriptor in one transaction. Its own
-non-graph changes and protected reads are bounded by the authority envelope;
-a topology coordinator must budget its additional mutations and all participating
-graphs against that same combined envelope. Preparation remains outside the
-transaction. A stale source fails before publication. The backend's actual
-admission and commit checks remain authoritative; arbitrary caller-composed
-extra writes are not exempt from them.
+`PreparedGraphTransition::protect` update-protects the Active Manifest, source
+Header and descriptor before topology edits. The topology owner validates child
+authority through its existing expose/drain/finalize operations, then checks each
+final Header with `validate_target` before appending graph descriptor, obsolete
+tail deletes and chunk payloads. The combined protected reads and non-payload
+mutations share the authority envelope; native adapter admission and commit
+checks remain authoritative. Preparation runs outside the transaction, and a
+stale source discards the prepared plan before publication.
 
-After an unknown commit, `published` recognizes only the exact target Header and
-descriptor. Callers check it before repeating accompanying child creation/removal.
-An unchanged source permits retry; a superseded source cannot prove a past commit.
+After an unknown commit, the graph-aware driver rediscovers persisted topology
+on its next call. It does not infer success from a superseding epoch or replay
+child creation/removal from an uncertain plan.
 Cancellation before commit discards the transaction. There is no begin/load,
 pending or retired generation, durable progress cursor, cancel operation or graph
 GC. Existing backend snapshots retain overwritten graph bytes for old queries;

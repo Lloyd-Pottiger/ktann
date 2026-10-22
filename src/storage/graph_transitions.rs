@@ -39,7 +39,7 @@ const PAGE: ScanLimits = ScanLimits {
 pub struct GraphTransitionSource {
     manifest: IndexManifest,
     tree: TreeKey,
-    pub(super) partition: PartitionKey,
+    partition: PartitionKey,
     header: Option<PartitionHeader>,
     descriptor: Option<GraphDescriptor>,
     children: Vec<ChildEntry>,
@@ -270,19 +270,6 @@ impl GraphTransitionSource {
         working_bytes: usize,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<PreparedGraphTransition> {
-        self.prepare_with_entries(next_header, next, working_bytes, check)
-            .map(|(prepared, _, _)| prepared)
-    }
-
-    /// Leaves source/proposed projections available for an owning operation's
-    /// authority delta, after native work has released its peak allocation.
-    pub(super) fn prepare_with_entries(
-        self,
-        next_header: Option<PartitionHeader>,
-        next: Vec<ChildEntry>,
-        working_bytes: usize,
-        check: &dyn Fn() -> Result<()>,
-    ) -> Result<(PreparedGraphTransition, Vec<ChildEntry>, Vec<ChildEntry>)> {
         check()?;
         let config = self.manifest.config();
         let capacity = config.max_internal_partition_entries() as usize + 2;
@@ -403,32 +390,28 @@ impl GraphTransitionSource {
         } else {
             None
         };
-        Ok((
-            PreparedGraphTransition {
-                manifest: self.manifest,
-                tree: self.tree,
-                partition: self.partition,
-                source_header: self.header,
-                source_descriptor: self.descriptor,
-                header: next_header,
-                records,
-                unchanged,
-            },
-            self.children,
-            next,
-        ))
+        Ok(PreparedGraphTransition {
+            manifest: self.manifest,
+            tree: self.tree,
+            partition: self.partition,
+            source_header: self.header,
+            source_descriptor: self.descriptor,
+            header: next_header,
+            records,
+            unchanged,
+        })
     }
 }
 
 /// Private replacement graph; no persisted staging or recovery cursor exists.
 #[derive(Debug)]
 pub struct PreparedGraphTransition {
-    pub(super) manifest: IndexManifest,
-    pub(super) tree: TreeKey,
-    pub(super) partition: PartitionKey,
-    pub(super) source_header: Option<PartitionHeader>,
+    manifest: IndexManifest,
+    tree: TreeKey,
+    partition: PartitionKey,
+    source_header: Option<PartitionHeader>,
     source_descriptor: Option<GraphDescriptor>,
-    pub(super) header: Option<PartitionHeader>,
+    header: Option<PartitionHeader>,
     records: Option<GraphRecords>,
     unchanged: bool,
 }
@@ -443,13 +426,6 @@ impl PreparedGraphTransition {
             .ok_or_else(limit)
     }
 
-    fn target_descriptor(&self) -> Option<&GraphDescriptor> {
-        if self.unchanged {
-            self.source_descriptor.as_ref()
-        } else {
-            self.records.as_ref().map(|r| &r.descriptor)
-        }
-    }
     async fn authority<T: WriteTxn>(
         &self,
         txn: &mut WriteLogicalTxn<'_, T>,
@@ -485,18 +461,6 @@ impl PreparedGraphTransition {
             _ => return Err(corrupt()),
         };
         Ok((header, descriptor))
-    }
-
-    /// Recognizes only this exact committed result. Supersession is not success.
-    pub async fn published<T: WriteTxn>(&self, txn: &mut WriteLogicalTxn<'_, T>) -> Result<bool> {
-        let (header, descriptor) = self.authority(txn).await?;
-        if header == self.header && descriptor.as_ref() == self.target_descriptor() {
-            return Ok(true);
-        }
-        if header != self.source_header || descriptor != self.source_descriptor {
-            return Err(stale());
-        }
-        Ok(false)
     }
 
     /// Establishes conflicts on the exact old body before topology edits.
@@ -712,10 +676,6 @@ mod tests {
             .unwrap();
         assert!(update.unchanged);
         assert!(update.records.is_none());
-        assert_eq!(
-            update.target_descriptor(),
-            update.source_descriptor.as_ref()
-        );
     }
 
     #[test]

@@ -9,7 +9,6 @@
 
 pub mod backend;
 pub mod graph_transitions;
-pub mod graph_updates;
 pub mod keys;
 pub mod membership;
 mod operations;
