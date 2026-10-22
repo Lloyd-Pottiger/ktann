@@ -187,9 +187,11 @@ Graph Descriptor and Graph Chunk values use tags `0x12` and `0x13`; their
 partition subkeys are `0x06` and `0x07`. Chunk keys end in a big-endian u32
 ordinal. Every complete graph value is at most 100,000 bytes. The descriptor binds
 one immutable topology to its source Header and canonical Child Entries;
-structural and digest validation precede native allocation. The exact envelope,
-topology grammar, source digest, and loading budget belong to
-[the local graph format](partition-local-hnsw.md#6-persisted-graph-and-snapshot-binding).
+structural and digest validation precede native allocation. The
+[graph codec](../../src/storage/values/graph.rs) defines the envelopes, and the
+[native stream validator](../../ktann-usearch/src/persistence.rs) defines the
+supported topology layout. Source binding and loading constraints belong to
+[the local graph design](partition-local-hnsw.md#persistence-and-snapshot-binding).
 Generic typed transactions support both families; `LogicalRange::graph_chunks`
 scans the complete chunk range with ordinary snapshot pagination. Producing
 these records alone does not authorize serving publication.

@@ -7,7 +7,7 @@ The Rust core in `src/search/local_hnsw.rs` owns canonical Child Entry validatio
 partition seed derivation, routing distances, and operation-wide admission.
 
 The algorithm contract belongs to
-[partition-local-hnsw.md](../docs/design/partition-local-hnsw.md#41-local-core-algorithm-and-usearch-integration).
+[partition-local-hnsw.md](../docs/design/partition-local-hnsw.md#local-graph-algorithm).
 Core storage owns graph KV envelopes and snapshot binding; this bridge owns
 validated native stream persistence. Production routing remains
 outside this crate.
@@ -126,9 +126,11 @@ through upstream `noexcept` functions. The bridge reports cancellation after
 native frames return. Partial restoration is never published. Loading calls no
 metric and performs no construction or repair.
 
-The format grammar, endian marker and source binding are specified in the owning
-local HNSW design. Decode admission covers borrowed encoded bytes, validation
-scratch, and native allocations; callers additionally charge their own retained
+The [safe stream validator](src/persistence.rs) defines the supported native
+grammar; the core [graph codec](../src/storage/values/graph.rs) defines KV envelopes
+and the byte-order marker. The [local HNSW design](../docs/design/partition-local-hnsw.md#persistence-and-snapshot-binding)
+owns source binding and loading constraints. Decode admission covers borrowed
+encoded bytes, validation scratch, and native allocations; callers additionally charge their own retained
 inputs. Native streams include full reserved adjacency capacity, accounted in
 encoded-size bounds. Updating USearch requires rechecking the layout and the
 validator together. Golden native fixtures, malformed inputs, allocation-failure
