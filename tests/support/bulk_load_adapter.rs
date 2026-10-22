@@ -13,34 +13,24 @@ use std::path::Path;
 #[path = "graph_updates.rs"]
 mod graph_updates;
 
-#[path = "mutable_graph_history.rs"]
-pub mod mutable_graph_history;
+#[path = "graph_history.rs"]
+pub mod graph_history;
 
 /// Exercises both manual loading and worker acceptance across a real backend
 /// reopen, then checks exact bytes before publication and ordinary verification.
 pub async fn exercise<B: Backend>(backend: impl Fn() -> B, directory: &Path) {
-    for (name, fixed, mutable_graph, metric) in [
-        ("mutable", false, false, Metric::L2),
-        ("mutable-graph", false, true, Metric::L2),
-        ("fixed-l2", true, false, Metric::L2),
-        ("fixed-cosine", true, false, Metric::Cosine),
-        ("fixed-ip", true, false, Metric::InnerProduct),
+    for (name, graph, metric) in [
+        ("ordinary", false, Metric::L2),
+        ("graph-l2", true, Metric::L2),
+        ("graph-cosine", true, Metric::Cosine),
+        ("graph-ip", true, Metric::InnerProduct),
     ] {
         let path = directory.join(name);
         std::fs::create_dir(&path).unwrap();
-        exercise_mode(
-            &backend,
-            &path,
-            fixed,
-            mutable_graph,
-            metric,
-            false,
-            &|_, _| {},
-        )
-        .await;
+        exercise_mode(&backend, &path, graph, metric, false, &|_, _| {}).await;
     }
     exercise_updates(&backend, &directory.join("graph-updates"), &|_, _| {}).await;
-    mutable_graph_history::exercise(&backend, &|_, _| {}).await;
+    graph_history::exercise(&backend, &|_, _| {}).await;
 }
 
 /// The same graph-update corpus is used by all adapters; Memory adds commit faults.
@@ -50,14 +40,13 @@ pub async fn exercise_updates<B: Backend>(
     fault: &dyn Fn(&'static str, usize),
 ) {
     std::fs::create_dir(directory).unwrap();
-    exercise_mode(backend, directory, true, false, Metric::L2, true, fault).await;
+    exercise_mode(backend, directory, true, Metric::L2, true, fault).await;
 }
 
 async fn exercise_mode<B: Backend>(
     backend: &impl Fn() -> B,
     directory: &Path,
-    fixed: bool,
-    mutable_graph: bool,
+    graph: bool,
     metric: Metric,
     updates: bool,
     fault: &dyn Fn(&'static str, usize),
@@ -73,8 +62,8 @@ async fn exercise_mode<B: Backend>(
         .unwrap()
         .with_tree_key_fields(vec![FieldId(0)])
         .unwrap();
-    let config = if fixed {
-        config.with_fixed_graph(
+    let config = if graph {
+        config.with_local_graph(
             ktann::api::LocalGraphConfig::new(
                 if updates { 16 } else { 4 },
                 if updates { 64 } else { 16 },
@@ -82,8 +71,6 @@ async fn exercise_mode<B: Backend>(
             )
             .unwrap(),
         )
-    } else if mutable_graph {
-        config.with_mutable_graph(ktann::api::LocalGraphConfig::new(4, 16, [3; 32]).unwrap())
     } else {
         config
     };
@@ -210,7 +197,7 @@ async fn exercise_mode<B: Backend>(
     }
     // Exercise real storage reads for both serving modes after durable loading.
     // The default beam is exhaustive for this small two-Tree-Key fixture.
-    let modes = if fixed || mutable_graph {
+    let modes = if graph {
         vec![
             ktann::api::RoutingMode::Exact,
             ktann::api::RoutingMode::PartitionLocalHnsw { ef_search: 1 },
@@ -264,7 +251,7 @@ async fn exercise_mode<B: Backend>(
         }
     }
 
-    if mutable_graph {
+    if graph {
         // Bulk-built graph indexes retain ordinary public write capability.
         let id = Bytes::from_static(b"post-publication");
         index

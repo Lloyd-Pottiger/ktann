@@ -97,7 +97,7 @@ pub(crate) async fn advance<B: Backend>(
     }) {
         return Ok(Advance::Idle);
     }
-    if manifest.config().mutable_graph().is_some() {
+    if manifest.config().local_graph().is_some() {
         return super::graph_topology::advance_observed(
             backend, manifest, tree_key, partition, policy, authority,
         )

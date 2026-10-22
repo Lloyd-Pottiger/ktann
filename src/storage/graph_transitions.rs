@@ -570,7 +570,7 @@ mod tests {
                     .unwrap()
                     .with_internal_partition_entries(2, 16)
                     .unwrap()
-                    .with_fixed_graph(LocalGraphConfig::new(4, 16, [3; 32]).unwrap()),
+                    .with_local_graph(LocalGraphConfig::new(4, 16, [3; 32]).unwrap()),
                 [0; 32],
                 vec![],
             )

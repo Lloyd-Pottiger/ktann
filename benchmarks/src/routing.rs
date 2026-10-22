@@ -1,4 +1,4 @@
-//! Fixed-index experiment settings shared by CLI workers and reports.
+//! Frozen-dataset experiment settings shared by CLI workers and reports.
 use ktann::api::{LocalGraphConfig, RoutingMode};
 use serde::{Deserialize, Serialize};
 
@@ -21,7 +21,7 @@ pub enum Mode {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Experiment {
-    /// Routing policy; all policies use the same fixed-index serving format.
+    /// Routing policy; all policies use the same graph-index serving format.
     pub mode: Mode,
     /// Graph maximum upper-layer degree.
     pub m: u32,

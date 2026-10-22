@@ -262,7 +262,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = IndexConfig::new(corpus[0].1.len(), metric)?
         .with_leaf_partition_entries(32, 64)?
         .with_internal_partition_entries(internal_min, internal_max)?
-        .with_mutable_graph(LocalGraphConfig::new(16, 64, [19; 32])?);
+        .with_local_graph(LocalGraphConfig::new(16, 64, [19; 32])?);
     let index = runtime.create_index("updates", config.clone()).await?;
     let mut observations = vec![json!({"phase": "configuration", "dataset": data.metadata,
         "metric": format!("{metric:?}"), "graph_seed_bytes": vec![19_u8; 32], "synthetic_data_seed": (args[0] == "clustered").then_some(7_u64),

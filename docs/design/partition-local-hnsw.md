@@ -1,33 +1,33 @@
 # Partition-local HNSW: serving and maintenance contract
 
-Status: fixed Bulk Build preparation and publication are implemented, including
-optional artifact refinement, final-centroid graph construction, immutable loading,
-and fixed-index write/maintenance restrictions. Snapshot-bound graph reads and
-shared cache ownership and production HNSW traversal are implemented, with
-explicit public routing selection and bounded per-tree/level candidate merging.
-Offline verification audits every fixed body and its centroid projections; the
-shared adapter integration corpus covers durable loading, reopening, publication,
-and both routing modes for all three metrics. This document owns the
-fixed and mutable graph contract of [issue #195](https://github.com/Lloyd-Pottiger/ktann/issues/195).
+Status: Bulk Build preparation and publication are implemented, including optional
+artifact refinement, final-centroid graph construction and fenced immutable
+loading. Graph-enabled indexes support ordinary creation and writes after
+publication. Snapshot-bound graph reads, shared cache ownership and production
+HNSW traversal use explicit public routing selection and bounded per-tree/level
+candidate merging. Offline verification audits graph bodies and centroid
+projections. The shared adapter corpus covers durable loading, reopening,
+publication and both routing modes for all three metrics. This document owns the
+local graph contract of [issue #195](https://github.com/Lloyd-Pottiger/ktann/issues/195).
 [Search](search.md), [Storage](storage.md), and [Bulk Build](bulk-build.md) retain
 ownership of their shared contracts.
 
-Mutable graph mode now connects graph publication to split, drain, merge, root
+Graph maintenance connects graph publication to split, drain, merge, root
 growth, and parent membership changes. Fault-injected Memory histories and
 durable RocksDB/FoundationDB histories pass. Bounded update experiments cover SIFT at 16,384 records
 for 32 rounds and 65,536 records for eight rounds, plus Cohere at 16,384 records
 for eight rounds, with fixed rerank budgets and independent evaluation queries.
 These establish the tested update behavior, not a general HNSW speedup, tuning
 default, or large-scale SLA. The reproducible runner and measurement limits are
-documented in [the benchmark guide](../../benchmarks/README.md#mutable-local-graph-update-history).
+documented in [the benchmark guide](../../benchmarks/README.md#local-graph-update-history).
 
 ## 1. Scope and invariants
 
-A fixed index is an explicitly selected, bulk-built Logical Index whose serving
-bytes cannot change after publication. Each internal partition has one persisted
-HNSW graph over exactly its own Child Entries. The graph selects routing
-candidates; it does not own partitions, records, or membership. The tree remains
-the storage and ownership structure. Leaf partitions have no graph.
+A graph-enabled Logical Index has one persisted HNSW graph per nonempty internal
+partition, over exactly that partition's Child Entries. The graph selects routing
+candidates; it does not own partitions, records or membership. The tree remains
+the storage and ownership structure. Leaf and empty internal partitions have no
+graph. Writes maintain graphs atomically with their authoritative projections.
 
 Preserve exact Record–Location–Leaf membership, one incoming Child Entry per
 non-root partition, existing Tree Key selection, per-tree level-scaled global
@@ -35,17 +35,17 @@ beam competition, leaf scans, exact filtering, RaBitQ selection, and exact
 reranking. Routing distances retain the current metric and tie semantics. A
 query uses one backend snapshot through traversal and reranking.
 
-The first stage includes empty input, leaf-only trees, multiple Tree Keys,
-multiple internal levels, all three metrics, filters, cancellation, reopen, and
-bounded-resource failure. Fixed mode is opt-in; ordinary mutable indexes retain
-their current behavior. There is no in-place conversion of an Active index.
-Changing membership, refinement settings, construction parameters, or capacities
-requires a new Bulk Build and a new Logical Index ID.
+The contract includes empty input, leaf-only trees, multiple Tree Keys, multiple
+internal levels, all three metrics, filters, cancellation, reopen and bounded
+resource failure. Graph configuration is opt-in and immutable. There is no
+in-place conversion of an Active index: changing construction parameters or
+capacities requires a new Logical Index ID. Membership changes use ordinary
+writes and maintenance; artifact refinement is available before initial graph
+construction. Online serving refinement is unsupported for graph indexes.
 
-Dynamic graph maintenance, automatic graph rebuilds, shared thresholds, adaptive
-expansion, and production default selection are outside this stage. The graph
-implementation/library is an implementation choice subject to this contract;
-measured warm local speed is not evidence of an end-to-end benefit.
+Automatic query-mode selection, adaptive expansion and production tuning defaults
+are outside this contract. Measured warm local graph speed alone does not prove
+an end-to-end benefit.
 
 ## 2. Evidence and changes required
 
@@ -53,7 +53,7 @@ Current implementation boundaries:
 
 | Existing owner | Verified behavior and implication |
 | --- | --- |
-| [`IndexConfig`](../../src/api/config.rs) | Independent leaf/internal min/max pairs are implemented; leaf maximum is capped at 65,536; internal maximum at 16,384 and internal minimum at 128. `with_fixed_graph` and `with_mutable_graph` select the mode; `LocalGraphConfig` holds persisted construction parameters for either mode. |
+| [`IndexConfig`](../../src/api/config.rs) | Independent leaf/internal min/max pairs are implemented; leaf maximum is capped at 65,536; internal maximum at 16,384 and internal minimum at 128. `with_local_graph` enables graph maintenance; `LocalGraphConfig` holds persisted construction parameters. |
 | [`construct_tree`, `ConstructionOptions`](../../src/construction.rs) | Bottom-up construction selects capacities by level, including root-fit. Memory admission reserves sample, centroid and row buffers; caller-retained output is excluded. |
 | [`local_hnsw`](../../src/search/local_hnsw.rs), [`ktann-usearch`](../../ktann-usearch/README.md) | Standalone graph construction, search, exact local top-k, structural inspection, and reusable bounded scratch are implemented. Bulk Build constructs and persists graphs; production queries explicitly select exact or graph routing. |
 | [`ForestArtifact`](../../src/bulk/forest.rs), [`ServingArtifact`](../../src/bulk/serving.rs) | Forest plans bind source/configuration/rotation/sample size. Serving preparation proves exact joins and emits canonical values; optional artifact refinement completes before final forest acceptance; serving encoding builds graphs from final Child Entries. |
@@ -73,45 +73,26 @@ This stage extends those mechanisms; it does not replace their authority.
 
 ## 3. Allowed operations and enforcement
 
-Persist ordinary, fixed-graph, or mutable-graph mode in the immutable Index Configuration inside the
-Index Manifest. Keep it independent of query routing choice: selecting exact
-routing does not make a fixed index writable. Fixed mode requires graph build
-configuration and creation through Bulk Build. Ordinary create rejects it with
-`InvalidArgument`; it must not expose an empty Active index awaiting population.
+The immutable Index Configuration stores `Option<LocalGraphConfig>` in the
+Index Manifest. It controls graph construction and maintenance independently of
+query routing. Both ordinary creation and Bulk Build support graph-enabled
+indexes; publication makes a built index available for ordinary writes.
 
-| Operation | Fixed Building index | Fixed Active index |
+| Operation | Building index | Active graph index |
 | --- | --- | --- |
-| Ordinary open, record/payload reads, search, public verify | `IndexBuilding` | Allowed; search chooses exact or local HNSW explicitly |
-| Insert, upsert, delete, batch mutation, public `refine` | `IndexBuilding` | Reject with a new `IndexReadOnly` error kind |
-| Build preparation, load, validation, publish, recovery | Existing job identity and fences | Identity-bound status/recovery; no serving-byte rewrite |
-| Automatic Structure Maintenance | Never admitted | Never offered or executed |
+| Ordinary open, record/payload reads, search, public verify | `IndexBuilding` | Allowed; search chooses Exact or local HNSW explicitly |
+| Insert, upsert, delete, batch mutation | `IndexBuilding` | Allowed with graph-aware maintenance |
+| Public `refine` | `IndexBuilding` | `InvalidArgument`; use artifact refinement before graph construction |
+| Build preparation, load, validation, publish, recovery | Existing job identity and fences | Identity-bound status/recovery; no loader rewrite of serving bytes |
+| Automatic Structure Maintenance | Never admitted | Uses graph-aware preparation and atomic publication |
 | Abort | Existing unpublished-identity rules | Rejected by existing abort rules |
 | Drop | Existing lifecycle rules | Allowed; uses Dropping cleanup |
 
-`IndexReadOnly` describes an index capability, not backend `Unsupported` or a
-retryable error. Reject even empty batches, missing-ID deletes, identical
-upserts, payload-only changes, and zero-round refinement. This makes the promise
-independent of whether a particular request happens to change a centroid.
-
-Enforcement belongs in core, not the CLI or benchmark harness:
-
-- Public mutation/refinement entrypoints reject early before planning or file IO.
-- The transaction admission path in [`writes`](../../src/runtime/writes.rs)
-  checks the snapshot Manifest capability before ordinary mutation, refinement,
-  or fixup writes. Do not add this restriction to every write transaction:
-  lifecycle/drop and the fenced Building loader must still work.
-- [`offer_fixups` and worker execution](../../src/runtime/fixup.rs) both gate
-  fixed indexes. Reads do not enqueue maintenance; a stale queued offer cannot
-  bypass the worker's Manifest check. A non-Ready partition encountered in a
-  fixed Active index is `Corruption`, not a request to repair it.
-- Internal topology mutators are reached only through these authorized write
-  contexts. Offline artifact computation has no backend mutation authority.
-
-Lifecycle/identity validation takes precedence over the read-only capability:
-a Building, Dropping, or absent identity reports its existing lifecycle error.
-Normal request syntax validation may still reject malformed input first.
-Runtime-private caches and metrics may change; serving KV bytes may not. Raw
-backend writes remain outside the library API's integrity guarantee.
+Building, Dropping and absent identities retain their existing lifecycle errors.
+Normal request syntax validation may reject malformed input first. Core write
+admission and fenced Building loader authority preserve lifecycle isolation;
+private artifact computation has no backend mutation authority. Raw backend
+writes remain outside the library API's integrity guarantee.
 
 ## 4. Configuration ownership
 
@@ -134,7 +115,7 @@ Do not copy mutable `ef_search` into graph metadata or persist a second mode in
 the Build Workspace. This stage keeps exact routing as the API default and
 requires explicit HNSW selection, avoiding a premature production default.
 HNSW on an ordinary index without graphs is `InvalidArgument`; an irrelevant
-HNSW-only parameter on exact routing is also rejected. Leaf-only fixed indexes
+HNSW-only parameter on exact routing is also rejected. Leaf-only graph indexes
 accept either routing choice and perform no graph work.
 
 Validate `M >= 2`, `ef_construction >= M`, positive `ef_search`, checked degree,
@@ -215,7 +196,7 @@ without computing a distance, and checks capacity and canonical keys once at
 the borrowed-view boundary. Bulk construction consumes that view synchronously
 and returns only encoded graph records; callers do not retain a borrowed graph
 or sequence separate build and persistence operations. Restoration returns a
-complete fixed internal body that owns its projections, numeric kernel and
+complete graph internal body that owns its projections, numeric kernel and
 validated graph. `Graph` itself owns only topology and exposes entry, level and
 bounded adjacency inspection; no Rust references or callbacks survive an FFI
 call. Immutable graphs support concurrent queries with separate workspaces.
@@ -421,12 +402,11 @@ key remains index/tree/partition/kind, and reuse requires the snapshot Header
 epoch. Account both Child Entries and graph allocations. Historical snapshots
 must not evict or replace newer entries. Equal/newer fills use the existing
 race policy; no graph-specific cache, readiness registry, pinning rule or
-singleflight state is introduced. A mutable body change replaces/invalidates its
-graph and increments that same epoch atomically; fixed indexes prohibit such
-dynamic writes.
+singleflight state is introduced. A body change replaces/invalidates its graph and increments that same epoch
+atomically.
 
-Exact routing uses the same fixed-index body validation and ignores adjacency
-when selecting candidates. Thus both query modes fail on a malformed fixed
+Exact routing uses the same graph-body validation and ignores adjacency
+when selecting candidates. Thus both query modes fail on a malformed graph
 body; exact is an explicit algorithm baseline, not a corruption recovery path.
 For serving-only timing this gives equal loading prerequisites. Also report
 ordinary exact-index costs separately to expose the graph's storage/load tax.
@@ -460,7 +440,7 @@ tie order: a parent's child below local rank B cannot enter global top B.
 Verify that equivalence against the current full-exposure traversal. HNSW has
 no exact-top-B or final-recall guarantee. When `B >= n`, directly scoring all
 children is a deterministic exhaustive case, independent of cache warmth; the
-fixed body still requires valid persisted graph data.
+graph body still requires valid persisted graph data.
 
 Exploration has explicit finite bounds from `n`, bounded levels/degrees and
 `effective_ef`. Upper-layer greedy moves strictly improve distance/key; visited
@@ -537,9 +517,10 @@ Metrics retain existing privacy rules and do not label raw Tree Keys or vectors.
 
 The following checks govern the complete feature, including integration steps:
 
-1. **Capability:** every public mutation path and fixup execution rejects fixed
-   Active indexes without serving changes; exact routing cannot bypass it.
-   Building/drop/abort precedence and mutable-index behavior are preserved.
+1. **Lifecycle and writes:** graph-enabled indexes support ordinary creation and
+   writes after Bulk Build publication. Building/drop/abort precedence is
+   preserved. Mutation and maintenance keep graph and topology changes atomic;
+   public serving refinement rejects graph indexes.
 2. **Artifact order:** zero/nonzero refinement produces final centroids before
    graph construction. Source/assignment/Child Entry/graph joins agree for all
    metrics. Attempting post-load edits or mismatched resume options fails.
@@ -583,29 +564,29 @@ layout/centroids when comparing internal grouping; no rerank-budget sweeps.
 
 The graph format and snapshot reader implement the source and resource contracts
 above. [Search](search.md#graph-index-bodies) owns graph-cache admission,
-complete fixed-body ownership, and the explicit loading/query interfaces. Candidate
+complete graph-body ownership, and the explicit loading/query interfaces. Candidate
 generation must supply the existing query snapshot, reserve query-wide retained
 state, consume one parent at a time, and merge the returned child identities and
 unmodified routing distances under the existing global beam and budgets. This
 document does not claim an end-to-end performance or 100M/10B feasibility result.
-Production parameter choices remain workload-dependent. Mutable maintenance is
-defined below. There is
-no stable release requiring compatibility machinery or migration of old builds.
+Production parameter choices remain workload-dependent. Graph maintenance is
+defined below. There is no stable release requiring compatibility machinery or
+migration of old builds.
 
 
 The step-9 experiment entrypoints and metric semantics are documented in
-[benchmark routing experiments](../../benchmarks/README.md#fixed-index-routing-experiments-issue-195-step-9).
+[benchmark routing experiments](../../benchmarks/README.md#frozen-layout-routing-experiments-issue-195-step-9).
 Benchmark-only global routing and diagnostic replay are feature-gated and use the
 production leaf/rerank pipeline. They do not add a production global index or
-change the fixed-index mutation contract. Matched-recall tuning remains step 10.
+change mutation semantics. Matched-recall tuning is covered by step 10.
 
 ## Local graph transitions
 
 `storage::graph_transitions` owns bounded graph snapshots, private preparation,
 source fencing and graph-record publication. The topology owner composes its
 Header, Child Entry and child creation/removal or movement in the same transaction.
-A graph replacement alone does not establish valid tree membership. Fixed Indexes
-retain their public read-only contract, and foreground write routing remains exact.
+A graph replacement alone does not establish valid tree membership. Foreground
+write routing remains exact.
 
 ### Algorithm and preparation
 
@@ -696,7 +677,7 @@ caches still validate the source epoch and descriptor before reuse.
 ### Split/merge integration boundary
 
 The graph-aware storage drain validates a single receiver and the transient
-node ceilings. Mutable serving composes the following transitions in
+node ceilings. Graph-aware maintenance composes the following transitions in
 `maintenance::graph_topology`, using `storage::graph_transitions` for snapshot
 preparation and publication:
 
@@ -726,15 +707,14 @@ commit is returned without blind replay; subsequent maintenance rediscovers the
 committed state. Backend snapshots retain overwritten graph bytes for older
 queries; there is no staging generation or asynchronous reclamation protocol.
 
-Fixed Index remains read-only. Mutable graph mode is a separate immutable
-configuration choice; foreground writes retain existing tree routing. Serving
-`Index::refine` is rejected for mutable graph mode; optional artifact refinement
-still precedes initial graph construction. Graph readers and verification accept
-legal non-Ready bodies and graph-free empty internal bodies only in mutable mode.
+Graph configuration is immutable; graph contents evolve with ordinary writes and
+maintenance. Serving `Index::refine` returns `InvalidArgument`; optional artifact
+refinement precedes initial graph construction. Graph readers and verification
+accept legal non-Ready bodies and graph-free empty internal bodies.
 
 The serialization proof and storage probes establish atomic publication
 feasibility, not throughput or long-running recall. Empirical opening evidence
-must come from the mutable history and update experiments, not the fixed-index
+must come from the mutation histories and update experiments, not the frozen-dataset
 step-10 matrix alone.
 
 Obsolete source-tail chunk deletions count against the same combined 900,000-byte

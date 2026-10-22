@@ -1172,23 +1172,23 @@ fn graph_envelope_golden_bounds_and_malformed_values() {
 }
 
 #[test]
-fn fixed_configuration_round_trip_and_malformed_parameters() {
+fn graph_configuration_round_trip_and_malformed_parameters() {
     use ktann::api::LocalGraphConfig;
     for (m, ef) in [(1, 8), (32_769, 32_769), (8, 7)] {
         assert!(LocalGraphConfig::new(m, ef, [3; 32]).is_err());
     }
     let graph = LocalGraphConfig::new(4, 16, [3; 32]).unwrap();
     let base = minimal_manifest();
-    let fixed = IndexManifest::new(
+    let manifest = IndexManifest::new(
         IndexLifecycle::Building,
         id(1),
-        base.config().clone().with_fixed_graph(graph),
+        base.config().clone().with_local_graph(graph),
         [0; 32],
         vec![],
     )
     .unwrap();
     let codec = ValueCodec::bootstrap();
-    let value = PersistentValue::IndexManifest(fixed.clone());
+    let value = PersistentValue::IndexManifest(manifest.clone());
     let bytes = codec.encode(&value).unwrap();
     let key = LogicalKey::Manifest(id(1));
     assert_eq!(decode(codec, &key, &bytes).unwrap(), value);
@@ -1199,30 +1199,11 @@ fn fixed_configuration_round_trip_and_malformed_parameters() {
     expected.extend_from_slice(&[3; 32]);
     expected.extend_from_slice(&[0; 32]);
     assert_eq!(&bytes[mode..], expected);
-    for (offset, value) in [(mode, 3), (mode + 4, 1), (mode + 8, 3)] {
+    for (offset, value) in [(mode, 2), (mode + 4, 1), (mode + 8, 3)] {
         let mut malformed = bytes.clone();
         malformed[offset] = value;
         assert_corrupt(decode(codec, &key, &malformed));
     }
-    assert_ne!(fixed.config(), base.config());
-    let mutable = IndexManifest::new(
-        IndexLifecycle::Building,
-        id(1),
-        base.config().clone().with_mutable_graph(graph),
-        [0; 32],
-        vec![],
-    )
-    .unwrap();
-    let value = PersistentValue::IndexManifest(mutable.clone());
-    let mutable_bytes = codec.encode(&value).unwrap();
-    assert_eq!(decode(codec, &key, &mutable_bytes).unwrap(), value);
-    assert_eq!(mutable_bytes[mode], 2);
-    assert_ne!(mutable.config(), fixed.config());
-    assert_eq!(mutable.config().local_graph(), Some(graph));
-    assert_eq!(mutable.config().fixed_graph(), None);
-    assert_eq!(fixed.config().mutable_graph(), None);
-    assert_eq!(
-        mutable.config().clone().with_fixed_graph(graph),
-        *fixed.config()
-    );
+    assert_ne!(manifest.config(), base.config());
+    assert_eq!(manifest.config().local_graph(), Some(graph));
 }

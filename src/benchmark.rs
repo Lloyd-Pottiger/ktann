@@ -1,7 +1,7 @@
 //! Experimental benchmark helpers, excluded from production builds.
 pub use crate::search::local_hnsw::benchmark::GlobalLeafRouter;
 
-/// Untimed quality diagnostics for one fixed-index query. Retains only truth IDs
+/// Untimed quality diagnostics for one graph-index query. Retains only truth IDs
 /// and selected leaf identities, never a second copy of the candidate pool.
 #[derive(Clone, Debug)]
 pub struct SearchDiagnostics {

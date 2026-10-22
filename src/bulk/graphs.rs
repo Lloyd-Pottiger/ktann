@@ -102,7 +102,7 @@ impl<'a> GraphPreparation<'a> {
             .index
             .config()
             .local_graph()
-            .expect("fixed preparation")
+            .expect("graph preparation")
             .parameters();
         let centroids = Centroids::new(
             &self.kernel,
@@ -174,7 +174,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn fixed_artifact_bytes_are_reproducible_in_independent_processes() {
+    fn graph_artifact_bytes_are_reproducible_in_independent_processes() {
         let run = || {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["bulk::graphs::tests::final_artifact_graphs_restore_against_exact_projections_for_all_metrics", "--exact", "--nocapture"])
@@ -214,7 +214,7 @@ mod tests {
                     .unwrap()
                     .with_internal_partition_entries(2, 4)
                     .unwrap()
-                    .with_fixed_graph(LocalGraphConfig::new(2, 8, [4; 32]).unwrap());
+                    .with_local_graph(LocalGraphConfig::new(2, 8, [4; 32]).unwrap());
                 let index = IndexManifest::new(
                     IndexLifecycle::Building,
                     LogicalIndexId::new(1).unwrap(),
@@ -345,7 +345,7 @@ mod tests {
                     }
                     internal_levels.insert(header.level());
                     let centroids = Centroids::new(&kernel, &body.children, 4, &|| Ok(())).unwrap();
-                    let graph = crate::search::local_hnsw::body::FixedInternalBody::restore(
+                    let graph = crate::search::local_hnsw::body::InternalGraphBody::restore(
                         body.children.clone().into_boxed_slice(),
                         VectorKernel::new(2, metric, [3; 32]).unwrap(),
                         GraphSource {

@@ -199,7 +199,7 @@ pub async fn exercise<B: Backend>(backend: impl Fn() -> B, fault: &dyn Fn(&'stat
         .unwrap()
         .with_internal_partition_entries(3, 6)
         .unwrap()
-        .with_mutable_graph(LocalGraphConfig::new(4, 16, [19; 32]).unwrap());
+        .with_local_graph(LocalGraphConfig::new(4, 16, [19; 32]).unwrap());
     let mut index = runtime
         .create_index("mutable-graph-history", config)
         .await

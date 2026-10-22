@@ -1,13 +1,13 @@
-//! Complete immutable fixed internal partitions, shared as one cached body.
+//! Complete snapshot-bound internal graph partitions, shared as one cached body.
 
 use super::persistence::{GraphSource, binding, restore_graph};
 use super::*;
 use crate::storage::values::{GraphChunk, GraphDescriptor};
 
-/// One fixed internal body: authoritative child projections, numeric kernel,
+/// One internal graph body: authoritative child projections, numeric kernel,
 /// validated topology and source identity have a single owner.
 /// No self-reference or native vector copy is needed. Each query owns its scratch.
-pub(crate) struct FixedInternalBody {
+pub(crate) struct InternalGraphBody {
     children: Box<[ChildEntry]>,
     kernel: VectorKernel,
     graph: ktann_usearch::Graph,
@@ -16,7 +16,7 @@ pub(crate) struct FixedInternalBody {
     centroid_bytes: usize,
 }
 
-impl FixedInternalBody {
+impl InternalGraphBody {
     /// Restores persisted topology without invoking construction or changing quality parameters.
     pub(crate) fn restore(
         children: Box<[ChildEntry]>,

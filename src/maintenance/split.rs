@@ -38,7 +38,7 @@
 //!   `advance` converges a split; abandoning it at any point leaves a
 //!   searchable state.
 //!
-//! Mutable graph indexes use [`super::graph_topology::advance`] for body-changing
+//! Graph indexes use [`super::graph_topology::advance`] for body-changing
 //! steps. These direct drivers reject such operations because graph preparation
 //! requires the caller's bounded native executor.
 
@@ -195,7 +195,7 @@ pub async fn expose_targets<B: Backend>(
     started_at_unix_millis: u64,
     retry: &RetryPolicy,
 ) -> Result<TargetExposure> {
-    if manifest.config().mutable_graph().is_some() {
+    if manifest.config().local_graph().is_some() {
         return Err(Error::invalid_argument());
     }
     // One consistent snapshot classifies the source and trains both target
@@ -280,7 +280,7 @@ pub async fn drain_batch<B: Backend>(
     else {
         return Ok(DrainStep::SourceAdvanced);
     };
-    if manifest.config().mutable_graph().is_some() && observed.header.level() > 1 {
+    if manifest.config().local_graph().is_some() && observed.header.level() > 1 {
         return Err(Error::invalid_argument());
     }
     drain_observed(backend, manifest, tree_key, source, retry, observed).await
@@ -530,7 +530,7 @@ pub async fn complete_split<B: Backend>(
     started_at_unix_millis: u64,
     retry: &RetryPolicy,
 ) -> Result<topology::SplitCompletion> {
-    if manifest.config().mutable_graph().is_some() {
+    if manifest.config().local_graph().is_some() {
         return Err(Error::invalid_argument());
     }
     let removal = topology::SourceRemoval::for_capabilities(backend.capabilities());
@@ -571,7 +571,7 @@ pub async fn advance<B: Backend>(
     started_at_unix_millis: u64,
     retry: &RetryPolicy,
 ) -> Result<Advance> {
-    if manifest.config().mutable_graph().is_some() {
+    if manifest.config().local_graph().is_some() {
         return Err(Error::invalid_argument());
     }
     let observed = reads::open_authority_read(backend, manifest, tree_key, partition).await?;

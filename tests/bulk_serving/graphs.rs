@@ -1,4 +1,4 @@
-//! Fixed publication and operation capabilities through public entrypoints.
+//! Writable graph publication and operation capabilities through public entrypoints.
 use super::*;
 use ktann::api::{
     BulkBuildOptions, BulkBuildStatus, BulkWorkerOptions, LocalGraphConfig, RefineOptions,
@@ -12,7 +12,7 @@ fn worker(dir: &Directory) -> BulkWorkerOptions {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fixed_publication_preserves_exact_membership_and_rejects_every_mutation() {
+async fn graph_publication_preserves_membership_and_supports_mutations() {
     for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
         for rounds in [None, Some(0), Some(2)] {
             for count in [0, 1, 73] {
@@ -20,15 +20,13 @@ async fn fixed_publication_preserves_exact_membership_and_rejects_every_mutation
                 let backend = MemoryBackend::new();
                 let runtime = runtime(backend);
                 let config = config(metric, true)
-                    .with_fixed_graph(LocalGraphConfig::new(2, 8, [9; 32]).unwrap());
-                assert_eq!(
-                    runtime
-                        .create_index("ordinary", config.clone())
-                        .await
-                        .unwrap_err()
-                        .kind(),
-                    ErrorKind::InvalidArgument
-                );
+                    .with_local_graph(LocalGraphConfig::new(2, 8, [9; 32]).unwrap());
+                let ordinary = runtime
+                    .create_index("ordinary", config.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(ordinary.config(), &config);
+                runtime.drop_index("ordinary").await.unwrap();
                 let input = InputSnapshot::create(
                     &dir.0.join("source"),
                     config,
@@ -41,11 +39,11 @@ async fn fixed_publication_preserves_exact_membership_and_rejects_every_mutation
                     refinement_rounds: rounds,
                 };
                 let job = runtime
-                    .start_bulk_build("fixed", &input, request)
+                    .start_bulk_build("graph", &input, request)
                     .await
                     .unwrap();
                 assert_eq!(
-                    runtime.open_index("fixed").await.unwrap_err().kind(),
+                    runtime.open_index("graph").await.unwrap_err().kind(),
                     ErrorKind::IndexBuilding
                 );
                 let options = worker(&dir);
@@ -65,26 +63,61 @@ async fn fixed_publication_preserves_exact_membership_and_rejects_every_mutation
                     verification.issues
                 );
                 assert_eq!(verification.objects.vector_records, count);
+                assert!(index.batch_mutate(Vec::new()).await.unwrap().is_empty());
+                assert!(!index.delete(Bytes::from_static(b"missing")).await.unwrap());
+                index.insert(record(999)).await.unwrap();
+                let replacement = Record::new(
+                    record(999).id().clone(),
+                    vec![3.0, 4.0, 5.0],
+                    vec![Value::I64(1), Value::string("replacement").unwrap()],
+                )
+                .unwrap();
                 assert_eq!(
-                    index.insert(record(999)).await.unwrap_err().kind(),
-                    ErrorKind::IndexReadOnly
-                );
-                assert_eq!(
-                    index.upsert(record(0)).await.unwrap_err().kind(),
-                    ErrorKind::IndexReadOnly
+                    index.upsert(replacement).await.unwrap(),
+                    ktann::api::UpsertResult::Replaced
                 );
                 assert_eq!(
                     index
-                        .delete(Bytes::from_static(b"missing"))
+                        .get(record(999).id().clone(), GetOptions::default())
                         .await
-                        .unwrap_err()
-                        .kind(),
-                    ErrorKind::IndexReadOnly
+                        .unwrap()
+                        .unwrap()
+                        .vector(),
+                    &[3.0, 4.0, 5.0]
                 );
+                assert!(index.delete(record(999).id().clone()).await.unwrap());
+                let outcomes = index
+                    .batch_mutate(vec![
+                        Mutation::Insert(record(1000)),
+                        Mutation::Upsert(record(1001)),
+                        Mutation::Delete(Bytes::from_static(b"missing")),
+                    ])
+                    .await
+                    .unwrap();
                 assert_eq!(
-                    index.batch_mutate(Vec::new()).await.unwrap_err().kind(),
-                    ErrorKind::IndexReadOnly
+                    outcomes,
+                    vec![
+                        ktann::api::MutationOutcome::Inserted,
+                        ktann::api::MutationOutcome::Upserted { replaced: false },
+                        ktann::api::MutationOutcome::Deleted { existed: false },
+                    ]
                 );
+                let index = runtime.open_index("graph").await.unwrap();
+                assert_eq!(
+                    index
+                        .get(record(1000).id().clone(), GetOptions::default())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .vector(),
+                    record(1000).vector()
+                );
+                let verification = index.verify(VerifyOptions::default()).await.unwrap();
+                assert!(
+                    verification.complete && verification.issues.is_empty(),
+                    "{verification:?}"
+                );
+                assert_eq!(verification.objects.vector_records, count + 2);
                 assert_eq!(
                     index
                         .refine(
@@ -96,16 +129,33 @@ async fn fixed_publication_preserves_exact_membership_and_rejects_every_mutation
                         .await
                         .unwrap_err()
                         .kind(),
-                    ErrorKind::IndexReadOnly
+                    ErrorKind::InvalidArgument
                 );
-                let result = index
-                    .search(SearchRequest::new(vec![1.0, 1.0, 1.0], 1).unwrap())
-                    .await
-                    .unwrap();
-                assert_eq!(result.hits.len(), usize::from(count > 0));
+                for mode in [
+                    ktann::api::RoutingMode::Exact,
+                    ktann::api::RoutingMode::PartitionLocalHnsw { ef_search: 64 },
+                ] {
+                    let result = index
+                        .search(
+                            SearchRequest::new(vec![1.0, 1.0, 1.0], 100)
+                                .unwrap()
+                                .with_options(
+                                    ktann::api::SearchOptions::default()
+                                        .with_leaf_beam_size(100)
+                                        .unwrap()
+                                        .with_routing_mode(mode)
+                                        .unwrap(),
+                                ),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(result.hits.len(), count as usize + 2);
+                    assert!(result.hits.iter().any(|hit| hit.id() == record(1000).id()));
+                    assert!(result.hits.iter().any(|hit| hit.id() == record(1001).id()));
+                }
                 assert_eq!(
                     runtime
-                        .open_index("fixed")
+                        .open_index("graph")
                         .await
                         .unwrap()
                         .logical_index_id(),
@@ -115,7 +165,7 @@ async fn fixed_publication_preserves_exact_membership_and_rejects_every_mutation
                     job.complete(options).await.unwrap().logical_index_id(),
                     index.logical_index_id()
                 );
-                runtime.drop_index("fixed").await.unwrap();
+                runtime.drop_index("graph").await.unwrap();
                 runtime.shutdown().await.unwrap();
             }
         }
@@ -123,12 +173,12 @@ async fn fixed_publication_preserves_exact_membership_and_rejects_every_mutation
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fixed_preparation_failure_is_terminal_hidden_and_identity_bound() {
+async fn graph_preparation_failure_is_terminal_hidden_and_identity_bound() {
     for refinement in [false, true] {
         let dir = Directory::new();
         let runtime = runtime(MemoryBackend::new());
         let config = config(Metric::L2, false)
-            .with_fixed_graph(LocalGraphConfig::new(2, 8, [1; 32]).unwrap());
+            .with_local_graph(LocalGraphConfig::new(2, 8, [1; 32]).unwrap());
         let input = InputSnapshot::create(
             &dir.0.join("source"),
             config,
@@ -141,7 +191,7 @@ async fn fixed_preparation_failure_is_terminal_hidden_and_identity_bound() {
             refinement_rounds: refinement.then_some(2),
         };
         let job = runtime
-            .start_bulk_build("fixed", &input, request)
+            .start_bulk_build("graph", &input, request)
             .await
             .unwrap();
         let different = BulkBuildOptions {
@@ -150,7 +200,7 @@ async fn fixed_preparation_failure_is_terminal_hidden_and_identity_bound() {
         };
         assert!(
             runtime
-                .start_bulk_build("fixed", &input, different)
+                .start_bulk_build("graph", &input, different)
                 .await
                 .is_err()
         );
@@ -171,7 +221,7 @@ async fn fixed_preparation_failure_is_terminal_hidden_and_identity_bound() {
             }
         );
         assert_eq!(
-            runtime.open_index("fixed").await.unwrap_err().kind(),
+            runtime.open_index("graph").await.unwrap_err().kind(),
             ErrorKind::IndexBuilding
         );
         assert_eq!(
@@ -189,7 +239,7 @@ async fn explicit_load_checks_refinement_identity_and_graph_bytes_before_publish
     let memory = MemoryBackend::new();
     let runtime = runtime(memory.clone());
     let config =
-        config(Metric::L2, false).with_fixed_graph(LocalGraphConfig::new(2, 8, [1; 32]).unwrap());
+        config(Metric::L2, false).with_local_graph(LocalGraphConfig::new(2, 8, [1; 32]).unwrap());
     let input = InputSnapshot::create(
         &dir.0.join("source"),
         config,
@@ -199,7 +249,7 @@ async fn explicit_load_checks_refinement_identity_and_graph_bytes_before_publish
     .unwrap();
     let job = runtime
         .start_bulk_build(
-            "fixed",
+            "graph",
             &input,
             BulkBuildOptions {
                 construction: construction_options(),
@@ -250,7 +300,7 @@ async fn explicit_load_checks_refinement_identity_and_graph_bytes_before_publish
         ErrorKind::Corruption
     );
     assert_eq!(
-        runtime.open_index("fixed").await.unwrap_err().kind(),
+        runtime.open_index("graph").await.unwrap_err().kind(),
         ErrorKind::IndexBuilding
     );
     job.abort().await.unwrap();

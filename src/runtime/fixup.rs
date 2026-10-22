@@ -208,7 +208,7 @@ impl<B: Backend> RuntimeInner<B> {
         I: IntoIterator<Item = (TreeKey, PartitionKey)>,
     {
         // With no workers nothing consumes the queue; drop immediately.
-        if manifest.config().fixed_graph().is_some() || self.config().maintenance_workers() == 0 {
+        if self.config().maintenance_workers() == 0 {
             return;
         }
         if !self.is_accepting() {

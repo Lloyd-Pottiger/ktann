@@ -397,7 +397,7 @@ fn index_config(graph: bool) -> IndexConfig {
         })
         .expect("valid partition entries");
     if graph {
-        config.with_mutable_graph(ktann::api::LocalGraphConfig::new(4, 16, [7; 32]).unwrap())
+        config.with_local_graph(ktann::api::LocalGraphConfig::new(4, 16, [7; 32]).unwrap())
     } else {
         config
     }
@@ -1534,7 +1534,7 @@ async fn model_history_expanded() {
 /// Replays the same fault/crash script through mutable graph topology. Small
 /// parents make routing exhaustive, so the existing exact oracle still applies.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mutable_graph_model_history() {
+async fn graph_model_history() {
     for seed in CI_SEEDS {
         let script = generate_script(seed, CI_STEPS);
         let mut driver = Driver::new(seed, CI_STEPS, true).await;

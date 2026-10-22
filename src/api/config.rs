@@ -31,13 +31,6 @@ pub struct LocalGraphConfig {
     seed: [u8; 32],
 }
 
-/// Serving policy and parameters form one immutable configuration choice.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum GraphMode {
-    Fixed(LocalGraphConfig),
-    Mutable(LocalGraphConfig),
-}
-
 impl LocalGraphConfig {
     /// Creates graph parameters for bounded atomic internal-graph publication.
     pub fn new(m: u32, ef_construction: u32, seed: [u8; 32]) -> Result<Self> {
@@ -79,7 +72,7 @@ impl LocalGraphConfig {
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct IndexConfig {
-    graph: Option<GraphMode>,
+    graph: Option<LocalGraphConfig>,
     dimension: usize,
     metric: Metric,
     fields: Box<[FieldSchema]>,
@@ -91,43 +84,17 @@ pub struct IndexConfig {
 }
 
 impl IndexConfig {
-    /// Selects immutable serving bytes and internal-partition graphs.
-    #[must_use]
-    pub fn with_fixed_graph(mut self, graph: LocalGraphConfig) -> Self {
-        self.graph = Some(GraphMode::Fixed(graph));
-        self
-    }
-
-    /// Selects mutable serving with atomically maintained partition-local graphs.
+    /// Enables atomically maintained partition-local graphs for internal routing.
     /// Foreground writes retain the existing exact tree routing.
     #[must_use]
-    pub fn with_mutable_graph(mut self, graph: LocalGraphConfig) -> Self {
-        self.graph = Some(GraphMode::Mutable(graph));
+    pub fn with_local_graph(mut self, graph: LocalGraphConfig) -> Self {
+        self.graph = Some(graph);
         self
     }
 
-    /// Construction parameters for a read-only graph index.
-    pub const fn fixed_graph(&self) -> Option<LocalGraphConfig> {
-        match self.graph {
-            Some(GraphMode::Fixed(graph)) => Some(graph),
-            _ => None,
-        }
-    }
-
-    /// Construction parameters for a mutable graph index.
-    pub const fn mutable_graph(&self) -> Option<LocalGraphConfig> {
-        match self.graph {
-            Some(GraphMode::Mutable(graph)) => Some(graph),
-            _ => None,
-        }
-    }
-
-    /// Construction parameters for either graph serving policy.
+    /// Construction parameters for partition-local HNSW graphs.
     pub const fn local_graph(&self) -> Option<LocalGraphConfig> {
-        match self.graph {
-            Some(GraphMode::Fixed(graph) | GraphMode::Mutable(graph)) => Some(graph),
-            None => None,
-        }
+        self.graph
     }
 
     /// Creates an immutable Logical Index configuration.
@@ -411,7 +378,7 @@ impl Default for RuntimeConfig {
 }
 
 impl RuntimeConfig {
-    /// Sets the per-query fixed-graph routing working-byte ceiling (default 256 MiB).
+    /// Sets the per-query graph routing working-byte ceiling (default 256 MiB).
     /// Includes held bodies, restoration buffers, native scratch and caller-reserved
     /// candidate/identity state. Cache capacity controls retention independently.
     pub fn with_routing_working_bytes(mut self, bytes: usize) -> Result<Self> {
@@ -422,7 +389,7 @@ impl RuntimeConfig {
         Ok(self)
     }
 
-    /// Returns the fixed-graph routing working-byte ceiling.
+    /// Returns the graph routing working-byte ceiling.
     pub const fn routing_working_bytes(&self) -> usize {
         self.routing_working_bytes
     }

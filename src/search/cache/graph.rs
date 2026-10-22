@@ -1,14 +1,14 @@
-//! Snapshot-bound fixed-index bodies shared by exact and graph routing.
+//! Snapshot-bound graph bodies shared by exact and graph routing.
 
 use super::*;
 use crate::api::Metric;
 use crate::search::local_hnsw::{
-    Candidate, Parameters, Workspace, body::FixedInternalBody, native_error,
+    Candidate, Parameters, Workspace, body::InternalGraphBody, native_error,
     persistence::GraphSource,
 };
 use crate::search::numeric::VectorKernel;
 use crate::storage::keys::LogicalKey;
-use crate::storage::values::{GRAPH_CHUNK_BYTES, GraphChunk, GraphDescriptor, PartitionState};
+use crate::storage::values::{GRAPH_CHUNK_BYTES, GraphChunk, GraphDescriptor};
 
 /// Runtime execution boundary: one snapshot, bounded owned CPU work and control.
 /// Traversal owns candidate selection; the runtime owns admission and dispatch.
@@ -67,9 +67,9 @@ impl RoutingGraph {
         self.partition().children()
     }
 
-    fn partition(&self) -> &FixedInternalBody {
-        let BodyEntries::FixedInternal(partition) = &self.body.entries else {
-            unreachable!("validated fixed internal body")
+    fn partition(&self) -> &InternalGraphBody {
+        let BodyEntries::InternalGraph(partition) = &self.body.entries else {
+            unreachable!("validated internal graph body")
         };
         partition
     }
@@ -157,7 +157,7 @@ impl GraphLoad {
         let started = std::time::Instant::now();
         let encoded_bytes = descriptor.bytes;
         let kernel = VectorKernel::new(dimension, metric, rotation_seed)?;
-        let graph = FixedInternalBody::restore(
+        let graph = InternalGraphBody::restore(
             children,
             kernel,
             GraphSource {
@@ -186,7 +186,7 @@ impl GraphLoad {
         let body = Arc::new(CachedBody {
             epoch: header.cache_epoch(),
             bytes,
-            entries: BodyEntries::FixedInternal(Box::new(graph)),
+            entries: BodyEntries::InternalGraph(Box::new(graph)),
         });
         check()?;
         cache.install(key, Arc::clone(&body));
@@ -223,7 +223,6 @@ pub(crate) async fn read_graph<T: ReadOps>(
     } = request;
     let header = *header;
     if header.level() <= 1
-        || (manifest.config().fixed_graph().is_some() && header.state() != PartitionState::Ready)
         || header.entry_count() == 0
         || header.entry_count() > manifest.config().max_internal_partition_entries() + 2
     {
@@ -292,7 +291,7 @@ pub(crate) async fn read_graph<T: ReadOps>(
     let read = BodyRead::start(cache, manifest, &request)?;
     let (children, body_bytes) = match read {
         BodyRead::Cached(body) => match &body.entries {
-            BodyEntries::FixedInternal(graph) => {
+            BodyEntries::InternalGraph(graph) => {
                 if graph.children().len() != n
                     || !graph.matches(
                         GraphSource {

@@ -1323,7 +1323,7 @@ async fn scan_bodies<R: LogicalReader>(
             if let Some(body) = &cached {
                 let entries = match body.entries() {
                     BodyEntries::Internal(entries) => entries.as_ref(),
-                    BodyEntries::FixedInternal(graph) => graph.children(),
+                    BodyEntries::InternalGraph(graph) => graph.children(),
                     BodyEntries::Leaf { .. } => return Err(Error::new(ErrorKind::Corruption)),
                 };
                 for entry in entries {

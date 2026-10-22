@@ -699,11 +699,7 @@ pub(super) fn binding(
     match config.local_graph() {
         None => hash.update([0]),
         Some(graph) => {
-            hash.update([if config.mutable_graph().is_some() {
-                2
-            } else {
-                1
-            }]);
+            hash.update([1]);
             hash.update(graph.m().to_be_bytes());
             hash.update(graph.ef_construction().to_be_bytes());
             hash.update(graph.seed());

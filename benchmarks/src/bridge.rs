@@ -538,7 +538,7 @@ impl<B: Backend> Service<B> {
                     .and_then(|c| c.with_fields(vec![FieldSchema::new("id", DataType::I64)?]))
                     .map_err(api_error)?;
                 let config = if let Some(experiment) = &self.experiment {
-                    config.with_fixed_graph(experiment.graph().map_err(api_error)?)
+                    config.with_local_graph(experiment.graph().map_err(api_error)?)
                 } else {
                     config
                 };

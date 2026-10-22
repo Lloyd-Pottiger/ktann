@@ -319,21 +319,21 @@ and cross-process deterministic vectors for rotation, Bloom, Tree Key, values,
 and RaBitQ7. Model tests assert that typed atomic operations preserve exact
 membership under conflicts and injected unknown outcomes.
 
-### Fixed Bulk Build metadata
+### Graph configuration and Bulk Build metadata
 
 The immutable Index Configuration stores an optional LocalGraphConfig (`M`,
-`ef_construction`, seed). Its Manifest encoding places a mode byte after the four
-capacity u32s: 0 for mutable, 1 followed by M:u32, ef_construction:u32 and seed:32
-for fixed, then the existing rotation seed. Build Descriptor encoding appends a
-refinement byte after construction budgets: 0 means omitted, 1..6 represent
+`ef_construction`, seed). Its Manifest encoding places an option tag after the four
+capacity u32s: 0 for no graph, 1 followed by M:u32, ef_construction:u32 and seed:32
+for a local graph, then the existing rotation seed. Other tags are invalid. Build
+Descriptor encoding appends a refinement byte after construction budgets: 0 means omitted, 1..6 represent
 zero..five rounds. Worker options encode graph and refinement memory u64 limits
 after serving scratch and before artifact/load limits. These unreleased formats
 change directly; no migration or compatibility path exists.
 
 Final graph descriptor/chunks are ordinary Serving Artifact entries. Completed
 Build Load seals them with the Child Entries; exact publication validation covers
-all their bytes. The write-attempt owner rejects fixed Active mutations and
-maintenance while lifecycle/drop and fenced Building writes retain their authority.
+all their bytes. Building remains isolated from ordinary reads, mutations and
+maintenance until publication; published graph indexes use ordinary write admission.
 
 Ordinary local-graph replacements use one transaction for all chunks, stale-tail
 chunk deletion, the descriptor and authoritative projections. There is no graph

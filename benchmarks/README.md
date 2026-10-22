@@ -422,7 +422,11 @@ Bridge reports record all four resolved values. Invalid pairs fail before reset
 changes storage. Keep rerank budgets fixed when comparing capacity choices.
 
 
-## Fixed-index routing experiments (issue #195, step 9)
+## Frozen-layout routing experiments (issue #195, step 9)
+
+These experiments hold the dataset and leaf layout fixed during query comparisons.
+The graph indexes they build support writes after publication; the frozen workload
+is an experimental control, not an index capability.
 
 `ktann-bench run --routing-experiment JSON` uses production Bulk Build and
 publication, including optional artifact refinement **before** graphs are built.
@@ -456,7 +460,7 @@ are recorded on construction. `routing_setup.leaf_layout_sha256` streams final
 leaf identities, centroids and membership bytes; compare this fingerprint when
 claiming the same layout across routing modes or internal capacities.
 
-Modes are `exact` (production fixed-index tree routing),
+Modes are `exact` (production exact tree routing),
 `partition-local-hnsw` (production local graphs), `global-exact`, and
 `global-hnsw`. Global modes are compiled only through the core `benchmark`
 feature and keep a separate, non-persisted global baseline. They use final stored
@@ -538,11 +542,11 @@ capacity/performance. No full 1M matrix or default selection is part of step 9.
 
 The VectorDBBench bridge accepts the same `--routing-experiment JSON` at startup;
 the Python client/protocol is unchanged. Its requested refinement runs in artifact
-preparation for fixed mode. The native runner owns the detailed per-query oracle
+preparation before initial graph construction. The native runner owns the detailed per-query oracle
 and routing metrics; bridge reports remain companion metrics, with VectorDBBench
 owning canonical recall. Use native runner controls for cache matrices.
 
-### Mutable local-graph update history
+### Local-graph update history
 
 `ktann-mutable-graph` exercises ordinary writes and real background split/merge
 maintenance on a bounded prefix of a cached `sift-1m` or `cohere-1m` dataset:

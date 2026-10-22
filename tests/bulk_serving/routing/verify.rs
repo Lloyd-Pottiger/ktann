@@ -1,4 +1,4 @@
-//! Offline fixed-index integrity, independent of candidate traversal and cache.
+//! Offline graph-index integrity, independent of candidate traversal and cache.
 use super::*;
 use ktann::api::{PartitionKey, VerifyIssueKind};
 use ktann::storage::backend::{ReadOps, ScanLimits};
@@ -14,7 +14,7 @@ async fn replace(memory: &MemoryBackend, key: Bytes, value: Option<Bytes>) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn every_fixed_partition_is_audited_even_after_warming_search() {
+async fn every_graph_partition_is_audited_even_after_warming_search() {
     let memory = MemoryBackend::new();
     let runtime = build(memory.clone(), Metric::L2, false, 73).await;
     let index = runtime.open_index("routing").await.unwrap();
@@ -220,7 +220,7 @@ async fn every_fixed_partition_is_audited_even_after_warming_search() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fixed_verify_is_snapshot_bound_and_read_only() {
+async fn graph_verify_is_snapshot_bound_and_read_only() {
     let memory = MemoryBackend::new();
     let builder = build(memory.clone(), Metric::L2, false, 73).await;
     let delete = std::sync::Arc::new(std::sync::Mutex::new(None));

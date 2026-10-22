@@ -101,7 +101,7 @@ enum Edit {
     MergeComplete,
 }
 
-/// Advances one mutable-graph partition by one committed topology step.
+/// Advances one graph partition by one committed topology step.
 ///
 /// Reuse the same executor across concurrent drivers to retain native CPU
 /// admission. Bound simultaneous drivers as each owns a snapshot plan before
@@ -116,7 +116,7 @@ pub async fn advance<B: Backend>(
     retry: &crate::runtime::RetryPolicy,
     executor: &GraphMaintenance,
 ) -> Result<()> {
-    if manifest.config().mutable_graph().is_none() {
+    if manifest.config().local_graph().is_none() {
         return Err(Error::invalid_argument());
     }
     let Some(authority) = reads::open_authority_read(backend, manifest, tree, partition).await?

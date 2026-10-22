@@ -89,12 +89,7 @@ _Avoid_: Shard, bucket
 A searchable derived projection of one Vector Record within a Leaf Partition.
 _Avoid_: Vector Record, search result
 
-**Fixed Index**:
-A Bulk Build-only Logical Index with immutable published serving bytes and one
-persisted graph per internal partition. Exact query routing remains available;
-selecting it does not grant mutation or maintenance capability.
-
-**Mutable Graph Index**:
+**Local Graph Index**:
 A Logical Index with partition-local HNSW graphs maintained atomically with
 internal membership changes. Foreground writes retain existing tree routing.
 Empty internal bodies have no graph; nonempty bodies in every searchable

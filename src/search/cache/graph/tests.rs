@@ -6,7 +6,7 @@ use crate::search::local_hnsw::{Centroids, persistence::build_records, tests::Te
 use crate::storage::keys;
 use crate::storage::test_support::{MockReadTxn, pk};
 use crate::storage::values::expect_header;
-use crate::storage::values::{IndexLifecycle, ValueCodec};
+use crate::storage::values::{IndexLifecycle, PartitionState, ValueCodec};
 
 const W: usize = 16 * 1024 * 1024;
 
@@ -79,7 +79,7 @@ impl Fixture {
             .unwrap()
             .with_internal_partition_entries(1, count.max(2))
             .unwrap()
-            .with_fixed_graph(LocalGraphConfig::new(m, 4 * m, [9; 32]).unwrap());
+            .with_local_graph(LocalGraphConfig::new(m, 4 * m, [9; 32]).unwrap());
         let manifest = IndexManifest::new(
             IndexLifecycle::Active,
             LogicalIndexId::new(index).unwrap(),
@@ -621,7 +621,7 @@ async fn projection_cache_upgrades_to_graph_and_ignores_same_epoch_projection_fi
     let upgraded = fixture.load(&cache).await;
     assert_eq!(upgraded.children(), graph.children());
     let complete = cache.lookup(&key, fixture.header.cache_epoch()).unwrap();
-    assert!(matches!(&complete.entries, BodyEntries::FixedInternal(_)));
+    assert!(matches!(&complete.entries, BodyEntries::InternalGraph(_)));
 
     // An exact-routing scan can have started before the graph was published.
     // Its later same-epoch fill must retain the complete graph and projections.

@@ -406,7 +406,7 @@ impl Traversal {
                 break;
             }
             let remaining = context.request.budgets.visited_partitions() - self.visited_partitions;
-            // Fixed internal bodies are restored and consumed one at a time.
+            // Internal graph bodies are restored and consumed one at a time.
             // Leaves retain the ordinary bounded prefetch path.
             if remaining > 1
                 && (context.manifest.config().local_graph().is_none()
@@ -573,12 +573,6 @@ impl Traversal {
             return Err(Error::new(ErrorKind::Corruption));
         }
         let level = header.level();
-        if context.manifest.config().fixed_graph().is_some()
-            && header.state() != PartitionState::Ready
-        {
-            return Err(Error::new(ErrorKind::Corruption));
-        }
-
         // A visit rediscovers only work the committed Header can advance.
         if fixup::is_actionable(context.manifest.config(), entry.partition, header) {
             self.maintenance.push((tree_key.clone(), entry.partition));
@@ -593,7 +587,7 @@ impl Traversal {
         // proves an empty internal body has no graph or routing candidates.
         if level > 1
             && header.entry_count() == 0
-            && context.manifest.config().mutable_graph().is_some()
+            && context.manifest.config().local_graph().is_some()
         {
             return Ok(None);
         }
@@ -732,7 +726,7 @@ impl Traversal {
 
     /// Exposes one internal partition's children to the next depth's beam.
     ///
-    /// Reads and consumes one complete fixed body through the runtime CPU boundary.
+    /// Reads and consumes one complete graph body through the runtime CPU boundary.
     async fn visit_graph<T: ReadOps>(
         &mut self,
         txn: &mut ReadLogicalTxn<'_, T>,
@@ -883,7 +877,7 @@ impl Traversal {
         Ok(())
     }
 
-    /// Exact mutable-index baseline; all exposed children compete in one
+    /// Exact routing baseline; all exposed children compete in one
     /// bounded tree/level heap under the existing total tie order.
     fn visit_internal(
         &mut self,

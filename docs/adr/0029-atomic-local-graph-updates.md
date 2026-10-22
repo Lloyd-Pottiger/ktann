@@ -31,7 +31,7 @@ not additional to the bound. Ordinary publication includes those deletes before
 its envelope preflight; future topology composition must enforce this envelope
 across all participants. A smaller batch or narrower keys may be needed to fit.
 
-## Implementation clarification: mutable serving (2026-10-21)
+## Implementation clarification: mutable serving (2026-10-21; capability distinction superseded below)
 
 Topology integration preserves Fixed Index read-only behavior and introduces a
 separate mutable graph configuration identity. It retains the existing foreground
@@ -43,3 +43,14 @@ source fencing and graph publication for every topology body change. It replaces
 the step-11 Ready-only projection publication wrapper; the topology owner supplies
 its existing child-authority validation and all authority edits. Unknown outcomes
 return to topology rediscovery rather than replaying a prepared mutation.
+
+## Capability amendment: unified graph indexes (2026-10-22)
+
+Graph-aware topology and write maintenance are integrated, and repeated-update
+quality has been validated for the tested workloads. The temporary Fixed Index
+restriction and separate fixed/mutable configuration identities above are
+superseded. `IndexConfig::with_local_graph` now selects one writable graph
+capability for ordinary creation and Bulk Build. This does not change the atomic
+publication decision, exact foreground write routing, or Building isolation.
+Serving refinement remains unsupported; artifact refinement precedes initial
+graph construction. No released format or consumer requires compatibility.
