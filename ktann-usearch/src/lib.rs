@@ -65,6 +65,13 @@ mod ffi {
             limit: usize,
             context: &MetricContext,
         ) -> Result<UniquePtr<NativeGraph>>;
+        fn retain(
+            graph: UniquePtr<NativeGraph>,
+            survivors: &[u32],
+            ef: u32,
+            limit: usize,
+            context: &MetricContext,
+        ) -> Result<UniquePtr<NativeGraph>>;
         fn workspace(n: u32, m: u32, limit: usize) -> Result<UniquePtr<NativeWorkspace>>;
         fn search(
             self: &NativeGraph,
@@ -260,6 +267,34 @@ impl Graph {
             native_limit,
             &context,
         )?;
+        Ok(Self {
+            inner,
+            n,
+            m: self.m,
+        })
+    }
+
+    /// Physically removes all but the sorted old `survivors` from a private
+    /// graph. Distances address the compacted survivor order. Existing levels
+    /// are retained; only neighborhoods touching removed nodes are refreshed.
+    pub fn retain(
+        self,
+        survivors: &[u32],
+        ef: usize,
+        limit: usize,
+        distance: &dyn Fn(u32, u32) -> f64,
+        check: &dyn Fn() -> bool,
+    ) -> Result<Self, Error> {
+        let n = survivors.len();
+        if n == 0
+            || ef < self.m
+            || survivors.iter().any(|&slot| slot as usize >= self.n)
+            || survivors.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(Error::InvalidArgument);
+        }
+        let context = MetricContext { distance, check };
+        let inner = ffi::retain(self.inner, survivors, ef.min(n) as u32, limit, &context)?;
         Ok(Self {
             inner,
             n,

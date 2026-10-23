@@ -62,7 +62,7 @@
      /// @brief  Number of "slots" available for `node_t` objects. Equals to @b `limits_.members`.
      mutable std::atomic<std::size_t> nodes_capacity_{};
 
-@@ -2581,6 +2588,46 @@
+@@ -2581,6 +2588,93 @@
      }
 
    public:
@@ -98,6 +98,53 @@
 +        entry_slot_ = mapping[entry_slot_];
 +        return true;
 +    }
++    // Remove private node tapes and compact surviving slots. All potentially
++    // throwing work precedes ownership transfer, so cancellation can destroy
++    // the original pointer array safely even after adjacency has changed.
++    template <typename mapping_at, typename affected_at, typename check_at>
++    bool retain_slots(mapping_at const& mapping, std::size_t retained,
++                      affected_at& affected, check_at&& check) {
++        auto const removed = std::numeric_limits<std::uint32_t>::max();
++        buffer_gt<node_t, nodes_allocator_t> reordered(nodes_capacity_);
++        if (!reordered) return false;
++        level_t highest = -1;
++        compressed_slot_t entry = 0;
++        for (std::size_t old = 0; old != size(); ++old) {
++            check();
++            auto node = node_at_(old);
++            auto target = mapping[old];
++            if (target == removed) {
++                for (level_t level = 0; level <= node.level(); ++level)
++                    for (auto neighbor : neighbors_(node, level))
++                        if (mapping[compressed_slot_t(neighbor)] != removed)
++                            affected[mapping[compressed_slot_t(neighbor)]] = true;
++                continue;
++            }
++            for (level_t level = 0; level <= node.level(); ++level) {
++                auto neighbors = neighbors_(node, level);
++                auto old_count = neighbors.size();
++                neighbors.erase_if([&](compressed_slot_t neighbor) {
++                    if (mapping[neighbor] != removed) return false;
++                    affected[target] = true;
++                    return true;
++                });
++                // Native update expects unused adjacency cells to be zero.
++                for (auto i = neighbors.size(); i != old_count; ++i) *(neighbors.begin() + i) = 0;
++                for (auto neighbor : neighbors) neighbor = mapping[compressed_slot_t(neighbor)];
++            }
++            node.key(target);
++            reordered[target] = node;
++            if (node.level() > highest) { highest = node.level(); entry = target; }
++        }
++        // No callbacks or allocations until every tape again has one owner.
++        for (std::size_t old = 0; old != size(); ++old)
++            if (mapping[old] == removed) node_free_(old);
++        nodes_ = std::move(reordered);
++        nodes_count_ = retained;
++        max_level_ = highest;
++        entry_slot_ = entry;
++        return true;
++    }
 +    std::size_t entry_slot() const noexcept { return entry_slot_; }
 +    void ensure_successor(std::size_t slot, std::uint32_t successor) {
 +        auto neighbors = neighbors_(node_at_(slot), 0);
@@ -109,7 +156,7 @@
      std::size_t connectivity() const noexcept { return config_.connectivity; }
      std::size_t capacity() const noexcept { return nodes_capacity_; }
      std::size_t size() const noexcept { return nodes_count_; }
-@@ -3431,7 +3478,8 @@
+@@ -3431,7 +3525,8 @@
          metric_at&& metric,                        //
          index_search_config_t config = {},         //
          predicate_at&& predicate = predicate_at{}, //
@@ -119,7 +166,7 @@
 
          // Someone is gonna fuzz this, so let's make sure we cover the basics
          if (!wanted)
-@@ -3442,13 +3490,14 @@
+@@ -3442,13 +3537,14 @@
              config.expansion = default_expansion_search();
 
          // Using references is cleaner, but would result in UBSan false positives
@@ -136,7 +183,7 @@
          context_t& context = *context_ptr;
          top_candidates_t& top = *top_ptr;
          // Go down the level, tracking only the closest match
-@@ -3789,18 +3838,27 @@
+@@ -3789,18 +3885,27 @@
              reset();
              return result.failed("Out of memory");
          }
@@ -165,7 +212,7 @@
              if (!progress(i + 1, header_size.value))
                  return result.failed("Terminated by user");
          }
-@@ -4366,10 +4424,24 @@
+@@ -4366,10 +4471,24 @@
          }
      }
 
@@ -194,7 +241,7 @@
      }
 
      struct candidates_range_t;
-@@ -4439,7 +4511,7 @@
+@@ -4439,7 +4558,7 @@
      template <typename value_at, typename metric_at, typename prefetch_at = dummy_prefetch_t>
      compressed_slot_t search_for_one_(                                //
          value_at&& query, metric_at&& metric, prefetch_at&& prefetch, //
@@ -203,7 +250,7 @@
 
          visits_hash_set_t& visits = context.visits;
          visits.clear();
-@@ -4466,7 +4538,7 @@
+@@ -4466,7 +4585,7 @@
                  // Actual traversal
                  for (compressed_slot_t candidate_slot : closest_neighbors) {
                      distance_t candidate_dist = context.measure(query, citerator_at(candidate_slot), metric);
@@ -212,7 +259,7 @@
                          closest_dist = candidate_dist;
                          closest_slot = candidate_slot;
                          changed = true;
-@@ -4487,7 +4559,7 @@
+@@ -4487,7 +4606,7 @@
      template <typename value_at, typename metric_at, typename prefetch_at = dummy_prefetch_t>
      bool search_to_insert_(                                           //
          value_at&& query, metric_at&& metric, prefetch_at&& prefetch, //
@@ -221,7 +268,7 @@
 
          visits_hash_set_t& visits = context.visits;
          next_candidates_t& next = context.next_candidates; // pop min, push
-@@ -4547,7 +4619,8 @@
+@@ -4547,7 +4666,8 @@
                  // so we don't have to lock it.
                  // node_lock_t successor_lock = node_lock_(successor_slot);
                  distance_t successor_dist = context.measure(query, citerator_at(successor_slot), metric);
@@ -231,7 +278,16 @@
                      // This can substantially grow our priority queue:
                      next.insert({-successor_dist, successor_slot});
                      // This will automatically evict poor matches:
-@@ -4716,7 +4789,8 @@
+@@ -4568,7 +4688,7 @@
+     bool search_to_update_(                                           //
+         value_at&& query, metric_at&& metric, prefetch_at&& prefetch, //
+         compressed_slot_t start_slot, compressed_slot_t updated_slot, level_t level, std::size_t top_limit,
+-        context_t& context) noexcept {
++        context_t& context) usearch_noexcept_m {
+
+         visits_hash_set_t& visits = context.visits;
+         next_candidates_t& next = context.next_candidates; // pop min, push
+@@ -4716,7 +4836,8 @@
                      continue;
 
                  distance_t successor_dist = context.measure(query, citerator_at(successor_slot), metric);
@@ -241,7 +297,7 @@
                      // This can substantially grow our priority queue:
                      next.insert({-successor_dist, successor_slot});
                      if (is_dummy<predicate_at>() ||
-@@ -4761,7 +4835,7 @@
+@@ -4761,7 +4882,7 @@
      distance_t inter_neighbor_distance_(                                   //
          candidate_t const& candidate, candidate_t const& submitted,        //
          compressed_slot_t override_slot, override_value_at override_value, //
@@ -250,7 +306,7 @@
          if (candidate.slot == override_slot)
              return context.measure(override_value, citerator_at(submitted.slot), metric);
          else if (submitted.slot == override_slot)
-@@ -4774,7 +4848,7 @@
+@@ -4774,7 +4895,7 @@
      distance_t inter_neighbor_distance_(                            //
          candidate_t const& candidate, candidate_t const& submitted, //
          compressed_slot_t, std::nullptr_t,                          //
@@ -259,7 +315,7 @@
          return context.measure(citerator_at(candidate.slot), citerator_at(submitted.slot), metric);
      }
 
-@@ -4796,7 +4870,7 @@
+@@ -4796,7 +4917,7 @@
          std::size_t needed, top_candidates_t& top, context_t& context, //
          std::size_t& refines_counter,                                  //
          compressed_slot_t override_slot = ((std::numeric_limits<compressed_slot_t>::max))(),

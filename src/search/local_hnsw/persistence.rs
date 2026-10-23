@@ -132,8 +132,8 @@ pub(crate) fn build_records(
     )
 }
 
-/// Prepares one complete replacement body. A deletion reuses the canonical
-/// builder; insertion and centroid replacement consume a private restored graph.
+/// Prepares one complete replacement body. Pure deletion, insertion and centroid
+/// replacement evolve private restored graphs; mixed deletion batches rebuild.
 /// Source corruption is never concealed by rebuilding.
 #[expect(
     clippy::too_many_arguments,
@@ -166,6 +166,59 @@ pub(crate) fn update_records(
         .checked_sub(next.bytes + mapping_bytes)
         .ok_or_else(limit)?;
     let (graph, _) = restore_graph(old, source, descriptor, chunks, restore_budget, check)?;
+    // Maintenance removes old child edges without changing surviving centroids.
+    // Keep this common path inside the private graph preparation boundary.
+    if next.children.len() < old.children.len() {
+        let mut survivors = Vec::new();
+        survivors
+            .try_reserve_exact(next.children.len())
+            .map_err(|_| limit())?;
+        for child in next.children {
+            check()?;
+            let Ok(slot) = old
+                .children
+                .binary_search_by_key(&child.child(), ChildEntry::child)
+            else {
+                break;
+            };
+            if old.children[slot].centroid() != child.centroid() {
+                break;
+            }
+            survivors.push(slot as u32);
+        }
+        if survivors.len() == next.children.len() {
+            let available = working_bytes
+                .checked_sub(old.bytes + next.bytes + mapping_bytes)
+                .ok_or_else(limit)?;
+            let distance = |a: u32, b: u32| {
+                next.distance(
+                    next.children[a as usize].centroid(),
+                    next.children[b as usize].centroid(),
+                )
+            };
+            let graph = controlled(check, |proceed| {
+                graph.retain(
+                    &survivors,
+                    source.parameters.ef_construction,
+                    available,
+                    &distance,
+                    proceed,
+                )
+            })?;
+            let identity = identity(next, source.parameters, source.tree, source.parent, check)?;
+            return persist_graph(
+                next,
+                &graph,
+                identity,
+                source.index,
+                next_header,
+                working_bytes
+                    .checked_sub(old.bytes + mapping_bytes)
+                    .ok_or_else(limit)?,
+                check,
+            );
+        }
+    }
     let mut mapping = Vec::new();
     let mut changed = Vec::new();
     mapping
