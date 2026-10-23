@@ -2620,6 +2620,53 @@ private:
         entry_slot_ = mapping[entry_slot_];
         return true;
     }
+    // Remove private node tapes and compact surviving slots. All potentially
+    // throwing work precedes ownership transfer, so cancellation can destroy
+    // the original pointer array safely even after adjacency has changed.
+    template <typename mapping_at, typename affected_at, typename check_at>
+    bool retain_slots(mapping_at const& mapping, std::size_t retained,
+                      affected_at& affected, check_at&& check) {
+        auto const removed = std::numeric_limits<std::uint32_t>::max();
+        buffer_gt<node_t, nodes_allocator_t> reordered(nodes_capacity_);
+        if (!reordered) return false;
+        level_t highest = -1;
+        compressed_slot_t entry = 0;
+        for (std::size_t old = 0; old != size(); ++old) {
+            check();
+            auto node = node_at_(old);
+            auto target = mapping[old];
+            if (target == removed) {
+                for (level_t level = 0; level <= node.level(); ++level)
+                    for (auto neighbor : neighbors_(node, level))
+                        if (mapping[compressed_slot_t(neighbor)] != removed)
+                            affected[mapping[compressed_slot_t(neighbor)]] = true;
+                continue;
+            }
+            for (level_t level = 0; level <= node.level(); ++level) {
+                auto neighbors = neighbors_(node, level);
+                auto old_count = neighbors.size();
+                neighbors.erase_if([&](compressed_slot_t neighbor) {
+                    if (mapping[neighbor] != removed) return false;
+                    affected[target] = true;
+                    return true;
+                });
+                // Native update expects unused adjacency cells to be zero.
+                for (auto i = neighbors.size(); i != old_count; ++i) *(neighbors.begin() + i) = 0;
+                for (auto neighbor : neighbors) neighbor = mapping[compressed_slot_t(neighbor)];
+            }
+            node.key(target);
+            reordered[target] = node;
+            if (node.level() > highest) { highest = node.level(); entry = target; }
+        }
+        // No callbacks or allocations until every tape again has one owner.
+        for (std::size_t old = 0; old != size(); ++old)
+            if (mapping[old] == removed) node_free_(old);
+        nodes_ = std::move(reordered);
+        nodes_count_ = retained;
+        max_level_ = highest;
+        entry_slot_ = entry;
+        return true;
+    }
     std::size_t entry_slot() const noexcept { return entry_slot_; }
     void ensure_successor(std::size_t slot, std::uint32_t successor) {
         auto neighbors = neighbors_(node_at_(slot), 0);
@@ -4641,7 +4688,7 @@ private:
     bool search_to_update_(                                           //
         value_at&& query, metric_at&& metric, prefetch_at&& prefetch, //
         compressed_slot_t start_slot, compressed_slot_t updated_slot, level_t level, std::size_t top_limit,
-        context_t& context) noexcept {
+        context_t& context) usearch_noexcept_m {
 
         visits_hash_set_t& visits = context.visits;
         next_candidates_t& next = context.next_candidates; // pop min, push

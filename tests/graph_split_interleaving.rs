@@ -60,6 +60,7 @@ async fn complete_split(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn child_graph_split_waits_for_receiving_parent_to_finish() {
+    let _audit = support::observe::audit_lock().await;
     let backend = MemoryBackend::default();
     let runtime_config = RuntimeConfig::default().with_maintenance(0, 1).unwrap();
     let runtime = Runtime::new(backend.clone(), runtime_config.clone()).unwrap();
@@ -207,5 +208,84 @@ async fn child_graph_split_waits_for_receiving_parent_to_finish() {
     );
     assert_eq!(report.objects.vector_records, 48);
     assert_eq!(report.objects.record_locations, 48);
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sibling_splits_share_parent_preparation_without_stale_publication() {
+    let _audit = support::observe::audit_lock().await;
+    let capture = support::observe::capture();
+    let backend = MemoryBackend::default();
+    let config = RuntimeConfig::default().with_maintenance(2, 32).unwrap();
+    let runtime = Runtime::new(backend.clone(), support::manual_maintenance_config()).unwrap();
+    let index = runtime
+        .create_index(
+            "sibling-graph-splits",
+            IndexConfig::new(1, Metric::L2)
+                .unwrap()
+                .with_leaf_partition_entries(1, 4)
+                .unwrap()
+                .with_internal_partition_entries(1, 16)
+                .unwrap()
+                .with_local_graph(LocalGraphConfig::new(2, 4, [17; 32]).unwrap()),
+        )
+        .await
+        .unwrap();
+    for id in 0_u64..32 {
+        index
+            .upsert(
+                Record::new(
+                    Bytes::copy_from_slice(&id.to_be_bytes()),
+                    vec![id as f32],
+                    vec![],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    let manifest = read_manifest(&backend, index.logical_index_id()).await;
+    let tree = TreeKey::encode(&[], &[]).unwrap();
+    let executor = GraphMaintenance::new(&config, tokio_util::sync::CancellationToken::new());
+    complete_split(&backend, &manifest, &tree, pk(1), 2, &executor).await;
+    let children = scan_child_entries(&backend, &manifest, &tree, pk(1)).await;
+    assert_eq!(children.len(), 2);
+    let (left, right) = (children[0].child(), children[1].child());
+    for child in [left, right] {
+        advance(&backend, &manifest, &tree, child, &executor).await;
+    }
+    let retries_before: u64 = capture
+        .metric_counters()
+        .into_iter()
+        .filter(|(name, _, _)| name == "ktann.write.retries")
+        .map(|(_, _, value)| value)
+        .sum();
+    // join polls the second exposure while the first awaits native preparation.
+    // Both change the same parent; the waiting plan must read it after ownership.
+    tokio::join!(
+        complete_split(&backend, &manifest, &tree, left, 0, &executor),
+        complete_split(&backend, &manifest, &tree, right, 0, &executor),
+    );
+    assert!(header_of(&backend, &manifest, &tree, left).await.is_none());
+    assert!(header_of(&backend, &manifest, &tree, right).await.is_none());
+    let retries: u64 = capture
+        .metric_counters()
+        .into_iter()
+        .filter(|(name, _, _)| name == "ktann.write.retries")
+        .map(|(_, _, value)| value)
+        .sum();
+    assert_eq!(
+        retries - retries_before,
+        0,
+        "sibling preparation must not publish a stale parent"
+    );
+    let report = index.verify(VerifyOptions::default()).await.unwrap();
+    assert!(
+        report.complete && report.issues.is_empty(),
+        "{:?}",
+        report.issues
+    );
+    assert_eq!(report.objects.vector_records, 32);
+    assert_eq!(report.objects.record_locations, 32);
     runtime.shutdown().await.unwrap();
 }

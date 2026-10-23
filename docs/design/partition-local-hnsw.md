@@ -209,10 +209,17 @@ the graph, so deletion cannot hide corruption.
 
 Insertions and centroid replacements evolve a private restored USearch graph,
 using proposed centroids for distance calculations. A representation-only
-permutation restores canonical child ordinals afterward. A batch containing any
-deletion rebuilds that parent's graph with the canonical builder. This avoids
-tombstones and a second stable-slot directory, at the cost of whole-parent
-construction for a deletion batch. Prepared results never enter the query cache.
+permutation restores canonical child ordinals afterward. A nonempty strict subset
+with unchanged centroids physically removes private native nodes, compacts slots
+into canonical order, and refreshes surviving neighborhoods incident to removed
+nodes. It retains surviving levels, selects a highest-level entry, and audits
+base-layer directed reachability before and after neighborhood repair. Mixed
+deletion/centroid/insertion batches use the canonical builder. Empty results
+remove graph records after source validation.
+There are no tombstones or persistent slot directories. Both paths validate the
+source before preparing a replacement and use the same bounded, source-fenced
+atomic publication. Prepared results never enter the query cache. See
+[ADR 0030](../adr/0030-private-local-graph-deletion.md).
 Ordinary leaf membership changes do not refresh parent centroids or rebuild graphs.
 
 | Topology change | Graph work in the same publication |
@@ -280,6 +287,18 @@ memory, and these charged-byte bounds are not process RSS bounds.
 preparations and holds admission until native CPU work actually exits, even if its
 async waiter is dropped. Runtime workers also bound waiting plans. Low-level
 callers must reuse an admission owner and bound their concurrent drivers.
+Graph-aware topology steps sharing a `GraphMaintenance` owner coordinate only
+when their participating graph bodies overlap. They discover participants from
+topology metadata and acquire body locks in Partition Key order before reading
+graph payloads. A waiter refreshes its snapshot after acquisition; an uncontended
+step reuses its discovery snapshot, with exact publication fences still applied. Split draining also owns the other sibling
+whose header guides balancing. Ownership spans private preparation, stale-plan
+refresh and atomic publication. Independent bodies remain concurrent. The lock registry retains
+weak references, so it does not grow with the index's historical partition count.
+Cancellation retains body ownership until detached native work exits. These are
+process-local cost controls, not write authority: exact source fencing still
+protects against other runtimes and low-level writers.
+
 Operation control is checked within validation, native work and serialization;
 limits never reduce `M`, construction ef or requested query width to obtain success.
 
@@ -303,8 +322,9 @@ seams, including failures and recovery.
 
 Wider internal partitions can reduce upper-tree routing work but increase graph
 loading, cache eviction and update units. A parent's centroid payload alone is
-`4*n*dimension` bytes, before graph and query scratch. Deletion batches pay the
-whole-parent rebuild cost. A global graph could avoid parent-by-parent selection,
+`4*n*dimension` bytes, before graph and query scratch. Pure deletion still scans
+all adjacency and serializes a complete replacement, but performs distance-based
+updates only for neighborhoods incident to removed nodes; mixed batches rebuild. A global graph could avoid parent-by-parent selection,
 but would create a different residency and maintenance unit; it is outside this
 design.
 

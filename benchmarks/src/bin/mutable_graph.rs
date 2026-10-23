@@ -39,7 +39,36 @@ async fn settle<B: Backend>(index: &Index<B>, raw: &B, metrics: &MetricCapture) 
     probe[0] = 1.0;
     let probe: Arc<[f32]> = probe.into();
     loop {
-        let _ = index
+        if Instant::now() >= deadline {
+            let partitions = audit::list_partitions(raw, index.logical_index_id())
+                .await
+                .unwrap();
+            let snapshot = metrics.snapshot();
+            eprintln!(
+                "maintenance timeout: backlog={} partitions={} unfinished={} steps={:?} retries={:?}",
+                metrics.fixup_backlog(),
+                partitions.len(),
+                partitions
+                    .iter()
+                    .filter(
+                        |(_, _, h)| h.state() != ktann::storage::values::PartitionState::Ready
+                            || h.entry_count() > index.config().max_partition_entries(h.level())
+                    )
+                    .count(),
+                snapshot.counters_rendered("ktann.fixup.steps"),
+                snapshot.counters_rendered("ktann.write.retries"),
+            );
+            panic!("maintenance did not settle");
+        }
+        // Running workers retain and yield their work. Rediscover only when
+        // the queue is idle, so the observer does not continuously scan and
+        // decode the entire corpus while measuring maintenance cost.
+        if metrics.fixup_backlog() != 0 {
+            quiet = 0;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            continue;
+        }
+        index
             .search(
                 SearchRequest::new(probe.clone(), 1)
                     .unwrap()
@@ -62,7 +91,6 @@ async fn settle<B: Backend>(index: &Index<B>, raw: &B, metrics: &MetricCapture) 
         if quiet >= 3 {
             break;
         }
-        assert!(Instant::now() < deadline, "maintenance did not settle");
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     let report = index.verify(VerifyOptions::default()).await.unwrap();

@@ -220,6 +220,40 @@ std::unique_ptr<NativeGraph> evolve(std::unique_ptr<NativeGraph> graph,
     return graph;
 }
 
+std::unique_ptr<NativeGraph> retain(std::unique_ptr<NativeGraph> graph,
+    rust::Slice<const std::uint32_t> survivors, std::uint32_t ef,
+    std::size_t limit, MetricContext const& context) {
+    checkpoint(context);
+    auto& state = *graph->state;
+    if (state.account.used > limit) throw std::runtime_error("limit");
+    state.account.limit = limit;
+    AllocationScope scope(state.account);
+    auto& engine = state.engine;
+    auto n = static_cast<std::uint32_t>(survivors.size());
+    unum::usearch::buffer_gt<std::uint32_t, Allocator<std::uint32_t>> mapping(engine.size());
+    unum::usearch::buffer_gt<bool, Allocator<bool>> affected(n);
+    if (!mapping || !affected) throw std::runtime_error("limit");
+    for (std::size_t i = 0; i != engine.size(); ++i) mapping[i] = UINT32_MAX;
+    for (std::uint32_t i = 0; i != n; ++i) { mapping[survivors[i]] = i; affected[i] = false; }
+    if (!engine.reserve({engine.size(), 1})) throw std::runtime_error("limit");
+    prepare(engine.build_context(), n, engine.connectivity());
+    if (!engine.retain_slots(mapping, n, affected, [&] { checkpoint(context); }))
+        throw std::runtime_error("limit");
+    repair(engine, n, context);
+    Metric metric{context};
+    for (std::uint32_t slot = 0; slot != n; ++slot) {
+        checkpoint(context);
+        if (!affected[slot]) continue;
+        auto result = engine.update(engine.begin() + slot, slot, slot, metric,
+            unum::usearch::index_update_config_t{ef, 0});
+        if (!result) throw std::runtime_error("limit");
+    }
+    repair(engine, n, context);
+    engine.release_build_context();
+    checkpoint(context);
+    return graph;
+}
+
 Stats NativeGraph::search(std::uint32_t ef, MetricContext const& context, NativeWorkspace& workspace,
     rust::Slice<Hit> output) const {
     checkpoint(context);

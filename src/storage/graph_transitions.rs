@@ -252,6 +252,11 @@ impl GraphTransitionSource {
         Ok(prepared)
     }
 
+    /// Partition whose body is replaced by this transition.
+    pub(crate) fn partition(&self) -> PartitionKey {
+        self.partition
+    }
+
     /// Source header, absent for a newly allocated partition.
     pub fn header(&self) -> Option<PartitionHeader> {
         self.header

@@ -34,7 +34,11 @@ Upper-layer greedy traversal can evaluate a node more than once; each move
 strictly improves the distance/ordinal pair. Visited state deduplicates
 best-first construction and base-layer query exploration. Full-coverage
 queries scan and sort in the bridge. Native exact search is not exposed;
-ordinary private updates use the adapted native update operation.
+ordinary private updates use the adapted native update operation. Pure deletion
+compacts surviving node tapes and refreshes neighborhoods incident to removed
+nodes. The compaction's ownership-transfer phase cannot throw; before that phase,
+cancellation destroys the original tape owners safely. Both update and deletion
+propagate metric cancellation through the native update search helper.
 
 Update the patched header and patch together. Verify the source hash when
 rebasing, regenerate the delta against the pinned original, and rerun the graph
@@ -141,7 +145,9 @@ sweeps, partial-node cancellation and byte-preserving round trips cover this sea
 `Graph::evolve` consumes a privately restored graph. It delegates changed-node
 updates and appended nodes to USearch, then remaps ordinal keys and neighbor
 slots to the canonical child order. The source persisted graph and shared search
-handles remain immutable. Batches containing deletion reuse the existing builder.
+handles remain immutable. `Graph::retain` removes a sorted subset of old slots
+and repairs incident surviving neighborhoods; mixed deletion batches reuse the
+existing builder. Both paths publish only a complete validated replacement.
 
 The pinned patch additionally releases and reinitializes thread scratch limits,
 and provides a checked slot permutation without changing neighbor selection.
@@ -149,6 +155,14 @@ The bridge reapplies the existing directed-reachability repair, releases build
 scratch, and serializes only after successful cancellation and memory checks.
 Update tests cover permutation validation, source immutability, and cancellation;
 the owning crate covers metric scores and atomic snapshot-consistent publication.
+
+The ignored `wide_parent_retention_cost` test compares rebuilding and retaining
+4096-node, 128-dimensional graphs for one-node and 128-node deletion. Run it with
+`cargo test -p ktann-usearch --release wide_parent_retention_cost -- --ignored --nocapture`.
+It reports distance work, elapsed time, fixed-ef recall, query work, and charged
+native memory. Set `KTANN_GRAPH_BENCH_FVECS` to a 128-dimensional fvecs file to use
+its first 4224 vectors instead of the seeded synthetic fixture. Run measurements
+without concurrent builds or tests; end-to-end maintenance remains a separate gate.
 
 Graph levels are capped at `floor(log_M(65536))` after the original geometric
 sampler finishes, preserving its RNG word consumption for subsequent nodes.
