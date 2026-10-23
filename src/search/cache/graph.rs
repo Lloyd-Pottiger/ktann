@@ -1,14 +1,14 @@
-//! Snapshot-bound fixed-index bodies shared by exact and graph routing.
+//! Snapshot-bound graph bodies shared by exact and graph routing.
 
 use super::*;
 use crate::api::Metric;
 use crate::search::local_hnsw::{
-    Candidate, Parameters, Workspace, body::FixedInternalBody, native_error,
+    Candidate, Parameters, Workspace, body::InternalGraphBody, native_error,
     persistence::GraphSource,
 };
 use crate::search::numeric::VectorKernel;
 use crate::storage::keys::LogicalKey;
-use crate::storage::values::{GRAPH_CHUNK_BYTES, GraphChunk, GraphDescriptor, PartitionState};
+use crate::storage::values::{GRAPH_CHUNK_BYTES, GraphChunk, GraphDescriptor};
 
 /// Runtime execution boundary: one snapshot, bounded owned CPU work and control.
 /// Traversal owns candidate selection; the runtime owns admission and dispatch.
@@ -67,9 +67,9 @@ impl RoutingGraph {
         self.partition().children()
     }
 
-    fn partition(&self) -> &FixedInternalBody {
-        let BodyEntries::FixedInternal(partition) = &self.body.entries else {
-            unreachable!("validated fixed internal body")
+    fn partition(&self) -> &InternalGraphBody {
+        let BodyEntries::InternalGraph(partition) = &self.body.entries else {
+            unreachable!("validated internal graph body")
         };
         partition
     }
@@ -157,7 +157,7 @@ impl GraphLoad {
         let started = std::time::Instant::now();
         let encoded_bytes = descriptor.bytes;
         let kernel = VectorKernel::new(dimension, metric, rotation_seed)?;
-        let graph = FixedInternalBody::restore(
+        let graph = InternalGraphBody::restore(
             children,
             kernel,
             GraphSource {
@@ -186,7 +186,7 @@ impl GraphLoad {
         let body = Arc::new(CachedBody {
             epoch: header.cache_epoch(),
             bytes,
-            entries: BodyEntries::FixedInternal(Box::new(graph)),
+            entries: BodyEntries::InternalGraph(Box::new(graph)),
         });
         check()?;
         cache.install(key, Arc::clone(&body));
@@ -212,7 +212,7 @@ pub(crate) async fn read_graph<T: ReadOps>(
     check()?;
     let parameters = manifest
         .config()
-        .fixed_graph()
+        .local_graph()
         .ok_or_else(Error::invalid_argument)?
         .parameters();
     let index = manifest.logical_index_id();
@@ -223,7 +223,6 @@ pub(crate) async fn read_graph<T: ReadOps>(
     } = request;
     let header = *header;
     if header.level() <= 1
-        || header.state() != PartitionState::Ready
         || header.entry_count() == 0
         || header.entry_count() > manifest.config().max_internal_partition_entries() + 2
     {
@@ -290,37 +289,46 @@ pub(crate) async fn read_graph<T: ReadOps>(
         header: &header,
     };
     let read = BodyRead::start(cache, manifest, &request)?;
-    if let BodyRead::Cached(body) = &read {
-        let BodyEntries::FixedInternal(graph) = &body.entries else {
-            return Err(corrupt());
-        };
-        if graph.children().len() != n {
-            return Err(corrupt());
+    let (children, body_bytes) = match read {
+        BodyRead::Cached(body) => match &body.entries {
+            BodyEntries::InternalGraph(graph) => {
+                if graph.children().len() != n
+                    || !graph.matches(
+                        GraphSource {
+                            index,
+                            tree,
+                            parent,
+                            header,
+                            parameters,
+                        },
+                        &descriptor,
+                    )
+                {
+                    return Err(corrupt());
+                }
+                return Ok(GraphRead::Cached(RoutingGraph {
+                    body: Arc::clone(&body),
+                    m: parameters.m,
+                    working_bytes,
+                }));
+            }
+            // Exact write routing can populate projections before the first
+            // graph query. Upgrade that complete body without another KV scan.
+            BodyEntries::Internal(children) => {
+                if children.len() != n {
+                    return Err(corrupt());
+                }
+                (children.clone(), body.bytes)
+            }
+            BodyEntries::Leaf { .. } => return Err(corrupt()),
+        },
+        BodyRead::Scan(scan) => {
+            let (entries, body_bytes) = scan.read(txn, manifest, check).await?;
+            let BodyEntries::Internal(children) = entries else {
+                unreachable!("internal source")
+            };
+            (children, body_bytes)
         }
-        if !graph.matches(
-            GraphSource {
-                index,
-                tree,
-                parent,
-                header,
-                parameters,
-            },
-            &descriptor,
-        ) {
-            return Err(corrupt());
-        }
-        return Ok(GraphRead::Cached(RoutingGraph {
-            body: Arc::clone(body),
-            m: parameters.m,
-            working_bytes,
-        }));
-    }
-    let BodyRead::Scan(scan) = read else {
-        unreachable!("cached fixed body returned above")
-    };
-    let (entries, body_bytes) = scan.read(txn, manifest, check).await?;
-    let BodyEntries::Internal(children) = entries else {
-        unreachable!("internal source")
     };
     let range = LogicalRange::graph_chunks(manifest, tree, parent)?;
     let mut cursor = None;

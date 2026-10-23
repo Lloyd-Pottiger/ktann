@@ -93,8 +93,8 @@ pub enum SplitExposure {
     /// completed); the step wrote nothing and must be abandoned.
     SourceAdvanced,
     /// The source's current parent cannot accept the new Child Entries (it
-    /// is itself draining or merging); the step wrote nothing and must be
-    /// abandoned so a later attempt can rediscover the source's parent.
+    /// is draining, merging, or lacks graph headroom); the step wrote nothing
+    /// and must be abandoned so a later attempt can rediscover the source's parent.
     ParentNotAccepting,
 }
 
@@ -291,11 +291,14 @@ pub async fn expose_split_targets<T: WriteTxn>(
             // abandoning lets a later attempt rediscover the moved edge.
             _ => return Ok(SplitExposure::ParentNotAccepting),
         }
-        if manifest.config().fixed_graph().is_some()
-            && parent_header.entry_count() > manifest.config().max_internal_partition_entries()
+        if manifest.config().local_graph().is_some()
+            && (parent_header.state() == PartitionState::ReceivingSplit
+                || parent_header.entry_count() > manifest.config().max_internal_partition_entries())
         {
-            // The parent must split first; two exposure edges use its reserved
-            // transient slots and cannot recursively consume unbounded headroom.
+            // A receiving parent must finish draining its source before adding
+            // new edges: spare receiver capacity does not imply spare capacity
+            // in their combined graph rewrite. Other parents reserve two slots
+            // for exposure and must split before consuming further headroom.
             return Ok(SplitExposure::ParentNotAccepting);
         }
         Some((parent, parent_header))
@@ -1001,7 +1004,7 @@ pub async fn relocate_child_entries<T: WriteTxn>(
     // Graph-aware drains rewrite the source and one destination together.
     // Their combined serialization bound depends on the small merge source and
     // the hard transient destination ceiling, not on a statistical graph size.
-    if manifest.config().fixed_graph().is_some() {
+    if manifest.config().local_graph().is_some() {
         let ceiling = manifest.config().max_internal_partition_entries() + 2;
         let source_limit = match movement {
             Movement::Merge => manifest.config().min_internal_partition_entries() - 1,
@@ -1539,13 +1542,13 @@ async fn remove_source_prefix<T: WriteTxn>(
 /// (ADR 0007).
 ///
 /// A duplicate or missing match is Corruption.
-async fn find_incoming_edge<T: WriteTxn>(
-    txn: &mut WriteLogicalTxn<'_, T>,
+pub(crate) async fn find_incoming_edge<T: LogicalReader>(
+    txn: &mut T,
+    manifest: &IndexManifest,
     tree_key: &TreeKey,
     partition: PartitionKey,
     level: u32,
 ) -> Result<Option<(PartitionKey, ChildEntry)>> {
-    let manifest = txn.require_manifest()?;
     let parent_level = level.checked_add(1).ok_or_else(corrupt)?;
     let bodies = level_bodies(txn, manifest, tree_key, parent_level).await?;
     // Only the parent level's matches are collected.
@@ -1576,7 +1579,9 @@ async fn lock_incoming_edge<T: WriteTxn>(
     level: u32,
 ) -> Result<PartitionKey> {
     let index = txn.require_manifest()?.logical_index_id();
-    let Some((parent, _)) = find_incoming_edge(txn, tree_key, partition, level).await? else {
+    let Some((parent, _)) =
+        find_incoming_edge(txn, txn.require_manifest()?, tree_key, partition, level).await?
+    else {
         // A non-root partition has exactly one incoming Child Entry in every
         // committed state (ADR 0007).
         return Err(corrupt());

@@ -82,7 +82,7 @@ impl PreparedSearch {
         if matches!(
             request.options().routing_mode(),
             crate::api::RoutingMode::PartitionLocalHnsw { .. }
-        ) && config.fixed_graph().is_none()
+        ) && config.local_graph().is_none()
         {
             return Err(Error::invalid_argument());
         }

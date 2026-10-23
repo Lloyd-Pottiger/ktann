@@ -67,7 +67,7 @@ pub struct Environment {
 /// Reproducible benchmark configuration.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Configuration {
-    /// Fixed-index experiment settings, absent for ordinary online benchmarks.
+    /// Frozen-dataset experiment settings, absent for ordinary online benchmarks.
     pub routing_experiment: Option<crate::routing::Experiment>,
     /// Starting query row in the original dataset.
     pub query_offset: usize,
@@ -980,7 +980,7 @@ mod tests {
 pub struct RoutingMeasurements {
     /// Native search expansion actually used, bounded by local beam and node count.
     pub effective_ef: Distribution,
-    /// Complete fixed graph bodies restored during this interval.
+    /// Complete local graph bodies restored during this interval.
     pub graph_loads: u64,
     /// Encoded graph bytes consumed on misses (can count the same graph repeatedly).
     pub graph_encoded_bytes: u64,

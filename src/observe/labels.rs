@@ -225,7 +225,6 @@ pub(crate) const fn error_kind(kind: ErrorKind) -> &'static str {
     match kind {
         ErrorKind::InvalidArgument => "invalid_argument",
         ErrorKind::IndexAlreadyExists => "index_already_exists",
-        ErrorKind::IndexReadOnly => "index_read_only",
         ErrorKind::IndexBuilding => "index_building",
         ErrorKind::BulkBuildSuperseded => "bulk_build_superseded",
         ErrorKind::BulkBuildBusy => "bulk_build_busy",

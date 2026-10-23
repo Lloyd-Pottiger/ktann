@@ -31,7 +31,7 @@ cleanup. `complete_with_control` applies cancellation and deadline control acros
 the entire operation. No automatic scheduler is started. Explicit `run_worker`,
 `load_serving`, and `publish` APIs remain available for phase control.
 
-A configuration with `FixedGraphConfig` requires Bulk Build. Preparation refines
+For a configuration with `LocalGraphConfig`, preparation refines
 membership and recomputes centroids before accepting the final Forest Artifact,
 then builds each internal graph exactly once from the final Child Entries while
 encoding Serving bytes. Omitted refinement preserves construction centroids.
@@ -41,10 +41,10 @@ and serialization. Both are persisted worker resource limits, not semantic input
 Failure exceeds neither budget by falling back or omitting work. Construction and
 refinement memory ceilings add while retained inputs feed construction.
 
-Fixed Active indexes reject all mutations and public refinement with
-`IndexReadOnly`, including empty batches and zero rounds. Runtime maintenance
-never admits fixed indexes. Reads, exact search, verification, reopen and drop
-retain their ordinary lifecycle behavior. Production HNSW routing is separate.
+After publication, graph-enabled indexes support ordinary mutations and graph-aware
+maintenance. Public serving refinement returns `InvalidArgument`; optional artifact
+refinement must finish before initial graph construction. Query HNSW routing is
+selected independently of the construction path.
 
 ### 1.1 Completion reports
 

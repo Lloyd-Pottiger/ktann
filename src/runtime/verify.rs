@@ -4,7 +4,7 @@
 //! `docs/design/runtime-operations.md` §6. Exactly one backend read
 //! transaction pins the snapshot: the persisted Active Manifest validates
 //! first, and every later check — canonical encodings, tree reachability and
-//! unique incoming references, complete fixed graphs and centroid projections,
+//! unique incoming references, complete graphs and centroid projections,
 //! exact Header counts and legal State
 //! references, Record–Location–Leaf membership, Leaf Entry projection
 //! agreement, conservative Synopses, and allocator high-water marks — reads
@@ -27,7 +27,7 @@
 //! Issue kinds are deliberately coarse; the stable mapping is:
 //!
 //! - [`VerifyIssueKind::InvalidEncoding`]: a key or value fails canonical
-//!   decoding, or a complete fixed graph fails source/topology validation.
+//!   decoding, or a complete graph fails source/topology validation.
 //! - [`VerifyIssueKind::Reachability`]: a required object is missing (a
 //!   partition Header or State, a leaf's Synopsis, a tree root, an edge
 //!   target, the allocator) or an unowned object exists (a partition without
@@ -529,7 +529,7 @@ async fn process_item<B: Backend>(
     Ok(())
 }
 
-/// Returns the partition owner shared by issue context and fixed-body auditing.
+/// Returns the partition owner shared by issue context and graph-body auditing.
 fn partition_key(key: &LogicalKey) -> Option<PartitionKey> {
     match key {
         LogicalKey::Header { partition, .. }

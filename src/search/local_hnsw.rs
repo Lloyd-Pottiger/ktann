@@ -2,7 +2,7 @@
 //!
 //! This module performs no IO, normalization, or production traversal. It
 //! builds encoded records from borrowed Child Entries and restores complete
-//! fixed internal bodies. The existing numeric kernel supplies native distances.
+//! internal graph bodies. The existing numeric kernel supplies native distances.
 
 #[cfg(feature = "benchmark")]
 pub(crate) mod benchmark;

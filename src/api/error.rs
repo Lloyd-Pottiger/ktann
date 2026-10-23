@@ -12,8 +12,6 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum ErrorKind {
     /// The Logical Index is reserved by a Bulk Build and is not serving.
     IndexBuilding,
-    /// Fixed indexes cannot change their published serving bytes.
-    IndexReadOnly,
     /// A newer invocation took over this Bulk Build load task.
     BulkBuildSuperseded,
     /// Loading has not finished, or active workspace IO prevents reclamation.
@@ -61,7 +59,6 @@ pub enum ErrorKind {
 impl ErrorKind {
     const fn message(self) -> &'static str {
         match self {
-            Self::IndexReadOnly => "index is read only",
             Self::IndexBuilding => "index is being built",
             Self::BulkBuildSuperseded => "bulk build worker was superseded",
             Self::BulkBuildBusy => "bulk build is busy",

@@ -560,7 +560,7 @@ impl ServingArtifact {
         let mut next_synopsis = synopses.next()?;
         let mut graphs = index
             .config()
-            .fixed_graph()
+            .local_graph()
             .map(|_| super::graphs::GraphPreparation::new(index, options.graph_memory_bytes))
             .transpose()?;
         while next.is_some() || next_synopsis.is_some() {

@@ -147,9 +147,9 @@ Traversal is a level-scaled beam. The leaf-level base beam defaults to 128 and
 SearchOptions may override it per request within the hard cap; moving one
 level toward the root divides it by two with minimum one. All admitted parents
 at one depth contribute before the next depth selects the globally nearest
-beam for each tree. `SearchOptions::routing_mode` defaults to Exact. Fixed
-Indexes can explicitly select PartitionLocalHnsw with positive `ef_search`;
-ordinary indexes reject that choice. Each parent contributes up to the full
+beam for each tree. `SearchOptions::routing_mode` defaults to Exact. Graph-enabled
+indexes can explicitly select PartitionLocalHnsw with positive `ef_search`;
+indexes without graph configuration reject that choice. Each parent contributes up to the full
 local next-level beam B, never a share divided among parents. Candidate scores
 come directly from the graph's f64 routing kernel evaluations. Exact scores all
 children. Both modes merge into a single bounded top-B heap per tree/level,
@@ -267,24 +267,30 @@ byte shares may be configured, but the eviction policy is an internal
 benchmark-driven detail, not a persistent or public compatibility contract.
 Corruption is never cached.
 
-### Fixed-index graph bodies
+### Graph index bodies
 
 The graph reader uses the complete query's existing validated logical
 transaction and the snapshot Header already read by traversal. It reads the
-Graph Descriptor on every access, including hits. Ready internal kind, exact count, epoch, configured capacity and
+Graph Descriptor on every access, including hits. Internal kind, exact count, epoch, configured capacity and
 the descriptor's source binding must agree. Missing or mismatched graphs are
-Corruption; there is no exact fallback. Mutable-index exact reads do not request graph records. Both routing modes on
-Fixed Indexes validate complete graph bodies.
+Corruption; there is no exact fallback. Ordinary indexes do not request graph
+records. Both routing modes on graph-enabled indexes validate complete
+nonempty graph bodies. Graph indexes
+allow every legal searchable state and skip graph loading for an exactly empty
+internal body after applying root split traversal.
 
 On a miss, the reader scans complete Child Entries and contiguous graph chunks
 from that same transaction, then restores the persisted native graph. It never
 builds a graph or changes its seed, construction parameters, adjacency or query
-distances. A fixed internal body owns its Child Entries, native graph, source
-binding, and numeric kernel together. The cache distinguishes leaf, ordinary
-internal, and fixed internal bodies; a fixed body cannot omit its graph.
+distances. A graph internal body owns its Child Entries, native graph, source
+binding, and numeric kernel together. An internal cache entry may contain ordinary
+projections or the complete graph body. Foreground exact routing reuses
+projections from either representation. When it populated ordinary projections
+first, the graph reader upgrades that same-epoch body after loading and validating
+the persisted graph. A late same-epoch projections-only fill cannot downgrade a
+complete graph body; a newer epoch may replace it normally.
 Cold reads retain unpublished entries and chunks until restoration succeeds,
-then publish one complete shared body. No entries-only cache object is created
-for a fixed internal partition. Older snapshots cannot replace newer cached
+then publish one complete shared body. Older snapshots cannot replace newer cached
 epochs. Eviction does not invalidate handles still held by queries.
 
 `RuntimeConfig::routing_working_bytes` (default 256 MiB) bounds one query's graph
@@ -302,8 +308,8 @@ and honor cancellation/deadlines. Scratch is private to each query; native graph
 are immutable and shared. Snapshot expiry propagates to complete-query retry;
 neither graph reads nor CPU restoration open a new transaction. Traversal passes
 its already-read snapshot Header into the reader, avoiding a duplicate Header
-read. Fixed internal bodies are consumed serially; ordinary and fixed leaf
-visits retain bounded metadata/body prefetch. Exact on a Fixed Index loads and
+read. Graph internal bodies are consumed serially; leaf
+visits retain bounded metadata/body prefetch. Exact on a graph index loads and
 validates the same mandatory graph body, then ignores adjacency; corruption
 never triggers a routing fallback. All children still participate in the
 query-wide incoming-edge integrity check. Its hash storage, live frontiers,

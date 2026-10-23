@@ -1010,6 +1010,7 @@ pub struct WriteLogicalTxn<'manifest, T> {
     hard_limits: HardLimits,
     budget: AdmissionBudget,
     size: TransactionSize,
+    affected_bytes: usize,
     read_cache: BTreeMap<Bytes, ReadCacheEntry>,
 }
 
@@ -1032,6 +1033,7 @@ impl<T> WriteLogicalTxn<'static, T> {
             hard_limits,
             budget,
             size: TransactionSize::default(),
+            affected_bytes: 0,
             read_cache: BTreeMap::new(),
         }
     }
@@ -1052,6 +1054,7 @@ impl<'manifest, T> WriteLogicalTxn<'manifest, T> {
             hard_limits,
             budget,
             size: TransactionSize::default(),
+            affected_bytes: 0,
             read_cache: BTreeMap::new(),
         }
     }
@@ -1077,6 +1080,7 @@ impl<'manifest, T> WriteLogicalTxn<'manifest, T> {
             hard_limits,
             budget,
             size: TransactionSize::default(),
+            affected_bytes: 0,
             read_cache: BTreeMap::new(),
         })
     }
@@ -1085,6 +1089,28 @@ impl<'manifest, T> WriteLogicalTxn<'manifest, T> {
     #[must_use]
     pub const fn size(&self) -> TransactionSize {
         self.size
+    }
+
+    /// Conservative affected-data work already issued, including physical key
+    /// prefixes, protected-read conflict endpoints, and mutation framing. Repeated
+    /// native operations are charged again; cached reads add no native work.
+    #[must_use]
+    pub const fn affected_bytes(&self) -> usize {
+        self.affected_bytes
+    }
+
+    fn affected_key_bytes(&self, key: &Bytes, copies: usize) -> Result<usize> {
+        key.len()
+            .checked_add(self.budget.mutation_key_overhead_bytes)
+            .and_then(|n| n.checked_mul(copies))
+            .and_then(|n| n.checked_add(64))
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))
+    }
+
+    fn add_affected(&self, bytes: usize) -> Result<usize> {
+        self.affected_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))
     }
 
     /// Returns the Index Manifest this transaction is bound to, if any.
@@ -1221,11 +1247,17 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
         {
             return Ok(entry.value.clone());
         }
+        let next_affected = if for_update {
+            self.add_affected(self.affected_key_bytes(&key, 2)?)?
+        } else {
+            self.affected_bytes
+        };
         let value = if for_update {
             self.raw.get_for_update(key.clone()).await?
         } else {
             self.raw.get(key.clone()).await?
         };
+        self.affected_bytes = next_affected;
         self.read_cache.insert(
             key,
             ReadCacheEntry {
@@ -1266,6 +1298,17 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
         let mut missing_keys: Vec<_> = missing.iter().map(|(_, key)| key.clone()).collect();
         missing_keys.dedup();
         let missing_count = missing_keys.len();
+        let next_affected = if for_update {
+            missing_keys
+                .iter()
+                .try_fold(self.affected_bytes, |total, key| {
+                    total
+                        .checked_add(self.affected_key_bytes(key, 2)?)
+                        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))
+                })?
+        } else {
+            self.affected_bytes
+        };
         let fetched = if for_update {
             self.raw.batch_get_for_update(missing_keys).await?
         } else {
@@ -1274,6 +1317,7 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
         if fetched.len() != missing_count {
             return Err(Error::new(ErrorKind::Backend));
         }
+        self.affected_bytes = next_affected;
         for (positions, value) in missing.chunk_by(|a, b| a.1 == b.1).zip(fetched) {
             self.read_cache.insert(
                 positions[0].1.clone(),
@@ -1356,11 +1400,17 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
             .checked_add(mutation_size)
             .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
         check_budget(self.budget, next)?;
+        let next_affected = self.add_affected(
+            self.affected_key_bytes(&encoded_key, 3)?
+                .checked_add(encoded_value.len())
+                .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?,
+        )?;
         let outcome = self
             .raw
             .insert(encoded_key.clone(), encoded_value.clone())
             .await?;
         if outcome == InsertOutcome::Inserted {
+            self.affected_bytes = next_affected;
             self.size = next;
             self.cache_write(encoded_key, Some(encoded_value));
         }
@@ -1384,6 +1434,7 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
             .checked_add(builder.size)
             .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
         check_budget(self.budget, next)?;
+        let next_affected = self.add_affected(builder.affected_bytes()?)?;
         let written: Vec<(Bytes, Option<Bytes>)> = builder
             .entries
             .iter()
@@ -1396,6 +1447,7 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
             self.cache_write(key, value);
         }
         self.size = next;
+        self.affected_bytes = next_affected;
         Ok(())
     }
 
@@ -1434,7 +1486,19 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
             })
             .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
         check_budget(self.budget, next)?;
+        let range_affected = bytes
+            .checked_add(
+                self.budget
+                    .mutation_key_overhead_bytes
+                    .checked_mul(2)
+                    .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?,
+            )
+            .and_then(|n| n.checked_mul(3))
+            .and_then(|n| n.checked_add(64))
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+        let next_affected = self.add_affected(range_affected)?;
         self.raw.clear_range(&range.raw).await?;
+        self.affected_bytes = next_affected;
         // A range clear invalidates every cached value in the range; the
         // cache is small and drops are rare, so the whole cache is dropped.
         self.read_cache.clear();

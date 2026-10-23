@@ -208,7 +208,7 @@ impl<B: Backend> RuntimeInner<B> {
         I: IntoIterator<Item = (TreeKey, PartitionKey)>,
     {
         // With no workers nothing consumes the queue; drop immediately.
-        if manifest.config().fixed_graph().is_some() || self.config().maintenance_workers() == 0 {
+        if self.config().maintenance_workers() == 0 {
             return;
         }
         if !self.is_accepting() {
@@ -494,6 +494,7 @@ async fn drive<B: Backend>(inner: &Arc<RuntimeInner<B>>, offer: &FixupOffer) -> 
                 now_unix_millis: started_at,
                 recovery: recovery.take(),
                 retry: &retry,
+                graph: Some(&inner.graph_maintenance),
             },
         )
         .await;

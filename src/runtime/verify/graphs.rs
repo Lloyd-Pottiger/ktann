@@ -1,4 +1,4 @@
-//! Fixed-body integrity joins over the audit's ordered snapshot stream.
+//! Graph-body integrity joins over the audit's ordered snapshot stream.
 //!
 //! Only one graph is retained. Per-tree fingerprints join Child Entries to the
 //! separately stored centroids; topology ownership remains in TopologyLedger.
@@ -10,12 +10,12 @@ use sha2::{Digest, Sha256};
 use super::Context;
 use crate::api::{ErrorKind, PartitionKey, Result, VerifyIssueKind};
 use crate::runtime::{OperationContext, check_control, compute::controlled_compute};
-use crate::search::local_hnsw::{body::FixedInternalBody, persistence::GraphSource};
+use crate::search::local_hnsw::{body::InternalGraphBody, persistence::GraphSource};
 use crate::search::numeric::VectorKernel;
 use crate::storage::backend::Backend;
 use crate::storage::keys::{LogicalKey, TreeKey};
 use crate::storage::values::{
-    ChildEntry, GraphChunk, GraphDescriptor, PartitionHeader, PartitionState, PersistentValue,
+    ChildEntry, GraphChunk, GraphDescriptor, PartitionHeader, PersistentValue,
 };
 
 /// Centroid facts retained until the tree boundary, independent of key order.
@@ -56,7 +56,7 @@ impl GraphLedger {
         let (Some(tree), Some(partition)) = (key.tree_key(), super::partition_key(key)) else {
             return Ok(());
         };
-        if cx.manifest.config().fixed_graph().is_none() {
+        if cx.manifest.config().local_graph().is_none() {
             if matches!(
                 value,
                 PersistentValue::GraphDescriptor(_) | PersistentValue::GraphChunk(_)
@@ -89,14 +89,6 @@ impl GraphLedger {
         match value {
             PersistentValue::PartitionHeader(header) => {
                 self.body.header = Some(*header);
-                if header.state() != PartitionState::Ready {
-                    cx.issue(
-                        VerifyIssueKind::Membership,
-                        Some(tree),
-                        Some(partition),
-                        None,
-                    );
-                }
                 if let Some(projection) = self.projection(cx, partition) {
                     projection.header = true;
                 }
@@ -180,6 +172,17 @@ impl GraphLedger {
         context.checkpoint()?;
         let tree = self.tree.as_ref().unwrap();
         match body.header {
+            Some(header) if header.level() > 1 && header.entry_count() == 0 => {
+                if body.descriptor.is_some() || !body.chunks.is_empty() || !body.children.is_empty()
+                {
+                    cx.issue(
+                        VerifyIssueKind::Membership,
+                        Some(tree),
+                        Some(partition),
+                        None,
+                    );
+                }
+            }
             Some(header) if header.level() > 1 => {
                 if let Some(descriptor) = body.descriptor {
                     let dimension = cx.manifest.config().dimension();
@@ -192,7 +195,7 @@ impl GraphLedger {
                         let tree_owned = tree.clone();
                         let metric = cx.manifest.config().metric();
                         let seed = *cx.manifest.rotation_seed();
-                        let parameters = cx.manifest.config().fixed_graph().unwrap().parameters();
+                        let parameters = cx.manifest.config().local_graph().unwrap().parameters();
                         let working_bytes = cx.limits.remaining_memory() as usize;
                         let result = controlled_compute(
                             context.options.clone(),
@@ -201,7 +204,7 @@ impl GraphLedger {
                                 .clone()
                                 .expect("verification admission"),
                             move |options| {
-                                FixedInternalBody::restore(
+                                InternalGraphBody::restore(
                                     body.children.into_boxed_slice(),
                                     VectorKernel::new(dimension, metric, seed)?,
                                     GraphSource {

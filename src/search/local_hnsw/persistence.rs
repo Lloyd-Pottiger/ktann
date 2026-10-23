@@ -2,9 +2,7 @@
 
 use super::*;
 use crate::api::{LogicalIndexId, Metric};
-use crate::storage::values::{
-    GRAPH_CHUNK_BYTES, GraphChunk, GraphDescriptor, PartitionHeader, PartitionState,
-};
+use crate::storage::values::{GRAPH_CHUNK_BYTES, GraphChunk, GraphDescriptor, PartitionHeader};
 use bytes::Bytes;
 
 /// Snapshot source of a persisted internal body; parameters come from its Manifest.
@@ -95,10 +93,10 @@ pub(super) fn binding(
 }
 
 fn header_matches(header: PartitionHeader, nodes: usize) -> bool {
-    header.level() > 1
-        && nodes > 0
-        && header.entry_count() as usize == nodes
-        && header.state() == PartitionState::Ready
+    // State-only transitions preserve the body epoch. A searchable draining or
+    // receiving partition has the same graph contract as a Ready partition;
+    // topology authority validates which transitions are legal.
+    header.level() > 1 && nodes > 0 && header.entry_count() as usize == nodes
 }
 
 fn corrupt() -> Error {
@@ -152,7 +150,7 @@ pub(crate) fn update_records(
     check: &dyn Fn() -> Result<()>,
 ) -> Result<GraphRecords> {
     if next_header.level() != source.header.level()
-        || source.header.cache_epoch().checked_add(1) != Some(next_header.cache_epoch())
+        || source.header.cache_epoch() >= next_header.cache_epoch()
         || !header_matches(next_header, next.children.len())
     {
         return Err(Error::invalid_argument());
@@ -285,7 +283,7 @@ pub(super) fn persist_graph(
 /// Budget charges both retained chunk input and the assembled buffer, child
 /// projections, validation scratch, and native restore allocations. Encoding
 /// corruption is never repaired or routed through an exact fallback.
-pub(super) fn restore_graph(
+pub(crate) fn restore_graph(
     centroids: Centroids<'_>,
     source: GraphSource<'_>,
     descriptor: &GraphDescriptor,

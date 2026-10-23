@@ -219,7 +219,7 @@ pub(crate) async fn traverse<T: ReadOps>(
 ) -> Result<TraversalOutcome> {
     let manifest = txn.require_manifest()?;
     let query = RaBitQQuery::new(request.routing, manifest.config().metric())?;
-    let input_bytes = if manifest.config().fixed_graph().is_some() {
+    let input_bytes = if manifest.config().local_graph().is_some() {
         request.trees.iter().try_fold(
             kernel
                 .heap_bytes()
@@ -250,7 +250,7 @@ pub(crate) async fn traverse<T: ReadOps>(
     let mut state = Traversal::seed(context.request.trees)?;
     #[cfg(feature = "benchmark")]
     if let Some(leaves) = context.request.selected_leaves {
-        if context.request.trees.len() != 1 || manifest.config().fixed_graph().is_none() {
+        if context.request.trees.len() != 1 || manifest.config().local_graph().is_none() {
             return Err(Error::invalid_argument());
         }
         state.frontier.clear();
@@ -406,10 +406,10 @@ impl Traversal {
                 break;
             }
             let remaining = context.request.budgets.visited_partitions() - self.visited_partitions;
-            // Fixed internal bodies are restored and consumed one at a time.
+            // Internal graph bodies are restored and consumed one at a time.
             // Leaves retain the ordinary bounded prefetch path.
             if remaining > 1
-                && (context.manifest.config().fixed_graph().is_none()
+                && (context.manifest.config().local_graph().is_none()
                     || self
                         .frontier
                         .peek()
@@ -573,12 +573,6 @@ impl Traversal {
             return Err(Error::new(ErrorKind::Corruption));
         }
         let level = header.level();
-        if context.manifest.config().fixed_graph().is_some()
-            && header.state() != PartitionState::Ready
-        {
-            return Err(Error::new(ErrorKind::Corruption));
-        }
-
         // A visit rediscovers only work the committed Header can advance.
         if fixup::is_actionable(context.manifest.config(), entry.partition, header) {
             self.maintenance.push((tree_key.clone(), entry.partition));
@@ -587,6 +581,15 @@ impl Traversal {
         if entry.expected_level.is_none() {
             self.apply_root_state(txn, index, tree_key, entry.tree, entry.partition, &header)
                 .await?;
+        }
+
+        // Root split targets have already been injected above. The exact count
+        // proves an empty internal body has no graph or routing candidates.
+        if level > 1
+            && header.entry_count() == 0
+            && context.manifest.config().local_graph().is_some()
+        {
+            return Ok(None);
         }
 
         let predicate = if level > 1 {
@@ -644,7 +647,7 @@ impl Traversal {
             return Ok(());
         };
         let tree_key = context.request.trees[entry.tree as usize].tree_key();
-        if visit.header.level() > 1 && context.manifest.config().fixed_graph().is_some() {
+        if visit.header.level() > 1 && context.manifest.config().local_graph().is_some() {
             return self.visit_graph(txn, context, &visit).await;
         }
         let body = load_body(
@@ -723,7 +726,7 @@ impl Traversal {
 
     /// Exposes one internal partition's children to the next depth's beam.
     ///
-    /// Reads and consumes one complete fixed body through the runtime CPU boundary.
+    /// Reads and consumes one complete graph body through the runtime CPU boundary.
     async fn visit_graph<T: ReadOps>(
         &mut self,
         txn: &mut ReadLogicalTxn<'_, T>,
@@ -874,7 +877,7 @@ impl Traversal {
         Ok(())
     }
 
-    /// Exact mutable-index baseline; all exposed children compete in one
+    /// Exact routing baseline; all exposed children compete in one
     /// bounded tree/level heap under the existing total tie order.
     fn visit_internal(
         &mut self,
@@ -983,7 +986,7 @@ impl Traversal {
                 distance,
                 RecordLocation::new(tree_key.clone(), partition),
             );
-            if context.manifest.config().fixed_graph().is_some() {
+            if context.manifest.config().local_graph().is_some() {
                 self.candidate_heap_bytes = self
                     .candidate_heap_bytes
                     .checked_add(candidate.heap_bytes()?)

@@ -1008,6 +1008,7 @@ dependencies = [
  "metrics",
  "metrics-util",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -1031,6 +1032,7 @@ dependencies = [
  "rocksdb",
  "tempfile",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

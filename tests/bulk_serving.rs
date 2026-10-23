@@ -736,8 +736,8 @@ fn construction_options() -> ktann::construction::ConstructionOptions {
     }
 }
 
-#[path = "bulk_serving/fixed.rs"]
-mod fixed;
+#[path = "bulk_serving/graphs.rs"]
+mod graphs;
 
 #[path = "bulk_serving/routing.rs"]
 mod routing;

@@ -20,12 +20,19 @@ At most the configured foreground operation limit may run and the same number
 may wait for admission; further calls fail with `LimitExceeded` rather than
 creating an unbounded process-local queue.
 
-Fixed-graph routing has a separate per-query working-byte ceiling configured by
+Graph routing has a separate per-query working-byte ceiling configured by
 `RuntimeConfig::with_routing_working_bytes`; its accounting contract belongs to
-[Search](search.md#fixed-index-graph-bodies). Native restore and query tasks, including offline graph verification, use
+[Search](search.md#graph-index-bodies). Native restore and query tasks, including offline graph verification, use
 the same cooperative CPU-task boundary as refinement. Foreground admission remains
 owned until those tasks actually exit, including when an awaiting future is
 dropped. Cache retention capacity does not bound such in-flight ownership.
+
+Local graph maintenance uses that working-byte ceiling for each complete
+multi-partition preparation. A Runtime-owned `GraphMaintenance` bounds native
+preparations by maintenance-worker count and retains its permit through CPU exit
+after cancellation. Workers also bound the snapshot plans waiting for native
+admission. Explicit low-level callers reuse one admission owner and bound their
+own concurrent drivers; an executor alone does not bound callers' waiting plans.
 
 ## 2. Shutdown
 
@@ -152,15 +159,16 @@ deadline, and cancellation bounds:
 - Leaf Entry field/code agreement with the Vector Record;
 - conservative synopsis contents recomputed from leaf entries;
 - allocator high-water marks and ownership ranges;
-- for fixed indexes, every internal partition's complete persisted graph and
+- for graph-enabled indexes, every nonempty internal partition's complete graph and
   every non-root centroid's agreement with its incoming Child Entry.
 
-Fixed-body verification consumes the same ordered scan, independently of search
+Graph-body verification consumes the same ordered scan, independently of search
 routing and cache contents. It restores one graph at a time through the existing
-fixed-body decoder: Header/source binding, child ordinals, chunk coverage and
+graph-body decoder: Header/source binding, child ordinals, chunk coverage and
 checksum, native topology, and local reachability are checked together. Leaf or
-ownerless graphs, and graphs in mutable indexes, are invalid. Fixed Headers must
-be Ready. The root needs no stored centroid because it has no incoming projection.
+ownerless graphs, and graphs in indexes without graph configuration, are invalid.
+Empty internal bodies have no graph; legal non-Ready states remain verifiable.
+The root needs no stored centroid because it has no incoming projection.
 Per-tree canonical centroid fingerprints join projections without retaining a
 second tree of vectors; topology ownership remains in the ordinary tree ledger.
 

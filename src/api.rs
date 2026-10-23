@@ -22,7 +22,7 @@ pub use bulk::{
     BulkLoadOptions, BulkSchedulerOptions, BulkWorkerOptions,
 };
 pub(crate) use config::MAX_DIMENSION;
-pub use config::{FixedGraphConfig, IndexConfig, RuntimeConfig};
+pub use config::{IndexConfig, LocalGraphConfig, RuntimeConfig};
 pub use error::{Error, ErrorKind, Result};
 pub use identifiers::{FieldId, IndexName, LogicalIndexId, PartitionKey};
 pub use index::Index;

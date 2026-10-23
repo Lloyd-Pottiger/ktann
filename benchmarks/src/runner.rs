@@ -28,12 +28,7 @@ use crate::report::{
 };
 use crate::resource::ResourceSnapshot;
 
-#[path = "../../tests/support/oracle.rs"]
-#[expect(
-    dead_code,
-    reason = "the shared oracle also exposes filter helpers used only by integration tests"
-)]
-mod oracle;
+use crate::oracle;
 
 /// Queue capacity for demand-driven Structure Maintenance.
 const FIXUP_QUEUE_CAPACITY: usize = 1_024;
@@ -57,7 +52,7 @@ struct RecallInput {
 pub struct ScenarioSpec {
     /// Stable scenario name used as the comparison key.
     pub name: &'static str,
-    /// Fixed-index experimental construction and routing controls.
+    /// Frozen-dataset experimental construction and routing controls.
     pub routing_experiment: Option<crate::routing::Experiment>,
     /// Prepared global baseline, shared only by this worker's query operations.
     pub global_router: Option<Arc<ktann::benchmark::GlobalLeafRouter>>,
@@ -839,7 +834,7 @@ fn index_config(spec: &ScenarioSpec) -> Result<IndexConfig, String> {
     };
     let config = config.and_then(|config| {
         if let Some(experiment) = &spec.routing_experiment {
-            Ok(config.with_fixed_graph(experiment.graph()?))
+            Ok(config.with_local_graph(experiment.graph()?))
         } else {
             Ok(config)
         }
@@ -1345,7 +1340,7 @@ async fn prepare_index<B: Backend>(
     String,
 > {
     if spec.routing_experiment.is_some() {
-        return prepare_fixed_index(runtime, backend_counters, metric_capture, spec, dataset).await;
+        return prepare_bulk_index(runtime, backend_counters, metric_capture, spec, dataset).await;
     }
     let index_config = index_config(spec)?;
     let index = runtime
@@ -2388,7 +2383,7 @@ fn error_at(phase: &str, error: ktann::api::Error) -> String {
 
 /// Bulk Build uses final refined centroids before graph encoding/publication.
 /// All construction and verification are outside the measured query interval.
-async fn prepare_fixed_index<B: Backend>(
+async fn prepare_bulk_index<B: Backend>(
     runtime: &Runtime<MeasuredBackend<B>>,
     backend_counters: &BackendCounters,
     capture: &MetricCapture,
@@ -2404,7 +2399,10 @@ async fn prepare_fixed_index<B: Backend>(
 > {
     use ktann::api::BulkBuildOptions;
     use ktann::bulk::InputSnapshot;
-    let experiment = spec.routing_experiment.as_ref().expect("fixed experiment");
+    let experiment = spec
+        .routing_experiment
+        .as_ref()
+        .expect("routing experiment");
     let root = tempfile::tempdir().map_err(|e| e.to_string())?;
     let config = index_config(spec)?;
     drop(capture.snapshot());
@@ -2434,14 +2432,14 @@ async fn prepare_fixed_index<B: Backend>(
             },
         )
         .await
-        .map_err(|e| error_at("reserve fixed index", e))?;
+        .map_err(|e| error_at("reserve bulk index", e))?;
     let worker = experiment.worker(root.path().join("workspace"));
     let settings = crate::report::bulk_build_settings(&construction, &worker);
     std::fs::create_dir(&worker.workspace).map_err(|e| e.to_string())?;
     let (index, stages) = job
         .complete_with_report(worker, None, OperationOptions::default())
         .await
-        .map_err(|e| error_at("complete fixed index", e))?;
+        .map_err(|e| error_at("complete bulk index", e))?;
     let imported = ResourceSnapshot::capture()?;
     let imported_io = backend_counters.snapshot();
     let import_seconds = started.elapsed().as_secs_f64();
@@ -2465,7 +2463,7 @@ async fn prepare_fixed_index<B: Backend>(
     let topology = verified_topology(
         &index,
         spec,
-        "verify fixed index",
+        "verify bulk index",
         Instant::now() + settle_timeout(spec),
     )
     .await?;

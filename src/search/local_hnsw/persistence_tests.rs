@@ -89,6 +89,66 @@ fn records(graph: &TestGraph<'_>) -> GraphRecords {
 }
 
 #[test]
+fn topology_states_preserve_graph_binding_and_batched_body_epochs() {
+    let kernel = VectorKernel::new(3, Metric::L2, [0; 32]).unwrap();
+    let rows = children(fixture(17, 3, 33));
+    let graph = build(&kernel, &rows, parameters());
+    let encoded = records(&graph);
+    let tree = tree();
+    for state in [
+        PartitionState::Ready,
+        PartitionState::Splitting,
+        PartitionState::ReceivingSplit,
+        PartitionState::DrainingSplit,
+        PartitionState::Merging,
+    ] {
+        let source = GraphSource {
+            header: PartitionHeader::new(2, rows.len() as u32, 42, state).unwrap(),
+            ..source(&tree, rows.len())
+        };
+        // State changes neither replace the graph nor change its body identity.
+        TestGraph::restore(
+            graph.centroids,
+            source,
+            &encoded.descriptor,
+            encoded.chunks(),
+            MEMORY,
+            &|| Ok(()),
+        )
+        .unwrap();
+        let next = &rows[2..];
+        let centroids = Centroids::new(&kernel, next, 4096, &|| Ok(())).unwrap();
+        for epoch in [41, 42, 44] {
+            let header = PartitionHeader::new(2, next.len() as u32, epoch, state).unwrap();
+            let updated = super::super::persistence::update_records(
+                graph.centroids,
+                centroids,
+                source,
+                &encoded.descriptor,
+                encoded.chunks(),
+                header,
+                MEMORY,
+                &|| Ok(()),
+            );
+            if epoch <= 42 {
+                assert_eq!(updated.unwrap_err().kind(), ErrorKind::InvalidArgument);
+            } else {
+                let updated = updated.unwrap();
+                TestGraph::restore(
+                    centroids,
+                    GraphSource { header, ..source },
+                    &updated.descriptor,
+                    updated.chunks(),
+                    MEMORY,
+                    &|| Ok(()),
+                )
+                .unwrap();
+            }
+        }
+    }
+}
+
+#[test]
 fn ordinary_updates_preserve_metric_scores_canonical_children_and_source_integrity() {
     for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
         let kernel = VectorKernel::new(8, metric, [0; 32]).unwrap();

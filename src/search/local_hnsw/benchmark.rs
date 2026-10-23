@@ -47,7 +47,7 @@ impl GlobalLeafRouter {
         };
         let config = manifest.config();
         let parameters = config
-            .fixed_graph()
+            .local_graph()
             .ok_or_else(Error::invalid_argument)?
             .parameters();
         if !config.tree_key_fields().is_empty()

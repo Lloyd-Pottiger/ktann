@@ -15,6 +15,7 @@ ktann = { path = ".." }
 metrics = "0.24"
 
 [dev-dependencies]
+tokio-util = { version = "0.7", features = ["rt"] }
 metrics-util = "0.20"
 tokio = { version = "1", features = ["macros", "rt"] }
 

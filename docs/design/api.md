@@ -196,6 +196,19 @@ internal capacities do not change those defaults.
 RaBitQ7, online split arity, Lloyd rounds, rotation algorithm, logical codecs, and
 hard safety caps are defined by the Persistent Format.
 
+`IndexConfig::with_local_graph(LocalGraphConfig)` enables partition-local graphs
+for ordinary empty-index creation or Bulk Build. `local_graph()` returns the
+optional persisted construction parameters. Graph-enabled indexes support writes
+and maintenance after publication. Query routing is selected independently;
+foreground writes keep existing tree routing.
+
+Local graph maintenance prepares native graphs outside transactions using one
+shared Runtime admission owner. Explicit low-level maintenance uses
+`maintenance::graph_topology::advance` with a reused `runtime::GraphMaintenance`
+owner; graph-unaware split/merge entrypoints reject graph-changing steps.
+The routing working-byte limit also bounds one complete maintenance preparation,
+including all participating source and proposed bodies and retained output.
+
 ### 4.2 Runtime configuration
 
 `RuntimeConfig` owns the foreground operation limit, cache bytes, worker count,
@@ -244,10 +257,10 @@ knob, not an accounted budget dimension, and the visited-partition budget still
 bounds the work it schedules.
 
 `SearchOptions::with_routing_mode` selects `RoutingMode::Exact` (default) or
-`RoutingMode::PartitionLocalHnsw { ef_search }`. The latter requires a Fixed
-Index and positive `ef_search`; invalid selections return `InvalidArgument`
+`RoutingMode::PartitionLocalHnsw { ef_search }`. The latter requires a graph-enabled
+index and positive `ef_search`; invalid selections return `InvalidArgument`
 before foreground admission, including for empty indexes. The enum carries no
-HNSW-only field in Exact mode. Leaf-only Fixed Indexes accept either mode and
+HNSW-only field in Exact mode. Leaf-only graph indexes accept either mode and
 perform no graph work. The local graph uses `min(n, max(ef_search, B))`, where
 `n` is the parent size and `B` is the next-level beam. No routing mode changes
 the rerank budget.
@@ -322,6 +335,10 @@ and settled Ready topology, before serving. The caller must exclude all other
 index operations, including maintenance from other runtimes, until it returns.
 Local queued or running fixups and non-Ready topology are rejected; idle Runtime
 workers may remain running.
+
+It rejects graph-enabled indexes with `InvalidArgument`: serving refinement does
+not implement graph-aware centroid publication. Use optional artifact refinement
+before initial graph construction.
 
 `RefineOptions::new(input_bytes)` requires a positive input byte limit and defaults
 to two rounds. Builders accept `with_refinement_rounds(0..=5)` and

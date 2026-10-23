@@ -23,15 +23,15 @@ const DEFAULT_TREE_KEY_SCAN_RANGES: u32 = 1_024;
 const DEFAULT_WRITE_BEAM_SIZE: u32 = 4;
 const MAX_WRITE_BEAM_SIZE: u32 = 16_384;
 
-/// Immutable construction parameters for a fixed, Bulk Build-only index.
+/// Immutable construction parameters for partition-local HNSW graphs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FixedGraphConfig {
+pub struct LocalGraphConfig {
     m: u32,
     ef_construction: u32,
     seed: [u8; 32],
 }
 
-impl FixedGraphConfig {
+impl LocalGraphConfig {
     /// Creates graph parameters for bounded atomic internal-graph publication.
     pub fn new(m: u32, ef_construction: u32, seed: [u8; 32]) -> Result<Self> {
         if !(2..=16).contains(&m) || ef_construction < m {
@@ -72,7 +72,7 @@ impl FixedGraphConfig {
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct IndexConfig {
-    fixed_graph: Option<FixedGraphConfig>,
+    graph: Option<LocalGraphConfig>,
     dimension: usize,
     metric: Metric,
     fields: Box<[FieldSchema]>,
@@ -84,22 +84,23 @@ pub struct IndexConfig {
 }
 
 impl IndexConfig {
-    /// Selects immutable serving bytes and internal-partition graphs.
+    /// Enables atomically maintained partition-local graphs for internal routing.
+    /// Foreground writes retain the existing exact tree routing.
     #[must_use]
-    pub fn with_fixed_graph(mut self, graph: FixedGraphConfig) -> Self {
-        self.fixed_graph = Some(graph);
+    pub fn with_local_graph(mut self, graph: LocalGraphConfig) -> Self {
+        self.graph = Some(graph);
         self
     }
 
-    /// Graph construction parameters, or None for an ordinary mutable index.
-    pub const fn fixed_graph(&self) -> Option<FixedGraphConfig> {
-        self.fixed_graph
+    /// Construction parameters for partition-local HNSW graphs.
+    pub const fn local_graph(&self) -> Option<LocalGraphConfig> {
+        self.graph
     }
 
     /// Creates an immutable Logical Index configuration.
     pub fn new(dimension: usize, metric: Metric) -> Result<Self> {
         let config = Self {
-            fixed_graph: None,
+            graph: None,
             dimension,
             metric,
             fields: Box::new([]),
@@ -377,7 +378,7 @@ impl Default for RuntimeConfig {
 }
 
 impl RuntimeConfig {
-    /// Sets the per-query fixed-graph routing working-byte ceiling (default 256 MiB).
+    /// Sets the per-query graph routing working-byte ceiling (default 256 MiB).
     /// Includes held bodies, restoration buffers, native scratch and caller-reserved
     /// candidate/identity state. Cache capacity controls retention independently.
     pub fn with_routing_working_bytes(mut self, bytes: usize) -> Result<Self> {
@@ -388,7 +389,7 @@ impl RuntimeConfig {
         Ok(self)
     }
 
-    /// Returns the fixed-graph routing working-byte ceiling.
+    /// Returns the graph routing working-byte ceiling.
     pub const fn routing_working_bytes(&self) -> usize {
         self.routing_working_bytes
     }

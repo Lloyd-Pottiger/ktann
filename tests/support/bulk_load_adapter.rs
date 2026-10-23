@@ -13,20 +13,24 @@ use std::path::Path;
 #[path = "graph_updates.rs"]
 mod graph_updates;
 
+#[path = "graph_history.rs"]
+pub mod graph_history;
+
 /// Exercises both manual loading and worker acceptance across a real backend
 /// reopen, then checks exact bytes before publication and ordinary verification.
 pub async fn exercise<B: Backend>(backend: impl Fn() -> B, directory: &Path) {
-    for (name, fixed, metric) in [
-        ("mutable", false, Metric::L2),
-        ("fixed-l2", true, Metric::L2),
-        ("fixed-cosine", true, Metric::Cosine),
-        ("fixed-ip", true, Metric::InnerProduct),
+    for (name, graph, metric) in [
+        ("ordinary", false, Metric::L2),
+        ("graph-l2", true, Metric::L2),
+        ("graph-cosine", true, Metric::Cosine),
+        ("graph-ip", true, Metric::InnerProduct),
     ] {
         let path = directory.join(name);
         std::fs::create_dir(&path).unwrap();
-        exercise_mode(&backend, &path, fixed, metric, false, &|_, _| {}).await;
+        exercise_mode(&backend, &path, graph, metric, false, &|_, _| {}).await;
     }
     exercise_updates(&backend, &directory.join("graph-updates"), &|_, _| {}).await;
+    graph_history::exercise(&backend, &|_, _| {}).await;
 }
 
 /// The same graph-update corpus is used by all adapters; Memory adds commit faults.
@@ -42,7 +46,7 @@ pub async fn exercise_updates<B: Backend>(
 async fn exercise_mode<B: Backend>(
     backend: &impl Fn() -> B,
     directory: &Path,
-    fixed: bool,
+    graph: bool,
     metric: Metric,
     updates: bool,
     fault: &dyn Fn(&'static str, usize),
@@ -58,9 +62,9 @@ async fn exercise_mode<B: Backend>(
         .unwrap()
         .with_tree_key_fields(vec![FieldId(0)])
         .unwrap();
-    let config = if fixed {
-        config.with_fixed_graph(
-            ktann::api::FixedGraphConfig::new(
+    let config = if graph {
+        config.with_local_graph(
+            ktann::api::LocalGraphConfig::new(
                 if updates { 16 } else { 4 },
                 if updates { 64 } else { 16 },
                 [3; 32],
@@ -171,12 +175,21 @@ async fn exercise_mode<B: Backend>(
         ErrorKind::IndexBuilding
     );
     let raw = backend();
-    let mut txn = raw.begin_read().await.unwrap();
-    for entry in serving.reader().unwrap() {
-        let entry = entry.unwrap();
-        assert_eq!(txn.get(entry.key).await.unwrap(), Some(entry.value));
+    // Loading is complete and the hidden namespace is immutable, so batches
+    // need no shared snapshot. Keep reads within FoundationDB's transaction
+    // lifetime even when the artifact contains thousands of entries.
+    let mut entries = serving.reader().unwrap();
+    loop {
+        let batch: Vec<_> = entries.by_ref().take(128).map(Result::unwrap).collect();
+        if batch.is_empty() {
+            break;
+        }
+        let mut txn = raw.begin_read().await.unwrap();
+        let keys = batch.iter().map(|entry| entry.key.clone()).collect();
+        let actual = txn.batch_get(keys).await.unwrap();
+        let expected: Vec<_> = batch.into_iter().map(|entry| Some(entry.value)).collect();
+        assert_eq!(actual, expected);
     }
-    drop(txn);
     let index = reopened.complete(worker.clone()).await.unwrap();
     let verified = index
         .verify(ktann::api::VerifyOptions::default())
@@ -193,7 +206,7 @@ async fn exercise_mode<B: Backend>(
     }
     // Exercise real storage reads for both serving modes after durable loading.
     // The default beam is exhaustive for this small two-Tree-Key fixture.
-    let modes = if fixed {
+    let modes = if graph {
         vec![
             ktann::api::RoutingMode::Exact,
             ktann::api::RoutingMode::PartitionLocalHnsw { ef_search: 1 },
@@ -247,6 +260,24 @@ async fn exercise_mode<B: Backend>(
         }
     }
 
+    if graph {
+        // Bulk-built graph indexes retain ordinary public write capability.
+        let id = Bytes::from_static(b"post-publication");
+        index
+            .insert(Record::new(id.clone(), vec![0.25, 1.0], vec![Value::I64(0)]).unwrap())
+            .await
+            .unwrap();
+        index
+            .upsert(Record::new(id.clone(), vec![0.5, 1.0], vec![Value::I64(0)]).unwrap())
+            .await
+            .unwrap();
+        assert!(index.delete(id).await.unwrap());
+        let report = index
+            .verify(ktann::api::VerifyOptions::default())
+            .await
+            .unwrap();
+        assert!(report.complete && report.issues.is_empty());
+    }
     assert_eq!(reopened.status().await.unwrap(), BulkBuildStatus::Published);
     runtime.drop_index("bulk-loader").await.unwrap();
     assert_eq!(

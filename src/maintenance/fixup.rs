@@ -57,6 +57,7 @@ pub(crate) struct StepPolicy<'a> {
     pub(crate) now_unix_millis: u64,
     /// Applies to rediscovery; an already progressing worker has no age gate.
     pub(crate) recovery: Option<&'a RuntimeConfig>,
+    pub(crate) graph: Option<&'a crate::runtime::graph_maintenance::GraphMaintenance>,
     pub(crate) retry: &'a RetryPolicy,
 }
 
@@ -95,6 +96,12 @@ pub(crate) async fn advance<B: Backend>(
         )
     }) {
         return Ok(Advance::Idle);
+    }
+    if manifest.config().local_graph().is_some() {
+        return super::graph_topology::advance_observed(
+            backend, manifest, tree_key, partition, policy, authority,
+        )
+        .await;
     }
     let started_at_unix_millis = policy.now_unix_millis;
     let retry = policy.retry;

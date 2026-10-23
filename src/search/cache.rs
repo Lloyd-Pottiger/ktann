@@ -1,7 +1,7 @@
 //! Byte-bounded cache of snapshot-validated, immutable Partition search bodies.
 //!
 //! Bodies contain Child Entries or Leaf Entries, including empty partitions.
-//! Explicit fixed-index reads can attach a restored graph sharing the Child Entries.
+//! Explicit graph-index reads can attach a restored graph sharing the Child Entries.
 //! A body is reusable only when its kind and epoch match the snapshot Header.
 //! Older cached epochs are evicted; newer epochs survive historical reads.
 //! Misses load and validate complete bodies in the same transaction. Corrupt
@@ -138,8 +138,8 @@ pub(crate) enum BodyEntries {
     },
     /// The decoded Child Entries of an internal partition.
     Internal(Box<[ChildEntry]>),
-    /// A complete fixed internal partition; graph and projections have one owner.
-    FixedInternal(Box<super::local_hnsw::body::FixedInternalBody>),
+    /// A complete internal graph body; graph and projections have one owner.
+    InternalGraph(Box<super::local_hnsw::body::InternalGraphBody>),
 }
 
 /// One immutable decoded partition body with its validation epoch.
@@ -311,7 +311,9 @@ impl PartitionCache {
     ///
     /// A body larger than the capacity is skipped. An existing entry with a
     /// strictly newer epoch is never downgraded by a racing fill; an equal or
-    /// newer epoch replaces it. Installation evicts until the cache is within
+    /// newer epoch replaces it. A complete graph body retains its projections
+    /// against a racing projections-only fill at the same epoch. Installation
+    /// evicts until the cache is within
     /// its byte capacity.
     pub(crate) fn install(&self, key: CacheKey, body: Arc<CachedBody>) {
         let kind = key.kind;
@@ -325,7 +327,11 @@ impl PartitionCache {
         {
             let mut inner = self.lock();
             if let Some(existing) = inner.slots.get(&key) {
-                if existing.body.epoch > body.epoch {
+                if existing.body.epoch > body.epoch
+                    || (existing.body.epoch == body.epoch
+                        && matches!(&existing.body.entries, BodyEntries::InternalGraph(_))
+                        && matches!(&body.entries, BodyEntries::Internal(_)))
+                {
                     drop(inner);
                     metrics::cache_install(kind, CacheInstallResult::SkippedStale);
                     return;
@@ -949,7 +955,7 @@ mod tests {
                 .iter()
                 .map(|entry| entry.record_id().clone())
                 .collect(),
-            BodyEntries::Internal(_) | BodyEntries::FixedInternal(_) => {
+            BodyEntries::Internal(_) | BodyEntries::InternalGraph(_) => {
                 panic!("expected a leaf body")
             }
         }
@@ -1394,7 +1400,7 @@ mod tests {
                 let children: Vec<u64> = entries.iter().map(|entry| entry.child().get()).collect();
                 assert_eq!(children, vec![2, 3]);
             }
-            BodyEntries::Leaf { .. } | BodyEntries::FixedInternal(_) => {
+            BodyEntries::Leaf { .. } | BodyEntries::InternalGraph(_) => {
                 panic!("expected an internal body")
             }
         }

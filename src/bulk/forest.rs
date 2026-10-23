@@ -696,7 +696,7 @@ pub(super) fn binding(
     hash.update(config.max_leaf_partition_entries().to_be_bytes());
     hash.update(config.min_internal_partition_entries().to_be_bytes());
     hash.update(config.max_internal_partition_entries().to_be_bytes());
-    match config.fixed_graph() {
+    match config.local_graph() {
         None => hash.update([0]),
         Some(graph) => {
             hash.update([1]);

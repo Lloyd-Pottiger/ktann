@@ -312,7 +312,7 @@ impl WriteTxn for GatedTxn<'_> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn takeover_and_abort_fence_an_already_prepared_old_chunk() {
-    for (abort, fixed) in [(false, false), (true, false), (false, true), (true, true)] {
+    for (abort, graph) in [(false, false), (true, false), (false, true), (true, true)] {
         let dir = Directory::new();
         let memory = MemoryBackend::with_test_config(TestConfig::default());
         let gate = Arc::new(Gate::default());
@@ -325,8 +325,8 @@ async fn takeover_and_abort_fence_an_already_prepared_old_chunk() {
         )
         .unwrap();
         let config = config(Metric::L2, true);
-        let config = if fixed {
-            config.with_fixed_graph(ktann::api::FixedGraphConfig::new(2, 8, [7; 32]).unwrap())
+        let config = if graph {
+            config.with_local_graph(ktann::api::LocalGraphConfig::new(2, 8, [7; 32]).unwrap())
         } else {
             config
         };

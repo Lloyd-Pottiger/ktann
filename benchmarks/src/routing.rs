@@ -1,5 +1,5 @@
-//! Fixed-index experiment settings shared by CLI workers and reports.
-use ktann::api::{FixedGraphConfig, RoutingMode};
+//! Frozen-dataset experiment settings shared by CLI workers and reports.
+use ktann::api::{LocalGraphConfig, RoutingMode};
 use serde::{Deserialize, Serialize};
 
 /// Explicit routing comparison; global variants are benchmark-only.
@@ -21,7 +21,7 @@ pub enum Mode {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Experiment {
-    /// Routing policy; all policies use the same fixed-index serving format.
+    /// Routing policy; all policies use the same graph-index serving format.
     pub mode: Mode,
     /// Graph maximum upper-layer degree.
     pub m: u32,
@@ -99,10 +99,10 @@ impl Experiment {
     }
 
     /// Persistent graph parameters, identical across routing policies.
-    pub fn graph(&self) -> ktann::api::Result<FixedGraphConfig> {
+    pub fn graph(&self) -> ktann::api::Result<LocalGraphConfig> {
         let mut seed = [0; 32];
         seed[..8].copy_from_slice(&self.graph_seed.to_le_bytes());
-        FixedGraphConfig::new(self.m, self.ef_construction, seed)
+        LocalGraphConfig::new(self.m, self.ef_construction, seed)
     }
 
     /// Production routing selection; global policies bypass internal traversal.

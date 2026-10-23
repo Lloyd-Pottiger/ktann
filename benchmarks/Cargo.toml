@@ -50,3 +50,8 @@ xxhash-rust = { version = "=0.8.18", features = ["xxh3"] }
 [lints.rust]
 missing_docs = "deny"
 unsafe_code = "deny"
+
+[[bin]]
+name = "ktann-mutable-graph"
+path = "src/bin/mutable_graph.rs"
+required-features = ["rocksdb"]

@@ -49,10 +49,6 @@ pub(crate) async fn open_validated_write<'b, 'm, B: Backend>(
         txn.rollback().await;
         return Err(error);
     }
-    if handle_manifest.config().fixed_graph().is_some() {
-        txn.rollback().await;
-        return Err(crate::api::Error::new(ErrorKind::IndexReadOnly));
-    }
     Ok(WriteLogicalTxn::for_index(
         txn.into_raw(),
         handle_manifest,

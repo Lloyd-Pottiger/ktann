@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
 
 use super::*;
-use crate::api::{FixedGraphConfig, IndexConfig, LogicalIndexId};
+use crate::api::{IndexConfig, LocalGraphConfig, LogicalIndexId};
 use crate::search::local_hnsw::{Centroids, persistence::build_records, tests::TestGraph};
 use crate::storage::keys;
 use crate::storage::test_support::{MockReadTxn, pk};
 use crate::storage::values::expect_header;
-use crate::storage::values::{IndexLifecycle, ValueCodec};
+use crate::storage::values::{IndexLifecycle, PartitionState, ValueCodec};
 
 const W: usize = 16 * 1024 * 1024;
 
@@ -79,7 +79,7 @@ impl Fixture {
             .unwrap()
             .with_internal_partition_entries(1, count.max(2))
             .unwrap()
-            .with_fixed_graph(FixedGraphConfig::new(m, 4 * m, [9; 32]).unwrap());
+            .with_local_graph(LocalGraphConfig::new(m, 4 * m, [9; 32]).unwrap());
         let manifest = IndexManifest::new(
             IndexLifecycle::Active,
             LogicalIndexId::new(index).unwrap(),
@@ -110,7 +110,7 @@ impl Fixture {
                 tree: &tree,
                 parent: pk(1),
                 header,
-                parameters: manifest.config().fixed_graph().unwrap().parameters(),
+                parameters: manifest.config().local_graph().unwrap().parameters(),
             },
             W,
             &|| Ok(()),
@@ -367,7 +367,7 @@ async fn restored_queries_match_native_search_for_all_metrics() {
         let parameters = fixture
             .manifest
             .config()
-            .fixed_graph()
+            .local_graph()
             .unwrap()
             .parameters();
         let core = TestGraph::build(
@@ -599,4 +599,43 @@ async fn warm_validation_rejects_changed_binding() {
         fixture.read(&cache, W, 0).await.err().unwrap().kind(),
         ErrorKind::Corruption
     );
+}
+
+#[tokio::test]
+async fn projection_cache_upgrades_to_graph_and_ignores_same_epoch_projection_fill() {
+    let fixture = Fixture::new(Metric::L2, 1, 1);
+    let source_cache = PartitionCache::new(W as u64);
+    let graph = fixture.load(&source_cache).await;
+    let key = CacheKey::new(
+        fixture.manifest.logical_index_id(),
+        fixture.tree.clone(),
+        pk(1),
+        PartitionKind::Internal,
+    );
+    let projections = Arc::new(CachedBody::internal(
+        fixture.header.cache_epoch(),
+        graph.children().to_vec(),
+    ));
+    let cache = PartitionCache::new(W as u64);
+    cache.install(key.clone(), Arc::clone(&projections));
+    let upgraded = fixture.load(&cache).await;
+    assert_eq!(upgraded.children(), graph.children());
+    let complete = cache.lookup(&key, fixture.header.cache_epoch()).unwrap();
+    assert!(matches!(&complete.entries, BodyEntries::InternalGraph(_)));
+
+    // An exact-routing scan can have started before the graph was published.
+    // Its later same-epoch fill must retain the complete graph and projections.
+    cache.install(key.clone(), projections);
+    let retained = cache.lookup(&key, fixture.header.cache_epoch()).unwrap();
+    assert!(Arc::ptr_eq(&complete, &retained));
+    let loaded = fixture.read(&cache, W, 0).await.unwrap();
+    assert!(matches!(loaded, GraphRead::Cached(_)));
+
+    let next_epoch = fixture.header.cache_epoch() + 1;
+    cache.install(
+        key.clone(),
+        Arc::new(CachedBody::internal(next_epoch, graph.children().to_vec())),
+    );
+    let newer = cache.lookup(&key, next_epoch).unwrap();
+    assert!(matches!(&newer.entries, BodyEntries::Internal(_)));
 }

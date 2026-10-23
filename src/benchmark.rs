@@ -1,7 +1,7 @@
 //! Experimental benchmark helpers, excluded from production builds.
 pub use crate::search::local_hnsw::benchmark::GlobalLeafRouter;
 
-/// Untimed quality diagnostics for one fixed-index query. Retains only truth IDs
+/// Untimed quality diagnostics for one graph-index query. Retains only truth IDs
 /// and selected leaf identities, never a second copy of the candidate pool.
 #[derive(Clone, Debug)]
 pub struct SearchDiagnostics {
@@ -51,7 +51,7 @@ pub(crate) async fn leaf_layout_fingerprint<B: crate::storage::backend::Backend>
     else {
         return Err(corrupt());
     };
-    if manifest.config().fixed_graph().is_none() || !manifest.config().tree_key_fields().is_empty()
+    if manifest.config().local_graph().is_none() || !manifest.config().tree_key_fields().is_empty()
     {
         return Err(Error::invalid_argument());
     }

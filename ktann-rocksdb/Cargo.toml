@@ -15,6 +15,7 @@ rocksdb = { version = "0.24", default-features = false, features = ["bindgen-run
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 
 [dev-dependencies]
+tokio-util = { version = "0.7", features = ["rt"] }
 metrics-util = "0.20"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "time"] }

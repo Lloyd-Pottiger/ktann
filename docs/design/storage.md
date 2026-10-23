@@ -187,9 +187,11 @@ Graph Descriptor and Graph Chunk values use tags `0x12` and `0x13`; their
 partition subkeys are `0x06` and `0x07`. Chunk keys end in a big-endian u32
 ordinal. Every complete graph value is at most 100,000 bytes. The descriptor binds
 one immutable topology to its source Header and canonical Child Entries;
-structural and digest validation precede native allocation. The exact envelope,
-topology grammar, source digest, and loading budget belong to
-[the local graph format](partition-local-hnsw.md#6-persisted-graph-and-snapshot-binding).
+structural and digest validation precede native allocation. The
+[graph codec](../../src/storage/values/graph.rs) defines the envelopes, and the
+[native stream validator](../../ktann-usearch/src/persistence.rs) defines the
+supported topology layout. Source binding and loading constraints belong to
+[the local graph design](partition-local-hnsw.md#persistence-and-snapshot-binding).
 Generic typed transactions support both families; `LogicalRange::graph_chunks`
 scans the complete chunk range with ordinary snapshot pagination. Producing
 these records alone does not authorize serving publication.
@@ -319,23 +321,29 @@ and cross-process deterministic vectors for rotation, Bloom, Tree Key, values,
 and RaBitQ7. Model tests assert that typed atomic operations preserve exact
 membership under conflicts and injected unknown outcomes.
 
-### Fixed Bulk Build metadata
+### Graph configuration and Bulk Build metadata
 
-The immutable Index Configuration stores an optional FixedGraphConfig (`M`,
-`ef_construction`, seed). Its Manifest encoding places a mode byte after the four
-capacity u32s: 0 for mutable, 1 followed by M:u32, ef_construction:u32 and seed:32
-for fixed, then the existing rotation seed. Build Descriptor encoding appends a
-refinement byte after construction budgets: 0 means omitted, 1..6 represent
+The immutable Index Configuration stores an optional LocalGraphConfig (`M`,
+`ef_construction`, seed). Its Manifest encoding places an option tag after the four
+capacity u32s: 0 for no graph, 1 followed by M:u32, ef_construction:u32 and seed:32
+for a local graph, then the existing rotation seed. Other tags are invalid. Build
+Descriptor encoding appends a refinement byte after construction budgets: 0 means omitted, 1..6 represent
 zero..five rounds. Worker options encode graph and refinement memory u64 limits
 after serving scratch and before artifact/load limits. These unreleased formats
 change directly; no migration or compatibility path exists.
 
 Final graph descriptor/chunks are ordinary Serving Artifact entries. Completed
 Build Load seals them with the Child Entries; exact publication validation covers
-all their bytes. The write-attempt owner rejects fixed Active mutations and
-maintenance while lifecycle/drop and fenced Building writes retain their authority.
+all their bytes. Building remains isolated from ordinary reads, mutations and
+maintenance until publication; published graph indexes use ordinary write admission.
 
 Ordinary local-graph replacements use one transaction for all chunks, stale-tail
 chunk deletion, the descriptor and authoritative projections. There is no graph
 staging namespace or maintenance record. The bounded configuration and topology
-contract is owned by [the local graph design](partition-local-hnsw.md#ordinary-ready-partition-updates).
+contract is owned by [the local graph design](partition-local-hnsw.md#local-graph-transitions).
+
+Graph-aware topology composes every participating replacement in that same
+transaction. `WriteLogicalTxn::affected_bytes` accounts for protected point reads,
+mutation keys/values, range endpoints and physical key overhead; topology and graph
+authority mutations share the 900,000-byte non-payload envelope before graph
+payloads are admitted. Empty internal bodies have no descriptor or chunks.
