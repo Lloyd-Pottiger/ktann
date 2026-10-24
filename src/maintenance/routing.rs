@@ -239,6 +239,7 @@ pub async fn route_leaf_for_write_with_beam<T: WriteTxn>(
         &[&routing],
         write_beam_size,
         None,
+        None,
     )
     .await?;
     match descent {
@@ -280,6 +281,10 @@ pub(crate) enum GroupedDescent {
 /// This is the foreground pre-mutation phase: internal bodies must still be
 /// committed snapshot data. Only lazy creation of a new leaf root may have
 /// staged writes. Never use this entry point after staging internal changes.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "snapshot routing inputs and operation control"
+)]
 pub(crate) async fn route_leaves_for_write_preprocessed<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     tree_key: &TreeKey,
@@ -288,6 +293,7 @@ pub(crate) async fn route_leaves_for_write_preprocessed<T: WriteTxn>(
     started_at_unix_millis: u64,
     write_beam_size: u32,
     cache: &PartitionCache,
+    control: Option<&crate::runtime::WriteRoutingControl>,
 ) -> Result<GroupedDescent> {
     let manifest = txn.require_manifest()?;
     if write_beam_size == 0 {
@@ -312,6 +318,7 @@ pub(crate) async fn route_leaves_for_write_preprocessed<T: WriteTxn>(
         routings,
         write_beam_size,
         Some(cache),
+        control,
     )
     .await?;
     if let GroupedDescent::Routed(routes) = &descent {
@@ -541,6 +548,7 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
     routings: &[&[f32]],
     write_beam_size: u32,
     cache: Option<&PartitionCache>,
+    control: Option<&crate::runtime::WriteRoutingControl>,
 ) -> Result<GroupedDescent> {
     let mut routes: Vec<Option<(f64, Route)>> = vec![None; routings.len()];
     let mut pending: BTreeMap<(PartitionKey, Option<u32>), Vec<PendingBeamMember>> =
@@ -836,47 +844,182 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
             let nearest = nearest
                 .as_mut()
                 .ok_or_else(|| Error::new(ErrorKind::Backend))?;
-            scan_bodies(
-                reader,
-                manifest,
-                tree_key,
-                &bodies,
-                cache,
-                &mut |index, entry| {
-                    let (body, _) = bodies[index];
-                    if incoming_owners
-                        .insert(entry.child(), body)
-                        .is_some_and(|owner| owner != body)
-                    {
-                        return Err(Error::new(ErrorKind::Corruption));
+            #[cfg(feature = "benchmark")]
+            let experiment =
+                cache.filter(|_| manifest.config().local_graph().is_some() && control.is_some());
+            #[cfg(not(feature = "benchmark"))]
+            let experiment: Option<&PartitionCache> = None;
+            if let Some(cache) = experiment {
+                let control = control.expect("experimental write route owns control");
+                let check = || control.checkpoint();
+                check()?;
+                // Charge borrowed query vectors and wave bookkeeping in addition
+                // to the one graph body/scratch admitted by read_graph.
+                let limit = || Error::new(ErrorKind::LimitExceeded);
+                let query_bytes = routings
+                    .len()
+                    .checked_mul(
+                        manifest.config().dimension() * 4 + write_beam_size as usize * 128 + 256,
+                    )
+                    .ok_or_else(limit)?;
+                let bookkeeping = bodies.iter().try_fold(query_bytes, |bytes, (_, header)| {
+                    bytes
+                        .checked_add(header.entry_count() as usize * 128)
+                        .ok_or_else(limit)
+                })?;
+                let working_bytes = control
+                    .working_bytes
+                    .checked_sub(bookkeeping)
+                    .ok_or_else(limit)?;
+
+                // Isolated benchmark prototype: committed pre-mutation inputs only.
+                // Keep complete-body ownership checks and the normal final validation.
+                for (index, (body, header)) in bodies.iter().enumerate() {
+                    if header.entry_count() == 0 {
+                        // Empty split-family bodies still require the original
+                        // exact count check; a stray entry is corruption.
+                        scan_bodies(
+                            reader,
+                            manifest,
+                            tree_key,
+                            &[(*body, *header)],
+                            None,
+                            &mut |_, _| Err(Error::new(ErrorKind::Corruption)),
+                        )
+                        .await?;
+                        continue;
                     }
-                    // Queries came from preprocess; Child Entry decoding checked
-                    // centroid dimensions and finite components before either
-                    // streaming them or filling the epoch-validated body cache.
-                    // Reuse those invariants across all distances in this body.
-                    let (groups, remainder) = body_members[index].as_chunks::<4>();
-                    for group in groups {
-                        let vectors =
-                            std::array::from_fn::<_, 4, _>(|lane| routings[group[lane].0]);
-                        let distances =
-                            kernel.routing_distances_validated(vectors, entry.centroid());
-                        for (&(member, repetitions), distance) in group.iter().zip(distances) {
+                    use crate::search::cache::{
+                        BodyRequest,
+                        graph::{GraphRead, read_graph},
+                    };
+                    let forced_cache = std::env::var_os("KTANN_FORCE_GRAPH_MISS")
+                        .map(|_| PartitionCache::new(working_bytes as u64));
+                    let cache = forced_cache.as_ref().unwrap_or(cache);
+                    let phase = std::time::Instant::now();
+                    let input = read_graph(
+                        reader,
+                        cache,
+                        manifest,
+                        BodyRequest {
+                            tree_key,
+                            partition: *body,
+                            header,
+                        },
+                        working_bytes,
+                        0,
+                        &check,
+                    )
+                    .await?;
+                    ::metrics::histogram!("ktann.experiment.graph_read")
+                        .record(phase.elapsed().as_secs_f64());
+                    let phase = std::time::Instant::now();
+                    let graph = match input {
+                        GraphRead::Cached(graph) => graph,
+                        GraphRead::Load(load) => {
+                            tokio::task::block_in_place(|| load.restore(cache, &check))?
+                        }
+                    };
+                    ::metrics::histogram!("ktann.experiment.graph_restore")
+                        .record(phase.elapsed().as_secs_f64());
+                    let phase = std::time::Instant::now();
+                    for entry in graph.children() {
+                        check()?;
+                        if incoming_owners
+                            .insert(entry.child(), *body)
+                            .is_some_and(|owner| owner != *body)
+                        {
+                            return Err(Error::new(ErrorKind::Corruption));
+                        }
+                    }
+                    ::metrics::histogram!("ktann.experiment.ownership")
+                        .record(phase.elapsed().as_secs_f64());
+                    tokio::task::block_in_place(|| -> Result<()> {
+                        let phase = std::time::Instant::now();
+                        let mut scratch = graph.write_workspace()?;
+                        ::metrics::histogram!("ktann.experiment.workspace")
+                            .record(phase.elapsed().as_secs_f64());
+                        for &(member, repetitions) in &body_members[index] {
+                            let phase = std::time::Instant::now();
+                            let (hits, stats) = graph.write_search(
+                                routings[member],
+                                nearest[member].beam,
+                                &mut scratch,
+                                &check,
+                            )?;
+                            ::metrics::histogram!("ktann.experiment.search")
+                                .record(phase.elapsed().as_secs_f64());
+                            let phase = std::time::Instant::now();
+                            ::metrics::counter!("ktann.experiment.write_distances")
+                                .increment(stats.distances as u64);
+                            for (child, distance) in hits {
+                                let ordinal = graph
+                                    .children()
+                                    .binary_search_by_key(&child, ChildEntry::child)
+                                    .map_err(|_| Error::new(ErrorKind::Corruption))?;
+                                for _ in 0..repetitions {
+                                    nearest[member].consider(
+                                        distance,
+                                        &graph.children()[ordinal],
+                                        *body,
+                                    );
+                                }
+                            }
+                            ::metrics::histogram!("ktann.experiment.merge")
+                                .record(phase.elapsed().as_secs_f64());
+                        }
+                        Ok(())
+                    })?;
+                }
+            } else {
+                scan_bodies(
+                    reader,
+                    manifest,
+                    tree_key,
+                    &bodies,
+                    if cfg!(feature = "benchmark")
+                        && std::env::var_os("KTANN_FORCE_GRAPH_MISS").is_some()
+                    {
+                        None
+                    } else {
+                        cache
+                    },
+                    &mut |index, entry| {
+                        let (body, _) = bodies[index];
+                        if incoming_owners
+                            .insert(entry.child(), body)
+                            .is_some_and(|owner| owner != body)
+                        {
+                            return Err(Error::new(ErrorKind::Corruption));
+                        }
+                        // Queries came from preprocess; Child Entry decoding checked
+                        // centroid dimensions and finite components before either
+                        // streaming them or filling the epoch-validated body cache.
+                        // Reuse those invariants across all distances in this body.
+                        let (groups, remainder) = body_members[index].as_chunks::<4>();
+                        for group in groups {
+                            let vectors =
+                                std::array::from_fn::<_, 4, _>(|lane| routings[group[lane].0]);
+                            let distances =
+                                kernel.routing_distances_validated(vectors, entry.centroid());
+                            for (&(member, repetitions), distance) in group.iter().zip(distances) {
+                                for _ in 0..repetitions {
+                                    nearest[member].consider(distance, entry, body);
+                                }
+                            }
+                        }
+                        for &(member, repetitions) in remainder {
+                            let [distance] = kernel
+                                .routing_distances_validated([routings[member]], entry.centroid());
                             for _ in 0..repetitions {
                                 nearest[member].consider(distance, entry, body);
                             }
                         }
-                    }
-                    for &(member, repetitions) in remainder {
-                        let [distance] = kernel
-                            .routing_distances_validated([routings[member]], entry.centroid());
-                        for _ in 0..repetitions {
-                            nearest[member].consider(distance, entry, body);
-                        }
-                    }
-                    Ok(())
-                },
-            )
-            .await?;
+                        Ok(())
+                    },
+                )
+                .await?;
+            }
         }
 
         // Child candidates from this wave become the next wave only after the

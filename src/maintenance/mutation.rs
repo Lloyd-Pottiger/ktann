@@ -99,6 +99,7 @@ pub(crate) async fn mutate<B: Backend>(
     let kernel = routing::kernel_for(handle_manifest)?;
     let prepared = prepare_all(handle_manifest, &kernel, mutations)?;
     let write_beam_size = context.write_beam_size();
+    let routing_control = context.write_routing_control();
     let cache = context.partition_cache();
     let backend = context.backend();
     let mut failed_attempts = 0_u32;
@@ -117,6 +118,7 @@ pub(crate) async fn mutate<B: Backend>(
                     &prepared,
                     write_beam_size,
                     &cache,
+                    routing_control.as_ref(),
                 ))
             },
         )
@@ -163,20 +165,30 @@ async fn apply_all<T: WriteTxn>(
     prepared: &[Option<PreparedRecord>],
     write_beam_size: u32,
     cache: &crate::search::cache::PartitionCache,
+    control: Option<&crate::runtime::WriteRoutingControl>,
 ) -> Result<ApplyOutcome> {
     debug_assert_eq!(mutations.len(), prepared.len());
     let started_at = now_unix_millis();
     let routing_timer = metrics::mutation_stage_started(MutationStage::Routing);
-    let (targets, draining_sources) =
-        match route_all(txn, kernel, prepared, started_at, write_beam_size, cache).await? {
-            RouteAll::Routed {
-                targets,
-                draining_sources,
-            } => (targets, draining_sources),
-            // Routing queues no writes, so an attempt abandoned here commits
-            // nothing and retries whole.
-            RouteAll::NoReadyMergeTarget => return Ok(ApplyOutcome::NoReadyMergeTarget),
-        };
+    let (targets, draining_sources) = match route_all(
+        txn,
+        kernel,
+        prepared,
+        started_at,
+        write_beam_size,
+        cache,
+        control,
+    )
+    .await?
+    {
+        RouteAll::Routed {
+            targets,
+            draining_sources,
+        } => (targets, draining_sources),
+        // Routing queues no writes, so an attempt abandoned here commits
+        // nothing and retries whole.
+        RouteAll::NoReadyMergeTarget => return Ok(ApplyOutcome::NoReadyMergeTarget),
+    };
     drop(routing_timer);
     let prefetch_timer = metrics::mutation_stage_started(MutationStage::Prefetch);
     let mut expected = read_locations(txn, mutations).await?;
@@ -260,6 +272,7 @@ async fn route_all<T: WriteTxn>(
     started_at: u64,
     write_beam_size: u32,
     cache: &crate::search::cache::PartitionCache,
+    control: Option<&crate::runtime::WriteRoutingControl>,
 ) -> Result<RouteAll> {
     let mut targets: Vec<Option<RecordLocation>> = vec![None; prepared.len()];
     let mut draining_sources = Vec::new();
@@ -293,6 +306,7 @@ async fn route_all<T: WriteTxn>(
             started_at,
             write_beam_size,
             cache,
+            control,
         )
         .await
         .map_err(|error| error.at_position(group.first_position))?

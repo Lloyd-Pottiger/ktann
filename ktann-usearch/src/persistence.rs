@@ -100,6 +100,8 @@ impl Graph {
         let mut bytes = reserved(length)?;
         bytes.resize(length, 0);
         let context = MetricContext {
+            four: None,
+            tails: false,
             distance: &|_, _| unreachable!(),
             check,
         };
@@ -219,6 +221,8 @@ impl Graph {
         }
         drop((levels, offsets, seen, pending));
         let context = MetricContext {
+            four: None,
+            tails: false,
             distance: &|_, _| unreachable!(),
             check,
         };
@@ -395,6 +399,8 @@ mod tests {
         // at its actual allocation boundaries, including partially loaded graphs.
         for (n, m, bytes) in [(1, 32768, bytes), (3, 2, topology())] {
             let context = MetricContext {
+                four: None,
+                tails: false,
                 distance: &|_, _| unreachable!(),
                 check: &|| true,
             };
@@ -420,6 +426,8 @@ mod tests {
                 true
             };
             let context = MetricContext {
+                four: None,
+                tails: false,
                 distance: &|_, _| unreachable!(),
                 check: &count,
             };
@@ -432,6 +440,8 @@ mod tests {
                     step != stop
                 };
                 let context = MetricContext {
+                    four: None,
+                    tails: false,
                     distance: &|_, _| unreachable!(),
                     check: &check,
                 };

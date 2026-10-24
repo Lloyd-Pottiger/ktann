@@ -663,9 +663,9 @@ impl BodyRead {
 
 impl BodyScan {
     /// Decodes unpublished data. The caller owns validation and cache publication.
-    async fn read<T: ReadOps>(
+    async fn read<T: crate::storage::LogicalReader>(
         self: Box<Self>,
-        txn: &mut ReadLogicalTxn<'_, T>,
+        txn: &mut T,
         manifest: &IndexManifest,
         check: &(dyn Fn() -> Result<()> + Sync),
     ) -> Result<(BodyEntries, u64)> {

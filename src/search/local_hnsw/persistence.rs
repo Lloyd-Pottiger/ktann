@@ -20,6 +20,7 @@ pub(crate) struct GraphSource<'a> {
 pub(crate) struct GraphRecords {
     pub(crate) descriptor: GraphDescriptor,
     body: Bytes,
+    pub(crate) ready: Option<(ktann_usearch::Graph, [u8; 32])>,
 }
 
 impl GraphRecords {
@@ -111,6 +112,8 @@ pub(crate) fn build_records(
     working_bytes: usize,
     check: &dyn Fn() -> Result<()>,
 ) -> Result<GraphRecords> {
+    #[cfg(feature = "benchmark")]
+    let phase = crate::benchmark::MaintenanceTimer::new("native_build");
     let (graph, identity) = build_graph(
         centroids,
         source.parameters,
@@ -119,11 +122,13 @@ pub(crate) fn build_records(
         working_bytes,
         check,
     )?;
+    #[cfg(feature = "benchmark")]
+    drop(phase);
     ::metrics::histogram!("ktann.routing.native_build_peak_bytes")
         .record(graph.peak_bytes() as f64);
-    persist_graph(
+    finish_records(
         centroids,
-        &graph,
+        graph,
         identity,
         source.index,
         source.header,
@@ -165,7 +170,12 @@ pub(crate) fn update_records(
     let restore_budget = working_bytes
         .checked_sub(next.bytes + mapping_bytes)
         .ok_or_else(limit)?;
+    #[cfg(feature = "benchmark")]
+    let phase = crate::benchmark::MaintenanceTimer::new("restore");
     let (graph, _) = restore_graph(old, source, descriptor, chunks, restore_budget, check)?;
+    #[cfg(feature = "benchmark")]
+    drop(phase);
+
     // Maintenance removes old child edges without changing surviving centroids.
     // Keep this common path inside the private graph preparation boundary.
     if next.children.len() < old.children.len() {
@@ -196,6 +206,8 @@ pub(crate) fn update_records(
                     next.children[b as usize].centroid(),
                 )
             };
+            #[cfg(feature = "benchmark")]
+            let phase = crate::benchmark::MaintenanceTimer::new("retain");
             let graph = controlled(check, |proceed| {
                 graph.retain(
                     &survivors,
@@ -205,10 +217,12 @@ pub(crate) fn update_records(
                     proceed,
                 )
             })?;
+            #[cfg(feature = "benchmark")]
+            drop(phase);
             let identity = identity(next, source.parameters, source.tree, source.parent, check)?;
-            return persist_graph(
+            return finish_records(
                 next,
-                &graph,
+                graph,
                 identity,
                 source.index,
                 next_header,
@@ -270,6 +284,8 @@ pub(crate) fn update_records(
             next.children[mapping[b as usize] as usize].centroid(),
         )
     };
+    #[cfg(feature = "benchmark")]
+    let phase = crate::benchmark::MaintenanceTimer::new("evolve");
     let graph = controlled(check, |proceed| {
         graph.evolve(
             &mapping,
@@ -282,10 +298,12 @@ pub(crate) fn update_records(
             proceed,
         )
     })?;
+    #[cfg(feature = "benchmark")]
+    drop(phase);
     let identity = identity(next, source.parameters, source.tree, source.parent, check)?;
-    persist_graph(
+    finish_records(
         next,
-        &graph,
+        graph,
         identity,
         source.index,
         next_header,
@@ -294,6 +312,33 @@ pub(crate) fn update_records(
             .ok_or_else(limit)?,
         check,
     )
+}
+
+/// Retains already-prepared immutable topology only for the opt-in publication experiment.
+fn finish_records(
+    centroids: Centroids<'_>,
+    graph: ktann_usearch::Graph,
+    identity: [u8; 32],
+    index: LogicalIndexId,
+    header: PartitionHeader,
+    working_bytes: usize,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<GraphRecords> {
+    #[cfg(feature = "benchmark")]
+    let _encode_timer = crate::benchmark::MaintenanceTimer::new("encode");
+    let mut records = persist_graph(
+        centroids,
+        &graph,
+        identity,
+        index,
+        header,
+        working_bytes,
+        check,
+    )?;
+    if cfg!(feature = "benchmark") && std::env::var_os("KTANN_EXPERIMENT_PUBLISH_READY").is_some() {
+        records.ready = Some((graph, identity));
+    }
+    Ok(records)
 }
 
 pub(super) fn persist_graph(
@@ -326,7 +371,11 @@ pub(super) fn persist_graph(
         binding: binding(identity, index, header),
         sha256: hash.finalize().into(),
     };
-    Ok(GraphRecords { descriptor, body })
+    Ok(GraphRecords {
+        descriptor,
+        body,
+        ready: None,
+    })
 }
 
 /// Loads a complete ordered chunk stream. The caller must use the same

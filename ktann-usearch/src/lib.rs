@@ -35,6 +35,9 @@ mod ffi {
         type MetricContext<'a>;
         fn measure(context: &MetricContext, a: u32, b: u32) -> f64;
         fn proceed(context: &MetricContext) -> bool;
+        fn has_four(context: &MetricContext) -> bool;
+        fn has_tails(context: &MetricContext) -> bool;
+        fn measure_four(context: &MetricContext, a: u32, nodes: &[u32], output: &mut [f64]);
     }
 
     unsafe extern "C++" {
@@ -142,15 +145,34 @@ impl From<cxx::Exception> for Error {
     }
 }
 
+/// Synchronous ordered scoring of two through four requested node ordinals.
+pub type DistanceBatch<'a> = dyn Fn(u32, &[u32], &mut [f64]) + 'a;
+
 // Opaque borrowed callbacks live only for a synchronous native call. C++ never
 // retains them, invokes them on other threads, or unwinds through a Rust frame.
 struct MetricContext<'a> {
     distance: &'a dyn Fn(u32, u32) -> f64,
+    four: Option<&'a DistanceBatch<'a>>,
+    tails: bool,
     check: &'a dyn Fn() -> bool,
 }
 
 fn measure(context: &MetricContext<'_>, a: u32, b: u32) -> f64 {
     (context.distance)(a, b)
+}
+
+/// Four ordered native ordinals; no callback or borrowed vector escapes this call.
+fn has_four(context: &MetricContext<'_>) -> bool {
+    context.four.is_some()
+}
+
+fn measure_four(context: &MetricContext<'_>, a: u32, nodes: &[u32], output: &mut [f64]) {
+    assert!((2..=4).contains(&nodes.len()) && nodes.len() == output.len());
+    context.four.expect("enabled native batch")(a, nodes, output);
+}
+
+fn has_tails(context: &MetricContext<'_>) -> bool {
+    context.tails
 }
 
 fn proceed(context: &MetricContext<'_>) -> bool {
@@ -257,7 +279,12 @@ impl Graph {
         {
             return Err(Error::InvalidArgument);
         }
-        let context = MetricContext { distance, check };
+        let context = MetricContext {
+            distance,
+            four: None,
+            tails: false,
+            check,
+        };
         let inner = ffi::evolve(
             self.inner,
             mapping,
@@ -293,7 +320,12 @@ impl Graph {
         {
             return Err(Error::InvalidArgument);
         }
-        let context = MetricContext { distance, check };
+        let context = MetricContext {
+            distance,
+            four: None,
+            tails: false,
+            check,
+        };
         let inner = ffi::retain(self.inner, survivors, ef.min(n) as u32, limit, &context)?;
         Ok(Self {
             inner,
@@ -321,7 +353,12 @@ impl Graph {
         if build_bound(n, m)? > limit {
             return Err(Error::LimitExceeded);
         }
-        let context = MetricContext { distance, check };
+        let context = MetricContext {
+            distance,
+            four: None,
+            tails: false,
+            check,
+        };
         let inner = ffi::build(
             n as u32,
             m as u32,
@@ -349,7 +386,41 @@ impl Graph {
         if ef == 0 || output.len() > self.n || scratch.n < self.n || scratch.m < self.m {
             return Err(Error::InvalidArgument);
         }
-        let context = MetricContext { distance, check };
+        let context = MetricContext {
+            distance,
+            four: None,
+            tails: false,
+            check,
+        };
+        Ok(self.inner.search(
+            ef.max(output.len()).min(self.n) as u32,
+            &context,
+            scratch.inner.pin_mut(),
+            output,
+        )?)
+    }
+
+    /// Experimental four-lane scoring with identical traversal and scalar tails.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_four(
+        &self,
+        ef: usize,
+        distance: &dyn Fn(u32, u32) -> f64,
+        four: &DistanceBatch<'_>,
+        tails: bool,
+        check: &dyn Fn() -> bool,
+        scratch: &mut Workspace,
+        output: &mut [Hit],
+    ) -> Result<Stats, Error> {
+        if ef == 0 || output.len() > self.n || scratch.n < self.n || scratch.m < self.m {
+            return Err(Error::InvalidArgument);
+        }
+        let context = MetricContext {
+            distance,
+            four: Some(four),
+            tails,
+            check,
+        };
         Ok(self.inner.search(
             ef.max(output.len()).min(self.n) as u32,
             &context,
@@ -561,5 +632,182 @@ mod atomic_size_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod quartet_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    /// Batched callbacks preserve distance bits, request order and traversal work.
+    #[test]
+    fn quartets_match_scalar_traces_and_reuse() {
+        for n in [17, 128, 374] {
+            for dot in [false, true] {
+                let rows: Vec<[f64; 8]> = (0..=n)
+                    .map(|i| {
+                        std::array::from_fn(|d| {
+                            // Repeated rows exercise ordinal tie-breaking.
+                            (((i / 2 + 1) * (d + 7) * 73) % 251) as f64 / 251.0
+                        })
+                    })
+                    .collect();
+                let distance = |a: u32, b: u32| {
+                    let mut value = 0.0;
+                    for (av, bv) in rows[a as usize].iter().zip(&rows[b as usize]) {
+                        value += if dot {
+                            *av * *bv
+                        } else {
+                            let delta = *av - *bv;
+                            delta * delta
+                        };
+                    }
+                    if dot { -value } else { value }
+                };
+                let graph = Graph::build(
+                    n,
+                    16,
+                    64,
+                    19,
+                    build_bound(n, 16).unwrap(),
+                    &distance,
+                    &|| true,
+                )
+                .unwrap();
+                let mut scratch = Workspace::new(n, 16, workspace_bound(n, 16).unwrap()).unwrap();
+                for query in 0..n.min(32) as u32 {
+                    for (beam, tails) in [1, 4, 64.min(n), n]
+                        .into_iter()
+                        .flat_map(|beam| [(beam, false), (beam, true)])
+                    {
+                        let scalar_trace = RefCell::new(Vec::new());
+                        let batch_trace = RefCell::new(Vec::new());
+                        let score = |node| distance(query, node);
+                        let scalar = |a, b| {
+                            scalar_trace.borrow_mut().push((a, b));
+                            score(b)
+                        };
+                        let tail = |a, b| {
+                            batch_trace.borrow_mut().push((a, b));
+                            score(b)
+                        };
+                        let four = |a, nodes: &[u32], output: &mut [f64]| {
+                            for (&b, value) in nodes.iter().zip(output) {
+                                batch_trace.borrow_mut().push((a, b));
+                                *value = score(b);
+                            }
+                        };
+                        let mut expected = vec![Hit::default(); beam];
+                        let mut actual = expected.clone();
+                        let scalar_stats = graph
+                            .search(64, &scalar, &|| true, &mut scratch, &mut expected)
+                            .unwrap();
+                        let batch_stats = graph
+                            .search_four(
+                                64,
+                                &tail,
+                                &four,
+                                tails,
+                                &|| true,
+                                &mut scratch,
+                                &mut actual,
+                            )
+                            .unwrap();
+                        assert_eq!(scalar_trace.into_inner(), batch_trace.into_inner());
+                        assert_eq!(scalar_stats.distances, batch_stats.distances);
+                        assert_eq!(scalar_stats.visits, batch_stats.visits);
+                        for (a, b) in expected.iter().zip(actual) {
+                            assert_eq!(a.node, b.node);
+                            assert_eq!(a.distance.to_bits(), b.distance.to_bits());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Native cancellation and invalid batched scores return through CXX safely.
+    #[test]
+    fn quartets_reject_invalid_scores_and_cancel_then_reuse() {
+        let n = 374;
+        let distance = |a: u32, b: u32| (f64::from(a) - f64::from(b)).powi(2);
+        let graph = Graph::build(
+            n,
+            16,
+            64,
+            7,
+            build_bound(n, 16).unwrap(),
+            &distance,
+            &|| true,
+        )
+        .unwrap();
+        let mut scratch = Workspace::new(n, 16, workspace_bound(n, 16).unwrap()).unwrap();
+        let mut output = [Hit::default(); 4];
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(matches!(
+                graph.search_four(
+                    64,
+                    &distance,
+                    &|_, _, output| output.fill(invalid),
+                    true,
+                    &|| true,
+                    &mut scratch,
+                    &mut output
+                ),
+                Err(Error::InvalidArgument)
+            ));
+        }
+        // Safe callbacks may leave output lanes untouched; reject those scores.
+        for tails in [false, true] {
+            for written in [0, 1] {
+                assert!(matches!(
+                    graph.search_four(
+                        64,
+                        &distance,
+                        &|a, nodes, output| {
+                            for i in 0..written {
+                                output[i] = distance(a, nodes[i]);
+                            }
+                        },
+                        tails,
+                        &|| true,
+                        &mut scratch,
+                        &mut output,
+                    ),
+                    Err(Error::InvalidArgument)
+                ));
+            }
+        }
+        let calls = Cell::new(0);
+        let four = |a, nodes: &[u32], output: &mut [f64]| {
+            calls.set(calls.get() + 1);
+            for (&b, value) in nodes.iter().zip(output) {
+                *value = distance(a, b);
+            }
+        };
+        assert!(matches!(
+            graph.search_four(
+                64,
+                &distance,
+                &four,
+                true,
+                &|| calls.get() == 0,
+                &mut scratch,
+                &mut output
+            ),
+            Err(Error::Cancelled)
+        ));
+        graph
+            .search_four(
+                64,
+                &distance,
+                &four,
+                true,
+                &|| true,
+                &mut scratch,
+                &mut output,
+            )
+            .unwrap();
     }
 }

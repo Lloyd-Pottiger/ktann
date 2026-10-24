@@ -181,7 +181,8 @@ impl<B: Backend> Runtime<B> {
         let partition_cache = Arc::new(PartitionCache::new(config.partition_cache_bytes()));
         let maintenance_cancel = CancellationToken::new();
         let graph_maintenance =
-            graph_maintenance::GraphMaintenance::new(&config, maintenance_cancel.clone());
+            graph_maintenance::GraphMaintenance::new(&config, maintenance_cancel.clone())
+                .with_cache(Arc::clone(&partition_cache));
         let runtime = Self {
             handle: Arc::new(RuntimeHandle {
                 inner: Arc::new(RuntimeInner {
@@ -403,11 +404,27 @@ impl<B: Backend> Drop for RuntimeHandle<B> {
     }
 }
 
+/// Control and per-operation memory envelope for the opt-in write graph route.
+/// Synchronous block_in_place work stays inside its admitted foreground task;
+/// it cannot outlive that task's admission or borrow transaction state elsewhere.
+#[derive(Clone)]
+pub(crate) struct WriteRoutingControl {
+    options: OperationOptions,
+    pub(crate) working_bytes: usize,
+}
+
+impl WriteRoutingControl {
+    pub(crate) fn checkpoint(&self) -> Result<()> {
+        check_control(&self.options)
+    }
+}
+
 pub(crate) struct OperationContext<B: Backend> {
     bulk_authority: Option<[u8; 32]>,
     backend: Arc<B>,
     options: OperationOptions,
     write_beam_size: u32,
+    routing_working_bytes: usize,
     partition_cache: Arc<PartitionCache>,
     commit_start: Option<CommitStart>,
     // Foreground CPU tasks retain this shared admission through actual task exit.
@@ -415,6 +432,14 @@ pub(crate) struct OperationContext<B: Backend> {
 }
 
 impl<B: Backend> OperationContext<B> {
+    pub(crate) fn write_routing_control(&self) -> Option<WriteRoutingControl> {
+        (cfg!(feature = "benchmark") && std::env::var_os("KTANN_EXPERIMENT_WRITE_HNSW").is_some())
+            .then(|| WriteRoutingControl {
+                options: self.options.clone(),
+                working_bytes: self.routing_working_bytes,
+            })
+    }
+
     pub(crate) fn backend(&self) -> Arc<B> {
         Arc::clone(&self.backend)
     }
@@ -591,6 +616,7 @@ impl<B: Backend> RuntimeInner<B> {
             backend,
             options,
             write_beam_size: self.config.write_beam_size(),
+            routing_working_bytes: self.config.routing_working_bytes(),
             partition_cache: self.partition_cache(),
             commit_start: Some(commit_start),
             cpu_admission,

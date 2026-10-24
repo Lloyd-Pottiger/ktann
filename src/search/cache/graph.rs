@@ -109,7 +109,7 @@ impl RoutingGraph {
     /// Native query work; invoke only inside an admitted blocking task. Scratch is
     /// private to this query, while all concurrent queries share immutable topology.
     pub(crate) fn search(
-        self,
+        &self,
         query: &[f32],
         beam: usize,
         ef: usize,
@@ -127,6 +127,34 @@ impl RoutingGraph {
         let mut scratch = Workspace::new(entries.len(), self.m, available).map_err(native_error)?;
         let (hits, stats) =
             graph.search(query, beam, ef, self.working_bytes, &mut scratch, check)?;
+        Ok((self.map_candidates(hits, check)?, stats))
+    }
+
+    /// Experimental batch scratch, private to one routing batch.
+    pub(crate) fn write_workspace(&self) -> Result<Workspace> {
+        Workspace::new(
+            self.children().len(),
+            self.m,
+            self.working_bytes
+                .checked_sub(self.body.bytes as usize)
+                .ok_or_else(limit)?,
+        )
+        .map_err(native_error)
+    }
+
+    /// Write routing scores two to four neighbors using caller-owned scratch.
+    pub(crate) fn write_search(
+        &self,
+        query: &[f32],
+        beam: usize,
+        scratch: &mut Workspace,
+        check: &(dyn Fn() -> Result<()> + Sync),
+    ) -> Result<(Vec<(PartitionKey, f64)>, ktann_usearch::Stats)> {
+        ::metrics::histogram!("ktann.routing.effective_ef")
+            .record(64.max(beam).min(self.children().len()) as f64);
+        let (hits, stats) =
+            self.partition()
+                .search_batched(query, beam, 64, self.working_bytes, scratch, check)?;
         Ok((self.map_candidates(hits, check)?, stats))
     }
 }
@@ -200,8 +228,8 @@ impl GraphLoad {
 
 /// Reads authority and complete input from the caller's existing snapshot.
 /// Cache warmth never affects admission; missing graph data is Corruption.
-pub(crate) async fn read_graph<T: ReadOps>(
-    txn: &mut ReadLogicalTxn<'_, T>,
+pub(crate) async fn read_graph<T: crate::storage::LogicalReader>(
+    txn: &mut T,
     cache: &PartitionCache,
     manifest: &IndexManifest,
     request: BodyRequest<'_>,
@@ -396,3 +424,29 @@ fn limit() -> Error {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+/// Publishes a known-committed graph through the existing capacity and epoch policy.
+pub(crate) fn install_prepared(
+    cache: &PartitionCache,
+    manifest: &IndexManifest,
+    tree: TreeKey,
+    partition: PartitionKey,
+    header: PartitionHeader,
+    graph: InternalGraphBody,
+) {
+    let bytes = CachedBody::internal_bytes(header.entry_count(), manifest.config().dimension())
+        + graph.additional_bytes() as u64;
+    let key = CacheKey::new(
+        manifest.logical_index_id(),
+        tree,
+        partition,
+        PartitionKind::Internal,
+    );
+    let body = Arc::new(CachedBody {
+        epoch: header.cache_epoch(),
+        bytes,
+        entries: BodyEntries::InternalGraph(Box::new(graph)),
+    });
+    ::metrics::counter!("ktann.experiment.ready_graph_offers").increment(1);
+    cache.install(key, body);
+}

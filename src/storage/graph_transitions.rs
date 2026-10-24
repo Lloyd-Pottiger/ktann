@@ -56,6 +56,8 @@ impl GraphTransitionSource {
         check: &C,
     ) -> Result<Self> {
         check()?;
+        #[cfg(feature = "benchmark")]
+        let _source_timer = crate::benchmark::MaintenanceTimer::new("source_read");
         let manifest = txn.require_manifest()?.clone();
         if manifest.lifecycle() != IndexLifecycle::Active
             || manifest.config().local_graph().is_none()
@@ -278,11 +280,15 @@ impl GraphTransitionSource {
         check()?;
         let config = self.manifest.config();
         let capacity = config.max_internal_partition_entries() as usize + 2;
+        #[cfg(feature = "benchmark")]
+        let phase = crate::benchmark::MaintenanceTimer::new("kernel");
         let kernel = VectorKernel::new(
             config.dimension(),
             config.metric(),
             *self.manifest.rotation_seed(),
         )?;
+        #[cfg(feature = "benchmark")]
+        drop(phase);
         let projection_bytes = config
             .dimension()
             .checked_mul(4)
@@ -300,6 +306,8 @@ impl GraphTransitionSource {
                     + METADATA_BYTES,
             )
             .ok_or_else(limit)?;
+        #[cfg(feature = "benchmark")]
+        let phase = crate::benchmark::MaintenanceTimer::new("centroid_validation");
         let old = Centroids::new(&kernel, &self.children, capacity, check).map_err(|e| {
             if e.kind() == ErrorKind::InvalidArgument {
                 corrupt()
@@ -318,6 +326,8 @@ impl GraphTransitionSource {
             return Err(Error::invalid_argument());
         }
         let target = Centroids::new(&kernel, &next, capacity, check)?;
+        #[cfg(feature = "benchmark")]
+        drop(phase);
         let parameters = config.local_graph().ok_or_else(corrupt)?.parameters();
         let unchanged = self
             .header
@@ -331,7 +341,7 @@ impl GraphTransitionSource {
         {
             return Err(Error::invalid_argument());
         }
-        let records = if let Some(descriptor) = &self.descriptor {
+        let mut records = if let Some(descriptor) = &self.descriptor {
             let source = GraphSource {
                 index: self.manifest.logical_index_id(),
                 tree: &self.tree,
@@ -395,7 +405,21 @@ impl GraphTransitionSource {
         } else {
             None
         };
+        let centroid_bytes = target_bytes;
+        let ready = records.as_mut().and_then(|records| {
+            records.ready.take().map(|(graph, identity)| {
+                crate::search::local_hnsw::body::InternalGraphBody::prepared(
+                    next,
+                    kernel,
+                    graph,
+                    identity,
+                    records.descriptor.clone(),
+                    centroid_bytes,
+                )
+            })
+        });
         Ok(PreparedGraphTransition {
+            ready,
             manifest: self.manifest,
             tree: self.tree,
             partition: self.partition,
@@ -411,6 +435,7 @@ impl GraphTransitionSource {
 /// Private replacement graph; no persisted staging or recovery cursor exists.
 #[derive(Debug)]
 pub struct PreparedGraphTransition {
+    ready: Option<crate::search::local_hnsw::body::InternalGraphBody>,
     manifest: IndexManifest,
     tree: TreeKey,
     partition: PartitionKey,
@@ -422,12 +447,29 @@ pub struct PreparedGraphTransition {
 }
 
 impl PreparedGraphTransition {
+    /// Called only after the enclosing topology transaction is known committed.
+    pub(crate) fn cache_committed(self, cache: &crate::search::cache::PartitionCache) {
+        if let (Some(body), Some(header)) = (self.ready, self.header) {
+            crate::search::cache::graph::install_prepared(
+                cache,
+                &self.manifest,
+                self.tree,
+                self.partition,
+                header,
+                body,
+            );
+        }
+    }
+
     /// Retained encoded output charged while preparing another partition.
     pub fn retained_bytes(&self) -> Result<usize> {
         self.records
             .as_ref()
             .map_or(0, |r| r.descriptor.bytes as usize)
             .checked_add(self.tree.as_bytes().len() + METADATA_BYTES)
+            .and_then(|bytes| {
+                bytes.checked_add(self.ready.as_ref().map_or(0, |body| body.retained_bytes()))
+            })
             .ok_or_else(limit)
     }
 
@@ -623,6 +665,86 @@ mod tests {
             chunks,
             ..source()
         }
+    }
+
+    #[cfg(feature = "benchmark")]
+    #[test]
+    #[ignore = "requires KTANN_EXPERIMENT_PUBLISH_READY=1"]
+    fn committed_prepared_graph_matches_restore_and_respects_cache_epochs() {
+        use super::super::values::PartitionState;
+        use crate::search::cache::{BodyEntries, CacheKey, PartitionCache, PartitionKind};
+        use crate::search::local_hnsw::body::InternalGraphBody;
+        assert!(std::env::var_os("KTANN_EXPERIMENT_PUBLISH_READY").is_some());
+        let manifest = source().manifest;
+        let tree = source().tree;
+        let parent = source().partition;
+        let key = CacheKey::new(
+            manifest.logical_index_id(),
+            tree.clone(),
+            parent,
+            PartitionKind::Internal,
+        );
+        let prepare = |epoch| {
+            source()
+                .prepare(
+                    Some(header(4, epoch, PartitionState::Ready)),
+                    rows(),
+                    MEMORY,
+                    &|| Ok(()),
+                )
+                .unwrap()
+        };
+        let prepared = prepare(9);
+        let ready_bytes = prepared.ready.as_ref().unwrap().retained_bytes();
+        assert!(prepared.retained_bytes().unwrap() >= ready_bytes);
+        let records = prepared.records.as_ref().unwrap();
+        let kernel =
+            VectorKernel::new(2, manifest.config().metric(), *manifest.rotation_seed()).unwrap();
+        let restored = InternalGraphBody::restore(
+            rows().into_boxed_slice(),
+            kernel,
+            GraphSource {
+                index: manifest.logical_index_id(),
+                tree: &tree,
+                parent,
+                header: header(4, 9, PartitionState::Ready),
+                parameters: manifest.config().local_graph().unwrap().parameters(),
+            },
+            records.descriptor.clone(),
+            records.chunks().collect(),
+            MEMORY,
+            &|| Ok(()),
+        )
+        .unwrap();
+        let cache = PartitionCache::new(MEMORY as u64);
+        assert!(cache.lookup(&key, 9).is_none());
+        // A discarded/failed transition has no publication side effect.
+        drop(prepare(8));
+        assert!(cache.lookup(&key, 8).is_none());
+        prepared.cache_committed(&cache);
+        let body = cache.lookup(&key, 9).unwrap();
+        let BodyEntries::InternalGraph(graph) = body.entries() else {
+            panic!("expected prepared native topology")
+        };
+        assert_eq!(graph.children(), restored.children());
+        for query in [[2.0, 1.0], [7.0, 3.0]] {
+            let mut a = ktann_usearch::Workspace::new(4, 4, MEMORY).unwrap();
+            let mut b = ktann_usearch::Workspace::new(4, 4, MEMORY).unwrap();
+            let (a, sa) = graph
+                .search_batched(&query, 2, 4, MEMORY, &mut a, &|| Ok(()))
+                .unwrap();
+            let (b, sb) = restored
+                .search_batched(&query, 2, 4, MEMORY, &mut b, &|| Ok(()))
+                .unwrap();
+            assert_eq!(a, b);
+            assert_eq!(sa.distances, sb.distances);
+        }
+        prepare(8).cache_committed(&cache);
+        assert!(cache.lookup(&key, 8).is_none());
+        assert!(cache.lookup(&key, 9).is_some());
+        let disabled = PartitionCache::new(0);
+        prepare(9).cache_committed(&disabled);
+        assert!(disabled.lookup(&key, 9).is_none());
     }
 
     #[test]
