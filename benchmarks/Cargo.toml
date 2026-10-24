@@ -60,3 +60,8 @@ required-features = ["rocksdb"]
 name = "ktann-write-routing"
 path = "src/bin/write_routing.rs"
 required-features = ["rocksdb"]
+
+[[bin]]
+name = "ktann-write-lifecycle"
+path = "src/bin/write_lifecycle.rs"
+required-features = ["rocksdb"]

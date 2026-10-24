@@ -1,65 +1,20 @@
 //! Isolated full-scale write-routing experiment; never a production entrypoint.
+#[path = "../bridge/settle.rs"]
+mod maintenance_settle;
 #[path = "../bridge/topology.rs"]
 mod topology;
 use ktann::api::{
-    Index, Mutation, Record, RuntimeConfig, SearchBudgets, SearchOptions, SearchRequest,
-    VerifyOptions,
+    Mutation, Record, RuntimeConfig, SearchBudgets, SearchOptions, SearchRequest, VerifyOptions,
 };
 use ktann::runtime::Runtime;
-use ktann::storage::backend::Backend;
 #[cfg(test)]
 use ktann_benchmarks as backend;
 use ktann_benchmarks::{MeasuredBackend, MetricCapture, ResourceSnapshot, load_large};
 use ktann_rocksdb::{BackendNamespace, RocksDbBackend};
+use maintenance_settle::settle;
 use rocksdb::{OptimisticTransactionDB, Options};
 use serde_json::json;
-use std::{
-    path::Path,
-    sync::Arc,
-    time::{Duration, Instant},
-};
-/// Poll only committed Headers; full membership verification is outside timing.
-async fn settle<B: Backend>(
-    index: &Index<B>,
-    raw: &B,
-    metrics: &MetricCapture,
-) -> (f64, usize, serde_json::Value) {
-    let deadline = Instant::now() + Duration::from_secs(600);
-    let mut quiet = 0;
-    let mut observer_seconds = 0.0;
-    let mut polls = 0;
-    let mut rediscovered = 0;
-    loop {
-        assert!(Instant::now() < deadline, "maintenance did not settle");
-        if metrics.fixup_backlog() != 0 {
-            quiet = 0;
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            continue;
-        }
-        let start = Instant::now();
-        let state = topology::snapshot(raw, index.logical_index_id(), 1_000_000)
-            .await
-            .unwrap();
-        observer_seconds += start.elapsed().as_secs_f64();
-        polls += 1;
-        quiet = if state.ready && metrics.fixup_backlog() == 0 {
-            quiet + 1
-        } else {
-            0
-        };
-        if quiet >= 3 {
-            return (
-                observer_seconds,
-                polls,
-                json!({"topology":state.facts,"rediscovered":rediscovered}),
-            );
-        }
-        rediscovered += state.pending.len();
-        index.benchmark_rediscover_fixups(state.pending).unwrap();
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-}
-
+use std::{path::Path, sync::Arc, time::Instant};
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().collect();
@@ -137,7 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let foreground = metrics.snapshot();
     eprintln!("FOREGROUND_END seconds={foreground_seconds}");
     let settle_observer = if workers > 0 {
-        Some(settle(&index, &raw, &metrics).await)
+        Some(settle(&index, &raw, &metrics, 1_000_000).await)
     } else {
         None
     };

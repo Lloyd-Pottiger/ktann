@@ -634,3 +634,9 @@ those parent bodies during local preparation. Mismatches discard the plan. This 
 experiment avoids the second parent-level centroid scan, while retaining exact
 initial discovery and incoming-edge conflict protection. Reports count proof
 reuse and stale attempts; evaluate total time, logical IO and retries together.
+
+### Write-routing lifecycle validation
+
+See [the small/cold/sustained-write protocol](write-lifecycle.md) for the
+`ktann-write-lifecycle` harness and fixed-budget quality checks toward default
+enablement. It complements the mature-topology write-routing measurements.
