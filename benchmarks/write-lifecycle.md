@@ -24,8 +24,8 @@ and swaps vectors between consecutive disjoint pairs. Both records of every
 pair are written in the same batch. This changes routing destinations while
 preserving the complete vector multiset. The harness maintains inverse maps
 between vector identity and current Record ID and remaps the original nearest
-neighbors accordingly. Full-corpus truth comes from the supplied dataset; the
-16K subset uses scalar-f64 brute force. A focused overlapping-swap test checks
+neighbors accordingly. Full-corpus truth comes from the supplied dataset; every
+partial-corpus fixture uses scalar-f64 brute force. A focused overlapping-swap test checks
 the remapped truth against the changed corpus. This workload does not represent
 net growth, deletion or an out-of-distribution vector stream.
 
@@ -159,18 +159,17 @@ leaves; exact ended with 13,409 and HNSW with 13,407. Both retained three level-
 partitions and one level-3 root. Maximum leaf occupancy remained 128; maximum
 level-2 occupancy was 5,264 exact and 5,262 HNSW.
 
-### Default-enablement decision
+### All-HNSW decision (2026-10-24)
 
 Large-graph write benefit is **demonstrated** for the tested RocksDB workload,
 including a cold graph cache and repeated updates with maintenance. Blanket
 default enablement is **not supported**, because 16K has a repeatable 24–25%
 regression even with warm graphs. Production defaults remain unchanged.
 
-The next write-routing candidate should retain the cheap exact path for small
-internal bodies and use HNSW where pruning repays traversal overhead. Select a
-crossover using internal graph node count and measured costs, not total dataset
-record count; these two sizes do not establish a threshold. No query-budget
-increase or query optimization is needed to address the observed small-body cost.
+These findings motivated the internal-body threshold experiment below: retain
+the cheap exact path for small bodies and use HNSW where pruning repays traversal
+overhead. The two original sizes alone did not establish a threshold. The added
+node-count cost curve and hybrid lifecycle validation keep query budgets fixed.
 The stationary swap workload does not establish quality under growth, deletion,
 or distribution shift; those claims remain outside this evidence.
 
@@ -214,3 +213,160 @@ The exact-path distance field is zero because this experimental counter only
 instruments HNSW; it does not mean exact routing performs no distance work.
 Supplemental artifacts are `diagnostic-exact/`, `diagnostic-hnsw/`,
 `diagnostic.py`, `diagnostic.json` and `diagnostic.sha256` under the same directory.
+
+## Internal-body threshold experiment
+
+`KTANN_EXPERIMENT_WRITE_HNSW_MIN_NODES=N` refines the opt-in write route:
+nonempty internal bodies below `N` use the existing exact quartet scorer;
+bodies with at least `N` nodes use HNSW. The node count is the current transaction's
+Header entry count. It is not the index record count, a cached graph estimate, or
+a query parameter. Omission (or `N=0`) retains the all-HNSW experimental arm.
+Malformed values fail with `InvalidArgument` when write HNSW is enabled.
+
+To test the selected policy, add `KTANN_EXPERIMENT_WRITE_HNSW_MIN_NODES=768`
+to the combined-candidate invocation above. The exact control must still unset
+all three experiment switches. Keep the same scenario, cloned fixture and binary
+for both arms; setting a presence-based switch to `0` does not disable it.
+
+Mixed waves retain one ownership map and one global candidate beam, including
+split-family multiplicity and deterministic tie ordering. Empty bodies retain
+uncached count validation. Small bodies in the same wave share the existing
+lockstep scan and quartet scorer. The ordinary production exact route is unchanged.
+Reports record `write_hnsw_min_nodes` and foreground `write_exact_bodies` /
+`write_hnsw_bodies` counts to distinguish policy selection from merely setting a flag.
+Counts include attempts/retries and are not unique partition counts.
+
+The fixture command reserves an 8 GiB refinement envelope for crossover fixtures;
+this is preparation-only admission, not allocated runtime memory or a query/write
+budget. The original default 256 MiB worker envelope cannot retain the 32K
+768-dimensional fixture's input and planning arrays. Larger fixtures can require
+more than this envelope; the Cohere 1M comparisons reuse the existing immutable
+fixture rather than rebuilding it.
+
+### Node-count cost curve (2026-10-25)
+
+Fresh size-specific Cohere fixtures, warm via the same 100 quality queries,
+8192 stationary updates in batches of 32, two maintenance workers. Three paired
+repetitions per arm, alternating order; timings include foreground and drain,
+exclude fixture construction/loading, Verify and quality queries. Each size uses
+an identical cloned fixture for both arms. All arms use the fixed query budget
+above. These are all-HNSW versus exact measurements, before applying a threshold.
+
+| Initial internal nodes | Records | Exact total median (s) | All-HNSW total median (s) | HNSW change |
+|---:|---:|---:|---:|---:|
+| 413 | 32,768 | 1.416135 | 1.448947 | +2.3% |
+| 793 | 61,440 | 2.091852 | 1.624442 | -22.3% |
+| 834 | 65,536 | 2.149647 | 1.701588 | -20.8% |
+| 1652 | 131,072 | 3.494182 | 1.875728 | -46.3% |
+
+All 24 runs completed full Verify without issues. Per-query post-write recall
+was identical across both arms and all repetitions within each fixture.
+At 413 nodes HNSW reduced distance work (about 2.23M distances, versus 3.38M for
+one complete scan per update before retries) but did not improve end-to-end time.
+At 834 and 1652 nodes total CPU also fell from 2.458 to 1.969 s and 4.265 to 2.694 s;
+logical reads fell from 226.46 to 153.41 MB and 627.01 to 348.44 MB respectively.
+The benefit therefore is not just time shifted into maintenance.
+
+Select 768 nodes as a conservative candidate above the small-graph crossover;
+the nearby 793-node sample already has 22.3% net benefit. This is an operating
+point for the measured Cohere workload, not a uniquely optimal or universal
+hardware/dimension-independent crossover. The following cold and sustained
+hybrid validation tests this selected policy.
+
+Pilot artifacts and binary hash: `.benchmark-data/results/write-routing-threshold-20261025/`.
+
+### Hybrid lifecycle validation at 768 nodes
+
+The same-binary exact/hybrid comparison includes the post-review cancellation
+checkpoint in cache-hit exact scoring. All three candidate switches are enabled;
+`write_hnsw_min_nodes` is 768. Ordinary exact controls unset all switches.
+Each scenario uses three fresh fixture clones per arm with alternating order.
+
+| Scenario | Exact total median (s) | Hybrid total median (s) | Hybrid change |
+|---|---:|---:|---:|
+| small-warm | 4.084102 | 4.062980 | -0.5% |
+| small-cold | 4.097522 | 4.074323 | -0.6% |
+| near-cold | 4.132713 | 3.222436 | -22.0% |
+| large-cold | 621.184045 | 188.560261 | -69.6% |
+
+Small scenarios repeat 4×8192 updates starting at 199 internal nodes, either
+query-warmed or cold graph cache. Their times overlap normal variation: the
+result is elimination of the prior 24–25% regression, not a demonstrated small-graph
+speedup. Candidate counters show only exact bodies in every round.
+Near-cold starts with 793 nodes and repeats 2×8192 updates; candidate counters show
+HNSW bodies. Every per-query post-write recall matches exact across these 18 runs.
+All complete Verify calls pass; no actionable or transitional partitions remain.
+
+Boundary checks on the same 199-node body select HNSW at threshold 199
+(`exact=0, hnsw=1`) and exact at threshold 200 (`exact=1, hnsw=0`). This checks
+inclusive selection independently of wall-clock measurements.
+
+
+The 1M scenario repeats 8×32768 updates (262144 per repetition), starting from
+a cold graph cache. Exact totals range from 617.442 to 632.685 s; hybrid totals
+range from 182.684 to 188.839 s. Median foreground time falls from 619.155 to
+182.555 s (70.5%), measured total CPU from 710.527 to 263.560 s (62.9%), and
+logical bytes read from 101.412 to 56.009 GB (44.8%). The cold first-round total
+median falls from 78.440 to 24.867 s (68.3%). The faster foreground can leave more
+maintenance to drain, which is included in these totals rather than hidden.
+Candidate body counters show exact for the three-node root and HNSW for its
+three large internal bodies throughout the run.
+
+All six 1M runs complete every Verify without issues, with no actionable or
+transitional partitions after settling. Final exact leaf count is 13409;
+hybrid counts are 13407–13408. Both retain three level-2 bodies and one root,
+maximum leaf occupancy 128, and maximum level-2 occupancy 5264 exact / 5262 hybrid.
+Thus the time reduction does not come from materially reducing partition count
+or leaving maintenance unfinished.
+
+Final mean recall is 82.63% in every run, under the unchanged beam128/ef64/
+rerank125 budget. Across rounds, paired mean hybrid-minus-exact differences are
++0.043,+0.010,+0.027,+0.027,+0.007,+0.017,+0.007,0.000 percentage points.
+The final query-resampling 95% interval is [-0.05,+0.05] percentage points
+(seed 7, 3000 resamples of the 100 per-query differences averaged across repetitions).
+This describes the sampled stationary workload, not a guarantee for every query:
+some individual queries lose one neighbor, while others gain one or two.
+No mean-quality loss approaching the predeclared 0.5-point concern threshold was
+observed. The cold, small and sustained-update concerns that motivated this
+experiment are therefore addressed for this Cohere/RocksDB profile.
+
+Two additional functional probes use the validation binary and unchanged budgets:
+
+- A 1M threshold 5150 run routes one large body with HNSW while the other two
+  level-2 bodies use exact in the same wave (plus an exact root): counters are
+  `exact=3,hnsw=1`. Full Verify passes, and all 100 per-query recall values match
+  the corresponding exact 32-update control.
+- A threshold 200 run starts with 199 nodes and follows the same four small warm
+  update rounds. Round 1 executes 184 exact and 75 HNSW bodies and ends at 200 nodes;
+  rounds 2–4 each execute 256 HNSW bodies and end at 201 nodes. This proves selection
+  follows changing snapshot Headers rather than a retained old graph size.
+  Full Verify and per-query quality comparisons with exact pass in every round.
+  These 200/5150 thresholds are correctness probes, not alternative performance
+  recommendations.
+
+### Disposition and validation
+
+**The 768-node adaptive policy is demonstrated for the tested workload and is the
+recommended default-enablement candidate.** It removes the small-body regression
+and preserves the large-body write benefit without raising query budgets.
+This commit retains the benchmark-only switch and leaves production defaults
+unchanged; promotion should carry the adaptive policy together with the prepared
+cache publication, parent-proof reuse, and existing resource/control invariants.
+There is no reason in these measurements to retain unconditional HNSW for small
+bodies. The evidence remains bounded to stationary swaps, this host/backend and
+two maintenance workers; growth, deletion and distribution drift are not measured.
+
+Both ordinary and threshold-enabled focused suites pass: tree routing 26 tests,
+graph split interleaving 2, graph transaction budget 1, and graph updates 3
+(one unrelated cost probe remains ignored). The lifecycle harness's 3 tests,
+workspace formatting, core/benchmark all-target Clippy and core no-default-feature
+check pass. Independent review found no actionable defects in the threshold
+implementation; cache-hit exact scoring subsequently gained an operation-control
+checkpoint, followed by the focused tests and the complete hybrid matrix above.
+
+Artifacts include `pilot.py`, `near.py`, `boundary.py`, `validate.py`, `mixed.py`,
+`crossing.py`, per-run reports, binary hashes, `analysis.json`, and source/compiler
+metadata under `.benchmark-data/results/write-routing-threshold-20261025/`.
+Measurements used arm64 macOS and Rust 1.99.0 (LLVM 23.1.1). `pilot-binary` preserves
+the cost-curve executable; `validation-binary` includes the exact-scoring control
+checkpoint. No compilation or tests ran concurrently with timing measurements.

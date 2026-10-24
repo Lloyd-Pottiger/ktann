@@ -175,12 +175,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             )
             .await?;
+        // Fixture refinement retains vectors and planning arrays; the default
+        // worker envelope is too small for the larger crossover fixtures.
+        let mut worker = BulkWorkerOptions::new(output.join("workspace"));
+        worker.refinement_memory_bytes = 8 << 30;
         let (index, _) = job
-            .complete_with_report(
-                BulkWorkerOptions::new(output.join("workspace")),
-                None,
-                Default::default(),
-            )
+            .complete_with_report(worker, None, Default::default())
             .await?;
         std::fs::write(
             output.join("fixture.json"),
@@ -286,11 +286,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         })
         .collect();
-        rounds.push(json!({"round":round,"foreground_seconds":foreground_seconds,"total_seconds":total_seconds,"foreground_cpu_seconds":foreground_resources.cpu_seconds_since(resources),"total_cpu_seconds":after.cpu_seconds_since(resources),"foreground_io":foreground_io,"total_io":io,"routing":foreground.routing_summary(),"write_stages_seconds":stages,"write_distances":foreground.counter("ktann.experiment.write_distances",&[]),"foreground_fixups":foreground.counters_rendered("ktann.fixup.steps"),"drain_fixups":drain.counters_rendered("ktann.fixup.steps"),"parent_proof_stale":foreground.counter("ktann.experiment.parent_proof_stale",&[])+drain.counter("ktann.experiment.parent_proof_stale",&[]),"settle":settle,"verify":verification,"quality":quality}));
+        rounds.push(json!({"round":round,"foreground_seconds":foreground_seconds,"total_seconds":total_seconds,"foreground_cpu_seconds":foreground_resources.cpu_seconds_since(resources),"total_cpu_seconds":after.cpu_seconds_since(resources),"foreground_io":foreground_io,"total_io":io,"routing":foreground.routing_summary(),"write_stages_seconds":stages,"write_exact_bodies":foreground.counter("ktann.experiment.write_exact_bodies", &[]),"write_hnsw_bodies":foreground.counter("ktann.experiment.write_hnsw_bodies", &[]),"write_distances":foreground.counter("ktann.experiment.write_distances",&[]),"foreground_fixups":foreground.counters_rendered("ktann.fixup.steps"),"drain_fixups":drain.counters_rendered("ktann.fixup.steps"),"parent_proof_stale":foreground.counter("ktann.experiment.parent_proof_stale",&[])+drain.counter("ktann.experiment.parent_proof_stale",&[]),"settle":settle,"verify":verification,"quality":quality}));
         std::fs::write(
             output.join("report.json"),
             serde_json::to_vec_pretty(
-                &json!({"scenario":scenario,"experiment_switches":{"write_hnsw":std::env::var_os("KTANN_EXPERIMENT_WRITE_HNSW").is_some(),"publish_ready":std::env::var_os("KTANN_EXPERIMENT_PUBLISH_READY").is_some(),"reuse_parent_proof":std::env::var_os("KTANN_EXPERIMENT_REUSE_PARENT_PROOF").is_some()},"query_budget":{"beam":128,"ef":64,"rerank":125,"k":100,"query_offset":100},"initial":initial,"baseline_quality":baseline,"rounds":rounds}),
+                &json!({"scenario":scenario,"write_hnsw_min_nodes":std::env::var("KTANN_EXPERIMENT_WRITE_HNSW_MIN_NODES").ok(),"experiment_switches":{"write_hnsw":std::env::var_os("KTANN_EXPERIMENT_WRITE_HNSW").is_some(),"publish_ready":std::env::var_os("KTANN_EXPERIMENT_PUBLISH_READY").is_some(),"reuse_parent_proof":std::env::var_os("KTANN_EXPERIMENT_REUSE_PARENT_PROOF").is_some()},"query_budget":{"beam":128,"ef":64,"rerank":125,"k":100,"query_offset":100},"initial":initial,"baseline_quality":baseline,"rounds":rounds}),
             )?,
         )?;
         eprintln!(

@@ -550,6 +550,21 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
     cache: Option<&PartitionCache>,
     control: Option<&crate::runtime::WriteRoutingControl>,
 ) -> Result<GroupedDescent> {
+    // The benchmark threshold counts nodes in each snapshot-authoritative
+    // internal body, not records in the index. Zero preserves the all-graph arm.
+    let min_graph_nodes = if cfg!(feature = "benchmark") && control.is_some() {
+        std::env::var_os("KTANN_EXPERIMENT_WRITE_HNSW_MIN_NODES")
+            .map(|value| {
+                value
+                    .to_str()
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .ok_or_else(|| Error::new(ErrorKind::InvalidArgument))
+            })
+            .transpose()?
+            .unwrap_or(0)
+    } else {
+        0
+    };
     let mut routes: Vec<Option<(f64, Route)>> = vec![None; routings.len()];
     let mut pending: BTreeMap<(PartitionKey, Option<u32>), Vec<PendingBeamMember>> =
         BTreeMap::from([(
@@ -849,6 +864,25 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                 cache.filter(|_| manifest.config().local_graph().is_some() && control.is_some());
             #[cfg(not(feature = "benchmark"))]
             let experiment: Option<&PartitionCache> = None;
+            // Keep the ordinary exact arm allocation-free beyond its existing
+            // wave state. Mixed waves scan their small bodies together so the
+            // quartet scorer and bounded lockstep reads remain shared.
+            let exact_indices = experiment.map(|_| {
+                bodies
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, (_, header))| {
+                        (header.entry_count() > 0 && header.entry_count() < min_graph_nodes)
+                            .then_some(index)
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let exact_bodies = exact_indices.as_ref().map(|indices| {
+                indices
+                    .iter()
+                    .map(|&index| bodies[index])
+                    .collect::<Vec<_>>()
+            });
             if let Some(cache) = experiment {
                 let control = control.expect("experimental write route owns control");
                 let check = || control.checkpoint();
@@ -860,6 +894,13 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                     .len()
                     .checked_mul(
                         manifest.config().dimension() * 4 + write_beam_size as usize * 128 + 256,
+                    )
+                    .ok_or_else(limit)?;
+                let query_bytes = query_bytes
+                    .checked_add(
+                        bodies.len()
+                            * (std::mem::size_of::<usize>()
+                                + std::mem::size_of::<(PartitionKey, PartitionHeader)>()),
                     )
                     .ok_or_else(limit)?;
                 let bookkeeping = bodies.iter().try_fold(query_bytes, |bytes, (_, header)| {
@@ -889,6 +930,10 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                         .await?;
                         continue;
                     }
+                    if header.entry_count() < min_graph_nodes {
+                        continue;
+                    }
+                    ::metrics::counter!("ktann.experiment.write_hnsw_bodies").increment(1);
                     use crate::search::cache::{
                         BodyRequest,
                         graph::{GraphRead, read_graph},
@@ -971,12 +1016,18 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                         Ok(())
                     })?;
                 }
-            } else {
+            }
+            let scan = exact_bodies.as_deref().unwrap_or(&bodies);
+            if !scan.is_empty() {
+                if experiment.is_some() {
+                    ::metrics::counter!("ktann.experiment.write_exact_bodies")
+                        .increment(scan.len() as u64);
+                }
                 scan_bodies(
                     reader,
                     manifest,
                     tree_key,
-                    &bodies,
+                    scan,
                     if cfg!(feature = "benchmark")
                         && std::env::var_os("KTANN_FORCE_GRAPH_MISS").is_some()
                     {
@@ -985,6 +1036,14 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                         cache
                     },
                     &mut |index, entry| {
+                        // Cache hits can score the whole small body without an
+                        // await; retain operation control in the hybrid arm.
+                        if let Some(control) = control {
+                            control.checkpoint()?;
+                        }
+                        let index = exact_indices
+                            .as_ref()
+                            .map_or(index, |indices| indices[index]);
                         let (body, _) = bodies[index];
                         if incoming_owners
                             .insert(entry.child(), body)
