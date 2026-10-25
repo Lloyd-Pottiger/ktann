@@ -1547,6 +1547,14 @@ pub(crate) trait LogicalReader {
         keys: Vec<LogicalKey>,
     ) -> impl Future<Output = Result<Vec<Option<PersistentValue>>>> + Send;
 
+    /// Scans one bounded page, preserving the backend's single-range semantics.
+    fn scan(
+        &mut self,
+        range: &LogicalRange,
+        cursor: Option<&LogicalScanCursor>,
+        limits: ScanLimits,
+    ) -> impl Future<Output = Result<LogicalScanPage>> + Send;
+
     /// Scans one bounded typed page from each `(range, cursor)` leg,
     /// preserving input order.
     fn batch_scan(
@@ -1571,6 +1579,15 @@ impl<T: ReadOps> LogicalReader for ReadLogicalTxn<'_, T> {
         ReadLogicalTxn::batch_get(self, keys)
     }
 
+    fn scan(
+        &mut self,
+        range: &LogicalRange,
+        cursor: Option<&LogicalScanCursor>,
+        limits: ScanLimits,
+    ) -> impl Future<Output = Result<LogicalScanPage>> + Send {
+        ReadLogicalTxn::scan(self, range, cursor, limits)
+    }
+
     fn batch_scan(
         &mut self,
         legs: &[(&LogicalRange, Option<&LogicalScanCursor>)],
@@ -1593,6 +1610,15 @@ impl<T: WriteTxn> LogicalReader for WriteLogicalTxn<'_, T> {
         keys: Vec<LogicalKey>,
     ) -> impl Future<Output = Result<Vec<Option<PersistentValue>>>> + Send {
         WriteLogicalTxn::batch_get(self, keys)
+    }
+
+    fn scan(
+        &mut self,
+        range: &LogicalRange,
+        cursor: Option<&LogicalScanCursor>,
+        limits: ScanLimits,
+    ) -> impl Future<Output = Result<LogicalScanPage>> + Send {
+        WriteLogicalTxn::scan(self, range, cursor, limits)
     }
 
     fn batch_scan(

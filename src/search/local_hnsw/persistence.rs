@@ -22,6 +22,14 @@ pub(crate) struct GraphRecords {
     body: Bytes,
 }
 
+/// A completed graph preparation, with both persisted records and native topology.
+#[derive(Debug)]
+pub(crate) struct PreparedGraphRecords {
+    pub(crate) records: GraphRecords,
+    pub(crate) graph: ktann_usearch::Graph,
+    pub(crate) identity: [u8; 32],
+}
+
 impl GraphRecords {
     /// Yields contiguous ordinals without copying or retaining a second body.
     pub(crate) fn chunks(&self) -> impl Iterator<Item = (u32, GraphChunk)> + '_ {
@@ -110,7 +118,7 @@ pub(crate) fn build_records(
     source: GraphSource<'_>,
     working_bytes: usize,
     check: &dyn Fn() -> Result<()>,
-) -> Result<GraphRecords> {
+) -> Result<PreparedGraphRecords> {
     let (graph, identity) = build_graph(
         centroids,
         source.parameters,
@@ -121,9 +129,9 @@ pub(crate) fn build_records(
     )?;
     ::metrics::histogram!("ktann.routing.native_build_peak_bytes")
         .record(graph.peak_bytes() as f64);
-    persist_graph(
+    finish_records(
         centroids,
-        &graph,
+        graph,
         identity,
         source.index,
         source.header,
@@ -148,7 +156,7 @@ pub(crate) fn update_records(
     next_header: PartitionHeader,
     working_bytes: usize,
     check: &dyn Fn() -> Result<()>,
-) -> Result<GraphRecords> {
+) -> Result<PreparedGraphRecords> {
     if next_header.level() != source.header.level()
         || source.header.cache_epoch() >= next_header.cache_epoch()
         || !header_matches(next_header, next.children.len())
@@ -166,6 +174,7 @@ pub(crate) fn update_records(
         .checked_sub(next.bytes + mapping_bytes)
         .ok_or_else(limit)?;
     let (graph, _) = restore_graph(old, source, descriptor, chunks, restore_budget, check)?;
+
     // Maintenance removes old child edges without changing surviving centroids.
     // Keep this common path inside the private graph preparation boundary.
     if next.children.len() < old.children.len() {
@@ -206,9 +215,9 @@ pub(crate) fn update_records(
                 )
             })?;
             let identity = identity(next, source.parameters, source.tree, source.parent, check)?;
-            return persist_graph(
+            return finish_records(
                 next,
-                &graph,
+                graph,
                 identity,
                 source.index,
                 next_header,
@@ -283,9 +292,9 @@ pub(crate) fn update_records(
         )
     })?;
     let identity = identity(next, source.parameters, source.tree, source.parent, check)?;
-    persist_graph(
+    finish_records(
         next,
-        &graph,
+        graph,
         identity,
         source.index,
         next_header,
@@ -294,6 +303,32 @@ pub(crate) fn update_records(
             .ok_or_else(limit)?,
         check,
     )
+}
+
+/// Retains prepared immutable topology for bounded cache publication after commit.
+fn finish_records(
+    centroids: Centroids<'_>,
+    graph: ktann_usearch::Graph,
+    identity: [u8; 32],
+    index: LogicalIndexId,
+    header: PartitionHeader,
+    working_bytes: usize,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<PreparedGraphRecords> {
+    let records = persist_graph(
+        centroids,
+        &graph,
+        identity,
+        index,
+        header,
+        working_bytes,
+        check,
+    )?;
+    Ok(PreparedGraphRecords {
+        records,
+        graph,
+        identity,
+    })
 }
 
 pub(super) fn persist_graph(

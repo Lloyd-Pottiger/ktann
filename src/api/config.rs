@@ -85,7 +85,8 @@ pub struct IndexConfig {
 
 impl IndexConfig {
     /// Enables atomically maintained partition-local graphs for internal routing.
-    /// Foreground writes retain the existing exact tree routing.
+    /// Foreground writes score internal bodies below 1024 nodes exactly and
+    /// use HNSW for bodies with at least 1024 nodes.
     #[must_use]
     pub fn with_local_graph(mut self, graph: LocalGraphConfig) -> Self {
         self.graph = Some(graph);

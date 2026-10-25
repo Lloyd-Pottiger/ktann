@@ -2529,7 +2529,7 @@ class index_gt {
                   typename callback_at> //
         inline void measure_batch(value_at const& first, entries_at const& second_entries, metric_at&& metric,
                                   candidate_allowed_at&& candidate_allowed, transform_at&& transform,
-                                  callback_at&& callback) noexcept {
+                                  callback_at&& callback) {
 
             using entry_t = typename std::remove_reference<decltype(second_entries[0])>::type;
             metric.batch(first, second_entries, candidate_allowed, transform,
@@ -4583,14 +4583,16 @@ private:
                 }
 
                 // Actual traversal
-                for (compressed_slot_t candidate_slot : closest_neighbors) {
-                    distance_t candidate_dist = context.measure(query, citerator_at(candidate_slot), metric);
-                    if (candidate_dist < closest_dist || (candidate_dist == closest_dist && candidate_slot < closest_slot)) {
-                        closest_dist = candidate_dist;
-                        closest_slot = candidate_slot;
-                        changed = true;
-                    }
-                }
+                context.measure_batch(query, closest_neighbors, metric,
+                    [](compressed_slot_t) { return true; },
+                    [&](compressed_slot_t slot) { return citerator_at(slot); },
+                    [&](compressed_slot_t candidate_slot, distance_t candidate_dist) {
+                        if (candidate_dist < closest_dist || (candidate_dist == closest_dist && candidate_slot < closest_slot)) {
+                            closest_dist = candidate_dist;
+                            closest_slot = candidate_slot;
+                            changed = true;
+                        }
+                    });
 
                 context.iteration_cycles++;
             } while (changed);
@@ -4831,11 +4833,10 @@ private:
             if (!visits.reserve(visits.size() + candidate_neighbors.size()))
                 return false;
 
-            for (compressed_slot_t successor_slot : candidate_neighbors) {
-                if (visits.set(successor_slot))
-                    continue;
-
-                distance_t successor_dist = context.measure(query, citerator_at(successor_slot), metric);
+            context.measure_batch(query, candidate_neighbors, metric,
+                [&](compressed_slot_t slot) { return !visits.set(slot); },
+                [&](compressed_slot_t slot) { return citerator_at(slot); },
+                [&](compressed_slot_t successor_slot, distance_t successor_dist) {
                 if (top.size() < top_limit || successor_dist < radius ||
                     (successor_dist == radius && successor_slot < top.top().slot)) {
                     // This can substantially grow our priority queue:
@@ -4846,7 +4847,7 @@ private:
                         radius = top.top().distance;
                     }
                 }
-            }
+            });
         }
 
         return true;

@@ -227,6 +227,19 @@ pub async fn expose_split_targets<T: WriteTxn>(
     targets: [(PartitionKey, &PartitionCentroid); 2],
     started_at_unix_millis: u64,
 ) -> Result<SplitExposure> {
+    expose_split_targets_with_parent(txn, tree_key, source, targets, started_at_unix_millis, None)
+        .await
+}
+
+/// Uses a parent only after the caller validates its complete discovery proof.
+pub(crate) async fn expose_split_targets_with_parent<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    tree_key: &TreeKey,
+    source: PartitionKey,
+    targets: [(PartitionKey, &PartitionCentroid); 2],
+    started_at_unix_millis: u64,
+    parent: Option<PartitionKey>,
+) -> Result<SplitExposure> {
     let manifest = txn.require_manifest()?;
     let index = manifest.logical_index_id();
     let (source_header_key, source_state_key) = authority_keys(index, tree_key, source);
@@ -272,7 +285,7 @@ pub async fn expose_split_targets<T: WriteTxn>(
     let parent = if source == root_partition() {
         None
     } else {
-        let parent = lock_incoming_edge(txn, tree_key, source, level).await?;
+        let parent = lock_incoming_edge(txn, tree_key, source, level, parent).await?;
         let parent_header = expect_header(
             txn.get_for_update(LogicalKey::Header {
                 index,
@@ -1124,6 +1137,26 @@ pub async fn finalize_split<T: WriteTxn>(
     started_at_unix_millis: u64,
     source_removal: SourceRemoval,
 ) -> Result<SplitCompletion> {
+    finalize_split_with_parent(
+        txn,
+        tree_key,
+        source,
+        started_at_unix_millis,
+        source_removal,
+        None,
+    )
+    .await
+}
+
+/// Uses a parent only after the caller validates its complete discovery proof.
+pub(crate) async fn finalize_split_with_parent<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    tree_key: &TreeKey,
+    source: PartitionKey,
+    started_at_unix_millis: u64,
+    source_removal: SourceRemoval,
+    parent: Option<PartitionKey>,
+) -> Result<SplitCompletion> {
     let manifest = txn.require_manifest()?;
     let index = manifest.logical_index_id();
     let (header_key, state_key) = authority_keys(index, tree_key, source);
@@ -1254,7 +1287,7 @@ pub async fn finalize_split<T: WriteTxn>(
 
     // Remove the source's unique incoming reference, rediscovered on this
     // transaction's snapshot and update-protected (ADR 0007).
-    let parent = remove_incoming_edge(txn, tree_key, source, level).await?;
+    let parent = remove_incoming_edge(txn, tree_key, source, level, parent).await?;
     remove_source_prefix(
         txn,
         manifest,
@@ -1418,6 +1451,17 @@ pub async fn finalize_merge<T: WriteTxn>(
     source: PartitionKey,
     source_removal: SourceRemoval,
 ) -> Result<MergeCompletion> {
+    finalize_merge_with_parent(txn, tree_key, source, source_removal, None).await
+}
+
+/// Uses a parent only after the caller validates its complete discovery proof.
+pub(crate) async fn finalize_merge_with_parent<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    tree_key: &TreeKey,
+    source: PartitionKey,
+    source_removal: SourceRemoval,
+    parent: Option<PartitionKey>,
+) -> Result<MergeCompletion> {
     let manifest = txn.require_manifest()?;
     let (header_key, state_key) = authority_keys(manifest.logical_index_id(), tree_key, source);
     let Some((header, state)) = authority_pair(txn, header_key.clone(), state_key.clone()).await?
@@ -1438,7 +1482,7 @@ pub async fn finalize_merge<T: WriteTxn>(
         return Ok(MergeCompletion::NotDrained);
     }
     let level = header.level();
-    remove_incoming_edge(txn, tree_key, source, level).await?;
+    remove_incoming_edge(txn, tree_key, source, level, parent).await?;
     remove_source_prefix(
         txn,
         manifest,
@@ -1465,9 +1509,10 @@ async fn remove_incoming_edge<T: WriteTxn>(
     tree_key: &TreeKey,
     source: PartitionKey,
     level: u32,
+    parent: Option<PartitionKey>,
 ) -> Result<PartitionKey> {
     let index = txn.require_manifest()?.logical_index_id();
-    let parent = lock_incoming_edge(txn, tree_key, source, level).await?;
+    let parent = lock_incoming_edge(txn, tree_key, source, level, parent).await?;
     let parent_header_key = LogicalKey::Header {
         index,
         tree_key: tree_key.clone(),
@@ -1566,6 +1611,99 @@ pub(crate) async fn find_incoming_edge<T: LogicalReader>(
     Ok(found)
 }
 
+/// Ephemeral proof of a complete incoming-edge discovery in one read snapshot.
+/// Reuse requires the same reachable parent set and update-protected Headers.
+/// Every Child Entry change advances its owner's epoch, including edge moves.
+pub(crate) struct IncomingEdgeProof {
+    level: u32,
+    headers: Vec<(PartitionKey, PartitionHeader)>,
+}
+
+impl IncomingEdgeProof {
+    pub(crate) async fn read<R: LogicalReader>(
+        reader: &mut R,
+        manifest: &IndexManifest,
+        tree: &TreeKey,
+        level: u32,
+        working_bytes: usize,
+    ) -> Result<Self> {
+        let level = level.checked_add(1).ok_or_else(corrupt)?;
+        let bodies = level_bodies(reader, manifest, tree, level).await?;
+        let bytes = bodies
+            .len()
+            .checked_mul(256)
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+        if bytes > working_bytes {
+            return Err(Error::new(ErrorKind::LimitExceeded));
+        }
+        let mut headers = Vec::with_capacity(bodies.len());
+        for batch in bodies.chunks(DISCOVERY_BODY_BATCH) {
+            let keys = batch
+                .iter()
+                .map(|&partition| LogicalKey::Header {
+                    index: manifest.logical_index_id(),
+                    tree_key: tree.clone(),
+                    partition,
+                })
+                .collect();
+            for (&partition, value) in batch.iter().zip(reader.batch_get(keys).await?) {
+                headers.push((partition, expect_header(value)?.ok_or_else(corrupt)?));
+            }
+        }
+        Ok(Self { level, headers })
+    }
+
+    /// Reuse existing ordered body guards to avoid preparing against a proof
+    /// another local publisher is already changing. Storage fences remain final.
+    pub(crate) fn bodies(&self) -> impl Iterator<Item = PartitionKey> + '_ {
+        self.headers.iter().map(|(partition, _)| *partition)
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.headers.capacity() * 256
+    }
+
+    /// False means discard the private plan and rediscover; never use a stale hint.
+    pub(crate) async fn validate<T: WriteTxn>(
+        &self,
+        txn: &mut WriteLogicalTxn<'_, T>,
+        tree: &TreeKey,
+    ) -> Result<bool> {
+        let manifest = txn.require_manifest()?;
+        if read_header(txn, manifest.logical_index_id(), tree, root_partition())
+            .await?
+            .level()
+            < self.level
+        {
+            return Ok(false);
+        }
+        let bodies = level_bodies(txn, manifest, tree, self.level).await?;
+        if !bodies
+            .iter()
+            .copied()
+            .eq(self.headers.iter().map(|(key, _)| *key))
+        {
+            return Ok(false);
+        }
+        for batch in self.headers.chunks(DISCOVERY_BODY_BATCH) {
+            let keys = batch
+                .iter()
+                .map(|&(partition, _)| LogicalKey::Header {
+                    index: manifest.logical_index_id(),
+                    tree_key: tree.clone(),
+                    partition,
+                })
+                .collect();
+            for ((_, expected), value) in batch.iter().zip(txn.batch_get_for_update(keys).await?) {
+                if expect_header(value)? != Some(*expected) {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+}
+
 /// Rediscovers one non-root partition's unique incoming Child Entry by the
 /// exact root-down scan and update-protects it, returning the parent's
 /// Partition Key.
@@ -1577,14 +1715,16 @@ async fn lock_incoming_edge<T: WriteTxn>(
     tree_key: &TreeKey,
     partition: PartitionKey,
     level: u32,
+    parent: Option<PartitionKey>,
 ) -> Result<PartitionKey> {
     let index = txn.require_manifest()?.logical_index_id();
-    let Some((parent, _)) =
-        find_incoming_edge(txn, txn.require_manifest()?, tree_key, partition, level).await?
-    else {
-        // A non-root partition has exactly one incoming Child Entry in every
-        // committed state (ADR 0007).
-        return Err(corrupt());
+    let parent = if let Some(parent) = parent {
+        parent
+    } else {
+        find_incoming_edge(txn, txn.require_manifest()?, tree_key, partition, level)
+            .await?
+            .ok_or_else(corrupt)?
+            .0
     };
     expect_child_entry(
         txn.get_for_update(LogicalKey::ChildEntry {
@@ -2292,3 +2432,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "topology/proof_tests.rs"]
+mod proof_tests;

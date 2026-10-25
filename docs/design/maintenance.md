@@ -30,6 +30,15 @@ Ready partitions and ReceivingSplit targets are not offered because their
 current state cannot advance independently. Failure to enqueue never changes
 the mutation result or correctness.
 
+For graph-enabled indexes, grouped foreground routing scores internal bodies
+below 1024 nodes exactly and uses local HNSW at 1024 nodes or above, according to
+the snapshot Header count. Mixed waves share the same bounded write beam and
+stable candidate ordering. Approximate selection does not weaken exact membership,
+complete child ownership validation, or final mutation fences. Indexes without
+local graphs retain exact routing. Prepared graphs enter the bounded cache only
+after known successful publication; parent discovery waits for body guards before
+reading the full incoming-edge set from the refreshed snapshot.
+
 Grouped foreground routing may reuse committed internal bodies from the shared
 Partition Cache (ADR 0023). It reads Header and State in the current transaction,
 checks the body epoch, and still update-protects the selected leaf and incoming

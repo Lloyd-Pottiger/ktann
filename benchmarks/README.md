@@ -583,3 +583,11 @@ cumulative peak RSS includes that full decode, the reserved update pool and orac
 allocations; it is not graph working memory.
 Logical KV bytes do not measure native physical writes. These experiments cover
 the reported size and update history and do not establish a production SLA.
+
+### Adaptive write routing
+
+Graph-enabled indexes use exact scoring below 1024 internal nodes and HNSW at
+or above 1024, independently for each snapshot-authoritative body. There are no
+write-routing experiment switches. Query behavior and budgets are unchanged.
+See [ADR 0031](../docs/adr/0031-adaptive-local-graph-write-routing.md) for the
+policy and rationale.
