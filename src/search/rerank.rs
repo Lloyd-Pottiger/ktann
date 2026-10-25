@@ -27,79 +27,53 @@ const RECORD_LOAD_BATCH: usize = 256;
 /// Traversal constructs candidates from Leaf Entries: the Record ID, the exact
 /// typed filter projection, the rough distance with its conservative interval,
 /// and the source location the authoritative Record Location must match.
-pub(crate) struct LeafCandidate {
-    record_id: Bytes,
+pub(crate) type LeafCandidate = ApproximateCandidate<LeafProjection>;
+
+/// Exact leaf projection carried unchanged through global overlap selection.
+pub(crate) struct LeafProjection {
     fields: Box<[Value]>,
-    distance: ApproximateDistance,
     location: RecordLocation,
 }
 
 impl LeafCandidate {
     /// Creates one candidate from its Leaf Entry projection and source.
-    pub(crate) fn new(
+    pub(crate) fn from_leaf(
         record_id: Bytes,
         fields: Box<[Value]>,
         distance: ApproximateDistance,
         location: RecordLocation,
     ) -> Self {
-        Self {
-            record_id,
-            fields,
-            distance,
-            location,
-        }
+        Self::new(record_id, distance, LeafProjection { fields, location })
     }
 
     /// Conservative retained heap charge; shared byte payloads are charged per owner.
     pub(crate) fn heap_bytes(&self) -> Result<usize> {
         let bytes = self
-            .fields
+            .fields()
             .iter()
             .try_fold(128_u64, |bytes, field| {
                 bytes.checked_add(super::cache::field_bytes(field))
             })
-            .and_then(|bytes| bytes.checked_add(self.record_id.len() as u64))
-            .and_then(|bytes| bytes.checked_add(self.location.tree_key().as_bytes().len() as u64))
+            .and_then(|bytes| bytes.checked_add(self.record_id().len() as u64))
+            .and_then(|bytes| bytes.checked_add(self.location().tree_key().as_bytes().len() as u64))
             .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
         usize::try_from(bytes).map_err(|_| Error::new(ErrorKind::LimitExceeded))
     }
 
-    /// Returns the Record ID, the deterministic final tie-breaker.
-    pub(crate) const fn record_id(&self) -> &Bytes {
-        &self.record_id
-    }
-
     /// Returns the exact typed filter projection from the Leaf Entry.
     pub(crate) fn fields(&self) -> &[Value] {
-        &self.fields
-    }
-
-    /// Returns the rough distance and conservative interval used by selection.
-    pub(crate) const fn distance(&self) -> ApproximateDistance {
-        self.distance
+        &self.value().fields
     }
 
     /// Returns the source Tree Key and Leaf Partition the candidate came from.
     pub(crate) const fn location(&self) -> &RecordLocation {
-        &self.location
+        &self.value().location
     }
 }
 
 impl std::fmt::Debug for LeafCandidate {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("LeafCandidate([REDACTED])")
-    }
-}
-
-impl From<LeafCandidate> for ApproximateCandidate<LeafCandidate> {
-    /// Wraps one candidate with its selection ranking key: the Record ID and
-    /// the rough distance with its conservative interval.
-    fn from(candidate: LeafCandidate) -> Self {
-        ApproximateCandidate::new(
-            candidate.record_id().clone(),
-            candidate.distance(),
-            candidate,
-        )
     }
 }
 
@@ -214,7 +188,7 @@ pub(crate) async fn exact_rerank<T: ReadOps>(
         for batch in candidates[..load_count].chunks(RECORD_LOAD_BATCH) {
             let ids = batch
                 .iter()
-                .map(|candidate| candidate.record_id.clone())
+                .map(|candidate| candidate.record_id().clone())
                 .collect();
             let groups = txn.read_record_groups(ids, false).await?;
             for (candidate, group) in batch.iter().zip(groups) {
@@ -227,7 +201,7 @@ pub(crate) async fn exact_rerank<T: ReadOps>(
                     return Err(Error::new(ErrorKind::Corruption));
                 }
                 let distance = exact_query.distance_validated(record.vector())?;
-                scored.push((candidate.record_id.clone(), distance));
+                scored.push((candidate.record_id().clone(), distance));
             }
         }
     }
@@ -370,7 +344,7 @@ mod tests {
     }
 
     fn candidate(record: &TestRecord, rough: f64) -> LeafCandidate {
-        LeafCandidate::new(
+        LeafCandidate::from_leaf(
             Bytes::copy_from_slice(record.id.as_bytes()),
             record.fields().into_boxed_slice(),
             test_approximate_distance(rough),
@@ -830,7 +804,7 @@ mod tests {
 
         let mut divergent = records[0].clone();
         divergent.tag = Some("forged");
-        let candidate = LeafCandidate::new(
+        let candidate = LeafCandidate::from_leaf(
             Bytes::copy_from_slice(divergent.id.as_bytes()),
             divergent.fields().into_boxed_slice(),
             test_approximate_distance(0.0),

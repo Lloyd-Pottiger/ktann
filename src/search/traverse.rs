@@ -980,7 +980,7 @@ impl Traversal {
             .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
         for candidate in selected {
             let (record_id, distance, entry) = candidate.into_parts();
-            let candidate = LeafCandidate::new(
+            let candidate = LeafCandidate::from_leaf(
                 record_id,
                 entry.fields().into(),
                 distance,
