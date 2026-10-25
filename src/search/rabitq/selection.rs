@@ -27,9 +27,14 @@ impl<T> ApproximateCandidate<T> {
     }
 
     /// Returns the Record ID used for stable unsigned byte ordering.
-    #[cfg(test)]
     pub(crate) const fn record_id(&self) -> &Bytes {
         &self.record_id
+    }
+
+    /// Returns the conservative distance used by selection.
+    #[cfg(test)]
+    pub(crate) const fn distance(&self) -> ApproximateDistance {
+        self.distance
     }
 
     /// Returns the caller-owned value.
@@ -64,14 +69,6 @@ impl<T> OverlapSelection<T> {
     /// Consumes the result and returns its selected candidates.
     pub(crate) fn into_candidates(self) -> Vec<ApproximateCandidate<T>> {
         self.candidates
-    }
-
-    /// Consumes the result and returns the carried values.
-    pub(crate) fn into_values(self) -> Vec<T> {
-        self.candidates
-            .into_iter()
-            .map(|candidate| candidate.into_parts().2)
-            .collect()
     }
 }
 
