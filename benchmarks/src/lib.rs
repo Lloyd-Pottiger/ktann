@@ -16,7 +16,7 @@ pub mod bridge;
 
 // Shared measurement and dataset helpers used by standalone benchmark binaries.
 pub use backend::MeasuredBackend;
-pub use dataset::{BenchmarkDataset, limit_with_query_offset, load, load_large};
+pub use dataset::{limit_with_query_offset, load, load_large};
 pub use metrics::MetricCapture;
 pub use resource::ResourceSnapshot;
 

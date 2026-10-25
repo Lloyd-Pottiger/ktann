@@ -134,29 +134,3 @@ pub(crate) async fn leaf_layout_fingerprint<B: crate::storage::backend::Backend>
     }
     Ok(hash.finalize().into())
 }
-
-/// Opt-in inclusive phase timing; overlapping maintenance workers must not be
-/// interpreted as a wall-clock decomposition. Dropping also records failures.
-pub(crate) struct MaintenanceTimer {
-    stage: &'static str,
-    started: Option<std::time::Instant>,
-}
-
-impl MaintenanceTimer {
-    pub(crate) fn new(stage: &'static str) -> Self {
-        Self {
-            stage,
-            started: std::env::var_os("KTANN_EXPERIMENT_MAINTENANCE_TIMING")
-                .map(|_| std::time::Instant::now()),
-        }
-    }
-}
-
-impl Drop for MaintenanceTimer {
-    fn drop(&mut self) {
-        if let Some(started) = self.started {
-            ::metrics::histogram!("ktann.experiment.maintenance_seconds", "stage" => self.stage)
-                .record(started.elapsed().as_secs_f64());
-        }
-    }
-}

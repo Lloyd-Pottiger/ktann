@@ -133,7 +133,7 @@ fn topology_states_preserve_graph_binding_and_batched_body_epochs() {
             if epoch <= 42 {
                 assert_eq!(updated.unwrap_err().kind(), ErrorKind::InvalidArgument);
             } else {
-                let updated = updated.unwrap();
+                let updated = updated.unwrap().records;
                 TestGraph::restore(
                     centroids,
                     GraphSource { header, ..source },
@@ -191,7 +191,8 @@ fn ordinary_updates_preserve_metric_scores_canonical_children_and_source_integri
                     MEMORY,
                     &|| Ok(()),
                 )
-                .unwrap();
+                .unwrap()
+                .records;
                 let restored = TestGraph::restore(
                     centroids,
                     GraphSource {

@@ -35,9 +35,8 @@ mod ffi {
         type MetricContext<'a>;
         fn measure(context: &MetricContext, a: u32, b: u32) -> f64;
         fn proceed(context: &MetricContext) -> bool;
-        fn has_four(context: &MetricContext) -> bool;
-        fn has_tails(context: &MetricContext) -> bool;
-        fn measure_four(context: &MetricContext, a: u32, nodes: &[u32], output: &mut [f64]);
+        fn has_batch(context: &MetricContext) -> bool;
+        fn measure_batch(context: &MetricContext, a: u32, nodes: &[u32], output: &mut [f64]);
     }
 
     unsafe extern "C++" {
@@ -152,8 +151,7 @@ pub type DistanceBatch<'a> = dyn Fn(u32, &[u32], &mut [f64]) + 'a;
 // retains them, invokes them on other threads, or unwinds through a Rust frame.
 struct MetricContext<'a> {
     distance: &'a dyn Fn(u32, u32) -> f64,
-    four: Option<&'a DistanceBatch<'a>>,
-    tails: bool,
+    batch: Option<&'a DistanceBatch<'a>>,
     check: &'a dyn Fn() -> bool,
 }
 
@@ -161,18 +159,14 @@ fn measure(context: &MetricContext<'_>, a: u32, b: u32) -> f64 {
     (context.distance)(a, b)
 }
 
-/// Four ordered native ordinals; no callback or borrowed vector escapes this call.
-fn has_four(context: &MetricContext<'_>) -> bool {
-    context.four.is_some()
+/// Whether ordered neighbor batching is enabled for this native call.
+fn has_batch(context: &MetricContext<'_>) -> bool {
+    context.batch.is_some()
 }
 
-fn measure_four(context: &MetricContext<'_>, a: u32, nodes: &[u32], output: &mut [f64]) {
+fn measure_batch(context: &MetricContext<'_>, a: u32, nodes: &[u32], output: &mut [f64]) {
     assert!((2..=4).contains(&nodes.len()) && nodes.len() == output.len());
-    context.four.expect("enabled native batch")(a, nodes, output);
-}
-
-fn has_tails(context: &MetricContext<'_>) -> bool {
-    context.tails
+    context.batch.expect("enabled native batch")(a, nodes, output);
 }
 
 fn proceed(context: &MetricContext<'_>) -> bool {
@@ -281,8 +275,7 @@ impl Graph {
         }
         let context = MetricContext {
             distance,
-            four: None,
-            tails: false,
+            batch: None,
             check,
         };
         let inner = ffi::evolve(
@@ -322,8 +315,7 @@ impl Graph {
         }
         let context = MetricContext {
             distance,
-            four: None,
-            tails: false,
+            batch: None,
             check,
         };
         let inner = ffi::retain(self.inner, survivors, ef.min(n) as u32, limit, &context)?;
@@ -355,8 +347,7 @@ impl Graph {
         }
         let context = MetricContext {
             distance,
-            four: None,
-            tails: false,
+            batch: None,
             check,
         };
         let inner = ffi::build(
@@ -388,8 +379,7 @@ impl Graph {
         }
         let context = MetricContext {
             distance,
-            four: None,
-            tails: false,
+            batch: None,
             check,
         };
         Ok(self.inner.search(
@@ -400,14 +390,12 @@ impl Graph {
         )?)
     }
 
-    /// Experimental four-lane scoring with identical traversal and scalar tails.
-    #[allow(clippy::too_many_arguments)]
-    pub fn search_four(
+    /// Ordered scoring of two through four neighbors with identical scalar traversal.
+    pub fn search_batched(
         &self,
         ef: usize,
         distance: &dyn Fn(u32, u32) -> f64,
-        four: &DistanceBatch<'_>,
-        tails: bool,
+        batch: &DistanceBatch<'_>,
         check: &dyn Fn() -> bool,
         scratch: &mut Workspace,
         output: &mut [Hit],
@@ -417,8 +405,7 @@ impl Graph {
         }
         let context = MetricContext {
             distance,
-            four: Some(four),
-            tails,
+            batch: Some(batch),
             check,
         };
         Ok(self.inner.search(
@@ -677,10 +664,7 @@ mod quartet_tests {
                 .unwrap();
                 let mut scratch = Workspace::new(n, 16, workspace_bound(n, 16).unwrap()).unwrap();
                 for query in 0..n.min(32) as u32 {
-                    for (beam, tails) in [1, 4, 64.min(n), n]
-                        .into_iter()
-                        .flat_map(|beam| [(beam, false), (beam, true)])
-                    {
+                    for beam in [1, 4, 64.min(n), n] {
                         let scalar_trace = RefCell::new(Vec::new());
                         let batch_trace = RefCell::new(Vec::new());
                         let score = |node| distance(query, node);
@@ -704,15 +688,7 @@ mod quartet_tests {
                             .search(64, &scalar, &|| true, &mut scratch, &mut expected)
                             .unwrap();
                         let batch_stats = graph
-                            .search_four(
-                                64,
-                                &tail,
-                                &four,
-                                tails,
-                                &|| true,
-                                &mut scratch,
-                                &mut actual,
-                            )
+                            .search_batched(64, &tail, &four, &|| true, &mut scratch, &mut actual)
                             .unwrap();
                         assert_eq!(scalar_trace.into_inner(), batch_trace.into_inner());
                         assert_eq!(scalar_stats.distances, batch_stats.distances);
@@ -746,11 +722,10 @@ mod quartet_tests {
         let mut output = [Hit::default(); 4];
         for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             assert!(matches!(
-                graph.search_four(
+                graph.search_batched(
                     64,
                     &distance,
                     &|_, _, output| output.fill(invalid),
-                    true,
                     &|| true,
                     &mut scratch,
                     &mut output
@@ -759,25 +734,22 @@ mod quartet_tests {
             ));
         }
         // Safe callbacks may leave output lanes untouched; reject those scores.
-        for tails in [false, true] {
-            for written in [0, 1] {
-                assert!(matches!(
-                    graph.search_four(
-                        64,
-                        &distance,
-                        &|a, nodes, output| {
-                            for i in 0..written {
-                                output[i] = distance(a, nodes[i]);
-                            }
-                        },
-                        tails,
-                        &|| true,
-                        &mut scratch,
-                        &mut output,
-                    ),
-                    Err(Error::InvalidArgument)
-                ));
-            }
+        for written in [0, 1] {
+            assert!(matches!(
+                graph.search_batched(
+                    64,
+                    &distance,
+                    &|a, nodes, output| {
+                        for i in 0..written {
+                            output[i] = distance(a, nodes[i]);
+                        }
+                    },
+                    &|| true,
+                    &mut scratch,
+                    &mut output,
+                ),
+                Err(Error::InvalidArgument)
+            ));
         }
         let calls = Cell::new(0);
         let four = |a, nodes: &[u32], output: &mut [f64]| {
@@ -787,11 +759,10 @@ mod quartet_tests {
             }
         };
         assert!(matches!(
-            graph.search_four(
+            graph.search_batched(
                 64,
                 &distance,
                 &four,
-                true,
                 &|| calls.get() == 0,
                 &mut scratch,
                 &mut output
@@ -799,15 +770,7 @@ mod quartet_tests {
             Err(Error::Cancelled)
         ));
         graph
-            .search_four(
-                64,
-                &distance,
-                &four,
-                true,
-                &|| true,
-                &mut scratch,
-                &mut output,
-            )
+            .search_batched(64, &distance, &four, &|| true, &mut scratch, &mut output)
             .unwrap();
     }
 }

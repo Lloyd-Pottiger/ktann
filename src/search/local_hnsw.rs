@@ -261,58 +261,40 @@ pub(crate) fn search_graph_scoring(
     hits.resize(beam, Candidate::default());
     let distance =
         |_: u32, node: u32| centroids.distance(query, centroids.children[node as usize].centroid());
-    let groups: [Cell<u64>; 3] = std::array::from_fn(|_| Cell::new(0));
-    let distance_four = |_: u32, nodes: &[u32], output: &mut [f64]| {
-        let count = &groups[nodes.len() - 2];
-        count.set(count.get() + 1);
-        match *nodes {
-            [a, b] => output.copy_from_slice(&centroids.kernel.routing_distances_validated(
-                [
-                    centroids.children[a as usize].centroid(),
-                    centroids.children[b as usize].centroid(),
-                ],
-                query,
-            )),
-            [a, b, c] => output.copy_from_slice(&centroids.kernel.routing_distances_validated(
-                [
-                    centroids.children[a as usize].centroid(),
-                    centroids.children[b as usize].centroid(),
-                    centroids.children[c as usize].centroid(),
-                ],
-                query,
-            )),
-            [a, b, c, d] => output.copy_from_slice(&centroids.kernel.routing_distances_validated(
-                [
-                    centroids.children[a as usize].centroid(),
-                    centroids.children[b as usize].centroid(),
-                    centroids.children[c as usize].centroid(),
-                    centroids.children[d as usize].centroid(),
-                ],
-                query,
-            )),
-            _ => unreachable!("native distance batch width"),
-        }
+    let distance_four = |_: u32, nodes: &[u32], output: &mut [f64]| match *nodes {
+        [a, b] => output.copy_from_slice(&centroids.kernel.routing_distances_validated(
+            [
+                centroids.children[a as usize].centroid(),
+                centroids.children[b as usize].centroid(),
+            ],
+            query,
+        )),
+        [a, b, c] => output.copy_from_slice(&centroids.kernel.routing_distances_validated(
+            [
+                centroids.children[a as usize].centroid(),
+                centroids.children[b as usize].centroid(),
+                centroids.children[c as usize].centroid(),
+            ],
+            query,
+        )),
+        [a, b, c, d] => output.copy_from_slice(&centroids.kernel.routing_distances_validated(
+            [
+                centroids.children[a as usize].centroid(),
+                centroids.children[b as usize].centroid(),
+                centroids.children[c as usize].centroid(),
+                centroids.children[d as usize].centroid(),
+            ],
+            query,
+        )),
+        _ => unreachable!("native distance batch width"),
     };
     let stats = controlled(check, |proceed| {
         if batched {
-            graph.search_four(
-                ef,
-                &distance,
-                &distance_four,
-                true,
-                proceed,
-                scratch,
-                &mut hits,
-            )
+            graph.search_batched(ef, &distance, &distance_four, proceed, scratch, &mut hits)
         } else {
             graph.search(ef, &distance, proceed, scratch, &mut hits)
         }
     })?;
-    if batched {
-        ::metrics::counter!("ktann.experiment.batch2_calls").increment(groups[0].get());
-        ::metrics::counter!("ktann.experiment.batch3_calls").increment(groups[1].get());
-        ::metrics::counter!("ktann.experiment.batch4_calls").increment(groups[2].get());
-    }
     Ok((hits, stats))
 }
 

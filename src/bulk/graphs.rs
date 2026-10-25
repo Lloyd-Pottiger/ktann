@@ -122,7 +122,8 @@ impl<'a> GraphPreparation<'a> {
             },
             self.budget,
             check,
-        )?;
+        )?
+        .records;
         ::metrics::histogram!("ktann.routing.build_seconds")
             .record(started.elapsed().as_secs_f64());
         ::metrics::counter!("ktann.routing.stored_graph_bytes").increment(records.descriptor.bytes);

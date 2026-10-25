@@ -365,17 +365,6 @@ impl<B: Backend> Index<B> {
         Ok(outcome)
     }
 
-    /// Experimental single-tree Header rediscovery for the write benchmark.
-    #[cfg(feature = "benchmark")]
-    pub fn benchmark_rediscover_fixups(&self, partitions: Vec<super::PartitionKey>) -> Result<()> {
-        let tree = crate::storage::keys::TreeKey::encode(&[], &[])?;
-        self.runtime.offer_fixups(
-            &self.manifest,
-            partitions.into_iter().map(|p| (tree.clone(), p)),
-        );
-        Ok(())
-    }
-
     /// Runs one bounded, read-only verification of this index.
     ///
     /// The audit validates the persisted Active Manifest and then checks one

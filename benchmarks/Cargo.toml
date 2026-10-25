@@ -55,13 +55,3 @@ unsafe_code = "deny"
 name = "ktann-mutable-graph"
 path = "src/bin/mutable_graph.rs"
 required-features = ["rocksdb"]
-
-[[bin]]
-name = "ktann-write-routing"
-path = "src/bin/write_routing.rs"
-required-features = ["rocksdb"]
-
-[[bin]]
-name = "ktann-write-lifecycle"
-path = "src/bin/write_lifecycle.rs"
-required-features = ["rocksdb"]

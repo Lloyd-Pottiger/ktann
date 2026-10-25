@@ -17,8 +17,6 @@ pub(super) const MAX_HEADER_SLOTS: u64 = 262_144;
 pub(super) struct Snapshot {
     pub(super) facts: Value,
     pub(super) ready: bool,
-    #[allow(dead_code, reason = "consumed by the isolated write benchmark")]
-    pub(super) pending: Vec<PartitionKey>,
 }
 
 /// A readiness round reads at most 262,144 allocated Header slots in 256-key
@@ -66,7 +64,6 @@ pub(super) async fn snapshot<B: Backend>(
     let mut partitions = 0;
     let mut transitional = 0;
     let mut actionable = 0;
-    let mut pending = Vec::new();
     let mut root_present = false;
     for first in (1..=high_water).step_by(256) {
         let partitions_in_batch: Vec<_> = (first..=(first + 255).min(high_water))
@@ -106,17 +103,13 @@ pub(super) async fn snapshot<B: Backend>(
                 || (partition != tree.root()
                     && header.entry_count()
                         < manifest.config().min_partition_entries(header.level()));
-            if needs_work && header.state() != PartitionState::ReceivingSplit {
-                actionable += 1;
-                pending.push(partition);
-            }
+            actionable += u64::from(needs_work && header.state() != PartitionState::ReceivingSplit);
         }
     }
     if !root_present {
         return Err(corrupt());
     }
     Ok(Snapshot {
-        pending,
         ready: leaf_entries == records && actionable == 0 && transitional == 0,
         facts: json!({"kind":"single-tree header snapshot (not full integrity verification)","records_from_leaf_headers":leaf_entries,"partitions":partitions,"max_level":partitions_by_level.keys().next_back(),"partitions_by_level":partitions_by_level,"max_entries_by_level":max_entries_by_level,"actionable":actionable,"transitional":transitional,"allocated_header_slots":high_water}),
     })

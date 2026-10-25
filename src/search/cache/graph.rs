@@ -447,6 +447,5 @@ pub(crate) fn install_prepared(
         bytes,
         entries: BodyEntries::InternalGraph(Box::new(graph)),
     });
-    ::metrics::counter!("ktann.experiment.ready_graph_offers").increment(1);
     cache.install(key, body);
 }

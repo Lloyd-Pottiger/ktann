@@ -584,59 +584,10 @@ allocations; it is not graph working memory.
 Logical KV bytes do not measure native physical writes. These experiments cover
 the reported size and update history and do not establish a production SLA.
 
-### Isolated write-routing experiment
+### Adaptive write routing
 
-See [measured findings and invariants](write-routing.md) for the Cohere 1M results.
-
-`ktann-write-routing OUTPUT WORKERS UPDATES` replays vector-changing upserts on
-an existing, settled Cohere 1M RocksDB fixture at `OUTPUT/database` (namespace
-`ktann-benchmark`, index `benchmark`). Clone the fixture for every run; the runner
-modifies its database. Build with:
-
-```sh
-cargo build --release -p ktann-benchmarks --bin ktann-write-routing
-```
-
-Set `KTANN_BENCH_DATASET_CACHE` as above. The reference workload uses 8,192
-updates in batches of 32, a seeded permutation, and zero or two maintenance
-workers. Query warmup is fixed at beam128/ef64/rerank125; it is outside write
-timing. The fixture must retain write beam4/ef64. Full verification runs before
-and after measurement.
-
-The default is exact write routing. Benchmark-feature-only experimental switches:
-
-- `KTANN_EXPERIMENT_WRITE_HNSW=1`: local HNSW write routing, with workspace
-  reuse and two/three/four-neighbor scoring.
-- `KTANN_EXPERIMENT_PUBLISH_READY=1`: after a known successful maintenance commit,
-  offer its prepared graph to the existing bounded cache, avoiding a subsequent
-  storage read and restore when that version is reusable.
-
-`KTANN_FORCE_GRAPH_MISS=1` (benchmark feature only) is an adversarial diagnostic that bypasses graph cache
-reuse, including prepared graph publication. Leave it unset for realistic
-maintenance comparisons. Leave all experimental switches unset for the baseline.
-
-`report.json` separates foreground writes, total time including maintenance
-rediscovery/drain, process CPU, logical backend IO, graph reads/restores, and
-maintenance work. The drain observer checks committed Headers and reoffers
-pending maintenance candidates; total time includes this observer and does not
-measure autonomous queue convergence. `ready_graph_offers` counts offers, not
-cache admissions or hits. Compare repeated complete-write runs and total CPU/IO,
-not routing latency alone. These experiments do not change production defaults
-or establish FoundationDB performance.
-
-For maintenance attribution, `KTANN_EXPERIMENT_MAINTENANCE_TIMING=1` records
-inclusive phase samples under `foreground_maintenance_phases` and
-`drain_maintenance_phases`. Phase sums overlap across workers and nested work.
-`KTANN_EXPERIMENT_REUSE_PARENT_PROOF=1` additionally reuses a prepared incoming-edge
-discovery only after validating the full parent-body set and update-protecting
-all captured Header versions. Its existing ordered body guards also cover
-those parent bodies during local preparation. Mismatches discard the plan. This benchmark-only
-experiment avoids the second parent-level centroid scan, while retaining exact
-initial discovery and incoming-edge conflict protection. Reports count proof
-reuse and stale attempts; evaluate total time, logical IO and retries together.
-
-### Write-routing lifecycle validation
-
-See [the small/cold/sustained-write protocol](write-lifecycle.md) for the
-`ktann-write-lifecycle` harness and fixed-budget quality checks toward default
-enablement. It complements the mature-topology write-routing measurements.
+Graph-enabled indexes use exact scoring below 1024 internal nodes and HNSW at
+or above 1024, independently for each snapshot-authoritative body. There are no
+write-routing experiment switches. Query behavior and budgets are unchanged.
+See [write-routing validation](write-routing.md) for the measured benefits,
+quality baseline, limitations, and pinned historical reproductions.

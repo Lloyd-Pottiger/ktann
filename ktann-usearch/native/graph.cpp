@@ -91,15 +91,14 @@ void checkpoint(MetricContext const& context) {
 struct Metric {
     MetricContext const& context;
     std::size_t calls = 0;
-    bool four = has_four(context);
-    bool tails = has_tails(context);
+    bool batched = has_batch(context);
     static std::uint32_t ordinal(std::uint32_t node) { return node; }
     template <typename T> static std::uint32_t ordinal(T const& node) { return get_slot(node); }
     // Gather only distances the scalar traversal would request. Consume scores
     // in adjacency order before moving to another frontier candidate.
     template <typename A, typename Entries, typename Allowed, typename Transform, typename Callback>
     void batch(A const& a, Entries const& entries, Allowed&& allowed, Transform&& transform, Callback&& callback) {
-        if (!four) {
+        if (!batched) {
             for (auto slot : entries)
                 if (allowed(slot)) callback(slot, (*this)(a, transform(slot)));
             return;
@@ -109,9 +108,9 @@ struct Metric {
         auto flush = [&]() {
             double distances[4];
             std::fill_n(distances, 4, std::numeric_limits<double>::quiet_NaN());
-            if (count == 4 || (tails && count >= 2)) {
+            if (count >= 2) {
                 if ((calls & 63) == 0 || (calls >> 6) != ((calls + count - 1) >> 6)) checkpoint(context);
-                measure_four(context, ordinal(a), rust::Slice<const std::uint32_t>(nodes, count), rust::Slice<double>(distances, count));
+                measure_batch(context, ordinal(a), rust::Slice<const std::uint32_t>(nodes, count), rust::Slice<double>(distances, count));
                 calls += count;
                 for (std::size_t i = 0; i != count; ++i) {
                     if (!std::isfinite(distances[i])) throw std::runtime_error("invalid");

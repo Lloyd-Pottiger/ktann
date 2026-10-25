@@ -115,7 +115,8 @@ impl Fixture {
             W,
             &|| Ok(()),
         )
-        .unwrap();
+        .unwrap()
+        .records;
         let mut fixture = Self {
             manifest,
             tree,

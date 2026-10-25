@@ -15,7 +15,7 @@ bounded working memory remain mandatory. Mixed waves share one candidate beam.
 Cohere lifecycle experiments found graph traversal overhead dominates small
 bodies, while mature 1M topology benefits substantially. The 1024 threshold is a
 conservative policy above the measured crossover, not a universal optimal value.
-See [the measurements](../../benchmarks/write-lifecycle.md) for scope and limits.
+See [the measurements](../../benchmarks/write-routing.md) for scope and limits.
 The threshold is internal policy, not persisted configuration.
 
 Prepared immutable graphs are published to the byte-bounded cache only after

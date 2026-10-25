@@ -1594,8 +1594,6 @@ pub(crate) async fn find_incoming_edge<T: LogicalReader>(
     partition: PartitionKey,
     level: u32,
 ) -> Result<Option<(PartitionKey, ChildEntry)>> {
-    #[cfg(feature = "benchmark")]
-    let _timer = crate::benchmark::MaintenanceTimer::new("incoming_edge_discovery");
     let parent_level = level.checked_add(1).ok_or_else(corrupt)?;
     let bodies = level_bodies(txn, manifest, tree_key, parent_level).await?;
     // Only the parent level's matches are collected.

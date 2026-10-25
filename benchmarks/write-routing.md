@@ -1,199 +1,94 @@
-# Write-time local HNSW: Cohere 1M findings
+# Adaptive write routing: validation findings
 
-Status: historical opt-in measurements. Graph-enabled indexes now use exact
-write routing below 1024 internal nodes and HNSW at or above 1024; see
-[default validation](write-lifecycle.md). The behavior switches below were removed.
-This work concerns writes and their structural maintenance. Query behavior and
-budgets are unchanged. The implementation is based on `partition-local-hnsw`
-(`48b52914b133d1b96807c1e8fac2c4975e3e71ad`). Measurements below were collected
-on 2026-10-24 with RocksDB; they are workload observations, not an SLA.
+Graph-enabled indexes route writes exactly below **1024 nodes per internal
+body** and use local HNSW at or above that threshold. The decision uses each
+body's snapshot Header, not the index record count. Query behavior and budgets
+are unchanged. See [ADR 0031](../docs/adr/0031-adaptive-local-graph-write-routing.md).
 
-## Fixed workload
+## Cohere validation
 
-- Cohere 1M, 768-dimensional cosine vectors. Every run clones the same settled
-  database: 13,130 leaves, three level-2 internal partitions and one level-3 root;
-  all 13,134 partitions Ready, no actionable maintenance, largest internal body
-  5,150 children. M16, efConstruction200, seed7, offline refinement2;
-  leaf bounds 16:128 and internal bounds 64:8192.
-- 8,192 vector-changing upserts, one foreground writer, batch32 (256 calls), four
-  runtime threads. A seed7 xorshift permutation selects target IDs from its first
-  8,192 ordinals and replacement vectors starting at ordinal 500,000. The record
-  count remains 1M. Input construction is outside timing.
-- Write beam4 and experimental HNSW ef64. Warmup queries 200..299 use
-  beam128/ef64/k100/rerank125, outside write timing. No rerank sweep.
-- Identical default caches: on the measured 16GiB host the partition cache budget
-  is 4GiB; RocksDB uses its default block cache. No compilation or tests overlap
-  timed runs. Full Verify before/after each run is outside timing.
-- With two maintenance workers, total time includes bounded Header rediscovery,
-  reoffering pending fixups, and drain to three quiet Ready rounds. This does
-  **not** demonstrate autonomous queue convergence. Logical read bytes measure
-  the adapter interface, not physical disk traffic. CPU includes maintenance.
+These are historical RocksDB measurements from 2026-10-25, collected before
+removing the temporary experiment runners and instrumentation. The measured
+implementation is pinned by `environment.json` in the local artifact directory
+`.benchmark-data/results/write-routing-default-1024-20261025/`; commit
+`0e6c18df2b22774cd909196a2291127277cd11d0` retains the validation sources.
+The exact control used the pinned binary from
+`.benchmark-data/results/write-routing-threshold-20261025/` with experimental
+flags unset. Cleanup has not been remeasured on Cohere 1M.
 
-## Results
+Every comparison cloned the same mature topology and used the same batches:
+Cohere 768-dimensional cosine, M16/efConstruction200/seed7, leaf bounds 16:128,
+internal bounds 64:8192, two refinement passes, batch32, write beam4/ef64 and
+two maintenance workers. Deterministic vector swaps preserve the dataset
+multiset. Total time includes foreground writes and maintenance drain; Verify
+and query evaluation are outside timing. Builds and tests did not overlap
+measurements. The 1M topology starts with a three-child root and three large
+internal bodies, the largest containing 5,150 nodes.
 
-Each table compares modes within one run series; do not mix medians across
-series. Concurrent scheduling can change the number of completed maintenance
-steps even with identical upserts.
+| Fixture | Internal nodes | Updates | Exact total | Adaptive total | Change |
+|---|---:|---:|---:|---:|---:|
+| 16K warm | 199 | 4 × 8,192 | 4.139s | 4.257s | +2.9% |
+| 16K cold | 199 | 4 × 8,192 | 4.169s | 4.162s | −0.2% |
+| 64K cold | 834 | 2 × 8,192 | 4.416s | 4.312s | −2.4% |
+| 128K cold | 1,652 | 2 × 8,192 | 7.098s | 3.886s | −45.3% |
+| 1M cold start | up to 5,150 | 8 × 32,768 | 651.351s | 193.196s | −70.3% |
 
-### Batched write routing and committed graph reuse
+Small/medium results are medians of three alternating repetitions per arm;
+1M is one fresh eight-round pair. Small exact-only differences should not be
+interpreted as an algorithmic speedup. Earlier threshold trials found HNSW
+regressed at 413 nodes and improved at 793–834 nodes; 1024 is a conservative
+cutover. The 1M first cold round improved from 83.043s to 25.114s.
 
-Fixed warm topology, no maintenance: three-run median complete-write time is
-17.584s exact versus 4.683s batched HNSW (**73.4% less**). A prior scalar HNSW
-mechanism probe took 9.070s versus 4.756s batched, with identical 9,583,160 distance
-calls; this was a single scalar probe, not a repeated throughput comparison.
+For 1M, foreground time fell from 649.032s to 187.357s, CPU from 725.248s to
+267.622s, and logical reads from 101.569GB to 55.992GB. Maintenance drain rose
+from 2.319s to 5.839s and is included in total time. Small-root routes stayed
+exact while large-body routes used HNSW.
 
-With two workers, three-run medians:
+## Write quality and recall
 
-| Mode | Foreground writes | Writes + drain | Total CPU | Logical reads |
-|---|---:|---:|---:|---:|
-| Exact | 22.313s | 25.130s | 63.400s | 30.999GB |
-| Batched HNSW | 6.943s | 21.032s | 42.270s | 25.627GB |
-| + committed prepared graph reuse | 5.254s | 20.791s | 38.988s | 24.434GB |
+All 26 completed validation runs passed Verify after every round and ended
+without pending transitional states. The 1M pair ended with 13,409 versus
+13,407 leaves, three internal parents and one root; both respected the maximum
+leaf size of 128. Maximum parent sizes were 5,264 versus 5,262.
 
-Publishing an already-prepared graph after known commit success reduces
-foreground graph loads from 64–66 to 5–8. Median graph read/restore time drops from
-1.864s to 0.211s. Foreground writes improve 24.3%, but writes plus drain improve
-only 1.1%; the foreground gain is not the overall throughput gain.
+Query evaluation was fixed at beam 128 / ef 64, rerank 125, k 100, query rows 100–199,
+distance budget 65,536 and candidate budget 16,384. Initial recall was 82.60%;
+final recall was **82.63% for both arms**. Intermediate adaptive-minus-exact
+mean differences were 0.00–0.04 percentage points. A paired query bootstrap
+(seed7, 3,000 resamples) gave a final 95% interval of [−0.05, +0.05] percentage
+points. This supports write-quality parity for the measured workload, not a
+universal recall or long-term drift guarantee.
 
-When every graph reuse is forcibly bypassed, two-run medians are 25.442s exact
-versus 20.248s HNSW. Each HNSW run loads 1,024 graphs: reading 9.151s and restoring
-6.046s dominate actual graph search 2.716s. This is an adversarial control, not a
-realistic invalidation frequency. Workspace allocation is only a few milliseconds.
+Earlier 90%+ results used different operating points: the October 17 record
+used leaf512/beam128 (92.422%, 500 queries); the October 19 record used
+leaf128/beam435/ef435 (91.01%, a different query sample). They are not directly
+comparable to this leaf128/beam128/ef64 write-routing control. Rerank remains125.
 
-### Avoid repeated parent-edge discovery during maintenance
+## Why the retained optimizations matter
 
-The remaining dominant work was exact incoming-edge discovery, which scans
-complete parent-level Child Entries and their 768-dimensional centroid payloads.
-Preparing and committing maintenance could independently repeat that scan.
+Write search reuses workspace and scores two to four neighbors together while
+preserving adjacency consumption and candidate ordering. Queries retain their
+scalar path. Graph preparation supplies both persistence records and the native
+graph; known-success commits can publish that graph into the existing bounded
+cache, avoiding immediate rereads and reconstruction.
 
-Three-run medians, **same executable**, all with batched HNSW and committed graph
-reuse; only parent-proof reuse differs:
+Structural maintenance discovers the incoming parent exactly after acquiring
+sorted body guards and refreshing its snapshot. A captured parent proof avoids
+a second full discovery during commit, while the commit rechecks the complete
+parent set, update-protects its Headers and protects the actual incoming entry.
+In the October 24 three-run mechanism comparison, proof reuse reduced total
+write-plus-drain time from 19.777s to 18.406s, CPU from 37.749s to 27.292s and
+logical reads from 24.301GB to 13.118GB; foreground time remained about 5.1s.
 
-| Metric | Control | Parent-proof reuse | Change |
-|---|---:|---:|---:|
-| Foreground writes | 5.083s | 5.116s | +0.6% |
-| Writes + drain | 19.777s | 18.406s | **-6.9%** |
-| Total CPU | 37.749s | 27.292s | **-27.7%** |
-| Logical reads | 24.301GB | 13.118GB | **-46.0%** |
-| Full incoming-edge discoveries | 484 | 209 | -56.8% |
-| Cumulative discovery time | 16.423s | 6.317s | -61.5% |
+Cancellation, memory admission, cache accounting, source identity/epoch checks
+and commit fences remain production requirements. There is no second graph
+cache, reverse pointer, persistent-format change or runtime experiment switch.
 
-Control total-time range 19.738–20.478s; optimized 17.972–18.419s. Optimized runs
-reuse 209 proofs each with zero stale-proof attempts. Retryable commits are 3/2/4
-versus 2/0/0. Controls complete 96 splits each, optimized 98 each; all complete 13
-merges. The improvement is not caused by fewer completed splits. Foreground
-latency is effectively unchanged: the gain is in maintenance and resources.
+## Limits
 
-Inclusive phase durations overlap across workers and nested phases; they cannot
-be added to reconstruct wall-clock time. Native preparation remains approximately
-6.87s versus 6.82s cumulative. Two mechanism probes established why avoiding the
-second scan alone was insufficient: without local guards it caused 98 stale
-plans and 300 native preparations; with guards but scanning before waiting, it
-still performed 375 full discoveries. The final path defers the full scan until
-after guard acquisition and snapshot refresh.
-
-## Retained implementation and invariants
-
-- Write HNSW always reuses per-body workspace and scores groups of two to four
-  neighbors. Adjacency consumption, candidate ordering and distance-call trace
-  are preserved; scalar production queries retain their existing path.
-- Write routing observes operation cancellation/deadlines and the configured
-  working-memory budget. CPU work stays within its admitted foreground task.
-- Prepared graph publication uses the existing bounded cache, only after known
-  commit success. Native graph/centroid/kernel retention is charged; old snapshots
-  still validate descriptor, identity and epoch. Failed or stale plans do not
-  publish. Offers are not necessarily cache admissions.
-- Parent-proof reuse first reads the parent-body set and Headers, then takes the
-  existing sorted body guards. Waiting refreshes the snapshot before full exact
-  incoming-edge discovery. Proof and discovery use the same snapshot.
-- Before editing, the commit rewalks the complete parent set and update-protects
-  every captured Header, requires equality, and protects the actual incoming
-  Child Entry in addition to existing graph-source fences. Any mismatch discards
-  the plan. Child Entry changes advance their owner's epoch. No reverse pointer,
-  second shared cache or persistent format change is introduced.
-- Extra proof and guard metadata reduces working-memory admission. Broader local
-  guard scope can affect concurrency; performance beyond two maintenance workers
-  and across processes/backends remains unmeasured. These results do not justify
-  enabling the experiment by default or claiming FoundationDB performance.
-
-## Historical reproduction (commit 24f9092)
-
-Build and use [`ktann-write-routing`](README.md#isolated-write-routing-experiment).
-The runner expects `OUTPUT/database`, namespace `ktann-benchmark`, index
-`benchmark`. It mutates that copy. Exact reproduction requires the original
-settled fixture; a fresh build with the same settings is a different topology.
-The locally retained fixture is:
-
-```text
-.benchmark-data/results/cohere-1m-attribution-20261024/fixture/database
-```
-
-Example on macOS/APFS (use a normal independent copy on other filesystems):
-
-```sh
-cargo build --release -p ktann-benchmarks --bin ktann-write-routing
-export KTANN_BENCH_DATASET_CACHE=/path/to/vectordb_bench/dataset
-case_dir=.benchmark-data/results/write-routing-final-repeat
-mkdir "$case_dir"
-cp -cR .benchmark-data/results/cohere-1m-attribution-20261024/fixture/database "$case_dir/database"
-env -u KTANN_FORCE_GRAPH_MISS \
-  KTANN_EXPERIMENT_WRITE_HNSW=1 \
-  KTANN_EXPERIMENT_PUBLISH_READY=1 \
-  KTANN_EXPERIMENT_REUSE_PARENT_PROOF=1 \
-  KTANN_EXPERIMENT_MAINTENANCE_TIMING=1 \
-  target/release/ktann-write-routing "$case_dir" 2 8192
-```
-
-For the parent-proof control, unset `KTANN_EXPERIMENT_REUSE_PARENT_PROOF`; retain
-the other switches. For the exact baseline, unset all three optimization switches.
-Use a fresh fixture copy per run and alternate run order. All switches enable by
-presence, so unset them rather than setting them to 0. Workers 0 isolates warm
-routing; `KTANN_FORCE_GRAPH_MISS=1` bypasses reuse only in benchmark-feature builds.
-The former workspace/scalar/quartet selection and audit-only switches were
-removed during cleanup; they are not needed to reproduce the retained modes.
-
-`report.json` contains foreground and total timing/CPU/IO, full Verify summaries,
-maintenance steps, proof reuse/stale counts, graph loads and phase samples.
-Local raw artifacts (not committed due to size):
-
-| Series | Directory under `.benchmark-data/results/` |
-|---|---|
-| Initial complete-write and scalar probe | `write-routing-1m-20261024` |
-| Prepared graph publication, 20 verified runs | `write-routing-publish-20261024` |
-| Parent-proof attribution/comparison, 13 verified runs | `write-maintenance-phases-20261024` |
-
-Each series retains reports, logs, driver invocations, source snapshots and
-measured executables. The six final parent-proof comparisons used SHA-256
-`9299ca3ec15c1d1027417e2989f5f967eddeb13c09d4330e66ae466cbfbe9df5`.
-These figures predate removal of redundant experiment selectors; cleanup
-validation is recorded below rather than relabeling historical measurements as
-new runs.
-
-## Correctness evidence
-
-Core tests, native scalar/batched trace equivalence, snapshot pagination, graph
-updates, split interleavings, commit faults/recovery, cache epoch publication,
-and parent-proof rejection/conflict-read coverage pass. Parent-proof tests include
-changes to an unselected parent, a changed parent set, root demotion and metadata
-budget exhaustion. Independent reviews covered publication, proof validation,
-ordered guards and discovery ordering. Complete-write runs verify the full 1M
-records before and after; the final whole-patch review/checks accompany merge
-preparation. No query optimization or rerank-budget change is included.
-
-## Merge cleanup validation (2026-10-24)
-
-After selector cleanup, the core benchmark-feature suite passed 751 tests; native
-tests passed 17, including scalar/batched equivalence. The explicit prepared-graph
-publication test and opt-in graph update, split-interleaving and transaction-budget
-suites passed. Formatting, workspace Clippy (excluding FoundationDB), and the core
-no-default-features check passed. An independent complete-patch review reported
-no actionable findings. FoundationDB performance was not measured.
-
-A final release-build smoke run used all three retained experiment switches,
-two maintenance workers, batch 32 and 8,192 updates on a fresh copy of the same
-Cohere 1M fixture. Full Verify before and after completed without issues; final
-topology had no actionable partitions. Foreground time was 5.598 s and total time
-including maintenance was 19.575 s. This single run verifies the cleaned entrypoint;
-it is not a replacement for the repeated comparisons above. Its report, invocation,
-binary hash and validation logs are under
-`.benchmark-data/results/write-routing-merge-cleanup-20261024/`.
+These observations cover a stationary multiset, local RocksDB and two
+maintenance workers. They do not establish performance under distribution
+drift, unbounded growth, more writers/workers, multiple processes or
+FoundationDB. Historical artifacts and source commits preserve the experiment
+provenance; temporary runners, forced-miss switches and phase counters are not
+part of the maintained implementation.

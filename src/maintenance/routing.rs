@@ -522,20 +522,8 @@ struct PendingBeamMember {
     distance: f64,
 }
 
-// Count nodes in each snapshot-authoritative internal body, not index records.
-fn use_write_graph(nodes: u32) -> bool {
-    nodes >= 1024
-}
-
-#[test]
-fn write_graph_threshold() {
-    for nodes in [0, 1, 1023] {
-        assert!(!use_write_graph(nodes));
-    }
-    for nodes in [1024, 1025, u32::MAX] {
-        assert!(use_write_graph(nodes));
-    }
-}
+// Select per internal body's snapshot-authoritative node count, not index records.
+const WRITE_HNSW_MIN_NODES: u32 = 1024;
 
 /// Descends from `root` with the whole group, reading each visited partition
 /// once, retaining several candidate paths per vector, and returning one Route
@@ -859,22 +847,21 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
             let nearest = nearest
                 .as_mut()
                 .ok_or_else(|| Error::new(ErrorKind::Backend))?;
-            let graph_cache = cache.filter(|_| {
+            let graph_route = cache.zip(control).filter(|_| {
                 manifest.config().local_graph().is_some()
-                    && control.is_some()
                     && bodies
                         .iter()
-                        .any(|(_, header)| use_write_graph(header.entry_count()))
+                        .any(|(_, header)| header.entry_count() >= WRITE_HNSW_MIN_NODES)
             });
             // Keep the ordinary exact arm allocation-free beyond its existing
             // wave state. Mixed waves scan their small bodies together so the
             // quartet scorer and bounded lockstep reads remain shared.
-            let exact_indices = graph_cache.map(|_| {
+            let exact_indices = graph_route.map(|_| {
                 bodies
                     .iter()
                     .enumerate()
                     .filter_map(|(index, (_, header))| {
-                        (header.entry_count() > 0 && !use_write_graph(header.entry_count()))
+                        (header.entry_count() > 0 && header.entry_count() < WRITE_HNSW_MIN_NODES)
                             .then_some(index)
                     })
                     .collect::<Vec<_>>()
@@ -885,8 +872,7 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                     .map(|&index| bodies[index])
                     .collect::<Vec<_>>()
             });
-            if let Some(cache) = graph_cache {
-                let control = control.expect("graph write route owns control");
+            if let Some((cache, control)) = graph_route {
                 let check = || control.checkpoint();
                 check()?;
                 // Charge borrowed query vectors and wave bookkeeping in addition
@@ -932,22 +918,13 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                         .await?;
                         continue;
                     }
-                    if !use_write_graph(header.entry_count()) {
+                    if header.entry_count() < WRITE_HNSW_MIN_NODES {
                         continue;
                     }
-                    #[cfg(feature = "benchmark")]
-                    ::metrics::counter!("ktann.experiment.write_hnsw_bodies").increment(1);
                     use crate::search::cache::{
                         BodyRequest,
                         graph::{GraphRead, read_graph},
                     };
-                    #[cfg(feature = "benchmark")]
-                    let forced_cache = std::env::var_os("KTANN_FORCE_GRAPH_MISS")
-                        .map(|_| PartitionCache::new(working_bytes as u64));
-                    #[cfg(feature = "benchmark")]
-                    let cache = forced_cache.as_ref().unwrap_or(cache);
-                    #[cfg(feature = "benchmark")]
-                    let phase = std::time::Instant::now();
                     let input = read_graph(
                         reader,
                         cache,
@@ -962,22 +939,12 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                         &check,
                     )
                     .await?;
-                    #[cfg(feature = "benchmark")]
-                    ::metrics::histogram!("ktann.experiment.graph_read")
-                        .record(phase.elapsed().as_secs_f64());
-                    #[cfg(feature = "benchmark")]
-                    let phase = std::time::Instant::now();
                     let graph = match input {
                         GraphRead::Cached(graph) => graph,
                         GraphRead::Load(load) => {
                             tokio::task::block_in_place(|| load.restore(cache, &check))?
                         }
                     };
-                    #[cfg(feature = "benchmark")]
-                    ::metrics::histogram!("ktann.experiment.graph_restore")
-                        .record(phase.elapsed().as_secs_f64());
-                    #[cfg(feature = "benchmark")]
-                    let phase = std::time::Instant::now();
                     for entry in graph.children() {
                         check()?;
                         if incoming_owners
@@ -987,49 +954,20 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                             return Err(Error::new(ErrorKind::Corruption));
                         }
                     }
-                    #[cfg(feature = "benchmark")]
-                    ::metrics::histogram!("ktann.experiment.ownership")
-                        .record(phase.elapsed().as_secs_f64());
                     tokio::task::block_in_place(|| -> Result<()> {
-                        #[cfg(feature = "benchmark")]
-                        let phase = std::time::Instant::now();
                         let mut scratch = graph.write_workspace()?;
-                        #[cfg(feature = "benchmark")]
-                        ::metrics::histogram!("ktann.experiment.workspace")
-                            .record(phase.elapsed().as_secs_f64());
                         for &(member, repetitions) in &body_members[index] {
-                            #[cfg(feature = "benchmark")]
-                            let phase = std::time::Instant::now();
                             let (hits, _stats) = graph.write_search(
                                 routings[member],
                                 nearest[member].beam,
                                 &mut scratch,
                                 &check,
                             )?;
-                            #[cfg(feature = "benchmark")]
-                            ::metrics::histogram!("ktann.experiment.search")
-                                .record(phase.elapsed().as_secs_f64());
-                            #[cfg(feature = "benchmark")]
-                            let phase = std::time::Instant::now();
-                            #[cfg(feature = "benchmark")]
-                            ::metrics::counter!("ktann.experiment.write_distances")
-                                .increment(_stats.distances as u64);
                             for (child, distance) in hits {
-                                let ordinal = graph
-                                    .children()
-                                    .binary_search_by_key(&child, ChildEntry::child)
-                                    .map_err(|_| Error::new(ErrorKind::Corruption))?;
                                 for _ in 0..repetitions {
-                                    nearest[member].consider(
-                                        distance,
-                                        &graph.children()[ordinal],
-                                        *body,
-                                    );
+                                    nearest[member].consider(distance, child, *body);
                                 }
                             }
-                            #[cfg(feature = "benchmark")]
-                            ::metrics::histogram!("ktann.experiment.merge")
-                                .record(phase.elapsed().as_secs_f64());
                         }
                         Ok(())
                     })?;
@@ -1037,21 +975,12 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
             }
             let scan = exact_bodies.as_deref().unwrap_or(&bodies);
             if !scan.is_empty() {
-                #[cfg(feature = "benchmark")]
-                ::metrics::counter!("ktann.experiment.write_exact_bodies")
-                    .increment(scan.len() as u64);
                 scan_bodies(
                     reader,
                     manifest,
                     tree_key,
                     scan,
-                    if cfg!(feature = "benchmark")
-                        && std::env::var_os("KTANN_FORCE_GRAPH_MISS").is_some()
-                    {
-                        None
-                    } else {
-                        cache
-                    },
+                    cache,
                     &mut |index, entry| {
                         // Cache hits can score the whole small body without an
                         // await; retain operation control in the hybrid arm.
@@ -1080,7 +1009,7 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                                 kernel.routing_distances_validated(vectors, entry.centroid());
                             for (&(member, repetitions), distance) in group.iter().zip(distances) {
                                 for _ in 0..repetitions {
-                                    nearest[member].consider(distance, entry, body);
+                                    nearest[member].consider(distance, entry.child(), body);
                                 }
                             }
                         }
@@ -1088,7 +1017,7 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                             let [distance] = kernel
                                 .routing_distances_validated([routings[member]], entry.centroid());
                             for _ in 0..repetitions {
-                                nearest[member].consider(distance, entry, body);
+                                nearest[member].consider(distance, entry.child(), body);
                             }
                         }
                         Ok(())
@@ -1159,10 +1088,10 @@ impl NearestChildren {
         }
     }
 
-    fn consider(&mut self, distance: f64, entry: &ChildEntry, owner: PartitionKey) {
+    fn consider(&mut self, distance: f64, child: PartitionKey, owner: PartitionKey) {
         let candidate = WriteChildCandidate {
             distance,
-            child: entry.child(),
+            child,
             owner,
         };
         if self.best.len() < self.beam {

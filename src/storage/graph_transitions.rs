@@ -56,8 +56,6 @@ impl GraphTransitionSource {
         check: &C,
     ) -> Result<Self> {
         check()?;
-        #[cfg(feature = "benchmark")]
-        let _source_timer = crate::benchmark::MaintenanceTimer::new("source_read");
         let manifest = txn.require_manifest()?.clone();
         if manifest.lifecycle() != IndexLifecycle::Active
             || manifest.config().local_graph().is_none()
@@ -280,15 +278,11 @@ impl GraphTransitionSource {
         check()?;
         let config = self.manifest.config();
         let capacity = config.max_internal_partition_entries() as usize + 2;
-        #[cfg(feature = "benchmark")]
-        let phase = crate::benchmark::MaintenanceTimer::new("kernel");
         let kernel = VectorKernel::new(
             config.dimension(),
             config.metric(),
             *self.manifest.rotation_seed(),
         )?;
-        #[cfg(feature = "benchmark")]
-        drop(phase);
         let projection_bytes = config
             .dimension()
             .checked_mul(4)
@@ -306,8 +300,6 @@ impl GraphTransitionSource {
                     + METADATA_BYTES,
             )
             .ok_or_else(limit)?;
-        #[cfg(feature = "benchmark")]
-        let phase = crate::benchmark::MaintenanceTimer::new("centroid_validation");
         let old = Centroids::new(&kernel, &self.children, capacity, check).map_err(|e| {
             if e.kind() == ErrorKind::InvalidArgument {
                 corrupt()
@@ -326,8 +318,6 @@ impl GraphTransitionSource {
             return Err(Error::invalid_argument());
         }
         let target = Centroids::new(&kernel, &next, capacity, check)?;
-        #[cfg(feature = "benchmark")]
-        drop(phase);
         let parameters = config.local_graph().ok_or_else(corrupt)?.parameters();
         let unchanged = self
             .header
@@ -341,7 +331,7 @@ impl GraphTransitionSource {
         {
             return Err(Error::invalid_argument());
         }
-        let mut records = if let Some(descriptor) = &self.descriptor {
+        let prepared = if let Some(descriptor) = &self.descriptor {
             let source = GraphSource {
                 index: self.manifest.logical_index_id(),
                 tree: &self.tree,
@@ -405,19 +395,19 @@ impl GraphTransitionSource {
         } else {
             None
         };
-        let centroid_bytes = target_bytes;
-        let ready = records.as_mut().and_then(|records| {
-            records.ready.take().map(|(graph, identity)| {
-                crate::search::local_hnsw::body::InternalGraphBody::prepared(
-                    next,
-                    kernel,
-                    graph,
-                    identity,
-                    records.descriptor.clone(),
-                    centroid_bytes,
-                )
-            })
-        });
+        let (records, ready) = if let Some(prepared) = prepared {
+            let ready = crate::search::local_hnsw::body::InternalGraphBody::prepared(
+                next,
+                kernel,
+                prepared.graph,
+                prepared.identity,
+                prepared.records.descriptor.clone(),
+                target_bytes,
+            );
+            (Some(prepared.records), Some(ready))
+        } else {
+            (None, None)
+        };
         Ok(PreparedGraphTransition {
             ready,
             manifest: self.manifest,
