@@ -1,8 +1,18 @@
 # Write-routing default-enablement validation
 
-This experiment tests whether local HNSW write routing is suitable for default
-use. It does not change production defaults or optimize queries. It complements
+Graph-enabled indexes now default to exact write routing below 1024 nodes per
+internal body and local HNSW at or above 1024 nodes. Indexes without local graphs
+retain exact routing. Query behavior and budgets are unchanged. It complements
 [the mature-topology write measurements](write-routing.md).
+
+The earlier sections below preserve historical opt-in measurements (including
+768-node experiments); they are not measurements of the final 1024 policy.
+The final default validation is recorded at the end. The removed
+`KTANN_EXPERIMENT_WRITE_HNSW`, `KTANN_EXPERIMENT_WRITE_HNSW_MIN_NODES`,
+`KTANN_EXPERIMENT_PUBLISH_READY`, and `KTANN_EXPERIMENT_REUSE_PARENT_PROOF`
+switches no longer affect behavior. Reproduce historical arms with their pinned
+binaries/revisions; unsetting those switches in current code does not select exact.
+Benchmark-only timing and forced-cache-miss diagnostics remain available.
 
 ## Controlled workload
 
@@ -370,3 +380,101 @@ metadata under `.benchmark-data/results/write-routing-threshold-20261025/`.
 Measurements used arm64 macOS and Rust 1.99.0 (LLVM 23.1.1). `pilot-binary` preserves
 the cost-curve executable; `validation-binary` includes the exact-scoring control
 checkpoint. No compilation or tests ran concurrently with timing measurements.
+
+## Default policy: 1024 nodes (2026-10-25)
+
+The default policy is now exact below 1024 nodes and HNSW at or above 1024,
+per snapshot-authoritative internal Header. The user selected 1024 as a
+conservative boundary above the measured crossover. This intentionally leaves
+834-node bodies on exact even though the earlier all-HNSW experiment benefited
+there. Graph-free indexes and all query algorithms/configuration remain unchanged.
+All-exact waves reuse the ordinary scanner without mixed-wave allocations or
+HNSW working-set admission. Mixed waves retain shared beam ordering, complete
+ownership validation, and final mutation fences.
+
+The four behavioral experiment switches are removed. Prepared-graph cache
+publication and guarded parent-proof reuse are always active. Phase timers,
+body/distance counters, maintenance timing, and forced cache misses remain
+benchmark-only diagnostics; production does not execute phase instrumentation.
+
+### Verification
+
+- Default core suite: 753 passed, two existing ignored probes.
+- All-feature core suite: 751 non-doc tests passed; default doctests also passed.
+- Adapter/native/harness suites: 112 passed, two existing ignored probes.
+- FoundationDB: shared Bulk Build/graph update history and maximum atomic graph
+  publication integration tests both passed against the configured 7.3 cluster.
+- Clippy across core, native, Memory, RocksDB and benchmark targets with all
+  features and warnings denied; formatting; no-default-features check; release
+  build all passed.
+- Fresh independent review found no actionable issues or material implementation
+  concerns. The threshold predicate covers 1023/1024; lifecycle runs validate
+  public default routing and mixed exact/HNSW topology. An exact-boundary public
+  fixture is not part of the retained regression suite.
+
+Initial expanded-test attempts were interrupted by missing FoundationDB dynamic
+library search paths and sandbox-denied localhost binding. Both were rerun with
+the documented library environment/local network access and passed; these were
+setup failures, not waived assertions. The unrelated `mutable_graph.rs` working
+tree changes were preserved and excluded from the default-enablement change.
+
+New measurements use the pinned `f99e17f` validation binary with behavior flags
+unset as the exact baseline, and the new default binary with no behavior flags.
+Both binaries, source hashes, commands, reports and scripts are retained under
+`.benchmark-data/results/write-routing-default-1024-20261025/`. Each run clones
+an identical fixture. Small/medium comparisons alternate three repetitions;
+the 1M comparison is one new eight-round confirmation pair, complemented by
+(but not substituted with) the earlier three-pair 768-node study. No compilation,
+tests or other benchmark jobs overlap timings. The temporary local FoundationDB
+server was stopped before timing. Query beam128/ef64/rerank125 and write
+batch32/beam4/ef64 remain fixed.
+
+### Fresh default-1024 results
+
+| Fixture / initial internal nodes | Updates per run | Exact total seconds | Default total seconds | Total change |
+| --- | ---: | ---: | ---: | ---: |
+| 16K warm / 199 | 4 × 8192 | 4.139 | 4.257 | +2.9% |
+| 16K cold / 199 | 4 × 8192 | 4.169 | 4.162 | -0.2% |
+| 64K cold / 834 | 2 × 8192 | 4.416 | 4.312 | -2.4% |
+| 128K cold / 1652 | 2 × 8192 | 7.098 | 3.886 | -45.3% |
+| 1M cold / root 3, three large bodies | 8 × 32768 | 651.351 | 193.196 | -70.3% |
+
+Small/medium rows are medians of three runs per arm. The 1M row is one new
+confirmation pair, not a three-run median. All 26 runs completed. Every round
+passed full Verify with exact record/location counts, no issues, no actionable
+partitions, and zero remaining split/merge transitional states.
+
+The 199- and 834-node fixtures executed zero HNSW write bodies. The 834-node
+case reduced logical reads 29.9% through the maintenance/cache optimization
+bundle while retaining exact routing; this comparison does not isolate each
+maintenance optimization's contribution. At 1652 nodes, CPU fell 38.5% and
+logical reads fell 41.5%. Every small/medium per-query quality result matched
+exact. Small warm elapsed time increased 2.9% (CPU +1.8%); cold was essentially
+flat. The evidence does not establish zero small-graph overhead or a universal
+speedup, but it avoids the earlier roughly 25% all-HNSW small-graph regression.
+
+For 1M, foreground time fell from 649.032s to 187.357s (-71.1%). Total CPU fell
+from 725.248s to 267.622s (-63.1%), and logical reads from 101.569GB to 55.992GB
+(-44.9%). The first cold round fell from 83.043s to 25.114s (-69.8%). Default
+routing executed 8,201 exact bodies and 24,603 HNSW bodies, demonstrating the
+small-root/large-internal-body selection throughout ongoing maintenance.
+Maintenance drain is included: it rose from 2.319s to 5.839s, but did not offset
+the foreground reduction. These are empirical RocksDB measurements, not a
+FoundationDB throughput claim.
+
+Final mean recall is 82.63% for both arms at fixed beam128/ef64/rerank125.
+Default-minus-exact mean differences by round are +0.04, +0.01, +0.03, +0.03,
++0.01, +0.02, +0.01 and 0.00 percentage points. The final paired query-bootstrap
+95% interval is [-0.05, +0.05] percentage points (100 queries, 3,000 resamples,
+seed7). Individual final queries can gain or lose one of 100 neighbors; mean
+parity is not per-query equivalence. Final leaf counts are 13,409 exact and
+13,407 default, with three level-2 bodies and one root in both. Maximum leaf
+size remains 128; maximum level-2 body size is 5,264 exact and 5,262 default.
+
+Disposition: retain default adaptive routing at 1024. Net write-lifecycle
+benefit is demonstrated for the tested mature 1M workload and supported by the
+prior repeated study with identical 1M path selection. Quality and topology
+remain stable across these eight stationary corpus-permutation rounds. This is
+bounded workload evidence, not a claim about indefinite duration, distribution
+drift, every graph configuration, or every query. Query algorithms and budgets
+were not optimized or expanded.

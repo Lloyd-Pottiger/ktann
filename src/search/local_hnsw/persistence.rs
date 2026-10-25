@@ -314,7 +314,7 @@ pub(crate) fn update_records(
     )
 }
 
-/// Retains already-prepared immutable topology only for the opt-in publication experiment.
+/// Retains prepared immutable topology for bounded cache publication after commit.
 fn finish_records(
     centroids: Centroids<'_>,
     graph: ktann_usearch::Graph,
@@ -335,9 +335,7 @@ fn finish_records(
         working_bytes,
         check,
     )?;
-    if cfg!(feature = "benchmark") && std::env::var_os("KTANN_EXPERIMENT_PUBLISH_READY").is_some() {
-        records.ready = Some((graph, identity));
-    }
+    records.ready = Some((graph, identity));
     Ok(records)
 }
 

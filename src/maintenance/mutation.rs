@@ -99,7 +99,10 @@ pub(crate) async fn mutate<B: Backend>(
     let kernel = routing::kernel_for(handle_manifest)?;
     let prepared = prepare_all(handle_manifest, &kernel, mutations)?;
     let write_beam_size = context.write_beam_size();
-    let routing_control = context.write_routing_control();
+    let routing_control = handle_manifest
+        .config()
+        .local_graph()
+        .map(|_| context.write_routing_control());
     let cache = context.partition_cache();
     let backend = context.backend();
     let mut failed_attempts = 0_u32;

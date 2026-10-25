@@ -54,3 +54,7 @@ capability for ordinary creation and Bulk Build. This does not change the atomic
 publication decision, exact foreground write routing, or Building isolation.
 Serving refinement remains unsupported; artifact refinement precedes initial
 graph construction. No released format or consumer requires compatibility.
+
+The exact foreground-routing restriction is superseded by
+[ADR 0031](0031-adaptive-local-graph-write-routing.md). Atomic publication and
+Building isolation remain unchanged.

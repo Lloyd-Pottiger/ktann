@@ -404,7 +404,7 @@ impl<B: Backend> Drop for RuntimeHandle<B> {
     }
 }
 
-/// Control and per-operation memory envelope for the opt-in write graph route.
+/// Control and per-operation memory envelope for adaptive write graph routing.
 /// Synchronous block_in_place work stays inside its admitted foreground task;
 /// it cannot outlive that task's admission or borrow transaction state elsewhere.
 #[derive(Clone)]
@@ -432,12 +432,11 @@ pub(crate) struct OperationContext<B: Backend> {
 }
 
 impl<B: Backend> OperationContext<B> {
-    pub(crate) fn write_routing_control(&self) -> Option<WriteRoutingControl> {
-        (cfg!(feature = "benchmark") && std::env::var_os("KTANN_EXPERIMENT_WRITE_HNSW").is_some())
-            .then(|| WriteRoutingControl {
-                options: self.options.clone(),
-                working_bytes: self.routing_working_bytes,
-            })
+    pub(crate) fn write_routing_control(&self) -> WriteRoutingControl {
+        WriteRoutingControl {
+            options: self.options.clone(),
+            working_bytes: self.routing_working_bytes,
+        }
     }
 
     pub(crate) fn backend(&self) -> Arc<B> {

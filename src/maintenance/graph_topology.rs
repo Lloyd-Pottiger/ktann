@@ -157,7 +157,6 @@ async fn body_participants<T: ReadOps>(
     working_bytes: usize,
 ) -> Result<BodyParticipants> {
     let mut participants = vec![partition];
-    let mut parent = None;
     let mut proof = None;
     let mut merge_candidates = Vec::new();
     match state {
@@ -168,28 +167,18 @@ async fn body_participants<T: ReadOps>(
                 || header.entry_count() == 0 =>
         {
             if partition != topology::root_partition() {
-                if cfg!(feature = "benchmark")
-                    && std::env::var_os("KTANN_EXPERIMENT_REUSE_PARENT_PROOF").is_some()
-                {
-                    // Discover only the lock set before waiting. The full
-                    // centroid scan belongs after acquisition and snapshot refresh.
-                    proof = Some(
-                        topology::IncomingEdgeProof::read(
-                            read,
-                            manifest,
-                            tree,
-                            header.level(),
-                            working_bytes,
-                        )
-                        .await?,
-                    );
-                } else if let Some((found, _)) =
-                    topology::find_incoming_edge(read, manifest, tree, partition, header.level())
-                        .await?
-                {
-                    participants.push(found);
-                    parent = Some(found);
-                }
+                // Discover only the lock set before waiting. The full centroid
+                // scan belongs after acquisition and snapshot refresh.
+                proof = Some(
+                    topology::IncomingEdgeProof::read(
+                        read,
+                        manifest,
+                        tree,
+                        header.level(),
+                        working_bytes,
+                    )
+                    .await?,
+                );
             }
         }
         PartitionTransition::DrainingSplit { left, right, .. } => {
@@ -240,7 +229,7 @@ async fn body_participants<T: ReadOps>(
     participants.dedup();
     Ok(BodyParticipants {
         keys: participants,
-        parent,
+        parent: None,
         proof,
         merge_candidates,
     })

@@ -91,7 +91,9 @@ _Avoid_: Vector Record, search result
 
 **Local Graph Index**:
 A Logical Index with partition-local HNSW graphs maintained atomically with
-internal membership changes. Foreground writes retain existing tree routing.
+internal membership changes. Foreground writes score internal bodies below 1024
+nodes exactly and use local HNSW at or above 1024 nodes, retaining the configured
+write beam and exact membership/fencing guarantees.
 Empty internal bodies have no graph; nonempty bodies in every searchable
 topology state have one snapshot-bound graph.
 

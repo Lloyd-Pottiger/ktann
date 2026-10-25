@@ -45,7 +45,10 @@ new index.
 
 Exact routing is the query default. HNSW selection requires graph configuration;
 a leaf-only graph index accepts either routing choice without graph work.
-Foreground writes retain the existing exact routing algorithm. Serving
+Foreground writes use exact scoring for internal bodies with fewer than 1024
+nodes and HNSW for bodies with at least 1024 nodes. The snapshot Header count
+selects the path independently for each body; write beam and query budgets are
+unchanged. Indexes without local graphs retain exact write routing. Serving
 `Index::refine` returns `InvalidArgument` for a graph index; optional artifact
 refinement precedes initial graph construction.
 

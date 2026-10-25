@@ -1,6 +1,8 @@
 # Write-time local HNSW: Cohere 1M findings
 
-Status: opt-in experiment, with exact write routing still the production default.
+Status: historical opt-in measurements. Graph-enabled indexes now use exact
+write routing below 1024 internal nodes and HNSW at or above 1024; see
+[default validation](write-lifecycle.md). The behavior switches below were removed.
 This work concerns writes and their structural maintenance. Query behavior and
 budgets are unchanged. The implementation is based on `partition-local-hnsw`
 (`48b52914b133d1b96807c1e8fac2c4975e3e71ad`). Measurements below were collected
@@ -114,7 +116,7 @@ after guard acquisition and snapshot refresh.
   and across processes/backends remains unmeasured. These results do not justify
   enabling the experiment by default or claiming FoundationDB performance.
 
-## Reproduction
+## Historical reproduction (commit 24f9092)
 
 Build and use [`ktann-write-routing`](README.md#isolated-write-routing-experiment).
 The runner expects `OUTPUT/database`, namespace `ktann-benchmark`, index

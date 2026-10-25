@@ -290,7 +290,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::fs::write(
             output.join("report.json"),
             serde_json::to_vec_pretty(
-                &json!({"scenario":scenario,"write_hnsw_min_nodes":std::env::var("KTANN_EXPERIMENT_WRITE_HNSW_MIN_NODES").ok(),"experiment_switches":{"write_hnsw":std::env::var_os("KTANN_EXPERIMENT_WRITE_HNSW").is_some(),"publish_ready":std::env::var_os("KTANN_EXPERIMENT_PUBLISH_READY").is_some(),"reuse_parent_proof":std::env::var_os("KTANN_EXPERIMENT_REUSE_PARENT_PROOF").is_some()},"query_budget":{"beam":128,"ef":64,"rerank":125,"k":100,"query_offset":100},"initial":initial,"baseline_quality":baseline,"rounds":rounds}),
+                &json!({"scenario":scenario,"write_hnsw_min_nodes":1024,"write_routing":"adaptive_default","query_budget":{"beam":128,"ef":64,"rerank":125,"k":100,"query_offset":100},"initial":initial,"baseline_quality":baseline,"rounds":rounds}),
             )?,
         )?;
         eprintln!(

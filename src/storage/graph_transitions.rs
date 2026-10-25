@@ -667,14 +667,11 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "benchmark")]
     #[test]
-    #[ignore = "requires KTANN_EXPERIMENT_PUBLISH_READY=1"]
     fn committed_prepared_graph_matches_restore_and_respects_cache_epochs() {
         use super::super::values::PartitionState;
         use crate::search::cache::{BodyEntries, CacheKey, PartitionCache, PartitionKind};
         use crate::search::local_hnsw::body::InternalGraphBody;
-        assert!(std::env::var_os("KTANN_EXPERIMENT_PUBLISH_READY").is_some());
         let manifest = source().manifest;
         let tree = source().tree;
         let parent = source().partition;

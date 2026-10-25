@@ -522,6 +522,21 @@ struct PendingBeamMember {
     distance: f64,
 }
 
+// Count nodes in each snapshot-authoritative internal body, not index records.
+fn use_write_graph(nodes: u32) -> bool {
+    nodes >= 1024
+}
+
+#[test]
+fn write_graph_threshold() {
+    for nodes in [0, 1, 1023] {
+        assert!(!use_write_graph(nodes));
+    }
+    for nodes in [1024, 1025, u32::MAX] {
+        assert!(use_write_graph(nodes));
+    }
+}
+
 /// Descends from `root` with the whole group, reading each visited partition
 /// once, retaining several candidate paths per vector, and returning one Route
 /// per input vector in input order. The same shared state-machine body
@@ -550,21 +565,6 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
     cache: Option<&PartitionCache>,
     control: Option<&crate::runtime::WriteRoutingControl>,
 ) -> Result<GroupedDescent> {
-    // The benchmark threshold counts nodes in each snapshot-authoritative
-    // internal body, not records in the index. Zero preserves the all-graph arm.
-    let min_graph_nodes = if cfg!(feature = "benchmark") && control.is_some() {
-        std::env::var_os("KTANN_EXPERIMENT_WRITE_HNSW_MIN_NODES")
-            .map(|value| {
-                value
-                    .to_str()
-                    .and_then(|value| value.parse::<u32>().ok())
-                    .ok_or_else(|| Error::new(ErrorKind::InvalidArgument))
-            })
-            .transpose()?
-            .unwrap_or(0)
-    } else {
-        0
-    };
     let mut routes: Vec<Option<(f64, Route)>> = vec![None; routings.len()];
     let mut pending: BTreeMap<(PartitionKey, Option<u32>), Vec<PendingBeamMember>> =
         BTreeMap::from([(
@@ -859,20 +859,22 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
             let nearest = nearest
                 .as_mut()
                 .ok_or_else(|| Error::new(ErrorKind::Backend))?;
-            #[cfg(feature = "benchmark")]
-            let experiment =
-                cache.filter(|_| manifest.config().local_graph().is_some() && control.is_some());
-            #[cfg(not(feature = "benchmark"))]
-            let experiment: Option<&PartitionCache> = None;
+            let graph_cache = cache.filter(|_| {
+                manifest.config().local_graph().is_some()
+                    && control.is_some()
+                    && bodies
+                        .iter()
+                        .any(|(_, header)| use_write_graph(header.entry_count()))
+            });
             // Keep the ordinary exact arm allocation-free beyond its existing
             // wave state. Mixed waves scan their small bodies together so the
             // quartet scorer and bounded lockstep reads remain shared.
-            let exact_indices = experiment.map(|_| {
+            let exact_indices = graph_cache.map(|_| {
                 bodies
                     .iter()
                     .enumerate()
                     .filter_map(|(index, (_, header))| {
-                        (header.entry_count() > 0 && header.entry_count() < min_graph_nodes)
+                        (header.entry_count() > 0 && !use_write_graph(header.entry_count()))
                             .then_some(index)
                     })
                     .collect::<Vec<_>>()
@@ -883,8 +885,8 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                     .map(|&index| bodies[index])
                     .collect::<Vec<_>>()
             });
-            if let Some(cache) = experiment {
-                let control = control.expect("experimental write route owns control");
+            if let Some(cache) = graph_cache {
+                let control = control.expect("graph write route owns control");
                 let check = || control.checkpoint();
                 check()?;
                 // Charge borrowed query vectors and wave bookkeeping in addition
@@ -913,7 +915,7 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                     .checked_sub(bookkeeping)
                     .ok_or_else(limit)?;
 
-                // Isolated benchmark prototype: committed pre-mutation inputs only.
+                // Read committed pre-mutation inputs only.
                 // Keep complete-body ownership checks and the normal final validation.
                 for (index, (body, header)) in bodies.iter().enumerate() {
                     if header.entry_count() == 0 {
@@ -930,17 +932,21 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                         .await?;
                         continue;
                     }
-                    if header.entry_count() < min_graph_nodes {
+                    if !use_write_graph(header.entry_count()) {
                         continue;
                     }
+                    #[cfg(feature = "benchmark")]
                     ::metrics::counter!("ktann.experiment.write_hnsw_bodies").increment(1);
                     use crate::search::cache::{
                         BodyRequest,
                         graph::{GraphRead, read_graph},
                     };
+                    #[cfg(feature = "benchmark")]
                     let forced_cache = std::env::var_os("KTANN_FORCE_GRAPH_MISS")
                         .map(|_| PartitionCache::new(working_bytes as u64));
+                    #[cfg(feature = "benchmark")]
                     let cache = forced_cache.as_ref().unwrap_or(cache);
+                    #[cfg(feature = "benchmark")]
                     let phase = std::time::Instant::now();
                     let input = read_graph(
                         reader,
@@ -956,8 +962,10 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                         &check,
                     )
                     .await?;
+                    #[cfg(feature = "benchmark")]
                     ::metrics::histogram!("ktann.experiment.graph_read")
                         .record(phase.elapsed().as_secs_f64());
+                    #[cfg(feature = "benchmark")]
                     let phase = std::time::Instant::now();
                     let graph = match input {
                         GraphRead::Cached(graph) => graph,
@@ -965,8 +973,10 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                             tokio::task::block_in_place(|| load.restore(cache, &check))?
                         }
                     };
+                    #[cfg(feature = "benchmark")]
                     ::metrics::histogram!("ktann.experiment.graph_restore")
                         .record(phase.elapsed().as_secs_f64());
+                    #[cfg(feature = "benchmark")]
                     let phase = std::time::Instant::now();
                     for entry in graph.children() {
                         check()?;
@@ -977,26 +987,33 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                             return Err(Error::new(ErrorKind::Corruption));
                         }
                     }
+                    #[cfg(feature = "benchmark")]
                     ::metrics::histogram!("ktann.experiment.ownership")
                         .record(phase.elapsed().as_secs_f64());
                     tokio::task::block_in_place(|| -> Result<()> {
+                        #[cfg(feature = "benchmark")]
                         let phase = std::time::Instant::now();
                         let mut scratch = graph.write_workspace()?;
+                        #[cfg(feature = "benchmark")]
                         ::metrics::histogram!("ktann.experiment.workspace")
                             .record(phase.elapsed().as_secs_f64());
                         for &(member, repetitions) in &body_members[index] {
+                            #[cfg(feature = "benchmark")]
                             let phase = std::time::Instant::now();
-                            let (hits, stats) = graph.write_search(
+                            let (hits, _stats) = graph.write_search(
                                 routings[member],
                                 nearest[member].beam,
                                 &mut scratch,
                                 &check,
                             )?;
+                            #[cfg(feature = "benchmark")]
                             ::metrics::histogram!("ktann.experiment.search")
                                 .record(phase.elapsed().as_secs_f64());
+                            #[cfg(feature = "benchmark")]
                             let phase = std::time::Instant::now();
+                            #[cfg(feature = "benchmark")]
                             ::metrics::counter!("ktann.experiment.write_distances")
-                                .increment(stats.distances as u64);
+                                .increment(_stats.distances as u64);
                             for (child, distance) in hits {
                                 let ordinal = graph
                                     .children()
@@ -1010,6 +1027,7 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
                                     );
                                 }
                             }
+                            #[cfg(feature = "benchmark")]
                             ::metrics::histogram!("ktann.experiment.merge")
                                 .record(phase.elapsed().as_secs_f64());
                         }
@@ -1019,10 +1037,9 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
             }
             let scan = exact_bodies.as_deref().unwrap_or(&bodies);
             if !scan.is_empty() {
-                if experiment.is_some() {
-                    ::metrics::counter!("ktann.experiment.write_exact_bodies")
-                        .increment(scan.len() as u64);
-                }
+                #[cfg(feature = "benchmark")]
+                ::metrics::counter!("ktann.experiment.write_exact_bodies")
+                    .increment(scan.len() as u64);
                 scan_bodies(
                     reader,
                     manifest,
