@@ -64,5 +64,4 @@ provide the consolidated current contract.
 
 - [Project README](../README.md): setup, examples, and workspace crates.
 - [Benchmark guide](../benchmarks/README.md): datasets, profiles, and comparable reports.
-- [Write-routing findings](../benchmarks/write-routing.md): Cohere 1M write-time HNSW experiments and limits.
 - [Repository guide](../AGENTS.md): required checks and test entry points.
