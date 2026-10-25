@@ -103,6 +103,34 @@ fn all_routes_share_layout_and_keep_diagnostics_out_of_measurement() {
         assert!(diagnostics["global_reference_skipped"].is_null());
         assert_eq!(diagnostics["queries"].as_array().unwrap().len(), 8);
         for quality in diagnostics["queries"].as_array().unwrap() {
+            let truth_leaves = quality["truth_leaves"].as_array().unwrap();
+            assert!(!truth_leaves.is_empty());
+            let scanned = truth_leaves
+                .iter()
+                .filter(|leaf| leaf["scanned"] == true)
+                .count();
+            let returned = truth_leaves
+                .iter()
+                .filter(|leaf| leaf["returned"] == true)
+                .count();
+            assert_eq!(
+                scanned as f64 / truth_leaves.len() as f64,
+                quality["true_neighbor_leaf_coverage"].as_f64().unwrap()
+            );
+            assert_eq!(
+                returned as f64 / truth_leaves.len() as f64,
+                quality["final_recall"].as_f64().unwrap()
+            );
+            for leaf in truth_leaves {
+                assert!(leaf["centroid_rank"].as_u64().unwrap() > 0);
+                assert!(leaf["entries"].as_u64().unwrap() > 0);
+                if *mode == "global-exact" {
+                    assert_eq!(
+                        leaf["scanned"],
+                        leaf["centroid_rank"].as_u64().unwrap() <= 4
+                    );
+                }
+            }
             let values: Vec<f64> = [
                 "true_neighbor_leaf_coverage",
                 "local_candidate_coverage",
@@ -151,6 +179,15 @@ fn all_routes_share_layout_and_keep_diagnostics_out_of_measurement() {
     let report: Value =
         serde_json::from_slice(&std::fs::read(root.path().join("exact.json")).unwrap()).unwrap();
     assert!(report["reports"][0]["measurements"]["values"]["points"][0]["measurements"]["quality_diagnostics"]["global_reference_skipped"].is_string());
+    let queries = report["reports"][0]["measurements"]["values"]["points"][0]["measurements"]["quality_diagnostics"]["queries"].as_array().unwrap();
+    for query in queries {
+        for leaf in query["truth_leaves"].as_array().unwrap() {
+            assert!(leaf["centroid_rank"].is_null());
+            assert!(leaf["entries"].as_u64().unwrap() > 0);
+            assert!(leaf["scanned"].is_boolean());
+            assert!(leaf["returned"].is_boolean());
+        }
+    }
 
     // The selected global mode must fail, not silently fall back to tree routing.
     let output = run(root.path(), "global-hnsw", true, Some(1));

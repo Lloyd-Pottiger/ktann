@@ -362,7 +362,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for round in 0..rounds {
         eprintln!("round {round}: update/delete/reinsert");
         let before = counters.snapshot();
-        let steps_before = metrics.snapshot().counters_rendered("ktann.fixup.steps");
+        // Snapshot drains counters; discard earlier phases before measuring this round.
+        drop(metrics.snapshot());
         let resources = ResourceSnapshot::capture()?;
         let start = Instant::now();
         // Reserve vectors outside the initial prefix so repeated updates preserve
@@ -401,15 +402,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         settle(&index, &raw, &metrics).await;
         let after = ResourceSnapshot::capture()?;
         let update_seconds = start.elapsed().as_secs_f64();
-        let steps: std::collections::BTreeMap<_, _> = metrics
-            .snapshot()
-            .counters_rendered("ktann.fixup.steps")
-            .into_iter()
-            .map(|(key, value)| {
-                let delta = value.saturating_sub(*steps_before.get(&key).unwrap_or(&0));
-                (key, delta)
-            })
-            .collect();
+        let steps = metrics.snapshot().counters_rendered("ktann.fixup.steps");
         observations.push(json!({"phase": "round", "round": round, "mutation_count": stride*3, "unique_touched_ids": touched.len(),
             "original_ids_touched": touched.intersection(&originals).count(),
             "maintenance_steps_per_second": steps.values().sum::<u64>() as f64 / update_seconds,

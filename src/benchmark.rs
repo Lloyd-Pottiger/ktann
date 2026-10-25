@@ -1,6 +1,83 @@
 //! Experimental benchmark helpers, excluded from production builds.
 pub use crate::search::local_hnsw::benchmark::GlobalLeafRouter;
 
+/// Resolves truth membership in one snapshot of a caller-frozen graph fixture.
+/// This bounded, untimed diagnostic is deliberately outside ordinary search.
+pub(crate) async fn truth_leaves<B: crate::storage::backend::Backend>(
+    backend: &B,
+    index: crate::api::LogicalIndexId,
+    ids: &[bytes::Bytes],
+) -> crate::api::Result<Vec<(crate::api::PartitionKey, u64)>> {
+    use crate::api::{Error, ErrorKind};
+    use crate::storage::backend::ReadOps;
+    use crate::storage::keys::{self, LogicalKey};
+    use crate::storage::values::{PersistentValue, ValueCodec};
+    if ids.len() > 65_536 {
+        return Err(Error::new(ErrorKind::LimitExceeded));
+    }
+    let corrupt = || Error::new(ErrorKind::Corruption);
+    let mut txn = backend.begin_read().await?;
+    let raw = txn
+        .get(keys::manifest_key(index).into())
+        .await?
+        .ok_or_else(corrupt)?;
+    let PersistentValue::IndexManifest(manifest) =
+        ValueCodec::bootstrap().decode(&LogicalKey::Manifest(index), raw)?
+    else {
+        return Err(corrupt());
+    };
+    if manifest.config().local_graph().is_none() || !manifest.config().tree_key_fields().is_empty()
+    {
+        return Err(Error::invalid_argument());
+    }
+    let codec = ValueCodec::for_index(&manifest);
+    let mut counts = std::collections::BTreeMap::new();
+    let mut result = Vec::with_capacity(ids.len());
+    for id in ids {
+        let raw = txn
+            .get(keys::location_key(index, id)?.into())
+            .await?
+            .ok_or_else(corrupt)?;
+        let PersistentValue::RecordLocation(location) = codec.decode(
+            &LogicalKey::Location {
+                index,
+                id: id.clone(),
+            },
+            raw,
+        )?
+        else {
+            return Err(corrupt());
+        };
+        let leaf = location.leaf();
+        let count = if let Some(count) = counts.get(&leaf) {
+            *count
+        } else {
+            let raw = txn
+                .get(keys::header_key(index, location.tree_key(), leaf).into())
+                .await?
+                .ok_or_else(corrupt)?;
+            let PersistentValue::PartitionHeader(header) = codec.decode(
+                &LogicalKey::Header {
+                    index,
+                    tree_key: location.tree_key().clone(),
+                    partition: leaf,
+                },
+                raw,
+            )?
+            else {
+                return Err(corrupt());
+            };
+            if header.level() != 1 {
+                return Err(corrupt());
+            }
+            counts.insert(leaf, header.entry_count());
+            header.entry_count()
+        };
+        result.push((leaf, u64::from(count)));
+    }
+    Ok(result)
+}
+
 /// Untimed quality diagnostics for one graph-index query. Retains only truth IDs
 /// and selected leaf identities, never a second copy of the candidate pool.
 #[derive(Clone, Debug)]

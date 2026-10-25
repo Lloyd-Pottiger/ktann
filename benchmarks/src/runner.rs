@@ -2546,7 +2546,13 @@ async fn quality_diagnostics<B: Backend>(
         let diagnostic = diagnostic.expect("truth requests quality diagnostics");
         let centroid_reference = match reference
             .as_ref()
-            .map(|router| router.exact(index.logical_index_id(), &dataset.queries[query], beam))
+            .map(|router| {
+                router.exact(
+                    index.logical_index_id(),
+                    &dataset.queries[query],
+                    router.leaves(),
+                )
+            })
             .transpose()
         {
             Ok(leaves) => leaves,
@@ -2559,13 +2565,38 @@ async fn quality_diagnostics<B: Backend>(
             }
             Err(error) => return Err(error_at("exact centroid reference", error)),
         };
-        let global_centroid_coverage = centroid_reference.map(|leaves| {
+        let global_centroid_coverage = centroid_reference.as_ref().map(|leaves| {
             leaves
                 .iter()
+                .take(beam)
                 .filter(|(key, _)| diagnostic.leaves.contains(key))
                 .count() as f64
-                / leaves.len() as f64
+                / leaves.len().min(beam) as f64
         });
+        let locations = index
+            .benchmark_truth_leaves(expected.iter().map(|(id, _)| id.clone()).collect())
+            .await
+            .map_err(|e| error_at("truth leaf membership", e))?;
+        // Retain ranks only for truth leaves, not a second map of the whole forest.
+        let mut ranks: BTreeMap<_, _> = locations.iter().map(|&(leaf, _)| (leaf, None)).collect();
+        for (rank, &(leaf, _)) in centroid_reference.iter().flatten().enumerate() {
+            if let Some(truth_rank) = ranks.get_mut(&leaf) {
+                *truth_rank = Some(rank + 1);
+            }
+        }
+        let truth_leaves = expected
+            .iter()
+            .zip(locations)
+            .map(
+                |((id, _), (leaf, entries))| crate::report::TruthLeafQuality {
+                    leaf: leaf.get(),
+                    entries,
+                    centroid_rank: ranks[&leaf],
+                    scanned: diagnostic.leaves.contains(&leaf),
+                    returned: outcome.hits.iter().any(|hit| hit.id() == id),
+                },
+            )
+            .collect();
         let denominator = expected.len() as f64;
         queries.push(crate::report::QueryQuality {
             query,
@@ -2575,6 +2606,7 @@ async fn quality_diagnostics<B: Backend>(
             rerank_candidate_coverage: diagnostic.neighbors_reranked as f64 / denominator,
             final_recall: oracle::recall_ids(outcome.hits.iter().map(|hit| hit.id()), expected),
             global_centroid_coverage,
+            truth_leaves,
         });
     }
     Ok(crate::report::QualityDiagnostics {

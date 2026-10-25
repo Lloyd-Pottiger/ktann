@@ -1026,4 +1026,21 @@ pub struct QueryQuality {
     pub final_recall: f64,
     /// Selected leaves overlapping global exact centroid top-beam, when feasible.
     pub global_centroid_coverage: Option<f64>,
+    /// Per-truth leaf ranks in the frozen global exact centroid ordering.
+    pub truth_leaves: Vec<TruthLeafQuality>,
+}
+
+/// One true neighbor's partition and routing visibility, collected outside timing.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TruthLeafQuality {
+    /// Authoritative leaf identity in this fixture.
+    pub leaf: u64,
+    /// Exact leaf occupancy, independent of how many truth IDs share it.
+    pub entries: u64,
+    /// One-based global exact centroid rank; absent when the bounded reference is unavailable.
+    pub centroid_rank: Option<usize>,
+    /// Whether ordinary search scanned this neighbor's leaf.
+    pub scanned: bool,
+    /// Whether this neighbor survived the complete query pipeline.
+    pub returned: bool,
 }
