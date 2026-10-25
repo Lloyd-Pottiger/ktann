@@ -520,7 +520,11 @@ leaf-entry scan and truncation metrics remain separate from graph work.
 All timing/resource snapshots finish before diagnostic replay. For each unique
 query, `quality_diagnostics` records true-neighbor leaf coverage, local RaBitQ
 candidate coverage, rerank candidate coverage, final recall, and optional overlap
-with global exact centroid top-beam. These are distinct quantities. Timed queries
+with global exact centroid top-beam. Per-truth `truth_leaves` rows also record the
+persisted leaf identity and occupancy, its one-based global centroid rank, and
+whether the leaf was scanned and the neighbor returned. Rank is null when the
+bounded global reference is unavailable. These diagnostics require an immutable
+fixture and run outside timing. These are distinct quantities. Timed queries
 also retain individual recall values in completion order. Offline-refinement move
 and completed-round counts are null when the artifact API does not expose them;
 requested rounds remain in configuration. Setup and diagnostics are never called

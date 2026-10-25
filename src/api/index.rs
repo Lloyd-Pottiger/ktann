@@ -226,6 +226,23 @@ impl<B: Backend> Index<B> {
             .await
     }
 
+    /// Resolves truth memberships for untimed diagnostics on an immutable fixture.
+    #[cfg(feature = "benchmark")]
+    pub async fn benchmark_truth_leaves(
+        &self,
+        ids: Vec<bytes::Bytes>,
+    ) -> Result<Vec<(crate::api::PartitionKey, u64)>> {
+        let id = self.logical_index_id();
+        self.run_foreground(
+            Operation::Search,
+            OperationOptions::default(),
+            move |context| async move {
+                crate::benchmark::truth_leaves(context.backend().as_ref(), id, &ids).await
+            },
+        )
+        .await
+    }
+
     /// Streams the final leaf layout identity for benchmark comparability checks.
     #[cfg(feature = "benchmark")]
     pub async fn leaf_layout_fingerprint(&self) -> Result<[u8; 32]> {
