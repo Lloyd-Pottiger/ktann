@@ -262,7 +262,7 @@ local baselines; `git_revision` has a `-dirty` suffix when the workspace changes
 VectorDBBench's loader, optimizer, and search workers. The Python adapter and
 process tests live in the [VectorDBBench repository](https://github.com/Lloyd-Pottiger/VectorDBBench).
 
-The bridge always uses Bulk Build followed by offline refinement. It supports
+The bridge uses Bulk Build with refinement. It supports
 RocksDB and FoundationDB, single-tenant IDs-only L2/cosine search, signed 64-bit
 record IDs, and an optional inclusive `id_min` predicate. This supports Cohere
 1M unfiltered, 1% excluded, and 99% excluded cases, plus custom ANN performance
@@ -278,8 +278,9 @@ the index rather than when a batch is received; unknown inserts must not be
 replayed automatically.
 
 Optimize checks the expected record count, seals the Input Snapshot, then runs
-preparation, loading, exact validation and atomic publication. It next calls
-`Index::refine` and checks topology readiness before admitting search. A successful
+preparation, loading, exact validation and atomic publication. The default path
+then calls `Index::refine`; routing experiments instead refine artifacts before
+publication. Both check topology readiness before admitting search. A successful
 repeated Optimize returns the existing result without rebuilding or refining.
 If refinement fails, search stays closed and a retry refines the already published
 index. The bridge holds exclusive access throughout refinement and disables its
@@ -287,13 +288,15 @@ Runtime maintenance workers. Shutdown cancels at operation checkpoints and waits
 for admitted work before dropping the index; socket timeouts do not release
 exclusive access from an unfinished operation.
 
-The Python client defaults to two refinement rounds and a 32 GiB input limit.
-Use `--refinement-rounds 0..5` and `--refinement-input-bytes BYTES` to configure
-these explicitly. Zero rounds still loads the index and refreshes centroids; it
+Reset requests must supply `refinement_rounds` (0..5) and
+`refinement_input_bytes`. On the default path, zero rounds still loads the index
+and refreshes centroids; it
 does not disable refinement. The input limit covers loaded vectors, IDs,
 centroids and topology, not total RSS: planning and migration proposals require
 additional memory. Exceeding the input limit fails Optimize rather than silently
-skipping refinement.
+skipping refinement. Routing experiments use the experiment's
+`build_memory_bytes` for artifact refinement, whose accounting includes planning
+workspace; this is a different limit from the live index's input cap.
 
 Construction uses IndexConfig defaults (64/512 partition entries), a sample cap
 of 1024, 256 MiB tree memory and 64 GiB tree scratch. Only an explicit leaf-beam
@@ -320,14 +323,9 @@ removing its stale socket. Reports remain caller-owned; temporary source snapsho
 are removed on normal exit. A crash may leave temporary files behind; core-owned
 preparation files are reclaimed after publication.
 
-Install the VectorDBBench checkout with `pip install -e .`, then run:
-
-```sh
-vectordbbench ktann --socket-path /tmp/ktann-bench.sock \
-  --dataset-identity cohere-1m --case-type Performance768D1M \
-  --load-concurrency 1 --insert-batch-size 50 --k 100 \
-  --refinement-rounds 2 --refinement-input-bytes 34359738368
-```
+The local VectorDBBench client currently omits the required refinement fields
+from Reset and has no refinement CLI options. It must be updated to the protocol
+below before it can drive this bridge.
 
 The private protocol is v1, with a big-endian u32 frame length, an 8 MiB frame
 limit and at most 128 connections. Control/search and responses are JSON.
@@ -363,9 +361,10 @@ large-dataset throughput, recall, peak memory or multi-host filesystem behavior.
 
 ### Offline refinement after import
 
-Quality sweeps accept `--refinement-rounds 0..5`. Omit the flag for the ordinary
+Quality sweeps without `--routing-experiment` accept `--refinement-rounds 0..5`.
+Omit the flag for the ordinary
 import baseline; `0` recomputes centroids without relocation rounds, and `2` or
-`5` requests bounded local refinement. Every path uses ordinary import and settles
+`5` requests bounded local refinement. These runs use ordinary import and settle
 topology until maintenance is drained before refinement. The runner issues no
 other index operations during refinement and starts measured queries afterward.
 The existing tree's partition IDs and topology remain fixed.
@@ -376,10 +375,9 @@ IDs, centroids and topology representation; numerical workspace and move lists
 add memory. Construction wall time, CPU and backend work include import,
 maintenance convergence and refinement. The convergence phase includes refinement.
 Compare the ordinary baseline and each refinement setting on identical import
-and search parameters; zero rounds is a centroid-recomputation control. Existing
-bulk-builder research measurements use a different initialization/publication
-pipeline and do not establish quality or performance for this API. Archive the
-executable and source/binary hashes before timing under the shared resource lock.
+and search parameters; zero rounds is a centroid-recomputation control.
+Routing experiments use the Bulk Build artifact path described below and are
+not interchangeable baselines for this import-and-refine path.
 
 ## Complete Bulk Build probe
 

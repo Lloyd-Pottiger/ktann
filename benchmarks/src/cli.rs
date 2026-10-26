@@ -14,6 +14,8 @@ use std::process::{Command, Stdio};
 #[cfg(feature = "foundationdb")]
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
+
 use crate::compare::{self, ComparisonPolicy};
 use crate::report::{BenchmarkReport, BenchmarkSuite, REPORT_SCHEMA_VERSION};
 use crate::runner::{self, ScenarioSpec};
@@ -45,7 +47,16 @@ where
         // Each public suite scenario executes in a fresh process so metrics
         // recorder state, Partition Cache, and peak RSS cannot leak between
         // reports. This command is intentionally absent from the public help.
-        "__worker" => run_worker(parse_worker_options(&arguments)?),
+        "__worker" => {
+            let [request] = arguments.as_slice() else {
+                return Err("worker requires one serialized request".to_owned());
+            };
+            let request = request.to_str().ok_or("worker request must be UTF-8")?;
+            run_worker(
+                serde_json::from_str(request)
+                    .map_err(|error| format!("decode worker request: {error}"))?,
+            )
+        }
         _ => Err(usage()),
     }
 }
@@ -60,7 +71,7 @@ struct RunOptions {
 }
 
 /// Inputs for one isolated scenario process.
-#[derive(Clone, Debug)]
+#[derive(Debug, Deserialize, Serialize)]
 struct WorkerOptions {
     profile: String,
     scenario: String,
@@ -69,9 +80,9 @@ struct WorkerOptions {
 }
 
 /// Execution settings shared by the suite and its scenario workers.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct ExecutionOptions {
-    routing_experiment: Option<String>,
+    routing_experiment: Option<crate::routing::Experiment>,
     backend: String,
     worker_threads: usize,
     write_beam_size: Option<u32>,
@@ -91,7 +102,8 @@ struct ExecutionOptions {
     measured_operations: Option<usize>,
     rocksdb_path: Option<PathBuf>,
     reuse_index: bool,
-    lifecycle: LifecycleOverrides,
+    maintenance_workers: Option<usize>,
+    import_batch_size: Option<usize>,
 }
 
 impl ExecutionOptions {
@@ -109,10 +121,12 @@ impl ExecutionOptions {
         {
             return Err("RocksDB cache and fixture options require --backend rocksdb".to_owned());
         }
-        let routing_experiment = values.get("routing-experiment").cloned();
-        if let Some(json) = &routing_experiment {
-            let experiment: crate::routing::Experiment = serde_json::from_str(json)
-                .map_err(|e| format!("invalid routing experiment JSON: {e}"))?;
+        let routing_experiment: Option<crate::routing::Experiment> = values
+            .get("routing-experiment")
+            .map(|json| serde_json::from_str(json))
+            .transpose()
+            .map_err(|e| format!("invalid routing experiment JSON: {e}"))?;
+        if let Some(experiment) = &routing_experiment {
             experiment.validate()?;
         }
         Ok(Self {
@@ -197,7 +211,14 @@ impl ExecutionOptions {
                 .get("leaf-beam-size")
                 .map(|value| parse_positive_u32(value, "leaf-beam-size"))
                 .transpose()?,
-            lifecycle: LifecycleOverrides::parse(values)?,
+            maintenance_workers: values
+                .get("maintenance-workers")
+                .map(|value| parse_nonnegative(value, "maintenance-workers"))
+                .transpose()?,
+            import_batch_size: values
+                .get("import-batch-size")
+                .map(|value| parse_positive(value, "import-batch-size"))
+                .transpose()?,
         })
     }
 }
@@ -229,41 +250,6 @@ const SCENARIO_OPTIONS: &[&str] = &[
     "import-batch-size",
 ];
 
-/// Optional diagnostic bounds applied to the selected scenario.
-#[derive(Clone, Debug, Default)]
-struct LifecycleOverrides {
-    maintenance_workers: Option<usize>,
-    batch_size: Option<usize>,
-}
-
-impl LifecycleOverrides {
-    fn parse(values: &BTreeMap<String, String>) -> Result<Self, String> {
-        Ok(Self {
-            maintenance_workers: values
-                .get("maintenance-workers")
-                .map(|value| parse_nonnegative(value, "maintenance-workers"))
-                .transpose()?,
-            batch_size: values
-                .get("import-batch-size")
-                .map(|value| parse_positive(value, "import-batch-size"))
-                .transpose()?,
-        })
-    }
-
-    fn is_empty(&self) -> bool {
-        self.maintenance_workers.is_none() && self.batch_size.is_none()
-    }
-
-    fn apply(&self, scenario: &mut ScenarioSpec) {
-        if let Some(workers) = self.maintenance_workers {
-            scenario.maintenance_workers = workers;
-        }
-        if let Some(batch_size) = self.batch_size {
-            scenario.import_batch_size = batch_size;
-        }
-    }
-}
-
 /// Report paths and comparison thresholds.
 #[derive(Clone, Debug)]
 struct CompareOptions {
@@ -294,7 +280,7 @@ fn parse_run_options(arguments: &[OsString]) -> Result<RunOptions, String> {
     {
         return Err("--query-concurrency and --leaf-beam-size require --profile large".to_owned());
     }
-    if !execution.lifecycle.is_empty()
+    if (execution.maintenance_workers.is_some() || execution.import_batch_size.is_some())
         && profile != "large"
         && scenario.as_deref() != Some(IMPORT_LIFECYCLE_SCENARIO)
     {
@@ -307,20 +293,6 @@ fn parse_run_options(arguments: &[OsString]) -> Result<RunOptions, String> {
         scenario,
         output: values.get("output").map(PathBuf::from),
         execution,
-    })
-}
-
-/// Parses the internal worker command using the same execution settings.
-fn parse_worker_options(arguments: &[OsString]) -> Result<WorkerOptions, String> {
-    let values = option_map(
-        arguments,
-        &[SCENARIO_OPTIONS, &["reproduction-command"]].concat(),
-    )?;
-    Ok(WorkerOptions {
-        profile: required(&values, "profile")?,
-        scenario: required(&values, "scenario")?,
-        reproduction_command: required(&values, "reproduction-command")?,
-        execution: ExecutionOptions::parse(&values)?,
     })
 }
 
@@ -400,11 +372,6 @@ fn required(values: &BTreeMap<String, String>, key: &str) -> Result<String, Stri
         .ok_or_else(|| format!("missing --{key}"))
 }
 
-/// Renders one optional value as a forwarded worker argument.
-fn option_string<T: ToString>(value: Option<T>) -> Option<String> {
-    value.map(|value| value.to_string())
-}
-
 /// Parses a strictly positive host-sized bound.
 fn parse_positive(value: &str, name: &str) -> Result<usize, String> {
     value
@@ -470,112 +437,21 @@ fn run_suite(options: RunOptions) -> Result<(), String> {
         .map_err(|error| format!("resolve benchmark executable: {error}"))?;
     let mut reports = Vec::with_capacity(selected.len());
     for scenario in selected {
+        // The public CLI owns parsing and validation. Workers receive that typed
+        // request directly, without a second CLI contract to keep in sync.
+        let request = WorkerOptions {
+            profile: options.profile.clone(),
+            scenario: scenario.name.to_owned(),
+            reproduction_command: reproduction_command.clone(),
+            execution: options.execution.clone(),
+        };
+        let request = serde_json::to_string(&request)
+            .map_err(|error| format!("encode worker request: {error}"))?;
         let mut command = Command::new(&executable);
         command
             .arg("__worker")
-            .args(["--backend", &options.execution.backend])
-            .args(["--profile", &options.profile])
-            .args(["--scenario", scenario.name])
-            .args(["--reproduction-command", &reproduction_command])
-            .args([
-                "--worker-threads",
-                &options.execution.worker_threads.to_string(),
-            ])
+            .arg(request)
             .stderr(Stdio::inherit());
-        let lifecycle = &options.execution.lifecycle;
-        for (name, value) in [
-            (
-                "rocksdb-path",
-                options
-                    .execution
-                    .rocksdb_path
-                    .as_ref()
-                    .map(|path| path.to_string_lossy().into_owned()),
-            ),
-            (
-                "reuse-index",
-                options.execution.reuse_index.then(|| "true".to_owned()),
-            ),
-            (
-                "rocksdb-block-cache-bytes",
-                option_string(options.execution.rocksdb_block_cache_bytes),
-            ),
-            (
-                "warmup-operations",
-                option_string(options.execution.warmup_operations),
-            ),
-            (
-                "measured-operations",
-                option_string(options.execution.measured_operations),
-            ),
-            (
-                "query-concurrency",
-                options.execution.query_concurrency.as_ref().map(|values| {
-                    values
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(",")
-                }),
-            ),
-            (
-                "partition-cache-bytes",
-                option_string(options.execution.partition_cache_bytes),
-            ),
-            (
-                "leaf-beam-size",
-                option_string(options.execution.leaf_beam_size),
-            ),
-            (
-                "write-beam-size",
-                option_string(options.execution.write_beam_size),
-            ),
-            (
-                "refinement-rounds",
-                option_string(options.execution.refinement_rounds),
-            ),
-            (
-                "base-vectors",
-                option_string(options.execution.base_vectors),
-            ),
-            (
-                "query-vectors",
-                option_string(options.execution.query_vectors),
-            ),
-            (
-                "query-offset",
-                option_string(options.execution.query_offset),
-            ),
-            (
-                "min-leaf-partition-entries",
-                option_string(options.execution.min_leaf_partition_entries),
-            ),
-            (
-                "max-leaf-partition-entries",
-                option_string(options.execution.max_leaf_partition_entries),
-            ),
-            (
-                "min-internal-partition-entries",
-                option_string(options.execution.min_internal_partition_entries),
-            ),
-            (
-                "max-internal-partition-entries",
-                option_string(options.execution.max_internal_partition_entries),
-            ),
-            (
-                "maintenance-workers",
-                option_string(lifecycle.maintenance_workers),
-            ),
-            ("import-batch-size", option_string(lifecycle.batch_size)),
-            (
-                "routing-experiment",
-                options.execution.routing_experiment.clone(),
-            ),
-        ] {
-            if let Some(value) = value {
-                command.args([format!("--{name}"), value]);
-            }
-        }
         let output = command
             .output()
             .map_err(|error| format!("start scenario {}: {error}", scenario.name))?;
@@ -603,19 +479,22 @@ fn run_worker(options: WorkerOptions) -> Result<(), String> {
         .into_iter()
         .find(|scenario| scenario.name == options.scenario)
         .ok_or_else(|| format!("unknown scenario `{}`", options.scenario))?;
-    options.execution.lifecycle.apply(&mut scenario);
-    if let Some(json) = &options.execution.routing_experiment {
+    if let Some(workers) = options.execution.maintenance_workers {
+        scenario.maintenance_workers = workers;
+    }
+    if let Some(batch_size) = options.execution.import_batch_size {
+        scenario.import_batch_size = batch_size;
+    }
+    if let Some(experiment) = &options.execution.routing_experiment {
         if scenario.leaf_beam_sweep.is_empty() {
             return Err("--routing-experiment requires a quality scenario".into());
         }
-        let experiment: crate::routing::Experiment =
-            serde_json::from_str(json).map_err(|e| e.to_string())?;
         scenario.search_options = scenario
             .search_options
             .with_routing_mode(experiment.production_mode())
             .map_err(|e| e.to_string())?;
         scenario.maintenance_workers = 0;
-        scenario.routing_experiment = Some(experiment);
+        scenario.routing_experiment = Some(experiment.clone());
     }
     if options.execution.rocksdb_path.is_some() {
         if scenario.leaf_beam_sweep.is_empty() {
@@ -1191,8 +1070,8 @@ mod tests {
         ]
         .map(std::ffi::OsString::from);
         let options = parse_run_options(&arguments).expect("valid lifecycle overrides");
-        assert_eq!(options.execution.lifecycle.maintenance_workers, Some(0));
-        assert_eq!(options.execution.lifecycle.batch_size, Some(25));
+        assert_eq!(options.execution.maintenance_workers, Some(0));
+        assert_eq!(options.execution.import_batch_size, Some(25));
     }
 
     #[test]
@@ -1218,7 +1097,7 @@ mod tests {
         .map(std::ffi::OsString::from);
         let options = parse_run_options(&arguments).expect("large diagnostic override");
         assert_eq!(options.profile, "large");
-        assert_eq!(options.execution.lifecycle.maintenance_workers, Some(0));
+        assert_eq!(options.execution.maintenance_workers, Some(0));
     }
 
     #[test]

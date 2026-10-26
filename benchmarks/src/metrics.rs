@@ -202,15 +202,19 @@ impl CapturedMetrics {
             .unwrap_or_default()
     }
 
-    /// Returns all observations from a histogram grouped by one label.
+    /// Summarizes search-stage durations in milliseconds, keyed by stage.
     #[must_use]
-    pub fn histograms_by_label(&self, name: &str, label: &str) -> BTreeMap<String, Vec<f64>> {
+    pub fn search_stage_summaries(&self) -> BTreeMap<String, Distribution> {
         self.histograms
             .iter()
-            .filter(|(key, _)| key.name == name)
+            .filter(|(key, _)| key.name == "ktann.search.stage.duration")
             .filter_map(|(key, values)| {
-                key.label(label)
-                    .map(|value| (value.to_owned(), values.clone()))
+                key.label("stage").map(|stage| {
+                    (
+                        stage.to_owned(),
+                        Distribution::from_samples(values.clone()).seconds_to_milliseconds(),
+                    )
+                })
             })
             .collect()
     }
@@ -255,10 +259,11 @@ impl CapturedMetrics {
 
     /// Converts duration series to milliseconds while preserving their label sets.
     fn distributions_ms(&self, name: &str) -> BTreeMap<String, Distribution> {
-        self.distributions_rendered(name)
-            .into_iter()
-            .map(|(labels, distribution)| (labels, distribution.seconds_to_milliseconds()))
-            .collect()
+        let mut distributions = self.distributions_rendered(name);
+        for distribution in distributions.values_mut() {
+            *distribution = distribution.clone().seconds_to_milliseconds();
+        }
+        distributions
     }
 
     /// Converts captured cache series into the report schema.
@@ -375,6 +380,39 @@ fn finite_usize(value: f64) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{CapturedMetrics, MetricCapture, SeriesKey};
+
+    #[test]
+    fn search_stages_select_labeled_durations_and_convert_to_milliseconds() {
+        let mut captured = CapturedMetrics::default();
+        for (name, labels, samples) in [
+            (
+                "ktann.search.stage.duration",
+                vec![("stage", "routing")],
+                vec![0.001, 0.003],
+            ),
+            (
+                "ktann.search.stage.duration",
+                vec![("stage", "rerank")],
+                vec![0.004],
+            ),
+            ("ktann.search.stage.duration", vec![], vec![9.0]),
+            (
+                "ktann.mutation.stage.duration",
+                vec![("stage", "routing")],
+                vec![8.0],
+            ),
+        ] {
+            captured
+                .histograms
+                .insert(SeriesKey::new(name, &labels), samples);
+        }
+        let stages = captured.search_stage_summaries();
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages["routing"].count, 2);
+        assert_eq!(stages["routing"].mean, 2.0);
+        assert_eq!(stages["routing"].p95, 3.0);
+        assert_eq!(stages["rerank"].mean, 4.0);
+    }
 
     #[test]
     fn write_series_preserve_complete_attribution_labels() {

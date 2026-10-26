@@ -504,7 +504,7 @@ pub async fn run_scenario<B: Backend>(
         )
     };
 
-    Ok(BenchmarkReport {
+    let report = BenchmarkReport {
         generated_unix_seconds: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -565,7 +565,9 @@ pub async fn run_scenario<B: Backend>(
         dataset: dataset.metadata,
         topology,
         measurements,
-    })
+    };
+    report.validate()?;
+    Ok(report)
 }
 
 /// Builds the complete process-local configuration used by benchmark workers.
@@ -774,16 +776,6 @@ async fn run_lifecycle_case<B: Backend>(
         stable_cold_search,
         stable_warm_search,
     };
-    lifecycle
-        .unattributed_wall_seconds()
-        .ok_or_else(|| "lifecycle phases exceed the continuous wall time".to_owned())?;
-    lifecycle
-        .unattributed_cpu_seconds()
-        .ok_or_else(|| "lifecycle phases exceed the continuous CPU time".to_owned())?;
-    lifecycle
-        .unattributed_backend_io()
-        .ok_or_else(|| "lifecycle phases exceed the continuous Backend IO".to_owned())?;
-
     Ok((topology, lifecycle))
 }
 
@@ -1055,7 +1047,7 @@ async fn run_search_phase<B: Backend>(
         visited_leaf_entries: Distribution::from_samples(
             metrics.histogram("ktann.search.leaf_entries", &[]),
         ),
-        search_stages_ms: search_stage_summaries(&metrics),
+        search_stages_ms: metrics.search_stage_summaries(),
         cache: metrics.cache_summary(),
         backend_admission: metrics.admission_summary(),
     };
@@ -1102,20 +1094,6 @@ fn phase_resources(
             backlog_at_end,
         },
     }
-}
-
-/// Converts measured search-stage histograms into milliseconds.
-fn search_stage_summaries(metrics: &CapturedMetrics) -> BTreeMap<String, Distribution> {
-    metrics
-        .histograms_by_label("ktann.search.stage.duration", "stage")
-        .into_iter()
-        .map(|(stage, samples)| {
-            (
-                stage,
-                Distribution::from_samples(samples).seconds_to_milliseconds(),
-            )
-        })
-        .collect()
 }
 
 /// Owns setup, one steady measurement, and the post-run invariant audit.
@@ -1547,7 +1525,7 @@ async fn measure_steady_workload<B: Backend>(
         visited_leaf_entries: Distribution::from_samples(
             metrics.histogram("ktann.search.leaf_entries", &[]),
         ),
-        search_stages_ms: search_stage_summaries(&metrics),
+        search_stages_ms: metrics.search_stage_summaries(),
         cache: metrics.cache_summary(),
         backend_admission: metrics.admission_summary(),
         backend_io,

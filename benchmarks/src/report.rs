@@ -39,6 +39,127 @@ pub struct BenchmarkReport {
     pub measurements: ReportMeasurements,
 }
 
+impl BenchmarkReport {
+    /// Checks workload outcomes and phase accounting before emission or comparison.
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        match &self.measurements {
+            ReportMeasurements::SteadyState(measurements) => {
+                self.validate_steady_operation_summaries(measurements)
+            }
+            ReportMeasurements::QualitySweep(sweep) => {
+                for point in &sweep.points {
+                    self.validate_steady_operation_summaries(&point.measurements)?;
+                }
+                Ok(())
+            }
+            ReportMeasurements::Lifecycle(lifecycle) => {
+                self.validate_lifecycle_measurements(lifecycle)
+            }
+        }
+    }
+
+    /// Checks continuous-case accounting and each configured lifecycle query pass.
+    fn validate_lifecycle_measurements(
+        &self,
+        lifecycle: &LifecycleMeasurements,
+    ) -> Result<(), String> {
+        if lifecycle.unattributed_wall_seconds().is_none() {
+            return Err(format!(
+                "scenario {}/{} has inconsistent lifecycle phase accounting",
+                self.configuration.backend, self.configuration.scenario
+            ));
+        }
+        match (
+            lifecycle.case_cpu_seconds,
+            lifecycle.unattributed_cpu_seconds(),
+        ) {
+            (Some(_), Some(_)) => {}
+            (None, None) => {}
+            _ => {
+                return Err(format!(
+                    "scenario {}/{} has inconsistent lifecycle CPU accounting",
+                    self.configuration.backend, self.configuration.scenario
+                ));
+            }
+        }
+        if lifecycle.unattributed_backend_io().is_none() {
+            return Err(format!(
+                "scenario {}/{} has inconsistent lifecycle Backend IO accounting",
+                self.configuration.backend, self.configuration.scenario
+            ));
+        }
+        let configured_attempts =
+            u64::try_from(self.configuration.measured_operations).map_err(|_| {
+                format!(
+                    "scenario {}/{} measured operation count exceeds report range",
+                    self.configuration.backend, self.configuration.scenario
+                )
+            })?;
+        for phase in [
+            &lifecycle.immediate_search,
+            &lifecycle.stable_cold_search,
+            &lifecycle.stable_warm_search,
+        ] {
+            phase.search.validate().map_err(|error| {
+                format!(
+                    "scenario {}/{} has invalid lifecycle search results: {error}",
+                    self.configuration.backend, self.configuration.scenario
+                )
+            })?;
+            if phase.search.attempted != configured_attempts {
+                return Err(format!(
+                    "scenario {}/{} lifecycle query attempts differ from its configuration",
+                    self.configuration.backend, self.configuration.scenario
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Rejects one steady measurement whose operation totals do not match config.
+    fn validate_steady_operation_summaries(
+        &self,
+        measurements: &SteadyStateMeasurements,
+    ) -> Result<(), String> {
+        if !OperationClass::for_mix(self.configuration.search_percent)
+            .eq(measurements.operations.keys().copied())
+        {
+            return Err(format!(
+                "scenario {}/{} has operation classes inconsistent with its mix",
+                self.configuration.backend, self.configuration.scenario
+            ));
+        }
+        let attempted = measurements
+            .operations
+            .values()
+            .try_fold(0_u64, |sum, summary| {
+                summary.validate()?;
+                sum.checked_add(summary.attempted)
+                    .ok_or("operation attempt count overflow")
+            })
+            .map_err(|error| {
+                format!(
+                    "scenario {}/{} has invalid operation results: {error}",
+                    self.configuration.backend, self.configuration.scenario
+                )
+            })?;
+        let configured_attempts =
+            u64::try_from(self.configuration.measured_operations).map_err(|_| {
+                format!(
+                    "scenario {}/{} measured operation count exceeds report range",
+                    self.configuration.backend, self.configuration.scenario
+                )
+            })?;
+        if attempted != configured_attempts {
+            return Err(format!(
+                "scenario {}/{} operation attempts differ from its configuration",
+                self.configuration.backend, self.configuration.scenario
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Hardware and software metadata needed to judge comparability.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Environment {

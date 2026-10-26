@@ -112,10 +112,8 @@ fn ensure_comparable(
     baseline: &BenchmarkReport,
     candidate: &BenchmarkReport,
 ) -> Result<(), String> {
-    validate_operation_summaries(baseline)?;
-    validate_operation_summaries(candidate)?;
-    validate_lifecycle_measurements(baseline)?;
-    validate_lifecycle_measurements(candidate)?;
+    baseline.validate()?;
+    candidate.validate()?;
     // Compare the schema type as a whole so adding a workload or admission
     // input cannot silently leave the comparability contract incomplete.
     if baseline.configuration != candidate.configuration || baseline.dataset != candidate.dataset {
@@ -136,123 +134,6 @@ fn ensure_comparable(
         return Err(format!(
             "scenario {}/{} has different measurement kinds",
             baseline.configuration.backend, baseline.configuration.scenario
-        ));
-    }
-    Ok(())
-}
-
-/// Rejects internally inconsistent lifecycle measurements at the JSON boundary.
-fn validate_lifecycle_measurements(report: &BenchmarkReport) -> Result<(), String> {
-    let ReportMeasurements::Lifecycle(lifecycle) = &report.measurements else {
-        return Ok(());
-    };
-    if lifecycle.unattributed_wall_seconds().is_none() {
-        return Err(format!(
-            "scenario {}/{} has inconsistent lifecycle phase accounting",
-            report.configuration.backend, report.configuration.scenario
-        ));
-    }
-    match (
-        lifecycle.case_cpu_seconds,
-        lifecycle.unattributed_cpu_seconds(),
-    ) {
-        (Some(_), Some(_)) => {}
-        (None, None) => {}
-        _ => {
-            return Err(format!(
-                "scenario {}/{} has inconsistent lifecycle CPU accounting",
-                report.configuration.backend, report.configuration.scenario
-            ));
-        }
-    }
-    if lifecycle.unattributed_backend_io().is_none() {
-        return Err(format!(
-            "scenario {}/{} has inconsistent lifecycle Backend IO accounting",
-            report.configuration.backend, report.configuration.scenario
-        ));
-    }
-    let configured_attempts =
-        u64::try_from(report.configuration.measured_operations).map_err(|_| {
-            format!(
-                "scenario {}/{} measured operation count exceeds report range",
-                report.configuration.backend, report.configuration.scenario
-            )
-        })?;
-    for phase in [
-        &lifecycle.immediate_search,
-        &lifecycle.stable_cold_search,
-        &lifecycle.stable_warm_search,
-    ] {
-        phase.search.validate().map_err(|error| {
-            format!(
-                "scenario {}/{} has invalid lifecycle search results: {error}",
-                report.configuration.backend, report.configuration.scenario
-            )
-        })?;
-        if phase.search.attempted != configured_attempts {
-            return Err(format!(
-                "scenario {}/{} lifecycle query attempts differ from its configuration",
-                report.configuration.backend, report.configuration.scenario
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Rejects internally inconsistent operation summaries at the JSON boundary.
-fn validate_operation_summaries(report: &BenchmarkReport) -> Result<(), String> {
-    match &report.measurements {
-        ReportMeasurements::SteadyState(measurements) => {
-            validate_steady_operation_summaries(report, measurements)
-        }
-        ReportMeasurements::QualitySweep(sweep) => {
-            for point in &sweep.points {
-                validate_steady_operation_summaries(report, &point.measurements)?;
-            }
-            Ok(())
-        }
-        ReportMeasurements::Lifecycle(_) => Ok(()),
-    }
-}
-
-/// Rejects one steady measurement whose operation totals do not match config.
-fn validate_steady_operation_summaries(
-    report: &BenchmarkReport,
-    measurements: &SteadyStateMeasurements,
-) -> Result<(), String> {
-    if !OperationClass::for_mix(report.configuration.search_percent)
-        .eq(measurements.operations.keys().copied())
-    {
-        return Err(format!(
-            "scenario {}/{} has operation classes inconsistent with its mix",
-            report.configuration.backend, report.configuration.scenario
-        ));
-    }
-    let attempted = measurements
-        .operations
-        .values()
-        .try_fold(0_u64, |sum, summary| {
-            summary.validate()?;
-            sum.checked_add(summary.attempted)
-                .ok_or("operation attempt count overflow")
-        })
-        .map_err(|error| {
-            format!(
-                "scenario {}/{} has invalid operation results: {error}",
-                report.configuration.backend, report.configuration.scenario
-            )
-        })?;
-    let configured_attempts =
-        u64::try_from(report.configuration.measured_operations).map_err(|_| {
-            format!(
-                "scenario {}/{} measured operation count exceeds report range",
-                report.configuration.backend, report.configuration.scenario
-            )
-        })?;
-    if attempted != configured_attempts {
-        return Err(format!(
-            "scenario {}/{} operation attempts differ from its configuration",
-            report.configuration.backend, report.configuration.scenario
         ));
     }
     Ok(())
@@ -1296,9 +1177,7 @@ mod tests {
         WorkloadDispatch, WriteAmplification,
     };
 
-    use super::{
-        ComparisonPolicy, ComparisonReport, compare, compare_quality_sweep, ensure_comparable,
-    };
+    use super::{ComparisonPolicy, ComparisonReport, compare, compare_quality_sweep};
 
     fn budget_configuration(runtime_default: u32, effective_limit: u32) -> BudgetConfiguration {
         BudgetConfiguration {
@@ -1428,17 +1307,6 @@ mod tests {
             reproduction_command: "ktann-bench run".to_owned(),
             reports: vec![report],
         }
-    }
-
-    #[test]
-    fn refinement_provenance_must_match_for_regression_comparison() {
-        let baseline = report();
-        ensure_comparable(&baseline, &baseline).expect("valid report fixture");
-        let mut candidate = baseline.clone();
-        candidate.configuration.refinement_rounds = Some(2);
-        candidate.configuration.refinement_neighbor_centroids = Some(32);
-        candidate.configuration.refinement_input_limit_bytes = Some(32 << 30);
-        assert!(ensure_comparable(&baseline, &candidate).is_err());
     }
 
     #[test]
