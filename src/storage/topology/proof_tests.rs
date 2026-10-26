@@ -118,17 +118,20 @@ fn raw(manifest: &IndexManifest, rows: &[(LogicalKey, PersistentValue)]) -> Mock
 async fn proof_protects_every_parent_and_rejects_changed_or_missing_parents() {
     let (manifest, tree, rows) = fixture();
     let mut read = ReadLogicalTxn::for_index(raw(&manifest, &rows), &manifest);
-    assert_eq!(
-        find_incoming_edge(&mut read, &manifest, &tree, pk(4), 1)
-            .await
-            .unwrap()
-            .unwrap()
-            .0,
-        pk(2)
-    );
+    let incoming = find_incoming_edge(&mut read, &manifest, &tree, pk(4), 1)
+        .await
+        .unwrap();
+    assert_eq!(incoming.as_ref().unwrap().0, pk(2));
     let proof = IncomingEdgeProof::read(&mut read, &manifest, &tree, 1, 4096)
         .await
         .unwrap();
+    assert_eq!(
+        proof
+            .find(&mut read, &manifest, &tree, pk(4))
+            .await
+            .unwrap(),
+        incoming
+    );
     assert!(
         IncomingEdgeProof::read(&mut read, &manifest, &tree, 1, 128)
             .await

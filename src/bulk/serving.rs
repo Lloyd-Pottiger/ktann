@@ -581,24 +581,10 @@ impl ServingArtifact {
             };
             if let Some(graphs) = &mut graphs {
                 let key = keys::decode_key(types, &Bytes::copy_from_slice(&row.key))?;
-                if matches!(
-                    key,
-                    LogicalKey::Header { .. } | LogicalKey::TreeManifest { .. }
-                ) {
-                    graphs.finish(check, |key, value| {
-                        let row = encoded(codec, options.hard_limits, key, value)?;
-                        write_entry(&mut writer, &mut previous_key, &mut report, row)
-                    })?;
-                }
-                if matches!(
-                    key,
-                    LogicalKey::Header { .. } | LogicalKey::ChildEntry { .. }
-                ) {
-                    graphs.observe(
-                        &key,
-                        codec.decode(&key, Bytes::copy_from_slice(&row.value))?,
-                    )?;
-                }
+                graphs.observe(&key, &row.value, check, |key, value| {
+                    let row = encoded(codec, options.hard_limits, key, value)?;
+                    write_entry(&mut writer, &mut previous_key, &mut report, row)
+                })?;
             }
             write_entry(&mut writer, &mut previous_key, &mut report, row)?;
         }

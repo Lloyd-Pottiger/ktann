@@ -160,22 +160,15 @@ fn ordinary_updates_preserve_metric_scores_canonical_children_and_source_integri
             });
             let graph = build(&kernel, &rows, parameters());
             let encoded = records(&graph);
-            for operation in 0..5 {
+            for operation in 0..3 {
                 let mut next = rows.clone();
                 match operation {
                     0 => next.insert(1, ChildEntry::new(key(11), vec![0.0; 8])),
-                    1 => next[16] = ChildEntry::new(next[16].child(), vec![0.5; 8]),
-                    2 => {
+                    1 => {
                         next.remove(graph.graph.entry().unwrap() as usize);
-                    }
-                    3 => {
-                        next.drain(4..20);
                     }
                     _ => {
-                        next.remove(graph.graph.entry().unwrap() as usize);
-                        next[0] = ChildEntry::new(next[0].child(), vec![0.5; 8]);
-                        next.insert(1, ChildEntry::new(key(11), vec![0.0; 8]));
-                        next.sort_by_key(ChildEntry::child);
+                        next.drain(4..20);
                     }
                 }
                 let centroids = Centroids::new(&kernel, &next, 4096, &|| Ok(())).unwrap();

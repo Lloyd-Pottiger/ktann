@@ -98,7 +98,7 @@ before queries. Reused reports set `construction: null`; comparison omits
 construction costs and rejects mixing fresh and reused runs. Cache capacity,
 client counts, warmup and read beam can
 change without reconstructing the tree. Keep both comparison binaries and the
-fixture manifest with the reports. Reports use schema version 9.
+fixture manifest with the reports. Reports use schema version 10.
 
 Large search diagnostics accept `--query-concurrency 1,4,16,4,1` and
 `--leaf-beam-size 32`. The worker imports and verifies the index once, then
@@ -430,7 +430,7 @@ Bridge reports record all four resolved values. Invalid pairs fail before reset
 changes storage. Keep rerank budgets fixed when comparing capacity choices.
 
 
-## Frozen-layout routing experiments (issue #195, step 9)
+## Frozen-layout routing experiments
 
 These experiments hold the dataset and leaf layout fixed during query comparisons.
 The graph indexes they build support writes after publication; the frozen workload
@@ -468,15 +468,9 @@ are recorded on construction. `routing_setup.leaf_layout_sha256` streams final
 leaf identities, centroids and membership bytes; compare this fingerprint when
 claiming the same layout across routing modes or internal capacities.
 
-Modes are `exact` (production exact tree routing),
-`partition-local-hnsw` (production local graphs), `global-exact`, and
-`global-hnsw`. Global modes are compiled only through the core `benchmark`
-feature and keep a separate, non-persisted global baseline. They use final stored
-centroids and the existing USearch engine. Selected leaves enter the production
-snapshot/leaf-scan/overlap/rerank pipeline. Global mode setup is untimed; query
-routing, private scratch allocation, dispatch and the production query are timed.
-This path preprocesses the query for global routing and again for production leaf
-scanning; its timings include that benchmark integration overhead.
+Modes are `exact` (production exact tree routing) and
+`partition-local-hnsw` (production local graphs). Both use the ordinary production
+search pipeline over the same published graph index.
 
 The experiment JSON accepts:
 
@@ -487,7 +481,6 @@ The experiment JSON accepts:
 | `graph_seed` | 0 | u64 encoded little-endian into the first 8 of 32 seed bytes |
 | `ef_search` | 200 | Requested expansion; actual per-parent effective values are recorded |
 | `routing_working_bytes` | 268435456 | Production per-operation routing admission |
-| `global_working_bytes` | 268435456 | Global centroids/graph plus one query/build working set |
 | `sample_items` | 1024 | Existing construction training sample control |
 | `build_memory_bytes` | 268435456 | Each existing construction/sort/serving/graph/refinement worker bound |
 | `build_scratch_bytes` | 68719476736 | Existing scratch and per-artifact bound |
@@ -499,19 +492,11 @@ apply. The rerank budget remains engine-owned and fixed for a given k. These are
 experimental settings, not selected production defaults. Construction resources
 are per existing worker phase, not a whole-process RSS limit.
 
-Global baselines support one Tree Key, at most 65,536 leaves (the shared local
-core/USearch limit), and 262,144 allocated Header slots. An explicitly selected
-global mode fails with a reason if its bound cannot be met; it never changes data
-size, mode or ef. A global exact reference used only for quality diagnostics may
-instead be recorded as skipped with a reason. The streaming fingerprint has the
-same Header-enumeration ceiling. Global retained bytes and setup time are reported;
-private query work is bounded separately for each concurrent caller. A global
-operation gate uses the Runtime foreground limit and retains its permit through
-native work and the production search. Total
-residency also includes runtime caches, backend/OS caches, dataset/oracle storage
-and other process state.
+The streaming leaf-layout fingerprint supports one Tree Key and at most 262,144
+allocated Header slots. Whole-process residency also includes runtime caches,
+backend/OS caches, dataset/oracle storage and other process state.
 
-### Measurement semantics and step 10 inputs
+### Measurement semantics and dataset comparisons
 
 Every worker reports construction phases, per-graph build/encode durations,
 native graph construction peaks (excluding Rust centroids/encoding), encoded graph
@@ -527,12 +512,10 @@ leaf-entry scan and truncation metrics remain separate from graph work.
 
 All timing/resource snapshots finish before diagnostic replay. For each unique
 query, `quality_diagnostics` records true-neighbor leaf coverage, local RaBitQ
-candidate coverage, rerank candidate coverage, final recall, and optional overlap
-with global exact centroid top-beam. Per-truth `truth_leaves` rows also record the
-persisted leaf identity and occupancy, its one-based global centroid rank, and
-whether the leaf was scanned and the neighbor returned. Rank is null when the
-bounded global reference is unavailable. These diagnostics require an immutable
-fixture and run outside timing. These are distinct quantities. Timed queries
+candidate coverage, rerank candidate coverage, and final recall. Per-truth
+`truth_leaves` rows also record the persisted leaf identity and occupancy, whether
+the leaf was scanned and the neighbor returned. These diagnostics require an
+immutable fixture and run outside timing. These are distinct quantities. Timed queries
 also retain individual recall values in completion order. Offline-refinement move
 and completed-round counts are null when the artifact API does not expose them;
 requested rounds remain in configuration. Setup and diagnostics are never called
@@ -541,7 +524,7 @@ caches, and later beam points can inherit the worker's Partition Cache. Use fres
 workers and cache capacities (including zero) to measure loading and turnover;
 no system cache purge is performed.
 
-For step 10, use the existing `large` dataset cache and scenarios
+For large-dataset comparisons, use the existing `large` dataset cache and scenarios
 `quality-cohere-1m` / `quality-sift-1m`, k=100, separate calibration/validation query
 windows, multiple graph seeds, independent capacity pairs, beam/ef, cache budgets
 and client counts. Keep the leaf-layout fingerprint and query checksum with each
@@ -550,7 +533,7 @@ logical bytes and process-lifetime peak RSS before diagnostics (not per-point
 RSS); it does not declare a winner or compare unequal recall.
 The existing `compare` command remains a strict identical-input regression check.
 Select matched final recall rows (including the >90% target) before comparing
-capacity/performance. No full 1M matrix or default selection is part of step 9.
+capacity/performance.
 
 The VectorDBBench bridge accepts the same `--routing-experiment JSON` at startup;
 the Python client/protocol is unchanged. Its requested refinement runs in artifact

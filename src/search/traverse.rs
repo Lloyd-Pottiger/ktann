@@ -65,8 +65,6 @@ pub(crate) struct TraversalRequest<'a> {
     leaf_beam: u32,
     routing_mode: RoutingMode,
     #[cfg(feature = "benchmark")]
-    selected_leaves: Option<&'a [(PartitionKey, f64)]>,
-    #[cfg(feature = "benchmark")]
     diagnostics: Option<&'a std::sync::Mutex<crate::benchmark::SearchDiagnostics>>,
 }
 
@@ -77,15 +75,6 @@ impl<'a> TraversalRequest<'a> {
         diagnostics: Option<&'a std::sync::Mutex<crate::benchmark::SearchDiagnostics>>,
     ) -> Self {
         self.diagnostics = diagnostics;
-        self
-    }
-
-    #[cfg(feature = "benchmark")]
-    pub(crate) fn with_selected_leaves(
-        mut self,
-        leaves: Option<&'a [(PartitionKey, f64)]>,
-    ) -> Self {
-        self.selected_leaves = leaves;
         self
     }
 
@@ -115,8 +104,6 @@ impl<'a> TraversalRequest<'a> {
             budgets,
             leaf_beam,
             routing_mode: RoutingMode::Exact,
-            #[cfg(feature = "benchmark")]
-            selected_leaves: None,
             #[cfg(feature = "benchmark")]
             diagnostics: None,
         })
@@ -248,25 +235,6 @@ pub(crate) async fn traverse<T: ReadOps>(
         request,
     };
     let mut state = Traversal::seed(context.request.trees)?;
-    #[cfg(feature = "benchmark")]
-    if let Some(leaves) = context.request.selected_leaves {
-        if context.request.trees.len() != 1 || manifest.config().local_graph().is_none() {
-            return Err(Error::invalid_argument());
-        }
-        state.frontier.clear();
-        state.referenced.clear();
-        for &(partition, distance) in leaves {
-            if !state.referenced.insert((0, partition)) {
-                return Err(Error::invalid_argument());
-            }
-            state.frontier.push(Reverse(FrontierEntry {
-                distance,
-                tree: 0,
-                partition,
-                expected_level: Some(1),
-            }));
-        }
-    }
     state.run(txn, &context).await?;
     state.finish()
 }

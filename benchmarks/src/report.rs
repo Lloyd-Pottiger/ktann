@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 /// Current complete benchmark suite/report JSON contract.
-pub const REPORT_SCHEMA_VERSION: u32 = 9;
+pub const REPORT_SCHEMA_VERSION: u32 = 10;
 
 /// Reports produced by one suite command on one comparable host.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -405,7 +405,7 @@ pub struct QualitySweepMeasurements {
     /// Construction through the first complete, maintenance-converged audit.
     /// Absent when the benchmark reuses a persisted index.
     pub construction: Option<ConstructionMeasurements>,
-    /// Global setup cost/residency and the exact persisted fixture identity.
+    /// Persisted fixture identity, fingerprint cost, and measured process peak RSS.
     pub routing_setup: Option<serde_json::Value>,
     /// Points ordered by client count, then from narrowest to widest beam.
     pub points: Vec<QualityPoint>,
@@ -1126,8 +1126,6 @@ pub struct RoutingMeasurements {
 /// Per-query quality decomposition, separate from measured latency/QPS.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct QualityDiagnostics {
-    /// Why the optional global exact centroid reference was unavailable.
-    pub global_reference_skipped: Option<String>,
     /// One row per held-out query, in source query order.
     pub queries: Vec<QueryQuality>,
 }
@@ -1145,9 +1143,7 @@ pub struct QueryQuality {
     pub rerank_candidate_coverage: f64,
     /// Returned true neighbors / number of true neighbors.
     pub final_recall: f64,
-    /// Selected leaves overlapping global exact centroid top-beam, when feasible.
-    pub global_centroid_coverage: Option<f64>,
-    /// Per-truth leaf ranks in the frozen global exact centroid ordering.
+    /// Each true neighbor's authoritative leaf and visibility in ordinary search.
     pub truth_leaves: Vec<TruthLeafQuality>,
 }
 
@@ -1158,8 +1154,6 @@ pub struct TruthLeafQuality {
     pub leaf: u64,
     /// Exact leaf occupancy, independent of how many truth IDs share it.
     pub entries: u64,
-    /// One-based global exact centroid rank; absent when the bounded reference is unavailable.
-    pub centroid_rank: Option<usize>,
     /// Whether ordinary search scanned this neighbor's leaf.
     pub scanned: bool,
     /// Whether this neighbor survived the complete query pipeline.

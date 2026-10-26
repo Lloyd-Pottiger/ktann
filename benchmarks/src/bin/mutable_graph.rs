@@ -184,13 +184,10 @@ async fn quality<B: Backend>(
                 SearchRequest::new(query.clone(), 100)
                     .unwrap()
                     .with_options(options),
-                None,
-                64,
-                Some(expected.iter().cloned().collect()),
+                expected.iter().cloned().collect(),
             )
             .await
             .unwrap();
-        let diagnostic = diagnostic.unwrap();
         let n = expected.len() as f64;
         diagnostic_coverage.push(json!({
             "true_neighbor_leaf_coverage": diagnostic.neighbors_in_leaves as f64/n,

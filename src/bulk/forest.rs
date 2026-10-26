@@ -337,8 +337,8 @@ impl ForestArtifact {
                 for record in records {
                     let record = record?;
                     check()?;
-                    // Includes retained originals, routing vectors, ID maps, five
-                    // rounds of moves and their simultaneous planning scratch.
+                    // Conservative admission for retained originals, routing
+                    // vectors, ID maps, and simultaneous per-round planning scratch.
                     charge_refinement(
                         &mut used,
                         1024 + record.id.len() * 4 + config.dimension() * 12,

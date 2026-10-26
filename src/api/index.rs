@@ -257,93 +257,31 @@ impl<B: Backend> Index<B> {
         .await
     }
 
-    /// Prepares a bounded global leaf-centroid comparison over this index.
-    #[cfg(feature = "benchmark")]
-    pub async fn global_leaf_router(
-        &self,
-        bytes: usize,
-        hnsw: bool,
-    ) -> Result<crate::benchmark::GlobalLeafRouter> {
-        let id = self.logical_index_id();
-        let concurrency = self.runtime.config().foreground_operation_limit();
-        self.run_foreground(
-            Operation::Search,
-            OperationOptions::default(),
-            move |context| async move {
-                crate::benchmark::GlobalLeafRouter::load(
-                    context.backend().as_ref(),
-                    id,
-                    bytes,
-                    hnsw,
-                    concurrency,
-                )
-                .await
-            },
-        )
-        .await
-    }
-
-    /// Executes a benchmark query through production search, optionally selecting
-    /// leaves globally and collecting untimed quality diagnostics. A global
-    /// operation retains its admission permit through routing and reranking.
-    /// Diagnostics are returned exactly when `truth` is supplied.
+    /// Executes production search with untimed truth-coverage diagnostics.
     #[cfg(feature = "benchmark")]
     pub async fn benchmark_search(
         &self,
         request: SearchRequest,
-        router: Option<Arc<crate::benchmark::GlobalLeafRouter>>,
-        ef: usize,
-        truth: Option<Vec<Bytes>>,
-    ) -> Result<(SearchOutcome, Option<crate::benchmark::SearchDiagnostics>)> {
-        if (router.is_some() || truth.is_some())
-            && (self.config().local_graph().is_none()
-                || !self.config().tree_key_fields().is_empty())
-            || truth
-                .as_ref()
-                .is_some_and(|truth| truth.len() > request.k())
+        truth: Vec<Bytes>,
+    ) -> Result<(SearchOutcome, crate::benchmark::SearchDiagnostics)> {
+        if self.config().local_graph().is_none()
+            || !self.config().tree_key_fields().is_empty()
+            || truth.len() > request.k()
         {
             return Err(Error::invalid_argument());
         }
-        let routing = router.map(|router| {
-            (
-                router,
-                request.vector().to_vec(),
-                request.options().resolved_leaf_beam_size() as usize,
-            )
-        });
-        let (leaves, _permit) = if let Some((router, query, beam)) = routing {
-            let id = self.logical_index_id();
-            let permit = router.permit().await?;
-            let (leaves, permit) = tokio::task::spawn_blocking(move || {
-                router
-                    .route(id, &query, beam, ef)
-                    .map(|leaves| (leaves, permit))
-            })
-            .await
-            .map_err(|error| Error::with_source(ErrorKind::Other, error))??;
-            (Some(leaves), Some(permit))
-        } else {
-            (None, None)
-        };
         let mut prepared = self.prepare_search(request)?;
-        prepared.leaves = leaves;
-        let diagnostics = truth.map(|truth| {
-            Arc::new(std::sync::Mutex::new(
-                crate::benchmark::SearchDiagnostics::new(truth),
-            ))
-        });
-        prepared.diagnostics = diagnostics.clone();
+        let diagnostics = Arc::new(std::sync::Mutex::new(
+            crate::benchmark::SearchDiagnostics::new(truth),
+        ));
+        prepared.diagnostics = Some(Arc::clone(&diagnostics));
         let outcome = self
             .execute_search(prepared, OperationOptions::default())
             .await?;
         let diagnostics = diagnostics
-            .map(|diagnostics| {
-                diagnostics
-                    .lock()
-                    .map(|value| value.clone())
-                    .map_err(|_| Error::new(ErrorKind::Other))
-            })
-            .transpose()?;
+            .lock()
+            .map_err(|_| Error::new(ErrorKind::Other))?
+            .clone();
         Ok((outcome, diagnostics))
     }
 

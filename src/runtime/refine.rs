@@ -296,7 +296,8 @@ fn plan(
                 )?;
             }
         }
-        tree.rounds = refine(
+        let history = &mut tree.rounds;
+        refine(
             checkpoint,
             &kernel,
             &loaded.vectors,
@@ -304,19 +305,17 @@ fn plan(
             manifest.config().min_leaf_partition_entries() as usize,
             manifest.config().max_leaf_partition_entries() as usize,
             options.rounds,
-        )?
-        .into_iter()
-        .map(|round| {
-            round
-                .into_iter()
-                .map(|(position, source, target)| Move {
+            |round, position, source, target| {
+                if history.len() == round {
+                    history.push(Vec::new());
+                }
+                history[round].push(Move {
                     source,
                     target,
                     id: loaded.ids[position].clone(),
-                })
-                .collect()
-        })
-        .collect();
+                });
+            },
+        )?;
         refresh_internal_centers(&kernel, &mut tree.parts, leaf_count, checkpoint)?;
         // Only final routing centers and ordered moves are needed during writes.
         for part in &mut tree.parts {
@@ -422,6 +421,7 @@ pub(crate) fn refine_plans(
         config.min_leaf_partition_entries() as usize,
         config.max_leaf_partition_entries() as usize,
         rounds as usize,
+        |_, _, _, _| {},
     )?;
     let positions = refresh_internal_centers(&kernel, &mut parts, leaves, check)?;
     for plan in plans {
@@ -557,6 +557,13 @@ fn mean<'a>(kernel: &VectorKernel, members: impl Iterator<Item = &'a [f32]>) -> 
 /// Greedy positive-gain moves use fixed centroids during one round, then
 /// recompute spherical means. Exact counts constrain every accepted move.
 /// The only root leaf is exempt from the ordinary nonroot minimum.
+/// Only online planning retains accepted moves for later persistence; artifact
+/// preparation needs only the final membership and centroids. Callers discard
+/// their private planning state if any round fails.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "numerical inputs, occupancy bounds, and move observation are independent"
+)]
 fn refine(
     checkpoint: &impl Fn() -> Result<()>,
     kernel: &VectorKernel,
@@ -565,14 +572,13 @@ fn refine(
     minimum: usize,
     maximum: usize,
     rounds: usize,
-) -> Result<Vec<Vec<(usize, PartitionKey, PartitionKey)>>> {
-    let mut history = Vec::new();
+    mut on_move: impl FnMut(usize, usize, PartitionKey, PartitionKey),
+) -> Result<()> {
     if leaves.len() < 2 {
-        return Ok(history);
+        return Ok(());
     }
-    for _ in 0..rounds {
+    for round in 0..rounds {
         checkpoint()?;
-        let mut accepted = Vec::new();
         let mut moves = Vec::new();
         for (source, leaf) in leaves.iter().enumerate() {
             checkpoint()?;
@@ -643,7 +649,7 @@ fn refine(
         let mut targets = BTreeMap::new();
         for (_, position, source, target) in moves {
             if counts[source] > minimum && counts[target] < maximum {
-                accepted.push((position, leaves[source].key, leaves[target].key));
+                on_move(round, position, leaves[source].key, leaves[target].key);
                 counts[source] -= 1;
                 counts[target] += 1;
                 targets.insert(position, target);
@@ -653,7 +659,6 @@ fn refine(
         if targets.is_empty() {
             break;
         }
-        history.push(accepted);
         let mut members = vec![Vec::new(); leaves.len()];
         for (source, leaf) in leaves.iter().enumerate() {
             for &position in &leaf.members {
@@ -669,7 +674,7 @@ fn refine(
             leaf.members = members;
         }
     }
-    Ok(history)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -740,6 +745,7 @@ mod tests {
             },
         ];
         let options = RefineOptions::new(100).unwrap();
+        let mut moves = Vec::new();
         refine(
             &|| Ok(()),
             &kernel,
@@ -748,9 +754,11 @@ mod tests {
             2,
             2,
             options.rounds,
+            |round, position, source, target| moves.push((round, position, source, target)),
         )
         .unwrap();
         assert_eq!(leaves[0].members, [0, 2]); // A full target cannot accept a move.
+        assert!(moves.is_empty());
         refine(
             &|| Ok(()),
             &kernel,
@@ -759,12 +767,20 @@ mod tests {
             1,
             3,
             options.rounds,
+            |round, position, source, target| moves.push((round, position, source, target)),
         )
         .unwrap();
         assert_eq!(leaves[0].members, [0, 1]);
         assert_eq!(leaves[1].members, [2, 3]);
         assert_eq!(leaves[0].center.as_ref(), [0.5]);
         assert_eq!(leaves[1].center.as_ref(), [9.5]);
+        assert_eq!(
+            moves,
+            [
+                (0, 1, leaves[1].key, leaves[0].key),
+                (0, 2, leaves[0].key, leaves[1].key),
+            ]
+        );
     }
 
     #[test]
@@ -800,6 +816,7 @@ mod tests {
             1,
             5,
             options.rounds,
+            |_, _, _, _| {},
         )
         .unwrap();
         for (cluster, leaf) in leaves.iter().enumerate() {

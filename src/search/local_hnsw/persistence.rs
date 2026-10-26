@@ -140,9 +140,8 @@ pub(crate) fn build_records(
     )
 }
 
-/// Prepares one complete replacement body. Pure deletion, insertion and centroid
-/// replacement evolve private restored graphs; mixed deletion batches rebuild.
-/// Source corruption is never concealed by rebuilding.
+/// Prepares one complete replacement for inserted or removed Child Entries.
+/// Existing children keep their centroids; each topology step only adds or removes.
 #[expect(
     clippy::too_many_arguments,
     reason = "snapshot-bound source and proposed body with operation admission"
@@ -163,11 +162,10 @@ pub(crate) fn update_records(
     {
         return Err(Error::invalid_argument());
     }
-    let mapping_bytes = old
+    let mapping_bytes = next
         .children
         .len()
-        .checked_add(next.children.len())
-        .and_then(|count| count.checked_mul(4))
+        .checked_mul(4)
         .and_then(|bytes| bytes.checked_add(128))
         .ok_or_else(limit)?;
     let restore_budget = working_bytes
@@ -184,81 +182,60 @@ pub(crate) fn update_records(
             .map_err(|_| limit())?;
         for child in next.children {
             check()?;
-            let Ok(slot) = old
+            let slot = old
                 .children
                 .binary_search_by_key(&child.child(), ChildEntry::child)
-            else {
-                break;
-            };
+                .map_err(|_| Error::invalid_argument())?;
             if old.children[slot].centroid() != child.centroid() {
-                break;
+                return Err(Error::invalid_argument());
             }
             survivors.push(slot as u32);
         }
-        if survivors.len() == next.children.len() {
-            let available = working_bytes
-                .checked_sub(old.bytes + next.bytes + mapping_bytes)
-                .ok_or_else(limit)?;
-            let distance = |a: u32, b: u32| {
-                next.distance(
-                    next.children[a as usize].centroid(),
-                    next.children[b as usize].centroid(),
-                )
-            };
-            let graph = controlled(check, |proceed| {
-                graph.retain(
-                    &survivors,
-                    source.parameters.ef_construction,
-                    available,
-                    &distance,
-                    proceed,
-                )
-            })?;
-            let identity = identity(next, source.parameters, source.tree, source.parent, check)?;
-            return finish_records(
-                next,
-                graph,
-                identity,
-                source.index,
-                next_header,
-                working_bytes
-                    .checked_sub(old.bytes + mapping_bytes)
-                    .ok_or_else(limit)?,
-                check,
-            );
-        }
+        let available = working_bytes
+            .checked_sub(old.bytes + next.bytes + mapping_bytes)
+            .ok_or_else(limit)?;
+        let distance = |a: u32, b: u32| {
+            next.distance(
+                next.children[a as usize].centroid(),
+                next.children[b as usize].centroid(),
+            )
+        };
+        let graph = controlled(check, |proceed| {
+            graph.retain(
+                &survivors,
+                source.parameters.ef_construction,
+                available,
+                &distance,
+                proceed,
+            )
+        })?;
+        let identity = identity(next, source.parameters, source.tree, source.parent, check)?;
+        return finish_records(
+            next,
+            graph,
+            identity,
+            source.index,
+            next_header,
+            working_bytes
+                .checked_sub(old.bytes + mapping_bytes)
+                .ok_or_else(limit)?,
+            check,
+        );
     }
     let mut mapping = Vec::new();
-    let mut changed = Vec::new();
     mapping
         .try_reserve_exact(next.children.len())
         .map_err(|_| limit())?;
-    changed
-        .try_reserve_exact(old.children.len())
-        .map_err(|_| limit())?;
-    for (slot, child) in old.children.iter().enumerate() {
+    for child in old.children {
         check()?;
-        let Ok(target) = next
+        let target = next
             .children
             .binary_search_by_key(&child.child(), ChildEntry::child)
-        else {
-            drop(graph);
-            return build_records(
-                next,
-                GraphSource {
-                    header: next_header,
-                    ..source
-                },
-                working_bytes
-                    .checked_sub(old.bytes + mapping_bytes)
-                    .ok_or_else(limit)?,
-                check,
-            );
-        };
-        mapping.push(target as u32);
+            .map_err(|_| Error::invalid_argument())?;
         if child.centroid() != next.children[target].centroid() {
-            changed.push(slot as u32);
+            return Err(Error::invalid_argument());
         }
+        mapping.push(target as u32);
     }
     for (target, child) in next.children.iter().enumerate() {
         check()?;
@@ -280,9 +257,8 @@ pub(crate) fn update_records(
         )
     };
     let graph = controlled(check, |proceed| {
-        graph.evolve(
+        graph.insert(
             &mapping,
-            &changed,
             source.parameters.ef_construction,
             partition_seed(source.parameters.seed, source.tree, source.parent)
                 ^ next_header.cache_epoch(),

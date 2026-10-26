@@ -16,13 +16,6 @@ use ktann::storage::{ReadLogicalTxn, WriteLogicalTxn};
 
 const MEMORY: usize = 64 * 1024 * 1024;
 
-fn report(phase: &str, started: std::time::Instant) {
-    let micros = started.elapsed().as_micros();
-    if std::env::var_os("KTANN_GRAPH_UPDATE_TIMING").is_some() {
-        eprintln!("graph_update_timing,{phase},{micros}");
-    }
-}
-
 /// Test-owned topology edits; publication itself uses the production transition.
 struct Update {
     graph: PreparedGraphTransition,
@@ -116,9 +109,7 @@ fn prepare(
     next: Vec<ChildEntry>,
     manifest: &IndexManifest,
     tree: &TreeKey,
-    phase: &str,
 ) -> Update {
-    let started = std::time::Instant::now();
     let old = source.children();
     let mut changes = Vec::new();
     for entry in &next {
@@ -150,7 +141,6 @@ fn prepare(
     let graph = source
         .prepare(Some(header), next, MEMORY, &|| Ok(()))
         .unwrap();
-    report(phase, started);
     Update {
         graph,
         index: manifest.logical_index_id(),
@@ -200,10 +190,9 @@ async fn commit<T: WriteTxn>(
     fault: &dyn Fn(&'static str, usize),
     phase: &'static str,
     attempt: usize,
-    started: std::time::Instant,
 ) -> bool {
     fault(phase, attempt);
-    let committed = match txn.commit().await {
+    match txn.commit().await {
         Ok(()) => true,
         Err(error)
             if matches!(
@@ -214,9 +203,7 @@ async fn commit<T: WriteTxn>(
             false
         }
         Err(error) => panic!("{phase}: {error:?}"),
-    };
-    report(phase, started);
-    committed
+    }
 }
 
 async fn source<B: Backend>(
@@ -224,9 +211,8 @@ async fn source<B: Backend>(
     manifest: &IndexManifest,
     tree: &TreeKey,
 ) -> GraphTransitionSource {
-    let started = std::time::Instant::now();
     let mut txn = ReadLogicalTxn::for_index(backend.begin_read().await.unwrap(), manifest);
-    let source = GraphTransitionSource::read(
+    GraphTransitionSource::read(
         &mut txn,
         tree,
         PartitionKey::new(1).unwrap(),
@@ -234,9 +220,7 @@ async fn source<B: Backend>(
         &|| Ok(()),
     )
     .await
-    .unwrap();
-    report("source-read", started);
-    source
+    .unwrap()
 }
 
 pub async fn exercise<B: Backend>(
@@ -256,10 +240,6 @@ pub async fn exercise<B: Backend>(
     let root = PartitionKey::new(1).unwrap();
     let initial = source(backend, &manifest, &tree).await;
     let original = initial.children().to_vec();
-    let mut next = original.clone();
-    let mut centroid = next[0].centroid().to_vec();
-    centroid[0] += 0.01;
-    next[0] = ChildEntry::new(next[0].child(), centroid);
     let mut old_snapshot =
         ReadLogicalTxn::for_index(backend.begin_read().await.unwrap(), &manifest);
     let descriptor_key = LogicalKey::GraphDescriptor {
@@ -275,20 +255,7 @@ pub async fn exercise<B: Backend>(
         descriptor.chunks() > 1,
         "fixture must exercise multi-chunk atomic replacement"
     );
-    if std::env::var_os("KTANN_GRAPH_UPDATE_TIMING").is_some() {
-        eprintln!(
-            "graph_update_fixture,nodes={},dimensions={},chunks={},centroid_bytes={},working_limit={},write_limit={}",
-            original.len(),
-            manifest.config().dimension(),
-            descriptor.chunks(),
-            original
-                .iter()
-                .map(|child| child.centroid().len() * 4)
-                .sum::<usize>(),
-            MEMORY,
-            9_000_000
-        );
-    }
+
     let expected_hits = query(index).await;
     // A shorter replacement removes stale tail chunks inside the atomic write.
     // Roll back this deliberately uncomposed topology change before publication.
@@ -297,7 +264,6 @@ pub async fn exercise<B: Backend>(
         original[..original.len() / 2].to_vec(),
         &manifest,
         &tree,
-        "shrink-prepare",
     );
     let mut shortened = writer(backend, &manifest).await;
     assert!(
@@ -328,18 +294,14 @@ pub async fn exercise<B: Backend>(
     );
     shortened.rollback().await;
 
-    let mut stale_next = next.clone();
-    let mut stale_centroid = stale_next[0].centroid().to_vec();
-    stale_centroid[0] += 0.02;
-    stale_next[0] = ChildEntry::new(stale_next[0].child(), stale_centroid);
+    // Header-only topology transitions still replace the snapshot-bound descriptor.
     let mut stale = prepare(
         source(backend, &manifest, &tree).await,
-        stale_next,
+        original.clone(),
         &manifest,
         &tree,
-        "stale-prepare",
     );
-    let mut update = prepare(initial, next, &manifest, &tree, "centroid-prepare");
+    let mut update = prepare(initial, original.clone(), &manifest, &tree);
     // Rolling back a complete replacement must leave the old body searchable.
     let mut aborted = writer(backend, &manifest).await;
     update.publish(&mut aborted).await.unwrap();
@@ -353,10 +315,9 @@ pub async fn exercise<B: Backend>(
         verified.issues
     );
     for attempt in 0..32 {
-        let started = std::time::Instant::now();
         let mut txn = writer(backend, &manifest).await;
         update.publish(&mut txn).await.unwrap();
-        if commit(txn, fault, "publish", attempt, started).await {
+        if commit(txn, fault, "publish", attempt).await {
             break;
         }
         assert!(attempt < 31);
@@ -397,9 +358,8 @@ pub async fn exercise<B: Backend>(
     let centroid = next[0].centroid().to_vec();
     next.push(ChildEntry::new(child, centroid.clone()));
     next.sort_by_key(ChildEntry::child);
-    let mut update = prepare(current, next, &manifest, &tree, "insert-prepare");
+    let mut update = prepare(current, next, &manifest, &tree);
     for attempt in 0..32 {
-        let started = std::time::Instant::now();
         let mut txn = writer(backend, &manifest).await;
         if !update.published(&mut txn).await.unwrap() {
             txn.put(
@@ -448,7 +408,7 @@ pub async fn exercise<B: Backend>(
             .unwrap();
             assert!(update.publish(&mut txn).await.unwrap());
         }
-        if commit(txn, fault, "insert", attempt, started).await {
+        if commit(txn, fault, "insert", attempt).await {
             break;
         }
         assert!(attempt < 31);
@@ -458,15 +418,8 @@ pub async fn exercise<B: Backend>(
     // Preparation has no durable state. Dropping an unused preparation leaves
     // nothing to cancel or reclaim; the same result can be published later.
     let current = source(backend, &manifest, &tree).await;
-    let mut update = prepare(
-        current,
-        original.clone(),
-        &manifest,
-        &tree,
-        "delete-prepare",
-    );
+    let mut update = prepare(current, original.clone(), &manifest, &tree);
     for attempt in 0..32 {
-        let started = std::time::Instant::now();
         let mut txn = writer(backend, &manifest).await;
         if !update.published(&mut txn).await.unwrap() {
             assert!(update.publish(&mut txn).await.unwrap());
@@ -495,7 +448,7 @@ pub async fn exercise<B: Backend>(
                 txn.delete(key).await.unwrap();
             }
         }
-        if commit(txn, fault, "delete", attempt, started).await {
+        if commit(txn, fault, "delete", attempt).await {
             break;
         }
         assert!(attempt < 31);

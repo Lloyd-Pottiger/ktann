@@ -2,7 +2,7 @@
 use ktann::api::{LocalGraphConfig, RoutingMode};
 use serde::{Deserialize, Serialize};
 
-/// Explicit routing comparison; global variants are benchmark-only.
+/// Production routing policies compared over the same frozen dataset.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Mode {
@@ -11,10 +11,6 @@ pub enum Mode {
     Exact,
     /// Production partition-local graph routing.
     PartitionLocalHnsw,
-    /// Exact scan over all final leaf centroids.
-    GlobalExact,
-    /// One in-memory graph over all final leaf centroids.
-    GlobalHnsw,
 }
 
 /// Fully resolved experiment inputs. Unknown fields are rejected, including typos.
@@ -33,8 +29,6 @@ pub struct Experiment {
     pub ef_search: u32,
     /// Per-operation production routing working memory.
     pub routing_working_bytes: usize,
-    /// Global baseline retained plus private operation memory ceiling.
-    pub global_working_bytes: usize,
     /// Existing construction sampling control.
     pub sample_items: usize,
     /// Per-worker construction/serving/refinement memory ceiling.
@@ -52,7 +46,6 @@ impl Default for Experiment {
             graph_seed: 0,
             ef_search: 200,
             routing_working_bytes: 256 << 20,
-            global_working_bytes: 256 << 20,
             sample_items: 1024,
             build_memory_bytes: 256 << 20,
             build_scratch_bytes: 64 << 30,
@@ -66,7 +59,6 @@ impl Experiment {
         self.graph().map_err(|e| e.to_string())?;
         if self.ef_search == 0
             || self.routing_working_bytes == 0
-            || self.global_working_bytes == 0
             || self.sample_items == 0
             || self.build_memory_bytes == 0
             || self.build_scratch_bytes == 0
@@ -105,18 +97,13 @@ impl Experiment {
         LocalGraphConfig::new(self.m, self.ef_construction, seed)
     }
 
-    /// Production routing selection; global policies bypass internal traversal.
+    /// Production routing selection for the frozen fixture.
     pub fn production_mode(&self) -> RoutingMode {
         match self.mode {
             Mode::PartitionLocalHnsw => RoutingMode::PartitionLocalHnsw {
                 ef_search: self.ef_search as usize,
             },
-            _ => RoutingMode::Exact,
+            Mode::Exact => RoutingMode::Exact,
         }
-    }
-
-    /// Whether to prepare the bounded global comparison before warmup.
-    pub fn global(&self) -> bool {
-        matches!(self.mode, Mode::GlobalExact | Mode::GlobalHnsw)
     }
 }

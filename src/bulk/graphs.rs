@@ -7,7 +7,10 @@ use crate::search::local_hnsw::{
 };
 use crate::search::numeric::VectorKernel;
 use crate::storage::keys::{LogicalKey, TreeKey};
-use crate::storage::values::{ChildEntry, IndexManifest, PartitionHeader, PersistentValue};
+use crate::storage::values::{
+    ChildEntry, IndexManifest, PartitionHeader, PersistentValue, ValueCodec,
+};
+use bytes::Bytes;
 
 /// Retains only one internal body; leaf bodies never allocate graph state.
 pub(super) struct GraphPreparation<'a> {
@@ -31,8 +34,28 @@ impl<'a> GraphPreparation<'a> {
         })
     }
 
-    /// Observe canonical bytes after finishing the preceding body at its boundary.
-    pub(super) fn observe(&mut self, key: &LogicalKey, value: PersistentValue) -> Result<()> {
+    /// Emits a completed graph before the next body, then collects its canonical projections.
+    /// The caller writes the observed row afterward and finishes once more at EOF.
+    pub(super) fn observe(
+        &mut self,
+        key: &LogicalKey,
+        value: &[u8],
+        check: &dyn Fn() -> Result<()>,
+        emit: impl FnMut(LogicalKey, PersistentValue) -> Result<()>,
+    ) -> Result<()> {
+        if matches!(
+            key,
+            LogicalKey::Header { .. } | LogicalKey::TreeManifest { .. }
+        ) {
+            self.finish(check, emit)?;
+        }
+        if !matches!(
+            key,
+            LogicalKey::Header { .. } | LogicalKey::ChildEntry { .. }
+        ) {
+            return Ok(());
+        }
+        let value = ValueCodec::for_index(self.index).decode(key, Bytes::copy_from_slice(value))?;
         match (key, value) {
             (
                 LogicalKey::Header {

@@ -381,8 +381,9 @@ pub(crate) async fn advance_observed<'b, B: Backend>(
                 continue;
             }
         }
-        let parent = if participants.proof.is_some() {
-            topology::find_incoming_edge(&mut read, manifest, tree, partition, header.level())
+        let parent = if let Some(proof) = &participants.proof {
+            proof
+                .find(&mut read, manifest, tree, partition)
                 .await?
                 .map(|(parent, _)| parent)
         } else {

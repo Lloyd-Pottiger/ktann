@@ -1,5 +1,4 @@
-//! Experimental benchmark helpers, excluded from production builds.
-pub use crate::search::local_hnsw::benchmark::GlobalLeafRouter;
+//! Untimed benchmark diagnostics, excluded from production builds.
 
 /// Resolves truth membership in one snapshot of a caller-frozen graph fixture.
 /// This bounded, untimed diagnostic is deliberately outside ordinary search.
@@ -105,8 +104,8 @@ impl SearchDiagnostics {
     }
 }
 
-/// Streams a canonical leaf-membership/centroid fingerprint without retaining a
-/// global routing index. Partition identities and raw membership bytes are included;
+/// Streams a canonical leaf-membership/centroid fingerprint.
+/// Partition identities and raw membership bytes are included;
 /// internal grouping and graph parameters are deliberately excluded.
 pub(crate) async fn leaf_layout_fingerprint<B: crate::storage::backend::Backend>(
     backend: &B,

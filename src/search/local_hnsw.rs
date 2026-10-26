@@ -4,8 +4,6 @@
 //! builds encoded records from borrowed Child Entries and restores complete
 //! internal graph bodies. The existing numeric kernel supplies native distances.
 
-#[cfg(feature = "benchmark")]
-pub(crate) mod benchmark;
 pub(crate) mod body;
 pub(crate) mod persistence;
 

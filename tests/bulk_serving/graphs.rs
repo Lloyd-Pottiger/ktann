@@ -14,19 +14,20 @@ fn worker(dir: &Directory) -> BulkWorkerOptions {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn graph_publication_preserves_membership_and_supports_mutations() {
     for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
+        // Empty and singleton forests have no internal graph. Cover their lifecycle
+        // once per refinement mode; exercise graph-bearing forests for every metric.
+        let counts: &[u64] = if metric == Metric::L2 {
+            &[0, 1, 73]
+        } else {
+            &[73]
+        };
         for rounds in [None, Some(0), Some(2)] {
-            for count in [0, 1, 73] {
+            for &count in counts {
                 let dir = Directory::new();
                 let backend = MemoryBackend::new();
                 let runtime = runtime(backend);
                 let config = config(metric, true)
                     .with_local_graph(LocalGraphConfig::new(2, 8, [9; 32]).unwrap());
-                let ordinary = runtime
-                    .create_index("ordinary", config.clone())
-                    .await
-                    .unwrap();
-                assert_eq!(ordinary.config(), &config);
-                runtime.drop_index("ordinary").await.unwrap();
                 let input = InputSnapshot::create(
                     &dir.0.join("source"),
                     config,

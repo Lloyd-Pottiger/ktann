@@ -63,8 +63,6 @@ pub(crate) struct PreparedSearch {
     predicate: Option<CompiledPredicate>,
     plan: TreeKeyPlan,
     #[cfg(feature = "benchmark")]
-    pub(crate) leaves: Option<Vec<(PartitionKey, f64)>>,
-    #[cfg(feature = "benchmark")]
     pub(crate) diagnostics:
         Option<std::sync::Arc<std::sync::Mutex<crate::benchmark::SearchDiagnostics>>>,
 }
@@ -107,8 +105,6 @@ impl PreparedSearch {
             routing,
             predicate,
             plan,
-            #[cfg(feature = "benchmark")]
-            leaves: None,
             #[cfg(feature = "benchmark")]
             diagnostics: None,
         })
@@ -162,9 +158,7 @@ pub(crate) async fn search<B: Backend>(
     )?
     .with_routing_mode(prepared.request.options().routing_mode());
     #[cfg(feature = "benchmark")]
-    let traversal_request = traversal_request
-        .with_selected_leaves(prepared.leaves.as_deref())
-        .with_diagnostics(prepared.diagnostics.as_deref());
+    let traversal_request = traversal_request.with_diagnostics(prepared.diagnostics.as_deref());
     let mut traversal = traverse(
         &mut txn,
         cache,

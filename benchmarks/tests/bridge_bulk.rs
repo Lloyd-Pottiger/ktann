@@ -230,7 +230,7 @@ fn refinement_limit_failure_stays_terminal_and_keeps_search_closed() {
 
 #[test]
 fn fixed_bridge_routes_after_artifact_refinement() {
-    for mode in ["partition-local-hnsw", "global-hnsw"] {
+    for mode in ["exact", "partition-local-hnsw"] {
         let mut bridge = Bridge::start_with(Some(
             json!({"mode":mode, "m":8, "ef_construction":40, "graph_seed":9, "ef_search":16, "build_memory_bytes":33554432}),
         ));
@@ -263,51 +263,6 @@ fn fixed_bridge_routes_after_artifact_refinement() {
             assert_eq!(report["bulk_build"][field], 33554432, "{field}: {report}");
         }
     }
-}
-
-#[test]
-fn global_router_failure_keeps_the_published_index_closed_to_search() {
-    let mut bridge = Bridge::start_with(Some(json!({
-        "mode":"global-hnsw", "global_working_bytes":1,
-    })));
-    assert_eq!(
-        bridge.request(json!({
-            "op":"reset", "dimension":4, "metric":"L2", "dataset":"router-limit",
-            "refinement_rounds":0, "refinement_memory_bytes":33554432,
-        }))["ok"],
-        true
-    );
-    assert_eq!(bridge.insert(&[1], &[vec![1., 2., 3., 4.]])["ok"], true);
-    for _ in 0..2 {
-        let result = bridge.request(json!({"op":"optimize", "records":1}));
-        assert_eq!(result["ok"], false, "{result}");
-        assert!(
-            result["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("LimitExceeded")
-        );
-        assert_eq!(
-            bridge.request(json!({"op":"health"}))["result"]["ready"],
-            false
-        );
-        assert_eq!(
-            bridge.request(json!({"op":"search", "vector":[1.,2.,3.,4.], "k":1}))["ok"],
-            false
-        );
-    }
-    bridge.stop();
-    let report: Value = serde_json::from_slice(
-        &std::fs::read(bridge.directory.path().join("report.json")).unwrap(),
-    )
-    .unwrap();
-    assert!(
-        report["bulk_build"]["validate_publish_cleanup_seconds"]
-            .as_f64()
-            .unwrap()
-            > 0.
-    );
-    assert_eq!(report["ready"], false);
 }
 
 #[test]

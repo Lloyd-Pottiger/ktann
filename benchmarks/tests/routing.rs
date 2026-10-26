@@ -4,11 +4,8 @@ use serde_json::{Value, json};
 use std::path::Path;
 use std::process::{Command, Output};
 
-fn run(root: &Path, mode: &str, reuse: bool, budget: Option<usize>) -> Output {
-    let mut experiment = json!({"mode": mode, "m":8,"ef_construction":40,"graph_seed":7,"ef_search":16,"build_memory_bytes":33554432});
-    if let Some(bytes) = budget {
-        experiment["global_working_bytes"] = json!(bytes);
-    }
+fn run(root: &Path, mode: &str, reuse: bool) -> Output {
+    let experiment = json!({"mode": mode, "m":8,"ef_construction":40,"graph_seed":7,"ef_search":16,"build_memory_bytes":33554432});
     Command::new(env!("CARGO_BIN_EXE_ktann-bench"))
         .args([
             "run",
@@ -45,16 +42,8 @@ fn all_routes_share_layout_and_keep_diagnostics_out_of_measurement() {
     let root = tempfile::tempdir().unwrap();
     let mut fingerprint = None;
     let mut rerank = None;
-    for (ordinal, mode) in [
-        "exact",
-        "partition-local-hnsw",
-        "global-exact",
-        "global-hnsw",
-    ]
-    .iter()
-    .enumerate()
-    {
-        let output = run(root.path(), mode, ordinal > 0, None);
+    for (ordinal, mode) in ["exact", "partition-local-hnsw"].iter().enumerate() {
+        let output = run(root.path(), mode, ordinal > 0);
         assert!(
             output.status.success(),
             "{mode}: {}",
@@ -64,7 +53,7 @@ fn all_routes_share_layout_and_keep_diagnostics_out_of_measurement() {
             &std::fs::read(root.path().join(format!("{mode}.json"))).unwrap(),
         )
         .unwrap();
-        assert_eq!(suite["schema_version"], 9);
+        assert_eq!(suite["schema_version"], 10);
         let report = &suite["reports"][0];
         assert_eq!(report["configuration"]["measured_operations"], 32);
         assert_eq!(report["configuration"]["routing_experiment"]["mode"], *mode);
@@ -96,11 +85,8 @@ fn all_routes_share_layout_and_keep_diagnostics_out_of_measurement() {
         let point = &sweep["points"][0]["measurements"];
         assert_eq!(point["per_query_recall"].as_array().unwrap().len(), 32);
         assert!(point["routing"]["distances"].as_u64().unwrap() > 0);
-        if ordinal < 2 {
-            assert!(point["routing"]["graph_loads"].as_u64().unwrap() > 0);
-        }
+        assert!(point["routing"]["graph_loads"].as_u64().unwrap() > 0);
         let diagnostics = &point["quality_diagnostics"];
-        assert!(diagnostics["global_reference_skipped"].is_null());
         assert_eq!(diagnostics["queries"].as_array().unwrap().len(), 8);
         for quality in diagnostics["queries"].as_array().unwrap() {
             let truth_leaves = quality["truth_leaves"].as_array().unwrap();
@@ -122,14 +108,7 @@ fn all_routes_share_layout_and_keep_diagnostics_out_of_measurement() {
                 quality["final_recall"].as_f64().unwrap()
             );
             for leaf in truth_leaves {
-                assert!(leaf["centroid_rank"].as_u64().unwrap() > 0);
                 assert!(leaf["entries"].as_u64().unwrap() > 0);
-                if *mode == "global-exact" {
-                    assert_eq!(
-                        leaf["scanned"],
-                        leaf["centroid_rank"].as_u64().unwrap() <= 4
-                    );
-                }
             }
             let values: Vec<f64> = [
                 "true_neighbor_leaf_coverage",
@@ -144,55 +123,8 @@ fn all_routes_share_layout_and_keep_diagnostics_out_of_measurement() {
                 values.windows(2).all(|pair| pair[0] >= pair[1]),
                 "{quality}"
             );
-            if *mode == "global-exact" {
-                assert_eq!(quality["global_centroid_coverage"], 1.0);
-            }
         }
     }
-    let global_report: Value =
-        serde_json::from_slice(&std::fs::read(root.path().join("global-exact.json")).unwrap())
-            .unwrap();
-    let reference_resident_bytes = global_report["reports"][0]["measurements"]["values"]["routing_setup"]["global"]["resident_bytes"].as_u64().unwrap() as usize;
-    let output = run(
-        root.path(),
-        "exact",
-        true,
-        Some(reference_resident_bytes + 256),
-    );
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let report: Value =
-        serde_json::from_slice(&std::fs::read(root.path().join("exact.json")).unwrap()).unwrap();
-    let skipped = report["reports"][0]["measurements"]["values"]["points"][0]["measurements"]["quality_diagnostics"]["global_reference_skipped"].as_str().unwrap();
-    assert!(skipped.contains("reference query"), "{skipped}");
-
-    // A diagnostic-only global reference may skip; the production route must run.
-    let output = run(root.path(), "exact", true, Some(1));
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let report: Value =
-        serde_json::from_slice(&std::fs::read(root.path().join("exact.json")).unwrap()).unwrap();
-    assert!(report["reports"][0]["measurements"]["values"]["points"][0]["measurements"]["quality_diagnostics"]["global_reference_skipped"].is_string());
-    let queries = report["reports"][0]["measurements"]["values"]["points"][0]["measurements"]["quality_diagnostics"]["queries"].as_array().unwrap();
-    for query in queries {
-        for leaf in query["truth_leaves"].as_array().unwrap() {
-            assert!(leaf["centroid_rank"].is_null());
-            assert!(leaf["entries"].as_u64().unwrap() > 0);
-            assert!(leaf["scanned"].is_boolean());
-            assert!(leaf["returned"].is_boolean());
-        }
-    }
-
-    // The selected global mode must fail, not silently fall back to tree routing.
-    let output = run(root.path(), "global-hnsw", true, Some(1));
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("global baseline refused"));
 }
 
 #[test]

@@ -58,10 +58,9 @@ mod ffi {
             limit: usize,
             context: &MetricContext,
         ) -> Result<UniquePtr<NativeGraph>>;
-        fn evolve(
+        fn insert(
             graph: UniquePtr<NativeGraph>,
             mapping: &[u32],
-            changed: &[u32],
             ef: u32,
             seed: u64,
             limit: usize,
@@ -229,18 +228,13 @@ impl fmt::Debug for Graph {
 }
 
 impl Graph {
-    /// Consumes a private graph, replaces selected old slots, appends new slots,
+    /// Consumes a private graph, appends new slots,
     /// and permutes the result into canonical order. `mapping[slot]` is the final
     /// ordinal; distances use pre-permutation slots throughout this operation.
-    /// Deletion is deliberately handled by the caller's existing full builder.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "private topology transform with borrowed metric and operation controls"
-    )]
-    pub fn evolve(
+    /// Existing nodes keep their coordinates. Deletion uses `retain`.
+    pub fn insert(
         self,
         mapping: &[u32],
-        changed: &[u32],
         ef: usize,
         seed: u64,
         limit: usize,
@@ -268,20 +262,14 @@ impl Graph {
                 return Err(Error::InvalidArgument);
             }
         }
-        if changed.iter().any(|&slot| slot as usize >= self.n)
-            || changed.windows(2).any(|pair| pair[0] >= pair[1])
-        {
-            return Err(Error::InvalidArgument);
-        }
         let context = MetricContext {
             distance,
             batch: None,
             check,
         };
-        let inner = ffi::evolve(
+        let inner = ffi::insert(
             self.inner,
             mapping,
-            changed,
             ef.min(n) as u32,
             seed,
             native_limit,

@@ -47,23 +47,6 @@ async fn memory_graph_updates_and_commit_recovery() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "release-mode 2D history phase cost probe; set KTANN_GRAPH_UPDATE_TIMING=1"]
-async fn graph_update_cost_probe() {
-    let root = std::env::temp_dir().join(format!("ktann-graph-update-cost-{}", std::process::id()));
-    std::fs::create_dir(&root).unwrap();
-    for repeat in 0..3 {
-        let backend = backend();
-        bulk_load_adapter::exercise_updates(
-            &|| backend.clone(),
-            &root.join(repeat.to_string()),
-            &|_, _| {},
-        )
-        .await;
-    }
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn graph_topology_commit_faults() {
     for fault in [
         CommitFault::Abort,

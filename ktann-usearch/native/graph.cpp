@@ -222,8 +222,8 @@ std::unique_ptr<NativeGraph> build(std::uint32_t n, std::uint32_t m, std::uint32
 }
 
 // Input ownership is consumed: failure can only discard this private graph.
-std::unique_ptr<NativeGraph> evolve(std::unique_ptr<NativeGraph> graph,
-    rust::Slice<const std::uint32_t> mapping, rust::Slice<const std::uint32_t> changed,
+std::unique_ptr<NativeGraph> insert(std::unique_ptr<NativeGraph> graph,
+    rust::Slice<const std::uint32_t> mapping,
     std::uint32_t ef, std::uint64_t seed, std::size_t limit, MetricContext const& context) {
     checkpoint(context);
     auto& state = *graph->state;
@@ -237,12 +237,6 @@ std::unique_ptr<NativeGraph> evolve(std::unique_ptr<NativeGraph> graph,
     prepare(engine.build_context(), n, engine.connectivity());
     engine.build_context().level_generator = seed;
     Metric metric{context};
-    for (auto slot : changed) {
-        checkpoint(context);
-        auto result = engine.update(engine.begin() + slot, slot, slot, metric,
-            unum::usearch::index_update_config_t{ef, 0});
-        if (!result) throw std::runtime_error("limit");
-    }
     for (std::uint32_t slot = old_size; slot != n; ++slot) {
         checkpoint(context);
         auto result = engine.add(slot, slot, metric, unum::usearch::index_update_config_t{ef, 0});

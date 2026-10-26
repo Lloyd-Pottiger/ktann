@@ -220,7 +220,6 @@ fn decode_request(data: &[u8]) -> Result<Request, String> {
 /// Lifecycle state is exclusive for mutation and shared for concurrent search.
 struct State<B: Backend> {
     index: Option<Index<MeasuredBackend<B>>>,
-    global_router: Option<Arc<ktann::benchmark::GlobalLeafRouter>>,
     bulk: Option<bulk::Build<MeasuredBackend<B>>>,
     ready: bool,
     records: u64,
@@ -237,7 +236,6 @@ impl<B: Backend> Default for State<B> {
     fn default() -> Self {
         Self {
             index: None,
-            global_router: None,
             bulk: None,
             ready: false,
             records: 0,
@@ -632,21 +630,6 @@ impl<B: Backend> Service<B> {
                                 .map_err(api_error)?,
                         );
                     }
-                    let index = state.index.as_ref().expect("bulk build published").clone();
-                    if let Some(experiment) = &self.experiment
-                        && experiment.global()
-                        && state.global_router.is_none()
-                    {
-                        state.global_router = Some(Arc::new(
-                            index
-                                .global_leaf_router(
-                                    experiment.global_working_bytes,
-                                    experiment.mode == crate::routing::Mode::GlobalHnsw,
-                                )
-                                .await
-                                .map_err(api_error)?,
-                        ));
-                    }
                     let resources =
                         ResourceSnapshot::capture().map_err(|error| ("other", error))?;
                     state.bulk.as_mut().expect("published build").report["ready_peak_rss_bytes"] =
@@ -678,15 +661,7 @@ impl<B: Backend> Service<B> {
                     });
                 }
                 let start = Instant::now();
-                let (result, _) = index
-                    .benchmark_search(
-                        request,
-                        state.global_router.clone(),
-                        self.experiment.as_ref().map_or(1, |e| e.ef_search as usize),
-                        None,
-                    )
-                    .await
-                    .map_err(api_error)?;
+                let result = index.search(request).await.map_err(api_error)?;
                 let elapsed = start.elapsed();
                 let ids: Vec<i64> = result
                     .hits

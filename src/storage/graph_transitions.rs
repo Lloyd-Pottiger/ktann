@@ -268,6 +268,8 @@ impl GraphTransitionSource {
 
     /// Prepares the exact final internal body, or validates and removes an old
     /// graph when its owner becomes empty, leaf, or absent.
+    /// At the same level, a topology step only inserts children or removes them;
+    /// surviving children keep their centroids. A level change rebuilds the graph.
     pub fn prepare(
         self,
         next_header: Option<PartitionHeader>,
@@ -801,8 +803,7 @@ mod tests {
     #[test]
     fn creates_advances_many_epochs_and_removes_empty_graph() {
         let old = populated();
-        let mut next = rows();
-        next[0] = ChildEntry::new(next[0].child(), vec![9.0, 1.0]);
+        let next = rows();
         let update = old
             .prepare(
                 Some(header(4, 9, super::super::values::PartitionState::Ready)),

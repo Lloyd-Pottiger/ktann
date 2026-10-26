@@ -201,9 +201,10 @@ pub async fn exercise<B: Backend>(backend: impl Fn() -> B, fault: &dyn Fn(&'stat
         .unwrap()
         .with_local_graph(LocalGraphConfig::new(4, 16, [19; 32]).unwrap());
     let mut index = runtime
-        .create_index("mutable-graph-history", config)
+        .create_index("mutable-graph-history", config.clone())
         .await
         .unwrap();
+    assert_eq!(index.config(), &config);
     let executor = ktann::runtime::GraphMaintenance::new(
         &runtime_config,
         tokio_util::sync::CancellationToken::new(),

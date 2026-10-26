@@ -6,14 +6,11 @@ Each nonempty internal partition has a graph over its own Child Entries. The
 partition is the unit of graph loading and maintenance; no global centroid graph
 must remain resident.
 
-This document owns the local graph model, candidate contract, source binding and
-atomic maintenance design. [Search](search.md) owns traversal and reranking;
-[Storage](storage.md) owns logical records and transactions;
-[Maintenance](maintenance.md) owns topology transitions;
-[Bulk Build](bulk-build.md) owns artifact preparation and publication;
-[Runtime and operations](runtime-operations.md) owns admission and cancellation.
-Domain terms and system invariants are defined in [CONTEXT](../../CONTEXT.md) and
-the [design overview](overview.md).
+This document owns the graph algorithm, source binding, native update policy and
+combined resource bounds. Traversal and cache behavior belong to
+[Search](search.md), atomic publication to [Storage](storage.md), topology
+execution to [Maintenance](maintenance.md), and lifecycle operations to
+[Bulk Build](bulk-build.md) and [Runtime and operations](runtime-operations.md).
 
 ## Model and configuration
 
@@ -23,30 +20,12 @@ exactly one node per Child Entry in its owning partition. Edges never cross
 partition boundaries. Leaf partitions and empty internal partitions have no
 graph records.
 
-Graph maintenance preserves the existing Record–Location–Leaf membership and
-topology invariants. Every committed topology state remains searchable, including
-legal split and merge states. A graph's validity does not require its partition
-to be Ready; it requires the graph and Child Entries to describe the same body.
-
-[`IndexConfig`](../../src/api/config.rs) stores `Option<LocalGraphConfig>`.
-`with_local_graph` enables graph construction and maintenance; `local_graph`
-returns its parameters. Graph indexes support ordinary creation, Bulk Build and
-ordinary writes after activation. Graph configuration is immutable for a Logical
-Index ID; changing construction parameters or partition capacities requires a
-new index.
-
-| Owner | Configuration |
-| --- | --- |
-| Index Configuration | `M`, `ef_construction`, graph seed, independent leaf/internal capacities, metric, dimension and rotation seed |
-| Persistent format | Canonical ordinals, level and degree bounds, graph encoding and source-binding algorithms |
-| Build options | Optional artifact refinement and bounded preparation, scratch, artifact and loading resources |
-| Runtime Configuration | Cache capacity, operation admission and routing/maintenance working-byte limits |
-| SearchOptions | Explicit `Exact` or `PartitionLocalHnsw { ef_search }`, leaf beam and Search Budgets |
-
-Exact routing is the query default. HNSW selection requires graph configuration;
-a leaf-only graph index accepts either routing choice without graph work.
-Serving `Index::refine` returns `InvalidArgument` for a graph index; optional
-artifact refinement precedes initial graph construction.
+A graph's validity depends on agreement with its Child Entries, including legal
+non-Ready topology states. [API configuration](api.md#4-immutable-and-runtime-configuration)
+owns immutable graph parameters and capacities; [search](search.md#6-search-algorithm)
+owns per-query routing selection. Graph indexes support ordinary creation, Bulk
+Build and writes. Refinement runs only during artifact preparation, before graphs
+are constructed.
 
 ### Foreground write routing
 
@@ -63,9 +42,7 @@ conservative policy above the measured crossover, not a universal optimum or
 persisted configuration. [PR #226](https://github.com/Lloyd-Pottiger/ktann/pull/226)
 records the measurement scope and limits. Approximate routing can choose a
 different leaf, so policy changes require fixed-budget quality and write-lifecycle
-measurements covering maintenance, cache and storage costs. Exact membership,
-complete child ownership validation, final fences and bounded working memory
-remain mandatory. Comparison baselines remain available in version control.
+measurements covering maintenance, cache and storage costs.
 
 ## Local graph algorithm
 
@@ -140,147 +117,60 @@ maintenance state, not a missing-graph fallback.
 
 ## Initial construction
 
-Ordinary creation starts with no internal graph bodies. Graph-aware maintenance
-constructs them when topology growth creates nonempty internal partitions.
-
-Bulk Build imposes a stricter dependency order before publication:
-
-1. Construct the forest with independent leaf and internal capacities.
-2. Apply optional artifact refinement and finalize membership and centroids.
-   Requested zero-round refinement still refreshes centroids; omitted refinement
-   preserves construction output.
-3. Accept the final Forest Artifact, derive its Child Entries and build graphs
-   over those exact child identities and centroid bytes.
-4. Seal one Serving Artifact containing the ordinary records and graph records,
-   prove the source/membership/topology joins, and load and validate it under the
-   existing Building lifecycle before activation.
-
-No membership, centroid or topology edits follow graph construction within that
-artifact. Refinement is preparation work, not a call to serving `Index::refine`.
-A resource limit fails preparation rather than silently omitting refinement or
-changing graph quality parameters.
-
-Initial graph loading may span transactions because Building isolation hides
-partial contents. Completed loading freezes the bytes for resumable exact
-backend/artifact comparison; publication is the existing small activation
-transaction. Public one-snapshot verification is not a substitute for that proof.
-
-Before artifact acceptance, interrupted graph preparation can be recomputed from
-the accepted forest. After Serving Artifact acceptance, recovery loads its bytes
-without reconstructing graphs. The loader cannot rewrite serving bytes after
-activation; subsequent changes use ordinary writes and atomic maintenance.
-Workspace fencing, identity-bound recovery and cleanup follow
-[Bulk Build](bulk-build.md).
+[Offline artifact preparation](bulk-artifacts.md#1-pipeline) finalizes membership
+and centroids before constructing graphs from the exact Child Entry projections.
+No membership or centroid edits follow graph construction within an artifact.
+[Bulk Build](bulk-build.md#5-loading-and-exact-validation) loads and validates all
+serving bytes before activation; accepted Serving Artifacts support recovery
+without reconstructing graphs.
 
 ## Query execution and cache
-
-A query uses one backend snapshot for the Active Manifest, Headers, Child Entries,
-graphs and reranking. On a cache miss it reads the complete internal body from that
-snapshot, validates the source binding and restores one immutable body containing
-both child projections and graph topology. It never loads a newer graph or uses a
-workspace artifact to satisfy an older snapshot.
-
-The [shared partition cache](search.md#graph-index-bodies) owns graph bodies under
-the existing index/tree/partition/kind key. Reuse requires the snapshot Header
-epoch. Older fills cannot replace newer bodies; an equal-epoch graph fill can
-upgrade an ordinary internal projection without a later plain fill downgrading
-it. Cache hits remain subject to working-set admission. Cache warmth does not
-change candidate semantics or guarantee detection of out-of-band corruption
-without an epoch change.
 
 For a parent with `n` children at level `L`, let
 `B = beam_width(leaf_beam, L - 1)`. Local HNSW returns `min(n, B)` distinct children,
 using `effective_ef = min(n, max(ef_search, B))`. It returns the kernel's scores
-without recomputation. It does not divide the beam among parents or silently
-increase `ef_search`.
+without recomputation. When `B >= n`, selection is exhaustive; the persisted graph
+still must be valid. Graph exploration deduplicates ordinals without consuming
+logical partition visits; selected child bodies consume visits when traversed.
 
-All admitted parents at a tree/depth feed the same deterministic global top-B
-merge. Local outputs do not create independent per-parent beams. Exact routing
-scores all children and can retain local top B before that merge without changing
-global exact selection. When `B >= n`, both selectors use the exhaustive local
-case; the persisted graph still must be valid.
-
-Graph exploration deduplicates ordinals. This does not replace the traversal's
-ownership checks for all Child Entries in an exposed body, including unselected
-children. Graph vertices examined within a body do not consume additional logical
-partition visits; selected child bodies do when visited. Tree Key fairness,
-filtering, leaf scanning, RaBitQ selection and exact reranking remain owned by
-[Search](search.md).
-
-HNSW does not guarantee exact top-B or final recall. A valid connected graph must
-nevertheless fill its requested local width unless the operation fails. Working
-memory exhaustion or cancellation is an error, not a shorter successful candidate
-list. Existing Search Budget exhaustion retains its established partial-outcome
-semantics.
+[Search traversal](search.md#61-snapshot-and-traversal-order) owns the shared
+snapshot, global candidate merge, child ownership checks and budget charging.
+[Graph index bodies](search.md#graph-index-bodies) owns graph loading, descriptor
+validation on cache hits, epoch-based reuse and working-set admission. Cache
+warmth does not guarantee detection of out-of-band corruption without an epoch
+change.
 
 ## Local graph transitions
 
-[`maintenance::graph_topology`](../../src/maintenance/graph_topology.rs) owns the
-combined topology plan, source protection, authoritative topology edits and commit.
-[`storage::graph_transitions`](../../src/storage/graph_transitions.rs) owns graph
-snapshots, private preparation and the batch publication boundary. Its
-`protect_sources` fences every prepared source before topology edits;
-`publish_batch` validates all resulting Headers, admits the combined authority
-envelope and applies all graph records. A graph replacement alone cannot establish
-valid tree membership.
+[`storage::graph_transitions`](../../src/storage/graph_transitions.rs) prepares
+replacements from complete source bodies and exact proposed Headers and Child
+Entries. Absent and empty bodies are valid creation sources. Existing graph bytes
+are validated even when the target removes the graph, so deletion cannot hide
+corruption.
 
-Preparation reads complete source bodies from one snapshot and accepts an exact
-proposed Header and canonical Child Entry body. Absent and empty bodies are valid
-creation sources. Existing graph bytes are validated even when the target removes
-the graph, so deletion cannot hide corruption.
+Topology maintenance changes child sets without changing surviving centroids:
 
-Insertions and centroid replacements evolve a private restored USearch graph,
-using proposed centroids for distance calculations. A representation-only
-permutation restores canonical child ordinals afterward. A nonempty strict subset
-with unchanged centroids physically removes private native nodes, compacts slots
-into canonical order, and refreshes surviving neighborhoods incident to removed
-nodes. It retains surviving levels, selects a highest-level entry, and audits
-base-layer directed reachability before and after neighborhood repair. Mixed
-deletion/centroid/insertion batches use the canonical builder. Empty results
-remove graph records after source validation.
-All update paths validate the source and use the same bounded, source-fenced
-atomic publication. Native nodes are compacted directly; the persistent model
-contains no tombstones or slot directory. Ordinary leaf membership changes do not
-refresh parent centroids or rebuild graphs.
+- Insertion preserves every old child and centroid, inserts new native nodes,
+  then restores canonical child ordinals.
+- Pure deletion requires a strict subset with unchanged surviving centroids. It
+  physically removes native nodes, compacts slots, refreshes surviving
+  neighborhoods incident to removed nodes, and audits directed reachability
+  before and after neighborhood repair. Surviving levels are retained and a
+  highest-level entry is selected.
+- An unchanged body preserves topology; an empty result removes graph records.
+- Creation and root level conversion build a complete graph for the resulting
+  internal body.
 
-Wide parents repeatedly remove an old child when a split finishes. Private
-physical deletion avoids rebuilding all surviving nodes and repeating their
-distance calculations. Tombstones would transfer state and work to queries and
-cleanup; batching sibling transitions would expand scheduling and transaction
-authority. Deletion still scans adjacency and serializes a complete replacement,
-so it promises neither constant cost nor unchanged approximate geometry.
-Cancellation or allocation failure discards the private graph; repeated-update
-recall and end-to-end maintenance remain validation obligations.
+Mixed child replacement and surviving centroid changes are unsupported.
+Ordinary leaf membership changes do not refresh parent centroids or rebuild
+parent graphs. Native nodes have no persistent tombstones or slot directory.
 
-| Topology change | Graph work in the same publication |
-| --- | --- |
-| Split exposure | Add the two target edges to the parent's graph; require parent headroom and defer exposure into a ReceivingSplit parent |
-| Internal drain | Move children to one receiver per batch and replace both changed graph bodies |
-| Merge receiver reselection | Plan against a fresh Ready receiver and its available headroom |
-| Emptying or populating an internal body | Remove all graph records with the last child, or build a graph for the first child |
-| Final source removal | Replace the parent's graph with the source edge removed |
-| Root growth completion | Build the two-child internal root graph while converting the root in place |
-| State-only transition | Preserve graph bytes and body epoch |
-
-Preparation finishes outside the write transaction under combined working-set
-admission. In the transaction, the topology owner protects the Active Manifest
-and exact source Headers/descriptors before changing child and partition records.
-Storage batch publication then checks every resulting Header against its prepared
-target and admits the combined topology mutations, graph descriptors, obsolete
-tail deletions and protected reads before applying graph payloads. The topology
-owner commits the complete change atomically. A stale source or target discards
-the plan and triggers rediscovery under the existing retry policy.
-
-Cancellation before commit discards the private work or transaction. An unknown
-commit outcome returns to topology rediscovery rather than replaying the prepared
-mutation. Backend snapshots retain old graph bytes for older readers.
-
-After known successful commit, the driver may install the prepared immutable
-body in the shared byte-bounded cache. The cache uses the same epoch and
-same-epoch representation rules as snapshot loads, so an older publication
-cannot replace a newer cached body. Failed, stale and unknown-outcome attempts
-do not install their private results. Cache insertion is optional; it establishes
-no persistent authority and does not bypass a later reader's snapshot Header.
+[Graph-aware maintenance](maintenance.md#7-graph-aware-topology) owns participant
+discovery, split/merge ordering, body ownership and stale-plan rediscovery.
+[Storage operations](storage.md#7-typed-atomic-operations) owns source fencing,
+target-Header validation and atomic graph/topology publication.
+[ADR 0029](../adr/0029-atomic-local-graph-updates.md) records why graph replacements
+share that transaction.
 
 ## Resource admission and failures
 
@@ -290,13 +180,6 @@ can temporarily hold two entries above its split threshold. Split exposure waits
 for ancestors to make room instead of exceeding this allowance. Together with
 the degree and level caps, these bounds limit a source/receiver graph rewrite;
 raising them requires revisiting the joint publication bound.
-
-A ReceivingSplit internal partition cannot accept new child split exposures
-until its source finishes draining. Moving entries from the source preserves
-their combined count; exposing a child's split would increase it even when the
-receiver itself has spare capacity. Deferring that exposure preserves the
-source/receiver bound and lets the ancestor finish before child maintenance
-resumes. Foreground leaf writes continue normally.
 
 Graph-aware internal drains target one receiver per transaction. Storage batch
 publication checks all participants against one 900,000-byte authority envelope
@@ -317,13 +200,9 @@ At 99,995 payload bytes per complete 100,000-byte chunk value this uses at most
 70 chunks, including both streams. Graph metadata and obsolete tail deletes
 remain inside the shared authority envelope.
 
-The [affected-data tests](../../tests/graph_transaction_budget.rs) verify that
-protected reads, physical key overhead and issued mutations are charged together.
-The [FoundationDB envelope test](../../ktann-foundationdb/tests/foundationdb_graph_atomic_size.rs)
-checks the maximum encoded shapes, physical keys and authority envelope against
-both adapter admission and native commit. The
-[backend contract](storage.md) owns that accounting. These bounds admit supported
-transitions; they do not make an arbitrary topology plan or wider keyspace fit.
+The [backend transaction contract](storage.md#2-transaction-sizing-and-retry) owns
+affected-data accounting. These bounds admit supported transitions; they do not
+make an arbitrary topology plan or wider keyspace fit.
 
 Construction, restoration and update preparation admit their full working set:
 source and proposed centroids, kernel, native graph and scratch, validation,
@@ -337,39 +216,26 @@ memory, and these charged-byte bounds are not process RSS bounds.
 preparations and holds admission until native CPU work actually exits, even if its
 async waiter is dropped. Runtime workers also bound waiting plans. Low-level
 callers must reuse an admission owner and bound their concurrent drivers.
-Graph-aware topology steps sharing a `GraphMaintenance` owner coordinate only
-when their participating graph bodies overlap. They discover participants from
-topology metadata and acquire body locks in Partition Key order before reading
-graph payloads. A waiter refreshes its snapshot after acquisition; an uncontended
-step reuses its discovery snapshot, with exact publication fences still applied.
-Split draining also owns the other sibling whose Header guides balancing.
-Ownership spans private preparation, stale-plan refresh and atomic publication.
-Independent bodies remain concurrent. The lock registry retains weak references,
-so it does not grow with the index's historical partition count.
-Cancellation retains body ownership until detached native work exits. These are
-process-local cost controls, not write authority: exact source fencing still
-protects against other runtimes and low-level writers.
+The [maintenance ownership protocol](maintenance.md#7-graph-aware-topology)
+serializes only overlapping graph bodies; independent bodies remain concurrent.
+Split draining also owns the sibling whose Header guides balancing. The lock
+registry retains weak references, so it does not grow with historical partition
+count. Cancellation retains body ownership until detached native work exits;
+storage source fencing remains the write authority across runtimes.
 
 Operation control is checked within validation, native work and serialization;
 limits never reduce `M`, construction ef or requested query width to obtain success.
 
-Malformed caller configuration is `InvalidArgument`; persisted invariant
-violations are `Corruption`; resource admission failure is `LimitExceeded`.
-Backend-native transaction errors remain distinct and follow the existing retry
-and commit-outcome contracts. Finite graph bounds constrain work but do not
-promise a latency SLA for every accepted configuration.
+[Operation control and errors](api.md#6-operation-control-and-errors) owns error
+classification. Finite graph bounds constrain work but do not promise a latency
+SLA for every accepted configuration.
 
 ## Verification and trade-offs
 
-Graph validity and exact membership are independent obligations. Preparation and
-public verification audit graph/source agreement, graph structure and reachability
-in addition to ordinary record and topology checks. Bulk publication requires the
-stronger completed-load comparison described above. The implementation's
-[persistence tests](../../src/search/local_hnsw/persistence_tests.rs),
-[snapshot/cache tests](../../src/search/cache/graph/tests.rs),
-[publication tests](../../tests/bulk_serving/graphs.rs) and
-[shared transition histories](../../tests/support/graph_history.rs) exercise these
-seams, including failures and recovery.
+[Public verification](runtime-operations.md#6-verification) audits graph/source
+agreement independently of the search cache and ordinary membership/topology
+checks. [Bulk publication](bulk-build.md#5-loading-and-exact-validation) requires
+the completed-load byte comparison rather than public verification alone.
 
 Wider internal partitions can reduce upper-tree routing work but increase graph
 loading, cache eviction and update units. A parent's centroid payload alone is
@@ -381,5 +247,3 @@ design.
 Choose operating points from end-to-end recall, latency and resource measurements,
 not local graph speed alone. The [benchmark guide](../../benchmarks/README.md)
 owns experiment commands, fixed-rerank comparison methods and measurement limits.
-The rationale for atomic updates is recorded in
-[ADR 0029](../adr/0029-atomic-local-graph-updates.md).

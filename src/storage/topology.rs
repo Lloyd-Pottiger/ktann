@@ -1596,9 +1596,20 @@ pub(crate) async fn find_incoming_edge<T: LogicalReader>(
 ) -> Result<Option<(PartitionKey, ChildEntry)>> {
     let parent_level = level.checked_add(1).ok_or_else(corrupt)?;
     let bodies = level_bodies(txn, manifest, tree_key, parent_level).await?;
+    find_incoming_edge_in(txn, manifest, tree_key, partition, &bodies).await
+}
+
+/// Resolves a unique incoming edge within an already discovered parent level.
+async fn find_incoming_edge_in<T: LogicalReader>(
+    txn: &mut T,
+    manifest: &IndexManifest,
+    tree_key: &TreeKey,
+    partition: PartitionKey,
+    bodies: &[PartitionKey],
+) -> Result<Option<(PartitionKey, ChildEntry)>> {
     // Only the parent level's matches are collected.
     let mut found: Option<(PartitionKey, ChildEntry)> = None;
-    scan_child_edges(txn, manifest, tree_key, &bodies, &mut |body, entry| {
+    scan_child_edges(txn, manifest, tree_key, bodies, &mut |body, entry| {
         if entry.child() == partition {
             if found.is_some() {
                 return Err(corrupt());
@@ -1651,6 +1662,18 @@ impl IncomingEdgeProof {
             }
         }
         Ok(Self { level, headers })
+    }
+
+    /// Resolves the edge in this snapshot without rediscovering the parent level.
+    pub(crate) async fn find<R: LogicalReader>(
+        &self,
+        reader: &mut R,
+        manifest: &IndexManifest,
+        tree: &TreeKey,
+        partition: PartitionKey,
+    ) -> Result<Option<(PartitionKey, ChildEntry)>> {
+        let bodies: Vec<_> = self.bodies().collect();
+        find_incoming_edge_in(reader, manifest, tree, partition, &bodies).await
     }
 
     /// Reuse existing ordered body guards to avoid preparing against a proof

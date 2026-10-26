@@ -54,8 +54,6 @@ pub struct ScenarioSpec {
     pub name: &'static str,
     /// Frozen-dataset experimental construction and routing controls.
     pub routing_experiment: Option<crate::routing::Experiment>,
-    /// Prepared global baseline, shared only by this worker's query operations.
-    pub global_router: Option<Arc<ktann::benchmark::GlobalLeafRouter>>,
     /// Public fixture or synthetic distribution.
     pub dataset: &'static str,
     /// Human-readable scale profile.
@@ -166,7 +164,6 @@ fn smoke_scenarios() -> Vec<ScenarioSpec> {
         write_beam_size: 8,
         refinement_rounds: None,
         routing_experiment: None,
-        global_router: None,
         query_concurrency_sweep: Vec::new(),
         leaf_beam_sweep: Vec::new(),
         min_leaf_partition_entries: 8,
@@ -262,7 +259,6 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
         write_beam_size: 8,
         refinement_rounds: None,
         routing_experiment: None,
-        global_router: None,
         query_concurrency_sweep: Vec::new(),
         leaf_beam_sweep: Vec::new(),
         min_leaf_partition_entries: 32,
@@ -373,7 +369,6 @@ fn large_scenarios() -> Result<Vec<ScenarioSpec>, String> {
             write_beam_size: defaults.write_beam_size(),
             refinement_rounds: None,
             routing_experiment: None,
-            global_router: None,
             query_concurrency_sweep: Vec::new(),
             leaf_beam_sweep: vec![1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128, 192, 256, 384],
             // Default capacities retain the multi-level million-vector workload;
@@ -1198,29 +1193,6 @@ async fn run_quality_sweep<B: Backend>(
         );
         routing_setup["fingerprint_seconds"] = serde_json::json!(started.elapsed().as_secs_f64());
     }
-    let mut spec = spec.clone();
-    if let Some(experiment) = &spec.routing_experiment
-        && experiment.global()
-    {
-        let started = Instant::now();
-        let router = index
-            .global_leaf_router(
-                experiment.global_working_bytes,
-                experiment.mode == crate::routing::Mode::GlobalHnsw,
-            )
-            .await
-            .map_err(|e| format!("global baseline refused (no data/mode fallback): {e}"))?;
-        eprintln!(
-            "global baseline: {} leaves, {} accounted resident bytes, {:.3}s setup",
-            router.leaves(),
-            router.resident_bytes(),
-            started.elapsed().as_secs_f64()
-        );
-        routing_setup["global"] = serde_json::json!({"leaves": router.leaves(), "resident_bytes": router.resident_bytes(),
-            "setup_seconds": started.elapsed().as_secs_f64(), "working_bytes": experiment.global_working_bytes});
-        spec.global_router = Some(Arc::new(router));
-    }
-    let spec = &spec;
     // Compute exact truth before releasing the base vectors, including
     // bounded subsets whose full-corpus ground truth no longer applies.
     let truth = exact_truth(dataset, spec.metric, spec.k);
@@ -1272,16 +1244,15 @@ async fn run_quality_sweep<B: Backend>(
             serde_json::json!(ResourceSnapshot::capture()?.peak_rss_bytes());
     }
     // All latency, IO, CPU and peak-RSS snapshots precede diagnostic replay.
-    if let Some(experiment) = &spec.routing_experiment {
+    if spec.routing_experiment.is_some() {
         for point in &mut points {
             let mut diagnostic_spec = spec.clone();
             diagnostic_spec.search_options = diagnostic_spec
                 .search_options
                 .with_leaf_beam_size(point.leaf_beam_size)
                 .map_err(|e| e.to_string())?;
-            point.measurements.quality_diagnostics = Some(
-                quality_diagnostics(&index, dataset, &diagnostic_spec, &truth, experiment).await?,
-            );
+            point.measurements.quality_diagnostics =
+                Some(quality_diagnostics(&index, dataset, &diagnostic_spec, &truth).await?);
         }
     }
     verify_measured_state(&index, spec).await?;
@@ -1926,8 +1897,6 @@ enum WorkItem {
         request: SearchRequest,
         /// Exact truth only for read-only workloads whose model stays valid.
         truth: Option<ExactTruth>,
-        router: Option<Arc<ktann::benchmark::GlobalLeafRouter>>,
-        ef: usize,
     },
     /// One replacement upsert derived from a stable base vector.
     Upsert {
@@ -1987,15 +1956,7 @@ fn work_items(
             // latency, but never compare against stale pre-update truth.
             let truth = truth.map(|truth| Arc::clone(&truth[query_index]));
             let request = search_request(dataset, spec, query_index)?;
-            items.push(WorkItem::Search {
-                request,
-                truth,
-                router: spec.global_router.clone(),
-                ef: spec
-                    .routing_experiment
-                    .as_ref()
-                    .map_or(1, |e| e.ef_search as usize),
-            });
+            items.push(WorkItem::Search { request, truth });
         } else {
             let ordinal = if spec.hot_updates {
                 operation % dataset.base.len().min(8)
@@ -2170,17 +2131,12 @@ async fn execute_item<B: Backend>(
 ) -> OperationObservation {
     let started = Instant::now();
     let (class, result) = match item {
-        WorkItem::Search {
-            request,
-            truth,
-            router,
-            ef,
-        } => (
+        WorkItem::Search { request, truth } => (
             OperationClass::Search,
             index
-                .benchmark_search(request, router, ef, None)
+                .search(request)
                 .await
-                .map(|(outcome, _)| {
+                .map(|outcome| {
                     truth.map(|truth| RecallInput {
                         hit_ids: outcome.hits.iter().map(|hit| hit.id().clone()).collect(),
                         truth,
@@ -2489,79 +2445,18 @@ async fn quality_diagnostics<B: Backend>(
     dataset: &BenchmarkDataset,
     spec: &ScenarioSpec,
     truth: &[ExactTruth],
-    experiment: &crate::routing::Experiment,
 ) -> Result<crate::report::QualityDiagnostics, String> {
-    let (mut reference, mut global_reference_skipped) = if let Some(router) = &spec.global_router {
-        (Some(Arc::clone(router)), None)
-    } else {
-        match index
-            .global_leaf_router(experiment.global_working_bytes, false)
-            .await
-        {
-            Ok(router) => (Some(Arc::new(router)), None),
-            Err(error) if error.kind() == ErrorKind::LimitExceeded => (
-                None,
-                Some(format!(
-                    "global reference exceeds explicit memory/node/enumeration bound: {error}"
-                )),
-            ),
-            Err(error) => return Err(error_at("global quality reference", error)),
-        }
-    };
     let mut queries = Vec::with_capacity(dataset.queries.len());
     for (query, expected) in truth.iter().enumerate() {
         let request = search_request(dataset, spec, query)?;
-        let beam = request.options().resolved_leaf_beam_size() as usize;
         let (outcome, diagnostic) = index
-            .benchmark_search(
-                request,
-                spec.global_router.clone(),
-                experiment.ef_search as usize,
-                Some(expected.iter().map(|(id, _)| id.clone()).collect()),
-            )
+            .benchmark_search(request, expected.iter().map(|(id, _)| id.clone()).collect())
             .await
             .map_err(|e| error_at("quality replay", e))?;
-        let diagnostic = diagnostic.expect("truth requests quality diagnostics");
-        let centroid_reference = match reference
-            .as_ref()
-            .map(|router| {
-                router.exact(
-                    index.logical_index_id(),
-                    &dataset.queries[query],
-                    router.leaves(),
-                )
-            })
-            .transpose()
-        {
-            Ok(leaves) => leaves,
-            Err(error) if error.kind() == ErrorKind::LimitExceeded && !experiment.global() => {
-                global_reference_skipped = Some(format!(
-                    "global reference query exceeds explicit memory bound: {error}"
-                ));
-                reference = None;
-                None
-            }
-            Err(error) => return Err(error_at("exact centroid reference", error)),
-        };
-        let global_centroid_coverage = centroid_reference.as_ref().map(|leaves| {
-            leaves
-                .iter()
-                .take(beam)
-                .filter(|(key, _)| diagnostic.leaves.contains(key))
-                .count() as f64
-                / leaves.len().min(beam) as f64
-        });
         let locations = index
             .benchmark_truth_leaves(expected.iter().map(|(id, _)| id.clone()).collect())
             .await
             .map_err(|e| error_at("truth leaf membership", e))?;
-        // Retain ranks only for truth leaves, not a second map of the whole forest.
-        let mut ranks: BTreeMap<_, _> = locations.iter().map(|&(leaf, _)| (leaf, None)).collect();
-        for (rank, &(leaf, _)) in centroid_reference.iter().flatten().enumerate() {
-            if let Some(truth_rank) = ranks.get_mut(&leaf) {
-                *truth_rank = Some(rank + 1);
-            }
-        }
         let truth_leaves = expected
             .iter()
             .zip(locations)
@@ -2569,7 +2464,6 @@ async fn quality_diagnostics<B: Backend>(
                 |((id, _), (leaf, entries))| crate::report::TruthLeafQuality {
                     leaf: leaf.get(),
                     entries,
-                    centroid_rank: ranks[&leaf],
                     scanned: diagnostic.leaves.contains(&leaf),
                     returned: outcome.hits.iter().any(|hit| hit.id() == id),
                 },
@@ -2583,14 +2477,10 @@ async fn quality_diagnostics<B: Backend>(
                 / denominator,
             rerank_candidate_coverage: diagnostic.neighbors_reranked as f64 / denominator,
             final_recall: oracle::recall_ids(outcome.hits.iter().map(|hit| hit.id()), expected),
-            global_centroid_coverage,
             truth_leaves,
         });
     }
-    Ok(crate::report::QualityDiagnostics {
-        global_reference_skipped,
-        queries,
-    })
+    Ok(crate::report::QualityDiagnostics { queries })
 }
 
 #[cfg(test)]
