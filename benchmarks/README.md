@@ -593,5 +593,5 @@ the reported size and update history and do not establish a production SLA.
 Graph-enabled indexes use exact scoring below 1024 internal nodes and HNSW at
 or above 1024, independently for each snapshot-authoritative body. There are no
 write-routing experiment switches. Query behavior and budgets are unchanged.
-See [ADR 0031](../docs/adr/0031-adaptive-local-graph-write-routing.md) for the
-policy and rationale.
+See [foreground write routing](../docs/design/partition-local-hnsw.md#foreground-write-routing)
+for the policy, rationale and measurement evidence.

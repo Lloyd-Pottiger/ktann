@@ -3,7 +3,7 @@ use crate::api::{DataType, Metric, Value};
 
 /// Holds borrowed test projections beside native topology for independent score,
 /// structure and round-trip comparisons. Production only exposes encoded builds
-/// and complete restored fixed bodies.
+/// and complete snapshot-bound bodies.
 #[derive(Debug)]
 pub(crate) struct TestGraph<'a> {
     centroids: Centroids<'a>,

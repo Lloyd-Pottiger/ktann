@@ -130,7 +130,7 @@ impl RoutingGraph {
         Ok((self.map_candidates(hits, check)?, stats))
     }
 
-    /// Experimental batch scratch, private to one routing batch.
+    /// Reusable private scratch for one foreground routing batch.
     pub(crate) fn write_workspace(&self) -> Result<Workspace> {
         Workspace::new(
             self.children().len(),

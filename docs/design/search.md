@@ -241,8 +241,11 @@ search reports exact-rerank usage, exhaustion, and stage latency.
 
 The Runtime shares byte-bounded caches of decoded internal and leaf search data.
 Foreground preparation also reuses committed internal bodies before staging
-internal changes, under the same snapshot/epoch rules (ADR 0023); general write
-routing and leaf mutation do not fill this cache.
+internal changes, under the same snapshot/epoch rules
+([ADR 0023](../adr/0023-committed-internal-routing-cache.md)). Graph-aware
+maintenance may seed complete immutable internal graph bodies after known
+successful commit. General write routing after staged changes and leaf mutation
+do not fill this cache.
 A key contains Logical Index ID, canonical Tree Key, Partition Key, and kind.
 Every entry contains Header cache epoch. Search reads the Header from its own
 snapshot and may reuse cached data only when epoch and kind match; otherwise it

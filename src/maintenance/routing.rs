@@ -158,8 +158,9 @@ impl Route {
 ///
 /// Returns `None` when the Tree Key has no tree yet; reads never create one.
 /// The vector is validated and preprocessed (metric normalization and the
-/// persisted rotation) exactly as the write path preprocesses it, so both
-/// paths descend identically on the same snapshot. A descent rerouted by a
+/// persisted rotation) exactly as the write path preprocesses it. This low-level
+/// entrypoint uses exact routing with a beam of one; Runtime writes may use a
+/// wider beam and adaptive local HNSW. A descent rerouted by a
 /// `Merging` partition fails with `ContentionExhausted` when no `Ready`
 /// same-level target exists — the single-vector shape has no retry layer,
 /// unlike the grouped write path.
@@ -175,7 +176,7 @@ pub async fn route_leaf<T: ReadOps>(
         return Ok(None);
     };
     Ok(Some(
-        descend(txn, manifest, &kernel, tree_key, tree.root(), &routing).await?,
+        descend_one(txn, manifest, &kernel, tree_key, tree.root(), &routing, 1).await?,
     ))
 }
 
@@ -198,13 +199,7 @@ pub async fn route_leaf_for_write<T: WriteTxn>(
     vector: &[f32],
     started_at_unix_millis: u64,
 ) -> Result<Route> {
-    let manifest = txn.require_manifest()?;
-    let kernel = kernel_for(manifest)?;
-    let routing = kernel.preprocess(vector)?;
-    let root = ensure_tree(txn, tree_key, started_at_unix_millis).await?;
-    let route = descend(txn, manifest, &kernel, tree_key, root, &routing).await?;
-    validate_for_write(txn, manifest, tree_key, std::slice::from_ref(&route)).await?;
-    Ok(route)
+    route_leaf_for_write_with_beam(txn, tree_key, vector, started_at_unix_millis, 1).await
 }
 
 /// Routes one caller vector with an explicit write beam.
@@ -223,35 +218,22 @@ pub async fn route_leaf_for_write_with_beam<T: WriteTxn>(
     if write_beam_size == 0 {
         return Err(Error::invalid_argument());
     }
-    if write_beam_size == 1 {
-        return route_leaf_for_write(txn, tree_key, vector, started_at_unix_millis).await;
-    }
     let manifest = txn.require_manifest()?;
     let kernel = kernel_for(manifest)?;
     let routing = kernel.preprocess(vector)?;
     let root = ensure_tree(txn, tree_key, started_at_unix_millis).await?;
-    let descent = descend_grouped_with_beam(
+    let route = descend_one(
         txn,
         manifest,
         &kernel,
         tree_key,
         root,
-        &[&routing],
+        &routing,
         write_beam_size,
-        None,
-        None,
     )
     .await?;
-    match descent {
-        GroupedDescent::Routed(routes) => {
-            validate_for_write(txn, manifest, tree_key, &routes).await?;
-            routes
-                .into_iter()
-                .next()
-                .ok_or_else(|| Error::new(ErrorKind::Backend))
-        }
-        GroupedDescent::NoReadyMergeTarget => Err(Error::new(ErrorKind::ContentionExhausted)),
-    }
+    validate_for_write(txn, manifest, tree_key, std::slice::from_ref(&route)).await?;
+    Ok(route)
 }
 
 /// The outcome of a grouped write descent.
@@ -413,100 +395,35 @@ fn check_root_state(
 /// The single-vector shape of the shared split-aware descent: each hop is
 /// resolved by [`resolve_hop`] and the nearest child is selected by a
 /// streaming argmin that never materializes a Child Entry.
-async fn descend<R: LogicalReader>(
+/// Adapts one exact low-level route to the shared grouped descent. Runtime
+/// writes supply cache and control directly to that same engine.
+async fn descend_one<R: LogicalReader>(
     reader: &mut R,
     manifest: &IndexManifest,
     kernel: &VectorKernel,
     tree_key: &TreeKey,
     root: PartitionKey,
     routing: &[f32],
+    write_beam_size: u32,
 ) -> Result<Route> {
-    let mut partition = root;
-    let mut parent = None;
-    let mut expected_level = None;
-    loop {
-        let authority =
-            topology::read_authority(reader, manifest.logical_index_id(), tree_key, partition)
-                .await?;
-        match resolve_hop(
-            reader,
-            manifest,
-            tree_key,
-            root,
-            partition,
-            expected_level,
-            authority,
-        )
-        .await?
-        {
-            Hop::Leaf(header) => {
-                return Ok(Route {
-                    leaf: partition,
-                    leaf_header: header,
-                    parent,
-                    incoming: Incoming::ParentEdge,
-                });
-            }
-            Hop::DrainRedirect {
-                source,
-                left,
-                right,
-            } => {
-                let (_, target) = nearer_redirect_target(kernel, routing, &left, &right)?;
-                return Ok(Route {
-                    leaf: target.partition,
-                    leaf_header: target.header,
-                    parent,
-                    incoming: Incoming::SourceSlot(source),
-                });
-            }
-            Hop::Children { bodies, next_level } => {
-                let mut nearest = NearestChild::default();
-                scan_bodies(
-                    reader,
-                    manifest,
-                    tree_key,
-                    &bodies,
-                    None,
-                    &mut |index, entry| nearest.consider(kernel, routing, entry, bodies[index].0),
-                )
-                .await?;
-                let (child, owner) = nearest.finish()?;
-                parent = Some(owner);
-                partition = child;
-                expected_level = Some(next_level);
-            }
-            Hop::Sideways(source) => {
-                // The carried parent is informational here: the next descent
-                // hop below the internal source replaces it.
-                partition = source;
-            }
-            Hop::MergeReroute { level, candidates } => {
-                let Some((_, candidate)) =
-                    nearest_ready_candidate(kernel, routing, partition, &candidates)?
-                else {
-                    // No Ready same-level target exists while the source is
-                    // Merging; the stall is transient and the caller may
-                    // retry (ADR 0008).
-                    return Err(Error::new(ErrorKind::ContentionExhausted));
-                };
-                if level == 1 {
-                    // The reselected Ready leaf ends the descent; its own
-                    // incoming edge at its observed parent is the reference
-                    // write validation protects.
-                    return Ok(Route {
-                        leaf: candidate.partition(),
-                        leaf_header: *candidate.header(),
-                        parent: Some(candidate.parent()),
-                        incoming: Incoming::ParentEdge,
-                    });
-                }
-                // Re-descend from the reselected same-level body at the same
-                // level; the next hop replaces the carried parent.
-                partition = candidate.partition();
-                parent = Some(candidate.parent());
-            }
-        }
+    match descend_grouped_with_beam(
+        reader,
+        manifest,
+        kernel,
+        tree_key,
+        root,
+        &[routing],
+        write_beam_size,
+        None,
+        None,
+    )
+    .await?
+    {
+        GroupedDescent::Routed(routes) => routes
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::new(ErrorKind::Corruption)),
+        GroupedDescent::NoReadyMergeTarget => Err(Error::new(ErrorKind::ContentionExhausted)),
     }
 }
 
@@ -527,9 +444,8 @@ const WRITE_HNSW_MIN_NODES: u32 = 1024;
 
 /// Descends from `root` with the whole group, reading each visited partition
 /// once, retaining several candidate paths per vector, and returning one Route
-/// per input vector in input order. The same shared state-machine body
-/// ([`resolve_hop`]) and fail-closed level and state contract as [`descend`]
-/// apply. A descent blocked by a `Merging` partition with no `Ready`
+/// per input vector in input order. [`resolve_hop`] owns the fail-closed level
+/// and state contract. A descent blocked by a `Merging` partition with no `Ready`
 /// same-level target reports [`GroupedDescent::NoReadyMergeTarget`] instead of
 /// routes.
 ///
@@ -1052,7 +968,7 @@ async fn descend_grouped_with_beam<R: LogicalReader>(
             .map(|route| {
                 route
                     .map(|(_, route)| route)
-                    .ok_or_else(|| Error::new(ErrorKind::Backend))
+                    .ok_or_else(|| Error::new(ErrorKind::Corruption))
             })
             .collect::<Result<Vec<_>>>()?,
     ))
@@ -1143,7 +1059,7 @@ impl PartialEq for WriteChildCandidate {
 impl Eq for WriteChildCandidate {}
 
 /// One resolved descent hop: the split-aware state machine's whole per-hop
-/// decision for one visited partition, shared by both descent shapes.
+/// decision for one visited partition in the shared descent.
 enum Hop {
     /// A write-accepting leaf — `Ready`, `Splitting`, or `ReceivingSplit` —
     /// ends the descent here.
@@ -1557,40 +1473,6 @@ async fn scan_bodies<R: LogicalReader>(
         }
     }
     Ok(())
-}
-
-/// One vector's nearest-child accumulator over a streamed Child Entry scan:
-/// the canonical argmin shared by the single-vector and grouped descents.
-#[derive(Clone, Copy, Default)]
-struct NearestChild {
-    best: Option<(f64, PartitionKey, PartitionKey)>,
-}
-
-impl NearestChild {
-    /// Considers one scanned Child Entry owned by `owner`.
-    fn consider(
-        &mut self,
-        kernel: &VectorKernel,
-        routing: &[f32],
-        entry: &ChildEntry,
-        owner: PartitionKey,
-    ) -> Result<()> {
-        let distance = kernel.routing_distance(routing, entry.centroid())?;
-        if self.best.is_none_or(|(best_distance, best_child, _)| {
-            beats(distance, entry.child(), (best_distance, best_child))
-        }) {
-            self.best = Some((distance, entry.child(), owner));
-        }
-        Ok(())
-    }
-
-    /// Returns the nearest child and its owning body, failing closed when the
-    /// scanned union was empty.
-    fn finish(self) -> Result<(PartitionKey, PartitionKey)> {
-        self.best
-            .map(|(_, child, owner)| (child, owner))
-            .ok_or_else(|| Error::new(ErrorKind::Corruption))
-    }
 }
 
 /// Whether `(distance, child)` displaces the current best under the canonical

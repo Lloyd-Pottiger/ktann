@@ -156,7 +156,10 @@ The Index Manifest stores the persistent format version (`FORMAT_VERSION = 3`),
 lifecycle state, immutable configuration, Logical Index ID, RaBitQ rotation
 seed, and exact Bloom parameters. The configuration encodes four big-endian
 u32 capacities in leaf minimum, leaf maximum, internal minimum, internal maximum
-order before the rotation seed. Both pairs are validated on decode. The Persistent Format covers Logical Keys,
+order, followed by the local-graph option and rotation seed. The option is 0 for
+no graph or 1 followed by `M:u32`, `ef_construction:u32` and a 32-byte graph seed.
+Both capacity pairs and graph parameters are validated on decode; other option
+tags are invalid. The Persistent Format covers Logical Keys,
 stored values, adapter physical keys, and algorithms that determine persisted
 bytes. Loading a Manifest validates its format version; an unsupported version
 returns `UnsupportedFormat`.
@@ -232,7 +235,8 @@ Bulk Build reservations add lifecycle byte `2` (Building; Active remains `0`,
 Dropping `1`) and index-owned key kind `0x05` for the Build Descriptor. Descriptor
 value tag `0x0d` contains a length-prefixed absolute
 UTF-8 source path (maximum 4096 bytes), a length-prefixed 89-byte input artifact
-manifest, and sample/memory/scratch ceilings u64, all big endian. Capacity,
+manifest, sample/memory/scratch ceilings u64, and a refinement byte: 0 means
+omitted, while 1..6 represent zero..five rounds. Integers are big endian. Capacity,
 dimension and metric remain solely in the Index Manifest. Bootstrap transactions may access the descriptor alongside the Manifest
 for atomic reservation. Serving transactions still validate an Active Manifest.
 See [ADR 0026](../adr/0026-building-reservations.md).
@@ -248,8 +252,10 @@ See the implemented load protocol in [Bulk Build](bulk-build.md).
 
 Namespace key `[0, 2] || LogicalIndexId:u64be` stores Build Workspace (tag `0x0f`).
 It survives index-prefix removal. Its canonical value contains a sized absolute
-UTF-8 root (at most 3900 bytes), nine u64 resource/admission/hard-limit values,
-a nonzero 32-byte ownership token, positive u64 epoch, two optional accepted
+UTF-8 root (at most 3900 bytes), nine u64 values in this order: sort memory,
+sort scratch, serving memory, serving scratch, graph memory, refinement memory,
+maximum artifact bytes, load mutation count and load bytes. These form the shared
+Worker Options encoding. The workspace then stores a nonzero 32-byte ownership token, positive u64 epoch, two optional accepted
 artifact descriptors (flag, epoch, sized 89-byte manifest), and a bounded failure
 code. Accepted Forest/Serving kinds and epoch bounds are validated; Serving
 requires Forest. All integer encodings are big endian.
@@ -263,8 +269,7 @@ compatibility layer; malformed, trailing and noncanonical bytes fail closed.
 See [ADR 0027](../adr/0027-bulk-workspace-and-publication.md).
 
 Namespace key `[0,3] || LogicalIndexId:u64be` stores Build Schedule, tag `0x11`:
-sized UTF-8 Index Name (1..=255 bytes), the shared Worker Options encoding (sized
-root and seven u64 resource/admission values), a 32-byte owner token, and u64 UTC
+sized UTF-8 Index Name (1..=255 bytes), the shared Worker Options encoding, a 32-byte owner token, and u64 UTC
 expiry milliseconds. Zero token means unowned; an unowned nonzero expiry is a
 retry delay. Nonzero owner requires nonzero expiry. The token and options are
 redacted in Debug. Index-bound transactions may access only their own namespace
@@ -281,10 +286,34 @@ Only this module may compose raw logical keys. It exposes typed operations for:
 - reading records, locations, headers, states, synopses, and entries;
 - atomically changing record membership and exact metadata;
 - installing and advancing split/merge states;
+- fencing source graph bodies and composing atomic graph replacements;
 - bounded deletion of one partition prefix or full index range.
 
 Algorithm modules do not hand-build keys or partially update counts/synopses.
 Natural decode or cross-value invariant failures return Corruption.
+
+Graph-aware topology prepares replacements privately, protects every source
+through `graph_transitions::protect_sources`, and edits authoritative Child
+Entries, centroids and Headers in one transaction. Source fences protect the exact
+Manifest, Headers and descriptors used for preparation. Storage's
+`graph_transitions::publish_batch` owns complete target-Header validation and
+publication of all participating graph records; the topology owner commits the
+combined transaction. Empty internal bodies have no graph records. State-only
+changes preserve the body epoch and graph bytes. The
+[local graph design](partition-local-hnsw.md#local-graph-transitions) owns graph
+preparation and topology bounds.
+
+`WriteLogicalTxn::affected_bytes` accounts for protected point reads, mutation
+keys/values, range endpoints and physical key overhead. Batch publication admits
+all topology and graph authority mutations, including obsolete-tail deletions,
+against one 900,000-byte non-payload envelope before applying graph payloads.
+Callers do not assemble or admit individual graph mutations. There is no separate
+graph staging namespace or maintenance record.
+
+Initial graph records are ordinary Serving Artifact entries. Building isolation
+allows their bounded loading across transactions; completed Build Load and exact
+publication validation cover their bytes together with Child Entries. After
+activation, graph indexes use ordinary write admission and atomic replacement.
 
 ## 8. Partition deletion
 
@@ -320,30 +349,3 @@ Codec tests use golden bytes, ordering properties, malformed/noncanonical input,
 and cross-process deterministic vectors for rotation, Bloom, Tree Key, values,
 and RaBitQ7. Model tests assert that typed atomic operations preserve exact
 membership under conflicts and injected unknown outcomes.
-
-### Graph configuration and Bulk Build metadata
-
-The immutable Index Configuration stores an optional LocalGraphConfig (`M`,
-`ef_construction`, seed). Its Manifest encoding places an option tag after the four
-capacity u32s: 0 for no graph, 1 followed by M:u32, ef_construction:u32 and seed:32
-for a local graph, then the existing rotation seed. Other tags are invalid. Build
-Descriptor encoding appends a refinement byte after construction budgets: 0 means omitted, 1..6 represent
-zero..five rounds. Worker options encode graph and refinement memory u64 limits
-after serving scratch and before artifact/load limits. These unreleased formats
-change directly; no migration or compatibility path exists.
-
-Final graph descriptor/chunks are ordinary Serving Artifact entries. Completed
-Build Load seals them with the Child Entries; exact publication validation covers
-all their bytes. Building remains isolated from ordinary reads, mutations and
-maintenance until publication; published graph indexes use ordinary write admission.
-
-Ordinary local-graph replacements use one transaction for all chunks, stale-tail
-chunk deletion, the descriptor and authoritative projections. There is no graph
-staging namespace or maintenance record. The bounded configuration and topology
-contract is owned by [the local graph design](partition-local-hnsw.md#local-graph-transitions).
-
-Graph-aware topology composes every participating replacement in that same
-transaction. `WriteLogicalTxn::affected_bytes` accounts for protected point reads,
-mutation keys/values, range endpoints and physical key overhead; topology and graph
-authority mutations share the 900,000-byte non-payload envelope before graph
-payloads are admitted. Empty internal bodies have no descriptor or chunks.

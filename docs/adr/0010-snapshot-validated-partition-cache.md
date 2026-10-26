@@ -1,9 +1,13 @@
 # Cache decoded search bodies with snapshot validation
 
-Read-only search uses a process-shared byte-bounded cache of decoded partition search bodies; write routing never uses this shared cache. Internal entries contain Child Partition Key and full-f32 centroid, while leaf entries contain Record ID, RaBitQ7 search data, and exact filter fields. Empty bodies are cached too. State, Header, Synopsis, Vector Record, and Payload are never cached with the body.
+Search and foreground preparation share a process-wide byte-bounded cache of immutable decoded partition bodies. Internal entries contain Child Partition Key and full-f32 centroid, while leaf entries contain Record ID, RaBitQ7 search data, and exact filter fields. Empty bodies are cached too. State, Header, Synopsis, Vector Record, and Payload are never cached with the body.
 
 Header carries a checked u64 cache epoch. Every transaction that changes the search body increments it exactly once, including Child or Leaf Entry addition, replacement, deletion or movement, body-kind/level changes, target creation, and root promotion. State timestamps or other non-body State changes and Synopsis-only changes do not increment it; overflow is Corruption rather than wraparound. A search first reads the snapshot-visible Header and then looks up the cache. Equal epoch is a hit; a cached older epoch is a miss and is evicted; a cached newer epoch means the query is using a historical snapshot, so it misses without evicting the useful newer entry. Header I/O does not itself consume the distinct logically visited-partition budget.
 
 On miss, the same search transaction scans and decodes the complete body and checks its exact entry count against the initial Header before publishing the entry. The backend's consistent snapshot guarantees that the Header and body belong to the same committed state. It never fills from a separate latest snapshot. Concurrent misses are allowed to duplicate work and race to install equal or newer epochs; KTANN deliberately has no per-key singleflight waiter/cancellation state. Eviction uses one global byte capacity, no pinned roots, and benchmark-selected internal policy. The policy may change without affecting persistent format or public behavior; cache warmth never changes logical search-budget accounting.
 
-The write-routing restriction above is superseded by [ADR 0023](0023-committed-internal-routing-cache.md), which permits committed internal-body reuse during foreground preparation. The snapshot, epoch, byte-budget and fail-closed rules remain in force.
+Foreground cache use follows [ADR 0023](0023-committed-internal-routing-cache.md).
+Graph-aware maintenance can also publish a complete prepared body after known
+successful commit, under its committed Header epoch. Uncommitted or
+unknown-outcome data never enters the cache. Every consumer still validates the
+body against its own snapshot Header; cache publication is not write authority.
