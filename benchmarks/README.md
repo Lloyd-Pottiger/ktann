@@ -277,31 +277,34 @@ insert acknowledges capture, not per-batch durability or publication. No
 the index rather than when a batch is received; unknown inserts must not be
 replayed automatically.
 
-Optimize checks the expected record count, seals the Input Snapshot, then runs
-preparation, loading, exact validation and atomic publication. The default path
-then calls `Index::refine`; routing experiments instead refine artifacts before
-publication. Both check topology readiness before admitting search. A successful
-repeated Optimize returns the existing result without rebuilding or refining.
-If refinement fails, search stays closed and a retry refines the already published
-index. The bridge holds exclusive access throughout refinement and disables its
-Runtime maintenance workers. Shutdown cancels at operation checkpoints and waits
-for admitted work before dropping the index; socket timeouts do not release
-exclusive access from an unfinished operation.
+Optimize checks the expected record count and seals the Input Snapshot. All
+routing modes refine the forest before serving encoding, loading, exact validation
+and atomic publication. Global modes then prepare their in-process router. Core artifact validation
+owns topology correctness; the bridge admits search after query preparation. Repeated successful Optimize
+returns the existing result without rebuilding or refining.
 
-Reset requests must supply `refinement_rounds` (0..5) and
-`refinement_input_bytes`. On the default path, zero rounds still loads the index
-and refreshes centroids; it
-does not disable refinement. The input limit covers loaded vectors, IDs,
-centroids and topology, not total RSS: planning and migration proposals require
-additional memory. Exceeding the input limit fails Optimize rather than silently
-skipping refinement. Routing experiments use the experiment's
-`build_memory_bytes` for artifact refinement, whose accounting includes planning
-workspace; this is a different limit from the live index's input cap.
+The bridge retains sealed input and the same core Bulk Build job for retries.
+Cancellation and transient build failures resume that job; terminal preparation
+errors such as insufficient memory remain failed and require a fresh case.
+Publication can precede a cleanup or router error, so an unsuccessful Optimize
+never implies that no index exists. Search stays closed until all preparation
+succeeds. Shutdown cancels at operation checkpoints and waits for admitted work
+before dropping the index; socket timeouts do not release exclusive access.
+
+Reset requires `refinement_rounds` (0..5) and `refinement_memory_bytes` (positive).
+The Python client defaults to two rounds and 32 GiB. Zero rounds refreshes
+centroids without moving records. The memory ceiling accounts for retained
+inputs, topology and refinement planning; it is not a process RSS limit, and
+construction/sort/serving/graph budgets remain separate. Reset owns the refinement
+budget in every mode, including routing experiments: their `build_memory_bytes`
+continues to configure the other build stages. Reports record the effective
+`bulk_build.refinement_rounds` and `bulk_build.refinement_memory_bytes`.
 
 Construction uses IndexConfig defaults (64/512 partition entries), a sample cap
 of 1024, 256 MiB tree memory and 64 GiB tree scratch. Only an explicit leaf-beam
-option changes the search defaults. Header readiness reads at most 262,144
-allocated slots; it is not a replacement for full integrity verification.
+option changes the search defaults. Optimize returns readiness and record count;
+per-level Header statistics and an independent Header-slot limit are not part of
+the bridge contract.
 
 ### Running
 
@@ -323,24 +326,31 @@ removing its stale socket. Reports remain caller-owned; temporary source snapsho
 are removed on normal exit. A crash may leave temporary files behind; core-owned
 preparation files are reclaimed after publication.
 
-The local VectorDBBench client currently omits the required refinement fields
-from Reset and has no refinement CLI options. It must be updated to the protocol
-below before it can drive this bridge.
+From the VectorDBBench checkout with its dependencies installed:
+
+```sh
+vectordbbench ktann --socket-path /tmp/ktann-bench.sock \
+  --dataset-identity cohere-1m --case-type Performance768D1M \
+  --load-concurrency 1 --insert-batch-size 50 --k 100 \
+  --refinement-rounds 2 --refinement-memory-bytes 34359738368
+```
 
 The private protocol is v1, with a big-endian u32 frame length, an 8 MiB frame
 limit and at most 128 connections. Control/search and responses are JSON.
 Binary inserts carry `KTI` plus byte version 1, big-endian u32 count/dimension,
 little-endian i64 IDs and row-major f32 values, with at most 50 records per batch.
-The reset request carries `refinement_rounds` and `refinement_input_bytes`.
+The reset request carries `refinement_rounds` and `refinement_memory_bytes`.
 JSON inserts are rejected; update the client and bridge together.
 
 ### Measurements and tests
 
 Canonical insert time measures input capture. Optimize time includes Bulk Build,
-refinement and readiness checks; canonical total load time includes both phases.
-Native reports identify `build_mode: bulk`, the refinement configuration,
-`phases.input_staging_seconds`, `phases.refinement_seconds`, total
-`phases.optimize_seconds`, and detailed Bulk Build stages. Optimize and refinement timers
+refinement and router preparation; canonical total load time includes both phases.
+Native reports identify `build_mode: bulk`, effective refinement controls,
+`phases.input_staging_seconds`, total `phases.optimize_seconds`, and detailed Bulk
+Build stages. Artifact refinement is included in `bulk_build.forest_seconds`;
+there is no separately measured refinement duration. Core stage timings describe
+the successful completion call (reused stages have zero duration); Optimize timers
 accumulate failed attempts as well as successful ones. Successful repeated
 Optimize calls leave those measurements unchanged. Compare identical datasets,
 query sets, construction/refinement settings and backend budgets; do not compare
@@ -398,7 +408,7 @@ Bulk Build bridge reports include `serving_detail` wall times for source
 sorting, topology sorting, exact joins/encoding, output merging, Synopsis
 reduction, and final emission/sealing, plus total and peak serving scratch bytes.
 `ready_peak_rss_bytes` captures the bridge process's resident-memory high-water
-mark immediately after successful publication and cleanup, before queries.
+mark after successful publication, cleanup and router preparation, before queries.
 The whole-run peak remains separate and may include later query cache growth.
 A resumed worker reports no detail for an already accepted serving artifact.
 
