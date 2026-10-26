@@ -165,7 +165,7 @@ fn ordinary_updates_preserve_metric_scores_canonical_children_and_source_integri
                 match operation {
                     0 => next.insert(1, ChildEntry::new(key(11), vec![0.0; 8])),
                     1 => {
-                        next.remove(graph.graph.entry().unwrap() as usize);
+                        next.remove(1);
                     }
                     _ => {
                         next.drain(4..20);

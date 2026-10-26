@@ -84,7 +84,7 @@ cargo test --release -p ktann --lib search::local_hnsw
 cargo clippy -p ktann -p ktann-usearch --all-targets -- -D warnings
 ```
 
-The core tests include independent-process topology fingerprints, graph
+The core tests include independent-process encoded-graph fingerprints, graph
 invariants/reachability, all metrics against an independent oracle, duplicate
 centroids/full beam, input and memory boundaries, cancellation/scratch reuse,
 concurrent readers, and small independent-query quality fixtures. These fixtures

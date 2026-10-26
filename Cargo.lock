@@ -1005,6 +1005,7 @@ dependencies = [
  "foundationdb",
  "futures-util",
  "ktann",
+ "ktann-usearch",
  "metrics",
  "metrics-util",
  "tokio",

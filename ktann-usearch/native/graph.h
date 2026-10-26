@@ -26,9 +26,6 @@ class NativeGraph {
     Stats search(std::uint32_t ef, MetricContext const&, NativeWorkspace&, rust::Slice<Hit>) const;
     std::size_t resident_bytes() const;
     std::size_t peak_bytes() const;
-    std::uint32_t entry() const;
-    std::uint32_t level(std::uint32_t node) const;
-    std::size_t neighbors(std::uint32_t node, std::uint32_t level, rust::Slice<std::uint32_t>) const;
     std::size_t encoded_size() const;
     void save(rust::Slice<std::uint8_t> output, MetricContext const&) const;
     std::unique_ptr<GraphState> state;

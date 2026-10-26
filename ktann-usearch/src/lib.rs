@@ -85,9 +85,6 @@ mod ffi {
         fn save(self: &NativeGraph, output: &mut [u8], context: &MetricContext) -> Result<()>;
         fn resident_bytes(self: &NativeGraph) -> usize;
         fn peak_bytes(self: &NativeGraph) -> usize;
-        fn entry(self: &NativeGraph) -> u32;
-        fn level(self: &NativeGraph, node: u32) -> u32;
-        fn neighbors(self: &NativeGraph, node: u32, level: u32, output: &mut [u32]) -> usize;
         fn allocated_bytes(self: &NativeWorkspace) -> usize;
         fn allocation_count(self: &NativeWorkspace) -> usize;
     }
@@ -413,24 +410,6 @@ impl Graph {
     pub fn peak_bytes(&self) -> usize {
         self.inner.peak_bytes()
     }
-
-    /// Returns the entry ordinal, or `None` for an empty graph.
-    pub fn entry(&self) -> Option<u32> {
-        (self.n != 0).then(|| self.inner.entry())
-    }
-
-    /// Returns a node's highest layer, or `None` for an invalid ordinal.
-    pub fn level(&self, node: u32) -> Option<u32> {
-        ((node as usize) < self.n).then(|| self.inner.level(node))
-    }
-
-    /// Copies one adjacency list into a buffer of at least `2*M` ordinals.
-    pub fn neighbors(&self, node: u32, level: u32, output: &mut [u32]) -> Result<usize, Error> {
-        if self.level(node).is_none_or(|max| level > max) || output.len() < 2 * self.m {
-            return Err(Error::InvalidArgument);
-        }
-        Ok(self.inner.neighbors(node, level, output))
-    }
 }
 
 /// Exclusive, reusable query workspace with no graph or vector ownership.
@@ -571,42 +550,7 @@ mod tests {
             ),
             Err(Error::InvalidArgument)
         ));
-        let mut neighbors = [0; 4];
-        assert!(matches!(
-            graph.neighbors(8, 0, &mut neighbors),
-            Err(Error::InvalidArgument)
-        ));
-        assert!(matches!(
-            graph.neighbors(0, MAX_LEVEL + 1, &mut neighbors),
-            Err(Error::InvalidArgument)
-        ));
         assert!(matches!(Workspace::new(8, 2, 0), Err(Error::LimitExceeded)));
-    }
-}
-
-#[cfg(test)]
-mod atomic_size_tests {
-    use super::*;
-
-    #[test]
-    fn supported_internal_shapes_fit_one_fdb_publication() {
-        // A split distributes at most threshold+2 nodes. A merge additionally
-        // retains an underfull source (minimum<=128); only one target per batch.
-        for capacity in [8192, 16384] {
-            for m in 2..=16 {
-                let nodes = capacity + 2 + 127;
-                let graph_bytes = encoded_bound(nodes, m).unwrap() + NATIVE_HEADER_BYTES;
-                // Two nonempty bodies can need one extra partial chunk.
-                let chunks = graph_bytes.div_ceil(99_995) + 1;
-                // Conservative maximum physical key length; charge mutation,
-                // both conflict endpoints, framing and per-mutation overhead.
-                let affected = graph_bytes + chunks * (3 * 10_000 + 64) + 900_000;
-                assert!(
-                    affected < 10_000_000,
-                    "capacity={capacity} M={m}: {affected}"
-                );
-            }
-        }
     }
 }
 

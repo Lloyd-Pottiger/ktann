@@ -88,7 +88,7 @@ pub struct SearchDiagnostics {
     pub neighbors_after_local_selection: usize,
     /// True neighbors admitted to exact reranking.
     pub neighbors_reranked: usize,
-    /// Actual scanned leaves; used for global centroid top-beam coverage.
+    /// Actual scanned leaf identities for truth-neighbor coverage diagnostics.
     pub leaves: Vec<crate::api::PartitionKey>,
 }
 

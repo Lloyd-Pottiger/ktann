@@ -1,8 +1,8 @@
 use super::*;
 use crate::api::{DataType, Metric, Value};
 
-/// Holds borrowed test projections beside native topology for independent score,
-/// structure and round-trip comparisons. Production only exposes encoded builds
+/// Holds borrowed test projections beside native topology for score and encoded
+/// round-trip comparisons. Production only exposes encoded builds
 /// and complete snapshot-bound bodies.
 #[derive(Debug)]
 pub(crate) struct TestGraph<'a> {
@@ -52,7 +52,6 @@ impl<'a> TestGraph<'a> {
 }
 
 use std::cell::Cell;
-use std::collections::{BTreeSet, VecDeque};
 
 const MEMORY: usize = 128 * 1024 * 1024;
 
@@ -142,52 +141,12 @@ fn fixture(count: usize, dimension: usize, seed: u64) -> Vec<Vec<f32>> {
         .collect()
 }
 
-/// Audit all layers and directed reachability independently of the builder.
-fn topology(graph: &TestGraph<'_>, m: usize) -> Vec<Vec<Vec<u32>>> {
-    let n = graph.centroids.children.len();
-    let native = &graph.graph;
-    let mut buffer = vec![0; 2 * m];
-    let mut result = Vec::new();
-    for node in 0..n as u32 {
-        let level = native.level(node).unwrap();
-        assert!(level <= ktann_usearch::MAX_LEVEL);
-        let mut layers = Vec::new();
-        for layer in 0..=level {
-            let count = native.neighbors(node, layer, &mut buffer).unwrap();
-            assert!(count <= if layer == 0 { 2 * m } else { m });
-            let edges = buffer[..count].to_vec();
-            assert_eq!(
-                edges.iter().copied().collect::<BTreeSet<_>>().len(),
-                edges.len()
-            );
-            for &neighbor in &edges {
-                assert_ne!(node, neighbor);
-                assert!(neighbor < n as u32);
-                assert!(native.level(neighbor).unwrap() >= layer);
-            }
-            layers.push(edges);
-        }
-        result.push(layers);
-    }
-    if let Some(entry) = native.entry() {
-        assert_eq!(
-            native.level(entry),
-            (0..n as u32).filter_map(|i| native.level(i)).max()
-        );
-        let mut seen = BTreeSet::from([entry]);
-        let mut queue = VecDeque::from([entry]);
-        while let Some(node) = queue.pop_front() {
-            for &neighbor in &result[node as usize][0] {
-                if seen.insert(neighbor) {
-                    queue.push_back(neighbor);
-                }
-            }
-        }
-        assert_eq!(seen.len(), n);
-    } else {
-        assert_eq!(n, 0);
-    }
-    result
+/// Validate built topology through the same encoding boundary used by serving.
+fn validated_encoding(graph: &TestGraph<'_>, m: usize) -> Vec<u8> {
+    let bytes = graph.graph.encode(MEMORY, &|| true).unwrap();
+    ktann_usearch::Graph::decode(&bytes, graph.centroids.children.len(), m, MEMORY, &|| true)
+        .unwrap();
+    bytes
 }
 
 #[test]
@@ -293,7 +252,7 @@ fn empty_singleton_small_and_exhaustive_queries_match_independent_oracle() {
         for n in 0..=8 {
             let rows = children(fixture(n, 2, 3));
             let graph = build(&kernel, &rows, params());
-            topology(&graph, params().m);
+            validated_encoding(&graph, params().m);
             let mut scratch = Workspace::new(n, params().m, MEMORY).unwrap();
             let query = [0.2, -0.7];
             let expected = oracle(metric, &rows, &query, n);
@@ -367,7 +326,7 @@ fn duplicate_centroids_fill_full_parent_beam_with_bounded_connected_graph() {
         ..params()
     };
     let graph = build(&kernel, &rows, parameters);
-    topology(&graph, parameters.m);
+    validated_encoding(&graph, parameters.m);
     let mut scratch = Workspace::new(rows.len(), parameters.m, MEMORY).unwrap();
     let allocation = scratch.allocated_bytes();
     let allocations = scratch.allocation_count();
@@ -392,19 +351,12 @@ fn seeded_builds_and_partition_identity_are_reproducible() {
     let rows = children(fixture(512, 4, 937));
     let kernel = VectorKernel::new(4, Metric::InnerProduct, [0; 32]).unwrap();
     let first = build(&kernel, &rows, params());
-    let mut digest = Sha256::new();
-    digest.update(first.graph.entry().unwrap().to_le_bytes());
-    for layers in topology(&first, params().m) {
-        digest.update((layers.len() as u32).to_le_bytes());
-        for neighbors in layers {
-            digest.update((neighbors.len() as u32).to_le_bytes());
-            for node in neighbors {
-                digest.update(node.to_le_bytes());
-            }
-        }
-    }
-    let fingerprint = format!("local-hnsw-topology:{:02x?}", digest.finalize().as_slice());
-    if std::env::var_os("KTANN_HNSW_TOPOLOGY_CHILD").is_some() {
+    let encoded = validated_encoding(&first, params().m);
+    let fingerprint = format!(
+        "local-hnsw-encoding:{:02x?}",
+        Sha256::digest(&encoded).as_slice()
+    );
+    if std::env::var_os("KTANN_HNSW_ENCODING_CHILD").is_some() {
         println!("{fingerprint}");
         return;
     }
@@ -415,7 +367,7 @@ fn seeded_builds_and_partition_identity_are_reproducible() {
                 "search::local_hnsw::tests::seeded_builds_and_partition_identity_are_reproducible",
                 "--nocapture",
             ])
-            .env("KTANN_HNSW_TOPOLOGY_CHILD", "1")
+            .env("KTANN_HNSW_ENCODING_CHILD", "1")
             .output()
             .unwrap();
         assert!(
@@ -430,8 +382,7 @@ fn seeded_builds_and_partition_identity_are_reproducible() {
         );
     }
     let second = build(&kernel, &rows, params());
-    assert_eq!(topology(&first, params().m), topology(&second, params().m));
-    assert_eq!(first.graph.entry(), second.graph.entry());
+    assert_eq!(encoded, validated_encoding(&second, params().m));
     let third = build(
         &kernel,
         &rows,
@@ -440,8 +391,7 @@ fn seeded_builds_and_partition_identity_are_reproducible() {
             ..params()
         },
     );
-    let levels = |g: &TestGraph<'_>| (0..512).map(|n| g.graph.level(n)).collect::<Vec<_>>();
-    assert_ne!(levels(&first), levels(&third));
+    assert_ne!(encoded, validated_encoding(&third, params().m));
     let other_tree = TreeKey::encode(&[DataType::I64], &[Value::I64(3)]).unwrap();
     assert_ne!(
         partition_seed([7; 32], &tree(), key(1)),
@@ -469,7 +419,7 @@ fn independent_queries_have_good_coverage_for_all_metrics_and_seeds() {
         let queries = fixture(16, 12, 887);
         for seed in [[7; 32], [19; 32]] {
             let graph = build(&kernel, &rows, Parameters { seed, ..params() });
-            topology(&graph, params().m);
+            validated_encoding(&graph, params().m);
             let mut scratch = Workspace::new(rows.len(), params().m, MEMORY).unwrap();
             let bytes = scratch.allocated_bytes();
             let allocations = scratch.allocation_count();

@@ -3,6 +3,7 @@
 use bytes::Bytes;
 use foundationdb::Database;
 use ktann::storage::backend::{Backend, Mutation, ReadOps, WriteTxn};
+use ktann::storage::values::{GRAPH_CHUNK_BYTES, MAX_GRAPH_VALUE_BYTES};
 use ktann_foundationdb::{BackendNamespace, FoundationDbBackend};
 mod support;
 
@@ -34,13 +35,19 @@ async fn largest_atomic_graph_shapes_fit_adapter_and_native_limits() {
             let mut mutations = Vec::new();
             let mut ordinal = 0;
             for nodes in [127, capacity + 2] {
-                // M=16, all nodes at the supported maximum level four.
-                let mut remaining = 40 + nodes * 416;
+                // Exercise the largest native encoding across every supported M.
+                let mut remaining = (2..=16)
+                    .map(|m| ktann_usearch::encoded_bound(nodes, m).unwrap())
+                    .max()
+                    .unwrap();
                 while remaining > 0 {
-                    let payload = remaining.min(99_995);
+                    let payload = remaining.min(GRAPH_CHUNK_BYTES);
                     mutations.push(Mutation::Put {
                         key: key(ordinal),
-                        value: Bytes::from(vec![0; payload + 5]),
+                        value: Bytes::from(vec![
+                            0;
+                            payload + MAX_GRAPH_VALUE_BYTES - GRAPH_CHUNK_BYTES
+                        ]),
                     });
                     ordinal += 1;
                     remaining -= payload;

@@ -27,7 +27,7 @@ path = "src/lib.rs"
 default = []
 # Low-level fault injection controls are excluded from production builds.
 test-support = []
-# Experimental routing comparisons; never required by production serving.
+# Untimed diagnostics over production search for benchmark quality analysis.
 benchmark = []
 
 [dependencies]
