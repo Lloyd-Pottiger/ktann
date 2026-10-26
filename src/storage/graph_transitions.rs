@@ -339,35 +339,10 @@ impl GraphTransitionSource {
                 header: self.header.ok_or_else(corrupt)?,
                 parameters,
             };
-            if target_count == 0 || unchanged {
-                drop(restore_graph(
-                    old,
-                    source,
-                    descriptor,
-                    self.chunks,
-                    available.checked_sub(target_bytes).ok_or_else(limit)?,
-                    check,
-                )?);
-                None
-            } else if next_header.is_some_and(|header| header.level() != source.header.level()) {
-                drop(restore_graph(
-                    old,
-                    source,
-                    descriptor,
-                    self.chunks,
-                    available.checked_sub(target_bytes).ok_or_else(limit)?,
-                    check,
-                )?);
-                Some(build_records(
-                    target,
-                    GraphSource {
-                        header: next_header.ok_or_else(corrupt)?,
-                        ..source
-                    },
-                    available.checked_sub(old_bytes).ok_or_else(limit)?,
-                    check,
-                )?)
-            } else {
+            if target_count > 0
+                && !unchanged
+                && next_header.is_some_and(|header| header.level() == source.header.level())
+            {
                 Some(update_records(
                     old,
                     target,
@@ -378,6 +353,28 @@ impl GraphTransitionSource {
                     available,
                     check,
                 )?)
+            } else {
+                drop(restore_graph(
+                    old,
+                    source,
+                    descriptor,
+                    self.chunks,
+                    available.checked_sub(target_bytes).ok_or_else(limit)?,
+                    check,
+                )?);
+                if target_count > 0 && !unchanged {
+                    Some(build_records(
+                        target,
+                        GraphSource {
+                            header: next_header.ok_or_else(corrupt)?,
+                            ..source
+                        },
+                        available.checked_sub(old_bytes).ok_or_else(limit)?,
+                        check,
+                    )?)
+                } else {
+                    None
+                }
             }
         } else if target_count > 0 {
             Some(build_records(
@@ -395,8 +392,8 @@ impl GraphTransitionSource {
         } else {
             None
         };
-        let (records, ready) = if let Some(prepared) = prepared {
-            let ready = crate::search::local_hnsw::body::InternalGraphBody::prepared(
+        let publication = if let Some(prepared) = prepared {
+            let body = crate::search::local_hnsw::body::InternalGraphBody::prepared(
                 next,
                 kernel,
                 prepared.graph,
@@ -404,42 +401,116 @@ impl GraphTransitionSource {
                 prepared.records.descriptor.clone(),
                 target_bytes,
             );
-            (Some(prepared.records), Some(ready))
+            GraphPublication::Replace {
+                header: next_header.ok_or_else(corrupt)?,
+                records: prepared.records,
+                body,
+            }
+        } else if unchanged {
+            GraphPublication::Preserve {
+                header: next_header.ok_or_else(corrupt)?,
+            }
         } else {
-            (None, None)
+            GraphPublication::Remove {
+                header: next_header,
+            }
         };
         Ok(PreparedGraphTransition {
-            ready,
             manifest: self.manifest,
             tree: self.tree,
             partition: self.partition,
             source_header: self.header,
             source_descriptor: self.descriptor,
-            header: next_header,
-            records,
-            unchanged,
+            publication,
         })
     }
 }
 
-/// Private replacement graph; no persisted staging or recovery cursor exists.
+/// Complete graph action after source validation. A replacement owns both its
+/// persistent records and the exact body that can enter the cache after commit.
+#[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "bounded per-body publication retains its replacement without another allocation"
+)]
+enum GraphPublication {
+    Preserve {
+        header: PartitionHeader,
+    },
+    Remove {
+        header: Option<PartitionHeader>,
+    },
+    Replace {
+        header: PartitionHeader,
+        records: GraphRecords,
+        body: crate::search::local_hnsw::body::InternalGraphBody,
+    },
+}
+
+impl GraphPublication {
+    fn header(&self) -> Option<PartitionHeader> {
+        match self {
+            Self::Remove { header } => *header,
+            Self::Preserve { header } | Self::Replace { header, .. } => Some(*header),
+        }
+    }
+}
+
+/// Private graph publication; no persisted staging or recovery cursor exists.
 #[derive(Debug)]
 pub struct PreparedGraphTransition {
-    ready: Option<crate::search::local_hnsw::body::InternalGraphBody>,
     manifest: IndexManifest,
     tree: TreeKey,
     partition: PartitionKey,
     source_header: Option<PartitionHeader>,
     source_descriptor: Option<GraphDescriptor>,
-    header: Option<PartitionHeader>,
-    records: Option<GraphRecords>,
-    unchanged: bool,
+    publication: GraphPublication,
+}
+
+/// Protects every prepared source before the topology owner edits its bodies.
+/// A changed source requires rediscovery instead of publishing the stale batch.
+pub async fn protect_sources<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    graphs: &[PreparedGraphTransition],
+) -> Result<bool> {
+    for graph in graphs {
+        if !graph.protect(txn).await? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Publishes graphs after source protection and the topology owner's edits.
+/// Validates all final headers and admits the combined authority envelope before
+/// appending payloads; the caller commits topology and graphs atomically.
+pub async fn publish_batch<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    graphs: &[PreparedGraphTransition],
+) -> Result<()> {
+    let mut builder = txn.mutations();
+    for graph in graphs {
+        graph.validate_target(txn).await?;
+        graph.append_authority(&mut builder)?;
+    }
+    if txn
+        .affected_bytes()
+        .checked_add(builder.affected_bytes()?)
+        .ok_or_else(limit)?
+        > 900_000
+    {
+        return Err(limit());
+    }
+    for graph in graphs {
+        graph.append_payload(&mut builder)?;
+    }
+    txn.apply(builder).await
 }
 
 impl PreparedGraphTransition {
     /// Called only after the enclosing topology transaction is known committed.
     pub(crate) fn cache_committed(self, cache: &crate::search::cache::PartitionCache) {
-        if let (Some(body), Some(header)) = (self.ready, self.header) {
+        if let GraphPublication::Replace { body, header, .. } = self.publication {
             crate::search::cache::graph::install_prepared(
                 cache,
                 &self.manifest,
@@ -451,22 +522,21 @@ impl PreparedGraphTransition {
         }
     }
 
-    /// Retained encoded output charged while preparing another partition.
+    /// Retained encoded output and cache body charged while preparing another partition.
     pub fn retained_bytes(&self) -> Result<usize> {
-        self.records
-            .as_ref()
-            .map_or(0, |r| r.descriptor.bytes as usize)
+        let replacement_bytes = match &self.publication {
+            GraphPublication::Replace { records, body, .. } => (records.descriptor.bytes as usize)
+                .checked_add(body.retained_bytes())
+                .ok_or_else(limit)?,
+            GraphPublication::Preserve { .. } | GraphPublication::Remove { .. } => 0,
+        };
+        replacement_bytes
             .checked_add(self.tree.as_bytes().len() + METADATA_BYTES)
-            .and_then(|bytes| {
-                bytes.checked_add(self.ready.as_ref().map_or(0, |body| body.retained_bytes()))
-            })
             .ok_or_else(limit)
     }
 
-    async fn authority<T: WriteTxn>(
-        &self,
-        txn: &mut WriteLogicalTxn<'_, T>,
-    ) -> Result<(Option<PartitionHeader>, Option<GraphDescriptor>)> {
+    /// Establishes conflicts on the exact old body before topology edits.
+    async fn protect<T: WriteTxn>(&self, txn: &mut WriteLogicalTxn<'_, T>) -> Result<bool> {
         let index = self.manifest.logical_index_id();
         let values = txn
             .batch_get_for_update(vec![
@@ -497,40 +567,46 @@ impl PreparedGraphTransition {
             None => None,
             _ => return Err(corrupt()),
         };
-        Ok((header, descriptor))
-    }
-
-    /// Establishes conflicts on the exact old body before topology edits.
-    pub async fn protect<T: WriteTxn>(&self, txn: &mut WriteLogicalTxn<'_, T>) -> Result<bool> {
-        let (header, descriptor) = self.authority(txn).await?;
         Ok(header == self.source_header && descriptor == self.source_descriptor)
     }
 
     /// Verifies the topology owner's final header before shared graph writes.
-    pub async fn validate_target<T: WriteTxn>(
-        &self,
-        txn: &mut WriteLogicalTxn<'_, T>,
-    ) -> Result<()> {
-        let (header, descriptor) = self.authority(txn).await?;
-        if header != self.header || descriptor != self.source_descriptor {
+    /// Call after `protect` and topology edits, before appending any graph records.
+    /// The protected Manifest and descriptor remain unchanged by topology edits.
+    async fn validate_target<T: WriteTxn>(&self, txn: &mut WriteLogicalTxn<'_, T>) -> Result<()> {
+        let header = match txn
+            .get_for_update(LogicalKey::Header {
+                index: self.manifest.logical_index_id(),
+                tree_key: self.tree.clone(),
+                partition: self.partition,
+            })
+            .await?
+        {
+            Some(PersistentValue::PartitionHeader(header)) => Some(header),
+            None => None,
+            _ => return Err(corrupt()),
+        };
+        if header != self.publication.header() {
             return Err(stale());
         }
         Ok(())
     }
 
     /// Adds descriptor and obsolete-tail edits to a shared authority envelope.
-    /// The topology owner checks the combined 900 KB envelope before payloads.
-    pub fn append_authority(&self, builder: &mut MutationBuilder<'_>) -> Result<()> {
-        if self.unchanged {
-            return Ok(());
-        }
+    /// Batch publication checks the combined authority envelope before payloads.
+    fn append_authority(&self, builder: &mut MutationBuilder<'_>) -> Result<()> {
+        let records = match &self.publication {
+            GraphPublication::Preserve { .. } => return Ok(()),
+            GraphPublication::Remove { .. } => None,
+            GraphPublication::Replace { records, .. } => Some(records),
+        };
         let index = self.manifest.logical_index_id();
         let key = LogicalKey::GraphDescriptor {
             index,
             tree_key: self.tree.clone(),
             partition: self.partition,
         };
-        if let Some(records) = &self.records {
+        if let Some(records) = records {
             builder.put(
                 key,
                 PersistentValue::GraphDescriptor(records.descriptor.clone()),
@@ -538,7 +614,7 @@ impl PreparedGraphTransition {
         } else if self.source_descriptor.is_some() {
             builder.delete(key)?;
         }
-        for chunk in self.records.as_ref().map_or(0, |r| r.descriptor.chunks())
+        for chunk in records.map_or(0, |r| r.descriptor.chunks())
             ..self
                 .source_descriptor
                 .as_ref()
@@ -555,9 +631,9 @@ impl PreparedGraphTransition {
     }
 
     /// Adds prepared chunk payloads after the shared envelope has been checked.
-    pub fn append_payload(&self, builder: &mut MutationBuilder<'_>) -> Result<()> {
+    fn append_payload(&self, builder: &mut MutationBuilder<'_>) -> Result<()> {
         let index = self.manifest.logical_index_id();
-        if let Some(records) = &self.records {
+        if let GraphPublication::Replace { records, .. } = &self.publication {
             for (chunk, value) in records.chunks() {
                 builder.put(
                     LogicalKey::GraphChunk {
@@ -571,24 +647,6 @@ impl PreparedGraphTransition {
             }
         }
         Ok(())
-    }
-
-    /// Writes only graph records after the owner has applied its final header.
-    /// Multi-partition owners use the append methods for one combined preflight.
-    pub async fn publish<T: WriteTxn>(&self, txn: &mut WriteLogicalTxn<'_, T>) -> Result<()> {
-        self.validate_target(txn).await?;
-        let mut builder = txn.mutations();
-        self.append_authority(&mut builder)?;
-        if builder
-            .affected_bytes()?
-            .checked_add(txn.affected_bytes())
-            .ok_or_else(limit)?
-            > 900_000
-        {
-            return Err(limit());
-        }
-        self.append_payload(&mut builder)?;
-        txn.apply(builder).await
     }
 }
 
@@ -646,10 +704,15 @@ mod tests {
                 &|| Ok(()),
             )
             .unwrap();
-        let records = prepared.records.unwrap();
+        let GraphPublication::Replace {
+            header, records, ..
+        } = prepared.publication
+        else {
+            panic!("expected graph replacement");
+        };
         let chunks = records.chunks().collect();
         GraphTransitionSource {
-            header: prepared.header,
+            header: Some(header),
             descriptor: Some(records.descriptor),
             children: next,
             chunks,
@@ -682,9 +745,10 @@ mod tests {
                 .unwrap()
         };
         let prepared = prepare(9);
-        let ready_bytes = prepared.ready.as_ref().unwrap().retained_bytes();
-        assert!(prepared.retained_bytes().unwrap() >= ready_bytes);
-        let records = prepared.records.as_ref().unwrap();
+        let GraphPublication::Replace { records, body, .. } = &prepared.publication else {
+            panic!("expected graph replacement");
+        };
+        assert!(prepared.retained_bytes().unwrap() >= body.retained_bytes());
         let kernel =
             VectorKernel::new(2, manifest.config().metric(), *manifest.rotation_seed()).unwrap();
         let restored = InternalGraphBody::restore(
@@ -747,7 +811,10 @@ mod tests {
                 &|| Ok(()),
             )
             .unwrap();
-        assert_eq!(update.records.unwrap().descriptor.epoch, 9);
+        let GraphPublication::Replace { records, .. } = update.publication else {
+            panic!("expected graph replacement");
+        };
+        assert_eq!(records.descriptor.epoch, 9);
         let empty = populated()
             .prepare(
                 Some(header(0, 10, super::super::values::PartitionState::Ready)),
@@ -756,8 +823,7 @@ mod tests {
                 &|| Ok(()),
             )
             .unwrap();
-        assert!(empty.records.is_none());
-        assert!(!empty.unchanged);
+        assert!(matches!(empty.publication, GraphPublication::Remove { .. }));
         assert!(empty.source_descriptor.is_some());
     }
 
@@ -788,8 +854,10 @@ mod tests {
                 &|| Ok(()),
             )
             .unwrap();
-        assert!(update.unchanged);
-        assert!(update.records.is_none());
+        assert!(matches!(
+            update.publication,
+            GraphPublication::Preserve { .. }
+        ));
     }
 
     #[test]

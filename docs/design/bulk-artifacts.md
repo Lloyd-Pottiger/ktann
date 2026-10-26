@@ -28,8 +28,8 @@ serving lifecycle and exact-membership contracts are unchanged.
 4. `ServingArtifact::build` uses bounded external joins to prove exact source/leaf
    membership and parent/child relationships. Core storage codecs encode records,
    locations, payloads, trees, partition metadata, entries, and synopses. Output
-   keys are unique and sorted, and adapter key/value limits are checked. For fixed
-   indexes, final canonical internal bodies feed one graph at a time; descriptor
+   keys are unique and sorted, and adapter key/value limits are checked. For Local Graph
+   Indexes, final canonical internal bodies feed one graph at a time; descriptor
    and chunk keys follow that body's Child Entries. Graph encoding completes
    before sealing and no serving projection changes afterward. It excludes
    the Index Manifest, name directory, and allocator. Its binding includes the

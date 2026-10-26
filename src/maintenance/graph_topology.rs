@@ -8,7 +8,9 @@ use crate::api::{Error, ErrorKind, PartitionKey, Result};
 use crate::observe::labels::Operation;
 use crate::runtime::{GraphMaintenance, reads, writes};
 use crate::storage::backend::{Backend, ReadOps, ScanLimits, WriteTxn};
-use crate::storage::graph_transitions::{GraphTransitionSource, PreparedGraphTransition};
+use crate::storage::graph_transitions::{
+    GraphTransitionSource, PreparedGraphTransition, protect_sources, publish_batch,
+};
 use crate::storage::keys::{LogicalKey, TreeKey};
 use crate::storage::membership::{added_entry, removed_entry};
 use crate::storage::values::{
@@ -767,10 +769,8 @@ async fn apply<T: WriteTxn>(
     } else {
         None
     };
-    for graph in graphs {
-        if !graph.protect(txn).await? {
-            return Ok(None);
-        }
+    if !protect_sources(txn, graphs).await? {
+        return Ok(None);
     }
     if let Edit::Drain {
         other_target: Some((partition, expected)),
@@ -857,23 +857,7 @@ async fn apply<T: WriteTxn>(
             }
         }
     };
-    let mut builder = txn.mutations();
-    for graph in graphs {
-        graph.validate_target(txn).await?;
-        graph.append_authority(&mut builder)?;
-    }
-    if txn
-        .affected_bytes()
-        .checked_add(builder.affected_bytes()?)
-        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?
-        > 900_000
-    {
-        return Err(Error::new(ErrorKind::LimitExceeded));
-    }
-    for graph in graphs {
-        graph.append_payload(&mut builder)?;
-    }
-    txn.apply(builder).await?;
+    publish_batch(txn, graphs).await?;
     Ok(Some(outcome))
 }
 

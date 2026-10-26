@@ -59,6 +59,7 @@ provide the consolidated current contract.
 | 0026 | [Reserve Bulk Builds through the Index lifecycle](adr/0026-building-reservations.md) |
 | 0027 | [Durable workspace ownership and exact Bulk Build publication](adr/0027-bulk-workspace-and-publication.md) |
 | 0028 | [Renewable automatic Bulk Build scheduling](adr/0028-automatic-bulk-scheduling.md) |
+| 0029 | [Publish bounded local graph replacements atomically](adr/0029-atomic-local-graph-updates.md) |
 
 ## Development and validation
 

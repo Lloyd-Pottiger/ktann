@@ -4,7 +4,9 @@ use ktann::api::{
     DataType, Error, ErrorKind, Index, LogicalIndexId, PartitionKey, Result, Value, VerifyOptions,
 };
 use ktann::storage::backend::{Backend, WriteTxn};
-use ktann::storage::graph_transitions::{GraphTransitionSource, PreparedGraphTransition};
+use ktann::storage::graph_transitions::{
+    GraphTransitionSource, PreparedGraphTransition, protect_sources, publish_batch,
+};
 use ktann::storage::keys::{LogicalKey, TreeKey};
 use ktann::storage::values::{
     ChildEntry, IndexManifest, PartitionCentroid, PartitionHeader, PartitionState,
@@ -51,7 +53,7 @@ impl Update {
     /// Fault retries recognize the exact Header and descriptor observed in the
     /// prepared transaction, rather than treating any later epoch as success.
     async fn published<T: WriteTxn>(&self, txn: &mut WriteLogicalTxn<'_, T>) -> Result<bool> {
-        if self.graph.protect(txn).await? {
+        if protect_sources(txn, std::slice::from_ref(&self.graph)).await? {
             return Ok(false);
         }
         if let Some(descriptor) = &self.expected_descriptor {
@@ -102,7 +104,7 @@ impl Update {
             PersistentValue::PartitionHeader(self.header),
         )
         .await?;
-        self.graph.publish(txn).await?;
+        publish_batch(txn, std::slice::from_ref(&self.graph)).await?;
         self.expected_descriptor = txn.get(self.descriptor_key()).await?;
         assert!(self.expected_descriptor.is_some());
         Ok(true)
@@ -298,6 +300,19 @@ pub async fn exercise<B: Backend>(
         "shrink-prepare",
     );
     let mut shortened = writer(backend, &manifest).await;
+    assert!(
+        protect_sources(&mut shortened, std::slice::from_ref(&smaller.graph))
+            .await
+            .unwrap()
+    );
+    // Source fencing is not proof that the topology owner installed its target.
+    assert_eq!(
+        publish_batch(&mut shortened, std::slice::from_ref(&smaller.graph))
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::RetryableAbort
+    );
     smaller.publish(&mut shortened).await.unwrap();
     assert!(
         shortened

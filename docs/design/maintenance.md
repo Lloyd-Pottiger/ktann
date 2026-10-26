@@ -35,9 +35,7 @@ below 1024 nodes exactly and uses local HNSW at 1024 nodes or above, according t
 the snapshot Header count. Mixed waves share the same bounded write beam and
 stable candidate ordering. Approximate selection does not weaken exact membership,
 complete child ownership validation, or final mutation fences. Indexes without
-local graphs retain exact routing. Prepared graphs enter the bounded cache only
-after known successful publication; parent discovery waits for body guards before
-reading the full incoming-edge set from the refreshed snapshot.
+local graphs retain exact routing.
 
 Grouped foreground routing may reuse committed internal bodies from the shared
 Partition Cache (ADR 0023). It reads Header and State in the current transaction,
@@ -216,20 +214,14 @@ Natural mismatches—wrong location, missing authoritative entry, duplicate
 incoming reference, impossible count, or malformed state—return Corruption and
 do not trigger automatic repair.
 
-## 7. Validation
+## 7. Graph-aware topology
 
-- State-machine tables test every state, allowed transition, traversal rule,
-  retry point, and adapter capability branch.
-- Model histories interleave mutation, split, merge, root transitions, process
-  loss, queue loss, conflicts, and unknown outcomes while asserting exact
-  membership and searchability after every commit.
-- Focused tests cover Tree Key moves, monotonic synopsis expansion, allocator gaps,
-  deterministic training ties, target reselection, terminal paged deletion, and
-  cold intermediate states.
-- Contention benchmarks measure transaction retries and write amplification;
-  they do not weaken invariants to improve throughput.
-
-## 8. Local graph indexes
+Graph and ordinary maintenance share the storage operations that expose targets,
+move entries and complete splits or merges. Their execution lifecycles differ:
+ordinary maintenance retains bounded paged discovery, while graph maintenance
+needs complete source/receiver snapshots and private native preparation before
+opening its publication transaction. Graph body locks, single-receiver batches
+and stale-plan refresh belong to that preparation lifecycle.
 
 The graph-aware driver plans changed internal bodies from one snapshot, closes
 it, prepares private native graphs under Runtime admission, then protects source
@@ -241,7 +233,27 @@ parent waits for that parent's source to finish, preserving the combined
 source/receiver graph bound. State-only transitions keep the body epoch and
 graph unchanged. Leaf membership changes do not rebuild parent graphs.
 
+Participating graph bodies are guarded in Partition Key order before reading
+payloads. A waiting plan refreshes its snapshot after guard acquisition; incoming
+edge discovery then uses that snapshot. Exact publication fences remain the write
+authority across runtimes. Prepared immutable bodies enter the bounded cache only
+after known successful commit, with the committed Header epoch. Failed, cancelled
+or unknown-outcome publications cannot seed the cache.
+
 The [partition-local graph contract](partition-local-hnsw.md) owns the combined
 transaction/memory envelope, empty-body representation and native update policy.
 Explicit low-level callers reuse `GraphMaintenance` admission and call
 `graph_topology::advance`, rather than graph-unaware split/merge entrypoints.
+
+## 8. Validation
+
+- State-machine tables test every state, allowed transition, traversal rule,
+  retry point, and adapter capability branch.
+- Model histories interleave mutation, split, merge, root transitions, process
+  loss, queue loss, conflicts, and unknown outcomes while asserting exact
+  membership and searchability after every commit.
+- Focused tests cover Tree Key moves, monotonic synopsis expansion, allocator gaps,
+  deterministic training ties, target reselection, terminal paged deletion, and
+  cold intermediate states.
+- Contention benchmarks measure transaction retries and write amplification;
+  they do not weaken invariants to improve throughput.

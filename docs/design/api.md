@@ -200,7 +200,10 @@ hard safety caps are defined by the Persistent Format.
 for ordinary empty-index creation or Bulk Build. `local_graph()` returns the
 optional persisted construction parameters. Graph-enabled indexes support writes
 and maintenance after publication. Query routing is selected independently;
-foreground writes keep existing tree routing.
+foreground writes use exact scoring below 1024 children and local HNSW at or
+above 1024, selected from each snapshot Header count. Both retain the configured
+write beam and exact membership/fencing guarantees; see
+[foreground routing](maintenance.md#1-foreground-mutation-protocol).
 
 Local graph maintenance prepares native graphs outside transactions using one
 shared Runtime admission owner. Explicit low-level maintenance uses

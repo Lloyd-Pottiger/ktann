@@ -993,6 +993,33 @@ async fn a_receiving_split_root_is_corruption() {
 }
 
 #[tokio::test]
+async fn internal_body_without_a_route_is_corruption_for_every_entrypoint() {
+    let backend = MemoryBackend::new();
+    let manifest = manifest();
+    let key = tree_key(1);
+    create_committed_tree(&backend, &manifest, &key).await;
+    write_topology(
+        &backend,
+        &manifest,
+        vec![(header_key_at(&key, pk(1)), header(2, 0))],
+    )
+    .await;
+
+    let error = route_leaf(&mut read_txn(&backend, &manifest).await, &key, &[1.0])
+        .await
+        .expect_err("an internal root must reach a leaf");
+    assert_eq!(error.kind(), ErrorKind::Corruption);
+    for beam in [1, 4] {
+        let mut txn = write_txn(&backend, &manifest).await;
+        let error = route_leaf_for_write_with_beam(&mut txn, &key, &[1.0], 100, beam)
+            .await
+            .expect_err("an internal root must reach a leaf");
+        assert_eq!(error.kind(), ErrorKind::Corruption);
+        txn.rollback().await;
+    }
+}
+
+#[tokio::test]
 async fn malformed_child_entry_bytes_are_corruption() {
     let backend = MemoryBackend::new();
     let manifest = manifest();
