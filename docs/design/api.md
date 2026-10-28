@@ -184,14 +184,15 @@ immutable identity comparisons. Limits are:
 | Fields | at most 16 |
 | Bloom-enabled fields | at most 4 |
 | Encoded Tree Key | schema worst case at most 8 KiB |
-| Leaf partition capacity pair | `1 <= min`, `2 * min <= max <= 65,536`; defaults 64/512 |
-| Internal partition capacity pair | `1 <= min <= 128`, `2 * min <= max <= 16,384`; defaults 64/512 |
+| Leaf partition capacity pair | `1 <= min`, `2 * min <= max <= 65,536`; defaults 16/128 |
+| Internal partition capacity pair | `1 <= min <= 128`, `2 * min <= max <= 16,384`; defaults 64/16384 |
 
 Level 1 selects leaf bounds; higher levels select internal bounds, including
 roots. Roots are exempt from minimum occupancy. Maxima are asynchronous split
 thresholds during online mutation and hard occupancy bounds for settled offline
-construction/refinement. Both pairs default to 64/512; experimental large
-internal capacities do not change those defaults.
+construction/refinement. Leaves default to 16/128 to bound member scans; internal
+partitions default to 64/16384 to support wide routing nodes. Enabling local
+graphs does not change these capacity pairs.
 
 RaBitQ7, online split arity, Lloyd rounds, rotation algorithm, logical codecs, and
 hard safety caps are defined by the Persistent Format.

@@ -46,7 +46,8 @@ impl<B: Backend> Build<B> {
         let mut worker = BulkWorkerOptions::new(root.join("workspace"));
         let mut construction = ConstructionOptions {
             sample_items: 1024,
-            memory_bytes: 256 * 1024 * 1024,
+            // Cover wide default routing nodes at Cohere dimensionality.
+            memory_bytes: 1024 * 1024 * 1024,
             scratch_bytes: DISK_LIMIT,
         };
         if let Some(experiment) = experiment {

@@ -163,9 +163,10 @@ before corresponding work. No speculative read-ahead occurs beyond a budget.
 
 ### 6.2 Bounded IO and prefetching
 
-Traversal batches snapshot Header reads for a funded prefix of up to 32
+Traversal batches snapshot Header reads for a funded prefix of up to 1024
 non-root partitions, including leaves. Filtered leaf visits include their
-Synopses in the same batch, with at most 64 keys in flight. Visits, body loads,
+Synopses in the same batch, with at most 2048 logical keys per request; adapters
+chunk requests at their own point-read ceilings. Visits, body loads,
 candidate selection, and budget accounting retain their original order. Roots
 are read individually because their transition state can inject split targets
 ahead of the queued work. Batching changes backend scheduling, not the selected
@@ -190,6 +191,14 @@ the global kth-smallest upper endpoint (positive infinity when fewer than `k`
 exist), retains overlapping candidates, truncates by rough distance and Record
 ID to the remaining rerank budget, then loads original vectors. Any local
 overlap truncation sets `rabitq_overlap_truncated`.
+
+Before global selection, candidates carry entry indices into one shared immutable
+entry array per admitted leaf. These arrays retain the snapshot's filter projections
+without retaining the body's expanded RaBitQ codes. Global selection keeps the same
+intervals, Record ID tie-breaking, and candidate coverage; only its survivors copy
+filter fields into the owned rerank projection. Retained entry arrays and candidate
+containers are included in routing working-memory accounting, including when the
+partition cache is disabled or evicts their originating bodies.
 
 The local overlap test already includes the rough top `r`: each rough distance
 is at most its upper endpoint, so the r-th rough distance is at most the r-th

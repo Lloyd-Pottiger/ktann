@@ -391,14 +391,14 @@ fn independent_partition_capacity_bounds_and_recovery_age() {
             config.min_leaf_partition_entries(),
             config.max_leaf_partition_entries()
         ),
-        (64, 512)
+        (16, 128)
     );
     assert_eq!(
         (
             config.min_internal_partition_entries(),
             config.max_internal_partition_entries()
         ),
-        (64, 512)
+        (64, 16_384)
     );
     for (minimum, maximum) in [(0, 2), (2, 3), (1, 65_537), (u32::MAX, u32::MAX)] {
         assert_invalid(config.clone().with_leaf_partition_entries(minimum, maximum));
@@ -413,7 +413,7 @@ fn independent_partition_capacity_bounds_and_recovery_age() {
             .clone()
             .with_leaf_partition_entries(minimum, maximum)
             .unwrap();
-        assert_eq!(changed.max_internal_partition_entries(), 512);
+        assert_eq!(changed.max_internal_partition_entries(), 16_384);
         changed
             .with_internal_partition_entries(minimum.min(128), maximum.min(16_384))
             .unwrap()

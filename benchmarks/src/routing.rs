@@ -47,7 +47,7 @@ impl Default for Experiment {
             ef_search: 200,
             routing_working_bytes: 256 << 20,
             sample_items: 1024,
-            build_memory_bytes: 256 << 20,
+            build_memory_bytes: 1 << 30,
             build_scratch_bytes: 64 << 30,
         }
     }

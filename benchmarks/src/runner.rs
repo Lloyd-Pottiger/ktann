@@ -371,8 +371,8 @@ fn large_scenarios() -> Result<Vec<ScenarioSpec>, String> {
             routing_experiment: None,
             query_concurrency_sweep: Vec::new(),
             leaf_beam_sweep: vec![1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128, 192, 256, 384],
-            // Default capacities retain the multi-level million-vector workload;
-            // independent capacity overrides may intentionally change its depth.
+            // Follow the library layout defaults; capacity overrides can independently
+            // control leaf scan size and internal routing fanout.
             min_leaf_partition_entries: index.min_leaf_partition_entries(),
             max_leaf_partition_entries: index.max_leaf_partition_entries(),
             min_internal_partition_entries: index.min_internal_partition_entries(),
@@ -2686,13 +2686,6 @@ mod tests {
                 super::index_config(&scenario).expect("large index config"),
                 ktann::api::IndexConfig::new(scenario.dimension, scenario.metric)
                     .expect("default index config")
-            );
-            let max_leaf_partition_entries = usize::try_from(scenario.max_leaf_partition_entries)
-                .expect("partition fanout fits usize");
-            assert!(
-                max_leaf_partition_entries * (scenario.max_internal_partition_entries as usize)
-                    < scenario.base_vectors,
-                "default capacities must force a third topology level"
             );
         }
     }

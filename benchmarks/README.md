@@ -300,8 +300,9 @@ budget in every mode, including routing experiments: their `build_memory_bytes`
 continues to configure the other build stages. Reports record the effective
 `bulk_build.refinement_rounds` and `bulk_build.refinement_memory_bytes`.
 
-Construction uses IndexConfig defaults (64/512 partition entries), a sample cap
-of 1024, 256 MiB tree memory and 64 GiB tree scratch. Only an explicit leaf-beam
+Construction uses IndexConfig defaults (leaf 16/128, internal 64/16384), a sample
+cap of 1024, 1 GiB tree memory and 64 GiB tree scratch. The tree budget covers
+the constructor reservation for wide internal nodes at Cohere dimensionality. Only an explicit leaf-beam
 option changes the search defaults. Optimize returns readiness and record count;
 per-level Header statistics and an independent Header-slot limit are not part of
 the bridge contract.
@@ -482,7 +483,7 @@ The experiment JSON accepts:
 | `ef_search` | 200 | Requested expansion; actual per-parent effective values are recorded |
 | `routing_working_bytes` | 268435456 | Production per-operation routing admission |
 | `sample_items` | 1024 | Existing construction training sample control |
-| `build_memory_bytes` | 268435456 | Each existing construction/sort/serving/graph/refinement worker bound |
+| `build_memory_bytes` | 1073741824 | Each existing construction/sort/serving/graph/refinement worker bound |
 | `build_scratch_bytes` | 68719476736 | Existing scratch and per-artifact bound |
 
 Existing independent `--min-leaf-partition-entries`, `--max-leaf-partition-entries`,

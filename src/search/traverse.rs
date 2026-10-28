@@ -14,7 +14,6 @@
 //! Synopses prune only proven NoMatch leaves. Exact predicates admit entries;
 //! conservative RaBitQ intervals select candidates for exact reranking.
 
-use std::borrow::Borrow;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt;
@@ -35,18 +34,21 @@ use super::cache::{
     BODY_PREFETCH_BATCH, BodyEntries, BodyRequest, CachedBody, CachedLeafEntry, PartitionCache,
     load_body, prefetch_bodies,
 };
+use super::candidates::LeafCandidatePool;
+#[cfg(test)]
+use super::candidates::LeafReference;
 use super::numeric::{VectorKernel, compare_finite};
 use super::plan::EnumeratedTree;
 use super::predicate::{CompiledPredicate, SynopsisClassification};
 use super::rabitq::{ApproximateCandidate, DecodedRaBitQ7, RaBitQQuery, select_leaf_overlap};
-use super::rerank::{LeafCandidate, filter_candidates};
+use super::rerank::filter_candidates;
 use crate::api::RoutingMode;
 
 /// The default leaf-level base beam (design `search.md` section 6).
 pub(crate) const DEFAULT_LEAF_BEAM: u32 = 128;
 
-/// Bounds prefetched partitions to 32 Headers and, for filtered leaves, 32 Synopses.
-const PARTITION_METADATA_BATCH: usize = 32;
+/// Bounds metadata prefetch; adapters independently chunk point reads.
+const PARTITION_METADATA_BATCH: usize = 1_024;
 
 /// One bounded traversal request over the enumerated trees of one snapshot.
 ///
@@ -117,7 +119,7 @@ impl<'a> TraversalRequest<'a> {
 /// Reports visited-partition and Leaf Entry usage together with partition
 /// budget exhaustion and overlap truncation.
 pub(crate) struct TraversalOutcome {
-    candidates: Vec<LeafCandidate>,
+    candidates: LeafCandidatePool,
     /// Visited partitions worth offering to the Runtime's demand-driven Fixup
     /// queue: split or merge states and threshold-crossing `Ready` partitions.
     maintenance: Vec<(TreeKey, PartitionKey)>,
@@ -130,13 +132,13 @@ pub(crate) struct TraversalOutcome {
 impl TraversalOutcome {
     /// Returns the merged candidate pool before global overlap selection.
     #[cfg(test)]
-    pub(crate) fn candidates(&self) -> &[LeafCandidate] {
-        &self.candidates
+    pub(crate) fn candidates(&self) -> &[ApproximateCandidate<LeafReference>] {
+        self.candidates.candidates()
     }
 
     /// Consumes the outcome and returns the merged candidates.
     #[must_use]
-    pub(crate) fn into_candidates(self) -> Vec<LeafCandidate> {
+    pub(crate) fn into_candidates(self) -> LeafCandidatePool {
         self.candidates
     }
 
@@ -177,7 +179,7 @@ impl fmt::Debug for TraversalOutcome {
         // Counts and flags are safe; candidate Record IDs stay redacted.
         formatter
             .debug_struct("TraversalOutcome")
-            .field("candidates", &self.candidates.len())
+            .field("candidates", &self.candidates.candidates().len())
             .field("visited_partitions", &self.visited_partitions)
             .field("visited_leaf_entries", &self.visited_leaf_entries)
             .field(
@@ -310,9 +312,7 @@ struct Traversal {
     /// targets, and discovered Child Entries. A second reference to one body is
     /// Corruption.
     referenced: HashSet<(u32, PartitionKey)>,
-    candidates: Vec<LeafCandidate>,
-    /// Owned payload charge accumulated once per retained leaf candidate.
-    candidate_heap_bytes: usize,
+    candidates: LeafCandidatePool,
     /// Visited partitions worth offering to the Runtime's demand-driven Fixup
     /// queue: split or merge states and threshold-crossing `Ready` partitions.
     maintenance: Vec<(TreeKey, PartitionKey)>,
@@ -329,8 +329,7 @@ impl Traversal {
             frontier: BinaryHeap::new(),
             next_frontier: HashMap::new(),
             referenced: HashSet::new(),
-            candidates: Vec::new(),
-            candidate_heap_bytes: 0,
+            candidates: LeafCandidatePool::default(),
             maintenance: Vec::new(),
             visited_partitions: 0,
             visited_leaf_entries: 0,
@@ -797,14 +796,7 @@ impl Traversal {
             .ok_or_else(limit)?;
         bytes
             .checked_add(groups)
-            .and_then(|bytes| bytes.checked_add(self.candidate_heap_bytes))
-            .and_then(|bytes| {
-                bytes.checked_add(
-                    self.candidates
-                        .capacity()
-                        .checked_mul(size_of::<LeafCandidate>())?,
-                )
-            })
+            .and_then(|bytes| bytes.checked_add(self.candidates.heap_bytes().ok()?))
             .ok_or_else(limit)
     }
 
@@ -920,48 +912,35 @@ impl Traversal {
                 .filter(|entry| diagnostics.truth.contains(entry.record_id()))
                 .count();
         }
-        // Only predicate evaluation needs a temporary list of entry references.
-        // Without a predicate (including AllMatch), score the body directly.
+        // Predicate filtering preserves each entry's original array ordinal.
         let filtered;
         let pool = if let Some(predicate) = predicate {
             filtered = filter_candidates(
-                entries.iter().collect(),
+                entries.iter().enumerate().collect(),
                 Some(predicate),
                 &mut self.visited_leaf_entries,
-                |entry| entry.fields(),
+                |(_, entry)| entry.fields(),
             )?;
-            score_leaf_entries(&filtered, codes, context.query)?
+            score_leaf_entries(filtered.len(), |i| filtered[i], codes, context.query)?
         } else {
-            let batch = score_leaf_entries(entries, codes, context.query)?;
-            filter_candidates(batch, None, &mut self.visited_leaf_entries, |candidate| {
-                candidate.value().fields()
-            })?
+            let batch =
+                score_leaf_entries(entries.len(), |i| (i, &entries[i]), codes, context.query)?;
+            self.visited_leaf_entries = self
+                .visited_leaf_entries
+                .checked_add(entries.len() as u64)
+                .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+            batch
         };
-        // Only local survivors need owned fields and locations for global reranking.
         let selection = select_leaf_overlap(pool, context.request.k, context.rerank_cap)?;
         if selection.truncated() {
             self.rabitq_overlap_truncated = true;
         }
-        let selected = selection.into_candidates();
-        self.candidates
-            .try_reserve(selected.len())
-            .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
-        for candidate in selected {
-            let (record_id, distance, entry) = candidate.into_parts();
-            let candidate = LeafCandidate::from_leaf(
-                record_id,
-                entry.fields().into(),
-                distance,
-                RecordLocation::new(tree_key.clone(), partition),
-            );
-            if context.manifest.config().local_graph().is_some() {
-                self.candidate_heap_bytes = self
-                    .candidate_heap_bytes
-                    .checked_add(candidate.heap_bytes()?)
-                    .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-            }
-            self.candidates.push(candidate);
-        }
+        self.candidates.push_leaf(
+            entries,
+            RecordLocation::new(tree_key.clone(), partition),
+            selection.into_candidates(),
+            context.manifest.config().local_graph().is_some(),
+        )?;
         Ok(())
     }
 
@@ -993,8 +972,8 @@ impl Traversal {
         // Exact membership admits at most one Leaf Entry per Vector Record in
         // one snapshot, even across draining split bodies; a duplicate Record
         // ID is Corruption rather than silently deduplicated.
-        let mut seen = HashSet::with_capacity(self.candidates.len());
-        for candidate in &self.candidates {
+        let mut seen = HashSet::with_capacity(self.candidates.candidates().len());
+        for candidate in self.candidates.candidates() {
             if !seen.insert(candidate.record_id().as_ref()) {
                 return Err(Error::new(ErrorKind::Corruption));
             }
@@ -1016,37 +995,35 @@ impl Traversal {
 ///
 /// Both inputs use the same four-entry slices and scalar tail, preserving each
 /// score's accumulation order without copying the unfiltered body's references.
-fn score_leaf_entries<'a, T: Borrow<CachedLeafEntry>>(
-    entries: &'a [T],
+fn score_leaf_entries<'a>(
+    len: usize,
+    entry_at: impl Fn(usize) -> (usize, &'a CachedLeafEntry),
     components: &[i8],
     query: &RaBitQQuery<'_>,
-) -> Result<Vec<ApproximateCandidate<&'a CachedLeafEntry>>> {
-    let mut batch = Vec::with_capacity(entries.len());
-    let (chunks, remainder) = entries.as_chunks::<4>();
-    for entries in chunks {
-        let codes: [_; 4] = std::array::from_fn(|lane| entries[lane].borrow().code(components));
+) -> Result<Vec<ApproximateCandidate<usize>>> {
+    let mut batch = Vec::with_capacity(len);
+    let full = len / 4 * 4;
+    for start in (0..full).step_by(4) {
+        let entries: [_; 4] = std::array::from_fn(|lane| entry_at(start + lane));
+        let codes: [_; 4] = std::array::from_fn(|lane| entries[lane].1.code(components));
         let distances = DecodedRaBitQ7::approximate_distances(codes.each_ref(), query)
             .map_err(|_| Error::new(ErrorKind::Corruption))?;
-        for (entry, distance) in entries.iter().zip(distances) {
-            let entry = entry.borrow();
+        for ((ordinal, entry), distance) in entries.into_iter().zip(distances) {
             batch.push(ApproximateCandidate::new(
                 entry.record_id().clone(),
                 distance,
-                entry,
+                ordinal,
             ));
         }
     }
-    for entry in remainder {
-        // Loading the immutable body validates every payload before filtering,
-        // so rejected entries cannot hide malformed persistent codes.
-        let [distance] =
-            DecodedRaBitQ7::approximate_distances([&entry.borrow().code(components)], query)
-                .map_err(|_| Error::new(ErrorKind::Corruption))?;
-        let entry = entry.borrow();
+    for i in full..len {
+        let (ordinal, entry) = entry_at(i);
+        let [distance] = DecodedRaBitQ7::approximate_distances([&entry.code(components)], query)
+            .map_err(|_| Error::new(ErrorKind::Corruption))?;
         batch.push(ApproximateCandidate::new(
             entry.record_id().clone(),
             distance,
-            entry,
+            ordinal,
         ));
     }
     Ok(batch)
@@ -1504,6 +1481,7 @@ mod tests {
     #[tokio::test]
     async fn metadata_batches_are_bounded_and_read_each_key_once() {
         let manifest = manifest();
+        let children = super::PARTITION_METADATA_BATCH as u32 + 6;
         let predicate = CompiledPredicate::compile(
             Predicate::Compare {
                 field: FieldId(1),
@@ -1516,8 +1494,8 @@ mod tests {
         for (level, predicate) in [(2, None), (1, None), (1, Some(&predicate))] {
             let mut fixture = Fixture::new(&manifest);
             let tree = fixture.tree(1);
-            fixture.header(&tree, 1, level + 1, 70, PartitionState::Ready);
-            for partition in 2..72 {
+            fixture.header(&tree, 1, level + 1, children, PartitionState::Ready);
+            for partition in 2..u64::from(children) + 2 {
                 fixture.child(&tree, 1, partition, [partition as f32, 0.0]);
                 fixture.header(&tree, partition, level, 0, PartitionState::Ready);
                 if level == 1 {
@@ -1537,12 +1515,19 @@ mod tests {
                         &mut txn,
                         &cache,
                         &kernel,
-                        TraversalRequest::new(&QUERY, &trees, predicate, 4, budgets(100, 8), 256)
-                            .expect("valid request"),
+                        TraversalRequest::new(
+                            &QUERY,
+                            &trees,
+                            predicate,
+                            4,
+                            budgets(children + 2, 8),
+                            4096,
+                        )
+                        .expect("valid request"),
                     )
                     .await
                     .expect("traverse empty beam");
-                    assert_eq!(outcome.visited_partitions(), 71);
+                    assert_eq!(outcome.visited_partitions(), children + 1);
                     assert!(!outcome.partition_budget_exhausted());
                     let raw = txn.into_raw();
                     assert!(
@@ -1554,7 +1539,7 @@ mod tests {
                     let keys_per_partition = if predicate.is_some() { 2 } else { 1 };
                     assert_eq!(
                         raw.batch_sizes.iter().sum::<usize>(),
-                        70 * keys_per_partition
+                        children as usize * keys_per_partition
                     );
                     assert!(
                         raw.batch_sizes
@@ -1563,7 +1548,7 @@ mod tests {
                                 <= super::PARTITION_METADATA_BATCH * keys_per_partition)
                     );
                     assert!(
-                        raw.batch_sizes.len() < 70,
+                        raw.batch_sizes.len() == 2,
                         "partition metadata requests are coalesced"
                     );
                 }
@@ -1675,7 +1660,7 @@ mod tests {
         assert_eq!(outcome.visited_leaf_entries(), 0);
         assert!(!outcome.partition_budget_exhausted());
         assert!(!outcome.rabitq_overlap_truncated());
-        assert!(outcome.into_candidates().is_empty());
+        assert!(outcome.into_candidates().candidates().is_empty());
     }
 
     #[tokio::test]

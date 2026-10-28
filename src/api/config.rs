@@ -12,8 +12,12 @@ use super::{DataType, Error, FieldId, FieldSchema, Metric, Result, SearchBudgets
 pub(crate) const MAX_DIMENSION: usize = 16_384;
 const MAX_BLOOM_FIELDS: usize = 4;
 const MAX_TREE_KEY_BYTES: usize = 8 * 1_024;
-const DEFAULT_MIN_PARTITION_ENTRIES: u32 = 64;
-const DEFAULT_MAX_PARTITION_ENTRIES: u32 = 512;
+// Small leaves bound member scans; wide internal partitions expose routing work
+// to partition-local graphs without adding unnecessary tree levels.
+const DEFAULT_MIN_LEAF_PARTITION_ENTRIES: u32 = 16;
+const DEFAULT_MAX_LEAF_PARTITION_ENTRIES: u32 = 128;
+const DEFAULT_MIN_INTERNAL_PARTITION_ENTRIES: u32 = 64;
+const DEFAULT_MAX_INTERNAL_PARTITION_ENTRIES: u32 = 16_384;
 const MAX_PARTITION_ENTRIES: u32 = 65_536;
 const DEFAULT_FIXUP_QUEUE_CAPACITY: usize = 1_024;
 const DEFAULT_FOREGROUND_OPERATION_LIMIT: usize = 1_024;
@@ -106,10 +110,10 @@ impl IndexConfig {
             metric,
             fields: Box::new([]),
             tree_key_fields: Box::new([]),
-            min_leaf_partition_entries: DEFAULT_MIN_PARTITION_ENTRIES,
-            min_internal_partition_entries: DEFAULT_MIN_PARTITION_ENTRIES,
-            max_leaf_partition_entries: DEFAULT_MAX_PARTITION_ENTRIES,
-            max_internal_partition_entries: DEFAULT_MAX_PARTITION_ENTRIES,
+            min_leaf_partition_entries: DEFAULT_MIN_LEAF_PARTITION_ENTRIES,
+            min_internal_partition_entries: DEFAULT_MIN_INTERNAL_PARTITION_ENTRIES,
+            max_leaf_partition_entries: DEFAULT_MAX_LEAF_PARTITION_ENTRIES,
+            max_internal_partition_entries: DEFAULT_MAX_INTERNAL_PARTITION_ENTRIES,
         };
         config.validate()?;
         Ok(config)

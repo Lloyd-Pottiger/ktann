@@ -27,8 +27,7 @@ use crate::search::cache::PartitionCache;
 use crate::search::numeric::VectorKernel;
 use crate::search::plan::{TreeKeyPlan, enumerate_tree_keys, plan_tree_keys};
 use crate::search::predicate::CompiledPredicate;
-use crate::search::rabitq::select_global_overlap;
-use crate::search::rerank::{LeafCandidate, exact_rerank};
+use crate::search::rerank::exact_rerank;
 use crate::search::traverse::{TraversalRequest, traverse};
 use crate::storage::backend::{Backend, ScanLimits};
 use crate::storage::keys::TreeKey;
@@ -188,13 +187,13 @@ pub(crate) async fn search<B: Backend>(
             .lock()
             .map_err(|_| Error::new(ErrorKind::Other))?;
         diagnostics.neighbors_after_local_selection = candidates
+            .candidates()
             .iter()
             .filter(|candidate| diagnostics.truth.contains(candidate.record_id()))
             .count();
     }
-    let selection = select_global_overlap(candidates, prepared.request.k(), rerank_budget)?;
-    let rerank_budget_exhausted = selection.truncated();
-    let mut selected: Vec<LeafCandidate> = selection.into_candidates();
+    let (mut selected, rerank_budget_exhausted) =
+        candidates.select(prepared.request.k(), rerank_budget)?;
     // Request compaction of spare traversal capacity before allocating rerank buffers.
     selected.shrink_to_fit();
     #[cfg(feature = "benchmark")]

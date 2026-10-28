@@ -788,7 +788,8 @@ fn index_handle_is_send_and_sync() {
 fn bulk_options() -> ktann::construction::ConstructionOptions {
     ktann::construction::ConstructionOptions {
         sample_items: 8,
-        memory_bytes: 16 * 1024 * 1024,
+        // Cover default wide internal partitions in the constructor reservation.
+        memory_bytes: 64 * 1024 * 1024,
         scratch_bytes: 16 * 1024 * 1024,
     }
 }
