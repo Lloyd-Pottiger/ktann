@@ -1,4 +1,3 @@
-use bytes::Bytes;
 use num_bigint::BigInt;
 use proptest::prelude::*;
 
@@ -6,10 +5,7 @@ use crate::api::{ErrorKind, MAX_DIMENSION, Metric};
 
 use super::rounding::{next_down, next_up};
 
-use super::{
-    ApproximateCandidate, ApproximateDistance, RaBitQ7, RaBitQQuery, select_global_overlap,
-    select_leaf_overlap,
-};
+use super::{ApproximateDistance, RaBitQ7, RaBitQQuery};
 
 #[test]
 fn adjacent_values_cover_ieee_boundaries() {
@@ -470,56 +466,6 @@ fn interleaved_scores_reject_a_dimension_mismatch_in_every_lane() {
     }
 }
 
-#[test]
-fn leaf_overlap_obeys_formula_cap_and_stable_membership() {
-    let candidates = (0_u16..300)
-        .map(|index| candidate(index, f64::from(index), 0.0, 1_000.0 + f64::from(index)))
-        .collect();
-    let selection = select_leaf_overlap(candidates, 1, usize::MAX).expect("selection succeeds");
-    assert!(selection.truncated());
-    assert_eq!(selection.candidates().len(), 256);
-    let mut ids = selected_ids(selection);
-    ids.sort_unstable();
-    assert_eq!(ids, (0..256).collect::<Vec<_>>());
-
-    let candidates = vec![candidate(2, 1.0, 0.0, 2.0), candidate(1, 1.0, 0.0, 2.0)];
-    let selection = select_leaf_overlap(candidates, 1, 1).expect("selection succeeds");
-    assert!(selection.truncated());
-    assert_eq!(selection.candidates()[0].record_id().as_ref(), [0, 1]);
-    assert_eq!(selection.candidates()[0].value(), &1);
-}
-
-#[test]
-fn global_overlap_uses_kth_upper_endpoint_then_rerank_cap() {
-    let candidates = vec![
-        candidate(1, 10.0, 9.0, 11.0),
-        candidate(2, 20.0, 19.0, 21.0),
-        candidate(3, 30.0, 10.5, 31.0),
-        candidate(4, 40.0, 22.0, 41.0),
-    ];
-    let selection = select_global_overlap(candidates, 2, 2).expect("selection succeeds");
-    assert!(selection.truncated());
-    let selected = selection.into_candidates();
-    assert_eq!(selected.len(), 2);
-    assert_eq!(selected[0].record_id().as_ref(), [0, 1]);
-    let (_, distance, value) = selected
-        .into_iter()
-        .nth(1)
-        .expect("second candidate exists")
-        .into_parts();
-    assert_eq!(distance.rough(), 20.0);
-    assert_eq!(value, 2);
-
-    assert_kind(
-        select_global_overlap::<u16>(Vec::new(), 0, 1),
-        ErrorKind::InvalidArgument,
-    );
-    let empty = select_global_overlap(vec![candidate(1, 1.0, 0.0, 2.0)], 2, 0)
-        .expect("zero budget is a valid hard cap");
-    assert!(empty.truncated());
-    assert!(empty.candidates().is_empty());
-}
-
 proptest! {
     #[test]
     fn adjacent_values_match_floating_reference(bits in any::<u64>()) {
@@ -604,148 +550,7 @@ proptest! {
         assert_exact_reconstructed_dot(&encoded, &components);
     }
 
-    #[test]
-    fn optimized_overlap_selection_matches_brute_force_sorting(
-        raw in prop::collection::vec((-1_000_i16..=1_000, 0_u8..=255, 0_u8..=255), 1..600),
-        k in 1_usize..150,
-        budget in 0_usize..800,
-    ) {
-        let specs: Vec<CandidateSpec> = raw.into_iter().enumerate().map(
-            |(index, (rough, lower_width, upper_width))| CandidateSpec {
-                id: index as u16,
-                rough: f64::from(rough),
-                lower: f64::from(rough) - f64::from(lower_width),
-                upper: f64::from(rough) + f64::from(upper_width),
-            },
-        ).collect();
 
-        let actual_leaf = select_leaf_overlap(build_candidates(&specs), k, budget)
-            .expect("generated leaf selection is valid");
-        let (expected_leaf, expected_leaf_truncated) = brute_force_leaf(&specs, k, budget);
-        prop_assert_eq!(actual_leaf.truncated(), expected_leaf_truncated);
-        let mut actual_leaf_ids = selected_ids(actual_leaf);
-        let mut expected_leaf_ids = expected_leaf;
-        actual_leaf_ids.sort_unstable();
-        expected_leaf_ids.sort_unstable();
-        prop_assert_eq!(actual_leaf_ids, expected_leaf_ids);
-
-        let actual_global = select_global_overlap(build_candidates(&specs), k, budget)
-            .expect("generated global selection is valid");
-        let (expected_global, expected_global_truncated) = brute_force_global(&specs, k, budget);
-        prop_assert_eq!(actual_global.truncated(), expected_global_truncated);
-        prop_assert_eq!(selected_ids(actual_global), expected_global.clone());
-
-        // Traversal supplies a merged pool without a global pre-sort. The
-        // final selection and truncation must not depend on that pool order.
-        let mut reversed = build_candidates(&specs);
-        reversed.reverse();
-        let reordered = select_global_overlap(reversed, k, budget)
-            .expect("reordered selection is valid");
-        prop_assert_eq!(reordered.truncated(), expected_global_truncated);
-        prop_assert_eq!(selected_ids(reordered), expected_global);
-    }
-}
-
-#[derive(Clone, Copy)]
-struct CandidateSpec {
-    id: u16,
-    rough: f64,
-    lower: f64,
-    upper: f64,
-}
-
-fn build_candidates(specs: &[CandidateSpec]) -> Vec<ApproximateCandidate<u16>> {
-    specs
-        .iter()
-        .map(|spec| candidate(spec.id, spec.rough, spec.lower, spec.upper))
-        .collect()
-}
-
-fn selected_ids(selection: super::OverlapSelection<u16>) -> Vec<u16> {
-    selection
-        .into_candidates()
-        .into_iter()
-        .map(|candidate| candidate.into_parts().2)
-        .collect()
-}
-
-fn brute_force_leaf(specs: &[CandidateSpec], k: usize, budget: usize) -> (Vec<u16>, bool) {
-    let rough_count = specs.len().min(k.saturating_mul(2).max(64));
-    let mut upper_order = specs.to_vec();
-    upper_order.sort_unstable_by(|left, right| left.upper.total_cmp(&right.upper));
-    let threshold = upper_order[rough_count - 1].upper;
-
-    let mut rough_order = specs.to_vec();
-    rough_order.sort_unstable_by(compare_spec_rough);
-    let rough_ids: Vec<u16> = rough_order
-        .iter()
-        .take(rough_count)
-        .map(|spec| spec.id)
-        .collect();
-    let mut retained: Vec<CandidateSpec> = specs
-        .iter()
-        .copied()
-        .filter(|spec| rough_ids.contains(&spec.id) || spec.lower <= threshold)
-        .collect();
-    let cap = rough_count.saturating_mul(4).min(budget);
-    let truncated = retained.len() > cap;
-    if truncated {
-        retained.sort_unstable_by(compare_spec_local_cap);
-        retained.truncate(cap);
-    }
-    retained.sort_unstable_by(compare_spec_rough);
-    (
-        retained.into_iter().map(|spec| spec.id).collect(),
-        truncated,
-    )
-}
-
-fn brute_force_global(specs: &[CandidateSpec], k: usize, budget: usize) -> (Vec<u16>, bool) {
-    let threshold = if specs.len() < k {
-        f64::INFINITY
-    } else {
-        let mut upper_order = specs.to_vec();
-        upper_order.sort_unstable_by(|left, right| left.upper.total_cmp(&right.upper));
-        upper_order[k - 1].upper
-    };
-    let mut retained: Vec<CandidateSpec> = specs
-        .iter()
-        .copied()
-        .filter(|spec| spec.lower <= threshold)
-        .collect();
-    retained.sort_unstable_by(compare_spec_rough);
-    let truncated = retained.len() > budget;
-    retained.truncate(budget);
-    (
-        retained.into_iter().map(|spec| spec.id).collect(),
-        truncated,
-    )
-}
-
-fn compare_spec_rough(left: &CandidateSpec, right: &CandidateSpec) -> std::cmp::Ordering {
-    left.rough
-        .total_cmp(&right.rough)
-        .then_with(|| left.id.cmp(&right.id))
-}
-
-fn compare_spec_local_cap(left: &CandidateSpec, right: &CandidateSpec) -> std::cmp::Ordering {
-    left.lower
-        .total_cmp(&right.lower)
-        .then_with(|| compare_spec_rough(left, right))
-}
-
-fn candidate(index: u16, rough: f64, lower: f64, upper: f64) -> ApproximateCandidate<u16> {
-    assert!(lower <= rough && rough <= upper);
-    let distance = ApproximateDistance {
-        rough,
-        lower,
-        upper,
-    };
-    ApproximateCandidate::new(
-        Bytes::copy_from_slice(&index.to_be_bytes()),
-        distance,
-        index,
-    )
 }
 
 /// Exercises the same trusted constructor used after a validated body load.

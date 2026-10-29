@@ -84,7 +84,7 @@ pub struct SearchDiagnostics {
     pub(crate) truth: std::collections::HashSet<bytes::Bytes>,
     /// True neighbors present in scanned leaf bodies before RaBitQ selection.
     pub neighbors_in_leaves: usize,
-    /// True neighbors surviving per-leaf overlap selection.
+    /// True neighbors retained in the global bounded rough-distance pool.
     pub neighbors_after_local_selection: usize,
     /// True neighbors admitted to exact reranking.
     pub neighbors_reranked: usize,

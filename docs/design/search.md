@@ -182,28 +182,31 @@ This bounds temporary prefetching independently of complete partition size.
 
 ### 6.3 Candidate selection
 
-For a leaf with `n` eligible entries, checked arithmetic computes
-`r = min(n, max(2*k, 64))`. The leaf keeps the rough top `r`, uses the r-th
-smallest upper endpoint as its overlap threshold, includes entries whose lower
-endpoint overlaps it, and caps the set at `min(4*r, remaining rerank budget)` by
-lower bound, rough distance, and Record ID. After merging leaf sets, search uses
-the global kth-smallest upper endpoint (positive infinity when fewer than `k`
-exist), retains overlapping candidates, truncates by rough distance and Record
-ID to the remaining rerank budget, then loads original vectors. Any local
-overlap truncation sets `rabitq_overlap_truncated`.
+Every predicate-eligible entry of every visited leaf is scored. One global max
+heap retains at most the remaining exact-rerank budget, ordered by rough distance
+and then unsigned Record ID bytes. There is no per-leaf quota. Before reranking, the retained pool's kth-smallest
+upper endpoint excludes candidates whose lower endpoint is greater; with fewer
+than k candidates no interval exclusion is applied. This bounded final pass avoids
+loading clearly noncompetitive vectors, especially for small or selective queries.
+Rejected or evicted heap candidates set exact-rerank budget exhaustion;
+`rabitq_overlap_truncated` remains false. This is an approximate ranking policy:
+fixed-capacity retention does not guarantee exact top-k recall.
 
-Before global selection, candidates carry entry indices into one shared immutable
-entry array per admitted leaf. These arrays retain the snapshot's filter projections
-without retaining the body's expanded RaBitQ codes. Global selection keeps the same
-intervals, Record ID tie-breaking, and candidate coverage; only its survivors copy
-filter fields into the owned rerank projection. Retained entry arrays and candidate
-containers are included in routing working-memory accounting, including when the
-partition cache is disabled or evicts their originating bodies.
+Only admitted candidates acquire a shared reference to the leaf's immutable entry
+array and their original entry ordinal. Filter fields are never copied. The final
+rerank stage reads these original projections to verify them and the source Record
+Location against authoritative records from the same snapshot. Expanded RaBitQ
+codes are not retained by candidate references. Eviction immediately releases a
+source array when its last candidate leaves the heap.
 
-The local overlap test already includes the rough top `r`: each rough distance
-is at most its upper endpoint, so the r-th rough distance is at most the r-th
-upper endpoint, and every top-`r` candidate's lower endpoint is no larger than
-its rough distance. No separate rough top-`r` selection is necessary.
+Scored Record IDs move into a separate compact list, including rejected and evicted
+candidates. Only admitted heap candidates require an additional ID reference.
+After traversal, one borrowed-ID set is reserved from the actual list length to
+validate duplicate membership before exact reads. Both the list and set are
+released immediately after successful validation. Thus candidate count and projection ownership are bounded by the rerank
+budget, while corruption-detection identity storage grows with the number of
+predicate-eligible entries visited. Both retained IDs and transient duplicate-table space are charged to routing working memory;
+shared source arrays are charged once, including on cache misses or eviction.
 
 ### 6.4 Intermediate topology
 

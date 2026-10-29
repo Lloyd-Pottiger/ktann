@@ -462,7 +462,7 @@ async fn every_budget_dimension_reports_exactly_its_own_exhaustion() {
     let outcome = index.search(search_request(2)).await.expect("search");
     assert_eq!(outcome.usage.exact_rerank_candidates, 3);
     assert!(outcome.exhausted.exact_rerank_candidates);
-    assert!(outcome.rabitq_overlap_truncated);
+    assert!(!outcome.rabitq_overlap_truncated);
     assert!(!outcome.exhausted.scanned_tree_keys);
     assert!(!outcome.exhausted.visited_partitions);
     assert_eq!(outcome.hits.len(), 2);

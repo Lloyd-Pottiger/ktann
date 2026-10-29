@@ -39,6 +39,7 @@ struct Options {
     database: PathBuf,
     report: PathBuf,
     backend: String,
+    preserve_index: bool,
 }
 
 /// Runs a single bridge until shutdown or SIGINT, then closes the Runtime.
@@ -53,6 +54,7 @@ pub fn run() -> Result<(), String> {
         database: PathBuf::new(),
         report: PathBuf::new(),
         backend: "rocksdb".into(),
+        preserve_index: false,
     };
     while let Some(arg) = args.next() {
         let value = args.next().ok_or(
@@ -69,6 +71,9 @@ pub fn run() -> Result<(), String> {
             "--database" => options.database = value.into(),
             "--report" => options.report = value.into(),
             "--backend" => options.backend = value,
+            "--preserve-index" => {
+                options.preserve_index = value.parse::<bool>().map_err(|e| e.to_string())?
+            }
             _ => return Err(format!("unknown argument {arg}")),
         }
     }
@@ -141,6 +146,12 @@ struct Request {
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 /// Operations accepted by the versioned VectorDBBench process bridge.
 enum Operation {
+    /// Reopens a frozen, already-published benchmark index without mutation.
+    Resume {
+        dataset: String,
+        records: u64,
+        leaf_beam: u32,
+    },
     Reset {
         dimension: usize,
         metric: String,
@@ -371,11 +382,15 @@ async fn serve<B: Backend>(backend: B, identity: String, options: &Options) -> R
     }
     // Capture workload IO before deleting this bridge's dedicated Logical Index.
     let report = service.report(&options.backend).await;
-    let cleanup = service
-        .runtime
-        .drop_index("vdbbench")
-        .await
-        .map_err(|e| e.to_string());
+    let cleanup = if options.preserve_index {
+        Ok(())
+    } else {
+        service
+            .runtime
+            .drop_index("vdbbench")
+            .await
+            .map_err(|e| e.to_string())
+    };
     let shutdown = service.runtime.shutdown().await.map_err(|e| e.to_string());
     let persisted = report.and_then(|report| write_report(&options.report, &report));
     result.and(cleanup).and(shutdown).and(persisted)
@@ -481,6 +496,47 @@ impl<B: Backend> Service<B> {
                 )
             }
             Operation::Shutdown => Ok(json!({"shutdown":true})),
+            Operation::Resume {
+                dataset,
+                records,
+                leaf_beam,
+            } => {
+                if dataset.is_empty() || dataset.len() > 1024 {
+                    return Err(invalid("dataset identity required (at most 1024 bytes)"));
+                }
+                let mut search = SearchOptions::default()
+                    .with_leaf_beam_size(leaf_beam)
+                    .map_err(api_error)?;
+                if let Some(experiment) = &self.experiment {
+                    search = search
+                        .with_routing_mode(experiment.production_mode())
+                        .map_err(api_error)?;
+                }
+                let mut state = self.state.write().await;
+                if state.dimension != 0 {
+                    return Err(invalid("one case per bridge; restart before resume"));
+                }
+                let index = self
+                    .runtime
+                    .open_index("vdbbench")
+                    .await
+                    .map_err(api_error)?;
+                state.dimension = index.config().dimension();
+                state.metric = match index.config().metric() {
+                    Metric::L2 => "L2",
+                    Metric::Cosine => "COSINE",
+                    _ => return Err(invalid("only L2 and COSINE are supported")),
+                }
+                .to_owned();
+                state.dataset = dataset;
+                // Fixture cardinality is supplied by the benchmark controller;
+                // resume performs no full record scan or index mutation.
+                state.records = records;
+                state.search = search;
+                state.index = Some(index);
+                state.ready = true;
+                Ok(json!({"resumed":true}))
+            }
             Operation::Reset {
                 dimension,
                 metric,

@@ -15,11 +15,13 @@
 //! truncation. Success deliberately makes no exact-global-top-k, completeness,
 //! continuation, or monotonic-across-budgets guarantee.
 
+#[cfg(feature = "benchmark")]
+use crate::api::ErrorKind;
 use std::time::Instant;
 
 use crate::api::{
-    Error, ErrorKind, PartitionKey, Result, SearchBudgetExhaustion, SearchBudgetUsage,
-    SearchBudgets, SearchOutcome, SearchRequest,
+    Error, PartitionKey, Result, SearchBudgetExhaustion, SearchBudgetUsage, SearchBudgets,
+    SearchOutcome, SearchRequest,
 };
 use crate::observe::labels::SearchStage;
 use crate::observe::metrics;
@@ -174,12 +176,8 @@ pub(crate) async fn search<B: Backend>(
     let partition_budget_exhausted = traversal.partition_budget_exhausted();
     let rabitq_overlap_truncated = traversal.rabitq_overlap_truncated();
 
-    // Global overlap selection retains every candidate whose conservative
-    // interval reaches the kth-smallest upper endpoint, then truncates the
-    // survivors to the rerank budget in deterministic rough order. That
-    // truncation is eligible rerank work the depleted budget prevented.
-    let rerank_budget = usize::try_from(prepared.budgets.exact_rerank_candidates())
-        .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
+    // Traversal already retains global rough top-budget candidates. The final
+    // bounded interval pass excludes clearly noncompetitive exact reads.
     let candidates = traversal.into_candidates();
     #[cfg(feature = "benchmark")]
     if let Some(diagnostics) = &prepared.diagnostics {
@@ -192,8 +190,7 @@ pub(crate) async fn search<B: Backend>(
             .filter(|candidate| diagnostics.truth.contains(candidate.record_id()))
             .count();
     }
-    let (mut selected, rerank_budget_exhausted) =
-        candidates.select(prepared.request.k(), rerank_budget)?;
+    let (mut selected, rerank_budget_exhausted) = candidates.select(prepared.request.k())?;
     // Request compaction of spare traversal capacity before allocating rerank buffers.
     selected.shrink_to_fit();
     #[cfg(feature = "benchmark")]

@@ -587,3 +587,15 @@ or above 1024, independently for each snapshot-authoritative body. There are no
 write-routing experiment switches. Query behavior and budgets are unchanged.
 See [foreground write routing](../docs/design/partition-local-hnsw.md#foreground-write-routing)
 for the policy, rationale and measurement evidence.
+
+### Reusing a frozen VectorDBBench index
+
+For controlled query-only comparisons, start the bridge with
+`--preserve-index true`. Shutdown then closes the runtime without dropping its
+Logical Index; the default still removes it. Restart with the same database path
+and routing configuration, then send protocol version 1 operation `resume` with
+`dataset`, `records`, and `leaf_beam`. This opens the published `vdbbench` index
+without rebuilding or changing it. Dimension and metric come from its manifest;
+`records` is controller-supplied fixture metadata, not a newly counted cardinality.
+The controller must verify dataset provenance and warm the new process's caches
+before measurement. A running bridge accepts only one reset or resume.

@@ -12,7 +12,7 @@
 //! and duplicate candidate Record IDs are Corruption.
 //!
 //! Synopses prune only proven NoMatch leaves. Exact predicates admit entries;
-//! conservative RaBitQ intervals select candidates for exact reranking.
+//! RaBitQ rough distances feed a global bounded candidate heap.
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -35,12 +35,12 @@ use super::cache::{
     load_body, prefetch_bodies,
 };
 use super::candidates::LeafCandidatePool;
-#[cfg(test)]
-use super::candidates::LeafReference;
 use super::numeric::{VectorKernel, compare_finite};
 use super::plan::EnumeratedTree;
 use super::predicate::{CompiledPredicate, SynopsisClassification};
-use super::rabitq::{ApproximateCandidate, DecodedRaBitQ7, RaBitQQuery, select_leaf_overlap};
+use super::rabitq::{ApproximateCandidate, DecodedRaBitQ7, RaBitQQuery};
+#[cfg(test)]
+use super::rerank::LeafProjection;
 use super::rerank::filter_candidates;
 use crate::api::RoutingMode;
 
@@ -62,7 +62,6 @@ pub(crate) struct TraversalRequest<'a> {
     routing: &'a [f32],
     trees: &'a [EnumeratedTree],
     predicate: Option<&'a CompiledPredicate>,
-    k: usize,
     budgets: SearchBudgets,
     leaf_beam: u32,
     routing_mode: RoutingMode,
@@ -102,7 +101,6 @@ impl<'a> TraversalRequest<'a> {
             routing,
             trees,
             predicate,
-            k,
             budgets,
             leaf_beam,
             routing_mode: RoutingMode::Exact,
@@ -132,7 +130,7 @@ pub(crate) struct TraversalOutcome {
 impl TraversalOutcome {
     /// Returns the merged candidate pool before global overlap selection.
     #[cfg(test)]
-    pub(crate) fn candidates(&self) -> &[ApproximateCandidate<LeafReference>] {
+    pub(crate) fn candidates(&self) -> &[ApproximateCandidate<LeafProjection>] {
         self.candidates.candidates()
     }
 
@@ -888,7 +886,7 @@ impl Traversal {
     }
 
     /// Considers every entry of an admitted Leaf Partition, filters exactly,
-    /// and merges the bounded overlap selection. The snapshot-validated cache
+    /// and admits scores to the global bounded candidate heap. The snapshot-validated cache
     /// supplies the whole decoded body; scanning has no independent entry cap.
     fn scan_leaf(
         &mut self,
@@ -931,14 +929,11 @@ impl Traversal {
                 .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
             batch
         };
-        let selection = select_leaf_overlap(pool, context.request.k, context.rerank_cap)?;
-        if selection.truncated() {
-            self.rabitq_overlap_truncated = true;
-        }
         self.candidates.push_leaf(
             entries,
             RecordLocation::new(tree_key.clone(), partition),
-            selection.into_candidates(),
+            pool,
+            context.rerank_cap,
             context.manifest.config().local_graph().is_some(),
         )?;
         Ok(())
@@ -967,19 +962,9 @@ impl Traversal {
         Ok(())
     }
 
-    /// Rejects duplicate membership and reports the merged candidate pool.
-    fn finish(self) -> Result<TraversalOutcome> {
-        // Exact membership admits at most one Leaf Entry per Vector Record in
-        // one snapshot, even across draining split bodies; a duplicate Record
-        // ID is Corruption rather than silently deduplicated.
-        let mut seen = HashSet::with_capacity(self.candidates.candidates().len());
-        for candidate in self.candidates.candidates() {
-            if !seen.insert(candidate.record_id().as_ref()) {
-                return Err(Error::new(ErrorKind::Corruption));
-            }
-        }
-        // Global overlap selection partitions this pool before ordering only
-        // its bounded survivors. Sorting the entire pool here adds no contract.
+    /// Reports the bounded candidate pool after membership validation.
+    fn finish(mut self) -> Result<TraversalOutcome> {
+        self.candidates.validate_membership()?;
         Ok(TraversalOutcome {
             candidates: self.candidates,
             maintenance: self.maintenance,
@@ -1363,9 +1348,15 @@ mod tests {
     }
 
     fn candidate_ids(outcome: &TraversalOutcome) -> Vec<&[u8]> {
-        outcome
-            .candidates()
-            .iter()
+        let mut candidates: Vec<_> = outcome.candidates().iter().collect();
+        candidates.sort_unstable_by(|a, b| {
+            a.distance()
+                .rough()
+                .total_cmp(&b.distance().rough())
+                .then_with(|| a.record_id().cmp(b.record_id()))
+        });
+        candidates
+            .into_iter()
             .map(|candidate| candidate.record_id().as_ref())
             .collect()
     }
@@ -1733,7 +1724,8 @@ mod tests {
         .await
         .expect("traverse");
         assert_eq!(candidate_ids(&outcome), vec![b"a".as_slice()]);
-        assert!(outcome.rabitq_overlap_truncated());
+        assert!(!outcome.rabitq_overlap_truncated());
+        assert!(outcome.candidates.truncated());
     }
 
     #[tokio::test]
@@ -2101,7 +2093,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn per_leaf_overlap_cap_reports_truncation() {
+    async fn global_candidate_cap_reports_rerank_truncation() {
         let manifest = manifest();
         let mut fixture = Fixture::new(&manifest);
         let tree = fixture.tree(1);
@@ -2111,8 +2103,8 @@ mod tests {
         fixture.entry(&tree, 1, 1, "b", 0, [2.0, 0.0]);
         fixture.entry(&tree, 1, 1, "c", 0, [3.0, 0.0]);
 
-        // k = 1 with a single-candidate rerank budget caps the leaf's overlap
-        // set at min(4 * 3, 1) and reports the truncation.
+        // A single-candidate global rerank budget reports budget exhaustion,
+        // without reporting an interval-overlap cutoff.
         let outcome = run(
             fixture.items,
             &manifest,
@@ -2125,7 +2117,8 @@ mod tests {
         .await
         .expect("traverse");
         assert_eq!(candidate_ids(&outcome), vec![b"a".as_slice()]);
-        assert!(outcome.rabitq_overlap_truncated());
+        assert!(!outcome.rabitq_overlap_truncated());
+        assert!(outcome.candidates.truncated());
         assert_eq!(outcome.visited_leaf_entries(), 3);
     }
 

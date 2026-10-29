@@ -5,6 +5,9 @@
 //! unrotated vectors; ties use unsigned lexicographic Record ID order.
 
 use bytes::Bytes;
+use std::sync::Arc;
+
+use super::cache::CachedLeafEntry;
 
 use crate::api::{Error, ErrorKind, Result, SearchHit, Value};
 use crate::storage::ReadLogicalTxn;
@@ -13,7 +16,9 @@ use crate::storage::values::RecordLocation;
 
 use super::numeric::{ExactDistance, VectorKernel, compare_finite};
 use super::predicate::CompiledPredicate;
-use super::rabitq::{ApproximateCandidate, ApproximateDistance};
+use super::rabitq::ApproximateCandidate;
+#[cfg(test)]
+use super::rabitq::ApproximateDistance;
 
 /// The number of Vector Records loaded per backend batch.
 ///
@@ -29,31 +34,58 @@ const RECORD_LOAD_BATCH: usize = 256;
 /// and the source location the authoritative Record Location must match.
 pub(crate) type LeafCandidate = ApproximateCandidate<LeafProjection>;
 
-/// Exact leaf projection carried unchanged through global overlap selection.
-pub(crate) struct LeafProjection {
-    fields: Box<[Value]>,
-    location: RecordLocation,
+/// Snapshot projections shared only by candidates still eligible for reranking.
+pub(crate) struct CandidateLeaf {
+    pub(crate) entries: Arc<[CachedLeafEntry]>,
+    pub(crate) location: RecordLocation,
+    pub(crate) bytes: usize,
+}
+
+/// A reference to a snapshot projection; fields are never copied during search.
+pub(crate) enum LeafProjection {
+    Shared {
+        source: Arc<CandidateLeaf>,
+        entry: usize,
+    },
+    #[cfg(test)]
+    Owned {
+        fields: Box<[Value]>,
+        location: RecordLocation,
+    },
 }
 
 impl LeafCandidate {
-    /// Creates one candidate from its Leaf Entry projection and source.
+    /// Constructs a standalone projection for rerank contract tests.
+    #[cfg(test)]
     pub(crate) fn from_leaf(
         record_id: Bytes,
         fields: Box<[Value]>,
         distance: ApproximateDistance,
         location: RecordLocation,
     ) -> Self {
-        Self::new(record_id, distance, LeafProjection { fields, location })
+        Self::new(
+            record_id,
+            distance,
+            LeafProjection::Owned { fields, location },
+        )
     }
 
-    /// Returns the exact typed filter projection from the Leaf Entry.
+    /// Returns the original exact typed projection without copying it.
     pub(crate) fn fields(&self) -> &[Value] {
-        &self.value().fields
+        match self.value() {
+            LeafProjection::Shared { source, entry } => source.entries[*entry].fields(),
+            #[cfg(test)]
+            LeafProjection::Owned { fields, .. } => fields,
+        }
     }
 
-    /// Returns the source Tree Key and Leaf Partition the candidate came from.
-    pub(crate) const fn location(&self) -> &RecordLocation {
-        &self.value().location
+    /// Returns the source location checked against authoritative membership.
+    pub(crate) fn location(&self) -> &RecordLocation {
+        match self.value() {
+            LeafProjection::Shared { source, .. } => &source.location,
+            #[cfg(test)]
+            LeafProjection::Owned { location, .. } => location,
+        }
     }
 }
 

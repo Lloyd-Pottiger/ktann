@@ -17,6 +17,14 @@ impl Bridge {
     }
 
     fn start_with(experiment: Option<Value>) -> Self {
+        Self::start_with_database(experiment, None, false)
+    }
+
+    fn start_with_database(
+        experiment: Option<Value>,
+        database: Option<&std::path::Path>,
+        preserve_index: bool,
+    ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("bridge.sock");
         let scratch = directory.path().join("scratch");
@@ -32,8 +40,14 @@ impl Bridge {
             .arg("rocksdb")
             .arg("--socket")
             .arg(&socket)
+            .arg("--preserve-index")
+            .arg(preserve_index.to_string())
             .arg("--database")
-            .arg(directory.path().join("database"))
+            .arg(
+                database
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or_else(|| directory.path().join("database")),
+            )
             .arg("--report")
             .arg(directory.path().join("report.json"))
             .env("TMPDIR", &scratch)
@@ -285,4 +299,46 @@ fn invalid_refinement_controls_do_not_consume_reset() {
         true
     );
     bridge.stop();
+}
+
+#[test]
+fn resume_opens_frozen_index_after_process_restart() {
+    let mut original = Bridge::start_with_database(None, None, true);
+    assert_eq!(
+        original.request(json!({"op":"resume","dataset":"tiny","records":3,"leaf_beam":128}))["ok"],
+        false
+    );
+    assert_eq!(original.request(json!({"op":"reset","dimension":2,"metric":"L2","dataset":"tiny","refinement_rounds":0,"refinement_memory_bytes":33554432}))["ok"], true);
+    assert_eq!(
+        original.insert(&[1, 2, 3], &[vec![1., 0.], vec![2., 0.], vec![3., 0.]])["ok"],
+        true
+    );
+    assert_eq!(
+        original.request(json!({"op":"optimize","records":3}))["ok"],
+        true
+    );
+    let expected = original.request(json!({"op":"search","vector":[1.,0.],"k":2}));
+    original.stop();
+    let mut resumed = Bridge::start_with_database(
+        None,
+        Some(&original.directory.path().join("database")),
+        true,
+    );
+    assert_eq!(
+        resumed.request(json!({"op":"health"}))["result"]["ready"],
+        false
+    );
+    assert_eq!(
+        resumed.request(json!({"op":"resume","dataset":"tiny","records":3,"leaf_beam":128}))["ok"],
+        true
+    );
+    assert_eq!(
+        resumed.request(json!({"op":"search","vector":[1.,0.],"k":2}))["result"]["ids"],
+        expected["result"]["ids"]
+    );
+    assert_eq!(
+        resumed.request(json!({"op":"resume","dataset":"tiny","records":3,"leaf_beam":128}))["ok"],
+        false
+    );
+    resumed.stop();
 }

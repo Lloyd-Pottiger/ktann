@@ -20,9 +20,7 @@ use bytes::Bytes;
 use crate::api::Result;
 
 pub(crate) use interval::RaBitQQuery;
-#[cfg(test)]
-pub(crate) use selection::OverlapSelection;
-pub(crate) use selection::{ApproximateCandidate, select_global_overlap, select_leaf_overlap};
+pub(crate) use selection::ApproximateCandidate;
 
 /// One borrowed canonical absolute RaBitQ7 payload.
 pub(crate) struct RaBitQ7<'a> {
