@@ -9,6 +9,9 @@ use super::RaBitQ7;
 use super::rounding::{add_down, add_up, multiply_down, multiply_up, sqrt_up};
 use super::{ApproximateDistance, CodeHeader, DecodedRaBitQ7};
 
+// Integer coarse dots remain exact over the public dimension limit.
+const _: () = assert!(MAX_DIMENSION <= i32::MAX as usize / (127 * 63));
+
 /// One validated, metric-specific query prepared once per Search.
 pub(crate) struct RaBitQQuery<'a> {
     components: &'a [f32],
@@ -17,14 +20,16 @@ pub(crate) struct RaBitQQuery<'a> {
     norm_squared_lower: f64,
     norm_squared_upper: f64,
     dot_error_factor: f64,
-    /// Bounds the difference between screened f32 and reference f64 dots.
-    screening_error_factor: Option<f64>,
+    /// The query's integer coarse representation and its conservative error.
+    screening_components: Vec<i8>,
+    screening_scale: f64,
+    screening_error_factor: f64,
 }
 
 impl<'a> RaBitQQuery<'a> {
-    /// Whether f32 screening can avoid overflow for this query's components.
-    pub(crate) fn supports_screening(&self) -> bool {
-        self.screening_error_factor.is_some()
+    /// Query-owned coarse components charged to routing working memory.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.screening_components.capacity()
     }
 
     /// Validates a rotated query and precomputes its scalar-f64 norm bounds.
@@ -48,6 +53,28 @@ impl<'a> RaBitQQuery<'a> {
             norm_squared_upper = add_up(norm_squared_upper, multiply_up(component, component));
         }
         let norm_upper = sqrt_up(norm_squared_upper);
+        let screening_scale = if max_component == 0.0 {
+            1.0
+        } else {
+            max_component / 127.0
+        };
+        let mut screening_components = Vec::with_capacity(components.len());
+        let mut screening_error_squared = 0.0;
+        for &component in components {
+            let component = f64::from(component);
+            let quantized = (component / screening_scale).round().clamp(-127.0, 127.0) as i8;
+            screening_components.push(quantized);
+            let lower = add_down(
+                component,
+                -multiply_up(screening_scale, f64::from(quantized)),
+            );
+            let upper = add_up(
+                component,
+                -multiply_down(screening_scale, f64::from(quantized)),
+            );
+            let error = lower.abs().max(upper.abs());
+            screening_error_squared = add_up(screening_error_squared, multiply_up(error, error));
+        }
         Ok(Self {
             components,
             metric,
@@ -55,24 +82,17 @@ impl<'a> RaBitQQuery<'a> {
             norm_squared_lower,
             norm_squared_upper,
             dot_error_factor: multiply_up(components.len() as f64 * f64::EPSILON, norm_upper),
-            // Even the sum of absolute products stays below half the f32
-            // maximum. The rounding bound below leaves ample overflow margin.
-            screening_error_factor: (max_component * 63.0 * components.len() as f64
-                <= f64::from(f32::MAX) / 2.0)
-                .then(|| {
-                    multiply_up(
-                        add_up(
-                            (components.len() + 2) as f64 * f64::from(f32::EPSILON),
-                            components.len() as f64 * f64::EPSILON,
-                        ),
-                        norm_upper,
-                    )
-                }),
+            screening_components,
+            screening_scale,
+            screening_error_factor: add_up(
+                sqrt_up(screening_error_squared),
+                multiply_up((components.len() + 2) as f64 * f64::EPSILON, norm_upper),
+            ),
         })
     }
 }
 
-/// Bounds the reference f64 rough score using a cheaper four-part f32 dot.
+/// Bounds the reference f64 rough score using a cheaper integer dot.
 ///
 /// These bounds concern rounding of the quantized dot, not reconstruction
 /// error against the original vector. They may only screen a candidate when
@@ -87,36 +107,35 @@ pub(super) fn rough_lower_bounds<const N: usize>(
     {
         return Err(Error::invalid_argument());
     }
-    let Some(error_factor) = query.screening_error_factor else {
-        return Ok([f64::NEG_INFINITY; N]);
-    };
     let mut chunks = codes.map(|code| code.codes.as_chunks::<4>().0.iter());
-    let mut sums = [[0.0_f32; 4]; N];
-    for components in query.components.as_chunks::<4>().0 {
+    let mut sums = [[0_i32; 4]; N];
+    for components in query.screening_components.as_chunks::<4>().0 {
         for lane in 0..N {
             let chunk = chunks[lane].next().expect("validated matching dimensions");
             for component in 0..4 {
-                sums[lane][component] += components[component] * f32::from(chunk[component]);
+                sums[lane][component] +=
+                    i32::from(components[component]) * i32::from(chunk[component]);
             }
         }
     }
     for index in query.components.len() / 4 * 4..query.components.len() {
         for lane in 0..N {
-            sums[lane][index % 4] += query.components[index] * f32::from(codes[lane].codes[index]);
+            sums[lane][index % 4] +=
+                i32::from(query.screening_components[index]) * i32::from(codes[lane].codes[index]);
         }
     }
     Ok(std::array::from_fn(|lane| {
         let sum = (sums[lane][0] + sums[lane][1]) + (sums[lane][2] + sums[lane][3]);
         let header = &codes[lane].header;
         let scale = f64::from(header.scale);
-        let dot = f64::from(sum) * scale;
-        // Products, partial sums and the balanced reduction have at most n+2
-        // rounded f32 operations per term. gamma_(n+2) <= (n+2)*EPSILON.
-        // Subnormal products/sums are exact multiples of the f32 quantum;
-        // overflow is excluded when preparing the query. Scaling two f32
-        // numbers in f64 is exact. Add the reference dot's f64 error bound.
+        // MAX_DIMENSION * 127 * 63 < 2^31, so every integer operation is exact.
+        // Directed scaling and Cauchy–Schwarz cover query quantization plus
+        // the unchanged reference dot's floating-point accumulation error.
         let norm = multiply_up(scale, sqrt_up(f64::from(header.code_norm_squared)));
-        let dot_upper = add_up(dot, multiply_up(error_factor, norm));
+        let dot_upper = add_up(
+            multiply_up(multiply_up(f64::from(sum), query.screening_scale), scale),
+            multiply_up(query.screening_error_factor, norm),
+        );
         match query.metric {
             Metric::InnerProduct => -dot_upper,
             Metric::Cosine => add_down(1.0, -dot_upper),

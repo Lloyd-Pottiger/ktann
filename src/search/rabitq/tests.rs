@@ -505,20 +505,26 @@ fn screening_bounds_cover_reference_scores_at_numeric_boundaries() {
                         lower <= reference.rough(),
                         "dim={dimension}, magnitude={magnitude}, metric={metric:?}"
                     );
-                    if magnitude == f32::MAX {
-                        assert_eq!(
-                            lower,
-                            f64::NEG_INFINITY,
-                            "overflow-prone queries refine every lane"
-                        );
-                    } else {
-                        assert!(
-                            lower.is_finite(),
-                            "ordinary queries use the screening kernel"
-                        );
-                    }
+                    assert!(
+                        lower.is_finite(),
+                        "all finite queries support integer screening"
+                    );
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn integer_screening_covers_full_accumulators_and_quantization_ties() {
+    for query in [
+        vec![1.0; MAX_DIMENSION],
+        vec![-1.0; MAX_DIMENSION],
+        vec![127.0, 0.5, -0.5, 1.5, -1.5],
+    ] {
+        for code in [-63, 63] {
+            let encoded = independently_encode_payload(&vec![code; query.len()], 1.0, 0.0);
+            assert_validated_packed_parity(&encoded, &query);
         }
     }
 }

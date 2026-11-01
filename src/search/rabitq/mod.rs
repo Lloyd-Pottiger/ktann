@@ -1,7 +1,7 @@
 //! Canonical RaBitQ7 encoding, approximate scores, and conservative bounds.
 //!
 //! This module is the single seam for the persistent seven-bit code, scalar
-//! f64 approximate distances, conservative intervals, and f32 screening bounds.
+//! f64 approximate distances, conservative intervals, and integer screening bounds.
 //! Callers do not need to know the bit layout or the
 //! directed-rounding rules that keep its intervals conservative.
 

@@ -202,6 +202,7 @@ pub(crate) async fn traverse<T: ReadOps>(
             kernel
                 .heap_bytes()
                 .checked_add(request.routing.len() * 8)
+                .and_then(|bytes| bytes.checked_add(query.heap_bytes()))
                 .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?,
             |bytes, tree| {
                 bytes

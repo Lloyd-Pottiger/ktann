@@ -161,7 +161,7 @@ impl GlobalCandidatePool {
             .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
         // A fixed leaf cutoff is conservative as subsequent admissions can only
         // improve the heap. Keep four-lane scoring and scalar tails unchanged.
-        let cutoff = self.rough_cutoff().filter(|_| query.supports_screening());
+        let cutoff = self.rough_cutoff();
         let mut source = Weak::new();
         let full = len / 4 * 4;
         for start in (0..full).step_by(4) {

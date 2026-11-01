@@ -109,41 +109,43 @@ substitute for that bound.
 
 ### 3.1 Screening against the global rough-distance heap
 
-Once the global candidate heap is full, leaf scoring first bounds the existing
-f64 rough score using a four-part f32 dot product. A candidate is screened only
-when its lower bound is strictly greater than the heap's worst rough score.
-Ties and overlapping bounds receive the unchanged f64 score and conservative
-original-vector interval. A leaf may use the cutoff observed before its scan:
-the worst retained score can only decrease as candidates arrive, so this older
-cutoff only performs extra refinement. A partially filled heap screens nothing.
-Every predicate-eligible Record ID, including screened IDs, still enters duplicate
-membership validation and routing-memory accounting. Screening sets the same
-rerank-exhaustion flag as ordinary rough-heap rejection. No visited partition,
-entry count, candidate coverage, or persistent format changes.
+Once the global heap is full, a cheap integer dot bounds the canonical f64
+rough score. The query is quantized once per search: `s=max(abs(q_i))/127`
+(or 1 for a zero query), and `a_i=clamp(round(q_i/s),-127,127)`. Both `s`
+and the rounded query coefficients are process-local scratch, not persisted data.
+For each stored signed seven-bit code `c`, the integer sum `S=sum(a_i*c_i)`
+is exact: `MAX_DIMENSION*127*63 < i32::MAX`, enforced at compile time.
 
-The screening bound concerns error between two computations of the *quantized*
-dot, not reconstruction error against the original vector. With dimension `n`,
-f32 unit roundoff `u32=2^-24`, each term encounters one product rounding, at most
-`ceil(n/4)-1` partial-sum additions, and two balanced-reduction additions. The
-conservative count `n+2` also covers all tails and small dimensions. Thus
-`gamma_(n+2) <= (n+2)*2^-23` for `n<=16384`. Subnormal f32 products of an f32
-component and an integer code, and subnormal sums of f32 operands, are exact
-multiples of `2^-149`; these operations have no additional underflow error.
-The query enables screening only when `max(abs(q_i))*63*n <= f32::MAX/2`, which
-bounds all intermediate absolute sums away from overflow even after rounding.
-Otherwise every lower bound is negative infinity and the original scorer handles
-the query. Multiplying the final f32 sum by the f32 scale in f64 is exact.
+Query preparation computes an outward interval for every `q_i-s*a_i` using
+directed multiplication and subtraction. Squaring the largest absolute endpoint,
+summing upward and taking an upward square root gives `E >= ||q-s*a||`.
+Let `Q >= ||q||` be the existing query norm bound and
+`C >= code_scale*sqrt(sum(c_i*c_i))` the decoded code norm bound. Cauchy–Schwarz
+bounds query-quantization error in the scaled dot by `E*C`.
 
-Add the reference scorer's `n*2^-52` error factor to `(n+2)*2^-23`, then multiply
-upward by upper bounds on `norm(q)` and `scale*sqrt(code_norm_squared)`.
-Cauchy–Schwarz therefore bounds the difference between the screened scaled dot
-and the reference scaled dot. Adding this error outward gives an upper bound
-`U` on the reference dot. Rough-distance lower bounds are `-U` for inner product
-and downward-rounded `1-U` for cosine. For L2, compute the same rounded constant
-`C = norm_squared + scale*scale*code_norm_squared` as the reference scorer and
-use `max(0, subtract_down(C, multiply_up(2,U)))`. Monotonicity of round-to-nearest
-ensures these outward endpoints also bound the reference's final rounded rough
-score. No changed rounding order is used for admitted candidates.
+The canonical reference multiplies f32 query components by small integers in
+f64 exactly, then accumulates and scales in f64. Its additional rounding error
+is bounded by `(n+2)*f64::EPSILON*Q*C`: this exceeds the relevant gamma bound
+for every supported dimension (`n <= 16,384`). All finite f32 components and
+code scales remain far below f64 overflow; integer screening needs no f32
+overflow fallback. Thus a conservative dot upper endpoint is obtained by
+scaling `S` by `s` and `code_scale` with upward rounding, then adding
+`C*(E+(n+2)*f64::EPSILON*Q)`, also with outward rounding.
+
+This bound concerns the canonical dot with the *quantized stored code*, not
+reconstruction error against the original vector. IP and cosine transform this
+upper endpoint monotonically into a distance lower bound. L2 uses the same
+rounded constant term as the canonical scorer and subtracts the dot endpoint
+with outward rounding before clamping at zero. A candidate is screened only
+when its lower bound is **strictly greater** than the heap cutoff; ties and
+uncertain bounds receive the unchanged f64 score and reconstruction interval.
+
+The cutoff is read once per leaf. The heap's worst score can only decrease,
+so this older cutoff only causes extra refinement. A partially filled heap
+screens nothing. Every eligible ID still participates in duplicate-membership
+validation and memory accounting. The query's one-byte-per-dimension coarse
+buffer is charged to routing working memory. Traversal counts, candidate
+coverage, authoritative rereads, and persistent formats are unchanged.
 
 ## 4. Tree Key enumeration
 
