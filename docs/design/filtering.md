@@ -139,7 +139,7 @@ or summaries cannot prune them. Membership-list sorting and deduplication are
 bounded by public expression limits; conservative range fallback bounds planning
 without changing predicate semantics.
 
-Search reports budget usage, exhausted dimensions, and RaBitQ overlap truncation.
+Search reports budget usage and exhausted dimensions.
 Every returned hit matches, but fewer than `k` hits can result from insufficient
 matches or approximate traversal and candidate budgets. Larger budgets or a wider
 beam may explore more candidates without a monotonic-result guarantee. Hits

@@ -1011,7 +1011,6 @@ async fn run_search_phase<B: Backend>(
                 summary.visited_partitions += u64::from(outcome.exhausted.visited_partitions);
                 summary.exact_rerank_candidates +=
                     u64::from(outcome.exhausted.exact_rerank_candidates);
-                summary.rabitq_overlap += u64::from(outcome.rabitq_overlap_truncated);
                 summary
             });
     let phase = SearchPhase {
@@ -2473,8 +2472,7 @@ async fn quality_diagnostics<B: Backend>(
         queries.push(crate::report::QueryQuality {
             query,
             true_neighbor_leaf_coverage: diagnostic.neighbors_in_leaves as f64 / denominator,
-            local_candidate_coverage: diagnostic.neighbors_after_local_selection as f64
-                / denominator,
+            global_candidate_coverage: diagnostic.neighbors_in_global_pool as f64 / denominator,
             rerank_candidate_coverage: diagnostic.neighbors_reranked as f64 / denominator,
             final_recall: oracle::recall_ids(outcome.hits.iter().map(|hit| hit.id()), expected),
             truth_leaves,

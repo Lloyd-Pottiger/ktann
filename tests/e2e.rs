@@ -519,9 +519,7 @@ impl Harness {
                 if !exhausted.is_empty() {
                     out.push_str(&format!("exhausted: {}\n", exhausted.join(" ")));
                 }
-                if outcome.rabitq_overlap_truncated {
-                    out.push_str("truncated: rabitq_overlap\n");
-                }
+
                 out
             }
             Err(error) => format!("error: {:?}\n", error.kind()),
@@ -571,7 +569,7 @@ impl Harness {
             let predicted: Vec<Bytes> = outcome.hits.iter().map(|hit| hit.id().clone()).collect();
             let truth = oracle::truth(&self.model, metric, query, k, &filter);
             total_recall += oracle::recall_ids(&predicted, &truth);
-            if outcome.exhausted != Default::default() || outcome.rabitq_overlap_truncated {
+            if outcome.exhausted != Default::default() {
                 truncated += 1;
             }
             total_partitions += u64::from(outcome.usage.visited_partitions);

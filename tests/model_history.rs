@@ -1043,8 +1043,7 @@ impl Driver {
         }
         let exhausted = outcome.exhausted.scanned_tree_keys
             || outcome.exhausted.visited_partitions
-            || outcome.exhausted.exact_rerank_candidates
-            || outcome.rabitq_overlap_truncated;
+            || outcome.exhausted.exact_rerank_candidates;
         if exhausted {
             self.trace.push(format!(
                 "step {n}: search k={k} -> {} hits (budget exhausted, membership checked)",

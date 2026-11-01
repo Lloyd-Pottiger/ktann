@@ -682,8 +682,6 @@ pub struct SearchTruncation {
     pub visited_partitions: u64,
     /// Searches exhausting the exact-rerank-candidate budget.
     pub exact_rerank_candidates: u64,
-    /// Searches truncated by a per-leaf RaBitQ overlap cap.
-    pub rabitq_overlap: u64,
 }
 
 /// Time and resources required to verify a stable topology.
@@ -1137,8 +1135,8 @@ pub struct QueryQuality {
     pub query: usize,
     /// True final top-k neighbors in the scanned leaves / number of true neighbors.
     pub true_neighbor_leaf_coverage: f64,
-    /// True neighbors retained after leaf-local RaBitQ overlap selection.
-    pub local_candidate_coverage: f64,
+    /// True neighbors retained in the global bounded rough-distance pool.
+    pub global_candidate_coverage: f64,
     /// True neighbors entering exact reranking; rerank budget remains engine-owned.
     pub rerank_candidate_coverage: f64,
     /// Returned true neighbors / number of true neighbors.

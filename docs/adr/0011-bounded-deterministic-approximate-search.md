@@ -1,5 +1,12 @@
 # Expose bounded approximate search
 
+Status: candidate retention and its outcome reporting below are superseded by
+the global candidate pool described in [Search Design](../design/search.md#63-candidate-selection).
+There is no per-leaf candidate quota or overlap-truncation flag in the current
+API. Heap rejections and evictions report exact-rerank budget exhaustion. The
+original decision below is retained as historical context; its other search
+budget and snapshot contracts still apply.
+
 Search uses level-scaled beam traversal and one hard budget over scanned Tree Keys, visited partitions, and exact-rerank candidates; the requested k is only an upper bound. Traversal and tie-breaking are deterministic within one snapshot and codec. Production v1 uses the scalar f64 RaBitQ kernel so conservative interval bounds do not depend on an unaccounted CPU-selected f32/SIMD error. Budget exhaustion returns accumulated hits plus usage and exhaustion details, while deadline or cancellation is an error; hits contain only Record IDs and exact distances, deliberately avoiding fill guarantees, implicit payload reads, and cross-call snapshot sessions.
 
 RaBitQ candidate retention is bounded in two stages. For a leaf with n eligible entries, `r=min(n,max(2*k,64))`; it retains the rough top r, adds interval-overlap entries whose lower bound does not exceed that leaf's r-th upper bound, and caps this intermediate set at `min(4*r, remaining request rerank budget)`, truncating by lower bound, estimated distance, then Record ID. The merged candidates use the global kth-smallest upper bound, or positive infinity when fewer than k candidates exist, are sorted by estimated distance and Record ID, truncated to remaining rerank budget, and only then batch-read for exact distance. Checked arithmetic rejects overflow. SearchOutcome reports `rabitq_overlap_truncated=true` if any leaf cap discarded a qualifying overlap; this makes the recall/resource trade-off visible while preventing wide error intervals from retaining every scanned entry in the candidate pool.

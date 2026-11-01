@@ -17,9 +17,16 @@ pub(crate) struct RaBitQQuery<'a> {
     norm_squared_lower: f64,
     norm_squared_upper: f64,
     dot_error_factor: f64,
+    /// Bounds the difference between screened f32 and reference f64 dots.
+    screening_error_factor: Option<f64>,
 }
 
 impl<'a> RaBitQQuery<'a> {
+    /// Whether f32 screening can avoid overflow for this query's components.
+    pub(crate) fn supports_screening(&self) -> bool {
+        self.screening_error_factor.is_some()
+    }
+
     /// Validates a rotated query and precomputes its scalar-f64 norm bounds.
     pub(crate) fn new(components: &'a [f32], metric: Metric) -> Result<Self> {
         if !(1..=MAX_DIMENSION).contains(&components.len()) {
@@ -29,27 +36,97 @@ impl<'a> RaBitQQuery<'a> {
         let mut norm_squared = 0.0_f64;
         let mut norm_squared_lower = 0.0_f64;
         let mut norm_squared_upper = 0.0_f64;
+        let mut max_component = 0.0_f64;
         for &component in components {
             if !component.is_finite() {
                 return Err(Error::invalid_argument());
             }
             let component = f64::from(component);
+            max_component = max_component.max(component.abs());
             norm_squared += component * component;
             norm_squared_lower = add_down(norm_squared_lower, multiply_down(component, component));
             norm_squared_upper = add_up(norm_squared_upper, multiply_up(component, component));
         }
+        let norm_upper = sqrt_up(norm_squared_upper);
         Ok(Self {
             components,
             metric,
             norm_squared,
             norm_squared_lower,
             norm_squared_upper,
-            dot_error_factor: multiply_up(
-                components.len() as f64 * f64::EPSILON,
-                sqrt_up(norm_squared_upper),
-            ),
+            dot_error_factor: multiply_up(components.len() as f64 * f64::EPSILON, norm_upper),
+            // Even the sum of absolute products stays below half the f32
+            // maximum. The rounding bound below leaves ample overflow margin.
+            screening_error_factor: (max_component * 63.0 * components.len() as f64
+                <= f64::from(f32::MAX) / 2.0)
+                .then(|| {
+                    multiply_up(
+                        add_up(
+                            (components.len() + 2) as f64 * f64::from(f32::EPSILON),
+                            components.len() as f64 * f64::EPSILON,
+                        ),
+                        norm_upper,
+                    )
+                }),
         })
     }
+}
+
+/// Bounds the reference f64 rough score using a cheaper four-part f32 dot.
+///
+/// These bounds concern rounding of the quantized dot, not reconstruction
+/// error against the original vector. They may only screen a candidate when
+/// its lower bound strictly exceeds an already-full heap's worst rough score.
+pub(super) fn rough_lower_bounds<const N: usize>(
+    codes: [&DecodedRaBitQ7<&[i8]>; N],
+    query: &RaBitQQuery<'_>,
+) -> Result<[f64; N]> {
+    if codes
+        .iter()
+        .any(|code| code.codes.len() != query.components.len())
+    {
+        return Err(Error::invalid_argument());
+    }
+    let Some(error_factor) = query.screening_error_factor else {
+        return Ok([f64::NEG_INFINITY; N]);
+    };
+    let mut chunks = codes.map(|code| code.codes.as_chunks::<4>().0.iter());
+    let mut sums = [[0.0_f32; 4]; N];
+    for components in query.components.as_chunks::<4>().0 {
+        for lane in 0..N {
+            let chunk = chunks[lane].next().expect("validated matching dimensions");
+            for component in 0..4 {
+                sums[lane][component] += components[component] * f32::from(chunk[component]);
+            }
+        }
+    }
+    for index in query.components.len() / 4 * 4..query.components.len() {
+        for lane in 0..N {
+            sums[lane][index % 4] += query.components[index] * f32::from(codes[lane].codes[index]);
+        }
+    }
+    Ok(std::array::from_fn(|lane| {
+        let sum = (sums[lane][0] + sums[lane][1]) + (sums[lane][2] + sums[lane][3]);
+        let header = &codes[lane].header;
+        let scale = f64::from(header.scale);
+        let dot = f64::from(sum) * scale;
+        // Products, partial sums and the balanced reduction have at most n+2
+        // rounded f32 operations per term. gamma_(n+2) <= (n+2)*EPSILON.
+        // Subnormal products/sums are exact multiples of the f32 quantum;
+        // overflow is excluded when preparing the query. Scaling two f32
+        // numbers in f64 is exact. Add the reference dot's f64 error bound.
+        let norm = multiply_up(scale, sqrt_up(f64::from(header.code_norm_squared)));
+        let dot_upper = add_up(dot, multiply_up(error_factor, norm));
+        match query.metric {
+            Metric::InnerProduct => -dot_upper,
+            Metric::Cosine => add_down(1.0, -dot_upper),
+            Metric::L2 => {
+                // Use the same rounded constant term as the reference scorer.
+                let base = query.norm_squared + scale * scale * f64::from(header.code_norm_squared);
+                add_down(base, -multiply_up(2.0, dot_upper)).max(0.0)
+            }
+        }
+    }))
 }
 
 impl fmt::Debug for RaBitQQuery<'_> {

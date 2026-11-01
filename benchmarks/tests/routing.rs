@@ -112,7 +112,7 @@ fn all_routes_share_layout_and_keep_diagnostics_out_of_measurement() {
             }
             let values: Vec<f64> = [
                 "true_neighbor_leaf_coverage",
-                "local_candidate_coverage",
+                "global_candidate_coverage",
                 "rerank_candidate_coverage",
                 "final_recall",
             ]

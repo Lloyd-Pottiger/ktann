@@ -202,8 +202,7 @@ impl<B: Backend> Index<B> {
     /// bodies are served by the Runtime's snapshot-validated Partition Cache.
     ///
     /// The outcome reports ordered exact-distance hits, actual budget usage,
-    /// every budget dimension that prevented eligible work, and per-leaf
-    /// RaBitQ overlap truncation. Success may return fewer than `k` hits and
+    /// and every budget dimension that prevented eligible work. Success may return fewer than `k` hits and
     /// deliberately makes no exact-global-top-k, completeness, continuation,
     /// or monotonic-across-budgets guarantee: resubmitting the same request
     /// with larger caller-controlled traversal budgets asks for more work

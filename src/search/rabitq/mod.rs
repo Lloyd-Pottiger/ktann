@@ -1,14 +1,13 @@
-//! Canonical RaBitQ7 encoding and bounded candidate selection.
+//! Canonical RaBitQ7 encoding, approximate scores, and conservative bounds.
 //!
 //! This module is the single seam for the persistent seven-bit code, scalar
-//! f64 approximate distances, conservative intervals, and deterministic
-//! overlap selection. Callers do not need to know the bit layout or the
+//! f64 approximate distances, conservative intervals, and f32 screening bounds.
+//! Callers do not need to know the bit layout or the
 //! directed-rounding rules that keep its intervals conservative.
 
 mod codec;
 mod interval;
 mod rounding;
-mod selection;
 
 #[cfg(test)]
 mod tests;
@@ -20,7 +19,6 @@ use bytes::Bytes;
 use crate::api::Result;
 
 pub(crate) use interval::RaBitQQuery;
-pub(crate) use selection::ApproximateCandidate;
 
 /// One borrowed canonical absolute RaBitQ7 payload.
 pub(crate) struct RaBitQ7<'a> {
@@ -77,6 +75,14 @@ impl DecodedRaBitQ7<std::ops::Range<usize>> {
 }
 
 impl DecodedRaBitQ7<&[i8]> {
+    /// Conservatively screens against the unchanged f64 rough ranking.
+    pub(crate) fn rough_lower_bounds<const N: usize>(
+        codes: [&Self; N],
+        query: &RaBitQQuery<'_>,
+    ) -> Result<[f64; N]> {
+        interval::rough_lower_bounds(codes, query)
+    }
+
     /// Scores independent lanes with the scalar accumulation order in each lane.
     pub(crate) fn approximate_distances<const N: usize>(
         codes: [&Self; N],

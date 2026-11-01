@@ -1,24 +1,17 @@
-//! Exact Leaf Entry filtering and bounded Vector Record reranking.
+//! Exact Vector Record reranking for globally selected Leaf Entries.
 //!
 //! Only SQL TRUE entries qualify. Record loads use one snapshot and verify
 //! authoritative ownership and filter fields. Exact f64 distances use original,
 //! unrotated vectors; ties use unsigned lexicographic Record ID order.
 
 use bytes::Bytes;
-use std::sync::Arc;
 
-use super::cache::CachedLeafEntry;
-
-use crate::api::{Error, ErrorKind, Result, SearchHit, Value};
+use crate::api::{Error, ErrorKind, Result, SearchHit};
 use crate::storage::ReadLogicalTxn;
 use crate::storage::backend::ReadOps;
-use crate::storage::values::RecordLocation;
 
+use super::candidates::LeafCandidate;
 use super::numeric::{ExactDistance, VectorKernel, compare_finite};
-use super::predicate::CompiledPredicate;
-use super::rabitq::ApproximateCandidate;
-#[cfg(test)]
-use super::rabitq::ApproximateDistance;
 
 /// The number of Vector Records loaded per backend batch.
 ///
@@ -27,83 +20,13 @@ use super::rabitq::ApproximateDistance;
 /// ceilings — and bounds the number of decoded records held in flight.
 const RECORD_LOAD_BATCH: usize = 256;
 
-/// One leaf candidate admitted for exact filtering and reranking.
+/// Exact hits and the number of authoritative Vector Records read.
 ///
-/// Traversal constructs candidates from Leaf Entries: the Record ID, the exact
-/// typed filter projection, the rough distance with its conservative interval,
-/// and the source location the authoritative Record Location must match.
-pub(crate) type LeafCandidate = ApproximateCandidate<LeafProjection>;
-
-/// Snapshot projections shared only by candidates still eligible for reranking.
-pub(crate) struct CandidateLeaf {
-    pub(crate) entries: Arc<[CachedLeafEntry]>,
-    pub(crate) location: RecordLocation,
-    pub(crate) bytes: usize,
-}
-
-/// A reference to a snapshot projection; fields are never copied during search.
-pub(crate) enum LeafProjection {
-    Shared {
-        source: Arc<CandidateLeaf>,
-        entry: usize,
-    },
-    #[cfg(test)]
-    Owned {
-        fields: Box<[Value]>,
-        location: RecordLocation,
-    },
-}
-
-impl LeafCandidate {
-    /// Constructs a standalone projection for rerank contract tests.
-    #[cfg(test)]
-    pub(crate) fn from_leaf(
-        record_id: Bytes,
-        fields: Box<[Value]>,
-        distance: ApproximateDistance,
-        location: RecordLocation,
-    ) -> Self {
-        Self::new(
-            record_id,
-            distance,
-            LeafProjection::Owned { fields, location },
-        )
-    }
-
-    /// Returns the original exact typed projection without copying it.
-    pub(crate) fn fields(&self) -> &[Value] {
-        match self.value() {
-            LeafProjection::Shared { source, entry } => source.entries[*entry].fields(),
-            #[cfg(test)]
-            LeafProjection::Owned { fields, .. } => fields,
-        }
-    }
-
-    /// Returns the source location checked against authoritative membership.
-    pub(crate) fn location(&self) -> &RecordLocation {
-        match self.value() {
-            LeafProjection::Shared { source, .. } => &source.location,
-            #[cfg(test)]
-            LeafProjection::Owned { location, .. } => location,
-        }
-    }
-}
-
-impl std::fmt::Debug for LeafCandidate {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("LeafCandidate([REDACTED])")
-    }
-}
-
-/// The exact-rerank stage's hits and its owned Search Budget accounting.
-///
-/// The traversal/search integration folds the usage counter into
-/// `SearchBudgetUsage::exact_rerank_candidates` and the exhaustion flag into
-/// `SearchBudgetExhaustion::exact_rerank_candidates`.
+/// Global candidate admission owns the rerank budget; this stage reports the
+/// actual reads through `SearchBudgetUsage::exact_rerank_candidates`.
 pub(crate) struct ExactRerankOutcome {
     hits: Vec<SearchHit>,
     exact_rerank_candidates: u32,
-    exact_rerank_budget_exhausted: bool,
 }
 
 impl ExactRerankOutcome {
@@ -122,43 +45,6 @@ impl ExactRerankOutcome {
     pub(crate) const fn exact_rerank_candidates(&self) -> u32 {
         self.exact_rerank_candidates
     }
-
-    /// Returns whether the depleted rerank budget prevented eligible work.
-    pub(crate) const fn exact_rerank_budget_exhausted(&self) -> bool {
-        self.exact_rerank_budget_exhausted
-    }
-}
-
-/// Applies the optional exact Filter Predicate to Leaf Candidates.
-///
-/// Every candidate is counted in `visited_leaf_entries`, including candidates
-/// admitted without evaluation when no predicate exists: each one is a Leaf
-/// Entry read and considered under the exact predicate. Only a SQL TRUE
-/// result qualifies; FALSE and UNKNOWN are rejected. Candidate order is
-/// preserved. A field projection that disagrees with the compiled schema is
-/// Corruption.
-pub(crate) fn filter_candidates<T>(
-    candidates: Vec<T>,
-    predicate: Option<&CompiledPredicate>,
-    visited_leaf_entries: &mut u64,
-    fields: impl Fn(&T) -> &[Value],
-) -> Result<Vec<T>> {
-    let considered =
-        u64::try_from(candidates.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
-    *visited_leaf_entries = visited_leaf_entries
-        .checked_add(considered)
-        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-
-    let Some(predicate) = predicate else {
-        return Ok(candidates);
-    };
-    let mut filtered = Vec::with_capacity(candidates.len());
-    for candidate in candidates {
-        if predicate.matches(fields(&candidate))? {
-            filtered.push(candidate);
-        }
-    }
-    Ok(filtered)
 }
 
 /// Loads original Vector Records and exactly reranks the selected candidates.
@@ -168,11 +54,8 @@ pub(crate) fn filter_candidates<T>(
 /// unrotated caller vector. Every load reads from `txn`'s one consistent
 /// snapshot in bounded batches.
 ///
-/// Each Vector Record is charged to the exact-rerank budget by admission: a
-/// record is loaded only while the remaining budget covers it, so no load ever
-/// starts unfunded. The budget is exhausted only when eligible pending
-/// candidates were actually prevented from loading; natural completion exactly
-/// on the limit is not exhaustion (ADR 0011).
+/// Global candidate admission has already bounded this work by the rerank
+/// budget. Every supplied candidate is loaded exactly once.
 ///
 /// The stage fails closed. A fully absent record group, a Record ID that does
 /// not match the requested candidate, a Record Location that disagrees with
@@ -190,20 +73,16 @@ pub(crate) async fn exact_rerank<T: ReadOps>(
     query: &[f32],
     candidates: Vec<LeafCandidate>,
     k: usize,
-    remaining_rerank_budget: u32,
 ) -> Result<ExactRerankOutcome> {
     if k == 0 {
         return Err(Error::invalid_argument());
     }
 
-    let budget = usize::try_from(remaining_rerank_budget)
-        .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
-    let load_count = candidates.len().min(budget);
-    let exhausted = candidates.len() > budget;
+    let load_count = candidates.len();
     let mut scored: Vec<(Bytes, ExactDistance)> = Vec::with_capacity(load_count);
     if load_count != 0 {
         let exact_query = kernel.prepare_exact_query(query)?;
-        for batch in candidates[..load_count].chunks(RECORD_LOAD_BATCH) {
+        for batch in candidates.chunks(RECORD_LOAD_BATCH) {
             let ids = batch
                 .iter()
                 .map(|candidate| candidate.record_id().clone())
@@ -244,7 +123,6 @@ pub(crate) async fn exact_rerank<T: ReadOps>(
         hits,
         exact_rerank_candidates: u32::try_from(load_count)
             .map_err(|_| Error::new(ErrorKind::LimitExceeded))?,
-        exact_rerank_budget_exhausted: exhausted,
     })
 }
 
@@ -269,7 +147,7 @@ mod tests {
     use super::super::numeric::VectorKernel;
     use super::super::predicate::CompiledPredicate;
     use super::super::rabitq::test_approximate_distance;
-    use super::{ExactRerankOutcome, LeafCandidate, exact_rerank, filter_candidates};
+    use super::{ExactRerankOutcome, LeafCandidate, exact_rerank};
 
     const DIMENSION: usize = 3;
     const SEED: [u8; 32] = [7; 32];
@@ -425,12 +303,11 @@ mod tests {
         txn: MockReadTxn,
         candidates: Vec<LeafCandidate>,
         k: usize,
-        budget: u32,
     ) -> Result<ExactRerankOutcome> {
         let mut txn = ReadLogicalTxn::for_index(txn, manifest);
         let kernel =
             VectorKernel::new(DIMENSION, manifest.config().metric(), SEED).expect("valid kernel");
-        exact_rerank(&mut txn, &kernel, &QUERY, candidates, k, budget).await
+        exact_rerank(&mut txn, &kernel, &QUERY, candidates, k).await
     }
 
     /// The independent brute-force numeric oracle over original f32 vectors.
@@ -503,76 +380,19 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn filter_charges_every_considered_entry_and_keeps_only_sql_true() {
-        let manifest = manifest(Metric::L2);
-        let records = fixture_records(24);
-        let total = records.len() as u32;
-
-        // No predicate admits every entry but still charges each one.
-        let mut visited = 0;
-        let admitted = filter_candidates(
-            candidates(&records),
-            None,
-            &mut visited,
-            LeafCandidate::fields,
-        )
-        .expect("filter without predicate");
-        assert_eq!(visited, u64::from(total));
-        assert_eq!(admitted.len(), records.len());
-        // Filtering preserves the input order and the rough distances.
-        for (index, candidate) in admitted.iter().enumerate() {
-            assert_eq!(candidate.distance().rough(), index as f64);
-        }
-
-        // Only SQL TRUE qualifies: NULL tags are UNKNOWN and never admitted.
-        let compiled = CompiledPredicate::compile(
-            Predicate::Compare {
-                field: FieldId(1),
-                op: CompareOp::Eq,
-                value: Value::String("red".to_owned()),
-            },
-            manifest.config().fields(),
-        )
-        .expect("compile");
-        let mut visited = 7;
-        let admitted = filter_candidates(
-            candidates(&records),
-            Some(&compiled),
-            &mut visited,
-            LeafCandidate::fields,
-        )
-        .expect("filter with predicate");
-        assert_eq!(visited, u64::from(7 + total));
-        let expected: Vec<&str> = records
-            .iter()
-            .filter(|record| record.tag == Some("red"))
-            .map(|record| record.id.as_str())
-            .collect();
-        let admitted: Vec<&[u8]> = admitted
-            .iter()
-            .map(|candidate| candidate.record_id().as_ref())
-            .collect();
-        assert_eq!(
-            admitted,
-            expected.iter().map(|id| id.as_bytes()).collect::<Vec<_>>()
-        );
-    }
-
     #[tokio::test]
     async fn rerank_matches_the_brute_force_oracle_for_every_metric() {
         let records = fixture_records(24);
         for metric in [Metric::L2, Metric::InnerProduct, Metric::Cosine] {
             let manifest = manifest(metric);
             let data = record_group_data(&manifest, &records);
-            let budget = records.len() as u32;
-            let outcome = rerank(&manifest, mock_txn(data), candidates(&records), 5, budget)
+            let expected_reads = records.len() as u32;
+            let outcome = rerank(&manifest, mock_txn(data), candidates(&records), 5)
                 .await
                 .expect("rerank succeeds");
             let expected = oracle_topk(metric, &records.iter().collect::<Vec<_>>(), 5);
             assert_hits(&outcome, &expected);
-            assert_eq!(outcome.exact_rerank_candidates(), budget);
-            assert!(!outcome.exact_rerank_budget_exhausted());
+            assert_eq!(outcome.exact_rerank_candidates(), expected_reads);
         }
     }
 
@@ -620,25 +440,19 @@ mod tests {
                 let compiled =
                     CompiledPredicate::compile(predicate.clone(), manifest.config().fields())
                         .expect("compile");
-                let mut visited = 0;
-                let filtered = filter_candidates(
-                    candidates(&records),
-                    Some(&compiled),
-                    &mut visited,
-                    LeafCandidate::fields,
-                )
-                .expect("filter");
-                assert_eq!(visited, records.len() as u64);
-                let budget = filtered.len() as u32;
+                let filtered: Vec<_> = candidates(&records)
+                    .into_iter()
+                    .filter(|candidate| compiled.matches(candidate.fields()).expect("filter"))
+                    .collect();
+                let expected_reads = filtered.len() as u32;
                 let data = record_group_data(&manifest, &records);
-                let outcome = rerank(&manifest, mock_txn(data), filtered, 4, budget)
+                let outcome = rerank(&manifest, mock_txn(data), filtered, 4)
                     .await
                     .expect("rerank succeeds");
                 let qualifying: Vec<&TestRecord> = records.iter().filter(|r| oracle(r)).collect();
                 let expected = oracle_topk(metric, &qualifying, 4);
                 assert_hits(&outcome, &expected);
-                assert_eq!(outcome.exact_rerank_candidates(), budget);
-                assert!(!outcome.exact_rerank_budget_exhausted());
+                assert_eq!(outcome.exact_rerank_candidates(), expected_reads);
             }
         }
     }
@@ -732,15 +546,10 @@ mod tests {
         for (predicate, expected) in cases {
             let compiled =
                 CompiledPredicate::compile(predicate, manifest.config().fields()).expect("compile");
-            let mut visited = 0;
-            let admitted = filter_candidates(
-                candidates(&records),
-                Some(&compiled),
-                &mut visited,
-                LeafCandidate::fields,
-            )
-            .expect("filter");
-            assert_eq!(visited, records.len() as u64);
+            let admitted: Vec<_> = candidates(&records)
+                .into_iter()
+                .filter(|candidate| compiled.matches(candidate.fields()).expect("filter"))
+                .collect();
             let admitted: Vec<&[u8]> = admitted
                 .iter()
                 .map(|candidate| candidate.record_id().as_ref())
@@ -760,7 +569,6 @@ mod tests {
             &manifest,
             mock_txn(vec![]),
             vec![candidate(&records[0], 0.0)],
-            1,
             1,
         )
         .await;
@@ -785,7 +593,6 @@ mod tests {
             mock_txn(data),
             vec![candidate(&records[0], 0.0)],
             1,
-            1,
         )
         .await;
         assert_eq!(
@@ -804,7 +611,6 @@ mod tests {
             &manifest,
             mock_txn(data),
             vec![candidate(&records[1], 0.0)],
-            1,
             1,
         )
         .await;
@@ -828,7 +634,7 @@ mod tests {
             test_approximate_distance(0.0),
             RecordLocation::new(tree_key(divergent.bucket), leaf(1)),
         );
-        let outcome = rerank(&manifest, mock_txn(data), vec![candidate], 1, 1).await;
+        let outcome = rerank(&manifest, mock_txn(data), vec![candidate], 1).await;
         assert_eq!(
             outcome.err().map(|error| error.kind()),
             Some(ErrorKind::Corruption)
@@ -856,7 +662,6 @@ mod tests {
             mock_txn(data),
             vec![candidate(&records[0], 0.0)],
             1,
-            1,
         )
         .await;
         assert_eq!(
@@ -866,52 +671,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_depleted_rerank_budget_loads_a_deterministic_prefix() {
+    async fn empty_candidates_do_not_load_records() {
         let manifest = manifest(Metric::L2);
-        let records = fixture_records(24);
-        let data = record_group_data(&manifest, &records);
-        let outcome = rerank(&manifest, mock_txn(data), candidates(&records), 5, 3)
-            .await
-            .expect("rerank succeeds");
-        assert_eq!(outcome.exact_rerank_candidates(), 3);
-        assert!(outcome.exact_rerank_budget_exhausted());
-        // Only the first three candidates in rough order were loaded, and the
-        // hits are their correctly ordered exact top-k.
-        let expected = oracle_topk(Metric::L2, &records[..3].iter().collect::<Vec<_>>(), 5);
-        assert_hits(&outcome, &expected);
-    }
-
-    #[tokio::test]
-    async fn natural_completion_on_the_budget_limit_is_not_exhaustion() {
-        let manifest = manifest(Metric::L2);
-        let records = fixture_records(24);
-        let data = record_group_data(&manifest, &records);
-        let budget = records.len() as u32;
-        let outcome = rerank(&manifest, mock_txn(data), candidates(&records), 2, budget)
-            .await
-            .expect("rerank succeeds");
-        assert_eq!(outcome.exact_rerank_candidates(), budget);
-        assert!(!outcome.exact_rerank_budget_exhausted());
-    }
-
-    #[tokio::test]
-    async fn a_zero_budget_prevents_all_loads_without_error() {
-        let manifest = manifest(Metric::L2);
-        let records = fixture_records(24);
-        let data = record_group_data(&manifest, &records);
-        let outcome = rerank(&manifest, mock_txn(data), candidates(&records), 1, 0)
+        let outcome = rerank(&manifest, mock_txn(vec![]), vec![], 1)
             .await
             .expect("rerank succeeds");
         assert!(outcome.hits().is_empty());
         assert_eq!(outcome.exact_rerank_candidates(), 0);
-        assert!(outcome.exact_rerank_budget_exhausted());
-
-        // No eligible work exists, so an empty candidate set is not exhaustion.
-        let outcome = rerank(&manifest, mock_txn(vec![]), vec![], 1, 0)
-            .await
-            .expect("rerank succeeds");
-        assert!(!outcome.exact_rerank_budget_exhausted());
-        assert!(outcome.into_hits().is_empty());
     }
 
     #[tokio::test]
@@ -923,15 +689,9 @@ mod tests {
         let data = record_group_data(&manifest, &records);
         let mut txn = mock_txn(data);
         txn.max_batch_size = 2 * super::RECORD_LOAD_BATCH;
-        let outcome = rerank(
-            &manifest,
-            txn,
-            candidates(&records),
-            5,
-            records.len() as u32,
-        )
-        .await
-        .expect("batched rerank succeeds");
+        let outcome = rerank(&manifest, txn, candidates(&records), 5)
+            .await
+            .expect("batched rerank succeeds");
         let expected = oracle_topk(Metric::L2, &records.iter().collect::<Vec<_>>(), 5);
         assert_hits(&outcome, &expected);
         assert_eq!(outcome.exact_rerank_candidates(), records.len() as u32);
@@ -956,15 +716,9 @@ mod tests {
         let expected_ids: Vec<&[u8]> = [b"a".as_slice(), b"aa", b"ab", b"b"].to_vec();
         let mut previous = None;
         for _ in 0..2 {
-            let outcome = rerank(
-                &manifest,
-                mock_txn(data.clone()),
-                candidates(&records),
-                4,
-                4,
-            )
-            .await
-            .expect("rerank succeeds");
+            let outcome = rerank(&manifest, mock_txn(data.clone()), candidates(&records), 4)
+                .await
+                .expect("rerank succeeds");
             let ids: Vec<&[u8]> = outcome.hits().iter().map(|hit| hit.id().as_ref()).collect();
             assert_eq!(ids, expected_ids);
             let distances: Vec<f64> = outcome.hits().iter().map(|hit| hit.distance()).collect();
@@ -979,7 +733,7 @@ mod tests {
     #[tokio::test]
     async fn rerank_rejects_a_zero_result_limit() {
         let manifest = manifest(Metric::L2);
-        let outcome = rerank(&manifest, mock_txn(vec![]), vec![], 0, 0).await;
+        let outcome = rerank(&manifest, mock_txn(vec![]), vec![], 0).await;
         assert_eq!(
             outcome.err().map(|error| error.kind()),
             Some(ErrorKind::InvalidArgument)

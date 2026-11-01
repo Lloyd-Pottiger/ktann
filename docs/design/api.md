@@ -272,8 +272,8 @@ the rerank budget.
 Leaf Entry scans have no separate budget; all entries in an admitted leaf are
 considered. Their usage is reported with a 64-bit counter and no exhaustion flag.
 
-`SearchOutcome` contains ordered Search Hits, logical search work, an exhaustive
-set of exhausted dimensions, and `rabitq_overlap_truncated`. A hit contains only
+`SearchOutcome` contains ordered Search Hits, logical search work, and the full
+set of exhausted dimensions. A hit contains only
 Record ID and exact f64 distance. Payload and stored fields are loaded through
 get/batch_get rather than search.
 

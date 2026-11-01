@@ -11,8 +11,7 @@
 //! Request validation, query preprocessing, predicate compilation, and Tree
 //! Key planning are pure functions of the handle's immutable Manifest and run
 //! before foreground admission in [`PreparedSearch`]. The response reports the
-//! actual budget usage, every exhausted dimension, and per-leaf overlap
-//! truncation. Success deliberately makes no exact-global-top-k, completeness,
+//! actual budget usage and every exhausted dimension. Success deliberately makes no exact-global-top-k, completeness,
 //! continuation, or monotonic-across-budgets guarantee.
 
 #[cfg(feature = "benchmark")]
@@ -174,7 +173,6 @@ pub(crate) async fn search<B: Backend>(
     let visited_partitions = traversal.visited_partitions();
     let visited_leaf_entries = traversal.visited_leaf_entries();
     let partition_budget_exhausted = traversal.partition_budget_exhausted();
-    let rabitq_overlap_truncated = traversal.rabitq_overlap_truncated();
 
     // Traversal already retains global rough top-budget candidates. The final
     // bounded interval pass excludes clearly noncompetitive exact reads.
@@ -184,7 +182,7 @@ pub(crate) async fn search<B: Backend>(
         let mut diagnostics = diagnostics
             .lock()
             .map_err(|_| Error::new(ErrorKind::Other))?;
-        diagnostics.neighbors_after_local_selection = candidates
+        diagnostics.neighbors_in_global_pool = candidates
             .candidates()
             .iter()
             .filter(|candidate| diagnostics.truth.contains(candidate.record_id()))
@@ -215,14 +213,12 @@ pub(crate) async fn search<B: Backend>(
         prepared.request.vector(),
         selected,
         prepared.request.k(),
-        prepared.budgets.exact_rerank_candidates(),
     )
     .await?;
     metrics::search_stage_finished(SearchStage::ExactReranking, reranking_started.elapsed());
     context.checkpoint()?;
 
     let exact_rerank_candidates = rerank.exact_rerank_candidates();
-    let rerank_exhausted = rerank_budget_exhausted || rerank.exact_rerank_budget_exhausted();
     let outcome = SearchOutcome {
         hits: rerank.into_hits(),
         usage: SearchBudgetUsage {
@@ -234,9 +230,8 @@ pub(crate) async fn search<B: Backend>(
         exhausted: SearchBudgetExhaustion {
             scanned_tree_keys: enumeration.scanned_tree_key_budget_exhausted(),
             visited_partitions: partition_budget_exhausted,
-            exact_rerank_candidates: rerank_exhausted,
+            exact_rerank_candidates: rerank_budget_exhausted,
         },
-        rabitq_overlap_truncated,
     };
     metrics::search_budget(&outcome.usage, &outcome.exhausted);
     Ok((outcome, maintenance))

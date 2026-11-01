@@ -463,6 +463,63 @@ fn interleaved_scores_reject_a_dimension_mismatch_in_every_lane() {
             super::DecodedRaBitQ7::approximate_distances(codes.each_ref(), &query),
             ErrorKind::InvalidArgument,
         );
+        assert_kind(
+            super::DecodedRaBitQ7::rough_lower_bounds(codes.each_ref(), &query),
+            ErrorKind::InvalidArgument,
+        );
+    }
+}
+
+#[test]
+fn screening_bounds_cover_reference_scores_at_numeric_boundaries() {
+    for dimension in [1, 2, 3, 4, 7, 8, 17, 65, 768, MAX_DIMENSION] {
+        let signed: Vec<i8> = (0..dimension)
+            .map(|i| ((i * 37) % 127) as i8 - 63)
+            .collect();
+        for magnitude in [
+            0.0,
+            f32::from_bits(1),
+            f32::MIN_POSITIVE,
+            1.0,
+            1e20,
+            f32::MAX / (256.0 * dimension as f32),
+            f32::MAX,
+        ] {
+            let components: Vec<f32> = (0..dimension)
+                .map(|i| magnitude * ((i % 7) as f32 / 3.0 - 1.0))
+                .collect();
+            let mut buffer = Vec::new();
+            let decoded = [0.0, f32::from_bits(1), 1.0, f32::MAX].map(|scale| {
+                let payload = independently_encode_payload(&signed, scale, 0.0);
+                super::DecodedRaBitQ7::append_validated_leaf_bytes(&payload, dimension, &mut buffer)
+            });
+            let codes = decoded.each_ref().map(|code| code.view(&buffer));
+            for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
+                let query = RaBitQQuery::new(&components, metric).unwrap();
+                let lower =
+                    super::DecodedRaBitQ7::rough_lower_bounds(codes.each_ref(), &query).unwrap();
+                let reference =
+                    super::DecodedRaBitQ7::approximate_distances(codes.each_ref(), &query).unwrap();
+                for (lower, reference) in lower.into_iter().zip(reference) {
+                    assert!(
+                        lower <= reference.rough(),
+                        "dim={dimension}, magnitude={magnitude}, metric={metric:?}"
+                    );
+                    if magnitude == f32::MAX {
+                        assert_eq!(
+                            lower,
+                            f64::NEG_INFINITY,
+                            "overflow-prone queries refine every lane"
+                        );
+                    } else {
+                        assert!(
+                            lower.is_finite(),
+                            "ordinary queries use the screening kernel"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -540,6 +597,16 @@ proptest! {
     }
 
     #[test]
+    fn screening_bounds_cover_generated_fast_path_scores(
+        entries in prop::collection::vec((-1e20_f32..1e20_f32, -63_i8..64), 1..257),
+        scale in 0.0_f32..1e20_f32,
+    ) {
+        let (components, codes): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
+        let encoded = independently_encode_payload(&codes, scale, 0.0);
+        assert_validated_packed_parity(&encoded, &components);
+    }
+
+    #[test]
     fn aggregate_dot_intervals_cover_exact_generated_reconstructions(
         entries in prop::collection::vec((finite_f32(), -63_i8..64), 1..129)
             .prop_filter("nonzero reconstruction", |entries| entries.iter().any(|(_, c)| *c != 0)),
@@ -548,6 +615,7 @@ proptest! {
         let (components, codes): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
         let encoded = independently_encode_payload(&codes, scale, 0.0);
         assert_exact_reconstructed_dot(&encoded, &components);
+        assert_validated_packed_parity(&encoded, &components);
     }
 
 
@@ -572,6 +640,11 @@ fn assert_validated_packed_parity(encoded: &[u8], components: &[f32]) {
         let [cached] = super::DecodedRaBitQ7::approximate_distances([&expanded], &query)
             .expect("cached distance is finite");
         assert_distance_bits_equal(cached, distance);
+        let [lower] = super::DecodedRaBitQ7::rough_lower_bounds([&expanded], &query).unwrap();
+        assert!(
+            lower <= distance.rough(),
+            "screening must cover the reference rough score"
+        );
         assert_rough_bits_equal(
             distance,
             expanded_reference_rough(encoded, components, metric),

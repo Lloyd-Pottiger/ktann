@@ -271,7 +271,7 @@ struct Measurements {
     received_bytes: u64,
     sent_bytes: u64,
     budget: [u64; 4],
-    exhausted: [u64; 4],
+    exhausted: [u64; 3],
     last_search: Option<Instant>,
 }
 
@@ -286,7 +286,7 @@ impl Default for Measurements {
             received_bytes: 0,
             sent_bytes: 0,
             budget: [0; 4],
-            exhausted: [0; 4],
+            exhausted: [0; 3],
             last_search: None,
         }
     }
@@ -755,7 +755,6 @@ impl<B: Backend> Service<B> {
                     e.scanned_tree_keys,
                     e.visited_partitions,
                     e.exact_rerank_candidates,
-                    result.rabitq_overlap_truncated,
                 ]) {
                     *sum += u64::from(value);
                 }

@@ -31,17 +31,16 @@ use crate::storage::values::{
 use super::beam_width;
 use super::cache::graph::RoutingExecution;
 use super::cache::{
-    BODY_PREFETCH_BATCH, BodyEntries, BodyRequest, CachedBody, CachedLeafEntry, PartitionCache,
-    load_body, prefetch_bodies,
+    BODY_PREFETCH_BATCH, BodyEntries, BodyRequest, CachedBody, PartitionCache, load_body,
+    prefetch_bodies,
 };
-use super::candidates::LeafCandidatePool;
+use super::candidates::GlobalCandidatePool;
+#[cfg(test)]
+use super::candidates::LeafCandidate;
 use super::numeric::{VectorKernel, compare_finite};
 use super::plan::EnumeratedTree;
 use super::predicate::{CompiledPredicate, SynopsisClassification};
-use super::rabitq::{ApproximateCandidate, DecodedRaBitQ7, RaBitQQuery};
-#[cfg(test)]
-use super::rerank::LeafProjection;
-use super::rerank::filter_candidates;
+use super::rabitq::RaBitQQuery;
 use crate::api::RoutingMode;
 
 /// The default leaf-level base beam (design `search.md` section 6).
@@ -54,7 +53,7 @@ const PARTITION_METADATA_BATCH: usize = 1_024;
 ///
 /// `routing` is the validated, metric-preprocessed, rotated query vector.
 /// `trees` are the materialized eligible trees in canonical Tree Key order.
-/// `budgets` bound visited partitions and cap every per-leaf overlap selection
+/// `budgets` bound visited partitions and the global candidate pool
 /// through the exact-rerank budget. All entries in an admitted leaf are
 /// considered; their count is observational. `leaf_beam` is
 /// the leaf-level base beam; [`DEFAULT_LEAF_BEAM`] is the production default.
@@ -115,28 +114,27 @@ impl<'a> TraversalRequest<'a> {
 /// Candidates are merged across every visited leaf for global overlap
 /// selection, which owns their final rough-distance/Record-ID ordering.
 /// Reports visited-partition and Leaf Entry usage together with partition
-/// budget exhaustion and overlap truncation.
+/// budget exhaustion.
 pub(crate) struct TraversalOutcome {
-    candidates: LeafCandidatePool,
+    candidates: GlobalCandidatePool,
     /// Visited partitions worth offering to the Runtime's demand-driven Fixup
     /// queue: split or merge states and threshold-crossing `Ready` partitions.
     maintenance: Vec<(TreeKey, PartitionKey)>,
     visited_partitions: u32,
     visited_leaf_entries: u64,
     partition_budget_exhausted: bool,
-    rabitq_overlap_truncated: bool,
 }
 
 impl TraversalOutcome {
     /// Returns the merged candidate pool before global overlap selection.
     #[cfg(test)]
-    pub(crate) fn candidates(&self) -> &[ApproximateCandidate<LeafProjection>] {
+    pub(crate) fn candidates(&self) -> &[LeafCandidate] {
         self.candidates.candidates()
     }
 
     /// Consumes the outcome and returns the merged candidates.
     #[must_use]
-    pub(crate) fn into_candidates(self) -> LeafCandidatePool {
+    pub(crate) fn into_candidates(self) -> GlobalCandidatePool {
         self.candidates
     }
 
@@ -164,12 +162,6 @@ impl TraversalOutcome {
     pub(crate) const fn partition_budget_exhausted(&self) -> bool {
         self.partition_budget_exhausted
     }
-
-    /// Returns whether any per-leaf overlap cap discarded a qualifying overlap.
-    #[must_use]
-    pub(crate) const fn rabitq_overlap_truncated(&self) -> bool {
-        self.rabitq_overlap_truncated
-    }
 }
 
 impl fmt::Debug for TraversalOutcome {
@@ -184,14 +176,13 @@ impl fmt::Debug for TraversalOutcome {
                 "partition_budget_exhausted",
                 &self.partition_budget_exhausted,
             )
-            .field("rabitq_overlap_truncated", &self.rabitq_overlap_truncated)
             .finish()
     }
 }
 
 /// Traverses every requested tree under one consistent snapshot.
 ///
-/// Returns the merged per-leaf candidate selections and the traversal-owned
+/// Returns the global candidate pool and the traversal-owned
 /// budget accounting. Partition bodies come from the snapshot-validated
 /// `cache`: a hit serves the decoded body without backend reads, and a miss
 /// scans, validates, and publishes the body from `txn`'s snapshot. The result
@@ -230,11 +221,15 @@ pub(crate) async fn traverse<T: ReadOps>(
         cache,
         kernel,
         query: &query,
-        rerank_cap: usize::try_from(request.budgets.exact_rerank_candidates())
-            .map_err(|_| Error::new(ErrorKind::LimitExceeded))?,
         request,
     };
-    let mut state = Traversal::seed(context.request.trees)?;
+    let capacity = usize::try_from(context.request.budgets.exact_rerank_candidates())
+        .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
+    let mut state = Traversal::seed(
+        context.request.trees,
+        capacity,
+        manifest.config().local_graph().is_some(),
+    )?;
     state.run(txn, &context).await?;
     state.finish()
 }
@@ -247,8 +242,6 @@ struct VisitContext<'a, R> {
     cache: &'a PartitionCache,
     kernel: &'a VectorKernel,
     query: &'a RaBitQQuery<'a>,
-    /// The exact-rerank budget converted for the per-leaf overlap caps.
-    rerank_cap: usize,
     request: TraversalRequest<'a>,
 }
 
@@ -310,29 +303,27 @@ struct Traversal {
     /// targets, and discovered Child Entries. A second reference to one body is
     /// Corruption.
     referenced: HashSet<(u32, PartitionKey)>,
-    candidates: LeafCandidatePool,
+    candidates: GlobalCandidatePool,
     /// Visited partitions worth offering to the Runtime's demand-driven Fixup
     /// queue: split or merge states and threshold-crossing `Ready` partitions.
     maintenance: Vec<(TreeKey, PartitionKey)>,
     visited_partitions: u32,
     visited_leaf_entries: u64,
     partition_budget_exhausted: bool,
-    rabitq_overlap_truncated: bool,
 }
 
 impl Traversal {
     /// Seeds the frontier with every eligible tree's root.
-    fn seed(trees: &[EnumeratedTree]) -> Result<Self> {
+    fn seed(trees: &[EnumeratedTree], capacity: usize, account_memory: bool) -> Result<Self> {
         let mut state = Self {
             frontier: BinaryHeap::new(),
             next_frontier: HashMap::new(),
             referenced: HashSet::new(),
-            candidates: LeafCandidatePool::default(),
+            candidates: GlobalCandidatePool::new(capacity, account_memory),
             maintenance: Vec::new(),
             visited_partitions: 0,
             visited_leaf_entries: 0,
             partition_budget_exhausted: false,
-            rabitq_overlap_truncated: false,
         };
         for (ordinal, tree) in trees.iter().enumerate() {
             let ordinal =
@@ -910,31 +901,28 @@ impl Traversal {
                 .filter(|entry| diagnostics.truth.contains(entry.record_id()))
                 .count();
         }
-        // Predicate filtering preserves each entry's original array ordinal.
-        let filtered;
-        let pool = if let Some(predicate) = predicate {
-            filtered = filter_candidates(
-                entries.iter().enumerate().collect(),
-                Some(predicate),
-                &mut self.visited_leaf_entries,
-                |(_, entry)| entry.fields(),
-            )?;
-            score_leaf_entries(filtered.len(), |i| filtered[i], codes, context.query)?
+        self.visited_leaf_entries = self
+            .visited_leaf_entries
+            .checked_add(entries.len() as u64)
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+        // Filtering retains only original ordinals; the pool owns all scoring.
+        let eligible = if let Some(predicate) = predicate {
+            let mut ordinals = Vec::new();
+            for (ordinal, entry) in entries.iter().enumerate() {
+                if predicate.matches(entry.fields())? {
+                    ordinals.push(ordinal);
+                }
+            }
+            Some(ordinals)
         } else {
-            let batch =
-                score_leaf_entries(entries.len(), |i| (i, &entries[i]), codes, context.query)?;
-            self.visited_leaf_entries = self
-                .visited_leaf_entries
-                .checked_add(entries.len() as u64)
-                .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-            batch
+            None
         };
         self.candidates.push_leaf(
             entries,
+            codes,
             RecordLocation::new(tree_key.clone(), partition),
-            pool,
-            context.rerank_cap,
-            context.manifest.config().local_graph().is_some(),
+            context.query,
+            eligible.as_deref(),
         )?;
         Ok(())
     }
@@ -971,47 +959,8 @@ impl Traversal {
             visited_partitions: self.visited_partitions,
             visited_leaf_entries: self.visited_leaf_entries,
             partition_budget_exhausted: self.partition_budget_exhausted,
-            rabitq_overlap_truncated: self.rabitq_overlap_truncated,
         })
     }
-}
-
-/// Scores a body slice or references to its exact predicate matches.
-///
-/// Both inputs use the same four-entry slices and scalar tail, preserving each
-/// score's accumulation order without copying the unfiltered body's references.
-fn score_leaf_entries<'a>(
-    len: usize,
-    entry_at: impl Fn(usize) -> (usize, &'a CachedLeafEntry),
-    components: &[i8],
-    query: &RaBitQQuery<'_>,
-) -> Result<Vec<ApproximateCandidate<usize>>> {
-    let mut batch = Vec::with_capacity(len);
-    let full = len / 4 * 4;
-    for start in (0..full).step_by(4) {
-        let entries: [_; 4] = std::array::from_fn(|lane| entry_at(start + lane));
-        let codes: [_; 4] = std::array::from_fn(|lane| entries[lane].1.code(components));
-        let distances = DecodedRaBitQ7::approximate_distances(codes.each_ref(), query)
-            .map_err(|_| Error::new(ErrorKind::Corruption))?;
-        for ((ordinal, entry), distance) in entries.into_iter().zip(distances) {
-            batch.push(ApproximateCandidate::new(
-                entry.record_id().clone(),
-                distance,
-                ordinal,
-            ));
-        }
-    }
-    for i in full..len {
-        let (ordinal, entry) = entry_at(i);
-        let [distance] = DecodedRaBitQ7::approximate_distances([&entry.code(components)], query)
-            .map_err(|_| Error::new(ErrorKind::Corruption))?;
-        batch.push(ApproximateCandidate::new(
-            entry.record_id().clone(),
-            distance,
-            ordinal,
-        ));
-    }
-    Ok(batch)
 }
 
 /// Keeps metrics cardinality bounded even for unusually deep valid trees.
@@ -1032,7 +981,7 @@ fn routing_level_label(level: u32) -> &'static str {
 mod tests {
     #[test]
     fn bounded_merge_matches_full_exposure_without_full_beam_allocation() {
-        let mut state = super::Traversal::seed(&[]).unwrap();
+        let mut state = super::Traversal::seed(&[], 0, false).unwrap();
         // A very wide request over many tiny trees must grow with actual entries.
         for tree in 0..4096 {
             state.merge_child(tree, 1, pk(1), 0.0, 16_384).unwrap();
@@ -1053,7 +1002,7 @@ mod tests {
         );
 
         for width in [1, 4, 17, 128] {
-            let mut state = super::Traversal::seed(&[]).unwrap();
+            let mut state = super::Traversal::seed(&[], 0, false).unwrap();
             let mut all = Vec::new();
             // Deliberately interleave parents and ties; the independent oracle
             // materializes every candidate and sorts once after full exposure.
@@ -1464,7 +1413,6 @@ mod tests {
                 assert_eq!(outcome.visited_partitions(), 3);
                 assert_eq!(outcome.visited_leaf_entries(), 2);
                 assert!(!outcome.partition_budget_exhausted());
-                assert!(!outcome.rabitq_overlap_truncated());
             }
         }
     }
@@ -1650,7 +1598,6 @@ mod tests {
         assert_eq!(outcome.visited_partitions(), 1);
         assert_eq!(outcome.visited_leaf_entries(), 0);
         assert!(!outcome.partition_budget_exhausted());
-        assert!(!outcome.rabitq_overlap_truncated());
         assert!(outcome.into_candidates().candidates().is_empty());
     }
 
@@ -1724,8 +1671,7 @@ mod tests {
         .await
         .expect("traverse");
         assert_eq!(candidate_ids(&outcome), vec![b"a".as_slice()]);
-        assert!(!outcome.rabitq_overlap_truncated());
-        assert!(outcome.candidates.truncated());
+        assert!(outcome.into_candidates().select(1).unwrap().1);
     }
 
     #[tokio::test]
@@ -2117,9 +2063,8 @@ mod tests {
         .await
         .expect("traverse");
         assert_eq!(candidate_ids(&outcome), vec![b"a".as_slice()]);
-        assert!(!outcome.rabitq_overlap_truncated());
-        assert!(outcome.candidates.truncated());
         assert_eq!(outcome.visited_leaf_entries(), 3);
+        assert!(outcome.into_candidates().select(1).unwrap().1);
     }
 
     #[tokio::test]

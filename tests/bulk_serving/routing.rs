@@ -161,10 +161,6 @@ async fn public_modes_metrics_filters_ties_and_cache_turnover() {
                             assert_eq!(signature(&cold), signature(&warm));
                             assert_eq!(cold.usage, warm.usage);
                             assert_eq!(cold.exhausted, warm.exhausted);
-                            assert_eq!(
-                                cold.rabitq_overlap_truncated,
-                                warm.rabitq_overlap_truncated
-                            );
                             // Wide local beams enumerate every child in this fixture.
                             // This is a deterministic exhaustive case, not an ANN recall assertion.
                             if beam == 128 {

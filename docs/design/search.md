@@ -107,6 +107,44 @@ clamped to zero. Cosine is not clamped. A future optimized kernel is permitted
 only after its proven rounding bound is added to `B`; tests alone are not a
 substitute for that bound.
 
+### 3.1 Screening against the global rough-distance heap
+
+Once the global candidate heap is full, leaf scoring first bounds the existing
+f64 rough score using a four-part f32 dot product. A candidate is screened only
+when its lower bound is strictly greater than the heap's worst rough score.
+Ties and overlapping bounds receive the unchanged f64 score and conservative
+original-vector interval. A leaf may use the cutoff observed before its scan:
+the worst retained score can only decrease as candidates arrive, so this older
+cutoff only performs extra refinement. A partially filled heap screens nothing.
+Every predicate-eligible Record ID, including screened IDs, still enters duplicate
+membership validation and routing-memory accounting. Screening sets the same
+rerank-exhaustion flag as ordinary rough-heap rejection. No visited partition,
+entry count, candidate coverage, or persistent format changes.
+
+The screening bound concerns error between two computations of the *quantized*
+dot, not reconstruction error against the original vector. With dimension `n`,
+f32 unit roundoff `u32=2^-24`, each term encounters one product rounding, at most
+`ceil(n/4)-1` partial-sum additions, and two balanced-reduction additions. The
+conservative count `n+2` also covers all tails and small dimensions. Thus
+`gamma_(n+2) <= (n+2)*2^-23` for `n<=16384`. Subnormal f32 products of an f32
+component and an integer code, and subnormal sums of f32 operands, are exact
+multiples of `2^-149`; these operations have no additional underflow error.
+The query enables screening only when `max(abs(q_i))*63*n <= f32::MAX/2`, which
+bounds all intermediate absolute sums away from overflow even after rounding.
+Otherwise every lower bound is negative infinity and the original scorer handles
+the query. Multiplying the final f32 sum by the f32 scale in f64 is exact.
+
+Add the reference scorer's `n*2^-52` error factor to `(n+2)*2^-23`, then multiply
+upward by upper bounds on `norm(q)` and `scale*sqrt(code_norm_squared)`.
+Cauchy–Schwarz therefore bounds the difference between the screened scaled dot
+and the reference scaled dot. Adding this error outward gives an upper bound
+`U` on the reference dot. Rough-distance lower bounds are `-U` for inner product
+and downward-rounded `1-U` for cosine. For L2, compute the same rounded constant
+`C = norm_squared + scale*scale*code_norm_squared` as the reference scorer and
+use `max(0, subtract_down(C, multiply_up(2,U)))`. Monotonicity of round-to-nearest
+ensures these outward endpoints also bound the reference's final rounded rough
+score. No changed rounding order is used for admitted candidates.
+
 ## 4. Tree Key enumeration
 
 [Filtering](filtering.md#4-conservative-tree-key-planning) derives conservative
@@ -158,7 +196,7 @@ for duplicate incoming references, including children omitted by local search. T
 consuming the next level's beam before other admitted parents contribute their
 children. Eligible trees advance fairly. Ties use Tree Key, Partition Key,
 then Record ID.
-Partition, rerank, and optional RaBitQ-overlap bounds are charged
+Partition and rerank bounds are charged
 before corresponding work. No speculative read-ahead occurs beyond a budget.
 
 ### 6.2 Bounded IO and prefetching
@@ -183,14 +221,14 @@ This bounds temporary prefetching independently of complete partition size.
 ### 6.3 Candidate selection
 
 Every predicate-eligible entry of every visited leaf is scored. One global max
-heap retains at most the remaining exact-rerank budget, ordered by rough distance
+heap owns the exact-rerank capacity and retains at most that many entries, ordered by rough distance
 and then unsigned Record ID bytes. There is no per-leaf quota. Before reranking, the retained pool's kth-smallest
 upper endpoint excludes candidates whose lower endpoint is greater; with fewer
 than k candidates no interval exclusion is applied. This bounded final pass avoids
 loading clearly noncompetitive vectors, especially for small or selective queries.
-Rejected or evicted heap candidates set exact-rerank budget exhaustion;
-`rabitq_overlap_truncated` remains false. This is an approximate ranking policy:
-fixed-capacity retention does not guarantee exact top-k recall.
+Rejected or evicted heap candidates set exact-rerank budget exhaustion. This is an approximate ranking policy:
+fixed-capacity retention does not guarantee exact top-k recall. The exact-rerank
+stage loads every admitted candidate; it does not apply a second capacity limit.
 
 Only admitted candidates acquire a shared reference to the leaf's immutable entry
 array and their original entry ordinal. Filter fields are never copied. The final
@@ -199,8 +237,10 @@ Location against authoritative records from the same snapshot. Expanded RaBitQ
 codes are not retained by candidate references. Eviction immediately releases a
 source array when its last candidate leaves the heap.
 
-Scored Record IDs move into a separate compact list, including rejected and evicted
-candidates. Only admitted heap candidates require an additional ID reference.
+The pool scores eligible entries in fixed-size batches and admits them directly,
+without per-leaf candidate or screened-ID buffers. Every eligible Record ID is
+registered once in a separate compact list, including screened, rejected, and
+evicted entries. Only admitted heap candidates require an additional ID reference.
 After traversal, one borrowed-ID set is reserved from the actual list length to
 validate duplicate membership before exact reads. Both the list and set are
 released immediately after successful validation. Thus candidate count and projection ownership are bounded by the rerank
@@ -235,7 +275,7 @@ Leaf Entry usage is a 64-bit counter, not an exhaustion dimension.
 SearchOptions overrides nonzero bounds for Tree Keys and partitions within
 hard caps, plus the leaf-level base beam width. Exact-rerank
 sizing is owned by search: checked arithmetic computes
-`max(64,k+ceil(k/4))`, matching the leaf rough-set floor, and bounds it by the
+`max(64,k+ceil(k/4))` and bounds it by the
 Runtime's exact-rerank ceiling. Defaults are process-local and benchmark-tunable.
 One successful response reports usage and each dimension that prevented
 pending work.
@@ -340,7 +380,7 @@ visits; each visited child body consumes its ordinary visit.
 - Predicate properties compare compiled evaluation and synopsis truth sets with
   a simple SQL three-valued oracle over boundary values and NULLs.
 - Deterministic tests cover Tree Key range widening, scan budgets, traversal
-  ordering, every exhaustion dimension, overlap truncation, and intermediate
+  ordering, every exhaustion dimension, and intermediate
   topology traversal.
 - Cache histories prove snapshot epoch validation and safe concurrent fills
   without asserting a particular eviction algorithm.

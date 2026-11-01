@@ -596,11 +596,6 @@ fn compare_lifecycle_search(
             baseline.truncation.exact_rerank_candidates,
             candidate.truncation.exact_rerank_candidates,
         ),
-        (
-            "RaBitQ overlap",
-            baseline.truncation.rabitq_overlap,
-            candidate.truncation.rabitq_overlap,
-        ),
     ] {
         relative_regression(
             result,

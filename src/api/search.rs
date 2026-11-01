@@ -391,6 +391,4 @@ pub struct SearchOutcome {
     pub usage: SearchBudgetUsage,
     /// Every Search Budget dimension that prevented eligible work.
     pub exhausted: SearchBudgetExhaustion,
-    /// Whether a per-leaf RaBitQ overlap cap discarded a qualifying overlap.
-    pub rabitq_overlap_truncated: bool,
 }

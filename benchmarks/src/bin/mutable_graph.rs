@@ -191,7 +191,7 @@ async fn quality<B: Backend>(
         let n = expected.len() as f64;
         diagnostic_coverage.push(json!({
             "true_neighbor_leaf_coverage": diagnostic.neighbors_in_leaves as f64/n,
-            "after_local_selection_coverage": diagnostic.neighbors_after_local_selection as f64/n,
+            "global_candidate_coverage": diagnostic.neighbors_in_global_pool as f64/n,
             "reranked_coverage": diagnostic.neighbors_reranked as f64/n,
             "leaves_scanned": diagnostic.leaves.len(),
         }));

@@ -85,7 +85,7 @@ pub struct SearchDiagnostics {
     /// True neighbors present in scanned leaf bodies before RaBitQ selection.
     pub neighbors_in_leaves: usize,
     /// True neighbors retained in the global bounded rough-distance pool.
-    pub neighbors_after_local_selection: usize,
+    pub neighbors_in_global_pool: usize,
     /// True neighbors admitted to exact reranking.
     pub neighbors_reranked: usize,
     /// Actual scanned leaf identities for truth-neighbor coverage diagnostics.
@@ -97,7 +97,7 @@ impl SearchDiagnostics {
         Self {
             truth: truth.into_iter().collect(),
             neighbors_in_leaves: 0,
-            neighbors_after_local_selection: 0,
+            neighbors_in_global_pool: 0,
             neighbors_reranked: 0,
             leaves: Vec::new(),
         }

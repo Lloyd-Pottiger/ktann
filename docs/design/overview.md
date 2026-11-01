@@ -152,7 +152,7 @@ selects a bounded candidate set; original vectors are loaded and reranked with
 f64 exact distance. Hits sort by `(distance, RecordId)`.
 
 Success may contain fewer than `k` hits. The response reports actual budget
-usage, every exhausted budget dimension, and RaBitQ overlap truncation. It does
+usage and every exhausted budget dimension. It does
 not claim completeness, expose a quality score, or provide continuation state;
 callers may retry the same request with larger caller-controlled traversal
 budgets or a wider beam. Exact-rerank sizing remains engine-owned for `k`.
