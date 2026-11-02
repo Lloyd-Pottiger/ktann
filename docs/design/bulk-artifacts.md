@@ -24,7 +24,14 @@ serving lifecycle and exact-membership contracts are unchanged.
    the ordinary metric-correct assignment algorithm. Zero rounds refreshes leaf
    and bottom-up internal centroids; omission preserves construction output.
    Refinement semantics participate in the forest binding. The reader validates
-   allocation, occupancy, levels, tree closure, and counts.
+   allocation, occupancy, levels, tree closure, and counts. Construction takes all
+   four capacities from the Input Snapshot configuration. Leaf and internal
+   grouping use their respective bounds; roots retain the minimum-occupancy
+   exception. Changing only internal bounds preserves leaf membership, IDs, and
+   centroid bits across resident and spilled paths. Working-memory admission
+   accounts for the larger maximum capacity. `ForestOptions` supplies sampling,
+   refinement, and resource budgets; standalone `construct_tree` likewise takes
+   capacities from `IndexConfig` and sampling/resources from `ConstructionOptions`.
 4. `ServingArtifact::build` uses bounded external joins to prove exact source/leaf
    membership and parent/child relationships. Core storage codecs encode records,
    locations, payloads, trees, partition metadata, entries, and synopses. Output
@@ -34,17 +41,7 @@ serving lifecycle and exact-membership contracts are unchanged.
    before sealing and no serving projection changes afterward. It excludes
    the Index Manifest, name directory, and allocator. Its binding includes the
    exact target Index Manifest and source and forest identities. Build budgets and
-   adapter limits do not affect content identity. Forest partition bounds come
-   from the source configuration; `ForestOptions` supplies the training
-   sample size, refinement semantics, and resource budgets. Standalone `construct_tree` also takes an
-   `IndexConfig`; `ConstructionOptions` carries only sampling and resources.
-   Leaf grouping and leaf-root fit use leaf
-   bounds; all higher grouping levels and internal-root fit use internal bounds.
-   Non-root occupancy checks select the same pair; roots retain the minimum
-   exception. Changing only internal bounds preserves leaf membership, IDs and
-   centroid bits, including across resident and spilled construction paths.
-   Memory admission reserves for the larger of the two maxima; larger internal
-   capacities may therefore require a larger working-memory budget.
+   adapter limits do not affect content identity.
 
 A sealed forest can reopen with the retained source manifest, configuration,
 seed, sample size, and refinement semantics; serving data can reopen with the retained source and forest

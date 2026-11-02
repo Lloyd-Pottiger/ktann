@@ -19,13 +19,9 @@ L2, negated dot product for inner product, and negated dot product for cosine.
 Cosine records are normalized during preprocessing and cosine split centroids
 are normalized after their arithmetic mean is trained; a zero centroid remains
 zero and uses a neutral distance of zero. Distance ties resolve to the smaller
-Partition Key. Routing distances use eight independent f64 sums for component
-indices modulo eight, followed by a fixed balanced pairwise reduction. Batched
-routing reuses the same single-distance kernel, shortening the dependency chain
-without multiplying the live accumulators or adding heap allocations. Vectors
-shorter than one eight-component block use direct scalar sums, interleaved for
-batch calls. Exact reranking keeps its separate kernel:
-it reads the unrotated original vector, accumulates in f64, and defines:
+Partition Key. Scalar and batched routing share the deterministic f64 reduction in
+[`VectorKernel`](../../src/search/numeric.rs). Exact reranking uses a separate
+kernel over the unrotated original vector, accumulates in f64, and defines:
 
 - L2 ranking: squared distance `sum((q_i - x_i)^2)`, with public SearchHit
   returning its Euclidean square root;
@@ -34,7 +30,7 @@ it reads the unrotated original vector, accumulates in f64, and defines:
 
 Any non-finite result derived from caller input is `InvalidArgument`. Non-finite
 or inconsistent decoded persistent numeric state is Corruption. Exact hits sort
-by distance and then unsigned lexicographic Record ID bytes.
+by the ranking value above, then unsigned lexicographic Record ID bytes.
 
 ## 2. Absolute RaBitQ7 format
 
@@ -154,10 +150,11 @@ One consistent snapshot performs:
 6. original Vector Record batch loading and exact reranking;
 7. deterministic top-k ordering and budget report construction.
 
-Every Leaf Entry in an admitted partition is considered and counted. Exact leaf
-filtering precedes RaBitQ scoring, so rejected entries consume no scoring work.
-The complete loaded body is still decoded and validated before filtering;
-predicate rejection cannot hide malformed persistent entries.
+A leaf whose Synopsis proves `NoMatch` consumes a partition visit but loads no
+body and counts no Leaf Entries. Otherwise the complete loaded body is decoded
+and validated, and every Leaf Entry is counted before exact predicate filtering
+and RaBitQ scoring. Rejected entries consume no scoring work; predicate rejection
+cannot hide malformed entries in a loaded body.
 
 Traversal is a level-scaled beam. The leaf-level base beam defaults to 128 and
 SearchOptions may override it per request within the hard cap; moving one
@@ -247,7 +244,7 @@ Corruption rather than silently deduplicated.
 ## 7. Search budgets and response
 
 Leaf Entry scans have no independent cap. Beam and the partition budget limit
-which partitions are admitted; actual partition sizes determine scan work.
+which partitions are admitted; non-pruned partition sizes determine scan work.
 Leaf Entry usage is a 64-bit counter, not an exhaustion dimension.
 
 SearchOptions overrides nonzero bounds for Tree Keys and partitions within
@@ -281,16 +278,11 @@ Every entry contains Header cache epoch. Search reads the Header from its own
 snapshot and may reuse cached data only when epoch and kind match; otherwise it
 loads and decodes the partition from that snapshot.
 
-Leaf bodies expand validated RaBitQ7 components to signed bytes once on load.
-Each leaf body owns one contiguous expanded-component buffer, and its entries
-retain numeric headers and ranges into that buffer instead of packed payloads.
-Initial reservation is capped at one scan page; larger bodies grow as validated
-entries arrive. Storage validation and the subsequent expansion remain separate
-passes, and complete body counts are checked before publication. Cached Record
-IDs own their bytes so they cannot keep the old encoded buffer alive. Cache
-accounting charges the shared expanded allocation once at the body owner, in
-addition to entry-owned data and the body envelope. Scoring uses the integer query/code dot and conservative intervals described
-above; the persistent RaBitQ7 format is unchanged.
+Leaf bodies retain validated RaBitQ7 components expanded to signed bytes and
+numeric headers. Complete body counts are validated before cache publication.
+Cached Record IDs own their bytes; cache accounting charges shared allocations
+once at their body owner, in addition to entry-owned data and the body envelope.
+Scoring uses the integer dot and conservative intervals above.
 
 Entries are immutable and never pinned. Concurrent misses may duplicate work and
 race to publish an equal or newer epoch; there is no waiter/cancellation state.

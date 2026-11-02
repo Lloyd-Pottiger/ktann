@@ -6,10 +6,10 @@ Open accepts only Index Name, reconstructs all immutable configuration from the
 current adapter's manifest, and validates that adapter's supported format. A
 Dropping manifest returns
 IndexDropping rather than a handle that cannot operate. Every operation
-validates that the name manifest is Active and still names its handle's
-ID—batched with its other initial reads where possible—while mutations update-
-protect that read; thus an old handle rejects a new same-name index rather than
-silently retargeting.
+validates that its handle's ID-keyed Index Manifest is Active and has the expected
+immutable identity; mutations update-protect that read. Never-reused Logical
+Index IDs prevent an old handle from retargeting a replacement index with the
+same name.
 
 Drop is a synchronous idempotent state machine: it changes Active to Dropping, resumes an already-Dropping manifest, clears that Logical Index ID's data range, and deletes the manifest last; an absent manifest is already successfully dropped. FoundationDB clears the complete range and deletes the Manifest atomically, so after CommitOutcomeUnknown an absent Manifest proves completion and the same Dropping Manifest permits retry. A point-delete backend instead rereads the Manifest and restarts its remaining range from the prefix beginning after an unknown outcome. Create for the same name returns IndexDropping until cleanup removes the manifest, preserving the authoritative recovery entry for the old ID. Unsupported formats are rejected and immutable schema, metric, quantizer, or Tree-Key changes require a new Logical Index rather than online migration.
 

@@ -30,12 +30,9 @@ Ready partitions and ReceivingSplit targets are not offered because their
 current state cannot advance independently. Failure to enqueue never changes
 the mutation result or correctness.
 
-For graph-enabled indexes, grouped foreground routing scores internal bodies
-below 1024 nodes exactly and uses local HNSW at 1024 nodes or above, according to
-the snapshot Header count. Mixed waves share the same bounded write beam and
-stable candidate ordering. Approximate selection does not weaken exact membership,
-complete child ownership validation, or final mutation fences. Indexes without
-local graphs retain exact routing.
+Graph-enabled indexes use the [foreground write routing policy](partition-local-hnsw.md#foreground-write-routing).
+Approximate selection preserves exact membership, complete child ownership
+validation, and final mutation fences. Indexes without local graphs route exactly.
 
 Grouped foreground routing may reuse committed internal bodies from the shared
 Partition Cache (ADR 0023). It reads Header and State in the current transaction,
@@ -196,8 +193,9 @@ never creates a target or reverts to Ready.
 ## 6. Contention and recovery
 
 Foreground mutations never wait for a whole split/merge. They may conflict with
-one bounded fixup and retry from a fresh snapshot. Fixups do not hold locks
-across transactions or reserve a durable owner.
+one bounded fixup and retry from a fresh snapshot. Ordinary fixups rely on
+transaction conflict protection; graph maintenance additionally guards overlapping
+bodies as described below. Neither reserves a durable owner.
 
 Independently rediscovered source states are eligible for assistance only after
 the runtime's [recovery age check](runtime-operations.md#32-recovery-age-and-timestamps).

@@ -10,6 +10,9 @@ caches, and maintenance workers. `Index<B>` is a cheap cloneable handle to one
 Active Logical Index. Static backend polymorphism keeps native transaction
 lifetimes explicit.
 
+`Runtime::new` requires an active Tokio multi-thread runtime, even when
+maintenance workers are disabled; otherwise it returns `InvalidArgument`.
+
 The primary operations are:
 
 ```rust
@@ -206,21 +209,14 @@ above 1024, selected from each snapshot Header count. Both retain the configured
 write beam and exact membership/fencing guarantees; see
 [foreground routing](maintenance.md#1-foreground-mutation-protocol).
 
-Local graph maintenance prepares native graphs outside transactions using one
-shared Runtime admission owner. Explicit low-level maintenance uses
-`maintenance::graph_topology::advance` with a reused `runtime::GraphMaintenance`
-owner; graph-unaware split/merge entrypoints reject graph-changing steps.
-The routing working-byte limit also bounds one complete maintenance preparation,
-including all participating source and proposed bodies and retained output.
-
 ### 4.2 Runtime configuration
 
 `RuntimeConfig` owns the foreground operation limit, cache bytes, worker count,
 queue capacity, the `stalled_timeout` recovery age threshold, retry/backoff,
-maintenance transaction budgets, and default search budgets. It also owns the per-level write beam used by foreground
-inserts and upserts, defaulting to four; a wider write beam still commits each
-record to exactly one leaf. Adapter config owns backend resources such as RocksDB blocking
-concurrency. Search options may only lower or override process defaults within
+routing working bytes, the Tree Key plan limit, and default search budgets. Its
+per-level write beam for inserts and upserts defaults to four; each record still
+commits to exactly one leaf. Adapters own backend resources, such as RocksDB
+blocking concurrency, and transaction admission budgets. Search options may only lower or override process defaults within
 hard caps; changing them cannot alter index correctness.
 
 The default partition cache budget is computed when `RuntimeConfig` is created

@@ -169,8 +169,6 @@ checksum, native topology, and local reachability are checked together. Leaf or
 ownerless graphs, and graphs in indexes without graph configuration, are invalid.
 Empty internal bodies have no graph; legal non-Ready states remain verifiable.
 The root needs no stored centroid because it has no incoming projection.
-Per-tree canonical centroid fingerprints join projections without retaining a
-second tree of vectors; topology ownership remains in the ordinary tree ledger.
 
 All retained children, chunks, projection joins, kernel construction, and native
 restore scratch share VerifyOptions' memory ceiling. Exhaustion returns an
@@ -181,13 +179,10 @@ source bindings report InvalidEncoding; wrong graph ownership and divergent
 centroid projections report Membership. Generic codec failures retain their
 existing InvalidEncoding classification.
 
-The complete report also exposes audited Tree Manifest count, Partition Header
-count, maximum tree level, Partition Header and exact entry counts by level,
-maximum entries by level, persistent partition-state counts, and the number of
-partitions whose committed Header can advance Structure Maintenance. These
-facts come from the same snapshot as the invariant audit and make topology
-quiescence independently auditable without treating a temporarily unchanged
-partition count as convergence or exposing raw Tree Keys or Partition Keys.
+`VerifyReport` also exposes snapshot-consistent tree, per-level partition/entry,
+topology-state, and actionable-maintenance counts for independently auditing
+topology quiescence. A temporarily unchanged partition count is not convergence;
+reports do not expose raw Tree Keys or Partition Keys.
 
 The report is conclusive only when `complete` is true. A reached limit returns a
 successful incomplete report with collected issues; cancellation, deadline, or
