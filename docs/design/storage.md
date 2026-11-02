@@ -44,8 +44,7 @@ affected-data accounting. Exceeding a declared limit returns `LimitExceeded`,
 not an unbounded internal retry.
 
 RetryableAbort restarts the complete logical attempt against a fresh snapshot.
-No transaction object survives an await outside its adapter-defined safe
-section. CommitOutcomeUnknown is surfaced unless a lifecycle operation has an
+CommitOutcomeUnknown is surfaced unless a lifecycle operation has an
 idempotent persistent-state recovery rule.
 
 ## 3. Backend mappings
@@ -62,7 +61,7 @@ quota. Live snapshots retain old data; applications control their lifetime.
 Conflict history is reclaimed when writers finish and capped at 100,000 key
 references and 8 MiB of key bytes. Writers with protected reads older than that
 window abort with `RetryableAbort`. The adapter enforces 10,000-byte keys,
-100,000-byte values, and budgets of 10,000 mutations and 9,000,000 mutation bytes per transaction.
+100,000-byte values, and budgets of 10,000 mutations and 1 MiB of mutation bytes per transaction.
 It does not advertise transactional range clear, so index drop uses bounded
 point deletes. See [ADR 0024](../adr/0024-production-memory-adapter.md).
 
@@ -109,7 +108,8 @@ Manifest. Bulk Build instead reserves a hidden Building Manifest and an immutabl
 Build Descriptor; [publication](bulk-build.md#5-loading-and-exact-validation)
 transitions it to Active after exact validation. ID gaps are valid. Drop
 transitions the Manifest to Dropping before
-deleting data; all ordinary operations update-protect and validate Active state.
+deleting data. All ordinary operations validate Active state; mutations
+update-protect that Manifest read.
 
 Offline refinement preserves the Active Manifest, Partition Keys and topology.
 Record relocation preserves exact membership, payloads and capacity constraints
@@ -231,51 +231,31 @@ or hashing is not permitted.
 
 ### 6.3 Build metadata
 
-Bulk Build reservations add lifecycle byte `2` (Building; Active remains `0`,
-Dropping `1`) and index-owned key kind `0x05` for the Build Descriptor. Descriptor
-value tag `0x0d` contains a length-prefixed absolute
-UTF-8 source path (maximum 4096 bytes), a length-prefixed 89-byte input artifact
-manifest, sample/memory/scratch ceilings u64, and a refinement byte: 0 means
-omitted, while 1..6 represent zero..five rounds. Integers are big endian. Capacity,
-dimension and metric remain solely in the Index Manifest. Bootstrap transactions may access the descriptor alongside the Manifest
-for atomic reservation. Serving transactions still validate an Active Manifest.
-See [ADR 0026](../adr/0026-building-reservations.md).
+Bulk Build persists five records:
 
-The index-owned Build Load key (`0x06`) stores value tag `0x0e`, a sized
-89-byte Serving Artifact manifest, positive u64 epoch, u64 committed-entry
-cursor, 32-byte prefix SHA-256, and a canonical completion byte. Completion
-requires cursor == item count and prefix hash == artifact hash. A completed
-checkpoint is immutable and fences further data writes; validation progress is
-owned solely by Build Validation, with no separate sealed flag.
-This metadata is codec-validated but excluded from serving membership ledgers.
-See the implemented load protocol in [Bulk Build](bulk-build.md).
+- **Build Descriptor** binds the source locator and identity, construction options,
+  and optional refinement semantics to the Building index.
+- **Build Load** binds one Serving Artifact to a fenced load epoch and atomic
+  count/digest checkpoint. A completed load is immutable and rejects data writes.
+- **Build Workspace** binds worker options, adapter key/value limits, ownership
+  token, attempt epoch, accepted artifacts, and terminal failure. Its namespace
+  scope lets cleanup survive index deletion.
+- **Build Validation** records exact comparison progress against frozen backend
+  serving bytes. Completed validation and the completed load authorize activation.
+- **Build Schedule** records automatic execution options and a renewable owner
+  token. A committed token change fences superseded writers; expiry alone does
+  not revoke authority.
 
-Namespace key `[0, 2] || LogicalIndexId:u64be` stores Build Workspace (tag `0x0f`).
-It survives index-prefix removal. Its canonical value contains a sized absolute
-UTF-8 root (at most 3900 bytes), nine u64 values in this order: sort memory,
-sort scratch, serving memory, serving scratch, graph memory, refinement memory,
-maximum artifact bytes, load mutation count and load bytes. These form the shared
-Worker Options encoding. The workspace then stores a nonzero 32-byte ownership token, positive u64 epoch, two optional accepted
-artifact descriptors (flag, epoch, sized 89-byte manifest), and a bounded failure
-code. Accepted Forest/Serving kinds and epoch bounds are validated; Serving
-requires Forest. All integer encodings are big endian.
+Build metadata Debug output redacts source/workspace locators, validation cursors,
+worker options, and ownership tokens.
 
-Index key kind `0x07` stores Build Validation (tag `0x10`): sized Serving manifest,
-sized backend scan cursor (at most 16 KiB), compared entries u64, prefix SHA-256,
-and canonical completion byte. Complete requires empty cursor, total entry count
-and full artifact hash. Initial proof requires the artifact-header digest.
-Workspace and proof Debug output redact locators/cursors. These formats have no
-compatibility layer; malformed, trailing and noncanonical bytes fail closed.
-See [ADR 0027](../adr/0027-bulk-workspace-and-publication.md).
-
-Namespace key `[0,3] || LogicalIndexId:u64be` stores Build Schedule, tag `0x11`:
-sized UTF-8 Index Name (1..=255 bytes), the shared Worker Options encoding, a 32-byte owner token, and u64 UTC
-expiry milliseconds. Zero token means unowned; an unowned nonzero expiry is a
-retry delay. Nonzero owner requires nonzero expiry. The token and options are
-redacted in Debug. Index-bound transactions may access only their own namespace
-Build Schedule to protect mutations against automatic takeover. Queue removal
-is separate from index-prefix deletion. All values are canonical and reject
-truncation, trailing bytes, and invalid ownership encodings.
+Canonical layouts and validation belong to
+[`build.rs`](../../src/storage/values/build.rs),
+[`load.rs`](../../src/storage/values/load.rs),
+[`workspace.rs`](../../src/storage/values/workspace.rs),
+[`validation.rs`](../../src/storage/values/validation.rs), and
+[`schedule.rs`](../../src/storage/values/schedule.rs).
+[Bulk Build](bulk-build.md) defines recovery and publication.
 
 ## 7. Typed atomic operations
 

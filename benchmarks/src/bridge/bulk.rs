@@ -147,11 +147,19 @@ impl<B: Backend> Build<B> {
 fn completion_report(stages: BulkBuildReport, elapsed: Duration) -> serde_json::Map<String, Value> {
     let publish_seconds = stages.publish.as_secs_f64();
     let report = json!({
+        "forest_detail": stages.forest_report.map(|r| json!({
+            "trees": r.trees,
+            "records": r.records,
+            "partitions": r.partitions,
+        })),
         "sort_written_bytes": stages.forest_report.map(|r| r.sort_written_bytes),
         "tree_written_bytes": stages.forest_report.map(|r| r.tree_written_bytes),
         "peak_sort_scratch_bytes": stages.forest_report.map(|r| r.peak_sort_scratch_bytes),
         "peak_tree_scratch_bytes": stages.forest_report.map(|r| r.peak_tree_scratch_bytes),
         "serving_detail": stages.serving_report.map(|r| json!({
+            "records": r.records,
+            "partitions": r.partitions,
+            "keys": r.keys,
             "source_sort_seconds": r.source_sort.as_secs_f64(),
             "topology_sort_seconds": r.topology_sort.as_secs_f64(),
             "join_encode_seconds": r.join_encode.as_secs_f64(),
@@ -236,6 +244,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(index.logical_index_id(), identity);
+        let record = index
+            .get(
+                Bytes::from_static(b"one"),
+                ktann::api::GetOptions::default(),
+            )
+            .await
+            .unwrap()
+            .expect("published record");
+        assert_eq!(record.vector(), &[1., 2.]);
         runtime.shutdown().await.unwrap();
     }
 }

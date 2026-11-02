@@ -108,8 +108,8 @@ another participating Runtime can take over after the lease expires.
 
 The Build Descriptor binds the source's absolute path, trusted Artifact Manifest,
 and construction options. The namespace-owned Build Workspace binds a canonical
-workspace path, resource limits, random ownership token, attempt epoch, accepted
-artifacts, and terminal failure. Workers register ownership before creating files.
+workspace path, worker options, adapter key/value limits, ownership token, attempt
+epoch, accepted artifacts, and terminal failure. Workers register ownership before creating files.
 Accepted Forest and Serving Artifacts survive worker replacement. Accepted
 Serving bytes permit loading and validation without reopening the source path.
 Before acceptance, the immutable source must remain available at its stored path.
@@ -118,8 +118,8 @@ After publication, completion requires neither source nor workspace artifacts.
 The workspace filesystem must provide reliable advisory locks, atomic rename,
 and fsync. Native IO retains shared root locks and admission until it actually
 exits, including when its async waiter is cancelled. Cleanup takes an exclusive
-root lock. Workspace options must match the persisted options when resuming
-preparation. Multi-host filesystem qualification is a deployment responsibility.
+root lock. Worker options and adapter key/value limits must match the persisted workspace
+when resuming preparation. Multi-host filesystem qualification is a deployment responsibility.
 
 ## 4. Admission and cancellation
 
@@ -183,6 +183,3 @@ completion, exact corruption checks, atomic visibility, abort, and cleanup.
 The shared `tests/support/bulk_load_adapter.rs` exercises durable reopen, exact
 loaded bytes, complete/publication, verification, and cleanup on RocksDB and
 FoundationDB. Filesystem qualification across hosts is outside these tests.
-
-See [ADR 0026](../adr/0026-building-reservations.md) and
-[ADR 0027](../adr/0027-bulk-workspace-and-publication.md) for persistence decisions.

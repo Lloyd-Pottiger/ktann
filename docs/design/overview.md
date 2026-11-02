@@ -149,7 +149,8 @@ Tree Key ranges, enumerates at most the Tree Key budget, traverses candidate
 partitions with a global deterministic budget, and uses leaf synopses only for
 safe pruning. Exact typed evaluation precedes candidate admission. RaBitQ7
 selects a bounded candidate set; original vectors are loaded and reranked with
-f64 exact distance. Hits sort by `(distance, RecordId)`.
+f64 exact distance. Hits sort by exact ranking value and then Record ID; see
+[distance semantics](search.md#1-vector-and-distance-semantics).
 
 Success may contain fewer than `k` hits. The response reports actual budget
 usage and every exhausted budget dimension. It does
@@ -169,16 +170,10 @@ metadata keys; no entry rescan is needed.
 
 ### 6.5 Shutdown
 
-Runtime shutdown stops new admission and waits for already admitted foreground
-operations and commits. Those operations retain their real results, including
-`CommitOutcomeUnknown`; `RuntimeClosed` never overwrites an admitted result.
-Only calls admitted after shutdown begins fail with `RuntimeClosed`.
-
-After foreground drain, Runtime invokes the backend shutdown hook before
-releasing it. For RocksDB this is the completion barrier for native actor
-cleanup, so successful Runtime shutdown permits immediate database reopen or
-teardown. Direct adapter users consume `RocksDbBackend` with its asynchronous
-shutdown for the same guarantee; transaction-handle Drop remains nonblocking.
+[Runtime shutdown](runtime-operations.md#2-shutdown) stops new admission, waits
+for admitted operations and native backend cleanup, and preserves each admitted
+operation's real result, including `CommitOutcomeUnknown`. New calls fail with
+`RuntimeClosed`; successful shutdown permits backend reopen or teardown.
 
 ### 6.6 Drop and verify
 
@@ -203,8 +198,7 @@ It does not replace an existing Active index.
 
 The synchronous [`bulk` module](bulk-artifacts.md) owns bounded input capture,
 external sorting, forest files, and serving artifact assembly. It reuses core
-construction and storage codecs and never writes backend state. The non-goals
-above concerning bulk-build generations and staging indexes remain unchanged.
+construction and storage codecs and never writes backend state.
 
 ## 7. Performance and operational constraints
 
@@ -213,10 +207,6 @@ above concerning bulk-build generations and staging indexes remain unchanged.
 - Tree Key enumeration materializes only keys counted within the same bounded
   Tree Key budget before traversal, so tree count cannot create unbounded query
   memory.
-- RocksDB transactions are admitted by a bounded semaphore and owned by
-  dedicated native thread actors through cleanup. Capacity-one channels serialize
-  calls without blocking async executor threads; existing transactions never
-  reacquire admission, and backend shutdown awaits detached cleanup.
 - Caches are process-local and byte bounded. Persistent epochs make cached
   decoded partition data safe; a particular eviction policy is an internal,
   benchmark-driven choice rather than a stable contract.
@@ -229,6 +219,5 @@ above concerning bulk-build generations and staging indexes remain unchanged.
 Tests protect current contracts: backend transaction semantics; codec golden
 vectors; model-based mutation and crash histories; synopsis and numeric
 properties; deterministic search budgets; lifecycle recovery; and focused
-recall, latency, contention, memory, and write-amplification benchmarks. The
-detailed evidence matrix is in the module designs. No compatibility suite for
-an unshipped format and no duplicated implementation-path tests are required.
+recall, latency, contention, memory, and write-amplification benchmarks. See the
+[validation matrix](runtime-operations.md#8-whole-system-validation) for evidence.
