@@ -107,25 +107,18 @@ pub(super) fn rough_lower_bounds<const N: usize>(
     {
         return Err(Error::invalid_argument());
     }
-    let mut chunks = codes.map(|code| code.codes.as_chunks::<4>().0.iter());
-    let mut sums = [[0_i32; 4]; N];
-    for components in query.screening_components.as_chunks::<4>().0 {
-        for lane in 0..N {
-            let chunk = chunks[lane].next().expect("validated matching dimensions");
-            for component in 0..4 {
-                sums[lane][component] +=
-                    i32::from(components[component]) * i32::from(chunk[component]);
-            }
-        }
-    }
-    for index in query.components.len() / 4 * 4..query.components.len() {
-        for lane in 0..N {
-            sums[lane][index % 4] +=
-                i32::from(query.screening_components[index]) * i32::from(codes[lane].codes[index]);
-        }
-    }
+    // A contiguous dot per candidate lets LLVM vectorize the exact integer
+    // reduction without interleaving independent code streams.
+    let sums = codes.map(|code| {
+        query
+            .screening_components
+            .iter()
+            .zip(code.codes)
+            .map(|(&query, &code)| i32::from(query) * i32::from(code))
+            .sum::<i32>()
+    });
     Ok(std::array::from_fn(|lane| {
-        let sum = (sums[lane][0] + sums[lane][1]) + (sums[lane][2] + sums[lane][3]);
+        let sum = sums[lane];
         let header = &codes[lane].header;
         let scale = f64::from(header.scale);
         // MAX_DIMENSION * 127 * 63 < 2^31, so every integer operation is exact.
