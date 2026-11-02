@@ -4,6 +4,35 @@
 `Runtime` and `Index` APIs. It writes JSON reports for reproducible, same-host
 comparisons. Results are empirical measurements, not an SLA.
 
+## Choosing a benchmark
+
+| Entry point | Evidence | When to run |
+| --- | --- | --- |
+| `ktann-bench run --profile smoke` | Runner, adapter, cache, routing, contention and lifecycle functionality | CI and quick checks; timings are not performance baselines |
+| `ktann-bench run --profile full` | Synthetic distribution/cache baselines, mixed read/write costs and SIFTsmall online import lifecycle | Relevant query, storage, runtime or maintenance changes; scheduled runs on an idle host |
+| `ktann-bench run --profile large` | Cohere 1M / SIFT1M recall versus query cost | Main evidence for ANN quality and routing decisions |
+| `ktann-bench run --profile diagnostic` | Fashion-MNIST high-dimensional queries and sustained admission saturation | On demand for relevant query or admission changes |
+| `ktann-vdbbench-bridge` | Bulk Build phase costs and VectorDBBench query/filter workloads | Construction changes and external benchmark comparisons |
+| `ktann-mutable-graph` | Recall and resource costs after repeated updates, deletes, inserts and split/merge maintenance | Changes to graph updates, routing or maintenance |
+
+The three executable entry points share the production APIs. Frozen-layout routing
+experiments are a mode of `ktann-bench`, not a separate executable. Bulk Build
+phase measurements live in the VectorDBBench bridge; publication and point-read
+correctness also have automated test coverage.
+
+The SIFTsmall lifecycle workload provides a quick real-data regression signal,
+including cold/warm search after convergence; it is not a substitute for SIFT1M
+quality curves or a concurrent steady-state baseline. Fashion-MNIST has only 20
+distinct queries in `diagnostic`; repeated timing samples do not expand its recall sample. Use it as a
+high-dimensional diagnostic rather than the main quality baseline. Clustered,
+skewed and duplicate-heavy inputs provide distinct synthetic stress cases.
+
+The mixed workloads replace existing records by toggling one vector component
+by 0.001; the hot case targets at most eight records. They measure transaction
+contention and search/write latency, not sustained topology evolution or
+post-update recall. Use `ktann-mutable-graph` for those questions. Keep rerank
+budgets fixed when comparing partition sizing and routing.
+
 ## Run
 
 Build and run with optimizations enabled:
@@ -20,9 +49,35 @@ resolved configuration and the full parent command needed to reproduce a run.
 
 | Profile | Workloads | Purpose |
 | --- | --- | --- |
-| `smoke` | Deterministic synthetic ANN, cache-disabled ANN, 95/5 and hot 50/50 search/update, saturated backend admission, import-to-search lifecycle | Functional CI checks |
-| `full` | Synthetic workloads plus SIFTsmall, Fashion-MNIST, clustered, skewed, and duplicate-heavy inputs | Performance comparisons on an otherwise idle host |
+| `smoke` | Deterministic synthetic ANN, routing quality smoke, cache-disabled ANN, hot 50/50 search/update, saturated backend admission, import-to-search lifecycle | Functional CI checks |
+| `full` | Clustered, skewed and duplicate-heavy ANN, cache-disabled ANN, 95/5 and hot 50/50 search/update, SIFTsmall import-to-search lifecycle | Performance comparisons on an otherwise idle host |
 | `large` | Cohere 1M cosine and SIFT1M L2 quality curves | Recall versus search cost on supplied ground truth |
+| `diagnostic` | Fashion-MNIST and sustained backend admission saturation | Opt-in diagnostics on an otherwise idle host |
+
+### Scenario inventory
+
+| Profile | Scenario names |
+| --- | --- |
+| `smoke` (6) | `ann-warm-cache`, `quality-routing-smoke`, `ann-cache-disabled`, `mixed-search50-update50-hot`, `backend-admission-saturated`, `import-to-search-lifecycle` |
+| `full` (7) | `ann-clustered`, `ann-skewed`, `ann-duplicates`, `ann-cache-disabled`, `mixed-search95-update5`, `mixed-search50-update50-hot`, `import-to-search-lifecycle` |
+| `large` (2) | `quality-cohere-1m`, `quality-sift-1m` |
+| `diagnostic` (2) | `ann-fashion-mnist`, `backend-admission-saturated` |
+
+The 95/5 mix is measured in `full`, where its window contains 100 writes.
+Smoke keeps one hot mixed workload plus admission saturation. Its cache-disabled
+scenario checks the uncached path on a tiny dataset, not realistic cache pressure.
+
+`diagnostic` is excluded from the scheduled `full` runs. Select one diagnostic
+with `--scenario`, or omit it to run both:
+
+```sh
+cargo run --release -p ktann-benchmarks --bin ktann-bench -- \
+  run --backend rocksdb --profile diagnostic --scenario ann-fashion-mnist \
+  --output .benchmark-data/results/fashion-mnist.json
+```
+
+`quality-routing-smoke` remains in the default smoke matrix for both backends;
+the dedicated routing integration tests currently cover only RocksDB.
 
 ### FoundationDB
 
@@ -201,7 +256,7 @@ isolate individual beams within the worker and is excluded from comparison.
 `backend-admission-saturated` submits fixed concurrent waves, draining each
 before starting the next. A valid run requires at least 100 accepted searches
 and 100 accepted writes, with 25–75% overall rejection. Smoke measures 640
-operations; full measures 2,000. Runs outside this region fail validation.
+operations; diagnostic measures 2,000. Runs outside this region fail validation.
 
 ### Import-to-search lifecycle
 
@@ -400,24 +455,19 @@ and search parameters; zero rounds is a centroid-recomputation control.
 Routing experiments use the Bulk Build artifact path described below and are
 not interchangeable baselines for this import-and-refine path.
 
-## Complete Bulk Build probe
+### Bulk Build measurements
 
-`cargo run --release -p ktann-benchmarks --bin ktann-bulk-build -- <sift-directory> <new-output-directory> [record-limit]`
-
-The SIFT directory contains `sift_base.fvecs`, `sift_query.fvecs`, and
-`sift_groundtruth.ivecs`. Default count is 1,000,000. The probe streams a source
-snapshot, reserves a RocksDB index, runs preparation/loading, publishes through
-exact validation, checks point reads, and measures held-out top-10 queries.
-Official recall is reported only for the full population. `report.json` separates
-phase wall times, forest and serving scratch IO, construction seed, and query
-latency; use `/usr/bin/time -l` for process resource
-counts on macOS. Reports retain the source and RocksDB database, while successful
-publication reclaims worker-owned artifacts. Run on an idle host. The result
-does not establish distributed throughput or an online insertion speedup.
+Use the bridge's companion report for source snapshot, forest construction,
+serving generation, loading, and validation/publication/cleanup timings. Reports
+include the rotation seed, forest sort/tree scratch IO and peak scratch bytes,
+plus forest tree/record/partition counts. VectorDBBench supplies query latency
+and recall measurements for the selected corpus and workload. These build
+measurements do not establish distributed throughput or online insertion speed.
 
 Bulk Build bridge reports include `serving_detail` wall times for source
 sorting, topology sorting, exact joins/encoding, output merging, Synopsis
-reduction, and final emission/sealing, plus total and peak serving scratch bytes.
+reduction, and final emission/sealing, plus total and peak serving scratch bytes
+and record/partition/key counts.
 `ready_peak_rss_bytes` captures the bridge process's resident-memory high-water
 mark after successful publication, cleanup and router preparation, before queries.
 The whole-run peak remains separate and may include later query cache growth.

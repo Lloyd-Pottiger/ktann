@@ -128,10 +128,11 @@ pub struct ScenarioSpec {
 pub fn scenarios(profile: &str) -> Result<Vec<ScenarioSpec>, String> {
     match profile {
         "smoke" => Ok(smoke_scenarios()),
-        "full" => Ok(full_scenarios()),
+        "full" => Ok(baseline_scenarios("full")),
+        "diagnostic" => Ok(baseline_scenarios("diagnostic")),
         "large" => large_scenarios(),
         _ => Err(format!(
-            "unknown profile `{profile}`; expected smoke, full, or large"
+            "unknown profile `{profile}`; expected smoke, full, large, or diagnostic"
         )),
     }
 }
@@ -189,13 +190,6 @@ fn smoke_scenarios() -> Vec<ScenarioSpec> {
             ..common.clone()
         },
         ScenarioSpec {
-            name: "mixed-search95-update5",
-            search_percent: 95,
-            concurrency: 4,
-            measured_operations: 80,
-            ..common.clone()
-        },
-        ScenarioSpec {
             name: "mixed-search50-update50-hot",
             search_percent: 50,
             hot_updates: true,
@@ -231,12 +225,12 @@ fn smoke_scenarios() -> Vec<ScenarioSpec> {
     ]
 }
 
-/// Representative public and synthetic baselines reserved for scheduled runs.
-fn full_scenarios() -> Vec<ScenarioSpec> {
+/// Scheduled baselines and opt-in diagnostics share the same measurement scale.
+fn baseline_scenarios(profile: &'static str) -> Vec<ScenarioSpec> {
     let ann = |name, dataset, base_vectors, query_vectors, dimension, seed| ScenarioSpec {
         name,
         dataset,
-        profile: "full",
+        profile,
         base_vectors,
         query_vectors,
         query_offset: 0,
@@ -270,16 +264,30 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
         maintenance_workers: 2,
     };
     let clustered = ann("ann-clustered", "clustered", 5_000, 100, 128, 0x38_1001);
+    if profile == "diagnostic" {
+        return vec![
+            ann(
+                "ann-fashion-mnist",
+                "fashion-mnist",
+                10_000,
+                20,
+                784,
+                0x38_1003,
+            ),
+            ScenarioSpec {
+                name: "backend-admission-saturated",
+                search_percent: 50,
+                hot_updates: true,
+                blocking_resource_limit: Some(1),
+                foreground_limit: 8,
+                concurrency: 32,
+                measured_operations: 2_000,
+                dispatch: WorkloadDispatch::FixedWaves(admission_target()),
+                ..clustered.clone()
+            },
+        ];
+    }
     vec![
-        ann("ann-siftsmall", "siftsmall", 10_000, 100, 128, 0x38_1002),
-        ann(
-            "ann-fashion-mnist",
-            "fashion-mnist",
-            10_000,
-            20,
-            784,
-            0x38_1003,
-        ),
         clustered.clone(),
         ann("ann-skewed", "skewed", 5_000, 100, 128, 0x38_1004),
         ann("ann-duplicates", "duplicates", 5_000, 100, 128, 0x38_1005),
@@ -301,17 +309,6 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
             hot_updates: true,
             measured_operations: 2_000,
             concurrency: 8,
-            ..clustered.clone()
-        },
-        ScenarioSpec {
-            name: "backend-admission-saturated",
-            search_percent: 50,
-            hot_updates: true,
-            blocking_resource_limit: Some(1),
-            foreground_limit: 8,
-            concurrency: 32,
-            measured_operations: 2_000,
-            dispatch: WorkloadDispatch::FixedWaves(admission_target()),
             ..clustered.clone()
         },
         ScenarioSpec {
@@ -2560,7 +2557,7 @@ mod tests {
 
     #[test]
     fn every_scenario_has_a_jointly_valid_runtime_configuration() {
-        for profile in ["smoke", "full", "large"] {
+        for profile in ["smoke", "full", "large", "diagnostic"] {
             for scenario in scenarios(profile).expect("known profile") {
                 for workers in [
                     scenario.maintenance_workers,
@@ -2576,7 +2573,7 @@ mod tests {
 
     #[test]
     fn measured_windows_preserve_each_declared_operation_mix() {
-        for profile in ["smoke", "full", "large"] {
+        for profile in ["smoke", "full", "large", "diagnostic"] {
             for scenario in scenarios(profile).expect("known profile") {
                 let searches = (scenario.warmup_operations
                     ..scenario.warmup_operations + scenario.measured_operations)
@@ -2594,7 +2591,7 @@ mod tests {
 
     #[test]
     fn admission_target_rejects_weak_samples() {
-        let scenario = scenarios("full")
+        let scenario = scenarios("diagnostic")
             .expect("known profile")
             .into_iter()
             .find(|scenario| scenario.name == "backend-admission-saturated")
