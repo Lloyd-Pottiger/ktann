@@ -14,6 +14,8 @@ use std::process::{Command, Stdio};
 #[cfg(feature = "foundationdb")]
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
+
 use crate::compare::{self, ComparisonPolicy};
 use crate::report::{BenchmarkReport, BenchmarkSuite, REPORT_SCHEMA_VERSION};
 use crate::runner::{self, ScenarioSpec};
@@ -40,11 +42,21 @@ where
     let arguments: Vec<OsString> = arguments.collect();
     match command.as_str() {
         "run" => run_suite(parse_run_options(&arguments)?),
+        "summarize-routing" => summarize_routing(&arguments),
         "compare" => compare_reports(parse_compare_options(&arguments)?),
         // Each public suite scenario executes in a fresh process so metrics
         // recorder state, Partition Cache, and peak RSS cannot leak between
         // reports. This command is intentionally absent from the public help.
-        "__worker" => run_worker(parse_worker_options(&arguments)?),
+        "__worker" => {
+            let [request] = arguments.as_slice() else {
+                return Err("worker requires one serialized request".to_owned());
+            };
+            let request = request.to_str().ok_or("worker request must be UTF-8")?;
+            run_worker(
+                serde_json::from_str(request)
+                    .map_err(|error| format!("decode worker request: {error}"))?,
+            )
+        }
         _ => Err(usage()),
     }
 }
@@ -59,7 +71,7 @@ struct RunOptions {
 }
 
 /// Inputs for one isolated scenario process.
-#[derive(Clone, Debug)]
+#[derive(Debug, Deserialize, Serialize)]
 struct WorkerOptions {
     profile: String,
     scenario: String,
@@ -68,8 +80,9 @@ struct WorkerOptions {
 }
 
 /// Execution settings shared by the suite and its scenario workers.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct ExecutionOptions {
+    routing_experiment: Option<crate::routing::Experiment>,
     backend: String,
     worker_threads: usize,
     write_beam_size: Option<u32>,
@@ -77,15 +90,20 @@ struct ExecutionOptions {
     base_vectors: Option<usize>,
     query_vectors: Option<usize>,
     query_offset: Option<usize>,
-    max_partition_entries: Option<u32>,
+    min_leaf_partition_entries: Option<u32>,
+    max_leaf_partition_entries: Option<u32>,
+    min_internal_partition_entries: Option<u32>,
+    max_internal_partition_entries: Option<u32>,
     query_concurrency: Option<Vec<usize>>,
     partition_cache_bytes: Option<u64>,
     leaf_beam_size: Option<u32>,
     rocksdb_block_cache_bytes: Option<usize>,
     warmup_operations: Option<usize>,
+    measured_operations: Option<usize>,
     rocksdb_path: Option<PathBuf>,
     reuse_index: bool,
-    lifecycle: LifecycleOverrides,
+    maintenance_workers: Option<usize>,
+    import_batch_size: Option<usize>,
 }
 
 impl ExecutionOptions {
@@ -103,7 +121,16 @@ impl ExecutionOptions {
         {
             return Err("RocksDB cache and fixture options require --backend rocksdb".to_owned());
         }
+        let routing_experiment: Option<crate::routing::Experiment> = values
+            .get("routing-experiment")
+            .map(|json| serde_json::from_str(json))
+            .transpose()
+            .map_err(|e| format!("invalid routing experiment JSON: {e}"))?;
+        if let Some(experiment) = &routing_experiment {
+            experiment.validate()?;
+        }
         Ok(Self {
+            routing_experiment,
             backend,
             worker_threads: match values.get("worker-threads") {
                 Some(value) => parse_positive(value, "worker-threads")?,
@@ -129,9 +156,21 @@ impl ExecutionOptions {
                 .get("query-offset")
                 .map(|value| parse_nonnegative(value, "query-offset"))
                 .transpose()?,
-            max_partition_entries: values
-                .get("max-partition-entries")
-                .map(|value| parse_positive_u32(value, "max-partition-entries"))
+            min_leaf_partition_entries: values
+                .get("min-leaf-partition-entries")
+                .map(|value| parse_positive_u32(value, "min-leaf-partition-entries"))
+                .transpose()?,
+            max_leaf_partition_entries: values
+                .get("max-leaf-partition-entries")
+                .map(|value| parse_positive_u32(value, "max-leaf-partition-entries"))
+                .transpose()?,
+            min_internal_partition_entries: values
+                .get("min-internal-partition-entries")
+                .map(|value| parse_positive_u32(value, "min-internal-partition-entries"))
+                .transpose()?,
+            max_internal_partition_entries: values
+                .get("max-internal-partition-entries")
+                .map(|value| parse_positive_u32(value, "max-internal-partition-entries"))
                 .transpose()?,
             query_concurrency: values
                 .get("query-concurrency")
@@ -164,16 +203,28 @@ impl ExecutionOptions {
                 .get("warmup-operations")
                 .map(|value| parse_nonnegative(value, "warmup-operations"))
                 .transpose()?,
+            measured_operations: values
+                .get("measured-operations")
+                .map(|value| parse_positive(value, "measured-operations"))
+                .transpose()?,
             leaf_beam_size: values
                 .get("leaf-beam-size")
                 .map(|value| parse_positive_u32(value, "leaf-beam-size"))
                 .transpose()?,
-            lifecycle: LifecycleOverrides::parse(values)?,
+            maintenance_workers: values
+                .get("maintenance-workers")
+                .map(|value| parse_nonnegative(value, "maintenance-workers"))
+                .transpose()?,
+            import_batch_size: values
+                .get("import-batch-size")
+                .map(|value| parse_positive(value, "import-batch-size"))
+                .transpose()?,
         })
     }
 }
 
 const SCENARIO_OPTIONS: &[&str] = &[
+    "routing-experiment",
     "backend",
     "profile",
     "scenario",
@@ -183,6 +234,7 @@ const SCENARIO_OPTIONS: &[&str] = &[
     "leaf-beam-size",
     "rocksdb-block-cache-bytes",
     "warmup-operations",
+    "measured-operations",
     "rocksdb-path",
     "reuse-index",
     "write-beam-size",
@@ -190,45 +242,13 @@ const SCENARIO_OPTIONS: &[&str] = &[
     "base-vectors",
     "query-vectors",
     "query-offset",
-    "max-partition-entries",
+    "min-leaf-partition-entries",
+    "max-leaf-partition-entries",
+    "min-internal-partition-entries",
+    "max-internal-partition-entries",
     "maintenance-workers",
     "import-batch-size",
 ];
-
-/// Optional diagnostic bounds applied to the selected scenario.
-#[derive(Clone, Debug, Default)]
-struct LifecycleOverrides {
-    maintenance_workers: Option<usize>,
-    batch_size: Option<usize>,
-}
-
-impl LifecycleOverrides {
-    fn parse(values: &BTreeMap<String, String>) -> Result<Self, String> {
-        Ok(Self {
-            maintenance_workers: values
-                .get("maintenance-workers")
-                .map(|value| parse_nonnegative(value, "maintenance-workers"))
-                .transpose()?,
-            batch_size: values
-                .get("import-batch-size")
-                .map(|value| parse_positive(value, "import-batch-size"))
-                .transpose()?,
-        })
-    }
-
-    fn is_empty(&self) -> bool {
-        self.maintenance_workers.is_none() && self.batch_size.is_none()
-    }
-
-    fn apply(&self, scenario: &mut ScenarioSpec) {
-        if let Some(workers) = self.maintenance_workers {
-            scenario.maintenance_workers = workers;
-        }
-        if let Some(batch_size) = self.batch_size {
-            scenario.import_batch_size = batch_size;
-        }
-    }
-}
 
 /// Report paths and comparison thresholds.
 #[derive(Clone, Debug)]
@@ -248,15 +268,19 @@ fn parse_run_options(arguments: &[OsString]) -> Result<RunOptions, String> {
         .unwrap_or_else(|| "smoke".to_owned());
     let scenario = values.get("scenario").cloned();
     let execution = ExecutionOptions::parse(&values)?;
-    if execution.rocksdb_path.is_some() && (profile != "large" || scenario.is_none()) {
+    if execution.rocksdb_path.is_some()
+        && ((profile != "large" && scenario.as_deref() != Some("quality-routing-smoke"))
+            || scenario.is_none())
+    {
         return Err("--rocksdb-path requires --profile large and one --scenario".to_owned());
     }
     if profile != "large"
+        && scenario.as_deref() != Some("quality-routing-smoke")
         && (execution.query_concurrency.is_some() || execution.leaf_beam_size.is_some())
     {
         return Err("--query-concurrency and --leaf-beam-size require --profile large".to_owned());
     }
-    if !execution.lifecycle.is_empty()
+    if (execution.maintenance_workers.is_some() || execution.import_batch_size.is_some())
         && profile != "large"
         && scenario.as_deref() != Some(IMPORT_LIFECYCLE_SCENARIO)
     {
@@ -269,20 +293,6 @@ fn parse_run_options(arguments: &[OsString]) -> Result<RunOptions, String> {
         scenario,
         output: values.get("output").map(PathBuf::from),
         execution,
-    })
-}
-
-/// Parses the internal worker command using the same execution settings.
-fn parse_worker_options(arguments: &[OsString]) -> Result<WorkerOptions, String> {
-    let values = option_map(
-        arguments,
-        &[SCENARIO_OPTIONS, &["reproduction-command"]].concat(),
-    )?;
-    Ok(WorkerOptions {
-        profile: required(&values, "profile")?,
-        scenario: required(&values, "scenario")?,
-        reproduction_command: required(&values, "reproduction-command")?,
-        execution: ExecutionOptions::parse(&values)?,
     })
 }
 
@@ -362,11 +372,6 @@ fn required(values: &BTreeMap<String, String>, key: &str) -> Result<String, Stri
         .ok_or_else(|| format!("missing --{key}"))
 }
 
-/// Renders one optional value as a forwarded worker argument.
-fn option_string<T: ToString>(value: Option<T>) -> Option<String> {
-    value.map(|value| value.to_string())
-}
-
 /// Parses a strictly positive host-sized bound.
 fn parse_positive(value: &str, name: &str) -> Result<usize, String> {
     value
@@ -432,92 +437,21 @@ fn run_suite(options: RunOptions) -> Result<(), String> {
         .map_err(|error| format!("resolve benchmark executable: {error}"))?;
     let mut reports = Vec::with_capacity(selected.len());
     for scenario in selected {
+        // The public CLI owns parsing and validation. Workers receive that typed
+        // request directly, without a second CLI contract to keep in sync.
+        let request = WorkerOptions {
+            profile: options.profile.clone(),
+            scenario: scenario.name.to_owned(),
+            reproduction_command: reproduction_command.clone(),
+            execution: options.execution.clone(),
+        };
+        let request = serde_json::to_string(&request)
+            .map_err(|error| format!("encode worker request: {error}"))?;
         let mut command = Command::new(&executable);
         command
             .arg("__worker")
-            .args(["--backend", &options.execution.backend])
-            .args(["--profile", &options.profile])
-            .args(["--scenario", scenario.name])
-            .args(["--reproduction-command", &reproduction_command])
-            .args([
-                "--worker-threads",
-                &options.execution.worker_threads.to_string(),
-            ])
+            .arg(request)
             .stderr(Stdio::inherit());
-        let lifecycle = &options.execution.lifecycle;
-        for (name, value) in [
-            (
-                "rocksdb-path",
-                options
-                    .execution
-                    .rocksdb_path
-                    .as_ref()
-                    .map(|path| path.to_string_lossy().into_owned()),
-            ),
-            (
-                "reuse-index",
-                options.execution.reuse_index.then(|| "true".to_owned()),
-            ),
-            (
-                "rocksdb-block-cache-bytes",
-                option_string(options.execution.rocksdb_block_cache_bytes),
-            ),
-            (
-                "warmup-operations",
-                option_string(options.execution.warmup_operations),
-            ),
-            (
-                "query-concurrency",
-                options.execution.query_concurrency.as_ref().map(|values| {
-                    values
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(",")
-                }),
-            ),
-            (
-                "partition-cache-bytes",
-                option_string(options.execution.partition_cache_bytes),
-            ),
-            (
-                "leaf-beam-size",
-                option_string(options.execution.leaf_beam_size),
-            ),
-            (
-                "write-beam-size",
-                option_string(options.execution.write_beam_size),
-            ),
-            (
-                "refinement-rounds",
-                option_string(options.execution.refinement_rounds),
-            ),
-            (
-                "base-vectors",
-                option_string(options.execution.base_vectors),
-            ),
-            (
-                "query-vectors",
-                option_string(options.execution.query_vectors),
-            ),
-            (
-                "query-offset",
-                option_string(options.execution.query_offset),
-            ),
-            (
-                "max-partition-entries",
-                option_string(options.execution.max_partition_entries),
-            ),
-            (
-                "maintenance-workers",
-                option_string(lifecycle.maintenance_workers),
-            ),
-            ("import-batch-size", option_string(lifecycle.batch_size)),
-        ] {
-            if let Some(value) = value {
-                command.args([format!("--{name}"), value]);
-            }
-        }
         let output = command
             .output()
             .map_err(|error| format!("start scenario {}: {error}", scenario.name))?;
@@ -545,10 +479,26 @@ fn run_worker(options: WorkerOptions) -> Result<(), String> {
         .into_iter()
         .find(|scenario| scenario.name == options.scenario)
         .ok_or_else(|| format!("unknown scenario `{}`", options.scenario))?;
-    options.execution.lifecycle.apply(&mut scenario);
+    if let Some(workers) = options.execution.maintenance_workers {
+        scenario.maintenance_workers = workers;
+    }
+    if let Some(batch_size) = options.execution.import_batch_size {
+        scenario.import_batch_size = batch_size;
+    }
+    if let Some(experiment) = &options.execution.routing_experiment {
+        if scenario.leaf_beam_sweep.is_empty() {
+            return Err("--routing-experiment requires a quality scenario".into());
+        }
+        scenario.search_options = scenario
+            .search_options
+            .with_routing_mode(experiment.production_mode())
+            .map_err(|e| e.to_string())?;
+        scenario.maintenance_workers = 0;
+        scenario.routing_experiment = Some(experiment.clone());
+    }
     if options.execution.rocksdb_path.is_some() {
-        if scenario.profile != "large" {
-            return Err("--rocksdb-path requires --profile large".to_owned());
+        if scenario.leaf_beam_sweep.is_empty() {
+            return Err("--rocksdb-path requires a quality scenario".to_owned());
         }
         scenario.persisted_index = options.execution.rocksdb_path.clone();
         scenario.reuse_index = options.execution.reuse_index;
@@ -556,9 +506,12 @@ fn run_worker(options: WorkerOptions) -> Result<(), String> {
     if let Some(count) = options.execution.warmup_operations {
         scenario.warmup_operations = count;
     }
+    if let Some(count) = options.execution.measured_operations {
+        scenario.measured_operations = count;
+    }
     if let Some(concurrency) = &options.execution.query_concurrency {
-        if scenario.profile != "large" {
-            return Err("--query-concurrency requires --profile large".to_owned());
+        if scenario.leaf_beam_sweep.is_empty() {
+            return Err("--query-concurrency requires a quality scenario".to_owned());
         }
         scenario.query_concurrency_sweep = concurrency.clone();
     }
@@ -566,8 +519,8 @@ fn run_worker(options: WorkerOptions) -> Result<(), String> {
         scenario.partition_cache_bytes = bytes;
     }
     if let Some(beam) = options.execution.leaf_beam_size {
-        if scenario.profile != "large" {
-            return Err("--leaf-beam-size requires --profile large".to_owned());
+        if scenario.leaf_beam_sweep.is_empty() {
+            return Err("--leaf-beam-size requires a quality scenario".to_owned());
         }
         scenario.leaf_beam_sweep = vec![beam];
     }
@@ -589,8 +542,17 @@ fn run_worker(options: WorkerOptions) -> Result<(), String> {
     if let Some(query_offset) = options.execution.query_offset {
         scenario.query_offset = query_offset;
     }
-    if let Some(max_partition_entries) = options.execution.max_partition_entries {
-        scenario.max_partition_entries = max_partition_entries;
+    if let Some(max_leaf_partition_entries) = options.execution.max_leaf_partition_entries {
+        scenario.max_leaf_partition_entries = max_leaf_partition_entries;
+    }
+    if let Some(maximum) = options.execution.max_internal_partition_entries {
+        scenario.max_internal_partition_entries = maximum;
+    }
+    if let Some(minimum) = options.execution.min_leaf_partition_entries {
+        scenario.min_leaf_partition_entries = minimum;
+    }
+    if let Some(minimum) = options.execution.min_internal_partition_entries {
+        scenario.min_internal_partition_entries = minimum;
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(options.execution.worker_threads)
@@ -920,7 +882,64 @@ fn shell_quote(value: &OsStr) -> String {
 
 /// Returns the stable help shown for missing or unknown public commands.
 fn usage() -> String {
-    "usage:\n  ktann-bench run --backend rocksdb|foundationdb [--profile smoke|full|large] [--scenario NAME] [--worker-threads N] [--query-concurrency N,...] [--partition-cache-bytes N] [--leaf-beam-size N] [--warmup-operations N] [--rocksdb-block-cache-bytes N] [--rocksdb-path PATH] [--reuse-index true|false] [--write-beam-size N] [--refinement-rounds 0..5] [--base-vectors N] [--query-vectors N] [--query-offset N] [--max-partition-entries N] [--maintenance-workers N] [--import-batch-size N] [--output PATH]\n  ktann-bench compare --baseline PATH --candidate PATH [--maximum-relative-regression N] [--maximum-recall-drop N] [--maximum-rejection-rate-increase N] [--output PATH]".to_owned()
+    "usage:\n  ktann-bench run --backend rocksdb|foundationdb [--profile smoke|full|large] [--routing-experiment JSON] [--scenario NAME] [--worker-threads N] [--query-concurrency N,...] [--partition-cache-bytes N] [--leaf-beam-size N] [--warmup-operations N] [--measured-operations N] [--rocksdb-block-cache-bytes N] [--rocksdb-path PATH] [--reuse-index true|false] [--write-beam-size N] [--refinement-rounds 0..5] [--base-vectors N] [--query-vectors N] [--query-offset N] [--min-leaf-partition-entries N] [--max-leaf-partition-entries N] [--min-internal-partition-entries N] [--max-internal-partition-entries N] [--maintenance-workers N] [--import-batch-size N] [--output PATH]\n  ktann-bench summarize-routing --inputs PATH,PATH,...\n  ktann-bench compare --baseline PATH --candidate PATH [--maximum-relative-regression N] [--maximum-recall-drop N] [--maximum-rejection-rate-increase N] [--output PATH]".to_owned()
+}
+
+/// Summarizes routing matrix rows without treating unequal recall as a speedup.
+fn summarize_routing(arguments: &[OsString]) -> Result<(), String> {
+    let values = option_map(arguments, &["inputs"])?;
+    println!(
+        "file\tmode\tleaf_max\tinternal_max\tbeam\tef\tclients\trecall_mean\trecall_min\tQPS\tp95_ms\tlogical_read_bytes\tpeak_RSS_bytes"
+    );
+    for path in required(&values, "inputs")?.split(',') {
+        let bytes = fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
+        let suite: BenchmarkSuite =
+            serde_json::from_slice(&bytes).map_err(|e| format!("decode {path}: {e}"))?;
+        if suite.schema_version != REPORT_SCHEMA_VERSION {
+            return Err(format!("unsupported report schema in {path}"));
+        }
+        for report in suite.reports {
+            let Some(experiment) = report.configuration.routing_experiment else {
+                return Err(format!("{path} is not a routing experiment"));
+            };
+            let crate::report::ReportMeasurements::QualitySweep(sweep) = report.measurements else {
+                return Err(format!("{path} is not a quality sweep"));
+            };
+            let process_peak = sweep
+                .routing_setup
+                .as_ref()
+                .and_then(|setup| setup["measured_process_peak_rss_bytes"].as_u64());
+            for point in sweep.points {
+                let measured = point.measurements;
+                let recall = measured
+                    .recall_at_k
+                    .ok_or_else(|| format!("{path} has no final recall"))?;
+                let search = measured
+                    .operations
+                    .get(&crate::report::OperationClass::Search)
+                    .ok_or_else(|| format!("{path} has no search measurements"))?;
+                println!(
+                    "{path}\t{:?}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{:.2}\t{:.3}\t{}\t{}",
+                    experiment.mode,
+                    report.configuration.max_leaf_partition_entries,
+                    report.configuration.max_internal_partition_entries,
+                    point.leaf_beam_size,
+                    experiment.ef_search,
+                    point.concurrency,
+                    recall.mean,
+                    recall.min,
+                    measured.throughput_per_second,
+                    search.latency_ms.p95,
+                    measured.backend_io.bytes_read,
+                    measured
+                        .peak_rss_bytes
+                        .or(process_peak)
+                        .map_or_else(|| "unavailable".into(), |bytes| bytes.to_string())
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -957,8 +976,11 @@ mod tests {
         assert_eq!(options.execution.rocksdb_block_cache_bytes, Some(4096));
         assert_eq!(options.execution.warmup_operations, Some(0));
         assert!(options.execution.reuse_index);
+        assert_eq!(options.execution.measured_operations, None);
         for arguments in [
             vec!["--backend", "rocksdb", "--rocksdb-block-cache-bytes", "0"],
+            vec!["--backend", "rocksdb", "--measured-operations", "0"],
+            vec!["--backend", "rocksdb", "--measured-operations", "invalid"],
             vec![
                 "--backend",
                 "foundationdb",
@@ -1048,8 +1070,8 @@ mod tests {
         ]
         .map(std::ffi::OsString::from);
         let options = parse_run_options(&arguments).expect("valid lifecycle overrides");
-        assert_eq!(options.execution.lifecycle.maintenance_workers, Some(0));
-        assert_eq!(options.execution.lifecycle.batch_size, Some(25));
+        assert_eq!(options.execution.maintenance_workers, Some(0));
+        assert_eq!(options.execution.import_batch_size, Some(25));
     }
 
     #[test]
@@ -1075,7 +1097,7 @@ mod tests {
         .map(std::ffi::OsString::from);
         let options = parse_run_options(&arguments).expect("large diagnostic override");
         assert_eq!(options.profile, "large");
-        assert_eq!(options.execution.lifecycle.maintenance_workers, Some(0));
+        assert_eq!(options.execution.maintenance_workers, Some(0));
     }
 
     #[test]

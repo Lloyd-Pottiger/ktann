@@ -1,5 +1,5 @@
 [workspace]
-members = ["benchmarks", "ktann-foundationdb", "ktann-memory", "ktann-rocksdb"]
+members = ["benchmarks", "ktann-foundationdb", "ktann-memory", "ktann-rocksdb", "ktann-usearch"]
 resolver = "3"
 
 [workspace.package]
@@ -27,8 +27,11 @@ path = "src/lib.rs"
 default = []
 # Low-level fault injection controls are excluded from production builds.
 test-support = []
+# Untimed diagnostics over production search for benchmark quality analysis.
+benchmark = []
 
 [dependencies]
+ktann-usearch = { path = "ktann-usearch" }
 bytes = "1"
 sha2 = "0.11"
 getrandom = { version = "0.3", features = ["std"] }

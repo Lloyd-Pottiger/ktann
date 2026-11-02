@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 fn serving_options(memory: &MemoryBackend) -> ServingOptions {
     ServingOptions {
+        graph_memory_bytes: 256 * 1024 * 1024,
         hard_limits: memory.hard_limits(),
         ..super::serving_options()
     }
@@ -32,9 +33,18 @@ async fn reservation<B: Backend>(
     dir: &Directory,
     count: u64,
 ) -> (BulkBuildJob<B>, InputSnapshot) {
+    reservation_config(runtime, dir, count, config(Metric::L2, true)).await
+}
+
+async fn reservation_config<B: Backend>(
+    runtime: &Runtime<B>,
+    dir: &Directory,
+    count: u64,
+    config: IndexConfig,
+) -> (BulkBuildJob<B>, InputSnapshot) {
     let input = InputSnapshot::create(
         &dir.0.join("source"),
-        config(Metric::L2, true),
+        config,
         1024 * 1024,
         (0..count).map(|id| Ok(record(id))),
     )
@@ -44,8 +54,6 @@ async fn reservation<B: Backend>(
             "bulk",
             &input,
             ktann::construction::ConstructionOptions {
-                min_partition_entries: config(Metric::L2, true).min_partition_entries(),
-                max_partition_entries: config(Metric::L2, true).max_partition_entries(),
                 sample_items: options().sample_items,
                 memory_bytes: options().tree_memory_bytes,
                 scratch_bytes: options().tree_scratch_bytes,
@@ -62,7 +70,17 @@ async fn fixture<B: Backend>(
     dir: &Directory,
     count: u64,
 ) -> (BulkBuildJob<B>, ServingArtifact) {
-    let (job, input) = reservation(runtime, dir, count).await;
+    fixture_config(runtime, memory, dir, count, config(Metric::L2, true)).await
+}
+
+async fn fixture_config<B: Backend>(
+    runtime: &Runtime<B>,
+    memory: &MemoryBackend,
+    dir: &Directory,
+    count: u64,
+    config: IndexConfig,
+) -> (BulkBuildJob<B>, ServingArtifact) {
+    let (job, input) = reservation_config(runtime, dir, count, config).await;
     let (forest, _) = ForestArtifact::build(
         &dir.0.join("forest"),
         &input,
@@ -294,7 +312,7 @@ impl WriteTxn for GatedTxn<'_> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn takeover_and_abort_fence_an_already_prepared_old_chunk() {
-    for abort in [false, true] {
+    for (abort, graph) in [(false, false), (true, false), (false, true), (true, true)] {
         let dir = Directory::new();
         let memory = MemoryBackend::with_test_config(TestConfig::default());
         let gate = Arc::new(Gate::default());
@@ -306,7 +324,13 @@ async fn takeover_and_abort_fence_an_already_prepared_old_chunk() {
             RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
         )
         .unwrap();
-        let (job, artifact) = fixture(&runtime, &memory, &dir, 19).await;
+        let config = config(Metric::L2, true);
+        let config = if graph {
+            config.with_local_graph(ktann::api::LocalGraphConfig::new(2, 8, [7; 32]).unwrap())
+        } else {
+            config
+        };
+        let (job, artifact) = fixture_config(&runtime, &memory, &dir, 73, config).await;
         gate.arm(2);
         let old = job.clone();
         let input = artifact.clone();
@@ -524,6 +548,8 @@ async fn admission_and_artifact_identity_are_enforced_before_data_writes() {
         &source,
         *job.index_manifest().rotation_seed(),
         ForestOptions {
+            refinement_rounds: None,
+            refinement_memory_bytes: 256 * 1024 * 1024,
             sample_items: options().sample_items + 1,
             ..options()
         },
@@ -556,8 +582,6 @@ async fn admission_and_artifact_identity_are_enforced_before_data_writes() {
             "other",
             &source,
             ktann::construction::ConstructionOptions {
-                min_partition_entries: config(Metric::L2, true).min_partition_entries(),
-                max_partition_entries: config(Metric::L2, true).max_partition_entries(),
                 sample_items: options().sample_items,
                 memory_bytes: options().tree_memory_bytes,
                 scratch_bytes: options().tree_scratch_bytes,

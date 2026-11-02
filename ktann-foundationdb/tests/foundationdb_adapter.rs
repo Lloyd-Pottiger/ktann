@@ -215,7 +215,7 @@ async fn foundationdb_adapter_preserves_the_backend_contract() {
     // Adapter-declared facts are asserted here; the shared suite checks the
     // rest of the common contract.
     assert_eq!(primary.admission_budget().max_mutations, 10_000);
-    assert_eq!(primary.admission_budget().max_mutation_bytes, 1 << 20);
+    assert_eq!(primary.admission_budget().max_mutation_bytes, 9_000_000);
     assert_eq!(primary.hard_limits().max_value_bytes, 100_000);
     assert!(primary.capabilities().transactional_clear_range);
 

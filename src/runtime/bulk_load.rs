@@ -37,7 +37,7 @@ pub(crate) async fn load<B: Backend>(
     options: BulkLoadOptions,
     retry: RetryPolicy,
 ) -> Result<()> {
-    if !artifact.matches_build(&index, descriptor.input()) {
+    if !artifact.matches_build(&index, &descriptor) {
         return Err(Error::invalid_argument());
     }
     let backend = context.backend();

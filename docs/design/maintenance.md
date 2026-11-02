@@ -30,6 +30,13 @@ Ready partitions and ReceivingSplit targets are not offered because their
 current state cannot advance independently. Failure to enqueue never changes
 the mutation result or correctness.
 
+For graph-enabled indexes, grouped foreground routing scores internal bodies
+below 1024 nodes exactly and uses local HNSW at 1024 nodes or above, according to
+the snapshot Header count. Mixed waves share the same bounded write beam and
+stable candidate ordering. Approximate selection does not weaken exact membership,
+complete child ownership validation, or final mutation fences. Indexes without
+local graphs retain exact routing.
+
 Grouped foreground routing may reuse committed internal bodies from the shared
 Partition Cache (ADR 0023). It reads Header and State in the current transaction,
 checks the body epoch, and still update-protects the selected leaf and incoming
@@ -51,7 +58,9 @@ targets, then removes the source at completion. Root Partition Key 1 remains
 stable and is converted in place to an internal root only after its entries
 drain, so every committed state has one searchable entry point.
 
-Merge is eligible for a Ready non-root partition below the configured minimum.
+Split and merge thresholds select leaf bounds at level 1 and internal bounds
+at higher levels. Root splits use the root's current level. Merge is eligible
+for a Ready non-root partition below that level's configured minimum.
 The worker reselects a legal target for each bounded batch under current
 topology rather than persisting or relying on a stale target. Roots never
 collapse.
@@ -121,14 +130,14 @@ charge fits the current Backend Admission Budget. The charge uses the
 Manifest's dimension, fields and Bloom parameters, the current Tree Key, codec
 key/value sizes, adapter key-prefix overhead, and the operation's worst target
 distribution: two targets for split, or one distinct Ready target per entry for
-merge. It then caps that safe bound at the configured split threshold, limiting
+merge. It then caps that safe bound at the leaf split threshold, limiting
 conflict rollback and failure blast radius to one ordinary partition's worth of
 entries. Internal movement retains its fixed entry bound because it does not
 write Record Locations or Synopses.
 
 Drain placement normally chooses the nearer persisted target centroid. Exact
 remaining and target counts reserve the last entries needed for each target to
-reach the configured minimum when the source has enough entries, crediting
+reach the source level's configured minimum when the source has enough entries, crediting
 entries already redirected into the targets. Thus duplicate-heavy routing
 cannot immediately merge a small target back into its oversized source, while
 ordinary inputs retain the distance-based placement learned by balanced
@@ -205,7 +214,38 @@ Natural mismatches—wrong location, missing authoritative entry, duplicate
 incoming reference, impossible count, or malformed state—return Corruption and
 do not trigger automatic repair.
 
-## 7. Validation
+## 7. Graph-aware topology
+
+Graph and ordinary maintenance share the storage operations that expose targets,
+move entries and complete splits or merges. Their execution lifecycles differ:
+ordinary maintenance retains bounded paged discovery, while graph maintenance
+needs complete source/receiver snapshots and private native preparation before
+opening its publication transaction. Graph body locks, single-receiver batches
+and stale-plan refresh belong to that preparation lifecycle.
+
+The graph-aware driver plans changed internal bodies from one snapshot, closes
+it, prepares private native graphs under Runtime admission, then protects source
+versions and commits typed topology changes together with graph publication.
+It uses the same searchable states and exact membership operations described
+above. Internal drains select one receiver per transaction; exposure and drains
+respect graph transient capacity. Child split exposure into a ReceivingSplit
+parent waits for that parent's source to finish, preserving the combined
+source/receiver graph bound. State-only transitions keep the body epoch and
+graph unchanged. Leaf membership changes do not rebuild parent graphs.
+
+Participating graph bodies are guarded in Partition Key order before reading
+payloads. A waiting plan refreshes its snapshot after guard acquisition; incoming
+edge discovery then uses that snapshot. Exact publication fences remain the write
+authority across runtimes. Prepared immutable bodies enter the bounded cache only
+after known successful commit, with the committed Header epoch. Failed, cancelled
+or unknown-outcome publications cannot seed the cache.
+
+The [partition-local graph contract](partition-local-hnsw.md) owns the combined
+transaction/memory envelope, empty-body representation and native update policy.
+Explicit low-level callers reuse `GraphMaintenance` admission and call
+`graph_topology::advance`, rather than graph-unaware split/merge entrypoints.
+
+## 8. Validation
 
 - State-machine tables test every state, allowed transition, traversal rule,
   retry point, and adapter capability branch.

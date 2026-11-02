@@ -44,7 +44,7 @@ pub struct BenchmarkDataset {
 /// Supplied ground truth belongs to the original corpus. Once the base set is
 /// truncated, it is discarded so the runner computes exact truth against the
 /// actual indexed vectors instead of reporting neighbors that were never
-/// loaded.
+/// loaded. Query-only windows retain the matching supplied ground-truth rows.
 pub fn limit_with_query_offset(
     mut dataset: BenchmarkDataset,
     base_count: usize,
@@ -63,6 +63,7 @@ pub fn limit_with_query_offset(
             dataset.queries.len()
         ));
     }
+    let full_base = base_count == dataset.base.len();
     dataset.ids.truncate(base_count);
     dataset.base.truncate(base_count);
     dataset.queries = dataset
@@ -71,7 +72,16 @@ pub fn limit_with_query_offset(
         .skip(query_offset)
         .take(query_count)
         .collect();
-    dataset.ground_truth = None;
+    dataset.ground_truth = if full_base {
+        dataset.ground_truth.map(|rows| {
+            rows.into_iter()
+                .skip(query_offset)
+                .take(query_count)
+                .collect()
+        })
+    } else {
+        None
+    };
     dataset.metadata.base_vectors = base_count;
     dataset.metadata.query_vectors = query_count;
     dataset.metadata.checksum_xxh3_128 = checksum(&dataset.ids, &dataset.base, &dataset.queries);
@@ -208,7 +218,7 @@ fn validate_dimension(vectors: &[Arc<[f32]>], expected: usize) -> Result<(), Str
 }
 
 /// Hashes the complete logical dataset into a cross-process stable identity.
-fn checksum(ids: &[Bytes], base: &[Arc<[f32]>], queries: &[Arc<[f32]>]) -> String {
+pub(crate) fn checksum(ids: &[Bytes], base: &[Arc<[f32]>], queries: &[Arc<[f32]>]) -> String {
     // Hash lengths and IEEE-754 bits explicitly; native byte layout and path
     // metadata therefore cannot change a dataset's identity.
     let mut hasher = Xxh3::new();
@@ -254,5 +264,33 @@ mod tests {
             second.metadata.checksum_xxh3_128
         );
         assert_eq!(first.ids, second.ids);
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    #[test]
+    fn query_windows_preserve_truth_only_when_the_base_is_unchanged() {
+        let mut dataset = load("clustered", 16, 4, 4, 7).unwrap();
+        let rows: Vec<Vec<Bytes>> = (0..4)
+            .map(|query| vec![dataset.ids[query].clone()])
+            .collect();
+        dataset.ground_truth = Some(rows.clone());
+        let base_identity = checksum(&dataset.ids, &dataset.base, &[]);
+        let window = limit_with_query_offset(dataset.clone(), 16, 1, 2).unwrap();
+        assert_eq!(window.ground_truth, Some(rows[1..3].to_vec()));
+        assert_eq!(checksum(&window.ids, &window.base, &[]), base_identity);
+        assert_ne!(
+            window.metadata.checksum_xxh3_128,
+            dataset.metadata.checksum_xxh3_128
+        );
+        assert!(
+            limit_with_query_offset(dataset, 8, 1, 2)
+                .unwrap()
+                .ground_truth
+                .is_none()
+        );
     }
 }

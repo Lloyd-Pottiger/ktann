@@ -64,7 +64,7 @@ test-fdb:
 	$(CARGO) test -p ktann-foundationdb \
 	  --test foundationdb_adapter --test foundationdb_faults \
 	  --test foundationdb_verify --test foundationdb_observability \
-	  --test foundationdb_recall -- --ignored
+	  --test foundationdb_recall --test foundationdb_graph_atomic_size -- --ignored
 
 bench:
 	@mkdir -p "$(REPORT_DIR)"

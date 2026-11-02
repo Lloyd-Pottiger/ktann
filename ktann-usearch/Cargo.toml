@@ -1,0 +1,17 @@
+[package]
+name = "ktann-usearch"
+version.workspace = true
+edition.workspace = true
+license = "MIT AND Apache-2.0"
+publish = false
+description = "Internal USearch graph bridge for KTANN"
+
+[dependencies]
+cxx = "=1.0.205"
+
+[build-dependencies]
+cxx-build = "=1.0.205"
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_code = "deny"

@@ -1,4 +1,3 @@
-use bytes::Bytes;
 use num_bigint::BigInt;
 use proptest::prelude::*;
 
@@ -6,10 +5,7 @@ use crate::api::{ErrorKind, MAX_DIMENSION, Metric};
 
 use super::rounding::{next_down, next_up};
 
-use super::{
-    ApproximateCandidate, ApproximateDistance, RaBitQ7, RaBitQQuery, select_global_overlap,
-    select_leaf_overlap,
-};
+use super::{ApproximateDistance, RaBitQ7, RaBitQQuery};
 
 #[test]
 fn adjacent_values_cover_ieee_boundaries() {
@@ -371,7 +367,7 @@ fn packed_scores_match_expanded_reference_at_layout_and_numeric_boundaries() {
 }
 
 #[test]
-fn interleaved_scores_preserve_scalar_bits_at_numeric_and_layout_boundaries() {
+fn decoded_scores_preserve_packed_bits_at_numeric_and_layout_boundaries() {
     let values = [
         0.0,
         -0.0,
@@ -420,92 +416,110 @@ fn interleaved_scores_preserve_scalar_bits_at_numeric_and_layout_boundaries() {
         let codes = payloads
             .each_ref()
             .map(|payload| RaBitQ7::decode(payload, dimension).unwrap());
-        let decoded = payloads
-            .each_ref()
-            .map(|payload| super::DecodedRaBitQ7::from_validated_leaf_bytes(payload, dimension));
+        // Keep distinct entries in one body allocation; offsets must remain valid
+        // after every append and packed and decoded scoring must agree.
+        let mut components_buffer = Vec::with_capacity(4 * dimension);
+        let decoded = payloads.each_ref().map(|payload| {
+            super::DecodedRaBitQ7::append_validated_leaf_bytes(
+                payload,
+                dimension,
+                &mut components_buffer,
+            )
+        });
+        assert_eq!(components_buffer.len(), 4 * dimension);
+        let decoded = decoded.each_ref().map(|code| code.view(&components_buffer));
         for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
             let query = RaBitQQuery::new(&components, metric).unwrap();
-            let distances =
-                super::DecodedRaBitQ7::approximate_distances(decoded.each_ref(), &query).unwrap();
-            for (lane, (code, distance)) in codes.iter().zip(distances).enumerate() {
-                let scalar = code.approximate_distance(&query).unwrap();
-                assert_distance_bits_equal(distance, scalar);
-                let [single] =
-                    super::DecodedRaBitQ7::approximate_distances([&decoded[lane]], &query).unwrap();
-                assert_distance_bits_equal(single, scalar);
+            for (code, decoded) in codes.iter().zip(&decoded) {
+                let distance = decoded.score(&query, None).unwrap().unwrap();
+                let packed = code.approximate_distance(&query).unwrap();
+                assert_distance_bits_equal(distance, packed);
             }
         }
     }
 }
 
+/// Long, same-sign dots exercise the accumulation limit without cancellation.
 #[test]
-fn interleaved_scores_reject_a_dimension_mismatch_in_every_lane() {
-    let matching = RaBitQ7::quantize(&[1.0, -1.0]).unwrap();
-    let short = RaBitQ7::quantize(&[1.0]).unwrap();
+fn integer_scores_cover_maximum_partial_sums() {
+    for dimension in [1, 1032, 1033, 1041, MAX_DIMENSION] {
+        for code in [-63, 63] {
+            let encoded = independently_encode_payload(&vec![code; dimension], 1.0, 0.0);
+            let components = vec![f32::MAX; dimension];
+            assert_validated_packed_parity(&encoded, &components);
+            assert_exact_reconstructed_dot(&encoded, &components);
+        }
+    }
+}
+
+#[test]
+fn decoded_scores_reject_dimension_mismatch_even_with_a_cutoff() {
+    let payload = RaBitQ7::quantize(&[1.0]).unwrap();
     let query = RaBitQQuery::new(&[1.0, -1.0], Metric::L2).unwrap();
-    for mismatched_lane in 0..4 {
-        let codes: [_; 4] = std::array::from_fn(|lane| {
-            if lane == mismatched_lane {
-                super::DecodedRaBitQ7::from_validated_leaf_bytes(&short, 1)
-            } else {
-                super::DecodedRaBitQ7::from_validated_leaf_bytes(&matching, 2)
-            }
-        });
+    let mut components = Vec::new();
+    let code = super::DecodedRaBitQ7::append_validated_leaf_bytes(&payload, 1, &mut components);
+    for cutoff in [None, Some(-f64::MAX)] {
         assert_kind(
-            super::DecodedRaBitQ7::approximate_distances(codes.each_ref(), &query),
+            code.view(&components).score(&query, cutoff),
             ErrorKind::InvalidArgument,
         );
     }
 }
 
 #[test]
-fn leaf_overlap_obeys_formula_cap_and_stable_membership() {
-    let candidates = (0_u16..300)
-        .map(|index| candidate(index, f64::from(index), 0.0, 1_000.0 + f64::from(index)))
-        .collect();
-    let selection = select_leaf_overlap(candidates, 1, usize::MAX).expect("selection succeeds");
-    assert!(selection.truncated());
-    assert_eq!(selection.candidates().len(), 256);
-    let mut ids = selected_ids(selection);
-    ids.sort_unstable();
-    assert_eq!(ids, (0..256).collect::<Vec<_>>());
-
-    let candidates = vec![candidate(2, 1.0, 0.0, 2.0), candidate(1, 1.0, 0.0, 2.0)];
-    let selection = select_leaf_overlap(candidates, 1, 1).expect("selection succeeds");
-    assert!(selection.truncated());
-    assert_eq!(selection.candidates()[0].record_id().as_ref(), [0, 1]);
-    assert_eq!(selection.candidates()[0].value(), &1);
+fn integer_cutoff_preserves_equal_scores_at_numeric_boundaries() {
+    for dimension in [1, 2, 3, 4, 7, 8, 17, 65, 768, MAX_DIMENSION] {
+        let signed: Vec<i8> = (0..dimension)
+            .map(|i| ((i * 37) % 127) as i8 - 63)
+            .collect();
+        for magnitude in [
+            0.0,
+            f32::from_bits(1),
+            f32::MIN_POSITIVE,
+            1.0,
+            1e20,
+            f32::MAX / (256.0 * dimension as f32),
+            f32::MAX,
+        ] {
+            let components: Vec<f32> = (0..dimension)
+                .map(|i| magnitude * ((i % 7) as f32 / 3.0 - 1.0))
+                .collect();
+            let mut buffer = Vec::new();
+            let decoded = [0.0, f32::from_bits(1), 1.0, f32::MAX].map(|scale| {
+                let payload = independently_encode_payload(&signed, scale, 0.0);
+                super::DecodedRaBitQ7::append_validated_leaf_bytes(&payload, dimension, &mut buffer)
+            });
+            let codes = decoded.each_ref().map(|code| code.view(&buffer));
+            for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
+                let query = RaBitQQuery::new(&components, metric).unwrap();
+                for code in &codes {
+                    let distance = code.score(&query, None).unwrap().unwrap();
+                    assert!(distance.rough().is_finite());
+                    let equal = code.score(&query, Some(distance.rough())).unwrap().unwrap();
+                    assert_distance_bits_equal(equal, distance);
+                    assert!(
+                        code.score(&query, Some(distance.rough().next_down()))
+                            .unwrap()
+                            .is_none()
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]
-fn global_overlap_uses_kth_upper_endpoint_then_rerank_cap() {
-    let candidates = vec![
-        candidate(1, 10.0, 9.0, 11.0),
-        candidate(2, 20.0, 19.0, 21.0),
-        candidate(3, 30.0, 10.5, 31.0),
-        candidate(4, 40.0, 22.0, 41.0),
-    ];
-    let selection = select_global_overlap(candidates, 2, 2).expect("selection succeeds");
-    assert!(selection.truncated());
-    let selected = selection.into_candidates();
-    assert_eq!(selected.len(), 2);
-    assert_eq!(selected[0].record_id().as_ref(), [0, 1]);
-    let (_, distance, value) = selected
-        .into_iter()
-        .nth(1)
-        .expect("second candidate exists")
-        .into_parts();
-    assert_eq!(distance.rough(), 20.0);
-    assert_eq!(value, 2);
-
-    assert_kind(
-        select_global_overlap::<u16>(Vec::new(), 0, 1),
-        ErrorKind::InvalidArgument,
-    );
-    let empty = select_global_overlap(vec![candidate(1, 1.0, 0.0, 2.0)], 2, 0)
-        .expect("zero budget is a valid hard cap");
-    assert!(empty.truncated());
-    assert!(empty.candidates().is_empty());
+fn integer_screening_covers_full_accumulators_and_quantization_ties() {
+    for query in [
+        vec![1.0; MAX_DIMENSION],
+        vec![-1.0; MAX_DIMENSION],
+        vec![127.0, 0.5, -0.5, 1.5, -1.5],
+    ] {
+        for code in [-63, 63] {
+            let encoded = independently_encode_payload(&vec![code; query.len()], 1.0, 0.0);
+            assert_validated_packed_parity(&encoded, &query);
+        }
+    }
 }
 
 proptest! {
@@ -582,6 +596,16 @@ proptest! {
     }
 
     #[test]
+    fn integer_scores_cover_generated_fast_path_scores(
+        entries in prop::collection::vec((-1e20_f32..1e20_f32, -63_i8..64), 1..257),
+        scale in 0.0_f32..1e20_f32,
+    ) {
+        let (components, codes): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
+        let encoded = independently_encode_payload(&codes, scale, 0.0);
+        assert_validated_packed_parity(&encoded, &components);
+    }
+
+    #[test]
     fn aggregate_dot_intervals_cover_exact_generated_reconstructions(
         entries in prop::collection::vec((finite_f32(), -63_i8..64), 1..129)
             .prop_filter("nonzero reconstruction", |entries| entries.iter().any(|(_, c)| *c != 0)),
@@ -590,164 +614,32 @@ proptest! {
         let (components, codes): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
         let encoded = independently_encode_payload(&codes, scale, 0.0);
         assert_exact_reconstructed_dot(&encoded, &components);
+        assert_validated_packed_parity(&encoded, &components);
     }
 
-    #[test]
-    fn optimized_overlap_selection_matches_brute_force_sorting(
-        raw in prop::collection::vec((-1_000_i16..=1_000, 0_u8..=255, 0_u8..=255), 1..600),
-        k in 1_usize..150,
-        budget in 0_usize..800,
-    ) {
-        let specs: Vec<CandidateSpec> = raw.into_iter().enumerate().map(
-            |(index, (rough, lower_width, upper_width))| CandidateSpec {
-                id: index as u16,
-                rough: f64::from(rough),
-                lower: f64::from(rough) - f64::from(lower_width),
-                upper: f64::from(rough) + f64::from(upper_width),
-            },
-        ).collect();
 
-        let actual_leaf = select_leaf_overlap(build_candidates(&specs), k, budget)
-            .expect("generated leaf selection is valid");
-        let (expected_leaf, expected_leaf_truncated) = brute_force_leaf(&specs, k, budget);
-        prop_assert_eq!(actual_leaf.truncated(), expected_leaf_truncated);
-        let mut actual_leaf_ids = selected_ids(actual_leaf);
-        let mut expected_leaf_ids = expected_leaf;
-        actual_leaf_ids.sort_unstable();
-        expected_leaf_ids.sort_unstable();
-        prop_assert_eq!(actual_leaf_ids, expected_leaf_ids);
-
-        let actual_global = select_global_overlap(build_candidates(&specs), k, budget)
-            .expect("generated global selection is valid");
-        let (expected_global, expected_global_truncated) = brute_force_global(&specs, k, budget);
-        prop_assert_eq!(actual_global.truncated(), expected_global_truncated);
-        prop_assert_eq!(selected_ids(actual_global), expected_global.clone());
-
-        // Traversal supplies a merged pool without a global pre-sort. The
-        // final selection and truncation must not depend on that pool order.
-        let mut reversed = build_candidates(&specs);
-        reversed.reverse();
-        let reordered = select_global_overlap(reversed, k, budget)
-            .expect("reordered selection is valid");
-        prop_assert_eq!(reordered.truncated(), expected_global_truncated);
-        prop_assert_eq!(selected_ids(reordered), expected_global);
-    }
-}
-
-#[derive(Clone, Copy)]
-struct CandidateSpec {
-    id: u16,
-    rough: f64,
-    lower: f64,
-    upper: f64,
-}
-
-fn build_candidates(specs: &[CandidateSpec]) -> Vec<ApproximateCandidate<u16>> {
-    specs
-        .iter()
-        .map(|spec| candidate(spec.id, spec.rough, spec.lower, spec.upper))
-        .collect()
-}
-
-fn selected_ids(selection: super::OverlapSelection<u16>) -> Vec<u16> {
-    selection
-        .into_candidates()
-        .into_iter()
-        .map(|candidate| candidate.into_parts().2)
-        .collect()
-}
-
-fn brute_force_leaf(specs: &[CandidateSpec], k: usize, budget: usize) -> (Vec<u16>, bool) {
-    let rough_count = specs.len().min(k.saturating_mul(2).max(64));
-    let mut upper_order = specs.to_vec();
-    upper_order.sort_unstable_by(|left, right| left.upper.total_cmp(&right.upper));
-    let threshold = upper_order[rough_count - 1].upper;
-
-    let mut rough_order = specs.to_vec();
-    rough_order.sort_unstable_by(compare_spec_rough);
-    let rough_ids: Vec<u16> = rough_order
-        .iter()
-        .take(rough_count)
-        .map(|spec| spec.id)
-        .collect();
-    let mut retained: Vec<CandidateSpec> = specs
-        .iter()
-        .copied()
-        .filter(|spec| rough_ids.contains(&spec.id) || spec.lower <= threshold)
-        .collect();
-    let cap = rough_count.saturating_mul(4).min(budget);
-    let truncated = retained.len() > cap;
-    if truncated {
-        retained.sort_unstable_by(compare_spec_local_cap);
-        retained.truncate(cap);
-    }
-    retained.sort_unstable_by(compare_spec_rough);
-    (
-        retained.into_iter().map(|spec| spec.id).collect(),
-        truncated,
-    )
-}
-
-fn brute_force_global(specs: &[CandidateSpec], k: usize, budget: usize) -> (Vec<u16>, bool) {
-    let threshold = if specs.len() < k {
-        f64::INFINITY
-    } else {
-        let mut upper_order = specs.to_vec();
-        upper_order.sort_unstable_by(|left, right| left.upper.total_cmp(&right.upper));
-        upper_order[k - 1].upper
-    };
-    let mut retained: Vec<CandidateSpec> = specs
-        .iter()
-        .copied()
-        .filter(|spec| spec.lower <= threshold)
-        .collect();
-    retained.sort_unstable_by(compare_spec_rough);
-    let truncated = retained.len() > budget;
-    retained.truncate(budget);
-    (
-        retained.into_iter().map(|spec| spec.id).collect(),
-        truncated,
-    )
-}
-
-fn compare_spec_rough(left: &CandidateSpec, right: &CandidateSpec) -> std::cmp::Ordering {
-    left.rough
-        .total_cmp(&right.rough)
-        .then_with(|| left.id.cmp(&right.id))
-}
-
-fn compare_spec_local_cap(left: &CandidateSpec, right: &CandidateSpec) -> std::cmp::Ordering {
-    left.lower
-        .total_cmp(&right.lower)
-        .then_with(|| compare_spec_rough(left, right))
-}
-
-fn candidate(index: u16, rough: f64, lower: f64, upper: f64) -> ApproximateCandidate<u16> {
-    assert!(lower <= rough && rough <= upper);
-    let distance = ApproximateDistance {
-        rough,
-        lower,
-        upper,
-    };
-    ApproximateCandidate::new(
-        Bytes::copy_from_slice(&index.to_be_bytes()),
-        distance,
-        index,
-    )
 }
 
 /// Exercises the same trusted constructor used after a validated body load.
 fn assert_validated_packed_parity(encoded: &[u8], components: &[f32]) {
     RaBitQ7::validate(encoded, components.len()).expect("fixture is canonical");
     let code = RaBitQ7::from_validated_leaf_bytes(encoded, components.len());
-    let expanded = super::DecodedRaBitQ7::from_validated_leaf_bytes(encoded, components.len());
+    let mut expanded_codes = Vec::with_capacity(components.len());
+    let expanded = super::DecodedRaBitQ7::append_validated_leaf_bytes(
+        encoded,
+        components.len(),
+        &mut expanded_codes,
+    );
+    let expanded = expanded.view(&expanded_codes);
     for metric in [Metric::InnerProduct, Metric::Cosine, Metric::L2] {
         let query = RaBitQQuery::new(components, metric).expect("finite query is valid");
         let distance = code
             .approximate_distance(&query)
             .expect("distance is finite");
-        let [cached] = super::DecodedRaBitQ7::approximate_distances([&expanded], &query)
-            .expect("cached distance is finite");
+        let cached = expanded
+            .score(&query, None)
+            .expect("cached distance is finite")
+            .unwrap();
         assert_distance_bits_equal(cached, distance);
         assert_rough_bits_equal(
             distance,
@@ -800,25 +692,36 @@ fn independently_encode_payload(codes: &[i8], scale: f32, error: f32) -> Vec<u8>
     encoded
 }
 
-/// Independent packed decoding and scalar accumulation preserve rough scores.
+/// Independent packed decoding and wide integer accumulation check rough scores.
 fn expanded_reference_rough(encoded: &[u8], components: &[f32], metric: Metric) -> f64 {
     let signed_codes = independently_decode_codes(encoded, components.len());
     let scale = f64::from(f32::from_bits(read_u32_le(encoded, 0)));
     let code_norm_squared = f64::from(read_u32_le(encoded, 4));
-    let mut norm_squared = 0.0_f64;
-    let mut dot = 0.0_f64;
-    let mut odd_dot = 0.0_f64;
-    for (index, (&component, &signed_code)) in components.iter().zip(&signed_codes).enumerate() {
-        let component = f64::from(component);
-        norm_squared += component * component;
-        let product = component * f64::from(signed_code);
-        if index % 2 == 0 {
-            dot += product;
-        } else {
-            odd_dot += product;
-        }
-    }
-    let dot = (dot + odd_dot) * scale;
+    let norm_squared = components
+        .iter()
+        .map(|&v| f64::from(v).powi(2))
+        .sum::<f64>();
+    let maximum = components
+        .iter()
+        .map(|&v| f64::from(v).abs())
+        .fold(0.0, f64::max);
+    let query_limit = (32767_usize.min(i32::MAX as usize / (63 * components.len()))) as f64;
+    let query_scale = if maximum == 0.0 {
+        1.0
+    } else {
+        maximum / query_limit
+    };
+    let sum: i64 = components
+        .iter()
+        .zip(&signed_codes)
+        .map(|(&q, &c)| {
+            let quantized = (f64::from(q) / query_scale)
+                .round()
+                .clamp(-query_limit, query_limit) as i64;
+            quantized * i64::from(c)
+        })
+        .sum();
+    let dot = sum as f64 * query_scale * scale;
     match metric {
         Metric::InnerProduct => -dot,
         Metric::Cosine => 1.0 - dot,

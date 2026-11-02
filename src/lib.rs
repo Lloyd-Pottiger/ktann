@@ -33,6 +33,8 @@
 //! ```
 
 pub mod api;
+#[cfg(feature = "benchmark")]
+pub mod benchmark;
 pub mod bulk;
 pub mod construction;
 pub mod maintenance;

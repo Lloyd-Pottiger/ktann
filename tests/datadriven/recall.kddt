@@ -84,5 +84,5 @@ mean usage: visited_partitions=7 visited_leaf_entries=43 exact_rerank_candidates
 
 recall k=10 samples=20 query=clustered:20:6 query-seed=91 beam-size=8 min-recall=95
 ----
-recall@10: 100.00% (samples=20, truncated=0)
+recall@10: 100.00% (samples=20, truncated=20)
 mean usage: visited_partitions=13 visited_leaf_entries=85 exact_rerank_candidates=23

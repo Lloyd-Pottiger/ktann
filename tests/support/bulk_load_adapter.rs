@@ -10,22 +10,76 @@ use ktann::runtime::Runtime;
 use ktann::storage::backend::{Backend, ReadOps};
 use std::path::Path;
 
+#[path = "graph_updates.rs"]
+mod graph_updates;
+
+#[path = "graph_history.rs"]
+pub mod graph_history;
+
 /// Exercises both manual loading and worker acceptance across a real backend
 /// reopen, then checks exact bytes before publication and ordinary verification.
 pub async fn exercise<B: Backend>(backend: impl Fn() -> B, directory: &Path) {
-    let config = IndexConfig::new(2, Metric::L2)
+    for (name, graph, metric) in [
+        ("ordinary", false, Metric::L2),
+        ("graph-l2", true, Metric::L2),
+        ("graph-cosine", true, Metric::Cosine),
+        ("graph-ip", true, Metric::InnerProduct),
+    ] {
+        let path = directory.join(name);
+        std::fs::create_dir(&path).unwrap();
+        exercise_mode(&backend, &path, graph, metric, false, &|_, _| {}).await;
+    }
+    exercise_updates(&backend, &directory.join("graph-updates"), &|_, _| {}).await;
+    graph_history::exercise(&backend, &|_, _| {}).await;
+}
+
+/// The same graph-update corpus is used by all adapters; Memory adds commit faults.
+pub async fn exercise_updates<B: Backend>(
+    backend: &impl Fn() -> B,
+    directory: &Path,
+    fault: &dyn Fn(&'static str, usize),
+) {
+    std::fs::create_dir(directory).unwrap();
+    exercise_mode(backend, directory, true, Metric::L2, true, fault).await;
+}
+
+async fn exercise_mode<B: Backend>(
+    backend: &impl Fn() -> B,
+    directory: &Path,
+    graph: bool,
+    metric: Metric,
+    updates: bool,
+    fault: &dyn Fn(&'static str, usize),
+) {
+    let config = IndexConfig::new(2, metric)
         .unwrap()
-        .with_partition_entries(4, 16)
+        .with_leaf_partition_entries(if updates { 1 } else { 4 }, if updates { 2 } else { 16 })
+        .and_then(|config| {
+            config.with_internal_partition_entries(2, if updates { 2048 } else { 4 })
+        })
         .unwrap()
         .with_fields(vec![FieldSchema::new("bucket", DataType::I64).unwrap()])
         .unwrap()
         .with_tree_key_fields(vec![FieldId(0)])
         .unwrap();
+    let config = if graph {
+        config.with_local_graph(
+            ktann::api::LocalGraphConfig::new(
+                if updates { 16 } else { 4 },
+                if updates { 64 } else { 16 },
+                [3; 32],
+            )
+            .unwrap(),
+        )
+    } else {
+        config
+    };
+    let record_count: u64 = if updates { 4096 } else { 128 };
     let source = InputSnapshot::create(
         &directory.join("source"),
         config,
         1024 * 1024,
-        (0..128_u64).map(|id| {
+        (0..record_count).map(|id| {
             Record::new(
                 Bytes::copy_from_slice(&id.to_be_bytes()),
                 vec![id as f32, 1.0],
@@ -36,10 +90,12 @@ pub async fn exercise<B: Backend>(backend: impl Fn() -> B, directory: &Path) {
     )
     .unwrap();
     let tree = ConstructionOptions {
-        min_partition_entries: 4,
-        max_partition_entries: 16,
         sample_items: 16,
-        memory_bytes: 2 * 1024 * 1024,
+        memory_bytes: if updates {
+            128 * 1024 * 1024
+        } else {
+            2 * 1024 * 1024
+        },
         scratch_bytes: 16 * 1024 * 1024,
     };
     let raw = backend();
@@ -59,6 +115,8 @@ pub async fn exercise<B: Backend>(backend: impl Fn() -> B, directory: &Path) {
         &source,
         *job.index_manifest().rotation_seed(),
         ForestOptions {
+            refinement_rounds: None,
+            refinement_memory_bytes: 256 * 1024 * 1024,
             sample_items: tree.sample_items,
             tree_memory_bytes: tree.memory_bytes,
             tree_scratch_bytes: tree.scratch_bytes,
@@ -74,6 +132,7 @@ pub async fn exercise<B: Backend>(backend: impl Fn() -> B, directory: &Path) {
         &forest,
         job.index_manifest(),
         ServingOptions {
+            graph_memory_bytes: 256 * 1024 * 1024,
             memory_bytes: 8 * 1024 * 1024,
             scratch_bytes: 32 * 1024 * 1024,
             hard_limits,
@@ -83,7 +142,7 @@ pub async fn exercise<B: Backend>(backend: impl Fn() -> B, directory: &Path) {
     .unwrap();
     let options = BulkLoadOptions {
         max_mutations: 17,
-        max_bytes: 4096,
+        max_bytes: if updates { 128 * 1024 } else { 4096 },
     };
     job.load_serving(&serving, options).await.unwrap();
     let root = directory.join("worker");
@@ -116,12 +175,21 @@ pub async fn exercise<B: Backend>(backend: impl Fn() -> B, directory: &Path) {
         ErrorKind::IndexBuilding
     );
     let raw = backend();
-    let mut txn = raw.begin_read().await.unwrap();
-    for entry in serving.reader().unwrap() {
-        let entry = entry.unwrap();
-        assert_eq!(txn.get(entry.key).await.unwrap(), Some(entry.value));
+    // Loading is complete and the hidden namespace is immutable, so batches
+    // need no shared snapshot. Keep reads within FoundationDB's transaction
+    // lifetime even when the artifact contains thousands of entries.
+    let mut entries = serving.reader().unwrap();
+    loop {
+        let batch: Vec<_> = entries.by_ref().take(128).map(Result::unwrap).collect();
+        if batch.is_empty() {
+            break;
+        }
+        let mut txn = raw.begin_read().await.unwrap();
+        let keys = batch.iter().map(|entry| entry.key.clone()).collect();
+        let actual = txn.batch_get(keys).await.unwrap();
+        let expected: Vec<_> = batch.into_iter().map(|entry| Some(entry.value)).collect();
+        assert_eq!(actual, expected);
     }
-    drop(txn);
     let index = reopened.complete(worker.clone()).await.unwrap();
     let verified = index
         .verify(ktann::api::VerifyOptions::default())
@@ -132,7 +200,84 @@ pub async fn exercise<B: Backend>(backend: impl Fn() -> B, directory: &Path) {
         "{:?}",
         verified.issues
     );
-    assert_eq!(verified.objects.vector_records, 128);
+    assert_eq!(verified.objects.vector_records, record_count);
+    if updates {
+        graph_updates::exercise(&raw, &index, id, fault).await;
+    }
+    // Exercise real storage reads for both serving modes after durable loading.
+    // The default beam is exhaustive for this small two-Tree-Key fixture.
+    let modes = if graph {
+        vec![
+            ktann::api::RoutingMode::Exact,
+            ktann::api::RoutingMode::PartitionLocalHnsw { ef_search: 1 },
+        ]
+    } else {
+        vec![ktann::api::RoutingMode::Exact]
+    };
+    for mode in modes {
+        for _ in 0..2 {
+            let result = index
+                .search(
+                    ktann::api::SearchRequest::new(vec![0.0, 1.0], 8)
+                        .unwrap()
+                        .with_options(
+                            ktann::api::SearchOptions::default()
+                                .with_routing_mode(mode)
+                                .unwrap(),
+                        ),
+                )
+                .await
+                .unwrap();
+            let actual: Vec<_> = result
+                .hits
+                .iter()
+                .map(|hit| {
+                    (
+                        u64::from_be_bytes(hit.id().as_ref().try_into().unwrap()),
+                        hit.distance(),
+                    )
+                })
+                .collect();
+            // The beam covers every leaf in this fixture. This original-vector
+            // oracle is independent of both routing implementations.
+            let mut expected: Vec<_> = (0..record_count)
+                .map(|id| {
+                    let distance = match metric {
+                        Metric::L2 => id as f64,
+                        Metric::Cosine => 1.0 - 1.0 / ((id as f64).powi(2) + 1.0).sqrt(),
+                        Metric::InnerProduct => -1.0,
+                        _ => unreachable!(),
+                    };
+                    (id, distance)
+                })
+                .collect();
+            expected.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+            assert_eq!(actual.len(), 8);
+            for (actual, expected) in actual.iter().zip(expected.iter().take(8)) {
+                assert_eq!(actual.0, expected.0);
+                assert!((actual.1 - expected.1).abs() < 1e-12);
+            }
+        }
+    }
+
+    if graph {
+        // Bulk-built graph indexes retain ordinary public write capability.
+        let id = Bytes::from_static(b"post-publication");
+        index
+            .insert(Record::new(id.clone(), vec![0.25, 1.0], vec![Value::I64(0)]).unwrap())
+            .await
+            .unwrap();
+        index
+            .upsert(Record::new(id.clone(), vec![0.5, 1.0], vec![Value::I64(0)]).unwrap())
+            .await
+            .unwrap();
+        assert!(index.delete(id).await.unwrap());
+        let report = index
+            .verify(ktann::api::VerifyOptions::default())
+            .await
+            .unwrap();
+        assert!(report.complete && report.issues.is_empty());
+    }
     assert_eq!(reopened.status().await.unwrap(), BulkBuildStatus::Published);
     runtime.drop_index("bulk-loader").await.unwrap();
     assert_eq!(

@@ -2620,3 +2620,65 @@ async fn leaf_relocation_conflicts_with_a_concurrent_destination_insert() {
         ErrorKind::RetryableAbort
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn independent_capacities_govern_online_leaf_and_internal_splits() {
+    for (leaf_min, leaf_max, internal_min, internal_max) in [(2, 4, 1, 2), (1, 2, 2, 8)] {
+        let backend = backend();
+        let runtime = make_runtime(backend.clone());
+        let index = runtime
+            .create_index(
+                "capacity",
+                config(leaf_min, leaf_max)
+                    .with_internal_partition_entries(internal_min, internal_max)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let manifest = read_manifest(&backend, index.logical_index_id()).await;
+        let key = tree_key(1);
+        let records = seed_records(&index, 1, 48).await;
+        for pass in 0..100 {
+            let mut split_any = false;
+            for partition in all_partitions(&backend, &manifest, &key).await {
+                let header = header_of(&backend, &manifest, &key, partition)
+                    .await
+                    .unwrap();
+                if header.entry_count() > index.config().max_partition_entries(header.level()) {
+                    let outcomes =
+                        drive_split_to_completion(&backend, &manifest, &key, partition).await;
+                    assert!(matches!(outcomes.last(), Some(Advance::Completed { .. })));
+                    split_any = true;
+                }
+            }
+            if !split_any {
+                break;
+            }
+            assert!(pass < 99, "splits must converge");
+        }
+        let root = header_of(&backend, &manifest, &key, pk(1)).await.unwrap();
+        assert!(root.level() >= 3);
+        for partition in all_partitions(&backend, &manifest, &key).await {
+            let header = header_of(&backend, &manifest, &key, partition)
+                .await
+                .unwrap();
+            assert_eq!(header.state(), PartitionState::Ready);
+            assert!(header.entry_count() <= index.config().max_partition_entries(header.level()));
+            if partition != pk(1) {
+                assert!(
+                    header.entry_count() >= index.config().min_partition_entries(header.level())
+                );
+            }
+            // At the selected maximum, another explicit split must remain idle.
+            assert!(matches!(
+                split::advance(&backend, &manifest, &key, partition, 20_000, &retry())
+                    .await
+                    .unwrap(),
+                Advance::Idle
+            ));
+        }
+        assert_exact_membership(&backend, &manifest, &key, &records).await;
+        assert_searchable(&backend, &manifest, &key, &records).await;
+        runtime.shutdown().await.unwrap();
+    }
+}

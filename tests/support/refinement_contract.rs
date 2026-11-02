@@ -28,7 +28,8 @@ pub async fn setup<B: Backend>(
             "offline-refinement",
             IndexConfig::new(1, Metric::L2)
                 .unwrap()
-                .with_partition_entries(2, 8)
+                .with_leaf_partition_entries(2, 8)
+                .and_then(|config| config.with_internal_partition_entries(1, 2))
                 .unwrap(),
         )
         .await

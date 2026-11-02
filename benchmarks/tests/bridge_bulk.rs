@@ -13,17 +13,41 @@ struct Bridge {
 }
 impl Bridge {
     fn start() -> Self {
+        Self::start_with(None)
+    }
+
+    fn start_with(experiment: Option<Value>) -> Self {
+        Self::start_with_database(experiment, None, false)
+    }
+
+    fn start_with_database(
+        experiment: Option<Value>,
+        database: Option<&std::path::Path>,
+        preserve_index: bool,
+    ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("bridge.sock");
         let scratch = directory.path().join("scratch");
         std::fs::create_dir(&scratch).unwrap();
-        let mut process = Command::new(env!("CARGO_BIN_EXE_ktann-vdbbench-bridge"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ktann-vdbbench-bridge"));
+        if let Some(experiment) = experiment {
+            command
+                .arg("--routing-experiment")
+                .arg(experiment.to_string());
+        }
+        let mut process = command
             .arg("--backend")
             .arg("rocksdb")
             .arg("--socket")
             .arg(&socket)
+            .arg("--preserve-index")
+            .arg(preserve_index.to_string())
             .arg("--database")
-            .arg(directory.path().join("database"))
+            .arg(
+                database
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or_else(|| directory.path().join("database")),
+            )
             .arg("--report")
             .arg(directory.path().join("report.json"))
             .env("TMPDIR", &scratch)
@@ -119,7 +143,7 @@ impl Drop for Bridge {
 fn staged_bulk_build_publishes_and_reports_real_build_phases() {
     let mut bridge = Bridge::start();
     assert_eq!(
-        bridge.request(json!({"op":"reset","dimension":4,"metric":"L2","refinement_rounds":2,"refinement_input_bytes":33554432,"dataset":"bulk-test"}))["ok"],
+        bridge.request(json!({"op":"reset","dimension":4,"metric":"L2","refinement_rounds":2,"refinement_memory_bytes":33554432,"dataset":"bulk-test"}))["ok"],
         true
     );
     for start in [0, 50, 100, 150] {
@@ -132,15 +156,6 @@ fn staged_bulk_build_publishes_and_reports_real_build_phases() {
         bridge.request(json!({"op":"search","vector":[7.,1.,2.,3.],"k":1}))["ok"],
         false
     );
-    let source = std::fs::read_dir(bridge.directory.path().join("scratch"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path()
-        .join("bulk/source");
-    assert!(source.is_dir());
-    assert!(!source.join("manifest.bin").exists());
     assert_eq!(
         bridge.request(json!({"op":"optimize","records":200}))["ok"],
         true
@@ -153,7 +168,6 @@ fn staged_bulk_build_publishes_and_reports_real_build_phases() {
     assert_eq!(response["ok"], true);
     assert_eq!(response["result"]["ids"], json!([7]));
     assert_eq!(bridge.insert(&[201], &[vec![1., 2., 3., 4.]])["ok"], false);
-    assert!(source.join("manifest.bin").exists());
     bridge.stop();
     let report: Value = serde_json::from_slice(
         &std::fs::read(bridge.directory.path().join("report.json")).unwrap(),
@@ -161,9 +175,8 @@ fn staged_bulk_build_publishes_and_reports_real_build_phases() {
     .unwrap();
     assert_eq!(report["build_mode"], "bulk");
     assert_eq!(report["ready"], true);
-    assert!(report["phases"]["refinement_seconds"].as_f64().unwrap() > 0.);
-    assert_eq!(report["refinement"]["rounds"], 2);
-    assert_eq!(report["refinement"]["input_bytes"], 33554432);
+    assert_eq!(report["bulk_build"]["refinement_rounds"], 2);
+    assert_eq!(report["bulk_build"]["refinement_memory_bytes"], 33554432);
     for phase in [
         "snapshot_seconds",
         "prepare_load_seconds",
@@ -171,13 +184,12 @@ fn staged_bulk_build_publishes_and_reports_real_build_phases() {
     ] {
         assert!(report["bulk_build"][phase].as_f64().unwrap() > 0.);
     }
-    assert!(!source.exists());
 }
 #[test]
 fn duplicate_staged_ids_fail_before_publication() {
     let mut bridge = Bridge::start();
     assert_eq!(
-        bridge.request(json!({"op":"reset","dimension":4,"metric":"L2","refinement_rounds":2,"refinement_input_bytes":33554432,"dataset":"duplicate"}))["ok"],
+        bridge.request(json!({"op":"reset","dimension":4,"metric":"L2","refinement_rounds":2,"refinement_memory_bytes":33554432,"dataset":"duplicate"}))["ok"],
         true
     );
     let response = bridge.insert(&[1, 1], &[vec![1., 2., 3., 4.], vec![2., 3., 4., 5.]]);
@@ -194,12 +206,12 @@ fn duplicate_staged_ids_fail_before_publication() {
 }
 
 #[test]
-fn refinement_limit_failure_keeps_search_closed_after_bulk_publication() {
+fn refinement_limit_failure_stays_terminal_and_keeps_search_closed() {
     let mut bridge = Bridge::start();
     assert_eq!(
         bridge.request(
             json!({"op":"reset","dimension":4,"metric":"L2","dataset":"limit",
-            "refinement_rounds":2,"refinement_input_bytes":1})
+            "refinement_rounds":2,"refinement_memory_bytes":1})
         )["ok"],
         true
     );
@@ -225,13 +237,108 @@ fn refinement_limit_failure_keeps_search_closed_after_bulk_publication() {
     .unwrap();
     assert_eq!(report["ready"], false);
     assert!(report["bulk_build"].is_object());
-    let optimize = report["phases"]["optimize_seconds"].as_f64().unwrap();
-    let refinement = report["phases"]["refinement_seconds"].as_f64().unwrap();
-    let build = report["bulk_build"]["prepare_load_seconds"]
-        .as_f64()
-        .unwrap()
-        + report["bulk_build"]["validate_publish_cleanup_seconds"]
-            .as_f64()
-            .unwrap();
-    assert!(refinement > 0. && optimize >= build + refinement);
+    assert_eq!(report["bulk_build"]["refinement_memory_bytes"], 1);
+    assert!(report["bulk_build"]["forest_seconds"].is_null());
+    assert!(report["phases"]["optimize_seconds"].as_f64().unwrap() > 0.);
+}
+
+#[test]
+fn fixed_bridge_routes_after_artifact_refinement() {
+    for mode in ["exact", "partition-local-hnsw"] {
+        let mut bridge = Bridge::start_with(Some(
+            json!({"mode":mode, "m":8, "ef_construction":40, "graph_seed":9, "ef_search":16, "build_memory_bytes":33554432}),
+        ));
+        let reset = bridge.request(json!({"op":"reset","dimension":4,"metric":"L2","refinement_rounds":1,
+            "refinement_memory_bytes":8388608,"dataset":"fixed", "min_leaf_partition_entries":4,
+            "max_leaf_partition_entries":16,"min_internal_partition_entries":4,"max_internal_partition_entries":16,"leaf_beam":4}));
+        assert_eq!(reset["ok"], true, "{reset}");
+        for start in [0, 50, 100, 150] {
+            let ids: Vec<_> = (start..start + 50).collect();
+            let vectors: Vec<_> = ids.iter().map(|id| vec![*id as f32, 1., 2., 3.]).collect();
+            assert_eq!(bridge.insert(&ids, &vectors)["ok"], true);
+        }
+        let optimize = bridge.request(json!({"op":"optimize","records":200}));
+        assert_eq!(optimize["ok"], true, "{optimize}");
+        let result = bridge.request(json!({"op":"search","vector":[7.,1.,2.,3.],"k":1}));
+        assert_eq!(result["result"]["ids"], json!([7]), "{result}");
+        bridge.stop();
+        let report: Value = serde_json::from_slice(
+            &std::fs::read(bridge.directory.path().join("report.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report["configuration"]["routing_experiment"]["mode"], mode);
+        assert_eq!(report["bulk_build"]["refinement_memory_bytes"], 8388608);
+        for field in [
+            "construction_memory_bytes",
+            "sort_memory_bytes",
+            "serving_memory_bytes",
+            "graph_memory_bytes",
+        ] {
+            assert_eq!(report["bulk_build"][field], 33554432, "{field}: {report}");
+        }
+    }
+}
+
+#[test]
+fn invalid_refinement_controls_do_not_consume_reset() {
+    let mut bridge = Bridge::start();
+    for (rounds, memory) in [(6, 33554432), (0, 0)] {
+        assert_eq!(
+            bridge.request(json!({
+                "op":"reset", "dimension":4, "metric":"L2", "dataset":"invalid-controls",
+                "refinement_rounds":rounds, "refinement_memory_bytes":memory,
+            }))["ok"],
+            false
+        );
+    }
+    assert_eq!(
+        bridge.request(json!({
+            "op":"reset", "dimension":4, "metric":"L2", "dataset":"valid-controls",
+            "refinement_rounds":0, "refinement_memory_bytes":33554432,
+        }))["ok"],
+        true
+    );
+    bridge.stop();
+}
+
+#[test]
+fn resume_opens_frozen_index_after_process_restart() {
+    let mut original = Bridge::start_with_database(None, None, true);
+    assert_eq!(
+        original.request(json!({"op":"resume","dataset":"tiny","records":3,"leaf_beam":128}))["ok"],
+        false
+    );
+    assert_eq!(original.request(json!({"op":"reset","dimension":2,"metric":"L2","dataset":"tiny","refinement_rounds":0,"refinement_memory_bytes":33554432}))["ok"], true);
+    assert_eq!(
+        original.insert(&[1, 2, 3], &[vec![1., 0.], vec![2., 0.], vec![3., 0.]])["ok"],
+        true
+    );
+    assert_eq!(
+        original.request(json!({"op":"optimize","records":3}))["ok"],
+        true
+    );
+    let expected = original.request(json!({"op":"search","vector":[1.,0.],"k":2}));
+    original.stop();
+    let mut resumed = Bridge::start_with_database(
+        None,
+        Some(&original.directory.path().join("database")),
+        true,
+    );
+    assert_eq!(
+        resumed.request(json!({"op":"health"}))["result"]["ready"],
+        false
+    );
+    assert_eq!(
+        resumed.request(json!({"op":"resume","dataset":"tiny","records":3,"leaf_beam":128}))["ok"],
+        true
+    );
+    assert_eq!(
+        resumed.request(json!({"op":"search","vector":[1.,0.],"k":2}))["result"]["ids"],
+        expected["result"]["ids"]
+    );
+    assert_eq!(
+        resumed.request(json!({"op":"resume","dataset":"tiny","records":3,"leaf_beam":128}))["ok"],
+        false
+    );
+    resumed.stop();
 }

@@ -24,6 +24,10 @@ use super::{InputSnapshot, plan};
 pub struct ForestOptions {
     /// Maximum training sample per construction group.
     pub sample_items: usize,
+    /// Optional refinement after construction; zero refreshes centroids only.
+    pub refinement_rounds: Option<u8>,
+    /// Additional per-tree input, topology, and refinement planning ceiling.
+    pub refinement_memory_bytes: usize,
     /// Memory ceiling for construction of one tree.
     pub tree_memory_bytes: usize,
     /// Live scratch ceiling for construction of one tree.
@@ -35,15 +39,24 @@ pub struct ForestOptions {
 }
 
 impl ForestOptions {
-    fn construction(self, config: &IndexConfig) -> ConstructionOptions {
+    fn construction(self) -> ConstructionOptions {
         ConstructionOptions {
-            min_partition_entries: config.min_partition_entries(),
-            max_partition_entries: config.max_partition_entries(),
             sample_items: self.sample_items,
             memory_bytes: self.tree_memory_bytes,
             scratch_bytes: self.tree_scratch_bytes,
         }
     }
+}
+
+/// Conservative admission for retained preparation and numerical planning arrays.
+fn charge_refinement(used: &mut usize, bytes: usize, limit: usize) -> Result<()> {
+    *used = used
+        .checked_add(bytes)
+        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+    if *used > limit {
+        return Err(Error::new(ErrorKind::LimitExceeded));
+    }
+    Ok(())
 }
 
 /// Completed forest counts and algorithm-owned scratch IO evidence.
@@ -142,13 +155,32 @@ impl ForestArtifact {
         options: ForestOptions,
         maximum_bytes: u64,
     ) -> Result<(Self, ForestReport)> {
+        Self::build_controlled(directory, input, seed, options, maximum_bytes, &|| Ok(()))
+    }
+
+    /// Preparation with runtime cancellation retained across refinement.
+    pub(crate) fn build_controlled(
+        directory: &Path,
+        input: &InputSnapshot,
+        seed: [u8; 32],
+        options: ForestOptions,
+        maximum_bytes: u64,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<(Self, ForestReport)> {
+        check()?;
         validate(input.config(), directory, options)?;
         let config = input.config();
         let types = tree_types(config);
         let writer = Writer::new(
             directory,
             2,
-            binding(input.manifest(), input.config(), seed, options.sample_items),
+            binding(
+                input.manifest(),
+                input.config(),
+                seed,
+                options.sample_items,
+                options.refinement_rounds,
+            ),
             maximum_bytes,
         )?;
         let sort_directory = directory.join("sort");
@@ -192,7 +224,15 @@ impl ForestArtifact {
         drop(source);
         let tree_run = trees.finish(&mut space)?;
         space.remove(projected)?;
-        Self::construct(directory, input, seed, options, writer, space, tree_run)
+        Self::construct(
+            directory,
+            input,
+            seed,
+            options,
+            writer,
+            (space, tree_run),
+            check,
+        )
     }
 
     /// Consumes receipt-time sorting work without rescanning the source.
@@ -203,6 +243,18 @@ impl ForestArtifact {
         seed: [u8; 32],
         maximum_bytes: u64,
     ) -> Result<(Self, ForestReport)> {
+        Self::build_prepared_controlled(directory, prepared, seed, maximum_bytes, &|| Ok(()))
+    }
+
+    /// Receipt preparation shares the same final refinement and cancellation path.
+    pub(crate) fn build_prepared_controlled(
+        directory: &Path,
+        prepared: PreparedInput,
+        seed: [u8; 32],
+        maximum_bytes: u64,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<(Self, ForestReport)> {
+        check()?;
         let PreparedInput {
             source,
             preparation,
@@ -217,6 +269,7 @@ impl ForestArtifact {
                 source.config(),
                 seed,
                 options.sample_items,
+                options.refinement_rounds,
             ),
             maximum_bytes,
         )?;
@@ -225,7 +278,15 @@ impl ForestArtifact {
             return Err(Error::new(ErrorKind::RecordAlreadyExists));
         }
         let run = preparation.trees.finish(&mut space)?;
-        Self::construct(directory, &source, seed, options, writer, space, run)
+        Self::construct(
+            directory,
+            &source,
+            seed,
+            options,
+            writer,
+            (space, run),
+            check,
+        )
     }
 
     /// Consumes Tree Key-sorted projections one tree at a time and seals the resulting forest.
@@ -236,16 +297,18 @@ impl ForestArtifact {
         seed: [u8; 32],
         options: ForestOptions,
         mut writer: Writer,
-        mut space: Space,
-        tree_run: super::sort::Run,
+        sorted: (Space, super::sort::Run),
+        check: &dyn Fn() -> Result<()>,
     ) -> Result<(Self, ForestReport)> {
         let config = input.config();
         let types = tree_types(config);
+        let (mut space, tree_run) = sorted;
         let mut source = space.reader(&tree_run)?;
         let mut next = source.next()?;
         let mut report = ForestReport::default();
         let scratch = directory.join("tree");
         while let Some(first) = &next {
+            check()?;
             let tree = TreeKey::from_encoded(&types, Bytes::copy_from_slice(&first.key))?;
             let records = std::iter::from_fn(|| {
                 if next.as_ref().is_none_or(|row| row.key != tree.as_bytes()) {
@@ -261,21 +324,72 @@ impl ForestArtifact {
                     Err(error) => Some(Err(error)),
                 }
             });
-            let built = construct_tree(
-                &scratch,
-                config.dimension(),
-                config.metric(),
-                seed,
-                options.construction(config),
-                records,
-                |partition| {
-                    let mut frame = Vec::new();
-                    frame.extend_from_slice(&(tree.as_bytes().len() as u32).to_be_bytes());
-                    frame.extend_from_slice(tree.as_bytes());
-                    plan::encode(&partition, &mut frame);
-                    writer.append(&frame)
-                },
-            )?;
+            let mut emit = |partition: PartitionPlan| {
+                let mut frame = Vec::new();
+                frame.extend_from_slice(&(tree.as_bytes().len() as u32).to_be_bytes());
+                frame.extend_from_slice(tree.as_bytes());
+                plan::encode(&partition, &mut frame);
+                writer.append(&frame)
+            };
+            let built = if let Some(rounds) = options.refinement_rounds {
+                let mut used = 0usize;
+                let mut retained = Vec::new();
+                for record in records {
+                    let record = record?;
+                    check()?;
+                    // Conservative admission for retained originals, routing
+                    // vectors, ID maps, and simultaneous per-round planning scratch.
+                    charge_refinement(
+                        &mut used,
+                        1024 + record.id.len() * 4 + config.dimension() * 12,
+                        options.refinement_memory_bytes,
+                    )?;
+                    retained.push(record);
+                }
+                let mut plans = Vec::new();
+                let built = construct_tree(
+                    &scratch,
+                    config,
+                    seed,
+                    options.construction(),
+                    retained.iter().map(|record| {
+                        Ok(ConstructionRecord {
+                            id: record.id.clone(),
+                            vector: record.vector.clone(),
+                        })
+                    }),
+                    |partition| {
+                        charge_refinement(
+                            &mut used,
+                            512 + config.dimension() * 24 + partition.entries.len() * 128,
+                            options.refinement_memory_bytes,
+                        )?;
+                        plans.push(partition);
+                        Ok(())
+                    },
+                )?;
+                crate::runtime::refine::refine_plans(
+                    config,
+                    seed,
+                    retained,
+                    &mut plans,
+                    rounds,
+                    &|| check(),
+                )?;
+                for partition in plans {
+                    emit(partition)?;
+                }
+                built
+            } else {
+                construct_tree(
+                    &scratch,
+                    config,
+                    seed,
+                    options.construction(),
+                    records,
+                    emit,
+                )?
+            };
             fs::remove_dir(&scratch).map_err(io_error)?;
             report.trees = checked_add(report.trees, 1)?;
             report.records = checked_add(report.records, built.records)?;
@@ -316,12 +430,18 @@ impl ForestArtifact {
         config: IndexConfig,
         seed: [u8; 32],
         sample_items: usize,
+        refinement_rounds: Option<u8>,
     ) -> Result<Self> {
         config.validate()?;
-        if sample_items < 2
+        if refinement_rounds
+            .is_some_and(|rounds| usize::from(rounds) > crate::api::MAX_REFINEMENT_ROUNDS)
+            || sample_items < 2
             || directory.as_os_str().len() > 4096
             || !source.matches(0, super::input::schema_binding(&config))
-            || !expected.matches(2, binding(source, &config, seed, sample_items))
+            || !expected.matches(
+                2,
+                binding(source, &config, seed, sample_items, refinement_rounds),
+            )
         {
             return Err(Error::invalid_argument());
         }
@@ -359,7 +479,10 @@ impl ForestArtifact {
             + MAX_TREE_KEY_BYTES
             + 16
             + self.config.dimension() * 4
-            + self.config.max_partition_entries() as usize
+            + self
+                .config
+                .max_leaf_partition_entries()
+                .max(self.config.max_internal_partition_entries()) as usize
                 * (size_of::<u16>() + crate::api::MAX_RECORD_ID_BYTES);
         Ok(ForestReader {
             reader: Reader::open(&self.directory, &self.manifest, maximum_frame)?,
@@ -402,11 +525,7 @@ impl ForestReader {
             return Err(corrupt());
         }
         let tree = TreeKey::from_encoded(&self.types, frame.split_to(length))?;
-        let partition = plan::decode(
-            frame,
-            self.config.dimension(),
-            self.config.max_partition_entries(),
-        )?;
+        let partition = plan::decode(frame, &self.config)?;
         if self.tree.as_ref() != Some(&tree) {
             if self
                 .tree
@@ -428,7 +547,8 @@ impl ForestReader {
             self.rooted = true;
         } else {
             if partition.key.get() != self.next_key
-                || partition.entries.len() < self.config.min_partition_entries() as usize
+                || partition.entries.len()
+                    < self.config.min_partition_entries(partition.level) as usize
             {
                 return Err(corrupt());
             }
@@ -512,11 +632,15 @@ fn maximum_row(config: &IndexConfig) -> usize {
 }
 
 fn validate(config: &IndexConfig, directory: &Path, options: ForestOptions) -> Result<()> {
-    options
-        .construction(config)
-        .resident_rows(config.dimension())?;
+    options.construction().resident_rows(config)?;
     super::sort::validate_memory(options.sort_memory_bytes, maximum_row(config))?;
-    if options.sort_scratch_bytes == 0 || directory.as_os_str().len() > 4096 {
+    if options
+        .refinement_rounds
+        .is_some_and(|rounds| usize::from(rounds) > crate::api::MAX_REFINEMENT_ROUNDS)
+        || options.refinement_memory_bytes == 0
+        || options.sort_scratch_bytes == 0
+        || directory.as_os_str().len() > 4096
+    {
         return Err(Error::invalid_argument());
     }
     Ok(())
@@ -548,11 +672,12 @@ fn checked_add(a: u64, b: u64) -> Result<u64> {
         .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))
 }
 
-fn binding(
+pub(super) fn binding(
     source: &ArtifactManifest,
     config: &IndexConfig,
     seed: [u8; 32],
     sample_items: usize,
+    refinement_rounds: Option<u8>,
 ) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(b"KTANN forest plan v1");
@@ -567,9 +692,22 @@ fn binding(
     for id in config.tree_key_fields() {
         hash.update(id.0.to_be_bytes());
     }
-    hash.update(config.min_partition_entries().to_be_bytes());
-    hash.update(config.max_partition_entries().to_be_bytes());
+    hash.update(config.min_leaf_partition_entries().to_be_bytes());
+    hash.update(config.max_leaf_partition_entries().to_be_bytes());
+    hash.update(config.min_internal_partition_entries().to_be_bytes());
+    hash.update(config.max_internal_partition_entries().to_be_bytes());
+    match config.local_graph() {
+        None => hash.update([0]),
+        Some(graph) => {
+            hash.update([1]);
+            hash.update(graph.m().to_be_bytes());
+            hash.update(graph.ef_construction().to_be_bytes());
+            hash.update(graph.seed());
+        }
+    }
     hash.update((sample_items as u64).to_be_bytes());
+    hash.update([refinement_rounds.map_or(0, |rounds| rounds + 1)]);
+    hash.update(b"artifact refinement v1");
     hash.finalize().into()
 }
 

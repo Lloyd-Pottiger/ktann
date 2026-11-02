@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use bytes::Bytes;
+#[cfg(test)]
 use tokio_util::sync::CancellationToken;
 
 use crate::api::{Error, ErrorKind, PartitionKey, RefineOptions, Result};
@@ -16,6 +17,7 @@ use crate::storage::keys::{LogicalKey, TreeKey};
 use crate::storage::values::{IndexManifest, PartitionState, PartitionTransition, PersistentValue};
 use crate::storage::{LogicalRange, LogicalScanCursor, LogicalScanPage, topology};
 
+use super::compute::controlled_compute;
 use super::{OperationContext, check_control, lifecycle::RetryPolicy, reads, writes};
 
 const PAGE: ScanLimits = ScanLimits {
@@ -172,9 +174,10 @@ async fn load<B: Backend>(
                 return Err(corrupt());
             }
             drop(txn);
-            if header.entry_count() > manifest.config().max_partition_entries()
+            if header.entry_count() > manifest.config().max_partition_entries(header.level())
                 || (parent.is_some()
-                    && header.entry_count() < manifest.config().min_partition_entries())
+                    && header.entry_count()
+                        < manifest.config().min_partition_entries(header.level()))
             {
                 return Err(Error::invalid_argument());
             }
@@ -293,44 +296,27 @@ fn plan(
                 )?;
             }
         }
-        tree.rounds = refine(
+        let history = &mut tree.rounds;
+        refine(
             checkpoint,
             &kernel,
             &loaded.vectors,
             &mut tree.parts[..leaf_count],
-            manifest.config().min_partition_entries() as usize,
-            manifest.config().max_partition_entries() as usize,
-            options,
-        )?
-        .into_iter()
-        .map(|round| {
-            round
-                .into_iter()
-                .map(|(position, source, target)| Move {
+            manifest.config().min_leaf_partition_entries() as usize,
+            manifest.config().max_leaf_partition_entries() as usize,
+            options.rounds,
+            |round, position, source, target| {
+                if history.len() == round {
+                    history.push(Vec::new());
+                }
+                history[round].push(Move {
                     source,
                     target,
                     id: loaded.ids[position].clone(),
-                })
-                .collect()
-        })
-        .collect();
-        let positions: BTreeMap<_, _> = tree
-            .parts
-            .iter()
-            .enumerate()
-            .map(|(i, part)| (part.key, i))
-            .collect();
-        for i in leaf_count..tree.parts.len() {
-            checkpoint()?;
-            let center = mean(
-                &kernel,
-                tree.parts[i]
-                    .children
-                    .iter()
-                    .map(|key| tree.parts[positions[key]].center.as_ref()),
-            )?;
-            tree.parts[i].center = center;
-        }
+                });
+            },
+        )?;
+        refresh_internal_centers(&kernel, &mut tree.parts, leaf_count, checkpoint)?;
         // Only final routing centers and ordered moves are needed during writes.
         for part in &mut tree.parts {
             part.members = Vec::new();
@@ -338,6 +324,116 @@ fn plan(
         }
     }
     Ok(loaded.trees)
+}
+
+/// Refreshes the hierarchy in child-before-parent order using unweighted means.
+fn refresh_internal_centers(
+    kernel: &VectorKernel,
+    parts: &mut [Part],
+    leaves: usize,
+    check: &impl Fn() -> Result<()>,
+) -> Result<BTreeMap<PartitionKey, usize>> {
+    let positions: BTreeMap<_, _> = parts
+        .iter()
+        .enumerate()
+        .map(|(i, part)| (part.key, i))
+        .collect();
+    for i in leaves..parts.len() {
+        check()?;
+        parts[i].center = mean(
+            kernel,
+            parts[i]
+                .children
+                .iter()
+                .map(|key| parts[positions[key]].center.as_ref()),
+        )?;
+    }
+    Ok(positions)
+}
+
+/// Pure artifact preparation reuses the ordinary numerical assignment algorithm.
+/// The caller admits all retained input and planning scratch before invoking it.
+pub(crate) fn refine_plans(
+    config: &crate::api::IndexConfig,
+    seed: [u8; 32],
+    records: Vec<crate::construction::ConstructionRecord>,
+    plans: &mut [crate::construction::PartitionPlan],
+    rounds: u8,
+    check: &impl Fn() -> Result<()>,
+) -> Result<()> {
+    let kernel = VectorKernel::new(config.dimension(), config.metric(), seed)?;
+    let mut ids = Vec::with_capacity(records.len());
+    let mut vectors = Vec::with_capacity(records.len());
+    for record in records {
+        check()?;
+        ids.push(record.id);
+        vectors.push(kernel.preprocess(&record.vector)?);
+    }
+    let positions: BTreeMap<_, _> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id.clone(), i))
+        .collect();
+    let mut parts = Vec::with_capacity(plans.len());
+    for plan in plans.iter_mut() {
+        check()?;
+        let members = if plan.level == 1 {
+            plan.entries
+                .iter()
+                .map(|id| positions.get(id).copied().ok_or_else(corrupt))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        let children = if plan.level > 1 {
+            plan.entries
+                .iter()
+                .map(|id| {
+                    PartitionKey::new(u64::from_be_bytes(
+                        id.as_ref().try_into().map_err(|_| corrupt())?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        let center = if plan.level == 1 {
+            mean(&kernel, members.iter().map(|&i| vectors[i].as_ref()))?
+        } else {
+            plan.centroid.clone()
+        };
+        parts.push(Part {
+            key: plan.key,
+            parent: None,
+            level: plan.level,
+            center,
+            members,
+            children,
+        });
+    }
+    parts.sort_by_key(|part| (part.level, part.key));
+    let leaves = parts.partition_point(|part| part.level == 1);
+    refine(
+        check,
+        &kernel,
+        &vectors,
+        &mut parts[..leaves],
+        config.min_leaf_partition_entries() as usize,
+        config.max_leaf_partition_entries() as usize,
+        rounds as usize,
+        |_, _, _, _| {},
+    )?;
+    let positions = refresh_internal_centers(&kernel, &mut parts, leaves, check)?;
+    for plan in plans {
+        check()?;
+        let part = &mut parts[positions[&plan.key]];
+        plan.centroid = std::mem::take(&mut part.center);
+        if plan.level == 1 {
+            plan.entries = part.members.iter().map(|&i| ids[i].clone()).collect();
+            plan.entries.sort();
+        }
+    }
+    Ok(())
 }
 
 /// Refines an ordinary index using existing retry/commit boundaries.
@@ -461,6 +557,13 @@ fn mean<'a>(kernel: &VectorKernel, members: impl Iterator<Item = &'a [f32]>) -> 
 /// Greedy positive-gain moves use fixed centroids during one round, then
 /// recompute spherical means. Exact counts constrain every accepted move.
 /// The only root leaf is exempt from the ordinary nonroot minimum.
+/// Only online planning retains accepted moves for later persistence; artifact
+/// preparation needs only the final membership and centroids. Callers discard
+/// their private planning state if any round fails.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "numerical inputs, occupancy bounds, and move observation are independent"
+)]
 fn refine(
     checkpoint: &impl Fn() -> Result<()>,
     kernel: &VectorKernel,
@@ -468,15 +571,14 @@ fn refine(
     leaves: &mut [Part],
     minimum: usize,
     maximum: usize,
-    options: &RefineOptions,
-) -> Result<Vec<Vec<(usize, PartitionKey, PartitionKey)>>> {
-    let mut rounds = Vec::new();
+    rounds: usize,
+    mut on_move: impl FnMut(usize, usize, PartitionKey, PartitionKey),
+) -> Result<()> {
     if leaves.len() < 2 {
-        return Ok(rounds);
+        return Ok(());
     }
-    for _ in 0..options.rounds {
+    for round in 0..rounds {
         checkpoint()?;
-        let mut accepted = Vec::new();
         let mut moves = Vec::new();
         for (source, leaf) in leaves.iter().enumerate() {
             checkpoint()?;
@@ -547,7 +649,7 @@ fn refine(
         let mut targets = BTreeMap::new();
         for (_, position, source, target) in moves {
             if counts[source] > minimum && counts[target] < maximum {
-                accepted.push((position, leaves[source].key, leaves[target].key));
+                on_move(round, position, leaves[source].key, leaves[target].key);
                 counts[source] -= 1;
                 counts[target] += 1;
                 targets.insert(position, target);
@@ -557,7 +659,6 @@ fn refine(
         if targets.is_empty() {
             break;
         }
-        rounds.push(accepted);
         let mut members = vec![Vec::new(); leaves.len()];
         for (source, leaf) in leaves.iter().enumerate() {
             for &position in &leaf.members {
@@ -573,35 +674,50 @@ fn refine(
             leaf.members = members;
         }
     }
-    Ok(rounds)
-}
-
-/// Keeps heavy CPU work off Tokio and cancels it when its owning future drops.
-/// Existing foreground admission bounds the number of these owned tasks.
-async fn controlled_compute<T: Send + 'static>(
-    options: crate::api::OperationOptions,
-    keep_alive: impl Send + 'static,
-    work: impl FnOnce(&crate::api::OperationOptions) -> Result<T> + Send + 'static,
-) -> Result<T> {
-    let cancellation = options
-        .cancellation()
-        .map(CancellationToken::child_token)
-        .unwrap_or_default();
-    let _guard = cancellation.clone().drop_guard();
-    let options = options.with_cancellation(cancellation);
-    tokio::task::spawn_blocking(move || {
-        // Retain admission even after the owning async future is cancelled.
-        let _keep_alive = keep_alive;
-        check_control(&options)?;
-        work(&options)
-    })
-    .await
-    .map_err(|error| Error::with_source(ErrorKind::Other, error))?
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn artifact_zero_rounds_refreshes_centroids_without_changing_membership() {
+        use crate::api::{IndexConfig, Metric};
+        use crate::construction::{ConstructionRecord, PartitionPlan};
+        let config = IndexConfig::new(1, Metric::L2).unwrap();
+        let mut plans = vec![PartitionPlan {
+            key: PartitionKey::new(1).unwrap(),
+            level: 1,
+            centroid: vec![999.0].into_boxed_slice(),
+            entries: vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")],
+        }];
+        let before = plans[0].entries.clone();
+        let records = vec![
+            ConstructionRecord {
+                id: before[0].clone(),
+                vector: vec![2.0].into_boxed_slice(),
+            },
+            ConstructionRecord {
+                id: before[1].clone(),
+                vector: vec![4.0].into_boxed_slice(),
+            },
+        ];
+        refine_plans(&config, [0; 32], records, &mut plans, 0, &|| Ok(())).unwrap();
+        assert_eq!(plans[0].entries, before);
+        let kernel = VectorKernel::new(1, Metric::L2, [0; 32]).unwrap();
+        let expected = mean(
+            &kernel,
+            [
+                kernel.preprocess(&[2.0]).unwrap(),
+                kernel.preprocess(&[4.0]).unwrap(),
+            ]
+            .iter()
+            .map(AsRef::as_ref),
+        )
+        .unwrap();
+        assert_eq!(plans[0].centroid, expected);
+    }
 
     #[test]
     fn refinement_improves_assignment_and_respects_occupancy() {
@@ -629,13 +745,42 @@ mod tests {
             },
         ];
         let options = RefineOptions::new(100).unwrap();
-        refine(&|| Ok(()), &kernel, &vectors, &mut leaves, 2, 2, &options).unwrap();
+        let mut moves = Vec::new();
+        refine(
+            &|| Ok(()),
+            &kernel,
+            &vectors,
+            &mut leaves,
+            2,
+            2,
+            options.rounds,
+            |round, position, source, target| moves.push((round, position, source, target)),
+        )
+        .unwrap();
         assert_eq!(leaves[0].members, [0, 2]); // A full target cannot accept a move.
-        refine(&|| Ok(()), &kernel, &vectors, &mut leaves, 1, 3, &options).unwrap();
+        assert!(moves.is_empty());
+        refine(
+            &|| Ok(()),
+            &kernel,
+            &vectors,
+            &mut leaves,
+            1,
+            3,
+            options.rounds,
+            |round, position, source, target| moves.push((round, position, source, target)),
+        )
+        .unwrap();
         assert_eq!(leaves[0].members, [0, 1]);
         assert_eq!(leaves[1].members, [2, 3]);
         assert_eq!(leaves[0].center.as_ref(), [0.5]);
         assert_eq!(leaves[1].center.as_ref(), [9.5]);
+        assert_eq!(
+            moves,
+            [
+                (0, 1, leaves[1].key, leaves[0].key),
+                (0, 2, leaves[0].key, leaves[1].key),
+            ]
+        );
     }
 
     #[test]
@@ -663,7 +808,17 @@ mod tests {
             std::mem::swap(&mut left[0].members[2], &mut right[0].members[2]);
         }
         let options = RefineOptions::new(4096).unwrap();
-        refine(&|| Ok(()), &kernel, &vectors, &mut leaves, 1, 5, &options).unwrap();
+        refine(
+            &|| Ok(()),
+            &kernel,
+            &vectors,
+            &mut leaves,
+            1,
+            5,
+            options.rounds,
+            |_, _, _, _| {},
+        )
+        .unwrap();
         for (cluster, leaf) in leaves.iter().enumerate() {
             assert_eq!(
                 leaf.members,

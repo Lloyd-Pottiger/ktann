@@ -7,8 +7,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use ktann::api::{
     CompareOp, DataType, FieldId, FieldSchema, Index, IndexConfig, Metric, OperationOptions,
-    Predicate, Record, RefineOptions, RuntimeConfig, SearchOptions, SearchRequest,
-    Value as FieldValue,
+    Predicate, Record, RuntimeConfig, SearchOptions, SearchRequest, Value as FieldValue,
 };
 use ktann::runtime::Runtime;
 use ktann::storage::backend::Backend;
@@ -24,7 +23,6 @@ use crate::backend::{BackendCounters, MeasuredBackend};
 use crate::resource::ResourceSnapshot;
 
 mod bulk;
-mod topology;
 
 /// Length-prefixed frames carry JSON control requests or binary float32 inserts.
 const VERSION: u32 = 1;
@@ -36,10 +34,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(3600);
 
 /// Private CLI options. A bridge owns exactly one isolated backend namespace.
 struct Options {
+    experiment: Option<crate::routing::Experiment>,
     socket: PathBuf,
     database: PathBuf,
     report: PathBuf,
     backend: String,
+    preserve_index: bool,
 }
 
 /// Runs a single bridge until shutdown or SIGINT, then closes the Runtime.
@@ -49,20 +49,31 @@ struct Options {
 pub fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     let mut options = Options {
+        experiment: None,
         socket: PathBuf::new(),
         database: PathBuf::new(),
         report: PathBuf::new(),
         backend: "rocksdb".into(),
+        preserve_index: false,
     };
     while let Some(arg) = args.next() {
         let value = args.next().ok_or(
             "expected --socket PATH --database PATH --report PATH --backend rocksdb|foundationdb",
         )?;
         match arg.as_str() {
+            "--routing-experiment" => {
+                let experiment: crate::routing::Experiment =
+                    serde_json::from_str(&value).map_err(|e| e.to_string())?;
+                experiment.validate()?;
+                options.experiment = Some(experiment);
+            }
             "--socket" => options.socket = value.into(),
             "--database" => options.database = value.into(),
             "--report" => options.report = value.into(),
             "--backend" => options.backend = value,
+            "--preserve-index" => {
+                options.preserve_index = value.parse::<bool>().map_err(|e| e.to_string())?
+            }
             _ => return Err(format!("unknown argument {arg}")),
         }
     }
@@ -72,6 +83,17 @@ pub fn run() -> Result<(), String> {
     {
         return Err("--socket, --database, and --report are required (database is the FDB namespace for foundationdb)".into());
     }
+    // Artifact refinement and publication produce settled topology before serving.
+    let runtime_config = RuntimeConfig::default()
+        .with_maintenance(0, 1)
+        .map_err(|e| e.to_string())?;
+    let runtime_config = if let Some(experiment) = &options.experiment {
+        runtime_config
+            .with_routing_working_bytes(experiment.routing_working_bytes)
+            .map_err(|e| e.to_string())?
+    } else {
+        runtime_config
+    };
     // Bind without unlinking: a stale path must never evict a live bridge.
     let executor = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -83,6 +105,18 @@ pub fn run() -> Result<(), String> {
             use ktann_rocksdb::{BackendNamespace, RocksDbBackend};
             let mut config = rocksdb::Options::default();
             config.create_if_missing(true);
+            // Share the existing cache budget between decoded partitions and
+            // native point-read results; record validity remains RocksDB-owned.
+            let cache_bytes = runtime_config.partition_cache_bytes();
+            let row_bytes = cache_bytes / 8;
+            let row_cache = rocksdb::Cache::new_lru_cache(
+                usize::try_from(row_bytes).map_err(|_| "row cache exceeds address space")?,
+            );
+            config.set_row_cache(&row_cache);
+            let runtime_config = runtime_config
+                .with_partition_cache_bytes(cache_bytes - row_bytes)
+                .map_err(|e| e.to_string())?;
+            eprintln!("rocksdb_row_cache_capacity_bytes={row_bytes}");
             let db = Arc::new(
                 rocksdb::OptimisticTransactionDB::open(&config, &options.database)
                     .map_err(|e| e.to_string())?,
@@ -95,6 +129,7 @@ pub fn run() -> Result<(), String> {
                 backend,
                 "rust-rocksdb=0.24.0; rocksdb=10.4.2".into(),
                 &options,
+                runtime_config,
             )
             .await
         }),
@@ -116,7 +151,7 @@ pub fn run() -> Result<(), String> {
                     database,
                     BackendNamespace::new(namespace).map_err(|e| e.to_string())?,
                 );
-                serve(backend, identity, &options).await
+                serve(backend, identity, &options, runtime_config).await
             })
         }
         _ => Err("backend unavailable; build with rocksdb and/or foundationdb features".into()),
@@ -135,13 +170,23 @@ struct Request {
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 /// Operations accepted by the versioned VectorDBBench process bridge.
 enum Operation {
+    /// Reopens a frozen, already-published benchmark index without mutation.
+    Resume {
+        dataset: String,
+        records: u64,
+        leaf_beam: u32,
+    },
     Reset {
         dimension: usize,
         metric: String,
+        min_leaf_partition_entries: Option<u32>,
+        max_leaf_partition_entries: Option<u32>,
+        min_internal_partition_entries: Option<u32>,
+        max_internal_partition_entries: Option<u32>,
         dataset: String,
         leaf_beam: Option<u32>,
         refinement_rounds: usize,
-        refinement_input_bytes: usize,
+        refinement_memory_bytes: usize,
     },
     #[serde(skip_deserializing)]
     Insert {
@@ -210,8 +255,7 @@ fn decode_request(data: &[u8]) -> Result<Request, String> {
 /// Lifecycle state is exclusive for mutation and shared for concurrent search.
 struct State<B: Backend> {
     index: Option<Index<MeasuredBackend<B>>>,
-    bulk: Option<bulk::InputCapture>,
-    bulk_report: Value,
+    bulk: Option<bulk::Build<MeasuredBackend<B>>>,
     ready: bool,
     records: u64,
     dimension: usize,
@@ -221,10 +265,6 @@ struct State<B: Backend> {
     started: Option<Instant>,
     insert_seconds: f64,
     optimize_seconds: f64,
-    refinement_seconds: f64,
-    refinement_rounds: usize,
-    refinement_input_bytes: usize,
-    topology: Value,
 }
 
 impl<B: Backend> Default for State<B> {
@@ -232,7 +272,6 @@ impl<B: Backend> Default for State<B> {
         Self {
             index: None,
             bulk: None,
-            bulk_report: Value::Null,
             ready: false,
             records: 0,
             dimension: 0,
@@ -242,10 +281,6 @@ impl<B: Backend> Default for State<B> {
             started: None,
             insert_seconds: 0.0,
             optimize_seconds: 0.0,
-            refinement_seconds: 0.0,
-            refinement_rounds: 0,
-            refinement_input_bytes: 0,
-            topology: Value::Null,
         }
     }
 }
@@ -260,7 +295,7 @@ struct Measurements {
     received_bytes: u64,
     sent_bytes: u64,
     budget: [u64; 4],
-    exhausted: [u64; 4],
+    exhausted: [u64; 3],
     last_search: Option<Instant>,
 }
 
@@ -275,7 +310,7 @@ impl Default for Measurements {
             received_bytes: 0,
             sent_bytes: 0,
             budget: [0; 4],
-            exhausted: [0; 4],
+            exhausted: [0; 3],
             last_search: None,
         }
     }
@@ -283,9 +318,9 @@ impl Default for Measurements {
 
 /// Shared process owner. No KTANN handle crosses the Python process boundary.
 struct Service<B: Backend> {
+    experiment: Option<crate::routing::Experiment>,
     runtime: Runtime<MeasuredBackend<B>>,
     bulk_workspace: PathBuf,
-    backend: MeasuredBackend<B>,
     state: RwLock<State<B>>,
     measurements: Mutex<Measurements>,
     counters: BackendCounters,
@@ -305,7 +340,12 @@ impl Drop for SocketGuard {
 }
 
 /// Owns the Unix socket and shared runtime for benchmark client connections.
-async fn serve<B: Backend>(backend: B, identity: String, options: &Options) -> Result<(), String> {
+async fn serve<B: Backend>(
+    backend: B,
+    identity: String,
+    options: &Options,
+    config: RuntimeConfig,
+) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     let listener = UnixListener::bind(&options.socket).map_err(|e| e.to_string())?;
     let _socket = SocketGuard(options.socket.clone());
@@ -317,19 +357,15 @@ async fn serve<B: Backend>(backend: B, identity: String, options: &Options) -> R
         backend.admission_budget()
     );
     let (backend, counters) = MeasuredBackend::new(backend);
-    // Bulk Build creates settled topology; refinement requires exclusive access.
-    let config = RuntimeConfig::default()
-        .with_maintenance(0, 1)
-        .map_err(|e| e.to_string())?;
     // Keep captured input and build files alive through retries and runtime shutdown.
     let workspace = tempfile::Builder::new()
         .prefix("ktann-vdbbench-")
         .tempdir()
         .map_err(|e| e.to_string())?;
     let service = Arc::new(Service {
-        runtime: Runtime::new(backend.clone(), config).map_err(|e| e.to_string())?,
+        experiment: options.experiment.clone(),
+        runtime: Runtime::new(backend, config).map_err(|e| e.to_string())?,
         bulk_workspace: workspace.path().join("bulk"),
-        backend,
         state: RwLock::new(State::default()),
         measurements: Mutex::new(Measurements::default()),
         counters,
@@ -364,11 +400,15 @@ async fn serve<B: Backend>(backend: B, identity: String, options: &Options) -> R
     }
     // Capture workload IO before deleting this bridge's dedicated Logical Index.
     let report = service.report(&options.backend).await;
-    let cleanup = service
-        .runtime
-        .drop_index("vdbbench")
-        .await
-        .map_err(|e| e.to_string());
+    let cleanup = if options.preserve_index {
+        Ok(())
+    } else {
+        service
+            .runtime
+            .drop_index("vdbbench")
+            .await
+            .map_err(|e| e.to_string())
+    };
     let shutdown = service.runtime.shutdown().await.map_err(|e| e.to_string());
     let persisted = report.and_then(|report| write_report(&options.report, &report));
     result.and(cleanup).and(shutdown).and(persisted)
@@ -474,17 +514,64 @@ impl<B: Backend> Service<B> {
                 )
             }
             Operation::Shutdown => Ok(json!({"shutdown":true})),
+            Operation::Resume {
+                dataset,
+                records,
+                leaf_beam,
+            } => {
+                if dataset.is_empty() || dataset.len() > 1024 {
+                    return Err(invalid("dataset identity required (at most 1024 bytes)"));
+                }
+                let mut search = SearchOptions::default()
+                    .with_leaf_beam_size(leaf_beam)
+                    .map_err(api_error)?;
+                if let Some(experiment) = &self.experiment {
+                    search = search
+                        .with_routing_mode(experiment.production_mode())
+                        .map_err(api_error)?;
+                }
+                let mut state = self.state.write().await;
+                if state.dimension != 0 {
+                    return Err(invalid("one case per bridge; restart before resume"));
+                }
+                let index = self
+                    .runtime
+                    .open_index("vdbbench")
+                    .await
+                    .map_err(api_error)?;
+                state.dimension = index.config().dimension();
+                state.metric = match index.config().metric() {
+                    Metric::L2 => "L2",
+                    Metric::Cosine => "COSINE",
+                    _ => return Err(invalid("only L2 and COSINE are supported")),
+                }
+                .to_owned();
+                state.dataset = dataset;
+                // Fixture cardinality is supplied by the benchmark controller;
+                // resume performs no full record scan or index mutation.
+                state.records = records;
+                state.search = search;
+                state.index = Some(index);
+                state.ready = true;
+                Ok(json!({"resumed":true}))
+            }
             Operation::Reset {
                 dimension,
                 metric,
+                min_leaf_partition_entries,
+                max_leaf_partition_entries,
+                min_internal_partition_entries,
+                max_internal_partition_entries,
                 dataset,
                 leaf_beam,
                 refinement_rounds,
-                refinement_input_bytes,
+                refinement_memory_bytes,
             } => {
-                RefineOptions::new(refinement_input_bytes)
-                    .and_then(|options| options.with_refinement_rounds(refinement_rounds))
-                    .map_err(api_error)?;
+                if refinement_rounds > 5 || refinement_memory_bytes == 0 {
+                    return Err(invalid(
+                        "refinement requires 0..=5 rounds and positive memory bytes",
+                    ));
+                }
                 if dataset.is_empty() || dataset.len() > 1024 {
                     return Err(invalid("dataset identity required (at most 1024 bytes)"));
                 }
@@ -494,9 +581,33 @@ impl<B: Backend> Service<B> {
                     _ => return Err(invalid("only L2 and COSINE are supported")),
                 };
                 let config = IndexConfig::new(dimension, metric_kind)
+                    .and_then(|c| {
+                        let minimum =
+                            min_leaf_partition_entries.unwrap_or(c.min_leaf_partition_entries());
+                        let maximum =
+                            max_leaf_partition_entries.unwrap_or(c.max_leaf_partition_entries());
+                        c.with_leaf_partition_entries(minimum, maximum)
+                    })
+                    .and_then(|c| {
+                        let minimum = min_internal_partition_entries
+                            .unwrap_or(c.min_internal_partition_entries());
+                        let maximum = max_internal_partition_entries
+                            .unwrap_or(c.max_internal_partition_entries());
+                        c.with_internal_partition_entries(minimum, maximum)
+                    })
                     .and_then(|c| c.with_fields(vec![FieldSchema::new("id", DataType::I64)?]))
                     .map_err(api_error)?;
+                let config = if let Some(experiment) = &self.experiment {
+                    config.with_local_graph(experiment.graph().map_err(api_error)?)
+                } else {
+                    config
+                };
                 let mut search = SearchOptions::default();
+                if let Some(experiment) = &self.experiment {
+                    search = search
+                        .with_routing_mode(experiment.production_mode())
+                        .map_err(api_error)?;
+                }
                 if let Some(beam) = leaf_beam {
                     search = search.with_leaf_beam_size(beam).map_err(api_error)?;
                 }
@@ -510,14 +621,21 @@ impl<B: Backend> Service<B> {
                     .await
                     .map_err(api_error)?;
                 let root = self.bulk_workspace.clone();
+                let experiment = self.experiment.clone();
                 state.bulk = Some(
-                    tokio::task::spawn_blocking(move || bulk::InputCapture::new(root, config))
-                        .await
-                        .map_err(|e| ("other", e.to_string()))?
-                        .map_err(api_error)?,
+                    tokio::task::spawn_blocking(move || {
+                        bulk::Build::new(
+                            root,
+                            config,
+                            experiment,
+                            refinement_rounds as u8,
+                            refinement_memory_bytes,
+                        )
+                    })
+                    .await
+                    .map_err(|e| ("other", e.to_string()))?
+                    .map_err(api_error)?,
                 );
-                state.refinement_rounds = refinement_rounds;
-                state.refinement_input_bytes = refinement_input_bytes;
                 state.dimension = dimension;
                 state.metric = metric;
                 state.dataset = dataset;
@@ -551,16 +669,13 @@ impl<B: Backend> Service<B> {
                 }
                 let start = Instant::now();
                 state.started.get_or_insert(start);
-                let staging = state
+                state
                     .bulk
-                    .take()
-                    .ok_or_else(|| invalid("bulk input already sealed or failed"))?;
-                state.bulk = Some(
-                    tokio::task::spawn_blocking(move || staging.append(records))
-                        .await
-                        .map_err(|e| ("other", e.to_string()))?
-                        .map_err(api_error)?,
-                );
+                    .as_mut()
+                    .ok_or_else(|| invalid("reset required"))?
+                    .append(records)
+                    .await
+                    .map_err(api_error)?;
                 state.insert_seconds += start.elapsed().as_secs_f64();
                 state.records += ids.len() as u64;
                 Ok(json!({"inserted":ids.len()}))
@@ -571,44 +686,30 @@ impl<B: Backend> Service<B> {
                     return Err(invalid("optimize record count mismatch or empty dataset"));
                 }
                 if state.ready {
-                    return Ok(state.topology.clone());
+                    return Ok(json!({"ready":true,"records":state.records}));
                 }
                 let start = Instant::now();
                 let result = async {
                     let control = OperationOptions::default()
                         .with_deadline(start + REQUEST_TIMEOUT)
                         .with_cancellation(self.stop.clone());
-                    // Retain a published index if refinement fails, so retries do not
-                    // consume the source or repeat Bulk Build.
                     if state.index.is_none() {
-                        let staging = state
-                            .bulk
-                            .take()
-                            .ok_or_else(|| invalid("bulk input already sealed or failed"))?;
-                        let (index, report) = bulk::build(&self.runtime, staging, control.clone())
-                            .await
-                            .map_err(api_error)?;
-                        state.index = Some(index);
-                        state.bulk_report = report;
+                        state.index = Some(
+                            state
+                                .bulk
+                                .as_mut()
+                                .ok_or_else(|| invalid("reset required"))?
+                                .complete(&self.runtime, control)
+                                .await
+                                .map_err(api_error)?,
+                        );
                     }
-                    let index = state.index.as_ref().expect("bulk build published").clone();
-                    let options = RefineOptions::new(state.refinement_input_bytes)
-                        .and_then(|options| options.with_refinement_rounds(state.refinement_rounds))
-                        .map_err(api_error)?;
-                    let refinement_started = Instant::now();
-                    let result = index.refine(options.with_operation_options(control)).await;
-                    state.refinement_seconds += refinement_started.elapsed().as_secs_f64();
-                    result.map_err(api_error)?;
-                    let snapshot =
-                        topology::snapshot(&self.backend, index.logical_index_id(), records)
-                            .await
-                            .map_err(api_error)?;
-                    if !snapshot.ready {
-                        return Err(("corruption", "refined bulk topology is not ready".into()));
-                    }
-                    state.topology = snapshot.facts;
+                    let resources =
+                        ResourceSnapshot::capture().map_err(|error| ("other", error))?;
+                    state.bulk.as_mut().expect("published build").report["ready_peak_rss_bytes"] =
+                        json!(resources.peak_rss_bytes());
                     state.ready = true;
-                    Ok(state.topology.clone())
+                    Ok(json!({"ready":true,"records":state.records}))
                 }
                 .await;
                 state.optimize_seconds += start.elapsed().as_secs_f64();
@@ -622,7 +723,7 @@ impl<B: Backend> Service<B> {
                 let index = state
                     .index
                     .as_ref()
-                    .ok_or_else(|| invalid("reset required"))?;
+                    .expect("ready bridge owns a published index");
                 let mut request = SearchRequest::new(vector, k)
                     .map_err(api_error)?
                     .with_options(state.search);
@@ -672,7 +773,6 @@ impl<B: Backend> Service<B> {
                     e.scanned_tree_keys,
                     e.visited_partitions,
                     e.exact_rerank_candidates,
-                    result.rabitq_overlap_truncated,
                 ]) {
                     *sum += u64::from(value);
                 }
@@ -708,21 +808,21 @@ impl<B: Backend> Service<B> {
             "records": state.records,
             "ready": state.ready,
             "configuration": {
-                "min_partition_entries": index_config.map(IndexConfig::min_partition_entries),
-                "max_partition_entries": index_config.map(IndexConfig::max_partition_entries),
+                "routing_experiment": self.experiment,
+                "min_leaf_partition_entries": index_config.map(IndexConfig::min_leaf_partition_entries),
+                "max_leaf_partition_entries": index_config.map(IndexConfig::max_leaf_partition_entries),
+                "min_internal_partition_entries": index_config.map(IndexConfig::min_internal_partition_entries),
+                "max_internal_partition_entries": index_config.map(IndexConfig::max_internal_partition_entries),
                 "write_beam_size": runtime_config.write_beam_size(),
                 "maintenance_workers": runtime_config.maintenance_workers(),
                 "partition_cache_bytes": runtime_config.partition_cache_bytes(),
                 "foreground_limit": runtime_config.foreground_operation_limit(),
                 "foreground_attempts": runtime_config.foreground_attempts(),
                 "fixup_attempts": runtime_config.fixup_attempts(),
-                "readiness_header_slot_limit": topology::MAX_HEADER_SLOTS,
-                "readiness_idle_interval_seconds": 1,
             },
             "continuous_first_insert_through_final_search_seconds": state.started.zip(m.last_search).map(|(a,b)| b.duration_since(a).as_secs_f64()),
             "phases": {
                 "input_staging_seconds": state.insert_seconds,
-                "refinement_seconds": state.refinement_seconds,
                 "optimize_seconds": state.optimize_seconds,
                 "ktann_search_seconds_sum": m.search_seconds
             },
@@ -737,10 +837,8 @@ impl<B: Backend> Service<B> {
             },
             "search_usage_totals": m.budget,
             "search_exhaustion_counts": m.exhausted,
-            "topology": state.topology,
             "build_mode": "bulk",
-            "refinement": {"rounds": state.refinement_rounds, "input_bytes": state.refinement_input_bytes},
-            "bulk_build": state.bulk_report,
+            "bulk_build": state.bulk.as_ref().map(|build| &build.report),
             "resource": { "peak_rss_bytes": resources.peak_rss_bytes(), "cpu_seconds": resources.cpu_seconds_since(self.baseline) },
             "backend_io": self.counters.snapshot(),
             "bridge": {

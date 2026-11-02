@@ -82,7 +82,7 @@ async fn rocksdb_adapter_preserves_the_backend_contract() {
         // rest of the common contract.
         assert_eq!(primary.config().blocking_resource_limit(), 64);
         assert_eq!(primary.admission_budget().max_mutations, 10_000);
-        assert_eq!(primary.admission_budget().max_mutation_bytes, 1 << 20);
+        assert_eq!(primary.admission_budget().max_mutation_bytes, 9_000_000);
         assert_eq!(primary.hard_limits().max_value_bytes, u32::MAX as usize);
         assert!(!primary.capabilities().transactional_clear_range);
 

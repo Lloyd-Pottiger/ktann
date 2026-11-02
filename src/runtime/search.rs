@@ -11,15 +11,16 @@
 //! Request validation, query preprocessing, predicate compilation, and Tree
 //! Key planning are pure functions of the handle's immutable Manifest and run
 //! before foreground admission in [`PreparedSearch`]. The response reports the
-//! actual budget usage, every exhausted dimension, and per-leaf overlap
-//! truncation. Success deliberately makes no exact-global-top-k, completeness,
+//! actual budget usage and every exhausted dimension. Success deliberately makes no exact-global-top-k, completeness,
 //! continuation, or monotonic-across-budgets guarantee.
 
+#[cfg(feature = "benchmark")]
+use crate::api::ErrorKind;
 use std::time::Instant;
 
 use crate::api::{
-    Error, ErrorKind, PartitionKey, Result, SearchBudgetExhaustion, SearchBudgetUsage,
-    SearchBudgets, SearchOutcome, SearchRequest,
+    Error, PartitionKey, Result, SearchBudgetExhaustion, SearchBudgetUsage, SearchBudgets,
+    SearchOutcome, SearchRequest,
 };
 use crate::observe::labels::SearchStage;
 use crate::observe::metrics;
@@ -27,8 +28,7 @@ use crate::search::cache::PartitionCache;
 use crate::search::numeric::VectorKernel;
 use crate::search::plan::{TreeKeyPlan, enumerate_tree_keys, plan_tree_keys};
 use crate::search::predicate::CompiledPredicate;
-use crate::search::rabitq::{ApproximateCandidate, select_global_overlap};
-use crate::search::rerank::{LeafCandidate, exact_rerank};
+use crate::search::rerank::exact_rerank;
 use crate::search::traverse::{TraversalRequest, traverse};
 use crate::storage::backend::{Backend, ScanLimits};
 use crate::storage::keys::TreeKey;
@@ -62,6 +62,9 @@ pub(crate) struct PreparedSearch {
     routing: Box<[f32]>,
     predicate: Option<CompiledPredicate>,
     plan: TreeKeyPlan,
+    #[cfg(feature = "benchmark")]
+    pub(crate) diagnostics:
+        Option<std::sync::Arc<std::sync::Mutex<crate::benchmark::SearchDiagnostics>>>,
 }
 
 impl PreparedSearch {
@@ -74,6 +77,13 @@ impl PreparedSearch {
     ) -> Result<Self> {
         let config = manifest.config();
         let budgets = request.validate(config.dimension(), config.fields(), defaults)?;
+        if matches!(
+            request.options().routing_mode(),
+            crate::api::RoutingMode::PartitionLocalHnsw { .. }
+        ) && config.local_graph().is_none()
+        {
+            return Err(Error::invalid_argument());
+        }
         let leaf_beam = request.options().resolved_leaf_beam_size();
         let kernel = VectorKernel::new(
             config.dimension(),
@@ -95,6 +105,8 @@ impl PreparedSearch {
             routing,
             predicate,
             plan,
+            #[cfg(feature = "benchmark")]
+            diagnostics: None,
         })
     }
 }
@@ -136,18 +148,22 @@ pub(crate) async fn search<B: Backend>(
     .await?;
     context.checkpoint()?;
 
+    let traversal_request = TraversalRequest::new(
+        &prepared.routing,
+        enumeration.trees(),
+        prepared.predicate.as_ref(),
+        prepared.budgets,
+        prepared.leaf_beam,
+    )?
+    .with_routing_mode(prepared.request.options().routing_mode());
+    #[cfg(feature = "benchmark")]
+    let traversal_request = traversal_request.with_diagnostics(prepared.diagnostics.as_deref());
     let mut traversal = traverse(
         &mut txn,
         cache,
         &prepared.kernel,
-        TraversalRequest::new(
-            &prepared.routing,
-            enumeration.trees(),
-            prepared.predicate.as_ref(),
-            prepared.request.k(),
-            prepared.budgets,
-            prepared.leaf_beam,
-        )?,
+        traversal_request,
+        context,
     )
     .await?;
     context.checkpoint()?;
@@ -156,22 +172,34 @@ pub(crate) async fn search<B: Backend>(
     let visited_partitions = traversal.visited_partitions();
     let visited_leaf_entries = traversal.visited_leaf_entries();
     let partition_budget_exhausted = traversal.partition_budget_exhausted();
-    let rabitq_overlap_truncated = traversal.rabitq_overlap_truncated();
 
-    // Global overlap selection retains every candidate whose conservative
-    // interval reaches the kth-smallest upper endpoint, then truncates the
-    // survivors to the rerank budget in deterministic rough order. That
-    // truncation is eligible rerank work the depleted budget prevented.
-    let rerank_budget = usize::try_from(prepared.budgets.exact_rerank_candidates())
-        .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
-    let pool: Vec<ApproximateCandidate<LeafCandidate>> = traversal
-        .into_candidates()
-        .into_iter()
-        .map(ApproximateCandidate::from)
-        .collect();
-    let selection = select_global_overlap(pool, prepared.request.k(), rerank_budget)?;
-    let rerank_budget_exhausted = selection.truncated();
-    let selected: Vec<LeafCandidate> = selection.into_values();
+    // Traversal already retains global rough top-budget candidates. The final
+    // bounded interval pass excludes clearly noncompetitive exact reads.
+    let candidates = traversal.into_candidates();
+    #[cfg(feature = "benchmark")]
+    if let Some(diagnostics) = &prepared.diagnostics {
+        let mut diagnostics = diagnostics
+            .lock()
+            .map_err(|_| Error::new(ErrorKind::Other))?;
+        diagnostics.neighbors_in_global_pool = candidates
+            .candidates()
+            .iter()
+            .filter(|candidate| diagnostics.truth.contains(candidate.record_id()))
+            .count();
+    }
+    let (mut selected, rerank_budget_exhausted) = candidates.select(prepared.request.k())?;
+    // Request compaction of spare traversal capacity before allocating rerank buffers.
+    selected.shrink_to_fit();
+    #[cfg(feature = "benchmark")]
+    if let Some(diagnostics) = &prepared.diagnostics {
+        let mut diagnostics = diagnostics
+            .lock()
+            .map_err(|_| Error::new(ErrorKind::Other))?;
+        diagnostics.neighbors_reranked = selected
+            .iter()
+            .filter(|candidate| diagnostics.truth.contains(candidate.record_id()))
+            .count();
+    }
     metrics::search_stage_finished(
         SearchStage::ApproximateSelection,
         approximate_started.elapsed(),
@@ -184,14 +212,12 @@ pub(crate) async fn search<B: Backend>(
         prepared.request.vector(),
         selected,
         prepared.request.k(),
-        prepared.budgets.exact_rerank_candidates(),
     )
     .await?;
     metrics::search_stage_finished(SearchStage::ExactReranking, reranking_started.elapsed());
     context.checkpoint()?;
 
     let exact_rerank_candidates = rerank.exact_rerank_candidates();
-    let rerank_exhausted = rerank_budget_exhausted || rerank.exact_rerank_budget_exhausted();
     let outcome = SearchOutcome {
         hits: rerank.into_hits(),
         usage: SearchBudgetUsage {
@@ -203,9 +229,8 @@ pub(crate) async fn search<B: Backend>(
         exhausted: SearchBudgetExhaustion {
             scanned_tree_keys: enumeration.scanned_tree_key_budget_exhausted(),
             visited_partitions: partition_budget_exhausted,
-            exact_rerank_candidates: rerank_exhausted,
+            exact_rerank_candidates: rerank_budget_exhausted,
         },
-        rabitq_overlap_truncated,
     };
     metrics::search_budget(&outcome.usage, &outcome.exhausted);
     Ok((outcome, maintenance))

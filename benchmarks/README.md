@@ -74,7 +74,7 @@ otherwise idle host for performance comparisons.
 
 `--write-beam-size N` overrides the write routing beam. Large runs also accept
 `--base-vectors N`, `--query-vectors N`, `--query-offset N`, and
-`--max-partition-entries N`. Resolved overrides are recorded in each report.
+`--max-leaf-partition-entries N` and `--max-internal-partition-entries N`. Resolved overrides are recorded in each report.
 
 The raw RocksDB block cache is independent of the decoded Partition Cache.
 `--rocksdb-block-cache-bytes N` sets its capacity (default 8 MiB); the worker
@@ -98,7 +98,7 @@ before queries. Reused reports set `construction: null`; comparison omits
 construction costs and rejects mixing fresh and reused runs. Cache capacity,
 client counts, warmup and read beam can
 change without reconstructing the tree. Keep both comparison binaries and the
-fixture manifest with the reports. Reports use schema version 8.
+fixture manifest with the reports. Reports use schema version 10.
 
 Large search diagnostics accept `--query-concurrency 1,4,16,4,1` and
 `--leaf-beam-size 32`. The worker imports and verifies the index once, then
@@ -107,6 +107,10 @@ help detect drift; each point reports its own concurrency, latency, CPU, recall,
 cache observations, backend logical IO, and admission waits. Without these
 options the standard beam curve and 16 clients are unchanged. A single beam
 checks complete search and recall samples without requiring a quality curve.
+`--measured-operations N` overrides the positive timed operation count; omitting it
+keeps the selected profile default. Use the same count for compared runs; for
+quality scenarios, an integer multiple of the query window gives equal weight
+to each query. Warmup and full quality diagnostics remain separate.
 `--partition-cache-bytes N` sets the decoded partition cache capacity for any
 profile; zero disables it. This cache excludes raw vectors read during reranking
 and does not replace RocksDB's block cache or FoundationDB's server cache.
@@ -258,11 +262,21 @@ local baselines; `git_revision` has a `-dirty` suffix when the workspace changes
 VectorDBBench's loader, optimizer, and search workers. The Python adapter and
 process tests live in the [VectorDBBench repository](https://github.com/Lloyd-Pottiger/VectorDBBench).
 
-The bridge always uses Bulk Build followed by offline refinement. It supports
+The bridge uses Bulk Build with refinement. It supports
 RocksDB and FoundationDB, single-tenant IDs-only L2/cosine search, signed 64-bit
 record IDs, and an optional inclusive `id_min` predicate. This supports Cohere
 1M unfiltered, 1% excluded, and 99% excluded cases, plus custom ANN performance
 cases. Incremental online and read/write workloads are not supported.
+
+For RocksDB, the bridge assigns one eighth of the Runtime's default decoded
+cache budget to a native row cache and leaves seven eighths for Partition
+bodies. The combined configured capacity is unchanged; the native block cache
+remains independently configured. Startup logs record the row-cache capacity,
+and the companion report records the remaining partition capacity. This
+allocation targets repeated exact-rerank record reads and can use more resident
+memory than a partition-only cache. FoundationDB keeps its existing allocation.
+The general benchmark worker's explicit cache settings are independent of this
+bridge policy.
 
 ### Lifecycle and controls
 
@@ -273,28 +287,35 @@ insert acknowledges capture, not per-batch durability or publication. No
 the index rather than when a batch is received; unknown inserts must not be
 replayed automatically.
 
-Optimize checks the expected record count, seals the Input Snapshot, then runs
-preparation, loading, exact validation and atomic publication. It next calls
-`Index::refine` and checks topology readiness before admitting search. A successful
-repeated Optimize returns the existing result without rebuilding or refining.
-If refinement fails, search stays closed and a retry refines the already published
-index. The bridge holds exclusive access throughout refinement and disables its
-Runtime maintenance workers. Shutdown cancels at operation checkpoints and waits
-for admitted work before dropping the index; socket timeouts do not release
-exclusive access from an unfinished operation.
+Optimize checks the expected record count and seals the Input Snapshot. All
+routing modes refine the forest before serving encoding, loading, exact validation
+and atomic publication. Global modes then prepare their in-process router. Core artifact validation
+owns topology correctness; the bridge admits search after query preparation. Repeated successful Optimize
+returns the existing result without rebuilding or refining.
 
-The Python client defaults to two refinement rounds and a 32 GiB input limit.
-Use `--refinement-rounds 0..5` and `--refinement-input-bytes BYTES` to configure
-these explicitly. Zero rounds still loads the index and refreshes centroids; it
-does not disable refinement. The input limit covers loaded vectors, IDs,
-centroids and topology, not total RSS: planning and migration proposals require
-additional memory. Exceeding the input limit fails Optimize rather than silently
-skipping refinement.
+The bridge retains sealed input and the same core Bulk Build job for retries.
+Cancellation and transient build failures resume that job; terminal preparation
+errors such as insufficient memory remain failed and require a fresh case.
+Publication can precede a cleanup or router error, so an unsuccessful Optimize
+never implies that no index exists. Search stays closed until all preparation
+succeeds. Shutdown cancels at operation checkpoints and waits for admitted work
+before dropping the index; socket timeouts do not release exclusive access.
 
-Construction uses IndexConfig defaults (64/512 partition entries), a sample cap
-of 1024, 256 MiB tree memory and 64 GiB tree scratch. Only an explicit leaf-beam
-option changes the search defaults. Header readiness reads at most 262,144
-allocated slots; it is not a replacement for full integrity verification.
+Reset requires `refinement_rounds` (0..5) and `refinement_memory_bytes` (positive).
+The Python client defaults to two rounds and 32 GiB. Zero rounds refreshes
+centroids without moving records. The memory ceiling accounts for retained
+inputs, topology and refinement planning; it is not a process RSS limit, and
+construction/sort/serving/graph budgets remain separate. Reset owns the refinement
+budget in every mode, including routing experiments: their `build_memory_bytes`
+continues to configure the other build stages. Reports record the effective
+`bulk_build.refinement_rounds` and `bulk_build.refinement_memory_bytes`.
+
+Construction uses IndexConfig defaults (leaf 16/128, internal 64/16384), a sample
+cap of 1024, 1 GiB tree memory and 64 GiB tree scratch. The tree budget covers
+the constructor reservation for wide internal nodes at Cohere dimensionality. Only an explicit leaf-beam
+option changes the search defaults. Optimize returns readiness and record count;
+per-level Header statistics and an independent Header-slot limit are not part of
+the bridge contract.
 
 ### Running
 
@@ -316,29 +337,31 @@ removing its stale socket. Reports remain caller-owned; temporary source snapsho
 are removed on normal exit. A crash may leave temporary files behind; core-owned
 preparation files are reclaimed after publication.
 
-Install the VectorDBBench checkout with `pip install -e .`, then run:
+From the VectorDBBench checkout with its dependencies installed:
 
 ```sh
 vectordbbench ktann --socket-path /tmp/ktann-bench.sock \
   --dataset-identity cohere-1m --case-type Performance768D1M \
   --load-concurrency 1 --insert-batch-size 50 --k 100 \
-  --refinement-rounds 2 --refinement-input-bytes 34359738368
+  --refinement-rounds 2 --refinement-memory-bytes 34359738368
 ```
 
 The private protocol is v1, with a big-endian u32 frame length, an 8 MiB frame
 limit and at most 128 connections. Control/search and responses are JSON.
 Binary inserts carry `KTI` plus byte version 1, big-endian u32 count/dimension,
 little-endian i64 IDs and row-major f32 values, with at most 50 records per batch.
-The reset request carries `refinement_rounds` and `refinement_input_bytes`.
+The reset request carries `refinement_rounds` and `refinement_memory_bytes`.
 JSON inserts are rejected; update the client and bridge together.
 
 ### Measurements and tests
 
 Canonical insert time measures input capture. Optimize time includes Bulk Build,
-refinement and readiness checks; canonical total load time includes both phases.
-Native reports identify `build_mode: bulk`, the refinement configuration,
-`phases.input_staging_seconds`, `phases.refinement_seconds`, total
-`phases.optimize_seconds`, and detailed Bulk Build stages. Optimize and refinement timers
+refinement and router preparation; canonical total load time includes both phases.
+Native reports identify `build_mode: bulk`, effective refinement controls,
+`phases.input_staging_seconds`, total `phases.optimize_seconds`, and detailed Bulk
+Build stages. Artifact refinement is included in `bulk_build.forest_seconds`;
+there is no separately measured refinement duration. Core stage timings describe
+the successful completion call (reused stages have zero duration); Optimize timers
 accumulate failed attempts as well as successful ones. Successful repeated
 Optimize calls leave those measurements unchanged. Compare identical datasets,
 query sets, construction/refinement settings and backend budgets; do not compare
@@ -359,9 +382,10 @@ large-dataset throughput, recall, peak memory or multi-host filesystem behavior.
 
 ### Offline refinement after import
 
-Quality sweeps accept `--refinement-rounds 0..5`. Omit the flag for the ordinary
+Quality sweeps without `--routing-experiment` accept `--refinement-rounds 0..5`.
+Omit the flag for the ordinary
 import baseline; `0` recomputes centroids without relocation rounds, and `2` or
-`5` requests bounded local refinement. Every path uses ordinary import and settles
+`5` requests bounded local refinement. These runs use ordinary import and settle
 topology until maintenance is drained before refinement. The runner issues no
 other index operations during refinement and starts measured queries afterward.
 The existing tree's partition IDs and topology remain fixed.
@@ -372,10 +396,9 @@ IDs, centroids and topology representation; numerical workspace and move lists
 add memory. Construction wall time, CPU and backend work include import,
 maintenance convergence and refinement. The convergence phase includes refinement.
 Compare the ordinary baseline and each refinement setting on identical import
-and search parameters; zero rounds is a centroid-recomputation control. Existing
-bulk-builder research measurements use a different initialization/publication
-pipeline and do not establish quality or performance for this API. Archive the
-executable and source/binary hashes before timing under the shared resource lock.
+and search parameters; zero rounds is a centroid-recomputation control.
+Routing experiments use the Bulk Build artifact path described below and are
+not interchangeable baselines for this import-and-refine path.
 
 ## Complete Bulk Build probe
 
@@ -396,7 +419,7 @@ Bulk Build bridge reports include `serving_detail` wall times for source
 sorting, topology sorting, exact joins/encoding, output merging, Synopsis
 reduction, and final emission/sealing, plus total and peak serving scratch bytes.
 `ready_peak_rss_bytes` captures the bridge process's resident-memory high-water
-mark immediately after successful publication and cleanup, before queries.
+mark after successful publication, cleanup and router preparation, before queries.
 The whole-run peak remains separate and may include later query cache growth.
 A resumed worker reports no detail for an already accepted serving artifact.
 
@@ -405,3 +428,184 @@ including AArch64 SHA-2 instructions with a software fallback. Artifact framing,
 per-frame checksums, whole-file hashes and publication verification are unchanged.
 Performance comparisons must record the CPU architecture and resolved dependency
 versions; the gain from hardware hashing is platform dependent.
+
+The four capacity overrides are independent. Unspecified values retain the
+profile's configured values (the large profile uses IndexConfig defaults).
+Lowering a maximum below twice its minimum requires explicitly lowering that
+minimum as well; the CLI and bridge do not infer a different capacity pair. Reports record all four values and comparison
+rejects mismatched configurations. The VectorDBBench bridge's
+`reset` accepts optional `min_leaf_partition_entries`,
+`max_leaf_partition_entries`, `min_internal_partition_entries`, and
+`max_internal_partition_entries`; omitted fields use IndexConfig defaults.
+Bridge reports record all four resolved values. Invalid pairs fail before reset
+changes storage. Keep rerank budgets fixed when comparing capacity choices.
+
+
+## Frozen-layout routing experiments
+
+These experiments hold the dataset and leaf layout fixed during query comparisons.
+The graph indexes they build support writes after publication; the frozen workload
+is an experimental control, not an index capability.
+
+`ktann-bench run --routing-experiment JSON` uses production Bulk Build and
+publication, including optional artifact refinement **before** graphs are built.
+It is supported by `large` quality scenarios and `quality-routing-smoke`. The
+ordinary online scenarios retain their existing import path. JSON rejects unknown
+fields; reports retain every resolved experiment setting. For example:
+
+```sh
+cargo build --release -p ktann-benchmarks --bin ktann-bench
+mkdir -p .benchmark-data/results
+B=target/release/ktann-bench
+$B run --backend rocksdb --profile smoke --scenario quality-routing-smoke \
+  --routing-experiment '{"mode":"exact","m":16,"ef_construction":200,"graph_seed":7,"ef_search":64}' \
+  --rocksdb-path .benchmark-data/results/routing-fixture \
+  --leaf-beam-size 4 --refinement-rounds 0 \
+  --output .benchmark-data/results/routing-exact.json
+$B run --backend rocksdb --profile smoke --scenario quality-routing-smoke \
+  --routing-experiment '{"mode":"partition-local-hnsw","m":16,"ef_construction":200,"graph_seed":7,"ef_search":64}' \
+  --rocksdb-path .benchmark-data/results/routing-fixture --reuse-index true \
+  --leaf-beam-size 4 --refinement-rounds 0 \
+  --output .benchmark-data/results/routing-local.json
+$B summarize-routing --inputs .benchmark-data/results/routing-exact.json,.benchmark-data/results/routing-local.json
+```
+
+Use a **new** fixture directory for each construction configuration. Reuse checks
+base-vector identity, capacities, graph parameters/seed, refinement and training
+sample size. Query windows are independent of fixture identity, allowing held-out
+validation with `--query-offset` and `--query-vectors`. The dataset checksum in each
+report still includes the actual query window. Rotation seed and source checksum
+are recorded on construction. `routing_setup.leaf_layout_sha256` streams final
+leaf identities, centroids and membership bytes; compare this fingerprint when
+claiming the same layout across routing modes or internal capacities.
+
+Modes are `exact` (production exact tree routing) and
+`partition-local-hnsw` (production local graphs). Both use the ordinary production
+search pipeline over the same published graph index.
+
+The experiment JSON accepts:
+
+| Field | Default | Meaning |
+| --- | ---: | --- |
+| `mode` | `exact` | Explicit routing policy |
+| `m`, `ef_construction` | 16, 200 | Persisted graph construction parameters |
+| `graph_seed` | 0 | u64 encoded little-endian into the first 8 of 32 seed bytes |
+| `ef_search` | 200 | Requested expansion; actual per-parent effective values are recorded |
+| `routing_working_bytes` | 268435456 | Production per-operation routing admission |
+| `sample_items` | 1024 | Existing construction training sample control |
+| `build_memory_bytes` | 1073741824 | Each existing construction/sort/serving/graph/refinement worker bound |
+| `build_scratch_bytes` | 68719476736 | Existing scratch and per-artifact bound |
+
+Existing independent `--min-leaf-partition-entries`, `--max-leaf-partition-entries`,
+`--min-internal-partition-entries`, `--max-internal-partition-entries`, beam,
+concurrency, refinement, Partition Cache and RocksDB block-cache controls still
+apply. The rerank budget remains engine-owned and fixed for a given k. These are
+experimental settings, not selected production defaults. Construction resources
+are per existing worker phase, not a whole-process RSS limit.
+
+The streaming leaf-layout fingerprint supports one Tree Key and at most 262,144
+allocated Header slots. Whole-process residency also includes runtime caches,
+backend/OS caches, dataset/oracle storage and other process state.
+
+### Measurement semantics and dataset comparisons
+
+Every worker reports construction phases, per-graph build/encode durations,
+native graph construction peaks (excluding Rust centroids/encoding), encoded graph
+payload bytes, process peak RSS, topology, and measured query latency/QPS/CPU.
+Routing counters distinguish distances, graph expansions, per-level parent visits
+(levels above 32 share `33+`), global tree-beam merge candidates, restore counts,
+encoded miss bytes, and accounted decoded body bytes. Repeated loads count again.
+Compute/merge/restore durations are **wall time**, not thread CPU. Process CPU is
+available over the complete timed interval. Logical read bytes are returned KV
+bytes; process physical IO is OS-dependent and unavailable values stay null.
+Graph payload size excludes KV keys and storage-engine amplification. Existing
+leaf-entry scan and truncation metrics remain separate from graph work.
+
+All timing/resource snapshots finish before diagnostic replay. For each unique
+query, `quality_diagnostics` records true-neighbor leaf coverage, local RaBitQ
+candidate coverage, rerank candidate coverage, and final recall. Per-truth
+`truth_leaves` rows also record the persisted leaf identity and occupancy, whether
+the leaf was scanned and the neighbor returned. These diagnostics require an
+immutable fixture and run outside timing. These are distinct quantities. Timed queries
+also retain individual recall values in completion order. Offline-refinement move
+and completed-round counts are null when the artifact API does not expose them;
+requested rounds remain in configuration. Setup and diagnostics are never called
+cold-cache measurements. In particular, zero warmup does not flush RocksDB/OS
+caches, and later beam points can inherit the worker's Partition Cache. Use fresh
+workers and cache capacities (including zero) to measure loading and turnover;
+no system cache purge is performed.
+
+For large-dataset comparisons, use the existing `large` dataset cache and scenarios
+`quality-cohere-1m` / `quality-sift-1m`, k=100, separate calibration/validation query
+windows, multiple graph seeds, independent capacity pairs, beam/ef, cache budgets
+and client counts. Keep the leaf-layout fingerprint and query checksum with each
+result. `summarize-routing` emits TSV rows with mean/min final recall, QPS, p95,
+logical bytes and process-lifetime peak RSS before diagnostics (not per-point
+RSS); it does not declare a winner or compare unequal recall.
+The existing `compare` command remains a strict identical-input regression check.
+Select matched final recall rows (including the >90% target) before comparing
+capacity/performance.
+
+The VectorDBBench bridge accepts the same `--routing-experiment JSON` at startup;
+the Python client/protocol is unchanged. Its requested refinement runs in artifact
+preparation before initial graph construction. The native runner owns the detailed per-query oracle
+and routing metrics; bridge reports remain companion metrics, with VectorDBBench
+owning canonical recall. Use native runner controls for cache matrices.
+
+### Local-graph update history
+
+`ktann-mutable-graph` exercises ordinary writes and real background split/merge
+maintenance on a bounded prefix of a cached `sift-1m` or `cohere-1m` dataset:
+
+```sh
+KTANN_BENCH_DATASET_CACHE=/Users/lloyd/projects/ktann/.benchmark-data/vectordb_bench/dataset \
+  cargo run --release -p ktann-benchmarks --bin ktann-mutable-graph -- \
+  sift-1m .benchmark-data/results/mutable-sift-16384 16384 8
+```
+
+The output directory must be new. The default is 16,384 records and eight rounds.
+An optional final `INTERNAL_MIN:MAX` argument overrides the default `32:128`;
+representative wider-parent runs use `64:512`, for example append `64:512` after
+the record and round counts.
+Each round rotates its update/delete windows, updates 10% from reserved dataset
+rows outside the initial prefix, deletes 10%, settles maintenance, reinserts
+that many vectors with fresh IDs, and settles again. One hundred held-out queries
+starting at query offset 100 are independent of the inserted vectors. The runner
+uses each corpus's metric (SIFT L2, Cohere cosine), graph seed `[19; 32]`, M16,
+efConstruction64, efSearch64, and fixed exact-rerank budget125. Before measured updates it selects the first
+beam in 8/16/32/64/128/256 reaching mean recall92% on a separate 50-query
+calibration window (offset0), then freezes that beam for all evaluated phases.
+
+`report.json` records initial, per-round, and fresh-rebuild recall@100 against
+current exact ground truth; per-query recall, minimum/p05/p50 recall, query
+p50/p95 and CPU; process RSS high-water marks;
+uncached graph/topology verification and record coverage; attempted logical KV
+mutation bytes, commits and conflicts; maintenance step counts; and mutation
+throughput including maintenance. Initial import timing runs through settlement.
+Oracle computation, paired Exact routing, untimed true-neighbor leaf/candidate
+coverage diagnostics, and invariant verification are outside HNSW query timing.
+The large loader decodes all one million vectors before selecting a prefix, so
+cumulative peak RSS includes that full decode, the reserved update pool and oracle
+allocations; it is not graph working memory.
+Logical KV bytes do not measure native physical writes. These experiments cover
+the reported size and update history and do not establish a production SLA.
+
+### Adaptive write routing
+
+Graph-enabled indexes use exact scoring below 1024 internal nodes and HNSW at
+or above 1024, independently for each snapshot-authoritative body. There are no
+write-routing experiment switches. Query behavior and budgets are unchanged.
+See [foreground write routing](../docs/design/partition-local-hnsw.md#foreground-write-routing)
+for the policy, rationale and measurement evidence.
+
+### Reusing a frozen VectorDBBench index
+
+For controlled query-only comparisons, start the bridge with
+`--preserve-index true`. Shutdown then closes the runtime without dropping its
+Logical Index; the default still removes it. Restart with the same database path
+and routing configuration, then send protocol version 1 operation `resume` with
+`dataset`, `records`, and `leaf_beam`. This opens the published `vdbbench` index
+without rebuilding or changing it. Dimension and metric come from its manifest;
+`records` is controller-supplied fixture metadata, not a newly counted cardinality.
+The controller must verify dataset provenance and warm the new process's caches
+before measurement. A running bridge accepts only one reset or resume.

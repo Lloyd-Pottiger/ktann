@@ -53,6 +53,14 @@ Production code uses no nightly features.
 
 ## Workflow Principles
 
+- Aim for a simple system with strong whole-system performance. Prioritize
+  meaningful, measured performance gains; when performance is comparable,
+  choose the simpler design. Replace the current implementation when a
+  candidate is simpler and performs comparably.
+- Evaluate the current implementation and alternatives on equal terms. Explore
+  the full solution space: algorithms, architecture, data structures, interfaces,
+  and implementation details are all open to change. Existing design choices
+  do not constrain the solution or justify retaining a more complex approach.
 - Before a non-trivial change, read `CONTEXT.md`, the relevant sections of
   `docs/design/overview.md`, the owning module design, and every directly
   relevant ADR. Trace callers, persistent state, backend behavior, and runtime

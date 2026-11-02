@@ -5,6 +5,8 @@
 //! RaBitQ selects approximate candidates before exact Vector Record reranking.
 
 pub(crate) mod cache;
+pub(crate) mod candidates;
+pub(crate) mod local_hnsw;
 pub(crate) mod numeric;
 pub(crate) mod plan;
 pub(crate) mod predicate;

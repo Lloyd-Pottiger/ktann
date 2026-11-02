@@ -61,6 +61,27 @@ impl VectorKernel {
         })
     }
 
+    /// Heap storage retained by the deterministic rotation schedule.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.rotation
+            .rounds
+            .iter()
+            .map(|round| size_of_val(round.as_ref()) + 32)
+            .sum()
+    }
+
+    /// Schedule plus temporary permutation storage while constructing a kernel.
+    pub(crate) fn allocation_bound(dimension: usize) -> Option<usize> {
+        dimension
+            .checked_mul((ROTATION_ROUNDS + 1) * size_of::<usize>())?
+            .checked_add(256)
+    }
+
+    /// Returns the routing metric for persisted graph source binding.
+    pub(crate) const fn metric(&self) -> Metric {
+        self.metric
+    }
+
     /// Returns the configured vector dimension.
     pub(crate) const fn dimension(&self) -> usize {
         self.dimension
@@ -117,6 +138,14 @@ impl VectorKernel {
         Ok(processed.into_boxed_slice())
     }
 
+    /// Validates a caller's routing-space vector without normalization or scoring.
+    ///
+    /// Wrong dimensions and nonfinite components are `InvalidArgument`;
+    /// zero vectors and unnormalized inner-product magnitudes are valid.
+    pub(crate) fn validate_routing(&self, vector: &[f32]) -> Result<()> {
+        validate_vector(vector, self.dimension, VectorSource::Caller)
+    }
+
     /// Computes the deterministic routing distance from a preprocessed routing
     /// vector to a persistent routing centroid; smaller is nearer.
     ///
@@ -135,17 +164,14 @@ impl VectorKernel {
         validate_vector(routing, self.dimension, VectorSource::Caller)?;
         validate_vector(centroid, self.dimension, VectorSource::Persistent)?;
 
-        match self.metric {
-            Metric::L2 => Ok(squared_l2(routing, centroid)),
-            Metric::Cosine | Metric::InnerProduct => Ok(-dot_product(routing, centroid)),
-        }
+        Ok(self.routing_distances_validated([routing], centroid)[0])
     }
 
     /// Computes independent routing distances against one shared centroid.
     ///
-    /// Interleaving vectors exposes independent accumulators to the compiler
-    /// without reassociating any vector's scalar-f64 additions. Every lane is
-    /// bit-for-bit identical to `routing_distance`, including signed zero.
+    /// Full blocks use eight f64 accumulation chains and a fixed pairwise
+    /// reduction. Every lane is bit-for-bit identical to `routing_distance`,
+    /// including signed zero; shorter vectors use direct scalar sums.
     pub(crate) fn routing_distances<const N: usize>(
         &self,
         routings: [&[f32]; N],
@@ -159,7 +185,7 @@ impl VectorKernel {
     }
 
     /// Scores independent persistent centroids against one query, preserving
-    /// each scalar routing distance's accumulation order and exact bits.
+    /// the routing kernel's accumulation order and exact bits.
     pub(crate) fn routing_centroid_distances<const N: usize>(
         &self,
         routing: &[f32],
@@ -178,37 +204,82 @@ impl VectorKernel {
     /// each component for every distance. Callers must establish those input
     /// invariants through preprocessing, persistent decoding, or validation.
     ///
-    /// Interleaving preserves each scalar-f64 accumulation order, including
-    /// signed zero; a single lane also serves a partial routing group.
+    /// Eight independent chains shorten the dependency path for one distance.
+    /// Scalar and batched callers share the same reduction, including signed
+    /// zero; the caller-visible exact-rerank kernel remains separate.
     pub(crate) fn routing_distances_validated<const N: usize>(
         &self,
         routings: [&[f32]; N],
         centroid: &[f32],
     ) -> [f64; N] {
-        let mut distances = [0.0; N];
+        // A short vector has no full block: interleave its direct sums instead
+        // of paying one kernel call and an eight-way reduction per lane.
+        if centroid.len() < 8 {
+            let mut distances = [0.0; N];
+            match self.metric {
+                Metric::L2 => {
+                    for (dimension, &component) in centroid.iter().enumerate() {
+                        let component = f64::from(component);
+                        for lane in 0..N {
+                            let difference = f64::from(routings[lane][dimension]) - component;
+                            distances[lane] += difference * difference;
+                        }
+                    }
+                }
+                Metric::Cosine | Metric::InnerProduct => {
+                    for (dimension, &component) in centroid.iter().enumerate() {
+                        let component = f64::from(component);
+                        for lane in 0..N {
+                            distances[lane] += f64::from(routings[lane][dimension]) * component;
+                        }
+                    }
+                    for distance in &mut distances {
+                        *distance = -*distance;
+                    }
+                }
+            }
+            return distances;
+        }
+        routings.map(|routing| self.routing_distance_validated(routing, centroid))
+    }
+
+    /// Scores one validated pair with a fixed eight-chain f64 reduction.
+    /// Batch callers reuse this small kernel rather than multiplying its live
+    /// accumulators and register pressure by the number of distances.
+    fn routing_distance_validated(&self, routing: &[f32], centroid: &[f32]) -> f64 {
+        let mut sums = [0.0; 8];
+        let (routing_blocks, routing_tail) = routing.as_chunks::<8>();
+        let (centroid_blocks, centroid_tail) = centroid.as_chunks::<8>();
         match self.metric {
             Metric::L2 => {
-                for (dimension, &component) in centroid.iter().enumerate() {
-                    let component = f64::from(component);
-                    for lane in 0..N {
-                        let difference = f64::from(routings[lane][dimension]) - component;
-                        distances[lane] += difference * difference;
+                for (a, b) in routing_blocks.iter().zip(centroid_blocks) {
+                    for offset in 0..8 {
+                        let difference = f64::from(a[offset]) - f64::from(b[offset]);
+                        sums[offset] += difference * difference;
                     }
+                }
+                for (offset, (&a, &b)) in routing_tail.iter().zip(centroid_tail).enumerate() {
+                    let difference = f64::from(a) - f64::from(b);
+                    sums[offset] += difference * difference;
                 }
             }
             Metric::Cosine | Metric::InnerProduct => {
-                for (dimension, &component) in centroid.iter().enumerate() {
-                    let component = f64::from(component);
-                    for lane in 0..N {
-                        distances[lane] += f64::from(routings[lane][dimension]) * component;
+                for (a, b) in routing_blocks.iter().zip(centroid_blocks) {
+                    for offset in 0..8 {
+                        sums[offset] += f64::from(a[offset]) * f64::from(b[offset]);
                     }
                 }
-                for distance in &mut distances {
-                    *distance = -*distance;
+                for (offset, (&a, &b)) in routing_tail.iter().zip(centroid_tail).enumerate() {
+                    sums[offset] += f64::from(a) * f64::from(b);
                 }
             }
         }
-        distances
+        let distance = ((sums[0] + sums[1]) + (sums[2] + sums[3]))
+            + ((sums[4] + sums[5]) + (sums[6] + sums[7]));
+        match self.metric {
+            Metric::L2 => distance,
+            Metric::Cosine | Metric::InnerProduct => -distance,
+        }
     }
 
     /// Validates one caller query and prepares its invariant exact-score data.
@@ -802,7 +873,7 @@ mod tests {
     }
 
     #[test]
-    fn interleaved_routing_preserves_scalar_distance_bits() {
+    fn routing_batches_preserve_scalar_bits_and_numerical_accuracy() {
         let mut random = ChaCha8::new(SEED);
         let extremes = [
             0.0,
@@ -815,7 +886,7 @@ mod tests {
             -1.0,
         ];
         for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
-            for dimension in [1, 2, 3, 7, 16, 17, 128, 768, MAX_DIMENSION] {
+            for dimension in [1, 2, 3, 7, 8, 9, 16, 17, 128, 768, MAX_DIMENSION] {
                 let kernel = VectorKernel::new(dimension, metric, SEED).unwrap();
                 for trial in 0..12 {
                     let mut component = || {
@@ -853,6 +924,31 @@ mod tests {
                     for ((vector, distance), centroid_distance) in
                         vectors.iter().zip(distances).zip(centroid_distances)
                     {
+                        // An independent compensated sum checks numerical accuracy;
+                        // scalar/batch parity alone would share the same mistakes.
+                        let mut sum = 0.0_f64;
+                        let mut correction = 0.0_f64;
+                        let mut magnitude = 0.0_f64;
+                        for (&a, &b) in vector.iter().zip(&centroid) {
+                            let (a, b) = (f64::from(a), f64::from(b));
+                            let term = match metric {
+                                Metric::L2 => (a - b) * (a - b),
+                                Metric::Cosine | Metric::InnerProduct => -(a * b),
+                            };
+                            let next = sum + term;
+                            correction += if sum.abs() >= term.abs() {
+                                (sum - next) + term
+                            } else {
+                                (term - next) + sum
+                            };
+                            sum = next;
+                            magnitude += term.abs();
+                        }
+                        let tolerance = (dimension + 2) as f64 * f64::EPSILON * magnitude;
+                        assert!(
+                            (distance - (sum + correction)).abs() <= tolerance,
+                            "routing accuracy metric={metric:?} dimension={dimension} trial={trial}"
+                        );
                         assert_eq!(
                             kernel.routing_distances_validated([vector.as_slice()], &centroid)[0]
                                 .to_bits(),

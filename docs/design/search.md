@@ -19,8 +19,13 @@ L2, negated dot product for inner product, and negated dot product for cosine.
 Cosine records are normalized during preprocessing and cosine split centroids
 are normalized after their arithmetic mean is trained; a zero centroid remains
 zero and uses a neutral distance of zero. Distance ties resolve to the smaller
-Partition Key. Exact reranking reads the unrotated original vector, accumulates
-in f64, and defines:
+Partition Key. Routing distances use eight independent f64 sums for component
+indices modulo eight, followed by a fixed balanced pairwise reduction. Batched
+routing reuses the same single-distance kernel, shortening the dependency chain
+without multiplying the live accumulators or adding heap allocations. Vectors
+shorter than one eight-component block use direct scalar sums, interleaved for
+batch calls. Exact reranking keeps its separate kernel:
+it reads the unrotated original vector, accumulates in f64, and defines:
 
 - L2 ranking: squared distance `sum((q_i - x_i)^2)`, with public SearchHit
   returning its Euclidean square root;
@@ -70,42 +75,53 @@ Corruption.
 
 ## 3. Conservative approximate intervals
 
-Production uses a deterministic f64 kernel for rotated query/code dot
-products. Each lane accumulates even and odd components independently,
-combines the two sums, and applies the stored scale once. This shortens the
-addition dependency chain without allocation or a new f32/SIMD rounding term.
+Production scores each stored code with one exact integer dot. The rotated
+query is quantized once per search: `L=min(32767, floor(i32::MAX/(63*n)))`,
+`s=max(abs(q_i))/L` (or 1 for a zero query), and
+`a_i=clamp(round(q_i/s),-L,L)`, stored as i16. These components and scale
+are query scratch; the persistent vector codec and exact reranking are unchanged.
+For signed seven-bit stored components `c`, `S=sum(a_i*c_i)` is exact:
+`n*L*63 <= i32::MAX`. The dimension-dependent limit uses the highest
+i16 precision compatible with exact i32 accumulation, avoiding a wider dot
+reduction. It uses one additional scratch byte per query dimension compared
+with i8 screening. The dot estimate
+is `D=(f64(S)*s)*code_scale`, with two f64 multiplications.
 
-Each `q_i * c_i` product is exact in f64: an f32 significand times a six-bit
-integer needs at most 30 significant bits. For dimension `n >= 2`, each term
-encounters at most `ceil(n/2)-1` partial-sum additions, one reduction, and one
-scale multiplication: at most `ceil(n/2)+1 <= n` rounding steps. For `n=1`,
-only the final scale multiplication can round. The same bound therefore
-covers odd dimensions, cancellation, and zero scale.
+Query preparation computes an outward interval for every `q_i-s*a_i` using
+directed multiplication and subtraction. Squaring the largest absolute endpoint,
+summing upward and taking an upward square root gives `E_q >= ||q-s*a||`.
+Let `Q >= ||q||` and `C >= code_scale*sqrt(sum(c_i*c_i))`. Cauchy–Schwarz
+bounds query-quantization error by `E_q*C`. Also `||s*a|| <= Q+E_q`, so the
+two final multiplications have rounding error at most
+`2*f64::EPSILON*(Q+E_q)*C` (an upper bound on their gamma factor).
+Thus the dot endpoints are `D ± (E_q + 2*f64::EPSILON*(Q+E_q))*C`,
+computed outward. Finite f32 inputs and the public dimension limit keep the
+nonzero scaled integer products within the normal f64 range.
 
-With unit roundoff `u = 2^-53` and `n <= 16384`, accumulated error is bounded
-by `gamma_n * sum(abs(q_i * x_hat_i))`, where
-`gamma_n = n*u/(1-n*u) <= 2*n*u`. Cauchy–Schwarz bounds the absolute sum by
-`norm(q) * norm(x_hat)`. Thus the computed dot's conservative endpoints are
-`dot ± n*2^-52*norm(q)*norm(x_hat)`, rounded outward. Both norms and the
-error products use upward-rounded bounds; `norm(x_hat)` uses the exact stored
-integer squared code norm and nonnegative stored scale. Finite f32 inputs and
-the dimension limit exclude f64 overflow. Nonzero partial sums are multiples
-of `2^-149`; the final scaled result cannot be smaller than `2^-298`, excluding
-f64 underflow. This numerical roundoff bound is applied before the
-reconstruction-error radius below.
+For reconstruction `x_hat` and stored reconstruction-error bound `E_x`:
 
-For query `q`, reconstruction `x_hat`, and error upper bound `E`:
-
-| Metric | rough distance `d_hat` | radius `B` |
+| Metric | rough distance | reconstruction-error radius |
 | --- | --- | --- |
-| Inner product | `-q dot x_hat` | `norm(q) E` |
-| Cosine | `1 - q dot x_hat` | `norm(q) E` |
-| Squared L2 | `max(0, norm(q)^2 + norm(x_hat)^2 - 2 q dot x_hat)` | `2 sqrt(d_hat) E + E^2` |
+| Inner product | `-D` | `norm(q) E_x` |
+| Cosine | `1-D` | `norm(q) E_x` |
+| Squared L2 | `max(0, norm(q)^2 + norm(x_hat)^2 - 2D)` | `2 sqrt(d_upper) E_x + E_x^2` |
 
-The interval is `[d_hat - B, d_hat + B]`; only the squared-L2 lower endpoint is
-clamped to zero. Cosine is not clamped. A future optimized kernel is permitted
-only after its proven rounding bound is added to `B`; tests alone are not a
-substitute for that bound.
+Directed norm and dot endpoints first bound distance to the reconstructed vector.
+The reconstruction-error radius then expands those bounds to cover the original
+vector; L2 lower endpoints clamp at zero. `d_upper` is the conservative upper
+endpoint before adding reconstruction error. The rough score need not equal the
+unquantized query/code dot; the interval accounts for both query and stored-vector
+quantization. Final Search Hit distances still use original vectors.
+
+### 3.1 Admission against the global rough-distance heap
+
+Each eligible entry is scored once. A full heap rejects a rough score strictly
+greater than its current worst rough score before constructing its interval.
+Equality remains eligible for Record ID tie-breaking. Successful admissions can
+only improve the cutoff; the next entry uses the updated value. This admission
+rule is exactly the same rough-score top-budget policy as full scoring and
+sorting, without a second dot, separate screening bound, or batch scratch.
+Every eligible identity is still registered for duplicate-membership detection.
 
 ## 4. Tree Key enumeration
 
@@ -146,19 +162,27 @@ predicate rejection cannot hide malformed persistent entries.
 Traversal is a level-scaled beam. The leaf-level base beam defaults to 128 and
 SearchOptions may override it per request within the hard cap; moving one
 level toward the root divides it by two with minimum one. All admitted parents
-at one depth expose their Child Entries before the next depth selects the
-globally nearest beam for each tree. This prevents one wide parent from
+at one depth contribute before the next depth selects the globally nearest
+beam for each tree. `SearchOptions::routing_mode` defaults to Exact. Graph-enabled
+indexes can explicitly select PartitionLocalHnsw with positive `ef_search`;
+indexes without graph configuration reject that choice. Each parent contributes up to the full
+local next-level beam B, never a share divided among parents. Candidate scores
+come directly from the graph's f64 routing kernel evaluations. Exact scores all
+children. Both modes merge into a single bounded top-B heap per tree/level,
+ordered by distance and Partition Key. Every exposed Child Entry is checked
+for duplicate incoming references, including children omitted by local search. This prevents one wide parent from
 consuming the next level's beam before other admitted parents contribute their
 children. Eligible trees advance fairly. Ties use Tree Key, Partition Key,
 then Record ID.
-Partition, rerank, and optional RaBitQ-overlap bounds are charged
+Partition and rerank bounds are charged
 before corresponding work. No speculative read-ahead occurs beyond a budget.
 
 ### 6.2 Bounded IO and prefetching
 
-Traversal batches snapshot Header reads for a funded prefix of up to 32
+Traversal batches snapshot Header reads for a funded prefix of up to 1024
 non-root partitions, including leaves. Filtered leaf visits include their
-Synopses in the same batch, with at most 64 keys in flight. Visits, body loads,
+Synopses in the same batch, with at most 2048 logical keys per request; adapters
+chunk requests at their own point-read ceilings. Visits, body loads,
 candidate selection, and budget accounting retain their original order. Roots
 are read individually because their transition state can inject split targets
 ahead of the queued work. Batching changes backend scheduling, not the selected
@@ -174,20 +198,33 @@ This bounds temporary prefetching independently of complete partition size.
 
 ### 6.3 Candidate selection
 
-For a leaf with `n` eligible entries, checked arithmetic computes
-`r = min(n, max(2*k, 64))`. The leaf keeps the rough top `r`, uses the r-th
-smallest upper endpoint as its overlap threshold, includes entries whose lower
-endpoint overlaps it, and caps the set at `min(4*r, remaining rerank budget)` by
-lower bound, rough distance, and Record ID. After merging leaf sets, search uses
-the global kth-smallest upper endpoint (positive infinity when fewer than `k`
-exist), retains overlapping candidates, truncates by rough distance and Record
-ID to the remaining rerank budget, then loads original vectors. Any local
-overlap truncation sets `rabitq_overlap_truncated`.
+Every predicate-eligible entry of every visited leaf is scored. One global max
+heap owns the exact-rerank capacity and retains at most that many entries, ordered by rough distance
+and then unsigned Record ID bytes. There is no per-leaf quota. Before reranking, the retained pool's kth-smallest
+upper endpoint excludes candidates whose lower endpoint is greater; with fewer
+than k candidates no interval exclusion is applied. This bounded final pass avoids
+loading clearly noncompetitive vectors, especially for small or selective queries.
+Rejected or evicted heap candidates set exact-rerank budget exhaustion. This is an approximate ranking policy:
+fixed-capacity retention does not guarantee exact top-k recall. The exact-rerank
+stage loads every admitted candidate; it does not apply a second capacity limit.
 
-The local overlap test already includes the rough top `r`: each rough distance
-is at most its upper endpoint, so the r-th rough distance is at most the r-th
-upper endpoint, and every top-`r` candidate's lower endpoint is no larger than
-its rough distance. No separate rough top-`r` selection is necessary.
+Only admitted candidates acquire a shared reference to the leaf's immutable entry
+array and their original entry ordinal. Filter fields are never copied. The final
+rerank stage reads these original projections to verify them and the source Record
+Location against authoritative records from the same snapshot. Expanded RaBitQ
+codes are not retained by candidate references. Eviction immediately releases a
+source array when its last candidate leaves the heap.
+
+The pool scores eligible entries individually and admits them directly,
+without per-leaf candidate or screened-ID buffers. Every eligible Record ID is
+registered once in a separate compact list, including screened, rejected, and
+evicted entries. Only admitted heap candidates require an additional ID reference.
+After traversal, one borrowed-ID set is reserved from the actual list length to
+validate duplicate membership before exact reads. Both the list and set are
+released immediately after successful validation. Thus candidate count and projection ownership are bounded by the rerank
+budget, while corruption-detection identity storage grows with the number of
+predicate-eligible entries visited. Both retained IDs and transient duplicate-table space are charged to routing working memory;
+shared source arrays are charged once, including on cache misses or eviction.
 
 ### 6.4 Intermediate topology
 
@@ -216,7 +253,7 @@ Leaf Entry usage is a 64-bit counter, not an exhaustion dimension.
 SearchOptions overrides nonzero bounds for Tree Keys and partitions within
 hard caps, plus the leaf-level base beam width. Exact-rerank
 sizing is owned by search: checked arithmetic computes
-`max(64,k+ceil(k/4))`, matching the leaf rough-set floor, and bounds it by the
+`max(64,k+ceil(k/4))` and bounds it by the
 Runtime's exact-rerank ceiling. Defaults are process-local and benchmark-tunable.
 One successful response reports usage and each dimension that prevented
 pending work.
@@ -234,19 +271,26 @@ search reports exact-rerank usage, exhaustion, and stage latency.
 
 The Runtime shares byte-bounded caches of decoded internal and leaf search data.
 Foreground preparation also reuses committed internal bodies before staging
-internal changes, under the same snapshot/epoch rules (ADR 0023); general write
-routing and leaf mutation do not fill this cache.
+internal changes, under the same snapshot/epoch rules
+([ADR 0023](../adr/0023-committed-internal-routing-cache.md)). Graph-aware
+maintenance may seed complete immutable internal graph bodies after known
+successful commit. General write routing after staged changes and leaf mutation
+do not fill this cache.
 A key contains Logical Index ID, canonical Tree Key, Partition Key, and kind.
 Every entry contains Header cache epoch. Search reads the Header from its own
 snapshot and may reuse cached data only when epoch and kind match; otherwise it
 loads and decodes the partition from that snapshot.
 
 Leaf bodies expand validated RaBitQ7 components to signed bytes once on load.
-They retain the numeric header and expanded components instead of the packed
-payload; cached Record IDs own their bytes so they cannot keep the old encoded
-buffer alive. Cache accounting includes the expanded allocation. Scoring keeps
-the scalar-f64 accumulation order and the same conservative interval arithmetic;
-the persistent RaBitQ7 format is unchanged.
+Each leaf body owns one contiguous expanded-component buffer, and its entries
+retain numeric headers and ranges into that buffer instead of packed payloads.
+Initial reservation is capped at one scan page; larger bodies grow as validated
+entries arrive. Storage validation and the subsequent expansion remain separate
+passes, and complete body counts are checked before publication. Cached Record
+IDs own their bytes so they cannot keep the old encoded buffer alive. Cache
+accounting charges the shared expanded allocation once at the body owner, in
+addition to entry-owned data and the body envelope. Scoring uses the integer query/code dot and conservative intervals described
+above; the persistent RaBitQ7 format is unchanged.
 
 Entries are immutable and never pinned. Concurrent misses may duplicate work and
 race to publish an equal or newer epoch; there is no waiter/cancellation state.
@@ -255,6 +299,57 @@ byte shares may be configured, but the eviction policy is an internal
 benchmark-driven detail, not a persistent or public compatibility contract.
 Corruption is never cached.
 
+### Graph index bodies
+
+The graph reader uses the complete query's existing validated logical
+transaction and the snapshot Header already read by traversal. It reads the
+Graph Descriptor on every access, including hits. Internal kind, exact count, epoch, configured capacity and
+the descriptor's source binding must agree. Missing or mismatched graphs are
+Corruption; there is no exact fallback. Ordinary indexes do not request graph
+records. Both routing modes on graph-enabled indexes validate complete
+nonempty graph bodies. Graph indexes
+allow every legal searchable state and skip graph loading for an exactly empty
+internal body after applying root split traversal.
+
+On a miss, the reader scans complete Child Entries and contiguous graph chunks
+from that same transaction, then restores the persisted native graph. It never
+builds a graph or changes its seed, construction parameters, adjacency or query
+distances. A graph internal body owns its Child Entries, native graph, source
+binding, and numeric kernel together. An internal cache entry may contain ordinary
+projections or the complete graph body. Foreground exact routing reuses
+projections from either representation. When it populated ordinary projections
+first, the graph reader upgrades that same-epoch body after loading and validating
+the persisted graph. A late same-epoch projections-only fill cannot downgrade a
+complete graph body; a newer epoch may replace it normally.
+Cold reads retain unpublished entries and chunks until restoration succeeds,
+then publish one complete shared body. Older snapshots cannot replace newer cached
+epochs. Eviction does not invalidate handles still held by queries.
+
+`RuntimeConfig::routing_working_bytes` (default 256 MiB) bounds one query's graph
+routing work independently of retained cache capacity. Before loading entries or
+chunks, the reader admits checked bounds for the complete body, kernel creation,
+chunk and assembly buffers, native validation/restoration, private query scratch,
+and candidate output. The caller reserves other retained query state, including
+global candidate merging and observed-child identities. Admission uses the same
+bound on warm and cold reads. Zero/insufficient cache capacity disables retention,
+not graph use; work exceeding the routing ceiling returns LimitExceeded.
+
+Each parent handle is consumed before loading the next. Restore and query work
+run on the blocking pool, retain foreground admission through actual task exit,
+and honor cancellation/deadlines. Scratch is private to each query; native graphs
+are immutable and shared. Snapshot expiry propagates to complete-query retry;
+neither graph reads nor CPU restoration open a new transaction. Traversal passes
+its already-read snapshot Header into the reader, avoiding a duplicate Header
+read. Graph internal bodies are consumed serially; leaf
+visits retain bounded metadata/body prefetch. Exact on a graph index loads and
+validates the same mandatory graph body, then ignores adjacency; corruption
+never triggers a routing fallback. All children still participate in the
+query-wide incoming-edge integrity check. Its hash storage, live frontiers,
+query inputs, and any leaf candidates retained by shallower trees are charged
+before admitting the next graph. These checks and native scratch admission are
+independent of cache warmth. Graph exploration consumes no logical partition
+visits; each visited child body consumes its ordinary visit.
+
 ## 9. Validation
 
 - Golden and property tests cover signed-code encoding, error rounding,
@@ -262,7 +357,7 @@ Corruption is never cached.
 - Predicate properties compare compiled evaluation and synopsis truth sets with
   a simple SQL three-valued oracle over boundary values and NULLs.
 - Deterministic tests cover Tree Key range widening, scan budgets, traversal
-  ordering, every exhaustion dimension, overlap truncation, and intermediate
+  ordering, every exhaustion dimension, and intermediate
   topology traversal.
 - Cache histories prove snapshot epoch validation and safe concurrent fills
   without asserting a particular eviction algorithm.

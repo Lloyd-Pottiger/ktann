@@ -34,14 +34,13 @@ impl Drop for Directory {
 fn config() -> IndexConfig {
     IndexConfig::new(2, Metric::L2)
         .unwrap()
-        .with_partition_entries(2, 4)
+        .with_leaf_partition_entries(2, 4)
+        .and_then(|config| config.with_internal_partition_entries(2, 4))
         .unwrap()
 }
 
 fn options() -> ConstructionOptions {
     ConstructionOptions {
-        min_partition_entries: 2,
-        max_partition_entries: 4,
         sample_items: 8,
         memory_bytes: 2 * 1024 * 1024,
         scratch_bytes: 8 * 1024 * 1024,
@@ -254,6 +253,8 @@ fn manifest_identity_and_version_are_checked_independently_of_data() {
 
 fn forest_options() -> ktann::bulk::ForestOptions {
     ktann::bulk::ForestOptions {
+        refinement_rounds: None,
+        refinement_memory_bytes: 256 * 1024 * 1024,
         sample_items: options().sample_items,
         tree_memory_bytes: options().memory_bytes,
         tree_scratch_bytes: options().scratch_bytes,
@@ -266,7 +267,8 @@ fn forest_config(metric: Metric) -> IndexConfig {
     use ktann::api::FieldId;
     IndexConfig::new(2, metric)
         .unwrap()
-        .with_partition_entries(2, 4)
+        .with_leaf_partition_entries(2, 4)
+        .and_then(|config| config.with_internal_partition_entries(2, 4))
         .unwrap()
         .with_fields(vec![
             FieldSchema::new("bucket", DataType::I64).unwrap(),
@@ -349,6 +351,7 @@ fn forest_globally_groups_exact_membership_and_matches_independent_tree_builds()
             source.config().clone(),
             [7; 32],
             forest_options().sample_items,
+            None,
         )
         .unwrap();
         let shape = forest_shape(&reopened);
@@ -373,8 +376,7 @@ fn forest_globally_groups_exact_membership_and_matches_independent_tree_builds()
         for (ordinal, (tree, records)) in expected.into_iter().enumerate() {
             construct_tree(
                 &directory.0.join(format!("independent-{ordinal}")),
-                2,
-                metric,
+                source.config(),
                 [7; 32],
                 options(),
                 records.into_iter().map(Ok),
@@ -449,7 +451,8 @@ fn forest_sort_spills_and_source_order_do_not_change_topology() {
             a.manifest(),
             a.config().clone(),
             [8; 32],
-            forest_options().sample_items
+            forest_options().sample_items,
+            None,
         )
         .err()
         .unwrap()
@@ -471,7 +474,8 @@ fn forest_sort_spills_and_source_order_do_not_change_topology() {
             regrouped.manifest(),
             regrouped.config().clone(),
             [9; 32],
-            forest_options().sample_items
+            forest_options().sample_items,
+            None,
         )
         .is_err()
     );
@@ -621,6 +625,7 @@ fn forest_reader_rejects_invalid_tree_envelopes_and_premature_roots() {
             input.config().clone(),
             [0; 32],
             forest_options().sample_items,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -836,7 +841,8 @@ fn variable_id_forest_is_identical_across_construction_budgets() {
             let dir = Directory::new();
             let config = IndexConfig::new(7, metric)
                 .unwrap()
-                .with_partition_entries(2, 4)
+                .with_leaf_partition_entries(2, 4)
+                .and_then(|config| config.with_internal_partition_entries(2, 4))
                 .unwrap();
             let records: Vec<_> = (0_u64..257)
                 .rev()
@@ -891,4 +897,95 @@ fn variable_id_forest_is_identical_across_construction_budgets() {
             assert_eq!(streamed.manifest(), resident.manifest());
         }
     }
+}
+
+#[test]
+fn forest_capacity_identity_and_round_trip_are_independent_by_level() {
+    let directory = Directory::new();
+    let config = IndexConfig::new(2, Metric::L2)
+        .unwrap()
+        .with_leaf_partition_entries(2, 4)
+        .unwrap()
+        .with_internal_partition_entries(1, 2)
+        .unwrap();
+    let input = InputSnapshot::create(
+        &directory.0.join("source"),
+        config.clone(),
+        1024 * 1024,
+        (0..129_u64).map(|id| {
+            Record::new(
+                Bytes::copy_from_slice(&id.to_be_bytes()),
+                vec![id as f32, 1.0],
+                vec![],
+            )
+        }),
+    )
+    .unwrap();
+    let mut expected_leaves = None;
+    let mut identities = Vec::new();
+    for maximum in [2, 8, 128] {
+        let config = config
+            .clone()
+            .with_internal_partition_entries(1, maximum)
+            .unwrap();
+        let source = InputSnapshot::open(
+            &directory.0.join("source"),
+            config.clone(),
+            input.manifest().clone(),
+        )
+        .unwrap();
+        let path = directory.0.join(format!("forest-{maximum}"));
+        let (forest, _) =
+            ForestArtifact::build(&path, &source, [0; 32], forest_options(), 1024 * 1024).unwrap();
+        let reopened = ForestArtifact::open(
+            &path,
+            forest.manifest().clone(),
+            source.manifest(),
+            config.clone(),
+            [0; 32],
+            forest_options().sample_items,
+            None,
+        )
+        .unwrap();
+        assert_eq!(forest_shape(&forest), forest_shape(&reopened));
+        let shape = forest_shape(&reopened);
+        for ((_, key), (level, _, entries)) in &shape {
+            assert!(entries.len() <= config.max_partition_entries(*level) as usize);
+            if *key != 1 {
+                assert!(entries.len() >= config.min_partition_entries(*level) as usize);
+            }
+        }
+        let leaves: ForestShape = shape
+            .into_iter()
+            .filter(|(_, (level, _, _))| *level == 1)
+            .collect();
+        if let Some(expected) = &expected_leaves {
+            assert_eq!(&leaves, expected);
+        } else {
+            expected_leaves = Some(leaves);
+        }
+        identities.push(forest.manifest().clone());
+        for changed in [
+            config.clone().with_leaf_partition_entries(1, 4).unwrap(),
+            config.clone().with_leaf_partition_entries(2, 8).unwrap(),
+            config
+                .clone()
+                .with_internal_partition_entries(1, maximum + 2)
+                .unwrap(),
+        ] {
+            assert!(
+                ForestArtifact::open(
+                    &path,
+                    forest.manifest().clone(),
+                    source.manifest(),
+                    changed,
+                    [0; 32],
+                    forest_options().sample_items,
+                    None,
+                )
+                .is_err()
+            );
+        }
+    }
+    assert!(identities.windows(2).all(|pair| pair[0] != pair[1]));
 }

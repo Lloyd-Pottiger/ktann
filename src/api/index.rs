@@ -202,8 +202,7 @@ impl<B: Backend> Index<B> {
     /// bodies are served by the Runtime's snapshot-validated Partition Cache.
     ///
     /// The outcome reports ordered exact-distance hits, actual budget usage,
-    /// every budget dimension that prevented eligible work, and per-leaf
-    /// RaBitQ overlap truncation. Success may return fewer than `k` hits and
+    /// and every budget dimension that prevented eligible work. Success may return fewer than `k` hits and
     /// deliberately makes no exact-global-top-k, completeness, continuation,
     /// or monotonic-across-budgets guarantee: resubmitting the same request
     /// with larger caller-controlled traversal budgets asks for more work
@@ -222,13 +221,85 @@ impl<B: Backend> Index<B> {
         request: SearchRequest,
         operation_options: OperationOptions,
     ) -> Result<SearchOutcome> {
+        self.execute_search(self.prepare_search(request)?, operation_options)
+            .await
+    }
+
+    /// Resolves truth memberships for untimed diagnostics on an immutable fixture.
+    #[cfg(feature = "benchmark")]
+    pub async fn benchmark_truth_leaves(
+        &self,
+        ids: Vec<bytes::Bytes>,
+    ) -> Result<Vec<(crate::api::PartitionKey, u64)>> {
+        let id = self.logical_index_id();
+        self.run_foreground(
+            Operation::Search,
+            OperationOptions::default(),
+            move |context| async move {
+                crate::benchmark::truth_leaves(context.backend().as_ref(), id, &ids).await
+            },
+        )
+        .await
+    }
+
+    /// Streams the final leaf layout identity for benchmark comparability checks.
+    #[cfg(feature = "benchmark")]
+    pub async fn leaf_layout_fingerprint(&self) -> Result<[u8; 32]> {
+        let id = self.logical_index_id();
+        self.run_foreground(
+            Operation::Search,
+            OperationOptions::default(),
+            move |context| async move {
+                crate::benchmark::leaf_layout_fingerprint(context.backend().as_ref(), id).await
+            },
+        )
+        .await
+    }
+
+    /// Executes production search with untimed truth-coverage diagnostics.
+    #[cfg(feature = "benchmark")]
+    pub async fn benchmark_search(
+        &self,
+        request: SearchRequest,
+        truth: Vec<Bytes>,
+    ) -> Result<(SearchOutcome, crate::benchmark::SearchDiagnostics)> {
+        if self.config().local_graph().is_none()
+            || !self.config().tree_key_fields().is_empty()
+            || truth.len() > request.k()
+        {
+            return Err(Error::invalid_argument());
+        }
+        let mut prepared = self.prepare_search(request)?;
+        let diagnostics = Arc::new(std::sync::Mutex::new(
+            crate::benchmark::SearchDiagnostics::new(truth),
+        ));
+        prepared.diagnostics = Some(Arc::clone(&diagnostics));
+        let outcome = self
+            .execute_search(prepared, OperationOptions::default())
+            .await?;
+        let diagnostics = diagnostics
+            .lock()
+            .map_err(|_| Error::new(ErrorKind::Other))?
+            .clone();
+        Ok((outcome, diagnostics))
+    }
+
+    /// Shares validation and preprocessing across production and benchmark calls.
+    fn prepare_search(&self, request: SearchRequest) -> Result<search::PreparedSearch> {
         let config = self.runtime.config();
-        let prepared = search::PreparedSearch::new(
+        search::PreparedSearch::new(
             &self.manifest,
             config.default_search_budgets(),
             config.tree_key_scan_ranges(),
             request,
-        )?;
+        )
+    }
+
+    async fn execute_search(
+        &self,
+        prepared: search::PreparedSearch,
+        operation_options: OperationOptions,
+    ) -> Result<SearchOutcome> {
         let manifest = Arc::clone(&self.manifest);
         let cache = self.runtime.partition_cache();
         let (outcome, maintenance) = self
@@ -285,7 +356,9 @@ impl<B: Backend> Index<B> {
         .await
     }
 
-    /// Refines an imported index before serving it, without changing its identity.
+    /// Refines an ordinary imported index before serving it, without changing its identity.
+    /// Graph indexes reject this operation; refine their construction
+    /// artifact before graph construction and Bulk Build publication instead.
     ///
     /// The caller must exclude all other operations and maintenance on this index,
     /// including other Runtime instances. Finish outstanding work first. Local
@@ -295,6 +368,9 @@ impl<B: Backend> Index<B> {
     /// failure, keep the index offline and drop/rebuild it if needed. There is no
     /// persistent progress or automatic recovery protocol.
     pub async fn refine(&self, options: RefineOptions) -> Result<()> {
+        if self.config().local_graph().is_some() {
+            return Err(Error::invalid_argument());
+        }
         let manifest = Arc::clone(&self.manifest);
         let runtime = Arc::clone(&self.runtime);
         let retry = lifecycle::RetryPolicy::from_config(self.runtime.config());

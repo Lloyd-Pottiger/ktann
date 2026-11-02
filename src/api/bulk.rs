@@ -10,6 +10,24 @@ use crate::storage::values::{BuildDescriptor, IndexManifest};
 
 use super::{IndexName, LogicalIndexId, OperationOptions, Result};
 
+/// Immutable Bulk Build preparation semantics, persisted with the source identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BulkBuildOptions {
+    /// Partition construction controls.
+    pub construction: crate::construction::ConstructionOptions,
+    /// None preserves constructed centroids; Some(0) refreshes them without moves.
+    pub refinement_rounds: Option<u8>,
+}
+
+impl From<crate::construction::ConstructionOptions> for BulkBuildOptions {
+    fn from(construction: crate::construction::ConstructionOptions) -> Self {
+        Self {
+            construction,
+            refinement_rounds: None,
+        }
+    }
+}
+
 /// Persisted lifecycle of the Logical Index owned by a Bulk Build.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BulkBuildStatus {
@@ -113,6 +131,10 @@ pub struct BulkWorkerOptions {
     pub serving_memory_bytes: usize,
     /// Serving scratch ceiling.
     pub serving_scratch_bytes: u64,
+    /// One graph's borrowed centroids, native construction and encoding memory.
+    pub graph_memory_bytes: usize,
+    /// Loaded topology, vectors, and planning scratch for artifact refinement.
+    pub refinement_memory_bytes: usize,
     /// Maximum size of each accepted artifact.
     pub max_artifact_bytes: u64,
     /// Bounded data and validation pages.
@@ -128,6 +150,8 @@ impl BulkWorkerOptions {
             sort_scratch_bytes: 64 * 1024 * 1024 * 1024,
             serving_memory_bytes: 128 * 1024 * 1024,
             serving_scratch_bytes: 64 * 1024 * 1024 * 1024,
+            graph_memory_bytes: 256 * 1024 * 1024,
+            refinement_memory_bytes: 256 * 1024 * 1024,
             max_artifact_bytes: 64 * 1024 * 1024 * 1024,
             load: BulkLoadOptions::default(),
         }
@@ -142,6 +166,8 @@ impl BulkWorkerOptions {
             || self.sort_scratch_bytes == 0
             || self.serving_memory_bytes == 0
             || self.serving_scratch_bytes == 0
+            || self.graph_memory_bytes == 0
+            || self.refinement_memory_bytes == 0
             || self.max_artifact_bytes == 0
             || self.load.max_mutations < 2
             || self.load.max_bytes == 0

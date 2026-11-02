@@ -869,3 +869,58 @@ fn build_descriptor_key_is_canonical_and_index_owned() {
     overlong.push(0);
     assert!(decode_key(&[], &Bytes::from(overlong)).is_err());
 }
+
+#[test]
+fn graph_key_golden_ordering_and_partition_range() {
+    use ktann::storage::keys::{graph_chunk_key, graph_chunk_range, graph_descriptor_key};
+    let tree = TreeKey::encode(&[], &[]).unwrap();
+    let partition = PartitionKey::new(2).unwrap();
+    let mut prefix = vec![1];
+    prefix.extend_from_slice(&1_u64.to_be_bytes());
+    prefix.push(4);
+    prefix.extend_from_slice(&2_u64.to_be_bytes());
+    let mut descriptor = prefix.clone();
+    descriptor.push(6);
+    assert_eq!(graph_descriptor_key(id(1), &tree, partition), descriptor);
+    let key = decode_key(&[], &Bytes::from(descriptor.clone())).unwrap();
+    assert_eq!(
+        key,
+        LogicalKey::GraphDescriptor {
+            index: id(1),
+            tree_key: tree.clone(),
+            partition
+        }
+    );
+    let range = graph_chunk_range(id(1), &tree, partition);
+    let mut previous = Vec::new();
+    for chunk in [0, 1, 255, 256, 65535, u32::MAX] {
+        let mut expected = prefix.clone();
+        expected.push(7);
+        expected.extend_from_slice(&chunk.to_be_bytes());
+        let encoded = graph_chunk_key(id(1), &tree, partition, chunk);
+        assert_eq!(encoded, expected);
+        assert!(previous < encoded);
+        assert!(range.start() <= encoded.as_slice() && encoded.as_slice() < range.end());
+        let decoded = decode_key(&[], &Bytes::from(encoded.clone())).unwrap();
+        assert_eq!(
+            decoded,
+            LogicalKey::GraphChunk {
+                index: id(1),
+                tree_key: tree.clone(),
+                partition,
+                chunk
+            }
+        );
+        previous = encoded;
+    }
+    for suffix in [
+        vec![6, 0],
+        vec![7],
+        vec![7, 0, 0, 0],
+        vec![7, 0, 0, 0, 0, 0],
+    ] {
+        let mut bad = prefix.clone();
+        bad.extend(suffix);
+        assert!(is_corrupt(&[], &bad));
+    }
+}

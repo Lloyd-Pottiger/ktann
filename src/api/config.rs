@@ -12,8 +12,12 @@ use super::{DataType, Error, FieldId, FieldSchema, Metric, Result, SearchBudgets
 pub(crate) const MAX_DIMENSION: usize = 16_384;
 const MAX_BLOOM_FIELDS: usize = 4;
 const MAX_TREE_KEY_BYTES: usize = 8 * 1_024;
-const DEFAULT_MIN_PARTITION_ENTRIES: u32 = 64;
-const DEFAULT_MAX_PARTITION_ENTRIES: u32 = 512;
+// Small leaves bound member scans; wide internal partitions expose routing work
+// to partition-local graphs without adding unnecessary tree levels.
+const DEFAULT_MIN_LEAF_PARTITION_ENTRIES: u32 = 16;
+const DEFAULT_MAX_LEAF_PARTITION_ENTRIES: u32 = 128;
+const DEFAULT_MIN_INTERNAL_PARTITION_ENTRIES: u32 = 64;
+const DEFAULT_MAX_INTERNAL_PARTITION_ENTRIES: u32 = 16_384;
 const MAX_PARTITION_ENTRIES: u32 = 65_536;
 const DEFAULT_FIXUP_QUEUE_CAPACITY: usize = 1_024;
 const DEFAULT_FOREGROUND_OPERATION_LIMIT: usize = 1_024;
@@ -23,28 +27,93 @@ const DEFAULT_TREE_KEY_SCAN_RANGES: u32 = 1_024;
 const DEFAULT_WRITE_BEAM_SIZE: u32 = 4;
 const MAX_WRITE_BEAM_SIZE: u32 = 16_384;
 
+/// Immutable construction parameters for partition-local HNSW graphs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalGraphConfig {
+    m: u32,
+    ef_construction: u32,
+    seed: [u8; 32],
+}
+
+impl LocalGraphConfig {
+    /// Creates graph parameters for bounded atomic internal-graph publication.
+    pub fn new(m: u32, ef_construction: u32, seed: [u8; 32]) -> Result<Self> {
+        if !(2..=16).contains(&m) || ef_construction < m {
+            return Err(Error::invalid_argument());
+        }
+        Ok(Self {
+            m,
+            ef_construction,
+            seed,
+        })
+    }
+
+    /// Maximum upper-layer degree.
+    pub const fn m(self) -> u32 {
+        self.m
+    }
+
+    /// Construction candidate budget.
+    pub const fn ef_construction(self) -> u32 {
+        self.ef_construction
+    }
+
+    /// Deterministic seed, further scoped by Tree Key and Partition Key.
+    pub const fn seed(self) -> [u8; 32] {
+        self.seed
+    }
+
+    pub(crate) fn parameters(self) -> crate::search::local_hnsw::Parameters {
+        crate::search::local_hnsw::Parameters {
+            m: self.m as usize,
+            ef_construction: self.ef_construction as usize,
+            seed: self.seed,
+        }
+    }
+}
+
 /// Immutable configuration persisted in an Index Manifest.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct IndexConfig {
+    graph: Option<LocalGraphConfig>,
     dimension: usize,
     metric: Metric,
     fields: Box<[FieldSchema]>,
     tree_key_fields: Box<[FieldId]>,
-    min_partition_entries: u32,
-    max_partition_entries: u32,
+    min_leaf_partition_entries: u32,
+    min_internal_partition_entries: u32,
+    max_leaf_partition_entries: u32,
+    max_internal_partition_entries: u32,
 }
 
 impl IndexConfig {
+    /// Enables atomically maintained partition-local graphs for internal routing.
+    /// Foreground writes score internal bodies below 1024 nodes exactly and
+    /// use HNSW for bodies with at least 1024 nodes.
+    #[must_use]
+    pub fn with_local_graph(mut self, graph: LocalGraphConfig) -> Self {
+        self.graph = Some(graph);
+        self
+    }
+
+    /// Construction parameters for partition-local HNSW graphs.
+    pub const fn local_graph(&self) -> Option<LocalGraphConfig> {
+        self.graph
+    }
+
     /// Creates an immutable Logical Index configuration.
     pub fn new(dimension: usize, metric: Metric) -> Result<Self> {
         let config = Self {
+            graph: None,
             dimension,
             metric,
             fields: Box::new([]),
             tree_key_fields: Box::new([]),
-            min_partition_entries: DEFAULT_MIN_PARTITION_ENTRIES,
-            max_partition_entries: DEFAULT_MAX_PARTITION_ENTRIES,
+            min_leaf_partition_entries: DEFAULT_MIN_LEAF_PARTITION_ENTRIES,
+            min_internal_partition_entries: DEFAULT_MIN_INTERNAL_PARTITION_ENTRIES,
+            max_leaf_partition_entries: DEFAULT_MAX_LEAF_PARTITION_ENTRIES,
+            max_internal_partition_entries: DEFAULT_MAX_INTERNAL_PARTITION_ENTRIES,
         };
         config.validate()?;
         Ok(config)
@@ -71,11 +140,22 @@ impl IndexConfig {
         Ok(self)
     }
 
-    /// Sets the minimum and maximum partition entry counts.
-    pub fn with_partition_entries(mut self, minimum: u32, maximum: u32) -> Result<Self> {
-        self.min_partition_entries = minimum;
-        self.max_partition_entries = maximum;
-        self.validate_partition_entries()?;
+    /// Sets leaf occupancy bounds and the asynchronous split threshold.
+    pub fn with_leaf_partition_entries(mut self, minimum: u32, maximum: u32) -> Result<Self> {
+        self.min_leaf_partition_entries = minimum;
+        self.max_leaf_partition_entries = maximum;
+        validate_partition_entries(minimum, maximum)?;
+        Ok(self)
+    }
+
+    /// Sets internal occupancy bounds and the asynchronous split threshold.
+    pub fn with_internal_partition_entries(mut self, minimum: u32, maximum: u32) -> Result<Self> {
+        validate_partition_entries(minimum, maximum)?;
+        if maximum > 16_384 || minimum > 128 {
+            return Err(Error::invalid_argument());
+        }
+        self.min_internal_partition_entries = minimum;
+        self.max_internal_partition_entries = maximum;
         Ok(self)
     }
 
@@ -84,9 +164,20 @@ impl IndexConfig {
         if !(1..=MAX_DIMENSION).contains(&self.dimension) {
             return Err(Error::invalid_argument());
         }
+        if self.max_internal_partition_entries > 16_384 || self.min_internal_partition_entries > 128
+        {
+            return Err(Error::invalid_argument());
+        }
         self.validate_schema()?;
         self.validate_tree_key_fields()?;
-        self.validate_partition_entries()
+        validate_partition_entries(
+            self.min_leaf_partition_entries,
+            self.max_leaf_partition_entries,
+        )?;
+        validate_partition_entries(
+            self.min_internal_partition_entries,
+            self.max_internal_partition_entries,
+        )
     }
 
     /// Validates the field inventory and index-wide limits before any storage work begins.
@@ -165,20 +256,6 @@ impl IndexConfig {
         Ok(())
     }
 
-    fn validate_partition_entries(&self) -> Result<()> {
-        let twice_minimum = self
-            .min_partition_entries
-            .checked_mul(2)
-            .ok_or_else(Error::invalid_argument)?;
-        if self.min_partition_entries == 0
-            || twice_minimum > self.max_partition_entries
-            || self.max_partition_entries > MAX_PARTITION_ENTRIES
-        {
-            return Err(Error::invalid_argument());
-        }
-        Ok(())
-    }
-
     /// Returns the exact vector dimension.
     #[must_use]
     pub const fn dimension(&self) -> usize {
@@ -203,17 +280,58 @@ impl IndexConfig {
         &self.tree_key_fields
     }
 
-    /// Returns the configured minimum partition entry count.
+    /// Returns the configured minimum leaf partition entry count.
     #[must_use]
-    pub const fn min_partition_entries(&self) -> u32 {
-        self.min_partition_entries
+    pub const fn min_leaf_partition_entries(&self) -> u32 {
+        self.min_leaf_partition_entries
     }
 
-    /// Returns the configured maximum partition entry count.
+    /// Returns the configured maximum leaf partition entry count.
     #[must_use]
-    pub const fn max_partition_entries(&self) -> u32 {
-        self.max_partition_entries
+    pub const fn max_leaf_partition_entries(&self) -> u32 {
+        self.max_leaf_partition_entries
     }
+
+    /// Returns the configured minimum internal partition entry count.
+    #[must_use]
+    pub const fn min_internal_partition_entries(&self) -> u32 {
+        self.min_internal_partition_entries
+    }
+
+    /// Returns the configured maximum internal partition entry count.
+    #[must_use]
+    pub const fn max_internal_partition_entries(&self) -> u32 {
+        self.max_internal_partition_entries
+    }
+
+    /// Selects occupancy by level; the root's minimum exception belongs to its caller.
+    pub const fn min_partition_entries(&self, level: u32) -> u32 {
+        if level == 1 {
+            self.min_leaf_partition_entries
+        } else {
+            self.min_internal_partition_entries
+        }
+    }
+
+    /// Selects the split threshold by level, including for the root.
+    pub const fn max_partition_entries(&self, level: u32) -> u32 {
+        if level == 1 {
+            self.max_leaf_partition_entries
+        } else {
+            self.max_internal_partition_entries
+        }
+    }
+}
+
+/// Validates each independently configured capacity pair.
+fn validate_partition_entries(minimum: u32, maximum: u32) -> Result<()> {
+    if minimum == 0
+        || minimum.checked_mul(2).is_none_or(|twice| twice > maximum)
+        || maximum > MAX_PARTITION_ENTRIES
+    {
+        return Err(Error::invalid_argument());
+    }
+    Ok(())
 }
 
 /// Process-local configuration owned by one Runtime.
@@ -230,6 +348,7 @@ pub struct RuntimeConfig {
     fixup_attempts: u32,
     foreground_attempts: u32,
     partition_cache_bytes: u64,
+    routing_working_bytes: usize,
     default_search_budgets: SearchBudgets,
     tree_key_scan_ranges: u32,
     write_beam_size: u32,
@@ -252,6 +371,7 @@ impl Default for RuntimeConfig {
             fixup_attempts: DEFAULT_ATTEMPTS,
             foreground_attempts: DEFAULT_ATTEMPTS,
             partition_cache_bytes,
+            routing_working_bytes: 256 * 1024 * 1024,
             default_search_budgets: SearchBudgets::default(),
             tree_key_scan_ranges: DEFAULT_TREE_KEY_SCAN_RANGES,
             write_beam_size: DEFAULT_WRITE_BEAM_SIZE,
@@ -263,6 +383,22 @@ impl Default for RuntimeConfig {
 }
 
 impl RuntimeConfig {
+    /// Sets the per-query graph routing working-byte ceiling (default 256 MiB).
+    /// Includes held bodies, restoration buffers, native scratch and caller-reserved
+    /// candidate/identity state. Cache capacity controls retention independently.
+    pub fn with_routing_working_bytes(mut self, bytes: usize) -> Result<Self> {
+        if bytes == 0 {
+            return Err(Error::invalid_argument());
+        }
+        self.routing_working_bytes = bytes;
+        Ok(self)
+    }
+
+    /// Returns the graph routing working-byte ceiling.
+    pub const fn routing_working_bytes(&self) -> usize {
+        self.routing_working_bytes
+    }
+
     /// Sets the positive minimum state age for rediscovered maintenance to resume.
     pub fn with_stalled_timeout(mut self, timeout: Duration) -> Result<Self> {
         if timeout.is_zero() {
@@ -362,6 +498,7 @@ impl RuntimeConfig {
             || self.fixup_attempts == 0
             || self.foreground_attempts == 0
             || usize::try_from(self.partition_cache_bytes).is_err()
+            || self.routing_working_bytes == 0
             || self.tree_key_scan_ranges == 0
             || self.write_beam_size == 0
             || self.write_beam_size > MAX_WRITE_BEAM_SIZE
@@ -431,11 +568,11 @@ impl RuntimeConfig {
 
     /// Returns the minimum state age before a worker assists rediscovered work.
     ///
-    /// The default is `max(1 ms, 1 s * max_partition_entries / 128)`.
+    /// The default is `max(1 ms, 1 s * level_maximum / 128)`.
     #[must_use]
-    pub fn stalled_timeout(&self, index: &IndexConfig) -> Duration {
+    pub fn stalled_timeout(&self, index: &IndexConfig, level: u32) -> Duration {
         self.stalled_timeout.unwrap_or_else(|| {
-            (Duration::from_secs(u64::from(index.max_partition_entries())) / 128)
+            (Duration::from_secs(u64::from(index.max_partition_entries(level))) / 128)
                 .max(Duration::from_millis(1))
         })
     }

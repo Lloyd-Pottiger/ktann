@@ -30,7 +30,8 @@ fn minimal_manifest() -> IndexManifest {
         id(1),
         IndexConfig::new(1, Metric::L2)
             .expect("valid config")
-            .with_partition_entries(16, 512)
+            .with_leaf_partition_entries(16, 512)
+            .and_then(|config| config.with_internal_partition_entries(8, 128))
             .expect("fixed codec configuration"),
         [0; 32],
         vec![],
@@ -54,7 +55,8 @@ fn rich_manifest() -> IndexManifest {
         .expect("valid fields")
         .with_tree_key_fields(vec![FieldId(0)])
         .expect("valid Tree Key fields")
-        .with_partition_entries(2, 4)
+        .with_leaf_partition_entries(2, 4)
+        .and_then(|config| config.with_internal_partition_entries(2, 4))
         .expect("valid partition limits");
     let mut seed = [0_u8; 32];
     for (value, byte) in seed.iter_mut().zip(0_u8..) {
@@ -227,7 +229,7 @@ fn namespace_and_manifest_golden_bytes() {
         b"\x01\x00\x00\x00\x00\x00\x00\x00\x01"
     );
 
-    let mut expected = vec![0x02, 0x00, 0x02, 0x00];
+    let mut expected = vec![0x02, 0x00, 0x03, 0x00];
     expected.extend_from_slice(&1_u64.to_be_bytes());
     expected.extend_from_slice(&1_u32.to_be_bytes());
     expected.push(0x00);
@@ -235,6 +237,9 @@ fn namespace_and_manifest_golden_bytes() {
     expected.extend_from_slice(&0_u16.to_be_bytes());
     expected.extend_from_slice(&16_u32.to_be_bytes());
     expected.extend_from_slice(&512_u32.to_be_bytes());
+    expected.extend_from_slice(&8_u32.to_be_bytes());
+    expected.extend_from_slice(&128_u32.to_be_bytes());
+    expected.push(0); // mutable mode
     expected.extend_from_slice(&[0; 32]);
     assert_eq!(
         codec
@@ -568,7 +573,7 @@ fn unsupported_manifest_formats_fail_closed() {
     let bootstrap = ValueCodec::bootstrap();
     let value = PersistentValue::IndexManifest(minimal_manifest());
     let key = key_for_value(id(1), &value);
-    for format in [0_u16, 1, 3, u16::MAX] {
+    for format in [0_u16, 1, 2, 4, u16::MAX] {
         let mut bytes = bootstrap.encode(&value).expect("encode Manifest");
         bytes[1..3].copy_from_slice(&format.to_be_bytes());
         assert_eq!(
@@ -958,7 +963,7 @@ fn building_manifest_and_request_descriptor_have_canonical_bytes() {
     let bytes = codec
         .encode(&PersistentValue::IndexManifest(building.clone()))
         .unwrap();
-    assert_eq!(&bytes[..4], &[2, 0, 2, 2]);
+    assert_eq!(&bytes[..4], &[2, 0, 3, 2]);
     assert_eq!(
         decode(codec, &LogicalKey::Manifest(id(1)), &bytes).unwrap(),
         PersistentValue::IndexManifest(building)
@@ -969,8 +974,6 @@ fn building_manifest_and_request_descriptor_have_canonical_bytes() {
     input_bytes[49..57].copy_from_slice(&41_u64.to_be_bytes());
     let input = ArtifactManifest::decode(&input_bytes).unwrap();
     let options = ConstructionOptions {
-        min_partition_entries: 2,
-        max_partition_entries: 4,
         sample_items: 8,
         memory_bytes: 2 * 1024 * 1024,
         scratch_bytes: 16 * 1024 * 1024,
@@ -984,11 +987,10 @@ fn building_manifest_and_request_descriptor_have_canonical_bytes() {
     expected.extend_from_slice(b"/source");
     expected.extend_from_slice(&89_u32.to_be_bytes());
     expected.extend_from_slice(&input_bytes);
-    expected.extend_from_slice(&2_u32.to_be_bytes());
-    expected.extend_from_slice(&4_u32.to_be_bytes());
     for number in [8_u64, 2 * 1024 * 1024, 16 * 1024 * 1024] {
         expected.extend_from_slice(&number.to_be_bytes());
     }
+    expected.push(0); // refinement omitted
     assert_eq!(bytes.as_slice(), expected.as_slice());
     assert_eq!(decode(codec, &key, &bytes).unwrap(), value);
     for end in 0..bytes.len() {
@@ -1019,7 +1021,7 @@ fn bulk_workspace_golden_and_malformed_ownership() {
     let key = LogicalKey::BuildWorkspace(id(1));
     let mut golden = vec![0x0f, 0, 0, 0, 5];
     golden.extend_from_slice(b"/bulk");
-    for n in [1_u64, 1, 1, 1, 1, 2, 1, 1, 1] {
+    for n in [1_u64, 1, 1, 1, 1, 1, 1, 2, 1, 1, 1] {
         golden.extend_from_slice(&n.to_be_bytes());
     }
     golden.extend_from_slice(&[1; 32]);
@@ -1040,7 +1042,7 @@ fn bulk_workspace_golden_and_malformed_ownership() {
         assert!(codec.decode(&key, Bytes::from(malformed)).is_err());
     }
     let mut zero_token = golden.clone();
-    zero_token[82..114].fill(0);
+    zero_token[98..130].fill(0);
     assert!(codec.decode(&key, Bytes::from(zero_token)).is_err());
     let mut trailing = golden;
     trailing.push(0);
@@ -1089,7 +1091,7 @@ fn build_schedule_golden_and_malformed_lease() {
     let key = LogicalKey::BuildSchedule(id(1));
     let mut golden = vec![0x11, 0, 0, 0, 1, b'x', 0, 0, 0, 5];
     golden.extend_from_slice(b"/bulk");
-    for n in [1_u64, 1, 1, 1, 1, 2, 1] {
+    for n in [1_u64, 1, 1, 1, 1, 1, 1, 2, 1] {
         golden.extend_from_slice(&n.to_be_bytes());
     }
     golden.extend_from_slice(&[1; 32]);
@@ -1109,4 +1111,99 @@ fn build_schedule_golden_and_malformed_lease() {
     assert!(codec.decode(&key, Bytes::from(invalid)).is_err());
     golden.push(0);
     assert!(codec.decode(&key, Bytes::from(golden)).is_err());
+}
+
+#[test]
+fn graph_envelope_golden_bounds_and_malformed_values() {
+    use ktann::storage::values::{GRAPH_CHUNK_BYTES, GraphChunk, MAX_GRAPH_VALUE_BYTES};
+    let codec = ValueCodec::bootstrap();
+    let tree_key = TreeKey::encode(&[], &[]).unwrap();
+    let descriptor_key = LogicalKey::GraphDescriptor {
+        index: id(1),
+        tree_key: tree_key.clone(),
+        partition: pk(2),
+    };
+    let chunk_key = LogicalKey::GraphChunk {
+        index: id(1),
+        tree_key,
+        partition: pk(2),
+        chunk: 0,
+    };
+    let mut golden = vec![0x12, ktann_usearch::NATIVE_ENCODING];
+    golden.extend_from_slice(&1_u32.to_be_bytes());
+    golden.extend_from_slice(&42_u64.to_be_bytes());
+    golden.extend_from_slice(&72_u64.to_be_bytes());
+    golden.extend_from_slice(&[7; 32]);
+    golden.extend_from_slice(&[8; 32]);
+    let descriptor = codec
+        .decode(&descriptor_key, Bytes::from(golden.clone()))
+        .unwrap();
+    assert_eq!(codec.encode(&descriptor).unwrap(), golden);
+    for length in 0..golden.len() {
+        assert_corrupt(codec.decode(&descriptor_key, Bytes::copy_from_slice(&golden[..length])));
+    }
+    for (offset, value) in [(0, 0x13), (1, 0), (5, 0), (21, 39), (2, 255), (14, 255)] {
+        let mut bad = golden.clone();
+        bad[offset] = value;
+        assert_corrupt(codec.decode(&descriptor_key, bad.into()));
+    }
+    let mut trailing = golden.clone();
+    trailing.push(0);
+    assert_corrupt(codec.decode(&descriptor_key, trailing.into()));
+    assert_corrupt(codec.decode(&chunk_key, golden.into()));
+    let chunk = PersistentValue::GraphChunk(GraphChunk::new(Bytes::from_static(&[0; 9])).unwrap());
+    let mut expected = vec![0x13, 0, 0, 0, 9];
+    expected.extend_from_slice(&[0; 9]);
+    assert_eq!(codec.encode(&chunk).unwrap(), expected);
+    assert_eq!(codec.decode(&chunk_key, expected.into()).unwrap(), chunk);
+    assert!(GraphChunk::new(Bytes::new()).is_err());
+    assert!(GraphChunk::new(Bytes::from(vec![0; GRAPH_CHUNK_BYTES + 1])).is_err());
+    let full = codec
+        .encode(&PersistentValue::GraphChunk(
+            GraphChunk::new(Bytes::from(vec![1; GRAPH_CHUNK_BYTES])).unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(full.len(), MAX_GRAPH_VALUE_BYTES);
+    assert_corrupt(codec.decode(&chunk_key, Bytes::from_static(&[0x13, 0, 0, 0, 0])));
+    let mut oversize = vec![0x13];
+    oversize.extend_from_slice(&((GRAPH_CHUNK_BYTES + 1) as u32).to_be_bytes());
+    oversize.resize(MAX_GRAPH_VALUE_BYTES + 1, 0);
+    assert_corrupt(codec.decode(&chunk_key, oversize.into()));
+}
+
+#[test]
+fn graph_configuration_round_trip_and_malformed_parameters() {
+    use ktann::api::LocalGraphConfig;
+    for (m, ef) in [(1, 8), (32_769, 32_769), (8, 7)] {
+        assert!(LocalGraphConfig::new(m, ef, [3; 32]).is_err());
+    }
+    let graph = LocalGraphConfig::new(4, 16, [3; 32]).unwrap();
+    let base = minimal_manifest();
+    let manifest = IndexManifest::new(
+        IndexLifecycle::Building,
+        id(1),
+        base.config().clone().with_local_graph(graph),
+        [0; 32],
+        vec![],
+    )
+    .unwrap();
+    let codec = ValueCodec::bootstrap();
+    let value = PersistentValue::IndexManifest(manifest.clone());
+    let bytes = codec.encode(&value).unwrap();
+    let key = LogicalKey::Manifest(id(1));
+    assert_eq!(decode(codec, &key, &bytes).unwrap(), value);
+    let mode = bytes.len() - 73;
+    let mut expected = vec![1];
+    expected.extend_from_slice(&4_u32.to_be_bytes());
+    expected.extend_from_slice(&16_u32.to_be_bytes());
+    expected.extend_from_slice(&[3; 32]);
+    expected.extend_from_slice(&[0; 32]);
+    assert_eq!(&bytes[mode..], expected);
+    for (offset, value) in [(mode, 2), (mode + 4, 1), (mode + 8, 3)] {
+        let mut malformed = bytes.clone();
+        malformed[offset] = value;
+        assert_corrupt(decode(codec, &key, &malformed));
+    }
+    assert_ne!(manifest.config(), base.config());
+    assert_eq!(manifest.config().local_graph(), Some(graph));
 }

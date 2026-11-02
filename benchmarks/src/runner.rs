@@ -28,12 +28,7 @@ use crate::report::{
 };
 use crate::resource::ResourceSnapshot;
 
-#[path = "../../tests/support/oracle.rs"]
-#[expect(
-    dead_code,
-    reason = "the shared oracle also exposes filter helpers used only by integration tests"
-)]
-mod oracle;
+use crate::oracle;
 
 /// Queue capacity for demand-driven Structure Maintenance.
 const FIXUP_QUEUE_CAPACITY: usize = 1_024;
@@ -57,6 +52,8 @@ struct RecallInput {
 pub struct ScenarioSpec {
     /// Stable scenario name used as the comparison key.
     pub name: &'static str,
+    /// Frozen-dataset experimental construction and routing controls.
+    pub routing_experiment: Option<crate::routing::Experiment>,
     /// Public fixture or synthetic distribution.
     pub dataset: &'static str,
     /// Human-readable scale profile.
@@ -107,8 +104,14 @@ pub struct ScenarioSpec {
     pub refinement_rounds: Option<usize>,
     /// Ordered single-variable beam values; empty for ordinary scenarios.
     pub leaf_beam_sweep: Vec<u32>,
-    /// Logical Index maximum partition size.
-    pub max_partition_entries: u32,
+    /// Minimum non-root leaf occupancy.
+    pub min_leaf_partition_entries: u32,
+    /// Leaf split threshold.
+    pub max_leaf_partition_entries: u32,
+    /// Minimum non-root internal occupancy.
+    pub min_internal_partition_entries: u32,
+    /// Internal split threshold.
+    pub max_internal_partition_entries: u32,
     /// Whether this scenario measures the import-to-search lifecycle.
     pub lifecycle: bool,
     /// Records per atomic batch load batch in a lifecycle scenario.
@@ -160,15 +163,26 @@ fn smoke_scenarios() -> Vec<ScenarioSpec> {
         search_options: SearchOptions::default(),
         write_beam_size: 8,
         refinement_rounds: None,
+        routing_experiment: None,
         query_concurrency_sweep: Vec::new(),
         leaf_beam_sweep: Vec::new(),
-        max_partition_entries: 32,
+        min_leaf_partition_entries: 8,
+        max_leaf_partition_entries: 32,
+        min_internal_partition_entries: 8,
+        max_internal_partition_entries: 32,
         lifecycle: false,
         import_batch_size: 32,
         maintenance_workers: 2,
     };
     vec![
         common.clone(),
+        ScenarioSpec {
+            name: "quality-routing-smoke",
+            routing_experiment: Some(crate::routing::Experiment::default()),
+            maintenance_workers: 0,
+            leaf_beam_sweep: vec![4, 16],
+            ..common.clone()
+        },
         ScenarioSpec {
             name: "ann-cache-disabled",
             partition_cache_bytes: 0,
@@ -244,9 +258,13 @@ fn full_scenarios() -> Vec<ScenarioSpec> {
         search_options: SearchOptions::default(),
         write_beam_size: 8,
         refinement_rounds: None,
+        routing_experiment: None,
         query_concurrency_sweep: Vec::new(),
         leaf_beam_sweep: Vec::new(),
-        max_partition_entries: 128,
+        min_leaf_partition_entries: 32,
+        max_leaf_partition_entries: 128,
+        min_internal_partition_entries: 32,
+        max_internal_partition_entries: 128,
         lifecycle: false,
         import_batch_size: 50,
         maintenance_workers: 2,
@@ -350,11 +368,15 @@ fn large_scenarios() -> Result<Vec<ScenarioSpec>, String> {
             search_options: SearchOptions::default(),
             write_beam_size: defaults.write_beam_size(),
             refinement_rounds: None,
+            routing_experiment: None,
             query_concurrency_sweep: Vec::new(),
             leaf_beam_sweep: vec![1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128, 192, 256, 384],
-            // Keep the shared leaf/internal fanout below sqrt(1M) so the
-            // million-vector corpus must form at least three searchable levels.
-            max_partition_entries: index.max_partition_entries(),
+            // Follow the library layout defaults; capacity overrides can independently
+            // control leaf scan size and internal routing fanout.
+            min_leaf_partition_entries: index.min_leaf_partition_entries(),
+            max_leaf_partition_entries: index.max_leaf_partition_entries(),
+            min_internal_partition_entries: index.min_internal_partition_entries(),
+            max_internal_partition_entries: index.max_internal_partition_entries(),
             lifecycle: false,
             import_batch_size: 50,
             maintenance_workers: defaults.maintenance_workers(),
@@ -397,15 +419,16 @@ pub async fn run_scenario<B: Backend>(
         dataset::load(
             spec.dataset,
             spec.base_vectors,
-            spec.query_vectors,
+            spec.query_vectors
+                .checked_add(spec.query_offset)
+                .ok_or("query window overflow")?,
             spec.dimension,
             spec.seed,
         )?
     };
-    if spec.profile == "large"
-        && (spec.base_vectors != dataset.base.len()
-            || spec.query_offset != 0
-            || spec.query_vectors != dataset.queries.len())
+    if spec.base_vectors != dataset.base.len()
+        || spec.query_offset != 0
+        || spec.query_vectors != dataset.queries.len()
     {
         dataset = dataset::limit_with_query_offset(
             dataset,
@@ -476,7 +499,7 @@ pub async fn run_scenario<B: Backend>(
         )
     };
 
-    Ok(BenchmarkReport {
+    let report = BenchmarkReport {
         generated_unix_seconds: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -485,6 +508,8 @@ pub async fn run_scenario<B: Backend>(
         git_revision: git_revision(),
         environment: environment(tokio_worker_threads, backend_runtime),
         configuration: Configuration {
+            routing_experiment: spec.routing_experiment.clone(),
+            query_offset: spec.query_offset,
             backend: backend_name.to_owned(),
             scenario: spec.name.to_owned(),
             profile: spec.profile.to_owned(),
@@ -495,8 +520,10 @@ pub async fn run_scenario<B: Backend>(
             tree_key_field_count: index_config.tree_key_fields().len(),
             search_percent: spec.search_percent,
             hot_updates: spec.hot_updates,
-            min_partition_entries: index_config.min_partition_entries(),
-            max_partition_entries: index_config.max_partition_entries(),
+            min_leaf_partition_entries: index_config.min_leaf_partition_entries(),
+            max_leaf_partition_entries: index_config.max_leaf_partition_entries(),
+            min_internal_partition_entries: index_config.min_internal_partition_entries(),
+            max_internal_partition_entries: index_config.max_internal_partition_entries(),
             partition_cache_bytes: spec.partition_cache_bytes,
             foreground_limit: spec.foreground_limit,
             maintenance_workers: spec.maintenance_workers,
@@ -510,7 +537,11 @@ pub async fn run_scenario<B: Backend>(
             write_beam_size: spec.write_beam_size,
             refinement_rounds: spec.refinement_rounds,
             refinement_neighbor_centroids: spec.refinement_rounds.map(|_| 32),
-            refinement_input_limit_bytes: spec.refinement_rounds.map(|_| 32 << 30),
+            refinement_input_limit_bytes: spec.refinement_rounds.map(|_| {
+                spec.routing_experiment
+                    .as_ref()
+                    .map_or(32 << 30, |e| e.build_memory_bytes as u64)
+            }),
             leaf_beam_size_override: spec.search_options.leaf_beam_size(),
             leaf_beam_sweep: spec.leaf_beam_sweep.clone(),
             query_concurrency_sweep: spec.query_concurrency_sweep.clone(),
@@ -529,7 +560,9 @@ pub async fn run_scenario<B: Backend>(
         dataset: dataset.metadata,
         topology,
         measurements,
-    })
+    };
+    report.validate()?;
+    Ok(report)
 }
 
 /// Builds the complete process-local configuration used by benchmark workers.
@@ -542,6 +575,13 @@ fn runtime_config(
         defaults.fixup_queue_capacity()
     } else {
         FIXUP_QUEUE_CAPACITY
+    };
+    let defaults = if let Some(experiment) = &spec.routing_experiment {
+        defaults
+            .with_routing_working_bytes(experiment.routing_working_bytes)
+            .map_err(|e| e.to_string())?
+    } else {
+        defaults
     };
     let config = defaults
         .with_foreground_operation_limit(spec.foreground_limit)
@@ -731,16 +771,6 @@ async fn run_lifecycle_case<B: Backend>(
         stable_cold_search,
         stable_warm_search,
     };
-    lifecycle
-        .unattributed_wall_seconds()
-        .ok_or_else(|| "lifecycle phases exceed the continuous wall time".to_owned())?;
-    lifecycle
-        .unattributed_cpu_seconds()
-        .ok_or_else(|| "lifecycle phases exceed the continuous CPU time".to_owned())?;
-    lifecycle
-        .unattributed_backend_io()
-        .ok_or_else(|| "lifecycle phases exceed the continuous Backend IO".to_owned())?;
-
     Ok((topology, lifecycle))
 }
 
@@ -767,14 +797,17 @@ const fn metric_name(metric: Metric) -> &'static str {
 /// Builds the public Index configuration shared by steady and lifecycle cases.
 fn index_config(spec: &ScenarioSpec) -> Result<IndexConfig, String> {
     let config = IndexConfig::new(spec.dimension, spec.metric).and_then(|config| {
-        if spec.profile == "large" && spec.max_partition_entries == config.max_partition_entries() {
-            Ok(config)
-        } else {
-            config
-                .with_partition_entries(spec.max_partition_entries / 4, spec.max_partition_entries)
-        }
+        config
+            .with_leaf_partition_entries(
+                spec.min_leaf_partition_entries,
+                spec.max_leaf_partition_entries,
+            )?
+            .with_internal_partition_entries(
+                spec.min_internal_partition_entries,
+                spec.max_internal_partition_entries,
+            )
     });
-    let config = if spec.profile == "large" {
+    let config = if spec.profile == "large" || spec.routing_experiment.is_some() {
         config
     } else {
         config
@@ -786,6 +819,13 @@ fn index_config(spec: &ScenarioSpec) -> Result<IndexConfig, String> {
             })
             .and_then(|config| config.with_tree_key_fields(vec![FieldId(0)]))
     };
+    let config = config.and_then(|config| {
+        if let Some(experiment) = &spec.routing_experiment {
+            Ok(config.with_local_graph(experiment.graph()?))
+        } else {
+            Ok(config)
+        }
+    });
     config.map_err(|error| error_at("configure index", error))
 }
 
@@ -971,7 +1011,6 @@ async fn run_search_phase<B: Backend>(
                 summary.visited_partitions += u64::from(outcome.exhausted.visited_partitions);
                 summary.exact_rerank_candidates +=
                     u64::from(outcome.exhausted.exact_rerank_candidates);
-                summary.rabitq_overlap += u64::from(outcome.rabitq_overlap_truncated);
                 summary
             });
     let phase = SearchPhase {
@@ -1002,7 +1041,7 @@ async fn run_search_phase<B: Backend>(
         visited_leaf_entries: Distribution::from_samples(
             metrics.histogram("ktann.search.leaf_entries", &[]),
         ),
-        search_stages_ms: search_stage_summaries(&metrics),
+        search_stages_ms: metrics.search_stage_summaries(),
         cache: metrics.cache_summary(),
         backend_admission: metrics.admission_summary(),
     };
@@ -1051,20 +1090,6 @@ fn phase_resources(
     }
 }
 
-/// Converts measured search-stage histograms into milliseconds.
-fn search_stage_summaries(metrics: &CapturedMetrics) -> BTreeMap<String, Distribution> {
-    metrics
-        .histograms_by_label("ktann.search.stage.duration", "stage")
-        .into_iter()
-        .map(|(stage, samples)| {
-            (
-                stage,
-                Distribution::from_samples(samples).seconds_to_milliseconds(),
-            )
-        })
-        .collect()
-}
-
 /// Owns setup, one steady measurement, and the post-run invariant audit.
 async fn run_with_runtime<B: Backend>(
     runtime: &Runtime<MeasuredBackend<B>>,
@@ -1098,11 +1123,12 @@ async fn run_quality_sweep<B: Backend>(
 ) -> Result<(Topology, QualitySweepMeasurements), String> {
     // Reuse requires the same dataset and construction inputs.
     let identity = format!(
-        "{:?};dataset={};write-beam={};refinement={:?}",
+        "{:?};base={};write-beam={};refinement={:?};sample-items={:?}",
         index_config(spec)?,
-        dataset.metadata.checksum_xxh3_128,
+        dataset::checksum(&dataset.ids, &dataset.base, &[]),
         spec.write_beam_size,
-        spec.refinement_rounds
+        spec.refinement_rounds,
+        spec.routing_experiment.as_ref().map(|e| e.sample_items)
     );
     let manifest_path = spec
         .persisted_index
@@ -1139,7 +1165,7 @@ async fn run_quality_sweep<B: Backend>(
             prepare_index(runtime, backend_counters, metric_capture, spec, dataset).await?;
         if let Some(path) = &manifest_path {
             let fixture = PersistedFixture {
-                identity,
+                identity: identity.clone(),
                 topology: topology.clone(),
             };
             let bytes = serde_json::to_vec_pretty(&fixture)
@@ -1149,11 +1175,22 @@ async fn run_quality_sweep<B: Backend>(
         }
         (index, topology, Some(construction))
     };
-    if topology.max_level.is_none_or(|level| level < 3) {
+    if spec.routing_experiment.is_none() && topology.max_level.is_none_or(|level| level < 3) {
         return Err(format!(
             "large quality topology has max level {:?} with {} partitions by level {:?}; expected at least three searchable levels",
             topology.max_level, topology.partitions, topology.partitions_by_level
         ));
+    }
+    let mut routing_setup = serde_json::json!({"fixture_identity": identity});
+    if spec.routing_experiment.is_some() {
+        let started = Instant::now();
+        routing_setup["leaf_layout_sha256"] = serde_json::json!(
+            index
+                .leaf_layout_fingerprint()
+                .await
+                .map_err(|e| error_at("leaf layout fingerprint", e))?
+        );
+        routing_setup["fingerprint_seconds"] = serde_json::json!(started.elapsed().as_secs_f64());
     }
     // Compute exact truth before releasing the base vectors, including
     // bounded subsets whose full-corpus ground truth no longer applies.
@@ -1195,12 +1232,33 @@ async fn run_quality_sweep<B: Backend>(
         }
         // Each client count retains the full quality/completion contract.
         let start = points.len() - spec.leaf_beam_sweep.len();
-        validate_quality_frontier(&points[start..], spec.measured_operations)?;
+        validate_quality_frontier(
+            &points[start..],
+            spec.measured_operations,
+            spec.routing_experiment.is_none(),
+        )?;
+    }
+    if spec.routing_experiment.is_some() {
+        routing_setup["measured_process_peak_rss_bytes"] =
+            serde_json::json!(ResourceSnapshot::capture()?.peak_rss_bytes());
+    }
+    // All latency, IO, CPU and peak-RSS snapshots precede diagnostic replay.
+    if spec.routing_experiment.is_some() {
+        for point in &mut points {
+            let mut diagnostic_spec = spec.clone();
+            diagnostic_spec.search_options = diagnostic_spec
+                .search_options
+                .with_leaf_beam_size(point.leaf_beam_size)
+                .map_err(|e| e.to_string())?;
+            point.measurements.quality_diagnostics =
+                Some(quality_diagnostics(&index, dataset, &diagnostic_spec, &truth).await?);
+        }
     }
     verify_measured_state(&index, spec).await?;
     Ok((
         topology,
         QualitySweepMeasurements {
+            routing_setup: spec.routing_experiment.as_ref().map(|_| routing_setup),
             construction,
             points,
         },
@@ -1229,6 +1287,9 @@ async fn prepare_index<B: Backend>(
     ),
     String,
 > {
+    if spec.routing_experiment.is_some() {
+        return prepare_bulk_index(runtime, backend_counters, metric_capture, spec, dataset).await;
+    }
     let index_config = index_config(spec)?;
     let index = runtime
         .create_index("benchmark", index_config)
@@ -1311,8 +1372,9 @@ async fn prepare_index<B: Backend>(
         cache: convergence_metrics.cache_summary(),
     };
     let construction = ConstructionMeasurements {
-        refinement_rounds,
-        refinement_moves,
+        bulk: None,
+        refinement_rounds: Some(refinement_rounds),
+        refinement_moves: Some(refinement_moves),
         wall_seconds,
         cpu_seconds: Some(resources_after.cpu_seconds_since(resources_before)),
         peak_rss_bytes: Some(resources_after.peak_rss_bytes()),
@@ -1409,6 +1471,9 @@ async fn measure_steady_workload<B: Backend>(
     let operations = workload.into_operation_summaries(&metrics);
     validate_admission_target(&operations, spec)?;
     let measurements = SteadyStateMeasurements {
+        quality_diagnostics: None,
+        per_query_recall: recalls.clone(),
+        routing: metrics.routing_summary(),
         wall_seconds,
         maintenance_drain_seconds,
         physical_read_bytes: resources_after
@@ -1430,7 +1495,7 @@ async fn measure_steady_workload<B: Backend>(
         visited_leaf_entries: Distribution::from_samples(
             metrics.histogram("ktann.search.leaf_entries", &[]),
         ),
-        search_stages_ms: search_stage_summaries(&metrics),
+        search_stages_ms: metrics.search_stage_summaries(),
         cache: metrics.cache_summary(),
         backend_admission: metrics.admission_summary(),
         backend_io,
@@ -1460,10 +1525,11 @@ async fn verify_measured_state<B: Backend>(
     Ok(())
 }
 
-/// Requires both quality and work to move across the declared beam curve.
+/// Checks completion, and optionally requires the standard fixture to expose a frontier.
 fn validate_quality_frontier(
     points: &[QualityPoint],
     expected_searches: usize,
+    require_variation: bool,
 ) -> Result<(), String> {
     let expected_searches = u64::try_from(expected_searches)
         .map_err(|_| "large quality search count exceeds u64".to_owned())?;
@@ -1504,7 +1570,7 @@ fn validate_quality_frontier(
         .zip(recalls.iter().copied().reduce(f64::max))
         .is_some_and(|(minimum, maximum)| maximum > minimum);
     let work_moves = leaf_work.windows(2).any(|window| window[1] > window[0]);
-    if points.len() > 1 && (!recall_moves || !work_moves) {
+    if require_variation && points.len() > 1 && (!recall_moves || !work_moves) {
         return Err(
             "large quality sweep did not produce a nontrivial quality/work frontier".to_owned(),
         );
@@ -1609,13 +1675,15 @@ async fn rediscover_topology_work<B: Backend>(
 }
 
 /// Returns whether aggregate topology could be a fully settled search tree.
-fn topology_is_settled(topology: &Topology, max_partition_entries: u32) -> bool {
+fn topology_is_settled(topology: &Topology, config: &IndexConfig) -> bool {
     let leaf_entries = topology.entries_by_level.get(&1).copied().unwrap_or(0);
-    let largest_leaf = topology.max_entries_by_level.get(&1).copied().unwrap_or(0);
     topology.partitions > 1
         && topology.entries > topology.vector_records
         && leaf_entries == topology.vector_records
-        && largest_leaf <= max_partition_entries
+        && topology
+            .max_entries_by_level
+            .iter()
+            .all(|(level, count)| *count <= config.max_partition_entries(*level))
         && topology.actionable_partitions == 0
         && topology.partition_states.transitional() == 0
 }
@@ -1671,7 +1739,7 @@ async fn settle_and_drain_topology<B: Backend>(
             topology.partition_states.transitional(),
             topology.max_entries_by_level,
         );
-        if topology_is_settled(&topology, spec.max_partition_entries) {
+        if topology_is_settled(&topology, index.config()) {
             return Ok((topology, maintenance_drain_seconds));
         }
         if observe_topology_progress(&topology, &mut previous_topology, &mut unchanged_rounds)
@@ -2246,6 +2314,173 @@ fn error_at(phase: &str, error: ktann::api::Error) -> String {
     format!("{phase}: {:?}", error.kind())
 }
 
+/// Bulk Build uses final refined centroids before graph encoding/publication.
+/// All construction and verification are outside the measured query interval.
+async fn prepare_bulk_index<B: Backend>(
+    runtime: &Runtime<MeasuredBackend<B>>,
+    backend_counters: &BackendCounters,
+    capture: &MetricCapture,
+    spec: &ScenarioSpec,
+    dataset: &BenchmarkDataset,
+) -> Result<
+    (
+        Index<MeasuredBackend<B>>,
+        Topology,
+        ConstructionMeasurements,
+    ),
+    String,
+> {
+    use ktann::api::BulkBuildOptions;
+    use ktann::bulk::InputSnapshot;
+    let experiment = spec
+        .routing_experiment
+        .as_ref()
+        .expect("routing experiment");
+    let root = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let config = index_config(spec)?;
+    drop(capture.snapshot());
+    let before = backend_counters.snapshot();
+    let resources = ResourceSnapshot::capture()?;
+    let started = Instant::now();
+    let source = InputSnapshot::create(
+        &root.path().join("input"),
+        config,
+        experiment.build_scratch_bytes,
+        dataset
+            .ids
+            .iter()
+            .zip(&dataset.base)
+            .map(|(id, vector)| Record::new(id.clone(), Arc::clone(vector), vec![])),
+    )
+    .map_err(|e| error_at("capture bulk source", e))?;
+    let capture_seconds = started.elapsed().as_secs_f64();
+    let construction = experiment.construction();
+    let job = runtime
+        .start_bulk_build(
+            "benchmark",
+            &source,
+            BulkBuildOptions {
+                construction,
+                refinement_rounds: spec.refinement_rounds.map(|rounds| rounds as u8),
+            },
+        )
+        .await
+        .map_err(|e| error_at("reserve bulk index", e))?;
+    let worker = experiment.worker(root.path().join("workspace"));
+    let settings = crate::report::bulk_build_settings(&construction, &worker);
+    std::fs::create_dir(&worker.workspace).map_err(|e| e.to_string())?;
+    let (index, stages) = job
+        .complete_with_report(worker, None, OperationOptions::default())
+        .await
+        .map_err(|e| error_at("complete bulk index", e))?;
+    let imported = ResourceSnapshot::capture()?;
+    let imported_io = backend_counters.snapshot();
+    let import_seconds = started.elapsed().as_secs_f64();
+    let metrics = capture.snapshot();
+    let graph_build_seconds = metrics.histogram("ktann.routing.build_seconds", &[]);
+    let graph_native_peak_bytes = metrics.histogram("ktann.routing.native_build_peak_bytes", &[]);
+    let stored_graph_bytes = metrics.counter("ktann.routing.stored_graph_bytes", &[]);
+    let import = ConstructionPhase {
+        resources: phase_resources(
+            import_seconds,
+            resources,
+            imported,
+            subtract(&imported_io, &before),
+            &metrics,
+            capture.fixup_backlog(),
+        ),
+        admission: metrics.admission_summary(),
+        cache: metrics.cache_summary(),
+    };
+    let verification = Instant::now();
+    let topology = verified_topology(
+        &index,
+        spec,
+        "verify bulk index",
+        Instant::now() + settle_timeout(spec),
+    )
+    .await?;
+    let after = ResourceSnapshot::capture()?;
+    let metrics = capture.snapshot();
+    let convergence = ConstructionPhase {
+        resources: phase_resources(
+            verification.elapsed().as_secs_f64(),
+            imported,
+            after,
+            subtract(&backend_counters.snapshot(), &imported_io),
+            &metrics,
+            capture.fixup_backlog(),
+        ),
+        admission: metrics.admission_summary(),
+        cache: metrics.cache_summary(),
+    };
+    let mut bulk = serde_json::json!({
+        "capture_seconds": capture_seconds, "forest_seconds": stages.forest.as_secs_f64(),
+        "serving_seconds": stages.serving.as_secs_f64(), "load_seconds": stages.load.as_secs_f64(),
+        "publish_seconds": stages.publish.as_secs_f64(), "source_sha256": source.manifest().sha256(),
+        "source_bytes": source.manifest().bytes(), "rotation_seed": stages.rotation_seed,
+        "graph_build_seconds": graph_build_seconds,
+        "graph_native_peak_bytes": graph_native_peak_bytes, "stored_graph_bytes": stored_graph_bytes,
+    });
+    bulk.as_object_mut()
+        .expect("bulk report object")
+        .extend(settings);
+    let measurements = ConstructionMeasurements {
+        bulk: Some(bulk),
+        refinement_rounds: None,
+        refinement_moves: None,
+        wall_seconds: started.elapsed().as_secs_f64(),
+        cpu_seconds: Some(after.cpu_seconds_since(resources)),
+        peak_rss_bytes: Some(after.peak_rss_bytes()),
+        import,
+        convergence,
+    };
+    Ok((index, topology, measurements))
+}
+
+/// Replays unique held-out queries after every timed resource counter is captured.
+async fn quality_diagnostics<B: Backend>(
+    index: &Index<MeasuredBackend<B>>,
+    dataset: &BenchmarkDataset,
+    spec: &ScenarioSpec,
+    truth: &[ExactTruth],
+) -> Result<crate::report::QualityDiagnostics, String> {
+    let mut queries = Vec::with_capacity(dataset.queries.len());
+    for (query, expected) in truth.iter().enumerate() {
+        let request = search_request(dataset, spec, query)?;
+        let (outcome, diagnostic) = index
+            .benchmark_search(request, expected.iter().map(|(id, _)| id.clone()).collect())
+            .await
+            .map_err(|e| error_at("quality replay", e))?;
+        let locations = index
+            .benchmark_truth_leaves(expected.iter().map(|(id, _)| id.clone()).collect())
+            .await
+            .map_err(|e| error_at("truth leaf membership", e))?;
+        let truth_leaves = expected
+            .iter()
+            .zip(locations)
+            .map(
+                |((id, _), (leaf, entries))| crate::report::TruthLeafQuality {
+                    leaf: leaf.get(),
+                    entries,
+                    scanned: diagnostic.leaves.contains(&leaf),
+                    returned: outcome.hits.iter().any(|hit| hit.id() == id),
+                },
+            )
+            .collect();
+        let denominator = expected.len() as f64;
+        queries.push(crate::report::QueryQuality {
+            query,
+            true_neighbor_leaf_coverage: diagnostic.neighbors_in_leaves as f64 / denominator,
+            global_candidate_coverage: diagnostic.neighbors_in_global_pool as f64 / denominator,
+            rerank_candidate_coverage: diagnostic.neighbors_reranked as f64 / denominator,
+            final_recall: oracle::recall_ids(outcome.hits.iter().map(|hit| hit.id()), expected),
+            truth_leaves,
+        });
+    }
+    Ok(crate::report::QualityDiagnostics { queries })
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -2450,26 +2685,32 @@ mod tests {
                 ktann::api::IndexConfig::new(scenario.dimension, scenario.metric)
                     .expect("default index config")
             );
-            let max_partition_entries = usize::try_from(scenario.max_partition_entries)
-                .expect("partition fanout fits usize");
-            assert!(
-                max_partition_entries * max_partition_entries < scenario.base_vectors,
-                "the shared partition fanout must force a third topology level"
-            );
         }
     }
 
     #[test]
     fn single_beam_diagnostic_still_requires_every_search_to_complete() {
         let mut points = vec![quality_point(32, 2, 0.9, 10.0)];
-        assert!(validate_quality_frontier(&points, 2).is_ok());
+        assert!(validate_quality_frontier(&points, 2, true).is_ok());
         points[0]
             .measurements
             .recall_at_k
             .as_mut()
             .expect("recall")
             .queries = 1;
-        assert!(validate_quality_frontier(&points, 2).is_err());
+        assert!(validate_quality_frontier(&points, 2, true).is_err());
+    }
+
+    #[test]
+    fn experimental_frontier_allows_plateaus_but_requires_completion() {
+        let mut points = vec![
+            quality_point(4, 2, 1.0, 20.0),
+            quality_point(16, 2, 1.0, 20.0),
+        ];
+        assert!(validate_quality_frontier(&points, 2, false).is_ok());
+        assert!(validate_quality_frontier(&points, 2, true).is_err());
+        points[0].measurements.recall_at_k.as_mut().unwrap().queries = 1;
+        assert!(validate_quality_frontier(&points, 2, false).is_err());
     }
 
     #[test]
@@ -2478,10 +2719,10 @@ mod tests {
             quality_point(1, 2, 0.5, 10.0),
             quality_point(2, 2, 1.0, 20.0),
         ];
-        assert!(validate_quality_frontier(&points, 2).is_ok());
+        assert!(validate_quality_frontier(&points, 2, true).is_ok());
 
         points[0].measurements.recall_at_k = None;
-        assert!(validate_quality_frontier(&points, 2).is_err());
+        assert!(validate_quality_frontier(&points, 2, true).is_err());
     }
 
     #[test]
@@ -2499,8 +2740,17 @@ mod tests {
             actionable_partitions: 0,
         };
 
-        assert!(topology_is_settled(&topology, 1_842));
-        assert!(!topology_is_settled(&topology, 512));
+        assert!(topology_is_settled(
+            &topology,
+            &ktann::api::IndexConfig::new(2, ktann::api::Metric::L2)
+                .unwrap()
+                .with_leaf_partition_entries(64, 1_842)
+                .unwrap()
+        ));
+        assert!(!topology_is_settled(
+            &topology,
+            &ktann::api::IndexConfig::new(2, ktann::api::Metric::L2).unwrap()
+        ));
     }
 
     #[test]

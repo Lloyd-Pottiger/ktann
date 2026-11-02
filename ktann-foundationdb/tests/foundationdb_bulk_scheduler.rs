@@ -85,7 +85,8 @@ async fn foundationdb_scheduler_process() {
     .unwrap();
     let config = IndexConfig::new(32, Metric::L2)
         .unwrap()
-        .with_partition_entries(32, 128)
+        .with_leaf_partition_entries(32, 128)
+        .and_then(|config| config.with_internal_partition_entries(32, 128))
         .unwrap();
     let source = InputSnapshot::create(
         &root.join("source"),
@@ -104,8 +105,6 @@ async fn foundationdb_scheduler_process() {
     )
     .unwrap();
     let construction = ConstructionOptions {
-        min_partition_entries: 32,
-        max_partition_entries: 128,
         sample_items: 256,
         memory_bytes: 32 * 1024 * 1024,
         scratch_bytes: 128 * 1024 * 1024,

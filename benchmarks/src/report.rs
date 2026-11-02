@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 /// Current complete benchmark suite/report JSON contract.
-pub const REPORT_SCHEMA_VERSION: u32 = 8;
+pub const REPORT_SCHEMA_VERSION: u32 = 10;
 
 /// Reports produced by one suite command on one comparable host.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -39,6 +39,127 @@ pub struct BenchmarkReport {
     pub measurements: ReportMeasurements,
 }
 
+impl BenchmarkReport {
+    /// Checks workload outcomes and phase accounting before emission or comparison.
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        match &self.measurements {
+            ReportMeasurements::SteadyState(measurements) => {
+                self.validate_steady_operation_summaries(measurements)
+            }
+            ReportMeasurements::QualitySweep(sweep) => {
+                for point in &sweep.points {
+                    self.validate_steady_operation_summaries(&point.measurements)?;
+                }
+                Ok(())
+            }
+            ReportMeasurements::Lifecycle(lifecycle) => {
+                self.validate_lifecycle_measurements(lifecycle)
+            }
+        }
+    }
+
+    /// Checks continuous-case accounting and each configured lifecycle query pass.
+    fn validate_lifecycle_measurements(
+        &self,
+        lifecycle: &LifecycleMeasurements,
+    ) -> Result<(), String> {
+        if lifecycle.unattributed_wall_seconds().is_none() {
+            return Err(format!(
+                "scenario {}/{} has inconsistent lifecycle phase accounting",
+                self.configuration.backend, self.configuration.scenario
+            ));
+        }
+        match (
+            lifecycle.case_cpu_seconds,
+            lifecycle.unattributed_cpu_seconds(),
+        ) {
+            (Some(_), Some(_)) => {}
+            (None, None) => {}
+            _ => {
+                return Err(format!(
+                    "scenario {}/{} has inconsistent lifecycle CPU accounting",
+                    self.configuration.backend, self.configuration.scenario
+                ));
+            }
+        }
+        if lifecycle.unattributed_backend_io().is_none() {
+            return Err(format!(
+                "scenario {}/{} has inconsistent lifecycle Backend IO accounting",
+                self.configuration.backend, self.configuration.scenario
+            ));
+        }
+        let configured_attempts =
+            u64::try_from(self.configuration.measured_operations).map_err(|_| {
+                format!(
+                    "scenario {}/{} measured operation count exceeds report range",
+                    self.configuration.backend, self.configuration.scenario
+                )
+            })?;
+        for phase in [
+            &lifecycle.immediate_search,
+            &lifecycle.stable_cold_search,
+            &lifecycle.stable_warm_search,
+        ] {
+            phase.search.validate().map_err(|error| {
+                format!(
+                    "scenario {}/{} has invalid lifecycle search results: {error}",
+                    self.configuration.backend, self.configuration.scenario
+                )
+            })?;
+            if phase.search.attempted != configured_attempts {
+                return Err(format!(
+                    "scenario {}/{} lifecycle query attempts differ from its configuration",
+                    self.configuration.backend, self.configuration.scenario
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Rejects one steady measurement whose operation totals do not match config.
+    fn validate_steady_operation_summaries(
+        &self,
+        measurements: &SteadyStateMeasurements,
+    ) -> Result<(), String> {
+        if !OperationClass::for_mix(self.configuration.search_percent)
+            .eq(measurements.operations.keys().copied())
+        {
+            return Err(format!(
+                "scenario {}/{} has operation classes inconsistent with its mix",
+                self.configuration.backend, self.configuration.scenario
+            ));
+        }
+        let attempted = measurements
+            .operations
+            .values()
+            .try_fold(0_u64, |sum, summary| {
+                summary.validate()?;
+                sum.checked_add(summary.attempted)
+                    .ok_or("operation attempt count overflow")
+            })
+            .map_err(|error| {
+                format!(
+                    "scenario {}/{} has invalid operation results: {error}",
+                    self.configuration.backend, self.configuration.scenario
+                )
+            })?;
+        let configured_attempts =
+            u64::try_from(self.configuration.measured_operations).map_err(|_| {
+                format!(
+                    "scenario {}/{} measured operation count exceeds report range",
+                    self.configuration.backend, self.configuration.scenario
+                )
+            })?;
+        if attempted != configured_attempts {
+            return Err(format!(
+                "scenario {}/{} operation attempts differ from its configuration",
+                self.configuration.backend, self.configuration.scenario
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Hardware and software metadata needed to judge comparability.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Environment {
@@ -67,6 +188,10 @@ pub struct Environment {
 /// Reproducible benchmark configuration.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Configuration {
+    /// Frozen-dataset experiment settings, absent for ordinary online benchmarks.
+    pub routing_experiment: Option<crate::routing::Experiment>,
+    /// Starting query row in the original dataset.
+    pub query_offset: usize,
     /// Production Backend under measurement.
     pub backend: String,
     /// Workload scenario.
@@ -87,10 +212,14 @@ pub struct Configuration {
     pub search_percent: u8,
     /// Whether writes target a small conflict set.
     pub hot_updates: bool,
-    /// Logical Index merge threshold.
-    pub min_partition_entries: u32,
-    /// Logical Index split threshold.
-    pub max_partition_entries: u32,
+    /// Minimum non-root leaf occupancy.
+    pub min_leaf_partition_entries: u32,
+    /// Leaf split threshold.
+    pub max_leaf_partition_entries: u32,
+    /// Minimum non-root internal occupancy.
+    pub min_internal_partition_entries: u32,
+    /// Internal split threshold.
+    pub max_internal_partition_entries: u32,
     /// Runtime Partition Cache capacity.
     pub partition_cache_bytes: u64,
     /// Foreground operation concurrency limit.
@@ -276,6 +405,8 @@ pub struct QualitySweepMeasurements {
     /// Construction through the first complete, maintenance-converged audit.
     /// Absent when the benchmark reuses a persisted index.
     pub construction: Option<ConstructionMeasurements>,
+    /// Persisted fixture identity, fingerprint cost, and measured process peak RSS.
+    pub routing_setup: Option<serde_json::Value>,
     /// Points ordered by client count, then from narrowest to widest beam.
     pub points: Vec<QualityPoint>,
 }
@@ -283,10 +414,12 @@ pub struct QualitySweepMeasurements {
 /// Construction costs before oracle preparation and query warmup.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ConstructionMeasurements {
+    /// Bulk Build stage timings and immutable source binding, when applicable.
+    pub bulk: Option<serde_json::Value>,
     /// Completed offline relocation rounds (zero when refinement is skipped).
-    pub refinement_rounds: u64,
+    pub refinement_rounds: Option<u64>,
     /// Accepted positive-gain moves across completed local rounds.
-    pub refinement_moves: u64,
+    pub refinement_moves: Option<u64>,
     /// Continuous elapsed time from import start through convergence and refinement.
     pub wall_seconds: f64,
     /// Process CPU across the same complete construction interval.
@@ -324,6 +457,12 @@ pub struct QualityPoint {
 /// Measurements attributed to one steady-state scenario worker.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct SteadyStateMeasurements {
+    /// Measured successful query recall, in operation completion order.
+    pub per_query_recall: Vec<f64>,
+    /// Independent replay after timing and resource snapshots; no oracle IO is timed.
+    pub quality_diagnostics: Option<QualityDiagnostics>,
+    /// Routing-only counters and elapsed compute/merge samples, excluding body IO.
+    pub routing: RoutingMeasurements,
     /// Timed-region wall-clock duration.
     pub wall_seconds: f64,
     /// Time after foreground completion until its maintenance backlog drained.
@@ -543,8 +682,6 @@ pub struct SearchTruncation {
     pub visited_partitions: u64,
     /// Searches exhausting the exact-rerank-candidate budget.
     pub exact_rerank_candidates: u64,
-    /// Searches truncated by a per-leaf RaBitQ overlap cap.
-    pub rabitq_overlap: u64,
 }
 
 /// Time and resources required to verify a stable topology.
@@ -855,6 +992,41 @@ pub struct WriteAmplification {
     pub write_retries: u64,
 }
 
+/// Records the resolved Bulk Build settings used by either benchmark entrypoint.
+/// Capture before transferring worker ownership to the build job.
+pub(crate) fn bulk_build_settings(
+    construction: &ktann::construction::ConstructionOptions,
+    worker: &ktann::api::BulkWorkerOptions,
+) -> serde_json::Map<String, serde_json::Value> {
+    use serde_json::json;
+    [
+        ("sample_items", json!(construction.sample_items)),
+        (
+            "construction_memory_bytes",
+            json!(construction.memory_bytes),
+        ),
+        (
+            "construction_scratch_bytes",
+            json!(construction.scratch_bytes),
+        ),
+        ("sort_memory_bytes", json!(worker.sort_memory_bytes)),
+        ("sort_scratch_bytes", json!(worker.sort_scratch_bytes)),
+        ("serving_memory_bytes", json!(worker.serving_memory_bytes)),
+        ("serving_scratch_bytes", json!(worker.serving_scratch_bytes)),
+        ("graph_memory_bytes", json!(worker.graph_memory_bytes)),
+        (
+            "refinement_memory_bytes",
+            json!(worker.refinement_memory_bytes),
+        ),
+        ("max_artifact_bytes", json!(worker.max_artifact_bytes)),
+        ("load_max_mutations", json!(worker.load.max_mutations)),
+        ("load_max_bytes", json!(worker.load.max_bytes)),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_owned(), value))
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{BackendIo, Distribution, LifecycleMeasurements};
@@ -920,4 +1092,68 @@ mod tests {
             })
         );
     }
+}
+
+/// Work observed in the timed routing interval; zero means no work was recorded.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct RoutingMeasurements {
+    /// Native search expansion actually used, bounded by local beam and node count.
+    pub effective_ef: Distribution,
+    /// Complete local graph bodies restored during this interval.
+    pub graph_loads: u64,
+    /// Encoded graph bytes consumed on misses (can count the same graph repeatedly).
+    pub graph_encoded_bytes: u64,
+    /// Accounted complete decoded body bytes restored, including repeated misses.
+    pub graph_decoded_bytes: u64,
+    /// Restore CPU-task elapsed milliseconds, excluding backend reads.
+    pub restore_ms: Distribution,
+    /// Distances evaluated by exact or graph routing, excluding leaf work.
+    pub distances: u64,
+    /// Native graph expansion iterations.
+    pub graph_visits: u64,
+    /// Complete internal partitions consumed, grouped by actual tree level.
+    pub parent_visits_by_level: BTreeMap<String, u64>,
+    /// Candidates presented to the per-tree/level beam container.
+    pub merge_candidates: u64,
+    /// Per-parent compute wall time in milliseconds; this is not thread CPU time.
+    pub compute_ms: Distribution,
+    /// Per-parent candidate merge wall time in milliseconds.
+    pub merge_ms: Distribution,
+}
+
+/// Per-query quality decomposition, separate from measured latency/QPS.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct QualityDiagnostics {
+    /// One row per held-out query, in source query order.
+    pub queries: Vec<QueryQuality>,
+}
+
+/// A reproducible query's independent quality observations.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct QueryQuality {
+    /// Index into the selected query window (add configuration query offset for source).
+    pub query: usize,
+    /// True final top-k neighbors in the scanned leaves / number of true neighbors.
+    pub true_neighbor_leaf_coverage: f64,
+    /// True neighbors retained in the global bounded rough-distance pool.
+    pub global_candidate_coverage: f64,
+    /// True neighbors entering exact reranking; rerank budget remains engine-owned.
+    pub rerank_candidate_coverage: f64,
+    /// Returned true neighbors / number of true neighbors.
+    pub final_recall: f64,
+    /// Each true neighbor's authoritative leaf and visibility in ordinary search.
+    pub truth_leaves: Vec<TruthLeafQuality>,
+}
+
+/// One true neighbor's partition and routing visibility, collected outside timing.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TruthLeafQuality {
+    /// Authoritative leaf identity in this fixture.
+    pub leaf: u64,
+    /// Exact leaf occupancy, independent of how many truth IDs share it.
+    pub entries: u64,
+    /// Whether ordinary search scanned this neighbor's leaf.
+    pub scanned: bool,
+    /// Whether this neighbor survived the complete query pipeline.
+    pub returned: bool,
 }

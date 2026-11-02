@@ -20,24 +20,43 @@ serving lifecycle and exact-membership contracts are unchanged.
    and delegates each tree to the existing deterministic construction algorithm.
    `build_prepared` consumes receipt-time preparation. Plans are emitted in
    canonical tree order, child-before-parent with root Partition Key 1 last.
-   The reader validates allocation, occupancy, levels, tree closure, and counts.
+   Optional bounded refinement runs on one retained tree before emission, reusing
+   the ordinary metric-correct assignment algorithm. Zero rounds refreshes leaf
+   and bottom-up internal centroids; omission preserves construction output.
+   Refinement semantics participate in the forest binding. The reader validates
+   allocation, occupancy, levels, tree closure, and counts.
 4. `ServingArtifact::build` uses bounded external joins to prove exact source/leaf
    membership and parent/child relationships. Core storage codecs encode records,
    locations, payloads, trees, partition metadata, entries, and synopses. Output
-   keys are unique and sorted, and adapter key/value limits are checked. It excludes
+   keys are unique and sorted, and adapter key/value limits are checked. For Local Graph
+   Indexes, final canonical internal bodies feed one graph at a time; descriptor
+   and chunk keys follow that body's Child Entries. Graph encoding completes
+   before sealing and no serving projection changes afterward. It excludes
    the Index Manifest, name directory, and allocator. Its binding includes the
    exact target Index Manifest and source and forest identities. Build budgets and
    adapter limits do not affect content identity. Forest partition bounds come
-   from the source configuration; `ForestOptions` supplies only the training
-   sample size and resource budgets.
+   from the source configuration; `ForestOptions` supplies the training
+   sample size, refinement semantics, and resource budgets. Standalone `construct_tree` also takes an
+   `IndexConfig`; `ConstructionOptions` carries only sampling and resources.
+   Leaf grouping and leaf-root fit use leaf
+   bounds; all higher grouping levels and internal-root fit use internal bounds.
+   Non-root occupancy checks select the same pair; roots retain the minimum
+   exception. Changing only internal bounds preserves leaf membership, IDs and
+   centroid bits, including across resident and spilled construction paths.
+   Memory admission reserves for the larger of the two maxima; larger internal
+   capacities may therefore require a larger working-memory budget.
 
 A sealed forest can reopen with the retained source manifest, configuration,
-seed, and sample size; serving data can reopen with the retained source and forest
+seed, sample size, and refinement semantics; serving data can reopen with the retained source and forest
 manifests and target Index Manifest. Neither operation requires upstream files or
 construction budgets. Serving readers apply the consumer's current adapter limits;
 exceeding them is `LimitExceeded`, not evidence of corrupt data.
 
 ## 2. Files, trust, and failure
+
+The forest binding includes all four capacities. The serving binding includes
+the target Manifest and forest identity. Capacity is not part of the source
+record schema.
 
 A versioned header binds each data file to its kind and configuration identity.
 Frames carry bounded lengths and SHA-256 checksums. The 89-byte Artifact Manifest

@@ -101,6 +101,8 @@ const SUB_STATE: u8 = 0x02;
 const SUB_CENTROID: u8 = 0x03;
 const SUB_LEAF_ENTRY: u8 = 0x04;
 const SUB_CHILD_ENTRY: u8 = 0x05;
+const SUB_GRAPH_DESCRIPTOR: u8 = 0x06;
+const SUB_GRAPH_CHUNK: u8 = 0x07;
 
 /// A storage-corruption error for a malformed or noncanonical decoded key.
 fn corrupt() -> Error {
@@ -205,6 +207,26 @@ pub enum LogicalKey {
         /// The raw Record ID.
         id: Bytes,
     },
+    /// Integrity metadata of a partition-local graph.
+    GraphDescriptor {
+        /// The owning Logical Index ID.
+        index: LogicalIndexId,
+        /// The canonical Tree Key.
+        tree_key: TreeKey,
+        /// The owning internal Partition Key.
+        partition: PartitionKey,
+    },
+    /// One format-sized topology chunk.
+    GraphChunk {
+        /// The owning Logical Index ID.
+        index: LogicalIndexId,
+        /// The canonical Tree Key.
+        tree_key: TreeKey,
+        /// The owning internal Partition Key.
+        partition: PartitionKey,
+        /// Zero-based contiguous chunk ordinal.
+        chunk: u32,
+    },
     /// A Child Entry.
     ChildEntry {
         /// The owning Logical Index ID.
@@ -239,6 +261,8 @@ impl LogicalKey {
             | Self::State { index, .. }
             | Self::Centroid { index, .. }
             | Self::LeafEntry { index, .. }
+            | Self::GraphDescriptor { index, .. }
+            | Self::GraphChunk { index, .. }
             | Self::ChildEntry { index, .. } => Some(*index),
         }
     }
@@ -252,6 +276,8 @@ impl LogicalKey {
             | Self::State { tree_key, .. }
             | Self::Centroid { tree_key, .. }
             | Self::LeafEntry { tree_key, .. }
+            | Self::GraphDescriptor { tree_key, .. }
+            | Self::GraphChunk { tree_key, .. }
             | Self::ChildEntry { tree_key, .. } => Some(tree_key),
             Self::IndexIdAllocator
             | Self::IndexNameDirectory(_)
@@ -350,6 +376,26 @@ impl fmt::Debug for LogicalKey {
                 .field("tree_key", &"[REDACTED]")
                 .field("partition", partition)
                 .field("id", &"[REDACTED]")
+                .finish(),
+            Self::GraphDescriptor {
+                index, partition, ..
+            } => formatter
+                .debug_struct("GraphDescriptor")
+                .field("index", index)
+                .field("tree_key", &"[REDACTED]")
+                .field("partition", partition)
+                .finish(),
+            Self::GraphChunk {
+                index,
+                partition,
+                chunk,
+                ..
+            } => formatter
+                .debug_struct("GraphChunk")
+                .field("index", index)
+                .field("tree_key", &"[REDACTED]")
+                .field("partition", partition)
+                .field("chunk", chunk)
                 .finish(),
             Self::ChildEntry {
                 index, partition, ..
@@ -611,6 +657,44 @@ pub fn centroid_key(index: LogicalIndexId, tree_key: &TreeKey, partition: Partit
     bytes
 }
 
+/// The partition-local graph descriptor key.
+#[must_use]
+pub fn graph_descriptor_key(
+    index: LogicalIndexId,
+    tree_key: &TreeKey,
+    partition: PartitionKey,
+) -> Vec<u8> {
+    let mut bytes = partition_prefix(index, tree_key, partition);
+    bytes.push(SUB_GRAPH_DESCRIPTOR);
+    bytes
+}
+
+/// One partition-local graph chunk key, ordered by its numeric ordinal.
+#[must_use]
+pub fn graph_chunk_key(
+    index: LogicalIndexId,
+    tree_key: &TreeKey,
+    partition: PartitionKey,
+    chunk: u32,
+) -> Vec<u8> {
+    let mut bytes = partition_prefix(index, tree_key, partition);
+    bytes.push(SUB_GRAPH_CHUNK);
+    bytes.extend_from_slice(&chunk.to_be_bytes());
+    bytes
+}
+
+/// Range containing only one partition's graph chunks.
+#[must_use]
+pub fn graph_chunk_range(
+    index: LogicalIndexId,
+    tree_key: &TreeKey,
+    partition: PartitionKey,
+) -> KeyRange {
+    let mut bytes = partition_prefix(index, tree_key, partition);
+    bytes.push(SUB_GRAPH_CHUNK);
+    KeyRange::new(bytes.clone(), successor(&bytes))
+}
+
 /// The Leaf Entry key for `id` in `partition`.
 pub fn leaf_entry_key(
     index: LogicalIndexId,
@@ -685,6 +769,17 @@ pub(crate) fn encode_key(key: &LogicalKey) -> Result<Vec<u8>> {
             partition,
             id,
         } => leaf_entry_key(*index, tree_key, *partition, id),
+        LogicalKey::GraphDescriptor {
+            index,
+            tree_key,
+            partition,
+        } => Ok(graph_descriptor_key(*index, tree_key, *partition)),
+        LogicalKey::GraphChunk {
+            index,
+            tree_key,
+            partition,
+            chunk,
+        } => Ok(graph_chunk_key(*index, tree_key, *partition, *chunk)),
         LogicalKey::ChildEntry {
             index,
             tree_key,
@@ -813,6 +908,17 @@ fn decode_partition_key(
             index,
             tree_key,
             partition,
+        }),
+        SUB_GRAPH_DESCRIPTOR if terminal.is_empty() => Ok(LogicalKey::GraphDescriptor {
+            index,
+            tree_key,
+            partition,
+        }),
+        SUB_GRAPH_CHUNK if terminal.len() == 4 => Ok(LogicalKey::GraphChunk {
+            index,
+            tree_key,
+            partition,
+            chunk: u32::from_be_bytes(terminal.try_into().map_err(|_| corrupt())?),
         }),
         SUB_CENTROID if terminal.is_empty() => Ok(LogicalKey::Centroid {
             index,

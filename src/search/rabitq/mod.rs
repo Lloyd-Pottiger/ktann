@@ -1,14 +1,13 @@
-//! Canonical RaBitQ7 encoding and bounded candidate selection.
+//! Canonical RaBitQ7 encoding, approximate scores, and conservative bounds.
 //!
-//! This module is the single seam for the persistent seven-bit code, scalar
-//! f64 approximate distances, conservative intervals, and deterministic
-//! overlap selection. Callers do not need to know the bit layout or the
+//! This module is the single seam for the persistent seven-bit code, integer
+//! approximate scoring, and conservative intervals.
+//! Callers do not need to know the bit layout or the
 //! directed-rounding rules that keep its intervals conservative.
 
 mod codec;
 mod interval;
 mod rounding;
-mod selection;
 
 #[cfg(test)]
 mod tests;
@@ -20,9 +19,6 @@ use bytes::Bytes;
 use crate::api::Result;
 
 pub(crate) use interval::RaBitQQuery;
-#[cfg(test)]
-pub(crate) use selection::OverlapSelection;
-pub(crate) use selection::{ApproximateCandidate, select_global_overlap, select_leaf_overlap};
 
 /// One borrowed canonical absolute RaBitQ7 payload.
 pub(crate) struct RaBitQ7<'a> {
@@ -42,17 +38,21 @@ struct CodeHeader {
 
 /// A validated code expanded once for an immutable cached leaf body.
 /// The packed payload is not retained alongside these signed components.
-pub(crate) struct DecodedRaBitQ7 {
+pub(crate) struct DecodedRaBitQ7<C> {
     header: CodeHeader,
-    codes: Box<[i8]>,
+    codes: C,
 }
 
-impl DecodedRaBitQ7 {
-    /// Expands a payload already validated by the Leaf Entry decoder.
-    pub(crate) fn from_validated_leaf_bytes(encoded: &[u8], dimension: usize) -> Self {
+impl DecodedRaBitQ7<std::ops::Range<usize>> {
+    /// Appends a validated payload to its leaf body's shared component buffer.
+    pub(crate) fn append_validated_leaf_bytes(
+        encoded: &[u8],
+        dimension: usize,
+        codes: &mut Vec<i8>,
+    ) -> Self {
         let packed = RaBitQ7::from_validated_leaf_bytes(encoded, dimension);
         let dimension = packed.dimension;
-        let mut codes = Vec::with_capacity(dimension);
+        let start = codes.len();
         // Decode each complete packed group once, including its sign nibble.
         for index in 0..dimension / 4 {
             let block = packed.code_block(index);
@@ -61,21 +61,27 @@ impl DecodedRaBitQ7 {
         codes.extend((dimension / 4 * 4..dimension).map(|index| packed.signed_code(index)));
         Self {
             header: packed.header,
-            codes: codes.into_boxed_slice(),
+            codes: start..codes.len(),
         }
     }
 
-    /// Returns the retained signed-code allocation size in bytes.
-    pub(crate) fn heap_bytes(&self) -> usize {
-        self.codes.len()
+    /// Borrows this entry's components from the owning immutable leaf body.
+    pub(crate) fn view<'a>(&self, codes: &'a [i8]) -> DecodedRaBitQ7<&'a [i8]> {
+        DecodedRaBitQ7 {
+            header: self.header,
+            codes: &codes[self.codes.clone()],
+        }
     }
+}
 
-    /// Scores independent lanes with the scalar accumulation order in each lane.
-    pub(crate) fn approximate_distances<const N: usize>(
-        codes: [&Self; N],
-        query: &RaBitQQuery<'_>,
-    ) -> Result<[ApproximateDistance; N]> {
-        interval::approximate_distances(codes, query)
+impl DecodedRaBitQ7<&[i8]> {
+    /// Scores one code, skipping interval construction above a full pool's cutoff.
+    pub(crate) fn score(
+        &self,
+        query: &RaBitQQuery,
+        cutoff: Option<f64>,
+    ) -> Result<Option<ApproximateDistance>> {
+        interval::score(self, query, cutoff)
     }
 }
 
@@ -106,12 +112,9 @@ impl<'a> RaBitQ7<'a> {
         codec::from_validated_bytes(encoded, dimension)
     }
 
-    /// Computes a scalar-f64 rough distance and conservative interval.
+    /// Computes an integer-dot rough distance and conservative interval.
     #[cfg(test)]
-    pub(crate) fn approximate_distance(
-        &self,
-        query: &RaBitQQuery<'_>,
-    ) -> Result<ApproximateDistance> {
+    pub(crate) fn approximate_distance(&self, query: &RaBitQQuery) -> Result<ApproximateDistance> {
         interval::approximate_distance(self, query)
     }
 }
@@ -140,7 +143,7 @@ impl ApproximateDistance {
         })
     }
 
-    /// Returns the rough scalar-f64 ranking value.
+    /// Returns the rough ranking value.
     pub(crate) const fn rough(self) -> f64 {
         self.rough
     }

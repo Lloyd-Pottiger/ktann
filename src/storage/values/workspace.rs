@@ -157,6 +157,8 @@ pub(super) fn encode_options(e: &mut Encoder, o: &BulkWorkerOptions) -> Result<(
         o.sort_scratch_bytes,
         o.serving_memory_bytes as u64,
         o.serving_scratch_bytes,
+        o.graph_memory_bytes as u64,
+        o.refinement_memory_bytes as u64,
         o.max_artifact_bytes,
         o.load.max_mutations as u64,
         o.load.max_bytes as u64,
@@ -175,6 +177,8 @@ pub(super) fn decode_options(d: &mut Decoder) -> Result<BulkWorkerOptions> {
         sort_scratch_bytes: d.u64()?,
         serving_memory_bytes: usize::try_from(d.u64()?).map_err(|_| corrupt())?,
         serving_scratch_bytes: d.u64()?,
+        graph_memory_bytes: usize::try_from(d.u64()?).map_err(|_| corrupt())?,
+        refinement_memory_bytes: usize::try_from(d.u64()?).map_err(|_| corrupt())?,
         max_artifact_bytes: d.u64()?,
         load: BulkLoadOptions {
             max_mutations: usize::try_from(d.u64()?).map_err(|_| corrupt())?,

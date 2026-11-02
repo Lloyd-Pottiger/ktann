@@ -23,6 +23,11 @@ use crate::storage::backend::{Backend, CommitCancellation, CommitStart};
 
 use self::fixup::FixupQueue;
 
+mod compute;
+pub(crate) mod graph_maintenance;
+pub use graph_maintenance::GraphMaintenance;
+mod routing_graph;
+
 pub(crate) mod bulk_load;
 pub(crate) mod bulk_publish;
 pub(crate) mod bulk_scheduler;
@@ -67,7 +72,7 @@ impl<B: Backend> Runtime<B> {
         &self,
         name: &str,
         input: &crate::bulk::InputSnapshot,
-        construction: crate::construction::ConstructionOptions,
+        construction: impl Into<crate::api::BulkBuildOptions>,
     ) -> Result<crate::api::BulkBuildJob<B>> {
         self.start_bulk_build_with_control(name, input, construction, OperationOptions::default())
             .await
@@ -78,24 +83,22 @@ impl<B: Backend> Runtime<B> {
         &self,
         name: &str,
         input: &crate::bulk::InputSnapshot,
-        construction: crate::construction::ConstructionOptions,
+        construction: impl Into<crate::api::BulkBuildOptions>,
         options: OperationOptions,
     ) -> Result<crate::api::BulkBuildJob<B>> {
         let name = IndexName::new(name)?;
         let config = input.config().clone();
-        construction.resident_rows(config.dimension())?;
-        if construction.min_partition_entries != config.min_partition_entries()
-            || construction.max_partition_entries != config.max_partition_entries()
-        {
-            return Err(Error::invalid_argument());
-        }
+        let preparation = construction.into();
+        let construction = preparation.construction;
+        construction.resident_rows(&config)?;
         let source =
             std::path::absolute(input.directory()).map_err(|_| Error::invalid_argument())?;
         let descriptor = crate::storage::values::BuildDescriptor::new(
             source,
             input.manifest().clone(),
             construction,
-        )?;
+        )?
+        .with_refinement_rounds(preparation.refinement_rounds)?;
         let request = descriptor.clone();
         let request_name = name.clone();
         let retry = lifecycle::RetryPolicy::from_config(self.config());
@@ -176,6 +179,10 @@ impl<B: Backend> Runtime<B> {
 
         let foreground_limit = config.foreground_operation_limit();
         let partition_cache = Arc::new(PartitionCache::new(config.partition_cache_bytes()));
+        let maintenance_cancel = CancellationToken::new();
+        let graph_maintenance =
+            graph_maintenance::GraphMaintenance::new(&config, maintenance_cancel.clone())
+                .with_cache(Arc::clone(&partition_cache));
         let runtime = Self {
             handle: Arc::new(RuntimeHandle {
                 inner: Arc::new(RuntimeInner {
@@ -186,7 +193,8 @@ impl<B: Backend> Runtime<B> {
                     fixups: Mutex::new(FixupQueue::new(config.fixup_queue_capacity())),
                     fixup_reporting: Mutex::new(()),
                     fixup_available: Notify::new(),
-                    maintenance_cancel: CancellationToken::new(),
+                    maintenance_cancel,
+                    graph_maintenance,
                     lifecycle: Mutex::new(Lifecycle {
                         phase: Phase::Accepting,
                         active: 0,
@@ -396,18 +404,41 @@ impl<B: Backend> Drop for RuntimeHandle<B> {
     }
 }
 
+/// Control and per-operation memory envelope for adaptive write graph routing.
+/// Synchronous block_in_place work stays inside its admitted foreground task;
+/// it cannot outlive that task's admission or borrow transaction state elsewhere.
+#[derive(Clone)]
+pub(crate) struct WriteRoutingControl {
+    options: OperationOptions,
+    pub(crate) working_bytes: usize,
+}
+
+impl WriteRoutingControl {
+    pub(crate) fn checkpoint(&self) -> Result<()> {
+        check_control(&self.options)
+    }
+}
+
 pub(crate) struct OperationContext<B: Backend> {
     bulk_authority: Option<[u8; 32]>,
     backend: Arc<B>,
     options: OperationOptions,
     write_beam_size: u32,
+    routing_working_bytes: usize,
     partition_cache: Arc<PartitionCache>,
     commit_start: Option<CommitStart>,
-    // Refinement CPU tasks retain this shared admission through actual task exit.
+    // Foreground CPU tasks retain this shared admission through actual task exit.
     cpu_admission: Option<Arc<Admission<B>>>,
 }
 
 impl<B: Backend> OperationContext<B> {
+    pub(crate) fn write_routing_control(&self) -> WriteRoutingControl {
+        WriteRoutingControl {
+            options: self.options.clone(),
+            working_bytes: self.routing_working_bytes,
+        }
+    }
+
     pub(crate) fn backend(&self) -> Arc<B> {
         Arc::clone(&self.backend)
     }
@@ -514,6 +545,7 @@ pub(crate) struct RuntimeInner<B: Backend> {
     fixup_reporting: Mutex<()>,
     fixup_available: Notify,
     maintenance_cancel: CancellationToken,
+    graph_maintenance: graph_maintenance::GraphMaintenance,
     lifecycle: Mutex<Lifecycle<B>>,
     terminal: Notify,
 }
@@ -553,10 +585,12 @@ impl<B: Backend> RuntimeInner<B> {
             }
         };
         // Ordinary operations retain direct admission without an allocation.
-        // Refinement shares ownership with cooperatively cancelled CPU work.
+        // Search and bulk/refinement operations share admission with CPU work.
         let admission = if matches!(
             operation,
-            Operation::Refine
+            Operation::Search
+                | Operation::Verify
+                | Operation::Refine
                 | Operation::LoadBulkBuild
                 | Operation::RunBulkBuild
                 | Operation::ScheduleBulkBuild
@@ -581,6 +615,7 @@ impl<B: Backend> RuntimeInner<B> {
             backend,
             options,
             write_beam_size: self.config.write_beam_size(),
+            routing_working_bytes: self.config.routing_working_bytes(),
             partition_cache: self.partition_cache(),
             commit_start: Some(commit_start),
             cpu_admission,
@@ -848,7 +883,7 @@ enum Phase {
     Closed,
 }
 
-/// Only offline refinement needs shared ownership of a foreground admission.
+/// CPU work shares foreground admission until its cooperatively cancelled task exits.
 enum ForegroundAdmission<B: Backend> {
     Direct { _guard: Admission<B> },
     Shared { guard: Arc<Admission<B>> },
@@ -1143,6 +1178,23 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidArgument);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graph_reads_and_queries_run_under_search_admission() {
+        let (runtime, _drops) = test_runtime(2);
+        runtime
+            .run_foreground(
+                Operation::Search,
+                None,
+                OperationOptions::default(),
+                |context| async move {
+                    crate::search::cache::graph::tests::exercise_runtime(&context).await
+                },
+            )
+            .await
+            .unwrap();
+        runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

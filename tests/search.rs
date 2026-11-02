@@ -2,7 +2,7 @@
 //!
 //! Every test drives the public `Index::search` API against the deterministic
 //! in-memory backend. Hits are compared with a brute-force exact-distance
-//! oracle; budget usage, exhaustion flags, and overlap truncation are asserted
+//! oracle; budget usage and exhaustion flags are asserted
 //! per dimension. Intermediate topology states are hand-installed through the
 //! public storage API to isolate search behavior from maintenance scheduling.
 
@@ -206,10 +206,6 @@ async fn search_matches_brute_force_and_reports_exact_usage() {
     assert_eq!(hit_parts(&rerun), hit_parts(&outcome));
     assert_eq!(rerun.usage, outcome.usage);
     assert_eq!(rerun.exhausted, outcome.exhausted);
-    assert_eq!(
-        rerun.rabitq_overlap_truncated,
-        outcome.rabitq_overlap_truncated
-    );
     runtime.shutdown().await.expect("shutdown");
 }
 
@@ -277,10 +273,6 @@ async fn packed_search_preserves_results_and_budgets_across_cache_modes() {
                     assert_eq!(hit_bits(&outcome), hit_bits(expected));
                     assert_eq!(outcome.usage, expected.usage);
                     assert_eq!(outcome.exhausted, expected.exhausted);
-                    assert_eq!(
-                        outcome.rabitq_overlap_truncated,
-                        expected.rabitq_overlap_truncated
-                    );
                 } else {
                     control = Some(outcome);
                 }
@@ -441,8 +433,8 @@ async fn every_budget_dimension_reports_exactly_its_own_exhaustion() {
     runtime.shutdown().await.expect("shutdown");
 
     // Exact rerank candidates: two trees of ten identical vectors each. Every
-    // interval coincides, so the per-leaf caps and the merged selection both
-    // truncate to the Runtime ceiling and report it.
+    // interval coincides, so the global candidate pool truncates to the
+    // Runtime ceiling and reports exact-rerank budget exhaustion.
     let backend = shared_backend(TestConfig::default());
     let search_budgets = SearchBudgets::new(4_096, 1_024, 3).expect("valid exact-rerank ceiling");
     let runtime_config = support::manual_maintenance_config()
@@ -462,7 +454,6 @@ async fn every_budget_dimension_reports_exactly_its_own_exhaustion() {
     let outcome = index.search(search_request(2)).await.expect("search");
     assert_eq!(outcome.usage.exact_rerank_candidates, 3);
     assert!(outcome.exhausted.exact_rerank_candidates);
-    assert!(outcome.rabitq_overlap_truncated);
     assert!(!outcome.exhausted.scanned_tree_keys);
     assert!(!outcome.exhausted.visited_partitions);
     assert_eq!(outcome.hits.len(), 2);

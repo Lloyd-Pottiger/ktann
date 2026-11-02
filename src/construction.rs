@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use bytes::Bytes;
 use xxhash_rust::xxh3::xxh3_128_with_seed;
 
-use crate::api::{Error, ErrorKind, Metric, PartitionKey, Result, validate_id};
+use crate::api::{Error, ErrorKind, IndexConfig, PartitionKey, Result, validate_id};
 use crate::search::numeric::VectorKernel;
 
 const BUFFER_BYTES: usize = 8 * 1024;
@@ -22,13 +22,9 @@ const ROW_OVERHEAD_BYTES: usize = 128;
 const MAX_ID_BYTES: usize = crate::api::MAX_RECORD_ID_BYTES;
 const SAMPLE_SEED: u64 = 0x6b74_616e_6e62_756c;
 
-/// Bounds for the single-tree construction stage.
+/// Training sample and resource budgets for single-tree construction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConstructionOptions {
-    /// Serving split threshold; non-root groups are within min/max occupancy.
-    pub max_partition_entries: u32,
-    /// Minimum non-root group size; twice this must not exceed the maximum.
-    pub min_partition_entries: u32,
     /// Maximum deterministic training sample size.
     pub sample_items: usize,
     /// Conservative bound for algorithm-owned working buffers, excluding caller IO.
@@ -40,15 +36,7 @@ pub struct ConstructionOptions {
 impl ConstructionOptions {
     /// Checks dimension-independent invariants before persisting a build request.
     pub(crate) fn validate(self) -> Result<()> {
-        if self.min_partition_entries == 0
-            || self
-                .min_partition_entries
-                .checked_mul(2)
-                .is_none_or(|minimum| minimum > self.max_partition_entries)
-            || self.sample_items < 2
-            || self.memory_bytes == 0
-            || self.scratch_bytes == 0
-        {
+        if self.sample_items < 2 || self.memory_bytes == 0 || self.scratch_bytes == 0 {
             return Err(Error::invalid_argument());
         }
         Ok(())
@@ -57,7 +45,9 @@ impl ConstructionOptions {
     /// Return the resident row allowance after reserving non-resident working space.
     /// Caller-owned input buffers and emitted plans retained by the consumer are
     /// outside this budget; construction owns only the buffers needed to emit them.
-    pub(crate) fn resident_rows(self, dimension: usize) -> Result<usize> {
+    pub(crate) fn resident_rows(self, config: &IndexConfig) -> Result<usize> {
+        config.validate()?;
+        let dimension = config.dimension();
         let row_bound = dimension
             .checked_mul(4)
             .and_then(|n| n.checked_add(MAX_ID_BYTES + ROW_OVERHEAD_BYTES))
@@ -67,7 +57,11 @@ impl ConstructionOptions {
         // maximum-length IDs and allocation overhead even when actual rows are small.
         let reserved_rows = self
             .sample_items
-            .max(self.max_partition_entries as usize)
+            .max(
+                config
+                    .max_leaf_partition_entries()
+                    .max(config.max_internal_partition_entries()) as usize,
+            )
             .checked_mul(8)
             .ok_or(Error::new(ErrorKind::LimitExceeded))?;
         // IO buffers and the reader's encoded-vector buffer are reserved separately
@@ -90,9 +84,6 @@ impl ConstructionOptions {
         Ok((self.memory_bytes - reserved) / row_bound)
     }
 }
-
-/// Version of deterministic construction persisted in Bulk Build descriptors.
-pub const CONSTRUCTION_VERSION: u32 = 1;
 
 /// One original vector, identified by its canonical Record ID.
 pub struct ConstructionRecord {
@@ -139,18 +130,18 @@ pub struct ConstructionReport {
 /// canonical input ordering belong to the enclosing forest preparation stage.
 ///
 /// The rotation seed must be the target Logical Index's persisted seed. Options
-/// must be sealed in the enclosing build descriptor.
+/// must be sealed in the enclosing build descriptor. Dimension, metric and
+/// occupancy bounds come only from the immutable Index Configuration.
 pub fn construct_tree(
     directory: &Path,
-    dimension: usize,
-    metric: Metric,
+    config: &IndexConfig,
     rotation_seed: [u8; 32],
     options: ConstructionOptions,
     records: impl IntoIterator<Item = Result<ConstructionRecord>>,
     mut emit: impl FnMut(PartitionPlan) -> Result<()>,
 ) -> Result<ConstructionReport> {
-    let kernel = VectorKernel::new(dimension, metric, rotation_seed)?;
-    let resident_rows = options.resident_rows(dimension)?;
+    let resident_rows = options.resident_rows(config)?;
+    let kernel = VectorKernel::new(config.dimension(), config.metric(), rotation_seed)?;
     fs::create_dir(directory).map_err(|error| Error::with_source(ErrorKind::Backend, error))?;
     let mut work = Workspace {
         directory: directory.to_owned(),
@@ -158,6 +149,7 @@ pub fn construct_tree(
         bytes: 0,
         report: ConstructionReport::default(),
         options,
+        config,
         kernel,
         resident_rows,
     };
@@ -177,7 +169,7 @@ pub fn construct_tree(
     let mut level = 1;
     let mut input = input;
     loop {
-        if input.count <= u64::from(options.max_partition_entries) {
+        if input.count <= u64::from(config.max_partition_entries(level)) {
             // The complete level fits in the root. It has no parent run, and
             // its input is already canonical, so emit it directly from disk.
             let mut reader = work.reader(&input)?;
@@ -304,7 +296,8 @@ impl Input {
 
 /// Owns construction scratch files and accounts their overlap against the shared disk ceiling.
 /// The resident-row limit determines when a group can switch to the in-memory path.
-struct Workspace {
+struct Workspace<'a> {
+    config: &'a IndexConfig,
     directory: PathBuf,
     next_file: u64,
     bytes: u64,
@@ -314,7 +307,7 @@ struct Workspace {
     resident_rows: usize,
 }
 
-impl Workspace {
+impl Workspace<'_> {
     fn writer(&mut self) -> Result<Output> {
         let path = self.directory.join(format!("{:016x}.run", self.next_file));
         self.next_file = self
@@ -477,7 +470,7 @@ impl Workspace {
         parents: &mut Output,
         emit: &mut impl FnMut(PartitionPlan) -> Result<()>,
     ) -> Result<()> {
-        if rows.len() <= self.options.max_partition_entries as usize {
+        if rows.len() <= self.config.max_partition_entries(level) as usize {
             rows.sort_unstable_by(|a, b| a.id.cmp(&b.id));
             let count = rows.len() as u64;
             return self.emit_partition(
@@ -508,13 +501,13 @@ impl Workspace {
                 (row.id.clone(), row.vector.clone())
             })
             .collect();
-        let centers = self.multi_centers(entries, rows.len() as u64)?;
+        let centers = self.multi_centers(entries, rows.len() as u64, level)?;
         let mut counts = vec![0; centers.len()];
         for row in rows.iter_mut() {
             row.label = self.nearest(&row.vector, &centers);
             counts[row.label] += 1;
         }
-        let sizes = group_sizes(&counts, u64::from(self.options.min_partition_entries));
+        let sizes = group_sizes(&counts, u64::from(self.config.min_partition_entries(level)));
         drop(centers);
         // Cutting the total (center label, ID) order selects exact memberships
         // without sorting each slice. Recursive training reorders its sample,
@@ -551,7 +544,7 @@ impl Workspace {
             self.remove(input)?;
             return self.resident_group(&mut rows, level, parents, emit);
         }
-        if input.count <= u64::from(self.options.max_partition_entries) {
+        if input.count <= u64::from(self.config.max_partition_entries(level)) {
             // Stable scatters preserve canonical ID order for streamed means.
             let mut reader = self.reader(&input)?;
             self.emit_partition(
@@ -586,14 +579,14 @@ impl Workspace {
             .into_iter()
             .map(|item| (item.row.id, item.row.vector))
             .collect();
-        let centers = self.multi_centers(entries, input.count)?;
+        let centers = self.multi_centers(entries, input.count, level)?;
         let mut counts = vec![0; centers.len()];
         let mut reader = self.reader(&input)?;
         while let Some(row) = reader.next()? {
             counts[self.nearest(&row.vector, &centers)] += 1;
         }
         drop(reader);
-        let sizes = group_sizes(&counts, u64::from(self.options.min_partition_entries));
+        let sizes = group_sizes(&counts, u64::from(self.config.min_partition_entries(level)));
         let mut end = 0;
         let ends: Vec<_> = sizes
             .iter()
@@ -684,10 +677,11 @@ impl Workspace {
         &self,
         mut entries: Vec<(Bytes, Box<[f32]>)>,
         n: u64,
+        level: u32,
     ) -> Result<Vec<Box<[f32]>>> {
         // Bound in u64 before converting so all platforms select the same fanout.
         let desired = n
-            .div_ceil(u64::from(self.options.max_partition_entries))
+            .div_ceil(u64::from(self.config.max_partition_entries(level)))
             .min(8) as usize;
         let k = entries.len().min(desired).max(2);
         // Heap iteration and resident slice order may differ. Canonical sample
@@ -778,7 +772,7 @@ impl Workspace {
 fn group_sizes(counts: &[u64], min: u64) -> Vec<u64> {
     let n: u64 = counts.iter().sum();
     // This is a recursion bound, not the final partition size: oversized
-    // children are split again until they meet max_partition_entries. Even
+    // children are split again until they meet the level's maximum occupancy. Even
     // identical vectors concentrated in one center must make strict progress.
     let max = n - n.div_ceil(4);
     let mut natural_end = 0;
@@ -833,6 +827,7 @@ impl Ord for Sample {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::Metric;
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
@@ -908,10 +903,17 @@ mod tests {
         }
     }
 
+    fn config(dimension: usize, metric: Metric) -> IndexConfig {
+        IndexConfig::new(dimension, metric)
+            .unwrap()
+            .with_leaf_partition_entries(2, 4)
+            .unwrap()
+            .with_internal_partition_entries(2, 4)
+            .unwrap()
+    }
+
     fn options() -> ConstructionOptions {
         ConstructionOptions {
-            min_partition_entries: 2,
-            max_partition_entries: 4,
             sample_items: 4,
             memory_bytes: 200_000,
             scratch_bytes: 16 * 1024 * 1024,
@@ -937,11 +939,11 @@ mod tests {
     fn build(
         input: Vec<Result<ConstructionRecord>>,
         options: ConstructionOptions,
-        metric: Metric,
+        config: &IndexConfig,
     ) -> (ConstructionReport, BTreeMap<u64, PartitionPlan>) {
         let dir = Directory::new();
         let mut plans = BTreeMap::new();
-        let report = construct_tree(&dir.0, 2, metric, [7; 32], options, input, |plan| {
+        let report = construct_tree(&dir.0, config, [7; 32], options, input, |plan| {
             assert!(plans.insert(plan.key.get(), plan).is_none());
             Ok(())
         })
@@ -956,6 +958,92 @@ mod tests {
     }
 
     #[test]
+    fn independent_capacities_preserve_leaf_layout_across_internal_grouping_and_spill() {
+        for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
+            let mut expected_leaves = None;
+            let mut root_levels = Vec::new();
+            for internal_maximum in [2, 8, 128] {
+                let mut options = options();
+                let config = config(2, metric)
+                    .with_internal_partition_entries(1, internal_maximum)
+                    .unwrap();
+                // Force streaming, then permit resident grouping. The selected
+                // path must not let internal capacity alter leaf assignments.
+                let row_bytes = 2 * 4 + MAX_ID_BYTES + ROW_OVERHEAD_BYTES;
+                let reserved =
+                    row_bytes * options.sample_items.max(internal_maximum as usize).max(4) * 8
+                        + 16 * BUFFER_BYTES
+                        + 2 * 4;
+                for memory in [reserved + row_bytes * 2, 4 * 1024 * 1024] {
+                    options.memory_bytes = memory;
+                    let (_, plans) = build(
+                        records(129, false)
+                            .into_iter()
+                            .map(|row| {
+                                row.map(|mut row| {
+                                    row.vector[0] += 1.0;
+                                    row
+                                })
+                            })
+                            .collect(),
+                        options,
+                        &config,
+                    );
+                    let mut leaves = Vec::new();
+                    for (&key, plan) in &plans {
+                        assert!(
+                            plan.entries.len() <= config.max_partition_entries(plan.level) as usize
+                        );
+                        if key != 1 {
+                            assert!(
+                                plan.entries.len()
+                                    >= config.min_partition_entries(plan.level) as usize
+                            );
+                        }
+                        if plan.level == 1 {
+                            leaves.push((
+                                key,
+                                plan.centroid
+                                    .iter()
+                                    .map(|v| v.to_bits())
+                                    .collect::<Vec<_>>(),
+                                plan.entries.clone(),
+                            ));
+                        }
+                    }
+                    if let Some(expected) = &expected_leaves {
+                        assert_eq!(&leaves, expected);
+                    } else {
+                        expected_leaves = Some(leaves);
+                    }
+                    root_levels.push(plans[&1].level);
+                }
+            }
+            assert!(root_levels[0] > root_levels[4]);
+            assert_eq!(root_levels[4], 2);
+        }
+    }
+
+    #[test]
+    fn root_fit_uses_its_level_and_keeps_the_minimum_exception() {
+        let config = config(2, Metric::L2)
+            .with_leaf_partition_entries(3, 6)
+            .unwrap();
+        for count in [1, 2, 6, 7, 25] {
+            let (_, plans) = build(records(count, false), options(), &config);
+            assert_eq!(plans[&1].level == 1, count <= 6);
+            for (&key, plan) in &plans {
+                assert!(plan.entries.len() <= config.max_partition_entries(plan.level) as usize);
+                if key != 1 {
+                    assert!(
+                        plan.entries.len() >= config.min_partition_entries(plan.level) as usize
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn bottom_up_topology_has_exact_membership_for_all_metrics() {
         for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
             for equal in [false, true] {
@@ -964,7 +1052,7 @@ mod tests {
                 if !equal {
                     input[0].as_mut().unwrap().vector[0] = 0.1;
                 }
-                let (report, plans) = build(input, options(), metric);
+                let (report, plans) = build(input, options(), &config(2, metric));
                 assert_eq!(report.records, 101);
                 assert_eq!(report.partitions, plans.len() as u64);
                 assert_eq!(report.partition_high_water, report.partitions);
@@ -1016,8 +1104,7 @@ mod tests {
                 let mut plans = BTreeMap::new();
                 construct_tree(
                     &directory.0,
-                    7,
-                    metric,
+                    &config(7, metric),
                     [7; 32],
                     settings,
                     input.into_iter().map(Ok),
@@ -1051,14 +1138,22 @@ mod tests {
             while low < high {
                 let middle = low + (high - low) / 2;
                 constrained.memory_bytes = middle;
-                if constrained.resident_rows(dimension).is_ok() {
+                if constrained
+                    .resident_rows(&config(dimension, Metric::L2))
+                    .is_ok()
+                {
                     high = middle;
                 } else {
                     low = middle + 1;
                 }
             }
             constrained.memory_bytes = low;
-            assert_eq!(constrained.resident_rows(dimension).unwrap(), 1);
+            assert_eq!(
+                constrained
+                    .resident_rows(&config(dimension, Metric::L2))
+                    .unwrap(),
+                1
+            );
             for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
                 let make = |memory| {
                     let directory = Directory::new();
@@ -1084,8 +1179,7 @@ mod tests {
                     let mut plans = BTreeMap::new();
                     let report = construct_tree(
                         &directory.0,
-                        dimension,
-                        metric,
+                        &config(dimension, metric),
                         [7; 32],
                         settings,
                         records.into_iter().map(Ok),
@@ -1120,10 +1214,10 @@ mod tests {
 
     #[test]
     fn empty_single_root_and_quotas() {
-        let (empty, plans) = build(vec![], options(), Metric::L2);
+        let (empty, plans) = build(vec![], options(), &config(2, Metric::L2));
         assert_eq!(empty.records, 0);
         assert!(plans.is_empty());
-        let (_, plans) = build(records(1, true), options(), Metric::L2);
+        let (_, plans) = build(records(1, true), options(), &config(2, Metric::L2));
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[&1].level, 1);
 
@@ -1132,8 +1226,7 @@ mod tests {
         bounded.scratch_bytes = 50;
         let error = construct_tree(
             &dir.0,
-            2,
-            Metric::L2,
+            &config(2, Metric::L2),
             [7; 32],
             bounded,
             records(4, true),
@@ -1163,7 +1256,7 @@ mod tests {
                 .collect();
             let mut bounded = options();
             bounded.sample_items = 2;
-            let (_, plans) = build(input, bounded, metric);
+            let (_, plans) = build(input, bounded, &config(2, metric));
             for plan in plans.values() {
                 let members: Vec<_> = plan
                     .entries
@@ -1200,8 +1293,7 @@ mod tests {
         fs::write(dir.0.join("sentinel"), b"caller data").unwrap();
         let error = construct_tree(
             &dir.0,
-            2,
-            Metric::L2,
+            &config(2, Metric::L2),
             [7; 32],
             options(),
             records(1, true),
@@ -1218,9 +1310,14 @@ mod tests {
             .into_iter()
             .chain([Err(Error::new(ErrorKind::Cancelled))]);
         assert_eq!(
-            construct_tree(&dir.0, 2, Metric::L2, [7; 32], options(), input, |_| {
-                panic!("incomplete source cannot emit")
-            })
+            construct_tree(
+                &dir.0,
+                &config(2, Metric::L2),
+                [7; 32],
+                options(),
+                input,
+                |_| { panic!("incomplete source cannot emit") }
+            )
             .unwrap_err()
             .kind(),
             ErrorKind::Cancelled
@@ -1230,8 +1327,7 @@ mod tests {
         let mut emitted = 0;
         let error = construct_tree(
             &dir.0,
-            2,
-            Metric::L2,
+            &config(2, Metric::L2),
             [7; 32],
             options(),
             records(20, true),
@@ -1253,16 +1349,32 @@ mod tests {
     fn invalid_options_and_vectors_fail_before_emitting_plans() {
         let mut large_budget = options();
         large_budget.memory_bytes = usize::MAX;
-        let (_, plans) = build(records(1, true), large_budget, Metric::L2);
+        let (_, plans) = build(records(1, true), large_budget, &config(2, Metric::L2));
         assert_eq!(plans.len(), 1);
         let dir = Directory::new();
+        let invalid_config = config(2, Metric::L2)
+            .with_tree_key_fields(vec![crate::api::FieldId(0)])
+            .unwrap();
+        assert_eq!(
+            construct_tree(
+                &dir.0,
+                &invalid_config,
+                [7; 32],
+                options(),
+                records(1, true),
+                |_| panic!("invalid config")
+            )
+            .unwrap_err()
+            .kind(),
+            ErrorKind::InvalidArgument
+        );
+        assert!(!dir.0.exists());
         let mut invalid = options();
         invalid.memory_bytes = 1;
         assert_eq!(
             construct_tree(
                 &dir.0,
-                2,
-                Metric::L2,
+                &config(2, Metric::L2),
                 [7; 32],
                 invalid,
                 records(1, true),
@@ -1282,8 +1394,7 @@ mod tests {
             assert_eq!(
                 construct_tree(
                     &dir.0,
-                    2,
-                    Metric::Cosine,
+                    &config(2, Metric::Cosine),
                     [7; 32],
                     options(),
                     input,
@@ -1307,8 +1418,6 @@ mod tests {
             })
             .collect();
         let mut settings = ConstructionOptions {
-            min_partition_entries: 3,
-            max_partition_entries: 10,
             sample_items: 27,
             ..options()
         };
@@ -1335,7 +1444,15 @@ mod tests {
                     })
                 })
                 .collect();
-            let (_, plans) = build(input, settings, Metric::L2);
+            let (_, plans) = build(
+                input,
+                settings,
+                &config(2, Metric::L2)
+                    .with_leaf_partition_entries(3, 10)
+                    .unwrap()
+                    .with_internal_partition_entries(3, 10)
+                    .unwrap(),
+            );
             let leaves = plans
                 .values()
                 .filter(|plan| plan.level == 1)
@@ -1371,13 +1488,22 @@ mod tests {
         let build = |row_capacity| {
             let directory = Directory::new();
             let options = ConstructionOptions {
-                min_partition_entries: 1,
-                max_partition_entries: 2,
                 sample_items: 2,
                 memory_bytes: reserved + row_capacity * row_bound,
                 scratch_bytes: 64 * 1024 * 1024,
             };
-            assert_eq!(options.resident_rows(dimension).unwrap(), row_capacity);
+            assert_eq!(
+                options
+                    .resident_rows(
+                        &config(dimension, Metric::Cosine)
+                            .with_leaf_partition_entries(1, 2)
+                            .unwrap()
+                            .with_internal_partition_entries(1, 2)
+                            .unwrap()
+                    )
+                    .unwrap(),
+                row_capacity
+            );
             let records = (0_u64..33).map(|id| {
                 Ok(ConstructionRecord {
                     id: Bytes::copy_from_slice(&id.to_be_bytes()),
@@ -1390,8 +1516,11 @@ mod tests {
             let mut members = BTreeSet::new();
             construct_tree(
                 &directory.0,
-                dimension,
-                Metric::Cosine,
+                &config(dimension, Metric::Cosine)
+                    .with_leaf_partition_entries(1, 2)
+                    .unwrap()
+                    .with_internal_partition_entries(1, 2)
+                    .unwrap(),
                 [7; 32],
                 options,
                 records,

@@ -20,6 +20,20 @@ At most the configured foreground operation limit may run and the same number
 may wait for admission; further calls fail with `LimitExceeded` rather than
 creating an unbounded process-local queue.
 
+Graph routing has a separate per-query working-byte ceiling configured by
+`RuntimeConfig::with_routing_working_bytes`; its accounting contract belongs to
+[Search](search.md#graph-index-bodies). Native restore and query tasks, including offline graph verification, use
+the same cooperative CPU-task boundary as refinement. Foreground admission remains
+owned until those tasks actually exit, including when an awaiting future is
+dropped. Cache retention capacity does not bound such in-flight ownership.
+
+Local graph maintenance uses that working-byte ceiling for each complete
+multi-partition preparation. A Runtime-owned `GraphMaintenance` bounds native
+preparations by maintenance-worker count and retains its permit through CPU exit
+after cancellation. Workers also bound the snapshot plans waiting for native
+admission. Explicit low-level callers reuse one admission owner and bound their
+own concurrent drivers; an executor alone does not bound callers' waiting plans.
+
 ## 2. Shutdown
 
 Shutdown is idempotent:
@@ -81,7 +95,9 @@ millisecond difference is reported in seconds. Tokio monotonic time controls dea
 `stalled_timeout` is the minimum age of a persisted `Splitting`,
 `DrainingSplit`, or `Merging` state before an independently rediscovered Fixup
 may assist it. Its default is
-`max(1 ms, 1 s * max_partition_entries / 128)`; overrides must be positive.
+`max(1 ms, 1 s * level_maximum / 128)`, selecting the leaf maximum at level 1
+and the internal maximum above it; explicit overrides apply to both and must
+be positive.
 The worker checks `now - started >= timeout` in its existing authority read,
 after process-local queue deduplication. Ready threshold crossings start
 immediately. A progressing worker, including one yielded to the queue tail,
@@ -142,7 +158,28 @@ deadline, and cancellation bounds:
 - one Record Location and Leaf Entry per Vector Record and no dangling entries;
 - Leaf Entry field/code agreement with the Vector Record;
 - conservative synopsis contents recomputed from leaf entries;
-- allocator high-water marks and ownership ranges.
+- allocator high-water marks and ownership ranges;
+- for graph-enabled indexes, every nonempty internal partition's complete graph and
+  every non-root centroid's agreement with its incoming Child Entry.
+
+Graph-body verification consumes the same ordered scan, independently of search
+routing and cache contents. It restores one graph at a time through the existing
+graph-body decoder: Header/source binding, child ordinals, chunk coverage and
+checksum, native topology, and local reachability are checked together. Leaf or
+ownerless graphs, and graphs in indexes without graph configuration, are invalid.
+Empty internal bodies have no graph; legal non-Ready states remain verifiable.
+The root needs no stored centroid because it has no incoming projection.
+Per-tree canonical centroid fingerprints join projections without retaining a
+second tree of vectors; topology ownership remains in the ordinary tree ledger.
+
+All retained children, chunks, projection joins, kernel construction, and native
+restore scratch share VerifyOptions' memory ceiling. Exhaustion returns an
+incomplete report, while cancellation and deadline errors propagate from native
+validation. The audit neither uses the routing cache nor populates it. Missing
+mandatory graphs or centroids report Reachability; malformed graph bodies or
+source bindings report InvalidEncoding; wrong graph ownership and divergent
+centroid projections report Membership. Generic codec failures retain their
+existing InvalidEncoding classification.
 
 The complete report also exposes audited Tree Manifest count, Partition Header
 count, maximum tree level, Partition Header and exact entry counts by level,

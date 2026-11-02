@@ -72,7 +72,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let started = Instant::now();
     let source = InputSnapshot::create(
         &output.join("source"),
-        IndexConfig::new(DIMENSION, Metric::L2)?.with_partition_entries(64, 256)?,
+        IndexConfig::new(DIMENSION, Metric::L2)?
+            .with_leaf_partition_entries(64, 256)?
+            .with_internal_partition_entries(64, 256)?,
         64 * 1024 * 1024 * 1024,
         Source {
             reader: BufReader::new(File::open(dataset.join("sift_base.fvecs"))?),
@@ -97,8 +99,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "sift",
             &source,
             ConstructionOptions {
-                min_partition_entries: 64,
-                max_partition_entries: 256,
                 sample_items: 256,
                 memory_bytes: 256 * 1024 * 1024,
                 scratch_bytes: 64 * 1024 * 1024 * 1024,

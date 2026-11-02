@@ -70,7 +70,7 @@ An asynchronous topology change such as splitting or merging partitions that pre
 _Avoid_: Foreground mutation, rebuild
 
 **Split Threshold**:
-The configured Leaf Partition entry count that makes a Ready partition actionable for split without synchronously limiting its size.
+The configured entry count for a partition's level (leaf or internal) that makes a Ready partition actionable for split without synchronously limiting its size.
 _Avoid_: Hard partition limit, target partition size
 
 **Balanced Binary K-means Split**:
@@ -89,8 +89,16 @@ _Avoid_: Shard, bucket
 A searchable derived projection of one Vector Record within a Leaf Partition.
 _Avoid_: Vector Record, search result
 
+**Local Graph Index**:
+A Logical Index with partition-local HNSW graphs maintained atomically with
+internal membership changes. Foreground writes score internal bodies below 1024
+nodes exactly and use local HNSW at or above 1024 nodes, retaining the configured
+write beam and exact membership/fencing guarantees.
+Empty internal bodies have no graph; nonempty bodies in every searchable
+topology state have one snapshot-bound graph.
+
 **Child Entry**:
-An internal-partition entry containing one child Partition Key and its centroid projection. The projection is immutable while serving; offline refinement replaces it atomically with the child centroid.
+An internal-partition entry containing one child Partition Key and its centroid projection. Replacing the projection updates the child centroid atomically, together with the parent graph when configured.
 _Avoid_: Parent pointer, Leaf Entry
 
 **Filter Predicate**:

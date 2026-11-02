@@ -173,7 +173,10 @@ depth 64, and 1,024 values per `IN`.
 ### 4.1 Index configuration
 
 `IndexConfig` persists dimension, metric, ordered fields, ordered unique
-non-null Tree Key FieldIds, and minimum/maximum partition entries. Limits are:
+non-null Tree Key FieldIds, and independent leaf/internal minimum and maximum
+partition entries. `with_leaf_partition_entries` and
+`with_internal_partition_entries` set each pair; all four values participate in
+immutable identity comparisons. Limits are:
 
 | Item | Contract |
 | --- | --- |
@@ -181,10 +184,34 @@ non-null Tree Key FieldIds, and minimum/maximum partition entries. Limits are:
 | Fields | at most 16 |
 | Bloom-enabled fields | at most 4 |
 | Encoded Tree Key | schema worst case at most 8 KiB |
-| Partition entries | `1 <= min`, `2 * min <= max <= 65,536`; defaults 64/512 |
+| Leaf partition capacity pair | `1 <= min`, `2 * min <= max <= 65,536`; defaults 16/128 |
+| Internal partition capacity pair | `1 <= min <= 128`, `2 * min <= max <= 16,384`; defaults 64/16384 |
+
+Level 1 selects leaf bounds; higher levels select internal bounds, including
+roots. Roots are exempt from minimum occupancy. Maxima are asynchronous split
+thresholds during online mutation and hard occupancy bounds for settled offline
+construction/refinement. Leaves default to 16/128 to bound member scans; internal
+partitions default to 64/16384 to support wide routing nodes. Enabling local
+graphs does not change these capacity pairs.
 
 RaBitQ7, online split arity, Lloyd rounds, rotation algorithm, logical codecs, and
 hard safety caps are defined by the Persistent Format.
+
+`IndexConfig::with_local_graph(LocalGraphConfig)` enables partition-local graphs
+for ordinary empty-index creation or Bulk Build. `local_graph()` returns the
+optional persisted construction parameters. Graph-enabled indexes support writes
+and maintenance after publication. Query routing is selected independently;
+foreground writes use exact scoring below 1024 children and local HNSW at or
+above 1024, selected from each snapshot Header count. Both retain the configured
+write beam and exact membership/fencing guarantees; see
+[foreground routing](maintenance.md#1-foreground-mutation-protocol).
+
+Local graph maintenance prepares native graphs outside transactions using one
+shared Runtime admission owner. Explicit low-level maintenance uses
+`maintenance::graph_topology::advance` with a reused `runtime::GraphMaintenance`
+owner; graph-unaware split/merge entrypoints reject graph-changing steps.
+The routing working-byte limit also bounds one complete maintenance preparation,
+including all participating source and proposed bodies and retained output.
 
 ### 4.2 Runtime configuration
 
@@ -233,11 +260,20 @@ the leaf-level base beam width per request; the beam is a traversal-quality
 knob, not an accounted budget dimension, and the visited-partition budget still
 bounds the work it schedules.
 
+`SearchOptions::with_routing_mode` selects `RoutingMode::Exact` (default) or
+`RoutingMode::PartitionLocalHnsw { ef_search }`. The latter requires a graph-enabled
+index and positive `ef_search`; invalid selections return `InvalidArgument`
+before foreground admission, including for empty indexes. The enum carries no
+HNSW-only field in Exact mode. Leaf-only graph indexes accept either mode and
+perform no graph work. The local graph uses `min(n, max(ef_search, B))`, where
+`n` is the parent size and `B` is the next-level beam. No routing mode changes
+the rerank budget.
+
 Leaf Entry scans have no separate budget; all entries in an admitted leaf are
 considered. Their usage is reported with a 64-bit counter and no exhaustion flag.
 
-`SearchOutcome` contains ordered Search Hits, logical search work, an exhaustive
-set of exhausted dimensions, and `rabitq_overlap_truncated`. A hit contains only
+`SearchOutcome` contains ordered Search Hits, logical search work, and the full
+set of exhausted dimensions. A hit contains only
 Record ID and exact f64 distance. Payload and stored fields are loaded through
 get/batch_get rather than search.
 
@@ -303,6 +339,10 @@ and settled Ready topology, before serving. The caller must exclude all other
 index operations, including maintenance from other runtimes, until it returns.
 Local queued or running fixups and non-Ready topology are rejected; idle Runtime
 workers may remain running.
+
+It rejects graph-enabled indexes with `InvalidArgument`: serving refinement does
+not implement graph-aware centroid publication. Use optional artifact refinement
+before initial graph construction.
 
 `RefineOptions::new(input_bytes)` requires a positive input byte limit and defaults
 to two rounds. Builders accept `with_refinement_rounds(0..=5)` and

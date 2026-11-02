@@ -249,10 +249,16 @@ impl Harness {
             (directive.arg("min-entries"), directive.arg("max-entries"))
         {
             config = config
-                .with_partition_entries(
+                .with_leaf_partition_entries(
                     minimum.parse().expect("min-entries"),
                     maximum.parse().expect("max-entries"),
                 )
+                .and_then(|config| {
+                    config.with_internal_partition_entries(
+                        minimum.parse().expect("min-entries"),
+                        maximum.parse().expect("max-entries"),
+                    )
+                })
                 .expect("valid partition entries");
         }
         let backend_config = TestConfig {
@@ -513,9 +519,7 @@ impl Harness {
                 if !exhausted.is_empty() {
                     out.push_str(&format!("exhausted: {}\n", exhausted.join(" ")));
                 }
-                if outcome.rabitq_overlap_truncated {
-                    out.push_str("truncated: rabitq_overlap\n");
-                }
+
                 out
             }
             Err(error) => format!("error: {:?}\n", error.kind()),
@@ -565,7 +569,7 @@ impl Harness {
             let predicted: Vec<Bytes> = outcome.hits.iter().map(|hit| hit.id().clone()).collect();
             let truth = oracle::truth(&self.model, metric, query, k, &filter);
             total_recall += oracle::recall_ids(&predicted, &truth);
-            if outcome.exhausted != Default::default() || outcome.rabitq_overlap_truncated {
+            if outcome.exhausted != Default::default() {
                 truncated += 1;
             }
             total_partitions += u64::from(outcome.usage.visited_partitions);
@@ -697,7 +701,7 @@ impl Harness {
         if in_flight.is_some() {
             return in_flight;
         }
-        let maximum = manifest.config().max_partition_entries();
+        let maximum = manifest.config().max_leaf_partition_entries();
         listing
             .into_iter()
             .filter(|(key, _, header)| {
@@ -847,7 +851,7 @@ impl Harness {
         if in_flight.is_some() {
             return in_flight;
         }
-        let minimum = manifest.config().min_partition_entries();
+        let minimum = manifest.config().min_leaf_partition_entries();
         listing
             .into_iter()
             .filter(|(key, partition, header)| {

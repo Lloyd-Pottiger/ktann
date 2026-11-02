@@ -62,7 +62,7 @@ fn immutable_configuration_enforces_schema_contract() -> ktann::api::Result<()> 
             .clone()
             .with_tree_key_fields(vec![FieldId(0), FieldId(0)]),
     );
-    assert_invalid(config.with_partition_entries(65_536, 65_536));
+    assert_invalid(config.with_leaf_partition_entries(65_536, 65_536));
 
     let tree_keys_first = IndexConfig::new(4, Metric::L2)?
         .with_tree_key_fields(vec![FieldId(0)])?
@@ -277,10 +277,11 @@ fn runtime_and_verify_limits_fail_closed() {
     assert_invalid(RuntimeConfig::default().with_stalled_timeout(std::time::Duration::ZERO));
     let recovery_index = IndexConfig::new(1, Metric::L2)
         .expect("index")
-        .with_partition_entries(1, 128)
+        .with_leaf_partition_entries(1, 128)
+        .and_then(|config| config.with_internal_partition_entries(1, 128))
         .expect("partition bounds");
     assert_eq!(
-        RuntimeConfig::default().stalled_timeout(&recovery_index),
+        RuntimeConfig::default().stalled_timeout(&recovery_index, 1),
         std::time::Duration::from_secs(1),
     );
     let override_timeout = std::time::Duration::from_millis(17);
@@ -288,7 +289,7 @@ fn runtime_and_verify_limits_fail_closed() {
         RuntimeConfig::default()
             .with_stalled_timeout(override_timeout)
             .expect("positive timeout")
-            .stalled_timeout(&recovery_index),
+            .stalled_timeout(&recovery_index, 1),
         override_timeout,
     );
     assert_invalid(RuntimeConfig::default().with_write_beam_size(0));
@@ -380,4 +381,94 @@ fn owned_public_values_are_send_and_sync() {
     assert_send_sync::<SearchRequest>();
     assert_send_sync::<RuntimeConfig>();
     assert_send_sync::<Error>();
+}
+
+#[test]
+fn independent_partition_capacity_bounds_and_recovery_age() {
+    let config = IndexConfig::new(2, Metric::L2).unwrap();
+    assert_eq!(
+        (
+            config.min_leaf_partition_entries(),
+            config.max_leaf_partition_entries()
+        ),
+        (16, 128)
+    );
+    assert_eq!(
+        (
+            config.min_internal_partition_entries(),
+            config.max_internal_partition_entries()
+        ),
+        (64, 16_384)
+    );
+    for (minimum, maximum) in [(0, 2), (2, 3), (1, 65_537), (u32::MAX, u32::MAX)] {
+        assert_invalid(config.clone().with_leaf_partition_entries(minimum, maximum));
+        assert_invalid(
+            config
+                .clone()
+                .with_internal_partition_entries(minimum, maximum),
+        );
+    }
+    for (minimum, maximum) in [(1, 2), (32_768, 65_536)] {
+        let changed = config
+            .clone()
+            .with_leaf_partition_entries(minimum, maximum)
+            .unwrap();
+        assert_eq!(changed.max_internal_partition_entries(), 16_384);
+        changed
+            .with_internal_partition_entries(minimum.min(128), maximum.min(16_384))
+            .unwrap()
+            .validate()
+            .unwrap();
+    }
+    let config = config
+        .with_leaf_partition_entries(1, 128)
+        .unwrap()
+        .with_internal_partition_entries(128, 4096)
+        .unwrap();
+    let runtime = RuntimeConfig::default();
+    assert_eq!(
+        runtime.stalled_timeout(&config, 1),
+        std::time::Duration::from_secs(1)
+    );
+    assert_eq!(
+        runtime.stalled_timeout(&config, 2),
+        std::time::Duration::from_secs(32)
+    );
+    let runtime = runtime
+        .with_stalled_timeout(std::time::Duration::from_millis(17))
+        .unwrap();
+    assert_eq!(
+        runtime.stalled_timeout(&config, 1),
+        runtime.stalled_timeout(&config, 3)
+    );
+}
+
+#[test]
+fn internal_graph_configuration_has_atomic_publication_bounds() {
+    use ktann::api::LocalGraphConfig;
+    for capacity in [8192, 16384] {
+        IndexConfig::new(768, Metric::L2)
+            .unwrap()
+            .with_internal_partition_entries(128, capacity)
+            .unwrap()
+            .validate()
+            .unwrap();
+    }
+    assert_invalid(
+        IndexConfig::new(128, Metric::L2)
+            .unwrap()
+            .with_internal_partition_entries(129, 16384),
+    );
+    assert_invalid(
+        IndexConfig::new(128, Metric::L2)
+            .unwrap()
+            .with_internal_partition_entries(128, 16385),
+    );
+    assert_invalid(LocalGraphConfig::new(17, 200, [0; 32]));
+    LocalGraphConfig::new(16, 200, [0; 32]).unwrap();
+    // Leaf occupancy is independent of the internal routing-graph envelope.
+    IndexConfig::new(128, Metric::L2)
+        .unwrap()
+        .with_leaf_partition_entries(1024, 65536)
+        .unwrap();
 }

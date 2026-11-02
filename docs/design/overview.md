@@ -82,13 +82,15 @@ their physical keyspaces are neither portable nor mutually compatible.
 
 ## 5. Architecture and ownership
 
-The Rust workspace contains four production crates:
+The serving implementation spans the core, three storage adapters and a private
+native graph bridge:
 
 ```text
 ktann/                  public API, algorithms, logical storage and codecs
 ktann-memory/          ephemeral in-process transactional adapter
 ktann-foundationdb/     FoundationDB transaction and physical-key adapter
 ktann-rocksdb/          RocksDB OptimisticTransactionDB adapter
+ktann-usearch/         private USearch topology bridge; KTANN owns vector scoring
 ```
 
 Rust Edition 2024 and the latest stable toolchain are required. Development and
@@ -101,6 +103,7 @@ CI both follow stable. Production code uses no nightly features.
 | [Offline artifacts](bulk-artifacts.md) | input capture, bounded sorting, forest construction, serving artifact assembly |
 | [Storage](storage.md) | backend transaction contract, logical keys/codecs, typed atomic operations, manifests |
 | [Filtering](filtering.md) | predicate semantics, Tree Key range planning, synopsis classification |
+| [Partition-local HNSW](partition-local-hnsw.md) | local graph model, source binding, candidate contract and atomic graph maintenance |
 | [Search](search.md) | numeric semantics, RaBitQ7, traversal, rerank, budgets, cache correctness |
 | [Maintenance](maintenance.md) | foreground routing and mutation protocol, tree shape, split/merge state machines |
 | [Runtime and operations](runtime-operations.md) | admission, retry scheduling, shutdown, observability, verification and validation |
@@ -149,7 +152,7 @@ selects a bounded candidate set; original vectors are loaded and reranked with
 f64 exact distance. Hits sort by `(distance, RecordId)`.
 
 Success may contain fewer than `k` hits. The response reports actual budget
-usage, every exhausted budget dimension, and RaBitQ overlap truncation. It does
+usage and every exhausted budget dimension. It does
 not claim completeness, expose a quality score, or provide continuation state;
 callers may retry the same request with larger caller-controlled traversal
 budgets or a wider beam. Exact-rerank sizing remains engine-owned for `k`.
