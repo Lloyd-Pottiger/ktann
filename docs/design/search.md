@@ -75,82 +75,53 @@ Corruption.
 
 ## 3. Conservative approximate intervals
 
-Production uses a deterministic f64 kernel for rotated query/code dot
-products. Each lane accumulates even and odd components independently,
-combines the two sums, and applies the stored scale once. This shortens the
-addition dependency chain without allocation or a new f32/SIMD rounding term.
-
-Each `q_i * c_i` product is exact in f64: an f32 significand times a six-bit
-integer needs at most 30 significant bits. For dimension `n >= 2`, each term
-encounters at most `ceil(n/2)-1` partial-sum additions, one reduction, and one
-scale multiplication: at most `ceil(n/2)+1 <= n` rounding steps. For `n=1`,
-only the final scale multiplication can round. The same bound therefore
-covers odd dimensions, cancellation, and zero scale.
-
-With unit roundoff `u = 2^-53` and `n <= 16384`, accumulated error is bounded
-by `gamma_n * sum(abs(q_i * x_hat_i))`, where
-`gamma_n = n*u/(1-n*u) <= 2*n*u`. Cauchy–Schwarz bounds the absolute sum by
-`norm(q) * norm(x_hat)`. Thus the computed dot's conservative endpoints are
-`dot ± n*2^-52*norm(q)*norm(x_hat)`, rounded outward. Both norms and the
-error products use upward-rounded bounds; `norm(x_hat)` uses the exact stored
-integer squared code norm and nonnegative stored scale. Finite f32 inputs and
-the dimension limit exclude f64 overflow. Nonzero partial sums are multiples
-of `2^-149`; the final scaled result cannot be smaller than `2^-298`, excluding
-f64 underflow. This numerical roundoff bound is applied before the
-reconstruction-error radius below.
-
-For query `q`, reconstruction `x_hat`, and error upper bound `E`:
-
-| Metric | rough distance `d_hat` | radius `B` |
-| --- | --- | --- |
-| Inner product | `-q dot x_hat` | `norm(q) E` |
-| Cosine | `1 - q dot x_hat` | `norm(q) E` |
-| Squared L2 | `max(0, norm(q)^2 + norm(x_hat)^2 - 2 q dot x_hat)` | `2 sqrt(d_hat) E + E^2` |
-
-The interval is `[d_hat - B, d_hat + B]`; only the squared-L2 lower endpoint is
-clamped to zero. Cosine is not clamped. A future optimized kernel is permitted
-only after its proven rounding bound is added to `B`; tests alone are not a
-substitute for that bound.
-
-### 3.1 Screening against the global rough-distance heap
-
-Once the global heap is full, a cheap integer dot bounds the canonical f64
-rough score. The query is quantized once per search: `s=max(abs(q_i))/127`
-(or 1 for a zero query), and `a_i=clamp(round(q_i/s),-127,127)`. Both `s`
-and the rounded query coefficients are process-local scratch, not persisted data.
-For each stored signed seven-bit code `c`, the integer sum `S=sum(a_i*c_i)`
-is exact: `MAX_DIMENSION*127*63 < i32::MAX`, enforced at compile time.
+Production scores each stored code with one exact integer dot. The rotated
+query is quantized once per search: `L=min(32767, floor(i32::MAX/(63*n)))`,
+`s=max(abs(q_i))/L` (or 1 for a zero query), and
+`a_i=clamp(round(q_i/s),-L,L)`, stored as i16. These components and scale
+are query scratch; the persistent vector codec and exact reranking are unchanged.
+For signed seven-bit stored components `c`, `S=sum(a_i*c_i)` is exact:
+`n*L*63 <= i32::MAX`. The dimension-dependent limit uses the highest
+i16 precision compatible with exact i32 accumulation, avoiding a wider dot
+reduction. It uses one additional scratch byte per query dimension compared
+with i8 screening. The dot estimate
+is `D=(f64(S)*s)*code_scale`, with two f64 multiplications.
 
 Query preparation computes an outward interval for every `q_i-s*a_i` using
 directed multiplication and subtraction. Squaring the largest absolute endpoint,
-summing upward and taking an upward square root gives `E >= ||q-s*a||`.
-Let `Q >= ||q||` be the existing query norm bound and
-`C >= code_scale*sqrt(sum(c_i*c_i))` the decoded code norm bound. Cauchy–Schwarz
-bounds query-quantization error in the scaled dot by `E*C`.
+summing upward and taking an upward square root gives `E_q >= ||q-s*a||`.
+Let `Q >= ||q||` and `C >= code_scale*sqrt(sum(c_i*c_i))`. Cauchy–Schwarz
+bounds query-quantization error by `E_q*C`. Also `||s*a|| <= Q+E_q`, so the
+two final multiplications have rounding error at most
+`2*f64::EPSILON*(Q+E_q)*C` (an upper bound on their gamma factor).
+Thus the dot endpoints are `D ± (E_q + 2*f64::EPSILON*(Q+E_q))*C`,
+computed outward. Finite f32 inputs and the public dimension limit keep the
+nonzero scaled integer products within the normal f64 range.
 
-The canonical reference multiplies f32 query components by small integers in
-f64 exactly, then accumulates and scales in f64. Its additional rounding error
-is bounded by `(n+2)*f64::EPSILON*Q*C`: this exceeds the relevant gamma bound
-for every supported dimension (`n <= 16,384`). All finite f32 components and
-code scales remain far below f64 overflow; integer screening needs no f32
-overflow fallback. Thus a conservative dot upper endpoint is obtained by
-scaling `S` by `s` and `code_scale` with upward rounding, then adding
-`C*(E+(n+2)*f64::EPSILON*Q)`, also with outward rounding.
+For reconstruction `x_hat` and stored reconstruction-error bound `E_x`:
 
-This bound concerns the canonical dot with the *quantized stored code*, not
-reconstruction error against the original vector. IP and cosine transform this
-upper endpoint monotonically into a distance lower bound. L2 uses the same
-rounded constant term as the canonical scorer and subtracts the dot endpoint
-with outward rounding before clamping at zero. A candidate is screened only
-when its lower bound is **strictly greater** than the heap cutoff; ties and
-uncertain bounds receive the unchanged f64 score and reconstruction interval.
+| Metric | rough distance | reconstruction-error radius |
+| --- | --- | --- |
+| Inner product | `-D` | `norm(q) E_x` |
+| Cosine | `1-D` | `norm(q) E_x` |
+| Squared L2 | `max(0, norm(q)^2 + norm(x_hat)^2 - 2D)` | `2 sqrt(d_upper) E_x + E_x^2` |
 
-The cutoff is read once per leaf. The heap's worst score can only decrease,
-so this older cutoff only causes extra refinement. A partially filled heap
-screens nothing. Every eligible ID still participates in duplicate-membership
-validation and memory accounting. The query's one-byte-per-dimension coarse
-buffer is charged to routing working memory. Traversal counts, candidate
-coverage, authoritative rereads, and persistent formats are unchanged.
+Directed norm and dot endpoints first bound distance to the reconstructed vector.
+The reconstruction-error radius then expands those bounds to cover the original
+vector; L2 lower endpoints clamp at zero. `d_upper` is the conservative upper
+endpoint before adding reconstruction error. The rough score need not equal the
+unquantized query/code dot; the interval accounts for both query and stored-vector
+quantization. Final Search Hit distances still use original vectors.
+
+### 3.1 Admission against the global rough-distance heap
+
+Each eligible entry is scored once. A full heap rejects a rough score strictly
+greater than its current worst rough score before constructing its interval.
+Equality remains eligible for Record ID tie-breaking. Successful admissions can
+only improve the cutoff; the next entry uses the updated value. This admission
+rule is exactly the same rough-score top-budget policy as full scoring and
+sorting, without a second dot, separate screening bound, or batch scratch.
+Every eligible identity is still registered for duplicate-membership detection.
 
 ## 4. Tree Key enumeration
 
@@ -244,7 +215,7 @@ Location against authoritative records from the same snapshot. Expanded RaBitQ
 codes are not retained by candidate references. Eviction immediately releases a
 source array when its last candidate leaves the heap.
 
-The pool scores eligible entries in fixed-size batches and admits them directly,
+The pool scores eligible entries individually and admits them directly,
 without per-leaf candidate or screened-ID buffers. Every eligible Record ID is
 registered once in a separate compact list, including screened, rejected, and
 evicted entries. Only admitted heap candidates require an additional ID reference.
@@ -318,9 +289,8 @@ entries arrive. Storage validation and the subsequent expansion remain separate
 passes, and complete body counts are checked before publication. Cached Record
 IDs own their bytes so they cannot keep the old encoded buffer alive. Cache
 accounting charges the shared expanded allocation once at the body owner, in
-addition to entry-owned data and the body envelope. Scoring keeps
-the scalar-f64 accumulation order and the same conservative interval arithmetic;
-the persistent RaBitQ7 format is unchanged.
+addition to entry-owned data and the body envelope. Scoring uses the integer query/code dot and conservative intervals described
+above; the persistent RaBitQ7 format is unchanged.
 
 Entries are immutable and never pinned. Concurrent misses may duplicate work and
 race to publish an equal or newer epoch; there is no waiter/cancellation state.

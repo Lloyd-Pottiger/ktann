@@ -367,7 +367,7 @@ fn packed_scores_match_expanded_reference_at_layout_and_numeric_boundaries() {
 }
 
 #[test]
-fn interleaved_scores_preserve_scalar_bits_at_numeric_and_layout_boundaries() {
+fn decoded_scores_preserve_packed_bits_at_numeric_and_layout_boundaries() {
     let values = [
         0.0,
         -0.0,
@@ -417,7 +417,7 @@ fn interleaved_scores_preserve_scalar_bits_at_numeric_and_layout_boundaries() {
             .each_ref()
             .map(|payload| RaBitQ7::decode(payload, dimension).unwrap());
         // Keep distinct entries in one body allocation; offsets must remain valid
-        // after every append and both four-lane and scalar scoring must agree.
+        // after every append and packed and decoded scoring must agree.
         let mut components_buffer = Vec::with_capacity(4 * dimension);
         let decoded = payloads.each_ref().map(|payload| {
             super::DecodedRaBitQ7::append_validated_leaf_bytes(
@@ -430,48 +430,44 @@ fn interleaved_scores_preserve_scalar_bits_at_numeric_and_layout_boundaries() {
         let decoded = decoded.each_ref().map(|code| code.view(&components_buffer));
         for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
             let query = RaBitQQuery::new(&components, metric).unwrap();
-            let distances =
-                super::DecodedRaBitQ7::approximate_distances(decoded.each_ref(), &query).unwrap();
-            for (lane, (code, distance)) in codes.iter().zip(distances).enumerate() {
-                let scalar = code.approximate_distance(&query).unwrap();
-                assert_distance_bits_equal(distance, scalar);
-                let [single] =
-                    super::DecodedRaBitQ7::approximate_distances([&decoded[lane]], &query).unwrap();
-                assert_distance_bits_equal(single, scalar);
+            for (code, decoded) in codes.iter().zip(&decoded) {
+                let distance = decoded.score(&query, None).unwrap().unwrap();
+                let packed = code.approximate_distance(&query).unwrap();
+                assert_distance_bits_equal(distance, packed);
             }
         }
     }
 }
 
+/// Long, same-sign dots exercise the accumulation limit without cancellation.
 #[test]
-fn interleaved_scores_reject_a_dimension_mismatch_in_every_lane() {
-    let matching = RaBitQ7::quantize(&[1.0, -1.0]).unwrap();
-    let short = RaBitQ7::quantize(&[1.0]).unwrap();
+fn integer_scores_cover_maximum_partial_sums() {
+    for dimension in [1, 1032, 1033, 1041, MAX_DIMENSION] {
+        for code in [-63, 63] {
+            let encoded = independently_encode_payload(&vec![code; dimension], 1.0, 0.0);
+            let components = vec![f32::MAX; dimension];
+            assert_validated_packed_parity(&encoded, &components);
+            assert_exact_reconstructed_dot(&encoded, &components);
+        }
+    }
+}
+
+#[test]
+fn decoded_scores_reject_dimension_mismatch_even_with_a_cutoff() {
+    let payload = RaBitQ7::quantize(&[1.0]).unwrap();
     let query = RaBitQQuery::new(&[1.0, -1.0], Metric::L2).unwrap();
-    for mismatched_lane in 0..4 {
-        let mut components = Vec::new();
-        let codes: [_; 4] = std::array::from_fn(|lane| {
-            let (payload, dimension) = if lane == mismatched_lane {
-                (&short, 1)
-            } else {
-                (&matching, 2)
-            };
-            super::DecodedRaBitQ7::append_validated_leaf_bytes(payload, dimension, &mut components)
-        });
-        let codes = codes.each_ref().map(|code| code.view(&components));
+    let mut components = Vec::new();
+    let code = super::DecodedRaBitQ7::append_validated_leaf_bytes(&payload, 1, &mut components);
+    for cutoff in [None, Some(-f64::MAX)] {
         assert_kind(
-            super::DecodedRaBitQ7::approximate_distances(codes.each_ref(), &query),
-            ErrorKind::InvalidArgument,
-        );
-        assert_kind(
-            super::DecodedRaBitQ7::rough_lower_bounds(codes.each_ref(), &query),
+            code.view(&components).score(&query, cutoff),
             ErrorKind::InvalidArgument,
         );
     }
 }
 
 #[test]
-fn screening_bounds_cover_reference_scores_at_numeric_boundaries() {
+fn integer_cutoff_preserves_equal_scores_at_numeric_boundaries() {
     for dimension in [1, 2, 3, 4, 7, 8, 17, 65, 768, MAX_DIMENSION] {
         let signed: Vec<i8> = (0..dimension)
             .map(|i| ((i * 37) % 127) as i8 - 63)
@@ -496,18 +492,15 @@ fn screening_bounds_cover_reference_scores_at_numeric_boundaries() {
             let codes = decoded.each_ref().map(|code| code.view(&buffer));
             for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
                 let query = RaBitQQuery::new(&components, metric).unwrap();
-                let lower =
-                    super::DecodedRaBitQ7::rough_lower_bounds(codes.each_ref(), &query).unwrap();
-                let reference =
-                    super::DecodedRaBitQ7::approximate_distances(codes.each_ref(), &query).unwrap();
-                for (lower, reference) in lower.into_iter().zip(reference) {
+                for code in &codes {
+                    let distance = code.score(&query, None).unwrap().unwrap();
+                    assert!(distance.rough().is_finite());
+                    let equal = code.score(&query, Some(distance.rough())).unwrap().unwrap();
+                    assert_distance_bits_equal(equal, distance);
                     assert!(
-                        lower <= reference.rough(),
-                        "dim={dimension}, magnitude={magnitude}, metric={metric:?}"
-                    );
-                    assert!(
-                        lower.is_finite(),
-                        "all finite queries support integer screening"
+                        code.score(&query, Some(distance.rough().next_down()))
+                            .unwrap()
+                            .is_none()
                     );
                 }
             }
@@ -603,7 +596,7 @@ proptest! {
     }
 
     #[test]
-    fn screening_bounds_cover_generated_fast_path_scores(
+    fn integer_scores_cover_generated_fast_path_scores(
         entries in prop::collection::vec((-1e20_f32..1e20_f32, -63_i8..64), 1..257),
         scale in 0.0_f32..1e20_f32,
     ) {
@@ -643,14 +636,11 @@ fn assert_validated_packed_parity(encoded: &[u8], components: &[f32]) {
         let distance = code
             .approximate_distance(&query)
             .expect("distance is finite");
-        let [cached] = super::DecodedRaBitQ7::approximate_distances([&expanded], &query)
-            .expect("cached distance is finite");
+        let cached = expanded
+            .score(&query, None)
+            .expect("cached distance is finite")
+            .unwrap();
         assert_distance_bits_equal(cached, distance);
-        let [lower] = super::DecodedRaBitQ7::rough_lower_bounds([&expanded], &query).unwrap();
-        assert!(
-            lower <= distance.rough(),
-            "screening must cover the reference rough score"
-        );
         assert_rough_bits_equal(
             distance,
             expanded_reference_rough(encoded, components, metric),
@@ -702,25 +692,36 @@ fn independently_encode_payload(codes: &[i8], scale: f32, error: f32) -> Vec<u8>
     encoded
 }
 
-/// Independent packed decoding and scalar accumulation preserve rough scores.
+/// Independent packed decoding and wide integer accumulation check rough scores.
 fn expanded_reference_rough(encoded: &[u8], components: &[f32], metric: Metric) -> f64 {
     let signed_codes = independently_decode_codes(encoded, components.len());
     let scale = f64::from(f32::from_bits(read_u32_le(encoded, 0)));
     let code_norm_squared = f64::from(read_u32_le(encoded, 4));
-    let mut norm_squared = 0.0_f64;
-    let mut dot = 0.0_f64;
-    let mut odd_dot = 0.0_f64;
-    for (index, (&component, &signed_code)) in components.iter().zip(&signed_codes).enumerate() {
-        let component = f64::from(component);
-        norm_squared += component * component;
-        let product = component * f64::from(signed_code);
-        if index % 2 == 0 {
-            dot += product;
-        } else {
-            odd_dot += product;
-        }
-    }
-    let dot = (dot + odd_dot) * scale;
+    let norm_squared = components
+        .iter()
+        .map(|&v| f64::from(v).powi(2))
+        .sum::<f64>();
+    let maximum = components
+        .iter()
+        .map(|&v| f64::from(v).abs())
+        .fold(0.0, f64::max);
+    let query_limit = (32767_usize.min(i32::MAX as usize / (63 * components.len()))) as f64;
+    let query_scale = if maximum == 0.0 {
+        1.0
+    } else {
+        maximum / query_limit
+    };
+    let sum: i64 = components
+        .iter()
+        .zip(&signed_codes)
+        .map(|(&q, &c)| {
+            let quantized = (f64::from(q) / query_scale)
+                .round()
+                .clamp(-query_limit, query_limit) as i64;
+            quantized * i64::from(c)
+        })
+        .sum();
+    let dot = sum as f64 * query_scale * scale;
     match metric {
         Metric::InnerProduct => -dot,
         Metric::Cosine => 1.0 - dot,

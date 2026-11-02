@@ -242,7 +242,7 @@ struct VisitContext<'a, R> {
     manifest: &'a IndexManifest,
     cache: &'a PartitionCache,
     kernel: &'a VectorKernel,
-    query: &'a RaBitQQuery<'a>,
+    query: &'a RaBitQQuery,
     request: TraversalRequest<'a>,
 }
 

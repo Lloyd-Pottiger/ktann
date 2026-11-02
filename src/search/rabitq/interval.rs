@@ -1,4 +1,4 @@
-//! Scalar-f64 rough distances with conservative directed-rounding intervals.
+//! Integer query/code dots with conservative directed-rounding intervals.
 
 use std::fmt;
 
@@ -10,30 +10,28 @@ use super::rounding::{add_down, add_up, multiply_down, multiply_up, sqrt_up};
 use super::{ApproximateDistance, CodeHeader, DecodedRaBitQ7};
 
 // Integer coarse dots remain exact over the public dimension limit.
-const _: () = assert!(MAX_DIMENSION <= i32::MAX as usize / (127 * 63));
+const _: () = assert!(MAX_DIMENSION <= i32::MAX as usize / 63);
 
 /// One validated, metric-specific query prepared once per Search.
-pub(crate) struct RaBitQQuery<'a> {
-    components: &'a [f32],
+pub(crate) struct RaBitQQuery {
     metric: Metric,
     norm_squared: f64,
     norm_squared_lower: f64,
     norm_squared_upper: f64,
+    /// Quantized query components, scale, and an upper bound on dot error.
+    components: Vec<i16>,
+    scale: f64,
     dot_error_factor: f64,
-    /// The query's integer coarse representation and its conservative error.
-    screening_components: Vec<i8>,
-    screening_scale: f64,
-    screening_error_factor: f64,
 }
 
-impl<'a> RaBitQQuery<'a> {
-    /// Query-owned coarse components charged to routing working memory.
+impl RaBitQQuery {
+    /// Query-owned components charged to routing working memory.
     pub(crate) fn heap_bytes(&self) -> usize {
-        self.screening_components.capacity()
+        self.components.capacity() * size_of::<i16>()
     }
 
-    /// Validates a rotated query and precomputes its scalar-f64 norm bounds.
-    pub(crate) fn new(components: &'a [f32], metric: Metric) -> Result<Self> {
+    /// Quantizes a rotated query and bounds its norm and quantization error.
+    pub(crate) fn new(components: &[f32], metric: Metric) -> Result<Self> {
         if !(1..=MAX_DIMENSION).contains(&components.len()) {
             return Err(Error::invalid_argument());
         }
@@ -53,95 +51,43 @@ impl<'a> RaBitQQuery<'a> {
             norm_squared_upper = add_up(norm_squared_upper, multiply_up(component, component));
         }
         let norm_upper = sqrt_up(norm_squared_upper);
-        let screening_scale = if max_component == 0.0 {
+        // Use the most precise i16 query that keeps every partial sum in i32.
+        let query_limit =
+            f64::from(i16::MAX).min((i32::MAX as usize / (63 * components.len())) as f64);
+        let scale = if max_component == 0.0 {
             1.0
         } else {
-            max_component / 127.0
+            max_component / query_limit
         };
-        let mut screening_components = Vec::with_capacity(components.len());
-        let mut screening_error_squared = 0.0;
+        let mut quantized_components = Vec::with_capacity(components.len());
+        let mut quantization_error_squared = 0.0;
         for &component in components {
             let component = f64::from(component);
-            let quantized = (component / screening_scale).round().clamp(-127.0, 127.0) as i8;
-            screening_components.push(quantized);
-            let lower = add_down(
-                component,
-                -multiply_up(screening_scale, f64::from(quantized)),
-            );
-            let upper = add_up(
-                component,
-                -multiply_down(screening_scale, f64::from(quantized)),
-            );
+            let quantized = (component / scale).round().clamp(-query_limit, query_limit) as i16;
+            quantized_components.push(quantized);
+            let lower = add_down(component, -multiply_up(scale, f64::from(quantized)));
+            let upper = add_up(component, -multiply_down(scale, f64::from(quantized)));
             let error = lower.abs().max(upper.abs());
-            screening_error_squared = add_up(screening_error_squared, multiply_up(error, error));
+            quantization_error_squared =
+                add_up(quantization_error_squared, multiply_up(error, error));
         }
+        let quantization_error = sqrt_up(quantization_error_squared);
         Ok(Self {
-            components,
+            components: quantized_components,
             metric,
             norm_squared,
             norm_squared_lower,
             norm_squared_upper,
-            dot_error_factor: multiply_up(components.len() as f64 * f64::EPSILON, norm_upper),
-            screening_components,
-            screening_scale,
-            screening_error_factor: add_up(
-                sqrt_up(screening_error_squared),
-                multiply_up((components.len() + 2) as f64 * f64::EPSILON, norm_upper),
+            scale,
+            dot_error_factor: add_up(
+                quantization_error,
+                multiply_up(2.0 * f64::EPSILON, add_up(norm_upper, quantization_error)),
             ),
         })
     }
 }
 
-/// Bounds the reference f64 rough score using a cheaper integer dot.
-///
-/// These bounds concern rounding of the quantized dot, not reconstruction
-/// error against the original vector. They may only screen a candidate when
-/// its lower bound strictly exceeds an already-full heap's worst rough score.
-pub(super) fn rough_lower_bounds<const N: usize>(
-    codes: [&DecodedRaBitQ7<&[i8]>; N],
-    query: &RaBitQQuery<'_>,
-) -> Result<[f64; N]> {
-    if codes
-        .iter()
-        .any(|code| code.codes.len() != query.components.len())
-    {
-        return Err(Error::invalid_argument());
-    }
-    // A contiguous dot per candidate lets LLVM vectorize the exact integer
-    // reduction without interleaving independent code streams.
-    let sums = codes.map(|code| {
-        query
-            .screening_components
-            .iter()
-            .zip(code.codes)
-            .map(|(&query, &code)| i32::from(query) * i32::from(code))
-            .sum::<i32>()
-    });
-    Ok(std::array::from_fn(|lane| {
-        let sum = sums[lane];
-        let header = &codes[lane].header;
-        let scale = f64::from(header.scale);
-        // MAX_DIMENSION * 127 * 63 < 2^31, so every integer operation is exact.
-        // Directed scaling and Cauchy–Schwarz cover query quantization plus
-        // the unchanged reference dot's floating-point accumulation error.
-        let norm = multiply_up(scale, sqrt_up(f64::from(header.code_norm_squared)));
-        let dot_upper = add_up(
-            multiply_up(multiply_up(f64::from(sum), query.screening_scale), scale),
-            multiply_up(query.screening_error_factor, norm),
-        );
-        match query.metric {
-            Metric::InnerProduct => -dot_upper,
-            Metric::Cosine => add_down(1.0, -dot_upper),
-            Metric::L2 => {
-                // Use the same rounded constant term as the reference scorer.
-                let base = query.norm_squared + scale * scale * f64::from(header.code_norm_squared);
-                add_down(base, -multiply_up(2.0, dot_upper)).max(0.0)
-            }
-        }
-    }))
-}
-
-impl fmt::Debug for RaBitQQuery<'_> {
+impl fmt::Debug for RaBitQQuery {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("RaBitQQuery([REDACTED])")
     }
@@ -150,115 +96,88 @@ impl fmt::Debug for RaBitQQuery<'_> {
 #[cfg(test)]
 pub(super) fn approximate_distance(
     code: &RaBitQ7<'_>,
-    query: &RaBitQQuery<'_>,
+    query: &RaBitQQuery,
 ) -> Result<ApproximateDistance> {
     if query.components.len() != code.dimension {
         return Err(Error::invalid_argument());
     }
 
-    let scale = f64::from(code.header.scale);
-    let mut dot = 0.0_f64;
-    let mut odd_dot = 0.0_f64;
-    for (index, (&query_component, signed_code)) in
-        query.components.iter().zip(code.signed_codes()).enumerate()
-    {
-        let query_component = f64::from(query_component);
-        let product = query_component * f64::from(signed_code);
-        if index % 2 == 0 {
-            dot += product;
-        } else {
-            odd_dot += product;
-        }
-    }
-
-    finish_distance(&code.header, query, (dot + odd_dot) * scale)
+    let sum: i32 = query
+        .components
+        .iter()
+        .zip(code.signed_codes())
+        .map(|(&query, code)| i32::from(query) * i32::from(code))
+        .sum();
+    finish_distance(
+        &code.header,
+        query,
+        f64::from(sum) * query.scale * f64::from(code.header.scale),
+    )
 }
 
-/// Scores decoded lanes using two independent scalar-f64 partial sums.
-///
-/// Query/code products are exact in f64. The two sums and final scale need
-/// at most `dimension` rounding steps per term, preserving the dot-error
-/// bound in `finish_distance` while shortening the addition dependency chain.
-pub(super) fn approximate_distances<const N: usize>(
-    codes: [&DecodedRaBitQ7<&[i8]>; N],
-    query: &RaBitQQuery<'_>,
-) -> Result<[ApproximateDistance; N]> {
-    if codes
-        .iter()
-        .any(|code| code.codes.len() != query.components.len())
-    {
+/// Computes one exact integer dot; only competitive rough scores need an interval.
+/// Equality remains eligible so the candidate pool can break ties by Record ID.
+pub(super) fn score(
+    code: &DecodedRaBitQ7<&[i8]>,
+    query: &RaBitQQuery,
+    cutoff: Option<f64>,
+) -> Result<Option<ApproximateDistance>> {
+    if code.codes.len() != query.components.len() {
         return Err(Error::invalid_argument());
     }
-    let scales = codes.map(|code| f64::from(code.header.scale));
-    let mut dots = [0.0_f64; N];
-    let mut odd_dots = [0.0_f64; N];
-    // Matching dimensions give every code iterator exactly the query's pair count.
-    // Chunk traversal lets the compiler hoist code pointers and bounds checks.
-    let mut code_pairs = codes.map(|code| code.codes.as_chunks::<2>().0.iter());
-    for pair in query.components.as_chunks::<2>().0 {
-        let even = f64::from(pair[0]);
-        let odd = f64::from(pair[1]);
-        for lane in 0..N {
-            let code_pair = code_pairs[lane]
-                .next()
-                .expect("validated matching dimensions");
-            dots[lane] += even * f64::from(code_pair[0]);
-            odd_dots[lane] += odd * f64::from(code_pair[1]);
+    // Every product and partial sum fits i32 over the public dimension limit.
+    // Contiguous components allow LLVM to vectorize this exact reduction.
+    let sum: i32 = query
+        .components
+        .iter()
+        .zip(code.codes)
+        .map(|(&query, &code)| i32::from(query) * i32::from(code))
+        .sum();
+    let dot = f64::from(sum) * query.scale * f64::from(code.header.scale);
+    if cutoff.is_some_and(|cutoff| rough_distance(&code.header, query, dot) > cutoff) {
+        return Ok(None);
+    }
+    finish_distance(&code.header, query, dot).map(Some)
+}
+
+/// Metric-specific rough score shared by admission and interval construction.
+fn rough_distance(header: &CodeHeader, query: &RaBitQQuery, dot: f64) -> f64 {
+    match query.metric {
+        Metric::InnerProduct => -dot,
+        Metric::Cosine => 1.0 - dot,
+        Metric::L2 => {
+            let scale = f64::from(header.scale);
+            (query.norm_squared + scale * scale * f64::from(header.code_norm_squared) - 2.0 * dot)
+                .max(0.0)
         }
     }
-    if !query.components.len().is_multiple_of(2) {
-        let index = query.components.len() - 1;
-        let component = f64::from(query.components[index]);
-        for lane in 0..N {
-            dots[lane] += component * f64::from(codes[lane].codes[index]);
-        }
-    }
-    let mut distances = [ApproximateDistance {
-        rough: 0.0,
-        lower: 0.0,
-        upper: 0.0,
-    }; N];
-    for (lane, distance) in distances.iter_mut().enumerate() {
-        *distance = finish_distance(
-            &codes[lane].header,
-            query,
-            (dots[lane] + odd_dots[lane]) * scales[lane],
-        )?;
-    }
-    Ok(distances)
 }
 
 /// Converts a completed dot product and its bounds to a metric-specific interval.
 fn finish_distance(
     header: &CodeHeader,
-    query: &RaBitQQuery<'_>,
+    query: &RaBitQQuery,
     dot: f64,
 ) -> Result<ApproximateDistance> {
     let scale = f64::from(header.scale);
     let error_upper = f64::from(header.reconstruction_error_upper);
-    // Each query-component times signed code is exact in f64 (at most 30 bits).
-    // Two partial sums, their reduction, and one final scale multiplication
-    // have at most ceil(n/2)+1 rounded operations per term for n >= 2,
-    // which is at most n. For n=1 only the final scale multiplication rounds.
-    // Thus roundoff is bounded by
-    // gamma_n * sum(abs(q_i * x_hat_i)), with u = 2^-53. Since n <= 16384,
-    // gamma_n = n*u/(1-n*u) <= 2*n*u = n*EPSILON. Cauchy-Schwarz bounds
-    // the absolute sum by ||q|| * ||x_hat||. All bound operations round up;
-    // f32 inputs and six-bit codes cannot underflow or overflow this kernel.
+    // Cauchy–Schwarz bounds query quantization error by E * ||reconstruction||.
+    // The query's error factor also covers the two final f64 multiplications.
+    // Directed arithmetic keeps both this bound and reconstruction error outward.
     let reconstruction_norm_upper =
         multiply_up(scale, sqrt_up(f64::from(header.code_norm_squared)));
     let dot_error = multiply_up(query.dot_error_factor, reconstruction_norm_upper);
     let dot_lower = add_down(dot, -dot_error);
     let dot_upper = add_up(dot, dot_error);
-    let (rough, center_lower, center_upper, radius_upper, clamp_lower) = match query.metric {
+    let rough = rough_distance(header, query, dot);
+    let (center_lower, center_upper, radius_upper, clamp_lower) = match query.metric {
         Metric::InnerProduct => {
             let radius = multiply_up(sqrt_up(query.norm_squared_upper), error_upper);
-            (-dot, -dot_upper, -dot_lower, radius, false)
+            (-dot_upper, -dot_lower, radius, false)
         }
         Metric::Cosine => {
             let radius = multiply_up(sqrt_up(query.norm_squared_upper), error_upper);
             (
-                1.0 - dot,
                 add_down(1.0, -dot_upper),
                 add_up(1.0, -dot_lower),
                 radius,
@@ -266,7 +185,6 @@ fn finish_distance(
             )
         }
         Metric::L2 => {
-            let reconstruction_norm_squared = scale * scale * f64::from(header.code_norm_squared);
             let reconstruction_norm_squared_lower = multiply_down(
                 multiply_down(scale, scale),
                 f64::from(header.code_norm_squared),
@@ -275,7 +193,6 @@ fn finish_distance(
                 multiply_up(scale, scale),
                 f64::from(header.code_norm_squared),
             );
-            let rough = (query.norm_squared + reconstruction_norm_squared - 2.0 * dot).max(0.0);
             let lower = add_down(
                 add_down(query.norm_squared_lower, reconstruction_norm_squared_lower),
                 -multiply_up(2.0, dot_upper),
@@ -290,7 +207,7 @@ fn finish_distance(
             let linear_error = multiply_up(multiply_up(2.0, root_distance_upper), error_upper);
             let squared_error = multiply_up(error_upper, error_upper);
             let radius = add_up(linear_error, squared_error);
-            (rough, lower, upper, radius, true)
+            (lower, upper, radius, true)
         }
     };
 

@@ -1,7 +1,7 @@
 //! Canonical RaBitQ7 encoding, approximate scores, and conservative bounds.
 //!
-//! This module is the single seam for the persistent seven-bit code, scalar
-//! f64 approximate distances, conservative intervals, and integer screening bounds.
+//! This module is the single seam for the persistent seven-bit code, integer
+//! approximate scoring, and conservative intervals.
 //! Callers do not need to know the bit layout or the
 //! directed-rounding rules that keep its intervals conservative.
 
@@ -75,20 +75,13 @@ impl DecodedRaBitQ7<std::ops::Range<usize>> {
 }
 
 impl DecodedRaBitQ7<&[i8]> {
-    /// Conservatively screens against the unchanged f64 rough ranking.
-    pub(crate) fn rough_lower_bounds<const N: usize>(
-        codes: [&Self; N],
-        query: &RaBitQQuery<'_>,
-    ) -> Result<[f64; N]> {
-        interval::rough_lower_bounds(codes, query)
-    }
-
-    /// Scores independent lanes with the scalar accumulation order in each lane.
-    pub(crate) fn approximate_distances<const N: usize>(
-        codes: [&Self; N],
-        query: &RaBitQQuery<'_>,
-    ) -> Result<[ApproximateDistance; N]> {
-        interval::approximate_distances(codes, query)
+    /// Scores one code, skipping interval construction above a full pool's cutoff.
+    pub(crate) fn score(
+        &self,
+        query: &RaBitQQuery,
+        cutoff: Option<f64>,
+    ) -> Result<Option<ApproximateDistance>> {
+        interval::score(self, query, cutoff)
     }
 }
 
@@ -119,12 +112,9 @@ impl<'a> RaBitQ7<'a> {
         codec::from_validated_bytes(encoded, dimension)
     }
 
-    /// Computes a scalar-f64 rough distance and conservative interval.
+    /// Computes an integer-dot rough distance and conservative interval.
     #[cfg(test)]
-    pub(crate) fn approximate_distance(
-        &self,
-        query: &RaBitQQuery<'_>,
-    ) -> Result<ApproximateDistance> {
+    pub(crate) fn approximate_distance(&self, query: &RaBitQQuery) -> Result<ApproximateDistance> {
         interval::approximate_distance(self, query)
     }
 }
@@ -153,7 +143,7 @@ impl ApproximateDistance {
         })
     }
 
-    /// Returns the rough scalar-f64 ranking value.
+    /// Returns the rough ranking value.
     pub(crate) const fn rough(self) -> f64 {
         self.rough
     }

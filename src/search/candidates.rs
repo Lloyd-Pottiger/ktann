@@ -15,7 +15,7 @@ use crate::storage::values::RecordLocation;
 
 use super::cache::{CachedLeafEntry, leaf_entry_bytes};
 use super::numeric::compare_finite;
-use super::rabitq::{ApproximateDistance, DecodedRaBitQ7, RaBitQQuery};
+use super::rabitq::{ApproximateDistance, RaBitQQuery};
 
 /// One globally retained candidate with its original snapshot projection.
 ///
@@ -151,7 +151,7 @@ impl GlobalCandidatePool {
         entries: &Arc<[CachedLeafEntry]>,
         components: &[i8],
         location: RecordLocation,
-        query: &RaBitQQuery<'_>,
+        query: &RaBitQQuery,
         eligible: Option<&[usize]>,
     ) -> Result<()> {
         let len = eligible.map_or(entries.len(), <[usize]>::len);
@@ -159,22 +159,13 @@ impl GlobalCandidatePool {
         self.ids
             .try_reserve(len)
             .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
-        // A fixed leaf cutoff is conservative as subsequent admissions can only
-        // improve the heap. Keep four-lane scoring and scalar tails unchanged.
-        let cutoff = self.rough_cutoff();
         let mut source = Weak::new();
-        let full = len / 4 * 4;
-        for start in (0..full).step_by(4) {
-            let ordinals: [_; 4] = std::array::from_fn(|lane| entry_at(start + lane));
-            let codes = ordinals.map(|i| entries[i].code(components));
-            let distances = score_batch(codes, query, cutoff)?;
-            for (entry, distance) in ordinals.into_iter().zip(distances) {
-                self.admit(entries, &location, &mut source, entry, distance)?;
-            }
-        }
-        for i in full..len {
+        for i in 0..len {
             let entry = entry_at(i);
-            let [distance] = score_batch([entries[entry].code(components)], query, cutoff)?;
+            let distance = entries[entry]
+                .code(components)
+                .score(query, self.rough_cutoff())
+                .map_err(|_| Error::new(ErrorKind::Corruption))?;
             self.admit(entries, &location, &mut source, entry, distance)?;
         }
         Ok(())
@@ -354,35 +345,6 @@ impl GlobalCandidatePool {
     }
 }
 
-/// Refines all lanes that may enter the heap using the canonical f64 score.
-fn score_batch<const N: usize>(
-    codes: [DecodedRaBitQ7<&[i8]>; N],
-    query: &RaBitQQuery<'_>,
-    cutoff: Option<f64>,
-) -> Result<[Option<ApproximateDistance>; N]> {
-    let rejected = if let Some(cutoff) = cutoff {
-        DecodedRaBitQ7::rough_lower_bounds(codes.each_ref(), query)
-            .map_err(|_| Error::new(ErrorKind::Corruption))?
-            .map(|lower| lower > cutoff)
-    } else {
-        [false; N]
-    };
-    if rejected.iter().all(|&rejected| !rejected) {
-        return DecodedRaBitQ7::approximate_distances(codes.each_ref(), query)
-            .map(|distances| distances.map(Some))
-            .map_err(|_| Error::new(ErrorKind::Corruption));
-    }
-    let mut distances = [None; N];
-    for lane in 0..N {
-        if !rejected[lane] {
-            let [distance] = DecodedRaBitQ7::approximate_distances([&codes[lane]], query)
-                .map_err(|_| Error::new(ErrorKind::Corruption))?;
-            distances[lane] = Some(distance);
-        }
-    }
-    Ok(distances)
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::rabitq::{RaBitQ7, test_approximate_distance};
@@ -543,8 +505,11 @@ mod tests {
             .unwrap();
         let cutoff = pool.rough_cutoff().unwrap();
         assert!(
-            DecodedRaBitQ7::rough_lower_bounds([&entries[1].code(&components)], &query).unwrap()[0]
-                > cutoff
+            entries[1]
+                .code(&components)
+                .score(&query, Some(cutoff))
+                .unwrap()
+                .is_none()
         );
         let before = pool.heap_bytes().unwrap();
         pool.push_leaf(&entries, &components, location, &query, Some(&[1, 2]))
@@ -665,9 +630,7 @@ mod tests {
                                 .iter()
                                 .map(|&entry| {
                                     let code = entries[entry].code(codes);
-                                    let [distance] =
-                                        DecodedRaBitQ7::approximate_distances([&code], &query)
-                                            .unwrap();
+                                    let distance = code.score(&query, None).unwrap().unwrap();
                                     (entry, distance)
                                 })
                                 .collect();
