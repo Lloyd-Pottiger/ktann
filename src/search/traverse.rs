@@ -84,16 +84,15 @@ impl<'a> TraversalRequest<'a> {
         self
     }
 
-    /// Creates one traversal request, rejecting a zero result limit or beam.
+    /// Creates one traversal request, rejecting a zero beam.
     pub(crate) fn new(
         routing: &'a [f32],
         trees: &'a [EnumeratedTree],
         predicate: Option<&'a CompiledPredicate>,
-        k: usize,
         budgets: SearchBudgets,
         leaf_beam: u32,
     ) -> Result<Self> {
-        if k == 0 || leaf_beam == 0 {
+        if leaf_beam == 0 {
             return Err(Error::invalid_argument());
         }
         Ok(Self {
@@ -1276,7 +1275,6 @@ mod tests {
         manifest: &IndexManifest,
         trees: &[EnumeratedTree],
         predicate: Option<Predicate>,
-        k: usize,
         budgets: SearchBudgets,
         beam: u32,
     ) -> Result<TraversalOutcome> {
@@ -1291,7 +1289,7 @@ mod tests {
             &mut txn,
             &cache,
             &kernel,
-            TraversalRequest::new(&QUERY, trees, compiled.as_ref(), k, budgets, beam)
+            TraversalRequest::new(&QUERY, trees, compiled.as_ref(), budgets, beam)
                 .expect("valid request"),
         )
         .await
@@ -1318,7 +1316,7 @@ mod tests {
         );
     }
 
-    /// Runs the default corruption traversal: no predicate, k = 8, generous
+    /// Runs the default corruption traversal: no predicate, generous
     /// budgets, and the default beam.
     async fn assert_corrupt(
         items: Vec<(Vec<u8>, Vec<u8>)>,
@@ -1331,7 +1329,6 @@ mod tests {
                 manifest,
                 trees,
                 None,
-                8,
                 budgets(16, 64),
                 DEFAULT_LEAF_BEAM,
             )
@@ -1354,11 +1351,10 @@ mod tests {
     }
 
     #[test]
-    fn request_rejects_zero_k_or_beam() {
+    fn request_rejects_zero_beam() {
         let trees = vec![];
         let budget = budgets(8, 8);
-        assert!(TraversalRequest::new(&QUERY, &trees, None, 0, budget, 1).is_err());
-        assert!(TraversalRequest::new(&QUERY, &trees, None, 1, budget, 0).is_err());
+        assert!(TraversalRequest::new(&QUERY, &trees, None, budget, 0).is_err());
     }
 
     #[tokio::test]
@@ -1384,15 +1380,8 @@ mod tests {
                     &mut txn,
                     &cache,
                     &kernel,
-                    TraversalRequest::new(
-                        &QUERY,
-                        &trees,
-                        None,
-                        4,
-                        budgets(8, 8),
-                        DEFAULT_LEAF_BEAM,
-                    )
-                    .expect("valid request"),
+                    TraversalRequest::new(&QUERY, &trees, None, budgets(8, 8), DEFAULT_LEAF_BEAM)
+                        .expect("valid request"),
                 )
                 .await
                 .expect("traverse");
@@ -1459,7 +1448,6 @@ mod tests {
                             &QUERY,
                             &trees,
                             predicate,
-                            4,
                             budgets(children + 2, 8),
                             4096,
                         )
@@ -1516,7 +1504,6 @@ mod tests {
                     &manifest,
                     &[tree_ref(&tree)],
                     None,
-                    4,
                     budgets(limit, 8),
                     DEFAULT_LEAF_BEAM,
                 )
@@ -1531,7 +1518,6 @@ mod tests {
                     &manifest,
                     &[tree_ref(&tree)],
                     None,
-                    4,
                     budgets(4, 8),
                     DEFAULT_LEAF_BEAM,
                 )
@@ -1562,7 +1548,6 @@ mod tests {
                     op: CompareOp::Eq,
                     value: Value::I64(1),
                 }),
-                4,
                 budgets(limit, 8),
                 DEFAULT_LEAF_BEAM,
             )
@@ -1590,7 +1575,6 @@ mod tests {
             &manifest,
             &[tree_ref(&tree)],
             None,
-            4,
             budgets(8, 8),
             DEFAULT_LEAF_BEAM,
         )
@@ -1620,7 +1604,6 @@ mod tests {
             &manifest,
             &trees,
             None,
-            4,
             budgets(8, 8),
             DEFAULT_LEAF_BEAM,
         )
@@ -1639,7 +1622,6 @@ mod tests {
             &manifest,
             &trees,
             None,
-            4,
             budgets(8, 8),
             DEFAULT_LEAF_BEAM,
         )
@@ -1665,7 +1647,6 @@ mod tests {
             &manifest,
             &[tree_ref(&tree)],
             None,
-            1,
             budgets(8, 1),
             DEFAULT_LEAF_BEAM,
         )
@@ -1707,7 +1688,6 @@ mod tests {
             &manifest,
             &trees,
             None,
-            8,
             budgets(16, 64),
             DEFAULT_LEAF_BEAM,
         )
@@ -1726,7 +1706,6 @@ mod tests {
             &manifest,
             &trees,
             None,
-            8,
             budgets(1, 64),
             DEFAULT_LEAF_BEAM,
         )
@@ -1764,7 +1743,6 @@ mod tests {
             &manifest,
             &trees,
             None,
-            8,
             budgets(3, 64),
             DEFAULT_LEAF_BEAM,
         )
@@ -1783,7 +1761,6 @@ mod tests {
             &manifest,
             &trees,
             None,
-            8,
             budgets(2, 64),
             DEFAULT_LEAF_BEAM,
         )
@@ -1813,7 +1790,6 @@ mod tests {
             &manifest,
             &[tree_ref(&tree)],
             None,
-            8,
             budgets(16, 64),
             DEFAULT_LEAF_BEAM,
         )
@@ -1855,7 +1831,6 @@ mod tests {
             &manifest,
             &trees,
             None,
-            8,
             budgets(16, 64),
             4,
         )
@@ -1880,7 +1855,6 @@ mod tests {
             &manifest,
             &trees,
             None,
-            8,
             budgets(16, 64),
             2,
         )
@@ -1894,17 +1868,9 @@ mod tests {
         assert!(!outcome.partition_budget_exhausted());
 
         // Beam 1 is a greedy single path to the nearest leaf.
-        let outcome = run(
-            fixture.items,
-            &manifest,
-            &trees,
-            None,
-            8,
-            budgets(16, 64),
-            1,
-        )
-        .await
-        .expect("traverse");
+        let outcome = run(fixture.items, &manifest, &trees, None, budgets(16, 64), 1)
+            .await
+            .expect("traverse");
         assert_eq!(candidate_ids(&outcome), vec![b"e4".as_slice()]);
         assert_eq!(outcome.visited_partitions(), 3);
         assert!(!outcome.partition_budget_exhausted());
@@ -1947,7 +1913,6 @@ mod tests {
             &manifest,
             &[tree_ref(&tree)],
             None,
-            8,
             budgets(16, 64),
             4,
         )
@@ -1996,7 +1961,6 @@ mod tests {
             &manifest,
             &trees,
             Some(predicate),
-            8,
             budgets(16, 64),
             DEFAULT_LEAF_BEAM,
         )
@@ -2026,7 +1990,6 @@ mod tests {
             &manifest,
             &trees,
             Some(always),
-            8,
             budgets(16, 64),
             DEFAULT_LEAF_BEAM,
         )
@@ -2057,7 +2020,6 @@ mod tests {
             &manifest,
             &[tree_ref(&tree)],
             None,
-            1,
             budgets(16, 1),
             DEFAULT_LEAF_BEAM,
         )
@@ -2119,7 +2081,6 @@ mod tests {
             &manifest,
             &[tree_ref(&tree)],
             None,
-            8,
             budgets(16, 64),
             DEFAULT_LEAF_BEAM,
         )
@@ -2161,7 +2122,6 @@ mod tests {
             &manifest,
             &[tree_ref(&tree)],
             None,
-            8,
             budgets(16, 64),
             DEFAULT_LEAF_BEAM,
         )
@@ -2208,7 +2168,6 @@ mod tests {
             &manifest,
             &[tree_ref(&tree)],
             None,
-            8,
             budgets(16, 64),
             DEFAULT_LEAF_BEAM,
         )
@@ -2249,7 +2208,6 @@ mod tests {
             &manifest,
             &[tree_ref(&tree)],
             None,
-            8,
             budgets(16, 64),
             DEFAULT_LEAF_BEAM,
         )
@@ -2361,7 +2319,6 @@ mod tests {
                 &manifest,
                 &[tree_ref(&tree)],
                 Some(predicate),
-                8,
                 budgets(16, 64),
                 DEFAULT_LEAF_BEAM,
             )
@@ -2402,7 +2359,6 @@ mod tests {
                     op: CompareOp::Eq,
                     value: Value::I64(1),
                 }),
-                8,
                 budgets(16, 64),
                 DEFAULT_LEAF_BEAM,
             )

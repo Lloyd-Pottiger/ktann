@@ -23,7 +23,6 @@ use super::rabitq::{ApproximateDistance, RaBitQQuery};
 /// typed filter projection, the rough distance with its conservative interval,
 /// and the source location the authoritative Record Location must match.
 pub(crate) struct LeafCandidate {
-    record_id: Bytes,
     distance: ApproximateDistance,
     projection: LeafProjection,
 }
@@ -43,6 +42,7 @@ enum LeafProjection {
     },
     #[cfg(test)]
     Owned {
+        record_id: Bytes,
         fields: Box<[Value]>,
         location: RecordLocation,
     },
@@ -50,7 +50,11 @@ enum LeafProjection {
 
 impl LeafCandidate {
     pub(crate) fn record_id(&self) -> &Bytes {
-        &self.record_id
+        match &self.projection {
+            LeafProjection::Shared { source, entry } => source.entries[*entry].record_id(),
+            #[cfg(test)]
+            LeafProjection::Owned { record_id, .. } => record_id,
+        }
     }
 
     pub(crate) fn distance(&self) -> ApproximateDistance {
@@ -66,9 +70,12 @@ impl LeafCandidate {
         location: RecordLocation,
     ) -> Self {
         Self {
-            record_id,
             distance,
-            projection: LeafProjection::Owned { fields, location },
+            projection: LeafProjection::Owned {
+                record_id,
+                fields,
+                location,
+            },
         }
     }
 
@@ -232,7 +239,6 @@ impl GlobalCandidatePool {
             }
         };
         let candidate = LeafCandidate {
-            record_id: id.clone(),
             distance,
             projection: LeafProjection::Shared { source, entry },
         };

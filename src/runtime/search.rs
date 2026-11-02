@@ -152,7 +152,6 @@ pub(crate) async fn search<B: Backend>(
         &prepared.routing,
         enumeration.trees(),
         prepared.predicate.as_ref(),
-        prepared.request.k(),
         prepared.budgets,
         prepared.leaf_beam,
     )?
