@@ -19,8 +19,13 @@ L2, negated dot product for inner product, and negated dot product for cosine.
 Cosine records are normalized during preprocessing and cosine split centroids
 are normalized after their arithmetic mean is trained; a zero centroid remains
 zero and uses a neutral distance of zero. Distance ties resolve to the smaller
-Partition Key. Exact reranking reads the unrotated original vector, accumulates
-in f64, and defines:
+Partition Key. Routing distances use eight independent f64 sums for component
+indices modulo eight, followed by a fixed balanced pairwise reduction. Batched
+routing reuses the same single-distance kernel, shortening the dependency chain
+without multiplying the live accumulators or adding heap allocations. Vectors
+shorter than one eight-component block use direct scalar sums, interleaved for
+batch calls. Exact reranking keeps its separate kernel:
+it reads the unrotated original vector, accumulates in f64, and defines:
 
 - L2 ranking: squared distance `sum((q_i - x_i)^2)`, with public SearchHit
   returning its Euclidean square root;

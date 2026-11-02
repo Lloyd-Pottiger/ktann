@@ -83,6 +83,17 @@ pub fn run() -> Result<(), String> {
     {
         return Err("--socket, --database, and --report are required (database is the FDB namespace for foundationdb)".into());
     }
+    // Artifact refinement and publication produce settled topology before serving.
+    let runtime_config = RuntimeConfig::default()
+        .with_maintenance(0, 1)
+        .map_err(|e| e.to_string())?;
+    let runtime_config = if let Some(experiment) = &options.experiment {
+        runtime_config
+            .with_routing_working_bytes(experiment.routing_working_bytes)
+            .map_err(|e| e.to_string())?
+    } else {
+        runtime_config
+    };
     // Bind without unlinking: a stale path must never evict a live bridge.
     let executor = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -94,6 +105,18 @@ pub fn run() -> Result<(), String> {
             use ktann_rocksdb::{BackendNamespace, RocksDbBackend};
             let mut config = rocksdb::Options::default();
             config.create_if_missing(true);
+            // Share the existing cache budget between decoded partitions and
+            // native point-read results; record validity remains RocksDB-owned.
+            let cache_bytes = runtime_config.partition_cache_bytes();
+            let row_bytes = cache_bytes / 8;
+            let row_cache = rocksdb::Cache::new_lru_cache(
+                usize::try_from(row_bytes).map_err(|_| "row cache exceeds address space")?,
+            );
+            config.set_row_cache(&row_cache);
+            let runtime_config = runtime_config
+                .with_partition_cache_bytes(cache_bytes - row_bytes)
+                .map_err(|e| e.to_string())?;
+            eprintln!("rocksdb_row_cache_capacity_bytes={row_bytes}");
             let db = Arc::new(
                 rocksdb::OptimisticTransactionDB::open(&config, &options.database)
                     .map_err(|e| e.to_string())?,
@@ -106,6 +129,7 @@ pub fn run() -> Result<(), String> {
                 backend,
                 "rust-rocksdb=0.24.0; rocksdb=10.4.2".into(),
                 &options,
+                runtime_config,
             )
             .await
         }),
@@ -127,7 +151,7 @@ pub fn run() -> Result<(), String> {
                     database,
                     BackendNamespace::new(namespace).map_err(|e| e.to_string())?,
                 );
-                serve(backend, identity, &options).await
+                serve(backend, identity, &options, runtime_config).await
             })
         }
         _ => Err("backend unavailable; build with rocksdb and/or foundationdb features".into()),
@@ -316,7 +340,12 @@ impl Drop for SocketGuard {
 }
 
 /// Owns the Unix socket and shared runtime for benchmark client connections.
-async fn serve<B: Backend>(backend: B, identity: String, options: &Options) -> Result<(), String> {
+async fn serve<B: Backend>(
+    backend: B,
+    identity: String,
+    options: &Options,
+    config: RuntimeConfig,
+) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     let listener = UnixListener::bind(&options.socket).map_err(|e| e.to_string())?;
     let _socket = SocketGuard(options.socket.clone());
@@ -328,17 +357,6 @@ async fn serve<B: Backend>(backend: B, identity: String, options: &Options) -> R
         backend.admission_budget()
     );
     let (backend, counters) = MeasuredBackend::new(backend);
-    // Artifact refinement and publication produce settled topology before serving.
-    let config = RuntimeConfig::default()
-        .with_maintenance(0, 1)
-        .map_err(|e| e.to_string())?;
-    let config = if let Some(experiment) = &options.experiment {
-        config
-            .with_routing_working_bytes(experiment.routing_working_bytes)
-            .map_err(|e| e.to_string())?
-    } else {
-        config
-    };
     // Keep captured input and build files alive through retries and runtime shutdown.
     let workspace = tempfile::Builder::new()
         .prefix("ktann-vdbbench-")

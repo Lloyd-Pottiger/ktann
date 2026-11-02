@@ -268,6 +268,16 @@ record IDs, and an optional inclusive `id_min` predicate. This supports Cohere
 1M unfiltered, 1% excluded, and 99% excluded cases, plus custom ANN performance
 cases. Incremental online and read/write workloads are not supported.
 
+For RocksDB, the bridge assigns one eighth of the Runtime's default decoded
+cache budget to a native row cache and leaves seven eighths for Partition
+bodies. The combined configured capacity is unchanged; the native block cache
+remains independently configured. Startup logs record the row-cache capacity,
+and the companion report records the remaining partition capacity. This
+allocation targets repeated exact-rerank record reads and can use more resident
+memory than a partition-only cache. FoundationDB keeps its existing allocation.
+The general benchmark worker's explicit cache settings are independent of this
+bridge policy.
+
 ### Lifecycle and controls
 
 Insert requests capture bounded batches through `PreparedInputWriter`, which

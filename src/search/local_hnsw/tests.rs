@@ -405,6 +405,9 @@ fn seeded_builds_and_partition_identity_are_reproducible() {
 
 #[test]
 fn independent_queries_have_good_coverage_for_all_metrics_and_seeds() {
+    // The independent scalar oracle can round differently. Coverage compares
+    // identities; native scores below must still match the routing kernel bits.
+    let nodes = |hits: &[Candidate]| hits.iter().map(|hit| hit.node).collect::<Vec<_>>();
     for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
         let kernel = VectorKernel::new(12, metric, [3; 32]).unwrap();
         let rows = children(
@@ -425,11 +428,13 @@ fn independent_queries_have_good_coverage_for_all_metrics_and_seeds() {
             let allocations = scratch.allocation_count();
             let query = kernel.preprocess(&queries[0]).unwrap();
             assert_eq!(
-                graph
-                    .search(&query, 7, usize::MAX, MEMORY, &mut scratch, &|| Ok(()))
-                    .unwrap()
-                    .0,
-                oracle(metric, &rows, &query, 7),
+                nodes(
+                    &graph
+                        .search(&query, 7, usize::MAX, MEMORY, &mut scratch, &|| Ok(()))
+                        .unwrap()
+                        .0
+                ),
+                nodes(&oracle(metric, &rows, &query, 7)),
                 "clipped full exploration must recover the exact local top-k"
             );
             let mut correct = 0;
@@ -438,11 +443,13 @@ fn independent_queries_have_good_coverage_for_all_metrics_and_seeds() {
                 let query = kernel.preprocess(query).unwrap();
                 let truth = oracle(metric, &rows, &query, 16);
                 assert_eq!(
-                    graph
-                        .centroids
-                        .exact(&query, 16, MEMORY, &|| Ok(()))
-                        .unwrap(),
-                    truth
+                    nodes(
+                        &graph
+                            .centroids
+                            .exact(&query, 16, MEMORY, &|| Ok(()))
+                            .unwrap()
+                    ),
+                    nodes(&truth)
                 );
                 let (hits, stats) = graph
                     .search(&query, 16, 96, MEMORY, &mut scratch, &|| Ok(()))

@@ -36,6 +36,15 @@ the ordered ranges required by KTANN scans. Prefix extractors and hash-based
 memtables are supported; the adapter forces total-order seeks for every
 contractual range scan.
 
+For repeated point reads, the caller can set a RocksDB row cache with
+`rocksdb::Options::set_row_cache`. It stores encoded record results and avoids
+repeated SST/block lookups, including in MultiGet. RocksDB owns snapshot
+visibility and invalidation; KTANN still decodes and validates authoritative
+records. Charge this cache alongside the native block cache and
+`RuntimeConfig::partition_cache_bytes` when choosing the total memory budget.
+A larger row cache can consume more resident memory as it warms, and its value
+depends on record reuse.
+
 The adapter keeps WAL enabled and sets `sync=true` for every transaction. It
 uses conservative defaults of 10,000 mutations, 9,000,000 bytes of physical mutation
 bytes, and 80 KiB per scan page. RocksDB v1 reports transactional range clear
