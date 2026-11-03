@@ -969,9 +969,9 @@ fn building_manifest_and_request_descriptor_have_canonical_bytes() {
         PersistentValue::IndexManifest(building)
     );
 
-    let mut input_bytes = [0; 89];
-    input_bytes[..8].copy_from_slice(b"KTANNBF\x01");
-    input_bytes[49..57].copy_from_slice(&41_u64.to_be_bytes());
+    let mut input_bytes = [0; 90];
+    input_bytes[..9].copy_from_slice(b"KTANNBF\x00\x01");
+    input_bytes[50..58].copy_from_slice(&42_u64.to_be_bytes());
     let input = ArtifactManifest::decode(&input_bytes).unwrap();
     let options = ConstructionOptions {
         sample_items: 8,
@@ -985,7 +985,7 @@ fn building_manifest_and_request_descriptor_have_canonical_bytes() {
     let mut expected = vec![0x0d];
     expected.extend_from_slice(&7_u32.to_be_bytes());
     expected.extend_from_slice(b"/source");
-    expected.extend_from_slice(&89_u32.to_be_bytes());
+    expected.extend_from_slice(&90_u32.to_be_bytes());
     expected.extend_from_slice(&input_bytes);
     for number in [8_u64, 2 * 1024 * 1024, 16 * 1024 * 1024] {
         expected.extend_from_slice(&number.to_be_bytes());
@@ -1003,7 +1003,7 @@ fn building_manifest_and_request_descriptor_have_canonical_bytes() {
     invalid[5] = b'x';
     assert_corrupt(decode(codec, &key, &invalid));
     for kind in [2, 3] {
-        input_bytes[8] = kind;
+        input_bytes[9] = kind;
         assert!(
             BuildDescriptor::new(
                 "/source".into(),
@@ -1055,13 +1055,13 @@ fn bulk_validation_golden_and_malformed_proofs() {
     let manifest = minimal_manifest();
     let codec = ValueCodec::for_index(&manifest);
     let key = LogicalKey::BuildValidation(id(1));
-    let mut artifact = b"KTANNBF\x01\x03".to_vec();
+    let mut artifact = b"KTANNBF\x00\x01\x03".to_vec();
     artifact.extend_from_slice(&[0; 32]);
     let hash = Sha256::digest(&artifact);
     artifact.extend_from_slice(&0_u64.to_be_bytes());
-    artifact.extend_from_slice(&41_u64.to_be_bytes());
+    artifact.extend_from_slice(&42_u64.to_be_bytes());
     artifact.extend_from_slice(&hash);
-    let mut golden = vec![0x10, 0, 0, 0, 89];
+    let mut golden = vec![0x10, 0, 0, 0, 90];
     golden.extend_from_slice(&artifact);
     golden.extend_from_slice(&[0; 4]);
     golden.extend_from_slice(&0_u64.to_be_bytes());
@@ -1076,7 +1076,7 @@ fn bulk_validation_golden_and_malformed_proofs() {
                 .is_err()
         );
     }
-    for offset in [13, 105, 106, golden.len() - 1] {
+    for offset in [14, 106, 107, golden.len() - 1] {
         let mut malformed = golden.clone();
         malformed[offset] ^= 3;
         assert!(codec.decode(&key, Bytes::from(malformed)).is_err());

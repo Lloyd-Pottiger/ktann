@@ -3,7 +3,7 @@
 //! The public `run` command never measures scenarios in its own process. It
 //! launches one hidden worker per scenario so process-global metrics, the
 //! Partition Cache, and peak RSS each have an unambiguous owner. The public
-//! `compare` command accepts only complete, comparable versioned suites.
+//! `compare` command accepts only complete, comparable suites.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -17,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::compare::{self, ComparisonPolicy};
-use crate::report::{BenchmarkReport, BenchmarkSuite, REPORT_SCHEMA_VERSION};
+use crate::report::{BenchmarkReport, BenchmarkSuite};
 use crate::runner::{self, ScenarioSpec};
 
 const IMPORT_LIFECYCLE_SCENARIO: &str = "import-to-search-lifecycle";
@@ -466,7 +466,6 @@ fn run_suite(options: RunOptions) -> Result<(), String> {
         reports.push(report);
     }
     let suite = BenchmarkSuite {
-        schema_version: REPORT_SCHEMA_VERSION,
         reproduction_command,
         reports,
     };
@@ -825,7 +824,7 @@ fn compare_reports(options: CompareOptions) -> Result<(), String> {
     }
 }
 
-/// Reads one complete versioned JSON artifact for comparison.
+/// Reads one complete JSON artifact for comparison.
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
     let bytes = fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
     serde_json::from_slice(&bytes).map_err(|error| format!("decode {}: {error}", path.display()))
@@ -895,9 +894,6 @@ fn summarize_routing(arguments: &[OsString]) -> Result<(), String> {
         let bytes = fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
         let suite: BenchmarkSuite =
             serde_json::from_slice(&bytes).map_err(|e| format!("decode {path}: {e}"))?;
-        if suite.schema_version != REPORT_SCHEMA_VERSION {
-            return Err(format!("unsupported report schema in {path}"));
-        }
         for report in suite.reports {
             let Some(experiment) = report.configuration.routing_experiment else {
                 return Err(format!("{path} is not a routing experiment"));

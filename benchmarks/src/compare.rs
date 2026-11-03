@@ -63,9 +63,6 @@ pub fn compare(
     candidate: &BenchmarkSuite,
     policy: ComparisonPolicy,
 ) -> Result<ComparisonReport, String> {
-    if baseline.schema_version != candidate.schema_version {
-        return Err("baseline and candidate report schema versions differ".to_owned());
-    }
     if !policy.maximum_relative_regression.is_finite()
         || policy.maximum_relative_regression < 0.0
         || !policy.maximum_recall_drop.is_finite()
@@ -1167,9 +1164,9 @@ mod tests {
     use crate::report::{
         BenchmarkReport, BenchmarkSuite, BudgetConfiguration, BudgetSummary, Configuration,
         DatasetMetadata, Distribution, Environment, LifecycleMeasurements, OperationClass,
-        OperationSummary, QualityPoint, QualitySweepMeasurements, REPORT_SCHEMA_VERSION,
-        RecallSummary, ReportMeasurements, SearchBudgetConfiguration, SteadyStateMeasurements,
-        WorkloadDispatch, WriteAmplification,
+        OperationSummary, QualityPoint, QualitySweepMeasurements, RecallSummary,
+        ReportMeasurements, SearchBudgetConfiguration, SteadyStateMeasurements, WorkloadDispatch,
+        WriteAmplification,
     };
 
     use super::{ComparisonPolicy, ComparisonReport, compare, compare_quality_sweep};
@@ -1298,7 +1295,6 @@ mod tests {
 
     fn suite(report: BenchmarkReport) -> BenchmarkSuite {
         BenchmarkSuite {
-            schema_version: REPORT_SCHEMA_VERSION,
             reproduction_command: "ktann-bench run".to_owned(),
             reports: vec![report],
         }

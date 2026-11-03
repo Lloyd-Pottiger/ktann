@@ -8,13 +8,14 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
 use crate::api::{Error, ErrorKind, Result};
+use crate::storage::FORMAT_VERSION;
 
-const MAGIC: &[u8; 8] = b"KTANNBF\x01";
-const HEADER_BYTES: u64 = 41;
+const MAGIC: &[u8; 7] = b"KTANNBF";
+const HEADER_BYTES: u64 = 42;
 const FRAME_OVERHEAD: u64 = 36;
 
-/// Size of the canonical version-1 artifact manifest.
-pub const ARTIFACT_MANIFEST_BYTES: usize = 89;
+/// Size of the canonical artifact manifest.
+pub const ARTIFACT_MANIFEST_BYTES: usize = 90;
 
 /// Identity of a completed input snapshot or construction artifact.
 ///
@@ -31,6 +32,16 @@ pub struct ArtifactManifest {
 }
 
 impl ArtifactManifest {
+    /// Canonical prefix shared by data files, manifests, and load checkpoints.
+    fn header(&self) -> [u8; HEADER_BYTES as usize] {
+        let mut bytes = [0; HEADER_BYTES as usize];
+        bytes[..7].copy_from_slice(MAGIC);
+        bytes[7..9].copy_from_slice(&FORMAT_VERSION.to_be_bytes());
+        bytes[9] = self.kind;
+        bytes[10..].copy_from_slice(&self.binding);
+        bytes
+    }
+
     /// Whether this identity denotes serving entries.
     pub(crate) const fn is_serving(&self) -> bool {
         self.kind == 3
@@ -48,7 +59,7 @@ impl ArtifactManifest {
 
     /// Digest of the header used by resumable entry checkpoints.
     pub(crate) fn initial_sha256(&self) -> [u8; 32] {
-        Sha256::digest(&self.encode()[..HEADER_BYTES as usize]).into()
+        Sha256::digest(self.header()).into()
     }
 
     /// Number of records or partitions in the artifact.
@@ -73,12 +84,10 @@ impl ArtifactManifest {
     #[must_use]
     pub fn encode(&self) -> [u8; ARTIFACT_MANIFEST_BYTES] {
         let mut bytes = [0; ARTIFACT_MANIFEST_BYTES];
-        bytes[..8].copy_from_slice(MAGIC);
-        bytes[8] = self.kind;
-        bytes[9..41].copy_from_slice(&self.binding);
-        bytes[41..49].copy_from_slice(&self.items.to_be_bytes());
-        bytes[49..57].copy_from_slice(&self.bytes.to_be_bytes());
-        bytes[57..].copy_from_slice(&self.digest);
+        bytes[..HEADER_BYTES as usize].copy_from_slice(&self.header());
+        bytes[42..50].copy_from_slice(&self.items.to_be_bytes());
+        bytes[50..58].copy_from_slice(&self.bytes.to_be_bytes());
+        bytes[58..].copy_from_slice(&self.digest);
         bytes
     }
 
@@ -87,21 +96,21 @@ impl ArtifactManifest {
         if bytes.len() != ARTIFACT_MANIFEST_BYTES {
             return Err(corrupt());
         }
-        if bytes[..7] != MAGIC[..7] {
+        if &bytes[..7] != MAGIC {
             return Err(corrupt());
         }
-        if bytes[7] != MAGIC[7] {
+        if u16::from_be_bytes(bytes[7..9].try_into().expect("fixed version")) != FORMAT_VERSION {
             return Err(Error::new(ErrorKind::UnsupportedFormat));
         }
-        if !matches!(bytes[8], 0 | 2 | 3) {
+        if !matches!(bytes[9], 0 | 2 | 3) {
             return Err(corrupt());
         }
         let manifest = Self {
-            kind: bytes[8],
-            binding: bytes[9..41].try_into().expect("fixed binding"),
-            items: u64::from_be_bytes(bytes[41..49].try_into().expect("fixed count")),
-            bytes: u64::from_be_bytes(bytes[49..57].try_into().expect("fixed length")),
-            digest: bytes[57..].try_into().expect("fixed digest"),
+            kind: bytes[9],
+            binding: bytes[10..42].try_into().expect("fixed binding"),
+            items: u64::from_be_bytes(bytes[42..50].try_into().expect("fixed count")),
+            bytes: u64::from_be_bytes(bytes[50..58].try_into().expect("fixed length")),
+            digest: bytes[58..].try_into().expect("fixed digest"),
         };
         if manifest.bytes < HEADER_BYTES
             || manifest.items > (manifest.bytes - HEADER_BYTES) / (FRAME_OVERHEAD + 1)
@@ -163,9 +172,7 @@ impl Writer {
             },
             quota,
         };
-        writer.write(MAGIC)?;
-        writer.write(&[kind])?;
-        writer.write(&binding)?;
+        writer.write(&writer.manifest.header())?;
         Ok(writer)
     }
 
@@ -287,7 +294,13 @@ impl Reader {
         };
         let mut header = [0; HEADER_BYTES as usize];
         reader.read(&mut header)?;
-        if &header[..8] != MAGIC || header[8] != expected.kind || header[9..] != expected.binding {
+        if &header[..7] != MAGIC {
+            return Err(corrupt());
+        }
+        if u16::from_be_bytes(header[7..9].try_into().expect("fixed version")) != FORMAT_VERSION {
+            return Err(Error::new(ErrorKind::UnsupportedFormat));
+        }
+        if header[9] != expected.kind || header[10..] != expected.binding {
             return Err(corrupt());
         }
         Ok(reader)

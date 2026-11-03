@@ -1,6 +1,6 @@
 # ADR 0026: Reserve Bulk Builds through the Index lifecycle
 
-Status: Accepted
+Status: Accepted; format-version paragraph amended 2026-11-03.
 
 ## Context
 
@@ -18,11 +18,10 @@ Abort permits only unpublished identities and uses the existing Dropping cleanup
 Caller-owned source files survive abort. No worker-owned files are created until
 a durable namespace cleanup ledger exists.
 
-Advance the persistent format from 1 to 2, adding lifecycle byte 2, descriptor key
-kind 0x05, and value tag 0x0d. Existing formats fail closed; there is no released
-compatibility requirement. The independently versioned source artifact format
-remains unchanged. This extends ADR 0017's lifecycle and follows ADR 0018's
-explicit format-version rule.
+The persistent format includes lifecycle byte 2, descriptor key kind 0x05, and
+value tag 0x0d. Index storage and bulk artifacts share the format version defined
+in ADR 0018; unsupported versions fail closed. There is no released compatibility
+requirement. This extends ADR 0017's lifecycle.
 
 ## Consequences
 

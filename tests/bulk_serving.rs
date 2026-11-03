@@ -380,7 +380,7 @@ fn serving_empty_input_and_resource_failures_never_seal_partial_output() {
                 ("memory", 1, 1 << 20, 1 << 20, 1 << 20),
                 ("scratch", 8 << 20, 1, 1 << 20, 1 << 20),
                 ("value", 8 << 20, 64 << 20, 8, 1 << 20),
-                ("output", 8 << 20, 64 << 20, 1 << 20, 130),
+                ("output", 8 << 20, 64 << 20, 1 << 20, 132),
             ] {
                 let failed = directory.0.join(label);
                 let mut limits = serving_options();
@@ -405,7 +405,7 @@ fn rewrite_forest(
     use sha2::{Digest, Sha256};
     let bytes = fs::read(path.join("data.bin")).unwrap();
     let mut frames = Vec::new();
-    let mut cursor = 41;
+    let mut cursor = 42;
     while cursor < bytes.len() {
         let size = u32::from_be_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
         cursor += 4;
@@ -413,16 +413,16 @@ fn rewrite_forest(
         cursor += size + 32;
     }
     edit(&mut frames);
-    let mut data = bytes[..41].to_vec();
+    let mut data = bytes[..42].to_vec();
     for frame in &frames {
         data.extend_from_slice(&(frame.len() as u32).to_be_bytes());
         data.extend_from_slice(frame);
         data.extend_from_slice(&Sha256::digest(frame));
     }
     let mut manifest = artifact.encode();
-    manifest[41..49].copy_from_slice(&(frames.len() as u64).to_be_bytes());
-    manifest[49..57].copy_from_slice(&(data.len() as u64).to_be_bytes());
-    manifest[57..].copy_from_slice(&Sha256::digest(&data));
+    manifest[42..50].copy_from_slice(&(frames.len() as u64).to_be_bytes());
+    manifest[50..58].copy_from_slice(&(data.len() as u64).to_be_bytes());
+    manifest[58..].copy_from_slice(&Sha256::digest(&data));
     fs::write(path.join("data.bin"), data).unwrap();
     fs::write(path.join("manifest.bin"), manifest).unwrap();
     ktann::bulk::ArtifactManifest::decode(&manifest).unwrap()

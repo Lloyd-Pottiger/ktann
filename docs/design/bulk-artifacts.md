@@ -60,8 +60,11 @@ The forest binding includes all four capacities. The serving binding includes
 the target Manifest and forest identity. Capacity is not part of the source
 record schema.
 
-A versioned header binds each data file to its kind and configuration identity.
-Frames carry bounded lengths and SHA-256 checksums. The 89-byte Artifact Manifest
+Index storage and bulk artifacts share `storage::FORMAT_VERSION`. Both the
+data header and Artifact Manifest begin with `KTANNBF`, the big-endian u16
+format version, the kind byte, and the 32-byte configuration binding. Unsupported
+versions return `UnsupportedFormat`; type and integrity failures return `Corruption`.
+Frames carry bounded lengths and SHA-256 checksums. The 90-byte Artifact Manifest
 records the kind, binding, item count, total data length, and whole-file SHA-256.
 The caller must persist a trusted expected manifest separately; checksums alone
 are not authentication against replacement of both the data and its identity.

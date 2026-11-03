@@ -437,7 +437,7 @@ async fn empty_load_and_checkpoint_codec_are_canonical_and_fail_closed() {
     let value = ValueCodec::bootstrap()
         .encode(&PersistentValue::BuildLoad(load.clone()))
         .unwrap();
-    let mut expected = vec![14, 0, 0, 0, 89];
+    let mut expected = vec![14, 0, 0, 0, 90];
     expected.extend_from_slice(&artifact.manifest().encode());
     expected.extend_from_slice(&1_u64.to_be_bytes());
     expected.extend_from_slice(&0_u64.to_be_bytes());
@@ -453,7 +453,7 @@ async fn empty_load_and_checkpoint_codec_are_canonical_and_fail_closed() {
         ]
         .concat()
     );
-    for (offset, replacement) in [(101, 0), (109, 1), (142, 2), (13, 2)] {
+    for (offset, replacement) in [(102, 0), (110, 1), (143, 2), (14, 2)] {
         let mut invalid = value.clone();
         invalid[offset] = replacement;
         assert_eq!(
@@ -639,13 +639,13 @@ async fn replay_checks_the_exact_previously_committed_prefix_before_skipping_it(
     let path = dir.0.join("serving/data.bin");
     let original = fs::read(&path).unwrap();
     let mut forged = original.clone();
-    let length = u32::from_be_bytes(forged[41..45].try_into().unwrap()) as usize;
-    let end = 45 + length;
-    let key_length = u32::from_be_bytes(forged[45..49].try_into().unwrap()) as usize;
-    let value = 49 + key_length;
+    let length = u32::from_be_bytes(forged[42..46].try_into().unwrap()) as usize;
+    let end = 46 + length;
+    let key_length = u32::from_be_bytes(forged[46..50].try_into().unwrap()) as usize;
+    let value = 50 + key_length;
     assert_eq!(forged[value], 4); // Vector Record, eight-byte ID and dimension.
     forged[value + 15..value + 19].copy_from_slice(&2_f32.to_be_bytes());
-    let digest = Sha256::digest(&forged[45..end]);
+    let digest = Sha256::digest(&forged[46..end]);
     forged[end..end + 32].copy_from_slice(&digest);
     fs::write(&path, forged).unwrap();
     // Every frame is well formed, but final file identity must fail.

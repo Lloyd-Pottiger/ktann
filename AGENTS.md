@@ -97,7 +97,7 @@ Production code uses no nightly features.
   cannot depend on a durable worker, lease, or coordinator.
 - Persistent Logical Index IDs and Partition Keys are never reused. Gaps are
   valid. Follow `docs/design/storage.md` for explicit format changes and
-  independent key/value codec versioning.
+  the shared index-storage and bulk-artifact format version.
 - Use canonical, deterministic codecs. Reject malformed and noncanonical
   bytes; do not silently normalize persistent data.
 - Fail closed: invalid persistent encoding or invariant mismatches are

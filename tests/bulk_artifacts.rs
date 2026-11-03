@@ -146,7 +146,7 @@ fn input_failures_and_quota_exhaustion_never_seal_or_overwrite() {
     assert_eq!(fs::read(failed.join("data.partial")).unwrap(), partial);
     let quota = directory.0.join("quota");
     assert_eq!(
-        InputSnapshot::create(&quota, config(), 130, [Ok(record(0))])
+        InputSnapshot::create(&quota, config(), 132, [Ok(record(0))])
             .err()
             .unwrap()
             .kind(),
@@ -181,8 +181,8 @@ fn changed_truncated_extended_and_forged_length_files_are_rejected() {
                 bytes.pop();
             }
             2 => bytes.push(0),
-            3 => bytes[41..45].copy_from_slice(&u32::MAX.to_be_bytes()),
-            _ => bytes[9] ^= 1,
+            3 => bytes[42..46].copy_from_slice(&u32::MAX.to_be_bytes()),
+            _ => bytes[10] ^= 1,
         }
         fs::write(path.join("data.bin"), bytes).unwrap();
         assert_eq!(snapshot.verify().unwrap_err().kind(), ErrorKind::Corruption);
@@ -196,8 +196,8 @@ fn swapping_valid_frames_fails_whole_file_identity_before_plan_sealing() {
     let snapshot =
         InputSnapshot::create(&path, config(), 1_000_000, [Ok(record(0)), Ok(record(1))]).unwrap();
     let mut bytes = fs::read(path.join("data.bin")).unwrap();
-    let frame_size = (bytes.len() - 41) / 2;
-    bytes[41..].rotate_left(frame_size);
+    let frame_size = (bytes.len() - 42) / 2;
+    bytes[42..].rotate_left(frame_size);
     fs::write(path.join("data.bin"), bytes).unwrap();
     let mut reader = snapshot.reader().unwrap();
     assert_eq!(reader.next().unwrap().unwrap().id(), record(1).id());
@@ -231,18 +231,27 @@ fn manifest_identity_and_version_are_checked_independently_of_data() {
     let mut encoded = b.manifest().encode();
     assert_eq!(encoded.len(), ARTIFACT_MANIFEST_BYTES);
     for kind in [1, 4, u8::MAX] {
-        encoded[8] = kind;
+        encoded[9] = kind;
         assert_eq!(
             ArtifactManifest::decode(&encoded).unwrap_err().kind(),
             ErrorKind::Corruption
         );
     }
     encoded = b.manifest().encode();
-    encoded[7] += 1;
-    assert_eq!(
-        ArtifactManifest::decode(&encoded).unwrap_err().kind(),
-        ErrorKind::UnsupportedFormat
-    );
+    let mut data = fs::read(second.join("data.bin")).unwrap();
+    let version = ktann::storage::FORMAT_VERSION.to_be_bytes();
+    assert_eq!(&encoded[7..9], &version);
+    assert_eq!(&data[7..9], &version);
+    for unsupported in [0_u16, 2, 256, u16::MAX] {
+        encoded[7..9].copy_from_slice(&unsupported.to_be_bytes());
+        assert_eq!(
+            ArtifactManifest::decode(&encoded).unwrap_err().kind(),
+            ErrorKind::UnsupportedFormat
+        );
+        data[7..9].copy_from_slice(&unsupported.to_be_bytes());
+        fs::write(second.join("data.bin"), &data).unwrap();
+        assert_eq!(b.verify().unwrap_err().kind(), ErrorKind::UnsupportedFormat);
+    }
     assert_eq!(
         ArtifactManifest::decode(&encoded[..encoded.len() - 1])
             .unwrap_err()
@@ -545,7 +554,7 @@ fn forest_rejects_cross_tree_duplicates_before_output_and_enforces_quotas() {
     assert!(!invalid.exists());
     let full = directory.0.join("full");
     assert_eq!(
-        ForestArtifact::build(&full, &unique, [0; 32], forest_options(), 130)
+        ForestArtifact::build(&full, &unique, [0; 32], forest_options(), 132)
             .err()
             .unwrap()
             .kind(),
@@ -565,7 +574,7 @@ fn empty_snapshot_and_forest_have_no_records_or_trees() {
         let input = InputSnapshot::create(
             &directory.0.join(format!("input-{index}")),
             config,
-            130,
+            132,
             std::iter::empty(),
         )
         .unwrap();
@@ -576,7 +585,7 @@ fn empty_snapshot_and_forest_have_no_records_or_trees() {
             &input,
             [0; 32],
             forest_options(),
-            130,
+            132,
         )
         .unwrap();
         assert_eq!(artifact.manifest().items(), 0);
@@ -604,8 +613,8 @@ fn forest_reader_rejects_invalid_tree_envelopes_and_premature_roots() {
         let (artifact, _) =
             ForestArtifact::build(&path, &input, [0; 32], forest_options(), 1024 * 1024).unwrap();
         let mut data = fs::read(path.join("data.bin")).unwrap();
-        let length = u32::from_be_bytes(data[41..45].try_into().unwrap()) as usize;
-        let body = &mut data[45..45 + length];
+        let length = u32::from_be_bytes(data[42..46].try_into().unwrap()) as usize;
+        let body = &mut data[46..46 + length];
         if root_early {
             let tree_len = u32::from_be_bytes(body[..4].try_into().unwrap()) as usize;
             body[4 + tree_len..12 + tree_len].copy_from_slice(&1_u64.to_be_bytes());
@@ -613,9 +622,9 @@ fn forest_reader_rejects_invalid_tree_envelopes_and_premature_roots() {
             body[..4].copy_from_slice(&u32::MAX.to_be_bytes());
         }
         let frame_hash = Sha256::digest(body);
-        data[45 + length..77 + length].copy_from_slice(&frame_hash);
+        data[46 + length..78 + length].copy_from_slice(&frame_hash);
         let mut manifest = artifact.manifest().encode();
-        manifest[57..].copy_from_slice(&Sha256::digest(&data));
+        manifest[58..].copy_from_slice(&Sha256::digest(&data));
         fs::write(path.join("data.bin"), &data).unwrap();
         fs::write(path.join("manifest.bin"), manifest).unwrap();
         let reopened = ForestArtifact::open(

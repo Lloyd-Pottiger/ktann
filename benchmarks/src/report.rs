@@ -4,14 +4,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-/// Current complete benchmark suite/report JSON contract.
-pub const REPORT_SCHEMA_VERSION: u32 = 1;
-
 /// Reports produced by one suite command on one comparable host.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BenchmarkSuite {
-    /// Version of the complete suite/report JSON contract.
-    pub schema_version: u32,
     /// Exact command that reproduces the suite.
     pub reproduction_command: String,
     /// Scenario reports, each measured in an isolated worker process.

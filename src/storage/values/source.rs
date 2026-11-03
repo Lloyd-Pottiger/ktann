@@ -9,7 +9,7 @@ use super::record::{decode_record_id, encode_record_id};
 use super::wire::{Decoder, Encoder};
 use super::{ValueKind, corrupt};
 
-// This body is framed by the independently versioned bulk input format. Reuse
+// This body is framed by the shared persistent bulk input format. Reuse
 // the serving primitives so original vectors and typed fields have one canonical
 // representation, without inventing an Index Manifest before name reservation.
 pub(crate) fn encode(config: &IndexConfig, record: &mut Record) -> Result<Vec<u8>> {
