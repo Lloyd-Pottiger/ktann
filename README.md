@@ -1,218 +1,142 @@
 # KTANN
 
-**Vector search that stays in step with your data.**
+KTANN is an embeddable Rust library for approximate nearest-neighbor search over
+vectors and typed metadata. It stores records and their index entries together
+in a transactional key-value backend, so inserts, updates, and deletes become
+searchable atomically.
 
-KTANN (**K-means Tree Approximate Nearest Neighbor**) is an embeddable Rust
-library for transactional vector search. It commits vectors, metadata, and
-index membership together, and keeps its K-means trees searchable as they grow
-and rebalance. Build semantic search, recommendations, and retrieval into your
-application with the storage backend that fits your deployment.
+Use KTANN to add filtered vector search to an application that owns its storage
+and service layer. It supports in-memory, embedded, and distributed storage;
+it does not provide a standalone database server or generate embeddings.
 
-## Project goals
+**Status:** active development, with no stable release. APIs and persistent
+formats may change without backward compatibility. The core search engine,
+three storage adapters, online updates, and resumable initial builds are
+implemented. The scalability goals below are not claims of validated capacity.
+
+## Capabilities
+
+- **Filtered search.** L2, cosine, and inner-product search with typed metadata
+  predicates using SQL `WHERE` semantics. Every returned hit satisfies the filter.
+- **Continuous updates.** Insert, upsert, delete, and atomic batches. Background
+  splits and merges keep the index searchable as its structure changes.
+- **Consistent reads.** Each query uses one backend snapshot, including filtering
+  and exact distance calculation over the selected candidates.
+- **Initial construction.** Build an index from an immutable input snapshot,
+  resume interrupted work, and publish it when loading and validation finish.
+- **Bounded query work.** Search budgets limit traversal and reranking; results
+  report budget exhaustion. Approximate search can miss neighbors or return fewer
+  than the requested number of hits.
+
+## Storage backends
+
+Choose a backend for the deployment. All adapters share the logical transaction
+contract and core index algorithms.
+
+| Backend | Use | Setup |
+| --- | --- | --- |
+| [Memory](ktann-memory/README.md) | Ephemeral indexes and local development | No external service; data is lost on restart |
+| [RocksDB](ktann-rocksdb/README.md) | Persistent embedded storage | C++ toolchain and Clang/libclang for builds |
+| [FoundationDB](ktann-foundationdb/README.md) | Distributed transactional storage | FoundationDB 7.3 client library and a running cluster |
+
+Your application owns backend initialization and lifetime. Shut down the KTANN
+runtime before the backend. Physical index data is not portable between backends.
+
+## Try it
+
+From a checkout, using the latest stable Rust toolchain:
+
+```sh
+cargo run --example basic
+```
+
+The [complete example](examples/basic.rs) creates an in-memory index, inserts a
+three-dimensional vector, searches it, and shuts down the runtime. Its main
+operations are:
+
+```rust
+let runtime = Runtime::new(MemoryBackend::new(), RuntimeConfig::default())?;
+let index = runtime
+    .create_index("vectors", IndexConfig::new(3, Metric::L2)?)
+    .await?;
+
+index
+    .insert(Record::new(
+        Bytes::from_static(b"first"),
+        vec![1.0, 0.0, 0.0],
+        vec![],
+    )?)
+    .await?;
+
+let result = index
+    .search(SearchRequest::new(vec![1.0, 0.0, 0.0], 1)?)
+    .await?;
+```
+
+To embed KTANN, use the `ktann` crate and a storage adapter from this checkout as
+path dependencies. Start with the [Memory adapter guide](ktann-memory/README.md),
+then see the [API guide](docs/design/api.md) for schemas, filters, updates, and
+search options. For initial datasets, see [Bulk Build](docs/design/bulk-build.md).
+
+## Project direction
 
 Strong scalability, query and filtering capabilities, continuous updates, and
-ease of use together define KTANN's product requirements.
+ease of use define the product requirements. KTANN targets both large datasets
+that need distributed storage and execution, and small datasets that should run
+efficiently on a single machine. These goals are not tied to particular backends.
+High recall, fast construction, high query throughput, and low latency matter
+across all backends.
 
-KTANN targets two complementary deployment scenarios, without tying dataset
-scale to a particular backend:
+Distributed Bulk Build is a requirement; distributed incremental writes are also
+a desired capability. The current bulk scheduler distributes whole jobs across
+workers with shared-filesystem requirements. It does not distribute the
+construction of a single index across workers.
 
-- **Large datasets:** scale through distributed storage and execution.
-  Bulk Build must support distributed execution; distributed incremental writes
-  are also a desired capability.
-- **Small datasets:** run efficiently on a single machine, without unnecessary
-  distributed coordination overhead.
+Strict read/write separation means queries do not mutate the index or perform
+structure maintenance. Read capacity should scale independently of writes;
+distributed storage alone does not establish this scalability.
 
-Across all backends, KTANN aims for strong recall, fast construction, high query
-throughput, and low latency.
-
-Strict separation of reads and writes is an architectural goal: query execution
-must not perform mutations or structure maintenance, and read capacity should
-scale independently of write capacity. Distributed storage alone does not
-establish scalable construction, writes, or reads.
-
-These are project targets, not claims of validated capacity or completed
-distributed execution support. Current implementation status is described below;
-scale and performance claims require workload-specific evidence.
-
-Required capabilities and correctness define which designs are acceptable.
-Within those requirements, continuously pursue better whole-system performance:
-faster construction, higher QPS, and lower latency at comparable recall, accounting
-for resource costs and operability. Complexity must be justified by a required
-capability or a meaningful, measured benefit; when outcomes are comparable, choose
-the simpler design. Observability supports validation and operation of those
-guarantees.
-
-## Why KTANN?
-
-- **One atomic write, a consistent index.** Each insert, update, or delete
-  commits the record, its location, its leaf membership, counts, and affected
-  metadata together. Atomic batches use the same contract.
-- **Built for changing data.** Online inserts, updates, and deletes do not
-  require rebuilding the index. Background splits and merges preserve a
-  searchable topology at every committed step.
-- **In-memory, embedded, or distributed storage.** Use Memory for ephemeral
-  indexes, RocksDB for embedded persistence, or FoundationDB for transactional
-  distributed storage. All adapters share
-  a logical transaction contract and core index algorithms.
-- **Filters that mean what they say.** Typed metadata predicates use SQL
-  `WHERE` semantics. Partition summaries prune unnecessary work; every returned
-  hit passes exact filtering.
-- **Fast candidate selection, precise distances.** Centroid routing and
-  RaBitQ7 quantization narrow the search, then original vectors provide exact
-  reranking. L2, cosine, and inner-product metrics are supported.
-- **Control over work and resources.** Search budgets bound tree enumeration,
-  partition visits, and exact reranking. Results expose budget truncation;
-  runtime admission, caches, queues, retries, and maintenance concurrency are
-  bounded too.
-- **Operations are part of the design.** Bounded batch mutations,
-  read-only index verification, metrics, tracing, and graceful shutdown support
-  the full lifecycle of an index.
-
-The core library, all three storage adapters, search, online maintenance, batch loading,
-and verification are implemented. KTANN is pre-1.0: APIs and persistent formats
-may change, and there is no stable release yet.
-
-The [`bulk` module](docs/design/bulk-artifacts.md) prepares bounded offline input,
-forest, and serving artifacts. Backend loading and publication are outside this
-module.
+Within the required capabilities and correctness guarantees, continuously pursue
+better whole-system performance at comparable recall. Additional complexity must
+provide a required capability or a meaningful, measured benefit; when outcomes
+are comparable, choose the simpler design. Observability supports validation and
+operation. [AGENTS.md](AGENTS.md) records the engineering rules.
 
 ## How it works
 
-```text
-Your application
-       |
-       v
-KTANN Runtime + Index
-  Atomic mutations | Filtered ANN search | Background maintenance
-       |
-       v
-Backend-neutral transaction contract
-       |
-       +-- Memory          ephemeral in-process storage
-       +-- RocksDB         embedded storage
-       +-- FoundationDB    distributed storage
-```
+KTANN stands for **K-means Tree Approximate Nearest Neighbor**. It organizes vectors
+in centroid-routing trees. Optional metadata fields called **Tree Keys** separate
+records into trees, allowing queries to route by values such as tenant or
+collection. Within a tree, centroid routing and conservative metadata summaries
+narrow the search. Compact RaBitQ7 representations rank candidates before exact
+reranking over the original vectors.
 
-Caller-declared **Tree Key** fields divide an index into disjoint shards, each
-with a centroid-routing tree. This lets applications route searches
-by fields such as tenant or collection. Internal partitions route by centroid
-distance; leaf partitions apply exact predicates and rank compact RaBitQ7
-representations before reranking over the original vectors. Bulk Build groups all
-tree levels with the same bounded multi-center protocol; online maintenance uses
-balanced binary splits.
+Exact reranking gives exact distances for selected candidates; it does not make
+the overall search exact. See the [architecture overview](docs/design/overview.md)
+and [search design](docs/design/search.md) for the full contracts.
 
-Each search uses a single consistent backend snapshot. Approximate candidate
-selection can miss true nearest neighbors, even when it returns `k` hits;
-exact reranking guarantees the distances of selected candidates, not global
-exact top-k recall.
-
-KTANN is a library: your application owns the service interface and storage
-lifecycle. Backend physical keyspaces are not portable between RocksDB and
-FoundationDB.
-
-## Get started
-
-Use the latest stable Rust toolchain. The [Memory adapter](ktann-memory/README.md)
-needs no native libraries or external services. RocksDB builds require a C++ toolchain
-and Clang/libclang; FoundationDB additionally requires its 7.3 native client
-library. See the
-[RocksDB](ktann-rocksdb/README.md) and
-[FoundationDB](ktann-foundationdb/README.md) adapter guides for integration.
-
-From a checkout:
+## Development and benchmarks
 
 ```sh
-make build       # Core, Memory and RocksDB adapters, and benchmark tools
-make test        # Tests that do not need a FoundationDB installation
-make doc         # Generate API documentation in target/doc
-make bench       # Run the optimized RocksDB smoke benchmark
-cargo test -p ktann-memory  # Memory adapter, no native dependencies
+make verify      # Format, lint, and test without FoundationDB
+make bench       # Run the RocksDB smoke benchmark
+make help        # List targets, including FoundationDB checks
 ```
 
-For embedding, use the `ktann` crate together with a storage adapter. Construct
-a `Runtime` from the adapter and a `RuntimeConfig`, create or open an `Index`,
-then call `insert`, `upsert`, `delete`, `batch_mutate`, and `search` on it.
-Call `Runtime::shutdown` before shutting down the backend. The
-[public API guide](docs/design/api.md) documents configuration, typed records,
-filters, request controls, and result semantics; the
-[adapter recall test](tests/support/adapter_recall.rs) exercises this flow
-against both real storage engines.
+Smoke benchmarks check the harness, not performance. Use the
+[benchmark guide](benchmarks/README.md) for full runs, datasets, recall comparisons,
+and VectorDBBench integration. Performance claims should include workload,
+recall, latency, throughput, and resource costs.
 
-### Initial Bulk Build
-
-For a finite initial dataset, write an immutable `bulk::InputSnapshot`, reserve
-with `Runtime::start_bulk_build`, and call `BulkBuildJob::complete` with an
-existing durable workspace. It prepares and loads artifacts, performs resumable
-exact backend validation, and returns the ordinary Active `Index`. The name remains unavailable to reads
-and online mutations until publication. Reopen a job with `open_bulk_build` to
-resume, or abort it and reclaim its owned files. See the [Bulk Build contract](docs/design/bulk-build.md) for options, filesystem semantics,
-and bounded cleanup. To distribute queued jobs automatically, call `job.schedule(worker_options)`
-and run `Runtime::run_bulk_scheduler` on each worker process. Renewable leases
-provide automatic takeover after process loss; each job remains a coarse unit
-of work. FoundationDB supports separate worker processes, while RocksDB remains
-in its owning process. Shared-filesystem deployment requirements still apply.
-
-## Performance you can measure
-
-KTANN combines compact candidate ranking, byte-bounded partition caches, and
-incremental maintenance to keep search and updates practical as data changes.
-Its benchmark suite measures the costs together: recall, latency distributions,
-throughput, CPU, memory, backend IO, contention, and write amplification.
-
-Reproduce measurements on your hardware:
-
-```sh
-make bench PROFILE=full
-make bench PROFILE=full BENCH_ARGS="--scenario import-to-search-lifecycle"
-# Requires the FoundationDB native client and a running local cluster:
-make bench-fdb PROFILE=full
-```
-
-Reports go to `.benchmark-data/results/` by default. Use a distinct
-`REPORT_DIR` to preserve runs for comparison. The suite also provides **Cohere
-1M and SIFT1M** quality profiles and a **VectorDBBench bridge**. See the
-[benchmark guide](benchmarks/README.md) for dataset setup, measurement boundaries,
-recall curves, and report comparison. Smoke profiles check the harness; use
-optimized full profiles on an otherwise idle host for performance analysis.
-
-## Development
-
-Run `make help` for all targets. `make verify` runs formatting checks, Clippy,
-and tests without FoundationDB. After configuring its native client,
-`make verify-all` checks all workspace packages and features;
-`make test-fdb` runs the cluster-dependent integration tests. Durability tests
-require separate process or server restarts as described in the adapter guides.
-
-| Crate | Responsibility |
-| --- | --- |
-| `ktann` | Public API, tree algorithms, search, maintenance, logical storage, and codecs |
-| `ktann-rocksdb` | RocksDB transactions, resource admission, and error mapping |
-| `ktann-foundationdb` | FoundationDB transactions, keyspace, limits, and error mapping |
-| `ktann-benchmarks` | ANN quality, lifecycle benchmarks, and VectorDBBench integration |
-
-## Documentation
-
-- [Documentation guide](docs/README.md): module ownership, reading paths, and the complete ADR index.
-- [Architecture](docs/design/overview.md): boundaries, invariants, and module ownership.
-- [Filtering](docs/design/filtering.md): typed predicates, NULL semantics, Tree Key planning, and synopsis invariants.
-- [API](docs/design/api.md): lifecycle, mutations, filters, and search requests.
-- [Bulk Build](docs/design/bulk-build.md) and [offline artifacts](docs/design/bulk-artifacts.md): initial construction, recovery, publication, and cleanup.
-- [Search](docs/design/search.md): routing, ranking, caches, and query budgets.
-- [Operations](docs/design/runtime-operations.md): maintenance, refinement, verification, telemetry, and shutdown.
-- [Storage](docs/design/storage.md) and [maintenance](docs/design/maintenance.md): transaction and topology contracts.
-- [Domain glossary](CONTEXT.md) and [architectural decisions](docs/adr/): terminology and rationale.
-- [Benchmarks](benchmarks/README.md): reproducible quality and performance evaluation.
-- [Contributor guidance](AGENTS.md): engineering rules and validation commands.
+The [documentation guide](docs/README.md) links the module designs and architectural
+decisions. [CONTEXT.md](CONTEXT.md) defines domain terminology and system invariants.
 
 ## Influences
 
 KTANN draws on CockroachDB's
-[C-SPANN vector index](https://github.com/cockroachdb/cockroach/tree/master/pkg/sql/vecindex/cspann)
-and Xu et al., [*SPFresh: Incremental In-Place Update for Billion-Scale Vector
-Search*](https://doi.org/10.1145/3600006.3613166), SOSP 2023. It adapts these ideas
-around its own backend-neutral transaction contract, filtering model, persistent
-format, and operational invariants.
+[C-SPANN](https://github.com/cockroachdb/cockroach/tree/master/pkg/sql/vecindex/cspann)
+and [SPFresh](https://doi.org/10.1145/3600006.3613166), SOSP 2023.
 
 ## License
 
-Licensed under the [MIT License](LICENSE).
+[MIT](LICENSE).
