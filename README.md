@@ -29,9 +29,10 @@ compatibility. Distributed execution and scalability goals are described under
   metadata predicates using SQL `WHERE` semantics. Route by fields such as tenant
   or collection, prune partitions using metadata summaries, and apply exact
   filtering to returned hits.
-- **Narrow the search before reading full vectors.** Centroid routing and compact
-  RaBitQ7 representations select candidates; original vectors provide exact final
-  distances. L2, cosine, and inner-product metrics are supported.
+- **Combine partitioned storage with graph-accelerated routing.** Optional local
+  HNSW graphs accelerate centroid selection within internal partitions. Compact
+  RaBitQ7 representations rank leaf candidates before original vectors provide
+  exact final distances. L2, cosine, and inner-product metrics are supported.
 - **Choose storage to fit the application.** Use Memory for ephemeral indexes,
   RocksDB for embedded persistence, or FoundationDB for distributed transactional
   storage, through the same index API and logical transaction contract.
@@ -40,6 +41,17 @@ compatibility. Distributed execution and scalability goals are described under
   after loading and validation. Interrupted work can resume.
 
 ## How it works
+
+KTANN combines a partitioned tree over transactional storage with optional
+partition-local HNSW routing. Its design draws on
+[C-SPANN](https://www.cockroachlabs.com/blog/cspann-real-time-indexing-billions-vectors/)
+for distributed tree indexing, and on
+[SPANN](https://www.microsoft.com/en-us/research/wp-content/uploads/2021/11/SPANN_finalversion1.pdf)
+and [SPFresh](https://arxiv.org/html/2410.14452v1) for centroid-based partition
+selection and incremental rebalancing. SPANN and SPFresh use SPTAG for their
+centroid index; KTANN uses HNSW locally within internal partitions, keeping the
+tree as the storage and ownership structure. See the
+[partition-local HNSW design](docs/design/partition-local-hnsw.md) for details.
 
 KTANN organizes vectors in centroid-routing trees. Optional metadata fields called
 **Tree Keys** separate records into trees, so a query can first select the relevant
@@ -161,12 +173,6 @@ recall, latency, throughput, and resource costs.
 
 The [documentation guide](docs/README.md) links the module designs and architectural
 decisions. [CONTEXT.md](CONTEXT.md) defines domain terminology and system invariants.
-
-## Influences
-
-KTANN draws on CockroachDB's
-[C-SPANN](https://github.com/cockroachdb/cockroach/tree/master/pkg/sql/vecindex/cspann)
-and [SPFresh](https://doi.org/10.1145/3600006.3613166), SOSP 2023.
 
 ## License
 
