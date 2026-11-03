@@ -47,22 +47,18 @@ tenant or collection. Within each tree, internal partitions route by centroid
 distance and leaves hold vector entries.
 
 ```text
-Query vector + metadata filter
-              |
-              v
-    Select relevant trees
-              |
-              v
- Route by centroids; prune with metadata summaries
-              |
-              v
- Filter and rank candidates using compact vector codes
-              |
-              v
- Rerank selected candidates using original vectors
-              |
-              v
-       IDs + exact distances
+Your application
+       |
+       v
+KTANN Runtime + Index
+  Atomic mutations | Filtered ANN search | Background maintenance
+       |
+       v
+Backend-neutral transaction contract
+       |
+       +-- Memory          ephemeral in-process storage
+       +-- RocksDB         embedded storage
+       +-- FoundationDB    distributed storage
 ```
 
 Records and index entries live in the same transactional backend. Foreground
