@@ -42,15 +42,13 @@ compatibility. Distributed execution and scalability goals are described under
 
 ## How it works
 
-KTANN combines a partitioned tree over transactional storage with optional
-partition-local HNSW routing. Its design draws on
-[C-SPANN](https://www.cockroachlabs.com/blog/cspann-real-time-indexing-billions-vectors/)
-for distributed tree indexing, and on
+KTANN combines
+[C-SPANN](https://www.cockroachlabs.com/blog/cspann-real-time-indexing-billions-vectors/)-style
+partitioned trees with optional HNSW-accelerated local routing, drawing on
 [SPANN](https://www.microsoft.com/en-us/research/wp-content/uploads/2021/11/SPANN_finalversion1.pdf)
-and [SPFresh](https://arxiv.org/html/2410.14452v1) for centroid-based partition
-selection and incremental rebalancing. SPANN and SPFresh use SPTAG for their
-centroid index; KTANN uses HNSW locally within internal partitions, keeping the
-tree as the storage and ownership structure. See the
+and [SPFresh](https://arxiv.org/html/2410.14452v1)'s centroid-based search and
+incremental maintenance. HNSW operates within internal partitions, while the tree
+remains the storage and ownership structure. See the
 [partition-local HNSW design](docs/design/partition-local-hnsw.md) for details.
 
 KTANN organizes vectors in centroid-routing trees. Optional metadata fields called
