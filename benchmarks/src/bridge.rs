@@ -1,4 +1,4 @@
-//! Versioned, benchmark-only Unix socket bridge for spawned VectorDBBench clients.
+//! Benchmark-only Unix socket bridge for spawned VectorDBBench clients.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -25,7 +25,6 @@ use crate::resource::ResourceSnapshot;
 mod bulk;
 
 /// Length-prefixed frames carry JSON control requests or binary float32 inserts.
-const VERSION: u32 = 1;
 const MAX_FRAME: usize = 8 << 20;
 const MAX_BATCH: usize = 50;
 const MAX_CONNECTIONS: usize = 128;
@@ -158,17 +157,9 @@ pub fn run() -> Result<(), String> {
     }
 }
 
-/// Strict envelope; unsupported fields and versions never silently change semantics.
-#[derive(Deserialize)]
-struct Request {
-    version: u32,
-    #[serde(flatten)]
-    operation: Operation,
-}
-
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-/// Operations accepted by the versioned VectorDBBench process bridge.
+/// Operations accepted by the VectorDBBench process bridge.
 enum Operation {
     /// Reopens a frozen, already-published benchmark index without mutation.
     Resume {
@@ -202,21 +193,21 @@ enum Operation {
         /// Inclusive signed record-ID threshold used by VectorDBBench numeric filters.
         id_min: Option<i64>,
     },
-    Health,
-    Shutdown,
+    Health {},
+    Shutdown {},
 }
 
-/// Binary inserts use KTI/version, big-endian count/dimension, then little-endian
+/// Binary inserts use KTI, big-endian count/dimension, then little-endian
 /// i64 IDs and row-major f32 values. Validate the entire shape before allocating.
-fn decode_request(data: &[u8]) -> Result<Request, String> {
+fn decode_request(data: &[u8]) -> Result<Operation, String> {
     if !data.starts_with(b"KTI") {
         return serde_json::from_slice(data).map_err(|e| e.to_string());
     }
-    if data.len() < 12 || &data[..4] != b"KTI\x01" {
-        return Err("invalid binary insert header or version".into());
+    if data.len() < 11 {
+        return Err("invalid binary insert header".into());
     }
-    let count = u32::from_be_bytes(data[4..8].try_into().unwrap()) as usize;
-    let dimension = u32::from_be_bytes(data[8..12].try_into().unwrap()) as usize;
+    let count = u32::from_be_bytes(data[3..7].try_into().unwrap()) as usize;
+    let dimension = u32::from_be_bytes(data[7..11].try_into().unwrap()) as usize;
     if count == 0 || count > MAX_BATCH || dimension == 0 {
         return Err("invalid binary insert shape".into());
     }
@@ -224,13 +215,13 @@ fn decode_request(data: &[u8]) -> Result<Request, String> {
     let bytes = vector_bytes
         .checked_add(8)
         .and_then(|row| row.checked_mul(count))
-        .and_then(|body| body.checked_add(12))
+        .and_then(|body| body.checked_add(11))
         .ok_or("binary insert overflow")?;
     if data.len() != bytes {
         return Err("binary insert length does not match shape".into());
     }
-    let ids_end = 12 + count * 8;
-    let ids = data[12..ids_end]
+    let ids_end = 11 + count * 8;
+    let ids = data[11..ids_end]
         .as_chunks::<8>()
         .0
         .iter()
@@ -246,10 +237,7 @@ fn decode_request(data: &[u8]) -> Result<Request, String> {
                 .collect()
         })
         .collect();
-    Ok(Request {
-        version: VERSION,
-        operation: Operation::Insert { ids, vectors },
-    })
+    Ok(Operation::Insert { ids, vectors })
 }
 
 /// Lifecycle state is exclusive for mutation and shared for concurrent search.
@@ -445,22 +433,15 @@ async fn exchange<B: Backend>(stream: &mut UnixStream, service: &Service<B>) -> 
     let start = Instant::now();
     let parsed = decode_request(&data);
     let decoded = start.elapsed().as_secs_f64();
-    let shutdown = matches!(
-        &parsed,
-        Ok(Request {
-            version: VERSION,
-            operation: Operation::Shutdown
-        })
-    );
+    let shutdown = matches!(&parsed, Ok(Operation::Shutdown {}));
     let result = match parsed {
-        Ok(request) if request.version == VERSION => service.handle(request.operation).await,
-        Ok(_) => Err(("protocol", "unsupported protocol version".into())),
-        Err(error) => Err(("invalid_argument", error.to_string())),
+        Ok(operation) => service.handle(operation).await,
+        Err(error) => Err(("invalid_argument", error)),
     };
     let result = match result {
-        Ok(value) => json!({"version":VERSION,"ok":true,"result":value}),
+        Ok(value) => json!({"ok":true,"result":value}),
         Err((kind, message)) => {
-            json!({"version":VERSION,"ok":false,"error":{"kind":kind,"message":message}})
+            json!({"ok":false,"error":{"kind":kind,"message":message}})
         }
     };
     let start = Instant::now();
@@ -505,7 +486,7 @@ fn invalid(message: &str) -> (&'static str, String) {
 impl<B: Backend> Service<B> {
     async fn handle(&self, operation: Operation) -> BridgeResult {
         match operation {
-            Operation::Health => {
+            Operation::Health {} => {
                 let Ok(state) = self.state.try_read() else {
                     return Ok(json!({"ready":false,"busy":true}));
                 };
@@ -513,7 +494,7 @@ impl<B: Backend> Service<B> {
                     json!({"ready":state.ready,"records":state.records,"max_frame_bytes":MAX_FRAME,"max_batch":MAX_BATCH,"backend_identity":self.identity,"limits":self.limits}),
                 )
             }
-            Operation::Shutdown => Ok(json!({"shutdown":true})),
+            Operation::Shutdown {} => Ok(json!({"shutdown":true})),
             Operation::Resume {
                 dataset,
                 records,
@@ -798,7 +779,6 @@ impl<B: Backend> Service<B> {
         });
         Ok(json!({
             "label": "KTANN plus benchmark bridge — companion report (not VectorDBBench canonical metrics)",
-            "protocol_version": VERSION,
             "backend": backend,
             "backend_identity": self.identity,
             "backend_limits": self.limits,
@@ -852,11 +832,11 @@ impl<B: Backend> Service<B> {
 
 #[cfg(test)]
 mod tests {
-    use super::Request;
+    use super::Operation;
 
     #[test]
     fn binary_insert_preserves_bits_and_rejects_incomplete_or_excess_bodies() {
-        let mut frame = b"KTI\x01".to_vec();
+        let mut frame = b"KTI".to_vec();
         frame.extend_from_slice(&2_u32.to_be_bytes());
         frame.extend_from_slice(&2_u32.to_be_bytes());
         for id in [i64::MIN, i64::MAX] {
@@ -866,7 +846,7 @@ mod tests {
             frame.extend_from_slice(&value.to_le_bytes());
         }
         let request = super::decode_request(&frame).unwrap();
-        let super::Operation::Insert { ids, vectors } = request.operation else {
+        let super::Operation::Insert { ids, vectors } = request else {
             panic!("insert expected");
         };
         assert_eq!(ids, [i64::MIN, i64::MAX]);
@@ -880,24 +860,26 @@ mod tests {
         assert!(super::decode_request(&trailing).is_err());
         for (count, dimension) in [(0, 2), (51, 2), (2, 0), (2, u32::MAX)] {
             let mut bad = frame.clone();
-            bad[4..8].copy_from_slice(&u32::to_be_bytes(count));
-            bad[8..12].copy_from_slice(&u32::to_be_bytes(dimension));
+            bad[3..7].copy_from_slice(&u32::to_be_bytes(count));
+            bad[7..11].copy_from_slice(&u32::to_be_bytes(dimension));
             assert!(super::decode_request(&bad).is_err());
         }
-        frame[3] = 2;
+        frame[0] = b'X';
         assert!(super::decode_request(&frame).is_err());
     }
 
     #[test]
-    fn envelope_rejects_unknown_operations_fields_and_noninteger_ids() {
-        assert!(serde_json::from_str::<Request>(r#"{"version":1,"op":"health"}"#).is_ok());
+    fn request_rejects_unknown_operations_fields_and_noninteger_ids() {
+        assert!(serde_json::from_str::<Operation>(r#"{"op":"health"}"#).is_ok());
         for input in [
-            r#"{"version":1,"op":"delete","id":1}"#,
-            r#"{"version":1,"op":"search","vector":[1],"k":1,"filter":{}}"#,
-            r#"{"version":1,"op":"insert","ids":[1.5],"vectors":[[1]]}"#,
-            r#"{"version":1,"op":"insert","ids":[9223372036854775808],"vectors":[[1]]}"#,
+            r#"{"op":"health","unexpected":true}"#,
+            r#"{"op":"shutdown","unexpected":true}"#,
+            r#"{"op":"delete","id":1}"#,
+            r#"{"op":"search","vector":[1],"k":1,"filter":{}}"#,
+            r#"{"op":"insert","ids":[1.5],"vectors":[[1]]}"#,
+            r#"{"op":"insert","ids":[9223372036854775808],"vectors":[[1]]}"#,
         ] {
-            assert!(serde_json::from_str::<Request>(input).is_err(), "{input}");
+            assert!(serde_json::from_str::<Operation>(input).is_err(), "{input}");
         }
     }
 }
