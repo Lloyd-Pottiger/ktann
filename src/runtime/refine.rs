@@ -554,6 +554,58 @@ fn mean<'a>(kernel: &VectorKernel, members: impl Iterator<Item = &'a [f32]>) -> 
     kernel.normalize_centroid(&center)
 }
 
+/// Retains the nearest 32 leaves in exact (distance, leaf ordinal) order.
+/// Distances are symmetric: score each unordered pair once, updating both ends.
+/// Only the bounded neighbor lists survive; no quadratic distance matrix is kept.
+fn leaf_neighbors(
+    checkpoint: &impl Fn() -> Result<()>,
+    kernel: &VectorKernel,
+    leaves: &[Part],
+) -> Result<Vec<[(f64, usize); 32]>> {
+    // One allocation avoids one independently allocated buffer per leaf.
+    let mut neighbors = vec![[(f64::INFINITY, usize::MAX); 32]; leaves.len()];
+    for (source, leaf) in leaves.iter().enumerate() {
+        checkpoint()?;
+        let (batches, tail) = leaves[source + 1..].as_chunks::<4>();
+        for (batch, candidates) in batches.iter().enumerate() {
+            let scores = kernel.routing_distances_validated(
+                candidates
+                    .each_ref()
+                    .map(|candidate| candidate.center.as_ref()),
+                &leaf.center,
+            );
+            for (lane, score) in scores.into_iter().enumerate() {
+                let target = source + 1 + batch * 4 + lane;
+                retain_neighbor(&mut neighbors[source], (score, target));
+                retain_neighbor(&mut neighbors[target], (score, source));
+            }
+        }
+        for (offset, candidate) in tail.iter().enumerate() {
+            let target = source + 1 + batches.len() * 4 + offset;
+            let score = kernel.routing_distances_validated([&leaf.center], &candidate.center)[0];
+            retain_neighbor(&mut neighbors[source], (score, target));
+            retain_neighbor(&mut neighbors[target], (score, source));
+        }
+    }
+    Ok(neighbors)
+}
+
+/// Inserts only improving candidates without growing beyond the neighbor bound.
+fn retain_neighbor(neighbors: &mut [(f64, usize); 32], candidate: (f64, usize)) {
+    let compare = |previous: &(f64, usize)| {
+        previous
+            .0
+            .total_cmp(&candidate.0)
+            .then(previous.1.cmp(&candidate.1))
+    };
+    if compare(&neighbors[31]).is_le() {
+        return;
+    }
+    let position = neighbors.partition_point(|previous| compare(previous).is_lt());
+    neighbors.copy_within(position..31, position + 1);
+    neighbors[position] = candidate;
+}
+
 /// Greedy positive-gain moves use fixed centroids during one round, then
 /// recompute spherical means. Exact counts constrain every accepted move.
 /// The only root leaf is exempt from the ordinary nonroot minimum.
@@ -574,59 +626,29 @@ fn refine(
     rounds: usize,
     mut on_move: impl FnMut(usize, usize, PartitionKey, PartitionKey),
 ) -> Result<()> {
+    // Both callers preprocess vectors and compute leaf centers with `mean`.
+    // Each later round also uses `mean`, which validates and normalizes centers.
+    // These finite, fixed-dimension inputs need no per-distance validation.
     if leaves.len() < 2 {
         return Ok(());
     }
     for round in 0..rounds {
         checkpoint()?;
+        let neighbors = leaf_neighbors(checkpoint, kernel, leaves)?;
         let mut moves = Vec::new();
         for (source, leaf) in leaves.iter().enumerate() {
             checkpoint()?;
-            let mut distances = Vec::with_capacity(leaves.len() - 1);
-            // Reuse the search kernel's independent accumulators without
-            // changing any distance bits or the deterministic target ordering.
-            let (batches, tail) = leaves.as_chunks::<4>();
-            for (batch, candidates) in batches.iter().enumerate() {
-                let scores = kernel.routing_centroid_distances(
-                    &leaf.center,
-                    candidates
-                        .each_ref()
-                        .map(|candidate| candidate.center.as_ref()),
-                )?;
-                for (lane, distance) in scores.into_iter().enumerate() {
-                    let target = batch * 4 + lane;
-                    if target != source {
-                        distances.push((distance, target));
-                    }
-                }
-            }
-            for (offset, candidate) in tail.iter().enumerate() {
-                let target = batches.len() * 4 + offset;
-                if target != source {
-                    distances.push((
-                        kernel.routing_distance(&leaf.center, &candidate.center)?,
-                        target,
-                    ));
-                }
-            }
-            let compare = |left: &(f64, usize), right: &(f64, usize)| {
-                left.0.total_cmp(&right.0).then(left.1.cmp(&right.1))
-            };
-            if distances.len() > 32 {
-                distances.select_nth_unstable_by(32, compare);
-                distances.truncate(32);
-            }
-            distances.sort_unstable_by(compare);
+            let distances = &neighbors[source][..32.min(leaves.len() - 1)];
             for &position in &leaf.members {
                 let vector = &vectors[position];
-                let old = kernel.routing_distance(vector, &leaf.center)?;
+                let old = kernel.routing_distances_validated([vector], &leaf.center)[0];
                 let mut best = (old, source);
                 let (batches, tail) = distances.as_chunks::<4>();
                 for targets in batches {
-                    let distances = kernel.routing_centroid_distances(
-                        vector,
+                    let distances = kernel.routing_distances_validated(
                         targets.map(|(_, target)| leaves[target].center.as_ref()),
-                    )?;
+                        vector,
+                    );
                     for (&(_, target), distance) in targets.iter().zip(distances) {
                         if distance < best.0 {
                             best = (distance, target);
@@ -634,7 +656,8 @@ fn refine(
                     }
                 }
                 for &(_, target) in tail {
-                    let distance = kernel.routing_distance(vector, &leaves[target].center)?;
+                    let distance =
+                        kernel.routing_distances_validated([vector], &leaves[target].center)[0];
                     if distance < best.0 {
                         best = (distance, target);
                     }
@@ -644,6 +667,7 @@ fn refine(
                 }
             }
         }
+        drop(neighbors);
         moves.sort_by(|left, right| right.0.total_cmp(&left.0).then(left.1.cmp(&right.1)));
         let mut counts: Vec<_> = leaves.iter().map(|leaf| leaf.members.len()).collect();
         let mut targets = BTreeMap::new();
@@ -680,6 +704,72 @@ fn refine(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn symmetric_neighbors_match_exhaustive_order_for_all_metrics() {
+        use crate::api::Metric;
+        for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
+            for dimension in [1, 7, 8, 9, 128] {
+                let kernel = VectorKernel::new(dimension, metric, [0; 32]).unwrap();
+                for count in [0_usize, 1, 2, 31, 32, 33, 34, 65] {
+                    let leaves: Vec<_> = (0..count)
+                        .map(|i| Part {
+                            key: PartitionKey::new(i as u64 + 2).unwrap(),
+                            parent: None,
+                            level: 1,
+                            // Repeated and zero centers exercise exact distance ties.
+                            center: kernel
+                                .normalize_centroid(
+                                    &(0..dimension)
+                                        .map(|d| {
+                                            if i % 9 == 0 {
+                                                0.0
+                                            } else {
+                                                ((i % 11 * 17 + d * 31) % 23) as f32 - 11.0
+                                            }
+                                        })
+                                        .collect::<Vec<_>>(),
+                                )
+                                .unwrap(),
+                            members: vec![],
+                            children: vec![],
+                        })
+                        .collect();
+                    let actual = leaf_neighbors(&|| Ok(()), &kernel, &leaves).unwrap();
+                    for (source, leaf) in leaves.iter().enumerate() {
+                        let mut expected: Vec<_> = leaves
+                            .iter()
+                            .enumerate()
+                            .filter(|(target, _)| *target != source)
+                            .map(|(target, candidate)| {
+                                (
+                                    kernel
+                                        .routing_distance(&leaf.center, &candidate.center)
+                                        .unwrap(),
+                                    target,
+                                )
+                            })
+                            .collect();
+                        expected.sort_by(|left, right| {
+                            left.0.total_cmp(&right.0).then(left.1.cmp(&right.1))
+                        });
+                        expected.truncate(32);
+                        let bits = |neighbors: &[(f64, usize)]| {
+                            neighbors
+                                .iter()
+                                .map(|&(distance, target)| (distance.to_bits(), target))
+                                .collect::<Vec<_>>()
+                        };
+                        assert_eq!(
+                            bits(&actual[source][..32.min(count.saturating_sub(1))]),
+                            bits(&expected),
+                            "metric={metric:?} dimension={dimension} count={count} source={source}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn artifact_zero_rounds_refreshes_centroids_without_changing_membership() {

@@ -78,7 +78,7 @@ pub struct BulkLoadOptions {
 impl Default for BulkLoadOptions {
     fn default() -> Self {
         Self {
-            max_mutations: 128,
+            max_mutations: 4096,
             max_bytes: 1024 * 1024,
         }
     }
