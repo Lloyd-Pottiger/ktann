@@ -152,7 +152,9 @@ fields, noncanonical values, nonzero padding, and trailing bytes.
 
 ### 6.1 Manifests and serving values
 
-The Index Manifest stores the persistent format version (`FORMAT_VERSION = 1`),
+Index storage and bulk artifacts use one persistent format version,
+`storage::FORMAT_VERSION = 1`, encoded as a big-endian u16 at each format boundary.
+The Index Manifest stores this version,
 lifecycle state, immutable configuration, Logical Index ID, RaBitQ rotation
 seed, and exact Bloom parameters. The configuration encodes four big-endian
 u32 capacities in leaf minimum, leaf maximum, internal minimum, internal maximum

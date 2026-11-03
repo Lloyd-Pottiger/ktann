@@ -153,7 +153,7 @@ before queries. Reused reports set `construction: null`; comparison omits
 construction costs and rejects mixing fresh and reused runs. Cache capacity,
 client counts, warmup and read beam can
 change without reconstructing the tree. Keep both comparison binaries and the
-fixture manifest with the reports. Reports use schema version 1.
+fixture manifest with the reports.
 
 Large search diagnostics accept `--query-concurrency 1,4,16,4,1` and
 `--leaf-beam-size 32`. The worker imports and verifies the index once, then

@@ -5,9 +5,11 @@ use crate::api::{
     Metric, Result, SynopsisConfig,
 };
 
+use crate::storage::FORMAT_VERSION;
+
 use super::data::maximum_typed_value_len;
 use super::wire::{Decoder, Encoder};
-use super::{FORMAT_VERSION, MAX_SYNOPSIS_BYTES, ROTATION_SEED_BYTES, corrupt};
+use super::{MAX_SYNOPSIS_BYTES, ROTATION_SEED_BYTES, corrupt};
 
 /// The lifecycle state persisted in an Index Manifest.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

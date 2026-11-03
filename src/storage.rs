@@ -24,3 +24,6 @@ pub use operations::{
     LogicalRange, LogicalScanCursor, LogicalScanItem, LogicalScanPage, MutationBuilder,
     ReadLogicalTxn, RecordGroupRead, TransactionSize, WriteLogicalTxn,
 };
+
+/// Shared format of index storage and bulk artifacts emitted and accepted by this build.
+pub const FORMAT_VERSION: u16 = 1;
