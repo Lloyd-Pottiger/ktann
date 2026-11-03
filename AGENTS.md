@@ -93,8 +93,7 @@ Production code uses no nightly features.
   effects before editing.
 - Use the domain terms from `CONTEXT.md` exactly. Do not introduce synonyms
   such as "table" for Logical Index or "partition key" for Tree Key.
-- Give each invariant and responsibility a clear owner. Module boundaries may
-  change when that improves the whole design.
+- Give each invariant and responsibility a clear owner.
 - Preserve behavior outside the requested change. Update affected designs and
   tests when changing contracts, and `CONTEXT.md` when changing domain language or
   system-wide invariants; explicitly supersede affected decisions and add ADRs only

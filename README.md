@@ -43,30 +43,25 @@ compatibility. Distributed execution and scalability goals are described under
 
 ## How it works
 
-KTANN combines a partitioned tree with local graph routing to balance scalability,
-candidate coverage, and search cost. The tree follows
-[C-SPANN](https://www.cockroachlabs.com/blog/cspann-real-time-indexing-billions-vectors/)'s
-approach of storing independently managed partitions in a transactional KV backend.
-Small internal partitions, however, can exclude relevant branches early during
-bounded traversal, limiting recall. A single graph over all partition centroids,
-as in the centroid-index approach of
-[SPANN](https://www.microsoft.com/en-us/research/wp-content/uploads/2021/11/SPANN_finalversion1.pdf)
-and [SPFresh](https://arxiv.org/html/2410.14452v1), allows broader candidate
-exploration but makes the global routing index harder to distribute.
-
-KTANN supports wider internal partitions so that more child centroids can compete
-within each routing decision, with optional HNSW to reduce the cost of searching
-them. The wider partitions address candidate coverage; HNSW addresses routing
-cost. Each graph stays within its owning partition, preserving the tree as the
-unit of storage and maintenance without requiring a single resident global graph.
-The design aims to retain tree scalability while improving the recall/performance
-trade-off; the gains depend on workload and routing configuration. See the
-[partition-local HNSW design](docs/design/partition-local-hnsw.md) for details.
-
 KTANN organizes vectors in centroid-routing trees. Optional metadata fields called
 **Tree Keys** separate records into trees, so a query can first select the relevant
 tenant or collection. Within each tree, internal partitions route by centroid
 distance and leaves hold vector entries.
+
+The design combines
+[C-SPANN](https://www.cockroachlabs.com/blog/cspann-real-time-indexing-billions-vectors/)-style
+partitioned trees with the broader centroid exploration of
+[SPANN](https://www.microsoft.com/en-us/research/wp-content/uploads/2021/11/SPANN_finalversion1.pdf)
+and [SPFresh](https://arxiv.org/html/2410.14452v1). Partitioned trees distribute
+routing and maintenance, but small internal partitions can exclude relevant
+branches early during bounded search. A global centroid graph offers broader
+exploration but is harder to distribute.
+
+KTANN uses wider internal partitions to let more child centroids compete at each
+routing decision, with optional HNSW to reduce the cost of searching them. Each
+graph belongs to one partition, preserving the tree as the storage and maintenance
+structure without requiring a single resident global graph. See the
+[partition-local HNSW design](docs/design/partition-local-hnsw.md) for details.
 
 ```text
 Your application
@@ -158,9 +153,8 @@ a desired capability. The current bulk scheduler distributes whole jobs across
 workers with shared-filesystem requirements. It does not distribute the
 construction of a single index across workers.
 
-Strict read/write separation means queries do not mutate the index or perform
-structure maintenance. Read capacity should scale independently of writes;
-distributed storage alone does not establish this scalability.
+Strict read/write separation keeps queries free of index mutations and structure
+maintenance, with the goal of scaling read capacity independently of writes.
 
 Within the required capabilities and correctness guarantees, continuously pursue
 better whole-system performance at comparable recall. Additional complexity must
