@@ -32,6 +32,16 @@ pub struct ArtifactManifest {
 }
 
 impl ArtifactManifest {
+    /// Canonical prefix shared by data files, manifests, and load checkpoints.
+    fn header(&self) -> [u8; HEADER_BYTES as usize] {
+        let mut bytes = [0; HEADER_BYTES as usize];
+        bytes[..7].copy_from_slice(MAGIC);
+        bytes[7..9].copy_from_slice(&FORMAT_VERSION.to_be_bytes());
+        bytes[9] = self.kind;
+        bytes[10..].copy_from_slice(&self.binding);
+        bytes
+    }
+
     /// Whether this identity denotes serving entries.
     pub(crate) const fn is_serving(&self) -> bool {
         self.kind == 3
@@ -49,7 +59,7 @@ impl ArtifactManifest {
 
     /// Digest of the header used by resumable entry checkpoints.
     pub(crate) fn initial_sha256(&self) -> [u8; 32] {
-        Sha256::digest(&self.encode()[..HEADER_BYTES as usize]).into()
+        Sha256::digest(self.header()).into()
     }
 
     /// Number of records or partitions in the artifact.
@@ -74,10 +84,7 @@ impl ArtifactManifest {
     #[must_use]
     pub fn encode(&self) -> [u8; ARTIFACT_MANIFEST_BYTES] {
         let mut bytes = [0; ARTIFACT_MANIFEST_BYTES];
-        bytes[..7].copy_from_slice(MAGIC);
-        bytes[7..9].copy_from_slice(&FORMAT_VERSION.to_be_bytes());
-        bytes[9] = self.kind;
-        bytes[10..42].copy_from_slice(&self.binding);
+        bytes[..HEADER_BYTES as usize].copy_from_slice(&self.header());
         bytes[42..50].copy_from_slice(&self.items.to_be_bytes());
         bytes[50..58].copy_from_slice(&self.bytes.to_be_bytes());
         bytes[58..].copy_from_slice(&self.digest);
@@ -165,10 +172,7 @@ impl Writer {
             },
             quota,
         };
-        writer.write(MAGIC)?;
-        writer.write(&FORMAT_VERSION.to_be_bytes())?;
-        writer.write(&[kind])?;
-        writer.write(&binding)?;
+        writer.write(&writer.manifest.header())?;
         Ok(writer)
     }
 

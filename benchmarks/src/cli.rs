@@ -3,7 +3,7 @@
 //! The public `run` command never measures scenarios in its own process. It
 //! launches one hidden worker per scenario so process-global metrics, the
 //! Partition Cache, and peak RSS each have an unambiguous owner. The public
-//! `compare` command accepts only complete, comparable versioned suites.
+//! `compare` command accepts only complete, comparable suites.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -824,7 +824,7 @@ fn compare_reports(options: CompareOptions) -> Result<(), String> {
     }
 }
 
-/// Reads one complete versioned JSON artifact for comparison.
+/// Reads one complete JSON artifact for comparison.
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
     let bytes = fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
     serde_json::from_slice(&bytes).map_err(|error| format!("decode {}: {error}", path.display()))
