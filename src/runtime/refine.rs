@@ -616,6 +616,7 @@ fn retain_neighbor(neighbors: &mut [(f64, usize); 32], candidate: (f64, usize)) 
     clippy::too_many_arguments,
     reason = "numerical inputs, occupancy bounds, and move observation are independent"
 )]
+/// Refines memberships within fixed initial neighborhoods and capacity bounds.
 fn refine(
     checkpoint: &impl Fn() -> Result<()>,
     kernel: &VectorKernel,
@@ -629,12 +630,15 @@ fn refine(
     // Both callers preprocess vectors and compute leaf centers with `mean`.
     // Each later round also uses `mean`, which validates and normalizes centers.
     // These finite, fixed-dimension inputs need no per-distance validation.
-    if leaves.len() < 2 {
+    if leaves.len() < 2 || rounds == 0 {
         return Ok(());
     }
+    // The topology is fixed throughout refinement. Reuse its initial local
+    // candidate sets, but score every proposed move against current centers.
+    // This pays the quadratic neighbor discovery cost once per invocation.
+    let neighbors = leaf_neighbors(checkpoint, kernel, leaves)?;
     for round in 0..rounds {
         checkpoint()?;
-        let neighbors = leaf_neighbors(checkpoint, kernel, leaves)?;
         let mut moves = Vec::new();
         for (source, leaf) in leaves.iter().enumerate() {
             checkpoint()?;
@@ -667,8 +671,8 @@ fn refine(
                 }
             }
         }
-        drop(neighbors);
-        moves.sort_by(|left, right| right.0.total_cmp(&left.0).then(left.1.cmp(&right.1)));
+        // A position proposes at most one move, so the tie-breaker defines a total order.
+        moves.sort_unstable_by(|left, right| right.0.total_cmp(&left.0).then(left.1.cmp(&right.1)));
         let mut counts: Vec<_> = leaves.iter().map(|leaf| leaf.members.len()).collect();
         let mut targets = BTreeMap::new();
         for (_, position, source, target) in moves {
@@ -876,14 +880,15 @@ mod tests {
     #[test]
     fn refinement_batches_preserve_target_mapping_and_tail_neighbors() {
         let kernel = VectorKernel::new(1, crate::api::Metric::L2, [0; 32]).unwrap();
-        let vectors: Vec<Box<[f32]>> = (0..9)
+        let vectors: Vec<Box<[f32]>> = (0..35)
             .flat_map(|cluster| {
                 [-0.1, 0.0, 0.1].map(|offset| vec![cluster as f32 * 10.0 + offset].into())
             })
             .collect();
-        // Exchange one member between adjacent clusters. The ninth leaf is
-        // unchanged and exercises the centroid and candidate batch tails.
-        let mut leaves: Vec<_> = (0..9)
+        // Exchange one member between adjacent clusters. The last leaf is
+        // unchanged. More than 33 leaves exercises capped candidate sets across
+        // rounds as well as centroid and candidate batch tails.
+        let mut leaves: Vec<_> = (0..35)
             .map(|cluster| Part {
                 parent: None,
                 children: vec![],
@@ -893,7 +898,7 @@ mod tests {
                 center: vec![cluster as f32 * 10.0].into(),
             })
             .collect();
-        for pair in leaves[..8].as_chunks_mut::<2>().0 {
+        for pair in leaves[..34].as_chunks_mut::<2>().0 {
             let (left, right) = pair.split_at_mut(1);
             std::mem::swap(&mut left[0].members[2], &mut right[0].members[2]);
         }

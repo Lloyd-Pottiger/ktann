@@ -346,7 +346,9 @@ to two rounds. Builders accept `with_refinement_rounds(0..=5)` and
 centroids and topology; numerical workspace and move lists require additional
 memory. Zero rounds refreshes centroids without relocating records.
 
-Refinement preserves Partition Keys and topology. Bounded atomic transactions
+Refinement preserves Partition Keys and topology. It selects up to 32 nearest
+initial leaf centroids per leaf once, reuses those candidate sets across rounds,
+and scores proposed moves against the current centroids. Bounded atomic transactions
 relocate records within capacity constraints and update centroids with their
 incoming parent projections and parent Header cache epochs. Every commit preserves
 exact membership and searchable projections. Cancellation, errors or unknown

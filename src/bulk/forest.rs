@@ -708,7 +708,7 @@ pub(super) fn binding(
     }
     hash.update((sample_items as u64).to_be_bytes());
     hash.update([refinement_rounds.map_or(0, |rounds| rounds + 1)]);
-    hash.update(b"artifact refinement v1");
+    hash.update(b"artifact refinement v2");
     hash.finalize().into()
 }
 
