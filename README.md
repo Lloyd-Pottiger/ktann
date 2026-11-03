@@ -8,6 +8,40 @@ index membership together, and keeps its K-means trees searchable as they grow
 and rebalance. Build semantic search, recommendations, and retrieval into your
 application with the storage backend that fits your deployment.
 
+## Project goals
+
+Strong scalability, query and filtering capabilities, continuous updates, and
+ease of use together define KTANN's product requirements.
+
+KTANN targets two complementary deployment scenarios, without tying dataset
+scale to a particular backend:
+
+- **Large datasets:** scale through distributed storage and execution.
+  Bulk Build must support distributed execution; distributed incremental writes
+  are also a desired capability.
+- **Small datasets:** run efficiently on a single machine, without unnecessary
+  distributed coordination overhead.
+
+Across all backends, KTANN aims for strong recall, fast construction, high query
+throughput, and low latency.
+
+Strict separation of reads and writes is an architectural goal: query execution
+must not perform mutations or structure maintenance, and read capacity should
+scale independently of write capacity. Distributed storage alone does not
+establish scalable construction, writes, or reads.
+
+These are project targets, not claims of validated capacity or completed
+distributed execution support. Current implementation status is described below;
+scale and performance claims require workload-specific evidence.
+
+Required capabilities and correctness define which designs are acceptable.
+Within those requirements, continuously pursue better whole-system performance:
+faster construction, higher QPS, and lower latency at comparable recall, accounting
+for resource costs and operability. Complexity must be justified by a required
+capability or a meaningful, measured benefit; when outcomes are comparable, choose
+the simpler design. Observability supports validation and operation of those
+guarantees.
+
 ## Why KTANN?
 
 - **One atomic write, a consistent index.** Each insert, update, or delete
@@ -19,7 +53,7 @@ application with the storage backend that fits your deployment.
 - **In-memory, embedded, or distributed storage.** Use Memory for ephemeral
   indexes, RocksDB for embedded persistence, or FoundationDB for transactional
   distributed storage. All adapters share
-  the same index algorithms and logical transaction contract.
+  a logical transaction contract and core index algorithms.
 - **Filters that mean what they say.** Typed metadata predicates use SQL
   `WHERE` semantics. Partition summaries prune unnecessary work; every returned
   hit passes exact filtering.
