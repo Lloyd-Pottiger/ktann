@@ -9,12 +9,13 @@ PROFILE ?= smoke
 REPORT_DIR ?= .benchmark-data/results
 BENCH_ARGS ?=
 
-.PHONY: help build release check test fmt fmt-check lint doc verify verify-all test-fdb bench bench-fdb
+.PHONY: help build release clean check test fmt fmt-check lint doc verify verify-all test-fdb bench bench-fdb
 
 help:
 	@printf '%s\n' \
 	  'KTANN development commands' \
 	  '  build / release  Build without FoundationDB (debug / optimized)' \
+	  '  clean            Remove Cargo build artifacts' \
 	  '  check            Check all default-package targets' \
 	  '  test             Run tests without FoundationDB' \
 	  '  fmt / fmt-check  Format Rust / check formatting' \
@@ -34,6 +35,9 @@ build:
 
 release:
 	$(CARGO) build $(PACKAGES) --release
+
+clean:
+	$(CARGO) clean
 
 check:
 	$(CARGO) check $(PACKAGES) --all-targets

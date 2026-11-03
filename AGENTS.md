@@ -1,12 +1,35 @@
 # Repository Guidelines
 
+## Design Principles
+
+Use the [product goals](README.md#project-goals) to evaluate designs. The scale
+requirements constrain today's architecture; they do not justify speculative
+infrastructure or claims of capacity without workload-specific evidence.
+
+- Required capabilities, correctness, and data integrity define acceptable designs.
+  Establish externally observable behavior and real constraints from first
+  principles; distinguish product requirements from replaceable implementation
+  choices.
+- Within the required capabilities and correctness guarantees, continuously pursue
+  better whole-system performance: faster Bulk Build, higher QPS, and lower latency
+  at comparable recall. Add complexity only for a required capability or a
+  meaningful, measured benefit. Account for resource costs, maintenance, recovery,
+  and operability; when outcomes are comparable, choose the simpler design.
+- Use observability to validate and operate the system. Add instrumentation for a
+  concrete diagnostic or operational need, not as a reason to expand public APIs,
+  configuration, or state machines.
+- Share backend semantics and useful algorithms behind small interfaces; allow
+  execution to differ where justified. Keep distributed coordination out of the
+  embedded path unless needed. Read/write separation does not relax consistency;
+  assess shared-storage contention when evaluating independent read scaling.
+
 ## Project Sources of Truth
 
-KTANN has no stable release. Do not add backward
-compatibility machinery unless the task explicitly requires it. Read `README.md`
-for project status; verify available APIs and behavior against the code.
+Verify available APIs and behavior against the code. Resolve discrepancies among
+code, designs, and decisions explicitly; do not silently choose one as authority.
 
 - `CONTEXT.md`: canonical domain language and system-wide invariants.
+- `README.md`: product goals, design priorities, and current implementation status.
 - `docs/design/overview.md`: product boundary, authoritative invariants, target
   architecture, end-to-end behavior, and validation.
 - `docs/design/`: detailed contracts for the public API, storage, search,
@@ -53,29 +76,28 @@ Production code uses no nightly features.
 
 ## Workflow Principles
 
-- Aim for a simple system with strong whole-system performance. Prioritize
-  meaningful, measured performance gains; when performance is comparable,
-  choose the simpler design. Replace the current implementation when a
-  candidate is simpler and performs comparably.
-- Evaluate the current implementation and alternatives on equal terms. Explore
-  the full solution space: algorithms, architecture, data structures, interfaces,
-  and implementation details are all open to change. Existing design choices
-  do not constrain the solution or justify retaining a more complex approach.
+- KTANN has no stable release: do not add backward compatibility unless explicitly
+  requested. APIs, formats, algorithms, variables, configuration, module boundaries,
+  internal constraints, and prior design decisions are all open to revision.
+  Preserve needed behavioral guarantees, not the historical mechanisms that
+  implement them. Evaluate existing and proposed implementations on equal terms.
+- Validate untrusted boundaries and handle realistic failures. Rely on established
+  internal invariants; do not add fallbacks for impossible states or abstractions
+  for hypothetical requirements.
+- Evolve in runnable increments. Remove obsolete code, configuration, tests, and
+  documentation within the changed boundary, preserving distinct guarantees that
+  remain part of the intended contract. Match process and verification to risk.
 - Before a non-trivial change, read `CONTEXT.md`, the relevant sections of
   `docs/design/overview.md`, the owning module design, and every directly
   relevant ADR. Trace callers, persistent state, backend behavior, and runtime
   effects before editing.
 - Use the domain terms from `CONTEXT.md` exactly. Do not introduce synonyms
   such as "table" for Logical Index or "partition key" for Tree Key.
-- Keep changes self-contained and runnable. Do not add placeholder abstractions
-  for hypothetical future features.
-- Keep each responsibility at its documented owner: logical codecs and atomic
-  index operations in core storage; backend limits and error classification in
-  the adapters; lifecycle and admission behavior in runtime/operations.
-- Treat a discrepancy among code, design, and ADRs as a decision to resolve,
-  not permission to choose whichever is easiest. Preserve behavior outside the
-  requested change. Update affected designs and `CONTEXT.md` when changing a
-  contract or domain language; record hard-to-reverse decisions in ADRs.
+- Give each invariant and responsibility a clear owner.
+- Preserve behavior outside the requested change. Update affected designs and
+  tests when changing contracts, and `CONTEXT.md` when changing domain language or
+  system-wide invariants; explicitly supersede affected decisions and add ADRs only
+  for new hard-to-reverse decisions.
 - Keep commits and diffs scoped to one coherent outcome. Do not mix formatting,
   dependency churn, or unrelated cleanup into a behavioral change.
 - Continue authorized work through verification. Resolve routine choices from
