@@ -153,7 +153,7 @@ before queries. Reused reports set `construction: null`; comparison omits
 construction costs and rejects mixing fresh and reused runs. Cache capacity,
 client counts, warmup and read beam can
 change without reconstructing the tree. Keep both comparison binaries and the
-fixture manifest with the reports. Reports use schema version 10.
+fixture manifest with the reports. Reports use schema version 1.
 
 Large search diagnostics accept `--query-concurrency 1,4,16,4,1` and
 `--leaf-beam-size 32`. The worker imports and verifies the index once, then
@@ -401,9 +401,10 @@ vectordbbench ktann --socket-path /tmp/ktann-bench.sock \
   --refinement-rounds 2 --refinement-memory-bytes 34359738368
 ```
 
-The private protocol is v1, with a big-endian u32 frame length, an 8 MiB frame
-limit and at most 128 connections. Control/search and responses are JSON.
-Binary inserts carry `KTI` plus byte version 1, big-endian u32 count/dimension,
+The private protocol is unversioned; update the client and bridge together.
+It uses a big-endian u32 frame length, an 8 MiB frame limit and at most 128
+connections. Control/search and responses are JSON.
+Binary inserts carry `KTI`, big-endian u32 count/dimension,
 little-endian i64 IDs and row-major f32 values, with at most 50 records per batch.
 The reset request carries `refinement_rounds` and `refinement_memory_bytes`.
 JSON inserts are rejected; update the client and bridge together.
@@ -653,7 +654,7 @@ for the policy, rationale and measurement evidence.
 For controlled query-only comparisons, start the bridge with
 `--preserve-index true`. Shutdown then closes the runtime without dropping its
 Logical Index; the default still removes it. Restart with the same database path
-and routing configuration, then send protocol version 1 operation `resume` with
+and routing configuration, then send operation `resume` with
 `dataset`, `records`, and `leaf_beam`. This opens the published `vdbbench` index
 without rebuilding or changing it. Dimension and metric come from its manifest;
 `records` is controller-supplied fixture metadata, not a newly counted cardinality.

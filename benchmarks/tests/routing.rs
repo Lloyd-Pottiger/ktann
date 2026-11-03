@@ -53,7 +53,7 @@ fn all_routes_share_layout_and_keep_diagnostics_out_of_measurement() {
             &std::fs::read(root.path().join(format!("{mode}.json"))).unwrap(),
         )
         .unwrap();
-        assert_eq!(suite["schema_version"], 10);
+        assert_eq!(suite["schema_version"], 1);
         let report = &suite["reports"][0];
         assert_eq!(report["configuration"]["measured_operations"], 32);
         assert_eq!(report["configuration"]["routing_experiment"]["mode"], *mode);

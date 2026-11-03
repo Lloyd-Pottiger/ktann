@@ -79,14 +79,13 @@ impl Bridge {
             stream,
         }
     }
-    fn request(&mut self, mut request: Value) -> Value {
-        request["version"] = json!(1);
+    fn request(&mut self, request: Value) -> Value {
         self.exchange(&serde_json::to_vec(&request).unwrap())
     }
     fn insert(&mut self, ids: &[i64], vectors: &[Vec<f32>]) -> Value {
         assert_eq!(ids.len(), vectors.len());
         let dimension = vectors[0].len();
-        let mut data = b"KTI\x01".to_vec();
+        let mut data = b"KTI".to_vec();
         data.extend_from_slice(&(ids.len() as u32).to_be_bytes());
         data.extend_from_slice(&(dimension as u32).to_be_bytes());
         for id in ids {
