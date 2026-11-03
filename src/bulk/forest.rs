@@ -361,7 +361,8 @@ impl ForestArtifact {
                     |partition| {
                         charge_refinement(
                             &mut used,
-                            512 + config.dimension() * 24 + partition.entries.len() * 128,
+                            // Includes each leaf's bounded refinement neighbor list.
+                            1024 + config.dimension() * 24 + partition.entries.len() * 128,
                             options.refinement_memory_bytes,
                         )?;
                         plans.push(partition);

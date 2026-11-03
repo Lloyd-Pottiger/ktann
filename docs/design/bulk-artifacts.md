@@ -23,7 +23,12 @@ serving lifecycle and exact-membership contracts are unchanged.
    Optional bounded refinement runs on one retained tree before emission, reusing
    the ordinary metric-correct assignment algorithm. Zero rounds refreshes leaf
    and bottom-up internal centroids; omission preserves construction output.
-   Refinement semantics participate in the forest binding. The reader validates
+   Refinement semantics participate in the forest binding. Each round selects the
+   nearest other leaf centroids, capped at 32 (distance, then leaf ordinal), computing
+   each symmetric pair once. A contiguous fixed-size neighbor list per leaf uses
+   512 bytes on 64-bit hosts, included in refinement admission; it is released
+   before applying moves. Validated routing vectors and refreshed centroids reuse
+   the same distance kernel without repeated component validation. The reader validates
    allocation, occupancy, levels, tree closure, and counts. Construction takes all
    four capacities from the Input Snapshot configuration. Leaf and internal
    grouping use their respective bounds; roots retain the minimum-occupancy

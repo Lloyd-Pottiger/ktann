@@ -134,7 +134,10 @@ preempted; subsequent admissions and checkpoints observe cancellation.
 Load registration fixes one Serving Artifact identity. Each invocation takes a
 new load epoch; every transaction checks the original index identity and epoch,
 and commits serving entries with its prefix count and digest checkpoint. Adapter
-limits and caller budgets bound mutation count and physical bytes. Unknown
+limits and caller budgets bound mutation count and physical bytes. Defaults allow
+up to 4096 mutations including the checkpoint, still capped at 1 MiB of physical
+key/value bytes; the first reached bound ends the chunk. These same caller
+budgets cap validation pages, subject to the backend's own scan limits. Unknown
 outcomes reread durable state. Recovery reconstructs the artifact prefix in
 bounded memory; it does not rewrite the committed prefix.
 
