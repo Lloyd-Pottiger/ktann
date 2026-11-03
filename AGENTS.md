@@ -2,7 +2,7 @@
 
 ## Design Principles
 
-Use the product goals in [README.md](README.md) to evaluate designs. The scale
+Use the [product goals](README.md#project-goals) to evaluate designs. The scale
 requirements constrain today's architecture; they do not justify speculative
 infrastructure or claims of capacity without workload-specific evidence.
 

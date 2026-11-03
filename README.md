@@ -1,32 +1,80 @@
 # KTANN
 
-KTANN is an embeddable Rust library for approximate nearest-neighbor search over
-vectors and typed metadata. It stores records and their index entries together
-in a transactional key-value backend, so inserts, updates, and deletes become
-searchable atomically.
+**Filtered vector search for data that keeps changing.**
 
-Use KTANN to add filtered vector search to an application that owns its storage
-and service layer. It supports in-memory, embedded, and distributed storage;
-it does not provide a standalone database server or generate embeddings.
+KTANN (**K-means Tree Approximate Nearest Neighbor**) is an embeddable Rust
+library that combines approximate nearest-neighbor search, typed metadata
+filtering, and transactional updates. It keeps vectors and their index membership
+in sync as records are inserted, updated, and deleted, with storage backends for
+in-memory, embedded, and distributed deployments.
 
-**Status:** active development, with no stable release. APIs and persistent
-formats may change without backward compatibility. The core search engine,
-three storage adapters, online updates, and resumable initial builds are
-implemented. The scalability goals below are not claims of validated capacity.
+Build semantic search, recommendations, or retrieval into your application while
+keeping control of the storage and service layer.
 
-## Capabilities
+**Status:** active development, with no stable release. Search, filtering, online
+updates, resumable initial builds, and Memory, RocksDB, and FoundationDB adapters
+are implemented. APIs and persistent formats may change without backward
+compatibility. Distributed execution and scalability goals are described under
+[Project goals](#project-goals).
 
-- **Filtered search.** L2, cosine, and inner-product search with typed metadata
-  predicates using SQL `WHERE` semantics. Every returned hit satisfies the filter.
-- **Continuous updates.** Insert, upsert, delete, and atomic batches. Background
-  splits and merges keep the index searchable as its structure changes.
-- **Consistent reads.** Each query uses one backend snapshot, including filtering
-  and exact distance calculation over the selected candidates.
-- **Initial construction.** Build an index from an immutable input snapshot,
-  resume interrupted work, and publish it when loading and validation finish.
-- **Bounded query work.** Search budgets limit traversal and reranking; results
-  report budget exhaustion. Approximate search can miss neighbors or return fewer
-  than the requested number of hits.
+## Why KTANN?
+
+- **Keep search current with your data.** A mutation commits the vector, metadata,
+  and index membership together. Each query reads a consistent snapshot, including
+  filtering and reranking, so it does not observe partially applied updates.
+- **Update continuously without rebuilding the index.** Insert, upsert, delete,
+  and atomic batches work on a live index. Background splits and merges adapt its
+  structure while keeping every committed state searchable.
+- **Search within the data that matters.** Combine vector similarity with typed
+  metadata predicates using SQL `WHERE` semantics. Route by fields such as tenant
+  or collection, prune partitions using metadata summaries, and apply exact
+  filtering to returned hits.
+- **Narrow the search before reading full vectors.** Centroid routing and compact
+  RaBitQ7 representations select candidates; original vectors provide exact final
+  distances. L2, cosine, and inner-product metrics are supported.
+- **Choose storage to fit the application.** Use Memory for ephemeral indexes,
+  RocksDB for embedded persistence, or FoundationDB for distributed transactional
+  storage, through the same index API and logical transaction contract.
+- **Load existing datasets with resumable builds.** Bulk Build prepares an index
+  from an immutable input snapshot, checkpoints progress, and publishes the index
+  after loading and validation. Interrupted work can resume.
+
+## How it works
+
+KTANN organizes vectors in centroid-routing trees. Optional metadata fields called
+**Tree Keys** separate records into trees, so a query can first select the relevant
+tenant or collection. Within each tree, internal partitions route by centroid
+distance and leaves hold vector entries.
+
+```text
+Query vector + metadata filter
+              |
+              v
+    Select relevant trees
+              |
+              v
+ Route by centroids; prune with metadata summaries
+              |
+              v
+ Filter and rank candidates using compact vector codes
+              |
+              v
+ Rerank selected candidates using original vectors
+              |
+              v
+       IDs + exact distances
+```
+
+Records and index entries live in the same transactional backend. Foreground
+writes update them atomically; background maintenance splits and merges partitions
+without making committed data unsearchable. Queries use one consistent snapshot
+and do not perform structure maintenance.
+
+Search is approximate: exact reranking gives exact distances for selected
+candidates, not guaranteed global top-k results. Query budgets bound traversal
+and reranking, and results report budget exhaustion. See the
+[architecture overview](docs/design/overview.md) and
+[search design](docs/design/search.md) for details.
 
 ## Storage backends
 
@@ -78,7 +126,7 @@ path dependencies. Start with the [Memory adapter guide](ktann-memory/README.md)
 then see the [API guide](docs/design/api.md) for schemas, filters, updates, and
 search options. For initial datasets, see [Bulk Build](docs/design/bulk-build.md).
 
-## Project direction
+## Project goals
 
 Strong scalability, query and filtering capabilities, continuous updates, and
 ease of use define the product requirements. KTANN targets both large datasets
@@ -101,19 +149,6 @@ better whole-system performance at comparable recall. Additional complexity must
 provide a required capability or a meaningful, measured benefit; when outcomes
 are comparable, choose the simpler design. Observability supports validation and
 operation. [AGENTS.md](AGENTS.md) records the engineering rules.
-
-## How it works
-
-KTANN stands for **K-means Tree Approximate Nearest Neighbor**. It organizes vectors
-in centroid-routing trees. Optional metadata fields called **Tree Keys** separate
-records into trees, allowing queries to route by values such as tenant or
-collection. Within a tree, centroid routing and conservative metadata summaries
-narrow the search. Compact RaBitQ7 representations rank candidates before exact
-reranking over the original vectors.
-
-Exact reranking gives exact distances for selected candidates; it does not make
-the overall search exact. See the [architecture overview](docs/design/overview.md)
-and [search design](docs/design/search.md) for the full contracts.
 
 ## Development and benchmarks
 
