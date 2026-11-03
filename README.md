@@ -30,9 +30,10 @@ compatibility. Distributed execution and scalability goals are described under
   or collection, prune partitions using metadata summaries, and apply exact
   filtering to returned hits.
 - **Combine partitioned storage with graph-accelerated routing.** Optional local
-  HNSW graphs accelerate centroid selection within internal partitions. Compact
-  RaBitQ7 representations rank leaf candidates before original vectors provide
-  exact final distances. L2, cosine, and inner-product metrics are supported.
+  HNSW graphs make wider internal partitions practical to search, letting more
+  child centroids compete at each routing step while keeping the routing structure
+  partitioned. Compact RaBitQ7 representations rank leaf candidates before exact
+  reranking. L2, cosine, and inner-product metrics are supported.
 - **Choose storage to fit the application.** Use Memory for ephemeral indexes,
   RocksDB for embedded persistence, or FoundationDB for distributed transactional
   storage, through the same index API and logical transaction contract.
@@ -42,13 +43,24 @@ compatibility. Distributed execution and scalability goals are described under
 
 ## How it works
 
-KTANN combines
-[C-SPANN](https://www.cockroachlabs.com/blog/cspann-real-time-indexing-billions-vectors/)-style
-partitioned trees with optional HNSW-accelerated local routing, drawing on
+KTANN combines a partitioned tree with local graph routing to balance scalability,
+candidate coverage, and search cost. The tree follows
+[C-SPANN](https://www.cockroachlabs.com/blog/cspann-real-time-indexing-billions-vectors/)'s
+approach of storing independently managed partitions in a transactional KV backend.
+Small internal partitions, however, can exclude relevant branches early during
+bounded traversal, limiting recall. A single graph over all partition centroids,
+as in the centroid-index approach of
 [SPANN](https://www.microsoft.com/en-us/research/wp-content/uploads/2021/11/SPANN_finalversion1.pdf)
-and [SPFresh](https://arxiv.org/html/2410.14452v1)'s centroid-based search and
-incremental maintenance. HNSW operates within internal partitions, while the tree
-remains the storage and ownership structure. See the
+and [SPFresh](https://arxiv.org/html/2410.14452v1), allows broader candidate
+exploration but makes the global routing index harder to distribute.
+
+KTANN supports wider internal partitions so that more child centroids can compete
+within each routing decision, with optional HNSW to reduce the cost of searching
+them. The wider partitions address candidate coverage; HNSW addresses routing
+cost. Each graph stays within its owning partition, preserving the tree as the
+unit of storage and maintenance without requiring a single resident global graph.
+The design aims to retain tree scalability while improving the recall/performance
+trade-off; the gains depend on workload and routing configuration. See the
 [partition-local HNSW design](docs/design/partition-local-hnsw.md) for details.
 
 KTANN organizes vectors in centroid-routing trees. Optional metadata fields called
