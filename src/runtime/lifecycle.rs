@@ -185,104 +185,116 @@ pub(crate) async fn reserve_index<B: Backend>(
     loop {
         context.checkpoint()?;
         let backend = context.backend();
-        let hard_limits = backend.hard_limits();
-        let budget = backend.admission_budget();
-        let raw = backend.begin_write().await?;
-        let mut txn = WriteLogicalTxn::bootstrap(raw, hard_limits, budget);
+        let attempted = async {
+            let hard_limits = backend.hard_limits();
+            let budget = backend.admission_budget();
+            let raw = backend.begin_write().await?;
+            let mut txn = WriteLogicalTxn::bootstrap(raw, hard_limits, budget);
 
-        let allocator = match txn.get_for_update(LogicalKey::IndexIdAllocator).await? {
-            None => IndexIdAllocator::new(0),
-            Some(PersistentValue::IndexIdAllocator(allocator)) => allocator,
-            Some(_) => return Err(Error::new(ErrorKind::Corruption)),
-        };
-        let name_key = LogicalKey::IndexNameDirectory(name.clone());
-        let existing = txn.get_for_update(name_key.clone()).await?;
-        if let Some(existing) = existing {
-            let PersistentValue::IndexNameEntry(entry) = existing else {
-                return Err(Error::new(ErrorKind::Corruption));
+            let allocator = match txn.get_for_update(LogicalKey::IndexIdAllocator).await? {
+                None => IndexIdAllocator::new(0),
+                Some(PersistentValue::IndexIdAllocator(allocator)) => allocator,
+                Some(_) => return Err(Error::new(ErrorKind::Corruption)),
             };
-            let manifest = read_manifest_for_update(&mut txn, entry.logical_index_id()).await?;
-            if let Some(expected) = &descriptor {
-                let stored = txn
-                    .get_for_update(LogicalKey::BuildDescriptor(entry.logical_index_id()))
-                    .await?;
+            let name_key = LogicalKey::IndexNameDirectory(name.clone());
+            let existing = txn.get_for_update(name_key.clone()).await?;
+            if let Some(existing) = existing {
+                let PersistentValue::IndexNameEntry(entry) = existing else {
+                    return Err(Error::new(ErrorKind::Corruption));
+                };
+                let manifest = read_manifest_for_update(&mut txn, entry.logical_index_id()).await?;
+                if let Some(expected) = &descriptor {
+                    let stored = txn
+                        .get_for_update(LogicalKey::BuildDescriptor(entry.logical_index_id()))
+                        .await?;
+                    txn.rollback().await;
+                    return classify_build(manifest, &config, expected, stored)
+                        .map(|manifest| (manifest, Ok(())));
+                }
                 txn.rollback().await;
-                return classify_build(manifest, &config, expected, stored);
+                return classify_existing(manifest, &config).map(|manifest| (manifest, Ok(())));
             }
-            txn.rollback().await;
-            return classify_existing(manifest, &config);
-        }
 
-        let next_high_water = allocator
-            .high_water()
-            .checked_add(1)
-            .ok_or_else(id_exhausted)?;
-        let logical_index_id = LogicalIndexId::new(next_high_water).map_err(|_| id_exhausted())?;
-        let manifest = IndexManifest::new(
-            if descriptor.is_some() {
-                IndexLifecycle::Building
-            } else {
-                IndexLifecycle::Active
-            },
-            logical_index_id,
-            config.clone(),
-            derive_rotation_seed(logical_index_id),
-            derive_bloom_parameters(&config)?,
-        )?;
+            let next_high_water = allocator
+                .high_water()
+                .checked_add(1)
+                .ok_or_else(id_exhausted)?;
+            let logical_index_id =
+                LogicalIndexId::new(next_high_water).map_err(|_| id_exhausted())?;
+            let manifest = IndexManifest::new(
+                if descriptor.is_some() {
+                    IndexLifecycle::Building
+                } else {
+                    IndexLifecycle::Active
+                },
+                logical_index_id,
+                config.clone(),
+                derive_rotation_seed(logical_index_id),
+                derive_bloom_parameters(&config)?,
+            )?;
 
-        let inserted = txn
-            .insert(
-                name_key,
-                PersistentValue::IndexNameEntry(IndexNameEntry::new(logical_index_id)),
-            )
-            .await?;
-        if inserted != crate::storage::backend::InsertOutcome::Inserted {
-            return Err(Error::new(ErrorKind::Backend));
-        }
-        txn.put(
-            LogicalKey::IndexIdAllocator,
-            PersistentValue::IndexIdAllocator(IndexIdAllocator::new(next_high_water)),
-        )
-        .await?;
-        txn.put(
-            LogicalKey::Manifest(logical_index_id),
-            PersistentValue::IndexManifest(manifest.clone()),
-        )
-        .await?;
-
-        if let Some(descriptor) = &descriptor {
+            let inserted = txn
+                .insert(
+                    name_key,
+                    PersistentValue::IndexNameEntry(IndexNameEntry::new(logical_index_id)),
+                )
+                .await?;
+            if inserted != crate::storage::backend::InsertOutcome::Inserted {
+                return Err(Error::new(ErrorKind::Backend));
+            }
             txn.put(
-                LogicalKey::BuildDescriptor(logical_index_id),
-                PersistentValue::BuildDescriptor(descriptor.clone()),
+                LogicalKey::IndexIdAllocator,
+                PersistentValue::IndexIdAllocator(IndexIdAllocator::new(next_high_water)),
             )
             .await?;
-        }
+            txn.put(
+                LogicalKey::Manifest(logical_index_id),
+                PersistentValue::IndexManifest(manifest.clone()),
+            )
+            .await?;
 
-        match context.commit(move |start| txn.commit_with(start)).await {
-            Ok(()) => return Ok(manifest),
-            Err(error) if error.kind() == ErrorKind::RetryableAbort => {
-                retry
-                    .wait_or_exhaust(
-                        if descriptor.is_some() {
-                            Operation::StartBulkBuild
-                        } else {
-                            Operation::CreateIndex
-                        },
-                        &mut failed_attempts,
-                    )
-                    .await?;
+            if let Some(descriptor) = &descriptor {
+                txn.put(
+                    LogicalKey::BuildDescriptor(logical_index_id),
+                    PersistentValue::BuildDescriptor(descriptor.clone()),
+                )
+                .await?;
             }
-            Err(error) if error.kind() == ErrorKind::CommitOutcomeUnknown => {
+
+            let committed = context.commit(move |start| txn.commit_with(start)).await;
+            Ok((manifest, committed))
+        }
+        .await;
+        // Keep recovery outside the retryable attempt: an error while resolving
+        // an uncertain commit must never allocate a new identity.
+        let error = match attempted {
+            Ok((manifest, Ok(()))) => return Ok(manifest),
+            Ok((manifest, Err(error))) if error.kind() == ErrorKind::CommitOutcomeUnknown => {
                 return recover_create(
                     backend.as_ref(),
                     &name,
                     &config,
-                    descriptor.as_ref().map(|d| (logical_index_id, d)),
+                    descriptor
+                        .as_ref()
+                        .map(|d| (manifest.logical_index_id(), d)),
                 )
                 .await;
             }
-            Err(error) => return Err(error),
+            Ok((_, Err(error))) | Err(error) => error,
+        };
+        if error.kind() != ErrorKind::RetryableAbort {
+            return Err(error);
         }
+        retry
+            .wait_or_exhaust(
+                if descriptor.is_some() {
+                    Operation::StartBulkBuild
+                } else {
+                    Operation::CreateIndex
+                },
+                &mut failed_attempts,
+            )
+            .await?;
     }
 }
 
@@ -410,93 +422,123 @@ pub(crate) async fn drop_index_bound<B: Backend>(
     loop {
         context.checkpoint()?;
         let backend = context.backend();
-        let capabilities = backend.capabilities();
-        let hard_limits = backend.hard_limits();
-        let budget = backend.admission_budget();
+        let attempted = async {
+            let capabilities = backend.capabilities();
+            let hard_limits = backend.hard_limits();
+            let budget = backend.admission_budget();
 
-        let raw = backend.begin_write().await?;
-        let mut txn = WriteLogicalTxn::bootstrap(raw, hard_limits, budget);
-        let Some(existing) = txn.get_for_update(name_key.clone()).await? else {
-            txn.rollback().await;
-            return Ok(());
-        };
-        let PersistentValue::IndexNameEntry(entry) = existing else {
-            return Err(Error::new(ErrorKind::Corruption));
-        };
-        let id = *target_id.get_or_insert(entry.logical_index_id());
-        if id != entry.logical_index_id() {
-            txn.rollback().await;
-            return Ok(());
-        }
-        let manifest = read_manifest_for_update(&mut txn, id).await?;
-        if build_id.is_some() && manifest.lifecycle() == IndexLifecycle::Active {
-            return Err(Error::invalid_argument());
-        }
-        let step = match manifest.lifecycle() {
-            IndexLifecycle::Active | IndexLifecycle::Building => {
-                let dropping = manifest.with_lifecycle(IndexLifecycle::Dropping);
-                txn.put(
-                    LogicalKey::Manifest(manifest.logical_index_id()),
-                    PersistentValue::IndexManifest(dropping),
-                )
-                .await?;
-                DropStep::Commit {
-                    cursor: None,
-                    complete: false,
-                }
-            }
-            IndexLifecycle::Dropping => {
-                let raw = txn.into_raw();
-                txn = WriteLogicalTxn::for_drop(raw, &manifest, hard_limits, budget)?;
-
-                let Some(existing) = txn.get_for_update(name_key.clone()).await? else {
-                    txn.rollback().await;
-                    return Ok(());
-                };
-                let PersistentValue::IndexNameEntry(entry) = existing else {
-                    return Err(Error::new(ErrorKind::Corruption));
-                };
-                let current = read_manifest_for_update(&mut txn, entry.logical_index_id()).await?;
-                if current.lifecycle() != IndexLifecycle::Dropping {
-                    return Err(Error::new(ErrorKind::Corruption));
-                }
-                if current.logical_index_id() != manifest.logical_index_id() {
-                    return Err(Error::new(ErrorKind::Corruption));
-                }
-
-                prepare_delete_step(&mut txn, &name_key, &current, capabilities, cursor.as_ref())
-                    .await?
-            }
-        };
-        match step {
-            DropStep::Advance { cursor: next } => {
+            let raw = backend.begin_write().await?;
+            let mut txn = WriteLogicalTxn::bootstrap(raw, hard_limits, budget);
+            let Some(existing) = txn.get_for_update(name_key.clone()).await? else {
                 txn.rollback().await;
-                cursor = Some(next);
+                return Ok(DropAttempt::Complete);
+            };
+            let PersistentValue::IndexNameEntry(entry) = existing else {
+                return Err(Error::new(ErrorKind::Corruption));
+            };
+            let id = *target_id.get_or_insert(entry.logical_index_id());
+            if id != entry.logical_index_id() {
+                txn.rollback().await;
+                return Ok(DropAttempt::Complete);
             }
-            DropStep::Commit {
-                cursor: next,
-                complete,
-            } => match context.commit(move |start| txn.commit_with(start)).await {
-                Ok(()) if complete => return Ok(()),
-                Ok(()) => {
-                    cursor = next;
-                }
-                Err(error) if error.kind() == ErrorKind::RetryableAbort => {
-                    retry
-                        .wait_or_exhaust(Operation::DropIndex, &mut failed_attempts)
-                        .await?;
-                }
-                Err(error) if error.kind() == ErrorKind::CommitOutcomeUnknown => {
-                    cursor = None;
-                    unknown_attempts += 1;
-                    if unknown_attempts >= retry.attempts {
-                        return recover_drop_after_unknown(backend.as_ref(), &name_key, id).await;
+            let manifest = read_manifest_for_update(&mut txn, id).await?;
+            if build_id.is_some() && manifest.lifecycle() == IndexLifecycle::Active {
+                return Err(Error::invalid_argument());
+            }
+            let step = match manifest.lifecycle() {
+                IndexLifecycle::Active | IndexLifecycle::Building => {
+                    let dropping = manifest.with_lifecycle(IndexLifecycle::Dropping);
+                    txn.put(
+                        LogicalKey::Manifest(manifest.logical_index_id()),
+                        PersistentValue::IndexManifest(dropping),
+                    )
+                    .await?;
+                    DropStep::Commit {
+                        cursor: None,
+                        complete: false,
                     }
                 }
-                Err(error) => return Err(error),
-            },
+                IndexLifecycle::Dropping => {
+                    let raw = txn.into_raw();
+                    txn = WriteLogicalTxn::for_drop(raw, &manifest, hard_limits, budget)?;
+
+                    let Some(existing) = txn.get_for_update(name_key.clone()).await? else {
+                        txn.rollback().await;
+                        return Ok(DropAttempt::Complete);
+                    };
+                    let PersistentValue::IndexNameEntry(entry) = existing else {
+                        return Err(Error::new(ErrorKind::Corruption));
+                    };
+                    let current =
+                        read_manifest_for_update(&mut txn, entry.logical_index_id()).await?;
+                    if current.lifecycle() != IndexLifecycle::Dropping {
+                        return Err(Error::new(ErrorKind::Corruption));
+                    }
+                    if current.logical_index_id() != manifest.logical_index_id() {
+                        return Err(Error::new(ErrorKind::Corruption));
+                    }
+
+                    prepare_delete_step(
+                        &mut txn,
+                        &name_key,
+                        &current,
+                        capabilities,
+                        cursor.as_ref(),
+                    )
+                    .await?
+                }
+            };
+            match step {
+                DropStep::Advance { cursor: next } => {
+                    txn.rollback().await;
+                    cursor = Some(next);
+                }
+                DropStep::Commit {
+                    cursor: next,
+                    complete,
+                } => match context.commit(move |start| txn.commit_with(start)).await {
+                    Ok(()) => {
+                        cursor = next;
+                        return Ok(if complete {
+                            DropAttempt::Complete
+                        } else {
+                            DropAttempt::Continue
+                        });
+                    }
+                    Err(error) if error.kind() == ErrorKind::CommitOutcomeUnknown => {
+                        return Ok(DropAttempt::Recover(id));
+                    }
+                    Err(error) => return Err(error),
+                },
+            }
+            Ok(DropAttempt::Continue)
+        }
+        .await;
+        match attempted {
+            Ok(DropAttempt::Complete) => return Ok(()),
+            Ok(DropAttempt::Continue) => {}
+            Err(error) if error.kind() == ErrorKind::RetryableAbort => {
+                retry
+                    .wait_or_exhaust(Operation::DropIndex, &mut failed_attempts)
+                    .await?;
+            }
+            Ok(DropAttempt::Recover(id)) => {
+                cursor = None;
+                unknown_attempts += 1;
+                if unknown_attempts >= retry.attempts {
+                    return recover_drop_after_unknown(backend.as_ref(), &name_key, id).await;
+                }
+            }
+            Err(error) => return Err(error),
         }
     }
+}
+
+/// Result of one drop attempt, retaining the target for uncertain-commit recovery.
+enum DropAttempt {
+    Continue,
+    Complete,
+    Recover(LogicalIndexId),
 }
 
 /// Separates scan-only progress from a deletion batch that must commit before advancing.

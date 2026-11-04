@@ -15,9 +15,9 @@ use std::time::Instant;
 use crate::api::{ErrorKind, Result};
 use crate::observe::labels::{Operation, WriteAttemptOutcome};
 use crate::observe::metrics;
-use crate::storage::WriteLogicalTxn;
 use crate::storage::backend::Backend;
 use crate::storage::values::IndexManifest;
+use crate::storage::{TransactionSize, WriteLogicalTxn};
 
 use super::OperationContext;
 use super::lifecycle::RetryPolicy;
@@ -89,36 +89,40 @@ pub(crate) async fn run_write_attempts<'b, 'm, B: Backend, O>(
         if let Some(context) = context.as_deref_mut() {
             context.checkpoint()?;
         }
-        let mut txn = open_validated_write(backend, handle_manifest).await?;
-        let stepped = step(&mut txn).await;
-        let size = txn.size();
-        let attempted = match stepped {
-            Ok(outcome) => {
-                let committed = match context.as_deref_mut() {
-                    Some(context) => {
-                        context
-                            .commit(move |start| async move {
-                                let commit_started = Instant::now();
-                                let committed = txn.commit_with(start).await;
-                                observe_commit(operation, &committed, commit_started);
-                                committed
-                            })
-                            .await
-                    }
-                    None => {
-                        let commit_started = Instant::now();
-                        let committed = txn.commit().await;
-                        observe_commit(operation, &committed, commit_started);
-                        committed
-                    }
-                };
-                committed.map(|()| outcome)
+        let mut size = TransactionSize::default();
+        let attempted = async {
+            let mut txn = open_validated_write(backend, handle_manifest).await?;
+            let stepped = step(&mut txn).await;
+            size = txn.size();
+            match stepped {
+                Ok(outcome) => {
+                    let committed = match context.as_deref_mut() {
+                        Some(context) => {
+                            context
+                                .commit(move |start| async move {
+                                    let commit_started = Instant::now();
+                                    let committed = txn.commit_with(start).await;
+                                    observe_commit(operation, &committed, commit_started);
+                                    committed
+                                })
+                                .await
+                        }
+                        None => {
+                            let commit_started = Instant::now();
+                            let committed = txn.commit().await;
+                            observe_commit(operation, &committed, commit_started);
+                            committed
+                        }
+                    };
+                    committed.map(|()| outcome)
+                }
+                Err(error) => {
+                    txn.rollback().await;
+                    Err(error)
+                }
             }
-            Err(error) => {
-                txn.rollback().await;
-                Err(error)
-            }
-        };
+        }
+        .await;
         metrics::write_attempt_finished(
             operation,
             WriteAttemptOutcome::from_result(&attempted),
