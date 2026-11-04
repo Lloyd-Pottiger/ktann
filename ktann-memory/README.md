@@ -92,7 +92,10 @@ fault/history types.
 
 `push_fault` and `set_fault_plan` resolve commits as normal, definitely aborted,
 unknown-but-applied, or unknown-and-not-applied. An unknown-but-applied step
-still validates conflicts and capacity before publishing. Operation counts and
+still validates conflicts and capacity before publishing. `set_write_fault_plan`
+injects a bounded sequence of errors before write transaction opening,
+update-protected point reads, or point mutation batches; unrelated operations do not consume
+the plan. Operation counts and
 bounded redacted commit history support work-amplification checks and replay.
 `reopen()` simulates ephemeral or durable restart; the durable mode copies a
 snapshot handle into a fresh instance and never writes to disk.
