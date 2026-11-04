@@ -209,10 +209,10 @@ pub(crate) async fn reserve_index<B: Backend>(
                         .await?;
                     txn.rollback().await;
                     return classify_build(manifest, &config, expected, stored)
-                        .map(|manifest| (manifest, Ok(())));
+                        .map(ReservationAttempt::Complete);
                 }
                 txn.rollback().await;
-                return classify_existing(manifest, &config).map(|manifest| (manifest, Ok(())));
+                return classify_existing(manifest, &config).map(ReservationAttempt::Complete);
             }
 
             let next_high_water = allocator
@@ -261,29 +261,30 @@ pub(crate) async fn reserve_index<B: Backend>(
                 .await?;
             }
 
-            let committed = context.commit(move |start| txn.commit_with(start)).await;
-            Ok((manifest, committed))
+            match context.commit(move |start| txn.commit_with(start)).await {
+                Ok(()) => Ok(ReservationAttempt::Complete(manifest)),
+                Err(error) if error.kind() == ErrorKind::CommitOutcomeUnknown => {
+                    Ok(ReservationAttempt::Recover(logical_index_id))
+                }
+                Err(error) => Err(error),
+            }
         }
         .await;
         // Keep recovery outside the retryable attempt: an error while resolving
         // an uncertain commit must never allocate a new identity.
-        let error = match attempted {
-            Ok((manifest, Ok(()))) => return Ok(manifest),
-            Ok((manifest, Err(error))) if error.kind() == ErrorKind::CommitOutcomeUnknown => {
+        match attempted {
+            Ok(ReservationAttempt::Complete(manifest)) => return Ok(manifest),
+            Ok(ReservationAttempt::Recover(id)) => {
                 return recover_create(
                     backend.as_ref(),
                     &name,
                     &config,
-                    descriptor
-                        .as_ref()
-                        .map(|d| (manifest.logical_index_id(), d)),
+                    descriptor.as_ref().map(|d| (id, d)),
                 )
                 .await;
             }
-            Ok((_, Err(error))) | Err(error) => error,
-        };
-        if error.kind() != ErrorKind::RetryableAbort {
-            return Err(error);
+            Err(error) if error.kind() == ErrorKind::RetryableAbort => {}
+            Err(error) => return Err(error),
         }
         retry
             .wait_or_exhaust(
@@ -296,6 +297,12 @@ pub(crate) async fn reserve_index<B: Backend>(
             )
             .await?;
     }
+}
+
+/// A reservation is complete, or its uncertain commit needs identity-bound recovery.
+enum ReservationAttempt {
+    Complete(IndexManifest),
+    Recover(LogicalIndexId),
 }
 
 /// Resolves an uncertain reservation from a fresh snapshot. Bulk recovery must
@@ -492,6 +499,7 @@ pub(crate) async fn drop_index_bound<B: Backend>(
                 DropStep::Advance { cursor: next } => {
                     txn.rollback().await;
                     cursor = Some(next);
+                    Ok(DropAttempt::Continue)
                 }
                 DropStep::Commit {
                     cursor: next,
@@ -499,19 +507,18 @@ pub(crate) async fn drop_index_bound<B: Backend>(
                 } => match context.commit(move |start| txn.commit_with(start)).await {
                     Ok(()) => {
                         cursor = next;
-                        return Ok(if complete {
+                        Ok(if complete {
                             DropAttempt::Complete
                         } else {
                             DropAttempt::Continue
-                        });
+                        })
                     }
                     Err(error) if error.kind() == ErrorKind::CommitOutcomeUnknown => {
-                        return Ok(DropAttempt::Recover(id));
+                        Ok(DropAttempt::Recover(id))
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => Err(error),
                 },
             }
-            Ok(DropAttempt::Continue)
         }
         .await;
         match attempted {
