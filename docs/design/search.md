@@ -183,7 +183,9 @@ chunk requests at their own point-read ceilings. Visits, body loads,
 candidate selection, and budget accounting retain their original order. Roots
 are read individually because their transition state can inject split targets
 ahead of the queued work. Batching changes backend scheduling, not the selected
-partitions or recall policy.
+partitions or recall policy. On Local Graph Indexes the prefetched prefix contains
+only leaves and stops before the first internal partition, including when trees
+of different heights share the frontier. Internal graph visits remain serial.
 
 Within that funded prefix, traversal validates metadata and applies Synopsis
 pruning before prefetching body pages. At most four first pages of cache misses
