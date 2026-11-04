@@ -374,6 +374,8 @@ pub(crate) async fn open_index<B: Backend>(
 
 /// Drops one Logical Index idempotently.
 ///
+/// The initially resolved Logical Index ID remains the target across retries
+/// and recovery; removal or replacement of its name mapping completes the drop.
 /// The first committed transaction changes Active to Dropping. A range-clear
 /// backend then atomically clears the index-owned range and removes the Index
 /// Name mapping. A point-delete backend repeatedly deletes one bounded scan
@@ -401,6 +403,9 @@ pub(crate) async fn drop_index_bound<B: Backend>(
     let mut cursor: Option<LogicalScanCursor> = None;
     let mut failed_attempts = 0_u32;
     let mut unknown_attempts = 0_u32;
+    // Bind before the first commit attempt, including attempts that abort or
+    // have unknown outcomes. Only build aborts also forbid an Active target.
+    let mut target_id = build_id;
 
     loop {
         context.checkpoint()?;
@@ -418,15 +423,14 @@ pub(crate) async fn drop_index_bound<B: Backend>(
         let PersistentValue::IndexNameEntry(entry) = existing else {
             return Err(Error::new(ErrorKind::Corruption));
         };
-        let manifest = read_manifest_for_update(&mut txn, entry.logical_index_id()).await?;
-        if let Some(id) = build_id {
-            if id != entry.logical_index_id() {
-                txn.rollback().await;
-                return Ok(());
-            }
-            if manifest.lifecycle() == IndexLifecycle::Active {
-                return Err(Error::invalid_argument());
-            }
+        let id = *target_id.get_or_insert(entry.logical_index_id());
+        if id != entry.logical_index_id() {
+            txn.rollback().await;
+            return Ok(());
+        }
+        let manifest = read_manifest_for_update(&mut txn, id).await?;
+        if build_id.is_some() && manifest.lifecycle() == IndexLifecycle::Active {
+            return Err(Error::invalid_argument());
         }
         let step = match manifest.lifecycle() {
             IndexLifecycle::Active | IndexLifecycle::Building => {
@@ -486,8 +490,7 @@ pub(crate) async fn drop_index_bound<B: Backend>(
                     cursor = None;
                     unknown_attempts += 1;
                     if unknown_attempts >= retry.attempts {
-                        return recover_drop_after_unknown(backend.as_ref(), &name_key, build_id)
-                            .await;
+                        return recover_drop_after_unknown(backend.as_ref(), &name_key, id).await;
                     }
                 }
                 Err(error) => return Err(error),
@@ -568,12 +571,12 @@ async fn prepare_delete_step<T: WriteTxn>(
     }
 }
 
-/// Resolves drop by the current name mapping. A bound abort is finished once that
-/// name no longer targets its original ID, even if a replacement index now exists.
+/// Resolves an unknown drop outcome against its original Logical Index ID.
+/// A missing or replaced name proves completion because IDs are never reused.
 async fn recover_drop_after_unknown<B: Backend>(
     backend: &B,
     name_key: &LogicalKey,
-    build_id: Option<LogicalIndexId>,
+    target_id: LogicalIndexId,
 ) -> Result<()> {
     let raw = backend.begin_read().await?;
     let mut txn = ReadLogicalTxn::bootstrap(raw);
@@ -583,7 +586,7 @@ async fn recover_drop_after_unknown<B: Backend>(
     let PersistentValue::IndexNameEntry(entry) = existing else {
         return Err(Error::new(ErrorKind::Corruption));
     };
-    if build_id.is_some_and(|id| id != entry.logical_index_id()) {
+    if target_id != entry.logical_index_id() {
         return Ok(());
     }
     let _ = read_manifest(&mut txn, entry.logical_index_id()).await?;

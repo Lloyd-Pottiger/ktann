@@ -58,6 +58,10 @@ physical-key limits on all supported backends.
 Create is idempotent for the same name and configuration after an unknown commit
 outcome. Open rejects a Building or Dropping index, unsupported format, backend mismatch, or
 configuration mismatch. Drop is idempotent and follows the storage lifecycle.
+Each drop remains bound to the Logical Index ID initially resolved from its
+Index Name, including retries and unknown-commit recovery. If another drop
+removes that identity, this operation succeeds without affecting a same-name
+replacement.
 
 ## 2. Records and mutations
 

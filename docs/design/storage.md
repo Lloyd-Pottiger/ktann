@@ -108,8 +108,12 @@ Manifest. Bulk Build instead reserves a hidden Building Manifest and an immutabl
 Build Descriptor; [publication](bulk-build.md#5-loading-and-exact-validation)
 transitions it to Active after exact validation. ID gaps are valid. Drop
 transitions the Manifest to Dropping before
-deleting data. All ordinary operations validate Active state; mutations
-update-protect that Manifest read.
+deleting data. Each drop binds the first resolved Logical Index ID across all
+transactions, retries, and unknown-outcome recovery. An absent name mapping or
+a mapping to another ID proves the original target was removed; the operation
+succeeds without touching a same-name replacement. Bulk Build abort additionally
+rejects an Active Manifest for its bound ID. All ordinary operations validate
+Active state; mutations update-protect that Manifest read.
 
 Offline refinement preserves the Active Manifest, Partition Keys and topology.
 Record relocation preserves exact membership, payloads and capacity constraints
