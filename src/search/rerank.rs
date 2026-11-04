@@ -73,6 +73,7 @@ pub(crate) async fn exact_rerank<T: ReadOps>(
     query: &[f32],
     candidates: Vec<LeafCandidate>,
     k: usize,
+    check: &(impl Fn() -> Result<()> + Sync),
 ) -> Result<ExactRerankOutcome> {
     if k == 0 {
         return Err(Error::invalid_argument());
@@ -82,13 +83,20 @@ pub(crate) async fn exact_rerank<T: ReadOps>(
     let mut scored: Vec<(Bytes, ExactDistance)> = Vec::with_capacity(load_count);
     if load_count != 0 {
         let exact_query = kernel.prepare_exact_query(query)?;
-        for batch in candidates.chunks(RECORD_LOAD_BATCH) {
+        for (batch_index, batch) in candidates.chunks(RECORD_LOAD_BATCH).enumerate() {
+            check()?;
+            if batch_index > 0 {
+                super::cooperate(check).await?;
+            }
             let ids = batch
                 .iter()
                 .map(|candidate| candidate.record_id().clone())
                 .collect();
             let groups = txn.read_record_groups(ids, false).await?;
-            for (candidate, group) in batch.iter().zip(groups) {
+            for (ordinal, (candidate, group)) in batch.iter().zip(groups).enumerate() {
+                if ordinal > 0 && ordinal % 32 == 0 {
+                    super::cooperate(check).await?;
+                }
                 let group = group.ok_or_else(|| Error::new(ErrorKind::Corruption))?;
                 let record = group.record();
                 if record.record_id() != candidate.record_id()
@@ -307,7 +315,7 @@ mod tests {
         let mut txn = ReadLogicalTxn::for_index(txn, manifest);
         let kernel =
             VectorKernel::new(DIMENSION, manifest.config().metric(), SEED).expect("valid kernel");
-        exact_rerank(&mut txn, &kernel, &QUERY, candidates, k).await
+        exact_rerank(&mut txn, &kernel, &QUERY, candidates, k, &|| Ok(())).await
     }
 
     /// The independent brute-force numeric oracle over original f32 vectors.

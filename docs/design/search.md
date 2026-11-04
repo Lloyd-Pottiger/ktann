@@ -193,6 +193,15 @@ Visits consume those pages in order and stream any continuation through one
 body at a time; a complete body passes count validation before cache publication.
 This bounds temporary prefetching independently of complete partition size.
 
+Ordinary search cooperatively yields between scan pages and bounded CPU batches
+(filtering, leaf scoring, exact internal routing, membership validation, and
+reranking), including when cache or Memory reads complete immediately. A small
+first batch may finish inline; further visits and batches yield, so a wide beam
+of small cached bodies also remains cooperative. Operation control is checked around yields; cancellation fails the whole query and cannot
+publish an incomplete body. These scheduling boundaries do not truncate an
+admitted leaf, change candidate order, or open another snapshot. They are internal
+execution choices, not public budgets or a real-time cancellation guarantee.
+
 ### 6.3 Candidate selection
 
 Every predicate-eligible entry of every visited leaf is scored. One global max

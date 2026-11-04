@@ -642,13 +642,14 @@ impl BodyRead {
         txn: &mut ReadLogicalTxn<'_, T>,
         cache: &PartitionCache,
         manifest: &IndexManifest,
+        check: &(impl Fn() -> Result<()> + Sync),
     ) -> Result<Arc<CachedBody>> {
         match self {
             Self::Cached(body) => Ok(body),
             Self::Scan(scan) => {
                 let key = scan.key.clone();
                 let epoch = scan.header.cache_epoch();
-                let (entries, bytes) = scan.read(txn, manifest, &|| Ok(())).await?;
+                let (entries, bytes) = scan.read(txn, manifest, check).await?;
                 let body = Arc::new(CachedBody {
                     epoch,
                     bytes,
@@ -694,7 +695,7 @@ impl BodyScan {
             };
         let mut cursor: Option<LogicalScanCursor> = None;
         loop {
-            check()?;
+            super::cooperate(&check).await?;
             let page = match first_page.take() {
                 Some(page) => page,
                 None => txn.scan(&range, cursor.as_ref(), BODY_SCAN_LIMITS).await?,
@@ -800,6 +801,7 @@ pub(super) async fn load_body<T: ReadOps>(
     tree_key: &TreeKey,
     partition: PartitionKey,
     header: &PartitionHeader,
+    check: &(impl Fn() -> Result<()> + Sync),
 ) -> Result<Arc<CachedBody>> {
     BodyRead::start(
         cache,
@@ -810,7 +812,7 @@ pub(super) async fn load_body<T: ReadOps>(
             header,
         },
     )?
-    .finish(txn, cache, manifest)
+    .finish(txn, cache, manifest, check)
     .await
 }
 
@@ -1223,9 +1225,47 @@ mod tests {
             &tree_key(),
             pk(partition),
             &header,
+            &|| Ok(()),
         )
         .await?;
         Ok((body, txn.into_raw()))
+    }
+
+    /// Cancellation after a decoded page must not publish a partial cache body.
+    #[tokio::test]
+    async fn cancellation_between_body_pages_leaves_cache_empty() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let manifest = manifest();
+        let cache = PartitionCache::new(1 << 20);
+        let data = (0_u32..600)
+            .map(|id| leaf_item(&manifest, 1, &id.to_be_bytes()))
+            .collect();
+        let mut txn = ReadLogicalTxn::for_index(mock_txn(data), &manifest);
+        let header = PartitionHeader::new(1, 600, 11, PartitionState::Ready).unwrap();
+        let checks = AtomicUsize::new(0);
+        let check = || {
+            if checks.fetch_add(1, Ordering::Relaxed) >= 2 {
+                Err(Error::new(ErrorKind::Cancelled))
+            } else {
+                Ok(())
+            }
+        };
+        let error = load_body(
+            &mut txn,
+            &cache,
+            &manifest,
+            &tree_key(),
+            pk(1),
+            &header,
+            &check,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), ErrorKind::Cancelled);
+        assert_eq!(txn.into_raw().scans, 1, "stop before the continuation read");
+        assert_eq!(cache.len(), 0);
     }
 
     #[tokio::test]
@@ -1265,7 +1305,7 @@ mod tests {
         let mut bodies = Vec::new();
         for read in reads {
             bodies.push(
-                read.finish(&mut txn, &cache, &manifest)
+                read.finish(&mut txn, &cache, &manifest, &|| Ok(()))
                     .await
                     .expect("finish"),
             );
@@ -1332,7 +1372,7 @@ mod tests {
             .expect("first pages are valid");
         let first = reads.into_iter().next().expect("first body");
         let error = first
-            .finish(&mut txn, &cache, &manifest)
+            .finish(&mut txn, &cache, &manifest, &|| Ok(()))
             .await
             .err()
             .expect("corrupt continuation");

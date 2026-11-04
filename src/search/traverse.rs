@@ -231,7 +231,7 @@ pub(crate) async fn traverse<T: ReadOps>(
         manifest.config().local_graph().is_some(),
     )?;
     state.run(txn, &context).await?;
-    state.finish()
+    state.finish(&|| execution.checkpoint()).await
 }
 
 /// The manifest-bound inputs shared by every partition visit.
@@ -349,7 +349,6 @@ impl Traversal {
         context: &VisitContext<'_, impl RoutingExecution>,
     ) -> Result<()> {
         loop {
-            context.execution.checkpoint()?;
             if self.frontier.is_empty() {
                 self.select_next_frontier();
                 if self.frontier.is_empty() {
@@ -360,6 +359,12 @@ impl Traversal {
             // enter the active frontier.
             if self.visited_partitions == context.request.budgets.visited_partitions() {
                 break;
+            }
+            context.execution.checkpoint()?;
+            // One small root may finish synchronously. Further visits must
+            // yield even when each cached body is below the CPU batch size.
+            if self.visited_partitions > 0 {
+                super::cooperate(&|| context.execution.checkpoint()).await?;
             }
             let remaining = context.request.budgets.visited_partitions() - self.visited_partitions;
             // Internal graph bodies are restored and consumed one at a time.
@@ -435,6 +440,9 @@ impl Traversal {
         }
         let mut values = txn.batch_get(keys).await?.into_iter();
         for entries in entries.chunks(BODY_PREFETCH_BATCH) {
+            // Small cached bodies may each finish without yielding internally.
+            // Keep a wide funded beam cooperative between prefetch groups too.
+            super::cooperate(&|| context.execution.checkpoint()).await?;
             let mut visits = Vec::with_capacity(entries.len());
             for &entry in entries {
                 let header = expect_header(values.next().flatten())?
@@ -465,8 +473,12 @@ impl Traversal {
                 .collect();
             let reads = prefetch_bodies(txn, context.cache, context.manifest, &requests).await?;
             for (visit, read) in visits.into_iter().zip(reads) {
-                let body = read.finish(txn, context.cache, context.manifest).await?;
-                self.visit_body(context, &visit, &body)?;
+                let body = read
+                    .finish(txn, context.cache, context.manifest, &|| {
+                        context.execution.checkpoint()
+                    })
+                    .await?;
+                self.visit_body(context, &visit, &body).await?;
             }
         }
         Ok(())
@@ -613,13 +625,14 @@ impl Traversal {
             tree_key,
             entry.partition,
             &visit.header,
+            &|| context.execution.checkpoint(),
         )
         .await?;
-        self.visit_body(context, &visit, &body)
+        self.visit_body(context, &visit, &body).await
     }
 
     /// Consumes complete bodies in the original deterministic traversal order.
-    fn visit_body(
+    async fn visit_body(
         &mut self,
         context: &VisitContext<'_, impl RoutingExecution>,
         visit: &PreparedVisit<'_>,
@@ -627,6 +640,7 @@ impl Traversal {
     ) -> Result<()> {
         if visit.header.level() > 1 {
             self.visit_internal(context, visit.entry.tree, &visit.header, body)
+                .await
         } else {
             self.scan_leaf(
                 context,
@@ -635,6 +649,7 @@ impl Traversal {
                 body,
                 visit.predicate,
             )
+            .await
         }
     }
 
@@ -713,8 +728,8 @@ impl Traversal {
             .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
         // Validate every exposed edge, including children excluded by local top-B.
         for (ordinal, child) in graph.children().iter().enumerate() {
-            if ordinal % 64 == 0 {
-                context.execution.checkpoint()?;
+            if ordinal > 0 && ordinal % 64 == 0 {
+                super::cooperate(&|| context.execution.checkpoint()).await?;
             }
             if !self.referenced.insert((visit.entry.tree, child.child())) {
                 return Err(Error::new(ErrorKind::Corruption));
@@ -733,8 +748,8 @@ impl Traversal {
         ::metrics::counter!("ktann.routing.merge_candidates").increment(candidates.len() as u64);
         let merge_started = std::time::Instant::now();
         for (ordinal, (child, distance)) in candidates.into_iter().enumerate() {
-            if ordinal % 64 == 0 {
-                context.execution.checkpoint()?;
+            if ordinal > 0 && ordinal % 64 == 0 {
+                super::cooperate(&|| context.execution.checkpoint()).await?;
             }
             self.merge_child(
                 visit.entry.tree,
@@ -828,7 +843,7 @@ impl Traversal {
 
     /// Exact routing baseline; all exposed children compete in one
     /// bounded tree/level heap under the existing total tie order.
-    fn visit_internal(
+    async fn visit_internal(
         &mut self,
         context: &VisitContext<'_, impl RoutingExecution>,
         tree: u32,
@@ -840,8 +855,8 @@ impl Traversal {
             return Err(Error::new(ErrorKind::Corruption));
         };
         for (batch, children) in entries.chunks(4).enumerate() {
-            if batch % 16 == 0 {
-                context.execution.checkpoint()?;
+            if batch > 0 && batch % 16 == 0 {
+                super::cooperate(&|| context.execution.checkpoint()).await?;
             }
             let distances = if children.len() == 4 {
                 context.kernel.routing_centroid_distances(
@@ -879,7 +894,7 @@ impl Traversal {
     /// Considers every entry of an admitted Leaf Partition, filters exactly,
     /// and admits scores to the global bounded candidate heap. The snapshot-validated cache
     /// supplies the whole decoded body; scanning has no independent entry cap.
-    fn scan_leaf(
+    async fn scan_leaf(
         &mut self,
         context: &VisitContext<'_, impl RoutingExecution>,
         tree_key: &TreeKey,
@@ -909,6 +924,9 @@ impl Traversal {
         let eligible = if let Some(predicate) = predicate {
             let mut ordinals = Vec::new();
             for (ordinal, entry) in entries.iter().enumerate() {
+                if ordinal > 0 && ordinal % 64 == 0 {
+                    super::cooperate(&|| context.execution.checkpoint()).await?;
+                }
                 if predicate.matches(entry.fields())? {
                     ordinals.push(ordinal);
                 }
@@ -917,13 +935,16 @@ impl Traversal {
         } else {
             None
         };
-        self.candidates.push_leaf(
-            entries,
-            codes,
-            RecordLocation::new(tree_key.clone(), partition),
-            context.query,
-            eligible.as_deref(),
-        )?;
+        self.candidates
+            .push_leaf(
+                entries,
+                codes,
+                RecordLocation::new(tree_key.clone(), partition),
+                context.query,
+                eligible.as_deref(),
+                &|| context.execution.checkpoint(),
+            )
+            .await?;
         Ok(())
     }
 
@@ -951,8 +972,11 @@ impl Traversal {
     }
 
     /// Reports the bounded candidate pool after membership validation.
-    fn finish(mut self) -> Result<TraversalOutcome> {
-        self.candidates.validate_membership()?;
+    async fn finish(
+        mut self,
+        check: &(impl Fn() -> Result<()> + Sync),
+    ) -> Result<TraversalOutcome> {
+        self.candidates.validate_membership(check).await?;
         Ok(TraversalOutcome {
             candidates: self.candidates,
             maintenance: self.maintenance,

@@ -12,7 +12,7 @@ use crate::storage::values::{GRAPH_CHUNK_BYTES, GraphChunk, GraphDescriptor};
 
 /// Runtime execution boundary: one snapshot, bounded owned CPU work and control.
 /// Traversal owns candidate selection; the runtime owns admission and dispatch.
-pub(crate) trait RoutingExecution {
+pub(crate) trait RoutingExecution: Sync {
     fn checkpoint(&self) -> Result<()>;
     async fn read<T: ReadOps>(
         &self,

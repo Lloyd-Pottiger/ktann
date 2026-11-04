@@ -20,6 +20,11 @@ At most the configured foreground operation limit may run and the same number
 may wait for admission; further calls fail with `LimitExceeded` rather than
 creating an unbounded process-local queue.
 
+Ordinary search uses cooperative CPU batches and explicit yields so ready-only
+backend reads cannot monopolize the executor. Cancellation/deadline checks surround
+those boundaries; the same admitted task retains its snapshot throughout. Native
+graph work retains the separate owned CPU-task boundary described below.
+
 Graph routing has a separate per-query working-byte ceiling configured by
 `RuntimeConfig::with_routing_working_bytes`; its accounting contract belongs to
 [Search](search.md#graph-index-bodies). Native restore and query tasks, including offline graph verification, use

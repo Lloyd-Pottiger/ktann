@@ -1074,3 +1074,97 @@ async fn invalid_requests_fail_before_admission() {
     assert!(SearchRequest::new(Arc::from([0.0_f32]), 0).is_err());
     runtime.shutdown().await.expect("shutdown");
 }
+
+/// Ready-only storage must not let a search monopolize the only worker.
+/// Observe actual IO progress before cancelling, rather than cancelling admission
+/// or depending on wall-clock timing. Both cache misses and warm reranking matter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn active_search_yields_and_cancels_with_ready_only_storage() {
+    // The test driver otherwise runs on the block_on thread, outside the worker.
+    tokio::spawn(async {
+        let backend = shared_backend(TestConfig::default());
+        let runtime = make_runtime(backend.clone());
+        let index = runtime
+            .create_index("cooperative", IndexConfig::new(8, Metric::L2).unwrap())
+            .await
+            .unwrap();
+        for id in 0..512_u32 {
+            index
+                .insert(
+                    Record::new(
+                        Bytes::copy_from_slice(&id.to_be_bytes()),
+                        vec![id as f32; 8],
+                        vec![],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        for warm in [false, true] {
+            backend.reset_operation_counts();
+            if warm {
+                index
+                    .search(SearchRequest::new(vec![0.0; 8], 512).unwrap())
+                    .await
+                    .unwrap();
+            }
+            let full_rerank_reads = backend.operation_counts().batch_get;
+            backend.reset_operation_counts();
+            let cancellation = CancellationToken::new();
+            let search_index = index.clone();
+            let options = OperationOptions::default().with_cancellation(cancellation.clone());
+            let task = tokio::spawn(async move {
+                search_index
+                    .search_with_control(SearchRequest::new(vec![0.0; 8], 512).unwrap(), options)
+                    .await
+            });
+            loop {
+                tokio::task::yield_now().await;
+                assert!(
+                    !task.is_finished(),
+                    "search finished without allowing cancellation during IO/CPU progress"
+                );
+                let counts = backend.operation_counts();
+                if if warm {
+                    counts.batch_get > 0
+                } else {
+                    counts.scan >= 2
+                } {
+                    if warm {
+                        assert!(
+                            counts.batch_get < full_rerank_reads,
+                            "observer must run before reranking finishes"
+                        );
+                    } else {
+                        assert_eq!(
+                            counts.batch_get, 0,
+                            "observer must run during the cold body scan, before reranking"
+                        );
+                    }
+                    break;
+                }
+            }
+            cancellation.cancel();
+            assert_eq!(
+                task.await.unwrap().unwrap_err().kind(),
+                ErrorKind::Cancelled
+            );
+            assert_eq!(
+                backend.active_transactions(),
+                0,
+                "cancelled snapshot released"
+            );
+        }
+        // Cancellation must not damage membership, cache publication, or admission.
+        let outcome = index
+            .search(SearchRequest::new(vec![0.0; 8], 512).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(outcome.hits.len(), 512);
+        assert_eq!(outcome.usage.visited_leaf_entries, 512);
+        runtime.shutdown().await.unwrap();
+    })
+    .await
+    .unwrap();
+}

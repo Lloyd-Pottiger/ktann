@@ -660,3 +660,18 @@ without rebuilding or changing it. Dimension and metric come from its manifest;
 `records` is controller-supplied fixture metadata, not a newly counted cardinality.
 The controller must verify dataset provenance and warm the new process's caches
 before measurement. A running bridge accepts only one reset or resume.
+
+### Search executor scheduling diagnostic
+
+Run `cargo test --release -p ktann --test search_scheduling -- --ignored --nocapture`
+on an otherwise idle host. This deterministic Memory workload uses a supported
+multi-thread Tokio runtime with one worker; both search and its 1 ms timer run
+on that worker. It reports cold latency, 50 warm-search latency/timer samples,
+throughput over 100 sequential warm queries, a 1 ms deadline response, and a digest
+of returned IDs and exact distances.
+The 32-record/8-dimensional case measures small-query overhead; the
+4096-record/768-dimensional case exposes CPU occupancy in one admitted leaf.
+Maintenance is disabled intentionally to keep that leaf unsplit. Compare identical
+builds/configurations and result digests; this is a scheduling diagnostic, not
+a steady-state throughput or recall benchmark. Use separate Cargo target directories
+when comparing checkouts to avoid reusing local-package build artifacts.

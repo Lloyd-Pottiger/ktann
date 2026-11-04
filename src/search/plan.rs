@@ -238,6 +238,7 @@ pub(crate) async fn enumerate_tree_keys<T: ReadOps>(
     let mut trees = Vec::new();
     let mut remaining = budget;
     let mut exhausted = false;
+    let mut first_page = true;
     'ranges: for raw in plan.ranges() {
         let range = LogicalRange::tree_manifest_plan(manifest, raw.clone());
         let mut cursor: Option<LogicalScanCursor> = None;
@@ -246,6 +247,12 @@ pub(crate) async fn enumerate_tree_keys<T: ReadOps>(
                 exhausted = true;
                 break 'ranges;
             }
+            // A one-page directory is cheap; subsequent ready-only pages must
+            // let the owning task observe abort, including empty ranges.
+            if !first_page {
+                tokio::task::yield_now().await;
+            }
+            first_page = false;
             let page = txn
                 .scan(
                     &range,

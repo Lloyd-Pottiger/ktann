@@ -212,6 +212,7 @@ pub(crate) async fn search<B: Backend>(
         prepared.request.vector(),
         selected,
         prepared.request.k(),
+        &|| context.checkpoint(),
     )
     .await?;
     metrics::search_stage_finished(SearchStage::ExactReranking, reranking_started.elapsed());
