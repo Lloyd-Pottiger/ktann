@@ -963,3 +963,150 @@ async fn bulk_controls_cancel_before_lifecycle_changes() {
     assert_drop_complete(&shared, &name("bulk")).await;
     runtime.shutdown().await.unwrap();
 }
+
+/// Pauses one drop before its next snapshot, without delaying other runtimes.
+#[derive(Clone)]
+struct DropGate {
+    memory: MemoryBackend,
+    writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pause_write: usize,
+    pause_read: bool,
+    reached: std::sync::Arc<tokio::sync::Notify>,
+    release: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl Backend for DropGate {
+    type ReadTxn<'a> = support::MemoryReadTxn;
+    type WriteTxn<'a> = support::MemoryWriteTxn<'a>;
+
+    fn hard_limits(&self) -> ktann::storage::backend::HardLimits {
+        self.memory.hard_limits()
+    }
+
+    fn admission_budget(&self) -> AdmissionBudget {
+        self.memory.admission_budget()
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.memory.capabilities()
+    }
+
+    async fn begin_read(&self) -> ktann::api::Result<Self::ReadTxn<'_>> {
+        if self.pause_read {
+            self.reached.notify_one();
+            self.release.notified().await;
+        }
+        self.memory.begin_read().await
+    }
+
+    async fn begin_write(&self) -> ktann::api::Result<Self::WriteTxn<'_>> {
+        if self
+            .writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1
+            == self.pause_write
+        {
+            self.reached.notify_one();
+            self.release.notified().await;
+        }
+        self.memory.begin_write().await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_flight_drop_preserves_same_name_replacement() {
+    // Exercise ordinary continuation, retry after an abort, and unknown final
+    // deletion with both another loop attempt and exhausted-budget recovery.
+    for cfg in [clear_config(), paged_config(32)] {
+        for scenario in 0..4 {
+            let shared = backend(cfg);
+            let other = make_runtime(shared.clone());
+            let original = other.create_index("docs", config()).await.expect("create");
+            if scenario >= 2 {
+                let raw = shared.begin_write().await.expect("begin");
+                let mut txn = WriteLogicalTxn::bootstrap(
+                    raw,
+                    shared.hard_limits(),
+                    shared.admission_budget(),
+                );
+                let manifest = read_manifest(&shared, &name("docs"))
+                    .await
+                    .expect("manifest");
+                txn.put(
+                    keys::LogicalKey::Manifest(original.logical_index_id()),
+                    PersistentValue::IndexManifest(
+                        manifest.with_lifecycle(IndexLifecycle::Dropping),
+                    ),
+                )
+                .await
+                .expect("mark dropping");
+                txn.commit().await.expect("commit");
+            }
+            shared
+                .set_fault_plan(vec![match scenario {
+                    1 => CommitFault::Abort,
+                    2 | 3 => CommitFault::UnknownApplied,
+                    _ => CommitFault::Normal,
+                }])
+                .expect("fault plan");
+            let gate = DropGate {
+                memory: shared.clone(),
+                writes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                pause_write: if scenario == 3 { usize::MAX } else { 2 },
+                pause_read: scenario == 3,
+                reached: std::sync::Arc::new(tokio::sync::Notify::new()),
+                release: std::sync::Arc::new(tokio::sync::Notify::new()),
+            };
+            let runtime = ktann::runtime::Runtime::new(
+                gate.clone(),
+                RuntimeConfig::default()
+                    .with_attempts(2, if scenario == 3 { 1 } else { 4 })
+                    .expect("attempts"),
+            )
+            .expect("runtime");
+            let drop = tokio::spawn(async move {
+                let result = runtime.drop_index("docs").await;
+                runtime.shutdown().await.expect("shutdown");
+                result
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), gate.reached.notified())
+                .await
+                .expect("drop paused");
+            if scenario >= 2 {
+                assert!(read_manifest(&shared, &name("docs")).await.is_none());
+                assert_eq!(
+                    shared.history().last().expect("final deletion").outcome,
+                    CommitOutcome::UnknownApplied
+                );
+            }
+            other.drop_index("docs").await.expect("concurrent drop");
+            let replacement = other
+                .create_index("docs", config())
+                .await
+                .expect("recreate");
+            assert_ne!(original.logical_index_id(), replacement.logical_index_id());
+            let record = ktann::api::Record::new(
+                Bytes::from_static(b"replacement"),
+                vec![1.0, 2.0],
+                vec![Value::I64(1)],
+            )
+            .expect("record");
+            replacement.insert(record.clone()).await.expect("insert");
+            gate.release.notify_one();
+            drop.await.expect("join").expect("original drop complete");
+            let opened = other
+                .open_index("docs")
+                .await
+                .expect("replacement survives");
+            assert_eq!(opened.logical_index_id(), replacement.logical_index_id());
+            let stored = opened
+                .get(record.id().clone(), ktann::api::GetOptions::default())
+                .await
+                .expect("get")
+                .expect("record survives");
+            assert_eq!(stored.vector(), record.vector());
+            assert_eq!(stored.fields(), record.fields());
+            other.shutdown().await.expect("shutdown");
+        }
+    }
+}
