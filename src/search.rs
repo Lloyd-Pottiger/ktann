@@ -23,3 +23,15 @@ pub(crate) fn beam_width(leaf_beam: u32, level: u32) -> u32 {
         .unwrap_or(0)
         .max(1)
 }
+
+/// Gives ready-only backends and cached CPU loops an explicit scheduling boundary.
+/// This is execution fairness, not a search budget: callers still process every
+/// admitted entry in order. Check both sides so cancellation cannot start a new
+/// batch after another task runs.
+pub(crate) async fn cooperate(
+    check: &(impl Fn() -> crate::api::Result<()> + Sync),
+) -> crate::api::Result<()> {
+    check()?;
+    tokio::task::yield_now().await;
+    check()
+}

@@ -153,14 +153,16 @@ impl GlobalCandidatePool {
 
     /// Scores eligible ordinals and admits only globally competitive entries.
     /// None means the whole leaf; predicate matches preserve original ordinals.
-    pub(crate) fn push_leaf(
+    pub(crate) async fn push_leaf(
         &mut self,
         entries: &Arc<[CachedLeafEntry]>,
         components: &[i8],
         location: RecordLocation,
         query: &RaBitQQuery,
         eligible: Option<&[usize]>,
+        check: &(impl Fn() -> Result<()> + Sync),
     ) -> Result<()> {
+        check()?;
         let len = eligible.map_or(entries.len(), <[usize]>::len);
         let entry_at = |i| eligible.map_or(i, |ordinals| ordinals[i]);
         self.ids
@@ -168,6 +170,9 @@ impl GlobalCandidatePool {
             .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
         let mut source = Weak::new();
         for i in 0..len {
+            if i > 0 && i % 64 == 0 {
+                super::cooperate(check).await?;
+            }
             let entry = entry_at(i);
             let distance = entries[entry]
                 .code(components)
@@ -292,11 +297,18 @@ impl GlobalCandidatePool {
 
     /// Checks every visited eligible identity before exact reads, then releases
     /// the scratch storage. Borrowed keys require no additional ID references.
-    pub(crate) fn validate_membership(&mut self) -> Result<()> {
+    pub(crate) async fn validate_membership(
+        &mut self,
+        check: &(impl Fn() -> Result<()> + Sync),
+    ) -> Result<()> {
+        check()?;
         let mut seen = HashSet::new();
         seen.try_reserve(self.ids.len())
             .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
-        for id in &self.ids {
+        for (ordinal, id) in self.ids.iter().enumerate() {
+            if ordinal > 0 && ordinal % 256 == 0 {
+                super::cooperate(check).await?;
+            }
             if !seen.insert(id) {
                 return Err(Error::new(ErrorKind::Corruption));
             }
@@ -400,8 +412,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn bounded_heap_matches_global_sort_and_shares_original_fields() {
+    #[tokio::test]
+    async fn bounded_heap_matches_global_sort_and_shares_original_fields() {
         for budget in [0, 1, 7, 125, 180, 1000] {
             for reverse in [false, true] {
                 let mut pool = GlobalCandidatePool::new(budget, true);
@@ -434,7 +446,7 @@ mod tests {
                 expected.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
                 let truncated = expected.len() > budget;
                 expected.truncate(budget);
-                pool.validate_membership().unwrap();
+                pool.validate_membership(&|| Ok(())).await.unwrap();
                 let (actual, was_truncated) = pool.select(1000).unwrap();
                 assert_eq!(was_truncated, truncated);
                 for (actual, expected) in actual.iter().zip(&expected) {
@@ -481,8 +493,51 @@ mod tests {
         assert_eq!(selected[2].distance().rough(), 2.0);
     }
 
-    #[test]
-    fn screened_entries_remain_accounted_and_detect_duplicate_membership() {
+    /// Cancellation is checked during a leaf, including entries screened out
+    /// by a full heap. No partial search result is returned to the caller.
+    #[tokio::test]
+    async fn scoring_checks_cancellation_before_finishing_a_leaf() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let query = RaBitQQuery::new(&[0.0; 4], Metric::L2).unwrap();
+        let mut codes = Vec::new();
+        let entries: Arc<[CachedLeafEntry]> = (0_u32..512)
+            .map(|id| {
+                CachedLeafEntry::from_leaf(
+                    LeafEntry::new(
+                        Bytes::copy_from_slice(&id.to_be_bytes()),
+                        vec![],
+                        RaBitQ7::quantize(&[id as f32; 4]).unwrap(),
+                    ),
+                    4,
+                    &mut codes,
+                )
+            })
+            .collect::<Vec<_>>()
+            .into();
+        let location = RecordLocation::new(
+            TreeKey::encode(&[], &[]).unwrap(),
+            PartitionKey::new(1).unwrap(),
+        );
+        let checks = AtomicUsize::new(0);
+        let check = || {
+            if checks.fetch_add(1, Ordering::Relaxed) >= 2 {
+                Err(Error::new(ErrorKind::Cancelled))
+            } else {
+                Ok(())
+            }
+        };
+        let mut pool = GlobalCandidatePool::new(1, false);
+        let error = pool
+            .push_leaf(&entries, &codes, location, &query, None, &check)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Cancelled);
+        assert!(!pool.ids.is_empty() && pool.ids.len() < entries.len());
+    }
+
+    #[tokio::test]
+    async fn screened_entries_remain_accounted_and_detect_duplicate_membership() {
         let query = RaBitQQuery::new(&[0.0; 4], Metric::L2).unwrap();
         let mut components = Vec::new();
         let entries: Arc<[CachedLeafEntry]> = [0.0, 10.0, 10.0]
@@ -507,8 +562,16 @@ mod tests {
         );
         let mut pool = GlobalCandidatePool::new(1, true);
         assert_eq!(pool.rough_cutoff(), None);
-        pool.push_leaf(&entries, &components, location.clone(), &query, Some(&[0]))
-            .unwrap();
+        pool.push_leaf(
+            &entries,
+            &components,
+            location.clone(),
+            &query,
+            Some(&[0]),
+            &|| Ok(()),
+        )
+        .await
+        .unwrap();
         let cutoff = pool.rough_cutoff().unwrap();
         assert!(
             entries[1]
@@ -518,19 +581,30 @@ mod tests {
                 .is_none()
         );
         let before = pool.heap_bytes().unwrap();
-        pool.push_leaf(&entries, &components, location, &query, Some(&[1, 2]))
-            .unwrap();
+        pool.push_leaf(
+            &entries,
+            &components,
+            location,
+            &query,
+            Some(&[1, 2]),
+            &|| Ok(()),
+        )
+        .await
+        .unwrap();
         assert!(pool.truncated);
         assert_eq!(pool.ids.len(), 3);
         assert!(pool.heap_bytes().unwrap() > before);
         assert_eq!(
-            pool.validate_membership().unwrap_err().kind(),
+            pool.validate_membership(&|| Ok(()))
+                .await
+                .unwrap_err()
+                .kind(),
             ErrorKind::Corruption
         );
     }
 
-    #[test]
-    fn eviction_releases_arrays_but_remembers_duplicate_ids() {
+    #[tokio::test]
+    async fn eviction_releases_arrays_but_remembers_duplicate_ids() {
         let mut pool = GlobalCandidatePool::new(1, true);
         let (entries, location) = leaf(0);
         let weak = Arc::downgrade(&entries);
@@ -559,12 +633,12 @@ mod tests {
             vec![(0, test_approximate_distance(10.0))],
         )
         .unwrap();
-        let error = pool.validate_membership().err().unwrap();
+        let error = pool.validate_membership(&|| Ok(())).await.err().unwrap();
         assert_eq!(error.kind(), ErrorKind::Corruption);
     }
 
-    #[test]
-    fn duplicate_rejected_ids_are_checked_even_with_no_heap_capacity() {
+    #[tokio::test]
+    async fn duplicate_rejected_ids_are_checked_even_with_no_heap_capacity() {
         for budget in [0, 1, 8] {
             let (entries, location) = leaf(0);
             let mut pool = GlobalCandidatePool::new(budget, true);
@@ -574,14 +648,18 @@ mod tests {
                 .collect();
             push_scored(&mut pool, &entries, location, scored).unwrap();
             assert_eq!(
-                pool.validate_membership().err().unwrap().kind(),
+                pool.validate_membership(&|| Ok(()))
+                    .await
+                    .err()
+                    .unwrap()
+                    .kind(),
                 ErrorKind::Corruption
             );
         }
     }
 
-    #[test]
-    fn screened_leaf_scores_preserve_the_entire_global_pool() {
+    #[tokio::test]
+    async fn screened_leaf_scores_preserve_the_entire_global_pool() {
         for dimension in [1, 3, 7, 64, 768] {
             let query_components: Vec<f32> = (0..dimension)
                 .map(|i| ((i * 31 % 97) as f32 - 48.0) / 48.0)
@@ -648,7 +726,9 @@ mod tests {
                                     location,
                                     &query,
                                     if filtered { Some(&indices) } else { None },
+                                    &|| Ok(()),
                                 )
+                                .await
                                 .unwrap();
                             let ordered = |pool: &GlobalCandidatePool| {
                                 let mut values: Vec<_> = pool
@@ -674,8 +754,8 @@ mod tests {
                             );
                             assert_eq!(reference.truncated, screened.truncated);
                         }
-                        reference.validate_membership().unwrap();
-                        screened.validate_membership().unwrap();
+                        reference.validate_membership(&|| Ok(())).await.unwrap();
+                        screened.validate_membership(&|| Ok(())).await.unwrap();
                     }
                 }
             }
