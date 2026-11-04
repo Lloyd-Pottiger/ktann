@@ -43,7 +43,10 @@ such as leaf relocation. Adapters re-check exact encoded keys, values, and
 affected-data accounting. Exceeding a declared limit returns `LimitExceeded`,
 not an unbounded internal retry.
 
-RetryableAbort restarts the complete logical attempt against a fresh snapshot.
+RetryableAbort from transaction opening, Manifest validation, operation reads or
+writes, or commit restarts the complete logical attempt against a fresh snapshot
+under the configured bounded retry/backoff policy. Each failed transaction is
+discarded before retry; foreground cancellation and deadlines still apply.
 CommitOutcomeUnknown is surfaced unless a lifecycle operation has an
 idempotent persistent-state recovery rule.
 

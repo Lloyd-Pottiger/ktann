@@ -8,7 +8,8 @@ mod tests;
 pub mod test_support;
 #[cfg(feature = "test-support")]
 use test_support::{
-    CommitFault, CommitOutcome, Control, Diagnostics, HistoryEntry, Lease, range_contains,
+    CommitFault, CommitOutcome, Control, Diagnostics, HistoryEntry, Lease, WriteFaultPoint,
+    range_contains,
 };
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -198,6 +199,11 @@ impl Backend for MemoryBackend {
     }
 
     async fn begin_write(&self) -> Result<MemoryWriteTxn<'_>> {
+        #[cfg(feature = "test-support")]
+        {
+            self.control.count(|c| c.begin_write += 1);
+            self.check_write_fault(WriteFaultPoint::BeginWrite)?;
+        }
         #[cfg(feature = "test-support")]
         let lease = self.control.admit()?;
         let mut state = self.lock()?;
@@ -466,7 +472,11 @@ impl MemoryWriteTxn<'_> {
 impl WriteTxn for MemoryWriteTxn<'_> {
     async fn get_for_update(&mut self, key: Bytes) -> Result<Option<Bytes>> {
         #[cfg(feature = "test-support")]
-        self.backend.control.count(|c| c.get_for_update += 1);
+        {
+            self.backend.control.count(|c| c.get_for_update += 1);
+            self.backend
+                .check_write_fault(WriteFaultPoint::GetForUpdate)?;
+        }
         let value = self.view.lookup(&key)?;
         self.protect(std::slice::from_ref(&key))?;
         Ok(value)
@@ -511,6 +521,8 @@ impl WriteTxn for MemoryWriteTxn<'_> {
         #[cfg(feature = "test-support")]
         {
             self.backend.control.count(|c| c.batch_mutate += 1);
+            self.backend
+                .check_write_fault(WriteFaultPoint::BatchMutate)?;
             self.backend.control.check_batch(mutations.len())?;
         }
         let budget = self.backend.admission_budget();

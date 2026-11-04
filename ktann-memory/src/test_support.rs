@@ -25,6 +25,18 @@ pub enum Durability {
     Durable,
 }
 
+/// Precommit operation at which a write fault plan injects errors.
+/// Other operations leave the plan unchanged.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WriteFaultPoint {
+    /// Before admitting a new write transaction.
+    BeginWrite,
+    /// Before an update-protected point read.
+    GetForUpdate,
+    /// Before staging a point mutation batch.
+    BatchMutate,
+}
+
 /// One step of the replayable commit fault plan.
 ///
 /// The plan is consumed in order by [`ktann::storage::backend::WriteTxn::commit`]: each
@@ -130,8 +142,8 @@ pub struct TestConfig {
     /// Maximum total committed key-plus-value bytes.
     pub max_db_bytes: usize,
     /// Maximum number of fault-plan steps accepted by
-    /// [`MemoryBackend::push_fault`] and
-    /// [`MemoryBackend::set_fault_plan`].
+    /// [`MemoryBackend::push_fault`],
+    /// [`MemoryBackend::set_fault_plan`], and [`MemoryBackend::set_write_fault_plan`].
     pub max_fault_plan: usize,
 }
 
@@ -190,6 +202,8 @@ impl Default for TestConfig {
 /// observable in deterministic tests.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct OperationCounts {
+    /// Write transaction opening calls, including injected failures.
+    pub begin_write: usize,
     /// Point `get` calls.
     pub get: usize,
     /// `batch_get` calls.
@@ -306,6 +320,7 @@ impl Drop for Lease {
 #[derive(Default)]
 pub(crate) struct Diagnostics {
     pub(crate) faults: VecDeque<CommitFault>,
+    write_faults: Option<(WriteFaultPoint, VecDeque<ErrorKind>)>,
     entries: VecDeque<HistoryEntry>,
     truncated: bool,
     pub(crate) db_bytes: usize,
@@ -363,6 +378,37 @@ impl MemoryBackend {
             return Err(limit_exceeded());
         }
         self.lock()?.diagnostics.faults = plan.into();
+        Ok(())
+    }
+
+    /// Replaces the bounded precommit fault plan. Each call at `point` consumes
+    /// one error before doing work; other calls and an exhausted plan proceed normally.
+    /// Independent of the commit plan and cleared by simulated restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LimitExceeded` if the plan exceeds `TestConfig::max_fault_plan`.
+    pub fn set_write_fault_plan(
+        &self,
+        point: WriteFaultPoint,
+        errors: Vec<ErrorKind>,
+    ) -> Result<()> {
+        if errors.len() > self.control.config.max_fault_plan {
+            return Err(limit_exceeded());
+        }
+        self.lock()?.diagnostics.write_faults = Some((point, errors.into()));
+        Ok(())
+    }
+
+    /// Consumes one fault only at its selected precommit operation.
+    pub(crate) fn check_write_fault(&self, point: WriteFaultPoint) -> Result<()> {
+        let mut state = self.lock()?;
+        if let Some((target, errors)) = &mut state.diagnostics.write_faults
+            && *target == point
+            && let Some(kind) = errors.pop_front()
+        {
+            return Err(Error::new(kind));
+        }
         Ok(())
     }
 

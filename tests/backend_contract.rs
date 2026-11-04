@@ -888,6 +888,17 @@ fn fault_plan_limit_is_enforced() {
         .push_fault(CommitFault::Abort)
         .expect_err("plan full");
     assert_eq!(error.kind(), ErrorKind::LimitExceeded);
+    let point = ktann_memory::test_support::WriteFaultPoint::GetForUpdate;
+    backend
+        .set_write_fault_plan(point, vec![ErrorKind::RetryableAbort; 2])
+        .expect("plan fits");
+    assert_eq!(
+        backend
+            .set_write_fault_plan(point, vec![ErrorKind::RetryableAbort; 3])
+            .unwrap_err()
+            .kind(),
+        ErrorKind::LimitExceeded
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -970,9 +981,21 @@ fn ephemeral_restart_starts_empty() {
     let backend = MemoryBackend::with_test_config(TestConfig::default());
     seed(&backend, &[(b"a", b"1")]);
 
+    backend
+        .set_write_fault_plan(
+            ktann_memory::test_support::WriteFaultPoint::BeginWrite,
+            vec![ErrorKind::RetryableAbort],
+        )
+        .expect("plan fits");
     let restarted = backend.reopen();
     assert_eq!(restarted.db_key_count(), 0);
     block_on(async {
+        restarted
+            .begin_write()
+            .await
+            .expect("restart clears fault plans")
+            .rollback()
+            .await;
         let mut txn = restarted.begin_read().await.expect("begin read");
         assert_eq!(txn.get(key(b"a")).await.expect("get"), None);
     });
