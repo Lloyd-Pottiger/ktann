@@ -1056,13 +1056,13 @@ mod tests {
     }
 
     /// Runs real graph validation and routing inline to isolate traversal scheduling.
-    struct GraphExecution<'a> {
-        cache: &'a PartitionCache,
+    struct GraphExecution {
+        cache: PartitionCache,
         working_bytes: usize,
         modes: std::sync::Mutex<Vec<RoutingMode>>,
     }
 
-    impl RoutingExecution for GraphExecution<'_> {
+    impl RoutingExecution for GraphExecution {
         fn checkpoint(&self) -> Result<()> {
             Ok(())
         }
@@ -1077,7 +1077,7 @@ mod tests {
             use super::super::cache::graph::{GraphRead, read_graph};
             match read_graph(
                 txn,
-                self.cache,
+                &self.cache,
                 manifest,
                 request,
                 self.working_bytes,
@@ -1087,7 +1087,7 @@ mod tests {
             .await?
             {
                 GraphRead::Cached(graph) => Ok(graph),
-                GraphRead::Load(load) => load.restore(self.cache, &|| Ok(())),
+                GraphRead::Load(load) => load.restore(&self.cache, &|| Ok(())),
             }
         }
 
@@ -1108,190 +1108,210 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn mixed_depth_graph_leaf_prefetch_preserves_graph_contract() {
-        use crate::api::LocalGraphConfig;
-        use crate::search::local_hnsw::{
-            Centroids,
-            persistence::{GraphSource, build_records},
-        };
+    /// A shallow tree's leaf sorts before a taller tree's non-root graph body.
+    struct MixedDepthGraph {
+        manifest: IndexManifest,
+        kernel: VectorKernel,
+        trees: [EnumeratedTree; 2],
+        items: Vec<(Vec<u8>, Vec<u8>)>,
+    }
 
-        let base = manifest();
-        let manifest = IndexManifest::new(
-            IndexLifecycle::Active,
-            id(1),
-            base.config()
-                .clone()
-                .with_local_graph(LocalGraphConfig::new(2, 8, SEED).unwrap()),
-            SEED,
-            base.bloom_parameters().to_vec(),
-        )
-        .unwrap();
-        let kernel = VectorKernel::new(DIMENSION, Metric::L2, SEED).unwrap();
-        let mut fixture = Fixture::new(&manifest);
-        let a = fixture.tree(0);
-        let b = fixture.tree(1);
-        // After both roots, the shallow leaf sorts ahead of B's internal body.
-        for (tree, parent, level, child, distance) in
-            [(&a, 1, 2, 2, 0.0), (&b, 1, 3, 2, 10.0), (&b, 2, 2, 3, 1.0)]
-        {
-            let header = PartitionHeader::new(level, 1, 0, PartitionState::Ready).unwrap();
-            fixture.header(tree, parent, level, 1, PartitionState::Ready);
-            let children = vec![ChildEntry::new(pk(child), vec![distance, 0.0])];
-            fixture.child(tree, parent, child, [distance, 0.0]);
-            let records = build_records(
-                Centroids::new(&kernel, &children, 1, &|| Ok(())).unwrap(),
-                GraphSource {
-                    index: id(1),
-                    tree,
-                    parent: pk(parent),
-                    header,
-                    parameters: manifest.config().local_graph().unwrap().parameters(),
-                },
-                16 << 20,
-                &|| Ok(()),
+    const GRAPH_ROUTING_MODES: [RoutingMode; 2] = [
+        RoutingMode::Exact,
+        RoutingMode::PartitionLocalHnsw { ef_search: 8 },
+    ];
+
+    impl MixedDepthGraph {
+        fn new() -> Self {
+            use crate::api::LocalGraphConfig;
+            use crate::search::local_hnsw::{
+                Centroids,
+                persistence::{GraphSource, build_records},
+            };
+
+            let base = manifest();
+            let manifest = IndexManifest::new(
+                IndexLifecycle::Active,
+                id(1),
+                base.config()
+                    .clone()
+                    .with_local_graph(LocalGraphConfig::new(2, 8, SEED).unwrap()),
+                SEED,
+                base.bloom_parameters().to_vec(),
             )
-            .unwrap()
-            .records;
-            fixture.push(
-                keys::graph_descriptor_key(id(1), tree, pk(parent)),
-                PersistentValue::GraphDescriptor(records.descriptor.clone()),
-            );
-            for (ordinal, chunk) in records.chunks() {
+            .unwrap();
+            let kernel = VectorKernel::new(DIMENSION, Metric::L2, SEED).unwrap();
+            let mut fixture = Fixture::new(&manifest);
+            let a = fixture.tree(0);
+            let b = fixture.tree(1);
+            // After both roots, the shallow leaf sorts ahead of B's internal body.
+            for (tree, parent, level, child, distance) in
+                [(&a, 1, 2, 2, 0.0), (&b, 1, 3, 2, 10.0), (&b, 2, 2, 3, 1.0)]
+            {
+                let header = PartitionHeader::new(level, 1, 0, PartitionState::Ready).unwrap();
+                fixture.header(tree, parent, level, 1, PartitionState::Ready);
+                let children = vec![ChildEntry::new(pk(child), vec![distance, 0.0])];
+                fixture.child(tree, parent, child, [distance, 0.0]);
+                let records = build_records(
+                    Centroids::new(&kernel, &children, 1, &|| Ok(())).unwrap(),
+                    GraphSource {
+                        index: id(1),
+                        tree,
+                        parent: pk(parent),
+                        header,
+                        parameters: manifest.config().local_graph().unwrap().parameters(),
+                    },
+                    16 << 20,
+                    &|| Ok(()),
+                )
+                .unwrap()
+                .records;
                 fixture.push(
-                    keys::graph_chunk_key(id(1), tree, pk(parent), ordinal),
-                    PersistentValue::GraphChunk(chunk),
+                    keys::graph_descriptor_key(id(1), tree, pk(parent)),
+                    PersistentValue::GraphDescriptor(records.descriptor.clone()),
                 );
+                for (ordinal, chunk) in records.chunks() {
+                    fixture.push(
+                        keys::graph_chunk_key(id(1), tree, pk(parent), ordinal),
+                        PersistentValue::GraphChunk(chunk),
+                    );
+                }
+            }
+            fixture.header(&a, 2, 1, 1, PartitionState::Ready);
+            fixture.entry(&a, 0, 2, "a", 0, [0.0, 0.0]);
+            fixture.header(&b, 3, 1, 1, PartitionState::Ready);
+            fixture.entry(&b, 1, 3, "b", 0, [1.0, 0.0]);
+            let items = fixture.items;
+            Self {
+                manifest,
+                kernel,
+                trees: [tree_ref(&a), tree_ref(&b)],
+                items,
             }
         }
-        fixture.header(&a, 2, 1, 1, PartitionState::Ready);
-        fixture.entry(&a, 0, 2, "a", 0, [0.0, 0.0]);
-        fixture.header(&b, 3, 1, 1, PartitionState::Ready);
-        fixture.entry(&b, 1, 3, "b", 0, [1.0, 0.0]);
-        let trees = [tree_ref(&a), tree_ref(&b)];
-        for mode in [
-            RoutingMode::Exact,
-            RoutingMode::PartitionLocalHnsw { ef_search: 8 },
-        ] {
+
+        /// Gives each case its own cache, optionally primed by searching only the taller tree.
+        async fn execution(&self, mode: RoutingMode, warm: bool) -> GraphExecution {
+            let execution = GraphExecution {
+                cache: PartitionCache::new(1 << 20),
+                working_bytes: 16 << 20,
+                modes: std::sync::Mutex::new(Vec::new()),
+            };
+            if warm {
+                self.search(&execution, &self.trees[1..], mode, 10)
+                    .await
+                    .unwrap();
+                execution.modes.lock().unwrap().clear();
+            }
+            execution
+        }
+
+        async fn search(
+            &self,
+            execution: &GraphExecution,
+            trees: &[EnumeratedTree],
+            mode: RoutingMode,
+            partition_budget: u32,
+        ) -> Result<TraversalOutcome> {
+            let mut txn =
+                ReadLogicalTxn::for_index(MockReadTxn::new(self.items.clone()), &self.manifest);
+            super::traverse(
+                &mut txn,
+                &execution.cache,
+                &self.kernel,
+                TraversalRequest::new(&QUERY, trees, None, budgets(partition_budget, 10), 128)
+                    .unwrap()
+                    .with_routing_mode(mode),
+                execution,
+            )
+            .await
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_depth_graph_prefetch_preserves_routing_and_budgets() {
+        let fixture = MixedDepthGraph::new();
+        for mode in GRAPH_ROUTING_MODES {
             for warm in [false, true] {
-                let cache = PartitionCache::new(1 << 20);
-                let mut execution = GraphExecution {
-                    cache: &cache,
-                    working_bytes: 16 << 20,
-                    modes: std::sync::Mutex::new(Vec::new()),
-                };
-                if warm {
-                    let mut txn = ReadLogicalTxn::for_index(
-                        MockReadTxn::new(fixture.items.clone()),
-                        &manifest,
-                    );
-                    super::traverse(
-                        &mut txn,
-                        &cache,
-                        &kernel,
-                        TraversalRequest::new(&QUERY, &trees[1..], None, budgets(10, 10), 128)
-                            .unwrap()
-                            .with_routing_mode(mode),
-                        &execution,
-                    )
-                    .await
-                    .unwrap();
-                }
-                for budget in [3, 4, 5] {
-                    execution.modes.lock().unwrap().clear();
-                    let mut txn = ReadLogicalTxn::for_index(
-                        MockReadTxn::new(fixture.items.clone()),
-                        &manifest,
-                    );
-                    let outcome = super::traverse(
-                        &mut txn,
-                        &cache,
-                        &kernel,
-                        TraversalRequest::new(&QUERY, &trees, None, budgets(budget, 10), 128)
-                            .unwrap()
-                            .with_routing_mode(mode),
-                        &execution,
-                    )
-                    .await
-                    .unwrap();
+                for (budget, expected_ids, graph_visits) in [
+                    (3, vec![b"a".as_slice()], 2),
+                    (4, vec![b"a".as_slice()], 3),
+                    (5, vec![b"a".as_slice(), b"b".as_slice()], 3),
+                ] {
+                    let execution = fixture.execution(mode, warm).await;
+                    let outcome = fixture
+                        .search(&execution, &fixture.trees, mode, budget)
+                        .await
+                        .unwrap();
                     assert_eq!(outcome.visited_partitions(), budget);
                     assert_eq!(outcome.partition_budget_exhausted, budget < 5);
-                    assert_eq!(
-                        outcome.visited_leaf_entries(),
-                        if budget == 5 { 2 } else { 1 }
-                    );
-                    assert_eq!(
-                        candidate_ids(&outcome),
-                        if budget == 5 {
-                            vec![b"a".as_slice(), b"b".as_slice()]
-                        } else {
-                            vec![b"a".as_slice()]
-                        }
-                    );
-                    assert_eq!(
-                        *execution.modes.lock().unwrap(),
-                        vec![mode; if budget == 3 { 2 } else { 3 }]
-                    );
+                    assert_eq!(outcome.visited_leaf_entries(), expected_ids.len() as u64);
+                    assert_eq!(candidate_ids(&outcome), expected_ids);
+                    assert_eq!(*execution.modes.lock().unwrap(), vec![mode; graph_visits]);
                 }
-                let cold_cache = PartitionCache::new(1 << 20);
-                if !warm {
-                    execution.cache = &cold_cache;
-                }
-                // The descriptor must be read even when the complete graph is cached.
-                let descriptor = keys::graph_descriptor_key(id(1), &b, pk(2));
-                let items: Vec<_> = fixture
-                    .items
-                    .iter()
-                    .filter(|(key, _)| *key != descriptor)
-                    .cloned()
-                    .collect();
-                let mut txn = ReadLogicalTxn::for_index(MockReadTxn::new(items), &manifest);
-                let error = super::traverse(
-                    &mut txn,
-                    execution.cache,
-                    &kernel,
-                    TraversalRequest::new(&QUERY, &trees, None, budgets(10, 10), 128)
-                        .unwrap()
-                        .with_routing_mode(mode),
-                    &execution,
-                )
-                .await
-                .unwrap_err();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_depth_graph_prefetch_rejects_missing_descriptor() {
+        for mode in GRAPH_ROUTING_MODES {
+            for warm in [false, true] {
+                let mut fixture = MixedDepthGraph::new();
+                let execution = fixture.execution(mode, warm).await;
+                // Remove authority after warming: cache hits must still read the descriptor.
+                let descriptor =
+                    keys::graph_descriptor_key(id(1), fixture.trees[1].tree_key(), pk(2));
+                fixture.items.retain(|(key, _)| *key != descriptor);
+                let error = fixture
+                    .search(&execution, &fixture.trees, mode, 10)
+                    .await
+                    .unwrap_err();
                 assert_eq!(error.kind(), ErrorKind::Corruption);
-                // Seed the mixed-depth frontier to isolate admission of the non-root graph.
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_depth_graph_prefetch_enforces_working_resource_admission() {
+        let fixture = MixedDepthGraph::new();
+        for mode in GRAPH_ROUTING_MODES {
+            for warm in [false, true] {
+                let mut execution = fixture.execution(mode, warm).await;
                 execution.working_bytes = 1;
+                // Start after the roots so their admission cannot mask a bypass at the mixed frontier.
                 let mut state = super::Traversal::seed(&[], 10, true).unwrap();
-                state.frontier.push(std::cmp::Reverse(super::FrontierEntry {
-                    distance: 0.0,
-                    tree: 0,
-                    partition: pk(2),
-                    expected_level: Some(1),
-                }));
-                state.frontier.push(std::cmp::Reverse(super::FrontierEntry {
-                    distance: 100.0,
-                    tree: 1,
-                    partition: pk(2),
-                    expected_level: Some(2),
-                }));
-                let request = TraversalRequest::new(&QUERY, &trees, None, budgets(10, 10), 128)
-                    .unwrap()
-                    .with_routing_mode(mode);
+                for (tree, distance, level) in [(0, 0.0, 1), (1, 100.0, 2)] {
+                    state.frontier.push(std::cmp::Reverse(super::FrontierEntry {
+                        distance,
+                        tree,
+                        partition: pk(2),
+                        expected_level: Some(level),
+                    }));
+                }
+                let request =
+                    TraversalRequest::new(&QUERY, &fixture.trees, None, budgets(10, 10), 128)
+                        .unwrap()
+                        .with_routing_mode(mode);
                 let query = super::RaBitQQuery::new(&QUERY, Metric::L2).unwrap();
                 let context = super::VisitContext {
                     input_bytes: 0,
                     execution: &execution,
-                    manifest: &manifest,
-                    cache: execution.cache,
-                    kernel: &kernel,
+                    manifest: &fixture.manifest,
+                    cache: &execution.cache,
+                    kernel: &fixture.kernel,
                     query: &query,
                     request,
                 };
-                let mut txn =
-                    ReadLogicalTxn::for_index(MockReadTxn::new(fixture.items.clone()), &manifest);
+                let mut txn = ReadLogicalTxn::for_index(
+                    MockReadTxn::new(fixture.items.clone()),
+                    &fixture.manifest,
+                );
                 assert_eq!(
                     state.run(&mut txn, &context).await.unwrap_err().kind(),
                     ErrorKind::LimitExceeded
                 );
+                assert_eq!(state.visited_leaf_entries, 1);
             }
         }
     }
