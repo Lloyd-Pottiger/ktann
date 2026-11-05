@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="540" viewBox="0 0 1120 540" role="img" aria-labelledby="title description">
+  <title id="title">KTANN system architecture</title>
+  <desc id="description">The application embeds KTANN Runtime and Index. Search reads a consistent snapshot; Foreground Mutation commits atomically; Structure Maintenance splits and merges partitions; Bulk Build builds and publishes an index. All four use a shared transactional storage contract implemented by Memory, RocksDB, or FoundationDB.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0L10 5L0 10Z" fill="#64748b"/>
+    </marker>
+  </defs>
+  <style>
+    text { font-family: Arial, Helvetica, sans-serif; text-anchor: middle; fill: #203047; }
+    .heading { font-size: 20px; font-weight: 700; }
+    .label { font-size: 18px; font-weight: 700; }
+    .detail { font-size: 16px; fill: #526277; }
+    .line { fill: none; stroke: #64748b; stroke-width: 2; }
+  </style>
+  <rect width="1120" height="540" rx="16" fill="#ffffff"/>
+
+  <rect x="370" y="24" width="380" height="56" rx="10" fill="#f1f5f9" stroke="#cbd5e1"/>
+  <text x="560" y="59" class="heading">Your application</text>
+  <path d="M560 80V122" class="line" marker-end="url(#arrow)"/>
+  <rect x="24" y="124" width="1072" height="174" rx="10" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="560" y="158" class="heading">KTANN Runtime + Index</text>
+  <rect x="44" y="182" width="240" height="92" rx="10" fill="#deecfb" stroke="#98b8dc"/>
+  <text x="164" y="218" class="label">Search</text>
+  <text x="164" y="249" class="detail">Snapshot reads</text>
+  <path d="M164 274V350" class="line" marker-end="url(#arrow)"/>
+  <rect x="308" y="182" width="240" height="92" rx="10" fill="#ede9fe" stroke="#b6a6dd"/>
+  <text x="428" y="218" class="label">Foreground Mutation</text>
+  <text x="428" y="249" class="detail">Atomic writes</text>
+  <path d="M428 274V350" class="line" marker-end="url(#arrow)"/>
+  <rect x="572" y="182" width="240" height="92" rx="10" fill="#dcf4ee" stroke="#87c8b7"/>
+  <text x="692" y="218" class="label">Structure Maintenance</text>
+  <text x="692" y="249" class="detail">Splits + merges</text>
+  <path d="M692 274V350" class="line" marker-end="url(#arrow)"/>
+  <rect x="836" y="182" width="240" height="92" rx="10" fill="#fff1db" stroke="#dfbd80"/>
+  <text x="956" y="218" class="label">Bulk Build</text>
+  <text x="956" y="249" class="detail">Build → publish</text>
+  <path d="M956 274V350" class="line" marker-end="url(#arrow)"/>
+  <rect x="44" y="352" width="1032" height="60" rx="10" fill="#e2e8f0" stroke="#b7c4d3"/>
+  <text x="560" y="389" class="heading">Shared transactional storage</text>
+  <path d="M560 412V438" class="line"/>
+  <path d="M204 438H916" class="line"/>
+  <path d="M204 438V466" class="line" marker-end="url(#arrow)"/>
+  <rect x="44" y="468" width="320" height="52" rx="10" fill="#ffffff" stroke="#cbd5e1"/>
+  <text x="204" y="501" class="heading">Memory</text>
+  <path d="M560 438V466" class="line" marker-end="url(#arrow)"/>
+  <rect x="400" y="468" width="320" height="52" rx="10" fill="#ffffff" stroke="#cbd5e1"/>
+  <text x="560" y="501" class="heading">RocksDB</text>
+  <path d="M916 438V466" class="line" marker-end="url(#arrow)"/>
+  <rect x="756" y="468" width="320" height="52" rx="10" fill="#ffffff" stroke="#cbd5e1"/>
+  <text x="916" y="501" class="heading">FoundationDB</text>
+</svg>
