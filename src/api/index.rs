@@ -7,7 +7,7 @@ use bytes::Bytes;
 
 use crate::maintenance::mutation;
 use crate::observe::labels::Operation;
-use crate::runtime::{OperationContext, RuntimeInner};
+use crate::runtime::{OperationContext, RuntimeHandle};
 use crate::runtime::{lifecycle, reads, refine, search, verify};
 use crate::storage::backend::Backend;
 use crate::storage::values::{IndexLifecycle, IndexManifest};
@@ -26,14 +26,14 @@ use super::{
 /// [`Runtime::open_index`](crate::runtime::Runtime::open_index). It never
 /// retargets to a newer Logical Index created under the same Index Name.
 pub struct Index<B: Backend> {
-    runtime: Arc<RuntimeInner<B>>,
+    runtime: Arc<RuntimeHandle<B>>,
     name: IndexName,
     manifest: Arc<IndexManifest>,
 }
 
 impl<B: Backend> Index<B> {
     pub(crate) fn new(
-        runtime: Arc<RuntimeInner<B>>,
+        runtime: Arc<RuntimeHandle<B>>,
         name: IndexName,
         manifest: IndexManifest,
     ) -> Result<Self> {
@@ -286,7 +286,7 @@ impl<B: Backend> Index<B> {
 
     /// Shares validation and preprocessing across production and benchmark calls.
     fn prepare_search(&self, request: SearchRequest) -> Result<search::PreparedSearch> {
-        let config = self.runtime.config();
+        let config = self.runtime.inner.config();
         search::PreparedSearch::new(
             &self.manifest,
             config.default_search_budgets(),
@@ -301,7 +301,7 @@ impl<B: Backend> Index<B> {
         operation_options: OperationOptions,
     ) -> Result<SearchOutcome> {
         let manifest = Arc::clone(&self.manifest);
-        let cache = self.runtime.partition_cache();
+        let cache = self.runtime.inner.partition_cache();
         let (outcome, maintenance) = self
             .run_foreground(
                 Operation::Search,
@@ -314,7 +314,7 @@ impl<B: Backend> Index<B> {
         // The search is the relevant access that rediscovers cold split and
         // merge states; offering them is best-effort and loss-safe.
         if !maintenance.is_empty() {
-            self.runtime.offer_fixups(&self.manifest, maintenance);
+            self.runtime.inner.offer_fixups(&self.manifest, maintenance);
         }
         Ok(outcome)
     }
@@ -372,8 +372,8 @@ impl<B: Backend> Index<B> {
             return Err(Error::invalid_argument());
         }
         let manifest = Arc::clone(&self.manifest);
-        let runtime = Arc::clone(&self.runtime);
-        let retry = lifecycle::RetryPolicy::from_config(self.runtime.config());
+        let runtime = Arc::clone(&self.runtime.inner);
+        let retry = lifecycle::RetryPolicy::from_config(self.runtime.inner.config());
         self.run_foreground(
             Operation::Refine,
             options.operation_options.clone(),
@@ -408,6 +408,7 @@ impl<B: Backend> Index<B> {
     {
         let index = Some(self.manifest.logical_index_id());
         self.runtime
+            .inner
             .run_foreground(operation, index, options, work)
             .await
     }
@@ -438,7 +439,7 @@ impl<B: Backend> Index<B> {
         mutations: Vec<Mutation>,
         operation_options: OperationOptions,
     ) -> Result<Vec<MutationOutcome>> {
-        let retry = lifecycle::RetryPolicy::from_config(self.runtime.config());
+        let retry = lifecycle::RetryPolicy::from_config(self.runtime.inner.config());
         let manifest = Arc::clone(&self.manifest);
         let report = self
             .run_foreground(
@@ -454,6 +455,7 @@ impl<B: Backend> Index<B> {
             .await?;
         if !report.maintenance.is_empty() {
             self.runtime
+                .inner
                 .offer_fixups(&self.manifest, report.maintenance);
         }
         Ok(report.outcomes)
