@@ -98,10 +98,14 @@ write transaction from admission through native cleanup. Its capacity-one
 channel serializes every synchronous call, commit, rollback, and destruction;
 async tasks never run native cleanup or wait synchronously for it. Existing
 transactions reuse their actor rather than reacquiring admission, so saturating
-the configured live-actor limit delays only new transaction creation. A
-backend shutdown hook waits for detached cleanup before Runtime releases the
-adapter; direct users get the same barrier from consuming asynchronous adapter
-shutdown. RocksDB does not advertise transactional range clear.
+the configured live-actor limit delays only new transaction creation. Native
+workers are created lazily and reused up to that limit. If worker creation fails,
+opening the transaction returns a Backend error before queuing its actor and
+releases its admission permit; a later open can retry worker creation. Existing
+workers may be occupied by live transactions and cannot guarantee progress for
+another queued actor. A backend shutdown hook waits for detached cleanup before
+Runtime releases the adapter; direct users get the same barrier from consuming
+asynchronous adapter shutdown. RocksDB does not advertise transactional range clear.
 
 ## 4. Persistent identity and lifecycle
 
