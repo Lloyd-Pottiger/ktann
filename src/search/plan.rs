@@ -674,8 +674,8 @@ impl FieldCheck {
 /// Materializes one expanded prefix as a directory byte range.
 ///
 /// The end is the byte successor of the prefix plus upper bound when present,
-/// so a String upper bound conservatively includes extended values that the
-/// plan's typed checks reject later.
+/// so keys equal to the upper-bound field value remain in the byte range;
+/// the plan's typed checks enforce the exclusive upper bound.
 fn materialize_range(
     index: LogicalIndexId,
     types: &[DataType],
@@ -1714,7 +1714,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enumeration_materializes_plan_eligible_keys_only() {
+    async fn enumeration_exact_string_prefix_excludes_extended_values() {
         let manifest = test_manifest(vec![string_field("a")], vec![FieldId(0)]);
         let types = [DataType::String];
         let data = vec![
@@ -1729,10 +1729,9 @@ mod tests {
         )
         .expect("plan");
         let enumeration = enumerate(&manifest, &plan, 10, data).await;
-        // The NUL-extended value lies inside the byte prefix range and is
-        // decoded and counted, but the typed check rejects it; "ab" lies
-        // outside the range and is never read.
-        assert_eq!(enumeration.scanned_tree_keys(), 2);
+        // Complete String framing excludes both the NUL-extended value and
+        // "ab" from the byte prefix range; neither consumes scan budget.
+        assert_eq!(enumeration.scanned_tree_keys(), 1);
         assert_eq!(
             tree_values(&enumeration, &types),
             vec![vec![string_value("a")]]

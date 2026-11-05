@@ -592,7 +592,7 @@ pub fn location_key(index: LogicalIndexId, id: &Bytes) -> Result<Vec<u8>> {
 pub(crate) const fn maximum_location_key_len() -> usize {
     // Index prefix, record-group kind, maximally escaped terminated Record ID,
     // and Record Location subkind.
-    1 + LOGICAL_INDEX_ID_BYTES + 1 + (2 * MAX_RECORD_ID_BYTES + 1) + 1
+    1 + LOGICAL_INDEX_ID_BYTES + 1 + (2 * MAX_RECORD_ID_BYTES + 2) + 1
 }
 
 /// The Opaque Payload key for `id` in `index`.

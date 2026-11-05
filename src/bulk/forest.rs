@@ -607,10 +607,9 @@ fn project(config: &IndexConfig, types: &[DataType], record: &Record) -> Result<
         .collect::<Vec<_>>();
     let key = TreeKey::encode(types, &values)?;
     let mut value = Vec::with_capacity(2 + 2 * record.id().len() + 4 * config.dimension());
-    // Tuple escaping preserves Record ID order within each Tree Key. The extra
-    // zero separates the terminator from vectors whose first byte can be 0xFF.
+    // Tuple escaping preserves Record ID order within each Tree Key and
+    // delimits the vector even when its first byte is 0xFF.
     push_escaped_terminated(&mut value, record.id());
-    value.push(0);
     for component in record.vector() {
         value.extend_from_slice(&component.to_bits().to_be_bytes());
     }
@@ -649,11 +648,8 @@ fn validate(config: &IndexConfig, directory: &Path, options: ForestOptions) -> R
 
 fn projection(value: Vec<u8>, dimension: usize) -> Result<ConstructionRecord> {
     let scan = scan_escaped_terminated(&value, crate::api::MAX_RECORD_ID_BYTES)?;
-    let vector_offset = scan.consumed + 1;
-    if scan.decoded_len == 0
-        || value.get(scan.consumed) != Some(&0)
-        || value.len() != vector_offset + dimension * 4
-    {
+    let vector_offset = scan.consumed;
+    if scan.decoded_len == 0 || value.len() != vector_offset + dimension * 4 {
         return Err(corrupt());
     }
     let vector = value[vector_offset..]

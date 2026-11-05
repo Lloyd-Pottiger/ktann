@@ -152,8 +152,12 @@ Logical keys begin with their namespace or index scope tag. The canonical layout
 specifies exact type tags, integer endianness, tuple escaping, terminators, and
 field ordering in codec source plus checked-in golden vectors. The Tree Key
 codec is memcomparable: byte ordering exactly matches typed comparison and
-supports field-prefix half-open ranges. Decoders reject unknown tags, duplicate
-fields, noncanonical values, nonzero padding, and trailing bytes.
+supports field-prefix half-open ranges. String fields and escaped Record IDs
+encode NUL as `00 FF` and terminate with `00 00`; no other byte may follow an
+unescaped `00`. The terminator sorts before every continuation and delimits
+the field independently of the next field or logical-key suffix. Bulk forest
+projections use the same framing before vector bytes. Decoders reject unknown
+tags, duplicate fields, noncanonical values, nonzero padding, and trailing bytes.
 
 ## 6. Persistent values
 

@@ -1168,3 +1168,45 @@ async fn active_search_yields_and_cancels_with_ready_only_storage() {
     .await
     .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compound_string_numeric_tree_key_insert_get_search() {
+    let runtime = make_runtime(shared_backend(TestConfig::default()));
+    let config = IndexConfig::new(1, Metric::L2)
+        .unwrap()
+        .with_fields(vec![
+            FieldSchema::new("string", DataType::String).unwrap(),
+            FieldSchema::new("number", DataType::I64).unwrap(),
+        ])
+        .unwrap()
+        .with_tree_key_fields(vec![FieldId(0), FieldId(1)])
+        .unwrap();
+    let index = runtime.create_index("compound", config).await.unwrap();
+    for (id, string) in [(b"empty".as_slice(), ""), (b"nul", "a\0b")] {
+        let id = Bytes::copy_from_slice(id);
+        let fields = vec![Value::String(string.into()), Value::I64(i64::MAX)];
+        index
+            .insert(Record::new(id.clone(), Arc::from([1.0]), fields.clone()).unwrap())
+            .await
+            .unwrap();
+        let stored = index
+            .get(id.clone(), Default::default())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.fields(), fields);
+        let predicate = Predicate::Compare {
+            field: FieldId(0),
+            op: CompareOp::Eq,
+            value: fields[0].clone(),
+        };
+        let result = index
+            .search(search_request(2).with_predicate(predicate))
+            .await
+            .unwrap();
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].id(), &id);
+        assert_no_budget_exhaustion(&result);
+    }
+    runtime.shutdown().await.unwrap();
+}
