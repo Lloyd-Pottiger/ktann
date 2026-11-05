@@ -4,7 +4,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::observe::labels::Operation;
-use crate::runtime::{RuntimeInner, lifecycle};
+use crate::runtime::{RuntimeHandle, lifecycle};
 use crate::storage::backend::Backend;
 use crate::storage::values::{BuildDescriptor, IndexManifest};
 
@@ -221,12 +221,14 @@ impl BulkSchedulerOptions {
 
 /// A recoverable reservation for one new Logical Index.
 ///
+/// The handle retains the owning Runtime until explicit shutdown or the last
+/// public Runtime, Index, or BulkBuildJob handle is dropped.
 /// This handle never follows a reused Index Name. Reservation launches no work;
 /// callers explicitly run workers and publish after loading. Preparation, loading,
 /// and validation are resumable. Source snapshots remain caller owned, including
 /// after abort, and are reverified when consumed.
 pub struct BulkBuildJob<B: Backend> {
-    runtime: Arc<RuntimeInner<B>>,
+    runtime: Arc<RuntimeHandle<B>>,
     name: IndexName,
     manifest: IndexManifest,
     descriptor: BuildDescriptor,
@@ -234,7 +236,7 @@ pub struct BulkBuildJob<B: Backend> {
 
 impl<B: Backend> BulkBuildJob<B> {
     pub(crate) fn new(
-        runtime: Arc<RuntimeInner<B>>,
+        runtime: Arc<RuntimeHandle<B>>,
         name: IndexName,
         manifest: IndexManifest,
         descriptor: BuildDescriptor,
@@ -283,6 +285,7 @@ impl<B: Backend> BulkBuildJob<B> {
         let manifest = self.manifest.clone();
         let descriptor = self.descriptor.clone();
         self.runtime
+            .inner
             .run_foreground(
                 Operation::BulkBuildStatus,
                 Some(self.logical_index_id()),
@@ -320,8 +323,9 @@ impl<B: Backend> BulkBuildJob<B> {
         let artifact = artifact.clone();
         let manifest = self.manifest.clone();
         let descriptor = self.descriptor.clone();
-        let retry = lifecycle::RetryPolicy::from_config(self.runtime.config());
+        let retry = lifecycle::RetryPolicy::from_config(self.runtime.inner.config());
         self.runtime
+            .inner
             .run_foreground(
                 Operation::LoadBulkBuild,
                 Some(self.logical_index_id()),
@@ -356,8 +360,9 @@ impl<B: Backend> BulkBuildJob<B> {
     ) -> Result<()> {
         let manifest = self.manifest.clone();
         let name = self.name.clone();
-        let retry = lifecycle::RetryPolicy::from_config(self.runtime.config());
+        let retry = lifecycle::RetryPolicy::from_config(self.runtime.inner.config());
         self.runtime
+            .inner
             .run_foreground(
                 Operation::ScheduleBulkBuild,
                 Some(self.logical_index_id()),
@@ -410,9 +415,10 @@ impl<B: Backend> BulkBuildJob<B> {
     ) -> Result<(super::Index<B>, BulkBuildReport)> {
         let manifest = self.manifest.clone();
         let descriptor = self.descriptor.clone();
-        let retry = lifecycle::RetryPolicy::from_config(self.runtime.config());
+        let retry = lifecycle::RetryPolicy::from_config(self.runtime.inner.config());
         let (active, report) = self
             .runtime
+            .inner
             .run_foreground(
                 Operation::RunBulkBuild,
                 Some(self.logical_index_id()),
@@ -449,8 +455,9 @@ impl<B: Backend> BulkBuildJob<B> {
     ) -> Result<()> {
         let manifest = self.manifest.clone();
         let descriptor = self.descriptor.clone();
-        let retry = lifecycle::RetryPolicy::from_config(self.runtime.config());
+        let retry = lifecycle::RetryPolicy::from_config(self.runtime.inner.config());
         self.runtime
+            .inner
             .run_foreground(
                 Operation::RunBulkBuild,
                 Some(self.logical_index_id()),
@@ -479,9 +486,10 @@ impl<B: Backend> BulkBuildJob<B> {
     pub async fn publish_with_control(&self, control: OperationOptions) -> Result<super::Index<B>> {
         let manifest = self.manifest.clone();
         let descriptor = self.descriptor.clone();
-        let retry = lifecycle::RetryPolicy::from_config(self.runtime.config());
+        let retry = lifecycle::RetryPolicy::from_config(self.runtime.inner.config());
         let active = self
             .runtime
+            .inner
             .run_foreground(
                 Operation::PublishBulkBuild,
                 Some(self.logical_index_id()),
@@ -503,8 +511,9 @@ impl<B: Backend> BulkBuildJob<B> {
     /// Busy means workspace IO still holds a shared lock; retry after it exits.
     pub async fn cleanup(&self) -> Result<()> {
         let index = self.manifest.clone();
-        let retry = lifecycle::RetryPolicy::from_config(self.runtime.config());
+        let retry = lifecycle::RetryPolicy::from_config(self.runtime.inner.config());
         self.runtime
+            .inner
             .run_foreground(
                 Operation::CleanupBulkBuild,
                 Some(self.logical_index_id()),
@@ -533,8 +542,9 @@ impl<B: Backend> BulkBuildJob<B> {
     pub async fn abort_with_control(&self, options: OperationOptions) -> Result<()> {
         let name = self.name.clone();
         let id = self.logical_index_id();
-        let retry = lifecycle::RetryPolicy::from_config(self.runtime.config());
+        let retry = lifecycle::RetryPolicy::from_config(self.runtime.inner.config());
         self.runtime
+            .inner
             .run_foreground(
                 Operation::AbortBulkBuild,
                 Some(id),

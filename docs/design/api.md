@@ -8,7 +8,9 @@ search internals, and maintenance states are defined by their own modules.
 `Runtime<B>` owns one backend, process-local configuration, admission state,
 caches, and maintenance workers. `Index<B>` is a cheap cloneable handle to one
 Active Logical Index. Static backend polymorphism keeps native transaction
-lifetimes explicit.
+lifetimes explicit. Index and BulkBuildJob handles retain Runtime ownership,
+including through clones, until the final public handle is dropped. Explicit
+shutdown closes admission for every associated handle.
 
 `Runtime::new` requires an active Tokio multi-thread runtime, even when
 maintenance workers are disabled; otherwise it returns `InvalidArgument`.

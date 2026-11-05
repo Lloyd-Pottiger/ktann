@@ -44,8 +44,9 @@ pub use lifecycle::RetryPolicy;
 
 /// Owns one backend and its process-local foreground operation lifecycle.
 ///
-/// Clone handles share admission capacity and shutdown state. Dropping the last
-/// handle begins the same non-blocking cleanup as [`shutdown`](Self::shutdown);
+/// Runtime, Index, and BulkBuildJob handles share admission capacity and shutdown
+/// state. Dropping the last of these public handles begins the same non-blocking
+/// cleanup as [`shutdown`](Self::shutdown);
 /// callers that must know cleanup completed should call `shutdown` explicitly.
 pub struct Runtime<B: Backend> {
     handle: Arc<RuntimeHandle<B>>,
@@ -120,7 +121,7 @@ impl<B: Backend> Runtime<B> {
             )
             .await?;
         Ok(crate::api::BulkBuildJob::new(
-            Arc::clone(&self.handle.inner),
+            Arc::clone(&self.handle),
             name,
             manifest,
             descriptor,
@@ -152,7 +153,7 @@ impl<B: Backend> Runtime<B> {
             )
             .await?;
         Ok(crate::api::BulkBuildJob::new(
-            Arc::clone(&self.handle.inner),
+            Arc::clone(&self.handle),
             name,
             manifest,
             descriptor,
@@ -268,7 +269,7 @@ impl<B: Backend> Runtime<B> {
                 },
             )
             .await?;
-        Index::new(Arc::clone(&self.handle.inner), handle_name, manifest)
+        Index::new(Arc::clone(&self.handle), handle_name, manifest)
     }
 
     /// Opens the current Active Logical Index for one Index Name.
@@ -298,7 +299,7 @@ impl<B: Backend> Runtime<B> {
                 move |mut context| async move { lifecycle::open_index(&mut context, name).await },
             )
             .await?;
-        Index::new(Arc::clone(&self.handle.inner), handle_name, manifest)
+        Index::new(Arc::clone(&self.handle), handle_name, manifest)
     }
 
     /// Drops one Logical Index idempotently.
@@ -394,8 +395,10 @@ impl<B: Backend> fmt::Debug for Runtime<B> {
     }
 }
 
-struct RuntimeHandle<B: Backend> {
-    inner: Arc<RuntimeInner<B>>,
+/// Shared public ownership; internal work holds only `RuntimeInner`.
+/// Releasing the final public owner initiates non-blocking shutdown.
+pub(crate) struct RuntimeHandle<B: Backend> {
+    pub(crate) inner: Arc<RuntimeInner<B>>,
 }
 
 impl<B: Backend> Drop for RuntimeHandle<B> {
@@ -1160,6 +1163,47 @@ mod tests {
         )
         .expect("test runs on a multi-thread runtime");
         (runtime, drops)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn final_index_clone_releases_backend() {
+        let (runtime, drops) = test_runtime(1);
+        let manifest = crate::storage::values::IndexManifest::new(
+            crate::storage::values::IndexLifecycle::Active,
+            LogicalIndexId::new(1).unwrap(),
+            IndexConfig::new(2, crate::api::Metric::L2).unwrap(),
+            [0; 32],
+            vec![],
+        )
+        .unwrap();
+        let index = Index::new(
+            Arc::clone(&runtime.handle),
+            IndexName::new("retained").unwrap(),
+            manifest,
+        )
+        .unwrap();
+        // Retaining internal state must not prevent final public-handle cleanup.
+        let inner = Arc::clone(&runtime.handle.inner);
+        let cloned = index.clone();
+        let runtime_clone = runtime.clone();
+        drop(runtime);
+        drop(runtime_clone);
+        drop(index);
+        assert_eq!(inner.phase(), Phase::Accepting);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(cloned);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let terminal = inner.terminal.notified();
+                if inner.phase() == Phase::Closed {
+                    break;
+                }
+                terminal.await;
+            }
+        })
+        .await
+        .expect("final Index release completes backend cleanup");
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]

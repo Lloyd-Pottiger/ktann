@@ -1110,3 +1110,86 @@ async fn in_flight_drop_preserves_same_name_replacement() {
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn index_retains_helper_local_runtime() {
+    async fn open() -> ktann::api::Index<MemoryBackend> {
+        let runtime = make_runtime(backend(clear_config()));
+        let created = runtime.create_index("retained", config()).await.unwrap();
+        let opened = runtime.open_index("retained").await.unwrap();
+        drop(runtime);
+        assert!(
+            created
+                .get(Bytes::from_static(b"missing"), Default::default())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        opened
+    }
+
+    let index = open().await;
+    let cloned = index.clone();
+    drop(index);
+    assert!(
+        cloned
+            .get(Bytes::from_static(b"missing"), Default::default())
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bulk_job_retains_runtime_and_explicit_shutdown_closes_all_handles() {
+    let runtime = make_runtime(backend(clear_config()));
+    let (_source, input) = BulkSource::new();
+    let job = runtime
+        .start_bulk_build("retained-bulk", &input, bulk_options())
+        .await
+        .unwrap();
+    let reopened = runtime.open_bulk_build("retained-bulk").await.unwrap();
+    let index = runtime
+        .create_index("retained-index", config())
+        .await
+        .unwrap();
+    let shutdown = runtime.clone();
+    drop(runtime);
+    shutdown.shutdown().await.unwrap();
+    assert_eq!(
+        job.status().await.unwrap_err().kind(),
+        ErrorKind::RuntimeClosed
+    );
+    assert_eq!(
+        reopened.status().await.unwrap_err().kind(),
+        ErrorKind::RuntimeClosed
+    );
+    assert_eq!(
+        index
+            .get(Bytes::from_static(b"missing"), Default::default())
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::RuntimeClosed
+    );
+
+    let runtime = make_runtime(backend(clear_config()));
+    let job = runtime
+        .start_bulk_build("retained-bulk", &input, bulk_options())
+        .await
+        .unwrap();
+    let reopened = runtime.open_bulk_build("retained-bulk").await.unwrap();
+    let cloned = job.clone();
+    drop(runtime);
+    drop(job);
+    assert_eq!(
+        reopened.status().await.unwrap(),
+        ktann::api::BulkBuildStatus::Preparing
+    );
+    drop(reopened);
+    assert_eq!(
+        cloned.status().await.unwrap(),
+        ktann::api::BulkBuildStatus::Preparing
+    );
+    cloned.abort().await.unwrap();
+}

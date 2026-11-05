@@ -8,8 +8,11 @@ whole-system validation matrix.
 
 `RuntimeInner` owns backend access, configuration, cache, bounded maintenance
 queue, workers, retry/backoff policy, shutdown state, and foreground in-flight
-tracking. Index handles retain `Arc<RuntimeInner>` and immutable Logical Index
-identity.
+tracking. Runtime, Index, and BulkBuildJob handles share an `Arc<RuntimeHandle>`
+that retains `RuntimeInner`; Index and BulkBuildJob also retain immutable Logical
+Index identity. Only public handles retain `RuntimeHandle`. Internal operations
+and workers do not retain public ownership, so they cannot prevent final-handle
+shutdown. Explicit shutdown closes admission for all associated public handles.
 
 Admission acquires the relevant bounded permit before starting work. A
 foreground in-flight guard is registered before an operation can begin commit
