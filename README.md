@@ -74,10 +74,24 @@ search options. For initial datasets, see [Bulk Build](docs/design/bulk-build.md
 
 ## Architecture
 
+Your application embeds KTANN through `Runtime` and `Index` and owns backend
+initialization. Search, Foreground Mutations, Structure Maintenance, and Bulk
+Build share the storage contract and use the selected backend.
+
+![KTANN architecture: search, foreground mutations, structure maintenance, and Bulk Build share a transactional storage contract backed by Memory, RocksDB, or FoundationDB.](docs/images/architecture.svg)
+
 Records and index entries live in the same transactional backend. Foreground
 writes update them atomically; background maintenance splits and merges partitions
 without making committed data unsearchable. Queries use one consistent snapshot
-and do not perform structure maintenance.
+and do not perform structure maintenance. Bulk Build prepares artifacts from an
+immutable Input Snapshot, loads and validates a hidden Logical Index, then
+atomically publishes it as Active.
+
+See the [architecture overview](docs/design/overview.md) for component ownership
+and the [runtime design](docs/design/runtime-operations.md) for execution and
+resource boundaries.
+
+## How indexing works
 
 KTANN organizes vectors in centroid-routing trees. Optional metadata fields called
 **Tree Keys** separate records into trees, so a query can first select the relevant
