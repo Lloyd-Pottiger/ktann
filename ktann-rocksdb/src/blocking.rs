@@ -96,6 +96,9 @@ pub(crate) struct BlockingPool {
     queue: Arc<JobQueue>,
     spawned: AtomicUsize,
     spawn_lock: Mutex<()>,
+    /// Pool-local fault injection; never affects other pools or production builds.
+    #[cfg(test)]
+    fail_spawn: std::sync::atomic::AtomicBool,
     limit: usize,
 }
 
@@ -118,6 +121,8 @@ impl BlockingPool {
             queue: Arc::new(JobQueue::default()),
             spawned: AtomicUsize::new(0),
             spawn_lock: Mutex::new(()),
+            #[cfg(test)]
+            fail_spawn: std::sync::atomic::AtomicBool::new(false),
             limit,
         }
     }
@@ -125,9 +130,9 @@ impl BlockingPool {
     /// Grows the pool toward the configured limit as transactions arrive.
     ///
     /// Spawning is serialized and lazy: an idle adapter holds no native
-    /// threads, and a failed spawn defers growth to the next transaction.
-    /// Fails closed with the spawn error only when no worker has ever come
-    /// up to serve queued jobs.
+    /// threads. A failed spawn rejects this admission before queuing its actor:
+    /// existing workers may be occupied by transactions whose callers are
+    /// waiting for this open. A later admission can retry growth.
     fn ensure_worker(&self) -> Result<()> {
         if self.spawned.load(Ordering::Acquire) >= self.limit {
             return Ok(());
@@ -140,20 +145,22 @@ impl BlockingPool {
         if worker >= self.limit {
             return Ok(());
         }
+        self.spawn_worker(worker)
+            .map_err(|source| Error::with_source(ErrorKind::Backend, source))?;
+        self.spawned.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// Spawns one reusable worker, with a pool-local failure seam for tests.
+    fn spawn_worker(&self, worker: usize) -> std::io::Result<std::thread::JoinHandle<()>> {
+        #[cfg(test)]
+        if self.fail_spawn.load(Ordering::Acquire) {
+            return Err(std::io::Error::other("injected worker spawn failure"));
+        }
         let queue = Arc::clone(&self.queue);
-        match std::thread::Builder::new()
+        std::thread::Builder::new()
             .name(format!("ktann-rocksdb-worker-{worker}"))
             .spawn(move || worker_loop(&queue))
-        {
-            Ok(_) => {
-                self.spawned.fetch_add(1, Ordering::AcqRel);
-                Ok(())
-            }
-            // Live workers serve queued jobs; the next transaction retries
-            // the deferred growth.
-            Err(_) if worker > 0 => Ok(()),
-            Err(source) => Err(Error::with_source(ErrorKind::Backend, source)),
-        }
     }
 
     /// Waits asynchronously, then queues one native transaction actor.
@@ -365,6 +372,49 @@ mod tests {
             })
             .await?;
         Ok((worker, started))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_failure_with_live_actor_releases_admission_and_can_retry() {
+        let pool = BlockingPool::new(2);
+        let holder = idle_worker(&pool).await.expect("first actor starts");
+        pool.fail_spawn.store(true, Ordering::Release);
+        let error = tokio::time::timeout(Duration::from_secs(1), idle_worker(&pool))
+            .await
+            .expect("spawn failure must return while the first actor remains open")
+            .err()
+            .expect("opening fails");
+        assert_eq!(error.kind(), ErrorKind::Backend);
+        assert_eq!(pool.state.permits.available_permits(), 1);
+        assert_eq!(pool.state.active.load(Ordering::Acquire), 1);
+        assert!(pool.queue.state.lock().unwrap().jobs.is_empty());
+
+        pool.fail_spawn.store(false, Ordering::Release);
+        let successor = tokio::time::timeout(Duration::from_secs(1), idle_worker(&pool))
+            .await
+            .expect("retry does not depend on the first actor closing")
+            .expect("retry starts");
+        drop(successor);
+        drop(holder);
+        tokio::time::timeout(Duration::from_secs(1), pool.wait_for_idle())
+            .await
+            .expect("actors finish cleanup");
+
+        // At capacity, reuse existing workers without trying to spawn again.
+        pool.fail_spawn.store(true, Ordering::Release);
+        let mut reused = Vec::new();
+        for _ in 0..2 {
+            reused.push(
+                tokio::time::timeout(Duration::from_secs(1), idle_worker(&pool))
+                    .await
+                    .expect("all admission capacity is recovered")
+                    .expect("existing worker is reused"),
+            );
+        }
+        drop(reused);
+        tokio::time::timeout(Duration::from_secs(1), pool.wait_for_idle())
+            .await
+            .expect("reused actor finishes cleanup");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
