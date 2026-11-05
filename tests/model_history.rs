@@ -1222,25 +1222,14 @@ impl Driver {
         }
     }
 
-    /// Process loss: the Index and Runtime handles drop without shutdown, so
-    /// the process-local Fixup queue is lost. The stale Index handle must
-    /// fail closed, never silently succeed; the durable committed state
-    /// reopens under the same Logical Index ID.
+    /// Process loss releases all public handles without explicit shutdown,
+    /// losing the process-local Fixup queue. Retaining an Index clone would
+    /// keep the Runtime alive rather than simulate process loss. Durable
+    /// committed state must reopen under the same Logical Index ID.
     async fn step_crash(&mut self, n: usize) {
         self.stats.crashes += 1;
-        let stale = self.index().clone();
         drop(self.index.take());
         drop(self.runtime.take());
-        let error = stale
-            .get(record_id(0), GetOptions::default())
-            .await
-            .expect_err("step {n}: the stale Index handle must fail after a crash");
-        assert_eq!(
-            error.kind(),
-            ErrorKind::RuntimeClosed,
-            "step {n}: the stale Index handle must fail closed, not silently succeed"
-        );
-        drop(stale);
         self.reopen(n).await;
         self.trace.push(format!(
             "step {n}: crash -> reopened Logical Index ID {}",
