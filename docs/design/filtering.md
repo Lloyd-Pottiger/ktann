@@ -53,6 +53,7 @@ cannot be NULL, and `In` lists cannot contain NULL.
 
 `SearchRequest::with_predicate` attaches an expression. Schema-dependent
 validation occurs during explicit request validation or search submission.
+Every field reference must exist, including in empty `In` lists and nested predicates.
 `CompiledPredicate::compile` validates the expression, binds referenced fields,
 and compiles membership lists into sorted, deduplicated sets. The public
 [API limits](api.md#3-schema-and-predicates) bound expression nodes, depth,

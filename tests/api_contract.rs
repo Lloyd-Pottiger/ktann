@@ -138,6 +138,31 @@ fn mutation_batches_reject_duplicate_ids_with_position() -> ktann::api::Result<(
 }
 
 #[test]
+fn empty_in_validates_field_references() -> ktann::api::Result<()> {
+    let fields = vec![FieldSchema::new("score", DataType::I64)?];
+    for schema in [&[][..], fields.as_slice()] {
+        let invalid = Predicate::In {
+            field: FieldId(u16::try_from(schema.len()).unwrap()),
+            values: vec![],
+        };
+        for mut predicate in [
+            invalid.clone(),
+            Predicate::And(vec![invalid.clone()]),
+            Predicate::Or(vec![invalid.clone()]),
+            Predicate::Not(Box::new(invalid)),
+        ] {
+            assert_invalid(predicate.validate(schema));
+        }
+    }
+    Predicate::In {
+        field: FieldId(0),
+        values: vec![],
+    }
+    .validate(&fields)?;
+    Ok(())
+}
+
+#[test]
 fn predicates_enforce_shape_and_types() -> ktann::api::Result<()> {
     let fields = vec![
         FieldSchema::new("published", DataType::Bool)?,
