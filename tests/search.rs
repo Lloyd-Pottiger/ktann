@@ -99,6 +99,72 @@ async fn setup() -> (MemoryBackend, Runtime<MemoryBackend>, Index<MemoryBackend>
     (backend, runtime, index)
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_in_rejects_unknown_fields_before_compilation() {
+    let runtime = make_runtime(shared_backend(TestConfig::default()));
+    for fields in [
+        vec![],
+        vec![FieldSchema::new("score", DataType::I64).unwrap()],
+    ] {
+        let field = FieldId(u16::try_from(fields.len()).unwrap());
+        let index = runtime
+            .create_index(
+                &format!("schema-{}", fields.len()),
+                IndexConfig::new(1, Metric::L2)
+                    .unwrap()
+                    .with_fields(fields)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let invalid = Predicate::In {
+            field,
+            values: vec![],
+        };
+        for predicate in [
+            invalid.clone(),
+            Predicate::Not(Box::new(Predicate::Or(vec![Predicate::And(vec![invalid])]))),
+        ] {
+            let error = index
+                .search(
+                    SearchRequest::new(vec![1.0], 1)
+                        .unwrap()
+                        .with_predicate(predicate),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::InvalidArgument);
+        }
+    }
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_in_on_valid_field_matches_no_records() {
+    let (_, runtime, index) = setup().await;
+    insert_all(
+        &index,
+        &[
+            (b"value".to_vec(), 1.0, 0, Some(1)),
+            (b"null".to_vec(), 2.0, 0, None),
+        ],
+    )
+    .await;
+    let outcome = index
+        .search(
+            SearchRequest::new(vec![1.0], 2)
+                .unwrap()
+                .with_predicate(Predicate::In {
+                    field: FieldId(1),
+                    values: vec![],
+                }),
+        )
+        .await
+        .unwrap();
+    assert!(outcome.hits.is_empty());
+    runtime.shutdown().await.unwrap();
+}
+
 /// The exact oracle: squared L2 accumulated in f64, ordered by `(distance,
 /// Record ID)`, truncated to `k`, with the public Euclidean distance exposed.
 fn brute_force(

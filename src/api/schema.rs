@@ -343,14 +343,16 @@ impl Predicate {
                 if value.is_null() {
                     return Err(Error::invalid_argument());
                 }
-                validate_predicate_value(*field, value, fields)
+                value.validate_for(field_schema(*field, fields)?.data_type, false)
             }
             Self::In { field, values } => {
+                // Bind the field even when there are no literals to validate.
+                let schema = field_schema(*field, fields)?;
                 if values.len() > MAX_IN_VALUES || values.iter().any(Value::is_null) {
                     return Err(Error::invalid_argument());
                 }
                 for value in values {
-                    validate_predicate_value(*field, value, fields)?;
+                    value.validate_for(schema.data_type, false)?;
                 }
                 Ok(())
             }
@@ -365,12 +367,4 @@ fn field_schema(field: FieldId, fields: &[FieldSchema]) -> Result<&FieldSchema> 
     fields
         .get(usize::from(field.0))
         .ok_or_else(Error::invalid_argument)
-}
-
-fn validate_predicate_value(
-    field: FieldId,
-    value: &mut Value,
-    fields: &[FieldSchema],
-) -> Result<()> {
-    value.validate_for(field_schema(field, fields)?.data_type, false)
 }
