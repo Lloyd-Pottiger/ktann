@@ -8,13 +8,12 @@
 //! * `I64` is eight big-endian bytes of `bits ^ 0x8000_0000_0000_0000`.
 //! * `F64` is eight bytes: `bits | 0x8000_0000_0000_0000` for non-negative
 //!   values and `!bits` for negative values. `-0.0` is noncanonical.
-//! * `String` escapes `0x00` as `0x00 0xFF` and ends with a single `0x00`.
+//! * `String` escapes `0x00` as `0x00 0xFF` and ends with `0x00 0x00`.
 //!
 //! Concatenating fields preserves tuple order and makes the encoding of leading
-//! fields a byte prefix of every Tree Key sharing those fields. A `String`
-//! field-prefix range is a conservative superset because it may also include a
-//! value extended by a leading `0x00`; exact predicate evaluation rejects that
-//! case later.
+//! fields a byte prefix of exactly the Tree Keys sharing those fields. The
+//! two-byte String terminator sorts before every continuation, including an
+//! escaped NUL, and cannot consume bytes from the next field or key suffix.
 
 use std::fmt;
 
@@ -149,7 +148,7 @@ pub(super) fn take_array<const N: usize>(bytes: &[u8]) -> Result<[u8; N]> {
 }
 
 /// Appends `bytes` with the v1 tuple escaping: `0x00` becomes `0x00 0xFF` and
-/// a single `0x00` terminates the string.
+/// `0x00 0x00` terminates the string. Other bytes after `0x00` are invalid.
 pub(crate) fn push_escaped_terminated(out: &mut Vec<u8>, bytes: &[u8]) {
     for &byte in bytes {
         if byte == 0x00 {
@@ -158,7 +157,7 @@ pub(crate) fn push_escaped_terminated(out: &mut Vec<u8>, bytes: &[u8]) {
             out.push(byte);
         }
     }
-    out.push(0x00);
+    out.extend_from_slice(&[0x00, 0x00]);
 }
 
 /// Decodes one tuple-escaped string whose layout was already validated by
@@ -169,7 +168,7 @@ pub(crate) fn decode_escaped_terminated(bytes: &[u8], scan: &EscapedScan) -> Vec
     debug_assert!(scan.consumed <= bytes.len());
     let mut value = Vec::with_capacity(scan.decoded_len);
     let mut offset = 0;
-    while offset < scan.consumed - 1 {
+    while offset < scan.consumed - 2 {
         let byte = bytes[offset];
         if byte == 0x00 {
             value.push(0x00);
@@ -206,9 +205,11 @@ pub(crate) fn scan_escaped_terminated(bytes: &[u8], maximum: usize) -> Result<Es
             if bytes.get(scan.consumed + 1) == Some(&0xFF) {
                 scan.escaped = true;
                 scan.consumed += 2;
-            } else {
-                scan.consumed += 1;
+            } else if bytes.get(scan.consumed + 1) == Some(&0x00) {
+                scan.consumed += 2;
                 return Ok(scan);
+            } else {
+                return Err(corrupt());
             }
         } else {
             scan.consumed += 1;
@@ -239,8 +240,10 @@ fn check_string(bytes: &[u8]) -> Result<usize> {
             if bytes.get(offset + 1) == Some(&0xFF) {
                 offset += 2;
                 segment = offset;
+            } else if bytes.get(offset + 1) == Some(&0x00) {
+                return Ok(offset + 2);
             } else {
-                return Ok(offset + 1);
+                return Err(corrupt());
             }
         } else {
             offset += 1;
@@ -377,4 +380,42 @@ fn decode_fields(types: &[DataType], bytes: &[u8]) -> Result<(Vec<Value>, usize)
         values.push(value);
     }
     Ok((values, offset))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn string_validation_and_decoding_reject_the_same_malformed_framing() {
+        let assert_corrupt = |bytes: &[u8]| {
+            assert_eq!(
+                check_string(bytes).unwrap_err().kind(),
+                ErrorKind::Corruption
+            );
+            assert_eq!(
+                decode_scalar(DataType::String, bytes).unwrap_err().kind(),
+                ErrorKind::Corruption
+            );
+        };
+        // Invalid UTF-8, both literal and split across a valid NUL escape.
+        for bytes in [&b"\xff\0\0"[..], b"\xc3\0\xff\xa9\0\0"] {
+            assert_corrupt(bytes);
+        }
+        // Every second byte except the terminator and escape tags is invalid.
+        for tag in 1..=254 {
+            assert_corrupt(&[b'a', 0, tag, 0, 0]);
+        }
+        let bytes = b"a\0\xffb\0\0";
+        for end in 0..bytes.len() {
+            assert_corrupt(&bytes[..end]);
+        }
+        assert_eq!(check_string(bytes).unwrap(), bytes.len());
+        assert_eq!(
+            decode_scalar(DataType::String, bytes).unwrap(),
+            (Value::String("a\0b".into()), bytes.len())
+        );
+        assert!(check_complete(&[DataType::String], b"a\0\0x").is_err());
+        assert!(decode_complete(&[DataType::String], b"a\0\0x").is_err());
+    }
 }

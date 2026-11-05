@@ -54,15 +54,15 @@ fn index_level_family_golden_bytes() {
     );
     assert_eq!(
         record_key(id(1), &Bytes::from_static(b"r")).expect("valid id"),
-        b"\x01\x00\x00\x00\x00\x00\x00\x00\x01\x01r\x00\x00"
+        b"\x01\x00\x00\x00\x00\x00\x00\x00\x01\x01r\x00\x00\x00"
     );
     assert_eq!(
         location_key(id(1), &Bytes::from_static(b"r")).expect("valid id"),
-        b"\x01\x00\x00\x00\x00\x00\x00\x00\x01\x01r\x00\x01"
+        b"\x01\x00\x00\x00\x00\x00\x00\x00\x01\x01r\x00\x00\x01"
     );
     assert_eq!(
         payload_key(id(1), &Bytes::from_static(b"r")).expect("valid id"),
-        b"\x01\x00\x00\x00\x00\x00\x00\x00\x01\x01r\x00\x02"
+        b"\x01\x00\x00\x00\x00\x00\x00\x00\x01\x01r\x00\x00\x02"
     );
 
     let empty = TreeKey::encode(&[], &[]).expect("empty tree key");
@@ -77,7 +77,7 @@ fn record_group_golden_bytes_escape_embedded_nul() {
     let record_id = Bytes::from_static(b"a\0b");
     assert_eq!(
         record_key(id(1), &record_id).expect("valid id"),
-        b"\x01\x00\x00\x00\x00\x00\x00\x00\x01\x01a\x00\xffb\x00\x00"
+        b"\x01\x00\x00\x00\x00\x00\x00\x00\x01\x01a\x00\xffb\x00\x00\x00"
     );
     assert_eq!(
         decode_key(
@@ -131,13 +131,13 @@ fn record_values_are_adjacent_and_ordered_by_record_id() {
 
 #[test]
 fn partition_family_golden_bytes() {
-    // Tree Key = (String "a") = 0x61 0x00.
+    // Tree Key = (String "a") = 0x61 0x00 0x00.
     let types = [DataType::String];
     let tree_key = TreeKey::encode(&types, &[Value::string("a").expect("short string")])
         .expect("canonical tree key");
     let partition = b"\x00\x00\x00\x00\x00\x00\x00\x01";
     let expected = |suffix: &[u8]| {
-        let mut key = b"\x01\x00\x00\x00\x00\x00\x00\x00\x01\x04\x61\x00".to_vec();
+        let mut key = b"\x01\x00\x00\x00\x00\x00\x00\x00\x01\x04\x61\x00\x00".to_vec();
         key.extend_from_slice(partition);
         key.extend_from_slice(suffix);
         key
@@ -219,25 +219,25 @@ fn tree_key_f64_golden_bytes() {
 fn tree_key_string_golden_bytes() {
     assert_eq!(
         tk(&[DataType::String], &[Value::string("").expect("empty")]),
-        b"\x00"
+        b"\x00\x00"
     );
     assert_eq!(
         tk(&[DataType::String], &[Value::string("a").expect("short")]),
-        b"\x61\x00"
+        b"\x61\x00\x00"
     );
     assert_eq!(
         tk(
             &[DataType::String],
             &[Value::string("a\0b").expect("embedded NUL")]
         ),
-        b"\x61\x00\xff\x62\x00"
+        b"\x61\x00\xff\x62\x00\x00"
     );
     assert_eq!(
         tk(
             &[DataType::String],
             &[Value::string("\u{4f60}\u{597d}").expect("multibyte")]
         ),
-        ["\u{4f60}\u{597d}".as_bytes(), &[0x00]].concat()
+        ["\u{4f60}\u{597d}".as_bytes(), &[0x00, 0x00]].concat()
     );
 }
 
@@ -247,7 +247,7 @@ fn tree_key_tuple_golden_bytes() {
     let values = [Value::string("a").expect("short"), Value::I64(1)];
     assert_eq!(
         tk(&types, &values),
-        b"\x61\x00\x80\x00\x00\x00\x00\x00\x00\x01"
+        b"\x61\x00\x00\x80\x00\x00\x00\x00\x00\x00\x01"
     );
 }
 
@@ -475,15 +475,15 @@ fn tree_key_values_round_trip() {
 }
 
 /// Builds a Tree Key of exactly `len` encoded bytes from eight String fields
-/// (each contributing its raw length plus one terminator byte).
+/// (each contributing its raw length plus two terminator bytes).
 fn tree_key_of_len(len: usize) -> ([DataType; 8], TreeKey) {
     let types = [DataType::String; 8];
     let mut values = Vec::with_capacity(types.len());
     let mut remaining = len;
     for field in 0..types.len() {
-        let raw = (remaining - 1 - (types.len() - 1 - field)).min(MAX_STRING_BYTES);
+        let raw = (remaining - 2 * (types.len() - field)).min(MAX_STRING_BYTES);
         values.push(Value::string("x".repeat(raw)).expect("within limit"));
-        remaining -= raw + 1;
+        remaining -= raw + 2;
     }
     assert_eq!(remaining, 0, "len {len} is representable");
     let tree_key = TreeKey::encode(&types, &values).expect("canonical");
@@ -735,7 +735,7 @@ fn decode_rejects_noncanonical_tree_key_scalars() {
     // Invalid UTF-8 String field (0xff followed by terminator).
     assert!(is_corrupt(
         &types_string,
-        b"\x01\x00\x00\x00\x00\x00\x00\x00\x01\x03\xff\x00"
+        b"\x01\x00\x00\x00\x00\x00\x00\x00\x01\x03\xff\x00\x00"
     ));
 }
 
@@ -766,15 +766,15 @@ fn decode_rejects_overlong_record_id_and_name() {
 fn decode_rejects_overlong_tree_key_prefix_in_partition_key() {
     // The Tree Key length cap applies to the consumed Tree Key prefix, not to
     // the whole partition-scoped key: eight maximum-length String fields
-    // encode to 8 * (MAX_STRING_BYTES + 1) = 8200 bytes, one past the
+    // encode to 8 * (MAX_STRING_BYTES + 2) = 8208 bytes, exceeding the
     // 8 KiB ceiling, so the prefix is Corruption wherever it appears.
     let types = [DataType::String; 8];
     let mut tree_key = Vec::new();
     for _ in 0..types.len() {
         tree_key.extend(std::iter::repeat_n(b'x', MAX_STRING_BYTES));
-        tree_key.push(0x00);
+        tree_key.extend_from_slice(&[0x00, 0x00]);
     }
-    assert_eq!(tree_key.len(), MAX_TREE_KEY_BYTES + 8);
+    assert_eq!(tree_key.len(), MAX_TREE_KEY_BYTES + 16);
 
     let mut key = b"\x01\x00\x00\x00\x00\x00\x00\x00\x01\x04".to_vec();
     key.extend_from_slice(&tree_key);
@@ -922,5 +922,69 @@ fn graph_key_golden_ordering_and_partition_range() {
         let mut bad = prefix.clone();
         bad.extend(suffix);
         assert!(is_corrupt(&[], &bad));
+    }
+}
+
+#[test]
+fn compound_string_numeric_boundaries_round_trip_and_order() {
+    for (numeric_type, numbers) in [
+        (
+            DataType::I64,
+            [i64::MIN, -1, 0, 1, i64::MAX].map(Value::I64),
+        ),
+        (
+            DataType::F64,
+            [-f64::MAX, -1.0, 0.0, 1.0, f64::MAX].map(Value::F64),
+        ),
+    ] {
+        let types = [DataType::String, numeric_type];
+        let mut previous = None;
+        for string in ["", "\0", "\0a", "a", "a\0", "a\0b", "é"] {
+            for number in &numbers {
+                let values = [Value::String(string.into()), number.clone()];
+                let tree = TreeKey::encode(&types, &values).unwrap();
+                assert_eq!(tree.values(&types).unwrap(), values);
+                if let Some(previous) = previous.replace(tree.as_bytes().to_vec()) {
+                    assert!(previous.as_slice() < tree.as_bytes());
+                }
+                let encoded = Bytes::from(header_key(id(1), &tree, pk(u64::MAX)));
+                assert_eq!(
+                    decode_key(&types, &encoded).unwrap(),
+                    LogicalKey::Header {
+                        index: id(1),
+                        tree_key: tree,
+                        partition: pk(u64::MAX),
+                    }
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn string_terminator_delimits_partition_suffix_and_exact_field_prefix() {
+    let types = [DataType::String];
+    for string in ["", "\0", "a", "a\0b"] {
+        let value = Value::String(string.into());
+        let tree = TreeKey::encode(&types, std::slice::from_ref(&value)).unwrap();
+        let key = Bytes::from(header_key(id(1), &tree, pk(u64::MAX)));
+        assert_eq!(
+            decode_key(&types, &key).unwrap(),
+            LogicalKey::Header {
+                index: id(1),
+                tree_key: tree.clone(),
+                partition: pk(u64::MAX),
+            }
+        );
+        let range = tree_manifest_prefix_range(id(1), &types, &[value]).unwrap();
+        for (suffix, included) in [("", true), ("\0", false), ("b", false)] {
+            let other =
+                TreeKey::encode(&types, &[Value::String(format!("{string}{suffix}"))]).unwrap();
+            let key = tree_manifest_key(id(1), &other);
+            assert_eq!(
+                range.start() <= key.as_slice() && key.as_slice() < range.end(),
+                included
+            );
+        }
     }
 }

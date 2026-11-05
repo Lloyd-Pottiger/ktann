@@ -757,9 +757,12 @@ async fn batch_reads_enforce_backend_batch_and_key_limits() {
 
     runtime.shutdown().await.expect("shutdown");
 
-    // Encoded keys that exceed the backend key ceiling fail with
-    // LimitExceeded before any value is read.
-    let shared = backend(key_limit_config(15));
+    // The encoded key for "abc" fits exactly; extending the Record ID by
+    // one byte must exceed the backend key ceiling and fail before reading.
+    let max_key_bytes = keys::record_key(id(1), &Bytes::from_static(b"abc"))
+        .expect("valid record key")
+        .len();
+    let shared = backend(key_limit_config(max_key_bytes));
     let manifest = seed_named_index(
         &shared,
         &name("docs"),
@@ -780,7 +783,7 @@ async fn batch_reads_enforce_backend_batch_and_key_limits() {
         index
             .get(Bytes::from_static(b"abc"), GetOptions::default())
             .await
-            .expect("within-limit key reads")
+            .expect("exactly-at-limit key reads")
             .is_some()
     );
     runtime.shutdown().await.expect("shutdown");
