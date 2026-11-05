@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="810" viewBox="0 0 1120 810" role="img" aria-labelledby="title description">
+<title id="title">KTANN K-means tree</title>
+<desc id="description">One tree within a Logical Index. Root Partition 1 routes to internal Partitions 2 and 3 using child centroids. They route to Leaf Partitions 4 through 7. Each leaf contains two Leaf Entries identifying Vector Records. Two-dimensional coordinates illustrate the hierarchy.</desc>
+<style>
+text { font-family: Arial, Helvetica, sans-serif; fill: #203047; text-anchor: middle; }
+.title { font-size: 26px; font-weight: 700; }
+.heading { font-size: 18px; font-weight: 700; }
+.body { font-size: 16px; }
+.small { font-size: 14px; fill: #526277; }
+.edge { fill: none; stroke: #77879b; stroke-width: 2; }
+</style>
+<rect width="1120" height="810" rx="16" fill="#ffffff"/>
+<text x="560" y="41" class="title">K-means tree</text>
+<text x="560" y="68" class="body">Child centroids guide traversal; Leaf Entries identify Vector Records.</text>
+
+<path d="M501 222 L300 304" class="edge"/>
+<circle cx="501" cy="222" r="3" fill="#77879b"/>
+<circle cx="300" cy="304" r="3" fill="#77879b"/>
+<path d="M619 222 L820 304" class="edge"/>
+<circle cx="619" cy="222" r="3" fill="#77879b"/>
+<circle cx="820" cy="304" r="3" fill="#77879b"/>
+<path d="M241 420 L170 502" class="edge"/>
+<circle cx="241" cy="420" r="3" fill="#77879b"/>
+<circle cx="170" cy="502" r="3" fill="#77879b"/>
+<path d="M359 420 L430 502" class="edge"/>
+<circle cx="359" cy="420" r="3" fill="#77879b"/>
+<circle cx="430" cy="502" r="3" fill="#77879b"/>
+<path d="M761 420 L690 502" class="edge"/>
+<circle cx="761" cy="420" r="3" fill="#77879b"/>
+<circle cx="690" cy="502" r="3" fill="#77879b"/>
+<path d="M879 420 L950 502" class="edge"/>
+<circle cx="879" cy="420" r="3" fill="#77879b"/>
+<circle cx="950" cy="502" r="3" fill="#77879b"/>
+<rect x="442" y="106" width="236" height="116" rx="10" fill="#ede9fe" stroke="#b6a6dd"/>
+<text x="560.0" y="134" class="heading">Partition 1</text>
+<text x="560.0" y="161" class="body">Centroid = (5, 5)</text>
+<path d="M442 178H678 M560.0 178V222" fill="none" stroke="#b6a6dd"/>
+<text x="501" y="206" class="body">2</text>
+<text x="619" y="206" class="body">3</text>
+<rect x="182" y="304" width="236" height="116" rx="10" fill="#deecfb" stroke="#98b8dc"/>
+<text x="300.0" y="332" class="heading">Partition 2</text>
+<text x="300.0" y="359" class="body">Centroid = (2, 3)</text>
+<path d="M182 376H418 M300.0 376V420" fill="none" stroke="#98b8dc"/>
+<text x="241" y="404" class="body">4</text>
+<text x="359" y="404" class="body">5</text>
+<rect x="702" y="304" width="236" height="116" rx="10" fill="#deecfb" stroke="#98b8dc"/>
+<text x="820.0" y="332" class="heading">Partition 3</text>
+<text x="820.0" y="359" class="body">Centroid = (8, 7)</text>
+<path d="M702 376H938 M820.0 376V420" fill="none" stroke="#98b8dc"/>
+<text x="761" y="404" class="body">6</text>
+<text x="879" y="404" class="body">7</text>
+<rect x="52" y="502" width="236" height="116" rx="10" fill="#dcf4ee" stroke="#87c8b7"/>
+<text x="170.0" y="530" class="heading">Partition 4</text>
+<text x="170.0" y="557" class="body">Centroid = (1, 2)</text>
+<path d="M52 574H288 M170.0 574V618" fill="none" stroke="#87c8b7"/>
+<text x="111" y="602" class="body">A</text>
+<text x="229" y="602" class="body">B</text>
+<rect x="52" y="632" width="236" height="34" rx="5" fill="#f1f5f9"/>
+<text x="170" y="655" class="body">A: (0, 2)</text>
+<rect x="52" y="672" width="236" height="34" rx="5" fill="#f1f5f9"/>
+<text x="170" y="695" class="body">B: (2, 2)</text>
+<rect x="312" y="502" width="236" height="116" rx="10" fill="#dcf4ee" stroke="#87c8b7"/>
+<text x="430.0" y="530" class="heading">Partition 5</text>
+<text x="430.0" y="557" class="body">Centroid = (3, 4)</text>
+<path d="M312 574H548 M430.0 574V618" fill="none" stroke="#87c8b7"/>
+<text x="371" y="602" class="body">C</text>
+<text x="489" y="602" class="body">D</text>
+<rect x="312" y="632" width="236" height="34" rx="5" fill="#f1f5f9"/>
+<text x="430" y="655" class="body">C: (2, 4)</text>
+<rect x="312" y="672" width="236" height="34" rx="5" fill="#f1f5f9"/>
+<text x="430" y="695" class="body">D: (4, 4)</text>
+<rect x="572" y="502" width="236" height="116" rx="10" fill="#dcf4ee" stroke="#87c8b7"/>
+<text x="690.0" y="530" class="heading">Partition 6</text>
+<text x="690.0" y="557" class="body">Centroid = (7, 6)</text>
+<path d="M572 574H808 M690.0 574V618" fill="none" stroke="#87c8b7"/>
+<text x="631" y="602" class="body">E</text>
+<text x="749" y="602" class="body">F</text>
+<rect x="572" y="632" width="236" height="34" rx="5" fill="#f1f5f9"/>
+<text x="690" y="655" class="body">E: (6, 6)</text>
+<rect x="572" y="672" width="236" height="34" rx="5" fill="#f1f5f9"/>
+<text x="690" y="695" class="body">F: (8, 6)</text>
+<rect x="832" y="502" width="236" height="116" rx="10" fill="#dcf4ee" stroke="#87c8b7"/>
+<text x="950.0" y="530" class="heading">Partition 7</text>
+<text x="950.0" y="557" class="body">Centroid = (9, 8)</text>
+<path d="M832 574H1068 M950.0 574V618" fill="none" stroke="#87c8b7"/>
+<text x="891" y="602" class="body">G</text>
+<text x="1009" y="602" class="body">H</text>
+<rect x="832" y="632" width="236" height="34" rx="5" fill="#f1f5f9"/>
+<text x="950" y="655" class="body">G: (8, 8)</text>
+<rect x="832" y="672" width="236" height="34" rx="5" fill="#f1f5f9"/>
+<text x="950" y="695" class="body">H: (10, 8)</text>
+<text x="68" y="130" class="small">ROOT</text>
+<text x="68" y="328" class="small">INTERNAL</text>
+<text x="68" y="480" class="small">LEAVES</text>
+<text x="560" y="751" class="small">Child Entries: child Partition Key + centroid  ·  Leaf Entries: Record ID + vector representation</text>
+<text x="560" y="778" class="small">Illustrative 2D vectors in one Tree Key; record rows show the associated Vector Records.</text>
+</svg>
