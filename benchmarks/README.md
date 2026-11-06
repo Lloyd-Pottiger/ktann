@@ -695,15 +695,11 @@ production distance kernel and fresh query scratch, records five timed rounds,
 and reports workspace bytes and an untimed digest of hits, scores and traversal
 work. Graph construction is timed separately. Repeat processes and compare
 digests before interpreting timings; this does not measure backend IO, complete
-search quality or end-to-end throughput. See the
-[visited-set experiment](reports/hnsw-visited-2026-11-06.md) for an example.
-The [leaf-selection experiments](reports/leaf-selection-2026-11-06.md) record
-profiling and three rejected end-to-end optimization candidates.
+search quality or end-to-end throughput.
 
-The [SIFT1M follow-up](reports/sift-search-identities-2026-11-06.md) uses default
-partition capacities and reports high-recall
-search separately from lower-recall routing diagnostics. The membership-only
-complement runs with:
+### Candidate membership diagnostic
+
+Run the membership-only diagnostic with:
 
 ```sh
 cargo test --release -p ktann --all-features --lib candidate_membership_performance -- --ignored --nocapture
