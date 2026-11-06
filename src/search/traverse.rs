@@ -29,7 +29,7 @@ use crate::storage::values::{
 };
 
 use super::beam_width;
-use super::cache::graph::RoutingExecution;
+use super::cache::graph::{PartitionReferences, RoutingExecution};
 use super::cache::{
     BODY_PREFETCH_BATCH, BodyEntries, BodyRequest, CachedBody, PartitionCache, load_body,
     prefetch_bodies,
@@ -302,7 +302,7 @@ struct Traversal {
     /// Every referenced `{tree, partition}`: roots, injected root-split
     /// targets, and discovered Child Entries. A second reference to one body is
     /// Corruption.
-    referenced: HashSet<(u32, PartitionKey)>,
+    referenced: PartitionReferences,
     candidates: GlobalCandidatePool,
     /// Visited partitions worth offering to the Runtime's demand-driven Fixup
     /// queue: split or merge states and threshold-crossing `Ready` partitions.
@@ -726,27 +726,23 @@ impl Traversal {
                 retained,
             )
             .await?;
-        self.referenced
-            .try_reserve(graph.children().len())
-            .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
-        // Validate every exposed edge, including children excluded by local top-B.
-        for (ordinal, child) in graph.children().iter().enumerate() {
-            if ordinal > 0 && ordinal % 64 == 0 {
-                super::cooperate(&|| context.execution.checkpoint()).await?;
-            }
-            if !self.referenced.insert((visit.entry.tree, child.child())) {
-                return Err(Error::new(ErrorKind::Corruption));
-            }
-        }
         let mut query = Vec::new();
         query
             .try_reserve_exact(context.request.routing.len())
             .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
         query.extend_from_slice(context.request.routing);
-        let candidates = context
+        let (candidates, references) = context
             .execution
-            .candidates(graph, query, beam, context.request.routing_mode)
+            .candidates(
+                graph,
+                query,
+                beam,
+                context.request.routing_mode,
+                visit.entry.tree,
+                std::mem::take(&mut self.referenced),
+            )
             .await?;
+        self.referenced = references;
         ::metrics::counter!("ktann.routing.parent_visits", "level" => routing_level_label(visit.header.level())).increment(1);
         ::metrics::counter!("ktann.routing.merge_candidates").increment(candidates.len() as u64);
         let merge_started = std::time::Instant::now();
@@ -1097,14 +1093,18 @@ mod tests {
             query: Vec<f32>,
             beam: usize,
             mode: RoutingMode,
-        ) -> Result<Vec<(PartitionKey, f64)>> {
+            tree: u32,
+            mut references: PartitionReferences,
+        ) -> Result<(Vec<(PartitionKey, f64)>, PartitionReferences)> {
+            graph.validate_references(tree, &mut references, &|| Ok(()))?;
             self.modes.lock().unwrap().push(mode);
-            match mode {
+            let candidates = match mode {
                 RoutingMode::Exact => graph.exact(&query, beam, &|| Ok(())),
                 RoutingMode::PartitionLocalHnsw { ef_search } => {
                     Ok(graph.search(&query, beam, ef_search, &|| Ok(()))?.0)
                 }
-            }
+            }?;
+            Ok((candidates, references))
         }
     }
 
@@ -1337,7 +1337,9 @@ mod tests {
             _: Vec<f32>,
             _: usize,
             _: RoutingMode,
-        ) -> Result<Vec<(PartitionKey, f64)>> {
+            _: u32,
+            _: PartitionReferences,
+        ) -> Result<(Vec<(PartitionKey, f64)>, PartitionReferences)> {
             unreachable!("mutable fixture")
         }
     }
@@ -1372,8 +1374,8 @@ mod tests {
     use super::super::predicate::CompiledPredicate;
     use super::super::rabitq::RaBitQ7;
     use super::{
-        DEFAULT_LEAF_BEAM, PartitionKey, ReadOps, RoutingExecution, RoutingMode, TraversalOutcome,
-        TraversalRequest, beam_width,
+        DEFAULT_LEAF_BEAM, PartitionKey, PartitionReferences, ReadOps, RoutingExecution,
+        RoutingMode, TraversalOutcome, TraversalRequest, beam_width,
     };
 
     const DIMENSION: usize = 2;

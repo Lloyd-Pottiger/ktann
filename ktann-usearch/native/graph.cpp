@@ -71,7 +71,72 @@ template <typename T> struct Allocator {
     }
 };
 
-using Engine = index_gt<double, std::uint64_t, std::uint32_t, Allocator<char>>;
+// Graph slots are dense ordinals. prepare() reserves for every possible slot
+// before construction, update or search, not merely for the number visited.
+// One bit per slot avoids hashing, probing and clearing a sparse hash table.
+class VisitedSlots {
+    std::uint64_t* words_ = nullptr;
+    std::size_t words_count_ = 0, count_ = 0;
+
+  public:
+    VisitedSlots() = default;
+
+    ~VisitedSlots() { reset(); }
+
+    VisitedSlots(VisitedSlots const&) = delete;
+
+    VisitedSlots& operator=(VisitedSlots const&) = delete;
+
+    VisitedSlots(VisitedSlots&& other) noexcept { *this = std::move(other); }
+
+    VisitedSlots& operator=(VisitedSlots&& other) noexcept {
+        std::swap(words_, other.words_);
+        std::swap(words_count_, other.words_count_);
+        std::swap(count_, other.count_);
+        return *this;
+    }
+
+    std::size_t size() const noexcept { return count_; }
+
+    void clear() noexcept {
+        if (words_) std::memset(words_, 0, words_count_ * sizeof(std::uint64_t));
+        count_ = 0;
+    }
+
+    void reset() noexcept {
+        Allocator<std::uint64_t>{}.deallocate(words_, words_count_);
+        words_ = nullptr;
+        words_count_ = count_ = 0;
+    }
+
+    bool reserve(std::size_t slots) noexcept {
+        if (slots > SIZE_MAX - 63) return false;
+        auto words = (slots + 63) / 64;
+        if (words <= words_count_) return true;
+        auto* replacement = Allocator<std::uint64_t>{}.allocate(words);
+        if (!replacement) return false;
+        if (words_) std::memcpy(replacement, words_, words_count_ * sizeof(std::uint64_t));
+        std::memset(replacement + words_count_, 0, (words - words_count_) * sizeof(std::uint64_t));
+        Allocator<std::uint64_t>{}.deallocate(words_, words_count_);
+        words_ = replacement;
+        words_count_ = words;
+        return true;
+    }
+
+    bool test(std::uint32_t slot) const noexcept {
+        usearch_assert_m(slot / 64 < words_count_, "visited slot outside prepared workspace");
+        return (words_[slot / 64] & (std::uint64_t{1} << (slot % 64))) != 0;
+    }
+
+    bool set(std::uint32_t slot) noexcept {
+        if (test(slot)) return true;
+        words_[slot / 64] |= std::uint64_t{1} << (slot % 64);
+        ++count_;
+        return false;
+    }
+};
+
+using Engine = index_gt<double, std::uint64_t, std::uint32_t, Allocator<char>, Allocator<char>, VisitedSlots>;
 
 void prepare(Engine::context_t& context, std::size_t n, std::size_t m) {
     // At most n unique queued nodes. Reserve the worst-case visit lookahead

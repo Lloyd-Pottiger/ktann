@@ -187,6 +187,14 @@ partitions or recall policy. On Local Graph Indexes the prefetched prefix contai
 only leaves and stops before the first internal partition, including when trees
 of different heights share the frontier. Internal graph visits remain serial.
 
+For graph-enabled internal bodies, duplicate-reference validation and local
+candidate selection share one admitted CPU task. Traversal transfers its observed
+reference set into that task and receives it back with the candidates. Every
+Child Entry is still checked, including those excluded by local top-B. The task
+checks operation control at bounded intervals; wide bodies do not require an
+async yield for every validation batch. Failure aborts the search, and detached
+CPU work retains admission until it exits.
+
 Within that funded prefix, traversal validates metadata and applies Synopsis
 pruning before prefetching body pages. At most four first pages of cache misses
 are read together, each under the existing 256-entry/1 MiB encoded scan limits
@@ -226,12 +234,16 @@ source array when its last candidate leaves the heap.
 The pool scores eligible entries individually and admits them directly,
 without per-leaf candidate or screened-ID buffers. Every eligible Record ID is
 registered once in a separate compact list, including screened, rejected, and
-evicted entries. Only admitted heap candidates require an additional ID reference.
+evicted entries. IDs of at most 16 bytes are copied inline in that list, avoiding
+shared cache reference-count traffic. Longer IDs retain their existing shared
+allocation rather than copying the payload. Identity equality and hashing use
+all ID bytes regardless of the storage form.
 After traversal, one borrowed-ID set is reserved from the actual list length to
 validate duplicate membership before exact reads. Both the list and set are
 released immediately after successful validation. Thus candidate count and projection ownership are bounded by the rerank
 budget, while corruption-detection identity storage grows with the number of
-predicate-eligible entries visited. Both retained IDs and transient duplicate-table space are charged to routing working memory;
+predicate-eligible entries visited. List capacity (including inline ID bytes),
+shared ID payloads, and transient duplicate-table space are charged to routing working memory;
 shared source arrays are charged once, including on cache misses or eviction.
 
 ### 6.4 Intermediate topology

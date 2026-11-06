@@ -10,6 +10,9 @@ use crate::search::numeric::VectorKernel;
 use crate::storage::keys::LogicalKey;
 use crate::storage::values::{GRAPH_CHUNK_BYTES, GraphChunk, GraphDescriptor};
 
+/// All observed incoming partition references, keyed by query-local tree ordinal.
+pub(crate) type PartitionReferences = std::collections::HashSet<(u32, PartitionKey)>;
+
 /// Runtime execution boundary: one snapshot, bounded owned CPU work and control.
 /// Traversal owns candidate selection; the runtime owns admission and dispatch.
 pub(crate) trait RoutingExecution: Sync {
@@ -27,7 +30,9 @@ pub(crate) trait RoutingExecution: Sync {
         query: Vec<f32>,
         beam: usize,
         mode: crate::api::RoutingMode,
-    ) -> Result<Vec<(PartitionKey, f64)>>;
+        tree: u32,
+        references: PartitionReferences,
+    ) -> Result<(Vec<(PartitionKey, f64)>, PartitionReferences)>;
 }
 
 /// An admitted complete snapshot read, ready for CPU restoration outside the executor.
@@ -62,6 +67,29 @@ pub(crate) struct RoutingGraph {
 }
 
 impl RoutingGraph {
+    /// Validates every exposed edge, including children omitted by local top-B.
+    /// The caller transfers the query's reference set into admitted CPU work so
+    /// wide bodies do not occupy the async executor or require per-batch dispatch.
+    pub(crate) fn validate_references(
+        &self,
+        tree: u32,
+        references: &mut PartitionReferences,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        references
+            .try_reserve(self.children().len())
+            .map_err(|_| limit())?;
+        for (ordinal, child) in self.children().iter().enumerate() {
+            if ordinal % 64 == 0 {
+                check()?;
+            }
+            if !references.insert((tree, child.child())) {
+                return Err(corrupt());
+            }
+        }
+        check()
+    }
+
     /// Complete children, including those the local algorithm will not select.
     pub(crate) fn children(&self) -> &[ChildEntry] {
         self.partition().children()

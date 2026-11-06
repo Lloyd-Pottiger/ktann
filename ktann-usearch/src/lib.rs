@@ -478,6 +478,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn visited_slots_cover_word_boundaries_and_reset_between_queries() {
+        for n in [63, 64, 65, 127, 128, 129, 4097] {
+            let distance = |a: u32, b: u32| (f64::from(a) - f64::from(b)).powi(2);
+            let graph = Graph::build(n, 4, 16, 17, build_bound(n, 4).unwrap(), &distance, &|| {
+                true
+            })
+            .unwrap();
+            let mut scratch = Workspace::new(n, 4, workspace_bound(n, 4).unwrap()).unwrap();
+            let allocations = scratch.allocation_count();
+            for query in [n - 1, 0, n / 2, n - 1] {
+                let mut hits = [Hit::default(); 1];
+                graph
+                    .search(
+                        n,
+                        &|_, node| distance(query as u32, node),
+                        &|| true,
+                        &mut scratch,
+                        &mut hits,
+                    )
+                    .unwrap();
+                assert_eq!(hits[0].node as usize, query);
+                assert_eq!(hits[0].distance, 0.0);
+                assert_eq!(scratch.allocation_count(), allocations);
+            }
+        }
+    }
+
+    #[test]
     fn admission_bounds_cover_small_sparse_and_large_degree_allocations() {
         for (n, m) in [(0, 2), (1, 2), (9, 3), (128, 12), (16, 129), (1, 32768)] {
             let bound = build_bound(n, m).unwrap();

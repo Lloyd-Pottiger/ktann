@@ -55,6 +55,69 @@ use std::cell::Cell;
 
 const MEMORY: usize = 128 * 1024 * 1024;
 
+/// Measures production routing on fixed graphs; construction and result digests
+/// stay outside query timing. Fresh scratch matches the production read path.
+#[test]
+#[ignore = "release-only routing performance diagnostic"]
+fn local_routing_performance() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    for (n, dimension) in [(512, 128), (4096, 128), (4096, 768), (16384, 128)] {
+        let mut seed = 19_u64;
+        let mut vector = || {
+            (0..dimension)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    (seed >> 40) as f32 / (1_u32 << 24) as f32
+                })
+                .collect::<Vec<_>>()
+        };
+        let rows = children((0..n).map(|_| vector()).collect());
+        let queries: Vec<_> = (0..64).map(|_| vector()).collect();
+        let kernel = VectorKernel::new(dimension, Metric::L2, [0; 32]).unwrap();
+        let parameters = params();
+        let started = Instant::now();
+        let graph = build(&kernel, &rows, parameters);
+        let build_us = started.elapsed().as_micros();
+        let run = |query: &[f32]| {
+            let mut scratch = Workspace::new(n, parameters.m, MEMORY).unwrap();
+            graph
+                .search(query, 16, 64, MEMORY, &mut scratch, &|| Ok(()))
+                .unwrap()
+        };
+        let mut digest = Sha256::new();
+        for query in &queries {
+            let (hits, stats) = run(query);
+            digest.update((stats.distances as u64).to_le_bytes());
+            digest.update((stats.visits as u64).to_le_bytes());
+            for hit in hits {
+                digest.update(hit.node.to_le_bytes());
+                digest.update(hit.distance.to_bits().to_le_bytes());
+            }
+        }
+        let scratch = Workspace::new(n, parameters.m, MEMORY).unwrap();
+        println!(
+            "n={n} d={dimension} build_us={build_us} workspace_bytes={} digest={:02x?}",
+            scratch.allocated_bytes(),
+            digest.finalize()
+        );
+        drop(scratch);
+        for round in 0..5 {
+            let started = Instant::now();
+            for query in &queries {
+                black_box(run(black_box(query)));
+            }
+            println!(
+                "n={n} d={dimension} round={round} ns_per_query={}",
+                started.elapsed().as_nanos() / queries.len() as u128
+            );
+        }
+    }
+}
+
 fn key(value: u64) -> PartitionKey {
     PartitionKey::new(value).unwrap()
 }

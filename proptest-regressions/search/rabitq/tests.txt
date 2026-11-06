@@ -1,0 +1,3 @@
+# Replays the all-zero code with a nonzero generated scale. The scoring corpus
+# must construct canonical zero metadata before comparing scoring paths.
+cc b1669c7bf6bef1af855f1b891cd5b72d1a32ef51392e36584d3007f3cd928a85

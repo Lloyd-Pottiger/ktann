@@ -73,6 +73,9 @@ The algorithm has the following constraints:
 - The native graph retains topology only. Query scratch is separate and bounded;
   concurrent queries use separate workspaces. No borrowed Rust reference or
   distance callback survives a native call.
+- Visited membership uses a bitmap over dense local ordinals. Preparation reserves
+  the whole ordinal domain before a walk; the bitmap is cleared between walks.
+  This changes scratch representation, not expansion order or distance scoring.
 
 The [core implementation](../../src/search/local_hnsw.rs) owns input validation,
 metric integration and seed derivation. The native bridge's README owns dependency

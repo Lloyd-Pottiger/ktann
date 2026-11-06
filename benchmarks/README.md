@@ -686,6 +686,32 @@ allocations; it is not graph working memory.
 Logical KV bytes do not measure native physical writes. These experiments cover
 the reported size and update history and do not establish a production SLA.
 
+### Local graph CPU and scratch diagnostic
+
+Run `cargo test --release -p ktann --lib local_routing_performance -- --ignored --nocapture`
+on an otherwise idle host. This diagnostic constructs deterministic local graphs
+at 512, 4096 and 16384 nodes, with 128- and 768-dimensional cases. It uses the
+production distance kernel and fresh query scratch, records five timed rounds,
+and reports workspace bytes and an untimed digest of hits, scores and traversal
+work. Graph construction is timed separately. Repeat processes and compare
+digests before interpreting timings; this does not measure backend IO, complete
+search quality or end-to-end throughput.
+
+### Candidate membership diagnostic
+
+Run the membership-only diagnostic with:
+
+```sh
+cargo test --release -p ktann --all-features --lib candidate_membership_performance -- --ignored --nocapture
+```
+
+It collects and validates 32,768 unique IDs with 8- and 256-byte payloads over
+64 rounds, with leaf construction and reusable score-batch preparation outside
+timing. The helper borrows the score batch and source location; it excludes vector
+scoring, routing and backend IO.
+Compare repeated processes and end-to-end search before interpreting this proxy.
+
+
 ### Adaptive write routing
 
 Graph-enabled indexes use exact scoring below 1024 internal nodes and HNSW at

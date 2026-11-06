@@ -30,6 +30,14 @@ of graph insertion, diversity selection, reverse-link pruning and graph search.
 No upstream dense index, metric plugins, SIMD dispatch, or
 vector storage is instantiated by this bridge.
 
+The generic graph accepts a visited-set type supplied by the bridge. KTANN uses
+one bit per dense node ordinal instead of a hash table. Before any build, update,
+repair or query, workspace preparation reserves all possible ordinals plus the
+existing neighbor-lookahead allowance. Traversal clears the bits between walks;
+membership, visit counts and neighbor order are unchanged. The bitmap uses the
+same charged allocator and preserves its bits if preparation grows it. Existing
+workspace admission bounds remain conservative; this changes no persisted bytes.
+
 Upper-layer greedy traversal can evaluate a node more than once; each move
 strictly improves the distance/ordinal pair. Visited state deduplicates
 best-first construction and base-layer query exploration. Full-coverage

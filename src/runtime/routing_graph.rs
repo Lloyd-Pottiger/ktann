@@ -3,7 +3,7 @@
 use super::{OperationContext, check_control, compute::controlled_compute};
 use crate::api::{PartitionKey, Result};
 use crate::search::cache::BodyRequest;
-use crate::search::cache::graph::{GraphRead, RoutingGraph, read_graph};
+use crate::search::cache::graph::{GraphRead, PartitionReferences, RoutingGraph, read_graph};
 use crate::storage::ReadLogicalTxn;
 use crate::storage::backend::{Backend, ReadOps};
 use crate::storage::values::IndexManifest;
@@ -53,11 +53,14 @@ impl<B: Backend> crate::search::cache::graph::RoutingExecution for OperationCont
         query: Vec<f32>,
         beam: usize,
         mode: crate::api::RoutingMode,
-    ) -> Result<Vec<(PartitionKey, f64)>> {
+        tree: u32,
+        mut references: PartitionReferences,
+    ) -> Result<(Vec<(PartitionKey, f64)>, PartitionReferences)> {
         controlled_compute(
             self.options.clone(),
             self.cpu_admission.clone().expect("search CPU admission"),
             move |options| {
+                graph.validate_references(tree, &mut references, &|| check_control(options))?;
                 let started = std::time::Instant::now();
                 let result = match mode {
                     crate::api::RoutingMode::PartitionLocalHnsw { ef_search } => {
@@ -78,7 +81,7 @@ impl<B: Backend> crate::search::cache::graph::RoutingExecution for OperationCont
                 };
                 ::metrics::histogram!("ktann.routing.compute_seconds")
                     .record(started.elapsed().as_secs_f64());
-                Ok(result)
+                Ok((result, references))
             },
         )
         .await

@@ -10,6 +10,54 @@ use crate::storage::values::{IndexLifecycle, PartitionState, ValueCodec};
 
 const W: usize = 16 * 1024 * 1024;
 
+#[tokio::test]
+async fn graph_reference_validation_checks_unselected_edges_and_control() {
+    let fixture = Fixture::with_size(Metric::L2, 1, 1, 128, 4);
+    let graph = fixture.load(&PartitionCache::new(W as u64)).await;
+    let hits = graph.search(&[0.3, 0.1, 0.2], 7, 12, &|| Ok(())).unwrap().0;
+    let excluded = graph
+        .children()
+        .iter()
+        .find(|child| !hits.iter().any(|(key, _)| *key == child.child()))
+        .unwrap()
+        .child();
+    let mut references = PartitionReferences::from([(3, excluded)]);
+    assert_eq!(
+        graph
+            .validate_references(3, &mut references, &|| Ok(()))
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Corruption
+    );
+
+    // Partition Keys are scoped by Tree Key, represented here by its query ordinal.
+    let mut references = PartitionReferences::from([(2, excluded)]);
+    graph
+        .validate_references(3, &mut references, &|| Ok(()))
+        .unwrap();
+    assert_eq!(references.len(), 129);
+
+    let checks = std::cell::Cell::new(0);
+    let mut references = PartitionReferences::new();
+    let result = graph.validate_references(3, &mut references, &|| {
+        checks.set(checks.get() + 1);
+        if checks.get() == 2 {
+            Err(Error::new(ErrorKind::Cancelled))
+        } else {
+            Ok(())
+        }
+    });
+    assert_eq!(result.unwrap_err().kind(), ErrorKind::Cancelled);
+    assert!(
+        !references.is_empty(),
+        "validation made progress before cancellation"
+    );
+    assert!(
+        references.len() < graph.children().len(),
+        "cancellation stopped validation early"
+    );
+}
+
 impl GraphRead {
     /// Unit tests execute pure restoration inline; the runtime test covers CPU dispatch.
     fn restore(
@@ -50,6 +98,8 @@ pub(crate) async fn exercise_runtime<B: crate::storage::backend::Backend>(
                 vec![0.3, 0.1, 0.2],
                 7,
                 crate::api::RoutingMode::PartitionLocalHnsw { ef_search: 12 },
+                0,
+                PartitionReferences::new(),
             )
             .await?;
         if let Some(expected) = &expected {

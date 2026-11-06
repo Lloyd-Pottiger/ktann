@@ -601,6 +601,12 @@ proptest! {
         scale in 0.0_f32..1e20_f32,
     ) {
         let (components, codes): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
+        // All-zero codes require a canonical zero header, independently of the query.
+        let scale = if codes.iter().all(|&code| code == 0) {
+            0.0
+        } else {
+            scale
+        };
         let encoded = independently_encode_payload(&codes, scale, 0.0);
         assert_validated_packed_parity(&encoded, &components);
     }
