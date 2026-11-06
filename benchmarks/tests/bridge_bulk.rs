@@ -97,6 +97,7 @@ impl Bridge {
                 data.extend_from_slice(&value.to_le_bytes());
             }
         }
+        data.push(0);
         self.exchange(&data)
     }
     fn exchange(&mut self, data: &[u8]) -> Value {

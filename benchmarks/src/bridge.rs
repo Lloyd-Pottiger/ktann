@@ -170,6 +170,8 @@ enum Operation {
     Reset {
         dimension: usize,
         metric: String,
+        #[serde(default)]
+        with_scalar_labels: bool,
         min_leaf_partition_entries: Option<u32>,
         max_leaf_partition_entries: Option<u32>,
         min_internal_partition_entries: Option<u32>,
@@ -183,6 +185,7 @@ enum Operation {
     Insert {
         ids: Vec<i64>,
         vectors: Vec<Vec<f32>>,
+        labels: Option<Vec<FieldValue>>,
     },
     Optimize {
         records: u64,
@@ -190,20 +193,44 @@ enum Operation {
     Search {
         vector: Vec<f32>,
         k: usize,
-        /// Inclusive signed record-ID threshold used by VectorDBBench numeric filters.
-        id_min: Option<i64>,
+        filter: Option<SearchFilter>,
     },
     Health {},
     Shutdown {},
 }
 
+/// The two typed predicates supported by the benchmark adapter. Each request
+/// owns its complete filter; a connection never retains predicate state.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum SearchFilter {
+    NumGe { value: i64 },
+    StrEqual { value: String },
+}
+
+impl SearchFilter {
+    fn predicate(self) -> ktann::api::Result<Predicate> {
+        let (field, op, value) = match self {
+            Self::NumGe { value } => (
+                FieldId(0),
+                CompareOp::GreaterOrEqual,
+                FieldValue::I64(value),
+            ),
+            Self::StrEqual { value } => (FieldId(1), CompareOp::Eq, FieldValue::string(value)?),
+        };
+        Ok(Predicate::Compare { field, op, value })
+    }
+}
+
 /// Binary inserts use KTI, big-endian count/dimension, then little-endian
-/// i64 IDs and row-major f32 values. Validate the entire shape before allocating.
+/// i64 IDs and row-major f32 values. A mandatory byte selects absent (0) or
+/// present (1) labels; present labels each have a big-endian u16 byte length.
+/// Validate the bounded shape and all labels before allocating vector rows.
 fn decode_request(data: &[u8]) -> Result<Operation, String> {
     if !data.starts_with(b"KTI") {
         return serde_json::from_slice(data).map_err(|e| e.to_string());
     }
-    if data.len() < 11 {
+    if data.len() < 11 || data.len() > MAX_FRAME {
         return Err("invalid binary insert header".into());
     }
     let count = u32::from_be_bytes(data[3..7].try_into().unwrap()) as usize;
@@ -217,8 +244,30 @@ fn decode_request(data: &[u8]) -> Result<Operation, String> {
         .and_then(|row| row.checked_mul(count))
         .and_then(|body| body.checked_add(11))
         .ok_or("binary insert overflow")?;
-    if data.len() != bytes {
+    if data.len() <= bytes {
         return Err("binary insert length does not match shape".into());
+    }
+    let mut tail = &data[bytes + 1..];
+    let labels = match data[bytes] {
+        0 => None,
+        1 => {
+            let mut labels = Vec::with_capacity(count);
+            for _ in 0..count {
+                let length = tail.get(..2).ok_or("truncated label length")?;
+                let length = usize::from(u16::from_be_bytes([length[0], length[1]]));
+                tail = &tail[2..];
+                let label = tail.get(..length).ok_or("truncated label")?;
+                let label = std::str::from_utf8(label).map_err(|_| "invalid UTF-8 label")?;
+                // Use the native field boundary rather than a second size policy.
+                labels.push(FieldValue::string(label).map_err(|_| "label exceeds field limit")?);
+                tail = &tail[length..];
+            }
+            Some(labels)
+        }
+        _ => return Err("invalid label presence byte".into()),
+    };
+    if !tail.is_empty() {
+        return Err("trailing binary insert bytes".into());
     }
     let ids_end = 11 + count * 8;
     let ids = data[11..ids_end]
@@ -227,7 +276,7 @@ fn decode_request(data: &[u8]) -> Result<Operation, String> {
         .iter()
         .map(|id| i64::from_le_bytes(*id))
         .collect();
-    let vectors = data[ids_end..]
+    let vectors = data[ids_end..bytes]
         .chunks_exact(vector_bytes)
         .map(|row| {
             row.as_chunks::<4>()
@@ -237,7 +286,11 @@ fn decode_request(data: &[u8]) -> Result<Operation, String> {
                 .collect()
         })
         .collect();
-    Ok(Operation::Insert { ids, vectors })
+    Ok(Operation::Insert {
+        ids,
+        vectors,
+        labels,
+    })
 }
 
 /// Lifecycle state is exclusive for mutation and shared for concurrent search.
@@ -247,6 +300,7 @@ struct State<B: Backend> {
     ready: bool,
     records: u64,
     dimension: usize,
+    with_scalar_labels: bool,
     metric: String,
     dataset: String,
     search: SearchOptions,
@@ -263,6 +317,7 @@ impl<B: Backend> Default for State<B> {
             ready: false,
             records: 0,
             dimension: 0,
+            with_scalar_labels: false,
             metric: String::new(),
             dataset: String::new(),
             search: SearchOptions::default(),
@@ -521,6 +576,7 @@ impl<B: Backend> Service<B> {
                     .await
                     .map_err(api_error)?;
                 state.dimension = index.config().dimension();
+                state.with_scalar_labels = index.config().fields().len() == 2;
                 state.metric = match index.config().metric() {
                     Metric::L2 => "L2",
                     Metric::Cosine => "COSINE",
@@ -539,6 +595,7 @@ impl<B: Backend> Service<B> {
             Operation::Reset {
                 dimension,
                 metric,
+                with_scalar_labels,
                 min_leaf_partition_entries,
                 max_leaf_partition_entries,
                 min_internal_partition_entries,
@@ -576,7 +633,13 @@ impl<B: Backend> Service<B> {
                             .unwrap_or(c.max_internal_partition_entries());
                         c.with_internal_partition_entries(minimum, maximum)
                     })
-                    .and_then(|c| c.with_fields(vec![FieldSchema::new("id", DataType::I64)?]))
+                    .and_then(|c| {
+                        let mut fields = vec![FieldSchema::new("id", DataType::I64)?];
+                        if with_scalar_labels {
+                            fields.push(FieldSchema::new("labels", DataType::String)?);
+                        }
+                        c.with_fields(fields)
+                    })
                     .map_err(api_error)?;
                 let config = if let Some(experiment) = &self.experiment {
                     config.with_local_graph(experiment.graph().map_err(api_error)?)
@@ -618,12 +681,17 @@ impl<B: Backend> Service<B> {
                     .map_err(api_error)?,
                 );
                 state.dimension = dimension;
+                state.with_scalar_labels = with_scalar_labels;
                 state.metric = metric;
                 state.dataset = dataset;
                 state.search = search;
                 Ok(json!({"created":true}))
             }
-            Operation::Insert { ids, vectors } => {
+            Operation::Insert {
+                ids,
+                vectors,
+                labels,
+            } => {
                 if ids.is_empty() || ids.len() != vectors.len() || ids.len() > MAX_BATCH {
                     return Err(invalid("batch must contain 1..50 paired IDs and vectors"));
                 }
@@ -634,18 +702,27 @@ impl<B: Backend> Service<B> {
                 if state.dimension == 0 {
                     return Err(invalid("reset required"));
                 }
+                if labels.is_some() != state.with_scalar_labels
+                    || labels
+                        .as_ref()
+                        .is_some_and(|labels| labels.len() != ids.len())
+                {
+                    return Err(invalid("labels must match the schema and batch size"));
+                }
+                let mut labels = labels.into_iter().flatten();
                 let mut records = Vec::with_capacity(ids.len());
                 for (id, vector) in ids.iter().zip(vectors) {
                     if vector.len() != state.dimension {
                         return Err(invalid("wrong vector dimension"));
                     }
                     let vector: Arc<[f32]> = vector.into();
-                    let record = Record::new(
-                        Bytes::copy_from_slice(&id.to_be_bytes()),
-                        vector,
-                        vec![FieldValue::I64(*id)],
-                    )
-                    .map_err(api_error)?;
+                    let mut fields = vec![FieldValue::I64(*id)];
+                    if let Some(label) = labels.next() {
+                        fields.push(label);
+                    }
+                    let record =
+                        Record::new(Bytes::copy_from_slice(&id.to_be_bytes()), vector, fields)
+                            .map_err(api_error)?;
                     records.push(record);
                 }
                 let start = Instant::now();
@@ -696,7 +773,7 @@ impl<B: Backend> Service<B> {
                 state.optimize_seconds += start.elapsed().as_secs_f64();
                 result
             }
-            Operation::Search { vector, k, id_min } => {
+            Operation::Search { vector, k, filter } => {
                 let state = self.state.read().await;
                 if !state.ready {
                     return Err(invalid("optimize must succeed before search"));
@@ -708,12 +785,8 @@ impl<B: Backend> Service<B> {
                 let mut request = SearchRequest::new(vector, k)
                     .map_err(api_error)?
                     .with_options(state.search);
-                if let Some(id_min) = id_min {
-                    request = request.with_predicate(Predicate::Compare {
-                        field: FieldId(0),
-                        op: CompareOp::GreaterOrEqual,
-                        value: FieldValue::I64(id_min),
-                    });
+                if let Some(filter) = filter {
+                    request = request.with_predicate(filter.predicate().map_err(api_error)?);
                 }
                 let start = Instant::now();
                 let result = index.search(request).await.map_err(api_error)?;
@@ -783,6 +856,7 @@ impl<B: Backend> Service<B> {
             "backend_identity": self.identity,
             "backend_limits": self.limits,
             "dataset": state.dataset,
+            "with_scalar_labels": state.with_scalar_labels,
             "dimension": state.dimension,
             "metric": state.metric,
             "records": state.records,
@@ -845,10 +919,17 @@ mod tests {
         for value in [-0.0_f32, f32::MAX, 1.25, -2.5] {
             frame.extend_from_slice(&value.to_le_bytes());
         }
+        frame.push(0);
         let request = super::decode_request(&frame).unwrap();
-        let super::Operation::Insert { ids, vectors } = request else {
+        let super::Operation::Insert {
+            ids,
+            vectors,
+            labels,
+        } = request
+        else {
             panic!("insert expected");
         };
+        assert!(labels.is_none());
         assert_eq!(ids, [i64::MIN, i64::MAX]);
         assert_eq!(vectors[0][0].to_bits(), (-0.0_f32).to_bits());
         assert_eq!(vectors, [vec![-0.0, f32::MAX], vec![1.25, -2.5]]);
@@ -869,6 +950,42 @@ mod tests {
     }
 
     #[test]
+    fn label_frames_validate_utf8_lengths_and_exact_tail() {
+        let mut base = b"KTI".to_vec();
+        base.extend_from_slice(&1_u32.to_be_bytes());
+        base.extend_from_slice(&1_u32.to_be_bytes());
+        base.extend_from_slice(&7_i64.to_le_bytes());
+        base.extend_from_slice(&1_f32.to_le_bytes());
+        base.push(1);
+        for label in ["".to_owned(), "é".to_owned(), "界".repeat(341) + "a"] {
+            let mut frame = base.clone();
+            frame.extend_from_slice(&u16::try_from(label.len()).unwrap().to_be_bytes());
+            frame.extend_from_slice(label.as_bytes());
+            let super::Operation::Insert { labels, .. } = super::decode_request(&frame).unwrap()
+            else {
+                panic!("insert expected");
+            };
+            assert_eq!(labels.unwrap(), [super::FieldValue::string(label).unwrap()]);
+            for end in base.len()..frame.len() {
+                assert!(super::decode_request(&frame[..end]).is_err());
+            }
+            frame.push(0);
+            assert!(super::decode_request(&frame).is_err());
+        }
+        for tail in [
+            vec![0, 1, 0xff],
+            vec![4, 1],
+            [vec![4, 1], vec![b'a'; 1025]].concat(),
+        ] {
+            let mut frame = base.clone();
+            frame.extend(tail);
+            assert!(super::decode_request(&frame).is_err());
+        }
+        *base.last_mut().unwrap() = 2;
+        assert!(super::decode_request(&base).is_err());
+    }
+
+    #[test]
     fn request_rejects_unknown_operations_fields_and_noninteger_ids() {
         assert!(serde_json::from_str::<Operation>(r#"{"op":"health"}"#).is_ok());
         for input in [
@@ -876,6 +993,10 @@ mod tests {
             r#"{"op":"shutdown","unexpected":true}"#,
             r#"{"op":"delete","id":1}"#,
             r#"{"op":"search","vector":[1],"k":1,"filter":{}}"#,
+            r#"{"op":"search","vector":[1],"k":1,"id_min":1}"#,
+            r#"{"op":"search","vector":[1],"k":1,"filter":{"type":"str_equal","value":1}}"#,
+            r#"{"op":"search","vector":[1],"k":1,"filter":{"type":"num_ge","value":1.5}}"#,
+            r#"{"op":"search","vector":[1],"k":1,"filter":{"type":"str_equal","value":"x","field":"other"}}"#,
             r#"{"op":"insert","ids":[1.5],"vectors":[[1]]}"#,
             r#"{"op":"insert","ids":[9223372036854775808],"vectors":[[1]]}"#,
         ] {

@@ -319,9 +319,11 @@ process tests live in the [VectorDBBench repository](https://github.com/Lloyd-Po
 
 The bridge uses Bulk Build with refinement. It supports
 RocksDB and FoundationDB, single-tenant IDs-only L2/cosine search, signed 64-bit
-record IDs, and an optional inclusive `id_min` predicate. This supports Cohere
-1M unfiltered, 1% excluded, and 99% excluded cases, plus custom ANN performance
-cases. Incremental online and read/write workloads are not supported.
+record IDs, and native typed predicates: inclusive `id >= threshold` and
+`labels == value`. This supports Cohere 1M unfiltered, 1% excluded, and 99%
+excluded numeric cases, official Cohere 1M label cases, plus custom unfiltered
+ANN performance cases. Label values are ingested with their vectors; filtering
+runs inside KTANN search, before exact reranking, rather than on returned hits. Incremental online and read/write workloads are not supported.
 
 For RocksDB, the bridge assigns one eighth of the Runtime's default decoded
 cache budget to a native row cache and leaves seven eighths for Partition
@@ -401,11 +403,54 @@ vectordbbench ktann --socket-path /tmp/ktann-bench.sock \
   --refinement-rounds 2 --refinement-memory-bytes 34359738368
 ```
 
+For an official 1% matching label workload, start a fresh bridge and use:
+
+```sh
+vectordbbench ktann --socket-path /tmp/ktann-bench.sock \
+  --dataset-identity cohere-1m-labels --case-type LabelFilterPerformanceCase \
+  --dataset-with-size-type 'Medium Cohere (768dim, 1M)' \
+  --label-percentage 0.01 --load-concurrency 1 --insert-batch-size 50 --k 100 \
+  --refinement-rounds 2 --refinement-memory-bytes 12884901888
+```
+
+The 12 GiB refinement budget is a conservative admission limit, not an RSS
+reservation. For 1M 768-dimensional records with eight-byte IDs, retained-input
+admission alone charges approximately 9.57 GiB, before partition plans; a 1 GiB
+refinement budget cannot build this workload. Tree/serving budgets remain separate.
+
+This queries `labels == "label_1p"` against
+`neighbors_labels_label_1p.parquet`, with labels loaded from
+`scalar_labels.parquet`. The percentage is the matching fraction, not the excluded
+fraction. The client limits label CLI cases to Cohere 1M and its registered official
+percentages. A frozen ID-only index must be rebuilt to query labels.
+Retain both canonical VectorDBBench metrics and companion reports together with
+the dataset/ground-truth identity, both source revisions, backend, effective
+configuration and environment. Reports distinguish measured label workloads from
+numeric workloads and identify backends not performance-tested. The bridge report
+records `with_scalar_labels`; client reports record `filter_at_close` (a final
+state, not a history of queries).
+
 The private protocol is unversioned; update the client and bridge together.
 It uses a big-endian u32 frame length, an 8 MiB frame limit and at most 128
 connections. Control/search and responses are JSON.
 Binary inserts carry `KTI`, big-endian u32 count/dimension,
 little-endian i64 IDs and row-major f32 values, with at most 50 records per batch.
+A mandatory trailing presence byte is 0 for no labels or 1 followed by one label
+per record. Each label is a big-endian u16 byte length and that many UTF-8 bytes
+(up to 1024). Empty strings are valid; strings are not normalized. The decoder
+rejects malformed UTF-8, truncation and trailing bytes before importing the batch.
+Reset's `with_scalar_labels` (default false) selects `id: I64` alone or adds
+non-null `labels: String`. Every insert must match that schema.
+
+Search carries `filter: null` (or omits it),
+`filter: {"type":"num_ge","value":123}`, or
+`filter: {"type":"str_equal","value":"label_1p"}`. Each request supplies its
+complete predicate; the bridge retains no connection-local filter state. Numeric
+filters bind field 0; label filters bind field 1 and require the label schema.
+The Python client validates field names (`id` / `labels`), values, label alignment
+and filter transitions; the bridge independently enforces frame/schema limits
+and creates native predicates. Dataset selection and official ground-truth
+resolution belong to VectorDBBench, not the bridge.
 The reset request carries `refinement_rounds` and `refinement_memory_bytes`.
 JSON inserts are rejected; update the client and bridge together.
 
