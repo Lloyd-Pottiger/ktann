@@ -1,0 +1,47 @@
+{
+  "source": "s3://assets.zilliz.com/benchmark/cohere_medium_1m/",
+  "files": {
+    "neighbors_labels_label_1p.parquet": {
+      "size_bytes": 2341138,
+      "sha256": "202fdd82243192fdc7c2dea3854aeb8296e4a6810822e192e4e5448077567bdb",
+      "rows": 1000,
+      "schema": "id: int64\nneighbors_id: large_list<item: int64>\n  child 0, item: int64"
+    },
+    "scalar_labels.parquet": {
+      "size_bytes": 1358536,
+      "sha256": "34841f6d16aa366261b7e70e74a79dcbb1aa6a758ecb0c5c60115bb512fa5144",
+      "rows": 1000000,
+      "schema": "id: int64\nlabels: large_string"
+    },
+    "shuffle_train.parquet": {
+      "size_bytes": 3134418448,
+      "sha256": "023b16f7abafecda7c790a25f6eb3837367070f6ea8837be1f986fbd302ccf21",
+      "rows": 1000000,
+      "schema": "id: int64\nemb: large_list<item: float>\n  child 0, item: float"
+    },
+    "test.parquet": {
+      "size_bytes": 3133165,
+      "sha256": "a2ec76c907da22e5533ce31c1105e4fd4d3c4597915a7771d5e41897a95ecbed",
+      "rows": 1000,
+      "schema": "id: int64\nemb: large_list<item: float>\n  child 0, item: float"
+    }
+  },
+  "label_counts": {
+    "label_20p": 200000,
+    "label_2p": 20000,
+    "label_50p": 500000,
+    "label_foo": 112000,
+    "label_10p": 100000,
+    "label_5p": 50000,
+    "label_0.5p": 5000,
+    "label_1p": 10000,
+    "label_0.2p": 2000,
+    "label_0.1p": 1000
+  },
+  "ground_truth_label_mismatches": 0,
+  "ground_truth_rows": 1000,
+  "ground_truth_widths": {
+    "1000": 1000
+  },
+  "label_rows_match_zero_based_record_ids": true
+}

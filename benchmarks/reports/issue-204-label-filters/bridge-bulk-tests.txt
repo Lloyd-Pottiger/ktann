@@ -1,0 +1,20 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 38.97s
+     Running tests/bridge_bulk.rs (target/debug/deps/bridge_bulk-029ff00c833193a7)
+
+running 6 tests
+rocksdb_row_cache_capacity_bytes=rocksdb_row_cache_capacity_bytes=rocksdb_row_cache_capacity_bytes=rocksdb_row_cache_capacity_bytes=524857216524857216rocksdb_row_cache_capacity_bytes=
+524857216
+524857216524857216
+
+
+rocksdb_row_cache_capacity_bytes=524857216
+test invalid_refinement_controls_do_not_consume_reset ... ok
+test duplicate_staged_ids_fail_before_publication ... ok
+test refinement_limit_failure_stays_terminal_and_keeps_search_closed ... ok
+rocksdb_row_cache_capacity_bytes=524857216
+test staged_bulk_build_publishes_and_reports_real_build_phases ... ok
+rocksdb_row_cache_capacity_bytes=524857216
+test resume_opens_frozen_index_after_process_restart ... ok
+test fixed_bridge_routes_after_artifact_refinement ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.57s

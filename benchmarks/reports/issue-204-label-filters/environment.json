@@ -1,0 +1,36 @@
+{
+  "sources": [
+    {
+      "checkout": "/home/ubuntu/workspace",
+      "base_commit": "9aab14d9264497ac7c8007e386b8b469f8719c16",
+      "uncommitted_changes": true,
+      "files_sha256": {
+        "benchmarks/src/bridge.rs": "c10142b027c93abf2d929a143641fa8a7d6627790e3faa7d3fd3c00d8f136a63",
+        "benchmarks/tests/bridge_bulk.rs": "ed74bd4615fd1761e16f590c9c5041ef77968dd7b4c0e32dec5dbaeb765c6735",
+        "Cargo.lock": "26a152ce7cdb8e255e868043dc9339f868e5bb948523d6280233923aec38d90c"
+      }
+    },
+    {
+      "checkout": "/home/ubuntu/VectorDBBench.worktrees/issue-204-label-filters",
+      "base_commit": "ca263b8fa8c776c5ef83662ef1a88bef6a8b0b61",
+      "uncommitted_changes": true,
+      "files_sha256": {
+        "vectordb_bench/backend/clients/ktann/ktann.py": "4b2c34b5a1727f57074975dc8751c69d29d2cb4dc78647ccf4a07ce71bc1794f",
+        "vectordb_bench/backend/clients/ktann/cli.py": "3b1fee7645ba1f28a2fc4259e35335662ad0eb287f3efbf66ccc416e168d9a6e",
+        "tests/test_ktann_filters.py": "3062f887580155265b2e22ec69695a3616850ee6b3fe8f57e9ce9aaf7b7e03fd",
+        "tests/test_ktann_bridge.py": "be4a90f0dc8336bbe865731a8a6f41bea7046b71ce1df74a0a2adfaef570b8a9"
+      }
+    }
+  ],
+  "bridge_binary_sha256": "ae5b169695e5a198494e321ec0d26a3be2619aaa15797dfbfc3ab48d1ce45ce1",
+  "build": "cargo build --release -p ktann-benchmarks --all-features --bin ktann-vdbbench-bridge",
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "python": "Python 3.12.3",
+  "host": {
+    "platform": "Linux-6.12.76-x86_64-with-glibc2.39",
+    "cpu": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           48 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  8\nOn-line CPU(s) list:                     0-7\nVendor ID:                               GenuineIntel\nModel name:                              Intel(R) Xeon(R) Processor\nCPU family:                              6\nModel:                                   173\nThread(s) per core:                      1\nCore(s) per socket:                      1\nSocket(s):                               8\nStepping:                                1\nBogoMIPS:                                5400.00\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology nonstop_tsc cpuid tsc_known_freq pni pclmulqdq ssse3 fma cx16 pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch cpuid_fault ssbd ibrs ibpb stibp ibrs_enhanced fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves avx_vnni avx512_bf16 wbnoinvd arat avx512vbmi umip pku waitpkg avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid bus_lock_detect cldemote movdiri movdir64b md_clear serialize amx_bf16 avx512_fp16 amx_tile amx_int8 flush_l1d arch_capabilities\nHypervisor vendor:                       KVM\nVirtualization type:                     full\n",
+    "memory": "15 GiB RAM, no swap",
+    "storage": "virtiofs; disk scratch explicitly selected because /tmp is tmpfs"
+  },
+  "foundationdb": "7.3.79 local single-process cluster; process tests only, no full dataset performance measurement"
+}
