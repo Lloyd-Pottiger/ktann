@@ -697,6 +697,24 @@ work. Graph construction is timed separately. Repeat processes and compare
 digests before interpreting timings; this does not measure backend IO, complete
 search quality or end-to-end throughput. See the
 [visited-set experiment](reports/hnsw-visited-2026-11-06.md) for an example.
+The [leaf-selection experiments](reports/leaf-selection-2026-11-06.md) record
+profiling and three rejected end-to-end optimization candidates.
+
+The [SIFT1M follow-up](reports/sift-search-identities-2026-11-06.md) uses default
+partition capacities and reports high-recall
+search separately from lower-recall routing diagnostics. The membership-only
+complement runs with:
+
+```sh
+cargo test --release -p ktann --all-features --lib candidate_membership_performance -- --ignored --nocapture
+```
+
+It collects and validates 32,768 unique IDs with 8- and 256-byte payloads over
+64 rounds, with leaf construction and reusable score-batch preparation outside
+timing. The helper borrows the score batch and source location; it excludes vector
+scoring, routing and backend IO.
+Compare repeated processes and end-to-end search before interpreting this proxy.
+
 
 ### Adaptive write routing
 

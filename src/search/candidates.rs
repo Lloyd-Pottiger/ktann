@@ -104,12 +104,64 @@ impl std::fmt::Debug for LeafCandidate {
     }
 }
 
+/// Query-owned identity for exact duplicate detection across visited leaves.
+/// Short IDs are copied inline to avoid updating shared cache reference counts;
+/// long IDs retain their existing allocation instead of copying their payload.
+enum ObservedId {
+    Inline { bytes: [u8; 16], len: u8 },
+    Shared(Bytes),
+}
+
+impl ObservedId {
+    fn new(id: &Bytes) -> Self {
+        if id.len() <= 16 {
+            let mut bytes = [0; 16];
+            bytes[..id.len()].copy_from_slice(id);
+            // The inline bound proves this conversion fits.
+            Self::Inline {
+                bytes,
+                len: id.len() as u8,
+            }
+        } else {
+            Self::Shared(id.clone())
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Inline { bytes, len } => &bytes[..usize::from(*len)],
+            Self::Shared(id) => id,
+        }
+    }
+
+    fn shared_bytes(&self) -> usize {
+        match self {
+            Self::Inline { .. } => 0,
+            Self::Shared(id) => id.len(),
+        }
+    }
+}
+
+impl PartialEq for ObservedId {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl Eq for ObservedId {}
+
+impl std::hash::Hash for ObservedId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(self.as_bytes(), state);
+    }
+}
+
 /// Retains only globally competitive candidates and their snapshot projections.
 pub(crate) struct GlobalCandidatePool {
     capacity: usize,
     account_memory: bool,
     candidates: Vec<LeafCandidate>,
-    ids: Vec<Bytes>,
+    ids: Vec<ObservedId>,
     retained_bytes: usize,
     truncated: bool,
     id_bytes: usize,
@@ -194,11 +246,12 @@ impl GlobalCandidatePool {
         distance: Option<ApproximateDistance>,
     ) -> Result<()> {
         let id = entries[entry].record_id();
+        let observed = ObservedId::new(id);
         self.id_bytes = self
             .id_bytes
-            .checked_add(id.len())
+            .checked_add(observed.shared_bytes())
             .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-        self.ids.push(id.clone());
+        self.ids.push(observed);
         let Some(distance) = distance else {
             self.truncated = true;
             return Ok(());
@@ -330,7 +383,7 @@ impl GlobalCandidatePool {
                 .len()
                 .checked_mul(2)
                 .and_then(usize::checked_next_power_of_two)
-                .and_then(|slots| slots.checked_mul(size_of::<&Bytes>() + 1))
+                .and_then(|slots| slots.checked_mul(size_of::<&ObservedId>() + 1))
                 .and_then(|bytes| bytes.checked_add(64))
         };
         self.candidates
@@ -338,7 +391,7 @@ impl GlobalCandidatePool {
             .checked_mul(size_of::<LeafCandidate>())
             .and_then(|bytes| bytes.checked_add(self.retained_bytes))
             .and_then(|bytes| {
-                bytes.checked_add(self.ids.capacity().checked_mul(size_of::<Bytes>())?)
+                bytes.checked_add(self.ids.capacity().checked_mul(size_of::<ObservedId>())?)
             })
             .and_then(|bytes| bytes.checked_add(self.id_bytes))
             .and_then(|bytes| bytes.checked_add(table_bytes?))
@@ -399,15 +452,15 @@ mod tests {
     fn push_scored(
         pool: &mut GlobalCandidatePool,
         entries: &Arc<[CachedLeafEntry]>,
-        location: RecordLocation,
-        scored: Vec<(usize, ApproximateDistance)>,
+        location: &RecordLocation,
+        scored: &[(usize, ApproximateDistance)],
     ) -> Result<()> {
         pool.ids
             .try_reserve(scored.len())
             .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
         let mut source = Weak::new();
-        for (entry, distance) in scored {
-            pool.admit(entries, &location, &mut source, entry, Some(distance))?;
+        for &(entry, distance) in scored {
+            pool.admit(entries, location, &mut source, entry, Some(distance))?;
         }
         Ok(())
     }
@@ -425,20 +478,17 @@ mod tests {
                     (0..30).collect()
                 } {
                     let (entries, location) = leaf(n);
-                    let scored = [1, 4, 7, 10, 13, 19]
-                        .into_iter()
-                        .map(|i| {
-                            let distance = test_approximate_distance(f64::from((n + i as u8) % 9));
-                            expected.push((
-                                distance.rough(),
-                                entries[i].record_id().clone(),
-                                entries[i].fields().as_ptr(),
-                                location.clone(),
-                            ));
-                            (i, distance)
-                        })
-                        .collect();
-                    push_scored(&mut pool, &entries, location, scored).unwrap();
+                    let scored = [1, 4, 7, 10, 13, 19].map(|i| {
+                        let distance = test_approximate_distance(f64::from((n + i as u8) % 9));
+                        expected.push((
+                            distance.rough(),
+                            entries[i].record_id().clone(),
+                            entries[i].fields().as_ptr(),
+                            location.clone(),
+                        ));
+                        (i, distance)
+                    });
+                    push_scored(&mut pool, &entries, &location, &scored).unwrap();
                     assert!(pool.candidates.len() <= budget);
                     assert!(pool.heap_bytes().is_ok());
                     sources.push(Arc::downgrade(&entries));
@@ -469,11 +519,11 @@ mod tests {
     fn signed_zero_distances_use_record_id_ties() {
         let mut pool = GlobalCandidatePool::new(1, true);
         let (entries, location) = leaf(0);
-        let scored = vec![
+        let scored = [
             (0, test_approximate_distance(0.0)),
             (1, test_approximate_distance(-0.0)),
         ];
-        push_scored(&mut pool, &entries, location, scored).unwrap();
+        push_scored(&mut pool, &entries, &location, &scored).unwrap();
         let (selected, truncated) = pool.select(1).unwrap();
         assert!(truncated);
         assert_eq!(selected[0].record_id(), entries[0].record_id());
@@ -483,10 +533,10 @@ mod tests {
     fn final_interval_filter_avoids_unnecessary_exact_reads() {
         let mut pool = GlobalCandidatePool::new(64, true);
         let (entries, location) = leaf(0);
-        let scored = (0..20)
+        let scored: Vec<_> = (0..20)
             .map(|i| (i, test_approximate_distance(i as f64)))
             .collect();
-        push_scored(&mut pool, &entries, location, scored).unwrap();
+        push_scored(&mut pool, &entries, &location, &scored).unwrap();
         let (selected, truncated) = pool.select(3).unwrap();
         assert_eq!(selected.len(), 3);
         assert!(!truncated);
@@ -611,8 +661,8 @@ mod tests {
         push_scored(
             &mut pool,
             &entries,
-            location.clone(),
-            vec![(0, test_approximate_distance(9.0))],
+            &location,
+            &[(0, test_approximate_distance(9.0))],
         )
         .unwrap();
         drop(entries);
@@ -620,8 +670,8 @@ mod tests {
         push_scored(
             &mut pool,
             &better,
-            better_location,
-            vec![(0, test_approximate_distance(1.0))],
+            &better_location,
+            &[(0, test_approximate_distance(1.0))],
         )
         .unwrap();
         assert!(weak.upgrade().is_none());
@@ -629,8 +679,8 @@ mod tests {
         push_scored(
             &mut pool,
             &duplicate,
-            location,
-            vec![(0, test_approximate_distance(10.0))],
+            &location,
+            &[(0, test_approximate_distance(10.0))],
         )
         .unwrap();
         let error = pool.validate_membership(&|| Ok(())).await.err().unwrap();
@@ -642,11 +692,8 @@ mod tests {
         for budget in [0, 1, 8] {
             let (entries, location) = leaf(0);
             let mut pool = GlobalCandidatePool::new(budget, true);
-            let scored = [0, 1, 0]
-                .into_iter()
-                .map(|i| (i, test_approximate_distance(i as f64)))
-                .collect();
-            push_scored(&mut pool, &entries, location, scored).unwrap();
+            let scored = [0, 1, 0].map(|i| (i, test_approximate_distance(i as f64)));
+            push_scored(&mut pool, &entries, &location, &scored).unwrap();
             assert_eq!(
                 pool.validate_membership(&|| Ok(()))
                     .await
@@ -710,7 +757,7 @@ mod tests {
                                 TreeKey::encode(&[], &[]).unwrap(),
                                 PartitionKey::new(leaf as u64 + 1).unwrap(),
                             );
-                            let scored = indices
+                            let scored: Vec<_> = indices
                                 .iter()
                                 .map(|&entry| {
                                     let code = entries[entry].code(codes);
@@ -718,7 +765,7 @@ mod tests {
                                     (entry, distance)
                                 })
                                 .collect();
-                            push_scored(&mut reference, entries, location.clone(), scored).unwrap();
+                            push_scored(&mut reference, entries, &location, &scored).unwrap();
                             screened
                                 .push_leaf(
                                     entries,
@@ -759,6 +806,107 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn membership_preserves_binary_id_boundaries_after_leaf_release() {
+        let ids = [
+            vec![0],
+            vec![0, 0],
+            vec![0, 1],
+            vec![255; 16],
+            vec![255; 17],
+            vec![255; 255],
+            vec![255; 256],
+        ];
+        for duplicate in std::iter::once(None).chain((0..ids.len()).map(Some)) {
+            // No candidates retain the leaf, but every identity must still be
+            // compared in full, including screened/rejected variable-length IDs.
+            let mut pool = GlobalCandidatePool::new(0, true);
+            for (ordinal, id) in (0..ids.len()).chain(duplicate).enumerate() {
+                let mut codes = Vec::new();
+                let entries: Arc<[CachedLeafEntry]> = vec![CachedLeafEntry::from_leaf(
+                    LeafEntry::new(
+                        Bytes::copy_from_slice(&ids[id]),
+                        vec![],
+                        RaBitQ7::quantize(&[0.0; 4]).unwrap(),
+                    ),
+                    4,
+                    &mut codes,
+                )]
+                .into();
+                let released = Arc::downgrade(&entries);
+                push_scored(
+                    &mut pool,
+                    &entries,
+                    &RecordLocation::new(
+                        TreeKey::encode(&[], &[]).unwrap(),
+                        PartitionKey::new(ordinal as u64 + 1).unwrap(),
+                    ),
+                    &[(0, test_approximate_distance(1.0))],
+                )
+                .unwrap();
+                drop(entries);
+                assert!(released.upgrade().is_none());
+            }
+            let result = pool.validate_membership(&|| Ok(())).await;
+            if duplicate.is_some() {
+                assert_eq!(result.unwrap_err().kind(), ErrorKind::Corruption);
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+
+    /// Complements end-to-end search with short and maximum-length Record IDs.
+    #[tokio::test]
+    #[ignore = "optimized membership diagnostic; run on an otherwise idle host"]
+    async fn candidate_membership_performance() {
+        for id_len in [8, 256] {
+            let leaves: Vec<Arc<[CachedLeafEntry]>> = (0..256_u64)
+                .map(|leaf| {
+                    let mut codes = Vec::new();
+                    (0..128_u64)
+                        .map(|entry| {
+                            let mut id = vec![0xa5; id_len];
+                            id[..8].copy_from_slice(&(leaf * 128 + entry).to_be_bytes());
+                            CachedLeafEntry::from_leaf(
+                                LeafEntry::new(
+                                    Bytes::from(id),
+                                    vec![],
+                                    RaBitQ7::quantize(&[0.0; 4]).unwrap(),
+                                ),
+                                4,
+                                &mut codes,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .into()
+                })
+                .collect();
+            let location = RecordLocation::new(
+                TreeKey::encode(&[], &[]).unwrap(),
+                PartitionKey::new(1).unwrap(),
+            );
+            let scored: Vec<_> = (0..128)
+                .map(|i| (i, test_approximate_distance(1.0)))
+                .collect();
+            let started = std::time::Instant::now();
+            let mut peak_accounted = 0;
+            for _ in 0..64 {
+                let mut pool = GlobalCandidatePool::new(0, true);
+                for entries in &leaves {
+                    push_scored(&mut pool, entries, &location, &scored).unwrap();
+                }
+                peak_accounted = peak_accounted.max(pool.heap_bytes().unwrap());
+                pool.validate_membership(&|| Ok(())).await.unwrap();
+                assert!(pool.candidates.is_empty());
+            }
+            eprintln!(
+                "membership ids=32768 id_len={id_len} us_per_scan={:.3} accounted_bytes={peak_accounted}",
+                started.elapsed().as_secs_f64() * 1e6 / 64.0
+            );
         }
     }
 }

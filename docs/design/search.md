@@ -234,12 +234,16 @@ source array when its last candidate leaves the heap.
 The pool scores eligible entries individually and admits them directly,
 without per-leaf candidate or screened-ID buffers. Every eligible Record ID is
 registered once in a separate compact list, including screened, rejected, and
-evicted entries. Only admitted heap candidates require an additional ID reference.
+evicted entries. IDs of at most 16 bytes are copied inline in that list, avoiding
+shared cache reference-count traffic. Longer IDs retain their existing shared
+allocation rather than copying the payload. Identity equality and hashing use
+all ID bytes regardless of the storage form.
 After traversal, one borrowed-ID set is reserved from the actual list length to
 validate duplicate membership before exact reads. Both the list and set are
 released immediately after successful validation. Thus candidate count and projection ownership are bounded by the rerank
 budget, while corruption-detection identity storage grows with the number of
-predicate-eligible entries visited. Both retained IDs and transient duplicate-table space are charged to routing working memory;
+predicate-eligible entries visited. List capacity (including inline ID bytes),
+shared ID payloads, and transient duplicate-table space are charged to routing working memory;
 shared source arrays are charged once, including on cache misses or eviction.
 
 ### 6.4 Intermediate topology

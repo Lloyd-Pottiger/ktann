@@ -1,0 +1,986 @@
+{
+  "baseline_revision": "fb4bdd872589c2093430e5a27556931939849067",
+  "disposition": "All three performance candidates reverted: no demonstrated end-to-end improvement.",
+  "args": [
+    "run",
+    "--backend",
+    "rocksdb",
+    "--profile",
+    "smoke",
+    "--scenario",
+    "quality-routing-smoke",
+    "--base-vectors",
+    "32768",
+    "--query-vectors",
+    "64",
+    "--min-leaf-partition-entries",
+    "4",
+    "--max-leaf-partition-entries",
+    "16",
+    "--min-internal-partition-entries",
+    "128",
+    "--max-internal-partition-entries",
+    "8192",
+    "--leaf-beam-size",
+    "128",
+    "--refinement-rounds",
+    "0",
+    "--partition-cache-bytes",
+    "67108864",
+    "--warmup-operations",
+    "1000",
+    "--measured-operations",
+    "20000",
+    "--query-concurrency",
+    "8",
+    "--worker-threads",
+    "4",
+    "--routing-experiment",
+    "{\"mode\": \"partition-local-hnsw\", \"m\": 12, \"ef_construction\": 100, \"ef_search\": 200, \"graph_seed\": 7}",
+    "--rocksdb-path",
+    "/home/ubuntu/workspace/.benchmark-data/leaf-selection/fixture"
+  ],
+  "experiments": {
+    "yield": {
+      "patch": "--- a/src/search/traverse.rs\n+++ b/src/search/traverse.rs\n@@ -442,10 +442,12 @@\n             }\n         }\n         let mut values = txn.batch_get(keys).await?.into_iter();\n-        for entries in entries.chunks(BODY_PREFETCH_BATCH) {\n+        for (batch_index, entries) in entries.chunks(BODY_PREFETCH_BATCH).enumerate() {\n             // Small cached bodies may each finish without yielding internally.\n             // Keep a wide funded beam cooperative between prefetch groups too.\n-            super::cooperate(&|| context.execution.checkpoint()).await?;\n+            if batch_index % 4 == 0 {\n+                super::cooperate(&|| context.execution.checkpoint()).await?;\n+            }\n             let mut visits = Vec::with_capacity(entries.len());\n             for &entry in entries {\n                 let header = expect_header(values.next().flatten())?\n",
+      "runs": [
+        {
+          "label": "baseline-1",
+          "qps": 2921.2107840358517,
+          "cpu_seconds": 33.058864,
+          "latency_ms": {
+            "count": 20000,
+            "mean": 2.6487163272000043,
+            "min": 1.240988,
+            "p50": 2.553325,
+            "p95": 3.658592,
+            "p99": 4.478542,
+            "max": 9.541378
+          },
+          "stages_ms": {
+            "approximate_selection": {
+              "count": 20000,
+              "mean": 1.8134413200500037,
+              "min": 0.8467830000000001,
+              "p50": 1.737703,
+              "p95": 2.593712,
+              "p99": 3.273779,
+              "max": 8.508230000000001
+            },
+            "exact_reranking": {
+              "count": 20000,
+              "mean": 0.6206681385500014,
+              "min": 0.246477,
+              "p50": 0.562643,
+              "p95": 1.025804,
+              "p99": 1.441071,
+              "max": 3.335621
+            }
+          },
+          "recall": {
+            "queries": 20000,
+            "mean": 0.981259999999998,
+            "min": 0.8
+          },
+          "physical_read_bytes": 0,
+          "peak_rss_bytes": null,
+          "work_sha256": "644b7252a3a9a65fbe144e008f57437e746b284b22cf81bc065dce5776cc2b60"
+        },
+        {
+          "label": "candidate-1",
+          "qps": 2851.980707688662,
+          "cpu_seconds": 32.998591000000005,
+          "latency_ms": {
+            "count": 20000,
+            "mean": 2.703167974099999,
+            "min": 1.257491,
+            "p50": 2.564215,
+            "p95": 3.959395,
+            "p99": 4.954923,
+            "max": 13.630559
+          },
+          "stages_ms": {
+            "approximate_selection": {
+              "count": 20000,
+              "mean": 1.8141443653999925,
+              "min": 0.779333,
+              "p50": 1.706002,
+              "p95": 2.754755,
+              "p99": 3.621126,
+              "max": 12.230972
+            },
+            "exact_reranking": {
+              "count": 20000,
+              "mean": 0.65840558235,
+              "min": 0.238676,
+              "p50": 0.5907100000000001,
+              "p95": 1.1278480000000002,
+              "p99": 1.642155,
+              "max": 6.471997
+            }
+          },
+          "recall": {
+            "queries": 20000,
+            "mean": 0.981259999999998,
+            "min": 0.8
+          },
+          "physical_read_bytes": 0,
+          "peak_rss_bytes": null,
+          "work_sha256": "644b7252a3a9a65fbe144e008f57437e746b284b22cf81bc065dce5776cc2b60"
+        },
+        {
+          "label": "candidate-2",
+          "qps": 2973.5670391477715,
+          "cpu_seconds": 32.430005,
+          "latency_ms": {
+            "count": 20000,
+            "mean": 2.594452829600002,
+            "min": 1.272849,
+            "p50": 2.485948,
+            "p95": 3.654071,
+            "p99": 4.624757,
+            "max": 7.069960999999999
+          },
+          "stages_ms": {
+            "approximate_selection": {
+              "count": 20000,
+              "mean": 1.7353181452000073,
+              "min": 0.787513,
+              "p50": 1.645755,
+              "p95": 2.544908,
+              "p99": 3.312426,
+              "max": 6.195678
+            },
+            "exact_reranking": {
+              "count": 20000,
+              "mean": 0.6354726863499978,
+              "min": 0.2448,
+              "p50": 0.574275,
+              "p95": 1.062099,
+              "p99": 1.503894,
+              "max": 3.874611
+            }
+          },
+          "recall": {
+            "queries": 20000,
+            "mean": 0.981259999999998,
+            "min": 0.8
+          },
+          "physical_read_bytes": 0,
+          "peak_rss_bytes": null,
+          "work_sha256": "644b7252a3a9a65fbe144e008f57437e746b284b22cf81bc065dce5776cc2b60"
+        },
+        {
+          "label": "baseline-2",
+          "qps": 2843.7255194911627,
+          "cpu_seconds": 33.280145,
+          "latency_ms": {
+            "count": 20000,
+            "mean": 2.7194819796000083,
+            "min": 1.2736340000000002,
+            "p50": 2.587052,
+            "p95": 3.956785,
+            "p99": 5.030961,
+            "max": 8.076856000000001
+          },
+          "stages_ms": {
+            "approximate_selection": {
+              "count": 20000,
+              "mean": 1.8623052637999975,
+              "min": 0.867626,
+              "p50": 1.758623,
+              "p95": 2.767785,
+              "p99": 3.752055,
+              "max": 6.901816
+            },
+            "exact_reranking": {
+              "count": 20000,
+              "mean": 0.6374650273499988,
+              "min": 0.246849,
+              "p50": 0.568365,
+              "p95": 1.092033,
+              "p99": 1.656814,
+              "max": 3.79206
+            }
+          },
+          "recall": {
+            "queries": 20000,
+            "mean": 0.981259999999998,
+            "min": 0.8
+          },
+          "physical_read_bytes": 0,
+          "peak_rss_bytes": null,
+          "work_sha256": "644b7252a3a9a65fbe144e008f57437e746b284b22cf81bc065dce5776cc2b60"
+        }
+      ],
+      "medians": {
+        "baseline": {
+          "qps": 2882.468151763507,
+          "cpu_seconds": 33.1695045,
+          "p95_ms": 3.8076885000000003,
+          "approximate_ms": 1.8378732919250007
+        },
+        "candidate": {
+          "qps": 2912.7738734182167,
+          "cpu_seconds": 32.714298,
+          "p95_ms": 3.8067330000000004,
+          "approximate_ms": 1.7747312552999999
+        },
+        "qps_change_percent": 1.0513809714139732
+      }
+    },
+    "ids": {
+      "patch": "--- a/src/search/candidates.rs\n+++ b/src/search/candidates.rs\n@@ -109,10 +109,10 @@\n     capacity: usize,\n     account_memory: bool,\n     candidates: Vec<LeafCandidate>,\n-    ids: Vec<Bytes>,\n+    ids: Vec<usize>,\n     retained_bytes: usize,\n     truncated: bool,\n-    id_bytes: usize,\n+    id_bytes: Vec<u8>,\n }\n \n /// The worst candidate is the heap root; ties follow unsigned Record ID order.\n@@ -131,7 +131,7 @@\n             ids: Vec::new(),\n             retained_bytes: 0,\n             truncated: false,\n-            id_bytes: 0,\n+            id_bytes: Vec::new(),\n         }\n     }\n \n@@ -194,11 +194,11 @@\n         distance: Option<ApproximateDistance>,\n     ) -> Result<()> {\n         let id = entries[entry].record_id();\n-        self.id_bytes = self\n-            .id_bytes\n-            .checked_add(id.len())\n-            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;\n-        self.ids.push(id.clone());\n+        self.id_bytes\n+            .try_reserve(id.len())\n+            .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;\n+        self.id_bytes.extend_from_slice(id);\n+        self.ids.push(self.id_bytes.len());\n         let Some(distance) = distance else {\n             self.truncated = true;\n             return Ok(());\n@@ -305,17 +305,19 @@\n         let mut seen = HashSet::new();\n         seen.try_reserve(self.ids.len())\n             .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;\n-        for (ordinal, id) in self.ids.iter().enumerate() {\n+        let mut start = 0;\n+        for (ordinal, &end) in self.ids.iter().enumerate() {\n             if ordinal > 0 && ordinal % 256 == 0 {\n                 super::cooperate(check).await?;\n             }\n-            if !seen.insert(id) {\n+            if !seen.insert(&self.id_bytes[start..end]) {\n                 return Err(Error::new(ErrorKind::Corruption));\n             }\n+            start = end;\n         }\n         drop(seen);\n         self.ids = Vec::new();\n-        self.id_bytes = 0;\n+        self.id_bytes = Vec::new();\n         Ok(())\n     }\n \n@@ -330,7 +332,7 @@\n                 .len()\n                 .checked_mul(2)\n                 .and_then(usize::checked_next_power_of_two)\n-                .and_then(|slots| slots.checked_mul(size_of::<&Bytes>() + 1))\n+                .and_then(|slots| slots.checked_mul(size_of::<&[u8]>() + 1))\n                 .and_then(|bytes| bytes.checked_add(64))\n         };\n         self.candidates\n@@ -338,9 +340,9 @@\n             .checked_mul(size_of::<LeafCandidate>())\n             .and_then(|bytes| bytes.checked_add(self.retained_bytes))\n             .and_then(|bytes| {\n-                bytes.checked_add(self.ids.capacity().checked_mul(size_of::<Bytes>())?)\n+                bytes.checked_add(self.ids.capacity().checked_mul(size_of::<usize>())?)\n             })\n-            .and_then(|bytes| bytes.checked_add(self.id_bytes))\n+            .and_then(|bytes| bytes.checked_add(self.id_bytes.capacity()))\n             .and_then(|bytes| bytes.checked_add(table_bytes?))\n             .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))\n     }\n",
+      "runs": [
+        {
+          "label": "baseline-ids-1",
+          "qps": 2889.0713069377603,
+          "cpu_seconds": 33.062874,
+          "latency_ms": {
+            "count": 20000,
+            "mean": 2.673342202649994,
+            "min": 1.387155,
+            "p50": 2.557133,
+            "p95": 3.782469,
+            "p99": 4.734068,
+            "max": 11.777975
+          },
+          "stages_ms": {
+            "approximate_selection": {
+              "count": 20000,
+              "mean": 1.8357273070999949,
+              "min": 0.8931199999999999,
+              "p50": 1.742999,
+              "p95": 2.681142,
+              "p99": 3.5237160000000003,
+              "max": 8.832146000000002
+            },
+            "exact_reranking": {
+              "count": 20000,
+              "mean": 0.624105268700003,
+              "min": 0.245147,
+              "p50": 0.562001,
+              "p95": 1.029592,
+              "p99": 1.500424,
+              "max": 9.209501
+            }
+          },
+          "recall": {
+            "queries": 20000,
+            "mean": 0.981259999999998,
+            "min": 0.8
+          },
+          "physical_read_bytes": 0,
+          "peak_rss_bytes": null,
+          "work_sha256": "644b7252a3a9a65fbe144e008f57437e746b284b22cf81bc065dce5776cc2b60"
+        },
+        {
+          "label": "candidate-ids-1",
+          "qps": 2823.287386283895,
+          "cpu_seconds": 32.882768,
+          "latency_ms": {
+            "count": 20000,
+            "mean": 2.7392266532500167,
+            "min": 1.270918,
+            "p50": 2.597732,
+            "p95": 4.012623,
+            "p99": 5.192925,
+            "max": 9.677889
+          },
+          "stages_ms": {
+            "approximate_selection": {
+              "count": 20000,
+              "mean": 1.8719116833999976,
+              "min": 0.80492,
+              "p50": 1.757861,
+              "p95": 2.850579,
+              "p99": 3.858025,
+              "max": 7.780656
+            },
+            "exact_reranking": {
+              "count": 20000,
+              "mean": 0.6455928097000012,
+              "min": 0.24552899999999997,
+              "p50": 0.575698,
+              "p95": 1.099762,
+              "p99": 1.635281,
+              "max": 5.888271
+            }
+          },
+          "recall": {
+            "queries": 20000,
+            "mean": 0.981259999999998,
+            "min": 0.8
+          },
+          "physical_read_bytes": 0,
+          "peak_rss_bytes": null,
+          "work_sha256": "644b7252a3a9a65fbe144e008f57437e746b284b22cf81bc065dce5776cc2b60"
+        },
+        {
+          "label": "candidate-ids-2",
+          "qps": 2870.890365837258,
+          "cpu_seconds": 32.672603,
+          "latency_ms": {
+            "count": 20000,
+            "mean": 2.694807891899996,
+            "min": 1.240403,
+            "p50": 2.576729,
+            "p95": 3.841926,
+            "p99": 4.808304000000001,
+            "max": 8.810656
+          },
+          "stages_ms": {
+            "approximate_selection": {
+              "count": 20000,
+              "mean": 1.8410624515999992,
+              "min": 0.7742979999999999,
+              "p50": 1.744742,
+              "p95": 2.743105,
+              "p99": 3.54611,
+              "max": 7.746544999999999
+            },
+            "exact_reranking": {
+              "count": 20000,
+              "mean": 0.636130216700003,
+              "min": 0.238815,
+              "p50": 0.5740959999999999,
+              "p95": 1.054787,
+              "p99": 1.552306,
+              "max": 4.577915999999999
+            }
+          },
+          "recall": {
+            "queries": 20000,
+            "mean": 0.981259999999998,
+            "min": 0.8
+          },
+          "physical_read_bytes": 0,
+          "peak_rss_bytes": null,
+          "work_sha256": "644b7252a3a9a65fbe144e008f57437e746b284b22cf81bc065dce5776cc2b60"
+        },
+        {
+          "label": "baseline-ids-2",
+          "qps": 2871.654482468344,
+          "cpu_seconds": 32.793867000000006,
+          "latency_ms": {
+            "count": 20000,
+            "mean": 2.6936535406499735,
+            "min": 1.390711,
+            "p50": 2.586377,
+            "p95": 3.775416,
+            "p99": 4.736644,
+            "max": 9.749445
+          },
+          "stages_ms": {
+            "approximate_selection": {
+              "count": 20000,
+              "mean": 1.8586824610000097,
+              "min": 0.84316,
+              "p50": 1.7734249999999998,
+              "p95": 2.7199020000000003,
+              "p99": 3.508687,
+              "max": 8.74519
+            },
+            "exact_reranking": {
+              "count": 20000,
+              "mean": 0.6231927279499999,
+              "min": 0.280818,
+              "p50": 0.55893,
+              "p95": 1.044868,
+              "p99": 1.494976,
+              "max": 6.882241
+            }
+          },
+          "recall": {
+            "queries": 20000,
+            "mean": 0.981259999999998,
+            "min": 0.8
+          },
+          "physical_read_bytes": 0,
+          "peak_rss_bytes": null,
+          "work_sha256": "644b7252a3a9a65fbe144e008f57437e746b284b22cf81bc065dce5776cc2b60"
+        },
+        {
+          "label": "baseline-ids-3",
+          "qps": 2869.6052469122665,
+          "cpu_seconds": 32.71979999999999,
+          "latency_ms": {
+            "count": 20000,
+            "mean": 2.699216032849996,
+            "min": 1.463586,
+            "p50": 2.586806,
+            "p95": 3.831474,
+            "p99": 4.8108889999999995,
+            "max": 10.466315
+          },
+          "stages_ms": {
+            "approximate_selection": {
+              "count": 20000,
+              "mean": 1.8556777555500037,
+              "min": 0.826186,
+              "p50": 1.764306,
+              "p95": 2.766766,
+              "p99": 3.581887,
+              "max": 7.851293
+            },
+            "exact_reranking": {
+              "count": 20000,
+              "mean": 0.6295113709999997,
+              "min": 0.252598,
+              "p50": 0.563552,
+              "p95": 1.06985,
+              "p99": 1.542209,
+              "max": 7.281038
+            }
+          },
+          "recall": {
+            "queries": 20000,
+            "mean": 0.981259999999998,
+            "min": 0.8
+          },
+          "physical_read_bytes": 0,
+          "peak_rss_bytes": null,
+          "work_sha256": "644b7252a3a9a65fbe144e008f57437e746b284b22cf81bc065dce5776cc2b60"
+        },
+        {
+          "label": "candidate-ids-3",
+          "qps": 2846.176489118895,
+          "cpu_seconds": 32.40516,
+          "latency_ms": {
+            "count": 20000,
+            "mean": 2.7186360925500126,
+            "min": 1.085372,
+            "p50": 2.596397,
+            "p95": 3.913648,
+            "p99": 4.9716700000000005,
+            "max": 8.700833999999999
+          },
+          "stages_ms": {
+            "approximate_selection": {
+              "count": 20000,
+              "mean": 1.8579966880500027,
+              "min": 0.6850339999999999,
+              "p50": 1.7582909999999998,
+              "p95": 2.8029610000000003,
+              "p99": 3.649737,
+              "max": 6.261096
+            },
+            "exact_reranking": {
+              "count": 20000,
+              "mean": 0.6373417124499969,
+              "min": 0.260569,
+              "p50": 0.570906,
+              "p95": 1.079508,
+              "p99": 1.584542,
+              "max": 5.344164
+            }
+          },
+          "recall": {
+            "queries": 20000,
+            "mean": 0.981259999999998,
+            "min": 0.8
+          },
+          "physical_read_bytes": 0,
+          "peak_rss_bytes": null,
+          "work_sha256": "644b7252a3a9a65fbe144e008f57437e746b284b22cf81bc065dce5776cc2b60"
+        }
+      ],
+      "medians": {
+        "baseline": {
+          "qps": 2871.654482468344,
+          "cpu_seconds": 32.793867000000006,
+          "p95_ms": 3.782469,
+          "approximate_ms": 1.8556777555500037
+        },
+        "candidate": {
+          "qps": 2846.176489118895,
+          "cpu_seconds": 32.672603,
+          "p95_ms": 3.913648,
+          "approximate_ms": 1.8579966880500027
+        },
+        "qps_change_percent": -0.8872234979867555
+      }
+    },
+    "buffers": {
+      "patch": "diff --git a/src/search/cache.rs b/src/search/cache.rs\nindex 35f0ef4..4d55a7c 100644\n--- a/src/search/cache.rs\n+++ b/src/search/cache.rs\n@@ -582,6 +582,7 @@ impl CacheInner {\n pub(super) const BODY_PREFETCH_BATCH: usize = 4;\n \n /// The snapshot authority for a body read.\n+#[derive(Clone, Copy)]\n pub(crate) struct BodyRequest<'a> {\n     pub(crate) tree_key: &'a TreeKey,\n     pub(crate) partition: PartitionKey,\n@@ -750,15 +751,14 @@ impl BodyScan {\n /// Prefetches only first pages of cache misses in an already-funded batch.\n /// Callers pass at most BODY_PREFETCH_BATCH requests, after Synopsis pruning.\n /// Cached bodies are shared; a miss retains one page until its ordered visit.\n-pub(super) async fn prefetch_bodies<T: ReadOps>(\n+pub(super) async fn prefetch_bodies<'a, T: ReadOps>(\n     txn: &mut ReadLogicalTxn<'_, T>,\n     cache: &PartitionCache,\n     manifest: &IndexManifest,\n-    requests: &[BodyRequest<'_>],\n+    requests: impl Iterator<Item = BodyRequest<'a>>,\n ) -> Result<Vec<BodyRead>> {\n     let mut reads = requests\n-        .iter()\n-        .map(|request| BodyRead::start(cache, manifest, request))\n+        .map(|request| BodyRead::start(cache, manifest, &request))\n         .collect::<Result<Vec<_>>>()?;\n     let legs: Vec<_> = reads\n         .iter()\n@@ -1298,7 +1298,7 @@ mod tests {\n             })\n             .collect();\n         let mut txn = ReadLogicalTxn::for_index(mock_txn(data), &manifest);\n-        let reads = super::prefetch_bodies(&mut txn, &cache, &manifest, &requests)\n+        let reads = super::prefetch_bodies(&mut txn, &cache, &manifest, requests.iter().copied())\n             .await\n             .expect(\"prefetch\");\n         assert_eq!(cache.len(), 1, \"incomplete reads must not be installed\");\n@@ -1323,7 +1323,7 @@ mod tests {\n             \"all pages contribute IDs and expanded components exactly once\"\n         );\n         assert_eq!(leaf_ids(&bodies[2]), vec![Bytes::from_static(b\"last\")]);\n-        let reads = super::prefetch_bodies(&mut txn, &cache, &manifest, &requests)\n+        let reads = super::prefetch_bodies(&mut txn, &cache, &manifest, requests.iter().copied())\n             .await\n             .expect(\"warm reads\");\n         assert!(\n@@ -1367,7 +1367,7 @@ mod tests {\n             })\n             .collect();\n         let mut txn = ReadLogicalTxn::for_index(mock_txn(data), &manifest);\n-        let reads = super::prefetch_bodies(&mut txn, &cache, &manifest, &requests)\n+        let reads = super::prefetch_bodies(&mut txn, &cache, &manifest, requests.iter().copied())\n             .await\n             .expect(\"first pages are valid\");\n         let first = reads.into_iter().next().expect(\"first body\");\ndiff --git a/src/search/traverse.rs b/src/search/traverse.rs\nindex 68d2665..04de7f3 100644\n--- a/src/search/traverse.rs\n+++ b/src/search/traverse.rs\n@@ -442,11 +442,11 @@ impl Traversal {\n             }\n         }\n         let mut values = txn.batch_get(keys).await?.into_iter();\n+        let mut visits = Vec::with_capacity(BODY_PREFETCH_BATCH);\n         for entries in entries.chunks(BODY_PREFETCH_BATCH) {\n             // Small cached bodies may each finish without yielding internally.\n             // Keep a wide funded beam cooperative between prefetch groups too.\n             super::cooperate(&|| context.execution.checkpoint()).await?;\n-            let mut visits = Vec::with_capacity(entries.len());\n             for &entry in entries {\n                 let header = expect_header(values.next().flatten())?\n                     .ok_or_else(|| Error::new(ErrorKind::Corruption))?;\n@@ -466,16 +466,15 @@ impl Traversal {\n                     visits.push(visit);\n                 }\n             }\n-            let requests: Vec<_> = visits\n+            let requests = visits\n                 .iter()\n                 .map(|visit| BodyRequest {\n                     tree_key: context.request.trees[visit.entry.tree as usize].tree_key(),\n                     partition: visit.entry.partition,\n                     header: &visit.header,\n-                })\n-                .collect();\n-            let reads = prefetch_bodies(txn, context.cache, context.manifest, &requests).await?;\n-            for (visit, read) in visits.into_iter().zip(reads) {\n+                });\n+            let reads = prefetch_bodies(txn, context.cache, context.manifest, requests).await?;\n+            for (visit, read) in visits.drain(..).zip(reads) {\n                 let body = read\n                     .finish(txn, context.cache, context.manifest, &|| {\n                         context.execution.checkpoint()\n",
+      "runs": [
+        {
+          "label": "baseline-buffers-1",
+          "qps": 2891.9215264004974,
+          "cpu_seconds": 33.214143,
+          "latency_ms": {
+            "count": 20000,
+            "mean": 2.670532319000015,
+            "min": 1.287268,
+            "p50": 2.559339,
+            "p95": 3.746805,
+            "p99": 4.754553,
+            "max": 8.268083
+          },
+          "stages_ms": {
+            "approximate_selection": {
+              "count": 20000,
+              "mean": 1.8355899664000024,
+              "min": 0.835486,
+              "p50": 1.748369,
+              "p95": 2.678632,
+              "p99": 3.50688,
+              "max": 7.394706
+            },
+            "exact_reranking": {
+              "count": 20000,
+              "mean": 0.6210490531500015,
+              "min": 0.261699,
+              "p50": 0.562379,
+              "p95": 1.015085,
+              "p99": 1.457267,
+              "max": 5.164446
+            }
+          },
+          "recall": {
+            "queries": 20000,
+            "mean": 0.981259999999998,
+            "min": 0.8
+          },
+          "physical_read_bytes": 0,
+          "peak_rss_bytes": null,
+          "work_sha256": "644b7252a3a9a65fbe144e008f57437e746b284b22cf81bc065dce5776cc2b60"
+        },
+        {
+          "label": "candidate-buffers-1",
+          "qps": 2803.7246682034065,
+          "cpu_seconds": 33.274598000000005,
+          "latency_ms": {
+            "count": 20000,
+            "mean": 2.756929340999999,
+            "min": 1.375743,
+            "p50": 2.614417,
+            "p95": 4.028804,
+            "p99": 5.1921930000000005,
+            "max": 11.112655
+          },
+          "stages_ms": {
+            "approximate_selection": {
+              "count": 20000,
+              "mean": 1.8894263349999911,
+              "min": 0.814582,
+              "p50": 1.778319,
+              "p95": 2.864813,
+              "p99": 3.800206,
+              "max": 9.221622
+            },
+            "exact_reranking": {
+              "count": 20000,
+              "mean": 0.6431754383999997,
+              "min": 0.244891,
+              "p50": 0.5742670000000001,
+              "p95": 1.101869,
+              "p99": 1.578414,
+              "max": 3.263839
+            }
+          },
+          "recall": {
+            "queries": 20000,
+            "mean": 0.981259999999998,
+            "min": 0.8
+          },
+          "physical_read_bytes": 0,
+          "peak_rss_bytes": null,
+          "work_sha256": "644b7252a3a9a65fbe144e008f57437e746b284b22cf81bc065dce5776cc2b60"
+        },
+        {
+          "label": "candidate-buffers-2",
+          "qps": 2897.9436407242633,
+          "cpu_seconds": 32.943964,
+          "latency_ms": {
+            "count": 20000,
+            "mean": 2.6691429561499955,
+            "min": 1.390342,
+            "p50": 2.565533,
+            "p95": 3.735854,
+            "p99": 4.674975,
+            "max": 8.964376
+          },
+          "stages_ms": {
+            "approximate_selection": {
+              "count": 20000,
+              "mean": 1.832990149700002,
+              "min": 0.800899,
+              "p50": 1.746846,
+              "p95": 2.676824,
+              "p99": 3.463593,
+              "max": 7.938689
+            },
+            "exact_reranking": {
+              "count": 20000,
+              "mean": 0.620526211550001,
+              "min": 0.24869699999999997,
+              "p50": 0.563506,
+              "p95": 1.019638,
+              "p99": 1.420913,
+              "max": 3.707374
+            }
+          },
+          "recall": {
+            "queries": 20000,
+            "mean": 0.981259999999998,
+            "min": 0.8
+          },
+          "physical_read_bytes": 0,
+          "peak_rss_bytes": null,
+          "work_sha256": "644b7252a3a9a65fbe144e008f57437e746b284b22cf81bc065dce5776cc2b60"
+        },
+        {
+          "label": "baseline-buffers-2",
+          "qps": 2862.214821201273,
+          "cpu_seconds": 32.805603,
+          "latency_ms": {
+            "count": 20000,
+            "mean": 2.6983004792999936,
+            "min": 1.235656,
+            "p50": 2.589697,
+            "p95": 3.79187,
+            "p99": 4.767081999999999,
+            "max": 9.104308
+          },
+          "stages_ms": {
+            "approximate_selection": {
+              "count": 20000,
+              "mean": 1.8597849024499973,
+              "min": 0.8074589999999999,
+              "p50": 1.7699090000000002,
+              "p95": 2.733569,
+              "p99": 3.554044,
+              "max": 8.430441
+            },
+            "exact_reranking": {
+              "count": 20000,
+              "mean": 0.6243999200000006,
+              "min": 0.230006,
+              "p50": 0.5619190000000001,
+              "p95": 1.0462749999999998,
+              "p99": 1.4695509999999998,
+              "max": 3.918445
+            }
+          },
+          "recall": {
+            "queries": 20000,
+            "mean": 0.981259999999998,
+            "min": 0.8
+          },
+          "physical_read_bytes": 0,
+          "peak_rss_bytes": null,
+          "work_sha256": "644b7252a3a9a65fbe144e008f57437e746b284b22cf81bc065dce5776cc2b60"
+        },
+        {
+          "label": "baseline-buffers-3",
+          "qps": 2920.7724358493188,
+          "cpu_seconds": 32.730788000000004,
+          "latency_ms": {
+            "count": 20000,
+            "mean": 2.647424801949997,
+            "min": 1.368634,
+            "p50": 2.560555,
+            "p95": 3.614671,
+            "p99": 4.429179,
+            "max": 9.016087
+          },
+          "stages_ms": {
+            "approximate_selection": {
+              "count": 20000,
+              "mean": 1.8256038268000017,
+              "min": 0.883906,
+              "p50": 1.748896,
+              "p95": 2.631243,
+              "p99": 3.292883,
+              "max": 5.575931
+            },
+            "exact_reranking": {
+              "count": 20000,
+              "mean": 0.615109236450001,
+              "min": 0.258335,
+              "p50": 0.5583170000000001,
+              "p95": 1.012028,
+              "p99": 1.3551030000000002,
+              "max": 5.933692
+            }
+          },
+          "recall": {
+            "queries": 20000,
+            "mean": 0.981259999999998,
+            "min": 0.8
+          },
+          "physical_read_bytes": 0,
+          "peak_rss_bytes": null,
+          "work_sha256": "644b7252a3a9a65fbe144e008f57437e746b284b22cf81bc065dce5776cc2b60"
+        },
+        {
+          "label": "candidate-buffers-3",
+          "qps": 2915.099194812479,
+          "cpu_seconds": 32.718275,
+          "latency_ms": {
+            "count": 20000,
+            "mean": 2.6573231876999945,
+            "min": 1.329823,
+            "p50": 2.558548,
+            "p95": 3.687251,
+            "p99": 4.686449,
+            "max": 9.856611
+          },
+          "stages_ms": {
+            "approximate_selection": {
+              "count": 20000,
+              "mean": 1.8253035197500012,
+              "min": 0.8664360000000001,
+              "p50": 1.740271,
+              "p95": 2.6355850000000003,
+              "p99": 3.429512,
+              "max": 8.459357
+            },
+            "exact_reranking": {
+              "count": 20000,
+              "mean": 0.6153719845500004,
+              "min": 0.242428,
+              "p50": 0.5553659999999999,
+              "p95": 1.007973,
+              "p99": 1.443667,
+              "max": 5.311635
+            }
+          },
+          "recall": {
+            "queries": 20000,
+            "mean": 0.981259999999998,
+            "min": 0.8
+          },
+          "physical_read_bytes": 0,
+          "peak_rss_bytes": null,
+          "work_sha256": "644b7252a3a9a65fbe144e008f57437e746b284b22cf81bc065dce5776cc2b60"
+        }
+      ],
+      "medians": {
+        "baseline": {
+          "qps": 2891.9215264004974,
+          "cpu_seconds": 32.805603,
+          "p95_ms": 3.746805,
+          "approximate_ms": 1.8355899664000024
+        },
+        "candidate": {
+          "qps": 2897.9436407242633,
+          "cpu_seconds": 32.943964,
+          "p95_ms": 3.735854,
+          "approximate_ms": 1.832990149700002
+        },
+        "qps_change_percent": 0.20823920250911954
+      }
+    }
+  },
+  "fingerprint_note": "Sorted recall multiset (completion order varies), budgets, visited entries, cache operations, backend IO and routing work; does not hash exact result IDs.",
+  "environment": {
+    "operating_system": "Linux boxlite 6.12.76 #1 SMP PREEMPT_DYNAMIC Tue Mar 10 13:28:56 CET 2026 x86_64 x86_64 x86_64 GNU/Linux",
+    "cpu_model": "Intel(R) Xeon(R) Processor",
+    "logical_cpus": 8,
+    "memory_bytes": 16795430912,
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13) | binary: rustc | commit-hash: 58cf8f9c35b355199727627d07ae34a4e2846d67 | commit-date: 2026-10-13 | host: x86_64-unknown-linux-gnu | release: 1.99.1 | LLVM version: 23.1.1",
+    "build_profile": "release",
+    "build_features": "rocksdb",
+    "rustflags": "",
+    "backend_runtime": "rust-rocksdb=0.24.0; rocksdb=10.4.2; block-cache-bytes=8388608",
+    "tokio_worker_threads": 4
+  },
+  "configuration": {
+    "routing_experiment": {
+      "mode": "partition-local-hnsw",
+      "m": 12,
+      "ef_construction": 100,
+      "graph_seed": 7,
+      "ef_search": 200,
+      "routing_working_bytes": 268435456,
+      "sample_items": 1024,
+      "build_memory_bytes": 1073741824,
+      "build_scratch_bytes": 68719476736
+    },
+    "query_offset": 0,
+    "backend": "rocksdb",
+    "scenario": "quality-routing-smoke",
+    "profile": "smoke",
+    "seed": 3670017,
+    "dimension": 16,
+    "metric": "l2",
+    "index_field_count": 0,
+    "tree_key_field_count": 0,
+    "search_percent": 100,
+    "hot_updates": false,
+    "min_leaf_partition_entries": 4,
+    "max_leaf_partition_entries": 16,
+    "min_internal_partition_entries": 128,
+    "max_internal_partition_entries": 8192,
+    "partition_cache_bytes": 67108864,
+    "foreground_limit": 8,
+    "maintenance_workers": 0,
+    "convergence_maintenance_workers": null,
+    "fixup_queue_capacity": 1024,
+    "mutation_attempt_limit": 32,
+    "maintenance_attempt_limit": 32,
+    "search_budgets": {
+      "scanned_tree_keys": {
+        "runtime_default": 4096,
+        "request_override": null,
+        "effective_limit": 4096
+      },
+      "visited_partitions": {
+        "runtime_default": 1024,
+        "request_override": null,
+        "effective_limit": 1024
+      },
+      "exact_rerank_candidates": {
+        "runtime_default": 65536,
+        "request_override": null,
+        "effective_limit": 64
+      }
+    },
+    "write_beam_size": 8,
+    "refinement_rounds": 0,
+    "refinement_neighbor_centroids": 32,
+    "refinement_input_limit_bytes": 1073741824,
+    "leaf_beam_size_override": null,
+    "leaf_beam_sweep": [
+      128
+    ],
+    "blocking_resource_limit": 8,
+    "backend_max_mutations": 10000,
+    "backend_max_mutation_bytes": 9000000,
+    "backend_mutation_key_overhead_bytes": 30,
+    "concurrency": 2,
+    "query_concurrency_sweep": [
+      8
+    ],
+    "dispatch": "continuous",
+    "warmup_operations": 1000,
+    "measured_operations": 20000,
+    "k": 10,
+    "import_batch_size": null
+  },
+  "dataset": {
+    "name": "clustered",
+    "base_vectors": 32768,
+    "query_vectors": 64,
+    "dimension": 16,
+    "checksum_xxh3_128": "1f21d2ab88d939e68d085bac356fd765",
+    "source": null
+  },
+  "topology": {
+    "vector_records": 32768,
+    "partitions": 3216,
+    "entries": 35983,
+    "trees": 1,
+    "max_level": 2,
+    "partitions_by_level": {
+      "1": 3215,
+      "2": 1
+    },
+    "entries_by_level": {
+      "1": 32768,
+      "2": 3215
+    },
+    "max_entries_by_level": {
+      "1": 16,
+      "2": 3215
+    },
+    "partition_states": {
+      "ready": 3216,
+      "splitting": 0,
+      "receiving_split": 0,
+      "draining_split": 0,
+      "merging": 0
+    },
+    "actionable_partitions": 0
+  },
+  "work": {
+    "search_budgets": {
+      "exact_rerank_candidates": {
+        "usage": {
+          "count": 20000,
+          "mean": 64.0,
+          "min": 64.0,
+          "p50": 64.0,
+          "p95": 64.0,
+          "p99": 64.0,
+          "max": 64.0
+        },
+        "exhausted_searches": 20000
+      },
+      "scanned_tree_keys": {
+        "usage": {
+          "count": 20000,
+          "mean": 1.0,
+          "min": 1.0,
+          "p50": 1.0,
+          "p95": 1.0,
+          "p99": 1.0,
+          "max": 1.0
+        },
+        "exhausted_searches": 0
+      },
+      "visited_partitions": {
+        "usage": {
+          "count": 20000,
+          "mean": 129.0,
+          "min": 129.0,
+          "p50": 129.0,
+          "p95": 129.0,
+          "p99": 129.0,
+          "max": 129.0
+        },
+        "exhausted_searches": 0
+      }
+    },
+    "visited_leaf_entries": {
+      "count": 20000,
+      "mean": 1384.95565,
+      "min": 1323.0,
+      "p50": 1380.0,
+      "p95": 1439.0,
+      "p99": 1469.0,
+      "max": 1469.0
+    },
+    "cache": {
+      "lookups": {
+        "level=internal,result=hit": 20000,
+        "level=leaf,result=hit": 2560000
+      },
+      "installs": {},
+      "accounted_bytes": 4605645
+    },
+    "backend_io": {
+      "read_transactions": 20000,
+      "write_transactions": 0,
+      "point_read_keys": 5180000,
+      "scans": 20000,
+      "items_read": 5200000,
+      "bytes_read": 270740000,
+      "mutation_operations": 0,
+      "mutation_bytes": 0,
+      "range_clears": 0,
+      "commits": 0,
+      "retryable_commits": 0,
+      "unknown_commits": 0,
+      "failed_commits": 0
+    },
+    "routing": {
+      "distances": 8703388,
+      "graph_visits": 4130313,
+      "parent_visits_by_level": {
+        "level=2": 20000
+      },
+      "merge_candidates": 2560000
+    }
+  },
+  "binaries_sha256": {
+    "baseline": "8dde8a03387b0076906ab228a5c2afbee7d126d7c374c49a5840661e6d0b3894",
+    "yield-candidate": "2d0580c4d45ad0050207990239f9ab4086b4c8e1791c489b257358e87edbd652",
+    "ids-candidate": "2cea56fa0512c0ebec9ec040dd6e8c7d84be334d28ea71eb025953fd569c694e",
+    "candidate": "d809c3b8cd0f785cba31c16febbad9d3a796321b5c31624ddab5555f8dc60e08"
+  },
+  "profile_functions": "Print limit set to 30\nFunctions sorted by metric: Exclusive Total CPU Time\n\nExcl. Total   Incl. Total    Name\nCPU           CPU\n sec.      %   sec.      %\n8.655 100.00  8.655 100.00   <Total>\n0.975  11.27  0.975  11.27   syscall\n0.658   7.60  0.658   7.60   <static>@0x188341 (<libc.so.6>)\n0.598   6.91  1.071  12.37   <static>@0xaab1b (<libc.so.6>)\n0.435   5.02  0.435   5.02   <static>@0xa8e24 (<libc.so.6>)\n0.299   3.46  0.315   3.64   bytes::bytes::promotable_even_clone\n0.282   3.26  0.416   4.80   ktann_usearch::NativeGraph::search(unsigned int, ktann_usearch::MetricContext const&, ktann_usearch::NativeWorkspace&, rust::cxxbridge1::Slice<ktann_usearch::Hit>) const\n0.215   2.49  0.744   8.59   malloc\n0.193   2.23  0.388   4.48   <hashbrown::map::HashMap<(u32, ktann::api::identifiers::PartitionKey), (), std::hash::random::RandomState>>::insert\n0.173   2.00  0.173   2.00   ktann::search::rabitq::interval::score\n0.159   1.83  0.240   2.78   bytes::bytes::shared_drop\n0.149   1.72  0.149   1.72   write\n0.147   1.69  3.609  41.70   ktann::runtime::search::search::<ktann_benchmarks::backend::MeasuredBackend<ktann_rocksdb::backend::RocksDbBackend>>::{closure#0}\n0.143   1.65  0.174   2.02   bool rocksdb::BlockIter<rocksdb::Slice>::BinarySeek<rocksdb::DecodeKey>(rocksdb::Slice const&, unsigned int*, bool*)\n0.141   1.62  0.141   1.62   <std::hash::random::DefaultHasher as core::hash::Hasher>::write\n0.140   1.61  0.425   4.91   free\n0.140   1.61  0.295   3.41   rocksdb::IndexBlockIter::SeekImpl(rocksdb::Slice const&)\n0.131   1.51  0.131   1.51   __lll_lock_wake_private\n0.113   1.30  0.113   1.30   <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write\n0.109   1.26  0.441   5.09   <ktann::search::candidates::GlobalCandidatePool>::admit\n0.100   1.15  1.283  14.83   rocksdb::BlockBasedTable::MultiGet(rocksdb::ReadOptions const&, rocksdb::MultiGetContext::Range const*, rocksdb::SliceTransform const*, bool)\n0.094   1.08  0.191   2.21   <std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&(u32, ktann::api::identifiers::PartitionKey)>\n0.092   1.06  0.293   3.39   <ktann::search::cache::PartitionCache>::lookup\n0.091   1.05  0.091   1.05   <ktann::search::numeric::VectorKernel>::routing_distance_validated\n0.091   1.05  0.150   1.73   bool rocksdb::BlockIter<rocksdb::Slice>::ParseNextKey<rocksdb::DecodeEntry>(bool*)\n0.090   1.04  0.099   1.14   rocksdb::lru_cache::LRUHandleTable::FindPointer(rocksdb::Slice const&, unsigned int)\n0.073   0.84  0.275   3.18   <hashbrown::map::HashMap<&bytes::bytes::Bytes, (), std::hash::random::RandomState>>::insert\n0.066   0.76  0.079   0.91   pthread_mutex_unlock\n0.064   0.74  0.170   1.97   <ktann::storage::values::ValueCodec>::decode\n0.062   0.71  0.137   1.58   void std::__introsort_loop<rocksdb::autovector<rocksdb::KeyContext*, 32ul>::iterator_impl<rocksdb::autovector<rocksdb::KeyContext*, 32ul>, rocksdb::KeyContext*>, long, __gnu_cxx::__ops::_Iter_comp_iter<rocksdb::(anonymous namespace)::CompareKeyContext> >(rocksdb::autovector<rocksdb::KeyContext*, 32ul>::iterator_impl<rocksdb::autovector<rocksdb::KeyContext*, 32ul>, rocksdb::KeyContext*>, rocksdb::autovector<rocksdb::KeyContext*, 32ul>::iterator_impl<rocksdb::autovector<rocksdb::KeyContext*, 32ul>, rocksdb::KeyContext*>, long, __gnu_cxx::__ops::_Iter_comp_iter<rocksdb::(anonymous namespace)::CompareKeyContext>)\n\n",
+  "profile_callers": "Print limit set to 10\nCallers and callees sorted by metric: Attributed Total CPU Time\n\nAttr. Total    Name\nCPU\n sec.      %\n============== Callers\n0.479  49.08   tokio::runtime::park::wake\n0.127  12.99   <std::sys::sync::condvar::futex::Condvar>::wait\n0.121  12.37   <tokio::runtime::scheduler::multi_thread::worker::Context>::run_task\n0.097   9.92   <tokio::runtime::blocking::pool::Spawner>::spawn_task\n0.066   6.75   <ktann_benchmarks::backend::MeasuredBackend<ktann_rocksdb::backend::RocksDbBackend> as ktann::storage::backend::Backend>::begin_read::{closure#0}\n0.051   5.21   tokio::runtime::context::with_scheduler::<(), tokio::runtime::scheduler::multi_thread::worker::with_current<(), <tokio::runtime::scheduler::multi_thread::handle::Handle>::schedule_task::{closure#0}>::{closure#0}>\n0.018   1.84   <std::sys::sync::condvar::futex::Condvar>::wait_optional_timeout\n0.010   1.02   <std::sys::sync::mutex::futex::Mutex>::lock_contended\n0.006   0.61   <ktann::search::cache::PartitionCache>::lookup\n0.001   0.10   <ktann_rocksdb::blocking::JobQueue>::push\n0.001   0.10   <tokio::runtime::blocking::pool::Inner>::run\n\n============== Stack Fragment\n0.975 100.00   syscall\n\n============== No Callees\n\nCallers and callees sorted by metric: Attributed Total CPU Time\n\nAttr. Total    Name\nCPU\n sec.      %\n============== Callers\n0.290  92.09   <ktann::search::candidates::GlobalCandidatePool>::admit\n0.010   3.16   ktann::storage::values::record::decode_vector_record\n0.008   2.53   ktann::runtime::search::search::<ktann_benchmarks::backend::MeasuredBackend<ktann_rocksdb::backend::RocksDbBackend>>::{closure#0}\n0.002   0.63   <ktann::api::index::Index<ktann_benchmarks::backend::MeasuredBackend<ktann_rocksdb::backend::RocksDbBackend>>>::verify::{closure#0}::{closure#0}::{closure#0}\n0.002   0.63   ktann::storage::keys::decode_partition_key\n0.002   0.63   ktann::storage::operations::decode_scan_page\n0.001   0.32   <alloc::vec::Vec<bytes::bytes::Bytes> as alloc::vec::spec_from_iter::SpecFromIter<bytes::bytes::Bytes, core::iter::adapters::map::Map<core::slice::iter::Iter<ktann::search::candidates::LeafCandidate>, ktann::search::rerank::exact_rerank<ktann_benchmarks::backend::MeasuredTxn<ktann_rocksdb::backend::RocksDbReadTxn>, ktann::runtime::search::search<ktann_benchmarks::backend::MeasuredBackend<ktann_rocksdb::backend::RocksDbBackend>>::{closure#0}::{closure#4}>::{closure#0}::{closure#0}>>>::from_iter\n\n============== Stack Fragment\n0.299  94.94   bytes::bytes::promotable_even_clone\n\n============== Callees\n0.016   5.06   bytes::bytes::shallow_clone_vec\n\n"
+}
