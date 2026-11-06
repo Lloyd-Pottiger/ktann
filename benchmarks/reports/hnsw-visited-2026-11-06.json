@@ -1,0 +1,643 @@
+{
+  "baseline_revision": "a131caf58bf2d250e04f40e26ad6e96ac70b49e3",
+  "date": "2026-11-06",
+  "local_queries": [
+    {
+      "role": "baseline",
+      "run": "baseline-core-final-1",
+      "nodes": 512,
+      "dimension": 128,
+      "build_us": 28204,
+      "workspace_bytes": 21256,
+      "query_ns": [
+        44134,
+        43667,
+        43674,
+        49522,
+        43205
+      ],
+      "median_query_ns": 43674,
+      "result_and_work_sha256": "a82709c9c1add70454a9512ccbcf8952e4bcad988ca282d1b00a7dfa9759560b"
+    },
+    {
+      "role": "baseline",
+      "run": "baseline-core-final-1",
+      "nodes": 4096,
+      "dimension": 128,
+      "build_us": 719636,
+      "workspace_bytes": 164616,
+      "query_ns": [
+        114689,
+        104168,
+        108992,
+        101450,
+        101018
+      ],
+      "median_query_ns": 104168,
+      "result_and_work_sha256": "99c54cbd674554d95e884120ebc11106cf967a20794b83f7311d28884418ef93"
+    },
+    {
+      "role": "baseline",
+      "run": "baseline-core-final-1",
+      "nodes": 4096,
+      "dimension": 768,
+      "build_us": 3438259,
+      "workspace_bytes": 164616,
+      "query_ns": [
+        446120,
+        446951,
+        441241,
+        439874,
+        455036
+      ],
+      "median_query_ns": 446120,
+      "result_and_work_sha256": "cd924c29ca69a67291eeb61cbc5eb5bf9b9d8eb5f935bf518b8afebccf06d1e5"
+    },
+    {
+      "role": "baseline",
+      "run": "baseline-core-final-1",
+      "nodes": 16384,
+      "dimension": 128,
+      "build_us": 5623365,
+      "workspace_bytes": 656136,
+      "query_ns": [
+        254274,
+        262963,
+        254509,
+        253364,
+        260545
+      ],
+      "median_query_ns": 254509,
+      "result_and_work_sha256": "90bb9e4a2d220d7fbb4067e23cb35064d4af14f0b545c4f153eb4eb770f34071"
+    },
+    {
+      "role": "baseline",
+      "run": "baseline-core-final-2",
+      "nodes": 512,
+      "dimension": 128,
+      "build_us": 27618,
+      "workspace_bytes": 21256,
+      "query_ns": [
+        43651,
+        44651,
+        45392,
+        43632,
+        43326
+      ],
+      "median_query_ns": 43651,
+      "result_and_work_sha256": "a82709c9c1add70454a9512ccbcf8952e4bcad988ca282d1b00a7dfa9759560b"
+    },
+    {
+      "role": "baseline",
+      "run": "baseline-core-final-2",
+      "nodes": 4096,
+      "dimension": 128,
+      "build_us": 707188,
+      "workspace_bytes": 164616,
+      "query_ns": [
+        98106,
+        104890,
+        99478,
+        98816,
+        99140
+      ],
+      "median_query_ns": 99140,
+      "result_and_work_sha256": "99c54cbd674554d95e884120ebc11106cf967a20794b83f7311d28884418ef93"
+    },
+    {
+      "role": "baseline",
+      "run": "baseline-core-final-2",
+      "nodes": 4096,
+      "dimension": 768,
+      "build_us": 3362122,
+      "workspace_bytes": 164616,
+      "query_ns": [
+        437622,
+        425163,
+        433064,
+        431410,
+        453399
+      ],
+      "median_query_ns": 433064,
+      "result_and_work_sha256": "cd924c29ca69a67291eeb61cbc5eb5bf9b9d8eb5f935bf518b8afebccf06d1e5"
+    },
+    {
+      "role": "baseline",
+      "run": "baseline-core-final-2",
+      "nodes": 16384,
+      "dimension": 128,
+      "build_us": 5618620,
+      "workspace_bytes": 656136,
+      "query_ns": [
+        256124,
+        254525,
+        261959,
+        255110,
+        256577
+      ],
+      "median_query_ns": 256124,
+      "result_and_work_sha256": "90bb9e4a2d220d7fbb4067e23cb35064d4af14f0b545c4f153eb4eb770f34071"
+    },
+    {
+      "role": "baseline",
+      "run": "baseline-core-final-3",
+      "nodes": 512,
+      "dimension": 128,
+      "build_us": 26952,
+      "workspace_bytes": 21256,
+      "query_ns": [
+        43254,
+        44676,
+        43818,
+        43623,
+        43200
+      ],
+      "median_query_ns": 43623,
+      "result_and_work_sha256": "a82709c9c1add70454a9512ccbcf8952e4bcad988ca282d1b00a7dfa9759560b"
+    },
+    {
+      "role": "baseline",
+      "run": "baseline-core-final-3",
+      "nodes": 4096,
+      "dimension": 128,
+      "build_us": 699248,
+      "workspace_bytes": 164616,
+      "query_ns": [
+        102182,
+        100975,
+        111764,
+        102550,
+        98764
+      ],
+      "median_query_ns": 102182,
+      "result_and_work_sha256": "99c54cbd674554d95e884120ebc11106cf967a20794b83f7311d28884418ef93"
+    },
+    {
+      "role": "baseline",
+      "run": "baseline-core-final-3",
+      "nodes": 4096,
+      "dimension": 768,
+      "build_us": 3382442,
+      "workspace_bytes": 164616,
+      "query_ns": [
+        442804,
+        422859,
+        490009,
+        434984,
+        424891
+      ],
+      "median_query_ns": 434984,
+      "result_and_work_sha256": "cd924c29ca69a67291eeb61cbc5eb5bf9b9d8eb5f935bf518b8afebccf06d1e5"
+    },
+    {
+      "role": "baseline",
+      "run": "baseline-core-final-3",
+      "nodes": 16384,
+      "dimension": 128,
+      "build_us": 5623305,
+      "workspace_bytes": 656136,
+      "query_ns": [
+        252890,
+        261973,
+        266479,
+        267301,
+        268778
+      ],
+      "median_query_ns": 266479,
+      "result_and_work_sha256": "90bb9e4a2d220d7fbb4067e23cb35064d4af14f0b545c4f153eb4eb770f34071"
+    },
+    {
+      "role": "candidate",
+      "run": "candidate-core-final-1",
+      "nodes": 512,
+      "dimension": 128,
+      "build_us": 27723,
+      "workspace_bytes": 17288,
+      "query_ns": [
+        41708,
+        41807,
+        41646,
+        41876,
+        41456
+      ],
+      "median_query_ns": 41708,
+      "result_and_work_sha256": "a82709c9c1add70454a9512ccbcf8952e4bcad988ca282d1b00a7dfa9759560b"
+    },
+    {
+      "role": "candidate",
+      "run": "candidate-core-final-1",
+      "nodes": 4096,
+      "dimension": 128,
+      "build_us": 691511,
+      "workspace_bytes": 132424,
+      "query_ns": [
+        98943,
+        99621,
+        107001,
+        102894,
+        103155
+      ],
+      "median_query_ns": 102894,
+      "result_and_work_sha256": "99c54cbd674554d95e884120ebc11106cf967a20794b83f7311d28884418ef93"
+    },
+    {
+      "role": "candidate",
+      "run": "candidate-core-final-1",
+      "nodes": 4096,
+      "dimension": 768,
+      "build_us": 3398943,
+      "workspace_bytes": 132424,
+      "query_ns": [
+        444922,
+        443838,
+        439206,
+        451075,
+        438344
+      ],
+      "median_query_ns": 443838,
+      "result_and_work_sha256": "cd924c29ca69a67291eeb61cbc5eb5bf9b9d8eb5f935bf518b8afebccf06d1e5"
+    },
+    {
+      "role": "candidate",
+      "run": "candidate-core-final-1",
+      "nodes": 16384,
+      "dimension": 128,
+      "build_us": 5530606,
+      "workspace_bytes": 527176,
+      "query_ns": [
+        205757,
+        199046,
+        199743,
+        202718,
+        196147
+      ],
+      "median_query_ns": 199743,
+      "result_and_work_sha256": "90bb9e4a2d220d7fbb4067e23cb35064d4af14f0b545c4f153eb4eb770f34071"
+    },
+    {
+      "role": "candidate",
+      "run": "candidate-core-final-2",
+      "nodes": 512,
+      "dimension": 128,
+      "build_us": 26453,
+      "workspace_bytes": 17288,
+      "query_ns": [
+        44055,
+        42388,
+        42302,
+        42939,
+        42174
+      ],
+      "median_query_ns": 42388,
+      "result_and_work_sha256": "a82709c9c1add70454a9512ccbcf8952e4bcad988ca282d1b00a7dfa9759560b"
+    },
+    {
+      "role": "candidate",
+      "run": "candidate-core-final-2",
+      "nodes": 4096,
+      "dimension": 128,
+      "build_us": 685749,
+      "workspace_bytes": 132424,
+      "query_ns": [
+        98298,
+        108145,
+        103851,
+        93228,
+        93021
+      ],
+      "median_query_ns": 98298,
+      "result_and_work_sha256": "99c54cbd674554d95e884120ebc11106cf967a20794b83f7311d28884418ef93"
+    },
+    {
+      "role": "candidate",
+      "run": "candidate-core-final-2",
+      "nodes": 4096,
+      "dimension": 768,
+      "build_us": 3383938,
+      "workspace_bytes": 132424,
+      "query_ns": [
+        437598,
+        430440,
+        432548,
+        434526,
+        442644
+      ],
+      "median_query_ns": 434526,
+      "result_and_work_sha256": "cd924c29ca69a67291eeb61cbc5eb5bf9b9d8eb5f935bf518b8afebccf06d1e5"
+    },
+    {
+      "role": "candidate",
+      "run": "candidate-core-final-2",
+      "nodes": 16384,
+      "dimension": 128,
+      "build_us": 5515189,
+      "workspace_bytes": 527176,
+      "query_ns": [
+        197945,
+        207373,
+        199813,
+        200006,
+        196612
+      ],
+      "median_query_ns": 199813,
+      "result_and_work_sha256": "90bb9e4a2d220d7fbb4067e23cb35064d4af14f0b545c4f153eb4eb770f34071"
+    },
+    {
+      "role": "candidate",
+      "run": "candidate-core-final-3",
+      "nodes": 512,
+      "dimension": 128,
+      "build_us": 26957,
+      "workspace_bytes": 17288,
+      "query_ns": [
+        42457,
+        41638,
+        40784,
+        41325,
+        42222
+      ],
+      "median_query_ns": 41638,
+      "result_and_work_sha256": "a82709c9c1add70454a9512ccbcf8952e4bcad988ca282d1b00a7dfa9759560b"
+    },
+    {
+      "role": "candidate",
+      "run": "candidate-core-final-3",
+      "nodes": 4096,
+      "dimension": 128,
+      "build_us": 683795,
+      "workspace_bytes": 132424,
+      "query_ns": [
+        95211,
+        92967,
+        105192,
+        99209,
+        96671
+      ],
+      "median_query_ns": 96671,
+      "result_and_work_sha256": "99c54cbd674554d95e884120ebc11106cf967a20794b83f7311d28884418ef93"
+    },
+    {
+      "role": "candidate",
+      "run": "candidate-core-final-3",
+      "nodes": 4096,
+      "dimension": 768,
+      "build_us": 3345439,
+      "workspace_bytes": 132424,
+      "query_ns": [
+        420774,
+        435087,
+        426641,
+        435801,
+        419444
+      ],
+      "median_query_ns": 426641,
+      "result_and_work_sha256": "cd924c29ca69a67291eeb61cbc5eb5bf9b9d8eb5f935bf518b8afebccf06d1e5"
+    },
+    {
+      "role": "candidate",
+      "run": "candidate-core-final-3",
+      "nodes": 16384,
+      "dimension": 128,
+      "build_us": 5380289,
+      "workspace_bytes": 527176,
+      "query_ns": [
+        200156,
+        197106,
+        190539,
+        194697,
+        196779
+      ],
+      "median_query_ns": 196779,
+      "result_and_work_sha256": "90bb9e4a2d220d7fbb4067e23cb35064d4af14f0b545c4f153eb4eb770f34071"
+    }
+  ],
+  "end_to_end": [
+    {
+      "window": "final",
+      "role": "baseline",
+      "actual_binary": "baseline",
+      "run": "baseline-final-1",
+      "qps": 1944.664196603404,
+      "cpu_seconds": 37.09773199999999,
+      "p95_ms": 6.487948,
+      "p99_ms": 8.159609999999999,
+      "recall": 0.981259999999998
+    },
+    {
+      "window": "final",
+      "role": "baseline",
+      "actual_binary": "baseline",
+      "run": "baseline-final-2",
+      "qps": 2062.5640621955986,
+      "cpu_seconds": 36.120401,
+      "p95_ms": 5.9698720000000005,
+      "p99_ms": 7.599765,
+      "recall": 0.981259999999998
+    },
+    {
+      "window": "final",
+      "role": "baseline",
+      "actual_binary": "baseline",
+      "run": "baseline-final-3",
+      "qps": 2131.8056786552975,
+      "cpu_seconds": 36.275843,
+      "p95_ms": 5.790006,
+      "p99_ms": 7.401178,
+      "recall": 0.981259999999998
+    },
+    {
+      "window": "final",
+      "role": "candidate",
+      "actual_binary": "candidate",
+      "run": "candidate-final-1",
+      "qps": 2797.49285495602,
+      "cpu_seconds": 33.689122,
+      "p95_ms": 3.958363,
+      "p99_ms": 5.087732,
+      "recall": 0.981259999999998
+    },
+    {
+      "window": "final",
+      "role": "candidate",
+      "actual_binary": "candidate",
+      "run": "candidate-final-2",
+      "qps": 1687.830501886241,
+      "cpu_seconds": 40.117731,
+      "p95_ms": 7.217418,
+      "p99_ms": 9.751286,
+      "recall": 0.981259999999998
+    },
+    {
+      "window": "final",
+      "role": "candidate",
+      "actual_binary": "candidate",
+      "run": "candidate-final-3",
+      "qps": 1773.9819578335807,
+      "cpu_seconds": 38.780062,
+      "p95_ms": 6.785537000000001,
+      "p99_ms": 8.529251,
+      "recall": 0.981259999999998
+    },
+    {
+      "window": "confirm",
+      "role": "baseline",
+      "actual_binary": "baseline",
+      "run": "baseline-confirm-1",
+      "qps": 2783.3571935515406,
+      "cpu_seconds": 33.790440000000004,
+      "p95_ms": 3.984313,
+      "p99_ms": 5.071875,
+      "recall": 0.981259999999998
+    },
+    {
+      "window": "confirm",
+      "role": "baseline",
+      "actual_binary": "baseline",
+      "run": "baseline-confirm-2",
+      "qps": 2866.5643207938656,
+      "cpu_seconds": 33.255315,
+      "p95_ms": 3.788334,
+      "p99_ms": 4.709355,
+      "recall": 0.981259999999998
+    },
+    {
+      "window": "confirm",
+      "role": "baseline",
+      "actual_binary": "baseline",
+      "run": "baseline-confirm-3",
+      "qps": 2845.588077642261,
+      "cpu_seconds": 33.454367999999995,
+      "p95_ms": 3.77487,
+      "p99_ms": 4.65856,
+      "recall": 0.981259999999998
+    },
+    {
+      "window": "confirm",
+      "role": "candidate",
+      "actual_binary": "candidate",
+      "run": "candidate-confirm-1",
+      "qps": 2849.7892048969825,
+      "cpu_seconds": 33.42116,
+      "p95_ms": 3.80582,
+      "p99_ms": 4.857096,
+      "recall": 0.981259999999998
+    },
+    {
+      "window": "confirm",
+      "role": "candidate",
+      "actual_binary": "candidate",
+      "run": "candidate-confirm-2",
+      "qps": 2864.7427639149196,
+      "cpu_seconds": 33.225775000000006,
+      "p95_ms": 3.776897,
+      "p99_ms": 4.8490720000000005,
+      "recall": 0.981259999999998
+    },
+    {
+      "window": "confirm",
+      "role": "candidate",
+      "actual_binary": "candidate",
+      "run": "candidate-confirm-3",
+      "qps": 2785.647207926443,
+      "cpu_seconds": 33.34729,
+      "p95_ms": 4.108304,
+      "p99_ms": 5.334485,
+      "recall": 0.981259999999998
+    },
+    {
+      "window": "control",
+      "role": "baseline",
+      "actual_binary": "baseline",
+      "run": "baseline-control-1",
+      "qps": 2814.414832909786,
+      "cpu_seconds": 33.683024999999994,
+      "p95_ms": 3.928711,
+      "p99_ms": 4.9130069999999995,
+      "recall": 0.981259999999998
+    },
+    {
+      "window": "control",
+      "role": "baseline",
+      "actual_binary": "baseline",
+      "run": "baseline-control-2",
+      "qps": 2671.85406206574,
+      "cpu_seconds": 34.123704,
+      "p95_ms": 4.319357999999999,
+      "p99_ms": 5.589871,
+      "recall": 0.981259999999998
+    },
+    {
+      "window": "control",
+      "role": "candidate",
+      "actual_binary": "baseline",
+      "run": "candidate-control-1",
+      "qps": 2831.111235034512,
+      "cpu_seconds": 33.768831999999996,
+      "p95_ms": 3.844434,
+      "p99_ms": 4.935869,
+      "recall": 0.981259999999998
+    },
+    {
+      "window": "control",
+      "role": "candidate",
+      "actual_binary": "baseline",
+      "run": "candidate-control-2",
+      "qps": 2849.2967791303454,
+      "cpu_seconds": 33.559225,
+      "p95_ms": 3.809404,
+      "p99_ms": 4.796782,
+      "recall": 0.981259999999998
+    }
+  ],
+  "binary_sha256": {
+    "baseline": "055de693fad83ea3bcc5f8b338b071e11c771d8a341ef157180bfef8605de7d8",
+    "candidate": "52cebd7db7524b335c74189963a0c06d8e9971064027a287efe12687e1c9c3f8"
+  },
+  "environment": {
+    "operating_system": "Linux boxlite 6.12.76 #1 SMP PREEMPT_DYNAMIC Tue Mar 10 13:28:56 CET 2026 x86_64 x86_64 x86_64 GNU/Linux",
+    "cpu_model": "Intel(R) Xeon(R) Processor",
+    "logical_cpus": 8,
+    "memory_bytes": 16795430912,
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13) | binary: rustc | commit-hash: 58cf8f9c35b355199727627d07ae34a4e2846d67 | commit-date: 2026-10-13 | host: x86_64-unknown-linux-gnu | release: 1.99.1 | LLVM version: 23.1.1",
+    "build_profile": "release",
+    "build_features": "rocksdb",
+    "rustflags": "",
+    "backend_runtime": "rust-rocksdb=0.24.0; rocksdb=10.4.2; block-cache-bytes=8388608",
+    "tokio_worker_threads": 4
+  },
+  "dataset": {
+    "name": "clustered",
+    "base_vectors": 32768,
+    "query_vectors": 64,
+    "dimension": 16,
+    "checksum_xxh3_128": "1f21d2ab88d939e68d085bac356fd765",
+    "source": null
+  },
+  "topology": {
+    "vector_records": 32768,
+    "partitions": 3216,
+    "entries": 35983,
+    "trees": 1,
+    "max_level": 2,
+    "partitions_by_level": {
+      "1": 3215,
+      "2": 1
+    },
+    "entries_by_level": {
+      "1": 32768,
+      "2": 3215
+    },
+    "max_entries_by_level": {
+      "1": 16,
+      "2": 3215
+    },
+    "partition_states": {
+      "ready": 3216,
+      "splitting": 0,
+      "receiving_split": 0,
+      "draining_split": 0,
+      "merging": 0
+    },
+    "actionable_partitions": 0
+  }
+}

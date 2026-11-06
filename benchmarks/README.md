@@ -686,6 +686,18 @@ allocations; it is not graph working memory.
 Logical KV bytes do not measure native physical writes. These experiments cover
 the reported size and update history and do not establish a production SLA.
 
+### Local graph CPU and scratch diagnostic
+
+Run `cargo test --release -p ktann --lib local_routing_performance -- --ignored --nocapture`
+on an otherwise idle host. This diagnostic constructs deterministic local graphs
+at 512, 4096 and 16384 nodes, with 128- and 768-dimensional cases. It uses the
+production distance kernel and fresh query scratch, records five timed rounds,
+and reports workspace bytes and an untimed digest of hits, scores and traversal
+work. Graph construction is timed separately. Repeat processes and compare
+digests before interpreting timings; this does not measure backend IO, complete
+search quality or end-to-end throughput. See the
+[visited-set experiment](reports/hnsw-visited-2026-11-06.md) for an example.
+
 ### Adaptive write routing
 
 Graph-enabled indexes use exact scoring below 1024 internal nodes and HNSW at

@@ -2267,7 +2267,8 @@ template <typename distance_at = default_distance_t,              //
           typename key_at = default_key_t,                        //
           typename compressed_slot_at = default_slot_t,           //
           typename dynamic_allocator_at = std::allocator<byte_t>, //
-          typename tape_allocator_at = dynamic_allocator_at>      //
+          typename tape_allocator_at = dynamic_allocator_at,      //
+          typename visits_at = growing_hash_set_gt<compressed_slot_at, hash_gt<compressed_slot_at>, dynamic_allocator_at>>
 class index_gt {
   public:
     using distance_t = distance_at;
@@ -2371,7 +2372,7 @@ class index_gt {
 
     using nodes_mutexes_t = striped_locks_gt<dynamic_allocator_t>;
 
-    using visits_hash_set_t = growing_hash_set_gt<compressed_slot_t, hash_gt<compressed_slot_t>, dynamic_allocator_t>;
+    using visits_t = visits_at;
 
     struct precomputed_constants_t {
         double inverse_log_connectivity{};
@@ -2494,7 +2495,7 @@ class index_gt {
         top_candidates_t top_candidates{};
         top_candidates_t top_for_refine{};
         next_candidates_t next_candidates{};
-        visits_hash_set_t visits{};
+        visits_t visits{};
         std::uint64_t level_generator{};
         std::size_t iteration_cycles{};
         std::size_t computed_distances{};
@@ -4497,7 +4498,7 @@ private:
 
         index_gt const& index_;
         neighbors_ref_t neighbors_;
-        visits_hash_set_t& visits_;
+        visits_t& visits_;
         std::size_t current_;
 
         candidates_iterator_t& skip_missing() noexcept {
@@ -4522,7 +4523,7 @@ private:
         using reference = misaligned_ref_gt<element_t>;
 
         value_type operator*() const noexcept { return neighbors_[current_]; }
-        candidates_iterator_t(index_gt const& index, neighbors_ref_t neighbors, visits_hash_set_t& visits,
+        candidates_iterator_t(index_gt const& index, neighbors_ref_t neighbors, visits_t& visits,
                               std::size_t progress) noexcept
             : index_(index), neighbors_(neighbors), visits_(visits), current_(progress) {}
         candidates_iterator_t operator++(int) noexcept {
@@ -4547,7 +4548,7 @@ private:
     struct candidates_range_t {
         index_gt const& index;
         neighbors_ref_t neighbors;
-        visits_hash_set_t& visits;
+        visits_t& visits;
 
         candidates_iterator_t begin() const noexcept {
             return candidates_iterator_t{index, neighbors, visits, 0}.skip_missing();
@@ -4560,7 +4561,7 @@ private:
         value_at&& query, metric_at&& metric, prefetch_at&& prefetch, //
         compressed_slot_t closest_slot, level_t begin_level, level_t end_level, context_t& context) const {
 
-        visits_hash_set_t& visits = context.visits;
+        visits_t& visits = context.visits;
         visits.clear();
 
         // Optional prefetching
@@ -4610,7 +4611,7 @@ private:
         value_at&& query, metric_at&& metric, prefetch_at&& prefetch, //
         compressed_slot_t start_slot, level_t level, std::size_t top_limit, context_t& context) {
 
-        visits_hash_set_t& visits = context.visits;
+        visits_t& visits = context.visits;
         next_candidates_t& next = context.next_candidates; // pop min, push
         top_candidates_t& top = context.top_candidates;    // pop max, push
 
@@ -4692,7 +4693,7 @@ private:
         compressed_slot_t start_slot, compressed_slot_t updated_slot, level_t level, std::size_t top_limit,
         context_t& context) usearch_noexcept_m {
 
-        visits_hash_set_t& visits = context.visits;
+        visits_t& visits = context.visits;
         next_candidates_t& next = context.next_candidates; // pop min, push
         top_candidates_t& top = context.top_candidates;    // pop max, push
 
@@ -4785,7 +4786,7 @@ private:
         value_at&& query, metric_at&& metric, predicate_at&& predicate, prefetch_at&& prefetch, //
         compressed_slot_t start_slot, std::size_t expansion, context_t& context) const usearch_noexcept_m {
 
-        visits_hash_set_t& visits = context.visits;
+        visits_t& visits = context.visits;
         next_candidates_t& next = context.next_candidates; // pop min, push
         top_candidates_t& top = context.top_candidates;    // pop max, push
         std::size_t const top_limit = expansion;
