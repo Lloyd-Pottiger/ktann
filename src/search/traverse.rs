@@ -558,4 +558,16 @@ impl Traversal {
 }
 
 #[cfg(test)]
+mod request_tests {
+    use super::{DEFAULT_LEAF_BEAM, SearchBudgets, TraversalRequest};
+
+    #[test]
+    fn request_rejects_zero_beam() {
+        assert_eq!(DEFAULT_LEAF_BEAM, 128);
+        let budgets = SearchBudgets::new(1_024, 8, 8).expect("valid budgets");
+        assert!(TraversalRequest::new(&[0.0, 0.0], &[], None, budgets, 0).is_err());
+    }
+}
+
+#[cfg(test)]
 mod tests;

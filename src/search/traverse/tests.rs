@@ -1,3 +1,5 @@
+//! Traversal contracts spanning scheduling, snapshot reads and candidate collection.
+
 /// Runs real graph validation and routing inline to isolate traversal scheduling.
 struct GraphExecution {
     cache: PartitionCache,
@@ -571,14 +573,6 @@ async fn assert_corrupt(
         )
         .await,
     );
-}
-
-#[test]
-fn request_rejects_zero_beam() {
-    assert_eq!(DEFAULT_LEAF_BEAM, 128);
-    let trees = vec![];
-    let budget = budgets(8, 8);
-    assert!(TraversalRequest::new(&QUERY, &trees, None, budget, 0).is_err());
 }
 
 #[tokio::test]
