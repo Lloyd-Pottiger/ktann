@@ -1,12 +1,14 @@
-//! Snapshot-proof rejection and conflict-read coverage without a native backend.
+//! Paged discovery, snapshot-proof rejection, and conflict-read coverage.
 use super::*;
-use crate::api::{IndexConfig, Metric};
+use crate::api::{IndexConfig, LogicalIndexId, Metric};
 use crate::storage::ReadLogicalTxn;
 use crate::storage::backend::{
-    CommitStart, HardLimits, InsertOutcome, Mutation, ReadOps, ScanPage,
+    AdmissionBudget, CommitStart, HardLimits, InsertOutcome, Mutation, ReadOps, ScanPage,
 };
+use crate::storage::keys;
 use crate::storage::test_support::{MockReadTxn, pk};
-use crate::storage::values::{IndexLifecycle, ValueCodec};
+use crate::storage::values::{IndexLifecycle, PersistentValue, ValueCodec};
+use bytes::Bytes;
 use std::sync::{Arc, Mutex};
 
 struct ProofTxn {
@@ -188,4 +190,54 @@ async fn proof_protects_every_parent_and_rejects_changed_or_missing_parents() {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn discovery_visits_every_edge_once_across_uneven_pages_and_waves() {
+    use std::collections::BTreeMap;
+
+    let (manifest, tree_key, _) = fixture();
+    let mut items = Vec::new();
+    let mut expected = BTreeMap::new();
+    // Empty, short, exact-page and multiple-page bodies span two waves.
+    let sizes = [0, 1, 128, 129, 257, 2, 0, 130, 3, 258];
+    let bodies: Vec<_> = (1..=sizes.len() as u64).map(pk).collect();
+    for (&body, size) in bodies.iter().zip(sizes) {
+        for child in 100..100 + size {
+            let child = pk(child);
+            let centroid = vec![child.get() as f32; manifest.config().dimension()];
+            items.push((
+                keys::child_entry_key(manifest.logical_index_id(), &tree_key, body, child),
+                ValueCodec::for_index(&manifest)
+                    .encode(&PersistentValue::ChildEntry(ChildEntry::new(
+                        child, centroid,
+                    )))
+                    .expect("encode child"),
+            ));
+            expected.insert((body, child), 0);
+        }
+    }
+    let mut read = ReadLogicalTxn::for_index(MockReadTxn::new(items), &manifest);
+    super::scan_child_edges(
+        &mut read,
+        &manifest,
+        &tree_key,
+        &bodies,
+        &mut |body, entry| {
+            *expected
+                .get_mut(&(body, entry.child()))
+                .expect("known edge") += 1;
+            Ok(())
+        },
+    )
+    .await
+    .expect("discovery");
+    assert!(expected.values().all(|&visits| visits == 1));
+    let raw = read.into_raw();
+    assert!(
+        raw.batch_scan_sizes
+            .iter()
+            .all(|&size| size <= super::DISCOVERY_BODY_BATCH)
+    );
+    assert!(raw.batch_scan_sizes.iter().any(|&size| size > 1));
 }
