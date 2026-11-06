@@ -28,7 +28,7 @@ backend reads cannot monopolize the executor. Cancellation/deadline checks surro
 those boundaries; the same admitted task retains its snapshot throughout. Native
 graph work retains the separate owned CPU-task boundary described below.
 
-Graph routing has a separate per-query working-byte ceiling configured by
+Retained filtered-Exact traversal and graph routing have a per-query working-byte ceiling configured by
 `RuntimeConfig::with_routing_working_bytes`; its accounting contract belongs to
 [Search](search.md#graph-index-bodies). Native restore and query tasks, including offline graph verification, use
 the same cooperative CPU-task boundary as refinement. Foreground admission remains

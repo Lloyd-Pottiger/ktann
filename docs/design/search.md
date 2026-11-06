@@ -156,23 +156,44 @@ and validated, and every Leaf Entry is counted before exact predicate filtering
 and RaBitQ scoring. Rejected entries consume no scoring work; predicate rejection
 cannot hide malformed entries in a loaded body.
 
-Traversal is a level-scaled beam. The leaf-level base beam defaults to 128 and
-SearchOptions may override it per request within the hard cap; moving one
-level toward the root divides it by two with minimum one. All admitted parents
-at one depth contribute before the next depth selects the globally nearest
-beam for each tree. `SearchOptions::routing_mode` defaults to Exact. Graph-enabled
-indexes can explicitly select PartitionLocalHnsw with positive `ef_search`;
-indexes without graph configuration reject that choice. Each parent contributes up to the full
-local next-level beam B, never a share divided among parents. Candidate scores
-come directly from the graph's f64 routing kernel evaluations. Exact scores all
-children. Both modes merge into a single bounded top-B heap per tree/level,
-ordered by distance and Partition Key. Every exposed Child Entry is checked
-for duplicate incoming references, including children omitted by local search. This prevents one wide parent from
-consuming the next level's beam before other admitted parents contribute their
-children. Eligible trees advance fairly. Ties use Tree Key, Partition Key,
-then Record ID.
-Partition and rerank bounds are charged
-before corresponding work. No speculative read-ahead occurs beyond a budget.
+`SearchOptions::routing_mode` defaults to Exact. With a predicate, Exact search
+uses the leaf beam (default 128) as an effective-leaf target **per Tree Key**.
+A leaf counts when at least one entry passes the exact predicate, before rough
+candidate pruning. NoMatch and MayMatch with zero true entries consume visits
+but no effective-leaf allowance. All trees share the existing partition budget.
+
+Filtered Exact traversal retains unexpanded branches by level and Tree Key.
+Each group keeps its nearest V candidates, where V is the total visit budget.
+An omitted candidate has V nearer pending competitors in that same group, and
+its parent already consumed a visit. Visiting it therefore cannot fit the query's
+budget, even after later parents contribute or other trees consume visits. If
+any tail is omitted, budget exhaustion is reached while funded competitors still
+remain; omission cannot masquerade as natural exhaustion. This is a budget-derived
+storage bound, not an independent recall/retention knob.
+All parents in an admitted batch contribute before selection. It consumes the
+deepest available candidates first, returning to pending upper branches when
+more leaves are needed. Internal batch widths halve toward the root with minimum
+one; leaf batches are limited to each tree's remaining effective allowance.
+Completed trees cannot consume another tree's allowance. Ordinary root transition
+beam bypass remains in force. Normal termination is only target completion,
+retained-work exhaustion, or shared visit-budget exhaustion. Reaching a quality
+target exactly on the visit cap is not budget truncation; pending mandatory split
+targets still require funding. Bounded working-state admission can independently
+return LimitExceeded. No fill-k, selectivity estimate, or convergence rule is used.
+
+Without a predicate, traversal retains level-scaled top-B selection. Explicit
+PartitionLocalHnsw also retains its existing policy: each parent contributes up
+to the full next-level B, followed by per-tree/per-level top-B merging. HNSW's
+bounded candidate set is not silently converted to Exact routing or claimed to
+provide complete continuation. Graph-backed indexes using Exact score all children and supply
+the nearest min(V, parent size) for filtered continuation, while loading and validating the same
+mandatory graph body. Indexes without graphs still reject HNSW routing.
+
+Ties remain distance, Tree Key ordinal, and Partition Key; candidates use Record
+ID as their final tie-break. Every exposed Child Entry participates in duplicate
+incoming-reference checks, including children omitted by HNSW. All work shares
+one snapshot and candidate pool, with one final exact rerank. This is bounded ANN
+search, not a promise of equal recall across filters or of returning k hits.
 
 ### 6.2 Bounded IO and prefetching
 
@@ -340,8 +361,18 @@ Cold reads retain unpublished entries and chunks until restoration succeeds,
 then publish one complete shared body. Older snapshots cannot replace newer cached
 epochs. Eviction does not invalidate handles still held by queries.
 
-`RuntimeConfig::routing_working_bytes` (default 256 MiB) bounds one query's graph
-routing work independently of retained cache capacity. Before loading entries or
+`RuntimeConfig::routing_working_bytes` (default 256 MiB) bounds one query's retained
+filtered-Exact routing state as well as graph work, independently of cache capacity.
+Before adding a parent's children, admission includes reference hash growth,
+active and pending frontier capacities, tree counters, query inputs and retained
+candidate state. Before candidate admission from a leaf, it conservatively adds
+identity-array/duplicate-check growth and potential leaf projection retention,
+using the decoded body's precomputed size. This is not a process RSS limit or an
+ordinary body-read buffer limit; body decoding/prefetch retain their existing
+codec and batch bounds. Exceeding the byte ceiling fails explicitly with
+LimitExceeded.
+
+For graph bodies, before loading entries or
 chunks, the reader admits checked bounds for the complete body, kernel creation,
 chunk and assembly buffers, native validation/restoration, private query scratch,
 and candidate output. The caller reserves other retained query state, including

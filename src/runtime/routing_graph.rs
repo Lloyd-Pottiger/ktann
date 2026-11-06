@@ -9,6 +9,10 @@ use crate::storage::backend::{Backend, ReadOps};
 use crate::storage::values::IndexManifest;
 
 impl<B: Backend> crate::search::cache::graph::RoutingExecution for OperationContext<B> {
+    fn working_byte_limit(&self) -> usize {
+        self.routing_working_bytes
+    }
+
     fn checkpoint(&self) -> Result<()> {
         self.checkpoint()
     }

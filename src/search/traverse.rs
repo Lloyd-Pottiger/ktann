@@ -1,7 +1,8 @@
 //! Deterministic, bounded best-first traversal across selected Tree Keys.
 //!
-//! Roots are always admitted; each later depth competes within a level-scaled
-//! beam. Each distinct partition is charged before visiting its complete body.
+//! Roots are always admitted. Filtered Exact searches retain branches until
+//! each Tree Key reaches its effective-leaf beam; other searches use top-B.
+//! Each distinct partition is charged before visiting its complete body.
 //! Beam pruning is not budget exhaustion; exhaustion means eligible work was
 //! prevented by a depleted budget (ADR 0011).
 //!
@@ -19,6 +20,9 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt;
 
 use crate::api::{Error, ErrorKind, PartitionKey, Result, SearchBudgets};
+use continuation::Continuation;
+
+mod continuation;
 use crate::maintenance::fixup;
 use crate::storage::ReadLogicalTxn;
 use crate::storage::backend::ReadOps;
@@ -196,7 +200,8 @@ pub(crate) async fn traverse<T: ReadOps>(
 ) -> Result<TraversalOutcome> {
     let manifest = txn.require_manifest()?;
     let query = RaBitQQuery::new(request.routing, manifest.config().metric())?;
-    let input_bytes = if manifest.config().local_graph().is_some() {
+    let filtered_exact = request.predicate.is_some() && request.routing_mode == RoutingMode::Exact;
+    let input_bytes = if manifest.config().local_graph().is_some() || filtered_exact {
         request.trees.iter().try_fold(
             kernel
                 .heap_bytes()
@@ -228,8 +233,16 @@ pub(crate) async fn traverse<T: ReadOps>(
     let mut state = Traversal::seed(
         context.request.trees,
         capacity,
-        manifest.config().local_graph().is_some(),
+        manifest.config().local_graph().is_some() || filtered_exact,
     )?;
+    if filtered_exact {
+        state.continuation = Some(Continuation::new(
+            context.request.leaf_beam,
+            context.request.trees.len(),
+            context.request.budgets.visited_partitions(),
+        )?);
+    }
+    state.check_retained(&context, 0, 0)?;
     state.run(txn, &context).await?;
     state.finish(&|| execution.checkpoint()).await
 }
@@ -294,6 +307,7 @@ impl Eq for FrontierEntry {}
 
 /// The mutable state of one forest traversal.
 struct Traversal {
+    continuation: Option<Continuation>,
     /// The already-selected beam at the current tree depth.
     frontier: BinaryHeap<Reverse<FrontierEntry>>,
     /// Children exposed by the current depth, grouped for next-level beam
@@ -316,6 +330,7 @@ impl Traversal {
     /// Seeds the frontier with every eligible tree's root.
     fn seed(trees: &[EnumeratedTree], capacity: usize, account_memory: bool) -> Result<Self> {
         let mut state = Self {
+            continuation: None,
             frontier: BinaryHeap::new(),
             next_frontier: HashMap::new(),
             referenced: HashSet::new(),
@@ -387,12 +402,37 @@ impl Traversal {
                 self.visit_partition(txn, context, entry).await?;
             }
         }
-        // Every still-queued entry is eligible work, prevented exactly when
-        // the Partition budget is fully spent. Natural completion on the limit
-        // (an empty frontier) is not exhaustion.
+        // Only eligible work counts: completed trees are excluded by the
+        // retained frontier, while active root-split targets still need funding.
+        // Natural completion exactly on the visit cap is not exhaustion.
         self.partition_budget_exhausted = self.visited_partitions
             == context.request.budgets.visited_partitions()
-            && (!self.frontier.is_empty() || !self.next_frontier.is_empty());
+            && self.has_pending();
+        Ok(())
+    }
+
+    /// Includes retained branches in budget exhaustion.
+    fn has_pending(&self) -> bool {
+        if self
+            .continuation
+            .as_ref()
+            .is_some_and(Continuation::has_work)
+        {
+            return true;
+        }
+        !self.frontier.is_empty() || !self.next_frontier.is_empty()
+    }
+
+    /// Checks unique incoming edges and reserves storage for retained identities.
+    fn reference(&mut self, tree: u32, partition: PartitionKey) -> Result<()> {
+        if self.continuation.is_some() {
+            self.referenced
+                .try_reserve(1)
+                .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
+        }
+        if !self.referenced.insert((tree, partition)) {
+            return Err(Error::new(ErrorKind::Corruption));
+        }
         Ok(())
     }
 
@@ -585,7 +625,9 @@ impl Traversal {
                     match predicate.classify(context.manifest, &synopsis, header.entry_count())? {
                         // The synopsis proves no entry can satisfy the
                         // predicate: prune the leaf without charging entries.
-                        SynopsisClassification::NoMatch => return Ok(None),
+                        SynopsisClassification::NoMatch => {
+                            return Ok(None);
+                        }
                         // Every entry provably matches: skip per-entry
                         // evaluation but still charge every entry read.
                         SynopsisClassification::AllMatch => None,
@@ -647,6 +689,7 @@ impl Traversal {
         } else {
             self.scan_leaf(
                 context,
+                visit.entry.tree,
                 context.request.trees[visit.entry.tree as usize].tree_key(),
                 visit.entry.partition,
                 body,
@@ -708,7 +751,14 @@ impl Traversal {
         visit: &PreparedVisit<'_>,
     ) -> Result<()> {
         let level = visit.header.level() - 1;
-        let beam = beam_width(context.request.leaf_beam, level) as usize;
+        let beam = if self.continuation.is_some() {
+            visit
+                .header
+                .entry_count()
+                .min(context.request.budgets.visited_partitions()) as usize
+        } else {
+            beam_width(context.request.leaf_beam, level) as usize
+        };
         let retained = self
             .routing_bytes(visit.header.entry_count() as usize, beam)?
             .checked_add(context.input_bytes)
@@ -797,10 +847,36 @@ impl Traversal {
                 n.checked_mul(4 * (size_of::<((u32, u32), BinaryHeap<FrontierEntry>)>() + 16))
             })
             .ok_or_else(limit)?;
+        bytes = bytes
+            .checked_add(match &self.continuation {
+                Some(continuation) => continuation.heap_bytes(children)?,
+                None => 0,
+            })
+            .ok_or_else(limit)?;
         bytes
             .checked_add(groups)
             .and_then(|bytes| bytes.checked_add(self.candidates.heap_bytes().ok()?))
             .ok_or_else(limit)
+    }
+
+    /// Bounds retained routing/candidate state independently of cache retention.
+    fn check_retained(
+        &self,
+        context: &VisitContext<'_, impl RoutingExecution>,
+        children: usize,
+        extra: usize,
+    ) -> Result<()> {
+        if self.continuation.is_some() {
+            let bytes = self
+                .routing_bytes(children, 0)?
+                .checked_add(context.input_bytes)
+                .and_then(|bytes| bytes.checked_add(extra))
+                .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+            if bytes > context.execution.working_byte_limit() {
+                return Err(Error::new(ErrorKind::LimitExceeded));
+            }
+        }
+        Ok(())
     }
 
     /// Maintains exactly one top-B container for each tree and target level.
@@ -812,6 +888,18 @@ impl Traversal {
         distance: f64,
         leaf_beam: u32,
     ) -> Result<()> {
+        if let Some(continuation) = &mut self.continuation {
+            continuation.push(
+                FrontierEntry {
+                    distance,
+                    tree,
+                    partition,
+                    expected_level: Some(level),
+                },
+                level,
+            );
+            return Ok(());
+        }
         let width = beam_width(leaf_beam, level) as usize;
         if !self.next_frontier.contains_key(&(tree, level)) {
             self.next_frontier
@@ -853,6 +941,7 @@ impl Traversal {
         let BodyEntries::Internal(entries) = body.entries() else {
             return Err(Error::new(ErrorKind::Corruption));
         };
+        self.check_retained(context, entries.len(), 0)?;
         for (batch, children) in entries.chunks(4).enumerate() {
             if batch > 0 && batch % 16 == 0 {
                 super::cooperate(&|| context.execution.checkpoint()).await?;
@@ -875,9 +964,7 @@ impl Traversal {
                 // Every non-root partition has exactly one incoming Child
                 // Entry; a second reference is Corruption, not a duplicate to
                 // deduplicate.
-                if !self.referenced.insert((tree, child.child())) {
-                    return Err(Error::new(ErrorKind::Corruption));
-                }
+                self.reference(tree, child.child())?;
                 self.merge_child(
                     tree,
                     level - 1,
@@ -896,6 +983,7 @@ impl Traversal {
     async fn scan_leaf(
         &mut self,
         context: &VisitContext<'_, impl RoutingExecution>,
+        tree: u32,
         tree_key: &TreeKey,
         partition: PartitionKey,
         body: &CachedBody,
@@ -934,6 +1022,24 @@ impl Traversal {
         } else {
             None
         };
+        if let Some(continuation) = &mut self.continuation
+            && eligible
+                .as_ref()
+                .map_or(!entries.is_empty(), |ordinals| !ordinals.is_empty())
+        {
+            // Count exact eligibility, not admission to the bounded rough pool.
+            // A far leaf with matches still satisfies one unit of search effort.
+            continuation.record_effective_leaf(tree);
+        }
+        if self.continuation.is_some() {
+            let count = eligible.as_ref().map_or(entries.len(), Vec::len);
+            self.check_retained(
+                context,
+                0,
+                self.candidates
+                    .leaf_growth_bytes(count, body.heap_bytes())?,
+            )?;
+        }
         self.candidates
             .push_leaf(
                 entries,
@@ -949,6 +1055,10 @@ impl Traversal {
 
     /// Promotes the completed globally selected beams only after all parents contribute.
     fn select_next_frontier(&mut self) {
+        if let Some(continuation) = &mut self.continuation {
+            continuation.select(&mut self.frontier);
+            return;
+        }
         for (_, entries) in self.next_frontier.drain() {
             self.frontier.extend(entries.into_iter().map(Reverse));
         }
@@ -958,9 +1068,7 @@ impl Traversal {
     fn inject(&mut self, tree: u32, partition: PartitionKey, level: u32) -> Result<()> {
         // A split target is exclusively referenced by the root transition
         // state before exposure; any second reference is Corruption.
-        if !self.referenced.insert((tree, partition)) {
-            return Err(Error::new(ErrorKind::Corruption));
-        }
+        self.reference(tree, partition)?;
         self.frontier.push(Reverse(FrontierEntry {
             distance: 0.0,
             tree,
@@ -1059,6 +1167,9 @@ mod tests {
     }
 
     impl RoutingExecution for GraphExecution {
+        fn working_byte_limit(&self) -> usize {
+            self.working_bytes
+        }
         fn checkpoint(&self) -> Result<()> {
             Ok(())
         }
@@ -1319,6 +1430,9 @@ mod tests {
     struct ExactOnly;
 
     impl RoutingExecution for ExactOnly {
+        fn working_byte_limit(&self) -> usize {
+            256 * 1024 * 1024
+        }
         fn checkpoint(&self) -> Result<()> {
             Ok(())
         }
@@ -2687,5 +2801,357 @@ mod tests {
             &[tree_ref(&first), tree_ref(&second)],
         )
         .await;
+    }
+
+    /// Exercises the production policy directly, without benchmark features.
+    async fn filtered_search(
+        fixture: &Fixture<'_>,
+        trees: &[EnumeratedTree],
+        visits: u32,
+        beam: u32,
+        working_bytes: usize,
+        mode: RoutingMode,
+    ) -> Result<TraversalOutcome> {
+        let mut txn =
+            ReadLogicalTxn::for_index(MockReadTxn::new(fixture.items.clone()), fixture.manifest);
+        let kernel = VectorKernel::new(DIMENSION, Metric::L2, SEED).unwrap();
+        let predicate = CompiledPredicate::compile(
+            Predicate::Compare {
+                field: FieldId(1),
+                op: CompareOp::Eq,
+                value: Value::I64(100),
+            },
+            fixture.manifest.config().fields(),
+        )
+        .unwrap();
+        let execution = GraphExecution {
+            cache: PartitionCache::new(1 << 20),
+            working_bytes,
+            modes: std::sync::Mutex::new(Vec::new()),
+        };
+        super::traverse(
+            &mut txn,
+            &execution.cache,
+            &kernel,
+            TraversalRequest::new(&QUERY, trees, Some(&predicate), budgets(visits, 64), beam)
+                .unwrap()
+                .with_routing_mode(mode),
+            &execution,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn filtered_tree_allowances_are_independent_and_share_the_visit_budget() {
+        for matching in [false, true] {
+            let manifest = manifest();
+            let mut fixture = Fixture::new(&manifest);
+            let a = fixture.tree(1);
+            let b = fixture.tree(2);
+            fixture.header(&a, 1, 2, 2, PartitionState::Ready);
+            for leaf in [2, 3] {
+                fixture.child(&a, 1, leaf, [leaf as f32, 0.0]);
+                fixture.header(&a, leaf, 1, 1, PartitionState::Ready);
+                fixture.synopsis(&a, 1, leaf, &[100]);
+                fixture.entry(&a, 1, leaf, &format!("a{leaf}"), 100, [leaf as f32, 0.0]);
+            }
+            fixture.header(&b, 1, 3, 2, PartitionState::Ready);
+            for (parent, leaf) in [(2, 4), (3, 5)] {
+                let value = if matching && leaf == 5 { 100 } else { 0 };
+                fixture.child(&b, 1, parent, [parent as f32, 0.0]);
+                fixture.header(&b, parent, 2, 1, PartitionState::Ready);
+                fixture.child(&b, parent, leaf, [leaf as f32, 0.0]);
+                fixture.header(&b, leaf, 1, 1, PartitionState::Ready);
+                // MayMatch does not prove an entry actually passes the predicate.
+                fixture.synopsis(&b, 2, leaf, &[0, 200]);
+                fixture.entry(&b, 2, leaf, &format!("b{leaf}"), value, [leaf as f32, 0.0]);
+            }
+            let trees = [tree_ref(&a), tree_ref(&b)];
+            let result = filtered_search(&fixture, &trees, 7, 1, 1 << 20, RoutingMode::Exact)
+                .await
+                .unwrap();
+            assert_eq!(result.visited_partitions(), 7);
+            assert_eq!(result.visited_leaf_entries(), 3);
+            assert!(!result.partition_budget_exhausted());
+            assert_eq!(
+                candidate_ids(&result),
+                if matching {
+                    vec![b"a2".as_slice(), b"b5".as_slice()]
+                } else {
+                    vec![b"a2".as_slice()]
+                }
+            );
+            let limited = filtered_search(&fixture, &trees, 5, 1, 1 << 20, RoutingMode::Exact)
+                .await
+                .unwrap();
+            assert_eq!(limited.visited_partitions(), 5);
+            assert!(limited.partition_budget_exhausted());
+        }
+    }
+
+    #[tokio::test]
+    async fn filtered_pending_growth_obeys_routing_working_bytes() {
+        let manifest = manifest();
+        let mut fixture = Fixture::new(&manifest);
+        let tree = fixture.tree(1);
+        fixture.header(&tree, 1, 2, 200, PartitionState::Ready);
+        for child in 2..202 {
+            fixture.child(&tree, 1, child, [child as f32, 0.0]);
+        }
+        let result = filtered_search(
+            &fixture,
+            &[tree_ref(&tree)],
+            10,
+            1,
+            16 << 10,
+            RoutingMode::Exact,
+        )
+        .await;
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::LimitExceeded);
+    }
+
+    #[tokio::test]
+    async fn graph_exact_filtering_retains_children_for_replacement() {
+        use crate::api::LocalGraphConfig;
+        use crate::search::local_hnsw::{
+            Centroids,
+            persistence::{GraphSource, build_records},
+        };
+        let base = manifest();
+        let manifest = IndexManifest::new(
+            IndexLifecycle::Active,
+            id(1),
+            base.config()
+                .clone()
+                .with_local_graph(LocalGraphConfig::new(2, 8, SEED).unwrap()),
+            SEED,
+            base.bloom_parameters().to_vec(),
+        )
+        .unwrap();
+        let kernel = VectorKernel::new(DIMENSION, Metric::L2, SEED).unwrap();
+        let mut fixture = Fixture::new(&manifest);
+        let tree = fixture.tree(1);
+        let header = PartitionHeader::new(2, 2, 0, PartitionState::Ready).unwrap();
+        fixture.header(&tree, 1, 2, 2, PartitionState::Ready);
+        let children = vec![
+            ChildEntry::new(pk(2), vec![1.0, 0.0]),
+            ChildEntry::new(pk(3), vec![10.0, 0.0]),
+        ];
+        for (leaf, value, distance) in [(2, 0, 1.0), (3, 100, 10.0)] {
+            fixture.child(&tree, 1, leaf, [distance, 0.0]);
+            fixture.header(&tree, leaf, 1, 1, PartitionState::Ready);
+            fixture.synopsis(&tree, 1, leaf, &[value]);
+            fixture.entry(&tree, 1, leaf, &format!("r{leaf}"), value, [distance, 0.0]);
+        }
+        let records = build_records(
+            Centroids::new(&kernel, &children, 2, &|| Ok(())).unwrap(),
+            GraphSource {
+                index: id(1),
+                tree: &tree,
+                parent: pk(1),
+                header,
+                parameters: manifest.config().local_graph().unwrap().parameters(),
+            },
+            16 << 20,
+            &|| Ok(()),
+        )
+        .unwrap()
+        .records;
+        fixture.push(
+            keys::graph_descriptor_key(id(1), &tree, pk(1)),
+            PersistentValue::GraphDescriptor(records.descriptor.clone()),
+        );
+        for (ordinal, chunk) in records.chunks() {
+            fixture.push(
+                keys::graph_chunk_key(id(1), &tree, pk(1), ordinal),
+                PersistentValue::GraphChunk(chunk),
+            );
+        }
+        let result = filtered_search(
+            &fixture,
+            &[tree_ref(&tree)],
+            3,
+            1,
+            16 << 20,
+            RoutingMode::Exact,
+        )
+        .await
+        .unwrap();
+        assert_eq!(candidate_ids(&result), vec![b"r3".as_slice()]);
+        assert_eq!(result.visited_partitions(), 3);
+        assert!(!result.partition_budget_exhausted());
+        // Explicit approximate routing retains its existing bounded candidate semantics.
+        let graph = filtered_search(
+            &fixture,
+            &[tree_ref(&tree)],
+            3,
+            1,
+            16 << 20,
+            RoutingMode::PartitionLocalHnsw { ef_search: 8 },
+        )
+        .await
+        .unwrap();
+        assert!(graph.candidates().is_empty());
+        assert_eq!(graph.visited_partitions(), 2);
+    }
+
+    mod filtered_tests {
+        use super::*;
+
+        async fn search(
+            fixture: &Fixture<'_>,
+            tree: &TreeKey,
+            visits: u32,
+            beam: u32,
+        ) -> Result<TraversalOutcome> {
+            filtered_search(
+                fixture,
+                &[tree_ref(tree)],
+                visits,
+                beam,
+                1 << 20,
+                RoutingMode::Exact,
+            )
+            .await
+        }
+
+        /// The matching leaf is below an internal branch discarded by ordinary beam=1.
+        fn two_branches(fixture: &mut Fixture<'_>, matching: bool) -> TreeKey {
+            let tree = fixture.tree(1);
+            fixture.header(&tree, 1, 3, 2, PartitionState::Ready);
+            for (parent, leaf, distance, value) in
+                [(2, 4, 0.0, 0), (3, 5, 10.0, if matching { 100 } else { 0 })]
+            {
+                fixture.child(&tree, 1, parent, [distance, 0.0]);
+                fixture.header(&tree, parent, 2, 1, PartitionState::Ready);
+                fixture.child(&tree, parent, leaf, [distance, 0.0]);
+                fixture.header(&tree, leaf, 1, 1, PartitionState::Ready);
+                fixture.synopsis(&tree, 1, leaf, &[value]);
+                fixture.entry(&tree, 1, leaf, &format!("r{leaf}"), value, [distance, 0.0]);
+            }
+            tree
+        }
+
+        #[tokio::test]
+        async fn may_match_without_hits_does_not_consume_leaf_allowance() {
+            let manifest = manifest();
+            let mut fixture = Fixture::new(&manifest);
+            let tree = fixture.tree(1);
+            fixture.header(&tree, 1, 2, 3, PartitionState::Ready);
+            for leaf in 2..=4 {
+                fixture.child(&tree, 1, leaf, [leaf as f32, 0.0]);
+                fixture.header(&tree, leaf, 1, 1, PartitionState::Ready);
+                // Historical extrema permit 100, but only the final leaf has a match.
+                fixture.synopsis(&tree, 1, leaf, &[0, 200]);
+                fixture.entry(
+                    &tree,
+                    1,
+                    leaf,
+                    &format!("r{leaf}"),
+                    if leaf == 4 { 100 } else { 0 },
+                    [leaf as f32, 0.0],
+                );
+            }
+            let result = search(&fixture, &tree, 10, 1).await.unwrap();
+            assert_eq!(candidate_ids(&result), vec![b"r4".as_slice()]);
+            assert_eq!(result.visited_leaf_entries(), 3);
+            assert!(!result.partition_budget_exhausted());
+        }
+
+        #[tokio::test]
+        async fn effective_leaves_resume_parents_and_obey_total_limits() {
+            let manifest = manifest();
+            let mut fixture = Fixture::new(&manifest);
+            let tree = two_branches(&mut fixture, true);
+            let result = search(&fixture, &tree, 10, 1).await.unwrap();
+            assert_eq!(candidate_ids(&result), vec![b"r5".as_slice()]);
+            assert_eq!(result.visited_partitions(), 5);
+            assert!(!result.partition_budget_exhausted());
+            let limited = search(&fixture, &tree, 3, 1).await.unwrap();
+            assert!(limited.candidates().is_empty());
+            assert_eq!(limited.visited_partitions(), 3);
+            assert!(limited.partition_budget_exhausted());
+        }
+
+        #[tokio::test]
+        async fn all_rejected_leaves_finish_naturally_at_the_visit_limit() {
+            let manifest = manifest();
+            let mut fixture = Fixture::new(&manifest);
+            let tree = two_branches(&mut fixture, false);
+            let result = search(&fixture, &tree, 5, 1).await.unwrap();
+            assert_eq!(result.visited_partitions(), 5);
+            assert!(result.candidates().is_empty());
+            assert!(!result.partition_budget_exhausted());
+        }
+
+        #[tokio::test]
+        async fn effective_leaves_refill_only_the_remaining_allowance() {
+            let manifest = manifest();
+            let mut fixture = Fixture::new(&manifest);
+            let tree = fixture.tree(1);
+            fixture.header(&tree, 1, 2, 4, PartitionState::Ready);
+            for leaf in 2..=5 {
+                let value = if leaf == 2 { 0 } else { 100 };
+                fixture.child(&tree, 1, leaf, [leaf as f32, 0.0]);
+                fixture.header(&tree, leaf, 1, 1, PartitionState::Ready);
+                fixture.synopsis(&tree, 1, leaf, &[0, 200]);
+                fixture.entry(
+                    &tree,
+                    1,
+                    leaf,
+                    &format!("r{leaf}"),
+                    value,
+                    [leaf as f32, 0.0],
+                );
+            }
+            for visits in [4, 10] {
+                let result = search(&fixture, &tree, visits, 2).await.unwrap();
+                assert_eq!(
+                    candidate_ids(&result),
+                    vec![b"r3".as_slice(), b"r4".as_slice()]
+                );
+                assert_eq!(result.visited_partitions(), 4);
+                assert_eq!(result.visited_leaf_entries(), 3);
+                assert!(!result.partition_budget_exhausted());
+            }
+        }
+
+        #[tokio::test]
+        async fn effective_leaf_target_does_not_skip_root_split_targets() {
+            let manifest = manifest();
+            let mut fixture = Fixture::new(&manifest);
+            let tree = fixture.tree(1);
+            fixture.header(&tree, 1, 1, 0, PartitionState::DrainingSplit);
+            fixture.state(
+                &tree,
+                1,
+                PartitionTransition::DrainingSplit {
+                    left: pk(2),
+                    right: pk(3),
+                    started_at_unix_millis: 0,
+                },
+            );
+            fixture.synopsis(&tree, 1, 1, &[]);
+            for leaf in [2, 3] {
+                fixture.header(&tree, leaf, 1, 1, PartitionState::ReceivingSplit);
+                fixture.state(
+                    &tree,
+                    leaf,
+                    PartitionTransition::ReceivingSplit {
+                        source: pk(1),
+                        started_at_unix_millis: 0,
+                    },
+                );
+                fixture.synopsis(&tree, 1, leaf, &[100]);
+                fixture.entry(&tree, 1, leaf, &format!("r{leaf}"), 100, [leaf as f32, 0.0]);
+            }
+            let result = search(&fixture, &tree, 10, 1).await.unwrap();
+            assert_eq!(result.candidates().len(), 2);
+            assert_eq!(result.visited_partitions(), 3);
+            assert!(!result.partition_budget_exhausted());
+            let limited = search(&fixture, &tree, 2, 1).await.unwrap();
+            assert_eq!(limited.candidates().len(), 1);
+            assert!(limited.partition_budget_exhausted());
+        }
     }
 }

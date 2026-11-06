@@ -59,7 +59,10 @@ search options. For initial datasets, see [Bulk Build](docs/design/bulk-build.md
 - **Search within the data that matters.** Combine vector similarity with typed
   metadata predicates using SQL `WHERE` semantics. Route by fields such as tenant
   or collection, prune partitions using metadata summaries, and apply exact
-  filtering to returned hits.
+  filtering to returned hits. Filtered Exact search automatically replaces leaves
+  with no exact matches, continuing through upper branches until each Tree Key's
+  effective-leaf beam is met or the shared visit budget stops it. Unfiltered and
+  explicitly selected HNSW searches retain their existing traversal policy.
 - **Combine partitioned storage with graph-accelerated routing.** Optional local
   HNSW graphs make wider internal partitions practical to search, letting more
   child centroids compete at each routing step while keeping the routing structure
