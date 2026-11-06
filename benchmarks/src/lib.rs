@@ -11,6 +11,7 @@ mod report;
 mod resource;
 mod routing;
 mod runner;
+mod scenario;
 
 pub mod bridge;
 

@@ -746,3 +746,21 @@ Maintenance is disabled intentionally to keep that leaf unsplit. Compare identic
 builds/configurations and result digests; this is a scheduling diagnostic, not
 a steady-state throughput or recall benchmark. Use separate Cargo target directories
 when comparing checkouts to avoid reusing local-package build artifacts.
+
+## Harness source layout
+
+`src/scenario.rs` owns the deterministic scenario matrix and configuration.
+`src/runner.rs` loads datasets, selects the measurement flow, and assembles reports.
+Its private modules keep related execution and accounting together:
+
+- `runner/construction.rs`: index loading, Bulk Build, Structure Maintenance
+  convergence, and invariant verification.
+- `runner/workload.rs`: bounded dispatch, operation observations, recall, and
+  steady-state measurement.
+- `runner/lifecycle.rs`: import-to-search measurement, including continuous
+  phase timing and resource snapshots.
+- `runner/quality.rs`: verified fixture reuse, quality sweeps, and diagnostics.
+
+Keep request preparation, warmup, timed execution, resource sampling, maintenance
+waits, and verification in their existing order when changing these flows; moving
+work across a measurement interval changes report comparability.
