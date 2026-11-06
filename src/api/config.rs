@@ -383,8 +383,10 @@ impl Default for RuntimeConfig {
 }
 
 impl RuntimeConfig {
-    /// Sets the per-query graph routing working-byte ceiling (default 256 MiB).
-    /// Includes held bodies, restoration buffers, native scratch and caller-reserved
+    /// Sets the per-query retained traversal and graph working-byte ceiling (default 256 MiB).
+    /// Filtered Exact searches also charge pending branches and candidate/identity
+    /// state before growth; exceeding the ceiling returns `LimitExceeded`.
+    /// Includes held graph bodies, restoration buffers, native scratch and caller-reserved
     /// candidate/identity state. Cache capacity controls retention independently.
     pub fn with_routing_working_bytes(mut self, bytes: usize) -> Result<Self> {
         if bytes == 0 {
@@ -394,7 +396,7 @@ impl RuntimeConfig {
         Ok(self)
     }
 
-    /// Returns the graph routing working-byte ceiling.
+    /// Returns the retained traversal and graph working-byte ceiling.
     pub const fn routing_working_bytes(&self) -> usize {
         self.routing_working_bytes
     }

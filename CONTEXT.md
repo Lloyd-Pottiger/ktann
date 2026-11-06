@@ -184,6 +184,7 @@ _Avoid_: Partition count, convergence state
 - A **Leaf Partition** crossing its **Split Threshold** makes Structure Maintenance actionable without making the partition unsearchable
 - A **Search Outcome** may vary with searchable topology shape and Search Budget even when exact membership is unchanged
 - A filtered search returns at most its requested number of **Vector Records** within its **Search Budget**
+- With Exact routing and a predicate, the leaf beam targets leaves containing at least one exact match per **Tree Key**; empty filtered leaves are replaced through retained upper branches, under one shared **Search Budget**. Unfiltered and explicitly selected HNSW routing retain their level-scaled top-B policy.
 
 ## Contract clarifications
 

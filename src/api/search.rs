@@ -154,6 +154,11 @@ impl SearchOptions {
 
     /// Overrides the positive leaf-level base beam width.
     ///
+    /// With a predicate and Exact routing, each Tree Key targets this many leaves
+    /// containing at least one exact match, continuing across upper branches as
+    /// needed. Unfiltered and explicit HNSW searches retain level-scaled top-B
+    /// selection. All searches still share the total visited-partition budget.
+    ///
     /// The beam is a traversal-quality knob, not an accounted budget
     /// dimension: wider beams visit more partitions, all still charged to the
     /// visited-partition budget. When unset, the leaf-level base beam defaults

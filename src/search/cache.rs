@@ -153,6 +153,11 @@ pub(crate) struct CachedBody {
 }
 
 impl CachedBody {
+    /// Conservative decoded size already computed when the body was validated.
+    pub(crate) const fn heap_bytes(&self) -> u64 {
+        self.bytes
+    }
+
     /// Accounts the envelope and fixed-dimension decoded Child Entries.
     pub(crate) fn internal_bytes(count: u32, dimension: usize) -> u64 {
         let entry_bytes = (size_of::<ChildEntry>() as u64 + 32)

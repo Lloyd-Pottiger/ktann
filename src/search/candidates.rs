@@ -372,6 +372,26 @@ impl GlobalCandidatePool {
         Ok(())
     }
 
+    /// Admits one additional leaf before growing identity arrays or retaining its
+    /// projections. Full body bytes bound both ID payloads and shared leaf data;
+    /// array slack includes growth buffers and the final duplicate-check table.
+    pub(crate) fn leaf_growth_bytes(&self, count: usize, body_bytes: u64) -> Result<usize> {
+        let limit = || Error::new(ErrorKind::LimitExceeded);
+        let slots = self
+            .ids
+            .len()
+            .checked_add(count)
+            .ok_or_else(limit)?
+            .max(self.ids.capacity())
+            .checked_next_power_of_two()
+            .ok_or_else(limit)?;
+        slots
+            .checked_mul(4 * (size_of::<ObservedId>() + size_of::<&ObservedId>() + 8))
+            .and_then(|bytes| bytes.checked_add(usize::try_from(body_bytes).ok()?.checked_mul(2)?))
+            .and_then(|bytes| bytes.checked_add(128))
+            .ok_or_else(limit)
+    }
+
     /// Charges retained arrays, ID ownership, and the transient duplicate table.
     /// Two slots per ID, rounded up, conservatively cover table load-factor
     /// slack; the extra cache line covers control bytes for small tables.

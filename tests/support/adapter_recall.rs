@@ -20,7 +20,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use ktann::api::{
     CompareOp, DataType, ErrorKind, FieldId, FieldSchema, Index, IndexConfig, Metric, Mutation,
-    MutationOutcome, Predicate, Record, RuntimeConfig, SearchRequest, Value, VerifyOptions,
+    MutationOutcome, Predicate, Record, RuntimeConfig, SearchOptions, SearchRequest, Value,
+    VerifyOptions,
 };
 use ktann::runtime::Runtime;
 use ktann::storage::backend::Backend;
@@ -219,6 +220,32 @@ pub async fn run<B: Backend>(backend: B, base: Vec<Arc<[f32]>>, queries: Vec<Arc
         "issues: {:?}",
         report.issues
     );
+
+    // A single exact match must remain reachable even when the closest initial
+    // beam does not contain it. This uses the default production Exact policy
+    // on each real adapter, including its snapshot and predicate implementation.
+    let target = base.len() - 1;
+    for query in &queries {
+        let request = SearchRequest::new(query.clone(), 1)
+            .expect("request")
+            .with_options(
+                SearchOptions::default()
+                    .with_leaf_beam_size(1)
+                    .expect("beam"),
+            )
+            .with_predicate(Predicate::Compare {
+                field: FieldId(1),
+                op: CompareOp::Eq,
+                value: Value::I64(i64::try_from(target).expect("fixture size")),
+            });
+        let outcome = split
+            .search(request)
+            .await
+            .expect("automatic filtered search");
+        assert_eq!(outcome.hits.len(), 1);
+        assert_eq!(outcome.hits[0].id(), &record_id(target));
+        assert!(!outcome.exhausted.visited_partitions);
+    }
 
     runtime.shutdown().await.expect("shutdown");
 }

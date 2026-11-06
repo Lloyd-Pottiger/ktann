@@ -16,6 +16,8 @@ pub(crate) type PartitionReferences = std::collections::HashSet<(u32, PartitionK
 /// Runtime execution boundary: one snapshot, bounded owned CPU work and control.
 /// Traversal owns candidate selection; the runtime owns admission and dispatch.
 pub(crate) trait RoutingExecution: Sync {
+    /// Per-query ceiling for retained routing state and graph work.
+    fn working_byte_limit(&self) -> usize;
     fn checkpoint(&self) -> Result<()>;
     async fn read<T: ReadOps>(
         &self,
