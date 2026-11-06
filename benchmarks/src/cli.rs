@@ -18,7 +18,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::compare::{self, ComparisonPolicy};
 use crate::report::{BenchmarkReport, BenchmarkSuite};
-use crate::runner::{self, ScenarioSpec};
+use crate::runner;
+use crate::scenario::{self, ScenarioSpec};
 
 const IMPORT_LIFECYCLE_SCENARIO: &str = "import-to-search-lifecycle";
 
@@ -415,7 +416,7 @@ fn default_worker_threads() -> usize {
 
 /// Runs every selected scenario in a fresh subprocess and assembles one suite.
 fn run_suite(options: RunOptions) -> Result<(), String> {
-    let all = runner::scenarios(&options.profile)?;
+    let all = scenario::scenarios(&options.profile)?;
     let selected: Vec<_> = all
         .into_iter()
         .filter(|scenario| {
@@ -474,7 +475,7 @@ fn run_suite(options: RunOptions) -> Result<(), String> {
 
 /// Builds one Tokio runtime and executes exactly one isolated scenario.
 fn run_worker(options: WorkerOptions) -> Result<(), String> {
-    let mut scenario = runner::scenarios(&options.profile)?
+    let mut scenario = scenario::scenarios(&options.profile)?
         .into_iter()
         .find(|scenario| scenario.name == options.scenario)
         .ok_or_else(|| format!("unknown scenario `{}`", options.scenario))?;
