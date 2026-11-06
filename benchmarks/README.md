@@ -413,9 +413,6 @@ vectordbbench ktann --socket-path /tmp/ktann-bench.sock \
   --refinement-rounds 2 --refinement-memory-bytes 12884901888
 ```
 
-The [issue #204 validation report](reports/issue-204-label-filters/README.md)
-retains the official label workload measurements and both backend process tests.
-
 The 12 GiB refinement budget is a conservative admission limit, not an RSS
 reservation. For 1M 768-dimensional records with eight-byte IDs, retained-input
 admission alone charges approximately 9.57 GiB, before partition plans; a 1 GiB
