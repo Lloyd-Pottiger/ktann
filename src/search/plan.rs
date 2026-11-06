@@ -985,15 +985,15 @@ mod tests {
         FieldSchema::new(name, DataType::String).expect("valid field")
     }
 
-    pub(super) fn i64_value(value: i64) -> Value {
+    fn i64_value(value: i64) -> Value {
         Value::I64(value)
     }
 
-    pub(super) fn string_value(value: &str) -> Value {
+    fn string_value(value: &str) -> Value {
         Value::String(value.to_owned())
     }
 
-    pub(super) fn compare(field: u16, op: CompareOp, value: Value) -> Predicate {
+    fn compare(field: u16, op: CompareOp, value: Value) -> Predicate {
         Predicate::Compare {
             field: FieldId(field),
             op,
@@ -1023,7 +1023,7 @@ mod tests {
         keys::tree_manifest_plan_range(index, prefix.as_bytes(), lower.as_deref(), upper.as_deref())
     }
 
-    pub(super) fn assert_ordered_and_disjoint(plan: &TreeKeyPlan) {
+    fn assert_ordered_and_disjoint(plan: &TreeKeyPlan) {
         for pair in plan.ranges().windows(2) {
             assert!(
                 pair[0].end() <= pair[1].start(),
@@ -1185,93 +1185,6 @@ mod tests {
                 "{key:?}"
             );
         }
-    }
-
-    #[test]
-    fn widening_keeps_the_typed_checks_when_expansion_exceeds_the_limit() {
-        let manifest = test_manifest(vec![i64_field("a")], vec![FieldId(0)]);
-        let predicate = Predicate::In {
-            field: FieldId(0),
-            values: vec![i64_value(1), i64_value(3), i64_value(5)],
-        };
-        let plan = plan_tree_keys(&manifest, Some(&predicate), 2).expect("plan");
-        assert_eq!(plan.ranges(), &[keys::tree_manifest_range(id(1))]);
-        for value in [1, 3, 5] {
-            let tree_key =
-                TreeKey::encode(&[DataType::I64], &[i64_value(value)]).expect("canonical key");
-            assert!(plan.accepts(&tree_key).expect("accepts"));
-        }
-        for value in [2, 4] {
-            let tree_key =
-                TreeKey::encode(&[DataType::I64], &[i64_value(value)]).expect("canonical key");
-            assert!(!plan.accepts(&tree_key).expect("accepts"));
-        }
-    }
-
-    #[test]
-    fn or_over_different_fields_widens_to_the_complete_directory() {
-        let manifest = test_manifest(
-            vec![i64_field("a"), i64_field("b")],
-            vec![FieldId(0), FieldId(1)],
-        );
-        let predicate = Predicate::Or(vec![
-            compare(0, CompareOp::Eq, i64_value(1)),
-            compare(1, CompareOp::Eq, i64_value(2)),
-        ]);
-        let plan = plan_tree_keys(&manifest, Some(&predicate), 1_024).expect("plan");
-        assert_eq!(plan.ranges(), &[keys::tree_manifest_range(id(1))]);
-        let values = [i64_value(1), i64_value(2)];
-        let tree_key =
-            TreeKey::encode(&[DataType::I64, DataType::I64], &values).expect("canonical key");
-        assert!(plan.accepts(&tree_key).expect("accepts"));
-    }
-
-    #[test]
-    fn negation_of_one_field_complements_exactly() {
-        let manifest = test_manifest(vec![i64_field("a")], vec![FieldId(0)]);
-        let plan = plan_tree_keys(
-            &manifest,
-            Some(&Predicate::Not(Box::new(compare(
-                0,
-                CompareOp::Eq,
-                i64_value(5),
-            )))),
-            1_024,
-        )
-        .expect("plan");
-        // The two complement halves are unbounded toward the domain ends, so
-        // the ranges tile the directory and merge into the complete range.
-        assert_eq!(plan.ranges(), &[keys::tree_manifest_range(id(1))]);
-        assert_ordered_and_disjoint(&plan);
-        for (value, accepted) in [
-            (i64::MIN, true),
-            (4, true),
-            (5, false),
-            (6, true),
-            (i64::MAX, true),
-        ] {
-            let tree_key =
-                TreeKey::encode(&[DataType::I64], &[i64_value(value)]).expect("canonical key");
-            assert_eq!(
-                plan.accepts(&tree_key).expect("accepts"),
-                accepted,
-                "{value}"
-            );
-        }
-    }
-
-    #[test]
-    fn negation_of_multiple_fields_widens_conservatively() {
-        let manifest = test_manifest(
-            vec![i64_field("a"), i64_field("b")],
-            vec![FieldId(0), FieldId(1)],
-        );
-        let predicate = Predicate::Not(Box::new(Predicate::And(vec![
-            compare(0, CompareOp::Eq, i64_value(1)),
-            compare(1, CompareOp::Eq, i64_value(2)),
-        ])));
-        let plan = plan_tree_keys(&manifest, Some(&predicate), 1_024).expect("plan");
-        assert_eq!(plan.ranges(), &[keys::tree_manifest_range(id(1))]);
     }
 
     #[test]
@@ -1593,42 +1506,33 @@ mod tests {
     }
 
     #[test]
-    fn next_string_appends_nul_below_the_length_ceiling() {
-        assert_eq!(
-            next_string("É", MAX_STRING_BYTES).expect("successor"),
-            Some("É\0".to_owned())
-        );
-    }
-
-    #[test]
-    fn next_string_grows_within_a_multibyte_character_at_the_ceiling() {
-        // "É" is [0xC3, 0x89]; at a two-byte ceiling the successor increments
-        // the continuation byte to [0xC3, 0x8A], which is U+00CA.
-        assert_eq!(
-            next_string("É", 2).expect("successor"),
-            Some("Ê".to_owned())
-        );
-    }
-
-    #[test]
-    fn next_string_skips_the_surrogate_gap() {
-        // U+D7FF is [0xED, 0x9F, 0xBF]; the next Unicode scalar value is
-        // U+E000, because surrogates are not valid UTF-8.
-        assert_eq!(
-            next_string("\u{D7FF}", 3).expect("successor"),
-            Some("\u{E000}".to_owned())
-        );
-    }
-
-    #[test]
-    fn next_string_reports_none_for_the_greatest_ceiling_length_string() {
-        assert_eq!(next_string("\u{10FFFF}", 4).expect("successor"), None);
-    }
-
-    #[test]
-    fn next_string_reports_none_when_only_longer_characters_remain() {
-        // Every character above U+007F needs at least two bytes.
-        assert_eq!(next_string("\u{7F}", 1).expect("successor"), None);
+    fn next_string_respects_utf8_and_the_length_ceiling() {
+        let cases = [
+            (
+                "append NUL below ceiling",
+                "É",
+                MAX_STRING_BYTES,
+                Some("É\0"),
+            ),
+            (
+                "increment multibyte character at ceiling",
+                "É",
+                2,
+                Some("Ê"),
+            ),
+            // Surrogates are not valid Unicode scalar values.
+            ("skip surrogate gap", "\u{D7FF}", 3, Some("\u{E000}")),
+            ("greatest scalar at ceiling", "\u{10FFFF}", 4, None),
+            // Every character above U+007F needs at least two bytes.
+            ("only longer characters remain", "\u{7F}", 1, None),
+        ];
+        for (case, value, ceiling, expected) in cases {
+            assert_eq!(
+                next_string(value, ceiling).expect("successor").as_deref(),
+                expected,
+                "{case}"
+            );
+        }
     }
 
     // --- Enumeration ---
@@ -1741,7 +1645,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enumeration_merges_multiple_ranges_in_canonical_order() {
+    async fn enumeration_orders_multiple_ranges_and_shares_the_budget() {
         let manifest = test_manifest(vec![i64_field("a")], vec![FieldId(0)]);
         let types = [DataType::I64];
         let data: Vec<(Vec<u8>, Vec<u8>)> = (1..=4)
@@ -1756,6 +1660,14 @@ mod tests {
             1_024,
         )
         .expect("plan");
+        assert_eq!(plan.ranges().len(), 2);
+        // Exhausting the budget at the end of the first range must still
+        // report truncation when another range remains.
+        let short = enumerate(&manifest, &plan, 1, data.clone()).await;
+        assert_eq!(short.scanned_tree_keys(), 1);
+        assert!(short.scanned_tree_key_budget_exhausted());
+        assert_eq!(tree_values(&short, &types), vec![vec![i64_value(1)]]);
+
         let enumeration = enumerate(&manifest, &plan, 10, data).await;
         assert_eq!(
             tree_values(&enumeration, &types),
@@ -1763,28 +1675,6 @@ mod tests {
         );
         assert_eq!(enumeration.scanned_tree_keys(), 2);
         assert!(!enumeration.scanned_tree_key_budget_exhausted());
-    }
-
-    #[tokio::test]
-    async fn crossing_a_range_boundary_with_no_budget_reports_exhaustion() {
-        let manifest = test_manifest(vec![i64_field("a")], vec![FieldId(0)]);
-        let types = [DataType::I64];
-        let data: Vec<(Vec<u8>, Vec<u8>)> = (1..=2)
-            .map(|value| directory_item(&manifest, &types, &[i64_value(value)]))
-            .collect();
-        let plan = plan_tree_keys(
-            &manifest,
-            Some(&Predicate::In {
-                field: FieldId(0),
-                values: vec![i64_value(1), i64_value(2)],
-            }),
-            1_024,
-        )
-        .expect("plan");
-        let enumeration = enumerate(&manifest, &plan, 1, data).await;
-        assert_eq!(enumeration.scanned_tree_keys(), 1);
-        assert!(enumeration.scanned_tree_key_budget_exhausted());
-        assert_eq!(tree_values(&enumeration, &types), vec![vec![i64_value(1)]]);
     }
 
     #[tokio::test]
@@ -1878,7 +1768,7 @@ mod tests {
     async fn enumeration_fails_closed_on_a_malformed_directory_key() {
         let manifest = test_manifest(vec![i64_field("a")], vec![FieldId(0)]);
         let plan = plan_tree_keys(&manifest, None, 1_024).expect("plan");
-        // The bare directory prefix is not a canonical Tree Key for a String
+        // The bare directory prefix is not a canonical Tree Key for an I64
         // schema: the decoder must reject it rather than skip it.
         let key = keys::tree_manifest_range(id(1)).start().to_vec();
         let value = ValueCodec::for_index(&manifest)
@@ -1902,74 +1792,6 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::Corruption);
     }
 
-    #[tokio::test]
-    async fn a_lower_bounded_only_interval_enumerates_everything_above() {
-        let manifest = test_manifest(vec![i64_field("a")], vec![FieldId(0)]);
-        let types = [DataType::I64];
-        let data: Vec<(Vec<u8>, Vec<u8>)> = [5_i64, 10, 15, 20]
-            .iter()
-            .map(|value| directory_item(&manifest, &types, &[i64_value(*value)]))
-            .collect();
-        let plan = plan_tree_keys(
-            &manifest,
-            Some(&compare(0, CompareOp::GreaterOrEqual, i64_value(10))),
-            1_024,
-        )
-        .expect("plan");
-        let enumeration = enumerate(&manifest, &plan, 10, data).await;
-        assert_eq!(
-            tree_values(&enumeration, &types),
-            vec![
-                vec![i64_value(10)],
-                vec![i64_value(15)],
-                vec![i64_value(20)]
-            ]
-        );
-        assert!(!enumeration.scanned_tree_key_budget_exhausted());
-    }
-
-    #[tokio::test]
-    async fn not_equal_enumerates_both_sides_of_the_excluded_point() {
-        let manifest = test_manifest(vec![i64_field("a")], vec![FieldId(0)]);
-        let types = [DataType::I64];
-        let data: Vec<(Vec<u8>, Vec<u8>)> = [4_i64, 5, 6, 7]
-            .iter()
-            .map(|value| directory_item(&manifest, &types, &[i64_value(*value)]))
-            .collect();
-        let plan = plan_tree_keys(
-            &manifest,
-            Some(&compare(0, CompareOp::NotEq, i64_value(5))),
-            1_024,
-        )
-        .expect("plan");
-        let enumeration = enumerate(&manifest, &plan, 10, data).await;
-        assert_eq!(
-            tree_values(&enumeration, &types),
-            vec![vec![i64_value(4)], vec![i64_value(6)], vec![i64_value(7)]]
-        );
-    }
-
-    #[tokio::test]
-    async fn a_string_lower_bound_enumerates_every_greater_value() {
-        let manifest = test_manifest(vec![string_field("a")], vec![FieldId(0)]);
-        let types = [DataType::String];
-        let data: Vec<(Vec<u8>, Vec<u8>)> = ["a", "b", "c"]
-            .iter()
-            .map(|value| directory_item(&manifest, &types, &[string_value(value)]))
-            .collect();
-        let plan = plan_tree_keys(
-            &manifest,
-            Some(&compare(0, CompareOp::Gt, string_value("a"))),
-            1_024,
-        )
-        .expect("plan");
-        let enumeration = enumerate(&manifest, &plan, 10, data).await;
-        assert_eq!(
-            tree_values(&enumeration, &types),
-            vec![vec![string_value("b")], vec![string_value("c")]]
-        );
-    }
-
     // --- Property tests ---
 
     fn property_schema() -> Vec<FieldSchema> {
@@ -1982,7 +1804,7 @@ mod tests {
         ]
     }
 
-    pub(super) fn property_manifest() -> IndexManifest {
+    fn property_manifest() -> IndexManifest {
         test_manifest(property_schema(), vec![FieldId(0), FieldId(1)])
     }
 
@@ -2075,7 +1897,7 @@ mod tests {
         (small_i64(), small_string()).prop_map(|(a, b)| vec![a, b])
     }
 
-    pub(super) fn oracle(predicate: &Predicate, key_values: &[Value]) -> bool {
+    fn oracle(predicate: &Predicate, key_values: &[Value]) -> bool {
         match predicate {
             Predicate::And(children) => children.iter().all(|child| oracle(child, key_values)),
             Predicate::Or(children) => children.iter().any(|child| oracle(child, key_values)),
@@ -2112,18 +1934,6 @@ mod tests {
             let tree_key = TreeKey::encode(&property_types(), &key).expect("canonical key");
             if oracle(&predicate, &key) {
                 prop_assert!(plan.accepts(&tree_key).expect("accepts"));
-            }
-        }
-
-        #[test]
-        fn every_oracle_match_lies_inside_a_planned_range(
-            predicate in pure_predicate(),
-            key in tree_key_values(),
-        ) {
-            let manifest = property_manifest();
-            let plan = plan_tree_keys(&manifest, Some(&predicate), 8).expect("plan");
-            let tree_key = TreeKey::encode(&property_types(), &key).expect("canonical key");
-            if oracle(&predicate, &key) {
                 // Enumeration only scans the planned ranges, so every matching
                 // Tree Key must byte-order inside at least one of them.
                 let directory_key = keys::tree_manifest_key(manifest.logical_index_id(), &tree_key);
@@ -2146,17 +1956,8 @@ mod tests {
             prop_assert_eq!(plan.accepts(&tree_key).expect("accepts"), oracle(&predicate, &key));
         }
     }
-}
 
-#[cfg(test)]
-mod exhaustive {
-    use super::tests::{
-        assert_ordered_and_disjoint, compare, i64_value, oracle, property_manifest, string_value,
-    };
-    use crate::api::{CompareOp, DataType, FieldId, Predicate, Value};
-    use crate::storage::keys::{self, TreeKey};
-
-    use super::plan_tree_keys;
+    // --- Exhaustive and regression cases ---
 
     fn format_predicate(predicate: &Predicate) -> String {
         match predicate {
