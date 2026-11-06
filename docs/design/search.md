@@ -187,6 +187,14 @@ partitions or recall policy. On Local Graph Indexes the prefetched prefix contai
 only leaves and stops before the first internal partition, including when trees
 of different heights share the frontier. Internal graph visits remain serial.
 
+For graph-enabled internal bodies, duplicate-reference validation and local
+candidate selection share one admitted CPU task. Traversal transfers its observed
+reference set into that task and receives it back with the candidates. Every
+Child Entry is still checked, including those excluded by local top-B. The task
+checks operation control at bounded intervals; wide bodies do not require an
+async yield for every validation batch. Failure aborts the search, and detached
+CPU work retains admission until it exits.
+
 Within that funded prefix, traversal validates metadata and applies Synopsis
 pruning before prefetching body pages. At most four first pages of cache misses
 are read together, each under the existing 256-entry/1 MiB encoded scan limits
