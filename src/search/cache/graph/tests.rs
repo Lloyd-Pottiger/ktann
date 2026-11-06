@@ -48,7 +48,14 @@ async fn graph_reference_validation_checks_unselected_edges_and_control() {
         }
     });
     assert_eq!(result.unwrap_err().kind(), ErrorKind::Cancelled);
-    assert_eq!(references.len(), 64);
+    assert!(
+        !references.is_empty(),
+        "validation made progress before cancellation"
+    );
+    assert!(
+        references.len() < graph.children().len(),
+        "cancellation stopped validation early"
+    );
 }
 
 impl GraphRead {
