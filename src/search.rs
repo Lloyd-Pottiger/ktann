@@ -35,3 +35,21 @@ pub(crate) async fn cooperate(
     tokio::task::yield_now().await;
     check()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::beam_width;
+
+    #[test]
+    fn beam_width_halves_toward_the_root_with_minimum_one() {
+        assert_eq!(beam_width(32, 1), 32);
+        assert_eq!(beam_width(32, 2), 16);
+        assert_eq!(beam_width(32, 3), 8);
+        assert_eq!(beam_width(32, 4), 4);
+        assert_eq!(beam_width(32, 5), 2);
+        assert_eq!(beam_width(32, 6), 1);
+        assert_eq!(beam_width(32, 40), 1);
+        assert_eq!(beam_width(1, 1), 1);
+        assert_eq!(beam_width(3, 2), 1);
+    }
+}
