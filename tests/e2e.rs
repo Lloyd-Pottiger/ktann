@@ -8,7 +8,7 @@
 //!
 //! KDDT requests use a test-only default leaf beam of 8 so small settled trees
 //! exercise approximate routing; production SearchOptions keep their default
-//! of 381. A directive can override the test default with `beam-size=`.
+//! of 384. A directive can override the test default with `beam-size=`.
 //!
 //! Directives:
 //!
@@ -1548,7 +1548,7 @@ fn fill_fields(
 }
 
 /// Keeps small KDDT datasets approximate enough to exercise tree routing.
-/// Production requests retain their independent default of 381.
+/// Production requests retain their independent default of 384.
 const TEST_DEFAULT_LEAF_BEAM: u32 = 8;
 
 /// Builds Search Budget overrides from directive arguments.

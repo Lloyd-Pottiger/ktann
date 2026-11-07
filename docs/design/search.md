@@ -158,7 +158,7 @@ cannot hide malformed entries in a loaded body.
 
 `SearchOptions::routing_mode` defaults to PartitionLocalHnsw with ef_search=64.
 With a predicate, explicitly selected Exact search uses the leaf beam (default
-381) as an effective-leaf target **per Tree Key**.
+384) as an effective-leaf target **per Tree Key**.
 A leaf counts when at least one entry passes the exact predicate, before rough
 candidate pruning. NoMatch and MayMatch with zero true entries consume visits
 but no effective-leaf allowance. All trees share the existing partition budget.

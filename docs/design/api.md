@@ -246,7 +246,7 @@ The runtime defaults and caps are:
 | Scanned Tree Keys | 4,096 | 65,536 |
 | Visited partitions | 1,024 | 16,384 |
 | Exact rerank candidates | `min(max(64,k+ceil(k/4)),65,536)` | Runtime ceiling 65,536; effective value at least `k` |
-| Leaf beam size | 381 | 16,384 |
+| Leaf beam size | 384 | 16,384 |
 | Write beam size | 4 | 16,384 |
 | Tree Key scan ranges | 1,024 | wider conservative fallback |
 

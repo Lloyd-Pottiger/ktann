@@ -371,7 +371,7 @@ Construction uses IndexConfig defaults (leaf 16/128, internal 64/16384,
 local HNSW graphs with M=16, ef_construction=200, seed=7), a sample
 cap of 1024, 1 GiB tree memory and 64 GiB tree scratch. The tree budget covers
 the constructor reservation for wide internal nodes at Cohere dimensionality. Only an explicit leaf-beam
-option changes the default beam of 381. Search defaults to partition-local HNSW
+option changes the default beam of 384. Search defaults to partition-local HNSW
 with ef_search=64; rerank sizing remains derived from k. Optimize returns readiness and record count;
 per-level Header statistics and an independent Header-slot limit are not part of
 the bridge contract.
