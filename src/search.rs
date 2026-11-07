@@ -14,6 +14,9 @@ pub(crate) mod rabitq;
 pub(crate) mod rerank;
 pub(crate) mod traverse;
 
+#[cfg(test)]
+mod test_support;
+
 /// Returns the level-scaled beam width shared by search and foreground writes.
 /// The configured leaf-level width halves toward the root and never drops
 /// below one.

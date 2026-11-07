@@ -49,6 +49,7 @@ ktann-memory = { path = "ktann-memory", features = ["test-support"] }
 metrics-util = "0.20"
 num-bigint = "0.4"
 proptest = "1"
+tempfile = "3"
 tracing-subscriber = "0.3"
 
 [lints]

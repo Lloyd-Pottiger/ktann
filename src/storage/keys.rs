@@ -1098,13 +1098,6 @@ mod tests {
     }
 
     #[test]
-    fn index_range_is_contiguous_across_adjacent_ids() {
-        let one = index_range(LogicalIndexId::new(1).expect("one is nonzero"));
-        let two = index_range(LogicalIndexId::new(2).expect("two is nonzero"));
-        assert_eq!(one.end(), two.start());
-    }
-
-    #[test]
     fn plan_range_without_bounds_is_the_directory_prefix() {
         let index = LogicalIndexId::new(7).expect("nonzero");
         let range = tree_manifest_plan_range(index, b"", None, None);

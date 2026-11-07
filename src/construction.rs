@@ -829,39 +829,12 @@ mod tests {
     use super::*;
     use crate::api::Metric;
     use std::collections::{BTreeMap, BTreeSet};
-    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-
-    struct Directory(PathBuf);
-
-    impl Directory {
-        fn new() -> Self {
-            Self(std::env::temp_dir().join(format!(
-                    "ktann-construction-{}-{}-{}",
-                    std::process::id(),
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_nanos(),
-                    NEXT.fetch_add(1, AtomicOrdering::Relaxed)
-                )))
-        }
-    }
-
-    impl Drop for Directory {
-        fn drop(&mut self) {
-            if self.0.exists() {
-                fs::remove_dir_all(&self.0).unwrap();
-            }
-        }
-    }
-
     #[test]
     fn scratch_vector_reads_cross_buffers_and_reject_truncation_or_nonfinite_values() {
-        let directory = Directory::new();
-        fs::create_dir(&directory.0).unwrap();
-        let path = directory.0.join("input.run");
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("scratch");
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("input.run");
         let dimension = BUFFER_BYTES / 4 + 1;
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&3_u32.to_be_bytes());
@@ -941,15 +914,16 @@ mod tests {
         options: ConstructionOptions,
         config: &IndexConfig,
     ) -> (ConstructionReport, BTreeMap<u64, PartitionPlan>) {
-        let dir = Directory::new();
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("scratch");
         let mut plans = BTreeMap::new();
-        let report = construct_tree(&dir.0, config, [7; 32], options, input, |plan| {
+        let report = construct_tree(&dir, config, [7; 32], options, input, |plan| {
             assert!(plans.insert(plan.key.get(), plan).is_none());
             Ok(())
         })
         .unwrap();
         assert_eq!(
-            fs::read_dir(&dir.0).unwrap().count(),
+            fs::read_dir(&dir).unwrap().count(),
             0,
             "all intermediate runs reclaimed"
         );
@@ -1086,7 +1060,8 @@ mod tests {
     fn grouping_keeps_variable_id_ties_canonical_across_spill_budgets() {
         for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
             let make = |budget: usize| {
-                let directory = Directory::new();
+                let root = tempfile::tempdir().unwrap();
+                let directory = root.path().join("scratch");
                 let mut settings = options();
                 settings.memory_bytes = budget;
                 let mut input: Vec<_> = (0_u64..513)
@@ -1103,7 +1078,7 @@ mod tests {
                 input.sort_unstable_by(|a, b| a.id.cmp(&b.id));
                 let mut plans = BTreeMap::new();
                 construct_tree(
-                    &directory.0,
+                    &directory,
                     &config(7, metric),
                     [7; 32],
                     settings,
@@ -1115,7 +1090,7 @@ mod tests {
                     },
                 )
                 .unwrap();
-                assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 0);
+                assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
                 plans
             };
             let a = make(200_000);
@@ -1156,7 +1131,8 @@ mod tests {
             );
             for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
                 let make = |memory| {
-                    let directory = Directory::new();
+                    let root = tempfile::tempdir().unwrap();
+                    let directory = root.path().join("scratch");
                     let mut settings = constrained;
                     settings.memory_bytes = memory;
                     let mut records: Vec<_> = (0_u64..257)
@@ -1178,7 +1154,7 @@ mod tests {
                     records.sort_unstable_by(|a, b| a.id.cmp(&b.id));
                     let mut plans = BTreeMap::new();
                     let report = construct_tree(
-                        &directory.0,
+                        &directory,
                         &config(dimension, metric),
                         [7; 32],
                         settings,
@@ -1202,7 +1178,7 @@ mod tests {
                     if memory == low {
                         assert!(report.scratch_written_bytes > report.peak_scratch_bytes);
                     }
-                    assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 0);
+                    assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
                     plans
                 };
                 let expected = make(4 * 1024 * 1024);
@@ -1221,11 +1197,13 @@ mod tests {
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[&1].level, 1);
 
-        let dir = Directory::new();
+        let root = tempfile::tempdir().unwrap();
+
+        let dir = root.path().join("scratch");
         let mut bounded = options();
         bounded.scratch_bytes = 50;
         let error = construct_tree(
-            &dir.0,
+            &dir,
             &config(2, Metric::L2),
             [7; 32],
             bounded,
@@ -1234,7 +1212,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::LimitExceeded);
-        let bytes: u64 = fs::read_dir(&dir.0)
+        let bytes: u64 = fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().metadata().unwrap().len())
             .sum();
@@ -1288,11 +1266,12 @@ mod tests {
 
     #[test]
     fn failures_propagate_without_replacing_caller_files_or_claiming_success() {
-        let dir = Directory::new();
-        fs::create_dir(&dir.0).unwrap();
-        fs::write(dir.0.join("sentinel"), b"caller data").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("scratch");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("sentinel"), b"caller data").unwrap();
         let error = construct_tree(
-            &dir.0,
+            &dir,
             &config(2, Metric::L2),
             [7; 32],
             options(),
@@ -1303,15 +1282,17 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::Backend);
         let source = std::error::Error::source(&error).unwrap();
         assert!(source.downcast_ref::<std::io::Error>().is_some());
-        assert_eq!(fs::read(dir.0.join("sentinel")).unwrap(), b"caller data");
+        assert_eq!(fs::read(dir.join("sentinel")).unwrap(), b"caller data");
 
-        let dir = Directory::new();
+        let root = tempfile::tempdir().unwrap();
+
+        let dir = root.path().join("scratch");
         let input = records(8, true)
             .into_iter()
             .chain([Err(Error::new(ErrorKind::Cancelled))]);
         assert_eq!(
             construct_tree(
-                &dir.0,
+                &dir,
                 &config(2, Metric::L2),
                 [7; 32],
                 options(),
@@ -1323,10 +1304,12 @@ mod tests {
             ErrorKind::Cancelled
         );
 
-        let dir = Directory::new();
+        let root = tempfile::tempdir().unwrap();
+
+        let dir = root.path().join("scratch");
         let mut emitted = 0;
         let error = construct_tree(
-            &dir.0,
+            &dir,
             &config(2, Metric::L2),
             [7; 32],
             options(),
@@ -1351,13 +1334,14 @@ mod tests {
         large_budget.memory_bytes = usize::MAX;
         let (_, plans) = build(records(1, true), large_budget, &config(2, Metric::L2));
         assert_eq!(plans.len(), 1);
-        let dir = Directory::new();
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("scratch");
         let invalid_config = config(2, Metric::L2)
             .with_tree_key_fields(vec![crate::api::FieldId(0)])
             .unwrap();
         assert_eq!(
             construct_tree(
-                &dir.0,
+                &dir,
                 &invalid_config,
                 [7; 32],
                 options(),
@@ -1368,12 +1352,12 @@ mod tests {
             .kind(),
             ErrorKind::InvalidArgument
         );
-        assert!(!dir.0.exists());
+        assert!(!dir.exists());
         let mut invalid = options();
         invalid.memory_bytes = 1;
         assert_eq!(
             construct_tree(
-                &dir.0,
+                &dir,
                 &config(2, Metric::L2),
                 [7; 32],
                 invalid,
@@ -1384,16 +1368,17 @@ mod tests {
             .kind(),
             ErrorKind::InvalidArgument
         );
-        assert!(!dir.0.exists());
+        assert!(!dir.exists());
         for vector in [vec![1.0], vec![f32::NAN, 0.0], vec![0.0, 0.0]] {
-            let dir = Directory::new();
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("scratch");
             let input = [Ok(ConstructionRecord {
                 id: Bytes::from_static(b"id"),
                 vector: vector.into_boxed_slice(),
             })];
             assert_eq!(
                 construct_tree(
-                    &dir.0,
+                    &dir,
                     &config(2, Metric::Cosine),
                     [7; 32],
                     options(),
@@ -1486,7 +1471,8 @@ mod tests {
         let row_bound = dimension * 4 + MAX_ID_BYTES + ROW_OVERHEAD_BYTES;
         let reserved = row_bound * 16 + 16 * BUFFER_BYTES + dimension * 4;
         let build = |row_capacity| {
-            let directory = Directory::new();
+            let root = tempfile::tempdir().unwrap();
+            let directory = root.path().join("scratch");
             let options = ConstructionOptions {
                 sample_items: 2,
                 memory_bytes: reserved + row_capacity * row_bound,
@@ -1515,7 +1501,7 @@ mod tests {
             let mut plans = BTreeMap::new();
             let mut members = BTreeSet::new();
             construct_tree(
-                &directory.0,
+                &directory,
                 &config(dimension, Metric::Cosine)
                     .with_leaf_partition_entries(1, 2)
                     .unwrap()
@@ -1547,7 +1533,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(members.len(), 33);
-            assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 0);
+            assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
             plans
         };
         assert_eq!(build(2), build(64));

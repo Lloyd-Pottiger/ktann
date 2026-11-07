@@ -11,15 +11,17 @@ use ktann::api::{
     RuntimeConfig, UpsertResult, Value,
 };
 use ktann::runtime::Runtime;
-use ktann::storage::backend::{AdmissionBudget, Backend, ScanLimits};
+use ktann::storage::backend::{AdmissionBudget, Backend};
 use ktann::storage::keys::{LogicalKey, TreeKey};
 use ktann::storage::values::{
     ChildEntry, IndexLifecycle, IndexManifest, PartitionHeader, PartitionState, PartitionSynopsis,
-    PartitionTransition, PersistentValue, RecordLocation,
+    PartitionTransition, PersistentValue,
 };
-use ktann::storage::{LogicalRange, ReadLogicalTxn, WriteLogicalTxn, tree_manifest};
+use ktann::storage::{ReadLogicalTxn, WriteLogicalTxn, tree_manifest};
 use tokio_util::sync::CancellationToken;
 
+use support::builders::{pk, tree_key};
+use support::topology_probe::{header_of, leaf_member_ids, location_of};
 use support::{CommitFault, CommitOutcome, MemoryBackend, Rng, TestConfig, read_manifest};
 
 #[allow(dead_code)]
@@ -42,10 +44,6 @@ fn config() -> IndexConfig {
 
 fn make_runtime(backend: MemoryBackend) -> Runtime<MemoryBackend> {
     Runtime::new(backend, RuntimeConfig::default()).expect("runtime is valid")
-}
-
-fn tree_key(bucket: i64) -> TreeKey {
-    TreeKey::encode(&[DataType::I64], &[Value::I64(bucket)]).expect("valid tree key")
 }
 
 fn rid(value: u8) -> Bytes {
@@ -72,84 +70,6 @@ async fn make_index(runtime: &Runtime<MemoryBackend>) -> Index<MemoryBackend> {
         .create_index("index", config())
         .await
         .expect("create index")
-}
-
-async fn read_location(
-    backend: &MemoryBackend,
-    manifest: &IndexManifest,
-    record_id: &[u8],
-) -> Option<RecordLocation> {
-    let raw = backend.begin_read().await.expect("begin read");
-    let mut txn = ReadLogicalTxn::for_index(raw, manifest);
-    match txn
-        .get(LogicalKey::Location {
-            index: manifest.logical_index_id(),
-            id: Bytes::copy_from_slice(record_id),
-        })
-        .await
-        .expect("read location")
-    {
-        Some(PersistentValue::RecordLocation(location)) => Some(location),
-        None => None,
-        _ => panic!("a Record Location key holds a Record Location value"),
-    }
-}
-
-async fn read_header(
-    backend: &MemoryBackend,
-    manifest: &IndexManifest,
-    bucket: i64,
-    partition: u64,
-) -> PartitionHeader {
-    let raw = backend.begin_read().await.expect("begin read");
-    let mut txn = ReadLogicalTxn::for_index(raw, manifest);
-    match txn
-        .get(LogicalKey::Header {
-            index: manifest.logical_index_id(),
-            tree_key: tree_key(bucket),
-            partition: PartitionKey::new(partition).expect("valid partition key"),
-        })
-        .await
-        .expect("read header")
-    {
-        Some(PersistentValue::PartitionHeader(header)) => header,
-        _ => panic!("committed partition header must exist"),
-    }
-}
-
-async fn leaf_member_ids(
-    backend: &MemoryBackend,
-    manifest: &IndexManifest,
-    bucket: i64,
-    partition: u64,
-) -> BTreeSet<Bytes> {
-    let raw = backend.begin_read().await.expect("begin read");
-    let mut txn = ReadLogicalTxn::for_index(raw, manifest);
-    let range = LogicalRange::leaf_entries(
-        manifest,
-        &tree_key(bucket),
-        PartitionKey::new(partition).expect("valid partition key"),
-    )
-    .expect("leaf range");
-    let page = txn
-        .scan(
-            &range,
-            None,
-            ScanLimits {
-                item_limit: 1_024,
-                byte_limit: 1 << 20,
-            },
-        )
-        .await
-        .expect("scan leaf");
-    assert!(page.next_cursor().is_none(), "one page covers the leaf");
-    page.items()
-        .iter()
-        .map(|item| match item.key() {
-            LogicalKey::LeafEntry { id, .. } => id.clone(),
-            _ => panic!("a Leaf Entry range holds only Leaf Entries"),
-        })
-        .collect()
 }
 
 async fn tree_exists(backend: &MemoryBackend, manifest: &IndexManifest, bucket: i64) -> bool {
@@ -208,16 +128,18 @@ async fn insert_commits_the_record_and_its_membership() {
 
     // The first insert lazily installed the tree with one searchable root.
     let manifest = read_manifest(&backend, index.logical_index_id()).await;
-    let location = read_location(&backend, &manifest, &rid(1))
+    let location = location_of(&backend, &manifest, &rid(1))
         .await
         .expect("location exists");
     assert_eq!(location.tree_key(), &tree_key(5));
     assert_eq!(location.leaf(), PartitionKey::new(1).expect("pk"));
     assert_eq!(
-        leaf_member_ids(&backend, &manifest, 5, 1).await,
+        leaf_member_ids(&backend, &manifest, &tree_key(5), pk(1)).await,
         BTreeSet::from([rid(1)])
     );
-    let header = read_header(&backend, &manifest, 5, 1).await;
+    let header = header_of(&backend, &manifest, &tree_key(5), pk(1))
+        .await
+        .unwrap();
     assert_eq!(header.entry_count(), 1);
 }
 
@@ -253,11 +175,14 @@ async fn upsert_creates_then_replaces_in_place() {
     // A same-tree replacement keeps the same leaf and the exact count.
     let manifest = read_manifest(&backend, index.logical_index_id()).await;
     assert_eq!(
-        leaf_member_ids(&backend, &manifest, 1, 1).await,
+        leaf_member_ids(&backend, &manifest, &tree_key(1), pk(1)).await,
         BTreeSet::from([rid(1)])
     );
     assert_eq!(
-        read_header(&backend, &manifest, 1, 1).await.entry_count(),
+        header_of(&backend, &manifest, &tree_key(1), pk(1))
+            .await
+            .unwrap()
+            .entry_count(),
         1
     );
 
@@ -299,24 +224,30 @@ async fn upsert_moves_across_tree_keys_preserving_membership() {
     // Exactly one membership exists: the new tree's leaf. The source tree's
     // leaf is empty with an exact zero count.
     let manifest = read_manifest(&backend, index.logical_index_id()).await;
-    let location = read_location(&backend, &manifest, &rid(1))
+    let location = location_of(&backend, &manifest, &rid(1))
         .await
         .expect("location exists");
     assert_eq!(location.tree_key(), &tree_key(7));
     assert_eq!(
-        leaf_member_ids(&backend, &manifest, 1, 1).await,
+        leaf_member_ids(&backend, &manifest, &tree_key(1), pk(1)).await,
         BTreeSet::new()
     );
     assert_eq!(
-        leaf_member_ids(&backend, &manifest, 7, 1).await,
+        leaf_member_ids(&backend, &manifest, &tree_key(7), pk(1)).await,
         BTreeSet::from([rid(1)])
     );
     assert_eq!(
-        read_header(&backend, &manifest, 1, 1).await.entry_count(),
+        header_of(&backend, &manifest, &tree_key(1), pk(1))
+            .await
+            .unwrap()
+            .entry_count(),
         0
     );
     assert_eq!(
-        read_header(&backend, &manifest, 7, 1).await.entry_count(),
+        header_of(&backend, &manifest, &tree_key(7), pk(1))
+            .await
+            .unwrap()
+            .entry_count(),
         1
     );
 }
@@ -336,13 +267,16 @@ async fn delete_is_idempotent_and_removes_membership() {
     assert!(!index.delete(rid(1)).await.expect("idempotent delete"));
 
     let manifest = read_manifest(&backend, index.logical_index_id()).await;
-    assert_eq!(read_location(&backend, &manifest, &rid(1)).await, None);
+    assert_eq!(location_of(&backend, &manifest, &rid(1)).await, None);
     assert_eq!(
-        leaf_member_ids(&backend, &manifest, 1, 1).await,
+        leaf_member_ids(&backend, &manifest, &tree_key(1), pk(1)).await,
         BTreeSet::new()
     );
     assert_eq!(
-        read_header(&backend, &manifest, 1, 1).await.entry_count(),
+        header_of(&backend, &manifest, &tree_key(1), pk(1))
+            .await
+            .unwrap()
+            .entry_count(),
         0
     );
 }
@@ -723,10 +657,13 @@ async fn concurrent_mutations_converge_with_exact_membership() {
     }
 
     let manifest = read_manifest(&backend, index.logical_index_id()).await;
-    let members = leaf_member_ids(&backend, &manifest, 1, 1).await;
+    let members = leaf_member_ids(&backend, &manifest, &tree_key(1), pk(1)).await;
     assert_eq!(members.len(), 8);
     assert_eq!(
-        read_header(&backend, &manifest, 1, 1).await.entry_count(),
+        header_of(&backend, &manifest, &tree_key(1), pk(1))
+            .await
+            .unwrap()
+            .entry_count(),
         8
     );
     for value in 0..8_u8 {
@@ -840,12 +777,13 @@ async fn seeded_model_history_with_abort_faults_preserves_membership() {
             continue;
         }
         assert_eq!(
-            leaf_member_ids(&backend, &manifest, bucket, 1).await,
+            leaf_member_ids(&backend, &manifest, &tree_key(bucket), pk(1)).await,
             expected
         );
         assert_eq!(
-            read_header(&backend, &manifest, bucket, 1)
+            header_of(&backend, &manifest, &tree_key(bucket), pk(1))
                 .await
+                .unwrap()
                 .entry_count() as usize,
             expected.len()
         );
@@ -1137,15 +1075,29 @@ async fn batched_inserts_share_routing_and_apply_writes_once() {
     );
 
     // All records, including a partial routing group, land in the correct leaf.
-    assert_eq!(leaf_member_ids(&backend, &manifest, 1, 2).await.len(), 22);
-    assert_eq!(leaf_member_ids(&backend, &manifest, 1, 3).await.len(), 21);
+    assert_eq!(
+        leaf_member_ids(&backend, &manifest, &tree_key(1), pk(2))
+            .await
+            .len(),
+        22
+    );
+    assert_eq!(
+        leaf_member_ids(&backend, &manifest, &tree_key(1), pk(3))
+            .await
+            .len(),
+        21
+    );
     // The committed Headers carry the exact per-item arithmetic the unbatched
     // sequence produced: one count increment and one cache-epoch bump per
     // record over the seeded epoch 0.
-    let header_2 = read_header(&backend, &manifest, 1, 2).await;
+    let header_2 = header_of(&backend, &manifest, &tree_key(1), pk(2))
+        .await
+        .unwrap();
     assert_eq!(header_2.entry_count(), 22);
     assert_eq!(header_2.cache_epoch(), 22);
-    let header_3 = read_header(&backend, &manifest, 1, 3).await;
+    let header_3 = header_of(&backend, &manifest, &tree_key(1), pk(3))
+        .await
+        .unwrap();
     assert_eq!(header_3.entry_count(), 21);
     assert_eq!(header_3.cache_epoch(), 21);
     for i in 0..N as u8 {
@@ -1554,7 +1506,7 @@ async fn batched_routing_scans_each_split_family_body_once() {
                 .flat_map(|pass| items.iter().map(move |&item| Bytes::from(vec![pass, item])))
                 .collect();
             assert_eq!(
-                leaf_member_ids(&backend, &manifest, 1, leaf).await,
+                leaf_member_ids(&backend, &manifest, &tree_key(1), pk(leaf)).await,
                 expected,
                 "capacity={capacity}, beam={beam}, leaf={leaf}"
             );
@@ -1602,11 +1554,11 @@ async fn write_routing_cache_reuses_only_matching_committed_bodies() {
             usize::from(capacity <= 1)
         );
         assert_eq!(
-            leaf_member_ids(&backend, &manifest, 1, 2).await,
+            leaf_member_ids(&backend, &manifest, &tree_key(1), pk(2)).await,
             BTreeSet::from([Bytes::from_static(b"a")])
         );
         assert_eq!(
-            leaf_member_ids(&backend, &manifest, 1, 3).await,
+            leaf_member_ids(&backend, &manifest, &tree_key(1), pk(3)).await,
             BTreeSet::from([Bytes::from_static(b"b")])
         );
 
@@ -1642,7 +1594,7 @@ async fn write_routing_cache_reuses_only_matching_committed_bodies() {
             .expect("new child insert");
         assert_eq!(backend.operation_counts().batch_scan, 1);
         assert_eq!(
-            leaf_member_ids(&backend, &manifest, 1, 4).await,
+            leaf_member_ids(&backend, &manifest, &tree_key(1), pk(4)).await,
             BTreeSet::from([Bytes::from_static(b"c")])
         );
         runtime.shutdown().await.expect("shutdown");

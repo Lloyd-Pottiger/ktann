@@ -90,11 +90,20 @@ use ktann::storage::values::PartitionState;
 #[allow(dead_code)]
 mod support;
 
-use support::datadriven::{self, Directive, Mismatch};
-use support::dataset::{self, Dataset};
-use support::load_index::{FixturePartition, FixtureState, LoadFixture};
+#[path = "support/datadriven.rs"]
+mod datadriven;
+#[path = "support/dataset.rs"]
+mod dataset;
+#[path = "support/fixtures.rs"]
+mod fixtures;
+#[path = "support/load_index.rs"]
+mod load_index;
+
+use datadriven::{Directive, Mismatch};
+use dataset::Dataset;
+use load_index::{FixturePartition, FixtureState, LoadFixture};
 use support::oracle::{self, Model, ModelRecord};
-use support::{CommitFault, Durability, MemoryBackend, TestConfig};
+use support::{CommitFault, Durability, MemoryBackend, Rng, TestConfig};
 
 /// The corpus directory, relative to the crate root.
 const CORPUS_DIR: &str = "tests/datadriven";
@@ -938,7 +947,7 @@ impl Harness {
         self.maintenance_clock += 100;
         let cache_epoch = self.maintenance_clock;
         self.maintenance_clock += 100;
-        let summary = support::load_index::install(
+        let summary = load_index::install(
             self.backend
                 .as_ref()
                 .expect("load-index requires new-index first"),

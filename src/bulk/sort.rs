@@ -436,20 +436,11 @@ fn limit() -> Error {
 mod tests {
     use super::*;
 
-    struct Directory(PathBuf);
-
-    impl Drop for Directory {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
     #[test]
     fn paired_sorters_do_not_spill_uniform_rows_that_fit_the_budget() {
-        let directory = Directory(
-            std::env::temp_dir().join(format!("ktann-paired-fit-{}", std::process::id())),
-        );
-        let mut space = Space::new(&directory.0, 1024 * 1024, 128).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("scratch");
+        let mut space = Space::new(&directory, 1024 * 1024, 128).unwrap();
         let (mut ids, mut trees) = Sorter::pair(&space, 2 * 1024 * 1024).unwrap();
         for id in 0..10000_u64 {
             ids.push(
@@ -480,11 +471,9 @@ mod tests {
     #[test]
     fn uniqueness_checks_buffered_keys_and_reclaims_runs() {
         for duplicate in [false, true] {
-            let directory = Directory(std::env::temp_dir().join(format!(
-                "ktann-unique-buffered-{}-{duplicate}",
-                std::process::id()
-            )));
-            let mut space = Space::new(&directory.0, 1024 * 1024, 128).unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let directory = root.path().join("scratch");
+            let mut space = Space::new(&directory, 1024 * 1024, 128).unwrap();
             let mut sorter = Sorter::new(&space, 1024 * 1024).unwrap();
             for id in (0..400_u16).rev() {
                 let key = if duplicate && id == 399 { 0 } else { id };
@@ -500,7 +489,7 @@ mod tests {
             }
             assert_eq!(sorter.unique_keys(&mut space).unwrap(), !duplicate);
             assert_eq!(space.live, 0);
-            assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 0);
+            assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
         }
     }
 
@@ -508,23 +497,16 @@ mod tests {
     fn bounded_merges_preserve_full_lexical_order_and_reclaim_runs() {
         let row_bound = 128;
         let overhead = std::mem::size_of::<Row>();
-        for (case, memory, count) in [
-            (0, 512 * 1024 + 5 * row_bound + overhead, 400_u16),
+        for (memory, count) in [
+            (512 * 1024 + 5 * row_bound + overhead, 400_u16),
             (
-                1,
                 512 * 1024 + 10 * row_bound + 10 * (row_bound + overhead),
                 2000,
             ),
         ] {
-            let directory = Directory(std::env::temp_dir().join(format!(
-                    "ktann-merge-{}-{case}-{}",
-                    std::process::id(),
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_nanos()
-                )));
-            let mut space = Space::new(&directory.0, 1024 * 1024, row_bound).unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let directory = root.path().join("scratch");
+            let mut space = Space::new(&directory, 1024 * 1024, row_bound).unwrap();
             let mut expected: Vec<_> = (0..count)
                 .rev()
                 .map(|id| {
@@ -557,18 +539,16 @@ mod tests {
             drop(reader);
             space.remove(run).unwrap();
             assert_eq!(space.live, 0);
-            assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 0);
+            assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
         }
     }
 
     #[test]
     fn spilled_uniqueness_needs_no_final_output_quota_and_preserves_the_paired_sorter() {
         for duplicate in [false, true] {
-            let directory = Directory(std::env::temp_dir().join(format!(
-                "ktann-unique-quota-{}-{duplicate}",
-                std::process::id()
-            )));
-            let mut space = Space::new(&directory.0, 3000 * 16, 64).unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let directory = root.path().join("scratch");
+            let mut space = Space::new(&directory, 3000 * 16, 64).unwrap();
             let (mut ids, mut trees) = Sorter::pair(&space, 600_000).unwrap();
             trees
                 .push(
@@ -599,16 +579,15 @@ mod tests {
             assert!(reader.next().unwrap().is_none());
             drop(reader);
             space.remove(run).unwrap();
-            assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 0);
+            assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
         }
     }
 
     #[test]
     fn duplicate_in_final_merge_does_not_hide_a_corrupt_input_tail() {
-        let directory = Directory(
-            std::env::temp_dir().join(format!("ktann-unique-tail-{}", std::process::id())),
-        );
-        let mut space = Space::new(&directory.0, 3000 * 16, 64).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("scratch");
+        let mut space = Space::new(&directory, 3000 * 16, 64).unwrap();
         let (mut ids, _trees) = Sorter::pair(&space, 600_000).unwrap();
         for id in 0..3000_u64 {
             let id = if id == 2999 { 0 } else { id };
@@ -622,7 +601,7 @@ mod tests {
             .unwrap();
         }
         ids.spill(&mut space).unwrap();
-        let path = directory.0.join((space.next - 1).to_string());
+        let path = directory.join((space.next - 1).to_string());
         let file = OpenOptions::new().write(true).open(path).unwrap();
         file.set_len(file.metadata().unwrap().len() - 1).unwrap();
         drop(file);

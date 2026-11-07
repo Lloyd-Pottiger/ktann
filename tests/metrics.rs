@@ -21,11 +21,14 @@ use ktann::api::{
 };
 use ktann::runtime::Runtime;
 
-use support::observe::CounterSeries;
-use support::{MemoryBackend, TestConfig, audit, observe};
+use observe::CounterSeries;
+use support::{MemoryBackend, TestConfig, audit};
 
 #[allow(dead_code)]
 mod support;
+
+#[path = "support/observe.rs"]
+mod observe;
 
 /// Returns `true` when one series carries every expected label.
 fn has_labels(series_labels: &[(String, String)], labels: &[(&str, &str)]) -> bool {

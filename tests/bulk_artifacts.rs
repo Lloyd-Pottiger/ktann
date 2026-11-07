@@ -1,35 +1,12 @@
 //! Durable source and topology artifacts: restart, integrity, and failure bounds.
 
 use std::fs;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use ktann::api::{DataType, Error, ErrorKind, FieldSchema, IndexConfig, Metric, Record, Value};
 use ktann::bulk::ForestArtifact;
 use ktann::bulk::{ARTIFACT_MANIFEST_BYTES, ArtifactManifest, InputSnapshot, InputSnapshotWriter};
 use ktann::construction::ConstructionOptions;
-
-struct Directory(PathBuf);
-
-impl Directory {
-    fn new() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "ktann-bulk-artifacts-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).unwrap();
-        Self(path)
-    }
-}
-
-impl Drop for Directory {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.0).unwrap();
-    }
-}
 
 fn config() -> IndexConfig {
     IndexConfig::new(2, Metric::L2)
@@ -58,8 +35,8 @@ fn record(id: u64) -> Record {
 
 #[test]
 fn full_records_survive_restart_with_payload_presence_and_canonical_fields() {
-    let directory = Directory::new();
-    let path = directory.0.join("input");
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("input");
     let config = config()
         .with_fields(vec![
             FieldSchema::new("enabled", DataType::Bool).unwrap(),
@@ -131,8 +108,8 @@ fn full_records_survive_restart_with_payload_presence_and_canonical_fields() {
 
 #[test]
 fn input_failures_and_quota_exhaustion_never_seal_or_overwrite() {
-    let directory = Directory::new();
-    let failed = directory.0.join("failed");
+    let directory = tempfile::tempdir().unwrap();
+    let failed = directory.path().join("failed");
     let result = InputSnapshot::create(
         &failed,
         config(),
@@ -144,7 +121,7 @@ fn input_failures_and_quota_exhaustion_never_seal_or_overwrite() {
     let partial = fs::read(failed.join("data.partial")).unwrap();
     assert!(InputSnapshot::create(&failed, config(), 1_000_000, []).is_err());
     assert_eq!(fs::read(failed.join("data.partial")).unwrap(), partial);
-    let quota = directory.0.join("quota");
+    let quota = directory.path().join("quota");
     assert_eq!(
         InputSnapshot::create(&quota, config(), 132, [Ok(record(0))])
             .err()
@@ -156,7 +133,7 @@ fn input_failures_and_quota_exhaustion_never_seal_or_overwrite() {
     let invalid = Record::new(Bytes::from_static(b"bad"), vec![1.0], vec![]).unwrap();
     assert_eq!(
         InputSnapshot::create(
-            &directory.0.join("invalid"),
+            &directory.path().join("invalid"),
             config(),
             1_000_000,
             [Ok(invalid)]
@@ -171,8 +148,8 @@ fn input_failures_and_quota_exhaustion_never_seal_or_overwrite() {
 #[test]
 fn changed_truncated_extended_and_forged_length_files_are_rejected() {
     for mutation in 0..5 {
-        let directory = Directory::new();
-        let path = directory.0.join("input");
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("input");
         let snapshot = InputSnapshot::create(&path, config(), 1_000_000, [Ok(record(0))]).unwrap();
         let mut bytes = fs::read(path.join("data.bin")).unwrap();
         match mutation {
@@ -191,8 +168,8 @@ fn changed_truncated_extended_and_forged_length_files_are_rejected() {
 
 #[test]
 fn swapping_valid_frames_fails_whole_file_identity_before_plan_sealing() {
-    let directory = Directory::new();
-    let path = directory.0.join("input");
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("input");
     let snapshot =
         InputSnapshot::create(&path, config(), 1_000_000, [Ok(record(0)), Ok(record(1))]).unwrap();
     let mut bytes = fs::read(path.join("data.bin")).unwrap();
@@ -207,7 +184,7 @@ fn swapping_valid_frames_fails_whole_file_identity_before_plan_sealing() {
         ErrorKind::Corruption
     );
     assert!(reader.next().is_none());
-    let output = directory.0.join("plan");
+    let output = directory.path().join("plan");
     assert_eq!(
         ForestArtifact::build(&output, &snapshot, [7; 32], forest_options(), 1_000_000)
             .err()
@@ -221,9 +198,9 @@ fn swapping_valid_frames_fails_whole_file_identity_before_plan_sealing() {
 
 #[test]
 fn manifest_identity_and_version_are_checked_independently_of_data() {
-    let directory = Directory::new();
-    let first = directory.0.join("first");
-    let second = directory.0.join("second");
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("first");
+    let second = directory.path().join("second");
     let a = InputSnapshot::create(&first, config(), 1_000_000, [Ok(record(0))]).unwrap();
     let b = InputSnapshot::create(&second, config(), 1_000_000, [Ok(record(1))]).unwrap();
     fs::copy(second.join("manifest.bin"), first.join("manifest.bin")).unwrap();
@@ -330,16 +307,16 @@ fn forest_globally_groups_exact_membership_and_matches_independent_tree_builds()
     use ktann::storage::keys::TreeKey;
     use std::collections::{BTreeMap, BTreeSet};
     for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
-        let directory = Directory::new();
+        let directory = tempfile::tempdir().unwrap();
         let source = InputSnapshot::create(
-            &directory.0.join("input"),
+            &directory.path().join("input"),
             forest_config(metric),
             4 * 1024 * 1024,
             (0..317).rev().map(|id| Ok(forest_record(id))),
         )
         .unwrap();
         let (artifact, report) = ForestArtifact::build(
-            &directory.0.join("forest"),
+            &directory.path().join("forest"),
             &source,
             [7; 32],
             forest_options(),
@@ -349,12 +326,12 @@ fn forest_globally_groups_exact_membership_and_matches_independent_tree_builds()
         assert_eq!(report.records, 317);
         assert_eq!(report.trees, 14);
         assert!(report.peak_sort_scratch_bytes <= forest_options().sort_scratch_bytes);
-        assert!(!directory.0.join("forest/sort").exists());
-        assert!(!directory.0.join("forest/tree").exists());
+        assert!(!directory.path().join("forest/sort").exists());
+        assert!(!directory.path().join("forest/tree").exists());
         let expected_manifest = ArtifactManifest::decode(&artifact.manifest().encode()).unwrap();
         drop(artifact);
         let reopened = ForestArtifact::open(
-            &directory.0.join("forest"),
+            &directory.path().join("forest"),
             expected_manifest,
             source.manifest(),
             source.config().clone(),
@@ -384,7 +361,7 @@ fn forest_globally_groups_exact_membership_and_matches_independent_tree_builds()
         let mut exact = ForestShape::new();
         for (ordinal, (tree, records)) in expected.into_iter().enumerate() {
             construct_tree(
-                &directory.0.join(format!("independent-{ordinal}")),
+                &directory.path().join(format!("independent-{ordinal}")),
                 source.config(),
                 [7; 32],
                 options(),
@@ -419,23 +396,23 @@ fn forest_globally_groups_exact_membership_and_matches_independent_tree_builds()
 #[test]
 fn forest_sort_spills_and_source_order_do_not_change_topology() {
     use ktann::bulk::ForestArtifact;
-    let directory = Directory::new();
+    let directory = tempfile::tempdir().unwrap();
     let a = InputSnapshot::create(
-        &directory.0.join("a"),
+        &directory.path().join("a"),
         forest_config(Metric::L2),
         4 * 1024 * 1024,
         (0..173).map(|id| Ok(forest_record(id))),
     )
     .unwrap();
     let b = InputSnapshot::create(
-        &directory.0.join("b"),
+        &directory.path().join("b"),
         forest_config(Metric::L2),
         4 * 1024 * 1024,
         (0..173).rev().map(|id| Ok(forest_record(id))),
     )
     .unwrap();
     let (small, _) = ForestArtifact::build(
-        &directory.0.join("small"),
+        &directory.path().join("small"),
         &a,
         [9; 32],
         forest_options(),
@@ -445,7 +422,7 @@ fn forest_sort_spills_and_source_order_do_not_change_topology() {
     let mut roomy = forest_options();
     roomy.sort_memory_bytes = 4 * 1024 * 1024;
     let (large, _) = ForestArtifact::build(
-        &directory.0.join("large"),
+        &directory.path().join("large"),
         &b,
         [9; 32],
         roomy,
@@ -455,7 +432,7 @@ fn forest_sort_spills_and_source_order_do_not_change_topology() {
     assert_eq!(forest_shape(&small), forest_shape(&large));
     assert_eq!(
         ForestArtifact::open(
-            &directory.0.join("small"),
+            &directory.path().join("small"),
             small.manifest().clone(),
             a.manifest(),
             a.config().clone(),
@@ -469,7 +446,7 @@ fn forest_sort_spills_and_source_order_do_not_change_topology() {
         ErrorKind::InvalidArgument
     );
     let regrouped = InputSnapshot::open(
-        &directory.0.join("a"),
+        &directory.path().join("a"),
         forest_config(Metric::L2)
             .with_tree_key_fields(vec![ktann::api::FieldId(0)])
             .unwrap(),
@@ -478,7 +455,7 @@ fn forest_sort_spills_and_source_order_do_not_change_topology() {
     .unwrap();
     assert!(
         ForestArtifact::open(
-            &directory.0.join("small"),
+            &directory.path().join("small"),
             small.manifest().clone(),
             regrouped.manifest(),
             regrouped.config().clone(),
@@ -493,7 +470,7 @@ fn forest_sort_spills_and_source_order_do_not_change_topology() {
 #[test]
 fn forest_rejects_cross_tree_duplicates_before_output_and_enforces_quotas() {
     use ktann::bulk::ForestArtifact;
-    let directory = Directory::new();
+    let directory = tempfile::tempdir().unwrap();
     let duplicate = Record::new(
         forest_record(0).id().clone(),
         vec![4.0, 5.0],
@@ -501,7 +478,7 @@ fn forest_rejects_cross_tree_duplicates_before_output_and_enforces_quotas() {
     )
     .unwrap();
     let input = InputSnapshot::create(
-        &directory.0.join("input"),
+        &directory.path().join("input"),
         forest_config(Metric::L2),
         4 * 1024 * 1024,
         (0..100)
@@ -509,7 +486,7 @@ fn forest_rejects_cross_tree_duplicates_before_output_and_enforces_quotas() {
             .chain([Ok(duplicate)]),
     )
     .unwrap();
-    let path = directory.0.join("duplicate");
+    let path = directory.path().join("duplicate");
     assert_eq!(
         ForestArtifact::build(&path, &input, [0; 32], forest_options(), 4 * 1024 * 1024)
             .err()
@@ -520,7 +497,7 @@ fn forest_rejects_cross_tree_duplicates_before_output_and_enforces_quotas() {
     assert!(!path.join("manifest.bin").exists());
     assert!(!path.join("tree").exists());
     let unique = InputSnapshot::create(
-        &directory.0.join("unique"),
+        &directory.path().join("unique"),
         forest_config(Metric::L2),
         4 * 1024 * 1024,
         (0..100).map(|id| Ok(forest_record(id))),
@@ -530,7 +507,7 @@ fn forest_rejects_cross_tree_duplicates_before_output_and_enforces_quotas() {
     tiny.sort_scratch_bytes = 100;
     assert_eq!(
         ForestArtifact::build(
-            &directory.0.join("quota"),
+            &directory.path().join("quota"),
             &unique,
             [0; 32],
             tiny,
@@ -543,7 +520,7 @@ fn forest_rejects_cross_tree_duplicates_before_output_and_enforces_quotas() {
     );
     tiny = forest_options();
     tiny.sort_memory_bytes = 1;
-    let invalid = directory.0.join("invalid");
+    let invalid = directory.path().join("invalid");
     assert_eq!(
         ForestArtifact::build(&invalid, &unique, [0; 32], tiny, 4 * 1024 * 1024)
             .err()
@@ -552,7 +529,7 @@ fn forest_rejects_cross_tree_duplicates_before_output_and_enforces_quotas() {
         ErrorKind::InvalidArgument
     );
     assert!(!invalid.exists());
-    let full = directory.0.join("full");
+    let full = directory.path().join("full");
     assert_eq!(
         ForestArtifact::build(&full, &unique, [0; 32], forest_options(), 132)
             .err()
@@ -566,13 +543,13 @@ fn forest_rejects_cross_tree_duplicates_before_output_and_enforces_quotas() {
 #[test]
 fn empty_snapshot_and_forest_have_no_records_or_trees() {
     use ktann::bulk::ForestArtifact;
-    let directory = Directory::new();
+    let directory = tempfile::tempdir().unwrap();
     for (index, config) in [config(), forest_config(Metric::L2)]
         .into_iter()
         .enumerate()
     {
         let input = InputSnapshot::create(
-            &directory.0.join(format!("input-{index}")),
+            &directory.path().join(format!("input-{index}")),
             config,
             132,
             std::iter::empty(),
@@ -581,7 +558,7 @@ fn empty_snapshot_and_forest_have_no_records_or_trees() {
         input.verify().unwrap();
         assert_eq!(input.manifest().items(), 0);
         let (artifact, report) = ForestArtifact::build(
-            &directory.0.join(format!("plan-{index}")),
+            &directory.path().join(format!("plan-{index}")),
             &input,
             [0; 32],
             forest_options(),
@@ -601,15 +578,15 @@ fn forest_reader_rejects_invalid_tree_envelopes_and_premature_roots() {
     use ktann::bulk::ForestArtifact;
     use sha2::{Digest, Sha256};
     for root_early in [false, true] {
-        let directory = Directory::new();
+        let directory = tempfile::tempdir().unwrap();
         let input = InputSnapshot::create(
-            &directory.0.join("input"),
+            &directory.path().join("input"),
             forest_config(Metric::L2),
             1024 * 1024,
             (0..100).map(|id| Ok(forest_record(id))),
         )
         .unwrap();
-        let path = directory.0.join("forest");
+        let path = directory.path().join("forest");
         let (artifact, _) =
             ForestArtifact::build(&path, &input, [0; 32], forest_options(), 1024 * 1024).unwrap();
         let mut data = fs::read(path.join("data.bin")).unwrap();
@@ -658,16 +635,16 @@ fn forest_reader_rejects_invalid_tree_envelopes_and_premature_roots() {
 
 #[test]
 fn streaming_snapshot_matches_one_pass_and_drop_leaves_it_unsealed() {
-    let directory = Directory::new();
+    let directory = tempfile::tempdir().unwrap();
     let rows: Vec<_> = (0..31).map(record).collect();
     let one = InputSnapshot::create(
-        &directory.0.join("one"),
+        &directory.path().join("one"),
         config(),
         1_000_000,
         rows.iter().cloned().map(Ok),
     )
     .unwrap();
-    let path = directory.0.join("stream");
+    let path = directory.path().join("stream");
     let mut writer = InputSnapshotWriter::new(&path, config(), 1_000_000).unwrap();
     for batch in rows.chunks(7) {
         writer = writer.append(batch.iter().cloned().map(Ok)).unwrap();
@@ -677,11 +654,11 @@ fn streaming_snapshot_matches_one_pass_and_drop_leaves_it_unsealed() {
     streamed.verify().unwrap();
     assert_eq!(one.manifest(), streamed.manifest());
     assert_eq!(
-        fs::read(directory.0.join("one/data.bin")).unwrap(),
+        fs::read(directory.path().join("one/data.bin")).unwrap(),
         fs::read(path.join("data.bin")).unwrap()
     );
 
-    let path = directory.0.join("cancelled");
+    let path = directory.path().join("cancelled");
     drop(
         InputSnapshotWriter::new(&path, config(), 1_000_000)
             .unwrap()
@@ -695,7 +672,7 @@ fn streaming_snapshot_matches_one_pass_and_drop_leaves_it_unsealed() {
 fn receipt_sorting_preserves_source_and_forest_bytes_with_spills() {
     use ktann::bulk::PreparedInputWriter;
     for count in [0, 73, 3000] {
-        let dir = Directory::new();
+        let dir = tempfile::tempdir().unwrap();
         let config = forest_config(Metric::L2);
         let mut options = forest_options();
         options.sort_memory_bytes *= 2;
@@ -715,15 +692,15 @@ fn receipt_sorting_preserves_source_and_forest_bytes_with_spills() {
             })
         };
         let original = InputSnapshot::create(
-            &dir.0.join("original"),
+            &dir.path().join("original"),
             config.clone(),
             8_000_000,
             records(),
         )
         .unwrap();
         let mut writer = PreparedInputWriter::new(
-            &dir.0.join("source"),
-            &dir.0.join("sorting"),
+            &dir.path().join("source"),
+            &dir.path().join("sorting"),
             config,
             8_000_000,
             options,
@@ -740,7 +717,7 @@ fn receipt_sorting_preserves_source_and_forest_bytes_with_spills() {
         let prepared = writer.seal().unwrap();
         assert_eq!(original.manifest(), prepared.source().manifest());
         let (before, _) = ForestArtifact::build(
-            &dir.0.join("before"),
+            &dir.path().join("before"),
             &original,
             [7; 32],
             options,
@@ -748,23 +725,23 @@ fn receipt_sorting_preserves_source_and_forest_bytes_with_spills() {
         )
         .unwrap();
         let (after, _) =
-            ForestArtifact::build_prepared(&dir.0.join("after"), prepared, [7; 32], 8_000_000)
+            ForestArtifact::build_prepared(&dir.path().join("after"), prepared, [7; 32], 8_000_000)
                 .unwrap();
         assert_eq!(before.manifest(), after.manifest());
         assert_eq!(forest_shape(&before), forest_shape(&after));
-        assert!(!dir.0.join("sorting").exists());
+        assert!(!dir.path().join("sorting").exists());
     }
 }
 
 #[test]
 fn receipt_sorting_rejects_cross_batch_duplicates_and_invalid_records() {
     use ktann::bulk::PreparedInputWriter;
-    let dir = Directory::new();
+    let dir = tempfile::tempdir().unwrap();
     let mut options = forest_options();
     options.sort_memory_bytes *= 2;
     let writer = PreparedInputWriter::new(
-        &dir.0.join("source"),
-        &dir.0.join("sorting"),
+        &dir.path().join("source"),
+        &dir.path().join("sorting"),
         forest_config(Metric::L2),
         8_000_000,
         options,
@@ -779,16 +756,16 @@ fn receipt_sorting_rejects_cross_batch_duplicates_and_invalid_records() {
         .seal()
         .unwrap();
     assert_eq!(
-        ForestArtifact::build_prepared(&dir.0.join("forest"), prepared, [7; 32], 8_000_000)
+        ForestArtifact::build_prepared(&dir.path().join("forest"), prepared, [7; 32], 8_000_000)
             .err()
             .unwrap()
             .kind(),
         ErrorKind::RecordAlreadyExists
     );
-    assert!(!dir.0.join("forest/manifest.bin").exists());
+    assert!(!dir.path().join("forest/manifest.bin").exists());
     let writer = PreparedInputWriter::new(
-        &dir.0.join("invalid"),
-        &dir.0.join("invalid-sort"),
+        &dir.path().join("invalid"),
+        &dir.path().join("invalid-sort"),
         forest_config(Metric::L2),
         8_000_000,
         options,
@@ -798,17 +775,17 @@ fn receipt_sorting_rejects_cross_batch_duplicates_and_invalid_records() {
         writer.append([Ok(record(1))]).err().unwrap().kind(),
         ErrorKind::InvalidArgument
     );
-    assert!(!dir.0.join("invalid/manifest.bin").exists());
+    assert!(!dir.path().join("invalid/manifest.bin").exists());
 }
 
 #[test]
 fn receipt_sorting_rejects_local_duplicates_before_sealing() {
-    let dir = Directory::new();
+    let dir = tempfile::tempdir().unwrap();
     let mut options = forest_options();
     options.sort_memory_bytes *= 2;
     let writer = ktann::bulk::PreparedInputWriter::new(
-        &dir.0.join("source"),
-        &dir.0.join("sort"),
+        &dir.path().join("source"),
+        &dir.path().join("sort"),
         forest_config(Metric::L2),
         8_000_000,
         options,
@@ -819,20 +796,20 @@ fn receipt_sorting_rejects_local_duplicates_before_sealing() {
         .err()
         .unwrap();
     assert_eq!(error.kind(), ErrorKind::RecordAlreadyExists);
-    assert!(!dir.0.join("source/manifest.bin").exists());
+    assert!(!dir.path().join("source/manifest.bin").exists());
 }
 
 #[test]
 fn receipt_sorting_validates_configuration_before_creating_files() {
-    let dir = Directory::new();
+    let dir = tempfile::tempdir().unwrap();
     let invalid = config()
         .with_tree_key_fields(vec![ktann::api::FieldId(99)])
         .unwrap();
     let mut options = forest_options();
     options.sort_memory_bytes *= 2;
     let error = ktann::bulk::PreparedInputWriter::new(
-        &dir.0.join("source"),
-        &dir.0.join("sort"),
+        &dir.path().join("source"),
+        &dir.path().join("sort"),
         invalid,
         8_000_000,
         options,
@@ -840,14 +817,14 @@ fn receipt_sorting_validates_configuration_before_creating_files() {
     .err()
     .unwrap();
     assert_eq!(error.kind(), ErrorKind::InvalidArgument);
-    assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
 }
 
 #[test]
 fn variable_id_forest_is_identical_across_construction_budgets() {
     for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
         for tied in [true, false] {
-            let dir = Directory::new();
+            let dir = tempfile::tempdir().unwrap();
             let config = IndexConfig::new(7, metric)
                 .unwrap()
                 .with_leaf_partition_entries(2, 4)
@@ -881,7 +858,7 @@ fn variable_id_forest_is_identical_across_construction_budgets() {
                 })
                 .collect();
             let input = InputSnapshot::create(
-                &dir.0.join("input"),
+                &dir.path().join("input"),
                 config.clone(),
                 8_000_000,
                 records.iter().cloned().map(Ok),
@@ -895,13 +872,23 @@ fn variable_id_forest_is_identical_across_construction_budgets() {
             large.tree_scratch_bytes *= 2;
             large.sort_memory_bytes *= 2;
             large.sort_scratch_bytes *= 2;
-            let (resident, _) =
-                ForestArtifact::build(&dir.0.join("resident"), &input, [7; 32], large, 8_000_000)
-                    .unwrap();
+            let (resident, _) = ForestArtifact::build(
+                &dir.path().join("resident"),
+                &input,
+                [7; 32],
+                large,
+                8_000_000,
+            )
+            .unwrap();
             let expected = forest_shape(&resident);
-            let (streamed, _) =
-                ForestArtifact::build(&dir.0.join("streamed"), &input, [7; 32], small, 8_000_000)
-                    .unwrap();
+            let (streamed, _) = ForestArtifact::build(
+                &dir.path().join("streamed"),
+                &input,
+                [7; 32],
+                small,
+                8_000_000,
+            )
+            .unwrap();
             assert_eq!(forest_shape(&streamed), expected);
             assert_eq!(streamed.manifest(), resident.manifest());
         }
@@ -910,7 +897,7 @@ fn variable_id_forest_is_identical_across_construction_budgets() {
 
 #[test]
 fn forest_capacity_identity_and_round_trip_are_independent_by_level() {
-    let directory = Directory::new();
+    let directory = tempfile::tempdir().unwrap();
     let config = IndexConfig::new(2, Metric::L2)
         .unwrap()
         .with_leaf_partition_entries(2, 4)
@@ -918,7 +905,7 @@ fn forest_capacity_identity_and_round_trip_are_independent_by_level() {
         .with_internal_partition_entries(1, 2)
         .unwrap();
     let input = InputSnapshot::create(
-        &directory.0.join("source"),
+        &directory.path().join("source"),
         config.clone(),
         1024 * 1024,
         (0..129_u64).map(|id| {
@@ -938,12 +925,12 @@ fn forest_capacity_identity_and_round_trip_are_independent_by_level() {
             .with_internal_partition_entries(1, maximum)
             .unwrap();
         let source = InputSnapshot::open(
-            &directory.0.join("source"),
+            &directory.path().join("source"),
             config.clone(),
             input.manifest().clone(),
         )
         .unwrap();
-        let path = directory.0.join(format!("forest-{maximum}"));
+        let path = directory.path().join(format!("forest-{maximum}"));
         let (forest, _) =
             ForestArtifact::build(&path, &source, [0; 32], forest_options(), 1024 * 1024).unwrap();
         let reopened = ForestArtifact::open(

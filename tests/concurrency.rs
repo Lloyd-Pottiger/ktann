@@ -33,12 +33,12 @@ use ktann::maintenance::merge::{self, Advance as MergeAdvance};
 use ktann::maintenance::split::{self, Advance as SplitAdvance};
 use ktann::runtime::{RetryPolicy, Runtime};
 use ktann::storage::keys::TreeKey;
-use ktann::storage::values::{PartitionHeader, PartitionState};
 
 #[allow(dead_code)]
 mod support;
 
 use support::oracle::{Model, ModelRecord};
+use support::topology_probe::{Work, collect_candidates};
 use support::{MemoryBackend, Rng, TestConfig, audit};
 
 /// The base seed every per-task script derives from.
@@ -97,15 +97,6 @@ struct DriverStats {
     merges: u64,
     /// Advances that declined (`Idle`/`Stalled`) or exhausted retries.
     retries: u64,
-}
-
-/// One drivable unit of Structure Maintenance.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Work {
-    /// `split::advance`: an in-flight split or an over-full Ready partition.
-    Split,
-    /// `merge::advance`: an in-flight merge or an under-full Ready non-root.
-    Merge,
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -406,85 +397,6 @@ async fn drive_maintenance(
         tokio::task::yield_now().await;
     }
     stats
-}
-
-/// Appends one ordered group of partitions as candidates for `work`.
-fn push_candidates(
-    candidates: &mut Vec<(TreeKey, PartitionKey, Work)>,
-    group: Vec<&(TreeKey, PartitionKey, PartitionHeader)>,
-    work: Work,
-) {
-    candidates.extend(
-        group
-            .into_iter()
-            .map(|(tree_key, partition, _)| (tree_key.clone(), *partition, work)),
-    );
-}
-
-/// Orders one partition listing into drivable candidates: in-flight machines
-/// first (smallest Tree Key and Partition Key), then over-full Ready
-/// partitions (most entries, largest key on ties), then under-full Ready
-/// non-roots (fewest entries, smallest key on ties) — mirroring the e2e
-/// corpus's split/merge candidate rules.
-fn collect_candidates(
-    listing: &[(TreeKey, PartitionKey, PartitionHeader)],
-    config: &IndexConfig,
-) -> Vec<(TreeKey, PartitionKey, Work)> {
-    let mut candidates = Vec::new();
-
-    let mut in_flight_splits: Vec<_> = listing
-        .iter()
-        .filter(|(_, _, header)| {
-            matches!(
-                header.state(),
-                PartitionState::Splitting | PartitionState::DrainingSplit
-            )
-        })
-        .collect();
-    in_flight_splits.sort_by_key(|(tree_key, partition, _)| (tree_key.clone(), *partition));
-    push_candidates(&mut candidates, in_flight_splits, Work::Split);
-
-    let mut in_flight_merges: Vec<_> = listing
-        .iter()
-        .filter(|(_, _, header)| header.state() == PartitionState::Merging)
-        .collect();
-    in_flight_merges.sort_by_key(|(tree_key, partition, _)| (tree_key.clone(), *partition));
-    push_candidates(&mut candidates, in_flight_merges, Work::Merge);
-
-    let maximum = config.max_leaf_partition_entries();
-    let mut over_full: Vec<_> = listing
-        .iter()
-        .filter(|(_, _, header)| {
-            header.state() == PartitionState::Ready && header.entry_count() > maximum
-        })
-        .collect();
-    over_full.sort_by(|left, right| {
-        right
-            .2
-            .entry_count()
-            .cmp(&left.2.entry_count())
-            .then_with(|| right.1.cmp(&left.1))
-    });
-    push_candidates(&mut candidates, over_full, Work::Split);
-
-    let minimum = config.min_leaf_partition_entries();
-    let mut under_full: Vec<_> = listing
-        .iter()
-        .filter(|(_, partition, header)| {
-            partition.get() != 1
-                && header.state() == PartitionState::Ready
-                && header.entry_count() < minimum
-        })
-        .collect();
-    under_full.sort_by(|left, right| {
-        left.2
-            .entry_count()
-            .cmp(&right.2.entry_count())
-            .then_with(|| left.1.cmp(&right.1))
-    });
-    push_candidates(&mut candidates, under_full, Work::Merge);
-
-    candidates
 }
 
 /// Draws every task's script and spawns one task per script. Scripts are

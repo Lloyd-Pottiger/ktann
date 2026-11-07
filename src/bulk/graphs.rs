@@ -222,15 +222,14 @@ mod tests {
 
     #[test]
     fn final_artifact_graphs_restore_against_exact_projections_for_all_metrics() {
-        let root = std::env::temp_dir().join(format!("ktann-final-graphs-{}", std::process::id()));
-        std::fs::create_dir(&root).unwrap();
+        let root = tempfile::tempdir().unwrap();
         let budget = 16 << 20;
         for (metric_id, metric) in [Metric::L2, Metric::Cosine, Metric::InnerProduct]
             .into_iter()
             .enumerate()
         {
             for (round_id, rounds) in [None, Some(0), Some(2)].into_iter().enumerate() {
-                let directory = root.join(format!("{metric_id}-{round_id}"));
+                let directory = root.path().join(format!("{metric_id}-{round_id}"));
                 std::fs::create_dir(&directory).unwrap();
                 let config = IndexConfig::new(2, metric)
                     .unwrap()
@@ -398,6 +397,5 @@ mod tests {
                 assert!(internal_levels.len() >= 2);
             }
         }
-        std::fs::remove_dir_all(root).unwrap();
     }
 }

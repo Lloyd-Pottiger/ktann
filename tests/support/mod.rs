@@ -20,12 +20,8 @@ pub use ktann_memory::{MemoryBackend, MemoryReadTxn, MemoryWriteTxn};
 
 pub mod audit;
 pub mod builders;
-pub mod datadriven;
-pub mod dataset;
-pub mod fixtures;
-pub mod load_index;
-pub mod observe;
 pub mod oracle;
+mod rng;
 pub mod topology_probe;
 
 /// A Runtime configuration without background maintenance workers.
@@ -41,7 +37,7 @@ pub fn manual_maintenance_config() -> RuntimeConfig {
 }
 
 #[allow(unused_imports, reason = "only replay suites draw seeded randomness")]
-pub use dataset::Rng;
+pub use rng::Rng;
 
 /// Reads the manifest through a fresh committed snapshot.
 pub async fn read_manifest(backend: &MemoryBackend, index: LogicalIndexId) -> IndexManifest {

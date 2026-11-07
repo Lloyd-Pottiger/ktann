@@ -7,7 +7,10 @@ use bytes::Bytes;
 
 use crate::api::{Error, ErrorKind, LogicalIndexId, PartitionKey, Result};
 
-use super::backend::{ReadOps, ScanItem, ScanLimits, ScanPage};
+use super::backend::{
+    CommitStart, InsertOutcome, Mutation, ReadOps, ReadTxn, ScanItem, ScanLimits, ScanPage,
+    WriteTxn,
+};
 use super::keys::{self, KeyRange};
 
 /// Returns a test Logical Index ID.
@@ -145,4 +148,70 @@ impl ReadOps for MockReadTxn {
         }
         Ok(pages)
     }
+}
+
+/// A transaction that rejects every storage operation. Runtime lifecycle and
+/// worker tests use it when only admission, cancellation, or retirement matters.
+/// Commit still claims the normal commit boundary before returning its error.
+pub(crate) struct FailingTxn;
+
+impl ReadOps for FailingTxn {
+    async fn get(&mut self, _key: Bytes) -> Result<Option<Bytes>> {
+        Err(Error::new(ErrorKind::Backend))
+    }
+
+    async fn batch_get(&mut self, _keys: Vec<Bytes>) -> Result<Vec<Option<Bytes>>> {
+        Err(Error::new(ErrorKind::Backend))
+    }
+
+    async fn scan(&mut self, _range: &KeyRange, _limits: ScanLimits) -> Result<ScanPage> {
+        Err(Error::new(ErrorKind::Backend))
+    }
+
+    async fn batch_scan(
+        &mut self,
+        _ranges: &[KeyRange],
+        _limits: ScanLimits,
+    ) -> Result<Vec<ScanPage>> {
+        Err(Error::new(ErrorKind::Backend))
+    }
+}
+
+impl ReadTxn for FailingTxn {}
+
+impl WriteTxn for FailingTxn {
+    async fn get_for_update(&mut self, _key: Bytes) -> Result<Option<Bytes>> {
+        Err(Error::new(ErrorKind::Backend))
+    }
+
+    async fn batch_get_for_update(&mut self, _keys: Vec<Bytes>) -> Result<Vec<Option<Bytes>>> {
+        Err(Error::new(ErrorKind::Backend))
+    }
+
+    async fn put(&mut self, _key: Bytes, _value: Bytes) -> Result<()> {
+        Err(Error::new(ErrorKind::Backend))
+    }
+
+    async fn insert(&mut self, _key: Bytes, _value: Bytes) -> Result<InsertOutcome> {
+        Err(Error::new(ErrorKind::Backend))
+    }
+
+    async fn delete(&mut self, _key: Bytes) -> Result<()> {
+        Err(Error::new(ErrorKind::Backend))
+    }
+
+    async fn batch_mutate(&mut self, _mutations: Vec<Mutation>) -> Result<()> {
+        Err(Error::new(ErrorKind::Backend))
+    }
+
+    async fn clear_range(&mut self, _range: &KeyRange) -> Result<()> {
+        Err(Error::new(ErrorKind::Backend))
+    }
+
+    async fn commit_with(self, start: CommitStart) -> Result<()> {
+        start.begin()?;
+        Err(Error::new(ErrorKind::Backend))
+    }
+
+    async fn rollback(self) {}
 }

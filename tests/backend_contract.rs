@@ -4,6 +4,8 @@
 //! [`ktann::storage::backend`] seam. Its optional test controls exercise resource
 //! bounds, injected commit outcomes, replay history, simulated range clear, and
 //! restart semantics on the same transaction implementation.
+//! The shared suite owns ordinary transaction semantics. Local cases cover
+//! test-control boundaries and guarantees not exercised by that suite.
 
 use std::future::Future;
 
@@ -22,10 +24,7 @@ mod storage_operations;
 mod support;
 
 use shared_backend_contract::{BackendHarness, Fault, FaultInjection, RestartMode};
-use support::{
-    CommitFault, CommitOutcome, Durability, HistoryEntry, MemoryBackend, MemoryReadTxn,
-    MemoryWriteTxn, TestConfig,
-};
+use support::{CommitFault, CommitOutcome, Durability, HistoryEntry, MemoryBackend, TestConfig};
 
 /// Drives an already-borrowing future to completion on a current-thread
 /// runtime. The backend's futures never park, so this never blocks.
@@ -150,42 +149,11 @@ impl BackendHarness for DeterministicHarness {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn transaction_types_are_send() {
-    fn assert_send<T: Send>() {}
-    assert_send::<MemoryReadTxn>();
-    assert_send::<MemoryWriteTxn<'static>>();
-}
-
-#[test]
 fn memory_backend_runs_the_shared_contract_suite_durable() {
     let harness = DeterministicHarness::new(TestConfig {
         durability: Durability::Durable,
         capabilities: Capabilities {
             transactional_clear_range: true,
-        },
-        ..Default::default()
-    });
-    block_on(shared_backend_contract::run_suite(&harness));
-}
-
-#[test]
-fn memory_backend_runs_the_shared_contract_suite_ephemeral() {
-    let harness = DeterministicHarness::new(TestConfig {
-        durability: Durability::Ephemeral,
-        capabilities: Capabilities {
-            transactional_clear_range: true,
-        },
-        ..Default::default()
-    });
-    block_on(shared_backend_contract::run_suite(&harness));
-}
-
-#[test]
-fn memory_backend_declines_range_clear_in_the_shared_suite() {
-    let harness = DeterministicHarness::new(TestConfig {
-        durability: Durability::Durable,
-        capabilities: Capabilities {
-            transactional_clear_range: false,
         },
         ..Default::default()
     });
@@ -201,34 +169,22 @@ fn backend_declares_limits_budget_and_capabilities() {
     assert_eq!(backend.admission_budget().max_mutation_bytes, 1 << 20);
     assert!(!backend.capabilities().transactional_clear_range);
     assert!(mock_with_clear().capabilities().transactional_clear_range);
+    block_on(async {
+        let mut txn = backend.begin_write().await.expect("begin write");
+        assert_eq!(
+            txn.clear_range(&range(b"a", b"z"))
+                .await
+                .expect_err("disabled range clear")
+                .kind(),
+            ErrorKind::Unsupported,
+        );
+        txn.rollback().await;
+    });
 }
 
 // ---------------------------------------------------------------------------
 // Snapshot and point/batch reads.
 // ---------------------------------------------------------------------------
-
-#[test]
-fn long_lived_read_txn_observes_original_version() {
-    let backend = mock();
-    seed(&backend, &[(b"a", b"1")]);
-
-    block_on(async {
-        let mut reader = backend.begin_read().await.expect("begin read");
-        // Several subsequent commits must leave the open snapshot untouched.
-        for (entry_key, entry_value) in [(b"b", b"2"), (b"c", b"3"), (b"a", b"4")] {
-            let mut writer = backend.begin_write().await.expect("begin write");
-            writer
-                .put(key(entry_key), key(entry_value))
-                .await
-                .expect("put");
-            writer.commit().await.expect("commit");
-        }
-
-        assert_eq!(reader.get(key(b"a")).await.expect("get"), Some(key(b"1")));
-        assert_eq!(reader.get(key(b"b")).await.expect("get"), None);
-        assert_eq!(reader.get(key(b"c")).await.expect("get"), None);
-    });
-}
 
 #[test]
 fn batch_get_preserves_order_duplicates_and_empty_input() {
@@ -582,52 +538,6 @@ fn commit_installs_complete_new_version_never_partial() {
     });
 }
 
-#[test]
-fn commit_failure_and_unknown_outcome_are_distinct() {
-    let backend = mock();
-
-    // Definite failure: an injected fault reports a retryable abort.
-    backend.push_fault(CommitFault::Abort).expect("fault");
-    block_on(async {
-        let mut txn = backend.begin_write().await.expect("begin write");
-        txn.put(key(b"a"), key(b"v")).await.expect("put");
-        let error = txn.commit().await.expect_err("faulted commit fails");
-        assert_eq!(error.kind(), ErrorKind::RetryableAbort);
-    });
-
-    // Unknown outcome: the mutation lands but the result is reported unknown.
-    backend
-        .push_fault(CommitFault::UnknownApplied)
-        .expect("fault");
-    block_on(async {
-        let mut txn = backend.begin_write().await.expect("begin write");
-        txn.put(key(b"b"), key(b"v")).await.expect("put");
-        let error = txn.commit().await.expect_err("faulted commit is unknown");
-        assert_eq!(error.kind(), ErrorKind::CommitOutcomeUnknown);
-    });
-}
-
-#[test]
-fn unknown_not_applied_persists_nothing() {
-    let backend = mock();
-    backend
-        .push_fault(CommitFault::UnknownNotApplied)
-        .expect("fault");
-
-    block_on(async {
-        let mut txn = backend.begin_write().await.expect("begin write");
-        txn.put(key(b"a"), key(b"1")).await.expect("put");
-        let error = txn.commit().await.expect_err("unknown outcome");
-        assert_eq!(error.kind(), ErrorKind::CommitOutcomeUnknown);
-    });
-
-    assert_eq!(backend.db_key_count(), 0);
-    block_on(async {
-        let mut txn = backend.begin_read().await.expect("begin read");
-        assert_eq!(txn.get(key(b"a")).await.expect("get"), None);
-    });
-}
-
 // ---------------------------------------------------------------------------
 // Hard limits and admission budgets.
 // ---------------------------------------------------------------------------
@@ -957,24 +867,6 @@ fn clear_range_composes_with_other_mutations_in_txn() {
 // ---------------------------------------------------------------------------
 // Durability and restart.
 // ---------------------------------------------------------------------------
-
-#[test]
-fn durable_restart_preserves_committed_data() {
-    let config = TestConfig {
-        durability: Durability::Durable,
-        ..Default::default()
-    };
-    let backend = MemoryBackend::with_test_config(config);
-    seed(&backend, &[(b"a", b"1"), (b"b", b"2")]);
-
-    let restarted = backend.reopen();
-    assert_eq!(restarted.db_key_count(), 2);
-    block_on(async {
-        let mut txn = restarted.begin_read().await.expect("begin read");
-        assert_eq!(txn.get(key(b"a")).await.expect("get"), Some(key(b"1")));
-        assert_eq!(txn.get(key(b"b")).await.expect("get"), Some(key(b"2")));
-    });
-}
 
 #[test]
 fn ephemeral_restart_starts_empty() {

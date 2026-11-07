@@ -4,8 +4,8 @@
 //! [`BackendHarness`] seam every adapter implements to run them. Cases drive a
 //! backend through public storage interfaces, including typed logical transactions,
 //! so they run unchanged against each production adapter, including
-//! Memory with its optional test controls. Each case is a small, named async function with a
-//! stable replay seed; on failure it reports the case name and seed together
+//! Memory with its optional test controls. Each case is deterministic and named;
+//! failures report the case name together
 //! with a safe error category or count, never a raw key, value, or backend
 //! error source.
 //!
@@ -105,22 +105,6 @@ pub trait BackendHarness: Send + Sync {
         Self: Sized;
 }
 
-/// The identity of one case invocation, used to label failures for replay.
-///
-/// The seed is fixed per case and does not drive any randomness: the suite is
-/// fully deterministic, so re-running the same case against a fresh harness
-/// reproduces the failure exactly.
-struct CaseContext {
-    name: &'static str,
-    seed: u64,
-}
-
-impl CaseContext {
-    const fn new(name: &'static str, seed: u64) -> Self {
-        Self { name, seed }
-    }
-}
-
 /// Runs every applicable contract case against `harness`.
 ///
 /// Cases whose capability is unavailable ([`FaultInjection::Unavailable`] or
@@ -128,145 +112,59 @@ impl CaseContext {
 /// adapter. Case order is stable so a replay against a fresh harness observes
 /// the same sequence of operations.
 pub async fn run_suite<H: BackendHarness>(harness: &H) {
-    case_declared_limits_and_capabilities(harness, &CaseContext::new("declared_limits", 1)).await;
-    case_snapshot_consistency(harness, &CaseContext::new("snapshot_consistency", 2)).await;
-    case_read_your_writes(harness, &CaseContext::new("read_your_writes", 3)).await;
-    case_ordered_writes(harness, &CaseContext::new("ordered_writes", 4)).await;
-    case_scan_pagination(harness, &CaseContext::new("scan_pagination", 5)).await;
-    case_unique_insert(harness, &CaseContext::new("unique_insert", 6)).await;
-    case_update_protected_conflict(harness, &CaseContext::new("update_protected_conflict", 7))
-        .await;
-    case_aba_conflict(harness, &CaseContext::new("aba_conflict", 8)).await;
-    case_rollback_and_drop(harness, &CaseContext::new("rollback_and_drop", 9)).await;
-    case_range_clear_capability(harness, &CaseContext::new("range_clear_capability", 10)).await;
-    case_commit_definite_abort(harness, &CaseContext::new("commit_definite_abort", 11)).await;
-    case_commit_unknown_applied(harness, &CaseContext::new("commit_unknown_applied", 12)).await;
-    case_commit_unknown_not_applied(harness, &CaseContext::new("commit_unknown_not_applied", 13))
-        .await;
-    case_durability_mapping(harness, &CaseContext::new("durability_mapping", 14)).await;
-    case_scan_no_skip(harness, &CaseContext::new("scan_no_skip", 15)).await;
-    case_scan_empty_range(harness, &CaseContext::new("scan_empty_range", 16)).await;
-    case_batch_scan(harness, &CaseContext::new("batch_scan", 17)).await;
-    case_graph_storage(harness, &CaseContext::new("graph_storage", 18)).await;
+    case_declared_limits_and_capabilities(harness, "declared_limits").await;
+    case_snapshot_consistency(harness, "snapshot_consistency").await;
+    case_read_your_writes(harness, "read_your_writes").await;
+    case_ordered_writes(harness, "ordered_writes").await;
+    case_scan_pagination(harness, "scan_pagination").await;
+    case_unique_insert(harness, "unique_insert").await;
+    case_update_protected_conflict(harness, "update_protected_conflict").await;
+    case_aba_conflict(harness, "aba_conflict").await;
+    case_rollback_and_drop(harness, "rollback_and_drop").await;
+    case_range_clear_capability(harness, "range_clear_capability").await;
+    case_commit_definite_abort(harness, "commit_definite_abort").await;
+    case_commit_unknown_applied(harness, "commit_unknown_applied").await;
+    case_commit_unknown_not_applied(harness, "commit_unknown_not_applied").await;
+    case_durability_mapping(harness, "durability_mapping").await;
+    case_scan_no_skip(harness, "scan_no_skip").await;
+    case_scan_empty_range(harness, "scan_empty_range").await;
+    case_batch_scan(harness, "batch_scan").await;
+    case_graph_storage(harness, "graph_storage").await;
 }
 
 // ---------------------------------------------------------------------------
 // Redacted assertion helpers.
 //
 // These helpers never interpolate raw keys or values into a panic message, so a
-// failing case leaks only its name, seed, and a safe category or count.
+// failing case leaks only its name and a safe category or count.
 // ---------------------------------------------------------------------------
 
-/// Fails with the case name, replay seed, and a safe detail.
+/// Compares bytes without including them in failure diagnostics.
 #[track_caller]
-fn fail(ctx: &CaseContext, what: &str, detail: impl fmt::Display) -> ! {
-    panic!(
-        "case `{}` (seed {:#x}): {what}: {detail}",
-        ctx.name, ctx.seed
+fn check_value(ctx: &str, what: impl fmt::Display, got: Option<&[u8]>, expected: Option<&[u8]>) {
+    assert!(
+        got == expected,
+        "case `{ctx}`: {what}: expected byte length {:?}, got {:?}",
+        expected.map(<[u8]>::len),
+        got.map(<[u8]>::len),
     );
 }
 
-/// Asserts a stable, redacted error category.
+/// Preserves per-item diagnostics while keeping stored bytes out of failures.
 #[track_caller]
-fn check_kind(ctx: &CaseContext, what: &str, got: ErrorKind, expected: ErrorKind) {
-    if got != expected {
-        fail(
-            ctx,
-            what,
-            format_args!("expected {expected:?}, got {got:?}"),
-        );
-    }
-}
-
-/// Asserts a count.
-#[track_caller]
-fn check_count(ctx: &CaseContext, what: &str, got: usize, expected: usize) {
-    if got != expected {
-        fail(ctx, what, format_args!("expected {expected}, got {got}"));
-    }
-}
-
-/// Asserts a unique-insert outcome.
-#[track_caller]
-fn check_insert(ctx: &CaseContext, what: &str, got: InsertOutcome, expected: InsertOutcome) {
-    if got != expected {
-        fail(
-            ctx,
-            what,
-            format_args!("expected {expected:?}, got {got:?}"),
-        );
-    }
-}
-
-/// Asserts a boolean condition without printing the operands.
-#[track_caller]
-fn check_true(ctx: &CaseContext, what: &str, condition: bool) {
-    if !condition {
-        fail(ctx, what, "condition is false");
-    }
-}
-
-/// Asserts that `got` is present and equals `expected` without printing bytes.
-#[track_caller]
-fn check_present(ctx: &CaseContext, what: &str, got: Option<&[u8]>, expected: &[u8]) {
-    match got {
-        Some(value) if value == expected => {}
-        Some(value) => fail(
-            ctx,
-            what,
-            format_args!(
-                "value mismatch (got {} bytes, expected {} bytes)",
-                value.len(),
-                expected.len(),
-            ),
-        ),
-        None => fail(
-            ctx,
-            what,
-            format_args!("expected present ({} bytes), got absent", expected.len()),
-        ),
-    }
-}
-
-/// Asserts that `got` is absent without printing bytes.
-#[track_caller]
-fn check_absent(ctx: &CaseContext, what: &str, got: Option<&[u8]>) {
-    if got.is_some() {
-        fail(ctx, what, "expected absent, got present");
-    }
-}
-
-/// Asserts a batch read against expected presence and values without printing
-/// bytes.
-#[track_caller]
-fn check_batch(ctx: &CaseContext, what: &str, got: &[Option<Bytes>], expected: &[Option<&[u8]>]) {
-    if got.len() != expected.len() {
-        fail(
-            ctx,
-            what,
-            format_args!("length mismatch ({} vs {})", got.len(), expected.len()),
-        );
-    }
+fn check_batch(ctx: &str, what: &str, got: &[Option<Bytes>], expected: &[Option<&[u8]>]) {
+    assert_eq!(
+        got.len(),
+        expected.len(),
+        "case `{ctx}`: {what}: batch length"
+    );
     for (index, (got, expected)) in got.iter().zip(expected).enumerate() {
-        match (got.as_deref(), *expected) {
-            (Some(value), Some(expected)) if value == expected => {}
-            (Some(value), Some(expected)) => fail(
-                ctx,
-                what,
-                format_args!(
-                    "item {index}: value mismatch (got {} bytes, expected {} bytes)",
-                    value.len(),
-                    expected.len(),
-                ),
-            ),
-            (Some(_), None) => fail(ctx, what, format_args!("item {index}: expected absent")),
-            (None, Some(expected)) => fail(
-                ctx,
-                what,
-                format_args!("item {index}: expected present ({} bytes)", expected.len()),
-            ),
-            (None, None) => {}
-        }
+        check_value(
+            ctx,
+            format_args!("{what}, item {index}"),
+            got.as_deref(),
+            *expected,
+        );
     }
 }
 
@@ -275,17 +173,12 @@ fn check_batch(ctx: &CaseContext, what: &str, got: &[Option<Bytes>], expected: &
 // ---------------------------------------------------------------------------
 
 /// Builds a case-scoped key so distinct cases cannot collide within one backend.
-fn case_key(ctx: &CaseContext, suffix: &str) -> Bytes {
-    let mut bytes = Vec::with_capacity(b"contract/".len() + ctx.name.len() + 1 + suffix.len());
-    bytes.extend_from_slice(b"contract/");
-    bytes.extend_from_slice(ctx.name.as_bytes());
-    bytes.push(b'/');
-    bytes.extend_from_slice(suffix.as_bytes());
-    Bytes::from(bytes)
+fn case_key(ctx: &str, suffix: &str) -> Bytes {
+    Bytes::from(format!("contract/{ctx}/{suffix}"))
 }
 
 /// Builds the `[start, end)` range covering every key under `prefix`.
-fn case_subrange(ctx: &CaseContext, prefix: &str) -> KeyRange {
+fn case_subrange(ctx: &str, prefix: &str) -> KeyRange {
     let start = case_key(ctx, prefix);
     KeyRange::new(start.to_vec(), prefix_end(&start))
 }
@@ -314,36 +207,32 @@ fn value(value: &'static [u8]) -> Bytes {
 // ---------------------------------------------------------------------------
 
 /// Every backend declares positive hard limits and admission budgets.
-async fn case_declared_limits_and_capabilities<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
+async fn case_declared_limits_and_capabilities<H: BackendHarness>(harness: &H, ctx: &str) {
     let backend = harness.backend();
     let hard_limits = backend.hard_limits();
     let budget = backend.admission_budget();
-    check_true(
-        ctx,
-        "hard key limit is positive",
+    assert!(
         hard_limits.max_key_bytes > 0,
+        "case `{ctx}`: hard key limit is positive"
     );
-    check_true(
-        ctx,
-        "hard value limit is positive",
+    assert!(
         hard_limits.max_value_bytes > 0,
+        "case `{ctx}`: hard value limit is positive"
     );
-    check_true(
-        ctx,
-        "mutation count budget is positive",
+    assert!(
         budget.max_mutations > 0,
+        "case `{ctx}`: mutation count budget is positive"
     );
-    check_true(
-        ctx,
-        "mutation byte budget is positive",
+    assert!(
         budget.max_mutation_bytes > 0,
+        "case `{ctx}`: mutation byte budget is positive"
     );
     // The range-clear capability flag is verified by the range-clear case.
     let _ = backend.capabilities();
 }
 
 /// An open read snapshot stays isolated from later commits.
-async fn case_snapshot_consistency<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
+async fn case_snapshot_consistency<H: BackendHarness>(harness: &H, ctx: &str) {
     let backend = harness.backend();
     let key = case_key(ctx, "snapshot");
     {
@@ -363,37 +252,42 @@ async fn case_snapshot_consistency<H: BackendHarness>(harness: &H, ctx: &CaseCon
     }
 
     let old_value = old.get(case_key(ctx, "snapshot")).await.expect("read old");
-    check_present(
+    check_value(
         ctx,
         "old snapshot keeps old value",
         old_value.as_deref(),
-        b"old",
+        Some(b"old"),
     );
     let later = old.get(case_key(ctx, "later")).await.expect("read later");
-    check_absent(ctx, "old snapshot does not see later key", later.as_deref());
+    check_value(
+        ctx,
+        "old snapshot does not see later key",
+        later.as_deref(),
+        None,
+    );
 }
 
 /// A write transaction reads its own uncommitted writes.
-async fn case_read_your_writes<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
+async fn case_read_your_writes<H: BackendHarness>(harness: &H, ctx: &str) {
     let backend = harness.backend();
     let key = case_key(ctx, "k");
     let mut txn = backend.begin_write().await.expect("begin write");
     let before = txn.get(key.clone()).await.expect("get");
-    check_absent(ctx, "absent before put", before.as_deref());
+    check_value(ctx, "absent before put", before.as_deref(), None);
 
     txn.put(key.clone(), value(b"v")).await.expect("put");
     let after_put = txn.get(key.clone()).await.expect("get");
-    check_present(ctx, "own put is visible", after_put.as_deref(), b"v");
+    check_value(ctx, "own put is visible", after_put.as_deref(), Some(b"v"));
 
     txn.delete(key.clone()).await.expect("delete");
     let after_delete = txn.get(key).await.expect("get");
-    check_absent(ctx, "own delete is visible", after_delete.as_deref());
+    check_value(ctx, "own delete is visible", after_delete.as_deref(), None);
 
     txn.rollback().await;
 }
 
 /// A batch mutation applies in input order and reads back through the overlay.
-async fn case_ordered_writes<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
+async fn case_ordered_writes<H: BackendHarness>(harness: &H, ctx: &str) {
     let backend = harness.backend();
     let mut txn = backend.begin_write().await.expect("begin write");
     txn.batch_mutate(vec![
@@ -441,12 +335,16 @@ async fn case_ordered_writes<H: BackendHarness>(harness: &H, ctx: &CaseContext) 
         )
         .await
         .expect("write scan");
-    check_count(ctx, "ordered batch scan count", page.items().len(), 1);
-    check_present(
+    assert_eq!(
+        page.items().len(),
+        1,
+        "case `{ctx}`: ordered batch scan count"
+    );
+    check_value(
         ctx,
         "ordered batch scan value",
         Some(page.items()[0].value().as_ref()),
-        b"second",
+        Some(b"second"),
     );
 
     txn.commit().await.expect("commit");
@@ -454,7 +352,7 @@ async fn case_ordered_writes<H: BackendHarness>(harness: &H, ctx: &CaseContext) 
 
 /// A scan returns ordered pages with a strictly advancing cursor and rejects
 /// zero limits.
-async fn case_scan_pagination<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
+async fn case_scan_pagination<H: BackendHarness>(harness: &H, ctx: &str) {
     let backend = harness.backend();
     {
         let mut txn = backend.begin_write().await.expect("begin seed");
@@ -482,25 +380,22 @@ async fn case_scan_pagination<H: BackendHarness>(harness: &H, ctx: &CaseContext)
         )
         .await
         .expect("first page");
-    check_count(ctx, "first page count", first.items().len(), 2);
-    check_true(
-        ctx,
-        "first page first key",
+    assert_eq!(first.items().len(), 2, "case `{ctx}`: first page count");
+    assert!(
         first.items()[0].key().as_ref() == case_key(ctx, "scan/a").as_ref(),
+        "case `{ctx}`: first page first key"
     );
-    check_true(
-        ctx,
-        "first page second key",
+    assert!(
         first.items()[1].key().as_ref() == case_key(ctx, "scan/b").as_ref(),
+        "case `{ctx}`: first page second key"
     );
 
     let next = first.next_start().expect("non-terminal cursor").clone();
     let mut expected_next = case_key(ctx, "scan/b").to_vec();
     expected_next.push(0x00);
-    check_true(
-        ctx,
-        "cursor is the byte-successor of the last key",
+    assert!(
         next.as_ref() == expected_next.as_slice(),
+        "case `{ctx}`: cursor is the byte-successor of the last key"
     );
 
     let second = txn
@@ -513,17 +408,16 @@ async fn case_scan_pagination<H: BackendHarness>(harness: &H, ctx: &CaseContext)
         )
         .await
         .expect("second page");
-    check_count(ctx, "second page count", second.items().len(), 1);
-    check_present(
+    assert_eq!(second.items().len(), 1, "case `{ctx}`: second page count");
+    check_value(
         ctx,
         "second page value",
         Some(second.items()[0].value().as_ref()),
-        b"12345",
+        Some(b"12345"),
     );
-    check_true(
-        ctx,
-        "second page is terminal",
+    assert!(
         second.next_start().is_none(),
+        "case `{ctx}`: second page is terminal"
     );
 
     let error = txn
@@ -536,11 +430,10 @@ async fn case_scan_pagination<H: BackendHarness>(harness: &H, ctx: &CaseContext)
         )
         .await
         .expect_err("zero item limit");
-    check_kind(
-        ctx,
-        "zero scan limit is invalid",
+    assert_eq!(
         error.kind(),
         ErrorKind::InvalidArgument,
+        "case `{ctx}`: zero scan limit is invalid"
     );
 }
 
@@ -575,7 +468,7 @@ async fn drain_scan<H: BackendHarness>(
 
 /// A scan paginates gap-free and duplicate-free across item and byte bounds,
 /// an oversized first item, and exact-boundary exhaustion.
-async fn case_scan_no_skip<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
+async fn case_scan_no_skip<H: BackendHarness>(harness: &H, ctx: &str) {
     let backend = harness.backend();
     let suffixes = ["a", "b", "c", "d", "e"];
     let expected: Vec<Vec<u8>> = suffixes
@@ -609,12 +502,11 @@ async fn case_scan_no_skip<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
         },
     )
     .await;
-    check_true(
-        ctx,
-        "item-bounded paging has no gap or duplicate",
+    assert!(
         item_keys == expected,
+        "case `{ctx}`: item-bounded paging has no gap or duplicate"
     );
-    check_count(ctx, "item-bounded page count", item_pages, 3);
+    assert_eq!(item_pages, 3, "case `{ctx}`: item-bounded page count");
 
     // Byte boundary: a tight byte limit splits pages mid-value while the
     // oversized middle value is still returned alone, and the final page
@@ -628,17 +520,20 @@ async fn case_scan_no_skip<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
         },
     )
     .await;
-    check_true(
-        ctx,
-        "byte-bounded paging has no gap or duplicate",
+    assert!(
         byte_keys == expected,
+        "case `{ctx}`: byte-bounded paging has no gap or duplicate"
     );
-    check_count(ctx, "byte-bounded page count", byte_pages, suffixes.len());
+    assert_eq!(
+        byte_pages,
+        suffixes.len(),
+        "case `{ctx}`: byte-bounded page count"
+    );
 }
 
 /// A scan of an inverted or keyless range yields an empty terminal page, never
 /// a continuation.
-async fn case_scan_empty_range<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
+async fn case_scan_empty_range<H: BackendHarness>(harness: &H, ctx: &str) {
     let backend = harness.backend();
     {
         let mut txn = backend.begin_write().await.expect("begin seed");
@@ -664,8 +559,15 @@ async fn case_scan_empty_range<H: BackendHarness>(harness: &H, ctx: &CaseContext
         )
         .await
         .expect("inverted scan");
-    check_count(ctx, "inverted range is empty", inverted.items().len(), 0);
-    check_true(ctx, "inverted range is terminal", inverted.is_terminal());
+    assert_eq!(
+        inverted.items().len(),
+        0,
+        "case `{ctx}`: inverted range is empty"
+    );
+    assert!(
+        inverted.is_terminal(),
+        "case `{ctx}`: inverted range is terminal"
+    );
 
     // A well-formed half-open range that happens to contain no keys is empty.
     let gap = txn
@@ -678,13 +580,13 @@ async fn case_scan_empty_range<H: BackendHarness>(harness: &H, ctx: &CaseContext
         )
         .await
         .expect("empty gap scan");
-    check_count(ctx, "keyless range is empty", gap.items().len(), 0);
-    check_true(ctx, "keyless range is terminal", gap.is_terminal());
+    assert_eq!(gap.items().len(), 0, "case `{ctx}`: keyless range is empty");
+    assert!(gap.is_terminal(), "case `{ctx}`: keyless range is terminal");
 }
 
 /// A batched scan returns one independently paginated page per input range,
 /// preserving input order, duplicates, and empty or inverted ranges.
-async fn case_batch_scan<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
+async fn case_batch_scan<H: BackendHarness>(harness: &H, ctx: &str) {
     let backend = harness.backend();
     {
         let mut txn = backend.begin_write().await.expect("begin seed");
@@ -720,7 +622,7 @@ async fn case_batch_scan<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
 
     // An empty input succeeds with an empty result.
     let none = txn.batch_scan(&[], limits).await.expect("empty batch scan");
-    check_count(ctx, "empty batch page count", none.len(), 0);
+    assert_eq!(none.len(), 0, "case `{ctx}`: empty batch page count");
 
     let inverted = KeyRange::new(case_key(ctx, "b/2").to_vec(), case_key(ctx, "b/1").to_vec());
     let pages = txn
@@ -730,40 +632,55 @@ async fn case_batch_scan<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
         )
         .await
         .expect("batch scan");
-    check_count(ctx, "one page per input range", pages.len(), 4);
+    assert_eq!(pages.len(), 4, "case `{ctx}`: one page per input range");
 
     // Range A paginates independently at the item limit.
-    check_count(ctx, "range a first page count", pages[0].items().len(), 2);
-    check_true(
-        ctx,
-        "range a page order",
+    assert_eq!(
+        pages[0].items().len(),
+        2,
+        "case `{ctx}`: range a first page count"
+    );
+    assert!(
         pages[0].items()[0].key().as_ref() == case_key(ctx, "a/1").as_ref()
             && pages[0].items()[1].key().as_ref() == case_key(ctx, "a/2").as_ref(),
+        "case `{ctx}`: range a page order"
     );
     let mut expected_next = case_key(ctx, "a/2").to_vec();
     expected_next.push(0x00);
-    check_true(
-        ctx,
-        "range a cursor is the byte-successor of its last key",
+    assert!(
         pages[0]
             .next_start()
             .is_some_and(|next| next.as_ref() == expected_next.as_slice()),
+        "case `{ctx}`: range a cursor is the byte-successor of its last key"
     );
 
     // Range B exhausts in one terminal page.
-    check_count(ctx, "range b page count", pages[1].items().len(), 2);
-    check_true(ctx, "range b page is terminal", pages[1].is_terminal());
+    assert_eq!(
+        pages[1].items().len(),
+        2,
+        "case `{ctx}`: range b page count"
+    );
+    assert!(
+        pages[1].is_terminal(),
+        "case `{ctx}`: range b page is terminal"
+    );
 
     // The inverted range is a terminal empty page at its own position.
-    check_count(ctx, "inverted range page count", pages[2].items().len(), 0);
-    check_true(
-        ctx,
-        "inverted range page is terminal",
+    assert_eq!(
+        pages[2].items().len(),
+        0,
+        "case `{ctx}`: inverted range page count"
+    );
+    assert!(
         pages[2].is_terminal(),
+        "case `{ctx}`: inverted range page is terminal"
     );
 
     // A repeated range is read independently and returns the same page.
-    check_true(ctx, "duplicate range repeats", pages[3] == pages[0]);
+    assert!(
+        pages[3] == pages[0],
+        "case `{ctx}`: duplicate range repeats"
+    );
 
     // Resuming range A in a later batch skips no key and repeats none.
     let resume = KeyRange::new(expected_next, range_a.end().to_vec());
@@ -771,14 +688,21 @@ async fn case_batch_scan<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
         .batch_scan(&[resume], limits)
         .await
         .expect("resumed batch scan");
-    check_count(ctx, "resumed page count", pages[0].items().len(), 1);
-    check_present(
+    assert_eq!(
+        pages[0].items().len(),
+        1,
+        "case `{ctx}`: resumed page count"
+    );
+    check_value(
         ctx,
         "resumed value",
         Some(pages[0].items()[0].value().as_ref()),
-        b"333",
+        Some(b"333"),
     );
-    check_true(ctx, "resumed page is terminal", pages[0].is_terminal());
+    assert!(
+        pages[0].is_terminal(),
+        "case `{ctx}`: resumed page is terminal"
+    );
 
     // A single oversized first item is returned alone even past the byte
     // limit.
@@ -792,8 +716,15 @@ async fn case_batch_scan<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
         )
         .await
         .expect("oversized batch scan");
-    check_count(ctx, "oversized first item alone", pages[0].items().len(), 1);
-    check_true(ctx, "oversized page is terminal", pages[0].is_terminal());
+    assert_eq!(
+        pages[0].items().len(),
+        1,
+        "case `{ctx}`: oversized first item alone"
+    );
+    assert!(
+        pages[0].is_terminal(),
+        "case `{ctx}`: oversized page is terminal"
+    );
 
     // A zero limit is invalid before any work.
     let error = txn
@@ -806,11 +737,10 @@ async fn case_batch_scan<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
         )
         .await
         .expect_err("zero item limit");
-    check_kind(
-        ctx,
-        "zero batch scan limit is invalid",
+    assert_eq!(
         error.kind(),
         ErrorKind::InvalidArgument,
+        "case `{ctx}`: zero batch scan limit is invalid"
     );
     drop(txn);
 
@@ -823,20 +753,28 @@ async fn case_batch_scan<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
         .batch_scan(&[case_subrange(ctx, "c/"), range_b], limits)
         .await
         .expect("write batch scan");
-    check_count(ctx, "staged range count", pages[0].items().len(), 1);
-    check_present(
+    assert_eq!(
+        pages[0].items().len(),
+        1,
+        "case `{ctx}`: staged range count"
+    );
+    check_value(
         ctx,
         "staged value is visible",
         Some(pages[0].items()[0].value().as_ref()),
-        b"staged",
+        Some(b"staged"),
     );
-    check_count(ctx, "committed range count", pages[1].items().len(), 2);
+    assert_eq!(
+        pages[1].items().len(),
+        2,
+        "case `{ctx}`: committed range count"
+    );
     txn.rollback().await;
 }
 
 /// Unique insertion distinguishes inserted from existing and conflicts on
 /// concurrent insertion.
-async fn case_unique_insert<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
+async fn case_unique_insert<H: BackendHarness>(harness: &H, ctx: &str) {
     let backend = harness.backend();
     {
         let mut txn = backend.begin_write().await.expect("begin seed");
@@ -847,37 +785,39 @@ async fn case_unique_insert<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
     }
 
     let mut txn = backend.begin_write().await.expect("begin write");
-    check_insert(
-        ctx,
-        "fresh insert",
+    assert_eq!(
         txn.insert(case_key(ctx, "fresh"), value(b"v"))
             .await
             .expect("insert"),
         InsertOutcome::Inserted,
+        "case `{ctx}`: fresh insert"
     );
-    check_insert(
-        ctx,
-        "existing insert",
+    assert_eq!(
         txn.insert(case_key(ctx, "existing"), value(b"v"))
             .await
             .expect("insert"),
         InsertOutcome::AlreadyExists,
+        "case `{ctx}`: existing insert"
     );
     let existing = txn.get(case_key(ctx, "existing")).await.expect("get");
-    check_present(ctx, "existing value unchanged", existing.as_deref(), b"old");
-    check_insert(
+    check_value(
         ctx,
-        "re-insert own write",
+        "existing value unchanged",
+        existing.as_deref(),
+        Some(b"old"),
+    );
+    assert_eq!(
         txn.insert(case_key(ctx, "fresh"), value(b"again"))
             .await
             .expect("insert"),
         InsertOutcome::AlreadyExists,
+        "case `{ctx}`: re-insert own write"
     );
     txn.commit().await.expect("commit");
 }
 
 /// An update-protected read conflicts with a concurrent write.
-async fn case_update_protected_conflict<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
+async fn case_update_protected_conflict<H: BackendHarness>(harness: &H, ctx: &str) {
     let backend = harness.backend();
     let key = case_key(ctx, "k");
     let mut first = backend.begin_write().await.expect("begin first");
@@ -900,20 +840,19 @@ async fn case_update_protected_conflict<H: BackendHarness>(harness: &H, ctx: &Ca
         .await
         .expect("second put");
     let error = second.commit().await.expect_err("second conflicts");
-    check_kind(
-        ctx,
-        "conflict maps to RetryableAbort",
+    assert_eq!(
         error.kind(),
         ErrorKind::RetryableAbort,
+        "case `{ctx}`: conflict maps to RetryableAbort"
     );
 
     let mut read = backend.begin_read().await.expect("read winner");
     let winner = read.get(key).await.expect("get");
-    check_present(ctx, "winner value persists", winner.as_deref(), b"1");
+    check_value(ctx, "winner value persists", winner.as_deref(), Some(b"1"));
 }
 
 /// Restoring a key to its original value still conflicts with a stale writer.
-async fn case_aba_conflict<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
+async fn case_aba_conflict<H: BackendHarness>(harness: &H, ctx: &str) {
     let backend = harness.backend();
     let key = case_key(ctx, "k");
     let mut reader = backend.begin_write().await.expect("begin reader");
@@ -935,16 +874,15 @@ async fn case_aba_conflict<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
         .await
         .expect("stage stale write");
     let error = reader.commit().await.expect_err("ABA conflict");
-    check_kind(
-        ctx,
-        "ABA conflict maps to RetryableAbort",
+    assert_eq!(
         error.kind(),
         ErrorKind::RetryableAbort,
+        "case `{ctx}`: ABA conflict maps to RetryableAbort"
     );
 }
 
 /// Rollback and dropping a transaction both persist nothing.
-async fn case_rollback_and_drop<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
+async fn case_rollback_and_drop<H: BackendHarness>(harness: &H, ctx: &str) {
     let backend = harness.backend();
     {
         let mut txn = backend.begin_write().await.expect("begin rollback");
@@ -975,7 +913,7 @@ async fn case_rollback_and_drop<H: BackendHarness>(harness: &H, ctx: &CaseContex
 }
 
 /// The range-clear capability either clears transactionally or is declined.
-async fn case_range_clear_capability<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
+async fn case_range_clear_capability<H: BackendHarness>(harness: &H, ctx: &str) {
     let backend = harness.backend();
     let clear = case_subrange(ctx, "clear/");
     if backend.capabilities().transactional_clear_range {
@@ -1011,19 +949,29 @@ async fn case_range_clear_capability<H: BackendHarness>(harness: &H, ctx: &CaseC
 
         let mut read = backend.begin_read().await.expect("read cleared");
         let a = read.get(case_key(ctx, "clear/a")).await.expect("get a");
-        check_absent(ctx, "cleared key a is absent", a.as_deref());
+        check_value(ctx, "cleared key a is absent", a.as_deref(), None);
         let b = read.get(case_key(ctx, "clear/b")).await.expect("get b");
-        check_absent(ctx, "cleared key b is absent", b.as_deref());
+        check_value(ctx, "cleared key b is absent", b.as_deref(), None);
         let concurrent = read
             .get(case_key(ctx, "clear/concurrent"))
             .await
             .expect("get concurrent");
-        check_absent(ctx, "concurrent key is cleared", concurrent.as_deref());
+        check_value(
+            ctx,
+            "concurrent key is cleared",
+            concurrent.as_deref(),
+            None,
+        );
         let outside = read
             .get(case_key(ctx, "outside"))
             .await
             .expect("get outside");
-        check_present(ctx, "outside key is retained", outside.as_deref(), b"3");
+        check_value(
+            ctx,
+            "outside key is retained",
+            outside.as_deref(),
+            Some(b"3"),
+        );
     } else {
         let mut txn = backend
             .begin_write()
@@ -1033,17 +981,16 @@ async fn case_range_clear_capability<H: BackendHarness>(harness: &H, ctx: &CaseC
             .clear_range(&clear)
             .await
             .expect_err("range clear is declined");
-        check_kind(
-            ctx,
-            "range clear is declined",
+        assert_eq!(
             error.kind(),
             ErrorKind::Unsupported,
+            "case `{ctx}`: range clear is declined"
         );
     }
 }
 
 /// A controlled definite abort reports `RetryableAbort` and persists nothing.
-async fn case_commit_definite_abort<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
+async fn case_commit_definite_abort<H: BackendHarness>(harness: &H, ctx: &str) {
     if harness.fault_injection() != FaultInjection::Controlled {
         return; // Skipped: this harness cannot stage a controlled abort.
     }
@@ -1055,21 +1002,20 @@ async fn case_commit_definite_abort<H: BackendHarness>(harness: &H, ctx: &CaseCo
         .await
         .expect("put");
     let error = txn.commit().await.expect_err("faulted commit aborts");
-    check_kind(
-        ctx,
-        "definite abort maps to RetryableAbort",
+    assert_eq!(
         error.kind(),
         ErrorKind::RetryableAbort,
+        "case `{ctx}`: definite abort maps to RetryableAbort"
     );
 
     let mut read = backend.begin_read().await.expect("read after abort");
     let got = read.get(case_key(ctx, "abort")).await.expect("get");
-    check_absent(ctx, "definite abort persists nothing", got.as_deref());
+    check_value(ctx, "definite abort persists nothing", got.as_deref(), None);
 }
 
 /// A controlled unknown-applied outcome reports `CommitOutcomeUnknown` and
 /// persists every mutation atomically.
-async fn case_commit_unknown_applied<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
+async fn case_commit_unknown_applied<H: BackendHarness>(harness: &H, ctx: &str) {
     if harness.fault_injection() != FaultInjection::Controlled {
         return; // Skipped: this harness cannot stage an unknown outcome.
     }
@@ -1084,23 +1030,22 @@ async fn case_commit_unknown_applied<H: BackendHarness>(harness: &H, ctx: &CaseC
         .await
         .expect("put b");
     let error = txn.commit().await.expect_err("unknown applied");
-    check_kind(
-        ctx,
-        "unknown applied maps to CommitOutcomeUnknown",
+    assert_eq!(
         error.kind(),
         ErrorKind::CommitOutcomeUnknown,
+        "case `{ctx}`: unknown applied maps to CommitOutcomeUnknown"
     );
 
     let mut read = backend.begin_read().await.expect("read after unknown");
     let a = read.get(case_key(ctx, "a")).await.expect("get a");
-    check_present(ctx, "unknown applied persists a", a.as_deref(), b"1");
+    check_value(ctx, "unknown applied persists a", a.as_deref(), Some(b"1"));
     let b = read.get(case_key(ctx, "b")).await.expect("get b");
-    check_present(ctx, "unknown applied persists b", b.as_deref(), b"2");
+    check_value(ctx, "unknown applied persists b", b.as_deref(), Some(b"2"));
 }
 
 /// A controlled unknown-not-applied outcome reports `CommitOutcomeUnknown` and
 /// persists nothing.
-async fn case_commit_unknown_not_applied<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
+async fn case_commit_unknown_not_applied<H: BackendHarness>(harness: &H, ctx: &str) {
     if harness.fault_injection() != FaultInjection::Controlled {
         return; // Skipped: this harness cannot stage an unknown outcome.
     }
@@ -1112,20 +1057,24 @@ async fn case_commit_unknown_not_applied<H: BackendHarness>(harness: &H, ctx: &C
         .await
         .expect("put a");
     let error = txn.commit().await.expect_err("unknown not applied");
-    check_kind(
-        ctx,
-        "unknown not applied maps to CommitOutcomeUnknown",
+    assert_eq!(
         error.kind(),
         ErrorKind::CommitOutcomeUnknown,
+        "case `{ctx}`: unknown not applied maps to CommitOutcomeUnknown"
     );
 
     let mut read = backend.begin_read().await.expect("read after unknown");
     let got = read.get(case_key(ctx, "a")).await.expect("get a");
-    check_absent(ctx, "unknown not applied persists nothing", got.as_deref());
+    check_value(
+        ctx,
+        "unknown not applied persists nothing",
+        got.as_deref(),
+        None,
+    );
 }
 
 /// A restart preserves or drops committed data per the harness's restart mode.
-async fn case_durability_mapping<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
+async fn case_durability_mapping<H: BackendHarness>(harness: &H, ctx: &str) {
     let mode = harness.restart_mode();
     if mode == RestartMode::Unsupported {
         return; // Skipped: this harness cannot simulate a restart.
@@ -1149,15 +1098,20 @@ async fn case_durability_mapping<H: BackendHarness>(harness: &H, ctx: &CaseConte
     let got = read.get(case_key(ctx, "durable")).await.expect("get");
     match mode {
         RestartMode::Durable => {
-            check_present(
+            check_value(
                 ctx,
                 "durable data survives restart",
                 got.as_deref(),
-                b"kept",
+                Some(b"kept"),
             );
         }
         RestartMode::Ephemeral => {
-            check_absent(ctx, "ephemeral data is lost on restart", got.as_deref());
+            check_value(
+                ctx,
+                "ephemeral data is lost on restart",
+                got.as_deref(),
+                None,
+            );
         }
         RestartMode::Unsupported => {}
     }
@@ -1165,7 +1119,7 @@ async fn case_durability_mapping<H: BackendHarness>(harness: &H, ctx: &CaseConte
 
 /// Full-size graph values and the final chunk survive typed writes and pagination.
 /// Topology restoration and source binding are checked by the owning core module.
-async fn case_graph_storage<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
+async fn case_graph_storage<H: BackendHarness>(harness: &H, ctx: &str) {
     use ktann::api::{IndexConfig, LogicalIndexId, Metric, PartitionKey};
     use ktann::storage::keys::{LogicalKey, TreeKey};
     use ktann::storage::values::{
@@ -1225,10 +1179,9 @@ async fn case_graph_storage<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
     write.commit().await.unwrap();
     let mut read = ReadLogicalTxn::for_index(backend.begin_read().await.unwrap(), &manifest);
     let stored = read.get(key).await.unwrap();
-    check_true(
-        ctx,
-        "graph descriptor round-trips",
+    assert!(
         stored == Some(descriptor),
+        "case `{ctx}`: graph descriptor round-trips"
     );
     let range = LogicalRange::graph_chunks(&manifest, &tree, partition).unwrap();
     let mut cursor = None;
@@ -1253,9 +1206,8 @@ async fn case_graph_storage<H: BackendHarness>(harness: &H, ctx: &CaseContext) {
             break;
         }
     }
-    check_true(
-        ctx,
-        "complete ordered graph chunks round-trip",
+    assert!(
         found == expected,
+        "case `{ctx}`: complete ordered graph chunks round-trip"
     );
 }

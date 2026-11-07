@@ -7,6 +7,8 @@
 //! may contain a canary, and every label and trace field must stay within the
 //! documented bounded allowlist (design `runtime-operations.md` section 5).
 
+#![allow(dead_code, reason = "audit suites use different capture views")]
+
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 

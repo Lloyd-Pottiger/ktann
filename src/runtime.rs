@@ -935,20 +935,16 @@ async fn wait_for_deadline(deadline: Option<Instant>) {
 
 #[cfg(test)]
 mod tests {
-    use std::future::{Ready, ready};
+    use std::future::ready;
     use std::sync::Condvar;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use bytes::Bytes;
     use tokio::sync::Notify;
 
     use super::*;
-    use crate::storage::backend::{
-        AdmissionBudget, Capabilities, HardLimits, InsertOutcome, Mutation, ReadOps, ReadTxn,
-        ScanLimits, ScanPage, WriteTxn,
-    };
-    use crate::storage::keys::KeyRange;
+    use crate::storage::backend::{AdmissionBudget, Capabilities, HardLimits};
+    use crate::storage::test_support::FailingTxn;
 
     struct TestBackend {
         drops: Arc<AtomicUsize>,
@@ -991,12 +987,6 @@ mod tests {
         }
     }
 
-    struct TestTxn;
-
-    fn backend_error<T>() -> Ready<Result<T>> {
-        ready(Err(Error::new(ErrorKind::Backend)))
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn commit_boundary_has_exactly_one_winner() {
         for _ in 0..100 {
@@ -1024,93 +1014,10 @@ mod tests {
         }
     }
 
-    impl ReadOps for TestTxn {
-        fn get(&mut self, _key: Bytes) -> impl Future<Output = Result<Option<Bytes>>> + Send {
-            backend_error()
-        }
-
-        fn batch_get(
-            &mut self,
-            _keys: Vec<Bytes>,
-        ) -> impl Future<Output = Result<Vec<Option<Bytes>>>> + Send {
-            backend_error()
-        }
-
-        fn scan(
-            &mut self,
-            _range: &KeyRange,
-            _limits: ScanLimits,
-        ) -> impl Future<Output = Result<ScanPage>> + Send {
-            backend_error()
-        }
-
-        fn batch_scan(
-            &mut self,
-            _ranges: &[KeyRange],
-            _limits: ScanLimits,
-        ) -> impl Future<Output = Result<Vec<ScanPage>>> + Send {
-            backend_error()
-        }
-    }
-
-    impl ReadTxn for TestTxn {}
-
-    impl WriteTxn for TestTxn {
-        fn get_for_update(
-            &mut self,
-            _key: Bytes,
-        ) -> impl Future<Output = Result<Option<Bytes>>> + Send {
-            backend_error()
-        }
-
-        fn batch_get_for_update(
-            &mut self,
-            _keys: Vec<Bytes>,
-        ) -> impl Future<Output = Result<Vec<Option<Bytes>>>> + Send {
-            backend_error()
-        }
-
-        fn put(&mut self, _key: Bytes, _value: Bytes) -> impl Future<Output = Result<()>> + Send {
-            backend_error()
-        }
-
-        fn insert(
-            &mut self,
-            _key: Bytes,
-            _value: Bytes,
-        ) -> impl Future<Output = Result<InsertOutcome>> + Send {
-            backend_error()
-        }
-
-        fn delete(&mut self, _key: Bytes) -> impl Future<Output = Result<()>> + Send {
-            backend_error()
-        }
-
-        fn batch_mutate(
-            &mut self,
-            _mutations: Vec<Mutation>,
-        ) -> impl Future<Output = Result<()>> + Send {
-            backend_error()
-        }
-
-        fn clear_range(&mut self, _range: &KeyRange) -> impl Future<Output = Result<()>> + Send {
-            backend_error()
-        }
-
-        async fn commit_with(self, start: CommitStart) -> Result<()> {
-            start.begin()?;
-            Err(Error::new(ErrorKind::Backend))
-        }
-
-        fn rollback(self) -> impl Future<Output = ()> + Send {
-            ready(())
-        }
-    }
-
     impl Backend for TestBackend {
-        type ReadTxn<'backend> = TestTxn;
+        type ReadTxn<'backend> = FailingTxn;
 
-        type WriteTxn<'backend> = TestTxn;
+        type WriteTxn<'backend> = FailingTxn;
 
         fn hard_limits(&self) -> HardLimits {
             HardLimits {
@@ -1138,11 +1045,11 @@ mod tests {
         }
 
         fn begin_read(&self) -> impl Future<Output = Result<Self::ReadTxn<'_>>> + Send + '_ {
-            ready(Ok(TestTxn))
+            ready(Ok(FailingTxn))
         }
 
         fn begin_write(&self) -> impl Future<Output = Result<Self::WriteTxn<'_>>> + Send + '_ {
-            ready(Ok(TestTxn))
+            ready(Ok(FailingTxn))
         }
     }
 

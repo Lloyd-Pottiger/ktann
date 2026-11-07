@@ -761,39 +761,7 @@ mod tests {
                 let kernel = VectorKernel::new(dimension, metric, SEED).unwrap();
                 let prepared = kernel.prepare_exact_query(&query).unwrap();
                 let exact = prepared.distance_validated(&record).unwrap();
-                let query64: Vec<f64> = query.iter().map(|&value| f64::from(value)).collect();
-                let record64: Vec<f64> = record.iter().map(|&value| f64::from(value)).collect();
-                let oracle = match metric {
-                    Metric::L2 => query64
-                        .iter()
-                        .zip(&record64)
-                        .map(|(left, right)| (left - right).powi(2))
-                        .sum::<f64>()
-                        .sqrt(),
-                    Metric::InnerProduct => -query64
-                        .iter()
-                        .zip(&record64)
-                        .map(|(left, right)| left * right)
-                        .sum::<f64>(),
-                    Metric::Cosine => {
-                        let dot = query64
-                            .iter()
-                            .zip(&record64)
-                            .map(|(left, right)| left * right)
-                            .sum::<f64>();
-                        let query_norm = query64
-                            .iter()
-                            .map(|value| value.powi(2))
-                            .sum::<f64>()
-                            .sqrt();
-                        let record_norm = record64
-                            .iter()
-                            .map(|value| value.powi(2))
-                            .sum::<f64>()
-                            .sqrt();
-                        1.0 - dot / (query_norm * record_norm)
-                    }
-                };
+                let oracle = crate::search::test_support::exact_distance(metric, &query, &record);
                 assert_eq!(exact.distance(), oracle);
             }
         }
