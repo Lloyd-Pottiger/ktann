@@ -169,3 +169,17 @@ sampler finishes, preserving its RNG word consumption for subsequent nodes.
 The safe parser and encoded-size bound enforce the same integer cap. The owning
 KTANN configuration limits M to 16 and internal capacity to 16,384 plus two
 transient slots; the native crate retains its broader standalone input limits.
+
+## Independent capacity bounds
+
+`MAX_NODES` is the u32 ordinal/sentinel representation bound, not a partition
+limit or a claim that such a graph fits in memory. `MAX_CONNECTIVITY` independently
+limits M to 32,768. Build, query and decode allocations must fit caller admission;
+size arithmetic is checked before crossing the native boundary. Duplicate-edge
+validation uses u64 epochs, admitting the entire ordinal domain without wraparound.
+
+The fixed degree-specific layer envelope described above remains a deterministic
+algorithm choice independent of node capacity. It preserves existing small-graph
+bytes; it does not restrict the number of graph nodes. KTANN owns its partition
+capacity restrictions separately. Its transient refinement graphs can exceed
+65,536 nodes under the refinement budget.

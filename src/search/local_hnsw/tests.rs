@@ -146,7 +146,13 @@ fn build<'a>(
     children: &'a [ChildEntry],
     parameters: Parameters,
 ) -> TestGraph<'a> {
-    let centroids = Centroids::new(kernel, children, ktann_usearch::MAX_NODES, &|| Ok(())).unwrap();
+    let centroids = Centroids::new(
+        kernel,
+        children,
+        crate::api::MAX_PARTITION_ENTRIES as usize,
+        &|| Ok(()),
+    )
+    .unwrap();
     TestGraph::build(centroids, parameters, &tree(), key(1), MEMORY, &|| Ok(())).unwrap()
 }
 
@@ -236,7 +242,7 @@ fn rejects_invalid_inputs_and_admits_checked_resource_bounds() {
         );
     }
     let rows = children(vec![vec![0.0; 2]; 2]);
-    for capacity in [0, 1, ktann_usearch::MAX_NODES + 1] {
+    for capacity in [0, 1, crate::api::MAX_PARTITION_ENTRIES as usize + 1] {
         assert!(Centroids::new(&kernel, &rows, capacity, &|| Ok(())).is_err());
     }
     let view = Centroids::new(&kernel, &rows, 2, &|| Ok(())).unwrap();

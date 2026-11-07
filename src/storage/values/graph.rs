@@ -35,10 +35,10 @@ impl GraphDescriptor {
 
     fn validate(&self) -> Result<()> {
         if self.nodes == 0
-            || self.nodes as usize > ktann_usearch::MAX_NODES
+            || self.nodes > crate::api::MAX_PARTITION_ENTRIES
             || self.bytes < ktann_usearch::NATIVE_HEADER_BYTES as u64
             || self.bytes
-                > ktann_usearch::encoded_bound(self.nodes as usize, ktann_usearch::MAX_NODES / 2)
+                > ktann_usearch::encoded_bound(self.nodes as usize, ktann_usearch::MAX_CONNECTIVITY)
                     .map_err(|_| corrupt())? as u64
         {
             return Err(corrupt());
@@ -106,5 +106,28 @@ impl std::fmt::Debug for GraphChunk {
         f.debug_struct("GraphChunk")
             .field("bytes", &self.0.len())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persisted_graph_still_obeys_partition_capacity() {
+        let mut descriptor = GraphDescriptor {
+            nodes: crate::api::MAX_PARTITION_ENTRIES,
+            epoch: 0,
+            bytes: ktann_usearch::NATIVE_HEADER_BYTES as u64,
+            binding: [0; 32],
+            sha256: [0; 32],
+        };
+        descriptor.validate().unwrap();
+        descriptor.nodes += 1;
+        assert!(ktann_usearch::build_bound(descriptor.nodes as usize, 8).is_ok());
+        assert_eq!(
+            descriptor.validate().unwrap_err().kind(),
+            crate::api::ErrorKind::Corruption
+        );
     }
 }

@@ -7,8 +7,9 @@ pub(crate) const MAX_REFINEMENT_ROUNDS: usize = 5;
 
 /// Controls bounded-round refinement before serving an imported index.
 ///
-/// The input limit covers loaded vectors, IDs and topology, not total resident
-/// memory. Numerical planning and migration proposals require additional space.
+/// The input limit covers loaded vectors, IDs, topology and a reservation for
+/// the largest transient candidate graph, not total resident memory. Other
+/// numerical planning and migration proposals require additional space.
 #[derive(Clone, Debug)]
 pub struct RefineOptions {
     pub(crate) rounds: usize,

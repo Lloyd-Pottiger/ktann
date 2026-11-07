@@ -356,8 +356,10 @@ an inadmissible single graph fails rather than falling back to graph-free storag
 `RefineOptions::new(input_bytes)` requires a positive input byte limit and defaults
 to two rounds. Builders accept `with_refinement_rounds(0..=5)` and
 `with_operation_options(OperationOptions)`. The limit covers loaded vectors, IDs,
-centroids and topology; numerical workspace and move lists require additional
-memory. Zero rounds refreshes centroids without relocating records.
+centroids, topology and the largest transient candidate graph. Trees execute
+sequentially and reuse that reserve; other numerical workspace and move lists
+require additional memory. Zero rounds refreshes centroids without relocating
+records.
 
 Refinement preserves Partition Keys and topology. Bounded atomic transactions
 relocate records within capacity constraints and update centroids with their

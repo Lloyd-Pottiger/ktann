@@ -29,9 +29,14 @@ pub fn encoded_bound(n: usize, m: usize) -> Result<usize, Error> {
 
 /// Admission includes input bytes, native load allocations, and validation scratch.
 pub fn decode_bound(n: usize, m: usize, bytes: usize) -> Result<usize, Error> {
-    build_bound(n, m)?
+    let build = build_bound(n, m)?;
+    let scratch = n
+        .checked_mul(2 * size_of::<usize>() + 10)
+        .and_then(|v| v.checked_add(1024))
+        .ok_or(Error::LimitExceeded)?;
+    build
         .checked_add(bytes)
-        .and_then(|v| v.checked_add(n * (2 * size_of::<usize>() + 6) + 1024))
+        .and_then(|v| v.checked_add(scratch))
         .ok_or(Error::LimitExceeded)
 }
 
@@ -152,8 +157,8 @@ impl Graph {
             levels.push(level);
         }
         let mut seen = reserved(n)?;
-        seen.resize(n, 0_u32);
-        let mut stamp = 0_u32;
+        seen.resize(n, 0_u64);
+        let mut stamp = 0_u64;
         // The level table is complete, so validate both layout and active edges
         // in one pass. An embedded level must equal its allocation's level.
         for (node, &level) in levels.iter().enumerate() {
@@ -163,7 +168,7 @@ impl Graph {
             }
             offsets.push(cursor.position);
             for layer in 0..=level {
-                stamp += 1; // At most MAX_NODES * (MAX_LEVEL+1), below u32::MAX.
+                stamp += 1; // A u32 node domain times at most 17 layers fits u64.
                 let capacity = if layer == 0 { 2 * m } else { m };
                 let degree = cursor.word()? as usize;
                 if degree > capacity.min(n.saturating_sub(1)) {

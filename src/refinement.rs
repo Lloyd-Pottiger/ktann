@@ -4,10 +4,26 @@
 //! Preparation normalizes vectors once; each tree refreshes all centroids even
 //! with zero rounds. Persistence and artifact emission remain caller owned.
 
+mod hnsw;
+
 use std::collections::BTreeMap;
 
 use crate::api::{IndexConfig, PartitionKey, Result};
 use crate::search::numeric::VectorKernel;
+
+/// Per-leaf candidate bound shared by exact selection, HNSW and move scoring.
+const NEIGHBOR_COUNT: usize = 32;
+
+/// Sorted routing distances and leaf ordinals; unused slots sort last.
+type LeafNeighbors = [(f64, usize); NEIGHBOR_COUNT];
+
+/// Native candidate scratch is shared across sequential trees and rounds.
+pub(crate) fn candidate_scratch_bytes(leaves: usize, rounds: usize) -> Result<usize> {
+    if rounds == 0 {
+        return Ok(0);
+    }
+    hnsw::scratch_bytes(leaves)
+}
 
 /// Existing partitions keep their identities and parent edges during refinement.
 pub(crate) struct Part {
@@ -128,55 +144,72 @@ fn mean<'a>(kernel: &VectorKernel, members: impl Iterator<Item = &'a [f32]>) -> 
     kernel.normalize_centroid(&center)
 }
 
-/// Retains the nearest 32 leaves in exact (distance, leaf ordinal) order.
-/// Distances are symmetric: score each unordered pair once, updating both ends.
+/// Retains up to 32 candidate leaves in exact (distance, leaf ordinal) order.
+/// Large trees use a centroid HNSW; small trees score each symmetric pair once,
+/// updating both ends.
 /// Only the bounded neighbor lists survive; no quadratic distance matrix is kept.
 fn leaf_neighbors(
     checkpoint: &impl Fn() -> Result<()>,
     kernel: &VectorKernel,
     leaves: &[Part],
-) -> Result<Vec<[(f64, usize); 32]>> {
+) -> Result<Vec<LeafNeighbors>> {
+    if hnsw::enabled(leaves.len()) {
+        return hnsw::neighbors(checkpoint, kernel, leaves);
+    }
     // One allocation avoids one independently allocated buffer per leaf.
-    let mut neighbors = vec![[(f64::INFINITY, usize::MAX); 32]; leaves.len()];
-    for (source, leaf) in leaves.iter().enumerate() {
-        checkpoint()?;
-        let (batches, tail) = leaves[source + 1..].as_chunks::<4>();
-        for (batch, candidates) in batches.iter().enumerate() {
-            let scores = kernel.routing_distances_validated(
-                candidates
-                    .each_ref()
-                    .map(|candidate| candidate.center.as_ref()),
-                &leaf.center,
-            );
-            for (lane, score) in scores.into_iter().enumerate() {
-                let target = source + 1 + batch * 4 + lane;
-                retain_neighbor(&mut neighbors[source], (score, target));
-                retain_neighbor(&mut neighbors[target], (score, source));
+    let mut neighbors = vec![[(f64::INFINITY, usize::MAX); NEIGHBOR_COUNT]; leaves.len()];
+    // Tile both axes so centroids and neighbor lists stay hot while scoring
+    // the upper triangle. Each unordered pair still uses the same kernel once.
+    const TILE: usize = 32;
+    for source_start in (0..leaves.len()).step_by(TILE) {
+        let source_end = (source_start + TILE).min(leaves.len());
+        for target_start in (source_start..leaves.len()).step_by(TILE) {
+            let target_end = (target_start + TILE).min(leaves.len());
+            checkpoint()?;
+            for source in source_start..source_end {
+                let start = (source + 1).max(target_start);
+                let (batches, tail) = leaves[start..target_end].as_chunks::<4>();
+                for (batch, candidates) in batches.iter().enumerate() {
+                    let scores = kernel.routing_distances_validated(
+                        candidates
+                            .each_ref()
+                            .map(|candidate| candidate.center.as_ref()),
+                        &leaves[source].center,
+                    );
+                    for (lane, score) in scores.into_iter().enumerate() {
+                        let target = start + batch * 4 + lane;
+                        retain_neighbor(&mut neighbors[source], (score, target));
+                        retain_neighbor(&mut neighbors[target], (score, source));
+                    }
+                }
+                for (offset, candidate) in tail.iter().enumerate() {
+                    let target = start + batches.len() * 4 + offset;
+                    let score = kernel
+                        .routing_distances_validated([&leaves[source].center], &candidate.center)
+                        [0];
+                    retain_neighbor(&mut neighbors[source], (score, target));
+                    retain_neighbor(&mut neighbors[target], (score, source));
+                }
             }
-        }
-        for (offset, candidate) in tail.iter().enumerate() {
-            let target = source + 1 + batches.len() * 4 + offset;
-            let score = kernel.routing_distances_validated([&leaf.center], &candidate.center)[0];
-            retain_neighbor(&mut neighbors[source], (score, target));
-            retain_neighbor(&mut neighbors[target], (score, source));
         }
     }
     Ok(neighbors)
 }
 
 /// Inserts only improving candidates without growing beyond the neighbor bound.
-fn retain_neighbor(neighbors: &mut [(f64, usize); 32], candidate: (f64, usize)) {
+fn retain_neighbor(neighbors: &mut LeafNeighbors, candidate: (f64, usize)) {
     let compare = |previous: &(f64, usize)| {
         previous
             .0
             .total_cmp(&candidate.0)
             .then(previous.1.cmp(&candidate.1))
     };
-    if compare(&neighbors[31]).is_le() {
+    let last = neighbors.len() - 1;
+    if compare(&neighbors[last]).is_le() {
         return;
     }
     let position = neighbors.partition_point(|previous| compare(previous).is_lt());
-    neighbors.copy_within(position..31, position + 1);
+    neighbors.copy_within(position..last, position + 1);
     neighbors[position] = candidate;
 }
 
@@ -212,7 +245,7 @@ fn refine(
         let mut moves = Vec::new();
         for (source, leaf) in leaves.iter().enumerate() {
             checkpoint()?;
-            let distances = &neighbors[source][..32.min(leaves.len() - 1)];
+            let distances = &neighbors[source][..NEIGHBOR_COUNT.min(leaves.len() - 1)];
             for &position in &leaf.members {
                 let vector = &vectors[position];
                 let old = kernel.routing_distances_validated([vector], &leaf.center)[0];
@@ -390,7 +423,7 @@ mod tests {
                         expected.sort_by(|left, right| {
                             left.0.total_cmp(&right.0).then(left.1.cmp(&right.1))
                         });
-                        expected.truncate(32);
+                        expected.truncate(NEIGHBOR_COUNT);
                         let bits = |neighbors: &[(f64, usize)]| {
                             neighbors
                                 .iter()
@@ -398,7 +431,7 @@ mod tests {
                                 .collect::<Vec<_>>()
                         };
                         assert_eq!(
-                            bits(&actual[source][..32.min(count.saturating_sub(1))]),
+                            bits(&actual[source][..NEIGHBOR_COUNT.min(count.saturating_sub(1))]),
                             bits(&expected),
                             "metric={metric:?} dimension={dimension} count={count} source={source}"
                         );
@@ -406,6 +439,40 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn neighbor_selection_propagates_cancellation_between_tiles() {
+        use crate::api::{Error, ErrorKind, Metric};
+        use std::cell::Cell;
+
+        let kernel = VectorKernel::new(1, Metric::L2, [0; 32]).unwrap();
+        let leaves: Vec<_> = (0..65)
+            .map(|i| Part {
+                key: PartitionKey::new(i + 1).unwrap(),
+                parent: None,
+                level: 1,
+                center: vec![i as f32].into_boxed_slice(),
+                members: Vec::new(),
+                children: Vec::new(),
+            })
+            .collect();
+        let checks = Cell::new(0);
+        let error = leaf_neighbors(
+            &|| {
+                checks.set(checks.get() + 1);
+                if checks.get() == 2 {
+                    Err(Error::new(ErrorKind::Cancelled))
+                } else {
+                    Ok(())
+                }
+            },
+            &kernel,
+            &leaves,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Cancelled);
+        assert_eq!(checks.get(), 2);
     }
 
     #[test]
@@ -515,3 +582,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod performance;

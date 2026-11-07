@@ -369,6 +369,14 @@ impl ForestArtifact {
                         Ok(())
                     },
                 )?;
+                charge_refinement(
+                    &mut used,
+                    crate::refinement::candidate_scratch_bytes(
+                        plans.iter().filter(|part| part.level == 1).count(),
+                        usize::from(rounds),
+                    )?,
+                    options.refinement_memory_bytes,
+                )?;
                 super::refine::refine_plans(config, seed, retained, &mut plans, rounds, &|| {
                     check()
                 })?;
@@ -699,7 +707,7 @@ pub(super) fn binding(
     }
     hash.update((sample_items as u64).to_be_bytes());
     hash.update([refinement_rounds.map_or(0, |rounds| rounds + 1)]);
-    hash.update(b"artifact refinement v1");
+    hash.update(b"artifact refinement v3");
     hash.finalize().into()
 }
 

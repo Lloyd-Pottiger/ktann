@@ -150,14 +150,27 @@ pub(super) async fn run_quality_sweep<B: Backend>(
     }
     // All latency, IO, CPU and peak-RSS snapshots precede diagnostic replay.
     if spec.routing_experiment.is_some() {
+        // The fixture is frozen for the whole sweep. Resolve truth membership
+        // once after timing, rather than repeating identical backend reads per beam.
+        let mut truth_locations = Vec::with_capacity(truth.len());
+        for expected in &truth {
+            truth_locations.push(
+                index
+                    .benchmark_truth_leaves(expected.iter().map(|(id, _)| id.clone()).collect())
+                    .await
+                    .map_err(|e| error_at("truth leaf membership", e))?,
+            );
+        }
         for point in &mut points {
             let mut diagnostic_spec = spec.clone();
             diagnostic_spec.search_options = diagnostic_spec
                 .search_options
                 .with_leaf_beam_size(point.leaf_beam_size)
                 .map_err(|e| e.to_string())?;
-            point.measurements.quality_diagnostics =
-                Some(quality_diagnostics(&index, dataset, &diagnostic_spec, &truth).await?);
+            point.measurements.quality_diagnostics = Some(
+                quality_diagnostics(&index, dataset, &diagnostic_spec, &truth, &truth_locations)
+                    .await?,
+            );
         }
     }
     verify_measured_state(&index, spec).await?;
@@ -237,6 +250,7 @@ async fn quality_diagnostics<B: Backend>(
     dataset: &BenchmarkDataset,
     spec: &ScenarioSpec,
     truth: &[ExactTruth],
+    truth_locations: &[Vec<(ktann::api::PartitionKey, u64)>],
 ) -> Result<crate::report::QualityDiagnostics, String> {
     let mut queries = Vec::with_capacity(dataset.queries.len());
     for (query, expected) in truth.iter().enumerate() {
@@ -245,15 +259,11 @@ async fn quality_diagnostics<B: Backend>(
             .benchmark_search(request, expected.iter().map(|(id, _)| id.clone()).collect())
             .await
             .map_err(|e| error_at("quality replay", e))?;
-        let locations = index
-            .benchmark_truth_leaves(expected.iter().map(|(id, _)| id.clone()).collect())
-            .await
-            .map_err(|e| error_at("truth leaf membership", e))?;
         let truth_leaves = expected
             .iter()
-            .zip(locations)
+            .zip(&truth_locations[query])
             .map(
-                |((id, _), (leaf, entries))| crate::report::TruthLeafQuality {
+                |((id, _), &(leaf, entries))| crate::report::TruthLeafQuality {
                     leaf: leaf.get(),
                     entries,
                     scanned: diagnostic.leaves.contains(&leaf),

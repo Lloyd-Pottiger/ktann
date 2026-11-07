@@ -43,7 +43,7 @@ membership and recomputes centroids before accepting the final Forest Artifact,
 then builds each internal graph exactly once from the final Child Entries while
 encoding Serving bytes. Omitted refinement preserves construction centroids.
 `refinement_memory_bytes` admits retained per-tree input, topology and numerical
-planning; `graph_memory_bytes` bounds one graph's centroids, native construction
+planning, including the transient candidate graph; `graph_memory_bytes` bounds one graph's centroids, native construction
 and serialization. Both are persisted worker resource limits, not semantic inputs.
 Failure exceeds neither budget by falling back or omitting work. Construction and
 refinement memory ceilings add while retained inputs feed construction.
