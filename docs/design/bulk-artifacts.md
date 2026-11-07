@@ -23,7 +23,7 @@ serving lifecycle and exact-membership contracts are unchanged.
    Optional bounded refinement runs on one retained tree before emission, reusing
    the ordinary metric-correct assignment algorithm. Zero rounds refreshes leaf
    and bottom-up internal centroids; omission preserves construction output.
-   Refinement semantics participate in the forest binding (`artifact refinement v3`).
+   Refinement round controls participate in the forest binding.
    Each round retains up to 32 candidate leaf centroids ordered by exact routing
    distance, then leaf ordinal. Trees with at least 1,024 leaves use an ephemeral
    centroid HNSW (M=8, efConstruction=64, efSearch=64, seed=7), rebuilt each round;
