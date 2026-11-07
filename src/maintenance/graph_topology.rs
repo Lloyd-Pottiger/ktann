@@ -381,17 +381,15 @@ pub(crate) async fn advance_observed<'b, B: Backend>(
             .is_none_or(|(held, _)| *held != participants.keys)
         {
             drop(locked_bodies.take());
+            // A body owner may need the backend's only transaction slot to
+            // publish. Release discovery's slot before waiting for its locks,
+            // then refresh the snapshot while holding the acquired bodies.
+            drop(read);
             let guards = executor
                 .lock_bodies(manifest.logical_index_id(), tree, participants.keys.clone())
                 .await?;
-            let waited = guards.waited;
             locked_bodies = Some((participants.keys.clone(), guards));
-            if waited {
-                // Refresh after another local publisher held these bodies.
-                // Uncontended acquisition reuses this snapshot; exact source
-                // fences still protect publication against concurrent writers.
-                continue;
-            }
+            continue;
         }
         let parent = if let Some(proof) = &participants.proof {
             proof
