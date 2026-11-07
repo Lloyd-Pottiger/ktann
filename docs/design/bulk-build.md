@@ -42,8 +42,9 @@ Failure exceeds neither budget by falling back or omitting work. Construction an
 refinement memory ceilings add while retained inputs feed construction.
 
 After publication, graph-enabled indexes support ordinary mutations and graph-aware
-maintenance. Public serving refinement returns `InvalidArgument`; optional artifact
-refinement must finish before initial graph construction. Query HNSW routing is
+maintenance and caller-exclusive `Index::refine`, which atomically refreshes each
+changed parent's graph with its routing projections. Optional artifact refinement
+finishes before initial graph construction. Query HNSW routing is
 selected independently of the construction path.
 
 ### 1.1 Completion reports

@@ -306,6 +306,18 @@ pub(crate) async fn advance_observed<'b, B: Backend>(
             ))
         };
     }
+    // Graph publication owns in-flight steps that bypass the ordinary drivers.
+    // Preserve their state-age observation before graph planning or leaf drains.
+    let kind = match state {
+        PartitionTransition::Splitting { .. } | PartitionTransition::DrainingSplit { .. } => {
+            Some(crate::observe::labels::FixupKind::Split)
+        }
+        PartitionTransition::Merging { .. } => Some(crate::observe::labels::FixupKind::Merge),
+        _ => None,
+    };
+    if let Some(kind) = kind {
+        crate::observe::metrics::fixup_state_age(kind, now, state.started_at_unix_millis());
+    }
     // Leaf movement changes exact membership, not an internal routing graph.
     if header.level() == 1 && header.entry_count() > 0 {
         match state {

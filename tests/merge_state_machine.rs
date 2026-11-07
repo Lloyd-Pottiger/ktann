@@ -1790,7 +1790,15 @@ async fn a_merging_source_stalls_searchable_until_a_ready_target_returns() {
     assert_exact_membership(&backend, &manifest, &key, &records).await;
     run_audit(&backend, &manifest, &records).await;
     let outcome = index
-        .search(SearchRequest::new(Arc::from([kept[0].1]), 1).expect("request"))
+        .search(
+            SearchRequest::new(Arc::from([kept[0].1]), 1)
+                .expect("request")
+                .with_options(
+                    ktann::api::SearchOptions::default()
+                        .with_routing_mode(ktann::api::RoutingMode::Exact)
+                        .unwrap(),
+                ),
+        )
         .await
         .expect("search");
     assert_eq!(outcome.hits.len(), 1);

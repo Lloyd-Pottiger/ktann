@@ -222,6 +222,13 @@ impl Capture {
                 "metric {name} leaves the ktann.* namespace"
             );
             for (key, value) in labels {
+                if name == "ktann.routing.parent_visits" && key == "level" {
+                    assert!(
+                        value == "33+" || (1..=32).any(|level| value == level.to_string()),
+                        "unbounded routing level {value:?}"
+                    );
+                    continue;
+                }
                 let allowed = ALLOWED_LABEL_VALUES
                     .iter()
                     .find(|(allowed_key, _)| *allowed_key == key);

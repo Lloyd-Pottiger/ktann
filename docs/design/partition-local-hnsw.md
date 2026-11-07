@@ -24,8 +24,9 @@ A graph's validity depends on agreement with its Child Entries, including legal
 non-Ready topology states. [API configuration](api.md#4-immutable-and-runtime-configuration)
 owns immutable graph parameters and capacities; [search](search.md#6-search-algorithm)
 owns per-query routing selection. Graph indexes support ordinary creation, Bulk
-Build and writes. Refinement runs only during artifact preparation, before graphs
-are constructed.
+Build, writes and offline `Index::refine`. Artifact refinement runs before initial
+graph construction; Active-index refinement atomically refreshes each changed
+parent graph with its Child Entries and partition centroids.
 
 ### Foreground write routing
 
@@ -45,6 +46,15 @@ different leaf, so policy changes require fixed-budget quality and write-lifecyc
 measurements covering maintenance, cache and storage costs.
 
 ## Local graph algorithm
+
+Caller-exclusive offline refinement rebuilds a parent's graph when centroid
+coordinates change; incremental insert/retain updates continue to require immutable
+surviving centroids. Refinement groups sibling updates into bounded transactions,
+child levels before parent levels. It validates the old graph before preparing a
+replacement and uses the existing source fences, authority envelope and atomic
+graph publication. No committed snapshot exposes new projections with the old graph.
+An unknown outcome stops the operation without replay; the caller keeps the index
+offline under the ordinary refinement failure contract.
 
 The graph core uses USearch's generic C++ graph through the private
 [`ktann-usearch`](../../ktann-usearch/README.md) bridge. It borrows KTANN's

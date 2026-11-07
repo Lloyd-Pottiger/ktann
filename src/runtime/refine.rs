@@ -13,6 +13,7 @@ use crate::api::{Error, ErrorKind, PartitionKey, RefineOptions, Result};
 use crate::observe::labels::Operation;
 use crate::search::numeric::VectorKernel;
 use crate::storage::backend::{Backend, ScanLimits};
+use crate::storage::graph_transitions::{GraphTransitionSource, protect_sources, publish_batch};
 use crate::storage::keys::{LogicalKey, TreeKey};
 use crate::storage::values::{IndexManifest, PartitionState, PartitionTransition, PersistentValue};
 use crate::storage::{LogicalRange, LogicalScanCursor, LogicalScanPage, topology};
@@ -513,6 +514,10 @@ pub(crate) async fn run<B: Backend>(
                 }
             }
         }
+        if manifest.config().local_graph().is_some() {
+            publish_graph_centroids(context, manifest, &tree, &retry).await?;
+            continue;
+        }
         for part in &tree.parts {
             let Some(parent) = part.parent else {
                 continue;
@@ -532,6 +537,119 @@ pub(crate) async fn run<B: Backend>(
                 },
             )
             .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Publishes bounded sibling batches, child levels before parent levels. Preparing
+/// one replacement per batch avoids rebuilding a wide graph for every centroid.
+/// Caller exclusivity keeps plans stable; source fences still protect each commit.
+async fn publish_graph_centroids<B: Backend>(
+    context: &mut OperationContext<B>,
+    manifest: &IndexManifest,
+    tree: &Tree,
+    retry: &RetryPolicy,
+) -> Result<()> {
+    let mut parents: BTreeMap<(u32, PartitionKey), Vec<&Part>> = BTreeMap::new();
+    for part in &tree.parts {
+        if let Some(parent) = part.parent {
+            parents.entry((part.level, parent)).or_default().push(part);
+        }
+    }
+    let backend = context.backend();
+    for ((_, parent), parts) in parents {
+        let mut offset = 0;
+        let mut batch = parts.len().min(128);
+        while offset < parts.len() {
+            context.checkpoint()?;
+            let end = (offset + batch).min(parts.len());
+            let prefix = &parts[offset..end];
+            let mut read = reads::open_validated_read(backend.as_ref(), manifest).await?;
+            let source = GraphTransitionSource::read(
+                &mut read,
+                &tree.key,
+                parent,
+                context.routing_working_bytes,
+                &|| context.checkpoint(),
+            )
+            .await?;
+            drop(read);
+            // Admit both the replacement body and the temporary update copies
+            // before allocating them. Native preparation retains the same ceiling.
+            let required = source
+                .retained_bytes()?
+                .checked_add(source.projection_bytes(source.children().len())?)
+                .and_then(|bytes| bytes.checked_add(source.projection_bytes(prefix.len()).ok()?))
+                .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+            if required > context.routing_working_bytes {
+                return Err(Error::new(ErrorKind::LimitExceeded));
+            }
+            let updates: Vec<_> = prefix
+                .iter()
+                .map(|part| (part.key, part.center.clone()))
+                .collect();
+            let working_bytes = context.routing_working_bytes;
+            let graphs = controlled_compute(
+                context.options.clone(),
+                context.cpu_admission.clone().expect("refinement admission"),
+                move |control| {
+                    Ok(
+                        [source.prepare_centroid_update(updates, working_bytes, &|| {
+                            check_control(control)
+                        })?],
+                    )
+                },
+            )
+            .await?;
+            let result = writes::run_write_attempts(
+                backend.as_ref(),
+                Some(context),
+                manifest,
+                retry,
+                Operation::Refine,
+                |txn| {
+                    let graphs = &graphs;
+                    let key = &tree.key;
+                    Box::pin(async move {
+                        if !protect_sources(txn, graphs).await? {
+                            // Replanning around a changed parent would violate the
+                            // caller-exclusive input used for numerical refinement.
+                            return Err(Error::new(ErrorKind::ContentionExhausted));
+                        }
+                        for part in prefix {
+                            topology::update_centroid(
+                                txn,
+                                key,
+                                part.key,
+                                parent,
+                                part.center.clone(),
+                            )
+                            .await?;
+                        }
+                        publish_batch(txn, graphs).await
+                    })
+                },
+            )
+            .await;
+            match result {
+                Ok(()) => {
+                    for graph in graphs {
+                        graph.cache_committed(&context.partition_cache);
+                    }
+                    offset = end;
+                }
+                Err(error)
+                    if batch > 1
+                        && matches!(
+                            error.kind(),
+                            ErrorKind::LimitExceeded | ErrorKind::TransactionTooLarge
+                        ) =>
+                {
+                    batch = batch.div_ceil(2);
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
     Ok(())

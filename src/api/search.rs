@@ -72,20 +72,25 @@ impl SearchBudgets {
 
 /// Candidate generation inside each internal partition.
 ///
-/// Exact is the default. HNSW requires a graph index and a positive `ef_search`.
+/// HNSW is the default and requires a graph index and a positive `ef_search`.
 /// The effective exploration width is clipped to the parent size and is at least
 /// the requested local beam; it does not change the exact-rerank budget.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum RoutingMode {
     /// Score every child centroid.
-    #[default]
     Exact,
     /// Search the persisted partition-local graph using its routing scores.
     PartitionLocalHnsw {
         /// Positive exploration width, raised to the local beam and clipped to parent size.
         ef_search: usize,
     },
+}
+
+impl Default for RoutingMode {
+    fn default() -> Self {
+        Self::PartitionLocalHnsw { ef_search: 64 }
+    }
 }
 
 /// Optional per-request overrides of Runtime Search Budgets and traversal
@@ -120,7 +125,7 @@ impl SearchOptions {
         Ok(self)
     }
 
-    /// Returns the internal candidate-generation mode (Exact by default).
+    /// Returns the internal candidate-generation mode (partition-local HNSW by default).
     #[must_use]
     pub const fn routing_mode(self) -> RoutingMode {
         self.routing_mode
@@ -162,7 +167,7 @@ impl SearchOptions {
     /// The beam is a traversal-quality knob, not an accounted budget
     /// dimension: wider beams visit more partitions, all still charged to the
     /// visited-partition budget. When unset, the leaf-level base beam defaults
-    /// to 128 (design `search.md` section 6).
+    /// to 381 (design `search.md` section 6).
     pub fn with_leaf_beam_size(mut self, value: u32) -> Result<Self> {
         validate_override(value, MAX_LEAF_BEAM_SIZE)?;
         self.leaf_beam_size = Some(value);

@@ -31,6 +31,7 @@ pub fn pk(value: u64) -> PartitionKey {
 pub fn manifest() -> IndexManifest {
     let config = IndexConfig::new(1, Metric::L2)
         .expect("valid config")
+        .without_local_graph()
         .with_fields(vec![FieldSchema::new("a", DataType::I64).expect("field")])
         .expect("valid fields")
         .with_tree_key_fields(vec![FieldId(0)])

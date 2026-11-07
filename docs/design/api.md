@@ -206,9 +206,10 @@ graphs does not change these capacity pairs.
 RaBitQ7, online split arity, Lloyd rounds, rotation algorithm, logical codecs, and
 hard safety caps are defined by the Persistent Format.
 
-`IndexConfig::with_local_graph(LocalGraphConfig)` enables partition-local graphs
-for ordinary empty-index creation or Bulk Build. `local_graph()` returns the
-optional persisted construction parameters. Graph-enabled indexes support writes
+`IndexConfig::new` enables partition-local graphs with M=16, construction
+effort 200 and seed 7. `with_local_graph(LocalGraphConfig)` overrides those
+parameters; `without_local_graph()` explicitly disables graphs and requires Exact
+query routing. `local_graph()` returns the optional persisted construction parameters. Graph-enabled indexes support writes
 and maintenance after publication. Query routing is selected independently;
 foreground writes use exact scoring below 1024 children and local HNSW at or
 above 1024, selected from each snapshot Header count. Both retain the configured
@@ -245,7 +246,7 @@ The runtime defaults and caps are:
 | Scanned Tree Keys | 4,096 | 65,536 |
 | Visited partitions | 1,024 | 16,384 |
 | Exact rerank candidates | `min(max(64,k+ceil(k/4)),65,536)` | Runtime ceiling 65,536; effective value at least `k` |
-| Leaf beam size | 128 | 16,384 |
+| Leaf beam size | 381 | 16,384 |
 | Write beam size | 4 | 16,384 |
 | Tree Key scan ranges | 1,024 | wider conservative fallback |
 
@@ -262,8 +263,8 @@ the leaf-level base beam width per request; the beam is a traversal-quality
 knob, not an accounted budget dimension, and the visited-partition budget still
 bounds the work it schedules.
 
-`SearchOptions::with_routing_mode` selects `RoutingMode::Exact` (default) or
-`RoutingMode::PartitionLocalHnsw { ef_search }`. The latter requires a graph-enabled
+`SearchOptions::with_routing_mode` selects `RoutingMode::Exact` or
+`RoutingMode::PartitionLocalHnsw { ef_search }` (default: 64). The latter requires a graph-enabled
 index and positive `ef_search`; invalid selections return `InvalidArgument`
 before foreground admission, including for empty indexes. The enum carries no
 HNSW-only field in Exact mode. Leaf-only graph indexes accept either mode and
@@ -342,9 +343,15 @@ index operations, including maintenance from other runtimes, until it returns.
 Local queued or running fixups and non-Ready topology are rejected; idle Runtime
 workers may remain running.
 
-It rejects graph-enabled indexes with `InvalidArgument`: serving refinement does
-not implement graph-aware centroid publication. Use optional artifact refinement
-before initial graph construction.
+Graph-enabled indexes support the same operation. Refinement prepares a replacement
+graph outside the write transaction for a bounded batch of sibling centroid changes.
+The transaction protects the source Header/descriptor, then publishes stored child
+centroids, parent projections, the parent epoch and graph records atomically. Only
+known commits may seed the partition cache. Definite aborts retry; unknown outcomes
+are returned without replay, with each committed graph/body pair still consistent.
+Graph preparation uses `RuntimeConfig::routing_working_bytes` in addition to the
+refinement input limit. Transaction admission can reduce the sibling batch size;
+an inadmissible single graph fails rather than falling back to graph-free storage.
 
 `RefineOptions::new(input_bytes)` requires a positive input byte limit and defaults
 to two rounds. Builders accept `with_refinement_rounds(0..=5)` and

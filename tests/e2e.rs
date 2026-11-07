@@ -8,7 +8,7 @@
 //!
 //! KDDT requests use a test-only default leaf beam of 8 so small settled trees
 //! exercise approximate routing; production SearchOptions keep their default
-//! of 128. A directive can override the test default with `beam-size=`.
+//! of 381. A directive can override the test default with `beam-size=`.
 //!
 //! Directives:
 //!
@@ -241,7 +241,9 @@ impl Harness {
             other => panic!("unknown metric `{other}` at line {}", directive.line),
         };
         let fields = parse_fields(directive);
-        let mut config = IndexConfig::new(dimension, metric).expect("valid config");
+        let mut config = IndexConfig::new(dimension, metric)
+            .expect("valid config")
+            .without_local_graph();
         if !fields.is_empty() {
             config = config.with_fields(fields).expect("valid fields");
         }
@@ -1546,12 +1548,14 @@ fn fill_fields(
 }
 
 /// Keeps small KDDT datasets approximate enough to exercise tree routing.
-/// Production requests retain their independent default of 128.
+/// Production requests retain their independent default of 381.
 const TEST_DEFAULT_LEAF_BEAM: u32 = 8;
 
 /// Builds Search Budget overrides from directive arguments.
 fn search_options(directive: &Directive) -> SearchOptions {
     let mut options = SearchOptions::default()
+        .with_routing_mode(ktann::api::RoutingMode::Exact)
+        .unwrap()
         .with_leaf_beam_size(TEST_DEFAULT_LEAF_BEAM)
         .expect("valid test default leaf beam");
     if let Some(value) = directive.arg("scanned-tree-keys") {

@@ -357,8 +357,8 @@ impl<B: Backend> Index<B> {
     }
 
     /// Refines an ordinary imported index before serving it, without changing its identity.
-    /// Graph indexes reject this operation; refine their construction
-    /// artifact before graph construction and Bulk Build publication instead.
+    /// Graph indexes atomically publish updated routing projections and their
+    /// local graphs. Graph preparation uses the Runtime's routing memory limit.
     ///
     /// The caller must exclude all other operations and maintenance on this index,
     /// including other Runtime instances. Finish outstanding work first. Local
@@ -368,9 +368,6 @@ impl<B: Backend> Index<B> {
     /// failure, keep the index offline and drop/rebuild it if needed. There is no
     /// persistent progress or automatic recovery protocol.
     pub async fn refine(&self, options: RefineOptions) -> Result<()> {
-        if self.config().local_graph().is_some() {
-            return Err(Error::invalid_argument());
-        }
         let manifest = Arc::clone(&self.manifest);
         let runtime = Arc::clone(&self.runtime.inner);
         let retry = lifecycle::RetryPolicy::from_config(self.runtime.inner.config());

@@ -30,6 +30,7 @@ fn minimal_manifest() -> IndexManifest {
         id(1),
         IndexConfig::new(1, Metric::L2)
             .expect("valid config")
+            .without_local_graph()
             .with_leaf_partition_entries(16, 512)
             .and_then(|config| config.with_internal_partition_entries(8, 128))
             .expect("fixed codec configuration"),
@@ -241,11 +242,12 @@ fn namespace_and_manifest_golden_bytes() {
     expected.extend_from_slice(&128_u32.to_be_bytes());
     expected.push(0); // mutable mode
     expected.extend_from_slice(&[0; 32]);
+    let graph_free = PersistentValue::IndexManifest(minimal_manifest());
+    assert_eq!(codec.encode(&graph_free).expect("encode"), expected);
     assert_eq!(
-        codec
-            .encode(&PersistentValue::IndexManifest(minimal_manifest()))
-            .expect("encode"),
-        expected
+        decode_value(codec, id(1), &graph_free, &expected).expect("decode graph-free manifest"),
+        graph_free,
+        "stored absence of a graph must override construction defaults"
     );
 }
 

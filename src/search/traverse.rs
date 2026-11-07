@@ -44,7 +44,7 @@ use frontier::{Frontier, FrontierEntry, VisitBatch};
 use partition::{PartitionReader, PreparedVisit};
 
 /// The default leaf-level base beam (design `search.md` section 6).
-pub(crate) const DEFAULT_LEAF_BEAM: u32 = 128;
+pub(crate) const DEFAULT_LEAF_BEAM: u32 = 381;
 
 /// Bounds metadata prefetch; adapters independently chunk point reads.
 const PARTITION_METADATA_BATCH: usize = 1_024;
@@ -563,7 +563,7 @@ mod request_tests {
 
     #[test]
     fn request_rejects_zero_beam() {
-        assert_eq!(DEFAULT_LEAF_BEAM, 128);
+        assert_eq!(DEFAULT_LEAF_BEAM, 381);
         let budgets = SearchBudgets::new(1_024, 8, 8).expect("valid budgets");
         assert!(TraversalRequest::new(&[0.0, 0.0], &[], None, budgets, 0).is_err());
     }

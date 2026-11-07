@@ -22,7 +22,8 @@ pub fn tree_key() -> TreeKey {
 ///
 /// Requires a fresh one-dimensional L2 index with no fields and maintenance
 /// disabled. Leaf 2 contains [-4,-3,-2,4], leaf 3 contains [2,3,4,-4].
-/// Dimension-one rotation is identity, so the projections are their means.
+/// Dimension-one rotation is identity. Routing centers are deliberately stale
+/// (-9 and 9), but stored centroids, projections and optional graphs agree.
 /// The existing index manifest supplies the production rotation seed and codec.
 pub async fn seed<B: Backend>(
     index: &Index<B>,
@@ -43,6 +44,33 @@ pub async fn seed<B: Backend>(
     let logical_index = manifest.logical_index_id();
     let key = tree_key();
     let root = partition(1);
+    let centers = [(partition(2), -9.0_f32), (partition(3), 9.0_f32)];
+    let graphs = if manifest.config().local_graph().is_some() {
+        use ktann::storage::graph_transitions::GraphTransitionSource;
+        let mut read =
+            ktann::storage::ReadLogicalTxn::for_index(backend.begin_read().await?, manifest);
+        let source =
+            GraphTransitionSource::read(&mut read, &key, root, 64 << 20, &|| Ok(())).await?;
+        let header = source.header().expect("root");
+        vec![
+            source.prepare(
+                Some(PartitionHeader::new(
+                    2,
+                    2,
+                    header.cache_epoch() + 1,
+                    PartitionState::Ready,
+                )?),
+                centers
+                    .iter()
+                    .map(|&(child, center)| ChildEntry::new(child, vec![center]))
+                    .collect(),
+                64 << 20,
+                &|| Ok(()),
+            )?,
+        ]
+    } else {
+        Vec::new()
+    };
     let raw = backend.begin_write().await?;
     let mut txn = WriteLogicalTxn::for_index(
         raw,
@@ -50,6 +78,7 @@ pub async fn seed<B: Backend>(
         backend.hard_limits(),
         backend.admission_budget(),
     );
+    assert!(ktann::storage::graph_transitions::protect_sources(&mut txn, &graphs).await?);
     let root_header_key = LogicalKey::Header {
         index: logical_index,
         tree_key: key.clone(),
@@ -84,7 +113,7 @@ pub async fn seed<B: Backend>(
         partition: root,
     })
     .await?;
-    for (leaf, centroid) in [(partition(2), -1.25_f32), (partition(3), 1.25_f32)] {
+    for (leaf, centroid) in centers {
         txn.put(
             LogicalKey::State {
                 index: logical_index,
@@ -166,6 +195,7 @@ pub async fn seed<B: Backend>(
         )
         .await?;
     }
+    ktann::storage::graph_transitions::publish_batch(&mut txn, &graphs).await?;
     txn.commit().await?;
     Ok(records)
 }

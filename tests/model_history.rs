@@ -400,7 +400,7 @@ fn index_config(graph: bool) -> IndexConfig {
     if graph {
         config.with_local_graph(ktann::api::LocalGraphConfig::new(4, 16, [7; 32]).unwrap())
     } else {
-        config
+        config.without_local_graph()
     }
 }
 
@@ -915,6 +915,12 @@ impl Driver {
                     .with_routing_mode(ktann::api::RoutingMode::PartitionLocalHnsw {
                         ef_search: 64,
                     })
+                    .unwrap(),
+            );
+        } else {
+            request = request.with_options(
+                ktann::api::SearchOptions::default()
+                    .with_routing_mode(ktann::api::RoutingMode::Exact)
                     .unwrap(),
             );
         }

@@ -8,7 +8,7 @@ use super::backend::{ReadOps, ScanLimits, WriteTxn};
 use super::keys::{LogicalKey, TreeKey};
 use super::values::{
     ChildEntry, GraphChunk, GraphDescriptor, IndexLifecycle, IndexManifest, PartitionHeader,
-    PersistentValue,
+    PartitionState, PersistentValue,
 };
 use super::{LogicalRange, MutationBuilder, ReadLogicalTxn, WriteLogicalTxn};
 use crate::api::{Error, ErrorKind, PartitionKey, Result};
@@ -195,7 +195,8 @@ impl GraphTransitionSource {
             .ok_or_else(limit)
     }
 
-    fn projection_bytes(&self, count: usize) -> Result<usize> {
+    /// Admission charge for a retained proposal's centroid projections.
+    pub(crate) fn projection_bytes(&self, count: usize) -> Result<usize> {
         self.manifest
             .config()
             .dimension()
@@ -277,6 +278,45 @@ impl GraphTransitionSource {
         working_bytes: usize,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<PreparedGraphTransition> {
+        self.prepare_inner(next_header, next, working_bytes, check, false)
+    }
+
+    /// Rebuilds graph topology for new centroid coordinates, after validating the
+    /// old persisted graph. Incremental edge updates require immutable centroids.
+    /// The caller admits the update copies and replacement Child Entries before allocation.
+    pub(crate) fn prepare_centroid_update(
+        self,
+        updates: Vec<(PartitionKey, Box<[f32]>)>,
+        working_bytes: usize,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<PreparedGraphTransition> {
+        check()?;
+        let mut header = self.header.ok_or_else(corrupt)?;
+        if header.state() != PartitionState::Ready {
+            return Err(Error::invalid_argument());
+        }
+        let mut next = self.children.clone();
+        for (child, center) in updates {
+            check()?;
+            let position = next
+                .binary_search_by_key(&child, ChildEntry::child)
+                .map_err(|_| corrupt())?;
+            if next[position].centroid() != center.as_ref() {
+                header = super::membership::touched_entry(header)?;
+                next[position] = ChildEntry::new(child, center);
+            }
+        }
+        self.prepare_inner(Some(header), next, working_bytes, check, true)
+    }
+
+    fn prepare_inner(
+        self,
+        next_header: Option<PartitionHeader>,
+        next: Vec<ChildEntry>,
+        working_bytes: usize,
+        check: &dyn Fn() -> Result<()>,
+        refresh_centroids: bool,
+    ) -> Result<PreparedGraphTransition> {
         check()?;
         let config = self.manifest.config();
         let capacity = config.max_internal_partition_entries() as usize + 2;
@@ -285,15 +325,8 @@ impl GraphTransitionSource {
             config.metric(),
             *self.manifest.rotation_seed(),
         )?;
-        let projection_bytes = config
-            .dimension()
-            .checked_mul(4)
-            .and_then(|n| n.checked_add(std::mem::size_of::<ChildEntry>() + 64))
-            .ok_or_else(limit)?;
-        let old_bytes = projection_bytes
-            .checked_mul(self.children.len())
-            .ok_or_else(limit)?;
-        let target_bytes = projection_bytes.checked_mul(next.len()).ok_or_else(limit)?;
+        let old_bytes = self.projection_bytes(self.children.len())?;
+        let target_bytes = self.projection_bytes(next.len())?;
         let available = working_bytes
             .checked_sub(
                 kernel.heap_bytes()
@@ -343,6 +376,7 @@ impl GraphTransitionSource {
             };
             if target_count > 0
                 && !unchanged
+                && !refresh_centroids
                 && next_header.is_some_and(|header| header.level() == source.header.level())
             {
                 Some(update_records(

@@ -201,7 +201,10 @@ async fn public_modes_metrics_filters_ties_and_cache_turnover() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn validation_empty_leaf_only_budgets_and_control() {
-    assert_eq!(SearchOptions::default().routing_mode(), RoutingMode::Exact);
+    assert_eq!(
+        SearchOptions::default().routing_mode(),
+        RoutingMode::PartitionLocalHnsw { ef_search: 64 }
+    );
     assert_eq!(
         SearchOptions::default()
             .with_routing_mode(RoutingMode::PartitionLocalHnsw { ef_search: 0 })
@@ -211,7 +214,7 @@ async fn validation_empty_leaf_only_budgets_and_control() {
     );
     let ordinary = runtime(MemoryBackend::new());
     let index = ordinary
-        .create_index("ordinary", config(Metric::L2, false))
+        .create_index("ordinary", config(Metric::L2, false).without_local_graph())
         .await
         .unwrap();
     assert_eq!(

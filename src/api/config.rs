@@ -28,11 +28,24 @@ const DEFAULT_WRITE_BEAM_SIZE: u32 = 4;
 const MAX_WRITE_BEAM_SIZE: u32 = 16_384;
 
 /// Immutable construction parameters for partition-local HNSW graphs.
+/// Defaults are M=16, ef_construction=200, and little-endian seed 7.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LocalGraphConfig {
     m: u32,
     ef_construction: u32,
     seed: [u8; 32],
+}
+
+impl Default for LocalGraphConfig {
+    fn default() -> Self {
+        let mut seed = [0; 32];
+        seed[..8].copy_from_slice(&7_u64.to_le_bytes());
+        Self {
+            m: 16,
+            ef_construction: 200,
+            seed,
+        }
+    }
 }
 
 impl LocalGraphConfig {
@@ -97,15 +110,29 @@ impl IndexConfig {
         self
     }
 
+    /// Disables local graphs. Searches on this index must select Exact routing.
+    ///
+    /// ```
+    /// use ktann::api::{IndexConfig, Metric, RoutingMode, SearchOptions};
+    /// let config = IndexConfig::new(3, Metric::L2)?.without_local_graph();
+    /// let search = SearchOptions::default().with_routing_mode(RoutingMode::Exact)?;
+    /// # Ok::<(), ktann::api::Error>(())
+    /// ```
+    #[must_use]
+    pub fn without_local_graph(mut self) -> Self {
+        self.graph = None;
+        self
+    }
+
     /// Construction parameters for partition-local HNSW graphs.
     pub const fn local_graph(&self) -> Option<LocalGraphConfig> {
         self.graph
     }
 
-    /// Creates an immutable Logical Index configuration.
+    /// Creates an immutable Logical Index configuration with local graphs enabled.
     pub fn new(dimension: usize, metric: Metric) -> Result<Self> {
         let config = Self {
-            graph: None,
+            graph: Some(LocalGraphConfig::default()),
             dimension,
             metric,
             fields: Box::new([]),

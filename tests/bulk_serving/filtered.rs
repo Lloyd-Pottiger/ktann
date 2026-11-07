@@ -59,6 +59,8 @@ async fn filtered_search_finds_sparse_matches_across_tree_levels() {
         .collect();
     let request = SearchRequest::new(vec![250.5], K).unwrap().with_options(
         SearchOptions::default()
+            .with_routing_mode(ktann::api::RoutingMode::Exact)
+            .unwrap()
             .with_leaf_beam_size(8)
             .unwrap()
             .with_visited_partitions(1024)

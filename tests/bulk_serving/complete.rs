@@ -47,6 +47,17 @@ async fn build_publish_reopen_cleanup_and_online_mutations_are_complete() {
         job.run_worker(opts.clone()).await.unwrap(); // accepted immutable outputs survive restart
         let index = job.complete(opts.clone()).await.unwrap();
         assert_eq!(index.logical_index_id(), id);
+        assert_eq!(
+            index.config().local_graph(),
+            Some(ktann::api::LocalGraphConfig::default())
+        );
+        // Default construction and search must agree after publication and reopen.
+        let reopened = runtime.open_index("bulk").await.unwrap();
+        let hits = reopened
+            .search(ktann::api::SearchRequest::new(record(0).vector().to_vec(), 1).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(hits.hits.len(), usize::from(count != 0));
         assert_eq!(job.status().await.unwrap(), BulkBuildStatus::Published);
         assert_eq!(
             job.abort().await.unwrap_err().kind(),
