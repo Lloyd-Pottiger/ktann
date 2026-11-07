@@ -33,10 +33,10 @@ async fn build(
     keyed: bool,
     count: u64,
 ) -> Runtime<MemoryBackend> {
-    let dir = Directory::new();
+    let dir = tempfile::tempdir().unwrap();
     let runtime = runtime(backend);
     let input = InputSnapshot::create(
-        &dir.0.join("input"),
+        &dir.path().join("input"),
         config(metric, keyed).with_local_graph(LocalGraphConfig::new(2, 8, [41; 32]).unwrap()),
         1 << 20,
         (0..count).map(|id| Ok(row(id))),
@@ -53,7 +53,7 @@ async fn build(
         )
         .await
         .unwrap();
-    let work = dir.0.join("work");
+    let work = dir.path().join("work");
     fs::create_dir(&work).unwrap();
     let worker = BulkWorkerOptions::new(work);
     job.run_worker(worker.clone()).await.unwrap();

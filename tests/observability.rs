@@ -25,11 +25,14 @@ use ktann::storage::backend::{Backend, WriteTxn};
 use ktann::storage::keys;
 use tokio_util::sync::CancellationToken;
 
-use support::observe::{audit_lock, capture};
+use observe::{audit_lock, capture};
 use support::{CommitFault, MemoryBackend, TestConfig, audit};
 
 #[allow(dead_code)]
 mod support;
+
+#[path = "support/observe.rs"]
+mod observe;
 
 /// Canary-shaped sensitive values. Every byte pattern a redaction bug could
 /// leak is covered by one of these: Index Names, Tree Keys (the `bucket`

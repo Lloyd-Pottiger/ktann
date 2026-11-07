@@ -32,7 +32,7 @@ use ktann::storage::values::{
 };
 use ktann::storage::{LogicalRange, ReadLogicalTxn, WriteLogicalTxn, tree_manifest};
 
-use super::{MemoryBackend, read_manifest};
+use crate::support::{MemoryBackend, audit, read_manifest};
 
 /// The state annotation of one fixture partition line.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -688,7 +688,7 @@ async fn read_root_entries(
     let mut txn = ReadLogicalTxn::for_index(raw, manifest);
     let range = LogicalRange::leaf_entries(manifest, tree_key, root_key()).expect("leaf range");
     let mut entries = BTreeMap::new();
-    for item in super::audit::scan_all(&mut txn, &range)
+    for item in audit::scan_all(&mut txn, &range)
         .await
         .expect("scan root leaf")
     {

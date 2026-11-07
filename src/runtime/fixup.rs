@@ -600,21 +600,14 @@ fn observe_merge_step(step: &Result<merge::Advance>) {
 
 #[cfg(test)]
 mod tests {
-    use std::future::{Future, Ready, ready};
+    use std::future::{Future, ready};
     use std::time::Duration;
 
-    use bytes::Bytes;
-
     use super::*;
-    use crate::api::{
-        DataType, Error, ErrorKind, IndexConfig, Metric, Result, RuntimeConfig, Value,
-    };
+    use crate::api::{DataType, IndexConfig, Metric, Result, RuntimeConfig, Value};
     use crate::runtime::Runtime;
-    use crate::storage::backend::{
-        AdmissionBudget, Capabilities, CommitStart, HardLimits, InsertOutcome, Mutation, ReadOps,
-        ReadTxn, ScanLimits, ScanPage, WriteTxn,
-    };
-    use crate::storage::keys::KeyRange;
+    use crate::storage::backend::{AdmissionBudget, Capabilities, HardLimits};
+    use crate::storage::test_support::FailingTxn;
     use crate::storage::values::IndexLifecycle;
 
     fn manifest(id: u64) -> Arc<IndexManifest> {
@@ -746,94 +739,6 @@ mod tests {
     /// A backend whose every operation fails: Fixup executions retire
     /// immediately, which exercises worker pickup and slot hygiene.
     struct FailingBackend;
-
-    struct FailingTxn;
-
-    fn failing<T>() -> Ready<Result<T>> {
-        ready(Err(Error::new(ErrorKind::Backend)))
-    }
-
-    impl ReadOps for FailingTxn {
-        fn get(&mut self, _key: Bytes) -> impl Future<Output = Result<Option<Bytes>>> + Send {
-            failing()
-        }
-
-        fn batch_get(
-            &mut self,
-            _keys: Vec<Bytes>,
-        ) -> impl Future<Output = Result<Vec<Option<Bytes>>>> + Send {
-            failing()
-        }
-
-        fn scan(
-            &mut self,
-            _range: &KeyRange,
-            _limits: ScanLimits,
-        ) -> impl Future<Output = Result<ScanPage>> + Send {
-            failing()
-        }
-
-        fn batch_scan(
-            &mut self,
-            _ranges: &[KeyRange],
-            _limits: ScanLimits,
-        ) -> impl Future<Output = Result<Vec<ScanPage>>> + Send {
-            failing()
-        }
-    }
-
-    impl ReadTxn for FailingTxn {}
-
-    impl WriteTxn for FailingTxn {
-        fn get_for_update(
-            &mut self,
-            _key: Bytes,
-        ) -> impl Future<Output = Result<Option<Bytes>>> + Send {
-            failing()
-        }
-
-        fn batch_get_for_update(
-            &mut self,
-            _keys: Vec<Bytes>,
-        ) -> impl Future<Output = Result<Vec<Option<Bytes>>>> + Send {
-            failing()
-        }
-
-        fn put(&mut self, _key: Bytes, _value: Bytes) -> impl Future<Output = Result<()>> + Send {
-            failing()
-        }
-
-        fn insert(
-            &mut self,
-            _key: Bytes,
-            _value: Bytes,
-        ) -> impl Future<Output = Result<InsertOutcome>> + Send {
-            failing()
-        }
-
-        fn delete(&mut self, _key: Bytes) -> impl Future<Output = Result<()>> + Send {
-            failing()
-        }
-
-        fn batch_mutate(
-            &mut self,
-            _mutations: Vec<Mutation>,
-        ) -> impl Future<Output = Result<()>> + Send {
-            failing()
-        }
-
-        fn clear_range(&mut self, _range: &KeyRange) -> impl Future<Output = Result<()>> + Send {
-            failing()
-        }
-
-        async fn commit_with(self, _start: CommitStart) -> Result<()> {
-            Err(Error::new(ErrorKind::Backend))
-        }
-
-        fn rollback(self) -> impl Future<Output = ()> + Send {
-            ready(())
-        }
-    }
 
     impl Backend for FailingBackend {
         type ReadTxn<'backend> = FailingTxn;

@@ -1,8 +1,6 @@
 //! Serving artifacts exercised through the ordinary verifier and online codecs.
 
 use std::fs;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use ktann::api::{
@@ -19,27 +17,6 @@ use ktann::storage::values::{
     BloomParameters, IndexLifecycle, IndexManifest, PersistentValue, ValueCodec,
 };
 use ktann_memory::MemoryBackend;
-
-struct Directory(PathBuf);
-
-impl Directory {
-    fn new() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "ktann-serving-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).unwrap();
-        Self(path)
-    }
-}
-
-impl Drop for Directory {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.0).unwrap();
-    }
-}
 
 fn config(metric: Metric, keyed: bool) -> IndexConfig {
     let config = IndexConfig::new(3, metric)
@@ -173,7 +150,7 @@ async fn encoded_leaf(backend: &MemoryBackend, manifest: &IndexManifest, id: u64
 
 #[test]
 fn serving_streams_record_groups_in_escaped_id_order() {
-    let directory = Directory::new();
+    let directory = tempfile::tempdir().unwrap();
     let config = IndexConfig::new(3, Metric::L2)
         .unwrap()
         .with_leaf_partition_entries(2, 4)
@@ -181,7 +158,7 @@ fn serving_streams_record_groups_in_escaped_id_order() {
         .unwrap();
     let ids: &[&[u8]] = &[b"a\xff", b"\0\0", b"a", b"\xff", b"a\0", b"\0"];
     let input = InputSnapshot::create(
-        &directory.0.join("input"),
+        &directory.path().join("input"),
         config,
         1 << 20,
         ids.iter().map(|id| {
@@ -193,7 +170,7 @@ fn serving_streams_record_groups_in_escaped_id_order() {
     let owned_manifest = fixture_manifest(input.config().clone());
     let manifest = &owned_manifest;
     let (forest, _) = ForestArtifact::build(
-        &directory.0.join("forest"),
+        &directory.path().join("forest"),
         &input,
         *manifest.rotation_seed(),
         options(),
@@ -201,7 +178,7 @@ fn serving_streams_record_groups_in_escaped_id_order() {
     )
     .unwrap();
     let (artifact, _) = ServingArtifact::build(
-        &directory.0.join("serving"),
+        &directory.path().join("serving"),
         &input,
         &forest,
         manifest,
@@ -235,12 +212,12 @@ fn serving_streams_record_groups_in_escaped_id_order() {
 async fn encoded_artifact_verifies_and_matches_online_leaf_values_for_every_metric() {
     for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
         for keyed in [false, true] {
-            let directory = Directory::new();
+            let directory = tempfile::tempdir().unwrap();
             let backend = MemoryBackend::new();
             let runtime = runtime(backend.clone());
             let config = config(metric, keyed);
             let input = InputSnapshot::create(
-                &directory.0.join("input"),
+                &directory.path().join("input"),
                 config.clone(),
                 1024 * 1024,
                 (0..73).rev().map(|id| Ok(record(id))),
@@ -257,7 +234,7 @@ async fn encoded_artifact_verifies_and_matches_online_leaf_values_for_every_metr
             };
             drop(txn);
             let (forest, _) = ForestArtifact::build(
-                &directory.0.join("forest"),
+                &directory.path().join("forest"),
                 &input,
                 *manifest.rotation_seed(),
                 options(),
@@ -265,7 +242,7 @@ async fn encoded_artifact_verifies_and_matches_online_leaf_values_for_every_metr
             )
             .unwrap();
             let (artifact, report) = ServingArtifact::build(
-                &directory.0.join("serving"),
+                &directory.path().join("serving"),
                 &input,
                 &forest,
                 &manifest,
@@ -279,7 +256,7 @@ async fn encoded_artifact_verifies_and_matches_online_leaf_values_for_every_metr
             .unwrap();
             assert_eq!(report.records, 73);
             assert!(report.partitions > 1);
-            assert!(!directory.0.join("serving/scratch").exists());
+            assert!(!directory.path().join("serving/scratch").exists());
             // Fixture-only load: production loading/publication is outside this module.
             let mut txn = backend.begin_write().await.unwrap();
             for entry in artifact.reader().unwrap() {
@@ -339,10 +316,10 @@ async fn encoded_artifact_verifies_and_matches_online_leaf_values_for_every_metr
 
 #[test]
 fn serving_empty_input_and_resource_failures_never_seal_partial_output() {
-    let directory = Directory::new();
+    let directory = tempfile::tempdir().unwrap();
     for count in [0, 10] {
         let input = InputSnapshot::create(
-            &directory.0.join(format!("input-{count}")),
+            &directory.path().join(format!("input-{count}")),
             config(Metric::L2, true),
             1024 * 1024,
             (0..count).map(|id| Ok(record(id))),
@@ -351,7 +328,7 @@ fn serving_empty_input_and_resource_failures_never_seal_partial_output() {
         let owned_manifest = fixture_manifest(input.config().clone());
         let manifest = &owned_manifest;
         let (forest, _) = ForestArtifact::build(
-            &directory.0.join(format!("forest-{count}")),
+            &directory.path().join(format!("forest-{count}")),
             &input,
             *manifest.rotation_seed(),
             options(),
@@ -359,7 +336,7 @@ fn serving_empty_input_and_resource_failures_never_seal_partial_output() {
         )
         .unwrap();
         if count == 0 {
-            let path = directory.0.join(format!("serving-{count}"));
+            let path = directory.path().join(format!("serving-{count}"));
             let (artifact, report) = ServingArtifact::build(
                 &path,
                 &input,
@@ -382,7 +359,7 @@ fn serving_empty_input_and_resource_failures_never_seal_partial_output() {
                 ("value", 8 << 20, 64 << 20, 8, 1 << 20),
                 ("output", 8 << 20, 64 << 20, 1 << 20, 132),
             ] {
-                let failed = directory.0.join(label);
+                let failed = directory.path().join(label);
                 let mut limits = serving_options();
                 limits.memory_bytes = memory;
                 limits.scratch_bytes = scratch;
@@ -431,11 +408,11 @@ fn rewrite_forest(
 #[test]
 fn serving_exact_joins_reject_validly_framed_but_wrong_membership_and_edges() {
     for defect in ["duplicate", "wrong_tree", "root_parent", "level"] {
-        let directory = Directory::new();
+        let directory = tempfile::tempdir().unwrap();
         let keyed = matches!(defect, "duplicate" | "wrong_tree");
         let count = if keyed { 2 } else { 30 };
         let input = InputSnapshot::create(
-            &directory.0.join("input"),
+            &directory.path().join("input"),
             config(Metric::L2, keyed),
             1024 * 1024,
             (0..count).map(|id| Ok(record(id))),
@@ -443,7 +420,7 @@ fn serving_exact_joins_reject_validly_framed_but_wrong_membership_and_edges() {
         .unwrap();
         let owned_manifest = fixture_manifest(input.config().clone());
         let index = &owned_manifest;
-        let path = directory.0.join("forest");
+        let path = directory.path().join("forest");
         let (forest, _) = ForestArtifact::build(
             &path,
             &input,
@@ -492,7 +469,7 @@ fn serving_exact_joins_reject_validly_framed_but_wrong_membership_and_edges() {
         for partition in forged.reader().unwrap() {
             partition.unwrap();
         }
-        let output = directory.0.join("serving");
+        let output = directory.path().join("serving");
         assert_eq!(
             ServingArtifact::build(
                 &output,
@@ -530,11 +507,11 @@ fn fixture_manifest(config: IndexConfig) -> IndexManifest {
 
 #[test]
 fn serving_reopens_after_relocation_and_rejects_wrong_bindings_and_corruption() {
-    let directory = Directory::new();
+    let directory = tempfile::tempdir().unwrap();
     let config = config(Metric::L2, true);
-    let source_path = directory.0.join("input");
-    let forest_path = directory.0.join("forest");
-    let serving_path = directory.0.join("serving");
+    let source_path = directory.path().join("input");
+    let forest_path = directory.path().join("forest");
+    let serving_path = directory.path().join("serving");
     let input = InputSnapshot::create(
         &source_path,
         config.clone(),
@@ -560,7 +537,7 @@ fn serving_reopens_after_relocation_and_rejects_wrong_bindings_and_corruption() 
     other_limits.hard_limits.max_key_bytes = 65536;
     other_limits.hard_limits.max_value_bytes = 1 << 20;
     let (other_serving, _) = ServingArtifact::build(
-        &directory.0.join("other-serving"),
+        &directory.path().join("other-serving"),
         &input,
         &forest,
         &index,
@@ -573,7 +550,7 @@ fn serving_reopens_after_relocation_and_rejects_wrong_bindings_and_corruption() 
     let source_identity = input.manifest().clone();
     let forest_identity = forest.manifest().clone();
     drop((artifact, forest, input, other_serving));
-    let moved = directory.0.join("moved");
+    let moved = directory.path().join("moved");
     fs::rename(&serving_path, &moved).unwrap();
     fs::remove_dir_all(&source_path).unwrap();
     // Reopening requires trusted identities and semantic parameters, not source files or build budgets.

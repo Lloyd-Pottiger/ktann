@@ -9,7 +9,7 @@ use ktann::storage::keys::KeyRange;
 use ktann_memory::test_support::{CommitFault, CommitOutcome, TestConfig};
 use ktann_memory::{MemoryReadTxn, MemoryWriteTxn};
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -30,7 +30,7 @@ fn load_options() -> BulkLoadOptions {
 }
 async fn reservation<B: Backend>(
     runtime: &Runtime<B>,
-    dir: &Directory,
+    dir: &tempfile::TempDir,
     count: u64,
 ) -> (BulkBuildJob<B>, InputSnapshot) {
     reservation_config(runtime, dir, count, config(Metric::L2, true)).await
@@ -38,12 +38,12 @@ async fn reservation<B: Backend>(
 
 async fn reservation_config<B: Backend>(
     runtime: &Runtime<B>,
-    dir: &Directory,
+    dir: &tempfile::TempDir,
     count: u64,
     config: IndexConfig,
 ) -> (BulkBuildJob<B>, InputSnapshot) {
     let input = InputSnapshot::create(
-        &dir.0.join("source"),
+        &dir.path().join("source"),
         config,
         1024 * 1024,
         (0..count).map(|id| Ok(record(id))),
@@ -67,7 +67,7 @@ async fn reservation_config<B: Backend>(
 async fn fixture<B: Backend>(
     runtime: &Runtime<B>,
     memory: &MemoryBackend,
-    dir: &Directory,
+    dir: &tempfile::TempDir,
     count: u64,
 ) -> (BulkBuildJob<B>, ServingArtifact) {
     fixture_config(runtime, memory, dir, count, config(Metric::L2, true)).await
@@ -76,13 +76,13 @@ async fn fixture<B: Backend>(
 async fn fixture_config<B: Backend>(
     runtime: &Runtime<B>,
     memory: &MemoryBackend,
-    dir: &Directory,
+    dir: &tempfile::TempDir,
     count: u64,
     config: IndexConfig,
 ) -> (BulkBuildJob<B>, ServingArtifact) {
     let (job, input) = reservation_config(runtime, dir, count, config).await;
     let (forest, _) = ForestArtifact::build(
-        &dir.0.join("forest"),
+        &dir.path().join("forest"),
         &input,
         *job.index_manifest().rotation_seed(),
         options(),
@@ -90,7 +90,7 @@ async fn fixture_config<B: Backend>(
     )
     .unwrap();
     let (artifact, _) = ServingArtifact::build(
-        &dir.0.join("serving"),
+        &dir.path().join("serving"),
         &input,
         &forest,
         job.index_manifest(),
@@ -130,7 +130,7 @@ async fn claims_and_chunks_recover_unknown_outcomes_without_rewriting_committed_
         CommitFault::UnknownNotApplied,
     ] {
         for at_claim in [false, true] {
-            let dir = Directory::new();
+            let dir = tempfile::tempdir().unwrap();
             let memory = MemoryBackend::with_test_config(TestConfig::default());
             let runtime = runtime(memory.clone());
             let (job, artifact) = fixture(&runtime, &memory, &dir, 19).await;
@@ -313,7 +313,7 @@ impl WriteTxn for GatedTxn<'_> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn takeover_and_abort_fence_an_already_prepared_old_chunk() {
     for (abort, graph) in [(false, false), (true, false), (false, true), (true, true)] {
-        let dir = Directory::new();
+        let dir = tempfile::tempdir().unwrap();
         let memory = MemoryBackend::with_test_config(TestConfig::default());
         let gate = Arc::new(Gate::default());
         let runtime = Runtime::new(
@@ -361,7 +361,7 @@ async fn takeover_and_abort_fence_an_already_prepared_old_chunk() {
         );
         if abort {
             assert_eq!(job.status().await.unwrap(), BulkBuildStatus::Aborted);
-            assert!(dir.0.join("serving/data.bin").exists());
+            assert!(dir.path().join("serving/data.bin").exists());
         } else {
             assert_exact(&memory, &artifact).await;
         }
@@ -371,7 +371,7 @@ async fn takeover_and_abort_fence_an_already_prepared_old_chunk() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancellation_keeps_atomic_progress_and_reopen_resumes_without_prefix_writes() {
-    let dir = Directory::new();
+    let dir = tempfile::tempdir().unwrap();
     let memory = MemoryBackend::with_test_config(TestConfig::default());
     let gate = Arc::new(Gate::default());
     let runtime = Runtime::new(
@@ -425,7 +425,7 @@ async fn cancellation_keeps_atomic_progress_and_reopen_resumes_without_prefix_wr
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_load_and_checkpoint_codec_are_canonical_and_fail_closed() {
-    let dir = Directory::new();
+    let dir = tempfile::tempdir().unwrap();
     let memory = MemoryBackend::new();
     let runtime = runtime(memory.clone());
     let (job, artifact) = fixture(&runtime, &memory, &dir, 0).await;
@@ -469,11 +469,11 @@ async fn empty_load_and_checkpoint_codec_are_canonical_and_fail_closed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn corrupt_input_never_completes_and_repaired_identical_bytes_resume() {
-    let dir = Directory::new();
+    let dir = tempfile::tempdir().unwrap();
     let memory = MemoryBackend::new();
     let runtime = runtime(memory.clone());
     let (job, artifact) = fixture(&runtime, &memory, &dir, 19).await;
-    let path = dir.0.join("serving/data.bin");
+    let path = dir.path().join("serving/data.bin");
     let original = fs::read(&path).unwrap();
     let mut corrupt = original.clone();
     *corrupt.last_mut().unwrap() ^= 1;
@@ -500,7 +500,7 @@ async fn corrupt_input_never_completes_and_repaired_identical_bytes_resume() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admission_and_artifact_identity_are_enforced_before_data_writes() {
-    let dir = Directory::new();
+    let dir = tempfile::tempdir().unwrap();
     let memory = MemoryBackend::with_test_config(TestConfig::default());
     let runtime = runtime(memory.clone());
     let (job, artifact) = fixture(&runtime, &memory, &dir, 19).await;
@@ -538,13 +538,13 @@ async fn admission_and_artifact_identity_are_enforced_before_data_writes() {
     // A different forest identity cannot replace the artifact registered by
     // the first attempt, even for the same source and target index.
     let source = InputSnapshot::open(
-        &dir.0.join("source"),
+        &dir.path().join("source"),
         job.index_manifest().config().clone(),
         job.descriptor().input().clone(),
     )
     .unwrap();
     let (forest, _) = ForestArtifact::build(
-        &dir.0.join("other-forest"),
+        &dir.path().join("other-forest"),
         &source,
         *job.index_manifest().rotation_seed(),
         ForestOptions {
@@ -559,7 +559,7 @@ async fn admission_and_artifact_identity_are_enforced_before_data_writes() {
     let mut changed = serving_options(&memory);
     changed.memory_bytes += 1024 * 1024;
     let (other, _) = ServingArtifact::build(
-        &dir.0.join("other-serving"),
+        &dir.path().join("other-serving"),
         &source,
         &forest,
         job.index_manifest(),
@@ -610,7 +610,7 @@ async fn physical_namespace_overhead_and_checkpoint_share_the_chunk_budget() {
     config.admission_budget.mutation_key_overhead_bytes = 100;
     let memory = MemoryBackend::with_test_config(config);
     let runtime = runtime(memory.clone());
-    let dir = Directory::new();
+    let dir = tempfile::tempdir().unwrap();
     let (job, artifact) = fixture(&runtime, &memory, &dir, 19).await;
     let before = memory.history().len();
     job.load_serving(
@@ -632,11 +632,11 @@ async fn physical_namespace_overhead_and_checkpoint_share_the_chunk_budget() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replay_checks_the_exact_previously_committed_prefix_before_skipping_it() {
     use sha2::{Digest, Sha256};
-    let dir = Directory::new();
+    let dir = tempfile::tempdir().unwrap();
     let memory = MemoryBackend::new();
     let runtime = runtime(memory.clone());
     let (job, artifact) = fixture(&runtime, &memory, &dir, 19).await;
-    let path = dir.0.join("serving/data.bin");
+    let path = dir.path().join("serving/data.bin");
     let original = fs::read(&path).unwrap();
     let mut forged = original.clone();
     let length = u32::from_be_bytes(forged[42..46].try_into().unwrap()) as usize;

@@ -21,6 +21,9 @@ pub use large::load_large;
 mod corpus_dataset;
 #[path = "../../tests/support/fixtures.rs"]
 mod fixtures;
+#[path = "../../tests/support/rng.rs"]
+mod rng;
+use rng::Rng;
 
 /// IDs, indexed vectors, and held-out queries before metadata is attached.
 type DatasetParts = (Vec<Bytes>, Vec<Arc<[f32]>>, Vec<Arc<[f32]>>);

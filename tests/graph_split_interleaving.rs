@@ -16,6 +16,9 @@ use support::{MemoryBackend, read_manifest};
 #[allow(dead_code)]
 mod support;
 
+#[path = "support/observe.rs"]
+mod observe;
+
 async fn advance(
     backend: &MemoryBackend,
     manifest: &IndexManifest,
@@ -60,7 +63,7 @@ async fn complete_split(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn child_graph_split_waits_for_receiving_parent_to_finish() {
-    let _audit = support::observe::audit_lock().await;
+    let _audit = observe::audit_lock().await;
     let backend = MemoryBackend::default();
     let runtime_config = RuntimeConfig::default().with_maintenance(0, 1).unwrap();
     let runtime = Runtime::new(backend.clone(), runtime_config.clone()).unwrap();
@@ -213,8 +216,8 @@ async fn child_graph_split_waits_for_receiving_parent_to_finish() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sibling_splits_share_parent_preparation_without_stale_publication() {
-    let _audit = support::observe::audit_lock().await;
-    let capture = support::observe::capture();
+    let _audit = observe::audit_lock().await;
+    let capture = observe::capture();
     let backend = MemoryBackend::default();
     let config = RuntimeConfig::default().with_maintenance(2, 32).unwrap();
     let runtime = Runtime::new(backend.clone(), support::manual_maintenance_config()).unwrap();

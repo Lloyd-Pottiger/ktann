@@ -5,8 +5,8 @@ use ktann::api::{
     SearchRequest,
 };
 
-fn worker(dir: &Directory) -> BulkWorkerOptions {
-    let root = dir.0.join("work");
+fn worker(dir: &tempfile::TempDir) -> BulkWorkerOptions {
+    let root = dir.path().join("work");
     fs::create_dir(&root).unwrap();
     BulkWorkerOptions::new(root)
 }
@@ -23,13 +23,13 @@ async fn graph_publication_preserves_membership_and_supports_mutations() {
         };
         for rounds in [None, Some(0), Some(2)] {
             for &count in counts {
-                let dir = Directory::new();
+                let dir = tempfile::tempdir().unwrap();
                 let backend = MemoryBackend::new();
                 let runtime = runtime(backend);
                 let config = config(metric, true)
                     .with_local_graph(LocalGraphConfig::new(2, 8, [9; 32]).unwrap());
                 let input = InputSnapshot::create(
-                    &dir.0.join("source"),
+                    &dir.path().join("source"),
                     config,
                     1 << 20,
                     (0..count).map(|id| Ok(record(id))),
@@ -54,7 +54,7 @@ async fn graph_publication_preserves_membership_and_supports_mutations() {
                     BulkBuildStatus::Loaded { .. }
                 ));
                 // Accepted Serving bytes survive loss of the source and a worker takeover.
-                fs::remove_dir_all(dir.0.join("source")).unwrap();
+                fs::remove_dir_all(dir.path().join("source")).unwrap();
                 job.run_worker(options.clone()).await.unwrap();
                 let index = job.complete(options.clone()).await.unwrap();
                 let verification = index.verify(VerifyOptions::default()).await.unwrap();
@@ -176,12 +176,12 @@ async fn graph_publication_preserves_membership_and_supports_mutations() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn graph_preparation_failure_is_terminal_hidden_and_identity_bound() {
     for refinement in [false, true] {
-        let dir = Directory::new();
+        let dir = tempfile::tempdir().unwrap();
         let runtime = runtime(MemoryBackend::new());
         let config = config(Metric::L2, false)
             .with_local_graph(LocalGraphConfig::new(2, 8, [1; 32]).unwrap());
         let input = InputSnapshot::create(
-            &dir.0.join("source"),
+            &dir.path().join("source"),
             config,
             1 << 20,
             (0..73).map(|id| Ok(record(id))),
@@ -236,13 +236,13 @@ async fn graph_preparation_failure_is_terminal_hidden_and_identity_bound() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn explicit_load_checks_refinement_identity_and_graph_bytes_before_publish() {
-    let dir = Directory::new();
+    let dir = tempfile::tempdir().unwrap();
     let memory = MemoryBackend::new();
     let runtime = runtime(memory.clone());
     let config =
         config(Metric::L2, false).with_local_graph(LocalGraphConfig::new(2, 8, [1; 32]).unwrap());
     let input = InputSnapshot::create(
-        &dir.0.join("source"),
+        &dir.path().join("source"),
         config,
         1 << 20,
         (0..73).map(|id| Ok(record(id))),
@@ -260,7 +260,7 @@ async fn explicit_load_checks_refinement_identity_and_graph_bytes_before_publish
         .await
         .unwrap();
     let (forest, _) = ForestArtifact::build(
-        &dir.0.join("wrong-forest"),
+        &dir.path().join("wrong-forest"),
         &input,
         *job.index_manifest().rotation_seed(),
         options(),
@@ -268,7 +268,7 @@ async fn explicit_load_checks_refinement_identity_and_graph_bytes_before_publish
     )
     .unwrap();
     let (serving, _) = ServingArtifact::build(
-        &dir.0.join("wrong-serving"),
+        &dir.path().join("wrong-serving"),
         &input,
         &forest,
         job.index_manifest(),

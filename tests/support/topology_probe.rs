@@ -11,15 +11,15 @@ use ktann::api::{
 use ktann::maintenance::routing::route_leaf;
 use ktann::maintenance::{merge, split};
 use ktann::runtime::{RetryPolicy, Runtime};
-use ktann::storage::backend::{AdmissionBudget, Capabilities, ScanLimits};
+use ktann::storage::backend::{AdmissionBudget, Capabilities, ScanLimits, WriteTxn};
 use ktann::storage::keys::{LogicalKey, TreeKey};
 use ktann::storage::values::{
-    ChildEntry, IndexManifest, LeafEntry, PartitionCentroid, PartitionHeader, PartitionSynopsis,
-    PartitionTransition, PersistentValue, RecordLocation,
+    ChildEntry, IndexManifest, LeafEntry, PartitionCentroid, PartitionHeader, PartitionState,
+    PartitionSynopsis, PartitionTransition, PersistentValue, RecordLocation,
 };
-use ktann::storage::{LogicalRange, tree_manifest};
+use ktann::storage::{LogicalRange, WriteLogicalTxn};
 
-use super::builders::{pk, read_txn, write_txn};
+use super::builders::{pk, read_txn};
 use super::{CommitFault, MemoryBackend, TestConfig};
 
 pub fn backend() -> MemoryBackend {
@@ -91,20 +91,6 @@ pub fn record(id: &[u8], x: f32, bucket: i64) -> Record {
         vec![Value::I64(bucket)],
     )
     .expect("valid record")
-}
-
-/// Installs the Tree Manifest and initial leaf root so fixtures can grow the
-/// root shape from a committed empty root.
-pub async fn create_committed_tree(
-    backend: &MemoryBackend,
-    manifest: &IndexManifest,
-    key: &TreeKey,
-) {
-    let mut txn = write_txn(backend, manifest).await;
-    tree_manifest::create_tree(&mut txn, key, 100)
-        .await
-        .expect("create tree");
-    txn.commit().await.expect("commit tree");
 }
 
 pub async fn header_of(
@@ -331,6 +317,20 @@ pub async fn scan_leaf_entries(
             return entries;
         }
     }
+}
+
+/// Reads the complete committed membership of one leaf, including all pages.
+pub async fn leaf_member_ids(
+    backend: &MemoryBackend,
+    manifest: &IndexManifest,
+    key: &TreeKey,
+    partition: PartitionKey,
+) -> BTreeSet<Bytes> {
+    scan_leaf_entries(backend, manifest, key, partition)
+        .await
+        .into_iter()
+        .map(|entry| entry.into_parts().0)
+        .collect()
 }
 
 /// The set of leaves a traversal can reach, with exact-count validation.
@@ -569,4 +569,164 @@ pub async fn all_partitions(
         }
     }
     seen.into_iter().collect()
+}
+
+/// One drivable unit of Structure Maintenance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Work {
+    /// `split::advance`: an in-flight split or an over-full Ready partition.
+    Split,
+    /// `merge::advance`: an in-flight merge or an under-full Ready non-root.
+    Merge,
+}
+
+/// Orders maintenance candidates deterministically: in-flight splits, in-flight
+/// merges, over-full Ready partitions, then under-full Ready non-roots.
+/// Histories and concurrent drivers share this policy so replay ordering agrees.
+pub fn collect_candidates(
+    listing: &[(TreeKey, PartitionKey, PartitionHeader)],
+    config: &IndexConfig,
+) -> Vec<(TreeKey, PartitionKey, Work)> {
+    let mut candidates = Vec::new();
+
+    let mut in_flight_splits: Vec<_> = listing
+        .iter()
+        .filter(|(_, _, header)| {
+            matches!(
+                header.state(),
+                PartitionState::Splitting | PartitionState::DrainingSplit
+            )
+        })
+        .collect();
+    in_flight_splits.sort_by_key(|(tree_key, partition, _)| (tree_key.clone(), *partition));
+    candidates.extend(
+        in_flight_splits
+            .into_iter()
+            .map(|(tree_key, partition, _)| (tree_key.clone(), *partition, Work::Split)),
+    );
+
+    let mut in_flight_merges: Vec<_> = listing
+        .iter()
+        .filter(|(_, _, header)| header.state() == PartitionState::Merging)
+        .collect();
+    in_flight_merges.sort_by_key(|(tree_key, partition, _)| (tree_key.clone(), *partition));
+    candidates.extend(
+        in_flight_merges
+            .into_iter()
+            .map(|(tree_key, partition, _)| (tree_key.clone(), *partition, Work::Merge)),
+    );
+
+    let maximum = config.max_leaf_partition_entries();
+    let mut over_full: Vec<_> = listing
+        .iter()
+        .filter(|(_, _, header)| {
+            header.state() == PartitionState::Ready && header.entry_count() > maximum
+        })
+        .collect();
+    over_full.sort_by(|left, right| {
+        right
+            .2
+            .entry_count()
+            .cmp(&left.2.entry_count())
+            .then_with(|| right.1.cmp(&left.1))
+    });
+    candidates.extend(
+        over_full
+            .into_iter()
+            .map(|(tree_key, partition, _)| (tree_key.clone(), *partition, Work::Split)),
+    );
+
+    let minimum = config.min_leaf_partition_entries();
+    let mut under_full: Vec<_> = listing
+        .iter()
+        .filter(|(_, partition, header)| {
+            partition.get() != 1
+                && header.state() == PartitionState::Ready
+                && header.entry_count() < minimum
+        })
+        .collect();
+    under_full.sort_by(|left, right| {
+        left.2
+            .entry_count()
+            .cmp(&right.2.entry_count())
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    candidates.extend(
+        under_full
+            .into_iter()
+            .map(|(tree_key, partition, _)| (tree_key.clone(), *partition, Work::Merge)),
+    );
+
+    candidates
+}
+
+/// Stages the shared drained-source fixture: root 1 has leaf children 2 and 3,
+/// source 2 has zero entries at epoch 3, and sibling 3 is empty and Ready.
+/// The caller creates the tree first, adds any transition-specific targets,
+/// and commits the whole fixture in its transaction.
+pub async fn stage_drained_branch<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    manifest: &IndexManifest,
+    key: &TreeKey,
+    source_state: PartitionTransition,
+) {
+    let index = manifest.logical_index_id();
+    txn.put(
+        LogicalKey::Header {
+            index,
+            tree_key: key.clone(),
+            partition: pk(1),
+        },
+        PersistentValue::PartitionHeader(
+            PartitionHeader::new(2, 2, 0, PartitionState::Ready).unwrap(),
+        ),
+    )
+    .await
+    .unwrap();
+    for (partition, epoch, state) in [
+        (pk(2), 3, source_state),
+        (
+            pk(3),
+            0,
+            PartitionTransition::Ready {
+                started_at_unix_millis: 100,
+            },
+        ),
+    ] {
+        txn.put(
+            LogicalKey::Header {
+                index,
+                tree_key: key.clone(),
+                partition,
+            },
+            PersistentValue::PartitionHeader(
+                PartitionHeader::new(1, 0, epoch, state.state()).unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+        txn.put(
+            LogicalKey::State {
+                index,
+                tree_key: key.clone(),
+                partition,
+            },
+            PersistentValue::PartitionState(state),
+        )
+        .await
+        .unwrap();
+    }
+    for (child, centroid) in [(pk(2), 0.0), (pk(3), 10.0)] {
+        txn.put(
+            LogicalKey::ChildEntry {
+                index,
+                tree_key: key.clone(),
+                partition: pk(1),
+                child,
+            },
+            PersistentValue::ChildEntry(ChildEntry::new(child, vec![centroid])),
+        )
+        .await
+        .unwrap();
+    }
 }

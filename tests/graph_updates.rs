@@ -15,17 +15,9 @@ fn backend() -> MemoryBackend {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn memory_graph_updates_and_commit_recovery() {
-    let root = std::env::temp_dir().join(format!(
-        "ktann-graph-updates-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir(&root).unwrap();
+    let root = tempfile::tempdir().unwrap();
     let backend = backend();
-    bulk_load_adapter::exercise(|| backend.clone(), &root).await;
+    bulk_load_adapter::exercise(|| backend.clone(), root.path()).await;
     for (name, fault) in [
         ("abort", CommitFault::Abort),
         ("unknown-applied", CommitFault::UnknownApplied),
@@ -34,7 +26,7 @@ async fn memory_graph_updates_and_commit_recovery() {
         let backend = self::backend();
         bulk_load_adapter::exercise_updates(
             &|| backend.clone(),
-            &root.join(name),
+            &root.path().join(name),
             &|_, attempt| {
                 if attempt == 0 {
                     backend.push_fault(fault).unwrap();
@@ -43,7 +35,6 @@ async fn memory_graph_updates_and_commit_recovery() {
         )
         .await;
     }
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

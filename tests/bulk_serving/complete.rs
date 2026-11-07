@@ -2,8 +2,8 @@
 use super::*;
 use ktann::api::BulkWorkerOptions;
 
-pub(super) fn worker_options(dir: &Directory) -> BulkWorkerOptions {
-    let root = dir.0.join("work");
+pub(super) fn worker_options(dir: &tempfile::TempDir) -> BulkWorkerOptions {
+    let root = dir.path().join("work");
     fs::create_dir(&root).unwrap();
     let mut worker = BulkWorkerOptions::new(root);
     worker.sort_memory_bytes = options().sort_memory_bytes;
@@ -25,7 +25,7 @@ fn artifact_directories(root: &std::path::Path) -> usize {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn build_publish_reopen_cleanup_and_online_mutations_are_complete() {
     for count in [0, 73] {
-        let dir = Directory::new();
+        let dir = tempfile::tempdir().unwrap();
         let memory = MemoryBackend::new();
         let first = runtime(memory.clone());
         let (job, _) = reservation(&first, &dir, count).await;
@@ -36,7 +36,11 @@ async fn build_publish_reopen_cleanup_and_online_mutations_are_complete() {
             job.status().await.unwrap(),
             BulkBuildStatus::Loaded { .. }
         ));
-        fs::rename(dir.0.join("source"), dir.0.join("relocated-source")).unwrap();
+        fs::rename(
+            dir.path().join("source"),
+            dir.path().join("relocated-source"),
+        )
+        .unwrap();
         first.shutdown().await.unwrap();
         let runtime = runtime(memory.clone());
         let job = runtime.open_bulk_build("bulk").await.unwrap();
@@ -54,7 +58,7 @@ async fn build_publish_reopen_cleanup_and_online_mutations_are_complete() {
         );
 
         assert_eq!(artifact_directories(&opts.workspace), 0);
-        assert!(dir.0.join("relocated-source/data.bin").exists());
+        assert!(dir.path().join("relocated-source/data.bin").exists());
         let report = index.verify(VerifyOptions::default()).await.unwrap();
         assert!(
             report.complete && report.issues.is_empty(),
@@ -110,7 +114,7 @@ async fn build_publish_reopen_cleanup_and_online_mutations_are_complete() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sealed_backend_damage_is_terminal_and_cannot_publish() {
     for damage in ["extra", "missing", "different"] {
-        let dir = Directory::new();
+        let dir = tempfile::tempdir().unwrap();
         let memory = MemoryBackend::new();
         let runtime = runtime(memory.clone());
         let (job, _) = reservation(&runtime, &dir, 19).await;
@@ -174,7 +178,7 @@ async fn sealed_backend_damage_is_terminal_and_cannot_publish() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_validation_reuses_proofs_and_rejects_further_loads() {
-    let dir = Directory::new();
+    let dir = tempfile::tempdir().unwrap();
     let memory = MemoryBackend::with_test_config(TestConfig::default());
     let gate = Arc::new(Gate::default());
     let runtime = Runtime::new(
@@ -231,7 +235,7 @@ async fn cancelled_validation_reuses_proofs_and_rejects_further_loads() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn abort_during_native_preparation_leaves_recoverable_namespace_cleanup() {
-    let dir = Directory::new();
+    let dir = tempfile::tempdir().unwrap();
     let memory = MemoryBackend::with_test_config(TestConfig::default());
     let gate = Arc::new(Gate::default());
     let runtime = Runtime::new(
@@ -262,7 +266,7 @@ async fn abort_during_native_preparation_leaves_recoverable_namespace_cleanup() 
     assert_eq!(report.pending, 0);
     assert_eq!(report.next, None);
     assert_eq!(artifact_directories(&opts.workspace), 0);
-    assert!(dir.0.join("source/data.bin").exists());
+    assert!(dir.path().join("source/data.bin").exists());
     runtime.shutdown().await.unwrap();
 }
 
@@ -274,7 +278,7 @@ async fn unknown_outcomes_at_sealing_proof_and_publication_are_idempotent() {
         CommitFault::UnknownNotApplied,
     ] {
         for point in [0, 1, 2] {
-            let dir = Directory::new();
+            let dir = tempfile::tempdir().unwrap();
             let memory = MemoryBackend::with_test_config(TestConfig::default());
             let runtime = runtime(memory.clone());
             let (job, artifact) = fixture(&runtime, &memory, &dir, 19).await;
@@ -304,7 +308,7 @@ async fn unknown_outcomes_at_sealing_proof_and_publication_are_idempotent() {
 async fn worker_claim_and_artifact_acceptance_unknown_outcomes_recover() {
     for fault in [CommitFault::UnknownApplied, CommitFault::UnknownNotApplied] {
         for position in [0, 1, 2] {
-            let dir = Directory::new();
+            let dir = tempfile::tempdir().unwrap();
             let memory = MemoryBackend::with_test_config(TestConfig::default());
             let runtime = runtime(memory.clone());
             let (job, _) = reservation(&runtime, &dir, 19).await;
@@ -336,7 +340,7 @@ async fn worker_claim_and_artifact_acceptance_unknown_outcomes_recover() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn abort_wins_against_a_prepared_publication_transaction() {
-    let dir = Directory::new();
+    let dir = tempfile::tempdir().unwrap();
     let memory = MemoryBackend::with_test_config(TestConfig::default());
     let gate = Arc::new(Gate::default());
     let runtime = Runtime::new(
@@ -377,7 +381,7 @@ async fn abort_wins_against_a_prepared_publication_transaction() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn preparation_failure_is_durable_and_partial_files_are_owned_until_abort() {
-    let dir = Directory::new();
+    let dir = tempfile::tempdir().unwrap();
     let memory = MemoryBackend::new();
     let runtime = runtime(memory.clone());
     let (job, _) = reservation(&runtime, &dir, 19).await;
@@ -406,13 +410,13 @@ async fn preparation_failure_is_durable_and_partial_files_are_owned_until_abort(
     assert_eq!(artifact_directories(&opts.workspace), 1);
     job.abort().await.unwrap();
     assert_eq!(artifact_directories(&opts.workspace), 0);
-    assert!(dir.0.join("source/data.bin").exists());
+    assert!(dir.path().join("source/data.bin").exists());
     runtime.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cleanup_outcome_unknown_and_pagination_are_recoverable_after_drop() {
-    let dir = Directory::new();
+    let dir = tempfile::tempdir().unwrap();
     let memory = MemoryBackend::with_test_config(TestConfig::default());
     let runtime = runtime(memory.clone());
     let (job, _) = reservation(&runtime, &dir, 19).await;
@@ -441,7 +445,7 @@ async fn cleanup_outcome_unknown_and_pagination_are_recoverable_after_drop() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_publishers_resolve_the_same_active_identity() {
-    let dir = Directory::new();
+    let dir = tempfile::tempdir().unwrap();
     let memory = MemoryBackend::with_test_config(TestConfig::default());
     let gate = Arc::new(Gate::default());
     let runtime = Runtime::new(
@@ -468,7 +472,7 @@ async fn concurrent_publishers_resolve_the_same_active_identity() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn preparation_takeover_fences_the_old_artifact_acceptance() {
-    let dir = Directory::new();
+    let dir = tempfile::tempdir().unwrap();
     let memory = MemoryBackend::with_test_config(TestConfig::default());
     let gate = Arc::new(Gate::default());
     let runtime = Runtime::new(
@@ -499,7 +503,7 @@ async fn preparation_takeover_fences_the_old_artifact_acceptance() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn premature_publish_does_not_fail_an_in_progress_load() {
     for commit in [1, 2, 3, 4, 5] {
-        let dir = Directory::new();
+        let dir = tempfile::tempdir().unwrap();
         let memory = MemoryBackend::with_test_config(TestConfig::default());
         let gate = Arc::new(Gate::default());
         let runtime = Runtime::new(
@@ -545,7 +549,7 @@ async fn premature_publish_does_not_fail_an_in_progress_load() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn complete_resumes_after_concurrent_publication_and_reclaimed_paths() {
-    let dir = Directory::new();
+    let dir = tempfile::tempdir().unwrap();
     let memory = MemoryBackend::with_test_config(TestConfig::default());
     let gate = Arc::new(Gate::default());
     let runtime = Runtime::new(
@@ -567,7 +571,7 @@ async fn complete_resumes_after_concurrent_publication_and_reclaimed_paths() {
     gate.release.notify_one();
     let second = pending.await.unwrap().unwrap();
     assert_eq!(first.logical_index_id(), second.logical_index_id());
-    fs::remove_dir_all(dir.0.join("source")).unwrap();
+    fs::remove_dir_all(dir.path().join("source")).unwrap();
     fs::remove_dir_all(&options.workspace).unwrap();
     let recovered = job.complete(options).await.unwrap();
     assert_eq!(recovered.logical_index_id(), first.logical_index_id());
@@ -579,7 +583,7 @@ async fn complete_resumes_after_concurrent_publication_and_reclaimed_paths() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn completed_load_fences_old_chunks_and_resumes_without_worker_takeover() {
-    let dir = Directory::new();
+    let dir = tempfile::tempdir().unwrap();
     let memory = MemoryBackend::with_test_config(TestConfig::default());
     let old_gate = Arc::new(Gate::default());
     let publication_gate = Arc::new(Gate::default());
@@ -652,7 +656,7 @@ async fn completed_load_fences_old_chunks_and_resumes_without_worker_takeover() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn completed_validation_publishes_without_reopening_artifacts() {
-    let dir = Directory::new();
+    let dir = tempfile::tempdir().unwrap();
     let memory = MemoryBackend::with_test_config(TestConfig::default());
     let gate = Arc::new(Gate::default());
     let runtime = Runtime::new(
@@ -703,7 +707,7 @@ async fn completed_validation_publishes_without_reopening_artifacts() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn complete_retries_when_validation_wins_before_worker_takeover() {
-    let dir = Directory::new();
+    let dir = tempfile::tempdir().unwrap();
     let memory = MemoryBackend::with_test_config(TestConfig::default());
     let gate = Arc::new(Gate::default());
     let runtime = Runtime::new(
@@ -746,7 +750,7 @@ async fn complete_retries_when_validation_wins_before_worker_takeover() {
 async fn prepared_receipt_and_lost_preparation_both_publish_complete_indexes() {
     use ktann::bulk::PreparedInputWriter;
     for recover_without_preparation in [false, true] {
-        let dir = Directory::new();
+        let dir = tempfile::tempdir().unwrap();
         let memory = MemoryBackend::new();
         let runtime = runtime(memory);
         let mut opts = worker_options(&dir);
@@ -755,8 +759,8 @@ async fn prepared_receipt_and_lost_preparation_both_publish_complete_indexes() {
         forest.sort_memory_bytes = opts.sort_memory_bytes;
         forest.sort_scratch_bytes = opts.sort_scratch_bytes;
         let prepared = PreparedInputWriter::new(
-            &dir.0.join("source"),
-            &dir.0.join("receipt"),
+            &dir.path().join("source"),
+            &dir.path().join("receipt"),
             config(Metric::L2, true),
             4_000_000,
             forest,
@@ -785,7 +789,7 @@ async fn prepared_receipt_and_lost_preparation_both_publish_complete_indexes() {
                     .kind(),
                 ErrorKind::InvalidArgument
             );
-            fs::remove_dir_all(dir.0.join("receipt")).unwrap();
+            fs::remove_dir_all(dir.path().join("receipt")).unwrap();
             job.complete_with_report(opts.clone(), None, Default::default())
                 .await
                 .unwrap()

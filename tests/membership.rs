@@ -3,17 +3,18 @@
 use std::collections::{BTreeMap, BTreeSet, btree_map};
 
 use bytes::Bytes;
-use ktann::api::{ErrorKind, PartitionKey, Value};
-use ktann::storage::backend::{Backend, ScanLimits};
+use ktann::api::{ErrorKind, Value};
+use ktann::storage::backend::Backend;
 use ktann::storage::keys::{LogicalKey, TreeKey};
 use ktann::storage::membership::{self, DeleteOutcome};
 use ktann::storage::values::{
     ChildEntry, IndexManifest, LeafEntry, OpaquePayload, PartitionHeader, PartitionState,
     PartitionSynopsis, PersistentValue, RecordLocation, VectorRecord,
 };
-use ktann::storage::{LogicalRange, RecordGroupRead, WriteLogicalTxn};
+use ktann::storage::{RecordGroupRead, WriteLogicalTxn};
 
 use support::builders::{create_committed_tree, id, manifest, pk, read_txn, tree_key, write_txn};
+use support::topology_probe::{header_of, leaf_entry_of, leaf_member_ids, synopsis_of};
 use support::{CommitFault, CommitOutcome, MemoryBackend, Rng};
 
 #[allow(dead_code)]
@@ -117,69 +118,21 @@ async fn insert_committed(
     txn.commit().await.expect("commit insert");
 }
 
-async fn read_header_at(
-    backend: &MemoryBackend,
-    manifest: &IndexManifest,
-    tree_key: &TreeKey,
-    partition: PartitionKey,
-) -> PartitionHeader {
-    let mut txn = read_txn(backend, manifest).await;
-    match txn
-        .get(LogicalKey::Header {
-            index: id(7),
-            tree_key: tree_key.clone(),
-            partition,
-        })
-        .await
-        .expect("read header")
-    {
-        Some(PersistentValue::PartitionHeader(header)) => header,
-        _ => panic!("committed partition header must exist"),
-    }
-}
-
-async fn read_synopsis_at(
-    backend: &MemoryBackend,
-    manifest: &IndexManifest,
-    tree_key: &TreeKey,
-    partition: PartitionKey,
-) -> PartitionSynopsis {
-    let mut txn = read_txn(backend, manifest).await;
-    match txn
-        .get(LogicalKey::Synopsis {
-            index: id(7),
-            tree_key: tree_key.clone(),
-            partition,
-        })
-        .await
-        .expect("read synopsis")
-    {
-        Some(PersistentValue::PartitionSynopsis(synopsis)) => synopsis,
-        _ => panic!("committed partition synopsis must exist"),
-    }
-}
-
+/// Reads the entry identified by a stored Record Location.
 async fn read_entry_at(
     backend: &MemoryBackend,
     manifest: &IndexManifest,
     location: &RecordLocation,
     record_id: &Bytes,
 ) -> Option<LeafEntry> {
-    let mut txn = read_txn(backend, manifest).await;
-    match txn
-        .get(LogicalKey::LeafEntry {
-            index: id(7),
-            tree_key: location.tree_key().clone(),
-            partition: location.leaf(),
-            id: record_id.clone(),
-        })
-        .await
-        .expect("read entry")
-    {
-        Some(PersistentValue::LeafEntry(entry)) => Some(entry),
-        None => None,
-        _ => panic!("a Leaf Entry key holds a Leaf Entry value"),
-    }
+    leaf_entry_of(
+        backend,
+        manifest,
+        location.tree_key(),
+        location.leaf(),
+        record_id,
+    )
+    .await
 }
 
 async fn read_group(
@@ -193,35 +146,6 @@ async fn read_group(
         .read_record_group(record_id, include_payload)
         .await
         .expect("read group")
-}
-
-async fn leaf_member_ids(
-    backend: &MemoryBackend,
-    manifest: &IndexManifest,
-    tree_key: &TreeKey,
-    partition: PartitionKey,
-) -> BTreeSet<Bytes> {
-    let mut txn = read_txn(backend, manifest).await;
-    let range = LogicalRange::leaf_entries(manifest, tree_key, partition).expect("leaf range");
-    let page = txn
-        .scan(
-            &range,
-            None,
-            ScanLimits {
-                item_limit: 1_024,
-                byte_limit: 1 << 20,
-            },
-        )
-        .await
-        .expect("scan leaf");
-    assert!(page.next_cursor().is_none(), "one page covers the leaf");
-    page.items()
-        .iter()
-        .map(|item| match item.key() {
-            LogicalKey::LeafEntry { id, .. } => id.clone(),
-            _ => panic!("a Leaf Entry range holds only Leaf Entries"),
-        })
-        .collect()
 }
 
 #[tokio::test]
@@ -253,13 +177,13 @@ async fn insert_commits_the_complete_record_group() {
         Some(entry(&rid(1), 5))
     );
 
-    let header = read_header_at(&backend, &manifest, &key, pk(1)).await;
+    let header = header_of(&backend, &manifest, &key, pk(1)).await.unwrap();
     assert_eq!(
         header,
         PartitionHeader::new(1, 1, 1, PartitionState::Ready).expect("header")
     );
 
-    let synopsis = read_synopsis_at(&backend, &manifest, &key, pk(1)).await;
+    let synopsis = synopsis_of(&backend, &manifest, &key, pk(1)).await.unwrap();
     assert!(!synopsis.fields()[0].has_null());
     assert_eq!(synopsis.fields()[0].minimum(), Some(&Value::I64(5)));
     assert_eq!(synopsis.fields()[0].maximum(), Some(&Value::I64(5)));
@@ -305,7 +229,7 @@ async fn duplicate_insert_is_record_already_exists_and_changes_nothing() {
         .expect("record exists");
     assert_eq!(group.record(), &record(&rid(1), 5));
     assert_eq!(
-        read_header_at(&backend, &manifest, &key, pk(1)).await,
+        header_of(&backend, &manifest, &key, pk(1)).await.unwrap(),
         PartitionHeader::new(1, 1, 1, PartitionState::Ready).expect("header")
     );
 }
@@ -357,7 +281,7 @@ async fn same_leaf_replace_rewrites_entry_payload_and_epoch() {
         Some(entry(&rid(1), 7))
     );
     assert_eq!(
-        read_header_at(&backend, &manifest, &key, pk(1)).await,
+        header_of(&backend, &manifest, &key, pk(1)).await.unwrap(),
         PartitionHeader::new(1, 1, 2, PartitionState::Ready).expect("header")
     );
 
@@ -386,7 +310,7 @@ async fn same_leaf_replace_rewrites_entry_payload_and_epoch() {
     assert_eq!(group.record(), &record(&rid(1), 9));
     assert_eq!(group.payload(), None);
     assert_eq!(
-        read_header_at(&backend, &manifest, &key, pk(1)).await,
+        header_of(&backend, &manifest, &key, pk(1)).await.unwrap(),
         PartitionHeader::new(1, 1, 3, PartitionState::Ready).expect("header")
     );
 }
@@ -408,7 +332,7 @@ async fn cross_leaf_and_cross_tree_moves_retarget_membership_and_counts() {
         &entry(&rid(1), 5),
     )
     .await;
-    let source_synopsis_before = read_synopsis_at(&backend, &manifest, &key, pk(2)).await;
+    let source_synopsis_before = synopsis_of(&backend, &manifest, &key, pk(2)).await.unwrap();
 
     // A same-tree cross-leaf move from PK 2 to PK 3.
     let mut txn = write_txn(&backend, &manifest).await;
@@ -428,16 +352,16 @@ async fn cross_leaf_and_cross_tree_moves_retarget_membership_and_counts() {
     txn.commit().await.expect("commit move");
 
     assert_eq!(
-        read_header_at(&backend, &manifest, &key, pk(2)).await,
+        header_of(&backend, &manifest, &key, pk(2)).await.unwrap(),
         PartitionHeader::new(1, 0, 2, PartitionState::Ready).expect("header")
     );
     assert_eq!(
-        read_header_at(&backend, &manifest, &key, pk(3)).await,
+        header_of(&backend, &manifest, &key, pk(3)).await.unwrap(),
         PartitionHeader::new(1, 1, 1, PartitionState::Ready).expect("header")
     );
     // The internal root is not part of the membership mutation.
     assert_eq!(
-        read_header_at(&backend, &manifest, &key, pk(1)).await,
+        header_of(&backend, &manifest, &key, pk(1)).await.unwrap(),
         PartitionHeader::new(2, 0, 0, PartitionState::Ready).expect("header")
     );
 
@@ -457,10 +381,10 @@ async fn cross_leaf_and_cross_tree_moves_retarget_membership_and_counts() {
     // Synopses are monotone: the source keeps its historical state
     // byte-identical while the target expands with the moved projection.
     assert_eq!(
-        read_synopsis_at(&backend, &manifest, &key, pk(2)).await,
+        synopsis_of(&backend, &manifest, &key, pk(2)).await.unwrap(),
         source_synopsis_before
     );
-    let target_synopsis = read_synopsis_at(&backend, &manifest, &key, pk(3)).await;
+    let target_synopsis = synopsis_of(&backend, &manifest, &key, pk(3)).await.unwrap();
     assert_eq!(target_synopsis.fields()[0].minimum(), Some(&Value::I64(5)));
     assert_eq!(target_synopsis.fields()[0].maximum(), Some(&Value::I64(5)));
 
@@ -479,7 +403,7 @@ async fn cross_leaf_and_cross_tree_moves_retarget_membership_and_counts() {
     )
     .await;
     assert_eq!(
-        read_header_at(&backend, &manifest, &key, pk(2)).await,
+        header_of(&backend, &manifest, &key, pk(2)).await.unwrap(),
         PartitionHeader::new(1, 1, 3, PartitionState::Ready).expect("header")
     );
 
@@ -500,11 +424,11 @@ async fn cross_leaf_and_cross_tree_moves_retarget_membership_and_counts() {
     txn.commit().await.expect("commit move");
 
     assert_eq!(
-        read_header_at(&backend, &manifest, &key, pk(2)).await,
+        header_of(&backend, &manifest, &key, pk(2)).await.unwrap(),
         PartitionHeader::new(1, 0, 4, PartitionState::Ready).expect("header")
     );
     assert_eq!(
-        read_header_at(&backend, &manifest, &other, pk(1)).await,
+        header_of(&backend, &manifest, &other, pk(1)).await.unwrap(),
         PartitionHeader::new(1, 1, 1, PartitionState::Ready).expect("header")
     );
     let group = read_group(&backend, &manifest, rid(2), false)
@@ -520,8 +444,9 @@ async fn cross_leaf_and_cross_tree_moves_retarget_membership_and_counts() {
         Some(entry(&rid(2), 3))
     );
     assert_eq!(
-        read_synopsis_at(&backend, &manifest, &other, pk(1))
+        synopsis_of(&backend, &manifest, &other, pk(1))
             .await
+            .unwrap()
             .fields()[0]
             .minimum(),
         Some(&Value::I64(3))
@@ -583,7 +508,7 @@ async fn delete_removes_the_whole_group_and_is_idempotent() {
         .expect("read payload");
     assert_eq!(payload_value, None);
     assert_eq!(
-        read_header_at(&backend, &manifest, &key, pk(1)).await,
+        header_of(&backend, &manifest, &key, pk(1)).await.unwrap(),
         PartitionHeader::new(1, 0, 2, PartitionState::Ready).expect("header")
     );
 
@@ -632,16 +557,16 @@ async fn delete_uses_the_stored_location_not_routing() {
     txn.commit().await.expect("commit delete");
 
     assert_eq!(
-        read_header_at(&backend, &manifest, &key, pk(2)).await,
+        header_of(&backend, &manifest, &key, pk(2)).await.unwrap(),
         PartitionHeader::new(1, 0, 2, PartitionState::Ready).expect("header")
     );
     // No other partition is touched.
     assert_eq!(
-        read_header_at(&backend, &manifest, &key, pk(3)).await,
+        header_of(&backend, &manifest, &key, pk(3)).await.unwrap(),
         PartitionHeader::new(1, 0, 0, PartitionState::Ready).expect("header")
     );
     assert_eq!(
-        read_header_at(&backend, &manifest, &key, pk(1)).await,
+        header_of(&backend, &manifest, &key, pk(1)).await.unwrap(),
         PartitionHeader::new(2, 0, 0, PartitionState::Ready).expect("header")
     );
 }
@@ -669,7 +594,7 @@ async fn rollback_discards_the_whole_mutation() {
 
     assert_eq!(read_group(&backend, &manifest, rid(1), true).await, None);
     assert_eq!(
-        read_header_at(&backend, &manifest, &key, pk(1)).await,
+        header_of(&backend, &manifest, &key, pk(1)).await.unwrap(),
         PartitionHeader::new(1, 0, 0, PartitionState::Ready).expect("header")
     );
 }
@@ -722,7 +647,7 @@ async fn concurrent_leaf_mutations_conflict_and_retry_cleanly() {
     );
     assert_eq!(read_group(&backend, &manifest, rid(2), false).await, None);
     assert_eq!(
-        read_header_at(&backend, &manifest, &key, pk(1)).await,
+        header_of(&backend, &manifest, &key, pk(1)).await.unwrap(),
         PartitionHeader::new(1, 1, 1, PartitionState::Ready).expect("header")
     );
 
@@ -742,7 +667,7 @@ async fn concurrent_leaf_mutations_conflict_and_retry_cleanly() {
     retry.apply(deferred).await.expect("apply deferred");
     retry.commit().await.expect("retry commits");
     assert_eq!(
-        read_header_at(&backend, &manifest, &key, pk(1)).await,
+        header_of(&backend, &manifest, &key, pk(1)).await.unwrap(),
         PartitionHeader::new(1, 2, 2, PartitionState::Ready).expect("header")
     );
 }
@@ -784,7 +709,7 @@ async fn unknown_commit_outcomes_surface_and_preserve_membership() {
             .is_some()
     );
     assert_eq!(
-        read_header_at(&backend, &manifest, &key, pk(1)).await,
+        header_of(&backend, &manifest, &key, pk(1)).await.unwrap(),
         PartitionHeader::new(1, 1, 1, PartitionState::Ready).expect("header")
     );
     assert_eq!(
@@ -817,7 +742,7 @@ async fn unknown_commit_outcomes_surface_and_preserve_membership() {
     );
     assert_eq!(read_group(&backend, &manifest, rid(2), false).await, None);
     assert_eq!(
-        read_header_at(&backend, &manifest, &key, pk(1)).await,
+        header_of(&backend, &manifest, &key, pk(1)).await.unwrap(),
         PartitionHeader::new(1, 1, 1, PartitionState::Ready).expect("header")
     );
     assert_eq!(
@@ -1010,7 +935,9 @@ async fn verify_model(
             })
             .map(|(value, _)| rid(*value))
             .collect();
-        let header = read_header_at(backend, manifest, tree_key, pk(*leaf)).await;
+        let header = header_of(backend, manifest, tree_key, pk(*leaf))
+            .await
+            .unwrap();
         assert_eq!(
             usize::try_from(header.entry_count()).expect("count fits"),
             expected.len(),

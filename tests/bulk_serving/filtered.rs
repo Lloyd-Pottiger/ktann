@@ -10,7 +10,7 @@ use ktann::api::{BulkWorkerOptions, CompareOp, Predicate, SearchOptions, SearchR
 async fn filtered_search_finds_sparse_matches_across_tree_levels() {
     const COUNT: u64 = 512;
     const K: usize = 5;
-    let dir = Directory::new();
+    let dir = tempfile::tempdir().unwrap();
     let runtime = runtime(MemoryBackend::new());
     let config = IndexConfig::new(1, Metric::L2)
         .unwrap()
@@ -22,7 +22,7 @@ async fn filtered_search_finds_sparse_matches_across_tree_levels() {
         .unwrap();
     let vector = |id: u64| ((id * 73) % COUNT) as f32;
     let input = InputSnapshot::create(
-        &dir.0.join("input"),
+        &dir.path().join("input"),
         config,
         1 << 20,
         (0..COUNT).map(|id| {
@@ -38,7 +38,7 @@ async fn filtered_search_finds_sparse_matches_across_tree_levels() {
         .start_bulk_build("filtered", &input, construction_options())
         .await
         .unwrap();
-    let work = dir.0.join("work");
+    let work = dir.path().join("work");
     fs::create_dir(&work).unwrap();
     let worker = BulkWorkerOptions::new(work);
     job.run_worker(worker.clone()).await.unwrap();

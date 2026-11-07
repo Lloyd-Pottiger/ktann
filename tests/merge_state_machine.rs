@@ -22,14 +22,14 @@ use ktann::storage::values::{
 };
 use ktann::storage::{topology, tree_manifest};
 
-use support::builders::{pk, tree_key, write_txn};
+use support::builders::{create_committed_tree, pk, tree_key, write_txn};
 use support::oracle::{Model, ModelRecord};
 use support::topology_probe::{
     all_partitions, assert_exact_membership, assert_fault_kind, assert_searchable, backend,
     backend_with_clear, backend_with_merge_drain_budget, centroid_of, config,
-    create_committed_tree, drive_merge_to_completion, drive_split_to_completion, edge_of,
-    header_of, leaf_entry_of, location_of, make_runtime, reachable_leaves, record, retry, rid,
-    scan_child_entries, scan_leaf_entries, seed_records, state_of, synopsis_of,
+    drive_merge_to_completion, drive_split_to_completion, edge_of, header_of, leaf_entry_of,
+    location_of, make_runtime, reachable_leaves, record, retry, rid, scan_child_entries,
+    scan_leaf_entries, seed_records, stage_drained_branch, state_of, synopsis_of,
 };
 use support::{CommitFault, Durability, MemoryBackend, Rng, TestConfig, audit, read_manifest};
 
@@ -2088,83 +2088,16 @@ async fn seed_completable_non_root_merge(
         .expect("create tree");
     txn.commit().await.expect("commit tree");
 
-    let index = manifest.logical_index_id();
     let mut txn = write_txn(backend, manifest).await;
-    let entries: Vec<(LogicalKey, PersistentValue)> = vec![
-        (
-            LogicalKey::Header {
-                index,
-                tree_key: key.clone(),
-                partition: pk(1),
-            },
-            PersistentValue::PartitionHeader(
-                PartitionHeader::new(2, 2, 0, PartitionState::Ready).expect("header"),
-            ),
-        ),
-        // The drained source.
-        (
-            LogicalKey::Header {
-                index,
-                tree_key: key.clone(),
-                partition: pk(2),
-            },
-            PersistentValue::PartitionHeader(
-                PartitionHeader::new(1, 0, 3, PartitionState::Merging).expect("header"),
-            ),
-        ),
-        (
-            LogicalKey::State {
-                index,
-                tree_key: key.clone(),
-                partition: pk(2),
-            },
-            PersistentValue::PartitionState(PartitionTransition::Merging {
-                started_at_unix_millis: 200,
-            }),
-        ),
-        // The sibling leaf.
-        (
-            LogicalKey::Header {
-                index,
-                tree_key: key.clone(),
-                partition: pk(3),
-            },
-            PersistentValue::PartitionHeader(
-                PartitionHeader::new(1, 0, 0, PartitionState::Ready).expect("header"),
-            ),
-        ),
-        (
-            LogicalKey::State {
-                index,
-                tree_key: key.clone(),
-                partition: pk(3),
-            },
-            PersistentValue::PartitionState(PartitionTransition::Ready {
-                started_at_unix_millis: 100,
-            }),
-        ),
-        (
-            LogicalKey::ChildEntry {
-                index,
-                tree_key: key.clone(),
-                partition: pk(1),
-                child: pk(2),
-            },
-            PersistentValue::ChildEntry(ChildEntry::new(pk(2), vec![0.0])),
-        ),
-        (
-            LogicalKey::ChildEntry {
-                index,
-                tree_key: key.clone(),
-                partition: pk(1),
-                child: pk(3),
-            },
-            PersistentValue::ChildEntry(ChildEntry::new(pk(3), vec![10.0])),
-        ),
-    ];
-    for (key, value) in entries {
-        txn.put(key, value).await.expect("put fixture");
-    }
+    stage_drained_branch(
+        &mut txn,
+        manifest,
+        key,
+        PartitionTransition::Merging {
+            started_at_unix_millis: 200,
+        },
+    )
+    .await;
     txn.commit().await.expect("commit fixture");
 }
 

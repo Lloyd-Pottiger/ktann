@@ -794,25 +794,17 @@ fn bulk_options() -> ktann::construction::ConstructionOptions {
     }
 }
 
-struct BulkSource(std::path::PathBuf);
-impl BulkSource {
-    fn new() -> (Self, ktann::bulk::InputSnapshot) {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "ktann-reservation-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        let input =
-            ktann::bulk::InputSnapshot::create(&path, config(), 1024 * 1024, std::iter::empty())
-                .unwrap();
-        (Self(path), input)
-    }
-}
-impl Drop for BulkSource {
-    fn drop(&mut self) {
-        std::fs::remove_dir_all(&self.0).unwrap();
-    }
+/// Owns the source directory for as long as its artifact is used.
+fn bulk_source() -> (tempfile::TempDir, ktann::bulk::InputSnapshot) {
+    let directory = tempfile::tempdir().unwrap();
+    let input = ktann::bulk::InputSnapshot::create(
+        &directory.path().join("source"),
+        config(),
+        1024 * 1024,
+        std::iter::empty(),
+    )
+    .unwrap();
+    (directory, input)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -821,7 +813,7 @@ async fn bulk_reservation_reopens_blocks_serving_and_never_retargets_abort() {
     for backend_config in [clear_config(), paged_config(4)] {
         let shared = backend(backend_config);
         let runtime = make_runtime(shared.clone());
-        let (source, input) = BulkSource::new();
+        let (source, input) = bulk_source();
         let options = bulk_options();
         let job = runtime
             .start_bulk_build("bulk", &input, options)
@@ -863,7 +855,7 @@ async fn bulk_reservation_reopens_blocks_serving_and_never_retargets_abort() {
         reopened.abort().await.unwrap();
         assert_drop_complete(&shared, &name("bulk")).await;
         assert_eq!(reopened.status().await.unwrap(), BulkBuildStatus::Aborted);
-        assert!(source.0.join("data.bin").exists());
+        assert!(source.path().join("source/data.bin").exists());
         let replacement = reopened_runtime
             .create_index("bulk", config())
             .await
@@ -892,7 +884,7 @@ async fn bulk_reservation_commit_recovery_and_validation_are_atomic() {
     ] {
         let shared = backend(no_clear_config());
         let runtime = make_runtime(shared.clone());
-        let (_source, input) = BulkSource::new();
+        let (_source, input) = bulk_source();
         let options = bulk_options();
         let mut invalid = options;
         invalid.memory_bytes = 1;
@@ -934,7 +926,7 @@ async fn bulk_reservation_commit_recovery_and_validation_are_atomic() {
 async fn bulk_controls_cancel_before_lifecycle_changes() {
     let shared = backend(no_clear_config());
     let runtime = make_runtime(shared.clone());
-    let (_source, input) = BulkSource::new();
+    let (_source, input) = bulk_source();
     let cancelled = tokio_util::sync::CancellationToken::new();
     cancelled.cancel();
     let control = ktann::api::OperationOptions::default().with_cancellation(cancelled);
@@ -1143,7 +1135,7 @@ async fn index_retains_helper_local_runtime() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bulk_job_retains_runtime_and_explicit_shutdown_closes_all_handles() {
     let runtime = make_runtime(backend(clear_config()));
-    let (_source, input) = BulkSource::new();
+    let (_source, input) = bulk_source();
     let job = runtime
         .start_bulk_build("retained-bulk", &input, bulk_options())
         .await

@@ -964,6 +964,7 @@ dependencies = [
  "proptest",
  "sha2",
  "sysinfo",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",

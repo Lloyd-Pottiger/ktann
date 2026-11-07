@@ -20,12 +20,13 @@ use ktann::storage::values::{
 };
 use ktann::storage::{topology, tree_manifest};
 
-use support::builders::{pk, read_txn, tree_key, write_txn};
+use support::builders::{create_committed_tree, pk, read_txn, tree_key, write_txn};
 use support::topology_probe::{
     all_partitions, assert_exact_membership, assert_fault_kind, assert_searchable, backend,
-    backend_with_clear, centroid_of, config, create_committed_tree, drive_split_to_completion,
-    edge_of, header_of, leaf_entry_of, location_of, make_runtime, reachable_leaves, record, retry,
-    rid, scan_child_entries, scan_leaf_entries, seed_records, state_of, synopsis_of,
+    backend_with_clear, centroid_of, config, drive_split_to_completion, edge_of, header_of,
+    leaf_entry_of, location_of, make_runtime, reachable_leaves, record, retry, rid,
+    scan_child_entries, scan_leaf_entries, seed_records, stage_drained_branch, state_of,
+    synopsis_of,
 };
 use support::{CommitFault, MemoryBackend, Rng, TestConfig, read_manifest};
 
@@ -1513,83 +1514,17 @@ async fn seed_completable_non_root_split(
 
     let index = manifest.logical_index_id();
     let mut txn = write_txn(backend, manifest).await;
-    let entries: Vec<(LogicalKey, PersistentValue)> = vec![
-        (
-            LogicalKey::Header {
-                index,
-                tree_key: key.clone(),
-                partition: pk(1),
-            },
-            PersistentValue::PartitionHeader(
-                PartitionHeader::new(2, 2, 0, PartitionState::Ready).expect("header"),
-            ),
-        ),
-        // The drained source.
-        (
-            LogicalKey::Header {
-                index,
-                tree_key: key.clone(),
-                partition: pk(2),
-            },
-            PersistentValue::PartitionHeader(
-                PartitionHeader::new(1, 0, 3, PartitionState::DrainingSplit).expect("header"),
-            ),
-        ),
-        (
-            LogicalKey::State {
-                index,
-                tree_key: key.clone(),
-                partition: pk(2),
-            },
-            PersistentValue::PartitionState(PartitionTransition::DrainingSplit {
-                left: pk(4),
-                right: pk(5),
-                started_at_unix_millis: 200,
-            }),
-        ),
-        // The sibling leaf.
-        (
-            LogicalKey::Header {
-                index,
-                tree_key: key.clone(),
-                partition: pk(3),
-            },
-            PersistentValue::PartitionHeader(
-                PartitionHeader::new(1, 0, 0, PartitionState::Ready).expect("header"),
-            ),
-        ),
-        (
-            LogicalKey::State {
-                index,
-                tree_key: key.clone(),
-                partition: pk(3),
-            },
-            PersistentValue::PartitionState(PartitionTransition::Ready {
-                started_at_unix_millis: 100,
-            }),
-        ),
-        (
-            LogicalKey::ChildEntry {
-                index,
-                tree_key: key.clone(),
-                partition: pk(1),
-                child: pk(2),
-            },
-            PersistentValue::ChildEntry(ChildEntry::new(pk(2), vec![0.0])),
-        ),
-        (
-            LogicalKey::ChildEntry {
-                index,
-                tree_key: key.clone(),
-                partition: pk(1),
-                child: pk(3),
-            },
-            PersistentValue::ChildEntry(ChildEntry::new(pk(3), vec![10.0])),
-        ),
-    ];
-    for (key, value) in entries {
-        txn.put(key, value).await.expect("put fixture");
-    }
+    stage_drained_branch(
+        &mut txn,
+        manifest,
+        key,
+        PartitionTransition::DrainingSplit {
+            left: pk(4),
+            right: pk(5),
+            started_at_unix_millis: 200,
+        },
+    )
+    .await;
     for target in [pk(4), pk(5)] {
         txn.put(
             LogicalKey::Header {

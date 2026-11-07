@@ -32,29 +32,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::fixtures;
+// The including module shares these leaf utilities without importing the generator.
+use super::{Rng, fixtures};
 use bytes::Bytes;
-
-/// A replayable xorshift64 generator for model and fault histories; the
-/// printed seed reproduces a failure.
-pub struct Rng(pub u64);
-
-impl Rng {
-    /// Returns the next pseudo-random word.
-    pub fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
-    }
-
-    /// Returns the next word modulo `bound`.
-    pub fn below(&mut self, bound: u64) -> u64 {
-        self.next() % bound
-    }
-}
 
 /// One generated dataset: stable Record IDs and their vectors in index order.
 pub struct Dataset {
@@ -230,11 +210,4 @@ fn read_fixture(name: &str, dimension: usize, spec: &str) -> Vec<Arc<[f32]>> {
         "fixture dimension {found} != index dimension {dimension} in spec `{spec}`"
     );
     vectors
-}
-
-/// Reads an `.ivecs` fixture (the `.fvecs` layout with i32 components); used
-/// to check the brute-force oracle against published ground truth.
-#[must_use]
-pub fn read_ivecs_fixture(name: &str) -> Vec<Vec<i32>> {
-    fixtures::read_ivecs(&fixture_dir(), name)
 }

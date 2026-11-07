@@ -50,7 +50,7 @@ async fn wait_empty(memory: &MemoryBackend, id: LogicalIndexId) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn heartbeat_waiting_for_a_transaction_slot_allows_progress_and_cancellation() {
     for cancel_while_waiting in [false, true] {
-        let dir = Directory::new();
+        let dir = tempfile::tempdir().unwrap();
         let memory = MemoryBackend::with_test_config(TestConfig::default());
         let gate = Arc::new(Gate {
             write_slots: Some(Arc::new(tokio::sync::Semaphore::new(1))),
@@ -113,7 +113,7 @@ async fn heartbeat_waiting_for_a_transaction_slot_allows_progress_and_cancellati
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scheduler_reports_missing_or_corrupt_build_descriptor() {
     for corrupt in [false, true] {
-        let dir = Directory::new();
+        let dir = tempfile::tempdir().unwrap();
         let memory = MemoryBackend::with_test_config(TestConfig::default());
         let runtime = Runtime::new(
             memory.clone(),
@@ -149,7 +149,7 @@ async fn scheduler_reports_missing_or_corrupt_build_descriptor() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn automatic_publish_across_runtimes_with_single_foreground_permit() {
-    let dir = Directory::new();
+    let dir = tempfile::tempdir().unwrap();
     let memory = MemoryBackend::with_test_config(TestConfig::default());
     let config = RuntimeConfig::default()
         .with_maintenance(0, 1)
@@ -207,7 +207,7 @@ async fn automatic_publish_across_runtimes_with_single_foreground_permit() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dropped_scheduler_is_replaced_after_lease_expiry() {
-    let dir = Directory::new();
+    let dir = tempfile::tempdir().unwrap();
     let memory = MemoryBackend::with_test_config(TestConfig::default());
     let gate = Arc::new(Gate::default());
     let first = Runtime::new(
@@ -277,7 +277,7 @@ async fn renewal_prevents_takeover_while_preparation_is_paused() {
         lease_duration: Duration::from_secs(2),
         ..settings()
     };
-    let dir = Directory::new();
+    let dir = tempfile::tempdir().unwrap();
     let memory = MemoryBackend::with_test_config(TestConfig::default());
     let gate = Arc::new(Gate::default());
     let first = Runtime::new(
@@ -356,7 +356,7 @@ async fn read_queue(memory: &MemoryBackend, id: LogicalIndexId) -> Vec<u8> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unknown_enqueue_and_claim_resolve_without_duplicate_jobs() {
     for fault in [CommitFault::UnknownApplied, CommitFault::UnknownNotApplied] {
-        let dir = Directory::new();
+        let dir = tempfile::tempdir().unwrap();
         let memory = MemoryBackend::with_test_config(TestConfig::default());
         let runtime = Runtime::new(
             memory.clone(),
@@ -391,7 +391,7 @@ async fn unknown_enqueue_and_claim_resolve_without_duplicate_jobs() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unknown_enqueue_exhaustion_preserves_uncertainty() {
     for fault in [CommitFault::UnknownApplied, CommitFault::UnknownNotApplied] {
-        let dir = Directory::new();
+        let dir = tempfile::tempdir().unwrap();
         let memory = MemoryBackend::with_test_config(TestConfig::default());
         let runtime = Runtime::new(
             memory.clone(),
@@ -416,7 +416,7 @@ async fn unknown_enqueue_exhaustion_preserves_uncertainty() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn discovery_passes_leased_entries_without_a_poll_per_entry() {
-    let dir = Directory::new();
+    let dir = tempfile::tempdir().unwrap();
     let memory = MemoryBackend::new();
     let runtime = Runtime::new(
         memory.clone(),
@@ -485,7 +485,7 @@ async fn discovery_passes_leased_entries_without_a_poll_per_entry() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn terminal_failure_and_queued_abort_leave_no_scheduler_work() {
     for fail in [true, false] {
-        let dir = Directory::new();
+        let dir = tempfile::tempdir().unwrap();
         let memory = MemoryBackend::with_test_config(TestConfig::default());
         let runtime = Runtime::new(
             memory.clone(),
@@ -536,7 +536,7 @@ async fn terminal_failure_and_queued_abort_leave_no_scheduler_work() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn takeover_fences_a_scheduled_chunk_prepared_by_the_old_owner() {
-    let dir = Directory::new();
+    let dir = tempfile::tempdir().unwrap();
     let memory = MemoryBackend::with_test_config(TestConfig::default());
     let gate = Arc::new(Gate::default());
     let first = Runtime::new(
@@ -620,7 +620,7 @@ async fn takeover_fences_a_scheduled_chunk_prepared_by_the_old_owner() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn separate_runtimes_progress_different_jobs_in_one_workspace() {
-    let dir = Directory::new();
+    let dir = tempfile::tempdir().unwrap();
     let memory = MemoryBackend::with_test_config(TestConfig::default());
     let gate = Arc::new(Gate::default());
     let first = Runtime::new(
@@ -638,7 +638,7 @@ async fn separate_runtimes_progress_different_jobs_in_one_workspace() {
     .unwrap();
     let one = reservation(&first, &dir, 19).await.0;
     let input = InputSnapshot::create(
-        &dir.0.join("source-two"),
+        &dir.path().join("source-two"),
         config(Metric::L2, true),
         1024 * 1024,
         (100..119).map(|id| Ok(record(id))),
@@ -721,7 +721,7 @@ async fn separate_runtimes_progress_different_jobs_in_one_workspace() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn enqueue_rejects_a_file_as_workspace_before_creating_queue_state() {
-    let dir = Directory::new();
+    let dir = tempfile::tempdir().unwrap();
     let memory = MemoryBackend::with_test_config(TestConfig::default());
     let runtime = Runtime::new(
         memory.clone(),
@@ -729,7 +729,7 @@ async fn enqueue_rejects_a_file_as_workspace_before_creating_queue_state() {
     )
     .unwrap();
     let job = reservation(&runtime, &dir, 0).await.0;
-    let options = ktann::api::BulkWorkerOptions::new(dir.0.join("source/data.bin"));
+    let options = ktann::api::BulkWorkerOptions::new(dir.path().join("source/data.bin"));
     assert_eq!(
         job.schedule(options).await.unwrap_err().kind(),
         ErrorKind::InvalidArgument
