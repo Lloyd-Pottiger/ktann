@@ -31,6 +31,13 @@ cleanup. `complete_with_control` applies cancellation and deadline control acros
 the entire operation. No automatic scheduler is started. Explicit `run_worker`,
 `load_serving`, and `publish` APIs remain available for phase control.
 
+Bulk Build and `Index::refine` share the in-memory planner in
+[`refinement`](../../src/refinement.rs): vector preprocessing, initial leaf means,
+assignment rounds and child-before-parent centroid refresh. Bulk preparation
+converts construction plans and retains only final membership; Runtime planning
+loads existing topology and observes moves for transactional publication. Neither
+path calls the other public lifecycle.
+
 For a configuration with `LocalGraphConfig`, preparation refines
 membership and recomputes centroids before accepting the final Forest Artifact,
 then builds each internal graph exactly once from the final Child Entries while
@@ -42,8 +49,9 @@ Failure exceeds neither budget by falling back or omitting work. Construction an
 refinement memory ceilings add while retained inputs feed construction.
 
 After publication, graph-enabled indexes support ordinary mutations and graph-aware
-maintenance. Public serving refinement returns `InvalidArgument`; optional artifact
-refinement must finish before initial graph construction. Query HNSW routing is
+maintenance and caller-exclusive `Index::refine`, which atomically refreshes each
+changed parent's graph with its routing projections. Optional artifact refinement
+finishes before initial graph construction. Query HNSW routing is
 selected independently of the construction path.
 
 ### 1.1 Completion reports

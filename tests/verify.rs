@@ -50,6 +50,7 @@ fn config() -> IndexConfig {
 fn config_with(dimension: usize, partition_entries: Option<(u32, u32)>) -> IndexConfig {
     let config = IndexConfig::new(dimension, Metric::L2)
         .expect("valid config")
+        .without_local_graph()
         .with_fields(vec![
             FieldSchema::new("bucket", DataType::I64).expect("valid field"),
             FieldSchema::new("score", DataType::I64)

@@ -59,6 +59,7 @@ pub fn backend_with_clear() -> MemoryBackend {
 pub fn config(minimum: u32, maximum: u32) -> IndexConfig {
     IndexConfig::new(1, Metric::L2)
         .expect("valid dimension")
+        .without_local_graph()
         .with_fields(vec![
             FieldSchema::new("bucket", DataType::I64).expect("field"),
         ])

@@ -39,6 +39,7 @@ pub mod bulk;
 pub mod construction;
 pub mod maintenance;
 mod observe;
+mod refinement;
 pub mod runtime;
 pub mod search;
 pub mod storage;

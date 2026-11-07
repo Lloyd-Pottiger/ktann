@@ -57,6 +57,16 @@ async fn graph_publication_preserves_membership_and_supports_mutations() {
                 fs::remove_dir_all(dir.path().join("source")).unwrap();
                 job.run_worker(options.clone()).await.unwrap();
                 let index = job.complete(options.clone()).await.unwrap();
+                // Refine the settled published topology before writes can overflow leaves.
+                index
+                    .refine(
+                        RefineOptions::new(1 << 20)
+                            .unwrap()
+                            .with_refinement_rounds(0)
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
                 let verification = index.verify(VerifyOptions::default()).await.unwrap();
                 assert!(
                     verification.complete && verification.issues.is_empty(),
@@ -119,19 +129,6 @@ async fn graph_publication_preserves_membership_and_supports_mutations() {
                     "{verification:?}"
                 );
                 assert_eq!(verification.objects.vector_records, count + 2);
-                assert_eq!(
-                    index
-                        .refine(
-                            RefineOptions::new(1 << 20)
-                                .unwrap()
-                                .with_refinement_rounds(0)
-                                .unwrap()
-                        )
-                        .await
-                        .unwrap_err()
-                        .kind(),
-                    ErrorKind::InvalidArgument
-                );
                 for mode in [
                     ktann::api::RoutingMode::Exact,
                     ktann::api::RoutingMode::PartitionLocalHnsw { ef_search: 64 },

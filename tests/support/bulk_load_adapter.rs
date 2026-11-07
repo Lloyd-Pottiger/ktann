@@ -72,7 +72,7 @@ async fn exercise_mode<B: Backend>(
             .unwrap(),
         )
     } else {
-        config
+        config.without_local_graph()
     };
     let record_count: u64 = if updates { 4096 } else { 128 };
     let source = InputSnapshot::create(
@@ -298,7 +298,9 @@ async fn exercise_mode<B: Backend>(
             )
             .await
     });
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+    // The 4096-record FoundationDB case validates tens of thousands of entries;
+    // this is a liveness watchdog, not a publication-latency assertion.
+    let publication = tokio::time::timeout(std::time::Duration::from_secs(60), async {
         loop {
             if scheduled.status().await.unwrap() == BulkBuildStatus::Published {
                 break;
@@ -306,8 +308,17 @@ async fn exercise_mode<B: Backend>(
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     })
-    .await
-    .unwrap();
+    .await;
+    if publication.is_err() {
+        let status = scheduled.status().await;
+        if scheduler.is_finished() {
+            panic!(
+                "scheduled {directory:?}: status={status:?}, scheduler={:?}",
+                scheduler.await
+            );
+        }
+        panic!("scheduled {directory:?}: status={status:?}, scheduler still running");
+    }
     let index = runtime.open_index("bulk-scheduled").await.unwrap();
     let report = index
         .verify(ktann::api::VerifyOptions::default())

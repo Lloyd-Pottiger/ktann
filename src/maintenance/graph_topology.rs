@@ -306,6 +306,18 @@ pub(crate) async fn advance_observed<'b, B: Backend>(
             ))
         };
     }
+    // Graph publication owns in-flight steps that bypass the ordinary drivers.
+    // Preserve their state-age observation before graph planning or leaf drains.
+    let kind = match state {
+        PartitionTransition::Splitting { .. } | PartitionTransition::DrainingSplit { .. } => {
+            Some(crate::observe::labels::FixupKind::Split)
+        }
+        PartitionTransition::Merging { .. } => Some(crate::observe::labels::FixupKind::Merge),
+        _ => None,
+    };
+    if let Some(kind) = kind {
+        crate::observe::metrics::fixup_state_age(kind, now, state.started_at_unix_millis());
+    }
     // Leaf movement changes exact membership, not an internal routing graph.
     if header.level() == 1 && header.entry_count() > 0 {
         match state {
@@ -369,17 +381,15 @@ pub(crate) async fn advance_observed<'b, B: Backend>(
             .is_none_or(|(held, _)| *held != participants.keys)
         {
             drop(locked_bodies.take());
+            // A body owner may need the backend's only transaction slot to
+            // publish. Release discovery's slot before waiting for its locks,
+            // then refresh the snapshot while holding the acquired bodies.
+            drop(read);
             let guards = executor
                 .lock_bodies(manifest.logical_index_id(), tree, participants.keys.clone())
                 .await?;
-            let waited = guards.waited;
             locked_bodies = Some((participants.keys.clone(), guards));
-            if waited {
-                // Refresh after another local publisher held these bodies.
-                // Uncontended acquisition reuses this snapshot; exact source
-                // fences still protect publication against concurrent writers.
-                continue;
-            }
+            continue;
         }
         let parent = if let Some(proof) = &participants.proof {
             proof

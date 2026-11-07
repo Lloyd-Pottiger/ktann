@@ -369,14 +369,9 @@ impl ForestArtifact {
                         Ok(())
                     },
                 )?;
-                crate::runtime::refine::refine_plans(
-                    config,
-                    seed,
-                    retained,
-                    &mut plans,
-                    rounds,
-                    &|| check(),
-                )?;
+                super::refine::refine_plans(config, seed, retained, &mut plans, rounds, &|| {
+                    check()
+                })?;
                 for partition in plans {
                     emit(partition)?;
                 }

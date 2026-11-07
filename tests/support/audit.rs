@@ -643,7 +643,14 @@ pub async fn settle<B: Backend>(index: &Index<B>, backend: &B, expected: u32) {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut stable = 0_u32;
     loop {
-        let request = SearchRequest::new(zeros.clone(), 1).expect("valid request");
+        // Audit probes must also drive maintenance on explicitly graph-free fixtures.
+        let request = SearchRequest::new(zeros.clone(), 1)
+            .expect("valid request")
+            .with_options(
+                ktann::api::SearchOptions::default()
+                    .with_routing_mode(ktann::api::RoutingMode::Exact)
+                    .expect("exact audit routing"),
+            );
         let _ = index.search(request).await;
         let partitions = list_partitions(backend, index.logical_index_id())
             .await

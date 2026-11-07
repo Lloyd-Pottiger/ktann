@@ -11,8 +11,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::api::{Error, ErrorKind, PartitionKey, RefineOptions, Result};
 use crate::observe::labels::Operation;
-use crate::search::numeric::VectorKernel;
+use crate::refinement::{Part, Planner};
 use crate::storage::backend::{Backend, ScanLimits};
+use crate::storage::graph_transitions::{GraphTransitionSource, protect_sources, publish_batch};
 use crate::storage::keys::{LogicalKey, TreeKey};
 use crate::storage::values::{IndexManifest, PartitionState, PartitionTransition, PersistentValue};
 use crate::storage::{LogicalRange, LogicalScanCursor, LogicalScanPage, topology};
@@ -24,16 +25,6 @@ const PAGE: ScanLimits = ScanLimits {
     item_limit: 128,
     byte_limit: 1 << 20,
 };
-
-/// Existing partitions keep their identities and parent edges during refinement.
-struct Part {
-    key: PartitionKey,
-    parent: Option<PartitionKey>,
-    level: u32,
-    center: Box<[f32]>,
-    members: Vec<usize>,
-    children: Vec<PartitionKey>,
-}
 
 /// A loaded tree and its planned refinement rounds; member indexes refer to the shared record arrays.
 struct Tree {
@@ -256,7 +247,6 @@ async fn load<B: Backend>(
             }
             parts.push(part);
         }
-        parts.sort_by_key(|part| (part.level, part.key));
         loaded.trees.push(Tree {
             key,
             parts,
@@ -273,38 +263,18 @@ fn plan(
     options: &RefineOptions,
     checkpoint: &impl Fn() -> Result<()>,
 ) -> Result<Vec<Tree>> {
-    let kernel = VectorKernel::new(
-        manifest.config().dimension(),
-        manifest.config().metric(),
+    let planner = Planner::new(
+        manifest.config(),
         *manifest.rotation_seed(),
+        loaded.vectors,
+        checkpoint,
     )?;
-    for vector in &mut loaded.vectors {
-        checkpoint()?;
-        *vector = kernel.preprocess(vector)?;
-    }
     for tree in &mut loaded.trees {
-        let leaf_count = tree.parts.partition_point(|part| part.level == 1);
-        // Recompute even unchanged leaf memberships: imported centroids may be stale.
-        for leaf in &mut tree.parts[..leaf_count] {
-            checkpoint()?;
-            if !leaf.members.is_empty() {
-                leaf.center = mean(
-                    &kernel,
-                    leaf.members
-                        .iter()
-                        .map(|&position| loaded.vectors[position].as_ref()),
-                )?;
-            }
-        }
         let history = &mut tree.rounds;
-        refine(
-            checkpoint,
-            &kernel,
-            &loaded.vectors,
-            &mut tree.parts[..leaf_count],
-            manifest.config().min_leaf_partition_entries() as usize,
-            manifest.config().max_leaf_partition_entries() as usize,
+        planner.refine_tree(
+            &mut tree.parts,
             options.rounds,
+            checkpoint,
             |round, position, source, target| {
                 if history.len() == round {
                     history.push(Vec::new());
@@ -316,7 +286,6 @@ fn plan(
                 });
             },
         )?;
-        refresh_internal_centers(&kernel, &mut tree.parts, leaf_count, checkpoint)?;
         // Only final routing centers and ordered moves are needed during writes.
         for part in &mut tree.parts {
             part.members = Vec::new();
@@ -324,116 +293,6 @@ fn plan(
         }
     }
     Ok(loaded.trees)
-}
-
-/// Refreshes the hierarchy in child-before-parent order using unweighted means.
-fn refresh_internal_centers(
-    kernel: &VectorKernel,
-    parts: &mut [Part],
-    leaves: usize,
-    check: &impl Fn() -> Result<()>,
-) -> Result<BTreeMap<PartitionKey, usize>> {
-    let positions: BTreeMap<_, _> = parts
-        .iter()
-        .enumerate()
-        .map(|(i, part)| (part.key, i))
-        .collect();
-    for i in leaves..parts.len() {
-        check()?;
-        parts[i].center = mean(
-            kernel,
-            parts[i]
-                .children
-                .iter()
-                .map(|key| parts[positions[key]].center.as_ref()),
-        )?;
-    }
-    Ok(positions)
-}
-
-/// Pure artifact preparation reuses the ordinary numerical assignment algorithm.
-/// The caller admits all retained input and planning scratch before invoking it.
-pub(crate) fn refine_plans(
-    config: &crate::api::IndexConfig,
-    seed: [u8; 32],
-    records: Vec<crate::construction::ConstructionRecord>,
-    plans: &mut [crate::construction::PartitionPlan],
-    rounds: u8,
-    check: &impl Fn() -> Result<()>,
-) -> Result<()> {
-    let kernel = VectorKernel::new(config.dimension(), config.metric(), seed)?;
-    let mut ids = Vec::with_capacity(records.len());
-    let mut vectors = Vec::with_capacity(records.len());
-    for record in records {
-        check()?;
-        ids.push(record.id);
-        vectors.push(kernel.preprocess(&record.vector)?);
-    }
-    let positions: BTreeMap<_, _> = ids
-        .iter()
-        .enumerate()
-        .map(|(i, id)| (id.clone(), i))
-        .collect();
-    let mut parts = Vec::with_capacity(plans.len());
-    for plan in plans.iter_mut() {
-        check()?;
-        let members = if plan.level == 1 {
-            plan.entries
-                .iter()
-                .map(|id| positions.get(id).copied().ok_or_else(corrupt))
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            Vec::new()
-        };
-        let children = if plan.level > 1 {
-            plan.entries
-                .iter()
-                .map(|id| {
-                    PartitionKey::new(u64::from_be_bytes(
-                        id.as_ref().try_into().map_err(|_| corrupt())?,
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            Vec::new()
-        };
-        let center = if plan.level == 1 {
-            mean(&kernel, members.iter().map(|&i| vectors[i].as_ref()))?
-        } else {
-            plan.centroid.clone()
-        };
-        parts.push(Part {
-            key: plan.key,
-            parent: None,
-            level: plan.level,
-            center,
-            members,
-            children,
-        });
-    }
-    parts.sort_by_key(|part| (part.level, part.key));
-    let leaves = parts.partition_point(|part| part.level == 1);
-    refine(
-        check,
-        &kernel,
-        &vectors,
-        &mut parts[..leaves],
-        config.min_leaf_partition_entries() as usize,
-        config.max_leaf_partition_entries() as usize,
-        rounds as usize,
-        |_, _, _, _| {},
-    )?;
-    let positions = refresh_internal_centers(&kernel, &mut parts, leaves, check)?;
-    for plan in plans {
-        check()?;
-        let part = &mut parts[positions[&plan.key]];
-        plan.centroid = std::mem::take(&mut part.center);
-        if plan.level == 1 {
-            plan.entries = part.members.iter().map(|&i| ids[i].clone()).collect();
-            plan.entries.sort();
-        }
-    }
-    Ok(())
 }
 
 /// Refines an ordinary index using existing retry/commit boundaries.
@@ -513,6 +372,10 @@ pub(crate) async fn run<B: Backend>(
                 }
             }
         }
+        if manifest.config().local_graph().is_some() {
+            publish_graph_centroids(context, manifest, &tree, &retry).await?;
+            continue;
+        }
         for part in &tree.parts {
             let Some(parent) = part.parent else {
                 continue;
@@ -537,165 +400,114 @@ pub(crate) async fn run<B: Backend>(
     Ok(())
 }
 
-/// Computes a metric-correct mean with f64 accumulation in canonical order.
-fn mean<'a>(kernel: &VectorKernel, members: impl Iterator<Item = &'a [f32]>) -> Result<Box<[f32]>> {
-    let mut sum = vec![0.0_f64; kernel.dimension()];
-    let mut count = 0_usize;
-    for vector in members {
-        for (sum, component) in sum.iter_mut().zip(vector) {
-            *sum += f64::from(*component);
-        }
-        count += 1;
-    }
-    let center: Vec<f32> = sum
-        .into_iter()
-        .map(|sum| (sum / count.max(1) as f64) as f32)
-        .collect();
-    kernel.normalize_centroid(&center)
-}
-
-/// Retains the nearest 32 leaves in exact (distance, leaf ordinal) order.
-/// Distances are symmetric: score each unordered pair once, updating both ends.
-/// Only the bounded neighbor lists survive; no quadratic distance matrix is kept.
-fn leaf_neighbors(
-    checkpoint: &impl Fn() -> Result<()>,
-    kernel: &VectorKernel,
-    leaves: &[Part],
-) -> Result<Vec<[(f64, usize); 32]>> {
-    // One allocation avoids one independently allocated buffer per leaf.
-    let mut neighbors = vec![[(f64::INFINITY, usize::MAX); 32]; leaves.len()];
-    for (source, leaf) in leaves.iter().enumerate() {
-        checkpoint()?;
-        let (batches, tail) = leaves[source + 1..].as_chunks::<4>();
-        for (batch, candidates) in batches.iter().enumerate() {
-            let scores = kernel.routing_distances_validated(
-                candidates
-                    .each_ref()
-                    .map(|candidate| candidate.center.as_ref()),
-                &leaf.center,
-            );
-            for (lane, score) in scores.into_iter().enumerate() {
-                let target = source + 1 + batch * 4 + lane;
-                retain_neighbor(&mut neighbors[source], (score, target));
-                retain_neighbor(&mut neighbors[target], (score, source));
-            }
-        }
-        for (offset, candidate) in tail.iter().enumerate() {
-            let target = source + 1 + batches.len() * 4 + offset;
-            let score = kernel.routing_distances_validated([&leaf.center], &candidate.center)[0];
-            retain_neighbor(&mut neighbors[source], (score, target));
-            retain_neighbor(&mut neighbors[target], (score, source));
-        }
-    }
-    Ok(neighbors)
-}
-
-/// Inserts only improving candidates without growing beyond the neighbor bound.
-fn retain_neighbor(neighbors: &mut [(f64, usize); 32], candidate: (f64, usize)) {
-    let compare = |previous: &(f64, usize)| {
-        previous
-            .0
-            .total_cmp(&candidate.0)
-            .then(previous.1.cmp(&candidate.1))
-    };
-    if compare(&neighbors[31]).is_le() {
-        return;
-    }
-    let position = neighbors.partition_point(|previous| compare(previous).is_lt());
-    neighbors.copy_within(position..31, position + 1);
-    neighbors[position] = candidate;
-}
-
-/// Greedy positive-gain moves use fixed centroids during one round, then
-/// recompute spherical means. Exact counts constrain every accepted move.
-/// The only root leaf is exempt from the ordinary nonroot minimum.
-/// Only online planning retains accepted moves for later persistence; artifact
-/// preparation needs only the final membership and centroids. Callers discard
-/// their private planning state if any round fails.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "numerical inputs, occupancy bounds, and move observation are independent"
-)]
-fn refine(
-    checkpoint: &impl Fn() -> Result<()>,
-    kernel: &VectorKernel,
-    vectors: &[Box<[f32]>],
-    leaves: &mut [Part],
-    minimum: usize,
-    maximum: usize,
-    rounds: usize,
-    mut on_move: impl FnMut(usize, usize, PartitionKey, PartitionKey),
+/// Publishes bounded sibling batches, child levels before parent levels. Preparing
+/// one replacement per batch avoids rebuilding a wide graph for every centroid.
+/// Caller exclusivity keeps plans stable; source fences still protect each commit.
+async fn publish_graph_centroids<B: Backend>(
+    context: &mut OperationContext<B>,
+    manifest: &IndexManifest,
+    tree: &Tree,
+    retry: &RetryPolicy,
 ) -> Result<()> {
-    // Both callers preprocess vectors and compute leaf centers with `mean`.
-    // Each later round also uses `mean`, which validates and normalizes centers.
-    // These finite, fixed-dimension inputs need no per-distance validation.
-    if leaves.len() < 2 {
-        return Ok(());
+    let mut parents: BTreeMap<(u32, PartitionKey), Vec<&Part>> = BTreeMap::new();
+    for part in &tree.parts {
+        if let Some(parent) = part.parent {
+            parents.entry((part.level, parent)).or_default().push(part);
+        }
     }
-    for round in 0..rounds {
-        checkpoint()?;
-        let neighbors = leaf_neighbors(checkpoint, kernel, leaves)?;
-        let mut moves = Vec::new();
-        for (source, leaf) in leaves.iter().enumerate() {
-            checkpoint()?;
-            let distances = &neighbors[source][..32.min(leaves.len() - 1)];
-            for &position in &leaf.members {
-                let vector = &vectors[position];
-                let old = kernel.routing_distances_validated([vector], &leaf.center)[0];
-                let mut best = (old, source);
-                let (batches, tail) = distances.as_chunks::<4>();
-                for targets in batches {
-                    let distances = kernel.routing_distances_validated(
-                        targets.map(|(_, target)| leaves[target].center.as_ref()),
-                        vector,
-                    );
-                    for (&(_, target), distance) in targets.iter().zip(distances) {
-                        if distance < best.0 {
-                            best = (distance, target);
+    let backend = context.backend();
+    for ((_, parent), parts) in parents {
+        let mut offset = 0;
+        let mut batch = parts.len().min(128);
+        while offset < parts.len() {
+            context.checkpoint()?;
+            let end = (offset + batch).min(parts.len());
+            let prefix = &parts[offset..end];
+            let mut read = reads::open_validated_read(backend.as_ref(), manifest).await?;
+            let source = GraphTransitionSource::read(
+                &mut read,
+                &tree.key,
+                parent,
+                context.routing_working_bytes,
+                &|| context.checkpoint(),
+            )
+            .await?;
+            drop(read);
+            // Admit both the replacement body and the temporary update copies
+            // before allocating them. Native preparation retains the same ceiling.
+            let required = source
+                .retained_bytes()?
+                .checked_add(source.projection_bytes(source.children().len())?)
+                .and_then(|bytes| bytes.checked_add(source.projection_bytes(prefix.len()).ok()?))
+                .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+            if required > context.routing_working_bytes {
+                return Err(Error::new(ErrorKind::LimitExceeded));
+            }
+            let updates: Vec<_> = prefix
+                .iter()
+                .map(|part| (part.key, part.center.clone()))
+                .collect();
+            let working_bytes = context.routing_working_bytes;
+            let graphs = controlled_compute(
+                context.options.clone(),
+                context.cpu_admission.clone().expect("refinement admission"),
+                move |control| {
+                    Ok(
+                        [source.prepare_centroid_update(updates, working_bytes, &|| {
+                            check_control(control)
+                        })?],
+                    )
+                },
+            )
+            .await?;
+            let result = writes::run_write_attempts(
+                backend.as_ref(),
+                Some(context),
+                manifest,
+                retry,
+                Operation::Refine,
+                |txn| {
+                    let graphs = &graphs;
+                    let key = &tree.key;
+                    Box::pin(async move {
+                        if !protect_sources(txn, graphs).await? {
+                            // Replanning around a changed parent would violate the
+                            // caller-exclusive input used for numerical refinement.
+                            return Err(Error::new(ErrorKind::ContentionExhausted));
                         }
+                        for part in prefix {
+                            topology::update_centroid(
+                                txn,
+                                key,
+                                part.key,
+                                parent,
+                                part.center.clone(),
+                            )
+                            .await?;
+                        }
+                        publish_batch(txn, graphs).await
+                    })
+                },
+            )
+            .await;
+            match result {
+                Ok(()) => {
+                    for graph in graphs {
+                        graph.cache_committed(&context.partition_cache);
                     }
+                    offset = end;
                 }
-                for &(_, target) in tail {
-                    let distance =
-                        kernel.routing_distances_validated([vector], &leaves[target].center)[0];
-                    if distance < best.0 {
-                        best = (distance, target);
-                    }
+                Err(error)
+                    if batch > 1
+                        && matches!(
+                            error.kind(),
+                            ErrorKind::LimitExceeded | ErrorKind::TransactionTooLarge
+                        ) =>
+                {
+                    batch = batch.div_ceil(2);
                 }
-                if best.1 != source {
-                    moves.push((old - best.0, position, source, best.1));
-                }
+                Err(error) => return Err(error),
             }
-        }
-        drop(neighbors);
-        moves.sort_by(|left, right| right.0.total_cmp(&left.0).then(left.1.cmp(&right.1)));
-        let mut counts: Vec<_> = leaves.iter().map(|leaf| leaf.members.len()).collect();
-        let mut targets = BTreeMap::new();
-        for (_, position, source, target) in moves {
-            if counts[source] > minimum && counts[target] < maximum {
-                on_move(round, position, leaves[source].key, leaves[target].key);
-                counts[source] -= 1;
-                counts[target] += 1;
-                targets.insert(position, target);
-            }
-        }
-        crate::observe::metrics::refinement_round(targets.len());
-        if targets.is_empty() {
-            break;
-        }
-        let mut members = vec![Vec::new(); leaves.len()];
-        for (source, leaf) in leaves.iter().enumerate() {
-            for &position in &leaf.members {
-                members[targets.get(&position).copied().unwrap_or(source)].push(position);
-            }
-        }
-        for (leaf, mut members) in leaves.iter_mut().zip(members) {
-            members.sort_unstable();
-            leaf.center = mean(
-                kernel,
-                members.iter().map(|&position| vectors[position].as_ref()),
-            )?;
-            leaf.members = members;
         }
     }
     Ok(())
@@ -704,219 +516,6 @@ fn refine(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn symmetric_neighbors_match_exhaustive_order_for_all_metrics() {
-        use crate::api::Metric;
-        for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
-            for dimension in [1, 7, 8, 9, 128] {
-                let kernel = VectorKernel::new(dimension, metric, [0; 32]).unwrap();
-                for count in [0_usize, 1, 2, 31, 32, 33, 34, 65] {
-                    let leaves: Vec<_> = (0..count)
-                        .map(|i| Part {
-                            key: PartitionKey::new(i as u64 + 2).unwrap(),
-                            parent: None,
-                            level: 1,
-                            // Repeated and zero centers exercise exact distance ties.
-                            center: kernel
-                                .normalize_centroid(
-                                    &(0..dimension)
-                                        .map(|d| {
-                                            if i % 9 == 0 {
-                                                0.0
-                                            } else {
-                                                ((i % 11 * 17 + d * 31) % 23) as f32 - 11.0
-                                            }
-                                        })
-                                        .collect::<Vec<_>>(),
-                                )
-                                .unwrap(),
-                            members: vec![],
-                            children: vec![],
-                        })
-                        .collect();
-                    let actual = leaf_neighbors(&|| Ok(()), &kernel, &leaves).unwrap();
-                    for (source, leaf) in leaves.iter().enumerate() {
-                        let mut expected: Vec<_> = leaves
-                            .iter()
-                            .enumerate()
-                            .filter(|(target, _)| *target != source)
-                            .map(|(target, candidate)| {
-                                (
-                                    kernel
-                                        .routing_distance(&leaf.center, &candidate.center)
-                                        .unwrap(),
-                                    target,
-                                )
-                            })
-                            .collect();
-                        expected.sort_by(|left, right| {
-                            left.0.total_cmp(&right.0).then(left.1.cmp(&right.1))
-                        });
-                        expected.truncate(32);
-                        let bits = |neighbors: &[(f64, usize)]| {
-                            neighbors
-                                .iter()
-                                .map(|&(distance, target)| (distance.to_bits(), target))
-                                .collect::<Vec<_>>()
-                        };
-                        assert_eq!(
-                            bits(&actual[source][..32.min(count.saturating_sub(1))]),
-                            bits(&expected),
-                            "metric={metric:?} dimension={dimension} count={count} source={source}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn artifact_zero_rounds_refreshes_centroids_without_changing_membership() {
-        use crate::api::{IndexConfig, Metric};
-        use crate::construction::{ConstructionRecord, PartitionPlan};
-        let config = IndexConfig::new(1, Metric::L2).unwrap();
-        let mut plans = vec![PartitionPlan {
-            key: PartitionKey::new(1).unwrap(),
-            level: 1,
-            centroid: vec![999.0].into_boxed_slice(),
-            entries: vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")],
-        }];
-        let before = plans[0].entries.clone();
-        let records = vec![
-            ConstructionRecord {
-                id: before[0].clone(),
-                vector: vec![2.0].into_boxed_slice(),
-            },
-            ConstructionRecord {
-                id: before[1].clone(),
-                vector: vec![4.0].into_boxed_slice(),
-            },
-        ];
-        refine_plans(&config, [0; 32], records, &mut plans, 0, &|| Ok(())).unwrap();
-        assert_eq!(plans[0].entries, before);
-        let kernel = VectorKernel::new(1, Metric::L2, [0; 32]).unwrap();
-        let expected = mean(
-            &kernel,
-            [
-                kernel.preprocess(&[2.0]).unwrap(),
-                kernel.preprocess(&[4.0]).unwrap(),
-            ]
-            .iter()
-            .map(AsRef::as_ref),
-        )
-        .unwrap();
-        assert_eq!(plans[0].centroid, expected);
-    }
-
-    #[test]
-    fn refinement_improves_assignment_and_respects_occupancy() {
-        let kernel = VectorKernel::new(1, crate::api::Metric::L2, [0; 32]).unwrap();
-        let vectors: Vec<Box<[f32]>> = [0.0, 1.0, 9.0, 10.0]
-            .into_iter()
-            .map(|x| vec![x].into())
-            .collect();
-        let mut leaves = vec![
-            Part {
-                parent: None,
-                children: vec![],
-                key: PartitionKey::new(2).unwrap(),
-                level: 1,
-                members: vec![0, 2],
-                center: vec![4.5].into(),
-            },
-            Part {
-                parent: None,
-                children: vec![],
-                key: PartitionKey::new(3).unwrap(),
-                level: 1,
-                members: vec![1, 3],
-                center: vec![5.5].into(),
-            },
-        ];
-        let options = RefineOptions::new(100).unwrap();
-        let mut moves = Vec::new();
-        refine(
-            &|| Ok(()),
-            &kernel,
-            &vectors,
-            &mut leaves,
-            2,
-            2,
-            options.rounds,
-            |round, position, source, target| moves.push((round, position, source, target)),
-        )
-        .unwrap();
-        assert_eq!(leaves[0].members, [0, 2]); // A full target cannot accept a move.
-        assert!(moves.is_empty());
-        refine(
-            &|| Ok(()),
-            &kernel,
-            &vectors,
-            &mut leaves,
-            1,
-            3,
-            options.rounds,
-            |round, position, source, target| moves.push((round, position, source, target)),
-        )
-        .unwrap();
-        assert_eq!(leaves[0].members, [0, 1]);
-        assert_eq!(leaves[1].members, [2, 3]);
-        assert_eq!(leaves[0].center.as_ref(), [0.5]);
-        assert_eq!(leaves[1].center.as_ref(), [9.5]);
-        assert_eq!(
-            moves,
-            [
-                (0, 1, leaves[1].key, leaves[0].key),
-                (0, 2, leaves[0].key, leaves[1].key),
-            ]
-        );
-    }
-
-    #[test]
-    fn refinement_batches_preserve_target_mapping_and_tail_neighbors() {
-        let kernel = VectorKernel::new(1, crate::api::Metric::L2, [0; 32]).unwrap();
-        let vectors: Vec<Box<[f32]>> = (0..9)
-            .flat_map(|cluster| {
-                [-0.1, 0.0, 0.1].map(|offset| vec![cluster as f32 * 10.0 + offset].into())
-            })
-            .collect();
-        // Exchange one member between adjacent clusters. The ninth leaf is
-        // unchanged and exercises the centroid and candidate batch tails.
-        let mut leaves: Vec<_> = (0..9)
-            .map(|cluster| Part {
-                parent: None,
-                children: vec![],
-                key: PartitionKey::new(cluster as u64 + 2).unwrap(),
-                level: 1,
-                members: (cluster * 3..cluster * 3 + 3).collect(),
-                center: vec![cluster as f32 * 10.0].into(),
-            })
-            .collect();
-        for pair in leaves[..8].as_chunks_mut::<2>().0 {
-            let (left, right) = pair.split_at_mut(1);
-            std::mem::swap(&mut left[0].members[2], &mut right[0].members[2]);
-        }
-        let options = RefineOptions::new(4096).unwrap();
-        refine(
-            &|| Ok(()),
-            &kernel,
-            &vectors,
-            &mut leaves,
-            1,
-            5,
-            options.rounds,
-            |_, _, _, _| {},
-        )
-        .unwrap();
-        for (cluster, leaf) in leaves.iter().enumerate() {
-            assert_eq!(
-                leaf.members,
-                (cluster * 3..cluster * 3 + 3).collect::<Vec<_>>(),
-                "cluster={cluster}"
-            );
-        }
-    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropped_planning_cancels_only_its_child_and_retains_admission() {

@@ -196,6 +196,7 @@ async fn seeded_interleaving_with_background_fixups_converges() {
 fn index_config() -> IndexConfig {
     IndexConfig::new(DIMENSION, Metric::L2)
         .expect("valid dimension")
+        .without_local_graph()
         .with_fields(vec![
             FieldSchema::new("bucket", DataType::I64).expect("valid field"),
         ])
@@ -296,7 +297,15 @@ async fn run_script(task: usize, script: Vec<Op>, index: Index<MemoryBackend>) -
                 // Hits legitimately vary with the interleaving; only the
                 // bound is stable.
                 let outcome = index
-                    .search(SearchRequest::new(vector_arc(&vector), k).expect("valid search"))
+                    .search(
+                        SearchRequest::new(vector_arc(&vector), k)
+                            .expect("valid search")
+                            .with_options(
+                                ktann::api::SearchOptions::default()
+                                    .with_routing_mode(ktann::api::RoutingMode::Exact)
+                                    .unwrap(),
+                            ),
+                    )
                     .await
                     .unwrap_or_else(|error| {
                         panic!("task {task} step {step}: search failed: {error:?}")

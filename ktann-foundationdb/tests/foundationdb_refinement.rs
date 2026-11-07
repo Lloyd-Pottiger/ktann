@@ -21,6 +21,8 @@ async fn foundationdb_refinement_preserves_membership_and_snapshots() {
             BackendNamespace::new(&namespace).unwrap(),
         )
     };
-    contract::run(open(), open()).await;
+    for graph in [false, true] {
+        contract::run(open(), open(), graph).await;
+    }
     support::clear_test_keys(&open()).await;
 }

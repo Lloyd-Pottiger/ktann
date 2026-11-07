@@ -29,7 +29,6 @@ struct BodyKey(LogicalIndexId, TreeKey, PartitionKey);
 /// of a waiter while its detached native computation is still running.
 pub(crate) struct GraphBodyGuards {
     _guards: Vec<OwnedMutexGuard<()>>,
-    pub(crate) waited: bool,
 }
 
 impl GraphMaintenance {
@@ -58,7 +57,8 @@ impl GraphMaintenance {
 
     /// Coordinates only overlapping graph bodies. Sorted acquisition prevents
     /// multi-body drains from deadlocking; weak entries bound the registry to
-    /// active participants plus the last acquisition's keys.
+    /// active participants plus the last acquisition's keys. Callers must release
+    /// backend transactions before waiting here: body owners may need their slots.
     pub(crate) async fn lock_bodies(
         &self,
         index: LogicalIndexId,
@@ -92,19 +92,12 @@ impl GraphMaintenance {
         };
         let mut guards = GraphBodyGuards {
             _guards: Vec::with_capacity(locks.len()),
-            waited: false,
         };
         for lock in locks {
-            let guard = match Arc::clone(&lock).try_lock_owned() {
-                Ok(guard) => guard,
-                Err(_) => {
-                    guards.waited = true;
-                    tokio::select! {
-                        biased;
-                        () = self.cancellation.cancelled() => return Err(Error::new(ErrorKind::Cancelled)),
-                        guard = lock.lock_owned() => guard,
-                    }
-                }
+            let guard = tokio::select! {
+                biased;
+                _ = self.cancellation.cancelled() => return Err(Error::new(ErrorKind::Cancelled)),
+                guard = lock.lock_owned() => guard,
             };
             guards._guards.push(guard);
         }

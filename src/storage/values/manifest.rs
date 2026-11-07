@@ -393,7 +393,7 @@ pub(super) fn decode_index_manifest(decoder: &mut Decoder) -> Result<IndexManife
         .map_err(|_| corrupt())?;
     let config = match graph {
         Some(graph) => config.with_local_graph(graph),
-        None => config,
+        None => config.without_local_graph(),
     };
     IndexManifest::new(
         lifecycle,

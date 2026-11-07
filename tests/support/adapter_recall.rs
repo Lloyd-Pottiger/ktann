@@ -222,7 +222,7 @@ pub async fn run<B: Backend>(backend: B, base: Vec<Arc<[f32]>>, queries: Vec<Arc
     );
 
     // A single exact match must remain reachable even when the closest initial
-    // beam does not contain it. This uses the default production Exact policy
+    // beam does not contain it. This explicitly selects the Exact policy
     // on each real adapter, including its snapshot and predicate implementation.
     let target = base.len() - 1;
     for query in &queries {
@@ -230,6 +230,8 @@ pub async fn run<B: Backend>(backend: B, base: Vec<Arc<[f32]>>, queries: Vec<Arc
             .expect("request")
             .with_options(
                 SearchOptions::default()
+                    .with_routing_mode(ktann::api::RoutingMode::Exact)
+                    .expect("exact routing")
                     .with_leaf_beam_size(1)
                     .expect("beam"),
             )

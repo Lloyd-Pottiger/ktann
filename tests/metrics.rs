@@ -63,6 +63,7 @@ fn delta(
 fn index_config() -> IndexConfig {
     IndexConfig::new(1, Metric::L2)
         .expect("valid dimension")
+        .without_local_graph()
         .with_fields(vec![
             FieldSchema::new("bucket", DataType::I64).expect("field"),
         ])
@@ -235,7 +236,15 @@ async fn operations_record_the_documented_series() {
     // Searches: one with sufficient budgets, one with a partition budget
     // of one that must report exhaustion.
     index
-        .search(SearchRequest::new(Arc::from([3.1_f32]), 1).expect("request"))
+        .search(
+            SearchRequest::new(Arc::from([3.1_f32]), 1)
+                .expect("request")
+                .with_options(
+                    SearchOptions::default()
+                        .with_routing_mode(ktann::api::RoutingMode::Exact)
+                        .unwrap(),
+                ),
+        )
         .await
         .expect("search");
     let tight = index
@@ -244,6 +253,8 @@ async fn operations_record_the_documented_series() {
                 .expect("request")
                 .with_options(
                     SearchOptions::default()
+                        .with_routing_mode(ktann::api::RoutingMode::Exact)
+                        .unwrap()
                         .with_visited_partitions(1)
                         .expect("valid budget"),
                 ),

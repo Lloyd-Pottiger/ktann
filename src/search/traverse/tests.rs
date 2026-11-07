@@ -346,6 +346,7 @@ fn manifest() -> IndexManifest {
         .collect();
     let config = IndexConfig::new(DIMENSION, Metric::L2)
         .expect("valid config")
+        .without_local_graph()
         .with_fields(fields)
         .expect("valid fields")
         .with_tree_key_fields(vec![FieldId(0)])
