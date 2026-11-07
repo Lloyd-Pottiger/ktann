@@ -15,6 +15,7 @@ use xxhash_rust::xxh3::xxh3_128_with_seed;
 
 use crate::api::{Error, ErrorKind, IndexConfig, PartitionKey, Result, validate_id};
 use crate::search::numeric::VectorKernel;
+use crate::storage::values::PartitionCentroid;
 
 const BUFFER_BYTES: usize = 8 * 1024;
 // Conservative row-slot and allocation overhead shared by memory planning.
@@ -100,8 +101,8 @@ pub struct PartitionPlan {
     pub key: PartitionKey,
     /// Leaves have level 1; every child is exactly one level below its parent.
     pub level: u32,
-    /// Full-f32 mean of all assigned entries; the root does not persist this value.
-    pub centroid: Box<[f32]>,
+    /// Complete routing model of all assigned entries; the root does not persist it.
+    pub centroid: PartitionCentroid,
     /// Final assignments, in canonical identity order.
     pub entries: Vec<Bytes>,
 }
@@ -442,6 +443,11 @@ impl Workspace<'_> {
             .into_iter()
             .map(|sum| (sum / count as f64) as f32)
             .collect();
+        let dispersion = if level == 1 {
+            self.kernel.leaf_dispersion(&mean)
+        } else {
+            0.0
+        };
         let centroid = self.kernel.normalize_centroid(&mean)?;
         if let Some(parents) = parents {
             self.append(parents, &key.get().to_be_bytes(), &centroid)?;
@@ -449,7 +455,7 @@ impl Workspace<'_> {
         emit(PartitionPlan {
             key,
             level,
-            centroid,
+            centroid: PartitionCentroid::with_dispersion(centroid, dispersion)?,
             entries,
         })?;
         self.report.partitions = self
@@ -978,6 +984,7 @@ mod tests {
                             leaves.push((
                                 key,
                                 plan.centroid
+                                    .components()
                                     .iter()
                                     .map(|v| v.to_bits())
                                     .collect::<Vec<_>>(),
@@ -1038,7 +1045,12 @@ mod tests {
                         assert!(plan.entries.len() >= 2);
                     }
                     assert!(plan.entries.windows(2).all(|pair| pair[0] < pair[1]));
-                    assert!(plan.centroid.iter().all(|value| value.is_finite()));
+                    assert!(
+                        plan.centroid
+                            .components()
+                            .iter()
+                            .all(|value| value.is_finite())
+                    );
                     for id in &plan.entries {
                         if plan.level == 1 {
                             assert!(members.insert(id.clone()));
@@ -1165,6 +1177,7 @@ mod tests {
                                 (
                                     plan.level,
                                     plan.centroid
+                                        .components()
                                         .iter()
                                         .map(|value| value.to_bits())
                                         .collect::<Vec<_>>(),
@@ -1244,7 +1257,7 @@ mod tests {
                             kernel.preprocess(&originals[id]).unwrap()
                         } else {
                             let key = u64::from_be_bytes(id.as_ref().try_into().unwrap());
-                            plans[&key].centroid.clone()
+                            Box::from(plans[&key].centroid.components())
                         };
                         kernel.normalize_centroid(&vector).unwrap()
                     })
@@ -1256,8 +1269,17 @@ mod tests {
                     })
                     .collect();
                 let expected = kernel.normalize_centroid(&mean).unwrap();
+                let sigma = if metric == Metric::Cosine && plan.level == 1 {
+                    (1.0 - mean.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>())
+                        .clamp(0.0, 1.0)
+                        .sqrt()
+                } else {
+                    0.0
+                };
+                assert_eq!(plan.centroid.dispersion(), sigma);
                 assert_eq!(
-                    plan.centroid, expected,
+                    plan.centroid.components(),
+                    expected.as_ref(),
                     "full membership mean, not sample mean"
                 );
             }
@@ -1451,6 +1473,7 @@ mod tests {
                         key,
                         plan.level,
                         plan.centroid
+                            .components()
                             .iter()
                             .map(|v| v.to_bits())
                             .collect::<Vec<_>>(),
@@ -1522,6 +1545,7 @@ mod tests {
                         (
                             plan.level,
                             plan.centroid
+                                .components()
                                 .iter()
                                 .map(|v| v.to_bits())
                                 .collect::<Vec<_>>(),

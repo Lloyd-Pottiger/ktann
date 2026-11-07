@@ -281,12 +281,13 @@ impl GraphTransitionSource {
         self.prepare_inner(next_header, next, working_bytes, check, false)
     }
 
-    /// Rebuilds graph topology for new centroid coordinates, after validating the
-    /// old persisted graph. Incremental edge updates require immutable centroids.
+    /// Publishes new routing models after validating the old persisted graph.
+    /// Coordinate changes rebuild topology; scalar-only changes rebind the existing
+    /// geometric graph to the new parent epoch without retraining its edges.
     /// The caller admits the update copies and replacement Child Entries before allocation.
     pub(crate) fn prepare_centroid_update(
         self,
-        updates: Vec<(PartitionKey, Box<[f32]>)>,
+        updates: Vec<(PartitionKey, crate::storage::values::PartitionCentroid)>,
         working_bytes: usize,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<PreparedGraphTransition> {
@@ -296,17 +297,19 @@ impl GraphTransitionSource {
             return Err(Error::invalid_argument());
         }
         let mut next = self.children.clone();
+        let mut geometry_changed = false;
         for (child, center) in updates {
             check()?;
             let position = next
                 .binary_search_by_key(&child, ChildEntry::child)
                 .map_err(|_| corrupt())?;
-            if next[position].centroid() != center.as_ref() {
+            if next[position].model() != &center {
+                geometry_changed |= next[position].centroid() != center.components();
                 header = super::membership::touched_entry(header)?;
-                next[position] = ChildEntry::new(child, center);
+                next[position] = ChildEntry::from_centroid(child, center);
             }
         }
-        self.prepare_inner(Some(header), next, working_bytes, check, true)
+        self.prepare_inner(Some(header), next, working_bytes, check, geometry_changed)
     }
 
     fn prepare_inner(

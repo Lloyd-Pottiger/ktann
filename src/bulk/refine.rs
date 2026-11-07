@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use crate::api::{Error, ErrorKind, PartitionKey, Result};
 use crate::refinement::{Part, Planner};
+use crate::storage::values::PartitionCentroid;
 
 fn corrupt() -> Error {
     Error::new(ErrorKind::Corruption)
@@ -59,7 +60,7 @@ pub(crate) fn refine_plans(
             key: plan.key,
             parent: None,
             level: plan.level,
-            center: std::mem::take(&mut plan.centroid),
+            centroid: std::mem::replace(&mut plan.centroid, PartitionCentroid::new([])),
             members,
             children,
         });
@@ -68,7 +69,7 @@ pub(crate) fn refine_plans(
     for plan in plans {
         check()?;
         let part = &mut parts[positions[&plan.key]];
-        plan.centroid = std::mem::take(&mut part.center);
+        plan.centroid = std::mem::replace(&mut part.centroid, PartitionCentroid::new([]));
         if plan.level == 1 {
             plan.entries = part.members.iter().map(|&i| ids[i].clone()).collect();
             plan.entries.sort();
@@ -91,7 +92,7 @@ mod tests {
         let mut plans = vec![PartitionPlan {
             key: PartitionKey::new(1).unwrap(),
             level: 1,
-            centroid: vec![999.0].into_boxed_slice(),
+            centroid: PartitionCentroid::new(vec![999.0]),
             entries: vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")],
         }];
         let before = plans[0].entries.clone();
@@ -109,6 +110,6 @@ mod tests {
         assert_eq!(plans[0].entries, before);
         let kernel = VectorKernel::new(1, Metric::L2, [0; 32]).unwrap();
         let expected = kernel.preprocess(&[3.0]).unwrap();
-        assert_eq!(plans[0].centroid, expected);
+        assert_eq!(plans[0].centroid.components(), expected.as_ref());
     }
 }

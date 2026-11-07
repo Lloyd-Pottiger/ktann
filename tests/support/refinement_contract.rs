@@ -19,12 +19,21 @@ pub async fn setup<B: Backend>(
     runtime_backend: B,
     graph: bool,
 ) -> (Runtime<B>, Index<B>, IndexManifest) {
+    setup_metric(backend, runtime_backend, graph, Metric::L2).await
+}
+
+pub async fn setup_metric<B: Backend>(
+    backend: &B,
+    runtime_backend: B,
+    graph: bool,
+    metric: Metric,
+) -> (Runtime<B>, Index<B>, IndexManifest) {
     let runtime = Runtime::new(
         runtime_backend,
         RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
     )
     .unwrap();
-    let config = IndexConfig::new(1, Metric::L2)
+    let config = IndexConfig::new(1, metric)
         .unwrap()
         .with_leaf_partition_entries(2, 8)
         .unwrap()
@@ -191,6 +200,6 @@ pub async fn assert_centroid_projection<T: ReadOps>(
     else {
         panic!("edge");
     };
-    assert_eq!(center.components(), child.centroid());
+    assert_eq!(&center, child.model());
     center
 }

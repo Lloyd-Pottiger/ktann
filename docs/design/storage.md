@@ -125,7 +125,11 @@ Active state; mutations update-protect that Manifest read.
 Offline refinement preserves the Active Manifest, Partition Keys and topology.
 Record relocation preserves exact membership, payloads and capacity constraints
 in bounded transactions. Centroid replacement atomically updates the centroid,
-incoming parent projection and parent Header cache epoch. The operation has no
+incoming parent projection and parent Header cache epoch. The centroid model
+includes one finite f64 dispersion in [0, 1], canonically encoded after its f32
+coordinates (negative zero is rejected). Child Entries duplicate the complete
+model. A scalar-only change also advances the parent epoch and publishes the
+matching graph binding. Both fields remain immutable during foreground writes. The operation has no
 additional persistent lifecycle state.
 
 FoundationDB may atomically clear the complete data range and remove the

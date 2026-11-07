@@ -2,13 +2,14 @@
 use super::files::corrupt;
 use crate::api::{IndexConfig, MAX_RECORD_ID_BYTES, PartitionKey, Result};
 use crate::construction::PartitionPlan;
+use crate::storage::values::PartitionCentroid;
 use bytes::Bytes;
 
 pub(super) fn encode(plan: &PartitionPlan, bytes: &mut Vec<u8>) {
     bytes.extend_from_slice(&plan.key.get().to_be_bytes());
     bytes.extend_from_slice(&plan.level.to_be_bytes());
     bytes.extend_from_slice(&(plan.entries.len() as u32).to_be_bytes());
-    for component in &plan.centroid {
+    for component in plan.centroid.components() {
         bytes.extend_from_slice(
             &if *component == 0.0 {
                 0
@@ -18,6 +19,7 @@ pub(super) fn encode(plan: &PartitionPlan, bytes: &mut Vec<u8>) {
             .to_be_bytes(),
         );
     }
+    bytes.extend_from_slice(&plan.centroid.dispersion().to_bits().to_be_bytes());
     for entry in &plan.entries {
         bytes.extend_from_slice(&(entry.len() as u16).to_be_bytes());
         bytes.extend_from_slice(entry);
@@ -30,7 +32,7 @@ pub(super) fn decode(mut bytes: Bytes, config: &IndexConfig) -> Result<Partition
     use bytes::Buf;
     let dimension = config.dimension();
 
-    if bytes.len() < 16 + dimension * 4 {
+    if bytes.len() < 24 + dimension * 4 {
         return Err(corrupt());
     }
     let key = PartitionKey::new(bytes.get_u64()).map_err(|_| corrupt())?;
@@ -48,6 +50,13 @@ pub(super) fn decode(mut bytes: Bytes, config: &IndexConfig) -> Result<Partition
         }
         centroid.push(value);
     }
+    let bits = bytes.get_u64();
+    let dispersion = f64::from_bits(bits);
+    if bits == (-0.0_f64).to_bits() || (level != 1 && dispersion != 0.0) {
+        return Err(corrupt());
+    }
+    let centroid =
+        PartitionCentroid::with_dispersion(centroid, dispersion).map_err(|_| corrupt())?;
     // Check a minimum body size before allocating the entry inventory.
     if count as usize > bytes.len() / 3 {
         return Err(corrupt());
@@ -79,7 +88,7 @@ pub(super) fn decode(mut bytes: Bytes, config: &IndexConfig) -> Result<Partition
     Ok(PartitionPlan {
         key,
         level,
-        centroid: centroid.into_boxed_slice(),
+        centroid,
         entries,
     })
 }

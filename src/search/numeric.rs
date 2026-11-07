@@ -87,6 +87,31 @@ impl VectorKernel {
         self.dimension
     }
 
+    /// Dispersion of unit vectors from their unnormalized mean, before centroid normalization.
+    pub(crate) fn leaf_dispersion(&self, mean: &[f32]) -> f64 {
+        if self.is_cosine() {
+            (1.0 - mean.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>())
+                .clamp(0.0, 1.0)
+                .sqrt()
+        } else {
+            0.0
+        }
+    }
+
+    /// Query-only leaf preference, not a distance bound for pruning or reranking.
+    /// The fixed cosine weight penalizes diffuse leaves; build and write distances stay geometric.
+    pub(crate) fn leaf_routing_score(
+        &self,
+        distance: f64,
+        child: &crate::storage::values::ChildEntry,
+    ) -> f64 {
+        if self.is_cosine() && child.model().dispersion() > 0.0 {
+            distance + 0.1 * child.model().dispersion()
+        } else {
+            distance
+        }
+    }
+
     /// Returns whether this kernel uses cosine routing semantics.
     pub(crate) const fn is_cosine(&self) -> bool {
         matches!(self.metric, Metric::Cosine)

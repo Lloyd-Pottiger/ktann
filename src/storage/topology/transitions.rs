@@ -341,9 +341,9 @@ pub(crate) async fn expose_split_targets_with_parent<T: WriteTxn>(
                         partition: *parent,
                         child: target,
                     },
-                    PersistentValue::ChildEntry(ChildEntry::new(
+                    PersistentValue::ChildEntry(ChildEntry::from_centroid(
                         target,
-                        centroid.components().to_vec(),
+                        centroid.clone(),
                     )),
                 )
                 .await?,
@@ -390,7 +390,7 @@ pub(crate) async fn update_centroid<T: WriteTxn>(
     tree_key: &TreeKey,
     partition: PartitionKey,
     parent: PartitionKey,
-    centroid: Box<[f32]>,
+    centroid: PartitionCentroid,
 ) -> Result<()> {
     if partition == root_partition() || partition == parent {
         return Err(corrupt());
@@ -454,22 +454,22 @@ pub(crate) async fn update_centroid<T: WriteTxn>(
         || parent_header.state() != PartitionState::Ready
         || child_header.level().checked_add(1) != Some(parent_header.level())
         || edge.child() != partition
-        || edge.centroid() != old_centroid.components()
+        || edge.model() != &old_centroid
     {
         return Err(corrupt());
     }
-    if centroid.as_ref() == old_centroid.components() {
+    if centroid == old_centroid {
         return Ok(());
     }
     let parent_header = touched_entry(parent_header)?;
     txn.put(
         centroid_key,
-        PersistentValue::PartitionCentroid(PartitionCentroid::new(centroid.clone())),
+        PersistentValue::PartitionCentroid(centroid.clone()),
     )
     .await?;
     txn.put(
         edge_key,
-        PersistentValue::ChildEntry(ChildEntry::new(partition, centroid)),
+        PersistentValue::ChildEntry(ChildEntry::from_centroid(partition, centroid)),
     )
     .await?;
     txn.put(
@@ -640,9 +640,9 @@ pub(crate) async fn finalize_split_with_parent<T: WriteTxn>(
                         partition: root_partition(),
                         child: target,
                     },
-                    PersistentValue::ChildEntry(ChildEntry::new(
+                    PersistentValue::ChildEntry(ChildEntry::from_centroid(
                         target,
-                        centroid.components().to_vec(),
+                        centroid.clone(),
                     )),
                 )
                 .await?,

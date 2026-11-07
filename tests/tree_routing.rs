@@ -1060,8 +1060,9 @@ async fn grouped_write_routing_rejects_nonfinite_child_centroids() {
             .expect("read entry")
             .expect("entry exists")
             .to_vec();
-        let offset = encoded.len() - size_of::<f32>();
-        encoded[offset..].copy_from_slice(&component.to_bits().to_be_bytes());
+        let offset = encoded.len() - size_of::<f64>() - size_of::<f32>();
+        encoded[offset..offset + size_of::<f32>()]
+            .copy_from_slice(&component.to_bits().to_be_bytes());
         raw.put(entry_key.clone(), Bytes::from(encoded))
             .await
             .expect("corrupt entry");

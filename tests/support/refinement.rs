@@ -20,7 +20,7 @@ pub fn tree_key() -> TreeKey {
 
 /// Seeds real encoded records through the index, then exposes two Ready leaves.
 ///
-/// Requires a fresh one-dimensional L2 index with no fields and maintenance
+/// Requires a fresh one-dimensional L2 or cosine index with no fields and maintenance
 /// disabled. Leaf 2 contains [-4,-3,-2,4], leaf 3 contains [2,3,4,-4].
 /// Dimension-one rotation is identity. Routing centers are deliberately stale
 /// (-9 and 9), but stored centroids, projections and optional graphs agree.

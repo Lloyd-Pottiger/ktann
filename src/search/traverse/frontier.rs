@@ -443,7 +443,7 @@ impl Frontier {
                     tree,
                     level - 1,
                     child.child(),
-                    distance,
+                    context.kernel.leaf_routing_score(distance, child),
                     context.request.leaf_beam,
                 )?;
             }

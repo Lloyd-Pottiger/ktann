@@ -292,7 +292,11 @@ fn forest_shape(artifact: &ktann::bulk::ForestArtifact) -> ForestShape {
                 (row.tree_key.as_bytes().to_vec(), plan.key.get()),
                 (
                     plan.level,
-                    plan.centroid.iter().map(|x| x.to_bits()).collect(),
+                    plan.centroid
+                        .components()
+                        .iter()
+                        .map(|x| x.to_bits())
+                        .collect(),
                     plan.entries,
                 ),
             )
@@ -371,7 +375,11 @@ fn forest_globally_groups_exact_membership_and_matches_independent_tree_builds()
                         (tree.clone(), plan.key.get()),
                         (
                             plan.level,
-                            plan.centroid.iter().map(|x| x.to_bits()).collect(),
+                            plan.centroid
+                                .components()
+                                .iter()
+                                .map(|x| x.to_bits())
+                                .collect(),
                             plan.entries,
                         ),
                     );

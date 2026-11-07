@@ -366,3 +366,107 @@ async fn graph_refinement_respects_the_runtime_preparation_budget() {
     assert_eq!(backend.history().len(), history);
     bounded.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cosine_dispersion_is_snapshot_bound_and_survives_reopen() {
+    use ktann::api::{Metric, RuntimeConfig, SearchRequest};
+    use ktann::runtime::Runtime;
+    for graph in [false, true] {
+        let backend = MemoryBackend::new();
+        let (runtime, index, manifest) =
+            contract::setup_metric(&backend, backend.clone(), graph, Metric::Cosine).await;
+        let mut before = ReadLogicalTxn::for_index(backend.begin_read().await.unwrap(), &manifest);
+        let old =
+            contract::assert_centroid_projection(&mut before, index.logical_index_id(), 2).await;
+        assert_eq!(old.dispersion(), 0.0);
+        index
+            .refine(
+                RefineOptions::new(4 << 20)
+                    .unwrap()
+                    .with_refinement_rounds(0)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut after = ReadLogicalTxn::for_index(backend.begin_read().await.unwrap(), &manifest);
+        for leaf in [2, 3] {
+            let model =
+                contract::assert_centroid_projection(&mut after, index.logical_index_id(), leaf)
+                    .await;
+            assert!((model.dispersion() - 0.75_f64.sqrt()).abs() < 1e-12);
+        }
+        assert_eq!(
+            contract::assert_centroid_projection(&mut before, index.logical_index_id(), 2).await,
+            old
+        );
+        let query = SearchRequest::new(vec![1.0], 4).unwrap().with_options(
+            ktann::api::SearchOptions::default()
+                .with_routing_mode(if graph {
+                    ktann::api::RoutingMode::PartitionLocalHnsw { ef_search: 64 }
+                } else {
+                    ktann::api::RoutingMode::Exact
+                })
+                .unwrap(),
+        );
+        // Warm routing, then change only dispersion: the remaining mean still points negative.
+        index.search(query.clone()).await.unwrap();
+        let parent_key = LogicalKey::Header {
+            index: index.logical_index_id(),
+            tree_key: fixture::tree_key(),
+            partition: fixture::partition(1),
+        };
+        let old_parent = after.get(parent_key.clone()).await.unwrap();
+        assert!(
+            index
+                .delete(bytes::Bytes::from_static(b"r\0"))
+                .await
+                .unwrap()
+        );
+        index
+            .refine(
+                RefineOptions::new(4 << 20)
+                    .unwrap()
+                    .with_refinement_rounds(0)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut fresh = ReadLogicalTxn::for_index(backend.begin_read().await.unwrap(), &manifest);
+        let model =
+            contract::assert_centroid_projection(&mut fresh, index.logical_index_id(), 2).await;
+        assert_eq!(model.components(), &[-1.0]);
+        assert!((model.dispersion() - (8.0_f64 / 9.0).sqrt()).abs() < 1e-7);
+        assert_ne!(fresh.get(parent_key).await.unwrap(), old_parent);
+        // A retained snapshot still has the previous scalar and projection.
+        assert!(
+            (contract::assert_centroid_projection(&mut after, index.logical_index_id(), 2)
+                .await
+                .dispersion()
+                - 0.75_f64.sqrt())
+            .abs()
+                < 1e-12
+        );
+        drop(fresh);
+        let expected = index.search(query.clone()).await.unwrap().hits;
+        contract::verify(&index).await;
+        drop((before, after));
+        runtime.shutdown().await.unwrap();
+        let reopened = Runtime::new(
+            backend.clone(),
+            RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
+        )
+        .unwrap();
+        let index = reopened.open_index("offline-refinement").await.unwrap();
+        let hits = index.search(query).await.unwrap().hits;
+        assert_eq!(
+            hits.iter()
+                .map(|h| (h.id(), h.distance().to_bits()))
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|h| (h.id(), h.distance().to_bits()))
+                .collect::<Vec<_>>()
+        );
+        reopened.shutdown().await.unwrap();
+    }
+}

@@ -657,3 +657,50 @@ fn immutable_graph_supports_parallel_queries_with_separate_scratch() {
 
 #[path = "persistence_tests.rs"]
 mod persistence_tests;
+
+#[test]
+fn dispersion_changes_query_navigation_but_not_write_routing() {
+    use crate::storage::values::PartitionCentroid;
+    let rows = vec![
+        ChildEntry::from_centroid(
+            key(2),
+            PartitionCentroid::with_dispersion(vec![1.0, 0.0], 1.0).unwrap(),
+        ),
+        ChildEntry::new(key(3), vec![0.95, 0.3122499]),
+    ];
+    for metric in [Metric::Cosine, Metric::L2, Metric::InnerProduct] {
+        let kernel = VectorKernel::new(2, metric, [0; 32]).unwrap();
+        let graph = build(&kernel, &rows, params());
+        let mut scratch = Workspace::new(rows.len(), params().m, MEMORY).unwrap();
+        let query = [1.0, 0.0];
+        let (hits, _) = graph
+            .search(&query, 1, 2, MEMORY, &mut scratch, &|| Ok(()))
+            .unwrap();
+        let exact = graph
+            .centroids
+            .exact(&query, 1, MEMORY, &|| Ok(()))
+            .unwrap();
+        assert_eq!(hits, exact);
+        assert_eq!(hits[0].node, u32::from(metric == Metric::Cosine));
+        let (writes, _) = search_graph_scoring(
+            graph.centroids,
+            &graph.graph,
+            &query,
+            1,
+            2,
+            MEMORY,
+            &mut scratch,
+            &|| Ok(()),
+            true,
+        )
+        .unwrap();
+        assert_eq!(writes[0].node, 0);
+        assert_eq!(
+            writes[0].distance.to_bits(),
+            kernel
+                .routing_distance(&query, rows[0].centroid())
+                .unwrap()
+                .to_bits()
+        );
+    }
+}

@@ -481,7 +481,7 @@ impl ForestArtifact {
     pub fn reader(&self) -> Result<ForestReader> {
         let maximum_frame = 4
             + MAX_TREE_KEY_BYTES
-            + 16
+            + 24
             + self.config.dimension() * 4
             + self
                 .config

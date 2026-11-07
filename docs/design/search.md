@@ -16,9 +16,23 @@ the persisted rotation. Internal centroids are full-f32 routing vectors. Routing
 ranks a partition's Child Entries by the f64 routing distance between the
 preprocessed vector and each persisted centroid: squared Euclidean distance for
 L2, negated dot product for inner product, and negated dot product for cosine.
+For cosine leaf selection, both Exact and HNSW query routing add
+`0.1 * sigma` to the negated dot product. HNSW uses this score during navigation,
+not as a second candidate rerank. `sigma = sqrt(clamp(1 - ||mean(unit members)||²,
+0, 1))` is computed before normalizing a leaf centroid. Other metrics, internal
+partition models, graph construction, and foreground write routing use the
+uncorrected geometric distance. Exact record reranking is unchanged. Search beam
+width remains caller-controlled; no workload-specific beam reduction is implicit.
+
+The scalar is a training-snapshot model, not a live aggregate. Bulk construction,
+split training and offline refinement compute it from the same members as the
+centroid. Ordinary insert/delete/relocation can make both stale; no per-record
+aggregate writes or extra query IO are introduced. A zero scalar preserves the
+original distance bits, including signed zero.
+
 Cosine records are normalized during preprocessing and cosine split centroids
 are normalized after their arithmetic mean is trained; a zero centroid remains
-zero and uses a neutral distance of zero. Distance ties resolve to the smaller
+zero and has geometric distance zero before the leaf correction. Distance ties resolve to the smaller
 Partition Key. Scalar and batched routing share the deterministic f64 reduction in
 [`VectorKernel`](../../src/search/numeric.rs). Exact reranking uses a separate
 kernel over the unrotated original vector, accumulates in f64, and defines:

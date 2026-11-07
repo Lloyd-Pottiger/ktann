@@ -15,7 +15,9 @@ use crate::refinement::{Part, Planner};
 use crate::storage::backend::{Backend, ScanLimits};
 use crate::storage::graph_transitions::{GraphTransitionSource, protect_sources, publish_batch};
 use crate::storage::keys::{LogicalKey, TreeKey};
-use crate::storage::values::{IndexManifest, PartitionState, PartitionTransition, PersistentValue};
+use crate::storage::values::{
+    IndexManifest, PartitionCentroid, PartitionState, PartitionTransition, PersistentValue,
+};
 use crate::storage::{LogicalRange, LogicalScanCursor, LogicalScanPage, topology};
 
 use super::compute::controlled_compute;
@@ -176,7 +178,7 @@ async fn load<B: Backend>(
                 key: partition,
                 parent,
                 level: header.level(),
-                center: vec![0.0; manifest.config().dimension()].into_boxed_slice(),
+                centroid: PartitionCentroid::new(vec![0.0; manifest.config().dimension()]),
                 members: Vec::new(),
                 children: Vec::new(),
             };
@@ -398,7 +400,7 @@ pub(crate) async fn run<B: Backend>(
                 |txn| {
                     let key = &tree.key;
                     Box::pin(async move {
-                        topology::update_centroid(txn, key, part.key, parent, part.center.clone())
+                        topology::update_centroid(txn, key, part.key, parent, part.centroid.clone())
                             .await
                     })
                 },
@@ -454,7 +456,7 @@ async fn publish_graph_centroids<B: Backend>(
             }
             let updates: Vec<_> = prefix
                 .iter()
-                .map(|part| (part.key, part.center.clone()))
+                .map(|part| (part.key, part.centroid.clone()))
                 .collect();
             let working_bytes = context.routing_working_bytes;
             let graphs = controlled_compute(
@@ -490,7 +492,7 @@ async fn publish_graph_centroids<B: Backend>(
                                 key,
                                 part.key,
                                 parent,
-                                part.center.clone(),
+                                part.centroid.clone(),
                             )
                             .await?;
                         }

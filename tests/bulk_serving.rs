@@ -435,7 +435,7 @@ fn serving_exact_joins_reject_validly_framed_but_wrong_membership_and_edges() {
                     .iter()
                     .map(|frame| {
                         4 + u32::from_be_bytes(frame[..4].try_into().unwrap()) as usize
-                            + 16
+                            + 24
                             + 12
                             + 2
                     })
@@ -452,7 +452,7 @@ fn serving_exact_joins_reject_validly_framed_but_wrong_membership_and_edges() {
                     let level = u32::from_be_bytes(root[12..16].try_into().unwrap());
                     root[12..16].copy_from_slice(&(level + 1).to_be_bytes());
                 } else {
-                    root[34..42].copy_from_slice(&1_u64.to_be_bytes());
+                    root[42..50].copy_from_slice(&1_u64.to_be_bytes());
                 }
             }
         });

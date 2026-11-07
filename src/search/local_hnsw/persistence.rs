@@ -65,6 +65,8 @@ pub(super) fn identity(
     }]);
     hash.update((centroids.kernel.dimension() as u64).to_be_bytes());
     hash.update((centroids.children.len() as u64).to_be_bytes());
+    // Topology depends only on geometric coordinates. Query dispersion is carried
+    // by the authoritative body and its cache epoch, not by geometric edge construction.
     // Batch canonical coordinates without retaining a second centroid body.
     let mut coordinates = [0_u8; 1024];
     for child in centroids.children {

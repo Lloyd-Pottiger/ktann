@@ -14,8 +14,8 @@ use crate::storage::graph_transitions::{
 use crate::storage::keys::{LogicalKey, TreeKey};
 use crate::storage::membership::{added_entry, removed_entry};
 use crate::storage::values::{
-    ChildEntry, IndexManifest, PartitionHeader, PartitionState, PartitionTransition,
-    PersistentValue, expect_centroid,
+    ChildEntry, IndexManifest, PartitionCentroid, PartitionHeader, PartitionState,
+    PartitionTransition, PersistentValue, expect_centroid,
 };
 use crate::storage::{LogicalRange, ReadLogicalTxn, WriteLogicalTxn, topology};
 
@@ -64,7 +64,7 @@ impl BodyPlan {
     fn add(
         &mut self,
         child: PartitionKey,
-        centroid: &[f32],
+        centroid: &PartitionCentroid,
         working_bytes: &mut usize,
     ) -> Result<()> {
         let position = self
@@ -73,9 +73,13 @@ impl BodyPlan {
             .err()
             .ok_or_else(corrupt)?;
         let header = added_entry(self.header.ok_or_else(corrupt)?)?;
-        admit_plan_entry(&mut self.children, centroid.len(), working_bytes)?;
+        admit_plan_entry(
+            &mut self.children,
+            centroid.components().len(),
+            working_bytes,
+        )?;
         self.children
-            .insert(position, ChildEntry::new(child, centroid.to_vec()));
+            .insert(position, ChildEntry::from_centroid(child, centroid.clone()));
         self.header = Some(header);
         Ok(())
     }
@@ -440,8 +444,8 @@ pub(crate) async fn advance_observed<'b, B: Backend>(
                     {
                         return Ok(fixup::Advance::Idle);
                     }
-                    body.add(left, centroids.left().components(), &mut read_bytes)?;
-                    body.add(right, centroids.right().components(), &mut read_bytes)?;
+                    body.add(left, centroids.left(), &mut read_bytes)?;
+                    body.add(right, centroids.right(), &mut read_bytes)?;
                     bodies.push(body);
                 }
                 Edit::Expose {
@@ -456,7 +460,7 @@ pub(crate) async fn advance_observed<'b, B: Backend>(
                 if partition == topology::root_partition() {
                     for target in [left, right] {
                         let centroid = centroid(&mut read, manifest, tree, target).await?;
-                        source_body.add(target, centroid.components(), &mut read_bytes)?;
+                        source_body.add(target, &centroid, &mut read_bytes)?;
                     }
                     let promoted = source_body.header.ok_or_else(corrupt)?;
                     source_body.header = Some(
@@ -533,7 +537,7 @@ pub(crate) async fn advance_observed<'b, B: Backend>(
                 let target = moves.first().ok_or_else(corrupt)?.1;
                 let mut receiver = BodyPlan::read(&mut read, tree, target, &mut read_bytes).await?;
                 for (entry, _) in &moves {
-                    receiver.add(entry.child(), entry.centroid(), &mut read_bytes)?;
+                    receiver.add(entry.child(), entry.model(), &mut read_bytes)?;
                 }
                 for (entry, _) in &moves {
                     source_body.remove(entry.child())?;
@@ -587,7 +591,7 @@ pub(crate) async fn advance_observed<'b, B: Backend>(
                     if body.header.ok_or_else(corrupt)?.entry_count() >= ceiling {
                         break;
                     }
-                    body.add(entry.child(), entry.centroid(), &mut read_bytes)?;
+                    body.add(entry.child(), entry.model(), &mut read_bytes)?;
                     admit_plan_entry(&mut moves, entry.centroid().len(), &mut read_bytes)?;
                     moves.push((entry.clone(), target));
                 }

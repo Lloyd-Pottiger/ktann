@@ -142,15 +142,15 @@ pub async fn train_split_centroids<T: ReadOps>(
     let trained = if header.level() == 1 {
         let entries = load_leaf_source(&mut txn, manifest, tree_key, source, &kernel).await?;
         drop(txn);
-        train(&kernel, entries)?
+        train(&kernel, header.level(), entries)?
     } else {
         let entries = load_internal_source(&mut txn, manifest, tree_key, source).await?;
         drop(txn);
-        train(&kernel, entries)?
+        train(&kernel, header.level(), entries)?
     };
     Ok(SplitCentroids {
-        left: PartitionCentroid::new(trained.left),
-        right: PartitionCentroid::new(trained.right),
+        left: trained.left,
+        right: trained.right,
     })
 }
 
@@ -242,8 +242,8 @@ async fn load_internal_source<T: ReadOps>(
 /// of Lloyd rounds run.
 #[derive(Clone, Debug, PartialEq)]
 struct TrainedSplit {
-    left: Box<[f32]>,
-    right: Box<[f32]>,
+    left: PartitionCentroid,
+    right: PartitionCentroid,
     /// The rounds actually run; consumed by the in-module training tests.
     #[allow(dead_code)]
     rounds: usize,
@@ -260,7 +260,11 @@ struct TrainedSplit {
 /// exposure. The split must still be able to advance on a valid persistent
 /// state, so an undersized set trains degenerate centroids: a single entry
 /// replicates as both centroids, and an empty source yields two zero vectors.
-fn train<I: Ord>(kernel: &VectorKernel, mut entries: Vec<(I, Box<[f32]>)>) -> Result<TrainedSplit> {
+fn train<I: Ord>(
+    kernel: &VectorKernel,
+    level: u32,
+    mut entries: Vec<(I, Box<[f32]>)>,
+) -> Result<TrainedSplit> {
     for (_, vector) in &entries {
         if vector.len() != kernel.dimension() || vector.iter().any(|c| !c.is_finite()) {
             return Err(Error::new(ErrorKind::Corruption));
@@ -275,16 +279,16 @@ fn train<I: Ord>(kernel: &VectorKernel, mut entries: Vec<(I, Box<[f32]>)>) -> Re
         0 => {
             let zero: Box<[f32]> = vec![0.0; kernel.dimension()].into();
             return Ok(TrainedSplit {
-                left: zero.clone(),
-                right: zero,
+                left: PartitionCentroid::new(zero.clone()),
+                right: PartitionCentroid::new(zero),
                 rounds: 0,
             });
         }
         1 => {
             let vector = &entries[0].1;
             return Ok(TrainedSplit {
-                left: vector.clone(),
-                right: vector.clone(),
+                left: PartitionCentroid::new(vector.clone()),
+                right: PartitionCentroid::new(vector.clone()),
                 rounds: 0,
             });
         }
@@ -305,19 +309,25 @@ fn train<I: Ord>(kernel: &VectorKernel, mut entries: Vec<(I, Box<[f32]>)>) -> Re
     let left_seed = farthest(&entries, &source, &distance)?;
     let right_seed = farthest(&entries, &entries[left_seed].1, &distance)?;
 
-    let mut left = entries[left_seed].1.clone();
-    let mut right = entries[right_seed].1.clone();
+    let mut left = PartitionCentroid::new(entries[left_seed].1.clone());
+    let mut right = PartitionCentroid::new(entries[right_seed].1.clone());
     let half = entries.len() / 2;
     let mut previous: Option<Vec<bool>> = None;
     let mut rounds = 0_usize;
     loop {
-        let assignment = assign(kernel, &entries, &left, &right, half)?;
+        let assignment = assign(
+            kernel,
+            &entries,
+            left.components(),
+            right.components(),
+            half,
+        )?;
         let stable = previous.as_ref() == Some(&assignment);
         // The same canonical membership produces byte-identical means. The
         // confirming round still counts, but has no centroid work to repeat.
         if !stable {
-            left = cluster_mean(kernel, &entries, &assignment, true)?;
-            right = cluster_mean(kernel, &entries, &assignment, false)?;
+            left = cluster_mean(kernel, level, &entries, &assignment, true)?;
+            right = cluster_mean(kernel, level, &entries, &assignment, false)?;
         }
         previous = Some(assignment);
         rounds += 1;
@@ -402,16 +412,17 @@ fn farthest<I, D: Fn(&[f32], &[f32]) -> Result<f64>>(
     Ok(farthest)
 }
 
-/// Computes one cluster's centroid from an assignment mask.
+/// Trains one cluster's routing model from an assignment mask and partition level.
 ///
 /// A balanced assignment never produces an empty cluster: `half >= 1` and
 /// `entries.len() - half >= 1` whenever training admits the entry set.
 fn cluster_mean<I>(
     kernel: &VectorKernel,
+    level: u32,
     entries: &[(I, Box<[f32]>)],
     assignment: &[bool],
     left: bool,
-) -> Result<Box<[f32]>> {
+) -> Result<PartitionCentroid> {
     let centroid = mean(
         kernel.dimension(),
         entries
@@ -421,9 +432,14 @@ fn cluster_mean<I>(
             .map(|(entry, _)| &*entry.1),
     )?;
     if kernel.is_cosine() {
-        kernel.normalize_centroid(&centroid)
+        let dispersion = if level == 1 {
+            kernel.leaf_dispersion(&centroid)
+        } else {
+            0.0
+        };
+        PartitionCentroid::with_dispersion(kernel.normalize_centroid(&centroid)?, dispersion)
     } else {
-        Ok(centroid)
+        Ok(PartitionCentroid::new(centroid))
     }
 }
 
@@ -489,11 +505,12 @@ mod tests {
         // already stable, so training stops after the confirming round.
         let trained = train(
             &kernel(1, Metric::L2),
+            1,
             entries(&[&[0.0], &[1.0], &[2.0], &[10.0]]),
         )
         .expect("trained");
-        assert_eq!(&*trained.left, &[6.0]);
-        assert_eq!(&*trained.right, &[0.5]);
+        assert_eq!(trained.left.components(), &[6.0]);
+        assert_eq!(trained.right.components(), &[0.5]);
         assert_eq!(trained.rounds, 2);
     }
 
@@ -503,8 +520,8 @@ mod tests {
         let mut shuffled = ordered.clone();
         shuffled.reverse();
         let kernel = kernel(1, Metric::L2);
-        let first = train(&kernel, ordered).expect("trained");
-        let second = train(&kernel, shuffled).expect("trained");
+        let first = train(&kernel, 1, ordered).expect("trained");
+        let second = train(&kernel, 1, shuffled).expect("trained");
         assert_eq!(first, second);
     }
 
@@ -538,10 +555,14 @@ mod tests {
     fn identical_entries_still_produce_finite_balanced_centroids() {
         // All distances and differences tie, so both seeds and the left
         // cluster resolve purely by canonical ID order.
-        let trained =
-            train(&kernel(1, Metric::L2), entries(&[&[5.0], &[5.0], &[5.0]])).expect("trained");
-        assert_eq!(&*trained.left, &[5.0]);
-        assert_eq!(&*trained.right, &[5.0]);
+        let trained = train(
+            &kernel(1, Metric::L2),
+            1,
+            entries(&[&[5.0], &[5.0], &[5.0]]),
+        )
+        .expect("trained");
+        assert_eq!(trained.left.components(), &[5.0]);
+        assert_eq!(trained.right.components(), &[5.0]);
         assert_eq!(trained.rounds, 2);
     }
 
@@ -550,16 +571,24 @@ mod tests {
         // In routing space cosine distance is the negated dot product between
         // unit vectors. The arithmetic mean of the right cluster is
         // `[-0.5, 0.5]`, so spherical training must persist its direction.
-        let trained = train(
-            &kernel(2, Metric::Cosine),
-            entries(&[&[1.0, 0.0], &[0.0, 1.0], &[-1.0, 0.0]]),
-        )
-        .expect("trained");
-        assert_eq!(&*trained.left, &[1.0, 0.0]);
-        let expected = std::f32::consts::FRAC_1_SQRT_2;
-        assert!((trained.right[0] + expected).abs() < 1e-6);
-        assert!((trained.right[1] - expected).abs() < 1e-6);
-        assert_eq!(trained.rounds, 2);
+        for level in [1, 2] {
+            let trained = train(
+                &kernel(2, Metric::Cosine),
+                level,
+                entries(&[&[1.0, 0.0], &[0.0, 1.0], &[-1.0, 0.0]]),
+            )
+            .expect("trained");
+            assert_eq!(trained.left.components(), &[1.0, 0.0]);
+            let expected = std::f32::consts::FRAC_1_SQRT_2;
+            assert!((trained.right.components()[0] + expected).abs() < 1e-6);
+            assert!((trained.right.components()[1] - expected).abs() < 1e-6);
+            assert_eq!(trained.rounds, 2);
+            assert_eq!(trained.left.dispersion(), 0.0);
+            assert_eq!(
+                trained.right.dispersion(),
+                if level == 1 { 0.5_f64.sqrt() } else { 0.0 }
+            );
+        }
     }
 
     #[test]
@@ -567,14 +596,14 @@ mod tests {
         let kernel = kernel(1, Metric::L2);
         // Foreground writes can legally shrink a Splitting source below two
         // entries before exposure (ADR 0014); the split must still advance.
-        let trained = train(&kernel, Vec::<(Bytes, Box<[f32]>)>::new()).expect("trained");
-        assert_eq!(&*trained.left, &[0.0]);
-        assert_eq!(&*trained.right, &[0.0]);
+        let trained = train(&kernel, 1, Vec::<(Bytes, Box<[f32]>)>::new()).expect("trained");
+        assert_eq!(trained.left.components(), &[0.0]);
+        assert_eq!(trained.right.components(), &[0.0]);
         assert_eq!(trained.rounds, 0);
 
-        let trained = train(&kernel, entries(&[&[3.0]])).expect("trained");
-        assert_eq!(&*trained.left, &[3.0]);
-        assert_eq!(&*trained.right, &[3.0]);
+        let trained = train(&kernel, 1, entries(&[&[3.0]])).expect("trained");
+        assert_eq!(trained.left.components(), &[3.0]);
+        assert_eq!(trained.right.components(), &[3.0]);
         assert_eq!(trained.rounds, 0);
     }
 
@@ -589,7 +618,7 @@ mod tests {
             entries(&[&[1.0], &[2.0]]),
             entries(&[&[1.0, f32::NAN], &[2.0, 3.0]]),
         ] {
-            assert_kind(train(&kernel, malformed), ErrorKind::Corruption);
+            assert_kind(train(&kernel, 1, malformed), ErrorKind::Corruption);
         }
     }
 
@@ -597,13 +626,26 @@ mod tests {
     fn extreme_magnitudes_convert_to_finite_f32() {
         let trained = train(
             &kernel(1, Metric::L2),
+            1,
             entries(&[&[f32::MAX], &[-f32::MAX], &[0.0]]),
         )
         .expect("trained");
-        assert!(trained.left.iter().all(|component| component.is_finite()));
-        assert!(trained.right.iter().all(|component| component.is_finite()));
-        assert_eq!(&*trained.left, &[f32::MAX]);
-        assert_eq!(&*trained.right, &[-f32::MAX / 2.0]);
+        assert!(
+            trained
+                .left
+                .components()
+                .iter()
+                .all(|component| component.is_finite())
+        );
+        assert!(
+            trained
+                .right
+                .components()
+                .iter()
+                .all(|component| component.is_finite())
+        );
+        assert_eq!(trained.left.components(), &[f32::MAX]);
+        assert_eq!(trained.right.components(), &[-f32::MAX / 2.0]);
     }
 
     #[test]
@@ -626,9 +668,9 @@ mod tests {
                     )
                 })
                 .collect();
-            let trained = train(&kernel, entries.clone()).expect("trained");
+            let trained = train(&kernel, 1, entries.clone()).expect("trained");
             assert!(trained.rounds <= MAX_TRAINING_ROUNDS);
-            assert_eq!(train(&kernel, entries).expect("trained"), trained);
+            assert_eq!(train(&kernel, 1, entries).expect("trained"), trained);
         }
     }
 
@@ -637,6 +679,7 @@ mod tests {
     // reduction order while the implementation chooses only a membership set.
     fn reference_train<I: Ord>(
         kernel: &VectorKernel,
+        level: u32,
         mut entries: Vec<(I, Box<[f32]>)>,
     ) -> Result<TrainedSplit> {
         for (_, vector) in &entries {
@@ -653,16 +696,16 @@ mod tests {
             0 => {
                 let zero: Box<[f32]> = vec![0.0; kernel.dimension()].into();
                 return Ok(TrainedSplit {
-                    left: zero.clone(),
-                    right: zero,
+                    left: PartitionCentroid::new(zero.clone()),
+                    right: PartitionCentroid::new(zero),
                     rounds: 0,
                 });
             }
             1 => {
                 let vector = &entries[0].1;
                 return Ok(TrainedSplit {
-                    left: vector.clone(),
-                    right: vector.clone(),
+                    left: PartitionCentroid::new(vector.clone()),
+                    right: PartitionCentroid::new(vector.clone()),
                     rounds: 0,
                 });
             }
@@ -683,16 +726,22 @@ mod tests {
         let left_seed = farthest(&entries, &source, &distance)?;
         let right_seed = farthest(&entries, &entries[left_seed].1, &distance)?;
 
-        let mut left = entries[left_seed].1.clone();
-        let mut right = entries[right_seed].1.clone();
+        let mut left = PartitionCentroid::new(entries[left_seed].1.clone());
+        let mut right = PartitionCentroid::new(entries[right_seed].1.clone());
         let half = entries.len() / 2;
         let mut previous: Option<Vec<bool>> = None;
         let mut rounds = 0_usize;
         loop {
-            let assignment = reference_assign(&entries, &left, &right, half, &distance)?;
+            let assignment = reference_assign(
+                &entries,
+                left.components(),
+                right.components(),
+                half,
+                &distance,
+            )?;
             let stable = previous.as_ref() == Some(&assignment);
-            left = cluster_mean(kernel, &entries, &assignment, true)?;
-            right = cluster_mean(kernel, &entries, &assignment, false)?;
+            left = cluster_mean(kernel, level, &entries, &assignment, true)?;
+            right = cluster_mean(kernel, level, &entries, &assignment, false)?;
             previous = Some(assignment);
             rounds += 1;
             if stable || rounds == MAX_TRAINING_ROUNDS {
@@ -755,23 +804,43 @@ mod tests {
                                 (id, vector)
                             })
                             .collect();
-                        let expected = reference_train(&kernel, entries.clone());
-                        let actual = train(&kernel, entries);
+                        let expected = reference_train(&kernel, 1, entries.clone());
+                        let actual = train(&kernel, 1, entries);
                         match (actual, expected) {
                             (Ok(actual), Ok(expected)) => {
                                 assert_eq!(actual.rounds, expected.rounds);
                                 assert_eq!(
-                                    actual.left.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                                    actual.left.dispersion().to_bits(),
+                                    expected.left.dispersion().to_bits()
+                                );
+                                assert_eq!(
+                                    actual.right.dispersion().to_bits(),
+                                    expected.right.dispersion().to_bits()
+                                );
+                                assert_eq!(
+                                    actual
+                                        .left
+                                        .components()
+                                        .iter()
+                                        .map(|x| x.to_bits())
+                                        .collect::<Vec<_>>(),
                                     expected
                                         .left
+                                        .components()
                                         .iter()
                                         .map(|x| x.to_bits())
                                         .collect::<Vec<_>>()
                                 );
                                 assert_eq!(
-                                    actual.right.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                                    actual
+                                        .right
+                                        .components()
+                                        .iter()
+                                        .map(|x| x.to_bits())
+                                        .collect::<Vec<_>>(),
                                     expected
                                         .right
+                                        .components()
                                         .iter()
                                         .map(|x| x.to_bits())
                                         .collect::<Vec<_>>()
@@ -819,9 +888,9 @@ mod tests {
                         for _ in 0..20 {
                             let input = black_box(entries.clone());
                             black_box(if reference {
-                                reference_train(&kernel, input)
+                                reference_train(&kernel, 1, input)
                             } else {
-                                train(&kernel, input)
+                                train(&kernel, 1, input)
                             })
                             .expect("train");
                         }
