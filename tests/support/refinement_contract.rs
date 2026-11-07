@@ -1,15 +1,15 @@
-//! Public offline-refinement contract shared by Memory and FoundationDB.
+//! Shared public offline-refinement contract.
 
 use ktann::api::{
-    GetOptions, Index, IndexConfig, Metric, PayloadProjection, RefineOptions, RuntimeConfig,
-    SearchOptions, SearchRequest, VerifyOptions,
+    GetOptions, Index, IndexConfig, LogicalIndexId, Metric, PayloadProjection, RefineOptions,
+    RuntimeConfig, SearchOptions, SearchRequest, VerifyOptions,
 };
 use ktann::runtime::Runtime;
 use ktann::storage::{
     ReadLogicalTxn,
-    backend::Backend,
+    backend::{Backend, ReadOps},
     keys::LogicalKey,
-    values::{IndexManifest, PersistentValue},
+    values::{IndexManifest, PartitionCentroid, PersistentValue},
 };
 
 use super::fixture;
@@ -132,30 +132,7 @@ pub async fn run<B: Backend>(backend: B, runtime_backend: B, graph: bool) {
         matches!(before.get(root).await.unwrap(), Some(PersistentValue::PartitionHeader(header)) if header == old_header)
     );
     for leaf in [2, 3] {
-        let Some(PersistentValue::PartitionCentroid(center)) = after
-            .get(LogicalKey::Centroid {
-                index: index.logical_index_id(),
-                tree_key: fixture::tree_key(),
-                partition: fixture::partition(leaf),
-            })
-            .await
-            .unwrap()
-        else {
-            panic!("centroid");
-        };
-        let Some(PersistentValue::ChildEntry(child)) = after
-            .get(LogicalKey::ChildEntry {
-                index: index.logical_index_id(),
-                tree_key: fixture::tree_key(),
-                partition: fixture::partition(1),
-                child: fixture::partition(leaf),
-            })
-            .await
-            .unwrap()
-        else {
-            panic!("edge");
-        };
-        assert_eq!(center.components(), child.centroid());
+        let center = assert_centroid_projection(&mut after, index.logical_index_id(), leaf).await;
         assert_eq!(center.components(), [if leaf == 2 { -3.25 } else { 3.25 }]);
     }
     let hits = index.search(query.clone()).await.unwrap().hits;
@@ -183,4 +160,37 @@ pub async fn run<B: Backend>(backend: B, runtime_backend: B, graph: bool) {
     );
     reopened.drop_index("offline-refinement").await.unwrap();
     reopened.shutdown().await.unwrap();
+}
+
+/// Checks both routing projections in the caller's snapshot and returns the centroid.
+pub async fn assert_centroid_projection<T: ReadOps>(
+    txn: &mut ReadLogicalTxn<'_, T>,
+    index: LogicalIndexId,
+    leaf: u64,
+) -> PartitionCentroid {
+    let Some(PersistentValue::PartitionCentroid(center)) = txn
+        .get(LogicalKey::Centroid {
+            index,
+            tree_key: fixture::tree_key(),
+            partition: fixture::partition(leaf),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("centroid");
+    };
+    let Some(PersistentValue::ChildEntry(child)) = txn
+        .get(LogicalKey::ChildEntry {
+            index,
+            tree_key: fixture::tree_key(),
+            partition: fixture::partition(1),
+            child: fixture::partition(leaf),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("edge");
+    };
+    assert_eq!(center.components(), child.centroid());
+    center
 }

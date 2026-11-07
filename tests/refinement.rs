@@ -48,30 +48,8 @@ async fn unknown_commits_leave_a_valid_index_without_replay() {
             // An ambiguous centroid commit still changes both projections or neither.
             let mut txn = ReadLogicalTxn::for_index(backend.begin_read().await.unwrap(), &manifest);
             for leaf in [2, 3] {
-                let Some(PersistentValue::PartitionCentroid(center)) = txn
-                    .get(LogicalKey::Centroid {
-                        index: index.logical_index_id(),
-                        tree_key: fixture::tree_key(),
-                        partition: fixture::partition(leaf),
-                    })
-                    .await
-                    .unwrap()
-                else {
-                    panic!("centroid");
-                };
-                let Some(PersistentValue::ChildEntry(edge)) = txn
-                    .get(LogicalKey::ChildEntry {
-                        index: index.logical_index_id(),
-                        tree_key: fixture::tree_key(),
-                        partition: fixture::partition(1),
-                        child: fixture::partition(leaf),
-                    })
-                    .await
-                    .unwrap()
-                else {
-                    panic!("edge");
-                };
-                assert_eq!(center.components(), edge.centroid());
+                contract::assert_centroid_projection(&mut txn, index.logical_index_id(), leaf)
+                    .await;
             }
             drop(txn);
             runtime.drop_index(index.name().as_str()).await.unwrap();
@@ -178,17 +156,6 @@ async fn rejects_unsettled_topology_before_writing() {
 async fn zero_rounds_refreshes_stale_centroids_without_moving_records() {
     let backend = MemoryBackend::new();
     let (runtime, index, manifest) = contract::setup(&backend, backend.clone(), false).await;
-    let centroid_key = LogicalKey::Centroid {
-        index: index.logical_index_id(),
-        tree_key: fixture::tree_key(),
-        partition: fixture::partition(2),
-    };
-    let edge_key = LogicalKey::ChildEntry {
-        index: index.logical_index_id(),
-        tree_key: fixture::tree_key(),
-        partition: fixture::partition(1),
-        child: fixture::partition(2),
-    };
     index
         .refine(
             RefineOptions::new(1 << 20)
@@ -199,15 +166,8 @@ async fn zero_rounds_refreshes_stale_centroids_without_moving_records() {
         .await
         .unwrap();
     let mut txn = ReadLogicalTxn::for_index(backend.begin_read().await.unwrap(), &manifest);
-    let Some(PersistentValue::PartitionCentroid(center)) = txn.get(centroid_key).await.unwrap()
-    else {
-        panic!("centroid");
-    };
-    let Some(PersistentValue::ChildEntry(edge)) = txn.get(edge_key).await.unwrap() else {
-        panic!("edge");
-    };
+    let center = contract::assert_centroid_projection(&mut txn, index.logical_index_id(), 2).await;
     assert_eq!(center.components(), [-1.25]);
-    assert_eq!(center.components(), edge.centroid());
     for position in 0..8 {
         let Some(PersistentValue::RecordLocation(location)) = txn
             .get(LogicalKey::Location {

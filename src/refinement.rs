@@ -278,7 +278,6 @@ fn refine(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::RefineOptions;
 
     #[test]
     fn zero_rounds_refreshes_nested_trees_from_shared_normalized_inputs() {
@@ -434,7 +433,6 @@ mod tests {
                 center: vec![5.5].into(),
             },
         ];
-        let options = RefineOptions::new(100).unwrap();
         let mut moves = Vec::new();
         refine(
             &|| Ok(()),
@@ -443,7 +441,7 @@ mod tests {
             &mut leaves,
             2,
             2,
-            options.rounds,
+            2,
             |round, position, source, target| moves.push((round, position, source, target)),
         )
         .unwrap();
@@ -456,7 +454,7 @@ mod tests {
             &mut leaves,
             1,
             3,
-            options.rounds,
+            2,
             |round, position, source, target| moves.push((round, position, source, target)),
         )
         .unwrap();
@@ -497,7 +495,6 @@ mod tests {
             let (left, right) = pair.split_at_mut(1);
             std::mem::swap(&mut left[0].members[2], &mut right[0].members[2]);
         }
-        let options = RefineOptions::new(4096).unwrap();
         refine(
             &|| Ok(()),
             &kernel,
@@ -505,7 +502,7 @@ mod tests {
             &mut leaves,
             1,
             5,
-            options.rounds,
+            2,
             |_, _, _, _| {},
         )
         .unwrap();
