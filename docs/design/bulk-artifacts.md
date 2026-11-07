@@ -23,9 +23,20 @@ serving lifecycle and exact-membership contracts are unchanged.
    Optional bounded refinement runs on one retained tree before emission, reusing
    the ordinary metric-correct assignment algorithm. Zero rounds refreshes leaf
    and bottom-up internal centroids; omission preserves construction output.
-   Refinement semantics participate in the forest binding. Each round selects the
-   nearest other leaf centroids, capped at 32 (distance, then leaf ordinal), computing
-   each symmetric pair once. A contiguous fixed-size neighbor list per leaf uses
+   Refinement round controls participate in the forest binding.
+   Each round retains up to 32 candidate leaf centroids ordered by exact routing
+   distance, then leaf ordinal. Trees with at least 1,024 leaves use an ephemeral
+   centroid HNSW (M=8, efConstruction=64, efSearch=64, seed=7), rebuilt each round;
+   33 hits are requested to exclude self. Smaller trees use exact symmetric pairs,
+   tiled on both leaf axes with cancellation between tiles. Candidate graph capacity
+   is independent of the 65,536-entry partition ceiling: graphs are admitted against
+   the refinement memory budget and the native u32 ordinal domain. An unsupported
+   count or insufficient budget fails with LimitExceeded, without exact fallback. Candidate selection is independent of serving
+   graph configuration. Both paths use the same metric-correct move scoring,
+   positive-gain ordering and occupancy enforcement. HNSW may change membership.
+   Native build and query scratch are reserved against refinement admission before
+   planning; cancellation and native failures propagate without algorithm fallback.
+   A contiguous fixed-size neighbor list per leaf uses
    512 bytes on 64-bit hosts, included in refinement admission; it is released
    before applying moves. Validated routing vectors and refreshed centroids reuse
    the same distance kernel without repeated component validation. The reader validates

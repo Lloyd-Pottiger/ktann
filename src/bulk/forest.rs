@@ -369,6 +369,14 @@ impl ForestArtifact {
                         Ok(())
                     },
                 )?;
+                charge_refinement(
+                    &mut used,
+                    crate::refinement::candidate_scratch_bytes(
+                        plans.iter().filter(|part| part.level == 1).count(),
+                        usize::from(rounds),
+                    )?,
+                    options.refinement_memory_bytes,
+                )?;
                 super::refine::refine_plans(config, seed, retained, &mut plans, rounds, &|| {
                     check()
                 })?;

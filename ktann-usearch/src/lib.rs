@@ -97,8 +97,11 @@ pub use ffi::Stats;
 
 /// Global node-level ceiling; the degree-specific limit is [`max_level`].
 pub const MAX_LEVEL: u32 = 16;
-/// Maximum partition size supported by this bridge.
-pub const MAX_NODES: usize = 65_536;
+/// Largest node count whose query sentinel fits the native u32 ordinal domain.
+/// This is a representation bound, not a memory or workload capacity guarantee.
+pub const MAX_NODES: usize = u32::MAX as usize;
+/// Maximum supported upper-layer degree; independent of graph node capacity.
+pub const MAX_CONNECTIVITY: usize = 32_768;
 
 /// The bridge's bounded failure categories.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -170,18 +173,19 @@ fn proceed(context: &MetricContext<'_>) -> bool {
 }
 
 fn validate(n: usize, m: usize) -> Result<(), Error> {
-    if n > MAX_NODES || !(2..=MAX_NODES / 2).contains(&m) {
+    if n > MAX_NODES || !(2..=MAX_CONNECTIVITY).contains(&m) {
         return Err(Error::InvalidArgument);
     }
     Ok(())
 }
 
-/// Highest hierarchy level whose expected population at MAX_NODES is at least
-/// one. Integer arithmetic matches the native sampler and bounds persisted size.
+/// Fixed degree-specific hierarchy envelope, independent of node capacity.
+/// The fixed 2^16 reference population preserves deterministic stored graphs;
+/// it limits layers, not nodes. Integer arithmetic matches the native sampler.
 pub fn max_level(m: usize) -> u32 {
     assert!(m >= 2);
     let mut level = 0;
-    let mut population = MAX_NODES;
+    let mut population = 1_usize << MAX_LEVEL;
     while population >= m {
         population /= m;
         level += 1;
@@ -242,7 +246,10 @@ impl Graph {
         if n < self.n || ef < self.m || n == 0 {
             return Err(Error::InvalidArgument);
         }
-        let native_limit = limit.checked_sub(n + 128).ok_or(Error::LimitExceeded)?;
+        let mapping_bytes = n.checked_add(128).ok_or(Error::LimitExceeded)?;
+        let native_limit = limit
+            .checked_sub(mapping_bytes)
+            .ok_or(Error::LimitExceeded)?;
         if build_bound(n, self.m)? > native_limit {
             return Err(Error::LimitExceeded);
         }
@@ -478,6 +485,69 @@ mod tests {
     use super::*;
 
     #[test]
+    fn large_graph_roundtrip_and_search_exceed_partition_capacity() {
+        let n = 65_537;
+        let m = 8;
+        let bound = build_bound(n, m).unwrap();
+        let distance = |a: u32, b: u32| (f64::from(a) - f64::from(b)).powi(2);
+        let graph = Graph::build(n, m, 64, 7, bound, &distance, &|| true).unwrap();
+        assert!(graph.peak_bytes() <= bound);
+        let bytes = graph
+            .encode(
+                graph.resident_bytes() + encoded_bound(n, m).unwrap(),
+                &|| true,
+            )
+            .unwrap();
+        let restored = Graph::decode(
+            &bytes,
+            n,
+            m,
+            decode_bound(n, m, bytes.len()).unwrap(),
+            &|| true,
+        )
+        .unwrap();
+        assert_eq!(
+            restored
+                .encode(
+                    restored.resident_bytes() + encoded_bound(n, m).unwrap(),
+                    &|| true
+                )
+                .unwrap(),
+            bytes
+        );
+        let scratch_bound = workspace_bound(n, m).unwrap();
+        let mut scratch = Workspace::new(n, m, scratch_bound).unwrap();
+        for query in [0, n / 2, n - 1] {
+            let mut hits = [Hit::default(); 1];
+            let stats = restored
+                .search(
+                    64,
+                    &|_, node| distance(query as u32, node),
+                    &|| true,
+                    &mut scratch,
+                    &mut hits,
+                )
+                .unwrap();
+            assert_eq!(hits[0].node as usize, query);
+            assert_eq!(hits[0].distance, 0.0);
+            assert!(stats.distances < n);
+        }
+        assert!(scratch.allocated_bytes() <= scratch_bound);
+    }
+
+    #[test]
+    fn native_capacity_and_degree_limits_are_independent() {
+        assert!(build_bound(65_537, 8).is_ok());
+        assert_eq!(
+            workspace_bound(1, MAX_CONNECTIVITY + 1),
+            Err(Error::InvalidArgument)
+        );
+        if let Some(unsupported) = MAX_NODES.checked_add(1) {
+            assert_eq!(build_bound(unsupported, 8), Err(Error::InvalidArgument));
+        }
+    }
+
+    #[test]
     fn visited_slots_cover_word_boundaries_and_reset_between_queries() {
         for n in [63, 64, 65, 127, 128, 129, 4097] {
             let distance = |a: u32, b: u32| (f64::from(a) - f64::from(b)).powi(2);
@@ -509,6 +579,15 @@ mod tests {
     fn admission_bounds_cover_small_sparse_and_large_degree_allocations() {
         for (n, m) in [(0, 2), (1, 2), (9, 3), (128, 12), (16, 129), (1, 32768)] {
             let bound = build_bound(n, m).unwrap();
+            let entered_native = std::cell::Cell::new(false);
+            assert!(matches!(
+                Graph::build(n, m, m, 17, bound - 1, &|_, _| 0.0, &|| {
+                    entered_native.set(true);
+                    true
+                }),
+                Err(Error::LimitExceeded)
+            ));
+            assert!(!entered_native.get());
             let graph = Graph::build(
                 n,
                 m,

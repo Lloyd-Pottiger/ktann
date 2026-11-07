@@ -61,7 +61,10 @@ impl<'a> Centroids<'a> {
         capacity: usize,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<Self> {
-        if capacity == 0 || capacity > ktann_usearch::MAX_NODES || children.len() > capacity {
+        if capacity == 0
+            || capacity > crate::api::MAX_PARTITION_ENTRIES as usize
+            || children.len() > capacity
+        {
             return Err(Error::invalid_argument());
         }
         check()?;

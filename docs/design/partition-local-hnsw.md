@@ -260,3 +260,18 @@ design.
 Choose operating points from end-to-end recall, latency and resource measurements,
 not local graph speed alone. The [benchmark guide](../../benchmarks/README.md)
 owns experiment commands, fixed-rerank comparison methods and measurement limits.
+
+## Graph capacity versus partition capacity
+
+The generic native bridge accepts graph counts in its u32 ordinal domain, subject
+to explicit allocation admission. This does not enlarge a KTANN partition:
+configuration, local centroid preparation, and stored Graph Descriptor validation
+retain the 65,536-entry format ceiling (and existing stricter configuration limits).
+Refinement's transient graph instead spans leaf centroids of an entire tree.
+
+The fixed hierarchy envelope remains `floor(log_M(2^16))`, independent of node
+capacity. It bounds layers and preserves existing graph bytes and RNG consumption;
+it is not a 65,536-node limit. The native degree ceiling remains 32,768 independently
+of node count. Larger graphs require workload-specific quality/performance evidence.
+Native decode reserves u64 duplicate-edge stamps so up to 17 layers per u32-domain
+node cannot overflow the validation epoch. Size admission uses checked arithmetic.

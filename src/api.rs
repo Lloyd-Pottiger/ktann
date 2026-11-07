@@ -21,8 +21,8 @@ pub use bulk::{
     BulkBuildJob, BulkBuildOptions, BulkBuildReport, BulkBuildStatus, BulkCleanupPage,
     BulkLoadOptions, BulkSchedulerOptions, BulkWorkerOptions,
 };
-pub(crate) use config::MAX_DIMENSION;
 pub use config::{IndexConfig, LocalGraphConfig, RuntimeConfig};
+pub(crate) use config::{MAX_DIMENSION, MAX_PARTITION_ENTRIES};
 pub use error::{Error, ErrorKind, Result};
 pub use identifiers::{FieldId, IndexName, LogicalIndexId, PartitionKey};
 pub use index::Index;

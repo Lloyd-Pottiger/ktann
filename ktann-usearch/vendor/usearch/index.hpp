@@ -4472,13 +4472,14 @@ private:
         }
     }
 
-    // KTANN: geometric levels stop when their expected population at 65536 nodes is below one.
+    // KTANN: layer caps use a fixed 2^16 reference population, not a node capacity limit.
+    // Keep RNG consumption and degree-specific layer caps stable for persisted graphs.
     level_t choose_random_level_(std::uint64_t& state) const noexcept {
         std::uint64_t threshold = UINT64_MAX / config_.connectivity;
         threshold += UINT64_MAX % config_.connectivity == config_.connectivity - 1;
         level_t level = 0;
         level_t highest = 0;
-        for (std::size_t population = 65536; population >= config_.connectivity;
+        for (std::size_t population = std::size_t(1) << 16; population >= config_.connectivity;
              population /= config_.connectivity) ++highest;
         while (level != 16) {
             std::uint64_t word = (state += UINT64_C(0x9e3779b97f4a7c15));

@@ -253,6 +253,15 @@ async fn load<B: Backend>(
             rounds: Vec::new(),
         });
     }
+    // Trees and rounds execute sequentially, so reserve only the largest graph.
+    let mut candidate_bytes = 0;
+    for tree in &loaded.trees {
+        candidate_bytes = candidate_bytes.max(crate::refinement::candidate_scratch_bytes(
+            tree.parts.iter().filter(|part| part.level == 1).count(),
+            options.rounds,
+        )?);
+    }
+    charge(&mut used, candidate_bytes, options)?;
     Ok(loaded)
 }
 
