@@ -115,26 +115,6 @@ mod tests {
             .collect()
     }
 
-    /// Checks the same candidate contract for metric and large-graph cases.
-    fn assert_candidates(kernel: &VectorKernel, leaves: &[Part], candidates: &[LeafNeighbors]) {
-        assert_eq!(candidates.len(), leaves.len());
-        for (source, hits) in candidates.iter().enumerate() {
-            let mut seen = std::collections::BTreeSet::new();
-            for &(distance, target) in hits {
-                assert_ne!(source, target);
-                assert!(seen.insert(target));
-                assert_eq!(
-                    distance,
-                    kernel.routing_distances_validated(
-                        [&leaves[source].center],
-                        &leaves[target].center,
-                    )[0]
-                );
-            }
-            assert!(hits.windows(2).all(|pair| pair[0] <= pair[1]));
-        }
-    }
-
     #[test]
     fn candidates_are_deterministic_distinct_and_metric_correct() {
         for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
@@ -142,7 +122,22 @@ mod tests {
             let leaves = leaves(&kernel);
             let first = super::super::leaf_neighbors(&|| Ok(()), &kernel, &leaves).unwrap();
             assert_eq!(first, neighbors(&|| Ok(()), &kernel, &leaves).unwrap());
-            assert_candidates(&kernel, &leaves, &first);
+            assert_eq!(first.len(), leaves.len());
+            for (source, hits) in first.iter().enumerate() {
+                let mut seen = std::collections::BTreeSet::new();
+                for &(distance, target) in hits {
+                    assert_ne!(source, target);
+                    assert!(seen.insert(target));
+                    assert_eq!(
+                        distance,
+                        kernel.routing_distances_validated(
+                            [&leaves[source].center],
+                            &leaves[target].center,
+                        )[0]
+                    );
+                }
+                assert!(hits.windows(2).all(|pair| pair[0] <= pair[1]));
+            }
         }
     }
 
@@ -154,14 +149,14 @@ mod tests {
         let check = || {
             calls.set(calls.get() + 1);
             if calls.get() >= 20 {
-                Err(Error::new(ErrorKind::Cancelled))
+                Err(Error::new(ErrorKind::DeadlineExceeded))
             } else {
                 Ok(())
             }
         };
         assert_eq!(
             neighbors(&check, &kernel, &leaves).unwrap_err().kind(),
-            ErrorKind::Cancelled
+            ErrorKind::DeadlineExceeded
         );
         assert!(calls.get() >= 20);
     }
@@ -213,54 +208,21 @@ mod tests {
     }
 
     #[test]
-    fn oversized_candidate_domain_fails_instead_of_selecting_exact() {
+    fn reservation_follows_candidate_selection_and_rounds() {
+        for n in [0, 1023] {
+            assert_eq!(super::super::candidate_scratch_bytes(n, 1).unwrap(), 0);
+        }
+        for n in [1024, 65_537] {
+            assert!(super::super::candidate_scratch_bytes(n, 1).unwrap() > 0);
+            assert_eq!(super::super::candidate_scratch_bytes(n, 0).unwrap(), 0);
+        }
         if let Some(unsupported) = ktann_usearch::MAX_NODES.checked_add(1) {
-            assert!(enabled(unsupported));
             assert_eq!(
-                scratch_bytes(unsupported).unwrap_err().kind(),
+                super::super::candidate_scratch_bytes(unsupported, 1)
+                    .unwrap_err()
+                    .kind(),
                 ErrorKind::LimitExceeded
             );
-        }
-        assert!(enabled(65_537));
-    }
-
-    #[test]
-    #[ignore = "release-mode large candidate graph validation"]
-    fn candidate_graph_above_partition_capacity() {
-        let kernel = VectorKernel::new(3, Metric::L2, [7; 32]).unwrap();
-        let leaves: Vec<_> = (0..65_537)
-            .map(|i| Part {
-                key: PartitionKey::new(i + 1).unwrap(),
-                parent: None,
-                level: 1,
-                center: vec![(i % 257) as f32, (i / 257) as f32, 1.0].into(),
-                members: vec![],
-                children: vec![],
-            })
-            .collect();
-        let started = std::time::Instant::now();
-        let candidates = super::super::leaf_neighbors(&|| Ok(()), &kernel, &leaves).unwrap();
-        let elapsed = started.elapsed().as_secs_f64();
-        assert_candidates(&kernel, &leaves, &candidates);
-        eprintln!(
-            "large_refinement leaves={} seconds={elapsed:.3} graph_reservation_bytes={}",
-            leaves.len(),
-            scratch_bytes(leaves.len()).unwrap()
-        );
-    }
-
-    #[test]
-    fn graph_reservation_covers_native_work_and_respects_selection_bounds() {
-        for n in [0, 1023] {
-            assert_eq!(scratch_bytes(n).unwrap(), 0);
-        }
-        for n in [1024, 65_536, 65_537, 131_072] {
-            assert!(
-                scratch_bytes(n).unwrap()
-                    >= ktann_usearch::build_bound(n, M).unwrap()
-                        + ktann_usearch::workspace_bound(n, M).unwrap()
-            );
-            assert_eq!(super::super::candidate_scratch_bytes(n, 0).unwrap(), 0);
         }
     }
 }

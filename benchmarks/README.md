@@ -699,32 +699,6 @@ work. Graph construction is timed separately. Repeat processes and compare
 digests before interpreting timings; this does not measure backend IO, complete
 search quality or end-to-end throughput.
 
-### Refinement CPU diagnostic
-
-Run on an otherwise idle host:
-
-```sh
-cargo test --release -p ktann --lib refinement::performance:: -- --ignored --nocapture --test-threads=1
-```
-
-The diagnostic measures exact leaf-neighbor selection at 256/4096 leaves and
-128/768 dimensions, and complete in-memory refinement planning (up to three
-rounds) on the checked-in SIFT small base and deterministic synthetic leaf layouts.
-The synthetic cases have 4096 leaves and 131,072 vectors, with one eighth of
-initial assignments deliberately displaced. Input generation, construction,
-normalization, and result digests are outside timing. Planning includes centroid
-refresh, neighbor selection, capacity-constrained moves, and final centroids.
-The synthetic cases isolate leaf planning; the SIFT case also includes the
-constructed internal hierarchy.
-It excludes artifact IO, graph construction, backend publication, and query time.
-
-Each case prints four repetitions; discard the first as warmup and compare the
-remaining distributions between baseline and candidate binaries. Compare result
-digests and move counts as well as time. The neighbor diagnostic retains 512 bytes
-per leaf on this 64-bit host, with no quadratic distance matrix or extra threads.
-These CPU results do not establish end-to-end Bulk Build speed or a capacity SLA.
-See [the tiling comparison](refinement-performance.md) for measured results.
-
 ### Candidate membership diagnostic
 
 Run the membership-only diagnostic with:
@@ -792,8 +766,3 @@ Its private modules keep related execution and accounting together:
 Keep request preparation, warmup, timed execution, resource sampling, maintenance
 waits, and verification in their existing order when changing these flows; moving
 work across a measurement interval changes report comparability.
-
-The [HNSW refinement experiment](refinement-hnsw-experiment.md) compares candidate
-leaf generation on SIFT1M, including total construction time and final recall/QPS.
-Default refinement now uses exact candidates below 1,024 leaves and budget-admitted
-HNSW for larger trees, independently of the partition capacity ceiling; the report records the evidence and remaining limits.
