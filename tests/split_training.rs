@@ -396,3 +396,29 @@ async fn an_unbound_transaction_is_rejected() {
         .expect_err("unbound transaction");
     assert_eq!(error.kind(), ErrorKind::InvalidArgument);
 }
+
+#[tokio::test]
+async fn cosine_split_persists_dispersion_of_the_balanced_training_members() {
+    let backend = MemoryBackend::new();
+    let manifest = cosine_manifest();
+    let key = tree_key(1);
+    seed_leaf_source(
+        &backend,
+        &manifest,
+        &key,
+        &[
+            (rid(0), -1.0),
+            (rid(1), 1.0),
+            (rid(2), 1.0),
+            (rid(3), 1.0),
+            (rid(4), 1.0),
+            (rid(5), 1.0),
+        ],
+    )
+    .await;
+    let trained = train(&backend, &manifest, &key, pk(1)).await.unwrap();
+    let mut sigma = [trained.left().dispersion(), trained.right().dispersion()];
+    sigma.sort_by(f64::total_cmp);
+    assert_eq!(sigma[0], 0.0);
+    assert!((sigma[1] - (8.0_f64 / 9.0).sqrt()).abs() < 1e-7);
+}

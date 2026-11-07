@@ -125,24 +125,48 @@ impl PartitionHeader {
     }
 }
 
-/// A full-f32 routing centroid, immutable during online operations.
+/// An immutable routing model: full-f32 centroid and training-time leaf dispersion.
 ///
 /// Caller-exclusive offline refinement may replace a nonroot centroid and
 /// its parent Child Entry projection in one transaction.
 #[derive(Clone, PartialEq)]
-pub struct PartitionCentroid(Box<[f32]>);
+pub struct PartitionCentroid {
+    components: Box<[f32]>,
+    dispersion: f64,
+}
 
 impl PartitionCentroid {
-    /// Creates a routing centroid.
+    /// Creates an uncorrected routing model, used for internal partitions and untrained fixtures.
     #[must_use]
     pub fn new(components: impl Into<Box<[f32]>>) -> Self {
-        Self(components.into())
+        Self {
+            components: components.into(),
+            dispersion: 0.0,
+        }
+    }
+
+    /// Creates a cosine leaf model from a training snapshot's centroid and dispersion.
+    /// The statistic is immutable until the centroid is retrained, not a live membership aggregate.
+    pub fn with_dispersion(components: impl Into<Box<[f32]>>, dispersion: f64) -> Result<Self> {
+        if !dispersion.is_finite() || !(0.0..=1.0).contains(&dispersion) {
+            return Err(Error::invalid_argument());
+        }
+        Ok(Self {
+            components: components.into(),
+            dispersion: if dispersion == 0.0 { 0.0 } else { dispersion },
+        })
+    }
+
+    /// Cosine leaf dispersion at training time; zero for uncorrected routing models.
+    #[must_use]
+    pub const fn dispersion(&self) -> f64 {
+        self.dispersion
     }
 
     /// Returns the centroid components.
     #[must_use]
     pub fn components(&self) -> &[f32] {
-        &self.0
+        &self.components
     }
 }
 
@@ -271,17 +295,21 @@ pub(super) fn encode_partition_centroid(
         encoder,
         manifest.config().dimension(),
         centroid.components(),
-    )
+    )?;
+    encoder.u64(centroid.dispersion().to_bits());
+    Ok(())
 }
 
 pub(super) fn decode_partition_centroid(
     decoder: &mut Decoder,
     manifest: &IndexManifest,
 ) -> Result<PartitionCentroid> {
-    Ok(PartitionCentroid::new(decode_vector(
-        decoder,
-        manifest.config().dimension(),
-    )?))
+    let components = decode_vector(decoder, manifest.config().dimension())?;
+    let bits = decoder.u64()?;
+    if bits == (-0.0_f64).to_bits() {
+        return Err(corrupt());
+    }
+    PartitionCentroid::with_dispersion(components, f64::from_bits(bits)).map_err(|_| corrupt())
 }
 
 pub(super) fn encode_partition_state(

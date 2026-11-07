@@ -8,10 +8,9 @@ use crate::api::{Error, PartitionKey, Result, Value};
 use crate::search::rabitq::RaBitQ7;
 use crate::storage::keys::MAX_RECORD_ID_BYTES;
 
+use super::authority::{PartitionCentroid, decode_partition_centroid, encode_partition_centroid};
 use super::corrupt;
-use super::data::{
-    decode_fields, decode_vector, encode_fields, encode_vector, maximum_typed_value_len,
-};
+use super::data::{decode_fields, encode_fields, maximum_typed_value_len};
 use super::manifest::IndexManifest;
 use super::record::{decode_record_id, encode_record_id};
 use super::wire::{Decoder, Encoder};
@@ -24,7 +23,7 @@ use super::wire::{Decoder, Encoder};
 #[derive(Clone, PartialEq)]
 pub struct ChildEntry {
     child: PartitionKey,
-    centroid: Box<[f32]>,
+    model: PartitionCentroid,
 }
 
 impl ChildEntry {
@@ -33,8 +32,20 @@ impl ChildEntry {
     pub fn new(child: PartitionKey, centroid: impl Into<Box<[f32]>>) -> Self {
         Self {
             child,
-            centroid: centroid.into(),
+            model: PartitionCentroid::new(centroid),
         }
+    }
+
+    /// Projects the complete immutable routing model into the parent body.
+    #[must_use]
+    pub fn from_centroid(child: PartitionKey, model: PartitionCentroid) -> Self {
+        Self { child, model }
+    }
+
+    /// Returns the model bound to this child projection.
+    #[must_use]
+    pub fn model(&self) -> &PartitionCentroid {
+        &self.model
     }
 
     /// Returns the child identity duplicated from the logical key.
@@ -46,7 +57,7 @@ impl ChildEntry {
     /// Returns the child centroid projection.
     #[must_use]
     pub fn centroid(&self) -> &[f32] {
-        &self.centroid
+        self.model.components()
     }
 }
 
@@ -120,7 +131,7 @@ pub(super) fn encode_child_entry(
     entry: &ChildEntry,
 ) -> Result<()> {
     encoder.u64(entry.child.get());
-    encode_vector(encoder, manifest.config().dimension(), entry.centroid())
+    encode_partition_centroid(encoder, manifest, entry.model())
 }
 
 pub(super) fn decode_child_entry(
@@ -128,8 +139,8 @@ pub(super) fn decode_child_entry(
     manifest: &IndexManifest,
 ) -> Result<ChildEntry> {
     let child = decoder.partition_key()?;
-    let centroid = decode_vector(decoder, manifest.config().dimension())?;
-    Ok(ChildEntry::new(child, centroid))
+    let model = decode_partition_centroid(decoder, manifest)?;
+    Ok(ChildEntry::from_centroid(child, model))
 }
 
 pub(super) fn encode_leaf_entry(

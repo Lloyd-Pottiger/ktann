@@ -52,8 +52,8 @@ pub(super) fn neighbors(
     let result = (|| {
         let distance = |a: u32, b: u32| {
             kernel.routing_distances_validated(
-                [&leaves[a as usize].center],
-                &leaves[b as usize].center,
+                [leaves[a as usize].centroid.components()],
+                leaves[b as usize].centroid.components(),
             )[0]
         };
         let build_limit = ktann_usearch::build_bound(n, M)?;
@@ -99,6 +99,7 @@ pub(super) fn neighbors(
 mod tests {
     use super::*;
     use crate::api::{Metric, PartitionKey};
+    use crate::storage::values::PartitionCentroid;
 
     fn leaves(kernel: &VectorKernel) -> Vec<Part> {
         (0..1024)
@@ -106,9 +107,11 @@ mod tests {
                 key: PartitionKey::new(i + 1).unwrap(),
                 parent: None,
                 level: 1,
-                center: kernel
-                    .normalize_centroid(&[1.0, (i % 31) as f32, (i % 47) as f32])
-                    .unwrap(),
+                centroid: PartitionCentroid::new(
+                    kernel
+                        .normalize_centroid(&[1.0, (i % 31) as f32, (i % 47) as f32])
+                        .unwrap(),
+                ),
                 members: vec![i as usize],
                 children: vec![],
             })
@@ -131,8 +134,8 @@ mod tests {
                     assert_eq!(
                         distance,
                         kernel.routing_distances_validated(
-                            [&leaves[source].center],
-                            &leaves[target].center,
+                            [leaves[source].centroid.components()],
+                            leaves[target].centroid.components(),
                         )[0]
                     );
                 }
@@ -170,9 +173,12 @@ mod tests {
         let mut leaves = leaves(&kernel);
         for (i, leaf) in leaves.iter_mut().enumerate() {
             leaf.members = vec![i * 3, i * 3 + 1, (i ^ 1) * 3 + 2];
-            leaf.center =
-                super::super::mean(&kernel, leaf.members.iter().map(|&i| vectors[i].as_ref()))
-                    .unwrap();
+            leaf.centroid = super::super::mean(
+                &kernel,
+                leaf.members.iter().map(|&i| vectors[i].as_ref()),
+                leaf.level,
+            )
+            .unwrap();
         }
         let mut moves = 0;
         super::super::refine(
@@ -200,9 +206,13 @@ mod tests {
         assert_eq!(members, (0..vectors.len()).collect::<Vec<_>>());
         for leaf in &leaves {
             assert_eq!(
-                leaf.center,
-                super::super::mean(&kernel, leaf.members.iter().map(|&i| vectors[i].as_ref()),)
-                    .unwrap()
+                leaf.centroid,
+                super::super::mean(
+                    &kernel,
+                    leaf.members.iter().map(|&i| vectors[i].as_ref()),
+                    leaf.level
+                )
+                .unwrap()
             );
         }
     }

@@ -95,12 +95,12 @@ impl GraphLedger {
             }
             PersistentValue::PartitionCentroid(centroid) => {
                 if let Some(projection) = self.projection(cx, partition) {
-                    projection.actual = Some(fingerprint(centroid.components()));
+                    projection.actual = Some(fingerprint(centroid));
                 }
             }
             PersistentValue::ChildEntry(child) => {
                 if let Some(projection) = self.projection(cx, child.child()) {
-                    projection.expected = Some((fingerprint(child.centroid()), partition));
+                    projection.expected = Some((fingerprint(child.model()), partition));
                 }
                 if reserve_entry(
                     cx,
@@ -308,9 +308,10 @@ impl GraphLedger {
 }
 
 /// Canonical f32 coordinates, including the persistent spelling of signed zero.
-fn fingerprint(vector: &[f32]) -> [u8; 32] {
+fn fingerprint(model: &crate::storage::values::PartitionCentroid) -> [u8; 32] {
     let mut hash = Sha256::new();
-    for &component in vector {
+    hash.update(model.dispersion().to_bits().to_le_bytes());
+    for &component in model.components() {
         hash.update(
             if component == 0.0 {
                 0_u32

@@ -221,13 +221,14 @@ impl ServingArtifact {
             let row = row?;
             let plan = row.partition;
             let node_key = keys::header_key(id, &row.tree_key, plan.key);
-            let mut meta = Vec::with_capacity(9 + 4 * index.config().dimension());
+            let mut meta = Vec::with_capacity(17 + 4 * index.config().dimension());
             meta.push(0);
             meta.extend_from_slice(&plan.level.to_be_bytes());
             meta.extend_from_slice(&(plan.entries.len() as u32).to_be_bytes());
-            for component in &plan.centroid {
+            for component in plan.centroid.components() {
                 meta.extend_from_slice(&component.to_bits().to_be_bytes());
             }
+            meta.extend_from_slice(&plan.centroid.dispersion().to_bits().to_be_bytes());
             topology.push(
                 &mut space,
                 Row {
@@ -368,7 +369,7 @@ impl ServingArtifact {
         let mut tree_state: Option<(TreeKey, PartitionKey)> = None;
         while let Some(row) = next.take() {
             if row.key.first() != Some(&1)
-                || row.value.len() != 9 + 4 * index.config().dimension()
+                || row.value.len() != 17 + 4 * index.config().dimension()
                 || row.value[0] != 0
             {
                 return Err(corrupt());
@@ -376,12 +377,19 @@ impl ServingArtifact {
             let (tree, partition) = node(Bytes::copy_from_slice(&row.key[1..]), index)?;
             let level = u32::from_be_bytes(row.value[1..5].try_into().expect("level"));
             let count = u32::from_be_bytes(row.value[5..9].try_into().expect("count"));
-            let centroid: Box<[f32]> = row.value[9..]
+            let centroid: Box<[f32]> = row.value[9..row.value.len() - 8]
                 .as_chunks::<4>()
                 .0
                 .iter()
                 .map(|bytes| f32::from_bits(u32::from_be_bytes(*bytes)))
                 .collect();
+            let dispersion = f64::from_bits(u64::from_be_bytes(
+                row.value[row.value.len() - 8..]
+                    .try_into()
+                    .expect("dispersion"),
+            ));
+            let centroid =
+                PartitionCentroid::with_dispersion(centroid, dispersion).map_err(|_| corrupt())?;
             next = topology.next()?;
             if partition.get() == 1 {
                 if next.as_ref().is_some_and(|entry| entry.key == row.key) {
@@ -412,7 +420,10 @@ impl ServingArtifact {
                         partition: parent_key,
                         child: partition,
                     },
-                    PersistentValue::ChildEntry(ChildEntry::new(partition, centroid.clone())),
+                    PersistentValue::ChildEntry(ChildEntry::from_centroid(
+                        partition,
+                        centroid.clone(),
+                    )),
                 )?;
                 emit(
                     &mut space,
@@ -424,7 +435,7 @@ impl ServingArtifact {
                         tree_key: tree.clone(),
                         partition,
                     },
-                    PersistentValue::PartitionCentroid(PartitionCentroid::new(centroid)),
+                    PersistentValue::PartitionCentroid(centroid),
                 )?;
                 next = topology.next()?;
                 if next.as_ref().is_some_and(|entry| entry.key == row.key) {

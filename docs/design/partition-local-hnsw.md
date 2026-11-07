@@ -28,6 +28,18 @@ Build, writes and offline `Index::refine`. Artifact refinement runs before initi
 graph construction; Active-index refinement atomically refreshes each changed
 parent graph with its Child Entries and partition centroids.
 
+### Query leaf scoring
+
+Cosine leaf queries use `-dot(q, centroid) + 0.1 * dispersion` throughout HNSW
+navigation and Exact selection. The immutable scalar travels with each Child
+Entry and its partition-cache epoch. Geometric graph construction and its source
+identity depend only on centroid coordinates; the snapshot binding includes the
+parent epoch, so publication still binds model updates to the complete body.
+Scalar-only refinement reuses and rebinds the geometric graph; coordinate changes
+rebuild it.
+Foreground write routing never uses the query correction. See [Search](search.md)
+for the training statistic and quality scope.
+
 ### Foreground write routing
 
 Foreground writes use exact scoring for internal bodies with fewer than 1024

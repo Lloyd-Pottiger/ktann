@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 
 use crate::api::{IndexConfig, PartitionKey, Result};
 use crate::search::numeric::VectorKernel;
+use crate::storage::values::PartitionCentroid;
 
 /// Per-leaf candidate bound shared by exact selection, HNSW and move scoring.
 const NEIGHBOR_COUNT: usize = 32;
@@ -30,7 +31,7 @@ pub(crate) struct Part {
     pub(crate) key: PartitionKey,
     pub(crate) parent: Option<PartitionKey>,
     pub(crate) level: u32,
-    pub(crate) center: Box<[f32]>,
+    pub(crate) centroid: PartitionCentroid,
     pub(crate) members: Vec<usize>,
     pub(crate) children: Vec<PartitionKey>,
 }
@@ -80,11 +81,12 @@ impl Planner {
             check()?;
             // Empty roots retain their existing center.
             if !leaf.members.is_empty() {
-                leaf.center = mean(
+                leaf.centroid = mean(
                     &self.kernel,
                     leaf.members
                         .iter()
                         .map(|&position| self.vectors[position].as_ref()),
+                    leaf.level,
                 )?;
             }
         }
@@ -116,19 +118,24 @@ fn refresh_internal_centers(
         .collect();
     for i in leaves..parts.len() {
         check()?;
-        parts[i].center = mean(
+        parts[i].centroid = mean(
             kernel,
             parts[i]
                 .children
                 .iter()
-                .map(|key| parts[positions[key]].center.as_ref()),
+                .map(|key| parts[positions[key]].centroid.components()),
+            parts[i].level,
         )?;
     }
     Ok(positions)
 }
 
-/// Computes a metric-correct mean with f64 accumulation in canonical order.
-fn mean<'a>(kernel: &VectorKernel, members: impl Iterator<Item = &'a [f32]>) -> Result<Box<[f32]>> {
+/// Trains a routing model with canonical f64 accumulation; only leaves get dispersion.
+fn mean<'a>(
+    kernel: &VectorKernel,
+    members: impl Iterator<Item = &'a [f32]>,
+    level: u32,
+) -> Result<PartitionCentroid> {
     let mut sum = vec![0.0_f64; kernel.dimension()];
     let mut count = 0_usize;
     for vector in members {
@@ -141,7 +148,12 @@ fn mean<'a>(kernel: &VectorKernel, members: impl Iterator<Item = &'a [f32]>) -> 
         .into_iter()
         .map(|sum| (sum / count.max(1) as f64) as f32)
         .collect();
-    kernel.normalize_centroid(&center)
+    let dispersion = if level == 1 {
+        kernel.leaf_dispersion(&center)
+    } else {
+        0.0
+    };
+    PartitionCentroid::with_dispersion(kernel.normalize_centroid(&center)?, dispersion)
 }
 
 /// Retains up to 32 candidate leaves in exact (distance, leaf ordinal) order.
@@ -173,8 +185,8 @@ fn leaf_neighbors(
                     let scores = kernel.routing_distances_validated(
                         candidates
                             .each_ref()
-                            .map(|candidate| candidate.center.as_ref()),
-                        &leaves[source].center,
+                            .map(|candidate| candidate.centroid.components()),
+                        leaves[source].centroid.components(),
                     );
                     for (lane, score) in scores.into_iter().enumerate() {
                         let target = start + batch * 4 + lane;
@@ -184,9 +196,10 @@ fn leaf_neighbors(
                 }
                 for (offset, candidate) in tail.iter().enumerate() {
                     let target = start + batches.len() * 4 + offset;
-                    let score = kernel
-                        .routing_distances_validated([&leaves[source].center], &candidate.center)
-                        [0];
+                    let score = kernel.routing_distances_validated(
+                        [leaves[source].centroid.components()],
+                        candidate.centroid.components(),
+                    )[0];
                     retain_neighbor(&mut neighbors[source], (score, target));
                     retain_neighbor(&mut neighbors[target], (score, source));
                 }
@@ -248,12 +261,13 @@ fn refine(
             let distances = &neighbors[source][..NEIGHBOR_COUNT.min(leaves.len() - 1)];
             for &position in &leaf.members {
                 let vector = &vectors[position];
-                let old = kernel.routing_distances_validated([vector], &leaf.center)[0];
+                let old =
+                    kernel.routing_distances_validated([vector], leaf.centroid.components())[0];
                 let mut best = (old, source);
                 let (batches, tail) = distances.as_chunks::<4>();
                 for targets in batches {
                     let distances = kernel.routing_distances_validated(
-                        targets.map(|(_, target)| leaves[target].center.as_ref()),
+                        targets.map(|(_, target)| leaves[target].centroid.components()),
                         vector,
                     );
                     for (&(_, target), distance) in targets.iter().zip(distances) {
@@ -263,8 +277,10 @@ fn refine(
                     }
                 }
                 for &(_, target) in tail {
-                    let distance =
-                        kernel.routing_distances_validated([vector], &leaves[target].center)[0];
+                    let distance = kernel.routing_distances_validated(
+                        [vector],
+                        leaves[target].centroid.components(),
+                    )[0];
                     if distance < best.0 {
                         best = (distance, target);
                     }
@@ -298,9 +314,10 @@ fn refine(
         }
         for (leaf, mut members) in leaves.iter_mut().zip(members) {
             members.sort_unstable();
-            leaf.center = mean(
+            leaf.centroid = mean(
                 kernel,
                 members.iter().map(|&position| vectors[position].as_ref()),
+                leaf.level,
             )?;
             leaf.members = members;
         }
@@ -330,7 +347,7 @@ mod tests {
                         .unwrap()
                 })
                 .collect();
-            let expected_root = mean(&kernel, expected_leaves.iter().map(Box::as_ref)).unwrap();
+            let expected_root = mean(&kernel, expected_leaves.iter().map(Box::as_ref), 3).unwrap();
             let planner = Planner::new(&config, [7; 32], vectors, &|| Ok(())).unwrap();
             // Two trees reuse normalized vectors without transforming them a second time.
             for reverse in [false, true] {
@@ -346,7 +363,7 @@ mod tests {
                     key: PartitionKey::new(key).unwrap(),
                     parent: None,
                     level,
-                    center: vec![999.0, 999.0].into_boxed_slice(),
+                    centroid: PartitionCentroid::new(vec![999.0, 999.0]),
                     members,
                     children: children
                         .into_iter()
@@ -364,11 +381,11 @@ mod tests {
                     .unwrap();
                 for (leaf, expected) in [(4, &expected_leaves[0]), (5, &expected_leaves[1])] {
                     let part = &parts[positions[&PartitionKey::new(leaf).unwrap()]];
-                    assert_eq!(&part.center, expected);
+                    assert_eq!(part.centroid.components(), expected.as_ref());
                     assert_eq!(part.members, [usize::try_from(leaf - 4).unwrap()]);
                 }
                 assert_eq!(
-                    parts[positions[&PartitionKey::new(1).unwrap()]].center,
+                    parts[positions[&PartitionKey::new(1).unwrap()]].centroid,
                     expected_root
                 );
             }
@@ -388,19 +405,21 @@ mod tests {
                             parent: None,
                             level: 1,
                             // Repeated and zero centers exercise exact distance ties.
-                            center: kernel
-                                .normalize_centroid(
-                                    &(0..dimension)
-                                        .map(|d| {
-                                            if i % 9 == 0 {
-                                                0.0
-                                            } else {
-                                                ((i % 11 * 17 + d * 31) % 23) as f32 - 11.0
-                                            }
-                                        })
-                                        .collect::<Vec<_>>(),
-                                )
-                                .unwrap(),
+                            centroid: PartitionCentroid::new(
+                                kernel
+                                    .normalize_centroid(
+                                        &(0..dimension)
+                                            .map(|d| {
+                                                if i % 9 == 0 {
+                                                    0.0
+                                                } else {
+                                                    ((i % 11 * 17 + d * 31) % 23) as f32 - 11.0
+                                                }
+                                            })
+                                            .collect::<Vec<_>>(),
+                                    )
+                                    .unwrap(),
+                            ),
                             members: vec![],
                             children: vec![],
                         })
@@ -414,7 +433,10 @@ mod tests {
                             .map(|(target, candidate)| {
                                 (
                                     kernel
-                                        .routing_distance(&leaf.center, &candidate.center)
+                                        .routing_distance(
+                                            leaf.centroid.components(),
+                                            candidate.centroid.components(),
+                                        )
                                         .unwrap(),
                                     target,
                                 )
@@ -452,7 +474,7 @@ mod tests {
                 key: PartitionKey::new(i + 1).unwrap(),
                 parent: None,
                 level: 1,
-                center: vec![i as f32].into_boxed_slice(),
+                centroid: PartitionCentroid::new(vec![i as f32]),
                 members: Vec::new(),
                 children: Vec::new(),
             })
@@ -489,7 +511,7 @@ mod tests {
                 key: PartitionKey::new(2).unwrap(),
                 level: 1,
                 members: vec![0, 2],
-                center: vec![4.5].into(),
+                centroid: PartitionCentroid::new(vec![4.5]),
             },
             Part {
                 parent: None,
@@ -497,7 +519,7 @@ mod tests {
                 key: PartitionKey::new(3).unwrap(),
                 level: 1,
                 members: vec![1, 3],
-                center: vec![5.5].into(),
+                centroid: PartitionCentroid::new(vec![5.5]),
             },
         ];
         let mut moves = Vec::new();
@@ -527,8 +549,8 @@ mod tests {
         .unwrap();
         assert_eq!(leaves[0].members, [0, 1]);
         assert_eq!(leaves[1].members, [2, 3]);
-        assert_eq!(leaves[0].center.as_ref(), [0.5]);
-        assert_eq!(leaves[1].center.as_ref(), [9.5]);
+        assert_eq!(leaves[0].centroid.components(), [0.5]);
+        assert_eq!(leaves[1].centroid.components(), [9.5]);
         assert_eq!(
             moves,
             [
@@ -555,7 +577,7 @@ mod tests {
                 key: PartitionKey::new(cluster as u64 + 2).unwrap(),
                 level: 1,
                 members: (cluster * 3..cluster * 3 + 3).collect(),
-                center: vec![cluster as f32 * 10.0].into(),
+                centroid: PartitionCentroid::new(vec![cluster as f32 * 10.0]),
             })
             .collect();
         for pair in leaves[..8].as_chunks_mut::<2>().0 {

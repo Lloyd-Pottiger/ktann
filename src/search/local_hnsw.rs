@@ -119,7 +119,9 @@ impl<'a> Centroids<'a> {
             }
             let hit = Ranked(Candidate {
                 node: node as u32,
-                distance: self.distance(query, child.centroid()),
+                distance: self
+                    .kernel
+                    .leaf_routing_score(self.distance(query, child.centroid()), child),
             });
             if best.len() < beam {
                 best.push(hit);
@@ -260,8 +262,15 @@ pub(crate) fn search_graph_scoring(
     let mut hits = Vec::new();
     hits.try_reserve_exact(beam).map_err(|_| limit())?;
     hits.resize(beam, Candidate::default());
-    let distance =
-        |_: u32, node: u32| centroids.distance(query, centroids.children[node as usize].centroid());
+    let distance = |_: u32, node: u32| {
+        let child = &centroids.children[node as usize];
+        let raw = centroids.distance(query, child.centroid());
+        if batched {
+            raw
+        } else {
+            centroids.kernel.leaf_routing_score(raw, child)
+        }
+    };
     let distance_four = |_: u32, nodes: &[u32], output: &mut [f64]| match *nodes {
         [a, b] => output.copy_from_slice(&centroids.kernel.routing_distances_validated(
             [

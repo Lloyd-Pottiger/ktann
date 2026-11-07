@@ -306,7 +306,7 @@ fn index_value_family_golden_bytes() {
                 vec![2.0_f32]
             )))
             .expect("encode"),
-        b"\x08\x00\x00\x00\x01\x40\x00\x00\x00"
+        b"\x08\x00\x00\x00\x01\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
     );
     assert_eq!(
         codec
@@ -315,7 +315,7 @@ fn index_value_family_golden_bytes() {
                 vec![2.0_f32]
             )))
             .expect("encode"),
-        b"\x09\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x01\x40\x00\x00\x00"
+        b"\x09\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x01\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
     );
 
     let mut leaf = vec![0x0a, 0x00, 0x01, b'r', 0x00, 0x00];
@@ -1208,4 +1208,45 @@ fn graph_configuration_round_trip_and_malformed_parameters() {
     }
     assert_ne!(manifest.config(), base.config());
     assert_eq!(manifest.config().local_graph(), Some(graph));
+}
+
+#[test]
+fn routing_dispersion_roundtrips_and_rejects_noncanonical_values() {
+    let manifest = minimal_manifest();
+    let codec = index_codec(&manifest);
+    for sigma in [0.0, 0.5, 1.0] {
+        let model = PartitionCentroid::with_dispersion(vec![0.0], sigma).unwrap();
+        for value in [
+            PersistentValue::PartitionCentroid(model.clone()),
+            PersistentValue::ChildEntry(ChildEntry::from_centroid(pk(2), model.clone())),
+        ] {
+            let encoded = codec.encode(&value).unwrap();
+            assert_eq!(
+                &encoded[encoded.len() - 8..],
+                &sigma.to_bits().to_be_bytes()
+            );
+            assert_eq!(decode_value(codec, id(1), &value, &encoded).unwrap(), value);
+            for bits in [
+                (-0.0_f64).to_bits(),
+                (-0.1_f64).to_bits(),
+                1.1_f64.to_bits(),
+                f64::NAN.to_bits(),
+                f64::INFINITY.to_bits(),
+            ] {
+                let mut bad = encoded.to_vec();
+                let start = bad.len() - 8;
+                bad[start..].copy_from_slice(&bits.to_be_bytes());
+                assert_corrupt(decode_value(codec, id(1), &value, &bad));
+            }
+            assert_corrupt(decode_value(
+                codec,
+                id(1),
+                &value,
+                &encoded[..encoded.len() - 1],
+            ));
+        }
+    }
+    for bad in [-0.1, 1.1, f64::NAN, f64::INFINITY] {
+        assert!(PartitionCentroid::with_dispersion(vec![0.0], bad).is_err());
+    }
 }
