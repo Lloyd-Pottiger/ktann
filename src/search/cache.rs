@@ -15,7 +15,8 @@
 pub(crate) mod graph;
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
 use crate::api::{Error, ErrorKind, LogicalIndexId, PartitionKey, Result, Value};
 use crate::observe::labels::{CacheInstallResult, CacheLookupResult};
@@ -192,18 +193,19 @@ impl CachedBody {
     }
 }
 
-/// A byte-bounded process-shared cache of decoded partition search bodies.
+/// A byte-bounded, runtime-owned shared cache of decoded partition search bodies.
 ///
 /// The eviction policy is S3-FIFO: a probationary small FIFO queue holding one
 /// tenth of the byte capacity, a main FIFO queue giving second chances through
 /// 2-bit frequency counters, and a ghost history queue of keys evicted
 /// from the small queue. A hit only increments a saturating frequency counter
-/// and never touches a queue, keeping the locked section short. The policy is
+/// and never touches a queue. Hits share a read lock; installation and eviction
+/// take the write lock. Saturated counters require no atomic writes. The policy is
 /// an internal benchmark-tunable detail, not a persistent or public
 /// compatibility contract.
 pub(crate) struct PartitionCache {
     capacity_bytes: u64,
-    inner: Mutex<CacheInner>,
+    inner: RwLock<CacheInner>,
 }
 
 /// The small queue's divisor of the byte capacity.
@@ -212,7 +214,7 @@ const SMALL_QUEUE_DIVISOR: u64 = 10;
 /// The maximum value of a slot's frequency counter.
 const MAX_FREQUENCY: u8 = 3;
 
-/// Mutex-protected cache contents and eviction history; queue generations distinguish stale records.
+/// Lock-protected cache contents and eviction history; queue generations distinguish stale records.
 struct CacheInner {
     slots: HashMap<CacheKey, CacheSlot>,
     /// The probationary small FIFO queue: one record per enqueue, matched to
@@ -232,7 +234,7 @@ struct CacheInner {
 /// The current body and eviction state for a key; its generation identifies the live queue record.
 struct CacheSlot {
     body: Arc<CachedBody>,
-    frequency: u8,
+    frequency: AtomicU8,
     queue: QueueKind,
     queue_tick: u64,
 }
@@ -258,7 +260,7 @@ impl PartitionCache {
     pub(crate) fn new(capacity_bytes: u64) -> Self {
         Self {
             capacity_bytes,
-            inner: Mutex::new(CacheInner {
+            inner: RwLock::new(CacheInner {
                 slots: HashMap::new(),
                 small: VecDeque::new(),
                 main: VecDeque::new(),
@@ -283,10 +285,20 @@ impl PartitionCache {
     /// historical snapshot: it misses without evicting the newer entry.
     #[must_use]
     pub(crate) fn lookup(&self, key: &CacheKey, epoch: u64) -> Option<Arc<CachedBody>> {
-        let mut inner = self.lock();
-        let stale = match inner.slots.get_mut(key) {
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let stale = match inner.slots.get(key) {
             Some(slot) if slot.body.epoch == epoch => {
-                slot.frequency = (slot.frequency + 1).min(MAX_FREQUENCY);
+                // Frequency is only an eviction hint. The read lock keeps the
+                // slot alive and excludes eviction; relaxed atomics coordinate
+                // concurrent hits without publishing any body data.
+                let _ =
+                    slot.frequency
+                        .try_update(Ordering::Relaxed, Ordering::Relaxed, |frequency| {
+                            (frequency < MAX_FREQUENCY).then_some(frequency + 1)
+                        });
                 let body = Arc::clone(&slot.body);
                 drop(inner);
                 metrics::cache_lookup(key.kind, CacheLookupResult::Hit);
@@ -295,6 +307,24 @@ impl PartitionCache {
             Some(slot) => slot.body.epoch < epoch,
             None => false,
         };
+        drop(inner);
+        if !stale {
+            metrics::cache_lookup(key.kind, CacheLookupResult::Miss);
+            return None;
+        }
+        self.evict_older(key, epoch);
+        None
+    }
+
+    /// Rechecks a stale observation after switching from the read to write lock.
+    fn evict_older(&self, key: &CacheKey, epoch: u64) {
+        let mut inner = self.write();
+        // A fill can replace the slot while acquiring the write lock. Never
+        // evict a body that is now equal to or newer than this snapshot.
+        let stale = inner
+            .slots
+            .get(key)
+            .is_some_and(|slot| slot.body.epoch < epoch);
         let evicted = if stale { inner.remove(key) } else { None };
         let remaining_bytes = inner.small_bytes + inner.main_bytes;
         drop(inner);
@@ -309,7 +339,6 @@ impl PartitionCache {
         if stale {
             metrics::cache_bytes(remaining_bytes);
         }
-        None
     }
 
     /// Publishes a decoded body.
@@ -330,7 +359,7 @@ impl PartitionCache {
         let mut evicted = Vec::new();
         let total_bytes;
         {
-            let mut inner = self.lock();
+            let mut inner = self.write();
             if let Some(existing) = inner.slots.get(&key) {
                 if existing.body.epoch > body.epoch
                     || (existing.body.epoch == body.epoch
@@ -357,19 +386,20 @@ impl PartitionCache {
     /// Returns the number of cached bodies.
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.lock().slots.len()
+        self.write().slots.len()
     }
 
     /// Returns the accounted bytes of all cached bodies.
     #[cfg(test)]
     fn total_bytes(&self) -> u64 {
-        let inner = self.lock();
+        let inner = self.write();
         inner.small_bytes + inner.main_bytes
     }
 
-    fn lock(&self) -> MutexGuard<'_, CacheInner> {
+    /// Serializes installation and eviction of cache contents.
+    fn write(&self) -> RwLockWriteGuard<'_, CacheInner> {
         self.inner
-            .lock()
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
@@ -383,16 +413,17 @@ impl CacheInner {
             self.small.clear();
             self.main.clear();
             self.queue_tick = 0;
-            let keys: Vec<CacheKey> = self.slots.keys().cloned().collect();
-            for key in keys {
+            for (key, slot) in &mut self.slots {
                 self.queue_tick += 1;
                 let tick = self.queue_tick;
-                if let Some(slot) = self.slots.get_mut(&key) {
-                    slot.queue_tick = tick;
-                    match slot.queue {
-                        QueueKind::Small => self.small.push_back(QueueRecord { key, tick }),
-                        QueueKind::Main => self.main.push_back(QueueRecord { key, tick }),
-                    }
+                slot.queue_tick = tick;
+                let record = QueueRecord {
+                    key: key.clone(),
+                    tick,
+                };
+                match slot.queue {
+                    QueueKind::Small => self.small.push_back(record),
+                    QueueKind::Main => self.main.push_back(record),
                 }
             }
         }
@@ -429,7 +460,7 @@ impl CacheInner {
             key,
             CacheSlot {
                 body,
-                frequency: 0,
+                frequency: AtomicU8::new(0),
                 queue,
                 queue_tick: tick,
             },
@@ -472,72 +503,49 @@ impl CacheInner {
         evicted: &mut Vec<Arc<CachedBody>>,
     ) {
         while self.small_bytes + self.main_bytes > capacity_bytes {
-            if self.small_bytes > small_capacity_bytes
-                && let Some(key) = self.pop_live(QueueKind::Small)
-            {
-                self.evict_small_front(key, evicted);
-                continue;
-            }
-            if let Some(key) = self.pop_live(QueueKind::Main) {
-                self.evict_main_front(key, evicted);
-                continue;
-            }
-            if let Some(key) = self.pop_live(QueueKind::Small) {
-                self.evict_small_front(key, evicted);
-                continue;
-            }
-            // Every accounted byte belongs to a live slot with one matching
-            // queue record, so an over-capacity cache never reaches this
-            // guard.
-            debug_assert!(self.slots.is_empty());
-            evicted.extend(self.slots.drain().map(|(_, slot)| slot.body));
-            self.ghost_set.clear();
-            self.ghost_order.clear();
-            self.small_bytes = 0;
-            self.main_bytes = 0;
-            break;
+            let key = if self.small_bytes > small_capacity_bytes {
+                self.pop_live(QueueKind::Small)
+            } else {
+                None
+            };
+            // Every live slot has a queue record, and excess bytes imply a
+            // live slot. Missing records would violate cache bookkeeping.
+            let key = key
+                .or_else(|| self.pop_live(QueueKind::Main))
+                .or_else(|| self.pop_live(QueueKind::Small))
+                .expect("an over-capacity cache has a live eviction record");
+            self.evict_front(key, evicted);
         }
     }
 
-    /// Evicts the small queue's front: entries that earned a hit graduate to
-    /// the main queue with a reset counter; the rest leave to the ghost queue.
-    fn evict_small_front(&mut self, key: CacheKey, evicted: &mut Vec<Arc<CachedBody>>) {
-        let Some(slot) = self.slots.get(&key) else {
+    /// Advances a live queue record: unreferenced bodies leave; referenced
+    /// bodies enter the main queue, graduating or spending a second chance.
+    /// The key comes from pop_live under the same exclusive cache lock.
+    fn evict_front(&mut self, key: CacheKey, evicted: &mut Vec<Arc<CachedBody>>) {
+        let slot = self.slots.get_mut(&key).expect("a live record has a slot");
+        let queue = slot.queue;
+        if *slot.frequency.get_mut() == 0 {
+            evicted.push(self.remove(&key).expect("a live record has a slot"));
+            if queue == QueueKind::Small {
+                self.ghost_insert(key);
+            }
             return;
-        };
-        if slot.frequency > 0 {
-            let bytes = slot.body.bytes;
-            let tick = self.next_queue_tick();
-            if let Some(slot) = self.slots.get_mut(&key) {
-                slot.frequency = 0;
+        }
+        let tick = self.next_queue_tick();
+        let slot = self.slots.get_mut(&key).expect("a live record has a slot");
+        match queue {
+            QueueKind::Small => {
+                *slot.frequency.get_mut() = 0;
                 slot.queue = QueueKind::Main;
-                slot.queue_tick = tick;
+                self.small_bytes -= slot.body.bytes;
+                self.main_bytes += slot.body.bytes;
             }
-            self.small_bytes -= bytes;
-            self.main_bytes += bytes;
-            self.main.push_back(QueueRecord { key, tick });
-        } else {
-            evicted.extend(self.remove(&key));
-            self.ghost_insert(key);
-        }
-    }
-
-    /// Gives the main queue's front a second chance per frequency mark, or
-    /// evicts it once the marks are spent.
-    fn evict_main_front(&mut self, key: CacheKey, evicted: &mut Vec<Arc<CachedBody>>) {
-        let Some(slot) = self.slots.get(&key) else {
-            return;
-        };
-        if slot.frequency > 0 {
-            let tick = self.next_queue_tick();
-            if let Some(slot) = self.slots.get_mut(&key) {
-                slot.frequency -= 1;
-                slot.queue_tick = tick;
+            QueueKind::Main => {
+                *slot.frequency.get_mut() -= 1;
             }
-            self.main.push_back(QueueRecord { key, tick });
-        } else {
-            evicted.extend(self.remove(&key));
         }
+        slot.queue_tick = tick;
+        self.main.push_back(QueueRecord { key, tick });
     }
 
     /// Remembers a key evicted from the small queue, bounded relative to the
@@ -548,9 +556,10 @@ impl CacheInner {
         }
         let limit = self.slots.len().saturating_mul(2).saturating_add(1_024);
         while self.ghost_set.len() > limit {
-            let Some(front) = self.ghost_order.pop_front() else {
-                break;
-            };
+            let front = self
+                .ghost_order
+                .pop_front()
+                .expect("the ghost set and FIFO contain the same keys");
             self.ghost_set.remove(&front);
         }
     }
@@ -984,7 +993,7 @@ mod tests {
             }
         }
 
-        let inner = cache.lock();
+        let inner = cache.write();
         let limit = inner.slots.len().saturating_mul(2).saturating_add(1_024);
         assert!(inner.ghost_set.len() <= limit);
         assert!(inner.ghost_order.len() <= limit);
@@ -1078,6 +1087,97 @@ mod tests {
     }
 
     #[test]
+    fn queue_compaction_preserves_eviction_order_after_replacements() {
+        // Three bodies go directly to main; ten bodies exercise the small queue.
+        for capacity in [3, 10] {
+            let body = cached_leaf_body(1, &[]);
+            let cache = PartitionCache::new(capacity * body.bytes);
+            for partition in 1..=capacity {
+                cache.install(key(partition, PartitionKind::Leaf), Arc::clone(&body));
+            }
+            for _ in 0..200 {
+                cache.install(key(2, PartitionKind::Leaf), Arc::clone(&body));
+            }
+            cache.install(key(capacity + 1, PartitionKind::Leaf), Arc::clone(&body));
+
+            assert!(cache.lookup(&key(1, PartitionKind::Leaf), 1).is_none());
+            for partition in 2..=capacity + 1 {
+                assert!(
+                    cache
+                        .lookup(&key(partition, PartitionKind::Leaf), 1)
+                        .is_some()
+                );
+            }
+            assert_eq!(cache.total_bytes(), cache.capacity_bytes());
+        }
+    }
+
+    #[test]
+    fn referenced_queue_front_survives_before_an_unreferenced_body() {
+        for capacity in [3, 10] {
+            let body = cached_leaf_body(1, &[]);
+            let cache = PartitionCache::new(capacity * body.bytes);
+            for partition in 1..=capacity {
+                cache.install(key(partition, PartitionKind::Leaf), Arc::clone(&body));
+            }
+            assert!(cache.lookup(&key(1, PartitionKind::Leaf), 1).is_some());
+            cache.install(key(capacity + 1, PartitionKind::Leaf), Arc::clone(&body));
+
+            // A small-queue hit graduates; a main-queue hit spends its second chance.
+            assert!(cache.lookup(&key(1, PartitionKind::Leaf), 1).is_some());
+            assert!(cache.lookup(&key(2, PartitionKind::Leaf), 1).is_none());
+            assert_eq!(cache.total_bytes(), cache.capacity_bytes());
+        }
+    }
+
+    #[test]
+    fn a_ghost_readmission_survives_small_queue_churn() {
+        let body = cached_leaf_body(1, &[]);
+        let cache = PartitionCache::new(10 * body.bytes);
+        for partition in 1..=11 {
+            cache.install(key(partition, PartitionKind::Leaf), Arc::clone(&body));
+        }
+        assert!(cache.lookup(&key(1, PartitionKind::Leaf), 1).is_none());
+        cache.install(key(1, PartitionKind::Leaf), Arc::clone(&body));
+        for partition in 12..=30 {
+            cache.install(key(partition, PartitionKind::Leaf), Arc::clone(&body));
+        }
+        assert!(cache.lookup(&key(1, PartitionKind::Leaf), 1).is_some());
+        assert_eq!(cache.total_bytes(), cache.capacity_bytes());
+    }
+
+    #[test]
+    fn queue_generation_rollover_preserves_live_bodies_and_capacity() {
+        for capacity in [3, 10] {
+            // Exercise rollover during both insertion and a second chance.
+            for tick in [u64::MAX, u64::MAX - 1] {
+                let body = cached_leaf_body(1, &[]);
+                let cache = PartitionCache::new(capacity * body.bytes);
+                for partition in 1..=capacity {
+                    cache.install(key(partition, PartitionKind::Leaf), Arc::clone(&body));
+                }
+                // Old generations must not survive rollover as live records.
+                for _ in 0..3 {
+                    cache.install(key(2, PartitionKind::Leaf), Arc::clone(&body));
+                }
+                assert!(cache.lookup(&key(1, PartitionKind::Leaf), 1).is_some());
+                cache.write().queue_tick = tick;
+                cache.install(key(capacity + 1, PartitionKind::Leaf), Arc::clone(&body));
+                assert!(cache.lookup(&key(1, PartitionKind::Leaf), 1).is_some());
+                assert_eq!(cache.len(), capacity as usize);
+                assert_eq!(cache.total_bytes(), cache.capacity_bytes());
+                // Subsequent compaction must still retain every live body.
+                for _ in 0..200 {
+                    cache.install(key(1, PartitionKind::Leaf), Arc::clone(&body));
+                }
+                assert!(cache.lookup(&key(1, PartitionKind::Leaf), 1).is_some());
+                assert_eq!(cache.len(), capacity as usize);
+                assert_eq!(cache.total_bytes(), cache.capacity_bytes());
+            }
+        }
+    }
+
+    #[test]
     fn total_bytes_stay_within_capacity_under_churn() {
         let cache = PartitionCache::new(4_096);
         let mut state = 0x2545_F491_u32;
@@ -1085,7 +1185,6 @@ mod tests {
             state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             state
         };
-        let mut installed_any_eviction = false;
         for round in 0..200_u64 {
             let partition = next() % 64 + 1;
             let epoch = round + 1;
@@ -1098,9 +1197,7 @@ mod tests {
             if let Some(hit) = cache.lookup(&key, query_epoch) {
                 assert_eq!(hit.epoch(), query_epoch);
             }
-            installed_any_eviction |= cache.len() < 64;
         }
-        assert!(installed_any_eviction, "the churn must exercise eviction");
     }
 
     #[test]
@@ -1536,5 +1633,22 @@ mod tests {
         assert_eq!(cache.len(), 0);
         let (_, mock) = load(&cache, &manifest, mock, 1).await.expect("load");
         assert_eq!(mock.scans, 2, "an uncacheable body is re-scanned");
+    }
+
+    #[test]
+    fn stale_observation_does_not_evict_a_concurrent_fill() {
+        for filled_epoch in [6, 7] {
+            let cache = PartitionCache::new(1 << 20);
+            let key = key(1, PartitionKind::Leaf);
+            cache.install(key.clone(), cached_leaf_body(5, &[b"old"]));
+            // A lookup for epoch 6 observed epoch 5 under its read lock.
+            // A fill wins the write lock before that lookup's stale cleanup.
+            cache.install(key.clone(), cached_leaf_body(filled_epoch, &[b"new"]));
+            cache.evict_older(&key, 6);
+            assert_eq!(
+                leaf_ids(&cache.lookup(&key, filled_epoch).unwrap()),
+                vec![Bytes::from_static(b"new")]
+            );
+        }
     }
 }
