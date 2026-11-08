@@ -126,7 +126,7 @@ Small mutable operational metadata associated with one partition.
 _Avoid_: Weak count hint, topology state
 
 **Partition Cache**:
-A process-shared cache of decoded partition search data.
+A runtime-owned shared cache of decoded partition search data.
 _Avoid_: Persistent cache, pinned-root map
 
 **Fixup Worker**:

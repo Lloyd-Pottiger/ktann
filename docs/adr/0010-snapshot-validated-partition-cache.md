@@ -1,5 +1,9 @@
 # Cache decoded search bodies with snapshot validation
 
+Ownership clarification (2026-11-08): each Runtime owns its shared Partition
+Cache and byte capacity. The process-wide wording below describes process-local
+sharing among that Runtime's operations; separate Runtimes have separate caches.
+
 Search and foreground preparation share a process-wide byte-bounded cache of immutable decoded partition bodies. Internal entries contain Child Partition Key and full-f32 centroid, while leaf entries contain Record ID, RaBitQ7 search data, and exact filter fields. Empty bodies are cached too. State, Header, Synopsis, Vector Record, and Payload are never cached with the body.
 
 Header carries a checked u64 cache epoch. Every transaction that changes the search body increments it exactly once, including Child or Leaf Entry addition, replacement, deletion or movement, body-kind/level changes, target creation, and root promotion. State timestamps or other non-body State changes and Synopsis-only changes do not increment it; overflow is Corruption rather than wraparound. A search first reads the snapshot-visible Header and then looks up the cache. Equal epoch is a hit; a cached older epoch is a miss and is evicted; a cached newer epoch means the query is using a historical snapshot, so it misses without evicting the useful newer entry. Header I/O does not itself consume the distinct logically visited-partition budget.

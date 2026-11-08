@@ -343,10 +343,15 @@ Cached Record IDs own their bytes; cache accounting charges shared allocations
 once at their body owner, in addition to entry-owned data and the body envelope.
 Scoring uses the integer dot and conservative intervals above.
 
-Entries are immutable and never pinned. Concurrent misses may duplicate work and
-race to publish an equal or newer epoch; there is no waiter/cancellation state.
-Cache insertion may be skipped when an item exceeds capacity. Internal and leaf
-byte shares may be configured, but the eviction policy is an internal
+Entries are immutable and never pinned. Cache hits share a read lock and update
+only a saturating atomic frequency counter; saturated hits do not write the
+counter. Installation and eviction take the write lock. Stale cleanup rechecks
+the epoch after acquiring that lock so it cannot evict a concurrent equal or
+newer fill. Metrics and stale-body destruction run outside the lock.
+Concurrent misses may duplicate work and race to publish an equal or newer epoch;
+there is no waiter/cancellation state. Cache insertion may be skipped when an
+item exceeds capacity. All body kinds share the Runtime's byte capacity;
+the eviction policy is an internal
 benchmark-driven detail, not a persistent or public compatibility contract.
 Corruption is never cached.
 

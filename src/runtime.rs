@@ -829,7 +829,7 @@ impl<B: Backend> RuntimeInner<B> {
         &self.config
     }
 
-    /// Returns a shared handle to the process-wide snapshot-validated
+    /// Returns a shared handle to this Runtime's snapshot-validated
     /// Partition Cache.
     pub(crate) fn partition_cache(&self) -> Arc<PartitionCache> {
         Arc::clone(&self.partition_cache)
