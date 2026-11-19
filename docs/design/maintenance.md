@@ -231,6 +231,10 @@ parent waits for that parent's source to finish, preserving the combined
 source/receiver graph bound. State-only transitions keep the body epoch and
 graph unchanged. Leaf membership changes do not rebuild parent graphs.
 
+For a non-root Leaf already Splitting when a step begins, the driver checks
+cancellation and trains from the source snapshot before waiting for graph body
+locks. Exposure uses those centroids only for the same two target Partition Keys.
+
 Participating graph bodies are guarded in Partition Key order before reading
 payloads. A waiting plan refreshes its snapshot after guard acquisition; incoming
 edge discovery then uses that snapshot. Exact publication fences remain the write
