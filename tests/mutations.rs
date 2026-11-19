@@ -1044,11 +1044,11 @@ async fn batched_inserts_share_routing_and_apply_writes_once() {
     assert_eq!(outcomes.len(), N);
 
     let counts = backend.operation_counts();
-    // One grouped descent for the whole batch: one Tree Manifest read, one
-    // root authority read, one batched authority (Header+State) read for both
+    // One grouped descent for the whole batch: one combined read for the
+    // Tree Manifest and root authority, one batched authority (Header+State) read for both
     // leaves, and one batched Child Entry scan round, independent of the
     // batch size.
-    assert_eq!(counts.get, 1, "plain reads: {counts:?}");
+    assert_eq!(counts.get, 0, "plain reads: {counts:?}");
     assert_eq!(counts.batch_get, 2, "batched authority reads: {counts:?}");
     assert_eq!(counts.scan, 0, "standalone scans: {counts:?}");
     assert_eq!(counts.batch_scan, 1, "batched scan rounds: {counts:?}");

@@ -342,12 +342,33 @@ async fn read_tree_manifest_plain<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     tree_key: &TreeKey,
 ) -> Result<Option<TreeManifest>> {
-    let manifest = txn.require_manifest()?;
-    let key = LogicalKey::TreeManifest {
-        index: manifest.logical_index_id(),
-        tree_key: tree_key.clone(),
-    };
-    match txn.get(key).await? {
+    let index = txn.require_manifest()?.logical_index_id();
+    // Every tree starts at the same Partition Key. Read the directory and the
+    // first routing hop together; descent reuses the transaction's read cache.
+    let partition = topology::root_partition();
+    let values = txn
+        .batch_get(vec![
+            LogicalKey::TreeManifest {
+                index,
+                tree_key: tree_key.clone(),
+            },
+            LogicalKey::Header {
+                index,
+                tree_key: tree_key.clone(),
+                partition,
+            },
+            LogicalKey::State {
+                index,
+                tree_key: tree_key.clone(),
+                partition,
+            },
+        ])
+        .await?;
+    match values
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::new(ErrorKind::Backend))?
+    {
         Some(PersistentValue::TreeManifest(tree)) => Ok(Some(tree)),
         // The codec decodes a directory key only as a Tree Manifest, so a
         // different value kind is unreachable but must stay fail-closed.
