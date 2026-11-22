@@ -124,11 +124,11 @@ fn admit_plan_entry<T>(
 }
 
 /// Existing topology operation whose changed bodies are prepared together.
-enum Edit {
+enum Edit<'a> {
     Expose {
         left: PartitionKey,
         right: PartitionKey,
-        centroids: training::SplitCentroids,
+        centroids: &'a training::SplitCentroids,
     },
     Drain {
         moves: Vec<(ChildEntry, PartitionKey)>,
@@ -295,9 +295,9 @@ pub(crate) async fn advance_observed<'b, B: Backend>(
     let now = policy.now_unix_millis;
     let retry = policy.retry;
     let header = authority.header;
-    let state = authority.state;
+    let initial_state = authority.state;
     // Beginning maintenance changes State alone and retains the same body epoch.
-    if matches!(state, PartitionTransition::Ready { .. }) {
+    if matches!(initial_state, PartitionTransition::Ready { .. }) {
         return if header.entry_count() > manifest.config().max_partition_entries(header.level()) {
             Ok(fixup::Advance::Split(
                 split::advance_observed(backend, manifest, tree, partition, now, retry, authority)
@@ -312,7 +312,7 @@ pub(crate) async fn advance_observed<'b, B: Backend>(
     }
     // Graph publication owns in-flight steps that bypass the ordinary drivers.
     // Preserve their state-age observation before graph planning or leaf drains.
-    let kind = match state {
+    let kind = match initial_state {
         PartitionTransition::Splitting { .. } | PartitionTransition::DrainingSplit { .. } => {
             Some(crate::observe::labels::FixupKind::Split)
         }
@@ -320,11 +320,11 @@ pub(crate) async fn advance_observed<'b, B: Backend>(
         _ => None,
     };
     if let Some(kind) = kind {
-        crate::observe::metrics::fixup_state_age(kind, now, state.started_at_unix_millis());
+        crate::observe::metrics::fixup_state_age(kind, now, initial_state.started_at_unix_millis());
     }
     // Leaf movement changes exact membership, not an internal routing graph.
     if header.level() == 1 && header.entry_count() > 0 {
-        match state {
+        match initial_state {
             PartitionTransition::DrainingSplit { .. } => {
                 drop(authority);
                 return Ok(fixup::Advance::Split(
@@ -355,7 +355,18 @@ pub(crate) async fn advance_observed<'b, B: Backend>(
             _ => {}
         }
     }
-    drop(authority);
+    // Leaf training needs only the source snapshot. Bind its routing model to
+    // the allocated targets; the parent edge is discovered after taking guards.
+    let trained_leaf = if header.level() == 1
+        && partition != topology::root_partition()
+        && matches!(initial_state, PartitionTransition::Splitting { .. })
+    {
+        executor.check_cancelled()?;
+        Some(training::train_split_centroids(authority.txn, tree, partition).await?)
+    } else {
+        drop(authority);
+        None
+    };
     let mut failures = 0;
     // Keep body ownership while refreshing a stale plan, so another local
     // publisher cannot invalidate the replacement snapshot during that read.
@@ -370,6 +381,10 @@ pub(crate) async fn advance_observed<'b, B: Backend>(
             header,
             state,
         } = observed;
+        if trained_leaf.is_some() && state != initial_state {
+            // Another worker advanced the split. Its new phase owns the next step.
+            return Ok(fixup::Advance::Idle);
+        }
         let participants = body_participants(
             &mut read,
             manifest,
@@ -412,11 +427,17 @@ pub(crate) async fn advance_observed<'b, B: Backend>(
             .working_bytes()
             .checked_sub(proof_bytes)
             .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+        let trained_under_guard;
         let edit = match state {
             PartitionTransition::Splitting { left, right, .. } => {
-                // Training uses the same existing deterministic split trainer.
-                let centroids = training::train_split_centroids(read, tree, partition).await?;
-                read = reads::open_validated_read(backend, manifest).await?;
+                let centroids = if let Some(centroids) = &trained_leaf {
+                    centroids
+                } else {
+                    trained_under_guard =
+                        training::train_split_centroids(read, tree, partition).await?;
+                    read = reads::open_validated_read(backend, manifest).await?;
+                    &trained_under_guard
+                };
                 if partition != topology::root_partition() {
                     let Some(parent) = parent else {
                         return Ok(fixup::Advance::Idle);
@@ -772,7 +793,7 @@ async fn apply<T: WriteTxn>(
     source: PartitionKey,
     now: u64,
     removal: topology::SourceRemoval,
-    edit: &Edit,
+    edit: &Edit<'_>,
     graphs: &[PreparedGraphTransition],
     parent_proof: Option<(PartitionKey, &topology::IncomingEdgeProof)>,
 ) -> Result<Option<fixup::Advance>> {

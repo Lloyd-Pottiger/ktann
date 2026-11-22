@@ -55,6 +55,14 @@ impl GraphMaintenance {
         }
     }
 
+    /// Checks cancellation before starting a new phase of graph maintenance.
+    pub(crate) fn check_cancelled(&self) -> Result<()> {
+        if self.cancellation.is_cancelled() {
+            return Err(Error::new(ErrorKind::Cancelled));
+        }
+        Ok(())
+    }
+
     /// Coordinates only overlapping graph bodies. Sorted acquisition prevents
     /// multi-body drains from deadlocking; weak entries bound the registry to
     /// active participants plus the last acquisition's keys. Callers must release
@@ -65,9 +73,7 @@ impl GraphMaintenance {
         tree: &TreeKey,
         mut partitions: Vec<PartitionKey>,
     ) -> Result<GraphBodyGuards> {
-        if self.cancellation.is_cancelled() {
-            return Err(Error::new(ErrorKind::Cancelled));
-        }
+        self.check_cancelled()?;
         partitions.sort_unstable();
         partitions.dedup();
         let locks = {

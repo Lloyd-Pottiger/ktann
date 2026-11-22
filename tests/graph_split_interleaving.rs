@@ -257,6 +257,25 @@ async fn sibling_splits_share_parent_preparation_without_stale_publication() {
     for child in [left, right] {
         advance(&backend, &manifest, &tree, child, &executor).await;
     }
+    // A pre-cancelled exposure must stop before scanning the source Leaf for training.
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    cancellation.cancel();
+    let cancelled = GraphMaintenance::new(&config, cancellation);
+    let scans = backend.operation_counts().scan;
+    let error = graph_topology::advance(
+        &backend,
+        &manifest,
+        &tree,
+        left,
+        1000,
+        &RetryPolicy::for_fixup(&config),
+        &cancelled,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.kind(), ktann::api::ErrorKind::Cancelled);
+    assert_eq!(backend.operation_counts().scan, scans);
+
     let retries_before: u64 = capture
         .metric_counters()
         .into_iter()
@@ -265,9 +284,11 @@ async fn sibling_splits_share_parent_preparation_without_stale_publication() {
         .sum();
     // join polls the second exposure while the first awaits native preparation.
     // Both change the same parent; the waiting plan must read it after ownership.
+    // A helper for the left Leaf must also discard its training if exposure won the race.
     tokio::join!(
         complete_split(&backend, &manifest, &tree, left, 0, &executor),
         complete_split(&backend, &manifest, &tree, right, 0, &executor),
+        advance(&backend, &manifest, &tree, left, &executor),
     );
     assert!(header_of(&backend, &manifest, &tree, left).await.is_none());
     assert!(header_of(&backend, &manifest, &tree, right).await.is_none());

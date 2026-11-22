@@ -189,6 +189,10 @@ async fn automatic_publish_across_runtimes_with_single_foreground_permit() {
     });
     wait_active(&job).await;
     wait_empty(&memory, job.logical_index_id()).await;
+    // Stop discovery before the final reads need the sole foreground permit.
+    cancel.cancel();
+    assert_eq!(a.await.unwrap().unwrap_err().kind(), ErrorKind::Cancelled);
+    assert_eq!(b.await.unwrap().unwrap_err().kind(), ErrorKind::Cancelled);
     let index = second.open_index("bulk").await.unwrap();
     assert!(
         index
@@ -198,9 +202,6 @@ async fn automatic_publish_across_runtimes_with_single_foreground_permit() {
             .issues
             .is_empty()
     );
-    cancel.cancel();
-    assert_eq!(a.await.unwrap().unwrap_err().kind(), ErrorKind::Cancelled);
-    assert_eq!(b.await.unwrap().unwrap_err().kind(), ErrorKind::Cancelled);
     first.shutdown().await.unwrap();
     second.shutdown().await.unwrap();
 }
