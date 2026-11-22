@@ -141,10 +141,7 @@ pub(crate) fn plan_tree_keys(
     // interval bounds ride on the expansion loop, not the prefix list.
     let mut prefixes: Vec<Vec<Value>> = vec![Vec::new()];
     let mut ranges = Vec::new();
-    for ordinal in 0..schema.types.len() {
-        let Some(set) = &constraints.sets[ordinal] else {
-            break;
-        };
+    for set in constraints.sets.iter().map_while(Option::as_ref) {
         if set.intervals.is_empty() {
             return Ok(TreeKeyPlan {
                 ranges: Vec::new(),
