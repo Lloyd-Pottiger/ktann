@@ -1,6 +1,6 @@
 //! Ephemeral centroid graph for bounded, approximate refinement candidates.
 
-use super::{LeafNeighbors, NEIGHBOR_COUNT, Part, retain_neighbor};
+use super::{LeafCenter, LeafNeighbors, NEIGHBOR_COUNT, retain_neighbor};
 use crate::api::{Error, ErrorKind, Result};
 use crate::search::{local_hnsw::native_error, numeric::VectorKernel};
 use std::cell::Cell;
@@ -37,7 +37,7 @@ pub(super) fn scratch_bytes(leaves: usize) -> Result<usize> {
 pub(super) fn neighbors(
     checkpoint: &impl Fn() -> Result<()>,
     kernel: &VectorKernel,
-    leaves: &[Part],
+    leaves: &[impl LeafCenter],
 ) -> Result<Vec<LeafNeighbors>> {
     let n = leaves.len();
     checkpoint()?;
@@ -52,8 +52,8 @@ pub(super) fn neighbors(
     let result = (|| {
         let distance = |a: u32, b: u32| {
             kernel.routing_distances_validated(
-                [leaves[a as usize].centroid.components()],
-                leaves[b as usize].centroid.components(),
+                [leaves[a as usize].center()],
+                leaves[b as usize].center(),
             )[0]
         };
         let build_limit = ktann_usearch::build_bound(n, M)?;
@@ -99,6 +99,7 @@ pub(super) fn neighbors(
 mod tests {
     use super::*;
     use crate::api::{Metric, PartitionKey};
+    use crate::refinement::Part;
     use crate::storage::values::PartitionCentroid;
 
     fn leaves(kernel: &VectorKernel) -> Vec<Part> {

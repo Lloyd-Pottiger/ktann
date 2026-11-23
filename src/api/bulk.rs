@@ -133,7 +133,7 @@ pub struct BulkWorkerOptions {
     pub serving_scratch_bytes: u64,
     /// One graph's borrowed centroids, native construction and encoding memory.
     pub graph_memory_bytes: usize,
-    /// Loaded topology, vectors, and planning scratch for artifact refinement.
+    /// Per-tree refinement metadata, move planning and cached routing vectors.
     pub refinement_memory_bytes: usize,
     /// Maximum size of each accepted artifact.
     pub max_artifact_bytes: u64,

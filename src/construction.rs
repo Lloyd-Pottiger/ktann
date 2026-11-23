@@ -4,10 +4,11 @@
 //! stream one Tree Key's original vectors and consume final partition plans.
 //! It does no backend IO and must run on a blocking worker, not an async executor.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
@@ -139,8 +140,34 @@ pub fn construct_tree(
     rotation_seed: [u8; 32],
     options: ConstructionOptions,
     records: impl IntoIterator<Item = Result<ConstructionRecord>>,
-    mut emit: impl FnMut(PartitionPlan) -> Result<()>,
+    emit: impl FnMut(PartitionPlan) -> Result<()>,
 ) -> Result<ConstructionReport> {
+    let (work, input) = stage(directory, config, rotation_seed, options, records)?;
+    build(work, Cow::Owned(input), emit)
+}
+
+/// Refined builds reuse the first canonical, preprocessed run for sequential replay.
+/// Its bytes stay charged while construction creates and removes child runs.
+pub(crate) fn construct_replayable(
+    directory: &Path,
+    config: &IndexConfig,
+    seed: [u8; 32],
+    options: ConstructionOptions,
+    records: impl IntoIterator<Item = Result<ConstructionRecord>>,
+    emit: impl FnMut(PartitionPlan) -> Result<()>,
+) -> Result<(ConstructionReport, Run)> {
+    let (work, input) = stage(directory, config, seed, options, records)?;
+    let report = build(work, Cow::Borrowed(&input), emit)?;
+    Ok((report, input))
+}
+
+fn stage<'a>(
+    directory: &Path,
+    config: &'a IndexConfig,
+    rotation_seed: [u8; 32],
+    options: ConstructionOptions,
+    records: impl IntoIterator<Item = Result<ConstructionRecord>>,
+) -> Result<(Workspace<'a>, Run)> {
     let resident_rows = options.resident_rows(config)?;
     let kernel = VectorKernel::new(config.dimension(), config.metric(), rotation_seed)?;
     fs::create_dir(directory).map_err(|error| Error::with_source(ErrorKind::Backend, error))?;
@@ -163,12 +190,20 @@ pub fn construct_tree(
     }
     let input = input.finish()?;
     work.report.records = input.count;
+    Ok((work, input))
+}
+
+fn build(
+    mut work: Workspace<'_>,
+    mut input: Cow<'_, Run>,
+    mut emit: impl FnMut(PartitionPlan) -> Result<()>,
+) -> Result<ConstructionReport> {
+    let config = work.config;
     if input.count == 0 {
         work.remove(input)?;
         return Ok(work.report);
     }
     let mut level = 1;
-    let mut input = input;
     loop {
         if input.count <= u64::from(config.max_partition_entries(level)) {
             // The complete level fits in the root. It has no parent run, and
@@ -187,8 +222,7 @@ pub fn construct_tree(
         }
         let mut parents = work.writer()?;
         work.group(input, level, &mut parents, &mut emit)?;
-        let parents = parents.finish()?;
-        input = parents;
+        input = Cow::Owned(parents.finish()?);
         level = level
             .checked_add(1)
             .ok_or(Error::new(ErrorKind::LimitExceeded))?;
@@ -196,10 +230,103 @@ pub fn construct_tree(
 }
 
 /// An immutable canonical-ID run; each file belongs to this invocation.
-struct Run {
+#[derive(Clone)]
+pub(crate) struct Run {
     path: PathBuf,
     count: u64,
     bytes: u64,
+}
+
+impl Run {
+    fn reader(&self, dimension: usize, buffer_bytes: usize) -> Result<Input> {
+        let file = File::open(&self.path).map_err(|e| Error::with_source(ErrorKind::Backend, e))?;
+        if file
+            .metadata()
+            .map_err(|e| Error::with_source(ErrorKind::Backend, e))?
+            .len()
+            != self.bytes
+        {
+            return Err(Error::new(ErrorKind::Corruption));
+        }
+        Ok(Input {
+            reader: BufReader::with_capacity(buffer_bytes, file),
+            remaining: self.count,
+            encoded_vector: vec![0; dimension * 4],
+        })
+    }
+
+    /// Read and validate the admitted prefix once. The open reader replays only the suffix.
+    pub(crate) fn vectors<'a>(
+        &self,
+        ids: &'a [Bytes],
+        dimension: usize,
+        budget: usize,
+        check: &impl Fn() -> Result<()>,
+    ) -> Result<RoutingVectors<'a>> {
+        if ids.len() as u64 != self.count {
+            return Err(Error::new(ErrorKind::Corruption));
+        }
+        let keep = ids.len().min(budget / (dimension * size_of::<f32>() + 32));
+        let mut input = self.reader(dimension, 256 * 1024)?;
+        let mut cached = Vec::with_capacity(keep);
+        let mut id = Vec::new();
+        for expected in &ids[..keep] {
+            check()?;
+            let mut vector = Vec::new();
+            input.read_vector(&mut id, &mut vector, expected)?;
+            cached.push(vector.into_boxed_slice());
+        }
+        let suffix = input
+            .reader
+            .stream_position()
+            .map_err(|e| Error::with_source(ErrorKind::Backend, e))?;
+        if keep as u64 == self.count {
+            input.check_end()?;
+        }
+        Ok(RoutingVectors {
+            ids_on_disk: &ids[keep..],
+            input,
+            cached,
+            suffix,
+        })
+    }
+
+    pub(crate) fn remove(&self) -> Result<()> {
+        fs::remove_file(&self.path).map_err(|e| Error::with_source(ErrorKind::Backend, e))
+    }
+}
+
+/// A fixed record-order prefix followed by the same sequential run suffix on every scan.
+pub(crate) struct RoutingVectors<'a> {
+    ids_on_disk: &'a [Bytes],
+    input: Input,
+    cached: Vec<Box<[f32]>>,
+    suffix: u64,
+}
+
+impl RoutingVectors<'_> {
+    pub(crate) fn scan(
+        &mut self,
+        mut visit: impl FnMut(usize, &[f32]) -> Result<()>,
+    ) -> Result<()> {
+        for (i, vector) in self.cached.iter().enumerate() {
+            visit(i, vector)?;
+        }
+        if self.ids_on_disk.is_empty() {
+            return Ok(());
+        }
+        self.input
+            .reader
+            .seek(SeekFrom::Start(self.suffix))
+            .map_err(|e| Error::with_source(ErrorKind::Backend, e))?;
+        let mut id = Vec::new();
+        let mut vector = Vec::new();
+        for (i, expected) in self.ids_on_disk.iter().enumerate() {
+            self.input.read_vector(&mut id, &mut vector, expected)?;
+            visit(self.cached.len() + i, &vector)?;
+        }
+        self.input.check_end()
+    }
 }
 
 /// An unfinished scratch run; flushing returns the descriptor used by later passes.
@@ -243,20 +370,50 @@ impl Row {
 }
 
 impl Input {
-    /// Reads one scratch row, rejecting invalid ID lengths, non-finite vector components, and trailing bytes.
     fn next(&mut self) -> Result<Option<Row>> {
         if self.remaining == 0 {
-            let mut tail = [0];
-            if self
-                .reader
-                .read(&mut tail)
-                .map_err(|error| Error::with_source(ErrorKind::Backend, error))?
-                != 0
-            {
-                return Err(Error::new(ErrorKind::Corruption));
-            }
+            self.check_end()?;
             return Ok(None);
         }
+        let mut id = Vec::new();
+        let mut vector = Vec::new();
+        self.read_into(&mut id, &mut vector)?;
+        self.remaining -= 1;
+        Ok(Some(Row {
+            label: 0,
+            id: Bytes::from(id),
+            vector: vector.into_boxed_slice(),
+        }))
+    }
+
+    fn check_end(&mut self) -> Result<()> {
+        if !self
+            .reader
+            .fill_buf()
+            .map_err(|e| Error::with_source(ErrorKind::Backend, e))?
+            .is_empty()
+        {
+            return Err(Error::new(ErrorKind::Corruption));
+        }
+        Ok(())
+    }
+
+    /// Detect a join mismatch before using a vector under the expected record's identity.
+    fn read_vector(
+        &mut self,
+        id: &mut Vec<u8>,
+        vector: &mut Vec<f32>,
+        expected: &[u8],
+    ) -> Result<()> {
+        self.read_into(id, vector)?;
+        if id != expected {
+            return Err(Error::new(ErrorKind::Corruption));
+        }
+        Ok(())
+    }
+
+    /// Keep the caller's buffers for sequential replay of uncached rows.
+    fn read_into(&mut self, id: &mut Vec<u8>, vector: &mut Vec<f32>) -> Result<()> {
         let mut len = [0; 4];
         self.reader
             .read_exact(&mut len)
@@ -265,33 +422,29 @@ impl Input {
         if len == 0 || len > MAX_ID_BYTES {
             return Err(Error::new(ErrorKind::Corruption));
         }
-        let mut id = vec![0; len];
+        id.resize(len, 0);
         self.reader
-            .read_exact(&mut id)
+            .read_exact(id)
             .map_err(|error| Error::with_source(ErrorKind::Corruption, error))?;
         // Read each vector in one call, including vectors larger than the IO buffer.
         self.reader
             .read_exact(&mut self.encoded_vector)
             .map_err(|error| Error::with_source(ErrorKind::Corruption, error))?;
-        let vector: Vec<f32> = self
-            .encoded_vector
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|bytes| f32::from_be_bytes(*bytes))
-            .collect();
+        vector.clear();
+        vector.extend(
+            self.encoded_vector
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| f32::from_be_bytes(*bytes)),
+        );
         if vector
             .iter()
             .fold(false, |invalid, value| invalid | !value.is_finite())
         {
             return Err(Error::new(ErrorKind::Corruption));
         }
-        self.remaining -= 1;
-        Ok(Some(Row {
-            label: 0,
-            id: Bytes::from(id),
-            vector: vector.into_boxed_slice(),
-        }))
+        Ok(())
     }
 }
 
@@ -375,25 +528,13 @@ impl Workspace<'_> {
     }
 
     fn reader(&self, run: &Run) -> Result<Input> {
-        let file =
-            File::open(&run.path).map_err(|error| Error::with_source(ErrorKind::Backend, error))?;
-        if file
-            .metadata()
-            .map_err(|error| Error::with_source(ErrorKind::Backend, error))?
-            .len()
-            != run.bytes
-        {
-            return Err(Error::new(ErrorKind::Corruption));
-        }
-        Ok(Input {
-            reader: BufReader::with_capacity(BUFFER_BYTES, file),
-            remaining: run.count,
-            encoded_vector: vec![0; self.kernel.dimension() * 4],
-        })
+        run.reader(self.kernel.dimension(), BUFFER_BYTES)
     }
 
-    fn remove(&mut self, run: Run) -> Result<()> {
-        fs::remove_file(run.path).map_err(|error| Error::with_source(ErrorKind::Backend, error))?;
+    /// A borrowed run belongs to refinement and remains on disk and charged to tree scratch.
+    fn remove(&mut self, run: Cow<'_, Run>) -> Result<()> {
+        let Cow::Owned(run) = run else { return Ok(()) };
+        run.remove()?;
         self.bytes = self
             .bytes
             .checked_sub(run.bytes)
@@ -535,7 +676,7 @@ impl Workspace<'_> {
     /// Both paths use deterministic sampling and ordering so spill decisions do not change topology.
     fn group(
         &mut self,
-        input: Run,
+        input: Cow<'_, Run>,
         level: u32,
         parents: &mut Output,
         emit: &mut impl FnMut(PartitionPlan) -> Result<()>,
@@ -633,7 +774,7 @@ impl Workspace<'_> {
             .map(Output::finish)
             .collect::<Result<_>>()?;
         for run in runs {
-            self.group(run, level, parents, emit)?;
+            self.group(Cow::Owned(run), level, parents, emit)?;
         }
         Ok(())
     }
@@ -1284,6 +1425,55 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn replay_requires_only_the_uncached_suffix_and_rejects_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(2, Metric::L2);
+        let records = records(4, false);
+        let ids: Vec<_> = records
+            .iter()
+            .map(|r| r.as_ref().unwrap().id.clone())
+            .collect();
+        let (_, run) = construct_replayable(
+            &dir.path().join("tree"),
+            &config,
+            [7; 32],
+            options(),
+            records,
+            |_| Ok(()),
+        )
+        .unwrap();
+        let mut cached = run.vectors(&ids, 2, usize::MAX, &|| Ok(())).unwrap();
+        let mut partial = run.vectors(&ids, 2, 40, &|| Ok(())).unwrap();
+        let mut expected = Vec::new();
+        partial
+            .scan(|_, v| {
+                expected.push(v.to_vec());
+                Ok(())
+            })
+            .unwrap();
+
+        // Both readers already exist. Only the cached stream can still replay every row.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&run.path)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        let mut actual = Vec::new();
+        cached
+            .scan(|_, v| {
+                actual.push(v.to_vec());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            partial.scan(|_, _| Ok(())).unwrap_err().kind(),
+            ErrorKind::Corruption
+        );
     }
 
     #[test]
