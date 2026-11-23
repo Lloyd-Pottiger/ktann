@@ -31,22 +31,24 @@ cleanup. `complete_with_control` applies cancellation and deadline control acros
 the entire operation. No automatic scheduler is started. Explicit `run_worker`,
 `load_serving`, and `publish` APIs remain available for phase control.
 
-Bulk Build and `Index::refine` share the in-memory planner in
-[`refinement`](../../src/refinement.rs): vector preprocessing, initial leaf means,
-assignment rounds and child-before-parent centroid refresh. Bulk preparation
-converts construction plans and retains only final membership; Runtime planning
-loads existing topology and observes moves for transactional publication. Neither
-path calls the other public lifecycle.
+Bulk Build and `Index::refine` share candidate discovery, scoring, move arbitration
+and centroid arithmetic in [refinement](../../src/refinement.rs). Bulk preparation
+scans routing vectors in canonical Record ID order, using the cached prefix
+and replaying only the uncached suffix. Runtime planning loads existing topology
+and observes moves for transactional publication. Bulk preparation emits the final
+membership.
 
 For a configuration with `LocalGraphConfig`, preparation refines
 membership and recomputes centroids before accepting the final Forest Artifact,
 then builds each internal graph exactly once from the final Child Entries while
 encoding Serving bytes. Omitted refinement preserves construction centroids.
-`refinement_memory_bytes` admits retained per-tree input, topology and numerical
-planning, including the transient candidate graph; `graph_memory_bytes` bounds one graph's centroids, native construction
-and serialization. Both are persisted worker resource limits, not semantic inputs.
-Failure exceeds neither budget by falling back or omitting work. Construction and
-refinement memory ceilings add while retained inputs feed construction.
+`refinement_memory_bytes` admits per-tree membership, topology, move and candidate
+workspace before caching routing vectors. The uncached suffix is read from the
+construction run in canonical ID order. The construction scratch quota covers
+the retained run alongside all other live construction files. Metadata that
+exceeds the refinement budget returns `LimitExceeded`. `graph_memory_bytes`
+separately bounds one serving graph's centroids, construction and serialization.
+Both budgets are persisted worker resource limits.
 
 After publication, graph-enabled indexes support ordinary mutations and graph-aware
 maintenance and caller-exclusive `Index::refine`, which atomically refreshes each

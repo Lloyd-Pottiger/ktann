@@ -1,8 +1,7 @@
-//! Shared in-memory refinement of fixed partition topology.
+//! Candidate discovery, move arbitration and centroid arithmetic for fixed-topology refinement.
 //!
-//! Callers admit retained inputs and scratch before constructing a planner.
-//! Preparation normalizes vectors once; each tree refreshes all centroids even
-//! with zero rounds. Persistence and artifact emission remain caller owned.
+//! The resident planner records accepted moves for transactional publication.
+//! Bulk Build uses the same numerical rules while scanning its budgeted vector cache and scratch run.
 
 mod hnsw;
 
@@ -16,7 +15,7 @@ use crate::storage::values::PartitionCentroid;
 const NEIGHBOR_COUNT: usize = 32;
 
 /// Sorted routing distances and leaf ordinals; unused slots sort last.
-type LeafNeighbors = [(f64, usize); NEIGHBOR_COUNT];
+pub(crate) type LeafNeighbors = [(f64, usize); NEIGHBOR_COUNT];
 
 /// Native candidate scratch is shared across sequential trees and rounds.
 pub(crate) fn candidate_scratch_bytes(leaves: usize, rounds: usize) -> Result<usize> {
@@ -34,6 +33,17 @@ pub(crate) struct Part {
     pub(crate) centroid: PartitionCentroid,
     pub(crate) members: Vec<usize>,
     pub(crate) children: Vec<PartitionKey>,
+}
+
+/// Candidate discovery and move scoring need only the routing centers of the leaves.
+pub(crate) trait LeafCenter {
+    fn center(&self) -> &[f32];
+}
+
+impl LeafCenter for Part {
+    fn center(&self) -> &[f32] {
+        self.centroid.components()
+    }
 }
 
 /// Normalized inputs shared by every tree in one admitted refinement operation.
@@ -65,16 +75,14 @@ impl Planner {
     }
 
     /// Refines fixed topology in child-before-parent order, preserving identities.
-    /// Returns key positions for callers retaining a different input order.
-    /// The move observer lets persistence retain history without charging artifacts
-    /// for a log they do not consume. Callers discard private state on failure.
+    /// The move observer records the ordered history needed for transactional publication.
     pub(crate) fn refine_tree(
         &self,
         parts: &mut [Part],
         rounds: usize,
         check: &impl Fn() -> Result<()>,
         on_move: impl FnMut(usize, usize, PartitionKey, PartitionKey),
-    ) -> Result<BTreeMap<PartitionKey, usize>> {
+    ) -> Result<()> {
         parts.sort_by_key(|part| (part.level, part.key));
         let leaves = parts.partition_point(|part| part.level == 1);
         for leaf in &mut parts[..leaves] {
@@ -100,34 +108,24 @@ impl Planner {
             rounds,
             on_move,
         )?;
-        refresh_internal_centers(&self.kernel, parts, leaves, check)
+        let positions: BTreeMap<_, _> = parts
+            .iter()
+            .enumerate()
+            .map(|(i, part)| (part.key, i))
+            .collect();
+        for i in leaves..parts.len() {
+            check()?;
+            parts[i].centroid = mean(
+                &self.kernel,
+                parts[i]
+                    .children
+                    .iter()
+                    .map(|key| parts[positions[key]].centroid.components()),
+                parts[i].level,
+            )?;
+        }
+        Ok(())
     }
-}
-
-/// Refreshes the hierarchy in child-before-parent order using unweighted means.
-fn refresh_internal_centers(
-    kernel: &VectorKernel,
-    parts: &mut [Part],
-    leaves: usize,
-    check: &impl Fn() -> Result<()>,
-) -> Result<BTreeMap<PartitionKey, usize>> {
-    let positions: BTreeMap<_, _> = parts
-        .iter()
-        .enumerate()
-        .map(|(i, part)| (part.key, i))
-        .collect();
-    for i in leaves..parts.len() {
-        check()?;
-        parts[i].centroid = mean(
-            kernel,
-            parts[i]
-                .children
-                .iter()
-                .map(|key| parts[positions[key]].centroid.components()),
-            parts[i].level,
-        )?;
-    }
-    Ok(positions)
 }
 
 /// Trains a routing model with canonical f64 accumulation; only leaves get dispersion.
@@ -139,13 +137,28 @@ fn mean<'a>(
     let mut sum = vec![0.0_f64; kernel.dimension()];
     let mut count = 0_usize;
     for vector in members {
-        for (sum, component) in sum.iter_mut().zip(vector) {
-            *sum += f64::from(*component);
-        }
+        add_to_sum(&mut sum, vector);
         count += 1;
     }
+    finish_mean(kernel, &sum, count, level)
+}
+
+/// Preserve the f64 addition order used to train routing centroids.
+pub(crate) fn add_to_sum(sum: &mut [f64], vector: &[f32]) {
+    for (sum, &component) in sum.iter_mut().zip(vector) {
+        *sum += f64::from(component);
+    }
+}
+
+/// Finalizes a mean accumulated in canonical membership order.
+pub(crate) fn finish_mean(
+    kernel: &VectorKernel,
+    sum: &[f64],
+    count: usize,
+    level: u32,
+) -> Result<PartitionCentroid> {
     let center: Vec<f32> = sum
-        .into_iter()
+        .iter()
         .map(|sum| (sum / count.max(1) as f64) as f32)
         .collect();
     let dispersion = if level == 1 {
@@ -160,10 +173,10 @@ fn mean<'a>(
 /// Large trees use a centroid HNSW; small trees score each symmetric pair once,
 /// updating both ends.
 /// Only the bounded neighbor lists survive; no quadratic distance matrix is kept.
-fn leaf_neighbors(
+pub(crate) fn leaf_neighbors(
     checkpoint: &impl Fn() -> Result<()>,
     kernel: &VectorKernel,
-    leaves: &[Part],
+    leaves: &[impl LeafCenter],
 ) -> Result<Vec<LeafNeighbors>> {
     if hnsw::enabled(leaves.len()) {
         return hnsw::neighbors(checkpoint, kernel, leaves);
@@ -183,10 +196,8 @@ fn leaf_neighbors(
                 let (batches, tail) = leaves[start..target_end].as_chunks::<4>();
                 for (batch, candidates) in batches.iter().enumerate() {
                     let scores = kernel.routing_distances_validated(
-                        candidates
-                            .each_ref()
-                            .map(|candidate| candidate.centroid.components()),
-                        leaves[source].centroid.components(),
+                        candidates.each_ref().map(|candidate| candidate.center()),
+                        leaves[source].center(),
                     );
                     for (lane, score) in scores.into_iter().enumerate() {
                         let target = start + batch * 4 + lane;
@@ -196,10 +207,9 @@ fn leaf_neighbors(
                 }
                 for (offset, candidate) in tail.iter().enumerate() {
                     let target = start + batches.len() * 4 + offset;
-                    let score = kernel.routing_distances_validated(
-                        [leaves[source].centroid.components()],
-                        candidate.centroid.components(),
-                    )[0];
+                    let score = kernel
+                        .routing_distances_validated([leaves[source].center()], candidate.center())
+                        [0];
                     retain_neighbor(&mut neighbors[source], (score, target));
                     retain_neighbor(&mut neighbors[target], (score, source));
                 }
@@ -224,6 +234,60 @@ fn retain_neighbor(neighbors: &mut LeafNeighbors, candidate: (f64, usize)) {
     let position = neighbors.partition_point(|previous| compare(previous).is_lt());
     neighbors.copy_within(position..last, position + 1);
     neighbors[position] = candidate;
+}
+
+/// Scores one record against its source and the fixed candidate list for this round.
+pub(crate) fn best_move(
+    kernel: &VectorKernel,
+    leaves: &[impl LeafCenter],
+    source: usize,
+    vector: &[f32],
+    neighbors: &LeafNeighbors,
+) -> Option<(f64, usize)> {
+    let distances = &neighbors[..NEIGHBOR_COUNT.min(leaves.len() - 1)];
+    let old = kernel.routing_distances_validated([vector], leaves[source].center())[0];
+    let mut best = (old, source);
+    let (batches, tail) = distances.as_chunks::<4>();
+    for targets in batches {
+        let distances = kernel.routing_distances_validated(
+            targets.map(|(_, target)| leaves[target].center()),
+            vector,
+        );
+        for (&(_, target), distance) in targets.iter().zip(distances) {
+            if distance < best.0 {
+                best = (distance, target);
+            }
+        }
+    }
+    for &(_, target) in tail {
+        let distance = kernel.routing_distances_validated([vector], leaves[target].center())[0];
+        if distance < best.0 {
+            best = (distance, target);
+        }
+    }
+    (best.1 != source).then_some((old - best.0, best.1))
+}
+
+/// Applies the global gain order, breaking ties by canonical record ordinal.
+pub(crate) fn accept_moves(
+    mut moves: Vec<(f64, usize, usize, usize)>,
+    counts: &mut [usize],
+    minimum: usize,
+    maximum: usize,
+    mut accept: impl FnMut(usize, usize, usize),
+) -> usize {
+    moves.sort_by(|left, right| right.0.total_cmp(&left.0).then(left.1.cmp(&right.1)));
+    let mut accepted = 0;
+    for (_, position, source, target) in moves {
+        if counts[source] > minimum && counts[target] < maximum {
+            counts[source] -= 1;
+            counts[target] += 1;
+            accept(position, source, target);
+            accepted += 1;
+        }
+    }
+    crate::observe::metrics::refinement_round(accepted);
+    accepted
 }
 
 /// Greedy positive-gain moves use fixed centroids during one round, then
@@ -258,51 +322,28 @@ fn refine(
         let mut moves = Vec::new();
         for (source, leaf) in leaves.iter().enumerate() {
             checkpoint()?;
-            let distances = &neighbors[source][..NEIGHBOR_COUNT.min(leaves.len() - 1)];
             for &position in &leaf.members {
                 let vector = &vectors[position];
-                let old =
-                    kernel.routing_distances_validated([vector], leaf.centroid.components())[0];
-                let mut best = (old, source);
-                let (batches, tail) = distances.as_chunks::<4>();
-                for targets in batches {
-                    let distances = kernel.routing_distances_validated(
-                        targets.map(|(_, target)| leaves[target].centroid.components()),
-                        vector,
-                    );
-                    for (&(_, target), distance) in targets.iter().zip(distances) {
-                        if distance < best.0 {
-                            best = (distance, target);
-                        }
-                    }
-                }
-                for &(_, target) in tail {
-                    let distance = kernel.routing_distances_validated(
-                        [vector],
-                        leaves[target].centroid.components(),
-                    )[0];
-                    if distance < best.0 {
-                        best = (distance, target);
-                    }
-                }
-                if best.1 != source {
-                    moves.push((old - best.0, position, source, best.1));
+                if let Some((gain, target)) =
+                    best_move(kernel, leaves, source, vector, &neighbors[source])
+                {
+                    moves.push((gain, position, source, target));
                 }
             }
         }
         drop(neighbors);
-        moves.sort_by(|left, right| right.0.total_cmp(&left.0).then(left.1.cmp(&right.1)));
         let mut counts: Vec<_> = leaves.iter().map(|leaf| leaf.members.len()).collect();
         let mut targets = BTreeMap::new();
-        for (_, position, source, target) in moves {
-            if counts[source] > minimum && counts[target] < maximum {
+        accept_moves(
+            moves,
+            &mut counts,
+            minimum,
+            maximum,
+            |position, source, target| {
                 on_move(round, position, leaves[source].key, leaves[target].key);
-                counts[source] -= 1;
-                counts[target] += 1;
                 targets.insert(position, target);
-            }
-        }
-        crate::observe::metrics::refinement_round(targets.len());
+            },
+        );
         if targets.is_empty() {
             break;
         }
@@ -374,20 +415,18 @@ mod tests {
                 if reverse {
                     parts.reverse();
                 }
-                let positions = planner
+                planner
                     .refine_tree(&mut parts, 0, &|| Ok(()), |_, _, _, _| {
                         panic!("zero rounds must not emit moves");
                     })
                     .unwrap();
+                let part = |key| parts.iter().find(|p| p.key.get() == key).unwrap();
                 for (leaf, expected) in [(4, &expected_leaves[0]), (5, &expected_leaves[1])] {
-                    let part = &parts[positions[&PartitionKey::new(leaf).unwrap()]];
+                    let part = part(leaf);
                     assert_eq!(part.centroid.components(), expected.as_ref());
                     assert_eq!(part.members, [usize::try_from(leaf - 4).unwrap()]);
                 }
-                assert_eq!(
-                    parts[positions[&PartitionKey::new(1).unwrap()]].centroid,
-                    expected_root
-                );
+                assert_eq!(part(1).centroid, expected_root);
             }
         }
     }

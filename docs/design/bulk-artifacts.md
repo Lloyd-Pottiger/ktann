@@ -20,7 +20,7 @@ serving lifecycle and exact-membership contracts are unchanged.
    and delegates each tree to the existing deterministic construction algorithm.
    `build_prepared` consumes receipt-time preparation. Plans are emitted in
    canonical tree order, child-before-parent with root Partition Key 1 last.
-   Optional bounded refinement runs on one retained tree before emission, reusing
+   Optional bounded refinement runs on one tree before emission, reusing
    the ordinary metric-correct assignment algorithm. Zero rounds refreshes leaf
    and bottom-up internal centroids; omission preserves construction output.
    Refinement round controls participate in the forest binding.
@@ -100,6 +100,15 @@ includes bounded row buffers and merge readers; numeric run IDs bound pending
 run metadata. Spilled uniqueness checks consume the final merge directly, avoiding
 an intermediate final run; ordinary sorted outputs still materialize their runs.
 Receipt-time sorters share their declared memory and scratch budget.
+When refinement is selected, construction keeps its canonical-ID run of
+preprocessed routing vectors until the tree is refined. Its bytes remain charged
+to tree scratch throughout construction. After admitting topology, membership,
+move and candidate workspace, refinement caches as many routing vectors as fit.
+Scoring moves and refreshing centers scan the same Record ID order at every
+budget. Only the uncached suffix is reread from scratch. Candidate discovery, move arbitration and f64 centroid arithmetic are shared
+with offline refinement.
+The working budget must still cover metadata for one tree, including its leaf
+centers and graph workspace. It is independent of the process-wide RSS.
 Forest sort scratch and per-tree construction scratch may overlap, so their
 ceilings add. Codec-bounded decoding buffers and a synopsis are additional to
 sort memory; caller-owned input and retained output are outside these budgets.

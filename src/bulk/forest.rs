@@ -8,7 +8,7 @@ use bytes::{Buf, Bytes};
 use sha2::{Digest, Sha256};
 
 use crate::api::{DataType, Error, ErrorKind, IndexConfig, Metric, Record, Result};
-use crate::construction::{ConstructionOptions, ConstructionRecord, PartitionPlan, construct_tree};
+use crate::construction::{ConstructionOptions, ConstructionRecord, PartitionPlan};
 use crate::storage::keys::{
     MAX_TREE_KEY_BYTES, TreeKey, decode_escaped_terminated, push_escaped_terminated,
     scan_escaped_terminated,
@@ -26,7 +26,7 @@ pub struct ForestOptions {
     pub sample_items: usize,
     /// Optional refinement after construction; zero refreshes centroids only.
     pub refinement_rounds: Option<u8>,
-    /// Additional per-tree input, topology, and refinement planning ceiling.
+    /// Per-tree ceiling for refinement metadata, move planning and cached routing vectors.
     pub refinement_memory_bytes: usize,
     /// Memory ceiling for construction of one tree.
     pub tree_memory_bytes: usize,
@@ -39,24 +39,13 @@ pub struct ForestOptions {
 }
 
 impl ForestOptions {
-    fn construction(self) -> ConstructionOptions {
+    pub(super) fn construction(self) -> ConstructionOptions {
         ConstructionOptions {
             sample_items: self.sample_items,
             memory_bytes: self.tree_memory_bytes,
             scratch_bytes: self.tree_scratch_bytes,
         }
     }
-}
-
-/// Conservative admission for retained preparation and numerical planning arrays.
-fn charge_refinement(used: &mut usize, bytes: usize, limit: usize) -> Result<()> {
-    *used = used
-        .checked_add(bytes)
-        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-    if *used > limit {
-        return Err(Error::new(ErrorKind::LimitExceeded));
-    }
-    Ok(())
 }
 
 /// Completed forest counts and algorithm-owned scratch IO evidence.
@@ -324,76 +313,17 @@ impl ForestArtifact {
                     Err(error) => Some(Err(error)),
                 }
             });
-            let mut emit = |partition: PartitionPlan| {
+            let emit = |partition: PartitionPlan| {
                 let mut frame = Vec::new();
                 frame.extend_from_slice(&(tree.as_bytes().len() as u32).to_be_bytes());
                 frame.extend_from_slice(tree.as_bytes());
                 plan::encode(&partition, &mut frame);
                 writer.append(&frame)
             };
-            let built = if let Some(rounds) = options.refinement_rounds {
-                let mut used = 0usize;
-                let mut retained = Vec::new();
-                for record in records {
-                    let record = record?;
-                    check()?;
-                    // Conservative admission for retained originals, routing
-                    // vectors, ID maps, and simultaneous per-round planning scratch.
-                    charge_refinement(
-                        &mut used,
-                        1024 + record.id.len() * 4 + config.dimension() * 12,
-                        options.refinement_memory_bytes,
-                    )?;
-                    retained.push(record);
-                }
-                let mut plans = Vec::new();
-                let built = construct_tree(
-                    &scratch,
-                    config,
-                    seed,
-                    options.construction(),
-                    retained.iter().map(|record| {
-                        Ok(ConstructionRecord {
-                            id: record.id.clone(),
-                            vector: record.vector.clone(),
-                        })
-                    }),
-                    |partition| {
-                        charge_refinement(
-                            &mut used,
-                            // Includes each leaf's bounded refinement neighbor list.
-                            1024 + config.dimension() * 24 + partition.entries.len() * 128,
-                            options.refinement_memory_bytes,
-                        )?;
-                        plans.push(partition);
-                        Ok(())
-                    },
-                )?;
-                charge_refinement(
-                    &mut used,
-                    crate::refinement::candidate_scratch_bytes(
-                        plans.iter().filter(|part| part.level == 1).count(),
-                        usize::from(rounds),
-                    )?,
-                    options.refinement_memory_bytes,
-                )?;
-                super::refine::refine_plans(config, seed, retained, &mut plans, rounds, &|| {
+            let built =
+                super::refine::build_tree(&scratch, config, seed, options, records, emit, &|| {
                     check()
                 })?;
-                for partition in plans {
-                    emit(partition)?;
-                }
-                built
-            } else {
-                construct_tree(
-                    &scratch,
-                    config,
-                    seed,
-                    options.construction(),
-                    records,
-                    emit,
-                )?
-            };
             fs::remove_dir(&scratch).map_err(io_error)?;
             report.trees = checked_add(report.trees, 1)?;
             report.records = checked_add(report.records, built.records)?;
