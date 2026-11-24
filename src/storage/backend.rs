@@ -43,7 +43,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 
 use crate::api::{Error, ErrorKind, Result};
 use crate::storage::keys::{self, KeyRange};
@@ -193,6 +193,71 @@ pub struct ScanLimits {
     pub item_limit: usize,
     /// The maximum total page bytes (encoded key length plus value length).
     pub byte_limit: usize,
+}
+
+impl ScanLimits {
+    /// Rejects zero limits, including for an empty range or batch.
+    pub fn validate(self) -> Result<()> {
+        if self.item_limit == 0 || self.byte_limit == 0 {
+            return Err(Error::new(ErrorKind::InvalidArgument));
+        }
+        Ok(())
+    }
+}
+
+/// Accumulates one adapter scan page, counting logical key and value bytes.
+/// The adapter supplies ordered items and retains control of range iteration.
+pub struct ScanPageBuilder {
+    limits: ScanLimits,
+    bytes: usize,
+    items: Vec<ScanItem>,
+}
+
+impl ScanPageBuilder {
+    /// Starts a page using the adapter's effective limits.
+    pub fn new(limits: ScanLimits) -> Result<Self> {
+        limits.validate()?;
+        Ok(Self {
+            limits,
+            bytes: 0,
+            items: Vec::new(),
+        })
+    }
+
+    /// Returns false when this item proves another page is needed. An oversized
+    /// first item is admitted so the scan always advances. Borrowed bytes are
+    /// copied only after admission, and owned [`Bytes`] can transfer directly.
+    pub fn try_push(&mut self, mut key: impl Buf, mut value: impl Buf) -> Result<bool> {
+        if self.items.len() >= self.limits.item_limit {
+            return Ok(false);
+        }
+        let key_len = key.remaining();
+        let value_len = value.remaining();
+        let bytes = self
+            .bytes
+            .checked_add(key_len)
+            .and_then(|n| n.checked_add(value_len))
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+        if !self.items.is_empty() && bytes > self.limits.byte_limit {
+            return Ok(false);
+        }
+        self.bytes = bytes;
+        self.items.push(ScanItem::new(
+            key.copy_to_bytes(key_len),
+            value.copy_to_bytes(value_len),
+        ));
+        Ok(true)
+    }
+
+    /// Finishes a page when another item exists beyond its limits.
+    pub fn continued(self, max_key_bytes: usize) -> Result<ScanPage> {
+        ScanPage::continued(self.items, max_key_bytes)
+    }
+
+    /// Finishes a page after the adapter exhausts its range.
+    pub fn terminal(self) -> ScanPage {
+        ScanPage::terminal(self.items)
+    }
 }
 
 /// One ordered key/value item returned by a scan.

@@ -21,7 +21,7 @@ use imbl::OrdMap;
 use ktann::api::{Error, ErrorKind, Result};
 use ktann::storage::backend::{
     AdmissionBudget, Backend, Capabilities, CommitStart, HardLimits, InsertOutcome, Mutation,
-    ReadOps, ReadTxn, ScanItem, ScanLimits, ScanPage, WriteTxn,
+    ReadOps, ReadTxn, ScanLimits, ScanPage, ScanPageBuilder, WriteTxn,
 };
 use ktann::storage::keys::KeyRange;
 
@@ -271,39 +271,24 @@ impl MemoryReadTxn {
     }
 
     fn scan_page(&self, range: &KeyRange, limits: ScanLimits) -> Result<ScanPage> {
-        validate_scan(limits)?;
+        #[cfg(feature = "test-support")]
+        let limits = self.lease.0.scan_limits(limits);
+        let mut page = ScanPageBuilder::new(limits)?;
         if range.start() >= range.end() {
-            return Ok(ScanPage::terminal(Vec::new()));
+            return Ok(page.terminal());
         }
         self.validate_key(range.start())?;
         self.validate_key(range.end())?;
-        #[cfg(feature = "test-support")]
-        let limits = self.lease.0.scan_limits(limits);
-        let mut items = Vec::new();
-        let mut bytes = 0_usize;
         for (key, value) in self
             .data
             .range::<_, [u8]>((Included(range.start()), Excluded(range.end())))
         {
-            let item_bytes = key.len() + value.len();
-            if !items.is_empty()
-                && (items.len() == limits.item_limit
-                    || item_bytes > limits.byte_limit.saturating_sub(bytes))
-            {
-                return ScanPage::continued(items, self.hard_limits().max_key_bytes);
+            if !page.try_push(key.clone(), value.clone())? {
+                return page.continued(self.hard_limits().max_key_bytes);
             }
-            bytes += item_bytes;
-            items.push(ScanItem::new(key.clone(), value.clone()));
         }
-        Ok(ScanPage::terminal(items))
+        Ok(page.terminal())
     }
-}
-
-fn validate_scan(limits: ScanLimits) -> Result<()> {
-    if limits.item_limit == 0 || limits.byte_limit == 0 {
-        return Err(Error::new(ErrorKind::InvalidArgument));
-    }
-    Ok(())
 }
 
 impl ReadOps for MemoryReadTxn {
@@ -338,7 +323,7 @@ impl ReadOps for MemoryReadTxn {
             });
             self.lease.0.check_batch(ranges.len())?;
         }
-        validate_scan(limits)?;
+        limits.validate()?;
         ranges
             .iter()
             .map(|range| self.scan_page(range, limits))

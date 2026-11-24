@@ -6,7 +6,7 @@ use bytes::Bytes;
 use ktann::api::{Error, ErrorKind, Result};
 use ktann::storage::backend::{
     AdmissionBudget, Backend, Capabilities, CommitStart, HardLimits, InsertOutcome, Mutation,
-    ReadOps, ReadTxn, ScanItem, ScanLimits, ScanPage, WriteTxn,
+    ReadOps, ReadTxn, ScanLimits, ScanPage, ScanPageBuilder, WriteTxn,
 };
 use ktann::storage::keys::KeyRange;
 use rocksdb::{
@@ -67,11 +67,10 @@ impl PhysicalPrefix {
         Ok(Bytes::from(physical_key))
     }
 
-    fn decode_key(&self, physical_key: &[u8]) -> Result<Bytes> {
-        if !physical_key.starts_with(self.bytes.as_ref()) {
-            return Err(Error::new(ErrorKind::Corruption));
-        }
-        Ok(Bytes::copy_from_slice(&physical_key[self.bytes.len()..]))
+    fn decode_key<'a>(&self, physical_key: &'a [u8]) -> Result<&'a [u8]> {
+        physical_key
+            .strip_prefix(self.bytes.as_ref())
+            .ok_or_else(|| Error::new(ErrorKind::Corruption))
     }
 
     fn encode_range(&self, range: &KeyRange) -> Result<PhysicalRange> {
@@ -399,9 +398,7 @@ macro_rules! impl_read_ops {
                 ranges: &[KeyRange],
                 limits: ScanLimits,
             ) -> Result<Vec<ScanPage>> {
-                if limits.item_limit == 0 || limits.byte_limit == 0 {
-                    return Err(Error::new(ErrorKind::InvalidArgument));
-                }
+                limits.validate()?;
                 let mut physical_ranges = Vec::with_capacity(ranges.len());
                 for range in ranges {
                     physical_ranges.push(self.prefix.encode_range(range)?);
@@ -832,44 +829,30 @@ fn scan<D: DBAccess>(
     range: &PhysicalRange,
     limits: ScanLimits,
 ) -> Result<ScanPage> {
-    if limits.item_limit == 0 || limits.byte_limit == 0 {
-        return Err(Error::new(ErrorKind::InvalidArgument));
-    }
-    if range.start.as_ref() >= range.end.as_ref() {
-        return Ok(ScanPage::terminal(Vec::new()));
-    }
     let byte_limit = limits.byte_limit.min(MAX_SCAN_PAGE_BYTES);
+    let mut page = ScanPageBuilder::new(ScanLimits {
+        byte_limit,
+        ..limits
+    })?;
+    if range.start.as_ref() >= range.end.as_ref() {
+        return Ok(page.terminal());
+    }
     let mut read_options = ReadOptions::default();
     read_options.set_iterate_lower_bound(range.start.to_vec());
     read_options.set_iterate_upper_bound(range.end.to_vec());
     read_options.set_total_order_seek(true);
     let mut iterator = snapshot.raw_iterator_opt(read_options);
     iterator.seek(&range.start);
-    let mut items = Vec::new();
-    let mut item_bytes = 0_usize;
+
     while let Some((physical_key, value)) = iterator.item() {
         let logical_key = prefix.decode_key(physical_key)?;
-        let bytes = logical_key
-            .len()
-            .checked_add(value.len())
-            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-        if !items.is_empty()
-            && (items.len() >= limits.item_limit
-                || item_bytes
-                    .checked_add(bytes)
-                    .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?
-                    > byte_limit)
-        {
-            return ScanPage::continued(items, prefix.max_logical_key_bytes());
+        if !page.try_push(logical_key, value)? {
+            return page.continued(prefix.max_logical_key_bytes());
         }
-        item_bytes = item_bytes
-            .checked_add(bytes)
-            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-        items.push(ScanItem::new(logical_key, Bytes::copy_from_slice(value)));
         iterator.next();
     }
     iterator.status().map_err(map_operation_error)?;
-    Ok(ScanPage::terminal(items))
+    Ok(page.terminal())
 }
 
 /// Serves every range of one batched scan in the single actor round trip,

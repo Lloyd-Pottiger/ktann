@@ -484,11 +484,7 @@ fn decode_scan_page(
 
     let next_cursor = match raw_page.next_start() {
         Some(next_start)
-            if !raw_page.items().is_empty()
-                && raw_page
-                    .items()
-                    .last()
-                    .is_some_and(|last| next_start > last.key())
+            if previous.is_some_and(|last| next_start > last)
                 && next_start.as_ref() < range.raw.end() =>
         {
             Some(LogicalScanCursor {
