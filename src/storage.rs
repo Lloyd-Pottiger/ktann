@@ -19,10 +19,11 @@ mod tree_key;
 pub mod tree_manifest;
 pub mod values;
 
+pub use backend::TransactionSize;
 pub(crate) use operations::LogicalReader;
 pub use operations::{
     LogicalRange, LogicalScanCursor, LogicalScanItem, LogicalScanPage, MutationBuilder,
-    ReadLogicalTxn, RecordGroupRead, TransactionSize, WriteLogicalTxn,
+    ReadLogicalTxn, RecordGroupRead, WriteLogicalTxn,
 };
 
 /// Shared format of index storage and bulk artifacts emitted and accepted by this build.

@@ -10,7 +10,7 @@ use crate::api::{DataType, Error, ErrorKind, LogicalIndexId, MAX_FIELDS, Result,
 
 use super::backend::{
     AdmissionBudget, CommitStart, HardLimits, InsertOutcome, Mutation, ReadOps, ScanLimits,
-    ScanPage, WriteTxn,
+    ScanPage, TransactionSize, WriteTxn,
 };
 use super::keys::{self, KeyRange, LogicalKey, TreeKey};
 use super::values::{
@@ -785,34 +785,6 @@ impl<T: ReadOps> ReadLogicalTxn<'_, T> {
     }
 }
 
-/// Exact mutation work charged to one backend transaction.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct TransactionSize {
-    mutations: usize,
-    bytes: usize,
-}
-
-impl TransactionSize {
-    /// Returns the number of point mutations.
-    #[must_use]
-    pub const fn mutations(self) -> usize {
-        self.mutations
-    }
-
-    /// Returns total encoded key plus value bytes.
-    #[must_use]
-    pub const fn bytes(self) -> usize {
-        self.bytes
-    }
-
-    fn checked_add(self, other: Self) -> Option<Self> {
-        Some(Self {
-            mutations: self.mutations.checked_add(other.mutations)?,
-            bytes: self.bytes.checked_add(other.bytes)?,
-        })
-    }
-}
-
 /// A deterministic, bounded set of typed point mutations.
 pub struct MutationBuilder<'manifest> {
     binding: LogicalBinding<'manifest>,
@@ -918,19 +890,12 @@ impl<'manifest> MutationBuilder<'manifest> {
                     mutations: self.size.mutations,
                     bytes,
                 };
-                check_budget(self.budget, next)?;
+                next.check_budget(self.budget)?;
                 entry.insert(value);
                 next
             }
             Entry::Vacant(entry) => {
-                let next = self
-                    .size
-                    .checked_add(TransactionSize {
-                        mutations: 1,
-                        bytes: new_bytes,
-                    })
-                    .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-                check_budget(self.budget, next)?;
+                let next = self.size.with_charge(1, new_bytes, self.budget)?;
                 entry.insert(value);
                 next
             }
@@ -973,14 +938,6 @@ fn check_hard_limits(limits: HardLimits, key: &Bytes, value: Option<&Bytes>) -> 
     if key.len() > limits.max_key_bytes
         || value.is_some_and(|value| value.len() > limits.max_value_bytes)
     {
-        Err(Error::new(ErrorKind::LimitExceeded))
-    } else {
-        Ok(())
-    }
-}
-
-fn check_budget(budget: AdmissionBudget, size: TransactionSize) -> Result<()> {
-    if size.mutations > budget.max_mutations || size.bytes > budget.max_mutation_bytes {
         Err(Error::new(ErrorKind::LimitExceeded))
     } else {
         Ok(())
@@ -1376,10 +1333,7 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
         let encoded_key = encode_input_key(&self.binding, &key)?;
         let encoded_value = Bytes::from(self.binding.codec().encode_for_key(&key, &value)?);
         check_hard_limits(self.hard_limits, &encoded_key, Some(&encoded_value))?;
-        let mutation_size = TransactionSize {
-            mutations: 1,
-            bytes: mutation_bytes(&encoded_key, Some(&encoded_value))?,
-        };
+        let bytes = mutation_bytes(&encoded_key, Some(&encoded_value))?;
 
         // An update-protected read both establishes a conflict on the target key
         // and decodes the existing value fail-closed, so a duplicate insert is
@@ -1391,11 +1345,7 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
             return Ok(InsertOutcome::AlreadyExists);
         }
 
-        let next = self
-            .size
-            .checked_add(mutation_size)
-            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-        check_budget(self.budget, next)?;
+        let next = self.size.with_charge(1, bytes, self.budget)?;
         let next_affected = self.add_affected(
             self.affected_key_bytes(&encoded_key, 3)?
                 .checked_add(encoded_value.len())
@@ -1425,11 +1375,9 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
         for (key, value) in &builder.entries {
             check_hard_limits(self.hard_limits, key, value.as_ref())?;
         }
-        let next = self
-            .size
-            .checked_add(builder.size)
-            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-        check_budget(self.budget, next)?;
+        let next =
+            self.size
+                .with_charge(builder.size.mutations, builder.size.bytes, self.budget)?;
         let next_affected = self.add_affected(builder.affected_bytes()?)?;
         let written: Vec<(Bytes, Option<Bytes>)> = builder
             .entries
@@ -1474,14 +1422,7 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
             .len()
             .checked_add(range.raw.end().len())
             .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-        let next = self
-            .size
-            .checked_add(TransactionSize {
-                mutations: 1,
-                bytes,
-            })
-            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-        check_budget(self.budget, next)?;
+        let next = self.size.with_charge(1, bytes, self.budget)?;
         let range_affected = bytes
             .checked_add(
                 self.budget

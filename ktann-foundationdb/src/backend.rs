@@ -6,9 +6,10 @@ use foundationdb::{Database, FdbError, RangeOption, Transaction};
 use futures_util::TryStreamExt;
 use futures_util::future::try_join_all;
 use ktann::api::{Error, ErrorKind, Result};
+use ktann::storage::TransactionSize;
 use ktann::storage::backend::{
     AdmissionBudget, Backend, Capabilities, CommitStart, HardLimits, InsertOutcome, Mutation,
-    ReadOps, ReadTxn, ScanLimits, ScanPage, ScanPageBuilder, WriteTxn,
+    PreparedMutation, ReadOps, ReadTxn, ScanLimits, ScanPage, ScanPageBuilder, WriteTxn,
 };
 use ktann::storage::keys::KeyRange;
 
@@ -49,6 +50,14 @@ impl PhysicalPrefix {
 
     fn max_logical_key_bytes(&self) -> usize {
         FDB_MAX_KEY_BYTES - self.bytes.len()
+    }
+
+    fn admission_budget(&self) -> AdmissionBudget {
+        AdmissionBudget {
+            max_mutations: DEFAULT_MAX_MUTATIONS,
+            max_mutation_bytes: DEFAULT_MAX_MUTATION_BYTES,
+            mutation_key_overhead_bytes: self.bytes.len(),
+        }
     }
 
     fn encode_key(&self, logical_key: &[u8]) -> Result<Bytes> {
@@ -137,16 +146,15 @@ impl fmt::Debug for FoundationDbReadTxn<'_> {
 pub struct FoundationDbWriteTxn<'backend> {
     transaction: Transaction,
     prefix: &'backend PhysicalPrefix,
-    mutation_count: usize,
-    mutation_bytes: usize,
+    size: TransactionSize,
 }
 
 impl fmt::Debug for FoundationDbWriteTxn<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("FoundationDbWriteTxn")
-            .field("mutation_count", &self.mutation_count)
-            .field("mutation_bytes", &self.mutation_bytes)
+            .field("mutation_count", &self.size.mutations())
+            .field("mutation_bytes", &self.size.bytes())
             .finish_non_exhaustive()
     }
 }
@@ -164,11 +172,7 @@ impl Backend for FoundationDbBackend {
     }
 
     fn admission_budget(&self) -> AdmissionBudget {
-        AdmissionBudget {
-            max_mutations: DEFAULT_MAX_MUTATIONS,
-            max_mutation_bytes: DEFAULT_MAX_MUTATION_BYTES,
-            mutation_key_overhead_bytes: self.prefix.bytes.len(),
-        }
+        self.prefix.admission_budget()
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -195,8 +199,7 @@ impl Backend for FoundationDbBackend {
         Ok(FoundationDbWriteTxn {
             transaction,
             prefix: &self.prefix,
-            mutation_count: 0,
-            mutation_bytes: 0,
+            size: TransactionSize::default(),
         })
     }
 }
@@ -235,31 +238,18 @@ impl ReadTxn for FoundationDbReadTxn<'_> {}
 
 impl FoundationDbWriteTxn<'_> {
     fn charge(&mut self, mutation_count: usize, mutation_bytes: usize) -> Result<()> {
-        let next_count = self
-            .mutation_count
-            .checked_add(mutation_count)
-            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-        let next_bytes = self
-            .mutation_bytes
-            .checked_add(mutation_bytes)
-            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-        if next_count > DEFAULT_MAX_MUTATIONS || next_bytes > DEFAULT_MAX_MUTATION_BYTES {
-            return Err(Error::new(ErrorKind::LimitExceeded));
-        }
-        self.mutation_count = next_count;
-        self.mutation_bytes = next_bytes;
+        self.size = self.size.with_charge(
+            mutation_count,
+            mutation_bytes,
+            self.prefix.admission_budget(),
+        )?;
         Ok(())
     }
 
-    fn prepare_put(&self, key: Bytes, value: Bytes) -> Result<PreparedMutation> {
-        validate_value(&value)?;
-        let key = self.prefix.encode_key(&key)?;
-        Ok(PreparedMutation::Put { key, value })
-    }
-
-    fn prepare_delete(&self, key: Bytes) -> Result<PreparedMutation> {
-        let key = self.prefix.encode_key(&key)?;
-        Ok(PreparedMutation::Delete { key })
+    fn prepare(&self, mutation: Mutation) -> Result<PreparedMutation> {
+        PreparedMutation::new(mutation, FDB_MAX_VALUE_BYTES, |key| {
+            self.prefix.encode_key(key)
+        })
     }
 }
 
@@ -273,14 +263,14 @@ impl WriteTxn for FoundationDbWriteTxn<'_> {
     }
 
     async fn put(&mut self, key: Bytes, value: Bytes) -> Result<()> {
-        let mutation = self.prepare_put(key, value)?;
+        let mutation = self.prepare(Mutation::Put { key, value })?;
         self.charge(1, mutation.charged_bytes()?)?;
-        mutation.apply(&self.transaction);
+        apply(&self.transaction, mutation);
         Ok(())
     }
 
     async fn insert(&mut self, key: Bytes, value: Bytes) -> Result<InsertOutcome> {
-        let mutation = self.prepare_put(key, value)?;
+        let mutation = self.prepare(Mutation::Put { key, value })?;
         let charged_bytes = mutation.charged_bytes()?;
         let existing = self
             .transaction
@@ -291,37 +281,27 @@ impl WriteTxn for FoundationDbWriteTxn<'_> {
             return Ok(InsertOutcome::AlreadyExists);
         }
         self.charge(1, charged_bytes)?;
-        mutation.apply(&self.transaction);
+        apply(&self.transaction, mutation);
         Ok(InsertOutcome::Inserted)
     }
 
     async fn delete(&mut self, key: Bytes) -> Result<()> {
-        let mutation = self.prepare_delete(key)?;
+        let mutation = self.prepare(Mutation::Delete { key })?;
         self.charge(1, mutation.charged_bytes()?)?;
-        mutation.apply(&self.transaction);
+        apply(&self.transaction, mutation);
         Ok(())
     }
 
     async fn batch_mutate(&mut self, mutations: Vec<Mutation>) -> Result<()> {
-        if mutations.len() > DEFAULT_MAX_MUTATIONS.saturating_sub(self.mutation_count) {
-            return Err(Error::new(ErrorKind::LimitExceeded));
-        }
-        let mut prepared = Vec::with_capacity(mutations.len());
-        let mut charged_bytes = 0_usize;
-        for mutation in mutations {
-            let mutation = match mutation {
-                Mutation::Put { key, value } => self.prepare_put(key, value)?,
-                Mutation::Delete { key } => self.prepare_delete(key)?,
-                _ => return Err(Error::new(ErrorKind::Unsupported)),
-            };
-            charged_bytes = charged_bytes
-                .checked_add(mutation.charged_bytes()?)
-                .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-            prepared.push(mutation);
-        }
-        self.charge(prepared.len(), charged_bytes)?;
+        let (prepared, size) = PreparedMutation::batch(
+            mutations,
+            self.size,
+            self.prefix.admission_budget(),
+            |mutation| self.prepare(mutation),
+        )?;
+        self.size = size;
         for mutation in prepared {
-            mutation.apply(&self.transaction);
+            apply(&self.transaction, mutation);
         }
         Ok(())
     }
@@ -356,12 +336,6 @@ impl WriteTxn for FoundationDbWriteTxn<'_> {
     async fn rollback(self) {}
 }
 
-/// A validated, namespace-encoded mutation staged before touching the native transaction.
-enum PreparedMutation {
-    Put { key: Bytes, value: Bytes },
-    Delete { key: Bytes },
-}
-
 /// Selects snapshot reads or reads that establish conflict protection for a write transaction.
 #[derive(Clone, Copy)]
 enum ReadMode {
@@ -375,28 +349,11 @@ impl ReadMode {
     }
 }
 
-impl PreparedMutation {
-    fn key(&self) -> &Bytes {
-        match self {
-            Self::Put { key, .. } | Self::Delete { key } => key,
-        }
-    }
-
-    fn charged_bytes(&self) -> Result<usize> {
-        match self {
-            Self::Put { key, value } => key
-                .len()
-                .checked_add(value.len())
-                .ok_or_else(|| Error::new(ErrorKind::LimitExceeded)),
-            Self::Delete { key } => Ok(key.len()),
-        }
-    }
-
-    fn apply(self, transaction: &Transaction) {
-        match self {
-            Self::Put { key, value } => transaction.set(&key, &value),
-            Self::Delete { key } => transaction.clear(&key),
-        }
+/// Stages a prevalidated point mutation in the native transaction.
+fn apply(transaction: &Transaction, mutation: PreparedMutation) {
+    match mutation.value() {
+        Some(value) => transaction.set(mutation.key(), value),
+        None => transaction.clear(mutation.key()),
     }
 }
 
@@ -610,13 +567,6 @@ async fn batch_scan(
         pages.extend(try_join_all(scans).await?);
     }
     Ok(pages)
-}
-
-fn validate_value(value: &[u8]) -> Result<()> {
-    if value.len() > FDB_MAX_VALUE_BYTES {
-        return Err(Error::new(ErrorKind::LimitExceeded));
-    }
-    Ok(())
 }
 
 fn map_operation_error(error: FdbError) -> Error {

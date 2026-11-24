@@ -4,9 +4,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use ktann::api::{Error, ErrorKind, Result};
+use ktann::storage::TransactionSize;
 use ktann::storage::backend::{
     AdmissionBudget, Backend, Capabilities, CommitStart, HardLimits, InsertOutcome, Mutation,
-    ReadOps, ReadTxn, ScanLimits, ScanPage, ScanPageBuilder, WriteTxn,
+    PreparedMutation, ReadOps, ReadTxn, ScanLimits, ScanPage, ScanPageBuilder, WriteTxn,
 };
 use ktann::storage::keys::KeyRange;
 use rocksdb::{
@@ -55,6 +56,14 @@ impl PhysicalPrefix {
 
     fn max_logical_key_bytes(&self) -> usize {
         ROCKSDB_MAX_PHYSICAL_KEY_BYTES - self.bytes.len()
+    }
+
+    fn admission_budget(&self) -> AdmissionBudget {
+        AdmissionBudget {
+            max_mutations: DEFAULT_MAX_MUTATIONS,
+            max_mutation_bytes: DEFAULT_MAX_MUTATION_BYTES,
+            mutation_key_overhead_bytes: self.bytes.len(),
+        }
     }
 
     fn encode_key(&self, logical_key: &[u8]) -> Result<Bytes> {
@@ -243,7 +252,6 @@ enum WriteCommand {
     },
     ApplyOne {
         mutation: PreparedMutation,
-        charged_bytes: usize,
         response: oneshot::Sender<Result<()>>,
     },
     ApplyBatch {
@@ -253,7 +261,6 @@ enum WriteCommand {
     },
     Insert {
         mutation: PreparedMutation,
-        charged_bytes: usize,
         response: oneshot::Sender<Result<InsertOutcome>>,
     },
     Commit {
@@ -320,11 +327,7 @@ impl Backend for RocksDbBackend {
     }
 
     fn admission_budget(&self) -> AdmissionBudget {
-        AdmissionBudget {
-            max_mutations: DEFAULT_MAX_MUTATIONS,
-            max_mutation_bytes: DEFAULT_MAX_MUTATION_BYTES,
-            mutation_key_overhead_bytes: self.prefix.bytes.len(),
-        }
+        self.prefix.admission_budget()
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -422,34 +425,11 @@ impl ReadTxn for RocksDbReadTxn<'_> {}
 impl_read_ops!(RocksDbWriteTxn, WriteCommand);
 
 impl RocksDbWriteTxn<'_> {
-    fn prepare_put(&self, key: Bytes, value: Bytes) -> Result<PreparedMutation> {
-        validate_value(&value)?;
-        let key = self.prefix.encode_key(&key)?;
-        Ok(PreparedMutation::Put { key, value })
+    fn prepare(&self, mutation: Mutation) -> Result<PreparedMutation> {
+        PreparedMutation::new(mutation, ROCKSDB_MAX_VALUE_BYTES, |key| {
+            self.prefix.encode_key(key)
+        })
     }
-
-    fn prepare_delete(&self, key: Bytes) -> Result<PreparedMutation> {
-        let key = self.prefix.encode_key(&key)?;
-        Ok(PreparedMutation::Delete { key })
-    }
-}
-
-fn next_charge(
-    current_count: usize,
-    current_bytes: usize,
-    mutation_count: usize,
-    mutation_bytes: usize,
-) -> Result<(usize, usize)> {
-    let next_count = current_count
-        .checked_add(mutation_count)
-        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-    let next_bytes = current_bytes
-        .checked_add(mutation_bytes)
-        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-    if next_count > DEFAULT_MAX_MUTATIONS || next_bytes > DEFAULT_MAX_MUTATION_BYTES {
-        return Err(Error::new(ErrorKind::LimitExceeded));
-    }
-    Ok((next_count, next_bytes))
 }
 
 impl WriteTxn for RocksDbWriteTxn<'_> {
@@ -467,65 +447,37 @@ impl WriteTxn for RocksDbWriteTxn<'_> {
     }
 
     async fn put(&mut self, key: Bytes, value: Bytes) -> Result<()> {
-        let mutation = self.prepare_put(key, value)?;
-        let charged_bytes = mutation.charged_bytes()?;
+        let mutation = self.prepare(Mutation::Put { key, value })?;
         self.worker
-            .request(|response| WriteCommand::ApplyOne {
-                mutation,
-                charged_bytes,
-                response,
-            })
+            .request(|response| WriteCommand::ApplyOne { mutation, response })
             .await
     }
 
     async fn insert(&mut self, key: Bytes, value: Bytes) -> Result<InsertOutcome> {
-        let mutation = self.prepare_put(key, value)?;
-        let charged_bytes = mutation.charged_bytes()?;
+        let mutation = self.prepare(Mutation::Put { key, value })?;
         self.worker
-            .request(|response| WriteCommand::Insert {
-                mutation,
-                charged_bytes,
-                response,
-            })
+            .request(|response| WriteCommand::Insert { mutation, response })
             .await
     }
 
     async fn delete(&mut self, key: Bytes) -> Result<()> {
-        let mutation = self.prepare_delete(key)?;
-        let charged_bytes = mutation.charged_bytes()?;
+        let mutation = self.prepare(Mutation::Delete { key })?;
         self.worker
-            .request(|response| WriteCommand::ApplyOne {
-                mutation,
-                charged_bytes,
-                response,
-            })
+            .request(|response| WriteCommand::ApplyOne { mutation, response })
             .await
     }
 
     async fn batch_mutate(&mut self, mutations: Vec<Mutation>) -> Result<()> {
-        if mutations.len() > DEFAULT_MAX_MUTATIONS {
-            return Err(Error::new(ErrorKind::LimitExceeded));
-        }
-        let mut prepared = Vec::with_capacity(mutations.len());
-        let mut charged_bytes = 0_usize;
-        for mutation in mutations {
-            let mutation = match mutation {
-                Mutation::Put { key, value } => self.prepare_put(key, value)?,
-                Mutation::Delete { key } => self.prepare_delete(key)?,
-                _ => return Err(Error::new(ErrorKind::Unsupported)),
-            };
-            charged_bytes = charged_bytes
-                .checked_add(mutation.charged_bytes()?)
-                .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-            prepared.push(mutation);
-        }
-        if charged_bytes > DEFAULT_MAX_MUTATION_BYTES {
-            return Err(Error::new(ErrorKind::LimitExceeded));
-        }
+        let (prepared, size) = PreparedMutation::batch(
+            mutations,
+            TransactionSize::default(),
+            self.prefix.admission_budget(),
+            |mutation| self.prepare(mutation),
+        )?;
         self.worker
             .request(|response| WriteCommand::ApplyBatch {
                 mutations: prepared,
-                charged_bytes,
+                charged_bytes: size.bytes(),
                 response,
             })
             .await
@@ -620,8 +572,8 @@ fn write_actor(
     let mut transaction_options = OptimisticTransactionOptions::default();
     transaction_options.set_snapshot(true);
     let transaction = database.transaction_opt(&write_options, &transaction_options);
-    let mut mutation_count = 0_usize;
-    let mut mutation_bytes = 0_usize;
+    let mut size = TransactionSize::default();
+    let budget = prefix.admission_budget();
     if ready.send(()).is_err() {
         return;
     }
@@ -669,14 +621,10 @@ fn write_actor(
                 }
                 Ok(values)
             }),
-            WriteCommand::ApplyOne {
-                mutation,
-                charged_bytes,
-                response,
-            } => respond(response, || {
-                let charge = next_charge(mutation_count, mutation_bytes, 1, charged_bytes)?;
-                mutation.apply(&transaction)?;
-                (mutation_count, mutation_bytes) = charge;
+            WriteCommand::ApplyOne { mutation, response } => respond(response, || {
+                let charge = size.with_charge(1, mutation.charged_bytes()?, budget)?;
+                apply(&transaction, mutation)?;
+                size = charge;
                 Ok(())
             }),
             WriteCommand::ApplyBatch {
@@ -684,32 +632,23 @@ fn write_actor(
                 charged_bytes,
                 response,
             } => respond(response, || {
-                let charge = next_charge(
-                    mutation_count,
-                    mutation_bytes,
-                    mutations.len(),
-                    charged_bytes,
-                )?;
+                let charge = size.with_charge(mutations.len(), charged_bytes, budget)?;
                 for mutation in mutations {
-                    mutation.apply(&transaction)?;
+                    apply(&transaction, mutation)?;
                 }
-                (mutation_count, mutation_bytes) = charge;
+                size = charge;
                 Ok(())
             }),
-            WriteCommand::Insert {
-                mutation,
-                charged_bytes,
-                response,
-            } => respond(response, || {
+            WriteCommand::Insert { mutation, response } => respond(response, || {
                 let snapshot = transaction.snapshot();
                 let mut read_options = ReadOptions::default();
                 read_options.set_snapshot(&snapshot);
                 if get_for_update(&transaction, mutation.key(), &read_options)?.is_some() {
                     return Ok(InsertOutcome::AlreadyExists);
                 }
-                let charge = next_charge(mutation_count, mutation_bytes, 1, charged_bytes)?;
-                mutation.apply(&transaction)?;
-                (mutation_count, mutation_bytes) = charge;
+                let charge = size.with_charge(1, mutation.charged_bytes()?, budget)?;
+                apply(&transaction, mutation)?;
+                size = charge;
                 Ok(InsertOutcome::Inserted)
             }),
             WriteCommand::Commit {
@@ -751,36 +690,16 @@ fn respond<T>(response: oneshot::Sender<Result<T>>, operation: impl FnOnce() -> 
     response.send(operation()).is_ok()
 }
 
-/// A validated physical mutation ready for native application and admission accounting.
-enum PreparedMutation {
-    Put { key: Bytes, value: Bytes },
-    Delete { key: Bytes },
-}
-
-impl PreparedMutation {
-    fn key(&self) -> &Bytes {
-        match self {
-            Self::Put { key, .. } | Self::Delete { key } => key,
-        }
+/// Applies a prevalidated point mutation inside the native write actor.
+fn apply(
+    transaction: &Transaction<'_, OptimisticTransactionDB>,
+    mutation: PreparedMutation,
+) -> Result<()> {
+    match mutation.value() {
+        Some(value) => transaction.put(mutation.key(), value),
+        None => transaction.delete(mutation.key()),
     }
-
-    fn charged_bytes(&self) -> Result<usize> {
-        match self {
-            Self::Put { key, value } => key
-                .len()
-                .checked_add(value.len())
-                .ok_or_else(|| Error::new(ErrorKind::LimitExceeded)),
-            Self::Delete { key } => Ok(key.len()),
-        }
-    }
-
-    fn apply(self, transaction: &Transaction<'_, OptimisticTransactionDB>) -> Result<()> {
-        match self {
-            Self::Put { key, value } => transaction.put(&key, &value),
-            Self::Delete { key } => transaction.delete(&key),
-        }
-        .map_err(map_operation_error)
-    }
+    .map_err(map_operation_error)
 }
 
 fn get<D: DBAccess>(snapshot: &SnapshotWithThreadMode<'_, D>, key: &[u8]) -> Result<Option<Bytes>> {
@@ -868,13 +787,6 @@ fn batch_scan<D: DBAccess>(
         pages.push(scan(snapshot, prefix, range, limits)?);
     }
     Ok(pages)
-}
-
-fn validate_value(value: &[u8]) -> Result<()> {
-    if value.len() > ROCKSDB_MAX_VALUE_BYTES {
-        return Err(Error::new(ErrorKind::LimitExceeded));
-    }
-    Ok(())
 }
 
 fn map_operation_error(error: RocksError) -> Error {
