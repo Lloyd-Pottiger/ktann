@@ -43,7 +43,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 
 use crate::api::{Error, ErrorKind, Result};
 use crate::storage::keys::{self, KeyRange};
@@ -195,6 +195,83 @@ pub struct ScanLimits {
     pub byte_limit: usize,
 }
 
+impl ScanLimits {
+    /// Rejects zero limits, including for an empty range or batch.
+    pub fn validate(self) -> Result<()> {
+        if self.item_limit == 0 || self.byte_limit == 0 {
+            return Err(Error::new(ErrorKind::InvalidArgument));
+        }
+        Ok(())
+    }
+}
+
+/// Accumulates one adapter scan page, counting logical key and value bytes.
+/// The adapter supplies ordered items and retains control of range iteration.
+pub struct ScanPageBuilder {
+    limits: ScanLimits,
+    bytes: usize,
+    items: Vec<ScanItem>,
+}
+
+impl ScanPageBuilder {
+    /// Starts a page using the adapter's effective limits.
+    pub fn new(limits: ScanLimits) -> Result<Self> {
+        limits.validate()?;
+        Ok(Self {
+            limits,
+            bytes: 0,
+            items: Vec::new(),
+        })
+    }
+
+    /// Returns false when this item proves another page is needed. An oversized
+    /// first item is admitted so the scan always advances. Borrowed bytes are
+    /// copied only after admission, and owned [`Bytes`] can transfer directly.
+    pub fn try_push(&mut self, mut key: impl Buf, mut value: impl Buf) -> Result<bool> {
+        if self.items.len() >= self.limits.item_limit {
+            return Ok(false);
+        }
+        let key_len = key.remaining();
+        let value_len = value.remaining();
+        let bytes = self
+            .bytes
+            .checked_add(key_len)
+            .and_then(|n| n.checked_add(value_len))
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+        if !self.items.is_empty() && bytes > self.limits.byte_limit {
+            return Ok(false);
+        }
+        self.bytes = bytes;
+        self.items.push(ScanItem {
+            key: key.copy_to_bytes(key_len),
+            value: value.copy_to_bytes(value_len),
+        });
+        Ok(true)
+    }
+
+    /// Finishes a nonempty page after lookahead finds another item. The
+    /// continuation must fit the backend's logical key-length limit.
+    pub fn continued(self, max_key_bytes: usize) -> Result<ScanPage> {
+        let last = self
+            .items
+            .last()
+            .ok_or_else(|| Error::new(ErrorKind::Backend))?;
+        let next_start = Bytes::from(scan_successor(last.key(), max_key_bytes));
+        Ok(ScanPage {
+            items: self.items,
+            next_start: Some(next_start),
+        })
+    }
+
+    /// Finishes a page after the adapter exhausts its range.
+    pub fn terminal(self) -> ScanPage {
+        ScanPage {
+            items: self.items,
+            next_start: None,
+        }
+    }
+}
+
 /// One ordered key/value item returned by a scan.
 ///
 /// `Debug` is redacted because keys and values may carry sensitive bytes.
@@ -205,12 +282,6 @@ pub struct ScanItem {
 }
 
 impl ScanItem {
-    /// Constructs a scan item from owned key and value bytes.
-    #[must_use]
-    pub fn new(key: Bytes, value: Bytes) -> Self {
-        Self { key, value }
-    }
-
     /// The item's key.
     #[must_use]
     pub fn key(&self) -> &Bytes {
@@ -251,38 +322,6 @@ pub struct ScanPage {
 }
 
 impl ScanPage {
-    /// Constructs a terminal page that exhausts the requested range.
-    #[must_use]
-    pub fn terminal(items: Vec<ScanItem>) -> Self {
-        Self {
-            items,
-            next_start: None,
-        }
-    }
-
-    /// Constructs a non-terminal page whose continuation is derived from the
-    /// last item's key.
-    ///
-    /// `max_key_bytes` is the backend's logical key-length limit; it bounds the
-    /// derived successor so the continuation is always a legal scan bound. The
-    /// continuation is the byte-lexicographic successor of the last key, so it
-    /// can never skip an eligible key or re-emit a returned key.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ErrorKind::Backend`] when `items` is empty: a non-terminal
-    /// page must carry its last key to derive the continuation from, and the
-    /// single-oversized-first-item guarantee means any non-empty range yields a
-    /// non-empty page.
-    pub fn continued(items: Vec<ScanItem>, max_key_bytes: usize) -> Result<Self> {
-        let last_key = items
-            .last()
-            .map(ScanItem::key)
-            .ok_or_else(|| Error::new(ErrorKind::Backend))?;
-        let next_start = Some(Bytes::from(scan_successor(last_key, max_key_bytes)));
-        Ok(Self { items, next_start })
-    }
-
     /// The ordered page items.
     #[must_use]
     pub fn items(&self) -> &[ScanItem] {
@@ -589,47 +628,43 @@ mod tests {
         assert_eq!(scan_successor(b"\x01\xff\xff", 3), b"\x02");
     }
 
-    #[test]
-    fn continued_page_derives_successor_and_is_not_terminal() {
-        let page = ScanPage::continued(
-            vec![ScanItem::new(
-                Bytes::from_static(b"a"),
-                Bytes::from_static(b"1"),
-            )],
-            1024,
-        )
-        .expect("non-empty page continues");
-        assert!(!page.is_terminal());
-        assert_eq!(page.next_start().expect("continuation").as_ref(), b"a\x00");
+    fn single_item_page(key: &[u8]) -> ScanPageBuilder {
+        let mut page = ScanPageBuilder::new(ScanLimits {
+            item_limit: 1,
+            byte_limit: 8,
+        })
+        .unwrap();
+        assert!(page.try_push(key, &b"1"[..]).unwrap());
+        page
     }
 
     #[test]
-    fn continued_page_at_the_ceiling_stays_within_the_limit() {
-        let page = ScanPage::continued(
-            vec![ScanItem::new(
-                Bytes::from_static(b"ab"),
-                Bytes::from_static(b"1"),
-            )],
-            2,
-        )
-        .expect("non-empty page continues");
-        assert_eq!(page.next_start().expect("continuation").as_ref(), b"ac");
+    fn continued_page_respects_the_key_length_ceiling() {
+        for (key, limit, next) in [
+            (b"a".as_slice(), 1024, b"a\x00".as_slice()),
+            (b"ab".as_slice(), 2, b"ac".as_slice()),
+        ] {
+            let page = single_item_page(key).continued(limit).unwrap();
+            assert!(!page.is_terminal());
+            assert_eq!(page.next_start().unwrap().as_ref(), next);
+        }
     }
 
     #[test]
     fn terminal_page_has_no_continuation() {
-        let page = ScanPage::terminal(vec![ScanItem::new(
-            Bytes::from_static(b"a"),
-            Bytes::from_static(b"1"),
-        )]);
+        let page = single_item_page(b"a").terminal();
         assert!(page.is_terminal());
         assert!(page.next_start().is_none());
     }
 
     #[test]
     fn empty_non_terminal_page_is_rejected() {
-        let error = ScanPage::continued(Vec::new(), 1024).expect_err("empty continued page");
-        assert_eq!(error.kind(), ErrorKind::Backend);
+        let page = ScanPageBuilder::new(ScanLimits {
+            item_limit: 1,
+            byte_limit: 8,
+        })
+        .unwrap();
+        assert_eq!(page.continued(1024).unwrap_err().kind(), ErrorKind::Backend);
     }
 
     #[test]

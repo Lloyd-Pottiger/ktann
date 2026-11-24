@@ -8,7 +8,7 @@ use bytes::Bytes;
 use crate::api::{Error, ErrorKind, LogicalIndexId, PartitionKey, Result};
 
 use super::backend::{
-    CommitStart, InsertOutcome, Mutation, ReadOps, ReadTxn, ScanItem, ScanLimits, ScanPage,
+    CommitStart, InsertOutcome, Mutation, ReadOps, ReadTxn, ScanLimits, ScanPage, ScanPageBuilder,
     WriteTxn,
 };
 use super::keys::{self, KeyRange};
@@ -100,40 +100,18 @@ impl ReadOps for MockReadTxn {
             return Err(Error::new(ErrorKind::Backend));
         }
         self.scans += 1;
-        if limits.item_limit == 0 || limits.byte_limit == 0 {
-            return Err(Error::invalid_argument());
-        }
-        let mut iter = self
-            .data
-            .range::<[u8], _>((Bound::Included(range.start()), Bound::Excluded(range.end())))
-            .peekable();
-        let mut items = Vec::new();
-        let mut bytes = 0_usize;
-        while let Some((key, value)) = iter.peek() {
-            let size = key.len() + value.len();
-            if items.is_empty() && size > limits.byte_limit {
-                let (key, value) = iter.next().expect("peeked item exists");
-                items.push(ScanItem::new(
-                    Bytes::copy_from_slice(key),
-                    Bytes::copy_from_slice(value),
-                ));
-                break;
+        let mut page = ScanPageBuilder::new(limits)?;
+        if range.start() < range.end() {
+            for (key, value) in self
+                .data
+                .range::<[u8], _>((Bound::Included(range.start()), Bound::Excluded(range.end())))
+            {
+                if !page.try_push(key.as_slice(), value.as_slice())? {
+                    return page.continued(keys::MAX_TREE_KEY_BYTES + 64);
+                }
             }
-            if items.len() >= limits.item_limit || bytes + size > limits.byte_limit {
-                break;
-            }
-            let (key, value) = iter.next().expect("peeked item exists");
-            items.push(ScanItem::new(
-                Bytes::copy_from_slice(key),
-                Bytes::copy_from_slice(value),
-            ));
-            bytes += size;
         }
-        if iter.peek().is_some() {
-            ScanPage::continued(items, keys::MAX_TREE_KEY_BYTES + 64)
-        } else {
-            Ok(ScanPage::terminal(items))
-        }
+        Ok(page.terminal())
     }
 
     async fn batch_scan(
@@ -141,6 +119,7 @@ impl ReadOps for MockReadTxn {
         ranges: &[KeyRange],
         limits: ScanLimits,
     ) -> Result<Vec<ScanPage>> {
+        limits.validate()?;
         self.batch_scan_sizes.push(ranges.len());
         let mut pages = Vec::with_capacity(ranges.len());
         for range in ranges {

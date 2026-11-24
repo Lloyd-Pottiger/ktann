@@ -431,6 +431,13 @@ impl KeyRange {
         Self { start, end }
     }
 
+    /// Selects every key under one encoded KTANN prefix. Its scope tag
+    /// guarantees the prefix has a finite exclusive end.
+    fn for_prefix(start: Vec<u8>) -> Self {
+        let end = successor(&start);
+        Self { start, end }
+    }
+
     /// The inclusive start bound.
     #[must_use]
     pub fn start(&self) -> &[u8] {
@@ -555,13 +562,16 @@ pub fn build_load_key(index: LogicalIndexId) -> Vec<u8> {
 /// Namespace-owned workspace ledger key; survives index-prefix removal.
 #[must_use]
 pub fn build_workspace_key(index: LogicalIndexId) -> Vec<u8> {
-    let mut bytes = vec![SCOPE_NAMESPACE, NS_BUILD_WORKSPACE];
-    bytes.extend_from_slice(&index.get().to_be_bytes());
-    bytes
+    namespace_build_key(NS_BUILD_WORKSPACE, index)
 }
+
 /// Namespace scheduler queue key, surviving index-prefix deletion.
 pub fn build_schedule_key(index: LogicalIndexId) -> Vec<u8> {
-    let mut bytes = vec![SCOPE_NAMESPACE, NS_BUILD_SCHEDULE];
+    namespace_build_key(NS_BUILD_SCHEDULE, index)
+}
+
+fn namespace_build_key(kind: u8, index: LogicalIndexId) -> Vec<u8> {
+    let mut bytes = vec![SCOPE_NAMESPACE, kind];
     bytes.extend_from_slice(&index.get().to_be_bytes());
     bytes
 }
@@ -690,9 +700,7 @@ pub fn graph_chunk_range(
     tree_key: &TreeKey,
     partition: PartitionKey,
 ) -> KeyRange {
-    let mut bytes = partition_prefix(index, tree_key, partition);
-    bytes.push(SUB_GRAPH_CHUNK);
-    KeyRange::new(bytes.clone(), successor(&bytes))
+    partition_subkind_range(index, tree_key, partition, SUB_GRAPH_CHUNK)
 }
 
 /// The Leaf Entry key for `id` in `partition`.
@@ -950,34 +958,29 @@ fn decode_partition_key(
 
 /// Namespace-owned workspace records strictly after the supplied index ID.
 pub(crate) fn build_workspace_range(after: Option<LogicalIndexId>) -> KeyRange {
-    let prefix = vec![SCOPE_NAMESPACE, NS_BUILD_WORKSPACE];
-    let end = successor(&prefix);
-    let start = after.map_or(prefix, |id| {
-        let mut key = build_workspace_key(id);
-        key.push(0);
-        key
-    });
-    KeyRange { start, end }
+    namespace_build_range(NS_BUILD_WORKSPACE, after)
 }
 
 /// Scheduled build records strictly after the supplied index ID.
 pub(crate) fn build_schedule_range(after: Option<LogicalIndexId>) -> KeyRange {
-    let prefix = vec![SCOPE_NAMESPACE, NS_BUILD_SCHEDULE];
-    let end = successor(&prefix);
-    let start = after.map_or(prefix, |id| {
-        let mut key = build_schedule_key(id);
-        key.push(0);
-        key
-    });
-    KeyRange { start, end }
+    namespace_build_range(NS_BUILD_SCHEDULE, after)
+}
+
+/// Resume strictly after the last processed key, retaining the full namespace
+/// range's exclusive end even when the last Logical Index ID is maximal.
+fn namespace_build_range(kind: u8, after: Option<LogicalIndexId>) -> KeyRange {
+    let mut range = KeyRange::for_prefix(vec![SCOPE_NAMESPACE, kind]);
+    if let Some(index) = after {
+        range.start = namespace_build_key(kind, index);
+        range.start.push(0);
+    }
+    range
 }
 
 /// The contiguous range of every key owned by one Logical Index.
 #[must_use]
 pub fn index_range(index: LogicalIndexId) -> KeyRange {
-    let start = index_prefix(index);
-    let end = successor(&start);
-    KeyRange { start, end }
+    KeyRange::for_prefix(index_prefix(index))
 }
 
 /// The contiguous range of every Tree Manifest directory key in one index.
@@ -985,8 +988,7 @@ pub fn index_range(index: LogicalIndexId) -> KeyRange {
 pub fn tree_manifest_range(index: LogicalIndexId) -> KeyRange {
     let mut start = index_prefix(index);
     start.push(KIND_TREE_MANIFEST);
-    let end = successor(&start);
-    KeyRange { start, end }
+    KeyRange::for_prefix(start)
 }
 
 /// The contiguous range of every key owned by one partition.
@@ -996,9 +998,7 @@ pub fn partition_range(
     tree_key: &TreeKey,
     partition: PartitionKey,
 ) -> KeyRange {
-    let start = partition_prefix(index, tree_key, partition);
-    let end = successor(&start);
-    KeyRange { start, end }
+    KeyRange::for_prefix(partition_prefix(index, tree_key, partition))
 }
 
 /// Builds the range for one partition-local subkind.
@@ -1010,8 +1010,7 @@ fn partition_subkind_range(
 ) -> KeyRange {
     let mut start = partition_prefix(index, tree_key, partition);
     start.push(subkind);
-    let end = successor(&start);
-    KeyRange { start, end }
+    KeyRange::for_prefix(start)
 }
 
 /// The contiguous range of every Leaf Entry in one partition.
@@ -1048,8 +1047,7 @@ pub fn tree_manifest_prefix_range(
     let mut start = index_prefix(index);
     start.push(KIND_TREE_MANIFEST);
     TreeKey::append_fields(&types[..prefix.len()], prefix, &mut start)?;
-    let end = successor(&start);
-    Ok(KeyRange { start, end })
+    Ok(KeyRange::for_prefix(start))
 }
 
 /// The Tree Manifest directory range for one planned field expansion.

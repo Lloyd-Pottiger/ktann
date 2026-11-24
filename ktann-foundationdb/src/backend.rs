@@ -8,7 +8,7 @@ use futures_util::future::try_join_all;
 use ktann::api::{Error, ErrorKind, Result};
 use ktann::storage::backend::{
     AdmissionBudget, Backend, Capabilities, CommitStart, HardLimits, InsertOutcome, Mutation,
-    ReadOps, ReadTxn, ScanItem, ScanLimits, ScanPage, WriteTxn,
+    ReadOps, ReadTxn, ScanLimits, ScanPage, ScanPageBuilder, WriteTxn,
 };
 use ktann::storage::keys::KeyRange;
 
@@ -61,11 +61,10 @@ impl PhysicalPrefix {
         Ok(Bytes::from(physical_key))
     }
 
-    fn decode_key(&self, physical_key: &[u8]) -> Result<Bytes> {
-        let logical_key = physical_key
+    fn decode_key<'a>(&self, physical_key: &'a [u8]) -> Result<&'a [u8]> {
+        physical_key
             .strip_prefix(self.bytes.as_ref())
-            .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
-        Ok(Bytes::copy_from_slice(logical_key))
+            .ok_or_else(|| Error::new(ErrorKind::Corruption))
     }
 }
 
@@ -555,17 +554,17 @@ async fn scan(
     range: &KeyRange,
     limits: ScanLimits,
 ) -> Result<ScanPage> {
-    if limits.item_limit == 0 || limits.byte_limit == 0 {
-        return Err(Error::new(ErrorKind::InvalidArgument));
-    }
+    let byte_limit = limits.byte_limit.min(MAX_SCAN_PAGE_BYTES);
+    let mut page = ScanPageBuilder::new(ScanLimits {
+        byte_limit,
+        ..limits
+    })?;
     if range.start() >= range.end() {
-        return Ok(ScanPage::terminal(Vec::new()));
+        return Ok(page.terminal());
     }
     let start = prefix.encode_key(range.start())?;
     let end = prefix.encode_key(range.end())?;
-    let byte_limit = limits.byte_limit.min(MAX_SCAN_PAGE_BYTES);
-    let mut items = Vec::new();
-    let mut item_bytes = 0_usize;
+
     let candidate_items = limits
         .item_limit
         .saturating_add(1)
@@ -586,29 +585,12 @@ async fn scan(
     while let Some(batch) = batches.try_next().await.map_err(map_operation_error)? {
         for value in &batch {
             let logical_key = prefix.decode_key(value.key())?;
-            let bytes = logical_key
-                .len()
-                .checked_add(value.value().len())
-                .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-            if !items.is_empty()
-                && (items.len() >= limits.item_limit
-                    || item_bytes
-                        .checked_add(bytes)
-                        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?
-                        > byte_limit)
-            {
-                return ScanPage::continued(items, prefix.max_logical_key_bytes());
+            if !page.try_push(logical_key, value.value())? {
+                return page.continued(prefix.max_logical_key_bytes());
             }
-            item_bytes = item_bytes
-                .checked_add(bytes)
-                .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-            items.push(ScanItem::new(
-                logical_key,
-                Bytes::copy_from_slice(value.value()),
-            ));
         }
     }
-    Ok(ScanPage::terminal(items))
+    Ok(page.terminal())
 }
 
 /// Serves every range as one snapshot range read, bounding the fan-out per
@@ -619,9 +601,7 @@ async fn batch_scan(
     ranges: &[KeyRange],
     limits: ScanLimits,
 ) -> Result<Vec<ScanPage>> {
-    if limits.item_limit == 0 || limits.byte_limit == 0 {
-        return Err(Error::new(ErrorKind::InvalidArgument));
-    }
+    limits.validate()?;
     let mut pages = Vec::with_capacity(ranges.len());
     for ranges in ranges.chunks(MAX_CONCURRENT_READS) {
         let scans = ranges
