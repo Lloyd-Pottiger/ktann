@@ -793,23 +793,34 @@ pub struct TransactionSize {
 }
 
 impl TransactionSize {
-    /// Returns the number of point mutations.
+    /// Returns the number of mutations, counting a range clear as one.
     #[must_use]
     pub const fn mutations(self) -> usize {
         self.mutations
     }
 
-    /// Returns total encoded key plus value bytes.
+    /// Returns the charged bytes, including both endpoints of a range clear.
     #[must_use]
     pub const fn bytes(self) -> usize {
         self.bytes
     }
 
-    fn checked_add(self, other: Self) -> Option<Self> {
-        Some(Self {
-            mutations: self.mutations.checked_add(other.mutations)?,
-            bytes: self.bytes.checked_add(other.bytes)?,
-        })
+    /// Computes the size after adding mutations, rejecting overflow or a budget
+    /// excess before the caller stages the writes. Adapters supply physical
+    /// bytes, including any namespace prefix already encoded in their keys.
+    pub fn with_charge(
+        self,
+        mutations: usize,
+        bytes: usize,
+        budget: AdmissionBudget,
+    ) -> Result<Self> {
+        let limit = || Error::new(ErrorKind::LimitExceeded);
+        let next = Self {
+            mutations: self.mutations.checked_add(mutations).ok_or_else(limit)?,
+            bytes: self.bytes.checked_add(bytes).ok_or_else(limit)?,
+        };
+        check_budget(budget, next)?;
+        Ok(next)
     }
 }
 
@@ -923,14 +934,7 @@ impl<'manifest> MutationBuilder<'manifest> {
                 next
             }
             Entry::Vacant(entry) => {
-                let next = self
-                    .size
-                    .checked_add(TransactionSize {
-                        mutations: 1,
-                        bytes: new_bytes,
-                    })
-                    .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-                check_budget(self.budget, next)?;
+                let next = self.size.with_charge(1, new_bytes, self.budget)?;
                 entry.insert(value);
                 next
             }
@@ -1376,10 +1380,7 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
         let encoded_key = encode_input_key(&self.binding, &key)?;
         let encoded_value = Bytes::from(self.binding.codec().encode_for_key(&key, &value)?);
         check_hard_limits(self.hard_limits, &encoded_key, Some(&encoded_value))?;
-        let mutation_size = TransactionSize {
-            mutations: 1,
-            bytes: mutation_bytes(&encoded_key, Some(&encoded_value))?,
-        };
+        let bytes = mutation_bytes(&encoded_key, Some(&encoded_value))?;
 
         // An update-protected read both establishes a conflict on the target key
         // and decodes the existing value fail-closed, so a duplicate insert is
@@ -1391,11 +1392,7 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
             return Ok(InsertOutcome::AlreadyExists);
         }
 
-        let next = self
-            .size
-            .checked_add(mutation_size)
-            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-        check_budget(self.budget, next)?;
+        let next = self.size.with_charge(1, bytes, self.budget)?;
         let next_affected = self.add_affected(
             self.affected_key_bytes(&encoded_key, 3)?
                 .checked_add(encoded_value.len())
@@ -1425,11 +1422,9 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
         for (key, value) in &builder.entries {
             check_hard_limits(self.hard_limits, key, value.as_ref())?;
         }
-        let next = self
-            .size
-            .checked_add(builder.size)
-            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-        check_budget(self.budget, next)?;
+        let next =
+            self.size
+                .with_charge(builder.size.mutations, builder.size.bytes, self.budget)?;
         let next_affected = self.add_affected(builder.affected_bytes()?)?;
         let written: Vec<(Bytes, Option<Bytes>)> = builder
             .entries
@@ -1474,14 +1469,7 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
             .len()
             .checked_add(range.raw.end().len())
             .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-        let next = self
-            .size
-            .checked_add(TransactionSize {
-                mutations: 1,
-                bytes,
-            })
-            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-        check_budget(self.budget, next)?;
+        let next = self.size.with_charge(1, bytes, self.budget)?;
         let range_affected = bytes
             .checked_add(
                 self.budget

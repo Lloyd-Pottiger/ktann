@@ -6,6 +6,7 @@ use foundationdb::{Database, FdbError, RangeOption, Transaction};
 use futures_util::TryStreamExt;
 use futures_util::future::try_join_all;
 use ktann::api::{Error, ErrorKind, Result};
+use ktann::storage::TransactionSize;
 use ktann::storage::backend::{
     AdmissionBudget, Backend, Capabilities, CommitStart, HardLimits, InsertOutcome, Mutation,
     ReadOps, ReadTxn, ScanLimits, ScanPage, ScanPageBuilder, WriteTxn,
@@ -49,6 +50,14 @@ impl PhysicalPrefix {
 
     fn max_logical_key_bytes(&self) -> usize {
         FDB_MAX_KEY_BYTES - self.bytes.len()
+    }
+
+    fn admission_budget(&self) -> AdmissionBudget {
+        AdmissionBudget {
+            max_mutations: DEFAULT_MAX_MUTATIONS,
+            max_mutation_bytes: DEFAULT_MAX_MUTATION_BYTES,
+            mutation_key_overhead_bytes: self.bytes.len(),
+        }
     }
 
     fn encode_key(&self, logical_key: &[u8]) -> Result<Bytes> {
@@ -137,16 +146,15 @@ impl fmt::Debug for FoundationDbReadTxn<'_> {
 pub struct FoundationDbWriteTxn<'backend> {
     transaction: Transaction,
     prefix: &'backend PhysicalPrefix,
-    mutation_count: usize,
-    mutation_bytes: usize,
+    size: TransactionSize,
 }
 
 impl fmt::Debug for FoundationDbWriteTxn<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("FoundationDbWriteTxn")
-            .field("mutation_count", &self.mutation_count)
-            .field("mutation_bytes", &self.mutation_bytes)
+            .field("mutation_count", &self.size.mutations())
+            .field("mutation_bytes", &self.size.bytes())
             .finish_non_exhaustive()
     }
 }
@@ -164,11 +172,7 @@ impl Backend for FoundationDbBackend {
     }
 
     fn admission_budget(&self) -> AdmissionBudget {
-        AdmissionBudget {
-            max_mutations: DEFAULT_MAX_MUTATIONS,
-            max_mutation_bytes: DEFAULT_MAX_MUTATION_BYTES,
-            mutation_key_overhead_bytes: self.prefix.bytes.len(),
-        }
+        self.prefix.admission_budget()
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -195,8 +199,7 @@ impl Backend for FoundationDbBackend {
         Ok(FoundationDbWriteTxn {
             transaction,
             prefix: &self.prefix,
-            mutation_count: 0,
-            mutation_bytes: 0,
+            size: TransactionSize::default(),
         })
     }
 }
@@ -235,19 +238,11 @@ impl ReadTxn for FoundationDbReadTxn<'_> {}
 
 impl FoundationDbWriteTxn<'_> {
     fn charge(&mut self, mutation_count: usize, mutation_bytes: usize) -> Result<()> {
-        let next_count = self
-            .mutation_count
-            .checked_add(mutation_count)
-            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-        let next_bytes = self
-            .mutation_bytes
-            .checked_add(mutation_bytes)
-            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-        if next_count > DEFAULT_MAX_MUTATIONS || next_bytes > DEFAULT_MAX_MUTATION_BYTES {
-            return Err(Error::new(ErrorKind::LimitExceeded));
-        }
-        self.mutation_count = next_count;
-        self.mutation_bytes = next_bytes;
+        self.size = self.size.with_charge(
+            mutation_count,
+            mutation_bytes,
+            self.prefix.admission_budget(),
+        )?;
         Ok(())
     }
 
@@ -303,7 +298,7 @@ impl WriteTxn for FoundationDbWriteTxn<'_> {
     }
 
     async fn batch_mutate(&mut self, mutations: Vec<Mutation>) -> Result<()> {
-        if mutations.len() > DEFAULT_MAX_MUTATIONS.saturating_sub(self.mutation_count) {
+        if mutations.len() > DEFAULT_MAX_MUTATIONS.saturating_sub(self.size.mutations()) {
             return Err(Error::new(ErrorKind::LimitExceeded));
         }
         let mut prepared = Vec::with_capacity(mutations.len());

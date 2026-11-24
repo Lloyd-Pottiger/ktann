@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use bytes::Bytes;
 use imbl::OrdMap;
 use ktann::api::{Error, ErrorKind, Result};
+use ktann::storage::TransactionSize;
 use ktann::storage::backend::{
     AdmissionBudget, Backend, Capabilities, CommitStart, HardLimits, InsertOutcome, Mutation,
     ReadOps, ReadTxn, ScanLimits, ScanPage, ScanPageBuilder, WriteTxn,
@@ -219,8 +220,7 @@ impl Backend for MemoryBackend {
             },
             protected: BTreeSet::new(),
             writes: BTreeMap::new(),
-            mutation_count: 0,
-            mutation_bytes: 0,
+            size: TransactionSize::default(),
             #[cfg(feature = "test-support")]
             clears: Vec::new(),
         })
@@ -343,8 +343,7 @@ pub struct MemoryWriteTxn<'a> {
     view: MemoryReadTxn,
     protected: BTreeSet<Bytes>,
     writes: BTreeMap<Bytes, Option<Bytes>>,
-    mutation_count: usize,
-    mutation_bytes: usize,
+    size: TransactionSize,
     #[cfg(feature = "test-support")]
     clears: Vec<KeyRange>,
 }
@@ -358,21 +357,30 @@ impl std::fmt::Debug for MemoryWriteTxn<'_> {
 impl MemoryWriteTxn<'_> {
     /// Validates admission before staging, so a rejected mutation changes nothing.
     fn stage(&mut self, key: Bytes, value: Option<Bytes>) -> Result<()> {
-        self.view.validate_key(&key)?;
+        let size = self.admit_point(self.size, &key, value.as_ref().map_or(0, Bytes::len))?;
         #[cfg(feature = "test-support")]
         self.check_buffer(usize::from(!self.writes.contains_key(&key)))?;
-        let budget = self.backend.admission_budget();
-        let value_bytes = value.as_ref().map_or(0, Bytes::len);
-        if value_bytes > self.backend.hard_limits().max_value_bytes
-            || self.mutation_count == budget.max_mutations
-            || key.len() + value_bytes > budget.max_mutation_bytes - self.mutation_bytes
-        {
-            return Err(Error::new(ErrorKind::LimitExceeded));
-        }
-        self.mutation_count += 1;
-        self.mutation_bytes += key.len() + value_bytes;
+        self.size = size;
         self.apply_point(key, value);
         Ok(())
+    }
+
+    /// Checks one point mutation against hard limits and the cumulative write budget.
+    fn admit_point(
+        &self,
+        size: TransactionSize,
+        key: &[u8],
+        value_bytes: usize,
+    ) -> Result<TransactionSize> {
+        self.view.validate_key(key)?;
+        if value_bytes > self.backend.hard_limits().max_value_bytes {
+            return Err(Error::new(ErrorKind::LimitExceeded));
+        }
+        let bytes = key
+            .len()
+            .checked_add(value_bytes)
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+        size.with_charge(1, bytes, self.backend.admission_budget())
     }
 
     /// Keeps the private read view and final commit delta in step after admission.
@@ -444,8 +452,8 @@ impl MemoryWriteTxn<'_> {
             HistoryEntry {
                 version: state.revision,
                 outcome,
-                mutations: self.mutation_count,
-                mutation_bytes: self.mutation_bytes,
+                mutations: self.size.mutations(),
+                mutation_bytes: self.size.bytes(),
                 distinct_keys: self.writes.len(),
                 fingerprint: test_support::fingerprint(&self.clears, &self.writes),
             },
@@ -511,8 +519,8 @@ impl WriteTxn for MemoryWriteTxn<'_> {
             self.backend.control.check_batch(mutations.len())?;
         }
         let budget = self.backend.admission_budget();
-        let mut bytes = self.mutation_bytes;
-        if mutations.len() > budget.max_mutations - self.mutation_count {
+        let mut size = self.size;
+        if mutations.len() > budget.max_mutations - self.size.mutations() {
             return Err(Error::new(ErrorKind::LimitExceeded));
         }
         // Validate and count the entire batch before changing the private view.
@@ -524,13 +532,7 @@ impl WriteTxn for MemoryWriteTxn<'_> {
                 Mutation::Delete { key } => (key, 0),
                 _ => return Err(Error::new(ErrorKind::Unsupported)),
             };
-            self.view.validate_key(key)?;
-            if value_bytes > self.backend.hard_limits().max_value_bytes
-                || key.len() + value_bytes > budget.max_mutation_bytes - bytes
-            {
-                return Err(Error::new(ErrorKind::LimitExceeded));
-            }
-            bytes += key.len() + value_bytes;
+            size = self.admit_point(size, key, value_bytes)?;
             #[cfg(feature = "test-support")]
             if !self.writes.contains_key(key) {
                 added.insert(key);
@@ -538,8 +540,7 @@ impl WriteTxn for MemoryWriteTxn<'_> {
         }
         #[cfg(feature = "test-support")]
         self.check_buffer(added.len())?;
-        self.mutation_count += mutations.len();
-        self.mutation_bytes = bytes;
+        self.size = size;
         for mutation in mutations {
             match mutation {
                 Mutation::Put { key, value } => self.apply_point(key, Some(value)),
@@ -699,14 +700,10 @@ impl MemoryWriteTxn<'_> {
             .count();
         let bytes = range.start().len() + range.end().len();
         let budget = self.backend.admission_budget();
-        if retained + clears.len() > self.backend.control.config.max_mutation_buffer
-            || self.mutation_count == budget.max_mutations
-            || bytes > budget.max_mutation_bytes - self.mutation_bytes
-        {
+        if retained + clears.len() > self.backend.control.config.max_mutation_buffer {
             return Err(Error::new(ErrorKind::LimitExceeded));
         }
-        self.mutation_count += 1;
-        self.mutation_bytes += bytes;
+        self.size = self.size.with_charge(1, bytes, budget)?;
         self.writes.retain(|key, _| !range_contains(range, key));
         let keys: Vec<_> = self
             .view

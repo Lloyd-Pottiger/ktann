@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use ktann::api::{Error, ErrorKind, Result};
+use ktann::storage::TransactionSize;
 use ktann::storage::backend::{
     AdmissionBudget, Backend, Capabilities, CommitStart, HardLimits, InsertOutcome, Mutation,
     ReadOps, ReadTxn, ScanLimits, ScanPage, ScanPageBuilder, WriteTxn,
@@ -55,6 +56,14 @@ impl PhysicalPrefix {
 
     fn max_logical_key_bytes(&self) -> usize {
         ROCKSDB_MAX_PHYSICAL_KEY_BYTES - self.bytes.len()
+    }
+
+    fn admission_budget(&self) -> AdmissionBudget {
+        AdmissionBudget {
+            max_mutations: DEFAULT_MAX_MUTATIONS,
+            max_mutation_bytes: DEFAULT_MAX_MUTATION_BYTES,
+            mutation_key_overhead_bytes: self.bytes.len(),
+        }
     }
 
     fn encode_key(&self, logical_key: &[u8]) -> Result<Bytes> {
@@ -320,11 +329,7 @@ impl Backend for RocksDbBackend {
     }
 
     fn admission_budget(&self) -> AdmissionBudget {
-        AdmissionBudget {
-            max_mutations: DEFAULT_MAX_MUTATIONS,
-            max_mutation_bytes: DEFAULT_MAX_MUTATION_BYTES,
-            mutation_key_overhead_bytes: self.prefix.bytes.len(),
-        }
+        self.prefix.admission_budget()
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -432,24 +437,6 @@ impl RocksDbWriteTxn<'_> {
         let key = self.prefix.encode_key(&key)?;
         Ok(PreparedMutation::Delete { key })
     }
-}
-
-fn next_charge(
-    current_count: usize,
-    current_bytes: usize,
-    mutation_count: usize,
-    mutation_bytes: usize,
-) -> Result<(usize, usize)> {
-    let next_count = current_count
-        .checked_add(mutation_count)
-        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-    let next_bytes = current_bytes
-        .checked_add(mutation_bytes)
-        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-    if next_count > DEFAULT_MAX_MUTATIONS || next_bytes > DEFAULT_MAX_MUTATION_BYTES {
-        return Err(Error::new(ErrorKind::LimitExceeded));
-    }
-    Ok((next_count, next_bytes))
 }
 
 impl WriteTxn for RocksDbWriteTxn<'_> {
@@ -620,8 +607,8 @@ fn write_actor(
     let mut transaction_options = OptimisticTransactionOptions::default();
     transaction_options.set_snapshot(true);
     let transaction = database.transaction_opt(&write_options, &transaction_options);
-    let mut mutation_count = 0_usize;
-    let mut mutation_bytes = 0_usize;
+    let mut size = TransactionSize::default();
+    let budget = prefix.admission_budget();
     if ready.send(()).is_err() {
         return;
     }
@@ -674,9 +661,9 @@ fn write_actor(
                 charged_bytes,
                 response,
             } => respond(response, || {
-                let charge = next_charge(mutation_count, mutation_bytes, 1, charged_bytes)?;
+                let charge = size.with_charge(1, charged_bytes, budget)?;
                 mutation.apply(&transaction)?;
-                (mutation_count, mutation_bytes) = charge;
+                size = charge;
                 Ok(())
             }),
             WriteCommand::ApplyBatch {
@@ -684,16 +671,11 @@ fn write_actor(
                 charged_bytes,
                 response,
             } => respond(response, || {
-                let charge = next_charge(
-                    mutation_count,
-                    mutation_bytes,
-                    mutations.len(),
-                    charged_bytes,
-                )?;
+                let charge = size.with_charge(mutations.len(), charged_bytes, budget)?;
                 for mutation in mutations {
                     mutation.apply(&transaction)?;
                 }
-                (mutation_count, mutation_bytes) = charge;
+                size = charge;
                 Ok(())
             }),
             WriteCommand::Insert {
@@ -707,9 +689,9 @@ fn write_actor(
                 if get_for_update(&transaction, mutation.key(), &read_options)?.is_some() {
                     return Ok(InsertOutcome::AlreadyExists);
                 }
-                let charge = next_charge(mutation_count, mutation_bytes, 1, charged_bytes)?;
+                let charge = size.with_charge(1, charged_bytes, budget)?;
                 mutation.apply(&transaction)?;
-                (mutation_count, mutation_bytes) = charge;
+                size = charge;
                 Ok(InsertOutcome::Inserted)
             }),
             WriteCommand::Commit {
