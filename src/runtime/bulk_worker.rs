@@ -2,7 +2,7 @@
 use super::{OperationContext, lifecycle::RetryPolicy};
 use crate::api::{BulkBuildReport, BulkWorkerOptions, Error, ErrorKind, Result};
 use crate::bulk::{
-    ForestArtifact, ForestOptions, InputSnapshot, PreparedInput, ServingArtifact, ServingOptions,
+    ForestArtifact, ForestOptions, InputSnapshot, OrderedSource, ServingArtifact, ServingOptions,
 };
 use crate::observe::labels::Operation;
 use crate::storage::backend::Backend;
@@ -114,7 +114,6 @@ pub(crate) async fn complete<B: Backend>(
     index: IndexManifest,
     descriptor: BuildDescriptor,
     options: BulkWorkerOptions,
-    mut prepared: Option<PreparedInput>,
     retry: RetryPolicy,
 ) -> Result<(IndexManifest, BulkBuildReport)> {
     let mut attempts = 0;
@@ -135,7 +134,6 @@ pub(crate) async fn complete<B: Backend>(
                         index.clone(),
                         descriptor.clone(),
                         options.clone(),
-                        prepared.take(),
                         retry,
                     )
                     .await?;
@@ -199,39 +197,15 @@ pub(crate) async fn run<B: Backend>(
     index: IndexManifest,
     descriptor: BuildDescriptor,
     options: BulkWorkerOptions,
-    prepared: Option<PreparedInput>,
     retry: RetryPolicy,
 ) -> Result<BulkBuildReport> {
     let options = normalize_options(context, options).await?;
-    if let Some(input) = &prepared {
-        let forest_options = ForestOptions {
-            refinement_rounds: descriptor.refinement_rounds(),
-            refinement_memory_bytes: options.refinement_memory_bytes,
-            sample_items: descriptor.options().sample_items,
-            tree_memory_bytes: descriptor.options().memory_bytes,
-            tree_scratch_bytes: descriptor.options().scratch_bytes,
-            sort_memory_bytes: options.sort_memory_bytes,
-            sort_scratch_bytes: options.sort_scratch_bytes,
-        };
-        if !input.matches(index.config(), descriptor.input(), forest_options) {
-            return Err(Error::invalid_argument());
-        }
-    }
     // Lock before registration or any directory creation, so cleanup can remove
     // the ledger only when every potential creator has left this critical region.
     let root = options.workspace.clone();
     let lock = Arc::new(blocking(context, move || lock_root(&root, false)).await?);
     let mut state = claim(context, &index, &descriptor, options, retry).await?;
-    let result = prepare_and_load(
-        context,
-        &index,
-        &descriptor,
-        &mut state,
-        lock,
-        prepared,
-        retry,
-    )
-    .await;
+    let result = prepare_and_load(context, &index, &descriptor, &mut state, lock, retry).await;
     if let Err(error) = &result {
         record_failure(context, &index, &state, error.kind(), retry).await?;
     }
@@ -326,16 +300,9 @@ async fn prepare_and_load<B: Backend>(
     descriptor: &BuildDescriptor,
     state: &mut BuildWorkspace,
     lock: Arc<File>,
-    prepared: Option<PreparedInput>,
     retry: RetryPolicy,
 ) -> Result<BulkBuildReport> {
     let mut report = BulkBuildReport::default();
-    let prepared = if state.forest.is_some() || state.serving.is_some() {
-        drop(prepared);
-        None
-    } else {
-        prepared
-    };
     let serving = if let Some(accepted) = &state.serving {
         let path = state.attempt(accepted.epoch).join("serving");
         let expected = accepted.manifest.clone();
@@ -389,6 +356,13 @@ async fn prepare_and_load<B: Backend>(
             sort_memory_bytes: state.options.sort_memory_bytes,
             sort_scratch_bytes: state.options.sort_scratch_bytes,
         };
+        let serving_options = ServingOptions {
+            graph_memory_bytes: state.options.graph_memory_bytes,
+            memory_bytes: state.options.serving_memory_bytes,
+            scratch_bytes: state.options.serving_scratch_bytes,
+            hard_limits: state.hard_limits,
+        };
+        let mut ordered = None;
         let forest = if let Some(accepted) = &state.forest {
             let path = state.attempt(accepted.epoch).join("forest");
             let expected = accepted.manifest.clone();
@@ -416,28 +390,41 @@ async fn prepare_and_load<B: Backend>(
             let lock = lock.clone();
             let start = Instant::now();
             let control = context.options.clone();
-            let (forest, forest_report) = blocking(context, move || {
+            let (forest, forest_report, sorted) = blocking(context, move || {
                 let _lock = lock;
-                match prepared {
-                    Some(input) => ForestArtifact::build_prepared_controlled(
-                        &path,
-                        input,
-                        seed,
-                        quota,
-                        &|| super::check_control(&control),
-                    ),
-                    None => ForestArtifact::build_controlled(
+                let check = || super::check_control(&control);
+                if source.config().tree_key_fields().is_empty() {
+                    let sorted = OrderedSource::build(
+                        &path.with_file_name("source-sort"),
+                        &source,
+                        serving_options,
+                        &check,
+                    )?;
+                    let (forest, report) = ForestArtifact::build_ordered(
                         &path,
                         &source,
                         seed,
                         forest_options,
                         quota,
-                        &|| super::check_control(&control),
-                    ),
+                        &sorted,
+                        &check,
+                    )?;
+                    return Ok((forest, report, Some(sorted)));
                 }
+                let (forest, report) = ForestArtifact::build_controlled(
+                    &path,
+                    &source,
+                    seed,
+                    forest_options,
+                    quota,
+                    &check,
+                )?;
+                Ok((forest, report, None))
             })
             .await?;
-            report.forest = start.elapsed();
+            report.serving = sorted.as_ref().map(|s| s.elapsed).unwrap_or_default();
+            report.forest = start.elapsed() - report.serving;
+            ordered = sorted;
             report.forest_report = Some(forest_report);
             let mut after = state.clone();
             after.forest = Some(PreparedArtifact {
@@ -447,12 +434,6 @@ async fn prepare_and_load<B: Backend>(
             accept(context, index, state, &after, retry).await?;
             *state = after;
             forest
-        };
-        let serving_options = ServingOptions {
-            graph_memory_bytes: state.options.graph_memory_bytes,
-            memory_bytes: state.options.serving_memory_bytes,
-            scratch_bytes: state.options.serving_scratch_bytes,
-            hard_limits: state.hard_limits,
         };
         let path = state.attempt(state.epoch).join("serving");
         let manifest = index.clone();
@@ -464,7 +445,7 @@ async fn prepare_and_load<B: Backend>(
             let _lock = lock;
             ServingArtifact::build_controlled(
                 &path,
-                &input,
+                (&input, ordered),
                 &forest,
                 &manifest,
                 serving_options,
@@ -473,7 +454,7 @@ async fn prepare_and_load<B: Backend>(
             )
         })
         .await?;
-        report.serving = start.elapsed();
+        report.serving += start.elapsed();
         report.serving_report = Some(serving_report);
         let mut after = state.clone();
         after.serving = Some(PreparedArtifact {

@@ -232,19 +232,17 @@ pub(super) struct Sorter {
     payload_bytes: usize,
     runs: Vec<Vec<Run>>,
     fan_in: usize,
-    reject_duplicate_keys: bool,
 }
 
 pub(super) fn validate_memory(memory: usize, maximum_row: usize) -> Result<()> {
-    memory_plan(memory, maximum_row, 1).map(|_| ())
+    memory_plan(memory, maximum_row).map(|_| ())
 }
 
 // Larger rows or small budgets reduce fan-in, rather than rejecting a budget
 // that can still support a two-way merge. All merge heads are explicitly charged.
-fn memory_plan(memory: usize, maximum_row: usize, buffers: usize) -> Result<(usize, usize)> {
+fn memory_plan(memory: usize, maximum_row: usize) -> Result<(usize, usize)> {
     let minimum = maximum_row
         .checked_add(std::mem::size_of::<Row>())
-        .and_then(|row| row.checked_mul(buffers))
         .ok_or_else(limit)?;
     for fan_in in (2..=MAX_FAN_IN).rev() {
         let Some(reserved) = maximum_row
@@ -265,32 +263,14 @@ fn memory_plan(memory: usize, maximum_row: usize, buffers: usize) -> Result<(usi
 
 impl Sorter {
     pub fn new(space: &Space, memory: usize) -> Result<Self> {
-        let (fan_in, budget) = memory_plan(memory, space.maximum_row, 1)?;
+        let (fan_in, budget) = memory_plan(memory, space.maximum_row)?;
         Ok(Self {
             rows: Vec::new(),
             budget,
             payload_bytes: 0,
             runs: Vec::new(),
             fan_in,
-            reject_duplicate_keys: false,
         })
-    }
-
-    // Paired receipt sorters retain disjoint row buffers, but push/finish run
-    // serially. Reserve merge heads and IO buffers once for the active sorter.
-    // The first sorter checks local ID duplicates as each run is written.
-    pub fn pair(space: &Space, memory: usize) -> Result<(Self, Self)> {
-        let (fan_in, budget) = memory_plan(memory, space.maximum_row, 2)?;
-        let first = budget / 2;
-        let make = |budget, reject_duplicate_keys| Self {
-            rows: Vec::new(),
-            budget,
-            payload_bytes: 0,
-            runs: Vec::new(),
-            fan_in,
-            reject_duplicate_keys,
-        };
-        Ok((make(first, true), make(budget - first, false)))
     }
 
     /// Admits one bounded row, spilling before its allocation would exceed the sorter budget.
@@ -345,9 +325,6 @@ impl Sorter {
         let mut rows = std::mem::take(&mut self.rows);
         self.payload_bytes = 0;
         rows.sort_unstable();
-        if self.reject_duplicate_keys && rows.windows(2).any(|pair| pair[0].key == pair[1].key) {
-            return Err(Error::new(ErrorKind::RecordAlreadyExists));
-        }
         let (mut run, mut output) = space.writer()?;
         for row in rows {
             space.append(&mut run, &mut output, &row)?;
@@ -437,38 +414,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn paired_sorters_do_not_spill_uniform_rows_that_fit_the_budget() {
-        let root = tempfile::tempdir().unwrap();
-        let directory = root.path().join("scratch");
-        let mut space = Space::new(&directory, 1024 * 1024, 128).unwrap();
-        let (mut ids, mut trees) = Sorter::pair(&space, 2 * 1024 * 1024).unwrap();
-        for id in 0..10000_u64 {
-            ids.push(
-                &mut space,
-                Row {
-                    key: id.to_be_bytes().to_vec(),
-                    value: Vec::new(),
-                },
-            )
-            .unwrap();
-            trees
-                .push(
-                    &mut space,
-                    Row {
-                        key: Vec::new(),
-                        value: vec![0; 18],
-                    },
-                )
-                .unwrap();
-        }
-        assert_eq!(space.written, 0);
-        assert!(ids.unique_keys(&mut space).unwrap());
-        let run = trees.finish(&mut space).unwrap();
-        space.remove(run).unwrap();
-        assert_eq!(space.live, 0);
-    }
-
-    #[test]
     fn uniqueness_checks_buffered_keys_and_reclaims_runs() {
         for duplicate in [false, true] {
             let root = tempfile::tempdir().unwrap();
@@ -544,21 +489,12 @@ mod tests {
     }
 
     #[test]
-    fn spilled_uniqueness_needs_no_final_output_quota_and_preserves_the_paired_sorter() {
+    fn spilled_uniqueness_needs_no_final_output_quota() {
         for duplicate in [false, true] {
             let root = tempfile::tempdir().unwrap();
             let directory = root.path().join("scratch");
             let mut space = Space::new(&directory, 3000 * 16, 64).unwrap();
-            let (mut ids, mut trees) = Sorter::pair(&space, 600_000).unwrap();
-            trees
-                .push(
-                    &mut space,
-                    Row {
-                        key: vec![7],
-                        value: vec![9],
-                    },
-                )
-                .unwrap();
+            let mut ids = Sorter::new(&space, 600_000).unwrap();
             for id in 0..3000_u64 {
                 let id = if duplicate && id == 2999 { 0 } else { id };
                 ids.push(
@@ -572,13 +508,6 @@ mod tests {
             }
             assert_eq!(ids.unique_keys(&mut space).unwrap(), !duplicate);
             assert_eq!(space.live, 0);
-            let run = trees.finish(&mut space).unwrap();
-            let mut reader = space.reader(&run).unwrap();
-            let row = reader.next().unwrap().unwrap();
-            assert_eq!((row.key, row.value), (vec![7], vec![9]));
-            assert!(reader.next().unwrap().is_none());
-            drop(reader);
-            space.remove(run).unwrap();
             assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
         }
     }
@@ -588,7 +517,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("scratch");
         let mut space = Space::new(&directory, 3000 * 16, 64).unwrap();
-        let (mut ids, _trees) = Sorter::pair(&space, 600_000).unwrap();
+        let mut ids = Sorter::new(&space, 600_000).unwrap();
         for id in 0..3000_u64 {
             let id = if id == 2999 { 0 } else { id };
             ids.push(

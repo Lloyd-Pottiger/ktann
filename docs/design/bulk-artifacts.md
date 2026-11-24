@@ -11,14 +11,9 @@ serving lifecycle and exact-membership contracts are unchanged.
    Payloads, in arrival order. Configuration validation and canonical source
    encoding happen during append. Plain snapshots retain duplicate IDs;
    forest preparation rejects them globally, including across Tree Keys.
-2. `PreparedInputWriter` optionally performs bounded ID and Tree Key sorting
-   while receiving records. Local duplicates fail during append; duplicates
-   across spilled runs fail when forest construction consolidates the ID runs. Its one-use `PreparedInput` avoids
-   repeating that work. The original-order source remains the durable authority;
-   lost preparation can be recomputed using `ForestArtifact::build`.
-3. `ForestArtifact::build` sorts IDs for global uniqueness, groups by Tree Key,
+2. `ForestArtifact::build` sorts IDs for global uniqueness, groups by Tree Key,
    and delegates each tree to the existing deterministic construction algorithm.
-   `build_prepared` consumes receipt-time preparation. Plans are emitted in
+   Plans are emitted in
    canonical tree order, child-before-parent with root Partition Key 1 last.
    Optional bounded refinement runs on one tree before emission, reusing
    the ordinary metric-correct assignment algorithm. Zero rounds refreshes leaf
@@ -48,7 +43,7 @@ serving lifecycle and exact-membership contracts are unchanged.
    accounts for the larger maximum capacity. `ForestOptions` supplies sampling,
    refinement, and resource budgets; standalone `construct_tree` likewise takes
    capacities from `IndexConfig` and sampling/resources from `ConstructionOptions`.
-4. `ServingArtifact::build` uses bounded external joins to prove exact source/leaf
+3. `ServingArtifact::build` uses bounded external joins to prove exact source/leaf
    membership and parent/child relationships. Core storage codecs encode records,
    locations, payloads, trees, partition metadata, entries, and synopses. Output
    keys are unique and sorted, and adapter key/value limits are checked. For Local Graph
@@ -99,7 +94,14 @@ and backpressure. Output quotas include framing and the manifest. Sort memory
 includes bounded row buffers and merge readers; numeric run IDs bound pending
 run metadata. Spilled uniqueness checks consume the final merge directly, avoiding
 an intermediate final run; ordinary sorted outputs still materialize their runs.
-Receipt-time sorters share their declared memory and scratch budget.
+When the runtime builds from the source snapshot with no Tree Key fields,
+it sorts the verified full frames once by Record ID under the serving budgets.
+The default tree consumes their original vectors in that order. Serving then
+reads the same run for its assignment join, including fields and payloads.
+The run remains in the attempt workspace and counts against serving scratch
+until the join finishes. That space can overlap per-tree construction scratch.
+An attempt resuming an accepted forest rebuilds the serving sort from the
+verified source.
 When refinement is selected, construction keeps its canonical-ID run of
 preprocessed routing vectors until the tree is refined. Its bytes remain charged
 to tree scratch throughout construction. After admitting topology, membership,
@@ -112,16 +114,13 @@ centers and graph workspace. It is independent of the process-wide RSS.
 Forest sort scratch and per-tree construction scratch may overlap, so their
 ceilings add. Codec-bounded decoding buffers and a synopsis are additional to
 sort memory; caller-owned input and retained output are outside these budgets.
-Ordinary preparation serializes ID and tree sorting to use the full row budget;
-receipt preparation shares it between two live sorters. These schedules preserve
-different minimum memory budgets and spill behavior. See the option fields for
-each stage's precise accounting. Successful stages
-remove scratch; callers own cleanup after failure or cancellation.
+Multi-tree preparation sorts IDs and tree projections in sequence using the full row budget.
+Successful stages remove scratch. Callers own cleanup after failure or cancellation.
 
 ## 4. Verification
 
-`tests/bulk_artifacts.rs` covers restart identity, canonical full records, receipt
-preparation, global duplicate rejection, spills, resource ceilings, deterministic
+`tests/bulk_artifacts.rs` covers restart identity, canonical full records, global
+duplicate rejection, spills, resource ceilings, deterministic
 forest equivalence, and corrupt files. `tests/bulk_serving.rs` checks exact joins,
 resource failures, relocation/reopen identity checks, escaped ID ordering, and all metrics with and without Tree
 Keys. Its fixture loads into Memory solely to run ordinary index verification

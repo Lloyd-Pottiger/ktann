@@ -1,6 +1,6 @@
 //! Exact external joins from finite source and topology to serving key/value bytes.
 
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -95,6 +95,73 @@ pub struct ServingArtifact {
     limits: HardLimits,
 }
 
+/// Verified original source frames sorted by Record ID in the serving scratch space.
+/// A live worker can read this run for a default-tree forest before the serving join.
+pub(crate) struct OrderedSource {
+    space: Space,
+    run: Run,
+    pub(crate) elapsed: Duration,
+}
+
+impl OrderedSource {
+    pub(crate) fn build(
+        directory: &Path,
+        input: &InputSnapshot,
+        options: ServingOptions,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Self> {
+        let start = Instant::now();
+        let mut space = Space::new(directory, options.scratch_bytes, MAX_ROW)?;
+        let mut records = Sorter::new(&space, options.memory_bytes)?;
+        let mut source = input.encoded_reader()?;
+        while let Some(frame) = source.next() {
+            check()?;
+            let frame = frame?;
+            let record = source::decode(input.config(), frame.clone())?;
+            let key = record.id().to_vec();
+            // Release decoded ID/payload slices so the canonical frame's buffer
+            // can move into the sort run without re-encoding or copying it.
+            drop(record);
+            records.push(
+                &mut space,
+                Row {
+                    key,
+                    value: frame.into(),
+                },
+            )?;
+        }
+        drop(source);
+        let record_run = records.finish(&mut space)?;
+        Ok(Self {
+            space,
+            run: record_run,
+            elapsed: start.elapsed(),
+        })
+    }
+
+    pub(super) fn construction_records(
+        &self,
+        input: &InputSnapshot,
+    ) -> Result<impl Iterator<Item = Result<crate::construction::ConstructionRecord>>> {
+        let mut reader = self.space.reader(&self.run)?;
+        let mut previous = None;
+        Ok(
+            std::iter::from_fn(move || reader.next().transpose()).map(move |row| {
+                let row = row?;
+                if previous.as_ref() == Some(&row.key) {
+                    return Err(Error::new(ErrorKind::RecordAlreadyExists));
+                }
+                previous = Some(row.key);
+                let record = source::decode(input.config(), Bytes::from(row.value))?;
+                Ok(crate::construction::ConstructionRecord {
+                    id: record.id().clone(),
+                    vector: record.vector().into(),
+                })
+            }),
+        )
+    }
+}
+
 impl ServingArtifact {
     /// Checks the source and target identities retained at construction or open.
     pub(crate) fn matches_build(
@@ -162,7 +229,7 @@ impl ServingArtifact {
     ) -> Result<(Self, ServingReport)> {
         Self::build_controlled(
             directory,
-            input,
+            (input, None),
             forest,
             index,
             options,
@@ -174,13 +241,14 @@ impl ServingArtifact {
     /// Runtime preparation retains cooperative cancellation during native graph work.
     pub(crate) fn build_controlled(
         directory: &Path,
-        input: &InputSnapshot,
+        source_input: (&InputSnapshot, Option<OrderedSource>),
         forest: &ForestArtifact,
         index: &IndexManifest,
         options: ServingOptions,
         maximum_bytes: u64,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<(Self, ServingReport)> {
+        let (input, sorted) = source_input;
         check()?;
         validate(directory, input, forest, index, options)?;
         let codec = ValueCodec::for_index(index);
@@ -191,30 +259,19 @@ impl ServingArtifact {
             binding(input.manifest(), forest.manifest(), index)?,
             maximum_bytes,
         )?;
-        let scratch = directory.join("scratch");
-        let mut space = Space::new(&scratch, options.scratch_bytes, MAX_ROW)?;
-        let mut report = ServingReport::default();
-        let start = Instant::now();
-        let mut records = Sorter::new(&space, options.memory_bytes)?;
-        let mut source = input.encoded_reader()?;
-        while let Some(frame) = source.next() {
-            let frame = frame?;
-            let record = source::decode(index.config(), frame.clone())?;
-            let key = record.id().to_vec();
-            // Release decoded ID/payload slices so the canonical frame's buffer
-            // can move into the sort run without re-encoding or copying it.
-            drop(record);
-            records.push(
-                &mut space,
-                Row {
-                    key,
-                    value: frame.into(),
-                },
-            )?;
-        }
-        drop(source);
-        let record_run = records.finish(&mut space)?;
-        report.source_sort = start.elapsed();
+        let sorted = match sorted {
+            Some(sorted) => sorted,
+            None => OrderedSource::build(&directory.join("scratch"), input, options, check)?,
+        };
+        let OrderedSource {
+            mut space,
+            run: record_run,
+            elapsed,
+        } = sorted;
+        let mut report = ServingReport {
+            source_sort: elapsed,
+            ..Default::default()
+        };
         let start = Instant::now();
         let mut topology = Sorter::new(&space, options.memory_bytes)?;
         for row in forest.reader()? {
@@ -608,7 +665,7 @@ impl ServingArtifact {
         drop((output, synopses));
         space.remove(output_run)?;
         space.remove(synopsis_run)?;
-        fs::remove_dir(scratch).map_err(io_error)?;
+        space.reclaim_directory()?;
         report.peak_scratch_bytes = space.peak;
         report.scratch_written_bytes = space.written;
         let (directory, artifact) = writer.seal()?;

@@ -337,8 +337,9 @@ bridge policy.
 
 ### Lifecycle and controls
 
-Insert requests capture bounded batches through `PreparedInputWriter`, which
-writes canonical source frames, hashes, and receipt-time sort runs. A successful
+Insert requests capture bounded batches through `InputSnapshotWriter`, which
+writes canonical source frames and hashes. During Optimize the default tree
+and the serving join share one Record ID-ordered run of full source frames. A successful
 insert acknowledges capture, not per-batch durability or publication. No
 `batch_mutate` path is used. Duplicate IDs can be detected when Optimize builds
 the index rather than when a batch is received; unknown inserts must not be

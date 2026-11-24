@@ -514,7 +514,7 @@ async fn prepare_bulk_index<B: Backend>(
     let settings = crate::report::bulk_build_settings(&construction, &worker);
     std::fs::create_dir(&worker.workspace).map_err(|e| e.to_string())?;
     let (index, stages) = job
-        .complete_with_report(worker, None, OperationOptions::default())
+        .complete_with_report(worker, OperationOptions::default())
         .await
         .map_err(|e| error_at("complete bulk index", e))?;
     let imported = ResourceSnapshot::capture()?;

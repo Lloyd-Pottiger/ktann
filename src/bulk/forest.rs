@@ -15,7 +15,6 @@ use crate::storage::keys::{
 };
 
 use super::files::{ArtifactManifest, Reader, Writer, corrupt, io_error};
-use super::input::PreparedInput;
 use super::sort::{Row, Sorter, Space};
 use super::{InputSnapshot, plan};
 
@@ -90,43 +89,6 @@ pub struct ForestArtifact {
     seed: [u8; 32],
 }
 
-// Volatile work derived from the same validated records as the sealed snapshot.
-// Two sorters share a fixed memory ceiling and a single scratch quota.
-pub(super) struct ForestPreparation {
-    pub options: ForestOptions,
-    space: Space,
-    ids: Sorter,
-    trees: Sorter,
-    types: Vec<DataType>,
-}
-
-impl ForestPreparation {
-    pub fn new(directory: &Path, config: &IndexConfig, options: ForestOptions) -> Result<Self> {
-        validate(config, directory, options)?;
-        let space = Space::new(directory, options.sort_scratch_bytes, maximum_row(config))?;
-        let (ids, trees) = Sorter::pair(&space, options.sort_memory_bytes)?;
-        Ok(Self {
-            options,
-            ids,
-            trees,
-            space,
-            types: tree_types(config),
-        })
-    }
-
-    pub fn append(&mut self, config: &IndexConfig, record: &Record) -> Result<()> {
-        self.ids.push(
-            &mut self.space,
-            Row {
-                key: record.id().to_vec(),
-                value: Vec::new(),
-            },
-        )?;
-        self.trees
-            .push(&mut self.space, project(config, &self.types, record)?)
-    }
-}
-
 impl ForestArtifact {
     /// Builds every nonempty tree into one sealed, canonically ordered artifact.
     ///
@@ -157,21 +119,9 @@ impl ForestArtifact {
         check: &dyn Fn() -> Result<()>,
     ) -> Result<(Self, ForestReport)> {
         check()?;
-        validate(input.config(), directory, options)?;
         let config = input.config();
         let types = tree_types(config);
-        let writer = Writer::new(
-            directory,
-            2,
-            binding(
-                input.manifest(),
-                input.config(),
-                seed,
-                options.sample_items,
-                options.refinement_rounds,
-            ),
-            maximum_bytes,
-        )?;
+        let builder = ForestBuilder::new(directory, input, seed, options, maximum_bytes)?;
         let sort_directory = directory.join("sort");
         let mut space = Space::new(
             &sort_directory,
@@ -213,145 +163,28 @@ impl ForestArtifact {
         drop(source);
         let tree_run = trees.finish(&mut space)?;
         space.remove(projected)?;
-        Self::construct(
-            directory,
-            input,
-            seed,
-            options,
-            writer,
-            (space, tree_run),
-            check,
-        )
+        builder.projected(space, tree_run, check)
     }
 
-    /// Consumes receipt-time sorting work without rescanning the source.
-    /// The caller owns scratch directories on failure, just as with `build`.
-    pub fn build_prepared(
-        directory: &Path,
-        prepared: PreparedInput,
-        seed: [u8; 32],
-        maximum_bytes: u64,
-    ) -> Result<(Self, ForestReport)> {
-        Self::build_prepared_controlled(directory, prepared, seed, maximum_bytes, &|| Ok(()))
-    }
-
-    /// Receipt preparation shares the same final refinement and cancellation path.
-    pub(crate) fn build_prepared_controlled(
-        directory: &Path,
-        prepared: PreparedInput,
-        seed: [u8; 32],
-        maximum_bytes: u64,
-        check: &dyn Fn() -> Result<()>,
-    ) -> Result<(Self, ForestReport)> {
-        check()?;
-        let PreparedInput {
-            source,
-            preparation,
-        } = prepared;
-        let options = preparation.options;
-        validate(source.config(), directory, options)?;
-        let writer = Writer::new(
-            directory,
-            2,
-            binding(
-                source.manifest(),
-                source.config(),
-                seed,
-                options.sample_items,
-                options.refinement_rounds,
-            ),
-            maximum_bytes,
-        )?;
-        let mut space = preparation.space;
-        if !preparation.ids.unique_keys(&mut space)? {
-            return Err(Error::new(ErrorKind::RecordAlreadyExists));
-        }
-        let run = preparation.trees.finish(&mut space)?;
-        Self::construct(
-            directory,
-            &source,
-            seed,
-            options,
-            writer,
-            (space, run),
-            check,
-        )
-    }
-
-    /// Consumes Tree Key-sorted projections one tree at a time and seals the resulting forest.
-    /// Each tree is constructed under its own memory and scratch ceilings.
-    fn construct(
+    /// The default tree consumes the same ID-ordered full records as the serving join.
+    pub(crate) fn build_ordered(
         directory: &Path,
         input: &InputSnapshot,
         seed: [u8; 32],
         options: ForestOptions,
-        mut writer: Writer,
-        sorted: (Space, super::sort::Run),
+        maximum_bytes: u64,
+        ordered: &super::OrderedSource,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<(Self, ForestReport)> {
-        let config = input.config();
-        let types = tree_types(config);
-        let (mut space, tree_run) = sorted;
-        let mut source = space.reader(&tree_run)?;
-        let mut next = source.next()?;
-        let mut report = ForestReport::default();
-        let scratch = directory.join("tree");
-        while let Some(first) = &next {
-            check()?;
-            let tree = TreeKey::from_encoded(&types, Bytes::copy_from_slice(&first.key))?;
-            let records = std::iter::from_fn(|| {
-                if next.as_ref().is_none_or(|row| row.key != tree.as_bytes()) {
-                    return None;
-                }
-                let row = next.take().expect("matching row");
-                let result = projection(row.value, config.dimension());
-                match source.next() {
-                    Ok(row) => {
-                        next = row;
-                        Some(result)
-                    }
-                    Err(error) => Some(Err(error)),
-                }
-            });
-            let emit = |partition: PartitionPlan| {
-                let mut frame = Vec::new();
-                frame.extend_from_slice(&(tree.as_bytes().len() as u32).to_be_bytes());
-                frame.extend_from_slice(tree.as_bytes());
-                plan::encode(&partition, &mut frame);
-                writer.append(&frame)
-            };
-            let built =
-                super::refine::build_tree(&scratch, config, seed, options, records, emit, &|| {
-                    check()
-                })?;
-            fs::remove_dir(&scratch).map_err(io_error)?;
-            report.trees = checked_add(report.trees, 1)?;
-            report.records = checked_add(report.records, built.records)?;
-            report.partitions = checked_add(report.partitions, built.partitions)?;
-            report.peak_tree_scratch_bytes =
-                report.peak_tree_scratch_bytes.max(built.peak_scratch_bytes);
-            report.tree_written_bytes =
-                checked_add(report.tree_written_bytes, built.scratch_written_bytes)?;
+        let mut builder = ForestBuilder::new(directory, input, seed, options, maximum_bytes)?;
+        if input.manifest().items() != 0 {
+            builder.tree(
+                &TreeKey::encode(&[], &[])?,
+                ordered.construction_records(input)?,
+                check,
+            )?;
         }
-        drop(source);
-        space.remove(tree_run)?;
-        space.reclaim_directory()?;
-        if report.records != input.manifest().items() {
-            return Err(corrupt());
-        }
-        report.peak_sort_scratch_bytes = space.peak;
-        report.sort_written_bytes = space.written;
-        let (directory, manifest) = writer.seal()?;
-        Ok((
-            Self {
-                directory,
-                manifest,
-                config: config.clone(),
-                source: input.manifest().clone(),
-                seed,
-            },
-            report,
-        ))
+        builder.seal()
     }
 
     /// Reopens using the trusted source identity and semantic parameters, without
@@ -531,7 +364,136 @@ impl Iterator for ForestReader {
 
 impl std::iter::FusedIterator for ForestReader {}
 
-// Both receipt-time and snapshot-time preparation use identical projection bytes.
+/// Writes canonical partition plans and accounts for each completed construction.
+struct ForestBuilder<'a> {
+    input: &'a InputSnapshot,
+    scratch: PathBuf,
+    writer: Writer,
+    seed: [u8; 32],
+    options: ForestOptions,
+    report: ForestReport,
+}
+
+impl<'a> ForestBuilder<'a> {
+    fn new(
+        directory: &Path,
+        input: &'a InputSnapshot,
+        seed: [u8; 32],
+        options: ForestOptions,
+        maximum_bytes: u64,
+    ) -> Result<Self> {
+        validate(input.config(), directory, options)?;
+        let writer = Writer::new(
+            directory,
+            2,
+            binding(
+                input.manifest(),
+                input.config(),
+                seed,
+                options.sample_items,
+                options.refinement_rounds,
+            ),
+            maximum_bytes,
+        )?;
+        Ok(Self {
+            input,
+            scratch: directory.join("tree"),
+            writer,
+            seed,
+            options,
+            report: ForestReport::default(),
+        })
+    }
+
+    fn projected(
+        mut self,
+        mut space: Space,
+        tree_run: super::sort::Run,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<(ForestArtifact, ForestReport)> {
+        let config = self.input.config();
+        let types = tree_types(config);
+        let mut source = space.reader(&tree_run)?;
+        let mut next = source.next()?;
+        while let Some(first) = &next {
+            check()?;
+            let tree = TreeKey::from_encoded(&types, Bytes::copy_from_slice(&first.key))?;
+            let records = std::iter::from_fn(|| {
+                if next.as_ref().is_none_or(|row| row.key != tree.as_bytes()) {
+                    return None;
+                }
+                let row = next.take().expect("matching row");
+                let result = projection(row.value, config.dimension());
+                match source.next() {
+                    Ok(row) => {
+                        next = row;
+                        Some(result)
+                    }
+                    Err(error) => Some(Err(error)),
+                }
+            });
+            self.tree(&tree, records, check)?;
+        }
+        drop(source);
+        space.remove(tree_run)?;
+        space.reclaim_directory()?;
+        self.report.peak_sort_scratch_bytes = space.peak;
+        self.report.sort_written_bytes = space.written;
+        self.seal()
+    }
+
+    fn tree(
+        &mut self,
+        tree: &TreeKey,
+        records: impl Iterator<Item = Result<ConstructionRecord>>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        let emit = |partition: PartitionPlan| {
+            let mut frame = Vec::new();
+            frame.extend_from_slice(&(tree.as_bytes().len() as u32).to_be_bytes());
+            frame.extend_from_slice(tree.as_bytes());
+            plan::encode(&partition, &mut frame);
+            self.writer.append(&frame)
+        };
+        let built = super::refine::build_tree(
+            &self.scratch,
+            self.input.config(),
+            self.seed,
+            self.options,
+            records,
+            emit,
+            &check,
+        )?;
+        fs::remove_dir(&self.scratch).map_err(io_error)?;
+        let report = &mut self.report;
+        report.trees = checked_add(report.trees, 1)?;
+        report.records = checked_add(report.records, built.records)?;
+        report.partitions = checked_add(report.partitions, built.partitions)?;
+        report.peak_tree_scratch_bytes =
+            report.peak_tree_scratch_bytes.max(built.peak_scratch_bytes);
+        report.tree_written_bytes =
+            checked_add(report.tree_written_bytes, built.scratch_written_bytes)?;
+        Ok(())
+    }
+
+    fn seal(self) -> Result<(ForestArtifact, ForestReport)> {
+        if self.report.records != self.input.manifest().items() {
+            return Err(corrupt());
+        }
+        let (directory, manifest) = self.writer.seal()?;
+        Ok((
+            ForestArtifact {
+                directory,
+                manifest,
+                config: self.input.config().clone(),
+                source: self.input.manifest().clone(),
+                seed: self.seed,
+            },
+            self.report,
+        ))
+    }
+}
+
 fn project(config: &IndexConfig, types: &[DataType], record: &Record) -> Result<Row> {
     let values = config
         .tree_key_fields()
