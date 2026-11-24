@@ -2318,6 +2318,58 @@ async fn non_root_finalize_recovers_from_an_unknown_commit_outcome() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exposure_validates_the_source_before_reporting_targets() {
+    let backend = backend();
+    let runtime = make_runtime(backend.clone());
+    let index = runtime
+        .create_index("index", config(1, 4))
+        .await
+        .expect("create");
+    let manifest = read_manifest(&backend, index.logical_index_id()).await;
+    let key = tree_key(1);
+    create_committed_tree(&backend, &manifest, &key).await;
+
+    // Target exposure requires agreement between the source Header and State.
+    let mut txn = write_txn(&backend, &manifest).await;
+    txn.put(
+        LogicalKey::State {
+            index: index.logical_index_id(),
+            tree_key: key.clone(),
+            partition: pk(1),
+        },
+        PersistentValue::PartitionState(PartitionTransition::DrainingSplit {
+            left: pk(2),
+            right: pk(3),
+            started_at_unix_millis: 200,
+        }),
+    )
+    .await
+    .expect("put state beside Ready header");
+    txn.commit().await.expect("commit");
+    let policy = retry();
+    let expose = || split::expose_targets(&backend, &manifest, &key, pk(1), 400, &policy);
+    assert_eq!(
+        expose().await.expect_err("disagreeing header").kind(),
+        ErrorKind::Corruption
+    );
+
+    let mut txn = write_txn(&backend, &manifest).await;
+    txn.delete(LogicalKey::Header {
+        index: index.logical_index_id(),
+        tree_key: key.clone(),
+        partition: pk(1),
+    })
+    .await
+    .expect("delete header");
+    txn.commit().await.expect("commit");
+    assert_eq!(
+        expose().await.expect_err("missing header").kind(),
+        ErrorKind::Corruption
+    );
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exposure_fails_closed_on_a_torn_target_without_committing() {
     let backend = backend();
     let runtime = make_runtime(backend.clone());

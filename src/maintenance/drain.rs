@@ -13,11 +13,12 @@
 use bytes::Bytes;
 
 use crate::api::{Error, ErrorKind, PartitionKey, Result};
-use crate::storage::backend::{AdmissionBudget, ReadOps, ScanLimits};
+use crate::search::numeric::VectorKernel;
+use crate::storage::backend::{AdmissionBudget, ReadOps, ScanLimits, WriteTxn};
 use crate::storage::keys::TreeKey;
-use crate::storage::topology::{self, Movement};
-use crate::storage::values::{IndexManifest, PartitionHeader, PersistentValue};
-use crate::storage::{LogicalRange, ReadLogicalTxn};
+use crate::storage::topology::{self, LeafDrainEntry, Movement};
+use crate::storage::values::{ChildEntry, IndexManifest, PartitionHeader, PersistentValue};
+use crate::storage::{LogicalRange, ReadLogicalTxn, WriteLogicalTxn};
 
 /// The number of Child Entries one drain batch moves.
 ///
@@ -25,11 +26,8 @@ use crate::storage::{LogicalRange, ReadLogicalTxn};
 /// far below every adapter admission budget.
 pub const DRAIN_BATCH_INTERNAL: usize = 128;
 
-/// The bound on one drain candidate scan page.
-const DRAIN_SCAN_LIMITS: ScanLimits = ScanLimits {
-    item_limit: DRAIN_BATCH_INTERNAL,
-    byte_limit: 1_048_576,
-};
+/// Maximum encoded bytes in one drain candidate scan page.
+const DRAIN_SCAN_BYTES: usize = 1_048_576;
 
 /// Applies the threshold and source-size bounds to a budget-safe leaf batch.
 ///
@@ -49,58 +47,45 @@ fn leaf_drain_batch_limit(
 
 /// One drain batch fixed by the read snapshot: leaf Record IDs or internal
 /// child Partition Keys.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum DrainBatch {
-    Leaf(Vec<Bytes>),
+pub(super) enum DrainBatch {
+    Leaf(Vec<(PartitionKey, Bytes)>),
     Child(Vec<PartitionKey>),
 }
 
-impl DrainBatch {
-    /// Whether the batch holds no candidates.
-    pub(crate) fn is_empty(&self) -> bool {
-        match self {
-            Self::Leaf(ids) => ids.is_empty(),
-            Self::Child(children) => children.is_empty(),
-        }
+/// Routes the Leaf Entries still present in the write attempt, in snapshot order.
+pub(super) async fn route_leaves<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    tree_key: &TreeKey,
+    candidates: &[(PartitionKey, Bytes)],
+    kernel: &VectorKernel,
+    mut target: impl FnMut(&[f32]) -> Result<PartitionKey>,
+) -> Result<Vec<(LeafDrainEntry, PartitionKey)>> {
+    let entries = topology::read_leaf_drain_candidates(txn, tree_key, candidates).await?;
+    let mut moves = Vec::new();
+    for entry in entries.into_iter().flatten() {
+        let vector = kernel
+            .preprocess(entry.record().vector())
+            .map_err(|_| Error::new(ErrorKind::Corruption))?;
+        moves.push((entry, target(&vector)?));
     }
+    Ok(moves)
 }
 
-/// Scans the source's current smallest drain candidates from the snapshot.
-pub(crate) async fn read_drain_batch<T: ReadOps>(
-    txn: &mut ReadLogicalTxn<'_, T>,
-    manifest: &IndexManifest,
+/// Routes the Child Entries still present using their persisted centroids.
+pub(super) async fn route_children<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
     tree_key: &TreeKey,
     source: PartitionKey,
-    level: u32,
-    leaf_limit: usize,
-) -> Result<DrainBatch> {
-    if level == 1 {
-        let range = LogicalRange::leaf_entries(manifest, tree_key, source)?;
-        let limits = ScanLimits {
-            item_limit: leaf_limit,
-            ..DRAIN_SCAN_LIMITS
-        };
-        let page = txn.scan(&range, None, limits).await?;
-        let mut ids = Vec::new();
-        for item in page.items() {
-            let PersistentValue::LeafEntry(entry) = item.value() else {
-                return Err(Error::new(ErrorKind::Corruption));
-            };
-            ids.push(entry.record_id().clone());
-        }
-        Ok(DrainBatch::Leaf(ids))
-    } else {
-        let range = LogicalRange::child_entries(manifest, tree_key, source)?;
-        let page = txn.scan(&range, None, DRAIN_SCAN_LIMITS).await?;
-        let mut children = Vec::new();
-        for item in page.items() {
-            let PersistentValue::ChildEntry(entry) = item.value() else {
-                return Err(Error::new(ErrorKind::Corruption));
-            };
-            children.push(entry.child());
-        }
-        Ok(DrainBatch::Child(children))
+    children: &[PartitionKey],
+    mut target: impl FnMut(&[f32]) -> Result<PartitionKey>,
+) -> Result<Vec<(ChildEntry, PartitionKey)>> {
+    let entries = topology::read_child_drain_candidates(txn, tree_key, source, children).await?;
+    let mut moves = Vec::new();
+    for entry in entries.into_iter().flatten() {
+        let target = target(entry.centroid())?;
+        moves.push((entry, target));
     }
+    Ok(moves)
 }
 
 /// Fixes one drain batch from the read snapshot: the source's current
@@ -108,7 +93,7 @@ pub(crate) async fn read_drain_batch<T: ReadOps>(
 ///
 /// The caller supplies the Header from a validated authority pair. An exact
 /// count that disagrees with the scanned entry set is Corruption.
-pub(crate) async fn next_drain_batch<T: ReadOps>(
+pub(super) async fn next_drain_batch<T: ReadOps>(
     txn: &mut ReadLogicalTxn<'_, T>,
     manifest: &IndexManifest,
     tree_key: &TreeKey,
@@ -120,23 +105,53 @@ pub(crate) async fn next_drain_batch<T: ReadOps>(
     if header.entry_count() == 0 {
         return Ok(None);
     }
-    let leaf_limit = if header.level() == 1 {
+    let leaf = header.level() == 1;
+    let (range, item_limit) = if leaf {
         let budget_limit =
             topology::leaf_relocation_batch_limit(manifest, tree_key, movement, budget)?;
-        leaf_drain_batch_limit(
+        let limit = leaf_drain_batch_limit(
             manifest.config().max_leaf_partition_entries(),
             header.entry_count(),
             budget_limit,
+        );
+        (
+            LogicalRange::leaf_entries(manifest, tree_key, source)?,
+            limit,
         )
     } else {
-        DRAIN_BATCH_INTERNAL
+        (
+            LogicalRange::child_entries(manifest, tree_key, source)?,
+            DRAIN_BATCH_INTERNAL,
+        )
     };
-    let batch =
-        read_drain_batch(txn, manifest, tree_key, source, header.level(), leaf_limit).await?;
-    if batch.is_empty() {
+    let limits = ScanLimits {
+        item_limit,
+        byte_limit: DRAIN_SCAN_BYTES,
+    };
+    let page = txn.scan(&range, None, limits).await?;
+    if page.items().is_empty() {
         // The exact count and the entry set disagree within one snapshot.
         return Err(Error::new(ErrorKind::Corruption));
     }
+    let batch = if leaf {
+        let mut entries = Vec::with_capacity(page.items().len());
+        for item in page.items() {
+            let PersistentValue::LeafEntry(entry) = item.value() else {
+                return Err(Error::new(ErrorKind::Corruption));
+            };
+            entries.push((source, entry.record_id().clone()));
+        }
+        DrainBatch::Leaf(entries)
+    } else {
+        let mut children = Vec::with_capacity(page.items().len());
+        for item in page.items() {
+            let PersistentValue::ChildEntry(entry) = item.value() else {
+                return Err(Error::new(ErrorKind::Corruption));
+            };
+            children.push(entry.child());
+        }
+        DrainBatch::Child(children)
+    };
     Ok(Some(batch))
 }
 

@@ -63,26 +63,6 @@ pub(super) async fn read_state<R: LogicalReader>(
     )
 }
 
-/// Reads one partition's authority pair in one batched plain read, without
-/// classifying presence or agreement.
-///
-/// One batched call covers what would otherwise be two sequential point
-/// reads; the caller classifies the pair because the meaning of a half-present
-/// pair depends on the state machine step.
-pub(crate) async fn read_authority_opt<R: LogicalReader>(
-    reader: &mut R,
-    index: LogicalIndexId,
-    tree_key: &TreeKey,
-    partition: PartitionKey,
-) -> Result<(Option<PartitionHeader>, Option<PartitionTransition>)> {
-    let (header_key, state_key) = authority_keys(index, tree_key, partition);
-    let mut values = reader
-        .batch_get(vec![header_key, state_key])
-        .await?
-        .into_iter();
-    decode_authority_pair(&mut values)
-}
-
 /// Reads one partition's authority pair in one batched plain read,
 /// classifying presence and agreement.
 ///
@@ -95,7 +75,12 @@ pub(crate) async fn read_authority_pair<R: LogicalReader>(
     tree_key: &TreeKey,
     partition: PartitionKey,
 ) -> Result<Option<(PartitionHeader, PartitionTransition)>> {
-    classify_authority(read_authority_opt(reader, index, tree_key, partition).await?)
+    let (header_key, state_key) = authority_keys(index, tree_key, partition);
+    let mut values = reader
+        .batch_get(vec![header_key, state_key])
+        .await?
+        .into_iter();
+    decode_authority_pair(&mut values)
 }
 
 /// Reads one visited partition's Header and State in one batch, failing
@@ -141,12 +126,7 @@ pub(crate) async fn read_authority_batch<R: LogicalReader>(
     let mut values = reader.batch_get(keys).await?.into_iter();
     let mut authorities = Vec::with_capacity(partitions.len());
     for _ in partitions {
-        let (header, state) = decode_authority_pair(&mut values)?;
-        let (Some(header), Some(state)) = (header, state) else {
-            return Err(corrupt());
-        };
-        expect_agreement(header, state)?;
-        authorities.push((header, state));
+        authorities.push(decode_authority_pair(&mut values)?.ok_or_else(corrupt)?);
     }
     if values.next().is_some() {
         return Err(Error::new(ErrorKind::Backend));
@@ -154,25 +134,15 @@ pub(crate) async fn read_authority_batch<R: LogicalReader>(
     Ok(authorities)
 }
 
-/// Decodes one Header/State pair while preserving missing values for callers
-/// whose state-machine rules distinguish an absent partition from corruption.
+/// Decodes matching Header and State values. Only a wholly absent pair is missing.
 fn decode_authority_pair(
     values: &mut impl Iterator<Item = Option<PersistentValue>>,
-) -> Result<(Option<PartitionHeader>, Option<PartitionTransition>)> {
+) -> Result<Option<(PartitionHeader, PartitionTransition)>> {
     let (Some(header), Some(state)) = (values.next(), values.next()) else {
         // The typed batch read returns exactly one value per input key.
         return Err(Error::new(ErrorKind::Backend));
     };
-    Ok((expect_header(header)?, expect_state(state)?))
-}
-
-/// Classifies one decoded authority pair: both present and in agreement is
-/// `Some`, both gone is `None`, and a half-present or disagreeing pair is
-/// Corruption.
-fn classify_authority(
-    pair: (Option<PartitionHeader>, Option<PartitionTransition>),
-) -> Result<Option<(PartitionHeader, PartitionTransition)>> {
-    match pair {
+    match (expect_header(header)?, expect_state(state)?) {
         (Some(header), Some(state)) => {
             expect_agreement(header, state)?;
             Ok(Some((header, state)))
@@ -186,14 +156,12 @@ fn classify_authority(
 /// batch.
 pub(crate) async fn authority_for_update<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
-    header_key: LogicalKey,
-    state_key: LogicalKey,
-) -> Result<(Option<PartitionHeader>, Option<PartitionTransition>)> {
-    let mut values = txn
-        .batch_get_for_update(vec![header_key, state_key])
-        .await?
-        .into_iter();
-    decode_authority_pair(&mut values)
+    index: LogicalIndexId,
+    tree_key: &TreeKey,
+    partition: PartitionKey,
+) -> Result<Option<(PartitionHeader, PartitionTransition)>> {
+    let (header, state) = authority_keys(index, tree_key, partition);
+    authority_pair(txn, header, state).await
 }
 
 /// Reads one partition's authority pair with update protection, classifying
@@ -207,7 +175,10 @@ pub(super) async fn authority_pair<T: WriteTxn>(
     header_key: LogicalKey,
     state_key: LogicalKey,
 ) -> Result<Option<(PartitionHeader, PartitionTransition)>> {
-    classify_authority(authority_for_update(txn, header_key, state_key).await?)
+    let values = txn
+        .batch_get_for_update(vec![header_key, state_key])
+        .await?;
+    decode_authority_pair(&mut values.into_iter())
 }
 
 /// Builds the Header and State keys of one partition.

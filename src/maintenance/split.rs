@@ -47,13 +47,12 @@ use crate::observe::labels::{FixupKind, Operation};
 use crate::observe::metrics;
 use crate::runtime::RetryPolicy;
 use crate::runtime::{reads, writes};
-use crate::storage::backend::{Backend, ReadOps, WriteTxn};
+use crate::storage::backend::{Backend, WriteTxn};
 use crate::storage::keys::{LogicalKey, TreeKey};
 use crate::storage::values::{
-    IndexManifest, PartitionCentroid, PartitionState, PartitionTransition, expect_centroid,
-    expect_header,
+    IndexManifest, PartitionCentroid, PartitionTransition, expect_centroid, expect_header,
 };
-use crate::storage::{ReadLogicalTxn, WriteLogicalTxn, topology};
+use crate::storage::{WriteLogicalTxn, topology};
 
 pub use super::drain::DRAIN_BATCH_INTERNAL;
 use super::drain::{self, DrainBatch};
@@ -201,7 +200,10 @@ pub async fn expose_targets<B: Backend>(
     // One consistent snapshot classifies the source and trains both target
     // centroids without holding KV locks.
     let mut read = reads::open_validated_read(backend, manifest).await?;
-    let Some(state) = read_source_state(&mut read, tree_key, source).await? else {
+    let Some((_, state)) =
+        topology::read_authority_pair(&mut read, manifest.logical_index_id(), tree_key, source)
+            .await?
+    else {
         return Ok(TargetExposure::SourceAdvanced);
     };
     let (left, right) = match state {
@@ -364,27 +366,10 @@ async fn drain_attempt<T: WriteTxn>(
     // Revalidate the durable state before moving anything; one batched
     // update-protected read covers both source authority values.
     let index = manifest.logical_index_id();
-    let (source_header, state) = topology::authority_for_update(
-        txn,
-        LogicalKey::Header {
-            index,
-            tree_key: tree_key.clone(),
-            partition: source,
-        },
-        LogicalKey::State {
-            index,
-            tree_key: tree_key.clone(),
-            partition: source,
-        },
-    )
-    .await?;
-    let (source_header, state) = match (source_header, state) {
-        // A completed split removed both authority values.
-        (None, None) => return Ok(DrainStep::SourceAdvanced),
-        (Some(header), Some(state)) => (header, state),
-        // Completion removes or converts the pair atomically, so a
-        // half-present pair is a torn committed state.
-        _ => return Err(Error::new(ErrorKind::Corruption)),
+    let Some((source_header, state)) =
+        topology::authority_for_update(txn, index, tree_key, source).await?
+    else {
+        return Ok(DrainStep::SourceAdvanced);
     };
     match state {
         // The DrainingSplit target pair is fixed at the transition, so a
@@ -396,9 +381,6 @@ async fn drain_attempt<T: WriteTxn>(
             return Err(Error::new(ErrorKind::Corruption));
         }
         _ => return Ok(DrainStep::SourceAdvanced),
-    }
-    if source_header.state() != PartitionState::DrainingSplit {
-        return Err(Error::new(ErrorKind::Corruption));
     }
 
     // Protect the exact target counts that shape this batch; relocation reuses
@@ -461,47 +443,25 @@ async fn drain_attempt<T: WriteTxn>(
             .config()
             .min_partition_entries(source_header.level()),
     );
+    let target = |vector: &[f32]| {
+        nearer_target(
+            &plan.kernel,
+            vector,
+            plan.left,
+            &left_centroid,
+            plan.right,
+            &right_centroid,
+            &mut balance,
+        )
+    };
     let moved = match &plan.batch {
-        DrainBatch::Leaf(record_ids) => {
-            let candidates: Vec<_> = record_ids.iter().cloned().map(|id| (source, id)).collect();
-            let candidates =
-                topology::read_leaf_drain_candidates(txn, tree_key, &candidates).await?;
-            let mut moves = Vec::new();
-            for candidate in candidates.into_iter().flatten() {
-                // A `None` slot is a concurrently removed entry: skipped.
-                let routing = plan
-                    .kernel
-                    .preprocess(candidate.record().vector())
-                    .map_err(|_| Error::new(ErrorKind::Corruption))?;
-                let target = nearer_target(
-                    &plan.kernel,
-                    &routing,
-                    plan.left,
-                    &left_centroid,
-                    plan.right,
-                    &right_centroid,
-                    &mut balance,
-                )?;
-                moves.push((candidate, target));
-            }
+        DrainBatch::Leaf(candidates) => {
+            let moves =
+                drain::route_leaves(txn, tree_key, candidates, &plan.kernel, target).await?;
             topology::relocate_leaf_entries(txn, tree_key, moves, topology::Movement::Split).await?
         }
         DrainBatch::Child(children) => {
-            let candidates =
-                topology::read_child_drain_candidates(txn, tree_key, source, children).await?;
-            let mut moves = Vec::new();
-            for entry in candidates.into_iter().flatten() {
-                let target = nearer_target(
-                    &plan.kernel,
-                    entry.centroid(),
-                    plan.left,
-                    &left_centroid,
-                    plan.right,
-                    &right_centroid,
-                    &mut balance,
-                )?;
-                moves.push((entry, target));
-            }
+            let moves = drain::route_children(txn, tree_key, source, children, target).await?;
             topology::relocate_child_entries(
                 txn,
                 tree_key,
@@ -776,27 +736,6 @@ impl SplitBalance {
             self.right_needed = self.right_needed.saturating_sub(1);
         }
         Ok(target)
-    }
-}
-
-/// Reads one split source's State from a snapshot, returning `None` when a
-/// completed non-root split removed both authority values.
-///
-/// Re-driving any step of a finished split observes the absence and is
-/// harmless (maintenance.md §3); a lone surviving Header is a torn committed
-/// state. One batched read covers both authority values.
-async fn read_source_state<T: ReadOps>(
-    txn: &mut ReadLogicalTxn<'_, T>,
-    tree_key: &TreeKey,
-    source: PartitionKey,
-) -> Result<Option<PartitionTransition>> {
-    let manifest = txn.require_manifest()?;
-    let (header, state) =
-        topology::read_authority_opt(txn, manifest.logical_index_id(), tree_key, source).await?;
-    match (header, state) {
-        (_, Some(state)) => Ok(Some(state)),
-        (Some(_), None) => Err(Error::new(ErrorKind::Corruption)),
-        (None, None) => Ok(None),
     }
 }
 
