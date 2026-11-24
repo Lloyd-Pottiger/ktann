@@ -3,7 +3,7 @@ use ktann::api::{
     BulkBuildJob, BulkBuildOptions, BulkBuildReport, BulkWorkerOptions, Error, ErrorKind, Index,
     IndexConfig, OperationOptions, Record, Result,
 };
-use ktann::bulk::{ForestOptions, PreparedInput, PreparedInputWriter};
+use ktann::bulk::{InputSnapshot, InputSnapshotWriter};
 use ktann::construction::ConstructionOptions;
 use ktann::runtime::Runtime;
 use ktann::storage::backend::Backend;
@@ -18,9 +18,8 @@ const DISK_LIMIT: u64 = 64 * 1024 * 1024 * 1024;
 pub(super) struct Build<B: Backend> {
     options: BulkBuildOptions,
     worker: BulkWorkerOptions,
-    writer: Option<PreparedInputWriter>,
-    // Keep preparation until reservation succeeds; completion may consume it.
-    prepared: Option<PreparedInput>,
+    writer: Option<InputSnapshotWriter>,
+    source: Option<InputSnapshot>,
     job: Option<BulkBuildJob<B>>,
     /// Effective controls and completed phase observations; available even on failure.
     pub(super) report: Value,
@@ -57,21 +56,8 @@ impl<B: Backend> Build<B> {
         // Reset owns this budget for every routing mode.
         worker.refinement_memory_bytes = refinement_memory_bytes;
         let refinement_rounds = Some(rounds);
-        let writer = PreparedInputWriter::new(
-            &root.join("source"),
-            &root.join("preparation"),
-            config,
-            worker.max_artifact_bytes,
-            ForestOptions {
-                refinement_rounds,
-                refinement_memory_bytes,
-                sample_items: construction.sample_items,
-                tree_memory_bytes: construction.memory_bytes,
-                tree_scratch_bytes: construction.scratch_bytes,
-                sort_memory_bytes: worker.sort_memory_bytes,
-                sort_scratch_bytes: worker.sort_scratch_bytes,
-            },
-        )?;
+        let writer =
+            InputSnapshotWriter::new(&root.join("source"), config, worker.max_artifact_bytes)?;
         let mut report = Value::Object(crate::report::bulk_build_settings(&construction, &worker));
         report["refinement_rounds"] = json!(rounds);
         Ok(Self {
@@ -81,7 +67,7 @@ impl<B: Backend> Build<B> {
             },
             worker,
             writer: Some(writer),
-            prepared: None,
+            source: None,
             job: None,
             report,
         })
@@ -101,7 +87,7 @@ impl<B: Backend> Build<B> {
         Ok(())
     }
 
-    /// Core owns durable progress: retain preparation on reservation errors and the job on completion errors.
+    /// Retains the sealed source across reservation errors and the job across completion errors.
     pub(super) async fn complete(
         &mut self,
         runtime: &Runtime<B>,
@@ -109,22 +95,22 @@ impl<B: Backend> Build<B> {
     ) -> Result<Index<B>> {
         if let Some(writer) = self.writer.take() {
             let start = Instant::now();
-            let prepared = tokio::task::spawn_blocking(move || writer.seal())
+            let source = tokio::task::spawn_blocking(move || writer.seal())
                 .await
                 .map_err(|e| Error::with_source(ErrorKind::Other, e))??;
             self.report["snapshot_seconds"] = json!(start.elapsed().as_secs_f64());
-            self.report["source_sha256"] = json!(prepared.source().manifest().sha256());
-            self.report["source_bytes"] = json!(prepared.source().manifest().bytes());
-            self.prepared = Some(prepared);
+            self.report["source_sha256"] = json!(source.manifest().sha256());
+            self.report["source_bytes"] = json!(source.manifest().bytes());
+            self.source = Some(source);
         }
         if self.job.is_none() {
-            let prepared = self
-                .prepared
+            let source = self
+                .source
                 .as_ref()
                 .ok_or_else(|| Error::new(ErrorKind::InvalidArgument))?;
             self.job = Some(
                 runtime
-                    .start_bulk_build("vdbbench", prepared.source(), self.options)
+                    .start_bulk_build("vdbbench", source, self.options)
                     .await?,
             );
         }
@@ -133,7 +119,7 @@ impl<B: Backend> Build<B> {
             .job
             .as_ref()
             .expect("reserved build")
-            .complete_with_report(self.worker.clone(), self.prepared.take(), control)
+            .complete_with_report(self.worker.clone(), control)
             .await?;
         self.report
             .as_object_mut()

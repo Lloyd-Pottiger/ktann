@@ -758,68 +758,102 @@ async fn complete_retries_when_validation_wins_before_worker_takeover() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn prepared_receipt_and_lost_preparation_both_publish_complete_indexes() {
-    use ktann::bulk::PreparedInputWriter;
-    for recover_without_preparation in [false, true] {
-        let dir = tempfile::tempdir().unwrap();
-        let memory = MemoryBackend::new();
-        let runtime = runtime(memory);
-        let mut opts = worker_options(&dir);
-        opts.sort_memory_bytes *= 2;
-        let mut forest = options();
-        forest.sort_memory_bytes = opts.sort_memory_bytes;
-        forest.sort_scratch_bytes = opts.sort_scratch_bytes;
-        let prepared = PreparedInputWriter::new(
-            &dir.path().join("source"),
-            &dir.path().join("receipt"),
-            config(Metric::L2, true),
-            4_000_000,
-            forest,
-        )
-        .unwrap()
-        .append((0..73).map(|id| Ok(record(id))))
-        .unwrap()
-        .seal()
+async fn default_tree_reuses_the_source_sort_with_payloads_and_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = runtime(MemoryBackend::new());
+    let input = InputSnapshot::create(
+        &dir.path().join("source"),
+        config(Metric::Cosine, false),
+        4_000_000,
+        (0..73).rev().map(|id| Ok(record(id))),
+    )
+    .unwrap();
+    let job = runtime
+        .start_bulk_build("bulk", &input, construction_options())
+        .await
         .unwrap();
-        let source = prepared.source().clone();
-        let job = runtime
-            .start_bulk_build("bulk", &source, construction_options())
+    let opts = worker_options(&dir);
+    let (index, report) = job
+        .complete_with_report(opts.clone(), Default::default())
+        .await
+        .unwrap();
+    assert!(!report.forest.is_zero() && !report.serving.is_zero());
+    assert!(!report.load.is_zero() && !report.publish.is_zero());
+    assert_eq!(report.rotation_seed, *job.index_manifest().rotation_seed());
+    let (_, reused) = job
+        .complete_with_report(opts, Default::default())
+        .await
+        .unwrap();
+    assert!(reused.forest.is_zero() && reused.serving.is_zero() && reused.load.is_zero());
+    let forest = report.forest_report.unwrap();
+    assert_eq!(
+        (forest.trees, forest.records, forest.sort_written_bytes),
+        (1, 73, 0)
+    );
+    assert_eq!(report.serving_report.unwrap().records, 73);
+    let verified = index.verify(VerifyOptions::default()).await.unwrap();
+    assert!(verified.complete && verified.issues.is_empty());
+    assert_eq!(verified.objects.vector_records, 73);
+    for id in 0..3 {
+        let expected = record(id);
+        let stored = index
+            .get(expected.id().clone(), GetOptions::default().with_payload())
             .await
+            .unwrap()
             .unwrap();
-        let (index, report) = if !recover_without_preparation {
-            job.complete_with_report(opts.clone(), Some(prepared), Default::default())
-                .await
-                .unwrap()
-        } else {
-            let mut mismatched = opts.clone();
-            mismatched.sort_memory_bytes *= 2;
-            assert_eq!(
-                job.complete_with_report(mismatched, Some(prepared), Default::default())
-                    .await
-                    .unwrap_err()
-                    .kind(),
-                ErrorKind::InvalidArgument
-            );
-            fs::remove_dir_all(dir.path().join("receipt")).unwrap();
-            job.complete_with_report(opts.clone(), None, Default::default())
-                .await
-                .unwrap()
-        };
-        assert!(!report.forest.is_zero());
-        assert!(!report.serving.is_zero());
-        assert!(!report.load.is_zero());
-        assert!(!report.publish.is_zero());
-        assert_eq!(report.rotation_seed, *job.index_manifest().rotation_seed());
-        if !recover_without_preparation {
-            let (_, reused) = job
-                .complete_with_report(opts, None, Default::default())
-                .await
-                .unwrap();
-            assert!(reused.forest.is_zero() && reused.serving.is_zero() && reused.load.is_zero());
-        }
-        let verified = index.verify(VerifyOptions::default()).await.unwrap();
-        assert!(verified.complete && verified.issues.is_empty());
-        assert_eq!(verified.objects.vector_records, 73);
-        runtime.shutdown().await.unwrap();
+        assert_eq!(stored.vector(), expected.vector());
+        assert_eq!(stored.fields(), expected.fields());
+        assert_eq!(
+            stored.payload(),
+            &expected
+                .payload()
+                .cloned()
+                .map_or(PayloadProjection::Absent, PayloadProjection::Present)
+        );
     }
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepted_default_forest_resumes_without_its_source_sort() {
+    let dir = tempfile::tempdir().unwrap();
+    let memory = MemoryBackend::with_test_config(TestConfig::default());
+    let gate = Arc::new(Gate::default());
+    let first = Runtime::new(
+        Gated {
+            memory: memory.clone(),
+            gate: gate.clone(),
+        },
+        RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
+    )
+    .unwrap();
+    let (job, _) = reservation_config(&first, &dir, 19, config(Metric::L2, false)).await;
+    let opts = worker_options(&dir);
+    let worker_opts = opts.clone();
+    // Cancel at the Forest acceptance commit. Once it finishes, Serving has no checkpoint.
+    gate.arm(2);
+    let cancellation = CancellationToken::new();
+    let control = OperationOptions::default().with_cancellation(cancellation.clone());
+    let pending =
+        tokio::spawn(async move { job.run_worker_with_control(worker_opts, control).await });
+    gate.wait().await;
+    cancellation.cancel();
+    gate.release.notify_one();
+    assert_eq!(
+        pending.await.unwrap().unwrap_err().kind(),
+        ErrorKind::Cancelled
+    );
+    first.shutdown().await.unwrap();
+
+    let second = runtime(memory);
+    let job = second.open_bulk_build("bulk").await.unwrap();
+    let (index, report) = job
+        .complete_with_report(opts, Default::default())
+        .await
+        .unwrap();
+    assert!(report.forest_report.is_none());
+    assert_eq!(report.serving_report.unwrap().records, 19);
+    let verified = index.verify(VerifyOptions::default()).await.unwrap();
+    assert!(verified.complete && verified.issues.is_empty());
+    second.shutdown().await.unwrap();
 }

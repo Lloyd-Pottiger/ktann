@@ -14,7 +14,6 @@ mod sort;
 
 pub use files::{ARTIFACT_MANIFEST_BYTES, ArtifactManifest};
 pub use forest::{ForestArtifact, ForestOptions, ForestPartition, ForestReader, ForestReport};
-pub use input::{
-    InputReader, InputSnapshot, InputSnapshotWriter, PreparedInput, PreparedInputWriter,
-};
+pub use input::{InputReader, InputSnapshot, InputSnapshotWriter};
+pub(crate) use serving::OrderedSource;
 pub use serving::{ServingArtifact, ServingEntry, ServingOptions, ServingReader, ServingReport};

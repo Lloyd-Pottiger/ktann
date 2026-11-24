@@ -101,7 +101,7 @@ pub struct BulkCleanupPage {
 pub struct BulkBuildReport {
     /// Forest sorting/training and immutable plan emission.
     pub forest: std::time::Duration,
-    /// Preparation IO counts, including receipt-time sorting when supplied.
+    /// Forest preparation IO counts.
     /// Absent when an accepted forest is reused.
     pub forest_report: Option<crate::bulk::ForestReport>,
     /// Exact joins and serving encoding.
@@ -396,7 +396,7 @@ impl<B: Backend> BulkBuildJob<B> {
         options: BulkWorkerOptions,
         control: OperationOptions,
     ) -> Result<super::Index<B>> {
-        self.complete_with_report(options, None, control)
+        self.complete_with_report(options, control)
             .await
             .map(|(index, _)| index)
     }
@@ -405,12 +405,10 @@ impl<B: Backend> BulkBuildJob<B> {
     ///
     /// Retry this operation on the same job to resume durable progress. A published
     /// job returns its original index. Queued jobs are owned by the scheduler and
-    /// reject direct execution. Optional receipt-time preparation avoids sorting
-    /// the source again; recovery needs only the sealed source.
+    /// reject direct execution. Recovery uses the sealed source and accepted artifacts.
     pub async fn complete_with_report(
         &self,
         options: BulkWorkerOptions,
-        prepared: Option<crate::bulk::PreparedInput>,
         control: OperationOptions,
     ) -> Result<(super::Index<B>, BulkBuildReport)> {
         let manifest = self.manifest.clone();
@@ -429,7 +427,6 @@ impl<B: Backend> BulkBuildJob<B> {
                         manifest,
                         descriptor,
                         options,
-                        prepared,
                         retry,
                     )
                     .await
@@ -468,7 +465,6 @@ impl<B: Backend> BulkBuildJob<B> {
                         manifest,
                         descriptor,
                         options,
-                        None,
                         retry,
                     )
                     .await

@@ -58,15 +58,13 @@ selected independently of the construction path.
 
 ### 1.1 Completion reports
 
-Receipt-time preparation can be passed with `complete_with_report`.
-It is a volatile optimization: its source identity, configuration, and options
-are checked before use; recovery recomputes it from the sealed Input Snapshot.
-
-`complete_with_report(options, prepared_input, control)` completes the same
+`complete_with_report(options, control)` completes the same
 protocol while returning the Active Index and a `BulkBuildReport` containing
 stage timing and the persisted rotation seed. Reused preparation and loading
 stages report zero work. These measurements are
-per-invocation observations, not throughput or latency guarantees.
+per-invocation observations, not throughput or latency guarantees. When the
+default tree shares a source sort with Serving, its duration and scratch writes
+are attributed to Serving even though sorting precedes tree construction.
 
 ### 1.2 Explicit phase control
 

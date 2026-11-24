@@ -208,7 +208,7 @@ async fn drive<B: Backend>(
         _ => return Err(bulk_worker::corrupt()),
     };
     drop(txn);
-    bulk_worker::complete(context, manifest, descriptor, schedule.options, None, retry)
+    bulk_worker::complete(context, manifest, descriptor, schedule.options, retry)
         .await
         .map(|_| ())
 }
