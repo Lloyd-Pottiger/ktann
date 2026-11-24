@@ -10,7 +10,7 @@ use crate::api::{DataType, Error, ErrorKind, LogicalIndexId, MAX_FIELDS, Result,
 
 use super::backend::{
     AdmissionBudget, CommitStart, HardLimits, InsertOutcome, Mutation, ReadOps, ScanLimits,
-    ScanPage, WriteTxn,
+    ScanPage, TransactionSize, WriteTxn,
 };
 use super::keys::{self, KeyRange, LogicalKey, TreeKey};
 use super::values::{
@@ -785,45 +785,6 @@ impl<T: ReadOps> ReadLogicalTxn<'_, T> {
     }
 }
 
-/// Exact mutation work charged to one backend transaction.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct TransactionSize {
-    mutations: usize,
-    bytes: usize,
-}
-
-impl TransactionSize {
-    /// Returns the number of mutations, counting a range clear as one.
-    #[must_use]
-    pub const fn mutations(self) -> usize {
-        self.mutations
-    }
-
-    /// Returns the charged bytes, including both endpoints of a range clear.
-    #[must_use]
-    pub const fn bytes(self) -> usize {
-        self.bytes
-    }
-
-    /// Computes the size after adding mutations, rejecting overflow or a budget
-    /// excess before the caller stages the writes. Adapters supply physical
-    /// bytes, including any namespace prefix already encoded in their keys.
-    pub fn with_charge(
-        self,
-        mutations: usize,
-        bytes: usize,
-        budget: AdmissionBudget,
-    ) -> Result<Self> {
-        let limit = || Error::new(ErrorKind::LimitExceeded);
-        let next = Self {
-            mutations: self.mutations.checked_add(mutations).ok_or_else(limit)?,
-            bytes: self.bytes.checked_add(bytes).ok_or_else(limit)?,
-        };
-        check_budget(budget, next)?;
-        Ok(next)
-    }
-}
-
 /// A deterministic, bounded set of typed point mutations.
 pub struct MutationBuilder<'manifest> {
     binding: LogicalBinding<'manifest>,
@@ -929,7 +890,7 @@ impl<'manifest> MutationBuilder<'manifest> {
                     mutations: self.size.mutations,
                     bytes,
                 };
-                check_budget(self.budget, next)?;
+                next.check_budget(self.budget)?;
                 entry.insert(value);
                 next
             }
@@ -977,14 +938,6 @@ fn check_hard_limits(limits: HardLimits, key: &Bytes, value: Option<&Bytes>) -> 
     if key.len() > limits.max_key_bytes
         || value.is_some_and(|value| value.len() > limits.max_value_bytes)
     {
-        Err(Error::new(ErrorKind::LimitExceeded))
-    } else {
-        Ok(())
-    }
-}
-
-fn check_budget(budget: AdmissionBudget, size: TransactionSize) -> Result<()> {
-    if size.mutations > budget.max_mutations || size.bytes > budget.max_mutation_bytes {
         Err(Error::new(ErrorKind::LimitExceeded))
     } else {
         Ok(())

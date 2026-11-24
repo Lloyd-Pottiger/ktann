@@ -118,6 +118,53 @@ pub struct AdmissionBudget {
     pub mutation_key_overhead_bytes: usize,
 }
 
+/// Exact mutation work charged to one backend transaction.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TransactionSize {
+    pub(super) mutations: usize,
+    pub(super) bytes: usize,
+}
+
+impl TransactionSize {
+    /// Returns the number of mutations, counting a range clear as one.
+    #[must_use]
+    pub const fn mutations(self) -> usize {
+        self.mutations
+    }
+
+    /// Returns the charged bytes, including both endpoints of a range clear.
+    #[must_use]
+    pub const fn bytes(self) -> usize {
+        self.bytes
+    }
+
+    /// Computes the size after adding mutations, rejecting overflow or a budget
+    /// excess before the caller stages the writes. Adapters supply physical
+    /// bytes, including any namespace prefix already encoded in their keys.
+    pub fn with_charge(
+        self,
+        mutations: usize,
+        bytes: usize,
+        budget: AdmissionBudget,
+    ) -> Result<Self> {
+        let limit = || Error::new(ErrorKind::LimitExceeded);
+        let next = Self {
+            mutations: self.mutations.checked_add(mutations).ok_or_else(limit)?,
+            bytes: self.bytes.checked_add(bytes).ok_or_else(limit)?,
+        };
+        next.check_budget(budget)?;
+        Ok(next)
+    }
+
+    pub(super) fn check_budget(self, budget: AdmissionBudget) -> Result<()> {
+        if self.mutations > budget.max_mutations || self.bytes > budget.max_mutation_bytes {
+            Err(Error::new(ErrorKind::LimitExceeded))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// Backend capabilities that adapters declare explicitly.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Capabilities {
@@ -414,6 +461,72 @@ impl fmt::Debug for Mutation {
     }
 }
 
+/// A point write with a validated value and an adapter-encoded physical key.
+pub struct PreparedMutation {
+    key: Bytes,
+    value: Option<Bytes>,
+}
+
+impl PreparedMutation {
+    /// Checks the value ceiling before encoding the logical key. The adapter's
+    /// encoder enforces its namespace and physical key-length limit.
+    pub fn new(
+        mutation: Mutation,
+        max_value_bytes: usize,
+        encode_key: impl FnOnce(&[u8]) -> Result<Bytes>,
+    ) -> Result<Self> {
+        let (key, value) = match mutation {
+            Mutation::Put { key, value } => {
+                if value.len() > max_value_bytes {
+                    return Err(Error::new(ErrorKind::LimitExceeded));
+                }
+                (key, Some(value))
+            }
+            Mutation::Delete { key } => (key, None),
+        };
+        Ok(Self {
+            key: encode_key(&key)?,
+            value,
+        })
+    }
+
+    /// Checks the batch count before allocating and accounts for physical bytes
+    /// as keys are encoded. Returns the new transaction size only on success.
+    pub fn batch(
+        mutations: Vec<Mutation>,
+        used: TransactionSize,
+        budget: AdmissionBudget,
+        mut prepare: impl FnMut(Mutation) -> Result<Self>,
+    ) -> Result<(Vec<Self>, TransactionSize)> {
+        let mut size = used.with_charge(mutations.len(), 0, budget)?;
+        let mut prepared = Vec::with_capacity(mutations.len());
+        for mutation in mutations {
+            let mutation = prepare(mutation)?;
+            size = size.with_charge(0, mutation.charged_bytes()?, budget)?;
+            prepared.push(mutation);
+        }
+        Ok((prepared, size))
+    }
+
+    /// Physical key passed to the native transaction.
+    pub fn key(&self) -> &[u8] {
+        &self.key
+    }
+
+    /// Value to write, or `None` for a deletion.
+    pub fn value(&self) -> Option<&[u8]> {
+        self.value.as_deref()
+    }
+
+    /// Physical key and value bytes charged to the transaction.
+    pub fn charged_bytes(&self) -> Result<usize> {
+        self.key
+            .len()
+            .checked_add(self.value.as_ref().map_or(0, Bytes::len))
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))
+    }
+}
+
 /// The result of a unique [`WriteTxn::insert`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -611,6 +724,30 @@ pub trait Backend: Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_stops_encoding_when_physical_bytes_exceed_the_remaining_budget() {
+        let budget = AdmissionBudget {
+            max_mutations: 4,
+            max_mutation_bytes: 5,
+            mutation_key_overhead_bytes: 1,
+        };
+        let used = TransactionSize::default()
+            .with_charge(1, 2, budget)
+            .unwrap();
+        let delete = Mutation::Delete {
+            key: Bytes::from_static(b"k"),
+        };
+        let mut encoded = 0;
+        let result = PreparedMutation::batch(vec![delete; 3], used, budget, |mutation| {
+            PreparedMutation::new(mutation, 0, |_| {
+                encoded += 1;
+                Ok(Bytes::from_static(b"pk"))
+            })
+        });
+        assert_eq!(result.err().unwrap().kind(), ErrorKind::LimitExceeded);
+        assert_eq!(encoded, 2);
+    }
 
     #[test]
     fn scan_successor_appends_zero_below_the_ceiling() {
