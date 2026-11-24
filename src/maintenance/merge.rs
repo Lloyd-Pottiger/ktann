@@ -423,27 +423,10 @@ async fn drain_attempt<T: WriteTxn>(
     // Revalidate the durable state before moving anything; one batched
     // update-protected read covers both source authority values.
     let index = manifest.logical_index_id();
-    let (source_header, state) = topology::authority_for_update(
-        txn,
-        LogicalKey::Header {
-            index,
-            tree_key: tree_key.clone(),
-            partition: source,
-        },
-        LogicalKey::State {
-            index,
-            tree_key: tree_key.clone(),
-            partition: source,
-        },
-    )
-    .await?;
-    let (source_header, state) = match (source_header, state) {
-        // A completed merge removed both authority values.
-        (None, None) => return Ok(Attempt::Step(DrainStep::SourceAdvanced)),
-        (Some(header), Some(state)) => (header, state),
-        // Completion removes the pair atomically, so a half-present pair is
-        // a torn committed state.
-        _ => return Err(Error::new(ErrorKind::Corruption)),
+    let Some((source_header, state)) =
+        topology::authority_for_update(txn, index, tree_key, source).await?
+    else {
+        return Ok(Attempt::Step(DrainStep::SourceAdvanced));
     };
     if !matches!(state, PartitionTransition::Merging { .. }) {
         // Merging never reverts to another persisted state and completion
@@ -451,53 +434,25 @@ async fn drain_attempt<T: WriteTxn>(
         // contradicts the persisted protocol.
         return Err(Error::new(ErrorKind::Corruption));
     }
-    if source_header.state() != PartitionState::Merging {
-        return Err(Error::new(ErrorKind::Corruption));
-    }
+
     let level = source_header.level();
 
+    let target = |vector: &[f32]| {
+        routing::nearest_ready_candidate(&plan.kernel, vector, source, &plan.candidates)?
+            .map(|(_, target)| target.partition())
+            .ok_or_else(|| Error::new(ErrorKind::Backend))
+    };
     let moved = match &plan.batch {
-        DrainBatch::Leaf(record_ids) => {
-            let candidates: Vec<_> = record_ids.iter().cloned().map(|id| (source, id)).collect();
-            let candidates =
-                topology::read_leaf_drain_candidates(txn, tree_key, &candidates).await?;
-            let mut moves = Vec::new();
-            for candidate in candidates.into_iter().flatten() {
-                // A `None` slot is a concurrently removed entry: skipped.
-                let routing = plan
-                    .kernel
-                    .preprocess(candidate.record().vector())
-                    .map_err(|_| Error::new(ErrorKind::Corruption))?;
-                let (_, target) = routing::nearest_ready_candidate(
-                    &plan.kernel,
-                    &routing,
-                    source,
-                    &plan.candidates,
-                )?
-                // The read phase proved at least one Ready candidate, and the
-                // plan's fixed candidate set cannot shrink inside the attempt.
-                .ok_or_else(|| Error::new(ErrorKind::Backend))?;
-                moves.push((candidate, target.partition()));
-            }
+        DrainBatch::Leaf(candidates) => {
+            let moves =
+                drain::route_leaves(txn, tree_key, candidates, &plan.kernel, target).await?;
             if !revalidate_targets(txn, tree_key, level, &moves).await? {
                 return Ok(Attempt::Reselect);
             }
             topology::relocate_leaf_entries(txn, tree_key, moves, topology::Movement::Merge).await?
         }
         DrainBatch::Child(children) => {
-            let candidates =
-                topology::read_child_drain_candidates(txn, tree_key, source, children).await?;
-            let mut moves = Vec::new();
-            for entry in candidates.into_iter().flatten() {
-                let (_, target) = routing::nearest_ready_candidate(
-                    &plan.kernel,
-                    entry.centroid(),
-                    source,
-                    &plan.candidates,
-                )?
-                .ok_or_else(|| Error::new(ErrorKind::Backend))?;
-                moves.push((entry, target.partition()));
-            }
+            let moves = drain::route_children(txn, tree_key, source, children, target).await?;
             if !revalidate_targets(txn, tree_key, level, &moves).await? {
                 return Ok(Attempt::Reselect);
             }

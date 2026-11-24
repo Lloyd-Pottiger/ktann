@@ -31,8 +31,7 @@ mod relocation;
 mod transitions;
 
 pub(crate) use authority::{
-    authority_for_update, read_authority, read_authority_batch, read_authority_opt,
-    read_authority_pair,
+    authority_for_update, read_authority, read_authority_batch, read_authority_pair,
 };
 pub(crate) use discovery::{IncomingEdgeProof, LevelCandidate, same_level_candidates};
 pub(crate) use relocation::leaf_relocation_batch_limit;
