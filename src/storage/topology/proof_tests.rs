@@ -117,45 +117,63 @@ fn raw(manifest: &IndexManifest, rows: &[(LogicalKey, PersistentValue)]) -> Mock
 }
 
 #[tokio::test]
-async fn proof_protects_every_parent_and_rejects_changed_or_missing_parents() {
+async fn proof_isolates_distinct_parents_and_rejects_stale_or_corrupt_edges() {
     let (manifest, tree, rows) = fixture();
+    let index = manifest.logical_index_id();
     let mut read = ReadLogicalTxn::for_index(raw(&manifest, &rows), &manifest);
     let incoming = find_incoming_edge(&mut read, &manifest, &tree, pk(4), 1)
         .await
         .unwrap();
     assert_eq!(incoming.as_ref().unwrap().0, pk(2));
-    let proof = IncomingEdgeProof::read(&mut read, &manifest, &tree, 1, 4096)
+    let proof = IncomingEdgeProof::read(&mut read, &manifest, &tree, pk(4), 1)
         .await
         .unwrap();
+    assert_eq!(proof.parent(), pk(2));
+    // Each call descends from level 3 to level 2 by scanning only the root's
+    // child range (`1`), then resolves `pk(4)` at level 2 via point reads
+    // without scanning the two level-2 bodies.
+    assert_eq!(read.into_raw().batch_scan_sizes, vec![1, 1]);
+
+    // Missing or duplicate incoming edges in the discovery snapshot fail closed.
+    let mut missing_edge = rows.clone();
+    missing_edge.retain(|(key, _)| {
+        !matches!(
+            key,
+            LogicalKey::ChildEntry { partition, child, .. }
+                if *partition == pk(2) && *child == pk(4)
+        )
+    });
+    let mut read = ReadLogicalTxn::for_index(raw(&manifest, &missing_edge), &manifest);
     assert_eq!(
-        proof
-            .find(&mut read, &manifest, &tree, pk(4))
+        IncomingEdgeProof::read(&mut read, &manifest, &tree, pk(4), 1)
             .await
-            .unwrap(),
-        incoming
+            .unwrap_err()
+            .kind(),
+        crate::api::ErrorKind::Corruption,
     );
-    assert!(
-        IncomingEdgeProof::read(&mut read, &manifest, &tree, 1, 128)
+
+    let mut duplicate_edge = rows.clone();
+    duplicate_edge.push((
+        LogicalKey::ChildEntry {
+            index,
+            tree_key: tree.clone(),
+            partition: pk(3),
+            child: pk(4),
+        },
+        PersistentValue::ChildEntry(ChildEntry::new(pk(4), vec![1.0, 0.0])),
+    ));
+    let mut read = ReadLogicalTxn::for_index(raw(&manifest, &duplicate_edge), &manifest);
+    assert_eq!(
+        IncomingEdgeProof::read(&mut read, &manifest, &tree, pk(4), 1)
             .await
-            .is_err()
+            .unwrap_err()
+            .kind(),
+        crate::api::ErrorKind::Corruption,
     );
-    for scenario in 0..4 {
-        let mut changed = rows.clone();
-        match scenario {
-            1 => {
-                // A different parent changes: the old unique-edge proof is stale.
-                let (_, value) = changed.iter_mut().find(|(key, _)| matches!(key, LogicalKey::Header { partition, .. } if *partition == pk(3))).unwrap();
-                *value = PersistentValue::PartitionHeader(PartitionHeader::new(2, 1, 8, PartitionState::Ready).unwrap());
-            }
-            2 => changed.retain(|(key, _)| !matches!(key, LogicalKey::ChildEntry { partition, child, .. } if *partition == pk(1) && *child == pk(3))),
-            3 => {
-                let (_, value) = changed.iter_mut().find(|(key, _)| matches!(key, LogicalKey::Header { partition, .. } if *partition == pk(1))).unwrap();
-                *value = PersistentValue::PartitionHeader(PartitionHeader::new(1, 0, 8, PartitionState::Ready).unwrap());
-            }
-            _ => {}
-        }
+
+    let make_write = |changed: Vec<(LogicalKey, PersistentValue)>| {
         let protected = Arc::new(Mutex::new(Vec::new()));
-        let mut write = WriteLogicalTxn::for_index(
+        let write = WriteLogicalTxn::for_index(
             ProofTxn {
                 read: raw(&manifest, &changed),
                 protected: protected.clone(),
@@ -171,25 +189,94 @@ async fn proof_protects_every_parent_and_rejects_changed_or_missing_parents() {
                 mutation_key_overhead_bytes: 0,
             },
         );
-        assert_eq!(
-            proof.validate(&mut write, &tree).await.unwrap(),
-            scenario == 0
-        );
-        if scenario == 0 {
-            for parent in [2, 3] {
-                assert!(
-                    protected.lock().unwrap().contains(&Bytes::from(
-                        keys::encode_key(&LogicalKey::Header {
-                            index: manifest.logical_index_id(),
-                            tree_key: tree.clone(),
-                            partition: pk(parent)
-                        })
-                        .unwrap()
-                    ))
-                );
-            }
+        (write, protected)
+    };
+
+    // Unchanged state and unrelated sibling-parent Header updates both validate
+    // without update-protecting sibling parent `pk(3)`.
+    for bump_sibling_parent in [false, true] {
+        let mut changed = rows.clone();
+        if bump_sibling_parent {
+            let (_, value) = changed
+                .iter_mut()
+                .find(|(key, _)| {
+                    matches!(key, LogicalKey::Header { partition, .. } if *partition == pk(3))
+                })
+                .unwrap();
+            *value = PersistentValue::PartitionHeader(
+                PartitionHeader::new(2, 1, 8, PartitionState::Ready).unwrap(),
+            );
         }
+        let (mut write, protected) = make_write(changed);
+        assert!(proof.validate(&mut write, &tree).await.unwrap());
+        let locked = protected.lock().unwrap().clone();
+        assert!(
+            locked.contains(&Bytes::from(
+                keys::encode_key(&LogicalKey::Header {
+                    index,
+                    tree_key: tree.clone(),
+                    partition: pk(2),
+                })
+                .unwrap()
+            ))
+        );
+        assert!(
+            locked.contains(&Bytes::from(
+                keys::encode_key(&LogicalKey::ChildEntry {
+                    index,
+                    tree_key: tree.clone(),
+                    partition: pk(2),
+                    child: pk(4),
+                })
+                .unwrap()
+            ))
+        );
+        assert!(
+            !locked.contains(&Bytes::from(
+                keys::encode_key(&LogicalKey::Header {
+                    index,
+                    tree_key: tree.clone(),
+                    partition: pk(3),
+                })
+                .unwrap()
+            ))
+        );
     }
+
+    // Relocating `pk(4)` from `pk(2)` to `pk(3)` invalidates the proof cleanly (`Ok(false)`).
+    let mut moved = missing_edge;
+    moved.push((
+        LogicalKey::ChildEntry {
+            index,
+            tree_key: tree.clone(),
+            partition: pk(3),
+            child: pk(4),
+        },
+        PersistentValue::ChildEntry(ChildEntry::new(pk(4), vec![1.0, 0.0])),
+    ));
+    let (mut write, _) = make_write(moved);
+    assert!(!proof.validate(&mut write, &tree).await.unwrap());
+
+    // A duplicate edge or orphaned owning parent in the write snapshot fails closed.
+    let (mut write, _) = make_write(duplicate_edge);
+    assert_eq!(
+        proof.validate(&mut write, &tree).await.unwrap_err().kind(),
+        crate::api::ErrorKind::Corruption,
+    );
+
+    let mut orphaned_parent = rows.clone();
+    orphaned_parent.retain(|(key, _)| {
+        !matches!(
+            key,
+            LogicalKey::ChildEntry { partition, child, .. }
+                if *partition == pk(1) && *child == pk(2)
+        )
+    });
+    let (mut write, _) = make_write(orphaned_parent);
+    assert_eq!(
+        proof.validate(&mut write, &tree).await.unwrap_err().kind(),
+        crate::api::ErrorKind::Corruption,
+    );
 }
 
 #[tokio::test]

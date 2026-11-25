@@ -209,3 +209,51 @@ fn retention_allocation_failures_leave_source_usable() {
     assert!(failures > 0);
     assert_eq!(bytes, original.encode(LIMIT, &|| true).unwrap());
 }
+
+#[test]
+fn try_clone_matches_decode_preserves_source_and_enforces_limits_and_cancellation() {
+    use std::cell::Cell;
+
+    let original = source();
+    let bytes = original.encode(LIMIT, &|| true).unwrap();
+    let bound = decode_bound(32, 4, bytes.len()).unwrap();
+    assert_eq!(
+        original.try_clone(bound - 1, &|| true).unwrap_err(),
+        Error::LimitExceeded
+    );
+
+    let cloned = original.try_clone(bound, &|| true).unwrap();
+    assert_eq!(cloned.encode(LIMIT, &|| true).unwrap(), bytes);
+
+    let mapping: Vec<u32> = (2..34).chain(0..2).collect();
+    let distance = |a: u32, b: u32| f64::from(mapping[a as usize].abs_diff(mapping[b as usize]));
+    let inserted_from_clone = cloned
+        .insert(&mapping, 24, 19, LIMIT, &distance, &|| true)
+        .unwrap();
+    let inserted_from_decode = Graph::decode(&bytes, 32, 4, LIMIT, &|| true)
+        .unwrap()
+        .insert(&mapping, 24, 19, LIMIT, &distance, &|| true)
+        .unwrap();
+    assert_eq!(
+        inserted_from_clone.encode(LIMIT, &|| true).unwrap(),
+        inserted_from_decode.encode(LIMIT, &|| true).unwrap()
+    );
+    assert_eq!(original.encode(LIMIT, &|| true).unwrap(), bytes);
+
+    let calls = Cell::new(0);
+    original
+        .try_clone(bound, &|| {
+            calls.set(calls.get() + 1);
+            true
+        })
+        .unwrap();
+    for stop in 0..calls.get() {
+        let current = Cell::new(0);
+        let result = original.try_clone(bound, &|| {
+            let next = current.get();
+            current.set(next + 1);
+            next != stop
+        });
+        assert_eq!(result.unwrap_err(), Error::Cancelled, "checkpoint {stop}");
+    }
+}

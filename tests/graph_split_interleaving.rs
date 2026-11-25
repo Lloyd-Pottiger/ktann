@@ -313,3 +313,161 @@ async fn sibling_splits_share_parent_preparation_without_stale_publication() {
     assert_eq!(report.objects.record_locations, 32);
     runtime.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn distinct_parent_splits_advance_without_cross_parent_lock_or_conflict() {
+    use ktann::storage::backend::{Backend as _, ReadOps as _, WriteTxn as _};
+    use ktann::storage::keys::child_entry_key;
+    use std::time::Duration;
+
+    let _audit = observe::audit_lock().await;
+    let capture = observe::capture();
+    let backend = MemoryBackend::default();
+    let config = RuntimeConfig::default().with_maintenance(2, 32).unwrap();
+    let runtime = Runtime::new(backend.clone(), support::manual_maintenance_config()).unwrap();
+    let index = runtime
+        .create_index(
+            "distinct-parent-graph-splits",
+            IndexConfig::new(1, Metric::L2)
+                .unwrap()
+                .with_leaf_partition_entries(1, 4)
+                .unwrap()
+                .with_internal_partition_entries(1, 4)
+                .unwrap()
+                .with_local_graph(LocalGraphConfig::new(2, 4, [23; 32]).unwrap()),
+        )
+        .await
+        .unwrap();
+    for id in 0_u64..64 {
+        index
+            .upsert(
+                Record::new(
+                    Bytes::copy_from_slice(&id.to_be_bytes()),
+                    vec![id as f32],
+                    vec![],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    let manifest = read_manifest(&backend, index.logical_index_id()).await;
+    let tree = TreeKey::encode(&[], &[]).unwrap();
+    let executor = GraphMaintenance::new(&config, tokio_util::sync::CancellationToken::new());
+
+    // Build a 3-level tree with two Ready level-2 internal parents.
+    complete_split(&backend, &manifest, &tree, pk(1), 2, &executor).await;
+    for _ in 0..3 {
+        let mut leaves = Vec::new();
+        for entry in scan_child_entries(&backend, &manifest, &tree, pk(1)).await {
+            let header = header_of(&backend, &manifest, &tree, entry.child())
+                .await
+                .unwrap();
+            leaves.push((header.entry_count(), entry.child()));
+        }
+        let (_, leaf) = leaves.into_iter().max().unwrap();
+        complete_split(&backend, &manifest, &tree, leaf, 0, &executor).await;
+    }
+    complete_split(&backend, &manifest, &tree, pk(1), 3, &executor).await;
+    let parents: Vec<_> = scan_child_entries(&backend, &manifest, &tree, pk(1))
+        .await
+        .into_iter()
+        .map(|entry| entry.child())
+        .collect();
+    assert_eq!(parents.len(), 2);
+    let (parent_a, parent_b) = (parents[0], parents[1]);
+
+    let pick_overfull_child = |parent| {
+        let backend = &backend;
+        let manifest = &manifest;
+        let tree = &tree;
+        async move {
+            for entry in scan_child_entries(backend, manifest, tree, parent).await {
+                if header_of(backend, manifest, tree, entry.child())
+                    .await
+                    .unwrap()
+                    .entry_count()
+                    > 4
+                {
+                    return entry.child();
+                }
+            }
+            panic!("expected an overfull leaf under {parent:?}");
+        }
+    };
+    let leaf_a = pick_overfull_child(parent_a).await;
+    let leaf_b = pick_overfull_child(parent_b).await;
+
+    // Begin both leaf splits so both are in `Splitting`.
+    advance(&backend, &manifest, &tree, leaf_a, &executor).await;
+    advance(&backend, &manifest, &tree, leaf_b, &executor).await;
+
+    // A missing incoming edge on `leaf_a` must fail closed as Corruption.
+    let edge_a = Bytes::from(child_entry_key(
+        manifest.logical_index_id(),
+        &tree,
+        parent_a,
+        leaf_a,
+    ));
+    let mut raw = backend.begin_write().await.unwrap();
+    let saved_edge_a = raw.get(edge_a.clone()).await.unwrap().unwrap();
+    raw.delete(edge_a.clone()).await.unwrap();
+    raw.commit().await.unwrap();
+    let err = graph_topology::advance(
+        &backend,
+        &manifest,
+        &tree,
+        leaf_a,
+        1000,
+        &RetryPolicy::for_fixup(&config),
+        &executor,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.kind(), ktann::api::ErrorKind::Corruption);
+    let mut raw = backend.begin_write().await.unwrap();
+    raw.put(edge_a, saved_edge_a).await.unwrap();
+    raw.commit().await.unwrap();
+
+    // Holding `parent_a`'s body lock must not block `leaf_b` under `parent_b`.
+    let retries_before: u64 = capture
+        .metric_counters()
+        .into_iter()
+        .filter(|(name, _, _)| name == "ktann.write.retries")
+        .map(|(_, _, value)| value)
+        .sum();
+    let guard_a = ktann::test_support::lock_graph_body(
+        &executor,
+        manifest.logical_index_id(),
+        &tree,
+        parent_a,
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        complete_split(&backend, &manifest, &tree, leaf_b, 0, &executor),
+    )
+    .await
+    .expect("distinct parent split must not wait on sibling parent lock");
+    drop(guard_a);
+
+    // Concurrent completion on both parents incurs zero cross-parent write retries.
+    complete_split(&backend, &manifest, &tree, leaf_a, 0, &executor).await;
+    let retries: u64 = capture
+        .metric_counters()
+        .into_iter()
+        .filter(|(name, _, _)| name == "ktann.write.retries")
+        .map(|(_, _, value)| value)
+        .sum();
+    assert_eq!(retries - retries_before, 0);
+
+    let report = index.verify(VerifyOptions::default()).await.unwrap();
+    assert!(
+        report.complete && report.issues.is_empty(),
+        "{:?}",
+        report.issues
+    );
+    assert_eq!(report.objects.vector_records, 64);
+    runtime.shutdown().await.unwrap();
+}

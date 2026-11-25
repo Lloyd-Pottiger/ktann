@@ -4,6 +4,9 @@
 //! then includes graph records in the same commit. Native work runs only in
 //! `prepare`, outside the transaction and under the caller's retained admission.
 
+use std::fmt;
+use std::sync::Arc;
+
 use super::backend::{ReadOps, ScanLimits, WriteTxn};
 use super::keys::{LogicalKey, TreeKey};
 use super::values::{
@@ -12,9 +15,13 @@ use super::values::{
 };
 use super::{LogicalRange, MutationBuilder, ReadLogicalTxn, WriteLogicalTxn};
 use crate::api::{Error, ErrorKind, PartitionKey, Result};
+use crate::search::cache::{BodyEntries, CacheKey, CachedBody, PartitionCache, PartitionKind};
 use crate::search::local_hnsw::{
     Centroids,
-    persistence::{GraphRecords, GraphSource, build_records, restore_graph, update_records},
+    persistence::{
+        GraphRecords, GraphSource, admit_cached_source, build_records, restore_graph,
+        update_cached_records, update_records, validate_descriptor_envelope,
+    },
 };
 use crate::search::numeric::VectorKernel;
 
@@ -34,6 +41,91 @@ const PAGE: ScanLimits = ScanLimits {
     byte_limit: 256 * 1024,
 };
 
+enum SourceBody {
+    Loaded {
+        children: Vec<ChildEntry>,
+        chunks: Vec<(u32, GraphChunk)>,
+    },
+    Cached(Arc<CachedBody>),
+}
+
+impl SourceBody {
+    fn children(&self) -> &[ChildEntry] {
+        match self {
+            Self::Loaded { children, .. } => children,
+            Self::Cached(body) => match body.entries() {
+                BodyEntries::InternalGraph(graph) => graph.children(),
+                _ => unreachable!("validated internal graph cache entry"),
+            },
+        }
+    }
+
+    fn chunk_count(&self, descriptor: Option<&GraphDescriptor>) -> usize {
+        match self {
+            Self::Loaded { chunks, .. } => chunks.len(),
+            Self::Cached(_) => descriptor.map_or(0, GraphDescriptor::chunks) as usize,
+        }
+    }
+}
+
+impl fmt::Debug for SourceBody {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Loaded { children, chunks } => formatter
+                .debug_struct("Loaded")
+                .field("children", &children.len())
+                .field("chunks", &chunks.len())
+                .finish(),
+            Self::Cached(body) => formatter
+                .debug_struct("Cached")
+                .field("children", &self.children().len())
+                .field("heap_bytes", &body.heap_bytes())
+                .finish(),
+        }
+    }
+}
+
+async fn scan_graph_chunks<T: ReadOps, C: Fn() -> Result<()> + ?Sized>(
+    txn: &mut ReadLogicalTxn<'_, T>,
+    manifest: &IndexManifest,
+    tree: &TreeKey,
+    partition: PartitionKey,
+    chunk_count: u32,
+    check: &C,
+) -> Result<Vec<(u32, GraphChunk)>> {
+    let mut chunks = Vec::new();
+    chunks
+        .try_reserve_exact(chunk_count as usize)
+        .map_err(|_| limit())?;
+    let range = LogicalRange::graph_chunks(manifest, tree, partition)?;
+    let mut cursor = None;
+    loop {
+        check()?;
+        let (items, next) = txn.scan(&range, cursor.as_ref(), PAGE).await?.into_parts();
+        for item in items {
+            let LogicalKey::GraphChunk { chunk, .. } = item.key() else {
+                return Err(corrupt());
+            };
+            let ordinal = *chunk;
+            if ordinal as usize != chunks.len() || ordinal >= chunk_count {
+                return Err(corrupt());
+            }
+            let PersistentValue::GraphChunk(chunk) = item.into_value() else {
+                return Err(corrupt());
+            };
+            chunks.push((ordinal, chunk));
+        }
+        cursor = next;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    if chunks.len() != chunk_count as usize {
+        return Err(corrupt());
+    }
+    Ok(chunks)
+}
+
 /// A complete existing partition body, including graph-free empty/leaf bodies.
 #[derive(Debug)]
 pub struct GraphTransitionSource {
@@ -42,14 +134,27 @@ pub struct GraphTransitionSource {
     partition: PartitionKey,
     header: Option<PartitionHeader>,
     descriptor: Option<GraphDescriptor>,
-    children: Vec<ChildEntry>,
-    chunks: Vec<(u32, GraphChunk)>,
+    body: SourceBody,
 }
 
 impl GraphTransitionSource {
     /// Reads a bounded snapshot; an absent partition is a valid creation source.
     pub async fn read<T: ReadOps, C: Fn() -> Result<()> + ?Sized>(
         txn: &mut ReadLogicalTxn<'_, T>,
+        tree: &TreeKey,
+        partition: PartitionKey,
+        working_bytes: usize,
+        check: &C,
+    ) -> Result<Self> {
+        Self::read_cached(txn, None, tree, partition, working_bytes, check).await
+    }
+
+    /// Reads a bounded snapshot, reusing a snapshot-validated cached internal
+    /// body when its epoch and descriptor binding match `txn` without changing
+    /// working-memory admission.
+    pub(crate) async fn read_cached<T: ReadOps, C: Fn() -> Result<()> + ?Sized>(
+        txn: &mut ReadLogicalTxn<'_, T>,
+        cache: Option<&PartitionCache>,
         tree: &TreeKey,
         partition: PartitionKey,
         working_bytes: usize,
@@ -116,6 +221,73 @@ impl GraphTransitionSource {
         if retained > working_bytes {
             return Err(limit());
         }
+        if count > 0
+            && let Some(cache) = cache
+        {
+            let header_val = header.ok_or_else(corrupt)?;
+            let descriptor_val = descriptor.as_ref().ok_or_else(corrupt)?;
+            let parameters = manifest
+                .config()
+                .local_graph()
+                .ok_or_else(corrupt)?
+                .parameters();
+            let source = GraphSource {
+                index,
+                tree,
+                parent: partition,
+                header: header_val,
+                parameters,
+            };
+            validate_descriptor_envelope(source, count as usize, descriptor_val)?;
+            let key = CacheKey::new(index, tree.clone(), partition, PartitionKind::Internal);
+            if let Some(cached) = cache.lookup(&key, header_val.cache_epoch()) {
+                match cached.entries() {
+                    BodyEntries::InternalGraph(graph) => {
+                        if graph.children().len() != count as usize
+                            || !graph.matches(source, descriptor_val)
+                        {
+                            return Err(corrupt());
+                        }
+                        return Ok(Self {
+                            manifest,
+                            tree: tree.clone(),
+                            partition,
+                            header,
+                            descriptor,
+                            body: SourceBody::Cached(cached),
+                        });
+                    }
+                    BodyEntries::Internal(cached_children) => {
+                        if cached_children.len() != count as usize {
+                            return Err(corrupt());
+                        }
+                        let mut children = Vec::new();
+                        children
+                            .try_reserve_exact(cached_children.len())
+                            .map_err(|_| limit())?;
+                        children.extend_from_slice(cached_children);
+                        let chunks = scan_graph_chunks(
+                            txn,
+                            &manifest,
+                            tree,
+                            partition,
+                            descriptor_val.chunks(),
+                            check,
+                        )
+                        .await?;
+                        return Ok(Self {
+                            manifest,
+                            tree: tree.clone(),
+                            partition,
+                            header,
+                            descriptor,
+                            body: SourceBody::Loaded { children, chunks },
+                        });
+                    }
+                    BodyEntries::Leaf { .. } => return Err(corrupt()),
+                }
+            }
+        }
         let mut children = Vec::new();
         children
             .try_reserve_exact(count as usize)
@@ -143,54 +315,23 @@ impl GraphTransitionSource {
             return Err(corrupt());
         }
         let chunk_count = descriptor.as_ref().map_or(0, GraphDescriptor::chunks);
-        let mut chunks = Vec::new();
-        chunks
-            .try_reserve_exact(chunk_count as usize)
-            .map_err(|_| limit())?;
-        let range = LogicalRange::graph_chunks(&manifest, tree, partition)?;
-        let mut cursor = None;
-        loop {
-            check()?;
-            let (items, next) = txn.scan(&range, cursor.as_ref(), PAGE).await?.into_parts();
-            for item in items {
-                let LogicalKey::GraphChunk { chunk, .. } = item.key() else {
-                    return Err(corrupt());
-                };
-                let ordinal = *chunk;
-                if ordinal as usize != chunks.len() || ordinal >= chunk_count {
-                    return Err(corrupt());
-                }
-                let PersistentValue::GraphChunk(chunk) = item.into_value() else {
-                    return Err(corrupt());
-                };
-                chunks.push((ordinal, chunk));
-            }
-            cursor = next;
-            if cursor.is_none() {
-                break;
-            }
-        }
-        if chunks.len() != chunk_count as usize {
-            return Err(corrupt());
-        }
+        let chunks = scan_graph_chunks(txn, &manifest, tree, partition, chunk_count, check).await?;
         Ok(Self {
             manifest,
             tree: tree.clone(),
             partition,
             header,
             descriptor,
-            children,
-            chunks,
+            body: SourceBody::Loaded { children, chunks },
         })
     }
 
     /// Retained source bytes charged while preparing another partition.
     pub fn retained_bytes(&self) -> Result<usize> {
-        self.projection_bytes(self.children.len())?
+        let chunk_count = self.body.chunk_count(self.descriptor.as_ref());
+        self.projection_bytes(self.children().len())?
             .checked_add(self.descriptor.as_ref().map_or(0, |d| d.bytes as usize))
-            .and_then(|n| {
-                n.checked_add(self.chunks.len() * std::mem::size_of::<(u32, GraphChunk)>())
-            })
+            .and_then(|n| n.checked_add(chunk_count * std::mem::size_of::<(u32, GraphChunk)>()))
             .and_then(|n| n.checked_add(self.tree.as_bytes().len() + METADATA_BYTES))
             .ok_or_else(limit)
     }
@@ -262,9 +403,10 @@ impl GraphTransitionSource {
     pub fn header(&self) -> Option<PartitionHeader> {
         self.header
     }
+
     /// Ordered authoritative child projections in the source snapshot.
     pub fn children(&self) -> &[ChildEntry] {
-        &self.children
+        self.body.children()
     }
 
     /// Prepares the exact final internal body, or validates and removes an old
@@ -296,7 +438,7 @@ impl GraphTransitionSource {
         if header.state() != PartitionState::Ready {
             return Err(Error::invalid_argument());
         }
-        let mut next = self.children.clone();
+        let mut next = self.children().to_vec();
         let mut geometry_changed = false;
         for (child, center) in updates {
             check()?;
@@ -321,24 +463,43 @@ impl GraphTransitionSource {
         refresh_centroids: bool,
     ) -> Result<PreparedGraphTransition> {
         check()?;
-        let config = self.manifest.config();
+        let old_bytes = self.projection_bytes(self.children().len())?;
+        let target_bytes = self.projection_bytes(next.len())?;
+        let chunk_count = self.body.chunk_count(self.descriptor.as_ref());
+        let Self {
+            manifest,
+            tree,
+            partition,
+            header,
+            descriptor,
+            body,
+        } = self;
+        let (loaded_children, loaded_chunks, cached_body) = match body {
+            SourceBody::Loaded { children, chunks } => (children, chunks, None),
+            SourceBody::Cached(cached) => (Vec::new(), Vec::new(), Some(cached)),
+        };
+        let cached_graph = match cached_body.as_ref().map(|body| body.entries()) {
+            Some(BodyEntries::InternalGraph(graph)) => Some(graph),
+            Some(_) => unreachable!("validated internal graph cache entry"),
+            None => None,
+        };
+        let old_children = cached_graph.map_or(loaded_children.as_slice(), |g| g.children());
+        let config = manifest.config();
         let capacity = config.max_internal_partition_entries() as usize + 2;
         let kernel = VectorKernel::new(
             config.dimension(),
             config.metric(),
-            *self.manifest.rotation_seed(),
+            *manifest.rotation_seed(),
         )?;
-        let old_bytes = self.projection_bytes(self.children.len())?;
-        let target_bytes = self.projection_bytes(next.len())?;
         let available = working_bytes
             .checked_sub(
                 kernel.heap_bytes()
-                    + self.tree.as_bytes().len()
-                    + self.chunks.len() * std::mem::size_of::<(u32, GraphChunk)>()
+                    + tree.as_bytes().len()
+                    + chunk_count * std::mem::size_of::<(u32, GraphChunk)>()
                     + METADATA_BYTES,
             )
             .ok_or_else(limit)?;
-        let old = Centroids::new(&kernel, &self.children, capacity, check).map_err(|e| {
+        let old = Centroids::new(&kernel, old_children, capacity, check).map_err(|e| {
             if e.kind() == ErrorKind::InvalidArgument {
                 corrupt()
             } else {
@@ -351,30 +512,29 @@ impl GraphTransitionSource {
         if target_count != next.len()
             || next
                 .iter()
-                .any(|c| c.child() == self.partition || c.child().get() == 1)
+                .any(|c| c.child() == partition || c.child().get() == 1)
         {
             return Err(Error::invalid_argument());
         }
         let target = Centroids::new(&kernel, &next, capacity, check)?;
         let parameters = config.local_graph().ok_or_else(corrupt)?.parameters();
-        let unchanged = self
-            .header
+        let unchanged = header
             .zip(next_header)
             .is_some_and(|(a, b)| a.level() == b.level() && a.cache_epoch() == b.cache_epoch())
-            && self.children == next;
-        if let Some((old_header, new_header)) = self.header.zip(next_header)
+            && old_children == next.as_slice();
+        if let Some((old_header, new_header)) = header.zip(next_header)
             && !unchanged
             && (old_header.level() > 1 || new_header.level() > 1)
             && new_header.cache_epoch() <= old_header.cache_epoch()
         {
             return Err(Error::invalid_argument());
         }
-        let prepared = if let Some(descriptor) = &self.descriptor {
+        let prepared = if let Some(descriptor) = &descriptor {
             let source = GraphSource {
-                index: self.manifest.logical_index_id(),
-                tree: &self.tree,
-                parent: self.partition,
-                header: self.header.ok_or_else(corrupt)?,
+                index: manifest.logical_index_id(),
+                tree: &tree,
+                parent: partition,
+                header: header.ok_or_else(corrupt)?,
                 parameters,
             };
             if target_count > 0
@@ -382,25 +542,47 @@ impl GraphTransitionSource {
                 && !refresh_centroids
                 && next_header.is_some_and(|header| header.level() == source.header.level())
             {
-                Some(update_records(
-                    old,
-                    target,
-                    source,
-                    descriptor,
-                    self.chunks,
-                    next_header.ok_or_else(corrupt)?,
-                    available,
-                    check,
-                )?)
+                let next_header = next_header.ok_or_else(corrupt)?;
+                let updated = match cached_graph {
+                    Some(graph) => update_cached_records(
+                        old,
+                        target,
+                        source,
+                        descriptor,
+                        graph,
+                        next_header,
+                        available,
+                        check,
+                    )?,
+                    None => update_records(
+                        old,
+                        target,
+                        source,
+                        descriptor,
+                        loaded_chunks,
+                        next_header,
+                        available,
+                        check,
+                    )?,
+                };
+                Some(updated)
             } else {
-                drop(restore_graph(
-                    old,
-                    source,
-                    descriptor,
-                    self.chunks,
-                    available.checked_sub(target_bytes).ok_or_else(limit)?,
-                    check,
-                )?);
+                let verify_budget = available.checked_sub(target_bytes).ok_or_else(limit)?;
+                match cached_graph {
+                    Some(graph) => {
+                        admit_cached_source(old, source, descriptor, graph, verify_budget, check)?;
+                    }
+                    None => {
+                        drop(restore_graph(
+                            old,
+                            source,
+                            descriptor,
+                            loaded_chunks,
+                            verify_budget,
+                            check,
+                        )?);
+                    }
+                }
                 if target_count > 0 && !unchanged {
                     Some(build_records(
                         target,
@@ -419,9 +601,9 @@ impl GraphTransitionSource {
             Some(build_records(
                 target,
                 GraphSource {
-                    index: self.manifest.logical_index_id(),
-                    tree: &self.tree,
-                    parent: self.partition,
+                    index: manifest.logical_index_id(),
+                    tree: &tree,
+                    parent: partition,
                     header: next_header.ok_or_else(corrupt)?,
                     parameters,
                 },
@@ -455,11 +637,11 @@ impl GraphTransitionSource {
             }
         };
         Ok(PreparedGraphTransition {
-            manifest: self.manifest,
-            tree: self.tree,
-            partition: self.partition,
-            source_header: self.header,
-            source_descriptor: self.descriptor,
+            manifest,
+            tree,
+            partition,
+            source_header: header,
+            source_descriptor: descriptor,
             publication,
         })
     }
@@ -713,8 +895,10 @@ mod tests {
             partition: PartitionKey::new(1).unwrap(),
             header: None,
             descriptor: None,
-            children: vec![],
-            chunks: vec![],
+            body: SourceBody::Loaded {
+                children: vec![],
+                chunks: vec![],
+            },
         }
     }
 
@@ -753,8 +937,10 @@ mod tests {
         GraphTransitionSource {
             header: Some(header),
             descriptor: Some(records.descriptor),
-            children: next,
-            chunks,
+            body: SourceBody::Loaded {
+                children: next,
+                chunks,
+            },
             ..source()
         }
     }
@@ -868,7 +1054,10 @@ mod tests {
     #[test]
     fn corrupt_graph_cannot_be_hidden_by_empty_or_deleted_target() {
         let mut old = populated();
-        old.chunks[0].1 = GraphChunk(bytes::Bytes::from_static(b"corrupt"));
+        let SourceBody::Loaded { chunks, .. } = &mut old.body else {
+            panic!("expected encoded fixture");
+        };
+        chunks[0].1 = GraphChunk(bytes::Bytes::from_static(b"corrupt"));
         assert_eq!(
             old.prepare(None, vec![], MEMORY, &|| Ok(()))
                 .unwrap_err()
@@ -959,5 +1148,260 @@ mod tests {
             .unwrap();
         assert_eq!(empty.header(), Some(empty_header));
         assert!(empty.children().is_empty());
+    }
+
+    #[tokio::test]
+    async fn warm_cache_hit_skips_body_scans_matches_cold_preparation_and_fails_closed() {
+        use super::super::keys::encode_key;
+        use super::super::test_support::MockReadTxn;
+        use super::super::values::{PartitionState, ValueCodec};
+
+        let base = source();
+        let codec = ValueCodec::for_index(&base.manifest);
+        let index = base.manifest.logical_index_id();
+        let initial_rows = rows();
+        let initial_header = header(4, 5, PartitionState::Ready);
+        let initial = source()
+            .prepare(Some(initial_header), initial_rows.clone(), MEMORY, &|| {
+                Ok(())
+            })
+            .unwrap();
+        let GraphPublication::Replace { records, .. } = &initial.publication else {
+            panic!("expected initial graph replacement");
+        };
+        let descriptor = records.descriptor.clone();
+        let mut kv_rows = vec![
+            (
+                LogicalKey::Manifest(index),
+                PersistentValue::IndexManifest(base.manifest.clone()),
+            ),
+            (
+                LogicalKey::Header {
+                    index,
+                    tree_key: base.tree.clone(),
+                    partition: base.partition,
+                },
+                PersistentValue::PartitionHeader(initial_header),
+            ),
+            (
+                LogicalKey::GraphDescriptor {
+                    index,
+                    tree_key: base.tree.clone(),
+                    partition: base.partition,
+                },
+                PersistentValue::GraphDescriptor(descriptor.clone()),
+            ),
+        ];
+        for child in &initial_rows {
+            kv_rows.push((
+                LogicalKey::ChildEntry {
+                    index,
+                    tree_key: base.tree.clone(),
+                    partition: base.partition,
+                    child: child.child(),
+                },
+                PersistentValue::ChildEntry(child.clone()),
+            ));
+        }
+        for (ordinal, chunk) in records.chunks() {
+            kv_rows.push((
+                LogicalKey::GraphChunk {
+                    index,
+                    tree_key: base.tree.clone(),
+                    partition: base.partition,
+                    chunk: ordinal,
+                },
+                PersistentValue::GraphChunk(chunk),
+            ));
+        }
+        let encode_rows = |items: &[(LogicalKey, PersistentValue)]| {
+            items
+                .iter()
+                .map(|(k, v)| (encode_key(k).unwrap(), codec.encode_for_key(k, v).unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let encoded_rows = encode_rows(&kv_rows);
+
+        let cache = PartitionCache::new(MEMORY as u64);
+        initial.cache_committed(&cache);
+
+        // Warm `InternalGraph` hit performs zero scans (`with_failing_scans` tripwire)
+        // and produces identical insertion and deletion outputs as cold reads.
+        let mut added = initial_rows.clone();
+        added.push(ChildEntry::new(
+            PartitionKey::new(6).unwrap(),
+            vec![6.0, 1.0],
+        ));
+        added.push(ChildEntry::new(
+            PartitionKey::new(7).unwrap(),
+            vec![7.0, 1.0],
+        ));
+        let mut removed = initial_rows.clone();
+        removed.remove(1);
+
+        for (next_header, next_children) in [
+            (header(6, 6, PartitionState::Ready), added),
+            (header(3, 6, PartitionState::Ready), removed),
+        ] {
+            let mut warm_txn = ReadLogicalTxn::for_index(
+                MockReadTxn::new(encoded_rows.clone()).with_failing_scans(),
+                &base.manifest,
+            );
+            let warm = GraphTransitionSource::read_cached(
+                &mut warm_txn,
+                Some(&cache),
+                &base.tree,
+                base.partition,
+                MEMORY,
+                &|| Ok(()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(warm_txn.into_raw().scans, 0);
+
+            let mut cold_txn =
+                ReadLogicalTxn::for_index(MockReadTxn::new(encoded_rows.clone()), &base.manifest);
+            let cold = GraphTransitionSource::read(
+                &mut cold_txn,
+                &base.tree,
+                base.partition,
+                MEMORY,
+                &|| Ok(()),
+            )
+            .await
+            .unwrap();
+            assert!(cold_txn.into_raw().scans >= 2);
+            assert_eq!(
+                warm.retained_bytes().unwrap(),
+                cold.retained_bytes().unwrap()
+            );
+
+            let warm_out = warm
+                .prepare(Some(next_header), next_children.clone(), MEMORY, &|| Ok(()))
+                .unwrap();
+            let cold_out = cold
+                .prepare(Some(next_header), next_children, MEMORY, &|| Ok(()))
+                .unwrap();
+            let (
+                GraphPublication::Replace {
+                    records: warm_rec, ..
+                },
+                GraphPublication::Replace {
+                    records: cold_rec, ..
+                },
+            ) = (&warm_out.publication, &cold_out.publication)
+            else {
+                panic!("expected replacement");
+            };
+            assert_eq!(warm_rec.descriptor, cold_rec.descriptor);
+            let warm_chunks: Vec<_> = warm_rec.chunks().collect();
+            let cold_chunks: Vec<_> = cold_rec.chunks().collect();
+            assert_eq!(warm_chunks, cold_chunks);
+        }
+
+        // Admission limit is identical warm vs cold.
+        let mut warm_txn = ReadLogicalTxn::for_index(
+            MockReadTxn::new(encoded_rows.clone()).with_failing_scans(),
+            &base.manifest,
+        );
+        let retained = GraphTransitionSource::read_cached(
+            &mut warm_txn,
+            Some(&cache),
+            &base.tree,
+            base.partition,
+            MEMORY,
+            &|| Ok(()),
+        )
+        .await
+        .unwrap()
+        .retained_bytes()
+        .unwrap();
+        let tight = retained
+            - descriptor.chunks() as usize * std::mem::size_of::<(u32, GraphChunk)>()
+            + PAGE.byte_limit
+            - 1;
+        let mut warm_tight = ReadLogicalTxn::for_index(
+            MockReadTxn::new(encoded_rows.clone()).with_failing_scans(),
+            &base.manifest,
+        );
+        let mut cold_tight =
+            ReadLogicalTxn::for_index(MockReadTxn::new(encoded_rows.clone()), &base.manifest);
+        assert_eq!(
+            GraphTransitionSource::read_cached(
+                &mut warm_tight,
+                Some(&cache),
+                &base.tree,
+                base.partition,
+                tight,
+                &|| Ok(()),
+            )
+            .await
+            .unwrap_err()
+            .kind(),
+            ErrorKind::LimitExceeded
+        );
+        assert_eq!(
+            GraphTransitionSource::read(
+                &mut cold_tight,
+                &base.tree,
+                base.partition,
+                tight,
+                &|| Ok(())
+            )
+            .await
+            .unwrap_err()
+            .kind(),
+            ErrorKind::LimitExceeded
+        );
+
+        // Projections-only `Internal` cache hit skips ChildEntry scan and scans only GraphChunks.
+        let projections_cache = PartitionCache::new(MEMORY as u64);
+        projections_cache.install(
+            CacheKey::new(
+                index,
+                base.tree.clone(),
+                base.partition,
+                PartitionKind::Internal,
+            ),
+            Arc::new(CachedBody::internal(5, initial_rows.clone())),
+        );
+        let mut partial_txn =
+            ReadLogicalTxn::for_index(MockReadTxn::new(encoded_rows.clone()), &base.manifest);
+        let partial = GraphTransitionSource::read_cached(
+            &mut partial_txn,
+            Some(&projections_cache),
+            &base.tree,
+            base.partition,
+            MEMORY,
+            &|| Ok(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(partial_txn.into_raw().scans, 1);
+        assert_eq!(partial.children(), initial_rows.as_slice());
+
+        // Mismatched snapshot GraphDescriptor binding fails closed even on matching epoch.
+        let mut tampered = kv_rows;
+        let mut bad_descriptor = descriptor;
+        bad_descriptor.binding[0] ^= 0xff;
+        tampered[2].1 = PersistentValue::GraphDescriptor(bad_descriptor);
+        let mut bad_txn = ReadLogicalTxn::for_index(
+            MockReadTxn::new(encode_rows(&tampered)).with_failing_scans(),
+            &base.manifest,
+        );
+        assert_eq!(
+            GraphTransitionSource::read_cached(
+                &mut bad_txn,
+                Some(&cache),
+                &base.tree,
+                base.partition,
+                MEMORY,
+                &|| Ok(()),
+            )
+            .await
+            .unwrap_err()
+            .kind(),
+            ErrorKind::Corruption
+        );
     }
 }

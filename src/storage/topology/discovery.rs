@@ -25,9 +25,10 @@ const DISCOVERY_SCAN_LIMITS: ScanLimits = ScanLimits {
     item_limit: 128,
     byte_limit: 1_048_576,
 };
-/// Rediscovers one partition's unique incoming Child Entry by an exact
-/// bounded root-down scan of every Child Entry at the required parent level
-/// (ADR 0007).
+
+/// Rediscovers one partition's unique incoming Child Entry by walking from the
+/// root down to the required parent level and point-reading `(parent, child)`
+/// across that level's bodies (ADR 0007).
 ///
 /// A duplicate match is Corruption; no match returns `None`.
 async fn find_incoming_edge<T: LogicalReader>(
@@ -42,7 +43,8 @@ async fn find_incoming_edge<T: LogicalReader>(
     find_incoming_edge_in(txn, manifest, tree_key, partition, &bodies).await
 }
 
-/// Resolves a unique incoming edge within an already discovered parent level.
+/// Resolves a unique incoming edge within an already discovered parent level
+/// by exact `(parent, child)` point reads rather than scanning sibling entries.
 async fn find_incoming_edge_in<T: LogicalReader>(
     txn: &mut T,
     manifest: &IndexManifest,
@@ -50,121 +52,133 @@ async fn find_incoming_edge_in<T: LogicalReader>(
     partition: PartitionKey,
     bodies: &[PartitionKey],
 ) -> Result<Option<(PartitionKey, ChildEntry)>> {
-    // Only the parent level's matches are collected.
+    let index = manifest.logical_index_id();
     let mut found: Option<(PartitionKey, ChildEntry)> = None;
-    scan_child_edges(txn, manifest, tree_key, bodies, &mut |body, entry| {
-        if entry.child() == partition {
-            if found.is_some() {
-                return Err(corrupt());
+    for chunk in bodies.chunks(DISCOVERY_SCAN_LIMITS.item_limit) {
+        let keys = chunk
+            .iter()
+            .map(|&body| LogicalKey::ChildEntry {
+                index,
+                tree_key: tree_key.clone(),
+                partition: body,
+                child: partition,
+            })
+            .collect();
+        for (&body, value) in chunk.iter().zip(txn.batch_get(keys).await?) {
+            if let Some(entry) = expect_child_entry(value)? {
+                if entry.child() != partition || found.is_some() {
+                    return Err(corrupt());
+                }
+                found = Some((body, entry));
             }
-            found = Some((body, entry.clone()));
         }
-        Ok(())
-    })
-    .await?;
+    }
     Ok(found)
 }
 
-/// Ephemeral proof of a complete incoming-edge discovery in one read snapshot.
-/// Reuse requires the same reachable parent set and update-protected Headers.
-/// Every Child Entry change advances its owner's epoch, including edge moves.
+/// Ephemeral proof of one non-root partition's unique incoming parent in a read
+/// snapshot.
+///
+/// Publication update-protects only the owning `parent` Header and `(parent,
+/// child)` Child Entry so transitions under distinct parents neither serialize
+/// on process-local body locks nor conflict on sibling parent Headers. When the
+/// parent level can contain other bodies, plain snapshot reads verify that
+/// `parent` remains reachable from the root and no sibling body carries a
+/// duplicate edge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct IncomingEdgeProof {
+    child: PartitionKey,
     level: u32,
-    headers: Vec<(PartitionKey, PartitionHeader)>,
+    parent: PartitionKey,
 }
 
 impl IncomingEdgeProof {
+    /// Resolves `child`'s unique incoming parent at `child_level + 1` in one
+    /// consistent read snapshot. Because the caller already observed `child` in
+    /// an active transition state in the same snapshot, an absent or duplicate
+    /// incoming edge is Corruption.
     pub(crate) async fn read<R: LogicalReader>(
         reader: &mut R,
         manifest: &IndexManifest,
         tree: &TreeKey,
-        level: u32,
-        working_bytes: usize,
+        child: PartitionKey,
+        child_level: u32,
     ) -> Result<Self> {
-        let level = level.checked_add(1).ok_or_else(corrupt)?;
-        let bodies = level_bodies(reader, manifest, tree, level).await?;
-        let bytes = bodies
-            .len()
-            .checked_mul(256)
-            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-        if bytes > working_bytes {
-            return Err(Error::new(ErrorKind::LimitExceeded));
-        }
-        let mut headers = Vec::with_capacity(bodies.len());
-        for batch in bodies.chunks(DISCOVERY_BODY_BATCH) {
-            let keys = batch
-                .iter()
-                .map(|&partition| LogicalKey::Header {
-                    index: manifest.logical_index_id(),
-                    tree_key: tree.clone(),
-                    partition,
-                })
-                .collect();
-            for (&partition, value) in batch.iter().zip(reader.batch_get(keys).await?) {
-                headers.push((partition, expect_header(value)?.ok_or_else(corrupt)?));
-            }
-        }
-        Ok(Self { level, headers })
+        let level = child_level.checked_add(1).ok_or_else(corrupt)?;
+        let (parent, _) = find_incoming_edge(reader, manifest, tree, child, child_level)
+            .await?
+            .ok_or_else(corrupt)?;
+        Ok(Self {
+            child,
+            level,
+            parent,
+        })
     }
 
-    /// Resolves the edge in this snapshot without rediscovering the parent level.
-    pub(crate) async fn find<R: LogicalReader>(
-        &self,
-        reader: &mut R,
-        manifest: &IndexManifest,
-        tree: &TreeKey,
-        partition: PartitionKey,
-    ) -> Result<Option<(PartitionKey, ChildEntry)>> {
-        let bodies: Vec<_> = self.bodies().collect();
-        find_incoming_edge_in(reader, manifest, tree, partition, &bodies).await
+    /// Returns the discovered owning parent Partition Key.
+    pub(crate) const fn parent(self) -> PartitionKey {
+        self.parent
     }
 
-    /// Reuse existing ordered body guards to avoid preparing against a proof
-    /// another local publisher is already changing. Storage fences remain final.
-    pub(crate) fn bodies(&self) -> impl Iterator<Item = PartitionKey> + '_ {
-        self.headers.iter().map(|(partition, _)| *partition)
-    }
-
-    pub(crate) fn retained_bytes(&self) -> usize {
-        self.headers.capacity() * 256
-    }
-
-    /// False means discard the private plan and rediscover; never use a stale hint.
+    /// Validates that `self.parent` still owns `self.child`'s unique incoming
+    /// edge in `txn`. False means the edge moved or the parent level changed so
+    /// the caller must discard its private plan and rediscover; structural
+    /// contradictions fail closed with Corruption.
     pub(crate) async fn validate<T: WriteTxn>(
-        &self,
+        self,
         txn: &mut WriteLogicalTxn<'_, T>,
         tree: &TreeKey,
     ) -> Result<bool> {
-        let manifest = txn.require_manifest()?;
-        if read_header(txn, manifest.logical_index_id(), tree, root_partition())
-            .await?
-            .level()
-            < self.level
-        {
-            return Ok(false);
-        }
-        let bodies = level_bodies(txn, manifest, tree, self.level).await?;
-        if !bodies
-            .iter()
-            .copied()
-            .eq(self.headers.iter().map(|(key, _)| *key))
-        {
-            return Ok(false);
-        }
-        for batch in self.headers.chunks(DISCOVERY_BODY_BATCH) {
-            let keys = batch
-                .iter()
-                .map(|&(partition, _)| LogicalKey::Header {
-                    index: manifest.logical_index_id(),
+        let manifest = txn.require_manifest()?.clone();
+        let index = manifest.logical_index_id();
+        let mut protected = txn
+            .batch_get_for_update(vec![
+                LogicalKey::Header {
+                    index,
                     tree_key: tree.clone(),
-                    partition,
-                })
-                .collect();
-            for ((_, expected), value) in batch.iter().zip(txn.batch_get_for_update(keys).await?) {
-                if expect_header(value)? != Some(*expected) {
-                    return Ok(false);
-                }
-            }
+                    partition: self.parent,
+                },
+                LogicalKey::ChildEntry {
+                    index,
+                    tree_key: tree.clone(),
+                    partition: self.parent,
+                    child: self.child,
+                },
+            ])
+            .await?
+            .into_iter();
+        let parent_header = expect_header(
+            protected
+                .next()
+                .ok_or_else(|| Error::new(ErrorKind::Backend))?,
+        )?;
+        let edge = expect_child_entry(
+            protected
+                .next()
+                .ok_or_else(|| Error::new(ErrorKind::Backend))?,
+        )?;
+        let (Some(parent_header), Some(edge)) = (parent_header, edge) else {
+            return Ok(false);
+        };
+        if edge.child() != self.child {
+            return Err(corrupt());
+        }
+        if parent_header.level() != self.level {
+            return Ok(false);
+        }
+        if self.parent == root_partition() && parent_header.state() == PartitionState::Ready {
+            return Ok(true);
+        }
+        let mut bodies = level_bodies(txn, &manifest, tree, self.level).await?;
+        if !bodies.contains(&self.parent) {
+            return Err(corrupt());
+        }
+        bodies.retain(|&body| body != self.parent);
+        if find_incoming_edge_in(txn, &manifest, tree, self.child, &bodies)
+            .await?
+            .is_some()
+        {
+            return Err(corrupt());
         }
         Ok(true)
     }

@@ -249,16 +249,23 @@ parent waits for that parent's source to finish, preserving the combined
 source/receiver graph bound. State-only transitions keep the body epoch and
 graph unchanged. Leaf membership changes do not rebuild parent graphs.
 
-For a non-root Leaf already Splitting when a step begins, the driver checks
+For a partition already Splitting when a step begins, the driver checks
 cancellation and trains from the source snapshot before waiting for graph body
 locks. Exposure uses those centroids only for the same two target Partition Keys.
 
 Participating graph bodies are guarded in Partition Key order before reading
-payloads. A waiting plan refreshes its snapshot after guard acquisition; incoming
-edge discovery then uses that snapshot. Exact publication fences remain the write
-authority across runtimes. Prepared immutable bodies enter the bounded cache only
-after known successful commit, with the committed Header epoch. Failed, cancelled
-or unknown-outcome publications cannot seed the cache.
+payloads. Incoming-edge discovery resolves the owning parent by exact
+`(parent, child)` point reads over the parent level's bodies so independent
+parents are neither co-locked nor update-protected together. A waiting plan
+refreshes its snapshot after guard acquisition and re-resolves ownership in
+that snapshot. When a guarded internal body's snapshot Header epoch and
+`GraphDescriptor` binding match an already-validated cached body, planning
+reuses those immutable projections and clones the validated native topology
+under the same working-memory admission instead of rescanning persisted entries
+and chunks; misses fall back to full snapshot scans. Exact publication fences
+remain the write authority across runtimes. Prepared immutable bodies enter the
+bounded cache only after known successful commit, with the committed Header
+epoch. Failed, cancelled or unknown-outcome publications cannot seed the cache.
 
 The [partition-local graph contract](partition-local-hnsw.md) owns the combined
 transaction/memory envelope, empty-body representation and native update policy.

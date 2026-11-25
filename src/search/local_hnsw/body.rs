@@ -78,6 +78,11 @@ impl InternalGraphBody {
         &self.children
     }
 
+    /// Validated immutable native graph topology owned by this body.
+    pub(crate) const fn graph(&self) -> &ktann_usearch::Graph {
+        &self.graph
+    }
+
     /// Validates the snapshot envelope even on a warm read. Identity includes index,
     /// tree, parent, configuration, metric, canonical children and centroids.
     pub(crate) fn matches(&self, source: GraphSource<'_>, descriptor: &GraphDescriptor) -> bool {

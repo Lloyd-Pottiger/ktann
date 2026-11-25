@@ -166,7 +166,7 @@ pub async fn drain_batch<B: Backend>(
 
 /// Discovers the first batch in the dispatch snapshot and refreshes it only
 /// when target revalidation requires a new route.
-async fn drain_observed<'b, B: Backend>(
+pub(super) async fn drain_observed<'b, B: Backend>(
     backend: &'b B,
     manifest: &IndexManifest,
     tree_key: &TreeKey,

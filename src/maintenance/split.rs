@@ -290,7 +290,7 @@ pub async fn drain_batch<B: Backend>(
 }
 
 /// Fixes the drain candidates in the snapshot that classified the source.
-async fn drain_observed<B: Backend>(
+pub(super) async fn drain_observed<B: Backend>(
     backend: &B,
     manifest: &IndexManifest,
     tree_key: &TreeKey,
@@ -612,6 +612,26 @@ pub async fn complete_split<B: Backend>(
     if manifest.config().local_graph().is_some() {
         return Err(Error::invalid_argument());
     }
+    complete_split_outcome(
+        backend,
+        manifest,
+        tree_key,
+        source,
+        started_at_unix_millis,
+        retry,
+    )
+    .await
+    .map(topology::FinalizeOutcome::into_public)
+}
+
+async fn complete_split_outcome<B: Backend>(
+    backend: &B,
+    manifest: &IndexManifest,
+    tree_key: &TreeKey,
+    source: PartitionKey,
+    started_at_unix_millis: u64,
+    retry: &RetryPolicy,
+) -> Result<topology::FinalizeOutcome> {
     let removal = topology::SourceRemoval::for_capabilities(backend.capabilities());
     writes::run_write_attempts(
         backend,
@@ -620,12 +640,13 @@ pub async fn complete_split<B: Backend>(
         retry,
         Operation::SplitFixup,
         |txn| {
-            writes::boxed_step(topology::finalize_split(
+            writes::boxed_step(topology::finalize_split_with_parent(
                 txn,
                 tree_key,
                 source,
                 started_at_unix_millis,
                 removal,
+                None,
             ))
         },
     )
@@ -669,6 +690,7 @@ pub async fn advance<B: Backend>(
         authority,
     )
     .await
+    .map(|(step, _)| step)
 }
 
 /// Runs one split step from a validated authority snapshot.
@@ -684,7 +706,7 @@ pub(crate) async fn advance_observed<B: Backend>(
     started_at_unix_millis: u64,
     retry: &RetryPolicy,
     authority: reads::PartitionRead<'_, B::ReadTxn<'_>>,
-) -> Result<Advance> {
+) -> Result<(Advance, [Option<PartitionKey>; 3])> {
     let header = authority.header;
     let state = authority.state;
     if matches!(
@@ -702,7 +724,7 @@ pub(crate) async fn advance_observed<B: Backend>(
         PartitionTransition::Ready { .. } => {
             drop(authority);
             if header.entry_count() <= manifest.config().max_partition_entries(header.level()) {
-                return Ok(Advance::Idle);
+                return Ok((Advance::Idle, [None; 3]));
             }
             match begin_split(
                 backend,
@@ -716,9 +738,9 @@ pub(crate) async fn advance_observed<B: Backend>(
             {
                 topology::SplitStart::Started { left, right }
                 | topology::SplitStart::AlreadySplitting { left, right } => {
-                    Ok(Advance::Began { left, right })
+                    Ok((Advance::Began { left, right }, [None; 3]))
                 }
-                topology::SplitStart::NotEligible => Ok(Advance::Idle),
+                topology::SplitStart::NotEligible => Ok((Advance::Idle, [None; 3])),
             }
         }
         PartitionTransition::Splitting { .. } => {
@@ -733,15 +755,17 @@ pub(crate) async fn advance_observed<B: Backend>(
             )
             .await?
             {
-                TargetExposure::Exposed { left, right } => Ok(Advance::Exposed { left, right }),
-                TargetExposure::SourceAdvanced => Ok(Advance::Idle),
+                TargetExposure::Exposed { left, right } => {
+                    Ok((Advance::Exposed { left, right }, [None; 3]))
+                }
+                TargetExposure::SourceAdvanced => Ok((Advance::Idle, [None; 3])),
             }
         }
         PartitionTransition::DrainingSplit { left, right, .. } => {
             match drain_observed(backend, manifest, tree_key, partition, retry, authority).await? {
                 DrainStep::Drained { moved, remaining } => {
                     if remaining == 0 {
-                        match complete_split(
+                        match complete_split_outcome(
                             backend,
                             manifest,
                             tree_key,
@@ -751,36 +775,53 @@ pub(crate) async fn advance_observed<B: Backend>(
                         )
                         .await?
                         {
-                            topology::SplitCompletion::Completed { parent } => {
-                                Ok(Advance::Completed {
+                            topology::FinalizeOutcome::Finalized {
+                                parent,
+                                targets,
+                                updated_parent,
+                            } => Ok((
+                                Advance::Completed {
                                     left,
                                     right,
                                     parent,
-                                })
-                            }
-                            topology::SplitCompletion::NotDraining => Ok(Advance::Completed {
-                                left,
-                                right,
-                                parent: None,
-                            }),
-                            topology::SplitCompletion::NotDrained => {
-                                Ok(Advance::Drained { moved, remaining })
+                                },
+                                super::fixup::split_followups(
+                                    manifest.config(),
+                                    left,
+                                    right,
+                                    Some((targets, updated_parent)),
+                                ),
+                            )),
+                            topology::FinalizeOutcome::AlreadyCompleted
+                            | topology::FinalizeOutcome::NotDraining => Ok((
+                                Advance::Completed {
+                                    left,
+                                    right,
+                                    parent: None,
+                                },
+                                super::fixup::split_followups(manifest.config(), left, right, None),
+                            )),
+                            topology::FinalizeOutcome::NotDrained => {
+                                Ok((Advance::Drained { moved, remaining }, [None; 3]))
                             }
                         }
                     } else {
-                        Ok(Advance::Drained { moved, remaining })
+                        Ok((Advance::Drained { moved, remaining }, [None; 3]))
                     }
                 }
-                DrainStep::SourceAdvanced => Ok(Advance::Completed {
-                    left,
-                    right,
-                    parent: None,
-                }),
-                DrainStep::NotDraining => Ok(Advance::Idle),
+                DrainStep::SourceAdvanced => Ok((
+                    Advance::Completed {
+                        left,
+                        right,
+                        parent: None,
+                    },
+                    super::fixup::split_followups(manifest.config(), left, right, None),
+                )),
+                DrainStep::NotDraining => Ok((Advance::Idle, [None; 3])),
             }
         }
         PartitionTransition::ReceivingSplit { .. } | PartitionTransition::Merging { .. } => {
-            Ok(Advance::Idle)
+            Ok((Advance::Idle, [None; 3]))
         }
     }
 }

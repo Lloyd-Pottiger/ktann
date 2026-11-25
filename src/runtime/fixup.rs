@@ -9,8 +9,8 @@
 //! Workers settle completed work, stall merges without a legal target,
 //! yield successful unfinished work to the queue tail, and retire errors or
 //! cancelled work without changing durable state. A completed split replaces
-//! its admission with bounded offers for both targets and the updated parent
-//! in one queue transition, then publishes the final backlog.
+//! its admission with bounded offers for any actionable targets or updated
+//! parent in one queue transition, then publishes the final backlog.
 //!
 //! Shutdown cancels pending work and lets an admitted bounded transaction
 //! finish. Worker lifecycle guards keep the backend alive until all workers
@@ -390,7 +390,7 @@ struct RunningFixup<'a, B: Backend> {
     inner: &'a RuntimeInner<B>,
     offer: &'a FixupOffer,
     yield_back: bool,
-    split_followups: Option<([PartitionKey; 2], Option<PartitionKey>)>,
+    split_followups: Option<[Option<PartitionKey>; 3]>,
 }
 
 impl<B: Backend> Drop for RunningFixup<'_, B> {
@@ -414,9 +414,9 @@ impl<B: Backend> Drop for RunningFixup<'_, B> {
                 let mut duplicate = 0_u64;
                 let mut saturated = 0_u64;
                 if !self.inner.maintenance_cancel.is_cancelled()
-                    && let Some((targets, parent)) = split_followups
+                    && let Some(followups) = split_followups
                 {
-                    for partition in targets.into_iter().chain(parent) {
+                    for partition in followups.into_iter().flatten() {
                         let key = FixupKey {
                             index: self.offer.key.index,
                             tree_key: self.offer.key.tree_key.clone(),
@@ -502,21 +502,20 @@ async fn drive<B: Backend>(inner: &Arc<RuntimeInner<B>>, offer: &FixupOffer) -> 
             Ok(maintenance_fixup::Advance::Idle) => {
                 return DrivenFixup::new(FixupExecution::Settled);
             }
-            Ok(maintenance_fixup::Advance::Split(split_step)) => {
+            Ok(maintenance_fixup::Advance::Split {
+                step: split_step,
+                followups,
+            }) => {
                 observe_split_step(&split_step);
                 trace::fixup_kind(&Span::current(), FixupKind::Split);
                 match split_step {
                     Ok(split::Advance::Idle) => {
                         return DrivenFixup::new(FixupExecution::Settled);
                     }
-                    Ok(split::Advance::Completed {
-                        left,
-                        right,
-                        parent,
-                    }) => {
+                    Ok(split::Advance::Completed { .. }) => {
                         return DrivenFixup {
                             execution: FixupExecution::Settled,
-                            split_followups: Some(([left, right], parent)),
+                            split_followups: Some(followups),
                         };
                     }
                     Ok(
@@ -556,7 +555,7 @@ async fn drive<B: Backend>(inner: &Arc<RuntimeInner<B>>, offer: &FixupOffer) -> 
 /// One bounded Fixup execution and any newly Ready split targets it discovered.
 struct DrivenFixup {
     execution: FixupExecution,
-    split_followups: Option<([PartitionKey; 2], Option<PartitionKey>)>,
+    split_followups: Option<[Option<PartitionKey>; 3]>,
 }
 
 impl DrivenFixup {

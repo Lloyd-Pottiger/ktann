@@ -169,9 +169,12 @@ change.
 
 [`storage::graph_transitions`](../../src/storage/graph_transitions.rs) prepares
 replacements from complete source bodies and exact proposed Headers and Child
-Entries. Absent and empty bodies are valid creation sources. Existing graph bytes
-are validated even when the target removes the graph, so deletion cannot hide
-corruption.
+Entries. Absent and empty bodies are valid creation sources. When the planning
+snapshot's Header epoch and `GraphDescriptor` binding match an already-validated
+cached `InternalGraphBody`, private preparation clones that validated native
+topology under the same `decode_bound` admission instead of rescanning and
+re-decoding persisted chunks. Uncached existing graph bytes are validated even
+when the target removes the graph, so deletion cannot hide corruption.
 
 Topology maintenance changes child sets without changing surviving centroids:
 
