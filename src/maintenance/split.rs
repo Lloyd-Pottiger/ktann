@@ -50,7 +50,8 @@ use crate::runtime::{reads, writes};
 use crate::storage::backend::{Backend, WriteTxn};
 use crate::storage::keys::{LogicalKey, TreeKey};
 use crate::storage::values::{
-    IndexManifest, PartitionCentroid, PartitionTransition, expect_centroid, expect_header,
+    IndexManifest, PartitionCentroid, PartitionTransition, PersistentValue, expect_centroid,
+    expect_drain_header, expect_header,
 };
 use crate::storage::{WriteLogicalTxn, topology};
 
@@ -323,13 +324,32 @@ async fn drain_observed<B: Backend>(
             remaining: 0,
         });
     };
+    // Target centroids are immutable once exposed (ADR 0014): read them once
+    // from this snapshot so write attempts and retries skip centroid round trips.
+    let index = manifest.logical_index_id();
+    let mut centroid_values = read
+        .batch_get(
+            [left, right]
+                .map(|partition| LogicalKey::Centroid {
+                    index,
+                    tree_key: tree_key.clone(),
+                    partition,
+                })
+                .into(),
+        )
+        .await?
+        .into_iter();
+    let (left_centroid, right_centroid) =
+        take_required_pair(&mut centroid_values, expect_centroid)?;
     drop(read);
 
     let plan = DrainPlan {
         batch,
         kernel: routing::kernel_for(manifest)?,
         left,
+        left_centroid,
         right,
+        right_centroid,
     };
     let step = writes::run_write_attempts(
         backend,
@@ -352,7 +372,9 @@ struct DrainPlan {
     batch: DrainBatch,
     kernel: crate::search::numeric::VectorKernel,
     left: PartitionKey,
+    left_centroid: PartitionCentroid,
     right: PartitionKey,
+    right_centroid: PartitionCentroid,
 }
 
 /// Runs one drain attempt inside the attempt transaction.
@@ -363,9 +385,80 @@ async fn drain_attempt<T: WriteTxn>(
     source: PartitionKey,
     plan: &DrainPlan,
 ) -> Result<DrainStep> {
-    // Revalidate the durable state before moving anything; one batched
-    // update-protected read covers both source authority values.
     let index = manifest.logical_index_id();
+    // Warm every update-protected key this attempt reads in one backend call,
+    // avoiding sequential round trips across validation, candidate reads, and
+    // relocation. For leaves, target authority warms `State` + `DrainHeader` +
+    // `DrainSynopsis` without locking target `Header` or `Synopsis`, avoiding
+    // conflicts with concurrent foreground writes.
+    let mut warm_keys = Vec::with_capacity(match &plan.batch {
+        DrainBatch::Leaf(candidates) => 8 + candidates.len() * 2,
+        DrainBatch::Child(children) => 4 + children.len(),
+    });
+    warm_keys.push(LogicalKey::Header {
+        index,
+        tree_key: tree_key.clone(),
+        partition: source,
+    });
+    warm_keys.push(LogicalKey::State {
+        index,
+        tree_key: tree_key.clone(),
+        partition: source,
+    });
+    match &plan.batch {
+        DrainBatch::Leaf(candidates) => {
+            for target in [plan.left, plan.right] {
+                warm_keys.push(LogicalKey::State {
+                    index,
+                    tree_key: tree_key.clone(),
+                    partition: target,
+                });
+                warm_keys.push(LogicalKey::DrainHeader {
+                    index,
+                    tree_key: tree_key.clone(),
+                    partition: target,
+                });
+                warm_keys.push(LogicalKey::DrainSynopsis {
+                    index,
+                    tree_key: tree_key.clone(),
+                    partition: target,
+                });
+            }
+            for (partition, id) in candidates {
+                warm_keys.push(LogicalKey::LeafEntry {
+                    index,
+                    tree_key: tree_key.clone(),
+                    partition: *partition,
+                    id: id.clone(),
+                });
+                warm_keys.push(LogicalKey::Location {
+                    index,
+                    id: id.clone(),
+                });
+            }
+        }
+        DrainBatch::Child(children) => {
+            for target in [plan.left, plan.right] {
+                warm_keys.push(LogicalKey::Header {
+                    index,
+                    tree_key: tree_key.clone(),
+                    partition: target,
+                });
+            }
+            for &child in children {
+                warm_keys.push(LogicalKey::ChildEntry {
+                    index,
+                    tree_key: tree_key.clone(),
+                    partition: source,
+                    child,
+                });
+            }
+        }
+    }
+    txn.warm_for_update(warm_keys).await?;
+
+    // Revalidate the durable state before touching target metadata; served
+    // from the warmed transaction-local cache.
     let Some((source_header, state)) =
         topology::authority_for_update(txn, index, tree_key, source).await?
     else {
@@ -383,62 +476,74 @@ async fn drain_attempt<T: WriteTxn>(
         _ => return Ok(DrainStep::SourceAdvanced),
     }
 
-    // Protect the exact target counts that shape this batch; relocation reuses
-    // these cached Headers through commit. The immutable centroid reads stay
-    // plain so unrelated target lifecycle work does not add conflicts.
-    let mut header_values = txn
-        .batch_get_for_update(
-            [plan.left, plan.right]
-                .map(|partition| LogicalKey::Header {
+    let (left_count, right_count) = match &plan.batch {
+        DrainBatch::Leaf(candidates) => {
+            let mut drain_values = txn
+                .batch_get_for_update(
+                    [plan.left, plan.right]
+                        .map(|partition| LogicalKey::DrainHeader {
+                            index,
+                            tree_key: tree_key.clone(),
+                            partition,
+                        })
+                        .into(),
+                )
+                .await?
+                .into_iter();
+            let (left_drain, right_drain) =
+                take_required_pair(&mut drain_values, expect_drain_header)?;
+            // Warm target primary Headers (for SplitBalance hints) together with
+            // candidate Vector Records in one plain snapshot batch without
+            // adding foreground conflicts or decoding records twice.
+            let target_header_keys = [plan.left, plan.right].map(|partition| LogicalKey::Header {
+                index,
+                tree_key: tree_key.clone(),
+                partition,
+            });
+            let mut snapshot_keys = Vec::with_capacity(2 + candidates.len());
+            snapshot_keys.extend(target_header_keys.iter().cloned());
+            for (_, id) in candidates {
+                snapshot_keys.push(LogicalKey::Record {
                     index,
-                    tree_key: tree_key.clone(),
-                    partition,
-                })
-                .into(),
-        )
-        .await?
-        .into_iter();
-    let (Some(left_header_value), Some(right_header_value)) =
-        (header_values.next(), header_values.next())
-    else {
-        // The typed batch read returns exactly one value per input key.
-        return Err(Error::new(ErrorKind::Backend));
-    };
-    let (Some(left_header), Some(right_header)) = (
-        expect_header(left_header_value)?,
-        expect_header(right_header_value)?,
-    ) else {
-        return Err(Error::new(ErrorKind::Corruption));
-    };
-
-    let mut centroid_values = txn
-        .batch_get(
-            [plan.left, plan.right]
-                .map(|partition| LogicalKey::Centroid {
-                    index,
-                    tree_key: tree_key.clone(),
-                    partition,
-                })
-                .into(),
-        )
-        .await?
-        .into_iter();
-    let (Some(left_centroid_value), Some(right_centroid_value)) =
-        (centroid_values.next(), centroid_values.next())
-    else {
-        return Err(Error::new(ErrorKind::Backend));
-    };
-    let (Some(left_centroid), Some(right_centroid)) = (
-        expect_centroid(left_centroid_value)?,
-        expect_centroid(right_centroid_value)?,
-    ) else {
-        return Err(Error::new(ErrorKind::Corruption));
+                    id: id.clone(),
+                });
+            }
+            txn.warm(snapshot_keys).await?;
+            let mut header_values = txn.batch_get(target_header_keys.into()).await?.into_iter();
+            let (left_header, right_header) =
+                take_required_pair(&mut header_values, expect_header)?;
+            (
+                left_header
+                    .entry_count()
+                    .saturating_add(left_drain.entry_count()),
+                right_header
+                    .entry_count()
+                    .saturating_add(right_drain.entry_count()),
+            )
+        }
+        DrainBatch::Child(_) => {
+            let mut header_values = txn
+                .batch_get_for_update(
+                    [plan.left, plan.right]
+                        .map(|partition| LogicalKey::Header {
+                            index,
+                            tree_key: tree_key.clone(),
+                            partition,
+                        })
+                        .into(),
+                )
+                .await?
+                .into_iter();
+            let (left_header, right_header) =
+                take_required_pair(&mut header_values, expect_header)?;
+            (left_header.entry_count(), right_header.entry_count())
+        }
     };
 
     let mut balance = SplitBalance::new(
         source_header.entry_count(),
-        left_header.entry_count(),
-        right_header.entry_count(),
+        left_count,
+        right_count,
         manifest
             .config()
             .min_partition_entries(source_header.level()),
@@ -448,9 +553,9 @@ async fn drain_attempt<T: WriteTxn>(
             &plan.kernel,
             vector,
             plan.left,
-            &left_centroid,
+            &plan.left_centroid,
             plan.right,
-            &right_centroid,
+            &plan.right_centroid,
             &mut balance,
         )
     };
@@ -477,6 +582,20 @@ async fn drain_attempt<T: WriteTxn>(
         .checked_sub(u32::try_from(moved).map_err(|_| Error::new(ErrorKind::Corruption))?)
         .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
     Ok(DrainStep::Drained { moved, remaining })
+}
+
+/// Extracts a required `(left, right)` pair from the head of a batch-read iterator.
+fn take_required_pair<T>(
+    values: &mut impl Iterator<Item = Option<PersistentValue>>,
+    expect: fn(Option<PersistentValue>) -> Result<Option<T>>,
+) -> Result<(T, T)> {
+    let (Some(left), Some(right)) = (values.next(), values.next()) else {
+        return Err(Error::new(ErrorKind::Backend));
+    };
+    match (expect(left)?, expect(right)?) {
+        (Some(left), Some(right)) => Ok((left, right)),
+        _ => Err(Error::new(ErrorKind::Corruption)),
+    }
 }
 
 /// Runs [`topology::finalize_split`] as one bounded whole-retrying step,

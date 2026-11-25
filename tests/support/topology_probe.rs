@@ -14,8 +14,8 @@ use ktann::runtime::{RetryPolicy, Runtime};
 use ktann::storage::backend::{AdmissionBudget, Capabilities, ScanLimits, WriteTxn};
 use ktann::storage::keys::{LogicalKey, TreeKey};
 use ktann::storage::values::{
-    ChildEntry, IndexManifest, LeafEntry, PartitionCentroid, PartitionHeader, PartitionState,
-    PartitionSynopsis, PartitionTransition, PersistentValue, RecordLocation,
+    ChildEntry, DrainHeader, IndexManifest, LeafEntry, PartitionCentroid, PartitionHeader,
+    PartitionState, PartitionSynopsis, PartitionTransition, PersistentValue, RecordLocation,
 };
 use ktann::storage::{LogicalRange, WriteLogicalTxn};
 
@@ -179,6 +179,50 @@ pub async fn synopsis_of(
         Some(PersistentValue::PartitionSynopsis(synopsis)) => Some(synopsis),
         None => None,
         other => panic!("wrong synopsis kind: {other:?}"),
+    }
+}
+
+pub async fn drain_header_of(
+    backend: &MemoryBackend,
+    manifest: &IndexManifest,
+    key: &TreeKey,
+    partition: PartitionKey,
+) -> Option<DrainHeader> {
+    match read_txn(backend, manifest)
+        .await
+        .get(LogicalKey::DrainHeader {
+            index: manifest.logical_index_id(),
+            tree_key: key.clone(),
+            partition,
+        })
+        .await
+        .expect("read drain header")
+    {
+        Some(PersistentValue::DrainHeader(header)) => Some(header),
+        None => None,
+        other => panic!("wrong drain header kind: {other:?}"),
+    }
+}
+
+pub async fn drain_synopsis_of(
+    backend: &MemoryBackend,
+    manifest: &IndexManifest,
+    key: &TreeKey,
+    partition: PartitionKey,
+) -> Option<PartitionSynopsis> {
+    match read_txn(backend, manifest)
+        .await
+        .get(LogicalKey::DrainSynopsis {
+            index: manifest.logical_index_id(),
+            tree_key: key.clone(),
+            partition,
+        })
+        .await
+        .expect("read drain synopsis")
+    {
+        Some(PersistentValue::PartitionSynopsis(synopsis)) => Some(synopsis),
+        None => None,
+        other => panic!("wrong drain synopsis kind: {other:?}"),
     }
 }
 
@@ -383,12 +427,34 @@ pub async fn reachable_leaves(
         }
         if header.level() == 1 {
             let entries = scan_leaf_entries(backend, manifest, key, partition).await;
+            let effective = if header.state() == PartitionState::ReceivingSplit {
+                let drain = drain_header_of(backend, manifest, key, partition)
+                    .await
+                    .unwrap_or_else(|| {
+                        panic!("ReceivingSplit leaf {partition:?} must have a DrainHeader")
+                    });
+                PartitionHeader::new(
+                    header.level(),
+                    header.entry_count() + drain.entry_count(),
+                    header.cache_epoch() + drain.cache_epoch(),
+                    header.state(),
+                )
+                .expect("effective header")
+            } else {
+                assert!(
+                    drain_header_of(backend, manifest, key, partition)
+                        .await
+                        .is_none(),
+                    "non-ReceivingSplit leaf {partition:?} must not have a DrainHeader"
+                );
+                header
+            };
             assert_eq!(
-                header.entry_count() as usize,
+                effective.entry_count() as usize,
                 entries.len(),
                 "exact leaf entry count"
             );
-            leaves.insert(partition, header);
+            leaves.insert(partition, effective);
         } else {
             let children = scan_child_entries(backend, manifest, key, partition).await;
             assert_eq!(

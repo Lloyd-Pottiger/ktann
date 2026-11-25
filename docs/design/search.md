@@ -215,7 +215,13 @@ search, not a promise of equal recall across filters or of returning k hits.
 Traversal batches snapshot Header reads for a funded prefix of up to 1024
 non-root partitions, including leaves. Filtered leaf visits include their
 Synopses in the same batch, with at most 2048 logical keys per request; adapters
-chunk requests at their own point-read ceilings. Visits, body loads,
+chunk requests at their own point-read ceilings. Steady-state `Ready` leaves
+require no further metadata reads; only a level-1 `ReceivingSplit` leaf
+additionally reads its `DrainHeader` (and `DrainSynopsis` when a predicate is
+present) in the same snapshot to derive its exact combined entry count
+(`header.entry_count + drain.entry_count`), strictly monotonic cache-validation
+epoch (`header.cache_epoch + drain.cache_epoch`), and conservative unioned
+Synopsis. Visits, body loads,
 candidate selection, and budget accounting retain their original order. Roots
 are read individually because their transition state can inject split targets
 ahead of the queued work. Batching changes backend scheduling, not the selected

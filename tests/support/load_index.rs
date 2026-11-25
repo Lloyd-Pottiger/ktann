@@ -27,8 +27,9 @@ use ktann::api::{Index, Mutation, PartitionKey, Record};
 use ktann::storage::backend::Backend;
 use ktann::storage::keys::{LogicalKey, TreeKey};
 use ktann::storage::values::{
-    ChildEntry, IndexManifest, LeafEntry, PartitionCentroid, PartitionHeader, PartitionState,
-    PartitionSynopsis, PartitionTransition, PersistentValue, RecordLocation, TreeManifest,
+    ChildEntry, DrainHeader, IndexManifest, LeafEntry, PartitionCentroid, PartitionHeader,
+    PartitionState, PartitionSynopsis, PartitionTransition, PersistentValue, RecordLocation,
+    TreeManifest,
 };
 use ktann::storage::{LogicalRange, ReadLogicalTxn, WriteLogicalTxn, tree_manifest};
 
@@ -542,6 +543,28 @@ pub async fn install(
             )
             .await
             .expect("write synopsis");
+            if transition.state() == PartitionState::ReceivingSplit {
+                txn.put(
+                    LogicalKey::DrainHeader {
+                        index: iid,
+                        tree_key: tree_key.clone(),
+                        partition: key,
+                    },
+                    PersistentValue::DrainHeader(DrainHeader::empty()),
+                )
+                .await
+                .expect("write drain header");
+                txn.put(
+                    LogicalKey::DrainSynopsis {
+                        index: iid,
+                        tree_key: tree_key.clone(),
+                        partition: key,
+                    },
+                    PersistentValue::PartitionSynopsis(PartitionSynopsis::empty(&manifest)),
+                )
+                .await
+                .expect("write drain synopsis");
+            }
         } else if key == root {
             // A root that becomes internal leaves its leaf-only Synopsis stale.
             txn.delete(LogicalKey::Synopsis {

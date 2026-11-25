@@ -102,9 +102,11 @@ source is empty — so every committed split state can always advance.
 
 One exposure transaction then
 unique-creates both targets as `ReceivingSplit { source }` with their persisted
-centroids, installs both Child Entries into the source's current parent (for a
-non-root split), and advances the source to `DrainingSplit { left, right }`
-atomically, so no committed state holds a partially exposed split. Exposure
+centroids (and, for level-1 leaves, empty `DrainHeader` and `DrainSynopsis`
+sidecar keys alongside the primary `Header` and `Synopsis`), installs both Child
+Entries into the source's current parent (for a non-root split), and advances
+the source to `DrainingSplit { left, right }` atomically, so no committed state
+holds a partially exposed split. Exposure
 update-protects the source authority pair and the current incoming topology so
 a stale worker cannot recreate a target after completion, and a Splitting
 source with an already-installed target fails closed as a torn committed state.
@@ -119,7 +121,12 @@ write transaction and re-reads each entry and its authoritative routing data.
 For every remaining entry it deterministically chooses a target, uniquely
 inserts the target entry, deletes the source entry, and updates both exact
 counts and cache epochs. Leaf movement also updates Record Location and target
-Synopsis. A concurrently removed entry is skipped; any remaining membership
+Synopsis. For level-1 split draining, target updates write to each
+`ReceivingSplit` target's `DrainHeader` and `DrainSynopsis` sidecars while
+validating target state through `State` alone — leaving the target's primary
+`Header` and `Synopsis` uncontended for concurrent foreground writes. All
+absence checks and mutations within a relocation batch share single batched
+backend calls. A concurrently removed entry is skipped; any remaining membership
 mismatch is Corruption.
 
 The leaf page first derives the largest batch whose exact worst-case relocation
@@ -135,21 +142,32 @@ write Record Locations or Synopses.
 Drain placement normally chooses the nearer persisted target centroid. Exact
 remaining and target counts reserve the last entries needed for each target to
 reach the source level's configured minimum when the source has enough entries, crediting
-entries already redirected into the targets. Thus duplicate-heavy routing
+entries already redirected into the targets (reading level-1 target primary
+Headers without update protection and summing them with update-protected
+`DrainHeader` counts so balance hints do not contend with foreground writes). Thus duplicate-heavy routing
 cannot immediately merge a small target back into its oversized source, while
 ordinary inputs retain the distance-based placement learned by balanced
 training. If concurrent deletes make both minima unattainable, nearest routing
 continues and the normal merge protocol converges the undersized result.
 
-New inserts route to the nearer target. Upsert relocates a source membership;
-delete follows exact Record Location. Traversal visits the source plus both
-targets while draining, so the state remains searchable if no worker runs again.
+New inserts route to the nearer target and update only its primary `Header` and
+`Synopsis`. Upsert relocates a source membership; delete and cross-leaf
+move-out follow exact Record Location, decrementing the leaf's primary `Header`
+while its count is positive and falling through to `DrainHeader` only when a
+`ReceivingSplit` leaf's primary count is already zero. Traversal visits the
+source plus both targets while draining, so the state remains searchable if no
+worker runs again.
 
 ### 4.3 Complete
 
 Exact source Header count zero is the sole proof that structural draining is
 complete; no entry rescan is performed. For a non-root source, completion finds
-and validates its unique incoming Child Entry. With transactional range clear,
+and validates its unique incoming Child Entry. For a level-1 split, completion
+atomically folds each target's `DrainHeader` into its primary `Header`
+(`entry_count = header.entry_count + drain.entry_count`,
+`cache_epoch = header.cache_epoch + drain.cache_epoch + 1`), merges
+`DrainSynopsis` into `Synopsis` (exact semilattice union), and deletes both
+sidecar keys as both targets become `Ready`. With transactional range clear,
 one final transaction switches topology, promotes both targets to Ready, and
 removes the source prefix. Without that capability, the exact zero count proves
 the entry ranges empty without a rescan — the source prefix holds only its

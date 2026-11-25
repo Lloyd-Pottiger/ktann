@@ -184,7 +184,42 @@ async fn read_partition_header<T: ReadOps>(
                     transition.state()
                 ));
             }
-            Ok((header, transition))
+            let effective_header =
+                if header.level() == 1 && header.state() == PartitionState::ReceivingSplit {
+                    let drain = match txn
+                        .get(LogicalKey::DrainHeader {
+                            index: manifest.logical_index_id(),
+                            tree_key: tree_key.clone(),
+                            partition,
+                        })
+                        .await
+                        .map_err(|error| format!("read drain header: {error:?}"))?
+                    {
+                        Some(PersistentValue::DrainHeader(drain)) => drain,
+                        other => {
+                            return Err(format!(
+                                "ReceivingSplit leaf {} drain header must exist, got {other:?}",
+                                partition.get()
+                            ));
+                        }
+                    };
+                    PartitionHeader::new(
+                        header.level(),
+                        header
+                            .entry_count()
+                            .checked_add(drain.entry_count())
+                            .ok_or_else(|| "combined entry count overflow".to_owned())?,
+                        header
+                            .cache_epoch()
+                            .checked_add(drain.cache_epoch())
+                            .ok_or_else(|| "combined cache epoch overflow".to_owned())?,
+                        header.state(),
+                    )
+                    .map_err(|error| format!("effective header: {error:?}"))?
+                } else {
+                    header
+                };
+            Ok((effective_header, transition))
         }
         other => Err(format!(
             "partition {} state must exist, got {other:?}",

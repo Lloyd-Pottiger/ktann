@@ -4,18 +4,18 @@
 use crate::api::{Error, ErrorKind, PartitionKey, Result};
 use crate::storage::backend::{Capabilities, WriteTxn};
 use crate::storage::keys::{LogicalKey, TreeKey};
-use crate::storage::membership::{added_entry, expect_inserted, removed_entry, touched_entry};
+use crate::storage::membership::{added_entry, removed_entry, touched_entry};
 use crate::storage::tree_manifest::reserve_partition_keys;
 use crate::storage::values::{
-    ChildEntry, IndexManifest, PartitionCentroid, PartitionHeader, PartitionState,
+    ChildEntry, DrainHeader, IndexManifest, PartitionCentroid, PartitionHeader, PartitionState,
     PartitionSynopsis, PartitionTransition, PersistentValue, expect_centroid, expect_child_entry,
-    expect_header, expect_state,
+    expect_drain_header, expect_header, expect_state, expect_synopsis,
 };
-use crate::storage::{LogicalRange, WriteLogicalTxn};
+use crate::storage::{LogicalRange, MutationBuilder, WriteLogicalTxn};
 
 use super::authority::{authority_keys, authority_pair, expect_agreement};
 use super::discovery::{lock_incoming_edge, same_level_candidates};
-use super::{corrupt, root_partition};
+use super::{corrupt, expect_all_absent, root_partition};
 
 /// The number of split targets one split reserves and exposes; binary fanout
 /// is a fixed persistent format protocol choice.
@@ -135,20 +135,20 @@ pub async fn begin_split<T: WriteTxn>(
     let left = reservation.next();
     let right = reservation.last();
 
-    txn.put(
+    let mut mutations = txn.mutations();
+    mutations.put(
         state_key,
         PersistentValue::PartitionState(PartitionTransition::Splitting {
             left,
             right,
             started_at_unix_millis,
         }),
-    )
-    .await?;
-    txn.put(
+    )?;
+    mutations.put(
         header_key,
         PersistentValue::PartitionHeader(with_state(header, PartitionState::Splitting)?),
-    )
-    .await?;
+    )?;
+    txn.apply(mutations).await?;
     Ok(SplitStart::Started { left, right })
 }
 
@@ -283,99 +283,135 @@ pub(crate) async fn expose_split_targets_with_parent<T: WriteTxn>(
         Some((parent, parent_header))
     };
 
-    // Every key of each target partition is a unique insert: under atomic
-    // exposure the partition cannot exist yet and Partition Keys are never
-    // reused, so an existing key is a torn committed state.
+    // Every key of each target partition must be absent: under atomic exposure
+    // the partition cannot exist yet and Partition Keys are never reused, so
+    // an existing key is a torn committed state. Verify all unique keys in one
+    // batched update-protected read, then stage every mutation in one batch.
+    let mut unique_keys = Vec::with_capacity(if level == 1 { 14 } else { 8 });
+    for target in [left, right] {
+        let (target_header_key, target_state_key) = authority_keys(index, tree_key, target);
+        unique_keys.push(target_header_key);
+        unique_keys.push(target_state_key);
+        unique_keys.push(LogicalKey::Centroid {
+            index,
+            tree_key: tree_key.clone(),
+            partition: target,
+        });
+        if level == 1 {
+            unique_keys.push(LogicalKey::Synopsis {
+                index,
+                tree_key: tree_key.clone(),
+                partition: target,
+            });
+            unique_keys.push(LogicalKey::DrainHeader {
+                index,
+                tree_key: tree_key.clone(),
+                partition: target,
+            });
+            unique_keys.push(LogicalKey::DrainSynopsis {
+                index,
+                tree_key: tree_key.clone(),
+                partition: target,
+            });
+        }
+        if let Some((parent, _)) = &parent {
+            unique_keys.push(LogicalKey::ChildEntry {
+                index,
+                tree_key: tree_key.clone(),
+                partition: *parent,
+                child: target,
+            });
+        }
+    }
+    expect_all_absent(txn, unique_keys).await?;
+
+    let mut mutations = txn.mutations();
     for (target, centroid) in [(left, left_centroid), (right, right_centroid)] {
         let (target_header_key, target_state_key) = authority_keys(index, tree_key, target);
-        expect_inserted(
-            txn.insert(
-                target_header_key,
-                PersistentValue::PartitionHeader(
-                    PartitionHeader::new(level, 0, 0, PartitionState::ReceivingSplit)
-                        .map_err(|_| corrupt())?,
-                ),
-            )
-            .await?,
+        mutations.put(
+            target_header_key,
+            PersistentValue::PartitionHeader(
+                PartitionHeader::new(level, 0, 0, PartitionState::ReceivingSplit)
+                    .map_err(|_| corrupt())?,
+            ),
         )?;
-        expect_inserted(
-            txn.insert(
-                target_state_key,
-                PersistentValue::PartitionState(PartitionTransition::ReceivingSplit {
-                    source,
-                    started_at_unix_millis,
-                }),
-            )
-            .await?,
+        mutations.put(
+            target_state_key,
+            PersistentValue::PartitionState(PartitionTransition::ReceivingSplit {
+                source,
+                started_at_unix_millis,
+            }),
         )?;
-        expect_inserted(
-            txn.insert(
-                LogicalKey::Centroid {
+        mutations.put(
+            LogicalKey::Centroid {
+                index,
+                tree_key: tree_key.clone(),
+                partition: target,
+            },
+            PersistentValue::PartitionCentroid(centroid.clone()),
+        )?;
+        if level == 1 {
+            mutations.put(
+                LogicalKey::Synopsis {
                     index,
                     tree_key: tree_key.clone(),
                     partition: target,
                 },
-                PersistentValue::PartitionCentroid(centroid.clone()),
-            )
-            .await?,
-        )?;
-        if level == 1 {
-            expect_inserted(
-                txn.insert(
-                    LogicalKey::Synopsis {
-                        index,
-                        tree_key: tree_key.clone(),
-                        partition: target,
-                    },
-                    PersistentValue::PartitionSynopsis(PartitionSynopsis::empty(manifest)),
-                )
-                .await?,
+                PersistentValue::PartitionSynopsis(PartitionSynopsis::empty(manifest)),
+            )?;
+            mutations.put(
+                LogicalKey::DrainHeader {
+                    index,
+                    tree_key: tree_key.clone(),
+                    partition: target,
+                },
+                PersistentValue::DrainHeader(DrainHeader::empty()),
+            )?;
+            mutations.put(
+                LogicalKey::DrainSynopsis {
+                    index,
+                    tree_key: tree_key.clone(),
+                    partition: target,
+                },
+                PersistentValue::PartitionSynopsis(PartitionSynopsis::empty(manifest)),
             )?;
         }
         if let Some((parent, _)) = &parent {
-            expect_inserted(
-                txn.insert(
-                    LogicalKey::ChildEntry {
-                        index,
-                        tree_key: tree_key.clone(),
-                        partition: *parent,
-                        child: target,
-                    },
-                    PersistentValue::ChildEntry(ChildEntry::from_centroid(
-                        target,
-                        centroid.clone(),
-                    )),
-                )
-                .await?,
+            mutations.put(
+                LogicalKey::ChildEntry {
+                    index,
+                    tree_key: tree_key.clone(),
+                    partition: *parent,
+                    child: target,
+                },
+                PersistentValue::ChildEntry(ChildEntry::from_centroid(target, centroid.clone())),
             )?;
         }
     }
     if let Some((parent, parent_header)) = parent {
-        txn.put(
+        mutations.put(
             LogicalKey::Header {
                 index,
                 tree_key: tree_key.clone(),
                 partition: parent,
             },
             PersistentValue::PartitionHeader(added_entry(added_entry(parent_header)?)?),
-        )
-        .await?;
+        )?;
     }
 
-    txn.put(
+    mutations.put(
         source_state_key,
         PersistentValue::PartitionState(PartitionTransition::DrainingSplit {
             left,
             right,
             started_at_unix_millis,
         }),
-    )
-    .await?;
-    txn.put(
+    )?;
+    mutations.put(
         source_header_key,
         PersistentValue::PartitionHeader(with_state(source_header, PartitionState::DrainingSplit)?),
-    )
-    .await?;
+    )?;
+    txn.apply(mutations).await?;
     Ok(SplitExposure::Exposed)
 }
 
@@ -462,21 +498,20 @@ pub(crate) async fn update_centroid<T: WriteTxn>(
         return Ok(());
     }
     let parent_header = touched_entry(parent_header)?;
-    txn.put(
+    let mut mutations = txn.mutations();
+    mutations.put(
         centroid_key,
         PersistentValue::PartitionCentroid(centroid.clone()),
-    )
-    .await?;
-    txn.put(
+    )?;
+    mutations.put(
         edge_key,
         PersistentValue::ChildEntry(ChildEntry::from_centroid(partition, centroid)),
-    )
-    .await?;
-    txn.put(
+    )?;
+    mutations.put(
         parent_header_key,
         PersistentValue::PartitionHeader(parent_header),
-    )
-    .await?;
+    )?;
+    txn.apply(mutations).await?;
     Ok(())
 }
 
@@ -510,7 +545,9 @@ impl SourceRemoval {
 /// The exact update-protected source Header count is the sole proof of
 /// emptiness; no entry scan is repeated (ADR 0014). The transaction
 /// revalidates the `DrainingSplit { left, right }` state, promotes both
-/// targets from `ReceivingSplit` to `Ready`, and switches the topology:
+/// targets from `ReceivingSplit` to `Ready` (folding level-1 target
+/// `DrainHeader` and `DrainSynopsis` sidecars into their primary keys and
+/// deleting both sidecars), and switches the topology:
 ///
 /// - **Non-root**: the source's unique incoming Child Entry — rediscovered by
 ///   an exact bounded root-down scan and update-protected — is removed with
@@ -566,18 +603,39 @@ pub(crate) async fn finalize_split_with_parent<T: WriteTxn>(
 
     // Promote both targets; a target in any other state contradicts the
     // committed DrainingSplit source and is Corruption. One update-protected
-    // batch reads both targets' authority values.
-    let target_keys = [left, right].map(|target| authority_keys(index, tree_key, target));
+    // batch reads both targets' authority values and, for level-1 leaves,
+    // their Drain Header, Synopsis, and Drain Synopsis to fold back into the
+    // primary keys.
+    let mut target_read_keys = Vec::with_capacity(if level == 1 { 10 } else { 4 });
+    for target in [left, right] {
+        let (target_header_key, target_state_key) = authority_keys(index, tree_key, target);
+        target_read_keys.push(target_state_key);
+        target_read_keys.push(target_header_key);
+        if level == 1 {
+            target_read_keys.push(LogicalKey::DrainHeader {
+                index,
+                tree_key: tree_key.clone(),
+                partition: target,
+            });
+            target_read_keys.push(LogicalKey::Synopsis {
+                index,
+                tree_key: tree_key.clone(),
+                partition: target,
+            });
+            target_read_keys.push(LogicalKey::DrainSynopsis {
+                index,
+                tree_key: tree_key.clone(),
+                partition: target,
+            });
+        }
+    }
     let mut target_values = txn
-        .batch_get_for_update(vec![
-            target_keys[0].1.clone(),
-            target_keys[0].0.clone(),
-            target_keys[1].1.clone(),
-            target_keys[1].0.clone(),
-        ])
+        .batch_get_for_update(target_read_keys)
         .await?
         .into_iter();
-    for (target_header_key, target_state_key) in target_keys {
+    let mut mutations = txn.mutations();
+    for target in [left, right] {
+        let (target_header_key, target_state_key) = authority_keys(index, tree_key, target);
         let (Some(state_value), Some(header_value)) = (target_values.next(), target_values.next())
         else {
             // The typed batch read returns exactly one value per input key.
@@ -593,18 +651,54 @@ pub(crate) async fn finalize_split_with_parent<T: WriteTxn>(
         if target_header.level() != level {
             return Err(corrupt());
         }
-        txn.put(
+        let promoted_target_header = if level == 1 {
+            let (Some(drain_header_value), Some(synopsis_value), Some(drain_synopsis_value)) = (
+                target_values.next(),
+                target_values.next(),
+                target_values.next(),
+            ) else {
+                return Err(Error::new(ErrorKind::Backend));
+            };
+            let drain_header = expect_drain_header(drain_header_value)?.ok_or_else(corrupt)?;
+            let mut synopsis = expect_synopsis(synopsis_value)?.ok_or_else(corrupt)?;
+            let drain_synopsis = expect_synopsis(drain_synopsis_value)?.ok_or_else(corrupt)?;
+            if synopsis
+                .merge(manifest, &drain_synopsis)
+                .map_err(|_| corrupt())?
+            {
+                mutations.put(
+                    LogicalKey::Synopsis {
+                        index,
+                        tree_key: tree_key.clone(),
+                        partition: target,
+                    },
+                    PersistentValue::PartitionSynopsis(synopsis),
+                )?;
+            }
+            mutations.delete(LogicalKey::DrainHeader {
+                index,
+                tree_key: tree_key.clone(),
+                partition: target,
+            })?;
+            mutations.delete(LogicalKey::DrainSynopsis {
+                index,
+                tree_key: tree_key.clone(),
+                partition: target,
+            })?;
+            target_header.fold_drain_to_ready(drain_header)?
+        } else {
+            with_state(target_header, PartitionState::Ready)?
+        };
+        mutations.put(
             target_state_key,
             PersistentValue::PartitionState(PartitionTransition::Ready {
                 started_at_unix_millis,
             }),
-        )
-        .await?;
-        txn.put(
+        )?;
+        mutations.put(
             target_header_key,
-            PersistentValue::PartitionHeader(with_state(target_header, PartitionState::Ready)?),
-        )
-        .await?;
+            PersistentValue::PartitionHeader(promoted_target_header),
+        )?;
     }
 
     if source == root_partition() {
@@ -623,39 +717,34 @@ pub(crate) async fn finalize_split_with_parent<T: WriteTxn>(
             )
             .await?
             .into_iter();
+        let child_keys = [left, right].map(|target| LogicalKey::ChildEntry {
+            index,
+            tree_key: tree_key.clone(),
+            partition: root_partition(),
+            child: target,
+        });
+        // The drained root holds no entries, so both Child Entries must be
+        // absent.
+        expect_all_absent(txn, child_keys.to_vec()).await?;
         let mut promoted = header;
-        for target in [left, right] {
+        for (target, child_key) in [left, right].into_iter().zip(child_keys) {
             let Some(centroid_value) = centroids.next() else {
                 // The typed batch read returns exactly one value per input key.
                 return Err(Error::new(ErrorKind::Backend));
             };
             let centroid = expect_centroid(centroid_value)?.ok_or_else(corrupt)?;
-            // The drained root holds no entries, so both Child Entries are
-            // unique inserts.
-            expect_inserted(
-                txn.insert(
-                    LogicalKey::ChildEntry {
-                        index,
-                        tree_key: tree_key.clone(),
-                        partition: root_partition(),
-                        child: target,
-                    },
-                    PersistentValue::ChildEntry(ChildEntry::from_centroid(
-                        target,
-                        centroid.clone(),
-                    )),
-                )
-                .await?,
+            mutations.put(
+                child_key,
+                PersistentValue::ChildEntry(ChildEntry::from_centroid(target, centroid)),
             )?;
             promoted = added_entry(promoted)?;
         }
         // The leaf root's Synopsis is obsolete one level up.
-        txn.delete(LogicalKey::Synopsis {
+        mutations.delete(LogicalKey::Synopsis {
             index,
             tree_key: tree_key.clone(),
             partition: root_partition(),
-        })
-        .await?;
+        })?;
         let promoted = PartitionHeader::new(
             promoted.level().checked_add(1).ok_or_else(corrupt)?,
             promoted.entry_count(),
@@ -663,23 +752,24 @@ pub(crate) async fn finalize_split_with_parent<T: WriteTxn>(
             PartitionState::Ready,
         )
         .map_err(|_| corrupt())?;
-        txn.put(header_key, PersistentValue::PartitionHeader(promoted))
-            .await?;
-        txn.put(
+        mutations.put(header_key, PersistentValue::PartitionHeader(promoted))?;
+        mutations.put(
             state_key,
             PersistentValue::PartitionState(PartitionTransition::Ready {
                 started_at_unix_millis,
             }),
-        )
-        .await?;
+        )?;
+        txn.apply(mutations).await?;
         return Ok(SplitCompletion::Completed { parent: None });
     }
 
     // Remove the source's unique incoming reference, rediscovered on this
     // transaction's snapshot and update-protected (ADR 0007).
-    let parent = remove_incoming_edge(txn, tree_key, source, level, parent).await?;
-    remove_source_prefix(
+    let parent =
+        stage_remove_incoming_edge(txn, &mut mutations, tree_key, source, level, parent).await?;
+    apply_remove_source_prefix(
         txn,
+        mutations,
         manifest,
         tree_key,
         source,
@@ -795,18 +885,18 @@ pub async fn begin_merge<T: WriteTxn>(
         return Ok(MergeStart::NoReadyTarget);
     }
 
-    txn.put(
+    let mut mutations = txn.mutations();
+    mutations.put(
         state_key,
         PersistentValue::PartitionState(PartitionTransition::Merging {
             started_at_unix_millis,
         }),
-    )
-    .await?;
-    txn.put(
+    )?;
+    mutations.put(
         header_key,
         PersistentValue::PartitionHeader(with_state(header, PartitionState::Merging)?),
-    )
-    .await?;
+    )?;
+    txn.apply(mutations).await?;
     Ok(MergeStart::Started)
 }
 
@@ -872,9 +962,11 @@ pub(crate) async fn finalize_merge_with_parent<T: WriteTxn>(
         return Ok(MergeCompletion::NotDrained);
     }
     let level = header.level();
-    remove_incoming_edge(txn, tree_key, source, level, parent).await?;
-    remove_source_prefix(
+    let mut mutations = txn.mutations();
+    stage_remove_incoming_edge(txn, &mut mutations, tree_key, source, level, parent).await?;
+    apply_remove_source_prefix(
         txn,
+        mutations,
         manifest,
         tree_key,
         source,
@@ -886,16 +978,17 @@ pub(crate) async fn finalize_merge_with_parent<T: WriteTxn>(
     Ok(MergeCompletion::Completed)
 }
 
-/// Removes one drained non-root source's unique incoming Child Entry and
-/// decrements the parent's exact count, atomically.
+/// Stages removal of one drained non-root source's unique incoming Child Entry
+/// and decrements the parent's exact count into `mutations`.
 ///
 /// The edge is rediscovered on this transaction's snapshot by the exact
 /// bounded root-down scan and update-protected (ADR 0007): a concurrent edge
 /// move aborts the commit with a retryable conflict, and a missing or
 /// duplicated edge fails closed. A parent whose own maintenance moved the
 /// edge is rediscovered afresh on the next attempt.
-async fn remove_incoming_edge<T: WriteTxn>(
+async fn stage_remove_incoming_edge<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
+    mutations: &mut MutationBuilder<'_>,
     tree_key: &TreeKey,
     source: PartitionKey,
     level: u32,
@@ -913,30 +1006,33 @@ async fn remove_incoming_edge<T: WriteTxn>(
     if parent_header.level() != level.checked_add(1).ok_or_else(corrupt)? {
         return Err(corrupt());
     }
-    txn.delete(LogicalKey::ChildEntry {
+    mutations.delete(LogicalKey::ChildEntry {
         index,
         tree_key: tree_key.clone(),
         partition: parent,
         child: source,
-    })
-    .await?;
-    txn.put(
+    })?;
+    mutations.put(
         parent_header_key,
         PersistentValue::PartitionHeader(removed_entry(parent_header)?),
-    )
-    .await?;
+    )?;
     Ok(parent)
 }
 
-/// Removes one fully drained source's whole partition prefix per the
-/// backend's capability branch.
+/// Applies `mutations` together with removal of one fully drained source's
+/// partition prefix per the backend's capability branch.
 ///
 /// After exact count zero the prefix holds only the four fixed metadata keys,
 /// so both forms are bounded; only the exact-count-zero invariant makes the
 /// point form complete without a rescan. A leaf-only Synopsis key is simply
 /// absent for an internal source, so its point delete is a no-op.
-async fn remove_source_prefix<T: WriteTxn>(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "shared prefix-cleanup arguments plus the batched transition mutations"
+)]
+async fn apply_remove_source_prefix<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
+    mut mutations: MutationBuilder<'_>,
     manifest: &IndexManifest,
     tree_key: &TreeKey,
     source: PartitionKey,
@@ -947,6 +1043,7 @@ async fn remove_source_prefix<T: WriteTxn>(
     let index = manifest.logical_index_id();
     match source_removal {
         SourceRemoval::TransactionalClear => {
+            txn.apply(mutations).await?;
             txn.clear_range(&LogicalRange::partition(manifest, tree_key, source)?)
                 .await?;
         }
@@ -965,8 +1062,9 @@ async fn remove_source_prefix<T: WriteTxn>(
                 state_key,
                 header_key,
             ] {
-                txn.delete(key).await?;
+                mutations.delete(key)?;
             }
+            txn.apply(mutations).await?;
         }
     }
     Ok(())

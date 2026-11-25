@@ -48,7 +48,10 @@ pub(crate) use transitions::{
     update_centroid,
 };
 
-use crate::api::{Error, ErrorKind, PartitionKey};
+use crate::api::{Error, ErrorKind, PartitionKey, Result};
+use crate::storage::WriteLogicalTxn;
+use crate::storage::backend::WriteTxn;
+use crate::storage::keys::LogicalKey;
 
 /// The stable root Partition Key of every tree.
 ///
@@ -59,6 +62,26 @@ pub(crate) fn root_partition() -> PartitionKey {
         Ok(root) => root,
         Err(_) => unreachable!("Partition Key 1 is nonzero"),
     }
+}
+
+/// Verifies that every key in `keys` is absent, establishing point conflicts
+/// on all of them in a single batched update-protected read.
+///
+/// Any existing key contradicts the unique-creation invariant and fails closed
+/// with [`ErrorKind::Corruption`].
+pub(super) async fn expect_all_absent<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    keys: Vec<LogicalKey>,
+) -> Result<()> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    for value in txn.batch_get_for_update(keys).await? {
+        if value.is_some() {
+            return Err(corrupt());
+        }
+    }
+    Ok(())
 }
 
 fn corrupt() -> Error {

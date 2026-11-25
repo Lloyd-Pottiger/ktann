@@ -5,16 +5,17 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
 
-use crate::api::{Error, ErrorKind, PartitionKey, Result};
-use crate::storage::WriteLogicalTxn;
+use crate::api::{Error, ErrorKind, LogicalIndexId, PartitionKey, Result};
 use crate::storage::backend::{AdmissionBudget, WriteTxn};
 use crate::storage::keys::{self, LogicalKey, TreeKey};
-use crate::storage::membership::{added_entry, expect_inserted, removed_entry};
+use crate::storage::membership::{added_entry, removed_entry};
 use crate::storage::values::{
-    ChildEntry, IndexManifest, LeafEntry, PartitionHeader, PartitionState, PersistentValue,
-    RecordLocation, VectorRecord, expect_child_entry, expect_header, expect_leaf_entry,
-    expect_location, expect_record, expect_synopsis, leaf_relocation_value_sizes,
+    ChildEntry, IndexManifest, LeafEntry, PartitionHeader, PartitionState, PartitionTransition,
+    PersistentValue, RecordLocation, VectorRecord, expect_child_entry, expect_drain_header,
+    expect_header, expect_leaf_entry, expect_location, expect_record, expect_state,
+    expect_synopsis, leaf_relocation_value_sizes,
 };
+use crate::storage::{MutationBuilder, WriteLogicalTxn};
 
 use super::corrupt;
 
@@ -207,7 +208,8 @@ pub(crate) fn leaf_relocation_batch_limit(
 struct LeafRelocationCharge {
     source_header: usize,
     entry: usize,
-    target: usize,
+    split_target: usize,
+    ready_target: usize,
 }
 
 impl LeafRelocationCharge {
@@ -232,20 +234,25 @@ impl LeafRelocationCharge {
             .checked_add(mutation(leaf_key, 0)?)
             .and_then(|bytes| bytes.checked_add(location))
             .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-        let target = mutation(metadata_key, values.partition_header)?
-            .checked_add(mutation(metadata_key, values.partition_synopsis)?)
+        let synopsis = mutation(metadata_key, values.partition_synopsis)?;
+        let split_target = mutation(metadata_key, values.drain_header)?
+            .checked_add(synopsis)
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+        let ready_target = mutation(metadata_key, values.partition_header)?
+            .checked_add(synopsis)
             .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
         Ok(Self {
             source_header,
             entry,
-            target,
+            split_target,
+            ready_target,
         })
     }
 
     fn size(&self, entries: usize, movement: Movement) -> Option<(usize, usize)> {
-        let targets = match movement {
-            Movement::Split => entries.min(2),
-            Movement::Merge | Movement::Refine => entries,
+        let (targets, target_bytes) = match movement {
+            Movement::Split => (entries.min(2), self.split_target),
+            Movement::Merge | Movement::Refine => (entries, self.ready_target),
         };
         let mutations = entries
             .checked_mul(3)
@@ -253,7 +260,7 @@ impl LeafRelocationCharge {
             .and_then(|count| count.checked_add(1))?;
         let bytes = entries
             .checked_mul(self.entry)
-            .and_then(|bytes| targets.checked_mul(self.target)?.checked_add(bytes))
+            .and_then(|bytes| targets.checked_mul(target_bytes)?.checked_add(bytes))
             .and_then(|bytes| bytes.checked_add(self.source_header))?;
         Some((mutations, bytes))
     }
@@ -267,20 +274,70 @@ impl LeafRelocationCharge {
     }
 }
 
+/// Verifies that the next `count` batch-read slots are all absent.
+fn expect_remaining_absent(
+    values: &mut impl Iterator<Item = Option<PersistentValue>>,
+    count: usize,
+) -> Result<()> {
+    for _ in 0..count {
+        let Some(value) = values.next() else {
+            return Err(Error::new(ErrorKind::Backend));
+        };
+        if value.is_some() {
+            return Err(corrupt());
+        }
+    }
+    Ok(())
+}
+
+/// Stages one leaf entry move: insert on target, delete from source, and
+/// repoint its authoritative Record Location.
+fn stage_leaf_move(
+    mutations: &mut MutationBuilder<'_>,
+    index: LogicalIndexId,
+    tree_key: &TreeKey,
+    drain: LeafDrainEntry,
+    target: PartitionKey,
+) -> Result<()> {
+    let id = drain.entry.record_id().clone();
+    mutations.put(
+        LogicalKey::LeafEntry {
+            index,
+            tree_key: tree_key.clone(),
+            partition: target,
+            id: id.clone(),
+        },
+        PersistentValue::LeafEntry(drain.entry),
+    )?;
+    mutations.delete(LogicalKey::LeafEntry {
+        index,
+        tree_key: tree_key.clone(),
+        partition: drain.source,
+        id: id.clone(),
+    })?;
+    mutations.put(
+        LogicalKey::Location { index, id },
+        PersistentValue::RecordLocation(RecordLocation::new(tree_key.clone(), target)),
+    )
+}
+
 /// Atomically moves one batch of verified leaf entries to their chosen targets.
 ///
 /// Each record appears at most once in a batch; candidates are read before moves.
 ///
 /// Each move copies the Leaf Entry — including its absolute RaBitQ7 payload —
-/// unchanged to the target, unique-inserts it, deletes the source entry, and
-/// repoints the Record Location. The batch reads each touched Header and each
-/// receiving target's Synopsis once, accumulates the exact counts,
-/// cache epochs, and synopsis expansions in memory, and writes each authority
-/// value back once, so a batch never pays per-entry authority round trips.
-/// Every source and target must be a leaf in the states `movement` names:
-/// callers provide candidates read in this transaction and preserve the
-/// protocol, including caller exclusivity for refinement. Returns the number
-/// of moved entries.
+/// unchanged to the target, verifies target-entry absence, deletes the source
+/// entry, and repoints the Record Location. All absence checks share one
+/// update-protected batch read and all writes land in one batched
+/// [`MutationBuilder`](crate::storage::MutationBuilder) apply.
+///
+/// Under [`Movement::Split`], targets are level-1 `ReceivingSplit` leaves and
+/// moves update their `DrainHeader` and `DrainSynopsis` sidecar keys while
+/// validating target state via `State` alone — avoiding conflicts with
+/// concurrent foreground writes on the primary `Header` and `Synopsis`. Under
+/// [`Movement::Merge`] and [`Movement::Refine`], targets are `Ready` leaves
+/// and moves update their primary `Header` and `Synopsis` directly. Returns
+/// the number of moved entries.
 pub async fn relocate_leaf_entries<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     tree_key: &TreeKey,
@@ -293,23 +350,49 @@ pub async fn relocate_leaf_entries<T: WriteTxn>(
     let manifest = txn.require_manifest()?;
     let index = manifest.logical_index_id();
 
-    // Source and target roles can overlap in refinement. Read each Header once,
-    // validate every role, and apply count/epoch changes in caller move order.
+    let mut seen_ids = BTreeSet::new();
+    for (drain, target) in &moves {
+        if drain.source == *target || !seen_ids.insert(drain.entry.record_id()) {
+            return Err(corrupt());
+        }
+    }
+    drop(seen_ids);
     let sources: BTreeSet<_> = moves.iter().map(|(drain, _)| drain.source).collect();
     let targets: BTreeSet<_> = moves.iter().map(|(_, target)| *target).collect();
-    if moves.iter().any(|(drain, target)| drain.source == *target) {
-        return Err(corrupt());
+
+    if movement == Movement::Split {
+        return relocate_split_leaf_entries(txn, manifest, tree_key, &sources, &targets, moves)
+            .await;
     }
+
+    // Source and target roles can overlap in refinement. Read each Header,
+    // target Synopsis, and target Leaf Entry absence check in one batched
+    // update-protected read, then apply all changes in one batch.
     let partitions: Vec<_> = sources.union(&targets).copied().collect();
-    let header_keys = partitions
-        .iter()
-        .map(|partition| LogicalKey::Header {
+    let mut read_keys = Vec::with_capacity(partitions.len() + targets.len() + moves.len());
+    for &partition in &partitions {
+        read_keys.push(LogicalKey::Header {
             index,
             tree_key: tree_key.clone(),
-            partition: *partition,
-        })
-        .collect();
-    let mut values = txn.batch_get_for_update(header_keys).await?.into_iter();
+            partition,
+        });
+    }
+    for &target in &targets {
+        read_keys.push(LogicalKey::Synopsis {
+            index,
+            tree_key: tree_key.clone(),
+            partition: target,
+        });
+    }
+    for (drain, target) in &moves {
+        read_keys.push(LogicalKey::LeafEntry {
+            index,
+            tree_key: tree_key.clone(),
+            partition: *target,
+            id: drain.entry.record_id().clone(),
+        });
+    }
+    let mut values = txn.batch_get_for_update(read_keys).await?.into_iter();
     let mut headers = BTreeMap::new();
     for partition in partitions {
         let Some(value) = values.next() else {
@@ -324,94 +407,203 @@ pub async fn relocate_leaf_entries<T: WriteTxn>(
         }
         headers.insert(partition, header);
     }
-    let synopsis_keys: Vec<LogicalKey> = targets
-        .iter()
-        .map(|target| LogicalKey::Synopsis {
-            index,
-            tree_key: tree_key.clone(),
-            partition: *target,
-        })
-        .collect();
-    let mut synopsis_values = txn.batch_get_for_update(synopsis_keys).await?.into_iter();
     let mut synopses = BTreeMap::new();
-    for target in &targets {
-        let Some(value) = synopsis_values.next() else {
+    for &target in &targets {
+        let Some(value) = values.next() else {
             return Err(Error::new(ErrorKind::Backend));
         };
         synopses.insert(
-            *target,
+            target,
             (expect_synopsis(value)?.ok_or_else(corrupt)?, false),
         );
     }
+    expect_remaining_absent(&mut values, moves.len())?;
 
     let moved = moves.len();
-    for (drain, target) in &moves {
-        let id = drain.entry.record_id().clone();
-        expect_inserted(
-            txn.insert(
-                LogicalKey::LeafEntry {
-                    index,
-                    tree_key: tree_key.clone(),
-                    partition: *target,
-                    id: id.clone(),
-                },
-                PersistentValue::LeafEntry(drain.entry.clone()),
-            )
-            .await?,
-        )?;
-        let mut mutations = txn.mutations();
-        mutations.delete(LogicalKey::LeafEntry {
-            index,
-            tree_key: tree_key.clone(),
-            partition: drain.source,
-            id: id.clone(),
-        })?;
-        mutations.put(
-            LogicalKey::Location { index, id },
-            PersistentValue::RecordLocation(RecordLocation::new(tree_key.clone(), *target)),
-        )?;
-        txn.apply(mutations).await?;
-    }
-
+    let mut mutations = txn.mutations();
     // Preserve move order even when a partition receives and then sends entries.
-    for (drain, target) in &moves {
+    for (drain, target) in moves {
         let source_header = headers
             .get_mut(&drain.source)
             .expect("source collected from moves");
         *source_header = removed_entry(*source_header)?;
         let target_header = headers
-            .get_mut(target)
+            .get_mut(&target)
             .expect("target collected from moves");
         *target_header = added_entry(*target_header)?;
         let (synopsis, changed) = synopses
-            .get_mut(target)
+            .get_mut(&target)
             .expect("target collected from moves");
         *changed |= synopsis.expand(manifest, drain.entry.fields())?;
+        stage_leaf_move(&mut mutations, index, tree_key, drain, target)?;
     }
     for (partition, header) in headers {
-        txn.put(
+        mutations.put(
             LogicalKey::Header {
                 index,
                 tree_key: tree_key.clone(),
                 partition,
             },
             PersistentValue::PartitionHeader(header),
-        )
-        .await?;
+        )?;
     }
     for (partition, (synopsis, changed)) in synopses {
         if changed {
-            txn.put(
+            mutations.put(
                 LogicalKey::Synopsis {
                     index,
                     tree_key: tree_key.clone(),
                     partition,
                 },
                 PersistentValue::PartitionSynopsis(synopsis),
-            )
-            .await?;
+            )?;
         }
     }
+    txn.apply(mutations).await?;
+    Ok(moved)
+}
+
+/// Moves verified leaf entries from `DrainingSplit` sources into `ReceivingSplit`
+/// targets using the target Drain Header and Drain Synopsis sidecar keys.
+///
+/// Target `Header` and `Synopsis` are deliberately neither read nor written so
+/// split draining does not conflict with concurrent foreground writes.
+async fn relocate_split_leaf_entries<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    manifest: &IndexManifest,
+    tree_key: &TreeKey,
+    sources: &BTreeSet<PartitionKey>,
+    targets: &BTreeSet<PartitionKey>,
+    moves: Vec<(LeafDrainEntry, PartitionKey)>,
+) -> Result<usize> {
+    if !sources.is_disjoint(targets) {
+        return Err(corrupt());
+    }
+    let index = manifest.logical_index_id();
+    let mut read_keys = Vec::with_capacity(sources.len() + targets.len() * 3 + moves.len());
+    for &source in sources {
+        read_keys.push(LogicalKey::Header {
+            index,
+            tree_key: tree_key.clone(),
+            partition: source,
+        });
+    }
+    for &target in targets {
+        read_keys.push(LogicalKey::State {
+            index,
+            tree_key: tree_key.clone(),
+            partition: target,
+        });
+        read_keys.push(LogicalKey::DrainHeader {
+            index,
+            tree_key: tree_key.clone(),
+            partition: target,
+        });
+        read_keys.push(LogicalKey::DrainSynopsis {
+            index,
+            tree_key: tree_key.clone(),
+            partition: target,
+        });
+    }
+    for (drain, target) in &moves {
+        read_keys.push(LogicalKey::LeafEntry {
+            index,
+            tree_key: tree_key.clone(),
+            partition: *target,
+            id: drain.entry.record_id().clone(),
+        });
+    }
+
+    let mut values = txn.batch_get_for_update(read_keys).await?.into_iter();
+    let mut source_headers = BTreeMap::new();
+    for &source in sources {
+        let Some(value) = values.next() else {
+            return Err(Error::new(ErrorKind::Backend));
+        };
+        let header = expect_header(value)?.ok_or_else(corrupt)?;
+        if header.level() != 1 || header.state() != PartitionState::DrainingSplit {
+            return Err(corrupt());
+        }
+        source_headers.insert(source, header);
+    }
+
+    let mut target_sources = BTreeMap::new();
+    let mut drain_headers = BTreeMap::new();
+    let mut drain_synopses = BTreeMap::new();
+    for &target in targets {
+        let (Some(state_value), Some(drain_header_value), Some(drain_synopsis_value)) =
+            (values.next(), values.next(), values.next())
+        else {
+            return Err(Error::new(ErrorKind::Backend));
+        };
+        let PartitionTransition::ReceivingSplit { source, .. } =
+            expect_state(state_value)?.ok_or_else(corrupt)?
+        else {
+            return Err(corrupt());
+        };
+        let drain_header = expect_drain_header(drain_header_value)?.ok_or_else(corrupt)?;
+        let drain_synopsis = expect_synopsis(drain_synopsis_value)?.ok_or_else(corrupt)?;
+        target_sources.insert(target, source);
+        drain_headers.insert(target, drain_header);
+        drain_synopses.insert(target, (drain_synopsis, false));
+    }
+
+    expect_remaining_absent(&mut values, moves.len())?;
+
+    let moved = moves.len();
+    let mut mutations = txn.mutations();
+    for (drain, target) in moves {
+        if target_sources.get(&target) != Some(&drain.source) {
+            return Err(corrupt());
+        }
+        let source_header = source_headers
+            .get_mut(&drain.source)
+            .expect("source collected from moves");
+        *source_header = removed_entry(*source_header)?;
+        let drain_header = drain_headers
+            .get_mut(&target)
+            .expect("target collected from moves");
+        *drain_header = drain_header.added_entry()?;
+        let (drain_synopsis, changed) = drain_synopses
+            .get_mut(&target)
+            .expect("target collected from moves");
+        *changed |= drain_synopsis.expand(manifest, drain.entry.fields())?;
+        stage_leaf_move(&mut mutations, index, tree_key, drain, target)?;
+    }
+
+    for (source, header) in source_headers {
+        mutations.put(
+            LogicalKey::Header {
+                index,
+                tree_key: tree_key.clone(),
+                partition: source,
+            },
+            PersistentValue::PartitionHeader(header),
+        )?;
+    }
+    for (target, drain_header) in drain_headers {
+        mutations.put(
+            LogicalKey::DrainHeader {
+                index,
+                tree_key: tree_key.clone(),
+                partition: target,
+            },
+            PersistentValue::DrainHeader(drain_header),
+        )?;
+    }
+    for (target, (drain_synopsis, changed)) in drain_synopses {
+        if changed {
+            mutations.put(
+                LogicalKey::DrainSynopsis {
+                    index,
+                    tree_key: tree_key.clone(),
+                    partition: target,
+                },
+                PersistentValue::PartitionSynopsis(drain_synopsis),
+            )?;
+        }
+    }
+    txn.apply(mutations).await?;
     Ok(moved)
 }
 
@@ -475,26 +667,40 @@ pub async fn relocate_child_entries<T: WriteTxn>(
     let manifest = txn.require_manifest()?;
     let index = manifest.logical_index_id();
 
+    let mut seen_children = BTreeSet::new();
+    for (entry, target) in &moves {
+        if source == *target || !seen_children.insert(entry.child()) {
+            return Err(corrupt());
+        }
+    }
     let mut targets: Vec<PartitionKey> = moves.iter().map(|(_, target)| *target).collect();
     targets.sort_unstable();
     targets.dedup();
-    let mut header_keys = Vec::with_capacity(targets.len() + 1);
+    let mut read_keys = Vec::with_capacity(targets.len() + 1 + moves.len());
     for target in &targets {
-        header_keys.push(LogicalKey::Header {
+        read_keys.push(LogicalKey::Header {
             index,
             tree_key: tree_key.clone(),
             partition: *target,
         });
     }
-    header_keys.push(LogicalKey::Header {
+    read_keys.push(LogicalKey::Header {
         index,
         tree_key: tree_key.clone(),
         partition: source,
     });
-    let mut headers = txn.batch_get_for_update(header_keys).await?.into_iter();
+    for (entry, target) in &moves {
+        read_keys.push(LogicalKey::ChildEntry {
+            index,
+            tree_key: tree_key.clone(),
+            partition: *target,
+            child: entry.child(),
+        });
+    }
+    let mut values = txn.batch_get_for_update(read_keys).await?.into_iter();
     let mut target_headers: Vec<(PartitionKey, PartitionHeader)> = Vec::new();
     for target in &targets {
-        let Some(value) = headers.next() else {
+        let Some(value) = values.next() else {
             return Err(Error::new(ErrorKind::Backend));
         };
         let header = expect_header(value)?.ok_or_else(corrupt)?;
@@ -503,7 +709,7 @@ pub async fn relocate_child_entries<T: WriteTxn>(
         }
         target_headers.push((*target, header));
     }
-    let Some(source_value) = headers.next() else {
+    let Some(source_value) = values.next() else {
         return Err(Error::new(ErrorKind::Backend));
     };
     let source_header = expect_header(source_value)?.ok_or_else(corrupt)?;
@@ -517,6 +723,7 @@ pub async fn relocate_child_entries<T: WriteTxn>(
             return Err(corrupt());
         }
     }
+    expect_remaining_absent(&mut values, moves.len())?;
 
     // Graph-aware drains rewrite the source and one destination together.
     // Their combined serialization bound depends on the small merge source and
@@ -540,57 +747,51 @@ pub async fn relocate_child_entries<T: WriteTxn>(
         }
     }
     let moved = moves.len();
+    let mut mutations = txn.mutations();
+    let mut source_header = source_header;
     for (entry, target) in &moves {
-        expect_inserted(
-            txn.insert(
-                LogicalKey::ChildEntry {
-                    index,
-                    tree_key: tree_key.clone(),
-                    partition: *target,
-                    child: entry.child(),
-                },
-                PersistentValue::ChildEntry(entry.clone()),
-            )
-            .await?,
+        mutations.put(
+            LogicalKey::ChildEntry {
+                index,
+                tree_key: tree_key.clone(),
+                partition: *target,
+                child: entry.child(),
+            },
+            PersistentValue::ChildEntry(entry.clone()),
         )?;
-        txn.delete(LogicalKey::ChildEntry {
+        mutations.delete(LogicalKey::ChildEntry {
             index,
             tree_key: tree_key.clone(),
             partition: source,
             child: entry.child(),
-        })
-        .await?;
-    }
-
-    let mut source_header = source_header;
-    for _ in &moves {
+        })?;
         source_header = removed_entry(source_header)?;
     }
-    txn.put(
+
+    mutations.put(
         LogicalKey::Header {
             index,
             tree_key: tree_key.clone(),
             partition: source,
         },
         PersistentValue::PartitionHeader(source_header),
-    )
-    .await?;
+    )?;
     for (target, mut header) in target_headers {
         for (_, move_target) in &moves {
             if move_target == &target {
                 header = added_entry(header)?;
             }
         }
-        txn.put(
+        mutations.put(
             LogicalKey::Header {
                 index,
                 tree_key: tree_key.clone(),
                 partition: target,
             },
             PersistentValue::PartitionHeader(header),
-        )
-        .await?;
+        )?;
     }
+    txn.apply(mutations).await?;
     Ok(moved)
 }
 

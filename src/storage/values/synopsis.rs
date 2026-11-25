@@ -146,6 +146,30 @@ impl PartitionSynopsis {
         Ok(changed)
     }
 
+    /// Monotonically merges `other` into this synopsis.
+    ///
+    /// Computes the exact join-semilattice union per field: `has_null` OR,
+    /// typed minimum and maximum, and bitwise Bloom OR. Used to combine a
+    /// `ReceivingSplit` leaf's Drain Synopsis with its primary Synopsis on
+    /// search, verification, and split completion.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidArgument` if either synopsis does not match the Index
+    /// Manifest.
+    ///
+    /// On success, returns whether this synopsis changed.
+    pub fn merge(&mut self, manifest: &IndexManifest, other: &Self) -> Result<bool> {
+        validate_synopsis_shape(self, manifest)?;
+        validate_synopsis_shape(other, manifest)?;
+
+        let mut changed = false;
+        for (target, source) in self.0.iter_mut().zip(other.0.iter()) {
+            changed |= merge_field(target, source);
+        }
+        Ok(changed)
+    }
+
     /// Returns field synopses in schema order.
     #[must_use]
     pub fn fields(&self) -> &[FieldSynopsis] {
@@ -339,6 +363,50 @@ fn expand_field(
     changed
 }
 
+/// Merges one already validated field synopsis into `target`.
+fn merge_field(target: &mut FieldSynopsis, source: &FieldSynopsis) -> bool {
+    let mut changed = false;
+    if source.has_null && !target.has_null {
+        target.has_null = true;
+        changed = true;
+    }
+    if let Some(source_min) = source.minimum.as_ref()
+        && target
+            .minimum
+            .as_ref()
+            .is_none_or(|target_min| value_order(source_min, target_min) == Ordering::Less)
+    {
+        target.minimum = Some(canonical_value(source_min));
+        changed = true;
+    }
+    if let Some(source_max) = source.maximum.as_ref()
+        && target
+            .maximum
+            .as_ref()
+            .is_none_or(|target_max| value_order(source_max, target_max) == Ordering::Greater)
+    {
+        target.maximum = Some(canonical_value(source_max));
+        changed = true;
+    }
+    if let (Some(source_bloom), Some(target_bloom)) = (source.bloom.as_ref(), target.bloom.as_ref())
+        && target_bloom
+            .iter()
+            .zip(source_bloom.iter())
+            .any(|(dst, src)| (*src & !*dst) != 0)
+        && let Some(target_bloom) = target.bloom.take()
+    {
+        let mut bloom = target_bloom
+            .try_into_mut()
+            .unwrap_or_else(|bytes| bytes.as_ref().into());
+        for (dst, src) in bloom.iter_mut().zip(source_bloom.iter()) {
+            *dst |= *src;
+        }
+        changed = true;
+        target.bloom = Some(bloom.freeze());
+    }
+    changed
+}
+
 fn canonical_value(value: &Value) -> Value {
     match value {
         Value::F64(value) if *value == 0.0 => Value::F64(0.0),
@@ -486,6 +554,62 @@ mod tests {
             ErrorKind::InvalidArgument
         );
         assert_eq!(synopsis, before);
+    }
+
+    #[test]
+    fn merge_computes_exact_union_of_nulls_extrema_and_bloom() {
+        let fields = vec![
+            FieldSchema::new("number", DataType::I64)
+                .unwrap()
+                .nullable()
+                .with_synopsis(SynopsisConfig::MinMaxBloom {
+                    expected_distinct: NonZeroU32::new(8).unwrap(),
+                    false_positive_rate: 0.01,
+                })
+                .unwrap(),
+            FieldSchema::new("float", DataType::F64).unwrap(),
+        ];
+        let manifest = manifest(fields);
+        let mut left = PartitionSynopsis::empty(&manifest);
+        left.expand(&manifest, &[Value::I64(5), Value::F64(1.0)])
+            .unwrap();
+        let mut right = PartitionSynopsis::empty(&manifest);
+        right
+            .expand(&manifest, &[Value::Null, Value::F64(-2.0)])
+            .unwrap();
+        right
+            .expand(&manifest, &[Value::I64(-3), Value::F64(4.0)])
+            .unwrap();
+
+        let mut expected = PartitionSynopsis::empty(&manifest);
+        expected
+            .expand(&manifest, &[Value::I64(5), Value::F64(1.0)])
+            .unwrap();
+        expected
+            .expand(&manifest, &[Value::Null, Value::F64(-2.0)])
+            .unwrap();
+        expected
+            .expand(&manifest, &[Value::I64(-3), Value::F64(4.0)])
+            .unwrap();
+
+        assert!(left.merge(&manifest, &right).unwrap());
+        assert_eq!(left, expected);
+        // Merging again or merging an empty synopsis is an idempotent no-op.
+        assert!(!left.merge(&manifest, &right).unwrap());
+        assert!(
+            !left
+                .merge(&manifest, &PartitionSynopsis::empty(&manifest))
+                .unwrap()
+        );
+
+        let other_manifest =
+            super::tests::manifest(vec![FieldSchema::new("x", DataType::Bool).unwrap()]);
+        assert_eq!(
+            left.merge(&manifest, &PartitionSynopsis::empty(&other_manifest))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidArgument
+        );
     }
 
     #[test]

@@ -17,12 +17,12 @@ use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 use bytes::Bytes;
 
 use crate::api::{Error, ErrorKind, LogicalIndexId, PartitionKey, Result, Value};
-use crate::storage::backend::{InsertOutcome, WriteTxn};
+use crate::storage::backend::WriteTxn;
 use crate::storage::keys::{LogicalKey, TreeKey};
 use crate::storage::values::{
-    IndexManifest, LeafEntry, OpaquePayload, PartitionHeader, PartitionSynopsis, PersistentValue,
-    RecordLocation, VectorRecord, expect_header, expect_leaf_entry, expect_location, expect_record,
-    expect_synopsis,
+    DrainHeader, IndexManifest, LeafEntry, OpaquePayload, PartitionHeader, PartitionSynopsis,
+    PersistentValue, RecordLocation, VectorRecord, expect_drain_header, expect_header,
+    expect_leaf_entry, expect_location, expect_record, expect_synopsis,
 };
 use crate::storage::{MutationBuilder, WriteLogicalTxn};
 
@@ -89,8 +89,15 @@ impl ReplacementHeaders {
 /// sequence.
 #[derive(Default)]
 pub(crate) struct LeafAccumulator {
-    headers: BTreeMap<(TreeKey, PartitionKey), PartitionHeader>,
+    headers: BTreeMap<(TreeKey, PartitionKey), HeaderUpdate>,
+    drain_headers: BTreeMap<(TreeKey, PartitionKey), DrainHeader>,
     synopses: BTreeMap<(TreeKey, PartitionKey), SynopsisExpansion>,
+}
+
+/// One leaf's accumulated Header state and whether it changed in this batch.
+struct HeaderUpdate {
+    header: PartitionHeader,
+    dirty: bool,
 }
 
 /// One leaf's accumulated Synopsis state: the current expansion and whether
@@ -116,19 +123,68 @@ impl LeafAccumulator {
         location: &RecordLocation,
     ) -> Result<PartitionHeader> {
         let key = (location.tree_key().clone(), location.leaf());
-        if let Some(header) = self.headers.get(&key) {
-            return Ok(*header);
+        if let Some(entry) = self.headers.get(&key) {
+            return Ok(entry.header);
         }
         let header = expect_header(txn.get_for_update(header_key(index, location)).await?)?
             .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
-        self.headers.insert(key, header);
+        self.headers.insert(
+            key,
+            HeaderUpdate {
+                header,
+                dirty: false,
+            },
+        );
         Ok(header)
     }
 
     /// Stores one item's adjusted Header as the leaf's current state.
     fn adjust_header(&mut self, location: &RecordLocation, header: PartitionHeader) {
-        self.headers
-            .insert((location.tree_key().clone(), location.leaf()), header);
+        self.headers.insert(
+            (location.tree_key().clone(), location.leaf()),
+            HeaderUpdate {
+                header,
+                dirty: true,
+            },
+        );
+    }
+
+    /// Decrements one leaf's exact entry count on delete or cross-leaf move-out.
+    ///
+    /// Ordinarily decrements the primary Header (including on `ReceivingSplit`
+    /// leaves while `Header.entry_count > 0`, avoiding contention with split
+    /// draining). Only when a `ReceivingSplit` leaf's primary count is already
+    /// zero does it read and decrement the `DrainHeader` sidecar instead.
+    async fn remove_entry<T: WriteTxn>(
+        &mut self,
+        txn: &mut WriteLogicalTxn<'_, T>,
+        index: LogicalIndexId,
+        location: &RecordLocation,
+    ) -> Result<PartitionHeader> {
+        let header = self.header(txn, index, location).await?;
+        if header.level() != 1 {
+            return Err(Error::new(ErrorKind::Corruption));
+        }
+        if header.entry_count() > 0 {
+            let adjusted = removed_entry(header)?;
+            self.adjust_header(location, adjusted);
+            return Ok(adjusted);
+        }
+        if !header.has_drain_sidecar() {
+            return Err(Error::new(ErrorKind::Corruption));
+        }
+        let key = (location.tree_key().clone(), location.leaf());
+        let drain_header = match self.drain_headers.get(&key) {
+            Some(drain_header) => *drain_header,
+            None => expect_drain_header(
+                txn.get_for_update(drain_header_key(index, location))
+                    .await?,
+            )?
+            .ok_or_else(|| Error::new(ErrorKind::Corruption))?,
+        };
+        self.drain_headers
+            .insert(key, drain_header.removed_entry()?);
+        Ok(header)
     }
 
     /// Expands one leaf's Synopsis with one exact Leaf projection.
@@ -171,14 +227,26 @@ impl LeafAccumulator {
         deferred: &mut MutationBuilder<'_>,
     ) -> Result<()> {
         let index = txn.require_manifest()?.logical_index_id();
-        for ((tree_key, partition), header) in self.headers {
+        for ((tree_key, partition), update) in self.headers {
+            if update.dirty {
+                deferred.put(
+                    LogicalKey::Header {
+                        index,
+                        tree_key,
+                        partition,
+                    },
+                    PersistentValue::PartitionHeader(update.header),
+                )?;
+            }
+        }
+        for ((tree_key, partition), drain_header) in self.drain_headers {
             deferred.put(
-                LogicalKey::Header {
+                LogicalKey::DrainHeader {
                     index,
                     tree_key,
                     partition,
                 },
-                PersistentValue::PartitionHeader(header),
+                PersistentValue::DrainHeader(drain_header),
             )?;
         }
         for ((tree_key, partition), expansion) in self.synopses {
@@ -427,9 +495,7 @@ pub(crate) async fn replace_record_with_headers<T: WriteTxn>(
 
         // The source follows the exact stored location, so any state is legal
         // for it; only the target must be a write-accepting leaf.
-        let source = writes.leaves.header(txn, index, expected).await?;
-        let adjusted = removed_entry(source)?;
-        writes.leaves.adjust_header(expected, adjusted);
+        let adjusted = writes.leaves.remove_entry(txn, index, expected).await?;
         Some(adjusted)
     };
 
@@ -515,8 +581,7 @@ pub(crate) async fn delete_record_with_header<T: WriteTxn>(
     writes.deferred.delete(location_key)?;
     writes.deferred.delete(entry_key)?;
     writes.deferred.delete(payload_key(index, id))?;
-    let header = removed_entry(writes.leaves.header(txn, index, &location).await?)?;
-    writes.leaves.adjust_header(&location, header);
+    let header = writes.leaves.remove_entry(txn, index, &location).await?;
     Ok(DeleteReport::Deleted { location, header })
 }
 
@@ -803,14 +868,6 @@ async fn expect_absent<T: WriteTxn>(
     Ok(())
 }
 
-/// Maps a duplicate unique insert of authoritative state to Corruption.
-pub(crate) fn expect_inserted(outcome: InsertOutcome) -> Result<()> {
-    match outcome {
-        InsertOutcome::Inserted => Ok(()),
-        InsertOutcome::AlreadyExists => Err(Error::new(ErrorKind::Corruption)),
-    }
-}
-
 fn record_key(index: LogicalIndexId, id: &Bytes) -> LogicalKey {
     LogicalKey::Record {
         index,
@@ -834,6 +891,14 @@ fn payload_key(index: LogicalIndexId, id: &Bytes) -> LogicalKey {
 
 fn header_key(index: LogicalIndexId, location: &RecordLocation) -> LogicalKey {
     LogicalKey::Header {
+        index,
+        tree_key: location.tree_key().clone(),
+        partition: location.leaf(),
+    }
+}
+
+fn drain_header_key(index: LogicalIndexId, location: &RecordLocation) -> LogicalKey {
+    LogicalKey::DrainHeader {
         index,
         tree_key: location.tree_key().clone(),
         partition: location.leaf(),

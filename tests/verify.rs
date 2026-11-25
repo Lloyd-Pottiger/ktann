@@ -22,8 +22,8 @@ use ktann::runtime::{RetryPolicy, Runtime};
 use ktann::storage::backend::{Backend, WriteTxn};
 use ktann::storage::keys::{self, LogicalKey, TreeKey};
 use ktann::storage::values::{
-    IndexIdAllocator, IndexManifest, LeafEntry, OpaquePayload, PartitionHeader, PartitionState,
-    PartitionSynopsis, PersistentValue, RecordLocation, ValueCodec,
+    DrainHeader, IndexIdAllocator, IndexManifest, LeafEntry, OpaquePayload, PartitionHeader,
+    PartitionState, PartitionSynopsis, PersistentValue, RecordLocation, ValueCodec,
 };
 use ktann::storage::{ReadLogicalTxn, WriteLogicalTxn};
 use tokio_util::sync::CancellationToken;
@@ -852,5 +852,167 @@ async fn corruption_in_one_index_does_not_leak_into_another() {
         .expect("verify second");
     assert_eq!(kinds(&dirty), vec![VerifyIssueKind::InvalidEncoding]);
     assert_eq!(dirty.issues[0].logical_index_id, second.logical_index_id());
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receiving_split_sidecar_invariants_are_verified() {
+    let retry = RetryPolicy::for_fixup(&RuntimeConfig::default());
+
+    // Stray DrainHeader / DrainSynopsis on a Ready leaf fail closed as Reachability.
+    let (backend, runtime, index, manifest) = two_record_setup().await;
+    typed_put(
+        &backend,
+        &manifest,
+        LogicalKey::DrainHeader {
+            index: index.logical_index_id(),
+            tree_key: tree_key(1),
+            partition: pk(1),
+        },
+        PersistentValue::DrainHeader(DrainHeader::empty()),
+    )
+    .await;
+    let report = index
+        .verify(VerifyOptions::default())
+        .await
+        .expect("verify");
+    assert_eq!(kinds(&report), vec![VerifyIssueKind::Reachability]);
+    raw_delete(
+        &backend,
+        keys::drain_header_key(index.logical_index_id(), &tree_key(1), pk(1)),
+    )
+    .await;
+    typed_put(
+        &backend,
+        &manifest,
+        LogicalKey::DrainSynopsis {
+            index: index.logical_index_id(),
+            tree_key: tree_key(1),
+            partition: pk(1),
+        },
+        PersistentValue::PartitionSynopsis(PartitionSynopsis::empty(&manifest)),
+    )
+    .await;
+    let report = index
+        .verify(VerifyOptions::default())
+        .await
+        .expect("verify");
+    assert_eq!(kinds(&report), vec![VerifyIssueKind::Reachability]);
+    runtime.shutdown().await.expect("shutdown");
+
+    // Expose and drain a root split into ReceivingSplit targets, then inject
+    // sidecar defects one at a time.
+    let (backend, runtime, index) = setup(config_with(1, Some((1, 2)))).await;
+    insert_all(
+        &index,
+        (0..4_u32).map(|id| record(id, id as f32, 1)).collect(),
+    )
+    .await;
+    let manifest = support::read_manifest(&backend, index.logical_index_id()).await;
+    split::begin_split(&backend, &manifest, &tree_key(1), pk(1), 1_000, &retry)
+        .await
+        .expect("begin");
+    split::expose_targets(&backend, &manifest, &tree_key(1), pk(1), 1_100, &retry)
+        .await
+        .expect("expose");
+    split::drain_batch(&backend, &manifest, &tree_key(1), pk(1), &retry)
+        .await
+        .expect("drain");
+
+    // Healthy mid-drain ReceivingSplit verifies clean and reports combined entry totals.
+    let clean = index
+        .verify(VerifyOptions::default())
+        .await
+        .expect("verify");
+    assert!(
+        clean.complete && clean.issues.is_empty(),
+        "{:?}",
+        clean.issues
+    );
+    assert_eq!(clean.topology.entries_by_level.get(&1), Some(&4));
+
+    // Combined count mismatch on DrainHeader surfaces CountMismatch.
+    let target = pk(2);
+    let orig_drain = {
+        let raw = backend.begin_read().await.expect("read");
+        let mut txn = ReadLogicalTxn::for_index(raw, &manifest);
+        match txn
+            .get(LogicalKey::DrainHeader {
+                index: index.logical_index_id(),
+                tree_key: tree_key(1),
+                partition: target,
+            })
+            .await
+            .expect("get drain header")
+        {
+            Some(PersistentValue::DrainHeader(h)) => h,
+            other => panic!("expected drain header, got {other:?}"),
+        }
+    };
+    typed_put(
+        &backend,
+        &manifest,
+        LogicalKey::DrainHeader {
+            index: index.logical_index_id(),
+            tree_key: tree_key(1),
+            partition: target,
+        },
+        PersistentValue::DrainHeader(DrainHeader::new(
+            orig_drain.entry_count() + 1,
+            orig_drain.cache_epoch(),
+        )),
+    )
+    .await;
+    let mismatch = index
+        .verify(VerifyOptions::default())
+        .await
+        .expect("verify");
+    assert_eq!(kinds(&mismatch), vec![VerifyIssueKind::CountMismatch]);
+
+    // Restore DrainHeader, then delete DrainSynopsis -> Reachability.
+    typed_put(
+        &backend,
+        &manifest,
+        LogicalKey::DrainHeader {
+            index: index.logical_index_id(),
+            tree_key: tree_key(1),
+            partition: target,
+        },
+        PersistentValue::DrainHeader(orig_drain),
+    )
+    .await;
+    raw_delete(
+        &backend,
+        keys::drain_synopsis_key(index.logical_index_id(), &tree_key(1), target),
+    )
+    .await;
+    let missing_syn = index
+        .verify(VerifyOptions::default())
+        .await
+        .expect("verify");
+    assert_eq!(kinds(&missing_syn), vec![VerifyIssueKind::Reachability]);
+
+    // Missing DrainHeader -> Reachability.
+    typed_put(
+        &backend,
+        &manifest,
+        LogicalKey::DrainSynopsis {
+            index: index.logical_index_id(),
+            tree_key: tree_key(1),
+            partition: target,
+        },
+        PersistentValue::PartitionSynopsis(PartitionSynopsis::empty(&manifest)),
+    )
+    .await;
+    raw_delete(
+        &backend,
+        keys::drain_header_key(index.logical_index_id(), &tree_key(1), target),
+    )
+    .await;
+    let missing_hdr = index
+        .verify(VerifyOptions::default())
+        .await
+        .expect("verify");
+    assert!(kinds(&missing_hdr).contains(&VerifyIssueKind::Reachability));
     runtime.shutdown().await.expect("shutdown");
 }

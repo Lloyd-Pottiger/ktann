@@ -1168,6 +1168,12 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
         decode_batch(&self.binding, &keys, values)
     }
 
+    /// Warms the read cache for `keys` with batched plain snapshot reads,
+    /// caching the raw bytes without decoding them or establishing conflicts.
+    pub(crate) async fn warm(&mut self, keys: Vec<LogicalKey>) -> Result<()> {
+        self.warm_raw(keys, false).await
+    }
+
     /// Warms the read cache for `keys` with batched update-protected reads,
     /// caching the raw bytes without decoding them.
     ///
@@ -1181,11 +1187,15 @@ impl<T: WriteTxn> WriteLogicalTxn<'_, T> {
     ///
     /// Returns the backend's error; keys read before the failure stay cached.
     pub(crate) async fn warm_for_update(&mut self, keys: Vec<LogicalKey>) -> Result<()> {
+        self.warm_raw(keys, true).await
+    }
+
+    async fn warm_raw(&mut self, keys: Vec<LogicalKey>, for_update: bool) -> Result<()> {
         let encoded = keys
             .iter()
             .map(|key| encode_input_key(&self.binding, key))
             .collect::<Result<Vec<_>>>()?;
-        self.batch_get_raw(encoded, true).await?;
+        self.batch_get_raw(encoded, for_update).await?;
         Ok(())
     }
 

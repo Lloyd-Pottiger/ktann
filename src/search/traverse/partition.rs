@@ -11,8 +11,8 @@ use crate::storage::ReadLogicalTxn;
 use crate::storage::backend::ReadOps;
 use crate::storage::keys::{LogicalKey, TreeKey};
 use crate::storage::values::{
-    PartitionHeader, PartitionState, PartitionSynopsis, PartitionTransition, PersistentValue,
-    expect_header, expect_synopsis,
+    IndexManifest, PartitionHeader, PartitionState, PartitionSynopsis, PartitionTransition,
+    PersistentValue, expect_drain_header, expect_header, expect_synopsis,
 };
 
 use super::VisitContext;
@@ -117,9 +117,24 @@ impl PartitionReader {
             return Ok(None);
         }
 
-        let predicate = if level > 1 {
-            None
+        let (header, predicate) = if level > 1 {
+            (header, None)
         } else {
+            let (header, synopsis) = if header.has_drain_sidecar() {
+                Self::apply_drain_sidecar(
+                    txn,
+                    context.manifest,
+                    tree_key,
+                    entry.partition,
+                    header,
+                    synopsis,
+                    context.request.predicate.is_some(),
+                )
+                .await?
+            } else {
+                (header, synopsis)
+            };
+
             let effective_predicate = match context.request.predicate {
                 Some(predicate) => {
                     let synopsis = match synopsis {
@@ -148,17 +163,78 @@ impl PartitionReader {
                 }
                 None => None,
             };
-            // The exact Header count authoritatively proves emptiness.
+            // The exact Header count (plus DrainHeader on ReceivingSplit)
+            // authoritatively proves emptiness.
             if header.entry_count() == 0 {
                 return Ok(None);
             }
-            effective_predicate
+            (header, effective_predicate)
         };
         Ok(Some(PreparedVisit {
             entry,
             header,
             predicate,
         }))
+    }
+
+    /// Combines a level-1 `ReceivingSplit` leaf's `DrainHeader` (and
+    /// `DrainSynopsis` when filtering) with its primary metadata in one read.
+    async fn apply_drain_sidecar<T: ReadOps>(
+        txn: &mut ReadLogicalTxn<'_, T>,
+        manifest: &IndexManifest,
+        tree_key: &TreeKey,
+        partition: PartitionKey,
+        header: PartitionHeader,
+        synopsis: Option<PartitionSynopsis>,
+        need_synopsis: bool,
+    ) -> Result<(PartitionHeader, Option<PartitionSynopsis>)> {
+        let index = manifest.logical_index_id();
+        let drain_header_key = LogicalKey::DrainHeader {
+            index,
+            tree_key: tree_key.clone(),
+            partition,
+        };
+        if !need_synopsis {
+            let drain_header = expect_drain_header(txn.get(drain_header_key).await?)?
+                .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
+            return Ok((header.with_drain(drain_header)?, synopsis));
+        }
+        let mut keys = Vec::with_capacity(if synopsis.is_some() { 2 } else { 3 });
+        keys.push(drain_header_key);
+        keys.push(LogicalKey::DrainSynopsis {
+            index,
+            tree_key: tree_key.clone(),
+            partition,
+        });
+        if synopsis.is_none() {
+            keys.push(LogicalKey::Synopsis {
+                index,
+                tree_key: tree_key.clone(),
+                partition,
+            });
+        }
+        let mut values = txn.batch_get(keys).await?.into_iter();
+        let (Some(drain_header_val), Some(drain_synopsis_val)) = (values.next(), values.next())
+        else {
+            return Err(Error::new(ErrorKind::Backend));
+        };
+        let drain_header = expect_drain_header(drain_header_val)?
+            .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
+        let drain_synopsis = expect_synopsis(drain_synopsis_val)?
+            .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
+        let mut base_synopsis = match synopsis {
+            Some(base) => base,
+            None => {
+                let Some(base_val) = values.next() else {
+                    return Err(Error::new(ErrorKind::Backend));
+                };
+                expect_synopsis(base_val)?.ok_or_else(|| Error::new(ErrorKind::Corruption))?
+            }
+        };
+        base_synopsis
+            .merge(manifest, &drain_synopsis)
+            .map_err(|_| Error::new(ErrorKind::Corruption))?;
+        Ok((header.with_drain(drain_header)?, Some(base_synopsis)))
     }
 
     /// Applies the root-only intermediate topology rules.

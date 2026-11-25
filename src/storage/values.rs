@@ -43,6 +43,7 @@
 //! 0b PartitionSynopsis  sized16<FieldSynopsis>
 //! 0c PartitionState     u8 state, u64 started_at_unix_millis,
 //!                       state-specific u64 keys
+//! 14 DrainHeader        u32 count, u64 epoch
 //! ```
 //!
 //! A zero `started_at_unix_millis` denotes unavailable wall time.
@@ -79,7 +80,8 @@ mod workspace;
 
 #[doc(inline)]
 pub use authority::{
-    PartitionCentroid, PartitionHeader, PartitionState, PartitionTransition, TreeManifest,
+    DrainHeader, PartitionCentroid, PartitionHeader, PartitionState, PartitionTransition,
+    TreeManifest,
 };
 #[doc(inline)]
 pub use build::BuildDescriptor;
@@ -112,6 +114,7 @@ pub(crate) struct LeafRelocationValueSizes {
     pub(crate) leaf_entry: usize,
     pub(crate) record_location: usize,
     pub(crate) partition_header: usize,
+    pub(crate) drain_header: usize,
     pub(crate) partition_synopsis: usize,
 }
 
@@ -124,6 +127,7 @@ pub(crate) fn leaf_relocation_value_sizes(
         leaf_entry: entry::maximum_leaf_entry_encoded_len(manifest)?,
         record_location: record::record_location_encoded_len(tree_key),
         partition_header: authority::PARTITION_HEADER_ENCODED_LEN,
+        drain_header: authority::DRAIN_HEADER_ENCODED_LEN,
         partition_synopsis: manifest.maximum_synopsis_encoded_len(),
     })
 }
@@ -151,6 +155,7 @@ const TAG_BUILD_VALIDATION: u8 = 0x10;
 const TAG_BUILD_LOAD: u8 = 0x0e;
 const TAG_GRAPH_DESCRIPTOR: u8 = 0x12;
 const TAG_GRAPH_CHUNK: u8 = 0x13;
+const TAG_DRAIN_HEADER: u8 = 0x14;
 
 /// The persistent value family expected at a logical key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -187,6 +192,8 @@ pub enum ValueKind {
     RecordLocation,
     /// A Partition Header.
     PartitionHeader,
+    /// A split-drain sidecar Header for a level-1 `ReceivingSplit` leaf.
+    DrainHeader,
     /// A partition's immutable centroid.
     PartitionCentroid,
     /// A Child Entry envelope.
@@ -217,6 +224,7 @@ impl ValueKind {
             Self::OpaquePayload => TAG_OPAQUE_PAYLOAD,
             Self::RecordLocation => TAG_RECORD_LOCATION,
             Self::PartitionHeader => TAG_PARTITION_HEADER,
+            Self::DrainHeader => TAG_DRAIN_HEADER,
             Self::PartitionCentroid => TAG_PARTITION_CENTROID,
             Self::ChildEntry => TAG_CHILD_ENTRY,
             Self::LeafEntry => TAG_LEAF_ENTRY,
@@ -261,6 +269,8 @@ pub enum PersistentValue {
     RecordLocation(RecordLocation),
     /// A Partition Header.
     PartitionHeader(PartitionHeader),
+    /// A split-drain sidecar Header for a level-1 `ReceivingSplit` leaf.
+    DrainHeader(DrainHeader),
     /// A partition centroid.
     PartitionCentroid(PartitionCentroid),
     /// A Child Entry envelope.
@@ -293,6 +303,7 @@ impl PersistentValue {
             Self::OpaquePayload(_) => ValueKind::OpaquePayload,
             Self::RecordLocation(_) => ValueKind::RecordLocation,
             Self::PartitionHeader(_) => ValueKind::PartitionHeader,
+            Self::DrainHeader(_) => ValueKind::DrainHeader,
             Self::PartitionCentroid(_) => ValueKind::PartitionCentroid,
             Self::ChildEntry(_) => ValueKind::ChildEntry,
             Self::LeafEntry(_) => ValueKind::LeafEntry,
@@ -323,6 +334,7 @@ expect_variant!(expect_tree_manifest, TreeManifest, TreeManifest);
 expect_variant!(expect_record, VectorRecord, VectorRecord);
 expect_variant!(expect_location, RecordLocation, RecordLocation);
 expect_variant!(expect_header, PartitionHeader, PartitionHeader);
+expect_variant!(expect_drain_header, DrainHeader, DrainHeader);
 expect_variant!(expect_centroid, PartitionCentroid, PartitionCentroid);
 expect_variant!(expect_leaf_entry, LeafEntry, LeafEntry);
 expect_variant!(expect_child_entry, ChildEntry, ChildEntry);
@@ -403,6 +415,10 @@ impl<'a> ValueCodec<'a> {
             PersistentValue::PartitionHeader(value) => {
                 self.require_manifest()?;
                 authority::encode_partition_header(&mut encoder, *value);
+            }
+            PersistentValue::DrainHeader(value) => {
+                self.require_manifest()?;
+                authority::encode_drain_header(&mut encoder, *value);
             }
             PersistentValue::PartitionCentroid(value) => {
                 authority::encode_partition_centroid(
@@ -501,6 +517,10 @@ impl<'a> ValueCodec<'a> {
                 self.require_manifest()?;
                 PersistentValue::PartitionHeader(authority::decode_partition_header(&mut decoder)?)
             }
+            ValueKind::DrainHeader => {
+                self.require_manifest()?;
+                PersistentValue::DrainHeader(authority::decode_drain_header(&mut decoder)?)
+            }
             ValueKind::PartitionCentroid => PersistentValue::PartitionCentroid(
                 authority::decode_partition_centroid(&mut decoder, self.require_manifest()?)?,
             ),
@@ -547,7 +567,10 @@ const fn value_kind_for_key(key: &LogicalKey) -> ValueKind {
         LogicalKey::Payload { .. } => ValueKind::OpaquePayload,
         LogicalKey::TreeManifest { .. } => ValueKind::TreeManifest,
         LogicalKey::Header { .. } => ValueKind::PartitionHeader,
-        LogicalKey::Synopsis { .. } => ValueKind::PartitionSynopsis,
+        LogicalKey::Synopsis { .. } | LogicalKey::DrainSynopsis { .. } => {
+            ValueKind::PartitionSynopsis
+        }
+        LogicalKey::DrainHeader { .. } => ValueKind::DrainHeader,
         LogicalKey::State { .. } => ValueKind::PartitionState,
         LogicalKey::Centroid { .. } => ValueKind::PartitionCentroid,
         LogicalKey::LeafEntry { .. } => ValueKind::LeafEntry,

@@ -312,9 +312,9 @@ use crate::storage::ReadLogicalTxn;
 use crate::storage::keys::{self, TreeKey};
 use crate::storage::test_support::{MockReadTxn, id, pk};
 use crate::storage::values::{
-    BloomParameters, ChildEntry, IndexLifecycle, IndexManifest, LeafEntry, PartitionHeader,
-    PartitionState, PartitionSynopsis, PartitionTransition, PersistentValue, TreeManifest,
-    ValueCodec,
+    BloomParameters, ChildEntry, DrainHeader, IndexLifecycle, IndexManifest, LeafEntry,
+    PartitionHeader, PartitionState, PartitionSynopsis, PartitionTransition, PersistentValue,
+    TreeManifest, ValueCodec,
 };
 
 use super::super::cache::PartitionCache;
@@ -420,6 +420,16 @@ impl<'a> Fixture<'a> {
                 PartitionHeader::new(level, count, 0, state).expect("valid header"),
             ),
         );
+        if level == 1 && state == PartitionState::ReceivingSplit {
+            self.push(
+                keys::drain_header_key(self.manifest.logical_index_id(), tree, pk(partition)),
+                PersistentValue::DrainHeader(DrainHeader::empty()),
+            );
+            self.push(
+                keys::drain_synopsis_key(self.manifest.logical_index_id(), tree, pk(partition)),
+                PersistentValue::PartitionSynopsis(PartitionSynopsis::empty(self.manifest)),
+            );
+        }
     }
 
     fn state(&mut self, tree: &TreeKey, partition: u64, transition: PartitionTransition) {
