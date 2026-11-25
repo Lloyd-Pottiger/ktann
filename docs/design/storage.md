@@ -147,7 +147,8 @@ The core defines one logical namespace for:
 - Index Manifest, Build Descriptor, Build Load, and Build Validation;
 - Vector Record, Opaque Payload, and Record Location;
 - Tree Manifest directory entries;
-- Partition Header, serving-immutable Centroid, Synopsis, and transition State;
+- Partition Header, serving-immutable Centroid, Synopsis, transition State, and
+  level-1 `ReceivingSplit` Drain Header and Drain Synopsis sidecars;
 - Leaf Entry and Child Entry;
 - partition-local Graph Descriptor and numbered Graph Chunks.
 
@@ -196,7 +197,17 @@ remain gaps.
 
 Partition Header stores level (1 for a leaf), exact entry count, cache epoch,
 and the small Partition State discriminator needed for traversal; level alone
-determines whether the partition contains Leaf or Child Entries. Transition
+determines whether the partition contains Leaf or Child Entries. A level-1
+`ReceivingSplit` leaf additionally stores two split-drain sidecar keys under the
+same partition prefix: Drain Header (subkey `0x08`, value tag `0x14`: big-endian
+`u32` entry count and `u64` cache epoch) and Drain Synopsis (subkey `0x09`,
+reusing the `PartitionSynopsis` value tag `0x0b`). These sidecars exist if and
+only if `level == 1` and `state == ReceivingSplit`: split exposure creates them
+empty, split draining updates them without conflicting against foreground writes
+to the primary Header and Synopsis, and split completion folds them into the
+primary Header and Synopsis and deletes both keys atomically. Presence on any
+other state or internal level, or absence on a level-1 `ReceivingSplit` leaf, is
+`Corruption`. Transition
 payloads store the source/target references required to resume a transition and
 `started_at_unix_millis`, an unsigned 64-bit Unix-epoch millisecond timestamp
 used for recovery age checks and diagnostic metrics. Zero denotes an unavailable timestamp. Structural drain

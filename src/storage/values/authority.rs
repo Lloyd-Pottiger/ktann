@@ -12,6 +12,9 @@ use super::wire::{Decoder, Encoder};
 /// The exact encoded length of every Partition Header.
 pub(super) const PARTITION_HEADER_ENCODED_LEN: usize = 1 + 4 + 4 + 8 + 1;
 
+/// The exact encoded length of every Drain Header.
+pub(super) const DRAIN_HEADER_ENCODED_LEN: usize = 1 + 4 + 8;
+
 /// The directory and Partition Key allocator state for one Tree Key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TreeManifest {
@@ -122,6 +125,108 @@ impl PartitionHeader {
     #[must_use]
     pub const fn state(self) -> PartitionState {
         self.state
+    }
+
+    /// Whether this partition owns `DrainHeader` and `DrainSynopsis` sidecars.
+    ///
+    /// Sidecars exist if and only if a partition is a level-1 `ReceivingSplit`
+    /// leaf target (ADR 0014).
+    #[must_use]
+    pub(crate) const fn has_drain_sidecar(self) -> bool {
+        self.level == 1 && matches!(self.state, PartitionState::ReceivingSplit)
+    }
+
+    /// Combines this primary Header with its `DrainHeader` sidecar for
+    /// read-time entry counts, cache validation, and verification.
+    pub(crate) fn with_drain(self, drain: DrainHeader) -> Result<Self> {
+        if !self.has_drain_sidecar() {
+            return Err(corrupt());
+        }
+        let entry_count = self
+            .entry_count
+            .checked_add(drain.entry_count)
+            .ok_or_else(corrupt)?;
+        let cache_epoch = self
+            .cache_epoch
+            .checked_add(drain.cache_epoch)
+            .ok_or_else(corrupt)?;
+        Self::new(self.level, entry_count, cache_epoch, self.state).map_err(|_| corrupt())
+    }
+
+    /// Folds `drain` into this primary Header and promotes the leaf to `Ready`.
+    ///
+    /// Advances `cache_epoch` by one past the combined epoch so the promoted
+    /// `Ready` leaf strictly supersedes any pre-finalize Partition Cache entry.
+    pub(crate) fn fold_drain_to_ready(self, drain: DrainHeader) -> Result<Self> {
+        let effective = self.with_drain(drain)?;
+        let cache_epoch = effective.cache_epoch.checked_add(1).ok_or_else(corrupt)?;
+        Self::new(
+            effective.level,
+            effective.entry_count,
+            cache_epoch,
+            PartitionState::Ready,
+        )
+        .map_err(|_| corrupt())
+    }
+}
+
+/// Split-drain sidecar count and cache epoch for a level-1 `ReceivingSplit` leaf.
+///
+/// Exists if and only if the partition is a level-1 `ReceivingSplit` target.
+/// Isolates split-drain entry counts and cache epochs from the primary
+/// [`PartitionHeader`] updated by concurrent foreground writes, and folds back
+/// into the primary Header when the split completes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DrainHeader {
+    entry_count: u32,
+    cache_epoch: u64,
+}
+
+impl DrainHeader {
+    /// Creates a Drain Header with the given count and cache epoch.
+    #[must_use]
+    pub const fn new(entry_count: u32, cache_epoch: u64) -> Self {
+        Self {
+            entry_count,
+            cache_epoch,
+        }
+    }
+
+    /// Creates an empty Drain Header for a newly exposed split target.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            entry_count: 0,
+            cache_epoch: 0,
+        }
+    }
+
+    /// Returns the exact count of entries tracked by this drain sidecar.
+    #[must_use]
+    pub const fn entry_count(self) -> u32 {
+        self.entry_count
+    }
+
+    /// Returns the persistent cache-validation epoch of this drain sidecar.
+    #[must_use]
+    pub const fn cache_epoch(self) -> u64 {
+        self.cache_epoch
+    }
+
+    /// Returns this Drain Header with its exact count increased by one and
+    /// cache epoch bumped, failing closed on overflow.
+    pub(crate) fn added_entry(self) -> Result<Self> {
+        let entry_count = self.entry_count.checked_add(1).ok_or_else(corrupt)?;
+        let cache_epoch = self.cache_epoch.checked_add(1).ok_or_else(corrupt)?;
+        Ok(Self::new(entry_count, cache_epoch))
+    }
+
+    /// Returns this Drain Header with its exact count decreased by one and
+    /// cache epoch bumped, failing closed on underflow or epoch overflow.
+    pub(crate) fn removed_entry(self) -> Result<Self> {
+        let entry_count = self.entry_count.checked_sub(1).ok_or_else(corrupt)?;
+        let cache_epoch = self.cache_epoch.checked_add(1).ok_or_else(corrupt)?;
+        Ok(Self::new(entry_count, cache_epoch))
     }
 }
 
@@ -284,6 +389,17 @@ pub(super) fn decode_partition_header(decoder: &mut Decoder) -> Result<Partition
     let cache_epoch = decoder.u64()?;
     let state = decode_state_kind(decoder.u8()?)?;
     PartitionHeader::new(level, entry_count, cache_epoch, state).map_err(|_| corrupt())
+}
+
+pub(super) fn encode_drain_header(encoder: &mut Encoder, header: DrainHeader) {
+    encoder.u32(header.entry_count);
+    encoder.u64(header.cache_epoch);
+}
+
+pub(super) fn decode_drain_header(decoder: &mut Decoder) -> Result<DrainHeader> {
+    let entry_count = decoder.u32()?;
+    let cache_epoch = decoder.u64()?;
+    Ok(DrainHeader::new(entry_count, cache_epoch))
 }
 
 pub(super) fn encode_partition_centroid(

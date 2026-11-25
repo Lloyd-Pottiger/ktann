@@ -9,9 +9,10 @@ use bytes::Bytes;
 use ktann::api::{DataType, ErrorKind, IndexName, LogicalIndexId, PartitionKey, Value};
 use ktann::storage::keys::{
     LogicalKey, MAX_RECORD_ID_BYTES, MAX_STRING_BYTES, MAX_TREE_KEY_BYTES, TreeKey, centroid_key,
-    child_entry_key, decode_key, header_key, index_id_allocator_key, index_range, leaf_entry_key,
-    location_key, manifest_key, name_directory_key, partition_range, payload_key, record_key,
-    state_key, synopsis_key, tree_manifest_key, tree_manifest_prefix_range, tree_manifest_range,
+    child_entry_key, decode_key, drain_header_key, drain_synopsis_key, header_key,
+    index_id_allocator_key, index_range, leaf_entry_key, location_key, manifest_key,
+    name_directory_key, partition_range, payload_key, record_key, state_key, synopsis_key,
+    tree_manifest_key, tree_manifest_prefix_range, tree_manifest_range,
 };
 
 fn id(value: u64) -> LogicalIndexId {
@@ -155,6 +156,40 @@ fn partition_family_golden_bytes() {
         child_entry_key(id(1), &tree_key, pk(1), pk(2)),
         expected(&[0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02])
     );
+    assert_eq!(drain_header_key(id(1), &tree_key, pk(1)), expected(&[0x08]));
+    assert_eq!(
+        drain_synopsis_key(id(1), &tree_key, pk(1)),
+        expected(&[0x09])
+    );
+    assert_eq!(
+        decode_key(
+            &types,
+            &Bytes::from(drain_header_key(id(1), &tree_key, pk(1)))
+        )
+        .expect("decode drain header"),
+        LogicalKey::DrainHeader {
+            index: id(1),
+            tree_key: tree_key.clone(),
+            partition: pk(1),
+        }
+    );
+    assert_eq!(
+        decode_key(
+            &types,
+            &Bytes::from(drain_synopsis_key(id(1), &tree_key, pk(1)))
+        )
+        .expect("decode drain synopsis"),
+        LogicalKey::DrainSynopsis {
+            index: id(1),
+            tree_key: tree_key.clone(),
+            partition: pk(1),
+        }
+    );
+    assert!(is_corrupt(&types, &expected(&[0x08, 0x00])));
+    assert!(is_corrupt(&types, &expected(&[0x09, 0x00])));
+    let range = partition_range(id(1), &tree_key, pk(1));
+    assert!(range.start() <= drain_header_key(id(1), &tree_key, pk(1)).as_slice());
+    assert!(drain_synopsis_key(id(1), &tree_key, pk(1)).as_slice() < range.end());
 }
 
 // ---------------------------------------------------------------------------

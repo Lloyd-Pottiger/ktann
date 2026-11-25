@@ -9,8 +9,8 @@ use ktann::api::{
 };
 use ktann::storage::keys::{LogicalKey, TreeKey};
 use ktann::storage::values::{
-    BloomParameters, ChildEntry, IndexIdAllocator, IndexLifecycle, IndexManifest, IndexNameEntry,
-    LeafEntry, OpaquePayload, PartitionCentroid, PartitionHeader, PartitionState,
+    BloomParameters, ChildEntry, DrainHeader, IndexIdAllocator, IndexLifecycle, IndexManifest,
+    IndexNameEntry, LeafEntry, OpaquePayload, PartitionCentroid, PartitionHeader, PartitionState,
     PartitionSynopsis, PartitionTransition, PersistentValue, RecordLocation, TreeManifest,
     ValueCodec, VectorRecord,
 };
@@ -127,6 +127,11 @@ fn key_for_value(index: LogicalIndexId, value: &PersistentValue) -> LogicalKey {
             id: Bytes::from_static(b"r"),
         },
         PersistentValue::PartitionHeader(_) => LogicalKey::Header {
+            index,
+            tree_key,
+            partition: pk(1),
+        },
+        PersistentValue::DrainHeader(_) => LogicalKey::DrainHeader {
             index,
             tree_key,
             partition: pk(1),
@@ -1249,4 +1254,36 @@ fn routing_dispersion_roundtrips_and_rejects_noncanonical_values() {
     for bad in [-0.1, 1.1, f64::NAN, f64::INFINITY] {
         assert!(PartitionCentroid::with_dispersion(vec![0.0], bad).is_err());
     }
+}
+
+#[test]
+fn drain_header_and_drain_synopsis_golden_bytes_and_malformed_framing() {
+    let manifest = rich_manifest();
+    let codec = index_codec(&manifest);
+    let drain_header = PersistentValue::DrainHeader(DrainHeader::new(42, 0x0102_0304_0506_0708));
+    let bytes = codec.encode(&drain_header).expect("encode drain header");
+    assert_eq!(
+        bytes,
+        b"\x14\x00\x00\x00\x2a\x01\x02\x03\x04\x05\x06\x07\x08"
+    );
+    round_trip(codec, id(7), &drain_header);
+    assert_malformed_framing(codec, id(7), &drain_header);
+
+    // DrainSynopsis reuses the PartitionSynopsis value codec under LogicalKey::DrainSynopsis.
+    let tree_key = TreeKey::encode(
+        &[DataType::String],
+        &[Value::string("tenant-a").expect("valid String")],
+    )
+    .expect("valid Tree Key");
+    let synopsis = PersistentValue::PartitionSynopsis(rich_synopsis(&manifest));
+    let synopsis_bytes = codec.encode(&synopsis).expect("encode drain synopsis");
+    let drain_synopsis_key = LogicalKey::DrainSynopsis {
+        index: id(7),
+        tree_key,
+        partition: pk(2),
+    };
+    assert_eq!(
+        decode(codec, &drain_synopsis_key, &synopsis_bytes).expect("decode drain synopsis"),
+        synopsis
+    );
 }

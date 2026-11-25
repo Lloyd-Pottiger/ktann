@@ -19,8 +19,8 @@ use ktann::runtime::Runtime;
 use ktann::storage::backend::{Backend, ScanLimits, WriteTxn};
 use ktann::storage::keys::{self, LogicalKey, TreeKey};
 use ktann::storage::values::{
-    IndexLifecycle, PartitionHeader, PartitionState, PartitionSynopsis, PartitionTransition,
-    PersistentValue, RecordLocation,
+    DrainHeader, IndexLifecycle, PartitionHeader, PartitionState, PartitionSynopsis,
+    PartitionTransition, PersistentValue, RecordLocation,
 };
 use ktann::storage::{LogicalRange, ReadLogicalTxn, WriteLogicalTxn};
 use tokio_util::sync::CancellationToken;
@@ -651,6 +651,22 @@ async fn a_draining_root_split_stays_searchable_with_exact_membership() {
             },
         ),
         synopsis(pk(2), &rows[0]),
+        (
+            LogicalKey::DrainHeader {
+                index: iid,
+                tree_key: key.clone(),
+                partition: pk(2),
+            },
+            PersistentValue::DrainHeader(DrainHeader::empty()),
+        ),
+        (
+            LogicalKey::DrainSynopsis {
+                index: iid,
+                tree_key: key.clone(),
+                partition: pk(2),
+            },
+            PersistentValue::PartitionSynopsis(PartitionSynopsis::empty(&manifest)),
+        ),
         header(pk(3), 1, PartitionState::ReceivingSplit),
         state(
             pk(3),
@@ -660,6 +676,22 @@ async fn a_draining_root_split_stays_searchable_with_exact_membership() {
             },
         ),
         synopsis(pk(3), &rows[2]),
+        (
+            LogicalKey::DrainHeader {
+                index: iid,
+                tree_key: key.clone(),
+                partition: pk(3),
+            },
+            PersistentValue::DrainHeader(DrainHeader::empty()),
+        ),
+        (
+            LogicalKey::DrainSynopsis {
+                index: iid,
+                tree_key: key.clone(),
+                partition: pk(3),
+            },
+            PersistentValue::PartitionSynopsis(PartitionSynopsis::empty(&manifest)),
+        ),
     ];
     for (key, value) in writes {
         txn.put(key, value).await.expect("write topology");
@@ -966,6 +998,22 @@ async fn a_duplicate_record_id_across_partitions_fails_closed() {
             },
         ),
         synopsis(pk(2), &rows[0]),
+        (
+            LogicalKey::DrainHeader {
+                index: iid,
+                tree_key: key.clone(),
+                partition: pk(2),
+            },
+            PersistentValue::DrainHeader(DrainHeader::empty()),
+        ),
+        (
+            LogicalKey::DrainSynopsis {
+                index: iid,
+                tree_key: key.clone(),
+                partition: pk(2),
+            },
+            PersistentValue::PartitionSynopsis(PartitionSynopsis::empty(&manifest)),
+        ),
         header(pk(3), 1, PartitionState::ReceivingSplit),
         state(
             pk(3),
@@ -975,6 +1023,22 @@ async fn a_duplicate_record_id_across_partitions_fails_closed() {
             },
         ),
         synopsis(pk(3), &rows[2]),
+        (
+            LogicalKey::DrainHeader {
+                index: iid,
+                tree_key: key.clone(),
+                partition: pk(3),
+            },
+            PersistentValue::DrainHeader(DrainHeader::empty()),
+        ),
+        (
+            LogicalKey::DrainSynopsis {
+                index: iid,
+                tree_key: key.clone(),
+                partition: pk(3),
+            },
+            PersistentValue::PartitionSynopsis(PartitionSynopsis::empty(&manifest)),
+        ),
     ];
     for (key, value) in writes {
         txn.put(key, value).await.expect("write topology");
@@ -1274,5 +1338,115 @@ async fn compound_string_numeric_tree_key_insert_get_search() {
         assert_eq!(result.hits[0].id(), &id);
         assert_no_budget_exhaustion(&result);
     }
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receiving_split_leaf_merges_drain_sidecars_for_search_and_cache() {
+    let backend = shared_backend(TestConfig::default());
+    let runtime = make_runtime(backend.clone());
+    let index = runtime
+        .create_index(
+            "sidecar-search",
+            config()
+                .without_local_graph()
+                .with_leaf_partition_entries(1, 2)
+                .unwrap()
+                .with_internal_partition_entries(1, 2)
+                .unwrap(),
+        )
+        .await
+        .expect("create");
+    let rows: Vec<Row> = vec![
+        (b"a".to_vec(), 0.0, 1, Some(10)),
+        (b"b".to_vec(), 1.0, 1, Some(20)),
+        (b"c".to_vec(), 10.0, 1, Some(30)),
+        (b"d".to_vec(), 11.0, 1, Some(40)),
+    ];
+    insert_all(&index, &rows).await;
+    let manifest = support::read_manifest(&backend, index.logical_index_id()).await;
+    let retry = ktann::runtime::RetryPolicy::for_fixup(&ktann::api::RuntimeConfig::default());
+    let key = tree_key(1);
+
+    ktann::maintenance::split::begin_split(&backend, &manifest, &key, pk(1), 1_000, &retry)
+        .await
+        .expect("begin");
+    ktann::maintenance::split::expose_targets(&backend, &manifest, &key, pk(1), 1_100, &retry)
+        .await
+        .expect("expose");
+
+    // Warm the cache on the freshly exposed empty targets, then drain one batch
+    // (advancing DrainHeader/DrainSynopsis only) and insert a foreground record
+    // (advancing primary Header/Synopsis only). Every search must reflect both
+    // unfiltered and filtered results without stale cache hits.
+    let exact = || {
+        search_request(10).with_options(
+            SearchOptions::default()
+                .with_routing_mode(ktann::api::RoutingMode::Exact)
+                .expect("exact routing"),
+        )
+    };
+    let initial = index.search(exact()).await.expect("initial");
+    assert_eq!(initial.hits.len(), 4);
+
+    ktann::maintenance::split::drain_batch(&backend, &manifest, &key, pk(1), &retry)
+        .await
+        .expect("drain batch 1");
+    let after_drain = index.search(exact()).await.expect("after drain");
+    assert_eq!(after_drain.hits.len(), 4);
+
+    // Filtered search must find a record whose synopsis lives only in DrainSynopsis.
+    let filtered = index
+        .search(exact().with_predicate(Predicate::Compare {
+            field: FieldId(1),
+            op: CompareOp::Eq,
+            value: Value::I64(10),
+        }))
+        .await
+        .expect("filtered drained");
+    assert_eq!(filtered.hits.len(), 1);
+    assert_eq!(filtered.hits[0].id().as_ref(), b"a");
+
+    // Foreground insert into a ReceivingSplit target updates primary Header/Synopsis
+    // and must invalidate the cached ReceivingSplit body too.
+    let extra = (b"e".to_vec(), 0.5, 1, Some(50));
+    index
+        .insert(record(&extra))
+        .await
+        .expect("foreground insert");
+    let after_insert = index
+        .search(exact().with_predicate(Predicate::Compare {
+            field: FieldId(1),
+            op: CompareOp::Eq,
+            value: Value::I64(50),
+        }))
+        .await
+        .expect("filtered foreground");
+    assert_eq!(after_insert.hits.len(), 1);
+    assert_eq!(after_insert.hits[0].id().as_ref(), b"e");
+
+    // Finish draining and complete the split; promoted Ready leaves must serve
+    // all 5 records and honor filters after sidecar folding.
+    while matches!(
+        ktann::maintenance::split::drain_batch(&backend, &manifest, &key, pk(1), &retry)
+            .await
+            .expect("drain remaining"),
+        ktann::maintenance::split::DrainStep::Drained { remaining, .. } if remaining > 0
+    ) {}
+    ktann::maintenance::split::complete_split(&backend, &manifest, &key, pk(1), 1_300, &retry)
+        .await
+        .expect("complete");
+    let final_all = index.search(exact()).await.expect("final all");
+    assert_eq!(final_all.hits.len(), 5);
+    let final_filtered = index
+        .search(exact().with_predicate(Predicate::Compare {
+            field: FieldId(1),
+            op: CompareOp::Eq,
+            value: Value::I64(10),
+        }))
+        .await
+        .expect("final filtered");
+    assert_eq!(final_filtered.hits.len(), 1);
+    assert_eq!(final_filtered.hits[0].id().as_ref(), b"a");
     runtime.shutdown().await.unwrap();
 }

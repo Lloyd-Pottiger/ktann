@@ -26,7 +26,7 @@ use crate::api::{PartitionKey, VerifyIssueKind, typed_order};
 use crate::storage::keys::TreeKey;
 use crate::storage::topology::root_partition;
 use crate::storage::values::{
-    FieldSynopsis, IndexManifest, LeafEntry, PartitionHeader, PartitionSynopsis,
+    DrainHeader, FieldSynopsis, IndexManifest, LeafEntry, PartitionHeader, PartitionSynopsis,
     PartitionTransition, TreeManifest,
 };
 
@@ -50,6 +50,10 @@ struct PartitionFacts {
     transition: Option<PartitionTransition>,
     /// The stored Synopsis, retained for the leaf conservatism check.
     synopsis: Option<PartitionSynopsis>,
+    /// The split-drain sidecar Header, valid iff level-1 `ReceivingSplit`.
+    drain_header: Option<DrainHeader>,
+    /// The split-drain sidecar Synopsis, valid iff level-1 `ReceivingSplit`.
+    drain_synopsis: Option<PartitionSynopsis>,
     /// The conservative lower bound expanded per scanned Leaf Entry.
     recomputed: PartitionSynopsis,
     leaf_entries: u64,
@@ -65,6 +69,8 @@ impl PartitionFacts {
             header: None,
             transition: None,
             synopsis: None,
+            drain_header: None,
+            drain_synopsis: None,
             recomputed: PartitionSynopsis::empty(manifest),
             leaf_entries: 0,
             child_entries: 0,
@@ -163,6 +169,40 @@ impl TopologyLedger {
         if let Some(facts) = self.current_facts() {
             facts.charged = facts.charged.saturating_add(estimate);
             facts.synopsis = Some(synopsis);
+        }
+    }
+
+    /// Notes one decoded split-drain sidecar Header.
+    pub(super) fn absorb_drain_header(
+        &mut self,
+        cx: &mut Context<'_>,
+        tree_key: &TreeKey,
+        partition: PartitionKey,
+        drain_header: DrainHeader,
+    ) {
+        self.open_partition(cx, tree_key, partition);
+        if let Some(facts) = self.current_facts() {
+            facts.drain_header = Some(drain_header);
+        }
+    }
+
+    /// Notes one decoded split-drain sidecar Synopsis.
+    pub(super) fn absorb_drain_synopsis(
+        &mut self,
+        cx: &mut Context<'_>,
+        tree_key: &TreeKey,
+        partition: PartitionKey,
+        drain_synopsis: PartitionSynopsis,
+    ) {
+        self.open_partition(cx, tree_key, partition);
+        let estimate = self.synopsis_estimate;
+        cx.charge_memory(estimate);
+        if cx.truncated() {
+            return;
+        }
+        if let Some(facts) = self.current_facts() {
+            facts.charged = facts.charged.saturating_add(estimate);
+            facts.drain_synopsis = Some(drain_synopsis);
         }
     }
 
@@ -387,9 +427,44 @@ impl TreeWalk {
         }
         if let Some(header) = facts.header {
             cx.note_actionable_partition(partition, header);
-            let expected = u64::from(header.entry_count());
+            let expects_drain_sidecar = header.has_drain_sidecar();
+            if facts.drain_header.is_some() != expects_drain_sidecar {
+                cx.issue(
+                    VerifyIssueKind::Reachability,
+                    Some(&self.tree_key),
+                    Some(partition),
+                    None,
+                );
+            }
+            if facts.drain_synopsis.is_some() != expects_drain_sidecar {
+                cx.issue(
+                    VerifyIssueKind::Reachability,
+                    Some(&self.tree_key),
+                    Some(partition),
+                    None,
+                );
+            }
+
             if header.level() == 1 {
-                if facts.leaf_entries != expected {
+                if expects_drain_sidecar {
+                    if let Some(drain_header) = facts.drain_header {
+                        cx.note_drain_entries(
+                            header.level(),
+                            header.entry_count(),
+                            drain_header.entry_count(),
+                        );
+                        match header.with_drain(drain_header) {
+                            Ok(effective)
+                                if facts.leaf_entries == u64::from(effective.entry_count()) => {}
+                            _ => cx.issue(
+                                VerifyIssueKind::CountMismatch,
+                                Some(&self.tree_key),
+                                Some(partition),
+                                None,
+                            ),
+                        }
+                    }
+                } else if facts.leaf_entries != u64::from(header.entry_count()) {
                     cx.issue(
                         VerifyIssueKind::CountMismatch,
                         Some(&self.tree_key),
@@ -397,9 +472,14 @@ impl TreeWalk {
                         None,
                     );
                 }
-                match &facts.synopsis {
-                    // A leaf requires its Synopsis.
-                    None => {
+
+                match (
+                    &facts.synopsis,
+                    expects_drain_sidecar,
+                    &facts.drain_synopsis,
+                ) {
+                    // A leaf requires its primary Synopsis.
+                    (None, _, _) => {
                         cx.issue(
                             VerifyIssueKind::Reachability,
                             Some(&self.tree_key),
@@ -407,17 +487,34 @@ impl TreeWalk {
                             None,
                         );
                     }
-                    Some(stored) if !conservative(stored, &facts.recomputed, cx.manifest) => {
-                        cx.issue(
-                            VerifyIssueKind::SynopsisNotConservative,
-                            Some(&self.tree_key),
-                            Some(partition),
-                            None,
-                        );
+                    (Some(stored), true, Some(drain)) => {
+                        let mut combined = stored.clone();
+                        if combined.merge(cx.manifest, drain).is_err()
+                            || !conservative(&combined, &facts.recomputed, cx.manifest)
+                        {
+                            cx.issue(
+                                VerifyIssueKind::SynopsisNotConservative,
+                                Some(&self.tree_key),
+                                Some(partition),
+                                None,
+                            );
+                        }
                     }
-                    Some(_) => {}
+                    // Missing DrainSynopsis was already reported above.
+                    (Some(_), true, None) => {}
+                    (Some(stored), false, _) => {
+                        if !conservative(stored, &facts.recomputed, cx.manifest) {
+                            cx.issue(
+                                VerifyIssueKind::SynopsisNotConservative,
+                                Some(&self.tree_key),
+                                Some(partition),
+                                None,
+                            );
+                        }
+                    }
                 }
             } else {
+                let expected = u64::from(header.entry_count());
                 if facts.child_entries != expected {
                     cx.issue(
                         VerifyIssueKind::CountMismatch,

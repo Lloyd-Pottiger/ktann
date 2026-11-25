@@ -244,7 +244,8 @@ impl<'m> Context<'m> {
                 };
                 *count = count.saturating_add(1);
             }
-            PersistentValue::PartitionSynopsis(_)
+            PersistentValue::DrainHeader(_)
+            | PersistentValue::PartitionSynopsis(_)
             | PersistentValue::PartitionState(_)
             | PersistentValue::PartitionCentroid(_) => {
                 self.counts.partitions = self.counts.partitions.saturating_add(1);
@@ -254,6 +255,20 @@ impl<'m> Context<'m> {
             }
             _ => {}
         }
+    }
+
+    /// Adds a level-1 `ReceivingSplit` leaf's Drain Header entry count into
+    /// the per-level topology totals once both Header and Drain Header are read.
+    pub(super) fn note_drain_entries(
+        &mut self,
+        level: u32,
+        header_entries: u32,
+        drain_entries: u32,
+    ) {
+        let entries = self.topology.entries_by_level.entry(level).or_default();
+        *entries = entries.saturating_add(u64::from(drain_entries));
+        let maximum = self.topology.max_entries_by_level.entry(level).or_default();
+        *maximum = (*maximum).max(header_entries.saturating_add(drain_entries));
     }
 
     /// Counts a Header whose durable state can advance Structure Maintenance.
@@ -408,6 +423,8 @@ async fn process_item<B: Backend>(
         LogicalKey::TreeManifest { .. }
             | LogicalKey::Header { .. }
             | LogicalKey::Synopsis { .. }
+            | LogicalKey::DrainHeader { .. }
+            | LogicalKey::DrainSynopsis { .. }
             | LogicalKey::State { .. }
             | LogicalKey::Centroid { .. }
             | LogicalKey::LeafEntry { .. }
@@ -450,6 +467,26 @@ async fn process_item<B: Backend>(
             PersistentValue::PartitionSynopsis(synopsis),
         ) => {
             topology.absorb_synopsis(cx, tree_key, *partition, synopsis);
+        }
+        (
+            LogicalKey::DrainHeader {
+                tree_key,
+                partition,
+                ..
+            },
+            PersistentValue::DrainHeader(drain_header),
+        ) => {
+            topology.absorb_drain_header(cx, tree_key, *partition, drain_header);
+        }
+        (
+            LogicalKey::DrainSynopsis {
+                tree_key,
+                partition,
+                ..
+            },
+            PersistentValue::PartitionSynopsis(drain_synopsis),
+        ) => {
+            topology.absorb_drain_synopsis(cx, tree_key, *partition, drain_synopsis);
         }
         (
             LogicalKey::State {
@@ -534,6 +571,8 @@ fn partition_key(key: &LogicalKey) -> Option<PartitionKey> {
     match key {
         LogicalKey::Header { partition, .. }
         | LogicalKey::Synopsis { partition, .. }
+        | LogicalKey::DrainHeader { partition, .. }
+        | LogicalKey::DrainSynopsis { partition, .. }
         | LogicalKey::State { partition, .. }
         | LogicalKey::Centroid { partition, .. }
         | LogicalKey::LeafEntry { partition, .. }

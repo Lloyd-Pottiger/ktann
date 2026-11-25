@@ -15,18 +15,18 @@ use ktann::maintenance::training::train_split_centroids;
 use ktann::storage::backend::{Backend, WriteTxn};
 use ktann::storage::keys::{self, LogicalKey, TreeKey};
 use ktann::storage::values::{
-    ChildEntry, IndexManifest, LeafEntry, PartitionCentroid, PartitionHeader, PartitionState,
-    PartitionSynopsis, PartitionTransition, PersistentValue,
+    ChildEntry, DrainHeader, IndexManifest, LeafEntry, PartitionCentroid, PartitionHeader,
+    PartitionState, PartitionSynopsis, PartitionTransition, PersistentValue,
 };
 use ktann::storage::{topology, tree_manifest};
 
 use support::builders::{create_committed_tree, pk, read_txn, tree_key, write_txn};
 use support::topology_probe::{
     all_partitions, assert_exact_membership, assert_fault_kind, assert_searchable, backend,
-    backend_with_clear, centroid_of, config, drive_split_to_completion, edge_of, header_of,
-    leaf_entry_of, location_of, make_runtime, reachable_leaves, record, retry, rid,
-    scan_child_entries, scan_leaf_entries, seed_records, stage_drained_branch, state_of,
-    synopsis_of,
+    backend_with_clear, centroid_of, config, drain_header_of, drain_synopsis_of,
+    drive_split_to_completion, edge_of, header_of, leaf_entry_of, location_of, make_runtime,
+    reachable_leaves, record, retry, rid, scan_child_entries, scan_leaf_entries, seed_records,
+    stage_drained_branch, state_of, synopsis_of,
 };
 use support::{CommitFault, MemoryBackend, Rng, TestConfig, read_manifest};
 
@@ -1561,6 +1561,36 @@ async fn seed_completable_non_root_split(
         )
         .await
         .expect("put target centroid");
+        txn.put(
+            LogicalKey::Synopsis {
+                index,
+                tree_key: key.clone(),
+                partition: target,
+            },
+            PersistentValue::PartitionSynopsis(PartitionSynopsis::empty(manifest)),
+        )
+        .await
+        .expect("put target synopsis");
+        txn.put(
+            LogicalKey::DrainHeader {
+                index,
+                tree_key: key.clone(),
+                partition: target,
+            },
+            PersistentValue::DrainHeader(DrainHeader::empty()),
+        )
+        .await
+        .expect("put target drain header");
+        txn.put(
+            LogicalKey::DrainSynopsis {
+                index,
+                tree_key: key.clone(),
+                partition: target,
+            },
+            PersistentValue::PartitionSynopsis(PartitionSynopsis::empty(manifest)),
+        )
+        .await
+        .expect("put target drain synopsis");
     }
     txn.commit().await.expect("commit fixture");
 }
@@ -2168,19 +2198,26 @@ async fn drain_moves_bounded_batches_and_refreshes_target_authority() {
         }
     );
 
-    // Each target's exact count, cache epoch, and synopsis reflect exactly
-    // the entries it received: the epoch bumped once per moved entry and the
-    // synopsis expanded monotonically from the canonical empty value.
+    // During ReceivingSplit, drained entries update the DrainHeader and
+    // DrainSynopsis sidecars while leaving the primary Header and Synopsis
+    // untouched (avoiding conflicts with concurrent foreground writes).
+    let mut expected_synopses = BTreeMap::new();
+    let mut expected_counts = BTreeMap::new();
     for target in [pk(2), pk(3)] {
         let entries = scan_leaf_entries(&backend, &manifest, &key, target).await;
         let header = header_of(&backend, &manifest, &key, target)
             .await
             .expect("target header");
-        assert_eq!(header.entry_count() as usize, entries.len());
+        assert_eq!(header.entry_count(), 0);
+        assert_eq!(header.cache_epoch(), 0);
+        let drain_header = drain_header_of(&backend, &manifest, &key, target)
+            .await
+            .expect("target drain header");
+        assert_eq!(drain_header.entry_count() as usize, entries.len());
         assert_eq!(
-            header.cache_epoch(),
-            u64::from(header.entry_count()),
-            "one epoch bump per moved entry"
+            drain_header.cache_epoch(),
+            u64::from(drain_header.entry_count()),
+            "one drain epoch bump per moved entry"
         );
         let mut expected = PartitionSynopsis::empty(&manifest);
         for entry in &entries {
@@ -2188,9 +2225,16 @@ async fn drain_moves_bounded_batches_and_refreshes_target_authority() {
         }
         assert_eq!(
             synopsis_of(&backend, &manifest, &key, target).await,
-            Some(expected),
-            "target synopsis is exactly the moved entries' expansion"
+            Some(PartitionSynopsis::empty(&manifest)),
+            "primary synopsis stays untouched by drain"
         );
+        assert_eq!(
+            drain_synopsis_of(&backend, &manifest, &key, target).await,
+            Some(expected.clone()),
+            "drain synopsis is exactly the moved entries' expansion"
+        );
+        expected_counts.insert(target, entries.len());
+        expected_synopses.insert(target, expected);
     }
 
     let completion = split::complete_split(&backend, &manifest, &key, pk(1), 1_300, &retry())
@@ -2200,6 +2244,30 @@ async fn drain_moves_bounded_batches_and_refreshes_target_authority() {
         completion,
         topology::SplitCompletion::Completed { .. }
     ));
+    // Split completion folds DrainHeader and DrainSynopsis into Header and
+    // Synopsis, bumps the epoch past the combined epoch, and deletes both
+    // sidecar keys.
+    for target in [pk(2), pk(3)] {
+        let count = expected_counts[&target];
+        let header = header_of(&backend, &manifest, &key, target)
+            .await
+            .expect("promoted header");
+        assert_eq!(header.state(), PartitionState::Ready);
+        assert_eq!(header.entry_count() as usize, count);
+        assert_eq!(header.cache_epoch(), count as u64 + 1);
+        assert_eq!(
+            synopsis_of(&backend, &manifest, &key, target).await,
+            Some(expected_synopses[&target].clone())
+        );
+        assert_eq!(
+            drain_header_of(&backend, &manifest, &key, target).await,
+            None
+        );
+        assert_eq!(
+            drain_synopsis_of(&backend, &manifest, &key, target).await,
+            None
+        );
+    }
     assert_searchable(&backend, &manifest, &key, &records).await;
     runtime.shutdown().await.expect("shutdown");
 }
@@ -2668,4 +2736,293 @@ async fn independent_capacities_govern_online_leaf_and_internal_splits() {
         assert_searchable(&backend, &manifest, &key, &records).await;
         runtime.shutdown().await.unwrap();
     }
+}
+
+/// Foreground inserts into a level-1 `ReceivingSplit` target and concurrent
+/// split-drain batches targeting the same leaf must not conflict on the target
+/// Header or Synopsis: both transactions commit cleanly when open concurrently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_foreground_insert_and_split_drain_commit_without_conflict() {
+    let backend = backend();
+    let runtime = make_runtime(backend.clone());
+    let index = runtime
+        .create_index("zero-conflict", config(1, 4))
+        .await
+        .expect("create");
+    let manifest = read_manifest(&backend, index.logical_index_id()).await;
+    let key = tree_key(1);
+    let mut records = seed_records(&index, 1, 6).await;
+
+    split::begin_split(&backend, &manifest, &key, pk(1), 1_000, &retry())
+        .await
+        .expect("begin");
+    split::expose_targets(&backend, &manifest, &key, pk(1), 1_100, &retry())
+        .await
+        .expect("expose");
+
+    // Open a drain transaction moving record 0 from pk(1) to pk(2).
+    let mut drain_txn = write_txn(&backend, &manifest).await;
+    let candidate = topology::read_leaf_drain_candidates(&mut drain_txn, &key, &[(pk(1), rid(0))])
+        .await
+        .expect("read candidate")
+        .pop()
+        .expect("slot")
+        .expect("candidate");
+    let sample_entry = candidate.entry().clone();
+    let sample_vec = candidate.record().vector().to_vec();
+    topology::relocate_leaf_entries(
+        &mut drain_txn,
+        &key,
+        vec![(candidate, pk(2))],
+        topology::Movement::Split,
+    )
+    .await
+    .expect("relocate");
+
+    // While drain_txn is still open, execute and commit a foreground insert
+    // directly into the same ReceivingSplit target pk(2).
+    let new_id = rid(99);
+    let new_vec = sample_vec;
+    let new_fields = vec![ktann::api::Value::I64(1)];
+    let new_record = ktann::storage::values::VectorRecord::new(
+        new_id.clone(),
+        new_vec.clone(),
+        new_fields.clone(),
+    );
+    let new_entry = LeafEntry::new(new_id.clone(), new_fields, sample_entry.rabitq7().clone());
+    let target_loc = ktann::storage::values::RecordLocation::new(key.clone(), pk(2));
+    {
+        let mut fg_txn = write_txn(&backend, &manifest).await;
+        let mut deferred = fg_txn.mutations();
+        ktann::storage::membership::insert_record(
+            &mut fg_txn,
+            &mut deferred,
+            &new_record,
+            None,
+            &target_loc,
+            &new_entry,
+        )
+        .await
+        .expect("stage foreground insert");
+        fg_txn.apply(deferred).await.expect("apply foreground");
+        fg_txn.commit().await.expect("foreground insert commits");
+    }
+
+    // The concurrent drain transaction must ALSO commit without RetryableAbort!
+    drain_txn
+        .commit()
+        .await
+        .expect("drain commits without conflicting on target Header/Synopsis");
+
+    records.push((new_id, new_vec[0]));
+    assert_eq!(
+        header_of(&backend, &manifest, &key, pk(2))
+            .await
+            .expect("primary header")
+            .entry_count(),
+        1
+    );
+    assert_eq!(
+        drain_header_of(&backend, &manifest, &key, pk(2))
+            .await
+            .expect("drain header")
+            .entry_count(),
+        1
+    );
+    assert_searchable(&backend, &manifest, &key, &records).await;
+    let report = index
+        .verify(ktann::api::VerifyOptions::default())
+        .await
+        .expect("verify");
+    assert!(
+        report.complete && report.issues.is_empty(),
+        "{:?}",
+        report.issues
+    );
+
+    drive_split_to_completion(&backend, &manifest, &key, pk(1)).await;
+    assert_searchable(&backend, &manifest, &key, &records).await;
+    runtime.shutdown().await.expect("shutdown");
+}
+
+/// Deleting or cross-leaf replacing a drained record from a `ReceivingSplit`
+/// leaf whose primary `Header.entry_count == 0` falls through to `DrainHeader`
+/// and preserves exact membership through split completion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreground_delete_and_cross_leaf_replace_fall_through_to_drain_header() {
+    let backend = backend();
+    let runtime = make_runtime(backend.clone());
+    let index = runtime
+        .create_index("drain-delete", config(1, 4))
+        .await
+        .expect("create");
+    let manifest = read_manifest(&backend, index.logical_index_id()).await;
+    let key = tree_key(1);
+    let mut records = seed_records(&index, 1, 6).await;
+
+    split::begin_split(&backend, &manifest, &key, pk(1), 1_000, &retry())
+        .await
+        .expect("begin");
+    split::expose_targets(&backend, &manifest, &key, pk(1), 1_100, &retry())
+        .await
+        .expect("expose");
+    drain_to_zero(&backend, &manifest, &key, pk(1)).await;
+
+    // All 6 entries sit in DrainHeader (primary Header count is 0 on both targets).
+    let target = location_of(&backend, &manifest, &rid(0))
+        .await
+        .expect("loc")
+        .leaf();
+    assert!(target == pk(2) || target == pk(3));
+    assert_eq!(
+        header_of(&backend, &manifest, &key, target)
+            .await
+            .expect("header")
+            .entry_count(),
+        0
+    );
+    let drain_before = drain_header_of(&backend, &manifest, &key, target)
+        .await
+        .expect("drain header");
+    assert!(drain_before.entry_count() >= 1);
+
+    // Delete rid(0) from the ReceivingSplit target with primary count == 0.
+    index.delete(rid(0)).await.expect("delete drained record");
+    records.retain(|(id, _)| id != &rid(0));
+    let drain_after = drain_header_of(&backend, &manifest, &key, target)
+        .await
+        .expect("drain header after delete");
+    assert_eq!(drain_after.entry_count(), drain_before.entry_count() - 1);
+    assert_eq!(drain_after.cache_epoch(), drain_before.cache_epoch() + 1);
+    assert_eq!(
+        header_of(&backend, &manifest, &key, target)
+            .await
+            .expect("header stays zero")
+            .entry_count(),
+        0
+    );
+    assert_searchable(&backend, &manifest, &key, &records).await;
+
+    // Cross-leaf upsert moving a record from its drained ReceivingSplit target
+    // to another tree (bucket 2) also falls through to DrainHeader cleanly.
+    let moved_id = rid(1);
+    let old_leaf = location_of(&backend, &manifest, &moved_id)
+        .await
+        .expect("loc")
+        .leaf();
+    let old_drain = drain_header_of(&backend, &manifest, &key, old_leaf)
+        .await
+        .expect("old drain header");
+    index
+        .upsert(record(&moved_id, 1.0, 2))
+        .await
+        .expect("cross-tree upsert");
+    records.retain(|(id, _)| id != &moved_id);
+    let new_drain = drain_header_of(&backend, &manifest, &key, old_leaf)
+        .await
+        .expect("new drain header");
+    assert_eq!(new_drain.entry_count(), old_drain.entry_count() - 1);
+    assert_eq!(new_drain.cache_epoch(), old_drain.cache_epoch() + 1);
+
+    let report = index
+        .verify(ktann::api::VerifyOptions::default())
+        .await
+        .expect("verify mid-drain");
+    assert!(
+        report.complete && report.issues.is_empty(),
+        "{:?}",
+        report.issues
+    );
+
+    split::complete_split(&backend, &manifest, &key, pk(1), 1_300, &retry())
+        .await
+        .expect("complete");
+    assert_searchable(&backend, &manifest, &key, &records).await;
+    let final_report = index
+        .verify(ktann::api::VerifyOptions::default())
+        .await
+        .expect("verify post-complete");
+    assert!(
+        final_report.complete && final_report.issues.is_empty(),
+        "{:?}",
+        final_report.issues
+    );
+    runtime.shutdown().await.expect("shutdown");
+}
+
+/// Exposure and leaf relocation batch their absence checks and writes rather
+/// than issuing per-entry point inserts or puts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batched_exposure_and_leaf_relocation_bound_backend_calls() {
+    let backend = backend();
+    let runtime = make_runtime(backend.clone());
+    let index = runtime
+        .create_index("batched-ops", config(1, 8))
+        .await
+        .expect("create");
+    let manifest = read_manifest(&backend, index.logical_index_id()).await;
+    let key = tree_key(1);
+    seed_records(&index, 1, 10).await;
+
+    split::begin_split(&backend, &manifest, &key, pk(1), 1_000, &retry())
+        .await
+        .expect("begin");
+    let trained = train_split_centroids(read_txn(&backend, &manifest).await, &key, pk(1))
+        .await
+        .expect("train");
+
+    backend.reset_operation_counts();
+    {
+        let mut txn = write_txn(&backend, &manifest).await;
+        let outcome = topology::expose_split_targets(
+            &mut txn,
+            &key,
+            pk(1),
+            [(pk(2), trained.left()), (pk(3), trained.right())],
+            1_100,
+        )
+        .await
+        .expect("expose");
+        assert_eq!(outcome, topology::SplitExposure::Exposed);
+        txn.commit().await.expect("commit expose");
+    }
+    let expose_counts = backend.operation_counts();
+    assert_eq!(expose_counts.insert, 0, "no per-key inserts");
+    assert_eq!(expose_counts.put, 0, "no per-key puts");
+    assert_eq!(expose_counts.delete, 0, "no per-key deletes");
+    assert_eq!(expose_counts.batch_mutate, 1, "one batched mutation apply");
+
+    backend.reset_operation_counts();
+    {
+        let mut txn = write_txn(&backend, &manifest).await;
+        let ids: Vec<_> = (0..8_u8).map(|n| (pk(1), rid(n))).collect();
+        let candidates = topology::read_leaf_drain_candidates(&mut txn, &key, &ids)
+            .await
+            .expect("read candidates");
+        let moves = candidates
+            .into_iter()
+            .enumerate()
+            .map(|(i, entry)| {
+                (
+                    entry.expect("candidate"),
+                    if i % 2 == 0 { pk(2) } else { pk(3) },
+                )
+            })
+            .collect();
+        let moved =
+            topology::relocate_leaf_entries(&mut txn, &key, moves, topology::Movement::Split)
+                .await
+                .expect("relocate");
+        assert_eq!(moved, 8);
+        txn.commit().await.expect("commit relocate");
+    }
+    let relocate_counts = backend.operation_counts();
+    assert_eq!(relocate_counts.insert, 0, "no per-entry inserts");
+    assert_eq!(relocate_counts.put, 0, "no per-entry puts");
+    assert_eq!(relocate_counts.delete, 0, "no per-entry deletes");
+    assert_eq!(
+        relocate_counts.batch_mutate, 1,
+        "all 8 moves and sidecar updates land in one batch_mutate"
+    );
+    runtime.shutdown().await.expect("shutdown");
 }

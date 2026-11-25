@@ -34,9 +34,10 @@
 //! or `Payload` subkind, keeping all three values adjacent by Record ID.
 //! `TreeManifest` ends with the canonical Tree Key. `Partition` is followed by
 //! the canonical Tree Key, the big-endian Partition Key, a subkind byte
-//! (`Header`, `Synopsis`, `State`, `Centroid`, `LeafEntry`, `ChildEntry`), and —
-//! only for `LeafEntry` and `ChildEntry` — a terminal Record ID or child
-//! Partition Key.
+//! (`Header`, `Synopsis`, `State`, `Centroid`, `LeafEntry`, `ChildEntry`,
+//! `GraphDescriptor`, `GraphChunk`, `DrainHeader`, `DrainSynopsis`), and —
+//! only for `LeafEntry`, `ChildEntry`, and `GraphChunk` — a terminal Record ID,
+//! child Partition Key, or chunk ordinal.
 //!
 //! # Fail closed
 //!
@@ -103,6 +104,8 @@ const SUB_LEAF_ENTRY: u8 = 0x04;
 const SUB_CHILD_ENTRY: u8 = 0x05;
 const SUB_GRAPH_DESCRIPTOR: u8 = 0x06;
 const SUB_GRAPH_CHUNK: u8 = 0x07;
+const SUB_DRAIN_HEADER: u8 = 0x08;
+const SUB_DRAIN_SYNOPSIS: u8 = 0x09;
 
 /// A storage-corruption error for a malformed or noncanonical decoded key.
 fn corrupt() -> Error {
@@ -171,6 +174,24 @@ pub enum LogicalKey {
     },
     /// A partition Synopsis.
     Synopsis {
+        /// The owning Logical Index ID.
+        index: LogicalIndexId,
+        /// The canonical Tree Key.
+        tree_key: TreeKey,
+        /// The Partition Key.
+        partition: PartitionKey,
+    },
+    /// A split-drain sidecar Header for a level-1 `ReceivingSplit` leaf.
+    DrainHeader {
+        /// The owning Logical Index ID.
+        index: LogicalIndexId,
+        /// The canonical Tree Key.
+        tree_key: TreeKey,
+        /// The Partition Key.
+        partition: PartitionKey,
+    },
+    /// A split-drain sidecar Synopsis for a level-1 `ReceivingSplit` leaf.
+    DrainSynopsis {
         /// The owning Logical Index ID.
         index: LogicalIndexId,
         /// The canonical Tree Key.
@@ -258,6 +279,8 @@ impl LogicalKey {
             | Self::TreeManifest { index, .. }
             | Self::Header { index, .. }
             | Self::Synopsis { index, .. }
+            | Self::DrainHeader { index, .. }
+            | Self::DrainSynopsis { index, .. }
             | Self::State { index, .. }
             | Self::Centroid { index, .. }
             | Self::LeafEntry { index, .. }
@@ -273,6 +296,8 @@ impl LogicalKey {
             Self::TreeManifest { tree_key, .. }
             | Self::Header { tree_key, .. }
             | Self::Synopsis { tree_key, .. }
+            | Self::DrainHeader { tree_key, .. }
+            | Self::DrainSynopsis { tree_key, .. }
             | Self::State { tree_key, .. }
             | Self::Centroid { tree_key, .. }
             | Self::LeafEntry { tree_key, .. }
@@ -348,6 +373,22 @@ impl fmt::Debug for LogicalKey {
                 index, partition, ..
             } => formatter
                 .debug_struct("Synopsis")
+                .field("index", index)
+                .field("tree_key", &"[REDACTED]")
+                .field("partition", partition)
+                .finish(),
+            Self::DrainHeader {
+                index, partition, ..
+            } => formatter
+                .debug_struct("DrainHeader")
+                .field("index", index)
+                .field("tree_key", &"[REDACTED]")
+                .field("partition", partition)
+                .finish(),
+            Self::DrainSynopsis {
+                index, partition, ..
+            } => formatter
+                .debug_struct("DrainSynopsis")
                 .field("index", index)
                 .field("tree_key", &"[REDACTED]")
                 .field("partition", partition)
@@ -645,6 +686,30 @@ pub fn synopsis_key(index: LogicalIndexId, tree_key: &TreeKey, partition: Partit
     bytes
 }
 
+/// The split-drain sidecar Header key for a level-1 `ReceivingSplit` leaf.
+#[must_use]
+pub fn drain_header_key(
+    index: LogicalIndexId,
+    tree_key: &TreeKey,
+    partition: PartitionKey,
+) -> Vec<u8> {
+    let mut bytes = partition_prefix(index, tree_key, partition);
+    bytes.push(SUB_DRAIN_HEADER);
+    bytes
+}
+
+/// The split-drain sidecar Synopsis key for a level-1 `ReceivingSplit` leaf.
+#[must_use]
+pub fn drain_synopsis_key(
+    index: LogicalIndexId,
+    tree_key: &TreeKey,
+    partition: PartitionKey,
+) -> Vec<u8> {
+    let mut bytes = partition_prefix(index, tree_key, partition);
+    bytes.push(SUB_DRAIN_SYNOPSIS);
+    bytes
+}
+
 /// Returns one partition metadata key's exact encoded length.
 pub(crate) fn partition_metadata_key_len(tree_key: &TreeKey) -> usize {
     // Index prefix, partition kind, Tree Key, Partition Key, and metadata subkind.
@@ -761,6 +826,16 @@ pub(crate) fn encode_key(key: &LogicalKey) -> Result<Vec<u8>> {
             tree_key,
             partition,
         } => Ok(synopsis_key(*index, tree_key, *partition)),
+        LogicalKey::DrainHeader {
+            index,
+            tree_key,
+            partition,
+        } => Ok(drain_header_key(*index, tree_key, *partition)),
+        LogicalKey::DrainSynopsis {
+            index,
+            tree_key,
+            partition,
+        } => Ok(drain_synopsis_key(*index, tree_key, *partition)),
         LogicalKey::State {
             index,
             tree_key,
@@ -908,6 +983,16 @@ fn decode_partition_key(
             partition,
         }),
         SUB_SYNOPSIS if terminal.is_empty() => Ok(LogicalKey::Synopsis {
+            index,
+            tree_key,
+            partition,
+        }),
+        SUB_DRAIN_HEADER if terminal.is_empty() => Ok(LogicalKey::DrainHeader {
+            index,
+            tree_key,
+            partition,
+        }),
+        SUB_DRAIN_SYNOPSIS if terminal.is_empty() => Ok(LogicalKey::DrainSynopsis {
             index,
             tree_key,
             partition,
