@@ -24,7 +24,7 @@ use super::{merge, split};
 
 /// The state machine selected by one committed Partition Header.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Action {
+pub(super) enum Action {
     Split,
     Merge,
 }
@@ -33,10 +33,52 @@ enum Action {
 pub(crate) enum Advance {
     /// The partition no longer has actionable work.
     Idle,
-    /// The split state machine ran one bounded step.
-    Split(Result<split::Advance>),
+    /// The split state machine ran one bounded step, plus any actionable
+    /// post-completion follow-up keys.
+    Split {
+        step: Result<split::Advance>,
+        followups: [Option<PartitionKey>; 3],
+    },
     /// The merge state machine ran one bounded step.
     Merge(Result<merge::Advance>),
+}
+
+impl Advance {
+    pub(super) const fn split(step: Result<split::Advance>) -> Self {
+        Self::Split {
+            step,
+            followups: [None; 3],
+        }
+    }
+
+    pub(super) fn from_split(result: Result<(split::Advance, [Option<PartitionKey>; 3])>) -> Self {
+        match result {
+            Ok((step, followups)) => Self::Split {
+                step: Ok(step),
+                followups,
+            },
+            Err(err) => Self::split(Err(err)),
+        }
+    }
+}
+
+/// Selects post-split follow-up partitions whose committed Headers are
+/// immediately actionable, or conservatively offers `[left, right]` when an
+/// idempotent replay observes an already-finalized split without target Headers.
+pub(super) fn split_followups(
+    config: &IndexConfig,
+    left: PartitionKey,
+    right: PartitionKey,
+    finalized: Option<([PartitionHeader; 2], (PartitionKey, PartitionHeader))>,
+) -> [Option<PartitionKey>; 3] {
+    let Some(([left_header, right_header], (parent, parent_header))) = finalized else {
+        return [Some(left), Some(right), None];
+    };
+    [
+        is_actionable(config, left, left_header).then_some(left),
+        is_actionable(config, right, right_header).then_some(right),
+        is_actionable(config, parent, parent_header).then_some(parent),
+    ]
 }
 
 /// Returns whether one committed Header identifies actionable maintenance.
@@ -107,7 +149,7 @@ pub(crate) async fn advance<B: Backend>(
     let retry = policy.retry;
 
     match action(manifest.config(), partition, header) {
-        Some(Action::Split) => Ok(Advance::Split(
+        Some(Action::Split) => Ok(Advance::from_split(
             split::advance_observed(
                 backend,
                 manifest,
@@ -136,7 +178,7 @@ pub(crate) async fn advance<B: Backend>(
 }
 
 /// Classifies one Header without reading any additional persistent state.
-fn action(
+pub(super) fn action(
     config: &IndexConfig,
     partition: PartitionKey,
     header: PartitionHeader,

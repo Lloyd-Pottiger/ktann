@@ -83,6 +83,37 @@ pub enum SplitCompletion {
     NotDraining,
 }
 
+/// Internal [`finalize_split_with_parent`] outcome retaining the committed
+/// Headers of the promoted targets and updated parent for follow-up admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FinalizeOutcome {
+    /// This transaction promoted `[left, right]` and updated `updated_parent`
+    /// (`parent` for a non-root split or `root_partition()` for a root split).
+    Finalized {
+        parent: Option<PartitionKey>,
+        targets: [PartitionHeader; 2],
+        updated_parent: (PartitionKey, PartitionHeader),
+    },
+    /// A prior committed finalize already removed the source's authority keys.
+    AlreadyCompleted,
+    /// The source is `DrainingSplit` but its exact entry count is not zero.
+    NotDrained,
+    /// The source is no longer `DrainingSplit`.
+    NotDraining,
+}
+
+impl FinalizeOutcome {
+    /// Projects into the public [`SplitCompletion`] contract.
+    pub(crate) const fn into_public(self) -> SplitCompletion {
+        match self {
+            Self::Finalized { parent, .. } => SplitCompletion::Completed { parent },
+            Self::AlreadyCompleted => SplitCompletion::Completed { parent: None },
+            Self::NotDrained => SplitCompletion::NotDrained,
+            Self::NotDraining => SplitCompletion::NotDraining,
+        }
+    }
+}
+
 /// Starts the split of one `Ready` partition above the split threshold.
 ///
 /// The update-protected source Header and State reads revalidate eligibility:
@@ -573,6 +604,7 @@ pub async fn finalize_split<T: WriteTxn>(
         None,
     )
     .await
+    .map(FinalizeOutcome::into_public)
 }
 
 /// Uses a parent only after the caller validates its complete discovery proof.
@@ -583,7 +615,7 @@ pub(crate) async fn finalize_split_with_parent<T: WriteTxn>(
     started_at_unix_millis: u64,
     source_removal: SourceRemoval,
     parent: Option<PartitionKey>,
-) -> Result<SplitCompletion> {
+) -> Result<FinalizeOutcome> {
     let manifest = txn.require_manifest()?;
     let index = manifest.logical_index_id();
     let (header_key, state_key) = authority_keys(index, tree_key, source);
@@ -591,13 +623,13 @@ pub(crate) async fn finalize_split_with_parent<T: WriteTxn>(
     else {
         // Both authority values are gone: a previous committed finalize
         // completed this split.
-        return Ok(SplitCompletion::Completed { parent: None });
+        return Ok(FinalizeOutcome::AlreadyCompleted);
     };
     let PartitionTransition::DrainingSplit { left, right, .. } = state else {
-        return Ok(SplitCompletion::NotDraining);
+        return Ok(FinalizeOutcome::NotDraining);
     };
     if header.entry_count() != 0 {
-        return Ok(SplitCompletion::NotDrained);
+        return Ok(FinalizeOutcome::NotDrained);
     }
     let level = header.level();
 
@@ -634,7 +666,8 @@ pub(crate) async fn finalize_split_with_parent<T: WriteTxn>(
         .await?
         .into_iter();
     let mut mutations = txn.mutations();
-    for target in [left, right] {
+    let mut promoted_targets = [header; 2];
+    for (slot, target) in [left, right].into_iter().enumerate() {
         let (target_header_key, target_state_key) = authority_keys(index, tree_key, target);
         let (Some(state_value), Some(header_value)) = (target_values.next(), target_values.next())
         else {
@@ -699,6 +732,7 @@ pub(crate) async fn finalize_split_with_parent<T: WriteTxn>(
             target_header_key,
             PersistentValue::PartitionHeader(promoted_target_header),
         )?;
+        promoted_targets[slot] = promoted_target_header;
     }
 
     if source == root_partition() {
@@ -760,12 +794,16 @@ pub(crate) async fn finalize_split_with_parent<T: WriteTxn>(
             }),
         )?;
         txn.apply(mutations).await?;
-        return Ok(SplitCompletion::Completed { parent: None });
+        return Ok(FinalizeOutcome::Finalized {
+            parent: None,
+            targets: promoted_targets,
+            updated_parent: (root_partition(), promoted),
+        });
     }
 
     // Remove the source's unique incoming reference, rediscovered on this
     // transaction's snapshot and update-protected (ADR 0007).
-    let parent =
+    let (parent, parent_header) =
         stage_remove_incoming_edge(txn, &mut mutations, tree_key, source, level, parent).await?;
     apply_remove_source_prefix(
         txn,
@@ -778,8 +816,10 @@ pub(crate) async fn finalize_split_with_parent<T: WriteTxn>(
         source_removal,
     )
     .await?;
-    Ok(SplitCompletion::Completed {
+    Ok(FinalizeOutcome::Finalized {
         parent: Some(parent),
+        targets: promoted_targets,
+        updated_parent: (parent, parent_header),
     })
 }
 
@@ -993,7 +1033,7 @@ async fn stage_remove_incoming_edge<T: WriteTxn>(
     source: PartitionKey,
     level: u32,
     parent: Option<PartitionKey>,
-) -> Result<PartitionKey> {
+) -> Result<(PartitionKey, PartitionHeader)> {
     let index = txn.require_manifest()?.logical_index_id();
     let parent = lock_incoming_edge(txn, tree_key, source, level, parent).await?;
     let parent_header_key = LogicalKey::Header {
@@ -1006,6 +1046,7 @@ async fn stage_remove_incoming_edge<T: WriteTxn>(
     if parent_header.level() != level.checked_add(1).ok_or_else(corrupt)? {
         return Err(corrupt());
     }
+    let updated_parent_header = removed_entry(parent_header)?;
     mutations.delete(LogicalKey::ChildEntry {
         index,
         tree_key: tree_key.clone(),
@@ -1014,9 +1055,9 @@ async fn stage_remove_incoming_edge<T: WriteTxn>(
     })?;
     mutations.put(
         parent_header_key,
-        PersistentValue::PartitionHeader(removed_entry(parent_header)?),
+        PersistentValue::PartitionHeader(updated_parent_header),
     )?;
-    Ok(parent)
+    Ok((parent, updated_parent_header))
 }
 
 /// Applies `mutations` together with removal of one fully drained source's

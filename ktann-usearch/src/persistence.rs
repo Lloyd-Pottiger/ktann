@@ -113,6 +113,30 @@ impl Graph {
         Ok(bytes)
     }
 
+    /// Clones an already-validated graph into an independent private instance
+    /// under the same [`decode_bound`] memory envelope as [`Self::decode`],
+    /// skipping redundant untrusted-stream structural and reachability passes.
+    pub fn try_clone(&self, limit: usize, check: &dyn Fn() -> bool) -> Result<Self, Error> {
+        checkpoint(check)?;
+        let length = self.inner.encoded_size();
+        if decode_bound(self.n, self.m, length)? > limit {
+            return Err(Error::LimitExceeded);
+        }
+        let bytes = self.encode(limit, check)?;
+        let native_limit = limit.checked_sub(bytes.len()).ok_or(Error::LimitExceeded)?;
+        let context = MetricContext {
+            batch: None,
+            distance: &|_, _| unreachable!(),
+            check,
+        };
+        let inner = ffi::restore(&bytes, self.n as u32, self.m as u32, native_limit, &context)?;
+        Ok(Self {
+            inner,
+            n: self.n,
+            m: self.m,
+        })
+    }
+
     /// Validates the entire pinned native layout before invoking USearch's loader.
     /// Checks both copies of levels, ordinal keys, capacities, degrees, target
     /// layers, duplicate/self edges, maximal entry, reachability and exact length.

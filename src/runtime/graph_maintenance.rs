@@ -14,7 +14,7 @@ use crate::storage::keys::TreeKey;
 /// Bounds concurrent native preparations and retains admission until CPU exit,
 /// including when cancellation drops the awaiting maintenance future.
 pub struct GraphMaintenance {
-    cache: Option<Arc<crate::search::cache::PartitionCache>>,
+    cache: Arc<crate::search::cache::PartitionCache>,
     working_bytes: usize,
     slots: Arc<Semaphore>,
     cancellation: CancellationToken,
@@ -34,12 +34,12 @@ pub(crate) struct GraphBodyGuards {
 impl GraphMaintenance {
     /// Automatic maintenance shares the Runtime's existing bounded cache.
     pub(crate) fn with_cache(mut self, cache: Arc<crate::search::cache::PartitionCache>) -> Self {
-        self.cache = Some(cache);
+        self.cache = cache;
         self
     }
 
-    pub(crate) fn cache(&self) -> Option<&crate::search::cache::PartitionCache> {
-        self.cache.as_deref()
+    pub(crate) fn cache(&self) -> &crate::search::cache::PartitionCache {
+        &self.cache
     }
 
     /// Creates one reusable admission owner for explicit maintenance. Automatic
@@ -47,7 +47,9 @@ impl GraphMaintenance {
     /// explicit calls still have one preparation slot.
     pub fn new(config: &RuntimeConfig, cancellation: CancellationToken) -> Self {
         Self {
-            cache: None,
+            cache: Arc::new(crate::search::cache::PartitionCache::new(
+                config.partition_cache_bytes(),
+            )),
             working_bytes: config.routing_working_bytes(),
             slots: Arc::new(Semaphore::new(config.maintenance_workers().max(1))),
             cancellation,

@@ -31,12 +31,20 @@ struct BodyPlan {
 impl BodyPlan {
     async fn read<T: ReadOps>(
         read: &mut ReadLogicalTxn<'_, T>,
+        cache: &crate::search::cache::PartitionCache,
         tree: &TreeKey,
         partition: PartitionKey,
         working_bytes: &mut usize,
     ) -> Result<Self> {
-        let source =
-            GraphTransitionSource::read(read, tree, partition, *working_bytes, &|| Ok(())).await?;
+        let source = GraphTransitionSource::read_cached(
+            read,
+            Some(cache),
+            tree,
+            partition,
+            *working_bytes,
+            &|| Ok(()),
+        )
+        .await?;
         let next_bytes = source
             .children()
             .iter()
@@ -159,7 +167,6 @@ async fn body_participants<T: ReadOps>(
     partition: PartitionKey,
     header: PartitionHeader,
     state: &PartitionTransition,
-    working_bytes: usize,
 ) -> Result<BodyParticipants> {
     let mut participants = vec![partition];
     let mut proof = None;
@@ -172,18 +179,16 @@ async fn body_participants<T: ReadOps>(
                 || header.entry_count() == 0 =>
         {
             if partition != topology::root_partition() {
-                // Discover only the lock set before waiting. The full centroid
-                // scan belongs after acquisition and snapshot refresh.
-                proof = Some(
-                    topology::IncomingEdgeProof::read(
-                        read,
-                        manifest,
-                        tree,
-                        header.level(),
-                        working_bytes,
-                    )
-                    .await?,
-                );
+                let resolved = topology::IncomingEdgeProof::read(
+                    read,
+                    manifest,
+                    tree,
+                    partition,
+                    header.level(),
+                )
+                .await?;
+                participants.push(resolved.parent());
+                proof = Some(resolved);
             }
         }
         PartitionTransition::DrainingSplit { left, right, .. } => {
@@ -226,9 +231,6 @@ async fn body_participants<T: ReadOps>(
             merge_candidates = candidates;
         }
         _ => {}
-    }
-    if let Some(proof) = &proof {
-        participants.extend(proof.bodies());
     }
     participants.sort_unstable();
     participants.dedup();
@@ -277,7 +279,7 @@ pub async fn advance<B: Backend>(
     .await?;
     match outcome {
         fixup::Advance::Idle => Ok(()),
-        fixup::Advance::Split(result) => result.map(|_| ()),
+        fixup::Advance::Split { step, .. } => step.map(|_| ()),
         fixup::Advance::Merge(result) => result.map(|_| ()),
     }
 }
@@ -298,16 +300,16 @@ pub(crate) async fn advance_observed<'b, B: Backend>(
     let initial_state = authority.state;
     // Beginning maintenance changes State alone and retains the same body epoch.
     if matches!(initial_state, PartitionTransition::Ready { .. }) {
-        return if header.entry_count() > manifest.config().max_partition_entries(header.level()) {
-            Ok(fixup::Advance::Split(
+        return match fixup::action(manifest.config(), partition, header) {
+            Some(fixup::Action::Split) => Ok(fixup::Advance::from_split(
                 split::advance_observed(backend, manifest, tree, partition, now, retry, authority)
                     .await,
-            ))
-        } else {
-            Ok(fixup::Advance::Merge(
+            )),
+            Some(fixup::Action::Merge) => Ok(fixup::Advance::Merge(
                 merge::advance_observed(backend, manifest, tree, partition, now, retry, authority)
                     .await,
-            ))
+            )),
+            None => Ok(fixup::Advance::Idle),
         };
     }
     // Graph publication owns in-flight steps that bypass the ordinary drivers.
@@ -326,9 +328,8 @@ pub(crate) async fn advance_observed<'b, B: Backend>(
     if header.level() == 1 && header.entry_count() > 0 {
         match initial_state {
             PartitionTransition::DrainingSplit { .. } => {
-                drop(authority);
-                return Ok(fixup::Advance::Split(
-                    split::drain_batch(backend, manifest, tree, partition, retry)
+                return Ok(fixup::Advance::split(
+                    split::drain_observed(backend, manifest, tree, partition, retry, authority)
                         .await
                         .map(|step| match step {
                             split::DrainStep::Drained { moved, remaining } => {
@@ -339,9 +340,8 @@ pub(crate) async fn advance_observed<'b, B: Backend>(
                 ));
             }
             PartitionTransition::Merging { .. } => {
-                drop(authority);
                 return Ok(fixup::Advance::Merge(
-                    merge::drain_batch(backend, manifest, tree, partition, retry)
+                    merge::drain_observed(backend, manifest, tree, partition, retry, authority)
                         .await
                         .map(|step| match step {
                             merge::DrainStep::Drained { moved, remaining } => {
@@ -355,46 +355,46 @@ pub(crate) async fn advance_observed<'b, B: Backend>(
             _ => {}
         }
     }
-    // Leaf training needs only the source snapshot. Bind its routing model to
-    // the allocated targets; the parent edge is discovered after taking guards.
-    let trained_leaf = if header.level() == 1
-        && partition != topology::root_partition()
-        && matches!(initial_state, PartitionTransition::Splitting { .. })
-    {
-        executor.check_cancelled()?;
-        Some(training::train_split_centroids(authority.txn, tree, partition).await?)
-    } else {
-        drop(authority);
-        None
-    };
+    // Split training needs only the source snapshot. Bind its routing model to
+    // the allocated targets before taking guards; non-Splitting steps reuse
+    // `authority` for their initial participant discovery pass.
+    let (trained_split, mut pending_read) =
+        if matches!(initial_state, PartitionTransition::Splitting { .. }) {
+            executor.check_cancelled()?;
+            (
+                Some(training::train_split_centroids(authority.txn, tree, partition).await?),
+                None,
+            )
+        } else {
+            (None, Some(authority))
+        };
     let mut failures = 0;
     // Keep body ownership while refreshing a stale plan, so another local
     // publisher cannot invalidate the replacement snapshot during that read.
     let mut locked_bodies = None;
     loop {
-        let Some(observed) = reads::open_authority_read(backend, manifest, tree, partition).await?
-        else {
-            return Ok(fixup::Advance::Idle);
+        let observed = match pending_read.take() {
+            Some(observed) => observed,
+            None => {
+                let Some(observed) =
+                    reads::open_authority_read(backend, manifest, tree, partition).await?
+                else {
+                    return Ok(fixup::Advance::Idle);
+                };
+                observed
+            }
         };
         let reads::PartitionRead {
             txn: mut read,
             header,
             state,
         } = observed;
-        if trained_leaf.is_some() && state != initial_state {
+        if trained_split.is_some() && state != initial_state {
             // Another worker advanced the split. Its new phase owns the next step.
             return Ok(fixup::Advance::Idle);
         }
-        let participants = body_participants(
-            &mut read,
-            manifest,
-            tree,
-            partition,
-            header,
-            &state,
-            executor.working_bytes(),
-        )
-        .await?;
+        let participants =
+            body_participants(&mut read, manifest, tree, partition, header, &state).await?;
         if locked_bodies
             .as_ref()
             .is_none_or(|(held, _)| *held != participants.keys)
@@ -410,52 +410,17 @@ pub(crate) async fn advance_observed<'b, B: Backend>(
             locked_bodies = Some((participants.keys.clone(), guards));
             continue;
         }
-        let parent = if let Some(proof) = &participants.proof {
-            proof
-                .find(&mut read, manifest, tree, partition)
-                .await?
-                .map(|(parent, _)| parent)
-        } else {
-            None
-        };
+        let parent = participants.proof.map(topology::IncomingEdgeProof::parent);
+        let cache = executor.cache();
         let mut bodies = Vec::new();
-        let proof_bytes = participants
-            .proof
-            .as_ref()
-            .map_or(0, topology::IncomingEdgeProof::retained_bytes);
-        let mut read_bytes = executor
-            .working_bytes()
-            .checked_sub(proof_bytes)
-            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-        let trained_under_guard;
+        let mut read_bytes = executor.working_bytes();
         let edit = match state {
             PartitionTransition::Splitting { left, right, .. } => {
-                let centroids = if let Some(centroids) = &trained_leaf {
-                    centroids
-                } else {
-                    trained_under_guard =
-                        training::train_split_centroids(read, tree, partition).await?;
-                    read = reads::open_validated_read(backend, manifest).await?;
-                    &trained_under_guard
-                };
+                let centroids = trained_split.as_ref().ok_or_else(corrupt)?;
                 if partition != topology::root_partition() {
-                    let Some(parent) = parent else {
-                        return Ok(fixup::Advance::Idle);
-                    };
-                    if read
-                        .get(LogicalKey::ChildEntry {
-                            index: manifest.logical_index_id(),
-                            tree_key: tree.clone(),
-                            partition: parent,
-                            child: partition,
-                        })
-                        .await?
-                        .is_none()
-                    {
-                        drop(locked_bodies.take());
-                        continue;
-                    }
-                    let mut body = BodyPlan::read(&mut read, tree, parent, &mut read_bytes).await?;
+                    let parent = parent.ok_or_else(corrupt)?;
+                    let mut body =
+                        BodyPlan::read(&mut read, cache, tree, parent, &mut read_bytes).await?;
                     let parent_header = body.header.ok_or_else(corrupt)?;
                     if !matches!(
                         parent_header.state(),
@@ -477,7 +442,7 @@ pub(crate) async fn advance_observed<'b, B: Backend>(
             }
             PartitionTransition::DrainingSplit { left, right, .. } if header.entry_count() == 0 => {
                 let mut source_body =
-                    BodyPlan::read(&mut read, tree, partition, &mut read_bytes).await?;
+                    BodyPlan::read(&mut read, cache, tree, partition, &mut read_bytes).await?;
                 if partition == topology::root_partition() {
                     for target in [left, right] {
                         let centroid = centroid(&mut read, manifest, tree, target).await?;
@@ -494,10 +459,9 @@ pub(crate) async fn advance_observed<'b, B: Backend>(
                         .map_err(|_| corrupt())?,
                     );
                 } else {
-                    let Some(parent) = parent else {
-                        return Ok(fixup::Advance::Idle);
-                    };
-                    let mut body = BodyPlan::read(&mut read, tree, parent, &mut read_bytes).await?;
+                    let parent = parent.ok_or_else(corrupt)?;
+                    let mut body =
+                        BodyPlan::read(&mut read, cache, tree, parent, &mut read_bytes).await?;
                     body.remove(partition)?;
                     bodies.push(body);
                     source_body.header = None;
@@ -506,21 +470,20 @@ pub(crate) async fn advance_observed<'b, B: Backend>(
                 Edit::SplitComplete { left, right }
             }
             PartitionTransition::Merging { .. } if header.entry_count() == 0 => {
-                let Some(parent) = parent else {
-                    return Ok(fixup::Advance::Idle);
-                };
-                let mut body = BodyPlan::read(&mut read, tree, parent, &mut read_bytes).await?;
+                let parent = parent.ok_or_else(corrupt)?;
+                let mut body =
+                    BodyPlan::read(&mut read, cache, tree, parent, &mut read_bytes).await?;
                 body.remove(partition)?;
                 bodies.push(body);
                 let mut source_body =
-                    BodyPlan::read(&mut read, tree, partition, &mut read_bytes).await?;
+                    BodyPlan::read(&mut read, cache, tree, partition, &mut read_bytes).await?;
                 source_body.header = None;
                 bodies.push(source_body);
                 Edit::MergeComplete
             }
             PartitionTransition::DrainingSplit { left, right, .. } => {
                 let mut source_body =
-                    BodyPlan::read(&mut read, tree, partition, &mut read_bytes).await?;
+                    BodyPlan::read(&mut read, cache, tree, partition, &mut read_bytes).await?;
                 let mut headers = read
                     .batch_get(
                         [left, right]
@@ -556,7 +519,8 @@ pub(crate) async fn advance_observed<'b, B: Backend>(
                     &mut read_bytes,
                 )?;
                 let target = moves.first().ok_or_else(corrupt)?.1;
-                let mut receiver = BodyPlan::read(&mut read, tree, target, &mut read_bytes).await?;
+                let mut receiver =
+                    BodyPlan::read(&mut read, cache, tree, target, &mut read_bytes).await?;
                 for (entry, _) in &moves {
                     receiver.add(entry.child(), entry.model(), &mut read_bytes)?;
                 }
@@ -580,7 +544,7 @@ pub(crate) async fn advance_observed<'b, B: Backend>(
             }
             PartitionTransition::Merging { .. } => {
                 let mut source_body =
-                    BodyPlan::read(&mut read, tree, partition, &mut read_bytes).await?;
+                    BodyPlan::read(&mut read, cache, tree, partition, &mut read_bytes).await?;
                 let ceiling = manifest.config().max_internal_partition_entries() + 2;
                 let candidates = participants.merge_candidates;
                 let kernel = routing::kernel_for(manifest)?;
@@ -605,8 +569,9 @@ pub(crate) async fn advance_observed<'b, B: Backend>(
                         continue;
                     }
                     if receiver.is_none() {
-                        receiver =
-                            Some(BodyPlan::read(&mut read, tree, target, &mut read_bytes).await?);
+                        receiver = Some(
+                            BodyPlan::read(&mut read, cache, tree, target, &mut read_bytes).await?,
+                        );
                     }
                     let body = receiver.as_mut().ok_or_else(corrupt)?;
                     if body.header.ok_or_else(corrupt)?.entry_count() >= ceiling {
@@ -662,7 +627,6 @@ pub(crate) async fn advance_observed<'b, B: Backend>(
             .prepare(move |bytes, check| {
                 let bytes = bytes
                     .checked_sub(edit_bytes)
-                    .and_then(|bytes| bytes.checked_sub(proof_bytes))
                     .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
                 let prepared = GraphTransitionSource::prepare_batch(
                     bodies
@@ -698,23 +662,22 @@ pub(crate) async fn advance_observed<'b, B: Backend>(
                     removal,
                     &edit,
                     &prepared,
-                    parent.zip(participants.proof.as_ref()),
+                    participants.proof,
                 ))
             })
             .await?;
         if let Some(outcome) = outcome {
-            if let Some(cache) = executor.cache() {
-                for transition in prepared {
-                    transition.cache_committed(cache);
-                }
+            for transition in prepared {
+                transition.cache_committed(cache);
             }
             match &outcome {
-                fixup::Advance::Split(Ok(split::Advance::Drained { moved, .. })) => {
-                    crate::observe::metrics::fixup_drain_step(
-                        crate::observe::labels::FixupKind::Split,
-                        *moved,
-                    )
-                }
+                fixup::Advance::Split {
+                    step: Ok(split::Advance::Drained { moved, .. }),
+                    ..
+                } => crate::observe::metrics::fixup_drain_step(
+                    crate::observe::labels::FixupKind::Split,
+                    *moved,
+                ),
                 fixup::Advance::Merge(Ok(merge::Advance::Drained { moved, .. })) => {
                     crate::observe::metrics::fixup_drain_step(
                         crate::observe::labels::FixupKind::Merge,
@@ -795,13 +758,13 @@ async fn apply<T: WriteTxn>(
     removal: topology::SourceRemoval,
     edit: &Edit<'_>,
     graphs: &[PreparedGraphTransition],
-    parent_proof: Option<(PartitionKey, &topology::IncomingEdgeProof)>,
+    parent_proof: Option<topology::IncomingEdgeProof>,
 ) -> Result<Option<fixup::Advance>> {
-    let parent = if let Some((parent, proof)) = parent_proof {
+    let parent = if let Some(proof) = parent_proof {
         if !proof.validate(txn, tree).await? {
             return Ok(None);
         }
-        Some(parent)
+        Some(proof.parent())
     } else {
         None
     };
@@ -842,7 +805,7 @@ async fn apply<T: WriteTxn>(
         .await?
         {
             topology::SplitExposure::Exposed => {
-                fixup::Advance::Split(Ok(split::Advance::Exposed {
+                fixup::Advance::split(Ok(split::Advance::Exposed {
                     left: *left,
                     right: *right,
                 }))
@@ -859,7 +822,7 @@ async fn apply<T: WriteTxn>(
                 topology::relocate_child_entries(txn, tree, source, moves.clone(), *movement)
                     .await?;
             if matches!(movement, topology::Movement::Split) {
-                fixup::Advance::Split(Ok(split::Advance::Drained {
+                fixup::Advance::split(Ok(split::Advance::Drained {
                     moved,
                     remaining: *remaining,
                 }))
@@ -874,13 +837,23 @@ async fn apply<T: WriteTxn>(
             match topology::finalize_split_with_parent(txn, tree, source, now, removal, parent)
                 .await?
             {
-                topology::SplitCompletion::Completed { parent } => {
-                    fixup::Advance::Split(Ok(split::Advance::Completed {
+                topology::FinalizeOutcome::Finalized {
+                    parent,
+                    targets,
+                    updated_parent,
+                } => fixup::Advance::Split {
+                    step: Ok(split::Advance::Completed {
                         left: *left,
                         right: *right,
                         parent,
-                    }))
-                }
+                    }),
+                    followups: fixup::split_followups(
+                        txn.require_manifest()?.config(),
+                        *left,
+                        *right,
+                        Some((targets, updated_parent)),
+                    ),
+                },
                 _ => return Ok(None),
             }
         }

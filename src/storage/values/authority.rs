@@ -1,6 +1,7 @@
 //! Persistent Tree Manifest and Partition authority values.
 
 use std::fmt;
+use std::sync::Arc;
 
 use crate::api::{Error, PartitionKey, Result};
 
@@ -236,14 +237,14 @@ impl DrainHeader {
 /// its parent Child Entry projection in one transaction.
 #[derive(Clone, PartialEq)]
 pub struct PartitionCentroid {
-    components: Box<[f32]>,
+    components: Arc<[f32]>,
     dispersion: f64,
 }
 
 impl PartitionCentroid {
     /// Creates an uncorrected routing model, used for internal partitions and untrained fixtures.
     #[must_use]
-    pub fn new(components: impl Into<Box<[f32]>>) -> Self {
+    pub fn new(components: impl Into<Arc<[f32]>>) -> Self {
         Self {
             components: components.into(),
             dispersion: 0.0,
@@ -252,7 +253,7 @@ impl PartitionCentroid {
 
     /// Creates a cosine leaf model from a training snapshot's centroid and dispersion.
     /// The statistic is immutable until the centroid is retrained, not a live membership aggregate.
-    pub fn with_dispersion(components: impl Into<Box<[f32]>>, dispersion: f64) -> Result<Self> {
+    pub fn with_dispersion(components: impl Into<Arc<[f32]>>, dispersion: f64) -> Result<Self> {
         if !dispersion.is_finite() || !(0.0..=1.0).contains(&dispersion) {
             return Err(Error::invalid_argument());
         }

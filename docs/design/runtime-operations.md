@@ -77,11 +77,11 @@ with capped jittered backoff. An execution that consumes its step budget through
 successful progress returns the same admission to the queue tail; this keeps
 each execution bounded and fair without requiring another foreground access.
 Errors and cancellation retire the admission. Completing a split replaces the
-source's queue slot with best-effort offers for both newly Ready targets and the
-updated parent in one process-local queue transition, then publishes the final
-backlog; this catches immediately actionable follow-on work without exposing a
-false quiescent interval or making the split transaction or one worker
-execution unbounded. Normal queue capacity, deduplication, and loss rules still
+source's queue slot with best-effort offers for any actionable newly Ready
+targets and updated parent in one process-local queue transition, then publishes
+the final backlog; this catches immediately actionable follow-on work without
+exposing a false quiescent interval or making the split transaction or one
+worker execution unbounded. Normal queue capacity, deduplication, and loss rules still
 apply. Later relevant access may enqueue dropped or retired work again.
 There is no durable scan, queue, leader, lease, or claim that one Runtime knows
 cluster-wide backlog.

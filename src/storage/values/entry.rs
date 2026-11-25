@@ -1,6 +1,7 @@
 //! Persistent Child and Leaf Entry values.
 
 use std::fmt;
+use std::sync::Arc;
 
 use bytes::Bytes;
 
@@ -29,7 +30,7 @@ pub struct ChildEntry {
 impl ChildEntry {
     /// Creates a Child Entry envelope.
     #[must_use]
-    pub fn new(child: PartitionKey, centroid: impl Into<Box<[f32]>>) -> Self {
+    pub fn new(child: PartitionKey, centroid: impl Into<Arc<[f32]>>) -> Self {
         Self {
             child,
             model: PartitionCentroid::new(centroid),

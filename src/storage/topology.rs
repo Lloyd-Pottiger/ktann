@@ -39,13 +39,13 @@ pub use relocation::{
     LeafDrainEntry, Movement, read_child_drain_candidates, read_leaf_drain_candidates,
     relocate_child_entries, relocate_leaf_entries,
 };
+pub(crate) use transitions::{
+    FinalizeOutcome, expose_split_targets_with_parent, finalize_merge_with_parent,
+    finalize_split_with_parent, update_centroid,
+};
 pub use transitions::{
     MergeCompletion, MergeStart, SourceRemoval, SplitCompletion, SplitExposure, SplitStart,
     begin_merge, begin_split, expose_split_targets, finalize_merge, finalize_split,
-};
-pub(crate) use transitions::{
-    expose_split_targets_with_parent, finalize_merge_with_parent, finalize_split_with_parent,
-    update_centroid,
 };
 
 use crate::api::{Error, ErrorKind, PartitionKey, Result};

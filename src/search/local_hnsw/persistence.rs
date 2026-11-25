@@ -158,6 +158,59 @@ pub(crate) fn update_records(
     working_bytes: usize,
     check: &dyn Fn() -> Result<()>,
 ) -> Result<PreparedGraphRecords> {
+    let (mapping_bytes, restore_budget) =
+        prepare_update_budget(source, next, next_header, working_bytes)?;
+    let (graph, _) = restore_graph(old, source, descriptor, chunks, restore_budget, check)?;
+    apply_graph_update(
+        old,
+        next,
+        source,
+        graph,
+        next_header,
+        mapping_bytes,
+        working_bytes,
+        check,
+    )
+}
+
+/// Prepares one complete replacement from a snapshot-validated cached internal
+/// graph body under identical working-memory admission as [`update_records`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "snapshot-bound source and proposed body with operation admission"
+)]
+pub(crate) fn update_cached_records(
+    old: Centroids<'_>,
+    next: Centroids<'_>,
+    source: GraphSource<'_>,
+    descriptor: &GraphDescriptor,
+    body: &super::body::InternalGraphBody,
+    next_header: PartitionHeader,
+    working_bytes: usize,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<PreparedGraphRecords> {
+    let (mapping_bytes, restore_budget) =
+        prepare_update_budget(source, next, next_header, working_bytes)?;
+    let available = admit_cached_source(old, source, descriptor, body, restore_budget, check)?;
+    let graph = controlled(check, |proceed| body.graph().try_clone(available, proceed))?;
+    apply_graph_update(
+        old,
+        next,
+        source,
+        graph,
+        next_header,
+        mapping_bytes,
+        working_bytes,
+        check,
+    )
+}
+
+fn prepare_update_budget(
+    source: GraphSource<'_>,
+    next: Centroids<'_>,
+    next_header: PartitionHeader,
+    working_bytes: usize,
+) -> Result<(usize, usize)> {
     if next_header.level() != source.header.level()
         || source.header.cache_epoch() >= next_header.cache_epoch()
         || !header_matches(next_header, next.children.len())
@@ -173,8 +226,23 @@ pub(crate) fn update_records(
     let restore_budget = working_bytes
         .checked_sub(next.bytes + mapping_bytes)
         .ok_or_else(limit)?;
-    let (graph, _) = restore_graph(old, source, descriptor, chunks, restore_budget, check)?;
+    Ok((mapping_bytes, restore_budget))
+}
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "restored source topology and admitted replacement buffers"
+)]
+fn apply_graph_update(
+    old: Centroids<'_>,
+    next: Centroids<'_>,
+    source: GraphSource<'_>,
+    graph: ktann_usearch::Graph,
+    next_header: PartitionHeader,
+    mapping_bytes: usize,
+    working_bytes: usize,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<PreparedGraphRecords> {
     // Maintenance removes old child edges without changing surviving centroids.
     // Keep this common path inside the private graph preparation boundary.
     if next.children.len() < old.children.len() {
@@ -342,6 +410,66 @@ pub(super) fn persist_graph(
     Ok(GraphRecords { descriptor, body })
 }
 
+/// Validates snapshot header, parameter, and encoded-length bounds for `descriptor`.
+pub(crate) fn validate_descriptor_envelope(
+    source: GraphSource<'_>,
+    nodes: usize,
+    descriptor: &GraphDescriptor,
+) -> Result<usize> {
+    if !header_matches(source.header, nodes)
+        || source.parameters.ef_construction < source.parameters.m
+        || descriptor.nodes as usize != nodes
+        || descriptor.epoch != source.header.cache_epoch()
+    {
+        return Err(corrupt());
+    }
+    let length = usize::try_from(descriptor.bytes).map_err(|_| corrupt())?;
+    if length < ktann_usearch::NATIVE_HEADER_BYTES
+        || length
+            > ktann_usearch::encoded_bound(nodes, source.parameters.m).map_err(|_| corrupt())?
+    {
+        return Err(corrupt());
+    }
+    Ok(length)
+}
+
+fn admit_restore_budget(
+    centroids: Centroids<'_>,
+    source: GraphSource<'_>,
+    descriptor: &GraphDescriptor,
+    working_bytes: usize,
+) -> Result<(usize, usize)> {
+    let length = validate_descriptor_envelope(source, centroids.children.len(), descriptor)?;
+    let available = working_bytes
+        .checked_sub(centroids.bytes)
+        .and_then(|v| v.checked_sub(length + 1024))
+        .ok_or_else(limit)?;
+    if ktann_usearch::decode_bound(centroids.children.len(), source.parameters.m, length)
+        .map_err(native_error)?
+        > available
+    {
+        return Err(limit());
+    }
+    Ok((length, available))
+}
+
+/// Validates snapshot metadata, descriptor binding, and the exact `restore_graph`
+/// working-memory envelope for an already-validated cached internal graph body.
+pub(crate) fn admit_cached_source(
+    centroids: Centroids<'_>,
+    source: GraphSource<'_>,
+    descriptor: &GraphDescriptor,
+    body: &super::body::InternalGraphBody,
+    working_bytes: usize,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<usize> {
+    check()?;
+    if !body.matches(source, descriptor) {
+        return Err(corrupt());
+    }
+    Ok(admit_restore_budget(centroids, source, descriptor, working_bytes)?.1)
+}
+
 /// Loads a complete ordered chunk stream. The caller must use the same
 /// snapshot for Header, Child Entries, descriptor, and chunks, and scan the
 /// entire chunk range so extra keys cannot be hidden by a point-read list.
@@ -358,31 +486,7 @@ pub(crate) fn restore_graph(
     check: &dyn Fn() -> Result<()>,
 ) -> Result<(ktann_usearch::Graph, [u8; 32])> {
     check()?;
-    if !header_matches(source.header, centroids.children.len())
-        || source.parameters.ef_construction < source.parameters.m
-        || descriptor.nodes as usize != centroids.children.len()
-        || descriptor.epoch != source.header.cache_epoch()
-    {
-        return Err(corrupt());
-    }
-    let length = usize::try_from(descriptor.bytes).map_err(|_| corrupt())?;
-    if length < ktann_usearch::NATIVE_HEADER_BYTES
-        || length
-            > ktann_usearch::encoded_bound(centroids.children.len(), source.parameters.m)
-                .map_err(|_| corrupt())?
-    {
-        return Err(corrupt());
-    }
-    let available = working_bytes
-        .checked_sub(centroids.bytes)
-        .and_then(|v| v.checked_sub(length + 1024))
-        .ok_or_else(limit)?;
-    if ktann_usearch::decode_bound(centroids.children.len(), source.parameters.m, length)
-        .map_err(native_error)?
-        > available
-    {
-        return Err(limit());
-    }
+    let (length, available) = admit_restore_budget(centroids, source, descriptor, working_bytes)?;
     let identity = identity(
         centroids,
         source.parameters,
