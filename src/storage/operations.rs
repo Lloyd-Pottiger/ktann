@@ -436,7 +436,9 @@ impl<'manifest> LogicalBinding<'manifest> {
             ),
             (Some(manifest), Some(index)) => index == manifest.logical_index_id(),
             (Some(manifest), None) => match key {
-                LogicalKey::BuildSchedule(id) | LogicalKey::BuildScheduleSlot { index: id, .. } => {
+                LogicalKey::BuildWorkspace(id)
+                | LogicalKey::BuildSchedule(id)
+                | LogicalKey::BuildScheduleSlot { index: id, .. } => {
                     *id == manifest.logical_index_id()
                 }
                 _ => self.allow_name_mapping && matches!(key, LogicalKey::IndexNameDirectory(_)),

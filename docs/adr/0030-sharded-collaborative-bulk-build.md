@@ -47,17 +47,20 @@ on one large build (`10M–10B` vectors).
    metadata above `32,768` leaves (`~100 MiB`), and scatter/refinement buffers
    avoid carrying `RaBitQ7` codes. Upper-tree internal partitions build local
    HNSW graphs directly from in-memory `&[ChildEntry]` slices.
-5. **Load across 16 fenced writer lanes and validate frozen slices in parallel
-   with 512-bit SHA-512 `LtHash` + full `ValueCodec` decoding.** Serving writes
-   batch up to `4 MiB` / `5,000` mutations (capped at `8 MiB` estimated
-   FoundationDB affected bytes) across 16 pipelined `STAGE_FENCE` lanes. Three
-   512-bit homomorphic multiset equations verify global ID uniqueness,
-   `RecordLocation == LeafEntry` equality, and `Centroid == ChildEntry` closure;
-   `publish` freezes all writer lanes by deleting `STAGE_FENCE` records, scans
-   `1..=256` keyspace slices collaboratively via short-lived `ReadTxn`s, decodes
-   every serving key/value through `ValueCodec`, and checks exact count and
-   `expected_kv_lthash` before flipping `Building -> Active` and reclaiming
-   transient `[0x06..0x08)` build metadata.
+5. **Load across 16 pipelined writer tasks fenced on `BuildWorkspace.writer_token`
+   and validate frozen slices in parallel with 512-bit SHA-512 `LtHash` + full
+   `ValueCodec` decoding.** Serving writes batch up to `4 MiB` / `5,000`
+   mutations (capped at `8 MiB` estimated FoundationDB affected bytes) across
+   16 concurrent writer tasks whose read-conflict-protected `BuildWorkspace`
+   check conflicts only when epoch ownership changes or validation freezes
+   writers. Three 512-bit homomorphic multiset equations verify global ID
+   uniqueness, `RecordLocation == LeafEntry` equality, and
+   `Centroid == ChildEntry` closure; `publish` freezes writers by clearing
+   `BuildWorkspace.writer_token`, scans `1..=256` keyspace slices
+   collaboratively via short-lived `ReadTxn`s, decodes every serving key/value
+   through `ValueCodec`, and checks exact count and `expected_kv_lthash` before
+   flipping `Building -> Active` and reclaiming transient `[0x07..0x08)` build
+   unit metadata.
 
 ## Consequences
 

@@ -112,7 +112,7 @@ asynchronous adapter shutdown. RocksDB does not advertise transactional range cl
 A Backend Namespace contains name mappings and never-reused Logical Index IDs.
 Create reserves an ID and atomically inserts the name mapping and Active
 Manifest. Bulk Build instead reserves a hidden Building Manifest and an immutable
-Build Descriptor; [publication](bulk-build.md#5-loading-and-exact-validation)
+Build Descriptor; [publication](bulk-build.md#4-homomorphic-multiset-verification-and-publication)
 transitions it to Active after exact validation. ID gaps are valid. Drop
 transitions the Manifest to Dropping before
 deleting data. Each drop binds the first resolved Logical Index ID across all
@@ -274,17 +274,18 @@ Bulk Build persists six logical key families:
   entry counts, expected 512-bit homomorphic serving KV digest (`LtHash`), and
   parallel validation split keys (`0..=255` splitters defining `1..=256` slices).
 - **Build Workspace** (namespace `[0,2] || id`, value `0x0f`) binds worker
-  options, adapter key/value limits, ownership token, attempt epoch, and terminal
-  failure. Its namespace scope lets cleanup survive index deletion.
+  options, adapter key/value limits, workspace directory token, active
+  writer-fence token (`[0; 32]` once frozen for validation), attempt epoch, and
+  terminal failure. Its namespace scope lets cleanup survive index deletion.
 - **Build Unit** (`0x07`, value `0x10`, keyed by `(index, stage, unit)`) records
-  writer-lane fences (`stage = 0`, `unit = 0..16`), disk stage work units
-  (`stage = 1..32`, including `Propose = 10+3r`, `Extract = 11+3r`,
-  `Apply = 12+3r`), and parallel validation slices (`stage = 40`), carrying the
-  build epoch, renewable worker owner token/expiry, completion flag, counts, and
-  512-bit `LtHash` digests. Post-publication cleanup reclaims `[0x07..0x08)`
-  (`BuildUnit`s) while compact `BuildDescriptor` (`0x05`) and `BuildProgress`
-  (`0x06`, with `validation_split_keys` cleared on activation) remain attached
-  for idempotent status and report counts until index drop.
+  disk stage work units (`stage = 1..32`, including `Propose = 10+3r`,
+  `Extract = 11+3r`, `Apply = 12+3r`) and parallel validation slices
+  (`stage = 40`), carrying the build epoch, renewable worker owner token/expiry,
+  completion flag, counts, and 512-bit `LtHash` digests. Post-publication
+  cleanup reclaims `[0x07..0x08)` (`BuildUnit`s) while compact
+  `BuildDescriptor` (`0x05`) and `BuildProgress` (`0x06`, with
+  `validation_split_keys` cleared on activation) remain attached for idempotent
+  status and report counts until index drop.
 - **Build Schedule** (namespace `[0,3] || id`, value `0x11`) records automatic
   execution options (including `distributed_workers`) and a renewable owner token.
   A committed token change fences superseded writers; expiry alone does not

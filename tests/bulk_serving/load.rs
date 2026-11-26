@@ -252,11 +252,11 @@ async fn claims_and_chunks_respect_budgets_and_recover_unknown_outcomes() {
             job.run_worker(opts.clone()).await.unwrap();
             assert_eq!(before, memory.history().len());
 
-            // Data chunk commits respect `opts.load` mutation and byte bounds.
+            // Every committed transaction respects `opts.load` mutation and byte bounds.
             for h in memory
                 .history()
                 .iter()
-                .filter(|h| h.outcome == CommitOutcome::Committed && h.mutations < 18)
+                .filter(|h| h.outcome == CommitOutcome::Committed)
             {
                 assert!(h.mutations <= opts.load.max_mutations);
                 assert!(h.mutation_bytes <= opts.load.max_bytes);

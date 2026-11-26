@@ -17,6 +17,8 @@ pub struct BuildWorkspace {
     pub(crate) options: BulkWorkerOptions,
     pub(crate) hard_limits: HardLimits,
     pub(crate) token: [u8; 32],
+    /// Non-zero while writers for `epoch` are authorized; `[0; 32]` once frozen for validation.
+    pub(crate) writer_token: [u8; 32],
     pub(crate) epoch: u64,
     pub(crate) failure: Option<ErrorKind>,
 }
@@ -59,6 +61,7 @@ pub(super) fn encode(e: &mut Encoder, w: &BuildWorkspace) -> Result<()> {
     e.u64(w.hard_limits.max_key_bytes as u64);
     e.u64(w.hard_limits.max_value_bytes as u64);
     e.bytes(&w.token);
+    e.bytes(&w.writer_token);
     e.u64(w.epoch);
     e.u8(match w.failure {
         None => 0,
@@ -82,6 +85,7 @@ pub(super) fn decode(d: &mut Decoder) -> Result<BuildWorkspace> {
         max_value_bytes: usize::try_from(d.u64()?).map_err(|_| corrupt())?,
     };
     let token = d.array()?;
+    let writer_token = d.array()?;
     let epoch = d.u64()?;
     let failure = match d.u8()? {
         0 => None,
@@ -99,6 +103,7 @@ pub(super) fn decode(d: &mut Decoder) -> Result<BuildWorkspace> {
         options,
         hard_limits,
         token,
+        writer_token,
         epoch,
         failure,
     };

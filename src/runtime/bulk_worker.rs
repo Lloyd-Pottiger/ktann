@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
+use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,9 +18,9 @@ use crate::api::{
 use crate::bulk::sharded::{
     EncodedLeafShard, EncodedLocationBatch, IdFrameEntry, ShardRows, ShardState,
     assign_leaf_partition_keys, build_and_encode_upper_tree, build_shard_leaves,
-    compute_shard_remap, encode_leaf_shard_opts, encode_record_group_bucket,
-    ingest_segment_into_slab, quantize_shards_and_extract_locations, refine_shards_parallel,
-    verify_id_bucket,
+    compute_shard_remap, encode_leaf_shard, encode_record_group_bucket, ingest_segment_into_slab,
+    parallel_chunks, quantize_shards_and_extract_locations, refine_shards_parallel,
+    refinement_per_leaf_bytes, verify_id_bucket,
 };
 use crate::bulk::{InputSnapshot, LtHash, ShardPlan};
 use crate::observe::labels::Operation;
@@ -27,16 +28,17 @@ use crate::search::numeric::VectorKernel;
 use crate::storage::backend::{AdmissionBudget, Backend, HardLimits, ScanLimits, WriteTxn};
 use crate::storage::keys::{self, LogicalKey, TreeKey};
 use crate::storage::values::{
-    BuildDescriptor, BuildPhase, BuildProgress, BuildUnit, BuildWorkspace, IndexLifecycle,
-    IndexManifest, MAX_SPLIT_KEYS, PartitionCentroid, PersistentValue,
+    BuildDescriptor, BuildPhase, BuildProgress, BuildWorkspace, IndexLifecycle, IndexManifest,
+    MAX_SPLIT_KEYS, PartitionCentroid, PersistentValue,
 };
 use crate::storage::{LogicalRange, ReadLogicalTxn, WriteLogicalTxn};
 
 use super::{
     OperationContext,
     bulk_scheduler::{
-        BulkAuthority, acquire_unscheduled_peer_slot, release_unscheduled_peer_slot,
-        renew_unscheduled_peer_slot, retire_orphaned_schedule,
+        BulkAuthority, acquire_unscheduled_peer_slot, authorize_raw,
+        ensure_no_peer_scheduler_leases, non_zero_token, release_unscheduled_peer_slot,
+        retire_orphaned_schedule, run_authority_lease_renewals,
     },
     lifecycle::RetryPolicy,
 };
@@ -44,9 +46,7 @@ use super::{
 #[path = "bulk_disk.rs"]
 pub(crate) mod bulk_disk;
 
-/// Number of independent writer-fence lanes (`BuildUnit { stage: 0, unit: 0..16 }`).
-pub(crate) const STAGE_FENCE: u8 = 0;
-pub(crate) const FENCE_LANES: u32 = 16;
+const MAX_WRITER_LANES: usize = 16;
 const MAX_TXN_AFFECTED_BYTES: usize = 8 * 1024 * 1024;
 const BUILD_UNIT_MUTATION_BYTES: usize = 296;
 
@@ -67,6 +67,110 @@ pub(crate) struct UnitLease {
     pub owner: [u8; 32],
     pub duration: Duration,
     pub lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// Outcome of one prepare-and-commit write attempt before retry policy resolution.
+pub(crate) enum CommitStep<T> {
+    Done(T),
+    PrepareAbort,
+    CommitFailed(Error),
+    Fatal(Error),
+}
+
+impl<T> CommitStep<T> {
+    pub(crate) async fn resolve(
+        self,
+        op: Operation,
+        retry: RetryPolicy,
+        attempts: &mut u32,
+    ) -> Result<Option<T>> {
+        match self {
+            Self::Done(v) => Ok(Some(v)),
+            Self::PrepareAbort => {
+                retry.wait_or_exhaust(op, attempts).await?;
+                Ok(None)
+            }
+            Self::CommitFailed(e) => {
+                retry.after_commit_error(op, attempts, e).await?;
+                Ok(None)
+            }
+            Self::Fatal(e) => Err(e),
+        }
+    }
+}
+
+pub(crate) async fn commit_raw_prepared<W: WriteTxn, T>(
+    prepared: Result<(Option<WriteLogicalTxn<'_, W>>, T)>,
+) -> CommitStep<T> {
+    match prepared {
+        Ok((None, out)) => CommitStep::Done(out),
+        Ok((Some(txn), out)) => match txn.commit().await {
+            Ok(()) => CommitStep::Done(out),
+            Err(e) => CommitStep::CommitFailed(e),
+        },
+        Err(e) if e.kind() == ErrorKind::RetryableAbort => CommitStep::PrepareAbort,
+        Err(e) => CommitStep::Fatal(e),
+    }
+}
+
+pub(crate) async fn lock_sched_read(
+    lock: &Option<Arc<tokio::sync::RwLock<()>>>,
+) -> Option<tokio::sync::RwLockReadGuard<'_, ()>> {
+    match lock {
+        Some(l) => Some(l.read().await),
+        None => None,
+    }
+}
+
+/// Executes a non-context write transaction step with scheduler read-lock protection and retries.
+pub(crate) async fn retry_raw_write<T, F, Fut>(
+    control: &OperationOptions,
+    sched_lock: Option<&tokio::sync::RwLock<()>>,
+    op: Operation,
+    retry: RetryPolicy,
+    mut step: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = CommitStep<T>>,
+{
+    let mut attempts = 0;
+    loop {
+        super::check_control(control)?;
+        let guard = match sched_lock {
+            Some(l) => Some(l.read().await),
+            None => None,
+        };
+        let outcome = step().await;
+        drop(guard);
+        if let Some(done) = outcome.resolve(op, retry, &mut attempts).await? {
+            return Ok(done);
+        }
+    }
+}
+
+/// Executes a read-only backend step with bounded `RetryableAbort` retries and control checks.
+pub(crate) async fn retry_read<T, F, Fut>(
+    control: &OperationOptions,
+    op: Operation,
+    retry: RetryPolicy,
+    mut step: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let mut attempts = 0;
+    loop {
+        super::check_control(control)?;
+        match step().await {
+            Ok(v) => return Ok(v),
+            Err(e) if e.kind() == ErrorKind::RetryableAbort => {
+                retry.wait_or_exhaust(op, &mut attempts).await?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Binds a drop-triggered cancellation token to `base` so dropping the owning async future
@@ -141,7 +245,7 @@ pub(crate) async fn building<T: WriteTxn>(
     }
 }
 
-/// In-flight lifecycle check for worker lanes, validation slices, and sealing (`Active` means
+/// In-flight lifecycle check for worker tasks, validation slices, and sealing (`Active` means
 /// a peer already published this build and supersedes our in-flight attempt).
 pub(crate) async fn building_in_flight<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
@@ -181,32 +285,22 @@ async fn fill_report_counts_from_progress<B: Backend>(
     if report.records > 0 || report.entries > 0 {
         return Ok(());
     }
-    let mut attempts = 0;
-    loop {
-        context.checkpoint()?;
-        let backend = context.backend();
-        let res = async {
+    let backend = context.backend();
+    let val = retry_read(&context.options, Operation::PublishBulkBuild, retry, || {
+        let backend = Arc::clone(&backend);
+        async move {
             let mut rtxn = ReadLogicalTxn::bootstrap(backend.begin_read().await?);
             rtxn.get(LogicalKey::BuildProgress(id)).await
         }
-        .await;
-        match res {
-            Ok(Some(PersistentValue::BuildProgress(p))) => {
-                report.records = p.total_records;
-                report.trees = p.trees;
-                report.partitions = p.partitions;
-                report.entries = p.total_entries;
-                return Ok(());
-            }
-            Ok(_) => return Ok(()),
-            Err(e) if e.kind() == ErrorKind::RetryableAbort => {
-                retry
-                    .wait_or_exhaust(Operation::PublishBulkBuild, &mut attempts)
-                    .await?;
-            }
-            Err(e) => return Err(e),
-        }
+    })
+    .await?;
+    if let Some(PersistentValue::BuildProgress(p)) = val {
+        report.records = p.total_records;
+        report.trees = p.trees;
+        report.partitions = p.partitions;
+        report.entries = p.total_entries;
     }
+    Ok(())
 }
 
 type ActivePeerSlot = (u32, [u8; 32], u64, Arc<tokio::sync::RwLock<()>>);
@@ -225,37 +319,6 @@ async fn maybe_acquire_peer_slot<B: Backend>(
     let lease_lock = Arc::new(tokio::sync::RwLock::new(()));
     context.bulk_lease_lock = Some(Arc::clone(&lease_lock));
     Ok(Some((slot, owner, initial_exp, lease_lock)))
-}
-
-async fn run_peer_slot_renewals<B: Backend>(
-    backend: Arc<B>,
-    lease_lock: Arc<tokio::sync::RwLock<()>>,
-    id: LogicalIndexId,
-    slot: u32,
-    owner: [u8; 32],
-    lease: Duration,
-    mut confirmed: u64,
-) -> Error {
-    let tick = (lease / 3).max(Duration::from_millis(5));
-    let mut timer = tokio::time::interval(tick);
-    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    timer.tick().await;
-    loop {
-        timer.tick().await;
-        if let Err(e) = renew_unscheduled_peer_slot(
-            backend.as_ref(),
-            &lease_lock,
-            id,
-            slot,
-            owner,
-            lease,
-            &mut confirmed,
-        )
-        .await
-        {
-            return e;
-        }
-    }
 }
 
 async fn complete_attempt<B: Backend>(
@@ -319,10 +382,12 @@ pub(crate) async fn complete<B: Backend>(
         let result = match peer_slot {
             Ok(Some((slot, owner, initial_exp, lease_lock))) => {
                 let backend = context.backend();
+                let auth = BulkAuthority::UnscheduledPeer { slot, owner };
+                let dist = options.distributed_workers;
                 let lease = options.unit_lease;
                 let outcome = tokio::select! {
                     res = complete_attempt(context, &index, &descriptor, &options, retry, &mut report) => res,
-                    err = run_peer_slot_renewals(backend, lease_lock, id, slot, owner, lease, initial_exp) => Err(err),
+                    err = run_authority_lease_renewals(backend, lease_lock, id, auth, dist, lease, initial_exp) => Err(err),
                 };
                 release_unscheduled_peer_slot(context, id, slot, owner, retry).await?;
                 outcome
@@ -385,10 +450,12 @@ pub(crate) async fn run<B: Backend>(
         maybe_acquire_peer_slot(context, &index, &options, retry).await?
     {
         let backend = context.backend();
+        let auth = BulkAuthority::UnscheduledPeer { slot, owner };
+        let dist = options.distributed_workers;
         let lease = options.unit_lease;
         let outcome = tokio::select! {
             res = run_normalized(context, index, descriptor, options, retry) => res,
-            err = run_peer_slot_renewals(backend, lease_lock, id, slot, owner, lease, initial_exp) => Err(err),
+            err = run_authority_lease_renewals(backend, lease_lock, id, auth, dist, lease, initial_exp) => Err(err),
         };
         release_unscheduled_peer_slot(context, id, slot, owner, retry).await?;
         outcome
@@ -433,7 +500,6 @@ async fn run_normalized<B: Backend>(
         });
     }
 
-    // Ensure the workspace's owned child directory exists so cleanup owns a concrete directory.
     {
         let dir = state.directory();
         let guard = lock.clone();
@@ -486,77 +552,7 @@ fn fits_in_memory(
     needed <= effective_mem
 }
 
-async fn stage_extra_fence_lanes<B: Backend>(
-    context: &OperationContext<B>,
-    index: &IndexManifest,
-    fence: WriteFence,
-    retry: RetryPolicy,
-) -> Result<()> {
-    let id = index.logical_index_id();
-    let max_per_batch = context
-        .backend()
-        .admission_budget()
-        .max_mutations
-        .saturating_sub(2)
-        .clamp(1, FENCE_LANES as usize) as u32;
-    for batch_start in (1..FENCE_LANES).step_by(max_per_batch as usize) {
-        let batch_end = (batch_start + max_per_batch).min(FENCE_LANES);
-        let mut attempts = 0;
-        loop {
-            context.checkpoint()?;
-            let _lease_guard = match &context.bulk_lease_lock {
-                Some(l) => Some(l.read().await),
-                None => None,
-            };
-            let backend = context.backend();
-            let prepared = async {
-                let mut txn = WriteLogicalTxn::bootstrap(
-                    backend.begin_write().await?,
-                    backend.hard_limits(),
-                    backend.admission_budget(),
-                );
-                building_in_flight(&mut txn, index).await?;
-                super::bulk_scheduler::authorize(context, &mut txn, id).await?;
-                for lane in batch_start..batch_end {
-                    txn.put(
-                        LogicalKey::BuildUnit {
-                            index: id,
-                            stage: STAGE_FENCE,
-                            unit: lane,
-                        },
-                        PersistentValue::BuildUnit(BuildUnit::fence_lane(fence.epoch, fence.owner)),
-                    )
-                    .await?;
-                }
-                Ok::<_, Error>(txn)
-            }
-            .await;
-            let txn = match prepared {
-                Ok(txn) => txn,
-                Err(e) if e.kind() == ErrorKind::RetryableAbort => {
-                    drop(_lease_guard);
-                    retry
-                        .wait_or_exhaust(Operation::RunBulkBuild, &mut attempts)
-                        .await?;
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-            match txn.commit().await {
-                Ok(()) => break,
-                Err(e) => {
-                    drop(_lease_guard);
-                    retry
-                        .after_commit_error(Operation::RunBulkBuild, &mut attempts, e)
-                        .await?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Claims or joins the workspace and installs the 16 writer-fence lanes.
+/// Claims or joins the workspace and installs `BuildWorkspace.writer_token`.
 async fn claim<B: Backend>(
     context: &mut OperationContext<B>,
     index: &IndexManifest,
@@ -564,18 +560,14 @@ async fn claim<B: Backend>(
     options: BulkWorkerOptions,
     retry: RetryPolicy,
 ) -> Result<(BuildWorkspace, WriteFence, Option<BuildProgress>)> {
-    let mut ws_token = [0_u8; 32];
-    getrandom::fill(&mut ws_token).map_err(|_| Error::new(ErrorKind::Other))?;
-    let mut fence_owner = [0_u8; 32];
-    getrandom::fill(&mut fence_owner).map_err(|_| Error::new(ErrorKind::Other))?;
+    let ws_token = non_zero_token()?;
+    let writer_token = non_zero_token()?;
 
     let _ = effective_budget(context.backend().admission_budget(), options.load)?;
     let id = index.logical_index_id();
-    let inline_all_lanes =
-        context.backend().admission_budget().max_mutations >= (FENCE_LANES as usize + 3);
 
     let mut attempts = 0;
-    let (state, fence) = loop {
+    loop {
         context.checkpoint()?;
         let backend = context.backend();
         let prepared = async {
@@ -599,12 +591,13 @@ async fn claim<B: Backend>(
                                 options: options.clone(),
                                 hard_limits: backend.hard_limits(),
                                 token: ws_token,
+                                writer_token,
                                 epoch: p.epoch,
                                 failure: None,
                             },
                             WriteFence {
                                 epoch: p.epoch,
-                                owner: ws_token,
+                                owner: writer_token,
                             },
                             Some(p),
                         ));
@@ -637,15 +630,17 @@ async fn claim<B: Backend>(
                         options: options.clone(),
                         hard_limits: backend.hard_limits(),
                         token: ws_token,
+                        writer_token,
                         epoch: 1,
                         failure: None,
                     };
-                    let owner = if options.distributed_workers > 1 {
-                        ws_token
-                    } else {
-                        fence_owner
-                    };
-                    (state, WriteFence { epoch: 1, owner })
+                    (
+                        state,
+                        WriteFence {
+                            epoch: 1,
+                            owner: writer_token,
+                        },
+                    )
                 }
                 Some(PersistentValue::BuildWorkspace(mut w)) => {
                     if w.options != options || w.hard_limits != backend.hard_limits() {
@@ -654,9 +649,10 @@ async fn claim<B: Backend>(
                     if let Some(kind) = w.failure {
                         return Err(Error::new(kind));
                     }
-                    if existing_progress
-                        .as_ref()
-                        .is_some_and(|p| p.phase == BuildPhase::Validating)
+                    if w.writer_token == [0; 32]
+                        || existing_progress
+                            .as_ref()
+                            .is_some_and(|p| p.phase == BuildPhase::Validating)
                     {
                         return Err(Error::new(ErrorKind::BulkBuildSuperseded));
                     }
@@ -670,7 +666,7 @@ async fn claim<B: Backend>(
                             w.clone(),
                             WriteFence {
                                 epoch: w.epoch,
-                                owner: w.token,
+                                owner: w.writer_token,
                             },
                             Some(loaded_prog),
                         ));
@@ -678,10 +674,8 @@ async fn claim<B: Backend>(
                     if options.distributed_workers > 1 {
                         let existing_fence = WriteFence {
                             epoch: w.epoch,
-                            owner: w.token,
+                            owner: w.writer_token,
                         };
-                        // Joining collaborative peers observe an already-initialized epoch without
-                        // rewriting `BuildWorkspace` or `STAGE_FENCE` lanes (zero writer conflicts!).
                         if existing_progress
                             .as_ref()
                             .is_some_and(|p| p.epoch == w.epoch)
@@ -695,11 +689,12 @@ async fn claim<B: Backend>(
                             .epoch
                             .checked_add(1)
                             .ok_or_else(|| Error::new(ErrorKind::IdExhausted))?;
+                        w.writer_token = writer_token;
                         (
                             w.clone(),
                             WriteFence {
                                 epoch: w.epoch,
-                                owner: fence_owner,
+                                owner: writer_token,
                             },
                         )
                     }
@@ -712,18 +707,6 @@ async fn claim<B: Backend>(
                 PersistentValue::BuildWorkspace(state.clone()),
             )
             .await?;
-            let lanes_in_txn = if inline_all_lanes { FENCE_LANES } else { 1 };
-            for lane in 0..lanes_in_txn {
-                txn.put(
-                    LogicalKey::BuildUnit {
-                        index: id,
-                        stage: STAGE_FENCE,
-                        unit: lane,
-                    },
-                    PersistentValue::BuildUnit(BuildUnit::fence_lane(fence.epoch, fence.owner)),
-                )
-                .await?;
-            }
             if existing_progress.is_none() || options.distributed_workers == 1 {
                 let disk_mode =
                     options.distributed_workers > 1 || !fits_in_memory(index, descriptor, &options);
@@ -769,7 +752,7 @@ async fn claim<B: Backend>(
         }
         let txn = txn_opt.expect("prepared write txn");
         match context.commit(|start| txn.commit_with(start)).await {
-            Ok(()) => break (state, fence),
+            Ok(()) => return Ok((state, fence, None)),
             Err(e) if e.kind() == ErrorKind::RetryableAbort => {
                 retry
                     .wait_or_exhaust(Operation::RunBulkBuild, &mut attempts)
@@ -777,12 +760,7 @@ async fn claim<B: Backend>(
             }
             Err(e) => return Err(e),
         }
-    };
-
-    if !inline_all_lanes {
-        stage_extra_fence_lanes(context, index, fence, retry).await?;
     }
-    Ok((state, fence, None))
 }
 
 pub(crate) fn effective_budget(
@@ -797,58 +775,179 @@ pub(crate) fn effective_budget(
     Ok(budget)
 }
 
-pub(crate) async fn bump_loading_progress<B: Backend>(
-    context: &OperationContext<B>,
+/// Advances `BuildProgress` (`Preparing -> Loading` and/or `loaded_entries += delta`).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "progress advancement accepts explicit backend/control/fencing handles from both OperationContext and StageEnv"
+)]
+pub(crate) async fn advance_loading_progress<B: Backend>(
+    backend: &B,
+    control: &OperationOptions,
+    sched_lease_lock: Option<&tokio::sync::RwLock<()>>,
+    bulk_authority: Option<BulkAuthority>,
     index: &IndexManifest,
     fence: WriteFence,
     delta_entries: u64,
+    retry: Option<RetryPolicy>,
 ) -> Result<()> {
-    if delta_entries == 0 {
+    if delta_entries == 0 && retry.is_none() {
         return Ok(());
     }
-    let _lease_guard = match &context.bulk_lease_lock {
-        Some(l) => Some(l.read().await),
-        None => None,
-    };
     let id = index.logical_index_id();
-    let backend = context.backend();
-    let mut txn = WriteLogicalTxn::bootstrap(
-        backend.begin_write().await?,
-        backend.hard_limits(),
-        backend.admission_budget(),
-    );
-    if building_in_flight(&mut txn, index).await.is_err()
-        || super::bulk_scheduler::authorize(context, &mut txn, id)
-            .await
-            .is_err()
-        || check_lane_fence(&mut txn, index, fence, 0).await.is_err()
-    {
-        txn.rollback().await;
-        return Ok(());
-    }
-    if let Some(PersistentValue::BuildProgress(mut p)) =
-        txn.get_for_update(LogicalKey::BuildProgress(id)).await?
-        && p.epoch == fence.epoch
-        && matches!(p.phase, BuildPhase::Preparing | BuildPhase::Loading)
-    {
-        p.phase = BuildPhase::Loading;
-        p.loaded_entries = p.loaded_entries.saturating_add(delta_entries);
-        if p.loaded_entries > p.total_entries {
-            p.total_entries = p.loaded_entries;
-        }
-        if txn
-            .put(
+    let step_once = || async {
+        let mut txn = WriteLogicalTxn::bootstrap(
+            backend.begin_write().await?,
+            backend.hard_limits(),
+            backend.admission_budget(),
+        );
+        building_in_flight(&mut txn, index).await?;
+        authorize_raw(&mut txn, id, bulk_authority).await?;
+        check_writer_fence(&mut txn, index, fence).await?;
+        if let Some(PersistentValue::BuildProgress(mut p)) =
+            txn.get_for_update(LogicalKey::BuildProgress(id)).await?
+            && p.epoch == fence.epoch
+            && matches!(p.phase, BuildPhase::Preparing | BuildPhase::Loading)
+            && (delta_entries > 0 || p.phase == BuildPhase::Preparing)
+        {
+            p.phase = BuildPhase::Loading;
+            p.loaded_entries = p.loaded_entries.saturating_add(delta_entries);
+            if p.loaded_entries > p.total_entries {
+                p.total_entries = p.loaded_entries;
+            }
+            txn.put(
                 LogicalKey::BuildProgress(id),
                 PersistentValue::BuildProgress(p),
             )
-            .await
-            .is_ok()
-        {
-            let _ = txn.commit().await;
-            return Ok(());
+            .await?;
+            return Ok::<_, Error>((Some(txn), ()));
         }
+        txn.rollback().await;
+        Ok((None, ()))
+    };
+
+    if let Some(policy) = retry {
+        retry_raw_write(
+            control,
+            sched_lease_lock,
+            Operation::RunBulkBuild,
+            policy,
+            || async { commit_raw_prepared(step_once().await).await },
+        )
+        .await
+    } else {
+        let _guard = match sched_lease_lock {
+            Some(l) => Some(l.read().await),
+            None => None,
+        };
+        if let Ok((Some(txn), ())) = step_once().await {
+            let _ = txn.commit().await;
+        }
+        Ok(())
     }
-    txn.rollback().await;
+}
+
+/// Overlaps CPU wave encoding on `spawn_blocking` with pipelined backend KV commits on the
+/// previous wave, updating best-effort `BuildProgress` after each committed wave.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "wave pipeline coordinates context, fencing, lane concurrency, budget, wave size, and encoder/accumulator closures"
+)]
+async fn pipeline_wave_commits<B, I, T, E, A>(
+    context: &mut OperationContext<B>,
+    index: &IndexManifest,
+    fence: WriteFence,
+    writer_lanes: usize,
+    budget: AdmissionBudget,
+    retry: RetryPolicy,
+    items: I,
+    wave_size: usize,
+    encode_wave: E,
+    mut accumulate: A,
+) -> Result<()>
+where
+    B: Backend,
+    I: IntoIterator,
+    I::Item: Send + 'static,
+    T: Send + 'static,
+    E: Fn(Vec<I::Item>, &OperationOptions) -> Result<T> + Clone + Send + Sync + 'static,
+    A: FnMut(T) -> Vec<(Bytes, Bytes)>,
+{
+    let cpu_adm_base = context.cpu_keep_alive();
+    let mut iter = items.into_iter();
+    let mut pending_kvs: Vec<(Bytes, Bytes)> = Vec::new();
+
+    let bump = |ctx: &OperationContext<B>, delta: u64| {
+        let backend = ctx.backend();
+        let ctrl = ctx.options.clone();
+        let sched = ctx.bulk_lease_lock.clone();
+        let auth = ctx.bulk_authority;
+        async move {
+            advance_loading_progress(
+                backend.as_ref(),
+                &ctrl,
+                sched.as_deref(),
+                auth,
+                index,
+                fence,
+                delta,
+                None,
+            )
+            .await
+        }
+    };
+
+    loop {
+        let wave: Vec<I::Item> = iter.by_ref().take(wave_size).collect();
+        if wave.is_empty() {
+            break;
+        }
+        context.checkpoint()?;
+        let (control, drop_guard) = drop_guarded_options(&context.options);
+        let adm = cpu_adm_base.clone();
+        let enc_fn = encode_wave.clone();
+        let encode_fut = async move {
+            let _drop_guard = drop_guard;
+            tokio::task::spawn_blocking(move || {
+                let _adm = adm;
+                super::check_control(&control)?;
+                enc_fn(wave, &control)
+            })
+            .await
+            .map_err(|e| Error::with_source(ErrorKind::Other, e))?
+        };
+
+        let to_commit = std::mem::take(&mut pending_kvs);
+        let committed_len = to_commit.len() as u64;
+        let commit_fut = commit_kv_batches(
+            context,
+            index,
+            fence,
+            None,
+            to_commit,
+            writer_lanes,
+            budget,
+            retry,
+        );
+        let (_, encoded) = tokio::try_join!(commit_fut, encode_fut)?;
+        bump(context, committed_len).await?;
+        pending_kvs = accumulate(encoded);
+    }
+
+    if !pending_kvs.is_empty() {
+        let committed_len = pending_kvs.len() as u64;
+        commit_kv_batches(
+            context,
+            index,
+            fence,
+            None,
+            pending_kvs,
+            writer_lanes,
+            budget,
+            retry,
+        )
+        .await?;
+        bump(context, committed_len).await?;
+    }
     Ok(())
 }
 
@@ -874,12 +973,10 @@ async fn run_in_memory<B: Backend>(
         .memory_bytes
         .min(descriptor.options().memory_bytes);
 
-    // Before planning or sealing, clear any serving KVs left by an aborted earlier epoch.
     if fence.epoch > 1 {
         clear_stale_serving_data(context, index, fence, budget, retry).await?;
     }
 
-    // 1. Open InputSnapshot and build ShardPlan.
     let plan_start = Instant::now();
     let (snapshot, plan) = {
         let desc = descriptor.clone();
@@ -902,19 +999,13 @@ async fn run_in_memory<B: Backend>(
     };
     report.plan = plan_start.elapsed();
 
-    if snapshot.manifest().items() == 0 {
-        if let Some(rounds) = descriptor.refinement_rounds() {
-            let mut empty_shards = Vec::new();
-            refine_shards_parallel(
-                index,
-                &plan,
-                &mut empty_shards,
-                rounds,
-                effective_mem,
-                parallelism,
-                &|| Ok(()),
-            )?;
+    if let Some(rounds) = descriptor.refinement_rounds() {
+        let per_leaf = refinement_per_leaf_bytes(index.config().dimension(), rounds);
+        if effective_mem < per_leaf.saturating_mul(2) {
+            return Err(Error::new(ErrorKind::LimitExceeded));
         }
+    }
+    if snapshot.manifest().items() == 0 {
         seal_loaded(
             context,
             index,
@@ -1077,42 +1168,26 @@ async fn run_in_memory<B: Backend>(
                 }
                 drop(slab_c);
 
-                let chunk_size = all_rows_by_shard.len().div_ceil(parallelism.max(1)).max(1);
-                let mut row_chunks = Vec::new();
-                let mut iter = all_rows_by_shard.into_iter();
-                while iter.len() > 0 {
-                    row_chunks.push(iter.by_ref().take(chunk_size).collect::<Vec<_>>());
-                }
-                let shards = std::thread::scope(|scope| {
-                    let mut handles = Vec::with_capacity(row_chunks.len());
-                    for chunk in row_chunks {
-                        let m_ref = &manifest_c;
-                        handles.push(scope.spawn(move || -> Result<Vec<ShardState>> {
-                            let mut out = Vec::with_capacity(chunk.len());
-                            for rows in chunk {
-                                if rows.rows.is_empty() {
-                                    out.push(ShardState {
-                                        rows,
-                                        leaves: Vec::new(),
-                                    });
-                                } else {
-                                    out.push(build_shard_leaves(
-                                        m_ref,
-                                        sample_items,
-                                        rows,
-                                        &check,
-                                    )?);
-                                }
-                            }
-                            Ok(out)
-                        }));
+                let batches = parallel_chunks(&all_rows_by_shard, parallelism, |_, chunk| {
+                    let mut out = Vec::with_capacity(chunk.len());
+                    for rows in chunk {
+                        if rows.rows.is_empty() {
+                            out.push(ShardState {
+                                rows: rows.clone(),
+                                leaves: Vec::new(),
+                            });
+                        } else {
+                            out.push(build_shard_leaves(
+                                &manifest_c,
+                                sample_items,
+                                rows.clone(),
+                                &check,
+                            )?);
+                        }
                     }
-                    let mut built = Vec::new();
-                    for h in handles {
-                        built.extend(h.join().map_err(|_| Error::new(ErrorKind::Other))??);
-                    }
-                    Ok::<_, Error>(built)
+                    Ok(out)
                 })?;
+                let shards: Vec<ShardState> = batches.into_iter().flatten().collect();
                 Ok((shards, dedup_records, dedup_lt, verified_buckets))
             })
             .await?
@@ -1152,7 +1227,8 @@ async fn run_in_memory<B: Backend>(
     } else {
         1
     };
-    let (assigned, tree_totals) = assign_leaf_partition_keys(&shards)?;
+    let (assigned, tree_totals) =
+        assign_leaf_partition_keys(&shards, |s| s.leaves.iter().map(|l| &l.tree_key))?;
     let leaf_partitions: u64 = tree_totals.values().map(|(_, c)| *c).sum();
 
     let mut child_by_tree: BTreeMap<Bytes, Vec<(PartitionKey, PartitionCentroid)>> =
@@ -1187,32 +1263,26 @@ async fn run_in_memory<B: Backend>(
             .await?
     };
 
-    let cpu_adm_base = context.cpu_keep_alive();
-
     // 5A. Emit `[0x01 Record + Payload + Location]` FIRST in strict ascending `id_bucket` order.
     let mut loc_records = 0_u64;
     let mut loc_mem_lt = LtHash::ZERO;
-    let bucket_wave_size = parallelism.clamp(1, 4);
-    let mut bucket_iter = verified_id_refs.into_iter().zip(locations_by_bucket);
-    let mut pending_rec_kvs: Vec<(Bytes, Bytes)> = Vec::new();
-
-    while bucket_iter.len() > 0 {
-        context.checkpoint()?;
-        let wave: Vec<_> = bucket_iter.by_ref().take(bucket_wave_size).collect();
+    let limits = state.hard_limits;
+    {
         let manifest_c = index.clone();
         let snap_c = snapshot.clone();
-        let limits = state.hard_limits;
-        let (control, _drop_guard) = drop_guarded_options(&context.options);
         let guard = lock.clone();
-        let adm = cpu_adm_base.clone();
-
-        let encode_fut = async move {
-            let _drop_guard = _drop_guard;
-            tokio::task::spawn_blocking(move || -> Result<Vec<(u64, EncodedLocationBatch)>> {
-                let _adm = adm;
-                let _lock = guard;
-                super::check_control(&control)?;
-                let check = || super::check_control(&control);
+        pipeline_wave_commits(
+            context,
+            index,
+            fence,
+            writer_lanes,
+            budget,
+            retry,
+            verified_id_refs.into_iter().zip(locations_by_bucket),
+            parallelism.clamp(1, 4),
+            move |wave, ctrl| {
+                let _lock = guard.as_ref();
+                let check = || super::check_control(ctrl);
                 std::thread::scope(|scope| {
                     let mut handles = Vec::with_capacity(wave.len());
                     for (id_refs, locs) in wave {
@@ -1240,59 +1310,25 @@ async fn run_in_memory<B: Backend>(
                     }
                     Ok(out)
                 })
-            })
-            .await
-            .map_err(|e| Error::with_source(ErrorKind::Other, e))?
-        };
-
-        let to_commit = std::mem::take(&mut pending_rec_kvs);
-        let committed_len = to_commit.len() as u64;
-        let commit_fut = commit_kv_batches(
-            context,
-            index,
-            fence,
-            None,
-            to_commit,
-            writer_lanes,
-            budget,
-            retry,
-        );
-        let (_, encoded_buckets) = tokio::try_join!(commit_fut, encode_fut)?;
-        if committed_len > 0 {
-            bump_loading_progress(context, index, fence, committed_len).await?;
-        }
-
-        let mut wave_kvs = Vec::new();
-        for (cnt, (bkvs, bkv_lt, bm_lt)) in encoded_buckets {
-            loc_records += cnt;
-            total_entries += bkvs.len() as u64;
-            expected_kv_lthash.add_assign(bkv_lt);
-            loc_mem_lt.add_assign(bm_lt);
-            wave_kvs.extend(bkvs);
-        }
-        pending_rec_kvs = wave_kvs;
-    }
-
-    if !pending_rec_kvs.is_empty() {
-        let committed_len = pending_rec_kvs.len() as u64;
-        commit_kv_batches(
-            context,
-            index,
-            fence,
-            None,
-            pending_rec_kvs,
-            writer_lanes,
-            budget,
-            retry,
+            },
+            |encoded_buckets| {
+                let mut wave_kvs = Vec::new();
+                for (cnt, (bkvs, bkv_lt, bm_lt)) in encoded_buckets {
+                    loc_records += cnt;
+                    total_entries += bkvs.len() as u64;
+                    expected_kv_lthash.add_assign(bkv_lt);
+                    loc_mem_lt.add_assign(bm_lt);
+                    wave_kvs.extend(bkvs);
+                }
+                wave_kvs
+            },
         )
         .await?;
-        bump_loading_progress(context, index, fence, committed_len).await?;
     }
 
     // 5B. Emit `[0x03 TreeManifest]` + `[0x04 Partitions]` SECOND in strict ascending key order.
     let (upper_kvs, upper_kv_lt, upper_def_lt, upper_ref_lt, internal_parts) = {
         let manifest_c = index.clone();
-        let limits = state.hard_limits;
         let sample_items = descriptor.options().sample_items;
         let graph_mem = state.options.graph_memory_bytes;
         let tree_list: Vec<UpperTreeInput> = tree_totals
@@ -1382,40 +1418,44 @@ async fn run_in_memory<B: Backend>(
         retry,
     )
     .await?;
-    bump_loading_progress(context, index, fence, pre_upper_len).await?;
+    advance_loading_progress(
+        context.backend().as_ref(),
+        &context.options,
+        context.bulk_lease_lock.as_deref(),
+        context.bulk_authority,
+        index,
+        fence,
+        pre_upper_len,
+        None,
+    )
+    .await?;
 
     let mut leaf_membership_lt = LtHash::ZERO;
     let mut edge_def_lt = LtHash::ZERO;
-
-    let leaf_wave_size = parallelism.clamp(1, 8);
-    let mut shard_iter = shards.into_iter().zip(assigned);
-    let mut pending_leaf_kvs: Vec<(Bytes, Bytes)> = Vec::new();
-
-    while shard_iter.len() > 0 {
-        context.checkpoint()?;
-        let wave: Vec<_> = shard_iter.by_ref().take(leaf_wave_size).collect();
+    {
         let manifest_c = index.clone();
         let plan_c = plan.clone();
-        let limits = state.hard_limits;
-        let (control, _drop_guard) = drop_guarded_options(&context.options);
-        let adm = cpu_adm_base.clone();
-
-        let encode_fut = async move {
-            let _drop_guard = _drop_guard;
-            tokio::task::spawn_blocking(move || -> Result<Vec<EncodedLeafShard>> {
-                let _adm = adm;
-                super::check_control(&control)?;
-                let check = || super::check_control(&control);
+        pipeline_wave_commits(
+            context,
+            index,
+            fence,
+            writer_lanes,
+            budget,
+            retry,
+            shards.into_iter().zip(assigned),
+            parallelism.clamp(1, 8),
+            move |wave, ctrl| {
+                let check = || super::check_control(ctrl);
                 std::thread::scope(|scope| {
                     let mut handles = Vec::with_capacity(wave.len());
                     for (shard, keys) in wave {
                         let m_ref = &manifest_c;
                         let p_ref = &plan_c;
-                        handles.push(scope.spawn(move || {
+                        handles.push(scope.spawn(move || -> Result<Option<EncodedLeafShard>> {
                             if shard.leaves.is_empty() {
                                 return Ok(None);
                             }
-                            let enc = encode_leaf_shard_opts(
+                            let enc = encode_leaf_shard(
                                 m_ref, p_ref, &shard, &keys, limits, false, &check,
                             )?;
                             drop(shard);
@@ -1430,55 +1470,21 @@ async fn run_in_memory<B: Backend>(
                     }
                     Ok(out)
                 })
-            })
-            .await
-            .map_err(|e| Error::with_source(ErrorKind::Other, e))?
-        };
-
-        let to_commit = std::mem::take(&mut pending_leaf_kvs);
-        let committed_len = to_commit.len() as u64;
-        let commit_fut = commit_kv_batches(
-            context,
-            index,
-            fence,
-            None,
-            to_commit,
-            writer_lanes,
-            budget,
-            retry,
-        );
-        let (_, encoded_wave) = tokio::try_join!(commit_fut, encode_fut)?;
-        if committed_len > 0 {
-            bump_loading_progress(context, index, fence, committed_len).await?;
-        }
-
-        let mut wave_kvs = Vec::new();
-        for enc in encoded_wave {
-            total_entries += enc.kvs.len() as u64;
-            expected_kv_lthash.add_assign(enc.kv_lthash);
-            leaf_membership_lt.add_assign(enc.membership_lthash);
-            edge_def_lt.add_assign(enc.edge_def_lthash);
-            wave_kvs.extend(enc.kvs);
-        }
-        wave_kvs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        pending_leaf_kvs = wave_kvs;
-    }
-    drop(shard_iter);
-
-    if !pending_leaf_kvs.is_empty() {
-        let committed_len = pending_leaf_kvs.len() as u64;
-        commit_kv_batches(
-            context,
-            index,
-            fence,
-            None,
-            pending_leaf_kvs,
-            writer_lanes,
-            budget,
-            retry,
+            },
+            |encoded_wave| {
+                let mut wave_kvs = Vec::new();
+                for enc in encoded_wave {
+                    total_entries += enc.kvs.len() as u64;
+                    expected_kv_lthash.add_assign(enc.kv_lthash);
+                    leaf_membership_lt.add_assign(enc.membership_lthash);
+                    edge_def_lt.add_assign(enc.edge_def_lthash);
+                    wave_kvs.extend(enc.kvs);
+                }
+                wave_kvs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                wave_kvs
+            },
         )
         .await?;
-        bump_loading_progress(context, index, fence, committed_len).await?;
     }
 
     let post_upper_len = post_leaf_upper_kvs.len() as u64;
@@ -1493,7 +1499,17 @@ async fn run_in_memory<B: Backend>(
         retry,
     )
     .await?;
-    bump_loading_progress(context, index, fence, post_upper_len).await?;
+    advance_loading_progress(
+        context.backend().as_ref(),
+        &context.options,
+        context.bulk_lease_lock.as_deref(),
+        context.bulk_authority,
+        index,
+        fence,
+        post_upper_len,
+        None,
+    )
+    .await?;
 
     if loc_records != total_records
         || leaf_membership_lt != loc_mem_lt
@@ -1503,14 +1519,44 @@ async fn run_in_memory<B: Backend>(
     }
     report.emit = emit_start.elapsed();
 
-    let total_trees = tree_totals.len() as u64;
-    let total_partitions = leaf_partitions + internal_parts;
-    let split_keys = build_validation_split_keys(
-        index.logical_index_id(),
+    finalize_and_seal_loaded(
+        context,
+        index,
+        fence,
         &plan,
-        total_entries,
         state.hard_limits,
-    )?;
+        total_records,
+        tree_totals.len() as u64,
+        leaf_partitions + internal_parts,
+        total_entries,
+        expected_kv_lthash,
+        retry,
+        &mut report,
+    )
+    .await?;
+    Ok(report)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "shared loaded-sealing tail computes split keys, commits BuildProgress, and populates report counts"
+)]
+pub(crate) async fn finalize_and_seal_loaded<B: Backend>(
+    context: &mut OperationContext<B>,
+    index: &IndexManifest,
+    fence: WriteFence,
+    plan: &ShardPlan,
+    hard_limits: HardLimits,
+    total_records: u64,
+    total_trees: u64,
+    total_partitions: u64,
+    total_entries: u64,
+    expected_kv_lthash: LtHash,
+    retry: RetryPolicy,
+    report: &mut BulkBuildReport,
+) -> Result<()> {
+    let split_keys =
+        build_validation_split_keys(index.logical_index_id(), plan, total_entries, hard_limits)?;
     seal_loaded(
         context,
         index,
@@ -1524,12 +1570,11 @@ async fn run_in_memory<B: Backend>(
         retry,
     )
     .await?;
-
     report.records = total_records;
     report.trees = total_trees;
     report.partitions = total_partitions;
     report.entries = total_entries;
-    Ok(report)
+    Ok(())
 }
 
 type VerifiedBucketsResult = (u64, LtHash, Vec<Vec<IdFrameEntry>>);
@@ -1538,39 +1583,27 @@ fn verify_all_id_buckets_parallel(
     buckets: Vec<Vec<IdFrameEntry>>,
     parallelism: usize,
 ) -> Result<VerifiedBucketsResult> {
-    let chunk_size = buckets.len().div_ceil(parallelism.max(1)).max(1);
-    let mut batches = Vec::new();
-    let mut iter = buckets.into_iter();
-    while iter.len() > 0 {
-        batches.push(iter.by_ref().take(chunk_size).collect::<Vec<_>>());
-    }
-    std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(batches.len());
-        for batch in batches {
-            handles.push(scope.spawn(move || -> Result<VerifiedBucketsResult> {
-                let mut total = 0_u64;
-                let mut lt = LtHash::ZERO;
-                let mut out_buckets = Vec::with_capacity(batch.len());
-                for ids in batch {
-                    let (c, h, sorted) = verify_id_bucket(ids)?;
-                    total += c;
-                    lt.add_assign(h);
-                    out_buckets.push(sorted);
-                }
-                Ok((total, lt, out_buckets))
-            }));
-        }
+    let results = parallel_chunks(&buckets, parallelism, |_, chunk| {
         let mut total = 0_u64;
         let mut lt = LtHash::ZERO;
-        let mut all_buckets = Vec::new();
-        for h in handles {
-            let (c, part, b_list) = h.join().map_err(|_| Error::new(ErrorKind::Other))??;
+        let mut out_buckets = Vec::with_capacity(chunk.len());
+        for ids in chunk {
+            let (c, h, sorted) = verify_id_bucket(ids.clone())?;
             total += c;
-            lt.add_assign(part);
-            all_buckets.extend(b_list);
+            lt.add_assign(h);
+            out_buckets.push(sorted);
         }
-        Ok((total, lt, all_buckets))
-    })
+        Ok((total, lt, out_buckets))
+    })?;
+    let mut total = 0_u64;
+    let mut lt = LtHash::ZERO;
+    let mut all_buckets = Vec::with_capacity(buckets.len());
+    for (c, part, b_list) in results {
+        total += c;
+        lt.add_assign(part);
+        all_buckets.extend(b_list);
+    }
+    Ok((total, lt, all_buckets))
 }
 
 /// Builds up to `MAX_SPLIT_KEYS` (`255`) balanced validation split keys strictly inside
@@ -1616,8 +1649,8 @@ pub(crate) fn build_validation_split_keys(
                 &heavy.tree_key,
                 PartitionKey::new(1)?,
             )));
-            let tree_splits = ((u64::from(heavy.shard_count) * part_budget as u64)
-                / non_zero_heavy.get()) as usize;
+            let tree_splits =
+                ((u64::from(heavy.shard_count) * part_budget as u64) / non_zero_heavy) as usize;
             let approx_leaves = u64::from(heavy.shard_count).saturating_mul(64);
             if tree_splits > 0 && approx_leaves >= 4 {
                 for s in 1..=tree_splits {
@@ -1644,7 +1677,6 @@ pub(crate) fn build_validation_split_keys(
         split_keys.dedup();
     }
 
-    // Cap total encoded byte footprint (`4 + key.len()` per split key) inside `max_value_bytes`.
     let max_split_bytes = hard_limits
         .max_value_bytes
         .saturating_sub(1024)
@@ -1677,58 +1709,89 @@ pub(crate) fn validate_split_keys_in_index(id: LogicalIndexId, split_keys: &[Byt
     Ok(())
 }
 
-/// Clears any serving KV keys (`0x01..0x05`) left by an earlier aborted epoch before rewriting.
-pub(crate) async fn clear_stale_serving_data<B: Backend>(
+#[derive(Clone, Copy)]
+enum RangeClearGuard {
+    StaleServing(WriteFence),
+    PublishedTransient,
+}
+
+async fn check_range_clear_guard<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    index: &IndexManifest,
+    bulk_authority: Option<BulkAuthority>,
+    guard: RangeClearGuard,
+) -> Result<bool> {
+    let id = index.logical_index_id();
+    match guard {
+        RangeClearGuard::StaleServing(fence) => {
+            check_writer_fence(txn, index, fence).await?;
+            authorize_raw(txn, id, bulk_authority).await?;
+            Ok(true)
+        }
+        RangeClearGuard::PublishedTransient => {
+            match txn.get_for_update(LogicalKey::Manifest(id)).await? {
+                None => Ok(false),
+                Some(PersistentValue::IndexManifest(m))
+                    if m.logical_index_id() == id && m.lifecycle() == IndexLifecycle::Active =>
+                {
+                    Ok(true)
+                }
+                Some(PersistentValue::IndexManifest(m))
+                    if m.logical_index_id() == id && m.lifecycle() == IndexLifecycle::Dropping =>
+                {
+                    Ok(false)
+                }
+                Some(PersistentValue::IndexManifest(m))
+                    if m.logical_index_id() == id && m.lifecycle() == IndexLifecycle::Building =>
+                {
+                    Err(Error::invalid_argument())
+                }
+                _ => Err(corrupt()),
+            }
+        }
+    }
+}
+
+/// Clears a logical key range via `transactional_clear_range` when supported or bounded
+/// point-delete batches otherwise, sharing retry and pagination logic between epoch recovery
+/// and post-publication `BuildUnit` reclamation.
+async fn clear_index_range<B: Backend>(
     context: &mut OperationContext<B>,
     index: &IndexManifest,
-    fence: WriteFence,
+    range: LogicalRange,
+    guard: RangeClearGuard,
+    op: Operation,
     budget: AdmissionBudget,
     retry: RetryPolicy,
 ) -> Result<()> {
-    let id = index.logical_index_id();
-    let range = LogicalRange::serving_data(index);
     let sched_lock = context.bulk_lease_lock.clone();
+    let bulk_authority = context.bulk_authority;
     if context.backend().capabilities().transactional_clear_range {
         let mut attempts = 0;
         loop {
-            context.checkpoint()?;
-            let _lease_guard = match &sched_lock {
-                Some(l) => Some(l.read().await),
-                None => None,
-            };
-            let backend = context.backend();
-            let prepared = async {
-                let mut txn = WriteLogicalTxn::for_index(
-                    backend.begin_write().await?,
-                    index,
-                    backend.hard_limits(),
-                    backend.admission_budget(),
-                );
-                check_lane_fence(&mut txn, index, fence, 0).await?;
-                super::bulk_scheduler::authorize(context, &mut txn, id).await?;
-                txn.clear_range(&range).await?;
-                Ok::<_, Error>(txn)
-            }
-            .await;
-            let txn = match prepared {
-                Ok(txn) => txn,
-                Err(e) if e.kind() == ErrorKind::RetryableAbort => {
-                    drop(_lease_guard);
-                    retry
-                        .wait_or_exhaust(Operation::RunBulkBuild, &mut attempts)
-                        .await?;
-                    continue;
+            let step = {
+                context.checkpoint()?;
+                let _sched_guard = lock_sched_read(&sched_lock).await;
+                let backend = context.backend();
+                let prepared = async {
+                    let mut txn = WriteLogicalTxn::for_index(
+                        backend.begin_write().await?,
+                        index,
+                        backend.hard_limits(),
+                        backend.admission_budget(),
+                    );
+                    if !check_range_clear_guard(&mut txn, index, bulk_authority, guard).await? {
+                        txn.rollback().await;
+                        return Ok::<_, Error>((None, ()));
+                    }
+                    txn.clear_range(&range).await?;
+                    Ok((Some(txn), ()))
                 }
-                Err(e) => return Err(e),
+                .await;
+                context.commit_prepared(prepared).await
             };
-            match context.commit(|start| txn.commit_with(start)).await {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    drop(_lease_guard);
-                    retry
-                        .after_commit_error(Operation::RunBulkBuild, &mut attempts, e)
-                        .await?;
-                }
+            if step.resolve(op, retry, &mut attempts).await?.is_some() {
+                return Ok(());
             }
         }
     }
@@ -1739,18 +1802,24 @@ pub(crate) async fn clear_stale_serving_data<B: Backend>(
     loop {
         context.checkpoint()?;
         let backend = context.backend();
-        let page = {
-            let mut rtxn = ReadLogicalTxn::for_index(backend.begin_read().await?, index);
-            rtxn.scan(
-                &range,
-                cursor.as_ref(),
-                ScanLimits {
-                    item_limit: max_del_muts,
-                    byte_limit: max_del_bytes,
-                },
-            )
-            .await?
-        };
+        let page = retry_read(&context.options, op, retry, || {
+            let backend = Arc::clone(&backend);
+            let cursor_ref = cursor.clone();
+            let range_ref = &range;
+            async move {
+                let mut rtxn = ReadLogicalTxn::for_index(backend.begin_read().await?, index);
+                rtxn.scan(
+                    range_ref,
+                    cursor_ref.as_ref(),
+                    ScanLimits {
+                        item_limit: max_del_muts,
+                        byte_limit: max_del_bytes,
+                    },
+                )
+                .await
+            }
+        })
+        .await?;
         if page.items().is_empty() {
             return Ok(());
         }
@@ -1762,47 +1831,36 @@ pub(crate) async fn clear_stale_serving_data<B: Backend>(
         for batch_keys in del_batches {
             let mut attempts = 0;
             loop {
-                context.checkpoint()?;
-                let _lease_guard = match &sched_lock {
-                    Some(l) => Some(l.read().await),
-                    None => None,
+                let step = {
+                    context.checkpoint()?;
+                    let _sched_guard = lock_sched_read(&sched_lock).await;
+                    let backend = context.backend();
+                    let prepared = async {
+                        let mut txn = WriteLogicalTxn::for_index(
+                            backend.begin_write().await?,
+                            index,
+                            backend.hard_limits(),
+                            budget,
+                        );
+                        if !check_range_clear_guard(&mut txn, index, bulk_authority, guard).await? {
+                            txn.rollback().await;
+                            return Ok::<_, Error>((None, false));
+                        }
+                        let mut batch = txn.mutations();
+                        for lk in &batch_keys {
+                            batch.delete(lk.clone())?;
+                        }
+                        txn.apply(batch).await?;
+                        Ok((Some(txn), true))
+                    }
+                    .await;
+                    context.commit_prepared(prepared).await
                 };
-                let prepared = async {
-                    let mut txn = WriteLogicalTxn::for_index(
-                        backend.begin_write().await?,
-                        index,
-                        backend.hard_limits(),
-                        budget,
-                    );
-                    check_lane_fence(&mut txn, index, fence, 0).await?;
-                    super::bulk_scheduler::authorize(context, &mut txn, id).await?;
-                    let mut batch = txn.mutations();
-                    for lk in &batch_keys {
-                        batch.delete(lk.clone())?;
+                if let Some(proceed) = step.resolve(op, retry, &mut attempts).await? {
+                    if !proceed {
+                        return Ok(());
                     }
-                    txn.apply(batch).await?;
-                    Ok::<_, Error>(txn)
-                }
-                .await;
-                let txn = match prepared {
-                    Ok(txn) => txn,
-                    Err(e) if e.kind() == ErrorKind::RetryableAbort => {
-                        drop(_lease_guard);
-                        retry
-                            .wait_or_exhaust(Operation::RunBulkBuild, &mut attempts)
-                            .await?;
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                };
-                match context.commit(|start| txn.commit_with(start)).await {
-                    Ok(()) => break,
-                    Err(e) => {
-                        drop(_lease_guard);
-                        retry
-                            .after_commit_error(Operation::RunBulkBuild, &mut attempts, e)
-                            .await?;
-                    }
+                    break;
                 }
             }
         }
@@ -1811,6 +1869,26 @@ pub(crate) async fn clear_stale_serving_data<B: Backend>(
             None => return Ok(()),
         }
     }
+}
+
+/// Clears any serving KV keys (`0x01..0x05`) left by an earlier aborted epoch before rewriting.
+pub(crate) async fn clear_stale_serving_data<B: Backend>(
+    context: &mut OperationContext<B>,
+    index: &IndexManifest,
+    fence: WriteFence,
+    budget: AdmissionBudget,
+    retry: RetryPolicy,
+) -> Result<()> {
+    clear_index_range(
+        context,
+        index,
+        LogicalRange::serving_data(index),
+        RangeClearGuard::StaleServing(fence),
+        Operation::RunBulkBuild,
+        budget,
+        retry,
+    )
+    .await
 }
 
 fn split_delete_keys(
@@ -1844,10 +1922,10 @@ fn split_delete_keys(
 }
 
 /// Splits pre-encoded `(key, value)` pairs into budget-admitted chunks and commits them
-/// across up to `min(parallelism, FENCE_LANES)` concurrent writer lanes.
+/// across up to `min(parallelism, MAX_WRITER_LANES)` concurrent writer tasks.
 #[expect(
     clippy::too_many_arguments,
-    reason = "lane fencing, optional unit lease check, and retry/budget parameters are orthogonal"
+    reason = "writer fencing, optional unit lease check, and retry/budget parameters are orthogonal"
 )]
 pub(crate) async fn commit_kv_batches<B: Backend>(
     context: &OperationContext<B>,
@@ -1863,10 +1941,9 @@ pub(crate) async fn commit_kv_batches<B: Backend>(
         return Ok(());
     }
     let chunks = split_into_chunks(&kvs, budget, unit_fence.is_some())?;
-    let concurrency = parallelism.clamp(1, FENCE_LANES as usize).min(chunks.len());
+    let concurrency = parallelism.clamp(1, MAX_WRITER_LANES).min(chunks.len());
 
     if concurrency <= 1 || unit_fence.is_some() {
-        let lane = unit_fence.map_or(0, |l| l.unit % FENCE_LANES);
         for chunk in chunks {
             commit_one_chunk(
                 context.backend(),
@@ -1875,7 +1952,6 @@ pub(crate) async fn commit_kv_batches<B: Backend>(
                 context.bulk_lease_lock.as_deref(),
                 index,
                 fence,
-                lane,
                 unit_fence,
                 chunk,
                 budget,
@@ -1888,14 +1964,13 @@ pub(crate) async fn commit_kv_batches<B: Backend>(
 
     let queue = Arc::new(std::sync::Mutex::new(chunks.into_iter()));
     let mut workers = tokio::task::JoinSet::<Result<()>>::new();
-    for lane in 0..concurrency {
+    for _ in 0..concurrency {
         let q = Arc::clone(&queue);
         let backend = context.backend();
         let control = context.options.clone();
         let bulk_auth = context.bulk_authority;
         let sched_lock = context.bulk_lease_lock.clone();
         let manifest = index.clone();
-        let lane_id = lane as u32;
         workers.spawn(async move {
             loop {
                 super::check_control(&control)?;
@@ -1910,7 +1985,6 @@ pub(crate) async fn commit_kv_batches<B: Backend>(
                     sched_lock.as_deref(),
                     &manifest,
                     fence,
-                    lane_id,
                     None,
                     chunk,
                     budget,
@@ -2001,7 +2075,7 @@ pub(super) fn split_into_chunks(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "detached async lane worker owns cloned backend, control, and explicit fencing tokens"
+    reason = "detached async writer task owns cloned backend, control, and explicit fencing tokens"
 )]
 pub(super) async fn commit_one_chunk<B: Backend>(
     backend: Arc<B>,
@@ -2010,138 +2084,102 @@ pub(super) async fn commit_one_chunk<B: Backend>(
     sched_lease_lock: Option<&tokio::sync::RwLock<()>>,
     index: &IndexManifest,
     fence: WriteFence,
-    lane: u32,
     unit_fence: Option<&UnitLease>,
     chunk: Vec<(Bytes, Bytes)>,
     budget: AdmissionBudget,
     retry: RetryPolicy,
 ) -> Result<()> {
-    let mut attempts = 0;
     let id = index.logical_index_id();
-    loop {
-        super::check_control(control)?;
-        let _sched_guard = match sched_lease_lock {
-            Some(l) => Some(l.read().await),
-            None => None,
-        };
-        let _lease_guard = match unit_fence {
-            Some(lease) => Some(lease.lock.lock().await),
-            None => None,
-        };
-        let prepared = async {
-            let mut txn = WriteLogicalTxn::for_index(
-                backend.begin_write().await?,
-                index,
-                backend.hard_limits(),
-                budget,
-            );
+    let chunk_ref = &chunk;
+    retry_raw_write(
+        control,
+        sched_lease_lock,
+        Operation::RunBulkBuild,
+        retry,
+        || async {
+            let _lease_guard = match unit_fence {
+                Some(lease) => Some(lease.lock.lock().await),
+                None => None,
+            };
+            let prepared = async {
+                let mut txn = WriteLogicalTxn::for_index(
+                    backend.begin_write().await?,
+                    index,
+                    backend.hard_limits(),
+                    budget,
+                );
 
-            let mut warm = Vec::with_capacity(5);
-            warm.push(LogicalKey::Manifest(id));
-            warm.push(LogicalKey::BuildUnit {
-                index: id,
-                stage: STAGE_FENCE,
-                unit: lane,
-            });
-            warm.push(LogicalKey::BuildSchedule(id));
-            if let Some(auth) = bulk_authority {
-                warm.push(auth.slot_key(id));
-            }
-            if let Some(lease) = unit_fence {
-                warm.push(LogicalKey::BuildUnit {
-                    index: id,
-                    stage: lease.stage,
-                    unit: lease.unit,
-                });
-            }
-            txn.warm_for_update(warm).await?;
-
-            check_lane_fence(&mut txn, index, fence, lane).await?;
-            super::bulk_scheduler::authorize_raw(&mut txn, id, bulk_authority).await?;
-            if let Some(lease) = unit_fence {
-                let ukey = LogicalKey::BuildUnit {
-                    index: id,
-                    stage: lease.stage,
-                    unit: lease.unit,
-                };
-                match txn.get_for_update(ukey.clone()).await? {
-                    Some(PersistentValue::BuildUnit(mut u))
-                        if u.epoch == fence.epoch && u.owner == lease.owner && !u.complete =>
-                    {
-                        u.expires_ms = u
-                            .expires_ms
-                            .max(super::bulk_scheduler::expiry(lease.duration)?);
-                        txn.put(ukey, PersistentValue::BuildUnit(u)).await?;
-                    }
-                    _ => return Err(Error::new(ErrorKind::BulkBuildSuperseded)),
+                let mut warm = Vec::with_capacity(5);
+                warm.push(LogicalKey::Manifest(id));
+                warm.push(LogicalKey::BuildWorkspace(id));
+                warm.push(LogicalKey::BuildSchedule(id));
+                if let Some(auth) = bulk_authority {
+                    warm.push(auth.slot_key(id));
                 }
-            }
-            let mut batch = txn.mutations();
-            for (k, v) in &chunk {
-                batch.put_encoded(k.clone(), v.clone())?;
-            }
-            txn.apply(batch).await?;
-            Ok(txn)
-        }
-        .await;
+                if let Some(lease) = unit_fence {
+                    warm.push(LogicalKey::BuildUnit {
+                        index: id,
+                        stage: lease.stage,
+                        unit: lease.unit,
+                    });
+                }
+                txn.warm_for_update(warm).await?;
 
-        let txn = match prepared {
-            Ok(txn) => txn,
-            Err(e) if e.kind() == ErrorKind::RetryableAbort => {
-                drop(_lease_guard);
-                drop(_sched_guard);
-                retry
-                    .wait_or_exhaust(Operation::RunBulkBuild, &mut attempts)
-                    .await?;
-                continue;
+                check_writer_fence(&mut txn, index, fence).await?;
+                authorize_raw(&mut txn, id, bulk_authority).await?;
+                if let Some(lease) = unit_fence {
+                    let ukey = LogicalKey::BuildUnit {
+                        index: id,
+                        stage: lease.stage,
+                        unit: lease.unit,
+                    };
+                    match txn.get_for_update(ukey.clone()).await? {
+                        Some(PersistentValue::BuildUnit(mut u))
+                            if u.epoch == fence.epoch && u.owner == lease.owner && !u.complete =>
+                        {
+                            u.expires_ms = u
+                                .expires_ms
+                                .max(super::bulk_scheduler::expiry(lease.duration)?);
+                            txn.put(ukey, PersistentValue::BuildUnit(u)).await?;
+                        }
+                        _ => return Err(Error::new(ErrorKind::BulkBuildSuperseded)),
+                    }
+                }
+                let mut batch = txn.mutations();
+                for (k, v) in chunk_ref {
+                    batch.put_encoded(k.clone(), v.clone())?;
+                }
+                txn.apply(batch).await?;
+                Ok((Some(txn), ()))
             }
-            Err(e) => return Err(e),
-        };
-        match txn.commit().await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                drop(_lease_guard);
-                drop(_sched_guard);
-                retry
-                    .after_commit_error(Operation::RunBulkBuild, &mut attempts, e)
-                    .await?;
-            }
-        }
-    }
+            .await;
+            commit_raw_prepared(prepared).await
+        },
+    )
+    .await
 }
 
-pub(crate) async fn check_lane_fence<T: WriteTxn>(
+/// Conflict-protects `BuildWorkspace(id)` without mutating it, verifying that `fence` remains the
+/// active writer authority for `index`.
+pub(crate) async fn check_writer_fence<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     index: &IndexManifest,
     fence: WriteFence,
-    lane: u32,
 ) -> Result<()> {
     building_in_flight(txn, index).await?;
     let id = index.logical_index_id();
-    match txn
-        .get_for_update(LogicalKey::BuildUnit {
-            index: id,
-            stage: STAGE_FENCE,
-            unit: lane,
-        })
-        .await?
-    {
-        Some(PersistentValue::BuildUnit(u)) if u.epoch == fence.epoch && u.owner == fence.owner => {
-            Ok(())
-        }
-        Some(PersistentValue::BuildUnit(_)) => Err(Error::new(ErrorKind::BulkBuildSuperseded)),
-        None => match txn.get(LogicalKey::Manifest(id)).await? {
-            None => Err(Error::new(ErrorKind::IndexNotFound)),
-            Some(PersistentValue::IndexManifest(m))
-                if m.lifecycle() == IndexLifecycle::Dropping =>
-            {
-                Err(Error::new(ErrorKind::IndexDropping))
+    match txn.get_for_update(LogicalKey::BuildWorkspace(id)).await? {
+        Some(PersistentValue::BuildWorkspace(w)) => {
+            if let Some(kind) = w.failure {
+                return Err(Error::new(kind));
             }
-            Some(PersistentValue::IndexManifest(_)) => {
+            if w.epoch == fence.epoch && w.writer_token == fence.owner && fence.owner != [0; 32] {
+                Ok(())
+            } else {
                 Err(Error::new(ErrorKind::BulkBuildSuperseded))
             }
-            _ => Err(corrupt()),
-        },
+        }
+        None => Err(Error::new(ErrorKind::BulkBuildSuperseded)),
         _ => Err(corrupt()),
     }
 }
@@ -2167,80 +2205,62 @@ pub(crate) async fn seal_loaded<B: Backend>(
     let sched_lock = context.bulk_lease_lock.clone();
     let mut attempts = 0;
     loop {
-        context.checkpoint()?;
-        let _sched_guard = match &sched_lock {
-            Some(l) => Some(l.read().await),
-            None => None,
+        let step = {
+            context.checkpoint()?;
+            let _sched_guard = lock_sched_read(&sched_lock).await;
+            let backend = context.backend();
+            let prepared = async {
+                let mut txn = WriteLogicalTxn::bootstrap(
+                    backend.begin_write().await?,
+                    backend.hard_limits(),
+                    backend.admission_budget(),
+                );
+                check_writer_fence(&mut txn, index, fence).await?;
+                super::bulk_scheduler::authorize(context, &mut txn, id).await?;
+
+                let cur = match txn.get_for_update(LogicalKey::BuildProgress(id)).await? {
+                    Some(PersistentValue::BuildProgress(p)) => p,
+                    _ => return Err(corrupt()),
+                };
+                if cur.phase == BuildPhase::Loaded
+                    && cur.epoch == fence.epoch
+                    && cur.total_entries == total_entries
+                    && cur.expected_kv_lthash == expected_kv_lthash
+                {
+                    txn.rollback().await;
+                    return Ok((None, ()));
+                }
+                if cur.phase == BuildPhase::Validating || cur.epoch != fence.epoch {
+                    return Err(Error::new(ErrorKind::BulkBuildSuperseded));
+                }
+
+                let next = BuildProgress {
+                    phase: BuildPhase::Loaded,
+                    epoch: fence.epoch,
+                    loaded_entries: total_entries,
+                    total_entries,
+                    total_records,
+                    trees,
+                    partitions,
+                    expected_kv_lthash,
+                    validation_split_keys: validation_split_keys.clone(),
+                };
+                txn.put(
+                    LogicalKey::BuildProgress(id),
+                    PersistentValue::BuildProgress(next),
+                )
+                .await?;
+                Ok((Some(txn), ()))
+            }
+            .await;
+            context.commit_prepared(prepared).await
         };
-        let backend = context.backend();
-        let prepared = async {
-            let mut txn = WriteLogicalTxn::bootstrap(
-                backend.begin_write().await?,
-                backend.hard_limits(),
-                backend.admission_budget(),
-            );
-            building_in_flight(&mut txn, index).await?;
-            super::bulk_scheduler::authorize(context, &mut txn, id).await?;
-            check_lane_fence(&mut txn, index, fence, 0).await?;
-
-            let cur = match txn.get_for_update(LogicalKey::BuildProgress(id)).await? {
-                Some(PersistentValue::BuildProgress(p)) => p,
-                _ => return Err(corrupt()),
-            };
-            if cur.phase == BuildPhase::Loaded
-                && cur.epoch == fence.epoch
-                && cur.total_entries == total_entries
-                && cur.expected_kv_lthash == expected_kv_lthash
-            {
-                txn.rollback().await;
-                return Ok(None);
-            }
-            if cur.phase == BuildPhase::Validating || cur.epoch != fence.epoch {
-                return Err(Error::new(ErrorKind::BulkBuildSuperseded));
-            }
-
-            let next = BuildProgress {
-                phase: BuildPhase::Loaded,
-                epoch: fence.epoch,
-                loaded_entries: total_entries,
-                total_entries,
-                total_records,
-                trees,
-                partitions,
-                expected_kv_lthash,
-                validation_split_keys: validation_split_keys.clone(),
-            };
-            txn.put(
-                LogicalKey::BuildProgress(id),
-                PersistentValue::BuildProgress(next),
-            )
-            .await?;
-            Ok(Some(txn))
-        }
-        .await;
-
-        let txn_opt = match prepared {
-            Ok(v) => v,
-            Err(e) if e.kind() == ErrorKind::RetryableAbort => {
-                drop(_sched_guard);
-                retry
-                    .wait_or_exhaust(Operation::RunBulkBuild, &mut attempts)
-                    .await?;
-                continue;
-            }
-            Err(e) => return Err(e),
-        };
-        let Some(txn) = txn_opt else {
+        if step
+            .resolve(Operation::RunBulkBuild, retry, &mut attempts)
+            .await?
+            .is_some()
+        {
             return Ok(());
-        };
-        match context.commit(|start| txn.commit_with(start)).await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                drop(_sched_guard);
-                retry
-                    .after_commit_error(Operation::RunBulkBuild, &mut attempts, e)
-                    .await?;
-            }
         }
     }
 }
@@ -2268,8 +2288,6 @@ pub(crate) async fn record_failure<B: Backend>(
     ) {
         return Ok(());
     }
-    let mut after = before.clone();
-    after.failure = Some(kind);
     let sched_lock = context.bulk_lease_lock.clone();
     let mut attempts = 0;
     let id = index.logical_index_id();
@@ -2277,78 +2295,76 @@ pub(crate) async fn record_failure<B: Backend>(
         if context.checkpoint().is_err() {
             return Ok(());
         }
-        let _sched_guard = match &sched_lock {
-            Some(l) => Some(l.read().await),
-            None => None,
-        };
-        let backend = context.backend();
-        let prepared = async {
-            let mut txn = WriteLogicalTxn::bootstrap(
-                backend.begin_write().await?,
-                backend.hard_limits(),
-                backend.admission_budget(),
-            );
-            match building(&mut txn, index).await {
-                Ok(()) => {}
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        ErrorKind::IndexDropping
-                            | ErrorKind::IndexNotFound
-                            | ErrorKind::InvalidArgument
-                    ) =>
+        let step = {
+            let _sched_guard = lock_sched_read(&sched_lock).await;
+            let backend = context.backend();
+            let prepared = async {
+                let mut txn = WriteLogicalTxn::bootstrap(
+                    backend.begin_write().await?,
+                    backend.hard_limits(),
+                    backend.admission_budget(),
+                );
+                match building(&mut txn, index).await {
+                    Ok(()) => {}
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            ErrorKind::IndexDropping
+                                | ErrorKind::IndexNotFound
+                                | ErrorKind::InvalidArgument
+                        ) =>
+                    {
+                        txn.rollback().await;
+                        return Ok((None, ()));
+                    }
+                    Err(e) => return Err(e),
+                }
+                if super::bulk_scheduler::authorize(context, &mut txn, id)
+                    .await
+                    .is_err()
                 {
                     txn.rollback().await;
-                    return Ok(None);
+                    return Ok((None, ()));
                 }
-                Err(e) => return Err(e),
-            }
-            if super::bulk_scheduler::authorize(context, &mut txn, id)
-                .await
-                .is_err()
-            {
-                txn.rollback().await;
-                return Ok(None);
-            }
-            if let Some(fence) = worker_fence {
-                if check_lane_fence(&mut txn, index, fence, 0).await.is_err() {
+                if let Some(fence) = worker_fence {
+                    if check_writer_fence(&mut txn, index, fence).await.is_err() {
+                        txn.rollback().await;
+                        return Ok((None, ()));
+                    }
+                    if matches!(
+                        txn.get_for_update(LogicalKey::BuildProgress(id)).await?,
+                        Some(PersistentValue::BuildProgress(p)) if p.phase == BuildPhase::Validating
+                    ) {
+                        txn.rollback().await;
+                        return Ok((None, ()));
+                    }
+                }
+                let key = LogicalKey::BuildWorkspace(id);
+                let mut current = match txn.get_for_update(key.clone()).await? {
+                    Some(PersistentValue::BuildWorkspace(w)) => w,
+                    _ => {
+                        txn.rollback().await;
+                        return Ok((None, ()));
+                    }
+                };
+                if current.failure.is_some()
+                    || current.epoch != before.epoch
+                    || current.token != before.token
+                {
                     txn.rollback().await;
-                    return Ok(None);
+                    return Ok((None, ()));
                 }
-                if matches!(
-                    txn.get_for_update(LogicalKey::BuildProgress(id)).await?,
-                    Some(PersistentValue::BuildProgress(p)) if p.phase == BuildPhase::Validating
-                ) {
-                    txn.rollback().await;
-                    return Ok(None);
-                }
+                current.failure = Some(kind);
+                txn.put(key, PersistentValue::BuildWorkspace(current))
+                    .await?;
+                Ok((Some(txn), ()))
             }
-            let key = LogicalKey::BuildWorkspace(id);
-            let current = match txn.get_for_update(key.clone()).await? {
-                Some(PersistentValue::BuildWorkspace(w)) => w,
-                _ => {
-                    txn.rollback().await;
-                    return Ok(None);
-                }
-            };
-            if current == after || current.failure.is_some() {
-                txn.rollback().await;
-                return Ok(None);
-            }
-            if current.epoch != before.epoch || current.token != before.token {
-                txn.rollback().await;
-                return Ok(None);
-            }
-            txn.put(key, PersistentValue::BuildWorkspace(after.clone()))
-                .await?;
-            Ok(Some(txn))
-        }
-        .await;
-
-        let txn_opt = match prepared {
-            Ok(v) => v,
-            Err(e) if e.kind() == ErrorKind::RetryableAbort => {
-                drop(_sched_guard);
+            .await;
+            context.commit_prepared(prepared).await
+        };
+        match step {
+            CommitStep::Done(()) => return Ok(()),
+            CommitStep::PrepareAbort => {
                 if retry
                     .wait_or_exhaust(Operation::RunBulkBuild, &mut attempts)
                     .await
@@ -2356,266 +2372,18 @@ pub(crate) async fn record_failure<B: Backend>(
                 {
                     return Ok(());
                 }
-                continue;
             }
-            Err(e) => return Err(e),
-        };
-        let Some(txn) = txn_opt else {
-            return Ok(());
-        };
-        match context.commit(|start| txn.commit_with(start)).await {
-            Ok(()) => return Ok(()),
-            Err(e) if matches!(e.kind(), ErrorKind::Cancelled | ErrorKind::DeadlineExceeded) => {
+            CommitStep::CommitFailed(e)
+                if matches!(e.kind(), ErrorKind::Cancelled | ErrorKind::DeadlineExceeded) =>
+            {
                 return Ok(());
             }
-            Err(e) => {
-                drop(_sched_guard);
+            CommitStep::CommitFailed(e) => {
                 retry
                     .after_commit_error(Operation::RunBulkBuild, &mut attempts, e)
                     .await?;
             }
-        }
-    }
-}
-
-async fn ensure_no_peer_scheduler_leases<B: Backend, T: WriteTxn>(
-    context: &OperationContext<B>,
-    txn: &mut WriteLogicalTxn<'_, T>,
-    id: LogicalIndexId,
-    distributed_workers: usize,
-) -> Result<()> {
-    let now = super::bulk_scheduler::now_ms()?;
-    if let Some(PersistentValue::BuildSchedule(s)) =
-        txn.get_for_update(LogicalKey::BuildSchedule(id)).await?
-        && s.options.distributed_workers <= 1
-        && s.owner != [0; 32]
-        && s.expires_ms > now
-        && context.bulk_authority
-            != Some(BulkAuthority::Scheduled {
-                slot: 0,
-                owner: s.owner,
-            })
-    {
-        return Err(Error::new(ErrorKind::BulkBuildBusy));
-    }
-    let slots = distributed_workers.max(1) as u32;
-    if slots > 1 {
-        let keys: Vec<LogicalKey> = (0..slots)
-            .map(|slot| LogicalKey::BuildScheduleSlot { index: id, slot })
-            .collect();
-        txn.warm_for_update(keys).await?;
-        let max_inline_del = txn.admission_budget().max_mutations.saturating_sub(2);
-        let mut expired_to_del = Vec::new();
-        for slot in 0..slots {
-            let skey = LogicalKey::BuildScheduleSlot { index: id, slot };
-            match txn.get_for_update(skey.clone()).await? {
-                None => {}
-                Some(PersistentValue::BuildUnit(u)) => {
-                    let is_self = matches!(
-                        context.bulk_authority,
-                        Some(
-                            BulkAuthority::Scheduled { slot: s, owner }
-                                | BulkAuthority::UnscheduledPeer { slot: s, owner }
-                        ) if s == slot && owner == u.owner
-                    );
-                    if !is_self && u.owner != [0; 32] && u.expires_ms > now {
-                        return Err(Error::new(ErrorKind::BulkBuildBusy));
-                    }
-                    if !is_self && expired_to_del.len() < max_inline_del {
-                        expired_to_del.push(skey);
-                    }
-                }
-                Some(_) => return Err(corrupt()),
-            }
-        }
-        for skey in expired_to_del {
-            txn.delete(skey).await?;
-        }
-    }
-    Ok(())
-}
-
-/// Reclaims transient `BuildUnit` (`0x07`) keys from a published `Active` index while
-/// preserving compact `BuildDescriptor` (`0x05`) and `BuildProgress` (`0x06`).
-async fn reclaim_published_build_records<B: Backend>(
-    context: &mut OperationContext<B>,
-    active_manifest: &IndexManifest,
-    retry: RetryPolicy,
-) -> Result<()> {
-    let id = active_manifest.logical_index_id();
-    let range = LogicalRange::transient_build_state(active_manifest);
-    let sched_lock = context.bulk_lease_lock.clone();
-    if context.backend().capabilities().transactional_clear_range {
-        let mut attempts = 0;
-        loop {
-            context.checkpoint()?;
-            let _sched_guard = match &sched_lock {
-                Some(l) => Some(l.read().await),
-                None => None,
-            };
-            let backend = context.backend();
-            let prepared = async {
-                let mut txn = WriteLogicalTxn::for_index(
-                    backend.begin_write().await?,
-                    active_manifest,
-                    backend.hard_limits(),
-                    backend.admission_budget(),
-                );
-                match txn.get_for_update(LogicalKey::Manifest(id)).await? {
-                    None => {
-                        txn.rollback().await;
-                        return Ok(None);
-                    }
-                    Some(PersistentValue::IndexManifest(m))
-                        if m.logical_index_id() == id
-                            && m.lifecycle() == IndexLifecycle::Active => {}
-                    Some(PersistentValue::IndexManifest(m))
-                        if m.logical_index_id() == id
-                            && m.lifecycle() == IndexLifecycle::Dropping =>
-                    {
-                        txn.rollback().await;
-                        return Ok(None);
-                    }
-                    Some(PersistentValue::IndexManifest(m))
-                        if m.logical_index_id() == id
-                            && m.lifecycle() == IndexLifecycle::Building =>
-                    {
-                        return Err(Error::invalid_argument());
-                    }
-                    _ => return Err(corrupt()),
-                }
-                txn.clear_range(&range).await?;
-                Ok(Some(txn))
-            }
-            .await;
-            let txn_opt = match prepared {
-                Ok(v) => v,
-                Err(e) if e.kind() == ErrorKind::RetryableAbort => {
-                    drop(_sched_guard);
-                    retry
-                        .wait_or_exhaust(Operation::CleanupBulkBuild, &mut attempts)
-                        .await?;
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-            let Some(txn) = txn_opt else {
-                return Ok(());
-            };
-            match context.commit(|start| txn.commit_with(start)).await {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    drop(_sched_guard);
-                    retry
-                        .after_commit_error(Operation::CleanupBulkBuild, &mut attempts, e)
-                        .await?;
-                }
-            }
-        }
-    }
-
-    let budget = context.backend().admission_budget();
-    let max_del_muts = budget.max_mutations.max(1);
-    let max_del_bytes = budget.max_mutation_bytes.max(1);
-    let mut cursor = None;
-    loop {
-        context.checkpoint()?;
-        let backend = context.backend();
-        let page = {
-            let mut rtxn = ReadLogicalTxn::for_index(backend.begin_read().await?, active_manifest);
-            rtxn.scan(
-                &range,
-                cursor.as_ref(),
-                ScanLimits {
-                    item_limit: max_del_muts,
-                    byte_limit: max_del_bytes,
-                },
-            )
-            .await?
-        };
-        if page.items().is_empty() {
-            return Ok(());
-        }
-        let next_cursor = page.next_cursor().cloned();
-        let del_batches = split_delete_keys(
-            page.into_items().into_iter().map(|it| it.key().clone()),
-            budget,
-        )?;
-
-        for batch_keys in del_batches {
-            let mut attempts = 0;
-            loop {
-                context.checkpoint()?;
-                let _sched_guard = match &sched_lock {
-                    Some(l) => Some(l.read().await),
-                    None => None,
-                };
-                let prepared = async {
-                    let mut txn = WriteLogicalTxn::bootstrap(
-                        backend.begin_write().await?,
-                        backend.hard_limits(),
-                        budget,
-                    );
-                    match txn.get_for_update(LogicalKey::Manifest(id)).await? {
-                        None => {
-                            txn.rollback().await;
-                            return Ok(None);
-                        }
-                        Some(PersistentValue::IndexManifest(m))
-                            if m.logical_index_id() == id
-                                && m.lifecycle() == IndexLifecycle::Active => {}
-                        Some(PersistentValue::IndexManifest(m))
-                            if m.logical_index_id() == id
-                                && m.lifecycle() == IndexLifecycle::Dropping =>
-                        {
-                            txn.rollback().await;
-                            return Ok(None);
-                        }
-                        Some(PersistentValue::IndexManifest(m))
-                            if m.logical_index_id() == id
-                                && m.lifecycle() == IndexLifecycle::Building =>
-                        {
-                            return Err(Error::invalid_argument());
-                        }
-                        _ => return Err(corrupt()),
-                    }
-                    let mut batch = txn.mutations();
-                    for lk in &batch_keys {
-                        batch.delete(lk.clone())?;
-                    }
-                    txn.apply(batch).await?;
-                    Ok(Some(txn))
-                }
-                .await;
-
-                let txn_opt = match prepared {
-                    Ok(v) => v,
-                    Err(e) if e.kind() == ErrorKind::RetryableAbort => {
-                        drop(_sched_guard);
-                        retry
-                            .wait_or_exhaust(Operation::CleanupBulkBuild, &mut attempts)
-                            .await?;
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                };
-                let Some(txn) = txn_opt else {
-                    return Ok(());
-                };
-                match context.commit(|start| txn.commit_with(start)).await {
-                    Ok(()) => break,
-                    Err(e) => {
-                        drop(_sched_guard);
-                        retry
-                            .after_commit_error(Operation::CleanupBulkBuild, &mut attempts, e)
-                            .await?;
-                    }
-                }
-            }
-        }
-        match next_cursor {
-            Some(nc) => cursor = Some(nc),
-            None => return Ok(()),
+            CommitStep::Fatal(e) => return Err(e),
         }
     }
 }
@@ -2627,43 +2395,44 @@ pub(crate) async fn cleanup<B: Backend>(
     id: LogicalIndexId,
     retry: RetryPolicy,
 ) -> Result<()> {
-    let mut read_attempts = 0;
-    let (active_manifest, state_opt) = loop {
-        context.checkpoint()?;
-        let backend = context.backend();
-        let res = async {
-            let mut snapshot = ReadLogicalTxn::bootstrap(backend.begin_read().await?);
-            let active_manifest = match snapshot.get(LogicalKey::Manifest(id)).await? {
-                None => None,
-                Some(PersistentValue::IndexManifest(m)) if m.logical_index_id() == id => {
-                    if m.lifecycle() == IndexLifecycle::Building {
-                        return Err(Error::invalid_argument());
+    let backend = context.backend();
+    let (active_manifest, state_opt) =
+        retry_read(&context.options, Operation::CleanupBulkBuild, retry, || {
+            let backend = Arc::clone(&backend);
+            async move {
+                let mut snapshot = ReadLogicalTxn::bootstrap(backend.begin_read().await?);
+                let active_manifest = match snapshot.get(LogicalKey::Manifest(id)).await? {
+                    None => None,
+                    Some(PersistentValue::IndexManifest(m)) if m.logical_index_id() == id => {
+                        if m.lifecycle() == IndexLifecycle::Building {
+                            return Err(Error::invalid_argument());
+                        }
+                        (m.lifecycle() == IndexLifecycle::Active).then_some(m)
                     }
-                    (m.lifecycle() == IndexLifecycle::Active).then_some(m)
-                }
-                _ => return Err(corrupt()),
-            };
-            let state = match snapshot.get(LogicalKey::BuildWorkspace(id)).await? {
-                None => None,
-                Some(PersistentValue::BuildWorkspace(w)) => Some(w),
-                _ => return Err(corrupt()),
-            };
-            Ok((active_manifest, state))
-        }
-        .await;
-        match res {
-            Ok(pair) => break pair,
-            Err(e) if e.kind() == ErrorKind::RetryableAbort => {
-                retry
-                    .wait_or_exhaust(Operation::CleanupBulkBuild, &mut read_attempts)
-                    .await?;
+                    _ => return Err(corrupt()),
+                };
+                let state = match snapshot.get(LogicalKey::BuildWorkspace(id)).await? {
+                    None => None,
+                    Some(PersistentValue::BuildWorkspace(w)) => Some(w),
+                    _ => return Err(corrupt()),
+                };
+                Ok((active_manifest, state))
             }
-            Err(e) => return Err(e),
-        }
-    };
+        })
+        .await?;
 
     if let Some(active) = &active_manifest {
-        reclaim_published_build_records(context, active, retry).await?;
+        let budget = context.backend().admission_budget();
+        clear_index_range(
+            context,
+            active,
+            LogicalRange::transient_build_state(active),
+            RangeClearGuard::PublishedTransient,
+            Operation::CleanupBulkBuild,
+            budget,
+            retry,
+        )
+        .await?;
     }
     let Some(state) = state_opt else {
         retire_orphaned_schedule(context, id, retry).await?;
@@ -2692,83 +2461,65 @@ pub(crate) async fn cleanup<B: Backend>(
     let sched_lock = context.bulk_lease_lock.clone();
     let mut attempts = 0;
     loop {
-        context.checkpoint()?;
-        let _sched_guard = match &sched_lock {
-            Some(l) => Some(l.read().await),
-            None => None,
+        let step = {
+            context.checkpoint()?;
+            let _sched_guard = lock_sched_read(&sched_lock).await;
+            let backend = context.backend();
+            let prepared = async {
+                let mut txn = WriteLogicalTxn::bootstrap(
+                    backend.begin_write().await?,
+                    backend.hard_limits(),
+                    backend.admission_budget(),
+                );
+                if let Some(value) = txn.get_for_update(LogicalKey::Manifest(id)).await? {
+                    match value {
+                        PersistentValue::IndexManifest(m)
+                            if m.logical_index_id() == id
+                                && m.lifecycle() != IndexLifecycle::Building => {}
+                        _ => return Err(Error::invalid_argument()),
+                    }
+                }
+                ensure_no_peer_scheduler_leases(
+                    context,
+                    &mut txn,
+                    id,
+                    state.options.distributed_workers,
+                )
+                .await?;
+                let key = LogicalKey::BuildWorkspace(id);
+                match txn.get_for_update(key.clone()).await? {
+                    None => {
+                        txn.rollback().await;
+                        return Ok((None, ()));
+                    }
+                    Some(PersistentValue::BuildWorkspace(w)) if w == state => {}
+                    _ => return Err(corrupt()),
+                }
+                let path = state.directory();
+                let lock = lock.clone();
+                blocking(context, move || {
+                    let _lock = lock;
+                    match fs::remove_dir_all(&path) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(io(e)),
+                    };
+                    File::open(path.parent().expect("root"))
+                        .and_then(|f| f.sync_all())
+                        .map_err(io)
+                })
+                .await?;
+                txn.delete(key).await?;
+                Ok((Some(txn), ()))
+            }
+            .await;
+            context.commit_prepared(prepared).await
         };
-        let backend = context.backend();
-        let prepared = async {
-            let mut txn = WriteLogicalTxn::bootstrap(
-                backend.begin_write().await?,
-                backend.hard_limits(),
-                backend.admission_budget(),
-            );
-            if let Some(value) = txn.get_for_update(LogicalKey::Manifest(id)).await? {
-                match value {
-                    PersistentValue::IndexManifest(m)
-                        if m.logical_index_id() == id
-                            && m.lifecycle() != IndexLifecycle::Building => {}
-                    _ => return Err(Error::invalid_argument()),
-                }
-            }
-            ensure_no_peer_scheduler_leases(
-                context,
-                &mut txn,
-                id,
-                state.options.distributed_workers,
-            )
-            .await?;
-            let key = LogicalKey::BuildWorkspace(id);
-            match txn.get_for_update(key.clone()).await? {
-                None => {
-                    txn.rollback().await;
-                    return Ok(None);
-                }
-                Some(PersistentValue::BuildWorkspace(w)) if w == state => {}
-                _ => return Err(corrupt()),
-            }
-            let path = state.directory();
-            let lock = lock.clone();
-            blocking(context, move || {
-                let _lock = lock;
-                match fs::remove_dir_all(&path) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(io(e)),
-                };
-                File::open(path.parent().expect("root"))
-                    .and_then(|f| f.sync_all())
-                    .map_err(io)
-            })
-            .await?;
-            txn.delete(key).await?;
-            Ok(Some(txn))
-        }
-        .await;
-
-        let txn_opt = match prepared {
-            Ok(v) => v,
-            Err(e) if e.kind() == ErrorKind::RetryableAbort => {
-                drop(_sched_guard);
-                retry
-                    .wait_or_exhaust(Operation::CleanupBulkBuild, &mut attempts)
-                    .await?;
-                continue;
-            }
-            Err(e) => return Err(e),
-        };
-        if let Some(txn) = txn_opt {
-            match context.commit(|start| txn.commit_with(start)).await {
-                Ok(()) => break,
-                Err(e) => {
-                    drop(_sched_guard);
-                    retry
-                        .after_commit_error(Operation::CleanupBulkBuild, &mut attempts, e)
-                        .await?;
-                }
-            }
-        } else {
+        if step
+            .resolve(Operation::CleanupBulkBuild, retry, &mut attempts)
+            .await?
+            .is_some()
+        {
             break;
         }
     }

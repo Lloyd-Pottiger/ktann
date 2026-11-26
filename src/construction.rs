@@ -26,9 +26,10 @@ impl ConstructionOptions {
     }
 
     /// Validates that `memory_bytes` accommodates the training sample, partition capacities,
-    /// and I/O working buffers for `config`, returning the remaining resident-row allowance.
-    pub(crate) fn resident_rows(self, config: &IndexConfig) -> Result<usize> {
+    /// and I/O working buffers for `config`.
+    pub(crate) fn validate_for(self, config: &IndexConfig) -> Result<()> {
         config.validate()?;
+        self.validate()?;
         let dimension = config.dimension();
         let row_bound = dimension
             .checked_mul(4)
@@ -43,19 +44,15 @@ impl ConstructionOptions {
             )
             .checked_mul(8)
             .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-        let reserved = row_bound
+        let min_bytes = row_bound
             .checked_mul(reserved_rows)
             .and_then(|n| n.checked_add(16 * BUFFER_BYTES))
             .and_then(|n| n.checked_add(dimension * 4))
+            .and_then(|n| n.checked_add(row_bound))
             .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-        self.validate()?;
-        if self.memory_bytes
-            <= reserved
-                .checked_add(row_bound)
-                .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?
-        {
+        if self.memory_bytes <= min_bytes {
             return Err(Error::invalid_argument());
         }
-        Ok((self.memory_bytes - reserved) / row_bound)
+        Ok(())
     }
 }

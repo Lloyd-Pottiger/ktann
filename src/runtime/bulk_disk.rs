@@ -3,8 +3,10 @@
 //! Each stage partitions work into bounded, deterministic units. In collaborative mode
 //! (`distributed_workers > 1`), units are leased and renewed in the KV backend so worker
 //! processes claim disjoint units concurrently and reclaim expired units after stalls.
-//! In single-worker disk mode (`distributed_workers == 1`), units execute directly via an
-//! in-process queue with writer-lane fencing and zero intermediate `BuildUnit` KV traffic.
+//! In single-worker disk mode (`distributed_workers == 1`), construction/emission stages
+//! execute via an in-process queue with `BuildWorkspace.writer_token` fencing and zero
+//! intermediate `BuildUnit` KV traffic, while `STAGE_VALIDATE` persists slice completion
+//! records for resumable frozen validation and atomic `activate` summation.
 
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
@@ -15,37 +17,43 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
-use crate::api::{BulkBuildReport, Error, ErrorKind, OperationOptions, PartitionKey, Result};
+use crate::api::{
+    BulkBuildReport, Error, ErrorKind, LogicalIndexId, OperationOptions, PartitionKey, Result,
+};
 use crate::bulk::files::io_error;
 use crate::bulk::sharded::{
     AssignedLeafKey, MoveProposal, ScratchQuota, ShardRows, ShardState, TreeLeafTotals,
-    assign_leaf_partition_keys_from_trees, build_and_encode_upper_tree, build_shard_leaves,
+    assign_leaf_partition_keys, build_and_encode_upper_tree, build_shard_leaves,
     compute_leaf_centroid, compute_shard_remap, encode_leaf_shard, encode_record_group_bucket,
     ingest_segment_range, read_bucket_id_refs, read_compact_shard_state, read_indexed_ids_slice,
     read_indexed_locations_slice, read_indexed_outbound_slice, read_indexed_shard_slice,
-    read_indexed_upper_children_slice, read_proposals, read_shard_centers, read_shard_counts,
-    read_shard_leaf_trees, refine_single_light_shard, refinement_per_leaf_bytes, score_halo_shard,
-    verify_id_bucket, write_base_shard_rows, write_bucket_id_refs, write_compact_shard_state,
-    write_indexed_ids, write_indexed_locations, write_indexed_outbound_rows, write_indexed_shards,
-    write_indexed_upper_children, write_proposals,
+    read_indexed_upper_children_slice, read_leaf_keys_plan, read_proposals, read_shard_centers,
+    read_shard_counts, read_shard_leaf_trees, refine_single_light_shard, refinement_per_leaf_bytes,
+    score_halo_shard, verify_id_bucket, write_base_shard_rows, write_bucket_id_refs,
+    write_compact_shard_state, write_indexed_ids, write_indexed_locations,
+    write_indexed_outbound_rows, write_indexed_shards, write_indexed_upper_children,
+    write_leaf_keys_plan, write_proposals,
 };
 use crate::bulk::{InputSnapshot, LtHash, ShardPlan};
 use crate::observe::labels::Operation;
 use crate::refinement::accept_moves;
-use crate::runtime::bulk_scheduler::{BulkAuthority, authorize_raw, expiry, now_ms};
+use crate::runtime::bulk_scheduler::{
+    BulkAuthority, authorize_raw, expiry, non_zero_token, now_ms,
+};
 use crate::search::numeric::VectorKernel;
-use crate::storage::backend::{AdmissionBudget, Backend, ScanLimits};
+use crate::storage::backend::{AdmissionBudget, Backend, ScanLimits, WriteTxn};
 use crate::storage::keys::{LogicalKey, TreeKey, tree_key_hash};
 use crate::storage::values::{
-    BuildDescriptor, BuildPhase, BuildUnit, BuildWorkspace, IndexLifecycle, IndexManifest,
-    PartitionCentroid, PersistentValue,
+    BuildDescriptor, BuildPhase, BuildProgress, BuildUnit, BuildWorkspace, IndexLifecycle,
+    IndexManifest, PartitionCentroid, PersistentValue,
 };
 use crate::storage::{LogicalRange, ReadLogicalTxn, WriteLogicalTxn};
 
 use super::{
-    OperationContext, RetryPolicy, UnitLease, WriteFence, build_validation_split_keys,
-    building_in_flight, check_lane_fence, clear_stale_serving_data, corrupt, drop_guarded_options,
-    effective_budget, seal_loaded,
+    CommitStep, OperationContext, RetryPolicy, UnitLease, WriteFence, advance_loading_progress,
+    building_in_flight, check_writer_fence, clear_stale_serving_data, commit_raw_prepared, corrupt,
+    drop_guarded_options, effective_budget, finalize_and_seal_loaded, lock_sched_read,
+    retry_raw_write, retry_read, seal_loaded, validate_split_keys_in_index,
 };
 
 const STAGE_SCATTER: u8 = 1;
@@ -59,28 +67,127 @@ const STAGE_EMIT_TREES: u8 = 32;
 type UpperTreeBucket = (TreeKey, u64, Vec<(PartitionKey, PartitionCentroid)>);
 type NonEmptyRunSources = Vec<(u32, Vec<usize>)>;
 
-#[derive(Default)]
-struct UnitOutput {
-    records: u64,
-    kv_count: u64,
-    aux_count: u64,
-    kv_lthash: LtHash,
-    aux_lthash: LtHash,
-    aux2_lthash: LtHash,
+/// Fencing mode shared across writer `BuildUnit` stages and frozen `STAGE_VALIDATE` slices.
+#[derive(Clone, Copy)]
+pub(crate) enum StageFence {
+    Write(WriteFence),
+    Validate { ws_token: [u8; 32], epoch: u64 },
 }
 
-struct StageEnv<B: Backend> {
-    backend: Arc<B>,
-    control: OperationOptions,
-    bulk_authority: Option<BulkAuthority>,
-    sched_lease_lock: Option<Arc<tokio::sync::RwLock<()>>>,
-    distributed_workers: usize,
-    admission: Option<Arc<dyn Any + Send + Sync>>,
-    manifest: IndexManifest,
-    fence: WriteFence,
-    unit_lease: Duration,
-    budget: AdmissionBudget,
-    retry: RetryPolicy,
+impl StageFence {
+    #[must_use]
+    pub(crate) const fn epoch(self) -> u64 {
+        match self {
+            Self::Write(wf) => wf.epoch,
+            Self::Validate { epoch, .. } => epoch,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn operation(self) -> Operation {
+        match self {
+            Self::Write(_) => Operation::RunBulkBuild,
+            Self::Validate { .. } => Operation::PublishBulkBuild,
+        }
+    }
+
+    fn warm_keys(
+        self,
+        id: LogicalIndexId,
+        bulk_authority: Option<BulkAuthority>,
+        ukey: Option<LogicalKey>,
+    ) -> Vec<LogicalKey> {
+        let mut warm = Vec::with_capacity(6);
+        warm.push(LogicalKey::Manifest(id));
+        warm.push(LogicalKey::BuildWorkspace(id));
+        if matches!(self, Self::Validate { .. }) {
+            warm.push(LogicalKey::BuildProgress(id));
+        }
+        warm.push(LogicalKey::BuildSchedule(id));
+        if let Some(auth) = bulk_authority {
+            warm.push(auth.slot_key(id));
+        }
+        if let Some(uk) = ukey {
+            warm.push(uk);
+        }
+        warm
+    }
+
+    pub(crate) async fn check<T: WriteTxn>(
+        self,
+        txn: &mut WriteLogicalTxn<'_, T>,
+        manifest: &IndexManifest,
+    ) -> Result<()> {
+        match self {
+            Self::Write(wf) => check_writer_fence(txn, manifest, wf).await,
+            Self::Validate { ws_token, epoch } => {
+                fence_validation(txn, manifest, ws_token, epoch).await?;
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Verifies in a write transaction that `manifest` remains in frozen `(Building, Validating)`
+/// at `(ws_token, expected_epoch)` with writers revoked (`writer_token == [0; 32]`).
+pub(crate) async fn fence_validation<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    index: &IndexManifest,
+    ws_token: [u8; 32],
+    expected_epoch: u64,
+) -> Result<BuildProgress> {
+    building_in_flight(txn, index).await?;
+    let id = index.logical_index_id();
+    let ws = txn.get_for_update(LogicalKey::BuildWorkspace(id)).await?;
+    let prog = match txn.get(LogicalKey::BuildProgress(id)).await? {
+        Some(PersistentValue::BuildProgress(p))
+            if p.phase == BuildPhase::Validating && p.epoch == expected_epoch =>
+        {
+            validate_split_keys_in_index(id, &p.validation_split_keys)?;
+            p
+        }
+        Some(PersistentValue::BuildProgress(_)) => {
+            return Err(Error::new(ErrorKind::BulkBuildSuperseded));
+        }
+        _ => return Err(corrupt()),
+    };
+    match ws {
+        Some(PersistentValue::BuildWorkspace(w)) => {
+            if let Some(kind) = w.failure {
+                return Err(Error::new(kind));
+            }
+            if w.token != ws_token || w.epoch != expected_epoch || w.writer_token != [0; 32] {
+                return Err(Error::new(ErrorKind::BulkBuildSuperseded));
+            }
+        }
+        _ => return Err(corrupt()),
+    }
+    Ok(prog)
+}
+
+#[derive(Default)]
+pub(crate) struct UnitOutput {
+    pub records: u64,
+    pub kv_count: u64,
+    pub aux_count: u64,
+    pub kv_lthash: LtHash,
+    pub aux_lthash: LtHash,
+    pub aux2_lthash: LtHash,
+}
+
+pub(crate) struct StageEnv<B: Backend> {
+    pub backend: Arc<B>,
+    pub control: OperationOptions,
+    pub bulk_authority: Option<BulkAuthority>,
+    pub sched_lease_lock: Option<Arc<tokio::sync::RwLock<()>>>,
+    pub distributed_workers: usize,
+    pub persist_single_worker: bool,
+    pub admission: Option<Arc<dyn Any + Send + Sync>>,
+    pub manifest: IndexManifest,
+    pub fence: StageFence,
+    pub unit_lease: Duration,
+    pub budget: AdmissionBudget,
+    pub retry: RetryPolicy,
 }
 
 impl<B: Backend> Clone for StageEnv<B> {
@@ -91,6 +198,7 @@ impl<B: Backend> Clone for StageEnv<B> {
             bulk_authority: self.bulk_authority,
             sched_lease_lock: self.sched_lease_lock.clone(),
             distributed_workers: self.distributed_workers,
+            persist_single_worker: self.persist_single_worker,
             admission: self.admission.clone(),
             manifest: self.manifest.clone(),
             fence: self.fence,
@@ -102,7 +210,7 @@ impl<B: Backend> Clone for StageEnv<B> {
 }
 
 impl<B: Backend> StageEnv<B> {
-    async fn spawn_cpu<T: Send + 'static>(
+    pub(crate) async fn spawn_cpu<T: Send + 'static>(
         &self,
         work: impl FnOnce(OperationOptions) -> Result<T> + Send + 'static,
     ) -> Result<T> {
@@ -121,14 +229,15 @@ impl<B: Backend> StageEnv<B> {
     async fn commit_unit_kvs(
         &self,
         lease: Option<&UnitLease>,
-        lane_hint: u32,
         kvs: Vec<(Bytes, Bytes)>,
     ) -> Result<()> {
         if kvs.is_empty() {
             return Ok(());
         }
+        let StageFence::Write(wf) = self.fence else {
+            return Err(corrupt());
+        };
         let chunks = super::split_into_chunks(&kvs, self.budget, lease.is_some())?;
-        let lane = lane_hint % super::FENCE_LANES;
         for chunk in chunks {
             super::commit_one_chunk(
                 Arc::clone(&self.backend),
@@ -136,8 +245,7 @@ impl<B: Backend> StageEnv<B> {
                 self.bulk_authority,
                 self.sched_lease_lock.as_deref(),
                 &self.manifest,
-                self.fence,
-                lane,
+                wf,
                 lease,
                 chunk,
                 self.budget,
@@ -147,6 +255,86 @@ impl<B: Backend> StageEnv<B> {
         }
         Ok(())
     }
+}
+
+fn read_shard_state(
+    dir: &Path,
+    epoch: u64,
+    round: u8,
+    shard: u32,
+    manifest: &IndexManifest,
+) -> Result<(ShardState, usize)> {
+    read_compact_shard_state(
+        &dir.join(format!("base-e{epoch}-{shard:06}.bin")),
+        &dir.join(format!("centers-e{epoch}-r{round}-{shard:06}.bin")),
+        &dir.join(format!("mem-e{epoch}-r{round}-{shard:06}.bin")),
+        &dir.join(format!("inb-e{epoch}-r{round}-{shard:06}.bin")),
+        manifest,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "shard-state writer binds workspace directory, epoch, round, shard id, manifest, state, base count, and quota"
+)]
+fn write_shard_state(
+    dir: &Path,
+    epoch: u64,
+    round: u8,
+    shard: u32,
+    manifest: &IndexManifest,
+    state: &ShardState,
+    base_count: usize,
+    quota: &ScratchQuota,
+) -> Result<()> {
+    write_compact_shard_state(
+        &dir.join(format!("mem-e{epoch}-r{round}-{shard:06}.bin")),
+        &dir.join(format!("centers-e{epoch}-r{round}-{shard:06}.bin")),
+        &dir.join(format!("inb-e{epoch}-r{round}-{shard:06}.bin")),
+        manifest,
+        state,
+        base_count,
+        quota,
+    )?;
+    Ok(())
+}
+
+/// Initializes and drives a pure CPU/disk `BuildUnit` stage while holding the shared workspace lock.
+async fn drive_cpu_stage<B, F>(
+    env: &StageEnv<B>,
+    lock: &Arc<File>,
+    stage: u8,
+    unit_count: u32,
+    concurrency: usize,
+    work: F,
+) -> Result<Vec<BuildUnit>>
+where
+    B: Backend,
+    F: Fn(u32, &IndexManifest, &(dyn Fn() -> Result<()> + Sync)) -> Result<UnitOutput>
+        + Send
+        + Sync
+        + 'static,
+{
+    init_stage_units(env, stage, unit_count).await?;
+    let work = Arc::new(work);
+    let env_outer = env.clone();
+    let lock_outer = Arc::clone(lock);
+    drive_stage(env, stage, unit_count, concurrency, move |unit, _lease| {
+        let env_c = env_outer.clone();
+        let guard = Arc::clone(&lock_outer);
+        let work_c = Arc::clone(&work);
+        async move {
+            let manifest = env_c.manifest.clone();
+            env_c
+                .spawn_cpu(move |ctrl| {
+                    let _lock = guard;
+                    let check = || crate::runtime::check_control(&ctrl);
+                    work_c(unit, &manifest, &check)
+                })
+                .await
+        }
+    })
+    .await
 }
 
 /// Removes leftover temporary files and prior-epoch scratch files when a single-worker
@@ -159,13 +347,18 @@ fn prune_stale_epoch_files(dir: &Path, epoch: u64) -> Result<()> {
     };
     let epoch_tag = format!("-e{epoch}-");
     let plan_name = format!("plan-e{epoch}.bin");
+    let leafkeys_name = format!("leafkeys-e{epoch}.bin");
     for entry in entries {
         let entry = entry.map_err(io_error)?;
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if name == ".ktann-build-lock" || name == plan_name || name.contains(&epoch_tag) {
+        if name == ".ktann-build-lock"
+            || name == plan_name
+            || name == leafkeys_name
+            || name.contains(&epoch_tag)
+        {
             continue;
         }
         let _ = fs::remove_file(path);
@@ -291,6 +484,8 @@ pub(crate) async fn run_disk_units<B: Backend>(
     let id_buckets = plan.id_bucket_count();
     let coarse_shards = plan.total_shards;
     let tree_buckets = id_buckets.clamp(1, 64);
+    let refinement_rounds = descriptor.refinement_rounds();
+    let sample_items = descriptor.options().sample_items;
 
     let env = StageEnv {
         backend: context.backend(),
@@ -298,9 +493,10 @@ pub(crate) async fn run_disk_units<B: Backend>(
         bulk_authority: context.bulk_authority,
         sched_lease_lock: context.bulk_lease_lock.clone(),
         distributed_workers: state.options.distributed_workers,
+        persist_single_worker: false,
         admission: context.cpu_keep_alive(),
         manifest: index.clone(),
-        fence,
+        fence: StageFence::Write(fence),
         unit_lease: state.options.unit_lease,
         budget,
         retry,
@@ -317,518 +513,458 @@ pub(crate) async fn run_disk_units<B: Backend>(
         parallelism.min(8)
     };
 
-    // 2. Stage 1: Scatter grouped segment runs into indexed Coarse-Shard `vec-*` and ID-bucket `ids-*` files.
-    let ingest_start = Instant::now();
-    init_stage_units(&env, STAGE_SCATTER, scatter_units).await?;
-    let scatter_done = drive_stage(&env, STAGE_SCATTER, scatter_units, scatter_conc, {
-        let env = env.clone();
-        let snapshot = snapshot.clone();
-        let plan = plan.clone();
-        let work_dir = work_dir.clone();
-        let quota = Arc::clone(&quota);
-        let lock = Arc::clone(&lock);
-        move |unit, _lease| {
-            let env_c = env.clone();
-            let snap_c = snapshot.clone();
-            let plan_c = plan.clone();
-            let dir = work_dir.clone();
-            let quota_c = Arc::clone(&quota);
-            let guard = lock.clone();
-            async move {
-                let (records, id_lt) = env_c
-                    .spawn_cpu({
-                        let manifest = env_c.manifest.clone();
-                        move |ctrl| {
-                            let _lock = guard;
-                            let check = || crate::runtime::check_control(&ctrl);
-                            let seg_start = (unit as usize) * segs_per_run;
-                            let seg_end = (seg_start + segs_per_run).min(seg_count);
-                            let seg = ingest_segment_range(
-                                &snap_c,
-                                seg_start..seg_end,
-                                &manifest,
-                                &plan_c,
-                                hard_limits,
-                                &check,
-                            )?;
-                            let ep = fence.epoch;
-                            write_indexed_ids(
-                                &dir.join(format!("ids-e{ep}-{unit:06}.bin")),
-                                &seg.ids_by_bucket,
-                                &quota_c,
-                            )?;
-                            write_indexed_shards(
-                                &dir.join(format!("vec-e{ep}-{unit:06}.bin")),
-                                &dir.join(format!("cnt-e{ep}-{unit:06}.bin")),
-                                &manifest,
-                                &seg.rows_by_shard,
-                                &quota_c,
-                            )?;
-                            Ok((seg.records, seg.id_lthash))
-                        }
-                    })
-                    .await?;
-                Ok(UnitOutput {
-                    records,
-                    aux_lthash: id_lt,
-                    ..UnitOutput::default()
-                })
-            }
-        }
-    })
-    .await?;
-    report.ingest = ingest_start.elapsed();
-
-    // 3. Stage 2 (Global ID Dedup -> `idref-*`) & Stage 3 (Sharded Leaf Construction -> `base-*` + `mem-r0-*`).
-    let construct_start = Instant::now();
-    init_stage_units(&env, STAGE_DEDUP, id_buckets).await?;
-    let dedup_done = drive_stage(&env, STAGE_DEDUP, id_buckets, parallelism, {
-        let env = env.clone();
-        let work_dir = work_dir.clone();
-        let quota = Arc::clone(&quota);
-        let lock = Arc::clone(&lock);
-        move |b, _lease| {
-            let env_c = env.clone();
-            let dir = work_dir.clone();
-            let quota_c = Arc::clone(&quota);
-            let guard = lock.clone();
-            async move {
-                let (count, id_lt) = env_c
-                    .spawn_cpu(move |ctrl| {
-                        let _lock = guard;
-                        let ep = fence.epoch;
-                        let mut ids = Vec::new();
-                        for run in 0..scatter_units {
-                            if run.is_multiple_of(32) {
-                                crate::runtime::check_control(&ctrl)?;
-                            }
-                            read_indexed_ids_slice(
-                                &dir.join(format!("ids-e{ep}-{run:06}.bin")),
-                                b as usize,
-                                &mut ids,
-                            )?;
-                        }
-                        let (count, hash, sorted) = verify_id_bucket(ids)?;
-                        write_bucket_id_refs(
-                            &dir.join(format!("idref-e{ep}-{b:06}.bin")),
-                            &sorted,
-                            &quota_c,
-                        )?;
-                        Ok((count, hash))
-                    })
-                    .await?;
-                Ok(UnitOutput {
-                    records: count,
-                    aux_lthash: id_lt,
-                    ..UnitOutput::default()
-                })
-            }
-        }
-    })
-    .await?;
-
-    let scatter_records: u64 = scatter_done.iter().map(|u| u.records).sum();
-    let dedup_records: u64 = dedup_done.iter().map(|u| u.records).sum();
-    let mut scatter_id_lt = LtHash::ZERO;
-    for u in &scatter_done {
-        scatter_id_lt.add_assign(u.aux_lthash);
-    }
-    let mut dedup_id_lt = LtHash::ZERO;
-    for u in &dedup_done {
-        dedup_id_lt.add_assign(u.aux_lthash);
-    }
-    if scatter_records != dedup_records || scatter_id_lt != dedup_id_lt {
-        return Err(corrupt());
-    }
-
-    reclaim_files(
-        &env,
-        &work_dir,
-        &quota,
-        &lock,
-        (0..scatter_units)
-            .map(|run| format!("ids-e{}-{run:06}.bin", fence.epoch))
-            .collect(),
-    )
-    .await?;
-
-    // Compute deterministic shard remap and exact non-empty `(run, Vec<orig_shard>)` sources from `cnt-*`.
-    let non_empty_runs_by_shard: Arc<Vec<NonEmptyRunSources>> = Arc::new(
-        env.spawn_cpu({
-            let dir = work_dir.clone();
+    let leafkeys_path = work_dir.join(format!("leafkeys-e{}.bin", fence.epoch));
+    let cached_leaf_plan = env
+        .spawn_cpu({
+            let path = leafkeys_path.clone();
             let manifest = index.clone();
-            let plan_c = plan.clone();
-            let guard = lock.clone();
-            move |ctrl| {
+            let guard = Arc::clone(&lock);
+            move |_ctrl| {
                 let _lock = guard;
-                let ep = fence.epoch;
-                let mut totals = vec![0_u64; coarse_shards as usize];
-                let mut per_run_non_empty: Vec<Vec<usize>> =
-                    Vec::with_capacity(scatter_units as usize);
-                for run in 0..scatter_units {
-                    if run.is_multiple_of(64) {
-                        crate::runtime::check_control(&ctrl)?;
-                    }
-                    let c = read_shard_counts(
-                        &dir.join(format!("cnt-e{ep}-{run:06}.bin")),
-                        coarse_shards as usize,
-                    )?;
-                    let mut run_origins = Vec::new();
-                    for (orig, v) in c.into_iter().enumerate() {
-                        if v > 0 {
-                            totals[orig] = totals[orig].checked_add(v).ok_or_else(corrupt)?;
-                            run_origins.push(orig);
-                        }
-                    }
-                    per_run_non_empty.push(run_origins);
+                if path.exists() {
+                    Ok(Some(read_leaf_keys_plan(&path, coarse_shards, &manifest)?))
+                } else {
+                    Ok(None)
                 }
-                let kernel = VectorKernel::new(
-                    manifest.config().dimension(),
-                    manifest.config().metric(),
-                    *manifest.rotation_seed(),
-                )?;
-                let remap = compute_shard_remap(
-                    &kernel,
-                    &plan_c,
-                    &totals,
-                    u64::from(manifest.config().min_leaf_partition_entries()),
-                    u64::from(manifest.config().max_leaf_partition_entries()),
-                );
-                let mut by_dst: Vec<NonEmptyRunSources> = vec![Vec::new(); coarse_shards as usize];
-                for (run_idx, origins) in per_run_non_empty.into_iter().enumerate() {
-                    let run_u32 = run_idx as u32;
-                    for orig in origins {
-                        let dst = remap[orig] as usize;
-                        match by_dst[dst].last_mut() {
-                            Some((last_run, list)) if *last_run == run_u32 => list.push(orig),
-                            _ => by_dst[dst].push((run_u32, vec![orig])),
-                        }
-                    }
-                }
-                Ok(by_dst)
             }
         })
-        .await?,
-    );
+        .await?;
 
-    let refinement_rounds = descriptor.refinement_rounds();
-    let sample_items = descriptor.options().sample_items;
-    let light_per_worker_mem = effective_mem / leaf_conc.max(1);
-
-    init_stage_units(&env, STAGE_LEAVES, coarse_shards).await?;
-    drive_stage(&env, STAGE_LEAVES, coarse_shards, leaf_conc, {
-        let env = env.clone();
-        let work_dir = work_dir.clone();
-        let run_sources = Arc::clone(&non_empty_runs_by_shard);
-        let plan = plan.clone();
-        let quota = Arc::clone(&quota);
-        let lock = Arc::clone(&lock);
-        move |s, _lease| {
-            let env_c = env.clone();
-            let dir = work_dir.clone();
-            let sources_c = Arc::clone(&run_sources);
-            let plan_c = plan.clone();
-            let quota_c = Arc::clone(&quota);
-            let guard = lock.clone();
-            async move {
-                let (row_count, leaf_count) = env_c
-                    .spawn_cpu({
-                        let manifest = env_c.manifest.clone();
-                        move |ctrl| {
-                            let _lock = guard;
-                            let check = || crate::runtime::check_control(&ctrl);
-                            let ep = fence.epoch;
-                            let run_list = &sources_c[s as usize];
-                            let mut rows = ShardRows::new(manifest.config().dimension());
-                            for (idx, (run, src_shards)) in run_list.iter().enumerate() {
-                                if idx.is_multiple_of(32) {
-                                    check()?;
-                                }
-                                let vpath = dir.join(format!("vec-e{ep}-{run:06}.bin"));
-                                for &src_s in src_shards {
-                                    read_indexed_shard_slice(&vpath, src_s, &manifest, &mut rows)?;
-                                }
-                            }
-                            let base_count = rows.rows.len();
-                            let mut shard_state = if base_count == 0 {
-                                ShardState {
-                                    rows,
-                                    leaves: Vec::new(),
-                                }
-                            } else {
-                                build_shard_leaves(&manifest, sample_items, rows, &check)?
-                            };
-                            if let Some(rounds) = refinement_rounds
-                                && s >= plan_c.light_shard_start
-                            {
-                                refine_single_light_shard(
-                                    &manifest,
-                                    &mut shard_state,
-                                    rounds,
-                                    light_per_worker_mem,
-                                    &check,
-                                )?;
-                            }
-                            write_base_shard_rows(
-                                &dir.join(format!("base-e{ep}-{s:06}.bin")),
-                                &manifest,
-                                &shard_state.rows,
-                                base_count,
-                                &quota_c,
-                            )?;
-                            write_compact_shard_state(
-                                &dir.join(format!("mem-e{ep}-r0-{s:06}.bin")),
-                                &dir.join(format!("centers-e{ep}-r0-{s:06}.bin")),
-                                &dir.join(format!("inb-e{ep}-r0-{s:06}.bin")),
-                                &manifest,
-                                &shard_state,
-                                base_count,
-                                &quota_c,
-                            )?;
-                            Ok((base_count as u64, shard_state.leaves.len() as u64))
-                        }
-                    })
-                    .await?;
-                Ok(UnitOutput {
-                    records: row_count,
-                    aux_count: leaf_count,
-                    ..UnitOutput::default()
-                })
-            }
-        }
-    })
-    .await?;
-    drop(non_empty_runs_by_shard);
-
-    // Reclaim scatter runs (`vec-*` + `cnt-*`) immediately after the `STAGE_LEAVES` barrier!
+    let (scatter_records, final_round, assigned, tree_totals) = if let Some(loaded) =
+        cached_leaf_plan
     {
-        let ep = fence.epoch;
-        let mut obsolete = Vec::with_capacity((scatter_units as usize) * 2);
-        for run in 0..scatter_units {
-            obsolete.push(format!("vec-e{ep}-{run:06}.bin"));
-            obsolete.push(format!("cnt-e{ep}-{run:06}.bin"));
-        }
-        reclaim_files(&env, &work_dir, &quota, &lock, obsolete).await?;
-    }
-    report.construct = construct_start.elapsed();
-
-    // 4. Optional Bounded-Halo Delta Refinement across heavy-tree shards (`0..plan.light_shard_start`).
-    let mut final_round = 0_u8;
-    let heavy_shards = plan.light_shard_start;
-    let rounds = refinement_rounds.unwrap_or(0);
-    if refinement_rounds.is_some() && heavy_shards > 0 {
-        let refine_start = Instant::now();
-        let per_leaf = refinement_per_leaf_bytes(index.config().dimension(), rounds);
-        let halo_conc = (effective_mem / (192 * 1024 * 1024)).clamp(1, parallelism);
-        let per_worker_budget = effective_mem / halo_conc.max(1);
-        let admitted_leaves = per_worker_budget / per_leaf.max(1);
-        if admitted_leaves < 2 {
-            return Err(Error::new(ErrorKind::LimitExceeded));
-        }
-        let max_halo_leaves = admitted_leaves.min(32_768);
-
-        for r in 0..rounds {
-            let stage_prop = STAGE_REFINE_BASE + 3 * r;
-            let stage_ext = STAGE_REFINE_BASE + 3 * r + 1;
-            let stage_app = STAGE_REFINE_BASE + 3 * r + 2;
-
-            init_stage_units(&env, stage_prop, heavy_shards).await?;
-            let prop_done = drive_stage(&env, stage_prop, heavy_shards, halo_conc, {
-                let env = env.clone();
-                let work_dir = work_dir.clone();
+        loaded
+    } else {
+        // 2. Stage 1: Scatter grouped segment runs into indexed Coarse-Shard `vec-*` and ID-bucket `ids-*` files.
+        let ingest_start = Instant::now();
+        let scatter_done =
+            drive_cpu_stage(&env, &lock, STAGE_SCATTER, scatter_units, scatter_conc, {
+                let snapshot = snapshot.clone();
                 let plan = plan.clone();
+                let dir = work_dir.clone();
                 let quota = Arc::clone(&quota);
-                let lock = Arc::clone(&lock);
-                move |s, _lease| {
-                    let env_c = env.clone();
-                    let dir = work_dir.clone();
-                    let plan_c = plan.clone();
-                    let quota_c = Arc::clone(&quota);
-                    let guard = lock.clone();
-                    async move {
-                        let prop_count = env_c
-                            .spawn_cpu({
-                                let manifest = env_c.manifest.clone();
-                                move |ctrl| {
-                                    let _lock = guard;
-                                    let check = || crate::runtime::check_control(&ctrl);
-                                    propose_disk_shard(
-                                        &dir,
-                                        fence.epoch,
-                                        r,
-                                        s,
-                                        &manifest,
-                                        &plan_c,
-                                        max_halo_leaves,
-                                        per_leaf,
-                                        per_worker_budget,
-                                        &quota_c,
-                                        &check,
-                                    )
-                                }
-                            })
-                            .await?;
-                        Ok(UnitOutput {
-                            aux_count: prop_count,
-                            ..UnitOutput::default()
-                        })
-                    }
+                move |unit, manifest, check| {
+                    let seg_start = (unit as usize) * segs_per_run;
+                    let seg_end = (seg_start + segs_per_run).min(seg_count);
+                    let seg = ingest_segment_range(
+                        &snapshot,
+                        seg_start..seg_end,
+                        manifest,
+                        &plan,
+                        hard_limits,
+                        check,
+                    )?;
+                    let ep = fence.epoch;
+                    write_indexed_ids(
+                        &dir.join(format!("ids-e{ep}-{unit:06}.bin")),
+                        &seg.ids_by_bucket,
+                        &quota,
+                    )?;
+                    write_indexed_shards(
+                        &dir.join(format!("vec-e{ep}-{unit:06}.bin")),
+                        &dir.join(format!("cnt-e{ep}-{unit:06}.bin")),
+                        manifest,
+                        &seg.rows_by_shard,
+                        &quota,
+                    )?;
+                    Ok(UnitOutput {
+                        records: seg.records,
+                        aux_lthash: seg.id_lthash,
+                        ..UnitOutput::default()
+                    })
                 }
             })
             .await?;
+        report.ingest = ingest_start.elapsed();
 
-            let total_proposals: u64 = prop_done.iter().map(|u| u.aux_count).sum();
-            if total_proposals == 0 {
-                break;
+        // 3. Stage 2 (Global ID Dedup -> `idref-*`) & Stage 3 (Sharded Leaf Construction -> `base-*` + `mem-r0-*`).
+        let construct_start = Instant::now();
+        let dedup_done = drive_cpu_stage(&env, &lock, STAGE_DEDUP, id_buckets, parallelism, {
+            let dir = work_dir.clone();
+            let quota = Arc::clone(&quota);
+            move |b, _manifest, check| {
+                let ep = fence.epoch;
+                let mut ids = Vec::new();
+                for run in 0..scatter_units {
+                    if run.is_multiple_of(32) {
+                        check()?;
+                    }
+                    read_indexed_ids_slice(
+                        &dir.join(format!("ids-e{ep}-{run:06}.bin")),
+                        b as usize,
+                        &mut ids,
+                    )?;
+                }
+                let (count, hash, sorted) = verify_id_bucket(ids)?;
+                write_bucket_id_refs(
+                    &dir.join(format!("idref-e{ep}-{b:06}.bin")),
+                    &sorted,
+                    &quota,
+                )?;
+                Ok(UnitOutput {
+                    records: count,
+                    aux_lthash: hash,
+                    ..UnitOutput::default()
+                })
             }
+        })
+        .await?;
 
-            let accepted_moves = Arc::new(
-                env.spawn_cpu({
+        let scatter_records: u64 = scatter_done.iter().map(|u| u.records).sum();
+        let dedup_records: u64 = dedup_done.iter().map(|u| u.records).sum();
+        let mut scatter_id_lt = LtHash::ZERO;
+        for u in &scatter_done {
+            scatter_id_lt.add_assign(u.aux_lthash);
+        }
+        let mut dedup_id_lt = LtHash::ZERO;
+        for u in &dedup_done {
+            dedup_id_lt.add_assign(u.aux_lthash);
+        }
+        if scatter_records != dedup_records || scatter_id_lt != dedup_id_lt {
+            return Err(corrupt());
+        }
+
+        reclaim_files(
+            &env,
+            &work_dir,
+            &quota,
+            &lock,
+            (0..scatter_units)
+                .map(|run| format!("ids-e{}-{run:06}.bin", fence.epoch))
+                .collect(),
+        )
+        .await?;
+
+        init_stage_units(&env, STAGE_LEAVES, coarse_shards).await?;
+        if !is_stage_complete(&env, STAGE_LEAVES, coarse_shards).await? {
+            let run_sources_res = env
+                .spawn_cpu({
                     let dir = work_dir.clone();
                     let manifest = index.clone();
                     let plan_c = plan.clone();
                     let guard = lock.clone();
                     move |ctrl| {
                         let _lock = guard;
-                        let check = || crate::runtime::check_control(&ctrl);
-                        arbitrate_disk_round(
+                        compute_non_empty_runs_by_shard(
                             &dir,
                             fence.epoch,
-                            r,
+                            scatter_units,
+                            coarse_shards,
                             &manifest,
                             &plan_c,
-                            effective_mem,
-                            &check,
+                            &ctrl,
                         )
                     }
                 })
-                .await?,
-            );
-            if accepted_moves.total_accepted == 0 {
-                break;
-            }
+                .await;
 
-            init_stage_units(&env, stage_ext, heavy_shards).await?;
-            drive_stage(&env, stage_ext, heavy_shards, leaf_conc, {
-                let env = env.clone();
-                let work_dir = work_dir.clone();
-                let accepted_moves = Arc::clone(&accepted_moves);
-                let quota = Arc::clone(&quota);
-                let lock = Arc::clone(&lock);
-                move |s, _lease| {
-                    let env_c = env.clone();
-                    let dir = work_dir.clone();
-                    let acc_c = Arc::clone(&accepted_moves);
-                    let quota_c = Arc::clone(&quota);
-                    let guard = lock.clone();
-                    async move {
-                        env_c
-                            .spawn_cpu({
-                                let manifest = env_c.manifest.clone();
-                                move |ctrl| {
-                                    let _lock = guard;
-                                    let check = || crate::runtime::check_control(&ctrl);
-                                    extract_disk_outbound(
-                                        &dir,
-                                        fence.epoch,
-                                        r,
-                                        s,
-                                        heavy_shards as usize,
-                                        &manifest,
-                                        &acc_c,
-                                        &quota_c,
-                                        &check,
-                                    )
-                                }
-                            })
-                            .await?;
-                        Ok(UnitOutput::default())
-                    }
+            let non_empty_runs_by_shard = match run_sources_res {
+                Ok(v) => Some(Arc::new(v)),
+                Err(e)
+                    if env.distributed_workers > 1
+                        && is_stage_complete(&env, STAGE_LEAVES, coarse_shards).await? =>
+                {
+                    let _ = e;
+                    None
                 }
-            })
-            .await?;
+                Err(e) => return Err(e),
+            };
 
-            init_stage_units(&env, stage_app, heavy_shards).await?;
-            drive_stage(&env, stage_app, heavy_shards, leaf_conc, {
-                let env = env.clone();
-                let work_dir = work_dir.clone();
-                let accepted_moves = Arc::clone(&accepted_moves);
-                let quota = Arc::clone(&quota);
-                let lock = Arc::clone(&lock);
-                move |s, _lease| {
-                    let env_c = env.clone();
+            if let Some(run_sources) = non_empty_runs_by_shard {
+                let light_per_worker_mem = effective_mem / leaf_conc.max(1);
+                drive_cpu_stage(&env, &lock, STAGE_LEAVES, coarse_shards, leaf_conc, {
                     let dir = work_dir.clone();
-                    let acc_c = Arc::clone(&accepted_moves);
-                    let quota_c = Arc::clone(&quota);
-                    let guard = lock.clone();
-                    async move {
-                        env_c
-                            .spawn_cpu({
-                                let manifest = env_c.manifest.clone();
-                                move |ctrl| {
-                                    let _lock = guard;
-                                    let check = || crate::runtime::check_control(&ctrl);
-                                    apply_disk_shard(
-                                        &dir,
-                                        fence.epoch,
-                                        r,
-                                        s,
-                                        &manifest,
-                                        &acc_c,
-                                        &quota_c,
-                                        &check,
-                                    )
-                                }
-                            })
-                            .await?;
-                        Ok(UnitOutput::default())
+                    let plan = plan.clone();
+                    let quota = Arc::clone(&quota);
+                    move |s, manifest, check| {
+                        let ep = fence.epoch;
+                        let run_list = &run_sources[s as usize];
+                        let mut rows = ShardRows::new(manifest.config().dimension());
+                        for (idx, (run, src_shards)) in run_list.iter().enumerate() {
+                            if idx.is_multiple_of(32) {
+                                check()?;
+                            }
+                            let vpath = dir.join(format!("vec-e{ep}-{run:06}.bin"));
+                            for &src_s in src_shards {
+                                read_indexed_shard_slice(&vpath, src_s, manifest, &mut rows)?;
+                            }
+                        }
+                        let base_count = rows.rows.len();
+                        let mut shard_state = if base_count == 0 {
+                            ShardState {
+                                rows,
+                                leaves: Vec::new(),
+                            }
+                        } else {
+                            build_shard_leaves(manifest, sample_items, rows, check)?
+                        };
+                        if let Some(rounds) = refinement_rounds
+                            && s >= plan.light_shard_start
+                        {
+                            refine_single_light_shard(
+                                manifest,
+                                &mut shard_state,
+                                rounds,
+                                light_per_worker_mem,
+                                check,
+                            )?;
+                        }
+                        write_base_shard_rows(
+                            &dir.join(format!("base-e{ep}-{s:06}.bin")),
+                            manifest,
+                            &shard_state.rows,
+                            base_count,
+                            &quota,
+                        )?;
+                        write_shard_state(
+                            &dir,
+                            ep,
+                            0,
+                            s,
+                            manifest,
+                            &shard_state,
+                            base_count,
+                            &quota,
+                        )?;
+                        Ok(UnitOutput {
+                            records: base_count as u64,
+                            aux_count: shard_state.leaves.len() as u64,
+                            ..UnitOutput::default()
+                        })
                     }
-                }
-            })
-            .await?;
+                })
+                .await?;
 
-            {
                 let ep = fence.epoch;
-                let mut obsolete = Vec::with_capacity((heavy_shards as usize) * 5);
-                for s in 0..heavy_shards {
-                    for kind in ["mem", "centers", "inb", "prop", "outb"] {
-                        obsolete.push(format!("{kind}-e{ep}-r{r}-{s:06}.bin"));
-                    }
+                let mut obsolete = Vec::with_capacity((scatter_units as usize) * 2);
+                for run in 0..scatter_units {
+                    obsolete.push(format!("vec-e{ep}-{run:06}.bin"));
+                    obsolete.push(format!("cnt-e{ep}-{run:06}.bin"));
                 }
                 reclaim_files(&env, &work_dir, &quota, &lock, obsolete).await?;
             }
-            final_round = r + 1;
         }
-        report.refine = refine_start.elapsed();
-    }
+        report.construct = construct_start.elapsed();
 
-    // 5. Assign global deterministic PartitionKeys from compact `centers-*` TreeKey headers.
-    let emit_start = Instant::now();
-    let (assigned, tree_totals) = env
-        .spawn_cpu({
-            let dir = work_dir.clone();
-            let manifest = index.clone();
-            let plan_c = plan.clone();
-            let guard = lock.clone();
-            move |ctrl| {
-                let _lock = guard;
-                let check = || crate::runtime::check_control(&ctrl);
-                assign_disk_leaf_keys(
-                    &dir,
-                    fence.epoch,
-                    final_round,
-                    &plan_c,
-                    coarse_shards,
-                    &manifest,
-                    &check,
-                )
+        // 4. Optional Bounded-Halo Delta Refinement across heavy-tree shards (`0..plan.light_shard_start`).
+        let mut final_round = 0_u8;
+        let heavy_shards = plan.light_shard_start;
+        let rounds = refinement_rounds.unwrap_or(0);
+        if refinement_rounds.is_some() && heavy_shards > 0 {
+            let refine_start = Instant::now();
+            let per_leaf = refinement_per_leaf_bytes(index.config().dimension(), rounds);
+            let halo_conc = (effective_mem / (192 * 1024 * 1024)).clamp(1, parallelism);
+            let per_worker_budget = effective_mem / halo_conc.max(1);
+            let admitted_leaves = per_worker_budget / per_leaf.max(1);
+            if admitted_leaves < 2 {
+                return Err(Error::new(ErrorKind::LimitExceeded));
             }
-        })
-        .await?;
+            let max_halo_leaves = admitted_leaves.min(32_768);
+
+            for r in 0..rounds {
+                let stage_prop = STAGE_REFINE_BASE + 3 * r;
+                let stage_ext = STAGE_REFINE_BASE + 3 * r + 1;
+                let stage_app = STAGE_REFINE_BASE + 3 * r + 2;
+
+                let prop_done =
+                    drive_cpu_stage(&env, &lock, stage_prop, heavy_shards, halo_conc, {
+                        let dir = work_dir.clone();
+                        let plan = plan.clone();
+                        let quota = Arc::clone(&quota);
+                        move |s, manifest, check| {
+                            let aux_count = propose_disk_shard(
+                                &dir,
+                                fence.epoch,
+                                r,
+                                s,
+                                manifest,
+                                &plan,
+                                max_halo_leaves,
+                                per_leaf,
+                                per_worker_budget,
+                                &quota,
+                                check,
+                            )?;
+                            Ok(UnitOutput {
+                                aux_count,
+                                ..UnitOutput::default()
+                            })
+                        }
+                    })
+                    .await?;
+
+                let prop_counts: Vec<u64> = prop_done.iter().map(|u| u.aux_count).collect();
+                if prop_counts.iter().sum::<u64>() == 0 {
+                    break;
+                }
+                if is_stage_complete(&env, stage_app, heavy_shards).await? {
+                    final_round = r + 1;
+                    continue;
+                }
+
+                let arb_res = env
+                    .spawn_cpu({
+                        let dir = work_dir.clone();
+                        let manifest = index.clone();
+                        let plan_c = plan.clone();
+                        let prop_counts_c = prop_counts.clone();
+                        let guard = lock.clone();
+                        move |ctrl| {
+                            let _lock = guard;
+                            let check = || crate::runtime::check_control(&ctrl);
+                            arbitrate_disk_round(
+                                &dir,
+                                fence.epoch,
+                                r,
+                                &prop_counts_c,
+                                &manifest,
+                                &plan_c,
+                                effective_mem,
+                                &check,
+                            )
+                        }
+                    })
+                    .await;
+
+                let accepted_moves = match arb_res {
+                    Ok(v) => Arc::new(v),
+                    Err(e)
+                        if env.distributed_workers > 1
+                            && is_stage_complete(&env, stage_app, heavy_shards).await? =>
+                    {
+                        let _ = e;
+                        final_round = r + 1;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
+
+                if accepted_moves.total_accepted == 0 {
+                    let ep = fence.epoch;
+                    let obsolete: Vec<String> = (0..heavy_shards)
+                        .filter(|&s| prop_counts[s as usize] > 0)
+                        .map(|s| format!("prop-e{ep}-r{r}-{s:06}.bin"))
+                        .collect();
+                    reclaim_files(&env, &work_dir, &quota, &lock, obsolete).await?;
+                    break;
+                }
+
+                drive_cpu_stage(&env, &lock, stage_ext, heavy_shards, leaf_conc, {
+                    let dir = work_dir.clone();
+                    let acc = Arc::clone(&accepted_moves);
+                    let quota = Arc::clone(&quota);
+                    move |s, manifest, check| {
+                        extract_disk_outbound(
+                            &dir,
+                            fence.epoch,
+                            r,
+                            s,
+                            heavy_shards as usize,
+                            manifest,
+                            &acc,
+                            &quota,
+                            check,
+                        )?;
+                        Ok(UnitOutput::default())
+                    }
+                })
+                .await?;
+
+                drive_cpu_stage(&env, &lock, stage_app, heavy_shards, leaf_conc, {
+                    let dir = work_dir.clone();
+                    let acc = Arc::clone(&accepted_moves);
+                    let quota = Arc::clone(&quota);
+                    move |s, manifest, check| {
+                        apply_disk_shard(&dir, fence.epoch, r, s, manifest, &acc, &quota, check)?;
+                        Ok(UnitOutput::default())
+                    }
+                })
+                .await?;
+
+                {
+                    let ep = fence.epoch;
+                    let mut obsolete = Vec::with_capacity((heavy_shards as usize) * 5);
+                    for s in 0..heavy_shards {
+                        for kind in ["mem", "centers", "inb", "prop", "outb"] {
+                            obsolete.push(format!("{kind}-e{ep}-r{r}-{s:06}.bin"));
+                        }
+                    }
+                    reclaim_files(&env, &work_dir, &quota, &lock, obsolete).await?;
+                }
+                final_round = r + 1;
+            }
+            report.refine = refine_start.elapsed();
+        }
+
+        // Persist `leafkeys-e{epoch}.bin` atomically before `STAGE_EMIT_LEAVES` unlinks `centers-*`.
+        let leaf_plan_res = env
+            .spawn_cpu({
+                let dir = work_dir.clone();
+                let path = leafkeys_path.clone();
+                let manifest = index.clone();
+                let plan_c = plan.clone();
+                let quota_c = Arc::clone(&quota);
+                let guard = lock.clone();
+                move |ctrl| {
+                    let _lock = guard;
+                    if path.exists() {
+                        return read_leaf_keys_plan(&path, coarse_shards, &manifest);
+                    }
+                    let check = || crate::runtime::check_control(&ctrl);
+                    let (assigned, tree_totals) = assign_disk_leaf_keys(
+                        &dir,
+                        fence.epoch,
+                        final_round,
+                        &plan_c,
+                        coarse_shards,
+                        &manifest,
+                        &check,
+                    )?;
+                    write_leaf_keys_plan(
+                        &path,
+                        scatter_records,
+                        final_round,
+                        &assigned,
+                        &tree_totals,
+                        &quota_c,
+                    )?;
+                    Ok((scatter_records, final_round, assigned, tree_totals))
+                }
+            })
+            .await;
+
+        match leaf_plan_res {
+            Ok(v) => v,
+            Err(e) if env.distributed_workers > 1 => {
+                let fallback = env
+                    .spawn_cpu({
+                        let path = leafkeys_path.clone();
+                        let manifest = index.clone();
+                        let guard = lock.clone();
+                        move |_ctrl| {
+                            let _lock = guard;
+                            if path.exists() {
+                                Ok(Some(read_leaf_keys_plan(&path, coarse_shards, &manifest)?))
+                            } else {
+                                Ok(None)
+                            }
+                        }
+                    })
+                    .await?;
+                match fallback {
+                    Some(v) => v,
+                    None => return Err(e),
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    };
+
+    // 5. Emit serving KVs across `STAGE_EMIT_LEAVES` -> `STAGE_EMIT_TREES` -> `STAGE_EMIT_RECORDS`.
+    let emit_start = Instant::now();
     let assigned = Arc::new(assigned);
     let leaf_partitions: u64 = tree_totals.values().map(|(_, c)| *c).sum();
 
-    // Stage 30: Emit Leaf Partitions (`[0x04]`) in shard order + write indexed `loc-*` & `uchild-*`.
     init_stage_units(&env, STAGE_EMIT_LEAVES, coarse_shards).await?;
     let leaf_emit_done = drive_stage(&env, STAGE_EMIT_LEAVES, coarse_shards, emit_conc, {
         let env = env.clone();
@@ -845,7 +981,7 @@ pub(crate) async fn run_disk_units<B: Backend>(
             let quota_c = Arc::clone(&quota);
             let guard = lock.clone();
             async move {
-                let res = env_c
+                let (kvs, kv_lt, mem_lt, def_lt, loc_count, uchild_count) = env_c
                     .spawn_cpu({
                         let manifest = env_c.manifest.clone();
                         move |ctrl| {
@@ -857,30 +993,14 @@ pub(crate) async fn run_disk_units<B: Backend>(
                             } else {
                                 0
                             };
-                            let (shard_state, _) = read_compact_shard_state(
-                                &dir.join(format!("base-e{ep}-{s:06}.bin")),
-                                &dir.join(format!("mem-e{ep}-r{r_use}-{s:06}.bin")),
-                                &dir.join(format!("inb-e{ep}-r{r_use}-{s:06}.bin")),
-                                &manifest,
-                            )?;
+                            let (shard_state, _) = read_shard_state(&dir, ep, r_use, s, &manifest)?;
                             if shard_state.leaves.is_empty() {
-                                write_indexed_locations(
-                                    &dir.join(format!("loc-e{ep}-{s:06}.bin")),
-                                    &vec![Vec::new(); plan_c.id_bucket_count() as usize],
-                                    &quota_c,
-                                )?;
-                                write_indexed_upper_children(
-                                    &dir.join(format!("uchild-e{ep}-{s:06}.bin")),
-                                    &manifest,
-                                    tree_buckets,
-                                    &[],
-                                    &quota_c,
-                                )?;
                                 return Ok((
                                     Vec::new(),
                                     LtHash::ZERO,
                                     LtHash::ZERO,
                                     LtHash::ZERO,
+                                    0_u64,
                                     0_u64,
                                 ));
                             }
@@ -890,37 +1010,45 @@ pub(crate) async fn run_disk_units<B: Backend>(
                                 &shard_state,
                                 &assigned_c[s as usize],
                                 hard_limits,
+                                true,
                                 &check,
                             )?;
-                            write_indexed_locations(
-                                &dir.join(format!("loc-e{ep}-{s:06}.bin")),
-                                &enc.locations_by_bucket,
-                                &quota_c,
-                            )?;
-                            write_indexed_upper_children(
-                                &dir.join(format!("uchild-e{ep}-{s:06}.bin")),
-                                &manifest,
-                                tree_buckets,
-                                &enc.child_centroids,
-                                &quota_c,
-                            )?;
+                            let loc_count: u64 =
+                                enc.locations_by_bucket.iter().map(|b| b.len() as u64).sum();
+                            if loc_count > 0 {
+                                write_indexed_locations(
+                                    &dir.join(format!("loc-e{ep}-{s:06}.bin")),
+                                    &enc.locations_by_bucket,
+                                    &quota_c,
+                                )?;
+                            }
+                            let uchild_count = enc.child_centroids.len() as u64;
+                            if uchild_count > 0 {
+                                write_indexed_upper_children(
+                                    &dir.join(format!("uchild-e{ep}-{s:06}.bin")),
+                                    &manifest,
+                                    tree_buckets,
+                                    &enc.child_centroids,
+                                    &quota_c,
+                                )?;
+                            }
                             Ok((
                                 enc.kvs,
                                 enc.kv_lthash,
                                 enc.membership_lthash,
                                 enc.edge_def_lthash,
-                                shard_state.leaves.len() as u64,
+                                loc_count,
+                                uchild_count,
                             ))
                         }
                     })
                     .await?;
-                let (kvs, kv_lt, mem_lt, def_lt, leaves_n) = res;
                 let kv_count = kvs.len() as u64;
-                env_c.commit_unit_kvs(u_lease.as_ref(), s, kvs).await?;
+                env_c.commit_unit_kvs(u_lease.as_ref(), kvs).await?;
                 Ok(UnitOutput {
-                    records: 0,
+                    records: loc_count,
                     kv_count,
-                    aux_count: leaves_n,
+                    aux_count: uchild_count,
                     kv_lthash: kv_lt,
                     aux_lthash: mem_lt,
                     aux2_lthash: def_lt,
@@ -947,6 +1075,21 @@ pub(crate) async fn run_disk_units<B: Backend>(
         reclaim_files(&env, &work_dir, &quota, &lock, obsolete).await?;
     }
 
+    let non_empty_loc_shards: Arc<Vec<u32>> = Arc::new(
+        leaf_emit_done
+            .iter()
+            .enumerate()
+            .filter_map(|(s, u)| (u.records > 0).then_some(s as u32))
+            .collect(),
+    );
+    let non_empty_uchild_shards: Arc<Vec<u32>> = Arc::new(
+        leaf_emit_done
+            .iter()
+            .enumerate()
+            .filter_map(|(s, u)| (u.aux_count > 0).then_some(s as u32))
+            .collect(),
+    );
+
     // Stage 32: Build and emit Upper Trees + Partition-Local HNSW graphs (`[0x03]` + `[0x04]`).
     let tree_totals_arc = Arc::new(tree_totals);
     init_stage_units(&env, STAGE_EMIT_TREES, tree_buckets).await?;
@@ -954,11 +1097,13 @@ pub(crate) async fn run_disk_units<B: Backend>(
         let env = env.clone();
         let work_dir = work_dir.clone();
         let tree_totals_arc = Arc::clone(&tree_totals_arc);
+        let uchild_shards = Arc::clone(&non_empty_uchild_shards);
         let lock = Arc::clone(&lock);
         move |tb, u_lease| {
             let env_c = env.clone();
             let dir = work_dir.clone();
             let totals_c = Arc::clone(&tree_totals_arc);
+            let uchild_c = Arc::clone(&uchild_shards);
             let guard = lock.clone();
             async move {
                 let (trees_n, internal_parts, kvs, kv_lt, def_lt, ref_lt) = env_c
@@ -990,8 +1135,8 @@ pub(crate) async fn run_disk_units<B: Backend>(
                                 ));
                             }
                             let mut children_buf = Vec::new();
-                            for s in 0..coarse_shards {
-                                if s.is_multiple_of(64) {
+                            for (idx, &s) in uchild_c.iter().enumerate() {
+                                if idx.is_multiple_of(64) {
                                     check()?;
                                 }
                                 children_buf.clear();
@@ -1038,7 +1183,7 @@ pub(crate) async fn run_disk_units<B: Backend>(
                     })
                     .await?;
                 let kv_count = kvs.len() as u64;
-                env_c.commit_unit_kvs(u_lease.as_ref(), tb, kvs).await?;
+                env_c.commit_unit_kvs(u_lease.as_ref(), kvs).await?;
                 Ok(UnitOutput {
                     records: trees_n,
                     kv_count,
@@ -1057,7 +1202,8 @@ pub(crate) async fn run_disk_units<B: Backend>(
         &work_dir,
         &quota,
         &lock,
-        (0..coarse_shards)
+        non_empty_uchild_shards
+            .iter()
             .map(|s| format!("uchild-e{}-{s:06}.bin", fence.epoch))
             .collect(),
     )
@@ -1070,11 +1216,13 @@ pub(crate) async fn run_disk_units<B: Backend>(
         let env = env.clone();
         let work_dir = work_dir.clone();
         let snapshot = snapshot.clone();
+        let loc_shards = Arc::clone(&non_empty_loc_shards);
         let lock = Arc::clone(&lock);
         move |b, u_lease| {
             let env_c = env.clone();
             let dir = work_dir.clone();
             let snap_c = snapshot.clone();
+            let loc_shards_c = Arc::clone(&loc_shards);
             let guard = lock.clone();
             async move {
                 let (mut id_refs, mut locs) = env_c
@@ -1088,8 +1236,8 @@ pub(crate) async fn run_disk_units<B: Backend>(
                             let id_refs =
                                 read_bucket_id_refs(&dir.join(format!("idref-e{ep}-{b:06}.bin")))?;
                             let mut locs = Vec::with_capacity(id_refs.len());
-                            for s in 0..coarse_shards {
-                                if s.is_multiple_of(64) {
+                            for (idx, &s) in loc_shards_c.iter().enumerate() {
+                                if idx.is_multiple_of(64) {
                                     check()?;
                                 }
                                 read_indexed_locations_slice(
@@ -1138,7 +1286,7 @@ pub(crate) async fn run_disk_units<B: Backend>(
                     total_kv_count += kvs.len() as u64;
                     total_kv_lt.add_assign(kv_lt);
                     total_loc_lt.add_assign(loc_lt);
-                    env_c.commit_unit_kvs(u_lease.as_ref(), b, kvs).await?;
+                    env_c.commit_unit_kvs(u_lease.as_ref(), kvs).await?;
                 }
 
                 Ok(UnitOutput {
@@ -1190,30 +1338,78 @@ pub(crate) async fn run_disk_units<B: Backend>(
         }
     }
 
-    let total_partitions = leaf_partitions + internal_parts;
-    let split_keys =
-        build_validation_split_keys(index.logical_index_id(), &plan, total_entries, hard_limits)?;
-    seal_loaded(
+    finalize_and_seal_loaded(
         context,
         index,
         fence,
+        &plan,
+        hard_limits,
         scatter_records,
         total_trees,
-        total_partitions,
+        leaf_partitions + internal_parts,
         total_entries,
         expected_kv_lthash,
-        split_keys,
         retry,
+        &mut report,
     )
     .await?;
-
-    report.records = scatter_records;
-    report.trees = total_trees;
-    report.partitions = total_partitions;
-    report.entries = total_entries;
     report.scratch_written_bytes = quota.written();
     report.peak_scratch_bytes = quota.peak();
     Ok(report)
+}
+
+fn compute_non_empty_runs_by_shard(
+    dir: &Path,
+    ep: u64,
+    scatter_units: u32,
+    coarse_shards: u32,
+    manifest: &IndexManifest,
+    plan: &ShardPlan,
+    ctrl: &OperationOptions,
+) -> Result<Vec<NonEmptyRunSources>> {
+    let mut totals = vec![0_u64; coarse_shards as usize];
+    let mut per_run_non_empty: Vec<Vec<usize>> = Vec::with_capacity(scatter_units as usize);
+    for run in 0..scatter_units {
+        if run.is_multiple_of(64) {
+            crate::runtime::check_control(ctrl)?;
+        }
+        let c = read_shard_counts(
+            &dir.join(format!("cnt-e{ep}-{run:06}.bin")),
+            coarse_shards as usize,
+        )?;
+        let mut run_origins = Vec::new();
+        for (orig, v) in c.into_iter().enumerate() {
+            if v > 0 {
+                totals[orig] = totals[orig].checked_add(v).ok_or_else(corrupt)?;
+                run_origins.push(orig);
+            }
+        }
+        per_run_non_empty.push(run_origins);
+    }
+    let kernel = VectorKernel::new(
+        manifest.config().dimension(),
+        manifest.config().metric(),
+        *manifest.rotation_seed(),
+    )?;
+    let remap = compute_shard_remap(
+        &kernel,
+        plan,
+        &totals,
+        u64::from(manifest.config().min_leaf_partition_entries()),
+        u64::from(manifest.config().max_leaf_partition_entries()),
+    );
+    let mut by_dst: Vec<NonEmptyRunSources> = vec![Vec::new(); coarse_shards as usize];
+    for (run_idx, origins) in per_run_non_empty.into_iter().enumerate() {
+        let run_u32 = run_idx as u32;
+        for orig in origins {
+            let dst = remap[orig] as usize;
+            match by_dst[dst].last_mut() {
+                Some((last_run, list)) if *last_run == run_u32 => list.push(orig),
+                _ => by_dst[dst].push((run_u32, vec![orig])),
+            }
+        }
+    }
+    Ok(by_dst)
 }
 
 async fn reclaim_files<B: Backend>(
@@ -1247,244 +1443,175 @@ async fn reclaim_files<B: Backend>(
     .await
 }
 
-async fn mark_loading_started<B: Backend>(env: &StageEnv<B>) -> Result<()> {
-    let id = env.manifest.logical_index_id();
-    let mut attempts = 0;
-    loop {
-        crate::runtime::check_control(&env.control)?;
-        let _sched_guard = match &env.sched_lease_lock {
-            Some(l) => Some(l.read().await),
-            None => None,
-        };
-        let prepared = async {
-            let mut txn = WriteLogicalTxn::bootstrap(
-                env.backend.begin_write().await?,
-                env.backend.hard_limits(),
-                env.backend.admission_budget(),
-            );
-            building_in_flight(&mut txn, &env.manifest).await?;
-            authorize_raw(&mut txn, id, env.bulk_authority).await?;
-            check_lane_fence(&mut txn, &env.manifest, env.fence, 0).await?;
-            if let Some(PersistentValue::BuildProgress(mut p)) =
-                txn.get_for_update(LogicalKey::BuildProgress(id)).await?
-                && p.epoch == env.fence.epoch
-                && p.phase == BuildPhase::Preparing
-            {
-                p.phase = BuildPhase::Loading;
-                txn.put(
-                    LogicalKey::BuildProgress(id),
-                    PersistentValue::BuildProgress(p),
-                )
-                .await?;
-                return Ok(Some(txn));
-            }
-            txn.rollback().await;
-            Ok::<_, Error>(None)
-        }
-        .await;
-        let txn_opt = match prepared {
-            Ok(v) => v,
-            Err(e) if e.kind() == ErrorKind::RetryableAbort => {
-                drop(_sched_guard);
-                env.retry
-                    .wait_or_exhaust(Operation::RunBulkBuild, &mut attempts)
-                    .await?;
-                continue;
-            }
-            Err(e) => return Err(e),
-        };
-        let Some(txn) = txn_opt else {
-            return Ok(());
-        };
-        match txn.commit().await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                drop(_sched_guard);
-                env.retry
-                    .after_commit_error(Operation::RunBulkBuild, &mut attempts, e)
-                    .await?;
-            }
-        }
+/// Checks whether a collaborative `BuildUnit` stage has already been 100% completed in KV
+/// so late or racing workers skip reading intermediate files reclaimed by ahead peers.
+async fn is_stage_complete<B: Backend>(
+    env: &StageEnv<B>,
+    stage: u8,
+    unit_count: u32,
+) -> Result<bool> {
+    if unit_count == 0 {
+        return Ok(true);
     }
+    if env.distributed_workers <= 1 {
+        return Ok(false);
+    }
+    let id = env.manifest.logical_index_id();
+    let epoch = env.fence.epoch();
+    let range = LogicalRange::build_units(id, stage);
+    retry_read(&env.control, env.fence.operation(), env.retry, || {
+        let backend = Arc::clone(&env.backend);
+        let range_ref = &range;
+        async move {
+            let mut rtxn = ReadLogicalTxn::bootstrap(backend.begin_read().await?);
+            let mut cursor = None;
+            let mut seen_complete = 0_u32;
+            loop {
+                let page = rtxn
+                    .scan(
+                        range_ref,
+                        cursor.as_ref(),
+                        ScanLimits {
+                            item_limit: 1024,
+                            byte_limit: 512 * 1024,
+                        },
+                    )
+                    .await?;
+                for item in page.items() {
+                    let PersistentValue::BuildUnit(u) = item.value() else {
+                        return Err(corrupt());
+                    };
+                    if u.epoch != epoch || !u.complete {
+                        return Ok(false);
+                    }
+                    seen_complete += 1;
+                }
+                cursor = page.into_next_cursor();
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            Ok(seen_complete == unit_count)
+        }
+    })
+    .await
 }
 
-async fn bump_single_worker_progress<B: Backend>(env: &StageEnv<B>, delta: u64) -> Result<()> {
-    if delta == 0 {
-        return Ok(());
-    }
-    let _sched_guard = match &env.sched_lease_lock {
-        Some(l) => Some(l.read().await),
-        None => None,
-    };
-    let id = env.manifest.logical_index_id();
-    let mut txn = WriteLogicalTxn::bootstrap(
-        env.backend.begin_write().await?,
-        env.backend.hard_limits(),
-        env.backend.admission_budget(),
-    );
-    if building_in_flight(&mut txn, &env.manifest).await.is_err()
-        || authorize_raw(&mut txn, id, env.bulk_authority)
-            .await
-            .is_err()
-        || check_lane_fence(&mut txn, &env.manifest, env.fence, 0)
-            .await
-            .is_err()
-    {
-        txn.rollback().await;
-        return Ok(());
-    }
-    if let Some(PersistentValue::BuildProgress(mut p)) =
-        txn.get_for_update(LogicalKey::BuildProgress(id)).await?
-        && p.epoch == env.fence.epoch
-        && matches!(p.phase, BuildPhase::Preparing | BuildPhase::Loading)
-    {
-        p.phase = BuildPhase::Loading;
-        p.loaded_entries = p.loaded_entries.saturating_add(delta);
-        if p.loaded_entries > p.total_entries {
-            p.total_entries = p.loaded_entries;
-        }
-        if txn
-            .put(
-                LogicalKey::BuildProgress(id),
-                PersistentValue::BuildProgress(p),
-            )
-            .await
-            .is_ok()
-        {
-            let _ = txn.commit().await;
-            return Ok(());
-        }
-    }
-    txn.rollback().await;
-    Ok(())
-}
-
-async fn init_stage_units<B: Backend>(env: &StageEnv<B>, stage: u8, unit_count: u32) -> Result<()> {
+pub(crate) async fn init_stage_units<B: Backend>(
+    env: &StageEnv<B>,
+    stage: u8,
+    unit_count: u32,
+) -> Result<()> {
     if unit_count == 0 {
         return Ok(());
     }
-    if env.distributed_workers == 1 {
-        if stage >= STAGE_EMIT_LEAVES {
-            mark_loading_started(env).await?;
+    if env.distributed_workers == 1 && !env.persist_single_worker {
+        if let StageFence::Write(wf) = env.fence
+            && stage >= STAGE_EMIT_LEAVES
+        {
+            advance_loading_progress(
+                env.backend.as_ref(),
+                &env.control,
+                env.sched_lease_lock.as_deref(),
+                env.bulk_authority,
+                &env.manifest,
+                wf,
+                0,
+                Some(env.retry),
+            )
+            .await?;
         }
         return Ok(());
     }
     let id = env.manifest.logical_index_id();
+    let epoch = env.fence.epoch();
+    let op = env.fence.operation();
     let max_per_txn = env.budget.max_mutations.saturating_sub(4).clamp(1, 512) as u32;
     for batch_start in (0..unit_count).step_by(max_per_txn as usize) {
         let batch_end = (batch_start + max_per_txn).min(unit_count);
-        let mut attempts = 0;
-        loop {
-            crate::runtime::check_control(&env.control)?;
-            let _sched_guard = match &env.sched_lease_lock {
-                Some(l) => Some(l.read().await),
-                None => None,
-            };
-            let prepared = async {
-                let mut txn = WriteLogicalTxn::bootstrap(
-                    env.backend.begin_write().await?,
-                    env.backend.hard_limits(),
-                    env.backend.admission_budget(),
-                );
-                let mut warm = Vec::with_capacity((batch_end - batch_start) as usize + 5);
-                warm.push(LogicalKey::Manifest(id));
-                warm.push(LogicalKey::BuildUnit {
-                    index: id,
-                    stage: super::STAGE_FENCE,
-                    unit: 0,
-                });
-                warm.push(LogicalKey::BuildSchedule(id));
-                if let Some(auth) = env.bulk_authority {
-                    warm.push(auth.slot_key(id));
-                }
-                if batch_start == 0 && stage >= STAGE_EMIT_LEAVES {
-                    warm.push(LogicalKey::BuildProgress(id));
-                }
-                for u in batch_start..batch_end {
-                    warm.push(LogicalKey::BuildUnit {
-                        index: id,
-                        stage,
-                        unit: u,
-                    });
-                }
-                txn.warm_for_update(warm).await?;
+        retry_raw_write(
+            &env.control,
+            env.sched_lease_lock.as_deref(),
+            op,
+            env.retry,
+            || async {
+                let prepared = async {
+                    let mut txn = WriteLogicalTxn::bootstrap(
+                        env.backend.begin_write().await?,
+                        env.backend.hard_limits(),
+                        env.backend.admission_budget(),
+                    );
+                    let mut warm = env.fence.warm_keys(id, env.bulk_authority, None);
+                    if batch_start == 0
+                        && matches!(env.fence, StageFence::Write(_))
+                        && stage >= STAGE_EMIT_LEAVES
+                    {
+                        warm.push(LogicalKey::BuildProgress(id));
+                    }
+                    for u in batch_start..batch_end {
+                        warm.push(LogicalKey::BuildUnit {
+                            index: id,
+                            stage,
+                            unit: u,
+                        });
+                    }
+                    txn.warm_for_update(warm).await?;
 
-                building_in_flight(&mut txn, &env.manifest).await?;
-                authorize_raw(&mut txn, id, env.bulk_authority).await?;
-                check_lane_fence(&mut txn, &env.manifest, env.fence, 0).await?;
+                    env.fence.check(&mut txn, &env.manifest).await?;
+                    authorize_raw(&mut txn, id, env.bulk_authority).await?;
 
-                let mut any_written = false;
-                if batch_start == 0
-                    && stage >= STAGE_EMIT_LEAVES
-                    && let Some(PersistentValue::BuildProgress(mut p)) =
-                        txn.get_for_update(LogicalKey::BuildProgress(id)).await?
-                    && p.epoch == env.fence.epoch
-                    && p.phase == BuildPhase::Preparing
-                {
-                    p.phase = BuildPhase::Loading;
-                    txn.put(
-                        LogicalKey::BuildProgress(id),
-                        PersistentValue::BuildProgress(p),
-                    )
-                    .await?;
-                    any_written = true;
-                }
-                for u in batch_start..batch_end {
-                    let ukey = LogicalKey::BuildUnit {
-                        index: id,
-                        stage,
-                        unit: u,
-                    };
-                    match txn.get_for_update(ukey.clone()).await? {
-                        Some(PersistentValue::BuildUnit(existing))
-                            if existing.epoch == env.fence.epoch => {}
-                        _ => {
-                            txn.put(
-                                ukey,
-                                PersistentValue::BuildUnit(BuildUnit::unclaimed(env.fence.epoch)),
-                            )
-                            .await?;
-                            any_written = true;
+                    let mut any_written = false;
+                    if batch_start == 0
+                        && matches!(env.fence, StageFence::Write(_))
+                        && stage >= STAGE_EMIT_LEAVES
+                        && let Some(PersistentValue::BuildProgress(mut p)) =
+                            txn.get_for_update(LogicalKey::BuildProgress(id)).await?
+                        && p.epoch == epoch
+                        && p.phase == BuildPhase::Preparing
+                    {
+                        p.phase = BuildPhase::Loading;
+                        txn.put(
+                            LogicalKey::BuildProgress(id),
+                            PersistentValue::BuildProgress(p),
+                        )
+                        .await?;
+                        any_written = true;
+                    }
+                    for u in batch_start..batch_end {
+                        let ukey = LogicalKey::BuildUnit {
+                            index: id,
+                            stage,
+                            unit: u,
+                        };
+                        match txn.get_for_update(ukey.clone()).await? {
+                            Some(PersistentValue::BuildUnit(existing))
+                                if existing.epoch == epoch => {}
+                            _ => {
+                                txn.put(
+                                    ukey,
+                                    PersistentValue::BuildUnit(BuildUnit::unclaimed(epoch)),
+                                )
+                                .await?;
+                                any_written = true;
+                            }
                         }
                     }
+                    if !any_written {
+                        txn.rollback().await;
+                        return Ok::<_, Error>((None, ()));
+                    }
+                    Ok((Some(txn), ()))
                 }
-                if !any_written {
-                    txn.rollback().await;
-                    return Ok::<_, Error>(None);
-                }
-                Ok(Some(txn))
-            }
-            .await;
-
-            let txn_opt = match prepared {
-                Ok(v) => v,
-                Err(e) if e.kind() == ErrorKind::RetryableAbort => {
-                    drop(_sched_guard);
-                    env.retry
-                        .wait_or_exhaust(Operation::RunBulkBuild, &mut attempts)
-                        .await?;
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-            let Some(txn) = txn_opt else {
-                break;
-            };
-            match txn.commit().await {
-                Ok(()) => break,
-                Err(e) => {
-                    drop(_sched_guard);
-                    env.retry
-                        .after_commit_error(Operation::RunBulkBuild, &mut attempts, e)
-                        .await?;
-                }
-            }
-        }
+                .await;
+                commit_raw_prepared(prepared).await
+            },
+        )
+        .await?;
     }
     Ok(())
 }
 
-async fn drive_stage<B, F, Fut>(
+pub(crate) async fn drive_stage<B, F, Fut>(
     env: &StageEnv<B>,
     stage: u8,
     unit_count: u32,
@@ -1502,8 +1629,6 @@ where
     let work = Arc::new(work);
     let worker_conc = concurrency.max(1).min(unit_count as usize);
 
-    // Single-worker fast path: process units in strict ascending order via an in-process
-    // atomic cursor with writer-lane fencing and zero `BuildUnit` KV transactions.
     if env.distributed_workers == 1 {
         let next_unit = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let mut tasks = tokio::task::JoinSet::<Result<Vec<(u32, BuildUnit)>>>::new();
@@ -1512,6 +1637,7 @@ where
             let env_c = env.clone();
             let work_c = Arc::clone(&work);
             tasks.spawn(async move {
+                let task_token = non_zero_token()?;
                 let mut local_done = Vec::new();
                 loop {
                     crate::runtime::check_control(&env_c.control)?;
@@ -1519,11 +1645,35 @@ where
                     if u >= unit_count {
                         return Ok(local_done);
                     }
-                    let out = work_c(u, None).await?;
-                    if out.kv_count > 0 && env_c.unit_lease >= Duration::from_millis(50) {
-                        bump_single_worker_progress(&env_c, out.kv_count).await?;
+                    if env_c.persist_single_worker
+                        && let Some(done) = read_completed_unit(&env_c, stage, u).await?
+                    {
+                        local_done.push((u, done));
+                        continue;
                     }
-                    let mut bu = BuildUnit::unclaimed(env_c.fence.epoch);
+                    let out = work_c(u, None).await?;
+                    if let StageFence::Write(wf) = env_c.fence
+                        && out.kv_count > 0
+                        && env_c.unit_lease >= Duration::from_millis(50)
+                    {
+                        advance_loading_progress(
+                            env_c.backend.as_ref(),
+                            &env_c.control,
+                            env_c.sched_lease_lock.as_deref(),
+                            env_c.bulk_authority,
+                            &env_c.manifest,
+                            wf,
+                            out.kv_count,
+                            None,
+                        )
+                        .await?;
+                    }
+                    let mut bu = BuildUnit::unclaimed(env_c.fence.epoch());
+                    bu.owner = if env_c.persist_single_worker {
+                        task_token
+                    } else {
+                        [0; 32]
+                    };
                     bu.complete = true;
                     bu.records = out.records;
                     bu.kv_count = out.kv_count;
@@ -1531,6 +1681,16 @@ where
                     bu.kv_lthash = out.kv_lthash;
                     bu.aux_lthash = out.aux_lthash;
                     bu.aux2_lthash = out.aux2_lthash;
+                    if env_c.persist_single_worker {
+                        let unit_lease = UnitLease {
+                            stage,
+                            unit: u,
+                            owner: task_token,
+                            duration: env_c.unit_lease,
+                            lock: Arc::new(tokio::sync::Mutex::new(())),
+                        };
+                        complete_unit(&env_c, &unit_lease, out, false).await?;
+                    }
                     local_done.push((u, bu));
                 }
             });
@@ -1571,8 +1731,7 @@ where
             let env_c = env.clone();
             let work_c = Arc::clone(&work);
             tasks.spawn(async move {
-                let mut task_token = [0_u8; 32];
-                getrandom::fill(&mut task_token).map_err(|_| Error::new(ErrorKind::Other))?;
+                let task_token = non_zero_token()?;
                 loop {
                     crate::runtime::check_control(&env_c.control)?;
                     let next_u = q.lock().unwrap_or_else(|e| e.into_inner()).next();
@@ -1598,7 +1757,7 @@ where
                             work_c(unit, Some(unit_lease.clone())),
                         )
                         .await?;
-                        complete_unit(&env_c, &unit_lease, out).await
+                        complete_unit(&env_c, &unit_lease, out, true).await
                     }
                     .await;
                     match outcome {
@@ -1607,8 +1766,6 @@ where
                             check_epoch_still_active(&env_c).await?;
                         }
                         Err(e) => {
-                            // If a peer reclaimed our expired unit lease, completed this unit,
-                            // and deleted prior-stage scratch files, ignore the stale local error.
                             if is_unit_completed_by_peer(&env_c, stage, unit).await? {
                                 continue;
                             }
@@ -1624,65 +1781,76 @@ where
     }
 }
 
+async fn read_completed_unit<B: Backend>(
+    env: &StageEnv<B>,
+    stage: u8,
+    unit: u32,
+) -> Result<Option<BuildUnit>> {
+    let id = env.manifest.logical_index_id();
+    let epoch = env.fence.epoch();
+    retry_read(&env.control, env.fence.operation(), env.retry, || {
+        let backend = Arc::clone(&env.backend);
+        async move {
+            let mut rtxn = ReadLogicalTxn::bootstrap(backend.begin_read().await?);
+            match rtxn
+                .get(LogicalKey::BuildUnit {
+                    index: id,
+                    stage,
+                    unit,
+                })
+                .await?
+            {
+                Some(PersistentValue::BuildUnit(u)) if u.complete && u.epoch == epoch => {
+                    Ok(Some(u))
+                }
+                _ => Ok(None),
+            }
+        }
+    })
+    .await
+}
+
 async fn is_unit_completed_by_peer<B: Backend>(
     env: &StageEnv<B>,
     stage: u8,
     unit: u32,
 ) -> Result<bool> {
     check_epoch_still_active(env).await?;
-    let id = env.manifest.logical_index_id();
-    let mut rtxn = ReadLogicalTxn::bootstrap(env.backend.begin_read().await?);
-    if let Some(PersistentValue::BuildUnit(u)) = rtxn
-        .get(LogicalKey::BuildUnit {
-            index: id,
-            stage,
-            unit,
-        })
-        .await?
-        && u.epoch == env.fence.epoch
-        && u.complete
-    {
-        return Ok(true);
-    }
-    Ok(false)
+    Ok(read_completed_unit(env, stage, unit).await?.is_some())
 }
 
 async fn check_epoch_still_active<B: Backend>(env: &StageEnv<B>) -> Result<()> {
-    let mut attempts = 0;
-    loop {
-        crate::runtime::check_control(&env.control)?;
-        let _sched_guard = match &env.sched_lease_lock {
-            Some(l) => Some(l.read().await),
-            None => None,
-        };
-        let res = async {
-            let mut txn = WriteLogicalTxn::bootstrap(
-                env.backend.begin_write().await?,
-                env.backend.hard_limits(),
-                env.backend.admission_budget(),
-            );
-            check_lane_fence(&mut txn, &env.manifest, env.fence, 0).await?;
-            authorize_raw(
-                &mut txn,
-                env.manifest.logical_index_id(),
-                env.bulk_authority,
-            )
-            .await?;
-            txn.rollback().await;
-            Ok::<_, Error>(())
-        }
-        .await;
-        match res {
-            Ok(()) => return Ok(()),
-            Err(e) if e.kind() == ErrorKind::RetryableAbort => {
-                drop(_sched_guard);
-                env.retry
-                    .wait_or_exhaust(Operation::RunBulkBuild, &mut attempts)
-                    .await?;
+    retry_raw_write(
+        &env.control,
+        env.sched_lease_lock.as_deref(),
+        env.fence.operation(),
+        env.retry,
+        || async {
+            let res: Result<()> = async {
+                let mut txn = WriteLogicalTxn::bootstrap(
+                    env.backend.begin_write().await?,
+                    env.backend.hard_limits(),
+                    env.backend.admission_budget(),
+                );
+                env.fence.check(&mut txn, &env.manifest).await?;
+                authorize_raw(
+                    &mut txn,
+                    env.manifest.logical_index_id(),
+                    env.bulk_authority,
+                )
+                .await?;
+                txn.rollback().await;
+                Ok(())
             }
-            Err(e) => return Err(e),
-        }
-    }
+            .await;
+            match res {
+                Ok(()) => CommitStep::Done(()),
+                Err(e) if e.kind() == ErrorKind::RetryableAbort => CommitStep::PrepareAbort,
+                Err(e) => CommitStep::Fatal(e),
+            }
+        },
+    )
+    .await
 }
 
 async fn scan_stage_status<B: Backend>(
@@ -1692,6 +1860,8 @@ async fn scan_stage_status<B: Backend>(
     known_complete: &mut BTreeSet<u32>,
 ) -> Result<(Vec<u32>, Option<Vec<BuildUnit>>)> {
     let id = env.manifest.logical_index_id();
+    let epoch = env.fence.epoch();
+    let op = env.fence.operation();
     let range = LogicalRange::build_units(id, stage);
     let mut attempts = 0;
 
@@ -1751,7 +1921,7 @@ async fn scan_stage_status<B: Backend>(
                     let PersistentValue::BuildUnit(u) = item.value().clone() else {
                         return Err(corrupt());
                     };
-                    if u.epoch != env.fence.epoch {
+                    if u.epoch != epoch {
                         return Err(Error::new(ErrorKind::BulkBuildSuperseded));
                     }
                     if u.complete {
@@ -1779,9 +1949,7 @@ async fn scan_stage_status<B: Backend>(
         match res {
             Ok(v) => return Ok(v),
             Err(e) if e.kind() == ErrorKind::RetryableAbort => {
-                env.retry
-                    .wait_or_exhaust(Operation::RunBulkBuild, &mut attempts)
-                    .await?;
+                env.retry.wait_or_exhaust(op, &mut attempts).await?;
             }
             Err(e) => return Err(e),
         }
@@ -1795,45 +1963,34 @@ async fn try_claim_unit<B: Backend>(
     owner: [u8; 32],
 ) -> Result<Option<u64>> {
     let id = env.manifest.logical_index_id();
+    let epoch = env.fence.epoch();
+    let op = env.fence.operation();
     let ukey = LogicalKey::BuildUnit {
         index: id,
         stage,
         unit,
     };
-    let lane = unit % super::FENCE_LANES;
     let mut attempts = 0;
     loop {
         crate::runtime::check_control(&env.control)?;
-        let _sched_guard = match &env.sched_lease_lock {
-            Some(l) => Some(l.read().await),
-            None => None,
-        };
+        let _sched_guard = lock_sched_read(&env.sched_lease_lock).await;
         let prepared = async {
             let mut txn = WriteLogicalTxn::bootstrap(
                 env.backend.begin_write().await?,
                 env.backend.hard_limits(),
                 env.backend.admission_budget(),
             );
-            let mut warm = vec![
-                LogicalKey::Manifest(id),
-                LogicalKey::BuildUnit {
-                    index: id,
-                    stage: super::STAGE_FENCE,
-                    unit: lane,
-                },
-                LogicalKey::BuildSchedule(id),
-                ukey.clone(),
-            ];
-            if let Some(auth) = env.bulk_authority {
-                warm.push(auth.slot_key(id));
-            }
-            txn.warm_for_update(warm).await?;
+            txn.warm_for_update(
+                env.fence
+                    .warm_keys(id, env.bulk_authority, Some(ukey.clone())),
+            )
+            .await?;
 
-            check_lane_fence(&mut txn, &env.manifest, env.fence, lane).await?;
+            env.fence.check(&mut txn, &env.manifest).await?;
             authorize_raw(&mut txn, id, env.bulk_authority).await?;
             let now = now_ms()?;
             let mut u = match txn.get_for_update(ukey.clone()).await? {
-                Some(PersistentValue::BuildUnit(u)) if u.epoch == env.fence.epoch => u,
+                Some(PersistentValue::BuildUnit(u)) if u.epoch == epoch => u,
                 Some(PersistentValue::BuildUnit(_)) => {
                     return Err(Error::new(ErrorKind::BulkBuildSuperseded));
                 }
@@ -1888,9 +2045,7 @@ async fn try_claim_unit<B: Backend>(
             }
             Err(e) => {
                 drop(_sched_guard);
-                env.retry
-                    .after_commit_error(Operation::RunBulkBuild, &mut attempts, e)
-                    .await?;
+                env.retry.after_commit_error(op, &mut attempts, e).await?;
             }
         }
     }
@@ -1932,12 +2087,9 @@ async fn renew_unit<B: Backend>(
     let Ok(_guard) = lease.lock.try_lock() else {
         return Ok(());
     };
-    let _sched_guard = match &env.sched_lease_lock {
-        Some(l) => Some(l.read().await),
-        None => None,
-    };
+    let _sched_guard = lock_sched_read(&env.sched_lease_lock).await;
     let id = env.manifest.logical_index_id();
-    let lane = lease.unit % super::FENCE_LANES;
+    let epoch = env.fence.epoch();
     let ukey = LogicalKey::BuildUnit {
         index: id,
         stage: lease.stage,
@@ -1949,25 +2101,16 @@ async fn renew_unit<B: Backend>(
             env.backend.hard_limits(),
             env.backend.admission_budget(),
         );
-        let mut warm = vec![
-            LogicalKey::Manifest(id),
-            LogicalKey::BuildUnit {
-                index: id,
-                stage: super::STAGE_FENCE,
-                unit: lane,
-            },
-            LogicalKey::BuildSchedule(id),
-            ukey.clone(),
-        ];
-        if let Some(auth) = env.bulk_authority {
-            warm.push(auth.slot_key(id));
-        }
-        txn.warm_for_update(warm).await?;
-        check_lane_fence(&mut txn, &env.manifest, env.fence, lane).await?;
+        txn.warm_for_update(
+            env.fence
+                .warm_keys(id, env.bulk_authority, Some(ukey.clone())),
+        )
+        .await?;
+        env.fence.check(&mut txn, &env.manifest).await?;
         authorize_raw(&mut txn, id, env.bulk_authority).await?;
         match txn.get_for_update(ukey.clone()).await? {
             Some(PersistentValue::BuildUnit(mut u))
-                if u.epoch == env.fence.epoch && u.owner == lease.owner && !u.complete =>
+                if u.epoch == epoch && u.owner == lease.owner && !u.complete =>
             {
                 let next_exp = u.expires_ms.max(expiry(env.unit_lease)?);
                 u.expires_ms = next_exp;
@@ -2005,94 +2148,71 @@ async fn complete_unit<B: Backend>(
     env: &StageEnv<B>,
     lease: &UnitLease,
     out: UnitOutput,
+    require_owner: bool,
 ) -> Result<()> {
     let id = env.manifest.logical_index_id();
-    let lane = lease.unit % super::FENCE_LANES;
+    let epoch = env.fence.epoch();
     let ukey = LogicalKey::BuildUnit {
         index: id,
         stage: lease.stage,
         unit: lease.unit,
     };
-    let mut attempts = 0;
-    loop {
-        crate::runtime::check_control(&env.control)?;
-        let _sched_guard = match &env.sched_lease_lock {
-            Some(l) => Some(l.read().await),
-            None => None,
-        };
-        let _guard = lease.lock.lock().await;
-        let prepared = async {
-            let mut txn = WriteLogicalTxn::bootstrap(
-                env.backend.begin_write().await?,
-                env.backend.hard_limits(),
-                env.backend.admission_budget(),
-            );
-            let mut warm = vec![
-                LogicalKey::Manifest(id),
-                LogicalKey::BuildUnit {
-                    index: id,
-                    stage: super::STAGE_FENCE,
-                    unit: lane,
-                },
-                LogicalKey::BuildSchedule(id),
-                ukey.clone(),
-            ];
-            if let Some(auth) = env.bulk_authority {
-                warm.push(auth.slot_key(id));
-            }
-            txn.warm_for_update(warm).await?;
-
-            check_lane_fence(&mut txn, &env.manifest, env.fence, lane).await?;
-            authorize_raw(&mut txn, id, env.bulk_authority).await?;
-            let mut u = match txn.get_for_update(ukey.clone()).await? {
-                Some(PersistentValue::BuildUnit(u)) if u.epoch == env.fence.epoch => u,
-                _ => return Err(Error::new(ErrorKind::BulkBuildSuperseded)),
-            };
-            if u.complete && u.owner == lease.owner {
-                txn.rollback().await;
-                return Ok(None);
-            }
-            if u.complete || u.owner != lease.owner {
-                return Err(Error::new(ErrorKind::BulkBuildSuperseded));
-            }
-            u.complete = true;
-            u.records = out.records;
-            u.kv_count = out.kv_count;
-            u.aux_count = out.aux_count;
-            u.kv_lthash = out.kv_lthash;
-            u.aux_lthash = out.aux_lthash;
-            u.aux2_lthash = out.aux2_lthash;
-            txn.put(ukey.clone(), PersistentValue::BuildUnit(u)).await?;
-            Ok(Some(txn))
-        }
-        .await;
-
-        let txn_opt = match prepared {
-            Ok(v) => v,
-            Err(e) if e.kind() == ErrorKind::RetryableAbort => {
-                drop(_guard);
-                drop(_sched_guard);
-                env.retry
-                    .wait_or_exhaust(Operation::RunBulkBuild, &mut attempts)
+    retry_raw_write(
+        &env.control,
+        env.sched_lease_lock.as_deref(),
+        env.fence.operation(),
+        env.retry,
+        || {
+            let ukey = ukey.clone();
+            async move {
+                let _guard = lease.lock.lock().await;
+                let prepared = async {
+                    let mut txn = WriteLogicalTxn::bootstrap(
+                        env.backend.begin_write().await?,
+                        env.backend.hard_limits(),
+                        env.backend.admission_budget(),
+                    );
+                    txn.warm_for_update(env.fence.warm_keys(
+                        id,
+                        env.bulk_authority,
+                        Some(ukey.clone()),
+                    ))
                     .await?;
-                continue;
+
+                    env.fence.check(&mut txn, &env.manifest).await?;
+                    authorize_raw(&mut txn, id, env.bulk_authority).await?;
+                    let mut u = match txn.get_for_update(ukey.clone()).await? {
+                        Some(PersistentValue::BuildUnit(u)) if u.epoch == epoch => u,
+                        Some(PersistentValue::BuildUnit(_)) => {
+                            return Err(Error::new(ErrorKind::BulkBuildSuperseded));
+                        }
+                        _ if !require_owner => return Err(corrupt()),
+                        _ => return Err(Error::new(ErrorKind::BulkBuildSuperseded)),
+                    };
+                    if u.complete && (!require_owner || u.owner == lease.owner) {
+                        txn.rollback().await;
+                        return Ok((None, ()));
+                    }
+                    if require_owner && (u.complete || u.owner != lease.owner) {
+                        return Err(Error::new(ErrorKind::BulkBuildSuperseded));
+                    }
+                    u.owner = lease.owner;
+                    u.complete = true;
+                    u.records = out.records;
+                    u.kv_count = out.kv_count;
+                    u.aux_count = out.aux_count;
+                    u.kv_lthash = out.kv_lthash;
+                    u.aux_lthash = out.aux_lthash;
+                    u.aux2_lthash = out.aux2_lthash;
+                    txn.put(ukey, PersistentValue::BuildUnit(u)).await?;
+                    Ok((Some(txn), ()))
+                }
+                .await;
+                commit_raw_prepared(prepared).await
             }
-            Err(e) => return Err(e),
-        };
-        let Some(txn) = txn_opt else {
-            return Ok(());
-        };
-        match txn.commit().await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                drop(_guard);
-                drop(_sched_guard);
-                env.retry
-                    .after_commit_error(Operation::RunBulkBuild, &mut attempts, e)
-                    .await?;
-            }
-        }
-    }
+        },
+    )
+    .await
 }
 
 // ============================================================================
@@ -2117,18 +2237,8 @@ fn propose_disk_shard(
     check: &(dyn Fn() -> Result<()> + Sync),
 ) -> Result<u64> {
     check()?;
-    let (src_state, _) = read_compact_shard_state(
-        &dir.join(format!("base-e{epoch}-{src_shard:06}.bin")),
-        &dir.join(format!("mem-e{epoch}-r{round}-{src_shard:06}.bin")),
-        &dir.join(format!("inb-e{epoch}-r{round}-{src_shard:06}.bin")),
-        manifest,
-    )?;
+    let (src_state, _) = read_shard_state(dir, epoch, round, src_shard, manifest)?;
     if src_state.leaves.is_empty() {
-        write_proposals(
-            &dir.join(format!("prop-e{epoch}-r{round}-{src_shard:06}.bin")),
-            &[],
-            quota,
-        )?;
         return Ok(0);
     }
 
@@ -2155,11 +2265,13 @@ fn propose_disk_shard(
         },
     )?;
 
-    write_proposals(
-        &dir.join(format!("prop-e{epoch}-r{round}-{src_shard:06}.bin")),
-        &proposals,
-        quota,
-    )?;
+    if !proposals.is_empty() {
+        write_proposals(
+            &dir.join(format!("prop-e{epoch}-r{round}-{src_shard:06}.bin")),
+            &proposals,
+            quota,
+        )?;
+    }
     Ok(proposals.len() as u64)
 }
 
@@ -2170,10 +2282,15 @@ struct DiskAcceptedMoves {
     donors_by_dst: Vec<Vec<u32>>,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "arbitration combines round identity, per-shard proposal counts, manifest, plan, memory ceiling, and cancellation"
+)]
 fn arbitrate_disk_round(
     dir: &Path,
     epoch: u64,
     round: u8,
+    prop_counts: &[u64],
     manifest: &IndexManifest,
     plan: &ShardPlan,
     memory_budget_bytes: usize,
@@ -2196,6 +2313,9 @@ fn arbitrate_disk_round(
             .shard_start
             .checked_add(heavy.shard_count)
             .ok_or_else(corrupt)?;
+        if prop_counts[start..start + count].iter().all(|&c| c == 0) {
+            continue;
+        }
         let mut leaf_offsets = Vec::with_capacity(count + 1);
         let mut shard_leaf_counts = Vec::with_capacity(count);
         let mut counts = Vec::new();
@@ -2206,7 +2326,8 @@ fn arbitrate_disk_round(
             if local_s.is_multiple_of(32) {
                 check()?;
             }
-            let s = (start + local_s) as u32;
+            let s_usize = start + local_s;
+            let s = s_usize as u32;
             let centers = read_shard_centers(
                 &dir.join(format!("centers-e{epoch}-r{round}-{s:06}.bin")),
                 manifest,
@@ -2216,15 +2337,20 @@ fn arbitrate_disk_round(
                 counts.push(mc);
             }
             leaf_offsets.push(counts.len());
-            let shard_props =
-                read_proposals(&dir.join(format!("prop-e{epoch}-r{round}-{s:06}.bin")))?;
-            used_mem = used_mem
-                .saturating_add(shard_props.len().saturating_mul(96))
-                .saturating_add(shard_leaf_counts[local_s].saturating_mul(16));
+            let expected_props = *prop_counts.get(s_usize).ok_or_else(corrupt)?;
+            used_mem = used_mem.saturating_add(shard_leaf_counts[local_s].saturating_mul(16));
+            if expected_props > 0 {
+                let shard_props =
+                    read_proposals(&dir.join(format!("prop-e{epoch}-r{round}-{s:06}.bin")))?;
+                if shard_props.len() as u64 != expected_props {
+                    return Err(corrupt());
+                }
+                used_mem = used_mem.saturating_add(shard_props.len().saturating_mul(96));
+                proposals.extend(shard_props);
+            }
             if used_mem > memory_budget_bytes.max(64 * 1024) {
                 return Err(Error::new(ErrorKind::LimitExceeded));
             }
-            proposals.extend(shard_props);
         }
         if proposals.is_empty() || counts.len() < 2 {
             continue;
@@ -2320,12 +2446,7 @@ fn extract_disk_outbound(
     if cross_out.is_empty() {
         return Ok(());
     }
-    let (state, _) = read_compact_shard_state(
-        &dir.join(format!("base-e{epoch}-{src_shard:06}.bin")),
-        &dir.join(format!("mem-e{epoch}-r{round}-{src_shard:06}.bin")),
-        &dir.join(format!("inb-e{epoch}-r{round}-{src_shard:06}.bin")),
-        manifest,
-    )?;
+    let (state, _) = read_shard_state(dir, epoch, round, src_shard, manifest)?;
     check()?;
     let mut by_dst = vec![Vec::new(); heavy_shards];
     for (&dst_s, list) in cross_out {
@@ -2356,12 +2477,7 @@ fn apply_disk_shard(
     check: &(dyn Fn() -> Result<()> + Sync),
 ) -> Result<()> {
     check()?;
-    let (mut shard, base_count) = read_compact_shard_state(
-        &dir.join(format!("base-e{epoch}-{shard_id:06}.bin")),
-        &dir.join(format!("mem-e{epoch}-r{round}-{shard_id:06}.bin")),
-        &dir.join(format!("inb-e{epoch}-r{round}-{shard_id:06}.bin")),
-        manifest,
-    )?;
+    let (mut shard, base_count) = read_shard_state(dir, epoch, round, shard_id, manifest)?;
     let moved_out = acc.outbound.get(shard_id as usize).ok_or_else(corrupt)?;
     let donors = acc
         .donors_by_dst
@@ -2451,17 +2567,16 @@ fn apply_disk_shard(
         }
     }
 
-    let next_r = round + 1;
-    write_compact_shard_state(
-        &dir.join(format!("mem-e{epoch}-r{next_r}-{shard_id:06}.bin")),
-        &dir.join(format!("centers-e{epoch}-r{next_r}-{shard_id:06}.bin")),
-        &dir.join(format!("inb-e{epoch}-r{next_r}-{shard_id:06}.bin")),
+    write_shard_state(
+        dir,
+        epoch,
+        round + 1,
+        shard_id,
         manifest,
         &shard,
         base_count,
         quota,
-    )?;
-    Ok(())
+    )
 }
 
 fn assign_disk_leaf_keys(
@@ -2489,5 +2604,5 @@ fn assign_disk_leaf_keys(
         )?;
         shard_tks.push(tks);
     }
-    assign_leaf_partition_keys_from_trees(&shard_tks)
+    assign_leaf_partition_keys(&shard_tks, |tks| tks.iter())
 }

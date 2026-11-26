@@ -28,6 +28,25 @@ pub struct InputSnapshot {
 }
 
 impl InputSnapshot {
+    fn from_parts(
+        directory: PathBuf,
+        config: IndexConfig,
+        manifest: InputManifest,
+        segments: Vec<SegmentMeta>,
+    ) -> Self {
+        let verified_segments = (0..segments.len())
+            .map(|_| AtomicBool::new(false))
+            .collect::<Vec<_>>()
+            .into();
+        Self {
+            directory,
+            config,
+            manifest,
+            segments: Arc::from(segments),
+            verified_segments,
+        }
+    }
+
     /// Caller-owned snapshot directory used by durable build recovery.
     pub(crate) fn directory(&self) -> &Path {
         &self.directory
@@ -68,17 +87,12 @@ impl InputSnapshot {
             return Err(Error::invalid_argument());
         }
         let segments = open_segments(directory, &expected)?;
-        let verified_segments = (0..segments.len())
-            .map(|_| AtomicBool::new(false))
-            .collect::<Vec<_>>()
-            .into();
-        Ok(Self {
-            directory: directory.to_path_buf(),
+        Ok(Self::from_parts(
+            directory.to_path_buf(),
             config,
-            manifest: expected,
-            segments: Arc::from(segments),
-            verified_segments,
-        })
+            expected,
+            segments,
+        ))
     }
 
     /// Trusted identity to persist before assigning work that consumes this snapshot.
@@ -214,17 +228,12 @@ impl InputSnapshotWriter {
     /// Returns I/O or quota errors if sealing fails.
     pub fn seal(self) -> Result<InputSnapshot> {
         let (directory, manifest, segments) = self.writer.seal()?;
-        let verified_segments = (0..segments.len())
-            .map(|_| AtomicBool::new(false))
-            .collect::<Vec<_>>()
-            .into();
-        Ok(InputSnapshot {
+        Ok(InputSnapshot::from_parts(
             directory,
-            config: self.config,
+            self.config,
             manifest,
-            segments: Arc::from(segments),
-            verified_segments,
-        })
+            segments,
+        ))
     }
 }
 

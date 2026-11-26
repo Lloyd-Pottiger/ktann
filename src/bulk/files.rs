@@ -707,9 +707,13 @@ impl<'a> SegmentFileReader<'a> {
             }
             let start = (offset - self.window_offset) as usize;
             let raw = &self.window[start..start + total];
-            return verify_frame_slice(raw, body_len);
+            validate_frame_bytes(raw, body_len)?;
+            return Ok(Bytes::copy_from_slice(&raw[4..4 + body_usize]));
         }
-        read_verified_frame_at(file, offset, body_len)
+        let mut buf = vec![0_u8; total];
+        read_at_exact(file, &mut buf, offset)?;
+        validate_frame_bytes(&buf, body_len)?;
+        Ok(Bytes::from(buf).slice(4..4 + body_usize))
     }
 }
 
@@ -741,7 +745,7 @@ fn verify_whole_segment(
     Ok(())
 }
 
-fn read_at_exact(file: &File, buf: &mut [u8], offset: u64) -> Result<()> {
+pub(crate) fn read_at_exact(file: &File, buf: &mut [u8], offset: u64) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::FileExt;
@@ -756,7 +760,7 @@ fn read_at_exact(file: &File, buf: &mut [u8], offset: u64) -> Result<()> {
     }
 }
 
-fn verify_frame_slice(buf: &[u8], body_len: u32) -> Result<Bytes> {
+fn validate_frame_bytes(buf: &[u8], body_len: u32) -> Result<()> {
     let body_usize = body_len as usize;
     if u32::from_be_bytes(buf[..4].try_into().expect("frame len")) != body_len {
         return Err(corrupt());
@@ -765,33 +769,7 @@ fn verify_frame_slice(buf: &[u8], body_len: u32) -> Result<Bytes> {
     if <[u8; 32]>::from(Sha256::digest(body)) != buf[4 + body_usize..] {
         return Err(corrupt());
     }
-    Ok(Bytes::copy_from_slice(body))
-}
-
-/// Reads and SHA-256-verifies one record frame at `frame_offset` without mutating file cursors.
-pub(crate) fn read_verified_frame_at(
-    file: &File,
-    frame_offset: u64,
-    body_len: u32,
-) -> Result<Bytes> {
-    let body_usize = body_len as usize;
-    if frame_offset < HEADER_BYTES || body_usize == 0 || body_usize > MAX_VALUE_BYTES {
-        return Err(corrupt());
-    }
-    let total = 4_usize
-        .checked_add(body_usize)
-        .and_then(|n| n.checked_add(32))
-        .ok_or_else(corrupt)?;
-    let mut buf = vec![0_u8; total];
-    read_at_exact(file, &mut buf, frame_offset)?;
-    if u32::from_be_bytes(buf[..4].try_into().expect("frame len")) != body_len {
-        return Err(corrupt());
-    }
-    let body = &buf[4..4 + body_usize];
-    if <[u8; 32]>::from(Sha256::digest(body)) != buf[4 + body_usize..] {
-        return Err(corrupt());
-    }
-    Ok(Bytes::from(buf).slice(4..4 + body_usize))
+    Ok(())
 }
 
 /// Writes a workspace file atomically via a sibling temporary file, syncing both the

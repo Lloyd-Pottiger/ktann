@@ -262,7 +262,7 @@ SLA for every accepted configuration.
 
 [Public verification](runtime-operations.md#6-verification) audits graph/source
 agreement independently of the search cache and ordinary membership/topology
-checks. [Bulk publication](bulk-build.md#5-loading-and-exact-validation) requires
+checks. [Bulk publication](bulk-build.md#4-homomorphic-multiset-verification-and-publication) requires
 the completed-load byte comparison rather than public verification alone.
 
 Wider internal partitions can reduce upper-tree routing work but increase graph

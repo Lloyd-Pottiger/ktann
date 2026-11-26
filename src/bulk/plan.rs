@@ -3,12 +3,10 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
 use std::fmt;
-use std::fs::File;
-use std::io::{BufReader, Read, Write};
 use std::path::Path;
 
 use bytes::Bytes;
-use xxhash_rust::xxh3::{Xxh3, xxh3_64, xxh3_128_with_seed};
+use xxhash_rust::xxh3::{xxh3_64, xxh3_128_with_seed};
 
 use crate::api::{Error, ErrorKind, MAX_RECORD_ID_BYTES, Result};
 use crate::construction::ConstructionOptions;
@@ -17,9 +15,12 @@ use crate::search::numeric::VectorKernel;
 use crate::storage::keys::{MAX_TREE_KEY_BYTES, TreeKey};
 use crate::storage::values::{IndexManifest, source};
 
-use super::files::{corrupt, io_error};
+use super::files::corrupt;
 use super::input::InputSnapshot;
-use super::sharded::ScratchQuota;
+use super::sharded::{
+    ScratchCursor, ScratchQuota, push_f32s, push_sized, read_checksummed_bytes,
+    write_checksummed_bytes,
+};
 
 pub(super) const SAMPLE_SEED: u64 = 0x6b74_616e_6e62_756c;
 const PLAN_MAGIC: &[u8; 8] = b"KTANNPL2";
@@ -461,49 +462,29 @@ impl ShardPlan {
             .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
         let heavy_len = u32::try_from(self.heavy_trees.len())
             .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
-        quota.write_tracked(path, |w| {
-            let mut hasher = Xxh3::new();
-            let mut write_checked = |bytes: &[u8]| -> Result<()> {
-                hasher.update(bytes);
-                w.write_all(bytes).map_err(io_error)
-            };
-            write_checked(PLAN_MAGIC)?;
-            write_checked(&(self.target_shard_rows as u64).to_be_bytes())?;
-            write_checked(&self.light_shard_start.to_be_bytes())?;
-            write_checked(&self.light_shard_count.to_be_bytes())?;
-            write_checked(&self.total_shards.to_be_bytes())?;
-            write_checked(&id_bounds_len.to_be_bytes())?;
-            for bound in &self.id_bounds {
-                let len =
-                    u32::try_from(bound.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
-                write_checked(&len.to_be_bytes())?;
-                write_checked(bound)?;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(PLAN_MAGIC);
+        buf.extend_from_slice(&(self.target_shard_rows as u64).to_be_bytes());
+        buf.extend_from_slice(&self.light_shard_start.to_be_bytes());
+        buf.extend_from_slice(&self.light_shard_count.to_be_bytes());
+        buf.extend_from_slice(&self.total_shards.to_be_bytes());
+        buf.extend_from_slice(&id_bounds_len.to_be_bytes());
+        for bound in &self.id_bounds {
+            push_sized(&mut buf, bound)?;
+        }
+        buf.extend_from_slice(&heavy_len.to_be_bytes());
+        for heavy in &self.heavy_trees {
+            let centers_len = u32::try_from(heavy.centers.len())
+                .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
+            push_sized(&mut buf, heavy.tree_key.as_bytes())?;
+            buf.extend_from_slice(&heavy.shard_start.to_be_bytes());
+            buf.extend_from_slice(&heavy.shard_count.to_be_bytes());
+            buf.extend_from_slice(&centers_len.to_be_bytes());
+            for center in &heavy.centers {
+                push_f32s(&mut buf, center)?;
             }
-            write_checked(&heavy_len.to_be_bytes())?;
-            for heavy in &self.heavy_trees {
-                let tk = heavy.tree_key.as_bytes();
-                let tk_len =
-                    u32::try_from(tk.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
-                let centers_len = u32::try_from(heavy.centers.len())
-                    .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
-                write_checked(&tk_len.to_be_bytes())?;
-                write_checked(tk)?;
-                write_checked(&heavy.shard_start.to_be_bytes())?;
-                write_checked(&heavy.shard_count.to_be_bytes())?;
-                write_checked(&centers_len.to_be_bytes())?;
-                for center in &heavy.centers {
-                    for &v in center.iter() {
-                        if !v.is_finite() {
-                            return Err(corrupt());
-                        }
-                        let bits = if v == 0.0 { 0_u32 } else { v.to_bits() };
-                        write_checked(&bits.to_be_bytes())?;
-                    }
-                }
-            }
-            let checksum = hasher.digest();
-            w.write_all(&checksum.to_be_bytes()).map_err(io_error)
-        })
+        }
+        write_checksummed_bytes(path, &buf, quota)
     }
 
     /// Loads and validates a persisted plan from `workspace/{token}/plan-e{epoch}.bin`.
@@ -513,28 +494,19 @@ impl ShardPlan {
         check: &(dyn Fn() -> Result<()> + Sync),
     ) -> Result<Self> {
         check()?;
-        let file = File::open(path).map_err(io_error)?;
-        let file_len = file.metadata().map_err(io_error)?.len();
-        if file_len < 16 {
+        let raw_file = read_checksummed_bytes(path)?;
+        let file_len = raw_file.len() as u64;
+        let mut r = ScratchCursor::new(&raw_file);
+        if r.take(8)? != PLAN_MAGIC {
             return Err(corrupt());
         }
-        let body_len = file_len - 8;
-        let mut r = HashingReader {
-            inner: BufReader::new(file).take(body_len),
-            hasher: Xxh3::new(),
-        };
-        let mut magic = [0_u8; 8];
-        r.read_exact(&mut magic).map_err(io_error)?;
-        if &magic != PLAN_MAGIC {
-            return Err(corrupt());
-        }
-        let target_shard_rows = usize::try_from(read_u64(&mut r)?).map_err(|_| corrupt())?;
+        let target_shard_rows = usize::try_from(r.u64()?).map_err(|_| corrupt())?;
         if target_shard_rows == 0 {
             return Err(corrupt());
         }
-        let light_shard_start = read_u32(&mut r)?;
-        let light_shard_count = read_u32(&mut r)?;
-        let total_shards = read_u32(&mut r)?;
+        let light_shard_start = r.u32()?;
+        let light_shard_count = r.u32()?;
+        let total_shards = r.u32()?;
         if (total_shards as usize) > MAX_TOTAL_SHARDS
             || light_shard_count > MAX_LIGHT_SHARDS
             || light_shard_start.checked_add(light_shard_count) != Some(total_shards)
@@ -542,28 +514,22 @@ impl ShardPlan {
             return Err(corrupt());
         }
 
-        let id_bounds_len = read_u32(&mut r)? as usize;
+        let id_bounds_len = r.u32()? as usize;
         if id_bounds_len > MAX_ID_BUCKETS {
             return Err(corrupt());
         }
         let mut id_bounds = Vec::with_capacity(id_bounds_len);
         for _ in 0..id_bounds_len {
-            let len = read_u32(&mut r)? as usize;
-            if len == 0 || len > MAX_RECORD_ID_BYTES {
-                return Err(corrupt());
-            }
-            let mut buf = vec![0_u8; len];
-            r.read_exact(&mut buf).map_err(io_error)?;
-            id_bounds.push(Bytes::from(buf));
+            let bound = r.non_empty_bytes(MAX_RECORD_ID_BYTES)?;
+            id_bounds.push(bound);
         }
-        if id_bounds.windows(2).any(|w| w[0] >= w[1]) {
-            return Err(corrupt());
-        }
-        if total_shards == 0 && !id_bounds.is_empty() {
+        if id_bounds.windows(2).any(|w| w[0] >= w[1])
+            || (total_shards == 0 && !id_bounds.is_empty())
+        {
             return Err(corrupt());
         }
 
-        let heavy_len = read_u32(&mut r)? as usize;
+        let heavy_len = r.u32()? as usize;
         if heavy_len > MAX_TOTAL_SHARDS / 2 {
             return Err(corrupt());
         }
@@ -578,22 +544,16 @@ impl ShardPlan {
 
         for _ in 0..heavy_len {
             check()?;
-            let tk_len = read_u32(&mut r)? as usize;
-            if tk_len > MAX_TREE_KEY_BYTES {
-                return Err(corrupt());
-            }
-            let mut tk_buf = vec![0_u8; tk_len];
-            r.read_exact(&mut tk_buf).map_err(io_error)?;
-            let tree_key = TreeKey::from_encoded(tree_types, Bytes::from(tk_buf))?;
+            let tree_key = TreeKey::from_encoded(tree_types, r.bytes(MAX_TREE_KEY_BYTES)?)?;
             if let Some(prev) = heavy_trees.last()
                 && prev.tree_key.as_bytes() >= tree_key.as_bytes()
             {
                 return Err(corrupt());
             }
 
-            let shard_start = read_u32(&mut r)?;
-            let shard_count = read_u32(&mut r)?;
-            let centers_len = read_u32(&mut r)? as usize;
+            let shard_start = r.u32()?;
+            let shard_count = r.u32()?;
+            let centers_len = r.u32()? as usize;
             if shard_start != expected_shard_start
                 || shard_count < 2
                 || centers_len != shard_count as usize
@@ -603,27 +563,16 @@ impl ShardPlan {
             }
             expected_shard_start = expected_shard_start
                 .checked_add(shard_count)
+                .filter(|&end| end <= light_shard_start)
                 .ok_or_else(corrupt)?;
-            if expected_shard_start > light_shard_start {
-                return Err(corrupt());
-            }
 
             let mut centers = Vec::with_capacity(centers_len);
-            let mut raw = vec![0_u8; center_bytes];
             for c_idx in 0..centers_len {
                 if c_idx.is_multiple_of(256) {
                     check()?;
                 }
-                r.read_exact(&mut raw).map_err(io_error)?;
-                let mut vec = Vec::with_capacity(dim);
-                for b in raw.as_chunks::<4>().0 {
-                    let bits = u32::from_be_bytes(*b);
-                    let val = f32::from_bits(bits);
-                    if !val.is_finite() || bits == 0x8000_0000 {
-                        return Err(corrupt());
-                    }
-                    vec.push(val);
-                }
+                let mut vec = vec![0.0_f32; dim];
+                r.f32s_into(&mut vec)?;
                 centers.push(vec.into_boxed_slice());
             }
             let (super_centers, super_children) = build_super_index(&kernel, &centers, check)?;
@@ -636,25 +585,12 @@ impl ShardPlan {
                 super_children,
             });
         }
-        if expected_shard_start != light_shard_start {
-            return Err(corrupt());
-        }
-        if config.tree_key_fields().is_empty() && heavy_trees.len() > 1 {
-            return Err(corrupt());
-        }
-        let mut extra = [0_u8; 1];
-        if r.read(&mut extra).map_err(io_error)? != 0 {
-            return Err(corrupt());
-        }
-        let actual_digest = r.hasher.digest();
-        let mut inner = r.inner.into_inner();
-        let mut expected_b = [0_u8; 8];
-        inner.read_exact(&mut expected_b).map_err(io_error)?;
-        if u64::from_be_bytes(expected_b) != actual_digest
-            || inner.read(&mut extra).map_err(io_error)? != 0
+        if expected_shard_start != light_shard_start
+            || (config.tree_key_fields().is_empty() && heavy_trees.len() > 1)
         {
             return Err(corrupt());
         }
+        r.finish()?;
         Ok(Self {
             id_bounds,
             heavy_trees,
@@ -666,29 +602,25 @@ impl ShardPlan {
     }
 }
 
-struct HashingReader<R> {
-    inner: R,
-    hasher: Xxh3,
-}
-
-impl<R: Read> Read for HashingReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        self.hasher.update(&buf[..n]);
-        Ok(n)
+fn score_batch_4(kernel: &VectorKernel, vector: &[f32], batch: &[&[f32]]) -> [f64; 4] {
+    match *batch {
+        [a, b, c, d] => kernel.routing_distances_validated([a, b, c, d], vector),
+        [a, b, c] => {
+            let d = kernel.routing_distances_validated([a, b, c], vector);
+            [d[0], d[1], d[2], f64::INFINITY]
+        }
+        [a, b] => {
+            let d = kernel.routing_distances_validated([a, b], vector);
+            [d[0], d[1], f64::INFINITY, f64::INFINITY]
+        }
+        [a] => [
+            kernel.routing_distances_validated([vector], a)[0],
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::INFINITY,
+        ],
+        _ => [f64::INFINITY; 4],
     }
-}
-
-fn read_u32(r: &mut impl Read) -> Result<u32> {
-    let mut b = [0_u8; 4];
-    r.read_exact(&mut b).map_err(io_error)?;
-    Ok(u32::from_be_bytes(b))
-}
-
-fn read_u64(r: &mut impl Read) -> Result<u64> {
-    let mut b = [0_u8; 8];
-    r.read_exact(&mut b).map_err(io_error)?;
-    Ok(u64::from_be_bytes(b))
 }
 
 pub(crate) fn nearest_center(
@@ -699,24 +631,11 @@ pub(crate) fn nearest_center(
     let mut best = 0;
     let mut best_dist = f64::INFINITY;
     for (chunk_idx, chunk) in centers.chunks(4).enumerate() {
-        let dists = match chunk {
-            [a, b, c, d] => kernel.routing_distances_validated([a, b, c, d], vector),
-            [a, b, c] => {
-                let d = kernel.routing_distances_validated([a, b, c], vector);
-                [d[0], d[1], d[2], f64::INFINITY]
-            }
-            [a, b] => {
-                let d = kernel.routing_distances_validated([a, b], vector);
-                [d[0], d[1], f64::INFINITY, f64::INFINITY]
-            }
-            [a] => [
-                kernel.routing_distances_validated([vector], a)[0],
-                f64::INFINITY,
-                f64::INFINITY,
-                f64::INFINITY,
-            ],
-            _ => unreachable!("nonempty chunk"),
-        };
+        let mut refs: [&[f32]; 4] = [&[]; 4];
+        for (dst, c) in refs.iter_mut().zip(chunk) {
+            *dst = c;
+        }
+        let dists = score_batch_4(kernel, vector, &refs[..chunk.len()]);
         for (lane, candidate) in dists.into_iter().take(chunk.len()).enumerate() {
             if candidate.total_cmp(&best_dist).is_lt() {
                 best = chunk_idx * 4 + lane;
@@ -736,42 +655,11 @@ fn nearest_indexed_center(
     let mut best = indices[0];
     let mut best_dist = f64::INFINITY;
     for chunk in indices.chunks(4) {
-        let dists = match *chunk {
-            [a, b, c, d] => kernel.routing_distances_validated(
-                [
-                    &centers[a as usize],
-                    &centers[b as usize],
-                    &centers[c as usize],
-                    &centers[d as usize],
-                ],
-                vector,
-            ),
-            [a, b, c] => {
-                let d = kernel.routing_distances_validated(
-                    [
-                        &centers[a as usize],
-                        &centers[b as usize],
-                        &centers[c as usize],
-                    ],
-                    vector,
-                );
-                [d[0], d[1], d[2], f64::INFINITY]
-            }
-            [a, b] => {
-                let d = kernel.routing_distances_validated(
-                    [&centers[a as usize], &centers[b as usize]],
-                    vector,
-                );
-                [d[0], d[1], f64::INFINITY, f64::INFINITY]
-            }
-            [a] => [
-                kernel.routing_distances_validated([vector], &centers[a as usize])[0],
-                f64::INFINITY,
-                f64::INFINITY,
-                f64::INFINITY,
-            ],
-            _ => unreachable!("nonempty chunk"),
-        };
+        let mut refs: [&[f32]; 4] = [&[]; 4];
+        for (dst, &idx) in refs.iter_mut().zip(chunk) {
+            *dst = &centers[idx as usize];
+        }
+        let dists = score_batch_4(kernel, vector, &refs[..chunk.len()]);
         for (&idx, candidate) in chunk.iter().zip(dists) {
             if candidate.total_cmp(&best_dist).is_lt()
                 || (candidate.total_cmp(&best_dist).is_eq() && idx < best)

@@ -138,7 +138,7 @@ peak (`records * (4 * dim + 140)` bytes plus shard/halo working sets) fits insid
      levels (`level >= 2`), invokes `build_internal_graph` directly on the
      in-memory `&[ChildEntry]` slice without intermediate serialization, and
      emits `TreeManifest`, internal partition KVs, `GraphDescriptor`, and
-     `GraphChunk`s around `encode_leaf_shard_opts`, which expands
+     `GraphChunk`s around `encode_leaf_shard`, which expands
      `PartitionSynopsis` inline and emits canonical `Header`, `Synopsis`,
      `State`, `Centroid`, and `LeafEntry` KV bytes in ascending
      `(tree_key, leaf_pk)` order so local LSM backends flush non-overlapping
@@ -156,26 +156,28 @@ uses **stage-fenced `BuildUnit`s** (`src/runtime/bulk_disk.rs`):
   `owner: [u8; 32]` and `expires_ms`. Workers claim unclaimed or lease-expired
   units in randomized order (ascending order when `distributed_workers == 1` for
   sequential LSM writes), renew leases every `unit_lease / 3` after verifying
-  writer-lane fencing, fence KV chunk commits against `(epoch, lane, unit_owner)`,
+  `BuildWorkspace` writer fencing, fence KV chunk commits against `(epoch, writer_token, unit_owner)`,
   and write tracked intermediate files (`ids-*`, `vec-*`, `cnt-*`, `base-*`,
-  `mem-*`, `centers-*`, `prop-*`, `outb-*`, `inb-*`, `loc-*`, `uchild-*`) via
+  `mem-*`, `centers-*`, `prop-*`, `outb-*`, `inb-*`, `leafkeys-*`, `loc-*`, `uchild-*`) via
   unique-temp-file + `sync_all` + atomic `rename` + parent directory sync.
   `STAGE_LEAVES` consolidates per-segment scatter chunks into one immutable
   `base-e{epoch}-{shard:06}.bin` file per shard and immediately reclaims
   `vec-*`/`cnt-*`; refinement rounds persist compact 4-byte member indices
-  (`mem-*`) and moved delta vectors (`outb-*` / `inb-*`), `uchild-*` embeds a
+  (`mem-*`) and moved delta vectors (`outb-*` / `inb-*`), `leafkeys-e{epoch}.bin`
+  persists deterministic leaf key assignments before emission, `uchild-*` embeds a
   64-entry `tree_bucket` offset index so `STAGE_EMIT_TREES` seeks only its target
   bucket slice, and `RaBitQ7` is computed once during `STAGE_EMIT_LEAVES`.
 
-### 3.3 Transaction Sizing and Multi-Lane Fencing
+### 3.3 Transaction Sizing and Pipelined Writer Fencing
 
 `BulkLoadOptions::default()` allows up to `5,000` mutations and `4 MiB` of
 logical KV bytes per write transaction, additionally capped at `8 MiB` of
 estimated FoundationDB affected bytes (`3 * key_bytes + value_bytes + 64` per
 mutation plus conflict ranges) and the adapter's `AdmissionBudget`. Mutations
-are routed to 16 independent fence lanes (`STAGE_FENCE`, `unit = 0..16`) with
-read-before-write warming so concurrent async writers pipeline CPU encoding with
-backend commits without serializing on a single progress key.
+are pipelined across up to 16 concurrent writer tasks that read-protect
+`BuildWorkspace.writer_token` with read-before-write warming so concurrent async
+writers overlap CPU encoding with backend commits without conflicting with one
+another or serializing on a single progress key.
 
 ## 4. Homomorphic Multiset Verification and Publication
 
@@ -196,8 +198,8 @@ heavy-tree partition ranges).
 
 `job.publish()` executes frozen backend validation (`src/runtime/bulk_publish.rs`):
 
-1. **Freeze writer lanes**: `begin_validation` atomically transitions
-   `BuildProgress` to `Validating`, deletes all `STAGE_FENCE` lane records
+1. **Freeze writers**: `begin_validation` atomically transitions
+   `BuildProgress` to `Validating`, clears `BuildWorkspace.writer_token`
    (permanently fencing any late worker transaction), and creates
    `STAGE_VALIDATE (40)` slice `BuildUnit`s.
 2. **Collaborative slice verification**: Workers claim incomplete

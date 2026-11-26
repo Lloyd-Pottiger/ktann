@@ -1,4 +1,4 @@
-//! Per-unit worker lease, writer-lane fence, and homomorphic multiset digest record.
+//! Per-unit worker lease and homomorphic multiset digest record.
 
 use std::fmt;
 
@@ -8,7 +8,7 @@ use crate::bulk::LtHash;
 use super::corrupt;
 use super::wire::{Decoder, Encoder};
 
-/// Persistent lease and completion digest for one `BuildUnit` or writer-fence lane.
+/// Persistent lease and completion digest for one `BuildUnit`.
 #[derive(Clone, Eq, PartialEq)]
 pub struct BuildUnit {
     pub(crate) epoch: u64,
@@ -29,21 +29,6 @@ impl BuildUnit {
             epoch,
             owner: [0; 32],
             expires_ms: 0,
-            complete: false,
-            records: 0,
-            kv_count: 0,
-            aux_count: 0,
-            kv_lthash: LtHash::ZERO,
-            aux_lthash: LtHash::ZERO,
-            aux2_lthash: LtHash::ZERO,
-        }
-    }
-
-    pub(crate) const fn fence_lane(epoch: u64, owner: [u8; 32]) -> Self {
-        Self {
-            epoch,
-            owner,
-            expires_ms: u64::MAX,
             complete: false,
             records: 0,
             kv_count: 0,

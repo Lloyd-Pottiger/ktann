@@ -221,10 +221,10 @@ same phases under renewable single-worker or collaborative multi-slot ownership.
 
 **Build Progress**: The index-scoped authoritative state record (`LogicalKey::BuildProgress`) for one `Building` Logical Index. It tracks the current `BuildPhase` (`Preparing`, `Loading`, `Loaded`, `Validating`), attempt epoch, topology counts, expected 512-bit homomorphic multiset digest (`LtHash`, wrapping `8 x u64` SHA-512 words), and parallel validation split keys.
 
-**Build Unit**: One stage-scoped unit of collaborative work, writer-lane fencing, or validation slice (`LogicalKey::BuildUnit { index, stage, unit }`). Each unit binds the build epoch, a renewable worker owner token and expiry, completion status, item counts, and 512-bit `LtHash` multiset digests for Record ID deduplication, exact `Location == LeafEntry` membership, `ChildEntry == Centroid` closure, and emitted serving KV inventory.
+**Build Unit**: One stage-scoped unit of collaborative work or validation slice (`LogicalKey::BuildUnit { index, stage, unit }`). Each unit binds the build epoch, a renewable worker owner token and expiry, completion status, item counts, and 512-bit `LtHash` multiset digests for Record ID deduplication, exact `Location == LeafEntry` membership, `ChildEntry == Centroid` closure, and emitted serving KV inventory.
 
 **Build Workspace**: Namespace-scoped durable ownership of one job's token-named
-preparation directory, worker options, epoch, and terminal failure.
+preparation directory, worker options, active writer-fence token, epoch, and terminal failure.
 It survives removal of the index prefix until exclusive-lock cleanup completes.
 
 **Build Schedule**: Namespace-scoped durable request for automatic execution of

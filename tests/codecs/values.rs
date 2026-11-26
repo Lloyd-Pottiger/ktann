@@ -1028,6 +1028,7 @@ fn bulk_workspace_golden_and_malformed_ownership() {
     }
     let token_offset = golden.len();
     golden.extend_from_slice(&[1; 32]);
+    golden.extend_from_slice(&[2; 32]); // writer_token
     golden.extend_from_slice(&1_u64.to_be_bytes());
     golden.push(0);
     let value = codec.decode(&key, Bytes::from(golden.clone())).unwrap();

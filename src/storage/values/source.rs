@@ -124,14 +124,6 @@ pub(crate) fn split_serving_bytes(
     Ok((id, tree_key, fields_bytes, record_bytes, payload_bytes))
 }
 
-/// Encodes canonical `fields` bytes matching `VectorRecord`'s field trailer for `LtHash` binding.
-pub(crate) fn encode_fields_bytes(config: &IndexConfig, fields: &[Value]) -> Result<Vec<u8>> {
-    let mut encoder = Encoder::new(ValueKind::VectorRecord);
-    encode_fields(&mut encoder, config.fields(), fields)?;
-    let framed = encoder.finish()?;
-    Ok(framed[1..].to_vec())
-}
-
 /// Encodes `(Record ID, typed fields)` for temporary coarse-shard spill files.
 pub(crate) fn encode_row_meta(
     config: &IndexConfig,

@@ -90,7 +90,7 @@ impl<B: Backend> Runtime<B> {
         let config = input.config().clone();
         let preparation = construction.into();
         let construction = preparation.construction;
-        construction.resident_rows(&config)?;
+        construction.validate_for(&config)?;
         let source =
             std::path::absolute(input.directory()).map_err(|_| Error::invalid_argument())?;
         let descriptor = crate::storage::values::BuildDescriptor::new(
@@ -496,6 +496,28 @@ impl<B: Backend> OperationContext<B> {
             .take()
             .unwrap_or_else(CommitStart::uncontrolled);
         commit(start).await
+    }
+
+    /// Commits an optional prepared write transaction through [`OperationContext::commit`],
+    /// classifying prepare-time aborts separately from commit-time errors for retry loops.
+    pub(crate) async fn commit_prepared<W, T>(
+        &mut self,
+        prepared: Result<(Option<crate::storage::WriteLogicalTxn<'_, W>>, T)>,
+    ) -> bulk_worker::CommitStep<T>
+    where
+        W: crate::storage::backend::WriteTxn,
+    {
+        match prepared {
+            Ok((None, out)) => bulk_worker::CommitStep::Done(out),
+            Ok((Some(txn), out)) => match self.commit(|start| txn.commit_with(start)).await {
+                Ok(()) => bulk_worker::CommitStep::Done(out),
+                Err(e) => bulk_worker::CommitStep::CommitFailed(e),
+            },
+            Err(e) if e.kind() == ErrorKind::RetryableAbort => {
+                bulk_worker::CommitStep::PrepareAbort
+            }
+            Err(e) => bulk_worker::CommitStep::Fatal(e),
+        }
     }
 }
 

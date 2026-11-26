@@ -22,7 +22,7 @@ pub enum BuildPhase {
     Loading,
     /// All serving KV entries and expected multiset digests are sealed.
     Loaded,
-    /// Writer lanes are revoked and parallel slice validation is in progress.
+    /// Writers are revoked and parallel slice validation is in progress.
     Validating,
 }
 

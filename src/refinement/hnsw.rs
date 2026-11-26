@@ -174,48 +174,27 @@ pub(super) fn neighbors_parallel(
                 for (offset, retained) in slice.iter_mut().enumerate() {
                     let source = base + offset;
                     let q_vec = leaves[source].center();
+                    let center = |node: u32| leaves[node as usize].center();
                     let query_distance = |_: u32, target: u32| {
-                        kernel
-                            .routing_distances_validated([q_vec], leaves[target as usize].center())
-                            [0]
+                        kernel.routing_distances_validated([q_vec], center(target))[0]
                     };
-                    let query_batch = |_: u32, nodes: &[u32], out: &mut [f64]| match nodes {
-                        [a, b, c, d] => {
-                            let scores = kernel.routing_distances_validated(
-                                [
-                                    leaves[*a as usize].center(),
-                                    leaves[*b as usize].center(),
-                                    leaves[*c as usize].center(),
-                                    leaves[*d as usize].center(),
-                                ],
-                                q_vec,
-                            );
-                            out.copy_from_slice(&scores);
-                        }
+                    let query_batch = |_: u32, nodes: &[u32], out: &mut [f64]| match *nodes {
+                        [a, b, c, d] => out.copy_from_slice(&kernel.routing_distances_validated(
+                            [center(a), center(b), center(c), center(d)],
+                            q_vec,
+                        )),
                         [a, b, c] => {
-                            let scores = kernel.routing_distances_validated(
-                                [
-                                    leaves[*a as usize].center(),
-                                    leaves[*b as usize].center(),
-                                    leaves[*c as usize].center(),
-                                ],
+                            out.copy_from_slice(&kernel.routing_distances_validated(
+                                [center(a), center(b), center(c)],
                                 q_vec,
-                            );
-                            out.copy_from_slice(&scores);
+                            ))
                         }
-                        [a, b] => {
-                            let scores = kernel.routing_distances_validated(
-                                [leaves[*a as usize].center(), leaves[*b as usize].center()],
-                                q_vec,
-                            );
-                            out.copy_from_slice(&scores);
-                        }
+                        [a, b] => out.copy_from_slice(
+                            &kernel.routing_distances_validated([center(a), center(b)], q_vec),
+                        ),
                         _ => {
                             for (dst, &node) in out.iter_mut().zip(nodes) {
-                                *dst = kernel.routing_distances_validated(
-                                    [q_vec],
-                                    leaves[node as usize].center(),
-                                )[0];
+                                *dst = kernel.routing_distances_validated([q_vec], center(node))[0];
                             }
                         }
                     };

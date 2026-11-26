@@ -4,14 +4,17 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use xxhash_rust::xxh3::{Xxh3, xxh3_64, xxh3_128_with_seed};
 
-use crate::api::{Error, ErrorKind, IndexConfig, MAX_RECORD_ID_BYTES, PartitionKey, Result, Value};
+use crate::api::{
+    DataType, Error, ErrorKind, IndexConfig, LogicalIndexId, MAX_RECORD_ID_BYTES, PartitionKey,
+    Result, Value,
+};
 use crate::maintenance::routing::kernel_for;
 use crate::refinement::{
     LeafCenter, LeafNeighbors, accept_moves, best_move, candidate_scratch_bytes, leaf_neighbors,
@@ -28,12 +31,66 @@ use crate::storage::values::{
 };
 
 use super::digest::LtHash;
-use super::files::{SegmentFileReader, corrupt, io_error, write_atomic};
+use super::files::{SegmentFileReader, corrupt, io_error, read_at_exact, write_atomic};
 use super::graphs::build_internal_graph;
 use super::input::InputSnapshot;
 use super::plan::{MAX_TOTAL_SHARDS, SAMPLE_SEED, ShardPlan, nearest_center, train_centers};
 
 pub(crate) const MAX_HALO_LEAVES_CAP: usize = 32_768;
+const LEAF_KEYS_MAGIC: &[u8; 8] = b"KTANNLK1";
+const INDEX_ENTRY_BYTES: u64 = 24; // `(offset: u64, len: u64, xxh3_64: u64)`
+
+/// Runs `f` over `workers`-bounded immutable slice chunks using scoped OS threads.
+pub(crate) fn parallel_chunks<T, R, F>(items: &[T], workers: usize, f: F) -> Result<Vec<R>>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(usize, &[T]) -> Result<R> + Sync,
+{
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    let chunk_size = items.len().div_ceil(workers.max(1)).max(1);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for (chunk_idx, chunk) in items.chunks(chunk_size).enumerate() {
+            let base = chunk_idx * chunk_size;
+            let f_ref = &f;
+            handles.push(scope.spawn(move || f_ref(base, chunk)));
+        }
+        let mut out = Vec::with_capacity(handles.len());
+        for h in handles {
+            out.push(h.join().map_err(|_| Error::new(ErrorKind::Other))??);
+        }
+        Ok(out)
+    })
+}
+
+/// Runs `f` over `workers`-bounded mutable slice chunks using scoped OS threads.
+pub(crate) fn parallel_chunks_mut<T, R, F>(items: &mut [T], workers: usize, f: F) -> Result<Vec<R>>
+where
+    T: Send,
+    R: Send,
+    F: Fn(usize, &mut [T]) -> Result<R> + Sync,
+{
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    let chunk_size = items.len().div_ceil(workers.max(1)).max(1);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for (chunk_idx, chunk) in items.chunks_mut(chunk_size).enumerate() {
+            let base = chunk_idx * chunk_size;
+            let f_ref = &f;
+            handles.push(scope.spawn(move || f_ref(base, chunk)));
+        }
+        let mut out = Vec::with_capacity(handles.len());
+        for h in handles {
+            out.push(h.join().map_err(|_| Error::new(ErrorKind::Other))??);
+        }
+        Ok(out)
+    })
+}
 
 #[derive(Default)]
 struct QuotaState {
@@ -45,59 +102,12 @@ struct QuotaState {
 }
 
 /// Tracks simultaneous and cumulative workspace disk bytes against `scratch_bytes`,
-/// accounting exact bytes written to temporary files *before* `fs::rename` so failed writes
-/// never spike sibling threads or unlink already-published canonical paths.
+/// reserving exact temporary-file bytes before writing and reconciling on `fs::rename`
+/// so failed writes never spike sibling threads or unlink already-published canonical paths.
 #[derive(Default)]
 pub(crate) struct ScratchQuota {
     limit: u64,
     state: Mutex<QuotaState>,
-}
-
-pub(crate) struct QuotaWriter<'a, W> {
-    inner: W,
-    quota: &'a ScratchQuota,
-    dir: Option<PathBuf>,
-    charged: u64,
-    unflushed: u64,
-    written: u64,
-}
-
-impl<W: Write> QuotaWriter<'_, W> {
-    fn reserve_more(&mut self, delta: u64) -> std::io::Result<()> {
-        self.quota
-            .reserve_temp_bytes(delta, self.dir.as_deref())
-            .map_err(|_| std::io::Error::other("scratch quota exceeded"))?;
-        self.charged += delta;
-        Ok(())
-    }
-}
-
-impl<W: Write> Write for QuotaWriter<'_, W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let len = buf.len() as u64;
-        let next_unflushed = self
-            .unflushed
-            .checked_add(len)
-            .ok_or_else(|| std::io::Error::other("scratch quota overflow"))?;
-        if next_unflushed > 64 * 1024 {
-            self.reserve_more(next_unflushed)?;
-            self.unflushed = 0;
-        } else {
-            self.unflushed = next_unflushed;
-        }
-        let n = self.inner.write(buf)?;
-        self.written += n as u64;
-        Ok(n)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        if self.unflushed > 0 {
-            let rem = self.unflushed;
-            self.reserve_more(rem)?;
-            self.unflushed = 0;
-        }
-        self.inner.flush()
-    }
 }
 
 impl ScratchQuota {
@@ -126,8 +136,11 @@ impl ScratchQuota {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(io_error(e)),
             };
-            let name = entry.file_name();
-            if name.to_str().is_some_and(|s| s.starts_with('.')) {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|s| s.starts_with('.'))
+            {
                 continue;
             }
             let meta = match entry.metadata() {
@@ -201,33 +214,31 @@ impl ScratchQuota {
         Ok(())
     }
 
-    /// Verifies upfront that `total_new_bytes` will fit inside `limit` (accounting for any
-    /// existing tracked sizes at `overwritten_paths`), preventing partial multi-file writes.
+    /// Verifies upfront that `total_new_bytes` fits inside `limit` (accounting for tracked
+    /// sizes at `overwritten_paths`), preventing partial multi-file writes.
     pub(crate) fn ensure_headroom(
         &self,
         total_new_bytes: u64,
         overwritten_paths: &[&Path],
     ) -> Result<()> {
         let mut st = self.lock_state();
-        let credit: u64 = overwritten_paths
-            .iter()
-            .filter_map(|p| st.files.get(*p).copied())
-            .sum();
+        let credit = |s: &QuotaState| -> u64 {
+            overwritten_paths
+                .iter()
+                .filter_map(|p| s.files.get(*p).copied())
+                .sum()
+        };
         if st
             .live
-            .saturating_sub(credit)
+            .saturating_sub(credit(&st))
             .checked_add(total_new_bytes)
             .is_none_or(|n| n > self.limit)
         {
             let dir = overwritten_paths.first().and_then(|p| p.parent());
             self.refresh_locked(&mut st, dir)?;
-            let refreshed_credit: u64 = overwritten_paths
-                .iter()
-                .filter_map(|p| st.files.get(*p).copied())
-                .sum();
             if st
                 .live
-                .saturating_sub(refreshed_credit)
+                .saturating_sub(credit(&st))
                 .checked_add(total_new_bytes)
                 .is_none_or(|n| n > self.limit)
             {
@@ -237,63 +248,21 @@ impl ScratchQuota {
         Ok(())
     }
 
-    /// Atomically writes `path` under exact pre-rename quota tracking.
-    pub(crate) fn write_tracked(
+    /// Reserves `expected_bytes` upfront, writes `path` atomically, and reconciles live quota.
+    pub(crate) fn write_exact(
         &self,
         path: &Path,
-        write_fn: impl FnOnce(&mut QuotaWriter<'_, &mut BufWriter<File>>) -> Result<()>,
+        expected_bytes: u64,
+        write_fn: impl FnOnce(&mut BufWriter<File>) -> Result<()>,
     ) -> Result<u64> {
-        let charged = std::cell::Cell::new(0_u64);
-        let quota_exceeded = std::cell::Cell::new(false);
-        let parent_dir = path.parent().map(Path::to_path_buf);
-        let res = write_atomic(path, |w| {
-            let mut qw = QuotaWriter {
-                inner: w,
-                quota: self,
-                dir: parent_dir,
-                charged: 0,
-                unflushed: 0,
-                written: 0,
-            };
-            let body_res = write_fn(&mut qw);
-            let flush_res = if body_res.is_ok() {
-                qw.flush().map_err(|e| {
-                    if e.to_string().contains("scratch quota") {
-                        quota_exceeded.set(true);
-                        Error::new(ErrorKind::LimitExceeded)
-                    } else {
-                        io_error(e)
-                    }
-                })
-            } else {
-                Ok(())
-            };
-            charged.set(qw.charged);
-            if let Err(err) = body_res {
-                if err.kind() == ErrorKind::Backend {
-                    // Check if `QuotaWriter` triggered the underlying io::Error::other.
-                    if qw.unflushed > 0
-                        && self
-                            .reserve_temp_bytes(qw.unflushed, qw.dir.as_deref())
-                            .is_err()
-                    {
-                        return Err(Error::new(ErrorKind::LimitExceeded));
-                    }
-                }
-                return Err(err);
-            }
-            flush_res
-        });
-
-        let reserved = charged.get();
-        match res {
+        self.reserve_temp_bytes(expected_bytes, path.parent())?;
+        match write_atomic(path, write_fn) {
             Ok(actual) => {
                 let mut st = self.lock_state();
                 let old_bytes = st.files.insert(path.to_path_buf(), actual).unwrap_or(0);
-                // Reconcile `reserved` -> `actual` and subtract `old_bytes` replaced by `rename`.
                 st.live = st
                     .live
-                    .saturating_sub(reserved)
+                    .saturating_sub(expected_bytes)
                     .saturating_sub(old_bytes)
                     .saturating_add(actual);
                 st.peak = st.peak.max(st.live);
@@ -302,12 +271,8 @@ impl ScratchQuota {
             }
             Err(err) => {
                 let mut st = self.lock_state();
-                st.live = st.live.saturating_sub(reserved);
-                if quota_exceeded.get() {
-                    Err(Error::new(ErrorKind::LimitExceeded))
-                } else {
-                    Err(err)
-                }
+                st.live = st.live.saturating_sub(expected_bytes);
+                Err(err)
             }
         }
     }
@@ -348,7 +313,7 @@ pub(crate) struct ShardRows {
     pub dim: usize,
     pub rows: Vec<CompactMeta>,
     pub vectors: Vec<f32>,
-    pub slab: Option<std::sync::Arc<Vec<f32>>>,
+    pub slab: Option<Arc<Vec<f32>>>,
 }
 
 impl ShardRows {
@@ -361,7 +326,7 @@ impl ShardRows {
         }
     }
 
-    pub(crate) fn with_slab(dim: usize, slab: std::sync::Arc<Vec<f32>>) -> Self {
+    pub(crate) fn with_slab(dim: usize, slab: Arc<Vec<f32>>) -> Self {
         Self {
             dim,
             rows: Vec::new(),
@@ -410,7 +375,7 @@ pub(crate) struct SourceFrameRef {
 /// Verified Record-ID bucket entry pairing a Record ID with its immutable source frame span.
 pub(crate) type IdFrameEntry = (Bytes, SourceFrameRef);
 
-/// Output of ingesting one `InputSnapshot` segment into compact routing shards and ID buckets.
+/// Output of ingesting one `InputSnapshot` segment range into compact routing shards and ID buckets.
 pub(crate) struct SegmentIngest {
     pub records: u64,
     pub id_lthash: LtHash,
@@ -693,10 +658,117 @@ pub(crate) struct ShardState {
     pub leaves: Vec<ShardLeaf>,
 }
 
+trait PartitionItem {
+    fn sample_key(&self) -> Bytes;
+
+    fn vec(&self) -> &[f32];
+
+    fn cmp_tie(&self, other: &Self) -> Ordering;
+}
+
 #[derive(Clone, Copy)]
-struct IndexedItem {
-    label: usize,
+struct LeafMember<'a> {
+    rows: &'a ShardRows,
     row_idx: usize,
+}
+
+impl PartitionItem for LeafMember<'_> {
+    fn sample_key(&self) -> Bytes {
+        self.rows.rows[self.row_idx].id.clone()
+    }
+
+    fn vec(&self) -> &[f32] {
+        self.rows.vector(self.rows.rows[self.row_idx].vec_slot)
+    }
+
+    fn cmp_tie(&self, other: &Self) -> Ordering {
+        self.rows.rows[self.row_idx]
+            .id
+            .cmp(&other.rows.rows[other.row_idx].id)
+    }
+}
+
+impl PartitionItem for (PartitionKey, PartitionCentroid) {
+    fn sample_key(&self) -> Bytes {
+        Bytes::copy_from_slice(&self.0.get().to_be_bytes())
+    }
+
+    fn vec(&self) -> &[f32] {
+        self.1.components()
+    }
+
+    fn cmp_tie(&self, other: &Self) -> Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+/// Recursive multi-center K-means partitioner shared by initial leaf construction and
+/// bottom-up internal partition grouping.
+fn partition_recursively<T: PartitionItem>(
+    kernel: &VectorKernel,
+    sample_items: usize,
+    min_cap: u64,
+    max_cap: usize,
+    items: &mut [(usize, T)],
+    emit_group: &mut impl FnMut(&mut [(usize, T)]) -> Result<()>,
+    check: &(dyn Fn() -> Result<()> + Sync),
+) -> Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    if items.len() <= max_cap {
+        items.sort_unstable_by(|a, b| a.1.cmp_tie(&b.1));
+        return emit_group(items);
+    }
+
+    check()?;
+    let cap = sample_items.max(2);
+    let mut heap = BinaryHeap::new();
+    for (pos, (_, it)) in items.iter().enumerate() {
+        let id_bytes = it.sample_key();
+        let cand = (xxh3_128_with_seed(&id_bytes, SAMPLE_SEED), id_bytes, pos);
+        if heap.len() < cap {
+            heap.push(cand);
+        } else if heap.peek().is_some_and(|max| &cand < max) {
+            heap.pop();
+            heap.push(cand);
+        }
+    }
+    let sample: Vec<(Bytes, Box<[f32]>)> = heap
+        .into_iter()
+        .map(|(_, id_bytes, pos)| (id_bytes, Box::from(items[pos].1.vec())))
+        .collect();
+
+    let desired = (items.len() as u64).div_ceil(max_cap as u64).min(8) as usize;
+    let k = sample.len().min(desired).max(2);
+    let centers = train_centers(kernel, sample, k, 10, check)?;
+    let mut counts = vec![0_u64; centers.len()];
+    for (label, it) in items.iter_mut() {
+        *label = nearest_center(kernel, it.vec(), &centers);
+        counts[*label] += 1;
+    }
+
+    let sizes = group_sizes(&counts, min_cap);
+    let cmp = |a: &(usize, T), b: &(usize, T)| a.0.cmp(&b.0).then_with(|| a.1.cmp_tie(&b.1));
+    let mut rest = items;
+    for size in sizes {
+        let size = size as usize;
+        if size < rest.len() {
+            rest.select_nth_unstable_by(size, cmp);
+        }
+        let (child, tail) = rest.split_at_mut(size);
+        partition_recursively(
+            kernel,
+            sample_items,
+            min_cap,
+            max_cap,
+            child,
+            emit_group,
+            check,
+        )?;
+        rest = tail;
+    }
+    Ok(())
 }
 
 /// Constructs initial leaves for one Coarse Shard in memory.
@@ -723,121 +795,54 @@ pub(crate) fn build_shard_leaves(
             .push(idx);
     }
 
+    let min_leaf = u64::from(config.min_leaf_partition_entries());
+    let max_leaf = config.max_leaf_partition_entries() as usize;
     let mut leaves = Vec::new();
-    for (_, (tree_key, mut indices)) in by_tree {
-        check()?;
-        indices.sort_unstable_by(|&a, &b| rows.rows[a].id.cmp(&rows.rows[b].id));
-        if indices
-            .windows(2)
-            .any(|w| rows.rows[w[0]].id == rows.rows[w[1]].id)
-        {
-            return Err(Error::new(ErrorKind::RecordAlreadyExists));
+    {
+        let rows_ref = &rows;
+        for (_, (tree_key, mut indices)) in by_tree {
+            check()?;
+            indices.sort_unstable_by(|&a, &b| rows_ref.rows[a].id.cmp(&rows_ref.rows[b].id));
+            if indices
+                .windows(2)
+                .any(|w| rows_ref.rows[w[0]].id == rows_ref.rows[w[1]].id)
+            {
+                return Err(Error::new(ErrorKind::RecordAlreadyExists));
+            }
+            let mut tagged: Vec<(usize, LeafMember<'_>)> = indices
+                .into_iter()
+                .map(|row_idx| {
+                    (
+                        0,
+                        LeafMember {
+                            rows: rows_ref,
+                            row_idx,
+                        },
+                    )
+                })
+                .collect();
+            partition_recursively(
+                &kernel,
+                sample_items,
+                min_leaf,
+                max_leaf,
+                &mut tagged,
+                &mut |group| {
+                    let members: Vec<usize> = group.iter().map(|&(_, m)| m.row_idx).collect();
+                    let centroid = compute_leaf_centroid(&kernel, rows_ref, &members)?;
+                    leaves.push(ShardLeaf {
+                        tree_key: tree_key.clone(),
+                        centroid,
+                        members,
+                    });
+                    Ok(())
+                },
+                check,
+            )?;
         }
-        let mut items: Vec<IndexedItem> = indices
-            .into_iter()
-            .map(|row_idx| IndexedItem { label: 0, row_idx })
-            .collect();
-        group_into_leaves(
-            &kernel,
-            config,
-            sample_items,
-            &rows,
-            &tree_key,
-            &mut items,
-            &mut leaves,
-            check,
-        )?;
     }
 
     Ok(ShardState { rows, leaves })
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "recursive slice grouping passes immutable kernel/config/rows alongside output buffer"
-)]
-fn group_into_leaves(
-    kernel: &VectorKernel,
-    config: &IndexConfig,
-    sample_items: usize,
-    rows: &ShardRows,
-    tree_key: &TreeKey,
-    items: &mut [IndexedItem],
-    out: &mut Vec<ShardLeaf>,
-    check: &(dyn Fn() -> Result<()> + Sync),
-) -> Result<()> {
-    if items.is_empty() {
-        return Ok(());
-    }
-    let max_leaf = config.max_leaf_partition_entries() as usize;
-    if items.len() <= max_leaf {
-        items.sort_unstable_by(|a, b| rows.rows[a.row_idx].id.cmp(&rows.rows[b.row_idx].id));
-        let members: Vec<usize> = items.iter().map(|it| it.row_idx).collect();
-        let centroid = compute_leaf_centroid(kernel, rows, &members)?;
-        out.push(ShardLeaf {
-            tree_key: tree_key.clone(),
-            centroid,
-            members,
-        });
-        return Ok(());
-    }
-
-    check()?;
-    let cap = sample_items.max(2);
-    let mut heap = BinaryHeap::new();
-    for (pos, it) in items.iter().enumerate() {
-        let id = &rows.rows[it.row_idx].id;
-        let cand = (xxh3_128_with_seed(id, SAMPLE_SEED), id, pos);
-        if heap.len() < cap {
-            heap.push(cand);
-        } else if heap.peek().is_some_and(|max| &cand < max) {
-            heap.pop();
-            heap.push(cand);
-        }
-    }
-    let sample: Vec<(Bytes, Box<[f32]>)> = heap
-        .into_iter()
-        .map(|(_, id, pos)| {
-            let r = &rows.rows[items[pos].row_idx];
-            (id.clone(), Box::from(rows.vector(r.vec_slot)))
-        })
-        .collect();
-
-    let desired = (items.len() as u64).div_ceil(max_leaf as u64).min(8) as usize;
-    let k = sample.len().min(desired).max(2);
-    let centers = train_centers(kernel, sample, k, 10, check)?;
-    let mut counts = vec![0_u64; centers.len()];
-    for it in items.iter_mut() {
-        let vec = rows.vector(rows.rows[it.row_idx].vec_slot);
-        it.label = nearest_center(kernel, vec, &centers);
-        counts[it.label] += 1;
-    }
-    let sizes = group_sizes(&counts, u64::from(config.min_leaf_partition_entries()));
-    let cmp = |a: &IndexedItem, b: &IndexedItem| -> Ordering {
-        a.label
-            .cmp(&b.label)
-            .then_with(|| rows.rows[a.row_idx].id.cmp(&rows.rows[b.row_idx].id))
-    };
-    let mut rest = items;
-    for size in sizes {
-        let size = size as usize;
-        if size < rest.len() {
-            rest.select_nth_unstable_by(size, cmp);
-        }
-        let (child, tail) = rest.split_at_mut(size);
-        group_into_leaves(
-            kernel,
-            config,
-            sample_items,
-            rows,
-            tree_key,
-            child,
-            out,
-            check,
-        )?;
-        rest = tail;
-    }
-    Ok(())
 }
 
 /// Computes a canonical level-1 `PartitionCentroid` over preprocessed `ShardRows` members,
@@ -968,7 +973,6 @@ pub(crate) fn refine_shards_parallel(
     let kernel = VectorKernel::new(dim, config.metric(), *manifest.rotation_seed())?;
     let max_halo_leaves = admitted_leaves.min(MAX_HALO_LEAVES_CAP);
 
-    // Refine light-tree shards independently in parallel (each light tree lives in 1 shard).
     let light_start = plan.light_shard_start as usize;
     let light_end = light_start + plan.light_shard_count as usize;
     if light_end > light_start {
@@ -985,7 +989,6 @@ pub(crate) fn refine_shards_parallel(
         )?;
     }
 
-    // Refine each heavy tree across its Coarse Shards.
     for heavy in &plan.heavy_trees {
         let h_start = heavy.shard_start as usize;
         let h_end = h_start + heavy.shard_count as usize;
@@ -1088,31 +1091,22 @@ fn refine_light_shards(
         .min(light_shards.len().max(1))
         .min(max_workers);
     let per_worker_budget = memory_budget_bytes / workers;
-    let chunk_size = light_shards.len().div_ceil(workers).max(1);
-    std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for chunk in light_shards.chunks_mut(chunk_size) {
-            handles.push(scope.spawn(move || -> Result<()> {
-                for shard in chunk {
-                    refine_single_shard(
-                        kernel,
-                        shard,
-                        rounds,
-                        min_leaf,
-                        max_leaf,
-                        per_leaf,
-                        per_worker_budget,
-                        check,
-                    )?;
-                }
-                Ok(())
-            }));
-        }
-        for h in handles {
-            h.join().map_err(|_| Error::new(ErrorKind::Other))??;
+    parallel_chunks_mut(light_shards, workers, |_, chunk| {
+        for shard in chunk {
+            refine_single_shard(
+                kernel,
+                shard,
+                rounds,
+                min_leaf,
+                max_leaf,
+                per_leaf,
+                per_worker_budget,
+                check,
+            )?;
         }
         Ok(())
-    })
+    })?;
+    Ok(())
 }
 
 #[expect(
@@ -1242,53 +1236,38 @@ fn propose_global_tree_parallel(
     let neighbor_budget = memory_budget_bytes.saturating_sub(centers_bytes);
     let neighbors =
         leaf_neighbors_parallel(&check, kernel, &all_centers, parallelism, neighbor_budget)?;
-    let neighbors_ref = &neighbors;
-    let centers_ref = &all_centers;
-    let map_ref = &global_to_shard_leaf;
-    let offsets_ref = &leaf_offsets;
 
-    let chunk_size = tree_shards.len().div_ceil(parallelism.max(1)).max(1);
-    std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for (chunk_idx, chunk) in tree_shards.chunks(chunk_size).enumerate() {
-            let base_s = chunk_idx * chunk_size;
-            handles.push(scope.spawn(move || -> Result<Vec<MoveProposal>> {
-                let mut out = Vec::new();
-                for (offset_s, shard) in chunk.iter().enumerate() {
-                    check()?;
-                    let local_s = base_s + offset_s;
-                    let src_shard = shard_start + local_s as u32;
-                    let g_base = offsets_ref[local_s];
-                    for (local_l, leaf) in shard.leaves.iter().enumerate() {
-                        let g_src = g_base + local_l;
-                        for &row_idx in &leaf.members {
-                            let vec = shard.rows.vector(shard.rows.rows[row_idx].vec_slot);
-                            if let Some((gain, g_dst)) =
-                                best_move(kernel, centers_ref, g_src, vec, &neighbors_ref[g_src])
-                            {
-                                let (dst_shard, dst_local_leaf) = map_ref[g_dst];
-                                out.push(MoveProposal {
-                                    gain,
-                                    id: shard.rows.rows[row_idx].id.clone(),
-                                    src_shard,
-                                    src_local_leaf: local_l as u32,
-                                    src_row_idx: row_idx as u32,
-                                    dst_shard,
-                                    dst_local_leaf,
-                                });
-                            }
-                        }
+    let batches = parallel_chunks(tree_shards, parallelism, |base_s, chunk| {
+        let mut out = Vec::new();
+        for (offset_s, shard) in chunk.iter().enumerate() {
+            check()?;
+            let local_s = base_s + offset_s;
+            let src_shard = shard_start + local_s as u32;
+            let g_base = leaf_offsets[local_s];
+            for (local_l, leaf) in shard.leaves.iter().enumerate() {
+                let g_src = g_base + local_l;
+                for &row_idx in &leaf.members {
+                    let vec = shard.rows.vector(shard.rows.rows[row_idx].vec_slot);
+                    if let Some((gain, g_dst)) =
+                        best_move(kernel, &all_centers, g_src, vec, &neighbors[g_src])
+                    {
+                        let (dst_shard, dst_local_leaf) = global_to_shard_leaf[g_dst];
+                        out.push(MoveProposal {
+                            gain,
+                            id: shard.rows.rows[row_idx].id.clone(),
+                            src_shard,
+                            src_local_leaf: local_l as u32,
+                            src_row_idx: row_idx as u32,
+                            dst_shard,
+                            dst_local_leaf,
+                        });
                     }
                 }
-                Ok(out)
-            }));
+            }
         }
-        let mut merged = Vec::new();
-        for h in handles {
-            merged.extend(h.join().map_err(|_| Error::new(ErrorKind::Other))??);
-        }
-        Ok(merged)
-    })
+        Ok(out)
+    })?;
+    Ok(batches.into_iter().flatten().collect())
 }
 
 /// Shared single-shard halo neighborhood admission, canonical ordering, and move scoring
@@ -1433,41 +1412,30 @@ fn propose_halo_tree_parallel(
     if per_worker_budget < per_leaf.saturating_mul(2) {
         return Err(Error::new(ErrorKind::LimitExceeded));
     }
-    let chunk_size = shard_ids.len().div_ceil(workers).max(1);
-    std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for chunk in shard_ids.chunks(chunk_size) {
-            handles.push(scope.spawn(move || -> Result<Vec<MoveProposal>> {
-                let mut out = Vec::new();
-                for &src_shard in chunk {
-                    let shard_props = score_halo_shard(
-                        kernel,
-                        plan,
-                        src_shard,
-                        &all_shards[src_shard as usize],
-                        max_halo_leaves,
-                        per_leaf,
-                        per_worker_budget,
-                        check,
-                        |nbr_shard| {
-                            Ok(all_shards[nbr_shard as usize]
-                                .leaves
-                                .iter()
-                                .map(|l| l.centroid.clone())
-                                .collect())
-                        },
-                    )?;
-                    out.extend(shard_props);
-                }
-                Ok(out)
-            }));
+    let batches = parallel_chunks(&shard_ids, workers, |_, chunk| {
+        let mut out = Vec::new();
+        for &src_shard in chunk {
+            out.extend(score_halo_shard(
+                kernel,
+                plan,
+                src_shard,
+                &all_shards[src_shard as usize],
+                max_halo_leaves,
+                per_leaf,
+                per_worker_budget,
+                check,
+                |nbr_shard| {
+                    Ok(all_shards[nbr_shard as usize]
+                        .leaves
+                        .iter()
+                        .map(|l| l.centroid.clone())
+                        .collect())
+                },
+            )?);
         }
-        let mut merged = Vec::new();
-        for h in handles {
-            merged.extend(h.join().map_err(|_| Error::new(ErrorKind::Other))??);
-        }
-        Ok(merged)
-    })
+        Ok(out)
+    })?;
+    Ok(batches.into_iter().flatten().collect())
 }
 
 #[expect(
@@ -1543,133 +1511,103 @@ fn apply_tree_proposals(
         }
     }
 
-    let chunk_size = tree_shards.len().div_ceil(parallelism.max(1)).max(1);
-    let mut out_iter = outbound.into_iter();
-    let mut in_iter = inbound.into_iter();
-    let mut work_batches = Vec::new();
-    for chunk in tree_shards.chunks_mut(chunk_size) {
-        let mut sub_out = Vec::with_capacity(chunk.len());
-        let mut sub_in = Vec::with_capacity(chunk.len());
-        for _ in 0..chunk.len() {
-            sub_out.push(out_iter.next().expect("aligned outbound"));
-            sub_in.push(in_iter.next().expect("aligned inbound"));
-        }
-        work_batches.push((chunk, sub_out, sub_in));
-    }
-
-    std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for (chunk_idx, (chunk, sub_out, sub_in)) in work_batches.into_iter().enumerate() {
-            let base_s = chunk_idx * chunk_size;
-            handles.push(scope.spawn(move || -> Result<()> {
-                for (offset_s, ((shard, moved_out), moved_in)) in
-                    chunk.iter_mut().zip(sub_out).zip(sub_in).enumerate()
-                {
-                    check()?;
-                    if moved_out.is_empty() && moved_in.is_empty() {
-                        continue;
-                    }
-                    let this_shard_id = shard_start + (base_s + offset_s) as u32;
-                    let mut next_members = vec![Vec::new(); shard.leaves.len()];
-                    let mut dirty = vec![false; shard.leaves.len()];
-                    for (local_l, leaf) in shard.leaves.iter().enumerate() {
-                        for &row_idx in &leaf.members {
-                            if let Some(&(dst_s, dst_l)) = moved_out.get(&row_idx) {
-                                dirty[local_l] = true;
-                                if dst_s == this_shard_id {
-                                    next_members[dst_l as usize].push(row_idx);
-                                    dirty[dst_l as usize] = true;
-                                }
-                            } else {
-                                next_members[local_l].push(row_idx);
-                            }
+    let outbound_ref = &outbound;
+    let inbound_ref = &inbound;
+    parallel_chunks_mut(tree_shards, parallelism, |base_s, chunk| {
+        for (offset_s, shard) in chunk.iter_mut().enumerate() {
+            check()?;
+            let local_s = base_s + offset_s;
+            let moved_out = &outbound_ref[local_s];
+            let moved_in = &inbound_ref[local_s];
+            if moved_out.is_empty() && moved_in.is_empty() {
+                continue;
+            }
+            let this_shard_id = shard_start + local_s as u32;
+            let mut next_members = vec![Vec::new(); shard.leaves.len()];
+            let mut dirty = vec![false; shard.leaves.len()];
+            for (local_l, leaf) in shard.leaves.iter().enumerate() {
+                for &row_idx in &leaf.members {
+                    if let Some(&(dst_s, dst_l)) = moved_out.get(&row_idx) {
+                        dirty[local_l] = true;
+                        if dst_s == this_shard_id {
+                            next_members[dst_l as usize].push(row_idx);
+                            dirty[dst_l as usize] = true;
                         }
+                    } else {
+                        next_members[local_l].push(row_idx);
                     }
-                    // Compact `shard.rows` to retain only active members, freeing moved-out slots.
-                    let active_total: usize = next_members.iter().map(Vec::len).sum();
-                    let dim = shard.rows.dim;
-                    let shared_slab = shard.rows.slab.clone();
-                    let mut compacted = ShardRows {
-                        dim,
-                        rows: Vec::with_capacity(active_total),
-                        vectors: if shared_slab.is_some() {
-                            Vec::new()
-                        } else {
-                            Vec::with_capacity(active_total * dim)
-                        },
-                        slab: shared_slab,
-                    };
-                    let mut inbound_rows: Vec<(CompactMeta, Vec<f32>)> =
-                        Vec::with_capacity(moved_in.len());
-                    let old_base = shard.rows.rows.len();
-                    for (dst_l, meta, vec) in moved_in {
-                        let temp_idx = old_base + inbound_rows.len();
-                        inbound_rows.push((meta, vec));
-                        next_members[dst_l as usize].push(temp_idx);
-                        dirty[dst_l as usize] = true;
-                    }
-                    for ((leaf, mut mem), changed) in
-                        shard.leaves.iter_mut().zip(next_members).zip(dirty)
-                    {
-                        if changed {
-                            mem.sort_unstable_by(|&a, &b| {
-                                let id_a = if a < old_base {
-                                    &shard.rows.rows[a].id
-                                } else {
-                                    &inbound_rows[a - old_base].0.id
-                                };
-                                let id_b = if b < old_base {
-                                    &shard.rows.rows[b].id
-                                } else {
-                                    &inbound_rows[b - old_base].0.id
-                                };
-                                id_a.cmp(id_b)
-                            });
-                        }
-                        let mut remapped = Vec::with_capacity(mem.len());
-                        for old_idx in mem {
-                            let new_idx = compacted.rows.len();
-                            if compacted.slab.is_some() {
-                                let r = if old_idx < old_base {
-                                    &shard.rows.rows[old_idx]
-                                } else {
-                                    &inbound_rows[old_idx - old_base].0
-                                };
-                                compacted.rows.push(r.clone());
-                            } else if old_idx < old_base {
-                                let r = &shard.rows.rows[old_idx];
-                                let v = shard.rows.vector(r.vec_slot);
-                                compacted.push(
-                                    r.tree_key.clone(),
-                                    r.id.clone(),
-                                    r.fields.clone(),
-                                    r.rabitq.clone(),
-                                    v,
-                                );
-                            } else {
-                                let (r, v) = &inbound_rows[old_idx - old_base];
-                                compacted.push(
-                                    r.tree_key.clone(),
-                                    r.id.clone(),
-                                    r.fields.clone(),
-                                    r.rabitq.clone(),
-                                    v,
-                                );
-                            }
-                            remapped.push(new_idx);
-                        }
-                        if changed {
-                            leaf.centroid = compute_leaf_centroid(kernel, &compacted, &remapped)?;
-                        }
-                        leaf.members = remapped;
-                    }
-                    shard.rows = compacted;
                 }
-                Ok(())
-            }));
-        }
-        for h in handles {
-            h.join().map_err(|_| Error::new(ErrorKind::Other))??;
+            }
+
+            let active_total = next_members.iter().map(Vec::len).sum::<usize>() + moved_in.len();
+            let dim = shard.rows.dim;
+            let shared_slab = shard.rows.slab.clone();
+            let mut compacted = ShardRows {
+                dim,
+                rows: Vec::with_capacity(active_total),
+                vectors: if shared_slab.is_some() {
+                    Vec::new()
+                } else {
+                    Vec::with_capacity(active_total * dim)
+                },
+                slab: shared_slab,
+            };
+            let old_base = shard.rows.rows.len();
+            for (in_idx, (dst_l, _, _)) in moved_in.iter().enumerate() {
+                next_members[*dst_l as usize].push(old_base + in_idx);
+                dirty[*dst_l as usize] = true;
+            }
+
+            for ((leaf, mut mem), changed) in shard.leaves.iter_mut().zip(next_members).zip(dirty) {
+                if changed {
+                    mem.sort_unstable_by(|&a, &b| {
+                        let id_a = if a < old_base {
+                            &shard.rows.rows[a].id
+                        } else {
+                            &moved_in[a - old_base].1.id
+                        };
+                        let id_b = if b < old_base {
+                            &shard.rows.rows[b].id
+                        } else {
+                            &moved_in[b - old_base].1.id
+                        };
+                        id_a.cmp(id_b)
+                    });
+                }
+                let mut remapped = Vec::with_capacity(mem.len());
+                for old_idx in mem {
+                    let new_idx = compacted.rows.len();
+                    let (r, v) = if old_idx < old_base {
+                        let r = &shard.rows.rows[old_idx];
+                        let v = if compacted.slab.is_some() {
+                            &[][..]
+                        } else {
+                            shard.rows.vector(r.vec_slot)
+                        };
+                        (r, v)
+                    } else {
+                        let (_, r, v) = &moved_in[old_idx - old_base];
+                        (r, v.as_slice())
+                    };
+                    if compacted.slab.is_some() {
+                        compacted.rows.push(r.clone());
+                    } else {
+                        compacted.push(
+                            r.tree_key.clone(),
+                            r.id.clone(),
+                            r.fields.clone(),
+                            r.rabitq.clone(),
+                            v,
+                        );
+                    }
+                    remapped.push(new_idx);
+                }
+                if changed {
+                    leaf.centroid = compute_leaf_centroid(kernel, &compacted, &remapped)?;
+                }
+                leaf.members = remapped;
+            }
+            shard.rows = compacted;
         }
         Ok(())
     })?;
@@ -1702,17 +1640,18 @@ type InternalNodePlan = (
 
 type EncodedNodeBatch = (Vec<(Bytes, Bytes)>, LtHash, LtHash, LtHash);
 
-/// Assigns deterministic per-tree PartitionKeys across per-shard `TreeKey` lists (`1` if
+/// Assigns deterministic per-tree PartitionKeys across per-shard `TreeKey` iterators (`1` if
 /// single-leaf root, else `2 ..= 1 + total_leaves` per tree).
-pub(crate) fn assign_leaf_partition_keys_from_trees<'a, I>(
-    shard_trees: &'a [I],
+pub(crate) fn assign_leaf_partition_keys<'a, S, I>(
+    shards: &'a [S],
+    leaves_of: impl Fn(&'a S) -> I,
 ) -> Result<(Vec<Vec<AssignedLeafKey>>, TreeLeafTotals)>
 where
-    for<'b> &'b I: IntoIterator<Item = &'b TreeKey>,
+    I: IntoIterator<Item = &'a TreeKey>,
 {
-    let mut tree_leaf_totals: BTreeMap<Bytes, (TreeKey, u64)> = BTreeMap::new();
-    for leaves in shard_trees {
-        for tk in leaves {
+    let mut tree_leaf_totals: TreeLeafTotals = BTreeMap::new();
+    for shard in shards {
+        for tk in leaves_of(shard) {
             let entry = tree_leaf_totals
                 .entry(Bytes::copy_from_slice(tk.as_bytes()))
                 .or_insert_with(|| (tk.clone(), 0));
@@ -1727,10 +1666,10 @@ where
         .map(|(k, (_, total))| (k.clone(), if *total == 1 { 1 } else { 2 }))
         .collect();
 
-    let mut assigned = Vec::with_capacity(shard_trees.len());
-    for leaves in shard_trees {
+    let mut assigned = Vec::with_capacity(shards.len());
+    for shard in shards {
         let mut shard_keys = Vec::new();
-        for tk in leaves {
+        for tk in leaves_of(shard) {
             let raw_tk = tk.as_bytes();
             let (_, total) = &tree_leaf_totals[raw_tk];
             let cursor = tree_cursors.get_mut(raw_tk).expect("cursor");
@@ -1746,17 +1685,6 @@ where
         assigned.push(shard_keys);
     }
     Ok((assigned, tree_leaf_totals))
-}
-
-/// Assigns deterministic per-tree PartitionKeys across resident `ShardState`s.
-pub(crate) fn assign_leaf_partition_keys(
-    shards: &[ShardState],
-) -> Result<(Vec<Vec<AssignedLeafKey>>, TreeLeafTotals)> {
-    let shard_trees: Vec<Vec<TreeKey>> = shards
-        .iter()
-        .map(|s| s.leaves.iter().map(|l| l.tree_key.clone()).collect())
-        .collect();
-    assign_leaf_partition_keys_from_trees(&shard_trees)
 }
 
 /// Encoded outputs from one Coarse Shard's final leaves.
@@ -1801,8 +1729,7 @@ pub(crate) fn quantize_shards_and_extract_locations(
     for (chunk_idx, shard_chunk) in shards.chunks(chunk_size).enumerate() {
         let start_s = chunk_idx * chunk_size;
         let end_s = start_s + shard_chunk.len();
-        let rows_in_chunk = shard_row_offsets[end_s] - shard_row_offsets[start_s];
-        let bytes_in_chunk = rows_in_chunk * code_len;
+        let bytes_in_chunk = (shard_row_offsets[end_s] - shard_row_offsets[start_s]) * code_len;
         let (head, tail) = rest_buf.split_at_mut(bytes_in_chunk);
         rest_buf = tail;
         work.push((shard_chunk, head));
@@ -1839,7 +1766,6 @@ pub(crate) fn quantize_shards_and_extract_locations(
     let mut byte_cursor = 0_usize;
 
     for (shard, keys) in shards.iter_mut().zip(assigned) {
-        // Release shared f32 slab reference immediately once RaBitQ7 codes are materialized.
         shard.rows.slab = None;
         shard.rows.vectors = Vec::new();
         for row in &mut shard.rows.rows {
@@ -1860,21 +1786,9 @@ pub(crate) fn quantize_shards_and_extract_locations(
     Ok(locations_by_bucket)
 }
 
-/// Encodes all Leaf Partitions of one Coarse Shard directly into canonical KV bytes,
-/// computing `PartitionSynopsis` inline without an extra pass.
+/// Encodes all Leaf Partitions of one Coarse Shard into canonical KV bytes, expanding
+/// `PartitionSynopsis` inline and slicing `fields_bytes` directly from encoded `LeafEntry` bytes.
 pub(crate) fn encode_leaf_shard(
-    manifest: &IndexManifest,
-    plan: &ShardPlan,
-    shard: &ShardState,
-    assigned: &[AssignedLeafKey],
-    hard_limits: HardLimits,
-    check: &(dyn Fn() -> Result<()> + Sync),
-) -> Result<EncodedLeafShard> {
-    encode_leaf_shard_opts(manifest, plan, shard, assigned, hard_limits, true, check)
-}
-
-/// Encodes all Leaf Partitions of one Coarse Shard with optional location collection.
-pub(crate) fn encode_leaf_shard_opts(
     manifest: &IndexManifest,
     plan: &ShardPlan,
     shard: &ShardState,
@@ -1913,7 +1827,7 @@ pub(crate) fn encode_leaf_shard_opts(
                 Some(bytes) => bytes.clone(),
                 None => RaBitQ7::quantize(shard.rows.vector(row.vec_slot))?,
             };
-            let fields_bytes = source::encode_fields_bytes(manifest.config(), &row.fields)?;
+            let rabitq_len = rabitq.len();
             let kv = encode_kv(
                 codec,
                 hard_limits,
@@ -1929,20 +1843,23 @@ pub(crate) fn encode_leaf_shard_opts(
                     rabitq,
                 )),
             )?;
-            leaf_entry_kvs.push(kv);
+            // `LeafEntry` wire layout: `[tag: 1B][u16 id_len: 2B][id][fields_bytes][u32 rq_len: 4B][rq]`.
+            let fields_start = 3 + row.id.len();
+            let fields_end = kv.1.len().checked_sub(4 + rabitq_len).ok_or_else(corrupt)?;
+            let fields_bytes = kv.1.get(fields_start..fields_end).ok_or_else(corrupt)?;
             membership_lthash.add_assign(LtHash::from_membership(
                 tk.as_bytes(),
                 pk,
                 &row.id,
-                &fields_bytes,
+                fields_bytes,
             ));
+            leaf_entry_kvs.push(kv);
             if collect_locations {
                 let bucket = plan.id_bucket(&row.id) as usize;
                 locations_by_bucket[bucket].push((row.id.clone(), tk.clone(), pk));
             }
         }
 
-        // Emit partition keys in canonical subkind order: Header(0), Synopsis(1), State(2), Centroid(3), LeafEntry(4).
         let header_kv = encode_kv(
             codec,
             hard_limits,
@@ -1997,7 +1914,8 @@ pub(crate) fn encode_leaf_shard_opts(
                 },
                 PersistentValue::PartitionCentroid(leaf.centroid.clone()),
             )?;
-            edge_def_lthash.add_assign(LtHash::from_edge(tk.as_bytes(), pk, &centroid_kv.1));
+            // `PartitionCentroid` wire layout: `[tag: 1B][sized<VectorComponent>]`.
+            edge_def_lthash.add_assign(LtHash::from_edge(tk.as_bytes(), pk, &centroid_kv.1[1..]));
             kv_lthash.add_assign(LtHash::from_kv(&centroid_kv.0, &centroid_kv.1));
             kvs.push(centroid_kv);
             child_centroids.push((tk.clone(), pk, leaf.centroid.clone()));
@@ -2056,8 +1974,6 @@ pub(crate) fn encode_record_group_bucket(
     let mut kv_lthash = LtHash::ZERO;
     let mut location_lthash = LtHash::ZERO;
 
-    // Sort `(rank, SourceFrameRef)` by `(seg_idx, frame_offset)` for monotonic single-FD reads
-    // while placing decoded `(record_bytes, payload_bytes)` directly into rank-aligned slots.
     let mut read_order: Vec<(usize, SourceFrameRef)> = id_refs
         .into_iter()
         .enumerate()
@@ -2090,8 +2006,6 @@ pub(crate) fn encode_record_group_bucket(
         rec_slots[rank] = Some((rec_val, pay_val));
     }
 
-    // Tuple-escaped `Record ID` ordering matches raw `id` ordering (`0x00 -> 0x00 0xFF`,
-    // terminated by `0x00 0x00`), and subkinds follow `Record(0x00) < Location(0x01) < Payload(0x02)`.
     let mut kvs = Vec::with_capacity(n * 3);
     for (rank, (id, tree_key, leaf)) in locations.into_iter().enumerate() {
         if rank.is_multiple_of(512) {
@@ -2203,22 +2117,30 @@ pub(crate) fn build_and_encode_upper_tree(
     loop {
         check()?;
         if children.len() <= max_internal {
-            // Root internal node receives reserved PartitionKey(1).
             let centroid = compute_internal_centroid(&kernel, &children)?;
             internal_nodes.push((PartitionKey::new(1)?, level, centroid, children));
             break;
         }
         let mut next_level_children = Vec::new();
-        group_internal_nodes(
+        let mut tagged: Vec<(usize, (PartitionKey, PartitionCentroid))> =
+            children.into_iter().map(|item| (0, item)).collect();
+        partition_recursively(
             &kernel,
             sample_items,
             min_internal,
             max_internal,
-            level,
-            &mut high_water,
-            &mut children,
-            &mut internal_nodes,
-            &mut next_level_children,
+            &mut tagged,
+            &mut |group| {
+                high_water = high_water
+                    .checked_add(1)
+                    .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+                let pk = PartitionKey::new(high_water)?;
+                let owned: Vec<_> = group.iter().map(|(_, item)| item.clone()).collect();
+                let centroid = compute_internal_centroid(&kernel, &owned)?;
+                next_level_children.push((pk, centroid.clone()));
+                internal_nodes.push((pk, level, centroid, owned));
+                Ok(())
+            },
             check,
         )?;
         next_level_children.sort_unstable_by_key(|(pk, _)| *pk);
@@ -2228,117 +2150,103 @@ pub(crate) fn build_and_encode_upper_tree(
             .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
     }
 
-    // Build partition-local HNSW graphs and encode internal partitions in parallel.
-    let chunk_size = internal_nodes.len().div_ceil(parallelism.max(1)).max(1);
-    let node_results: Vec<EncodedNodeBatch> = std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for chunk in internal_nodes.chunks(chunk_size) {
-            let kernel_ref = &kernel;
-            handles.push(scope.spawn(move || -> Result<EncodedNodeBatch> {
-                let mut kvs = Vec::new();
-                let mut kv_lt = LtHash::ZERO;
-                let mut def_lt = LtHash::ZERO;
-                let mut ref_lt = LtHash::ZERO;
+    let node_results: Vec<EncodedNodeBatch> =
+        parallel_chunks(&internal_nodes, parallelism, |_, chunk| {
+            let mut kvs = Vec::new();
+            let mut kv_lt = LtHash::ZERO;
+            let mut def_lt = LtHash::ZERO;
+            let mut ref_lt = LtHash::ZERO;
 
-                for (pk, node_level, centroid, node_children) in chunk {
-                    check()?;
-                    let count = u32::try_from(node_children.len())
-                        .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
-                    let header =
-                        PartitionHeader::new(*node_level, count, 1, PartitionState::Ready)?;
-                    let header_kv = encode_kv(
-                        codec,
-                        hard_limits,
-                        LogicalKey::Header {
-                            index: index_id,
-                            tree_key: tree_key.clone(),
-                            partition: *pk,
-                        },
-                        PersistentValue::PartitionHeader(header),
-                    )?;
-                    let state_kv = encode_kv(
-                        codec,
-                        hard_limits,
-                        LogicalKey::State {
-                            index: index_id,
-                            tree_key: tree_key.clone(),
-                            partition: *pk,
-                        },
-                        PersistentValue::PartitionState(PartitionTransition::Ready {
-                            started_at_unix_millis: 0,
-                        }),
-                    )?;
-                    for kv in [header_kv, state_kv] {
-                        kv_lt.add_assign(LtHash::from_kv(&kv.0, &kv.1));
-                        kvs.push(kv);
-                    }
-                    if pk.get() != 1 {
-                        let c_kv = encode_kv(
-                            codec,
-                            hard_limits,
-                            LogicalKey::Centroid {
-                                index: index_id,
-                                tree_key: tree_key.clone(),
-                                partition: *pk,
-                            },
-                            PersistentValue::PartitionCentroid(centroid.clone()),
-                        )?;
-                        def_lt.add_assign(LtHash::from_edge(tree_key.as_bytes(), *pk, &c_kv.1));
-                        kv_lt.add_assign(LtHash::from_kv(&c_kv.0, &c_kv.1));
-                        kvs.push(c_kv);
-                    }
-
-                    let mut typed_children = Vec::with_capacity(node_children.len());
-                    for (child_pk, child_centroid) in node_children {
-                        let centroid_bytes = codec
-                            .encode(&PersistentValue::PartitionCentroid(child_centroid.clone()))?;
-                        ref_lt.add_assign(LtHash::from_edge(
-                            tree_key.as_bytes(),
-                            *child_pk,
-                            &centroid_bytes,
-                        ));
-                        let ce = ChildEntry::from_centroid(*child_pk, child_centroid.clone());
-                        let ce_kv = encode_kv(
-                            codec,
-                            hard_limits,
-                            LogicalKey::ChildEntry {
-                                index: index_id,
-                                tree_key: tree_key.clone(),
-                                partition: *pk,
-                                child: *child_pk,
-                            },
-                            PersistentValue::ChildEntry(ce.clone()),
-                        )?;
-                        kv_lt.add_assign(LtHash::from_kv(&ce_kv.0, &ce_kv.1));
-                        kvs.push(ce_kv);
-                        typed_children.push(ce);
-                    }
-
-                    let graph_items = build_internal_graph(
-                        manifest,
-                        kernel_ref,
-                        tree_key,
-                        *pk,
-                        header,
-                        &typed_children,
-                        graph_memory_bytes,
-                        check,
-                    )?;
-                    for (gk, gv) in graph_items {
-                        let gkv = encode_kv(codec, hard_limits, gk, gv)?;
-                        kv_lt.add_assign(LtHash::from_kv(&gkv.0, &gkv.1));
-                        kvs.push(gkv);
-                    }
+            for (pk, node_level, centroid, node_children) in chunk {
+                check()?;
+                let count = u32::try_from(node_children.len())
+                    .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
+                let header = PartitionHeader::new(*node_level, count, 1, PartitionState::Ready)?;
+                let header_kv = encode_kv(
+                    codec,
+                    hard_limits,
+                    LogicalKey::Header {
+                        index: index_id,
+                        tree_key: tree_key.clone(),
+                        partition: *pk,
+                    },
+                    PersistentValue::PartitionHeader(header),
+                )?;
+                let state_kv = encode_kv(
+                    codec,
+                    hard_limits,
+                    LogicalKey::State {
+                        index: index_id,
+                        tree_key: tree_key.clone(),
+                        partition: *pk,
+                    },
+                    PersistentValue::PartitionState(PartitionTransition::Ready {
+                        started_at_unix_millis: 0,
+                    }),
+                )?;
+                for kv in [header_kv, state_kv] {
+                    kv_lt.add_assign(LtHash::from_kv(&kv.0, &kv.1));
+                    kvs.push(kv);
                 }
-                Ok((kvs, kv_lt, def_lt, ref_lt))
-            }));
-        }
-        let mut results = Vec::with_capacity(handles.len());
-        for h in handles {
-            results.push(h.join().map_err(|_| Error::new(ErrorKind::Other))??);
-        }
-        Ok::<_, Error>(results)
-    })?;
+                if pk.get() != 1 {
+                    let c_kv = encode_kv(
+                        codec,
+                        hard_limits,
+                        LogicalKey::Centroid {
+                            index: index_id,
+                            tree_key: tree_key.clone(),
+                            partition: *pk,
+                        },
+                        PersistentValue::PartitionCentroid(centroid.clone()),
+                    )?;
+                    def_lt.add_assign(LtHash::from_edge(tree_key.as_bytes(), *pk, &c_kv.1[1..]));
+                    kv_lt.add_assign(LtHash::from_kv(&c_kv.0, &c_kv.1));
+                    kvs.push(c_kv);
+                }
+
+                let mut typed_children = Vec::with_capacity(node_children.len());
+                for (child_pk, child_centroid) in node_children {
+                    let ce = ChildEntry::from_centroid(*child_pk, child_centroid.clone());
+                    let ce_kv = encode_kv(
+                        codec,
+                        hard_limits,
+                        LogicalKey::ChildEntry {
+                            index: index_id,
+                            tree_key: tree_key.clone(),
+                            partition: *pk,
+                            child: *child_pk,
+                        },
+                        PersistentValue::ChildEntry(ce.clone()),
+                    )?;
+                    // `ChildEntry` wire layout: `[tag: 1B][u64 child: 8B][sized<VectorComponent>]`.
+                    ref_lt.add_assign(LtHash::from_edge(
+                        tree_key.as_bytes(),
+                        *child_pk,
+                        &ce_kv.1[9..],
+                    ));
+                    kv_lt.add_assign(LtHash::from_kv(&ce_kv.0, &ce_kv.1));
+                    kvs.push(ce_kv);
+                    typed_children.push(ce);
+                }
+
+                let graph_items = build_internal_graph(
+                    manifest,
+                    &kernel,
+                    tree_key,
+                    *pk,
+                    header,
+                    &typed_children,
+                    graph_memory_bytes,
+                    check,
+                )?;
+                for (gk, gv) in graph_items {
+                    let gkv = encode_kv(codec, hard_limits, gk, gv)?;
+                    kv_lt.add_assign(LtHash::from_kv(&gkv.0, &gkv.1));
+                    kvs.push(gkv);
+                }
+            }
+            Ok((kvs, kv_lt, def_lt, ref_lt))
+        })?;
 
     let tm_kv = encode_kv(
         codec,
@@ -2374,103 +2282,6 @@ pub(crate) fn build_and_encode_upper_tree(
     })
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "recursive internal grouping threads immutable bounds and mutable output collectors"
-)]
-fn group_internal_nodes(
-    kernel: &VectorKernel,
-    sample_items: usize,
-    min_internal: u64,
-    max_internal: usize,
-    level: u32,
-    high_water: &mut u64,
-    items: &mut [(PartitionKey, PartitionCentroid)],
-    out_nodes: &mut Vec<InternalNodePlan>,
-    out_parents: &mut Vec<(PartitionKey, PartitionCentroid)>,
-    check: &(dyn Fn() -> Result<()> + Sync),
-) -> Result<()> {
-    if items.len() <= max_internal {
-        items.sort_unstable_by_key(|(pk, _)| *pk);
-        *high_water = high_water
-            .checked_add(1)
-            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-        let pk = PartitionKey::new(*high_water)?;
-        let owned: Vec<_> = items.to_vec();
-        let centroid = compute_internal_centroid(kernel, &owned)?;
-        out_parents.push((pk, centroid.clone()));
-        out_nodes.push((pk, level, centroid, owned));
-        return Ok(());
-    }
-
-    check()?;
-    let cap = sample_items.max(2);
-    let mut heap = BinaryHeap::new();
-    for (pos, (pk, _)) in items.iter().enumerate() {
-        let id_bytes = pk.get().to_be_bytes();
-        let cand = (xxh3_128_with_seed(&id_bytes, SAMPLE_SEED), id_bytes, pos);
-        if heap.len() < cap {
-            heap.push(cand);
-        } else if heap.peek().is_some_and(|max| &cand < max) {
-            heap.pop();
-            heap.push(cand);
-        }
-    }
-    let sample: Vec<(Bytes, Box<[f32]>)> = heap
-        .into_iter()
-        .map(|(_, id_bytes, pos)| {
-            (
-                Bytes::copy_from_slice(&id_bytes),
-                Box::from(items[pos].1.components()),
-            )
-        })
-        .collect();
-    let desired = (items.len() as u64).div_ceil(max_internal as u64).min(8) as usize;
-    let k = sample.len().min(desired).max(2);
-    let centers = train_centers(kernel, sample, k, 10, check)?;
-
-    let mut tagged: Vec<(usize, (PartitionKey, PartitionCentroid))> = items
-        .iter()
-        .cloned()
-        .map(|(pk, c)| {
-            let lbl = nearest_center(kernel, c.components(), &centers);
-            (lbl, (pk, c))
-        })
-        .collect();
-    let mut counts = vec![0_u64; centers.len()];
-    for (lbl, _) in &tagged {
-        counts[*lbl] += 1;
-    }
-    let sizes = group_sizes(&counts, min_internal);
-    let cmp = |a: &(usize, (PartitionKey, PartitionCentroid)),
-               b: &(usize, (PartitionKey, PartitionCentroid))| {
-        a.0.cmp(&b.0).then_with(|| a.1.0.cmp(&b.1.0))
-    };
-    let mut rest = &mut tagged[..];
-    for size in sizes {
-        let size = size as usize;
-        if size < rest.len() {
-            rest.select_nth_unstable_by(size, cmp);
-        }
-        let (child_slice, tail) = rest.split_at_mut(size);
-        let mut child_vec: Vec<_> = child_slice.iter().map(|(_, item)| item.clone()).collect();
-        group_internal_nodes(
-            kernel,
-            sample_items,
-            min_internal,
-            max_internal,
-            level,
-            high_water,
-            &mut child_vec,
-            out_nodes,
-            out_parents,
-            check,
-        )?;
-        rest = tail;
-    }
-    Ok(())
-}
-
 fn compute_internal_centroid(
     kernel: &VectorKernel,
     children: &[(PartitionKey, PartitionCentroid)],
@@ -2496,102 +2307,181 @@ pub(crate) fn encode_kv(
 // Checksummed Disk Spill / Multi-Worker Indexed Run Files (`workspace/{token}/`)
 // ============================================================================
 
-const INDEX_ENTRY_BYTES: u64 = 24; // `(offset: u64, len: u64, xxh3_64: u64)`
+/// Zero-copy big-endian cursor over verified in-memory scratch buffers.
+pub(crate) struct ScratchCursor<'a> {
+    buf: &'a [u8],
+}
 
-fn check_slice_bounds(file_len: u64, min_offset: u64, offset: u64, len: u64) -> Result<()> {
-    if len == 0 {
-        return Ok(());
+impl<'a> ScratchCursor<'a> {
+    pub(crate) const fn new(buf: &'a [u8]) -> Self {
+        Self { buf }
     }
-    if offset < min_offset || offset.checked_add(len).is_none_or(|end| end > file_len) {
-        return Err(corrupt());
+
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.buf.is_empty()
     }
+
+    pub(crate) fn take(&mut self, len: usize) -> Result<&'a [u8]> {
+        if self.buf.len() < len {
+            return Err(corrupt());
+        }
+        let (head, tail) = self.buf.split_at(len);
+        self.buf = tail;
+        Ok(head)
+    }
+
+    pub(crate) fn u8(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+
+    pub(crate) fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_be_bytes(self.take(4)?.try_into().expect("u32")))
+    }
+
+    pub(crate) fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_be_bytes(self.take(8)?.try_into().expect("u64")))
+    }
+
+    pub(crate) fn bytes(&mut self, max_len: usize) -> Result<Bytes> {
+        let len = self.u32()? as usize;
+        if len > max_len {
+            return Err(corrupt());
+        }
+        Ok(Bytes::copy_from_slice(self.take(len)?))
+    }
+
+    pub(crate) fn non_empty_bytes(&mut self, max_len: usize) -> Result<Bytes> {
+        let len = self.u32()? as usize;
+        if len == 0 || len > max_len {
+            return Err(corrupt());
+        }
+        Ok(Bytes::copy_from_slice(self.take(len)?))
+    }
+
+    pub(crate) fn tree_key(&mut self, tree_types: &[DataType]) -> Result<TreeKey> {
+        TreeKey::from_encoded(tree_types, self.bytes(MAX_TREE_KEY_BYTES)?)
+    }
+
+    pub(crate) fn centroid(
+        &mut self,
+        codec: ValueCodec<'_>,
+        index_id: LogicalIndexId,
+        tk: &TreeKey,
+        pk: PartitionKey,
+    ) -> Result<PartitionCentroid> {
+        let c_bytes = self.non_empty_bytes(MAX_VALUE_BYTES)?;
+        let c_key = LogicalKey::Centroid {
+            index: index_id,
+            tree_key: tk.clone(),
+            partition: pk,
+        };
+        match codec.decode(&c_key, c_bytes)? {
+            PersistentValue::PartitionCentroid(c) => Ok(c),
+            _ => Err(corrupt()),
+        }
+    }
+
+    pub(crate) fn f32s_into(&mut self, dst: &mut [f32]) -> Result<()> {
+        let raw = self.take(dst.len().checked_mul(4).ok_or_else(corrupt)?)?;
+        for (slot, chunk) in dst.iter_mut().zip(raw.as_chunks::<4>().0.iter()) {
+            let bits = u32::from_be_bytes(*chunk);
+            let val = f32::from_bits(bits);
+            if !val.is_finite() || bits == 0x8000_0000 {
+                return Err(corrupt());
+            }
+            *slot = val;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(self) -> Result<()> {
+        if self.buf.is_empty() {
+            Ok(())
+        } else {
+            Err(corrupt())
+        }
+    }
+}
+
+pub(crate) fn push_sized(buf: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
+    let len = u32::try_from(bytes.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
+    buf.extend_from_slice(&len.to_be_bytes());
+    buf.extend_from_slice(bytes);
     Ok(())
 }
 
-fn read_eof_checked(r: &mut impl Read) -> Result<()> {
-    let mut tail = [0_u8; 1];
-    if r.read(&mut tail).map_err(io_error)? != 0 {
-        return Err(corrupt());
+pub(crate) fn push_f32s(buf: &mut Vec<u8>, vec: &[f32]) -> Result<()> {
+    for &v in vec {
+        if !v.is_finite() {
+            return Err(corrupt());
+        }
+        let bits = if v == 0.0 { 0_u32 } else { v.to_bits() };
+        buf.extend_from_slice(&bits.to_be_bytes());
     }
     Ok(())
 }
 
 /// Writes a sequential payload followed by an 8-byte big-endian `xxh3_64` trailer.
-fn write_checksummed_bytes(path: &Path, body: &[u8], quota: &ScratchQuota) -> Result<u64> {
+pub(crate) fn write_checksummed_bytes(
+    path: &Path,
+    body: &[u8],
+    quota: &ScratchQuota,
+) -> Result<u64> {
     let checksum = xxh3_64(body);
-    quota.write_tracked(path, |w| {
+    let total_len = (body.len() as u64)
+        .checked_add(8)
+        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+    quota.write_exact(path, total_len, |w| {
         w.write_all(body).map_err(io_error)?;
         w.write_all(&checksum.to_be_bytes()).map_err(io_error)
     })
 }
 
-/// Streaming reader that verifies a trailing 8-byte `xxh3_64` checksum on `finish()`.
-struct ChecksummedFileReader {
-    inner: std::io::Take<BufReader<File>>,
-    hasher: Xxh3,
-    body_len: u64,
+/// Reads an entire scratch file and verifies its trailing 8-byte `xxh3_64` trailer.
+pub(crate) fn read_checksummed_bytes(path: &Path) -> Result<Vec<u8>> {
+    let mut raw = fs::read(path).map_err(io_error)?;
+    if raw.len() < 8 {
+        return Err(corrupt());
+    }
+    let body_len = raw.len() - 8;
+    let expected = u64::from_be_bytes(raw[body_len..].try_into().expect("trailer"));
+    if xxh3_64(&raw[..body_len]) != expected {
+        return Err(corrupt());
+    }
+    raw.truncate(body_len);
+    Ok(raw)
 }
 
-impl ChecksummedFileReader {
-    fn open(path: &Path) -> Result<Self> {
-        let file = File::open(path).map_err(io_error)?;
-        let file_len = file.metadata().map_err(io_error)?.len();
-        if file_len < 8 {
-            return Err(corrupt());
-        }
-        let body_len = file_len - 8;
-        Ok(Self {
-            inner: BufReader::new(file).take(body_len),
-            hasher: Xxh3::new(),
-            body_len,
-        })
-    }
-
-    fn finish(mut self) -> Result<()> {
-        read_eof_checked(&mut self)?;
-        let actual = self.hasher.digest();
-        let mut raw = self.inner.into_inner();
-        let mut exp_b = [0_u8; 8];
-        raw.read_exact(&mut exp_b).map_err(io_error)?;
-        if u64::from_be_bytes(exp_b) != actual {
-            return Err(corrupt());
-        }
-        read_eof_checked(&mut raw)
-    }
-}
-
-impl Read for ChecksummedFileReader {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        self.hasher.update(&buf[..n]);
-        Ok(n)
-    }
-}
-
-/// Shared `[count: u32][(offset: u64, len: u64, xxh3_64: u64); count][non-empty bodies...]`
-/// container writer. Empty slices store `len = 0` so readers skip I/O immediately.
+/// Shared `[count: u32][(offset: u64, len: u64, xxh3_64: u64); count][hdr_xxh3: u64][bodies...]`
+/// container writer. Empty slices store `len = 0` so readers skip body I/O immediately.
 fn write_indexed_slices(path: &Path, slices: &[Vec<u8>], quota: &ScratchQuota) -> Result<u64> {
     let count = u32::try_from(slices.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
-    let header_end = 4_u64
+    let header_bytes = 4_u64
         .checked_add((slices.len() as u64).saturating_mul(INDEX_ENTRY_BYTES))
+        .and_then(|n| n.checked_add(8))
         .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-    quota.write_tracked(path, |w| {
+    let body_bytes = slices
+        .iter()
+        .try_fold(0_u64, |acc, s| acc.checked_add(s.len() as u64))
+        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+    let total_bytes = header_bytes
+        .checked_add(body_bytes)
+        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+
+    quota.write_exact(path, total_bytes, |w| {
         let mut header_hash = Xxh3::new();
         let count_b = count.to_be_bytes();
         header_hash.update(&count_b);
         w.write_all(&count_b).map_err(io_error)?;
-        let mut cursor = header_end + 8; // 8-byte header checksum right after index directory
+        let mut cursor = header_bytes;
         for slice in slices {
             let len = slice.len() as u64;
-            let off = cursor;
             let csum = if len == 0 { 0_u64 } else { xxh3_64(slice) };
-            for b in [off.to_be_bytes(), len.to_be_bytes(), csum.to_be_bytes()] {
+            for b in [cursor.to_be_bytes(), len.to_be_bytes(), csum.to_be_bytes()] {
                 header_hash.update(&b);
                 w.write_all(&b).map_err(io_error)?;
             }
-            cursor = cursor
-                .checked_add(len)
-                .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+            cursor += len;
         }
         w.write_all(&header_hash.digest().to_be_bytes())
             .map_err(io_error)?;
@@ -2604,71 +2494,50 @@ fn write_indexed_slices(path: &Path, slices: &[Vec<u8>], quota: &ScratchQuota) -
     })
 }
 
-struct SliceReader {
-    inner: std::io::Take<BufReader<File>>,
-    hasher: Xxh3,
-    expected_hash: u64,
-    len: u64,
-}
-
-impl SliceReader {
-    fn open(path: &Path, slice_idx: usize, max_slices: usize) -> Result<Option<Self>> {
-        let mut file = File::open(path).map_err(io_error)?;
-        let file_len = file.metadata().map_err(io_error)?.len();
-        if file_len < 12 {
-            return Err(corrupt());
-        }
-        let mut count_b = [0_u8; 4];
-        file.read_exact(&mut count_b).map_err(io_error)?;
-        let count = u32::from_be_bytes(count_b) as usize;
-        let dir_bytes = (count as u64)
-            .checked_mul(INDEX_ENTRY_BYTES)
-            .ok_or_else(corrupt)?;
-        let body_min_offset = 4_u64
-            .checked_add(dir_bytes)
-            .and_then(|n| n.checked_add(8))
-            .ok_or_else(corrupt)?;
-        if slice_idx >= count || count > max_slices || body_min_offset > file_len {
-            return Err(corrupt());
-        }
-        file.seek(SeekFrom::Start(4 + (slice_idx as u64) * INDEX_ENTRY_BYTES))
-            .map_err(io_error)?;
-        let mut meta = [0_u8; 24];
-        file.read_exact(&mut meta).map_err(io_error)?;
-        let offset = u64::from_be_bytes(meta[0..8].try_into().expect("offset"));
-        let len = u64::from_be_bytes(meta[8..16].try_into().expect("len"));
-        let expected_hash = u64::from_be_bytes(meta[16..24].try_into().expect("hash"));
-        check_slice_bounds(file_len, body_min_offset, offset, len)?;
-        if len == 0 {
-            if expected_hash != 0 {
-                return Err(corrupt());
-            }
-            return Ok(None);
-        }
-        file.seek(SeekFrom::Start(offset)).map_err(io_error)?;
-        Ok(Some(Self {
-            inner: BufReader::new(file).take(len),
-            hasher: Xxh3::new(),
-            expected_hash,
-            len,
-        }))
+/// Reads and checksum-verifies one indexed slice via `pread` without buffering the whole file.
+fn read_indexed_slice(path: &Path, slice_idx: usize, max_slices: usize) -> Result<Option<Vec<u8>>> {
+    let file = File::open(path).map_err(io_error)?;
+    let file_len = file.metadata().map_err(io_error)?.len();
+    if file_len < 12 {
+        return Err(corrupt());
+    }
+    let mut count_b = [0_u8; 4];
+    read_at_exact(&file, &mut count_b, 0)?;
+    let count = u32::from_be_bytes(count_b) as usize;
+    let body_min_offset = 4_u64
+        .checked_add(
+            (count as u64)
+                .checked_mul(INDEX_ENTRY_BYTES)
+                .ok_or_else(corrupt)?,
+        )
+        .and_then(|n| n.checked_add(8))
+        .ok_or_else(corrupt)?;
+    if slice_idx >= count || count > max_slices || body_min_offset > file_len {
+        return Err(corrupt());
     }
 
-    fn finish(mut self) -> Result<()> {
-        read_eof_checked(&mut self)?;
-        if self.hasher.digest() != self.expected_hash {
-            return Err(corrupt());
-        }
-        Ok(())
+    let mut meta = [0_u8; 24];
+    read_at_exact(&file, &mut meta, 4 + (slice_idx as u64) * INDEX_ENTRY_BYTES)?;
+    let offset = u64::from_be_bytes(meta[0..8].try_into().expect("offset"));
+    let len = u64::from_be_bytes(meta[8..16].try_into().expect("len"));
+    let expected_hash = u64::from_be_bytes(meta[16..24].try_into().expect("hash"));
+    if len == 0 {
+        return if expected_hash == 0 {
+            Ok(None)
+        } else {
+            Err(corrupt())
+        };
     }
-}
-
-impl Read for SliceReader {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        self.hasher.update(&buf[..n]);
-        Ok(n)
+    if offset < body_min_offset || offset.checked_add(len).is_none_or(|end| end > file_len) {
+        return Err(corrupt());
     }
+    let len_usize = usize::try_from(len).map_err(|_| corrupt())?;
+    let mut buf = vec![0_u8; len_usize];
+    read_at_exact(&file, &mut buf, offset)?;
+    if xxh3_64(&buf) != expected_hash {
+        return Err(corrupt());
+    }
+    Ok(Some(buf))
 }
 
 fn encode_compact_row(
@@ -2677,91 +2546,41 @@ fn encode_compact_row(
     row: &CompactMeta,
     vec: &[f32],
 ) -> Result<()> {
-    let tk = row.tree_key.as_bytes();
-    let tk_len = u32::try_from(tk.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
-    buf.extend_from_slice(&tk_len.to_be_bytes());
-    buf.extend_from_slice(tk);
+    push_sized(buf, row.tree_key.as_bytes())?;
     let meta_bytes = source::encode_row_meta(config, &row.id, &row.fields)?;
-    let meta_len =
-        u32::try_from(meta_bytes.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
-    buf.extend_from_slice(&meta_len.to_be_bytes());
-    buf.extend_from_slice(&meta_bytes);
-    for &v in vec {
-        if !v.is_finite() {
-            return Err(corrupt());
-        }
-        let bits = if v == 0.0 { 0_u32 } else { v.to_bits() };
-        buf.extend_from_slice(&bits.to_be_bytes());
-    }
-    Ok(())
+    push_sized(buf, &meta_bytes)?;
+    push_f32s(buf, vec)
 }
 
-fn decode_row_from_reader(
-    r: &mut impl Read,
+fn decode_compact_row(
+    r: &mut ScratchCursor<'_>,
     config: &IndexConfig,
-    tree_types: &[crate::api::DataType],
-    vec_raw: &mut [u8],
+    tree_types: &[DataType],
     vec_f32: &mut [f32],
 ) -> Result<(TreeKey, Bytes, Box<[Value]>)> {
-    let mut tk_len_b = [0_u8; 4];
-    r.read_exact(&mut tk_len_b).map_err(io_error)?;
-    let tk_len = u32::from_be_bytes(tk_len_b) as usize;
-    if tk_len > MAX_TREE_KEY_BYTES {
-        return Err(corrupt());
-    }
-    let mut tk_buf = vec![0_u8; tk_len];
-    r.read_exact(&mut tk_buf).map_err(io_error)?;
-    let tree_key = TreeKey::from_encoded(tree_types, Bytes::from(tk_buf))?;
-
-    let mut meta_len_b = [0_u8; 4];
-    r.read_exact(&mut meta_len_b).map_err(io_error)?;
-    let meta_len = u32::from_be_bytes(meta_len_b) as usize;
-    if meta_len == 0 || meta_len > MAX_VALUE_BYTES {
-        return Err(corrupt());
-    }
-    let mut meta_buf = vec![0_u8; meta_len];
-    r.read_exact(&mut meta_buf).map_err(io_error)?;
-    let (id, fields) = source::decode_row_meta(config, Bytes::from(meta_buf))?;
-
-    r.read_exact(vec_raw).map_err(io_error)?;
-    for (dst_v, bytes) in vec_f32.iter_mut().zip(vec_raw.as_chunks::<4>().0.iter()) {
-        let bits = u32::from_be_bytes(*bytes);
-        let val = f32::from_bits(bits);
-        if !val.is_finite() || bits == 0x8000_0000 {
-            return Err(corrupt());
-        }
-        *dst_v = val;
-    }
+    let tree_key = r.tree_key(tree_types)?;
+    let meta_bytes = r.non_empty_bytes(MAX_VALUE_BYTES)?;
+    let (id, fields) = source::decode_row_meta(config, meta_bytes)?;
+    r.f32s_into(vec_f32)?;
     Ok((tree_key, id, fields))
 }
 
 fn push_id_frame_ref(buf: &mut Vec<u8>, id: &Bytes, fref: SourceFrameRef) -> Result<()> {
-    let id_len = u32::try_from(id.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
-    buf.extend_from_slice(&id_len.to_be_bytes());
-    buf.extend_from_slice(id);
+    push_sized(buf, id)?;
     buf.extend_from_slice(&fref.seg_idx.to_be_bytes());
     buf.extend_from_slice(&fref.frame_offset.to_be_bytes());
     buf.extend_from_slice(&fref.body_len.to_be_bytes());
     Ok(())
 }
 
-fn read_id_frame_ref(r: &mut impl Read) -> Result<(IdFrameEntry, u64)> {
-    let mut l_b = [0_u8; 4];
-    r.read_exact(&mut l_b).map_err(io_error)?;
-    let id_len = u32::from_be_bytes(l_b) as usize;
-    if id_len == 0 || id_len > MAX_RECORD_ID_BYTES {
-        return Err(corrupt());
-    }
-    let mut id = vec![0_u8; id_len];
-    r.read_exact(&mut id).map_err(io_error)?;
-    let mut ref_b = [0_u8; 16];
-    r.read_exact(&mut ref_b).map_err(io_error)?;
+fn decode_id_frame_ref(r: &mut ScratchCursor<'_>) -> Result<IdFrameEntry> {
+    let id = r.non_empty_bytes(MAX_RECORD_ID_BYTES)?;
     let fref = SourceFrameRef {
-        seg_idx: u32::from_be_bytes(ref_b[0..4].try_into().expect("seg")),
-        frame_offset: u64::from_be_bytes(ref_b[4..12].try_into().expect("off")),
-        body_len: u32::from_be_bytes(ref_b[12..16].try_into().expect("len")),
+        seg_idx: r.u32()?,
+        frame_offset: r.u64()?,
+        body_len: r.u32()?,
     };
-    Ok(((Bytes::from(id), fref), 20 + id_len as u64))
+    Ok((id, fref))
 }
 
 /// Writes one scatter run's bucketed `(id, SourceFrameRef)` entries (`ids-e{ep}-{run:06}.bin`).
@@ -2787,18 +2606,12 @@ pub(crate) fn read_indexed_ids_slice(
     bucket_idx: usize,
     out: &mut Vec<IdFrameEntry>,
 ) -> Result<()> {
-    let Some(mut r) = SliceReader::open(path, bucket_idx, MAX_TOTAL_SHARDS)? else {
+    let Some(raw) = read_indexed_slice(path, bucket_idx, MAX_TOTAL_SHARDS)? else {
         return Ok(());
     };
-    let len = r.len;
-    let mut read_bytes = 0_u64;
-    while read_bytes < len {
-        let (entry, step) = read_id_frame_ref(&mut r)?;
-        read_bytes = read_bytes.checked_add(step).ok_or_else(corrupt)?;
-        if read_bytes > len {
-            return Err(corrupt());
-        }
-        out.push(entry);
+    let mut r = ScratchCursor::new(&raw);
+    while !r.is_empty() {
+        out.push(decode_id_frame_ref(&mut r)?);
     }
     r.finish()
 }
@@ -2820,18 +2633,15 @@ pub(crate) fn write_bucket_id_refs(
 
 /// Reads a deduplicated bucket's `(id, SourceFrameRef)` list.
 pub(crate) fn read_bucket_id_refs(path: &Path) -> Result<Vec<IdFrameEntry>> {
-    let mut r = ChecksummedFileReader::open(path)?;
-    let mut n_b = [0_u8; 4];
-    r.read_exact(&mut n_b).map_err(io_error)?;
-    let count = u32::from_be_bytes(n_b) as usize;
-    let max_possible = (r.body_len.saturating_sub(4) / 21) as usize;
-    if count > max_possible {
+    let raw = read_checksummed_bytes(path)?;
+    let mut r = ScratchCursor::new(&raw);
+    let count = r.u32()? as usize;
+    if count > raw.len().saturating_sub(4) / 21 {
         return Err(corrupt());
     }
     let mut out = Vec::with_capacity(count.min(65_536));
     for _ in 0..count {
-        let (entry, _) = read_id_frame_ref(&mut r)?;
-        out.push(entry);
+        out.push(decode_id_frame_ref(&mut r)?);
     }
     r.finish()?;
     Ok(out)
@@ -2849,13 +2659,14 @@ pub(crate) fn write_indexed_shards(
         u32::try_from(shards.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
     let config = manifest.config();
     let mut encoded_slices: Vec<Vec<u8>> = Vec::with_capacity(shards.len());
-    let mut counts = Vec::with_capacity(shards.len());
+    let mut cnt_buf = Vec::with_capacity(4 + shards.len() * 8);
+    cnt_buf.extend_from_slice(&shard_count.to_be_bytes());
     let mut body_bytes = 0_u64;
 
     for shard in shards {
         let row_count =
             u32::try_from(shard.rows.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
-        counts.push(shard.rows.len() as u64);
+        cnt_buf.extend_from_slice(&(shard.rows.len() as u64).to_be_bytes());
         let mut buf = Vec::new();
         if row_count > 0 {
             buf.extend_from_slice(&row_count.to_be_bytes());
@@ -2865,12 +2676,6 @@ pub(crate) fn write_indexed_shards(
         }
         body_bytes += buf.len() as u64;
         encoded_slices.push(buf);
-    }
-
-    let mut cnt_buf = Vec::with_capacity(4 + counts.len() * 8);
-    cnt_buf.extend_from_slice(&shard_count.to_be_bytes());
-    for &c in &counts {
-        cnt_buf.extend_from_slice(&c.to_be_bytes());
     }
 
     let total_needed = 12_u64
@@ -2886,22 +2691,42 @@ pub(crate) fn write_indexed_shards(
 
 /// Reads the per-shard row counts written for one scatter run.
 pub(crate) fn read_shard_counts(cnt_path: &Path, expected_shards: usize) -> Result<Vec<u64>> {
-    let mut r = ChecksummedFileReader::open(cnt_path)?;
-    let mut len_b = [0_u8; 4];
-    r.read_exact(&mut len_b).map_err(io_error)?;
-    let count = u32::from_be_bytes(len_b) as usize;
-    if count != expected_shards || count > MAX_TOTAL_SHARDS || r.body_len != 4 + (count as u64) * 8
-    {
+    let raw = read_checksummed_bytes(cnt_path)?;
+    let mut r = ScratchCursor::new(&raw);
+    let count = r.u32()? as usize;
+    if count != expected_shards || count > MAX_TOTAL_SHARDS || raw.len() != 4 + count * 8 {
         return Err(corrupt());
     }
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
-        let mut b = [0_u8; 8];
-        r.read_exact(&mut b).map_err(io_error)?;
-        out.push(u64::from_be_bytes(b));
+        out.push(r.u64()?);
     }
     r.finish()?;
     Ok(out)
+}
+
+fn append_decoded_rows(raw: &[u8], manifest: &IndexManifest, dst: &mut ShardRows) -> Result<()> {
+    let mut r = ScratchCursor::new(raw);
+    let rows = r.u32()? as usize;
+    if rows == 0 {
+        return r.finish();
+    }
+    let config = manifest.config();
+    let (types, type_count) = manifest.tree_key_types();
+    let tree_types = &types[..type_count];
+    let dim = config.dimension();
+    let min_row_bytes = (8 + dim * 4) as u64;
+    if (rows as u64).saturating_mul(min_row_bytes) > (raw.len().saturating_sub(4) as u64) {
+        return Err(corrupt());
+    }
+    dst.rows.reserve(rows.min(65_536));
+    dst.vectors.reserve(rows.min(65_536).saturating_mul(dim));
+    let mut vec_f32 = vec![0.0_f32; dim];
+    for _ in 0..rows {
+        let (tk, id, fields) = decode_compact_row(&mut r, config, tree_types, &mut vec_f32)?;
+        dst.push(tk, id, fields, None, &vec_f32);
+    }
+    r.finish()
 }
 
 /// Appends one Coarse-Shard slice `shard_idx` from `vec-{run:06}.bin` into `dst`.
@@ -2911,37 +2736,13 @@ pub(crate) fn read_indexed_shard_slice(
     manifest: &IndexManifest,
     dst: &mut ShardRows,
 ) -> Result<()> {
-    let Some(mut r) = SliceReader::open(vec_path, shard_idx, MAX_TOTAL_SHARDS)? else {
+    let Some(raw) = read_indexed_slice(vec_path, shard_idx, MAX_TOTAL_SHARDS)? else {
         return Ok(());
     };
-    let len = r.len;
-    let mut n_b = [0_u8; 4];
-    r.read_exact(&mut n_b).map_err(io_error)?;
-    let rows = u32::from_be_bytes(n_b) as usize;
-    if rows == 0 {
-        return r.finish();
-    }
-    let config = manifest.config();
-    let (types, type_count) = manifest.tree_key_types();
-    let tree_types = &types[..type_count];
-    let dim = config.dimension();
-    let min_row_bytes = (8 + dim * 4) as u64;
-    if (rows as u64).saturating_mul(min_row_bytes) > len.saturating_sub(4) {
-        return Err(corrupt());
-    }
-    let mut vec_raw = vec![0_u8; dim * 4];
-    let mut vec_f32 = vec![0.0_f32; dim];
-
-    for _ in 0..rows {
-        let (tree_key, id, fields) =
-            decode_row_from_reader(&mut r, config, tree_types, &mut vec_raw, &mut vec_f32)?;
-        dst.push(tree_key, id, fields, None, &vec_f32);
-    }
-    r.finish()
+    append_decoded_rows(&raw, manifest, dst)
 }
 
-/// Consolidates one Coarse Shard's immutable base rows (`0..count`) into a single checksummed
-/// file (`base-e{ep}-{s:06}.bin`) during `STAGE_LEAVES`.
+/// Consolidates one Coarse Shard's immutable base rows (`0..count`) into `base-e{ep}-{s:06}.bin`.
 pub(crate) fn write_base_shard_rows(
     path: &Path,
     manifest: &IndexManifest,
@@ -2949,6 +2750,9 @@ pub(crate) fn write_base_shard_rows(
     count: usize,
     quota: &ScratchQuota,
 ) -> Result<u64> {
+    if count == 0 {
+        return Ok(0);
+    }
     let row_count = u32::try_from(count).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
     let config = manifest.config();
     let mut buf = Vec::new();
@@ -2959,41 +2763,8 @@ pub(crate) fn write_base_shard_rows(
     write_checksummed_bytes(path, &buf, quota)
 }
 
-/// Reads consolidated base rows (`base-e{ep}-{s:06}.bin`) into `dst`.
-pub(crate) fn read_base_shard_rows(
-    path: &Path,
-    manifest: &IndexManifest,
-    dst: &mut ShardRows,
-) -> Result<()> {
-    let mut r = ChecksummedFileReader::open(path)?;
-    let mut n_b = [0_u8; 4];
-    r.read_exact(&mut n_b).map_err(io_error)?;
-    let rows = u32::from_be_bytes(n_b) as usize;
-    if rows == 0 {
-        return r.finish();
-    }
-    let config = manifest.config();
-    let (types, type_count) = manifest.tree_key_types();
-    let tree_types = &types[..type_count];
-    let dim = config.dimension();
-    let min_row_bytes = (8 + dim * 4) as u64;
-    if (rows as u64).saturating_mul(min_row_bytes) > r.body_len.saturating_sub(4) {
-        return Err(corrupt());
-    }
-    dst.rows.reserve(rows.min(65_536));
-    dst.vectors.reserve(rows.min(65_536).saturating_mul(dim));
-    let mut vec_raw = vec![0_u8; dim * 4];
-    let mut vec_f32 = vec![0.0_f32; dim];
-    for _ in 0..rows {
-        let (tk, id, fields) =
-            decode_row_from_reader(&mut r, config, tree_types, &mut vec_raw, &mut vec_f32)?;
-        dst.push(tk, id, fields, None, &vec_f32);
-    }
-    r.finish()
-}
-
-/// Persists a shard's delta state (`mem-*`, `centers-*`, `inb-*`) without rewriting its
-/// immutable base vectors in `base-*` (`0..base_row_count`).
+/// Persists a shard's delta state (`mem-*`, `centers-*`, and non-empty `inb-*`) without
+/// duplicating `(TreeKey, PartitionCentroid)` in `mem-*` or creating empty `inb-*` files.
 pub(crate) fn write_compact_shard_state(
     mem_path: &Path,
     centers_path: &Path,
@@ -3005,6 +2776,9 @@ pub(crate) fn write_compact_shard_state(
 ) -> Result<(u64, u64, u64)> {
     let base_u32 =
         u32::try_from(base_row_count).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
+    let inb_rows = state.rows.rows.get(base_row_count..).unwrap_or(&[]);
+    let inb_u32 =
+        u32::try_from(inb_rows.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
     let leaf_count =
         u32::try_from(state.leaves.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
     let config = manifest.config();
@@ -3012,30 +2786,20 @@ pub(crate) fn write_compact_shard_state(
 
     let mut mem_buf = Vec::new();
     mem_buf.extend_from_slice(&base_u32.to_be_bytes());
+    mem_buf.extend_from_slice(&inb_u32.to_be_bytes());
     mem_buf.extend_from_slice(&leaf_count.to_be_bytes());
 
     let mut centers_buf = Vec::new();
     centers_buf.extend_from_slice(&leaf_count.to_be_bytes());
 
     for leaf in &state.leaves {
-        let tk = leaf.tree_key.as_bytes();
-        let tk_len = u32::try_from(tk.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
         let mem_len =
             u32::try_from(leaf.members.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
         let c_bytes = codec.encode(&PersistentValue::PartitionCentroid(leaf.centroid.clone()))?;
-        let c_len =
-            u32::try_from(c_bytes.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
-
-        centers_buf.extend_from_slice(&tk_len.to_be_bytes());
-        centers_buf.extend_from_slice(tk);
+        push_sized(&mut centers_buf, leaf.tree_key.as_bytes())?;
         centers_buf.extend_from_slice(&mem_len.to_be_bytes());
-        centers_buf.extend_from_slice(&c_len.to_be_bytes());
-        centers_buf.extend_from_slice(&c_bytes);
+        push_sized(&mut centers_buf, &c_bytes)?;
 
-        mem_buf.extend_from_slice(&tk_len.to_be_bytes());
-        mem_buf.extend_from_slice(tk);
-        mem_buf.extend_from_slice(&c_len.to_be_bytes());
-        mem_buf.extend_from_slice(&c_bytes);
         mem_buf.extend_from_slice(&mem_len.to_be_bytes());
         for &row_idx in &leaf.members {
             let row_u32 =
@@ -3044,80 +2808,83 @@ pub(crate) fn write_compact_shard_state(
         }
     }
 
-    let inb_rows = state.rows.rows.get(base_row_count..).unwrap_or(&[]);
-    let inb_count =
-        u32::try_from(inb_rows.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
     let mut inb_buf = Vec::new();
-    inb_buf.extend_from_slice(&inb_count.to_be_bytes());
-    for row in inb_rows {
-        encode_compact_row(&mut inb_buf, config, row, state.rows.vector(row.vec_slot))?;
+    if inb_u32 > 0 {
+        inb_buf.extend_from_slice(&inb_u32.to_be_bytes());
+        for row in inb_rows {
+            encode_compact_row(&mut inb_buf, config, row, state.rows.vector(row.vec_slot))?;
+        }
     }
 
+    let inb_needed = if inb_u32 > 0 {
+        inb_buf.len() as u64 + 8
+    } else {
+        0
+    };
     let total_needed = (mem_buf.len() as u64 + 8)
         .saturating_add(centers_buf.len() as u64 + 8)
-        .saturating_add(inb_buf.len() as u64 + 8);
+        .saturating_add(inb_needed);
     quota.ensure_headroom(total_needed, &[mem_path, centers_path, inb_path])?;
 
     let b1 = write_checksummed_bytes(mem_path, &mem_buf, quota)?;
     let b2 = write_checksummed_bytes(centers_path, &centers_buf, quota)?;
-    let b3 = write_checksummed_bytes(inb_path, &inb_buf, quota)?;
+    let b3 = if inb_u32 > 0 {
+        write_checksummed_bytes(inb_path, &inb_buf, quota)?
+    } else {
+        0
+    };
     Ok((b1, b2, b3))
 }
 
-/// Reconstructs a full `ShardState` (and its `base_row_count`) from `base-*` + `inb-*` + `mem-*`.
+/// Reconstructs a full `ShardState` (and `base_row_count`) from `base-*`, `centers-*`, `mem-*`, and `inb-*`.
 pub(crate) fn read_compact_shard_state(
     base_path: &Path,
+    centers_path: &Path,
     mem_path: &Path,
     inb_path: &Path,
     manifest: &IndexManifest,
 ) -> Result<(ShardState, usize)> {
-    let config = manifest.config();
-    let dim = config.dimension();
-    let mut rows = ShardRows::new(dim);
-    read_base_shard_rows(base_path, manifest, &mut rows)?;
-    let actual_base = rows.rows.len();
+    let mem_raw = read_checksummed_bytes(mem_path)?;
+    let mut r_mem = ScratchCursor::new(&mem_raw);
+    let recorded_base = r_mem.u32()? as usize;
+    let recorded_inb = r_mem.u32()? as usize;
+    let leaf_count = r_mem.u32()? as usize;
 
-    let mut r_mem = ChecksummedFileReader::open(mem_path)?;
-    let mut base_b = [0_u8; 4];
-    r_mem.read_exact(&mut base_b).map_err(io_error)?;
-    let recorded_base = u32::from_be_bytes(base_b) as usize;
-    if recorded_base != actual_base {
+    let mut rows = ShardRows::new(manifest.config().dimension());
+    if recorded_base > 0 {
+        let base_raw = read_checksummed_bytes(base_path)?;
+        append_decoded_rows(&base_raw, manifest, &mut rows)?;
+        if rows.rows.len() != recorded_base {
+            return Err(corrupt());
+        }
+    }
+    if recorded_inb > 0 {
+        let inb_raw = read_checksummed_bytes(inb_path)?;
+        append_decoded_rows(&inb_raw, manifest, &mut rows)?;
+        if rows.rows.len() != recorded_base + recorded_inb {
+            return Err(corrupt());
+        }
+    }
+
+    let centers = read_shard_centers(centers_path, manifest)?;
+    if centers.len() != leaf_count {
         return Err(corrupt());
     }
-    let mut l_b = [0_u8; 4];
-    r_mem.read_exact(&mut l_b).map_err(io_error)?;
-    let leaf_count = u32::from_be_bytes(l_b) as usize;
-    if (leaf_count as u64).saturating_mul(12) > r_mem.body_len.saturating_sub(8) {
-        return Err(corrupt());
-    }
 
-    // Append inbound delta rows (`base_row_count ..`).
-    read_base_shard_rows(inb_path, manifest, &mut rows)?;
-
-    let (types, type_count) = manifest.tree_key_types();
-    let tree_types = &types[..type_count];
-    let codec = ValueCodec::for_index(manifest);
-    let index_id = manifest.logical_index_id();
-    let dummy_pk = PartitionKey::new(2).map_err(|_| corrupt())?;
-    let mut leaves = Vec::with_capacity(leaf_count.min(65_536));
+    let mut leaves = Vec::with_capacity(leaf_count);
     let mut seen_members = 0_usize;
-
-    for _ in 0..leaf_count {
-        let tk = decode_len_tree_key(&mut r_mem, tree_types)?;
-        let centroid = decode_len_centroid(&mut r_mem, codec, index_id, &tk, dummy_pk)?;
-
-        let mut m_len_b = [0_u8; 4];
-        r_mem.read_exact(&mut m_len_b).map_err(io_error)?;
-        let m_count = u32::from_be_bytes(m_len_b) as usize;
+    for (tk, expected_count, centroid) in centers {
+        let m_count = r_mem.u32()? as usize;
+        if m_count != expected_count {
+            return Err(corrupt());
+        }
         seen_members = seen_members.checked_add(m_count).ok_or_else(corrupt)?;
         if seen_members > rows.rows.len() {
             return Err(corrupt());
         }
         let mut members = Vec::with_capacity(m_count);
         for _ in 0..m_count {
-            let mut idx_b = [0_u8; 4];
-            r_mem.read_exact(&mut idx_b).map_err(io_error)?;
-            let row_idx = u32::from_be_bytes(idx_b) as usize;
+            let row_idx = r_mem.u32()? as usize;
             if row_idx >= rows.rows.len() {
                 return Err(corrupt());
             }
@@ -3130,45 +2897,7 @@ pub(crate) fn read_compact_shard_state(
         });
     }
     r_mem.finish()?;
-    Ok((ShardState { rows, leaves }, actual_base))
-}
-
-fn decode_len_tree_key(r: &mut impl Read, tree_types: &[crate::api::DataType]) -> Result<TreeKey> {
-    let mut tk_len_b = [0_u8; 4];
-    r.read_exact(&mut tk_len_b).map_err(io_error)?;
-    let tk_len = u32::from_be_bytes(tk_len_b) as usize;
-    if tk_len > MAX_TREE_KEY_BYTES {
-        return Err(corrupt());
-    }
-    let mut tk_buf = vec![0_u8; tk_len];
-    r.read_exact(&mut tk_buf).map_err(io_error)?;
-    TreeKey::from_encoded(tree_types, Bytes::from(tk_buf))
-}
-
-fn decode_len_centroid(
-    r: &mut impl Read,
-    codec: ValueCodec<'_>,
-    index_id: crate::api::LogicalIndexId,
-    tk: &TreeKey,
-    pk: PartitionKey,
-) -> Result<PartitionCentroid> {
-    let mut c_len_b = [0_u8; 4];
-    r.read_exact(&mut c_len_b).map_err(io_error)?;
-    let c_len = u32::from_be_bytes(c_len_b) as usize;
-    if c_len == 0 || c_len > MAX_VALUE_BYTES {
-        return Err(corrupt());
-    }
-    let mut c_buf = vec![0_u8; c_len];
-    r.read_exact(&mut c_buf).map_err(io_error)?;
-    let c_key = LogicalKey::Centroid {
-        index: index_id,
-        tree_key: tk.clone(),
-        partition: pk,
-    };
-    match codec.decode(&c_key, Bytes::from(c_buf))? {
-        PersistentValue::PartitionCentroid(c) => Ok(c),
-        _ => Err(corrupt()),
-    }
+    Ok((ShardState { rows, leaves }, recorded_base))
 }
 
 /// Writes outbound cross-shard moved rows (`outb-e{ep}-r{r}-{src_s:06}.bin`) indexed by `dst_shard`.
@@ -3206,31 +2935,23 @@ pub(crate) fn read_indexed_outbound_slice(
     rows: &mut ShardRows,
     inbound_leaf_targets: &mut Vec<(u32, usize)>,
 ) -> Result<()> {
-    let Some(mut r) = SliceReader::open(path, dst_shard, MAX_TOTAL_SHARDS)? else {
+    let Some(raw) = read_indexed_slice(path, dst_shard, MAX_TOTAL_SHARDS)? else {
         return Ok(());
     };
-    let len = r.len;
-    let mut n_b = [0_u8; 4];
-    r.read_exact(&mut n_b).map_err(io_error)?;
-    let item_count = u32::from_be_bytes(n_b) as usize;
-
+    let mut r = ScratchCursor::new(&raw);
+    let item_count = r.u32()? as usize;
     let config = manifest.config();
     let (types, type_count) = manifest.tree_key_types();
     let tree_types = &types[..type_count];
     let dim = config.dimension();
     let min_item_bytes = (12 + dim * 4) as u64;
-    if (item_count as u64).saturating_mul(min_item_bytes) > len.saturating_sub(4) {
+    if (item_count as u64).saturating_mul(min_item_bytes) > (raw.len().saturating_sub(4) as u64) {
         return Err(corrupt());
     }
-    let mut vec_raw = vec![0_u8; dim * 4];
     let mut vec_f32 = vec![0.0_f32; dim];
-
     for _ in 0..item_count {
-        let mut dl_b = [0_u8; 4];
-        r.read_exact(&mut dl_b).map_err(io_error)?;
-        let dst_local_leaf = u32::from_be_bytes(dl_b);
-        let (tk, id, fields) =
-            decode_row_from_reader(&mut r, config, tree_types, &mut vec_raw, &mut vec_f32)?;
+        let dst_local_leaf = r.u32()?;
+        let (tk, id, fields) = decode_compact_row(&mut r, config, tree_types, &mut vec_f32)?;
         let new_idx = rows.rows.len();
         rows.push(tk, id, fields, None, &vec_f32);
         inbound_leaf_targets.push((dst_local_leaf, new_idx));
@@ -3243,11 +2964,10 @@ pub(crate) fn read_shard_centers(
     centers_path: &Path,
     manifest: &IndexManifest,
 ) -> Result<Vec<(TreeKey, usize, PartitionCentroid)>> {
-    let mut r = ChecksummedFileReader::open(centers_path)?;
-    let mut n_b = [0_u8; 4];
-    r.read_exact(&mut n_b).map_err(io_error)?;
-    let count = u32::from_be_bytes(n_b) as usize;
-    if (count as u64).saturating_mul(12) > r.body_len.saturating_sub(4) {
+    let raw = read_checksummed_bytes(centers_path)?;
+    let mut r = ScratchCursor::new(&raw);
+    let count = r.u32()? as usize;
+    if (count as u64).saturating_mul(12) > (raw.len().saturating_sub(4) as u64) {
         return Err(corrupt());
     }
     let codec = ValueCodec::for_index(manifest);
@@ -3257,47 +2977,141 @@ pub(crate) fn read_shard_centers(
     let tree_types = &types[..type_count];
     let mut out = Vec::with_capacity(count.min(65_536));
     for _ in 0..count {
-        let tk = decode_len_tree_key(&mut r, tree_types)?;
-        let mut mc_b = [0_u8; 4];
-        r.read_exact(&mut mc_b).map_err(io_error)?;
-        let member_count = u32::from_be_bytes(mc_b) as usize;
-        let centroid = decode_len_centroid(&mut r, codec, index_id, &tk, dummy_pk)?;
+        let tk = r.tree_key(tree_types)?;
+        let member_count = r.u32()? as usize;
+        let centroid = r.centroid(codec, index_id, &tk, dummy_pk)?;
         out.push((tk, member_count, centroid));
     }
     r.finish()?;
     Ok(out)
 }
 
-/// Reads only the `TreeKey` per leaf from `centers-*` while verifying its `xxh3_64` trailer.
+/// Reads only the `TreeKey` per leaf from `centers-*` without allocating decoded centroids.
 pub(crate) fn read_shard_leaf_trees(
     centers_path: &Path,
     manifest: &IndexManifest,
 ) -> Result<Vec<TreeKey>> {
-    let mut r = ChecksummedFileReader::open(centers_path)?;
-    let mut n_b = [0_u8; 4];
-    r.read_exact(&mut n_b).map_err(io_error)?;
-    let count = u32::from_be_bytes(n_b) as usize;
-    if (count as u64).saturating_mul(12) > r.body_len.saturating_sub(4) {
+    let raw = read_checksummed_bytes(centers_path)?;
+    let mut r = ScratchCursor::new(&raw);
+    let count = r.u32()? as usize;
+    if (count as u64).saturating_mul(12) > (raw.len().saturating_sub(4) as u64) {
         return Err(corrupt());
     }
     let (types, type_count) = manifest.tree_key_types();
     let tree_types = &types[..type_count];
     let mut out = Vec::with_capacity(count.min(65_536));
-    let mut skip_buf = Vec::new();
     for _ in 0..count {
-        let tk = decode_len_tree_key(&mut r, tree_types)?;
-        let mut skip_hdr = [0_u8; 8];
-        r.read_exact(&mut skip_hdr).map_err(io_error)?;
-        let c_len = u32::from_be_bytes(skip_hdr[4..8].try_into().expect("c_len")) as usize;
+        let tk = r.tree_key(tree_types)?;
+        let _member_count = r.u32()?;
+        let c_len = r.u32()? as usize;
         if c_len == 0 || c_len > MAX_VALUE_BYTES {
             return Err(corrupt());
         }
-        skip_buf.resize(c_len, 0);
-        r.read_exact(&mut skip_buf).map_err(io_error)?;
+        r.take(c_len)?;
         out.push(tk);
     }
     r.finish()?;
     Ok(out)
+}
+
+/// Persists `(scatter_records, final_round, assigned, tree_totals)` to `leafkeys-e{ep}.bin`
+/// before `STAGE_EMIT_LEAVES` so late or recovering workers remain decoupled from reclaimed
+/// construction/refinement scratch files.
+pub(crate) fn write_leaf_keys_plan(
+    path: &Path,
+    scatter_records: u64,
+    final_round: u8,
+    assigned: &[Vec<AssignedLeafKey>],
+    tree_totals: &TreeLeafTotals,
+    quota: &ScratchQuota,
+) -> Result<u64> {
+    let shard_count =
+        u32::try_from(assigned.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
+    let tree_count =
+        u32::try_from(tree_totals.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
+    let mut buf = Vec::new();
+    buf.extend_from_slice(LEAF_KEYS_MAGIC);
+    buf.extend_from_slice(&scatter_records.to_be_bytes());
+    buf.push(final_round);
+    buf.extend_from_slice(&shard_count.to_be_bytes());
+    for keys in assigned {
+        let k_len = u32::try_from(keys.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
+        buf.extend_from_slice(&k_len.to_be_bytes());
+        for ak in keys {
+            buf.extend_from_slice(&ak.partition_key.get().to_be_bytes());
+            buf.push(u8::from(ak.is_single_leaf_root));
+        }
+    }
+    buf.extend_from_slice(&tree_count.to_be_bytes());
+    for (tk, total_leaves) in tree_totals.values() {
+        push_sized(&mut buf, tk.as_bytes())?;
+        buf.extend_from_slice(&total_leaves.to_be_bytes());
+    }
+    write_checksummed_bytes(path, &buf, quota)
+}
+
+pub(crate) type LoadedLeafKeysPlan = (u64, u8, Vec<Vec<AssignedLeafKey>>, TreeLeafTotals);
+
+/// Loads `(scatter_records, final_round, assigned, tree_totals)` from `leafkeys-e{ep}.bin`.
+pub(crate) fn read_leaf_keys_plan(
+    path: &Path,
+    expected_shards: u32,
+    manifest: &IndexManifest,
+) -> Result<LoadedLeafKeysPlan> {
+    let raw = read_checksummed_bytes(path)?;
+    let mut r = ScratchCursor::new(&raw);
+    if r.take(8)? != LEAF_KEYS_MAGIC {
+        return Err(corrupt());
+    }
+    let scatter_records = r.u64()?;
+    let final_round = r.u8()?;
+    let shard_count = r.u32()?;
+    if shard_count != expected_shards || (shard_count as usize) > MAX_TOTAL_SHARDS {
+        return Err(corrupt());
+    }
+    let mut assigned = Vec::with_capacity(shard_count as usize);
+    for _ in 0..shard_count {
+        let k_len = r.u32()? as usize;
+        if (k_len as u64).saturating_mul(9) > (raw.len() as u64) {
+            return Err(corrupt());
+        }
+        let mut keys = Vec::with_capacity(k_len);
+        for _ in 0..k_len {
+            let pk = PartitionKey::new(r.u64()?).map_err(|_| corrupt())?;
+            let is_single_leaf_root = match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(corrupt()),
+            };
+            keys.push(AssignedLeafKey {
+                partition_key: pk,
+                is_single_leaf_root,
+            });
+        }
+        assigned.push(keys);
+    }
+    let tree_count = r.u32()? as usize;
+    if (tree_count as u64).saturating_mul(12) > (raw.len() as u64) {
+        return Err(corrupt());
+    }
+    let (types, tcount) = manifest.tree_key_types();
+    let tree_types = &types[..tcount];
+    let mut tree_totals = BTreeMap::new();
+    for _ in 0..tree_count {
+        let tk = r.tree_key(tree_types)?;
+        let total_leaves = r.u64()?;
+        if total_leaves == 0 {
+            return Err(corrupt());
+        }
+        if tree_totals
+            .insert(Bytes::copy_from_slice(tk.as_bytes()), (tk, total_leaves))
+            .is_some()
+        {
+            return Err(corrupt());
+        }
+    }
+    r.finish()?;
+    Ok((scatter_records, final_round, assigned, tree_totals))
 }
 
 /// Writes indexed location buckets (`loc-e{ep}-{shard:06}.bin`) emitted by one Coarse Shard.
@@ -3310,15 +3124,8 @@ pub(crate) fn write_indexed_locations(
     for bucket in buckets {
         let mut buf = Vec::new();
         for (id, tk, pk) in bucket {
-            let id_len =
-                u32::try_from(id.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
-            let tk_b = tk.as_bytes();
-            let tk_len =
-                u32::try_from(tk_b.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
-            buf.extend_from_slice(&id_len.to_be_bytes());
-            buf.extend_from_slice(id);
-            buf.extend_from_slice(&tk_len.to_be_bytes());
-            buf.extend_from_slice(tk_b);
+            push_sized(&mut buf, id)?;
+            push_sized(&mut buf, tk.as_bytes())?;
             buf.extend_from_slice(&pk.get().to_be_bytes());
         }
         slices.push(buf);
@@ -3333,36 +3140,17 @@ pub(crate) fn read_indexed_locations_slice(
     manifest: &IndexManifest,
     out: &mut Vec<(Bytes, TreeKey, PartitionKey)>,
 ) -> Result<()> {
-    let Some(mut r) = SliceReader::open(path, bucket_idx, MAX_TOTAL_SHARDS)? else {
+    let Some(raw) = read_indexed_slice(path, bucket_idx, MAX_TOTAL_SHARDS)? else {
         return Ok(());
     };
-    let len = r.len;
+    let mut r = ScratchCursor::new(&raw);
     let (types, type_count) = manifest.tree_key_types();
     let tree_types = &types[..type_count];
-    let mut read_bytes = 0_u64;
-    while read_bytes < len {
-        let mut id_l = [0_u8; 4];
-        r.read_exact(&mut id_l).map_err(io_error)?;
-        let id_len = u32::from_be_bytes(id_l) as usize;
-        if id_len == 0 || id_len > MAX_RECORD_ID_BYTES {
-            return Err(corrupt());
-        }
-        let mut id = vec![0_u8; id_len];
-        r.read_exact(&mut id).map_err(io_error)?;
-
-        let tk = decode_len_tree_key(&mut r, tree_types)?;
-        let tk_len = tk.as_bytes().len();
-        let step = 16_u64 + id_len as u64 + tk_len as u64;
-        if read_bytes.checked_add(step).is_none_or(|end| end > len) {
-            return Err(corrupt());
-        }
-
-        let mut pk_b = [0_u8; 8];
-        r.read_exact(&mut pk_b).map_err(io_error)?;
-        let pk = PartitionKey::new(u64::from_be_bytes(pk_b)).map_err(|_| corrupt())?;
-
-        read_bytes += step;
-        out.push((Bytes::from(id), tk, pk));
+    while !r.is_empty() {
+        let id = r.non_empty_bytes(MAX_RECORD_ID_BYTES)?;
+        let tk = r.tree_key(tree_types)?;
+        let pk = PartitionKey::new(r.u64()?).map_err(|_| corrupt())?;
+        out.push((id, tk, pk));
     }
     r.finish()
 }
@@ -3377,10 +3165,8 @@ pub(crate) fn write_proposals(
     let mut buf = Vec::with_capacity(4 + proposals.len() * 40);
     buf.extend_from_slice(&count.to_be_bytes());
     for p in proposals {
-        let id_len = u32::try_from(p.id.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
         buf.extend_from_slice(&p.gain.to_bits().to_be_bytes());
-        buf.extend_from_slice(&id_len.to_be_bytes());
-        buf.extend_from_slice(&p.id);
+        push_sized(&mut buf, &p.id)?;
         buf.extend_from_slice(&p.src_shard.to_be_bytes());
         buf.extend_from_slice(&p.src_local_leaf.to_be_bytes());
         buf.extend_from_slice(&p.src_row_idx.to_be_bytes());
@@ -3392,42 +3178,27 @@ pub(crate) fn write_proposals(
 
 /// Reads `MoveProposal`s written by [`write_proposals`].
 pub(crate) fn read_proposals(path: &Path) -> Result<Vec<MoveProposal>> {
-    let mut r = ChecksummedFileReader::open(path)?;
-    let mut n_b = [0_u8; 4];
-    r.read_exact(&mut n_b).map_err(io_error)?;
-    let count = u32::from_be_bytes(n_b) as usize;
-    let max_possible = (r.body_len.saturating_sub(4) / 33) as usize;
-    if count > max_possible {
+    let raw = read_checksummed_bytes(path)?;
+    let mut r = ScratchCursor::new(&raw);
+    let count = r.u32()? as usize;
+    if count > raw.len().saturating_sub(4) / 33 {
         return Err(corrupt());
     }
     let mut out = Vec::with_capacity(count.min(65_536));
     for _ in 0..count {
-        let mut g_b = [0_u8; 8];
-        r.read_exact(&mut g_b).map_err(io_error)?;
-        let gain = f64::from_bits(u64::from_be_bytes(g_b));
+        let gain = f64::from_bits(r.u64()?);
         if !gain.is_finite() || gain <= 0.0 {
             return Err(corrupt());
         }
-
-        let mut id_l = [0_u8; 4];
-        r.read_exact(&mut id_l).map_err(io_error)?;
-        let id_len = u32::from_be_bytes(id_l) as usize;
-        if id_len == 0 || id_len > MAX_RECORD_ID_BYTES {
-            return Err(corrupt());
-        }
-        let mut id = vec![0_u8; id_len];
-        r.read_exact(&mut id).map_err(io_error)?;
-
-        let mut fields = [0_u8; 20];
-        r.read_exact(&mut fields).map_err(io_error)?;
+        let id = r.non_empty_bytes(MAX_RECORD_ID_BYTES)?;
         out.push(MoveProposal {
             gain,
-            id: Bytes::from(id),
-            src_shard: u32::from_be_bytes(fields[0..4].try_into().expect("src_s")),
-            src_local_leaf: u32::from_be_bytes(fields[4..8].try_into().expect("src_l")),
-            src_row_idx: u32::from_be_bytes(fields[8..12].try_into().expect("src_r")),
-            dst_shard: u32::from_be_bytes(fields[12..16].try_into().expect("dst_s")),
-            dst_local_leaf: u32::from_be_bytes(fields[16..20].try_into().expect("dst_l")),
+            id,
+            src_shard: r.u32()?,
+            src_local_leaf: r.u32()?,
+            src_row_idx: r.u32()?,
+            dst_shard: r.u32()?,
+            dst_local_leaf: r.u32()?,
         });
     }
     r.finish()?;
@@ -3450,15 +3221,10 @@ pub(crate) fn write_indexed_upper_children(
         let tk_hash = u64::from_be_bytes(tree_key_hash(tk)[..8].try_into().expect("sha256 prefix"));
         let bucket = (tk_hash % (nbuckets as u64)) as usize;
         let dst = &mut slices[bucket];
-        let tk_b = tk.as_bytes();
-        let tk_len = u32::try_from(tk_b.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
         let c_b = codec.encode(&PersistentValue::PartitionCentroid(centroid.clone()))?;
-        let c_len = u32::try_from(c_b.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
-        dst.extend_from_slice(&tk_len.to_be_bytes());
-        dst.extend_from_slice(tk_b);
+        push_sized(dst, tk.as_bytes())?;
         dst.extend_from_slice(&pk.get().to_be_bytes());
-        dst.extend_from_slice(&c_len.to_be_bytes());
-        dst.extend_from_slice(&c_b);
+        push_sized(dst, &c_b)?;
     }
     write_indexed_slices(path, &slices, quota)
 }
@@ -3470,47 +3236,18 @@ pub(crate) fn read_indexed_upper_children_slice(
     manifest: &IndexManifest,
     out: &mut Vec<(TreeKey, PartitionKey, PartitionCentroid)>,
 ) -> Result<()> {
-    let Some(mut r) = SliceReader::open(path, bucket_idx, MAX_TOTAL_SHARDS)? else {
+    let Some(raw) = read_indexed_slice(path, bucket_idx, MAX_TOTAL_SHARDS)? else {
         return Ok(());
     };
-    let len = r.len;
+    let mut r = ScratchCursor::new(&raw);
     let codec = ValueCodec::for_index(manifest);
     let index_id = manifest.logical_index_id();
     let (types, tcount) = manifest.tree_key_types();
     let tree_types = &types[..tcount];
-    let mut read_bytes = 0_u64;
-
-    while read_bytes < len {
-        let tk = decode_len_tree_key(&mut r, tree_types)?;
-        let tk_len = tk.as_bytes().len();
-
-        let mut pk_b = [0_u8; 8];
-        r.read_exact(&mut pk_b).map_err(io_error)?;
-        let pk = PartitionKey::new(u64::from_be_bytes(pk_b)).map_err(|_| corrupt())?;
-
-        let mut c_l = [0_u8; 4];
-        r.read_exact(&mut c_l).map_err(io_error)?;
-        let c_len = u32::from_be_bytes(c_l) as usize;
-        if c_len == 0 || c_len > MAX_VALUE_BYTES {
-            return Err(corrupt());
-        }
-        let step = 16_u64 + tk_len as u64 + c_len as u64;
-        if read_bytes.checked_add(step).is_none_or(|end| end > len) {
-            return Err(corrupt());
-        }
-        let mut c_b = vec![0_u8; c_len];
-        r.read_exact(&mut c_b).map_err(io_error)?;
-        let c_key = LogicalKey::Centroid {
-            index: index_id,
-            tree_key: tk.clone(),
-            partition: pk,
-        };
-        let PersistentValue::PartitionCentroid(centroid) =
-            codec.decode(&c_key, Bytes::from(c_b))?
-        else {
-            return Err(corrupt());
-        };
-        read_bytes += step;
+    while !r.is_empty() {
+        let tk = r.tree_key(tree_types)?;
+        let pk = PartitionKey::new(r.u64()?).map_err(|_| corrupt())?;
+        let centroid = r.centroid(codec, index_id, &tk, pk)?;
         out.push((tk, pk, centroid));
     }
     r.finish()
