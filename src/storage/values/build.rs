@@ -4,7 +4,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::api::{Error, Result};
-use crate::bulk::{ARTIFACT_MANIFEST_BYTES, ArtifactManifest};
+use crate::bulk::{INPUT_MANIFEST_BYTES, InputManifest};
 use crate::construction::ConstructionOptions;
 
 use super::corrupt;
@@ -20,7 +20,7 @@ const MAX_SOURCE_PATH_BYTES: usize = 4096;
 #[derive(Clone, Eq, PartialEq)]
 pub struct BuildDescriptor {
     source: PathBuf,
-    input: ArtifactManifest,
+    input: InputManifest,
     options: ConstructionOptions,
     refinement_rounds: Option<u8>,
 }
@@ -29,11 +29,10 @@ impl BuildDescriptor {
     /// Creates a bounded request descriptor with an absolute UTF-8 source path.
     pub fn new(
         source: PathBuf,
-        input: ArtifactManifest,
+        input: InputManifest,
         options: ConstructionOptions,
     ) -> Result<Self> {
-        if !input.is_input()
-            || !source.is_absolute()
+        if !source.is_absolute()
             || source
                 .to_str()
                 .is_none_or(|path| path.len() > MAX_SOURCE_PATH_BYTES || path.contains('\0'))
@@ -71,7 +70,7 @@ impl BuildDescriptor {
 
     /// Expected immutable source identity.
     #[must_use]
-    pub const fn input(&self) -> &ArtifactManifest {
+    pub const fn input(&self) -> &InputManifest {
         &self.input
     }
 
@@ -97,7 +96,7 @@ pub(super) fn encode(encoder: &mut Encoder, descriptor: &BuildDescriptor) -> Res
             .as_bytes(),
         MAX_SOURCE_PATH_BYTES,
     )?;
-    encoder.sized_bytes(&descriptor.input.encode(), ARTIFACT_MANIFEST_BYTES)?;
+    encoder.sized_bytes(&descriptor.input.encode(), INPUT_MANIFEST_BYTES)?;
     let options = descriptor.options;
     encoder.u64(options.sample_items as u64);
     encoder.u64(options.memory_bytes as u64);
@@ -109,7 +108,7 @@ pub(super) fn encode(encoder: &mut Encoder, descriptor: &BuildDescriptor) -> Res
 pub(super) fn decode(decoder: &mut Decoder) -> Result<BuildDescriptor> {
     let path = decoder.sized_bytes(MAX_SOURCE_PATH_BYTES)?;
     let source = PathBuf::from(std::str::from_utf8(&path).map_err(|_| corrupt())?);
-    let input = ArtifactManifest::decode(&decoder.sized_bytes(ARTIFACT_MANIFEST_BYTES)?)?;
+    let input = InputManifest::decode(&decoder.sized_bytes(INPUT_MANIFEST_BYTES)?)?;
     let options = ConstructionOptions {
         sample_items: usize::try_from(decoder.u64()?).map_err(|_| corrupt())?,
         memory_bytes: usize::try_from(decoder.u64()?).map_err(|_| corrupt())?,

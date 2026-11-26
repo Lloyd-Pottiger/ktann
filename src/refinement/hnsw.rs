@@ -95,6 +95,162 @@ pub(super) fn neighbors(
     }
 }
 
+/// Builds the centroid graph and executes batched candidate searches in parallel across threads.
+pub(super) fn neighbors_parallel(
+    checkpoint: &(dyn Fn() -> Result<()> + Sync),
+    kernel: &VectorKernel,
+    leaves: &[impl LeafCenter + Sync],
+    parallelism: usize,
+    memory_limit_bytes: usize,
+) -> Result<Vec<LeafNeighbors>> {
+    let n = leaves.len();
+    if n > ktann_usearch::MAX_NODES {
+        return Err(Error::new(ErrorKind::LimitExceeded));
+    }
+    checkpoint()?;
+    let build_limit = ktann_usearch::build_bound(n, M).map_err(native_error)?;
+    let ws_bound = ktann_usearch::workspace_bound(n, M).map_err(native_error)?;
+    let neighbors_bytes = n
+        .checked_mul(std::mem::size_of::<LeafNeighbors>())
+        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+    let fixed_bytes = build_limit
+        .checked_add(neighbors_bytes)
+        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+    if fixed_bytes > memory_limit_bytes {
+        return Err(Error::new(ErrorKind::LimitExceeded));
+    }
+    let remaining_for_ws = memory_limit_bytes - fixed_bytes;
+    let max_affordable_workers = remaining_for_ws.checked_div(ws_bound).unwrap_or(8);
+    if max_affordable_workers == 0 {
+        return Err(Error::new(ErrorKind::LimitExceeded));
+    }
+    let workers = parallelism
+        .clamp(1, 8)
+        .min(n.max(1))
+        .min(max_affordable_workers);
+
+    let failure = std::sync::Mutex::new(None);
+    let record_err = |error: Error| {
+        let mut guard = failure.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            *guard = Some(error);
+        }
+    };
+    let proceed = || match checkpoint() {
+        Ok(()) => true,
+        Err(error) => {
+            record_err(error);
+            false
+        }
+    };
+    let distance = |a: u32, b: u32| {
+        kernel
+            .routing_distances_validated([leaves[a as usize].center()], leaves[b as usize].center())
+            [0]
+    };
+    let graph =
+        ktann_usearch::Graph::build(n, M, EF_CONSTRUCTION, 7, build_limit, &distance, &proceed)
+            .map_err(|e| {
+                if let Some(err) = failure.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                    err
+                } else {
+                    native_error(e)
+                }
+            })?;
+
+    let mut neighbors = vec![[(f64::INFINITY, usize::MAX); NEIGHBOR_COUNT]; n];
+    let chunk_size = n.div_ceil(workers).max(1);
+    let graph_ref = &graph;
+    let proceed_ref = &proceed;
+
+    let scope_res = std::thread::scope(|scope| -> Result<()> {
+        let mut handles = Vec::new();
+        for (chunk_idx, slice) in neighbors.chunks_mut(chunk_size).enumerate() {
+            let base = chunk_idx * chunk_size;
+            handles.push(scope.spawn(move || -> Result<()> {
+                let mut scratch =
+                    ktann_usearch::Workspace::new(n, M, ws_bound).map_err(native_error)?;
+                let mut hits = [ktann_usearch::Hit::default(); NEIGHBOR_COUNT + 1];
+                for (offset, retained) in slice.iter_mut().enumerate() {
+                    let source = base + offset;
+                    let q_vec = leaves[source].center();
+                    let query_distance = |_: u32, target: u32| {
+                        kernel
+                            .routing_distances_validated([q_vec], leaves[target as usize].center())
+                            [0]
+                    };
+                    let query_batch = |_: u32, nodes: &[u32], out: &mut [f64]| match nodes {
+                        [a, b, c, d] => {
+                            let scores = kernel.routing_distances_validated(
+                                [
+                                    leaves[*a as usize].center(),
+                                    leaves[*b as usize].center(),
+                                    leaves[*c as usize].center(),
+                                    leaves[*d as usize].center(),
+                                ],
+                                q_vec,
+                            );
+                            out.copy_from_slice(&scores);
+                        }
+                        [a, b, c] => {
+                            let scores = kernel.routing_distances_validated(
+                                [
+                                    leaves[*a as usize].center(),
+                                    leaves[*b as usize].center(),
+                                    leaves[*c as usize].center(),
+                                ],
+                                q_vec,
+                            );
+                            out.copy_from_slice(&scores);
+                        }
+                        [a, b] => {
+                            let scores = kernel.routing_distances_validated(
+                                [leaves[*a as usize].center(), leaves[*b as usize].center()],
+                                q_vec,
+                            );
+                            out.copy_from_slice(&scores);
+                        }
+                        _ => {
+                            for (dst, &node) in out.iter_mut().zip(nodes) {
+                                *dst = kernel.routing_distances_validated(
+                                    [q_vec],
+                                    leaves[node as usize].center(),
+                                )[0];
+                            }
+                        }
+                    };
+                    graph_ref
+                        .search_batched(
+                            EF_SEARCH,
+                            &query_distance,
+                            &query_batch,
+                            proceed_ref,
+                            &mut scratch,
+                            &mut hits,
+                        )
+                        .map_err(native_error)?;
+                    for hit in &hits {
+                        if hit.node as usize != source {
+                            retain_neighbor(retained, (hit.distance, hit.node as usize));
+                        }
+                    }
+                }
+                Ok(())
+            }));
+        }
+        for h in handles {
+            h.join().map_err(|_| Error::new(ErrorKind::Other))??;
+        }
+        Ok(())
+    });
+
+    if let Some(err) = failure.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        return Err(err);
+    }
+    scope_res?;
+    Ok(neighbors)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,6 +319,23 @@ mod tests {
             ErrorKind::DeadlineExceeded
         );
         assert!(calls.get() >= 20);
+
+        // Also cover cancellation during the multi-threaded batched search phase after Graph::build.
+        let search_calls = std::sync::atomic::AtomicUsize::new(0);
+        let search_check = || {
+            let cur = search_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if cur >= 1500 {
+                Err(Error::new(ErrorKind::DeadlineExceeded))
+            } else {
+                Ok(())
+            }
+        };
+        assert_eq!(
+            neighbors_parallel(&search_check, &kernel, &leaves, 4, 64 << 20)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::DeadlineExceeded
+        );
     }
 
     #[test]

@@ -1,12 +1,10 @@
-//! Durable source and topology artifacts: restart, integrity, and failure bounds.
+//! Segmented input snapshot tests: rollover, restart, integrity, and quota bounds.
 
 use std::fs;
 
 use bytes::Bytes;
 use ktann::api::{DataType, Error, ErrorKind, FieldSchema, IndexConfig, Metric, Record, Value};
-use ktann::bulk::ForestArtifact;
-use ktann::bulk::{ARTIFACT_MANIFEST_BYTES, ArtifactManifest, InputSnapshot, InputSnapshotWriter};
-use ktann::construction::ConstructionOptions;
+use ktann::bulk::{INPUT_MANIFEST_BYTES, InputManifest, InputSnapshot, InputSnapshotWriter};
 
 fn config() -> IndexConfig {
     IndexConfig::new(2, Metric::L2)
@@ -14,14 +12,6 @@ fn config() -> IndexConfig {
         .with_leaf_partition_entries(2, 4)
         .and_then(|config| config.with_internal_partition_entries(2, 4))
         .unwrap()
-}
-
-fn options() -> ConstructionOptions {
-    ConstructionOptions {
-        sample_items: 8,
-        memory_bytes: 2 * 1024 * 1024,
-        scratch_bytes: 8 * 1024 * 1024,
-    }
 }
 
 fn record(id: u64) -> Record {
@@ -81,7 +71,7 @@ fn full_records_survive_restart_with_payload_presence_and_canonical_fields() {
     let reopened = InputSnapshot::open(
         &path,
         config.clone(),
-        ArtifactManifest::decode(&descriptor).unwrap(),
+        InputManifest::decode(&descriptor).unwrap(),
     )
     .unwrap();
     assert_eq!(reopened.manifest().items(), 3);
@@ -107,6 +97,35 @@ fn full_records_survive_restart_with_payload_presence_and_canonical_fields() {
 }
 
 #[test]
+fn multi_segment_rollover_preserves_exact_order_and_relocatability() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("segmented");
+    let count = 20_000_u64;
+    let writer = InputSnapshotWriter::new(&path, config(), 64 << 20).unwrap();
+    let writer = writer.append((0..count).map(|id| Ok(record(id)))).unwrap();
+    assert!(path.join("seg-00000000.bin").exists());
+    assert!(path.join("data.partial").exists());
+    assert!(!path.join("manifest.bin").exists());
+    let snapshot = writer.seal().unwrap();
+    assert!(!path.join("data.partial").exists());
+    assert!(path.join("seg-00000001.bin").exists());
+    assert!(path.join("segments.bin").exists());
+    assert!(path.join("manifest.bin").exists());
+
+    let relocated = directory.path().join("relocated");
+    fs::rename(&path, &relocated).unwrap();
+    let reopened = InputSnapshot::open(&relocated, config(), snapshot.manifest().clone()).unwrap();
+    assert_eq!(reopened.manifest().items(), count);
+    let mut seen = 0_u64;
+    for item in reopened.reader().unwrap() {
+        let rec = item.unwrap();
+        assert_eq!(rec.id(), record(seen).id());
+        seen += 1;
+    }
+    assert_eq!(seen, count);
+}
+
+#[test]
 fn input_failures_and_quota_exhaustion_never_seal_or_overwrite() {
     let directory = tempfile::tempdir().unwrap();
     let failed = directory.path().join("failed");
@@ -121,15 +140,17 @@ fn input_failures_and_quota_exhaustion_never_seal_or_overwrite() {
     let partial = fs::read(failed.join("data.partial")).unwrap();
     assert!(InputSnapshot::create(&failed, config(), 1_000_000, []).is_err());
     assert_eq!(fs::read(failed.join("data.partial")).unwrap(), partial);
+
     let quota = directory.path().join("quota");
     assert_eq!(
-        InputSnapshot::create(&quota, config(), 132, [Ok(record(0))])
+        InputSnapshot::create(&quota, config(), 150, [Ok(record(0))])
             .err()
             .unwrap()
             .kind(),
         ErrorKind::LimitExceeded
     );
     assert!(!quota.join("manifest.bin").exists());
+
     let invalid = Record::new(Bytes::from_static(b"bad"), vec![1.0], vec![]).unwrap();
     assert_eq!(
         InputSnapshot::create(
@@ -146,12 +167,13 @@ fn input_failures_and_quota_exhaustion_never_seal_or_overwrite() {
 }
 
 #[test]
-fn changed_truncated_extended_and_forged_length_files_are_rejected() {
+fn changed_truncated_extended_and_forged_length_segment_files_are_rejected() {
     for mutation in 0..5 {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("input");
         let snapshot = InputSnapshot::create(&path, config(), 1_000_000, [Ok(record(0))]).unwrap();
-        let mut bytes = fs::read(path.join("data.bin")).unwrap();
+        let seg_path = path.join("seg-00000000.bin");
+        let mut bytes = fs::read(&seg_path).unwrap();
         match mutation {
             0 => bytes[50] ^= 1,
             1 => {
@@ -161,21 +183,22 @@ fn changed_truncated_extended_and_forged_length_files_are_rejected() {
             3 => bytes[42..46].copy_from_slice(&u32::MAX.to_be_bytes()),
             _ => bytes[10] ^= 1,
         }
-        fs::write(path.join("data.bin"), bytes).unwrap();
+        fs::write(&seg_path, bytes).unwrap();
         assert_eq!(snapshot.verify().unwrap_err().kind(), ErrorKind::Corruption);
     }
 }
 
 #[test]
-fn swapping_valid_frames_fails_whole_file_identity_before_plan_sealing() {
+fn swapping_valid_frames_fails_segment_digest_verification() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("input");
     let snapshot =
         InputSnapshot::create(&path, config(), 1_000_000, [Ok(record(0)), Ok(record(1))]).unwrap();
-    let mut bytes = fs::read(path.join("data.bin")).unwrap();
+    let seg_path = path.join("seg-00000000.bin");
+    let mut bytes = fs::read(&seg_path).unwrap();
     let frame_size = (bytes.len() - 42) / 2;
     bytes[42..].rotate_left(frame_size);
-    fs::write(path.join("data.bin"), bytes).unwrap();
+    fs::write(&seg_path, bytes).unwrap();
     let mut reader = snapshot.reader().unwrap();
     assert_eq!(reader.next().unwrap().unwrap().id(), record(1).id());
     assert!(reader.next().unwrap().is_ok());
@@ -184,16 +207,7 @@ fn swapping_valid_frames_fails_whole_file_identity_before_plan_sealing() {
         ErrorKind::Corruption
     );
     assert!(reader.next().is_none());
-    let output = directory.path().join("plan");
-    assert_eq!(
-        ForestArtifact::build(&output, &snapshot, [7; 32], forest_options(), 1_000_000)
-            .err()
-            .unwrap()
-            .kind(),
-        ErrorKind::Corruption
-    );
-    assert!(!output.join("manifest.bin").exists());
-    assert!(!output.join("tree").exists());
+    assert_eq!(snapshot.verify().unwrap_err().kind(), ErrorKind::Corruption);
 }
 
 #[test]
@@ -205,653 +219,41 @@ fn manifest_identity_and_version_are_checked_independently_of_data() {
     let b = InputSnapshot::create(&second, config(), 1_000_000, [Ok(record(1))]).unwrap();
     fs::copy(second.join("manifest.bin"), first.join("manifest.bin")).unwrap();
     assert_eq!(a.verify().unwrap_err().kind(), ErrorKind::Corruption);
+
     let mut encoded = b.manifest().encode();
-    assert_eq!(encoded.len(), ARTIFACT_MANIFEST_BYTES);
+    assert_eq!(encoded.len(), INPUT_MANIFEST_BYTES);
     for kind in [1, 4, u8::MAX] {
         encoded[9] = kind;
         assert_eq!(
-            ArtifactManifest::decode(&encoded).unwrap_err().kind(),
+            InputManifest::decode(&encoded).unwrap_err().kind(),
             ErrorKind::Corruption
         );
     }
     encoded = b.manifest().encode();
-    let mut data = fs::read(second.join("data.bin")).unwrap();
+    let mut seg = fs::read(second.join("segments.bin")).unwrap();
     let version = ktann::storage::FORMAT_VERSION.to_be_bytes();
     assert_eq!(&encoded[7..9], &version);
-    assert_eq!(&data[7..9], &version);
+    assert_eq!(&seg[7..9], &version);
     for unsupported in [0_u16, 2, 256, u16::MAX] {
         encoded[7..9].copy_from_slice(&unsupported.to_be_bytes());
         assert_eq!(
-            ArtifactManifest::decode(&encoded).unwrap_err().kind(),
+            InputManifest::decode(&encoded).unwrap_err().kind(),
             ErrorKind::UnsupportedFormat
         );
-        data[7..9].copy_from_slice(&unsupported.to_be_bytes());
-        fs::write(second.join("data.bin"), &data).unwrap();
-        assert_eq!(b.verify().unwrap_err().kind(), ErrorKind::UnsupportedFormat);
+        seg[7..9].copy_from_slice(&unsupported.to_be_bytes());
+        fs::write(second.join("segments.bin"), &seg).unwrap();
+        assert_eq!(
+            InputSnapshot::open(&second, config(), b.manifest().clone())
+                .err()
+                .unwrap()
+                .kind(),
+            ErrorKind::UnsupportedFormat
+        );
     }
     assert_eq!(
-        ArtifactManifest::decode(&encoded[..encoded.len() - 1])
+        InputManifest::decode(&encoded[..encoded.len() - 1])
             .unwrap_err()
             .kind(),
         ErrorKind::Corruption
     );
-}
-
-fn forest_options() -> ktann::bulk::ForestOptions {
-    ktann::bulk::ForestOptions {
-        refinement_rounds: None,
-        refinement_memory_bytes: 256 * 1024 * 1024,
-        sample_items: options().sample_items,
-        tree_memory_bytes: options().memory_bytes,
-        tree_scratch_bytes: options().scratch_bytes,
-        sort_memory_bytes: 556 * 1024,
-        sort_scratch_bytes: 16 * 1024 * 1024,
-    }
-}
-
-fn forest_config(metric: Metric) -> IndexConfig {
-    use ktann::api::FieldId;
-    IndexConfig::new(2, metric)
-        .unwrap()
-        .with_leaf_partition_entries(2, 4)
-        .and_then(|config| config.with_internal_partition_entries(2, 4))
-        .unwrap()
-        .with_fields(vec![
-            FieldSchema::new("bucket", DataType::I64).unwrap(),
-            FieldSchema::new("name", DataType::String).unwrap(),
-        ])
-        .unwrap()
-        .with_tree_key_fields(vec![FieldId(1), FieldId(0)])
-        .unwrap()
-}
-
-fn forest_record(id: u64) -> Record {
-    Record::new(
-        Bytes::copy_from_slice(&id.to_be_bytes()),
-        vec![id as f32 + 1.0, (id % 7) as f32],
-        vec![
-            Value::I64((id % 7) as i64 - 3),
-            Value::string(if id.is_multiple_of(2) { "a\0b" } else { "a" }).unwrap(),
-        ],
-    )
-    .unwrap()
-    .with_payload(Bytes::from_static(b"original payload"))
-    .unwrap()
-}
-
-type ForestShape = std::collections::BTreeMap<(Vec<u8>, u64), (u32, Vec<u32>, Vec<Bytes>)>;
-
-fn forest_shape(artifact: &ktann::bulk::ForestArtifact) -> ForestShape {
-    artifact
-        .reader()
-        .unwrap()
-        .map(|row| {
-            let row = row.unwrap();
-            let plan = row.partition;
-            (
-                (row.tree_key.as_bytes().to_vec(), plan.key.get()),
-                (
-                    plan.level,
-                    plan.centroid
-                        .components()
-                        .iter()
-                        .map(|x| x.to_bits())
-                        .collect(),
-                    plan.entries,
-                ),
-            )
-        })
-        .collect()
-}
-
-#[test]
-fn forest_globally_groups_exact_membership_and_matches_independent_tree_builds() {
-    use ktann::bulk::ForestArtifact;
-    use ktann::construction::{ConstructionRecord, construct_tree};
-    use ktann::storage::keys::TreeKey;
-    use std::collections::{BTreeMap, BTreeSet};
-    for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
-        let directory = tempfile::tempdir().unwrap();
-        let source = InputSnapshot::create(
-            &directory.path().join("input"),
-            forest_config(metric),
-            4 * 1024 * 1024,
-            (0..317).rev().map(|id| Ok(forest_record(id))),
-        )
-        .unwrap();
-        let (artifact, report) = ForestArtifact::build(
-            &directory.path().join("forest"),
-            &source,
-            [7; 32],
-            forest_options(),
-            4 * 1024 * 1024,
-        )
-        .unwrap();
-        assert_eq!(report.records, 317);
-        assert_eq!(report.trees, 14);
-        assert!(report.peak_sort_scratch_bytes <= forest_options().sort_scratch_bytes);
-        assert!(!directory.path().join("forest/sort").exists());
-        assert!(!directory.path().join("forest/tree").exists());
-        let expected_manifest = ArtifactManifest::decode(&artifact.manifest().encode()).unwrap();
-        drop(artifact);
-        let reopened = ForestArtifact::open(
-            &directory.path().join("forest"),
-            expected_manifest,
-            source.manifest(),
-            source.config().clone(),
-            [7; 32],
-            forest_options().sample_items,
-            None,
-        )
-        .unwrap();
-        let shape = forest_shape(&reopened);
-        assert_eq!(shape.len() as u64, report.partitions);
-        let mut expected: BTreeMap<Vec<u8>, Vec<ConstructionRecord>> = BTreeMap::new();
-        for id in 0..317 {
-            let record = forest_record(id);
-            let tree = TreeKey::encode(
-                &[DataType::String, DataType::I64],
-                &[record.fields()[1].clone(), record.fields()[0].clone()],
-            )
-            .unwrap();
-            expected
-                .entry(tree.as_bytes().to_vec())
-                .or_default()
-                .push(ConstructionRecord {
-                    id: record.id().clone(),
-                    vector: record.vector().into(),
-                });
-        }
-        let mut exact = ForestShape::new();
-        for (ordinal, (tree, records)) in expected.into_iter().enumerate() {
-            construct_tree(
-                &directory.path().join(format!("independent-{ordinal}")),
-                source.config(),
-                [7; 32],
-                options(),
-                records.into_iter().map(Ok),
-                |plan| {
-                    exact.insert(
-                        (tree.clone(), plan.key.get()),
-                        (
-                            plan.level,
-                            plan.centroid
-                                .components()
-                                .iter()
-                                .map(|x| x.to_bits())
-                                .collect(),
-                            plan.entries,
-                        ),
-                    );
-                    Ok(())
-                },
-            )
-            .unwrap();
-        }
-        assert_eq!(shape, exact);
-        let mut all_ids = BTreeSet::new();
-        for (_, (level, _, entries)) in shape {
-            if level == 1 {
-                for id in entries {
-                    assert!(all_ids.insert(id));
-                }
-            }
-        }
-        assert_eq!(all_ids.len(), 317);
-    }
-}
-
-#[test]
-fn forest_sort_spills_and_source_order_do_not_change_topology() {
-    use ktann::bulk::ForestArtifact;
-    let directory = tempfile::tempdir().unwrap();
-    let a = InputSnapshot::create(
-        &directory.path().join("a"),
-        forest_config(Metric::L2),
-        4 * 1024 * 1024,
-        (0..173).map(|id| Ok(forest_record(id))),
-    )
-    .unwrap();
-    let b = InputSnapshot::create(
-        &directory.path().join("b"),
-        forest_config(Metric::L2),
-        4 * 1024 * 1024,
-        (0..173).rev().map(|id| Ok(forest_record(id))),
-    )
-    .unwrap();
-    let (small, _) = ForestArtifact::build(
-        &directory.path().join("small"),
-        &a,
-        [9; 32],
-        forest_options(),
-        4 * 1024 * 1024,
-    )
-    .unwrap();
-    let mut roomy = forest_options();
-    roomy.sort_memory_bytes = 4 * 1024 * 1024;
-    let (large, _) = ForestArtifact::build(
-        &directory.path().join("large"),
-        &b,
-        [9; 32],
-        roomy,
-        4 * 1024 * 1024,
-    )
-    .unwrap();
-    assert_eq!(forest_shape(&small), forest_shape(&large));
-    assert_eq!(
-        ForestArtifact::open(
-            &directory.path().join("small"),
-            small.manifest().clone(),
-            a.manifest(),
-            a.config().clone(),
-            [8; 32],
-            forest_options().sample_items,
-            None,
-        )
-        .err()
-        .unwrap()
-        .kind(),
-        ErrorKind::InvalidArgument
-    );
-    let regrouped = InputSnapshot::open(
-        &directory.path().join("a"),
-        forest_config(Metric::L2)
-            .with_tree_key_fields(vec![ktann::api::FieldId(0)])
-            .unwrap(),
-        a.manifest().clone(),
-    )
-    .unwrap();
-    assert!(
-        ForestArtifact::open(
-            &directory.path().join("small"),
-            small.manifest().clone(),
-            regrouped.manifest(),
-            regrouped.config().clone(),
-            [9; 32],
-            forest_options().sample_items,
-            None,
-        )
-        .is_err()
-    );
-}
-
-#[test]
-fn forest_rejects_cross_tree_duplicates_before_output_and_enforces_quotas() {
-    use ktann::bulk::ForestArtifact;
-    let directory = tempfile::tempdir().unwrap();
-    let duplicate = Record::new(
-        forest_record(0).id().clone(),
-        vec![4.0, 5.0],
-        forest_record(1).fields().to_vec(),
-    )
-    .unwrap();
-    let input = InputSnapshot::create(
-        &directory.path().join("input"),
-        forest_config(Metric::L2),
-        4 * 1024 * 1024,
-        (0..100)
-            .map(|id| Ok(forest_record(id)))
-            .chain([Ok(duplicate)]),
-    )
-    .unwrap();
-    let path = directory.path().join("duplicate");
-    assert_eq!(
-        ForestArtifact::build(&path, &input, [0; 32], forest_options(), 4 * 1024 * 1024)
-            .err()
-            .unwrap()
-            .kind(),
-        ErrorKind::RecordAlreadyExists
-    );
-    assert!(!path.join("manifest.bin").exists());
-    assert!(!path.join("tree").exists());
-    let unique = InputSnapshot::create(
-        &directory.path().join("unique"),
-        forest_config(Metric::L2),
-        4 * 1024 * 1024,
-        (0..100).map(|id| Ok(forest_record(id))),
-    )
-    .unwrap();
-    let mut tiny = forest_options();
-    tiny.sort_scratch_bytes = 100;
-    assert_eq!(
-        ForestArtifact::build(
-            &directory.path().join("quota"),
-            &unique,
-            [0; 32],
-            tiny,
-            4 * 1024 * 1024
-        )
-        .err()
-        .unwrap()
-        .kind(),
-        ErrorKind::LimitExceeded
-    );
-    tiny = forest_options();
-    tiny.sort_memory_bytes = 1;
-    let invalid = directory.path().join("invalid");
-    assert_eq!(
-        ForestArtifact::build(&invalid, &unique, [0; 32], tiny, 4 * 1024 * 1024)
-            .err()
-            .unwrap()
-            .kind(),
-        ErrorKind::InvalidArgument
-    );
-    assert!(!invalid.exists());
-    let full = directory.path().join("full");
-    assert_eq!(
-        ForestArtifact::build(&full, &unique, [0; 32], forest_options(), 132)
-            .err()
-            .unwrap()
-            .kind(),
-        ErrorKind::LimitExceeded
-    );
-    assert!(!full.join("manifest.bin").exists());
-}
-
-#[test]
-fn empty_snapshot_and_forest_have_no_records_or_trees() {
-    use ktann::bulk::ForestArtifact;
-    let directory = tempfile::tempdir().unwrap();
-    for (index, config) in [config(), forest_config(Metric::L2)]
-        .into_iter()
-        .enumerate()
-    {
-        let input = InputSnapshot::create(
-            &directory.path().join(format!("input-{index}")),
-            config,
-            132,
-            std::iter::empty(),
-        )
-        .unwrap();
-        input.verify().unwrap();
-        assert_eq!(input.manifest().items(), 0);
-        let (artifact, report) = ForestArtifact::build(
-            &directory.path().join(format!("plan-{index}")),
-            &input,
-            [0; 32],
-            forest_options(),
-            132,
-        )
-        .unwrap();
-        assert_eq!(artifact.manifest().items(), 0);
-        assert_eq!(report.records, 0);
-        assert_eq!(report.trees, 0);
-        assert_eq!(report.partitions, 0);
-        assert!(artifact.reader().unwrap().next().is_none());
-    }
-}
-
-#[test]
-fn forest_reader_rejects_invalid_tree_envelopes_and_premature_roots() {
-    use ktann::bulk::ForestArtifact;
-    use sha2::{Digest, Sha256};
-    for root_early in [false, true] {
-        let directory = tempfile::tempdir().unwrap();
-        let input = InputSnapshot::create(
-            &directory.path().join("input"),
-            forest_config(Metric::L2),
-            1024 * 1024,
-            (0..100).map(|id| Ok(forest_record(id))),
-        )
-        .unwrap();
-        let path = directory.path().join("forest");
-        let (artifact, _) =
-            ForestArtifact::build(&path, &input, [0; 32], forest_options(), 1024 * 1024).unwrap();
-        let mut data = fs::read(path.join("data.bin")).unwrap();
-        let length = u32::from_be_bytes(data[42..46].try_into().unwrap()) as usize;
-        let body = &mut data[46..46 + length];
-        if root_early {
-            let tree_len = u32::from_be_bytes(body[..4].try_into().unwrap()) as usize;
-            body[4 + tree_len..12 + tree_len].copy_from_slice(&1_u64.to_be_bytes());
-        } else {
-            body[..4].copy_from_slice(&u32::MAX.to_be_bytes());
-        }
-        let frame_hash = Sha256::digest(body);
-        data[46 + length..78 + length].copy_from_slice(&frame_hash);
-        let mut manifest = artifact.manifest().encode();
-        manifest[58..].copy_from_slice(&Sha256::digest(&data));
-        fs::write(path.join("data.bin"), &data).unwrap();
-        fs::write(path.join("manifest.bin"), manifest).unwrap();
-        let reopened = ForestArtifact::open(
-            &path,
-            ArtifactManifest::decode(&manifest).unwrap(),
-            input.manifest(),
-            input.config().clone(),
-            [0; 32],
-            forest_options().sample_items,
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            reopened
-                .reader()
-                .unwrap()
-                .try_for_each(|row| row.map(|_| ()))
-                .unwrap_err()
-                .kind(),
-            ErrorKind::Corruption
-        );
-        let mut reader = reopened.reader().unwrap();
-        while let Some(row) = reader.next() {
-            if row.is_err() {
-                assert!(reader.next().is_none());
-                break;
-            }
-        }
-    }
-}
-
-#[test]
-fn streaming_snapshot_matches_one_pass_and_drop_leaves_it_unsealed() {
-    let directory = tempfile::tempdir().unwrap();
-    let rows: Vec<_> = (0..31).map(record).collect();
-    let one = InputSnapshot::create(
-        &directory.path().join("one"),
-        config(),
-        1_000_000,
-        rows.iter().cloned().map(Ok),
-    )
-    .unwrap();
-    let path = directory.path().join("stream");
-    let mut writer = InputSnapshotWriter::new(&path, config(), 1_000_000).unwrap();
-    for batch in rows.chunks(7) {
-        writer = writer.append(batch.iter().cloned().map(Ok)).unwrap();
-        assert!(!path.join("manifest.bin").exists());
-    }
-    let streamed = writer.seal().unwrap();
-    streamed.verify().unwrap();
-    assert_eq!(one.manifest(), streamed.manifest());
-    assert_eq!(
-        fs::read(directory.path().join("one/data.bin")).unwrap(),
-        fs::read(path.join("data.bin")).unwrap()
-    );
-
-    let path = directory.path().join("cancelled");
-    drop(
-        InputSnapshotWriter::new(&path, config(), 1_000_000)
-            .unwrap()
-            .append([Ok(record(0))])
-            .unwrap(),
-    );
-    assert!(!path.join("manifest.bin").exists());
-}
-
-#[test]
-fn snapshot_writer_rejects_invalid_config_before_creating_files() {
-    let dir = tempfile::tempdir().unwrap();
-    let invalid = config()
-        .with_tree_key_fields(vec![ktann::api::FieldId(99)])
-        .unwrap();
-    let error =
-        ktann::bulk::InputSnapshotWriter::new(&dir.path().join("source"), invalid, 1_000_000)
-            .err()
-            .unwrap();
-    assert_eq!(error.kind(), ErrorKind::InvalidArgument);
-    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
-}
-
-#[test]
-fn variable_id_forest_is_identical_across_construction_budgets() {
-    for metric in [Metric::L2, Metric::Cosine, Metric::InnerProduct] {
-        for tied in [true, false] {
-            let dir = tempfile::tempdir().unwrap();
-            let config = IndexConfig::new(7, metric)
-                .unwrap()
-                .with_leaf_partition_entries(2, 4)
-                .and_then(|config| config.with_internal_partition_entries(2, 4))
-                .unwrap();
-            let records: Vec<_> = (0_u64..257)
-                .rev()
-                .map(|id| {
-                    let encoded = id.to_be_bytes();
-                    let first = encoded.iter().position(|byte| *byte != 0).unwrap_or(7);
-                    let mut key = encoded[first..].to_vec();
-                    if id % 2 == 0 {
-                        key.resize(255, 0);
-                    }
-                    Record::new(
-                        Bytes::from(key),
-                        (0..7)
-                            .map(|axis| {
-                                if axis == 0 {
-                                    1.0
-                                } else if tied {
-                                    0.0
-                                } else {
-                                    (id % 3) as f32
-                                }
-                            })
-                            .collect::<Vec<_>>(),
-                        vec![],
-                    )
-                    .unwrap()
-                })
-                .collect();
-            let input = InputSnapshot::create(
-                &dir.path().join("input"),
-                config.clone(),
-                8_000_000,
-                records.iter().cloned().map(Ok),
-            )
-            .unwrap();
-            let mut small = forest_options();
-            small.tree_memory_bytes = 160 * 1024;
-            small.sort_memory_bytes *= 2;
-            let mut large = small;
-            large.tree_memory_bytes = 4 * 1024 * 1024;
-            large.tree_scratch_bytes *= 2;
-            large.sort_memory_bytes *= 2;
-            large.sort_scratch_bytes *= 2;
-            let (resident, _) = ForestArtifact::build(
-                &dir.path().join("resident"),
-                &input,
-                [7; 32],
-                large,
-                8_000_000,
-            )
-            .unwrap();
-            let expected = forest_shape(&resident);
-            let (streamed, _) = ForestArtifact::build(
-                &dir.path().join("streamed"),
-                &input,
-                [7; 32],
-                small,
-                8_000_000,
-            )
-            .unwrap();
-            assert_eq!(forest_shape(&streamed), expected);
-            assert_eq!(streamed.manifest(), resident.manifest());
-        }
-    }
-}
-
-#[test]
-fn forest_capacity_identity_and_round_trip_are_independent_by_level() {
-    let directory = tempfile::tempdir().unwrap();
-    let config = IndexConfig::new(2, Metric::L2)
-        .unwrap()
-        .with_leaf_partition_entries(2, 4)
-        .unwrap()
-        .with_internal_partition_entries(1, 2)
-        .unwrap();
-    let input = InputSnapshot::create(
-        &directory.path().join("source"),
-        config.clone(),
-        1024 * 1024,
-        (0..129_u64).map(|id| {
-            Record::new(
-                Bytes::copy_from_slice(&id.to_be_bytes()),
-                vec![id as f32, 1.0],
-                vec![],
-            )
-        }),
-    )
-    .unwrap();
-    let mut expected_leaves = None;
-    let mut identities = Vec::new();
-    for maximum in [2, 8, 128] {
-        let config = config
-            .clone()
-            .with_internal_partition_entries(1, maximum)
-            .unwrap();
-        let source = InputSnapshot::open(
-            &directory.path().join("source"),
-            config.clone(),
-            input.manifest().clone(),
-        )
-        .unwrap();
-        let path = directory.path().join(format!("forest-{maximum}"));
-        let (forest, _) =
-            ForestArtifact::build(&path, &source, [0; 32], forest_options(), 1024 * 1024).unwrap();
-        let reopened = ForestArtifact::open(
-            &path,
-            forest.manifest().clone(),
-            source.manifest(),
-            config.clone(),
-            [0; 32],
-            forest_options().sample_items,
-            None,
-        )
-        .unwrap();
-        assert_eq!(forest_shape(&forest), forest_shape(&reopened));
-        let shape = forest_shape(&reopened);
-        for ((_, key), (level, _, entries)) in &shape {
-            assert!(entries.len() <= config.max_partition_entries(*level) as usize);
-            if *key != 1 {
-                assert!(entries.len() >= config.min_partition_entries(*level) as usize);
-            }
-        }
-        let leaves: ForestShape = shape
-            .into_iter()
-            .filter(|(_, (level, _, _))| *level == 1)
-            .collect();
-        if let Some(expected) = &expected_leaves {
-            assert_eq!(&leaves, expected);
-        } else {
-            expected_leaves = Some(leaves);
-        }
-        identities.push(forest.manifest().clone());
-        for changed in [
-            config.clone().with_leaf_partition_entries(1, 4).unwrap(),
-            config.clone().with_leaf_partition_entries(2, 8).unwrap(),
-            config
-                .clone()
-                .with_internal_partition_entries(1, maximum + 2)
-                .unwrap(),
-        ] {
-            assert!(
-                ForestArtifact::open(
-                    &path,
-                    forest.manifest().clone(),
-                    source.manifest(),
-                    changed,
-                    [0; 32],
-                    forest_options().sample_items,
-                    None,
-                )
-                .is_err()
-            );
-        }
-    }
-    assert!(identities.windows(2).all(|pair| pair[0] != pair[1]));
 }

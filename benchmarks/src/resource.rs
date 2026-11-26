@@ -141,3 +141,21 @@ fn disk_io_bytes() -> Result<Option<(u64, u64)>, String> {
 fn disk_io_bytes() -> Result<Option<(u64, u64)>, String> {
     Ok(None)
 }
+
+/// Advises the system allocator to release unused free heap pages to the OS
+/// between isolated benchmark phases after peak RSS has been recorded.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[expect(
+    unsafe_code,
+    reason = "malloc_trim releases idle glibc thread-arena pages before spawning multi-process search clients"
+)]
+pub fn trim_unused_heap() {
+    // SAFETY: `malloc_trim(0)` is thread-safe in glibc and only releases unused free heap pages.
+    unsafe {
+        let _ = libc::malloc_trim(0);
+    }
+}
+
+/// No-op on targets without glibc `malloc_trim`.
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+pub fn trim_unused_heap() {}

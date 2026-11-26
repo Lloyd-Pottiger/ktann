@@ -1,7 +1,9 @@
 # ADR 0027: Durable workspace ownership and exact Bulk Build publication
 
 Status: Accepted. The automatic-scheduling deferral is superseded by
-[ADR 0028](0028-automatic-bulk-scheduling.md).
+[ADR 0028](0028-automatic-bulk-scheduling.md); monolithic offline
+`ForestArtifact`/`ServingArtifact` files and single-lane sequential loading/proof
+cursors are superseded by [ADR 0030](0030-sharded-collaborative-bulk-build.md).
 
 ## Context
 

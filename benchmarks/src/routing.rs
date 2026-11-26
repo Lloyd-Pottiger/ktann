@@ -77,16 +77,12 @@ impl Experiment {
         }
     }
 
-    /// Applies explicit memory/scratch ceilings at their existing Bulk Build owner.
+    /// Applies explicit memory/scratch ceilings at their Bulk Build owner.
     pub fn worker(&self, workspace: std::path::PathBuf) -> ktann::api::BulkWorkerOptions {
         let mut worker = ktann::api::BulkWorkerOptions::new(workspace);
-        worker.sort_memory_bytes = self.build_memory_bytes;
-        worker.serving_memory_bytes = self.build_memory_bytes;
+        worker.memory_bytes = self.build_memory_bytes;
         worker.graph_memory_bytes = self.build_memory_bytes;
-        worker.refinement_memory_bytes = self.build_memory_bytes;
-        worker.sort_scratch_bytes = self.build_scratch_bytes;
-        worker.serving_scratch_bytes = self.build_scratch_bytes;
-        worker.max_artifact_bytes = self.build_scratch_bytes;
+        worker.scratch_bytes = self.build_scratch_bytes;
         worker
     }
 

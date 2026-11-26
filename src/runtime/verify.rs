@@ -545,8 +545,8 @@ async fn process_item<B: Backend>(
         (LogicalKey::GraphDescriptor { .. }, PersistentValue::GraphDescriptor(_))
         | (LogicalKey::GraphChunk { .. }, PersistentValue::GraphChunk(_))
         | (LogicalKey::BuildDescriptor(_), PersistentValue::BuildDescriptor(_))
-        | (LogicalKey::BuildLoad(_), PersistentValue::BuildLoad(_))
-        | (LogicalKey::BuildValidation(_), PersistentValue::BuildValidation(_)) => {}
+        | (LogicalKey::BuildProgress(_), PersistentValue::BuildProgress(_))
+        | (LogicalKey::BuildUnit { .. }, PersistentValue::BuildUnit(_)) => {}
         // The Manifest was validated before the scan; namespace keys cannot
         // sort inside the index-owned range, and a successful typed decode
         // always yields the key's value family.

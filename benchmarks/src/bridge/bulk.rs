@@ -16,6 +16,7 @@ const DISK_LIMIT: u64 = 64 * 1024 * 1024 * 1024;
 
 /// Captures one finite input and retains the core job across Optimize retries.
 pub(super) struct Build<B: Backend> {
+    root: PathBuf,
     options: BulkBuildOptions,
     worker: BulkWorkerOptions,
     writer: Option<InputSnapshotWriter>,
@@ -45,22 +46,22 @@ impl<B: Backend> Build<B> {
         let mut worker = BulkWorkerOptions::new(root.join("workspace"));
         let mut construction = ConstructionOptions {
             sample_items: 1024,
-            // Cover wide default routing nodes at Cohere dimensionality.
-            memory_bytes: 1024 * 1024 * 1024,
+            // Cover both wide routing nodes and large resident builds when requested.
+            memory_bytes: refinement_memory_bytes.max(1024 * 1024 * 1024),
             scratch_bytes: DISK_LIMIT,
         };
         if let Some(experiment) = experiment {
             construction = experiment.construction();
             worker = experiment.worker(root.join("workspace"));
         }
-        // Reset owns this budget for every routing mode.
-        worker.refinement_memory_bytes = refinement_memory_bytes;
+        // Reset owns the worker memory ceiling across both routing modes.
+        worker.memory_bytes = refinement_memory_bytes;
         let refinement_rounds = Some(rounds);
-        let writer =
-            InputSnapshotWriter::new(&root.join("source"), config, worker.max_artifact_bytes)?;
+        let writer = InputSnapshotWriter::new(&root.join("source"), config, worker.scratch_bytes)?;
         let mut report = Value::Object(crate::report::bulk_build_settings(&construction, &worker));
         report["refinement_rounds"] = json!(rounds);
         Ok(Self {
+            root,
             options: BulkBuildOptions {
                 construction,
                 refinement_rounds,
@@ -125,6 +126,10 @@ impl<B: Backend> Build<B> {
             .as_object_mut()
             .expect("build report object")
             .extend(completion_report(stages, start.elapsed()));
+        // Reclaim staged source segments off the Tokio executor once the Active index is published.
+        self.source = None;
+        let source_dir = self.root.join("source");
+        let _ = tokio::task::spawn_blocking(move || fs::remove_dir_all(source_dir)).await;
         Ok(index)
     }
 }
@@ -132,33 +137,25 @@ impl<B: Backend> Build<B> {
 /// Core stage timings describe only the successful completion call, including reused stages.
 fn completion_report(stages: BulkBuildReport, elapsed: Duration) -> serde_json::Map<String, Value> {
     let publish_seconds = stages.publish.as_secs_f64();
+    let forest_seconds =
+        (stages.plan + stages.ingest + stages.construct + stages.refine).as_secs_f64();
     let report = json!({
-        "forest_detail": stages.forest_report.map(|r| json!({
-            "trees": r.trees,
-            "records": r.records,
-            "partitions": r.partitions,
-        })),
-        "sort_written_bytes": stages.forest_report.map(|r| r.sort_written_bytes),
-        "tree_written_bytes": stages.forest_report.map(|r| r.tree_written_bytes),
-        "peak_sort_scratch_bytes": stages.forest_report.map(|r| r.peak_sort_scratch_bytes),
-        "peak_tree_scratch_bytes": stages.forest_report.map(|r| r.peak_tree_scratch_bytes),
-        "serving_detail": stages.serving_report.map(|r| json!({
-            "records": r.records,
-            "partitions": r.partitions,
-            "keys": r.keys,
-            "source_sort_seconds": r.source_sort.as_secs_f64(),
-            "topology_sort_seconds": r.topology_sort.as_secs_f64(),
-            "join_encode_seconds": r.join_encode.as_secs_f64(),
-            "output_merge_seconds": r.output_merge.as_secs_f64(),
-            "synopsis_seconds": r.synopsis.as_secs_f64(),
-            "final_emit_seconds": r.final_emit.as_secs_f64(),
-            "scratch_written_bytes": r.scratch_written_bytes,
-            "peak_scratch_bytes": r.peak_scratch_bytes,
-        })),
-        "forest_seconds": stages.forest.as_secs_f64(),
-        "serving_seconds": stages.serving.as_secs_f64(),
-        "load_seconds": stages.load.as_secs_f64(),
-        "prepare_load_seconds": elapsed.as_secs_f64() - publish_seconds,
+        "in_memory_mode": stages.in_memory_mode,
+        "records": stages.records,
+        "trees": stages.trees,
+        "partitions": stages.partitions,
+        "entries": stages.entries,
+        "scratch_written_bytes": stages.scratch_written_bytes,
+        "peak_scratch_bytes": stages.peak_scratch_bytes,
+        "plan_seconds": stages.plan.as_secs_f64(),
+        "ingest_seconds": stages.ingest.as_secs_f64(),
+        "construct_seconds": stages.construct.as_secs_f64(),
+        "refine_seconds": stages.refine.as_secs_f64(),
+        "emit_seconds": stages.emit.as_secs_f64(),
+        "forest_seconds": forest_seconds,
+        "serving_seconds": 0.0,
+        "load_seconds": stages.emit.as_secs_f64(),
+        "prepare_load_seconds": (elapsed.as_secs_f64() - publish_seconds).max(0.0),
         "validate_publish_cleanup_seconds": publish_seconds,
         "rotation_seed": stages.rotation_seed,
     });

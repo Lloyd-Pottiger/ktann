@@ -76,8 +76,8 @@ cargo run --release -p ktann-benchmarks --bin ktann-bench -- \
   --output .benchmark-data/results/fashion-mnist.json
 ```
 
-`quality-routing-smoke` remains in the default smoke matrix for both backends;
-the dedicated routing integration tests currently cover only RocksDB.
+`quality-routing-smoke` remains in the default smoke matrix for both backends, and
+the dedicated routing integration tests cover both RocksDB and FoundationDB.
 
 ### FoundationDB
 
@@ -338,18 +338,19 @@ bridge policy.
 ### Lifecycle and controls
 
 Insert requests capture bounded batches through `InputSnapshotWriter`, which
-writes canonical source frames and hashes. During Optimize the default tree
-and the serving join share one Record ID-ordered run of full source frames. A successful
-insert acknowledges capture, not per-batch durability or publication. No
-`batch_mutate` path is used. Duplicate IDs can be detected when Optimize builds
-the index rather than when a batch is received; unknown inserts must not be
-replayed automatically.
+writes segmented canonical source frames (`seg-{i:08x}.bin`) and SHA-256 digests.
+A successful insert acknowledges capture, not per-batch durability or
+publication. No `batch_mutate` path is used. Duplicate IDs are detected globally
+across segments when Optimize builds the index rather than when a batch is
+received; unknown inserts must not be replayed automatically.
 
-Optimize checks the expected record count and seals the Input Snapshot. All
-routing modes refine the forest before serving encoding, loading, exact validation
-and atomic publication. Global modes then prepare their in-process router. Core artifact validation
-owns topology correctness; the bridge admits search after query preparation. Repeated successful Optimize
-returns the existing result without rebuilding or refining.
+Optimize checks the expected record count and seals the segmented Input Snapshot.
+All routing modes run sharded construction and optional halo-bounded refinement
+before direct serving KV emission, multi-lane loading, frozen parallel slice
+validation, and atomic publication. Global modes then prepare their in-process
+router. Core validation owns topology correctness; the bridge admits search
+after query preparation. Repeated successful Optimize returns the existing
+result without rebuilding or refining.
 
 The bridge retains sealed input and the same core Bulk Build job for retries.
 Cancellation and transient build failures resume that job; terminal preparation
@@ -361,11 +362,11 @@ before dropping the index; socket timeouts do not release exclusive access.
 
 Reset requires `refinement_rounds` (0..5) and `refinement_memory_bytes` (positive).
 The Python client defaults to two rounds and 32 GiB. Zero rounds refreshes
-centroids without moving records. The memory ceiling accounts for retained
-inputs, topology and refinement planning; it is not a process RSS limit, and
-construction/sort/serving/graph budgets remain separate. Reset owns the refinement
-budget in every mode, including routing experiments: their `build_memory_bytes`
-continues to configure the other build stages. Reports record the effective
+centroids without moving records. `refinement_memory_bytes` configures the Bulk
+Build worker's working-memory budget (`BulkWorkerOptions::memory_bytes`):
+ample budgets (`>= ~4 GiB` on Cohere 1M) run the zero-disk resident fast path,
+while smaller budgets (e.g., `512 MiB`) automatically spill bounded Coarse Shards
+to the temporary workspace directory. Reports record the effective
 `bulk_build.refinement_rounds` and `bulk_build.refinement_memory_bytes`.
 
 Construction uses IndexConfig defaults (leaf 16/128, internal 64/16384,
@@ -416,10 +417,8 @@ vectordbbench ktann --socket-path /tmp/ktann-bench.sock \
   --refinement-rounds 2 --refinement-memory-bytes 12884901888
 ```
 
-The 12 GiB refinement budget is a conservative admission limit, not an RSS
-reservation. For 1M 768-dimensional records with eight-byte IDs, retained-input
-admission alone charges approximately 9.57 GiB, before partition plans; a 1 GiB
-refinement budget cannot build this workload. Tree/serving budgets remain separate.
+With Coarse-Shard planning and halo-bounded refinement, Cohere 1M builds in
+resident mode above `~4 GiB` and in bounded disk-spill mode down to `512 MiB`.
 
 This queries `labels == "label_1p"` against
 `neighbors_labels_label_1p.parquet`, with labels loaded from
@@ -506,21 +505,15 @@ not interchangeable baselines for this import-and-refine path.
 
 ### Bulk Build measurements
 
-Use the bridge's companion report for source snapshot, forest construction,
-serving generation, loading, and validation/publication/cleanup timings. Reports
-include the rotation seed, forest sort/tree scratch IO and peak scratch bytes,
-plus forest tree/record/partition counts. VectorDBBench supplies query latency
-and recall measurements for the selected corpus and workload. These build
-measurements do not establish distributed throughput or online insertion speed.
-
-Bulk Build bridge reports include `serving_detail` wall times for source
-sorting, topology sorting, exact joins/encoding, output merging, Synopsis
-reduction, and final emission/sealing, plus total and peak serving scratch bytes
-and record/partition/key counts.
+Use the bridge's companion report for input staging, shard planning, segment
+ingestion, leaf construction, halo refinement, direct serving KV emission/loading,
+and frozen validation/publication/cleanup timings. Reports include `in_memory_mode`,
+the rotation seed, workspace scratch written and peak simultaneous bytes, and
+emitted record/tree/partition/KV-entry counts. VectorDBBench supplies query
+latency and recall measurements for the selected corpus and workload.
 `ready_peak_rss_bytes` captures the bridge process's resident-memory high-water
-mark after successful publication, cleanup and router preparation, before queries.
+mark after successful publication, cleanup, and router preparation, before queries.
 The whole-run peak remains separate and may include later query cache growth.
-A resumed worker reports no detail for an already accepted serving artifact.
 
 Core and benchmark SHA-256 use sha2 0.11's default runtime CPU detection,
 including AArch64 SHA-2 instructions with a software fallback. Artifact framing,

@@ -962,7 +962,7 @@ fn reopened_manifest_reproduces_identical_index_value_bytes() {
 
 #[test]
 fn building_manifest_and_request_descriptor_have_canonical_bytes() {
-    use ktann::bulk::ArtifactManifest;
+    use ktann::bulk::InputManifest;
     use ktann::construction::ConstructionOptions;
     use ktann::storage::values::BuildDescriptor;
     let codec = ValueCodec::bootstrap();
@@ -978,8 +978,8 @@ fn building_manifest_and_request_descriptor_have_canonical_bytes() {
 
     let mut input_bytes = [0; 90];
     input_bytes[..9].copy_from_slice(b"KTANNBF\x00\x01");
-    input_bytes[50..58].copy_from_slice(&42_u64.to_be_bytes());
-    let input = ArtifactManifest::decode(&input_bytes).unwrap();
+    input_bytes[50..58].copy_from_slice(&46_u64.to_be_bytes());
+    let input = InputManifest::decode(&input_bytes).unwrap();
     let options = ConstructionOptions {
         sample_items: 8,
         memory_bytes: 2 * 1024 * 1024,
@@ -1009,16 +1009,9 @@ fn building_manifest_and_request_descriptor_have_canonical_bytes() {
     let mut invalid = bytes.to_vec();
     invalid[5] = b'x';
     assert_corrupt(decode(codec, &key, &invalid));
-    for kind in [2, 3] {
+    for kind in [1, 2, 3] {
         input_bytes[9] = kind;
-        assert!(
-            BuildDescriptor::new(
-                "/source".into(),
-                ArtifactManifest::decode(&input_bytes).unwrap(),
-                options
-            )
-            .is_err()
-        );
+        assert!(InputManifest::decode(&input_bytes).is_err());
     }
 }
 
@@ -1028,12 +1021,15 @@ fn bulk_workspace_golden_and_malformed_ownership() {
     let key = LogicalKey::BuildWorkspace(id(1));
     let mut golden = vec![0x0f, 0, 0, 0, 5];
     golden.extend_from_slice(b"/bulk");
-    for n in [1_u64, 1, 1, 1, 1, 1, 1, 2, 1, 1, 1] {
+    // parallelism=1, distributed_workers=1, unit_lease_ms=10, memory=1, graph_mem=1, scratch=1,
+    // load.max_mutations=2, load.max_bytes=1, hard_limits=(1, 1)
+    for n in [1_u64, 1, 10, 1, 1, 1, 2, 1, 1, 1] {
         golden.extend_from_slice(&n.to_be_bytes());
     }
+    let token_offset = golden.len();
     golden.extend_from_slice(&[1; 32]);
     golden.extend_from_slice(&1_u64.to_be_bytes());
-    golden.extend_from_slice(&[0, 0, 0]);
+    golden.push(0);
     let value = codec.decode(&key, Bytes::from(golden.clone())).unwrap();
     assert_eq!(codec.encode(&value).unwrap(), golden);
     for length in 0..golden.len() {
@@ -1043,13 +1039,13 @@ fn bulk_workspace_golden_and_malformed_ownership() {
                 .is_err()
         );
     }
-    for (offset, replacement) in [(5, b'x'), (golden.len() - 1, 255), (golden.len() - 3, 2)] {
+    for (offset, replacement) in [(5, b'x'), (golden.len() - 1, 255)] {
         let mut malformed = golden.clone();
         malformed[offset] = replacement;
         assert!(codec.decode(&key, Bytes::from(malformed)).is_err());
     }
     let mut zero_token = golden.clone();
-    zero_token[98..130].fill(0);
+    zero_token[token_offset..token_offset + 32].fill(0);
     assert!(codec.decode(&key, Bytes::from(zero_token)).is_err());
     let mut trailing = golden;
     trailing.push(0);
@@ -1057,39 +1053,74 @@ fn bulk_workspace_golden_and_malformed_ownership() {
 }
 
 #[test]
-fn bulk_validation_golden_and_malformed_proofs() {
-    use sha2::{Digest, Sha256};
-    let manifest = minimal_manifest();
-    let codec = ValueCodec::for_index(&manifest);
-    let key = LogicalKey::BuildValidation(id(1));
-    let mut artifact = b"KTANNBF\x00\x01\x03".to_vec();
-    artifact.extend_from_slice(&[0; 32]);
-    let hash = Sha256::digest(&artifact);
-    artifact.extend_from_slice(&0_u64.to_be_bytes());
-    artifact.extend_from_slice(&42_u64.to_be_bytes());
-    artifact.extend_from_slice(&hash);
-    let mut golden = vec![0x10, 0, 0, 0, 90];
-    golden.extend_from_slice(&artifact);
-    golden.extend_from_slice(&[0; 4]);
-    golden.extend_from_slice(&0_u64.to_be_bytes());
-    golden.extend_from_slice(&hash);
-    golden.push(1);
-    let value = codec.decode(&key, Bytes::from(golden.clone())).unwrap();
-    assert_eq!(codec.encode(&value).unwrap(), golden);
-    for length in 0..golden.len() {
+fn bulk_progress_and_unit_golden_and_malformed_values() {
+    let codec = ValueCodec::bootstrap();
+    let pkey = LogicalKey::BuildProgress(id(1));
+    let mut p_golden = vec![0x0e, 2]; // Loaded
+    for n in [1_u64, 19, 42, 42, 1, 3] {
+        p_golden.extend_from_slice(&n.to_be_bytes());
+    }
+    p_golden.extend_from_slice(&[7_u8; 64]); // expected_kv_lthash
+    p_golden.extend_from_slice(&1_u16.to_be_bytes());
+    p_golden.extend_from_slice(&3_u32.to_be_bytes());
+    p_golden.extend_from_slice(b"\x01\x00\x01");
+    let pvalue = codec.decode(&pkey, Bytes::from(p_golden.clone())).unwrap();
+    assert_eq!(codec.encode(&pvalue).unwrap(), p_golden);
+    for length in 0..p_golden.len() {
         assert!(
             codec
-                .decode(&key, Bytes::copy_from_slice(&golden[..length]))
+                .decode(&pkey, Bytes::copy_from_slice(&p_golden[..length]))
                 .is_err()
         );
     }
-    for offset in [14, 106, 107, golden.len() - 1] {
-        let mut malformed = golden.clone();
-        malformed[offset] ^= 3;
-        assert!(codec.decode(&key, Bytes::from(malformed)).is_err());
+    let mut bad_phase = p_golden.clone();
+    bad_phase[1] = 4; // Removed ReadyToPublish discriminator must fail closed
+    assert!(codec.decode(&pkey, Bytes::from(bad_phase)).is_err());
+    let mut zero_epoch = p_golden.clone();
+    zero_epoch[2..10].fill(0);
+    assert!(codec.decode(&pkey, Bytes::from(zero_epoch)).is_err());
+    let mut mismatched_loaded = p_golden.clone();
+    mismatched_loaded[18..26].copy_from_slice(&41_u64.to_be_bytes());
+    assert!(codec.decode(&pkey, Bytes::from(mismatched_loaded)).is_err());
+    p_golden.push(0);
+    assert!(codec.decode(&pkey, Bytes::from(p_golden)).is_err());
+
+    let ukey = LogicalKey::BuildUnit {
+        index: id(1),
+        stage: 40,
+        unit: 0,
+    };
+    let skey = LogicalKey::BuildScheduleSlot {
+        index: id(1),
+        slot: 2,
+    };
+    let mut u_golden = vec![0x10];
+    u_golden.extend_from_slice(&1_u64.to_be_bytes());
+    u_golden.extend_from_slice(&[2_u8; 32]);
+    u_golden.extend_from_slice(&100_u64.to_be_bytes());
+    u_golden.push(1);
+    for n in [5_u64, 12, 1] {
+        u_golden.extend_from_slice(&n.to_be_bytes());
     }
-    golden.push(0);
-    assert!(codec.decode(&key, Bytes::from(golden)).is_err());
+    u_golden.extend_from_slice(&[3_u8; 64]);
+    u_golden.extend_from_slice(&[4_u8; 64]);
+    u_golden.extend_from_slice(&[5_u8; 64]);
+    for key in [&ukey, &skey] {
+        let uvalue = codec.decode(key, Bytes::from(u_golden.clone())).unwrap();
+        assert_eq!(codec.encode(&uvalue).unwrap(), u_golden);
+    }
+    for length in 0..u_golden.len() {
+        assert!(
+            codec
+                .decode(&ukey, Bytes::copy_from_slice(&u_golden[..length]))
+                .is_err()
+        );
+    }
+    let mut bad_complete = u_golden.clone();
+    bad_complete[49] = 2;
+    assert!(codec.decode(&ukey, Bytes::from(bad_complete)).is_err());
+    u_golden.push(0);
+    assert!(codec.decode(&ukey, Bytes::from(u_golden)).is_err());
 }
 
 #[test]
@@ -1098,7 +1129,7 @@ fn build_schedule_golden_and_malformed_lease() {
     let key = LogicalKey::BuildSchedule(id(1));
     let mut golden = vec![0x11, 0, 0, 0, 1, b'x', 0, 0, 0, 5];
     golden.extend_from_slice(b"/bulk");
-    for n in [1_u64, 1, 1, 1, 1, 1, 1, 2, 1] {
+    for n in [1_u64, 1, 10, 1, 1, 1, 2, 1] {
         golden.extend_from_slice(&n.to_be_bytes());
     }
     golden.extend_from_slice(&[1; 32]);

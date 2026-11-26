@@ -23,7 +23,6 @@ requirements.
 | How are admission, workers, recovery age, shutdown, and verification operated? | [Runtime and operations](design/runtime-operations.md) |
 | How is a new index built, recovered, scheduled, and published? | [Bulk Build](design/bulk-build.md) |
 | How are partition-local graphs built, updated, bound to their source, and sized? | [Partition-local HNSW](design/partition-local-hnsw.md) |
-| How are immutable input, forest, and serving files prepared? | [Offline artifacts](design/bulk-artifacts.md) |
 
 ## Architectural decisions
 
@@ -60,6 +59,7 @@ provide the consolidated current contract.
 | 0027 | [Durable workspace ownership and exact Bulk Build publication](adr/0027-bulk-workspace-and-publication.md) |
 | 0028 | [Renewable automatic Bulk Build scheduling](adr/0028-automatic-bulk-scheduling.md) |
 | 0029 | [Publish bounded local graph replacements atomically](adr/0029-atomic-local-graph-updates.md) |
+| 0030 | [Sharded, direct-loading, and collaborative Bulk Build](adr/0030-sharded-collaborative-bulk-build.md) |
 
 ## Development and validation
 

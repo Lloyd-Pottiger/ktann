@@ -174,6 +174,62 @@ async fn foundationdb_scheduler_process() {
     assert_eq!(report.objects.vector_records, 20_000);
     drop(second);
     runtime.drop_index("scheduled").await.unwrap();
+
+    // Also exercise multi-process collaboration (`distributed_workers = 3`) on ONE single build,
+    // including SIGKILL of one collaborating worker process mid-build and lease takeover!
+    let collab_ws = root.join("collab-workspace");
+    std::fs::create_dir(&collab_ws).unwrap();
+    let collab_job = runtime
+        .start_bulk_build("scheduled-collab", &source, construction)
+        .await
+        .unwrap();
+    let mut collab_opts = BulkWorkerOptions::new(collab_ws);
+    collab_opts.distributed_workers = 3;
+    collab_opts.unit_lease = Duration::from_millis(500);
+    collab_opts.parallelism = 2;
+    collab_job.schedule(collab_opts).await.unwrap();
+    let mut w1 = spawn_worker(&namespace);
+    let mut w2 = spawn_worker(&namespace);
+    let mut w3 = spawn_worker(&namespace);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    w1.0.kill().unwrap();
+    w1.0.wait().unwrap();
+    let collab_queue_key: Bytes =
+        ktann::storage::keys::build_schedule_key(collab_job.logical_index_id()).into();
+    tokio::time::timeout(Duration::from_secs(90), async {
+        loop {
+            assert!(w2.0.try_wait().unwrap().is_none());
+            assert!(w3.0.try_wait().unwrap().is_none());
+            match collab_job.status().await.unwrap() {
+                BulkBuildStatus::Published => {
+                    if raw
+                        .begin_read()
+                        .await
+                        .unwrap()
+                        .get(collab_queue_key.clone())
+                        .await
+                        .unwrap()
+                        .is_none()
+                    {
+                        break;
+                    }
+                }
+                BulkBuildStatus::Failed { kind } => panic!("collab job failed: {kind:?}"),
+                _ => {}
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let collab_idx = runtime.open_index("scheduled-collab").await.unwrap();
+    let collab_rep = collab_idx.verify(VerifyOptions::default()).await.unwrap();
+    assert!(collab_rep.complete && collab_rep.issues.is_empty());
+    assert_eq!(collab_rep.objects.vector_records, 20_000);
+    drop(w2);
+    drop(w3);
+    runtime.drop_index("scheduled-collab").await.unwrap();
+
     runtime.shutdown().await.unwrap();
     support::clear_test_keys(&raw).await;
     std::fs::remove_dir_all(root).unwrap();

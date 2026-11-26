@@ -224,8 +224,9 @@ async fn dropped_scheduler_is_replaced_after_lease_expiry() {
         RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
     )
     .unwrap();
-    let (job, artifact) = fixture(&first, &memory, &dir, 19).await;
-    let options = worker_options(&dir);
+    let (job, _) = reservation(&first, &dir, 19).await;
+    let mut options = worker_options(&dir);
+    options.parallelism = 1;
     job.schedule(options.clone()).await.unwrap();
     gate.arm(3);
     let old = tokio::spawn({
@@ -238,10 +239,7 @@ async fn dropped_scheduler_is_replaced_after_lease_expiry() {
     });
     gate.wait().await;
     assert_eq!(
-        job.load_serving(&artifact, load_options())
-            .await
-            .unwrap_err()
-            .kind(),
+        job.run_worker(options.clone()).await.unwrap_err().kind(),
         ErrorKind::BulkBuildBusy
     );
     old.abort();
@@ -295,7 +293,9 @@ async fn renewal_prevents_takeover_while_preparation_is_paused() {
     )
     .unwrap();
     let job = reservation(&first, &dir, 19).await.0;
-    job.schedule(worker_options(&dir)).await.unwrap();
+    let mut paused_opts = worker_options(&dir);
+    paused_opts.parallelism = 1;
+    job.schedule(paused_opts).await.unwrap();
     gate.arm(3);
     let stop = CancellationToken::new();
     let a = tokio::spawn({
@@ -496,7 +496,8 @@ async fn terminal_failure_and_queued_abort_leave_no_scheduler_work() {
         let job = reservation(&runtime, &dir, 19).await.0;
         let mut options = worker_options(&dir);
         if fail {
-            options.max_artifact_bytes = 100;
+            options.memory_bytes = 8 * 1024;
+            options.scratch_bytes = 100;
         }
         job.schedule(options).await.unwrap();
         if !fail {
@@ -554,7 +555,9 @@ async fn takeover_fences_a_scheduled_chunk_prepared_by_the_old_owner() {
     )
     .unwrap();
     let job = reservation(&first, &dir, 19).await.0;
-    job.schedule(worker_options(&dir)).await.unwrap();
+    let mut paused_opts = worker_options(&dir);
+    paused_opts.parallelism = 1;
+    job.schedule(paused_opts).await.unwrap();
     gate.arm(6);
     let stop = CancellationToken::new();
     let a = tokio::spawn({
@@ -730,11 +733,151 @@ async fn enqueue_rejects_a_file_as_workspace_before_creating_queue_state() {
     )
     .unwrap();
     let job = reservation(&runtime, &dir, 0).await.0;
-    let options = ktann::api::BulkWorkerOptions::new(dir.path().join("source/data.bin"));
+    let options = ktann::api::BulkWorkerOptions::new(dir.path().join("source/manifest.bin"));
     assert_eq!(
         job.schedule(options).await.unwrap_err().kind(),
         ErrorKind::InvalidArgument
     );
     wait_empty(&memory, job.logical_index_id()).await;
     runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn collaborative_schedulers_share_one_queued_build() {
+    let dir = tempfile::tempdir().unwrap();
+    let memory = MemoryBackend::new();
+    let first = Runtime::new(
+        memory.clone(),
+        RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
+    )
+    .unwrap();
+    let second = Runtime::new(
+        memory.clone(),
+        RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
+    )
+    .unwrap();
+    let job = reservation(&first, &dir, 120).await.0;
+    let mut opts = worker_options(&dir);
+    opts.distributed_workers = 2;
+    opts.load = BulkLoadOptions::default();
+    job.schedule(opts).await.unwrap();
+
+    let stop = CancellationToken::new();
+    let a = tokio::spawn({
+        let rt = first.clone();
+        let stop = stop.clone();
+        async move {
+            rt.run_bulk_scheduler(
+                settings(),
+                OperationOptions::default().with_cancellation(stop),
+            )
+            .await
+        }
+    });
+    let b = tokio::spawn({
+        let rt = second.clone();
+        let stop = stop.clone();
+        async move {
+            rt.run_bulk_scheduler(
+                settings(),
+                OperationOptions::default().with_cancellation(stop),
+            )
+            .await
+        }
+    });
+    wait_active(&job).await;
+    wait_empty(&memory, job.logical_index_id()).await;
+    stop.cancel();
+    let _ = a.await.unwrap();
+    let _ = b.await.unwrap();
+    let lid = job.logical_index_id();
+    let mut txn = ReadLogicalTxn::bootstrap(memory.begin_read().await.unwrap());
+    assert!(
+        txn.get(LogicalKey::BuildWorkspace(lid))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    match txn.get(LogicalKey::BuildProgress(lid)).await.unwrap() {
+        Some(PersistentValue::BuildProgress(p)) => {
+            assert!(p.total_entries() > 0);
+            assert_eq!(p.validation_slices(), 1);
+        }
+        other => panic!("expected compact BuildProgress, got {other:?}"),
+    }
+    for slot in 0..2 {
+        assert!(
+            txn.get(LogicalKey::BuildScheduleSlot { index: lid, slot })
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    drop(txn);
+    let index = second.open_index("bulk").await.unwrap();
+    let verified = index.verify(VerifyOptions::default()).await.unwrap();
+    assert!(verified.complete && verified.issues.is_empty());
+    assert_eq!(verified.objects.vector_records, 120);
+    first.shutdown().await.unwrap();
+    second.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abort_without_or_during_scheduler_retires_schedule_without_stopping_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let memory = MemoryBackend::with_test_config(TestConfig::default());
+    let gate = Arc::new(Gate::default());
+    let rt = Runtime::new(
+        Gated {
+            memory: memory.clone(),
+            gate: gate.clone(),
+        },
+        RuntimeConfig::default().with_maintenance(0, 2).unwrap(),
+    )
+    .unwrap();
+
+    // 1. Scheduled job aborted before any scheduler runs retires `BuildSchedule` immediately.
+    let (job_idle, _) = reservation(&rt, &dir, 10).await;
+    let idle_id = job_idle.logical_index_id();
+    job_idle.schedule(worker_options(&dir)).await.unwrap();
+    job_idle.abort().await.unwrap();
+    wait_empty(&memory, idle_id).await;
+
+    // 2. Scheduled job aborted mid-flight while `run_bulk_scheduler` holds it does not kill the daemon.
+    let dir2 = tempfile::tempdir().unwrap();
+    let (job_active, _) = reservation(&rt, &dir2, 25).await;
+    let active_id = job_active.logical_index_id();
+    job_active.schedule(worker_options(&dir2)).await.unwrap();
+    gate.arm(2);
+    let stop = CancellationToken::new();
+    let daemon = tokio::spawn({
+        let rt = rt.clone();
+        let stop = stop.clone();
+        async move {
+            rt.run_bulk_scheduler(
+                settings(),
+                OperationOptions::default().with_cancellation(stop),
+            )
+            .await
+        }
+    });
+    gate.wait().await;
+    let abort_fut = tokio::spawn({
+        let job_active = job_active.clone();
+        async move { job_active.abort().await }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    gate.release.notify_waiters();
+    abort_fut.await.unwrap().unwrap();
+    wait_empty(&memory, active_id).await;
+    assert!(
+        !daemon.is_finished(),
+        "mid-flight job.abort() must not terminate run_bulk_scheduler"
+    );
+    stop.cancel();
+    assert_eq!(
+        daemon.await.unwrap().unwrap_err().kind(),
+        ErrorKind::Cancelled
+    );
+    rt.shutdown().await.unwrap();
 }

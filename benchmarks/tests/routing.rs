@@ -73,8 +73,7 @@ fn all_routes_share_layout_and_keep_diagnostics_out_of_measurement() {
             let settings = &sweep["construction"]["bulk"];
             for field in [
                 "construction_memory_bytes",
-                "sort_memory_bytes",
-                "serving_memory_bytes",
+                "worker_memory_bytes",
                 "graph_memory_bytes",
                 "refinement_memory_bytes",
             ] {

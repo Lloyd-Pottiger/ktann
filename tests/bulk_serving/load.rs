@@ -1,34 +1,30 @@
-//! Crash/retry and transaction fencing tests for the public serving loader.
+//! Transaction fencing, chunk budget bounds, and recovery tests for Bulk Build workers.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
+
 use super::*;
 use ktann::api::{BulkBuildJob, BulkBuildStatus, BulkLoadOptions, OperationOptions, Result};
 use ktann::storage::backend::{
     AdmissionBudget, Capabilities, CommitStart, HardLimits, InsertOutcome, Mutation as RawMutation,
-    ReadOps, ScanLimits, ScanPage,
+    ScanLimits, ScanPage,
 };
 use ktann::storage::keys::KeyRange;
 use ktann_memory::test_support::{CommitFault, CommitOutcome, TestConfig};
 use ktann_memory::{MemoryReadTxn, MemoryWriteTxn};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
-use tokio::sync::Notify;
-use tokio_util::sync::CancellationToken;
 
-fn serving_options(memory: &MemoryBackend) -> ServingOptions {
-    ServingOptions {
-        graph_memory_bytes: 256 * 1024 * 1024,
-        hard_limits: memory.hard_limits(),
-        ..super::serving_options()
-    }
-}
-
-fn load_options() -> BulkLoadOptions {
+pub(super) fn load_options() -> BulkLoadOptions {
     BulkLoadOptions {
         max_mutations: 7,
         max_bytes: 2048,
     }
 }
-async fn reservation<B: Backend>(
+
+pub(super) async fn reservation<B: Backend>(
     runtime: &Runtime<B>,
     dir: &tempfile::TempDir,
     count: u64,
@@ -36,7 +32,7 @@ async fn reservation<B: Backend>(
     reservation_config(runtime, dir, count, config(Metric::L2, true)).await
 }
 
-async fn reservation_config<B: Backend>(
+pub(super) async fn reservation_config<B: Backend>(
     runtime: &Runtime<B>,
     dir: &tempfile::TempDir,
     count: u64,
@@ -50,181 +46,68 @@ async fn reservation_config<B: Backend>(
     )
     .unwrap();
     let job = runtime
-        .start_bulk_build(
-            "bulk",
-            &input,
-            ktann::construction::ConstructionOptions {
-                sample_items: options().sample_items,
-                memory_bytes: options().tree_memory_bytes,
-                scratch_bytes: options().tree_scratch_bytes,
-            },
-        )
+        .start_bulk_build("bulk", &input, construction_options())
         .await
         .unwrap();
     (job, input)
 }
 
-async fn fixture<B: Backend>(
-    runtime: &Runtime<B>,
-    memory: &MemoryBackend,
-    dir: &tempfile::TempDir,
-    count: u64,
-) -> (BulkBuildJob<B>, ServingArtifact) {
-    fixture_config(runtime, memory, dir, count, config(Metric::L2, true)).await
-}
-
-async fn fixture_config<B: Backend>(
-    runtime: &Runtime<B>,
-    memory: &MemoryBackend,
-    dir: &tempfile::TempDir,
-    count: u64,
-    config: IndexConfig,
-) -> (BulkBuildJob<B>, ServingArtifact) {
-    let (job, input) = reservation_config(runtime, dir, count, config).await;
-    let (forest, _) = ForestArtifact::build(
-        &dir.path().join("forest"),
-        &input,
-        *job.index_manifest().rotation_seed(),
-        options(),
-        1024 * 1024,
-    )
-    .unwrap();
-    let (artifact, _) = ServingArtifact::build(
-        &dir.path().join("serving"),
-        &input,
-        &forest,
-        job.index_manifest(),
-        serving_options(memory),
-        4 * 1024 * 1024,
-    )
-    .unwrap();
-    (job, artifact)
-}
-async fn checkpoint(
-    memory: &MemoryBackend,
-    job: &BulkBuildJob<impl Backend>,
-) -> ktann::storage::values::BuildLoad {
-    let mut txn = ReadLogicalTxn::bootstrap(memory.begin_read().await.unwrap());
-    match txn
-        .get(LogicalKey::BuildLoad(job.logical_index_id()))
-        .await
-        .unwrap()
-    {
-        Some(PersistentValue::BuildLoad(load)) => load,
-        _ => panic!("missing checkpoint"),
-    }
-}
-async fn assert_exact(memory: &MemoryBackend, artifact: &ServingArtifact) {
-    let mut txn = memory.begin_read().await.unwrap();
-    for entry in artifact.reader().unwrap() {
-        let entry = entry.unwrap();
-        assert_eq!(txn.get(entry.key).await.unwrap(), Some(entry.value));
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn claims_and_chunks_recover_unknown_outcomes_without_rewriting_committed_prefixes() {
-    for fault in [
-        CommitFault::Abort,
-        CommitFault::UnknownApplied,
-        CommitFault::UnknownNotApplied,
-    ] {
-        for at_claim in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
-            let memory = MemoryBackend::with_test_config(TestConfig::default());
-            let runtime = runtime(memory.clone());
-            let (job, artifact) = fixture(&runtime, &memory, &dir, 19).await;
-            let mut faults = vec![];
-            if !at_claim {
-                faults.push(CommitFault::Normal);
-            }
-            faults.push(fault);
-            memory.set_fault_plan(faults).unwrap();
-            let result = job.load_serving(&artifact, load_options()).await;
-            if at_claim && fault != CommitFault::Abort {
-                assert_eq!(result.unwrap_err().kind(), ErrorKind::CommitOutcomeUnknown);
-                let reopened = runtime.open_bulk_build("bulk").await.unwrap();
-                reopened
-                    .load_serving(&artifact, load_options())
-                    .await
-                    .unwrap();
-            } else {
-                result.unwrap();
-            }
-            assert_eq!(
-                job.status().await.unwrap(),
-                BulkBuildStatus::Loaded {
-                    entries: artifact.manifest().items()
-                }
-            );
-            assert_exact(&memory, &artifact).await;
-            let before = memory.history().len();
-            job.load_serving(&artifact, load_options()).await.unwrap();
-            assert_eq!(
-                before,
-                memory.history().len(),
-                "complete task must not write again"
-            );
-            for h in memory.history().iter().skip(1) {
-                assert!(h.mutations <= load_options().max_mutations);
-                assert!(h.mutation_bytes <= load_options().max_bytes);
-            }
-            assert_eq!(
-                runtime.open_index("bulk").await.unwrap_err().kind(),
-                ErrorKind::IndexBuilding
-            );
-            runtime.shutdown().await.unwrap();
-        }
-    }
-}
-
-// Pause one chosen commit or snapshot read without sleeps or scheduler
-// assumptions. All other transactions continue through the production adapter.
+// Pause one chosen commit or snapshot read without sleeps or scheduler assumptions.
 #[derive(Default)]
-struct Gate {
-    remaining: AtomicUsize,
-    read_remaining: AtomicUsize,
-    reached: Notify,
-    release: Notify,
-    write_slots: Option<Arc<tokio::sync::Semaphore>>,
-    waiting_for_slot: Notify,
+pub(super) struct Gate {
+    pub(super) remaining: AtomicUsize,
+    pub(super) read_remaining: AtomicUsize,
+    pub(super) reached: Notify,
+    pub(super) release: Notify,
+    pub(super) write_slots: Option<Arc<tokio::sync::Semaphore>>,
+    pub(super) waiting_for_slot: Notify,
 }
+
 impl Gate {
-    fn arm(&self, commit: usize) {
+    pub(super) fn arm(&self, commit: usize) {
         self.remaining.store(commit, Ordering::SeqCst);
     }
-    fn arm_read(&self, read: usize) {
+
+    #[allow(dead_code)]
+    pub(super) fn arm_read(&self, read: usize) {
         self.read_remaining.store(read, Ordering::SeqCst);
     }
 
-    async fn wait(&self) {
+    pub(super) async fn wait(&self) {
         tokio::time::timeout(Duration::from_secs(10), self.reached.notified())
             .await
             .unwrap();
     }
 }
+
 #[derive(Clone)]
-struct Gated {
-    memory: MemoryBackend,
-    gate: Arc<Gate>,
+pub(super) struct Gated {
+    pub(super) memory: MemoryBackend,
+    pub(super) gate: Arc<Gate>,
 }
-struct GatedTxn<'a> {
+
+pub(super) struct GatedTxn<'a> {
     inner: MemoryWriteTxn<'a>,
     gate: Arc<Gate>,
     _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
+
 impl Backend for Gated {
     type ReadTxn<'a> = MemoryReadTxn;
     type WriteTxn<'a> = GatedTxn<'a>;
+
     fn hard_limits(&self) -> HardLimits {
         self.memory.hard_limits()
     }
+
     fn admission_budget(&self) -> AdmissionBudget {
         self.memory.admission_budget()
     }
+
     fn capabilities(&self) -> Capabilities {
         self.memory.capabilities()
     }
+
     async fn begin_read(&self) -> Result<MemoryReadTxn> {
         if self
             .gate
@@ -237,6 +120,7 @@ impl Backend for Gated {
         }
         self.memory.begin_read().await
     }
+
     async fn begin_write(&self) -> Result<GatedTxn<'_>> {
         let permit = if let Some(slots) = &self.gate.write_slots {
             let permit = match slots.clone().try_acquire_owned() {
@@ -257,42 +141,54 @@ impl Backend for Gated {
         })
     }
 }
+
 impl ReadOps for GatedTxn<'_> {
     async fn get(&mut self, k: Bytes) -> Result<Option<Bytes>> {
         self.inner.get(k).await
     }
+
     async fn batch_get(&mut self, k: Vec<Bytes>) -> Result<Vec<Option<Bytes>>> {
         self.inner.batch_get(k).await
     }
+
     async fn scan(&mut self, r: &KeyRange, l: ScanLimits) -> Result<ScanPage> {
         self.inner.scan(r, l).await
     }
+
     async fn batch_scan(&mut self, r: &[KeyRange], l: ScanLimits) -> Result<Vec<ScanPage>> {
         self.inner.batch_scan(r, l).await
     }
 }
+
 impl WriteTxn for GatedTxn<'_> {
     async fn get_for_update(&mut self, k: Bytes) -> Result<Option<Bytes>> {
         self.inner.get_for_update(k).await
     }
+
     async fn batch_get_for_update(&mut self, k: Vec<Bytes>) -> Result<Vec<Option<Bytes>>> {
         self.inner.batch_get_for_update(k).await
     }
+
     async fn put(&mut self, k: Bytes, v: Bytes) -> Result<()> {
         self.inner.put(k, v).await
     }
+
     async fn insert(&mut self, k: Bytes, v: Bytes) -> Result<InsertOutcome> {
         self.inner.insert(k, v).await
     }
+
     async fn delete(&mut self, k: Bytes) -> Result<()> {
         self.inner.delete(k).await
     }
+
     async fn batch_mutate(&mut self, m: Vec<RawMutation>) -> Result<()> {
         self.inner.batch_mutate(m).await
     }
+
     async fn clear_range(&mut self, r: &KeyRange) -> Result<()> {
         self.inner.clear_range(r).await
     }
+
     async fn commit_with(self, start: CommitStart) -> Result<()> {
         if self
             .gate
@@ -305,76 +201,81 @@ impl WriteTxn for GatedTxn<'_> {
         }
         self.inner.commit_with(start).await
     }
+
     async fn rollback(self) {
         self.inner.rollback().await;
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn takeover_and_abort_fence_an_already_prepared_old_chunk() {
-    for (abort, graph) in [(false, false), (true, false), (false, true), (true, true)] {
-        let dir = tempfile::tempdir().unwrap();
-        let memory = MemoryBackend::with_test_config(TestConfig::default());
-        let gate = Arc::new(Gate::default());
-        let runtime = Runtime::new(
-            Gated {
-                memory: memory.clone(),
-                gate: gate.clone(),
-            },
-            RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
-        )
-        .unwrap();
-        let config = config(Metric::L2, true);
-        let config = if graph {
-            config.with_local_graph(ktann::api::LocalGraphConfig::new(2, 8, [7; 32]).unwrap())
-        } else {
-            config
-        };
-        let (job, artifact) = fixture_config(&runtime, &memory, &dir, 73, config).await;
-        gate.arm(2);
-        let old = job.clone();
-        let input = artifact.clone();
-        let task = tokio::spawn(async move { old.load_serving(&input, load_options()).await });
-        gate.wait().await;
-        assert_eq!(checkpoint(&memory, &job).await.entries(), 0);
-        if abort {
-            job.abort().await.unwrap();
-        } else {
-            job.load_serving(&artifact, load_options()).await.unwrap();
-            assert_eq!(checkpoint(&memory, &job).await.epoch(), 2);
-        }
-        gate.release.notify_one();
-        let error = task.await.unwrap().unwrap_err();
-        assert_eq!(
-            error.kind(),
-            if abort {
-                ErrorKind::IndexNotFound
-            } else {
-                ErrorKind::BulkBuildSuperseded
+async fn claims_and_chunks_respect_budgets_and_recover_unknown_outcomes() {
+    for fault in [
+        CommitFault::Abort,
+        CommitFault::UnknownApplied,
+        CommitFault::UnknownNotApplied,
+    ] {
+        for at_claim in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let memory = MemoryBackend::with_test_config(TestConfig::default());
+            let rt = runtime(memory.clone());
+            let (job, _) = reservation(&rt, &dir, 19).await;
+            let work = dir.path().join("work");
+            fs::create_dir(&work).unwrap();
+            let mut opts = BulkWorkerOptions::new(work);
+            opts.parallelism = 1;
+            opts.load = BulkLoadOptions {
+                max_mutations: 24,
+                max_bytes: 4096,
+            };
+
+            let mut faults = vec![];
+            if !at_claim {
+                faults.push(CommitFault::Normal);
             }
-        );
-        assert!(
-            memory
+            faults.push(fault);
+            memory.set_fault_plan(faults).unwrap();
+            let result = job.run_worker(opts.clone()).await;
+            if at_claim && fault != CommitFault::Abort {
+                assert_eq!(result.unwrap_err().kind(), ErrorKind::CommitOutcomeUnknown);
+                let reopened = rt.open_bulk_build("bulk").await.unwrap();
+                reopened.run_worker(opts.clone()).await.unwrap();
+            } else {
+                result.unwrap();
+            }
+            assert!(matches!(
+                job.status().await.unwrap(),
+                BulkBuildStatus::Loaded { .. }
+            ));
+
+            // Calling run_worker again on a Loaded build writes no new backend mutations.
+            let before = memory.history().len();
+            job.run_worker(opts.clone()).await.unwrap();
+            assert_eq!(before, memory.history().len());
+
+            // Data chunk commits respect `opts.load` mutation and byte bounds.
+            for h in memory
                 .history()
                 .iter()
-                .any(|h| h.outcome == CommitOutcome::Aborted)
-        );
-        if abort {
-            assert_eq!(job.status().await.unwrap(), BulkBuildStatus::Aborted);
-            assert!(dir.path().join("serving/data.bin").exists());
-        } else {
-            assert_exact(&memory, &artifact).await;
+                .filter(|h| h.outcome == CommitOutcome::Committed && h.mutations < 18)
+            {
+                assert!(h.mutations <= opts.load.max_mutations);
+                assert!(h.mutation_bytes <= opts.load.max_bytes);
+            }
+            let index = job.publish().await.unwrap();
+            let verified = index.verify(VerifyOptions::default()).await.unwrap();
+            assert!(verified.complete && verified.issues.is_empty());
+            assert_eq!(verified.objects.vector_records, 19);
+            rt.shutdown().await.unwrap();
         }
-        runtime.shutdown().await.unwrap();
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cancellation_keeps_atomic_progress_and_reopen_resumes_without_prefix_writes() {
+async fn cancellation_mid_load_recovers_cleanly_on_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let memory = MemoryBackend::with_test_config(TestConfig::default());
     let gate = Arc::new(Gate::default());
-    let runtime = Runtime::new(
+    let rt = Runtime::new(
         Gated {
             memory: memory.clone(),
             gate: gate.clone(),
@@ -382,297 +283,63 @@ async fn cancellation_keeps_atomic_progress_and_reopen_resumes_without_prefix_wr
         RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
     )
     .unwrap();
-    let (job, artifact) = fixture(&runtime, &memory, &dir, 19).await;
+    let (job, _) = reservation(&rt, &dir, 19).await;
+    let work = dir.path().join("work");
+    fs::create_dir(&work).unwrap();
+    let mut opts = BulkWorkerOptions::new(work);
+    opts.parallelism = 1;
+    opts.load = load_options();
+
     gate.arm(3);
-    let worker = job.clone();
-    let input = artifact.clone();
-    let cancellation = CancellationToken::new();
-    let control = OperationOptions::default().with_cancellation(cancellation.clone());
-    let task = tokio::spawn(async move {
-        worker
-            .load_serving_with_control(&input, load_options(), control)
-            .await
-    });
+    let cancel = CancellationToken::new();
+    let ctrl = OperationOptions::default().with_cancellation(cancel.clone());
+    let worker_job = job.clone();
+    let opts_c = opts.clone();
+    let pending =
+        tokio::spawn(async move { worker_job.run_worker_with_control(opts_c, ctrl).await });
     gate.wait().await;
-    assert_eq!(checkpoint(&memory, &job).await.entries(), 6);
-    cancellation.cancel();
+    cancel.cancel();
     gate.release.notify_one();
     assert_eq!(
-        task.await.unwrap().unwrap_err().kind(),
+        pending.await.unwrap().unwrap_err().kind(),
         ErrorKind::Cancelled
     );
-    let progress = checkpoint(&memory, &job).await;
-    assert!(progress.entries() >= 6 && !progress.is_complete());
-    let before = memory.history().len();
-    let resumed = runtime.open_bulk_build("bulk").await.unwrap();
-    resumed
-        .load_serving(&artifact, load_options())
-        .await
-        .unwrap();
-    let delta = memory.history();
-    let data_writes: usize = delta[before..]
-        .iter()
-        .filter(|h| h.outcome == CommitOutcome::Committed)
-        .map(|h| h.mutations - 1)
-        .sum();
-    assert_eq!(
-        data_writes as u64,
-        artifact.manifest().items() - progress.entries()
-    );
-    assert_exact(&memory, &artifact).await;
-    runtime.shutdown().await.unwrap();
+
+    let reopened = rt.open_bulk_build("bulk").await.unwrap();
+    let index = reopened.complete(opts).await.unwrap();
+    let report = index.verify(VerifyOptions::default()).await.unwrap();
+    assert!(report.complete && report.issues.is_empty());
+    assert_eq!(report.objects.vector_records, 19);
+    rt.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn empty_load_and_checkpoint_codec_are_canonical_and_fail_closed() {
+async fn corrupt_input_segment_fails_closed_before_publication() {
     let dir = tempfile::tempdir().unwrap();
     let memory = MemoryBackend::new();
-    let runtime = runtime(memory.clone());
-    let (job, artifact) = fixture(&runtime, &memory, &dir, 0).await;
-    job.load_serving(&artifact, load_options()).await.unwrap();
-    let load = checkpoint(&memory, &job).await;
-    assert!(load.is_complete());
-    assert_eq!(load.entries(), 0);
-    let key = LogicalKey::BuildLoad(job.logical_index_id());
-    let value = ValueCodec::bootstrap()
-        .encode(&PersistentValue::BuildLoad(load.clone()))
-        .unwrap();
-    let mut expected = vec![14, 0, 0, 0, 90];
-    expected.extend_from_slice(&artifact.manifest().encode());
-    expected.extend_from_slice(&1_u64.to_be_bytes());
-    expected.extend_from_slice(&0_u64.to_be_bytes());
-    expected.extend_from_slice(load.prefix_sha256());
-    expected.push(1);
-    assert_eq!(value, expected);
-    assert_eq!(
-        keys::build_load_key(job.logical_index_id()),
-        [
-            vec![1],
-            job.logical_index_id().get().to_be_bytes().to_vec(),
-            vec![6]
-        ]
-        .concat()
-    );
-    for (offset, replacement) in [(102, 0), (110, 1), (143, 2), (14, 2)] {
-        let mut invalid = value.clone();
-        invalid[offset] = replacement;
-        assert_eq!(
-            ValueCodec::bootstrap()
-                .decode(&key, Bytes::from(invalid))
-                .unwrap_err()
-                .kind(),
-            ErrorKind::Corruption
-        );
-    }
-    runtime.shutdown().await.unwrap();
-}
+    let rt = runtime(memory);
+    let (job, _) = reservation(&rt, &dir, 19).await;
+    let seg_path = dir.path().join("source/seg-00000000.bin");
+    let orig = fs::read(&seg_path).unwrap();
+    let mut damaged = orig.clone();
+    *damaged.last_mut().unwrap() ^= 0xff;
+    fs::write(&seg_path, damaged).unwrap();
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn corrupt_input_never_completes_and_repaired_identical_bytes_resume() {
-    let dir = tempfile::tempdir().unwrap();
-    let memory = MemoryBackend::new();
-    let runtime = runtime(memory.clone());
-    let (job, artifact) = fixture(&runtime, &memory, &dir, 19).await;
-    let path = dir.path().join("serving/data.bin");
-    let original = fs::read(&path).unwrap();
-    let mut corrupt = original.clone();
-    *corrupt.last_mut().unwrap() ^= 1;
-    fs::write(&path, corrupt).unwrap();
+    let work = dir.path().join("work");
+    fs::create_dir(&work).unwrap();
+    let opts = BulkWorkerOptions::new(work);
     assert_eq!(
-        job.load_serving(&artifact, load_options())
-            .await
-            .unwrap_err()
-            .kind(),
+        job.run_worker(opts).await.unwrap_err().kind(),
         ErrorKind::Corruption
     );
-    let partial = checkpoint(&memory, &job).await;
-    assert!(!partial.is_complete());
-    assert!(partial.entries() > 0);
     assert_eq!(
-        runtime.open_index("bulk").await.unwrap_err().kind(),
-        ErrorKind::IndexBuilding
+        job.status().await.unwrap(),
+        BulkBuildStatus::Failed {
+            kind: ErrorKind::Corruption
+        }
     );
-    fs::write(path, original).unwrap();
-    job.load_serving(&artifact, load_options()).await.unwrap();
-    assert_exact(&memory, &artifact).await;
-    runtime.shutdown().await.unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn admission_and_artifact_identity_are_enforced_before_data_writes() {
-    let dir = tempfile::tempdir().unwrap();
-    let memory = MemoryBackend::with_test_config(TestConfig::default());
-    let runtime = runtime(memory.clone());
-    let (job, artifact) = fixture(&runtime, &memory, &dir, 19).await;
-    for limit in [0, 152] {
-        let err = job
-            .load_serving(
-                &artifact,
-                BulkLoadOptions {
-                    max_mutations: 7,
-                    max_bytes: limit,
-                },
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            err.kind(),
-            ErrorKind::InvalidArgument | ErrorKind::LimitExceeded
-        ));
-        assert_eq!(job.status().await.unwrap(), BulkBuildStatus::Preparing);
-    }
-    assert_eq!(
-        job.load_serving(
-            &artifact,
-            BulkLoadOptions {
-                max_mutations: 7,
-                max_bytes: 154
-            }
-        )
-        .await
-        .unwrap_err()
-        .kind(),
-        ErrorKind::LimitExceeded
-    );
-    assert_eq!(checkpoint(&memory, &job).await.entries(), 0);
-    // A different forest identity cannot replace the artifact registered by
-    // the first attempt, even for the same source and target index.
-    let source = InputSnapshot::open(
-        &dir.path().join("source"),
-        job.index_manifest().config().clone(),
-        job.descriptor().input().clone(),
-    )
-    .unwrap();
-    let (forest, _) = ForestArtifact::build(
-        &dir.path().join("other-forest"),
-        &source,
-        *job.index_manifest().rotation_seed(),
-        ForestOptions {
-            refinement_rounds: None,
-            refinement_memory_bytes: 256 * 1024 * 1024,
-            sample_items: options().sample_items + 1,
-            ..options()
-        },
-        1024 * 1024,
-    )
-    .unwrap();
-    let mut changed = serving_options(&memory);
-    changed.memory_bytes += 1024 * 1024;
-    let (other, _) = ServingArtifact::build(
-        &dir.path().join("other-serving"),
-        &source,
-        &forest,
-        job.index_manifest(),
-        changed,
-        4 * 1024 * 1024,
-    )
-    .unwrap();
-    assert_eq!(
-        job.load_serving(&other, load_options())
-            .await
-            .unwrap_err()
-            .kind(),
-        ErrorKind::InvalidArgument
-    );
-    assert_eq!(checkpoint(&memory, &job).await.epoch(), 1);
-    job.load_serving(&artifact, load_options()).await.unwrap();
-    // A second index has a different immutable identity even with identical input.
-    let other_job = runtime
-        .start_bulk_build(
-            "other",
-            &source,
-            ktann::construction::ConstructionOptions {
-                sample_items: options().sample_items,
-                memory_bytes: options().tree_memory_bytes,
-                scratch_bytes: options().tree_scratch_bytes,
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        other_job
-            .load_serving(&artifact, load_options())
-            .await
-            .unwrap_err()
-            .kind(),
-        ErrorKind::InvalidArgument
-    );
-    assert_eq!(
-        other_job.status().await.unwrap(),
-        BulkBuildStatus::Preparing
-    );
-    runtime.shutdown().await.unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn physical_namespace_overhead_and_checkpoint_share_the_chunk_budget() {
-    let mut config = TestConfig::default();
-    config.admission_budget.mutation_key_overhead_bytes = 100;
-    let memory = MemoryBackend::with_test_config(config);
-    let runtime = runtime(memory.clone());
-    let dir = tempfile::tempdir().unwrap();
-    let (job, artifact) = fixture(&runtime, &memory, &dir, 19).await;
-    let before = memory.history().len();
-    job.load_serving(
-        &artifact,
-        BulkLoadOptions {
-            max_mutations: 7,
-            max_bytes: 640,
-        },
-    )
-    .await
-    .unwrap();
-    for h in &memory.history()[before..] {
-        assert!(h.mutations <= 7 && h.mutation_bytes <= 640);
-    }
-    assert_exact(&memory, &artifact).await;
-    runtime.shutdown().await.unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn replay_checks_the_exact_previously_committed_prefix_before_skipping_it() {
-    use sha2::{Digest, Sha256};
-    let dir = tempfile::tempdir().unwrap();
-    let memory = MemoryBackend::new();
-    let runtime = runtime(memory.clone());
-    let (job, artifact) = fixture(&runtime, &memory, &dir, 19).await;
-    let path = dir.path().join("serving/data.bin");
-    let original = fs::read(&path).unwrap();
-    let mut forged = original.clone();
-    let length = u32::from_be_bytes(forged[42..46].try_into().unwrap()) as usize;
-    let end = 46 + length;
-    let key_length = u32::from_be_bytes(forged[46..50].try_into().unwrap()) as usize;
-    let value = 50 + key_length;
-    assert_eq!(forged[value], 4); // Vector Record, eight-byte ID and dimension.
-    forged[value + 15..value + 19].copy_from_slice(&2_f32.to_be_bytes());
-    let digest = Sha256::digest(&forged[46..end]);
-    forged[end..end + 32].copy_from_slice(&digest);
-    fs::write(&path, forged).unwrap();
-    // Every frame is well formed, but final file identity must fail.
-    assert_eq!(
-        job.load_serving(&artifact, load_options())
-            .await
-            .unwrap_err()
-            .kind(),
-        ErrorKind::Corruption
-    );
-    let before = checkpoint(&memory, &job).await;
-    assert!(before.entries() > 0 && !before.is_complete());
-    fs::write(path, original).unwrap();
-    // Repairing the file cannot bless a different prefix already in storage.
-    assert_eq!(
-        job.load_serving(&artifact, load_options())
-            .await
-            .unwrap_err()
-            .kind(),
-        ErrorKind::Corruption
-    );
-    let after = checkpoint(&memory, &job).await;
-    assert_eq!(before.entries(), after.entries());
-    assert_eq!(before.prefix_sha256(), after.prefix_sha256());
-    assert!(!after.is_complete());
     job.abort().await.unwrap();
-    runtime.shutdown().await.unwrap();
+    rt.shutdown().await.unwrap();
 }
 
 #[path = "complete.rs"]

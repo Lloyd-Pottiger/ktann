@@ -1,19 +1,16 @@
-//! Bounded offline input capture, forest construction, and serving artifacts.
+//! Segmented input snapshots, deterministic shard planning, and bounded bulk construction.
 //!
-//! Files remain caller owned. These synchronous operations prepare and validate
-//! immutable artifacts; they do not load or publish a Logical Index.
+//! Input snapshots remain caller owned. Bulk Build execution streams input segments
+//! directly into sharded leaf construction, bounded halo refinement, and backend KV batches.
 
-mod files;
-mod forest;
-mod graphs;
+pub(crate) mod digest;
+pub(crate) mod files;
+pub(crate) mod graphs;
 mod input;
-mod plan;
-mod refine;
-mod serving;
-mod sort;
+pub(crate) mod plan;
+pub(crate) mod sharded;
 
-pub use files::{ARTIFACT_MANIFEST_BYTES, ArtifactManifest};
-pub use forest::{ForestArtifact, ForestOptions, ForestPartition, ForestReader, ForestReport};
+pub(crate) use digest::LtHash;
+pub use files::{INPUT_MANIFEST_BYTES, InputManifest};
 pub use input::{InputReader, InputSnapshot, InputSnapshotWriter};
-pub(crate) use serving::OrderedSource;
-pub use serving::{ServingArtifact, ServingEntry, ServingOptions, ServingReader, ServingReport};
+pub(crate) use plan::ShardPlan;

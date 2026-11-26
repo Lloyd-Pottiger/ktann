@@ -204,7 +204,7 @@ async fn graph_preparation_failure_is_terminal_hidden_and_identity_bound() {
         );
         let mut options = worker(&dir);
         if refinement {
-            options.refinement_memory_bytes = 1;
+            options.memory_bytes = 1;
         } else {
             options.graph_memory_bytes = 1;
         }
@@ -232,7 +232,7 @@ async fn graph_preparation_failure_is_terminal_hidden_and_identity_bound() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn explicit_load_checks_refinement_identity_and_graph_bytes_before_publish() {
+async fn missing_graph_chunk_in_sealed_backend_fails_closed_before_publish() {
     let dir = tempfile::tempdir().unwrap();
     let memory = MemoryBackend::new();
     let runtime = runtime(memory.clone());
@@ -256,30 +256,6 @@ async fn explicit_load_checks_refinement_identity_and_graph_bytes_before_publish
         )
         .await
         .unwrap();
-    let (forest, _) = ForestArtifact::build(
-        &dir.path().join("wrong-forest"),
-        &input,
-        *job.index_manifest().rotation_seed(),
-        options(),
-        1 << 24,
-    )
-    .unwrap();
-    let (serving, _) = ServingArtifact::build(
-        &dir.path().join("wrong-serving"),
-        &input,
-        &forest,
-        job.index_manifest(),
-        serving_options(),
-        1 << 24,
-    )
-    .unwrap();
-    assert_eq!(
-        job.load_serving(&serving, ktann::api::BulkLoadOptions::default())
-            .await
-            .unwrap_err()
-            .kind(),
-        ErrorKind::InvalidArgument
-    );
     let options = worker(&dir);
     job.run_worker(options).await.unwrap();
     let mut txn = memory.begin_write().await.unwrap();

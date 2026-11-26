@@ -268,12 +268,8 @@ fn fixed_bridge_routes_after_artifact_refinement() {
         .unwrap();
         assert_eq!(report["configuration"]["routing_experiment"]["mode"], mode);
         assert_eq!(report["bulk_build"]["refinement_memory_bytes"], 8388608);
-        for field in [
-            "construction_memory_bytes",
-            "sort_memory_bytes",
-            "serving_memory_bytes",
-            "graph_memory_bytes",
-        ] {
+        assert_eq!(report["bulk_build"]["worker_memory_bytes"], 8388608);
+        for field in ["construction_memory_bytes", "graph_memory_bytes"] {
             assert_eq!(report["bulk_build"][field], 33554432, "{field}: {report}");
         }
     }

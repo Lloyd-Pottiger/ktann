@@ -312,12 +312,14 @@ impl Backend for SnapshotCut {
     type ReadTxn<'a> = <MemoryBackend as Backend>::ReadTxn<'a>;
     type WriteTxn<'a> = <MemoryBackend as Backend>::WriteTxn<'a>;
 
-    fn hard_limits(&self) -> HardLimits {
+    fn hard_limits(&self) -> ktann::storage::backend::HardLimits {
         self.memory.hard_limits()
     }
+
     fn admission_budget(&self) -> ktann::storage::backend::AdmissionBudget {
         self.memory.admission_budget()
     }
+
     fn capabilities(&self) -> ktann::storage::backend::Capabilities {
         self.memory.capabilities()
     }

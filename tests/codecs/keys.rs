@@ -8,11 +8,13 @@ use std::cmp::Ordering;
 use bytes::Bytes;
 use ktann::api::{DataType, ErrorKind, IndexName, LogicalIndexId, PartitionKey, Value};
 use ktann::storage::keys::{
-    LogicalKey, MAX_RECORD_ID_BYTES, MAX_STRING_BYTES, MAX_TREE_KEY_BYTES, TreeKey, centroid_key,
-    child_entry_key, decode_key, drain_header_key, drain_synopsis_key, header_key,
-    index_id_allocator_key, index_range, leaf_entry_key, location_key, manifest_key,
-    name_directory_key, partition_range, payload_key, record_key, state_key, synopsis_key,
-    tree_manifest_key, tree_manifest_prefix_range, tree_manifest_range,
+    LogicalKey, MAX_RECORD_ID_BYTES, MAX_STRING_BYTES, MAX_TREE_KEY_BYTES, TreeKey,
+    build_descriptor_key, build_progress_key, build_schedule_key, build_schedule_slot_key,
+    build_unit_key, build_workspace_key, centroid_key, child_entry_key, decode_key,
+    drain_header_key, drain_synopsis_key, header_key, index_id_allocator_key, index_range,
+    leaf_entry_key, location_key, manifest_key, name_directory_key, partition_range, payload_key,
+    record_key, state_key, synopsis_key, tree_manifest_key, tree_manifest_prefix_range,
+    tree_manifest_range,
 };
 
 fn id(value: u64) -> LogicalIndexId {
@@ -903,6 +905,39 @@ fn build_descriptor_key_is_canonical_and_index_owned() {
     let mut overlong = encoded.to_vec();
     overlong.push(0);
     assert!(decode_key(&[], &Bytes::from(overlong)).is_err());
+
+    let progress_key = LogicalKey::BuildProgress(id(1));
+    let progress_enc = ktann::storage::keys::build_progress_key(id(1));
+    assert_eq!(
+        progress_enc.as_slice(),
+        b"\x01\x00\x00\x00\x00\x00\x00\x00\x01\x06"
+    );
+    assert_eq!(
+        decode_key(&[], &Bytes::from(progress_enc.clone())).unwrap(),
+        progress_key
+    );
+    let mut bad_prog = progress_enc;
+    bad_prog.push(0);
+    assert!(decode_key(&[], &Bytes::from(bad_prog)).is_err());
+
+    let unit_key = LogicalKey::BuildUnit {
+        index: id(1),
+        stage: 40,
+        unit: 7,
+    };
+    let unit_enc = ktann::storage::keys::build_unit_key(id(1), 40, 7);
+    assert_eq!(
+        unit_enc.as_slice(),
+        b"\x01\x00\x00\x00\x00\x00\x00\x00\x01\x07\x28\x00\x00\x00\x07"
+    );
+    assert_eq!(
+        decode_key(&[], &Bytes::from(unit_enc.clone())).unwrap(),
+        unit_key
+    );
+    assert!(decode_key(&[], &Bytes::from(unit_enc[..unit_enc.len() - 1].to_vec())).is_err());
+    let mut bad_unit = unit_enc;
+    bad_unit.push(0);
+    assert!(decode_key(&[], &Bytes::from(bad_unit)).is_err());
 }
 
 #[test]
@@ -1022,4 +1057,76 @@ fn string_terminator_delimits_partition_suffix_and_exact_field_prefix() {
             );
         }
     }
+}
+
+#[test]
+fn build_metadata_and_schedule_slot_golden_and_malformed_keys() {
+    let idx = id(7);
+    let cases = [
+        (
+            build_workspace_key(idx),
+            b"\x00\x02\x00\x00\x00\x00\x00\x00\x00\x07".as_slice(),
+            LogicalKey::BuildWorkspace(idx),
+        ),
+        (
+            build_schedule_key(idx),
+            b"\x00\x03\x00\x00\x00\x00\x00\x00\x00\x07".as_slice(),
+            LogicalKey::BuildSchedule(idx),
+        ),
+        (
+            build_schedule_slot_key(idx, 3),
+            b"\x00\x04\x00\x00\x00\x00\x00\x00\x00\x07\x00\x00\x00\x03".as_slice(),
+            LogicalKey::BuildScheduleSlot {
+                index: idx,
+                slot: 3,
+            },
+        ),
+        (
+            build_descriptor_key(idx),
+            b"\x01\x00\x00\x00\x00\x00\x00\x00\x07\x05".as_slice(),
+            LogicalKey::BuildDescriptor(idx),
+        ),
+        (
+            build_progress_key(idx),
+            b"\x01\x00\x00\x00\x00\x00\x00\x00\x07\x06".as_slice(),
+            LogicalKey::BuildProgress(idx),
+        ),
+        (
+            build_unit_key(idx, 40, 2),
+            b"\x01\x00\x00\x00\x00\x00\x00\x00\x07\x07\x28\x00\x00\x00\x02".as_slice(),
+            LogicalKey::BuildUnit {
+                index: idx,
+                stage: 40,
+                unit: 2,
+            },
+        ),
+    ];
+
+    for (encoded, expected_bytes, expected_key) in cases {
+        assert_eq!(encoded.as_slice(), expected_bytes);
+        assert_eq!(
+            decode_key(&[], &Bytes::from(encoded.clone())).unwrap(),
+            expected_key
+        );
+        for length in 0..encoded.len() {
+            assert!(is_corrupt(&[], &encoded[..length]));
+        }
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(is_corrupt(&[], &trailing));
+    }
+
+    // Zero LogicalIndexId is invalid in both namespace-scoped and index-scoped build keys.
+    assert!(is_corrupt(&[], b"\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00"));
+    assert!(is_corrupt(&[], b"\x00\x03\x00\x00\x00\x00\x00\x00\x00\x00"));
+    assert!(is_corrupt(
+        &[],
+        b"\x00\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+    ));
+    assert!(is_corrupt(&[], b"\x01\x00\x00\x00\x00\x00\x00\x00\x00\x05"));
+    assert!(is_corrupt(&[], b"\x01\x00\x00\x00\x00\x00\x00\x00\x00\x06"));
+    assert!(is_corrupt(
+        &[],
+        b"\x01\x00\x00\x00\x00\x00\x00\x00\x00\x07\x00\x00\x00\x00\x00"
+    ));
 }

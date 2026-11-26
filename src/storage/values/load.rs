@@ -1,64 +1,108 @@
-//! One immutable serving artifact and its atomically advanced load checkpoint.
+//! Persistent Bulk Build phase, inventory counts, and multiset-digest expectations.
 
 use std::fmt;
 
+use bytes::Bytes;
+
 use crate::api::{Error, Result};
-use crate::bulk::{ARTIFACT_MANIFEST_BYTES, ArtifactManifest};
+use crate::bulk::LtHash;
 
 use super::corrupt;
 use super::wire::{Decoder, Encoder};
 
-/// Durable fencing and progress for one index's serving-data load.
-///
-/// The artifact cannot be replaced after registration. A new invocation takes
-/// over by increasing the epoch; data and progress commit together. Completion
-/// means every artifact entry and EOF were verified, not that publication is
-/// authorized. A completed checkpoint never changes: claims return it unchanged,
-/// and outstanding chunks cannot match its predecessor to commit more writes.
-#[derive(Clone, Eq, PartialEq)]
-pub struct BuildLoad {
-    pub(crate) artifact: ArtifactManifest,
-    pub(crate) epoch: u64,
-    pub(crate) entries: u64,
-    pub(crate) prefix_sha256: [u8; 32],
-    pub(crate) complete: bool,
+pub(crate) const MAX_SPLIT_KEYS: usize = 255;
+const MAX_SPLIT_KEY_BYTES: usize = 16 * 1024;
+
+/// High-level persisted phase of one Bulk Build.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BuildPhase {
+    /// Plan or intermediate shard units are being prepared.
+    Preparing,
+    /// Serving KV entries are being emitted into the hidden index.
+    Loading,
+    /// All serving KV entries and expected multiset digests are sealed.
+    Loaded,
+    /// Writer lanes are revoked and parallel slice validation is in progress.
+    Validating,
 }
 
-impl BuildLoad {
-    /// The immutable, sealed input identity.
-    #[must_use]
-    pub fn artifact(&self) -> &ArtifactManifest {
-        &self.artifact
+impl BuildPhase {
+    const fn to_u8(self) -> u8 {
+        match self {
+            Self::Preparing => 0,
+            Self::Loading => 1,
+            Self::Loaded => 2,
+            Self::Validating => 3,
+        }
     }
-    /// Monotonic takeover epoch, starting at one.
+
+    fn from_u8(tag: u8) -> Result<Self> {
+        match tag {
+            0 => Ok(Self::Preparing),
+            1 => Ok(Self::Loading),
+            2 => Ok(Self::Loaded),
+            3 => Ok(Self::Validating),
+            _ => Err(corrupt()),
+        }
+    }
+}
+
+/// Durable stage progress and sealed inventory digest of one Bulk Build.
+#[derive(Clone, Eq, PartialEq)]
+pub struct BuildProgress {
+    pub(crate) phase: BuildPhase,
+    pub(crate) epoch: u64,
+    pub(crate) total_records: u64,
+    pub(crate) loaded_entries: u64,
+    pub(crate) total_entries: u64,
+    pub(crate) trees: u64,
+    pub(crate) partitions: u64,
+    pub(crate) expected_kv_lthash: LtHash,
+    pub(crate) validation_split_keys: Vec<Bytes>,
+}
+
+impl BuildProgress {
+    /// Current persisted phase.
+    #[must_use]
+    pub const fn phase(&self) -> BuildPhase {
+        self.phase
+    }
+
+    /// Monotonic attempt epoch, starting at one.
     #[must_use]
     pub const fn epoch(&self) -> u64 {
         self.epoch
     }
-    /// Number of sorted entries committed with this checkpoint.
+
+    /// Serving entries committed so far.
     #[must_use]
-    pub const fn entries(&self) -> u64 {
-        self.entries
-    }
-    /// SHA-256 of the data-file prefix corresponding to committed entries.
-    #[must_use]
-    pub const fn prefix_sha256(&self) -> &[u8; 32] {
-        &self.prefix_sha256
-    }
-    /// Whether the complete stream was loaded and its checksum verified.
-    #[must_use]
-    pub const fn is_complete(&self) -> bool {
-        self.complete
+    pub const fn loaded_entries(&self) -> u64 {
+        self.loaded_entries
     }
 
-    fn validate(&self) -> Result<()> {
-        if !self.artifact.is_serving()
-            || self.epoch == 0
-            || self.entries > self.artifact.items()
-            || (self.entries == 0 && self.prefix_sha256 != self.artifact.initial_sha256())
-            || (self.complete
-                && (self.entries != self.artifact.items()
-                    || self.prefix_sha256 != *self.artifact.sha256()))
+    /// Total serving entries expected once sealed.
+    #[must_use]
+    pub const fn total_entries(&self) -> u64 {
+        self.total_entries
+    }
+
+    /// Disjoint keyspace slices (`validation_split_keys.len() + 1`) used during validation.
+    #[must_use]
+    pub const fn validation_slices(&self) -> u32 {
+        (self.validation_split_keys.len() as u32) + 1
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.epoch == 0
+            || self.loaded_entries > self.total_entries
+            || (matches!(self.phase, BuildPhase::Loaded | BuildPhase::Validating)
+                && self.loaded_entries != self.total_entries)
+            || self.validation_split_keys.len() > MAX_SPLIT_KEYS
+            || self
+                .validation_split_keys
+                .iter()
+                .any(|k| k.is_empty() || k.len() > MAX_SPLIT_KEY_BYTES)
+            || self.validation_split_keys.windows(2).any(|w| w[0] >= w[1])
         {
             return Err(Error::invalid_argument());
         }
@@ -66,43 +110,63 @@ impl BuildLoad {
     }
 }
 
-impl fmt::Debug for BuildLoad {
+impl fmt::Debug for BuildProgress {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BuildLoad")
+        f.debug_struct("BuildProgress")
+            .field("phase", &self.phase)
             .field("epoch", &self.epoch)
-            .field("entries", &self.entries)
-            .field("complete", &self.complete)
+            .field("loaded_entries", &self.loaded_entries)
+            .field("total_entries", &self.total_entries)
             .finish_non_exhaustive()
     }
 }
 
-pub(super) fn encode(encoder: &mut Encoder, load: &BuildLoad) -> Result<()> {
-    load.validate()?;
-    encoder.sized_bytes(&load.artifact.encode(), ARTIFACT_MANIFEST_BYTES)?;
-    encoder.u64(load.epoch);
-    encoder.u64(load.entries);
-    encoder.bytes(&load.prefix_sha256);
-    encoder.u8(u8::from(load.complete));
+pub(super) fn encode(encoder: &mut Encoder, p: &BuildProgress) -> Result<()> {
+    p.validate()?;
+    encoder.u8(p.phase.to_u8());
+    encoder.u64(p.epoch);
+    encoder.u64(p.total_records);
+    encoder.u64(p.loaded_entries);
+    encoder.u64(p.total_entries);
+    encoder.u64(p.trees);
+    encoder.u64(p.partitions);
+    encoder.bytes(&p.expected_kv_lthash.encode());
+    encoder.u16(p.validation_split_keys.len() as u16);
+    for key in &p.validation_split_keys {
+        encoder.sized_bytes(key, MAX_SPLIT_KEY_BYTES)?;
+    }
     Ok(())
 }
 
-pub(super) fn decode(decoder: &mut Decoder) -> Result<BuildLoad> {
-    let artifact = ArtifactManifest::decode(&decoder.sized_bytes(ARTIFACT_MANIFEST_BYTES)?)?;
+pub(super) fn decode(decoder: &mut Decoder) -> Result<BuildProgress> {
+    let phase = BuildPhase::from_u8(decoder.u8()?)?;
     let epoch = decoder.u64()?;
-    let entries = decoder.u64()?;
-    let prefix_sha256 = decoder.array()?;
-    let complete = match decoder.u8()? {
-        0 => false,
-        1 => true,
-        _ => return Err(corrupt()),
-    };
-    let load = BuildLoad {
-        artifact,
+    let total_records = decoder.u64()?;
+    let loaded_entries = decoder.u64()?;
+    let total_entries = decoder.u64()?;
+    let trees = decoder.u64()?;
+    let partitions = decoder.u64()?;
+    let lthash_bytes: [u8; 64] = decoder.array()?;
+    let expected_kv_lthash = LtHash::decode(&lthash_bytes);
+    let split_count = usize::from(decoder.u16()?);
+    if split_count > MAX_SPLIT_KEYS {
+        return Err(corrupt());
+    }
+    let mut validation_split_keys = Vec::with_capacity(split_count);
+    for _ in 0..split_count {
+        validation_split_keys.push(decoder.sized_bytes(MAX_SPLIT_KEY_BYTES)?);
+    }
+    let value = BuildProgress {
+        phase,
         epoch,
-        entries,
-        prefix_sha256,
-        complete,
+        total_records,
+        loaded_entries,
+        total_entries,
+        trees,
+        partitions,
+        expected_kv_lthash,
+        validation_split_keys,
     };
-    load.validate().map_err(|_| corrupt())?;
-    Ok(load)
+    value.validate().map_err(|_| corrupt())?;
+    Ok(value)
 }

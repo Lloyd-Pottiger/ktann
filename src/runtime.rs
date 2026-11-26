@@ -28,7 +28,6 @@ pub(crate) mod graph_maintenance;
 pub use graph_maintenance::GraphMaintenance;
 mod routing_graph;
 
-pub(crate) mod bulk_load;
 pub(crate) mod bulk_publish;
 pub(crate) mod bulk_scheduler;
 pub(crate) mod bulk_worker;
@@ -423,9 +422,10 @@ impl WriteRoutingControl {
 }
 
 pub(crate) struct OperationContext<B: Backend> {
-    bulk_authority: Option<[u8; 32]>,
+    pub(crate) bulk_authority: Option<bulk_scheduler::BulkAuthority>,
+    pub(crate) bulk_lease_lock: Option<Arc<tokio::sync::RwLock<()>>>,
     backend: Arc<B>,
-    options: OperationOptions,
+    pub(crate) options: OperationOptions,
     write_beam_size: u32,
     routing_working_bytes: usize,
     partition_cache: Arc<PartitionCache>,
@@ -458,6 +458,23 @@ impl<B: Backend> OperationContext<B> {
 
     pub(crate) fn checkpoint(&self) -> Result<()> {
         check_control(&self.options)
+    }
+
+    /// Returns an erased shared-admission token for parallel worker tasks that outlive an async poll.
+    pub(crate) fn cpu_keep_alive(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        self.cpu_admission
+            .as_ref()
+            .map(|guard| Arc::clone(guard) as Arc<dyn std::any::Any + Send + Sync>)
+    }
+
+    /// Runs synchronous CPU or native file work off Tokio while retaining foreground admission
+    /// and cancelling inner loops if the owning async future drops.
+    pub(crate) async fn compute<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&OperationOptions) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        self.checkpoint()?;
+        compute::controlled_compute(self.options.clone(), self.cpu_admission.clone(), work).await
     }
 
     /// Starts one commit attempt at the Runtime's cancellation boundary.
@@ -594,7 +611,6 @@ impl<B: Backend> RuntimeInner<B> {
             Operation::Search
                 | Operation::Verify
                 | Operation::Refine
-                | Operation::LoadBulkBuild
                 | Operation::RunBulkBuild
                 | Operation::ScheduleBulkBuild
                 | Operation::PublishBulkBuild
@@ -615,6 +631,7 @@ impl<B: Backend> RuntimeInner<B> {
         let (commit_cancellation, commit_start) = CommitCancellation::pair();
         let context = OperationContext {
             bulk_authority: None,
+            bulk_lease_lock: None,
             backend,
             options,
             write_beam_size: self.config.write_beam_size(),

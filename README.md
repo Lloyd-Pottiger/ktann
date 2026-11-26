@@ -86,9 +86,9 @@ Build share the storage contract and use the selected backend.
 Records and index entries live in the same transactional backend. Foreground
 writes update them atomically; background maintenance splits and merges partitions
 without making committed data unsearchable. Queries use one consistent snapshot
-and do not perform structure maintenance. Bulk Build prepares artifacts from an
-immutable Input Snapshot, loads and validates a hidden Logical Index, then
-atomically publishes it as Active.
+and do not perform structure maintenance. Bulk Build constructs and loads a
+hidden Logical Index directly from a segmented immutable Input Snapshot,
+validates frozen backend serving bytes, and atomically publishes it as Active.
 
 See the [architecture overview](docs/design/overview.md) for component ownership
 and the [runtime design](docs/design/runtime-operations.md) for execution and
@@ -152,10 +152,10 @@ efficiently on a single machine. These goals are not tied to particular backends
 High recall, fast construction, high query throughput, and low latency matter
 across all backends.
 
-Distributed Bulk Build is a requirement; distributed incremental writes are also
-a desired capability. The current bulk scheduler distributes whole jobs across
-workers with shared-filesystem requirements. It does not distribute the
-construction of a single index across workers.
+Distributed Bulk Build is supported both across independent jobs and
+collaboratively across multiple workers within a single job through KV-leased
+Build Units and shared coarse-shard workspace storage; distributed incremental
+writes are also a desired capability.
 
 Strict read/write separation keeps queries free of index mutations and structure
 maintenance, with the goal of scaling read capacity independently of writes.

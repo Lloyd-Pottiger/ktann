@@ -855,7 +855,8 @@ async fn bulk_reservation_reopens_blocks_serving_and_never_retargets_abort() {
         reopened.abort().await.unwrap();
         assert_drop_complete(&shared, &name("bulk")).await;
         assert_eq!(reopened.status().await.unwrap(), BulkBuildStatus::Aborted);
-        assert!(source.path().join("source/data.bin").exists());
+        assert!(source.path().join("source/manifest.bin").exists());
+        assert!(source.path().join("source/segments.bin").exists());
         let replacement = reopened_runtime
             .create_index("bulk", config())
             .await

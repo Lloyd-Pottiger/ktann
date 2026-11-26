@@ -1,33 +1,26 @@
-//! Namespace-owned preparation state and durable file-reclamation inventory.
-use super::{
-    corrupt,
-    wire::{Decoder, Encoder},
-};
-use crate::api::{BulkLoadOptions, BulkWorkerOptions, Error, ErrorKind, Result};
-use crate::bulk::{ARTIFACT_MANIFEST_BYTES, ArtifactManifest};
-use crate::storage::backend::HardLimits;
-use std::{fmt, path::PathBuf};
+//! Namespace-owned workspace ledger and terminal failure record.
 
-/// An accepted immutable artifact in an attempt-owned directory.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PreparedArtifact {
-    /// May precede the workspace epoch: takeover retains accepted attempt files.
-    pub epoch: u64,
-    pub manifest: ArtifactManifest,
-}
-/// Namespace-scoped ownership survives abort and ordinary index drop.
-/// The random token identifies exactly one child of the configured workspace.
+use std::fmt;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use crate::api::{BulkLoadOptions, BulkWorkerOptions, Error, ErrorKind, Result};
+use crate::storage::backend::HardLimits;
+
+use super::corrupt;
+use super::wire::{Decoder, Encoder};
+
+/// Namespace-scoped workspace ownership survives abort and ordinary index drop.
+/// The random token identifies one owned child directory of the configured workspace.
 #[derive(Clone, Eq, PartialEq)]
 pub struct BuildWorkspace {
     pub(crate) options: BulkWorkerOptions,
     pub(crate) hard_limits: HardLimits,
     pub(crate) token: [u8; 32],
-    /// Fences preparation acceptance, independently of the loader's epoch.
     pub(crate) epoch: u64,
-    pub(crate) forest: Option<PreparedArtifact>,
-    pub(crate) serving: Option<PreparedArtifact>,
     pub(crate) failure: Option<ErrorKind>,
 }
+
 impl BuildWorkspace {
     pub(crate) fn directory(&self) -> PathBuf {
         self.options.workspace.join(
@@ -37,31 +30,20 @@ impl BuildWorkspace {
                 .collect::<String>(),
         )
     }
-    pub(crate) fn attempt(&self, epoch: u64) -> PathBuf {
-        self.directory().join(format!("attempt-{epoch}"))
-    }
+
     pub(crate) fn validate(&self) -> Result<()> {
         self.options.validate()?;
         if self.epoch == 0
             || self.token == [0; 32]
             || self.hard_limits.max_key_bytes == 0
             || self.hard_limits.max_value_bytes == 0
-            || self
-                .forest
-                .as_ref()
-                .is_some_and(|a| a.epoch == 0 || a.epoch > self.epoch || !a.manifest.is_forest())
-            || self.serving.as_ref().is_some_and(|a| {
-                a.epoch == 0
-                    || a.epoch > self.epoch
-                    || !a.manifest.is_serving()
-                    || self.forest.is_none()
-            })
         {
             return Err(Error::invalid_argument());
         }
         Ok(())
     }
 }
+
 impl fmt::Debug for BuildWorkspace {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BuildWorkspace")
@@ -70,6 +52,7 @@ impl fmt::Debug for BuildWorkspace {
             .finish_non_exhaustive()
     }
 }
+
 pub(super) fn encode(e: &mut Encoder, w: &BuildWorkspace) -> Result<()> {
     w.validate()?;
     encode_options(e, &w.options)?;
@@ -77,13 +60,6 @@ pub(super) fn encode(e: &mut Encoder, w: &BuildWorkspace) -> Result<()> {
     e.u64(w.hard_limits.max_value_bytes as u64);
     e.bytes(&w.token);
     e.u64(w.epoch);
-    for artifact in [&w.forest, &w.serving] {
-        e.u8(u8::from(artifact.is_some()));
-        if let Some(a) = artifact {
-            e.u64(a.epoch);
-            e.sized_bytes(&a.manifest.encode(), ARTIFACT_MANIFEST_BYTES)?;
-        }
-    }
     e.u8(match w.failure {
         None => 0,
         Some(ErrorKind::Corruption) => 1,
@@ -98,6 +74,7 @@ pub(super) fn encode(e: &mut Encoder, w: &BuildWorkspace) -> Result<()> {
     });
     Ok(())
 }
+
 pub(super) fn decode(d: &mut Decoder) -> Result<BuildWorkspace> {
     let options = decode_options(d)?;
     let hard_limits = HardLimits {
@@ -106,18 +83,6 @@ pub(super) fn decode(d: &mut Decoder) -> Result<BuildWorkspace> {
     };
     let token = d.array()?;
     let epoch = d.u64()?;
-    fn artifact(d: &mut Decoder) -> Result<Option<PreparedArtifact>> {
-        match d.u8()? {
-            0 => Ok(None),
-            1 => Ok(Some(PreparedArtifact {
-                epoch: d.u64()?,
-                manifest: ArtifactManifest::decode(&d.sized_bytes(ARTIFACT_MANIFEST_BYTES)?)?,
-            })),
-            _ => Err(corrupt()),
-        }
-    }
-    let forest = artifact(d)?;
-    let serving = artifact(d)?;
     let failure = match d.u8()? {
         0 => None,
         1 => Some(ErrorKind::Corruption),
@@ -135,8 +100,6 @@ pub(super) fn decode(d: &mut Decoder) -> Result<BuildWorkspace> {
         hard_limits,
         token,
         epoch,
-        forest,
-        serving,
         failure,
     };
     value.validate().map_err(|_| corrupt())?;
@@ -152,14 +115,15 @@ pub(super) fn encode_options(e: &mut Encoder, o: &BulkWorkerOptions) -> Result<(
             .as_bytes(),
         3900,
     )?;
+    let lease_ms =
+        u64::try_from(o.unit_lease.as_millis()).map_err(|_| Error::invalid_argument())?;
     for n in [
-        o.sort_memory_bytes as u64,
-        o.sort_scratch_bytes,
-        o.serving_memory_bytes as u64,
-        o.serving_scratch_bytes,
+        o.parallelism as u64,
+        o.distributed_workers as u64,
+        lease_ms,
+        o.memory_bytes as u64,
         o.graph_memory_bytes as u64,
-        o.refinement_memory_bytes as u64,
-        o.max_artifact_bytes,
+        o.scratch_bytes,
         o.load.max_mutations as u64,
         o.load.max_bytes as u64,
     ] {
@@ -173,13 +137,12 @@ pub(super) fn decode_options(d: &mut Decoder) -> Result<BulkWorkerOptions> {
     let workspace = PathBuf::from(std::str::from_utf8(&path).map_err(|_| corrupt())?);
     let options = BulkWorkerOptions {
         workspace,
-        sort_memory_bytes: usize::try_from(d.u64()?).map_err(|_| corrupt())?,
-        sort_scratch_bytes: d.u64()?,
-        serving_memory_bytes: usize::try_from(d.u64()?).map_err(|_| corrupt())?,
-        serving_scratch_bytes: d.u64()?,
+        parallelism: usize::try_from(d.u64()?).map_err(|_| corrupt())?,
+        distributed_workers: usize::try_from(d.u64()?).map_err(|_| corrupt())?,
+        unit_lease: Duration::from_millis(d.u64()?),
+        memory_bytes: usize::try_from(d.u64()?).map_err(|_| corrupt())?,
         graph_memory_bytes: usize::try_from(d.u64()?).map_err(|_| corrupt())?,
-        refinement_memory_bytes: usize::try_from(d.u64()?).map_err(|_| corrupt())?,
-        max_artifact_bytes: d.u64()?,
+        scratch_bytes: d.u64()?,
         load: BulkLoadOptions {
             max_mutations: usize::try_from(d.u64()?).map_err(|_| corrupt())?,
             max_bytes: usize::try_from(d.u64()?).map_err(|_| corrupt())?,

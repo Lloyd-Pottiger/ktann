@@ -1,75 +1,120 @@
-//! Bounded proof cursor over immutable sealed backend data.
-use super::{
-    corrupt,
-    wire::{Decoder, Encoder},
-};
+//! Per-unit worker lease, writer-lane fence, and homomorphic multiset digest record.
+
+use std::fmt;
+
 use crate::api::{Error, Result};
-use crate::bulk::{ARTIFACT_MANIFEST_BYTES, ArtifactManifest};
-use bytes::Bytes;
-/// Persistent exact-comparison proof for a sealed serving artifact.
+use crate::bulk::LtHash;
+
+use super::corrupt;
+use super::wire::{Decoder, Encoder};
+
+/// Persistent lease and completion digest for one `BuildUnit` or writer-fence lane.
 #[derive(Clone, Eq, PartialEq)]
-pub struct BuildValidation {
-    pub(crate) artifact: ArtifactManifest,
-    /// Backend continuation key, advancing past both serving and lifecycle keys.
-    pub(crate) cursor: Bytes,
-    /// Compared serving entries only; lifecycle metadata is excluded.
-    pub(crate) entries: u64,
-    /// Artifact-stream digest through the last compared entry, used on replay.
-    pub(crate) prefix_sha256: [u8; 32],
-    /// Both streams are exhausted and their full inventory has been compared.
+pub struct BuildUnit {
+    pub(crate) epoch: u64,
+    pub(crate) owner: [u8; 32],
+    pub(crate) expires_ms: u64,
     pub(crate) complete: bool,
+    pub(crate) records: u64,
+    pub(crate) kv_count: u64,
+    pub(crate) aux_count: u64,
+    pub(crate) kv_lthash: LtHash,
+    pub(crate) aux_lthash: LtHash,
+    pub(crate) aux2_lthash: LtHash,
 }
-impl BuildValidation {
+
+impl BuildUnit {
+    pub(crate) const fn unclaimed(epoch: u64) -> Self {
+        Self {
+            epoch,
+            owner: [0; 32],
+            expires_ms: 0,
+            complete: false,
+            records: 0,
+            kv_count: 0,
+            aux_count: 0,
+            kv_lthash: LtHash::ZERO,
+            aux_lthash: LtHash::ZERO,
+            aux2_lthash: LtHash::ZERO,
+        }
+    }
+
+    pub(crate) const fn fence_lane(epoch: u64, owner: [u8; 32]) -> Self {
+        Self {
+            epoch,
+            owner,
+            expires_ms: u64::MAX,
+            complete: false,
+            records: 0,
+            kv_count: 0,
+            aux_count: 0,
+            kv_lthash: LtHash::ZERO,
+            aux_lthash: LtHash::ZERO,
+            aux2_lthash: LtHash::ZERO,
+        }
+    }
+
     pub(crate) fn validate(&self) -> Result<()> {
-        if !self.artifact.is_serving()
-            || self.cursor.len() > 16 * 1024
-            || self.entries > self.artifact.items()
-            || (self.entries == 0 && self.prefix_sha256 != self.artifact.initial_sha256())
-            || (self.complete
-                && (!self.cursor.is_empty()
-                    || self.entries != self.artifact.items()
-                    || self.prefix_sha256 != *self.artifact.sha256()))
-        {
+        if self.epoch == 0 || (self.owner != [0; 32] && !self.complete && self.expires_ms == 0) {
             return Err(Error::invalid_argument());
         }
         Ok(())
     }
 }
-pub(super) fn encode(e: &mut Encoder, v: &BuildValidation) -> Result<()> {
-    v.validate()?;
-    e.sized_bytes(&v.artifact.encode(), ARTIFACT_MANIFEST_BYTES)?;
-    e.sized_bytes(&v.cursor, 16 * 1024)?;
-    e.u64(v.entries);
-    e.bytes(&v.prefix_sha256);
-    e.u8(u8::from(v.complete));
+
+impl fmt::Debug for BuildUnit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BuildUnit")
+            .field("epoch", &self.epoch)
+            .field("claimed", &(self.owner != [0; 32]))
+            .field("complete", &self.complete)
+            .field("kv_count", &self.kv_count)
+            .finish_non_exhaustive()
+    }
+}
+
+pub(super) fn encode(e: &mut Encoder, u: &BuildUnit) -> Result<()> {
+    u.validate()?;
+    e.u64(u.epoch);
+    e.bytes(&u.owner);
+    e.u64(u.expires_ms);
+    e.u8(u8::from(u.complete));
+    e.u64(u.records);
+    e.u64(u.kv_count);
+    e.u64(u.aux_count);
+    e.bytes(&u.kv_lthash.encode());
+    e.bytes(&u.aux_lthash.encode());
+    e.bytes(&u.aux2_lthash.encode());
     Ok(())
 }
-pub(super) fn decode(d: &mut Decoder) -> Result<BuildValidation> {
-    let artifact = ArtifactManifest::decode(&d.sized_bytes(ARTIFACT_MANIFEST_BYTES)?)?;
-    let cursor = d.sized_bytes(16 * 1024)?;
-    let entries = d.u64()?;
-    let prefix_sha256 = d.array()?;
+
+pub(super) fn decode(d: &mut Decoder) -> Result<BuildUnit> {
+    let epoch = d.u64()?;
+    let owner = d.array()?;
+    let expires_ms = d.u64()?;
     let complete = match d.u8()? {
         0 => false,
         1 => true,
         _ => return Err(corrupt()),
     };
-    let v = BuildValidation {
-        artifact,
-        cursor,
-        entries,
-        prefix_sha256,
+    let records = d.u64()?;
+    let kv_count = d.u64()?;
+    let aux_count = d.u64()?;
+    let kv_lthash = LtHash::decode(&d.array()?);
+    let aux_lthash = LtHash::decode(&d.array()?);
+    let aux2_lthash = LtHash::decode(&d.array()?);
+    let u = BuildUnit {
+        epoch,
+        owner,
+        expires_ms,
         complete,
+        records,
+        kv_count,
+        aux_count,
+        kv_lthash,
+        aux_lthash,
+        aux2_lthash,
     };
-    v.validate().map_err(|_| corrupt())?;
-    Ok(v)
-}
-
-impl std::fmt::Debug for BuildValidation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BuildValidation")
-            .field("entries", &self.entries)
-            .field("complete", &self.complete)
-            .finish_non_exhaustive()
-    }
+    u.validate().map_err(|_| corrupt())?;
+    Ok(u)
 }

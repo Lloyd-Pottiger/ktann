@@ -754,17 +754,60 @@ pub(crate) async fn build_status<B: Backend>(
             {
                 return Ok(BulkBuildStatus::Failed { kind });
             }
-            if let Some(PersistentValue::BuildValidation(v)) =
-                txn.get(LogicalKey::BuildValidation(id)).await?
-            {
-                return Ok(BulkBuildStatus::Validating {
-                    verified_entries: v.entries,
-                    total_entries: v.artifact.items(),
-                });
-            }
-            match txn.get(LogicalKey::BuildLoad(id)).await? {
+            match txn.get(LogicalKey::BuildProgress(id)).await? {
                 None => BulkBuildStatus::Preparing,
-                Some(PersistentValue::BuildLoad(load)) => super::bulk_load::status(&load),
+                Some(PersistentValue::BuildProgress(p)) => match p.phase {
+                    crate::storage::values::BuildPhase::Preparing => BulkBuildStatus::Preparing,
+                    crate::storage::values::BuildPhase::Loading => BulkBuildStatus::Loading {
+                        loaded_entries: p.loaded_entries,
+                        total_entries: p.total_entries,
+                    },
+                    crate::storage::values::BuildPhase::Loaded => BulkBuildStatus::Loaded {
+                        entries: p.total_entries,
+                    },
+                    crate::storage::values::BuildPhase::Validating => {
+                        let range = crate::storage::LogicalRange::build_units(
+                            id,
+                            crate::runtime::bulk_publish::STAGE_VALIDATE,
+                        );
+                        let mut cursor = None;
+                        let mut verified_entries = 0_u64;
+                        loop {
+                            let page = txn
+                                .scan(
+                                    &range,
+                                    cursor.as_ref(),
+                                    crate::storage::backend::ScanLimits {
+                                        item_limit: 260,
+                                        byte_limit: 256 * 1024,
+                                    },
+                                )
+                                .await?;
+                            for item in page.items() {
+                                let PersistentValue::BuildUnit(u) = item.value() else {
+                                    return Err(Error::new(ErrorKind::Corruption));
+                                };
+                                if u.epoch != p.epoch {
+                                    return Err(Error::new(ErrorKind::Corruption));
+                                }
+                                if u.complete {
+                                    verified_entries = verified_entries
+                                        .checked_add(u.kv_count)
+                                        .filter(|&sum| sum <= p.total_entries)
+                                        .ok_or_else(|| Error::new(ErrorKind::Corruption))?;
+                                }
+                            }
+                            cursor = page.into_next_cursor();
+                            if cursor.is_none() {
+                                break;
+                            }
+                        }
+                        BulkBuildStatus::Validating {
+                            verified_entries,
+                            total_entries: p.total_entries,
+                        }
+                    }
+                },
                 _ => return Err(Error::new(ErrorKind::Corruption)),
             }
         }
