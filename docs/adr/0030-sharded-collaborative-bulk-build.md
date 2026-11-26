@@ -32,16 +32,18 @@ on one large build (`10M–10B` vectors).
    (`<= 4,096`) and Coarse Shards (`<= 65,536`, with a two-level super-centroid
    index and 3-nearest candidate lists when a heavy tree has `>= 32` coarse
    shards).
-3. **Support both zero-disk resident execution and bounded disk/collaborative
-   `BuildUnit` execution.** Single-worker builds whose compact routing state
-   fits in `memory_bytes` stream segment waves, construct/refine shards, and emit
-   serving KVs directly from memory with `0` workspace scratch writes. Tight
-   memory budgets and multi-worker builds (`distributed_workers > 1`) persist
-   stage-scoped `BuildUnit`s (`LogicalKey::BuildUnit { index, stage, unit }`,
-   including `Propose / Extract / Apply` refinement stages) and namespace-scoped
-   `BuildScheduleSlot` peer leases with renewable KV ownership (`unit_lease`) and
-   exchange atomic consolidated/indexed coarse-shard files in the `BuildWorkspace`
-   directory.
+3. **Execute a single sharded pipeline over a pluggable `StageStore` (`Memory`
+   vs `Disk`) and collaborative `BuildUnit`s.** One unified stage graph
+   (`Plan -> Scatter -> Dedup -> Leaves -> [Halo Refine] -> Emit`) handles both
+   resident and out-of-core execution: single-worker builds whose compact routing
+   state fits in `memory_bytes` keep intermediate buckets and shards in
+   `StageStore::Memory` (backed by a shared contiguous `f32` vector slab, writing
+   `0` workspace scratch bytes), while constrained-memory and multi-worker builds
+   (`distributed_workers > 1`) spill self-contained per-unit files (`shard-*`,
+   `centers-*`, `loc-*`, `ids-*`, `idref-*`, `prop-*`, `outb-*`) via
+   `StageStore::Disk` and coordinate `LogicalKey::BuildUnit` / `BuildScheduleSlot`
+   leases in the KV backend. Both modes emit serving KVs in ascending keyspace
+   order (`[0x01 RecordGroup] -> [0x03/0x04]`).
 4. **Bound refinement neighborhoods (`max_halo_leaves <= 32,768`) and defer
    `RaBitQ7` quantization to leaf emission.** No worker holds whole-tree leaf
    metadata above `32,768` leaves (`~100 MiB`), and scatter/refinement buffers

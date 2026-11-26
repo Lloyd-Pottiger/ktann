@@ -20,7 +20,7 @@ use super::{
     OperationContext,
     bulk_worker::{
         self, CommitStep,
-        bulk_disk::{StageEnv, StageFence, UnitOutput, drive_stage, fence_validation},
+        bulk_pipeline::{StageEnv, StageFence, UnitOutput, drive_stage, fence_validation},
         commit_raw_prepared, corrupt, effective_budget, lock_sched_read, retry_raw_write,
         retry_read, validate_split_keys_in_index,
     },
@@ -407,6 +407,9 @@ async fn validate_all_slices<B: Backend>(
         sched_lease_lock: context.bulk_lease_lock.clone(),
         distributed_workers: state.options.distributed_workers,
         persist_single_worker: true,
+        in_memory: false,
+        writer_lanes: 1,
+        commit_sem: Arc::new(tokio::sync::Semaphore::new(1)),
         admission: context.cpu_keep_alive(),
         manifest: index.clone(),
         fence: StageFence::Validate {

@@ -84,17 +84,6 @@ impl LtHash {
         }
     }
 
-    /// Returns the combined multiset digest of `self` and `other`.
-    #[must_use]
-    pub const fn wrapping_add(mut self, other: Self) -> Self {
-        let mut i = 0;
-        while i < 8 {
-            self.0[i] = self.0[i].wrapping_add(other.0[i]);
-            i += 1;
-        }
-        self
-    }
-
     /// Encodes lanes in canonical big-endian order.
     #[must_use]
     pub fn encode(&self) -> [u8; LTHASH_BYTES] {
@@ -136,18 +125,19 @@ mod tests {
 
     #[test]
     fn multiset_addition_is_order_independent_and_sensitive_to_edits() {
+        let sum = |items: &[LtHash]| {
+            let mut acc = LtHash::ZERO;
+            for &it in items {
+                acc.add_assign(it);
+            }
+            acc
+        };
         let a = LtHash::from_kv(b"k1", b"v1");
         let b = LtHash::from_kv(b"k2", b"v2");
         let c = LtHash::from_kv(b"k3", b"v3");
-        assert_eq!(
-            a.wrapping_add(b).wrapping_add(c),
-            c.wrapping_add(a).wrapping_add(b)
-        );
-        assert_ne!(
-            a.wrapping_add(b),
-            a.wrapping_add(LtHash::from_kv(b"k2", b"v2-mut"))
-        );
-        let encoded = a.wrapping_add(b).encode();
-        assert_eq!(LtHash::decode(&encoded), a.wrapping_add(b));
+        assert_eq!(sum(&[a, b, c]), sum(&[c, a, b]));
+        assert_ne!(sum(&[a, b]), sum(&[a, LtHash::from_kv(b"k2", b"v2-mut")]));
+        let ab = sum(&[a, b]);
+        assert_eq!(LtHash::decode(&ab.encode()), ab);
     }
 }

@@ -1,7 +1,6 @@
-//! Sharded Bulk Build execution: zero-disk in-memory fast path, collaborative disk BuildUnits,
-//! and namespace-owned workspace reclamation.
+//! Unified sharded Bulk Build worker claims, transaction chunking, and workspace reclamation.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::path::Path;
@@ -15,21 +14,13 @@ use crate::api::{
     BulkBuildReport, BulkLoadOptions, BulkWorkerOptions, Error, ErrorKind, LogicalIndexId,
     OperationOptions, PartitionKey, Result,
 };
-use crate::bulk::sharded::{
-    EncodedLeafShard, EncodedLocationBatch, IdFrameEntry, ShardRows, ShardState,
-    assign_leaf_partition_keys, build_and_encode_upper_tree, build_shard_leaves,
-    compute_shard_remap, encode_leaf_shard, encode_record_group_bucket, ingest_segment_into_slab,
-    parallel_chunks, quantize_shards_and_extract_locations, refine_shards_parallel,
-    refinement_per_leaf_bytes, verify_id_bucket,
-};
-use crate::bulk::{InputSnapshot, LtHash, ShardPlan};
+use crate::bulk::{LtHash, ShardPlan};
 use crate::observe::labels::Operation;
-use crate::search::numeric::VectorKernel;
 use crate::storage::backend::{AdmissionBudget, Backend, HardLimits, ScanLimits, WriteTxn};
-use crate::storage::keys::{self, LogicalKey, TreeKey};
+use crate::storage::keys::{self, LogicalKey};
 use crate::storage::values::{
     BuildDescriptor, BuildPhase, BuildProgress, BuildWorkspace, IndexLifecycle, IndexManifest,
-    MAX_SPLIT_KEYS, PartitionCentroid, PersistentValue,
+    MAX_SPLIT_KEYS, PersistentValue,
 };
 use crate::storage::{LogicalRange, ReadLogicalTxn, WriteLogicalTxn};
 
@@ -43,14 +34,12 @@ use super::{
     lifecycle::RetryPolicy,
 };
 
-#[path = "bulk_disk.rs"]
-pub(crate) mod bulk_disk;
+#[path = "bulk_pipeline.rs"]
+pub(crate) mod bulk_pipeline;
 
-const MAX_WRITER_LANES: usize = 16;
+pub(super) const MAX_WRITER_LANES: usize = 16;
 const MAX_TXN_AFFECTED_BYTES: usize = 8 * 1024 * 1024;
 const BUILD_UNIT_MUTATION_BYTES: usize = 296;
-
-type UpperTreeInput = (TreeKey, u64, Vec<(PartitionKey, PartitionCentroid)>);
 
 #[derive(Clone, Copy)]
 pub(crate) struct WriteFence {
@@ -303,6 +292,33 @@ async fn fill_report_counts_from_progress<B: Backend>(
     Ok(())
 }
 
+async fn run_with_optional_peer_slot<B, T, F>(
+    context: &mut OperationContext<B>,
+    id: LogicalIndexId,
+    peer_slot: Option<ActivePeerSlot>,
+    options: &BulkWorkerOptions,
+    retry: RetryPolicy,
+    work: F,
+) -> Result<T>
+where
+    B: Backend,
+    F: AsyncFnOnce(&mut OperationContext<B>) -> Result<T>,
+{
+    let Some((slot, owner, initial_exp, lease_lock)) = peer_slot else {
+        return work(context).await;
+    };
+    let backend = context.backend();
+    let auth = BulkAuthority::UnscheduledPeer { slot, owner };
+    let dist = options.distributed_workers;
+    let lease = options.unit_lease;
+    let outcome = tokio::select! {
+        res = work(context) => res,
+        err = run_authority_lease_renewals(backend, lease_lock, id, auth, dist, lease, initial_exp) => Err(err),
+    };
+    release_unscheduled_peer_slot(context, id, slot, owner, retry).await?;
+    outcome
+}
+
 type ActivePeerSlot = (u32, [u8; 32], u64, Arc<tokio::sync::RwLock<()>>);
 
 async fn maybe_acquire_peer_slot<B: Backend>(
@@ -380,20 +396,11 @@ pub(crate) async fn complete<B: Backend>(
             maybe_acquire_peer_slot(context, &index, &options, retry).await
         };
         let result = match peer_slot {
-            Ok(Some((slot, owner, initial_exp, lease_lock))) => {
-                let backend = context.backend();
-                let auth = BulkAuthority::UnscheduledPeer { slot, owner };
-                let dist = options.distributed_workers;
-                let lease = options.unit_lease;
-                let outcome = tokio::select! {
-                    res = complete_attempt(context, &index, &descriptor, &options, retry, &mut report) => res,
-                    err = run_authority_lease_renewals(backend, lease_lock, id, auth, dist, lease, initial_exp) => Err(err),
-                };
-                release_unscheduled_peer_slot(context, id, slot, owner, retry).await?;
-                outcome
-            }
-            Ok(None) => {
-                complete_attempt(context, &index, &descriptor, &options, retry, &mut report).await
+            Ok(slot_opt) => {
+                run_with_optional_peer_slot(context, id, slot_opt, &options, retry, async |ctx| {
+                    complete_attempt(ctx, &index, &descriptor, &options, retry, &mut report).await
+                })
+                .await
             }
             Err(error) => Err(error),
         };
@@ -446,22 +453,12 @@ pub(crate) async fn run<B: Backend>(
 ) -> Result<BulkBuildReport> {
     let options = normalize_options(context, options).await?;
     let id = index.logical_index_id();
-    if let Some((slot, owner, initial_exp, lease_lock)) =
-        maybe_acquire_peer_slot(context, &index, &options, retry).await?
-    {
-        let backend = context.backend();
-        let auth = BulkAuthority::UnscheduledPeer { slot, owner };
-        let dist = options.distributed_workers;
-        let lease = options.unit_lease;
-        let outcome = tokio::select! {
-            res = run_normalized(context, index, descriptor, options, retry) => res,
-            err = run_authority_lease_renewals(backend, lease_lock, id, auth, dist, lease, initial_exp) => Err(err),
-        };
-        release_unscheduled_peer_slot(context, id, slot, owner, retry).await?;
-        outcome
-    } else {
-        run_normalized(context, index, descriptor, options, retry).await
-    }
+    let peer_slot = maybe_acquire_peer_slot(context, &index, &options, retry).await?;
+    let options_ref = options.clone();
+    run_with_optional_peer_slot(context, id, peer_slot, &options_ref, retry, async |ctx| {
+        run_normalized(ctx, index, descriptor, options, retry).await
+    })
+    .await
 }
 
 async fn run_normalized<B: Backend>(
@@ -513,14 +510,19 @@ async fn run_normalized<B: Backend>(
         .await?;
     }
 
-    let use_in_memory = state.options.distributed_workers == 1
+    let in_memory = state.options.distributed_workers == 1
         && fits_in_memory(&index, &descriptor, &state.options);
-
-    let result = if use_in_memory {
-        run_in_memory(context, &index, &descriptor, &state, fence, lock, retry).await
-    } else {
-        bulk_disk::run_disk_units(context, &index, &descriptor, &state, fence, lock, retry).await
-    };
+    let result = bulk_pipeline::run_pipeline(
+        context,
+        &index,
+        &descriptor,
+        &state,
+        fence,
+        in_memory,
+        lock,
+        retry,
+    )
+    .await;
     if let Err(error) = &result {
         record_failure(context, &index, &state, Some(fence), error.kind(), retry).await?;
     }
@@ -846,697 +848,6 @@ pub(crate) async fn advance_loading_progress<B: Backend>(
     }
 }
 
-/// Overlaps CPU wave encoding on `spawn_blocking` with pipelined backend KV commits on the
-/// previous wave, updating best-effort `BuildProgress` after each committed wave.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "wave pipeline coordinates context, fencing, lane concurrency, budget, wave size, and encoder/accumulator closures"
-)]
-async fn pipeline_wave_commits<B, I, T, E, A>(
-    context: &mut OperationContext<B>,
-    index: &IndexManifest,
-    fence: WriteFence,
-    writer_lanes: usize,
-    budget: AdmissionBudget,
-    retry: RetryPolicy,
-    items: I,
-    wave_size: usize,
-    encode_wave: E,
-    mut accumulate: A,
-) -> Result<()>
-where
-    B: Backend,
-    I: IntoIterator,
-    I::Item: Send + 'static,
-    T: Send + 'static,
-    E: Fn(Vec<I::Item>, &OperationOptions) -> Result<T> + Clone + Send + Sync + 'static,
-    A: FnMut(T) -> Vec<(Bytes, Bytes)>,
-{
-    let cpu_adm_base = context.cpu_keep_alive();
-    let mut iter = items.into_iter();
-    let mut pending_kvs: Vec<(Bytes, Bytes)> = Vec::new();
-
-    let bump = |ctx: &OperationContext<B>, delta: u64| {
-        let backend = ctx.backend();
-        let ctrl = ctx.options.clone();
-        let sched = ctx.bulk_lease_lock.clone();
-        let auth = ctx.bulk_authority;
-        async move {
-            advance_loading_progress(
-                backend.as_ref(),
-                &ctrl,
-                sched.as_deref(),
-                auth,
-                index,
-                fence,
-                delta,
-                None,
-            )
-            .await
-        }
-    };
-
-    loop {
-        let wave: Vec<I::Item> = iter.by_ref().take(wave_size).collect();
-        if wave.is_empty() {
-            break;
-        }
-        context.checkpoint()?;
-        let (control, drop_guard) = drop_guarded_options(&context.options);
-        let adm = cpu_adm_base.clone();
-        let enc_fn = encode_wave.clone();
-        let encode_fut = async move {
-            let _drop_guard = drop_guard;
-            tokio::task::spawn_blocking(move || {
-                let _adm = adm;
-                super::check_control(&control)?;
-                enc_fn(wave, &control)
-            })
-            .await
-            .map_err(|e| Error::with_source(ErrorKind::Other, e))?
-        };
-
-        let to_commit = std::mem::take(&mut pending_kvs);
-        let committed_len = to_commit.len() as u64;
-        let commit_fut = commit_kv_batches(
-            context,
-            index,
-            fence,
-            None,
-            to_commit,
-            writer_lanes,
-            budget,
-            retry,
-        );
-        let (_, encoded) = tokio::try_join!(commit_fut, encode_fut)?;
-        bump(context, committed_len).await?;
-        pending_kvs = accumulate(encoded);
-    }
-
-    if !pending_kvs.is_empty() {
-        let committed_len = pending_kvs.len() as u64;
-        commit_kv_batches(
-            context,
-            index,
-            fence,
-            None,
-            pending_kvs,
-            writer_lanes,
-            budget,
-            retry,
-        )
-        .await?;
-        bump(context, committed_len).await?;
-    }
-    Ok(())
-}
-
-/// Zero-disk in-memory sharded execution with wave-pipelined ingestion and emission.
-async fn run_in_memory<B: Backend>(
-    context: &mut OperationContext<B>,
-    index: &IndexManifest,
-    descriptor: &BuildDescriptor,
-    state: &BuildWorkspace,
-    fence: WriteFence,
-    lock: Arc<File>,
-    retry: RetryPolicy,
-) -> Result<BulkBuildReport> {
-    let mut report = BulkBuildReport {
-        in_memory_mode: true,
-        rotation_seed: *index.rotation_seed(),
-        ..BulkBuildReport::default()
-    };
-    let parallelism = state.options.parallelism.max(1);
-    let budget = effective_budget(context.backend().admission_budget(), state.options.load)?;
-    let effective_mem = state
-        .options
-        .memory_bytes
-        .min(descriptor.options().memory_bytes);
-
-    if fence.epoch > 1 {
-        clear_stale_serving_data(context, index, fence, budget, retry).await?;
-    }
-
-    let plan_start = Instant::now();
-    let (snapshot, plan) = {
-        let desc = descriptor.clone();
-        let manifest = index.clone();
-        let guard = lock.clone();
-        context
-            .compute(move |control| {
-                let _lock = guard;
-                let check = || super::check_control(control);
-                let snap = InputSnapshot::open(
-                    desc.source(),
-                    manifest.config().clone(),
-                    desc.input().clone(),
-                )?;
-                let plan =
-                    ShardPlan::build(&snap, &manifest, desc.options(), effective_mem, &check)?;
-                Ok((snap, plan))
-            })
-            .await?
-    };
-    report.plan = plan_start.elapsed();
-
-    if let Some(rounds) = descriptor.refinement_rounds() {
-        let per_leaf = refinement_per_leaf_bytes(index.config().dimension(), rounds);
-        if effective_mem < per_leaf.saturating_mul(2) {
-            return Err(Error::new(ErrorKind::LimitExceeded));
-        }
-    }
-    if snapshot.manifest().items() == 0 {
-        seal_loaded(
-            context,
-            index,
-            fence,
-            0,
-            0,
-            0,
-            0,
-            LtHash::ZERO,
-            Vec::new(),
-            retry,
-        )
-        .await?;
-        return Ok(report);
-    }
-
-    // 2. Parallel segment ingestion directly into a single contiguous vector slab (`1.0x` exact size).
-    let ingest_start = Instant::now();
-    let num_buckets = plan.id_bucket_count() as usize;
-    let num_shards = plan.total_shards as usize;
-    let dim = index.config().dimension();
-    let total_items_usize = usize::try_from(snapshot.manifest().items())
-        .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
-    let slab_floats = total_items_usize
-        .checked_mul(dim)
-        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
-
-    let (slab, all_ids_by_bucket, mut all_rows_by_shard, total_records, input_id_lthash) = {
-        let snap_c = snapshot.clone();
-        let manifest_c = index.clone();
-        let plan_c = plan.clone();
-        let limits = state.hard_limits;
-        let guard = lock.clone();
-
-        context
-            .compute(move |control| {
-                let _lock = guard;
-                let check = || super::check_control(control);
-                let mut raw_slab = vec![0.0_f32; slab_floats];
-                let segs = snap_c.segments();
-                let seg_count = segs.len();
-                let mut all_ids: Vec<Vec<IdFrameEntry>> = vec![Vec::new(); num_buckets];
-                let mut shard_metas: Vec<Vec<crate::bulk::sharded::CompactMeta>> =
-                    vec![Vec::new(); num_shards];
-                let mut total_records = 0_u64;
-                let mut input_id_lthash = LtHash::ZERO;
-
-                let wave_size = parallelism.clamp(1, 16);
-                let mut slab_rest: &mut [f32] = raw_slab.as_mut_slice();
-                let mut base_row = 0_usize;
-
-                for wave_start in (0..seg_count).step_by(wave_size) {
-                    let wave_end = (wave_start + wave_size).min(seg_count);
-                    let mut seg_slices = Vec::with_capacity(wave_end - wave_start);
-                    for (seg_idx, seg_meta) in segs[wave_start..wave_end].iter().enumerate() {
-                        let items = usize::try_from(seg_meta.items).map_err(|_| corrupt())?;
-                        let floats = items.checked_mul(dim).ok_or_else(corrupt)?;
-                        if floats > slab_rest.len() {
-                            return Err(corrupt());
-                        }
-                        let (head, tail) = slab_rest.split_at_mut(floats);
-                        slab_rest = tail;
-                        seg_slices.push((wave_start + seg_idx, base_row, head));
-                        base_row += items;
-                    }
-
-                    let ingested = std::thread::scope(|scope| {
-                        let mut handles = Vec::with_capacity(seg_slices.len());
-                        for (seg_idx, seg_base, slice) in seg_slices {
-                            let s_ref = &snap_c;
-                            let m_ref = &manifest_c;
-                            let p_ref = &plan_c;
-                            handles.push(scope.spawn(move || {
-                                ingest_segment_into_slab(
-                                    s_ref, seg_idx, seg_base, slice, m_ref, p_ref, limits, &check,
-                                )
-                            }));
-                        }
-                        let mut out = Vec::with_capacity(handles.len());
-                        for h in handles {
-                            out.push(h.join().map_err(|_| Error::new(ErrorKind::Other))??);
-                        }
-                        Ok::<_, Error>(out)
-                    })?;
-
-                    for seg in ingested {
-                        total_records += seg.records;
-                        input_id_lthash.add_assign(seg.id_lthash);
-                        for (b, ids) in seg.ids_by_bucket.into_iter().enumerate() {
-                            all_ids[b].extend(ids);
-                        }
-                        for (s, metas) in seg.metas_by_shard.into_iter().enumerate() {
-                            shard_metas[s].extend(metas);
-                        }
-                    }
-                }
-                if !slab_rest.is_empty() {
-                    return Err(corrupt());
-                }
-
-                let slab = Arc::new(raw_slab);
-                let rows_by_shard: Vec<ShardRows> = shard_metas
-                    .into_iter()
-                    .map(|rows| {
-                        let mut sr = ShardRows::with_slab(dim, Arc::clone(&slab));
-                        sr.rows = rows;
-                        sr
-                    })
-                    .collect();
-                Ok((slab, all_ids, rows_by_shard, total_records, input_id_lthash))
-            })
-            .await?
-    };
-    let mut total_entries = 0_u64;
-    let mut expected_kv_lthash = LtHash::ZERO;
-    report.ingest = ingest_start.elapsed();
-
-    // 3. Parallel global ID dedup + shard remap + sharded leaf construction.
-    let construct_start = Instant::now();
-    let (mut shards, dedup_records, dedup_id_lthash, verified_id_refs) = {
-        let manifest_c = index.clone();
-        let plan_c = plan.clone();
-        let sample_items = descriptor.options().sample_items;
-        let slab_c = Arc::clone(&slab);
-        drop(slab);
-        context
-            .compute(move |control| {
-                let check = || super::check_control(control);
-                let (dedup_records, dedup_lt, verified_buckets) =
-                    verify_all_id_buckets_parallel(all_ids_by_bucket, parallelism)?;
-
-                let kernel = VectorKernel::new(
-                    manifest_c.config().dimension(),
-                    manifest_c.config().metric(),
-                    *manifest_c.rotation_seed(),
-                )?;
-                let counts: Vec<u64> = all_rows_by_shard
-                    .iter()
-                    .map(|s| s.rows.len() as u64)
-                    .collect();
-                let remap = compute_shard_remap(
-                    &kernel,
-                    &plan_c,
-                    &counts,
-                    u64::from(manifest_c.config().min_leaf_partition_entries()),
-                    u64::from(manifest_c.config().max_leaf_partition_entries()),
-                );
-                for src in 0..all_rows_by_shard.len() {
-                    let dst = remap[src] as usize;
-                    if dst != src && !all_rows_by_shard[src].rows.is_empty() {
-                        let mut moved = std::mem::replace(
-                            &mut all_rows_by_shard[src],
-                            ShardRows::with_slab(
-                                manifest_c.config().dimension(),
-                                Arc::clone(&slab_c),
-                            ),
-                        );
-                        all_rows_by_shard[dst].rows.append(&mut moved.rows);
-                    }
-                }
-                drop(slab_c);
-
-                let batches = parallel_chunks(&all_rows_by_shard, parallelism, |_, chunk| {
-                    let mut out = Vec::with_capacity(chunk.len());
-                    for rows in chunk {
-                        if rows.rows.is_empty() {
-                            out.push(ShardState {
-                                rows: rows.clone(),
-                                leaves: Vec::new(),
-                            });
-                        } else {
-                            out.push(build_shard_leaves(
-                                &manifest_c,
-                                sample_items,
-                                rows.clone(),
-                                &check,
-                            )?);
-                        }
-                    }
-                    Ok(out)
-                })?;
-                let shards: Vec<ShardState> = batches.into_iter().flatten().collect();
-                Ok((shards, dedup_records, dedup_lt, verified_buckets))
-            })
-            .await?
-    };
-    if dedup_records != total_records || dedup_id_lthash != input_id_lthash {
-        return Err(corrupt());
-    }
-    report.construct = construct_start.elapsed();
-
-    // 4. Optional parallel halo refinement (including `Some(0)` centroid refresh & admission).
-    if let Some(rounds) = descriptor.refinement_rounds() {
-        let refine_start = Instant::now();
-        let manifest_c = index.clone();
-        let plan_c = plan.clone();
-        shards = context
-            .compute(move |control| {
-                let check = || super::check_control(control);
-                refine_shards_parallel(
-                    &manifest_c,
-                    &plan_c,
-                    &mut shards,
-                    rounds,
-                    effective_mem,
-                    parallelism,
-                    &check,
-                )?;
-                Ok(shards)
-            })
-            .await?;
-        report.refine = refine_start.elapsed();
-    }
-
-    // 5. Global ascending key-order emission.
-    let emit_start = Instant::now();
-    let writer_lanes = if context.backend().capabilities().transactional_clear_range {
-        parallelism.clamp(1, 8)
-    } else {
-        1
-    };
-    let (assigned, tree_totals) =
-        assign_leaf_partition_keys(&shards, |s| s.leaves.iter().map(|l| &l.tree_key))?;
-    let leaf_partitions: u64 = tree_totals.values().map(|(_, c)| *c).sum();
-
-    let mut child_by_tree: BTreeMap<Bytes, Vec<(PartitionKey, PartitionCentroid)>> =
-        BTreeMap::new();
-    for (shard, keys) in shards.iter().zip(&assigned) {
-        for (leaf, ak) in shard.leaves.iter().zip(keys) {
-            if !ak.is_single_leaf_root {
-                child_by_tree
-                    .entry(Bytes::copy_from_slice(leaf.tree_key.as_bytes()))
-                    .or_default()
-                    .push((ak.partition_key, leaf.centroid.clone()));
-            }
-        }
-    }
-
-    let (shards, assigned, locations_by_bucket) = {
-        let manifest_c = index.clone();
-        let plan_c = plan.clone();
-        context
-            .compute(move |control| {
-                let check = || super::check_control(control);
-                let locs = quantize_shards_and_extract_locations(
-                    &manifest_c,
-                    &plan_c,
-                    &mut shards,
-                    &assigned,
-                    parallelism,
-                    &check,
-                )?;
-                Ok((shards, assigned, locs))
-            })
-            .await?
-    };
-
-    // 5A. Emit `[0x01 Record + Payload + Location]` FIRST in strict ascending `id_bucket` order.
-    let mut loc_records = 0_u64;
-    let mut loc_mem_lt = LtHash::ZERO;
-    let limits = state.hard_limits;
-    {
-        let manifest_c = index.clone();
-        let snap_c = snapshot.clone();
-        let guard = lock.clone();
-        pipeline_wave_commits(
-            context,
-            index,
-            fence,
-            writer_lanes,
-            budget,
-            retry,
-            verified_id_refs.into_iter().zip(locations_by_bucket),
-            parallelism.clamp(1, 4),
-            move |wave, ctrl| {
-                let _lock = guard.as_ref();
-                let check = || super::check_control(ctrl);
-                std::thread::scope(|scope| {
-                    let mut handles = Vec::with_capacity(wave.len());
-                    for (id_refs, locs) in wave {
-                        let m_ref = &manifest_c;
-                        let s_ref = &snap_c;
-                        let rec_count = locs.len() as u64;
-                        handles.push(scope.spawn(
-                            move || -> Result<(u64, EncodedLocationBatch)> {
-                                let mut seg_reader = s_ref.frame_reader();
-                                let batch = encode_record_group_bucket(
-                                    m_ref,
-                                    &mut seg_reader,
-                                    id_refs,
-                                    locs,
-                                    limits,
-                                    &check,
-                                )?;
-                                Ok((rec_count, batch))
-                            },
-                        ));
-                    }
-                    let mut out = Vec::with_capacity(handles.len());
-                    for h in handles {
-                        out.push(h.join().map_err(|_| Error::new(ErrorKind::Other))??);
-                    }
-                    Ok(out)
-                })
-            },
-            |encoded_buckets| {
-                let mut wave_kvs = Vec::new();
-                for (cnt, (bkvs, bkv_lt, bm_lt)) in encoded_buckets {
-                    loc_records += cnt;
-                    total_entries += bkvs.len() as u64;
-                    expected_kv_lthash.add_assign(bkv_lt);
-                    loc_mem_lt.add_assign(bm_lt);
-                    wave_kvs.extend(bkvs);
-                }
-                wave_kvs
-            },
-        )
-        .await?;
-    }
-
-    // 5B. Emit `[0x03 TreeManifest]` + `[0x04 Partitions]` SECOND in strict ascending key order.
-    let (upper_kvs, upper_kv_lt, upper_def_lt, upper_ref_lt, internal_parts) = {
-        let manifest_c = index.clone();
-        let sample_items = descriptor.options().sample_items;
-        let graph_mem = state.options.graph_memory_bytes;
-        let tree_list: Vec<UpperTreeInput> = tree_totals
-            .iter()
-            .map(|(raw, (tk, total))| {
-                let children = child_by_tree.remove(raw).unwrap_or_default();
-                (tk.clone(), *total, children)
-            })
-            .collect();
-
-        context
-            .compute(move |control| {
-                let check = || super::check_control(control);
-                let mut upper_kvs = Vec::new();
-                let mut upper_kv_lt = LtHash::ZERO;
-                let mut upper_def_lt = LtHash::ZERO;
-                let mut upper_ref_lt = LtHash::ZERO;
-                let mut internal_parts = 0_u64;
-                for (tk, total_leaves, children) in tree_list {
-                    let enc = build_and_encode_upper_tree(
-                        &manifest_c,
-                        &tk,
-                        total_leaves,
-                        children,
-                        sample_items,
-                        graph_mem,
-                        limits,
-                        parallelism,
-                        &check,
-                    )?;
-                    internal_parts += enc.partitions;
-                    upper_kv_lt.add_assign(enc.kv_lthash);
-                    upper_def_lt.add_assign(enc.edge_def_lthash);
-                    upper_ref_lt.add_assign(enc.edge_ref_lthash);
-                    upper_kvs.extend(enc.kvs);
-                }
-                upper_kvs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-                Ok((
-                    upper_kvs,
-                    upper_kv_lt,
-                    upper_def_lt,
-                    upper_ref_lt,
-                    internal_parts,
-                ))
-            })
-            .await?
-    };
-
-    total_entries += upper_kvs.len() as u64;
-    expected_kv_lthash.add_assign(upper_kv_lt);
-
-    let upper_split_key = if tree_totals.len() == 1 {
-        let (_, (single_tk, single_leaves)) = tree_totals.iter().next().expect("single tree");
-        if *single_leaves >= 2 {
-            Bytes::from(keys::header_key(
-                index.logical_index_id(),
-                single_tk,
-                PartitionKey::new(2)?,
-            ))
-        } else {
-            Bytes::from(
-                keys::tree_manifest_range(index.logical_index_id())
-                    .end()
-                    .to_vec(),
-            )
-        }
-    } else {
-        Bytes::from(
-            keys::tree_manifest_range(index.logical_index_id())
-                .end()
-                .to_vec(),
-        )
-    };
-    let split_pos = upper_kvs.partition_point(|(k, _)| k < &upper_split_key);
-    let mut post_leaf_upper_kvs = upper_kvs;
-    let pre_leaf_upper_kvs: Vec<_> = post_leaf_upper_kvs.drain(..split_pos).collect();
-    let pre_upper_len = pre_leaf_upper_kvs.len() as u64;
-
-    commit_kv_batches(
-        context,
-        index,
-        fence,
-        None,
-        pre_leaf_upper_kvs,
-        writer_lanes,
-        budget,
-        retry,
-    )
-    .await?;
-    advance_loading_progress(
-        context.backend().as_ref(),
-        &context.options,
-        context.bulk_lease_lock.as_deref(),
-        context.bulk_authority,
-        index,
-        fence,
-        pre_upper_len,
-        None,
-    )
-    .await?;
-
-    let mut leaf_membership_lt = LtHash::ZERO;
-    let mut edge_def_lt = LtHash::ZERO;
-    {
-        let manifest_c = index.clone();
-        let plan_c = plan.clone();
-        pipeline_wave_commits(
-            context,
-            index,
-            fence,
-            writer_lanes,
-            budget,
-            retry,
-            shards.into_iter().zip(assigned),
-            parallelism.clamp(1, 8),
-            move |wave, ctrl| {
-                let check = || super::check_control(ctrl);
-                std::thread::scope(|scope| {
-                    let mut handles = Vec::with_capacity(wave.len());
-                    for (shard, keys) in wave {
-                        let m_ref = &manifest_c;
-                        let p_ref = &plan_c;
-                        handles.push(scope.spawn(move || -> Result<Option<EncodedLeafShard>> {
-                            if shard.leaves.is_empty() {
-                                return Ok(None);
-                            }
-                            let enc = encode_leaf_shard(
-                                m_ref, p_ref, &shard, &keys, limits, false, &check,
-                            )?;
-                            drop(shard);
-                            Ok(Some(enc))
-                        }));
-                    }
-                    let mut out = Vec::with_capacity(handles.len());
-                    for h in handles {
-                        if let Some(enc) = h.join().map_err(|_| Error::new(ErrorKind::Other))?? {
-                            out.push(enc);
-                        }
-                    }
-                    Ok(out)
-                })
-            },
-            |encoded_wave| {
-                let mut wave_kvs = Vec::new();
-                for enc in encoded_wave {
-                    total_entries += enc.kvs.len() as u64;
-                    expected_kv_lthash.add_assign(enc.kv_lthash);
-                    leaf_membership_lt.add_assign(enc.membership_lthash);
-                    edge_def_lt.add_assign(enc.edge_def_lthash);
-                    wave_kvs.extend(enc.kvs);
-                }
-                wave_kvs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-                wave_kvs
-            },
-        )
-        .await?;
-    }
-
-    let post_upper_len = post_leaf_upper_kvs.len() as u64;
-    commit_kv_batches(
-        context,
-        index,
-        fence,
-        None,
-        post_leaf_upper_kvs,
-        writer_lanes,
-        budget,
-        retry,
-    )
-    .await?;
-    advance_loading_progress(
-        context.backend().as_ref(),
-        &context.options,
-        context.bulk_lease_lock.as_deref(),
-        context.bulk_authority,
-        index,
-        fence,
-        post_upper_len,
-        None,
-    )
-    .await?;
-
-    if loc_records != total_records
-        || leaf_membership_lt != loc_mem_lt
-        || edge_def_lt.wrapping_add(upper_def_lt) != upper_ref_lt
-    {
-        return Err(corrupt());
-    }
-    report.emit = emit_start.elapsed();
-
-    finalize_and_seal_loaded(
-        context,
-        index,
-        fence,
-        &plan,
-        state.hard_limits,
-        total_records,
-        tree_totals.len() as u64,
-        leaf_partitions + internal_parts,
-        total_entries,
-        expected_kv_lthash,
-        retry,
-        &mut report,
-    )
-    .await?;
-    Ok(report)
-}
-
 #[expect(
     clippy::too_many_arguments,
     reason = "shared loaded-sealing tail computes split keys, commits BuildProgress, and populates report counts"
@@ -1575,35 +886,6 @@ pub(crate) async fn finalize_and_seal_loaded<B: Backend>(
     report.partitions = total_partitions;
     report.entries = total_entries;
     Ok(())
-}
-
-type VerifiedBucketsResult = (u64, LtHash, Vec<Vec<IdFrameEntry>>);
-
-fn verify_all_id_buckets_parallel(
-    buckets: Vec<Vec<IdFrameEntry>>,
-    parallelism: usize,
-) -> Result<VerifiedBucketsResult> {
-    let results = parallel_chunks(&buckets, parallelism, |_, chunk| {
-        let mut total = 0_u64;
-        let mut lt = LtHash::ZERO;
-        let mut out_buckets = Vec::with_capacity(chunk.len());
-        for ids in chunk {
-            let (c, h, sorted) = verify_id_bucket(ids.clone())?;
-            total += c;
-            lt.add_assign(h);
-            out_buckets.push(sorted);
-        }
-        Ok((total, lt, out_buckets))
-    })?;
-    let mut total = 0_u64;
-    let mut lt = LtHash::ZERO;
-    let mut all_buckets = Vec::with_capacity(buckets.len());
-    for (c, part, b_list) in results {
-        total += c;
-        lt.add_assign(part);
-        all_buckets.extend(b_list);
-    }
-    Ok((total, lt, all_buckets))
 }
 
 /// Builds up to `MAX_SPLIT_KEYS` (`255`) balanced validation split keys strictly inside
@@ -1919,85 +1201,6 @@ fn split_delete_keys(
         batches.push(cur);
     }
     Ok(batches)
-}
-
-/// Splits pre-encoded `(key, value)` pairs into budget-admitted chunks and commits them
-/// across up to `min(parallelism, MAX_WRITER_LANES)` concurrent writer tasks.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "writer fencing, optional unit lease check, and retry/budget parameters are orthogonal"
-)]
-pub(crate) async fn commit_kv_batches<B: Backend>(
-    context: &OperationContext<B>,
-    index: &IndexManifest,
-    fence: WriteFence,
-    unit_fence: Option<&UnitLease>,
-    kvs: Vec<(Bytes, Bytes)>,
-    parallelism: usize,
-    budget: AdmissionBudget,
-    retry: RetryPolicy,
-) -> Result<()> {
-    if kvs.is_empty() {
-        return Ok(());
-    }
-    let chunks = split_into_chunks(&kvs, budget, unit_fence.is_some())?;
-    let concurrency = parallelism.clamp(1, MAX_WRITER_LANES).min(chunks.len());
-
-    if concurrency <= 1 || unit_fence.is_some() {
-        for chunk in chunks {
-            commit_one_chunk(
-                context.backend(),
-                &context.options,
-                context.bulk_authority,
-                context.bulk_lease_lock.as_deref(),
-                index,
-                fence,
-                unit_fence,
-                chunk,
-                budget,
-                retry,
-            )
-            .await?;
-        }
-        return Ok(());
-    }
-
-    let queue = Arc::new(std::sync::Mutex::new(chunks.into_iter()));
-    let mut workers = tokio::task::JoinSet::<Result<()>>::new();
-    for _ in 0..concurrency {
-        let q = Arc::clone(&queue);
-        let backend = context.backend();
-        let control = context.options.clone();
-        let bulk_auth = context.bulk_authority;
-        let sched_lock = context.bulk_lease_lock.clone();
-        let manifest = index.clone();
-        workers.spawn(async move {
-            loop {
-                super::check_control(&control)?;
-                let next_chunk = q.lock().unwrap_or_else(|e| e.into_inner()).next();
-                let Some(chunk) = next_chunk else {
-                    return Ok(());
-                };
-                commit_one_chunk(
-                    Arc::clone(&backend),
-                    &control,
-                    bulk_auth,
-                    sched_lock.as_deref(),
-                    &manifest,
-                    fence,
-                    None,
-                    chunk,
-                    budget,
-                    retry,
-                )
-                .await?;
-            }
-        });
-    }
-    while let Some(res) = workers.join_next().await {
-        res.map_err(|e| Error::with_source(ErrorKind::Other, e))??;
-    }
-    Ok(())
 }
 
 pub(super) fn split_into_chunks(

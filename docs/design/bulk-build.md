@@ -91,82 +91,63 @@ In disk/collaborative mode, the first worker persists `plan-e{epoch}.bin`
 atomically under `ScratchQuota` in the token-owned workspace so all workers share
 bit-identical bucket and shard boundaries.
 
-### 3.2 Execution Modes: Resident Fast Path vs. Collaborative `BuildUnit`s
+### 3.2 Unified Pipeline over `StageStore` (`Memory` vs. `Disk`)
 
-When `distributed_workers == 1` and the estimated compact routing and workspace
-peak (`records * (4 * dim + 140)` bytes plus shard/halo working sets) fits inside
-`memory_bytes`, the worker uses the **zero-disk resident fast path**:
+One unified stage pipeline (`src/runtime/bulk_pipeline.rs`) executes across both
+ample-memory single-worker builds (`StageStore::Memory`, `in_memory_mode = true`,
+`0 B` workspace scratch writes) and constrained-memory or multi-worker builds
+(`StageStore::Disk`, `in_memory_mode = false`):
 
-1. **Wave-pipelined segment ingestion**: CPU threads decode segments once,
-   preprocess rotated vectors once into a shared contiguous `f32` slab, scatter
-   compact rows (`id`, `tree_key`, typed `fields`, `slab_idx`) into Coarse
-   Shards, and record `(id, SourceFrameRef)` offsets into Record-ID buckets.
-   Workspace disk writes are `0` bytes.
-2. **Global ID uniqueness**: Each Record-ID bucket sorts by canonical escaped ID
-   and checks strict uniqueness in parallel (`RecordAlreadyExists` on any
-   duplicate across segments or Tree Keys).
-3. **Underfull shard remap & parallel leaf construction**: Any heavy-tree shard
-   with `0 < rows < min_leaf` merges deterministically into its nearest sibling
-   coarse center before recursive multi-center leaf construction (`build_shard_leaves`).
-4. **Halo-bounded parallel refinement**: `Some(0)` refreshes exact `f64` leaf
-   centroids without moves. For `1..=5` rounds, light-tree shards refine each
-   contained tree locally in parallel under `memory_bytes`, while heavy trees run
-   candidate discovery (`leaf_neighbors`), move scoring (`best_move`), global
-   positive-gain capacity arbitration (`accept_moves`), in-place `ShardRows`
-   compaction, and parallel exact `f64` centroid recomputation. When a tree
-   exceeds `max_halo_leaves = min(32,768, memory_bytes / per_leaf_overhead)`,
-   each Coarse Shard loads and scores its nearest sibling shards' leaf centroids
-   up to `max_halo_leaves` in canonical ascending shard order, bounding
-   per-worker centroid/HNSW state to at most `~100 MiB` regardless of total tree
-   size.
-5. **Global ascending key-order serving emission**:
+1. **`STAGE_SCATTER (1)`**: Reads immutable `InputSnapshot` segments, validates
+   adapter key/value limits, projects `TreeKey`, routes rotated `f32` vectors to
+   Coarse Shards, and partitions `(id, SourceFrameRef)` offsets into Record-ID
+   buckets. `StageStore::Memory` ingests waves directly into a single contiguous
+   `f32` vector slab; `StageStore::Disk` writes checksummed indexed `ids-*`,
+   `vec-*`, and `cnt-*` run files.
+2. **`STAGE_DEDUP (2)`**: Each Record-ID bucket sorts by canonical escaped ID,
+   rejects any duplicate across segments or Tree Keys with `RecordAlreadyExists`,
+   persists `idref-*` (in `Disk` mode), and reclaims scatter ID runs.
+3. **`STAGE_LEAVES (3)`**: Underfull heavy-tree shards (`0 < rows < min_leaf`)
+   remap deterministically into their nearest sibling center (`compute_shard_remap`),
+   each Coarse Shard builds recursive multi-center leaves (`build_shard_leaves`)
+   and refines light-tree shards locally (`refine_single_light_shard`), writes
+   self-contained `shard-e{epoch}-r0-*`, `centers-e{epoch}-r0-*`, and bucketed
+   `(id, local_leaf)` indices (`loc-e{epoch}-r0-*`) in `Disk` mode, and reclaims
+   scatter vector runs.
+4. **Optional Halo Refinement (`Propose = 10+3r`, `Extract = 11+3r`, `Apply = 12+3r`)**:
+   `Some(0)` validates leaf-metadata memory admission without moves. For `1..=5`
+   rounds on heavy trees, single-worker runs precompute whole-tree HNSW neighbors
+   once when the tree fits within `max_halo_leaves = min(32,768, memory_bytes / per_leaf)`
+   and otherwise score each shard's bounded halo neighborhood (`score_halo_shard`)
+   in canonical ascending shard order; `arbitrate_tree_proposals` selects
+   positive-gain capacity-safe moves, cross-shard donors extract moved rows
+   (`outb-*` on disk, zero-copy slab references in memory), and
+   `apply_moves_to_shard` compacts rows and recomputes dirty `f64` centroids.
+5. **Serving KV Emission (`STAGE_EMIT_RECORDS = 30` -> `STAGE_EMIT_TREES = 31` -> `STAGE_EMIT_LEAVES = 32`)**:
    - Deterministic `PartitionKey`s are assigned per tree (`1` for a single-leaf
      root; otherwise `2 ..= 1 + total_leaves` for leaves and `1` for the upper
-     root).
-   - `quantize_shards_and_extract_locations` batch-quantizes `RaBitQ7` **once**
-     per vector into a single contiguous slab, immediately drops (`munmap`) the
-     `f32` vector slab before backend writes begin, and extracts bucketed
-     `(id, tree_key, leaf_pk)` tuples.
-   - **RecordGroup keyspace (`[0x01]`) first**: `encode_record_group_bucket`
-     reads verified `InputSnapshot` frames in forward per-segment offset order via
-     an `O(1)`-FD segment reader, verifies exact `(id, tree_key)` binding against
-     the leaf assignment, zero-copy slices the canonical `VectorRecord` wire body,
-     and emits `VectorRecord` + `OpaquePayload` + `RecordLocation` together in
-     strict ascending `[index, 0x01, escaped_id, subkind]` order per ID bucket.
-   - **TreeManifest & Partition keyspace (`[0x03..0x04]`) second**:
-     `build_and_encode_upper_tree` groups leaf centroids bottom-up into internal
-     levels (`level >= 2`), invokes `build_internal_graph` directly on the
-     in-memory `&[ChildEntry]` slice without intermediate serialization, and
-     emits `TreeManifest`, internal partition KVs, `GraphDescriptor`, and
-     `GraphChunk`s around `encode_leaf_shard`, which expands
-     `PartitionSynopsis` inline and emits canonical `Header`, `Synopsis`,
-     `State`, `Centroid`, and `LeafEntry` KV bytes in ascending
-     `(tree_key, leaf_pk)` order so local LSM backends flush non-overlapping
-     SSTables with minimal compaction.
+     root, persisted to `leafkeys-e{epoch}.bin` in `Disk` mode). In `Memory` mode,
+     `prepare_in_memory_for_emit` extracts bucketed `RecordLocation`s, batch-quantizes
+     `RaBitQ7` into one `Bytes` slab, and drops the `f32` vector slab before backend emission.
+   - `STAGE_EMIT_RECORDS` emits `[index, 0x01, escaped_id]` (`VectorRecord`,
+     `RecordLocation`, and `OpaquePayload`) first in strict ascending ID-bucket
+     and Record-ID order, reading verified `InputSnapshot` frames in forward
+     per-segment offset order via `SegmentFileReader` and immediately reclaiming
+     `idref-*` and `loc-*`.
+   - `STAGE_EMIT_TREES` reads non-root leaf centroids directly from `StageStore`
+     (`centers-*` on disk, opening only shards with multi-leaf trees in the target
+     bucket), groups internal levels bottom-up, builds partition-local HNSW graphs
+     directly from `&[ChildEntry]`, and emits `[0x03]` `TreeManifest` + `[0x04]`
+     internal partition KVs.
+   - `STAGE_EMIT_LEAVES` expands `PartitionSynopsis` inline, emits `[0x04]` leaf
+     `Header`, `Synopsis`, `State`, `Centroid`, and `LeafEntry` KVs in ascending
+     `(tree_key, leaf_pk)` order, and reclaims final shard state immediately.
 
-When `distributed_workers > 1` or the dataset exceeds `memory_bytes`, execution
-uses **stage-fenced `BuildUnit`s** (`src/runtime/bulk_disk.rs`):
-
-- Stages execute in order: `STAGE_SCATTER (1)` -> `STAGE_DEDUP (2)` ->
-  `STAGE_LEAVES (3)` -> optional `Propose(10+3r)` / `Extract(11+3r)` /
-  `Apply(12+3r)` halo refinement (`0 <= r < rounds`) -> `STAGE_EMIT_LEAVES (30)`
-  -> `STAGE_EMIT_TREES (32)` -> `STAGE_EMIT_RECORDS (31)` (emitting
-  `VectorRecord` + `OpaquePayload` + `RecordLocation` per ID bucket).
-- Every unit is persisted at `LogicalKey::BuildUnit { index, stage, unit }` with
-  `owner: [u8; 32]` and `expires_ms`. Workers claim unclaimed or lease-expired
-  units in randomized order (ascending order when `distributed_workers == 1` for
-  sequential LSM writes), renew leases every `unit_lease / 3` after verifying
-  `BuildWorkspace` writer fencing, fence KV chunk commits against `(epoch, writer_token, unit_owner)`,
-  and write tracked intermediate files (`ids-*`, `vec-*`, `cnt-*`, `base-*`,
-  `mem-*`, `centers-*`, `prop-*`, `outb-*`, `inb-*`, `leafkeys-*`, `loc-*`, `uchild-*`) via
-  unique-temp-file + `sync_all` + atomic `rename` + parent directory sync.
-  `STAGE_LEAVES` consolidates per-segment scatter chunks into one immutable
-  `base-e{epoch}-{shard:06}.bin` file per shard and immediately reclaims
-  `vec-*`/`cnt-*`; refinement rounds persist compact 4-byte member indices
-  (`mem-*`) and moved delta vectors (`outb-*` / `inb-*`), `leafkeys-e{epoch}.bin`
-  persists deterministic leaf key assignments before emission, `uchild-*` embeds a
-  64-entry `tree_bucket` offset index so `STAGE_EMIT_TREES` seeks only its target
-  bucket slice, and `RaBitQ7` is computed once during `STAGE_EMIT_LEAVES`.
+When `distributed_workers > 1`, each stage persists `LogicalKey::BuildUnit { index, stage, unit }`
+with renewable `unit_lease` ownership (`unit_lease / 3` heartbeats) so peer
+processes claim disjoint units concurrently and take over expired units cleanly;
+when `distributed_workers == 1`, construction and emission stages run in-process
+with zero intermediate `BuildUnit` KV writes.
 
 ### 3.3 Transaction Sizing and Pipelined Writer Fencing
 
@@ -255,10 +236,10 @@ filter field, cosine metric, local HNSW enabled):
 | **Input Snapshot** | `610,352` segments (`16,384` rows, `~49 MiB` each); `segments.bin` = `29.3 MiB` | `~30.1 TiB` immutable segments; `O(1)`-FD segment reads |
 | **`ShardPlan` memory & I/O** | Uniform strided full-segment sample capped at `32,768` rows; `65,536` Coarse Shards (`~152,588` rows/shard) with `256` super-centers (`3` candidate lists, `~512` distance evals/vector) + `4,096` ID buckets | `~105 MiB` sample RAM; `plan.bin` = `201 MiB` (read once per worker) |
 | **Per-worker RAM (`W` workers, `P` threads/worker)** | Scatter/Leaf/Emit hold at most `P` Coarse Shards (`152,588 * ~3,200 B ≈ 488 MiB`/shard); Halo refinement caps at `max_halo_leaves = 32,768` (`~26` shards, `~105 MiB` centroids + HNSW) + `1` active shard (`~488 MiB`) | `2–4 GiB` RAM per worker (`O(1)` in dataset size $N$) |
-| **Intermediate coarse-shard storage** | Scatter (`vec-*` + `ids-*`): `~31.4 TiB`, consolidated into `65,536` `base-*` files during `STAGE_LEAVES` (`vec-*`/`cnt-*` immediately deleted); per-round compact indices + moved deltas (`mem-*` + `outb-*`/`inb-*`): `~1–3 TiB`; Location + indexed Upper summaries (`loc-*` + `uchild-*`): `~0.6 TiB` | Peak simultaneous scratch `~33–36 TiB` on shared object/file store (`~1.1x–1.2x` raw vectors) |
+| **Intermediate coarse-shard storage** | Scatter (`vec-*` + `ids-*`): `~31.4 TiB`, consolidated into `65,536` self-contained `shard-*`, `centers-*`, and compact `(id, local_leaf)` `loc-*` files during `STAGE_LEAVES` (`vec-*`/`cnt-*` immediately deleted); per-round moved outbound deltas (`outb-*`): `~1–3 TiB` | Peak simultaneous scratch `~33–36 TiB` on shared object/file store (`~1.1x–1.2x` raw vectors) |
 | **Inter-worker coordination & KV metadata** | Workers share zero direct RPCs; coordination uses KV `BuildUnit` claims (`610k` scatter + `4k` dedup + `65.5k` leaf + `65.5k * 3R` refine + `70k` emit + `256` validate $\approx 1.14 \times 10^6$ units for `R = 2`, `< 320 MiB` transient KV metadata reclaimed on cleanup) | `< 350` lease/claim txns/sec across `64` workers (`30 s` lease) |
 | **Serving KV write transactions** | `~2.08 \times 10^{10}` serving KV records (`~64 TiB` logical bytes) batched at `4 MiB` / `5,000` mutations across 16 pipelined writer lanes | `~1.6 \times 10^7` write txns total (`~250k` txns/worker across `64` workers), zero whole-index serial bottleneck |
-| **Upper-tree & HNSW construction** | `~1.0 \times 10^8` leaf centroids (`~307 GiB` across trees, indexed into `64` `tree_buckets` inside `uchild-*`); for a single `10B` tree (`level 2`: `~15.6k` internal nodes of `~6,400` children; `level 3`: `1` root of `~15.6k` children), each internal node's local HNSW builds independently in `< 64 MiB` | Parallelized across `tree_buckets` and worker threads without global graph residency |
+| **Upper-tree & HNSW construction** | `~1.0 \times 10^8` leaf centroids (`~307 GiB` across trees in `centers-*`, partitioned across `64` `tree_buckets`); for a single `10B` tree (`level 2`: `~15.6k` internal nodes of `~6,400` children; `level 3`: `1` root of `~15.6k` children), each internal node's local HNSW builds independently in `< 64 MiB` | Parallelized across `tree_buckets` and worker threads without global graph residency |
 
 ## 8. Verification
 

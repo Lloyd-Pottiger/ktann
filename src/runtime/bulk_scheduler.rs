@@ -461,6 +461,40 @@ pub(crate) async fn release_unscheduled_peer_slot<B: Backend>(
     }
 }
 
+/// Scans `0..slots` in a write transaction, returning `(active_peer_count, expired_peer_keys)`.
+async fn inspect_peer_slots<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    id: LogicalIndexId,
+    slots: u32,
+    self_slot: Option<(u32, [u8; 32])>,
+    now: u64,
+) -> Result<(usize, Vec<LogicalKey>)> {
+    let keys: Vec<LogicalKey> = (0..slots)
+        .map(|slot| LogicalKey::BuildScheduleSlot { index: id, slot })
+        .collect();
+    txn.warm_for_update(keys).await?;
+    let mut active = 0_usize;
+    let mut expired = Vec::new();
+    for slot in 0..slots {
+        let skey = LogicalKey::BuildScheduleSlot { index: id, slot };
+        let Some(val) = txn.get_for_update(skey.clone()).await? else {
+            continue;
+        };
+        let PersistentValue::BuildUnit(u) = val else {
+            return Err(bulk_worker::corrupt());
+        };
+        if self_slot == Some((slot, u.owner)) {
+            continue;
+        }
+        if u.owner != [0; 32] && u.expires_ms > now {
+            active += 1;
+        } else {
+            expired.push(skey);
+        }
+    }
+    Ok((active, expired))
+}
+
 /// Verifies no other scheduler or peer worker holds an unexpired lease on `id`, deleting
 /// expired peer slot records inline within the caller's mutation budget.
 pub(crate) async fn ensure_no_peer_scheduler_leases<B: Backend, T: WriteTxn>(
@@ -485,36 +519,16 @@ pub(crate) async fn ensure_no_peer_scheduler_leases<B: Backend, T: WriteTxn>(
     }
     let slots = distributed_workers.max(1) as u32;
     if slots > 1 {
-        let keys: Vec<LogicalKey> = (0..slots)
-            .map(|slot| LogicalKey::BuildScheduleSlot { index: id, slot })
-            .collect();
-        txn.warm_for_update(keys).await?;
-        let max_inline_del = txn.admission_budget().max_mutations.saturating_sub(2);
-        let mut expired_to_del = Vec::new();
-        for slot in 0..slots {
-            let skey = LogicalKey::BuildScheduleSlot { index: id, slot };
-            if let Some(val) = txn.get_for_update(skey.clone()).await? {
-                let PersistentValue::BuildUnit(u) = val else {
-                    return Err(bulk_worker::corrupt());
-                };
-                let is_self = matches!(
-                    context.bulk_authority,
-                    Some(
-                        BulkAuthority::Scheduled { slot: s, owner }
-                            | BulkAuthority::UnscheduledPeer { slot: s, owner }
-                    ) if s == slot && owner == u.owner
-                );
-                if !is_self {
-                    if u.owner != [0; 32] && u.expires_ms > now {
-                        return Err(Error::new(ErrorKind::BulkBuildBusy));
-                    }
-                    if expired_to_del.len() < max_inline_del {
-                        expired_to_del.push(skey);
-                    }
-                }
-            }
+        let self_slot = context.bulk_authority.map(|a| match a {
+            BulkAuthority::Scheduled { slot, owner }
+            | BulkAuthority::UnscheduledPeer { slot, owner } => (slot, owner),
+        });
+        let (active, expired) = inspect_peer_slots(txn, id, slots, self_slot, now).await?;
+        if active > 0 {
+            return Err(Error::new(ErrorKind::BulkBuildBusy));
         }
-        for skey in expired_to_del {
+        let max_inline_del = txn.admission_budget().max_mutations.saturating_sub(2);
+        for skey in expired.into_iter().take(max_inline_del) {
             txn.delete(skey).await?;
         }
     }
@@ -683,16 +697,16 @@ pub(crate) async fn enqueue<B: Backend>(
                     None => {}
                 }
                 if options.distributed_workers > 1 {
-                    let now = now_ms()?;
-                    for slot in 0..options.distributed_workers as u32 {
-                        if let Some(PersistentValue::BuildUnit(u)) = txn
-                            .get_for_update(LogicalKey::BuildScheduleSlot { index: id, slot })
-                            .await?
-                            && u.owner != [0; 32]
-                            && u.expires_ms > now
-                        {
-                            return Err(Error::new(ErrorKind::BulkBuildBusy));
-                        }
+                    let (active, _) = inspect_peer_slots(
+                        &mut txn,
+                        id,
+                        options.distributed_workers as u32,
+                        None,
+                        now_ms()?,
+                    )
+                    .await?;
+                    if active > 0 {
+                        return Err(Error::new(ErrorKind::BulkBuildBusy));
                     }
                 }
                 txn.put(
@@ -981,29 +995,14 @@ async fn finish<B: Backend>(
                     ));
                 }
 
-                let now = now_ms()?;
-                let slots = s.options.distributed_workers as u32;
-                let mut active_peer_slots = 0_usize;
-                let mut expired_peer_slots = Vec::new();
-                for other in 0..slots {
-                    if other == slot {
-                        continue;
-                    }
-                    let okey = LogicalKey::BuildScheduleSlot {
-                        index: id,
-                        slot: other,
-                    };
-                    match txn.get_for_update(okey.clone()).await? {
-                        None => {}
-                        Some(PersistentValue::BuildUnit(u))
-                            if u.owner != [0; 32] && u.expires_ms > now =>
-                        {
-                            active_peer_slots += 1;
-                        }
-                        Some(PersistentValue::BuildUnit(_)) => expired_peer_slots.push(okey),
-                        Some(_) => return Err(bulk_worker::corrupt()),
-                    }
-                }
+                let (active_peer_slots, expired_peer_slots) = inspect_peer_slots(
+                    &mut txn,
+                    id,
+                    s.options.distributed_workers as u32,
+                    Some((slot, owner)),
+                    now_ms()?,
+                )
+                .await?;
 
                 let mut needs_final_cleanup = false;
                 if terminal_done || failed {

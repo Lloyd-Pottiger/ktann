@@ -413,7 +413,7 @@ impl ShardPlan {
         };
         let local = (shard - heavy.shard_start) as usize;
         let origin = &heavy.centers[local];
-        let ranked: Vec<(f64, u32)> = if heavy.super_centers.len() >= 8 {
+        let candidates: Vec<u32> = if heavy.super_centers.len() >= 8 {
             let mut sc_ranked: Vec<(f64, usize)> = heavy
                 .super_centers
                 .iter()
@@ -427,29 +427,20 @@ impl ShardPlan {
             }
             cands.sort_unstable();
             cands.dedup();
-            let mut sub: Vec<(f64, u32)> = cands
-                .into_iter()
-                .filter(|&c| c as usize != local)
-                .map(|c| {
-                    let dist =
-                        kernel.routing_distances_validated([&heavy.centers[c as usize]], origin)[0];
-                    (dist, heavy.shard_start + c)
-                })
-                .collect();
-            sub.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-            sub
+            cands
         } else {
-            let mut sub: Vec<(f64, u32)> = (0..heavy.shard_count)
-                .filter(|&c| c as usize != local)
-                .map(|c| {
-                    let dist =
-                        kernel.routing_distances_validated([&heavy.centers[c as usize]], origin)[0];
-                    (dist, heavy.shard_start + c)
-                })
-                .collect();
-            sub.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-            sub
+            (0..heavy.shard_count).collect()
         };
+        let mut ranked: Vec<(f64, u32)> = candidates
+            .into_iter()
+            .filter(|&c| c as usize != local)
+            .map(|c| {
+                let dist =
+                    kernel.routing_distances_validated([&heavy.centers[c as usize]], origin)[0];
+                (dist, heavy.shard_start + c)
+            })
+            .collect();
+        ranked.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         let mut out = Vec::with_capacity(1 + ranked.len());
         out.push(shard);
         out.extend(ranked.into_iter().map(|(_, s)| s));
