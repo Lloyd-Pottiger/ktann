@@ -1,6 +1,8 @@
 # ADR 0028: Renewable automatic Bulk Build scheduling
 
 Status: Accepted; supersedes the automatic-scheduling deferral in ADR 0027.
+Single-worker-per-job execution is extended to multi-slot intra-job collaboration
+by [ADR 0030](0030-sharded-collaborative-bulk-build.md).
 
 ## Context
 

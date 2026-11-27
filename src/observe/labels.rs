@@ -81,8 +81,6 @@ pub(crate) enum Operation {
     OpenBulkBuild,
     /// Bulk Build lifecycle operation.
     StartBulkBuild,
-    /// Fenced serving artifact loading.
-    LoadBulkBuild,
     /// Durable preparation and loading.
     RunBulkBuild,
     /// Queue/lease coordination for automatic Bulk Builds.
@@ -128,7 +126,6 @@ impl Operation {
             Self::BulkBuildStatus => "bulk_build_status",
             Self::OpenBulkBuild => "open_bulk_build",
             Self::StartBulkBuild => "start_bulk_build",
-            Self::LoadBulkBuild => "load_bulk_build",
             Self::RunBulkBuild => "run_bulk_build",
             Self::ScheduleBulkBuild => "schedule_bulk_build",
             Self::PublishBulkBuild => "publish_bulk_build",
@@ -486,7 +483,6 @@ mod tests {
         assert_bounded(&[
             Operation::CreateIndex.as_str(),
             Operation::StartBulkBuild.as_str(),
-            Operation::LoadBulkBuild.as_str(),
             Operation::RunBulkBuild.as_str(),
             Operation::ScheduleBulkBuild.as_str(),
             Operation::PublishBulkBuild.as_str(),

@@ -83,14 +83,15 @@ const NS_INDEX_ID_ALLOCATOR: u8 = 0x00;
 const NS_INDEX_NAME_DIRECTORY: u8 = 0x01;
 const NS_BUILD_WORKSPACE: u8 = 0x02;
 const NS_BUILD_SCHEDULE: u8 = 0x03;
+const NS_BUILD_SCHEDULE_SLOT: u8 = 0x04;
 
 const KIND_MANIFEST: u8 = 0x00;
 const KIND_RECORD_GROUP: u8 = 0x01;
 const KIND_TREE_MANIFEST: u8 = 0x03;
 const KIND_PARTITION: u8 = 0x04;
 const KIND_BUILD_DESCRIPTOR: u8 = 0x05;
-const KIND_BUILD_LOAD: u8 = 0x06;
-const KIND_BUILD_VALIDATION: u8 = 0x07;
+const KIND_BUILD_PROGRESS: u8 = 0x06;
+const KIND_BUILD_UNIT: u8 = 0x07;
 
 const RECORD_VALUE: u8 = 0x00;
 const RECORD_LOCATION: u8 = 0x01;
@@ -127,14 +128,28 @@ pub enum LogicalKey {
     Manifest(LogicalIndexId),
     /// Immutable input identity and construction parameters of a Bulk Build.
     BuildDescriptor(LogicalIndexId),
-    /// Fenced progress for loading one sealed serving artifact.
-    BuildLoad(LogicalIndexId),
-    /// Durable workspace ownership and preparation progress, outside index data.
+    /// Fenced stage, entry, and multiset-digest progress of a Bulk Build.
+    BuildProgress(LogicalIndexId),
+    /// Durable workspace ownership and failure ledger, outside index data.
     BuildWorkspace(LogicalIndexId),
     /// Durable distributed scheduler queue and lease.
     BuildSchedule(LogicalIndexId),
-    /// Checkpoint over sealed backend data.
-    BuildValidation(LogicalIndexId),
+    /// Renewable worker-slot lease for a collaborative scheduled Bulk Build.
+    BuildScheduleSlot {
+        /// The target Logical Index ID.
+        index: LogicalIndexId,
+        /// Zero-based worker slot (`0..distributed_workers`).
+        slot: u32,
+    },
+    /// Per-stage lease and completion record for one Bulk Build unit.
+    BuildUnit {
+        /// The owning Logical Index ID.
+        index: LogicalIndexId,
+        /// Stage discriminator (`1..` = execution stages, `40` = validation slices).
+        stage: u8,
+        /// Zero-based unit ordinal within `stage`.
+        unit: u32,
+    },
     /// A Vector Record.
     Record {
         /// The owning Logical Index ID.
@@ -268,11 +283,12 @@ impl LogicalKey {
             Self::IndexIdAllocator
             | Self::IndexNameDirectory(_)
             | Self::BuildWorkspace(_)
-            | Self::BuildSchedule(_) => None,
+            | Self::BuildSchedule(_)
+            | Self::BuildScheduleSlot { .. } => None,
             Self::Manifest(index)
             | Self::BuildDescriptor(index)
-            | Self::BuildLoad(index)
-            | Self::BuildValidation(index) => Some(*index),
+            | Self::BuildProgress(index)
+            | Self::BuildUnit { index, .. } => Some(*index),
             Self::Record { index, .. }
             | Self::Location { index, .. }
             | Self::Payload { index, .. }
@@ -308,10 +324,11 @@ impl LogicalKey {
             | Self::IndexNameDirectory(_)
             | Self::Manifest(_)
             | Self::BuildDescriptor(_)
-            | Self::BuildLoad(_)
+            | Self::BuildProgress(_)
             | Self::BuildWorkspace(_)
             | Self::BuildSchedule(_)
-            | Self::BuildValidation(_)
+            | Self::BuildScheduleSlot { .. }
+            | Self::BuildUnit { .. }
             | Self::Record { .. }
             | Self::Location { .. }
             | Self::Payload { .. } => None,
@@ -328,15 +345,24 @@ impl fmt::Debug for LogicalKey {
             Self::BuildSchedule(index) => {
                 formatter.debug_tuple("BuildSchedule").field(index).finish()
             }
+            Self::BuildScheduleSlot { index, slot } => formatter
+                .debug_struct("BuildScheduleSlot")
+                .field("index", index)
+                .field("slot", slot)
+                .finish(),
             Self::BuildWorkspace(index) => formatter
                 .debug_tuple("BuildWorkspace")
                 .field(index)
                 .finish(),
-            Self::BuildValidation(index) => formatter
-                .debug_tuple("BuildValidation")
-                .field(index)
+            Self::BuildUnit { index, stage, unit } => formatter
+                .debug_struct("BuildUnit")
+                .field("index", index)
+                .field("stage", stage)
+                .field("unit", unit)
                 .finish(),
-            Self::BuildLoad(index) => formatter.debug_tuple("BuildLoad").field(index).finish(),
+            Self::BuildProgress(index) => {
+                formatter.debug_tuple("BuildProgress").field(index).finish()
+            }
             Self::BuildDescriptor(index) => formatter
                 .debug_tuple("BuildDescriptor")
                 .field(index)
@@ -592,11 +618,11 @@ pub fn build_descriptor_key(index: LogicalIndexId) -> Vec<u8> {
     bytes
 }
 
-/// The fenced serving-load progress key for `index`.
+/// The Bulk Build stage and multiset-digest progress key for `index`.
 #[must_use]
-pub fn build_load_key(index: LogicalIndexId) -> Vec<u8> {
+pub fn build_progress_key(index: LogicalIndexId) -> Vec<u8> {
     let mut bytes = index_prefix(index);
-    bytes.push(KIND_BUILD_LOAD);
+    bytes.push(KIND_BUILD_PROGRESS);
     bytes
 }
 
@@ -607,8 +633,23 @@ pub fn build_workspace_key(index: LogicalIndexId) -> Vec<u8> {
 }
 
 /// Namespace scheduler queue key, surviving index-prefix deletion.
+#[must_use]
 pub fn build_schedule_key(index: LogicalIndexId) -> Vec<u8> {
     namespace_build_key(NS_BUILD_SCHEDULE, index)
+}
+
+/// Namespace collaborative scheduler slot key, surviving index-prefix deletion.
+#[must_use]
+pub fn build_schedule_slot_key(index: LogicalIndexId, slot: u32) -> Vec<u8> {
+    let mut bytes = namespace_build_key(NS_BUILD_SCHEDULE_SLOT, index);
+    bytes.extend_from_slice(&slot.to_be_bytes());
+    bytes
+}
+
+/// Contiguous namespace range of every collaborative scheduler slot for `index`.
+#[must_use]
+pub(crate) fn build_schedule_slot_range(index: LogicalIndexId) -> KeyRange {
+    KeyRange::for_prefix(namespace_build_key(NS_BUILD_SCHEDULE_SLOT, index))
 }
 
 fn namespace_build_key(kind: u8, index: LogicalIndexId) -> Vec<u8> {
@@ -617,12 +658,57 @@ fn namespace_build_key(kind: u8, index: LogicalIndexId) -> Vec<u8> {
     bytes
 }
 
-/// The sealed backend validation checkpoint key.
+/// One stage-local Bulk Build unit key.
 #[must_use]
-pub fn build_validation_key(index: LogicalIndexId) -> Vec<u8> {
+pub fn build_unit_key(index: LogicalIndexId, stage: u8, unit: u32) -> Vec<u8> {
     let mut bytes = index_prefix(index);
-    bytes.push(KIND_BUILD_VALIDATION);
+    bytes.push(KIND_BUILD_UNIT);
+    bytes.push(stage);
+    bytes.extend_from_slice(&unit.to_be_bytes());
     bytes
+}
+
+/// Contiguous range of every `BuildUnit` in one stage of `index`.
+#[must_use]
+pub(crate) fn build_unit_stage_range(index: LogicalIndexId, stage: u8) -> KeyRange {
+    let mut prefix = index_prefix(index);
+    prefix.push(KIND_BUILD_UNIT);
+    prefix.push(stage);
+    KeyRange::for_prefix(prefix)
+}
+
+/// Contiguous range of `BuildUnit`s in one stage of `index` starting at `from_unit`.
+#[must_use]
+pub(crate) fn build_unit_stage_range_from(
+    index: LogicalIndexId,
+    stage: u8,
+    from_unit: u32,
+) -> KeyRange {
+    let full = build_unit_stage_range(index, stage);
+    if from_unit == 0 {
+        return full;
+    }
+    KeyRange::new(build_unit_key(index, stage, from_unit), full.end)
+}
+
+/// Contiguous serving-data range (`RecordGroup`, `TreeManifest`, and `Partition` keys
+/// `[0x01..0x05)`) owned by `index`, excluding `Manifest` (`0x00`) and `Build*` (`0x05..`).
+#[must_use]
+pub(crate) fn serving_data_range(index: LogicalIndexId) -> KeyRange {
+    let mut start = index_prefix(index);
+    start.push(KIND_RECORD_GROUP);
+    let mut end = index_prefix(index);
+    end.push(KIND_BUILD_DESCRIPTOR);
+    KeyRange::new(start, end)
+}
+
+/// Contiguous range of transient `BuildUnit` keys (`[0x07..0x08)`) owned by `index`,
+/// preserving `BuildDescriptor` (`0x05`) and `BuildProgress` (`0x06`).
+#[must_use]
+pub(crate) fn transient_build_unit_range(index: LogicalIndexId) -> KeyRange {
+    let mut prefix = index_prefix(index);
+    prefix.push(KIND_BUILD_UNIT);
+    KeyRange::for_prefix(prefix)
 }
 
 /// The Vector Record key for `id` in `index`.
@@ -808,10 +894,11 @@ pub(crate) fn encode_key(key: &LogicalKey) -> Result<Vec<u8>> {
         LogicalKey::IndexNameDirectory(name) => Ok(name_directory_key(name)),
         LogicalKey::Manifest(index) => Ok(manifest_key(*index)),
         LogicalKey::BuildDescriptor(index) => Ok(build_descriptor_key(*index)),
-        LogicalKey::BuildLoad(index) => Ok(build_load_key(*index)),
+        LogicalKey::BuildProgress(index) => Ok(build_progress_key(*index)),
         LogicalKey::BuildWorkspace(index) => Ok(build_workspace_key(*index)),
         LogicalKey::BuildSchedule(index) => Ok(build_schedule_key(*index)),
-        LogicalKey::BuildValidation(index) => Ok(build_validation_key(*index)),
+        LogicalKey::BuildScheduleSlot { index, slot } => Ok(build_schedule_slot_key(*index, *slot)),
+        LogicalKey::BuildUnit { index, stage, unit } => Ok(build_unit_key(*index, *stage, *unit)),
         LogicalKey::Record { index, id } => record_key(*index, id),
         LogicalKey::Location { index, id } => location_key(*index, id),
         LogicalKey::Payload { index, id } => payload_key(*index, id),
@@ -899,6 +986,13 @@ fn decode_namespace_key(body: &[u8]) -> Result<LogicalKey> {
             LogicalIndexId::new(u64::from_be_bytes(body[1..].try_into().expect("fixed id")))
                 .map_err(|_| corrupt())?,
         )),
+        Some(&NS_BUILD_SCHEDULE_SLOT) if body.len() == 13 => {
+            let index =
+                LogicalIndexId::new(u64::from_be_bytes(body[1..9].try_into().expect("fixed id")))
+                    .map_err(|_| corrupt())?;
+            let slot = u32::from_be_bytes(body[9..13].try_into().expect("fixed slot"));
+            Ok(LogicalKey::BuildScheduleSlot { index, slot })
+        }
         Some(&NS_INDEX_NAME_DIRECTORY) => {
             Ok(LogicalKey::IndexNameDirectory(decode_name(&body[1..])?))
         }
@@ -915,11 +1009,17 @@ fn decode_index_key(types: &[DataType], key: &Bytes, offset: usize) -> Result<Lo
     let rest = offset + LOGICAL_INDEX_ID_BYTES + 1;
 
     match kind {
-        KIND_BUILD_VALIDATION if body.len() == LOGICAL_INDEX_ID_BYTES + 1 => {
-            Ok(LogicalKey::BuildValidation(index))
+        KIND_BUILD_UNIT if body.len() == LOGICAL_INDEX_ID_BYTES + 6 => {
+            let stage = body[LOGICAL_INDEX_ID_BYTES + 1];
+            let unit = u32::from_be_bytes(
+                body[LOGICAL_INDEX_ID_BYTES + 2..]
+                    .try_into()
+                    .expect("fixed u32"),
+            );
+            Ok(LogicalKey::BuildUnit { index, stage, unit })
         }
-        KIND_BUILD_LOAD if body.len() == LOGICAL_INDEX_ID_BYTES + 1 => {
-            Ok(LogicalKey::BuildLoad(index))
+        KIND_BUILD_PROGRESS if body.len() == LOGICAL_INDEX_ID_BYTES + 1 => {
+            Ok(LogicalKey::BuildProgress(index))
         }
         KIND_BUILD_DESCRIPTOR if body.len() == LOGICAL_INDEX_ID_BYTES + 1 => {
             Ok(LogicalKey::BuildDescriptor(index))
@@ -1049,6 +1149,16 @@ pub(crate) fn build_workspace_range(after: Option<LogicalIndexId>) -> KeyRange {
 /// Scheduled build records strictly after the supplied index ID.
 pub(crate) fn build_schedule_range(after: Option<LogicalIndexId>) -> KeyRange {
     namespace_build_range(NS_BUILD_SCHEDULE, after)
+}
+
+/// Collaborative scheduler slot records strictly after all slots of `after`.
+pub(crate) fn build_schedule_slot_all_range(after: Option<LogicalIndexId>) -> KeyRange {
+    let mut range = KeyRange::for_prefix(vec![SCOPE_NAMESPACE, NS_BUILD_SCHEDULE_SLOT]);
+    if let Some(index) = after {
+        range.start = build_schedule_slot_key(index, u32::MAX);
+        range.start.push(0);
+    }
+    range
 }
 
 /// Resume strictly after the last processed key, retaining the full namespace

@@ -37,6 +37,26 @@ pub(super) fn decode_vector(decoder: &mut Decoder, dimension: usize) -> Result<B
     decoder.canonical_f32s(dimension)
 }
 
+pub(super) fn decode_vector_into(
+    decoder: &mut Decoder,
+    dimension: usize,
+    dst: &mut [f32],
+) -> Result<()> {
+    if dst.len() != dimension
+        || usize::try_from(decoder.u32()?).map_err(|_| corrupt())? != dimension
+    {
+        return Err(corrupt());
+    }
+    decoder.canonical_f32s_into(dst)
+}
+
+pub(super) fn validate_vector(decoder: &mut Decoder, dimension: usize) -> Result<()> {
+    if usize::try_from(decoder.u32()?).map_err(|_| corrupt())? != dimension {
+        return Err(corrupt());
+    }
+    decoder.validate_canonical_f32s(dimension)
+}
+
 pub(super) fn encode_fields(
     encoder: &mut Encoder,
     schema: &[FieldSchema],
@@ -133,4 +153,30 @@ pub(super) fn decode_typed_value(
         }
         _ => Err(corrupt()),
     }
+}
+
+pub(super) fn validate_fields(decoder: &mut Decoder, schema: &[FieldSchema]) -> Result<()> {
+    if usize::from(decoder.u16()?) != schema.len() {
+        return Err(corrupt());
+    }
+    for field in schema {
+        match decoder.u8()? {
+            0 if field.is_nullable() => {}
+            1 if field.data_type() == DataType::Bool => {
+                let _ = decoder.bool()?;
+            }
+            2 if field.data_type() == DataType::I64 => {
+                let _ = decoder.i64()?;
+            }
+            3 if field.data_type() == DataType::F64 => {
+                let _ = decoder.canonical_f64()?;
+            }
+            4 if field.data_type() == DataType::String => {
+                let bytes = decoder.sized_bytes(MAX_STRING_BYTES)?;
+                std::str::from_utf8(&bytes).map_err(|_| corrupt())?;
+            }
+            _ => return Err(corrupt()),
+        }
+    }
+    Ok(())
 }

@@ -1,8 +1,8 @@
 //! Production routing through published graph indexes; quality is not an exactness promise.
 use super::*;
 use ktann::api::{
-    BulkBuildOptions, BulkWorkerOptions, CompareOp, LocalGraphConfig, OperationOptions, Predicate,
-    RoutingMode, SearchOptions, SearchOutcome, SearchRequest,
+    BulkWorkerOptions, CompareOp, LocalGraphConfig, OperationOptions, Predicate, RoutingMode,
+    SearchOptions, SearchOutcome, SearchRequest,
 };
 use std::time::Instant;
 
@@ -43,14 +43,7 @@ async fn build(
     )
     .unwrap();
     let job = runtime
-        .start_bulk_build(
-            "routing",
-            &input,
-            BulkBuildOptions {
-                construction: construction_options(),
-                refinement_rounds: None,
-            },
-        )
+        .start_bulk_build("routing", &input, construction_options())
         .await
         .unwrap();
     let work = dir.path().join("work");
@@ -312,12 +305,14 @@ impl Backend for SnapshotCut {
     type ReadTxn<'a> = <MemoryBackend as Backend>::ReadTxn<'a>;
     type WriteTxn<'a> = <MemoryBackend as Backend>::WriteTxn<'a>;
 
-    fn hard_limits(&self) -> HardLimits {
+    fn hard_limits(&self) -> ktann::storage::backend::HardLimits {
         self.memory.hard_limits()
     }
+
     fn admission_budget(&self) -> ktann::storage::backend::AdmissionBudget {
         self.memory.admission_budget()
     }
+
     fn capabilities(&self) -> ktann::storage::backend::Capabilities {
         self.memory.capabilities()
     }

@@ -28,7 +28,6 @@ pub(crate) mod graph_maintenance;
 pub use graph_maintenance::GraphMaintenance;
 mod routing_graph;
 
-pub(crate) mod bulk_load;
 pub(crate) mod bulk_publish;
 pub(crate) mod bulk_scheduler;
 pub(crate) mod bulk_worker;
@@ -73,9 +72,9 @@ impl<B: Backend> Runtime<B> {
         &self,
         name: &str,
         input: &crate::bulk::InputSnapshot,
-        construction: impl Into<crate::api::BulkBuildOptions>,
+        options: crate::api::BulkBuildOptions,
     ) -> Result<crate::api::BulkBuildJob<B>> {
-        self.start_bulk_build_with_control(name, input, construction, OperationOptions::default())
+        self.start_bulk_build_with_control(name, input, options, OperationOptions::default())
             .await
     }
 
@@ -84,22 +83,20 @@ impl<B: Backend> Runtime<B> {
         &self,
         name: &str,
         input: &crate::bulk::InputSnapshot,
-        construction: impl Into<crate::api::BulkBuildOptions>,
-        options: OperationOptions,
+        build_options: crate::api::BulkBuildOptions,
+        control: OperationOptions,
     ) -> Result<crate::api::BulkBuildJob<B>> {
         let name = IndexName::new(name)?;
         let config = input.config().clone();
-        let preparation = construction.into();
-        let construction = preparation.construction;
-        construction.resident_rows(&config)?;
+        config.validate()?;
+        build_options.validate()?;
         let source =
             std::path::absolute(input.directory()).map_err(|_| Error::invalid_argument())?;
         let descriptor = crate::storage::values::BuildDescriptor::new(
             source,
             input.manifest().clone(),
-            construction,
-        )?
-        .with_refinement_rounds(preparation.refinement_rounds)?;
+            build_options,
+        )?;
         let request = descriptor.clone();
         let request_name = name.clone();
         let retry = lifecycle::RetryPolicy::from_config(self.config());
@@ -107,7 +104,7 @@ impl<B: Backend> Runtime<B> {
             .run_foreground(
                 Operation::StartBulkBuild,
                 None,
-                options,
+                control,
                 move |mut context| async move {
                     lifecycle::reserve_index(
                         &mut context,
@@ -423,9 +420,10 @@ impl WriteRoutingControl {
 }
 
 pub(crate) struct OperationContext<B: Backend> {
-    bulk_authority: Option<[u8; 32]>,
+    pub(crate) bulk_authority: Option<bulk_scheduler::BulkAuthority>,
+    pub(crate) bulk_lease_lock: Option<Arc<tokio::sync::RwLock<()>>>,
     backend: Arc<B>,
-    options: OperationOptions,
+    pub(crate) options: OperationOptions,
     write_beam_size: u32,
     routing_working_bytes: usize,
     partition_cache: Arc<PartitionCache>,
@@ -460,6 +458,23 @@ impl<B: Backend> OperationContext<B> {
         check_control(&self.options)
     }
 
+    /// Returns an erased shared-admission token for parallel worker tasks that outlive an async poll.
+    pub(crate) fn cpu_keep_alive(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        self.cpu_admission
+            .as_ref()
+            .map(|guard| Arc::clone(guard) as Arc<dyn std::any::Any + Send + Sync>)
+    }
+
+    /// Runs synchronous CPU or native file work off Tokio while retaining foreground admission
+    /// and cancelling inner loops if the owning async future drops.
+    pub(crate) async fn compute<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&OperationOptions) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        self.checkpoint()?;
+        compute::controlled_compute(self.options.clone(), self.cpu_admission.clone(), work).await
+    }
+
     /// Starts one commit attempt at the Runtime's cancellation boundary.
     ///
     /// The first attempt consumes the guarded boundary. A resumable lifecycle
@@ -479,6 +494,28 @@ impl<B: Backend> OperationContext<B> {
             .take()
             .unwrap_or_else(CommitStart::uncontrolled);
         commit(start).await
+    }
+
+    /// Commits an optional prepared write transaction through [`OperationContext::commit`],
+    /// classifying prepare-time aborts separately from commit-time errors for retry loops.
+    pub(crate) async fn commit_prepared<W, T>(
+        &mut self,
+        prepared: Result<(Option<crate::storage::WriteLogicalTxn<'_, W>>, T)>,
+    ) -> bulk_worker::CommitStep<T>
+    where
+        W: crate::storage::backend::WriteTxn,
+    {
+        match prepared {
+            Ok((None, out)) => bulk_worker::CommitStep::Done(out),
+            Ok((Some(txn), out)) => match self.commit(|start| txn.commit_with(start)).await {
+                Ok(()) => bulk_worker::CommitStep::Done(out),
+                Err(e) => bulk_worker::CommitStep::CommitFailed(e),
+            },
+            Err(e) if e.kind() == ErrorKind::RetryableAbort => {
+                bulk_worker::CommitStep::PrepareAbort
+            }
+            Err(e) => bulk_worker::CommitStep::Fatal(e),
+        }
     }
 }
 
@@ -594,7 +631,6 @@ impl<B: Backend> RuntimeInner<B> {
             Operation::Search
                 | Operation::Verify
                 | Operation::Refine
-                | Operation::LoadBulkBuild
                 | Operation::RunBulkBuild
                 | Operation::ScheduleBulkBuild
                 | Operation::PublishBulkBuild
@@ -615,6 +651,7 @@ impl<B: Backend> RuntimeInner<B> {
         let (commit_cancellation, commit_start) = CommitCancellation::pair();
         let context = OperationContext {
             bulk_authority: None,
+            bulk_lease_lock: None,
             backend,
             options,
             write_beam_size: self.config.write_beam_size(),

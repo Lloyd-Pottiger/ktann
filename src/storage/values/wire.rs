@@ -115,6 +115,10 @@ impl Decoder {
         Ok(Self { bytes, position: 1 })
     }
 
+    pub(super) const fn position(&self) -> usize {
+        self.position
+    }
+
     fn take_range(&mut self, length: usize) -> Result<(usize, usize)> {
         let end = self.position.checked_add(length).ok_or_else(corrupt)?;
         if end > self.bytes.len() {
@@ -176,26 +180,45 @@ impl Decoder {
     }
 
     /// Decodes a contiguous vector before checking canonical component bits.
-    /// Keeping conversion separate lets the compiler batch the byte swaps while
-    /// preserving the same finite, positive-zero-only wire contract.
     pub(super) fn canonical_f32s(&mut self, count: usize) -> Result<Box<[f32]>> {
         let byte_count = count.checked_mul(4).ok_or_else(corrupt)?;
-        let values: Vec<f32> = self
-            .take(byte_count)?
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|bytes| f32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-            .collect();
-        // A full reduction keeps validation vectorizable instead of branching
-        // out at each component. The Manifest bounds this work even on corruption.
-        let invalid = values.iter().fold(false, |invalid, value| {
-            invalid | !value.is_finite() | (value.to_bits() == 0x8000_0000)
+        if byte_count > self.bytes.len().saturating_sub(self.position) {
+            return Err(corrupt());
+        }
+        let mut values = vec![0.0_f32; count];
+        self.canonical_f32s_into(&mut values)?;
+        Ok(values.into_boxed_slice())
+    }
+
+    /// Decodes a contiguous vector into caller-provided storage and validates canonical bits.
+    pub(super) fn canonical_f32s_into(&mut self, dst: &mut [f32]) -> Result<()> {
+        let byte_count = dst.len().checked_mul(4).ok_or_else(corrupt)?;
+        let chunks = self.take(byte_count)?.as_chunks::<4>().0;
+        let mut invalid = false;
+        for (out, bytes) in dst.iter_mut().zip(chunks.iter()) {
+            let value = f32::from_be_bytes(*bytes);
+            invalid |= !value.is_finite() | (value.to_bits() == 0x8000_0000);
+            *out = value;
+        }
+        if invalid {
+            return Err(corrupt());
+        }
+        Ok(())
+    }
+
+    /// Validates a contiguous vector's canonical finite bits in place without allocating.
+    pub(super) fn validate_canonical_f32s(&mut self, count: usize) -> Result<()> {
+        let byte_count = count.checked_mul(4).ok_or_else(corrupt)?;
+        let chunks = self.take(byte_count)?.as_chunks::<4>().0;
+        let invalid = chunks.iter().fold(false, |inv, bytes| {
+            let bits = u32::from_be_bytes(*bytes);
+            let value = f32::from_bits(bits);
+            inv | !value.is_finite() | (bits == 0x8000_0000)
         });
         if invalid {
             return Err(corrupt());
         }
-        Ok(values.into_boxed_slice())
+        Ok(())
     }
 
     pub(super) fn canonical_f64(&mut self) -> Result<f64> {

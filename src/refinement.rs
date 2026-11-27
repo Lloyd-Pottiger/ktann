@@ -129,7 +129,7 @@ impl Planner {
 }
 
 /// Trains a routing model with canonical f64 accumulation; only leaves get dispersion.
-fn mean<'a>(
+pub(crate) fn mean<'a>(
     kernel: &VectorKernel,
     members: impl Iterator<Item = &'a [f32]>,
     level: u32,
@@ -169,10 +169,10 @@ pub(crate) fn finish_mean(
     PartitionCentroid::with_dispersion(kernel.normalize_centroid(&center)?, dispersion)
 }
 
-/// Retains up to 32 candidate leaves in exact (distance, leaf ordinal) order.
+/// Retains up to 32 candidate leaves in exact `(distance, leaf ordinal)` order.
 /// Large trees use a centroid HNSW; small trees score each symmetric pair once,
-/// updating both ends.
-/// Only the bounded neighbor lists survive; no quadratic distance matrix is kept.
+/// updating both ends. Only the bounded neighbor lists survive; no quadratic
+/// distance matrix is kept.
 pub(crate) fn leaf_neighbors(
     checkpoint: &impl Fn() -> Result<()>,
     kernel: &VectorKernel,
@@ -276,7 +276,7 @@ pub(crate) fn accept_moves(
     maximum: usize,
     mut accept: impl FnMut(usize, usize, usize),
 ) -> usize {
-    moves.sort_by(|left, right| right.0.total_cmp(&left.0).then(left.1.cmp(&right.1)));
+    moves.sort_unstable_by(|left, right| right.0.total_cmp(&left.0).then(left.1.cmp(&right.1)));
     let mut accepted = 0;
     for (_, position, source, target) in moves {
         if counts[source] > minimum && counts[target] < maximum {

@@ -1,14 +1,15 @@
-//! Real-adapter persistence and exact-byte checks for fenced serving loading.
+//! Real-adapter persistence, reopen recovery, and scheduler checks for sharded Bulk Build.
+
+use std::path::Path;
+
 use bytes::Bytes;
 use ktann::api::{
-    BulkBuildStatus, BulkLoadOptions, DataType, ErrorKind, FieldId, FieldSchema, IndexConfig,
-    Metric, Record, RuntimeConfig, Value,
+    BulkBuildOptions, BulkBuildStatus, BulkLoadOptions, DataType, ErrorKind, FieldId, FieldSchema,
+    IndexConfig, Metric, Record, RuntimeConfig, Value,
 };
-use ktann::bulk::{ForestArtifact, ForestOptions, InputSnapshot, ServingArtifact, ServingOptions};
-use ktann::construction::ConstructionOptions;
+use ktann::bulk::InputSnapshot;
 use ktann::runtime::Runtime;
-use ktann::storage::backend::{Backend, ReadOps};
-use std::path::Path;
+use ktann::storage::backend::Backend;
 
 #[path = "graph_updates.rs"]
 mod graph_updates;
@@ -16,8 +17,8 @@ mod graph_updates;
 #[path = "graph_history.rs"]
 pub mod graph_history;
 
-/// Exercises both manual loading and worker acceptance across a real backend
-/// reopen, then checks exact bytes before publication and ordinary verification.
+/// Exercises worker execution, reopen recovery, verification, online mutations,
+/// and scheduled builds across real storage adapters.
 pub async fn exercise<B: Backend>(backend: impl Fn() -> B, directory: &Path) {
     for (name, graph, metric) in [
         ("ordinary", false, Metric::L2),
@@ -78,7 +79,7 @@ async fn exercise_mode<B: Backend>(
     let source = InputSnapshot::create(
         &directory.join("source"),
         config,
-        1024 * 1024,
+        2 * 1024 * 1024,
         (0..record_count).map(|id| {
             Record::new(
                 Bytes::copy_from_slice(&id.to_be_bytes()),
@@ -89,19 +90,12 @@ async fn exercise_mode<B: Backend>(
         }),
     )
     .unwrap();
-    let tree = ConstructionOptions {
+    let tree = BulkBuildOptions {
         sample_items: 16,
-        memory_bytes: if updates {
-            128 * 1024 * 1024
-        } else {
-            2 * 1024 * 1024
-        },
-        scratch_bytes: 16 * 1024 * 1024,
+        refinement_rounds: None,
     };
-    let raw = backend();
-    let hard_limits = raw.hard_limits();
     let runtime = Runtime::new(
-        raw,
+        backend(),
         RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
     )
     .unwrap();
@@ -110,52 +104,22 @@ async fn exercise_mode<B: Backend>(
         .await
         .unwrap();
     let id = job.logical_index_id();
-    let (forest, _) = ForestArtifact::build(
-        &directory.join("forest"),
-        &source,
-        *job.index_manifest().rotation_seed(),
-        ForestOptions {
-            refinement_rounds: None,
-            refinement_memory_bytes: 256 * 1024 * 1024,
-            sample_items: tree.sample_items,
-            tree_memory_bytes: tree.memory_bytes,
-            tree_scratch_bytes: tree.scratch_bytes,
-            sort_memory_bytes: 1024 * 1024,
-            sort_scratch_bytes: 16 * 1024 * 1024,
-        },
-        1024 * 1024,
-    )
-    .unwrap();
-    let (serving, _) = ServingArtifact::build(
-        &directory.join("serving"),
-        &source,
-        &forest,
-        job.index_manifest(),
-        ServingOptions {
-            graph_memory_bytes: 256 * 1024 * 1024,
-            memory_bytes: 8 * 1024 * 1024,
-            scratch_bytes: 32 * 1024 * 1024,
-            hard_limits,
-        },
-        4 * 1024 * 1024,
-    )
-    .unwrap();
-    let options = BulkLoadOptions {
-        max_mutations: 17,
-        max_bytes: if updates { 128 * 1024 } else { 4096 },
-    };
-    job.load_serving(&serving, options).await.unwrap();
     let root = directory.join("worker");
     std::fs::create_dir(&root).unwrap();
     let mut worker = ktann::api::BulkWorkerOptions::new(root);
-    worker.sort_memory_bytes = 1024 * 1024;
-    worker.sort_scratch_bytes = 16 * 1024 * 1024;
-    worker.serving_memory_bytes = 8 * 1024 * 1024;
-    worker.serving_scratch_bytes = 32 * 1024 * 1024;
-    worker.max_artifact_bytes = 4 * 1024 * 1024;
-    worker.load = options;
+    worker.memory_bytes = if updates {
+        64 * 1024 * 1024
+    } else {
+        8 * 1024 // Exercise disk BuildUnit path on real adapters too!
+    };
+    worker.scratch_bytes = 32 * 1024 * 1024;
+    worker.load = BulkLoadOptions {
+        max_mutations: if updates { 512 } else { 32 },
+        max_bytes: if updates { 256 * 1024 } else { 8192 },
+    };
     job.run_worker(worker.clone()).await.unwrap();
     runtime.shutdown().await.unwrap();
+
     let runtime = Runtime::new(
         backend(),
         RuntimeConfig::default().with_maintenance(0, 1).unwrap(),
@@ -163,33 +127,17 @@ async fn exercise_mode<B: Backend>(
     .unwrap();
     let reopened = runtime.open_bulk_build("bulk-loader").await.unwrap();
     assert_eq!(reopened.logical_index_id(), id);
-    reopened.load_serving(&serving, options).await.unwrap();
-    assert_eq!(
+    reopened.run_worker(worker.clone()).await.unwrap();
+    assert!(matches!(
         reopened.status().await.unwrap(),
-        BulkBuildStatus::Loaded {
-            entries: serving.manifest().items()
-        }
-    );
+        BulkBuildStatus::Loaded { entries } if entries > record_count
+    ));
     assert_eq!(
         runtime.open_index("bulk-loader").await.unwrap_err().kind(),
         ErrorKind::IndexBuilding
     );
+
     let raw = backend();
-    // Loading is complete and the hidden namespace is immutable, so batches
-    // need no shared snapshot. Keep reads within FoundationDB's transaction
-    // lifetime even when the artifact contains thousands of entries.
-    let mut entries = serving.reader().unwrap();
-    loop {
-        let batch: Vec<_> = entries.by_ref().take(128).map(Result::unwrap).collect();
-        if batch.is_empty() {
-            break;
-        }
-        let mut txn = raw.begin_read().await.unwrap();
-        let keys = batch.iter().map(|entry| entry.key.clone()).collect();
-        let actual = txn.batch_get(keys).await.unwrap();
-        let expected: Vec<_> = batch.into_iter().map(|entry| Some(entry.value)).collect();
-        assert_eq!(actual, expected);
-    }
     let index = reopened.complete(worker.clone()).await.unwrap();
     let verified = index
         .verify(ktann::api::VerifyOptions::default())
@@ -204,8 +152,7 @@ async fn exercise_mode<B: Backend>(
     if updates {
         graph_updates::exercise(&raw, &index, id, fault).await;
     }
-    // Exercise real storage reads for both serving modes after durable loading.
-    // The default beam is exhaustive for this small two-Tree-Key fixture.
+
     let modes = if graph {
         vec![
             ktann::api::RoutingMode::Exact,
@@ -238,8 +185,6 @@ async fn exercise_mode<B: Backend>(
                     )
                 })
                 .collect();
-            // The beam covers every leaf in this fixture. This original-vector
-            // oracle is independent of both routing implementations.
             let mut expected: Vec<_> = (0..record_count)
                 .map(|id| {
                     let distance = match metric {
@@ -261,7 +206,6 @@ async fn exercise_mode<B: Backend>(
     }
 
     if graph {
-        // Bulk-built graph indexes retain ordinary public write capability.
         let id = Bytes::from_static(b"post-publication");
         index
             .insert(Record::new(id.clone(), vec![0.25, 1.0], vec![Value::I64(0)]).unwrap())
@@ -298,8 +242,6 @@ async fn exercise_mode<B: Backend>(
             )
             .await
     });
-    // The 4096-record FoundationDB case validates tens of thousands of entries;
-    // this is a liveness watchdog, not a publication-latency assertion.
     let publication = tokio::time::timeout(std::time::Duration::from_secs(60), async {
         loop {
             if scheduled.status().await.unwrap() == BulkBuildStatus::Published {

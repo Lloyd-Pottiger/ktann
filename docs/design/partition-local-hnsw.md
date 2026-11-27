@@ -24,7 +24,7 @@ A graph's validity depends on agreement with its Child Entries, including legal
 non-Ready topology states. [API configuration](api.md#4-immutable-and-runtime-configuration)
 owns immutable graph parameters and capacities; [search](search.md#6-search-algorithm)
 owns per-query routing selection. Graph indexes support ordinary creation, Bulk
-Build, writes and offline `Index::refine`. Artifact refinement runs before initial
+Build, writes and offline `Index::refine`. Bulk Build refinement runs before initial
 graph construction; Active-index refinement atomically refreshes each changed
 parent graph with its Child Entries and partition centroids.
 
@@ -142,12 +142,12 @@ maintenance state, not a missing-graph fallback.
 
 ## Initial construction
 
-[Offline artifact preparation](bulk-artifacts.md#1-pipeline) finalizes membership
-and centroids before constructing graphs from the exact Child Entry projections.
-No membership or centroid edits follow graph construction within an artifact.
-[Bulk Build](bulk-build.md#5-loading-and-exact-validation) loads and validates all
-serving bytes before activation; accepted Serving Artifacts support recovery
-without reconstructing graphs.
+[Bulk Build](bulk-build.md) finalizes leaf membership and centroids across Coarse
+Shards before constructing upper-tree internal partitions and their local HNSW
+graphs directly from the final in-memory `ChildEntry` slices. No membership or
+centroid edits follow graph construction. All serving graph descriptors and
+chunks are loaded under writer-lane fences and decoded/verified during frozen
+parallel slice validation before atomic `Active` publication.
 
 ## Query execution and cache
 
@@ -262,7 +262,7 @@ SLA for every accepted configuration.
 
 [Public verification](runtime-operations.md#6-verification) audits graph/source
 agreement independently of the search cache and ordinary membership/topology
-checks. [Bulk publication](bulk-build.md#5-loading-and-exact-validation) requires
+checks. [Bulk publication](bulk-build.md#4-homomorphic-multiset-verification-and-publication) requires
 the completed-load byte comparison rather than public verification alone.
 
 Wider internal partitions can reduce upper-tree routing work but increase graph

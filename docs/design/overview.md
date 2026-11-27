@@ -99,8 +99,7 @@ CI both follow stable. Production code uses no nightly features.
 | Module design | Sole owner of |
 | --- | --- |
 | [Public API](api.md) | caller-visible types, validation, configuration, errors, lifecycle calls |
-| [Bulk Build](bulk-build.md) | reservation, worker recovery, loading, exact publication, scheduling, cleanup |
-| [Offline artifacts](bulk-artifacts.md) | input capture, bounded sorting, forest construction, serving artifact assembly |
+| [Bulk Build](bulk-build.md) | segmented input snapshots, coarse-shard planning, halo refinement, direct KV loading, collaborative Build Units, exact publication, scheduling, cleanup |
 | [Storage](storage.md) | backend transaction contract, logical keys/codecs, typed atomic operations, manifests |
 | [Filtering](filtering.md) | predicate semantics, Tree Key range planning, synopsis classification |
 | [Partition-local HNSW](partition-local-hnsw.md) | local graph model, source binding, candidate contract and atomic graph maintenance |
@@ -189,16 +188,17 @@ common Backend API does not invent a long-lived snapshot facility.
 
 ### 6.7 Bulk Build
 
-[Bulk Build](bulk-build.md) constructs a new Logical Index from an immutable Input
-Snapshot. Reservation hides it in Building state. Manual completion or an opt-in
-automatic scheduler prepares artifacts, loads bounded transactions, and validates
-exact serving bytes before atomically publishing the original identity as Active.
-Durable checkpoints permit recovery; owned workspace files are reclaimed separately.
-It does not replace an existing Active index.
-
-The synchronous [`bulk` module](bulk-artifacts.md) owns bounded input capture,
-external sorting, forest files, and serving artifact assembly. It reuses core
-construction and storage codecs and never writes backend state.
+[Bulk Build](bulk-build.md) constructs a new Logical Index from an immutable
+segmented Input Snapshot. Reservation hides it in Building state. Manual
+completion or an opt-in automatic scheduler partitions work into deterministic
+Coarse Shards and Record-ID buckets, performs halo-bounded refinement without
+whole-tree residency, emits canonical serving KV records directly across
+fenced writer lanes, and validates frozen backend bytes plus 512-bit homomorphic
+multiset digests (`LtHash`) before atomically publishing the original identity
+as Active. Ample-memory single-worker builds execute with zero workspace disk
+writes; constrained-memory and multi-worker builds coordinate resumable
+`BuildUnit`s with renewable KV leases. It does not replace an existing Active
+index.
 
 ## 7. Performance and operational constraints
 

@@ -2,14 +2,6 @@
 //!
 //! This module is excluded from production builds unless `test-support` is enabled.
 
-pub use crate::bulk::{ForestArtifact, ForestPartition, ForestReader};
-pub use crate::bulk::{ServingArtifact, ServingEntry, ServingOptions, ServingReader};
-
-/// Pure tree-construction primitives used by algorithm tests.
-pub mod construction {
-    pub use crate::construction::*;
-}
-
 /// Held process-local graph body lock for interleaving tests.
 pub struct GraphBodyLock {
     _guards: crate::runtime::graph_maintenance::GraphBodyGuards,

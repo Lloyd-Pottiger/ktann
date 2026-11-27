@@ -137,29 +137,40 @@ impl VectorKernel {
         Ok(normalized.into_boxed_slice())
     }
 
-    /// Validates, metric-preprocesses, and rotates a caller vector.
+    /// Validates, metric-preprocesses, and rotates a caller vector into caller-reused `out`.
     ///
     /// Cosine is normalized with scalar f64 accumulation before conversion
     /// back to f32. L2 and inner product retain their original scale. Rotation
     /// then uses only format-fixed f32 steps because these bytes feed the
     /// persistent RaBitQ codec.
-    pub(crate) fn preprocess(&self, vector: &[f32]) -> Result<Box<[f32]>> {
+    pub(crate) fn preprocess_into(&self, vector: &[f32], out: &mut [f32]) -> Result<()> {
         validate_vector(vector, self.dimension, VectorSource::Caller)?;
-
-        let mut processed = allocate_vec(self.dimension)?;
+        if out.len() != self.dimension {
+            return Err(vector_error(VectorSource::Caller));
+        }
         match self.metric {
             Metric::Cosine => {
                 let norm = vector_norm(vector, VectorSource::Caller)?;
                 if norm == 0.0 {
                     return Err(vector_error(VectorSource::Caller));
                 }
-                push_normalized(&mut processed, vector, norm, VectorSource::Caller)?;
+                for (dst, &component) in out.iter_mut().zip(vector) {
+                    let normalized = (f64::from(component) / norm) as f32;
+                    if !normalized.is_finite() {
+                        return Err(vector_error(VectorSource::Caller));
+                    }
+                    *dst = normalized;
+                }
             }
-            Metric::L2 | Metric::InnerProduct => processed.extend_from_slice(vector),
+            Metric::L2 | Metric::InnerProduct => out.copy_from_slice(vector),
         }
+        self.rotation.apply_in_place(out, VectorSource::Caller)
+    }
 
-        self.rotation
-            .apply_in_place(&mut processed, VectorSource::Caller)?;
+    /// Validates, metric-preprocesses, and rotates a caller vector.
+    pub(crate) fn preprocess(&self, vector: &[f32]) -> Result<Box<[f32]>> {
+        let mut processed = vec![0.0_f32; self.dimension];
+        self.preprocess_into(vector, &mut processed)?;
         Ok(processed.into_boxed_slice())
     }
 

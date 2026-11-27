@@ -1,0 +1,3314 @@
+//! Unified sharded Bulk Build pipeline across resident memory, bounded disk spill,
+//! and multi-worker collaborative `BuildUnit` execution.
+//!
+//! One stage graph (`Plan -> Scatter -> Dedup -> Leaves -> [Halo Refine] -> Emit`)
+//! executes over a typed `StageStore`: `StageStore::Memory` keeps native intermediate
+//! structures in process memory (`0 B` scratch disk I/O and zero codec round-trips),
+//! while `StageStore::Disk` persists checksummed files under `ScratchQuota` and
+//! coordinates collaborative `BuildUnit` leases when `distributed_workers > 1`.
+
+use std::any::Any;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use bytes::Bytes;
+use tokio::sync::Semaphore;
+
+use crate::api::{
+    BulkBuildReport, Error, ErrorKind, LogicalIndexId, OperationOptions, PartitionKey, Result,
+};
+use crate::bulk::files::io_error;
+use crate::bulk::plan::MAX_TOTAL_SHARDS;
+use crate::bulk::sharded::{
+    AssignedLeafKey, DonorRow, INDEX_ENTRY_BYTES, IdFrameEntry, LeafPlan, MAX_HALO_LEAVES_CAP,
+    MoveProposal, ScratchQuota, SegmentIngest, ShardRows, ShardState, TreePlanEntry,
+    apply_moves_to_shard, arbitrate_tree_proposals, assign_leaf_partition_keys, build_shard_leaves,
+    compute_shard_remap, decode_id_refs, decode_id_slice, decode_leaf_keys_plan,
+    decode_locations_slice, decode_outbound_slice, decode_proposals, decode_shard_centers,
+    decode_shard_slice, decode_shard_state, encode_id_buckets, encode_id_refs,
+    encode_leaf_keys_plan, encode_leaf_shard, encode_outbound_slices, encode_proposals,
+    encode_record_group_bucket, encode_shard_locations, encode_shard_slices, encode_shard_state,
+    encode_upper_tree_nodes, ingest_segment_range, parallel_chunks, plan_upper_tree,
+    read_checksummed_bytes, read_indexed_counts, read_indexed_slice, refine_single_light_shard,
+    refinement_per_leaf_bytes, score_halo_shard, verify_id_bucket, write_checksummed_bytes,
+    write_indexed_slices,
+};
+use crate::bulk::{InputSnapshot, LtHash, ShardPlan};
+use crate::maintenance::routing::kernel_for;
+use crate::observe::labels::Operation;
+use crate::runtime::bulk_scheduler::{
+    BulkAuthority, authorize_raw, expiry, non_zero_token, now_ms,
+};
+use crate::storage::backend::{AdmissionBudget, Backend, ScanLimits, WriteTxn};
+use crate::storage::keys::{LogicalKey, TreeKey};
+use crate::storage::values::{
+    BuildDescriptor, BuildPhase, BuildProgress, BuildUnit, BuildWorkspace, IndexManifest,
+    PartitionCentroid, PersistentValue,
+};
+use crate::storage::{LogicalRange, ReadLogicalTxn, WriteLogicalTxn};
+
+use super::{
+    BUILD_UNIT_MUTATION_BYTES, CommitStep, MAX_WRITER_LANES, OperationContext, RetryPolicy,
+    SealedSummary, UnitLease, WriteFence, advance_loading_progress, building_in_flight,
+    check_manifest_building_in_flight, check_writer_fence, clear_stale_serving_data,
+    commit_raw_prepared, corrupt, drop_guarded_options, effective_budget, finalize_and_seal_loaded,
+    lock_sched_read, retry_raw_write, retry_read, seal_loaded, validate_split_keys_in_index,
+};
+
+const STAGE_SCATTER: u8 = 1;
+const STAGE_DEDUP: u8 = 2;
+const STAGE_LEAVES: u8 = 3;
+const STAGE_REFINE_BASE: u8 = 10; // 10 + 3*r = Propose, 11 + 3*r = Extract, 12 + 3*r = Apply
+const STAGE_EMIT_LOCS: u8 = 29; // Disk early-convergence fallback when final_round < rounds
+pub(crate) const STAGE_EMIT_RECORDS: u8 = 30;
+pub(crate) const STAGE_EMIT_TREES: u8 = 31;
+pub(crate) const STAGE_EMIT_LEAVES: u8 = 32;
+
+type UpperTreeBucket = (TreeKey, u64, Vec<(PartitionKey, PartitionCentroid)>);
+type RecordLocationEntry = (Bytes, TreeKey, PartitionKey);
+type NonEmptyRunSources = Vec<(u32, Vec<usize>)>;
+
+fn shard_final_round(shard: u32, final_round: u8, plan: &ShardPlan) -> u8 {
+    if shard < plan.light_shard_start {
+        final_round
+    } else {
+        0
+    }
+}
+
+fn lock_mutex<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Fencing mode shared across writer `BuildUnit` stages and frozen `STAGE_VALIDATE` slices.
+#[derive(Clone, Copy)]
+pub(crate) enum StageFence {
+    Write(WriteFence),
+    Validate { ws_token: [u8; 32], epoch: u64 },
+}
+
+impl StageFence {
+    #[must_use]
+    pub(crate) const fn epoch(self) -> u64 {
+        match self {
+            Self::Write(wf) => wf.epoch,
+            Self::Validate { epoch, .. } => epoch,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn operation(self) -> Operation {
+        match self {
+            Self::Write(_) => Operation::RunBulkBuild,
+            Self::Validate { .. } => Operation::PublishBulkBuild,
+        }
+    }
+
+    fn warm_keys(
+        self,
+        id: LogicalIndexId,
+        bulk_authority: Option<BulkAuthority>,
+        ukey: Option<LogicalKey>,
+    ) -> Vec<LogicalKey> {
+        let mut warm = Vec::with_capacity(6);
+        warm.push(LogicalKey::Manifest(id));
+        warm.push(LogicalKey::BuildWorkspace(id));
+        if matches!(self, Self::Validate { .. }) {
+            warm.push(LogicalKey::BuildProgress(id));
+        }
+        warm.push(LogicalKey::BuildSchedule(id));
+        if let Some(auth) = bulk_authority {
+            warm.push(auth.slot_key(id));
+        }
+        if let Some(uk) = ukey {
+            warm.push(uk);
+        }
+        warm
+    }
+
+    pub(crate) async fn check<T: WriteTxn>(
+        self,
+        txn: &mut WriteLogicalTxn<'_, T>,
+        manifest: &IndexManifest,
+    ) -> Result<()> {
+        match self {
+            Self::Write(wf) => check_writer_fence(txn, manifest, wf).await,
+            Self::Validate { ws_token, epoch } => {
+                fence_validation(txn, manifest, ws_token, epoch).await?;
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Verifies in a write transaction that `manifest` remains in frozen `(Building, Validating)`
+/// at `(ws_token, expected_epoch)` with writers revoked (`writer_token == [0; 32]`).
+pub(crate) async fn fence_validation<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    index: &IndexManifest,
+    ws_token: [u8; 32],
+    expected_epoch: u64,
+) -> Result<BuildProgress> {
+    building_in_flight(txn, index).await?;
+    let id = index.logical_index_id();
+    let ws = txn.get_for_update(LogicalKey::BuildWorkspace(id)).await?;
+    let prog = match txn.get(LogicalKey::BuildProgress(id)).await? {
+        Some(PersistentValue::BuildProgress(p))
+            if p.phase == BuildPhase::Validating && p.epoch == expected_epoch =>
+        {
+            validate_split_keys_in_index(id, &p.validation_split_keys)?;
+            p
+        }
+        Some(PersistentValue::BuildProgress(_)) => {
+            return Err(Error::new(ErrorKind::BulkBuildSuperseded));
+        }
+        _ => return Err(corrupt()),
+    };
+    match ws {
+        Some(PersistentValue::BuildWorkspace(w)) => {
+            if let Some(kind) = w.failure {
+                return Err(Error::new(kind));
+            }
+            if w.token != ws_token || w.epoch != expected_epoch || w.writer_token != [0; 32] {
+                return Err(Error::new(ErrorKind::BulkBuildSuperseded));
+            }
+        }
+        _ => return Err(corrupt()),
+    }
+    Ok(prog)
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct UnitOutput {
+    pub records: u64,
+    pub kv_count: u64,
+    pub aux_count: u64,
+    pub kv_lthash: LtHash,
+    pub aux_lthash: LtHash,
+    pub aux2_lthash: LtHash,
+}
+
+impl UnitOutput {
+    fn apply_to(self, u: &mut BuildUnit, owner: [u8; 32]) {
+        u.owner = owner;
+        u.complete = true;
+        u.records = self.records;
+        u.kv_count = self.kv_count;
+        u.aux_count = self.aux_count;
+        u.kv_lthash = self.kv_lthash;
+        u.aux_lthash = self.aux_lthash;
+        u.aux2_lthash = self.aux2_lthash;
+    }
+
+    fn into_completed(self, epoch: u64, owner: [u8; 32]) -> BuildUnit {
+        let mut u = BuildUnit::unclaimed(epoch);
+        self.apply_to(&mut u, owner);
+        u
+    }
+}
+
+pub(crate) struct StageEnv<B: Backend> {
+    pub backend: Arc<B>,
+    pub control: OperationOptions,
+    pub bulk_authority: Option<BulkAuthority>,
+    pub sched_lease_lock: Option<Arc<tokio::sync::RwLock<()>>>,
+    pub distributed_workers: usize,
+    pub writer_lanes: usize,
+    pub commit_sem: Arc<Semaphore>,
+    pub admission: Option<Arc<dyn Any + Send + Sync>>,
+    pub manifest: IndexManifest,
+    pub fence: StageFence,
+    pub unit_lease: Duration,
+    pub budget: AdmissionBudget,
+    pub retry: RetryPolicy,
+}
+
+impl<B: Backend> Clone for StageEnv<B> {
+    fn clone(&self) -> Self {
+        Self {
+            backend: Arc::clone(&self.backend),
+            control: self.control.clone(),
+            bulk_authority: self.bulk_authority,
+            sched_lease_lock: self.sched_lease_lock.clone(),
+            distributed_workers: self.distributed_workers,
+            writer_lanes: self.writer_lanes,
+            commit_sem: Arc::clone(&self.commit_sem),
+            admission: self.admission.clone(),
+            manifest: self.manifest.clone(),
+            fence: self.fence,
+            unit_lease: self.unit_lease,
+            budget: self.budget,
+            retry: self.retry,
+        }
+    }
+}
+
+impl<B: Backend> StageEnv<B> {
+    const fn persists_single_worker(&self) -> bool {
+        matches!(self.fence, StageFence::Validate { .. })
+    }
+
+    const fn persists_units(&self) -> bool {
+        self.distributed_workers > 1 || self.persists_single_worker()
+    }
+
+    pub(crate) async fn spawn_cpu<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(OperationOptions) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        crate::runtime::check_control(&self.control)?;
+        let adm = self.admission.clone();
+        let (ctrl, _drop_guard) = drop_guarded_options(&self.control);
+        tokio::task::spawn_blocking(move || {
+            let _adm = adm;
+            crate::runtime::check_control(&ctrl)?;
+            work(ctrl)
+        })
+        .await
+        .map_err(|e| Error::with_source(ErrorKind::Other, e))?
+    }
+
+    async fn begin_fenced_txn(
+        &self,
+        ukey: Option<LogicalKey>,
+        extra_warm: impl IntoIterator<Item = LogicalKey>,
+    ) -> Result<WriteLogicalTxn<'_, B::WriteTxn<'_>>> {
+        let id = self.manifest.logical_index_id();
+        let mut txn = WriteLogicalTxn::bootstrap(
+            self.backend.begin_write().await?,
+            self.backend.hard_limits(),
+            self.budget,
+        );
+        let mut warm = self.fence.warm_keys(id, self.bulk_authority, ukey);
+        warm.extend(extra_warm);
+        txn.warm_for_update(warm).await?;
+        self.fence.check(&mut txn, &self.manifest).await?;
+        authorize_raw(&mut txn, id, self.bulk_authority).await?;
+        Ok(txn)
+    }
+
+    async fn commit_chunk(
+        &self,
+        lease: Option<&UnitLease>,
+        chunk: Vec<(Bytes, Bytes)>,
+    ) -> Result<()> {
+        let StageFence::Write(wf) = self.fence else {
+            return Err(corrupt());
+        };
+        let _permit = self
+            .commit_sem
+            .acquire()
+            .await
+            .map_err(|_| Error::new(ErrorKind::Other))?;
+        let id = self.manifest.logical_index_id();
+        let chunk_ref = &chunk;
+        retry_raw_write(
+            &self.control,
+            self.sched_lease_lock.as_deref(),
+            Operation::RunBulkBuild,
+            self.retry,
+            || async {
+                let _lease_guard = match lease {
+                    Some(l) => Some(l.lock.lock().await),
+                    None => None,
+                };
+                let prepared = async {
+                    let mut txn = WriteLogicalTxn::for_index(
+                        self.backend.begin_write().await?,
+                        &self.manifest,
+                        self.backend.hard_limits(),
+                        self.budget,
+                    );
+                    let ukey = lease.map(|l| LogicalKey::BuildUnit {
+                        index: id,
+                        stage: l.stage,
+                        unit: l.unit,
+                    });
+                    txn.warm_for_update(self.fence.warm_keys(
+                        id,
+                        self.bulk_authority,
+                        ukey.clone(),
+                    ))
+                    .await?;
+                    check_writer_fence(&mut txn, &self.manifest, wf).await?;
+                    authorize_raw(&mut txn, id, self.bulk_authority).await?;
+                    if let (Some(l), Some(ukey)) = (lease, ukey) {
+                        match txn.get_for_update(ukey.clone()).await? {
+                            Some(PersistentValue::BuildUnit(mut u))
+                                if u.epoch == wf.epoch && u.owner == l.owner && !u.complete =>
+                            {
+                                u.expires_ms = u.expires_ms.max(expiry(l.duration)?);
+                                txn.put(ukey, PersistentValue::BuildUnit(u)).await?;
+                            }
+                            _ => return Err(Error::new(ErrorKind::BulkBuildSuperseded)),
+                        }
+                    }
+                    let mut batch = txn.mutations();
+                    for (k, v) in chunk_ref {
+                        batch.put_encoded(k.clone(), v.clone())?;
+                    }
+                    txn.apply(batch).await?;
+                    Ok((Some(txn), ()))
+                }
+                .await;
+                commit_raw_prepared(prepared).await
+            },
+        )
+        .await
+    }
+
+    async fn commit_unit_kvs(
+        &self,
+        lease: Option<&UnitLease>,
+        kvs: Vec<(Bytes, Bytes)>,
+    ) -> Result<()> {
+        if kvs.is_empty() {
+            return Ok(());
+        }
+        let chunks = super::split_into_chunks(&kvs, self.budget, lease.is_some())?;
+        let fanout = if lease.is_none() {
+            self.writer_lanes
+                .clamp(1, MAX_WRITER_LANES)
+                .min(chunks.len())
+        } else {
+            1
+        };
+        if fanout <= 1 {
+            for chunk in chunks {
+                self.commit_chunk(lease, chunk).await?;
+            }
+            return Ok(());
+        }
+
+        let queue = Arc::new(Mutex::new(chunks.into_iter()));
+        let mut workers = tokio::task::JoinSet::<Result<()>>::new();
+        for _ in 0..fanout {
+            let q = Arc::clone(&queue);
+            let env_c = self.clone();
+            workers.spawn(async move {
+                loop {
+                    crate::runtime::check_control(&env_c.control)?;
+                    let Some(chunk) = lock_mutex(&q).next() else {
+                        return Ok(());
+                    };
+                    env_c.commit_chunk(None, chunk).await?;
+                }
+            });
+        }
+        while let Some(res) = workers.join_next().await {
+            res.map_err(|e| Error::with_source(ErrorKind::Other, e))??;
+        }
+        Ok(())
+    }
+}
+
+type BucketLocations = Vec<Vec<(Bytes, u32)>>;
+
+#[derive(Default)]
+struct MemoryStageData {
+    scatter_ids: BTreeMap<u32, Vec<Vec<IdFrameEntry>>>,
+    scatter_shards: BTreeMap<u32, Vec<ShardRows>>,
+    id_refs: BTreeMap<u32, Vec<IdFrameEntry>>,
+    shards: BTreeMap<(u8, u32), ShardState>,
+    locs: BTreeMap<(u8, u32), BucketLocations>,
+    proposals: BTreeMap<(u8, u32), Vec<MoveProposal>>,
+    outbound: BTreeMap<(u8, u32), Vec<Vec<DonorRow>>>,
+}
+
+/// Typed intermediate stage store backing the unified Bulk Build pipeline.
+///
+/// `Memory` holds native structures directly (zero encoding, zero disk I/O),
+/// while `Disk` encapsulates workspace file naming, `ScratchQuota` headroom,
+/// and checksummed binary codecs.
+struct StageStore {
+    epoch: u64,
+    inner: StoreBackend,
+}
+
+enum StoreBackend {
+    Memory(Mutex<MemoryStageData>),
+    Disk {
+        dir: PathBuf,
+        quota: Arc<ScratchQuota>,
+    },
+}
+
+impl StageStore {
+    fn memory(epoch: u64) -> Self {
+        Self {
+            epoch,
+            inner: StoreBackend::Memory(Mutex::new(MemoryStageData::default())),
+        }
+    }
+
+    fn disk(epoch: u64, dir: PathBuf, quota: Arc<ScratchQuota>) -> Self {
+        Self {
+            epoch,
+            inner: StoreBackend::Disk { dir, quota },
+        }
+    }
+
+    fn is_disk(&self) -> bool {
+        matches!(self.inner, StoreBackend::Disk { .. })
+    }
+
+    fn has_leaf_plan(&self) -> bool {
+        match &self.inner {
+            StoreBackend::Disk { dir, .. } => dir.join(self.leafkeys_key()).exists(),
+            StoreBackend::Memory(_) => false,
+        }
+    }
+
+    fn ids_key(&self, run: u32) -> String {
+        format!("ids-e{}-{run:06}.bin", self.epoch)
+    }
+
+    fn vec_key(&self, run: u32) -> String {
+        format!("vec-e{}-{run:06}.bin", self.epoch)
+    }
+
+    fn idref_key(&self, bucket: u32) -> String {
+        format!("idref-e{}-{bucket:06}.bin", self.epoch)
+    }
+
+    fn prop_key(&self, round: u8, shard: u32) -> String {
+        format!("prop-e{}-r{round}-{shard:06}.bin", self.epoch)
+    }
+
+    fn out_key(&self, round: u8, shard: u32) -> String {
+        format!("out-e{}-r{round}-{shard:06}.bin", self.epoch)
+    }
+
+    fn leafkeys_key(&self) -> String {
+        format!("leafkeys-e{}.bin", self.epoch)
+    }
+
+    fn shard_keys(&self, round: u8, s: u32) -> (String, String, String) {
+        let ep = self.epoch;
+        (
+            format!("shard-e{ep}-r{round}-{s:06}.bin"),
+            format!("centers-e{ep}-r{round}-{s:06}.bin"),
+            format!("loc-e{ep}-r{round}-{s:06}.bin"),
+        )
+    }
+
+    fn indexed_file_bytes(slices: &[Vec<u8>]) -> u64 {
+        4_u64
+            .saturating_add((slices.len() as u64).saturating_mul(INDEX_ENTRY_BYTES))
+            .saturating_add(slices.iter().map(|s| s.len() as u64).sum::<u64>())
+    }
+
+    fn put_scatter_run(
+        &self,
+        run: u32,
+        manifest: &IndexManifest,
+        seg: SegmentIngest,
+        check: &(dyn Fn() -> Result<()> + Sync),
+    ) -> Result<()> {
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                let mut g = lock_mutex(m);
+                g.scatter_ids.insert(run, seg.ids_by_bucket);
+                g.scatter_shards.insert(run, seg.rows_by_shard);
+                Ok(())
+            }
+            StoreBackend::Disk { dir, quota } => {
+                let ids_slices = encode_id_buckets(&seg.ids_by_bucket)?;
+                write_indexed_slices(
+                    &dir.join(self.ids_key(run)),
+                    &ids_slices,
+                    None,
+                    quota,
+                    check,
+                )?;
+                let (vec_slices, row_counts) = encode_shard_slices(manifest, &seg.rows_by_shard)?;
+                write_indexed_slices(
+                    &dir.join(self.vec_key(run)),
+                    &vec_slices,
+                    Some(&row_counts),
+                    quota,
+                    check,
+                )?;
+                Ok(())
+            }
+        }
+    }
+
+    fn take_id_bucket(&self, run: u32, bucket: usize, out: &mut Vec<IdFrameEntry>) -> Result<()> {
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                let mut g = lock_mutex(m);
+                let run_buckets = g.scatter_ids.get_mut(&run).ok_or_else(corrupt)?;
+                let slot = run_buckets.get_mut(bucket).ok_or_else(corrupt)?;
+                let taken = std::mem::take(slot);
+                if out.is_empty() {
+                    *out = taken;
+                } else {
+                    out.extend(taken);
+                }
+                Ok(())
+            }
+            StoreBackend::Disk { dir, .. } => {
+                if let Some(raw) =
+                    read_indexed_slice(&dir.join(self.ids_key(run)), bucket, MAX_TOTAL_SHARDS)?
+                {
+                    decode_id_slice(&raw, out)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn put_id_refs(
+        &self,
+        bucket: u32,
+        items: Vec<IdFrameEntry>,
+        check: &(dyn Fn() -> Result<()> + Sync),
+    ) -> Result<()> {
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                lock_mutex(m).id_refs.insert(bucket, items);
+                Ok(())
+            }
+            StoreBackend::Disk { dir, quota } => {
+                write_checksummed_bytes(
+                    &dir.join(self.idref_key(bucket)),
+                    &encode_id_refs(&items)?,
+                    quota,
+                    check,
+                )?;
+                Ok(())
+            }
+        }
+    }
+
+    fn take_id_refs(&self, bucket: u32) -> Result<Vec<IdFrameEntry>> {
+        match &self.inner {
+            StoreBackend::Memory(m) => lock_mutex(m).id_refs.remove(&bucket).ok_or_else(corrupt),
+            StoreBackend::Disk { dir, .. } => {
+                decode_id_refs(&read_checksummed_bytes(&dir.join(self.idref_key(bucket)))?)
+            }
+        }
+    }
+
+    fn read_scatter_counts(&self, run: u32, coarse_shards: usize) -> Result<Vec<u64>> {
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                let g = lock_mutex(m);
+                let shards = g.scatter_shards.get(&run).ok_or_else(corrupt)?;
+                if shards.len() != coarse_shards {
+                    return Err(corrupt());
+                }
+                Ok(shards.iter().map(|s| s.rows.len() as u64).collect())
+            }
+            StoreBackend::Disk { dir, .. } => {
+                read_indexed_counts(&dir.join(self.vec_key(run)), coarse_shards)
+            }
+        }
+    }
+
+    fn take_scatter_shard_rows(
+        &self,
+        run: u32,
+        src_shard: usize,
+        manifest: &IndexManifest,
+        dst: &mut ShardRows,
+    ) -> Result<()> {
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                let taken = {
+                    let mut g = lock_mutex(m);
+                    let shards = g.scatter_shards.get_mut(&run).ok_or_else(corrupt)?;
+                    let slot = shards.get_mut(src_shard).ok_or_else(corrupt)?;
+                    let dim = slot.dim;
+                    std::mem::replace(slot, ShardRows::new(dim))
+                };
+                dst.append(taken);
+                Ok(())
+            }
+            StoreBackend::Disk { dir, .. } => {
+                if let Some(raw) =
+                    read_indexed_slice(&dir.join(self.vec_key(run)), src_shard, MAX_TOTAL_SHARDS)?
+                {
+                    decode_shard_slice(&raw, manifest, dst)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "stores round shard state, centers, and optional location buckets under quota and cancellation"
+    )]
+    fn put_shard_state(
+        &self,
+        round: u8,
+        s: u32,
+        manifest: &IndexManifest,
+        plan: &ShardPlan,
+        state: ShardState,
+        write_locs: bool,
+        check: &(dyn Fn() -> Result<()> + Sync),
+    ) -> Result<()> {
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                lock_mutex(m).shards.insert((round, s), state);
+                Ok(())
+            }
+            StoreBackend::Disk { dir, quota } => {
+                let (s_key, c_key, loc_key) = self.shard_keys(round, s);
+                let s_path = dir.join(s_key);
+                let c_path = dir.join(c_key);
+                let loc_path = dir.join(loc_key);
+                let (centers_buf, rest) = encode_shard_state(manifest, plan, &state, write_locs)?;
+                let Some((shard_buf, loc_slices)) = rest else {
+                    write_checksummed_bytes(&c_path, &centers_buf, quota, check)?;
+                    return Ok(());
+                };
+                let mut total =
+                    (centers_buf.len() as u64 + 8).saturating_add(shard_buf.len() as u64 + 8);
+                if let Some(locs) = loc_slices.as_ref() {
+                    total = total.saturating_add(Self::indexed_file_bytes(locs));
+                    quota.ensure_headroom(total, &[&s_path, &c_path, &loc_path])?;
+                } else {
+                    quota.ensure_headroom(total, &[&s_path, &c_path])?;
+                }
+                write_checksummed_bytes(&s_path, &shard_buf, quota, check)?;
+                write_checksummed_bytes(&c_path, &centers_buf, quota, check)?;
+                if let Some(locs) = loc_slices {
+                    write_indexed_slices(&loc_path, &locs, None, quota, check)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn write_shard_locations(
+        &self,
+        round: u8,
+        s: u32,
+        manifest: &IndexManifest,
+        plan: &ShardPlan,
+        check: &(dyn Fn() -> Result<()> + Sync),
+    ) -> Result<()> {
+        let StoreBackend::Disk { dir, quota } = &self.inner else {
+            return Ok(());
+        };
+        let state = self.read_shard_state(round, s, manifest, false)?;
+        if state.leaves.is_empty() {
+            return Ok(());
+        }
+        let (_, _, loc_key) = self.shard_keys(round, s);
+        let loc_slices = encode_shard_locations(plan, &state)?;
+        write_indexed_slices(&dir.join(loc_key), &loc_slices, None, quota, check)?;
+        Ok(())
+    }
+
+    fn prepare_memory_locations(&self, leaf_plan: &LeafPlan, plan: &ShardPlan) -> Result<()> {
+        let StoreBackend::Memory(m) = &self.inner else {
+            return Ok(());
+        };
+        let mut g = lock_mutex(m);
+        for s in 0..plan.total_shards {
+            let round = shard_final_round(s, leaf_plan.final_round, plan);
+            let state = g.shards.get(&(round, s)).ok_or_else(corrupt)?;
+            if state.leaves.is_empty() {
+                continue;
+            }
+            let mut buckets = vec![Vec::new(); plan.id_bucket_count() as usize];
+            for (local_l, leaf) in state.leaves.iter().enumerate() {
+                let local_l_u32 = local_l as u32;
+                for &row_idx in &leaf.members {
+                    let id = &state.rows.rows[row_idx].id;
+                    buckets[plan.id_bucket(id) as usize].push((id.clone(), local_l_u32));
+                }
+            }
+            g.locs.insert((round, s), buckets);
+        }
+        Ok(())
+    }
+
+    fn read_shard_centers(
+        &self,
+        round: u8,
+        s: u32,
+        manifest: &IndexManifest,
+    ) -> Result<Vec<(TreeKey, usize, PartitionCentroid)>> {
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                let g = lock_mutex(m);
+                let state = g.shards.get(&(round, s)).ok_or_else(corrupt)?;
+                Ok(state
+                    .leaves
+                    .iter()
+                    .map(|l| (l.tree_key.clone(), l.members.len(), l.centroid.clone()))
+                    .collect())
+            }
+            StoreBackend::Disk { dir, .. } => {
+                let (_, c_key, _) = self.shard_keys(round, s);
+                decode_shard_centers(&read_checksummed_bytes(&dir.join(c_key))?, manifest)
+            }
+        }
+    }
+
+    fn read_shard_state(
+        &self,
+        round: u8,
+        s: u32,
+        manifest: &IndexManifest,
+        consume_in_memory: bool,
+    ) -> Result<ShardState> {
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                let mut g = lock_mutex(m);
+                if consume_in_memory {
+                    g.shards.remove(&(round, s)).ok_or_else(corrupt)
+                } else {
+                    g.shards.get(&(round, s)).cloned().ok_or_else(corrupt)
+                }
+            }
+            StoreBackend::Disk { dir, .. } => {
+                let (s_key, c_key, _) = self.shard_keys(round, s);
+                let centers_raw = read_checksummed_bytes(&dir.join(c_key))?;
+                let s_path = dir.join(s_key);
+                let shard_raw = if s_path.exists() {
+                    Some(read_checksummed_bytes(&s_path)?)
+                } else {
+                    None
+                };
+                decode_shard_state(&centers_raw, shard_raw.as_deref(), manifest)
+            }
+        }
+    }
+
+    fn put_outbound_rows(
+        &self,
+        round: u8,
+        donor_shard: u32,
+        heavy_shards: u32,
+        manifest: &IndexManifest,
+        moved_out: &BTreeMap<usize, (u32, u32)>,
+        check: &(dyn Fn() -> Result<()> + Sync),
+    ) -> Result<()> {
+        let has_cross_shard = moved_out
+            .values()
+            .any(|&(dst_shard, _)| dst_shard != donor_shard);
+        if !has_cross_shard {
+            return Ok(());
+        }
+        let donor = self.read_shard_state(round, donor_shard, manifest, false)?;
+        let mut slices: Vec<Vec<DonorRow>> = vec![Vec::new(); heavy_shards as usize];
+        for (&src_row_idx, &(dst_shard, dst_local_leaf)) in moved_out {
+            if dst_shard == donor_shard {
+                continue;
+            }
+            let meta = donor
+                .rows
+                .rows
+                .get(src_row_idx)
+                .ok_or_else(corrupt)?
+                .clone();
+            let vec = donor.rows.vector(meta.vec_slot).to_vec();
+            slices
+                .get_mut(dst_shard as usize)
+                .ok_or_else(corrupt)?
+                .push((dst_local_leaf, meta, vec));
+        }
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                lock_mutex(m).outbound.insert((round, donor_shard), slices);
+                Ok(())
+            }
+            StoreBackend::Disk { dir, quota } => {
+                let (raw_slices, counts) = encode_outbound_slices(manifest, &slices)?;
+                write_indexed_slices(
+                    &dir.join(self.out_key(round, donor_shard)),
+                    &raw_slices,
+                    Some(&counts),
+                    quota,
+                    check,
+                )?;
+                Ok(())
+            }
+        }
+    }
+
+    fn take_outbound_slice(
+        &self,
+        round: u8,
+        donor_shard: u32,
+        dst_shard: u32,
+        manifest: &IndexManifest,
+        out: &mut Vec<DonorRow>,
+    ) -> Result<()> {
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                let mut g = lock_mutex(m);
+                let slices = g
+                    .outbound
+                    .get_mut(&(round, donor_shard))
+                    .ok_or_else(corrupt)?;
+                let slot = slices.get_mut(dst_shard as usize).ok_or_else(corrupt)?;
+                out.extend(std::mem::take(slot));
+                Ok(())
+            }
+            StoreBackend::Disk { dir, .. } => {
+                let path = dir.join(self.out_key(round, donor_shard));
+                if let Some(raw) = read_indexed_slice(&path, dst_shard as usize, MAX_TOTAL_SHARDS)?
+                {
+                    decode_outbound_slice(&raw, manifest, out)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn take_shard_locations(
+        &self,
+        round: u8,
+        s: u32,
+        bucket: usize,
+        shard_assigned: &[AssignedLeafKey],
+        trees: &[TreePlanEntry],
+        out: &mut Vec<RecordLocationEntry>,
+    ) -> Result<()> {
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                let taken = {
+                    let mut g = lock_mutex(m);
+                    let buckets = g.locs.get_mut(&(round, s)).ok_or_else(corrupt)?;
+                    let slot = buckets.get_mut(bucket).ok_or_else(corrupt)?;
+                    std::mem::take(slot)
+                };
+                for (id, local_leaf) in taken {
+                    let ak = shard_assigned
+                        .get(local_leaf as usize)
+                        .ok_or_else(corrupt)?;
+                    let tk = &trees.get(ak.tree_id as usize).ok_or_else(corrupt)?.tree_key;
+                    out.push((id, tk.clone(), ak.partition_key));
+                }
+                Ok(())
+            }
+            StoreBackend::Disk { dir, .. } => {
+                let (_, _, loc_key) = self.shard_keys(round, s);
+                if let Some(raw) = read_indexed_slice(&dir.join(loc_key), bucket, MAX_TOTAL_SHARDS)?
+                {
+                    decode_locations_slice(&raw, shard_assigned, trees, out)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn put_proposals(
+        &self,
+        round: u8,
+        s: u32,
+        proposals: Vec<MoveProposal>,
+        check: &(dyn Fn() -> Result<()> + Sync),
+    ) -> Result<()> {
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                lock_mutex(m).proposals.insert((round, s), proposals);
+                Ok(())
+            }
+            StoreBackend::Disk { dir, quota } => {
+                write_checksummed_bytes(
+                    &dir.join(self.prop_key(round, s)),
+                    &encode_proposals(&proposals)?,
+                    quota,
+                    check,
+                )?;
+                Ok(())
+            }
+        }
+    }
+
+    fn read_proposals(&self, round: u8, s: u32) -> Result<Vec<MoveProposal>> {
+        match &self.inner {
+            StoreBackend::Memory(m) => lock_mutex(m)
+                .proposals
+                .get(&(round, s))
+                .cloned()
+                .ok_or_else(corrupt),
+            StoreBackend::Disk { dir, .. } => {
+                decode_proposals(&read_checksummed_bytes(&dir.join(self.prop_key(round, s)))?)
+            }
+        }
+    }
+
+    fn load_leaf_plan(
+        &self,
+        coarse_shards: u32,
+        tree_buckets: u32,
+        manifest: &IndexManifest,
+    ) -> Result<Option<LeafPlan>> {
+        let StoreBackend::Disk { dir, .. } = &self.inner else {
+            return Ok(None);
+        };
+        let path = dir.join(self.leafkeys_key());
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(decode_leaf_keys_plan(
+            &read_checksummed_bytes(&path)?,
+            coarse_shards,
+            tree_buckets,
+            manifest,
+        )?))
+    }
+
+    fn save_leaf_plan(
+        &self,
+        leaf_plan: &LeafPlan,
+        tree_buckets: u32,
+        check: &(dyn Fn() -> Result<()> + Sync),
+    ) -> Result<()> {
+        let StoreBackend::Disk { dir, quota } = &self.inner else {
+            return Ok(());
+        };
+        write_checksummed_bytes(
+            &dir.join(self.leafkeys_key()),
+            &encode_leaf_keys_plan(leaf_plan, tree_buckets)?,
+            quota,
+            check,
+        )?;
+        Ok(())
+    }
+
+    async fn remove_disk_files<B: Backend>(
+        &self,
+        env: &StageEnv<B>,
+        lock: &Arc<File>,
+        keys: Vec<String>,
+    ) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let StoreBackend::Disk { dir, quota } = &self.inner else {
+            return Ok(());
+        };
+        let dir = dir.clone();
+        let quota = Arc::clone(quota);
+        let guard = Arc::clone(lock);
+        env.spawn_cpu(move |_ctrl| {
+            let _lock = guard;
+            for name in keys {
+                let p = dir.join(name);
+                match fs::remove_file(&p) {
+                    Ok(()) => quota.release_path(&p),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        quota.release_path(&p);
+                    }
+                    Err(_) => {}
+                }
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn reclaim_scatter_ids<B: Backend>(
+        &self,
+        env: &StageEnv<B>,
+        lock: &Arc<File>,
+        scatter_units: u32,
+    ) -> Result<()> {
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                lock_mutex(m).scatter_ids.clear();
+                Ok(())
+            }
+            StoreBackend::Disk { .. } => {
+                self.remove_disk_files(
+                    env,
+                    lock,
+                    (0..scatter_units).map(|run| self.ids_key(run)).collect(),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn reclaim_scatter_vecs<B: Backend>(
+        &self,
+        env: &StageEnv<B>,
+        lock: &Arc<File>,
+        scatter_units: u32,
+    ) -> Result<()> {
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                lock_mutex(m).scatter_shards.clear();
+                Ok(())
+            }
+            StoreBackend::Disk { .. } => {
+                self.remove_disk_files(
+                    env,
+                    lock,
+                    (0..scatter_units).map(|run| self.vec_key(run)).collect(),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn reclaim_round_proposals<B: Backend>(
+        &self,
+        env: &StageEnv<B>,
+        lock: &Arc<File>,
+        round: u8,
+        heavy_shards: u32,
+    ) -> Result<()> {
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                lock_mutex(m).proposals.retain(|&(r, _), _| r != round);
+                Ok(())
+            }
+            StoreBackend::Disk { .. } => {
+                let keys = (0..heavy_shards).map(|s| self.prop_key(round, s)).collect();
+                self.remove_disk_files(env, lock, keys).await
+            }
+        }
+    }
+
+    async fn reclaim_round<B: Backend>(
+        &self,
+        env: &StageEnv<B>,
+        lock: &Arc<File>,
+        round: u8,
+        heavy_shards: u32,
+    ) -> Result<()> {
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                let mut g = lock_mutex(m);
+                g.shards.retain(|&(r, _), _| r != round);
+                g.proposals.retain(|&(r, _), _| r != round);
+                g.outbound.retain(|&(r, _), _| r != round);
+                Ok(())
+            }
+            StoreBackend::Disk { .. } => {
+                let mut obsolete = Vec::with_capacity((heavy_shards as usize) * 4);
+                for s in 0..heavy_shards {
+                    let (sk, ck, _) = self.shard_keys(round, s);
+                    obsolete.extend([sk, ck, self.prop_key(round, s), self.out_key(round, s)]);
+                }
+                self.remove_disk_files(env, lock, obsolete).await
+            }
+        }
+    }
+
+    async fn reclaim_emit_records<B: Backend>(
+        &self,
+        env: &StageEnv<B>,
+        lock: &Arc<File>,
+        id_buckets: u32,
+        leaf_plan: &LeafPlan,
+        plan: &ShardPlan,
+    ) -> Result<()> {
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                let mut g = lock_mutex(m);
+                g.id_refs.clear();
+                g.locs.clear();
+                Ok(())
+            }
+            StoreBackend::Disk { .. } => {
+                let mut obsolete =
+                    Vec::with_capacity(id_buckets as usize + leaf_plan.assigned.len());
+                for b in 0..id_buckets {
+                    obsolete.push(self.idref_key(b));
+                }
+                for (s, keys) in leaf_plan.assigned.iter().enumerate() {
+                    if !keys.is_empty() {
+                        let r_use = shard_final_round(s as u32, leaf_plan.final_round, plan);
+                        obsolete.push(self.shard_keys(r_use, s as u32).2);
+                    }
+                }
+                self.remove_disk_files(env, lock, obsolete).await
+            }
+        }
+    }
+
+    async fn reclaim_final_shards<B: Backend>(
+        &self,
+        env: &StageEnv<B>,
+        lock: &Arc<File>,
+        leaf_plan: &LeafPlan,
+        plan: &ShardPlan,
+    ) -> Result<()> {
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                lock_mutex(m).shards.clear();
+                Ok(())
+            }
+            StoreBackend::Disk { .. } => {
+                let mut obsolete = Vec::with_capacity((plan.total_shards as usize) * 2);
+                for s in 0..plan.total_shards {
+                    let r_use = shard_final_round(s, leaf_plan.final_round, plan);
+                    let (sk, ck, _) = self.shard_keys(r_use, s);
+                    obsolete.push(sk);
+                    obsolete.push(ck);
+                }
+                self.remove_disk_files(env, lock, obsolete).await
+            }
+        }
+    }
+}
+
+/// Initializes and drives a pure CPU/workspace `BuildUnit` stage while holding the shared workspace lock.
+async fn drive_cpu_stage<B, F>(
+    env: &StageEnv<B>,
+    lock: &Arc<File>,
+    stage: u8,
+    unit_count: u32,
+    concurrency: usize,
+    work: F,
+) -> Result<Vec<BuildUnit>>
+where
+    B: Backend,
+    F: Fn(u32, &IndexManifest, &(dyn Fn() -> Result<()> + Sync)) -> Result<UnitOutput>
+        + Send
+        + Sync
+        + 'static,
+{
+    if unit_count == 0 {
+        return Ok(Vec::new());
+    }
+    if !env.persists_units() {
+        let manifest = env.manifest.clone();
+        let guard = Arc::clone(lock);
+        let epoch = env.fence.epoch();
+        let workers = concurrency.max(1).min(unit_count as usize);
+        return env
+            .spawn_cpu(move |ctrl| {
+                let _lock = guard;
+                let check = || crate::runtime::check_control(&ctrl);
+                let units: Vec<u32> = (0..unit_count).collect();
+                let batches = parallel_chunks(&units, workers, |_, chunk| {
+                    let mut out = Vec::with_capacity(chunk.len());
+                    for &u in chunk {
+                        check()?;
+                        let uo = work(u, &manifest, &check)?;
+                        out.push(uo.into_completed(epoch, [0; 32]));
+                    }
+                    Ok(out)
+                })?;
+                Ok(batches.into_iter().flatten().collect())
+            })
+            .await;
+    }
+
+    init_stage_units(env, stage, unit_count).await?;
+    let work = Arc::new(work);
+    let env_outer = env.clone();
+    let lock_outer = Arc::clone(lock);
+    drive_stage(env, stage, unit_count, concurrency, move |unit, _lease| {
+        let env_c = env_outer.clone();
+        let guard = Arc::clone(&lock_outer);
+        let work_c = Arc::clone(&work);
+        async move {
+            let manifest = env_c.manifest.clone();
+            env_c
+                .spawn_cpu(move |ctrl| {
+                    let _lock = guard;
+                    let check = || crate::runtime::check_control(&ctrl);
+                    work_c(unit, &manifest, &check)
+                })
+                .await
+        }
+    })
+    .await
+}
+
+fn prune_stale_epoch_files(dir: &Path, epoch: u64) -> Result<()> {
+    let entries = match fs::read_dir(dir) {
+        Ok(it) => it,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(io_error(e)),
+    };
+    let epoch_tag = format!("-e{epoch}-");
+    let plan_name = format!("plan-e{epoch}.bin");
+    let leafkeys_name = format!("leafkeys-e{epoch}.bin");
+    for entry in entries {
+        let entry = entry.map_err(io_error)?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name == ".ktann-build-lock"
+            || name == plan_name
+            || name == leafkeys_name
+            || name.contains(&epoch_tag)
+        {
+            continue;
+        }
+        let _ = fs::remove_file(path);
+    }
+    Ok(())
+}
+
+/// Executes the unified sharded Bulk Build pipeline over `StageStore::Memory` or `StageStore::Disk`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "pipeline entry binds context, manifest, descriptor, workspace state, writer fence, storage mode, root lock, and retry policy"
+)]
+pub(crate) async fn run_pipeline<B: Backend>(
+    context: &mut OperationContext<B>,
+    index: &IndexManifest,
+    descriptor: &BuildDescriptor,
+    state: &BuildWorkspace,
+    fence: WriteFence,
+    in_memory: bool,
+    lock: Arc<File>,
+    retry: RetryPolicy,
+) -> Result<BulkBuildReport> {
+    let mut report = BulkBuildReport {
+        in_memory_mode: in_memory,
+        rotation_seed: *index.rotation_seed(),
+        ..BulkBuildReport::default()
+    };
+    let parallelism = state.options.parallelism.max(1);
+    let budget = effective_budget(context.backend().admission_budget(), state.options.load)?;
+    let effective_mem = state.options.memory_bytes;
+    let quota = Arc::new(ScratchQuota::new(
+        state.options.scratch_bytes,
+        state.options.distributed_workers > 1,
+    ));
+    let work_dir = state.directory();
+    let hard_limits = state.hard_limits;
+    let graph_memory_bytes = state.options.graph_memory_bytes;
+    let ep = fence.epoch;
+
+    if ep > 1 && state.options.distributed_workers == 1 {
+        clear_stale_serving_data(context, index, fence, budget, retry).await?;
+    }
+
+    // 1. Open InputSnapshot and build or load deterministic `ShardPlan`.
+    let plan_start = Instant::now();
+    let (snapshot, plan) = {
+        let desc = descriptor.clone();
+        let manifest = index.clone();
+        let dir = work_dir.clone();
+        let single_worker = state.options.distributed_workers == 1;
+        let guard = Arc::clone(&lock);
+        let quota_c = Arc::clone(&quota);
+        context
+            .compute(move |control| {
+                let _lock = guard;
+                let check = || crate::runtime::check_control(control);
+                if !in_memory {
+                    if single_worker {
+                        prune_stale_epoch_files(&dir, ep)?;
+                    }
+                    quota_c.seed_existing(&dir)?;
+                }
+                let snap = InputSnapshot::open(
+                    desc.source(),
+                    manifest.config().clone(),
+                    desc.input().clone(),
+                )?;
+                let sample_items = desc.options().sample_items;
+                let plan = if in_memory {
+                    ShardPlan::build(&snap, &manifest, sample_items, effective_mem, &check)?
+                } else {
+                    let plan_path = dir.join(format!("plan-e{ep}.bin"));
+                    if plan_path.exists() {
+                        let row_bytes = manifest
+                            .config()
+                            .dimension()
+                            .saturating_mul(4)
+                            .saturating_add(128);
+                        if effective_mem < row_bytes.saturating_mul(16) {
+                            return Err(Error::new(ErrorKind::LimitExceeded));
+                        }
+                        ShardPlan::load(&plan_path, &manifest, snap.manifest().items(), &check)?
+                    } else {
+                        let built = ShardPlan::build(
+                            &snap,
+                            &manifest,
+                            sample_items,
+                            effective_mem,
+                            &check,
+                        )?;
+                        built.save(&plan_path, &quota_c, &check)?;
+                        built
+                    }
+                };
+                Ok((snap, plan))
+            })
+            .await?
+    };
+    report.plan = plan_start.elapsed();
+
+    if let Some(rounds) = descriptor.refinement_rounds() {
+        let per_leaf = refinement_per_leaf_bytes(index.config().dimension(), rounds);
+        if effective_mem < per_leaf.saturating_mul(2) {
+            return Err(Error::new(ErrorKind::LimitExceeded));
+        }
+    }
+
+    if snapshot.manifest().items() == 0 {
+        seal_loaded(
+            context,
+            index,
+            fence,
+            SealedSummary::default(),
+            Vec::new(),
+            retry,
+        )
+        .await?;
+        report.scratch_written_bytes = quota.written();
+        report.peak_scratch_bytes = quota.peak();
+        return Ok(report);
+    }
+
+    let id_buckets = plan.id_bucket_count();
+    let coarse_shards = plan.total_shards;
+    let heavy_shards = plan.light_shard_start;
+    let tree_buckets = id_buckets.clamp(1, 64);
+    let refinement_rounds = descriptor.refinement_rounds();
+    let sample_items = descriptor.options().sample_items;
+
+    let store = Arc::new(if in_memory {
+        StageStore::memory(ep)
+    } else {
+        StageStore::disk(ep, work_dir, Arc::clone(&quota))
+    });
+
+    let writer_lanes = if state.options.distributed_workers > 1
+        || context.backend().capabilities().transactional_clear_range
+    {
+        parallelism.clamp(1, 8)
+    } else {
+        1
+    };
+
+    let env = StageEnv {
+        backend: context.backend(),
+        control: context.options.clone(),
+        bulk_authority: context.bulk_authority,
+        sched_lease_lock: context.bulk_lease_lock.clone(),
+        distributed_workers: state.options.distributed_workers,
+        writer_lanes,
+        commit_sem: Arc::new(Semaphore::new(writer_lanes)),
+        admission: context.cpu_keep_alive(),
+        manifest: index.clone(),
+        fence: StageFence::Write(fence),
+        unit_lease: state.options.unit_lease,
+        budget,
+        retry,
+    };
+
+    let seg_mem_est = (16_384_usize)
+        .saturating_mul(index.config().dimension() * 4 + 256)
+        .max(1);
+    let scatter_conc = if in_memory {
+        parallelism.min(16)
+    } else {
+        (effective_mem / seg_mem_est).clamp(1, parallelism.min(8))
+    };
+    let seg_count = snapshot.segments().len();
+    let max_segs_by_mem = (effective_mem / scatter_conc.max(1) / seg_mem_est).clamp(1, 32);
+    let segs_per_run = seg_count.div_ceil(2_048).max(1).min(max_segs_by_mem);
+    let scatter_units = u32::try_from(seg_count.div_ceil(segs_per_run))
+        .map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
+
+    let leaf_conc = (effective_mem / (96 * 1024 * 1024))
+        .clamp(1, parallelism.min(8))
+        .min(coarse_shards.max(1) as usize);
+    let emit_conc = if in_memory || state.options.distributed_workers > 1 {
+        parallelism.min(8)
+    } else {
+        (effective_mem / (64 * 1024 * 1024)).clamp(1, parallelism.min(8))
+    };
+
+    let cached_leaf_plan = if store.is_disk() {
+        let store_c = Arc::clone(&store);
+        let manifest_c = env.manifest.clone();
+        let guard = Arc::clone(&lock);
+        env.spawn_cpu(move |_ctrl| {
+            let _lock = guard;
+            store_c.load_leaf_plan(coarse_shards, tree_buckets, &manifest_c)
+        })
+        .await?
+    } else {
+        None
+    };
+
+    let leaf_plan = if let Some(loaded) = cached_leaf_plan {
+        loaded
+    } else {
+        // 2. Stage 1: Scatter input segments into Coarse Shards and Record-ID buckets.
+        let ingest_start = Instant::now();
+        let scatter_done =
+            drive_cpu_stage(&env, &lock, STAGE_SCATTER, scatter_units, scatter_conc, {
+                let store_c = Arc::clone(&store);
+                let snap_c = snapshot.clone();
+                let plan_c = plan.clone();
+                move |unit, manifest, check| {
+                    let seg_start = (unit as usize) * segs_per_run;
+                    let seg_end = (seg_start + segs_per_run).min(seg_count);
+                    let seg = ingest_segment_range(
+                        &snap_c,
+                        seg_start..seg_end,
+                        manifest,
+                        &plan_c,
+                        hard_limits,
+                        check,
+                    )?;
+                    let records = seg.records;
+                    let id_lthash = seg.id_lthash;
+                    store_c.put_scatter_run(unit, manifest, seg, check)?;
+                    Ok(UnitOutput {
+                        records,
+                        aux_lthash: id_lthash,
+                        ..UnitOutput::default()
+                    })
+                }
+            })
+            .await?;
+
+        let scatter_records: u64 = scatter_done.iter().map(|u| u.records).sum();
+        let mut scatter_id_lt = LtHash::ZERO;
+        for u in &scatter_done {
+            scatter_id_lt.add_assign(u.aux_lthash);
+        }
+        report.ingest = ingest_start.elapsed();
+
+        // 3. Stage 2 (Global ID Dedup) & Stage 3 (Sharded Leaf Construction + Light-Shard Refinement).
+        let construct_start = Instant::now();
+        let dedup_done = drive_cpu_stage(&env, &lock, STAGE_DEDUP, id_buckets, parallelism, {
+            let store_c = Arc::clone(&store);
+            move |b, _manifest, check| {
+                let mut ids = Vec::new();
+                for run in 0..scatter_units {
+                    if run.is_multiple_of(32) {
+                        check()?;
+                    }
+                    store_c.take_id_bucket(run, b as usize, &mut ids)?;
+                }
+                let (count, hash, sorted) = verify_id_bucket(ids)?;
+                store_c.put_id_refs(b, sorted, check)?;
+                Ok(UnitOutput {
+                    records: count,
+                    aux_lthash: hash,
+                    ..UnitOutput::default()
+                })
+            }
+        })
+        .await?;
+
+        let dedup_records: u64 = dedup_done.iter().map(|u| u.records).sum();
+        let mut dedup_id_lt = LtHash::ZERO;
+        for u in &dedup_done {
+            dedup_id_lt.add_assign(u.aux_lthash);
+        }
+        if scatter_records != dedup_records || scatter_id_lt != dedup_id_lt {
+            return Err(corrupt());
+        }
+        store
+            .reclaim_scatter_ids(&env, &lock, scatter_units)
+            .await?;
+
+        init_stage_units(&env, STAGE_LEAVES, coarse_shards).await?;
+        if !is_stage_complete(&env, STAGE_LEAVES, coarse_shards).await?
+            && !(env.distributed_workers > 1 && store.has_leaf_plan())
+        {
+            let run_sources = {
+                let store_c = Arc::clone(&store);
+                let manifest_c = env.manifest.clone();
+                let plan_c = plan.clone();
+                let guard = Arc::clone(&lock);
+                env.spawn_cpu(move |ctrl| {
+                    let _lock = guard;
+                    compute_non_empty_runs_by_shard(
+                        &store_c,
+                        scatter_units,
+                        coarse_shards,
+                        &manifest_c,
+                        &plan_c,
+                        &ctrl,
+                    )
+                })
+                .await
+            };
+            let run_sources = match run_sources {
+                Ok(v) => Some(Arc::new(v)),
+                Err(_)
+                    if env.distributed_workers > 1
+                        && (is_stage_complete(&env, STAGE_LEAVES, coarse_shards).await?
+                            || store.has_leaf_plan()) =>
+                {
+                    None
+                }
+                Err(e) => return Err(e),
+            };
+            if let Some(sources) = run_sources {
+                let light_per_worker_mem = effective_mem / leaf_conc.max(1);
+                drive_cpu_stage(&env, &lock, STAGE_LEAVES, coarse_shards, leaf_conc, {
+                    let store_c = Arc::clone(&store);
+                    let plan_c = plan.clone();
+                    move |s, manifest, check| {
+                        let mut rows = ShardRows::new(manifest.config().dimension());
+                        for (idx, (run, src_shards)) in sources[s as usize].iter().enumerate() {
+                            if idx.is_multiple_of(32) {
+                                check()?;
+                            }
+                            for &src_s in src_shards {
+                                store_c
+                                    .take_scatter_shard_rows(*run, src_s, manifest, &mut rows)?;
+                            }
+                        }
+                        let base_count = rows.rows.len() as u64;
+                        let mut shard_state = if base_count == 0 {
+                            ShardState {
+                                rows,
+                                leaves: Vec::new(),
+                            }
+                        } else {
+                            build_shard_leaves(manifest, sample_items, rows, check)?
+                        };
+                        if let Some(rounds) = refinement_rounds
+                            && s >= plan_c.light_shard_start
+                        {
+                            refine_single_light_shard(
+                                manifest,
+                                &mut shard_state,
+                                rounds,
+                                light_per_worker_mem,
+                                check,
+                            )?;
+                        }
+                        let leaf_count = shard_state.leaves.len() as u64;
+                        let write_locs =
+                            s >= plan_c.light_shard_start || refinement_rounds.unwrap_or(0) == 0;
+                        store_c.put_shard_state(
+                            0,
+                            s,
+                            manifest,
+                            &plan_c,
+                            shard_state,
+                            write_locs,
+                            check,
+                        )?;
+                        Ok(UnitOutput {
+                            records: base_count,
+                            aux_count: leaf_count,
+                            ..UnitOutput::default()
+                        })
+                    }
+                })
+                .await?;
+                store
+                    .reclaim_scatter_vecs(&env, &lock, scatter_units)
+                    .await?;
+            }
+        }
+        report.construct = construct_start.elapsed();
+
+        // 4. Optional Bounded-Halo Refinement across heavy-tree shards (`0..heavy_shards`).
+        let mut final_round = 0_u8;
+        let rounds = refinement_rounds.unwrap_or(0);
+        if refinement_rounds.is_some() && heavy_shards > 0 {
+            let refine_start = Instant::now();
+            final_round = run_halo_refinement(
+                &env,
+                &store,
+                &lock,
+                &plan,
+                rounds,
+                effective_mem,
+                parallelism,
+                leaf_conc,
+            )
+            .await?;
+            report.refine = refine_start.elapsed();
+        }
+
+        let lp = finalize_leaf_plan(
+            &env,
+            &store,
+            &lock,
+            scatter_records,
+            final_round,
+            &plan,
+            tree_buckets,
+        )
+        .await?;
+        if refinement_rounds.is_some_and(|rds| lp.final_round < rds) && heavy_shards > 0 {
+            store
+                .reclaim_round_proposals(&env, &lock, lp.final_round, heavy_shards)
+                .await?;
+        }
+        lp
+    };
+
+    // 5. Emit serving KVs in ascending keyspace order:
+    //    `STAGE_EMIT_RECORDS ([0x01])` -> `STAGE_EMIT_TREES ([0x03/0x04])` -> `STAGE_EMIT_LEAVES ([0x04])`.
+    let emit_start = Instant::now();
+    let leaf_partitions: u64 = leaf_plan.trees.iter().map(|t| t.total_leaves).sum();
+    let leaf_plan = Arc::new(leaf_plan);
+
+    let avg_rec_bytes = ((snapshot.manifest().bytes() / snapshot.manifest().items().max(1))
+        as usize)
+        .saturating_add(128)
+        .max(128);
+    let per_emit_worker_mem = effective_mem / emit_conc.max(1);
+    let max_records_per_subbatch =
+        (per_emit_worker_mem / 2 / avg_rec_bytes).clamp(16, if in_memory { 16_384 } else { 4_096 });
+    if in_memory {
+        let store_c = Arc::clone(&store);
+        let lp_c = Arc::clone(&leaf_plan);
+        let plan_c = plan.clone();
+        env.spawn_cpu(move |_ctrl| store_c.prepare_memory_locations(&lp_c, &plan_c))
+            .await?;
+    } else if !env.persists_units() {
+        advance_loading_progress(
+            env.backend.as_ref(),
+            &env.control,
+            env.sched_lease_lock.as_deref(),
+            env.bulk_authority,
+            &env.manifest,
+            fence,
+            0,
+            Some(env.retry),
+        )
+        .await?;
+    }
+    init_stage_units(&env, STAGE_EMIT_RECORDS, id_buckets).await?;
+    let rec_emit_done = drive_stage(&env, STAGE_EMIT_RECORDS, id_buckets, emit_conc, {
+        let env = env.clone();
+        let store_c = Arc::clone(&store);
+        let snapshot = snapshot.clone();
+        let leaf_plan_c = Arc::clone(&leaf_plan);
+        let plan_c = plan.clone();
+        let lock = Arc::clone(&lock);
+        move |b, u_lease| {
+            let env_c = env.clone();
+            let store_u = Arc::clone(&store_c);
+            let snap_c = snapshot.clone();
+            let lp_c = Arc::clone(&leaf_plan_c);
+            let plan_u = plan_c.clone();
+            let guard = Arc::clone(&lock);
+            async move {
+                let (mut id_refs, mut locs) = env_c
+                    .spawn_cpu({
+                        let guard_init = Arc::clone(&guard);
+                        move |ctrl| {
+                            let _lock = guard_init;
+                            let check = || crate::runtime::check_control(&ctrl);
+                            let id_refs = store_u.take_id_refs(b)?;
+                            let mut locs: Vec<RecordLocationEntry> =
+                                Vec::with_capacity(id_refs.len());
+                            for (s, shard_keys) in lp_c.assigned.iter().enumerate() {
+                                if shard_keys.is_empty() {
+                                    continue;
+                                }
+                                if s.is_multiple_of(64) {
+                                    check()?;
+                                }
+                                let r_use = shard_final_round(s as u32, lp_c.final_round, &plan_u);
+                                store_u.take_shard_locations(
+                                    r_use,
+                                    s as u32,
+                                    b as usize,
+                                    shard_keys,
+                                    &lp_c.trees,
+                                    &mut locs,
+                                )?;
+                            }
+                            if id_refs.len() != locs.len() {
+                                return Err(corrupt());
+                            }
+                            locs.sort_unstable_by(|x, y| x.0.cmp(&y.0));
+                            Ok((id_refs, locs))
+                        }
+                    })
+                    .await?;
+
+                let loc_count = locs.len() as u64;
+                let mut total_kv_count = 0_u64;
+                let mut total_kv_lt = LtHash::ZERO;
+                let mut total_loc_lt = LtHash::ZERO;
+
+                while !id_refs.is_empty() {
+                    let take_n = id_refs.len().min(max_records_per_subbatch);
+                    let sub_refs: Vec<_> = id_refs.drain(..take_n).collect();
+                    let sub_locs: Vec<_> = locs.drain(..take_n).collect();
+                    let snap_sub = snap_c.clone();
+                    let guard_sub = Arc::clone(&guard);
+                    let manifest_sub = env_c.manifest.clone();
+                    let (kvs, kv_lt, loc_lt) = env_c
+                        .spawn_cpu(move |ctrl| {
+                            let _lock = guard_sub;
+                            let check = || crate::runtime::check_control(&ctrl);
+                            let mut seg_reader = snap_sub.frame_reader();
+                            encode_record_group_bucket(
+                                &manifest_sub,
+                                &mut seg_reader,
+                                sub_refs,
+                                sub_locs,
+                                hard_limits,
+                                &check,
+                            )
+                        })
+                        .await?;
+                    total_kv_count += kvs.len() as u64;
+                    total_kv_lt.add_assign(kv_lt);
+                    total_loc_lt.add_assign(loc_lt);
+                    env_c.commit_unit_kvs(u_lease.as_ref(), kvs).await?;
+                }
+
+                Ok(UnitOutput {
+                    records: loc_count,
+                    kv_count: total_kv_count,
+                    aux_count: 0,
+                    kv_lthash: total_kv_lt,
+                    aux_lthash: total_loc_lt,
+                    aux2_lthash: LtHash::ZERO,
+                })
+            }
+        }
+    })
+    .await?;
+
+    store
+        .reclaim_emit_records(&env, &lock, id_buckets, &leaf_plan, &plan)
+        .await?;
+
+    // Stage 31: Build and emit Upper Trees + Partition-Local HNSW graphs (`[0x03]` + `[0x04]`).
+    let min_graph_thread_mem = (16 * 1024 * 1024).min(graph_memory_bytes.max(1));
+    let max_graph_concurrency = (graph_memory_bytes / min_graph_thread_mem).clamp(1, parallelism);
+    let tree_conc = max_graph_concurrency
+        .min(4)
+        .min(tree_buckets as usize)
+        .max(1);
+    let graph_threads = (max_graph_concurrency / tree_conc).max(1);
+    let per_thread_graph_mem = (graph_memory_bytes / (tree_conc * graph_threads).max(1)).max(1);
+
+    init_stage_units(&env, STAGE_EMIT_TREES, tree_buckets).await?;
+    let tree_emit_done = drive_stage(&env, STAGE_EMIT_TREES, tree_buckets, tree_conc, {
+        let env = env.clone();
+        let store_c = Arc::clone(&store);
+        let leaf_plan_c = Arc::clone(&leaf_plan);
+        let plan_c = plan.clone();
+        let lock = Arc::clone(&lock);
+        move |tb, u_lease| {
+            let env_c = env.clone();
+            let store_u = Arc::clone(&store_c);
+            let lp_c = Arc::clone(&leaf_plan_c);
+            let plan_u = plan_c.clone();
+            let guard = Arc::clone(&lock);
+            async move {
+                let mut bucket_trees: Vec<UpperTreeBucket> = env_c
+                    .spawn_cpu({
+                        let manifest = env_c.manifest.clone();
+                        let guard_load = Arc::clone(&guard);
+                        move |ctrl| {
+                            let _lock = guard_load;
+                            let check = || crate::runtime::check_control(&ctrl);
+                            let mut by_key: BTreeMap<Bytes, UpperTreeBucket> = BTreeMap::new();
+                            for t in &lp_c.trees {
+                                if t.tree_bucket == tb {
+                                    by_key.insert(
+                                        Bytes::copy_from_slice(t.tree_key.as_bytes()),
+                                        (t.tree_key.clone(), t.total_leaves, Vec::new()),
+                                    );
+                                }
+                            }
+                            if by_key.is_empty() {
+                                return Ok(Vec::new());
+                            }
+                            for (s, shard_keys) in lp_c.assigned.iter().enumerate() {
+                                if !shard_keys.iter().any(|ak| {
+                                    !ak.is_single_leaf_root
+                                        && lp_c.trees[ak.tree_id as usize].tree_bucket == tb
+                                }) {
+                                    continue;
+                                }
+                                check()?;
+                                let r_use = shard_final_round(s as u32, lp_c.final_round, &plan_u);
+                                let centers =
+                                    store_u.read_shard_centers(r_use, s as u32, &manifest)?;
+                                if centers.len() != shard_keys.len() {
+                                    return Err(corrupt());
+                                }
+                                for ((tk, _, centroid), ak) in centers.into_iter().zip(shard_keys) {
+                                    if !ak.is_single_leaf_root
+                                        && lp_c.trees[ak.tree_id as usize].tree_bucket == tb
+                                    {
+                                        by_key
+                                            .get_mut(tk.as_bytes())
+                                            .ok_or_else(corrupt)?
+                                            .2
+                                            .push((ak.partition_key, centroid));
+                                    }
+                                }
+                            }
+                            for (_, total_l, children) in by_key.values() {
+                                if *total_l > 1 && children.len() as u64 != *total_l {
+                                    return Err(corrupt());
+                                }
+                            }
+                            Ok(by_key.into_values().collect())
+                        }
+                    })
+                    .await?;
+
+                if bucket_trees.is_empty() {
+                    return Ok(UnitOutput::default());
+                }
+
+                let trees_n = bucket_trees.len() as u64;
+                let mut total_kv_count = 0_u64;
+                let mut internal_parts = 0_u64;
+                let mut kv_lt = LtHash::ZERO;
+                let mut def_lt = LtHash::ZERO;
+                let mut ref_lt = LtHash::ZERO;
+
+                while !bucket_trees.is_empty() {
+                    let mut wave_leaves = 0_u64;
+                    let mut take_trees = 0_usize;
+                    for (_, total_l, _) in &bucket_trees {
+                        if take_trees > 0 && (take_trees >= 512 || wave_leaves + total_l > 4_096) {
+                            break;
+                        }
+                        wave_leaves = wave_leaves.saturating_add(*total_l);
+                        take_trees += 1;
+                    }
+                    let mut wave: Vec<UpperTreeBucket> = bucket_trees.drain(..take_trees).collect();
+
+                    if wave.len() == 1 && wave[0].1 > 8_192 {
+                        let (tk, total_l, children) = wave.pop().expect("single large tree");
+                        let manifest_p = env_c.manifest.clone();
+                        let guard_p = Arc::clone(&guard);
+                        let tk_p = tk.clone();
+                        let planned = env_c
+                            .spawn_cpu(move |ctrl| {
+                                let _lock = guard_p;
+                                let check = || crate::runtime::check_control(&ctrl);
+                                plan_upper_tree(
+                                    &manifest_p,
+                                    &tk_p,
+                                    total_l,
+                                    children,
+                                    sample_items,
+                                    hard_limits,
+                                    &check,
+                                )
+                            })
+                            .await?;
+
+                        kv_lt.add_assign(LtHash::from_kv(
+                            &planned.tree_manifest_kv.0,
+                            &planned.tree_manifest_kv.1,
+                        ));
+                        total_kv_count += 1;
+                        env_c
+                            .commit_unit_kvs(u_lease.as_ref(), vec![planned.tree_manifest_kv])
+                            .await?;
+
+                        let mut nodes = planned.internal_nodes;
+                        while !nodes.is_empty() {
+                            let n_take = nodes.len().min(64);
+                            let node_batch: Vec<_> = nodes.drain(..n_take).collect();
+                            let manifest_e = env_c.manifest.clone();
+                            let guard_e = Arc::clone(&guard);
+                            let tk_e = tk.clone();
+                            let enc = env_c
+                                .spawn_cpu(move |ctrl| {
+                                    let _lock = guard_e;
+                                    let check = || crate::runtime::check_control(&ctrl);
+                                    encode_upper_tree_nodes(
+                                        &manifest_e,
+                                        &tk_e,
+                                        &node_batch,
+                                        per_thread_graph_mem,
+                                        hard_limits,
+                                        graph_threads,
+                                        &check,
+                                    )
+                                })
+                                .await?;
+                            internal_parts += enc.partitions;
+                            total_kv_count += enc.kvs.len() as u64;
+                            kv_lt.add_assign(enc.kv_lthash);
+                            def_lt.add_assign(enc.edge_def_lthash);
+                            ref_lt.add_assign(enc.edge_ref_lthash);
+                            env_c.commit_unit_kvs(u_lease.as_ref(), enc.kvs).await?;
+                        }
+                    } else {
+                        let manifest_w = env_c.manifest.clone();
+                        let guard_w = Arc::clone(&guard);
+                        let (w_parts, w_kvs, w_kv_lt, w_def_lt, w_ref_lt) = env_c
+                            .spawn_cpu(move |ctrl| {
+                                let _lock = guard_w;
+                                let check = || crate::runtime::check_control(&ctrl);
+                                let mut kvs = Vec::new();
+                                let mut w_kv = LtHash::ZERO;
+                                let mut w_def = LtHash::ZERO;
+                                let mut w_ref = LtHash::ZERO;
+                                let mut w_p = 0_u64;
+                                for (tk, total_l, children) in wave {
+                                    let planned = plan_upper_tree(
+                                        &manifest_w,
+                                        &tk,
+                                        total_l,
+                                        children,
+                                        sample_items,
+                                        hard_limits,
+                                        &check,
+                                    )?;
+                                    w_kv.add_assign(LtHash::from_kv(
+                                        &planned.tree_manifest_kv.0,
+                                        &planned.tree_manifest_kv.1,
+                                    ));
+                                    kvs.push(planned.tree_manifest_kv);
+                                    if !planned.internal_nodes.is_empty() {
+                                        let enc = encode_upper_tree_nodes(
+                                            &manifest_w,
+                                            &tk,
+                                            &planned.internal_nodes,
+                                            per_thread_graph_mem,
+                                            hard_limits,
+                                            graph_threads,
+                                            &check,
+                                        )?;
+                                        w_p += enc.partitions;
+                                        w_kv.add_assign(enc.kv_lthash);
+                                        w_def.add_assign(enc.edge_def_lthash);
+                                        w_ref.add_assign(enc.edge_ref_lthash);
+                                        kvs.extend(enc.kvs);
+                                    }
+                                }
+                                kvs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                                Ok((w_p, kvs, w_kv, w_def, w_ref))
+                            })
+                            .await?;
+                        internal_parts += w_parts;
+                        total_kv_count += w_kvs.len() as u64;
+                        kv_lt.add_assign(w_kv_lt);
+                        def_lt.add_assign(w_def_lt);
+                        ref_lt.add_assign(w_ref_lt);
+                        env_c.commit_unit_kvs(u_lease.as_ref(), w_kvs).await?;
+                    }
+                }
+
+                Ok(UnitOutput {
+                    records: trees_n,
+                    kv_count: total_kv_count,
+                    aux_count: internal_parts,
+                    kv_lthash: kv_lt,
+                    aux_lthash: def_lt,
+                    aux2_lthash: ref_lt,
+                })
+            }
+        }
+    })
+    .await?;
+
+    // Stage 32: Emit `[0x04 Leaf Partitions]` and reclaim final shard state.
+    init_stage_units(&env, STAGE_EMIT_LEAVES, coarse_shards).await?;
+    let leaf_emit_done = drive_stage(&env, STAGE_EMIT_LEAVES, coarse_shards, emit_conc, {
+        let env = env.clone();
+        let store_c = Arc::clone(&store);
+        let plan_c = plan.clone();
+        let leaf_plan_c = Arc::clone(&leaf_plan);
+        let lock = Arc::clone(&lock);
+        move |s, u_lease| {
+            let env_c = env.clone();
+            let store_u = Arc::clone(&store_c);
+            let plan_u = plan_c.clone();
+            let lp_c = Arc::clone(&leaf_plan_c);
+            let guard = Arc::clone(&lock);
+            async move {
+                let enc = env_c
+                    .spawn_cpu({
+                        let manifest = env_c.manifest.clone();
+                        move |ctrl| {
+                            let _lock = guard;
+                            let check = || crate::runtime::check_control(&ctrl);
+                            let r_use = shard_final_round(s, lp_c.final_round, &plan_u);
+                            let shard_state =
+                                store_u.read_shard_state(r_use, s, &manifest, true)?;
+                            if shard_state.leaves.is_empty() {
+                                return Ok(None);
+                            }
+                            Ok(Some(encode_leaf_shard(
+                                &manifest,
+                                &shard_state,
+                                &lp_c.assigned[s as usize],
+                                hard_limits,
+                                &check,
+                            )?))
+                        }
+                    })
+                    .await?;
+                let Some(enc) = enc else {
+                    return Ok(UnitOutput::default());
+                };
+                let kv_count = enc.kvs.len() as u64;
+                env_c.commit_unit_kvs(u_lease.as_ref(), enc.kvs).await?;
+                Ok(UnitOutput {
+                    records: enc.records,
+                    kv_count,
+                    aux_count: 0,
+                    kv_lthash: enc.kv_lthash,
+                    aux_lthash: enc.membership_lthash,
+                    aux2_lthash: enc.edge_def_lthash,
+                })
+            }
+        }
+    })
+    .await?;
+
+    store
+        .reclaim_final_shards(&env, &lock, &leaf_plan, &plan)
+        .await?;
+    report.emit = emit_start.elapsed();
+
+    // 6. Verify global 512-bit homomorphic multiset equations across all stages and seal `Loaded`.
+    let loc_records: u64 = rec_emit_done.iter().map(|u| u.records).sum();
+    let leaf_records: u64 = leaf_emit_done.iter().map(|u| u.records).sum();
+    let mut leaf_mem_lt = LtHash::ZERO;
+    let mut edge_def_lt = LtHash::ZERO;
+    for u in &leaf_emit_done {
+        leaf_mem_lt.add_assign(u.aux_lthash);
+        edge_def_lt.add_assign(u.aux2_lthash);
+    }
+    let mut loc_mem_lt = LtHash::ZERO;
+    for u in &rec_emit_done {
+        loc_mem_lt.add_assign(u.aux_lthash);
+    }
+    let mut edge_ref_lt = LtHash::ZERO;
+    let mut internal_parts = 0_u64;
+    let mut total_trees = 0_u64;
+    for u in &tree_emit_done {
+        total_trees += u.records;
+        internal_parts += u.aux_count;
+        edge_def_lt.add_assign(u.aux_lthash);
+        edge_ref_lt.add_assign(u.aux2_lthash);
+    }
+
+    if loc_records != leaf_plan.scatter_records
+        || leaf_records != leaf_plan.scatter_records
+        || leaf_mem_lt != loc_mem_lt
+        || edge_def_lt != edge_ref_lt
+    {
+        return Err(corrupt());
+    }
+
+    let mut total_entries = 0_u64;
+    let mut expected_kv_lthash = LtHash::ZERO;
+    for list in [&rec_emit_done, &tree_emit_done, &leaf_emit_done] {
+        for u in list {
+            total_entries = total_entries.checked_add(u.kv_count).ok_or_else(corrupt)?;
+            expected_kv_lthash.add_assign(u.kv_lthash);
+        }
+    }
+
+    finalize_and_seal_loaded(
+        context,
+        index,
+        fence,
+        &plan,
+        SealedSummary {
+            records: leaf_plan.scatter_records,
+            trees: total_trees,
+            partitions: leaf_partitions + internal_parts,
+            entries: total_entries,
+            expected_kv_lthash,
+        },
+        retry,
+        &mut report,
+    )
+    .await?;
+    report.scratch_written_bytes = quota.written();
+    report.peak_scratch_bytes = quota.peak();
+    Ok(report)
+}
+
+async fn finalize_leaf_plan<B: Backend>(
+    env: &StageEnv<B>,
+    store: &Arc<StageStore>,
+    lock: &Arc<File>,
+    scatter_records: u64,
+    final_round: u8,
+    plan: &ShardPlan,
+    tree_buckets: u32,
+) -> Result<LeafPlan> {
+    let coarse_shards = plan.total_shards;
+    let store_c = Arc::clone(store);
+    let manifest_c = env.manifest.clone();
+    let plan_c = plan.clone();
+    let guard = Arc::clone(lock);
+    let res = env
+        .spawn_cpu(move |ctrl| {
+            let _lock = guard;
+            if let Some(loaded) =
+                store_c.load_leaf_plan(coarse_shards, tree_buckets, &manifest_c)?
+            {
+                return Ok(loaded);
+            }
+            let check = || crate::runtime::check_control(&ctrl);
+            let mut shard_tks = Vec::with_capacity(coarse_shards as usize);
+            for s in 0..coarse_shards {
+                if s.is_multiple_of(64) {
+                    check()?;
+                }
+                let r_use = shard_final_round(s, final_round, &plan_c);
+                let centers = store_c.read_shard_centers(r_use, s, &manifest_c)?;
+                shard_tks.push(centers.into_iter().map(|(tk, _, _)| tk).collect::<Vec<_>>());
+            }
+            let (assigned, trees) =
+                assign_leaf_partition_keys(&shard_tks, tree_buckets, |tks| tks.iter())?;
+            let leaf_plan = LeafPlan {
+                scatter_records,
+                final_round,
+                assigned,
+                trees,
+            };
+            store_c.save_leaf_plan(&leaf_plan, tree_buckets, &check)?;
+            Ok(leaf_plan)
+        })
+        .await;
+
+    match res {
+        Ok(v) => Ok(v),
+        Err(e) if env.distributed_workers > 1 && store.is_disk() => {
+            let store_c = Arc::clone(store);
+            let manifest_c = env.manifest.clone();
+            let guard = Arc::clone(lock);
+            env.spawn_cpu(move |_ctrl| {
+                let _lock = guard;
+                match store_c.load_leaf_plan(coarse_shards, tree_buckets, &manifest_c)? {
+                    Some(loaded) => Ok(loaded),
+                    None => Err(e),
+                }
+            })
+            .await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn compute_non_empty_runs_by_shard(
+    store: &StageStore,
+    scatter_units: u32,
+    coarse_shards: u32,
+    manifest: &IndexManifest,
+    plan: &ShardPlan,
+    ctrl: &OperationOptions,
+) -> Result<Vec<NonEmptyRunSources>> {
+    let mut totals = vec![0_u64; coarse_shards as usize];
+    let mut per_run_non_empty: Vec<Vec<usize>> = Vec::with_capacity(scatter_units as usize);
+    for run in 0..scatter_units {
+        if run.is_multiple_of(64) {
+            crate::runtime::check_control(ctrl)?;
+        }
+        let c = store.read_scatter_counts(run, coarse_shards as usize)?;
+        let mut run_origins = Vec::new();
+        for (orig, v) in c.into_iter().enumerate() {
+            if v > 0 {
+                totals[orig] = totals[orig].checked_add(v).ok_or_else(corrupt)?;
+                run_origins.push(orig);
+            }
+        }
+        per_run_non_empty.push(run_origins);
+    }
+    let kernel = kernel_for(manifest)?;
+    let remap = compute_shard_remap(
+        &kernel,
+        plan,
+        &totals,
+        u64::from(manifest.config().min_leaf_partition_entries()),
+        u64::from(manifest.config().max_leaf_partition_entries()),
+    );
+    let mut by_dst: Vec<NonEmptyRunSources> = vec![Vec::new(); coarse_shards as usize];
+    for (run_idx, origins) in per_run_non_empty.into_iter().enumerate() {
+        let run_u32 = run_idx as u32;
+        for orig in origins {
+            let dst = remap[orig] as usize;
+            match by_dst[dst].last_mut() {
+                Some((last_run, list)) if *last_run == run_u32 => list.push(orig),
+                _ => by_dst[dst].push((run_u32, vec![orig])),
+            }
+        }
+    }
+    Ok(by_dst)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "bounded-halo refinement coordinates proposal scoring, arbitration, and shard compaction across rounds"
+)]
+async fn run_halo_refinement<B: Backend>(
+    env: &StageEnv<B>,
+    store: &Arc<StageStore>,
+    lock: &Arc<File>,
+    plan: &ShardPlan,
+    rounds: u8,
+    effective_mem: usize,
+    parallelism: usize,
+    leaf_conc: usize,
+) -> Result<u8> {
+    let per_leaf = refinement_per_leaf_bytes(env.manifest.config().dimension(), rounds);
+    if effective_mem < per_leaf.saturating_mul(2) {
+        return Err(Error::new(ErrorKind::LimitExceeded));
+    }
+    if rounds == 0 {
+        return Ok(0);
+    }
+
+    let heavy_shards = plan.light_shard_start;
+    let halo_unit_budget = (effective_mem / 2)
+        .max(per_leaf.saturating_mul(2))
+        .min(effective_mem);
+    let max_halo_leaves = (halo_unit_budget / per_leaf.max(1)).min(MAX_HALO_LEAVES_CAP);
+    let halo_conc = (effective_mem / halo_unit_budget.max(1))
+        .clamp(1, parallelism.min(8))
+        .min(heavy_shards.max(1) as usize);
+
+    let mut final_round = 0_u8;
+    for r in 0..rounds {
+        if env.distributed_workers > 1 && store.has_leaf_plan() {
+            return Ok(final_round);
+        }
+        let stage_prop = STAGE_REFINE_BASE + 3 * r;
+        let stage_ext = STAGE_REFINE_BASE + 3 * r + 1;
+        let stage_app = STAGE_REFINE_BASE + 3 * r + 2;
+
+        let prop_done = drive_cpu_stage(env, lock, stage_prop, heavy_shards, halo_conc, {
+            let store_c = Arc::clone(store);
+            let plan_c = plan.clone();
+            move |s, manifest, check| {
+                let kernel = kernel_for(manifest)?;
+                let src_state = store_c.read_shard_state(r, s, manifest, false)?;
+                let proposals = score_halo_shard(
+                    &kernel,
+                    &plan_c,
+                    s,
+                    &src_state,
+                    max_halo_leaves,
+                    per_leaf,
+                    halo_unit_budget,
+                    check,
+                    |nbr| {
+                        if nbr == s {
+                            return Ok(src_state
+                                .leaves
+                                .iter()
+                                .map(|l| l.centroid.clone())
+                                .collect());
+                        }
+                        Ok(store_c
+                            .read_shard_centers(r, nbr, manifest)?
+                            .into_iter()
+                            .map(|(_, _, c)| c)
+                            .collect())
+                    },
+                )?;
+                let aux_count = proposals.len() as u64;
+                if !proposals.is_empty() {
+                    store_c.put_proposals(r, s, proposals, check)?;
+                }
+                Ok(UnitOutput {
+                    aux_count,
+                    ..UnitOutput::default()
+                })
+            }
+        })
+        .await?;
+
+        let prop_counts: Vec<u64> = prop_done.iter().map(|u| u.aux_count).collect();
+        if prop_counts.iter().sum::<u64>() == 0 {
+            break;
+        }
+        if is_stage_complete(env, stage_app, heavy_shards).await? {
+            final_round = r + 1;
+            continue;
+        }
+
+        let arb_res = env
+            .spawn_cpu({
+                let store_c = Arc::clone(store);
+                let manifest = env.manifest.clone();
+                let plan_c = plan.clone();
+                let prop_counts_c = prop_counts.clone();
+                let guard = Arc::clone(lock);
+                move |ctrl| {
+                    let _lock = guard;
+                    let check = || crate::runtime::check_control(&ctrl);
+                    arbitrate_round(
+                        &store_c,
+                        r,
+                        &prop_counts_c,
+                        &manifest,
+                        &plan_c,
+                        effective_mem,
+                        &check,
+                    )
+                }
+            })
+            .await;
+
+        let accepted_moves = match arb_res {
+            Ok(v) => Arc::new(v),
+            Err(_)
+                if env.distributed_workers > 1
+                    && is_stage_complete(env, stage_app, heavy_shards).await? =>
+            {
+                final_round = r + 1;
+                continue;
+            }
+            Err(_) if env.distributed_workers > 1 && store.has_leaf_plan() => {
+                return Ok(r);
+            }
+            Err(e) => return Err(e),
+        };
+
+        if accepted_moves.total_accepted == 0 {
+            break;
+        }
+
+        if accepted_moves.has_cross_shard {
+            drive_cpu_stage(env, lock, stage_ext, heavy_shards, leaf_conc, {
+                let store_c = Arc::clone(store);
+                let acc = Arc::clone(&accepted_moves);
+                move |s, manifest, check| {
+                    let moved_out = acc.outbound.get(s as usize).ok_or_else(corrupt)?;
+                    store_c.put_outbound_rows(r, s, heavy_shards, manifest, moved_out, check)?;
+                    Ok(UnitOutput::default())
+                }
+            })
+            .await?;
+        }
+
+        let write_locs = r + 1 == rounds;
+        drive_cpu_stage(env, lock, stage_app, heavy_shards, leaf_conc, {
+            let store_c = Arc::clone(store);
+            let plan_c = plan.clone();
+            let acc = Arc::clone(&accepted_moves);
+            move |s, manifest, check| {
+                apply_round_shard(&store_c, r, s, manifest, &plan_c, &acc, write_locs, check)?;
+                Ok(UnitOutput::default())
+            }
+        })
+        .await?;
+
+        store.reclaim_round(env, lock, r, heavy_shards).await?;
+        final_round = r + 1;
+    }
+    if store.is_disk()
+        && rounds > 0
+        && final_round < rounds
+        && !(env.distributed_workers > 1 && store.has_leaf_plan())
+    {
+        drive_cpu_stage(env, lock, STAGE_EMIT_LOCS, heavy_shards, leaf_conc, {
+            let store_c = Arc::clone(store);
+            let plan_c = plan.clone();
+            move |s, manifest, check| {
+                store_c.write_shard_locations(final_round, s, manifest, &plan_c, check)?;
+                Ok(UnitOutput::default())
+            }
+        })
+        .await?;
+    }
+    Ok(final_round)
+}
+
+struct AcceptedRoundMoves {
+    total_accepted: usize,
+    has_cross_shard: bool,
+    outbound: Vec<BTreeMap<usize, (u32, u32)>>,
+    inbound_donors_by_dst: Vec<BTreeSet<u32>>,
+}
+
+fn arbitrate_round(
+    store: &StageStore,
+    round: u8,
+    prop_counts: &[u64],
+    manifest: &IndexManifest,
+    plan: &ShardPlan,
+    memory_budget_bytes: usize,
+    check: &(dyn Fn() -> Result<()> + Sync),
+) -> Result<AcceptedRoundMoves> {
+    let heavy_shards = plan.light_shard_start as usize;
+    let mut outbound = vec![BTreeMap::new(); heavy_shards];
+    let mut inbound_donors_by_dst: Vec<BTreeSet<u32>> = vec![BTreeSet::new(); heavy_shards];
+    let mut total_accepted = 0_usize;
+    let mut has_cross_shard = false;
+    let min_leaf = manifest.config().min_leaf_partition_entries() as usize;
+    let max_leaf = manifest.config().max_leaf_partition_entries() as usize;
+
+    for heavy in &plan.heavy_trees {
+        check()?;
+        let start = heavy.shard_start as usize;
+        let count = heavy.shard_count as usize;
+        if prop_counts[start..start + count].iter().all(|&c| c == 0) {
+            continue;
+        }
+        let mut shard_leaf_counts = Vec::with_capacity(count);
+        let mut proposals = Vec::new();
+        let mut used_mem = 0_usize;
+        for local_s in 0..count {
+            if local_s.is_multiple_of(32) {
+                check()?;
+            }
+            let s_usize = start + local_s;
+            let s = s_usize as u32;
+            let centers = store.read_shard_centers(round, s, manifest)?;
+            let l_counts: Vec<usize> = centers.into_iter().map(|(_, mc, _)| mc).collect();
+            used_mem = used_mem.saturating_add(l_counts.len().saturating_mul(16));
+            shard_leaf_counts.push(l_counts);
+
+            let expected_props = *prop_counts.get(s_usize).ok_or_else(corrupt)?;
+            if expected_props > 0 {
+                let shard_props = store.read_proposals(round, s)?;
+                if shard_props.len() as u64 != expected_props {
+                    return Err(corrupt());
+                }
+                used_mem = used_mem.saturating_add(shard_props.len().saturating_mul(96));
+                proposals.extend(shard_props);
+            }
+            if used_mem > memory_budget_bytes.max(64 * 1024) {
+                return Err(Error::new(ErrorKind::LimitExceeded));
+            }
+        }
+
+        let accepted = arbitrate_tree_proposals(
+            heavy.shard_start,
+            &shard_leaf_counts,
+            proposals,
+            min_leaf,
+            max_leaf,
+        )?;
+        total_accepted += accepted.len();
+        for p in accepted {
+            let src_idx = p.src_shard as usize;
+            let dst_idx = p.dst_shard as usize;
+            if outbound
+                .get_mut(src_idx)
+                .ok_or_else(corrupt)?
+                .insert(p.src_row_idx as usize, (p.dst_shard, p.dst_local_leaf))
+                .is_some()
+            {
+                return Err(corrupt());
+            }
+            if p.src_shard != p.dst_shard {
+                has_cross_shard = true;
+                inbound_donors_by_dst
+                    .get_mut(dst_idx)
+                    .ok_or_else(corrupt)?
+                    .insert(p.src_shard);
+            }
+        }
+    }
+    Ok(AcceptedRoundMoves {
+        total_accepted,
+        has_cross_shard,
+        outbound,
+        inbound_donors_by_dst,
+    })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "applies round moves for one shard and emits final loc slices only on the last planned round"
+)]
+fn apply_round_shard(
+    store: &StageStore,
+    round: u8,
+    shard_id: u32,
+    manifest: &IndexManifest,
+    plan: &ShardPlan,
+    acc: &AcceptedRoundMoves,
+    write_locs: bool,
+    check: &(dyn Fn() -> Result<()> + Sync),
+) -> Result<()> {
+    check()?;
+    let moved_out = acc.outbound.get(shard_id as usize).ok_or_else(corrupt)?;
+    let donors = acc
+        .inbound_donors_by_dst
+        .get(shard_id as usize)
+        .ok_or_else(corrupt)?;
+
+    let mut shard = store.read_shard_state(round, shard_id, manifest, true)?;
+    if !moved_out.is_empty() || !donors.is_empty() {
+        let kernel = kernel_for(manifest)?;
+        let mut moved_in = Vec::new();
+        for &donor_s in donors {
+            check()?;
+            store.take_outbound_slice(round, donor_s, shard_id, manifest, &mut moved_in)?;
+        }
+        apply_moves_to_shard(&kernel, shard_id, &mut shard, moved_out, moved_in)?;
+    }
+    store.put_shard_state(
+        round + 1,
+        shard_id,
+        manifest,
+        plan,
+        shard,
+        write_locs,
+        check,
+    )
+}
+
+// ============================================================================
+// Collaborative `BuildUnit` Leasing & Progress Coordination
+// ============================================================================
+
+async fn open_stage_read_txn<B: Backend>(
+    env: &StageEnv<B>,
+) -> Result<ReadLogicalTxn<'static, B::ReadTxn<'_>>> {
+    let id = env.manifest.logical_index_id();
+    let mut rtxn = ReadLogicalTxn::bootstrap(env.backend.begin_read().await?);
+    let fetched = rtxn
+        .batch_get(vec![
+            LogicalKey::Manifest(id),
+            LogicalKey::BuildWorkspace(id),
+        ])
+        .await?;
+    if fetched.len() != 2 {
+        return Err(Error::new(ErrorKind::Backend));
+    }
+    check_manifest_building_in_flight(fetched[0].as_ref(), &env.manifest)?;
+    match &fetched[1] {
+        Some(PersistentValue::BuildWorkspace(w)) => {
+            if let Some(kind) = w.failure {
+                return Err(Error::new(kind));
+            }
+            match env.fence {
+                StageFence::Write(wf) => {
+                    if w.epoch != wf.epoch || w.writer_token != wf.owner || wf.owner == [0; 32] {
+                        return Err(Error::new(ErrorKind::BulkBuildSuperseded));
+                    }
+                }
+                StageFence::Validate { ws_token, epoch } => {
+                    if w.token != ws_token || w.epoch != epoch || w.writer_token != [0; 32] {
+                        return Err(Error::new(ErrorKind::BulkBuildSuperseded));
+                    }
+                }
+            }
+        }
+        None => return Err(Error::new(ErrorKind::BulkBuildSuperseded)),
+        _ => return Err(corrupt()),
+    }
+    Ok(rtxn)
+}
+
+async fn is_stage_complete<B: Backend>(
+    env: &StageEnv<B>,
+    stage: u8,
+    unit_count: u32,
+) -> Result<bool> {
+    if unit_count == 0 {
+        return Ok(true);
+    }
+    if env.distributed_workers <= 1 {
+        return Ok(false);
+    }
+    let id = env.manifest.logical_index_id();
+    let epoch = env.fence.epoch();
+    let range = LogicalRange::build_units(id, stage);
+    retry_read(&env.control, env.fence.operation(), env.retry, || {
+        let range_ref = &range;
+        async move {
+            let mut rtxn = open_stage_read_txn(env).await?;
+            let mut cursor = None;
+            let mut seen_complete = 0_u32;
+            let mut pages_on_txn = 0_usize;
+            loop {
+                if pages_on_txn >= 8 {
+                    rtxn = open_stage_read_txn(env).await?;
+                    pages_on_txn = 0;
+                }
+                let page = rtxn
+                    .scan(
+                        range_ref,
+                        cursor.as_ref(),
+                        ScanLimits {
+                            item_limit: 1024,
+                            byte_limit: 512 * 1024,
+                        },
+                    )
+                    .await?;
+                pages_on_txn += 1;
+                for item in page.items() {
+                    let PersistentValue::BuildUnit(u) = item.value() else {
+                        return Err(corrupt());
+                    };
+                    if u.epoch != epoch {
+                        return Err(Error::new(ErrorKind::BulkBuildSuperseded));
+                    }
+                    if !u.complete {
+                        return Ok(false);
+                    }
+                    seen_complete += 1;
+                }
+                cursor = page.into_next_cursor();
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            Ok(seen_complete == unit_count)
+        }
+    })
+    .await
+}
+
+pub(crate) async fn init_stage_units<B: Backend>(
+    env: &StageEnv<B>,
+    stage: u8,
+    unit_count: u32,
+) -> Result<()> {
+    if unit_count == 0 {
+        return Ok(());
+    }
+    if !env.persists_units() {
+        return Ok(());
+    }
+    let id = env.manifest.logical_index_id();
+    let epoch = env.fence.epoch();
+    let op = env.fence.operation();
+
+    let unit_mut_bytes = BUILD_UNIT_MUTATION_BYTES
+        .checked_add(env.budget.mutation_key_overhead_bytes)
+        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+    let max_by_bytes = env.budget.max_mutation_bytes / unit_mut_bytes.max(1);
+    let max_by_muts = env.budget.max_mutations;
+    if max_by_bytes == 0 || max_by_muts == 0 {
+        return Err(Error::new(ErrorKind::LimitExceeded));
+    }
+    let max_per_txn = max_by_muts.min(max_by_bytes).clamp(1, 512) as u32;
+
+    if matches!(env.fence, StageFence::Write(_)) && stage >= STAGE_EMIT_RECORDS {
+        retry_raw_write(
+            &env.control,
+            env.sched_lease_lock.as_deref(),
+            op,
+            env.retry,
+            || async {
+                let prepared = async {
+                    let mut txn = env
+                        .begin_fenced_txn(None, std::iter::once(LogicalKey::BuildProgress(id)))
+                        .await?;
+                    if let Some(PersistentValue::BuildProgress(mut p)) =
+                        txn.get_for_update(LogicalKey::BuildProgress(id)).await?
+                        && p.epoch == epoch
+                        && p.phase == BuildPhase::Preparing
+                    {
+                        p.phase = BuildPhase::Loading;
+                        txn.put(
+                            LogicalKey::BuildProgress(id),
+                            PersistentValue::BuildProgress(p),
+                        )
+                        .await?;
+                        return Ok::<_, Error>((Some(txn), ()));
+                    }
+                    txn.rollback().await;
+                    Ok((None, ()))
+                }
+                .await;
+                commit_raw_prepared(prepared).await
+            },
+        )
+        .await?;
+    }
+
+    for batch_start in (0..unit_count).step_by(max_per_txn as usize) {
+        let batch_end = (batch_start + max_per_txn).min(unit_count);
+        retry_raw_write(
+            &env.control,
+            env.sched_lease_lock.as_deref(),
+            op,
+            env.retry,
+            || async {
+                let prepared = async {
+                    let extra = (batch_start..batch_end).map(|u| LogicalKey::BuildUnit {
+                        index: id,
+                        stage,
+                        unit: u,
+                    });
+                    let mut txn = env.begin_fenced_txn(None, extra).await?;
+                    let mut any_written = false;
+                    for u in batch_start..batch_end {
+                        let ukey = LogicalKey::BuildUnit {
+                            index: id,
+                            stage,
+                            unit: u,
+                        };
+                        match txn.get_for_update(ukey.clone()).await? {
+                            Some(PersistentValue::BuildUnit(existing))
+                                if existing.epoch == epoch => {}
+                            _ => {
+                                txn.put(
+                                    ukey,
+                                    PersistentValue::BuildUnit(BuildUnit::unclaimed(epoch)),
+                                )
+                                .await?;
+                                any_written = true;
+                            }
+                        }
+                    }
+                    if !any_written {
+                        txn.rollback().await;
+                        return Ok::<_, Error>((None, ()));
+                    }
+                    Ok((Some(txn), ()))
+                }
+                .await;
+                commit_raw_prepared(prepared).await
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn drive_stage<B, F, Fut>(
+    env: &StageEnv<B>,
+    stage: u8,
+    unit_count: u32,
+    concurrency: usize,
+    work: F,
+) -> Result<Vec<BuildUnit>>
+where
+    B: Backend,
+    F: Fn(u32, Option<UnitLease>) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<UnitOutput>> + Send + 'static,
+{
+    if unit_count == 0 {
+        return Ok(Vec::new());
+    }
+    let work = Arc::new(work);
+    let worker_conc = concurrency.max(1).min(unit_count as usize);
+
+    if env.distributed_workers == 1 {
+        let next_unit = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut tasks = tokio::task::JoinSet::<Result<Vec<(u32, BuildUnit)>>>::new();
+        for _ in 0..worker_conc {
+            let counter = Arc::clone(&next_unit);
+            let env_c = env.clone();
+            let work_c = Arc::clone(&work);
+            tasks.spawn(async move {
+                let task_token = non_zero_token()?;
+                let mut local_done = Vec::new();
+                loop {
+                    crate::runtime::check_control(&env_c.control)?;
+                    let u = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if u >= unit_count {
+                        return Ok(local_done);
+                    }
+                    let persist_unit = env_c.persists_single_worker();
+                    if persist_unit
+                        && let Some(done) = read_completed_unit(&env_c, stage, u).await?
+                    {
+                        local_done.push((u, done));
+                        continue;
+                    }
+                    let out = work_c(u, None).await?;
+                    if let StageFence::Write(wf) = env_c.fence
+                        && out.kv_count > 0
+                    {
+                        let _permit = env_c
+                            .commit_sem
+                            .acquire()
+                            .await
+                            .map_err(|_| Error::new(ErrorKind::Other))?;
+                        advance_loading_progress(
+                            env_c.backend.as_ref(),
+                            &env_c.control,
+                            env_c.sched_lease_lock.as_deref(),
+                            env_c.bulk_authority,
+                            &env_c.manifest,
+                            wf,
+                            out.kv_count,
+                            None,
+                        )
+                        .await?;
+                    }
+                    let owner = if persist_unit { task_token } else { [0; 32] };
+                    let bu = out.into_completed(env_c.fence.epoch(), owner);
+                    if persist_unit {
+                        let unit_lease = UnitLease {
+                            stage,
+                            unit: u,
+                            owner: task_token,
+                            duration: env_c.unit_lease,
+                            lock: Arc::new(tokio::sync::Mutex::new(())),
+                        };
+                        complete_unit(&env_c, &unit_lease, out, false).await?;
+                    }
+                    local_done.push((u, bu));
+                }
+            });
+        }
+        let mut results = Vec::with_capacity(unit_count as usize);
+        while let Some(res) = tasks.join_next().await {
+            results.extend(res.map_err(|e| Error::with_source(ErrorKind::Other, e))??);
+        }
+        results.sort_unstable_by_key(|(u, _)| *u);
+        return Ok(results.into_iter().map(|(_, bu)| bu).collect());
+    }
+
+    let mut completed: Vec<Option<BuildUnit>> = vec![None; unit_count as usize];
+    let mut prefix_done = 0_u32;
+    let wave_cap = (worker_conc * 4).max(8);
+    loop {
+        crate::runtime::check_control(&env.control)?;
+        let claimable =
+            scan_stage_status(env, stage, unit_count, &mut prefix_done, &mut completed).await?;
+        if prefix_done == unit_count {
+            return completed
+                .into_iter()
+                .map(|u| u.ok_or_else(corrupt))
+                .collect();
+        }
+        if claimable.is_empty() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            continue;
+        }
+
+        let mut jitter = [0_u8; 4];
+        let _ = getrandom::fill(&mut jitter);
+        let offset = (u32::from_le_bytes(jitter) as usize) % claimable.len();
+        let mut ordered = Vec::with_capacity(claimable.len().min(wave_cap));
+        for &u in claimable[offset..].iter().chain(&claimable[..offset]) {
+            ordered.push(u);
+            if ordered.len() == wave_cap {
+                break;
+            }
+        }
+
+        let claimable_len = ordered.len();
+        let queue = Arc::new(Mutex::new(ordered.into_iter()));
+        let mut tasks = tokio::task::JoinSet::<Result<()>>::new();
+        for _ in 0..worker_conc.min(claimable_len) {
+            let q = Arc::clone(&queue);
+            let env_c = env.clone();
+            let work_c = Arc::clone(&work);
+            tasks.spawn(async move {
+                let task_token = non_zero_token()?;
+                loop {
+                    crate::runtime::check_control(&env_c.control)?;
+                    let Some(unit) = lock_mutex(&q).next() else {
+                        return Ok(());
+                    };
+                    let Some(initial_exp) = try_claim_unit(&env_c, stage, unit, task_token).await?
+                    else {
+                        continue;
+                    };
+                    let unit_lease = UnitLease {
+                        stage,
+                        unit,
+                        owner: task_token,
+                        duration: env_c.unit_lease,
+                        lock: Arc::new(tokio::sync::Mutex::new(())),
+                    };
+                    let outcome = async {
+                        let out = run_with_unit_heartbeat(
+                            &env_c,
+                            &unit_lease,
+                            initial_exp,
+                            work_c(unit, Some(unit_lease.clone())),
+                        )
+                        .await?;
+                        complete_unit(&env_c, &unit_lease, out, true).await
+                    }
+                    .await;
+                    match outcome {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == ErrorKind::BulkBuildSuperseded => {
+                            check_epoch_still_active(&env_c).await?;
+                        }
+                        Err(e) => {
+                            if is_unit_completed_by_peer(&env_c, stage, unit).await? {
+                                continue;
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+            });
+        }
+        while let Some(res) = tasks.join_next().await {
+            res.map_err(|e| Error::with_source(ErrorKind::Other, e))??;
+        }
+    }
+}
+
+async fn read_completed_unit<B: Backend>(
+    env: &StageEnv<B>,
+    stage: u8,
+    unit: u32,
+) -> Result<Option<BuildUnit>> {
+    let id = env.manifest.logical_index_id();
+    let epoch = env.fence.epoch();
+    retry_read(
+        &env.control,
+        env.fence.operation(),
+        env.retry,
+        || async move {
+            let mut rtxn = open_stage_read_txn(env).await?;
+            match rtxn
+                .get(LogicalKey::BuildUnit {
+                    index: id,
+                    stage,
+                    unit,
+                })
+                .await?
+            {
+                Some(PersistentValue::BuildUnit(u)) if u.complete && u.epoch == epoch => {
+                    Ok(Some(u))
+                }
+                _ => Ok(None),
+            }
+        },
+    )
+    .await
+}
+
+async fn is_unit_completed_by_peer<B: Backend>(
+    env: &StageEnv<B>,
+    stage: u8,
+    unit: u32,
+) -> Result<bool> {
+    check_epoch_still_active(env).await?;
+    Ok(read_completed_unit(env, stage, unit).await?.is_some())
+}
+
+async fn check_epoch_still_active<B: Backend>(env: &StageEnv<B>) -> Result<()> {
+    retry_raw_write(
+        &env.control,
+        env.sched_lease_lock.as_deref(),
+        env.fence.operation(),
+        env.retry,
+        || async {
+            match env.begin_fenced_txn(None, std::iter::empty()).await {
+                Ok(txn) => {
+                    txn.rollback().await;
+                    CommitStep::Done(())
+                }
+                Err(e) if e.kind() == ErrorKind::RetryableAbort => CommitStep::PrepareAbort,
+                Err(e) => CommitStep::Fatal(e),
+            }
+        },
+    )
+    .await
+}
+
+async fn scan_stage_status<B: Backend>(
+    env: &StageEnv<B>,
+    stage: u8,
+    unit_count: u32,
+    prefix_done: &mut u32,
+    completed: &mut [Option<BuildUnit>],
+) -> Result<Vec<u32>> {
+    let id = env.manifest.logical_index_id();
+    let epoch = env.fence.epoch();
+    let from_unit = *prefix_done;
+    if from_unit >= unit_count {
+        return Ok(Vec::new());
+    }
+    let expected_tail = (unit_count - from_unit) as usize;
+    let range = LogicalRange::build_units_from(id, stage, from_unit);
+    let (newly_done, claimable) =
+        retry_read(&env.control, env.fence.operation(), env.retry, || {
+            let range_ref = &range;
+            async move {
+                let now = now_ms()?;
+                let mut rtxn = open_stage_read_txn(env).await?;
+                let mut cursor = None;
+                let mut seen_tail = 0_usize;
+                let mut newly_done: Vec<(u32, BuildUnit)> = Vec::new();
+                let mut claimable = Vec::new();
+                let mut pages_on_txn = 0_usize;
+                loop {
+                    if pages_on_txn >= 8 {
+                        rtxn = open_stage_read_txn(env).await?;
+                        pages_on_txn = 0;
+                    }
+                    let page = rtxn
+                        .scan(
+                            range_ref,
+                            cursor.as_ref(),
+                            ScanLimits {
+                                item_limit: 1024,
+                                byte_limit: 512 * 1024,
+                            },
+                        )
+                        .await?;
+                    pages_on_txn += 1;
+                    for item in page.items() {
+                        let LogicalKey::BuildUnit { unit, .. } = *item.key() else {
+                            return Err(corrupt());
+                        };
+                        if unit != from_unit + seen_tail as u32 {
+                            return Err(corrupt());
+                        }
+                        let PersistentValue::BuildUnit(u) = item.value().clone() else {
+                            return Err(corrupt());
+                        };
+                        if u.epoch != epoch {
+                            return Err(Error::new(ErrorKind::BulkBuildSuperseded));
+                        }
+                        seen_tail += 1;
+                        if u.complete {
+                            newly_done.push((unit, u));
+                        } else if u.owner == [0; 32] || u.expires_ms <= now {
+                            claimable.push(unit);
+                        }
+                    }
+                    cursor = page.into_next_cursor();
+                    if cursor.is_none() {
+                        break;
+                    }
+                }
+                if seen_tail != expected_tail {
+                    return Err(corrupt());
+                }
+                Ok((newly_done, claimable))
+            }
+        })
+        .await?;
+
+    for (unit, bu) in newly_done {
+        if let Some(slot) = completed.get_mut(unit as usize)
+            && slot.is_none()
+        {
+            *slot = Some(bu);
+        }
+    }
+    while (*prefix_done as usize) < completed.len() && completed[*prefix_done as usize].is_some() {
+        *prefix_done += 1;
+    }
+    Ok(claimable)
+}
+
+async fn try_claim_unit<B: Backend>(
+    env: &StageEnv<B>,
+    stage: u8,
+    unit: u32,
+    owner: [u8; 32],
+) -> Result<Option<u64>> {
+    let id = env.manifest.logical_index_id();
+    let epoch = env.fence.epoch();
+    let op = env.fence.operation();
+    let ukey = LogicalKey::BuildUnit {
+        index: id,
+        stage,
+        unit,
+    };
+    let mut attempts = 0;
+    loop {
+        crate::runtime::check_control(&env.control)?;
+        let _sched_guard = lock_sched_read(&env.sched_lease_lock).await;
+        let prepared = async {
+            let mut txn = env
+                .begin_fenced_txn(Some(ukey.clone()), std::iter::empty())
+                .await?;
+            let now = now_ms()?;
+            let mut u = match txn.get_for_update(ukey.clone()).await? {
+                Some(PersistentValue::BuildUnit(u)) if u.epoch == epoch => u,
+                Some(PersistentValue::BuildUnit(_)) => {
+                    return Err(Error::new(ErrorKind::BulkBuildSuperseded));
+                }
+                _ => return Err(corrupt()),
+            };
+            if u.complete {
+                txn.rollback().await;
+                return Ok((None, None));
+            }
+            if u.owner == owner {
+                let exp = u.expires_ms;
+                txn.rollback().await;
+                return Ok((None, Some(exp)));
+            }
+            if u.owner != [0; 32] && u.expires_ms > now {
+                txn.rollback().await;
+                return Ok((None, None));
+            }
+            let exp = expiry(env.unit_lease)?;
+            u.owner = owner;
+            u.expires_ms = exp;
+            txn.put(ukey.clone(), PersistentValue::BuildUnit(u)).await?;
+            Ok((Some(txn), Some(exp)))
+        }
+        .await;
+
+        let (txn_opt, exp_opt) = match prepared {
+            Ok(v) => v,
+            Err(e) if e.kind() == ErrorKind::RetryableAbort => {
+                drop(_sched_guard);
+                if env.retry.would_exhaust(attempts) {
+                    return Ok(None);
+                }
+                env.retry.wait(attempts).await;
+                attempts += 1;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        let Some(txn) = txn_opt else {
+            return Ok(exp_opt);
+        };
+        match txn.commit().await {
+            Ok(()) => return Ok(exp_opt),
+            Err(e) if e.kind() == ErrorKind::RetryableAbort => {
+                drop(_sched_guard);
+                if env.retry.would_exhaust(attempts) {
+                    return Ok(None);
+                }
+                env.retry.wait(attempts).await;
+                attempts += 1;
+            }
+            Err(e) => {
+                drop(_sched_guard);
+                env.retry.after_commit_error(op, &mut attempts, e).await?;
+            }
+        }
+    }
+}
+
+async fn run_with_unit_heartbeat<B: Backend, Fut>(
+    env: &StageEnv<B>,
+    lease: &UnitLease,
+    initial_expires_ms: u64,
+    work: Fut,
+) -> Result<UnitOutput>
+where
+    Fut: std::future::Future<Output = Result<UnitOutput>>,
+{
+    let tick = (env.unit_lease / 3).max(Duration::from_millis(5));
+    let renewals = async {
+        let mut confirmed_expires_ms = initial_expires_ms;
+        let mut timer = tokio::time::interval(tick);
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        timer.tick().await;
+        loop {
+            timer.tick().await;
+            if let Err(e) = renew_unit(env, lease, &mut confirmed_expires_ms).await {
+                break Err(e);
+            }
+        }
+    };
+    tokio::select! {
+        res = work => res,
+        res = renewals => res,
+    }
+}
+
+async fn renew_unit<B: Backend>(
+    env: &StageEnv<B>,
+    lease: &UnitLease,
+    confirmed_expires_ms: &mut u64,
+) -> Result<()> {
+    let Ok(_guard) = lease.lock.try_lock() else {
+        return Ok(());
+    };
+    let _sched_guard = lock_sched_read(&env.sched_lease_lock).await;
+    let id = env.manifest.logical_index_id();
+    let epoch = env.fence.epoch();
+    let ukey = LogicalKey::BuildUnit {
+        index: id,
+        stage: lease.stage,
+        unit: lease.unit,
+    };
+    let outcome = async {
+        let mut txn = env
+            .begin_fenced_txn(Some(ukey.clone()), std::iter::empty())
+            .await?;
+        match txn.get_for_update(ukey.clone()).await? {
+            Some(PersistentValue::BuildUnit(mut u))
+                if u.epoch == epoch && u.owner == lease.owner && !u.complete =>
+            {
+                let next_exp = u.expires_ms.max(expiry(env.unit_lease)?);
+                u.expires_ms = next_exp;
+                txn.put(ukey, PersistentValue::BuildUnit(u)).await?;
+                txn.commit().await?;
+                Ok(next_exp)
+            }
+            _ => Err(Error::new(ErrorKind::BulkBuildSuperseded)),
+        }
+    }
+    .await;
+
+    match outcome {
+        Ok(next_exp) => {
+            *confirmed_expires_ms = (*confirmed_expires_ms).max(next_exp);
+            Ok(())
+        }
+        Err(e)
+            if matches!(
+                e.kind(),
+                ErrorKind::RetryableAbort | ErrorKind::CommitOutcomeUnknown
+            ) =>
+        {
+            if now_ms()? < *confirmed_expires_ms {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn complete_unit<B: Backend>(
+    env: &StageEnv<B>,
+    lease: &UnitLease,
+    out: UnitOutput,
+    require_owner: bool,
+) -> Result<()> {
+    let id = env.manifest.logical_index_id();
+    let epoch = env.fence.epoch();
+    let ukey = LogicalKey::BuildUnit {
+        index: id,
+        stage: lease.stage,
+        unit: lease.unit,
+    };
+    retry_raw_write(
+        &env.control,
+        env.sched_lease_lock.as_deref(),
+        env.fence.operation(),
+        env.retry,
+        || async {
+            let _lease_guard = lease.lock.lock().await;
+            let prepared = async {
+                let mut txn = env
+                    .begin_fenced_txn(Some(ukey.clone()), std::iter::empty())
+                    .await?;
+
+                match txn.get_for_update(ukey.clone()).await? {
+                    Some(PersistentValue::BuildUnit(u)) if u.epoch == epoch && u.complete => {
+                        txn.rollback().await;
+                        return Ok((None, ()));
+                    }
+                    Some(PersistentValue::BuildUnit(mut u))
+                        if u.epoch == epoch && (!require_owner || u.owner == lease.owner) =>
+                    {
+                        out.apply_to(&mut u, lease.owner);
+                        txn.put(ukey.clone(), PersistentValue::BuildUnit(u)).await?;
+                    }
+                    None if !require_owner => {
+                        let u = out.into_completed(epoch, lease.owner);
+                        txn.put(ukey.clone(), PersistentValue::BuildUnit(u)).await?;
+                    }
+                    Some(PersistentValue::BuildUnit(_)) | None => {
+                        return Err(Error::new(ErrorKind::BulkBuildSuperseded));
+                    }
+                    _ => return Err(corrupt()),
+                }
+                Ok((Some(txn), ()))
+            }
+            .await;
+            commit_raw_prepared(prepared).await
+        },
+    )
+    .await
+}

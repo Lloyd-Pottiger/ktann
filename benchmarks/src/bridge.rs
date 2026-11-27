@@ -766,6 +766,7 @@ impl<B: Backend> Service<B> {
                         ResourceSnapshot::capture().map_err(|error| ("other", error))?;
                     state.bulk.as_mut().expect("published build").report["ready_peak_rss_bytes"] =
                         json!(resources.peak_rss_bytes());
+                    crate::resource::trim_unused_heap();
                     state.ready = true;
                     Ok(json!({"ready":true,"records":state.records}))
                 }

@@ -331,9 +331,9 @@ Call `job.complete` for manual completion, or opt into automatic execution with
 `job.schedule` and `Runtime::run_bulk_scheduler`. Publication returns an ordinary
 Active `Index`; incomplete builds are not available to serving operations.
 
-The [Bulk Build contract](bulk-build.md) defines these entry points, explicit
-phase control, status, recovery, cancellation, and cleanup. The synchronous
-[artifact pipeline](bulk-artifacts.md) owns input capture and artifact preparation.
+The [Bulk Build contract](bulk-build.md) defines segmented input capture,
+explicit phase control, collaborative worker options, status, recovery,
+cancellation, and cleanup.
 
 ### 7.3 Offline refinement
 

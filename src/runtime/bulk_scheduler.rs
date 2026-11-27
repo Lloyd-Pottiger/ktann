@@ -1,52 +1,550 @@
-//! Namespace queue discovery, renewable claims, and identity-fenced execution.
-use super::{OperationContext, Runtime, bulk_worker, lifecycle::RetryPolicy};
+//! Namespace queue discovery, renewable slot claims, and collaborative worker leases.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use tokio_util::sync::CancellationToken;
+
 use crate::api::{
     BulkSchedulerOptions, BulkWorkerOptions, Error, ErrorKind, LogicalIndexId, OperationOptions,
     Result,
 };
 use crate::observe::labels::Operation;
 use crate::storage::backend::{Backend, ReadOps, ScanLimits, WriteTxn};
-use crate::storage::keys::{self, LogicalKey};
+use crate::storage::keys::LogicalKey;
 use crate::storage::values::{
-    BuildSchedule, IndexLifecycle, IndexManifest, PersistentValue, ValueCodec,
+    BuildSchedule, BuildUnit, IndexLifecycle, IndexManifest, PersistentValue,
 };
-use crate::storage::{ReadLogicalTxn, WriteLogicalTxn};
-use std::{
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
-use tokio_util::sync::CancellationToken;
+use crate::storage::{LogicalRange, ReadLogicalTxn, WriteLogicalTxn};
 
-fn now_ms() -> Result<u64> {
+use super::{OperationContext, Runtime, bulk_worker, lifecycle::RetryPolicy};
+
+/// Explicit slot write authority shared by scheduled jobs and unscheduled collaborative peers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BulkAuthority {
+    pub slot: u32,
+    pub owner: [u8; 32],
+    pub scheduled: bool,
+}
+
+impl BulkAuthority {
+    #[must_use]
+    pub(crate) const fn slot_key(self, id: LogicalIndexId) -> LogicalKey {
+        LogicalKey::BuildScheduleSlot {
+            index: id,
+            slot: self.slot,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DriveOutcome {
+    Published,
+    AbortedOrDropped,
+}
+
+enum SlotClaim {
+    AlreadyOwned { slot: u32, expires_ms: u64 },
+    Claimed { slot: u32, expires_ms: u64 },
+    Busy,
+}
+
+pub(crate) fn non_zero_token() -> Result<[u8; 32]> {
+    let mut token = [0_u8; 32];
+    getrandom::fill(&mut token).map_err(|e| Error::with_source(ErrorKind::Other, e))?;
+    if token == [0_u8; 32] {
+        token[0] = 1;
+    }
+    Ok(token)
+}
+
+pub(crate) fn now_ms() -> Result<u64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
         .and_then(|d| u64::try_from(d.as_millis()).ok())
         .ok_or_else(|| Error::new(ErrorKind::Other))
 }
-fn expiry(delay: Duration) -> Result<u64> {
+
+pub(crate) fn expiry(delay: Duration) -> Result<u64> {
+    let delay_ms = u64::try_from(delay.as_nanos().div_ceil(1_000_000))
+        .map_err(|_| Error::invalid_argument())?;
     now_ms()?
-        .checked_add(u64::try_from(delay.as_millis()).map_err(|_| Error::invalid_argument())?)
+        .checked_add(delay_ms)
         .ok_or_else(Error::invalid_argument)
 }
-/// Every build mutation reads this token, including manual operations. Expiry
-/// enables takeover; only a committed token change revokes write authority.
+
+/// Checks scheduler or collaborative-peer authority against `BuildSchedule` and `BuildScheduleSlot`.
+pub(crate) async fn authorize_raw<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    id: LogicalIndexId,
+    authority: Option<BulkAuthority>,
+) -> Result<()> {
+    let sched = txn.get_for_update(LogicalKey::BuildSchedule(id)).await?;
+    let Some(auth) = authority else {
+        return match sched {
+            None => Ok(()),
+            Some(PersistentValue::BuildSchedule(_)) => Err(Error::new(ErrorKind::BulkBuildBusy)),
+            Some(_) => Err(bulk_worker::corrupt()),
+        };
+    };
+    if auth.scheduled {
+        match sched {
+            Some(PersistentValue::BuildSchedule(s))
+                if (auth.slot as usize) < s.options.distributed_workers.max(1) => {}
+            None | Some(PersistentValue::BuildSchedule(_)) => {
+                return Err(Error::new(ErrorKind::BulkBuildSuperseded));
+            }
+            Some(_) => return Err(bulk_worker::corrupt()),
+        }
+    } else {
+        match sched {
+            None => {}
+            Some(PersistentValue::BuildSchedule(_)) => {
+                return Err(Error::new(ErrorKind::BulkBuildBusy));
+            }
+            Some(_) => return Err(bulk_worker::corrupt()),
+        }
+    }
+    match txn.get_for_update(auth.slot_key(id)).await? {
+        Some(PersistentValue::BuildUnit(u)) if u.owner == auth.owner => Ok(()),
+        None | Some(PersistentValue::BuildUnit(_)) => {
+            Err(Error::new(ErrorKind::BulkBuildSuperseded))
+        }
+        Some(_) => Err(bulk_worker::corrupt()),
+    }
+}
+
 pub(crate) async fn authorize<B: Backend, T: WriteTxn>(
     context: &OperationContext<B>,
     txn: &mut WriteLogicalTxn<'_, T>,
     id: LogicalIndexId,
 ) -> Result<()> {
-    match (
-        context.bulk_authority,
-        txn.get_for_update(LogicalKey::BuildSchedule(id)).await?,
-    ) {
-        (None, None) => Ok(()),
-        (Some(owner), Some(PersistentValue::BuildSchedule(s))) if s.owner == owner => Ok(()),
-        (None, Some(PersistentValue::BuildSchedule(_))) => {
-            Err(Error::new(ErrorKind::BulkBuildBusy))
+    authorize_raw(txn, id, context.bulk_authority).await
+}
+
+/// Scans `0..slots` for an existing claim by `owner` first (for idempotent recovery after
+/// `CommitOutcomeUnknown`), then claims the first free or expired slot.
+async fn scan_and_claim_slot<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    id: LogicalIndexId,
+    slots: u32,
+    owner: [u8; 32],
+    lease: Duration,
+    require_all_idle: bool,
+) -> Result<SlotClaim> {
+    let now = now_ms()?;
+    let mut first_free = None;
+    for slot in 0..slots {
+        let skey = LogicalKey::BuildScheduleSlot { index: id, slot };
+        match txn.get_for_update(skey).await? {
+            Some(PersistentValue::BuildUnit(u)) if u.owner == owner => {
+                if !require_all_idle || slot == 0 {
+                    return Ok(SlotClaim::AlreadyOwned {
+                        slot,
+                        expires_ms: u.expires_ms,
+                    });
+                }
+            }
+            None => {
+                if first_free.is_none() {
+                    first_free = Some(slot);
+                }
+            }
+            Some(PersistentValue::BuildUnit(u)) if u.owner == [0; 32] || u.expires_ms <= now => {
+                if first_free.is_none() {
+                    first_free = Some(slot);
+                }
+            }
+            Some(PersistentValue::BuildUnit(_)) => {
+                if require_all_idle {
+                    return Ok(SlotClaim::Busy);
+                }
+            }
+            Some(_) => return Err(bulk_worker::corrupt()),
         }
-        (Some(_), _) => Err(Error::new(ErrorKind::BulkBuildSuperseded)),
-        _ => Err(bulk_worker::corrupt()),
+    }
+    let chosen = if require_all_idle {
+        Some(0)
+    } else {
+        first_free
+    };
+    let Some(slot) = chosen else {
+        return Ok(SlotClaim::Busy);
+    };
+    let exp = expiry(lease)?;
+    let mut unit = BuildUnit::unclaimed(1);
+    unit.owner = owner;
+    unit.expires_ms = exp;
+    txn.put(
+        LogicalKey::BuildScheduleSlot { index: id, slot },
+        PersistentValue::BuildUnit(unit),
+    )
+    .await?;
+    Ok(SlotClaim::Claimed {
+        slot,
+        expires_ms: exp,
+    })
+}
+
+/// Acquires an ephemeral renewable `BuildScheduleSlot` lease for unscheduled `distributed_workers > 1`
+/// callers so concurrent peers never reclaim the shared workspace out from under one another.
+pub(crate) async fn acquire_unscheduled_peer_slot<B: Backend>(
+    context: &mut OperationContext<B>,
+    index: &IndexManifest,
+    options: &BulkWorkerOptions,
+    retry: RetryPolicy,
+) -> Result<(u32, [u8; 32], u64)> {
+    let owner = non_zero_token()?;
+    let id = index.logical_index_id();
+    let slots = options.distributed_workers.max(1) as u32;
+    let lease = options.unit_lease;
+    let backend = context.backend();
+    let budget = backend.admission_budget();
+
+    let (slot, exp) = bulk_worker::retry_ctx_write(
+        context,
+        backend.as_ref(),
+        budget,
+        Operation::RunBulkBuild,
+        retry,
+        |mut txn| async move {
+            let mut warm = Vec::with_capacity(slots as usize + 2);
+            warm.push(LogicalKey::Manifest(id));
+            warm.push(LogicalKey::BuildSchedule(id));
+            for slot in 0..slots {
+                warm.push(LogicalKey::BuildScheduleSlot { index: id, slot });
+            }
+            txn.warm_for_update(warm).await?;
+
+            match bulk_worker::manifest(&mut txn, index).await?.lifecycle() {
+                IndexLifecycle::Building | IndexLifecycle::Active => {}
+                IndexLifecycle::Dropping => return Err(Error::new(ErrorKind::IndexDropping)),
+            }
+            if txn
+                .get_for_update(LogicalKey::BuildSchedule(id))
+                .await?
+                .is_some()
+            {
+                return Err(Error::new(ErrorKind::BulkBuildBusy));
+            }
+            match scan_and_claim_slot(&mut txn, id, slots, owner, lease, false).await? {
+                SlotClaim::AlreadyOwned { slot, expires_ms } => {
+                    txn.rollback().await;
+                    Ok((None, (slot, expires_ms)))
+                }
+                SlotClaim::Claimed { slot, expires_ms } => Ok((Some(txn), (slot, expires_ms))),
+                SlotClaim::Busy => Err(Error::new(ErrorKind::BulkBuildBusy)),
+            }
+        },
+    )
+    .await?;
+
+    context.bulk_authority = Some(BulkAuthority {
+        slot,
+        owner,
+        scheduled: false,
+    });
+    Ok((slot, owner, exp))
+}
+
+/// Runs periodic `BuildScheduleSlot` lease renewals for scheduled workers and unscheduled peers.
+pub(crate) async fn run_authority_lease_renewals<B: Backend>(
+    backend: Arc<B>,
+    lease_lock: Arc<tokio::sync::RwLock<()>>,
+    id: LogicalIndexId,
+    authority: BulkAuthority,
+    lease: Duration,
+    mut confirmed_expires_ms: u64,
+) -> Error {
+    let tick = (lease / 3).max(Duration::from_millis(5));
+    let mut timer = tokio::time::interval(tick);
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    timer.tick().await;
+    loop {
+        timer.tick().await;
+        if let Err(err) = renew_authority_once(
+            backend.as_ref(),
+            &lease_lock,
+            id,
+            authority,
+            lease,
+            &mut confirmed_expires_ms,
+        )
+        .await
+        {
+            return err;
+        }
+    }
+}
+
+async fn renew_authority_once<B: Backend>(
+    backend: &B,
+    lease_lock: &tokio::sync::RwLock<()>,
+    id: LogicalIndexId,
+    authority: BulkAuthority,
+    lease: Duration,
+    confirmed_expires_ms: &mut u64,
+) -> Result<()> {
+    let lock_wait = (lease / 6).clamp(Duration::from_millis(25), Duration::from_secs(2));
+    let _guard = tokio::time::timeout(lock_wait, lease_lock.write())
+        .await
+        .ok();
+    let skey = authority.slot_key(id);
+    let outcome = async {
+        let mut txn = WriteLogicalTxn::bootstrap(
+            backend.begin_write().await?,
+            backend.hard_limits(),
+            backend.admission_budget(),
+        );
+        txn.warm_for_update(vec![LogicalKey::BuildSchedule(id), skey.clone()])
+            .await?;
+        if authority.scheduled {
+            if txn.get(LogicalKey::BuildSchedule(id)).await?.is_none() {
+                return Err(Error::new(ErrorKind::BulkBuildSuperseded));
+            }
+        } else if txn
+            .get_for_update(LogicalKey::BuildSchedule(id))
+            .await?
+            .is_some()
+        {
+            return Err(Error::new(ErrorKind::BulkBuildBusy));
+        }
+        match txn.get_for_update(skey.clone()).await? {
+            Some(PersistentValue::BuildUnit(mut u)) if u.owner == authority.owner => {
+                let next_exp = u.expires_ms.max(expiry(lease)?);
+                u.expires_ms = next_exp;
+                txn.put(skey, PersistentValue::BuildUnit(u)).await?;
+                txn.commit().await?;
+                Ok(next_exp)
+            }
+            _ => Err(Error::new(ErrorKind::BulkBuildSuperseded)),
+        }
+    }
+    .await;
+
+    match outcome {
+        Ok(next_exp) => {
+            *confirmed_expires_ms = (*confirmed_expires_ms).max(next_exp);
+            Ok(())
+        }
+        Err(e)
+            if matches!(
+                e.kind(),
+                ErrorKind::RetryableAbort | ErrorKind::CommitOutcomeUnknown
+            ) =>
+        {
+            if now_ms()? < *confirmed_expires_ms {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+pub(crate) async fn release_unscheduled_peer_slot<B: Backend>(
+    context: &mut OperationContext<B>,
+    id: LogicalIndexId,
+    slot: u32,
+    owner: [u8; 32],
+    retry: RetryPolicy,
+) -> Result<()> {
+    context.bulk_authority = None;
+    context.bulk_lease_lock = None;
+    let backend = context.backend();
+    let release_ctrl = OperationOptions::default()
+        .with_deadline(std::time::Instant::now() + Duration::from_secs(2));
+    let _ = bulk_worker::retry_raw_write(
+        &release_ctrl,
+        None,
+        Operation::RunBulkBuild,
+        retry,
+        || async {
+            bulk_worker::commit_raw_prepared(
+                async {
+                    let mut txn = WriteLogicalTxn::bootstrap(
+                        backend.begin_write().await?,
+                        backend.hard_limits(),
+                        backend.admission_budget(),
+                    );
+                    let skey = LogicalKey::BuildScheduleSlot { index: id, slot };
+                    match txn.get_for_update(skey.clone()).await? {
+                        Some(PersistentValue::BuildUnit(u)) if u.owner == owner => {
+                            txn.delete(skey).await?;
+                            Ok::<_, Error>((Some(txn), ()))
+                        }
+                        _ => {
+                            txn.rollback().await;
+                            Ok((None, ()))
+                        }
+                    }
+                }
+                .await,
+            )
+            .await
+        },
+    )
+    .await;
+    Ok(())
+}
+
+/// Scans `0..slots` in a write transaction, returning `(active_peer_count, expired_peer_keys)`.
+async fn inspect_peer_slots<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    id: LogicalIndexId,
+    slots: u32,
+    self_slot: Option<(u32, [u8; 32])>,
+    now: u64,
+) -> Result<(usize, Vec<LogicalKey>)> {
+    let keys: Vec<LogicalKey> = (0..slots)
+        .map(|slot| LogicalKey::BuildScheduleSlot { index: id, slot })
+        .collect();
+    txn.warm_for_update(keys).await?;
+    let mut active = 0_usize;
+    let mut expired = Vec::new();
+    for slot in 0..slots {
+        let skey = LogicalKey::BuildScheduleSlot { index: id, slot };
+        let Some(val) = txn.get_for_update(skey.clone()).await? else {
+            continue;
+        };
+        let PersistentValue::BuildUnit(u) = val else {
+            return Err(bulk_worker::corrupt());
+        };
+        if self_slot == Some((slot, u.owner)) {
+            continue;
+        }
+        if u.owner != [0; 32] && u.expires_ms > now {
+            active += 1;
+        } else {
+            expired.push(skey);
+        }
+    }
+    Ok((active, expired))
+}
+
+/// Verifies no other scheduler or peer worker holds an unexpired lease on `id`, deleting
+/// expired slot records inline within the caller's mutation budget.
+pub(crate) async fn ensure_no_peer_scheduler_leases<T: WriteTxn>(
+    authority: Option<BulkAuthority>,
+    txn: &mut WriteLogicalTxn<'_, T>,
+    id: LogicalIndexId,
+    distributed_workers: usize,
+) -> Result<()> {
+    let now = now_ms()?;
+    let sched_slots = match txn.get_for_update(LogicalKey::BuildSchedule(id)).await? {
+        Some(PersistentValue::BuildSchedule(s)) => s.options.distributed_workers,
+        None => 0,
+        Some(_) => return Err(bulk_worker::corrupt()),
+    };
+    let slots = distributed_workers.max(sched_slots).max(1) as u32;
+    let self_slot = authority.map(|a| (a.slot, a.owner));
+    let (active, expired) = inspect_peer_slots(txn, id, slots, self_slot, now).await?;
+    if active > 0 {
+        return Err(Error::new(ErrorKind::BulkBuildBusy));
+    }
+    let max_inline_del = txn.admission_budget().max_mutations.saturating_sub(2);
+    for skey in expired.into_iter().take(max_inline_del) {
+        txn.delete(skey).await?;
+    }
+    Ok(())
+}
+
+/// Retires orphaned `BuildSchedule` and `BuildScheduleSlot` entries once an index has been
+/// published, aborted, or dropped and no peer worker holds an unexpired lease.
+pub(crate) async fn retire_orphaned_schedule<B: Backend>(
+    context: &mut OperationContext<B>,
+    id: LogicalIndexId,
+    retry: RetryPolicy,
+) -> Result<()> {
+    if context.bulk_authority.is_some_and(|a| a.scheduled) {
+        return Ok(());
+    }
+    let slot_range = LogicalRange::build_schedule_slots(id);
+    let slot_range_ref = &slot_range;
+    let auth = context.bulk_authority;
+    let backend = context.backend();
+    let budget = backend.admission_budget();
+    let max_del = budget.max_mutations.saturating_sub(2).clamp(1, 256);
+
+    loop {
+        let more_slots = bulk_worker::retry_ctx_write(
+            context,
+            backend.as_ref(),
+            budget,
+            Operation::CleanupBulkBuild,
+            retry,
+            |mut txn| async move {
+                if let Some(val) = txn.get_for_update(LogicalKey::Manifest(id)).await? {
+                    match val {
+                        PersistentValue::IndexManifest(m)
+                            if m.logical_index_id() == id
+                                && m.lifecycle() != IndexLifecycle::Building => {}
+                        _ => return Err(Error::invalid_argument()),
+                    }
+                }
+                let now = now_ms()?;
+                let has_schedule = match txn.get_for_update(LogicalKey::BuildSchedule(id)).await? {
+                    None => false,
+                    Some(PersistentValue::BuildSchedule(_)) => true,
+                    Some(_) => return Err(bulk_worker::corrupt()),
+                };
+
+                let page = txn
+                    .scan(
+                        slot_range_ref,
+                        None,
+                        ScanLimits {
+                            item_limit: 260,
+                            byte_limit: 256 * 1024,
+                        },
+                    )
+                    .await?;
+                let mut to_delete = Vec::new();
+                let mut has_remaining_slots = page.next_cursor().is_some();
+                for item in page.items() {
+                    let LogicalKey::BuildScheduleSlot { slot, .. } = *item.key() else {
+                        return Err(bulk_worker::corrupt());
+                    };
+                    let PersistentValue::BuildUnit(u) = item.value() else {
+                        return Err(bulk_worker::corrupt());
+                    };
+                    let is_self =
+                        auth.is_some_and(|a| !a.scheduled && a.slot == slot && a.owner == u.owner);
+                    if !is_self {
+                        if u.owner != [0; 32] && u.expires_ms > now {
+                            return Err(Error::new(ErrorKind::BulkBuildBusy));
+                        }
+                        if to_delete.len() < max_del {
+                            to_delete.push(item.key().clone());
+                        } else {
+                            has_remaining_slots = true;
+                        }
+                    }
+                }
+
+                if to_delete.is_empty() && !has_schedule {
+                    txn.rollback().await;
+                    return Ok((None, false));
+                }
+                let mut batch = txn.mutations();
+                for skey in to_delete {
+                    batch.delete(skey)?;
+                }
+                if !has_remaining_slots && has_schedule {
+                    batch.delete(LogicalKey::BuildSchedule(id))?;
+                }
+                txn.apply(batch).await?;
+                Ok((Some(txn), has_remaining_slots))
+            },
+        )
+        .await?;
+
+        if !more_slots {
+            return Ok(());
+        }
     }
 }
 
@@ -58,52 +556,58 @@ pub(crate) async fn enqueue<B: Backend>(
     retry: RetryPolicy,
 ) -> Result<()> {
     let options = bulk_worker::normalize_options(context, options).await?;
-    let mut attempts = 0;
-    loop {
-        context.checkpoint()?;
-        let backend = context.backend();
-        let mut txn = WriteLogicalTxn::bootstrap(
-            backend.begin_write().await?,
-            backend.hard_limits(),
-            backend.admission_budget(),
-        );
-        bulk_worker::building(&mut txn, &index).await?;
-        let id = index.logical_index_id();
-        if let Some(PersistentValue::BuildWorkspace(w)) =
-            txn.get_for_update(LogicalKey::BuildWorkspace(id)).await?
-        {
-            if w.options != options {
-                return Err(Error::invalid_argument());
+    let backend = context.backend();
+    let budget = backend.admission_budget();
+    let index_ref = &index;
+    let name_ref = &name;
+    let options_ref = &options;
+
+    bulk_worker::retry_ctx_write(
+        context,
+        backend.as_ref(),
+        budget,
+        Operation::ScheduleBulkBuild,
+        retry,
+        |mut txn| async move {
+            bulk_worker::building(&mut txn, index_ref).await?;
+            let id = index_ref.logical_index_id();
+            if let Some(PersistentValue::BuildWorkspace(w)) =
+                txn.get_for_update(LogicalKey::BuildWorkspace(id)).await?
+            {
+                if &w.options != options_ref {
+                    return Err(Error::invalid_argument());
+                }
+                if let Some(kind) = w.failure {
+                    return Err(Error::new(kind));
+                }
             }
-            if let Some(kind) = w.failure {
-                return Err(Error::new(kind));
+            let key = LogicalKey::BuildSchedule(id);
+            match txn.get_for_update(key.clone()).await? {
+                Some(PersistentValue::BuildSchedule(s)) if &s.options == options_ref => {
+                    txn.rollback().await;
+                    return Ok((None, ()));
+                }
+                Some(_) => return Err(Error::invalid_argument()),
+                None => {}
             }
-        }
-        let key = LogicalKey::BuildSchedule(id);
-        match txn.get_for_update(key.clone()).await? {
-            Some(PersistentValue::BuildSchedule(s)) if s.options == options => return Ok(()),
-            Some(_) => return Err(Error::invalid_argument()),
-            None => {}
-        }
-        txn.put(
-            key,
-            PersistentValue::BuildSchedule(BuildSchedule {
-                name: name.clone(),
-                options: options.clone(),
-                owner: [0; 32],
-                expires_ms: 0,
-            }),
-        )
-        .await?;
-        match context.commit(|start| txn.commit_with(start)).await {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                retry
-                    .after_commit_error(Operation::ScheduleBulkBuild, &mut attempts, error)
-                    .await?;
+            let now = now_ms()?;
+            let check_slots = options_ref.distributed_workers.max(1) as u32;
+            let (active, _) = inspect_peer_slots(&mut txn, id, check_slots, None, now).await?;
+            if active > 0 || has_any_active_slot_in_write(&mut txn, id, now).await? {
+                return Err(Error::new(ErrorKind::BulkBuildBusy));
             }
-        }
-    }
+            txn.put(
+                key,
+                PersistentValue::BuildSchedule(BuildSchedule {
+                    name: name_ref.clone(),
+                    options: options_ref.clone(),
+                }),
+            )
+            .await?;
+            Ok((Some(txn), ()))
+        },
+    )
+    .await
 }
 
 async fn claim<B: Backend>(
@@ -111,70 +615,79 @@ async fn claim<B: Backend>(
     id: LogicalIndexId,
     lease: Duration,
     retry: RetryPolicy,
-) -> Result<Option<BuildSchedule>> {
-    let mut owner = [0; 32];
-    getrandom::fill(&mut owner).map_err(|e| Error::with_source(ErrorKind::Other, e))?;
-    let mut attempts = 0;
-    loop {
-        context.checkpoint()?;
-        let backend = context.backend();
-        let mut txn = WriteLogicalTxn::bootstrap(
-            backend.begin_write().await?,
-            backend.hard_limits(),
-            backend.admission_budget(),
-        );
-        let key = LogicalKey::BuildSchedule(id);
-        let Some(PersistentValue::BuildSchedule(mut s)) = txn.get_for_update(key.clone()).await?
-        else {
-            return Ok(None);
-        };
-        // Resolve an unknown claim only against this exact random token.
-        if s.owner == owner {
-            context.bulk_authority = Some(owner);
-            return Ok(Some(s));
-        }
-        if s.expires_ms > now_ms()? {
-            return Ok(None);
-        }
-        s.owner = owner;
-        s.expires_ms = expiry(lease)?;
-        txn.put(key, PersistentValue::BuildSchedule(s.clone()))
-            .await?;
-        match context.commit(|start| txn.commit_with(start)).await {
-            Ok(()) => {
-                context.bulk_authority = Some(owner);
-                return Ok(Some(s));
+) -> Result<Option<(BuildSchedule, u32, [u8; 32], u64)>> {
+    let owner = non_zero_token()?;
+    let backend = context.backend();
+    let budget = backend.admission_budget();
+
+    let claimed = bulk_worker::retry_ctx_write(
+        context,
+        backend.as_ref(),
+        budget,
+        Operation::ScheduleBulkBuild,
+        retry,
+        |mut txn| async move {
+            let Some(val) = txn.get_for_update(LogicalKey::BuildSchedule(id)).await? else {
+                txn.rollback().await;
+                return Ok((None, None));
+            };
+            let PersistentValue::BuildSchedule(s) = val else {
+                return Err(bulk_worker::corrupt());
+            };
+            let slots = s.options.distributed_workers.max(1) as u32;
+            let require_all_idle = if slots <= 1 {
+                false
+            } else {
+                match txn.get(LogicalKey::Manifest(id)).await? {
+                    Some(PersistentValue::IndexManifest(m)) => {
+                        m.lifecycle() != IndexLifecycle::Building
+                    }
+                    None => true,
+                    _ => return Err(bulk_worker::corrupt()),
+                }
+            };
+
+            let slot_keys: Vec<LogicalKey> = (0..slots)
+                .map(|slot| LogicalKey::BuildScheduleSlot { index: id, slot })
+                .collect();
+            txn.warm_for_update(slot_keys).await?;
+
+            match scan_and_claim_slot(&mut txn, id, slots, owner, lease, require_all_idle).await? {
+                SlotClaim::AlreadyOwned { slot, expires_ms } => {
+                    txn.rollback().await;
+                    Ok((None, Some((s, slot, expires_ms))))
+                }
+                SlotClaim::Claimed { slot, expires_ms } => {
+                    Ok((Some(txn), Some((s, slot, expires_ms))))
+                }
+                SlotClaim::Busy => {
+                    txn.rollback().await;
+                    Ok((None, None))
+                }
             }
-            Err(error) => {
-                retry
-                    .after_commit_error(Operation::ScheduleBulkBuild, &mut attempts, error)
-                    .await?;
-            }
-        }
-    }
+        },
+    )
+    .await?;
+
+    Ok(claimed.map(|(s, slot, exp)| {
+        context.bulk_authority = Some(BulkAuthority {
+            slot,
+            owner,
+            scheduled: true,
+        });
+        (s, slot, owner, exp)
+    }))
 }
 
-// Heartbeats share the admitted build operation. They must not request a second
-// foreground permit, which would deadlock a Runtime configured with capacity one.
-async fn renew<B: Backend>(
-    backend: &B,
+async fn cleanup_scheduled_job<B: Backend>(
+    context: &mut OperationContext<B>,
     id: LogicalIndexId,
-    owner: [u8; 32],
-    lease: Duration,
+    collab: bool,
+    retry: RetryPolicy,
 ) -> Result<()> {
-    let mut txn = WriteLogicalTxn::bootstrap(
-        backend.begin_write().await?,
-        backend.hard_limits(),
-        backend.admission_budget(),
-    );
-    let key = LogicalKey::BuildSchedule(id);
-    match txn.get_for_update(key.clone()).await? {
-        Some(PersistentValue::BuildSchedule(mut s)) if s.owner == owner => {
-            s.expires_ms = expiry(lease)?;
-            txn.put(key, PersistentValue::BuildSchedule(s)).await?;
-            txn.commit().await
-        }
-        _ => Err(Error::new(ErrorKind::BulkBuildSuperseded)),
+    match bulk_worker::cleanup(context, id, retry).await {
+        Err(e) if collab && e.kind() == ErrorKind::BulkBuildBusy => Ok(()),
+        other => other,
     }
 }
 
@@ -183,78 +696,198 @@ async fn drive<B: Backend>(
     id: LogicalIndexId,
     schedule: BuildSchedule,
     retry: RetryPolicy,
-) -> Result<()> {
+) -> Result<DriveOutcome> {
+    let collab = schedule.options.distributed_workers > 1;
     let backend = context.backend();
-    let mut txn = ReadLogicalTxn::bootstrap(backend.begin_read().await?);
-    let manifest = match txn.get(LogicalKey::Manifest(id)).await? {
-        None => {
-            drop(txn);
-            return bulk_worker::cleanup(context, id, retry).await;
-        }
-        Some(PersistentValue::IndexManifest(m)) => m,
-        _ => return Err(bulk_worker::corrupt()),
+    let (manifest_opt, descriptor_opt) = bulk_worker::retry_read(
+        &context.options,
+        Operation::ScheduleBulkBuild,
+        retry,
+        || {
+            let backend = Arc::clone(&backend);
+            async move {
+                let mut txn = ReadLogicalTxn::bootstrap(backend.begin_read().await?);
+                let m = match txn.get(LogicalKey::Manifest(id)).await? {
+                    None => return Ok((None, None)),
+                    Some(PersistentValue::IndexManifest(m)) => m,
+                    _ => return Err(bulk_worker::corrupt()),
+                };
+                if m.lifecycle() != IndexLifecycle::Building {
+                    return Ok((Some(m), None));
+                }
+                let d = match txn.get(LogicalKey::BuildDescriptor(id)).await? {
+                    Some(PersistentValue::BuildDescriptor(d)) => d,
+                    _ => return Err(bulk_worker::corrupt()),
+                };
+                Ok((Some(m), Some(d)))
+            }
+        },
+    )
+    .await?;
+
+    let Some(manifest) = manifest_opt else {
+        cleanup_scheduled_job(context, id, collab, retry).await?;
+        return Ok(DriveOutcome::AbortedOrDropped);
     };
     if manifest.lifecycle() == IndexLifecycle::Dropping {
-        drop(txn);
         super::lifecycle::drop_index_bound(context, schedule.name, retry, Some(id)).await?;
-        return bulk_worker::cleanup(context, id, retry).await;
+        cleanup_scheduled_job(context, id, collab, retry).await?;
+        return Ok(DriveOutcome::AbortedOrDropped);
     }
     if manifest.lifecycle() == IndexLifecycle::Active {
-        drop(txn);
-        return bulk_worker::cleanup(context, id, retry).await;
+        cleanup_scheduled_job(context, id, collab, retry).await?;
+        return Ok(DriveOutcome::Published);
     }
-    let descriptor = match txn.get(LogicalKey::BuildDescriptor(id)).await? {
-        Some(PersistentValue::BuildDescriptor(d)) => d,
-        _ => return Err(bulk_worker::corrupt()),
-    };
-    drop(txn);
-    bulk_worker::complete(context, manifest, descriptor, schedule.options, retry)
-        .await
-        .map(|_| ())
+    let descriptor = descriptor_opt.ok_or_else(bulk_worker::corrupt)?;
+    match bulk_worker::complete(
+        context,
+        manifest,
+        descriptor,
+        schedule.options.clone(),
+        retry,
+    )
+    .await
+    {
+        Ok(_) => Ok(DriveOutcome::Published),
+        Err(e)
+            if matches!(
+                e.kind(),
+                ErrorKind::IndexDropping | ErrorKind::IndexNotFound
+            ) =>
+        {
+            if e.kind() == ErrorKind::IndexDropping {
+                super::lifecycle::drop_index_bound(context, schedule.name, retry, Some(id)).await?;
+            }
+            cleanup_scheduled_job(context, id, collab, retry).await?;
+            Ok(DriveOutcome::AbortedOrDropped)
+        }
+        Err(e) => Err(e),
+    }
 }
 
-/// Releases the schedule and reports whether the worker persisted a terminal failure.
+struct FinishState {
+    failed: bool,
+    needs_final_cleanup: bool,
+}
+
 async fn finish<B: Backend>(
     context: &mut OperationContext<B>,
     id: LogicalIndexId,
-    success: bool,
-    delay: Duration,
+    outcome: Option<DriveOutcome>,
     retry: RetryPolicy,
-) -> Result<bool> {
-    let mut attempts = 0;
-    loop {
-        context.checkpoint()?;
-        let backend = context.backend();
-        let mut txn = WriteLogicalTxn::bootstrap(
-            backend.begin_write().await?,
-            backend.hard_limits(),
-            backend.admission_budget(),
-        );
-        let key = LogicalKey::BuildSchedule(id);
-        let failed = matches!(txn.get(LogicalKey::BuildWorkspace(id)).await?, Some(PersistentValue::BuildWorkspace(w)) if w.failure.is_some());
-        let Some(PersistentValue::BuildSchedule(mut s)) = txn.get_for_update(key.clone()).await?
-        else {
-            return Ok(failed);
-        };
-        if Some(s.owner) != context.bulk_authority {
-            return Err(Error::new(ErrorKind::BulkBuildSuperseded));
-        }
-        if success || failed {
-            txn.delete(key).await?;
-        } else {
-            s.owner = [0; 32];
-            s.expires_ms = expiry(delay)?;
-            txn.put(key, PersistentValue::BuildSchedule(s)).await?;
-        }
-        match context.commit(|start| txn.commit_with(start)).await {
-            Ok(()) => return Ok(failed),
-            Err(error) => {
-                retry
-                    .after_commit_error(Operation::ScheduleBulkBuild, &mut attempts, error)
-                    .await?;
+) -> Result<FinishState> {
+    let Some(auth) = context.bulk_authority.filter(|a| a.scheduled) else {
+        return Err(Error::new(ErrorKind::BulkBuildSuperseded));
+    };
+    let backend = context.backend();
+    let budget = backend.admission_budget();
+    // Use a short uncancelled deadline so graceful scheduler shutdown or cancellation
+    // still releases or retires this worker's `BuildScheduleSlot` lease cleanly.
+    let finish_ctrl = OperationOptions::default()
+        .with_deadline(std::time::Instant::now() + Duration::from_secs(2));
+    let attempted_slot_delete = std::sync::atomic::AtomicBool::new(false);
+    let attempted_ref = &attempted_slot_delete;
+
+    bulk_worker::retry_raw_write(
+        &finish_ctrl,
+        None,
+        Operation::ScheduleBulkBuild,
+        retry,
+        || async {
+            let prepared = async {
+                let mut txn = WriteLogicalTxn::bootstrap(
+                    backend.begin_write().await?,
+                    backend.hard_limits(),
+                    budget,
+                );
+                let key = LogicalKey::BuildSchedule(id);
+                let ws_opt = txn.get(LogicalKey::BuildWorkspace(id)).await?;
+                let failed = matches!(
+                    &ws_opt,
+                    Some(PersistentValue::BuildWorkspace(w)) if w.failure.is_some()
+                );
+                let ws_reclaimed = ws_opt.is_none();
+                let is_building = match txn.get(LogicalKey::Manifest(id)).await? {
+                    Some(PersistentValue::IndexManifest(m)) => {
+                        m.lifecycle() == IndexLifecycle::Building
+                    }
+                    None => false,
+                    _ => return Err(bulk_worker::corrupt()),
+                };
+                let Some(val) = txn.get_for_update(key.clone()).await? else {
+                    txn.rollback().await;
+                    return Ok((
+                        None,
+                        FinishState {
+                            failed,
+                            needs_final_cleanup: false,
+                        },
+                    ));
+                };
+                let PersistentValue::BuildSchedule(s) = val else {
+                    return Err(bulk_worker::corrupt());
+                };
+                let slots = s.options.distributed_workers.max(1) as u32;
+                let (active_peers, expired_peers) = inspect_peer_slots(
+                    &mut txn,
+                    id,
+                    slots,
+                    Some((auth.slot, auth.owner)),
+                    now_ms()?,
+                )
+                .await?;
+                let skey = auth.slot_key(id);
+                let has_self_slot = match txn.get_for_update(skey.clone()).await? {
+                    Some(PersistentValue::BuildUnit(u)) if u.owner == auth.owner => true,
+                    None if attempted_ref.load(std::sync::atomic::Ordering::SeqCst) => false,
+                    _ => return Err(Error::new(ErrorKind::BulkBuildSuperseded)),
+                };
+
+                let collab = slots > 1;
+                let terminal_done = outcome.is_some() || !is_building;
+                let can_retire_self = if collab {
+                    terminal_done || failed
+                } else {
+                    (terminal_done && ws_reclaimed) || failed
+                };
+                let mut needs_final_cleanup = false;
+                let mut any_mutation = false;
+                if has_self_slot {
+                    txn.delete(skey).await?;
+                    attempted_ref.store(true, std::sync::atomic::Ordering::SeqCst);
+                    any_mutation = true;
+                }
+                if can_retire_self && active_peers == 0 {
+                    let max_peer_del = budget.max_mutations.saturating_sub(2);
+                    let remaining_expired = expired_peers.len() > max_peer_del;
+                    for okey in expired_peers.into_iter().take(max_peer_del) {
+                        txn.delete(okey).await?;
+                        any_mutation = true;
+                    }
+                    if remaining_expired {
+                        needs_final_cleanup = true;
+                    } else if ws_reclaimed || failed {
+                        txn.delete(key).await?;
+                        any_mutation = true;
+                    } else {
+                        needs_final_cleanup = true;
+                    }
+                }
+                let state = FinishState {
+                    failed,
+                    needs_final_cleanup,
+                };
+                if !any_mutation {
+                    txn.rollback().await;
+                    return Ok((None, state));
+                }
+                Ok((Some(txn), state))
             }
-        }
-    }
+            .await;
+            bulk_worker::commit_raw_prepared(prepared).await
+        },
+    )
+    .await
 }
 
 async fn execute<B: Backend>(
@@ -263,98 +896,220 @@ async fn execute<B: Backend>(
     settings: BulkSchedulerOptions,
     retry: RetryPolicy,
 ) -> Result<()> {
-    let Some(s) = claim(&mut context, id, settings.lease_duration, retry).await? else {
+    let Some((s, slot, owner, initial_expires_ms)) =
+        claim(&mut context, id, settings.lease_duration, retry).await?
+    else {
         return Ok(());
     };
-    let backend = context.backend();
-    let (result, work_finished) = {
-        let work = drive(&mut context, id, s.clone(), retry);
-        let renewals = async {
-            let mut heartbeat = tokio::time::interval(settings.lease_duration / 3);
-            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            heartbeat.tick().await;
-            loop {
-                heartbeat.tick().await;
-                if let Err(error) =
-                    renew(backend.as_ref(), id, s.owner, settings.lease_duration).await
-                {
-                    break Err(error);
-                }
-            }
-        };
-        // A pending renewal must not stop work that holds a backend transaction slot.
-        tokio::select! {
-            result = work => (result, true),
-            result = renewals => (result, false),
-        }
+    let collab = s.options.distributed_workers > 1;
+    let authority = BulkAuthority {
+        slot,
+        owner,
+        scheduled: true,
     };
-    let failed = finish(
-        &mut context,
-        id,
-        result.is_ok(),
-        settings.poll_interval,
-        retry,
-    )
-    .await?;
-    // Only persisted worker failures are handled here. The scheduler classifies
-    // transient errors; coordination failures must reach its caller.
-    if work_finished && failed {
+    let lease_lock = Arc::new(tokio::sync::RwLock::new(()));
+    context.bulk_lease_lock = Some(Arc::clone(&lease_lock));
+    let backend = context.backend();
+
+    let (result, work_finished) = tokio::select! {
+        res = drive(&mut context, id, s.clone(), retry) => (res, true),
+        err = run_authority_lease_renewals(
+            backend,
+            lease_lock,
+            id,
+            authority,
+            settings.lease_duration,
+            initial_expires_ms,
+        ) => (Err(err), false),
+    };
+    context.bulk_lease_lock = None;
+
+    let drive_outcome = result.as_ref().ok().copied();
+    let finish_state = match finish(&mut context, id, drive_outcome, retry).await {
+        Ok(state) => state,
+        Err(e) if collab && e.kind() == ErrorKind::BulkBuildSuperseded && result.is_ok() => {
+            FinishState {
+                failed: false,
+                needs_final_cleanup: false,
+            }
+        }
+        Err(e) => return Err(e),
+    };
+
+    if finish_state.needs_final_cleanup {
+        context.bulk_authority = None;
+        context.options = OperationOptions::default()
+            .with_deadline(std::time::Instant::now() + Duration::from_secs(5));
+        let _ = bulk_worker::cleanup(&mut context, id, retry).await;
+    }
+
+    if work_finished
+        && (finish_state.failed || drive_outcome == Some(DriveOutcome::AbortedOrDropped))
+    {
         Ok(())
     } else {
-        result
+        result.map(|_| ())
     }
+}
+
+async fn has_any_active_slot_in_write<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    id: LogicalIndexId,
+    now: u64,
+) -> Result<bool> {
+    let range = LogicalRange::build_schedule_slots(id);
+    let mut cursor = None;
+    loop {
+        let page = txn
+            .scan(
+                &range,
+                cursor.as_ref(),
+                ScanLimits {
+                    item_limit: 260,
+                    byte_limit: 256 * 1024,
+                },
+            )
+            .await?;
+        for s_item in page.items() {
+            let LogicalKey::BuildScheduleSlot { index, .. } = *s_item.key() else {
+                return Err(bulk_worker::corrupt());
+            };
+            if index != id {
+                return Err(bulk_worker::corrupt());
+            }
+            let PersistentValue::BuildUnit(u) = s_item.value() else {
+                return Err(bulk_worker::corrupt());
+            };
+            if u.owner != [0; 32] && u.expires_ms > now {
+                return Ok(true);
+            }
+        }
+        cursor = page.into_next_cursor();
+        if cursor.is_none() {
+            return Ok(false);
+        }
+    }
+}
+
+async fn count_active_slots<T: ReadOps>(
+    txn: &mut ReadLogicalTxn<'_, T>,
+    id: LogicalIndexId,
+    now: u64,
+) -> Result<usize> {
+    let range = LogicalRange::build_schedule_slots(id);
+    let mut cursor = None;
+    let mut active = 0_usize;
+    loop {
+        let page = txn
+            .scan(
+                &range,
+                cursor.as_ref(),
+                ScanLimits {
+                    item_limit: 260,
+                    byte_limit: 256 * 1024,
+                },
+            )
+            .await?;
+        for s_item in page.items() {
+            let LogicalKey::BuildScheduleSlot { index, .. } = *s_item.key() else {
+                return Err(bulk_worker::corrupt());
+            };
+            if index != id {
+                return Err(bulk_worker::corrupt());
+            }
+            let PersistentValue::BuildUnit(u) = s_item.value() else {
+                return Err(bulk_worker::corrupt());
+            };
+            if u.owner != [0; 32] && u.expires_ms > now {
+                active += 1;
+            }
+        }
+        cursor = page.into_next_cursor();
+        if cursor.is_none() {
+            break;
+        }
+    }
+    Ok(active)
 }
 
 async fn discover<B: Backend>(
     context: OperationContext<B>,
     after: Option<LogicalIndexId>,
     limit: usize,
+    active_local: BTreeSet<LogicalIndexId>,
 ) -> Result<(Vec<LogicalIndexId>, Option<LogicalIndexId>)> {
     context.checkpoint()?;
     let backend = context.backend();
-    let mut txn = backend.begin_read().await?;
-    // Start with available slots so a ready queue does not overfetch. Widen only
-    // past leased entries, with a fixed per-poll bound independent of concurrency.
+    let mut txn = ReadLogicalTxn::bootstrap(backend.begin_read().await?);
     let mut remaining = 256;
-    let mut page_limit = limit;
+    let mut page_limit = limit.max(1);
     let mut cursor = after;
     let now = now_ms()?;
     let mut ids = Vec::new();
     while remaining != 0 {
+        let range = LogicalRange::build_schedules(cursor);
         let page = txn
             .scan(
-                &keys::build_schedule_range(cursor),
+                &range,
+                None,
                 ScanLimits {
                     item_limit: page_limit.min(remaining),
                     byte_limit: 1024 * 1024,
                 },
             )
             .await?;
-        for item in page.items() {
-            let key = keys::decode_key(&[], item.key())?;
-            let LogicalKey::BuildSchedule(id) = key else {
+        let has_more = page.next_cursor().is_some();
+        let items = page.into_items();
+        let page_len = items.len();
+        for item in items {
+            let LogicalKey::BuildSchedule(id) = *item.key() else {
                 return Err(bulk_worker::corrupt());
             };
-            let PersistentValue::BuildSchedule(schedule) =
-                ValueCodec::bootstrap().decode(&key, item.value().clone())?
-            else {
+            let PersistentValue::BuildSchedule(schedule) = item.into_value() else {
                 return Err(bulk_worker::corrupt());
             };
             cursor = Some(id);
-            // Claim establishes authority transactionally; this snapshot only
-            // avoids futile attempts against leases that have not expired.
-            if schedule.expires_ms <= now {
+            if active_local.contains(&id) {
+                continue;
+            }
+            let slots = schedule.options.distributed_workers.max(1);
+            let active_slots = count_active_slots(&mut txn, id, now).await?;
+            let eligible = if slots == 1 {
+                active_slots == 0
+            } else {
+                let is_building = match txn.get(LogicalKey::Manifest(id)).await? {
+                    Some(PersistentValue::IndexManifest(m)) => {
+                        m.lifecycle() == IndexLifecycle::Building
+                    }
+                    None => false,
+                    _ => return Err(bulk_worker::corrupt()),
+                };
+                if is_building {
+                    let ws_failed = matches!(
+                        txn.get(LogicalKey::BuildWorkspace(id)).await?,
+                        Some(PersistentValue::BuildWorkspace(w)) if w.failure.is_some()
+                    );
+                    if ws_failed {
+                        active_slots == 0
+                    } else {
+                        active_slots < slots
+                    }
+                } else {
+                    active_slots == 0
+                }
+            };
+            if eligible {
                 ids.push(id);
                 if ids.len() == limit {
                     return Ok((ids, cursor));
                 }
             }
         }
-        if page.is_terminal() {
+        if !has_more || page_len == 0 {
             return Ok((ids, None));
         }
-        remaining -= page.items().len();
-        page_limit = (page_limit * 2).min(remaining);
+        remaining = remaining.saturating_sub(page_len);
+        page_limit = (page_limit * 2).min(remaining.max(1));
         context.checkpoint()?;
     }
     Ok((ids, cursor))
@@ -370,6 +1125,8 @@ pub(crate) async fn run<B: Backend>(
     let stop = CancellationToken::new();
     let _cancel_on_drop = stop.clone().drop_guard();
     let mut jobs = tokio::task::JoinSet::<Result<()>>::new();
+    let mut active_tasks = BTreeMap::<tokio::task::Id, LogicalIndexId>::new();
+    let mut active_ids = BTreeSet::<LogicalIndexId>::new();
     let mut cursor = None;
     let mut timer = tokio::time::interval(settings.poll_interval);
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -379,18 +1136,37 @@ pub(crate) async fn run<B: Backend>(
             _ = runtime.handle.inner.maintenance_cancel.cancelled() => break Ok(()),
             _ = async { if let Some(token) = control.cancellation() { token.cancelled().await } else { std::future::pending().await } } => break Err(Error::new(ErrorKind::Cancelled)),
             _ = async { if let Some(deadline) = control.deadline() { tokio::time::sleep_until(deadline.into()).await } else { std::future::pending().await } } => break Err(Error::new(ErrorKind::DeadlineExceeded)),
-            result = jobs.join_next(), if !jobs.is_empty() => {
+            result = jobs.join_next_with_id(), if !jobs.is_empty() => {
                 match result {
-                    Some(Err(e)) => break Err(Error::with_source(ErrorKind::Other,e)),
-                    Some(Ok(Err(e))) if e.kind() == ErrorKind::RuntimeClosed && runtime.handle.inner.maintenance_cancel.is_cancelled() => break Ok(()),
-                    Some(Ok(Err(e))) if !matches!(e.kind(), ErrorKind::RetryableAbort | ErrorKind::ContentionExhausted | ErrorKind::CommitOutcomeUnknown | ErrorKind::LimitExceeded | ErrorKind::BulkBuildSuperseded | ErrorKind::BulkBuildBusy) => break Err(e),
-                    _ => {}
+                    Some(Err(e)) => break Err(Error::with_source(ErrorKind::Other, e)),
+                    Some(Ok((task_id, res))) => {
+                        if let Some(done_id) = active_tasks.remove(&task_id) {
+                            active_ids.remove(&done_id);
+                        }
+                        match res {
+                            Err(e) if e.kind() == ErrorKind::RuntimeClosed && runtime.handle.inner.maintenance_cancel.is_cancelled() => break Ok(()),
+                            Err(e) if !matches!(
+                                e.kind(),
+                                ErrorKind::RetryableAbort
+                                    | ErrorKind::ContentionExhausted
+                                    | ErrorKind::CommitOutcomeUnknown
+                                    | ErrorKind::LimitExceeded
+                                    | ErrorKind::BulkBuildSuperseded
+                                    | ErrorKind::BulkBuildBusy
+                                    | ErrorKind::IndexDropping
+                                    | ErrorKind::IndexNotFound
+                            ) => break Err(e),
+                            _ => {}
+                        }
+                    }
+                    None => {}
                 }
             }
             _ = timer.tick(), if jobs.len() < settings.max_jobs => {
                 let count = settings.max_jobs - jobs.len();
-                let page = runtime.run_foreground(Operation::ScheduleBulkBuild, None, control.clone(), move |context| discover(context,cursor,count)).await;
-                let (ids,next) = match page {
+                let running_snapshot = active_ids.clone();
+                let page = runtime.run_foreground(Operation::ScheduleBulkBuild, None, control.clone(), move |context| discover(context, cursor, count, running_snapshot)).await;
+                let (ids, next) = match page {
                     Ok(page) => page,
                     Err(e) if matches!(e.kind(), ErrorKind::RetryableAbort | ErrorKind::LimitExceeded) => continue,
                     Err(e) if e.kind() == ErrorKind::RuntimeClosed && runtime.handle.inner.maintenance_cancel.is_cancelled() => break Ok(()),
@@ -398,9 +1174,15 @@ pub(crate) async fn run<B: Backend>(
                 };
                 cursor = next;
                 for id in ids {
+                    if !active_ids.insert(id) {
+                        continue;
+                    }
                     let inner = Arc::clone(&runtime.handle.inner);
                     let options = OperationOptions::default().with_cancellation(stop.clone());
-                    jobs.spawn(async move { inner.run_foreground(Operation::ScheduleBulkBuild, Some(id), options, move |context| execute(context,id,settings,retry)).await });
+                    let ab = jobs.spawn(async move {
+                        inner.run_foreground(Operation::ScheduleBulkBuild, Some(id), options, move |context| execute(context, id, settings, retry)).await
+                    });
+                    active_tasks.insert(ab.id(), id);
                 }
             }
         }

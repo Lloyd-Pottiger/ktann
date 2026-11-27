@@ -142,10 +142,11 @@ A bounded read-only audit of one Logical Index's persistent invariants that eith
 _Avoid_: Search-time validation, automatic repair
 
 **Input Snapshot**:
-A finite immutable source of complete Records for Bulk Build preparation, identified by a schema-bound, checksummed manifest. It is not a backend transaction snapshot or a serving Logical Index.
+A finite, immutable, caller-owned directory of segmented canonical source Records (`seg-{i:08x}.bin`) and an **Input Manifest**, bound to an Index Configuration and per-segment SHA-256 digests for Bulk Build preparation. It is not a backend transaction snapshot or a serving Logical Index.
 
-**Construction Artifact**:
-An immutable, sealed output of construction work, identified independently of its filesystem location. A single-tree topology artifact contains partition plans; it does not by itself establish serving membership or authorize publication.
+**Coarse Shard**:
+A deterministic build-time partition of routing work produced by `ShardPlan` from a bounded prefix sample (`<= 32,768` records). Heavy Tree Keys split across multiple vector-space coarse centers; light Tree Keys hash into shared coarse shards. Coarse Shards exist only during Bulk Build and are not serving partitions.
+_Avoid_: Leaf Partition, Tree Key
 
 **Offline Refinement**:
 A caller-exclusive preparation operation on a settled Active Logical Index before serving. It improves leaf assignments and centroids under capacity constraints while preserving Partition Keys, topology and exact membership. Errors can leave a valid, partially refined index.
@@ -203,59 +204,31 @@ _Avoid_: Partition count, convergence state
 - A Sharded Forest contains disjoint records, not replicated recall trees.
 - Structure Maintenance requires no global owner or lease.
 
-## Offline artifacts
+## Bulk Build coordination
 
-- An **Input Snapshot** is a finite, immutable, caller-owned file of full Vector
-  Records in receipt order, bound to an Index Configuration.
-- A **Forest Artifact** contains deterministic partition plans for all Tree Keys,
-  bound to the Input Snapshot, semantic configuration, rotation seed, and training
-  sample size. Resource budgets do not determine artifact identity.
-- A **Serving Artifact** contains canonical logical key/value bytes derived from
-  exact joins between an Input Snapshot and its Forest Artifact, bound to a target
-  Index Manifest. Adapter limits constrain production or consumption without
-  changing artifact identity. It grants no loading or publication authority.
-- An **Artifact Manifest** identifies sealed file bytes by kind, binding, count,
-  size, and SHA-256 digest. The caller retains the trusted expected identity.
+- An **Input Snapshot** is a finite, immutable, caller-owned segmented directory of full Vector Records in receipt order, bound to an Index Configuration via an **Input Manifest** containing segment counts, byte lengths, and SHA-256 digests. The caller retains the trusted expected `InputManifest`.
+- Bulk Build emits canonical serving KV records directly into the hidden `Building` Logical Index without intermediate whole-index topology or serving files. In ample memory, coarse shards remain resident with zero workspace scratch writes; under tight memory budgets or multi-worker collaboration, workers exchange bounded indexed coarse-shard files in the Build Workspace.
 
 ### Bulk Build Reservation
 
 A durable name and Logical Index ID held by a Building Manifest, with a separate
-immutable Build Descriptor identifying the caller-owned input snapshot and
+immutable Build Descriptor identifying the caller-owned Input Snapshot and
 construction parameters. Ordinary operations reject Building. Job handles bind
 the never-reused ID; abort cannot follow a reused name or remove a published index.
-Reservation itself launches no work. `complete` drives preparation, loading,
-validation, activation and owned-file reclamation. Scheduled jobs execute the
-same phases under renewable ownership.
+Reservation itself launches no work. `complete` drives sharded construction, loading,
+validation, activation, and owned-file reclamation. Scheduled jobs execute the
+same phases under renewable single-worker or collaborative multi-slot ownership.
 
-**Forest Artifact**: A sealed topology artifact for every nonempty
-Tree Key in one finite Input Snapshot. Preparation rejects globally duplicate
-Record IDs before constructing trees. It carries no backend loading or publication
-authority; exact serving-membership validation is still required.
+**Build Progress**: The index-scoped authoritative state record (`LogicalKey::BuildProgress`) for one `Building` Logical Index. It tracks the current `BuildPhase` (`Preparing`, `Loading`, `Loaded`, `Validating`), attempt epoch, topology counts, expected 512-bit homomorphic multiset digest (`LtHash`, wrapping `8 x u64` SHA-512 words), and parallel validation split keys.
 
-**Serving Artifact**: A sealed, sorted file of canonical serving KV pairs for a
-specific Logical Index identity, produced by exact source/assignment and topology
-joins. It preserves source records and payloads and uses the online projection
-codecs. It excludes lifecycle bookkeeping and conveys no loading or publication
-authority; sealed backend validation is still required.
-
-**Build Load**: The single fenced task that loads one immutable Serving Artifact
-into a hidden Building index. Its epoch rejects superseded workers, and its
-entry cursor commits atomically with each data chunk. Loaded means the artifact
-stream finished; it is not sealed backend validation or permission to publish.
-
+**Build Unit**: One stage-scoped unit of collaborative work or validation slice (`LogicalKey::BuildUnit { index, stage, unit }`). Each unit binds the build epoch, a renewable worker owner token and expiry, completion status, item counts, and 512-bit `LtHash` multiset digests for Record ID deduplication, exact `Location == LeafEntry` membership, `ChildEntry == Centroid` closure, and emitted serving KV inventory.
 
 **Build Workspace**: Namespace-scoped durable ownership of one job's token-named
-preparation directory, options, epoch, accepted artifacts and terminal failure.
+preparation directory, worker options, active writer-fence token, epoch, and terminal failure.
 It survives removal of the index prefix until exclusive-lock cleanup completes.
 
-**Build Validation**: A paged exact comparison proof between a core-accepted
-Serving Artifact and frozen backend serving KV bytes. The completed proof and
-immutable completed Build Load authorize one atomic transition from Building to Active.
-
-
 **Build Schedule**: Namespace-scoped durable request for automatic execution of
-one Bulk Build Job. It fixes worker options and the original name/ID and carries
-a renewable owner token with an expiry for takeover. A committed token change
-fences every old build writer; time alone is not write authority. It is separate
-from artifact ownership in Build Workspace and retires after completion/cleanup
+one Bulk Build Job. It fixes worker options (including `distributed_workers`) and the original name/ID, while worker ownership leases live in `LogicalKey::BuildScheduleSlot` (`slot = 0..distributed_workers`). A committed token change
+fences superseded writers; time alone is not write authority. It is separate
+from scratch-directory ownership in Build Workspace and retires after workspace reclamation
 or a persisted terminal job failure.

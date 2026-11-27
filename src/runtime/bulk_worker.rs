@@ -1,26 +1,219 @@
-//! Durable, attempt-fenced preparation and namespace-owned artifact reclamation.
-use super::{OperationContext, lifecycle::RetryPolicy};
-use crate::api::{BulkBuildReport, BulkWorkerOptions, Error, ErrorKind, Result};
-use crate::bulk::{
-    ForestArtifact, ForestOptions, InputSnapshot, OrderedSource, ServingArtifact, ServingOptions,
+//! Unified sharded Bulk Build worker claims, transaction chunking, and workspace reclamation.
+
+use std::collections::BTreeSet;
+use std::fs::{self, File, OpenOptions};
+use std::future::Future;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use bytes::Bytes;
+use tokio_util::sync::{CancellationToken, DropGuard};
+
+use crate::api::{
+    BulkBuildReport, BulkLoadOptions, BulkWorkerOptions, Error, ErrorKind, LogicalIndexId,
+    OperationOptions, PartitionKey, Result,
 };
+use crate::bulk::{LtHash, ShardPlan};
 use crate::observe::labels::Operation;
-use crate::storage::backend::Backend;
-use crate::storage::keys::LogicalKey;
+use crate::storage::backend::{AdmissionBudget, Backend, HardLimits, ScanLimits, WriteTxn};
+use crate::storage::keys::{self, LogicalKey};
 use crate::storage::values::{
-    BuildDescriptor, BuildWorkspace, IndexLifecycle, IndexManifest, PersistentValue,
-    PreparedArtifact,
+    BuildDescriptor, BuildPhase, BuildProgress, BuildWorkspace, IndexLifecycle, IndexManifest,
+    MAX_SPLIT_KEYS, PersistentValue,
 };
-use crate::storage::{ReadLogicalTxn, WriteLogicalTxn};
-use std::{
-    fs::{self, File, OpenOptions},
-    path::Path,
-    sync::Arc,
-    time::Instant,
+use crate::storage::{LogicalRange, ReadLogicalTxn, WriteLogicalTxn};
+
+use super::{
+    OperationContext,
+    bulk_scheduler::{
+        BulkAuthority, acquire_unscheduled_peer_slot, authorize_raw,
+        ensure_no_peer_scheduler_leases, non_zero_token, release_unscheduled_peer_slot,
+        retire_orphaned_schedule, run_authority_lease_renewals,
+    },
+    lifecycle::RetryPolicy,
 };
 
-/// A shared root lock is retained by native work, even when its async waiter is
-/// cancelled. Exclusive cleanup therefore cannot race a detached/stale writer.
+#[path = "bulk_pipeline.rs"]
+pub(crate) mod bulk_pipeline;
+
+pub(super) const MAX_WRITER_LANES: usize = 8;
+const MAX_TXN_AFFECTED_BYTES: usize = 8 * 1024 * 1024;
+pub(super) const BUILD_UNIT_MUTATION_BYTES: usize = 296;
+
+#[derive(Clone, Copy)]
+pub(crate) struct WriteFence {
+    pub epoch: u64,
+    pub owner: [u8; 32],
+}
+
+/// Coordinates background lease heartbeats with foreground chunk/completion commits
+/// on the same `BuildUnit` so a worker never conflict-aborts its own transactions.
+#[derive(Clone)]
+pub(crate) struct UnitLease {
+    pub stage: u8,
+    pub unit: u32,
+    pub owner: [u8; 32],
+    pub duration: Duration,
+    pub lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// Outcome of one prepare-and-commit write attempt before retry policy resolution.
+pub(crate) enum CommitStep<T> {
+    Done(T),
+    PrepareAbort,
+    CommitFailed(Error),
+    Fatal(Error),
+}
+
+impl<T> CommitStep<T> {
+    pub(crate) async fn resolve(
+        self,
+        op: Operation,
+        retry: RetryPolicy,
+        attempts: &mut u32,
+    ) -> Result<Option<T>> {
+        match self {
+            Self::Done(v) => Ok(Some(v)),
+            Self::PrepareAbort => {
+                retry.wait_or_exhaust(op, attempts).await?;
+                Ok(None)
+            }
+            Self::CommitFailed(e) => {
+                retry.after_commit_error(op, attempts, e).await?;
+                Ok(None)
+            }
+            Self::Fatal(e) => Err(e),
+        }
+    }
+}
+
+pub(crate) async fn commit_raw_prepared<W: WriteTxn, T>(
+    prepared: Result<(Option<WriteLogicalTxn<'_, W>>, T)>,
+) -> CommitStep<T> {
+    match prepared {
+        Ok((None, out)) => CommitStep::Done(out),
+        Ok((Some(txn), out)) => match txn.commit().await {
+            Ok(()) => CommitStep::Done(out),
+            Err(e) => CommitStep::CommitFailed(e),
+        },
+        Err(e) if e.kind() == ErrorKind::RetryableAbort => CommitStep::PrepareAbort,
+        Err(e) => CommitStep::Fatal(e),
+    }
+}
+
+pub(crate) async fn lock_sched_read(
+    lock: &Option<Arc<tokio::sync::RwLock<()>>>,
+) -> Option<tokio::sync::RwLockReadGuard<'_, ()>> {
+    match lock {
+        Some(l) => Some(l.read().await),
+        None => None,
+    }
+}
+
+/// Executes a context-managed bootstrap write transaction with scheduler read-lock protection and retries.
+pub(crate) async fn retry_ctx_write<'b, B, T, F, Fut>(
+    context: &mut OperationContext<B>,
+    backend: &'b B,
+    budget: AdmissionBudget,
+    op: Operation,
+    retry: RetryPolicy,
+    mut prepare: F,
+) -> Result<T>
+where
+    B: Backend,
+    F: FnMut(WriteLogicalTxn<'b, B::WriteTxn<'b>>) -> Fut,
+    Fut: Future<Output = Result<(Option<WriteLogicalTxn<'b, B::WriteTxn<'b>>>, T)>>,
+{
+    let sched_lock = context.bulk_lease_lock.clone();
+    let mut attempts = 0;
+    loop {
+        let step = {
+            context.checkpoint()?;
+            let _sched_guard = lock_sched_read(&sched_lock).await;
+            let prepared = match backend.begin_write().await {
+                Ok(raw) => {
+                    prepare(WriteLogicalTxn::bootstrap(
+                        raw,
+                        backend.hard_limits(),
+                        budget,
+                    ))
+                    .await
+                }
+                Err(e) => Err(e),
+            };
+            context.commit_prepared(prepared).await
+        };
+        if let Some(done) = step.resolve(op, retry, &mut attempts).await? {
+            return Ok(done);
+        }
+    }
+}
+
+/// Executes a non-context write transaction step with scheduler read-lock protection and retries.
+pub(crate) async fn retry_raw_write<T, F, Fut>(
+    control: &OperationOptions,
+    sched_lock: Option<&tokio::sync::RwLock<()>>,
+    op: Operation,
+    retry: RetryPolicy,
+    mut step: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = CommitStep<T>>,
+{
+    let mut attempts = 0;
+    loop {
+        super::check_control(control)?;
+        let guard = match sched_lock {
+            Some(l) => Some(l.read().await),
+            None => None,
+        };
+        let outcome = step().await;
+        drop(guard);
+        if let Some(done) = outcome.resolve(op, retry, &mut attempts).await? {
+            return Ok(done);
+        }
+    }
+}
+
+/// Executes a read-only backend step with bounded `RetryableAbort` retries and control checks.
+pub(crate) async fn retry_read<T, F, Fut>(
+    control: &OperationOptions,
+    op: Operation,
+    retry: RetryPolicy,
+    mut step: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let mut attempts = 0;
+    loop {
+        super::check_control(control)?;
+        match step().await {
+            Ok(v) => return Ok(v),
+            Err(e) if e.kind() == ErrorKind::RetryableAbort => {
+                retry.wait_or_exhaust(op, &mut attempts).await?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Binds a drop-triggered cancellation token to `base` so dropping the owning async future
+/// immediately cancels synchronous CPU/disk loops running inside `spawn_blocking`.
+pub(crate) fn drop_guarded_options(base: &OperationOptions) -> (OperationOptions, DropGuard) {
+    let token = match base.cancellation() {
+        Some(parent) => parent.child_token(),
+        None => CancellationToken::new(),
+    };
+    let guard = token.clone().drop_guard();
+    (base.clone().with_cancellation(token), guard)
+}
+
+/// Shared root advisory lock retained across native workspace IO; exclusive cleanup
+/// cannot delete directories while any local worker holds a shared lock.
 pub(crate) fn lock_root(root: &Path, exclusive: bool) -> Result<File> {
     let path = root.join(".ktann-build-lock");
     if fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
@@ -44,28 +237,17 @@ pub(crate) fn lock_root(root: &Path, exclusive: bool) -> Result<File> {
     })?;
     Ok(lock)
 }
-/// Retains CPU admission until native work exits, even if its async waiter is
-/// dropped. Callers capture any filesystem lock needed by that detached work.
+
+/// Runs synchronous CPU/disk work while retaining foreground CPU admission and drop-cancellation.
 pub(crate) async fn blocking<B: Backend, T: Send + 'static>(
     context: &OperationContext<B>,
     work: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
-    context.checkpoint()?;
-    let admission = context
-        .cpu_admission
-        .clone()
-        .expect("bulk worker admission");
-    let options = context.options.clone();
-    tokio::task::spawn_blocking(move || {
-        let _admission = admission;
-        super::check_control(&options)?;
-        work()
-    })
-    .await
-    .map_err(|e| Error::with_source(ErrorKind::Other, e))?
+    context.compute(|_options| work()).await
 }
+
 /// Reads and conflict-protects the exact handle identity before lifecycle decisions.
-pub(crate) async fn manifest<T: crate::storage::backend::WriteTxn>(
+pub(crate) async fn manifest<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     expected: &IndexManifest,
 ) -> Result<IndexManifest> {
@@ -78,7 +260,9 @@ pub(crate) async fn manifest<T: crate::storage::backend::WriteTxn>(
         _ => Err(corrupt()),
     }
 }
-pub(crate) async fn building<T: crate::storage::backend::WriteTxn>(
+
+/// Entry-point lifecycle check (`Active` rejects reservation/schedule/manual restart with `InvalidArgument`).
+pub(crate) async fn building<T: WriteTxn>(
     txn: &mut WriteLogicalTxn<'_, T>,
     expected: &IndexManifest,
 ) -> Result<()> {
@@ -88,7 +272,38 @@ pub(crate) async fn building<T: crate::storage::backend::WriteTxn>(
         IndexLifecycle::Active => Err(Error::invalid_argument()),
     }
 }
-/// Resolves the shared workspace once at the worker/queue input boundary.
+
+/// Classifies a read-only `Manifest` lookup for an in-flight worker or validator.
+pub(crate) fn check_manifest_building_in_flight(
+    value: Option<&PersistentValue>,
+    expected: &IndexManifest,
+) -> Result<()> {
+    match value {
+        None => Err(Error::new(ErrorKind::IndexNotFound)),
+        Some(PersistentValue::IndexManifest(m)) if m.has_same_immutable_identity(expected) => {
+            match m.lifecycle() {
+                IndexLifecycle::Building => Ok(()),
+                IndexLifecycle::Dropping => Err(Error::new(ErrorKind::IndexDropping)),
+                IndexLifecycle::Active => Err(Error::new(ErrorKind::BulkBuildSuperseded)),
+            }
+        }
+        _ => Err(corrupt()),
+    }
+}
+
+/// In-flight lifecycle check for worker tasks, validation slices, and sealing (`Active` means
+/// a peer already published this build and supersedes our in-flight attempt).
+pub(crate) async fn building_in_flight<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    expected: &IndexManifest,
+) -> Result<()> {
+    match manifest(txn, expected).await?.lifecycle() {
+        IndexLifecycle::Building => Ok(()),
+        IndexLifecycle::Dropping => Err(Error::new(ErrorKind::IndexDropping)),
+        IndexLifecycle::Active => Err(Error::new(ErrorKind::BulkBuildSuperseded)),
+    }
+}
+
 pub(crate) async fn normalize_options<B: Backend>(
     context: &OperationContext<B>,
     mut options: BulkWorkerOptions,
@@ -107,8 +322,118 @@ pub(crate) async fn normalize_options<B: Backend>(
     Ok(options)
 }
 
+async fn fill_report_counts_from_progress<B: Backend>(
+    context: &OperationContext<B>,
+    id: LogicalIndexId,
+    retry: RetryPolicy,
+    report: &mut BulkBuildReport,
+) -> Result<()> {
+    if report.records > 0 || report.entries > 0 {
+        return Ok(());
+    }
+    let backend = context.backend();
+    let val = retry_read(&context.options, Operation::PublishBulkBuild, retry, || {
+        let backend = Arc::clone(&backend);
+        async move {
+            let mut rtxn = ReadLogicalTxn::bootstrap(backend.begin_read().await?);
+            rtxn.get(LogicalKey::BuildProgress(id)).await
+        }
+    })
+    .await?;
+    if let Some(PersistentValue::BuildProgress(p)) = val {
+        report.records = p.total_records;
+        report.trees = p.trees;
+        report.partitions = p.partitions;
+        report.entries = p.total_entries;
+    }
+    Ok(())
+}
+
+async fn run_with_optional_peer_slot<B, T, F>(
+    context: &mut OperationContext<B>,
+    id: LogicalIndexId,
+    peer_slot: Option<ActivePeerSlot>,
+    options: &BulkWorkerOptions,
+    retry: RetryPolicy,
+    work: F,
+) -> Result<T>
+where
+    B: Backend,
+    F: AsyncFnOnce(&mut OperationContext<B>) -> Result<T>,
+{
+    let Some((slot, owner, initial_exp, lease_lock)) = peer_slot else {
+        return work(context).await;
+    };
+    let backend = context.backend();
+    let auth = BulkAuthority {
+        slot,
+        owner,
+        scheduled: false,
+    };
+    let lease = options.unit_lease;
+    let outcome = tokio::select! {
+        res = work(context) => res,
+        err = run_authority_lease_renewals(backend, lease_lock, id, auth, lease, initial_exp) => Err(err),
+    };
+    release_unscheduled_peer_slot(context, id, slot, owner, retry).await?;
+    outcome
+}
+
+type ActivePeerSlot = (u32, [u8; 32], u64, Arc<tokio::sync::RwLock<()>>);
+
+async fn maybe_acquire_peer_slot<B: Backend>(
+    context: &mut OperationContext<B>,
+    index: &IndexManifest,
+    options: &BulkWorkerOptions,
+    retry: RetryPolicy,
+) -> Result<Option<ActivePeerSlot>> {
+    if options.distributed_workers <= 1 || context.bulk_authority.is_some() {
+        return Ok(None);
+    }
+    let (slot, owner, initial_exp) =
+        acquire_unscheduled_peer_slot(context, index, options, retry).await?;
+    let lease_lock = Arc::new(tokio::sync::RwLock::new(()));
+    context.bulk_lease_lock = Some(Arc::clone(&lease_lock));
+    Ok(Some((slot, owner, initial_exp, lease_lock)))
+}
+
+async fn complete_attempt<B: Backend>(
+    context: &mut OperationContext<B>,
+    index: &IndexManifest,
+    descriptor: &BuildDescriptor,
+    options: &BulkWorkerOptions,
+    retry: RetryPolicy,
+    report: &mut BulkBuildReport,
+) -> Result<IndexManifest> {
+    let started = Instant::now();
+    let publication =
+        super::bulk_publish::publish(context, index.clone(), descriptor.clone(), retry).await;
+    report.publish += started.elapsed();
+    match publication {
+        Err(error) if error.kind() == ErrorKind::BulkBuildBusy => {
+            let normalized = normalize_options(context, options.clone()).await?;
+            let pub_elapsed = report.publish;
+            *report = run_normalized(
+                context,
+                index.clone(),
+                descriptor.clone(),
+                normalized,
+                retry,
+            )
+            .await?;
+            report.publish = pub_elapsed;
+            let started = Instant::now();
+            let publication =
+                super::bulk_publish::publish(context, index.clone(), descriptor.clone(), retry)
+                    .await;
+            report.publish += started.elapsed();
+            publication
+        }
+        other => other,
+    }
+}
+
 /// Resumes the durable phase and atomically publishes the original identity.
-/// Concurrent callers may supersede an attempt; retries observe the latest phase.
 pub(crate) async fn complete<B: Backend>(
     context: &mut OperationContext<B>,
     index: IndexManifest,
@@ -116,60 +441,48 @@ pub(crate) async fn complete<B: Backend>(
     options: BulkWorkerOptions,
     retry: RetryPolicy,
 ) -> Result<(IndexManifest, BulkBuildReport)> {
+    options.validate()?;
     let mut attempts = 0;
     let mut report = BulkBuildReport::default();
+    let id = index.logical_index_id();
     loop {
         context.checkpoint()?;
-        let result = async {
-            let started = Instant::now();
-            let publication =
-                super::bulk_publish::publish(context, index.clone(), descriptor.clone(), retry)
-                    .await;
-            report.publish += started.elapsed();
-            match publication {
-                Err(error) if error.kind() == ErrorKind::BulkBuildBusy => {
-                    let publication_time = report.publish;
-                    report = run(
-                        context,
-                        index.clone(),
-                        descriptor.clone(),
-                        options.clone(),
-                        retry,
-                    )
-                    .await?;
-                    report.publish = publication_time;
-                    let started = Instant::now();
-                    let publication = super::bulk_publish::publish(
-                        context,
-                        index.clone(),
-                        descriptor.clone(),
-                        retry,
-                    )
-                    .await;
-                    report.publish += started.elapsed();
-                    publication
-                }
-                result => result,
+        let peer_slot = if super::bulk_publish::already_active_retry(context, &index, retry)
+            .await?
+            .is_some()
+        {
+            Ok(None)
+        } else {
+            maybe_acquire_peer_slot(context, &index, &options, retry).await
+        };
+        let result = match peer_slot {
+            Ok(slot_opt) => {
+                run_with_optional_peer_slot(context, id, slot_opt, &options, retry, async |ctx| {
+                    complete_attempt(ctx, &index, &descriptor, &options, retry, &mut report).await
+                })
+                .await
             }
-        }
-        .await;
-        // A peer can publish and reclaim files during any native IO or KV await.
+            Err(error) => Err(error),
+        };
+
         let result = match result {
-            Err(error) => match super::bulk_publish::already_active(context, &index).await {
-                Ok(Some(active)) => Ok(active),
-                _ => Err(error),
-            },
-            other => other,
+            Ok(active) => Ok(active),
+            Err(error) => {
+                match super::bulk_publish::already_active_retry(context, &index, retry).await {
+                    Ok(Some(active)) => Ok(active),
+                    _ => Err(error),
+                }
+            }
         };
         match result {
             Ok(active) => {
+                fill_report_counts_from_progress(context, id, retry, &mut report).await?;
                 let started = Instant::now();
-                match cleanup(context, index.logical_index_id(), retry).await {
-                    // Manual callers can defer cleanup to the namespace sweep.
-                    // Scheduled jobs must retain their queue entry until cleanup succeeds.
+                match cleanup(context, id, retry).await {
                     Err(error)
                         if error.kind() == ErrorKind::BulkBuildBusy
-                            && context.bulk_authority.is_none() => {}
+                            && (options.distributed_workers > 1
+                                || context.bulk_authority.is_none()) => {}
                     result => result?,
                 }
                 report.publish += started.elapsed();
@@ -190,8 +503,7 @@ pub(crate) async fn complete<B: Backend>(
     }
 }
 
-/// Runs one preparation/loading attempt, reusing accepted artifacts. Publication
-/// remains a separate phase, and terminal failures are recorded only by its owner.
+/// Runs sharded construction and backend emission, leaving the index in `Loaded`.
 pub(crate) async fn run<B: Backend>(
     context: &mut OperationContext<B>,
     index: IndexManifest,
@@ -200,335 +512,975 @@ pub(crate) async fn run<B: Backend>(
     retry: RetryPolicy,
 ) -> Result<BulkBuildReport> {
     let options = normalize_options(context, options).await?;
-    // Lock before registration or any directory creation, so cleanup can remove
-    // the ledger only when every potential creator has left this critical region.
+    let id = index.logical_index_id();
+    let peer_slot = maybe_acquire_peer_slot(context, &index, &options, retry).await?;
+    let options_ref = options.clone();
+    run_with_optional_peer_slot(context, id, peer_slot, &options_ref, retry, async |ctx| {
+        run_normalized(ctx, index, descriptor, options, retry).await
+    })
+    .await
+}
+
+async fn peer_completed_loading<B: Backend>(
+    context: &OperationContext<B>,
+    expected: &IndexManifest,
+    retry: RetryPolicy,
+) -> Result<Option<BuildProgress>> {
+    let id = expected.logical_index_id();
+    let backend = context.backend();
+    retry_read(&context.options, Operation::RunBulkBuild, retry, || {
+        let backend = Arc::clone(&backend);
+        async move {
+            let mut rtxn = ReadLogicalTxn::bootstrap(backend.begin_read().await?);
+            let Some(PersistentValue::IndexManifest(m)) =
+                rtxn.get(LogicalKey::Manifest(id)).await?
+            else {
+                return Ok(None);
+            };
+            if !m.has_same_immutable_identity(expected) {
+                return Err(corrupt());
+            }
+            match m.lifecycle() {
+                IndexLifecycle::Active => match rtxn.get(LogicalKey::BuildProgress(id)).await? {
+                    Some(PersistentValue::BuildProgress(p)) => Ok(Some(p)),
+                    _ => Ok(None),
+                },
+                IndexLifecycle::Building => match rtxn.get(LogicalKey::BuildProgress(id)).await? {
+                    Some(PersistentValue::BuildProgress(p))
+                        if matches!(p.phase, BuildPhase::Loaded | BuildPhase::Validating) =>
+                    {
+                        Ok(Some(p))
+                    }
+                    _ => Ok(None),
+                },
+                IndexLifecycle::Dropping => Err(Error::new(ErrorKind::IndexDropping)),
+            }
+        }
+    })
+    .await
+}
+
+async fn run_normalized<B: Backend>(
+    context: &mut OperationContext<B>,
+    index: IndexManifest,
+    descriptor: BuildDescriptor,
+    options: BulkWorkerOptions,
+    retry: RetryPolicy,
+) -> Result<BulkBuildReport> {
+    let collab = options.distributed_workers > 1;
+    if collab
+        && super::bulk_publish::already_active_retry(context, &index, retry)
+            .await?
+            .is_some()
+    {
+        let mut report = BulkBuildReport {
+            rotation_seed: *index.rotation_seed(),
+            ..BulkBuildReport::default()
+        };
+        fill_report_counts_from_progress(context, index.logical_index_id(), retry, &mut report)
+            .await?;
+        return Ok(report);
+    }
+
     let root = options.workspace.clone();
     let lock = Arc::new(blocking(context, move || lock_root(&root, false)).await?);
-    let mut state = claim(context, &index, &descriptor, options, retry).await?;
-    let result = prepare_and_load(context, &index, &descriptor, &mut state, lock, retry).await;
+    let (state, fence) = match claim(context, &index, &descriptor, options, retry).await {
+        Ok(ClaimOutcome::AlreadyLoaded(p)) => {
+            return Ok(BulkBuildReport {
+                records: p.total_records,
+                trees: p.trees,
+                partitions: p.partitions,
+                entries: p.total_entries,
+                rotation_seed: *index.rotation_seed(),
+                ..BulkBuildReport::default()
+            });
+        }
+        Ok(ClaimOutcome::Claimed(state, fence)) => (state, fence),
+        Err(e) if collab && e.kind() == ErrorKind::BulkBuildSuperseded => {
+            if let Some(p) = peer_completed_loading(context, &index, retry).await? {
+                return Ok(BulkBuildReport {
+                    records: p.total_records,
+                    trees: p.trees,
+                    partitions: p.partitions,
+                    entries: p.total_entries,
+                    rotation_seed: *index.rotation_seed(),
+                    ..BulkBuildReport::default()
+                });
+            }
+            return Err(e);
+        }
+        Err(e) => return Err(e),
+    };
+
+    let in_memory = state.options.distributed_workers == 1
+        && fits_in_memory(&index, &descriptor, &state.options);
+    if !in_memory {
+        let dir = state.directory();
+        let guard = lock.clone();
+        blocking(context, move || {
+            let _lock = guard;
+            fs::create_dir_all(&dir).map_err(io)?;
+            File::open(dir.parent().expect("workspace root"))
+                .and_then(|f| f.sync_all())
+                .map_err(io)
+        })
+        .await?;
+    }
+
+    let result = bulk_pipeline::run_pipeline(
+        context,
+        &index,
+        &descriptor,
+        &state,
+        fence,
+        in_memory,
+        lock,
+        retry,
+    )
+    .await;
     if let Err(error) = &result {
-        record_failure(context, &index, &state, error.kind(), retry).await?;
+        if collab
+            && error.kind() == ErrorKind::BulkBuildSuperseded
+            && let Some(p) = peer_completed_loading(context, &index, retry).await?
+        {
+            return Ok(BulkBuildReport {
+                records: p.total_records,
+                trees: p.trees,
+                partitions: p.partitions,
+                entries: p.total_entries,
+                rotation_seed: *index.rotation_seed(),
+                ..BulkBuildReport::default()
+            });
+        }
+        record_failure(context, &index, &state, Some(fence), error.kind(), retry).await?;
     }
     result
 }
-/// Takes a preparation epoch while retaining accepted outputs from prior attempts.
-/// Once validation owns the next phase, this worker cannot supersede it.
+
+fn fits_in_memory(
+    index: &IndexManifest,
+    descriptor: &BuildDescriptor,
+    options: &BulkWorkerOptions,
+) -> bool {
+    let items = descriptor.input().items();
+    if items == 0 {
+        return true;
+    }
+    let effective_mem = options.memory_bytes as u64;
+    let dim = index.config().dimension() as u64;
+    let per_row = dim.saturating_mul(4).saturating_add(320);
+    let wave_size = (options.parallelism.clamp(1, 16)) as u64;
+    let est_segments = items.div_ceil(16_384).max(1);
+    let avg_seg_bytes = descriptor.input().bytes() / est_segments;
+    let wave_frame_bytes = avg_seg_bytes.saturating_mul(wave_size.min(est_segments));
+    let seg_overhead = items.min(16_384).saturating_mul(per_row);
+    let needed = items
+        .saturating_mul(per_row)
+        .saturating_add(wave_frame_bytes)
+        .saturating_add(seg_overhead)
+        .saturating_add(4096);
+    needed <= effective_mem
+}
+
+enum ClaimOutcome {
+    AlreadyLoaded(BuildProgress),
+    Claimed(BuildWorkspace, WriteFence),
+}
+
+/// Claims or joins the workspace and installs `BuildWorkspace.writer_token`.
 async fn claim<B: Backend>(
     context: &mut OperationContext<B>,
     index: &IndexManifest,
     descriptor: &BuildDescriptor,
     options: BulkWorkerOptions,
     retry: RetryPolicy,
-) -> Result<BuildWorkspace> {
-    let mut token = [0; 32];
-    getrandom::fill(&mut token).map_err(|_| Error::new(ErrorKind::Other))?;
+) -> Result<ClaimOutcome> {
+    let ws_token = non_zero_token()?;
+    let writer_token = non_zero_token()?;
+
+    let _ = effective_budget(context.backend().admission_budget(), options.load)?;
+    let id = index.logical_index_id();
+
     let mut attempts = 0;
     loop {
         context.checkpoint()?;
         let backend = context.backend();
-        let mut txn = WriteLogicalTxn::bootstrap(
-            backend.begin_write().await?,
-            backend.hard_limits(),
-            backend.admission_budget(),
-        );
-        building(&mut txn, index).await?;
-        super::bulk_scheduler::authorize(context, &mut txn, index.logical_index_id()).await?;
-        match txn
-            .get(LogicalKey::BuildDescriptor(index.logical_index_id()))
-            .await?
-        {
-            Some(PersistentValue::BuildDescriptor(d)) if d == *descriptor => {}
-            _ => return Err(corrupt()),
-        }
-        let state = match txn
-            .get_for_update(LogicalKey::BuildWorkspace(index.logical_index_id()))
-            .await?
-        {
-            None => BuildWorkspace {
-                options: options.clone(),
-                hard_limits: backend.hard_limits(),
-                token,
-                epoch: 1,
-                forest: None,
-                serving: None,
-                failure: None,
-            },
-            Some(PersistentValue::BuildWorkspace(mut w)) => {
-                if w.options != options || w.hard_limits != backend.hard_limits() {
-                    return Err(Error::invalid_argument());
+        let prepared = async {
+            let mut txn = WriteLogicalTxn::bootstrap(
+                backend.begin_write().await?,
+                backend.hard_limits(),
+                backend.admission_budget(),
+            );
+            let current_manifest = manifest(&mut txn, index).await?;
+            match current_manifest.lifecycle() {
+                IndexLifecycle::Building => {}
+                IndexLifecycle::Dropping => return Err(Error::new(ErrorKind::IndexDropping)),
+                IndexLifecycle::Active if options.distributed_workers > 1 => {
+                    if let Some(PersistentValue::BuildProgress(p)) =
+                        txn.get(LogicalKey::BuildProgress(id)).await?
+                    {
+                        txn.rollback().await;
+                        return Ok((None, ClaimOutcome::AlreadyLoaded(p)));
+                    }
+                    return Err(Error::new(ErrorKind::BulkBuildSuperseded));
                 }
-                if let Some(kind) = w.failure {
-                    return Err(Error::new(kind));
-                }
-                w.epoch = w
-                    .epoch
-                    .checked_add(1)
-                    .ok_or_else(|| Error::new(ErrorKind::IdExhausted))?;
-                w
+                IndexLifecycle::Active => return Err(Error::invalid_argument()),
             }
-            _ => return Err(corrupt()),
-        };
-        if txn
-            .get(LogicalKey::BuildValidation(index.logical_index_id()))
-            .await?
-            .is_some()
-        {
-            // Validation owns the next phase; this worker can no longer claim it.
-            return Err(Error::new(ErrorKind::BulkBuildSuperseded));
+            super::bulk_scheduler::authorize(context, &mut txn, id).await?;
+            match txn.get(LogicalKey::BuildDescriptor(id)).await? {
+                Some(PersistentValue::BuildDescriptor(d)) if d == *descriptor => {}
+                _ => return Err(corrupt()),
+            }
+
+            let existing_progress = match txn.get_for_update(LogicalKey::BuildProgress(id)).await? {
+                None => None,
+                Some(PersistentValue::BuildProgress(p)) => Some(p),
+                _ => return Err(corrupt()),
+            };
+
+            let (state, fence) = match txn.get_for_update(LogicalKey::BuildWorkspace(id)).await? {
+                None => {
+                    if existing_progress
+                        .as_ref()
+                        .is_some_and(|p| p.phase == BuildPhase::Validating)
+                    {
+                        return Err(Error::new(ErrorKind::BulkBuildSuperseded));
+                    }
+                    let state = BuildWorkspace {
+                        options: options.clone(),
+                        hard_limits: backend.hard_limits(),
+                        token: ws_token,
+                        writer_token,
+                        epoch: 1,
+                        failure: None,
+                    };
+                    (
+                        state,
+                        WriteFence {
+                            epoch: 1,
+                            owner: writer_token,
+                        },
+                    )
+                }
+                Some(PersistentValue::BuildWorkspace(mut w)) => {
+                    if w.options != options || w.hard_limits != backend.hard_limits() {
+                        return Err(Error::invalid_argument());
+                    }
+                    if let Some(kind) = w.failure {
+                        return Err(Error::new(kind));
+                    }
+                    if w.writer_token == [0; 32]
+                        || existing_progress
+                            .as_ref()
+                            .is_some_and(|p| p.phase == BuildPhase::Validating)
+                    {
+                        return Err(Error::new(ErrorKind::BulkBuildSuperseded));
+                    }
+                    if let Some(p) = existing_progress.as_ref()
+                        && p.phase == BuildPhase::Loaded
+                    {
+                        let loaded_prog = p.clone();
+                        txn.rollback().await;
+                        return Ok((None, ClaimOutcome::AlreadyLoaded(loaded_prog)));
+                    }
+                    if options.distributed_workers > 1 {
+                        let existing_fence = WriteFence {
+                            epoch: w.epoch,
+                            owner: w.writer_token,
+                        };
+                        if existing_progress
+                            .as_ref()
+                            .is_some_and(|p| p.epoch == w.epoch)
+                        {
+                            txn.rollback().await;
+                            return Ok((None, ClaimOutcome::Claimed(w, existing_fence)));
+                        }
+                        (w, existing_fence)
+                    } else {
+                        w.epoch = w
+                            .epoch
+                            .checked_add(1)
+                            .ok_or_else(|| Error::new(ErrorKind::IdExhausted))?;
+                        w.writer_token = writer_token;
+                        (
+                            w.clone(),
+                            WriteFence {
+                                epoch: w.epoch,
+                                owner: writer_token,
+                            },
+                        )
+                    }
+                }
+                _ => return Err(corrupt()),
+            };
+
+            txn.put(
+                LogicalKey::BuildWorkspace(id),
+                PersistentValue::BuildWorkspace(state.clone()),
+            )
+            .await?;
+            if existing_progress.is_none() || options.distributed_workers == 1 {
+                let disk_mode =
+                    options.distributed_workers > 1 || !fits_in_memory(index, descriptor, &options);
+                let total_records = descriptor.input().items();
+                let est_entries = total_records.saturating_mul(4).saturating_add(64);
+                let progress = BuildProgress {
+                    phase: if disk_mode {
+                        BuildPhase::Preparing
+                    } else {
+                        BuildPhase::Loading
+                    },
+                    epoch: fence.epoch,
+                    total_records,
+                    loaded_entries: 0,
+                    total_entries: if total_records == 0 { 0 } else { est_entries },
+                    trees: 0,
+                    partitions: 0,
+                    expected_kv_lthash: LtHash::ZERO,
+                    validation_split_keys: Vec::new(),
+                };
+                txn.put(
+                    LogicalKey::BuildProgress(id),
+                    PersistentValue::BuildProgress(progress),
+                )
+                .await?;
+            }
+            Ok((Some(txn), ClaimOutcome::Claimed(state, fence)))
         }
-        txn.put(
-            LogicalKey::BuildWorkspace(index.logical_index_id()),
-            PersistentValue::BuildWorkspace(state.clone()),
-        )
-        .await?;
-        match context.commit(|start| txn.commit_with(start)).await {
-            Ok(()) => return Ok(state),
+        .await;
+
+        let (txn_opt, outcome) = match prepared {
+            Ok(v) => v,
             Err(e) if e.kind() == ErrorKind::RetryableAbort => {
                 retry
                     .wait_or_exhaust(Operation::RunBulkBuild, &mut attempts)
-                    .await?
+                    .await?;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        let Some(txn) = txn_opt else {
+            return Ok(outcome);
+        };
+        match context.commit(|start| txn.commit_with(start)).await {
+            Ok(()) => return Ok(outcome),
+            Err(e) if e.kind() == ErrorKind::RetryableAbort => {
+                retry
+                    .wait_or_exhaust(Operation::RunBulkBuild, &mut attempts)
+                    .await?;
             }
             Err(e) => return Err(e),
         }
     }
 }
-/// Reuses accepted Serving bytes without source IO; otherwise prepares the
-/// missing artifacts in the current attempt before handing them to the loader.
-async fn prepare_and_load<B: Backend>(
-    context: &mut OperationContext<B>,
-    index: &IndexManifest,
-    descriptor: &BuildDescriptor,
-    state: &mut BuildWorkspace,
-    lock: Arc<File>,
-    retry: RetryPolicy,
-) -> Result<BulkBuildReport> {
-    let mut report = BulkBuildReport::default();
-    let serving = if let Some(accepted) = &state.serving {
-        let path = state.attempt(accepted.epoch).join("serving");
-        let expected = accepted.manifest.clone();
-        let manifest = index.clone();
-        let source = descriptor.input().clone();
-        let forest = state.forest.as_ref().ok_or_else(corrupt)?.manifest.clone();
-        let limits = state.hard_limits;
-        let guard = lock.clone();
-        blocking(context, move || {
-            let _lock = guard;
-            ServingArtifact::open(&path, expected, &source, &forest, &manifest, limits)
-        })
-        .await?
-    } else {
-        let input = blocking(context, {
-            let descriptor = descriptor.clone();
-            let config = index.config().clone();
-            let lock = lock.clone();
-            move || {
-                let _lock = lock;
-                InputSnapshot::open(descriptor.source(), config, descriptor.input().clone())
-            }
-        })
-        .await?;
-        {
-            let path = state.attempt(state.epoch);
-            let lock = lock.clone();
-            blocking(context, move || {
-                let _lock = lock;
-                fs::create_dir_all(path.parent().expect("owned directory")).map_err(io)?;
-                fs::create_dir(&path).map_err(io)?;
-                File::open(path.parent().expect("parent"))
-                    .and_then(|f| f.sync_all())
-                    .map_err(io)?;
-                File::open(
-                    path.parent()
-                        .and_then(Path::parent)
-                        .expect("workspace root"),
-                )
-                .and_then(|f| f.sync_all())
-                .map_err(io)
-            })
-            .await?;
-        }
-        let forest_options = ForestOptions {
-            refinement_rounds: descriptor.refinement_rounds(),
-            refinement_memory_bytes: state.options.refinement_memory_bytes,
-            sample_items: descriptor.options().sample_items,
-            tree_memory_bytes: descriptor.options().memory_bytes,
-            tree_scratch_bytes: descriptor.options().scratch_bytes,
-            sort_memory_bytes: state.options.sort_memory_bytes,
-            sort_scratch_bytes: state.options.sort_scratch_bytes,
-        };
-        let serving_options = ServingOptions {
-            graph_memory_bytes: state.options.graph_memory_bytes,
-            memory_bytes: state.options.serving_memory_bytes,
-            scratch_bytes: state.options.serving_scratch_bytes,
-            hard_limits: state.hard_limits,
-        };
-        let mut ordered = None;
-        let forest = if let Some(accepted) = &state.forest {
-            let path = state.attempt(accepted.epoch).join("forest");
-            let expected = accepted.manifest.clone();
-            let source = input.clone();
-            let seed = *index.rotation_seed();
-            let lock = lock.clone();
-            blocking(context, move || {
-                let _lock = lock;
-                ForestArtifact::open(
-                    &path,
-                    expected,
-                    source.manifest(),
-                    source.config().clone(),
-                    seed,
-                    forest_options.sample_items,
-                    forest_options.refinement_rounds,
-                )
-            })
-            .await?
-        } else {
-            let path = state.attempt(state.epoch).join("forest");
-            let source = input.clone();
-            let seed = *index.rotation_seed();
-            let quota = state.options.max_artifact_bytes;
-            let lock = lock.clone();
-            let start = Instant::now();
-            let control = context.options.clone();
-            let (forest, forest_report, sorted) = blocking(context, move || {
-                let _lock = lock;
-                let check = || super::check_control(&control);
-                if source.config().tree_key_fields().is_empty() {
-                    let sorted = OrderedSource::build(
-                        &path.with_file_name("source-sort"),
-                        &source,
-                        serving_options,
-                        &check,
-                    )?;
-                    let (forest, report) = ForestArtifact::build_ordered(
-                        &path,
-                        &source,
-                        seed,
-                        forest_options,
-                        quota,
-                        &sorted,
-                        &check,
-                    )?;
-                    return Ok((forest, report, Some(sorted)));
-                }
-                let (forest, report) = ForestArtifact::build_controlled(
-                    &path,
-                    &source,
-                    seed,
-                    forest_options,
-                    quota,
-                    &check,
-                )?;
-                Ok((forest, report, None))
-            })
-            .await?;
-            report.serving = sorted.as_ref().map(|s| s.elapsed).unwrap_or_default();
-            report.forest = start.elapsed() - report.serving;
-            ordered = sorted;
-            report.forest_report = Some(forest_report);
-            let mut after = state.clone();
-            after.forest = Some(PreparedArtifact {
-                epoch: state.epoch,
-                manifest: forest.manifest().clone(),
-            });
-            accept(context, index, state, &after, retry).await?;
-            *state = after;
-            forest
-        };
-        let path = state.attempt(state.epoch).join("serving");
-        let manifest = index.clone();
-        let quota = state.options.max_artifact_bytes;
-        let lock = lock.clone();
-        let start = Instant::now();
-        let control = context.options.clone();
-        let (serving, serving_report) = blocking(context, move || {
-            let _lock = lock;
-            ServingArtifact::build_controlled(
-                &path,
-                (&input, ordered),
-                &forest,
-                &manifest,
-                serving_options,
-                quota,
-                &|| super::check_control(&control),
-            )
-        })
-        .await?;
-        report.serving += start.elapsed();
-        report.serving_report = Some(serving_report);
-        let mut after = state.clone();
-        after.serving = Some(PreparedArtifact {
-            epoch: state.epoch,
-            manifest: serving.manifest().clone(),
-        });
-        accept(context, index, state, &after, retry).await?;
-        *state = after;
-        serving
-    };
-    // The shared root lock spans the entire async load; detached reader tasks
-    // hold only open immutable file handles and cannot recreate deleted paths.
-    let start = Instant::now();
-    super::bulk_load::load(
-        context,
-        index.clone(),
-        descriptor.clone(),
-        serving,
-        state.options.load,
-        retry,
-    )
-    .await?;
-    report.load = start.elapsed();
-    Ok(report)
+
+pub(crate) fn effective_budget(
+    mut budget: AdmissionBudget,
+    load: BulkLoadOptions,
+) -> Result<AdmissionBudget> {
+    budget.max_mutations = budget.max_mutations.min(load.max_mutations);
+    budget.max_mutation_bytes = budget.max_mutation_bytes.min(load.max_bytes);
+    if budget.max_mutations < 2 || budget.max_mutation_bytes == 0 {
+        return Err(Error::invalid_argument());
+    }
+    Ok(budget)
 }
-/// Publishes accepted outputs or terminal failure only for the exact claimed
-/// workspace state. Reading the successor makes uncertain commits idempotent.
-async fn accept<B: Backend>(
-    context: &mut OperationContext<B>,
+
+/// Advances `BuildProgress` (`Preparing -> Loading` and/or `loaded_entries += delta`).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "progress advancement accepts explicit backend/control/fencing handles from both OperationContext and StageEnv"
+)]
+pub(crate) async fn advance_loading_progress<B: Backend>(
+    backend: &B,
+    control: &OperationOptions,
+    sched_lease_lock: Option<&tokio::sync::RwLock<()>>,
+    bulk_authority: Option<BulkAuthority>,
     index: &IndexManifest,
-    before: &BuildWorkspace,
-    after: &BuildWorkspace,
-    retry: RetryPolicy,
+    fence: WriteFence,
+    delta_entries: u64,
+    retry: Option<RetryPolicy>,
 ) -> Result<()> {
-    let mut attempts = 0;
-    loop {
-        context.checkpoint()?;
-        let backend = context.backend();
+    if delta_entries == 0 && retry.is_none() {
+        return Ok(());
+    }
+    let id = index.logical_index_id();
+    let step_once = || async {
         let mut txn = WriteLogicalTxn::bootstrap(
             backend.begin_write().await?,
             backend.hard_limits(),
             backend.admission_budget(),
         );
-        building(&mut txn, index).await?;
-        super::bulk_scheduler::authorize(context, &mut txn, index.logical_index_id()).await?;
-        let key = LogicalKey::BuildWorkspace(index.logical_index_id());
-        let current = match txn.get_for_update(key.clone()).await? {
-            Some(PersistentValue::BuildWorkspace(w)) => w,
-            _ => return Err(corrupt()),
-        };
-        if current == *after {
-            return Ok(());
-        }
-        if current != *before {
-            return Err(Error::new(ErrorKind::BulkBuildSuperseded));
-        }
-        txn.put(key, PersistentValue::BuildWorkspace(after.clone()))
+        building_in_flight(&mut txn, index).await?;
+        authorize_raw(&mut txn, id, bulk_authority).await?;
+        check_writer_fence(&mut txn, index, fence).await?;
+        if let Some(PersistentValue::BuildProgress(mut p)) =
+            txn.get_for_update(LogicalKey::BuildProgress(id)).await?
+            && p.epoch == fence.epoch
+            && matches!(p.phase, BuildPhase::Preparing | BuildPhase::Loading)
+            && (delta_entries > 0 || p.phase == BuildPhase::Preparing)
+        {
+            p.phase = BuildPhase::Loading;
+            p.loaded_entries = p.loaded_entries.saturating_add(delta_entries);
+            if p.loaded_entries > p.total_entries {
+                p.total_entries = p.loaded_entries;
+            }
+            txn.put(
+                LogicalKey::BuildProgress(id),
+                PersistentValue::BuildProgress(p),
+            )
             .await?;
-        match context.commit(|start| txn.commit_with(start)).await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                retry
-                    .after_commit_error(Operation::RunBulkBuild, &mut attempts, e)
-                    .await?
+            return Ok::<_, Error>((Some(txn), ()));
+        }
+        txn.rollback().await;
+        Ok((None, ()))
+    };
+
+    if let Some(policy) = retry {
+        retry_raw_write(
+            control,
+            sched_lease_lock,
+            Operation::RunBulkBuild,
+            policy,
+            || async { commit_raw_prepared(step_once().await).await },
+        )
+        .await
+    } else {
+        let _guard = match sched_lease_lock {
+            Some(l) => Some(l.read().await),
+            None => None,
+        };
+        match step_once().await {
+            Ok((Some(txn), ())) => {
+                if let Err(e) = txn.commit().await
+                    && e.kind() == ErrorKind::Corruption
+                {
+                    return Err(e);
+                }
+                Ok(())
+            }
+            Ok((None, ())) => Ok(()),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    ErrorKind::RetryableAbort
+                        | ErrorKind::LimitExceeded
+                        | ErrorKind::CommitOutcomeUnknown
+                ) =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Sealed serving inventory totals and homomorphic digest committed when entering `Loaded`.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SealedSummary {
+    pub records: u64,
+    pub trees: u64,
+    pub partitions: u64,
+    pub entries: u64,
+    pub expected_kv_lthash: LtHash,
+}
+
+pub(crate) async fn finalize_and_seal_loaded<B: Backend>(
+    context: &mut OperationContext<B>,
+    index: &IndexManifest,
+    fence: WriteFence,
+    plan: &ShardPlan,
+    summary: SealedSummary,
+    retry: RetryPolicy,
+    report: &mut BulkBuildReport,
+) -> Result<()> {
+    let split_keys = build_validation_split_keys(
+        index.logical_index_id(),
+        plan,
+        summary.entries,
+        context.backend().hard_limits(),
+    )?;
+    seal_loaded(context, index, fence, summary, split_keys, retry).await?;
+    report.records = summary.records;
+    report.trees = summary.trees;
+    report.partitions = summary.partitions;
+    report.entries = summary.entries;
+    Ok(())
+}
+
+/// Builds up to `MAX_SPLIT_KEYS` (`255`) balanced validation split keys strictly inside
+/// `serving_data_range(index_id)` (`[0x01..0x05)`), bounded so `BuildProgress` always fits
+/// well inside `hard_limits.max_value_bytes`.
+pub(crate) fn build_validation_split_keys(
+    index_id: LogicalIndexId,
+    plan: &ShardPlan,
+    total_entries: u64,
+    hard_limits: HardLimits,
+) -> Result<Vec<Bytes>> {
+    if total_entries < 4_096 {
+        return Ok(Vec::new());
+    }
+    let target_splits = (total_entries / 32_768).clamp(2, MAX_SPLIT_KEYS as u64) as usize;
+    let rg_budget = (target_splits * 3 / 5).max(1);
+    let part_budget = target_splits.saturating_sub(rg_budget + 1).max(1);
+
+    let mut split_keys = Vec::with_capacity(target_splits + 8);
+    if !plan.id_bounds.is_empty() {
+        let target_rg = rg_budget.min(plan.id_bounds.len());
+        for i in 0..target_rg {
+            let pos = (i * plan.id_bounds.len()) / target_rg;
+            split_keys.push(Bytes::from(keys::record_key(
+                index_id,
+                &plan.id_bounds[pos],
+            )?));
+        }
+    }
+    split_keys.push(Bytes::from(
+        keys::tree_manifest_range(index_id).start().to_vec(),
+    ));
+
+    let total_heavy_shards: u64 = plan
+        .heavy_trees
+        .iter()
+        .map(|h| u64::from(h.shard_count))
+        .sum();
+    if let Some(non_zero_heavy) = std::num::NonZeroU64::new(total_heavy_shards) {
+        for heavy in &plan.heavy_trees {
+            split_keys.push(Bytes::from(keys::header_key(
+                index_id,
+                &heavy.tree_key,
+                PartitionKey::new(1)?,
+            )));
+            let tree_splits =
+                ((u64::from(heavy.shard_count) * part_budget as u64) / non_zero_heavy) as usize;
+            let approx_leaves = u64::from(heavy.shard_count).saturating_mul(64);
+            if tree_splits > 0 && approx_leaves >= 4 {
+                for s in 1..=tree_splits {
+                    let pk_num = ((approx_leaves * s as u64) / (tree_splits as u64 + 1)).max(2);
+                    split_keys.push(Bytes::from(keys::header_key(
+                        index_id,
+                        &heavy.tree_key,
+                        PartitionKey::new(pk_num)?,
+                    )));
+                }
+            }
+        }
+    }
+
+    let serving = keys::serving_data_range(index_id);
+    split_keys.retain(|k| serving.start() < k.as_ref() && k.as_ref() < serving.end());
+    split_keys.sort_unstable();
+    split_keys.dedup();
+    if split_keys.len() > MAX_SPLIT_KEYS {
+        let step = split_keys.len() as f64 / MAX_SPLIT_KEYS as f64;
+        split_keys = (0..MAX_SPLIT_KEYS)
+            .map(|i| split_keys[((i as f64 * step) as usize).min(split_keys.len() - 1)].clone())
+            .collect();
+        split_keys.dedup();
+    }
+
+    let max_split_bytes = hard_limits
+        .max_value_bytes
+        .saturating_sub(1024)
+        .min(64 * 1024);
+    while split_keys.iter().map(|k| 4 + k.len()).sum::<usize>() > max_split_bytes
+        && split_keys.len() > 1
+    {
+        let next_cap = (split_keys.len() / 2).max(1);
+        let step = split_keys.len() as f64 / next_cap as f64;
+        split_keys = (0..next_cap)
+            .map(|i| split_keys[((i as f64 * step) as usize).min(split_keys.len() - 1)].clone())
+            .collect();
+        split_keys.dedup();
+    }
+    if split_keys.iter().map(|k| 4 + k.len()).sum::<usize>() > max_split_bytes {
+        split_keys.clear();
+    }
+    Ok(split_keys)
+}
+
+pub(crate) fn validate_split_keys_in_index(id: LogicalIndexId, split_keys: &[Bytes]) -> Result<()> {
+    let serving = keys::serving_data_range(id);
+    if split_keys
+        .iter()
+        .any(|k| k.as_ref() <= serving.start() || k.as_ref() >= serving.end())
+        || split_keys.windows(2).any(|w| w[0] >= w[1])
+    {
+        return Err(corrupt());
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum RangeClearGuard {
+    StaleServing(WriteFence),
+    PublishedTransient,
+}
+
+async fn check_range_clear_guard<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    index: &IndexManifest,
+    bulk_authority: Option<BulkAuthority>,
+    guard: RangeClearGuard,
+) -> Result<bool> {
+    let id = index.logical_index_id();
+    match guard {
+        RangeClearGuard::StaleServing(fence) => {
+            check_writer_fence(txn, index, fence).await?;
+            authorize_raw(txn, id, bulk_authority).await?;
+            Ok(true)
+        }
+        RangeClearGuard::PublishedTransient => {
+            match txn.get_for_update(LogicalKey::Manifest(id)).await? {
+                None => Ok(false),
+                Some(PersistentValue::IndexManifest(m))
+                    if m.logical_index_id() == id && m.lifecycle() == IndexLifecycle::Active =>
+                {
+                    Ok(true)
+                }
+                Some(PersistentValue::IndexManifest(m))
+                    if m.logical_index_id() == id && m.lifecycle() == IndexLifecycle::Dropping =>
+                {
+                    Ok(false)
+                }
+                Some(PersistentValue::IndexManifest(m))
+                    if m.logical_index_id() == id && m.lifecycle() == IndexLifecycle::Building =>
+                {
+                    Err(Error::invalid_argument())
+                }
+                _ => Err(corrupt()),
             }
         }
     }
 }
-/// Persists terminal failures for the current owner; cancellation, contention,
-/// and lost ownership must leave the build resumable rather than poison it.
+
+/// Clears a logical key range via `transactional_clear_range` when supported or bounded
+/// point-delete batches otherwise, sharing retry and pagination logic between epoch recovery
+/// and post-publication `BuildUnit` reclamation.
+async fn clear_index_range<B: Backend>(
+    context: &mut OperationContext<B>,
+    index: &IndexManifest,
+    range: LogicalRange,
+    guard: RangeClearGuard,
+    op: Operation,
+    budget: AdmissionBudget,
+    retry: RetryPolicy,
+) -> Result<()> {
+    let bulk_authority = context.bulk_authority;
+    let backend = context.backend();
+    let hard_limits = backend.hard_limits();
+    let range_ref = &range;
+    if backend.capabilities().transactional_clear_range {
+        let adm = backend.admission_budget();
+        return retry_ctx_write(
+            context,
+            backend.as_ref(),
+            adm,
+            op,
+            retry,
+            |raw_boot| async move {
+                let mut txn =
+                    WriteLogicalTxn::for_index(raw_boot.into_raw(), index, hard_limits, adm);
+                if !check_range_clear_guard(&mut txn, index, bulk_authority, guard).await? {
+                    txn.rollback().await;
+                    return Ok::<_, Error>((None, ()));
+                }
+                txn.clear_range(range_ref).await?;
+                Ok((Some(txn), ()))
+            },
+        )
+        .await;
+    }
+
+    let max_del_muts = budget.max_mutations.max(1);
+    let max_del_bytes = budget.max_mutation_bytes.max(1);
+    let mut cursor = None;
+    loop {
+        context.checkpoint()?;
+        let page = retry_read(&context.options, op, retry, || {
+            let backend = Arc::clone(&backend);
+            let cursor_ref = cursor.clone();
+            async move {
+                let mut rtxn = ReadLogicalTxn::for_index(backend.begin_read().await?, index);
+                rtxn.scan(
+                    range_ref,
+                    cursor_ref.as_ref(),
+                    ScanLimits {
+                        item_limit: max_del_muts,
+                        byte_limit: max_del_bytes,
+                    },
+                )
+                .await
+            }
+        })
+        .await?;
+        if page.items().is_empty() {
+            return Ok(());
+        }
+        let next_cursor = page.next_cursor().cloned();
+        let del_batches = split_delete_keys(
+            page.into_items().into_iter().map(|it| it.key().clone()),
+            budget,
+        )?;
+        for batch_keys in del_batches {
+            let batch_ref = &batch_keys;
+            let proceed = retry_ctx_write(
+                context,
+                backend.as_ref(),
+                budget,
+                op,
+                retry,
+                |raw_boot| async move {
+                    let mut txn =
+                        WriteLogicalTxn::for_index(raw_boot.into_raw(), index, hard_limits, budget);
+                    if !check_range_clear_guard(&mut txn, index, bulk_authority, guard).await? {
+                        txn.rollback().await;
+                        return Ok::<_, Error>((None, false));
+                    }
+                    let mut batch = txn.mutations();
+                    for lk in batch_ref {
+                        batch.delete(lk.clone())?;
+                    }
+                    txn.apply(batch).await?;
+                    Ok((Some(txn), true))
+                },
+            )
+            .await?;
+            if !proceed {
+                return Ok(());
+            }
+        }
+        match next_cursor {
+            Some(nc) => cursor = Some(nc),
+            None => return Ok(()),
+        }
+    }
+}
+
+/// Clears any serving KV keys (`0x01..0x05`) left by an earlier aborted epoch before rewriting.
+pub(crate) async fn clear_stale_serving_data<B: Backend>(
+    context: &mut OperationContext<B>,
+    index: &IndexManifest,
+    fence: WriteFence,
+    budget: AdmissionBudget,
+    retry: RetryPolicy,
+) -> Result<()> {
+    clear_index_range(
+        context,
+        index,
+        LogicalRange::serving_data(index),
+        RangeClearGuard::StaleServing(fence),
+        Operation::RunBulkBuild,
+        budget,
+        retry,
+    )
+    .await
+}
+
+fn split_delete_keys(
+    keys_iter: impl Iterator<Item = LogicalKey>,
+    budget: AdmissionBudget,
+) -> Result<Vec<Vec<LogicalKey>>> {
+    let max_muts = budget.max_mutations.max(1);
+    let max_bytes = budget.max_mutation_bytes.max(1);
+    let mut batches = Vec::new();
+    let mut cur = Vec::new();
+    let mut cur_bytes = 0_usize;
+    for lk in keys_iter {
+        let raw_len = keys::encode_key(&lk)?.len();
+        let cost = raw_len
+            .checked_add(budget.mutation_key_overhead_bytes)
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+        if cost > max_bytes {
+            return Err(Error::new(ErrorKind::LimitExceeded));
+        }
+        if !cur.is_empty()
+            && (cur.len() >= max_muts || cur_bytes.checked_add(cost).is_none_or(|n| n > max_bytes))
+        {
+            batches.push(std::mem::take(&mut cur));
+            cur_bytes = 0;
+        }
+        cur_bytes += cost;
+        cur.push(lk);
+    }
+    if !cur.is_empty() {
+        batches.push(cur);
+    }
+    Ok(batches)
+}
+
+pub(super) fn split_into_chunks(
+    kvs: &[(Bytes, Bytes)],
+    budget: AdmissionBudget,
+    has_unit_fence: bool,
+) -> Result<Vec<Vec<(Bytes, Bytes)>>> {
+    let reserved_muts = usize::from(has_unit_fence);
+    let reserved_bytes = if has_unit_fence {
+        BUILD_UNIT_MUTATION_BYTES
+            .checked_add(budget.mutation_key_overhead_bytes)
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?
+    } else {
+        0
+    };
+    let max_muts = budget
+        .max_mutations
+        .checked_sub(reserved_muts)
+        .filter(|&m| m >= 1)
+        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+    let max_bytes = budget
+        .max_mutation_bytes
+        .checked_sub(reserved_bytes)
+        .filter(|&b| b >= 1)
+        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+    let base_affected = 5_usize
+        .saturating_mul(32_usize.saturating_add(budget.mutation_key_overhead_bytes))
+        .saturating_mul(3)
+        .saturating_add(512);
+
+    let mut chunks = Vec::new();
+    let mut cur = Vec::new();
+    let mut cur_bytes = 0_usize;
+    let mut cur_affected = base_affected;
+
+    for (k, v) in kvs {
+        let item_bytes = k
+            .len()
+            .checked_add(v.len())
+            .and_then(|n| n.checked_add(budget.mutation_key_overhead_bytes))
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+        let item_affected = k
+            .len()
+            .checked_add(budget.mutation_key_overhead_bytes)
+            .and_then(|kb| kb.checked_mul(3))
+            .and_then(|n| n.checked_add(v.len()))
+            .and_then(|n| n.checked_add(64))
+            .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
+
+        if item_bytes > max_bytes
+            || base_affected
+                .checked_add(item_affected)
+                .is_none_or(|tot| tot > MAX_TXN_AFFECTED_BYTES)
+        {
+            return Err(Error::new(ErrorKind::LimitExceeded));
+        }
+        if !cur.is_empty()
+            && (cur.len() >= max_muts
+                || cur_bytes
+                    .checked_add(item_bytes)
+                    .is_none_or(|n| n > max_bytes)
+                || cur_affected
+                    .checked_add(item_affected)
+                    .is_none_or(|n| n > MAX_TXN_AFFECTED_BYTES))
+        {
+            chunks.push(std::mem::take(&mut cur));
+            cur_bytes = 0;
+            cur_affected = base_affected;
+        }
+        cur_bytes += item_bytes;
+        cur_affected += item_affected;
+        cur.push((k.clone(), v.clone()));
+    }
+    if !cur.is_empty() {
+        chunks.push(cur);
+    }
+    Ok(chunks)
+}
+
+/// Conflict-protects `BuildWorkspace(id)` without mutating it, verifying that `fence` remains the
+/// active writer authority for `index`.
+pub(crate) async fn check_writer_fence<T: WriteTxn>(
+    txn: &mut WriteLogicalTxn<'_, T>,
+    index: &IndexManifest,
+    fence: WriteFence,
+) -> Result<()> {
+    building_in_flight(txn, index).await?;
+    let id = index.logical_index_id();
+    match txn.get_for_update(LogicalKey::BuildWorkspace(id)).await? {
+        Some(PersistentValue::BuildWorkspace(w)) => {
+            if let Some(kind) = w.failure {
+                return Err(Error::new(kind));
+            }
+            if w.epoch == fence.epoch && w.writer_token == fence.owner && fence.owner != [0; 32] {
+                Ok(())
+            } else {
+                Err(Error::new(ErrorKind::BulkBuildSuperseded))
+            }
+        }
+        None => Err(Error::new(ErrorKind::BulkBuildSuperseded)),
+        _ => Err(corrupt()),
+    }
+}
+
+pub(crate) async fn seal_loaded<B: Backend>(
+    context: &mut OperationContext<B>,
+    index: &IndexManifest,
+    fence: WriteFence,
+    summary: SealedSummary,
+    validation_split_keys: Vec<Bytes>,
+    retry: RetryPolicy,
+) -> Result<()> {
+    let id = index.logical_index_id();
+    validate_split_keys_in_index(id, &validation_split_keys)?;
+    let backend = context.backend();
+    let budget = backend.admission_budget();
+    let auth = context.bulk_authority;
+    let split_ref = &validation_split_keys;
+
+    retry_ctx_write(
+        context,
+        backend.as_ref(),
+        budget,
+        Operation::RunBulkBuild,
+        retry,
+        |mut txn| async move {
+            check_writer_fence(&mut txn, index, fence).await?;
+            authorize_raw(&mut txn, id, auth).await?;
+
+            let cur = match txn.get_for_update(LogicalKey::BuildProgress(id)).await? {
+                Some(PersistentValue::BuildProgress(p)) => p,
+                _ => return Err(corrupt()),
+            };
+            if cur.phase == BuildPhase::Loaded
+                && cur.epoch == fence.epoch
+                && cur.total_entries == summary.entries
+                && cur.expected_kv_lthash == summary.expected_kv_lthash
+            {
+                txn.rollback().await;
+                return Ok((None, ()));
+            }
+            if cur.phase == BuildPhase::Validating || cur.epoch != fence.epoch {
+                return Err(Error::new(ErrorKind::BulkBuildSuperseded));
+            }
+
+            let next = BuildProgress {
+                phase: BuildPhase::Loaded,
+                epoch: fence.epoch,
+                loaded_entries: summary.entries,
+                total_entries: summary.entries,
+                total_records: summary.records,
+                trees: summary.trees,
+                partitions: summary.partitions,
+                expected_kv_lthash: summary.expected_kv_lthash,
+                validation_split_keys: split_ref.clone(),
+            };
+            txn.put(
+                LogicalKey::BuildProgress(id),
+                PersistentValue::BuildProgress(next),
+            )
+            .await?;
+            Ok((Some(txn), ()))
+        },
+    )
+    .await
+}
+
+/// Persists terminal failures for the current workspace epoch; transient errors,
+/// cancellation, contention, and superseded ownership leave the build resumable.
 pub(crate) async fn record_failure<B: Backend>(
     context: &mut OperationContext<B>,
     index: &IndexManifest,
     before: &BuildWorkspace,
+    worker_fence: Option<WriteFence>,
     kind: ErrorKind,
     retry: RetryPolicy,
 ) -> Result<()> {
@@ -545,131 +1497,390 @@ pub(crate) async fn record_failure<B: Backend>(
     ) {
         return Ok(());
     }
-    let mut after = before.clone();
-    after.failure = Some(kind);
-    match accept(context, index, before, &after, retry).await {
-        Err(e)
-            if matches!(
-                e.kind(),
-                ErrorKind::BulkBuildSuperseded
-                    | ErrorKind::IndexDropping
-                    | ErrorKind::IndexNotFound
-                    | ErrorKind::Cancelled
-                    | ErrorKind::DeadlineExceeded
-            ) =>
-        {
-            Ok(())
+    let sched_lock = context.bulk_lease_lock.clone();
+    let mut attempts = 0;
+    let id = index.logical_index_id();
+    loop {
+        if context.checkpoint().is_err() {
+            return Ok(());
         }
-        result => result,
+        let step = {
+            let _sched_guard = lock_sched_read(&sched_lock).await;
+            let backend = context.backend();
+            let prepared = async {
+                let mut txn = WriteLogicalTxn::bootstrap(
+                    backend.begin_write().await?,
+                    backend.hard_limits(),
+                    backend.admission_budget(),
+                );
+                match building(&mut txn, index).await {
+                    Ok(()) => {}
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            ErrorKind::IndexDropping
+                                | ErrorKind::IndexNotFound
+                                | ErrorKind::InvalidArgument
+                        ) =>
+                    {
+                        txn.rollback().await;
+                        return Ok((None, ()));
+                    }
+                    Err(e) => return Err(e),
+                }
+                if super::bulk_scheduler::authorize(context, &mut txn, id)
+                    .await
+                    .is_err()
+                {
+                    txn.rollback().await;
+                    return Ok((None, ()));
+                }
+                if let Some(fence) = worker_fence {
+                    if check_writer_fence(&mut txn, index, fence).await.is_err() {
+                        txn.rollback().await;
+                        return Ok((None, ()));
+                    }
+                    if matches!(
+                        txn.get_for_update(LogicalKey::BuildProgress(id)).await?,
+                        Some(PersistentValue::BuildProgress(p)) if p.phase == BuildPhase::Validating
+                    ) {
+                        txn.rollback().await;
+                        return Ok((None, ()));
+                    }
+                }
+                let key = LogicalKey::BuildWorkspace(id);
+                let mut current = match txn.get_for_update(key.clone()).await? {
+                    Some(PersistentValue::BuildWorkspace(w)) => w,
+                    _ => {
+                        txn.rollback().await;
+                        return Ok((None, ()));
+                    }
+                };
+                if current.failure.is_some()
+                    || current.epoch != before.epoch
+                    || current.token != before.token
+                {
+                    txn.rollback().await;
+                    return Ok((None, ()));
+                }
+                current.failure = Some(kind);
+                txn.put(key, PersistentValue::BuildWorkspace(current))
+                    .await?;
+                Ok((Some(txn), ()))
+            }
+            .await;
+            context.commit_prepared(prepared).await
+        };
+        match step {
+            CommitStep::Done(()) => return Ok(()),
+            CommitStep::PrepareAbort => {
+                if retry
+                    .wait_or_exhaust(Operation::RunBulkBuild, &mut attempts)
+                    .await
+                    .is_err()
+                {
+                    return Ok(());
+                }
+            }
+            CommitStep::CommitFailed(e)
+                if matches!(e.kind(), ErrorKind::Cancelled | ErrorKind::DeadlineExceeded) =>
+            {
+                return Ok(());
+            }
+            CommitStep::CommitFailed(e) => {
+                retry
+                    .after_commit_error(Operation::RunBulkBuild, &mut attempts, e)
+                    .await?;
+            }
+            CommitStep::Fatal(e) => return Err(e),
+        }
     }
 }
 
-/// Only generated child directories are removed. The existing root and its
-/// coordination file stay in place so stale initializers cannot evade the lock.
+/// Reclaims generated child directories under exclusive `.ktann-build-lock` and removes
+/// transient post-publication and orphaned scheduler metadata once no peer holds an active lease.
 pub(crate) async fn cleanup<B: Backend>(
     context: &mut OperationContext<B>,
-    id: crate::api::LogicalIndexId,
+    id: LogicalIndexId,
     retry: RetryPolicy,
 ) -> Result<()> {
     let backend = context.backend();
-    let mut snapshot = ReadLogicalTxn::bootstrap(backend.begin_read().await?);
-    let state = match snapshot.get(LogicalKey::BuildWorkspace(id)).await? {
-        None => return Ok(()),
-        Some(PersistentValue::BuildWorkspace(w)) => w,
-        _ => return Err(corrupt()),
-    };
-    drop(snapshot);
-    let root = state.options.workspace.clone();
-    let lock = Arc::new(blocking(context, move || lock_root(&root, true)).await?);
-    let mut attempts = 0;
-    loop {
-        context.checkpoint()?;
-        let mut txn = WriteLogicalTxn::bootstrap(
-            backend.begin_write().await?,
-            backend.hard_limits(),
-            backend.admission_budget(),
-        );
-        if let Some(value) = txn.get_for_update(LogicalKey::Manifest(id)).await? {
-            match value {
-                PersistentValue::IndexManifest(m)
-                    if m.logical_index_id() == id && m.lifecycle() != IndexLifecycle::Building => {}
-                _ => return Err(Error::invalid_argument()),
+    let (active_manifest, state_opt) =
+        retry_read(&context.options, Operation::CleanupBulkBuild, retry, || {
+            let backend = Arc::clone(&backend);
+            async move {
+                let mut snapshot = ReadLogicalTxn::bootstrap(backend.begin_read().await?);
+                let active_manifest = match snapshot.get(LogicalKey::Manifest(id)).await? {
+                    None => None,
+                    Some(PersistentValue::IndexManifest(m)) if m.logical_index_id() == id => {
+                        if m.lifecycle() == IndexLifecycle::Building {
+                            return Err(Error::invalid_argument());
+                        }
+                        (m.lifecycle() == IndexLifecycle::Active).then_some(m)
+                    }
+                    _ => return Err(corrupt()),
+                };
+                let state = match snapshot.get(LogicalKey::BuildWorkspace(id)).await? {
+                    None => None,
+                    Some(PersistentValue::BuildWorkspace(w)) => Some(w),
+                    _ => return Err(corrupt()),
+                };
+                Ok((active_manifest, state))
             }
-        }
-        let key = LogicalKey::BuildWorkspace(id);
-        match txn.get_for_update(key.clone()).await? {
-            None => return Ok(()),
-            Some(PersistentValue::BuildWorkspace(w)) if w == state => {}
-            _ => return Err(corrupt()),
-        }
-        let path = state.directory();
-        let lock = lock.clone();
-        blocking(context, move || {
-            let _lock = lock;
-            match fs::remove_dir_all(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(io(e)),
-            };
-            File::open(path.parent().expect("root"))
-                .and_then(|f| f.sync_all())
-                .map_err(io)
         })
         .await?;
-        txn.delete(key).await?;
-        match context.commit(|start| txn.commit_with(start)).await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                retry
-                    .after_commit_error(Operation::CleanupBulkBuild, &mut attempts, e)
-                    .await?
+
+    if let Some(state) = state_opt {
+        let lock = {
+            let mut lock_attempts = 0;
+            loop {
+                let root_c = state.options.workspace.clone();
+                match blocking(context, move || lock_root(&root_c, true)).await {
+                    Ok(file) => break Arc::new(file),
+                    Err(e)
+                        if e.kind() == ErrorKind::BulkBuildBusy
+                            && context.bulk_authority.is_some()
+                            && !retry.would_exhaust(lock_attempts) =>
+                    {
+                        retry.wait(lock_attempts).await;
+                        lock_attempts += 1;
+                    }
+                    Err(e) => return Err(e),
+                }
             }
-        }
+        };
+
+        let auth = context.bulk_authority;
+        let adm = context.cpu_keep_alive();
+        let adm_ref = &adm;
+        let budget = backend.admission_budget();
+        let state_ref = &state;
+        let lock_ref = &lock;
+        retry_ctx_write(
+            context,
+            backend.as_ref(),
+            budget,
+            Operation::CleanupBulkBuild,
+            retry,
+            |mut txn| async move {
+                if let Some(value) = txn.get_for_update(LogicalKey::Manifest(id)).await? {
+                    match value {
+                        PersistentValue::IndexManifest(m)
+                            if m.logical_index_id() == id
+                                && m.lifecycle() != IndexLifecycle::Building => {}
+                        _ => return Err(Error::invalid_argument()),
+                    }
+                }
+                ensure_no_peer_scheduler_leases(
+                    auth,
+                    &mut txn,
+                    id,
+                    state_ref.options.distributed_workers,
+                )
+                .await?;
+                let key = LogicalKey::BuildWorkspace(id);
+                match txn.get_for_update(key.clone()).await? {
+                    None => {
+                        txn.rollback().await;
+                        return Ok((None, ()));
+                    }
+                    Some(PersistentValue::BuildWorkspace(w)) if &w == state_ref => {}
+                    _ => return Err(corrupt()),
+                }
+                let path = state_ref.directory();
+                let guard = Arc::clone(lock_ref);
+                let keep_alive = adm_ref.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _adm = keep_alive;
+                    let _lock = guard;
+                    match fs::remove_dir_all(&path) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(io(e)),
+                    };
+                    File::open(path.parent().expect("root"))
+                        .and_then(|f| f.sync_all())
+                        .map_err(io)
+                })
+                .await
+                .map_err(|e| Error::with_source(ErrorKind::Other, e))??;
+                txn.delete(key).await?;
+                Ok((Some(txn), ()))
+            },
+        )
+        .await?;
+
+        drop(lock);
     }
+
+    retire_orphaned_schedule(context, id, retry).await?;
+
+    if let Some(active) = &active_manifest {
+        let budget = context.backend().admission_budget();
+        clear_index_range(
+            context,
+            active,
+            LogicalRange::transient_build_state(active),
+            RangeClearGuard::PublishedTransient,
+            Operation::CleanupBulkBuild,
+            budget,
+            retry,
+        )
+        .await?;
+    }
+    Ok(())
 }
+
 pub(crate) fn io(e: std::io::Error) -> Error {
     Error::with_source(ErrorKind::Other, e)
 }
+
 pub(crate) fn corrupt() -> Error {
     Error::new(ErrorKind::Corruption)
 }
 
-/// Discovers namespace cleanup records even after their original names and
-/// manifests were dropped. One bounded page is visited per call.
+async fn scan_distinct_slot_ids<T: crate::storage::backend::ReadOps>(
+    rtxn: &mut ReadLogicalTxn<'_, T>,
+    after: Option<LogicalIndexId>,
+    maximum: usize,
+) -> Result<(Vec<LogicalIndexId>, bool)> {
+    let mut slot_ids = Vec::with_capacity(maximum);
+    let mut cursor = after;
+    let mut has_more = false;
+    while slot_ids.len() < maximum {
+        let range = LogicalRange::build_schedule_slots_after(cursor);
+        let page = rtxn
+            .scan(
+                &range,
+                None,
+                ScanLimits {
+                    item_limit: 64,
+                    byte_limit: 64 * 1024,
+                },
+            )
+            .await?;
+        if page.items().is_empty() {
+            break;
+        }
+        for item in page.items() {
+            let LogicalKey::BuildScheduleSlot { index: id, .. } = *item.key() else {
+                return Err(corrupt());
+            };
+            if slot_ids.last() != Some(&id) {
+                slot_ids.push(id);
+                cursor = Some(id);
+                if slot_ids.len() == maximum {
+                    has_more = page.next_cursor().is_some();
+                    break;
+                }
+            }
+        }
+        if slot_ids.len() == maximum {
+            if !has_more {
+                let probe = LogicalRange::build_schedule_slots_after(cursor);
+                has_more = !rtxn
+                    .scan(
+                        &probe,
+                        None,
+                        ScanLimits {
+                            item_limit: 1,
+                            byte_limit: 1024,
+                        },
+                    )
+                    .await?
+                    .items()
+                    .is_empty();
+            }
+            break;
+        }
+        if page.next_cursor().is_none() {
+            break;
+        }
+    }
+    Ok((slot_ids, has_more))
+}
+
+/// Visits a bounded page of namespace cleanup records across `BuildWorkspace`,
+/// `BuildSchedule`, and orphaned `BuildScheduleSlot` entries without skipping
+/// records when individual scan legs paginate at different Logical Index IDs.
 pub(crate) async fn cleanup_pending<B: Backend>(
     context: &mut OperationContext<B>,
     maximum: usize,
-    after: Option<crate::api::LogicalIndexId>,
+    after: Option<LogicalIndexId>,
     retry: RetryPolicy,
 ) -> Result<crate::api::BulkCleanupPage> {
-    use crate::storage::backend::ReadOps;
     if maximum == 0 || maximum > 1000 {
         return Err(Error::invalid_argument());
     }
     let backend = context.backend();
-    let mut raw = backend.begin_read().await?;
-    let page = raw
-        .scan(
-            &crate::storage::keys::build_workspace_range(after),
-            crate::storage::backend::ScanLimits {
-                item_limit: maximum,
-                byte_limit: 1024 * 1024,
-            },
-        )
-        .await?;
-    let mut ids = Vec::new();
-    for item in page.items() {
-        match crate::storage::keys::decode_key(&[], item.key())? {
-            LogicalKey::BuildWorkspace(id) => ids.push(id),
-            _ => return Err(corrupt()),
+    let (ids, has_more) = {
+        let mut rtxn = ReadLogicalTxn::bootstrap(backend.begin_read().await?);
+        let ws_range = LogicalRange::build_workspaces(after);
+        let sched_range = LogicalRange::build_schedules(after);
+        let ws_page = rtxn
+            .scan(
+                &ws_range,
+                None,
+                ScanLimits {
+                    item_limit: maximum,
+                    byte_limit: 1024 * 1024,
+                },
+            )
+            .await?;
+        let sched_page = rtxn
+            .scan(
+                &sched_range,
+                None,
+                ScanLimits {
+                    item_limit: maximum,
+                    byte_limit: 1024 * 1024,
+                },
+            )
+            .await?;
+        let (slot_ids, slot_more) = scan_distinct_slot_ids(&mut rtxn, after, maximum).await?;
+
+        let mut ws_ids = Vec::with_capacity(ws_page.items().len());
+        for item in ws_page.items() {
+            match *item.key() {
+                LogicalKey::BuildWorkspace(id) => ws_ids.push(id),
+                _ => return Err(corrupt()),
+            }
         }
-    }
-    let next = if page.is_terminal() {
-        None
-    } else {
-        ids.last().copied()
+        let mut sched_ids = Vec::with_capacity(sched_page.items().len());
+        for item in sched_page.items() {
+            match *item.key() {
+                LogicalKey::BuildSchedule(id) => sched_ids.push(id),
+                _ => return Err(corrupt()),
+            }
+        }
+
+        let ws_more = ws_page.next_cursor().is_some();
+        let sched_more = sched_page.next_cursor().is_some();
+        let upper_bound = [
+            (ws_ids.last().copied(), ws_more),
+            (sched_ids.last().copied(), sched_more),
+            (slot_ids.last().copied(), slot_more),
+        ]
+        .into_iter()
+        .filter_map(|(last, more)| more.then_some(last).flatten())
+        .min();
+
+        let mut merged = BTreeSet::new();
+        merged.extend(ws_ids);
+        merged.extend(sched_ids);
+        merged.extend(slot_ids);
+
+        let total_merged = merged.len();
+        let ids: Vec<LogicalIndexId> = merged
+            .into_iter()
+            .filter(|&id| upper_bound.is_none_or(|ub| id <= ub))
+            .take(maximum)
+            .collect();
+        let has_more = ids.len() < total_merged || ws_more || sched_more || slot_more;
+        (ids, has_more)
     };
-    drop(raw);
+
+    let next = if has_more { ids.last().copied() } else { None };
     let mut result = crate::api::BulkCleanupPage {
         reclaimed: 0,
         pending: 0,

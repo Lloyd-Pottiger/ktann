@@ -31,6 +31,14 @@ struct TreeKeySchema {
 }
 
 impl TreeKeySchema {
+    /// The empty namespace schema for bootstrap metadata ranges.
+    const fn empty() -> Self {
+        Self {
+            types: [DataType::Bool; MAX_FIELDS],
+            count: 0,
+        }
+    }
+
     /// The Tree Key schema declared by one Index Manifest.
     fn for_index(manifest: &IndexManifest) -> Self {
         let (types, count) = manifest.tree_key_types();
@@ -43,15 +51,18 @@ impl TreeKeySchema {
     }
 }
 
-/// A typed half-open range over one Logical Index.
+/// A typed half-open range over one Logical Index or bootstrap metadata namespace.
 ///
 /// Raw range bounds remain private so algorithm modules cannot compose logical
-/// keys or resume a scan outside the range that produced its cursor. The range
-/// binds both the Logical Index ID and the Tree Key schema required to decode
-/// its keys.
+/// keys or resume a scan outside the range that produced its cursor. Index-bound
+/// serving ranges bind both the Logical Index ID and the Tree Key schema required
+/// to decode their keys; bootstrap metadata ranges bind `index = None` (and an
+/// optional `bootstrap_index` so both bootstrap and index-bound transactions can
+/// scan index-scoped `BuildUnit` or `BuildScheduleSlot` metadata).
 #[derive(Clone, Eq, PartialEq)]
 pub struct LogicalRange {
-    index: LogicalIndexId,
+    index: Option<LogicalIndexId>,
+    bootstrap_index: Option<LogicalIndexId>,
     schema: TreeKeySchema,
     raw: KeyRange,
 }
@@ -61,6 +72,100 @@ impl LogicalRange {
     #[must_use]
     pub fn index(manifest: &IndexManifest) -> Self {
         Self::bind(manifest, keys::index_range(manifest.logical_index_id()))
+    }
+
+    /// Selects serving data (`RecordGroup`, `TreeManifest`, and `Partition` keys `[0x01..0x05)`)
+    /// owned by one Logical Index, excluding `Manifest` (`0x00`) and `Build*` (`0x05..`).
+    #[must_use]
+    pub(crate) fn serving_data(manifest: &IndexManifest) -> Self {
+        Self::bind(
+            manifest,
+            keys::serving_data_range(manifest.logical_index_id()),
+        )
+    }
+
+    /// Selects transient `BuildUnit` state (`[0x07..0x08)`) owned by one Logical Index,
+    /// preserving `BuildDescriptor` (`0x05`) and `BuildProgress` (`0x06`).
+    #[must_use]
+    pub(crate) fn transient_build_state(manifest: &IndexManifest) -> Self {
+        Self::bind(
+            manifest,
+            keys::transient_build_unit_range(manifest.logical_index_id()),
+        )
+    }
+
+    /// Selects all `BuildUnit`s in one stage of `index` for bootstrap or index-bound scans.
+    #[must_use]
+    pub(crate) fn build_units(index: LogicalIndexId, stage: u8) -> Self {
+        Self::build_units_from(index, stage, 0)
+    }
+
+    /// Selects `BuildUnit`s in one stage of `index` starting at `from_unit`.
+    #[must_use]
+    pub(crate) fn build_units_from(index: LogicalIndexId, stage: u8, from_unit: u32) -> Self {
+        Self {
+            index: None,
+            bootstrap_index: Some(index),
+            schema: TreeKeySchema::empty(),
+            raw: keys::build_unit_stage_range_from(index, stage, from_unit),
+        }
+    }
+
+    /// Selects all collaborative `BuildScheduleSlot`s of `index` for bootstrap or index-bound scans.
+    #[must_use]
+    pub(crate) fn build_schedule_slots(index: LogicalIndexId) -> Self {
+        Self {
+            index: None,
+            bootstrap_index: Some(index),
+            schema: TreeKeySchema::empty(),
+            raw: keys::build_schedule_slot_range(index),
+        }
+    }
+
+    /// Selects namespace `BuildScheduleSlot` entries strictly after all slots of `after`.
+    #[must_use]
+    pub(crate) fn build_schedule_slots_after(after: Option<LogicalIndexId>) -> Self {
+        Self {
+            index: None,
+            bootstrap_index: None,
+            schema: TreeKeySchema::empty(),
+            raw: keys::build_schedule_slot_all_range(after),
+        }
+    }
+
+    /// Selects namespace `BuildSchedule` entries strictly after `after`.
+    #[must_use]
+    pub(crate) fn build_schedules(after: Option<LogicalIndexId>) -> Self {
+        Self {
+            index: None,
+            bootstrap_index: None,
+            schema: TreeKeySchema::empty(),
+            raw: keys::build_schedule_range(after),
+        }
+    }
+
+    /// Selects namespace `BuildWorkspace` entries strictly after `after`.
+    #[must_use]
+    pub(crate) fn build_workspaces(after: Option<LogicalIndexId>) -> Self {
+        Self {
+            index: None,
+            bootstrap_index: None,
+            schema: TreeKeySchema::empty(),
+            raw: keys::build_workspace_range(after),
+        }
+    }
+
+    /// Selects one disjoint validation slice `[start, end)` inside `manifest`'s full index range.
+    pub(crate) fn validation_slice(
+        manifest: &IndexManifest,
+        start: Vec<u8>,
+        end: Vec<u8>,
+    ) -> Result<Self> {
+        let full = keys::index_range(manifest.logical_index_id());
+        if start.as_slice() < full.start() || end.as_slice() > full.end() || start >= end {
+            return Err(Error::new(ErrorKind::Corruption));
+        }
+        Ok(Self::bind(manifest, KeyRange::new(start, end)))
     }
 
     /// Selects every Tree Manifest in one Logical Index.
@@ -156,7 +261,8 @@ impl LogicalRange {
     /// schema.
     fn bind(manifest: &IndexManifest, raw: KeyRange) -> Self {
         Self {
-            index: manifest.logical_index_id(),
+            index: Some(manifest.logical_index_id()),
+            bootstrap_index: None,
             schema: TreeKeySchema::for_index(manifest),
             raw,
         }
@@ -298,10 +404,7 @@ impl LogicalBinding<'static> {
         Self {
             manifest: None,
             // The empty namespace schema; bootstrap keys carry no Tree Key.
-            schema: TreeKeySchema {
-                types: [DataType::Bool; MAX_FIELDS],
-                count: 0,
-            },
+            schema: TreeKeySchema::empty(),
             allow_name_mapping: true,
         }
     }
@@ -345,12 +448,16 @@ impl<'manifest> LogicalBinding<'manifest> {
                 key,
                 LogicalKey::Manifest(_)
                     | LogicalKey::BuildDescriptor(_)
-                    | LogicalKey::BuildLoad(_)
-                    | LogicalKey::BuildValidation(_)
+                    | LogicalKey::BuildProgress(_)
+                    | LogicalKey::BuildUnit { .. }
             ),
             (Some(manifest), Some(index)) => index == manifest.logical_index_id(),
             (Some(manifest), None) => match key {
-                LogicalKey::BuildSchedule(id) => *id == manifest.logical_index_id(),
+                LogicalKey::BuildWorkspace(id)
+                | LogicalKey::BuildSchedule(id)
+                | LogicalKey::BuildScheduleSlot { index: id, .. } => {
+                    *id == manifest.logical_index_id()
+                }
                 _ => self.allow_name_mapping && matches!(key, LogicalKey::IndexNameDirectory(_)),
             },
         };
@@ -373,9 +480,15 @@ impl<'manifest> LogicalBinding<'manifest> {
     }
 
     fn validate_range(&self, range: &LogicalRange) -> Result<()> {
-        match self.manifest {
-            Some(manifest)
-                if manifest.logical_index_id() == range.index && self.schema == range.schema =>
+        match (self.manifest, range.index) {
+            (Some(manifest), Some(index))
+                if manifest.logical_index_id() == index && self.schema == range.schema =>
+            {
+                Ok(())
+            }
+            (None, None) if self.schema == range.schema => Ok(()),
+            (Some(manifest), None)
+                if range.bootstrap_index == Some(manifest.logical_index_id()) =>
             {
                 Ok(())
             }
@@ -768,6 +881,45 @@ impl<T: ReadOps> ReadLogicalTxn<'_, T> {
         limits: ScanLimits,
     ) -> Result<LogicalScanPage> {
         scan_logical(&mut self.raw, &self.binding, range, cursor, limits).await
+    }
+
+    /// Scans one bounded raw page from `range`, enforcing `decode_scan_page`'s exact
+    /// range-bound, strict-monotonicity, and advancing-cursor checks while returning raw
+    /// `(key, value)` pairs for parallel off-thread codec + `LtHash` verification.
+    pub(crate) async fn scan_raw_validated(
+        &mut self,
+        range: &LogicalRange,
+        cursor: Option<&LogicalScanCursor>,
+        limits: ScanLimits,
+    ) -> Result<(Vec<(Bytes, Bytes)>, Option<LogicalScanCursor>)> {
+        let raw_range = scan_raw_range(&self.binding, range, cursor)?;
+        let raw_page = self.raw.scan(&raw_range, limits).await?;
+        let mut items = Vec::with_capacity(raw_page.items().len());
+        let mut previous: Option<&Bytes> = None;
+        for item in raw_page.items() {
+            if item.key().as_ref() < raw_range.start()
+                || item.key().as_ref() >= raw_range.end()
+                || previous.is_some_and(|prev| prev >= item.key())
+            {
+                return Err(Error::new(ErrorKind::Backend));
+            }
+            previous = Some(item.key());
+            items.push((item.key().clone(), item.value().clone()));
+        }
+        let next_cursor = match raw_page.next_start() {
+            Some(next_start)
+                if previous.is_some_and(|last| next_start > last)
+                    && next_start.as_ref() < range.raw.end() =>
+            {
+                Some(LogicalScanCursor {
+                    range: range.clone(),
+                    next_start: next_start.clone(),
+                })
+            }
+            Some(_) => return Err(Error::new(ErrorKind::Backend)),
+            None => None,
+        };
+        Ok((items, next_cursor))
     }
 
     /// Scans one bounded typed page from each leg, preserving input order.

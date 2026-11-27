@@ -68,25 +68,20 @@ impl Experiment {
         Ok(())
     }
 
-    /// Resolves the same construction controls for the native runner and bridge.
-    pub fn construction(&self) -> ktann::construction::ConstructionOptions {
-        ktann::construction::ConstructionOptions {
+    /// Resolves semantic Bulk Build options for the native runner and bridge.
+    pub fn bulk_options(&self, refinement_rounds: Option<u8>) -> ktann::api::BulkBuildOptions {
+        ktann::api::BulkBuildOptions {
             sample_items: self.sample_items,
-            memory_bytes: self.build_memory_bytes,
-            scratch_bytes: self.build_scratch_bytes,
+            refinement_rounds,
         }
     }
 
-    /// Applies explicit memory/scratch ceilings at their existing Bulk Build owner.
+    /// Applies explicit memory/scratch ceilings at their Bulk Build owner.
     pub fn worker(&self, workspace: std::path::PathBuf) -> ktann::api::BulkWorkerOptions {
         let mut worker = ktann::api::BulkWorkerOptions::new(workspace);
-        worker.sort_memory_bytes = self.build_memory_bytes;
-        worker.serving_memory_bytes = self.build_memory_bytes;
+        worker.memory_bytes = self.build_memory_bytes;
         worker.graph_memory_bytes = self.build_memory_bytes;
-        worker.refinement_memory_bytes = self.build_memory_bytes;
-        worker.sort_scratch_bytes = self.build_scratch_bytes;
-        worker.serving_scratch_bytes = self.build_scratch_bytes;
-        worker.max_artifact_bytes = self.build_scratch_bytes;
+        worker.scratch_bytes = self.build_scratch_bytes;
         worker
     }
 

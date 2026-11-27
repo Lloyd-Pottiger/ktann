@@ -238,7 +238,7 @@ fn refinement_limit_failure_stays_terminal_and_keeps_search_closed() {
     assert_eq!(report["ready"], false);
     assert!(report["bulk_build"].is_object());
     assert_eq!(report["bulk_build"]["refinement_memory_bytes"], 1);
-    assert!(report["bulk_build"]["forest_seconds"].is_null());
+    assert!(report["bulk_build"]["plan_seconds"].is_null());
     assert!(report["phases"]["optimize_seconds"].as_f64().unwrap() > 0.);
 }
 
@@ -268,14 +268,11 @@ fn fixed_bridge_routes_after_artifact_refinement() {
         .unwrap();
         assert_eq!(report["configuration"]["routing_experiment"]["mode"], mode);
         assert_eq!(report["bulk_build"]["refinement_memory_bytes"], 8388608);
-        for field in [
-            "construction_memory_bytes",
-            "sort_memory_bytes",
-            "serving_memory_bytes",
-            "graph_memory_bytes",
-        ] {
-            assert_eq!(report["bulk_build"][field], 33554432, "{field}: {report}");
-        }
+        assert_eq!(report["bulk_build"]["worker_memory_bytes"], 8388608);
+        assert_eq!(
+            report["bulk_build"]["graph_memory_bytes"], 33554432,
+            "{report}"
+        );
     }
 }
 

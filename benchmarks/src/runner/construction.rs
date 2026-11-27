@@ -474,7 +474,6 @@ async fn prepare_bulk_index<B: Backend>(
     ),
     String,
 > {
-    use ktann::api::BulkBuildOptions;
     use ktann::bulk::InputSnapshot;
     let experiment = spec
         .routing_experiment
@@ -498,20 +497,13 @@ async fn prepare_bulk_index<B: Backend>(
     )
     .map_err(|e| error_at("capture bulk source", e))?;
     let capture_seconds = started.elapsed().as_secs_f64();
-    let construction = experiment.construction();
+    let bulk_options = experiment.bulk_options(spec.refinement_rounds.map(|rounds| rounds as u8));
     let job = runtime
-        .start_bulk_build(
-            "benchmark",
-            &source,
-            BulkBuildOptions {
-                construction,
-                refinement_rounds: spec.refinement_rounds.map(|rounds| rounds as u8),
-            },
-        )
+        .start_bulk_build("benchmark", &source, bulk_options)
         .await
         .map_err(|e| error_at("reserve bulk index", e))?;
     let worker = experiment.worker(root.path().join("workspace"));
-    let settings = crate::report::bulk_build_settings(&construction, &worker);
+    let settings = crate::report::bulk_build_settings(&bulk_options, &worker);
     std::fs::create_dir(&worker.workspace).map_err(|e| e.to_string())?;
     let (index, stages) = job
         .complete_with_report(worker, OperationOptions::default())
@@ -559,12 +551,22 @@ async fn prepare_bulk_index<B: Backend>(
         cache: metrics.cache_summary(),
     };
     let mut bulk = serde_json::json!({
-        "capture_seconds": capture_seconds, "forest_seconds": stages.forest.as_secs_f64(),
-        "serving_seconds": stages.serving.as_secs_f64(), "load_seconds": stages.load.as_secs_f64(),
-        "publish_seconds": stages.publish.as_secs_f64(), "source_sha256": source.manifest().sha256(),
-        "source_bytes": source.manifest().bytes(), "rotation_seed": stages.rotation_seed,
+        "capture_seconds": capture_seconds,
+        "plan_seconds": stages.plan.as_secs_f64(),
+        "ingest_seconds": stages.ingest.as_secs_f64(),
+        "construct_seconds": stages.construct.as_secs_f64(),
+        "refine_seconds": stages.refine.as_secs_f64(),
+        "emit_seconds": stages.emit.as_secs_f64(),
+        "publish_seconds": stages.publish.as_secs_f64(),
+        "in_memory_mode": stages.in_memory_mode,
+        "scratch_written_bytes": stages.scratch_written_bytes,
+        "peak_scratch_bytes": stages.peak_scratch_bytes,
+        "source_sha256": source.manifest().sha256(),
+        "source_bytes": source.manifest().bytes(),
+        "rotation_seed": stages.rotation_seed,
         "graph_build_seconds": graph_build_seconds,
-        "graph_native_peak_bytes": graph_native_peak_bytes, "stored_graph_bytes": stored_graph_bytes,
+        "graph_native_peak_bytes": graph_native_peak_bytes,
+        "stored_graph_bytes": stored_graph_bytes,
     });
     bulk.as_object_mut()
         .expect("bulk report object")

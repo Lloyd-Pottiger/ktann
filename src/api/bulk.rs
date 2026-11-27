@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::observe::labels::Operation;
 use crate::runtime::{RuntimeHandle, lifecycle};
@@ -13,18 +14,32 @@ use super::{IndexName, LogicalIndexId, OperationOptions, Result};
 /// Immutable Bulk Build preparation semantics, persisted with the source identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BulkBuildOptions {
-    /// Partition construction controls.
-    pub construction: crate::construction::ConstructionOptions,
+    /// Maximum deterministic training sample size (`>= 2`).
+    pub sample_items: usize,
     /// None preserves constructed centroids; Some(0) refreshes them without moves.
     pub refinement_rounds: Option<u8>,
 }
 
-impl From<crate::construction::ConstructionOptions> for BulkBuildOptions {
-    fn from(construction: crate::construction::ConstructionOptions) -> Self {
+impl Default for BulkBuildOptions {
+    fn default() -> Self {
         Self {
-            construction,
+            sample_items: 1_024,
             refinement_rounds: None,
         }
+    }
+}
+
+impl BulkBuildOptions {
+    /// Validates semantic construction and refinement options before persisting a reservation.
+    pub(crate) fn validate(self) -> Result<()> {
+        if self.sample_items < 2
+            || self
+                .refinement_rounds
+                .is_some_and(|rounds| usize::from(rounds) > super::MAX_REFINEMENT_ROUNDS)
+        {
+            return Err(super::Error::invalid_argument());
+        }
+        Ok(())
     }
 }
 
@@ -33,9 +48,9 @@ impl From<crate::construction::ConstructionOptions> for BulkBuildOptions {
 pub enum BulkBuildStatus {
     /// The name and immutable input identity are reserved; the index is hidden.
     Preparing,
-    /// A bounded exact comparison of sealed backend data is in progress.
+    /// Parallel slice verification of sealed backend data is in progress.
     Validating {
-        /// Serving entries already checked against accepted bytes.
+        /// Serving entries already verified against expected inventory digests.
         verified_entries: u64,
         /// Total expected serving entries.
         total_entries: u64,
@@ -45,11 +60,11 @@ pub enum BulkBuildStatus {
         /// Redacted, bounded error category.
         kind: super::ErrorKind,
     },
-    /// Serving bytes are partially loaded and remain hidden.
+    /// Serving bytes are being emitted into the hidden index.
     Loading {
-        /// Entries committed atomically with the checkpoint.
+        /// Serving entries committed so far.
         loaded_entries: u64,
-        /// Total entries in the immutable serving artifact.
+        /// Total expected serving entries.
         total_entries: u64,
     },
     /// All serving bytes are loaded; backend validation and publication remain.
@@ -65,21 +80,22 @@ pub enum BulkBuildStatus {
     Aborted,
 }
 
-/// Per-transaction limits for serving artifact loading, including its checkpoint.
+/// Per-transaction limits for Bulk Build backend writes and validation scans.
 /// Adapter admission may impose smaller limits. Physical namespace overhead is
 /// included in the byte budget. At least two mutations must fit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BulkLoadOptions {
-    /// Maximum data plus checkpoint mutations in one transaction.
+    /// Maximum data plus fence/checkpoint mutations in one transaction.
     pub max_mutations: usize,
     /// Maximum physical key plus value bytes in one transaction.
     pub max_bytes: usize,
 }
+
 impl Default for BulkLoadOptions {
     fn default() -> Self {
         Self {
-            max_mutations: 4096,
-            max_bytes: 1024 * 1024,
+            max_mutations: 5_000,
+            max_bytes: 4 * 1024 * 1024,
         }
     }
 }
@@ -95,80 +111,99 @@ pub struct BulkCleanupPage {
     pub next: Option<LogicalIndexId>,
 }
 
-/// Work performed while completing one build, excluding input receipt.
+/// Stage timings and resource metrics performed while completing one build.
 /// Reused stages have zero duration; a retry returns only work done by that call.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct BulkBuildReport {
-    /// Forest sorting/training and immutable plan emission.
-    pub forest: std::time::Duration,
-    /// Forest preparation IO counts.
-    /// Absent when an accepted forest is reused.
-    pub forest_report: Option<crate::bulk::ForestReport>,
-    /// Exact joins and serving encoding.
-    pub serving: std::time::Duration,
-    /// Exact join and encoding evidence; absent when serving data is reused.
-    pub serving_report: Option<crate::bulk::ServingReport>,
-    /// Backend artifact loading, including checkpoint transactions.
-    pub load: std::time::Duration,
-    /// Exact validation, atomic publication and owned-workspace cleanup.
-    pub publish: std::time::Duration,
+    /// Coarse-shard and Record-ID-bucket planning duration.
+    pub plan: Duration,
+    /// Parallel segment ingestion and coarse-shard scatter duration.
+    pub ingest: Duration,
+    /// Shard deduplication and bottom-up leaf construction duration.
+    pub construct: Duration,
+    /// Bounded halo refinement duration.
+    pub refine: Duration,
+    /// RaBitQ7 quantization and serving Record, Location, Tree Manifest, and Partition emission duration.
+    pub emit: Duration,
+    /// Parallel backend validation, atomic publication, and workspace cleanup duration.
+    pub publish: Duration,
+    /// Number of Vector Records built.
+    pub records: u64,
+    /// Number of Tree Keys built.
+    pub trees: u64,
+    /// Number of serving partitions built across all trees.
+    pub partitions: u64,
+    /// Total serving key-value entries committed to the backend.
+    pub entries: u64,
+    /// Total workspace scratch bytes written across the build.
+    pub scratch_written_bytes: u64,
+    /// Peak simultaneous workspace scratch bytes held on disk.
+    pub peak_scratch_bytes: u64,
+    /// Whether execution completed in the zero-disk in-memory fast path.
+    pub in_memory_mode: bool,
     /// Persisted construction seed for reproducing the completed index.
     pub rotation_seed: [u8; 32],
 }
 
-/// Resource bounds and an existing durable, shared preparation workspace.
-/// Workers require reliable advisory file locks, atomic rename, and fsync on
-/// this filesystem. The root and its coordination lock remain caller owned.
+/// Resource bounds and an existing durable scratch workspace for Bulk Build workers.
+/// Single-machine builds use a local directory (writing zero scratch files when
+/// resident in memory); multi-worker builds (`distributed_workers > 1`) share
+/// coarse shards over a shared directory or object-store mount while coordinating
+/// unit leases and validation through the KV backend.
 #[derive(Clone, Eq, PartialEq)]
 pub struct BulkWorkerOptions {
     /// Existing absolute workspace root, separate from the source snapshot.
     pub workspace: std::path::PathBuf,
-    /// Allocated buffers for forest sorting.
-    pub sort_memory_bytes: usize,
-    /// Forest sort scratch ceiling.
-    pub sort_scratch_bytes: u64,
-    /// Allocated buffers for serving preparation.
-    pub serving_memory_bytes: usize,
-    /// Serving scratch ceiling.
-    pub serving_scratch_bytes: u64,
-    /// One graph's borrowed centroids, native construction and encoding memory.
+    /// Per-worker CPU and backend-write concurrency (1..=256).
+    pub parallelism: usize,
+    /// Maximum concurrent worker processes collaborating on one build (1..=256).
+    pub distributed_workers: usize,
+    /// Renewable lease duration for individual collaborative BuildUnits (>= 10ms).
+    pub unit_lease: Duration,
+    /// Per-worker memory budget for sharded construction and halo refinement.
+    pub memory_bytes: usize,
+    /// Working memory ceiling for one internal partition's local graph build.
     pub graph_memory_bytes: usize,
-    /// Per-tree refinement metadata, move planning and cached routing vectors.
-    pub refinement_memory_bytes: usize,
-    /// Maximum size of each accepted artifact.
-    pub max_artifact_bytes: u64,
-    /// Bounded data and validation pages.
+    /// Workspace scratch-file ceiling in bytes.
+    pub scratch_bytes: u64,
+    /// Bounded backend write and validation transaction limits.
     pub load: BulkLoadOptions,
 }
+
 impl BulkWorkerOptions {
-    /// Uses bounded defaults with the supplied durable workspace root.
+    /// Uses bounded defaults with the supplied workspace root.
     #[must_use]
     pub fn new(workspace: impl Into<std::path::PathBuf>) -> Self {
+        let parallelism = std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .clamp(1, 32);
         Self {
             workspace: workspace.into(),
-            sort_memory_bytes: 64 * 1024 * 1024,
-            sort_scratch_bytes: 64 * 1024 * 1024 * 1024,
-            serving_memory_bytes: 128 * 1024 * 1024,
-            serving_scratch_bytes: 64 * 1024 * 1024 * 1024,
+            parallelism,
+            distributed_workers: 1,
+            unit_lease: Duration::from_secs(30),
+            memory_bytes: 512 * 1024 * 1024,
             graph_memory_bytes: 256 * 1024 * 1024,
-            refinement_memory_bytes: 256 * 1024 * 1024,
-            max_artifact_bytes: 64 * 1024 * 1024 * 1024,
+            scratch_bytes: 64 * 1024 * 1024 * 1024,
             load: BulkLoadOptions::default(),
         }
     }
+
     pub(crate) fn validate(&self) -> Result<()> {
         if !self.workspace.is_absolute()
             || self
                 .workspace
                 .to_str()
                 .is_none_or(|p| p.len() > 3900 || p.contains('\0'))
-            || self.sort_memory_bytes == 0
-            || self.sort_scratch_bytes == 0
-            || self.serving_memory_bytes == 0
-            || self.serving_scratch_bytes == 0
+            || self.parallelism == 0
+            || self.parallelism > 256
+            || self.distributed_workers == 0
+            || self.distributed_workers > 256
+            || self.unit_lease < Duration::from_millis(10)
+            || self.unit_lease > Duration::from_secs(86_400 * 365)
+            || self.memory_bytes == 0
             || self.graph_memory_bytes == 0
-            || self.refinement_memory_bytes == 0
-            || self.max_artifact_bytes == 0
+            || self.scratch_bytes == 0
             || self.load.max_mutations < 2
             || self.load.max_bytes == 0
         {
@@ -177,6 +212,7 @@ impl BulkWorkerOptions {
         Ok(())
     }
 }
+
 impl fmt::Debug for BulkWorkerOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("BulkWorkerOptions([REDACTED])")
@@ -189,19 +225,21 @@ pub struct BulkSchedulerOptions {
     /// Maximum jobs admitted concurrently by this scheduler (1..=64).
     pub max_jobs: usize,
     /// Queue polling and retry delay, at least one millisecond.
-    pub poll_interval: std::time::Duration,
+    pub poll_interval: Duration,
     /// Renewable lease duration; at least three poll intervals.
-    pub lease_duration: std::time::Duration,
+    pub lease_duration: Duration,
 }
+
 impl Default for BulkSchedulerOptions {
     fn default() -> Self {
         Self {
             max_jobs: 1,
-            poll_interval: std::time::Duration::from_secs(1),
-            lease_duration: std::time::Duration::from_secs(30),
+            poll_interval: Duration::from_secs(1),
+            lease_duration: Duration::from_secs(30),
         }
     }
 }
+
 impl BulkSchedulerOptions {
     pub(crate) fn validate(self) -> Result<()> {
         if self.max_jobs == 0
@@ -211,7 +249,7 @@ impl BulkSchedulerOptions {
                 .poll_interval
                 .checked_mul(3)
                 .is_none_or(|minimum| self.lease_duration < minimum)
-            || self.lease_duration.as_millis() > u128::from(u64::MAX)
+            || self.lease_duration > Duration::from_secs(86_400 * 365)
         {
             return Err(super::Error::invalid_argument());
         }
@@ -224,9 +262,8 @@ impl BulkSchedulerOptions {
 /// The handle retains the owning Runtime until explicit shutdown or the last
 /// public Runtime, Index, or BulkBuildJob handle is dropped.
 /// This handle never follows a reused Index Name. Reservation launches no work;
-/// callers explicitly run workers and publish after loading. Preparation, loading,
-/// and validation are resumable. Source snapshots remain caller owned, including
-/// after abort, and are reverified when consumed.
+/// callers explicitly run workers and publish after loading, or schedule the job.
+/// Source snapshots remain caller owned, including after abort.
 pub struct BulkBuildJob<B: Backend> {
     runtime: Arc<RuntimeHandle<B>>,
     name: IndexName,
@@ -297,61 +334,14 @@ impl<B: Backend> BulkBuildJob<B> {
             .await
     }
 
-    /// Loads a sealed serving artifact into this hidden Building index.
-    ///
-    /// The first call fixes the artifact identity. Subsequent calls resume it
-    /// and take over from earlier invocations through a persisted epoch. A
-    /// superseded call cannot commit further chunks. Any failure may leave a
-    /// committed prefix; retry with the same artifact or abort the build.
-    /// Completion does not authorize publication. Files remain caller owned.
-    pub async fn load_serving(
-        &self,
-        artifact: &crate::bulk::ServingArtifact,
-        options: BulkLoadOptions,
-    ) -> Result<()> {
-        self.load_serving_with_control(artifact, options, OperationOptions::default())
-            .await
-    }
-
-    /// Loads with explicit cancellation and deadline control.
-    pub async fn load_serving_with_control(
-        &self,
-        artifact: &crate::bulk::ServingArtifact,
-        options: BulkLoadOptions,
-        control: OperationOptions,
-    ) -> Result<()> {
-        let artifact = artifact.clone();
-        let manifest = self.manifest.clone();
-        let descriptor = self.descriptor.clone();
-        let retry = lifecycle::RetryPolicy::from_config(self.runtime.inner.config());
-        self.runtime
-            .inner
-            .run_foreground(
-                Operation::LoadBulkBuild,
-                Some(self.logical_index_id()),
-                control,
-                move |mut context| async move {
-                    crate::runtime::bulk_load::load(
-                        &mut context,
-                        manifest,
-                        descriptor,
-                        artifact,
-                        options,
-                        retry,
-                    )
-                    .await
-                },
-            )
-            .await
-    }
-
-    /// Durably queues this job for automatic preparation, loading and publication.
+    /// Durably queues this job for automatic construction, loading, validation, and publication.
     /// Repeating identical options is idempotent. Run a Runtime scheduler on each
     /// participating process; all must have access to the shared source/workspace.
     pub async fn schedule(&self, options: BulkWorkerOptions) -> Result<()> {
         self.schedule_with_control(options, OperationOptions::default())
             .await
     }
+
     /// Queues work with explicit cancellation and deadline control.
     pub async fn schedule_with_control(
         &self,
@@ -381,9 +371,9 @@ impl<B: Backend> BulkBuildJob<B> {
             .await
     }
 
-    /// Completes preparation, loading, exact validation, and atomic publication.
+    /// Completes sharded construction, loading, validation, and atomic publication.
     /// Retries resume the durable phase, including after an unknown commit or
-    /// publication by another caller. Owned files are reclaimed when no IO holds
+    /// publication by another caller. Owned scratch files are reclaimed when no IO holds
     /// the workspace lock; namespace cleanup can finish a busy reclamation later.
     pub async fn complete(&self, options: BulkWorkerOptions) -> Result<super::Index<B>> {
         self.complete_with_control(options, OperationOptions::default())
@@ -401,16 +391,13 @@ impl<B: Backend> BulkBuildJob<B> {
             .map(|(index, _)| index)
     }
 
-    /// Completes preparation, loading, validation, publication and workspace cleanup.
-    ///
-    /// Retry this operation on the same job to resume durable progress. A published
-    /// job returns its original index. Queued jobs are owned by the scheduler and
-    /// reject direct execution. Recovery uses the sealed source and accepted artifacts.
+    /// Completes sharded construction, loading, validation, publication, and workspace cleanup.
     pub async fn complete_with_report(
         &self,
         options: BulkWorkerOptions,
         control: OperationOptions,
     ) -> Result<(super::Index<B>, BulkBuildReport)> {
+        let (control, _drop_guard) = crate::runtime::bulk_worker::drop_guarded_options(&control);
         let manifest = self.manifest.clone();
         let descriptor = self.descriptor.clone();
         let retry = lifecycle::RetryPolicy::from_config(self.runtime.inner.config());
@@ -437,19 +424,20 @@ impl<B: Backend> BulkBuildJob<B> {
         Ok((index, report))
     }
 
-    /// Resumes preparation and loading, reusing previously accepted artifacts.
-    /// The new invocation takes a durable attempt epoch. Completion leaves the
-    /// index hidden; call `publish` to validate and activate it.
+    /// Executes sharded construction and backend emission, leaving the index hidden in `Loaded`.
+    /// Call `publish` to validate and activate it.
     pub async fn run_worker(&self, options: BulkWorkerOptions) -> Result<()> {
         self.run_worker_with_control(options, OperationOptions::default())
             .await
     }
+
     /// Runs a worker with explicit cancellation/deadline control.
     pub async fn run_worker_with_control(
         &self,
         options: BulkWorkerOptions,
         control: OperationOptions,
     ) -> Result<()> {
+        let (control, _drop_guard) = crate::runtime::bulk_worker::drop_guarded_options(&control);
         let manifest = self.manifest.clone();
         let descriptor = self.descriptor.clone();
         let retry = lifecycle::RetryPolicy::from_config(self.runtime.inner.config());
@@ -473,16 +461,20 @@ impl<B: Backend> BulkBuildJob<B> {
             .await
             .map(|_| ())
     }
-    /// Requires completed loading, resumes exact paged validation, and publishes.
+
+    /// Requires completed loading, runs parallel slice validation, and atomically publishes.
     /// Unknown publication is resolved by the original Logical Index identity.
     pub async fn publish(&self) -> Result<super::Index<B>> {
         self.publish_with_control(OperationOptions::default()).await
     }
+
     /// Publishes with cancellation and deadline control.
     pub async fn publish_with_control(&self, control: OperationOptions) -> Result<super::Index<B>> {
+        let (control, _drop_guard) = crate::runtime::bulk_worker::drop_guarded_options(&control);
         let manifest = self.manifest.clone();
         let descriptor = self.descriptor.clone();
         let retry = lifecycle::RetryPolicy::from_config(self.runtime.inner.config());
+        let cleanup_control = control.clone();
         let active = self
             .runtime
             .inner
@@ -496,16 +488,22 @@ impl<B: Backend> BulkBuildJob<B> {
                 },
             )
             .await?;
-        match self.cleanup().await {
+        match self.cleanup_with_control(cleanup_control).await {
             Err(e) if e.kind() == super::ErrorKind::BulkBuildBusy => {}
             result => result?,
         }
         super::Index::new(Arc::clone(&self.runtime), self.name.clone(), active)
     }
-    /// Reclaims owned attempt files after publication or abort. This is safe to
+
+    /// Reclaims owned scratch files after publication or abort. This is safe to
     /// retry after process loss, including after index data has been dropped.
     /// Busy means workspace IO still holds a shared lock; retry after it exits.
     pub async fn cleanup(&self) -> Result<()> {
+        self.cleanup_with_control(OperationOptions::default()).await
+    }
+
+    /// Reclaims owned scratch files with explicit cancellation and deadline control.
+    pub async fn cleanup_with_control(&self, options: OperationOptions) -> Result<()> {
         let index = self.manifest.clone();
         let retry = lifecycle::RetryPolicy::from_config(self.runtime.inner.config());
         self.runtime
@@ -513,7 +511,7 @@ impl<B: Backend> BulkBuildJob<B> {
             .run_foreground(
                 Operation::CleanupBulkBuild,
                 Some(self.logical_index_id()),
-                OperationOptions::default(),
+                options,
                 move |mut context| async move {
                     crate::runtime::bulk_worker::cleanup(
                         &mut context,
@@ -539,6 +537,7 @@ impl<B: Backend> BulkBuildJob<B> {
         let name = self.name.clone();
         let id = self.logical_index_id();
         let retry = lifecycle::RetryPolicy::from_config(self.runtime.inner.config());
+        let cleanup_options = options.clone();
         self.runtime
             .inner
             .run_foreground(
@@ -550,7 +549,7 @@ impl<B: Backend> BulkBuildJob<B> {
                 },
             )
             .await?;
-        match self.cleanup().await {
+        match self.cleanup_with_control(cleanup_options).await {
             Err(e) if e.kind() == super::ErrorKind::BulkBuildBusy => Ok(()),
             result => result,
         }

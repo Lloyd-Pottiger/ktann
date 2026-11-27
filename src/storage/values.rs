@@ -67,13 +67,13 @@ mod build;
 mod data;
 mod entry;
 mod graph;
-mod load;
 mod manifest;
+mod progress;
 mod record;
 mod schedule;
 pub(crate) mod source;
 mod synopsis;
-mod validation;
+mod unit;
 mod wire;
 pub use graph::{GRAPH_CHUNK_BYTES, GraphChunk, GraphDescriptor, MAX_GRAPH_VALUE_BYTES};
 mod workspace;
@@ -87,19 +87,19 @@ pub use authority::{
 pub use build::BuildDescriptor;
 #[doc(inline)]
 pub use entry::{ChildEntry, LeafEntry};
-pub use load::BuildLoad;
 #[doc(inline)]
 pub use manifest::{
     BloomParameters, IndexIdAllocator, IndexLifecycle, IndexManifest, IndexNameEntry,
 };
+pub(crate) use progress::MAX_SPLIT_KEYS;
+pub use progress::{BuildPhase, BuildProgress};
 #[doc(inline)]
 pub use record::{OpaquePayload, RecordLocation, VectorRecord};
 pub use schedule::BuildSchedule;
 #[doc(inline)]
 pub use synopsis::{FieldSynopsis, PartitionSynopsis};
-pub use validation::BuildValidation;
+pub use unit::BuildUnit;
 pub use workspace::BuildWorkspace;
-pub(crate) use workspace::PreparedArtifact;
 
 use wire::{Decoder, Encoder};
 
@@ -149,10 +149,10 @@ const TAG_LEAF_ENTRY: u8 = 0x0a;
 const TAG_PARTITION_SYNOPSIS: u8 = 0x0b;
 const TAG_PARTITION_STATE: u8 = 0x0c;
 const TAG_BUILD_DESCRIPTOR: u8 = 0x0d;
+const TAG_BUILD_PROGRESS: u8 = 0x0e;
 const TAG_BUILD_WORKSPACE: u8 = 0x0f;
+const TAG_BUILD_UNIT: u8 = 0x10;
 const TAG_BUILD_SCHEDULE: u8 = 0x11;
-const TAG_BUILD_VALIDATION: u8 = 0x10;
-const TAG_BUILD_LOAD: u8 = 0x0e;
 const TAG_GRAPH_DESCRIPTOR: u8 = 0x12;
 const TAG_GRAPH_CHUNK: u8 = 0x13;
 const TAG_DRAIN_HEADER: u8 = 0x14;
@@ -167,15 +167,14 @@ pub enum ValueKind {
     GraphChunk,
     /// Immutable Bulk Build input and construction parameters.
     BuildDescriptor,
-    /// Fenced serving artifact load checkpoint.
-    /// Bulk Build control metadata.
+    /// Bulk Build workspace ownership and failure metadata.
     BuildWorkspace,
     /// Distributed scheduler lease.
     BuildSchedule,
-    /// Bulk Build control metadata.
-    BuildValidation,
-    /// Atomic serving load progress.
-    BuildLoad,
+    /// Per-unit Bulk Build lease and digest record.
+    BuildUnit,
+    /// Bulk Build stage and sealed inventory progress.
+    BuildProgress,
     /// The namespace Logical Index ID allocator.
     IndexIdAllocator,
     /// An Index Name to Logical Index ID mapping.
@@ -214,8 +213,8 @@ impl ValueKind {
             Self::BuildDescriptor => TAG_BUILD_DESCRIPTOR,
             Self::BuildWorkspace => TAG_BUILD_WORKSPACE,
             Self::BuildSchedule => TAG_BUILD_SCHEDULE,
-            Self::BuildValidation => TAG_BUILD_VALIDATION,
-            Self::BuildLoad => TAG_BUILD_LOAD,
+            Self::BuildUnit => TAG_BUILD_UNIT,
+            Self::BuildProgress => TAG_BUILD_PROGRESS,
             Self::IndexIdAllocator => TAG_INDEX_ID_ALLOCATOR,
             Self::IndexNameEntry => TAG_INDEX_NAME_ENTRY,
             Self::IndexManifest => TAG_INDEX_MANIFEST,
@@ -244,15 +243,14 @@ pub enum PersistentValue {
     GraphChunk(GraphChunk),
     /// Immutable Bulk Build input and construction parameters.
     BuildDescriptor(BuildDescriptor),
-    /// Fenced serving artifact load checkpoint.
-    /// Bulk Build control metadata.
+    /// Bulk Build workspace ownership and failure metadata.
     BuildWorkspace(BuildWorkspace),
     /// Durable automatic scheduling request.
     BuildSchedule(BuildSchedule),
-    /// Bulk Build control metadata.
-    BuildValidation(BuildValidation),
-    /// Atomic serving load progress.
-    BuildLoad(BuildLoad),
+    /// Per-unit Bulk Build lease and digest record.
+    BuildUnit(BuildUnit),
+    /// Bulk Build stage and sealed inventory progress.
+    BuildProgress(BuildProgress),
     /// The namespace Logical Index ID allocator.
     IndexIdAllocator(IndexIdAllocator),
     /// An Index Name directory mapping.
@@ -293,8 +291,8 @@ impl PersistentValue {
             Self::BuildDescriptor(_) => ValueKind::BuildDescriptor,
             Self::BuildWorkspace(_) => ValueKind::BuildWorkspace,
             Self::BuildSchedule(_) => ValueKind::BuildSchedule,
-            Self::BuildValidation(_) => ValueKind::BuildValidation,
-            Self::BuildLoad(_) => ValueKind::BuildLoad,
+            Self::BuildUnit(_) => ValueKind::BuildUnit,
+            Self::BuildProgress(_) => ValueKind::BuildProgress,
             Self::IndexIdAllocator(_) => ValueKind::IndexIdAllocator,
             Self::IndexNameEntry(_) => ValueKind::IndexNameEntry,
             Self::IndexManifest(_) => ValueKind::IndexManifest,
@@ -387,8 +385,8 @@ impl<'a> ValueCodec<'a> {
             PersistentValue::BuildDescriptor(value) => build::encode(&mut encoder, value)?,
             PersistentValue::BuildWorkspace(value) => workspace::encode(&mut encoder, value)?,
             PersistentValue::BuildSchedule(value) => schedule::encode(&mut encoder, value)?,
-            PersistentValue::BuildValidation(value) => validation::encode(&mut encoder, value)?,
-            PersistentValue::BuildLoad(value) => load::encode(&mut encoder, value)?,
+            PersistentValue::BuildUnit(value) => unit::encode(&mut encoder, value)?,
+            PersistentValue::BuildProgress(value) => progress::encode(&mut encoder, value)?,
             PersistentValue::IndexIdAllocator(value) => {
                 manifest::encode_index_id_allocator(&mut encoder, *value);
             }
@@ -476,10 +474,10 @@ impl<'a> ValueCodec<'a> {
             ValueKind::BuildWorkspace => {
                 PersistentValue::BuildWorkspace(workspace::decode(&mut decoder)?)
             }
-            ValueKind::BuildValidation => {
-                PersistentValue::BuildValidation(validation::decode(&mut decoder)?)
+            ValueKind::BuildUnit => PersistentValue::BuildUnit(unit::decode(&mut decoder)?),
+            ValueKind::BuildProgress => {
+                PersistentValue::BuildProgress(progress::decode(&mut decoder)?)
             }
-            ValueKind::BuildLoad => PersistentValue::BuildLoad(load::decode(&mut decoder)?),
             ValueKind::GraphDescriptor => {
                 PersistentValue::GraphDescriptor(graph::decode_descriptor(&mut decoder)?)
             }
@@ -560,8 +558,8 @@ const fn value_kind_for_key(key: &LogicalKey) -> ValueKind {
         LogicalKey::BuildDescriptor(_) => ValueKind::BuildDescriptor,
         LogicalKey::BuildWorkspace(_) => ValueKind::BuildWorkspace,
         LogicalKey::BuildSchedule(_) => ValueKind::BuildSchedule,
-        LogicalKey::BuildValidation(_) => ValueKind::BuildValidation,
-        LogicalKey::BuildLoad(_) => ValueKind::BuildLoad,
+        LogicalKey::BuildScheduleSlot { .. } | LogicalKey::BuildUnit { .. } => ValueKind::BuildUnit,
+        LogicalKey::BuildProgress(_) => ValueKind::BuildProgress,
         LogicalKey::Record { .. } => ValueKind::VectorRecord,
         LogicalKey::Location { .. } => ValueKind::RecordLocation,
         LogicalKey::Payload { .. } => ValueKind::OpaquePayload,
