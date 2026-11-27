@@ -4,11 +4,10 @@ use std::path::Path;
 
 use bytes::Bytes;
 use ktann::api::{
-    BulkBuildStatus, BulkLoadOptions, DataType, ErrorKind, FieldId, FieldSchema, IndexConfig,
-    Metric, Record, RuntimeConfig, Value,
+    BulkBuildOptions, BulkBuildStatus, BulkLoadOptions, DataType, ErrorKind, FieldId, FieldSchema,
+    IndexConfig, Metric, Record, RuntimeConfig, Value,
 };
 use ktann::bulk::InputSnapshot;
-use ktann::construction::ConstructionOptions;
 use ktann::runtime::Runtime;
 use ktann::storage::backend::Backend;
 
@@ -91,14 +90,9 @@ async fn exercise_mode<B: Backend>(
         }),
     )
     .unwrap();
-    let tree = ConstructionOptions {
+    let tree = BulkBuildOptions {
         sample_items: 16,
-        memory_bytes: if updates {
-            128 * 1024 * 1024
-        } else {
-            2 * 1024 * 1024
-        },
-        scratch_bytes: 32 * 1024 * 1024,
+        refinement_rounds: None,
     };
     let runtime = Runtime::new(
         backend(),

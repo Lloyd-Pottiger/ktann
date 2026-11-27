@@ -418,7 +418,8 @@ async fn cleanup_outcome_unknown_and_pagination_are_recoverable_after_drop() {
     let memory = MemoryBackend::with_test_config(TestConfig::default());
     let runtime = runtime(memory.clone());
     let (job, _) = reservation(&runtime, &dir, 19).await;
-    let opts = worker_options(&dir);
+    let mut opts = worker_options(&dir);
+    opts.memory_bytes = 8 * 1024; // trigger disk mode so owned scratch files exist before cleanup
     job.run_worker(opts.clone()).await.unwrap();
     runtime.drop_index("bulk").await.unwrap();
     assert_eq!(artifact_directories(&opts.workspace), 1);
@@ -654,8 +655,8 @@ async fn collaborative_workers_execute_disjoint_units_and_reclaim_crashed_leases
             "collab",
             &input,
             ktann::api::BulkBuildOptions {
-                construction: construction_options(),
                 refinement_rounds: Some(1),
+                ..construction_options()
             },
         )
         .await

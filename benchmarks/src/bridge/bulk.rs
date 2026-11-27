@@ -4,7 +4,6 @@ use ktann::api::{
     IndexConfig, OperationOptions, Record, Result,
 };
 use ktann::bulk::{InputSnapshot, InputSnapshotWriter};
-use ktann::construction::ConstructionOptions;
 use ktann::runtime::Runtime;
 use ktann::storage::backend::Backend;
 use serde_json::{Value, json};
@@ -44,28 +43,23 @@ impl<B: Backend> Build<B> {
         fs::create_dir(&root).map_err(io)?;
         fs::create_dir(root.join("workspace")).map_err(io)?;
         let mut worker = BulkWorkerOptions::new(root.join("workspace"));
-        let mut construction = ConstructionOptions {
+        worker.scratch_bytes = DISK_LIMIT;
+        let mut options = BulkBuildOptions {
             sample_items: 1024,
-            // Cover both wide routing nodes and large resident builds when requested.
-            memory_bytes: refinement_memory_bytes.max(1024 * 1024 * 1024),
-            scratch_bytes: DISK_LIMIT,
+            refinement_rounds: Some(rounds),
         };
         if let Some(experiment) = experiment {
-            construction = experiment.construction();
+            options = experiment.bulk_options(Some(rounds));
             worker = experiment.worker(root.join("workspace"));
         }
         // Reset owns the worker memory ceiling across both routing modes.
         worker.memory_bytes = refinement_memory_bytes;
-        let refinement_rounds = Some(rounds);
         let writer = InputSnapshotWriter::new(&root.join("source"), config, worker.scratch_bytes)?;
-        let mut report = Value::Object(crate::report::bulk_build_settings(&construction, &worker));
+        let mut report = Value::Object(crate::report::bulk_build_settings(&options, &worker));
         report["refinement_rounds"] = json!(rounds);
         Ok(Self {
             root,
-            options: BulkBuildOptions {
-                construction,
-                refinement_rounds,
-            },
+            options,
             worker,
             writer: Some(writer),
             source: None,
@@ -137,8 +131,6 @@ impl<B: Backend> Build<B> {
 /// Core stage timings describe only the successful completion call, including reused stages.
 fn completion_report(stages: BulkBuildReport, elapsed: Duration) -> serde_json::Map<String, Value> {
     let publish_seconds = stages.publish.as_secs_f64();
-    let forest_seconds =
-        (stages.plan + stages.ingest + stages.construct + stages.refine).as_secs_f64();
     let report = json!({
         "in_memory_mode": stages.in_memory_mode,
         "records": stages.records,
@@ -152,9 +144,6 @@ fn completion_report(stages: BulkBuildReport, elapsed: Duration) -> serde_json::
         "construct_seconds": stages.construct.as_secs_f64(),
         "refine_seconds": stages.refine.as_secs_f64(),
         "emit_seconds": stages.emit.as_secs_f64(),
-        "forest_seconds": forest_seconds,
-        "serving_seconds": 0.0,
-        "load_seconds": stages.emit.as_secs_f64(),
         "prepare_load_seconds": (elapsed.as_secs_f64() - publish_seconds).max(0.0),
         "validate_publish_cleanup_seconds": publish_seconds,
         "rotation_seed": stages.rotation_seed,

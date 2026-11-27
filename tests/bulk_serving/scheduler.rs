@@ -726,9 +726,18 @@ async fn separate_runtimes_progress_different_jobs_in_one_workspace() {
     // Wait until the published job has encountered busy cleanup and released
     // its queue claim for retry, before allowing the other worker to finish.
     tokio::time::timeout(Duration::from_secs(10), async {
+        use ktann::storage::backend::ReadOps;
         loop {
-            let slot = read_slot(&memory, two.logical_index_id()).await;
-            if slot[9..41] == [0; 32] {
+            let slot = memory
+                .begin_read()
+                .await
+                .unwrap()
+                .get(
+                    ktann::storage::keys::build_schedule_slot_key(two.logical_index_id(), 0).into(),
+                )
+                .await
+                .unwrap();
+            if slot.is_none() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;

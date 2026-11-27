@@ -72,9 +72,9 @@ impl<B: Backend> Runtime<B> {
         &self,
         name: &str,
         input: &crate::bulk::InputSnapshot,
-        construction: impl Into<crate::api::BulkBuildOptions>,
+        options: crate::api::BulkBuildOptions,
     ) -> Result<crate::api::BulkBuildJob<B>> {
-        self.start_bulk_build_with_control(name, input, construction, OperationOptions::default())
+        self.start_bulk_build_with_control(name, input, options, OperationOptions::default())
             .await
     }
 
@@ -83,22 +83,20 @@ impl<B: Backend> Runtime<B> {
         &self,
         name: &str,
         input: &crate::bulk::InputSnapshot,
-        construction: impl Into<crate::api::BulkBuildOptions>,
-        options: OperationOptions,
+        build_options: crate::api::BulkBuildOptions,
+        control: OperationOptions,
     ) -> Result<crate::api::BulkBuildJob<B>> {
         let name = IndexName::new(name)?;
         let config = input.config().clone();
-        let preparation = construction.into();
-        let construction = preparation.construction;
-        construction.validate_for(&config)?;
+        config.validate()?;
+        build_options.validate()?;
         let source =
             std::path::absolute(input.directory()).map_err(|_| Error::invalid_argument())?;
         let descriptor = crate::storage::values::BuildDescriptor::new(
             source,
             input.manifest().clone(),
-            construction,
-        )?
-        .with_refinement_rounds(preparation.refinement_rounds)?;
+            build_options,
+        )?;
         let request = descriptor.clone();
         let request_name = name.clone();
         let retry = lifecycle::RetryPolicy::from_config(self.config());
@@ -106,7 +104,7 @@ impl<B: Backend> Runtime<B> {
             .run_foreground(
                 Operation::StartBulkBuild,
                 None,
-                options,
+                control,
                 move |mut context| async move {
                     lifecycle::reserve_index(
                         &mut context,

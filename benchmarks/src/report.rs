@@ -990,20 +990,12 @@ pub struct WriteAmplification {
 /// Records the resolved Bulk Build settings used by either benchmark entrypoint.
 /// Capture before transferring worker ownership to the build job.
 pub(crate) fn bulk_build_settings(
-    construction: &ktann::construction::ConstructionOptions,
+    options: &ktann::api::BulkBuildOptions,
     worker: &ktann::api::BulkWorkerOptions,
 ) -> serde_json::Map<String, serde_json::Value> {
     use serde_json::json;
     [
-        ("sample_items", json!(construction.sample_items)),
-        (
-            "construction_memory_bytes",
-            json!(construction.memory_bytes),
-        ),
-        (
-            "construction_scratch_bytes",
-            json!(construction.scratch_bytes),
-        ),
+        ("sample_items", json!(options.sample_items)),
         ("parallelism", json!(worker.parallelism)),
         ("distributed_workers", json!(worker.distributed_workers)),
         ("worker_memory_bytes", json!(worker.memory_bytes)),

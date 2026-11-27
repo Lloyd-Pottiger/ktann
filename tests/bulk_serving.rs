@@ -9,7 +9,6 @@ use ktann::api::{
     RuntimeConfig, SynopsisConfig, Value, VerifyOptions,
 };
 use ktann::bulk::InputSnapshot;
-use ktann::construction::ConstructionOptions;
 use ktann::runtime::Runtime;
 use ktann::storage::ReadLogicalTxn;
 use ktann::storage::backend::{Backend, ReadOps, ScanLimits, WriteTxn};
@@ -70,11 +69,10 @@ fn record(id: u64) -> Record {
     }
 }
 
-fn construction_options() -> ConstructionOptions {
-    ConstructionOptions {
+fn construction_options() -> BulkBuildOptions {
+    BulkBuildOptions {
         sample_items: 8,
-        memory_bytes: 2 * 1024 * 1024,
-        scratch_bytes: 16 * 1024 * 1024,
+        refinement_rounds: None,
     }
 }
 
@@ -247,8 +245,8 @@ async fn in_memory_and_disk_modes_match_each_other_and_online_leaf_values() {
                     "bulk-disk-ref",
                     &input,
                     BulkBuildOptions {
-                        construction: construction_options(),
                         refinement_rounds: Some(2),
+                        ..construction_options()
                     },
                 )
                 .await
@@ -446,15 +444,7 @@ async fn resident_mode_does_not_pin_large_payload_frames_in_memory() {
     )
     .unwrap();
     let job = rt
-        .start_bulk_build(
-            "payload-unpinned",
-            &input,
-            ConstructionOptions {
-                sample_items: 8,
-                memory_bytes: 16 * 1024 * 1024,
-                scratch_bytes: 64 * 1024 * 1024,
-            },
-        )
+        .start_bulk_build("payload-unpinned", &input, construction_options())
         .await
         .unwrap();
     let work = dir.path().join("work");

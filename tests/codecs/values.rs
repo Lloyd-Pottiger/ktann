@@ -962,8 +962,8 @@ fn reopened_manifest_reproduces_identical_index_value_bytes() {
 
 #[test]
 fn building_manifest_and_request_descriptor_have_canonical_bytes() {
+    use ktann::api::BulkBuildOptions;
     use ktann::bulk::InputManifest;
-    use ktann::construction::ConstructionOptions;
     use ktann::storage::values::BuildDescriptor;
     let codec = ValueCodec::bootstrap();
     let building = minimal_manifest().with_lifecycle(IndexLifecycle::Building);
@@ -980,10 +980,9 @@ fn building_manifest_and_request_descriptor_have_canonical_bytes() {
     input_bytes[..9].copy_from_slice(b"KTANNBF\x00\x01");
     input_bytes[50..58].copy_from_slice(&46_u64.to_be_bytes());
     let input = InputManifest::decode(&input_bytes).unwrap();
-    let options = ConstructionOptions {
+    let options = BulkBuildOptions {
         sample_items: 8,
-        memory_bytes: 2 * 1024 * 1024,
-        scratch_bytes: 16 * 1024 * 1024,
+        refinement_rounds: None,
     };
     let descriptor = BuildDescriptor::new("/source".into(), input, options).unwrap();
     let value = PersistentValue::BuildDescriptor(descriptor);
@@ -994,9 +993,7 @@ fn building_manifest_and_request_descriptor_have_canonical_bytes() {
     expected.extend_from_slice(b"/source");
     expected.extend_from_slice(&90_u32.to_be_bytes());
     expected.extend_from_slice(&input_bytes);
-    for number in [8_u64, 2 * 1024 * 1024, 16 * 1024 * 1024] {
-        expected.extend_from_slice(&number.to_be_bytes());
-    }
+    expected.extend_from_slice(&8_u64.to_be_bytes());
     expected.push(0); // refinement omitted
     assert_eq!(bytes.as_slice(), expected.as_slice());
     assert_eq!(decode(codec, &key, &bytes).unwrap(), value);

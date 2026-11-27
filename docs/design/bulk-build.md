@@ -38,9 +38,10 @@ Architectural rationale is recorded in [ADR 0026](../adr/0026-building-reservati
 
 ## 2. Reservation and Worker Options
 
-Call `Runtime::start_bulk_build(name, &input, options)` with `ConstructionOptions`
-(no refinement) or `BulkBuildOptions { construction, refinement_rounds }` (`0..=5`
-rounds; `Some(0)` refreshes centroids without moves). Reservation atomically
+Call `Runtime::start_bulk_build(name, &input, options)` with
+`BulkBuildOptions { sample_items, refinement_rounds }` (`sample_items >= 2`,
+`refinement_rounds` in `0..=5`; `None` preserves constructed centroids and
+`Some(0)` refreshes centroids without moves). Reservation atomically
 allocates a never-reused Logical Index ID, reserves `name`, and persists a
 `Building` `IndexManifest`, `BuildDescriptor`, and initial `BuildProgress`.
 Repeating an identical request recovers that `BulkBuildJob`; `open_bulk_build(name)`
@@ -95,13 +96,15 @@ bit-identical bucket and shard boundaries.
 
 One unified stage pipeline (`src/runtime/bulk_pipeline.rs`) executes across both
 ample-memory single-worker builds (`StageStore::Memory`, `in_memory_mode = true`,
-`0 B` workspace scratch writes) and constrained-memory or multi-worker builds
-(`StageStore::Disk`, `in_memory_mode = false`) over a 6-primitive byte/slice store:
+`0 B` workspace scratch writes and zero intermediate byte encoding) and
+constrained-memory or multi-worker builds (`StageStore::Disk`,
+`in_memory_mode = false`) over a typed `StageStore`:
 
 1. **`STAGE_SCATTER (1)`**: Reads immutable `InputSnapshot` segments, validates
    adapter key/value limits, projects `TreeKey`, routes rotated `f32` vectors to
    Coarse Shards, and partitions `(id, SourceFrameRef)` offsets into Record-ID
-   buckets, storing indexed `ids-*`, `vec-*`, and `cnt-*` entries in `StageStore`.
+   buckets, storing indexed `ids-*` and `vec-*` (with per-shard row counts in the
+   index header) entries in `StageStore`.
 2. **`STAGE_DEDUP (2)`**: Each Record-ID bucket sorts by canonical escaped ID,
    rejects any duplicate across segments or Tree Keys with `RecordAlreadyExists`,
    stores `idref-*` in `StageStore`, and reclaims scatter ID runs.
@@ -232,7 +235,7 @@ filter field, cosine metric, local HNSW enabled):
 | **Input Snapshot** | `610,352` segments (`16,384` rows, `~49 MiB` each); `segments.bin` = `29.3 MiB` | `~30.1 TiB` immutable segments; `O(1)`-FD segment reads |
 | **`ShardPlan` memory & I/O** | Uniform strided full-segment sample capped at `32,768` rows; `65,536` Coarse Shards (`~152,588` rows/shard) with `256` super-centers (`3` candidate lists, `~512` distance evals/vector) + `4,096` ID buckets | `~105 MiB` sample RAM; `plan.bin` = `201 MiB` (read once per worker) |
 | **Per-worker RAM (`W` workers, `P` threads/worker)** | Scatter/Leaf/Emit hold at most `P` Coarse Shards (`152,588 * ~3,200 B ≈ 488 MiB`/shard); Halo refinement caps at `max_halo_leaves = 32,768` (`~26` shards, `~105 MiB` centroids + HNSW) + `1` active shard (`~488 MiB`) | `2–4 GiB` RAM per worker (`O(1)` in dataset size $N$) |
-| **Intermediate coarse-shard storage** | Scatter (`vec-*` + `ids-*`): `~31.4 TiB`, consolidated into `65,536` self-contained `shard-*`, `centers-*`, and compact `(id, local_leaf)` `loc-*` files during `STAGE_LEAVES` (`vec-*`/`cnt-*` immediately deleted) | Peak simultaneous scratch `~32–34 TiB` on shared object/file store (`~1.05x–1.15x` raw vectors) |
+| **Intermediate coarse-shard storage** | Scatter (`vec-*` + `ids-*`): `~31.4 TiB`, consolidated into `65,536` self-contained `shard-*`, `centers-*`, and final-round compact `(id, local_leaf)` `loc-*` files (`vec-*` immediately deleted after `STAGE_LEAVES`) | Peak simultaneous scratch `~32–34 TiB` on shared object/file store (`~1.05x–1.15x` raw vectors) |
 | **Inter-worker coordination & KV metadata** | Workers share zero direct RPCs; coordination uses KV `BuildUnit` claims (`610k` scatter + `4k` dedup + `65.5k` leaf + `65.5k * 2R` refine + `70k` emit + `256` validate $\approx 1.01 \times 10^6$ units for `R = 2`, `< 290 MiB` transient KV metadata reclaimed on cleanup) | `< 350` lease/claim txns/sec across `64` workers (`30 s` lease) |
 | **Serving KV write transactions** | `~2.08 \times 10^{10}` serving KV records (`~64 TiB` logical bytes) batched at `4 MiB` / `5,000` mutations across 16 pipelined writer lanes | `~1.6 \times 10^7` write txns total (`~250k` txns/worker across `64` workers), zero whole-index serial bottleneck |
 | **Upper-tree & HNSW construction** | `~1.0 \times 10^8` leaf centroids (`~307 GiB` across trees in `centers-*`, partitioned across `64` `tree_buckets`); for a single `10B` tree (`level 2`: `~15.6k` internal nodes of `~6,400` children; `level 3`: `1` root of `~15.6k` children), each internal node's local HNSW builds independently in `< 64 MiB` | Parallelized across `tree_buckets` and worker threads without global graph residency |

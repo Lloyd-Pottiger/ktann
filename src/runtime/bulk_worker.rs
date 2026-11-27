@@ -273,6 +273,24 @@ pub(crate) async fn building<T: WriteTxn>(
     }
 }
 
+/// Classifies a read-only `Manifest` lookup for an in-flight worker or validator.
+pub(crate) fn check_manifest_building_in_flight(
+    value: Option<&PersistentValue>,
+    expected: &IndexManifest,
+) -> Result<()> {
+    match value {
+        None => Err(Error::new(ErrorKind::IndexNotFound)),
+        Some(PersistentValue::IndexManifest(m)) if m.has_same_immutable_identity(expected) => {
+            match m.lifecycle() {
+                IndexLifecycle::Building => Ok(()),
+                IndexLifecycle::Dropping => Err(Error::new(ErrorKind::IndexDropping)),
+                IndexLifecycle::Active => Err(Error::new(ErrorKind::BulkBuildSuperseded)),
+            }
+        }
+        _ => Err(corrupt()),
+    }
+}
+
 /// In-flight lifecycle check for worker tasks, validation slices, and sealing (`Active` means
 /// a peer already published this build and supersedes our in-flight attempt).
 pub(crate) async fn building_in_flight<T: WriteTxn>(
@@ -526,20 +544,23 @@ async fn run_normalized<B: Backend>(
 
     let root = options.workspace.clone();
     let lock = Arc::new(blocking(context, move || lock_root(&root, false)).await?);
-    let (state, fence, already_loaded) =
-        claim(context, &index, &descriptor, options, retry).await?;
-    if let Some(p) = already_loaded {
-        return Ok(BulkBuildReport {
-            records: p.total_records,
-            trees: p.trees,
-            partitions: p.partitions,
-            entries: p.total_entries,
-            rotation_seed: *index.rotation_seed(),
-            ..BulkBuildReport::default()
-        });
-    }
+    let (state, fence) = match claim(context, &index, &descriptor, options, retry).await? {
+        ClaimOutcome::AlreadyLoaded(p) => {
+            return Ok(BulkBuildReport {
+                records: p.total_records,
+                trees: p.trees,
+                partitions: p.partitions,
+                entries: p.total_entries,
+                rotation_seed: *index.rotation_seed(),
+                ..BulkBuildReport::default()
+            });
+        }
+        ClaimOutcome::Claimed(state, fence) => (state, fence),
+    };
 
-    {
+    let in_memory = state.options.distributed_workers == 1
+        && fits_in_memory(&index, &descriptor, &state.options);
+    if !in_memory {
         let dir = state.directory();
         let guard = lock.clone();
         blocking(context, move || {
@@ -552,8 +573,6 @@ async fn run_normalized<B: Backend>(
         .await?;
     }
 
-    let in_memory = state.options.distributed_workers == 1
-        && fits_in_memory(&index, &descriptor, &state.options);
     let result = bulk_pipeline::run_pipeline(
         context,
         &index,
@@ -580,7 +599,7 @@ fn fits_in_memory(
     if items == 0 {
         return true;
     }
-    let effective_mem = options.memory_bytes.min(descriptor.options().memory_bytes) as u64;
+    let effective_mem = options.memory_bytes as u64;
     let dim = index.config().dimension() as u64;
     let per_row = dim.saturating_mul(4).saturating_add(224);
     let wave_size = (options.parallelism.clamp(1, 16)) as u64;
@@ -596,6 +615,11 @@ fn fits_in_memory(
     needed <= effective_mem
 }
 
+enum ClaimOutcome {
+    AlreadyLoaded(BuildProgress),
+    Claimed(BuildWorkspace, WriteFence),
+}
+
 /// Claims or joins the workspace and installs `BuildWorkspace.writer_token`.
 async fn claim<B: Backend>(
     context: &mut OperationContext<B>,
@@ -603,7 +627,7 @@ async fn claim<B: Backend>(
     descriptor: &BuildDescriptor,
     options: BulkWorkerOptions,
     retry: RetryPolicy,
-) -> Result<(BuildWorkspace, WriteFence, Option<BuildProgress>)> {
+) -> Result<ClaimOutcome> {
     let ws_token = non_zero_token()?;
     let writer_token = non_zero_token()?;
 
@@ -629,22 +653,7 @@ async fn claim<B: Backend>(
                         txn.get(LogicalKey::BuildProgress(id)).await?
                     {
                         txn.rollback().await;
-                        return Ok((
-                            None,
-                            BuildWorkspace {
-                                options: options.clone(),
-                                hard_limits: backend.hard_limits(),
-                                token: ws_token,
-                                writer_token,
-                                epoch: p.epoch,
-                                failure: None,
-                            },
-                            WriteFence {
-                                epoch: p.epoch,
-                                owner: writer_token,
-                            },
-                            Some(p),
-                        ));
+                        return Ok((None, ClaimOutcome::AlreadyLoaded(p)));
                     }
                     return Err(Error::new(ErrorKind::BulkBuildSuperseded));
                 }
@@ -705,15 +714,7 @@ async fn claim<B: Backend>(
                     {
                         let loaded_prog = p.clone();
                         txn.rollback().await;
-                        return Ok((
-                            None,
-                            w.clone(),
-                            WriteFence {
-                                epoch: w.epoch,
-                                owner: w.writer_token,
-                            },
-                            Some(loaded_prog),
-                        ));
+                        return Ok((None, ClaimOutcome::AlreadyLoaded(loaded_prog)));
                     }
                     if options.distributed_workers > 1 {
                         let existing_fence = WriteFence {
@@ -725,7 +726,7 @@ async fn claim<B: Backend>(
                             .is_some_and(|p| p.epoch == w.epoch)
                         {
                             txn.rollback().await;
-                            return Ok((None, w, existing_fence, None));
+                            return Ok((None, ClaimOutcome::Claimed(w, existing_fence)));
                         }
                         (w, existing_fence)
                     } else {
@@ -777,11 +778,11 @@ async fn claim<B: Backend>(
                 )
                 .await?;
             }
-            Ok((Some(txn), state, fence, None))
+            Ok((Some(txn), ClaimOutcome::Claimed(state, fence)))
         }
         .await;
 
-        let (txn_opt, state, fence, loaded_opt) = match prepared {
+        let (txn_opt, outcome) = match prepared {
             Ok(v) => v,
             Err(e) if e.kind() == ErrorKind::RetryableAbort => {
                 retry
@@ -791,12 +792,11 @@ async fn claim<B: Backend>(
             }
             Err(e) => return Err(e),
         };
-        if loaded_opt.is_some() || txn_opt.is_none() {
-            return Ok((state, fence, loaded_opt));
-        }
-        let txn = txn_opt.expect("prepared write txn");
+        let Some(txn) = txn_opt else {
+            return Ok(outcome);
+        };
         match context.commit(|start| txn.commit_with(start)).await {
-            Ok(()) => return Ok((state, fence, None)),
+            Ok(()) => return Ok(outcome),
             Err(e) if e.kind() == ErrorKind::RetryableAbort => {
                 retry
                     .wait_or_exhaust(Operation::RunBulkBuild, &mut attempts)
@@ -890,43 +890,36 @@ pub(crate) async fn advance_loading_progress<B: Backend>(
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "shared loaded-sealing tail computes split keys, commits BuildProgress, and populates report counts"
-)]
+/// Sealed serving inventory totals and homomorphic digest committed when entering `Loaded`.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SealedSummary {
+    pub records: u64,
+    pub trees: u64,
+    pub partitions: u64,
+    pub entries: u64,
+    pub expected_kv_lthash: LtHash,
+}
+
 pub(crate) async fn finalize_and_seal_loaded<B: Backend>(
     context: &mut OperationContext<B>,
     index: &IndexManifest,
     fence: WriteFence,
     plan: &ShardPlan,
-    hard_limits: HardLimits,
-    total_records: u64,
-    total_trees: u64,
-    total_partitions: u64,
-    total_entries: u64,
-    expected_kv_lthash: LtHash,
+    summary: SealedSummary,
     retry: RetryPolicy,
     report: &mut BulkBuildReport,
 ) -> Result<()> {
-    let split_keys =
-        build_validation_split_keys(index.logical_index_id(), plan, total_entries, hard_limits)?;
-    seal_loaded(
-        context,
-        index,
-        fence,
-        total_records,
-        total_trees,
-        total_partitions,
-        total_entries,
-        expected_kv_lthash,
-        split_keys,
-        retry,
-    )
-    .await?;
-    report.records = total_records;
-    report.trees = total_trees;
-    report.partitions = total_partitions;
-    report.entries = total_entries;
+    let split_keys = build_validation_split_keys(
+        index.logical_index_id(),
+        plan,
+        summary.entries,
+        context.backend().hard_limits(),
+    )?;
+    seal_loaded(context, index, fence, summary, split_keys, retry).await?;
+    report.records = summary.records;
+    report.trees = summary.trees;
+    report.partitions = summary.partitions;
+    report.entries = summary.entries;
     Ok(())
 }
 
@@ -1302,92 +1295,6 @@ pub(super) fn split_into_chunks(
     Ok(chunks)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "detached async writer task owns cloned backend, control, and explicit fencing tokens"
-)]
-pub(super) async fn commit_one_chunk<B: Backend>(
-    backend: Arc<B>,
-    control: &OperationOptions,
-    bulk_authority: Option<BulkAuthority>,
-    sched_lease_lock: Option<&tokio::sync::RwLock<()>>,
-    index: &IndexManifest,
-    fence: WriteFence,
-    unit_fence: Option<&UnitLease>,
-    chunk: Vec<(Bytes, Bytes)>,
-    budget: AdmissionBudget,
-    retry: RetryPolicy,
-) -> Result<()> {
-    let id = index.logical_index_id();
-    let chunk_ref = &chunk;
-    retry_raw_write(
-        control,
-        sched_lease_lock,
-        Operation::RunBulkBuild,
-        retry,
-        || async {
-            let _lease_guard = match unit_fence {
-                Some(lease) => Some(lease.lock.lock().await),
-                None => None,
-            };
-            let prepared = async {
-                let mut txn = WriteLogicalTxn::for_index(
-                    backend.begin_write().await?,
-                    index,
-                    backend.hard_limits(),
-                    budget,
-                );
-
-                let mut warm = Vec::with_capacity(5);
-                warm.push(LogicalKey::Manifest(id));
-                warm.push(LogicalKey::BuildWorkspace(id));
-                warm.push(LogicalKey::BuildSchedule(id));
-                if let Some(auth) = bulk_authority {
-                    warm.push(auth.slot_key(id));
-                }
-                if let Some(lease) = unit_fence {
-                    warm.push(LogicalKey::BuildUnit {
-                        index: id,
-                        stage: lease.stage,
-                        unit: lease.unit,
-                    });
-                }
-                txn.warm_for_update(warm).await?;
-
-                check_writer_fence(&mut txn, index, fence).await?;
-                authorize_raw(&mut txn, id, bulk_authority).await?;
-                if let Some(lease) = unit_fence {
-                    let ukey = LogicalKey::BuildUnit {
-                        index: id,
-                        stage: lease.stage,
-                        unit: lease.unit,
-                    };
-                    match txn.get_for_update(ukey.clone()).await? {
-                        Some(PersistentValue::BuildUnit(mut u))
-                            if u.epoch == fence.epoch && u.owner == lease.owner && !u.complete =>
-                        {
-                            u.expires_ms = u
-                                .expires_ms
-                                .max(super::bulk_scheduler::expiry(lease.duration)?);
-                            txn.put(ukey, PersistentValue::BuildUnit(u)).await?;
-                        }
-                        _ => return Err(Error::new(ErrorKind::BulkBuildSuperseded)),
-                    }
-                }
-                let mut batch = txn.mutations();
-                for (k, v) in chunk_ref {
-                    batch.put_encoded(k.clone(), v.clone())?;
-                }
-                txn.apply(batch).await?;
-                Ok((Some(txn), ()))
-            }
-            .await;
-            commit_raw_prepared(prepared).await
-        },
-    )
-    .await
-}
-
 /// Conflict-protects `BuildWorkspace(id)` without mutating it, verifying that `fence` remains the
 /// active writer authority for `index`.
 pub(crate) async fn check_writer_fence<T: WriteTxn>(
@@ -1413,19 +1320,11 @@ pub(crate) async fn check_writer_fence<T: WriteTxn>(
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "sealing Loaded commits exact counts, multiset digest, and validation split keys atomically"
-)]
 pub(crate) async fn seal_loaded<B: Backend>(
     context: &mut OperationContext<B>,
     index: &IndexManifest,
     fence: WriteFence,
-    total_records: u64,
-    trees: u64,
-    partitions: u64,
-    total_entries: u64,
-    expected_kv_lthash: LtHash,
+    summary: SealedSummary,
     validation_split_keys: Vec<Bytes>,
     retry: RetryPolicy,
 ) -> Result<()> {
@@ -1452,8 +1351,8 @@ pub(crate) async fn seal_loaded<B: Backend>(
             };
             if cur.phase == BuildPhase::Loaded
                 && cur.epoch == fence.epoch
-                && cur.total_entries == total_entries
-                && cur.expected_kv_lthash == expected_kv_lthash
+                && cur.total_entries == summary.entries
+                && cur.expected_kv_lthash == summary.expected_kv_lthash
             {
                 txn.rollback().await;
                 return Ok((None, ()));
@@ -1465,12 +1364,12 @@ pub(crate) async fn seal_loaded<B: Backend>(
             let next = BuildProgress {
                 phase: BuildPhase::Loaded,
                 epoch: fence.epoch,
-                loaded_entries: total_entries,
-                total_entries,
-                total_records,
-                trees,
-                partitions,
-                expected_kv_lthash,
+                loaded_entries: summary.entries,
+                total_entries: summary.entries,
+                total_records: summary.records,
+                trees: summary.trees,
+                partitions: summary.partitions,
+                expected_kv_lthash: summary.expected_kv_lthash,
                 validation_split_keys: split_ref.clone(),
             };
             txn.put(

@@ -2,11 +2,10 @@
 use bytes::Bytes;
 use foundationdb::Database;
 use ktann::api::{
-    BulkBuildStatus, BulkSchedulerOptions, BulkWorkerOptions, IndexConfig, Metric,
-    OperationOptions, Record, RuntimeConfig, VerifyOptions,
+    BulkBuildOptions, BulkBuildStatus, BulkSchedulerOptions, BulkWorkerOptions, IndexConfig,
+    Metric, OperationOptions, Record, RuntimeConfig, VerifyOptions,
 };
 use ktann::bulk::InputSnapshot;
-use ktann::construction::ConstructionOptions;
 use ktann::runtime::Runtime;
 use ktann::storage::backend::{Backend, ReadOps};
 use ktann_foundationdb::{BackendNamespace, FoundationDbBackend};
@@ -104,10 +103,9 @@ async fn foundationdb_scheduler_process() {
         }),
     )
     .unwrap();
-    let construction = ConstructionOptions {
+    let construction = BulkBuildOptions {
         sample_items: 256,
-        memory_bytes: 32 * 1024 * 1024,
-        scratch_bytes: 128 * 1024 * 1024,
+        refinement_rounds: None,
     };
     let job = runtime
         .start_bulk_build("scheduled", &source, construction)
@@ -118,20 +116,19 @@ async fn foundationdb_scheduler_process() {
         .unwrap();
     let mut first = spawn_worker(&namespace);
     let queue_key: Bytes = ktann::storage::keys::build_schedule_key(job.logical_index_id()).into();
+    let slot_key: Bytes =
+        ktann::storage::keys::build_schedule_slot_key(job.logical_index_id(), 0).into();
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             assert!(first.0.try_wait().unwrap().is_none());
-            let bytes = raw
+            if raw
                 .begin_read()
                 .await
                 .unwrap()
-                .get(queue_key.clone())
+                .get(slot_key.clone())
                 .await
                 .unwrap()
-                .expect("queue must exist before publication");
-            if bytes[bytes.len() - 40..bytes.len() - 8]
-                .iter()
-                .any(|v| *v != 0)
+                .is_some()
             {
                 break;
             }

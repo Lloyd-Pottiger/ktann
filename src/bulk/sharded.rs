@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use bytes::Bytes;
-use xxhash_rust::xxh3::{Xxh3, xxh3_64, xxh3_128_with_seed};
+use xxhash_rust::xxh3::{xxh3_64, xxh3_128_with_seed};
 
 use crate::api::{
     DataType, Error, ErrorKind, IndexConfig, MAX_RECORD_ID_BYTES, PartitionKey, Result, Value,
@@ -36,7 +36,7 @@ use super::input::InputSnapshot;
 use super::plan::{MAX_TOTAL_SHARDS, SAMPLE_SEED, ShardPlan, nearest_center, train_centers};
 
 pub(crate) const MAX_HALO_LEAVES_CAP: usize = 32_768;
-pub(crate) const INDEX_ENTRY_BYTES: u64 = 24; // `(offset: u64, len: u64, xxh3_64: u64)`
+pub(crate) const INDEX_ENTRY_BYTES: u64 = 32; // `(offset: u64, len: u64, xxh3_64: u64, count: u64)`
 const LEAF_KEYS_MAGIC: &[u8; 8] = b"KTANNLK2";
 
 /// Runs `f` over `workers`-bounded immutable slice chunks using scoped OS threads.
@@ -306,6 +306,27 @@ impl ShardRows {
     pub(crate) fn vector(&self, vec_slot: usize) -> &[f32] {
         let start = vec_slot * self.dim;
         &self.vectors[start..start + self.dim]
+    }
+
+    pub(crate) fn append(&mut self, mut other: Self) {
+        if other.rows.is_empty() {
+            return;
+        }
+        if self.rows.is_empty() {
+            *self = other;
+            return;
+        }
+        let slot_offset = self.vectors.len() / self.dim;
+        self.vectors.extend_from_slice(&other.vectors);
+        self.rows.reserve(other.rows.len());
+        for row in other.rows.drain(..) {
+            self.rows.push(CompactMeta {
+                tree_key: row.tree_key,
+                id: row.id,
+                fields: row.fields,
+                vec_slot: row.vec_slot + slot_offset,
+            });
+        }
     }
 }
 
@@ -810,24 +831,28 @@ pub(crate) fn refine_single_light_shard(
         for _ in 0..rounds {
             check()?;
             let neighbors = leaf_neighbors(&check, &kernel, leaves)?;
-            let mut moves: Vec<(f64, Bytes, usize, usize, usize)> = Vec::new();
+            let mut moves: Vec<(f64, usize, usize, usize)> = Vec::new();
             for (src, leaf) in leaves.iter().enumerate() {
                 for &row_idx in &leaf.members {
                     let vec = shard.rows.vector(shard.rows.rows[row_idx].vec_slot);
                     if let Some((gain, dst)) = best_move(&kernel, leaves, src, vec, &neighbors[src])
                     {
-                        moves.push((gain, shard.rows.rows[row_idx].id.clone(), row_idx, src, dst));
+                        moves.push((gain, row_idx, src, dst));
                     }
                 }
             }
             if moves.is_empty() {
                 break;
             }
-            moves.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            moves.sort_unstable_by(|a, b| {
+                b.0.total_cmp(&a.0)
+                    .then_with(|| shard.rows.rows[a.1].id.cmp(&shard.rows.rows[b.1].id))
+            });
+            let row_ids: Vec<usize> = moves.iter().map(|m| m.1).collect();
             let indexed_moves: Vec<(f64, usize, usize, usize)> = moves
-                .iter()
+                .into_iter()
                 .enumerate()
-                .map(|(rank, m)| (m.0, rank, m.3, m.4))
+                .map(|(rank, (gain, _, src, dst))| (gain, rank, src, dst))
                 .collect();
             let mut counts: Vec<usize> = leaves.iter().map(|l| l.members.len()).collect();
             let mut moved_row_to_dst: BTreeMap<usize, usize> = BTreeMap::new();
@@ -837,7 +862,7 @@ pub(crate) fn refine_single_light_shard(
                 min_leaf,
                 max_leaf,
                 |rank, _src, dst| {
-                    moved_row_to_dst.insert(moves[rank].2, dst);
+                    moved_row_to_dst.insert(row_ids[rank], dst);
                 },
             );
             if accepted == 0 {
@@ -1829,16 +1854,19 @@ pub(crate) fn read_checksummed_bytes(path: &Path) -> Result<Vec<u8>> {
     Ok(raw)
 }
 
-/// Writes `[count: u32][(offset: u64, len: u64, xxh3_64: u64); count][hdr_xxh3: u64][bodies...]`.
+/// Writes `[count: u32][(offset: u64, len: u64, xxh3_64: u64, item_count: u64); count][bodies...]`.
 pub(crate) fn write_indexed_slices(
     path: &Path,
     slices: &[Vec<u8>],
+    item_counts: Option<&[u64]>,
     quota: &ScratchQuota,
 ) -> Result<u64> {
+    if item_counts.is_some_and(|c| c.len() != slices.len()) {
+        return Err(Error::invalid_argument());
+    }
     let count = u32::try_from(slices.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
     let header_bytes = 4_u64
         .checked_add((slices.len() as u64).saturating_mul(INDEX_ENTRY_BYTES))
-        .and_then(|n| n.checked_add(8))
         .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
     let body_bytes = slices
         .iter()
@@ -1849,22 +1877,22 @@ pub(crate) fn write_indexed_slices(
         .ok_or_else(|| Error::new(ErrorKind::LimitExceeded))?;
 
     quota.write_exact(path, total_bytes, |w| {
-        let mut header_hash = Xxh3::new();
-        let count_b = count.to_be_bytes();
-        header_hash.update(&count_b);
-        w.write_all(&count_b).map_err(io_error)?;
+        w.write_all(&count.to_be_bytes()).map_err(io_error)?;
         let mut cursor = header_bytes;
-        for slice in slices {
+        for (idx, slice) in slices.iter().enumerate() {
             let len = slice.len() as u64;
             let csum = if len == 0 { 0_u64 } else { xxh3_64(slice) };
-            for b in [cursor.to_be_bytes(), len.to_be_bytes(), csum.to_be_bytes()] {
-                header_hash.update(&b);
+            let items = item_counts.map_or(0, |c| c[idx]);
+            for b in [
+                cursor.to_be_bytes(),
+                len.to_be_bytes(),
+                csum.to_be_bytes(),
+                items.to_be_bytes(),
+            ] {
                 w.write_all(&b).map_err(io_error)?;
             }
             cursor += len;
         }
-        w.write_all(&header_hash.digest().to_be_bytes())
-            .map_err(io_error)?;
         for slice in slices {
             if !slice.is_empty() {
                 w.write_all(slice).map_err(io_error)?;
@@ -1872,6 +1900,40 @@ pub(crate) fn write_indexed_slices(
         }
         Ok(())
     })
+}
+
+/// Reads per-slice item counts from an indexed slice file header in a single sequential read.
+pub(crate) fn read_indexed_counts(path: &Path, expected_slices: usize) -> Result<Vec<u64>> {
+    let file = File::open(path).map_err(io_error)?;
+    let file_len = file.metadata().map_err(io_error)?.len();
+    if expected_slices > MAX_TOTAL_SHARDS || file_len < 4 {
+        return Err(corrupt());
+    }
+    let mut count_b = [0_u8; 4];
+    read_at_exact(&file, &mut count_b, 0)?;
+    let count = u32::from_be_bytes(count_b) as usize;
+    let table_bytes = (count as u64)
+        .checked_mul(INDEX_ENTRY_BYTES)
+        .ok_or_else(corrupt)?;
+    if count != expected_slices || 4_u64.checked_add(table_bytes).is_none_or(|n| n > file_len) {
+        return Err(corrupt());
+    }
+    let mut table = vec![0_u8; table_bytes as usize];
+    read_at_exact(&file, &mut table, 4)?;
+    let mut out = Vec::with_capacity(count);
+    let (entries, remainder) = table.as_chunks::<{ INDEX_ENTRY_BYTES as usize }>();
+    if !remainder.is_empty() {
+        return Err(corrupt());
+    }
+    for entry in entries {
+        let len = u64::from_be_bytes(entry[8..16].try_into().expect("len"));
+        let items = u64::from_be_bytes(entry[24..32].try_into().expect("items"));
+        if (len == 0) != (items == 0) {
+            return Err(corrupt());
+        }
+        out.push(items);
+    }
+    Ok(out)
 }
 
 /// Reads and checksum-verifies one indexed slice via `pread` without buffering the whole file.
@@ -1882,7 +1944,7 @@ pub(crate) fn read_indexed_slice(
 ) -> Result<Option<Vec<u8>>> {
     let file = File::open(path).map_err(io_error)?;
     let file_len = file.metadata().map_err(io_error)?.len();
-    if file_len < 12 {
+    if file_len < 4 {
         return Err(corrupt());
     }
     let mut count_b = [0_u8; 4];
@@ -1894,7 +1956,6 @@ pub(crate) fn read_indexed_slice(
                 .checked_mul(INDEX_ENTRY_BYTES)
                 .ok_or_else(corrupt)?,
         )
-        .and_then(|n| n.checked_add(8))
         .ok_or_else(corrupt)?;
     if slice_idx >= count || count > max_slices || body_min_offset > file_len {
         return Err(corrupt());
@@ -2001,17 +2062,15 @@ pub(crate) fn decode_id_refs(raw: &[u8]) -> Result<Vec<IdFrameEntry>> {
 pub(crate) fn encode_shard_slices(
     manifest: &IndexManifest,
     shards: &[ShardRows],
-) -> Result<(Vec<Vec<u8>>, Vec<u8>)> {
-    let shard_count =
-        u32::try_from(shards.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
+) -> Result<(Vec<Vec<u8>>, Vec<u64>)> {
+    let _ = u32::try_from(shards.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
     let config = manifest.config();
     let mut slices = Vec::with_capacity(shards.len());
-    let mut cnt_buf = Vec::with_capacity(4 + shards.len() * 8);
-    cnt_buf.extend_from_slice(&shard_count.to_be_bytes());
+    let mut counts = Vec::with_capacity(shards.len());
     for shard in shards {
         let row_count =
             u32::try_from(shard.rows.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
-        cnt_buf.extend_from_slice(&(shard.rows.len() as u64).to_be_bytes());
+        counts.push(u64::from(row_count));
         let mut buf = Vec::new();
         if row_count > 0 {
             buf.extend_from_slice(&row_count.to_be_bytes());
@@ -2021,21 +2080,7 @@ pub(crate) fn encode_shard_slices(
         }
         slices.push(buf);
     }
-    Ok((slices, cnt_buf))
-}
-
-pub(crate) fn decode_shard_counts(raw: &[u8], expected_shards: usize) -> Result<Vec<u64>> {
-    let mut r = ScratchCursor::new(raw);
-    let count = r.u32()? as usize;
-    if count != expected_shards || count > MAX_TOTAL_SHARDS || raw.len() != 4 + count * 8 {
-        return Err(corrupt());
-    }
-    let mut out = Vec::with_capacity(count);
-    for _ in 0..count {
-        out.push(r.u64()?);
-    }
-    r.finish()?;
-    Ok(out)
+    Ok((slices, counts))
 }
 
 fn decode_rows_from_cursor(
@@ -2076,12 +2121,27 @@ pub(crate) fn decode_shard_slice(
     r.finish()
 }
 
-pub(crate) type EncodedShardState = (Vec<u8>, Option<(Vec<u8>, Vec<Vec<u8>>)>);
+pub(crate) type EncodedShardState = (Vec<u8>, Option<(Vec<u8>, Option<Vec<Vec<u8>>>)>);
+
+pub(crate) fn encode_shard_locations(plan: &ShardPlan, state: &ShardState) -> Result<Vec<Vec<u8>>> {
+    let mut loc_slices = vec![Vec::new(); plan.id_bucket_count() as usize];
+    for (local_l, leaf) in state.leaves.iter().enumerate() {
+        let local_l_u32 = local_l as u32;
+        for &row_idx in &leaf.members {
+            let id = &state.rows.rows[row_idx].id;
+            let dst = &mut loc_slices[plan.id_bucket(id) as usize];
+            push_sized(dst, id)?;
+            dst.extend_from_slice(&local_l_u32.to_be_bytes());
+        }
+    }
+    Ok(loc_slices)
+}
 
 pub(crate) fn encode_shard_state(
     manifest: &IndexManifest,
     plan: &ShardPlan,
     state: &ShardState,
+    emit_locs: bool,
 ) -> Result<EncodedShardState> {
     let leaf_count =
         u32::try_from(state.leaves.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
@@ -2109,22 +2169,21 @@ pub(crate) fn encode_shard_state(
         encode_compact_row(&mut shard_buf, config, row, state.rows.vector(row.vec_slot))?;
     }
     shard_buf.extend_from_slice(&leaf_count.to_be_bytes());
-    let mut loc_slices = vec![Vec::new(); plan.id_bucket_count() as usize];
-    for (local_l, leaf) in state.leaves.iter().enumerate() {
+    for leaf in &state.leaves {
         let mem_len =
             u32::try_from(leaf.members.len()).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
         shard_buf.extend_from_slice(&mem_len.to_be_bytes());
-        let local_l_u32 = local_l as u32;
         for &row_idx in &leaf.members {
             let row_u32 =
                 u32::try_from(row_idx).map_err(|_| Error::new(ErrorKind::LimitExceeded))?;
             shard_buf.extend_from_slice(&row_u32.to_be_bytes());
-            let id = &state.rows.rows[row_idx].id;
-            let dst = &mut loc_slices[plan.id_bucket(id) as usize];
-            push_sized(dst, id)?;
-            dst.extend_from_slice(&local_l_u32.to_be_bytes());
         }
     }
+    let loc_slices = if emit_locs {
+        Some(encode_shard_locations(plan, state)?)
+    } else {
+        None
+    };
     Ok((centers_buf, Some((shard_buf, loc_slices))))
 }
 

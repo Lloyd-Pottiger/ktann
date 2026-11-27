@@ -68,12 +68,11 @@ impl Experiment {
         Ok(())
     }
 
-    /// Resolves the same construction controls for the native runner and bridge.
-    pub fn construction(&self) -> ktann::construction::ConstructionOptions {
-        ktann::construction::ConstructionOptions {
+    /// Resolves semantic Bulk Build options for the native runner and bridge.
+    pub fn bulk_options(&self, refinement_rounds: Option<u8>) -> ktann::api::BulkBuildOptions {
+        ktann::api::BulkBuildOptions {
             sample_items: self.sample_items,
-            memory_bytes: self.build_memory_bytes,
-            scratch_bytes: self.build_scratch_bytes,
+            refinement_rounds,
         }
     }
 

@@ -36,8 +36,8 @@ async fn graph_publication_preserves_membership_and_supports_mutations() {
                 )
                 .unwrap();
                 let request = BulkBuildOptions {
-                    construction: construction_options(),
                     refinement_rounds: rounds,
+                    ..construction_options()
                 };
                 let job = runtime
                     .start_bulk_build("graph", &input, request)
@@ -185,8 +185,8 @@ async fn graph_preparation_failure_is_terminal_hidden_and_identity_bound() {
         )
         .unwrap();
         let request = BulkBuildOptions {
-            construction: construction_options(),
             refinement_rounds: refinement.then_some(2),
+            ..construction_options()
         };
         let job = runtime
             .start_bulk_build("graph", &input, request)
@@ -250,8 +250,8 @@ async fn missing_graph_chunk_in_sealed_backend_fails_closed_before_publish() {
             "graph",
             &input,
             BulkBuildOptions {
-                construction: construction_options(),
                 refinement_rounds: Some(0),
+                ..construction_options()
             },
         )
         .await

@@ -9,8 +9,8 @@ use bytes::Bytes;
 use xxhash_rust::xxh3::{xxh3_64, xxh3_128_with_seed};
 
 use crate::api::{Error, ErrorKind, MAX_RECORD_ID_BYTES, Result};
-use crate::construction::ConstructionOptions;
 use crate::maintenance::routing::kernel_for;
+use crate::refinement::mean;
 use crate::search::numeric::VectorKernel;
 use crate::storage::keys::{MAX_TREE_KEY_BYTES, TreeKey};
 use crate::storage::values::{IndexManifest, source};
@@ -116,20 +116,19 @@ impl ShardPlan {
     /// Samples uniformly across segments and constructs a deterministic coarse shard plan.
     ///
     /// All workers of one build share identical `BulkWorkerOptions` and `BuildDescriptor`,
-    /// so `effective_mem = worker_memory_bytes.min(construction.memory_bytes)` deterministically
-    /// lowers `target_shard_rows` when working memory is constrained.
+    /// so `worker_memory_bytes` deterministically lowers `target_shard_rows` when working
+    /// memory is constrained.
     pub(crate) fn build(
         snapshot: &InputSnapshot,
         manifest: &IndexManifest,
-        construction: ConstructionOptions,
+        sample_items: usize,
         worker_memory_bytes: usize,
         check: &(dyn Fn() -> Result<()> + Sync),
     ) -> Result<Self> {
         check()?;
         let config = manifest.config();
         let row_bytes = config.dimension().saturating_mul(4).saturating_add(128);
-        let effective_mem = worker_memory_bytes.min(construction.memory_bytes);
-        if effective_mem < row_bytes.saturating_mul(16) {
+        if worker_memory_bytes < row_bytes.saturating_mul(16) {
             return Err(Error::new(ErrorKind::LimitExceeded));
         }
 
@@ -151,16 +150,15 @@ impl ShardPlan {
             .saturating_mul(4)
             .max(64);
         let scale_floor = total_items.div_ceil(MAX_TOTAL_SHARDS as u64) as usize;
-        let mem_shard_rows = (effective_mem / 4 / row_bytes.max(1)).max(min_shard_rows);
+        let mem_shard_rows = (worker_memory_bytes / 4 / row_bytes.max(1)).max(min_shard_rows);
         let target_shard_rows = mem_shard_rows
             .min(DEFAULT_SHARD_TARGET_ROWS as usize)
             .max(scale_floor)
             .max(min_shard_rows);
 
         // Bound sample capacity by construction policy and available working memory.
-        let mem_sample_cap = (effective_mem / 2 / row_bytes.max(1)).max(2);
-        let sample_cap = construction
-            .sample_items
+        let mem_sample_cap = (worker_memory_bytes / 2 / row_bytes.max(1)).max(2);
+        let sample_cap = sample_items
             .clamp(4_096, MAX_SAMPLE_CAP)
             .min(mem_sample_cap);
 
@@ -302,10 +300,7 @@ impl ShardPlan {
         let mut next_shard = 0_u32;
         for (tree_key, tree_samples, _, k) in heavy_candidates {
             check()?;
-            let train_cap = construction
-                .sample_items
-                .max(k * 16)
-                .min(tree_samples.len());
+            let train_cap = sample_items.max(k * 16).min(tree_samples.len());
             let stride = (tree_samples.len() / train_cap.max(1)).max(1);
             let train_samples: Vec<_> = tree_samples
                 .into_iter()
@@ -728,15 +723,8 @@ fn train_centers_hierarchical(
     for (bucket, sub_k) in buckets.into_iter().zip(sub_ks) {
         check()?;
         if sub_k == 1 {
-            let mut mean = vec![0.0_f64; kernel.dimension()];
-            for (_, v) in &bucket {
-                for (s, x) in mean.iter_mut().zip(v.iter()) {
-                    *s += f64::from(*x);
-                }
-            }
-            let inv = 1.0 / bucket.len() as f64;
-            let m: Vec<f32> = mean.into_iter().map(|s| (s * inv) as f32).collect();
-            all_centers.push(kernel.normalize_centroid(&m)?);
+            let centroid = mean(kernel, bucket.iter().map(|(_, v)| v.as_ref()), 2)?;
+            all_centers.push(Box::from(centroid.components()));
         } else {
             all_centers.extend(train_centers(kernel, bucket, sub_k, max_iters, check)?);
         }
@@ -861,28 +849,21 @@ fn build_super_index(
             check()?;
         }
         // Assign each coarse center to its 3 nearest super-centers to mitigate Voronoi boundary loss.
-        let mut best1 = (f64::INFINITY, 0_usize);
-        let mut best2 = (f64::INFINITY, 0_usize);
-        let mut best3 = (f64::INFINITY, 0_usize);
+        let mut best = [(f64::INFINITY, usize::MAX); 3];
         for (sc_idx, sc) in super_centers.iter().enumerate() {
             let d = kernel.routing_distances_validated([c], sc)[0];
-            if d.total_cmp(&best1.0).is_lt() {
-                best3 = best2;
-                best2 = best1;
-                best1 = (d, sc_idx);
-            } else if d.total_cmp(&best2.0).is_lt() {
-                best3 = best2;
-                best2 = (d, sc_idx);
-            } else if d.total_cmp(&best3.0).is_lt() {
-                best3 = (d, sc_idx);
+            if d.total_cmp(&best[2].0).is_lt() {
+                let pos = best.partition_point(|&(bd, _)| bd.total_cmp(&d).is_le());
+                if pos < 3 {
+                    best.copy_within(pos..2, pos + 1);
+                    best[pos] = (d, sc_idx);
+                }
             }
         }
-        super_children[best1.1].push(idx as u32);
-        if super_centers.len() > 1 && best2.1 != best1.1 {
-            super_children[best2.1].push(idx as u32);
-        }
-        if super_centers.len() > 2 && best3.1 != best1.1 && best3.1 != best2.1 {
-            super_children[best3.1].push(idx as u32);
+        for &(_, sc_idx) in &best {
+            if sc_idx < super_centers.len() {
+                super_children[sc_idx].push(idx as u32);
+            }
         }
     }
     for list in &mut super_children {

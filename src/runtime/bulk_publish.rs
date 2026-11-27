@@ -134,8 +134,8 @@ async fn read_active<T: ReadTxn>(
     }
 }
 
-/// Pre-stages `STAGE_VALIDATE` `BuildUnit`s when `max_mutations` is smaller than `slices + 2`,
-/// then atomically clears `BuildWorkspace.writer_token` and flips `BuildProgress` to `Validating`.
+/// Atomically clears `BuildWorkspace.writer_token` and flips `BuildProgress` to `Validating`,
+/// initializing `STAGE_VALIDATE` `BuildUnit`s inline when they fit in one transaction.
 async fn begin_validation<B: Backend>(
     context: &mut OperationContext<B>,
     index: &IndexManifest,
@@ -145,49 +145,7 @@ async fn begin_validation<B: Backend>(
 ) -> Result<BuildProgress> {
     let id = index.logical_index_id();
     let backend = context.backend();
-    let (loaded_prog, slices) =
-        retry_read(&context.options, Operation::PublishBulkBuild, retry, || {
-            let backend = Arc::clone(&backend);
-            async move {
-                let mut rtxn = ReadLogicalTxn::bootstrap(backend.begin_read().await?);
-                if read_active(&mut rtxn, index).await?.is_some() {
-                    return Err(Error::new(ErrorKind::BulkBuildSuperseded));
-                }
-                match rtxn.get(LogicalKey::BuildDescriptor(id)).await? {
-                    Some(PersistentValue::BuildDescriptor(d)) if d == *descriptor => {}
-                    _ => return Err(corrupt()),
-                }
-                let p = match rtxn.get(LogicalKey::BuildProgress(id)).await? {
-                    None => return Err(Error::new(ErrorKind::BulkBuildBusy)),
-                    Some(PersistentValue::BuildProgress(p)) => p,
-                    _ => return Err(corrupt()),
-                };
-                validate_split_keys_in_index(id, &p.validation_split_keys)?;
-                if p.total_records != descriptor.input().items() {
-                    return Err(corrupt());
-                }
-                if p.epoch != state.epoch {
-                    return Err(Error::new(ErrorKind::BulkBuildSuperseded));
-                }
-                match p.phase {
-                    BuildPhase::Preparing | BuildPhase::Loading => {
-                        Err(Error::new(ErrorKind::BulkBuildBusy))
-                    }
-                    BuildPhase::Validating | BuildPhase::Loaded => {
-                        let s = p.validation_slices();
-                        Ok((p, s))
-                    }
-                }
-            }
-        })
-        .await?;
-
-    if loaded_prog.phase == BuildPhase::Validating {
-        return Ok(loaded_prog);
-    }
-
     let budget = backend.admission_budget();
-    let inline_all = budget.max_mutations >= (slices as usize + 2);
     let bulk_authority = context.bulk_authority;
 
     retry_ctx_write(
@@ -254,7 +212,8 @@ async fn begin_validation<B: Backend>(
                 PersistentValue::BuildWorkspace(w),
             )
             .await?;
-            if inline_all {
+            let slices = progress.validation_slices();
+            if budget.max_mutations >= (slices as usize + 2) {
                 for s in 0..slices {
                     txn.put(
                         LogicalKey::BuildUnit {
@@ -325,8 +284,6 @@ async fn validate_all_slices<B: Backend>(
         bulk_authority: context.bulk_authority,
         sched_lease_lock: context.bulk_lease_lock.clone(),
         distributed_workers: state.options.distributed_workers,
-        persist_single_worker: true,
-        in_memory: false,
         writer_lanes: 1,
         commit_sem: Arc::new(tokio::sync::Semaphore::new(1)),
         admission: context.cpu_keep_alive(),
@@ -477,21 +434,7 @@ async fn open_frozen_validation_snapshot<'a, B: Backend>(
     if fetched.len() != 3 {
         return Err(Error::new(ErrorKind::Backend));
     }
-    match &fetched[0] {
-        None => return Err(Error::new(ErrorKind::IndexNotFound)),
-        Some(PersistentValue::IndexManifest(m))
-            if m.has_same_immutable_identity(expected_manifest) =>
-        {
-            match m.lifecycle() {
-                IndexLifecycle::Building => {}
-                IndexLifecycle::Dropping => return Err(Error::new(ErrorKind::IndexDropping)),
-                IndexLifecycle::Active => {
-                    return Err(Error::new(ErrorKind::BulkBuildSuperseded));
-                }
-            }
-        }
-        _ => return Err(corrupt()),
-    }
+    bulk_worker::check_manifest_building_in_flight(fetched[0].as_ref(), expected_manifest)?;
     match &fetched[2] {
         Some(PersistentValue::BuildWorkspace(w)) => {
             if let Some(kind) = w.failure {

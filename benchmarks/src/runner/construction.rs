@@ -474,7 +474,6 @@ async fn prepare_bulk_index<B: Backend>(
     ),
     String,
 > {
-    use ktann::api::BulkBuildOptions;
     use ktann::bulk::InputSnapshot;
     let experiment = spec
         .routing_experiment
@@ -498,20 +497,13 @@ async fn prepare_bulk_index<B: Backend>(
     )
     .map_err(|e| error_at("capture bulk source", e))?;
     let capture_seconds = started.elapsed().as_secs_f64();
-    let construction = experiment.construction();
+    let bulk_options = experiment.bulk_options(spec.refinement_rounds.map(|rounds| rounds as u8));
     let job = runtime
-        .start_bulk_build(
-            "benchmark",
-            &source,
-            BulkBuildOptions {
-                construction,
-                refinement_rounds: spec.refinement_rounds.map(|rounds| rounds as u8),
-            },
-        )
+        .start_bulk_build("benchmark", &source, bulk_options)
         .await
         .map_err(|e| error_at("reserve bulk index", e))?;
     let worker = experiment.worker(root.path().join("workspace"));
-    let settings = crate::report::bulk_build_settings(&construction, &worker);
+    let settings = crate::report::bulk_build_settings(&bulk_options, &worker);
     std::fs::create_dir(&worker.workspace).map_err(|e| e.to_string())?;
     let (index, stages) = job
         .complete_with_report(worker, OperationOptions::default())

@@ -67,13 +67,13 @@ mod build;
 mod data;
 mod entry;
 mod graph;
-mod load;
 mod manifest;
+mod progress;
 mod record;
 mod schedule;
 pub(crate) mod source;
 mod synopsis;
-mod validation;
+mod unit;
 mod wire;
 pub use graph::{GRAPH_CHUNK_BYTES, GraphChunk, GraphDescriptor, MAX_GRAPH_VALUE_BYTES};
 mod workspace;
@@ -87,18 +87,18 @@ pub use authority::{
 pub use build::BuildDescriptor;
 #[doc(inline)]
 pub use entry::{ChildEntry, LeafEntry};
-pub(crate) use load::MAX_SPLIT_KEYS;
-pub use load::{BuildPhase, BuildProgress};
 #[doc(inline)]
 pub use manifest::{
     BloomParameters, IndexIdAllocator, IndexLifecycle, IndexManifest, IndexNameEntry,
 };
+pub(crate) use progress::MAX_SPLIT_KEYS;
+pub use progress::{BuildPhase, BuildProgress};
 #[doc(inline)]
 pub use record::{OpaquePayload, RecordLocation, VectorRecord};
 pub use schedule::BuildSchedule;
 #[doc(inline)]
 pub use synopsis::{FieldSynopsis, PartitionSynopsis};
-pub use validation::BuildUnit;
+pub use unit::BuildUnit;
 pub use workspace::BuildWorkspace;
 
 use wire::{Decoder, Encoder};
@@ -149,10 +149,10 @@ const TAG_LEAF_ENTRY: u8 = 0x0a;
 const TAG_PARTITION_SYNOPSIS: u8 = 0x0b;
 const TAG_PARTITION_STATE: u8 = 0x0c;
 const TAG_BUILD_DESCRIPTOR: u8 = 0x0d;
+const TAG_BUILD_PROGRESS: u8 = 0x0e;
 const TAG_BUILD_WORKSPACE: u8 = 0x0f;
+const TAG_BUILD_UNIT: u8 = 0x10;
 const TAG_BUILD_SCHEDULE: u8 = 0x11;
-const TAG_BUILD_VALIDATION: u8 = 0x10;
-const TAG_BUILD_LOAD: u8 = 0x0e;
 const TAG_GRAPH_DESCRIPTOR: u8 = 0x12;
 const TAG_GRAPH_CHUNK: u8 = 0x13;
 const TAG_DRAIN_HEADER: u8 = 0x14;
@@ -213,8 +213,8 @@ impl ValueKind {
             Self::BuildDescriptor => TAG_BUILD_DESCRIPTOR,
             Self::BuildWorkspace => TAG_BUILD_WORKSPACE,
             Self::BuildSchedule => TAG_BUILD_SCHEDULE,
-            Self::BuildUnit => TAG_BUILD_VALIDATION,
-            Self::BuildProgress => TAG_BUILD_LOAD,
+            Self::BuildUnit => TAG_BUILD_UNIT,
+            Self::BuildProgress => TAG_BUILD_PROGRESS,
             Self::IndexIdAllocator => TAG_INDEX_ID_ALLOCATOR,
             Self::IndexNameEntry => TAG_INDEX_NAME_ENTRY,
             Self::IndexManifest => TAG_INDEX_MANIFEST,
@@ -385,8 +385,8 @@ impl<'a> ValueCodec<'a> {
             PersistentValue::BuildDescriptor(value) => build::encode(&mut encoder, value)?,
             PersistentValue::BuildWorkspace(value) => workspace::encode(&mut encoder, value)?,
             PersistentValue::BuildSchedule(value) => schedule::encode(&mut encoder, value)?,
-            PersistentValue::BuildUnit(value) => validation::encode(&mut encoder, value)?,
-            PersistentValue::BuildProgress(value) => load::encode(&mut encoder, value)?,
+            PersistentValue::BuildUnit(value) => unit::encode(&mut encoder, value)?,
+            PersistentValue::BuildProgress(value) => progress::encode(&mut encoder, value)?,
             PersistentValue::IndexIdAllocator(value) => {
                 manifest::encode_index_id_allocator(&mut encoder, *value);
             }
@@ -474,8 +474,10 @@ impl<'a> ValueCodec<'a> {
             ValueKind::BuildWorkspace => {
                 PersistentValue::BuildWorkspace(workspace::decode(&mut decoder)?)
             }
-            ValueKind::BuildUnit => PersistentValue::BuildUnit(validation::decode(&mut decoder)?),
-            ValueKind::BuildProgress => PersistentValue::BuildProgress(load::decode(&mut decoder)?),
+            ValueKind::BuildUnit => PersistentValue::BuildUnit(unit::decode(&mut decoder)?),
+            ValueKind::BuildProgress => {
+                PersistentValue::BuildProgress(progress::decode(&mut decoder)?)
+            }
             ValueKind::GraphDescriptor => {
                 PersistentValue::GraphDescriptor(graph::decode_descriptor(&mut decoder)?)
             }

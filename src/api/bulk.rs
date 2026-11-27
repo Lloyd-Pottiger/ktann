@@ -14,18 +14,32 @@ use super::{IndexName, LogicalIndexId, OperationOptions, Result};
 /// Immutable Bulk Build preparation semantics, persisted with the source identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BulkBuildOptions {
-    /// Partition construction controls.
-    pub construction: crate::construction::ConstructionOptions,
+    /// Maximum deterministic training sample size (`>= 2`).
+    pub sample_items: usize,
     /// None preserves constructed centroids; Some(0) refreshes them without moves.
     pub refinement_rounds: Option<u8>,
 }
 
-impl From<crate::construction::ConstructionOptions> for BulkBuildOptions {
-    fn from(construction: crate::construction::ConstructionOptions) -> Self {
+impl Default for BulkBuildOptions {
+    fn default() -> Self {
         Self {
-            construction,
+            sample_items: 1_024,
             refinement_rounds: None,
         }
+    }
+}
+
+impl BulkBuildOptions {
+    /// Validates semantic construction and refinement options before persisting a reservation.
+    pub(crate) fn validate(self) -> Result<()> {
+        if self.sample_items < 2
+            || self
+                .refinement_rounds
+                .is_some_and(|rounds| usize::from(rounds) > super::MAX_REFINEMENT_ROUNDS)
+        {
+            return Err(super::Error::invalid_argument());
+        }
+        Ok(())
     }
 }
 

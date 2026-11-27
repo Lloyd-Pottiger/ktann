@@ -299,9 +299,9 @@ keys, worker options, and ownership tokens.
 
 Canonical layouts and validation belong to
 [`build.rs`](../../src/storage/values/build.rs),
-[`load.rs`](../../src/storage/values/load.rs),
+[`progress.rs`](../../src/storage/values/progress.rs),
 [`workspace.rs`](../../src/storage/values/workspace.rs),
-[`validation.rs`](../../src/storage/values/validation.rs), and
+[`unit.rs`](../../src/storage/values/unit.rs), and
 [`schedule.rs`](../../src/storage/values/schedule.rs).
 [Bulk Build](bulk-build.md) defines recovery and publication.
 

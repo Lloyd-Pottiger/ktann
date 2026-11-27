@@ -785,12 +785,10 @@ fn index_handle_is_send_and_sync() {
     assert_send_sync::<ktann::api::Index<MemoryBackend>>();
 }
 
-fn bulk_options() -> ktann::construction::ConstructionOptions {
-    ktann::construction::ConstructionOptions {
+fn bulk_options() -> ktann::api::BulkBuildOptions {
+    ktann::api::BulkBuildOptions {
         sample_items: 8,
-        // Cover default wide internal partitions in the constructor reservation.
-        memory_bytes: 64 * 1024 * 1024,
-        scratch_bytes: 16 * 1024 * 1024,
+        refinement_rounds: None,
     }
 }
 
@@ -888,7 +886,7 @@ async fn bulk_reservation_commit_recovery_and_validation_are_atomic() {
         let (_source, input) = bulk_source();
         let options = bulk_options();
         let mut invalid = options;
-        invalid.memory_bytes = 1;
+        invalid.sample_items = 1;
         assert_eq!(
             runtime
                 .start_bulk_build("bulk", &input, invalid)

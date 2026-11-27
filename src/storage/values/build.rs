@@ -3,9 +3,8 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::api::{Error, Result};
+use crate::api::{BulkBuildOptions, Error, Result};
 use crate::bulk::{INPUT_MANIFEST_BYTES, InputManifest};
-use crate::construction::ConstructionOptions;
 
 use super::corrupt;
 use super::wire::{Decoder, Encoder};
@@ -21,17 +20,12 @@ const MAX_SOURCE_PATH_BYTES: usize = 4096;
 pub struct BuildDescriptor {
     source: PathBuf,
     input: InputManifest,
-    options: ConstructionOptions,
-    refinement_rounds: Option<u8>,
+    options: BulkBuildOptions,
 }
 
 impl BuildDescriptor {
     /// Creates a bounded request descriptor with an absolute UTF-8 source path.
-    pub fn new(
-        source: PathBuf,
-        input: InputManifest,
-        options: ConstructionOptions,
-    ) -> Result<Self> {
+    pub fn new(source: PathBuf, input: InputManifest, options: BulkBuildOptions) -> Result<Self> {
         if !source.is_absolute()
             || source
                 .to_str()
@@ -44,22 +38,13 @@ impl BuildDescriptor {
             source,
             input,
             options,
-            refinement_rounds: None,
         })
     }
 
-    /// Binds optional refinement to this reservation; None and Some(0) differ.
-    pub fn with_refinement_rounds(mut self, rounds: Option<u8>) -> Result<Self> {
-        if rounds.is_some_and(|rounds| usize::from(rounds) > crate::api::MAX_REFINEMENT_ROUNDS) {
-            return Err(Error::invalid_argument());
-        }
-        self.refinement_rounds = rounds;
-        Ok(self)
-    }
-
-    /// Requested bounded refinement rounds, before final forest acceptance.
+    /// Requested bounded refinement rounds, before serving emission.
+    #[must_use]
     pub const fn refinement_rounds(&self) -> Option<u8> {
-        self.refinement_rounds
+        self.options.refinement_rounds
     }
 
     /// Absolute source snapshot directory; its contents must match `input`.
@@ -74,9 +59,9 @@ impl BuildDescriptor {
         &self.input
     }
 
-    /// Deterministic construction parameters and resource ceilings.
+    /// Deterministic construction and refinement semantics.
     #[must_use]
-    pub const fn options(&self) -> ConstructionOptions {
+    pub const fn options(&self) -> BulkBuildOptions {
         self.options
     }
 }
@@ -97,11 +82,11 @@ pub(super) fn encode(encoder: &mut Encoder, descriptor: &BuildDescriptor) -> Res
         MAX_SOURCE_PATH_BYTES,
     )?;
     encoder.sized_bytes(&descriptor.input.encode(), INPUT_MANIFEST_BYTES)?;
-    let options = descriptor.options;
-    encoder.u64(options.sample_items as u64);
-    encoder.u64(options.memory_bytes as u64);
-    encoder.u64(options.scratch_bytes);
-    encoder.u8(descriptor.refinement_rounds.map_or(0, |rounds| rounds + 1));
+    encoder.u64(descriptor.options.sample_items as u64);
+    encoder.u8(descriptor
+        .options
+        .refinement_rounds
+        .map_or(0, |rounds| rounds + 1));
     Ok(())
 }
 
@@ -109,17 +94,19 @@ pub(super) fn decode(decoder: &mut Decoder) -> Result<BuildDescriptor> {
     let path = decoder.sized_bytes(MAX_SOURCE_PATH_BYTES)?;
     let source = PathBuf::from(std::str::from_utf8(&path).map_err(|_| corrupt())?);
     let input = InputManifest::decode(&decoder.sized_bytes(INPUT_MANIFEST_BYTES)?)?;
-    let options = ConstructionOptions {
-        sample_items: usize::try_from(decoder.u64()?).map_err(|_| corrupt())?,
-        memory_bytes: usize::try_from(decoder.u64()?).map_err(|_| corrupt())?,
-        scratch_bytes: decoder.u64()?,
-    };
+    let sample_items = usize::try_from(decoder.u64()?).map_err(|_| corrupt())?;
     let refinement_rounds = match decoder.u8()? {
         0 => None,
         tag @ 1..=6 => Some(tag - 1),
         _ => return Err(corrupt()),
     };
-    BuildDescriptor::new(source, input, options)
-        .and_then(|d| d.with_refinement_rounds(refinement_rounds))
-        .map_err(|_| corrupt())
+    BuildDescriptor::new(
+        source,
+        input,
+        BulkBuildOptions {
+            sample_items,
+            refinement_rounds,
+        },
+    )
+    .map_err(|_| corrupt())
 }

@@ -2,10 +2,10 @@
 //! and multi-worker collaborative `BuildUnit` execution.
 //!
 //! One stage graph (`Plan -> Scatter -> Dedup -> Leaves -> [Halo Refine] -> Emit`)
-//! executes over a 6-primitive byte/slice `StageStore`: `StageStore::Memory` keeps
-//! encoded intermediate blobs and indexed slices in process memory (`0 B` scratch
-//! disk I/O), while `StageStore::Disk` persists checksummed files under `ScratchQuota`
-//! and coordinates collaborative `BuildUnit` leases when `distributed_workers > 1`.
+//! executes over a typed `StageStore`: `StageStore::Memory` keeps native intermediate
+//! structures in process memory (`0 B` scratch disk I/O and zero codec round-trips),
+//! while `StageStore::Disk` persists checksummed files under `ScratchQuota` and
+//! coordinates collaborative `BuildUnit` leases when `distributed_workers > 1`.
 
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,16 +23,17 @@ use crate::api::{
 use crate::bulk::files::io_error;
 use crate::bulk::plan::MAX_TOTAL_SHARDS;
 use crate::bulk::sharded::{
-    INDEX_ENTRY_BYTES, LeafPlan, MAX_HALO_LEAVES_CAP, ScratchQuota, ShardRows, ShardState,
+    AssignedLeafKey, CompactMeta, INDEX_ENTRY_BYTES, IdFrameEntry, LeafPlan, MAX_HALO_LEAVES_CAP,
+    MoveProposal, ScratchQuota, SegmentIngest, ShardRows, ShardState, TreePlanEntry,
     apply_moves_to_shard, arbitrate_tree_proposals, assign_leaf_partition_keys,
     build_and_encode_upper_tree, build_shard_leaves, compute_shard_remap, decode_id_refs,
     decode_id_slice, decode_leaf_keys_plan, decode_locations_slice, decode_proposals,
-    decode_shard_centers, decode_shard_counts, decode_shard_slice, decode_shard_state,
-    encode_id_buckets, encode_id_refs, encode_leaf_keys_plan, encode_leaf_shard, encode_proposals,
-    encode_record_group_bucket, encode_shard_slices, encode_shard_state, ingest_segment_range,
-    parallel_chunks, read_checksummed_bytes, read_indexed_slice, refine_single_light_shard,
-    refinement_per_leaf_bytes, score_halo_shard, verify_id_bucket, write_checksummed_bytes,
-    write_indexed_slices,
+    decode_shard_centers, decode_shard_slice, decode_shard_state, encode_id_buckets,
+    encode_id_refs, encode_leaf_keys_plan, encode_leaf_shard, encode_proposals,
+    encode_record_group_bucket, encode_shard_locations, encode_shard_slices, encode_shard_state,
+    ingest_segment_range, parallel_chunks, read_checksummed_bytes, read_indexed_counts,
+    read_indexed_slice, refine_single_light_shard, refinement_per_leaf_bytes, score_halo_shard,
+    verify_id_bucket, write_checksummed_bytes, write_indexed_slices,
 };
 use crate::bulk::{InputSnapshot, LtHash, ShardPlan};
 use crate::maintenance::routing::kernel_for;
@@ -43,22 +44,24 @@ use crate::runtime::bulk_scheduler::{
 use crate::storage::backend::{AdmissionBudget, Backend, ScanLimits, WriteTxn};
 use crate::storage::keys::{LogicalKey, TreeKey};
 use crate::storage::values::{
-    BuildDescriptor, BuildPhase, BuildProgress, BuildUnit, BuildWorkspace, IndexLifecycle,
-    IndexManifest, PartitionCentroid, PersistentValue,
+    BuildDescriptor, BuildPhase, BuildProgress, BuildUnit, BuildWorkspace, IndexManifest,
+    PartitionCentroid, PersistentValue,
 };
 use crate::storage::{LogicalRange, ReadLogicalTxn, WriteLogicalTxn};
 
 use super::{
-    CommitStep, MAX_WRITER_LANES, OperationContext, RetryPolicy, UnitLease, WriteFence,
-    advance_loading_progress, building_in_flight, check_writer_fence, clear_stale_serving_data,
-    commit_raw_prepared, corrupt, drop_guarded_options, effective_budget, finalize_and_seal_loaded,
-    lock_sched_read, retry_raw_write, retry_read, seal_loaded, validate_split_keys_in_index,
+    CommitStep, MAX_WRITER_LANES, OperationContext, RetryPolicy, SealedSummary, UnitLease,
+    WriteFence, advance_loading_progress, building_in_flight, check_manifest_building_in_flight,
+    check_writer_fence, clear_stale_serving_data, commit_raw_prepared, corrupt,
+    drop_guarded_options, effective_budget, finalize_and_seal_loaded, lock_sched_read,
+    retry_raw_write, retry_read, seal_loaded, validate_split_keys_in_index,
 };
 
 const STAGE_SCATTER: u8 = 1;
 const STAGE_DEDUP: u8 = 2;
 const STAGE_LEAVES: u8 = 3;
 const STAGE_REFINE_BASE: u8 = 10; // 10 + 2*r = Propose, 11 + 2*r = Apply
+const STAGE_EMIT_LOCS: u8 = 29; // Disk early-convergence fallback when final_round < rounds
 const STAGE_EMIT_RECORDS: u8 = 30;
 const STAGE_EMIT_TREES: u8 = 31;
 const STAGE_EMIT_LEAVES: u8 = 32;
@@ -212,8 +215,6 @@ pub(crate) struct StageEnv<B: Backend> {
     pub bulk_authority: Option<BulkAuthority>,
     pub sched_lease_lock: Option<Arc<tokio::sync::RwLock<()>>>,
     pub distributed_workers: usize,
-    pub persist_single_worker: bool,
-    pub in_memory: bool,
     pub writer_lanes: usize,
     pub commit_sem: Arc<Semaphore>,
     pub admission: Option<Arc<dyn Any + Send + Sync>>,
@@ -232,8 +233,6 @@ impl<B: Backend> Clone for StageEnv<B> {
             bulk_authority: self.bulk_authority,
             sched_lease_lock: self.sched_lease_lock.clone(),
             distributed_workers: self.distributed_workers,
-            persist_single_worker: self.persist_single_worker,
-            in_memory: self.in_memory,
             writer_lanes: self.writer_lanes,
             commit_sem: Arc::clone(&self.commit_sem),
             admission: self.admission.clone(),
@@ -247,6 +246,14 @@ impl<B: Backend> Clone for StageEnv<B> {
 }
 
 impl<B: Backend> StageEnv<B> {
+    const fn persists_single_worker(&self) -> bool {
+        matches!(self.fence, StageFence::Validate { .. })
+    }
+
+    const fn persists_units(&self) -> bool {
+        self.distributed_workers > 1 || self.persists_single_worker()
+    }
+
     pub(crate) async fn spawn_cpu<T: Send + 'static>(
         &self,
         work: impl FnOnce(OperationOptions) -> Result<T> + Send + 'static,
@@ -282,6 +289,76 @@ impl<B: Backend> StageEnv<B> {
         Ok(txn)
     }
 
+    async fn commit_chunk(
+        &self,
+        lease: Option<&UnitLease>,
+        chunk: Vec<(Bytes, Bytes)>,
+    ) -> Result<()> {
+        let StageFence::Write(wf) = self.fence else {
+            return Err(corrupt());
+        };
+        let _permit = self
+            .commit_sem
+            .acquire()
+            .await
+            .map_err(|_| Error::new(ErrorKind::Other))?;
+        let id = self.manifest.logical_index_id();
+        let chunk_ref = &chunk;
+        retry_raw_write(
+            &self.control,
+            self.sched_lease_lock.as_deref(),
+            Operation::RunBulkBuild,
+            self.retry,
+            || async {
+                let _lease_guard = match lease {
+                    Some(l) => Some(l.lock.lock().await),
+                    None => None,
+                };
+                let prepared = async {
+                    let mut txn = WriteLogicalTxn::for_index(
+                        self.backend.begin_write().await?,
+                        &self.manifest,
+                        self.backend.hard_limits(),
+                        self.budget,
+                    );
+                    let ukey = lease.map(|l| LogicalKey::BuildUnit {
+                        index: id,
+                        stage: l.stage,
+                        unit: l.unit,
+                    });
+                    txn.warm_for_update(self.fence.warm_keys(
+                        id,
+                        self.bulk_authority,
+                        ukey.clone(),
+                    ))
+                    .await?;
+                    check_writer_fence(&mut txn, &self.manifest, wf).await?;
+                    authorize_raw(&mut txn, id, self.bulk_authority).await?;
+                    if let (Some(l), Some(ukey)) = (lease, ukey) {
+                        match txn.get_for_update(ukey.clone()).await? {
+                            Some(PersistentValue::BuildUnit(mut u))
+                                if u.epoch == wf.epoch && u.owner == l.owner && !u.complete =>
+                            {
+                                u.expires_ms = u.expires_ms.max(expiry(l.duration)?);
+                                txn.put(ukey, PersistentValue::BuildUnit(u)).await?;
+                            }
+                            _ => return Err(Error::new(ErrorKind::BulkBuildSuperseded)),
+                        }
+                    }
+                    let mut batch = txn.mutations();
+                    for (k, v) in chunk_ref {
+                        batch.put_encoded(k.clone(), v.clone())?;
+                    }
+                    txn.apply(batch).await?;
+                    Ok((Some(txn), ()))
+                }
+                .await;
+                commit_raw_prepared(prepared).await
+            },
+        )
+        .await
+    }
+
     async fn commit_unit_kvs(
         &self,
         lease: Option<&UnitLease>,
@@ -290,9 +367,6 @@ impl<B: Backend> StageEnv<B> {
         if kvs.is_empty() {
             return Ok(());
         }
-        let StageFence::Write(wf) = self.fence else {
-            return Err(corrupt());
-        };
         let chunks = super::split_into_chunks(&kvs, self.budget, lease.is_some())?;
         let fanout = if lease.is_none() {
             self.writer_lanes
@@ -303,24 +377,7 @@ impl<B: Backend> StageEnv<B> {
         };
         if fanout <= 1 {
             for chunk in chunks {
-                let _permit = self
-                    .commit_sem
-                    .acquire()
-                    .await
-                    .map_err(|_| Error::new(ErrorKind::Other))?;
-                super::commit_one_chunk(
-                    Arc::clone(&self.backend),
-                    &self.control,
-                    self.bulk_authority,
-                    self.sched_lease_lock.as_deref(),
-                    &self.manifest,
-                    wf,
-                    lease,
-                    chunk,
-                    self.budget,
-                    self.retry,
-                )
-                .await?;
+                self.commit_chunk(lease, chunk).await?;
             }
             return Ok(());
         }
@@ -336,24 +393,7 @@ impl<B: Backend> StageEnv<B> {
                     let Some(chunk) = lock_mutex(&q).next() else {
                         return Ok(());
                     };
-                    let _permit = env_c
-                        .commit_sem
-                        .acquire()
-                        .await
-                        .map_err(|_| Error::new(ErrorKind::Other))?;
-                    super::commit_one_chunk(
-                        Arc::clone(&env_c.backend),
-                        &env_c.control,
-                        env_c.bulk_authority,
-                        env_c.sched_lease_lock.as_deref(),
-                        &env_c.manifest,
-                        wf,
-                        None,
-                        chunk,
-                        env_c.budget,
-                        env_c.retry,
-                    )
-                    .await?;
+                    env_c.commit_chunk(None, chunk).await?;
                 }
             });
         }
@@ -364,30 +404,59 @@ impl<B: Backend> StageEnv<B> {
     }
 }
 
-enum StoreEntry {
-    Blob(Bytes),
-    Slices(Vec<Bytes>),
+type BucketLocations = Vec<Vec<(Bytes, u32)>>;
+
+#[derive(Default)]
+struct MemoryStageData {
+    scatter_ids: BTreeMap<u32, Vec<Vec<IdFrameEntry>>>,
+    scatter_shards: BTreeMap<u32, Vec<ShardRows>>,
+    id_refs: BTreeMap<u32, Vec<IdFrameEntry>>,
+    shards: BTreeMap<(u8, u32), ShardState>,
+    locs: BTreeMap<(u8, u32), BucketLocations>,
+    proposals: BTreeMap<(u8, u32), Vec<MoveProposal>>,
 }
 
-/// Byte and indexed-slice intermediate store backing the unified Bulk Build pipeline.
+/// Typed intermediate stage store backing the unified Bulk Build pipeline.
+///
+/// `Memory` holds native structures directly (zero encoding, zero disk I/O),
+/// while `Disk` encapsulates workspace file naming, `ScratchQuota` headroom,
+/// and checksummed binary codecs.
 struct StageStore {
     epoch: u64,
     inner: StoreBackend,
 }
 
 enum StoreBackend {
-    Memory(Mutex<BTreeMap<String, StoreEntry>>),
+    Memory(Mutex<MemoryStageData>),
     Disk {
         dir: PathBuf,
         quota: Arc<ScratchQuota>,
     },
 }
 
+fn extract_donor_rows(
+    donor: &ShardState,
+    items: &[(usize, u32)],
+    out: &mut Vec<(u32, CompactMeta, Vec<f32>)>,
+) -> Result<()> {
+    for &(src_row_idx, dst_local_leaf) in items {
+        let meta = donor
+            .rows
+            .rows
+            .get(src_row_idx)
+            .ok_or_else(corrupt)?
+            .clone();
+        let vec = donor.rows.vector(meta.vec_slot).to_vec();
+        out.push((dst_local_leaf, meta, vec));
+    }
+    Ok(())
+}
+
 impl StageStore {
     fn memory(epoch: u64) -> Self {
         Self {
             epoch,
-            inner: StoreBackend::Memory(Mutex::new(BTreeMap::new())),
+            inner: StoreBackend::Memory(Mutex::new(MemoryStageData::default())),
         }
     }
 
@@ -402,117 +471,24 @@ impl StageStore {
         matches!(self.inner, StoreBackend::Disk { .. })
     }
 
-    fn exists(&self, key: &str) -> bool {
-        match &self.inner {
-            StoreBackend::Memory(m) => lock_mutex(m).contains_key(key),
-            StoreBackend::Disk { dir, .. } => dir.join(key).exists(),
-        }
+    fn ids_key(&self, run: u32) -> String {
+        format!("ids-e{}-{run:06}.bin", self.epoch)
     }
 
-    fn put(&self, key: &str, data: Vec<u8>) -> Result<()> {
-        match &self.inner {
-            StoreBackend::Memory(m) => {
-                lock_mutex(m).insert(key.to_owned(), StoreEntry::Blob(Bytes::from(data)));
-                Ok(())
-            }
-            StoreBackend::Disk { dir, quota } => {
-                write_checksummed_bytes(&dir.join(key), &data, quota)?;
-                Ok(())
-            }
-        }
+    fn vec_key(&self, run: u32) -> String {
+        format!("vec-e{}-{run:06}.bin", self.epoch)
     }
 
-    fn get(&self, key: &str) -> Result<Bytes> {
-        match &self.inner {
-            StoreBackend::Memory(m) => match lock_mutex(m).get(key) {
-                Some(StoreEntry::Blob(b)) => Ok(b.clone()),
-                _ => Err(corrupt()),
-            },
-            StoreBackend::Disk { dir, .. } => {
-                Ok(Bytes::from(read_checksummed_bytes(&dir.join(key))?))
-            }
-        }
+    fn idref_key(&self, bucket: u32) -> String {
+        format!("idref-e{}-{bucket:06}.bin", self.epoch)
     }
 
-    fn put_slices(&self, key: &str, slices: Vec<Vec<u8>>) -> Result<()> {
-        match &self.inner {
-            StoreBackend::Memory(m) => {
-                let stored = slices.into_iter().map(Bytes::from).collect();
-                lock_mutex(m).insert(key.to_owned(), StoreEntry::Slices(stored));
-                Ok(())
-            }
-            StoreBackend::Disk { dir, quota } => {
-                write_indexed_slices(&dir.join(key), &slices, quota)?;
-                Ok(())
-            }
-        }
+    fn prop_key(&self, round: u8, shard: u32) -> String {
+        format!("prop-e{}-r{round}-{shard:06}.bin", self.epoch)
     }
 
-    fn get_slice(&self, key: &str, idx: usize) -> Result<Option<Bytes>> {
-        match &self.inner {
-            StoreBackend::Memory(m) => {
-                let mut guard = lock_mutex(m);
-                let Some(StoreEntry::Slices(v)) = guard.get_mut(key) else {
-                    return Err(corrupt());
-                };
-                let slot = v.get_mut(idx).ok_or_else(corrupt)?;
-                let taken = std::mem::take(slot);
-                Ok((!taken.is_empty()).then_some(taken))
-            }
-            StoreBackend::Disk { dir, .. } => {
-                Ok(read_indexed_slice(&dir.join(key), idx, MAX_TOTAL_SHARDS)?.map(Bytes::from))
-            }
-        }
-    }
-
-    fn ensure_headroom(&self, total_new_bytes: u64, keys: &[&str]) -> Result<()> {
-        let StoreBackend::Disk { dir, quota } = &self.inner else {
-            return Ok(());
-        };
-        let paths: Vec<PathBuf> = keys.iter().map(|k| dir.join(k)).collect();
-        let refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
-        quota.ensure_headroom(total_new_bytes, &refs)
-    }
-
-    async fn reclaim<B: Backend>(
-        &self,
-        env: &StageEnv<B>,
-        lock: &Arc<File>,
-        keys: Vec<String>,
-    ) -> Result<()> {
-        if keys.is_empty() {
-            return Ok(());
-        }
-        match &self.inner {
-            StoreBackend::Memory(m) => {
-                let mut guard = lock_mutex(m);
-                for k in keys {
-                    guard.remove(&k);
-                }
-                Ok(())
-            }
-            StoreBackend::Disk { dir, quota } => {
-                let dir = dir.clone();
-                let quota = Arc::clone(quota);
-                let guard = Arc::clone(lock);
-                env.spawn_cpu(move |_ctrl| {
-                    let _lock = guard;
-                    for name in keys {
-                        let p = dir.join(name);
-                        let len = fs::metadata(&p).map_or(0, |m| m.len());
-                        match fs::remove_file(&p) {
-                            Ok(()) => quota.release_path(&p, len),
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                                quota.release_path(&p, 0);
-                            }
-                            Err(_) => {}
-                        }
-                    }
-                    Ok(())
-                })
-                .await
-            }
-        }
+    fn leafkeys_key(&self) -> String {
+        format!("leafkeys-e{}.bin", self.epoch)
     }
 
     fn shard_keys(&self, round: u8, s: u32) -> (String, String, String) {
@@ -524,29 +500,221 @@ impl StageStore {
         )
     }
 
-    fn write_shard_state(
+    fn indexed_file_bytes(slices: &[Vec<u8>]) -> u64 {
+        4_u64
+            .saturating_add((slices.len() as u64).saturating_mul(INDEX_ENTRY_BYTES))
+            .saturating_add(slices.iter().map(|s| s.len() as u64).sum::<u64>())
+    }
+
+    fn put_scatter_run(
+        &self,
+        run: u32,
+        manifest: &IndexManifest,
+        seg: SegmentIngest,
+    ) -> Result<()> {
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                let mut g = lock_mutex(m);
+                g.scatter_ids.insert(run, seg.ids_by_bucket);
+                g.scatter_shards.insert(run, seg.rows_by_shard);
+                Ok(())
+            }
+            StoreBackend::Disk { dir, quota } => {
+                let ids_slices = encode_id_buckets(&seg.ids_by_bucket)?;
+                write_indexed_slices(&dir.join(self.ids_key(run)), &ids_slices, None, quota)?;
+                let (vec_slices, row_counts) = encode_shard_slices(manifest, &seg.rows_by_shard)?;
+                write_indexed_slices(
+                    &dir.join(self.vec_key(run)),
+                    &vec_slices,
+                    Some(&row_counts),
+                    quota,
+                )?;
+                Ok(())
+            }
+        }
+    }
+
+    fn take_id_bucket(&self, run: u32, bucket: usize, out: &mut Vec<IdFrameEntry>) -> Result<()> {
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                let mut g = lock_mutex(m);
+                let run_buckets = g.scatter_ids.get_mut(&run).ok_or_else(corrupt)?;
+                let slot = run_buckets.get_mut(bucket).ok_or_else(corrupt)?;
+                let taken = std::mem::take(slot);
+                if out.is_empty() {
+                    *out = taken;
+                } else {
+                    out.extend(taken);
+                }
+                Ok(())
+            }
+            StoreBackend::Disk { dir, .. } => {
+                if let Some(raw) =
+                    read_indexed_slice(&dir.join(self.ids_key(run)), bucket, MAX_TOTAL_SHARDS)?
+                {
+                    decode_id_slice(&raw, out)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn put_id_refs(&self, bucket: u32, items: Vec<IdFrameEntry>) -> Result<()> {
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                lock_mutex(m).id_refs.insert(bucket, items);
+                Ok(())
+            }
+            StoreBackend::Disk { dir, quota } => {
+                write_checksummed_bytes(
+                    &dir.join(self.idref_key(bucket)),
+                    &encode_id_refs(&items)?,
+                    quota,
+                )?;
+                Ok(())
+            }
+        }
+    }
+
+    fn take_id_refs(&self, bucket: u32) -> Result<Vec<IdFrameEntry>> {
+        match &self.inner {
+            StoreBackend::Memory(m) => lock_mutex(m).id_refs.remove(&bucket).ok_or_else(corrupt),
+            StoreBackend::Disk { dir, .. } => {
+                decode_id_refs(&read_checksummed_bytes(&dir.join(self.idref_key(bucket)))?)
+            }
+        }
+    }
+
+    fn read_scatter_counts(&self, run: u32, coarse_shards: usize) -> Result<Vec<u64>> {
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                let g = lock_mutex(m);
+                let shards = g.scatter_shards.get(&run).ok_or_else(corrupt)?;
+                if shards.len() != coarse_shards {
+                    return Err(corrupt());
+                }
+                Ok(shards.iter().map(|s| s.rows.len() as u64).collect())
+            }
+            StoreBackend::Disk { dir, .. } => {
+                read_indexed_counts(&dir.join(self.vec_key(run)), coarse_shards)
+            }
+        }
+    }
+
+    fn take_scatter_shard_rows(
+        &self,
+        run: u32,
+        src_shard: usize,
+        manifest: &IndexManifest,
+        dst: &mut ShardRows,
+    ) -> Result<()> {
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                let taken = {
+                    let mut g = lock_mutex(m);
+                    let shards = g.scatter_shards.get_mut(&run).ok_or_else(corrupt)?;
+                    let slot = shards.get_mut(src_shard).ok_or_else(corrupt)?;
+                    let dim = slot.dim;
+                    std::mem::replace(slot, ShardRows::new(dim))
+                };
+                dst.append(taken);
+                Ok(())
+            }
+            StoreBackend::Disk { dir, .. } => {
+                if let Some(raw) =
+                    read_indexed_slice(&dir.join(self.vec_key(run)), src_shard, MAX_TOTAL_SHARDS)?
+                {
+                    decode_shard_slice(&raw, manifest, dst)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn put_shard_state(
         &self,
         round: u8,
         s: u32,
-        state: &ShardState,
-        plan: &ShardPlan,
         manifest: &IndexManifest,
+        plan: &ShardPlan,
+        state: ShardState,
+        write_locs: bool,
     ) -> Result<()> {
-        let (s_key, c_key, loc_key) = self.shard_keys(round, s);
-        let (centers_buf, rest) = encode_shard_state(manifest, plan, state)?;
-        let Some((shard_buf, loc_slices)) = rest else {
-            return self.put(&c_key, centers_buf);
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                lock_mutex(m).shards.insert((round, s), state);
+                Ok(())
+            }
+            StoreBackend::Disk { dir, quota } => {
+                let (s_key, c_key, loc_key) = self.shard_keys(round, s);
+                let s_path = dir.join(s_key);
+                let c_path = dir.join(c_key);
+                let loc_path = dir.join(loc_key);
+                let (centers_buf, rest) = encode_shard_state(manifest, plan, &state, write_locs)?;
+                let Some((shard_buf, loc_slices)) = rest else {
+                    write_checksummed_bytes(&c_path, &centers_buf, quota)?;
+                    return Ok(());
+                };
+                let mut total =
+                    (centers_buf.len() as u64 + 8).saturating_add(shard_buf.len() as u64 + 8);
+                if let Some(locs) = loc_slices.as_ref() {
+                    total = total.saturating_add(Self::indexed_file_bytes(locs));
+                    quota.ensure_headroom(total, &[&s_path, &c_path, &loc_path])?;
+                } else {
+                    quota.ensure_headroom(total, &[&s_path, &c_path])?;
+                }
+                write_checksummed_bytes(&s_path, &shard_buf, quota)?;
+                write_checksummed_bytes(&c_path, &centers_buf, quota)?;
+                if let Some(locs) = loc_slices {
+                    write_indexed_slices(&loc_path, &locs, None, quota)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn write_shard_locations(
+        &self,
+        round: u8,
+        s: u32,
+        manifest: &IndexManifest,
+        plan: &ShardPlan,
+    ) -> Result<()> {
+        let StoreBackend::Disk { dir, quota } = &self.inner else {
+            return Ok(());
         };
-        let loc_bytes = 12_u64
-            .saturating_add((loc_slices.len() as u64).saturating_mul(INDEX_ENTRY_BYTES))
-            .saturating_add(loc_slices.iter().map(|sl| sl.len() as u64).sum::<u64>());
-        let total = (centers_buf.len() as u64 + 8)
-            .saturating_add(shard_buf.len() as u64 + 8)
-            .saturating_add(loc_bytes);
-        self.ensure_headroom(total, &[&s_key, &c_key, &loc_key])?;
-        self.put(&s_key, shard_buf)?;
-        self.put(&c_key, centers_buf)?;
-        self.put_slices(&loc_key, loc_slices)
+        let state = self.read_shard_state(round, s, manifest, false)?;
+        if state.leaves.is_empty() {
+            return Ok(());
+        }
+        let (_, _, loc_key) = self.shard_keys(round, s);
+        let loc_slices = encode_shard_locations(plan, &state)?;
+        write_indexed_slices(&dir.join(loc_key), &loc_slices, None, quota)?;
+        Ok(())
+    }
+
+    fn prepare_memory_locations(&self, leaf_plan: &LeafPlan, plan: &ShardPlan) -> Result<()> {
+        let StoreBackend::Memory(m) = &self.inner else {
+            return Ok(());
+        };
+        let mut g = lock_mutex(m);
+        for s in 0..plan.total_shards {
+            let round = shard_final_round(s, leaf_plan.final_round, plan);
+            let state = g.shards.get(&(round, s)).ok_or_else(corrupt)?;
+            if state.leaves.is_empty() {
+                continue;
+            }
+            let mut buckets = vec![Vec::new(); plan.id_bucket_count() as usize];
+            for (local_l, leaf) in state.leaves.iter().enumerate() {
+                let local_l_u32 = local_l as u32;
+                for &row_idx in &leaf.members {
+                    let id = &state.rows.rows[row_idx].id;
+                    buckets[plan.id_bucket(id) as usize].push((id.clone(), local_l_u32));
+                }
+            }
+            g.locs.insert((round, s), buckets);
+        }
+        Ok(())
     }
 
     fn read_shard_centers(
@@ -555,8 +723,21 @@ impl StageStore {
         s: u32,
         manifest: &IndexManifest,
     ) -> Result<Vec<(TreeKey, usize, PartitionCentroid)>> {
-        let (_, c_key, _) = self.shard_keys(round, s);
-        decode_shard_centers(&self.get(&c_key)?, manifest)
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                let g = lock_mutex(m);
+                let state = g.shards.get(&(round, s)).ok_or_else(corrupt)?;
+                Ok(state
+                    .leaves
+                    .iter()
+                    .map(|l| (l.tree_key.clone(), l.members.len(), l.centroid.clone()))
+                    .collect())
+            }
+            StoreBackend::Disk { dir, .. } => {
+                let (_, c_key, _) = self.shard_keys(round, s);
+                decode_shard_centers(&read_checksummed_bytes(&dir.join(c_key))?, manifest)
+            }
+        }
     }
 
     fn read_shard_state(
@@ -566,19 +747,331 @@ impl StageStore {
         manifest: &IndexManifest,
         consume_in_memory: bool,
     ) -> Result<ShardState> {
-        let (s_key, c_key, _) = self.shard_keys(round, s);
-        let centers_raw = self.get(&c_key)?;
-        let shard_raw = if self.exists(&s_key) {
-            Some(self.get(&s_key)?)
-        } else {
-            None
-        };
-        if consume_in_memory && let StoreBackend::Memory(m) = &self.inner {
-            let mut g = lock_mutex(m);
-            g.remove(&s_key);
-            g.remove(&c_key);
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                let mut g = lock_mutex(m);
+                if consume_in_memory {
+                    g.shards.remove(&(round, s)).ok_or_else(corrupt)
+                } else {
+                    g.shards.get(&(round, s)).cloned().ok_or_else(corrupt)
+                }
+            }
+            StoreBackend::Disk { dir, .. } => {
+                let (s_key, c_key, _) = self.shard_keys(round, s);
+                let centers_raw = read_checksummed_bytes(&dir.join(c_key))?;
+                let s_path = dir.join(s_key);
+                let shard_raw = if s_path.exists() {
+                    Some(read_checksummed_bytes(&s_path)?)
+                } else {
+                    None
+                };
+                decode_shard_state(&centers_raw, shard_raw.as_deref(), manifest)
+            }
         }
-        decode_shard_state(&centers_raw, shard_raw.as_deref(), manifest)
+    }
+
+    fn read_donor_rows(
+        &self,
+        round: u8,
+        donor_shard: u32,
+        manifest: &IndexManifest,
+        items: &[(usize, u32)],
+        out: &mut Vec<(u32, CompactMeta, Vec<f32>)>,
+    ) -> Result<()> {
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                let g = lock_mutex(m);
+                let donor = g.shards.get(&(round, donor_shard)).ok_or_else(corrupt)?;
+                extract_donor_rows(donor, items, out)
+            }
+            StoreBackend::Disk { .. } => {
+                let donor = self.read_shard_state(round, donor_shard, manifest, false)?;
+                extract_donor_rows(&donor, items, out)
+            }
+        }
+    }
+
+    fn take_shard_locations(
+        &self,
+        round: u8,
+        s: u32,
+        bucket: usize,
+        shard_assigned: &[AssignedLeafKey],
+        trees: &[TreePlanEntry],
+        out: &mut Vec<RecordLocationEntry>,
+    ) -> Result<()> {
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                let taken = {
+                    let mut g = lock_mutex(m);
+                    let buckets = g.locs.get_mut(&(round, s)).ok_or_else(corrupt)?;
+                    let slot = buckets.get_mut(bucket).ok_or_else(corrupt)?;
+                    std::mem::take(slot)
+                };
+                for (id, local_leaf) in taken {
+                    let ak = shard_assigned
+                        .get(local_leaf as usize)
+                        .ok_or_else(corrupt)?;
+                    let tk = &trees.get(ak.tree_id as usize).ok_or_else(corrupt)?.tree_key;
+                    out.push((id, tk.clone(), ak.partition_key));
+                }
+                Ok(())
+            }
+            StoreBackend::Disk { dir, .. } => {
+                let (_, _, loc_key) = self.shard_keys(round, s);
+                if let Some(raw) = read_indexed_slice(&dir.join(loc_key), bucket, MAX_TOTAL_SHARDS)?
+                {
+                    decode_locations_slice(&raw, shard_assigned, trees, out)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn put_proposals(&self, round: u8, s: u32, proposals: Vec<MoveProposal>) -> Result<()> {
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                lock_mutex(m).proposals.insert((round, s), proposals);
+                Ok(())
+            }
+            StoreBackend::Disk { dir, quota } => {
+                write_checksummed_bytes(
+                    &dir.join(self.prop_key(round, s)),
+                    &encode_proposals(&proposals)?,
+                    quota,
+                )?;
+                Ok(())
+            }
+        }
+    }
+
+    fn read_proposals(&self, round: u8, s: u32) -> Result<Vec<MoveProposal>> {
+        match &self.inner {
+            StoreBackend::Memory(m) => lock_mutex(m)
+                .proposals
+                .get(&(round, s))
+                .cloned()
+                .ok_or_else(corrupt),
+            StoreBackend::Disk { dir, .. } => {
+                decode_proposals(&read_checksummed_bytes(&dir.join(self.prop_key(round, s)))?)
+            }
+        }
+    }
+
+    fn load_leaf_plan(
+        &self,
+        coarse_shards: u32,
+        tree_buckets: u32,
+        manifest: &IndexManifest,
+    ) -> Result<Option<LeafPlan>> {
+        let StoreBackend::Disk { dir, .. } = &self.inner else {
+            return Ok(None);
+        };
+        let path = dir.join(self.leafkeys_key());
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(decode_leaf_keys_plan(
+            &read_checksummed_bytes(&path)?,
+            coarse_shards,
+            tree_buckets,
+            manifest,
+        )?))
+    }
+
+    fn save_leaf_plan(&self, leaf_plan: &LeafPlan, tree_buckets: u32) -> Result<()> {
+        let StoreBackend::Disk { dir, quota } = &self.inner else {
+            return Ok(());
+        };
+        write_checksummed_bytes(
+            &dir.join(self.leafkeys_key()),
+            &encode_leaf_keys_plan(leaf_plan, tree_buckets)?,
+            quota,
+        )?;
+        Ok(())
+    }
+
+    async fn remove_disk_files<B: Backend>(
+        &self,
+        env: &StageEnv<B>,
+        lock: &Arc<File>,
+        keys: Vec<String>,
+    ) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let StoreBackend::Disk { dir, quota } = &self.inner else {
+            return Ok(());
+        };
+        let dir = dir.clone();
+        let quota = Arc::clone(quota);
+        let guard = Arc::clone(lock);
+        env.spawn_cpu(move |_ctrl| {
+            let _lock = guard;
+            for name in keys {
+                let p = dir.join(name);
+                let len = fs::metadata(&p).map_or(0, |m| m.len());
+                match fs::remove_file(&p) {
+                    Ok(()) => quota.release_path(&p, len),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        quota.release_path(&p, 0);
+                    }
+                    Err(_) => {}
+                }
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn reclaim_scatter_ids<B: Backend>(
+        &self,
+        env: &StageEnv<B>,
+        lock: &Arc<File>,
+        scatter_units: u32,
+    ) -> Result<()> {
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                lock_mutex(m).scatter_ids.clear();
+                Ok(())
+            }
+            StoreBackend::Disk { .. } => {
+                self.remove_disk_files(
+                    env,
+                    lock,
+                    (0..scatter_units).map(|run| self.ids_key(run)).collect(),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn reclaim_scatter_vecs<B: Backend>(
+        &self,
+        env: &StageEnv<B>,
+        lock: &Arc<File>,
+        scatter_units: u32,
+    ) -> Result<()> {
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                lock_mutex(m).scatter_shards.clear();
+                Ok(())
+            }
+            StoreBackend::Disk { .. } => {
+                self.remove_disk_files(
+                    env,
+                    lock,
+                    (0..scatter_units).map(|run| self.vec_key(run)).collect(),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn reclaim_proposals<B: Backend>(
+        &self,
+        env: &StageEnv<B>,
+        lock: &Arc<File>,
+        round: u8,
+        prop_counts: &[u64],
+    ) -> Result<()> {
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                lock_mutex(m).proposals.retain(|&(r, _), _| r != round);
+                Ok(())
+            }
+            StoreBackend::Disk { .. } => {
+                let keys = prop_counts
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &c)| c > 0)
+                    .map(|(s, _)| self.prop_key(round, s as u32))
+                    .collect();
+                self.remove_disk_files(env, lock, keys).await
+            }
+        }
+    }
+
+    async fn reclaim_round<B: Backend>(
+        &self,
+        env: &StageEnv<B>,
+        lock: &Arc<File>,
+        round: u8,
+        heavy_shards: u32,
+    ) -> Result<()> {
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                let mut g = lock_mutex(m);
+                g.shards.retain(|&(r, _), _| r != round);
+                g.proposals.retain(|&(r, _), _| r != round);
+                Ok(())
+            }
+            StoreBackend::Disk { .. } => {
+                let mut obsolete = Vec::with_capacity((heavy_shards as usize) * 3);
+                for s in 0..heavy_shards {
+                    let (sk, ck, _) = self.shard_keys(round, s);
+                    obsolete.extend([sk, ck, self.prop_key(round, s)]);
+                }
+                self.remove_disk_files(env, lock, obsolete).await
+            }
+        }
+    }
+
+    async fn reclaim_emit_records<B: Backend>(
+        &self,
+        env: &StageEnv<B>,
+        lock: &Arc<File>,
+        id_buckets: u32,
+        leaf_plan: &LeafPlan,
+        plan: &ShardPlan,
+    ) -> Result<()> {
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                let mut g = lock_mutex(m);
+                g.id_refs.clear();
+                g.locs.clear();
+                Ok(())
+            }
+            StoreBackend::Disk { .. } => {
+                let mut obsolete =
+                    Vec::with_capacity(id_buckets as usize + leaf_plan.assigned.len());
+                for b in 0..id_buckets {
+                    obsolete.push(self.idref_key(b));
+                }
+                for (s, keys) in leaf_plan.assigned.iter().enumerate() {
+                    if !keys.is_empty() {
+                        let r_use = shard_final_round(s as u32, leaf_plan.final_round, plan);
+                        obsolete.push(self.shard_keys(r_use, s as u32).2);
+                    }
+                }
+                self.remove_disk_files(env, lock, obsolete).await
+            }
+        }
+    }
+
+    async fn reclaim_final_shards<B: Backend>(
+        &self,
+        env: &StageEnv<B>,
+        lock: &Arc<File>,
+        leaf_plan: &LeafPlan,
+        plan: &ShardPlan,
+    ) -> Result<()> {
+        match &self.inner {
+            StoreBackend::Memory(m) => {
+                lock_mutex(m).shards.clear();
+                Ok(())
+            }
+            StoreBackend::Disk { .. } => {
+                let mut obsolete = Vec::with_capacity((plan.total_shards as usize) * 2);
+                for s in 0..plan.total_shards {
+                    let r_use = shard_final_round(s, leaf_plan.final_round, plan);
+                    let (sk, ck, _) = self.shard_keys(r_use, s);
+                    obsolete.push(sk);
+                    obsolete.push(ck);
+                }
+                self.remove_disk_files(env, lock, obsolete).await
+            }
+        }
     }
 }
 
@@ -601,7 +1094,7 @@ where
     if unit_count == 0 {
         return Ok(Vec::new());
     }
-    if env.distributed_workers == 1 && !env.persist_single_worker {
+    if !env.persists_units() {
         let manifest = env.manifest.clone();
         let guard = Arc::clone(lock);
         let epoch = env.fence.epoch();
@@ -696,16 +1189,8 @@ pub(crate) async fn run_pipeline<B: Backend>(
     };
     let parallelism = state.options.parallelism.max(1);
     let budget = effective_budget(context.backend().admission_budget(), state.options.load)?;
-    let effective_mem = state
-        .options
-        .memory_bytes
-        .min(descriptor.options().memory_bytes);
-    let quota = Arc::new(ScratchQuota::new(
-        state
-            .options
-            .scratch_bytes
-            .min(descriptor.options().scratch_bytes),
-    ));
+    let effective_mem = state.options.memory_bytes;
+    let quota = Arc::new(ScratchQuota::new(state.options.scratch_bytes));
     let work_dir = state.directory();
     let hard_limits = state.hard_limits;
     let graph_memory_bytes = state.options.graph_memory_bytes;
@@ -739,8 +1224,9 @@ pub(crate) async fn run_pipeline<B: Backend>(
                     manifest.config().clone(),
                     desc.input().clone(),
                 )?;
+                let sample_items = desc.options().sample_items;
                 let plan = if in_memory {
-                    ShardPlan::build(&snap, &manifest, desc.options(), effective_mem, &check)?
+                    ShardPlan::build(&snap, &manifest, sample_items, effective_mem, &check)?
                 } else {
                     let plan_path = dir.join(format!("plan-e{ep}.bin"));
                     if plan_path.exists() {
@@ -757,7 +1243,7 @@ pub(crate) async fn run_pipeline<B: Backend>(
                         let built = ShardPlan::build(
                             &snap,
                             &manifest,
-                            desc.options(),
+                            sample_items,
                             effective_mem,
                             &check,
                         )?;
@@ -783,11 +1269,7 @@ pub(crate) async fn run_pipeline<B: Backend>(
             context,
             index,
             fence,
-            0,
-            0,
-            0,
-            0,
-            LtHash::ZERO,
+            SealedSummary::default(),
             Vec::new(),
             retry,
         )
@@ -824,8 +1306,6 @@ pub(crate) async fn run_pipeline<B: Backend>(
         bulk_authority: context.bulk_authority,
         sched_lease_lock: context.bulk_lease_lock.clone(),
         distributed_workers: state.options.distributed_workers,
-        persist_single_worker: false,
-        in_memory,
         writer_lanes,
         commit_sem: Arc::new(Semaphore::new(writer_lanes)),
         admission: context.cpu_keep_alive(),
@@ -861,24 +1341,13 @@ pub(crate) async fn run_pipeline<B: Backend>(
         (effective_mem / (64 * 1024 * 1024)).clamp(1, parallelism.min(8))
     };
 
-    let leafkeys_key = format!("leafkeys-e{ep}.bin");
     let cached_leaf_plan = if store.is_disk() {
         let store_c = Arc::clone(&store);
-        let key_c = leafkeys_key.clone();
         let manifest_c = env.manifest.clone();
         let guard = Arc::clone(&lock);
         env.spawn_cpu(move |_ctrl| {
             let _lock = guard;
-            if store_c.exists(&key_c) {
-                Ok(Some(decode_leaf_keys_plan(
-                    &store_c.get(&key_c)?,
-                    coarse_shards,
-                    tree_buckets,
-                    &manifest_c,
-                )?))
-            } else {
-                Ok(None)
-            }
+            store_c.load_leaf_plan(coarse_shards, tree_buckets, &manifest_c)
         })
         .await?
     } else {
@@ -906,24 +1375,12 @@ pub(crate) async fn run_pipeline<B: Backend>(
                         hard_limits,
                         check,
                     )?;
-                    store_c.put_slices(
-                        &format!("ids-e{ep}-{unit:06}.bin"),
-                        encode_id_buckets(&seg.ids_by_bucket)?,
-                    )?;
-                    let (vec_slices, cnt_buf) = encode_shard_slices(manifest, &seg.rows_by_shard)?;
-                    let vec_key = format!("vec-e{ep}-{unit:06}.bin");
-                    let cnt_key = format!("cnt-e{ep}-{unit:06}.bin");
-                    let vec_body: u64 = vec_slices.iter().map(|s| s.len() as u64).sum();
-                    let needed = 12_u64
-                        .saturating_add((vec_slices.len() as u64).saturating_mul(INDEX_ENTRY_BYTES))
-                        .saturating_add(vec_body)
-                        .saturating_add(cnt_buf.len() as u64 + 8);
-                    store_c.ensure_headroom(needed, &[&vec_key, &cnt_key])?;
-                    store_c.put_slices(&vec_key, vec_slices)?;
-                    store_c.put(&cnt_key, cnt_buf)?;
+                    let records = seg.records;
+                    let id_lthash = seg.id_lthash;
+                    store_c.put_scatter_run(unit, manifest, seg)?;
                     Ok(UnitOutput {
-                        records: seg.records,
-                        aux_lthash: seg.id_lthash,
+                        records,
+                        aux_lthash: id_lthash,
                         ..UnitOutput::default()
                     })
                 }
@@ -947,14 +1404,10 @@ pub(crate) async fn run_pipeline<B: Backend>(
                     if run.is_multiple_of(32) {
                         check()?;
                     }
-                    if let Some(raw) =
-                        store_c.get_slice(&format!("ids-e{ep}-{run:06}.bin"), b as usize)?
-                    {
-                        decode_id_slice(&raw, &mut ids)?;
-                    }
+                    store_c.take_id_bucket(run, b as usize, &mut ids)?;
                 }
                 let (count, hash, sorted) = verify_id_bucket(ids)?;
-                store_c.put(&format!("idref-e{ep}-{b:06}.bin"), encode_id_refs(&sorted)?)?;
+                store_c.put_id_refs(b, sorted)?;
                 Ok(UnitOutput {
                     records: count,
                     aux_lthash: hash,
@@ -973,13 +1426,7 @@ pub(crate) async fn run_pipeline<B: Backend>(
             return Err(corrupt());
         }
         store
-            .reclaim(
-                &env,
-                &lock,
-                (0..scatter_units)
-                    .map(|run| format!("ids-e{ep}-{run:06}.bin"))
-                    .collect(),
-            )
+            .reclaim_scatter_ids(&env, &lock, scatter_units)
             .await?;
 
         init_stage_units(&env, STAGE_LEAVES, coarse_shards).await?;
@@ -1023,11 +1470,9 @@ pub(crate) async fn run_pipeline<B: Backend>(
                             if idx.is_multiple_of(32) {
                                 check()?;
                             }
-                            let vkey = format!("vec-e{ep}-{run:06}.bin");
                             for &src_s in src_shards {
-                                if let Some(raw) = store_c.get_slice(&vkey, src_s)? {
-                                    decode_shard_slice(&raw, manifest, &mut rows)?;
-                                }
+                                store_c
+                                    .take_scatter_shard_rows(*run, src_s, manifest, &mut rows)?;
                             }
                         }
                         let base_count = rows.rows.len() as u64;
@@ -1051,7 +1496,16 @@ pub(crate) async fn run_pipeline<B: Backend>(
                             )?;
                         }
                         let leaf_count = shard_state.leaves.len() as u64;
-                        store_c.write_shard_state(0, s, &shard_state, &plan_c, manifest)?;
+                        let write_locs =
+                            s >= plan_c.light_shard_start || refinement_rounds.unwrap_or(0) == 0;
+                        store_c.put_shard_state(
+                            0,
+                            s,
+                            manifest,
+                            &plan_c,
+                            shard_state,
+                            write_locs,
+                        )?;
                         Ok(UnitOutput {
                             records: base_count,
                             aux_count: leaf_count,
@@ -1060,12 +1514,9 @@ pub(crate) async fn run_pipeline<B: Backend>(
                     }
                 })
                 .await?;
-                let mut obsolete = Vec::with_capacity((scatter_units as usize) * 2);
-                for run in 0..scatter_units {
-                    obsolete.push(format!("vec-e{ep}-{run:06}.bin"));
-                    obsolete.push(format!("cnt-e{ep}-{run:06}.bin"));
-                }
-                store.reclaim(&env, &lock, obsolete).await?;
+                store
+                    .reclaim_scatter_vecs(&env, &lock, scatter_units)
+                    .await?;
             }
         }
         report.construct = construct_start.elapsed();
@@ -1093,7 +1544,6 @@ pub(crate) async fn run_pipeline<B: Backend>(
             &env,
             &store,
             &lock,
-            &leafkeys_key,
             scatter_records,
             final_round,
             &plan,
@@ -1113,6 +1563,25 @@ pub(crate) async fn run_pipeline<B: Backend>(
     } else {
         (effective_mem / 4096).clamp(64, 4096)
     };
+    if in_memory {
+        let store_c = Arc::clone(&store);
+        let lp_c = Arc::clone(&leaf_plan);
+        let plan_c = plan.clone();
+        env.spawn_cpu(move |_ctrl| store_c.prepare_memory_locations(&lp_c, &plan_c))
+            .await?;
+    } else if !env.persists_units() {
+        advance_loading_progress(
+            env.backend.as_ref(),
+            &env.control,
+            env.sched_lease_lock.as_deref(),
+            env.bulk_authority,
+            &env.manifest,
+            fence,
+            0,
+            Some(env.retry),
+        )
+        .await?;
+    }
     init_stage_units(&env, STAGE_EMIT_RECORDS, id_buckets).await?;
     let rec_emit_done = drive_stage(&env, STAGE_EMIT_RECORDS, id_buckets, emit_conc, {
         let env = env.clone();
@@ -1135,8 +1604,7 @@ pub(crate) async fn run_pipeline<B: Backend>(
                         move |ctrl| {
                             let _lock = guard_init;
                             let check = || crate::runtime::check_control(&ctrl);
-                            let id_refs =
-                                decode_id_refs(&store_u.get(&format!("idref-e{ep}-{b:06}.bin"))?)?;
+                            let id_refs = store_u.take_id_refs(b)?;
                             let mut locs: Vec<RecordLocationEntry> =
                                 Vec::with_capacity(id_refs.len());
                             for (s, shard_keys) in lp_c.assigned.iter().enumerate() {
@@ -1147,15 +1615,14 @@ pub(crate) async fn run_pipeline<B: Backend>(
                                     check()?;
                                 }
                                 let r_use = shard_final_round(s as u32, lp_c.final_round, &plan_u);
-                                let (_, _, loc_key) = store_u.shard_keys(r_use, s as u32);
-                                if let Some(raw) = store_u.get_slice(&loc_key, b as usize)? {
-                                    decode_locations_slice(
-                                        &raw,
-                                        shard_keys,
-                                        &lp_c.trees,
-                                        &mut locs,
-                                    )?;
-                                }
+                                store_u.take_shard_locations(
+                                    r_use,
+                                    s as u32,
+                                    b as usize,
+                                    shard_keys,
+                                    &lp_c.trees,
+                                    &mut locs,
+                                )?;
                             }
                             if id_refs.len() != locs.len() {
                                 return Err(corrupt());
@@ -1212,17 +1679,9 @@ pub(crate) async fn run_pipeline<B: Backend>(
     })
     .await?;
 
-    let mut rec_obsolete = Vec::with_capacity(id_buckets as usize + leaf_plan.assigned.len());
-    for b in 0..id_buckets {
-        rec_obsolete.push(format!("idref-e{ep}-{b:06}.bin"));
-    }
-    for (s, keys) in leaf_plan.assigned.iter().enumerate() {
-        if !keys.is_empty() {
-            let r_use = shard_final_round(s as u32, leaf_plan.final_round, &plan);
-            rec_obsolete.push(format!("loc-e{ep}-r{r_use}-{s:06}.bin"));
-        }
-    }
-    store.reclaim(&env, &lock, rec_obsolete).await?;
+    store
+        .reclaim_emit_records(&env, &lock, id_buckets, &leaf_plan, &plan)
+        .await?;
 
     // Stage 31: Build and emit Upper Trees + Partition-Local HNSW graphs (`[0x03]` + `[0x04]`).
     init_stage_units(&env, STAGE_EMIT_TREES, tree_buckets).await?;
@@ -1401,14 +1860,9 @@ pub(crate) async fn run_pipeline<B: Backend>(
     })
     .await?;
 
-    let mut final_obsolete = Vec::with_capacity((coarse_shards as usize) * 2);
-    for s in 0..coarse_shards {
-        let r_use = shard_final_round(s, leaf_plan.final_round, &plan);
-        let (s_key, c_key, _) = store.shard_keys(r_use, s);
-        final_obsolete.push(s_key);
-        final_obsolete.push(c_key);
-    }
-    store.reclaim(&env, &lock, final_obsolete).await?;
+    store
+        .reclaim_final_shards(&env, &lock, &leaf_plan, &plan)
+        .await?;
     report.emit = emit_start.elapsed();
 
     // 6. Verify global 512-bit homomorphic multiset equations across all stages and seal `Loaded`.
@@ -1456,12 +1910,13 @@ pub(crate) async fn run_pipeline<B: Backend>(
         index,
         fence,
         &plan,
-        hard_limits,
-        leaf_plan.scatter_records,
-        total_trees,
-        leaf_partitions + internal_parts,
-        total_entries,
-        expected_kv_lthash,
+        SealedSummary {
+            records: leaf_plan.scatter_records,
+            trees: total_trees,
+            partitions: leaf_partitions + internal_parts,
+            entries: total_entries,
+            expected_kv_lthash,
+        },
         retry,
         &mut report,
     )
@@ -1471,15 +1926,10 @@ pub(crate) async fn run_pipeline<B: Backend>(
     Ok(report)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "finalizes global leaf keys into StageStore and recovers on collaborative write races"
-)]
 async fn finalize_leaf_plan<B: Backend>(
     env: &StageEnv<B>,
     store: &Arc<StageStore>,
     lock: &Arc<File>,
-    leafkeys_key: &str,
     scatter_records: u64,
     final_round: u8,
     plan: &ShardPlan,
@@ -1489,18 +1939,14 @@ async fn finalize_leaf_plan<B: Backend>(
     let store_c = Arc::clone(store);
     let manifest_c = env.manifest.clone();
     let plan_c = plan.clone();
-    let key_c = leafkeys_key.to_owned();
     let guard = Arc::clone(lock);
     let res = env
         .spawn_cpu(move |ctrl| {
             let _lock = guard;
-            if store_c.exists(&key_c) {
-                return decode_leaf_keys_plan(
-                    &store_c.get(&key_c)?,
-                    coarse_shards,
-                    tree_buckets,
-                    &manifest_c,
-                );
+            if let Some(loaded) =
+                store_c.load_leaf_plan(coarse_shards, tree_buckets, &manifest_c)?
+            {
+                return Ok(loaded);
             }
             let check = || crate::runtime::check_control(&ctrl);
             let mut shard_tks = Vec::with_capacity(coarse_shards as usize);
@@ -1520,9 +1966,7 @@ async fn finalize_leaf_plan<B: Backend>(
                 assigned,
                 trees,
             };
-            if store_c.is_disk() {
-                store_c.put(&key_c, encode_leaf_keys_plan(&leaf_plan, tree_buckets)?)?;
-            }
+            store_c.save_leaf_plan(&leaf_plan, tree_buckets)?;
             Ok(leaf_plan)
         })
         .await;
@@ -1532,19 +1976,12 @@ async fn finalize_leaf_plan<B: Backend>(
         Err(e) if env.distributed_workers > 1 && store.is_disk() => {
             let store_c = Arc::clone(store);
             let manifest_c = env.manifest.clone();
-            let key_c = leafkeys_key.to_owned();
             let guard = Arc::clone(lock);
             env.spawn_cpu(move |_ctrl| {
                 let _lock = guard;
-                if store_c.exists(&key_c) {
-                    decode_leaf_keys_plan(
-                        &store_c.get(&key_c)?,
-                        coarse_shards,
-                        tree_buckets,
-                        &manifest_c,
-                    )
-                } else {
-                    Err(e)
+                match store_c.load_leaf_plan(coarse_shards, tree_buckets, &manifest_c)? {
+                    Some(loaded) => Ok(loaded),
+                    None => Err(e),
                 }
             })
             .await
@@ -1561,17 +1998,13 @@ fn compute_non_empty_runs_by_shard(
     plan: &ShardPlan,
     ctrl: &OperationOptions,
 ) -> Result<Vec<NonEmptyRunSources>> {
-    let ep = store.epoch;
     let mut totals = vec![0_u64; coarse_shards as usize];
     let mut per_run_non_empty: Vec<Vec<usize>> = Vec::with_capacity(scatter_units as usize);
     for run in 0..scatter_units {
         if run.is_multiple_of(64) {
             crate::runtime::check_control(ctrl)?;
         }
-        let c = decode_shard_counts(
-            &store.get(&format!("cnt-e{ep}-{run:06}.bin"))?,
-            coarse_shards as usize,
-        )?;
+        let c = store.read_scatter_counts(run, coarse_shards as usize)?;
         let mut run_origins = Vec::new();
         for (orig, v) in c.into_iter().enumerate() {
             if v > 0 {
@@ -1618,9 +2051,8 @@ async fn run_halo_refinement<B: Backend>(
     leaf_conc: usize,
 ) -> Result<u8> {
     let heavy_shards = plan.light_shard_start;
-    let ep = store.epoch;
     let per_leaf = refinement_per_leaf_bytes(env.manifest.config().dimension(), rounds);
-    let halo_conc = if env.in_memory {
+    let halo_conc = if !store.is_disk() {
         parallelism
     } else {
         (effective_mem / (192 * 1024 * 1024)).clamp(1, parallelism)
@@ -1696,10 +2128,7 @@ async fn run_halo_refinement<B: Backend>(
                 )?;
                 let aux_count = proposals.len() as u64;
                 if !proposals.is_empty() {
-                    store_c.put(
-                        &format!("prop-e{ep}-r{r}-{s:06}.bin"),
-                        encode_proposals(&proposals)?,
-                    )?;
+                    store_c.put_proposals(r, s, proposals)?;
                 }
                 Ok(UnitOutput {
                     aux_count,
@@ -1754,35 +2183,35 @@ async fn run_halo_refinement<B: Backend>(
         };
 
         if accepted_moves.total_accepted == 0 {
-            let prop_keys: Vec<String> = prop_counts
-                .iter()
-                .enumerate()
-                .filter(|&(_, &c)| c > 0)
-                .map(|(s, _)| format!("prop-e{ep}-r{r}-{s:06}.bin"))
-                .collect();
-            store.reclaim(env, lock, prop_keys).await?;
+            store.reclaim_proposals(env, lock, r, &prop_counts).await?;
             break;
         }
 
+        let write_locs = r + 1 == rounds;
         drive_cpu_stage(env, lock, stage_app, heavy_shards, leaf_conc, {
             let store_c = Arc::clone(store);
             let plan_c = plan.clone();
             let acc = Arc::clone(&accepted_moves);
             move |s, manifest, check| {
-                apply_round_shard(&store_c, r, s, manifest, &plan_c, &acc, check)?;
+                apply_round_shard(&store_c, r, s, manifest, &plan_c, &acc, write_locs, check)?;
                 Ok(UnitOutput::default())
             }
         })
         .await?;
 
-        let mut obsolete = Vec::with_capacity((heavy_shards as usize) * 4);
-        for s in 0..heavy_shards {
-            for kind in ["shard", "centers", "loc", "prop"] {
-                obsolete.push(format!("{kind}-e{ep}-r{r}-{s:06}.bin"));
-            }
-        }
-        store.reclaim(env, lock, obsolete).await?;
+        store.reclaim_round(env, lock, r, heavy_shards).await?;
         final_round = r + 1;
+    }
+    if store.is_disk() && rounds > 0 && final_round < rounds {
+        drive_cpu_stage(env, lock, STAGE_EMIT_LOCS, heavy_shards, leaf_conc, {
+            let store_c = Arc::clone(store);
+            let plan_c = plan.clone();
+            move |s, manifest, _check| {
+                store_c.write_shard_locations(final_round, s, manifest, &plan_c)?;
+                Ok(UnitOutput::default())
+            }
+        })
+        .await?;
     }
     Ok(final_round)
 }
@@ -1802,7 +2231,6 @@ fn arbitrate_round(
     memory_budget_bytes: usize,
     check: &(dyn Fn() -> Result<()> + Sync),
 ) -> Result<AcceptedRoundMoves> {
-    let ep = store.epoch;
     let heavy_shards = plan.light_shard_start as usize;
     let mut outbound = vec![BTreeMap::new(); heavy_shards];
     let mut inbound_by_dst: Vec<BTreeMap<u32, Vec<(usize, u32)>>> =
@@ -1834,8 +2262,7 @@ fn arbitrate_round(
 
             let expected_props = *prop_counts.get(s_usize).ok_or_else(corrupt)?;
             if expected_props > 0 {
-                let shard_props =
-                    decode_proposals(&store.get(&format!("prop-e{ep}-r{round}-{s:06}.bin"))?)?;
+                let shard_props = store.read_proposals(round, s)?;
                 if shard_props.len() as u64 != expected_props {
                     return Err(corrupt());
                 }
@@ -1883,6 +2310,10 @@ fn arbitrate_round(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "applies round moves for one shard and emits final loc slices only on the last planned round"
+)]
 fn apply_round_shard(
     store: &StageStore,
     round: u8,
@@ -1890,6 +2321,7 @@ fn apply_round_shard(
     manifest: &IndexManifest,
     plan: &ShardPlan,
     acc: &AcceptedRoundMoves,
+    write_locs: bool,
     check: &(dyn Fn() -> Result<()> + Sync),
 ) -> Result<()> {
     check()?;
@@ -1905,21 +2337,11 @@ fn apply_round_shard(
         let mut moved_in = Vec::new();
         for (&donor_s, items) in donors {
             check()?;
-            let donor = store.read_shard_state(round, donor_s, manifest, false)?;
-            for &(src_row_idx, dst_local_leaf) in items {
-                let meta = donor
-                    .rows
-                    .rows
-                    .get(src_row_idx)
-                    .ok_or_else(corrupt)?
-                    .clone();
-                let vec = donor.rows.vector(meta.vec_slot).to_vec();
-                moved_in.push((dst_local_leaf, meta, vec));
-            }
+            store.read_donor_rows(round, donor_s, manifest, items, &mut moved_in)?;
         }
         apply_moves_to_shard(&kernel, shard_id, &mut shard, moved_out, moved_in)?;
     }
-    store.write_shard_state(round + 1, shard_id, &shard, plan, manifest)
+    store.put_shard_state(round + 1, shard_id, manifest, plan, shard, write_locs)
 }
 
 // ============================================================================
@@ -1986,23 +2408,7 @@ pub(crate) async fn init_stage_units<B: Backend>(
     if unit_count == 0 {
         return Ok(());
     }
-    if env.distributed_workers == 1 && !env.persist_single_worker {
-        if let StageFence::Write(wf) = env.fence
-            && stage == STAGE_EMIT_RECORDS
-            && !env.in_memory
-        {
-            advance_loading_progress(
-                env.backend.as_ref(),
-                &env.control,
-                env.sched_lease_lock.as_deref(),
-                env.bulk_authority,
-                &env.manifest,
-                wf,
-                0,
-                Some(env.retry),
-            )
-            .await?;
-        }
+    if !env.persists_units() {
         return Ok(());
     }
     let id = env.manifest.logical_index_id();
@@ -2119,7 +2525,8 @@ where
                     if u >= unit_count {
                         return Ok(local_done);
                     }
-                    if env_c.persist_single_worker
+                    let persist_unit = env_c.persists_single_worker();
+                    if persist_unit
                         && let Some(done) = read_completed_unit(&env_c, stage, u).await?
                     {
                         local_done.push((u, done));
@@ -2128,7 +2535,6 @@ where
                     let out = work_c(u, None).await?;
                     if let StageFence::Write(wf) = env_c.fence
                         && out.kv_count > 0
-                        && env_c.unit_lease >= Duration::from_millis(50)
                     {
                         let _permit = env_c
                             .commit_sem
@@ -2147,13 +2553,9 @@ where
                         )
                         .await?;
                     }
-                    let owner = if env_c.persist_single_worker {
-                        task_token
-                    } else {
-                        [0; 32]
-                    };
+                    let owner = if persist_unit { task_token } else { [0; 32] };
                     let bu = out.into_completed(env_c.fence.epoch(), owner);
-                    if env_c.persist_single_worker {
+                    if persist_unit {
                         let unit_lease = UnitLease {
                             stage,
                             unit: u,
@@ -2325,23 +2727,10 @@ async fn scan_stage_status<B: Backend>(
         async move {
             let now = now_ms()?;
             let mut rtxn = ReadLogicalTxn::bootstrap(env.backend.begin_read().await?);
-            match rtxn.get(LogicalKey::Manifest(id)).await? {
-                None => return Err(Error::new(ErrorKind::IndexNotFound)),
-                Some(PersistentValue::IndexManifest(m))
-                    if m.has_same_immutable_identity(&env.manifest) =>
-                {
-                    match m.lifecycle() {
-                        IndexLifecycle::Building => {}
-                        IndexLifecycle::Dropping => {
-                            return Err(Error::new(ErrorKind::IndexDropping));
-                        }
-                        IndexLifecycle::Active => {
-                            return Err(Error::new(ErrorKind::BulkBuildSuperseded));
-                        }
-                    }
-                }
-                _ => return Err(corrupt()),
-            }
+            check_manifest_building_in_flight(
+                rtxn.get(LogicalKey::Manifest(id)).await?.as_ref(),
+                &env.manifest,
+            )?;
             if let Some(PersistentValue::BuildWorkspace(w)) =
                 rtxn.get(LogicalKey::BuildWorkspace(id)).await?
                 && let Some(kind) = w.failure

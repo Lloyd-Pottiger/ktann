@@ -778,7 +778,6 @@ async fn finish<B: Backend>(
     context: &mut OperationContext<B>,
     id: LogicalIndexId,
     outcome: Option<DriveOutcome>,
-    delay: Duration,
     retry: RetryPolicy,
 ) -> Result<FinishState> {
     let Some(auth) = context.bulk_authority.filter(|a| a.scheduled) else {
@@ -831,19 +830,6 @@ async fn finish<B: Backend>(
                     return Err(bulk_worker::corrupt());
                 };
                 let slots = s.options.distributed_workers.max(1) as u32;
-                let slot_keys: Vec<LogicalKey> = (0..slots)
-                    .map(|idx| LogicalKey::BuildScheduleSlot {
-                        index: id,
-                        slot: idx,
-                    })
-                    .collect();
-                txn.warm_for_update(slot_keys).await?;
-                let skey = auth.slot_key(id);
-                match txn.get_for_update(skey.clone()).await? {
-                    Some(PersistentValue::BuildUnit(u)) if u.owner == auth.owner => {}
-                    _ => return Err(Error::new(ErrorKind::BulkBuildSuperseded)),
-                }
-
                 let (active_peers, expired_peers) = inspect_peer_slots(
                     &mut txn,
                     id,
@@ -852,6 +838,11 @@ async fn finish<B: Backend>(
                     now_ms()?,
                 )
                 .await?;
+                let skey = auth.slot_key(id);
+                match txn.get_for_update(skey.clone()).await? {
+                    Some(PersistentValue::BuildUnit(u)) if u.owner == auth.owner => {}
+                    _ => return Err(Error::new(ErrorKind::BulkBuildSuperseded)),
+                }
 
                 let collab = slots > 1;
                 let terminal_done = outcome.is_some() || !is_building;
@@ -861,22 +852,16 @@ async fn finish<B: Backend>(
                     (terminal_done && ws_reclaimed) || failed
                 };
                 let mut needs_final_cleanup = false;
-                if can_retire_self {
-                    txn.delete(skey).await?;
-                    if active_peers == 0 {
-                        for okey in expired_peers {
-                            txn.delete(okey).await?;
-                        }
-                        if ws_reclaimed || failed {
-                            txn.delete(key).await?;
-                        } else {
-                            needs_final_cleanup = true;
-                        }
+                txn.delete(skey).await?;
+                if can_retire_self && active_peers == 0 {
+                    for okey in expired_peers {
+                        txn.delete(okey).await?;
                     }
-                } else {
-                    let mut u = BuildUnit::unclaimed(1);
-                    u.expires_ms = expiry(delay)?;
-                    txn.put(skey, PersistentValue::BuildUnit(u)).await?;
+                    if ws_reclaimed || failed {
+                        txn.delete(key).await?;
+                    } else {
+                        needs_final_cleanup = true;
+                    }
                 }
                 Ok((
                     Some(txn),
@@ -928,15 +913,7 @@ async fn execute<B: Backend>(
     context.bulk_lease_lock = None;
 
     let drive_outcome = result.as_ref().ok().copied();
-    let finish_state = match finish(
-        &mut context,
-        id,
-        drive_outcome,
-        settings.poll_interval,
-        retry,
-    )
-    .await
-    {
+    let finish_state = match finish(&mut context, id, drive_outcome, retry).await {
         Ok(state) => state,
         Err(e) if collab && e.kind() == ErrorKind::BulkBuildSuperseded && result.is_ok() => {
             FinishState {

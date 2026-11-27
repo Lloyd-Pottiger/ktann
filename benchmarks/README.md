@@ -462,8 +462,9 @@ Canonical insert time measures input capture. Optimize time includes Bulk Build,
 refinement and router preparation; canonical total load time includes both phases.
 Native reports identify `build_mode: bulk`, effective refinement controls,
 `phases.input_staging_seconds`, total `phases.optimize_seconds`, and detailed Bulk
-Build stages. Artifact refinement is included in `bulk_build.forest_seconds`;
-there is no separately measured refinement duration. Core stage timings describe
+Build stages (`plan_seconds`, `ingest_seconds`, `construct_seconds`,
+`refine_seconds`, `emit_seconds`, `prepare_load_seconds`, and
+`validate_publish_cleanup_seconds`). Core stage timings describe
 the successful completion call (reused stages have zero duration); Optimize timers
 accumulate failed attempts as well as successful ones. Successful repeated
 Optimize calls leave those measurements unchanged. Compare identical datasets,
